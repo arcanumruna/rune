@@ -171,18 +171,31 @@ void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count) {
         }
     }
 
+    // fix1 (review m4): every size check below runs on the transport config the
+    // driver will REALLY get — after the RUNE_* env overrides (toAgentConfig) —
+    // still before any driver starts.  Env overrides are process-wide, so every
+    // shard gets the same sizes: shard 0's effective config stands for all.
+    const transport::TransportConfig t =
+        toAgentConfig(shardClientConfig(g, 0, count, -1)).transport;
+    if (auto err = transport::validate(t)) {
+        throw std::invalid_argument("ShardGroupConfig: shard 0 transport (after env overrides): " +
+                                    *err);
+    }
+
     // Term: the max message is term/8, which must hold the largest frame.
-    const std::size_t term = g.shardTermBufferBytes;
+    const std::size_t term = t.termBufferLength;
     if (g.producer.maxFrameBytes > 0 && static_cast<std::size_t>(g.producer.maxFrameBytes) > term / 8) {
         throw std::invalid_argument("ShardGroupConfig: producer.maxFrameBytes (" +
                                     std::to_string(g.producer.maxFrameBytes) +
                                     ") exceeds the shard term's max message (shardTermBufferBytes/8 = " +
                                     std::to_string(term / 8) + ")");
     }
-    if (transport::kAeronDefaultRcvWindowLength > term / 2) {
+    const std::size_t window = t.rcvInitialWindowLength != 0 ? t.rcvInitialWindowLength
+                                                             : transport::kAeronDefaultRcvWindowLength;
+    if (window > term / 2) {
         throw std::invalid_argument("ShardGroupConfig: shardTermBufferBytes (" + std::to_string(term) +
                                     ") must be >= 2x the Aeron receive window (" +
-                                    std::to_string(transport::kAeronDefaultRcvWindowLength) + ")");
+                                    std::to_string(window) + ")");
     }
 }
 
@@ -227,10 +240,15 @@ ClientConfig shardClientConfig(const ShardGroupConfig& g, uint32_t index) {
             "shardClientConfig(g, i): shardCount is AUTO — resolve it first (resolveShardCount) "
             "and use shardClientConfig(g, i, count, core)");
     }
-    const int32_t core = (g.mode == ShardMode::Agent && g.firstCore >= 0)
-                             ? g.firstCore + static_cast<int32_t>(index)
-                             : -1;
-    return shardClientConfig(g, index, g.shardCount, core);
+    if (index >= g.shardCount) {
+        throw std::invalid_argument("shardClientConfig: shard index " + std::to_string(index) +
+                                    " out of range for shard count " + std::to_string(g.shardCount));
+    }
+    // fix1 (review m5): the same core rules as a group — pin / firstCore are
+    // honoured or rejected (mask, platform, Invoker), never silently dropped.
+    const std::vector<int32_t> cores =
+        assignShardCores(g, g.shardCount, platformAllowedCpus(), platformPinningSupported());
+    return shardClientConfig(g, index, g.shardCount, cores[index]);
 }
 
 ProducerConfig shardProducerConfig(const ShardGroupConfig& g) {

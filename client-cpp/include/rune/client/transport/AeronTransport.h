@@ -91,6 +91,10 @@ public:
     /// timeout).  Offers then fail; the owner decides whether to rebuild.
     [[nodiscard]] bool closed() const noexcept { return aeron_ && aeron_->isClosed(); }
 
+    /// The default ingress publication's current channel (changes on retarget()).
+    /// Owner thread only.
+    [[nodiscard]] const std::string& ingressChannel() const noexcept { return cfg_.ingressChannel; }
+
     /// True when a background driver thread exists (Thread mode after start()).
     [[nodiscard]] bool usesDriverThread() const noexcept { return driverThread_.joinable(); }
 

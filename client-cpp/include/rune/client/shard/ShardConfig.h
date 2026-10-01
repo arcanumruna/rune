@@ -123,9 +123,9 @@ struct ShardCount {
 /// Checks, before any driver starts, that N shards can be built (throws
 /// std::invalid_argument naming the shard and the cause):
 ///   count >= 1; every derived egress port fits (base + N - 1 <= 65535) and none
-///   equals the gateway endpoint (same host, localhost == 127.0.0.1);
-///   producer.maxFrameBytes <= shardTermBufferBytes / 8; Aeron's receive window
-///   (128 KiB) <= shardTermBufferBytes / 2.
+///   equals the gateway endpoint (same host, localhost == 127.0.0.1); the
+///   transport config AFTER the RUNE_* env overrides passes transport::validate;
+///   producer.maxFrameBytes <= term / 8; the receive window <= term / 2.
 void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count);
 
 /// Warnings to log once at construction (empty = none).
@@ -138,8 +138,10 @@ void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count);
 [[nodiscard]] ClientConfig shardClientConfig(const ShardGroupConfig& g, uint32_t index, uint32_t count,
                                              int32_t runnerCore);
 
-/// Convenience for an explicit shardCount: the runner core is firstCore + index
-/// (Agent, firstCore >= 0) or -1.  AUTO -> std::invalid_argument (resolve first).
+/// Convenience for an explicit shardCount: the runner core is
+/// assignShardCores(g, shardCount, platformAllowedCpus(), platformPinningSupported())
+/// [index] — the same pin / firstCore rules and rejections as a group.
+/// AUTO -> std::invalid_argument (resolve first).
 [[nodiscard]] ClientConfig shardClientConfig(const ShardGroupConfig& g, uint32_t index);
 
 /// The shard producer's config: Invoker -> lingerUs = invokerLingerUs.

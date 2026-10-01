@@ -102,6 +102,8 @@ struct SessionEndpointIo : session::SessionIo {
 
     bool sendFrame(const uint8_t* buf, std::size_t len) override;
     bool retarget(const std::string& newIngressChannel) noexcept override;
+    /// T15a fix1 I1: the seed's bootstrap fallback (leader sessions: no-op).
+    bool retargetToBootstrap() noexcept override;
 };
 
 struct Session {
@@ -348,6 +350,9 @@ public:
     [[nodiscard]] bool transportClosed() const noexcept { return transport_.closed(); }
     /// Test hook (T15a): read-only access to the transport's thread-model observers.
     [[nodiscard]] const transport::AeronTransport& testTransport() const noexcept { return transport_; }
+    /// Test hook (T15a fix1): retarget the seed's default ingress publication, as
+    /// the Client's stick-to-leader redirect path does.  Agent thread only.
+    bool testRetargetSeed(const std::string& channel) noexcept { return retarget(channel); }
 
     /// Test hooks.  Reserved ack-buffer capacity (the hot path must never grow it).
     [[nodiscard]] std::size_t testProduceAckCapacity() const noexcept { return produceAcks_.capacity(); }
@@ -692,6 +697,10 @@ private:
     friend struct SessionEndpointIo;
     bool offerControlTo(const std::string& channel,
                         const uint8_t* buf, std::size_t len) noexcept;
+    /// T15a fix1 I1: point the default ingress publication (the seed session's
+    /// control path) back at the configured gateway and forget the stuck-to
+    /// leader.  No-op when already there.  Agent thread only (cold path).
+    bool retargetSeedToBootstrap_() noexcept;
 
     // ---- Task 1.4: shared produce→leader routing (drain path + redirect resend) --
     // Probe the route slot, resolve its session / pub once, hold if the session is not

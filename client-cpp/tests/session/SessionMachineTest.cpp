@@ -39,7 +39,17 @@ struct FakeIo final : sm::SessionIo {
 
     bool sendFrame(const uint8_t* buf, std::size_t len) override {
         sends.push_back(Frame{std::vector<uint8_t>(buf, buf + len)});
+        events.push_back('S');
         return sendSucceeds;
+    }
+
+    // T15a fix1 I1: Backoff falls back to the configured bootstrap endpoint.
+    std::string events;  // 'S' = sendFrame, 'B' = retargetToBootstrap, in call order
+    int         bootstrapFallbacks = 0;
+    bool retargetToBootstrap() noexcept override {
+        events.push_back('B');
+        ++bootstrapFallbacks;
+        return true;
     }
 
     bool retargetSucceeds = true;
@@ -2161,4 +2171,72 @@ TEST(SessionMachineRegression, PlainClientDefaultStillGivesUp) {
         }
         EXPECT_EQ(m.state(), sm::SessionState::Disconnected);
     }
+}
+
+// T15a fix1 I1: a seed session in Backoff must not retry its last (redirected)
+// endpoint forever — that node may be dead while the bootstrap gateway is alive.
+// Kafka-style: attempt 1 retries the current endpoint (fast resume on a still-
+// alive leader); every later even attempt first falls back to the bootstrap
+// endpoint, which redirects to the current leader.  Clock-driven, no sleeps.
+TEST(SessionMachineRegression, BackoffFallsBackToBootstrapEndpoint) {
+    FakeIo io;
+    auto cfg = foreverConfig();
+    cfg.maxConnectRetries = 0;
+    sm::SessionMachine m(io, cfg);
+    m.connect(T0);
+    m.onConnectResponseRedirect("aeron:udp?endpoint=leader:9", m.correlationId(), T0 + 1);
+    m.onConnectResponse(kOk, 2, 50, m.correlationId(), T0 + 2);
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+    int64_t now = T0 + 2;
+    m.onTransportDisconnected(now);
+    m.tick(++now);  // resume on the (now dead) redirected endpoint
+
+    for (int attempt = 1; attempt <= 6; ++attempt) {
+        now = timeOutUntilNotConnecting(m, cfg, now);
+        ASSERT_EQ(m.state(), sm::SessionState::Backoff);
+        ASSERT_EQ(m.backoffAttempt(), attempt);
+        io.events.clear();
+        now = m.nextAttemptNs();
+        m.tick(now);
+        ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+        if (attempt % 2 == 0) {
+            EXPECT_EQ(io.events, "BS") << "attempt " << attempt
+                                       << ": fall back to bootstrap BEFORE the ConnectRequest";
+        } else {
+            EXPECT_EQ(io.events, "S") << "attempt " << attempt << ": retry the current endpoint";
+        }
+    }
+    EXPECT_EQ(io.bootstrapFallbacks, 3);
+    // The bootstrap gateway answers: Live again.
+    m.onConnectResponse(kOk, 1, 50, m.correlationId(), ++now);
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+
+    // A plain (flag-off) machine never falls back: unchanged behaviour.
+    FakeIo plainIo;
+    sm::SessionMachine plain(plainIo, testConfig());
+    now = goLive(plain, 7, T0);
+    plain.onTransportDisconnected(now);
+    plain.tick(++now);
+    (void)timeOutUntilNotConnecting(plain, testConfig(), now);
+    EXPECT_EQ(plain.state(), sm::SessionState::Disconnected);
+    EXPECT_EQ(plainIo.bootstrapFallbacks, 0);
+}
+
+// T15a fix1 (review m9): disconnect() from Backoff says goodbye and closes.
+TEST(SessionMachineRegression, DisconnectFromBackoffSendsDisconnectAndCloses) {
+    FakeIo io;
+    auto cfg = foreverConfig();
+    cfg.maxConnectRetries = 0;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = goLive(m, 11, T0);
+    m.onTransportDisconnected(now);
+    m.tick(++now);
+    (void)timeOutUntilNotConnecting(m, cfg, now);
+    ASSERT_EQ(m.state(), sm::SessionState::Backoff);
+    io.reset();
+    m.disconnect();
+    EXPECT_EQ(m.state(), sm::SessionState::Closed);
+    auto d = io.lastDisconnect();
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->sessionId, 11);
 }

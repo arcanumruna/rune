@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <future>
@@ -108,9 +109,9 @@ TEST(ShardConfigRegression, DerivesDirPortCoreTermAndKeepsMtu1408) {
     g.base.dataDir       = "/tmp/x";
     g.base.egressChannel = "aeron:udp?endpoint=127.0.0.1:40400";
     g.shardCount         = 4;
-    g.firstCore          = 2;
 
-    const rc::ClientConfig c1 = rs::shardClientConfig(g, 1);
+    // Layout overload: the resolved count + core (assignShardCores' output).
+    const rc::ClientConfig c1 = rs::shardClientConfig(g, 1, 4, 3);
     EXPECT_EQ(c1.dataDir, "/tmp/x/shard-1");
     EXPECT_EQ(c1.egressChannel, "aeron:udp?endpoint=127.0.0.1:40401");
     EXPECT_EQ(c1.runnerMode, rc::RunnerMode::Thread);
@@ -125,7 +126,7 @@ TEST(ShardConfigRegression, DerivesDirPortCoreTermAndKeepsMtu1408) {
     g.base.mtuBytes = rt::kJumboMtuLength;  // explicit opt-in is carried through
     EXPECT_EQ(rs::shardClientConfig(g, 0).mtuBytes, rt::kJumboMtuLength);
 
-    // The layout overload takes the resolved count + core (AUTO / pin = true).
+    EXPECT_EQ(rs::shardClientConfig(g, 1).runnerCore, -1) << "no pinning requested";
     const rc::ClientConfig c2 = rs::shardClientConfig(g, 2, 4, 6);
     EXPECT_EQ(c2.runnerCore, 6);
     EXPECT_EQ(c2.egressChannel, "aeron:udp?endpoint=127.0.0.1:40402");
@@ -444,8 +445,11 @@ TEST(ShardConfigRegression, DriverOnDutyThreadRunsNoDriverOrConductorThread) {
         EXPECT_EQ(processThreadCount() - before, 1) << "only the runner: no driver, no conductor thread";
         EXPECT_FALSE(client.testTransport().usesDriverThread());
         EXPECT_TRUE(client.testTransport().usesConductorInvoker());
-        client.close();  // joins the runner: the counter below has no concurrent writer
-        EXPECT_EQ(client.testTransport().callerPumpViolations(), 0) << "T2: exactly one pumper";
+        // "Exactly one pumper" rests on these two facts (no driver thread, no
+        // conductor thread: the runner is the only thread that can pump) plus
+        // the TSan run of DriverHandoffStartThreadToRunnerIsRaceFree.  fix1:
+        // the old callerPumpViolations() == 0 check was vacuous here — that
+        // counter only moves while a driver THREAD runs, which never exists.
     }
     EXPECT_EQ(processThreadCount(), before);
 }
@@ -557,6 +561,138 @@ TEST(ShardConfigRegression, DriverHandoffStartThreadToRunnerIsRaceFree) {
         ASSERT_TRUE(pumpUntil([&] { return gw->metadataRequests > 0; }));
         gw.reset();
         client.close();
-        EXPECT_EQ(client.testTransport().callerPumpViolations(), 0);
+        std::filesystem::remove_all(g.base.dataDir);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1
+// ---------------------------------------------------------------------------
+
+namespace {
+// Scoped environment override (gtest runs tests serially on one thread).
+struct ScopedEnv {
+    std::string name;
+    ScopedEnv(const char* n, const char* v) : name(n) { ::setenv(n, v, 1); }
+    ~ScopedEnv() { ::unsetenv(name.c_str()); }
+};
+} // namespace
+
+// I1, real transport: the seed session stuck to a leader that died (a retarget
+// of the default publication onto an endpoint nobody listens on) must find its
+// way back through the configured bootstrap gateway once in R1 Backoff, instead
+// of retrying the dead endpoint forever.  Invoker agent + injected duty clock.
+TEST(ShardConfigRegression, SeedBackoffFallsBackToBootstrapGateway) {
+    namespace rca = rune::client::agent;
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = 4100;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = 4101;
+    cfg.transport.dataDir         = uniqueDir("seed_bootstrap");
+    cfg.transport.driverMode      = rt::DriverMode::Invoker;
+    cfg.session.egressChannel     = "aeron:ipc";
+    cfg.session.egressStreamId    = 4101;
+    cfg.session.reconnectForeverAfterLive = true;
+    cfg.session.maxConnectRetries = 0;
+    cfg.session.connectTimeoutNs  = 50'000'000;  // 50 ms of injected time
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    auto gw = std::make_unique<test_support::InvokerGateway>(cfg.transport.dataDir + "/aeron", "aeron:ipc",
+                                                             4100, "aeron:ipc", 4101);
+    int64_t now  = 1'000'000'000;
+    auto drive = [&](int64_t stepNs, auto&& pred) {
+        for (int i = 0; i < 400'000; ++i) {
+            now += stepNs;
+            agent.doWork(now);
+            gw->pump();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    namespace rcs = rune::client::session;
+    ASSERT_TRUE(drive(0, [&] { return gw->ready(); }));
+    ASSERT_TRUE(agent.submitConnect());
+    ASSERT_TRUE(drive(0, [&] { return agent.sessionState() == rcs::SessionState::Connected; }));
+
+    // Stick-to-leader onto a node that then dies: nothing listens on this port.
+    const std::string deadLeader = "aeron:udp?endpoint=127.0.0.1:24799";
+    ASSERT_TRUE(agent.testRetargetSeed(deadLeader));
+    ASSERT_EQ(agent.testTransport().ingressChannel(), deadLeader);
+    const int connectsBefore = gw->connects;
+
+    // The seed session is lost (no inbound frame past the response timeout).
+    now += cfg.session.responseTimeoutNs + 1;
+    // 1 ms of injected time per cycle: resume -> timeouts -> Backoff -> ...
+    ASSERT_TRUE(drive(1'000'000, [&] { return agent.sessionState() == rcs::SessionState::Connected; }))
+        << "never reconnected: every Backoff attempt went to the dead leader";
+    EXPECT_GT(gw->connects, connectsBefore) << "the bootstrap gateway saw the reconnect";
+    EXPECT_EQ(agent.testTransport().ingressChannel(), "aeron:ipc") << "seed is back on the bootstrap";
+    gw.reset();
+    agent.stop();
+    std::filesystem::remove_all(cfg.transport.dataDir);
+}
+
+// Review m4: the size checks must see the configuration the driver will really
+// get, i.e. AFTER the RUNE_* env overrides — and still before any driver starts.
+TEST(ShardConfigRegression, EnvOverridesValidatedBeforeAnyDriverStarts) {
+    rs::ShardGroupConfig g = ipcGroup(4110, 4111, 2, rs::ShardMode::Agent);
+    EXPECT_NO_THROW(rs::validateShardGroupConfig(g, 2));
+    {
+        // SO_RCVBUF 64 KiB < Aeron's 128 KiB receive window: the driver would refuse.
+        ScopedEnv env("RUNE_AERON_SOCKET_BUFFER_BYTES", "65536");
+        try {
+            rs::validateShardGroupConfig(g, 2);
+            FAIL() << "the env override must be validated";
+        } catch (const std::invalid_argument& e) {
+            EXPECT_NE(std::string(e.what()).find("shard 0"), std::string::npos) << e.what();
+        }
+    }
+    {
+        ScopedEnv env("RUNE_CLIENT_AERON_MTU", "1000");  // not a multiple of 32
+        EXPECT_THROW(rs::validateShardGroupConfig(g, 2), std::invalid_argument);
+    }
+    EXPECT_NO_THROW(rs::validateShardGroupConfig(g, 2));
+    EXPECT_FALSE(std::filesystem::exists(g.base.dataDir)) << "nothing was started";
+}
+
+// Review m5: the single-index overload applies exactly assignShardCores' rules
+// (it used to ignore pin = true and skip the mask / platform / Invoker checks).
+TEST(ShardConfigRegression, SingleIndexOverloadAppliesCoreChecks) {
+    rs::ShardGroupConfig g;
+    g.shardCount = 2;
+    g.mode       = rs::ShardMode::Invoker;
+    g.firstCore  = 0;
+    EXPECT_THROW((void)rs::shardClientConfig(g, 0), std::invalid_argument)
+        << "Invoker: the app pins its own thread (assignShardCores rejects it)";
+
+    g.mode      = rs::ShardMode::Agent;
+    g.firstCore = -1;
+    g.pin       = true;
+    const rs::CpuSet allowed = rs::platformAllowedCpus();
+    bool expectThrow = false;
+    std::vector<int32_t> expectCores;
+    try {
+        expectCores = rs::assignShardCores(g, 2, allowed, rs::platformPinningSupported());
+    } catch (const std::invalid_argument&) {
+        expectThrow = true;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (expectThrow) {
+            EXPECT_THROW((void)rs::shardClientConfig(g, i), std::invalid_argument)
+                << "pin = true must not silently become 'not pinned'";
+        } else {
+            EXPECT_EQ(rs::shardClientConfig(g, i).runnerCore, expectCores[i]);
+        }
+    }
+
+    // firstCore outside the mask is rejected by the overload too (Linux), and
+    // rejected outright where pinning is unsupported (macOS).
+    g.pin       = false;
+    g.firstCore = allowed.back() + 1;
+    EXPECT_THROW((void)rs::shardClientConfig(g, 0), std::invalid_argument);
+
+    // No pinning requested: nobody is pinned.
+    g.firstCore = -1;
+    EXPECT_EQ(rs::shardClientConfig(g, 1).runnerCore, -1);
 }

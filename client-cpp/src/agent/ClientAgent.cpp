@@ -805,6 +805,24 @@ bool SessionEndpointIo::retarget(const std::string& /*newIngressChannel*/) noexc
     return true;
 }
 
+bool SessionEndpointIo::retargetToBootstrap() noexcept {
+    // Only the seed session's endpoint is the transport's default publication,
+    // which redirects / stick-to-leader retarget.  A leader session addresses its
+    // own endpoint explicitly and is re-routed by metadata: nothing to undo.
+    if (endpoint != agent->cfg_.transport.ingressChannel) return true;
+    return agent->retargetSeedToBootstrap_();
+}
+
+bool ClientAgent::retargetSeedToBootstrap_() noexcept {
+    const std::string& bootstrap = cfg_.transport.ingressChannel;  // never retargeted
+    if (transport_.ingressChannel() == bootstrap) return true;
+    if (!transport_.retarget(bootstrap)) return false;  // old pub intact; next attempt retries
+    Session& seed             = seedSession();
+    seed.currentLeaderChannel = bootstrap;
+    seed.currentLeaderNode    = -1;  // unknown until the gateway redirects us again
+    return true;
+}
+
 bool ClientAgent::offerControlTo(const std::string& channel,
                                  const uint8_t* buf, std::size_t len) noexcept {
     // Seed endpoint == transport default ingress channel → byte-identical default
