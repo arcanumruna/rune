@@ -46,6 +46,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1686,6 +1687,12 @@ class GatewayLargeBatchPushRegression
 public:
     void SetUp() override {
         GatewaySubscribeFixture::SetUp();
+        // The passive test client sends no keepalives; session liveness is not
+        // under test, and multi-MiB pushes under TSan/Debug can outlast the
+        // 10 s default idle timeout (the session would be reaped mid-drain).
+        gw_ = std::make_unique<ClientGateway>(aeron_, "aeron:ipc", kIngressStream, kThisNodeId,
+                                              /*sessionTimeoutNs=*/std::numeric_limits<int64_t>::max() / 2);
+        gw_->setTopicRegistry(registry_.get());
         if (GetParam()) {
             ownedPool_ = std::make_unique<rune::node::WorkerPool>(
                 1, rune::metadata::ShardRouter(1));
