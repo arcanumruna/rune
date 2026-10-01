@@ -143,6 +143,15 @@ public:
         if (limit > committedLimit_) committedLimit_ = limit;
     }
 
+    /// Re-arm the gate at a coordinator LOAD: nothing may be handed out until a
+    /// ceiling written by THIS load commits (a limit committed by an earlier
+    /// load of this node is never reused, even though the reseed would already
+    /// place nextId() above it).
+    void resetGate() noexcept {
+        gated_          = true;
+        committedLimit_ = 0;
+    }
+
     /// True once commitLimit() has been called (allocation is ceiling-gated).
     [[nodiscard]] bool gated() const noexcept { return gated_; }
 

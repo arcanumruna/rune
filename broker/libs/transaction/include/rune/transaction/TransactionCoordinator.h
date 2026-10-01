@@ -111,6 +111,8 @@ struct InitProducerIdResult {
     static constexpr int kOk                    = 0;
     static constexpr int kInvalidTxnTimeout     = 5;
     static constexpr int kConcurrentTransactions = 6;
+    /// The producerId space is exhausted (INT64_MAX) — NOT retriable.
+    static constexpr int kProducerIdsExhausted   = 7;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -527,6 +529,9 @@ private:
     /// Prepare* → markersPending; a CompleteAbort that still carries a deferred
     /// overflow pid swap adopts it (Complete* is otherwise kept as-is).
     static void adoptRecovered_(TransactionMetadata& m) noexcept;
+
+    /// Map an allocator failure sentinel to the InitProducerId answer.
+    static InitProducerIdResult allocationFailure_(ProducerId sentinel) noexcept;
 
     /// Validate epoch and PID match; returns errorCode (0 = ok).
     [[nodiscard]] int validateEpochAndPid(const TransactionMetadata& meta,

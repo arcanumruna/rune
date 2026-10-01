@@ -213,7 +213,7 @@ TEST_F(TxnCoordTest, ReInitOngoingTxnDrivesToPrepareAbort)
     EXPECT_EQ(coord_.state("txn-1"), TxnState::PrepareAbort);
 }
 
-TEST_F(TxnCoordTest, ReInitOngoingThenCompleteResetsToEmpty)
+TEST_F(TxnCoordTest, ReInitOngoingThenCompleteRestsInCompleteAbort)
 {
     auto r = coord_.initProducerId("txn-1", kDefaultTimeoutMs, nowNs_);
     ASSERT_TRUE(r.ok());
@@ -340,17 +340,18 @@ TEST_F(TxnCoordTest, AddPartitionsWhenPrepareAbortIsInvalidTransition)
     EXPECT_EQ(ar.errorCode, AddPartitionsResult::kInvalidTransition);
 }
 
-TEST_F(TxnCoordTest, AddPartitionsWhenCompleteCommitIsInvalidTransition)
+TEST_F(TxnCoordTest, AddPartitionsWhenCompleteCommitStartsTheNextTxn)
 {
-    // Setup: full commit path.
+    // F15 §5.4: CompleteCommit is the resting state; addPartitions → Ongoing.
     auto r = coord_.initProducerId("txn-1", kDefaultTimeoutMs, nowNs_);
     coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
                          tps({tp("t", 0)}), nowNs_);
     coord_.endTransaction("txn-1", r.producerId, r.producerEpoch, true, nowNs_);
-    // At PrepareCommit — force transition to CompleteCommit by not completing.
-    // Actually CompleteCommit is not directly reachable without completeTransaction.
-    // Test: add while PrepareCommit (already tested above). Skip.
-    SUCCEED();
+    ASSERT_TRUE(coord_.completeTransaction("txn-1").ok());
+    ASSERT_EQ(coord_.state("txn-1"), TxnState::CompleteCommit);
+    EXPECT_TRUE(coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
+                                     tps({tp("t", 1)}), nowNs_).ok());
+    EXPECT_EQ(coord_.state("txn-1"), TxnState::Ongoing);
 }
 
 // ===========================================================================
@@ -381,7 +382,7 @@ TEST_F(TxnCoordTest, EndTransactionCommitExposesPartitions)
     EXPECT_EQ(er.partitions.size(), 2u);
 }
 
-TEST_F(TxnCoordTest, CompleteCommitTransitionsThenEmpty)
+TEST_F(TxnCoordTest, CompleteCommitRestsInCompleteCommit)
 {
     auto r = coord_.initProducerId("txn-1", kDefaultTimeoutMs, nowNs_);
     coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
@@ -423,7 +424,7 @@ TEST_F(TxnCoordTest, EndTransactionAbortOngoingToPrepareAbort)
     EXPECT_EQ(coord_.state("txn-1"), TxnState::PrepareAbort);
 }
 
-TEST_F(TxnCoordTest, CompleteAbortTransitionsThenEmpty)
+TEST_F(TxnCoordTest, CompleteAbortRestsInCompleteAbort)
 {
     auto r = coord_.initProducerId("txn-1", kDefaultTimeoutMs, nowNs_);
     coord_.addPartitions("txn-1", r.producerId, r.producerEpoch,
@@ -1286,7 +1287,7 @@ TEST_F(TxnCoordTest, TimeoutAbortNoPartitionLeftUnmarked)
         EXPECT_TRUE(captured.contains(tp("t", i)))
             << "Partition t/" << i << " must have an ABORT marker";
     }
-    // All states must be Empty.
+    // F15 §5.4: all rest in CompleteAbort.
     for (int i = 0; i < 4; ++i) {
         EXPECT_EQ(coord_.state("txn-multi-" + std::to_string(i)), TxnState::CompleteAbort);
     }
@@ -1653,7 +1654,7 @@ TEST_F(TxnCoordTest, ReInitWhilePrepareAbortReturnsConcurrentTransactions)
     EXPECT_EQ(coord_.state("txn-c4"), TxnState::PrepareAbort);
 }
 
-TEST_F(TxnCoordTest, ReInitWhileCompleteCommitReturnsConcurrentTransactions)
+TEST_F(TxnCoordTest, ReInitWhileCompleteCommitBumpsTheEpoch)
 {
     // P5-5 LIVENESS FIX: A recovered CompleteCommit is now collapsed to Empty in
     // the constructor (crash-in-two-write-window fix).  A LIVE (in-memory-only)
@@ -1852,7 +1853,7 @@ TEST_F(TxnCoordTest, TimeoutAbortWritesAbortMarkersToAllPartitions_T1)
 // T2 — AddPartitionsWhenCompleteCommitIsInvalidTransition — replace vacuous SUCCEED()
 // ===========================================================================
 
-TEST(TxnCoordAuditT2Test, AddPartitionsWhenCompleteCommitIsInvalidTransition)
+TEST(TxnCoordAuditT2Test, AddPartitionsOnRecoveredCompleteCommitStartsOngoing)
 {
     // P5-5 LIVENESS FIX: a recovered CompleteCommit is now collapsed to Empty.
     // This means addPartitions is now a VALID transition (Empty→Ongoing), not
@@ -2060,7 +2061,7 @@ static void injectState(const std::string& path, const std::string& txnId,
     log.append(e);
 }
 
-TEST(TxnCoordAuditA3StateTest, ReInitInCompleteAbortReturnsConcurrent)
+TEST(TxnCoordAuditA3StateTest, ReInitInCompleteAbortBumpsTheEpoch)
 {
     // P5-5 LIVENESS FIX: a recovered CompleteAbort is now collapsed to Empty in
     // the constructor (crash-in-two-write-window fix).  The txnId is NOT wedged.
@@ -2778,7 +2779,7 @@ TEST(TxnCoordP55LivenessTest, RecoveredCompleteCommitCollapsedToEmpty_NotWedged)
     TransactionCoordinator coord2(ProducerIdAllocator{}, 60'000, &log2,
                                   /*coordinatorEpoch=*/0, cb);
 
-    // KEY ASSERTION 1: state must be Empty (not CompleteCommit).
+    // KEY ASSERTION 1: the recovered CompleteCommit is the resting state (F15 §5.4).
     ASSERT_TRUE(coord2.state("wedge-txn").has_value());
     EXPECT_EQ(coord2.state("wedge-txn"), TxnState::CompleteCommit)
         << "a recovered CompleteCommit stays the resting state (F15 §5.4)";
@@ -2827,7 +2828,7 @@ TEST(TxnCoordP55LivenessTest, RecoveredCompleteAbortCollapsedToEmpty_NotWedged)
     TransactionLog log2(path);
     TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2, 0);
 
-    // State must be Empty.
+    // F15 §5.4: the resting CompleteAbort.
     ASSERT_TRUE(coord.state("abort-wedge").has_value());
     EXPECT_EQ(coord.state("abort-wedge"), TxnState::CompleteAbort)
         << "a recovered CompleteAbort stays the resting state (F15 §5.4)";
@@ -2873,7 +2874,7 @@ TEST(TxnCoordP55LivenessTest, RecoveredCompleteAbortWithPendingNewPid_AdoptsDefe
     TransactionLog log2(path);
     TransactionCoordinator coord(ProducerIdAllocator{500}, 60'000, &log2, 0);
 
-    // State must be Empty.
+    // F15 §5.4: the resting CompleteAbort.
     ASSERT_TRUE(coord.state("overflow-abort-wedge").has_value());
     EXPECT_EQ(coord.state("overflow-abort-wedge"), TxnState::CompleteAbort)
         << "a recovered CompleteAbort+pendingNewPid stays the resting state, swap adopted";

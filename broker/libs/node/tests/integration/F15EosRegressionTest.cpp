@@ -21,6 +21,7 @@
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/LogCleaner.h>
 #include <rune/transaction/ControlMarker.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 
@@ -183,7 +184,7 @@ struct EosRig {
     // The coordinator's marker dispatch (gateway → owning worker).
     void abortMarker(int64_t pid, int16_t epoch, int64_t now) {
         const auto m = tx::ControlMarker::build(pid, epoch, tx::ControlType::Abort, 0);
-        ASSERT_EQ(gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), pid, /*commit=*/false),
+        ASSERT_EQ(gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), pid, /*commit=*/false, /*coordinatorEpoch=*/0),
                   rune::gateway::ClientGateway::kControlRecordAsync);
         for (int i = 0; i < 64 && gw.markersInFlightForTest() > 0; ++i) runWorker(now + i);
         ASSERT_EQ(gw.markersInFlightForTest(), 0u) << "the marker reply reached the gateway";
@@ -319,7 +320,7 @@ TEST(ControlBatchRegression, GatewayInlineMarkerLandsAsControlBatch) {
     gw.setTopicRegistry(&topics);
     gw.setReplicaRegistry(&reg);
     const auto marker = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
-    ASSERT_EQ(gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, false), 0);
+    ASSERT_EQ(gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, false, /*coordinatorEpoch=*/0), 0);
     EXPECT_TRUE(logHoldsControlBatchAt0(*topics.log(0, 0))) << "the inline replica path wraps the marker as data";
 }
 
@@ -697,7 +698,7 @@ TEST(MarkerRoutingRegression, LegacyModeMarkerAppendedByOwningWorker) {
     // thread.  Observable: the log is untouched until the worker runs.
     LegacyRig R;
     const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
-    const int64_t rc = R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false);
+    const int64_t rc = R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false, /*coordinatorEpoch=*/0);
     EXPECT_EQ(R.r->log()->logEndOffset(), 0)
         << "the control thread appended the marker inline to a worker-owned log (write-write race)";
     EXPECT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync) << "the marker must be routed to the worker";
@@ -715,7 +716,7 @@ TEST(MarkerRoutingRegression, LegacyMarkerLandsAfterQueuedProduce) {
     R.produce(sid, 1);
     ASSERT_EQ(R.r->log()->logEndOffset(), 0) << "precondition: the produce is queued on the worker's op ring";
     const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
-    const int64_t rc = R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false);
+    const int64_t rc = R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false, /*coordinatorEpoch=*/0);
     for (int i = 0; i < 64 && (R.gw.markersInFlightForTest() > 0 || R.produced.empty()); ++i) R.runWorker(10 + i);
     ASSERT_EQ(R.produced.size(), 1u);
     ASSERT_EQ(R.produced[0].first, 0) << "the produce succeeded";
@@ -744,7 +745,7 @@ TEST(ControlBatchRegression, MarkerAppendRequestsFlush) {
         LegacyRig R(/*tier=*/2);
         const uint64_t before = R.w().ioSubmitCountForTest();
         const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
-        (void)R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false);
+        (void)R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false, /*coordinatorEpoch=*/0);
         for (int i = 0; i < 64 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
         ASSERT_EQ(R.r->log()->logEndOffset(), 1);
         EXPECT_GT(R.w().ioSubmitCountForTest(), before)
@@ -1109,4 +1110,142 @@ TEST(TxnPidBlockRegression, AllocationWaitsForCommittedCeiling) {
     const auto ok = R.initPid("t");
     EXPECT_EQ(ok.err, 0) << "allocates once the ceiling is committed";
     EXPECT_GE(ok.pid, 0);
+}
+
+// ============================================================================
+// F15 S7 fix round 1 — I1: the pid block ceiling record is COMPACTED to the
+// latest (reserved non-empty key); concern 3: the fence flag survives a reload.
+// ============================================================================
+namespace {
+// Every record value in [0, LEO) of `log`, across all segments.
+std::vector<std::string> allValues(Log& log) {
+    std::vector<std::string> out;
+    int64_t off = 0;
+    for (int guard = 0; guard < 100'000 && off < log.logEndOffset(); ++guard) {
+        const auto raw = log.read(off, 1 << 20);
+        if (raw.empty()) {                                   // a compaction gap: next segment base
+            int64_t nextBase = -1;
+            for (const auto b : log.segmentBaseOffsets()) if (b > off) { nextBase = b; break; }
+            if (nextBase < 0) break;
+            off = nextBase;
+            continue;
+        }
+        std::size_t pos = 0;
+        int64_t next = off;
+        while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= raw.size()) {
+            rune::protocol::RecordBatchReader rd(raw.data() + pos, raw.size() - pos);
+            const int32_t total = rd.totalLength();
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > raw.size()) break;
+            rd.forEach([&](std::string_view, std::string_view v, int64_t, int64_t) { out.emplace_back(v); });
+            next = rd.baseOffset() + rd.lastOffsetDelta() + 1;
+            pos += static_cast<std::size_t>(total);
+        }
+        if (next <= off) break;
+        off = next;
+    }
+    return out;
+}
+int countCeilingRecords(Log& log) {
+    int n = 0;
+    for (const auto& v : allValues(log)) {
+        uint32_t magic = 0;
+        if (v.size() >= 4) std::memcpy(&magic, v.data(), 4);
+        if (magic == tx::ReplicatedTxnStateStore::kPidBlockMagic) ++n;
+    }
+    return n;
+}
+} // namespace
+
+TEST(TxnPidBlockRegression, CeilingRecordIsCompactedToLatest) {
+    // §5.6 "Compaction keeps the latest": every ceiling record shares one
+    // compaction key, so a clean leaves exactly the newest (= the max: ceilings
+    // are monotone) and the load scan stays bounded.
+    TmpDir d;
+    Log log(d.path.string(), /*segmentBytes=*/1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1, 1, 99, 0), Role::Leader, 1, {1}, {1}, &log, &t);
+    tx::ReplicatedTxnStateStore store(&rep);
+    for (int64_t c = 1000; c <= 5000; c += 1000) ASSERT_GE(store.putPidBlockCeiling(c), 0);
+    tx::TransactionMetadata pad;
+    pad.txnId = "pad"; pad.producerId = 1; pad.producerEpoch = 0;
+    while (log.segmentBaseOffsets().size() < 3) ASSERT_TRUE(store.put(pad, 1));
+    ASSERT_EQ(countCeilingRecords(log), 5) << "precondition: five ceilings before the clean";
+    rune::storage::LogCleaner cleaner;
+    cleaner.clean(log, 0, log.segmentBaseOffsets().back(), /*nowNs=*/0, /*deleteRetentionMs=*/1'000'000);
+    log.reloadSegments();
+    EXPECT_EQ(countCeilingRecords(log), 1) << "the cleaner must keep only the latest ceiling record";
+    tx::ReplicatedTxnStateStore reloaded(&rep);
+    reloaded.rebuildFromLog();
+    EXPECT_EQ(reloaded.persistedPidCeiling(), 5000) << "the surviving record is the max ceiling";
+    ASSERT_NE(reloaded.get("pad"), nullptr) << "transactional records still fold";
+}
+
+TEST(TxnPidBlockRegression, ReservedKeyIsNotATransactionalId) {
+    // The ceiling record's compaction key may never be a transactional id: a txn
+    // record under it would be compacted against (or instead of) the ceiling.
+    CoordRig R(Role::Leader, 1, {1}, {1});
+    ASSERT_EQ(R.initPid("ok").err, 0) << "precondition: loaded, ceiling committed";
+    const int64_t leo = R.log->logEndOffset();
+    const std::string reserved = std::string("\xFF") + "__rune_pid_block";
+    const auto r = R.initPid(reserved);
+    EXPECT_NE(r.err, 0) << "the reserved ceiling key was accepted as a transactional id";
+    EXPECT_NE(r.err, kConcurrent) << "non-retriable";
+    EXPECT_EQ(R.log->logEndOffset(), leo) << "nothing persisted under the reserved key";
+    EXPECT_EQ(R.store->get(reserved), nullptr);
+}
+
+TEST(TxnCoordinatorLoadRegression, FenceCallerAnswerSurvivesReload) {
+    // Concern 3: the fence flag is persisted (header byte 27), so after a reload
+    // the fence caller's EndTxn gets the same answer as before the reload: 27
+    // (retriable), never 19.
+    auto endTxnAfterFence = [](bool reload) {
+        CoordRig R(Role::Leader, 1, {1}, {1});
+        const auto ip = R.initPid("t-fence");
+        EXPECT_EQ(ip.err, 0);
+        EXPECT_EQ(R.addPartition("t-fence", ip), 0);
+        const auto fence = R.initPid("t-fence");             // fences the Ongoing txn → PrepareAbort
+        EXPECT_EQ(fence.err, 0);
+        if (reload) R.newCoordinator();
+        pc::EndTxn q; q.sessionId = 1; q.correlationId = ++R.corr; q.producerId = fence.pid;
+        q.producerEpoch = fence.epoch; q.commit = 1;
+        const std::string id = "t-fence";
+        q.transactionalId = {reinterpret_cast<const uint8_t*>(id.data()), id.size()};
+        std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
+        const auto n = R.tcs->handleEndTxn(f.data(), f.size(), 2, R.out.data(), R.out.size());
+        auto r = pc::EndTxnResponse::decode(R.out.data(), n);
+        return r ? r->errorCode : int16_t{-1};
+    };
+    const int16_t noReload = endTxnAfterFence(false);
+    ASSERT_EQ(noReload, kConcurrent) << "precondition: the resident answer";
+    EXPECT_EQ(endTxnAfterFence(true), noReload) << "the fence flag was lost on reload";
+}
+
+TEST(TxnStateStoreRegression, RebuildCrossesCompactionGaps) {
+    // Found on sight (fix round 1): after compaction a sealed segment's
+    // superseded TAIL records are gone, so a read inside that segment past its
+    // last survivor returns nothing.  rebuildFromLog stopped there and silently
+    // dropped every later segment's txn state (a coordinator failover would
+    // lose committed transactions).  It must skip to the next segment base, as
+    // ReplicatedOffsetStore (CP-4) and ProducerStateManager (CP-3) do.
+    TmpDir d;
+    Log log(d.path.string(), /*segmentBytes=*/1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1, 1, 99, 0), Role::Leader, 1, {1}, {1}, &log, &t);
+    tx::ReplicatedTxnStateStore store(&rep);
+    tx::TransactionMetadata m;
+    m.producerEpoch = 0;
+    m.txnId = "early"; m.producerId = 1; ASSERT_TRUE(store.put(m, 1));
+    m.txnId = "churn"; m.producerId = 2;
+    for (int i = 0; i < 4; ++i) ASSERT_TRUE(store.put(m, 1));   // superseded tail of segment 0
+    while (log.segmentBaseOffsets().size() < 2) ASSERT_TRUE(store.put(m, 1));
+    m.txnId = "late"; m.producerId = 3; m.state = tx::TxnState::PrepareCommit;
+    while (log.segmentBaseOffsets().size() < 3) ASSERT_TRUE(store.put(m, 1));
+    rune::storage::LogCleaner cleaner;
+    cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
+    log.reloadSegments();
+    tx::ReplicatedTxnStateStore reloaded(&rep);
+    reloaded.rebuildFromLog();
+    EXPECT_NE(reloaded.get("early"), nullptr);
+    ASSERT_NE(reloaded.get("late"), nullptr) << "the rebuild stopped at a compaction gap";
+    EXPECT_EQ(reloaded.get("late")->state, tx::TxnState::PrepareCommit);
 }

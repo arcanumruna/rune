@@ -163,7 +163,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
         tx::ProducerId base = txnState_->persistedPidCeiling();
         if (maxPid + 1 > base) base = maxPid + 1;
         if (base > 0) coordinator_.allocator().reseedAtLeast(base - 1);
-        coordinator_.allocator().commitLimit(0);          // gated from now on
+        coordinator_.allocator().resetGate();             // gated; no limit from an earlier load
         pidCeilingPending_       = -1;
         pidCeilingPendingOffset_ = -1;
     }
@@ -299,6 +299,17 @@ size_t TransactionCoordinationService::handleInitProducerId(
             reinterpret_cast<const char*>(msg.transactionalId.data()),
             msg.transactionalId.size());
         txnIdOpt = txnIdScratch_;
+    }
+
+    // F15 I1: the pid block ceiling's reserved compaction key is never a
+    // transactional id (a txn record under it would be compacted against the
+    // ceiling).  Non-retriable, nothing created or persisted.
+    if (txnIdOpt.has_value() && tx::ReplicatedTxnStateStore::isReservedKey(*txnIdOpt)) {
+        resp.producerId    = -1;
+        resp.producerEpoch = -1;
+        resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
+        if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return 0;
+        return resp.encode(out);
     }
 
     // Call coordinator.

@@ -388,7 +388,7 @@ TEST_F(TxnMarkerDirectTest, WriteMarkersCommitLandsOnEachPartition) {
     EXPECT_TRUE(lastBatchIsControl(&log1_))
         << "[TX-4] Partition 1 log should end with a COMMIT control batch";
 
-    // The local coordinator should now be in CompleteCommit → Empty.
+    // The local coordinator should now rest in CompleteCommit (F15 §5.4).
     const auto state = localCoord.state("tx_commit");
     ASSERT_TRUE(state.has_value());
     EXPECT_EQ(*state, tx::TxnState::CompleteCommit)
@@ -488,7 +488,8 @@ TEST_F(TxnMarkerDirectTest, ResolvePendingMarkersResolvesPrepareAbort) {
 // Test 4: doWork with the appendFnOverride test seam resolves a timeout-aborted
 // txn end-to-end: coordinator timeout → PrepareAbort (markersPending=true) →
 // doWork drives resolvePendingMarkers via the override → ABORT control batches
-// land on both participant partition logs → txn transitions to Empty.
+// land on both participant partition logs; the txn stays PrepareAbort
+// (the override seam observes appends, not commits — F15 S7).
 //
 // This is a REAL integration test of the doWork→resolvePendingMarkers path.
 // The appendFnOverride seam is used instead of a real ClientGateway to avoid

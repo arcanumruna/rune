@@ -81,6 +81,18 @@ void TransactionCoordinator::adoptRecovered_(TransactionMetadata& m) noexcept
 }
 
 // ---------------------------------------------------------------------------
+// allocationFailure_ — F15 I7: a block not yet committed is retriable (27);
+// an exhausted producerId space is not.
+// ---------------------------------------------------------------------------
+InitProducerIdResult TransactionCoordinator::allocationFailure_(ProducerId sentinel) noexcept
+{
+    return { .producerId = -1, .producerEpoch = -1,
+             .errorCode  = sentinel == ProducerIdAllocator::kBlockNotCommitted
+                               ? InitProducerIdResult::kConcurrentTransactions
+                               : InitProducerIdResult::kProducerIdsExhausted };
+}
+
+// ---------------------------------------------------------------------------
 // Internal: persist transition to the durable log (fsync before return).
 // ---------------------------------------------------------------------------
 namespace {
@@ -117,11 +129,7 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     // No transactional id → fresh producer, no state machine entry.
     if (!txnId.has_value() || txnId->empty()) {
         ProducerId pid   = allocator_.allocate();
-        if (pid < 0) {
-            // F15 I7: the next block's ceiling is not committed yet — retriable.
-            return { .producerId = -1, .producerEpoch = -1,
-                     .errorCode  = InitProducerIdResult::kConcurrentTransactions };
-        }
+        if (pid < 0) return allocationFailure_(pid);
         return { .producerId = pid, .producerEpoch = 0, .errorCode = 0 };
     }
 
@@ -131,10 +139,7 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     if (meta == nullptr) {
         // Unknown txnId → create new metadata (Empty, epoch 0).
         ProducerId pid = allocator_.allocate();
-        if (pid < 0) {
-            return { .producerId = -1, .producerEpoch = -1,
-                     .errorCode  = InitProducerIdResult::kConcurrentTransactions };
-        }
+        if (pid < 0) return allocationFailure_(pid);
         TransactionMetadata newMeta;
         newMeta.txnId             = id;
         newMeta.producerId        = pid;
@@ -169,11 +174,7 @@ InitProducerIdResult TransactionCoordinator::initProducerId(
     if (meta->producerEpoch == INT16_MAX) {
         // Epoch space exhausted — allocate a fresh PID.
         newPid   = allocator_.allocate();
-        if (newPid < 0) {
-            // F15 I7: no committed pid block — retriable, nothing mutated.
-            return { .producerId = -1, .producerEpoch = -1,
-                     .errorCode  = InitProducerIdResult::kConcurrentTransactions };
-        }
+        if (newPid < 0) return allocationFailure_(newPid);   // nothing mutated
         newEpoch = 0;
     } else {
         newEpoch = static_cast<ProducerEpoch>(meta->producerEpoch + 1);

@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rune::transaction {
@@ -113,10 +114,13 @@ public:
 
     /// F15 I7 (Kafka ProducerIdManager): append a pid BLOCK CEILING record —
     /// every producerId below @p ceiling may have been handed out.  The record
-    /// is identified by its own record-type tag (kPidBlockMagic in the value
-    /// header), never by its key, so it can never collide with a transactional
-    /// id; its key is empty, so compaction never drops it (one record per
-    /// block: bounded by the pid issue rate / kBlockSize).
+    /// is recognised by its own record-type tag (kPidBlockMagic in the value
+    /// header) and written under the RESERVED compaction key kPidBlockKey, so
+    /// the LogCleaner keeps only the latest ceiling (= the max: ceilings are
+    /// monotone) and the load scan stays bounded.  kPidBlockKey can never be a
+    /// transactional id: its leading 0xFF byte is never valid UTF-8 (Kafka
+    /// STRING) and InitProducerId rejects it explicitly
+    /// (isReservedKey) — metadata is only ever created there.
     /// \returns the record's offset (commit it by HW > offset), or -1 if the
     ///          replica is min-ISR-gated.
     rune::replication::Offset putPidBlockCeiling(ProducerId ceiling);
@@ -126,6 +130,12 @@ public:
 
     /// Value-header tag of a pid block ceiling record ("PIDB", little-endian).
     static constexpr uint32_t kPidBlockMagic = 0x42444950u;
+
+    /// Reserved compaction key of the pid block ceiling record.
+    static constexpr std::string_view kPidBlockKey{"\xFF__rune_pid_block", 17};
+
+    /// True for a key reserved by this store (never a valid transactional id).
+    [[nodiscard]] static bool isReservedKey(std::string_view txnId) noexcept { return txnId == kPidBlockKey; }
 
 private:
     // -----------------------------------------------------------------------

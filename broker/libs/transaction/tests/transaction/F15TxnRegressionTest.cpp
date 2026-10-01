@@ -429,3 +429,50 @@ TEST(TxnPidBlockRegression, GatedAllocatorRefusesAboveTheCommittedCeiling) {
     ASSERT_TRUE(ok.ok());
     EXPECT_EQ(ok.producerId, 2);
 }
+
+// F15 S7 fix round 1 (concern 3): the fence flag survives a disk-log replay —
+// the fence caller's answers are the same with and without a restart.
+TEST(TxnEndTxnTableRegression, FenceAnswersSurviveTransactionLogReplay) {
+    TmpDir d;
+    const auto path = (d.path / "txn.log").string();
+    ProducerId pid = -1; ProducerEpoch epoch = -1;
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+        const auto ip = coord.initProducerId(std::string("t-fl"), 60'000, 0);
+        ASSERT_TRUE(coord.addPartitions("t-fl", ip.producerId, ip.producerEpoch, {TopicPartition{"t", 0}}, 0).ok());
+        const auto fence = coord.initProducerId(std::string("t-fl"), 60'000, 0);
+        ASSERT_TRUE(fence.ok());
+        pid = fence.producerId; epoch = fence.producerEpoch;
+    }
+    {
+        TransactionLog log(path);
+        TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+        ASSERT_EQ(coord.state("t-fl"), TxnState::PrepareAbort);
+        EXPECT_EQ(coord.endTransaction("t-fl", pid, epoch, true, 0).errorCode,
+                  EndTransactionResult::kConcurrentTransactions) << "fence caller after replay: 27, not 19";
+        ASSERT_TRUE(coord.completeTransaction("t-fl").ok());
+    }
+    TransactionLog log(path);
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, &log);
+    ASSERT_EQ(coord.state("t-fl"), TxnState::CompleteAbort);
+    EXPECT_EQ(coord.endTransaction("t-fl", pid, epoch, true, 0).errorCode,
+              EndTransactionResult::kInvalidPid) << "COMMIT after a fence's abort, after replay: 18, not 19";
+}
+
+TEST(TxnPidBlockRegression, ExhaustedPidSpaceIsNotRetriable) {
+    TransactionCoordinator coord(ProducerIdAllocator{INT64_MAX}, 60'000);
+    EXPECT_EQ(coord.initProducerId(std::nullopt, 60'000, 0).errorCode, InitProducerIdResult::kProducerIdsExhausted);
+    EXPECT_EQ(coord.initProducerId(std::string("x"), 60'000, 0).errorCode, InitProducerIdResult::kProducerIdsExhausted);
+}
+
+TEST(TxnPidBlockRegression, ResetGateDropsAnEarlierLoadsLimit) {
+    ProducerIdAllocator a;
+    a.commitLimit(1000);
+    ASSERT_EQ(a.allocate(), 0);
+    a.resetGate();                                            // a new coordinator load
+    EXPECT_EQ(a.allocate(), ProducerIdAllocator::kBlockNotCommitted)
+        << "only a ceiling committed by THIS load may be used";
+    a.commitLimit(2000);
+    EXPECT_EQ(a.allocate(), 1);
+}

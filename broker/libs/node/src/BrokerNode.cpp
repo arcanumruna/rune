@@ -1583,7 +1583,9 @@ void BrokerNode::buildGateway() {
 
             txnState_ = std::make_unique<rune::transaction::ReplicatedTxnStateStore>(
                 txnReplicaRaw);
-            txnState_->rebuildFromLog();
+            // F15 §5.1: no startup fold — the TransactionCoordinationService
+            // folds the store at its coordinator LOAD (txn replica Leader,
+            // leadership complete, HW == LEO); nothing reads the store before.
 
             txnCoordService_ = std::make_unique<TransactionCoordinationService>(
                 txnState_.get(),

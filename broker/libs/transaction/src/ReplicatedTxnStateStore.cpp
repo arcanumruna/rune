@@ -11,8 +11,10 @@
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/transaction/detail/Crc32c.h>
 
-#include <rune/protocol/RecordBatch.h>  // RecordBatchReader (for rebuildFromLog)
+#include <rune/protocol/RecordBatch.h>
+#include <rune/storage/Log.h>  // RecordBatchReader (for rebuildFromLog)
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstring>
@@ -28,6 +30,7 @@ namespace {
 static constexpr uint32_t kMagic          = 0x544B4E4Cu;
 static constexpr uint32_t kFixedHeaderSize = 52u;
 static constexpr uint32_t kChecksumSize   = 4u;
+static constexpr uint8_t  kFlagFencing    = 0x01u;   // header byte 27, bit0 (F15)
 
 template<typename T>
 inline void write_le(uint8_t* p, T v) noexcept { std::memcpy(p, &v, sizeof(T)); }
@@ -99,7 +102,9 @@ void ReplicatedTxnStateStore::encodeRecord(
     write_le<int64_t> (p + 16, meta.producerId);
     write_le<int16_t> (p + 24, meta.producerEpoch);
     p[26] = static_cast<uint8_t>(meta.state);
-    p[27] = 0u;
+    // F15 concern 3: flags byte (was always-0 padding, so old records decode as
+    // no flags).  bit0 = fencingEpoch (the txn was ended by an InitProducerId fence).
+    p[27] = meta.fencingEpoch ? kFlagFencing : 0u;
     write_le<int32_t> (p + 28, coordinatorEpoch);
     write_le<int32_t> (p + 32, meta.txnTimeoutMs);
     write_le<uint16_t>(p + 36, txnIdLen);
@@ -183,8 +188,9 @@ rune::replication::Offset ReplicatedTxnStateStore::putPidBlockCeiling(ProducerId
     write_le<uint32_t>(rec.data() + 4, kLen);
     write_le<int64_t> (rec.data() + 8, ceiling);
     write_le<uint32_t>(rec.data() + 16, crc32c(rec.data(), 16));
+    const std::span<const uint8_t> key{reinterpret_cast<const uint8_t*>(kPidBlockKey.data()), kPidBlockKey.size()};
     const rune::replication::Offset base = replica_->appendKeyed(
-        std::span<const uint8_t>{}, std::span<const uint8_t>(rec.data(), rec.size()), /*acksAll=*/true);
+        key, std::span<const uint8_t>(rec.data(), rec.size()), /*acksAll=*/true);
     return base < 0 ? -1 : base;   // persistedPidCeiling_ folds only committed records (rebuild)
 }
 
@@ -240,6 +246,7 @@ void ReplicatedTxnStateStore::applyRecord(std::string_view payload)
     const int64_t   producerId       = read_le<int64_t> (p + 16);
     const int16_t   producerEpoch    = read_le<int16_t> (p + 24);
     const TxnState  state            = static_cast<TxnState>(p[26]);
+    const bool      fencing          = (p[27] & kFlagFencing) != 0;
     const int32_t   coordEpoch       = read_le<int32_t> (p + 28);
     const int32_t   txnTimeoutMs     = read_le<int32_t> (p + 32);
     const uint16_t  txnIdLen         = read_le<uint16_t>(p + 36);
@@ -305,7 +312,7 @@ void ReplicatedTxnStateStore::applyRecord(std::string_view payload)
     meta.pendingNewProducerId    = pendingNewPid;
     meta.pendingNewProducerEpoch = pendingNewEpoch;
     meta.pendingOffsets          = std::move(pendingOffsets);
-    meta.fencingEpoch            = false;
+    meta.fencingEpoch            = fencing;   // F15 concern 3: persisted in byte 27
     // Recovered Prepare* states need markers written (B2 resolution).
     meta.markersPending = (state == TxnState::PrepareCommit
                            || state == TxnState::PrepareAbort);
@@ -330,11 +337,28 @@ void ReplicatedTxnStateStore::rebuildFromLog()
 
     static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB per segment read
 
+    // F15 fix round 1: __transaction_state is COMPACTED.  Start at the first
+    // live segment (a compacted/retained prefix), and when a read inside a
+    // segment returns nothing (its superseded tail was compacted away) skip to
+    // the next segment base instead of stopping — stopping silently dropped all
+    // later segments' txn state.  Mirrors ReplicatedOffsetStore CP-3/CP-4.
+    rune::storage::Log* diskLog = replica_->log();   // null for memory-backed replicas
     rune::replication::Offset fetchOffset = 0;
+    if (diskLog != nullptr) {
+        const auto bases = diskLog->segmentBaseOffsets();
+        if (!bases.empty() && bases.front() > 0) fetchOffset = bases.front();
+    }
 
     while (fetchOffset < hw) {
         std::vector<uint8_t> data = replica_->read(fetchOffset, kChunkBytes);
-        if (data.empty()) break;
+        if (data.empty()) {
+            if (diskLog == nullptr) break;
+            const auto bases = diskLog->segmentBaseOffsets();
+            const auto it = std::upper_bound(bases.begin(), bases.end(), static_cast<int64_t>(fetchOffset));
+            if (it == bases.end()) break;
+            fetchOffset = static_cast<rune::replication::Offset>(*it);
+            continue;
+        }
 
         std::size_t pos = 0;
         rune::replication::Offset lastBatchEnd = fetchOffset; // sentinel: no progress

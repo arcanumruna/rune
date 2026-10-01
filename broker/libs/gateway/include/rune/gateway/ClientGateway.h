@@ -552,9 +552,9 @@ public:
     int64_t appendControlRecord(int32_t                    topicId,
                                 int32_t                    partition,
                                 std::span<const uint8_t>   marker,
-                                int64_t                    producerId = -1,
-                                bool                       commit     = false,
-                                int32_t                    coordinatorEpoch = 0);
+                                int64_t                    producerId,
+                                bool                       commit,
+                                int32_t                    coordinatorEpoch);
 
     /// F15 m3: drop every marker still waiting in markerSendQueue_ (never
     /// handed to a worker) whose coordinatorEpoch < @p olderThan.  Markers
