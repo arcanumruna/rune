@@ -928,7 +928,14 @@ void ProducerImpl::submitFlush() noexcept {
         if (std::this_thread::get_id() != dutyThreadId_ || directClosed_) return;
         // F12: only partitions with buffered work can have anything to flush —
         // O(dirty), not O(partitions).
-        for (const uint32_t slot : dirty_) partitions_[slot]->flushRequested = true;
+        // Only partitions still ON the dirty list: a flush() from a callback during
+        // the flushBatches walk sees the half-compacted list, whose tail holds stale
+        // slots of partitions already removed (dirty=false) — flagging those would
+        // leave a flag nothing clears (later record skips linger; spurious pending).
+        for (const uint32_t slot : dirty_) {
+            auto& ps = *partitions_[slot];
+            if (ps.dirty) ps.flushRequested = true;
+        }
         // fix2 minor 3: flush() covers records already accepted into the
         // deferred arena too — each is flushed when it is applied.
         for (std::size_t r = 0; r < deferred_.tail(); r += deferred_.sizeAt(r)) {
@@ -1763,8 +1770,8 @@ int ProducerImpl::flushBatches(
             // maxInFlight gates ALL flushes (bounds outstanding un-acked batches —
             // the durability/idempotent window; the MaxInFlightBound contract).
             // The builder can never grow past effCap because drainRing's drain
-            // gate STOPS draining a partition once it is size-full AND at
-            // maxInFlight, so no oversized (unsendable) frame is ever built.
+            // gate STOPS draining a partition once it is size-full (F12: regardless
+            // of the in-flight window), so no oversized (unsendable) frame is built.
             const bool doFlush        = canFlight && (sizeFull || otherTrigger);
 
             if (doFlush) {

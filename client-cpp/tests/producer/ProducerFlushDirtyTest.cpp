@@ -295,3 +295,29 @@ TEST(ProducerFlushDirty, DirtyTrackingAllocatesNothingRegression) {
     EXPECT_EQ(allocs, 0);
     EXPECT_GT(frames, 0u);
 }
+
+// F12 review minor 1: a flush() from a user callback fired DURING the
+// flushBatches walk sees the half-compacted dirty list, whose stale tail holds
+// slots of partitions already flushed and removed (dirty=false).  Flagging
+// those left a flushRequested that nothing cleared, so the partition's NEXT
+// record skipped linger.  Only partitions still on the list may be flagged.
+TEST(ProducerFlushDirty, FlushFromCallbackMidWalkLeavesNoStaleFlagRegression) {
+    Rig r(cfgOf(rc::Acks::None, /*lingerUs=*/60'000'000), 4, /*direct=*/true);
+    uint64_t frames = 0, bytes = 0;
+    const CountingSink sink{&frames, &bytes};
+
+    // Partition 0 is walked first (plain record); partition 1's acks=None
+    // "sent" callback fires inside the same walk and calls flush().
+    ASSERT_EQ(r.send(0), rc::SendResult::Ok);
+    const int64_t h = r.impl->registerCallback([&r](int64_t) { r.impl->submitFlush(); });
+    ASSERT_EQ(r.impl->trySubmit(kTopic, 1, rc::Key(uint64_t{7}), kVal, h), rc::SendResult::Ok);
+    r.impl->submitFlush();
+    r.cycle(sink);
+    ASSERT_EQ(frames, 2u) << "explicit flush sends both partitions";
+
+    // A fresh record on partition 0 must wait for linger (no stale flush flag).
+    frames = 0;
+    ASSERT_EQ(r.send(0), rc::SendResult::Ok);
+    r.cycle(sink);
+    EXPECT_EQ(frames, 0u) << "stale flushRequested made partition 0 skip linger";
+}
