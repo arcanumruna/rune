@@ -22,6 +22,7 @@ TEST(LeaderObserver, UnboundObserverReportsNoLeader) {
 
 TEST(LeaderObserver, ObserverSeesLatestPublishedSnapshot) {
     LeaderObserver o{1};
+    o.bindObserver();
     o.publish({/*leaderId=*/2, /*term=*/5, /*isLeader=*/false});
     o.publish({/*leaderId=*/1, /*term=*/6, /*isLeader=*/true});
     const LeaderSnapshot& v = o.observe();
@@ -34,6 +35,7 @@ TEST(LeaderObserver, ObserverSeesLatestPublishedSnapshot) {
 // the observer drains and the control thread runs its next cycle.
 TEST(LeaderObserverRegression, FullRingConvergesOnLatestView) {
     LeaderObserver o{1};
+    o.bindObserver();
     LeaderSnapshot last{};
     for (int i = 0; i < 10'000; ++i) {          // >> ring capacity (128 snapshots)
         last = {static_cast<rune::consensus::NodeId>(i % 3), i, (i % 3) == 1};
@@ -49,6 +51,7 @@ TEST(LeaderObserverRegression, FullRingConvergesOnLatestView) {
 // the observer never sees a torn {leaderId, term} pair and ends on the final.
 TEST(LeaderObserverRegression, CrossThreadSnapshotsAreNeverTorn) {
     LeaderObserver o{0};
+    o.bindObserver();
     constexpr int kN = 200'000;
     std::thread control([&o] {
         for (int t = 1; t <= kN; ++t) {
@@ -73,4 +76,26 @@ TEST(LeaderObserverRegression, CrossThreadSnapshotsAreNeverTorn) {
     }
     control.join();
     EXPECT_EQ(o.observe().term, kN);
+}
+
+// Fix round 1: single reader BY CONSTRUCTION.  The bound observer thread drains;
+// any other thread is refused (critical log + abort in debug, "no leader"
+// snapshot in release) — it can never become a second ring consumer.
+TEST(LeaderObserverRegression, SecondThreadObserverIsRefused) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    LeaderObserver o{1};
+    o.bindObserver();                                  // this thread observes
+    o.publish({/*leaderId=*/1, /*term=*/4, /*isLeader=*/true});
+#ifndef NDEBUG
+    EXPECT_DEATH({
+        std::thread t([&o] { (void)o.observe(); });
+        t.join();
+    }, "");
+#else
+    LeaderSnapshot foreign{7, 7, true};
+    std::thread t([&o, &foreign] { foreign = o.observe(); });
+    t.join();
+    EXPECT_EQ(foreign, LeaderSnapshot{}) << "a foreign observer gets nothing";
+#endif
+    EXPECT_EQ(o.observe().term, 4) << "the bound observer still drains (ring untouched)";
 }

@@ -65,6 +65,10 @@ BrokerNode::~BrokerNode() {
 void BrokerNode::start() {
     if (started_) return; // idempotent (controller-owned flag, F9a)
     started_ = true;
+    // F9a fix round 1: the thread that starts the node is the ONE leadership
+    // observer (isLeader/leaderId/... drain the ring; others are refused).
+    // Bound before the control thread exists (ordered by its start).
+    leaderObserver_.bindObserver();
 
     // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
     // side effect (no dataDir, no driver, no ports).
@@ -2033,6 +2037,10 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
     return hasLeader(); // one final check at deadline
 }
 
+LeaderSnapshot BrokerNode::leaderSnapshot() const noexcept {
+    return leaderObserver_.observe();
+}
+
 bool BrokerNode::isLeader() const noexcept {
     // One snapshot carries leaderId + isLeader together, so the old TOCTOU
     // between stateCode_ and observedLeaderId_ cannot occur.
@@ -2462,6 +2470,9 @@ void BrokerNode::stop() {
     if (agentRunner_) {
         agentRunner_->stopAndJoin();
     }
+    // F9a: the control thread is joined — skip any owner-thread test task still
+    // queued for it (its test thread waits for a decision with no bound).
+    if (runtimeAgent_) runtimeAgent_->skipQueuedOwnerThreadTestTasks();
 
     // Task 8a: main duty cycle is now quiesced — safe to drop the admin agent.
     // Clear the gateway's admin sink first (defensive; gateway is torn down below).

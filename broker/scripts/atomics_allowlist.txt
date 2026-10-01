@@ -1,63 +1,163 @@
-# atomics_allowlist.txt — the ONLY places std::atomic / locks / memory-ordering
-# primitives may appear in production code (scripts/check_no_atomics.py,
+# atomics_allowlist.txt — the ONLY production sites where atomics / locks /
+# memory-ordering / blocking primitives may appear (scripts/check_no_atomics.py,
 # ctest NoAtomicsOrMutexesOutsideAllowlistRegression).
 #
-# Format:  <path> | <token on the offending line, or *> | <CATEGORY> | <reason>
+# Format:  <path> | <normalized line> | <count> | <CATEGORY> | <reason>
+#   normalized line = the hit line's code, trailing comment removed, whitespace
+#   collapsed.  The number of such lines in <path> must EQUAL <count>: an extra
+#   copy or a missing one fails.  No wildcards.
 # CATEGORY:
-#   RING     — inside a ring-buffer implementation (permanent).
-#   CLEANER  — the off-thread LogCleaner/compaction channel (permanent, user law).
-#   SLICE-B  — TEMPORARY: F9 slice B converts these, then deletes the entry.
-#   UNSCOPED — TEMPORARY: outside slice A and slice B as briefed; must be
-#              scheduled + converted (never add new ones to dodge the guard).
-# A stale entry (matches nothing) FAILS the guard: delete entries as sites go.
+#   RING        — inside a ring-buffer implementation (permanent).
+#   CLEANER     — the off-thread LogCleaner/compaction channel (permanent, user law).
+#   CRASH-ORDER — compiler-only barrier ordering stores into a single-writer
+#                 mmap'd file (not shared state; coordinator ruling F9a r1).
+#   CPU-HINT    — spin-wait CPU hint (pause/yield) in BusySpinIdleStrategy; no
+#                 shared state, no ordering contract (F9a r1: flagged by the
+#                 widened inline-asm detection — pending ruling).
+#   SLICE-B     — TEMPORARY: F9 slice B converts these, then deletes the entries.
+#   UNSCOPED    — TEMPORARY: owned by neither slice yet; must be converted.
 
-# --------------------------------------------------------------------- RING
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | * | RING | agrona M2O ring copy: release fences inside the ring
-libs/node/include/rune/node/detail/O2ORingBuffer.h | * | RING | agrona O2O ring copy: release fences inside the ring
-libs/node/include/rune/node/UringFlushBackend.h | __atomic_ | RING | io_uring CQ ring head/tail (kernel-shared ring protocol)
-libs/node/src/UringFlushBackend.cpp | __atomic_ | RING | io_uring SQ ring head/tail (kernel-shared ring protocol)
-libs/storage/include/rune/storage/Log.h | renameReqHead_ | RING | Log deferred-rename SPSC ring index (append -> bg)
-libs/storage/include/rune/storage/Log.h | renameReqTail_ | RING | Log deferred-rename SPSC ring index (append -> bg)
-libs/storage/include/rune/storage/Log.h | renameDoneHead_ | RING | Log deferred-rename SPSC ring index (bg -> append)
-libs/storage/include/rune/storage/Log.h | renameDoneTail_ | RING | Log deferred-rename SPSC ring index (bg -> append)
+# ------------------------------------------------------------ RING
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | #include <atomic> | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_release); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex)); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return m_buffer.getInt64Volatile(m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return m_buffer.getInt64Volatile(m_headPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | std::int64_t head = m_buffer.getInt64Volatile(headCachePositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | tail = m_buffer.getInt64Volatile(tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | head = m_buffer.getInt64Volatile(m_headPositionIndex); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt64Ordered(headCachePositionIndex, head); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | } while (!m_buffer.compareAndSetInt64(tailPositionIndex, tail, newTail)); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), -padding); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), padding); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/UringFlushBackend.h | const uint32_t head = __atomic_load_n(cqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/include/rune/node/UringFlushBackend.h | const uint32_t tail = __atomic_load_n(cqTail_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/include/rune/node/UringFlushBackend.h | __atomic_store_n(cqHead_, head + 1, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_release); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead); | 3 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex)); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t tail = m_buffer.getInt64Volatile(m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t head = m_buffer.getInt64Volatile(m_headPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | head = m_buffer.getInt64Volatile(m_headPositionIndex); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt64Ordered(tailPositionIndex, nextTail); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -padding); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), padding); | 1 | RING | agrona ring implementation internals
+libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
 
-# ------------------------------------------------------------------ CLEANER
-libs/storage/include/rune/storage/Log.h | #include <atomic> | CLEANER | Log cleaner channel (swap/delete rings, sealed snapshot)
-libs/storage/include/rune/storage/Log.h | swapHead_ | CLEANER | cleaner -> append swap ring index
-libs/storage/include/rune/storage/Log.h | swapTail_ | CLEANER | cleaner -> append swap ring index
-libs/storage/include/rune/storage/Log.h | deleteHead_ | CLEANER | cleaner -> append retention-delete ring index
-libs/storage/include/rune/storage/Log.h | deleteTail_ | CLEANER | cleaner -> append retention-delete ring index
-libs/storage/include/rune/storage/Log.h | sealedSnapshot_ | CLEANER | append -> cleaner sealed-segment snapshot publish
-libs/storage/src/Log.cpp | sealedSnapshot_ | CLEANER | append -> cleaner sealed-segment snapshot publish
+# ------------------------------------------------------------ CLEANER
+libs/storage/include/rune/storage/Log.h | #include <atomic> | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | return std::atomic_load(&sealedSnapshot_); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> swapHead_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> swapTail_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> deleteHead_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> deleteTail_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | auto prevSnap = std::atomic_load(&sealedSnapshot_); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(std::move(snap))); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = swapTail_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = swapHead_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | swapTail_.store(tail + 1, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = swapHead_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = swapTail_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | swapHead_.store(tail, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = deleteTail_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = deleteHead_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | deleteTail_.store(tail + 1, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t head = deleteHead_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | const std::size_t tail = deleteTail_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | deleteHead_.store(tail, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 
-# ------------------------------------------------------------------ SLICE-B
-libs/replication/include/rune/replication/PartitionReplica.h | #include <atomic> | SLICE-B | PartitionReplica published* (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | lastCleanOffset_ | SLICE-B | PartitionReplica cleaner-facing published state (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | publishedHwForCleaner_ | SLICE-B | PartitionReplica published* (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | publishedRoleForCleaner_ | SLICE-B | PartitionReplica published* (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | publishedIsrSizeForGateway_ | SLICE-B | PartitionReplica published* (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | publishedControllerEpoch_ | SLICE-B | PartitionReplica published* (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | publishedReplicaLeo_ | SLICE-B | PartitionReplica published* (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | #include <mutex> | SLICE-B | PartitionReplica mu_ pending-queue lock (NOT in the slice-B brief list; same file — flagged)
-libs/replication/include/rune/replication/PartitionReplica.h | lock_guard lk(mu_) | SLICE-B | PartitionReplica mu_ pending-queue lock (flagged, see above)
-libs/replication/include/rune/replication/PartitionReplica.h | std::mutex           mu_ | SLICE-B | PartitionReplica mu_ pending-queue lock (flagged, see above)
-libs/gateway/include/rune/gateway/ClientGateway.h | #include <atomic> | SLICE-B | ClientGateway::minIsr_ (slice B)
-libs/gateway/include/rune/gateway/ClientGateway.h | minIsr_ | SLICE-B | ClientGateway::minIsr_ (slice B)
-libs/node/include/rune/node/ReplicationMetadataBridge.h | #include <atomic> | SLICE-B | ReplicationMetadataBridge observers (slice B)
-libs/node/include/rune/node/ReplicationMetadataBridge.h | observedEpoch_ | SLICE-B | ReplicationMetadataBridge observers (slice B)
-libs/node/include/rune/node/ReplicationMetadataBridge.h | observedIsLeader_ | SLICE-B | ReplicationMetadataBridge observers (slice B)
+# ------------------------------------------------------------ CRASH-ORDER
+libs/consensus/src/NodeStateFile.cpp | inline void crashOrderBarrier() noexcept { asm volatile("" ::: "memory"); } | 1 | CRASH-ORDER | compiler-only barrier: store order of the single-writer mmap state file
 
-# ----------------------------------------------------------------- UNSCOPED
-libs/storage/include/rune/storage/Log.h | preparedSegment_ | UNSCOPED | bg pre-provisioning hand-off (not cleaner): convert to a ring hand-off
-libs/storage/include/rune/storage/Log.h | preprovInFlight_ | UNSCOPED | bg pre-provisioning in-flight flag (not cleaner): owner-state + ring
-libs/metadata/include/rune/metadata/RoutingImage.h | #include <atomic> | UNSCOPED | RoutingImage atomic shared_ptr publish (metadata): convert to ring-delivered image
-libs/metadata/include/rune/metadata/RoutingImage.h | atomic_store_explicit | UNSCOPED | RoutingImage atomic shared_ptr publish (metadata)
-libs/metadata/include/rune/metadata/RoutingImage.h | atomic_load_explicit | UNSCOPED | RoutingImage atomic shared_ptr publish (metadata)
-libs/transaction/src/ControlMarker.cpp | #include <mutex> | UNSCOPED | call_once CRC table init: replace with a constexpr table
-libs/transaction/src/ControlMarker.cpp | cm_crc32c_once | UNSCOPED | call_once CRC table init: replace with a constexpr table
-libs/transaction/src/ReplicatedTxnStateStore.cpp | #include <mutex> | UNSCOPED | call_once CRC table init: replace with a constexpr table
-libs/transaction/src/ReplicatedTxnStateStore.cpp | crc_once | UNSCOPED | call_once CRC table init: replace with a constexpr table
-libs/transaction/src/TransactionLog.cpp | #include <mutex> | UNSCOPED | call_once CRC table init: replace with a constexpr table
-libs/transaction/src/TransactionLog.cpp | crc32c_tbl_once | UNSCOPED | call_once CRC table init: replace with a constexpr table
-libs/coordination/include/rune/coordination/GroupCoordinator.h | #include <atomic> | UNSCOPED | unused <atomic> include: delete
-libs/node/include/rune/node/Worker.h | #include <atomic> | UNSCOPED | unused <atomic> include (Worker is mid-change on another branch): delete
+# ------------------------------------------------------------ CPU-HINT
+libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("pause" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
+libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("yield" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
+libs/consensus/include/rune/consensus/IdleStrategy.h | __asm__ volatile("" ::: "memory"); | 1 | CPU-HINT | BusySpinIdleStrategy spin hint (pause/yield; compiler-barrier fallback): no shared state
+
+# ------------------------------------------------------------ SLICE-B
+libs/gateway/include/rune/gateway/ClientGateway.h | #include <atomic> | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | minIsr_.store((minIsr >= 1) ? minIsr : 1, std::memory_order_relaxed); | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | return minIsr_.load(std::memory_order_relaxed); | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | std::atomic<int> minIsr_{1}; | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/src/ClientGateway.cpp | cachedMinIsr_ = minIsr_.load(std::memory_order_relaxed); | 1 | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | #include <atomic> | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | observedEpoch_.store(lastObservedEpoch_, std::memory_order_relaxed); | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | observedIsLeader_.store(selfIsClusterLeader, std::memory_order_release); | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | return observedIsLeader_.load(std::memory_order_acquire); | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | (void)observedIsLeader_.load(std::memory_order_acquire); | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | return observedEpoch_.load(std::memory_order_relaxed); | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | std::atomic<rune::replication::Epoch> observedEpoch_{0}; | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | std::atomic<bool> observedIsLeader_{false}; | 1 | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | #include <atomic> | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | #include <mutex> | 1 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling)
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedHwForCleaner_.load(std::memory_order_acquire); | 2 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return static_cast<Role>(publishedRoleForCleaner_.load(std::memory_order_acquire)); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedIsrSizeForGateway_.load(std::memory_order_acquire); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return publishedControllerEpoch_.load(std::memory_order_acquire); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | const Offset raw = publishedReplicaLeo_[static_cast<std::size_t>(nodeId)] | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | .load(std::memory_order_acquire); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | return lastCleanOffset_.load(std::memory_order_relaxed); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | lastCleanOffset_.store(o, std::memory_order_relaxed); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> lastCleanOffset_{0}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<Offset> publishedHwForCleaner_{0}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int> publishedRoleForCleaner_{static_cast<int>(Role::Follower)}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int> publishedIsrSizeForGateway_{0}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int32_t> publishedControllerEpoch_{-1}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::array<std::atomic<Offset>, kMaxControllerNodes> publishedReplicaLeo_{}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | std::lock_guard lk(mu_); | 13 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling)
+libs/replication/include/rune/replication/PartitionReplica.h | mutable std::mutex mu_; | 1 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling)
+libs/replication/src/PartitionReplica.cpp | publishedHwForCleaner_.store(computeServedHw(), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedRoleForCleaner_.store(static_cast<int>(role_), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedIsrSizeForGateway_.store(isrSize, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedControllerEpoch_.store(static_cast<int32_t>(epoch_), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std::size_t>(cfg_.selfId)].store( | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | logEndOffset_() + 1, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std::size_t>(fid)].store( | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | leo + 1, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+
+# ------------------------------------------------------------ UNSCOPED
+libs/coordination/include/rune/coordination/GroupCoordinator.h | #include <atomic> | 1 | UNSCOPED | unused <atomic> include: delete
+libs/metadata/include/rune/metadata/RoutingImage.h | #include <atomic> | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/metadata/include/rune/metadata/RoutingImage.h | std::atomic_store_explicit(&current_, std::move(img), | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/metadata/include/rune/metadata/RoutingImage.h | std::memory_order_release); | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/metadata/include/rune/metadata/RoutingImage.h | return std::atomic_load_explicit(&current_, std::memory_order_acquire); | 1 | UNSCOPED | RoutingImage atomic shared_ptr publish: convert to a ring-delivered image
+libs/node/include/rune/node/Worker.h | #include <atomic> | 1 | UNSCOPED | unused <atomic> include: delete
+libs/storage/include/rune/storage/Log.h | std::atomic<LogSegment*> preparedSegment_{nullptr}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | std::atomic<bool> preprovInFlight_{false}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameReqHead_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameReqTail_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameDoneHead_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> renameDoneTail_{0}; | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t head = renameReqHead_.load(std::memory_order_relaxed); | 2 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed); | 2 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | LogSegment* prepared = preparedSegment_.exchange(nullptr, std::memory_order_acq_rel); | 2 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | if (!preprovInFlight_.compare_exchange_strong(expected, true, | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | std::memory_order_acq_rel, std::memory_order_acquire)) { | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | if (preparedSegment_.load(std::memory_order_acquire) != nullptr) { | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | preprovInFlight_.store(false, std::memory_order_release); | 3 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | preparedSegment_.store(seg.release(), std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t head = renameReqHead_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | renameReqTail_.store(tail + 1, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t tail = renameReqTail_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t dt = renameDoneTail_.load(std::memory_order_relaxed); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t dh = renameDoneHead_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | renameDoneTail_.store(dt + 1, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | if (count > 0) renameReqHead_.store(tail, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t head = renameDoneHead_.load(std::memory_order_relaxed); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | const std::size_t tail = renameDoneTail_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/storage/src/Log.cpp | if (count > 0) renameDoneHead_.store(tail, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
+libs/transaction/src/ControlMarker.cpp | #include <mutex> | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ControlMarker.cpp | static std::once_flag cm_crc32c_once; | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ControlMarker.cpp | std::call_once(cm_crc32c_once, cm_build_table); | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ReplicatedTxnStateStore.cpp | #include <mutex> | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ReplicatedTxnStateStore.cpp | static std::once_flag crc_once; | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ReplicatedTxnStateStore.cpp | std::call_once(crc_once, build_crc_table); | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/TransactionLog.cpp | #include <mutex> | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/TransactionLog.cpp | static std::once_flag crc32c_tbl_once; | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/TransactionLog.cpp | std::call_once(crc32c_tbl_once, build_crc32c_table); | 1 | UNSCOPED | call_once CRC table init: replace with a constexpr table

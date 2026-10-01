@@ -267,8 +267,10 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     }
     // Advance the flyweight position so the frame is well-formed (commit uses frameLen).
     enc.sbePosition(lenPos + isbe::OutboundFrame::payloadHeaderLength() + payloadLen);
-    outboundRing_.commit(idx);
+    // FR mark BEFORE commit: once committed the consumer may drain + free the slot
+    // and a later claim may reuse it, so marking after would mis-pair the slot.
     RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    outboundRing_.commit(idx);
     return true;
 }
 
@@ -320,10 +322,11 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
     enc.wrapAndApplyHeader(reinterpret_cast<char*>(outboundRing_.base() + idx), 0, frameLen);
     enc.targetNodeId(targetNodeId);
     enc.putPayload(reinterpret_cast<const char*>(wire), static_cast<std::uint32_t>(len));
-    outboundRing_.commit(idx);
     // Worker-clock: frame handed to the outbound ring (→ control thread drains it).
-    // corr = ring slot offset; pairs 1:1 with ReplOutDrain (same slot).
+    // corr = ring slot offset; pairs 1:1 with ReplOutDrain (same slot).  Marked
+    // BEFORE commit (after commit the slot may already be drained and reused).
     RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    outboundRing_.commit(idx);
     return true;
 }
 

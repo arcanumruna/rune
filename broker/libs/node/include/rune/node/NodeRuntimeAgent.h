@@ -551,6 +551,16 @@ public:
     // this control thread).  Returns false if the ring is full (caller fails
     // loudly).
     // -----------------------------------------------------------------------
+    /// Shutdown (the controller, AFTER the runtime's AgentRunner was joined):
+    /// skip every test task still queued so no test thread waits forever.
+    void skipQueuedOwnerThreadTestTasks() noexcept {
+        for (void* ref : pendingTestTasks_) skipOwnerThreadTestTask(ref);
+        pendingTestTasks_.clear();
+        (void)testTaskRing_.poll([](int32_t, std::int64_t a, std::int64_t) noexcept {
+            skipOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)));
+        });
+    }
+
     [[nodiscard]] bool offerOwnerThreadTestTask(void* ref) noexcept {
         return testTaskRing_.offer(kTestTaskMsgTypeId,
                                    static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(ref)));

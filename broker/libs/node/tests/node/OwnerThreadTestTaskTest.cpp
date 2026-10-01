@@ -26,40 +26,50 @@ auto makeControlTask(F f, Clock::time_point deadline) {
 TEST(OwnerThreadTestTaskRegression, OwnerRunsBeforeDeadline) {
     int ran = 0;
     auto task = makeControlTask([&ran] { return ++ran; }, Clock::now() + 10s);
-    auto fut  = task->future();
     std::thread owner([&task] { task->runOnOwner(nullptr); });
-    EXPECT_EQ(awaitOwnerThreadTestTask(*task, fut, 10'000ms), 1);
+    EXPECT_EQ(awaitOwnerThreadTestTask(*task, 10'000ms), 1);
     owner.join();
     EXPECT_EQ(ran, 1);
 }
 
+// The callable's exception is delivered to the test thread (ring completion,
+// no std::promise).
+TEST(OwnerThreadTestTaskRegression, CallableExceptionIsRethrownOnTestThread) {
+    auto task = makeControlTask([]() -> int { throw std::logic_error("boom"); }, Clock::now() + 10s);
+    std::thread owner([&task] { task->runOnOwner(nullptr); });
+    EXPECT_THROW(awaitOwnerThreadTestTask(*task, 10'000ms), std::logic_error);
+    owner.join();
+}
+
 // The owner reaches the task only after the deadline: it must SKIP (never call
-// the callable, which may reference a test frame that already unwound) and the
-// test side must throw the timeout.
+// the callable) and the test side must throw the timeout.
 TEST(OwnerThreadTestTaskRegression, OwnerPastDeadlineSkipsAndTestThrows) {
     bool ran = false;
     auto task = makeControlTask([&ran] { ran = true; return 0; }, Clock::now() + 20ms);
-    auto fut  = task->future();
     std::thread owner([&task] {
         std::this_thread::sleep_for(60ms);      // owner busy past the deadline
         task->runOnOwner(nullptr);
     });
-    EXPECT_THROW(awaitOwnerThreadTestTask(*task, fut, 20ms), std::runtime_error);
+    EXPECT_THROW(awaitOwnerThreadTestTask(*task, 20ms), std::runtime_error);
     owner.join();
     EXPECT_FALSE(ran) << "a task reached after its deadline must never run";
 }
 
-// The owner never reaches the task (wedged / stopped): the test throws after
-// the deadline + grace instead of hanging; the callable never runs.
-TEST(OwnerThreadTestTaskRegression, OwnerNeverReachesTaskTestThrows) {
-    bool ran = false;
-    auto task = makeControlTask([&ran] { ran = true; return 0; }, Clock::now() + 10ms);
-    auto fut  = task->future();
+// Fix round 1 (deadline UAF): past the deadline the test waits for the OWNER's
+// decision with no bound of its own — it never returns while the owner could
+// still pick the task up.  (The old 2 s grace returned early, leaving a window
+// in which a just-started callable ran against an unwound frame.)
+TEST(OwnerThreadTestTaskRegression, TestNeverReturnsBeforeOwnerDecision) {
+    auto task = makeControlTask([] { return 0; }, Clock::now() + 10ms);
+    static constexpr auto kOwnerLate = 2500ms;   // > the old 2 s grace
     const auto t0 = Clock::now();
-    EXPECT_THROW(awaitOwnerThreadTestTask(*task, fut, 10ms), std::runtime_error);
-    EXPECT_LT(Clock::now() - t0, kOwnerDecisionGrace + 2s);
-    task->runOnOwner(nullptr);                 // a late owner still only skips
-    EXPECT_FALSE(ran);
+    std::thread owner([&task] {
+        std::this_thread::sleep_for(kOwnerLate);
+        task->runOnOwner(nullptr);
+    });
+    EXPECT_THROW(awaitOwnerThreadTestTask(*task, 10ms), std::runtime_error);
+    EXPECT_GE(Clock::now() - t0, kOwnerLate) << "returned before the owner decided";
+    owner.join();
 }
 
 // The owner STARTED before the deadline and is still running when the deadline
@@ -70,9 +80,19 @@ TEST(OwnerThreadTestTaskRegression, StartedBeforeDeadlineIsAwaitedPastIt) {
         std::this_thread::sleep_for(300ms);     // outlives the 100 ms deadline
         return ++ran;
     }, Clock::now() + 100ms);
-    auto fut  = task->future();
     std::thread owner([&task] { task->runOnOwner(nullptr); });
-    EXPECT_EQ(awaitOwnerThreadTestTask(*task, fut, 100ms), 1);
+    EXPECT_EQ(awaitOwnerThreadTestTask(*task, 100ms), 1);
     owner.join();
     EXPECT_EQ(ran, 1);
+}
+
+// Shutdown skip (BrokerNode::stop drains queued tasks): the waiter is released.
+TEST(OwnerThreadTestTaskRegression, ShutdownSkipReleasesWaiter) {
+    bool ran = false;
+    auto task = makeControlTask([&ran] { ran = true; return 0; }, Clock::now() + 10s);
+    auto* ref = new OwnerThreadTestTaskRef(task);
+    std::thread owner([ref] { skipOwnerThreadTestTask(ref); });
+    EXPECT_THROW(awaitOwnerThreadTestTask(*task, 10'000ms), std::runtime_error);
+    owner.join();
+    EXPECT_FALSE(ran);
 }

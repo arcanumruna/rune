@@ -292,13 +292,17 @@ public:
     // {leaderId, term, isLeader} snapshot on LeaderObserver's ring whenever it
     // changes.  isLeader()/leaderId()/leadershipTermId()/awaitLeader()/
     // publishRole()/leaderClientEndpoint() DRAIN that ring: they must be called
-    // from ONE external thread at a time (main()'s poll loop, or the test
-    // thread driving the node).  Node-internal (control-thread) code uses
+    // from the ONE observer thread: the thread that called start() (enforced —
+    // any other thread is refused: critical log, abort in debug builds).  Node-internal (control-thread) code uses
     // LeaderObserver::computeOnControl() instead — never these.
     // -----------------------------------------------------------------------
 
     bool   isLeader()  const noexcept;
     rune::consensus::NodeId leaderId() const noexcept;
+
+    /// One ring-drained snapshot {leaderId, term, isLeader} — use it when more
+    /// than one field is needed together (never torn).  Observer thread only.
+    LeaderSnapshot leaderSnapshot() const noexcept;
 
     /// Return the current leadershipTermId (from the same ring snapshot as
     /// leaderId(), so the pair is never torn).
@@ -344,8 +348,18 @@ public:
     // partition + WorkerPool] owning worker via the existing control→worker
     // ingress ring (WorkerOp::TestTask).  See OwnerThreadTestTask.h.
     //
-    // Timeout: if the owner has not STARTED the task within `timeout`, it is
-    // cancelled (never runs) and std::runtime_error is thrown.
+    // Timeout: if the owner reaches the task after `timeout`, it SKIPS it (the
+    // callable never runs) and std::runtime_error is thrown.  The caller waits
+    // for the owner's decision with no bound of its own (F9a ruling: the ctest
+    // timeout is the bound), so the callable can never run against an unwound
+    // frame.
+    //
+    // PRECONDITION (F9a): the calling thread is the controller, or a thread
+    // started after start() returned and joined before stop() is called.  That
+    // ordering (thread start / join) is what makes the controller-owned
+    // started_/stopped_ check below race-free, and guarantees the control
+    // thread is alive to drain the task.  stop() additionally SKIPS any task
+    // still queued on the control ring when the runtime is joined.
     // Preconditions (fail loudly with std::logic_error / invalid_argument):
     //   node started and not stopped; topicId != kSchemaTopicId (-4, the
     //   __topic_schemas replica is AdminWorker-owned — not routable here).
@@ -518,13 +532,12 @@ private:
         // from it alone (see OwnerThreadTestTask.h, F9a).
         auto task = std::make_shared<Impl>(topicId, partition, std::forward<F>(f),
                                            OwnerThreadTestTask::Clock::now() + timeout);
-        auto fut  = task->future();
         auto* ref = new OwnerThreadTestTaskRef(task);   // the ring's reference
         if (!runtimeAgent_->offerOwnerThreadTestTask(ref)) {
             delete ref;
             throw std::runtime_error("onOwnerThreadForTest: control test-task ring full");
         }
-        return awaitOwnerThreadTestTask(*task, fut, timeout);
+        return awaitOwnerThreadTestTask(*task, timeout);
     }
 
     // F9a: control-thread-side helper for the gateway leaderView — pure function

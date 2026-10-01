@@ -13,6 +13,14 @@
 
 namespace rune::consensus {
 
+namespace {
+// CRASH-ORDER (F9a fix round 1, coordinator ruling): a compiler-only barrier.
+// Not shared state, not an atomic, not a mutex — it only stops the compiler
+// from sinking the metadata stores below the candidateTermId store in this
+// single-writer mmap'd file.  Allowlisted under CRASH-ORDER.
+inline void crashOrderBarrier() noexcept { asm volatile("" ::: "memory"); }
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Construction helpers
 // ---------------------------------------------------------------------------
@@ -58,6 +66,7 @@ NodeStateFile::NodeStateFile(std::string path, int fileSyncLevel)
         // candidateTermId — same write order as an update (single owner thread).
         *slotAt(kLogPositionOffset) = 0;
         *slotAt(kTimestampOffset)   = 0;
+        crashOrderBarrier();   // metadata stores precede the id store (CRASH-ORDER)
         *slotAt(kCandidateTermIdOffset) = NULL_VALUE;
 
         syncFile();
@@ -113,8 +122,11 @@ void NodeStateFile::updateCandidateTermId(
     *slotAt(kTimestampOffset)   = timestampMs;
 
     // Aeron writes candidateTermId LAST (putLongVolatile).  The mapping has a
-    // single owner thread (F9a), so a plain store keeps the order that matters
-    // to the owner; persistence is msync's job (syncFile below).
+    // single owner thread (F9a) — no other reader — so no CPU fence is needed;
+    // a COMPILER barrier keeps the stores in program order so the id is written
+    // after its metadata (crash order of the mmap'd file).  Persistence is
+    // msync's job (syncFile below).
+    crashOrderBarrier();
     *slotAt(kCandidateTermIdOffset) = candidateTermId;
 
     syncFile();

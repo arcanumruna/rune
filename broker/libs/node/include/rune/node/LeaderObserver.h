@@ -13,11 +13,16 @@
 //     message on ring_.  A full ring (observer not draining) is not an error:
 //     lastPublished_ is left unchanged, so the next cycle retries with the then
 //     current view — the observer always converges on the latest view.
-//   - Observer thread (EXACTLY ONE — the thread that drives the node from the
-//     outside: main()'s poll loop, or a test thread): observe() drains ring_
-//     and returns the latest snapshot it has seen.  observed_ is owned by that
-//     thread.  The observer role may move between threads only across a
-//     happens-before edge (thread start / join).
+//   - Observer thread (EXACTLY ONE, enforced): bindObserver() — called by
+//     BrokerNode::start() — makes the CALLING thread the only observer.
+//     observe() drains ring_ and returns the latest snapshot; observed_ is owned
+//     by that thread.  observe() from any OTHER thread is refused: logged
+//     critical, std::abort() in debug builds, a "no leader" snapshot in release
+//     (same pattern as EmbeddedDriver's pump owner).  Before bindObserver()
+//     nothing is published (the control thread is not running) and observe()
+//     returns the initial view without draining.  Rebinding (bindObserver() on
+//     another thread) is allowed only across a happens-before edge with the
+//     previous observer (thread start / join).
 //
 //   Everything the CONTROL thread itself needs (gateway leaderView, group / txn
 //   coordinators, admin role hook) MUST use computeOnControl(), never observe():
@@ -32,7 +37,11 @@
 #include <rune/consensus/Types.h>
 #include <rune/node/NodeConsensusAgent.h>
 
+#include <spdlog/spdlog.h>
+
 #include <cstdint>
+#include <cstdlib>
+#include <thread>
 
 namespace rune::node {
 
@@ -97,8 +106,17 @@ public:
     }
 
     // --------------------------------------------------------------- observer
-    /// OBSERVER thread only: drain published snapshots; return the latest.
-    const LeaderSnapshot& observe() noexcept {
+    /// Make the CALLING thread the one observer (BrokerNode::start()).
+    void bindObserver() noexcept { observer_ = std::this_thread::get_id(); }
+
+    /// OBSERVER thread only (enforced): drain published snapshots; return the
+    /// latest.  Another thread is refused (critical log; abort in debug).
+    LeaderSnapshot observe() noexcept {
+        if (observer_ == std::thread::id{}) return observed_;   // unbound: nothing published
+        if (std::this_thread::get_id() != observer_) [[unlikely]] {
+            refuseForeignObserver_();
+            return LeaderSnapshot{};
+        }
         ring_.poll([this](std::int32_t type, std::int64_t a, std::int64_t b) noexcept {
             observed_.isLeader = (type == kLeaderMsg);
             observed_.leaderId = static_cast<rune::consensus::NodeId>(a);
@@ -108,6 +126,15 @@ public:
     }
 
 private:
+    [[gnu::cold]] [[gnu::noinline]] static void refuseForeignObserver_() noexcept {
+        spdlog::critical("LeaderObserver: observe() from a thread that is not the bound "
+                         "observer — the leadership ring has exactly ONE consumer (F9a); "
+                         "refused");
+#ifndef NDEBUG
+        std::abort();
+#endif
+    }
+
     static constexpr std::int32_t kNotLeaderMsg = 1;
     static constexpr std::int32_t kLeaderMsg    = 2;
 
@@ -118,6 +145,7 @@ private:
     LeaderSnapshot                    lastPublished_{};       // control-thread-owned
     rune::consensus::ControlRing<4096> ring_;                 // control → observer
     LeaderSnapshot                    observed_{};            // observer-thread-owned
+    std::thread::id                   observer_{};            // set by bindObserver()
 };
 
 } // namespace rune::node

@@ -120,11 +120,14 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
             // loop iteration — no shared flag.
             thread_ = std::thread([this] {
                 bool stop = false;
-                while (!stop) {
-                    aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+                for (;;) {
+                    const int work = aeron_driver_main_do_work(driver_);
+                    // Stop is checked BEFORE idling (no extra park after Stop).
                     stopRing_.poll([&stop](std::int32_t type, std::int64_t, std::int64_t) noexcept {
                         if (type == kStopCmd) stop = true;
                     });
+                    if (stop) break;
+                    aeron_driver_main_idle_strategy(driver_, work);
                 }
             });
             threadRunning_ = true;

@@ -1203,13 +1203,19 @@ TEST(BrokerNodeTest, OwnerThreadHookTimeoutCancelsTaskRegression) {
     });
     ASSERT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
 
-    // Queued behind the blocker → cannot start within 100ms → cancelled + throws.
+    // Queued behind the blocker → cannot start within 100ms → the owner skips it
+    // + the caller throws.  F9a fix round 1: the caller waits for the owner's
+    // decision with no bound, so the blocker is released from another thread
+    // AFTER the 100 ms deadline (the owner then reaches + skips the task).
+    std::thread releaser([&release] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{400});
+        release.set_value();
+    });
     bool ran = false;
     EXPECT_THROW(node.onControlThreadForTest([&ran] { ran = true; return 0; },
                                              std::chrono::milliseconds{100}),
                  std::runtime_error);
-
-    release.set_value();
+    releaser.join();
     EXPECT_TRUE(blocker.get()) << "blocker task must have been released, not timed out";
 
     // FIFO round-trip AFTER the cancelled task: it has been drained by now.

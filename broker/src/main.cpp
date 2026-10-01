@@ -115,6 +115,12 @@ static void frReport(const std::string& tag) {
 int main() {
     // F9a: block the control signals BEFORE any thread exists (every thread
     // inherits the mask), then hand them to the one sigwait thread.
+    //
+    // WARNING: blockControlSignals() MUST stay the first thing main() does.  Any
+    // thread created BEFORE it (or any thread that later unblocks SIGINT/SIGTERM/
+    // SIGUSR1/SIGUSR2) can receive a process-directed signal with the default
+    // action — killing the broker without a clean stop — or swallow it, so the
+    // signal thread never sees it and shutdown breaks.
     if (const int rc = rune::node::blockControlSignals(); rc != 0) {
         std::cerr << "rune-broker: pthread_sigmask failed: " << rc << "\n";
         return 2;
@@ -163,8 +169,8 @@ int main() {
 
     // For a 1-node cluster, await self-election.
     if (node.awaitLeader(5s)) {
-        spdlog::info("rune-broker: node {} is LEADER term {}",
-                     node.leaderId(), node.leadershipTermId());
+        const auto v = node.leaderSnapshot();   // ONE snapshot: id + term never torn
+        spdlog::info("rune-broker: node {} is LEADER term {}", v.leaderId, v.term);
     } else {
         spdlog::warn("rune-broker: leadership not reached within 5 s — continuing");
     }
@@ -197,12 +203,13 @@ int main() {
         // rune_role instead of scraping the "is LEADER" log lines below — the
         // counters are authoritative and log-level independent.
         node.publishRole();
-        const rune::consensus::NodeId cur = node.leaderId();
+        const auto v = node.leaderSnapshot();   // ONE snapshot: id + term never torn
+        const rune::consensus::NodeId cur = v.leaderId;
         if (cur != lastObservedLeader) {
             lastObservedLeader = cur;
             if (cur >= 0) {
                 spdlog::info("rune-broker: leadership change — node {} is LEADER term {}",
-                             cur, node.leadershipTermId());
+                             cur, v.term);
             } else {
                 spdlog::info("rune-broker: leadership change — no leader (election in progress)");
             }

@@ -160,6 +160,19 @@ if(aeron_FOUND)
     # libs/node/CMakeLists.txt.
 endif()
 
+# F9a fix round 1: real process-directed signal delivery to the broker binary
+# (spawn rune_broker, kill(pid, SIGINT/SIGTERM), expect a clean exit 0).
+if(BUILD_TESTING)
+    find_package(GTest REQUIRED)
+    add_executable(rune_broker_process_tests tests/process/BrokerProcessSignalTest.cpp)
+    target_link_libraries(rune_broker_process_tests PRIVATE GTest::gtest_main)
+    target_compile_definitions(rune_broker_process_tests PRIVATE
+        RUNE_BROKER_BIN="$<TARGET_FILE:rune_broker>")
+    add_dependencies(rune_broker_process_tests rune_broker)
+    include(GoogleTest)
+    gtest_discover_tests(rune_broker_process_tests PROPERTIES RUN_SERIAL TRUE)
+endif()
+
 # ── rune_role — standalone Aeron node-role counter reader ────────────────────
 # Reads the machine-readable leadership signal (RoleCounter.h) out of a broker's
 # CnC file and prints one line.  The dr-e2e harness runs this via `docker exec`

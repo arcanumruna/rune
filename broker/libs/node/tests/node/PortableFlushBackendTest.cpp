@@ -117,8 +117,9 @@ TEST(PortableFlushBackendRegression, TeardownDrainSyncsTheRequestedFd) {
     g_firstSyncEntered = false;
     g_gateOpen = false;
 
-    auto* be = new rune::node::PortableFlushBackend(/*submitDepth=*/64, /*completionDepth=*/64,
-                                                    &recordingSync);
+    // Compile-time seam: the recording Sync is a template argument.
+    auto* be = new rune::node::BasicPortableFlushBackend<&recordingSync>(/*submitDepth=*/64,
+                                                                         /*completionDepth=*/64);
     ASSERT_NE(be->submit(1000, 1), rune::node::kNoToken);
     while (!g_firstSyncEntered.load()) std::this_thread::sleep_for(std::chrono::microseconds{50});
     for (int i = 1; i < kTeardownReqs; ++i) {
