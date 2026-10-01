@@ -39,6 +39,7 @@
 // Gateway
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
 
 // Replication
@@ -157,10 +158,7 @@ static double pct(const std::vector<double>& sorted, double p)
 // ===========================================================================
 struct GR8BaseFixture {
     // ---- Aeron ----
-    aeron_driver_context_t* driverCtx_   = nullptr;
-    aeron_driver_t*         driver_      = nullptr;
-    std::atomic<bool>       driverRunning_{false};
-    std::thread             driverThread_;
+    std::unique_ptr<rune::node::EmbeddedDriver> driver_;
     std::shared_ptr<aeron::Aeron> aeron_;
 
     // ---- Gateway stack ----
@@ -281,59 +279,23 @@ private:
     {
         const std::string aeronDir = (tmpPath_ / "aeron").string();
 
-        aeron_driver_context_init(&driverCtx_);
-        aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
-        aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx_, 1024 * 1024);
-
-        if (aeron_driver_init(&driver_, driverCtx_) != 0 ||
-            aeron_driver_start(driver_, /*manual_main_loop=*/true) != 0) {
+        // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+        // readiness pumping — aeron_driver_init already wrote cnc.dat and stamped
+        // the heartbeat synchronously before the driver thread even starts.
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir;
+        cfg.termBufferBytes = 1024 * 1024;
+        try {
+            driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        } catch (const std::exception&) {
             return false;
         }
-
-        driverRunning_.store(true, std::memory_order_release);
-        driverThread_ = std::thread([this]() {
-            while (driverRunning_.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver_, aeron_driver_main_do_work(driver_));
-            }
-        });
-
-        const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver_);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
-        return fs::exists(cncPath);
+        return true;
     }
 
     void stopDriver()
     {
-        if (driverRunning_.exchange(false, std::memory_order_acq_rel)) {
-            if (driverThread_.joinable()) driverThread_.join();
-        }
-        if (driver_) {
-            const auto dl = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds{50};
-            while (std::chrono::steady_clock::now() < dl) {
-                if (aeron_driver_main_do_work(driver_) == 0) {
-                    aeron_driver_main_do_work(driver_);
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds{200});
-            }
-            aeron_driver_close(driver_);
-            driver_ = nullptr;
-        }
-        if (driverCtx_) {
-            aeron_driver_context_close(driverCtx_);
-            driverCtx_ = nullptr;
-        }
+        driver_.reset();
     }
 
     bool connectAeron()

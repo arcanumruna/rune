@@ -43,6 +43,7 @@
 #include <rune/gateway/TopicRegistry.h>
 
 // Node / coordination
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -182,44 +183,24 @@ static uint16_t frameTemplateId(const uint8_t* buf, std::size_t len) {
 // Uses IPC so no network ports are needed.
 // ===========================================================================
 struct EmbeddedAeronDriver {
-    aeron_driver_context_t* driverCtx = nullptr;
-    aeron_driver_t*         driver    = nullptr;
-    std::atomic<bool>       running{false};
-    std::thread             thread;
-    std::shared_ptr<aeron::Aeron> aeron;
-    bool                    ok = false;
+    // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+    // readiness pumping — aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before the driver thread even starts.
+    std::unique_ptr<rune::node::EmbeddedDriver> driver;
+    std::shared_ptr<aeron::Aeron>                aeron;
+    bool                                          ok = false;
 
     // Returns false on failure (call site checks ok flag).
     bool start(const std::string& aeronDir) {
         fs::create_directories(aeronDir);
-        aeron_driver_context_init(&driverCtx);
-        aeron_driver_context_set_dir(driverCtx, aeronDir.c_str());
-        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
-
-        if (aeron_driver_init(&driver, driverCtx) != 0) return false;
-        if (aeron_driver_start(driver, /*manual_main_loop=*/true) != 0) return false;
-
-        running.store(true, std::memory_order_release);
-        thread = std::thread([this]() {
-            while (running.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver, aeron_driver_main_do_work(driver));
-            }
-        });
-
-        // Spin until cnc.dat appears (driver ready).
-        const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 500; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(1ms);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir;
+        cfg.termBufferBytes = 64 * 1024;
+        try {
+            driver = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        } catch (const std::exception&) {
+            return false;
         }
-        if (!fs::exists(cncPath)) return false;
 
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
@@ -231,22 +212,7 @@ struct EmbeddedAeronDriver {
 
     ~EmbeddedAeronDriver() {
         aeron.reset();
-        if (running.exchange(false, std::memory_order_acq_rel)) {
-            if (thread.joinable()) thread.join();
-        }
-        if (driver) {
-            const auto dl = std::chrono::steady_clock::now() + 50ms;
-            while (std::chrono::steady_clock::now() < dl) {
-                if (aeron_driver_main_do_work(driver) == 0) {
-                    aeron_driver_main_do_work(driver); break;
-                }
-                std::this_thread::sleep_for(200us);
-            }
-            aeron_driver_close(driver);   driver    = nullptr;
-        }
-        if (driverCtx) {
-            aeron_driver_context_close(driverCtx); driverCtx = nullptr;
-        }
+        driver.reset();
     }
 };
 
