@@ -358,15 +358,16 @@ public:
     // -----------------------------------------------------------------------
     // Pump doWork until condition is met or kPumpIter is exceeded.
     // -----------------------------------------------------------------------
+    // Progress-driven condition wait: run the gateway until done() holds, yielding
+    // only on idle passes (the driver thread delivers asynchronously).  Bounded by
+    // a pass cap, not a wall clock; callers assert done() afterwards.
     void pump(std::function<bool()> done, int iterations = kPumpIter)
     {
-        using clock = std::chrono::steady_clock;
-        const auto deadline = clock::now() + std::chrono::seconds{10};
-        for (int i = 0; i < iterations && clock::now() < deadline && !done(); ++i) {
-            gw_->doWork(nowNs());
+        const int64_t cap = std::max<int64_t>(iterations, 4'000'000);
+        for (int64_t i = 0; i < cap && !done(); ++i) {
             // driverThread_ (startDriver()) is the driver's ONE pumper; do not pump
             // aeron_driver_main_do_work here too (second-pumper race, spec Sec 3.6).
-            std::this_thread::sleep_for(std::chrono::microseconds{100});
+            if (gw_->doWork(nowNs()) == 0) std::this_thread::yield();
         }
     }
 

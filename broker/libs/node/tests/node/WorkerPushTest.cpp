@@ -47,6 +47,7 @@ protected:
 
     void SetUp() override {
         startDriver();
+        if (HasFatalFailure()) return;  // driver failed to start: don't block in connect
         aeron::Context ctx; ctx.aeronDir(aeronDir_);
         aeron_ = aeron::Aeron::connect(ctx);
         ASSERT_NE(aeron_, nullptr);
