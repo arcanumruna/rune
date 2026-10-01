@@ -1220,3 +1220,146 @@ TEST(LegacyAcksAllRegression, HeldWhileIsrBelowMinIsrAtFire) {
     ASSERT_EQ(R.answers.size(), 1u);
     EXPECT_EQ(R.answers[0].code, 0);
 }
+
+// ============================================================================
+// F15 S2 fix round 1 (review C1, controller ruling Option 1): in the default
+// config the gateway's PSM / LSO / dirty-log mirrors still exist until S4/S5,
+// so the OWNING worker must hand them the append facts AT APPEND (a facts-only
+// return), never only with the final ack — which arrives a replication RTT
+// later, or as an error that carries no facts.
+// ============================================================================
+namespace {
+std::vector<uint8_t> idemBatch(int64_t pid, int16_t epoch, int32_t seq, bool txn = false) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.setTransactional(txn); b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+    b.append("k", "idem", 1000);
+    return b.build();
+}
+void produceIdem(LegacyAcksRig& R, int64_t corr, int64_t pid, int32_t seq, bool txn = false) {
+    const auto f = produceFrame(R.sid, corr, idemBatch(pid, 0, seq, txn), /*acks=all*/1, 0, 0, pid, 0, seq);
+    R.gw.applyProduceForTest(f.data(), f.size());
+}
+} // namespace
+
+TEST(LegacyAcksAllRegression, PipelinedIdempotentAcksAllNotOutOfOrder) {
+    // (a) An idempotent producer pipelines seq 0 and seq 1 (acks=all, default
+    // client maxInFlight 32): seq 1 reaches the gateway's PSM validate while
+    // seq 0's ack is still parked on the HW.  It must be accepted.
+    LegacyAcksRig R({1, 2});
+    produceIdem(R, 1, /*pid=*/7, /*seq=*/0);
+    R.runWorker();
+    produceIdem(R, 2, 7, 1);
+    R.runWorker();
+    ASSERT_TRUE(R.answers.empty()) << "seq 1 answered " << (R.answers.empty() ? 0 : R.answers[0].code)
+                                   << " (20 = OutOfOrderSequence) while seq 0 was parked";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 2) << "both batches appended";
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.size() < 2; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[0].code, 0);
+    EXPECT_EQ(R.answers[1].code, 0);
+}
+
+TEST(LegacyAcksAllRegression, RetryAfterAckTimeoutIsDeduped) {
+    // (b) The batch IS appended, its acks=all ack fails (timeout: the follower
+    // never fetches), the client retries the same sequence → a duplicate: one
+    // copy in the log, answered with the original offset.
+    LegacyAcksRig R({1, 2});
+    produceIdem(R, 1, 7, 0);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    R.now += 31'000'000'000LL;                                // past the 30 s acks=all deadline
+    for (int i = 0; i < 4 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    ASSERT_NE(R.answers[0].code, 0) << "precondition: the ack failed";
+    produceIdem(R, 2, 7, 0);                                  // the client's retry
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the retry of an appended batch was appended again";
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, 0) << "a duplicate is answered OK";
+    EXPECT_EQ(R.answers[1].base, 0) << "with the ORIGINAL offset";
+}
+
+TEST(LegacyAcksAllRegression, TxnBatchRegisteredAtAppendAndCoveredAfterFailedAck) {
+    // (c) A transactional acks=all batch: its open txn is registered AT APPEND
+    // (the read_committed bound is held at its first offset while the ack is
+    // parked), and an ABORT after its ack FAILED still covers it.
+    LegacyAcksRig R({1, 2});
+    produceIdem(R, 1, 7, 0, /*txn=*/true);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    ASSERT_TRUE(R.answers.empty()) << "precondition: the ack is parked";
+    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 1u) << "the open txn is not registered while its ack is parked "
+                                                 "(read_committed bound not held)";
+    R.now += 31'000'000'000LL;
+    for (int i = 0; i < 4 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    ASSERT_NE(R.answers[0].code, 0) << "precondition: the ack failed";
+    const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
+    ASSERT_EQ(R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false),
+              rune::gateway::ClientGateway::kControlRecordAsync);
+    for (int i = 0; i < 64 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker();
+    ASSERT_EQ(R.gw.markersInFlightForTest(), 0u);
+    ASSERT_EQ(R.r->log()->logEndOffset(), 2) << "the ABORT marker landed at 1";
+    bool covered = false;
+    for (const auto& rg : R.gw.abortedRangesForTest(0, 0)) covered = covered || rg.contains(0);
+    EXPECT_TRUE(covered) << "the appended txn batch whose ack failed is not covered by the abort";
+    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 0u);
+}
+
+TEST(LegacyAcksAllRegression, InlinePathStaleAckFailsNotLeaderWithoutDereference) {
+    // Review m5: the gateway's own pendingAcks_ still serves the INLINE path (no
+    // worker pool): an acks=all entry whose partition is removed + freed (and
+    // re-created) resolves through the registry → NotLeader, no dereference.
+    for (bool recreate : {false, true}) {
+        TmpDir d;
+        rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+        NullTransport t;
+        ReplicaRegistry reg;
+        auto mk = [&] {
+            return std::make_unique<PartitionReplica>(cfg(1, 1, 0, 0), Role::Leader, 1,
+                std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, topics.log(0, 0), &t);
+        };
+        reg.add(0, 0, mk());
+        std::vector<int16_t> codes;
+        auto gw = rune::gateway::ClientGateway::makeForTest([&](const uint8_t* b, std::size_t n) -> int64_t {
+            if (auto r = pc::ProduceResponse::decode(b, n)) codes.push_back(r->errorCode);
+            return 1;
+        });
+        gw.setTopicRegistry(&topics);
+        gw.setReplicaRegistry(&reg);
+        gw.setCommittedMetadataReady(true);
+        const int64_t sid = gw.injectTestSession();
+        const auto f = produceFrame(sid, 1, batchAt(0), /*acks=all*/1, 0, 0);
+        gw.applyProduceForTest(f.data(), f.size());
+        ASSERT_EQ(gw.pendingAcksForTest(), 1u) << "precondition: inline acks=all parked in the gateway";
+        reg.remove(0, 0);
+        ASSERT_EQ(reg.collectRetired(reg.generation()), 1u) << "freed";
+        if (recreate) reg.add(0, 0, mk());
+        gw.drainPendingAcksForTest(1);
+        EXPECT_EQ(gw.pendingAcksForTest(), 0u);
+        ASSERT_EQ(codes.size(), 1u) << "recreate=" << recreate;
+        EXPECT_EQ(codes[0], kNotLeader) << "recreate=" << recreate;
+    }
+}
+
+TEST(TxnRoleGateRegression, NoOpEpochTruncationKeepsLogGeneration) {
+    // Review m10: an epoch-change "truncation" at or above the LEO changes
+    // nothing — it must not bump logGeneration (a needless bump can turn a
+    // later single cut into "two changes" and fail a waiter / force an RC rebuild).
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    refetch(rep, concat({batchAt(0), batchAt(1)}), /*leaderHw=*/2);
+    ASSERT_EQ(log.logEndOffset(), 2);
+    const uint64_t gen = rep.logGeneration();
+    rune::replication::FetchResponseMsg fr{};
+    fr.leaderEpoch = 2; fr.partition = 0; fr.highWatermark = 2; fr.errorCode = 0; fr.topicId = rep.topicId();
+    rep.applyReplicated(fr);                                  // epoch upgrade: shared epoch 1 ends at LEO
+    ASSERT_EQ(rep.epoch(), 2);
+    EXPECT_EQ(log.logEndOffset(), 2);
+    EXPECT_EQ(rep.logGeneration(), gen) << "a no-op truncation bumped logGeneration";
+    truncateTo(rep, 5);                                       // OLE answer above the LEO: no-op
+    EXPECT_EQ(rep.logGeneration(), gen);
+}
