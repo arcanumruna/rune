@@ -27,6 +27,11 @@
 //                            per step: hint_ns / probe_ns (mincore) / parse_ns,
 //                            minflt / majflt per step (whole run incl. drops),
 //                            async_hints / sync_hints totals.
+//                            Fix round 3 (m6): p999_us and max_step_minflt (the
+//                            worst minor-fault count inside ONE timed step,
+//                            getrusage outside the timed interval).  Regression
+//                            threshold (controller ticket): p99 <= 20 µs at the
+//                            default 32 KiB budget.
 //   BM_RcWorkerPush/<iso>  — the worker-push egress arm (pushOwnedSubscriptions_)
 //                            of 64 x ~1 KiB non-txn batches on an embedded-driver
 //                            IPC publication (review I-3).  iso 0 / 1 as above.
@@ -242,6 +247,12 @@ void BM_RcWorkerPush(benchmark::State& state) {
 // Read-ahead issuer for the bench: exactly the worker's policy — an async
 // IORING_OP_FADVISE(WILLNEED) where the io backend is io_uring, else the
 // synchronous MADV_WILLNEED.
+#if defined(__linux__)
+constexpr int kRusageWho = RUSAGE_THREAD;   // the worker-thread view
+#else
+constexpr int kRusageWho = RUSAGE_SELF;
+#endif
+
 struct BenchHints {
     rune::node::IoBackend* io = nullptr;
     uint64_t asyncIssued = 0, syncIssued = 0, skipped = 0;
@@ -287,6 +298,7 @@ void BM_RcBuildStep(benchmark::State& state) {
     std::vector<double> us;
     us.reserve(1 << 20);
     uint64_t nonRes = 0, steps = 0;
+    long maxStepMinflt = 0;   // review m6: worst-case minor faults inside ONE step
     auto fresh = [&] {
         auto rc = std::make_unique<RcState>();
         rc->reserve(1024);
@@ -309,10 +321,14 @@ void BM_RcBuildStep(benchmark::State& state) {
             dropCache(log, d.path);
             state.ResumeTiming();
         }
+        struct rusage s0{}, s1{};
+        ::getrusage(kRusageWho, &s0);   // outside the timed interval
         const auto t0 = std::chrono::steady_clock::now();
         benchmark::DoNotOptimize(rc->advance(f, &log, budget));
         const auto t1 = std::chrono::steady_clock::now();
+        ::getrusage(kRusageWho, &s1);
         us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        maxStepMinflt = std::max<long>(maxStepMinflt, s1.ru_minflt - s0.ru_minflt);
         // The worker reaps completions every pass (its existing drain).
         state.PauseTiming();
         (void)io.reap([&](const rune::node::FlushCompletion&) { rc->onHintCompleted(); });
@@ -325,7 +341,9 @@ void BM_RcBuildStep(benchmark::State& state) {
     const double n = static_cast<double>(us.size());
     state.counters["p50_us"] = us[us.size() / 2];
     state.counters["p99_us"] = us[std::min(us.size() - 1, us.size() * 99 / 100)];
+    state.counters["p999_us"] = us[std::min(us.size() - 1, us.size() * 999 / 1000)];
     state.counters["max_us"] = us.back();
+    state.counters["max_step_minflt"] = static_cast<double>(maxStepMinflt);
     state.counters["nonres_frac"] = static_cast<double>(nonRes) / static_cast<double>(std::max<uint64_t>(1, steps));
     state.counters["hint_ns"]  = static_cast<double>(prof.hintNs) / n;     // mean per step
     state.counters["probe_ns"] = static_cast<double>(prof.probeNs) / n;
