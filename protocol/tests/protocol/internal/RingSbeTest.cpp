@@ -250,4 +250,24 @@ TEST(RingSbe, TestTaskOpCarriesOpaquePointersRegression) {
     EXPECT_EQ(dec.egressPub(), 0x0102030405060708ULL);
 }
 
+TEST(RingSbe, OwnershipGuardFieldsAndReturnsRoundTripRegression) {
+    // Task 10 fix 3: replicaId / incarnation / ownershipGen ride every op; the
+    // OWNERSHIP_ACK and CONTROL_RECORD_REFUSED returns decode (no E103).
+    std::array<char, 512> buf{};
+    sbe::WorkerOp enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.opType(sbe::OpType::Value::PRODUCE).topicId(2).partition(5)
+       .targetReplicaId(77).incarnation(9).ownershipGen(123456789ULL)
+       .tailKind(sbe::TailKind::Value::NONE);
+    enc.putTail(nullptr, 0);
+    auto dec = decodeAt<sbe::WorkerOp>(buf.data(), buf.size());
+    EXPECT_EQ(dec.targetReplicaId(), 77u);
+    EXPECT_EQ(dec.incarnation(), 9u);
+    EXPECT_EQ(dec.ownershipGen(), 123456789ULL);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::OWNERSHIP_ACK), 4);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::CONTROL_RECORD_REFUSED), 5);
+    EXPECT_EQ(sbe::ReturnType::get(4), sbe::ReturnType::Value::OWNERSHIP_ACK);
+    EXPECT_EQ(sbe::ReturnType::get(5), sbe::ReturnType::Value::CONTROL_RECORD_REFUSED);
+}
+
 } // namespace

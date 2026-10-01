@@ -93,6 +93,14 @@
            the log is permanently failed and the runtime halts the broker.
            topicId/partition name the log, errorCode carries errno, chunk the dir. -->
       <validValue name="STORAGE_FAILURE">3</validValue>
+      <!-- Worker applied a SET_OWNERSHIP: partition = workerId, lastOffset =
+           ownershipGen.  The runtime frees replicas removed at or below the
+           minimum acked generation (no worker can still reference them). -->
+      <validValue name="OWNERSHIP_ACK">4</validValue>
+      <!-- An APPEND_CONTROL_RECORD refused by the ownership guard (stale
+           routing): topicId / partition / producerId, the marker in chunk.  The
+           runtime re-routes it or surfaces NotLeader to the txn coordinator. -->
+      <validValue name="CONTROL_RECORD_REFUSED">5</validValue>
     </enum>
   </types>
 
@@ -154,6 +162,12 @@
     <field name="egressPub"       id="42" type="uint64"/>
     <!-- SESSION_ANNOUNCE: the client session's egress stream id (channel in the tail). -->
     <field name="egressStreamId"  id="45" type="int32"/>
+    <!-- Ownership guard (Task 10 fix 3): the target replica's dense registry id (targetReplicaId)
+         and incarnation (0 = unregistered / not gated), and for SET_OWNERSHIP
+         the registry generation it reflects (acked back as OWNERSHIP_ACK). -->
+    <field name="targetReplicaId" id="46" type="uint32"/>
+    <field name="incarnation"     id="47" type="uint32"/>
+    <field name="ownershipGen"    id="48" type="uint64"/>
     <!-- which variable field the tail holds -->
     <field name="tailKind"        id="43" type="TailKind"/>
     <!-- variable tail (record batch / replicated records / isr / owned-set) -->
