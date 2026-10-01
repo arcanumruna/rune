@@ -363,6 +363,9 @@ public:
     /// Review I-2: read_committed PushReads held while their partition's RC
     /// state builds (each owes one return; beyond this → notReady fallback).
     static constexpr std::size_t kMaxHeldPushReads = 1024;
+    /// Review m1: async RC read-ahead hints in flight per worker (the rest are
+    /// skipped this pass), so hints never crowd fsyncs out of the io cap.
+    static constexpr std::size_t kMaxRcHintsInFlight = 8;
     [[nodiscard]] std::size_t heldPushReadsForTest() const noexcept { return heldPushReads_.size(); }
     static constexpr int kRcNone     = -1;   ///< no RC state for the partition
     static constexpr int kRcUnbuilt  = 0;
@@ -423,6 +426,16 @@ public:
     [[nodiscard]] uint64_t rcHintsSyncForTest() const noexcept { return rcHintsSync_; }
     [[nodiscard]] uint64_t rcHintsSkippedForTest() const noexcept { return rcHintsSkipped_; }
     [[nodiscard]] uint64_t rcHintErrorsForTest() const noexcept { return rcHintErrors_; }
+    /// Fix round 3 test seams.  Fake async hints: the issuer behaves as on
+    /// io_uring (token routed as RouteKind::Hint, in flight until its
+    /// completion is delivered with deliverCompletionForTest).
+    void setRcFakeAsyncHintsForTest(bool on) noexcept { rcFakeAsyncHints_ = on; }
+    [[nodiscard]] CompletionToken lastRcHintTokenForTest() const noexcept { return lastRcHintToken_; }
+    /// The synchronous hint (default RcState::syncWillNeed).
+    using RcSyncHint = void (*)(void* ctx, const RcReadAheadReq& req);
+    void setRcSyncHintForTest(RcSyncHint fn, void* ctx) noexcept { rcSyncHintFn_ = fn; rcSyncHintCtx_ = ctx; }
+    [[nodiscard]] std::size_t rcHintsInFlightForTest() const noexcept { return rcHintsInFlight_; }
+    [[nodiscard]] bool ioAsyncHintsForTest() const noexcept { return io_.asyncHints(); }
     /// Test seam: an async read-ahead hint of (topicId, partition) completed.
     void completeRcHintForTest(int32_t topicId, int32_t partition) {
         if (RcState* rc = const_cast<RcState*>(rcFor_(topicId, partition))) rc->onHintCompleted();
@@ -3551,17 +3564,21 @@ private:
     static bool rcIssueHint_(void* c, const RcReadAheadReq& req) {
         auto* h = static_cast<RcHintCtx*>(c);
         Worker& w = *h->w;
-        if (w.io_.asyncHints() && req.fd >= 0 && h->log != nullptr) [[likely]] {
+        if ((w.io_.asyncHints() || w.rcFakeAsyncHints_) && req.fd >= 0 && h->log != nullptr) [[likely]] {
             const auto len = static_cast<uint32_t>(std::min<std::size_t>(req.len, UINT32_MAX));
-            const CompletionToken t = w.io_.submitWillNeed(req.fd, req.fileOff, len);
+            const CompletionToken t = w.rcFakeAsyncHints_ ? ++w.rcFakeHintSeq_
+                                                          : w.io_.submitWillNeed(req.fd, req.fileOff, len);
             if (t == kNoToken) { ++w.rcHintsSkipped_; return false; }
             if (!w.routeInsert_(TokenRoute{t, h->log, nullptr, 0, RouteKind::Hint}))
                 spdlog::critical("Worker {}: io token route table full (hint token={})", w.workerId_, t);
             ++w.rcHintsSubmitted_;
+            ++w.rcHintsInFlight_;
+            w.lastRcHintToken_ = t;
             return true;
         }
         ++w.rcHintsSync_;
-        RcState::syncWillNeed(req);
+        if (w.rcSyncHintFn_ != nullptr) w.rcSyncHintFn_(w.rcSyncHintCtx_, req);
+        else                            RcState::syncWillNeed(req);
         return false;
     }
     void installReadAhead_(RcSlot& sl) {
@@ -3574,6 +3591,7 @@ private:
     // A hint's CQE: clear its partition's in-flight flag (by log identity; a
     // purged partition is ignored).  Errors are counted, never fatal.
     void onRcHintCompleted_(const rune::storage::Log* log, int err) noexcept {
+        if (rcHintsInFlight_ > 0) --rcHintsInFlight_;
         if (err != 0) ++rcHintErrors_;
         for (auto& sl : rcSlots_)
             if (sl.hint && sl.hint->log == log) { sl.rc->onHintCompleted(); return; }
@@ -3623,6 +3641,12 @@ private:
     uint64_t         rcHintsSync_      = 0;   // synchronous fallback hints (no io_uring)
     uint64_t         rcHintsSkipped_   = 0;   // SQ / in-flight cap full: skipped this pass
     uint64_t         rcHintErrors_     = 0;   // hint completions with an error (counted, never fatal)
+    bool             rcFakeAsyncHints_ = false;
+    CompletionToken  lastRcHintToken_  = kNoToken;
+    CompletionToken  rcFakeHintSeq_    = CompletionToken{1} << 40;
+    RcSyncHint       rcSyncHintFn_     = nullptr;
+    void*            rcSyncHintCtx_    = nullptr;
+    std::size_t      rcHintsInFlight_  = 0;   // async hints submitted, CQE not reaped yet
     RcReadAhead      rcReadAheadOverride_    = nullptr;
     void*            rcReadAheadOverrideCtx_ = nullptr;
     RcResidencyProbe rcProbeFn_  = nullptr;

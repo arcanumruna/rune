@@ -3610,9 +3610,11 @@ TEST(TxnRcRegression, UringReadAheadIsSubmittedAsynchronously) {
     for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
     R.own(4096);
     if (std::string(R.w->ioBackendNameForTest()) != "uring") GTEST_SKIP() << "io_uring backend not selected";
+    if (!R.w->ioAsyncHintsForTest()) GTEST_SKIP() << "kernel without IORING_OP_FADVISE: sync hints by design";
     R.w->setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
     for (int i = 0; i < 4; ++i) R.pass();
     EXPECT_GE(R.w->rcHintsSubmittedForTest(), 1u);
+    EXPECT_EQ(R.w->rcHintsSyncForTest(), 0u) << "review m4: io_uring must never fall back to a sync hint";
     R.w->setRcResidencyProbeForTest(nullptr, nullptr);
     EXPECT_TRUE(R.runUntilReady(4096));
     EXPECT_EQ(R.w->storageFailureSignalsForTest(), 0u) << "a hint completion was taken for an fsync error";
@@ -3673,4 +3675,160 @@ TEST(TxnRcRegression, MinIsrPinnedOpenTxnHoldsRcAfterIsrRestore) {
     EXPECT_TRUE(T.m.delivered(ru, 0)) << "non-vacuity witness: read_uncommitted egress must deliver offset 0";
     EXPECT_EQ(T.m.deliveredCount(rc), 0u) << "read_committed received data at / past the LSO (the open txn)";
     EXPECT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u);
+}
+
+// ---- F15 S4 fix round 3 (re-review 2: RR2-1, m1, m2, m4, N6) ------------------
+namespace {
+// The page-cache model of a SYNCHRONOUS hint: residency only for the ranges
+// a synchronous hint covered.
+struct SyncCache {
+    int calls = 0;
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+    static void hint(void* c, const RcReadAheadReq& r) {
+        auto* k = static_cast<SyncCache*>(c);
+        ++k->calls;
+        k->ranges.emplace_back(reinterpret_cast<uintptr_t>(r.addr), reinterpret_cast<uintptr_t>(r.addr) + r.len);
+    }
+    static std::size_t probe(void* c, const uint8_t* p, std::size_t len) {
+        auto* k = static_cast<SyncCache*>(c);
+        uintptr_t at = reinterpret_cast<uintptr_t>(p);
+        const uintptr_t end = at + len;
+        bool grew = true;
+        while (grew && at < end) {
+            grew = false;
+            for (const auto& [b, e] : k->ranges)
+                if (b <= at && at < e) { at = std::min(e, end); grew = true; }
+        }
+        return at - reinterpret_cast<uintptr_t>(p);
+    }
+    static void noop(void* c, const RcReadAheadReq&) { ++static_cast<SyncCache*>(c)->calls; }
+};
+} // namespace
+
+TEST(TxnRcRegression, AsyncHintsThatAlwaysFailFallBackToSync) {
+    // RR2-1: IORING_OP_FADVISE needs kernel >= 5.6 (and may be refused by ring
+    // restrictions / seccomp).  If every async hint completes with an error,
+    // the worker must fall back to the synchronous hint — else no page is ever
+    // read ahead and the build never reaches Ready.  Both triggers: an
+    // "unsupported" error (EINVAL) at once, a generic error (EIO) after a few.
+    for (const int err : {EINVAL, EIO}) {
+        RcRig R;
+        R.append(txnBatch(7, 0, 0));
+        for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
+        R.own(4096);
+        SyncCache cache;
+        R.w->setRcResidencyProbeForTest(&SyncCache::probe, &cache);
+        R.w->setRcSyncHintForTest(&SyncCache::hint, &cache);
+        R.w->setRcFakeAsyncHintsForTest(true);
+        CompletionToken delivered = kNoToken;
+        for (int i = 0; i < 4096 && R.status() != Worker::kRcReady; ++i) {
+            R.pass();
+            const CompletionToken t = R.w->lastRcHintTokenForTest();
+            if (t != kNoToken && t != delivered) {
+                R.w->deliverCompletionForTest(FlushCompletion{t, err, 0});
+                delivered = t;
+            }
+        }
+        EXPECT_EQ(R.status(), Worker::kRcReady) << "err=" << err << ": failing async hints stalled the build";
+        EXPECT_GT(R.w->rcHintsSyncForTest(), 0u) << "err=" << err;
+        EXPECT_EQ(R.w->storageFailureSignalsForTest(), 0u) << "a hint error reached the fsync fail-stop";
+        EXPECT_FALSE(R.log->storageFailed());
+        EXPECT_EQ(R.open(), 1u);
+    }
+}
+
+TEST(TxnRcRegression, HintErrorCompletionNeverFailStops) {
+    // Review m4: a hint CQE with an I/O error is counted — never taken for an
+    // fsync failure (no StorageFailure signal, the log stays healthy, a durable
+    // produce still acks OK).
+    RcRig R;
+    for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    R.w->setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
+    R.w->setRcFakeAsyncHintsForTest(true);
+    R.pass();
+    const CompletionToken t = R.w->lastRcHintTokenForTest();
+    ASSERT_NE(t, kNoToken) << "precondition: a hint is in flight";
+    R.w->deliverCompletionForTest(FlushCompletion{t, EIO, 0});
+    EXPECT_EQ(R.w->rcHintErrorsForTest(), 1u);
+    EXPECT_EQ(R.w->storageFailureSignalsForTest(), 0u);
+    EXPECT_FALSE(R.log->storageFailed());
+    ASSERT_TRUE(R.w->tryEnqueueOp(produceOp(R.rep.get(), 5)));
+    R.pass();
+    bool ok = false;
+    for (const auto& r : drainAll(*R.w)) ok = ok || (r.type == WorkerReturn::Type::ProduceResult && r.errorCode == 0);
+    EXPECT_TRUE(ok) << "the partition was failed by a hint error";
+}
+
+TEST(TxnRcRegression, InFlightHintsCappedPerWorker) {
+    // Review m1: a mass leadership change (many partitions building at once on
+    // one worker) must not fill the shared io in-flight cap with hints — at
+    // most kMaxRcHintsInFlight per worker, the rest skipped this pass.
+    constexpr int kParts = 12;
+    TmpDir d;
+    NullTransport t;
+    std::vector<std::unique_ptr<Log>> logs;
+    std::vector<std::unique_ptr<PartitionReplica>> reps;
+    Worker::OwnedSet owned;
+    for (int p = 0; p < kParts; ++p) {
+        auto dir = d.path / ("p" + std::to_string(p));
+        fs::create_directories(dir);
+        logs.push_back(std::make_unique<Log>(dir.string(), 64LL * 1024 * 1024));
+        logs.back()->recover();
+        for (int i = 0; i < 16; ++i) appendAt(*logs.back(), bigBatch(1000));
+        reps.push_back(std::make_unique<PartitionReplica>(cfg(1, 1, 1, p), Role::Leader, 1, std::vector<NodeId>{1},
+                                                          std::vector<NodeId>{1}, logs.back().get(), &t));
+        reps.back()->onLeaderLogAppended();
+        owned.push_back(reps.back().get());
+    }
+    Worker w(0, 1 << 22, 1 << 23, 64, 64);
+    w.setRcScanBytesPerPass(4096);
+    w.setOwnedDirect(owned);
+    w.setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
+    w.setRcFakeAsyncHintsForTest(true);
+    for (int i = 0; i < 4; ++i) w.doWork(2 + i);
+    EXPECT_LE(w.rcHintsInFlightForTest(), Worker::kMaxRcHintsInFlight) << "hints crowd the io in-flight cap";
+    EXPECT_GT(w.rcHintsSkippedForTest(), 0u);
+}
+
+TEST(TxnRcRegression, SyncHintFallbackBacksOff) {
+    // Review m2: the synchronous fallback re-requests a non-resident window
+    // with a doubling pass backoff (as N3) — not one madvise per pass.
+    RcRig R;
+    for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    SyncCache cache;
+    R.w->setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
+    R.w->setRcSyncHintForTest(&SyncCache::noop, &cache);
+    for (int i = 0; i < 128; ++i) R.pass();
+    EXPECT_GT(cache.calls, 1) << "the window must still be re-requested (RR1-1)";
+    EXPECT_LE(cache.calls, 16) << "a synchronous hint per pass while nothing is resident (" << cache.calls << ")";
+}
+
+TEST(TxnRcRegression, HeldPushReadUnansweredOnOwnershipLossRegistered) {
+    // Review N6: the production (registered, non-zero incarnation) branch of a
+    // held read's ownership loss: answered unanswered (bound -1), never kept.
+    EosRig R;
+    for (int i = 0; i < 64; ++i) appendAt(*R.r->log(), bigBatch(1000));
+    R.r->onLeaderLogAppended();
+    R.runWorker(2);
+    R.w().setRcScanBytesPerPass(1024);
+    R.r->becomeFollower(R.r->epoch(), 2);
+    R.r->becomeLeader(R.r->epoch() + 1, {1});
+    R.runWorker(3);
+    ASSERT_NE(R.w().rcStatusForTest(0, 0), Worker::kRcReady) << "precondition: building";
+    ASSERT_NE(R.r->incarnation(), 0u) << "precondition: a registered replica";
+    ASSERT_TRUE(R.w().tryEnqueueOp(pushReadIso(R.r, 77, 0, R.r->log()->logEndOffset(), 1)));
+    R.w().doWork(4);
+    ASSERT_TRUE(drainAll(R.w()).empty()) << "precondition: held";
+    WorkerOp so;
+    so.type = WorkerOp::Type::SetOwnership;
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(so)));
+    R.w().doWork(5);
+    std::vector<WorkerReturn> rs;
+    for (auto& r : drainAll(R.w())) if (r.type == WorkerReturn::Type::PushReadResult) rs.push_back(std::move(r));
+    ASSERT_EQ(rs.size(), 1u) << "a held read survived the ownership loss";
+    EXPECT_EQ(rs[0].pushEffectiveBound(), -1);
+    EXPECT_TRUE(rs[0].chunk.empty());
+    EXPECT_EQ(R.w().heldPushReadsForTest(), 0u);
 }
