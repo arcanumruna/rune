@@ -361,14 +361,35 @@ public:
     // Progress-driven condition wait: run the gateway until done() holds, yielding
     // only on idle passes (the driver thread delivers asynchronously).  Bounded by
     // a pass cap, not a wall clock; callers assert done() afterwards.
-    void pump(std::function<bool()> done, int iterations = kPumpIter)
+    void pump(std::function<bool()> done, int64_t cap = 4'000'000)
     {
-        const int64_t cap = std::max<int64_t>(iterations, 4'000'000);
         for (int64_t i = 0; i < cap && !done(); ++i) {
             // driverThread_ (startDriver()) is the driver's ONE pumper; do not pump
             // aeron_driver_main_do_work here too (second-pumper race, spec Sec 3.6).
             if (gw_->doWork(nowNs()) == 0) std::this_thread::yield();
         }
+    }
+
+    // For ABSENCE checks ("X must NOT be delivered"): run until the system is
+    // observably quiescent — kQuiet consecutive passes in which the gateway did
+    // no work AND no new frame arrived — instead of burning an arbitrary number
+    // of passes.  Returns false (and the caller fails) if it never settles.
+    [[nodiscard]] bool pumpUntilQuiescent(int kQuiet = 2'000, int64_t cap = 4'000'000)
+    {
+        int quiet = 0;
+        std::size_t lastFrames = allFrames_.size();
+        for (int64_t i = 0; i < cap; ++i) {
+            const int w = gw_->doWork(nowNs());
+            const std::size_t f = allFrames_.size();
+            if (w == 0 && f == lastFrames) {
+                if (++quiet >= kQuiet) return true;
+                std::this_thread::yield();
+            } else {
+                quiet = 0;
+            }
+            lastFrames = f;
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -883,7 +904,7 @@ TEST_F(ReadCommittedPushFixture, GroupReadUncommittedSeesAbortedAfterCarrier)
     // Pump several cycles WITHOUT sending the carrier.
     // Before the fix: nextOffset would advance past the aborted records.
     // After the fix: nextOffset stalls at offset 5 (first aborted batch).
-    pump([&]() { return false; }, 200);  // run 200 duty cycles unconditionally
+    ASSERT_TRUE(pumpUntilQuiescent()) << "gateway never quiesced pre-carrier";
 
     // Verify: pre-carrier, batches 0..4 may have been delivered but NOT 5..7 or 9.
     // (nextOffset must not have advanced past 5 into the aborted records.)
@@ -1155,8 +1176,8 @@ TEST_F(ReadCommittedRebuildOnFailoverFixture, OpenTxnPinsLsoAfterFailover)
         return has0 && has1 && has2;
     });
 
-    // Run a few more cycles to confirm offset 3 does NOT leak.
-    pump([&]() { return false; }, 500);
+    // Run until quiescent to confirm offset 3 does NOT leak.
+    ASSERT_TRUE(pumpUntilQuiescent()) << "gateway never quiesced after the LSO check";
 
     const auto delivered = extractBaseOffsets(sid, allFrames_);
 

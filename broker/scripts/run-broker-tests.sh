@@ -26,9 +26,32 @@ echo "== tier 1: fast tests (-j$LIGHT_J, no lock)"
 ctest --test-dir "$B" -E "$HEAVY_RE" -j "$LIGHT_J" --timeout 300 "$@"; rc1=$?
 
 echo "== tier 2: heavy multi-node tests (-j2, waiting for /tmp/rune-heavy.lock)"
-until mkdir /tmp/rune-heavy.lock 2>/dev/null; do sleep 5; done
-trap 'rmdir /tmp/rune-heavy.lock 2>/dev/null' EXIT INT TERM
+LOCK=/tmp/rune-heavy.lock
+# Owned lock: our pid lives in $LOCK/pid.  A lock whose recorded owner is dead
+# (SIGKILL / OOM / crash) is stale and reclaimed; we only ever remove a lock
+# that records OUR pid.  (Legacy holders using plain mkdir/rmdir write no pid
+# file and are simply waited for.)
+acquire_lock() {
+  while :; do
+    if mkdir "$LOCK" 2>/dev/null; then echo $$ > "$LOCK/pid"; return 0; fi
+    owner=$(cat "$LOCK/pid" 2>/dev/null || true)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      echo "reclaiming stale $LOCK (owner pid $owner is gone)" >&2
+      rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true
+      continue
+    fi
+    sleep 5
+  done
+}
+release_lock() {
+  [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true
+}
+acquire_lock
+trap 'release_lock' EXIT
+trap 'release_lock; exit 130' INT
+trap 'release_lock; exit 143' TERM
 ctest --test-dir "$B" -R "$HEAVY_RE" -j2 --timeout 300 "$@"; rc2=$?
-rmdir /tmp/rune-heavy.lock 2>/dev/null; trap - EXIT INT TERM
+release_lock
 
 [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ]
