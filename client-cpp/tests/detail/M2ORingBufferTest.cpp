@@ -392,3 +392,20 @@ TEST(M2ORingBuffer, M2OCloseLinearizesWithClaimsRegression) {
         ASSERT_EQ(r.ring.tryClaim(kMsgTypeId, sizeof(Rec)), M2ORingBuffer::kClaimClosed);
     }
 }
+
+// F8c C1(a) fix round 1: a CLOSED ring that is also FULL reports kClaimClosed,
+// never INSUFFICIENT_CAPACITY (-2) — a writer that retries on -2 (back-pressure)
+// would otherwise spin forever on a ring that will never drain for it.
+TEST(M2ORingBuffer, M2OClosedFullRingReturnsClaimClosedRegression) {
+    Ring r(512);
+    int n = 0;
+    while (r.writeOne(static_cast<uint8_t>(n))) ++n;
+    ASSERT_EQ(n, 12);
+    ASSERT_EQ(r.ring.tryClaim(kMsgTypeId, kPayloadLen), -2) << "full and open: back-pressure";
+    ASSERT_TRUE(r.ring.close());
+    EXPECT_EQ(r.ring.tryClaim(kMsgTypeId, kPayloadLen), M2ORingBuffer::kClaimClosed)
+        << "full and closed: Closed, not back-pressure";
+    EXPECT_EQ(readAll(r.ring).size(), 12u) << "pre-close records still drain";
+    EXPECT_EQ(r.ring.tryClaim(kMsgTypeId, kPayloadLen), M2ORingBuffer::kClaimClosed)
+        << "drained and closed: Closed";
+}

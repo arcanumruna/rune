@@ -514,8 +514,9 @@ private:
     void storeRelaxed64_(aeron::util::index_t off, std::int64_t v) noexcept {
         __atomic_store_n(word64_(off), v, __ATOMIC_RELAXED);
     }
-    bool compareAndSet64_(aeron::util::index_t off, std::int64_t expected,
-                          std::int64_t desired) noexcept {
+    /// CAS that reports the observed value in `expected` on failure (the witness).
+    bool compareAndSwap64_(aeron::util::index_t off, std::int64_t& expected,
+                           std::int64_t desired) noexcept {
         return __atomic_compare_exchange_n(word64_(off), &expected, desired, /*weak=*/false,
                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     }
@@ -584,22 +585,30 @@ private:
         const aeron::util::index_t mask = capacity - 1;
 
         std::int64_t head = loadAcquire64_(headCachePositionIndex);
-        std::int64_t tail, newTail;
+        std::int64_t newTail;
         aeron::util::index_t tailIndex, padding, writeIndex;
 
-        do {
-            tail = loadAcquire64_(tailPositionIndex);
-            // F8c C1(a): closed (sign bit) — decided on the SAME word the CAS
-            // below targets, so a close between this load and the CAS fails the
-            // CAS and the retry sees it: claims are linearized with the close.
-            if (tail < 0) [[unlikely]] return kClaimClosed;
+        // F8c C1(a): the closed flag is bit 63 of the tail word.  The CAS's
+        // EXPECTED value is always the masked (open) position, so a closed word
+        // can never match: a claim succeeds only on an open tail, and every
+        // claim is totally ordered with close() (one RMW on the same word).
+        // The success path is load, AND, compute, CAS — the closed test runs
+        // only on a failed CAS (already the contended path) and on the cold
+        // full-ring return.  Do NOT drop the mask: an expected value carrying
+        // the bit would let the CAS move a closed tail.
+        for (;;) {
+            const std::int64_t raw  = loadAcquire64_(tailPositionIndex);
+            const std::int64_t tail = raw & TAIL_POSITION_MASK;
             const aeron::util::index_t availableCapacity =
                 capacity - static_cast<aeron::util::index_t>(tail - head);
 
             if (requiredCapacity > availableCapacity) {
                 head = loadAcquire64_(m_headPositionIndex);
                 if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
-                    return INSUFFICIENT_CAPACITY;
+                    // Cold: report closed from the value already loaded (closed
+                    // is sticky), so a writer retrying on -2 can never livelock
+                    // on a closed, full ring.
+                    return raw < 0 ? kClaimClosed : INSUFFICIENT_CAPACITY;
                 }
                 storeRelease64_(headCachePositionIndex, head);
             }
@@ -625,7 +634,10 @@ private:
                 padding = toBufferEndLength;
                 newTail += padding;
             }
-        } while (!compareAndSet64_(tailPositionIndex, tail, newTail));
+            std::int64_t witness = tail;
+            if (compareAndSwap64_(tailPositionIndex, witness, newTail)) break;
+            if (witness < 0) [[unlikely]] return kClaimClosed;
+        }
 
         if (0 != padding) {
             storeRelease32_(RD::RecordDescriptor::lengthOffset(tailIndex), -padding);
