@@ -101,6 +101,19 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_single_driver_pumper.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # F9a guard (user law 2026-10-01): no std::atomic / mutex / lock /
+    # thread_local in production code (libs/**, src/**; test code excluded)
+    # outside scripts/atomics_allowlist.txt — ring-buffer internals, the
+    # LogCleaner channel, and TEMPORARY slice-B / unscoped entries.  Stale
+    # allowlist entries fail too, so converted sites must leave the list.
+    add_test(NAME NoAtomicsGuardSelfTestRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics.py --selftest)
+    add_test(NAME NoAtomicsOrMutexesOutsideAllowlistRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # gtest_discover_tests() defaults to running each test binary with

@@ -1,0 +1,63 @@
+# atomics_allowlist.txt — the ONLY places std::atomic / locks / memory-ordering
+# primitives may appear in production code (scripts/check_no_atomics.py,
+# ctest NoAtomicsOrMutexesOutsideAllowlistRegression).
+#
+# Format:  <path> | <token on the offending line, or *> | <CATEGORY> | <reason>
+# CATEGORY:
+#   RING     — inside a ring-buffer implementation (permanent).
+#   CLEANER  — the off-thread LogCleaner/compaction channel (permanent, user law).
+#   SLICE-B  — TEMPORARY: F9 slice B converts these, then deletes the entry.
+#   UNSCOPED — TEMPORARY: outside slice A and slice B as briefed; must be
+#              scheduled + converted (never add new ones to dodge the guard).
+# A stale entry (matches nothing) FAILS the guard: delete entries as sites go.
+
+# --------------------------------------------------------------------- RING
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | * | RING | agrona M2O ring copy: release fences inside the ring
+libs/node/include/rune/node/detail/O2ORingBuffer.h | * | RING | agrona O2O ring copy: release fences inside the ring
+libs/node/include/rune/node/UringFlushBackend.h | __atomic_ | RING | io_uring CQ ring head/tail (kernel-shared ring protocol)
+libs/node/src/UringFlushBackend.cpp | __atomic_ | RING | io_uring SQ ring head/tail (kernel-shared ring protocol)
+libs/storage/include/rune/storage/Log.h | renameReqHead_ | RING | Log deferred-rename SPSC ring index (append -> bg)
+libs/storage/include/rune/storage/Log.h | renameReqTail_ | RING | Log deferred-rename SPSC ring index (append -> bg)
+libs/storage/include/rune/storage/Log.h | renameDoneHead_ | RING | Log deferred-rename SPSC ring index (bg -> append)
+libs/storage/include/rune/storage/Log.h | renameDoneTail_ | RING | Log deferred-rename SPSC ring index (bg -> append)
+
+# ------------------------------------------------------------------ CLEANER
+libs/storage/include/rune/storage/Log.h | #include <atomic> | CLEANER | Log cleaner channel (swap/delete rings, sealed snapshot)
+libs/storage/include/rune/storage/Log.h | swapHead_ | CLEANER | cleaner -> append swap ring index
+libs/storage/include/rune/storage/Log.h | swapTail_ | CLEANER | cleaner -> append swap ring index
+libs/storage/include/rune/storage/Log.h | deleteHead_ | CLEANER | cleaner -> append retention-delete ring index
+libs/storage/include/rune/storage/Log.h | deleteTail_ | CLEANER | cleaner -> append retention-delete ring index
+libs/storage/include/rune/storage/Log.h | sealedSnapshot_ | CLEANER | append -> cleaner sealed-segment snapshot publish
+libs/storage/src/Log.cpp | sealedSnapshot_ | CLEANER | append -> cleaner sealed-segment snapshot publish
+
+# ------------------------------------------------------------------ SLICE-B
+libs/replication/include/rune/replication/PartitionReplica.h | #include <atomic> | SLICE-B | PartitionReplica published* (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | lastCleanOffset_ | SLICE-B | PartitionReplica cleaner-facing published state (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | publishedHwForCleaner_ | SLICE-B | PartitionReplica published* (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | publishedRoleForCleaner_ | SLICE-B | PartitionReplica published* (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | publishedIsrSizeForGateway_ | SLICE-B | PartitionReplica published* (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | publishedControllerEpoch_ | SLICE-B | PartitionReplica published* (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | publishedReplicaLeo_ | SLICE-B | PartitionReplica published* (slice B)
+libs/replication/include/rune/replication/PartitionReplica.h | #include <mutex> | SLICE-B | PartitionReplica mu_ pending-queue lock (NOT in the slice-B brief list; same file — flagged)
+libs/replication/include/rune/replication/PartitionReplica.h | lock_guard lk(mu_) | SLICE-B | PartitionReplica mu_ pending-queue lock (flagged, see above)
+libs/replication/include/rune/replication/PartitionReplica.h | std::mutex           mu_ | SLICE-B | PartitionReplica mu_ pending-queue lock (flagged, see above)
+libs/gateway/include/rune/gateway/ClientGateway.h | #include <atomic> | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/gateway/include/rune/gateway/ClientGateway.h | minIsr_ | SLICE-B | ClientGateway::minIsr_ (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | #include <atomic> | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | observedEpoch_ | SLICE-B | ReplicationMetadataBridge observers (slice B)
+libs/node/include/rune/node/ReplicationMetadataBridge.h | observedIsLeader_ | SLICE-B | ReplicationMetadataBridge observers (slice B)
+
+# ----------------------------------------------------------------- UNSCOPED
+libs/storage/include/rune/storage/Log.h | preparedSegment_ | UNSCOPED | bg pre-provisioning hand-off (not cleaner): convert to a ring hand-off
+libs/storage/include/rune/storage/Log.h | preprovInFlight_ | UNSCOPED | bg pre-provisioning in-flight flag (not cleaner): owner-state + ring
+libs/metadata/include/rune/metadata/RoutingImage.h | #include <atomic> | UNSCOPED | RoutingImage atomic shared_ptr publish (metadata): convert to ring-delivered image
+libs/metadata/include/rune/metadata/RoutingImage.h | atomic_store_explicit | UNSCOPED | RoutingImage atomic shared_ptr publish (metadata)
+libs/metadata/include/rune/metadata/RoutingImage.h | atomic_load_explicit | UNSCOPED | RoutingImage atomic shared_ptr publish (metadata)
+libs/transaction/src/ControlMarker.cpp | #include <mutex> | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ControlMarker.cpp | cm_crc32c_once | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ReplicatedTxnStateStore.cpp | #include <mutex> | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/ReplicatedTxnStateStore.cpp | crc_once | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/TransactionLog.cpp | #include <mutex> | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/transaction/src/TransactionLog.cpp | crc32c_tbl_once | UNSCOPED | call_once CRC table init: replace with a constexpr table
+libs/coordination/include/rune/coordination/GroupCoordinator.h | #include <atomic> | UNSCOPED | unused <atomic> include: delete
+libs/node/include/rune/node/Worker.h | #include <atomic> | UNSCOPED | unused <atomic> include (Worker is mid-change on another branch): delete
