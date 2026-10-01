@@ -657,10 +657,13 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     }
 
 
-    // FETCH CONFLATION + NO-DUP-FETCH (spec §3.5) — FollowerSlots.h.  Decided
-    // BEFORE the liveness update (B-2): the decision is slot-local (no ISR/HW
-    // input), and it lets the single log read below happen ONLY for a Data serve
-    // — a conflated or ack-only fetch reads nothing, exactly as before.
+    // FETCH CONFLATION + NO-DUP-FETCH (spec §3.5) — FollowerSlots.h: an IDENTICAL
+    // request (same fetchOffset AND LEO) within kFetchResendNs is conflated — a
+    // behind follower re-fetches the same range while its prior response is in
+    // flight, and re-serving it would flood its ingress ring with duplicate apply
+    // ops.  Decided BEFORE the liveness update (B-2): the decision is slot-local
+    // (no ISR/HW input), and it lets the single log read below happen ONLY for a
+    // Data serve — a conflated or ack-only fetch reads nothing, as before.
     FollowerSlot* const slot = followerSlots_.find(req.followerId);
     const FetchServe serve = slot
         ? decideFetchServe(*slot, req.fetchOffset, req.maxBytes, logEndOffset_(),
@@ -733,17 +736,9 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         maybeCompleteLeadership();
     }
 
-    // FETCH CONFLATION: if we already served this follower the IDENTICAL response
-    // (same fetchOffset AND same current LEO) within kFetchResendNs, skip re-serving.
-    // A behind/stuck follower re-fetches the same range on every apply + 5ms tick
-    // while its prior response is still in flight/unapplied — re-sending it floods
-    // the follower's ingress ring with duplicate (already-applied) apply ops that
-    // head-of-line-block the useful ones.  ISR liveness + HW were already updated
-    // above, so skipping the RESPONSE is safe; the timeout re-serve recovers a
-    // genuinely lost push/response.  (Does NOT touch the DR reconcile/ahead-follower
-    // paths handled earlier.)
-    // FETCH CONFLATION + NO-DUP-FETCH (spec §3.5) — FollowerSlots.h.  ISR liveness
-    // and HW were updated above, so answering ack-only or nothing is safe.
+    // Conflated (decided above): an identical response is still in flight — ISR
+    // liveness + HW were updated above, so skipping the RESPONSE is safe; the
+    // timeout re-serve recovers a genuinely lost push/response.
     if (serve == FetchServe::Conflate) return kErrNone;
 
     // Read records (Data only; AckOnly answers the HW with no records).

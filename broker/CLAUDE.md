@@ -103,6 +103,12 @@ net.core.netdev_max_backlog=100000
    give ~512 KiB; the profile above gives ~4 MiB — keep the client's `min(RUNE_BATCH_BYTES, RUNE_MAX_FRAME_BYTES)`
    below it.  A batch STORED above the current frame (e.g. after shrinking these sizes) is unreplicable: the
    leader answers kErrRecordTooLarge and followers wedge at that offset and leave the ISR (logged + counted).
+5. Frame uniformity (F18): keep every node's follower apply frame (`RUNE_WORKER_INGRESS_RING_BYTES/8`) ≥
+   `min(maxFetchBytes = 1 MiB, the leader's push frame = min(RUNE_REPL_OUTBOUND_RING_BYTES/8, RUNE_AERON_TERM_BUFFER_BYTES/8))`.
+   Otherwise a coalesced multi-batch push above the follower's frame is dropped (never wedged) and the follower
+   catches up via its capped fetch — ~20 ms per dropped push.  Equal sizes are NOT enough (a uniform 4 MiB worker
+   ring gives a 524,037 B apply frame < the default 524,226 B push frame); the default 32 MiB worker ring (~4 MiB
+   frame ≥ 1 MiB) always satisfies it.
 
 ### ccx23 runtime note
 gcc-13 binaries need newer libstdc++ → copy build-agent's `libstdc++.so.6` to `/root/rune-libs` +
