@@ -108,6 +108,10 @@ public:
     /// its caller frees the impl.  Nobody waits (OneToOneRingBuffer's I5 word).
     bool detachProducer() noexcept { return ring_.detachProducer(); }
     bool detachConsumer() noexcept { return ring_.detachConsumer(); }
+    /// F8c C7 fix round 2 (F1): the handle's detach with its release ORPHANED
+    /// (the command ring was full) — the duty side applies it.
+    bool detachConsumerOrphaned() noexcept { return ring_.detachConsumerOrphaned(); }
+    [[nodiscard]] bool consumerOrphaned() const noexcept { return ring_.consumerOrphaned(); }
     /// Either side (acquire): the duty side detached — it never touches the
     /// impl (or its Client) again; the handle owns it alone.
     [[nodiscard]] bool producerDetached() const noexcept { return ring_.producerDetached(); }

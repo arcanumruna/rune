@@ -332,6 +332,14 @@ public:
     void testForceIngressOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
         agent_.testForceIngressOffers(r, n);
     }
+    /// F8c C7 F1 test seam (duty thread / Invoker owner): put a Ping frame of
+    /// the current seed session on the command ring as a kMsgSend — with
+    /// testForceIngressOffers(Retry, ...) it ABORTs and stays at the ring head.
+    bool testSubmitSessionPing() {
+        uint8_t buf[64]{};
+        const std::size_t n = codec::encodePing(buf, sizeof buf, "x", agent_.stateAndSessionId().sessionId, 1);
+        return n != 0 && agent_.submitSend(buf, n);
+    }
     /// F8a fix1 test hook: called on the submitting thread each time a
     /// lifecycle hub command (unsubscribe / GroupConsumer close) finds the
     /// command ring full and waits for duty-thread progress.  Set before use.
@@ -657,6 +665,12 @@ private:
     int  reapReleases_() noexcept;
     /// Client close (after every hub finished): hand every still-held impl back.
     void handBackAll_() noexcept;
+    /// F8c C7 fix round 2 (F1): a release that found the command ring full is
+    /// ORPHANED (no command, no wait); the duty side discovers and applies it.
+    void orphanRelease_(const detail::HubCommand& cmd) noexcept;
+    void noteOrphan_(detail::HandleKind kind, void* impl, std::int64_t fence);
+    void scanOrphans_();
+    int  applyDueOrphans_();
 
     // ---- F8c C7: Client::close()'s drain ----------------------------------------
     OpResult issueDrain_(Completions& q, Token token);
@@ -1020,6 +1034,7 @@ private:
     // reapReleases_() (never inside a walk) or handed back at close.
     std::vector<producer::TransactionalProducerImpl*> txnProducers_;
     std::vector<PendingRelease> releases_;  // duty-thread owned (C7)
+    std::vector<PendingRelease> orphans_;   // duty-thread owned (C7 F1): orphaned, not yet applied
     uint64_t implsHandedBack_ = 0;          // closing thread (C7 test hook)
     struct DrainWaiter {
         DutyTarget target{};

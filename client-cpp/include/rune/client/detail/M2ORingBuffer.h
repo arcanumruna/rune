@@ -69,6 +69,7 @@ public:
         m_consumerHeartbeatIndex    = m_capacity + CONSUMER_HEARTBEAT_OFFSET;
         m_consumerFinishedIndex     = m_capacity + CONSUMER_FINISHED_OFFSET;
         m_detachIndex               = m_capacity + DETACH_OFFSET;
+        m_orphanHintIndex           = m_capacity + ORPHAN_HINT_OFFSET;
     }
 
     M2ORingBuffer(const M2ORingBuffer&)            = delete;
@@ -152,6 +153,29 @@ public:
     /// Either side (acquire): has the producer side (the handle) detached?
     [[nodiscard]] bool producerDetached() const noexcept {
         return (loadAcquire64_(m_detachIndex) & kDetachedProducer) != 0;
+    }
+    /// F8c C7 fix round 2 (F1): the producer side (the handle) detaches AND
+    /// marks its release as ORPHANED (it could not be put on the command ring:
+    /// full) in the same RMW — the duty side discovers it (orphanHint below)
+    /// and applies the release itself.  Returns true iff the consumer side had
+    /// already detached (the caller frees the owner).
+    bool detachProducerOrphaned() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedProducer | kOrphanRelease,
+                                  __ATOMIC_ACQ_REL) & kDetachedConsumer) != 0;
+    }
+    [[nodiscard]] bool producerOrphaned() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kOrphanRelease) != 0;
+    }
+
+    /// F8c C7 fix round 2 (F1), on a COMMAND ring: "an orphaned handle release
+    /// exists — scan for it".  Any thread raises it (release) AFTER marking its
+    /// impl orphaned; the consumer takes it (one acquire load per duty cycle;
+    /// the RMW only when raised), then scans.  A raise racing the take is
+    /// either seen by this scan or leaves the hint up for the next one.
+    void raiseOrphanHint() noexcept { __atomic_store_n(word64_(m_orphanHintIndex), 1, __ATOMIC_RELEASE); }
+    [[nodiscard]] bool takeOrphanHint() noexcept {
+        if (loadAcquire64_(m_orphanHintIndex) == 0) [[likely]] return false;
+        return __atomic_exchange_n(word64_(m_orphanHintIndex), 0, __ATOMIC_ACQ_REL) != 0;
     }
 
     /// Test seam (fix5 / F8c fix round 1): turn a claim returned by tryClaim()
@@ -516,8 +540,10 @@ private:
     static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10; // matches Aeron
     static constexpr aeron::util::index_t CONSUMER_FINISHED_OFFSET   = CL * 11; // Rune (I2): spare line
     static constexpr aeron::util::index_t DETACH_OFFSET              = CL * 9;  // Rune (C7): spare line
+    static constexpr aeron::util::index_t ORPHAN_HINT_OFFSET         = CL * 1;  // Rune (C7 F1): spare line
     static constexpr std::int64_t kDetachedProducer = 1;
     static constexpr std::int64_t kDetachedConsumer = 2;
+    static constexpr std::int64_t kOrphanRelease    = 4;
     static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 12; // matches Aeron
     static constexpr aeron::util::index_t INSUFFICIENT_CAPACITY      = -2;
     // The tail word: bit 63 = closed (positions never reach 2^63), bits 0..62 =
@@ -715,6 +741,7 @@ private:
     aeron::util::index_t m_consumerHeartbeatIndex   = 0;
     aeron::util::index_t m_consumerFinishedIndex = 0;
     aeron::util::index_t m_detachIndex           = 0;
+    aeron::util::index_t m_orphanHintIndex       = 0;
 };
 
 } // namespace rune::client::detail

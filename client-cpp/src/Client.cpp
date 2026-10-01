@@ -159,12 +159,24 @@ Client::Client(ClientConfig cfg)
     // single-owner ProducerHub list.  F8c C7: the record carries the impl itself
     // (no shared_ptr holder) — from here the duty side holds its share (§3.3).
     agent_.setProducerRegisterFn([this](void* impl) {
-        producerHub_.add(static_cast<producer::ProducerImpl*>(impl));
+        auto* p = static_cast<producer::ProducerImpl*>(impl);
+        producerHub_.add(p);
+        // F1: its handle orphaned the release before this adoption: a scan
+        // could not see it yet — queue it now (its fence keeps FIFO).
+        if (p->releaseOrphaned() && !p->releaseNoted) {
+            p->releaseNoted = true;
+            noteOrphan_(detail::HandleKind::Producer, p, p->orphanFence());
+        }
     });
     // Same hand-off for transactional producers (was a mutex-guarded vector that
     // the runner locked and copied every duty cycle).
     agent_.setTxnProducerRegisterFn([this](void* impl) {
-        txnProducers_.push_back(static_cast<producer::TransactionalProducerImpl*>(impl));
+        auto* t = static_cast<producer::TransactionalProducerImpl*>(impl);
+        txnProducers_.push_back(t);
+        if (t->status.consumerOrphaned() && !t->releaseNoted) {  // F1: see producers
+            t->releaseNoted = true;
+            noteOrphan_(detail::HandleKind::TxnProducer, t, t->orphanFence);
+        }
         agent_.setForwardProduceResponses(true);  // txn producers consume raw ProduceResponses
     });
 
@@ -1462,6 +1474,10 @@ int Client::dutyCycle(int64_t nowNs) {
     //    end of the cycle, outside every hub walk (a released impl is freed
     //    only once nothing references it: never under a running handler).
     if (!drainWaiters_.empty()) [[unlikely]] work += checkDrain_();
+    // F8c C7 fix round 2 (F1): orphaned releases (one acquire load per cycle
+    // when none exists), applied in FIFO order behind the handle's own ops.
+    if (agent_.takeOrphanHint()) [[unlikely]] scanOrphans_();
+    if (!orphans_.empty()) [[unlikely]] work += applyDueOrphans_();
     if (!releases_.empty()) [[unlikely]] work += reapReleases_();
     return work;
 }
@@ -2483,43 +2499,122 @@ detail::HubSubmit Client::submitRelease_(const detail::HubCommand& cmd) {
     }
     // Any other thread (spec §3.3): a lifecycle command on the command ring —
     // FIFO behind this handle's own ops; it never touches duty state itself
-    // (the Invoker owner may be pumping right now).  A full ring is waited out
-    // on the consumer's progress.  Closed: close() is in progress elsewhere
-    // and hands the impl back.
+    // (the Invoker owner may be pumping right now).  Closed: close() is in
+    // progress elsewhere and hands the impl back.
     //
-    // F8c C7 fix round 1 (I-2): Invoker mode has no runner — if NOBODY drains
-    // (the documented join-then-destroy: the owner stopped pumping), waiting
-    // for room would never end.  The bound is the Invoker liveness contract
-    // itself: the owner must call doWork() at least every
-    // aeronClientLivenessTimeoutNs (else the Aeron client closes itself), so a
-    // command-ring head that has not moved for that long has no pumper.  The
-    // handle then lets go of its share without a release; the impl stays with
-    // the duty side and Client close (handBackAll_) frees it.  Thread mode: the
-    // runner always drains — no bound needed.
-    aeron::concurrent::BackoffIdleStrategy idle(
-        10, 20, std::chrono::duration<long, std::nano>(1'000),
-        std::chrono::duration<long, std::nano>(100'000));
-    const bool invoker = cfg_.runnerMode == RunnerMode::Invoker;
-    std::int64_t lastHead  = invoker ? agent_.commandRingHead() : 0;
-    auto         lastMoved = std::chrono::steady_clock::now();
-    for (;;) {
-        const auto r = agent_.submitHubCommand(cmd);
-        if (r == agent::ClientAgent::Submit::Accepted) return detail::HubSubmit::Accepted;
-        if (r == agent::ClientAgent::Submit::Closed) return detail::HubSubmit::Closed;
-        if (testHubCommandRingFullHook_) [[unlikely]] testHubCommandRingFullHook_();
-        if (invoker) {
-            const std::int64_t head = agent_.commandRingHead();
-            const auto         t    = std::chrono::steady_clock::now();
-            if (head != lastHead) {
-                lastHead  = head;
-                lastMoved = t;
-            } else if (std::chrono::duration_cast<std::chrono::nanoseconds>(t - lastMoved).count() >=
-                       cfg_.aeronClientLivenessTimeoutNs) {
-                return detail::HubSubmit::Closed;  // no pumper: the close hand-back frees it
-            }
-        }
-        idle.idle(0);
+    // F8c C7 fix round 2 (F1): the ring is FULL — never wait (the head may sit
+    // behind an ABORTed send for as long as the transport refuses it, or
+    // nobody pumps at all: join-then-destroy).  The release is ORPHANED
+    // instead: no command, no time bound, nothing touched on the duty side.
+    // The duty side discovers it (the ring's orphan hint -> a scan, or at the
+    // impl's adoption) and applies it through the same {impl, fence} path as
+    // a direct release, so it still takes effect in FIFO order behind this
+    // handle's queued ops.
+    const auto r = agent_.submitHubCommand(cmd);
+    if (r == agent::ClientAgent::Submit::Accepted) return detail::HubSubmit::Accepted;
+    if (r == agent::ClientAgent::Submit::Closed) return detail::HubSubmit::Closed;
+    if (testHubCommandRingFullHook_) [[unlikely]] testHubCommandRingFullHook_();
+    orphanRelease_(cmd);
+    return detail::HubSubmit::Orphaned;
+}
+
+void Client::orphanRelease_(const detail::HubCommand& cmd) noexcept {
+    using K = detail::HandleKind;
+    void* const        impl  = reinterpret_cast<void*>(static_cast<uintptr_t>(cmd.handle));
+    const std::int64_t fence = agent_.commandRingTail();
+    // The fence (a plain field) first, then ONE RMW that orphans the release
+    // and detaches the handle's share (release-ordered: it publishes the
+    // fence).  If the duty side already let go, this side frees the impl.
+    switch (static_cast<K>(cmd.a)) {
+    case K::Producer: {
+        auto* p = static_cast<producer::ProducerImpl*>(impl);
+        p->setOrphanFence(fence);
+        if (p->detachHandleOrphaned()) delete p;
+        break;
     }
+    case K::TxnProducer: {
+        auto* t = static_cast<producer::TransactionalProducerImpl*>(impl);
+        t->orphanFence = fence;
+        if (t->status.detachConsumerOrphaned()) delete t;
+        break;
+    }
+    case K::Subscription: {
+        auto* sub = static_cast<SubscriptionImpl*>(impl);
+        sub->orphanFence = fence;
+        if (sub->status.detachConsumerOrphaned()) delete sub;
+        break;
+    }
+    case K::GroupConsumer: {
+        auto* gc = static_cast<GroupConsumerImpl*>(impl);
+        gc->orphanFence = fence;
+        if (gc->status.detachConsumerOrphaned()) delete gc;
+        break;
+    }
+    }
+    agent_.raiseOrphanHint();  // after the RMW: a scan that takes it sees the mark
+}
+
+void Client::noteOrphan_(detail::HandleKind kind, void* impl, std::int64_t fence) {
+    try {
+        orphans_.push_back(PendingRelease{kind, impl, fence});
+    } catch (...) {
+        // Out of memory: the impl stays with the duty side until close hands it back.
+    }
+}
+
+void Client::scanOrphans_() {
+    // Cold: only when an orphan hint was taken.  Every impl the duty side holds
+    // whose release is orphaned and not yet noted is queued (FIFO: applied
+    // once the command-ring head passes its fence).
+    using K = detail::HandleKind;
+    producerHub_.forEach([&](producer::ProducerImpl& p) {
+        if (!p.releaseNoted && p.releaseOrphaned()) {
+            p.releaseNoted = true;
+            noteOrphan_(K::Producer, &p, p.orphanFence());
+        }
+    });
+    for (std::size_t i = 0; i < txnProducers_.size(); ++i) {
+        producer::TransactionalProducerImpl* t = txnProducers_[i];
+        if (!t->releaseNoted && t->status.consumerOrphaned()) {
+            t->releaseNoted = true;
+            noteOrphan_(K::TxnProducer, t, t->orphanFence);
+        }
+    }
+    subscriberHub_.forEachOwned([&](SubscriptionImpl& sub) {
+        if (!sub.releaseNoted && sub.status.consumerOrphaned()) {
+            sub.releaseNoted = true;
+            noteOrphan_(K::Subscription, &sub, sub.orphanFence);
+        }
+    });
+    groupConsumerHub_.forEachOwned([&](GroupConsumerImpl& gc) {
+        if (!gc.releaseNoted && gc.status.consumerOrphaned()) {
+            gc.releaseNoted = true;
+            noteOrphan_(K::GroupConsumer, &gc, gc.orphanFence);
+        }
+    });
+}
+
+int Client::applyDueOrphans_() {
+    // An orphaned release takes effect once the command-ring head passed its
+    // fence: everything the handle submitted before it was applied first.
+    const std::int64_t head = agent_.commandRingHead();
+    int n = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < orphans_.size(); ++i) {  // applyRelease_ may run user code
+        const PendingRelease o = orphans_[i];
+        if (head >= o.fence) {
+            detail::HubCommand cmd;
+            cmd.op     = detail::HubCommand::Op::HandleRelease;
+            cmd.handle = reinterpret_cast<uint64_t>(o.impl);
+            cmd.a      = static_cast<int64_t>(o.kind);
+            applyRelease_(cmd, 0, /*closing=*/false);
+            ++n;
+        } else {
+            orphans_[keep++] = o;
+        }
+    }
+    orphans_.resize(keep);
+    return n;
 }
 
 void Client::applyRelease_(const detail::HubCommand& cmd, std::int64_t fence, bool closing) {
@@ -2532,13 +2627,16 @@ void Client::applyRelease_(const detail::HubCommand& cmd, std::int64_t fence, bo
     // finished locally here so no further callback reaches a destroyed handle.
     switch (kind) {
     case K::Producer:
+        static_cast<producer::ProducerImpl*>(impl)->releaseNoted = true;
         if (!closing) static_cast<producer::ProducerImpl*>(impl)->applyHandleRelease();
         break;
     case K::TxnProducer:
+        static_cast<producer::TransactionalProducerImpl*>(impl)->releaseNoted = true;
         if (!closing) static_cast<producer::TransactionalProducerImpl*>(impl)->applyHandleRelease();
         break;
     case K::Subscription: {
         auto* sub = static_cast<SubscriptionImpl*>(impl);
+        sub->releaseNoted = true;
         if (closing) {
             if (sub->active) subscriberHub_.finishLocal(*sub);
         } else {
@@ -2551,6 +2649,7 @@ void Client::applyRelease_(const detail::HubCommand& cmd, std::int64_t fence, bo
     }
     case K::GroupConsumer: {
         auto* gc = static_cast<GroupConsumerImpl*>(impl);
+        gc->releaseNoted = true;
         if (closing) {
             if (gc->active) groupConsumerHub_.finishLocal(*gc);
         } else {
@@ -2624,8 +2723,10 @@ int Client::reapReleases_() noexcept {
 }
 
 void Client::handBackAll_() noexcept {
-    // Released impls are in the hubs' lists too (forgotten only by a reap).
+    // Released impls are in the hubs' lists too (forgotten only by a reap);
+    // orphaned releases not yet applied are handed back with them.
     releases_.clear();
+    orphans_.clear();
     uint64_t n = 0;
     producerHub_.handBackAll([&n](producer::ProducerImpl* p) noexcept {
         ++n;
@@ -2822,6 +2923,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         (void)req.release();      // the duty thread owns it now
         break;
     case detail::HubSubmit::Closed:
+    case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a SubscribeAdd
         impl->status.abandon();         // never submitted (req freed): born finished
         (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
@@ -2931,6 +3033,10 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
         }
     }
     if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
+        SubscriptionImpl* adopted = nullptr;  // F1: check the adopted impl for an orphaned release
+        if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
+            adopted = reinterpret_cast<subscriber::SubscribeRequest*>(cmd.handle)->impl;
+        }
         const auto snap = agent_.stateAndSessionId();
         const int64_t unsubCorrId = (cmd.op == Op::Unsubscribe) ? nextCorrId_++ : 0;
         subscriberHub_.applyCommand(
@@ -2938,12 +3044,23 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                 return agent_.submitSend(fb, fl);
             });
+        if (adopted != nullptr && adopted->status.consumerOrphaned() && !adopted->releaseNoted) {
+            adopted->releaseNoted = true;  // its handle orphaned the release before this adoption
+            noteOrphan_(detail::HandleKind::Subscription, adopted, adopted->orphanFence);
+        }
     } else if (cmd.op == Op::GroupCommitSync) {
         detail::HubCommand pinned = cmd;
         pinCommandTarget_(pinned);  // I3: counted before anything can complete it
         groupConsumerHub_.applyCommand(pinned, now());
     } else {
         groupConsumerHub_.applyCommand(cmd, now());
+        if (cmd.op == Op::GroupAdd && cmd.handle != 0) {  // F1: as for subscriptions
+            auto* gc = reinterpret_cast<GroupConsumerImpl*>(cmd.handle);
+            if (gc->status.consumerOrphaned() && !gc->releaseNoted) {
+                gc->releaseNoted = true;
+                noteOrphan_(detail::HandleKind::GroupConsumer, gc, gc->orphanFence);
+            }
+        }
     }
 }
 
@@ -3056,6 +3173,7 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
         groupSubscribed_ = true;
         break;
     case detail::HubSubmit::Closed:
+    case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a GroupAdd
         impl->status.abandon();               // never submitted: born finished
         (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;

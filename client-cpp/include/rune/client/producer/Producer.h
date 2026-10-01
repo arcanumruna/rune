@@ -252,10 +252,10 @@ public:
     /// F8c C7: closeImmediately() (unless a close already started) + the §3.3
     /// release.  Never throws.  The release: the duty thread (the Invoker
     /// owner, a Thread-mode runner callback) applies it directly; any other
-    /// thread hands it over on the command ring (a full ring is waited out on
-    /// the consumer's progress — in Invoker mode bounded by the liveness
-    /// contract, aeronClientLivenessTimeoutNs: with nobody pumping, the handle
-    /// lets go and Client close frees the impl).
+    /// thread hands it over on the command ring, FIFO behind its own ops; if
+    /// the ring is full the release is ORPHANED instead — no wait, no time
+    /// bound: the duty side discovers it and applies it in the same FIFO
+    /// order (or Client close frees the impl).
     ~Producer();
 
     /// The handle owns no producer (moved-from).

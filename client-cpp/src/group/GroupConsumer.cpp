@@ -58,7 +58,8 @@ void GroupConsumer::release_() noexcept {
         try {
             // Accepted: the duty side closes it and later detaches its share.
             // Closed: a close() on another thread hands it back.
-            (void)sink_(sinkCtx_, cmd);
+            // Orphaned: the sink handed the share over itself (F8c C7 F1).
+            if (sink_(sinkCtx_, cmd) == detail::HubSubmit::Orphaned) return;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "rune-client: ~GroupConsumer: release not delivered: %s\n", e.what());
         } catch (...) {
@@ -127,6 +128,7 @@ void GroupConsumer::setCallback_(int which, Fn cb) {
         (void)holder.release();
         break;
     case detail::HubSubmit::Closed:
+    case detail::HubSubmit::Orphaned:  // HandleRelease only
         break;  // never submitted: holder frees itself
     }
 }

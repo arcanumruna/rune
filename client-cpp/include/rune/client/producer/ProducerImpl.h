@@ -425,6 +425,17 @@ public:
     /// BatchBuilder that outlived its Producer while the duty side still holds
     /// the impl).
     [[nodiscard]] bool handleDetached() const noexcept { return ring_.producerDetached(); }
+    /// F8c C7 fix round 2 (F1): the handle's share handed over with its release
+    /// ORPHANED (the command ring was full).  setOrphanFence first (plain
+    /// field), then the RMW publishes it.  True: the duty side had already
+    /// detached — the caller frees the impl.
+    void setOrphanFence(int64_t fence) noexcept { orphanFence_ = fence; }
+    [[nodiscard]] bool detachHandleOrphaned() noexcept { return ring_.detachProducerOrphaned(); }
+    /// Duty side (acquire): the handle orphaned its release; and its fence.
+    [[nodiscard]] bool releaseOrphaned() const noexcept { return ring_.producerOrphaned(); }
+    [[nodiscard]] int64_t orphanFence() const noexcept { return orphanFence_; }
+    /// Duty side: the release was applied / queued (never twice).
+    bool releaseNoted = false;
     /// Duty side: the handle's destructor semantics (closeImmediately unless a
     /// close — begin-close, closeImmediately, Client close — already started).
     void applyHandleRelease() {
@@ -1162,6 +1173,7 @@ private:
     // correlation id encodes (ordinal_, partition slot, ring sequence).
     uint32_t ordinal_ = 0;
     uint64_t seqBase_ = 0;  // F8c C7 F2: the ordinal's carried-forward sequence base
+    int64_t  orphanFence_ = 0;  // F8c C7 F1: written by the handle before its orphan RMW
     // Lower bound of every live batch's attemptDeadlineNs: retransmitStalled()
     // returns in O(1) until it passes (spec §1a.5; replaces the ordered map front).
     int64_t earliestAttemptDeadlineNs_ = INT64_MAX;

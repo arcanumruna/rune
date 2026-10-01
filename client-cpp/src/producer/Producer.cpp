@@ -104,7 +104,8 @@ void Producer::release_() noexcept {
             // Accepted: the duty side applies closeImmediately (unless a close
             // already started) and detaches its share once the producer is
             // quiescent.  Closed: a close() on another thread hands it back.
-            (void)hk.release(hk.ctx, cmd);
+            // Orphaned: the sink handed the share over itself (F8c C7 F1).
+            if (hk.release(hk.ctx, cmd) == detail::HubSubmit::Orphaned) return;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "rune-client: ~Producer: release not delivered: %s\n", e.what());
         } catch (...) {

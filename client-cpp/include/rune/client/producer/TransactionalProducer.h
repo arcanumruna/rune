@@ -146,9 +146,9 @@ public:
     TransactionalProducer& operator=(TransactionalProducer&& o) noexcept;
 
     /// F8c C7: closeImmediately() (unless a close already started) + the §3.3
-    /// release.  Never throws; routed like ~Producer (the duty thread applies
-    /// it, any other thread uses the command ring — Invoker: bounded by
-    /// aeronClientLivenessTimeoutNs when nobody pumps).
+    /// release.  Never throws, never waits; routed like ~Producer (the duty
+    /// thread applies it, any other thread uses the command ring — orphaned
+    /// when the ring is full, applied by the duty side in FIFO order).
     ~TransactionalProducer();
 
     // ---- Token ops (exactly one completion after Accepted) --------------------

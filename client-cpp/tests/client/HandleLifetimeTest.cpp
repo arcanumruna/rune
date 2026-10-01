@@ -584,12 +584,10 @@ TEST(HandleLifetime, HandleDestroyedInsideOwnCallbackDefersFreeRegression) {
 // The Client is driven on a worker and its handles are destroyed on main after
 // the worker joined (the documented join-then-destroy).  Each release goes
 // through the command ring (spec §3.3; F8c C7 fix round 1, I-2) — never
-// touching duty state off the owner — and the Client's own (off-owner)
-// destruction applies / hands back every impl: each freed exactly once.  With
-// the command ring FULL nobody can ever drain it: the release gives up after
-// the Invoker liveness bound (aeronClientLivenessTimeoutNs — the owner must
-// pump at least that often) instead of waiting forever, and close frees the
-// impl.  RED (mutation): an unbounded wait hangs (watchdog).
+// touching duty state off the owner.  With the command ring FULL nobody can
+// drain it: the release is ORPHANED at once (F8c C7 fix round 2, F1 — no
+// wait, no time bound) and the Client's own (off-owner) close frees the impl.
+// Every impl freed exactly once; no release waits (watchdog).
 TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
     Watchdog wd("Invoker off-owner handle destroy");
     for (const bool fullRing : {false, true}) {
@@ -600,10 +598,8 @@ TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
         std::optional<rc::TransactionalProducer>  tp;
         std::optional<rc::Subscription>           sub;
         std::optional<rc::GroupConsumer>          gc;
-        rc::ClientConfig cfg = cfgFor(fullRing ? 5416 : 5438);
-        cfg.aeronClientLivenessTimeoutNs = 1'000'000'000LL;  // the no-pumper bound (1 s)
         std::thread owner([&] {
-            client = std::make_unique<rc::Client>(cfg);
+            client = std::make_unique<rc::Client>(cfgFor(fullRing ? 5416 : 5438));
             const auto topic = client->topic("t");
             p.emplace(client->producer(ackCfg()));
             tp.emplace(client->transactionalProducer("tx-offowner"));
@@ -613,17 +609,10 @@ TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
             if (fullRing) client->testFillCommandRing();
         });
         owner.join();
-        const auto t0 = std::chrono::steady_clock::now();
-        p.reset();
+        p.reset();  // each returns at once: accepted onto the ring, or orphaned (full)
         tp.reset();
         sub.reset();
         gc.reset();
-        const auto took = std::chrono::steady_clock::now() - t0;
-        if (fullRing) {
-            EXPECT_LT(took, std::chrono::seconds(20)) << "each release bounded by the liveness timeout";
-        } else {
-            EXPECT_LT(took, std::chrono::seconds(1)) << "accepted onto the ring at once";
-        }
         EXPECT_EQ(totalFrees(), 0) << "nothing frees an impl off the owner";
         client.reset();  // off-owner close: drains / hands back, frees each impl once
         EXPECT_EQ(totalFrees(), 4);
@@ -632,6 +621,69 @@ TEST(HandleLifetime, InvokerOffOwnerDestroyNeverWaitsRegression) {
             EXPECT_EQ(frees(k), 1) << "kind " << static_cast<int>(k);
         }
     }
+}
+
+// F1: the command-ring head is stuck behind a back-pressured send (the drain
+// ABORTs it every cycle while the transport refuses it) and the ring is FULL,
+// while the Invoker owner keeps pumping.  A worker destroys its Subscription:
+// the release is orphaned — it never waits and is never dropped.  The duty
+// side applies it in FIFO order once the head moves (the back-pressure lifts):
+// the Unsubscribe reaches the gateway, the handler stops for good, and the
+// impl is freed WITHOUT closing the Client.  RED (round 1): after
+// aeronClientLivenessTimeoutNs of a frozen head the handle gave up and only
+// detached — the subscription was never unsubscribed nor freed while the
+// Client lived (its handler kept running after its destructor returned).
+TEST(HandleLifetime, InvokerOffOwnerReleaseUnderAbortedHeadStillAppliesRegression) {
+    Watchdog wd("off-owner release under an ABORTed command-ring head");
+    FreeHook hook;
+    rc::ClientConfig cfg = cfgFor(5442);
+    cfg.aeronClientLivenessTimeoutNs = 1'000'000'000LL;  // round 1's bound: 1 s of frozen head
+    Rig r(cfg);
+    r.connect();
+    const auto topic = r.client->topic("t");
+    std::atomic<int> delivered{0};
+    std::optional<rc::Subscription> sub(r.client->subscribe(
+        topic, 0, rc::SubscribeOptions{rc::From::earliest()},
+        [&](const rc::Record&) { delivered.fetch_add(1); }));
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub->subscriptionId() > 0; }));
+    int64_t next = 0;
+    r.gw.pushRecords(r.gw.subscribed[0], next, 2);
+    next += 2;
+    ASSERT_TRUE(r.drive([&] { return delivered.load() == 2; }));
+
+    // The head: a session frame the transport refuses (ABORT, retried every cycle).
+    r.client->testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Retry, 1 << 30);
+    const int pingsBefore = r.gw.pings;
+    ASSERT_TRUE(r.client->testSubmitSessionPing());
+    for (int i = 0; i < 100; ++i) r.doWork();  // it is at the head now, refused every cycle
+    r.client->testFillCommandRing();
+
+    std::atomic<bool> released{false};
+    std::thread worker([&, s = std::move(sub)]() mutable {
+        s.reset();  // the ring is full: orphaned at once
+        released.store(true);
+    });
+    // The owner keeps pumping (and records keep flowing) while the head is stuck.
+    ASSERT_TRUE(r.drive([&] {
+        r.gw.pushRecords(r.gw.subscribed[0], next, 1);
+        ++next;
+        return released.load();
+    }));
+    worker.join();
+    for (int i = 0; i < 200; ++i) r.doWork(), r.gw.pump();
+    EXPECT_EQ(frees(rcd::HandleKind::Subscription), 0) << "FIFO: not before the head passes its fence";
+    EXPECT_EQ(r.gw.pings, pingsBefore) << "the head send is still being refused";
+
+    r.client->testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Accepted, 0);  // lift it
+    ASSERT_TRUE(r.drive([&] {
+        return r.gw.pings > pingsBefore && !r.gw.unsubscribed.empty() &&
+               frees(rcd::HandleKind::Subscription) == 1;
+    })) << "the orphaned release was never applied";
+    const int after = delivered.load();
+    r.gw.pushRecords(r.gw.subscribed[0], next, 3);
+    for (int i = 0; i < 2'000; ++i) r.doWork(), r.gw.pump();
+    EXPECT_EQ(delivered.load(), after) << "the handler ran after its release was applied";
+    EXPECT_EQ(r.client->testSubscriptionImplsHeld(), 0u);
 }
 
 // I-2: handles owned by a worker thread are destroyed while the Invoker owner

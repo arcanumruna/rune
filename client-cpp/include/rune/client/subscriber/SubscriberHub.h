@@ -240,6 +240,12 @@ public:
     /// frame sent (Client close: the transport is going away).
     void finishLocal(SubscriptionImpl& impl) { finish_(impl); }
 
+    /// F8c C7 F1: visit every impl this hub owns (cold: an orphan scan).
+    template <class F>
+    void forEachOwned(F&& f) {
+        for (std::size_t i = 0; i < owned_.size(); ++i) f(*owned_[i]);
+    }
+
     /// Impls this hub owns (adopted, not yet released and forgotten).
     [[nodiscard]] std::size_t ownedCount() const noexcept { return owned_.size(); }
 

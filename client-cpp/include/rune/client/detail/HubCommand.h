@@ -148,6 +148,13 @@ enum class HubSubmit : uint8_t {
     /// by close()) or Closed (never written).  F8a's indeterminate
     /// ClosedAfterSubmit outcome (and its accepted leak) no longer exists.
     Closed,
+    /// F8c C7 fix round 2 (F1) — HandleRelease only: the command ring was full,
+    /// so the sink handed the handle's share over WITHOUT a command: it marked
+    /// the impl's release orphaned (fenced at the current ring tail), detached
+    /// the handle's share (freeing the impl if the duty side had already let
+    /// go) and raised the ring's orphan hint; the duty side discovers it and
+    /// applies the release in FIFO order.  The caller must not touch the impl.
+    Orphaned,
 };
 
 /// F8a fix4 M1: verdict of a duty-thread DIRECT send (Subscribe /

@@ -212,6 +212,10 @@ struct GroupConsumerImpl {
     // ---- Liveness (duty thread) -----------------------------------------------
     bool active {true};
 
+    // ---- F8c C7 fix round 2 (F1): orphaned release -------------------------------
+    int64_t orphanFence  = 0;      // written by the handle BEFORE its orphan RMW (published by it)
+    bool    releaseNoted = false;  // duty thread: its release was applied / queued
+
     // ---- Duty thread -> app handle ------------------------------------------------
     detail::StatusRing<GroupConsumerStatus, 256> status;
 
@@ -253,8 +257,8 @@ struct GroupConsumerImpl {
 //     destruction); commitSync() then returns OpResult::Closed.
 //   - Destruction (F8c C7) = close() + the handle's share of the impl handed
 //     to the duty side (one HandleRelease: applied directly on the duty
-//     thread, through the command ring elsewhere — Invoker: bounded by
-//     aeronClientLivenessTimeoutNs when nobody pumps); the impl is freed by
+//     thread, through the command ring elsewhere — orphaned and applied by
+//     the duty side in FIFO order when the ring is full); the impl is freed by
 //     whichever side lets go last — never while one of its callbacks runs.
 //   - HANDLE LIFETIME (fix4 M6): the handle must NOT be destroyed, moved from
 //     or moved into while ANY thread may still be calling it — its owner app
@@ -282,8 +286,8 @@ public:
 
     /// F8c C7 release (§3.3): closes the consumer (the duty side applies it)
     /// and gives the handle's share of the impl to the duty side.  Never
-    /// throws; routed like ~Producer (duty thread: direct; elsewhere: the
-    /// command ring, Invoker-bounded by the liveness timeout).  After Client
+    /// throws, never waits; routed like ~Producer (duty thread: direct;
+    /// elsewhere: the command ring, orphaned when full).  After Client
     /// close the handle frees the impl, never touching the Client.
     ~GroupConsumer();
 

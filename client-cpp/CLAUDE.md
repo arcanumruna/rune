@@ -92,9 +92,11 @@ alloc-free handoff). The agent drains, accumulates records into per-
   started; Subscription: unsubscribe; GroupConsumer: close); the duty side
   frees at the end of a duty cycle once nothing references the impl (never
   under a running callback).  The duty thread (Invoker owner, runner callback)
-  applies a release directly; any other thread uses the command ring (Invoker:
-  a full ring is waited out at most `aeronClientLivenessTimeoutNs` — nobody
-  pumping — then the handle lets go and close frees the impl).  Client close
+  applies a release directly; any other thread uses the command ring, and if
+  that is full the release is ORPHANED (orphan bit in the impl's ownership
+  word + a fence at the ring tail + the ring's orphan hint): the duty side
+  scans, applies it once the ring head passes the fence — no wait, no time
+  bound.  Client close
   hands every still-held impl back to its handle.
 - Shutdown pairs (user decision 2): `Producer::close()` drains /
   `closeImmediately()` discards; `TransactionalProducer::close()` aborts an open

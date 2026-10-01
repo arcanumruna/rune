@@ -232,6 +232,16 @@ public:
         return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedConsumer, __ATOMIC_ACQ_REL) &
                 kDetachedProducer) != 0;
     }
+    /// F8c C7 fix round 2 (F1): the consumer side (the handle) detaches AND
+    /// marks its release ORPHANED in one RMW (see M2ORingBuffer).  True iff
+    /// the producer side had already detached (the caller frees the owner).
+    bool detachConsumerOrphaned() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedConsumer | kOrphanRelease,
+                                  __ATOMIC_ACQ_REL) & kDetachedProducer) != 0;
+    }
+    [[nodiscard]] bool consumerOrphaned() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kOrphanRelease) != 0;
+    }
     /// F8c C7: either side (acquire) — has the producer side detached?  Once
     /// true, the producer side never touches the ring (or its owner) again.
     [[nodiscard]] bool producerDetached() const noexcept {
@@ -272,6 +282,7 @@ private:
     // CL*0..CL*10: Aeron RingBufferDescriptor.  CL*12/CL*14: Rune extensions.
     static constexpr std::int64_t kDetachedProducer = 1;
     static constexpr std::int64_t kDetachedConsumer = 2;
+    static constexpr std::int64_t kOrphanRelease    = 4;
     static constexpr aeron::util::index_t TAIL_POSITION_OFFSET       = CL * 2;
     static constexpr aeron::util::index_t HEAD_CACHE_POSITION_OFFSET = CL * 4;
     static constexpr aeron::util::index_t HEAD_POSITION_OFFSET       = CL * 6;

@@ -161,6 +161,10 @@ struct SubscriptionImpl {
     SubscriptionImpl* prevDirty = nullptr;
     SubscriptionImpl* nextDirty = nullptr;
 
+    // ---- F8c C7 fix round 2 (F1): orphaned release -------------------------------
+    int64_t orphanFence  = 0;      // written by the handle BEFORE its orphan RMW (published by it)
+    bool    releaseNoted = false;  // duty thread: its release was applied / queued
+
     // ---- Duty thread -> app handle ------------------------------------------------
     detail::StatusRing<SubscriptionStatus> status;
 
@@ -194,8 +198,8 @@ struct SubscriptionImpl {
 //     ring is waited out on duty-thread progress, never a timeout, never a
 //     throw.  The destructor (F8c C7) hands over the handle's share of the
 //     impl in one HandleRelease command, which unsubscribes (applied directly
-//     on the duty thread, through the command ring elsewhere — Invoker:
-//     bounded by aeronClientLivenessTimeoutNs when nobody pumps), and the
+//     on the duty thread, through the command ring elsewhere — orphaned and
+//     applied by the duty side in FIFO order when the ring is full), and the
 //     impl is freed by whichever side lets go last — never
 //     while one of its handlers runs.
 //   - position() / subscriptionId() drain the subscription's status ring and
@@ -237,9 +241,8 @@ public:
 
     /// F8c C7 release (§3.3): unsubscribes (the duty side applies it) and
     /// gives the handle's share of the impl to the duty side.  Never throws,
-    /// never waits for the duty side to apply it (a full command ring is
-    /// waited out on duty progress, as for unsubscribe(); Invoker mode:
-    /// bounded by aeronClientLivenessTimeoutNs when nobody pumps).  After Client
+    /// never waits (a full command ring: the release is orphaned and the duty
+    /// side applies it in FIFO order — see ~Producer).  After Client
     /// close the impl was handed back: the handle frees it, never touching
     /// the Client.
     ~Subscription();

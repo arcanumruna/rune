@@ -252,6 +252,10 @@ public:
     [[nodiscard]] bool commandRingConsumerFinished() const noexcept { return ring_.consumerFinished(); }
     /// The command ring's consumer position (duty thread: its own progress).
     [[nodiscard]] std::int64_t commandRingHead() const noexcept { return ring_.headPosition(); }
+    /// F8c C7 fix round 2 (F1): orphaned handle releases exist (any thread
+    /// raises; the duty thread takes, then scans).
+    void raiseOrphanHint() noexcept { ring_.raiseOrphanHint(); }
+    [[nodiscard]] bool takeOrphanHint() noexcept { return ring_.takeOrphanHint(); }
     /// Any thread: the command ring's tail position (acquire).
     [[nodiscard]] std::int64_t commandRingTail() const noexcept { return ring_.tailPosition(); }
     /// The largest command record (header + payload) the ring accepts.

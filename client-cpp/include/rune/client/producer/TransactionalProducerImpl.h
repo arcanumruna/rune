@@ -237,6 +237,9 @@ public:
     detail::StatusRing<TxnStatus, 4096> status;  // room for many unread transitions
     /// App-owned: the latest snapshot drained by the handle (one app thread).
     TxnStatus appStatusCache{};
+    /// F8c C7 fix round 2 (F1): orphaned release.
+    int64_t orphanFence  = 0;      // written by the handle BEFORE its orphan RMW (published by it)
+    bool    releaseNoted = false;  // duty thread: its release was applied / queued
 
     /// The F14 request kinds (testRequestCorrId's `kind`).
     enum class ReqKind : uint8_t { InitProducerId, AddPartitions, AddOffsets, TxnOffsetCommit, EndTxn };

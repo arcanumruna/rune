@@ -74,7 +74,8 @@ void TransactionalProducer::release_() noexcept {
             // Accepted: the duty side applies closeImmediately (unless a close
             // already started) and detaches its share once the producer is
             // closed.  Closed: a close() on another thread hands it back.
-            (void)sink_(sinkCtx_, cmd);
+            // Orphaned: the sink handed the share over itself (F8c C7 F1).
+            if (sink_(sinkCtx_, cmd) == detail::HubSubmit::Orphaned) return;
         } catch (const std::exception& e) {
             std::fprintf(stderr, "rune-client: ~TransactionalProducer: release not delivered: %s\n", e.what());
         } catch (...) {
@@ -278,6 +279,7 @@ void TransactionalProducer::send(TopicHandle topic, const Key& key, std::span<co
         (void)rec.release();  // the duty side owns it now
         return;
     case detail::HubSubmit::Closed:
+    case detail::HubSubmit::Orphaned:  // HandleRelease only
         break;
     }
     throw std::logic_error("client closed");
