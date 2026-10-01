@@ -691,6 +691,7 @@ public:
             }
         }
 
+        passNowNs_ = nowNs;   // this pass's clock (acks=all deadlines on the op path)
         if (shardMode_) return doWorkShard_(nowNs);
 
         // Step E3: reap async-durability completions from the IoBackend FIRST so
@@ -711,26 +712,27 @@ public:
         //     Skipping the poll when any ack backlog exists ensures Aeron's term
         //     buffer fills → client offer() back-pressures.  No ack is ever
         //     dropped (G-A6 structural enforcement).
+        // Round 5: ordered must-deliver returns (markers) may sit in retOverflow_
+        // in every mode — flush them first, before any newer return is produced.
+        work += flushRetOverflow_();
+        // F15 S2 (I-A, addendum R-4a): acks=all waiters are parked on THIS worker
+        // in EVERY mode (gateway-routed produces included), so the per-pass fire
+        // + §3.2 re-validation runs in every mode — not only with per-worker
+        // ingress.
+        work += flushOwedAcksAll_(nowNs);
         if (perWorkerIngressActive_) {
-            work += flushRetOverflow_();
-            work += flushOwedAcksAll_(nowNs);
             // Pipelined acks=all: poll new produce as long as the return ring has
-            // space for the acks about to be polled PLUS all already-parked acks
-            // (pendingAcksAll_ fire later, into ret_).  Previously the gate required
+            // space for the acks about to be polled PLUS all already-owed acks
+            // (they fire later, into ret_).  Previously the gate required
             // pendingAcksAll_.empty(), which SERIALIZED acks=all on the ~172ms
             // replication round-trip (no new intake while any ack was in flight →
-            // throughput = batch / round-trip).  Now pendingAcksAll_ is bounded by
-            // ret_ capacity (reservation below subtracts its size) instead of 1.
+            // throughput = batch / round-trip).  Now the owed acks are bounded by
+            // ret_ capacity (reservation below subtracts them) instead of 1.
             if (retOverflow_.empty() &&
-                ret_.freeSlotsForMsgSize(ackSlotBytes_) >
-                    static_cast<int64_t>(pendingAcksAll_.size())) {
+                ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
                 work += pollWorkerIngress_(nowNs);
             }
         }
-
-        // Round 5: ordered must-deliver returns (markers) may sit in retOverflow_
-        // in every mode — flush them first, before any newer return is produced.
-        if (!perWorkerIngressActive_) work += flushRetOverflow_();
 
         // Step 0: drain ingress ring (E2 inc2a / R2). This may include SetOwnership
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
@@ -1554,6 +1556,16 @@ private:
             return;
         }
 
+        // F15 §3.1 (I1): the OWNING worker is the role authority.  A produce
+        // routed while a BecomeFollower (or a self-demotion) was ahead of it is
+        // refused retriably — the follower log is never touched.
+        if (!produceRoleGatePasses_(replica)) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            ret.deferAck  = false;
+            enqueueReturn_(ret);
+            return;
+        }
+
         // Task 10 round 5: the min-ISR admission gate for acks=all lives HERE, on
         // the owning thread (the replica's ISR is worker-owned state).  The
         // gateway used to read replica->isr() on the control thread — a data race
@@ -1565,6 +1577,24 @@ private:
             ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation);
             ret.deferAck  = false;
             enqueueReturn_(ret);   // log untouched — no append, no LEO advance
+            return;
+        }
+
+        // F15 S2 (I-A, addendum R-4c): the acks=all waiter will be parked on THIS
+        // worker and fire into ret_ later — reserve its return slot BEFORE the
+        // append (the G-A6 reservation, now covering gateway-routed produces;
+        // the gateway's old pendingAcks_ cap is gone).  No slot → retriable
+        // NotLeader with the log untouched (a retry is always safe).
+        const bool acksAll = op.deferAck() != 0 && replica != nullptr;
+        if (acksAll && !ackReservationAvailable_()) [[unlikely]] {
+            ++acksAllRefusedNoReservation_;
+            if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
+                spdlog::warn("Worker {}: acks=all produce refused NotLeader — return-ring reservation "
+                             "exhausted (owed={}, total refused={})", workerId_, reservedAckSlots_(),
+                             acksAllRefusedNoReservation_);
+            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            ret.deferAck  = false;
+            enqueueReturn_(ret);
             return;
         }
 
@@ -1680,6 +1710,12 @@ private:
             replica->onLeaderLogAppended();
         }
 
+        // F15 I-A: this worker answers the produce itself (immediately, after
+        // its fsync, or when the HW passes it) — the result is final, the
+        // gateway never parks it.
+        ret.deferAck = false;
+        const int32_t ackMinIsr = !replica ? 1 : (op.minIsr() > 0 ? op.minIsr() : replica->minIsr());
+
         // E3 Task 5: Strict durability tier — defer ack until fsync completion is reaped.
         // Only applicable to disk-backed logs (memory logs have no fd to fsync).
         //
@@ -1692,7 +1728,19 @@ private:
         if (op.durabilityTier() == 2 && log->isDiskBacked()) {
             ret.errorCode = 0; // tentatively OK; updated in submitCoalescedFlushes_ or on completion
             // token=0 means "not yet submitted" — reapDurableCompletions_ will never fire this.
-            durablePending_.push_back({kNoToken, ret.lastOffset, log, std::move(ret)});
+            // F15 R-4b: a Strict acks=all ack waits for its fsync, THEN the HW
+            // (thenAwaitHw) — in every mode.
+            DurablePending dp;
+            dp.token       = kNoToken;
+            dp.lastOffset  = ret.lastOffset;
+            dp.logPtr      = log;
+            dp.ret         = std::move(ret);
+            dp.thenAwaitHw = acksAll ? replica : nullptr;
+            dp.deadlineNs  = passNowNs_ + ackTimeoutNs_;
+            dp.replica     = replica;
+            dp.logGen      = replica ? replica->logGeneration() : 0;
+            dp.minIsr      = ackMinIsr;
+            durablePending_.push_back(std::move(dp));
 
             // Record this log as dirty for this cycle (dedup).
             bool found = false;
@@ -1700,6 +1748,22 @@ private:
                 if (dl == log) { found = true; break; }
             }
             if (!found) dirtyThisCycle_.push_back(log);
+            return;
+        }
+
+        if (acksAll) {
+            // F15 I-A: park on THIS worker (was: the gateway's pendingAcks_ on
+            // the published HW snapshot).  Fires in flushOwedAcksAll_ when the
+            // HW passes it with the ISR >= minIsr (DR-BUG-3), re-validated every
+            // pass against role / ownership / log generation (§3.2).
+            PendingAcksAll pending;
+            pending.replica    = replica;
+            pending.lastOffset = ret.lastOffset;
+            pending.deadlineNs = passNowNs_ + ackTimeoutNs_;
+            pending.logGen     = replica->logGeneration();
+            pending.minIsr     = ackMinIsr;
+            pending.ret        = std::move(ret);
+            pendingAcksAll_.push_back(std::move(pending));
             return;
         }
 
@@ -2490,6 +2554,11 @@ private:
         /// Its token completed, but an async roll seal on the same log was still
         /// outstanding: fires when the seals complete (fireSealGated_).
         bool                    awaitSeal  = false;
+        /// F15 §3.2: the replica it parked on (null = replication-less) and its
+        /// log generation as last validated — re-checked before it may fire OK.
+        rune::replication::PartitionReplica* replica = nullptr;
+        uint64_t                logGen     = 0;
+        int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
     };
     std::vector<DurablePending> durablePending_;
 
@@ -2611,6 +2680,12 @@ private:
         rune::replication::PartitionReplica* replica    = nullptr;
         int64_t                              lastOffset = 0;   ///< fire when replica HW > this
         int64_t                              deadlineNs = 0;   ///< monotonic ns deadline
+        /// F15 §3.2: the replica's log generation as last validated for this
+        /// waiter (min-cut rule, waiterReplica_).
+        uint64_t                             logGen     = 0;
+        /// DR-BUG-3 (moved from the gateway's drain with I-A): fire OK only while
+        /// |ISR| >= this admission minIsr.
+        int32_t                              minIsr     = 1;
         WorkerReturn                         ret;               ///< ack payload when ready
     };
     std::vector<PendingAcksAll> pendingAcksAll_;
@@ -2628,6 +2703,11 @@ private:
 
     // E5.1.2d: acks=all commit-wait timeout (ns).
     int64_t ackTimeoutNs_ = kDefaultAckTimeoutNs;
+    // F15 S2: this pass's clock (set at the top of doWork) — the deadline base
+    // for acks=all parked from an op (the op path has no clock of its own).
+    int64_t passNowNs_ = 0;
+    // F15 S2 (R-4c): gateway-routed acks=all refused for lack of a reservation.
+    uint64_t acksAllRefusedNoReservation_ = 0;
 
     // E5.1.3 (d) R7 fix: last time syncOwnedLogs_ was run (ns). 0 = never.
     // Worker-thread only — no atomic needed.
@@ -3117,6 +3197,17 @@ private:
     }
     void fireDurable_(DurablePending& entry) {
         durableAckToken_ = entry.token;
+        // F15 §3.2: a durable ack may fire OK only while this worker still owns
+        // the replica, it is still Leader and the acked content is unchanged —
+        // a Strict ack whose fsync completes after a demotion fails NotLeader.
+        if (entry.replica || entry.ret.incarnation != 0) {
+            if (waiterReplica_(entry.replica, entry.ret.targetReplicaId, entry.ret.incarnation,
+                               entry.lastOffset, entry.logGen) == nullptr) [[unlikely]] {
+                entry.ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+                enqueueReturn_(entry.ret);
+                return;
+            }
+        }
         if (entry.thenAwaitHw) {
             // Shard Strict acks=all: durable locally — now the HW gate.  (M4: for
             // a single-ISR Strict log, HW / consumer visibility can precede the
@@ -3126,6 +3217,8 @@ private:
             pending.replica    = entry.thenAwaitHw;
             pending.lastOffset = entry.lastOffset;
             pending.deadlineNs = entry.deadlineNs;
+            pending.logGen     = entry.logGen;
+            pending.minIsr     = entry.minIsr;
             pending.ret        = std::move(entry.ret);
             pendingAcksAll_.push_back(std::move(pending));
         } else {
@@ -3362,47 +3455,91 @@ private:
         for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
             auto& entry = pendingAcksAll_[i];
 
-            // HW-passed: the replica has committed past our last offset.
-            const bool hwPassed = entry.replica &&
-                (entry.replica->highWatermark() > entry.lastOffset);
-            // Timeout: this ack has been waiting too long.
-            const bool timedOut = (nowNs >= entry.deadlineNs);
-
-            if (hwPassed || timedOut) {
-                if (timedOut && !hwPassed) {
-                    spdlog::warn("Worker {}: acks=all timeout for partition={} "
-                                 "lastOffset={}; acking Internal error",
-                                 workerId_, entry.ret.partition, entry.lastOffset);
-                    // E5.1.3 review fix #1: use Internal (6) for acks=all timeout.
-                    // The protocol has no RequestTimedOut code; ErrorCode 7 is
-                    // UnknownTopic — sending 7 would cause the client to misinterpret
-                    // a timeout as a missing topic, a client-facing correctness bug.
-                    // Internal (6) is the correct "unexpected server-side failure" code.
-                    entry.ret.errorCode =
-                        static_cast<int16_t>(
-                            rune::protocol::client::ErrorCode::Internal);
-                } else {
-                    entry.ret.errorCode = 0; // OK
-                }
-                // Keyed by (partition<<24)|offset — unique across partitions;
-                // correlates across nodes with follower apply/fetch + onFetchRequest.
-                RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckFire,
-                    (static_cast<uint32_t>(entry.ret.partition) << 24) |
-                        (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
-                RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplAckSendOff,
-                    (static_cast<uint32_t>(entry.ret.partition) << 24) |
-                        (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
-                enqueueReturn_(entry.ret);
-                // O(1) erase by swap-with-back.
-                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
-                pendingAcksAll_.pop_back();
-                ++fired;
-                // Do NOT advance i — the swapped entry needs checking.
+            // F15 §3.2: re-validate first — ownership, role (BecomeFollower OR a
+            // self-demotion in onFetchRequest, no hook needed), log generation.
+            auto* rep = waiterReplica_(entry.replica, entry.ret.targetReplicaId, entry.ret.incarnation,
+                                       entry.lastOffset, entry.logGen);
+            int16_t code = 0;
+            if (rep == nullptr) [[unlikely]] {
+                code = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            } else if (rep->highWatermark() > entry.lastOffset &&
+                       static_cast<int>(rep->isr().size()) >= entry.minIsr) {
+                // HW-passed AND the ISR still >= minIsr at FIRE time (DR-BUG-3:
+                // closes the admission→fire shrink-to-minority window; a stranded
+                // minority leader never acks OK).
+                code = 0;
+            } else if (nowNs >= entry.deadlineNs) {
+                spdlog::warn("Worker {}: acks=all timeout for partition={} "
+                             "lastOffset={}; acking Internal error",
+                             workerId_, entry.ret.partition, entry.lastOffset);
+                // E5.1.3 review fix #1: use Internal (6) for acks=all timeout.
+                // The protocol has no RequestTimedOut code; ErrorCode 7 is
+                // UnknownTopic — sending 7 would cause the client to misinterpret
+                // a timeout as a missing topic, a client-facing correctness bug.
+                // Internal (6) is the correct "unexpected server-side failure" code.
+                code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
             } else {
                 ++i;
+                continue;
             }
+            entry.ret.errorCode = code;
+            // Keyed by (partition<<24)|offset — unique across partitions;
+            // correlates across nodes with follower apply/fetch + onFetchRequest.
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckFire,
+                (static_cast<uint32_t>(entry.ret.partition) << 24) |
+                    (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplAckSendOff,
+                (static_cast<uint32_t>(entry.ret.partition) << 24) |
+                    (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
+            enqueueReturn_(entry.ret);
+            // O(1) erase by swap-with-back.
+            pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
+            pendingAcksAll_.pop_back();
+            ++fired;
+            // Do NOT advance i — the swapped entry needs checking.
         }
         return fired;
+    }
+
+    // -----------------------------------------------------------------------
+    // waiterReplica_ — F15 §3.2: may a parked waiter (acks=all on the HW, a
+    // Strict ack on its fsync) still fire OK?  Evaluated on THIS worker every
+    // pass, state-driven (no role-change hooks):
+    //   * ownership: the exact incarnation it parked on is still owned here
+    //     (registered replicas; unregistered ones are pointer-tracked by
+    //     rebuildFlushSlots_);
+    //   * role: still Leader (BecomeFollower op OR self-demotion in
+    //     onFetchRequest) — an epoch bump while still Leader keeps waiting;
+    //   * content: the log generation is unchanged since the waiter last looked,
+    //     or changed by EXACTLY one cut strictly above its offset (then the
+    //     content at/below the offset is untouched and the waiter re-bases).  Two
+    //     or more changes between passes fail it: only the last cut is recorded,
+    //     so the min-cut since park is unknown (addendum: never fire OK over data
+    //     an earlier cut replaced).
+    // Returns the replica to evaluate the fire condition on, or nullptr → fail
+    // the waiter NotLeader (retriable).  Two loads + compares in steady state.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] rune::replication::PartitionReplica*
+    waiterReplica_(rune::replication::PartitionReplica* r, uint32_t id, uint32_t inc,
+                   int64_t offset, uint64_t& logGen) const noexcept {
+        if (inc != 0) {
+            if (!ownsIncarnation_(id, inc)) [[unlikely]] return nullptr;
+            r = ownedPtr_[id];
+        }
+        if (r == nullptr || r->role() != rune::replication::Role::Leader) [[unlikely]] return nullptr;
+        const uint64_t g = r->logGeneration();
+        if (g != logGen) [[unlikely]] {
+            if (g != logGen + 1 || offset >= r->lastTruncationOffset()) return nullptr;
+            logGen = g;
+        }
+        return r;
+    }
+
+    // F15 S2 (R-4c): one more owed ack (fires into ret_ later) still fits the
+    // G-A6 return-ring reservation — the same rule the shard-ingress poll uses.
+    [[nodiscard]] bool ackReservationAvailable_() const noexcept {
+        return ret_.freeSlotsForMsgSize(ackSlotBytes_) >
+               reservedAckSlots_() + static_cast<int64_t>(retOverflow_.size());
     }
 
     // -----------------------------------------------------------------------
@@ -3458,11 +3595,12 @@ private:
     // Never drops an ack: errors return error acks on ret_; acks=all go to
     // pendingAcksAll_ for deferred fire.
     // -----------------------------------------------------------------------
-    // Acks already owed that will fire into ret_ later: acks=all parked on HW and,
-    // in shard mode, Strict acks parked on their fsync (G-A6 reservation).
+    // Acks already owed that will fire into ret_ later: acks=all parked on HW and
+    // Strict acks parked on their fsync (G-A6 reservation).  F15 S2: every mode —
+    // gateway-routed acks=all / Strict produces park on this worker too.
     [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
         return static_cast<int64_t>(pendingAcksAll_.size()) +
-               (shardMode_ ? static_cast<int64_t>(durablePending_.size()) : 0);
+               static_cast<int64_t>(durablePending_.size());
     }
 
     int pollWorkerIngress_(int64_t nowNs) {
@@ -3570,6 +3708,14 @@ private:
             return 1;
         }
 
+        // F15 §3.1 (I1): the owning worker is the role authority — a follower
+        // (BecomeFollower applied, or self-demoted) never appends a client batch.
+        if (!produceRoleGatePasses_(replica)) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
         // Zero-copy: handleProduceBatch now takes a READ-ONLY view and the log
         // restamps the base offset in place via pwritev — no mutable local copy.
         const std::span<const uint8_t> rbSpan = msg.recordBatch;
@@ -3653,6 +3799,9 @@ private:
             dp.ret         = std::move(ret);
             dp.thenAwaitHw = acksAll ? replica : nullptr;
             dp.deadlineNs  = nowNs + ackTimeoutNs_;
+            dp.replica     = replica;
+            dp.logGen      = replica->logGeneration();
+            dp.minIsr      = minIsr;
             durablePending_.push_back(std::move(dp));
             if (std::find(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), log) == dirtyThisCycle_.end())
                 dirtyThisCycle_.push_back(log);
@@ -3677,6 +3826,8 @@ private:
         pending.replica    = replica;
         pending.lastOffset = outcome.lastOffset;
         pending.deadlineNs = nowNs + ackTimeoutNs_;
+        pending.logGen     = replica->logGeneration();
+        pending.minIsr     = minIsr;
         pending.ret        = std::move(ret);
         pendingAcksAll_.push_back(std::move(pending));
         return 1;

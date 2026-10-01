@@ -1648,30 +1648,41 @@ TEST(ReplicaLifetimeRegression, ParkedSubscriptionIsNotReactivatedOntoANewIncarn
 
 TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWithoutDereference) {
     // Important 3: an acks=all entry in flight when its partition is removed and
-    // FREED → the drain resolves it through the registry → NotLeader.  Also for a
-    // re-created partition (new incarnation, possibly the same address).
+    // FREED → it fails NotLeader without dereferencing the freed replica.  Also
+    // for a re-created partition (new incarnation, same registry id).
+    // F15 I-A: the waiter lives on the OWNING worker in every mode (the gateway's
+    // pendingAcks_ no longer holds worker-owned acks), so the invariant is pinned
+    // where the waiter is: a gateway-routed acks=all produce (executeProduceWire_,
+    // deferAck) parked on the worker; the ownership drop answers it.
     for (bool recreate : {false, true}) {
         Reg R;
-        Captured cap;
-        auto gw = rune::gateway::ClientGateway::makeForTest(cap.fn());
-        gw.setReplicaRegistry(&R.reg);
-        const int64_t sid = gw.injectTestSession();
-        R.add(5, 0);
-        const auto h = R.reg.lookupHandle(5, 0);
-        WorkerReturn ret;
-        ret.type = WorkerReturn::Type::ProduceResult;
-        ret.sessionId = sid; ret.correlationId = 77; ret.topicId = 5; ret.partition = 0;
-        ret.baseOffset = 0; ret.lastOffset = 0; ret.deferAck = true;
-        ret.targetReplicaId = h.id; ret.incarnation = h.incarnation;
-        gw.handleWorkerReturnForTest(ret);
-        ASSERT_EQ(gw.pendingAcksForTest(), 1u);
+        auto* rep = R.add(5, 0);
+        rep->becomeLeader(2, {1, 2});                         // follower 2 behind → the ack parks on the HW
+        Worker w(0, 1 << 16, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{rep});
+        WorkerOp op = produceOp(rep, 77);
+        op.deferAck = true;                                   // acks=all, steady state
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+        w.doWork(1);
+        ASSERT_EQ(w.reservedAckSlotsForTest(), 1) << "precondition: parked on the owning worker";
+        std::vector<WorkerReturn> rets;
+        w.drainReturn([&](WorkerReturn r) { rets.push_back(std::move(r)); });
+        ASSERT_TRUE(rets.empty());
         R.reg.remove(5, 0);
+        PartitionReplica* again = recreate ? R.add(5, 0) : nullptr;
+        WorkerOp own;
+        own.type = WorkerOp::Type::SetOwnership;
+        if (again) own.ownedSet = {again};
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(own)));
+        w.doWork(2);
         ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u) << "freed";
-        if (recreate) R.add(5, 0);
-        gw.drainPendingAcksForTest(1);
-        EXPECT_EQ(gw.pendingAcksForTest(), 0u);
-        ASSERT_EQ(cap.produceErrors.size(), 1u);
-        EXPECT_EQ(cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "recreate=" << recreate;
+        w.doWork(3);                                          // no read of the freed replica
+        w.drainReturn([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::ProduceResult) rets.push_back(std::move(r));   // (skip OwnershipAck)
+        });
+        EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
+        ASSERT_EQ(rets.size(), 1u) << "recreate=" << recreate;
+        EXPECT_EQ(rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "recreate=" << recreate;
     }
 }
 

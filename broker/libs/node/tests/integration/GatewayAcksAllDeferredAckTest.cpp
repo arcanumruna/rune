@@ -1340,12 +1340,25 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
 
     // The record was appended to the leader log (LEO advanced) but the ack is
     // still deferred: the pending-ack entry must remain enqueued.
-    // pendingAcks_ is CONTROL-thread-owned (gateway duty cycle) → read it there.
-    EXPECT_GE(leaderNode->onControlThreadForTest(
-                  [leaderGw] { return leaderGw->pendingAckCount(); }),
-              static_cast<std::size_t>(1))
-        << "acks=All entry for the single record must remain deferred "
-           "(HW=0 does NOT satisfy HW > lastOffset=0)";
+    // F15 I-A: a worker-owned partition's acks=all waiter is parked on the
+    // OWNING worker (the gateway's pendingAcks_ holds only inline-path acks), so
+    // read the worker's owed-ack count on that worker's thread.
+    const int32_t ownerWorker = leaderNode->workerForPartitionForTest(prod.topicId, prod.partition);
+    if (ownerWorker >= 0) {
+        rune::node::Worker* w = leaderNode->workerForTest(ownerWorker);
+        ASSERT_NE(w, nullptr);
+        EXPECT_GE(leaderNode->onOwnerThreadForTest(prod.topicId, prod.partition,
+                      [w](rune::replication::PartitionReplica&) { return w->reservedAckSlotsForTest(); }),
+                  int64_t{1})
+            << "acks=All entry for the single record must remain deferred on the owning worker "
+               "(HW=0 does NOT satisfy HW > lastOffset=0)";
+    } else {
+        EXPECT_GE(leaderNode->onControlThreadForTest(
+                      [leaderGw] { return leaderGw->pendingAckCount(); }),
+                  static_cast<std::size_t>(1))
+            << "acks=All entry for the single record must remain deferred "
+               "(HW=0 does NOT satisfy HW > lastOffset=0)";
+    }
 
     // Cleanup.
     conn.ingressPub.reset();

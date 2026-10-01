@@ -3179,44 +3179,12 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 }
             }
 
-            // Deferred ack (acks=All) or immediate ack (acks=Leader/None).
-            if (ret.deferAck) {
-                if (pendingAcks_.size() >= kMaxPendingAcks) {
-                    spdlog::warn(
-                        "ClientGateway: drainWorkerReturns_ pendingAcks_ full "
-                        "({} entries); acks=All result rejected with MinIsrViolation "
-                        "sessionId={} topicId={} partition={}",
-                        kMaxPendingAcks, ret.sessionId, ret.topicId, ret.partition);
-                    pc::ProduceResponse errResp;
-                    errResp.sessionId     = ret.sessionId;
-                    errResp.correlationId = ret.correlationId;
-                    errResp.errorCode     =
-                        static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
-                    errResp.partition     = ret.partition;
-                    errResp.baseOffset    = 0;
-                    const std::size_t encoded = errResp.encode(scratch_.data());
-                    // G0.1: reliable delivery (retry on back-pressure).
-                    enqueueOrBestEffort_(*session, scratch_.data(), encoded);
-                    return;
-                }
-
-                PendingAck entry;
-                entry.sessionId     = ret.sessionId;
-                entry.correlationId = ret.correlationId;
-                entry.partition     = ret.partition;
-                entry.baseOffset    = ret.baseOffset;
-                entry.lastOffset    = ret.lastOffset;
-                entry.enqueuedAtNs  = ret.enqueuedAtNs;
-                entry.topicId       = ret.topicId;
-                entry.incarnation   = ret.incarnation;   // echoed from the routed op
-                pendingAcks_.push_back(entry);
-
-                spdlog::debug(
-                    "ClientGateway: drainWorkerReturns_ acks=All produce enqueued "
-                    "pending-ack sessionId={} partition={} baseOffset={} lastOffset={}",
-                    ret.sessionId, ret.partition, ret.baseOffset, ret.lastOffset);
-            } else {
-                // Immediate ack (acks=Leader/None) — encode + reliable egress send.
+            // F15 I-A: every ProduceResult from a worker is FINAL.  The owning
+            // worker answers acks=all itself — parked on W until the HW passes
+            // with |ISR| >= minIsr and the §3.2 role / ownership / log-generation
+            // re-validation holds — so the gateway never parks a worker-owned
+            // ack (its pendingAcks_ serves only the inline, control-owned path).
+            {
                 RUNE_FR_SPAN_PRODUCE(rune_fr::Site::ProduceAckSend,
                                      static_cast<uint32_t>(ret.correlationId));
                 pc::ProduceResponse okResp;
