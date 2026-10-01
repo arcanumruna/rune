@@ -1092,6 +1092,11 @@ void ProducerImpl::setOnBatchAck(BatchAckFn fn, void* ctx) {
     if (batchAckCq_ != nullptr) {
         throw std::logic_error("Producer::onBatchAck: batchAcksTo() already set (exclusive)");
     }
+    // Review m1: setup phase only (the duty thread reads it on every batch).
+    if (mode_ == IngressMode::Direct ? (recordsSent_ != 0 || !deferred_.empty())
+                                     : (ring_.tailPosition() != 0)) {
+        throw std::logic_error("Producer::onBatchAck: called after a send (setup phase only)");
+    }
     batchAckFn_  = fn;
     batchAckCtx_ = ctx;
 }
@@ -2214,8 +2219,11 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
 
 int ProducerImpl::discardRing_(OpStatus st, int limit) {
     // Records still in the app->agent ring (single consumer: we are it) are
-    // completed with `st` and never sent.  Tier-2 entries are freed.  The
-    // handle is read and the record consumed BEFORE any user code runs.
+    // completed with `st` and never sent.  Tier-2 entries are freed.  NOTE:
+    // the ring head advances only when read() returns, so a handler run here
+    // must never re-enter a read of this ring — the only ways (closeImmediately
+    // / failClose from a handler) are deferred to the DutyScope end (fix round 1,
+    // I1), and discardRing_'s callers hold a DutyScope or are Discarding already.
     return ring_.read(
         [&](int32_t type, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
             aeron::util::index_t len) {
@@ -2324,8 +2332,8 @@ OpResult ProducerImpl::closeImmediately() {
 
 void ProducerImpl::applyBeginClose(const detail::OpTarget& target, Token token, int64_t nowNs) {
     if (!lifeOpen()) {
-        // Unreachable through the intake CAS (only its winner applies a begin-
-        // close); kept total: the token still completes exactly once.
+        // Reachable: a closeImmediately / failClose applied before the CAS
+        // winner's BeginClose command.  The token still completes exactly once.
         Completion c;
         c.token  = token;
         c.op     = OpKind::ProducerClose;
@@ -2339,7 +2347,7 @@ void ProducerImpl::applyBeginClose(const detail::OpTarget& target, Token token, 
     d.deadlineNs = nowNs + cfg_.deliveryTimeoutMs * 1'000'000LL;
     life_        = d;
     flushAll_    = true;  // nothing more can join a batch: flush every builder at once
-    (void)closeDuty(nowNs);
+    if (!inDuty_) (void)closeDuty(nowNs);  // inside a handler: the next hub pass decides
 }
 
 void ProducerImpl::applyCloseImmediately(OpStatus st) {
@@ -2349,6 +2357,17 @@ void ProducerImpl::applyCloseImmediately(OpStatus st) {
     const LifeDraining d = wasDraining ? std::get<LifeDraining>(life_) : LifeDraining{};
     life_     = LifeDiscarding{st};
     flushAll_ = true;
+    if (inDuty_) {
+        // F8c fix round 1 (I1): called from a handler this producer fired
+        // (an ack / batch-ack / failure completion): the walk that fired it
+        // still holds live state (a batch not yet released, a ring read not
+        // yet consumed).  Fail-all at the outermost DutyScope's end instead.
+        pendingFail_.armed    = true;
+        pendingFail_.status   = st;
+        pendingFail_.hadToken = wasDraining;
+        pendingFail_.drain    = d;
+        return;
+    }
     failAllPending(st);
     if (wasDraining) {
         Completion c;
@@ -2356,6 +2375,19 @@ void ProducerImpl::applyCloseImmediately(OpStatus st) {
         c.op     = OpKind::ProducerClose;
         c.status = OpStatus::Closed;
         hooks_.sink.deliver(d.target, c);
+    }
+}
+
+void ProducerImpl::runPendingFail_() {
+    const PendingFail pf = pendingFail_;
+    pendingFail_ = PendingFail{};
+    failAllPending(pf.status);  // nested DutyScope: inDuty_ is still set
+    if (pf.hadToken) {
+        Completion c;
+        c.token  = pf.drain.token;
+        c.op     = OpKind::ProducerClose;
+        c.status = OpStatus::Closed;
+        hooks_.sink.deliver(pf.drain.target, c);
     }
 }
 
@@ -2404,11 +2436,14 @@ void ProducerImpl::closeFinal(OpStatus st, int stalledYieldsBeforeUnblock) {
     // progress, then Aeron's unblock() after a yield cap; stop only when
     // unblock() cannot make progress (a hang is the worse failure).
     const int64_t target = ring_.tailPosition();
+    // Review m9: an earlier failClose(st') set the status the ring's records
+    // complete with — keep it.
+    const OpStatus ringSt = discarding() ? std::get<LifeDiscarding>(life_).status : st;
     int stalled = 0;
     int failedUnblocks = 0;
     while (ring_.headPosition() < target) {
         const int64_t before = ring_.headPosition();
-        const int n = discardRing_(st, INT_MAX);
+        const int n = discardRing_(ringSt, INT_MAX);
         if (n > 0 || ring_.headPosition() != before) {
             stalled = 0;
             failedUnblocks = 0;

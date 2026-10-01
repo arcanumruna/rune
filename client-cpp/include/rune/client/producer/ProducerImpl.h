@@ -1109,6 +1109,18 @@ private:
     // Closed / Discarding) — every pass flushes at once (no linger: nothing
     // more can join a batch).
     bool flushAll_ = false;
+    // F8c fix round 1 (I1): a closeImmediately / failClose applied INSIDE this
+    // producer's own duty work (from a handler it fired) — the intake is closed
+    // and the life is Discarding at once, but the fail-all (and the aborted
+    // begin-close token) waits for the outermost DutyScope's end.
+    struct PendingFail {
+        bool         armed    = false;
+        OpStatus     status   = OpStatus::Closed;
+        bool         hadToken = false;
+        LifeDraining drain{};
+    };
+    PendingFail pendingFail_{};
+    void runPendingFail_();
     bool clientClosedDirect_ = false;  // Direct only: closeFinal ran (owner state)
 
     // ---- sendBlocking() support (app thread only) -----------------------------
@@ -1168,7 +1180,14 @@ private:
         explicit DutyScope(ProducerImpl& pi) noexcept : p(pi), prev(pi.inDuty_) { p.inDuty_ = true; }
         ~DutyScope() {
             if (!prev) {
+                // F8c fix round 1 (I1): a close applied from a handler this
+                // producer fired runs its fail-all HERE — after the walk that
+                // fired the handler finished (no live batch / ring read / slot
+                // is ever failed twice) — and before the deferred records are
+                // applied (they are failed with everything else).
+                while (p.pendingFail_.armed) p.runPendingFail_();
                 if (!p.deferred_.empty()) p.applyDeferred_();
+                while (p.pendingFail_.armed) p.runPendingFail_();  // a lost-record handler closed
                 p.inDuty_ = false;
             }
         }

@@ -65,6 +65,7 @@ Producer::Producer(std::shared_ptr<producer::ProducerImpl> impl) noexcept
 // bound (cold: only producers bound to a batch-ack queue reach this).
 namespace {
 [[nodiscard]] SendResult reserveBatchUnit(Completions& bq) noexcept {
+    if (!bq.valid()) return SendResult::InvalidArgument;  // review m7: moved-from queue
     if (!bq.onOwnerThread()) return SendResult::WrongThread;
     const OpResult r = bq.reserve(producer::kAckRecordBytes);
     return r == OpResult::Accepted ? SendResult::Ok : mapReserve(r);

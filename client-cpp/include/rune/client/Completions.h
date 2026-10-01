@@ -124,6 +124,8 @@ public:
     [[nodiscard]] Client* client() const noexcept { return client_; }
     /// The duty-registry reference (kNoCqRef: standalone, or born closed).
     [[nodiscard]] CqRef cqRef() const noexcept { return cqRef_; }
+    /// False for a moved-from queue (no ring).
+    [[nodiscard]] bool valid() const noexcept { return ring_ != nullptr; }
     /// True on the owner (constructing) thread.
     [[nodiscard]] bool onOwnerThread() const noexcept { return std::this_thread::get_id() == owner_; }
 
@@ -253,7 +255,9 @@ public:
             bool done = false;
             work += ring_->read(
                 [&](const Completion& c, std::span<const uint8_t> payload) {
-                    if (!done && c.token == t) {
+                    // Review m6: a BatchAck's token field packs (topic, partition),
+                    // never an app token — never taken for one.
+                    if (!done && c.token == t && c.op != OpKind::BatchAck) {
                         done = true;
                         consumeCredit_(c);
                         onDone(c, payload);
@@ -382,7 +386,7 @@ private:
             if (hdr.live != 0) {
                 Completion c;
                 std::memcpy(&c, e + sizeof hdr, sizeof c);
-                if (c.token == t) {
+                if (c.token == t && c.op != OpKind::BatchAck) {
                     hdr.live = 0;
                     std::memcpy(e, &hdr, sizeof hdr);
                     --stashLive_;

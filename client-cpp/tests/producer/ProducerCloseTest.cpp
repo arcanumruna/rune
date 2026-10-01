@@ -20,6 +20,7 @@
 #include <rune/client/Completions.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <gtest/gtest.h>
 
@@ -568,4 +569,213 @@ TEST(ProducerClose, ThreadModeCloseImmediatelyAbortsDrainRegression) {
     }
     client.close();
     EXPECT_EQ(cq.timesCompleted(tok.token()), 1);
+}
+
+// ---------------------------------------------------------------------------
+// F8c fix round 1 (I1): close applied from a handler the producer itself fired
+// (an ack / batch-ack / failure completion).  The walk that fired the handler
+// still holds live state (a batch not yet released, a ring read not yet
+// consumed); the fail-all must run after it, never nested inside it.
+// ---------------------------------------------------------------------------
+
+namespace {
+/// Per-record + batch ledger whose handlers call closeImmediately() on a
+/// trigger; optional batch-ack Completions (BareCq-style, slot 0) to check the
+/// credit balances exactly.
+struct ReentryRig {
+    ProducerImpl impl;
+    std::vector<AckLedger::Rec>          recs;
+    std::vector<rc::BatchAck>            batches;
+    rc::Token                            closeOnToken = 0;   // per-record trigger
+    bool                                 closeOnFirstBatch = false;
+    int                                  closes = 0;
+    // batch-ack credit queue (CQ form)
+    rc::Completions                      bq{[] {
+        rc::CompletionsConfig c;
+        c.capacityBytes = 1u << 16;
+        c.maxResultBytes = 64;
+        c.maxErrorText = 64;
+        return c;
+    }()};
+    bool                                 cqForm = false;
+
+    explicit ReentryRig(rc::ProducerConfig cfg, bool direct, bool cq) : impl(cfg), cqForm(cq) {
+        if (direct) impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, kNow});
+        impl.setOnAck(&ReentryRig::onAck, this);
+        if (cq) {
+            ProducerImpl::Hooks h;
+            h.ctx = this;
+            h.cqDeliver = &ReentryRig::cqDeliver;
+            impl.setHooks(h);
+            impl.setBatchAckCq(&bq, 0);
+        } else {
+            impl.setOnBatchAck(&ReentryRig::onBatch, this);
+        }
+    }
+    void closeNow() {
+        ++closes;
+        (void)impl.closeImmediately();  // bare rig: applied in place (the duty thread)
+    }
+    static void onAck(void* c, rc::Token t, int64_t v, OpStatus st, uint16_t ec) noexcept {
+        auto* self = static_cast<ReentryRig*>(c);
+        self->recs.push_back({t, v, st, ec});
+        if (t == self->closeOnToken) self->closeNow();
+    }
+    void batch(const rc::BatchAck& a) {
+        batches.push_back(a);
+        if (closeOnFirstBatch && batches.size() == 1) closeNow();
+    }
+    static void onBatch(void* c, const rc::BatchAck& a) noexcept { static_cast<ReentryRig*>(c)->batch(a); }
+    static void cqDeliver(void* c, rc::CqRef, const rc::Completion& done) noexcept {
+        auto* self = static_cast<ReentryRig*>(c);
+        (void)self->bq.ring().deliver(done, {});
+        self->batch(rc::batchAckOf(done));
+    }
+    /// One accepted record with ack token t (and its batch-ack credit unit).
+    bool send(int32_t part, rc::Token t) {
+        if (cqForm && bq.reserve(rc::producer::kAckRecordBytes) != OpResult::Accepted) return false;
+        const bool ok = impl.trySubmit(1, part, rc::Key(t), kVal, AckLedger::hi(t)) == SendResult::Ok;
+        if (!ok && cqForm) bq.unreserve(rc::producer::kAckRecordBytes);
+        return ok;
+    }
+    int times(rc::Token t) const {
+        int n = 0;
+        for (const auto& r : recs) n += r.token == t ? 1 : 0;
+        return n;
+    }
+    int64_t batchRecords() const {
+        int64_t n = 0;
+        for (const auto& b : batches) n += b.recordCount;
+        return n;
+    }
+    void pollCredit() { (void)bq.poll([](const rc::Completion&, std::span<const uint8_t>) {}); }
+};
+
+void expectExactlyOnce(ReentryRig& R, rc::Token from, rc::Token to, int64_t acceptedRecords) {
+    for (rc::Token t = from; t < to; ++t) EXPECT_EQ(R.times(t), 1) << "token " << t;
+    EXPECT_EQ(R.batchRecords(), acceptedRecords) << "every accepted record in exactly one BatchAck";
+    if (R.cqForm) {
+        R.pollCredit();
+        EXPECT_EQ(R.bq.outstanding(), 0u) << "batch-ack credit exact";
+        EXPECT_EQ(R.bq.reservedBytes(), 0u);
+        EXPECT_EQ(R.bq.ring().lostCompletions(), 0u);
+    }
+}
+} // namespace
+
+// Regression (review I1(a)): closeImmediately() from the onAck handler while
+// onProduceResponse completes the acked batch.  The acked batch is NOT failed
+// a second time (no duplicate BatchAck, no double credit return, no epoch
+// bump); the remaining records complete Closed once each.  RED: applying the
+// fail-all in place (no DutyScope deferral) reproduces the review's run
+// (4 BatchAcks for 3 records, epoch bumped).
+TEST(ProducerClose, CloseImmediatelyFromOnAckHandlerCompletesEachRecordOnceRegression) {
+    for (const bool direct : {false, true}) {
+        for (const bool cq : {false, true}) {
+            SCOPED_TRACE(std::string(direct ? "Direct" : "Ring") + (cq ? "/CQ" : "/handler"));
+            rc::ProducerConfig cfg = ackCfg();
+            ReentryRig R(cfg, direct, cq);
+            CorrSink cs;
+            const auto sink = cs.fn();
+            ASSERT_TRUE(R.send(0, 1));
+            R.impl.submitFlush();
+            (void)R.impl.drainRing(kNow, 256);
+            (void)R.impl.flushBatches(kNow, 42, sink);
+            ASSERT_EQ(cs.corr.size(), 1u);
+            ASSERT_TRUE(R.send(0, 2));  // not yet sent (Ring: in the ring; Direct: builder)
+            ASSERT_TRUE(R.send(1, 3));
+            R.closeOnToken = 1;
+            const int16_t epoch0 = R.impl.producerEpoch();
+            R.impl.onProduceResponse(cs.corr[0], 100);
+            EXPECT_EQ(R.closes, 1);
+            EXPECT_EQ(R.impl.producerEpoch(), epoch0) << "the acked batch must not bump the epoch";
+            for (int i = 0; i < 5; ++i) (void)R.impl.drainRing(kNow, 256);  // Discarding drain
+            expectExactlyOnce(R, 1, 4, 3);
+            EXPECT_EQ(R.recs.front().status, OpStatus::Ok);
+            for (const auto& r : R.recs) {
+                if (r.token != 1) EXPECT_EQ(r.status, OpStatus::Closed);
+            }
+        }
+    }
+}
+
+// Regression (review I1(a)): the same from the BATCH-ack handler.
+TEST(ProducerClose, CloseImmediatelyFromBatchAckHandlerCompletesEachRecordOnceRegression) {
+    for (const bool direct : {false, true}) {
+        for (const bool cq : {false, true}) {
+            SCOPED_TRACE(std::string(direct ? "Direct" : "Ring") + (cq ? "/CQ" : "/handler"));
+            ReentryRig R(ackCfg(), direct, cq);
+            CorrSink cs;
+            const auto sink = cs.fn();
+            ASSERT_TRUE(R.send(0, 1));
+            ASSERT_TRUE(R.send(0, 2));
+            R.impl.submitFlush();
+            (void)R.impl.drainRing(kNow, 256);
+            (void)R.impl.flushBatches(kNow, 42, sink);
+            ASSERT_EQ(cs.corr.size(), 1u);
+            ASSERT_TRUE(R.send(1, 3));
+            R.closeOnFirstBatch = true;
+            const int16_t epoch0 = R.impl.producerEpoch();
+            R.impl.onProduceResponse(cs.corr[0], 100);
+            EXPECT_EQ(R.closes, 1);
+            EXPECT_EQ(R.impl.producerEpoch(), epoch0);
+            for (int i = 0; i < 5; ++i) (void)R.impl.drainRing(kNow, 256);
+            expectExactlyOnce(R, 1, 4, 3);
+            EXPECT_EQ(R.batches.front().errorCode, 0);
+            EXPECT_EQ(R.batches.front().recordCount, 2);
+        }
+    }
+}
+
+// Regression (review I1(b)): closeImmediately() from a handler fired by
+// failAllPending(SessionLost) while it is reading the producer ring (Tier-1
+// records and a Tier-2 batch in it): no record is re-read / completed twice,
+// the Tier-2 entry is freed once (ASan), and the credit balances.  Also a
+// delivery-timeout sweep firing the handler (failBatch_ / failBuilder_ paths).
+TEST(ProducerClose, CloseImmediatelyDuringFailAllAndSweepCompletesEachRecordOnceRegression) {
+    for (const bool direct : {false, true}) {
+        for (const bool cq : {false, true}) {
+            SCOPED_TRACE(std::string(direct ? "Direct" : "Ring") + (cq ? "/CQ" : "/handler"));
+            {
+                ReentryRig R(ackCfg(), direct, cq);
+                for (rc::Token t = 1; t <= 3; ++t) ASSERT_TRUE(R.send(0, t));
+                // A Tier-2 batch (one credit unit) after them.
+                std::vector<uint8_t> bytes;
+                rune::protocol::RecordBatchBuilder bb(0, 0);
+                bb.append("", "x", 0);
+                bb.append("", "y", 0);
+                bb.buildInto(bytes);
+                if (cq) ASSERT_EQ(R.bq.reserve(rc::producer::kAckRecordBytes), OpResult::Accepted);
+                ASSERT_EQ(R.impl.submitTier2Batch(1, 0, AckLedger::h(4), 2, bytes),
+                          rc::producer::RejectReason::None);
+                R.closeOnToken = 1;
+                R.impl.failAllPending(OpStatus::SessionLost);
+                EXPECT_EQ(R.closes, 1);
+                for (int i = 0; i < 5; ++i) (void)R.impl.drainRing(kNow, 256);
+                expectExactlyOnce(R, 1, 5, 5);  // 3 records + a 2-record Tier-2 batch
+            }
+            {
+                rc::ProducerConfig cfg = ackCfg();
+                cfg.deliveryTimeoutMs = 10;
+                ReentryRig R(cfg, direct, cq);
+                CorrSink cs;
+                const auto sink = cs.fn();
+                ASSERT_TRUE(R.send(0, 1));
+                R.impl.submitFlush();
+                (void)R.impl.drainRing(kNow, 256);
+                (void)R.impl.flushBatches(kNow, 42, sink);  // token 1 in flight
+                ASSERT_TRUE(R.send(1, 2));
+                (void)R.impl.drainRing(kNow, 256);           // token 2 in a builder (linger)
+                ASSERT_TRUE(R.send(1, 3));                   // Ring: token 3 in the ring
+                R.closeOnToken = 1;
+                const int16_t epoch0 = R.impl.producerEpoch();
+                R.impl.sweepTimedOut(std::chrono::steady_clock::time_point{
+                    std::chrono::nanoseconds{kNow + 10'000'000LL}});
+                EXPECT_EQ(R.closes, 1);
+                EXPECT_EQ(R.impl.producerEpoch(), epoch0 + 1) << "exactly one bump: the timed-out batch";
+                for (int i = 0; i < 5; ++i) (void)R.impl.drainRing(kNow, 256);
+                expectExactlyOnce(R, 1, 4, 3);
+            }
+        }
+    }
 }

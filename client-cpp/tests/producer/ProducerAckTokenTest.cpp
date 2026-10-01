@@ -521,3 +521,243 @@ TEST(ProducerAllocRegression, AckedCqPathAllocatesNothingRegression) {
         EXPECT_EQ(bq.q.outstanding(), 0u);
     }
 }
+
+// ---------------------------------------------------------------------------
+// F8c fix round 1 (review I2): batchAcksTo / batchAckOf / the BatchAck credit
+// and "every accepted record in exactly one BatchAck".
+// ---------------------------------------------------------------------------
+
+namespace {
+rc::CompletionsConfig smallCq(uint32_t cap = 1u << 16) {
+    rc::CompletionsConfig c;
+    c.capacityBytes = cap;
+    c.maxResultBytes = 64;
+    c.maxErrorText = 64;
+    return c;
+}
+struct BatchSeen {
+    std::vector<rc::BatchAck> acks;
+    std::vector<rc::Completion> raw;
+    int64_t records() const {
+        int64_t n = 0;
+        for (const auto& a : acks) n += a.recordCount;
+        return n;
+    }
+};
+int pollBatches(rc::Completions& q, BatchSeen& s) {
+    return q.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+        s.raw.push_back(c);
+        if (c.op == rc::OpKind::BatchAck) s.acks.push_back(rc::batchAckOf(c));
+    });
+}
+} // namespace
+
+// Regression: a bound producer's void, acked and Tier-2 sends each reserve one
+// unit; once acked and polled every unit is returned (outstanding 0, reserved
+// 0), batchAckOf decodes topic / partition / sequence / count, and the
+// BatchAcks cover every record exactly once.  RED (mutation): consumeCredit_
+// returning one op per BatchAck (not reserved0) leaves outstanding != 0.
+TEST(ProducerBatchAcks, BatchAcksToRoundTripCreditExactRegression) {
+    Rig r(invokerCfg(4410, 4411, 2));
+    r.connect();
+    rc::ProducerConfig pcfg = ackCfg();
+    pcfg.lingerUs = 60'000'000;
+    auto p = r.client->producer(pcfg);
+    rc::Completions bq(*r.client, smallCq());
+    p.batchAcksTo(bq);
+    test_support::TestCq cq(*r.client);
+    const auto topic = r.client->topic("t");
+    const rc::Key k0 = [] { for (uint64_t k = 0;; ++k) if (rc::Key(k).partition(2) == 0) return rc::Key(k); }();
+    const rc::Key k1 = [] { for (uint64_t k = 0;; ++k) if (rc::Key(k).partition(2) == 1) return rc::Key(k); }();
+    for (int i = 0; i < 4; ++i) ASSERT_EQ(p.trySend(topic, k0, kVal), SendResult::Ok);
+    auto acked = cq.send(p, topic, k0, kVal);
+    ASSERT_TRUE(acked.accepted());
+    for (int i = 0; i < 2; ++i) ASSERT_EQ(p.trySend(topic, k1, kVal), SendResult::Ok);
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return acked.ready(); }));
+    auto b = p.batch(topic, k1);
+    b.add(kVal);
+    b.add(kVal);
+    b.add(kVal);
+    auto t2 = cq.send(b);
+    ASSERT_TRUE(t2.accepted());
+    EXPECT_EQ(bq.outstanding(), 8u) << "4 + 1 + 2 Tier-1 records + 1 Tier-2 batch";
+    BatchSeen seen;
+    ASSERT_TRUE(r.drive([&] {
+        (void)pollBatches(bq, seen);
+        return t2.ready() && seen.records() >= 10;
+    }));
+    for (int i = 0; i < 1'000; ++i) { r.client->doWork(); r.gw.pump(); (void)pollBatches(bq, seen); }
+    EXPECT_EQ(seen.records(), 10) << "5 + 2 Tier-1 records + a 3-record Tier-2 batch, each once";
+    EXPECT_EQ(bq.outstanding(), 0u);
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+    EXPECT_EQ(bq.ring().lostCompletions(), 0u);
+    int64_t p0 = 0, p1 = 0;
+    for (const auto& a : seen.acks) {
+        EXPECT_EQ(a.topicId, 1);
+        EXPECT_EQ(a.errorCode, 0);
+        EXPECT_GE(a.baseOffset, 0);
+        EXPECT_GE(a.baseSequence, 0);
+        (a.partition == 0 ? p0 : p1) += a.recordCount;
+    }
+    EXPECT_EQ(p0, 5);
+    EXPECT_EQ(p1, 5);
+    for (const auto& c : seen.raw) EXPECT_EQ(c.status, OpStatus::Ok);
+    EXPECT_EQ(cq.timesCompleted(acked.token()), 1);
+}
+
+// Regression: at the credit limit a VOID send returns QueueFull with nothing
+// accepted (credit unchanged); a non-owner thread gets WrongThread; binding
+// (and onBatchAck) after a send throws.  RED (mutation): skipping the unit
+// reservation on the void path never reports QueueFull.
+TEST(ProducerBatchAcks, BatchAcksToQueueFullWrongThreadAndSetupPhaseRegression) {
+    Rig r(invokerCfg(4412, 4413));
+    r.connect();
+    rc::ProducerConfig pcfg = ackCfg();
+    pcfg.lingerUs = 60'000'000;
+    auto p = r.client->testProducerWithRingCap(pcfg, 64 * 1024);
+    rc::Completions bq(*r.client, smallCq(1024));
+    p.batchAcksTo(bq);
+    const auto topic = r.client->topic("t");
+    SendResult res = SendResult::Ok;
+    uint32_t accepted = 0;
+    for (int i = 0; i < 1'000 && res == SendResult::Ok; ++i) {
+        res = p.trySend(topic, rc::Key(uint64_t{1}), kVal);
+        if (res == SendResult::Ok) ++accepted;
+    }
+    EXPECT_EQ(res, SendResult::QueueFull);
+    EXPECT_GT(accepted, 0u);
+    EXPECT_EQ(bq.outstanding(), accepted) << "the rejected send reserved nothing";
+    SendResult other = SendResult::Ok;
+    std::thread t([&] { other = p.trySend(topic, rc::Key(uint64_t{1}), kVal); });
+    t.join();
+    EXPECT_EQ(other, SendResult::WrongThread);
+    EXPECT_EQ(bq.outstanding(), accepted);
+    rc::Completions bq2(*r.client, smallCq());
+    EXPECT_THROW(p.batchAcksTo(bq2), std::logic_error) << "second binding";
+    auto p2 = r.client->testProducerWithRingCap(pcfg, 64 * 1024);
+    ASSERT_EQ(p2.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Ok);
+    EXPECT_THROW(p2.batchAcksTo(bq2), std::logic_error) << "after a send";
+    EXPECT_THROW(p2.onBatchAck([](void*, const rc::BatchAck&) noexcept {}, nullptr), std::logic_error)
+        << "review m1: onBatchAck is setup-phase too";
+}
+
+// Regression: records that never got (or never finished) a batch are still
+// reported in exactly one BatchAck — closeImmediately (in flight, builder,
+// queued Tier-2) and Client close (records still in the producer ring) — and
+// the credit balances on both bound queues.  RED (mutation): dropping the
+// never-sent BatchAck in failBuilder_ leaves records unreported and credit
+// outstanding.
+TEST(ProducerBatchAcks, EveryAcceptedRecordInExactlyOneBatchAckThroughCloseRegression) {
+    Rig r(invokerCfg(4414, 4415));
+    r.connect();
+    r.gw.replyAcks = false;
+    rc::ProducerConfig pcfg = ackCfg();
+    pcfg.maxInFlight = 1;
+    auto direct = r.client->producer(pcfg);
+    auto ring   = r.client->testProducerWithRingCap(pcfg, 64 * 1024);
+    rc::Completions bqD(*r.client, smallCq()), bqR(*r.client, smallCq());
+    direct.batchAcksTo(bqD);
+    ring.batchAcksTo(bqR);
+    const auto topic = r.client->topic("t");
+    ASSERT_EQ(direct.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.produced.empty(); }));  // in flight (never acked)
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(direct.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Ok);
+    auto b = direct.batch(topic, rc::Key(uint64_t{1}));
+    b.add(kVal);
+    b.add(kVal);
+    ASSERT_EQ(b.send(), OpResult::Accepted);                        // queued Tier-2
+    for (int i = 0; i < 4; ++i) ASSERT_EQ(ring.trySend(topic, rc::Key(uint64_t{2}), kVal), SendResult::Ok);
+    ASSERT_EQ(direct.closeImmediately(), OpResult::Accepted);
+    BatchSeen sD, sR;
+    (void)pollBatches(bqD, sD);
+    EXPECT_EQ(sD.records(), 6) << "1 in flight + 3 never sent + a 2-record Tier-2 batch";
+    for (const auto& c : sD.raw) EXPECT_EQ(c.status, OpStatus::Closed);
+    EXPECT_EQ(bqD.outstanding(), 0u);
+    EXPECT_EQ(bqD.reservedBytes(), 0u);
+    r.client->close();  // the ring producer's 4 records are still in its ring
+    (void)pollBatches(bqR, sR);
+    EXPECT_EQ(sR.records(), 4);
+    for (const auto& a : sR.acks) {
+        EXPECT_EQ(a.baseSequence, -1);
+        EXPECT_EQ(a.errorCode, rc::BatchAck::kClientFailure);
+    }
+    EXPECT_EQ(bqR.outstanding(), 0u);
+    EXPECT_EQ(bqR.reservedBytes(), 0u);
+    EXPECT_EQ(bqD.ring().lostCompletions() + bqR.ring().lostCompletions(), 0u);
+}
+
+// Regression: a bound batch-ack queue released with BatchAck units still owed
+// stays quarantined until those units are delivered (dropped) — a BatchAck
+// accounts reserved0 producer ops.  RED (mutation): counting a BatchAck as one
+// producer op never recycles the slot.
+TEST(ProducerBatchAcks, ReleasedBatchAckQueueQuarantinedUntilUnitsDeliveredRegression) {
+    Rig r(invokerCfg(4416, 4417));
+    r.connect();
+    rc::CompletionsConfig tiny = smallCq(1024);
+    std::vector<std::unique_ptr<rc::Completions>> live;
+    for (uint32_t i = 0; i < rc::kMaxCqs - 2; ++i) live.push_back(std::make_unique<rc::Completions>(*r.client, tiny));
+    rc::ProducerConfig pcfg = ackCfg();
+    pcfg.lingerUs = 60'000'000;
+    auto ring = r.client->testProducerWithRingCap(pcfg, 64 * 1024);
+    const auto topic = r.client->topic("t");
+    auto a = std::make_unique<rc::Completions>(*r.client, tiny);
+    const uint32_t aIdx = rc::cqRefIndex(a->cqRef());
+    ring.batchAcksTo(*a);
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(ring.trySend(topic, rc::Key(uint64_t{1}), kVal), SendResult::Ok);
+    a.reset();  // 3 units owed, all still in the producer ring
+    for (int i = 0; i < 64; ++i) {
+        rc::Completions churn(*r.client, tiny);
+        EXPECT_NE(rc::cqRefIndex(churn.cqRef()), aIdx) << "quarantined slot reused at churn " << i;
+    }
+    const uint64_t stale0 = r.client->testStaleCqDrops();
+    ring.flush();
+    ASSERT_TRUE(r.drive([&] { return r.client->testStaleCqDrops() > stale0; }));
+    for (int i = 0; i < 1'000; ++i) { r.client->doWork(); r.gw.pump(); }
+    bool reused = false;
+    for (int i = 0; i < 8 && !reused; ++i) {
+        rc::Completions churn(*r.client, tiny);
+        reused = rc::cqRefIndex(churn.cqRef()) == aIdx;
+    }
+    EXPECT_TRUE(reused) << "the slot returns once the BatchAck's 3 units are accounted";
+}
+
+// Regression (review I1, through the Client): Producer::closeImmediately()
+// from the producer's own onAck handler (the Invoker owner, inside doWork) —
+// each token once, the acked batch reported once.
+TEST(ProducerBatchAcks, ClientCloseImmediatelyFromOnAckHandlerExactlyOnceRegression) {
+    Rig r(invokerCfg(4418, 4419));
+    r.connect();
+    rc::ProducerConfig pcfg = ackCfg();
+    pcfg.lingerUs = 60'000'000;
+    auto p = r.client->producer(pcfg);
+    rc::Completions bq(*r.client, smallCq());
+    p.batchAcksTo(bq);
+    struct Ctx {
+        rc::Producer*         p;
+        std::vector<AckLedger::Rec> recs;
+    } ctx{&p, {}};
+    p.onAck([](void* c, rc::Token t, int64_t v, OpStatus st, uint16_t ec) noexcept {
+        auto* x = static_cast<Ctx*>(c);
+        x->recs.push_back({t, v, st, ec});
+        if (t == 1) (void)x->p->closeImmediately();
+    }, &ctx);
+    const auto topic = r.client->topic("t");
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, AckToken{1}), SendResult::Ok);
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.produced.empty(); }));
+    r.gw.replyAcks = false;  // what follows never acks
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, AckToken{2}), SendResult::Ok);
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal, AckToken{3}), SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] { return ctx.recs.size() >= 3; }));
+    for (int i = 0; i < 1'000; ++i) { r.client->doWork(); r.gw.pump(); }
+    ASSERT_EQ(ctx.recs.size(), 3u);
+    EXPECT_EQ(ctx.recs[0].token, 1u);
+    EXPECT_EQ(ctx.recs[0].status, OpStatus::Ok);
+    for (int i = 1; i < 3; ++i) EXPECT_EQ(ctx.recs[i].status, OpStatus::Closed);
+    BatchSeen s;
+    (void)pollBatches(bq, s);
+    EXPECT_EQ(s.records(), 3);
+    EXPECT_EQ(bq.outstanding(), 0u);
+    EXPECT_EQ(bq.reservedBytes(), 0u);
+}

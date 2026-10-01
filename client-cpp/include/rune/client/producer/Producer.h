@@ -370,13 +370,30 @@ public:
 
     /// Setup phase (before the first send): per-batch acknowledgements into
     /// `cq` as op == OpKind::BatchAck completions (decode with batchAckOf()).
-    /// Credit: EVERY send on this producer (void and acked, Tier-1 and
-    /// Tier-2) then reserves one completion record on `cq` and returns
-    /// QueueFull when it has none — so the producer's sends must be made on
-    /// `cq`'s owner thread, and `cq` must outlive them.  One BatchAck record
-    /// returns the credit of all the records of its batch.  Throws
-    /// std::logic_error after a send, on a second call, when onBatchAck() was
-    /// set, or for a queue not registered with this producer's Client.
+    ///
+    /// Credit model (F8c C6, ruled as designed):
+    ///   * Once bound, EVERY send on this producer — void and acked, Tier-1 and
+    ///     Tier-2 — reserves one 48-byte credit unit on `cq` before it is
+    ///     accepted.  So ALL of the producer's sends must be made on `cq`'s
+    ///     owner thread (WrongThread otherwise), and a void send can return
+    ///     SendResult::QueueFull: poll `cq`, then retry.
+    ///   * One BatchAck record returns the units of every record of its batch
+    ///     (a Tier-2 batch is one unit).  EVERY accepted record is reported in
+    ///     exactly one BatchAck, including records failed before they were sent
+    ///     (baseSequence -1, errorCode kClientFailure).
+    ///   * Sizing: records accepted but not yet batch-acked AND polled are capped
+    ///     at  (capacityBytes - maxRecordBytes) / 48,  where maxRecordBytes =
+    ///     8-aligned(48 + max(maxResultBytes, maxErrorText)).  Defaults (1 MiB,
+    ///     16 KiB results): (1'048'576 - 16'432) / 48 ≈ 21'500 records.  Size
+    ///     capacityBytes >= 48 x (max in-flight records + max unpolled per-record
+    ///     acks on the same queue) + maxRecordBytes.  A dedicated batch-ack queue
+    ///     is recommended (a BatchAck's token field packs topicId << 32 |
+    ///     partition; Completions::waitFor never matches BatchAcks).
+    ///   * `cq` must outlive the producer's sends and must not be moved while
+    ///     bound (a moved-from queue: InvalidArgument).
+    /// Throws std::logic_error after a send, on a second call, when
+    /// onBatchAck() was set, or for a queue not registered with this producer's
+    /// Client.
     void batchAcksTo(Completions& cq);
 
     // ---- Tier-2: explicit atomic batch ---------------------------------------
