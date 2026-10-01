@@ -437,6 +437,14 @@ TEST(ShardConfigRegression, DriverOnDutyThreadRunsNoDriverOrConductorThread) {
     const rc::ClientConfig     c = rs::shardClientConfig(g, 0);
     ASSERT_EQ(c.runnerMode, rc::RunnerMode::Thread);
     ASSERT_TRUE(c.driverOnDutyThread);
+    // Sanitizer runtimes (TSan) start a helper thread at the process's first
+    // pthread_create and keep it.  Create (and keep alive across both counts)
+    // one parked thread first, so `before` already includes any such helper and
+    // the deltas measure only the Client's own threads (ctest runs this test
+    // alone, so the Client would otherwise be the first pthread_create).  A
+    // joined thread would not do: macOS may still list an exited thread.
+    std::promise<void> release;
+    std::thread parked([f = release.get_future()]() mutable { f.wait(); });
     const int before = processThreadCount();
     ASSERT_GT(before, 0);
     {
@@ -448,6 +456,8 @@ TEST(ShardConfigRegression, DriverOnDutyThreadRunsNoDriverOrConductorThread) {
         EXPECT_EQ(client.testTransport().callerPumpViolations(), 0) << "T2: exactly one pumper";
     }
     EXPECT_EQ(processThreadCount(), before);
+    release.set_value();
+    parked.join();
 }
 
 TEST(ShardConfigRegression, DutyThreadLivenessDefaultsUnbounded) {
