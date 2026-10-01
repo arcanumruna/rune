@@ -1216,18 +1216,20 @@ void runLargeBatchAcksAllCommits(bool perWorkerReplication, std::string_view tag
     for (auto& n : nodes) n->start();
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
 
-    const rune::consensus::NodeId lid = nodes[0]->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-    rune::node::BrokerNode& leader = *nodes[static_cast<std::size_t>(lid)];
+    // The PARTITION leader (the replica whose owner-thread role is Leader) — not
+    // assumed to be the consensus leader, which may lag/differ under slow
+    // (e.g. TSan) scheduling.  Deadline-bounded condition wait.
+    rune::node::BrokerNode* leaderPtr = nullptr;
     {
         const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline && !leader.replicationIsLeaderForTest())
-            std::this_thread::sleep_for(20ms);
+        while (std::chrono::steady_clock::now() < deadline && leaderPtr == nullptr) {
+            for (auto& n : nodes)
+                if (hasReplica(*n) && roleOnOwner(*n) == Role::Leader) { leaderPtr = n.get(); break; }
+            if (leaderPtr == nullptr) std::this_thread::sleep_for(20ms);
+        }
     }
-    ASSERT_TRUE(leader.replicationIsLeaderForTest());
-    ASSERT_TRUE(hasReplica(leader));
-    ASSERT_EQ(roleOnOwner(leader), Role::Leader);
+    ASSERT_NE(leaderPtr, nullptr) << "no partition leader emerged";
+    rune::node::BrokerNode& leader = *leaderPtr;
 
     // The follower fetch cap is 1 MiB (BrokerNode); this batch is ~2 MiB on disk.
     const std::size_t kValue = 2 * 1024 * 1024 - 256;
