@@ -19,7 +19,9 @@
 #include <cstdlib>
 #include <mutex>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <set>
 #include <string_view>
 #include <thread>
 #include <unistd.h>
@@ -43,6 +45,9 @@ struct TmpDir {
 };
 
 constexpr int32_t kClientStream  = 110;
+// Legacy per-worker ingress base (also the default egress-stream anchor).  F25:
+// a SHARD worker's ingress subscribes kClientStream on its own port — the
+// stream the metadata advertises — never base + w.
 constexpr int32_t kIngressStream = 111;
 
 struct ShardPorts {
@@ -156,7 +161,7 @@ TEST(ShardMode, SingleNodeProduceRoundTripOnWorkerShard) {
         ShardTestClient c(cdir.path);
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid, 0);
-        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0,
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0,
                                     /*acks=*/1, makeBatch(3));
         ASSERT_TRUE(ack.has_value()) << "no OK ack from the worker shard";
         EXPECT_EQ(ack->partition, 0);
@@ -187,7 +192,7 @@ TEST(ShardMode, ThreeNodeAcksAllCommitsOverShardReplicationPlanes) {
         const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
         ASSERT_GT(sid, 0);
         for (int b = 0; b < 5; ++b) {
-            auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kIngressStream, sid, 0, 0,
+            auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, 0,
                                         /*acks=all*/1, makeBatch(4));
             ASSERT_TRUE(ack.has_value()) << "acks=all batch " << b << " not committed";
         }
@@ -357,7 +362,7 @@ TEST(ShardModeRegression, PeerRestartStillMismatchedStaysRefused) {
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid, 0);
         ASSERT_TRUE(leaderBecomes(c, ports, sid, part, 0));
-        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, part,
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, part,
                                     /*acks=leader*/0, makeBatch(3));
         ASSERT_TRUE(ack.has_value());
     }
@@ -400,7 +405,7 @@ TEST(ShardModeRegression, PeerFixedAndRestartedHeals) {
         }, 400)) << "no partition leader advertised";
         const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
         ASSERT_GT(sid, 0);
-        auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kIngressStream, sid, 0, 0,
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, 0,
                                     /*acks=all*/1, makeBatch(4));
         ASSERT_TRUE(ack.has_value()) << "acks=all did not complete after the plane healed";
     }
@@ -434,7 +439,7 @@ TEST(ShardModeRegression, LargerWorkerCountExtraShardsDoNotSplit) {
     const int64_t sid = c.connect(gatewayChannel(ports, 1), kClientStream);
     ASSERT_GT(sid, 0);
     constexpr int64_t kCorr = 50'000;
-    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 1, 1), kIngressStream + 1, sid, kCorr, 0, part,
+    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 1, 1), kClientStream, sid, kCorr, 0, part,
                           /*acks=all*/1, makeBatch(1)));
     auto r = c.awaitProduceResponse(kCorr);
     ASSERT_TRUE(r.has_value()) << "acks=all got no answer (silent hang)";
@@ -475,7 +480,7 @@ TEST(ShardModeRegression, SlowStartupPhaseDoesNotKillShardClient) {
         EXPECT_FALSE(node.onOwnerThreadForTest(0, part, [&node, w](rune::replication::PartitionReplica*) {
             return node.shardClientClosedForTest(w);
         })) << "shard " << w << " client died during startup";
-        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, w), kIngressStream + w, sid, 0, part,
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, w), kClientStream, sid, 0, part,
                                     /*acks=*/0, makeBatch(2), /*maxAttempts=*/20);
         EXPECT_TRUE(ack.has_value()) << "shard " << w << " does not serve after a slow startup phase";
     }
@@ -509,7 +514,7 @@ TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
         EXPECT_FALSE(node.onOwnerThreadForTest(0, part, [&node, w](rune::replication::PartitionReplica*) {
             return node.shardClientClosedForTest(w);
         })) << "shard " << w << " client died while a later shard resolved";
-        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, w), kIngressStream + w, sid, 0, part,
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, w), kClientStream, sid, 0, part,
                                     /*acks=*/0, makeBatch(2), /*maxAttempts=*/20);
         EXPECT_TRUE(ack.has_value()) << "shard " << w << " does not serve";
     }
@@ -552,16 +557,16 @@ TEST(ShardModeRegression, StorageFailureHaltsBrokerWithExitCode) {
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
-    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(2)));
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0, 1, makeBatch(2)));
     ASSERT_TRUE(node.onOwnerThreadForTest(0, 0, [&node](rune::replication::PartitionReplica*) {
         node.workerForTest(0)->forceFlushErrorForTest(EIO);
         return true;
     }));
-    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 9001, 0, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kClientStream, sid, 9001, 0, 0, 1, makeBatch(1)));
     ASSERT_TRUE(c.awaitProduceResponse(9001).has_value());
     EXPECT_EQ(halt.await(10'000ms), BrokerNode::kExitStorageFailure)
         << "the next background fsync fails → the broker is halted with EX_IOERR";
-    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 9002, 0, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kClientStream, sid, 9002, 0, 0, 1, makeBatch(1)));
     const auto refused = c.awaitProduceResponse(9002);
     ASSERT_TRUE(refused.has_value());
     EXPECT_EQ(refused->errorCode, static_cast<uint16_t>(pc::ErrorCode::StorageError));
@@ -638,7 +643,7 @@ TEST(ShardMode, MetadataAdvertisesTheLeaderWorkerEndpoint) {
         return !ep.empty();
     }, 400)) << "no ingressEndpoint advertised for topic 0 partition 0";
     EXPECT_EQ(ep, "127.0.0.1:" + std::to_string(ports.ib[0]));
-    ASSERT_TRUE(c.produceUntilOk("aeron:udp?endpoint=" + ep, kIngressStream, sid, 0, 0, 1, makeBatch(1)))
+    ASSERT_TRUE(c.produceUntilOk("aeron:udp?endpoint=" + ep, kClientStream, sid, 0, 0, 1, makeBatch(1)))
         << "the advertised endpoint is the live worker ingress";
     node.stop();
 }
@@ -681,7 +686,7 @@ TEST(ShardModeFusedRegression, SingleNodeRunsRuntimeOnWorkerZero) {
         ShardTestClient c(cdir.path);
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid, 0) << "gateway Connect served by the fused runtime";
-        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(2));
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0, 1, makeBatch(2));
         ASSERT_TRUE(ack.has_value());
     }
     node.stop();
@@ -709,10 +714,10 @@ TEST(ShardModeFusedRegression, ReturnRingPressureNeverDeadlocksTheFusedLoop) {
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0);
-    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 0, makeBatch(1)));
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0, 0, makeBatch(1)));
     constexpr int kN = 2000;
     for (int i = 0; i < kN; ++i)
-        ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 10'000 + i, 0, 0, 0, makeBatch(1)));
+        ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kClientStream, sid, 10'000 + i, 0, 0, 0, makeBatch(1)));
     int ok = 0;
     for (int i = 0; i < kN; ++i) {
         auto a = c.awaitProduceResponse(10'000 + i);
@@ -748,7 +753,7 @@ TEST(ShardModeFusedRegression, ThreeNodeAcksAllCommitsWithFusedRuntimes) {
         const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
         ASSERT_GT(sid, 0);
         for (int b = 0; b < 5; ++b) {
-            auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kIngressStream, sid, 0, 0,
+            auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, 0,
                                         /*acks=all*/1, makeBatch(4));
             ASSERT_TRUE(ack.has_value()) << "acks=all batch " << b << " not committed";
         }
@@ -780,7 +785,7 @@ TEST(ShardModeFusedRegression, SlowStartupPhaseDoesNotKillTheRuntimeClient) {
     ShardTestClient c(cdir.path);
     const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid, 0) << "the runtime client died during startup (gateway no longer serves)";
-    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0, 1, makeBatch(1)));
     node.stop();
 }
 
@@ -870,7 +875,7 @@ TEST(ShardModeFusedRegression, PartitionLeaderFailsOverBetweenFusedRuntimes) {
     {
         const int64_t sid = c.connect(gatewayChannel(ports, oldLeader), kClientStream);
         ASSERT_GT(sid, 0);
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, oldLeader, 0), kIngressStream, sid, 0, 0,
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, oldLeader, 0), kClientStream, sid, 0, 0,
                                      /*acks=all*/1, makeBatch(2)));
     }
     nodes[static_cast<std::size_t>(oldLeader)]->stop();                  // the partition leader dies
@@ -884,7 +889,7 @@ TEST(ShardModeFusedRegression, PartitionLeaderFailsOverBetweenFusedRuntimes) {
     })) << "partition 0 never failed over from dead node " << oldLeader;
     const int64_t sid = c.connect(gatewayChannel(ports, newLeader), kClientStream);
     ASSERT_GT(sid, 0);
-    EXPECT_TRUE(c.produceUntilOk(workerIngressChannel(ports, newLeader, 0), kIngressStream, sid, 0, 0,
+    EXPECT_TRUE(c.produceUntilOk(workerIngressChannel(ports, newLeader, 0), kClientStream, sid, 0, 0,
                                  /*acks=all*/1, makeBatch(2)))
         << "acks=all must commit on the surviving pair";
     for (auto& n : nodes) n->stop();
@@ -1080,7 +1085,7 @@ TEST(ShardModeRegression, WorkerSideAcksEndToEndAndSessionReconnect) {
         ShardTestClient c(cdir.path);
         const int64_t sid1 = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid1, 0);
-        auto ack1 = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid1, 0, 0, 1, makeBatch(2));
+        auto ack1 = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid1, 0, 0, 1, makeBatch(2));
         ASSERT_TRUE(ack1.has_value());
         EXPECT_NE(c.ackImageSessionId(ack1->correlationId), 0);
         EXPECT_NE(c.ackImageSessionId(ack1->correlationId), c.connectImageSessionId())
@@ -1089,7 +1094,7 @@ TEST(ShardModeRegression, WorkerSideAcksEndToEndAndSessionReconnect) {
         const int64_t sid2 = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid2, 0);
         ASSERT_NE(sid2, sid1);
-        auto ack2 = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid2, 0, 0, 1, makeBatch(2));
+        auto ack2 = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid2, 0, 0, 1, makeBatch(2));
         ASSERT_TRUE(ack2.has_value()) << "a new session is announced and acked by the worker after the old one closed";
         EXPECT_NE(c.ackImageSessionId(ack2->correlationId), c.connectImageSessionId());
     }
@@ -1108,9 +1113,69 @@ TEST(ShardModeRegression, WorkerSideAcksEndToEndThreadPlacement) {
         ShardTestClient c(cdir.path);
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid, 0);
-        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(4));
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0, 1, makeBatch(4));
         ASSERT_TRUE(ack.has_value());
         EXPECT_NE(c.ackImageSessionId(ack->correlationId), c.connectImageSessionId());
     }
     node.stop();
+}
+
+// F25 (REGRESSION, k3s 3-node shard bench hang): shard mode advertised
+// ingressStreamId = workerIngressBase + owner, subscribed ONLY on the worker's
+// own port.  A client that ignores the additive ingressEndpoint trailer (spec
+// §2: older clients must keep working) routes (leader NODE endpoint, advertised
+// stream) — nothing subscribed it → NOT_CONNECTED forever.  Both routes a
+// client can derive from the metadata must reach a live subscriber and every
+// acks=all batch must be acked, on partitions led by more than one node.  The
+// test routes ONLY from what the MetadataResponse advertises (no hard-coded
+// stream — the harness used to pair the worker endpoint with a known stream,
+// which masked this).
+TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwareClients) {
+    constexpr int kNodes = 3, kBatches = 6;
+    constexpr int32_t kWorkers = 2, kParts = 6;
+    TmpDir d0{"f25n0"}, d1{"f25n1"}, d2{"f25n2"}, cdir{"f25cl"};
+    const auto ports = ShardPorts::discover(kNodes, kWorkers);
+    const fs::path* dirs[] = {&d0.path, &d1.path, &d2.path};
+    std::vector<std::unique_ptr<BrokerNode>> nodes;
+    for (int i = 0; i < kNodes; ++i) {
+        auto cfg = makeShardConfig(i, *dirs[i], ports, kNodes, kWorkers, /*fused=*/true);
+        cfg.topics[0].partitionCount = kParts;
+        nodes.push_back(std::make_unique<BrokerNode>(cfg));
+    }
+    for (auto& n : nodes) n->start();
+    ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid0, 0);
+        std::vector<PartitionInfo> parts;
+        std::set<int32_t> leaders;
+        ASSERT_TRUE(eventually([&] {
+            parts.clear(); leaders.clear();
+            for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                if (pi.topicId == 0 && pi.leaderId >= 0) { parts.push_back(pi); leaders.insert(pi.leaderId); }
+            return parts.size() == static_cast<std::size_t>(kParts) && leaders.size() > 1;
+        }, 400)) << "partitions never led by more than one node";
+        std::map<int32_t, int64_t> sidOn;   // sessions are per node: one on every leader
+        for (int32_t l : leaders) {
+            sidOn[l] = c.connect(gatewayChannel(ports, l), kClientStream);
+            ASSERT_GT(sidOn[l], 0) << "connect to leader " << l;
+        }
+        for (const bool endpointAware : {false, true}) {
+            for (const auto& pi : parts) {
+                if (endpointAware) ASSERT_FALSE(pi.ingressEndpoint.empty()) << "partition " << pi.partition;
+                const std::string ch = endpointAware ? "aeron:udp?endpoint=" + pi.ingressEndpoint
+                                                     : gatewayChannel(ports, pi.leaderId);
+                for (int b = 0; b < kBatches; ++b) {
+                    auto ack = c.produceUntilOk(ch, pi.ingressStreamId, sidOn[pi.leaderId], 0, pi.partition,
+                                                /*acks=all*/1, makeBatch(2), /*maxAttempts=*/3);
+                    ASSERT_TRUE(ack.has_value())
+                        << (endpointAware ? "endpoint-aware" : "endpoint-UNAWARE") << " client: partition "
+                        << pi.partition << " (leader " << pi.leaderId << ", advertised stream "
+                        << pi.ingressStreamId << ") batch " << b << " never acked";
+                }
+            }
+        }
+    }
+    for (auto& n : nodes) n->stop();
 }

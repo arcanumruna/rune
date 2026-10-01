@@ -4550,7 +4550,17 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // consecutive records and exhausted its redirect budget (dr3 rolling
             // leader-kill: produced 44/50).  clientStreamId_ has a live subscriber on
             // every node, so it is always a safe, consistent routing target.
-            p.ingressStreamId = perWorkerIngressActive_
+            //
+            // F25 — shard mode (spec §2/§3.3): advertise clientStreamId_.  The
+            // node endpoint's gateway subscribes it (→ worker op ring →
+            // executeProduceWire_) AND every shard's WorkerIngress subscribes it
+            // on its own port, so BOTH routes a client can derive are live: an
+            // ingressEndpoint-aware client sends (endpoint, stream) straight to
+            // the owning worker; one that ignores the trailer sends (node
+            // endpoint, stream) to the gateway.  base + owner was subscribed only
+            // on the worker port → the latter hit NOT_CONNECTED forever.
+            p.ingressStreamId = shardMode_ ? clientStreamId_
+                              : perWorkerIngressActive_
                               ? (workerIngressBaseStreamId_
                                  + (workerPool_
                                     ? workerPool_->ownerWorkerId(topicId, partition)

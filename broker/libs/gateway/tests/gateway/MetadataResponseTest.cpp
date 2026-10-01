@@ -391,5 +391,45 @@ TEST(MetadataResponseIngressEndpointRegression, LeaderWithoutAdvertisedBaseGetsE
     EXPECT_TRUE(findEntry(*dec, 10, 0)->ingressEndpoint.empty()) << "client falls back to the node endpoint";
 }
 
+// ===========================================================================
+// F25 (REGRESSION): shard mode advertised ingressStreamId = workerIngressBase
+// + owner, but the shard WorkerIngress subscribes that stream ONLY on the
+// per-worker endpoint — a client that ignores the additive ingressEndpoint
+// trailer (spec §2: "older clients ignore it") sent it to the NODE endpoint,
+// where nothing subscribes → NOT_CONNECTED forever.  Shard mode must advertise
+// the stream the node endpoint's gateway subscribes (clientStreamId_); each
+// shard's WorkerIngress subscribes the same stream on its own port.
+// ===========================================================================
+TEST(MetadataResponseIngressStreamIdRegression, ShardModeAdvertisesTheStreamTheNodeEndpointSubscribes)
+{
+    constexpr int32_t kBase = 77, kClientStream = 110, kWorkers = 2;
+    const std::vector<std::pair<int32_t,int32_t>> kParts = {{10, 0}, {10, 1}, {10, 2}, {20, 0}};
+    md::ShardRouter router(kWorkers);
+    auto pool = std::make_unique<rune::node::WorkerPool>(kWorkers, router, 4096, 4096, 16, 16);
+    ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, 1);
+    gw.setRoutingImageSnapshot(makeImage(kParts, /*leader=*/1));
+    gw.setWorkerIngressBaseStreamId(kBase);
+    gw.setClientStreamIdForTest(kClientStream);
+    gw.setCommittedMetadataReady(true);
+    gw.setWorkerPool(pool.get());
+    gw.setPerWorkerIngressActive(true);     // what attachShardRuntimes_ sets
+    gw.setShardMode(true);
+    gw.setShardIngressEndpoints({{1, "10.0.0.2", 40520}});
+    std::vector<uint8_t> frameCopy;
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) { frameCopy.assign(buf, buf + len); });
+    const int64_t sid = gw.injectTestSession();
+    const auto frame = makeMetadataRequestFrame(sid);
+    gw.applyMetadataForTest(frame.data(), frame.size());
+    auto dec = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
+    ASSERT_TRUE(dec.has_value());
+    ASSERT_EQ(dec->partitions.size(), kParts.size());
+    for (const auto& p : dec->partitions) {
+        EXPECT_EQ(p.ingressStreamId, kClientStream)
+            << "shard mode: the advertised stream must be live on the node endpoint (gateway) AND on the "
+               "advertised worker endpoint; topic=" << p.topicId << " part=" << p.partition;
+        EXPECT_FALSE(std::string(p.ingressEndpoint).empty()) << "the endpoint-aware route stays advertised";
+    }
+}
+
 } // namespace
 } // namespace rune::gateway

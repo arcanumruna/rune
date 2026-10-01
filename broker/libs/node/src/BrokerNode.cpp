@@ -3025,8 +3025,12 @@ void BrokerNode::attachShardRuntimes_() {
                                        static_cast<int64_t>(config_.produceIntakeLimit()),
                                        config_.workerIngressRingBytes);
         }
+        // F25: the shard ingress subscribes the CLIENT stream on this worker's
+        // own port — the stream the metadata advertises in shard mode, which the
+        // node endpoint's gateway subscribes too (an ingressEndpoint-unaware
+        // client lands there).  Legacy per-worker ingress keeps base + w.
         auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(w),
-                                                   config_.workerIngressBaseStreamId + w, pump);
+                                                   config_.clientEndpoint.streamId, pump);
         const std::string control = config_.workerEgressControlHost + ":" + std::to_string(egressControlBase + w);
         auto eg = std::make_unique<WorkerEgress>(shardClients_[idx], control, egressBase + w, pump);
         if (!ing->resolved() || !eg->resolved())
