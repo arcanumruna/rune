@@ -70,6 +70,9 @@ struct InvokerGateway {
     std::set<int32_t>     holdPartitions;  // partitions whose acks are held
     std::vector<Produced> produced;
     std::vector<Produced> held;
+    // Acks sent immediately BEFORE the next ConnectResponse, from the same
+    // publication, so the client receives [ack..., ConnectResponse] in one poll.
+    std::vector<Produced> ackBeforeNextConnect;
     int connects = 0;
     int metadataRequests = 0;
 
@@ -206,6 +209,8 @@ private:
             const auto c = rcc::decodeConnectRequest(buf, len);
             if (!c) return;
             ++connects;
+            for (const Produced& pr : ackBeforeNextConnect) ack(pr);
+            ackBeforeNextConnect.clear();
             uint8_t out[64];
             const std::size_t n = rcc::encodeConnectResponse(
                 out, sizeof out, static_cast<int16_t>(rcc::ErrorCode::OK), 0, assignedSessionId,

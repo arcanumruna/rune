@@ -205,16 +205,19 @@ inline constexpr int64_t kLegacyStubProducerId =
 // failure the OS-entropy term falls back to steady_clock ^ pid; the clock and pid
 // terms are mixed in below regardless, and the redraw loop still advances
 // because steady_clock moves between iterations.
-uint64_t osEntropyOrFallback(uint64_t clockBits, uint64_t pidBits) noexcept {
+uint64_t osEntropyOrFallback(uint64_t clockBits, uint64_t pidBits, uint64_t selfBits) noexcept {
     try {
         std::random_device rd;
         return (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
     } catch (...) {
-        return splitmix64(clockBits ^ splitmix64(pidBits));
+        return splitmix64(clockBits ^ splitmix64(pidBits) ^ splitmix64(selfBits ^ 0xA5A5A5A5A5A5A5A5ULL));
     }
 }
 
-int64_t generateProducerId() noexcept {
+// `self` (the ProducerImpl address) separates two producers of one process
+// constructed within the same steady_clock tick when OS entropy is unavailable.
+int64_t generateProducerId(const void* self) noexcept {
+    const uint64_t selfBits = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(self));
     for (;;) {
         const uint64_t clockBits = static_cast<uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
@@ -225,11 +228,12 @@ int64_t generateProducerId() noexcept {
             ::getpid()
 #endif
         );
-        const uint64_t rdBits = osEntropyOrFallback(clockBits, pidBits);
+        const uint64_t rdBits = osEntropyOrFallback(clockBits, pidBits, selfBits);
 
         uint64_t mixed = splitmix64(rdBits);
         mixed = splitmix64(mixed ^ splitmix64(clockBits));
         mixed = splitmix64(mixed ^ splitmix64(pidBits));
+        mixed = splitmix64(mixed ^ splitmix64(selfBits));
 
         const int64_t candidate =
             static_cast<int64_t>(mixed & 0x7FFFFFFFFFFFFFFFULL); // mask to non-negative
@@ -278,7 +282,7 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     , ringBuf_(makeRingBuffer(static_cast<std::size_t>(ringTotalBytes(ringCap)),
                               kRingAlignment))
     , ring_(ringBuf_.get(), static_cast<std::size_t>(ringTotalBytes(ringCap)))
-    , producerId_(generateProducerId())  // F5: unique per instance, never the old shared stub
+    , producerId_(generateProducerId(this))  // F5: unique per instance, never the old shared stub
 {
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
@@ -1182,7 +1186,7 @@ void ProducerImpl::onUnresolvedSequence_(int16_t batchEpoch) noexcept {
         // producer's id as the original was, and gives the broker no reason to
         // believe this is a distinct producer).  Fresh id + epoch 0 is the same
         // trust-on-first-use the broker already grants any never-seen producerId.
-        producerId_ = generateProducerId();
+        producerId_ = generateProducerId(this);
         producerEpoch_ = 0;
     } else {
         ++producerEpoch_;

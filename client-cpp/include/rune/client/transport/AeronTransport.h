@@ -173,12 +173,25 @@ public:
                 }
             };
         };
+        // fragmentLimit is the TOTAL budget across the default egress subscription
+        // and every per-worker subscription (the caller sizes it to its ack-buffer
+        // room).  The starting source rotates each poll so no subscription starves.
         int frags = 0;
-        if (egressSub_ && assembler_) frags += egressSub_->poll(onFragment(*assembler_), fragmentLimit);
-        for (SubSlot& s : subSlots_) {
+        const std::size_t sources = 1 + subSlots_.size();
+        const std::size_t start   = pollStart_ < sources ? pollStart_ : 0;
+        pollStart_ = (start + 1 == sources) ? 0 : start + 1;
+        for (std::size_t k = 0; k < sources && frags < fragmentLimit; ++k) {
+            std::size_t i = start + k;
+            if (i >= sources) i -= sources;
+            if (i == 0) {
+                if (egressSub_ && assembler_)
+                    frags += egressSub_->poll(onFragment(*assembler_), fragmentLimit - frags);
+                continue;
+            }
+            SubSlot& s = subSlots_[i - 1];
             aeron::Subscription* sub = s.res.ready();
             if (sub == nullptr) sub = resolveSubSlot_(s);
-            if (sub != nullptr) frags += sub->poll(onFragment(*s.assembler), fragmentLimit);
+            if (sub != nullptr) frags += sub->poll(onFragment(*s.assembler), fragmentLimit - frags);
         }
         pollCtx_   = nullptr;
         pollThunk_ = nullptr;
@@ -282,6 +295,7 @@ private:
     // Reassembled (multi-fragment) messages reach the current poll() handler via
     // this thunk; set only for the duration of poll().
     void* pollCtx_ = nullptr;
+    std::size_t pollStart_ = 0;  // round-robin first source for poll() (single-writer)
     void (*pollThunk_)(void*, const uint8_t*, std::size_t) = nullptr;
 
     // ---- Internal helpers ----------------------------------------------------

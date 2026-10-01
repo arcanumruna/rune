@@ -160,3 +160,179 @@ TEST(CpuAffinity, PinsTheCallingThreadOnLinux) {
     GTEST_SKIP() << "thread affinity is unsupported on this OS (macOS)";
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// Task 12 fix round 1
+// ---------------------------------------------------------------------------
+
+// I1: a producer / txn producer whose registration is still in the agent ring
+// when close() runs must be adopted (holder freed) and then failed — never hang.
+TEST(InvokerClient, CloseFailsUnadoptedProducerRegression) {
+    for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
+        SCOPED_TRACE(mode == rc::RunnerMode::Invoker ? "Invoker" : "Thread");
+        rc::ClientConfig c = invokerCfg(mode == rc::RunnerMode::Invoker ? 3740 : 3742,
+                                        mode == rc::RunnerMode::Invoker ? 3741 : 3743);
+        c.runnerMode = mode;
+        rc::Client client(c);
+        rc::ProducerConfig pcfg;
+        pcfg.acks = rc::Acks::Leader;
+        pcfg.lingerUs = 0;
+        auto p = client.producer(pcfg);
+        auto fut = p.send(client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                          rc::want_future);
+        auto tp    = client.transactionalProducer("tx-close");
+        auto initF = tp.initTransactions();
+        client.close();
+        ASSERT_TRUE(ready(fut)) << "produce future must be failed by close(), not hang";
+        EXPECT_THROW(fut.get(), std::runtime_error);
+        ASSERT_TRUE(ready(initF)) << "txn initTransactions future must be failed by close()";
+        EXPECT_THROW(initF.get(), std::runtime_error);
+        // Adoption == the ring holder was consumed and freed (no leak).
+        EXPECT_EQ(client.testProducerCount(), 1u);
+        EXPECT_EQ(client.testTxnProducerCount(), 1u);
+    }
+}
+
+// I2: a registration retry must never pump the duty cycle from inside a duty-cycle
+// callback (re-entrant agent/transport poll) nor from a non-owner thread.
+TEST(InvokerClient, RegistrationFromCallbackWithFullRingFailsFastRegression) {
+    Rig r(invokerCfg(3750, 3751));
+    bool inCallbackThrew = false;
+    r.client.onConnected([&](int64_t) {
+        r.client.testFillCommandRing();
+        try {
+            (void)r.client.producer();
+        } catch (const std::logic_error&) {
+            inCallbackThrew = true;
+        }
+    });
+    r.connect();
+    EXPECT_TRUE(inCallbackThrew);
+
+    ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() == 0; }, 1'000));
+    r.client.testFillCommandRing();
+    bool otherThreadThrew = false;
+    std::thread t([&] {
+        try {
+            (void)r.client.producer();
+        } catch (const std::logic_error&) {
+            otherThreadThrew = true;
+        }
+    });
+    t.join();
+    EXPECT_TRUE(otherThreadThrew);
+}
+
+// I3: the owner-thread contract is enforced in release builds too.
+TEST(InvokerClient, DoWorkFromNonOwnerThreadThrowsRegression) {
+    Rig r(invokerCfg(3752, 3753));
+    bool threw = false;
+    std::thread t([&] {
+        try {
+            r.client.doWork();
+        } catch (const std::logic_error&) {
+            threw = true;
+        }
+    });
+    t.join();
+    EXPECT_TRUE(threw);
+}
+
+// M5: close() from a duty-cycle callback would tear the agent down under its own
+// poll — rejected with logic_error, and the client keeps working.
+TEST(InvokerClient, CloseFromCallbackThrowsRegression) {
+    Rig r(invokerCfg(3754, 3755));
+    bool threw = false;
+    r.client.onConnected([&](int64_t) {
+        try {
+            r.client.close();
+        } catch (const std::logic_error&) {
+            threw = true;
+        }
+    });
+    r.connect();
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(r.client.state(), rune::client::session::SessionState::Connected);
+    EXPECT_FALSE(r.client.transportClosed());
+}
+
+// I4: a ProduceResponse for X and a (redirect-reconnect) ConnectResponse in ONE
+// poll: X's ack must reach the hub before the resend path runs, so X is not resent.
+TEST(InvokerClient, AckThenConnectResponseInOnePollDoesNotResendRegression) {
+    Rig r(invokerCfg(3760, 3761));
+    r.connect();
+    r.gw.replyAcks = false;
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::Leader;
+    pcfg.lingerUs = 0;
+    auto p  = r.client.producer(pcfg);
+    auto fx = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                     rc::want_future);
+    ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; }));
+    auto fy = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                     rc::want_future);
+    ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 2; }));
+    const auto X = r.gw.produced[0];
+    const auto Y = r.gw.produced[1];
+    ASSERT_NE(X.corrId, Y.corrId);
+    r.gw.held.clear();
+    r.gw.ackBeforeNextConnect.push_back(X);
+
+    namespace rcc = rune::client::codec;
+    uint8_t buf[256];
+    const std::size_t n = rcc::encodeErrorResponse(
+        buf, sizeof buf, static_cast<int16_t>(rcc::ErrorCode::Redirect), "aeron:ipc",
+        r.gw.assignedSessionId, Y.corrId);
+    ASSERT_GT(n, 0u);
+    r.gw.send(0, buf, n);
+
+    auto countCorr = [&](int64_t corr) {
+        int k = 0;
+        for (const auto& pr : r.gw.produced) k += (pr.corrId == corr) ? 1 : 0;
+        return k;
+    };
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && ready(fx); }));
+    ASSERT_TRUE(r.drive([&] { return countCorr(Y.corrId) >= 2; }))
+        << "the redirected batch Y is resent after the reconnect";
+    EXPECT_EQ(countCorr(X.corrId), 1) << "acked batch X must not be resent";
+    EXPECT_EQ(fx.get(), 100);
+}
+
+// I5 coverage.
+TEST(InvokerClient, DoWorkReentryReturnsZeroRegression) {
+    Rig r(invokerCfg(3762, 3763));
+    bool called = false;
+    int  nested = -1;
+    r.client.onConnected([&](int64_t) {
+        called = true;
+        nested = r.client.doWork();
+    });
+    r.connect();
+    EXPECT_TRUE(called);
+    EXPECT_EQ(nested, 0);
+}
+
+TEST(InvokerClient, InvokerRingFullRetryPumpsRegression) {
+    Rig r(invokerCfg(3764, 3765));
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    r.client.testFillCommandRing();
+    // No runner thread exists: the only way this registration lands is the retry
+    // loop running the duty cycle (which drains the ring) on this thread.
+    auto p = r.client.producer();
+    ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() == 1; }, 1'000));
+}
+
+TEST(InvokerClient, TxnAndRegularProducerAcksBothRouteRegression) {
+    Rig r(invokerCfg(3766, 3767));
+    auto tp = r.client.transactionalProducer("tx-2");
+    r.connect();
+    ASSERT_EQ(r.client.testTxnProducerCount(), 1u);  // forwardProduceResponses on
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::Leader;
+    pcfg.lingerUs = 0;
+    auto p   = r.client.producer(pcfg);
+    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                      rc::want_future);
+    ASSERT_TRUE(r.drive([&] { return ready(fut); }));
+    EXPECT_EQ(fut.get(), 100);
+}

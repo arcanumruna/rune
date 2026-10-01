@@ -800,6 +800,23 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
 
 void TransactionalProducerImpl::failAll(const std::string& reason)
 {
+    // Commands the duty cycle never drained (e.g. initTransactions() before
+    // close()): their futures must fail, not hang.
+    std::vector<Command> cmds;
+    {
+        std::lock_guard<std::mutex> lk(cmdMtx_);
+        cmds.swap(cmdQueue_);
+    }
+    for (auto& cmd : cmds) {
+        try {
+            cmd.promise.set_exception(std::make_exception_ptr(std::runtime_error(reason)));
+        } catch (...) {}
+    }
+    {
+        std::lock_guard<std::mutex> lk(pendingSendsMtx_);
+        pendingSends_.clear();  // no completions carried
+    }
+
     for (auto& [corrId, op] : pendingOps_) {
         try {
             op.promise.set_exception(

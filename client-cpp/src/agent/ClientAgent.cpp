@@ -193,11 +193,23 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     totalWork += ringWork;
 
     // ---- Step 2: Poll egress (bounded) --------------------------------------
-    int fragments = transport_.poll(
-        [this, nowNs](const uint8_t* buf, std::size_t len) {
-            dispatchEgressFrame(nowNs, buf, len);
-        },
-        cfg_.egressPollLimit);
+    // The fragment budget never exceeds the free room in the reserved ack buffer
+    // (one unfragmented ProduceResponse per fragment at most), so the hot path
+    // never grows produceAcks_.  A full buffer pauses egress for this cycle; the
+    // owner clears it and polling resumes next cycle (nothing is dropped).
+    int pollLimit = cfg_.egressPollLimit;
+    if (!produceResponseFn_) {
+        const int room = static_cast<int>(produceAcks_.capacity() - produceAcks_.size());
+        if (room < pollLimit) pollLimit = room;
+    }
+    int fragments = 0;
+    if (pollLimit > 0) {
+        fragments = transport_.poll(
+            [this, nowNs](const uint8_t* buf, std::size_t len) {
+                dispatchEgressFrame(nowNs, buf, len);
+            },
+            pollLimit);
+    }
 
     totalWork += fragments;
 
@@ -309,6 +321,35 @@ bool ClientAgent::submitRegisterProducer(void* holder) noexcept {
     uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
     const std::size_t n = msg.encode(buf);
     return writeCommand(kMsgRegisterProducer, buf, n);
+}
+
+int ClientAgent::drainRegistrationsForClose() noexcept {
+    int total = 0;
+    for (;;) {
+        const int n = ring_.read(
+            [this](std::int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf,
+                   aeron::util::index_t offset, aeron::util::index_t len) {
+                const ProducerRegisterFn* fn =
+                    (msgTypeId == kMsgRegisterProducer)      ? &producerRegisterFn_
+                    : (msgTypeId == kMsgRegisterTxnProducer) ? &txnProducerRegisterFn_
+                                                             : nullptr;
+                if (fn == nullptr || !*fn) return;  // sends / lifecycle: dropped
+                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                auto msg = ring_msg::RegisterProducer::decode(p, static_cast<std::size_t>(len));
+                if (msg) (*fn)(reinterpret_cast<void*>(msg->handle));
+            },
+            cfg_.ringDrainLimit);
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+void ClientAgent::testFillCommandRing() {
+    std::vector<uint8_t> scratch(static_cast<std::size_t>(ring_.maxMsgLength()), 0);
+    for (std::size_t len = scratch.size(); len >= 1; len /= 2) {
+        while (writeCommand(kMsgTestNoop, scratch.data(), len)) {}
+    }
 }
 
 bool ClientAgent::submitRegisterTxnProducer(void* holder) noexcept {

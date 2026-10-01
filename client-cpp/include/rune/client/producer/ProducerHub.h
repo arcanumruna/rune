@@ -111,6 +111,7 @@ public:
         // Runner-thread-only read of the single-owner vector — no lock, no atomic.
         return producers_.empty();
     }
+    std::size_t size() const noexcept { return producers_.size(); }
 
     /// CB-5 B: attempt to resend a redirected Produce identified by correlationId.
     /// Returns true if one producer handled it (resent or failed).

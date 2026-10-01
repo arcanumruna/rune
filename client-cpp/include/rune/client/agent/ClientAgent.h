@@ -253,6 +253,12 @@ public:
     /// std::shared_ptr<TransactionalProducerImpl>* adopted on the duty-cycle thread.
     bool submitRegisterTxnProducer(void* holder) noexcept;
 
+    /// close() path, single-threaded (runner joined / Invoker owner): drain the
+    /// WHOLE command ring once, adopting producer + txn-producer registrations
+    /// through their hooks (so their holders are freed and the owner can fail
+    /// them) and dropping every other command (sends carry no completion).
+    int drainRegistrationsForClose() noexcept;
+
     /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
     /// subscription so the client receives Records pushed by the owning worker.
     /// AGENT-THREAD ONLY — call from onMetadataResponse (which runs on the agent
@@ -310,6 +316,12 @@ public:
     void setForwardProduceResponses(bool on) noexcept { forwardProduceResponses_ = on; }
 
     [[nodiscard]] bool transportClosed() const noexcept { return transport_.closed(); }
+
+    /// Test hooks.  Reserved ack-buffer capacity (the hot path must never grow it).
+    [[nodiscard]] std::size_t testProduceAckCapacity() const noexcept { return produceAcks_.capacity(); }
+    /// Fill the command ring with no-op commands until no registration fits
+    /// (cold, allocates a scratch buffer).  The duty cycle drops no-ops.
+    void testFillCommandRing();
 
     /// Task 1.4 (redirect convergence): route ONE pre-encoded produce frame to its
     /// partition leader session — the SAME routing the produce drain path uses
@@ -455,6 +467,7 @@ private:
     static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
     static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
     static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
+    static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
     // starts its correlationId counter at i*stride so concurrent connects demux

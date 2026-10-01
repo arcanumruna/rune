@@ -235,6 +235,10 @@ public:
 
     /// Test hook: transactional producers adopted by the duty-cycle thread.
     [[nodiscard]] std::size_t testTxnProducerCount() const noexcept { return txnProducers_.size(); }
+    /// Test hook: producers adopted by the duty-cycle thread.
+    [[nodiscard]] std::size_t testProducerCount() const noexcept { return producerHub_.size(); }
+    /// Test hook: fill the agent command ring so the next registration finds it full.
+    void testFillCommandRing() { agent_.testFillCommandRing(); }
 
     // -------------------------------------------------------------------------
     // Callback registration — MUST be called before connect()  (FIX F4)
@@ -509,6 +513,10 @@ private:
     /// the runner thread (Thread mode) and Client::doWork() (Invoker mode).
     int  dutyCycle(int64_t nowNs);
     int  producerDuty_(int64_t nowNs);
+    /// Route the agent's buffered ProduceResponses into the hub (plain calls) and
+    /// clear the buffer.  Run by dutyCycle() and at the top of every resend path so
+    /// an ack that arrived earlier in the same poll is applied before a resend.
+    int  routeBufferedAcks_();
     [[nodiscard]] int64_t now() const noexcept {
         return cfg_.nanoClock != nullptr ? cfg_.nanoClock() : nowNs();
     }
@@ -519,6 +527,18 @@ private:
     template <class Submit, class OnFail>
     void submitRegistration_(Submit&& submit, OnFail&& onFail) {
         if (submit()) return;
+        // Ring full.  Pumping is only safe on the duty-cycle thread OUTSIDE a cycle:
+        // from a duty-cycle callback it would re-enter the agent's own poll, and in
+        // Invoker mode a non-owner thread must never run the duty cycle.  Thread
+        // mode: an app thread parks while the runner drains; the runner itself
+        // (callback) cannot wait for itself.  inDutyCycle_ is read only on the
+        // duty-cycle thread (no cross-thread read).
+        const bool onDutyThread = std::this_thread::get_id() == dutyThreadId_;
+        if ((onDutyThread && inDutyCycle_) ||
+            (cfg_.runnerMode == RunnerMode::Invoker && !onDutyThread)) {
+            onFail();
+            throw std::logic_error("ring full: cannot pump from callback/non-owner thread");
+        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (!submit()) {
             if (std::chrono::steady_clock::now() >= deadline) {
@@ -609,6 +629,7 @@ private:
     int64_t         nextSweepNs_ = 0;       // duty-cycle thread only
     bool            inDutyCycle_ = false;   // duty-cycle thread only
     std::thread::id ownerThread_;           // constructing thread (Invoker owner)
+    std::thread::id dutyThreadId_;          // thread running dutyCycle(): owner or runner
     // Built ONCE: the txn producers' send paths (no per-cycle std::function build).
     std::function<bool(int32_t, const uint8_t*, std::size_t)> txnSendFn_;
     std::function<bool(int32_t, const uint8_t*, std::size_t)> txnControlSendFn_;

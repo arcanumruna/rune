@@ -113,6 +113,7 @@ Client::Client(ClientConfig cfg)
     // partition-leader session reaches Connected.  Re-offer every in-flight frame
     // through its partition route.  Cold path (connect event), unchanged.
     agent_.setProduceResendFn([this]() {
+        (void)routeBufferedAcks_();  // acks earlier in this poll first: never resend an acked batch
         producer::ProducerImpl::SendFn sendFn =
             [this](int32_t t, int32_t p, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
                 return agent_.offerToPartition(t, p, sid, fb, fl);
@@ -157,10 +158,12 @@ Client::Client(ClientConfig cfg)
     // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence).
 
     agent_.start();  // Invoker: pumps its own driver while resolving (no threads)
-    ownerThread_ = std::this_thread::get_id();
-    nextSweepNs_ = now() + kSweepIntervalMs * 1'000'000LL;
+    ownerThread_  = std::this_thread::get_id();
+    dutyThreadId_ = ownerThread_;
+    nextSweepNs_  = now() + kSweepIntervalMs * 1'000'000LL;
     if (cfg_.runnerMode == RunnerMode::Thread) {
         runnerThread_ = std::thread([this]() { runLoop(); });
+        dutyThreadId_ = runnerThread_.get_id();
     }
 }
 
@@ -177,6 +180,17 @@ Client::~Client() {
 // ---------------------------------------------------------------------------
 
 void Client::close() {
+    if (cfg_.runnerMode == RunnerMode::Invoker) {
+        // Cold-path contract checks, enforced in release builds too.
+        if (std::this_thread::get_id() != ownerThread_) [[unlikely]] {
+            throw std::logic_error("Client::close(): Invoker mode — call from the owner thread");
+        }
+        if (inDutyCycle_) [[unlikely]] {
+            throw std::logic_error(
+                "Client::close(): called from a duty-cycle callback (would tear the agent "
+                "down under its own poll)");
+        }
+    }
     // Atomically transition to stopped; only the first caller does the work.
     bool alreadyStopped = stopped_.exchange(true, std::memory_order_acq_rel);
     if (alreadyStopped) return;
@@ -190,6 +204,11 @@ void Client::close() {
     if (runnerThread_.joinable()) {
         runnerThread_.join();
     }
+
+    // Single-threaded from here.  Adopt registrations still sitting in the command
+    // ring (producer()/transactionalProducer() whose registration no duty cycle has
+    // drained yet) so their holders are freed and the failAll below reaches them.
+    (void)agent_.drainRegistrationsForClose();
 
     // Stop the agent (idempotent — CC-5 contract).
     agent_.stop();
@@ -576,16 +595,19 @@ int Client::doWork() {
     if (cfg_.runnerMode != RunnerMode::Invoker) {
         throw std::logic_error("Client::doWork(): only valid in RunnerMode::Invoker");
     }
-    assert(std::this_thread::get_id() == ownerThread_ && "doWork() from a non-owner thread");
+    if (std::this_thread::get_id() != ownerThread_) [[unlikely]] {
+        throw std::logic_error("Client::doWork(): call from the owner (constructing) thread");
+    }
     if (inDutyCycle_) return 0;  // re-entered from a callback: never nest the duty cycle
     return dutyCycle(now());
 }
 
 int Client::dutyCycle(int64_t nowNs) {
-    struct InCycle {
+    struct InCycle {  // saves + restores: nesting-safe (a registration pump inside)
         bool& flag;
-        explicit InCycle(bool& f) : flag(f) { flag = true; }
-        ~InCycle() { flag = false; }
+        bool  prev;
+        explicit InCycle(bool& f) : flag(f), prev(f) { flag = true; }
+        ~InCycle() { flag = prev; }
     } inCycle(inDutyCycle_);
 
     // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
@@ -593,13 +615,10 @@ int Client::dutyCycle(int64_t nowNs) {
     int work = agent_.doWork(nowNs);
 
     // 2. ProduceResponses → hub with plain calls (O(1) ordinal routing).
-    const auto acks = agent_.produceAcks();
-    const int ackCount = static_cast<int>(acks.size());
-    for (const auto& a : acks) producerHub_.onProduceResponse(a.correlationId, a.baseOffsetOrError);
-    agent_.clearProduceAcks();
+    work += routeBufferedAcks_();
 
     // 3. Producer drain/flush through AgentProduceSink (no per-cycle std::function).
-    work += ackCount + producerDuty_(nowNs);
+    work += producerDuty_(nowNs);
 
     // 4. Periodic sweep on the duty-cycle clock.
     if (nowNs >= nextSweepNs_) {
@@ -607,6 +626,14 @@ int Client::dutyCycle(int64_t nowNs) {
         nextSweepNs_ = nowNs + kSweepIntervalMs * 1'000'000LL;
     }
     return work;
+}
+
+int Client::routeBufferedAcks_() {
+    const auto acks = agent_.produceAcks();
+    const int n = static_cast<int>(acks.size());
+    for (const auto& a : acks) producerHub_.onProduceResponse(a.correlationId, a.baseOffsetOrError);
+    agent_.clearProduceAcks();
+    return n;
 }
 
 int Client::producerDuty_(int64_t nowNs) {
@@ -822,6 +849,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // Runs on the agent thread (single-writer): submitSend → agent ring.
             if (redirectPending()) {
                 redirectPending() = false;
+                // Acks that arrived earlier in THIS poll reach the hub before the
+                // resend, so an already-acked batch is never resent (T12 I4).
+                (void)routeBufferedAcks_();
                 const int64_t newSessionId = opt->assignedSessionId;
                 // E5.1: resend uses per-worker streamId stored in BatchInfo.
                 // submitSend goes through the agent ring → transport_.offer(streamId, ...)
