@@ -1284,3 +1284,106 @@ TEST(LargeBatchReplicationRegression, AcksAll2MiBBatchCommitsPerWorkerPlane) {
 TEST(LargeBatchReplicationRegression, AcksAll2MiBBatchCommitsLegacyTransport) {
     runLargeBatchAcksAllCommits(/*perWorkerReplication=*/false, "f18lg_");
 }
+
+// ===========================================================================
+// F18 fix round 1 (I-1, *Regression*): a stored batch LARGER than the leader's
+// own replication frame (accepted earlier under a larger config / by an older
+// broker — appended here directly on the owner to model it) must NOT stall the
+// partition silently.  Default sizes: 4 MiB outbound ring / term → ~512 KiB
+// frames; the batch is ~1 MiB.  Before: every serve was dropped by the
+// transport, the followers re-fetched forever, each re-fetch refreshed their ISR
+// liveness → HW pinned below the batch forever, nothing but a drop log.
+// Required (time-independent, the existing lag check only): the leader answers
+// kErrRecordTooLarge (counted), each follower wedges (counted, stops fetching),
+// both leave the ISR, and acks=all with minIsr=2 fails loudly (MinIsr) instead
+// of hanging.  Both planes.
+// ===========================================================================
+namespace {
+void runUnservableBatchEvictsFollowers(bool perWorkerReplication, std::string_view tag) {
+    PwTempDir dir0{std::string(tag) + "0_"}, dir1{std::string(tag) + "1_"},
+              dir2{std::string(tag) + "2_"};
+    const auto cPorts = pwDiscoverFreePorts(3);
+    const auto kPorts = pwDiscoverFreePorts(3);
+    const auto rPorts = pwDiscoverFreePorts(3);
+    std::array<rune::node::NodeConfig, 3> cfgs{
+        makePwConfig(0, dir0.path, cPorts, kPorts, rPorts, /*minIsr=*/2),
+        makePwConfig(1, dir1.path, cPorts, kPorts, rPorts, 2),
+        makePwConfig(2, dir2.path, cPorts, kPorts, rPorts, 2)};
+    for (auto& c : cfgs) {
+        c.perWorkerReplication = perWorkerReplication;
+        c.replicaLagMaxMs      = 1'500;                    // the EXISTING lag check
+        ASSERT_LT(c.produceIntakeLimit(), 1 * 1024 * 1024) << "defaults: frame ~512 KiB";
+    }
+    std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+
+    rune::node::BrokerNode* leaderPtr = nullptr;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && leaderPtr == nullptr) {
+            for (auto& n : nodes)
+                if (hasReplica(*n) && roleOnOwner(*n) == Role::Leader) { leaderPtr = n.get(); break; }
+            if (leaderPtr == nullptr) std::this_thread::sleep_for(20ms);
+        }
+    }
+    ASSERT_NE(leaderPtr, nullptr);
+    rune::node::BrokerNode& leader = *leaderPtr;
+    {   // full ISR first, so the eviction below is caused by the batch
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && rune::node::test::isrSizeOnOwner(leader) < 3)
+            std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_EQ(rune::node::test::isrSizeOnOwner(leader), 3);
+
+    const auto big = makePwPayload(0xD1, 1024 * 1024);     // ~1 MiB > ~512 KiB frame
+    ASSERT_EQ(appendOnOwner(leader, std::span<const uint8_t>(big.data(), big.size()), false), 0);
+
+    // The followers leave the ISR (deadline-bounded condition wait; the lag check
+    // is 1.5 s — nothing here is a sleep-to-pass-time).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
+        while (std::chrono::steady_clock::now() < deadline && rune::node::test::isrSizeOnOwner(leader) != 1)
+            std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(rune::node::test::isrSizeOnOwner(leader), 1) << "the stuck followers must leave the ISR";
+    const uint64_t served = leader.onOwnerThreadForTest(0, 0,
+        [](PartitionReplica& r) { return r.recordTooLargeServed(); });
+    EXPECT_GE(served, 1u) << "the leader must answer kErrRecordTooLarge (counted)";
+    for (auto& n : nodes) {
+        if (n.get() == &leader) continue;
+        const auto [at, count] = n->onOwnerThreadForTest(0, 0, [](PartitionReplica& r) {
+            return std::pair<Offset, uint64_t>{r.wedgedAtOffset(), r.wedgedRefusals()};
+        });
+        EXPECT_EQ(at, 0) << "follower must be wedged at the unservable offset";
+        EXPECT_GE(count, 1u);
+        EXPECT_EQ(leoOnOwner(*n), 0);
+    }
+    // acks=all now fails loudly (min-ISR 2 > ISR 1) instead of hanging.
+    const auto small = makePwPayload(0xD2, 32);
+    EXPECT_EQ(appendOnOwner(leader, std::span<const uint8_t>(small.data(), small.size()), true), -1);
+    // No infinite silent re-fetch: once both followers are wedged (and evicted)
+    // the leader's counter STOPS growing.  (Requests already in flight when the
+    // first answer went out are answered too — a bounded burst, not a loop.)
+    // Progress-bounded: the leader's owner thread keeps running its duty cycle
+    // between these owner-thread round trips; the followers' wedged state is
+    // re-checked so a re-fetch would have to come from a still-wedged follower.
+    for (auto& n : nodes) {
+        if (n.get() == &leader) continue;
+        EXPECT_EQ(n->onOwnerThreadForTest(0, 0, [](PartitionReplica& r) { return r.wedgedAtOffset(); }), 0);
+    }
+    const uint64_t servedLater = leader.onOwnerThreadForTest(0, 0,
+        [](PartitionReplica& r) { return r.recordTooLargeServed(); });
+    EXPECT_EQ(servedLater, served) << "a wedged follower kept re-fetching the unservable batch";
+    for (auto& n : nodes) n->stop();
+}
+} // namespace
+
+TEST(LargeBatchReplicationRegression, UnservableStoredBatchEvictsFollowersPerWorkerPlane) {
+    runUnservableBatchEvictsFollowers(/*perWorkerReplication=*/true, "f18uw_");
+}
+
+TEST(LargeBatchReplicationRegression, UnservableStoredBatchEvictsFollowersLegacyTransport) {
+    runUnservableBatchEvictsFollowers(/*perWorkerReplication=*/false, "f18ul_");
+}

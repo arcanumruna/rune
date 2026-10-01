@@ -1,4 +1,5 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/node/RoleCounter.h>
 
 #include <spdlog/spdlog.h>
@@ -461,6 +462,10 @@ void BrokerNode::buildReplication() {
             replTransport_ = std::make_unique<rune::replication::AeronPartitionTransport>(
                 aeron_, ingressChannel, ingressStream, selfId,
                 config_.replicationOutboundRingBytes);
+            // F18: every replication publication uses the embedded driver's term
+            // (no channel overrides term-length) — fixed before any worker runs.
+            replTransport_->setPublicationMaxMessageBytes(
+                rune::replication::aeronMaxMessageLength(config_.aeronTermBufferBytes));
 
             // Add each peer (excluding self) as an egress destination.
             for (const auto& peer : config_.peers) {

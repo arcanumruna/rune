@@ -14,9 +14,11 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -66,9 +68,22 @@ class CapturingTransport : public InMemoryTransport {
 public:
     std::vector<std::vector<uint8_t>> fetchResponses;
     std::vector<std::vector<uint8_t>> reconcileResponses;
+    std::vector<int16_t>              fetchErrors;     // errorCode of every response
+    // F18: a real transport's per-frame records ceiling.  A response above it is
+    // DROPPED (exactly what AeronPartitionTransport does) — never delivered.
+    int64_t frameCap        = std::numeric_limits<int64_t>::max();
+    int     oversizeDropped = 0;
+    int     fetchRequests   = 0;                       // every follower FetchRequest
 
+    [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return frameCap; }
+    void sendFetchRequest(const FetchRequestMsg& req) override {
+        ++fetchRequests;
+        InMemoryTransport::sendFetchRequest(req);
+    }
     void sendFetchResponse(NodeId to, const FetchResponseMsg& resp) override {
+        if (static_cast<int64_t>(resp.records.size()) > frameCap) { ++oversizeDropped; return; }
         fetchResponses.emplace_back(resp.records.begin(), resp.records.end());
+        fetchErrors.push_back(resp.errorCode);
         InMemoryTransport::sendFetchResponse(to, resp);
     }
     void sendReconcileResponse(NodeId to, const FetchResponseMsg& resp) override {
@@ -237,4 +252,157 @@ TEST_F(LargeBatchReplicationRegression, ReconcileServesWholeOversizedFirstBatch)
     leader->onReconcileRequest(fetchReq(1, kMaxBytes));
     ASSERT_EQ(transport.reconcileResponses.size(), 2u);
     EXPECT_EQ(batchesOf(transport.reconcileResponses.back()).size(), 2u);
+}
+
+// ===========================================================================
+// F18 fix round 1 (I-1): an UNSERVABLE batch must never stall silently.
+// The leader holds a stored batch larger than its own replication frame (e.g.
+// accepted under a larger config).  Before: every serve was dropped by the
+// transport, the follower re-fetched it forever, each re-fetch refreshed its ISR
+// liveness → HW pinned below the batch forever, nothing reported.
+// Required: an explicit kErrRecordTooLarge answer (counted), the follower stops
+// re-fetching (wedged, counted), the request is NOT ISR liveness → the follower
+// leaves the ISR via the existing lag check, HW advances with the remaining ISR,
+// acks=all with minIsr=2 then fails loudly.
+// ===========================================================================
+namespace {
+PartitionConfig lagCfg(NodeId self, int minIsr = 2) {
+    PartitionConfig c = makeCfg(self, /*push*/true);
+    c.replicaLagMaxMs = 20;            // existing ISR lag check (ms of the injected clock)
+    c.minIsr          = minIsr;
+    return c;
+}
+} // namespace
+
+// minIsr=2: after the eviction the served HW stays min-ISR-gated (DR-BUG-3) and
+// acks=all is refused loudly.  minIsr=1 (below): HW advances with the remaining ISR.
+TEST_F(LargeBatchReplicationRegression, LeaderUnservableBatchEvictsFollowerInsteadOfSilentStall) {
+    const std::vector<NodeId> replicas{kLeaderId, kFollowerId};
+    leader = std::make_unique<PartitionReplica>(lagCfg(kLeaderId), Role::Leader, 1, replicas,
+                                                replicas, &leaderLog, &transport);
+    follower = std::make_unique<PartitionReplica>(lagCfg(kFollowerId), Role::Follower, 1,
+                                                  replicas, replicas, &followerLog, &transport);
+    follower->becomeFollower(1, kLeaderId);
+    transport.setLeader(leader.get());
+    transport.addFollower(kFollowerId, follower.get());
+    transport.frameCap = 4096;                         // the leader's replication frame
+    const std::vector<uint8_t> big(kBigValue, 0xE1);   // ~16 KiB stored batch
+    ASSERT_EQ(leader->append(big, /*acksAll=*/true), 0);
+
+    constexpr int kIters = 200;                        // 200 ms of injected time >> 20 ms lag
+    int fetchesAtWedge = -1;
+    for (int i = 0; i < kIters; ++i) {
+        clock += 1'000'000LL;
+        leader->doWork(clock);
+        follower->doWork(clock);
+        transport.pump(clock);
+        if (fetchesAtWedge < 0 && follower->wedgedAtOffset() == 0) fetchesAtWedge = transport.fetchRequests;
+    }
+    // Leader: explicit, counted answer — never a silent drop.
+    EXPECT_GE(leader->recordTooLargeServed(), 1u);
+    EXPECT_NE(std::find(transport.fetchErrors.begin(), transport.fetchErrors.end(), kErrRecordTooLarge),
+              transport.fetchErrors.end()) << "the follower must be TOLD (kErrRecordTooLarge)";
+    // Follower: wedged at the unservable offset, counted, and stops re-fetching.
+    EXPECT_EQ(follower->wedgedAtOffset(), 0);
+    EXPECT_GE(follower->wedgedRefusals(), 1u);
+    ASSERT_GE(fetchesAtWedge, 0) << "the follower never wedged";
+    EXPECT_LE(transport.fetchRequests - fetchesAtWedge, 1) << "no infinite silent re-fetch";
+    // ISR: the stuck follower leaves (existing lag check), HW advances with the
+    // remaining ISR, acks=all (minIsr=2) fails loudly.
+    EXPECT_EQ(leader->isr(), std::vector<NodeId>{kLeaderId}) << "the follower must leave the ISR";
+    EXPECT_EQ(leader->append(std::vector<uint8_t>(8, 1), /*acksAll=*/true), -1)
+        << "acks=all must fail visibly (MinIsr), not hang";
+}
+
+TEST_F(LargeBatchReplicationRegression, LeaderUnservableBatchMinIsrOneHwAdvancesWithRemainingIsr) {
+    const std::vector<NodeId> replicas{kLeaderId, kFollowerId};
+    leader = std::make_unique<PartitionReplica>(lagCfg(kLeaderId, 1), Role::Leader, 1, replicas,
+                                                replicas, &leaderLog, &transport);
+    follower = std::make_unique<PartitionReplica>(lagCfg(kFollowerId, 1), Role::Follower, 1,
+                                                  replicas, replicas, &followerLog, &transport);
+    follower->becomeFollower(1, kLeaderId);
+    transport.setLeader(leader.get());
+    transport.addFollower(kFollowerId, follower.get());
+    transport.frameCap = 4096;
+    ASSERT_EQ(leader->append(std::vector<uint8_t>(kBigValue, 0xE2), true), 0);
+    for (int i = 0; i < 200 && leader->highWatermark() < 1; ++i) {
+        clock += 1'000'000LL;
+        leader->doWork(clock);
+        follower->doWork(clock);
+        transport.pump(clock);
+    }
+    EXPECT_EQ(leader->isr(), std::vector<NodeId>{kLeaderId});
+    EXPECT_EQ(leader->highWatermark(), 1) << "HW advances with the remaining ISR (never pinned)";
+    EXPECT_EQ(follower->wedgedAtOffset(), 0);
+}
+
+// Follower side: its OWN worker ring cannot hold the batch (heterogeneous config).
+// The transport reports that as a local kErrRecordTooLarge response (no records);
+// the follower must wedge, stop re-fetching, and leave the ISR — same contract.
+TEST_F(LargeBatchReplicationRegression, FollowerUnapplicableBatchWedgesAndLeavesIsr) {
+    const std::vector<NodeId> replicas{kLeaderId, kFollowerId};
+    leader = std::make_unique<PartitionReplica>(lagCfg(kLeaderId), Role::Leader, 1, replicas,
+                                                replicas, &leaderLog, &transport);
+    follower = std::make_unique<PartitionReplica>(lagCfg(kFollowerId), Role::Follower, 1,
+                                                  replicas, replicas, &followerLog, &transport);
+    follower->becomeFollower(1, kLeaderId);
+    transport.setLeader(leader.get());
+    transport.addFollower(kFollowerId, follower.get());
+
+    FetchResponseMsg refused{};
+    refused.leaderEpoch = 1;
+    refused.partition   = 0;
+    refused.errorCode   = kErrRecordTooLarge;
+    follower->applyReplicated(refused);
+    EXPECT_EQ(follower->wedgedAtOffset(), 0);
+    EXPECT_EQ(follower->wedgedRefusals(), 1u);
+
+    const int before = transport.fetchRequests;
+    for (int i = 0; i < 200; ++i) {
+        clock += 1'000'000LL;
+        leader->doWork(clock);
+        follower->doWork(clock);
+        transport.pump(clock);
+    }
+    EXPECT_EQ(transport.fetchRequests, before) << "a wedged follower emits no fetch (no liveness)";
+    EXPECT_EQ(leader->isr(), std::vector<NodeId>{kLeaderId});
+
+    // A leadership/epoch change clears the wedge (time-independent recovery path).
+    follower->becomeFollower(2, kLeaderId);
+    EXPECT_EQ(follower->wedgedAtOffset(), -1);
+}
+
+// A stale-epoch kErrRecordTooLarge (from a deposed leader) must NOT wedge.
+TEST_F(LargeBatchReplicationRegression, StaleEpochRecordTooLargeDoesNotWedge) {
+    build(false, true);
+    follower->becomeFollower(3, kLeaderId);
+    FetchResponseMsg refused{};
+    refused.leaderEpoch = 2;
+    refused.errorCode   = kErrRecordTooLarge;
+    follower->applyReplicated(refused);
+    EXPECT_EQ(follower->wedgedAtOffset(), -1);
+    EXPECT_EQ(follower->wedgedRefusals(), 0u);
+}
+
+// m-3: the push path bounds LATER batches by the transport frame, not 1 MiB
+// maxFetchBytes — a multi-batch push above the frame was dropped (and still
+// advanced pushedThrough, costing a resend round-trip).
+TEST_F(LargeBatchReplicationRegression, PushPrefixBoundedByTransportFrame) {
+    build(/*push*/true, /*follower*/true);
+    transport.frameCap = 2048;
+    // Three ~1 KiB batches appended straight to the log (the gateway/worker
+    // append-direct path), then ONE coalesced push in doWork.
+    for (int64_t base = 0; base < 3; ++base) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", std::string(900, 'z'), 1000);
+        const auto bytes = b.build();
+        ASSERT_GE(leaderLog.append(bytes, base), 0);
+    }
+    leader->onLeaderLogAppended();
+    transport.fetchResponses.clear();
+    transport.oversizeDropped = 0;
+    leader->doWork(++clock);
+    EXPECT_EQ(transport.oversizeDropped, 0) << "a push prefix above the frame was built and dropped";
+    ASSERT_FALSE(transport.fetchResponses.empty()) << "nothing pushed";
+    EXPECT_LE(static_cast<int64_t>(transport.fetchResponses.front().size()), transport.frameCap);
 }

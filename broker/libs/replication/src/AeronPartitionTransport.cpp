@@ -32,7 +32,8 @@ namespace isbe = ::rune::protocol::internal::sbe;
 
 // kOutboundEnvelopeOverhead (ReplicationFrameLimits.h): the OutboundFrame envelope
 // overhead, from the generated codec — the records tail must be capped so the whole
-// envelope fits the outbound ring's maxMsgLength.  Shared with startup validation.
+// envelope fits the outbound ring's maxMsgLength.  Shared with the produce intake
+// limit (NodeConfig::produceIntakeLimit) and maxFetchRecordsBytes().
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -131,6 +132,22 @@ bool AeronPartitionTransport::deliverFrameForTest(const uint8_t* frame, std::siz
 {
     nowNs_ = nowNs;
     return handleFrame_(frame, len) != aeron::ControlledPollAction::ABORT;
+}
+
+// ---------------------------------------------------------------------------
+// maxFetchRecordsBytes — F18.  WORKER-SAFE: reads only the outbound ring's
+// maxMsgLength (fixed at construction) and pubMaxMessageBytes_ (set once before
+// any worker runs) — never the control-owned peers_/pubs.
+// ---------------------------------------------------------------------------
+int64_t AeronPartitionTransport::maxFetchRecordsBytes() const noexcept
+{
+    const int64_t kFrameFixed = static_cast<int64_t>(FetchResponseMsg::encodedSize(0));
+    int64_t cap = static_cast<int64_t>(outboundRing_.maxMsgLength())
+                - static_cast<int64_t>(kOutboundEnvelopeOverhead) - kFrameFixed;
+    if (pubMaxMessageBytes_ > 0) {
+        cap = std::min<int64_t>(cap, pubMaxMessageBytes_ - kFrameFixed);
+    }
+    return std::max<int64_t>(0, cap);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +278,7 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
             "AeronPartitionTransport::enqueueFetchResponse: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++outboundRingFullCount_;
+        ++oversizedFrameDropped_;   // F18: an oversize, not back-pressure
         return false;
     }
     const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
@@ -330,7 +347,7 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
             "AeronPartitionTransport::enqueueOutbound: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++outboundRingFullCount_;
+        ++oversizedFrameDropped_;   // F18: an oversize, not back-pressure
         return false;
     }
     // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: bump the
@@ -589,16 +606,35 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         }
         if (workerPool_ && resp.topicId >= 0 &&
             !workerPool_->opTailFits(resp.topicId, resp.partition, resp.records.size())) [[unlikely]] {
-            // F18: records that cannot fit ONE frame of the owning worker's ingress
-            // ring would THROW in tryClaim (terminating the process), and treating it
-            // as back-pressure (ABORT) would redeliver it forever and stall every
-            // partition on this subscription.  Unreachable when intake is bounded by
-            // produceIntakeLimit(); refuse it as a replication error (counted, logged),
-            // consume the fragment — the follower stays at its offset and re-fetches.
-            ++oversizedApplyRefused_;
-            spdlog::error("AeronPartitionTransport: FetchResponse for (topicId={}, partition={}) "
-                          "carries {} B of records — exceeds the worker ingress frame; refused",
-                          resp.topicId, resp.partition, resp.records.size());
+            // F18 (I-1): records that cannot fit ONE frame of the owning worker's
+            // ingress ring would THROW in tryClaim (terminating the process), and
+            // ABORT would redeliver them forever.  Instead tell the follower
+            // replica — on its owning worker — that this batch is unapplicable: a
+            // small record-less kErrRecordTooLarge apply op.  The replica WEDGES at
+            // its LEO (stops fetching → leaves the ISR visibly), exactly as when
+            // the leader answers kErrRecordTooLarge.  Counted + logged here.
+            if (oversizedApplyRefused_++ == 0 || (oversizedApplyRefused_ & 1023u) == 0) {
+                spdlog::error("AeronPartitionTransport: FetchResponse for (topicId={}, partition={}) "
+                              "carries {} B of records — exceeds this node's worker ingress frame "
+                              "(raise RUNE_WORKER_INGRESS_RING_BYTES); follower wedged (count={})",
+                              resp.topicId, resp.partition, resp.records.size(),
+                              oversizedApplyRefused_);
+            }
+            rune::node::WorkerOp op;
+            op.type                              = rune::node::WorkerOp::Type::ApplyReplicated;
+            op.topicId                           = resp.topicId;
+            op.partition                         = resp.partition;
+            op.replica                           = rep;
+            op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
+            op.replicatedPayload.partition       = resp.partition;
+            op.replicatedPayload.highWatermark   = resp.highWatermark;
+            op.replicatedPayload.logStartOffset  = resp.logStartOffset;
+            op.replicatedPayload.errorCode       = kErrRecordTooLarge;
+            op.replicatedPayload.topicId         = resp.topicId;
+            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition, std::move(op))) {
+                --oversizedApplyRefused_;   // re-counted on redelivery
+                return Action::ABORT;       // ring full (small op): genuine back-pressure
+            }
             return Action::CONTINUE;
         }
         // E2 inc2a: when a WorkerPool is wired, route the applyReplicated call
@@ -835,11 +871,11 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
                                          std::size_t                  len)
 {
     // Defence-in-depth: NEVER let offer() throw IllegalArgumentException on an
-    // oversized frame.  After fixes (1)+(3) this branch must never be reached in
-    // normal operation — req.maxBytes is capped to the deliverable ceiling before
-    // onFetchRequest() reads the log, and the whole-batch alignment in
-    // onFetchRequest() ensures the encoded response stays within that ceiling.
-    // If somehow it fires, DROP + warn (the follower will retry on next fetch).
+    // oversized frame.  This branch must never be reached in normal operation:
+    // later batches are bounded by req.maxBytes (capped to the deliverable
+    // ceiling), and an oversized FIRST batch (KIP-74, served whole) that exceeds
+    // the frame is answered kErrRecordTooLarge by the replica instead of sent
+    // (F18).  If it fires anyway, DROP + warn.
     //
     // Note: a single very large RecordBatch (e.g. value field close to INT16_MAX)
     // could still exceed maxMessageLength with the production 64 KiB term
@@ -850,6 +886,7 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
         spdlog::warn("AeronPartitionTransport::sendOnPub: drop oversized frame "
                      "len={} maxMessageLength={} — fetch ceiling not applied correctly",
                      len, pub.maxMessageLength());
+        ++oversizedFrameDropped_;   // F18: an oversize, not back-pressure
         return false;
     }
 

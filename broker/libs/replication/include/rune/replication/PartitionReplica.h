@@ -46,6 +46,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <limits>
 #include <vector>
 #include <string>
 
@@ -98,6 +99,13 @@ inline constexpr int16_t kErrOutOfRange   = -4;   // fetchOffset out of range
 // RESETS its fallback probe counter so a slow reconcile under packet loss never
 // trips the destructive fallback-to-committedHw truncation (the DR-8 loss).
 inline constexpr int16_t kErrReconcileDeferred = -5;
+// F18: the first batch at the requested offset cannot fit ONE replication frame
+// (leader: its outbound/publication frame; follower: its own worker-ingress ring).
+// NOT retriable for this offset: the follower stops fetching it ("wedged") and the
+// leader does not count the request as ISR liveness, so the follower leaves the
+// ISR visibly instead of pinning HW forever.  Cleared by a leadership/epoch change
+// or a truncation that moves the follower's LEO.
+inline constexpr int16_t kErrRecordTooLarge = -6;
 
 // ---------------------------------------------------------------------------
 // PartitionConfig — constructor argument bundle
@@ -193,6 +201,14 @@ public:
     /// (Leader → New follower) the epoch-boundary answer.
     virtual void sendOffsetsForLeaderEpochResponse(
             NodeId /*toFollower*/, const OffsetsForLeaderEpochRespMsg& /*resp*/) {}
+
+    /// F18: the largest records payload ONE FetchResponse can carry to any peer
+    /// on this transport (conservative min over its frame bounds).  Unbounded by
+    /// default (test fakes).  Queried only on cold paths (an oversized first
+    /// batch) and once per push.
+    [[nodiscard]] virtual int64_t maxFetchRecordsBytes() const noexcept {
+        return std::numeric_limits<int64_t>::max();
+    }
 
     /// (Deficient leader → ahead survivor) pull missing committed records
     /// [fromOffset, survivorLEO) — a REVERSE fetch (leader fetches from a
@@ -607,6 +623,14 @@ public:
     /// ISR as seen by the leader (empty for follower).
     [[nodiscard]] const std::vector<NodeId>& isr() const noexcept;
 
+    // F18 (cumulative, never reset — exported for ops/tests).
+    /// Leader: fetches answered kErrRecordTooLarge (first batch > one frame).
+    [[nodiscard]] uint64_t recordTooLargeServed() const noexcept { return recordTooLargeServed_; }
+    /// Follower: times this replica wedged on an unreplicable batch.
+    [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
+    /// Follower: the offset it is wedged at (stops fetching it), or -1.
+    [[nodiscard]] Offset wedgedAtOffset() const noexcept { return wedgedAtOffset_; }
+
 private:
     // -----------------------------------------------------------------------
     // Internal helpers
@@ -826,6 +850,10 @@ private:
     int64_t rtLastNs_ = 0;
     int64_t rtAppends_ = 0, rtApplies_ = 0, rtPushes_ = 0, rtFastAcks_ = 0;
     int64_t rtApplyBytes_ = 0, rtPushBytes_ = 0;
+    // F18 unreplicable-batch state (see kErrRecordTooLarge).
+    uint64_t recordTooLargeServed_ = 0;
+    uint64_t wedgedRefusals_       = 0;
+    Offset   wedgedAtOffset_       = -1;
     Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
 
     // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.

@@ -676,6 +676,12 @@ public:
     // The poll path caps FetchRequest.maxBytes to this value before dispatching
     // to onFetchRequest so the leader never builds an oversized response.
     // -----------------------------------------------------------------------
+    /// F18: PartitionTransport::maxFetchRecordsBytes — the per-worker plane's
+    /// frame ceiling (its pubs are owned by this worker: safe to read here).
+    [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
+        return maxFetchResponseBytes();
+    }
+
     [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept
     {
         const int32_t kOverhead =

@@ -167,6 +167,22 @@ public:
     /// F18: follower apply/reconcile frames refused because their records cannot
     /// fit one worker-ingress frame (a replication error; never a crash/livelock).
     [[nodiscard]] uint64_t oversizedApplyRefused() const noexcept { return oversizedApplyRefused_; }
+    /// F18: outbound frames dropped because they exceed one frame (ring
+    /// maxMsgLength / publication maxMessageLength) — NOT back-pressure; counted
+    /// apart from outboundRingFullCount_.  Unreachable once the replica answers an
+    /// unservable batch with kErrRecordTooLarge; a non-zero value is a bug signal.
+    [[nodiscard]] uint64_t oversizedFrameDropped() const noexcept { return oversizedFrameDropped_; }
+
+    /// F18: the replication publication's maxMessageLength (min(term/8, 16 MiB)),
+    /// set ONCE before any worker runs (BrokerNode, from aeronTermBufferBytes) so
+    /// worker-thread replicas can bound a FetchResponse without touching the
+    /// control-owned peers_/pubs.  0 = unknown (outbound-ring bound only).
+    void setPublicationMaxMessageBytes(int64_t n) noexcept { pubMaxMessageBytes_ = n; }
+
+    /// F18: largest records payload ONE FetchResponse can carry (worker-safe:
+    /// reads only state immutable after start).  = outbound-ring frame and, when
+    /// known, the publication frame, each minus its framing.
+    [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override;
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -368,6 +384,8 @@ private:
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
     uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
+    uint64_t oversizedFrameDropped_ = 0;   // F18; see oversizedFrameDropped()
+    int64_t  pubMaxMessageBytes_    = 0;   // F18; immutable after start
 
     // Back-pressure observability: bumped when the outbound ring is full and a
     // (retriable) send had to be skipped. Control-thread reads for logging.

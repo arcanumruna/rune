@@ -2289,14 +2289,23 @@ TEST(ProduceBatchLimitRegression, FollowerApplyOfOversizedRecordsIsRefusedNotFat
     aeron::Context ctx; ctx.aeronDir(ad.path.string());
     auto client = aeron::Aeron::connect(ctx);
     rune::replication::AeronPartitionTransport tr(client, "aeron:ipc", 7303, /*self*/1, 1 << 20);
+    // A FOLLOWER replica (node 1 follows leader 2) owned by a worker with 8 KiB frames.
     Reg R;
+    fs::create_directories(R.d.path / "follower");
+    Log flog((R.d.path / "follower").string(), 64LL * 1024 * 1024);
+    flog.recover();
+    auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 5, 0), Role::Follower, 1,
+        std::vector<rune::replication::NodeId>{1, 2}, std::vector<rune::replication::NodeId>{1, 2},
+        &flog, &R.t);
+    rep->becomeFollower(1, 2);
+    PartitionReplica* const follower = rep.get();
+    R.reg.add(5, 0, std::move(rep));
     WorkerPool pool(1, rune::metadata::ShardRouter(1), /*ingress*/ 1 << 16, 1 << 16, 16, 16);   // 8 KiB frames
     pool.assignFromRegistry(R.reg);
     pool.setRegistry(&R.reg);
     pool.setRunnersStartedForTest(true);
     tr.setReplicaRegistry(&R.reg);
     tr.setWorkerPool(&pool);
-    R.add(5, 0);
     pool.reconcile(R.reg);
     ackAll(pool);
 
@@ -2306,17 +2315,22 @@ TEST(ProduceBatchLimitRegression, FollowerApplyOfOversizedRecordsIsRefusedNotFat
     EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(big.data(), big.size(), 1));
     EXPECT_TRUE(consumed) << "never ABORT (redelivered forever → subscription livelock)";
     EXPECT_EQ(tr.oversizedApplyRefused(), 1u);
+    // F18 fix round 1 (I-1): the follower is TOLD (on its owning worker) and wedges
+    // at its LEO — it stops fetching and leaves the ISR instead of a silent stall.
+    pool.worker(0).doWork(2);
+    EXPECT_EQ(follower->wedgedAtOffset(), 0) << "the follower must wedge, not re-fetch forever";
+    EXPECT_EQ(follower->wedgedRefusals(), 1u);
 
     const auto bigRec = encodeBigFetchResp(5, 0, 16 * 1024, rune::replication::kReconcileFetchRespTemplateId);
-    EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(bigRec.data(), bigRec.size(), 2));
+    EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(bigRec.data(), bigRec.size(), 3));
     EXPECT_TRUE(consumed);
     EXPECT_EQ(tr.oversizedApplyRefused(), 2u);
 
     // A normal-size response still routes to the worker (no false refusals).
     const auto small = encodeFetchResp(5, 0);
-    EXPECT_TRUE(tr.deliverFrameForTest(small.data(), small.size(), 3));
+    EXPECT_TRUE(tr.deliverFrameForTest(small.data(), small.size(), 4));
     EXPECT_EQ(tr.oversizedApplyRefused(), 2u);
-    pool.worker(0).doWork(4);
+    pool.worker(0).doWork(5);
     EXPECT_EQ(pool.worker(0).oversizedOpsRefusedForTest(), 0u);
 }
 
@@ -2327,10 +2341,15 @@ TEST(ProduceBatchLimitRegression, WorkerEnqueueOfOversizedOpRefusesInsteadOfThro
     op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 5; op.partition = 0;
     op.replicatedPayload.records.assign(16 * 1024, 0xAB);
     ASSERT_FALSE(w.opTailFits(op.replicatedPayload.records.size()));
-    bool ok = true;
-    EXPECT_NO_THROW(ok = w.tryEnqueueOp(std::move(op)));
-    EXPECT_FALSE(ok);
+    EnqueueResult r = EnqueueResult::Enqueued;
+    EXPECT_NO_THROW(r = w.enqueueOp(std::move(op)));
+    EXPECT_EQ(r, EnqueueResult::TooLarge) << "distinguishable from ring-full (never retried)";
     EXPECT_EQ(w.oversizedOpsRefusedForTest(), 1u);
+
+    // A full ring is reported as Full, not TooLarge.
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (w.tryEnqueueOp(filler)) {}
+    EXPECT_EQ(w.enqueueOp(filler), EnqueueResult::Full);
 }
 
 // F18: the GATEWAY produce intake answers MessageTooLarge for a batch above the
@@ -2360,4 +2379,24 @@ TEST(ProduceBatchLimitRegression, GatewayIntakeRejectsBatchAboveLimitBeforeAppen
     produce(2);
     for (int i = 0; i < 64 && m.r->log()->logEndOffset() == 0; ++i) m.runWorker(10 + i);   // bounded
     EXPECT_EQ(m.r->log()->logEndOffset(), 1) << "a batch at the limit is accepted";
+}
+
+// F18 fix round 1 (m-1): a produce batch the gateway admits but the worker ring
+// can never hold is answered the NON-retriable MessageTooLarge — not the
+// retriable NotLeader (which made the client re-send it forever).
+TEST(ProduceBatchLimitRegression, GatewayAnswersMessageTooLargeWhenWorkerFrameIsSmaller) {
+    MarkerRig m;                                           // worker ingress 64 KiB → 8 KiB frames
+    const int64_t sid = m.gw.injectTestSession();
+    const auto batch = batchAt(0, 1, 16 * 1024);           // < gateway limit, > worker frame
+    ASSERT_GE(m.gw.maxProduceBatchBytes(), batch.size());
+    pc::Produce msg;
+    msg.sessionId = sid; msg.correlationId = 1; msg.topicId = 0; msg.partition = 0;
+    msg.partitionKnown = 1; msg.acks = 0; msg.producerId = -1;
+    msg.recordBatch = std::span<const uint8_t>(batch);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    msg.encode(frame.data());
+    EXPECT_NO_THROW(m.gw.applyProduceForTest(frame.data(), frame.size()));
+    ASSERT_EQ(m.cap.produceErrors.size(), 1u);
+    EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(m.r->log()->logEndOffset(), 0);
 }

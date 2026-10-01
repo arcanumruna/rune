@@ -388,6 +388,12 @@ public:
     // WorkerPool) pass a WorkerOp and observe the same false-on-full contract.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
+        return enqueueOp(std::move(op)) == EnqueueResult::Enqueued;
+    }
+
+    /// F18 (m-1): tryEnqueueOp with the failure kind exposed — Full (ring
+    /// back-pressure: retry) vs TooLarge (can never fit: never retry).
+    [[nodiscard]] EnqueueResult enqueueOp(WorkerOp op) {
         // SBE wrap-in-place: reserve the exact ring slot (computeLength — no
         // hand-rolled size), then encode the WorkerOp DIRECTLY into the claimed
         // buffer via the SBE flyweight (no intermediate struct, no memcpy).
@@ -451,13 +457,13 @@ public:
         if (n > static_cast<std::size_t>(ingress_.maxMsgLength())) [[unlikely]] {
             ++oversizedOpsRefused_;
             spdlog::error("Worker {}: op type={} tail {} B exceeds the ingress ring frame "
-                          "({} B); refused", workerId_, static_cast<int>(op.type), tailLen,
-                          ingress_.maxMsgLength());
-            return false;
+                          "({} B); refused (TooLarge, not retriable)", workerId_,
+                          static_cast<int>(op.type), tailLen, ingress_.maxMsgLength());
+            return EnqueueResult::TooLarge;
         }
         const aeron::util::index_t idx =
             ingress_.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
-        if (idx < 0) return false;  // ring full — back-pressure
+        if (idx < 0) return EnqueueResult::Full;  // ring full — back-pressure
 
         sbe::WorkerOp enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(ingress_.base() + idx), 0, n);
@@ -512,7 +518,7 @@ public:
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
         ingress_.commit(idx);
-        return true;
+        return EnqueueResult::Enqueued;
     }
 
     // -----------------------------------------------------------------------

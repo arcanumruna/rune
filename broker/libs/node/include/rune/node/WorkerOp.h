@@ -380,6 +380,11 @@ struct WorkerReturn {
     std::vector<uint8_t> chunk;
 };
 
+/// F18 (m-1): outcome of enqueueing a WorkerOp.  Full = back-pressure (retry
+/// later); TooLarge = the op's tail can never fit one ring frame — NOT retriable
+/// (a caller that retries it would livelock); answer it as an error instead.
+enum class EnqueueResult : uint8_t { Enqueued, Full, TooLarge };
+
 // ---------------------------------------------------------------------------
 // workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a
 // `tailLen`-byte variable tail (record batch / replicated records): SBE header +
