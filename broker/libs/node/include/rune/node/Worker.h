@@ -181,6 +181,7 @@ public:
         validators_.reserve(kValidatorsReserve);
         egressScratch_.resize(kEgressScratchSize);
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
+        maxProduceBatchBytes_ = maxOpTailBytes();   // F3 r5 C2: sane default; BrokerNode installs
     }
 
     // Thread name for `ps -M`/`top -H`/profilers: "rune-wrk-<id>" (see
@@ -368,6 +369,50 @@ public:
     // Signature UNCHANGED — all producer call sites (gateway, transport, bridge,
     // WorkerPool) pass a WorkerOp and observe the same false-on-full contract.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // F3 round 5, item I1 (single source of truth): the largest variable tail
+    // (record batch / replicated records / ...) a WorkerOp can carry through
+    // this worker's ingress O2O ring.  agrona checkMsgLength() THROWS for a
+    // message above maxMsgLength (= capacity/8), and the framed op is
+    //   SBE header (8) + WorkerOp block (219) + tail length prefix (4) + tail
+    // (generated-codec constants).  maxOpTailBytesFor() computes it from the
+    // configured ring size (BrokerNode's derivation); maxOpTailBytes() from the
+    // live ring; tryEnqueueOp() enforces it before tryClaim().
+    // -----------------------------------------------------------------------
+    static constexpr std::size_t kWorkerOpFrameOverhead =
+        sbe::MessageHeader::encodedLength() + sbe::WorkerOp::sbeBlockLength() +
+        sbe::WorkerOp::tailHeaderLength();
+
+    [[nodiscard]] static constexpr std::size_t maxOpTailBytesFor(std::size_t ingressRingBytes) noexcept {
+        const std::size_t maxMsg = ingressRingBytes / 8;   // O2ORingBuffer: capacity / 8
+        return maxMsg > kWorkerOpFrameOverhead ? maxMsg - kWorkerOpFrameOverhead : 0;
+    }
+    [[nodiscard]] std::size_t maxOpTailBytes() const noexcept {
+        const std::size_t maxMsg = static_cast<std::size_t>(ingress_.maxMsgLength());
+        return maxMsg > kWorkerOpFrameOverhead ? maxMsg - kWorkerOpFrameOverhead : 0;
+    }
+    /// True when a tail of tailLen bytes fits this worker's ingress ring (one compare).
+    [[nodiscard]] bool fitsIngressTail(std::size_t tailLen) const noexcept {
+        return tailLen <= maxOpTailBytes();
+    }
+
+    // -----------------------------------------------------------------------
+    // F3 round 5, item C2: the EFFECTIVE max produce-batch size this worker
+    // accepts on its per-worker ingress path (WorkerIngress frames, including
+    // idempotent/transactional produce).  Installed by BrokerNode at build time
+    // (cold, before the runner starts) with effectiveMaxProduceBatchBytes() —
+    // the same value the gateway enforces.  Defaults to this worker's own ring
+    // tail max (a sane bound for unit tests that never install one).
+    // -----------------------------------------------------------------------
+    void setMaxProduceBatchBytes(std::size_t bytes) noexcept { maxProduceBatchBytes_ = bytes; }
+    [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept { return maxProduceBatchBytes_; }
+
+    /// Test seam: run one per-worker ingress Produce frame through the real
+    /// handler (no Aeron subscription needed).
+    int handleWorkerIngressFrameForTest(const uint8_t* data, std::size_t len, int64_t nowNs) {
+        return handleWorkerIngressFrame_(data, len, nowNs);
+    }
+
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
         // SBE wrap-in-place: reserve the exact ring slot (computeLength — no
         // hand-rolled size), then encode the WorkerOp DIRECTLY into the claimed
@@ -420,6 +465,21 @@ public:
             break;
         default:
             break;  // NONE tail
+        }
+
+        // F3 round 5, item I1: an oversize tail must NEVER reach tryClaim()
+        // (agrona checkMsgLength throws).  Refuse it here — callers with a
+        // variable tail pre-check with fitsIngressTail() (gateway via the
+        // effective max, transport for replicated records), so this is a
+        // backstop; rate-limited (producer-thread-owned counter).
+        if (tailLen > maxOpTailBytes()) [[unlikely]] {
+            if (oversizeOpRejects_++ % 1024 == 0) {
+                spdlog::error("Worker {}: tryEnqueueOp refused op type={} tail={} B > ring max "
+                              "tail {} B (rejects={})", workerId_,
+                              static_cast<int>(op.type), tailLen, maxOpTailBytes(),
+                              oversizeOpRejects_);
+            }
+            return false;
         }
 
         // Total frame = SBE MessageHeader (8) + block + varData.  computeLength()
@@ -2387,6 +2447,11 @@ private:
     // Configurable (RUNE_WORKER_ACK_SLOT_BYTES); see setAckSlotBytes.  256 comfortably
     // covers the ~160 B framed ProduceResult.
     int32_t ackSlotBytes_ = 256;
+    // F3 round 5: effective max produce batch (C2, worker-thread read) and the
+    // oversize-op refusal counter (I1, producer/control-thread-owned — only
+    // tryEnqueueOp touches it; single producer per SPSC ring).
+    std::size_t maxProduceBatchBytes_ = 0;
+    uint64_t    oversizeOpRejects_    = 0;
     // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
     // default so routed replication ops / acks don't queue behind a tiny cap).
     int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
@@ -2718,6 +2783,21 @@ private:
                          workerId_, msg.topicId, msg.partition);
             // E5.1.3 review fix #2: use enum, not magic literal.
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // F3 round 5, item C2: the per-worker ingress path must enforce the
+        // SAME effective max the gateway does — a UDP client's own term (not
+        // the broker's) governs the image frame size, so nothing upstream
+        // bounds it.  One compare; covers idempotent/transactional produce too
+        // (same frame, same handler).  Rejected loudly, never appended.
+        if (rbSpan.size() > maxProduceBatchBytes_) [[unlikely]] {
+            spdlog::warn("Worker {}: WorkerIngress: Produce batch too large ({} > {}) "
+                         "topicId={} partition={}; rejected (MessageTooLarge)",
+                         workerId_, rbSpan.size(), maxProduceBatchBytes_,
+                         msg.topicId, msg.partition);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
             enqueueReturn_(ret);
             return 1;
         }

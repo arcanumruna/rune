@@ -4000,6 +4000,85 @@ TEST(PartitionReplicaRegression, PushOversizeFirstBatchIsDeliveredRegression) {
     std::filesystem::remove_all(logDir2);
 }
 
+// ---------------------------------------------------------------------------
+// F3 round 5, item I2: an UNSENDABLE batch (larger than the transport's hard
+// ceiling) at the head of the push window must NOT make the leader spin.
+// Before the fix, every doWork() cycle re-ran pushToFollowers(): a fresh
+// readView + parse of the same batch, ++work (so the idle strategy never
+// engages) and a critical-log occurrence bump.  Now the unsendable offset is
+// remembered and push is skipped until LEO, the ISR or the follower position
+// (push ceiling) changes; the critical log fires once per offset transition.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, PushUnsendableHeadDoesNotSpinRegression) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r5_push_unsendable_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    struct CaptureTransport : public PartitionTransport {
+        int calls = 0;
+        int32_t ceiling = INT32_MAX;
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg&) override { ++calls; }
+        [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept override {
+            return ceiling;
+        }
+    };
+
+    rune::storage::Log log(logDir.string());
+    CaptureTransport transport;
+    transport.ceiling = 50;   // every batch below is unsendable
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 1'000'000;      // no ISR shrink during the test
+    cfg.replicaLagMaxOffset = 1'000'000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 100;
+    cfg.pushOnAppend        = true;           // coalesced doWork push path
+
+    PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+
+    // Append DIRECTLY to the log (the produce hot path) so only doWork pushes.
+    {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", std::string(300, 'x'), 1000);
+        log.append(b.build(), 0);
+    }
+    leader.onLeaderLogAppended();
+
+    constexpr int kCycles = 1000;
+    int totalWork = 0;
+    for (int i = 0; i < kCycles; ++i) totalWork += leader.doWork(/*nowNs=*/1);
+
+    EXPECT_EQ(transport.calls, 0) << "the unsendable batch must never be sent";
+    EXPECT_LE(leader.unsendableBatchEvaluationsForTest(), 1u)
+        << "the unsendable head must be read/parsed once, not once per cycle";
+    EXPECT_LE(totalWork, 4) << "an unsendable head must not count as work every cycle "
+                               "(the idle strategy must engage)";
+    EXPECT_EQ(leader.unsendablePushLogEmitsForTest(), 1u)
+        << "exactly one critical log for this offset transition";
+
+    // LEO change -> re-evaluated once (still unsendable at the same head
+    // offset: no new log line, since the offset did not transition).
+    {
+        rune::protocol::RecordBatchBuilder b(1, 1001);
+        b.append("k", "v", 1001);
+        log.append(b.build(), 1);
+    }
+    leader.onLeaderLogAppended();
+    for (int i = 0; i < kCycles; ++i) (void)leader.doWork(/*nowNs=*/1);
+    EXPECT_EQ(leader.unsendableBatchEvaluationsForTest(), 2u)
+        << "a LEO change must re-evaluate the head exactly once";
+    EXPECT_EQ(leader.unsendablePushLogEmitsForTest(), 1u)
+        << "same unsendable offset -> no new critical log";
+
+    std::filesystem::remove_all(logDir);
+}
+
 // ===========================================================================
 // GR-10: Push-on-append + fast-ack tests
 //

@@ -31,6 +31,8 @@
 #include <rune/protocol/RecordBatch.h>
 // Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 #include <cstdlib>
 #include <cstring>
 
@@ -46,39 +48,57 @@ namespace rune::node {
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 
 // ---------------------------------------------------------------------------
-// F3 round 4 (corrects round 3) — see BrokerNode.h doc comments.
+// Max produce-batch derivation (F3 rounds 4-5) — see BrokerNode.h.  Every
+// limit CALLS the transport's/ring's own function; no hand arithmetic here.
 // ---------------------------------------------------------------------------
-int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept {
-    // Aeron: maxMessageLength = termLength/8.  Agrona ManyToOneRingBuffer:
-    // maxMsgLength = capacity/8.  The ACTIVE transport is bounded by
-    // whichever applies to it; take the min of both so this is a safe
-    // (never-too-large) estimate regardless of which transport kind is
-    // configured — same conservative-estimate spirit as
-    // AeronPartitionTransport::maxFetchResponseBytes()'s own ring-only choice.
-    const int64_t ringBound = static_cast<int64_t>(config.replicationOutboundRingBytes) / 8;
-    const int64_t termBound = static_cast<int64_t>(config.aeronTermBufferBytes) / 8;
-    int64_t ceiling = std::min(ringBound, termBound);
-    ceiling -= static_cast<int64_t>(rune::replication::FetchResponseMsg::encodedSize(0));
-    if (ceiling < 0) ceiling = 0;
-    if (ceiling > INT32_MAX) ceiling = INT32_MAX;
-    return static_cast<int32_t>(ceiling);
+namespace {
+int32_t clampI32(int64_t v) noexcept {
+    if (v < 0) return 0;
+    if (v > INT32_MAX) return INT32_MAX;
+    return static_cast<int32_t>(v);
+}
+} // namespace
+
+std::size_t workerIngressMaxBatchBytes(const NodeConfig& config) noexcept {
+    return Worker::maxOpTailBytesFor(static_cast<std::size_t>(
+        config.workerIngressRingBytes > 0 ? config.workerIngressRingBytes : 0));
+}
+
+int32_t aeronIngressMaxBatchBytes(const NodeConfig& config) noexcept {
+    if (config.aeronTermBufferBytes <= 0) return 0;
+    namespace pc = rune::protocol::client;
+    // Produce frame = header + fixed body + key u16 prefix + batch u32 prefix
+    // + key + batch (pc::Produce::encodedSize()); key-less here.
+    constexpr int64_t kProduceFraming =
+        static_cast<int64_t>(pc::MessageHeader::ENCODED_SIZE) + pc::Produce::BODY_FIXED + 2 + 4;
+    const int64_t maxMsg =
+        aeron::concurrent::logbuffer::FrameDescriptor::computeMaxMessageLength(
+            config.aeronTermBufferBytes);
+    return clampI32(maxMsg - kProduceFraming);
 }
 
 int32_t ingressHardTransportMaxBytes(const NodeConfig& config) noexcept {
-    // Same /8 rules as replicationHardTransportMaxBytes(), applied to the
-    // PRODUCE-path knobs instead: the per-worker ingress SPSC ring (see
-    // Worker.h's own "maxMsgLength() = capacity/8" comments on
-    // workerIngressRingBytes) and the same shared Aeron embedded-driver term
-    // length (every produce frame that arrives via an Aeron channel — legacy
-    // gateway fan-out or per-worker ingress alike — is bounded by it).  No
-    // framing-overhead subtraction: unlike a FetchResponse, the produce batch
-    // IS the payload, not wrapped in a further envelope at this layer.
-    const int64_t ringBound = static_cast<int64_t>(config.workerIngressRingBytes) / 8;
-    const int64_t termBound = static_cast<int64_t>(config.aeronTermBufferBytes) / 8;
-    int64_t ceiling = std::min(ringBound, termBound);
-    if (ceiling < 0) ceiling = 0;
-    if (ceiling > INT32_MAX) ceiling = INT32_MAX;
-    return static_cast<int32_t>(ceiling);
+    return clampI32(std::min<int64_t>(
+        static_cast<int64_t>(workerIngressMaxBatchBytes(config)),
+        static_cast<int64_t>(aeronIngressMaxBatchBytes(config))));
+}
+
+int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept {
+    const int32_t legacy = rune::replication::AeronPartitionTransport::maxFetchResponseBytesFor(
+        config.replicationOutboundRingBytes, config.aeronTermBufferBytes);
+    const int32_t perWorker = WorkerReplicationTransport::maxFetchResponseBytesFor(
+        config.aeronTermBufferBytes);
+    return std::min(legacy, perWorker);
+}
+
+int32_t userTopicMaxFetchBytes(const NodeConfig& config) noexcept {
+    // A follower's FetchResponse records for a USER partition are forwarded
+    // to the owning worker through its ingress ring (ApplyReplicated) on the
+    // legacy transport — so a fetch/push chunk must never exceed what that
+    // ring can carry.  Unchanged (1 MiB) for the default 32 MiB ring.
+    return clampI32(std::min<int64_t>(
+        rune::replication::kDefaultMaxFetchBytes,
+        static_cast<int64_t>(workerIngressMaxBatchBytes(config))));
 }
 
 std::size_t configuredMaxProduceBatchBytes(const NodeConfig& config) noexcept {
@@ -107,6 +127,20 @@ std::size_t effectiveMaxProduceBatchBytes(const NodeConfig& config) noexcept {
     const std::size_t configured = configuredMaxProduceBatchBytes(config);
     if (hardMax < 0) return 0;
     return std::min<std::size_t>(configured, static_cast<std::size_t>(hardMax));
+}
+
+std::optional<std::string> validateEffectiveMaxProduceBatch(const NodeConfig& config) {
+    const std::size_t eff = effectiveMaxProduceBatchBytes(config);
+    if (eff >= kMinSaneMaxProduceBatchBytes) return std::nullopt;
+    return "effective max produce batch is " + std::to_string(eff) + " bytes (configured=" +
+           std::to_string(configuredMaxProduceBatchBytes(config)) + ", workerIngress=" +
+           std::to_string(workerIngressMaxBatchBytes(config)) + ", aeronIngress=" +
+           std::to_string(aeronIngressMaxBatchBytes(config)) + ", replication=" +
+           (config.isSingleNode() ? std::string("n/a")
+                                  : std::to_string(replicationHardTransportMaxBytes(config))) +
+           ") — below the minimum of " + std::to_string(kMinSaneMaxProduceBatchBytes) +
+           " bytes needed to carry even one record.  Raise workerIngressRingBytes / "
+           "replicationOutboundRingBytes / aeronTermBufferBytes (or RUNE_MAX_PRODUCE_BATCH_BYTES).";
 }
 
 std::optional<std::string> validateExplicitMaxProduceBatch(const NodeConfig& config) {
@@ -173,6 +207,12 @@ void BrokerNode::start() {
     // accepted and then permanently unfetchable.  Same hard-refusal-before-
     // any-side-effect pattern as the shard-config check above.
     if (auto err = validateExplicitMaxProduceBatch(config_); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
+    // F3 round 5, item M3: an effective max too small to carry one record is a
+    // misconfiguration — refuse loudly (never silently fall back to 8 MiB).
+    if (auto err = validateEffectiveMaxProduceBatch(config_); err.has_value()) {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
@@ -541,6 +581,7 @@ void BrokerNode::buildReplication() {
         try {
             replTransport_ = std::make_unique<rune::replication::AeronPartitionTransport>(
                 aeron_, ingressChannel, ingressStream, selfId,
+                config_.aeronTermBufferBytes,
                 config_.replicationOutboundRingBytes);
 
             // Add each peer (excluding self) as an egress destination.
@@ -753,7 +794,7 @@ void BrokerNode::buildReplication() {
             pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
             pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
-            pcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
+            pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
             // runBoundedCompaction() reads the correct policy from every replica.
             // TopicSpec::CleanupPolicy and rune::replication::CleanupPolicy share
@@ -958,7 +999,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.minIsr               = config_.gatewayMinIsr;
         pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
         pcfg.isrCheckIntervalNs   = 10'000'000LL;
-        pcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
+        pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
         pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
             static_cast<uint8_t>(spec.cleanupPolicy));
         pcfg.minCleanableDirtyRatio = spec.minCleanableDirtyRatio;
@@ -1109,6 +1150,9 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
+        // F3 round 5, item C2: every worker enforces the SAME effective max the
+        // gateway does on its per-worker ingress path (incl. shard mode).
+        workerPool_->worker(i).setMaxProduceBatchBytes(effectiveMaxProduceBatchBytes(config_));
     }
 
     if (config_.shardMode()) {
@@ -1350,20 +1394,20 @@ void BrokerNode::buildGateway() {
         spdlog::info("BrokerNode[{}]: gateway fragmentLimit set to {}",
                      nodeId, config_.gatewayFragmentLimit);
 
-        // F3 round 4: install the EFFECTIVE max produce-batch size — derived
-        // from the actual transport limits, never just the static default —
-        // so the gateway rejects (MessageTooLarge) any batch that could never
-        // be carried end-to-end, instead of accepting it and leaving it
-        // permanently unfetchable by replication.  validateExplicitMaxProduceBatch()
-        // already refused startup above if an EXPLICIT override couldn't be
-        // honored, so this call always succeeds with a safe value.
+        // F3 rounds 4-5: install the EFFECTIVE max produce-batch size — derived
+        // from the transports' own per-message maxima, never the static
+        // default — so the gateway rejects (MessageTooLarge) any batch that
+        // could never be carried end-to-end.  Every Worker gets the SAME value
+        // (per-worker ingress path).  validateExplicitMaxProduceBatch() /
+        // validateEffectiveMaxProduceBatch() already refused startup above
+        // for an unhonorable explicit override or a too-small effective max.
         {
             const std::size_t effectiveMaxBatch = effectiveMaxProduceBatchBytes(config_);
             gateway_->setMaxProduceBatchBytes(effectiveMaxBatch);
-            spdlog::info("BrokerNode[{}]: gateway maxProduceBatchBytes set to {} "
-                         "(configured={}, ingressHardMax={}, replicationHardMax={})",
+            spdlog::info("BrokerNode[{}]: max produce batch set to {} B (configured={}, "
+                         "workerIngress={}, aeronIngress={}, replication={})",
                          nodeId, effectiveMaxBatch, configuredMaxProduceBatchBytes(config_),
-                         ingressHardTransportMaxBytes(config_),
+                         workerIngressMaxBatchBytes(config_), aeronIngressMaxBatchBytes(config_),
                          config_.isSingleNode() ? -1 : replicationHardTransportMaxBytes(config_));
         }
 

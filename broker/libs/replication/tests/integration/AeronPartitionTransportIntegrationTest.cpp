@@ -229,12 +229,12 @@ TEST(AeronPartitionTransportInteg, FetchLoop_TwoNodes) {
 
     // Leader transport: listens on chanLeader; sends to chanFollower.
     auto ldrTransport = std::make_unique<AeronPartitionTransport>(
-        aeronClient, chanLeader, kReplStream, kLeaderId);
+        aeronClient, chanLeader, kReplStream, kLeaderId, /*termBufferBytes=*/64 * 1024);
     ldrTransport->addPeer(kFollowerId, chanFollower, kReplStream);
 
     // Follower transport: listens on chanFollower; sends to chanLeader.
     auto flwTransport = std::make_unique<AeronPartitionTransport>(
-        aeronClient, chanFollower, kReplStream, kFollowerId);
+        aeronClient, chanFollower, kReplStream, kFollowerId, /*termBufferBytes=*/64 * 1024);
     flwTransport->addPeer(kLeaderId, chanLeader, kReplStream);
 
     // -----------------------------------------------------------------------
@@ -384,11 +384,11 @@ TEST(AeronPartitionTransportInteg, FetchLoop_LargeBacklog) {
     constexpr PartitionId kPid   = 1;
 
     auto ldrTransport = std::make_unique<AeronPartitionTransport>(
-        aeronClient, chanLeader, kReplStream, kLeaderId);
+        aeronClient, chanLeader, kReplStream, kLeaderId, /*termBufferBytes=*/64 * 1024);
     ldrTransport->addPeer(kFollowerId, chanFollower, kReplStream);
 
     auto flwTransport = std::make_unique<AeronPartitionTransport>(
-        aeronClient, chanFollower, kReplStream, kFollowerId);
+        aeronClient, chanFollower, kReplStream, kFollowerId, /*termBufferBytes=*/64 * 1024);
     flwTransport->addPeer(kLeaderId, chanLeader, kReplStream);
 
     // -----------------------------------------------------------------------
@@ -573,4 +573,45 @@ TEST(WorkerReplicationTransportInteg, GatherSendArrivesByteIdenticalRegression) 
     // (3) oversized frame is dropped, never thrown.
     const std::vector<uint8_t> huge(static_cast<std::size_t>(maxRecords) + 1, 0x22);
     EXPECT_NO_THROW(a.sendFetchResponse(2, mk(huge)));
+}
+
+// ===========================================================================
+// F3 round 5, item I3: AeronPartitionTransport::maxFetchResponseBytes() must
+// be the min of the outbound-ring bound AND the Aeron term bound (term/8 −
+// FetchResponse framing).  Before the fix it used the ring bound only, so with
+// a term whose maxMessageLength (term/8) is smaller than ring/8 it claimed
+// "sendable" for batches that sendOnPub() then silently DROPS (oversized
+// frame) — a follower stalled forever on such a batch.  Driver term here is
+// 64 KiB (maxMessageLength 8192) against a 4 MiB outbound ring (8× larger).
+// ===========================================================================
+TEST(AeronPartitionTransportInteg, MaxFetchResponseHonorsTermBoundRegression) {
+    TempDir driverTd("rune_apt_termbound_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());   // 64 KiB term
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    constexpr int32_t kTermBytes = 64 * 1024;
+    constexpr int     kRingBytes = 4 * 1024 * 1024;
+    AeronPartitionTransport t(aeronClient, udpChannel(discoverFreeUdpPort()), 801,
+                              /*selfId=*/1, kTermBytes, kRingBytes);
+
+    const int32_t kFrameworkOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
+    // Aeron maxMessageLength(64 KiB term) = 8192; minus the FetchResponse framing.
+    EXPECT_EQ(t.maxFetchResponseBytes(), 8192 - kFrameworkOverhead)
+        << "the term bound (8192) is tighter than the ring bound (524288) and must win";
+    EXPECT_EQ(t.maxFetchResponseBytes(),
+              AeronPartitionTransport::maxFetchResponseBytesFor(kRingBytes, kTermBytes))
+        << "the config-only helper BrokerNode uses must equal the live instance";
+
+    // Ring tighter than term: the ring bound (ring/8 − outbound envelope −
+    // framing) must win instead.
+    AeronPartitionTransport t2(aeronClient, udpChannel(discoverFreeUdpPort()), 802,
+                               /*selfId=*/1, /*termBufferBytes=*/16 * 1024 * 1024,
+                               /*outboundRingBytes=*/64 * 1024);
+    EXPECT_EQ(t2.maxFetchResponseBytes(),
+              8192 - static_cast<int32_t>(AeronPartitionTransport::kOutboundEnvelopeOverhead)
+                   - kFrameworkOverhead);
+    EXPECT_EQ(t2.maxFetchResponseBytes(),
+              AeronPartitionTransport::maxFetchResponseBytesFor(64 * 1024, 16 * 1024 * 1024));
 }

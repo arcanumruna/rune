@@ -754,9 +754,9 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
                         "PartitionReplica[node={} part={}] FETCH batch at offset={} is {} "
                         "bytes — exceeds this transport's hard ceiling of {} bytes.  The "
                         "follower can NEVER receive it over this transport (occurrence={}). "
-                        "This means a produced batch is larger than the replication "
-                        "fetch-ceiling config allows — see kDefaultMaxFetchBytes / "
-                        "validateReplicationFetchCeiling (BrokerNode.cpp).",
+                        "This means a batch larger than the transport's "
+                        "maxFetchResponseBytes() reached the log — produce must reject it "
+                        "(see effectiveMaxProduceBatchBytes, BrokerNode.cpp).",
                         cfg_.selfId, cfg_.partitionId, req.fetchOffset, v.len, hardCeiling,
                         unsendableBatchLogCount_);
                 }
@@ -1679,7 +1679,8 @@ int PartitionReplica::doWork(int64_t nowNs)
                 if (fl < minFollowerLeo) minFollowerLeo = fl;
             }
             const Offset pushCeiling = minFollowerLeo + kPushFlowWindow;
-            if (pushCeiling > lastPushedOffset_) {
+            if (pushCeiling > lastPushedOffset_ &&
+                !unsendablePushSuppressed_(pushCeiling)) {
                 pushToFollowers(lastPushedOffset_, pushCeiling);
                 ++work;
             }
@@ -2292,12 +2293,22 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
             // return.  The follower's OWN pull-based fetch hits this exact
             // batch in onFetchRequest() and gets the proper kErrRecordTooLarge
             // response — push does not need to duplicate that signalling.
+            //
+            // F3 round 5, item I2: remember this head so doWork() does not
+            // re-read/re-parse it (and count it as work) every cycle — push
+            // is retried only once LEO, the ISR, the follower position
+            // (pushCeiling) or the epoch changes.  The critical log fires
+            // once per unsendable-offset transition, not per evaluation.
             ++unsendableBatchLogCount_;
-            if (unsendableBatchLogCount_ == 1 || unsendableBatchLogCount_ % 1024 == 0) {
+            unsendablePush_ = UnsendablePushMemo{fromOffset, currentLeo, pushCeiling,
+                                                 isrSignature_(), epoch_};
+            if (firstBase != unsendablePushLoggedOffset_) {
+                unsendablePushLoggedOffset_ = firstBase;
+                ++unsendablePushLogEmits_;
                 spdlog::critical(
                     "PartitionReplica[node={} part={}] PUSH batch at offset={} is {} "
                     "bytes — exceeds this transport's hard ceiling of {} bytes.  Push "
-                    "cannot deliver it (occurrence={}); the follower's own fetch will "
+                    "cannot deliver it (evaluations={}); the follower's own fetch will "
                     "surface kErrRecordTooLarge.",
                     cfg_.selfId, cfg_.partitionId, firstBase, total, hardCeiling,
                     unsendableBatchLogCount_);
@@ -2308,6 +2319,8 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
         sendBytes     = pre.bytes;
         pushedThrough = pre.endOffset;
     }
+
+    unsendablePush_.fromOffset = -1;   // F3 r5 I2: a sendable head disarms the memo
 
     // Build once — reused for all ISR followers; the view stays valid for the loop
     // (no append/truncate on this thread in between).
@@ -2325,6 +2338,29 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     }
     lastPushedOffset_ = pushedThrough;   // next cycle pushes the rest once the
                                          // follower's ack lifts the window.
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 5, item I2: unsendable-push suppression (see header).
+// ---------------------------------------------------------------------------
+bool PartitionReplica::unsendablePushSuppressed_(Offset pushCeiling) const noexcept
+{
+    if (unsendablePush_.fromOffset < 0) [[likely]] return false;   // unarmed
+    return unsendablePush_.fromOffset  == lastPushedOffset_ &&
+           unsendablePush_.leo         == logEndOffset_() &&
+           unsendablePush_.pushCeiling == pushCeiling &&
+           unsendablePush_.epoch       == epoch_ &&
+           unsendablePush_.isrSig      == isrSignature_();
+}
+
+uint64_t PartitionReplica::isrSignature_() const noexcept
+{
+    uint64_t sig = 1469598103934665603ULL;   // FNV-1a over (size, ids in order)
+    if (!isrManager_) return sig;
+    const std::vector<NodeId>& isr = isrManager_->isr();
+    sig = (sig ^ static_cast<uint64_t>(isr.size())) * 1099511628211ULL;
+    for (NodeId id : isr) sig = (sig ^ static_cast<uint64_t>(id)) * 1099511628211ULL;
+    return sig;
 }
 
 } // namespace rune::replication

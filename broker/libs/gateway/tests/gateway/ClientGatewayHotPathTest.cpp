@@ -291,5 +291,98 @@ TEST(ClientGatewayHotPath, OversizeProduceBatchRejectedNotAcceptedRegression)
     fs::remove_all(dir, ec);
 }
 
+// ===========================================================================
+// F3 round 5, item M4: exact boundary at the gateway with the REAL derived
+// default (multi-node) effective max — 524226 bytes (pinned against real
+// transport instances in BrokerNodeRegression.DerivedMaxMatchesRealTransports-
+// Regression).  A batch of EXACTLY the effective max is accepted (appended);
+// effective max + 1 is rejected with MessageTooLarge (never appended).
+// ===========================================================================
+static std::vector<uint8_t> makeBatchOfExactSizeGw(std::size_t target) {
+    auto build = [](std::size_t keyLen, std::size_t valLen) {
+        rune::protocol::RecordBatchBuilder b(0, 1000LL);
+        b.append(std::string(keyLen, 'k'), std::string(valLen, 'v'), 1000LL);
+        return b.build();
+    };
+    for (std::size_t keyLen = 1; keyLen <= 4; ++keyLen) {
+        std::size_t val = target - build(keyLen, 0).size();
+        for (int iter = 0; iter < 8; ++iter) {
+            auto b = build(keyLen, val);
+            if (b.size() == target) return b;
+            if (b.size() > target) { const std::size_t o = b.size() - target; if (o > val) break; val -= o; }
+            else val += target - b.size();
+        }
+    }
+    ADD_FAILURE() << "could not build a batch of exactly " << target << " bytes";
+    return {};
+}
+
+TEST(ClientGatewayHotPath, ProduceBatchExactEffectiveMaxBoundaryRegression)
+{
+    const fs::path dir = makeTempDir();
+    using rune::node::TopicSpec;
+    std::vector<TopicSpec> specs;
+    {
+        TopicSpec ts;
+        ts.name           = "events";
+        ts.partitionCount = 1;
+        ts.topicId        = 0;
+        specs.push_back(ts);
+    }
+    rune::gateway::TopicRegistry registry(specs, dir.string());
+
+    std::vector<uint8_t> captured;
+    ClientGateway::TestEgressFn captureEgress =
+        [&captured](const uint8_t* buf, std::size_t len) -> int64_t {
+            captured.assign(buf, buf + len);
+            return 1;
+        };
+    ClientGateway gw = ClientGateway::makeForTest(captureEgress, /*currentProduceSessionId=*/1);
+    gw.setTopicRegistry(&registry);
+
+    constexpr std::size_t kEffectiveMax = 524226;   // default multi-node derivation
+    gw.setMaxProduceBatchBytes(kEffectiveMax);
+    const int64_t sid = gw.injectTestSession(/*nowNs=*/0);
+
+    auto produce = [&](const std::vector<uint8_t>& batch, int64_t corr) {
+        pc::Produce prod;
+        prod.sessionId      = sid;
+        prod.correlationId  = corr;
+        prod.topicId        = 0;
+        prod.partition      = 0;
+        prod.partitionKnown = 1;
+        prod.acks           = 0;
+        prod.producerId     = -1;
+        prod.key            = {};
+        prod.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> frame(prod.encodedSize());
+        prod.encode(frame.data());
+        captured.clear();
+        gw.applyProduceForTest(frame.data(), frame.size());
+        auto resp = pc::ProduceResponse::decode(captured.data(), captured.size());
+        EXPECT_TRUE(resp.has_value()) << "every produce gets a response";
+        return resp ? resp->errorCode : int16_t{-999};
+    };
+
+    const auto over = makeBatchOfExactSizeGw(kEffectiveMax + 1);
+    const auto exact = makeBatchOfExactSizeGw(kEffectiveMax);
+    ASSERT_EQ(over.size(), kEffectiveMax + 1);
+    ASSERT_EQ(exact.size(), kEffectiveMax);
+
+    EXPECT_EQ(produce(over, 1), static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(registry.log(0, 0)->logEndOffset(), 0) << "oversize must never be appended";
+    EXPECT_EQ(produce(exact, 2), 0) << "exactly the effective max must be accepted";
+    EXPECT_EQ(registry.log(0, 0)->logEndOffset(), 1);
+
+    // M3: 0 is installed VERBATIM (no silent 8 MiB fallback) — rejects all.
+    gw.setMaxProduceBatchBytes(0);
+    EXPECT_EQ(gw.maxProduceBatchBytes(), 0u);
+    EXPECT_EQ(produce(makeBatchOfExactSizeGw(200), 3),
+              static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 } // namespace
 } // namespace rune::gateway

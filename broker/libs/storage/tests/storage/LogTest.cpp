@@ -1675,3 +1675,39 @@ TEST(LogRegression, TruncateRebuildFailureFailsStopRegression) {
     std::filesystem::remove_all(dir);
 }
 
+// ---------------------------------------------------------------------------
+// F3 round 5, item I4: the post-truncate fail-stop block must ALSO cover the
+// rebuilt active segment's recover() and the logEndOffset_ assignment.  Round
+// 2 left activeSegment().recover() OUTSIDE the guard; recover() rebuilds the
+// index (remove .index.tmp, write, rename), so a throw there escaped as an
+// ordinary exception with the .log ALREADY truncated on disk and LEO not yet
+// updated — disk and memory disagreeing, exactly what the guard exists for.
+// Sabotage: <base>.index.tmp is a NON-EMPTY directory, so recover()'s
+// std::filesystem::remove(indexTmp) throws ENOTEMPTY — while the segment
+// reopen itself (which never touches .index.tmp) still succeeds.
+// ---------------------------------------------------------------------------
+TEST(LogRegression, TruncateRecoverFailureFailsStopRegression) {
+    auto dir = makeTempDir("rune_f3r5_truncate_recover_abort");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), /*rollBytes=*/1 << 20);
+    int64_t off = 0;
+    for (int i = 0; i < 5; ++i) {
+        RecordBatchBuilder b(off, 9800 + i); b.append("k", "v" + std::to_string(i), 9800 + i);
+        off = log.append(b.build(), off);
+    }
+
+    std::string indexPath;
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() == ".index") { indexPath = e.path().string(); break; }
+    }
+    ASSERT_FALSE(indexPath.empty());
+    const std::string tmpPath = indexPath + ".tmp";   // <base>.index.tmp
+    std::filesystem::create_directory(tmpPath);
+    { std::ofstream dummy(tmpPath + std::string("/dummy.txt")); dummy << "x"; }
+
+    EXPECT_DEATH(log.truncateTo(2), "FATAL");   // recover() throws past the point of no return
+
+    std::filesystem::remove_all(dir);
+}
+

@@ -115,8 +115,10 @@ inline constexpr int16_t kErrRecordTooLarge    = -6;
 // per-message maximum (see onFetchRequest/pushToFollowers and
 // PartitionTransport::maxFetchResponseBytes()) — only a batch that exceeds
 // even that hard transport maximum is genuinely unfetchable
-// (kErrRecordTooLarge).  See validateReplicationFetchCeiling() in
-// BrokerNode.cpp, which startup-validates THAT constraint instead.
+// (kErrRecordTooLarge).  BrokerNode's effectiveMaxProduceBatchBytes()
+// guarantees no such batch is ever ACCEPTED: the gateway and every worker
+// reject a produce batch above the transport's maxFetchResponseBytes() with
+// MessageTooLarge (F3 round 5).
 //
 // F3 round 2 briefly raised this to 8 MiB to (wrongly) paper over a gap that
 // the progress rule above already closes correctly; round 3 reverted it to
@@ -614,6 +616,16 @@ public:
         pushToFollowers(fromOffset, pushCeiling);
     }
 
+    /// F3 round 5, item I2 test accessors: how many times the "batch exceeds the
+    /// transport's hard ceiling" condition was EVALUATED (each one is a log read
+    /// + parse), and how many critical log lines it actually EMITTED.
+    [[nodiscard]] uint64_t unsendableBatchEvaluationsForTest() const noexcept {
+        return unsendableBatchLogCount_;
+    }
+    [[nodiscard]] uint64_t unsendablePushLogEmitsForTest() const noexcept {
+        return unsendablePushLogEmits_;
+    }
+
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
     /// replica is disk-backed — asserts !memoryBacked_.  Callers MUST gate on
@@ -704,6 +716,15 @@ private:
     /// Push [fromOffset, min(LEO, pushCeiling)) to ISR followers (whole-batch aligned,
     /// capped at maxFetchBytes).  Advances lastPushedOffset_ to the last offset pushed.
     void pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
+
+    /// F3 round 5, item I2: true while the push head is a remembered UNSENDABLE
+    /// batch and nothing that could change the outcome (LEO, ISR, follower
+    /// position via pushCeiling, epoch) has changed — doWork() then skips the
+    /// push entirely (no readView/parse, no work count).  One compare when unarmed.
+    [[nodiscard]] bool unsendablePushSuppressed_(Offset pushCeiling) const noexcept;
+    /// Order-sensitive signature of the current ISR (cold: only computed while
+    /// an unsendable-push memo is armed or being armed).
+    [[nodiscard]] uint64_t isrSignature_() const noexcept;
     // Spec §3.5.2: follower FetchRequests are unicast to the known leader.
     void sendFetchToLeader_(const FetchRequestMsg& req);
 
@@ -854,6 +875,21 @@ private:
     // rate-limited critical logging (first occurrence, then every 1024th) —
     // same convention as LogSegment::readMapFailures_.
     uint64_t unsendableBatchLogCount_ = 0;
+    // F3 round 5, item I2: critical log lines actually emitted by the push path
+    // (rate-limited to once per unsendable-offset transition).
+    uint64_t unsendablePushLogEmits_ = 0;
+    // F3 round 5, item I2: memo of the last unsendable push head.  Armed
+    // (fromOffset >= 0) by pushToFollowers() when the head batch exceeds the
+    // transport's hard ceiling; cleared by any successful push.
+    struct UnsendablePushMemo {
+        Offset   fromOffset  = -1;   ///< lastPushedOffset_ at the failed push (-1 = unarmed)
+        Offset   leo         = -1;
+        Offset   pushCeiling = -1;
+        uint64_t isrSig      = 0;
+        Epoch    epoch       = 0;
+    };
+    UnsendablePushMemo unsendablePush_{};
+    Offset             unsendablePushLoggedOffset_ = -1;   ///< last offset logged critical
 
     // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
     //

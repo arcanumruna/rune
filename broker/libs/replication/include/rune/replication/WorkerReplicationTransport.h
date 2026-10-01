@@ -77,6 +77,7 @@
 #include <FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 #include <util/Index.h>
 
 #include <rune/aeronutil/AeronPump.h>          // spec §3.6 invoker-aware resolve
@@ -631,11 +632,33 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept override
     {
+        return recordsBudgetFor_(pubReg_.maxMessageLength());
+    }
+
+    // F3 round 5 (single source of truth): the same ceiling from config alone
+    // (before any pub exists) — the peer pubs are UDP ExclusivePublications on
+    // the embedded driver, whose maxMessageLength is
+    // FrameDescriptor::computeMaxMessageLength(termBufferBytes).  sendGatherToPeer
+    // enforces prefix(encodedSize(0)) + body <= pub->maxMessageLength(), so the
+    // records budget is maxMessageLength − encodedSize(0) — the SAME helper the
+    // live instance uses above.  BrokerNode's effectiveMaxProduceBatchBytes()
+    // calls this.
+    [[nodiscard]] static int32_t maxFetchResponseBytesFor(int32_t termBufferBytes) noexcept
+    {
+        if (termBufferBytes <= 0) return 0;
+        return recordsBudgetFor_(static_cast<int32_t>(
+            aeron::concurrent::logbuffer::FrameDescriptor::computeMaxMessageLength(termBufferBytes)));
+    }
+
+private:
+    [[nodiscard]] static int32_t recordsBudgetFor_(int32_t maxMessageLength) noexcept
+    {
         const int32_t kOverhead =
             static_cast<int32_t>(rune::replication::FetchResponseMsg::encodedSize(0));
-        const int32_t ml = pubReg_.maxMessageLength();
-        return (ml > kOverhead) ? (ml - kOverhead) : 0;
+        return (maxMessageLength > kOverhead) ? (maxMessageLength - kOverhead) : 0;
     }
+
+public:
 
     // =======================================================================
     // Shard plane handshake (spec §3.3 symmetric worker count; Task 6 ruling I2).

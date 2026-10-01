@@ -28,12 +28,37 @@ namespace rune::replication {
 
 namespace isbe = ::rune::protocol::internal::sbe;
 
-// Fixed overhead of the SBE OutboundFrame envelope (SBE header + targetNodeId block
-// + varData length prefix), from the generated codec — the records tail must be
-// capped so the whole envelope fits the outbound ring's maxMsgLength.
-static constexpr std::size_t kOutboundEnvelopeOverhead =
-    isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::sbeBlockLength() +
-    sizeof(std::uint32_t); // varDataEncoding length field
+// kOutboundEnvelopeOverhead (header): the records tail must be capped so the
+// whole envelope fits the outbound ring's maxMsgLength.
+
+namespace {
+// F3 round 5: the ONE formula for this transport's records ceiling, shared by
+// the config-only helper (BrokerNode's derivation), the live instance, and
+// poll()'s FetchRequest clamp.
+int32_t fetchCeilingFrom(int64_t ringMaxMsgLength, int64_t termMaxMessageLength) noexcept {
+    const int64_t framing = static_cast<int64_t>(FetchResponseMsg::encodedSize(0));
+    const int64_t ringBound =
+        ringMaxMsgLength - static_cast<int64_t>(AeronPartitionTransport::kOutboundEnvelopeOverhead) - framing;
+    const int64_t termBound = termMaxMessageLength - framing;
+    int64_t c = std::min(ringBound, termBound);
+    if (c < 0) c = 0;
+    if (c > INT32_MAX) c = INT32_MAX;
+    return static_cast<int32_t>(c);
+}
+} // namespace
+
+int32_t AeronPartitionTransport::maxFetchResponseBytesFor(int outboundRingBytes,
+                                                          int32_t termBufferBytes) noexcept
+{
+    // IngressRing(payloadCapacity) → M2ORingBuffer capacity = payloadCapacity,
+    // maxMsgLength = capacity / 8 (agrona rule).  Aeron pub maxMessageLength =
+    // FrameDescriptor::computeMaxMessageLength(termLength).
+    const int64_t ringMax = static_cast<int64_t>(outboundRingBytes) / 8;
+    const int64_t termMax = termBufferBytes > 0
+        ? aeron::concurrent::logbuffer::FrameDescriptor::computeMaxMessageLength(termBufferBytes)
+        : 0;
+    return fetchCeilingFrom(ringMax, termMax);
+}
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -43,6 +68,7 @@ AeronPartitionTransport::AeronPartitionTransport(
         const std::string&             ingressChannel,
         int32_t                        ingressStreamId,
         NodeId                         selfId,
+        int32_t                        termBufferBytes,
         int                            outboundRingBytes)
     : aeron_(std::move(aeron))
     , assembler_([this](aeron::concurrent::AtomicBuffer& buf,
@@ -53,6 +79,9 @@ AeronPartitionTransport::AeronPartitionTransport(
       })
     , selfId_(selfId)
     , outboundRing_(outboundRingBytes)  // NodeConfig-configurable ring size
+    , termMaxMessageLength_(termBufferBytes > 0
+          ? aeron::concurrent::logbuffer::FrameDescriptor::computeMaxMessageLength(termBufferBytes)
+          : 0)
 {
     // Register ingress subscription.  One bounded synchronous wait at
     // construction — never called on the duty-cycle hot path.
@@ -204,17 +233,14 @@ void AeronPartitionTransport::sendReconcileResponse(
 
 int32_t AeronPartitionTransport::maxFetchResponseBytes() const noexcept
 {
-    // See the header doc: only the outbound ring's bound is safe to read from
-    // whichever thread calls this (worker or control) — peers_/pub are
-    // control-thread-owned.  Mirrors the unconditional half of the
-    // control-thread ingress clamp in poll()'s FetchRequest handling, minus
-    // the resolved-pub tightening (which needs peers_).
-    const int32_t kFetchResponseOverhead =
-        static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
-    const int32_t ceiling = static_cast<int32_t>(outboundRing_.maxMsgLength())
-                           - static_cast<int32_t>(kOutboundEnvelopeOverhead)
-                           - kFetchResponseOverhead;
-    return ceiling > 0 ? ceiling : 0;
+    // F3 round 5, item I3: min(outbound-ring bound, Aeron term bound) — both
+    // fixed at construction, so this is safe from any thread (worker or
+    // control).  The term bound is what sendOnPub() enforces (pub
+    // maxMessageLength = term/8); before round 5 only the ring bound was
+    // used, so a term smaller than the ring could make this claim
+    // "sendable" for a frame sendOnPub() then silently dropped.
+    return fetchCeilingFrom(static_cast<int64_t>(outboundRing_.maxMsgLength()),
+                            static_cast<int64_t>(termMaxMessageLength_));
 }
 
 // FR trace correlation via per-endpoint MONOTONIC SEQUENCE (not offset — offsets
@@ -495,6 +521,8 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         const int32_t kFetchResponseOverhead =
             static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
 
+        // F3 round 5: the unconditional base IS maxFetchResponseBytes() (ring
+        // AND term bound) — the same function BrokerNode's derivation uses.
         // The records tail must survive TWO framing hops without exceeding either
         // transport bound:
         //   1. enqueueOutbound writes [int32 targetNodeId][SBE frame] into the
@@ -507,10 +535,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // Previously the cap was gated on followerPeer->pub AND ignored the ring bound
         // + the 4-byte outbound header, so an early/large fetch slipped through and
         // threw inside the worker's onFetchRequest — the fetch was lost.
-        int32_t ceiling =
-            static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
-            - kFetchResponseOverhead;
+        int32_t ceiling = maxFetchResponseBytes();
         auto* followerPeer = findPeer(req.followerId);
         if (followerPeer && followerPeer->pub) {
             const int32_t pubCeiling =
@@ -591,6 +616,20 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // inline here (routing them to a worker would race the control thread's
         // NodeRuntimeAgent doWork on the same internal replica).
         if (workerPool_ && resp.topicId >= 0) {
+            // F3 round 5, item I1: records that can never fit the owning
+            // worker's ingress ring must be DROPPED (the follower re-fetches;
+            // BrokerNode caps fetch maxBytes to the worker ring), never
+            // ABORT-retried forever and never thrown out of tryClaim().
+            if (!workerPool_->fitsIngressTail(resp.topicId, resp.partition,
+                                              resp.records.size())) [[unlikely]] {
+                if (unfittableApplyDrops_++ % 1024 == 0) {
+                    spdlog::error("AeronPartitionTransport: FetchResponse records {} B do not fit "
+                                  "the worker ingress ring (topicId={} partition={}); dropped "
+                                  "(drops={})", resp.records.size(), resp.topicId,
+                                  resp.partition, unfittableApplyDrops_);
+                }
+                return Action::CONTINUE;
+            }
             rune::node::WorkerOp op;
             op.type                              = rune::node::WorkerOp::Type::ApplyReplicated;
             op.topicId                           = resp.topicId;
@@ -672,10 +711,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // resolved, minus the outbound header — so the reconcile response never
         // overflows the outbound ring and throws inside the worker.
         const int32_t kOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
-        int32_t ceiling =
-            static_cast<int32_t>(outboundRing_.maxMsgLength())
-            - static_cast<int32_t>(kOutboundEnvelopeOverhead)
-            - kOverhead;
+        int32_t ceiling = maxFetchResponseBytes();   // F3 r5: ring AND term bound
         auto* peer = findPeer(req.followerId);
         if (peer && peer->pub) {
             const int32_t pubCeiling =
@@ -698,6 +734,16 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // leaderState_.setLeaderLogEndOffset + recomputeHw).
         // Copy records bytes before returning from the Aeron callback (buffer lifetime).
         if (workerPool_ && resp.topicId >= 0) {
+            if (!workerPool_->fitsIngressTail(resp.topicId, resp.partition,
+                                              resp.records.size())) [[unlikely]] {
+                if (unfittableApplyDrops_++ % 1024 == 0) {
+                    spdlog::error("AeronPartitionTransport: reconcile response records {} B do "
+                                  "not fit the worker ingress ring (topicId={} partition={}); "
+                                  "dropped (drops={})", resp.records.size(), resp.topicId,
+                                  resp.partition, unfittableApplyDrops_);
+                }
+                return Action::CONTINUE;
+            }
             rune::node::WorkerOp op;
             op.type                              = rune::node::WorkerOp::Type::ReconcileFetchResp;
             op.topicId                           = resp.topicId;

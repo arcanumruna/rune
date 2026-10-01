@@ -1107,11 +1107,22 @@ TEST(BrokerNodeRegression, EffectiveMaxBatchDerivedFromTransportRegression) {
 
     const int32_t ingressMax = ingressHardTransportMaxBytes(cfg);
     const int32_t replMax    = replicationHardTransportMaxBytes(cfg);
-    EXPECT_EQ(ingressMax, 131072);
-    EXPECT_LT(replMax, 131072) << "replication subtracts framing overhead; must be strictly smaller";
+    // F3 round 5: exact numbers (real framing constants, no hand /8 shortcut):
+    //   worker ring tail  = 8 MiB/8 − (8 + 219 + 4)          = 1048345
+    //   aeron ingress     = term max msg 131072 − Produce framing (24 hdr? + 24 + 2 + 4)
+    //   replication       = min(ring 262144 − 16 − 46, term 131072 − 46) = 131026
+    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 1048576u - 231u);
+    EXPECT_EQ(ingressMax, aeronIngressMaxBatchBytes(cfg));
+    EXPECT_LT(ingressMax, 131072);
+    EXPECT_EQ(replMax, 131072 - static_cast<int32_t>(
+                           rune::replication::FetchResponseMsg::encodedSize(0)));
 
-    // (1) Default config (no explicit override): effective = min(8 MiB, ingressMax, replMax) = replMax.
-    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), static_cast<std::size_t>(replMax));
+    // (1) Default config (no explicit override): effective = min(8 MiB, ingressMax, replMax).
+    // Here the Aeron-ingress Produce framing (54) exceeds the FetchResponse
+    // framing (46), so ingress is the tightest by 8 bytes.
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg),
+              static_cast<std::size_t>(std::min(ingressMax, replMax)));
+    EXPECT_EQ(ingressMax, 131072 - 54);
 
     // (2) Explicit override smaller than every hard max wins exactly.
     cfg.maxProduceBatchBytes = 1000;
@@ -1150,7 +1161,7 @@ TEST(BrokerNodeRegression, ExplicitOversizeMaxBatchConfigRefusedRegression) {
     auto err = validateExplicitMaxProduceBatch(cfg);
     ASSERT_TRUE(err.has_value());
     EXPECT_NE(err->find(std::to_string(10 * 1024 * 1024)), std::string::npos) << *err;
-    EXPECT_NE(err->find("8192"), std::string::npos) << *err;
+    EXPECT_NE(err->find(std::to_string(ingressHardTransportMaxBytes(cfg))), std::string::npos) << *err;
 
     BrokerNode node{cfg};
     EXPECT_THROW(node.start(), std::runtime_error);
@@ -1174,6 +1185,91 @@ TEST(BrokerNodeRegression, DefaultMaxBatchConfigNeverRefusedRegression) {
     EXPECT_FALSE(validateExplicitMaxProduceBatch(cfg).has_value());
 }
 
+
+// ---------------------------------------------------------------------------
+// F3 round 5, items C1 + M4: the derivation is the SAME function the
+// transports enforce.  Pins the exact default numbers and checks them against
+// REAL transport instances (one EmbeddedDriver, default 4 MiB term):
+//   legacy (AeronPartitionTransport, 4 MiB outbound ring):
+//     min(524288 − 16 envelope − 46 framing, 524288 − 46) = 524226
+//   per-worker (WorkerReplicationTransport, gather send): 524288 − 46 = 524242
+//   worker ingress ring (32 MiB): 4194304 − 231 = 4194073
+//   aeron ingress (4 MiB term):   524288 − Produce framing
+// → effective (multi-node) = 524226 = the ENFORCED legacy ceiling (round 4
+//   derived 524242, 16 bytes above what the legacy ring path can carry).
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
+    const fs::path dir = makeTempDataDir("derivedreal_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    PeerConfig peer1;
+    peer1.id = 1; peer1.host = "127.0.0.1"; peer1.consensusPort = 40116;
+    cfg.peers.push_back(peer1);
+    ASSERT_FALSE(cfg.isSingleNode());
+    ASSERT_EQ(cfg.aeronTermBufferBytes, 4 * 1024 * 1024);
+    ASSERT_EQ(cfg.replicationOutboundRingBytes, 4 * 1024 * 1024);
+    ASSERT_EQ(cfg.workerIngressRingBytes, 32 * 1024 * 1024);
+
+    EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524226);
+    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 4194073u);
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524226u);
+    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 1 << 20) << "default fetch chunk unchanged";
+
+    fs::create_directories(dir);
+    EmbeddedDriverConfig dcfg = EmbeddedDriverConfig::fromNode(cfg, (dir / "aeron").string());
+    ASSERT_EQ(dcfg.termBufferBytes, cfg.aeronTermBufferBytes);
+    EmbeddedDriver driver(dcfg, DriverMode::Threaded);
+    aeron::Context ctx;
+    ctx.aeronDir(dcfg.dir);
+    auto aeron = aeron::Aeron::connect(ctx);
+
+    const std::string chanA = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(40117);
+    const std::string chanB = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(40118);
+    rune::replication::AeronPartitionTransport legacy(
+        aeron, chanA, 900, /*selfId=*/0, cfg.aeronTermBufferBytes,
+        cfg.replicationOutboundRingBytes);
+    WorkerReplicationTransport perWorker(aeron, 0, chanB, 901, {{1, chanA}}, 902);
+    ASSERT_TRUE(perWorker.resolved());
+
+    const std::size_t eff = effectiveMaxProduceBatchBytes(cfg);
+    EXPECT_EQ(legacy.maxFetchResponseBytes(), 524226) << "derived == enforced (legacy ring path)";
+    EXPECT_EQ(perWorker.maxFetchResponseBytes(), 524242) << "derived == enforced (gather path)";
+    EXPECT_GE(static_cast<std::size_t>(legacy.maxFetchResponseBytes()), eff);
+    EXPECT_GE(static_cast<std::size_t>(perWorker.maxFetchResponseBytes()), eff);
+    EXPECT_EQ(perWorker.maxFetchResponseBytes(),
+              WorkerReplicationTransport::maxFetchResponseBytesFor(cfg.aeronTermBufferBytes));
+
+    Worker w(0, static_cast<std::size_t>(cfg.workerIngressRingBytes));
+    EXPECT_EQ(w.maxOpTailBytes(), workerIngressMaxBatchBytes(cfg));
+    EXPECT_GE(w.maxOpTailBytes(), eff);
+
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// F3 round 5, item M3: an effective max too small to carry a single record
+// (here: a 1 KiB worker ingress ring → 128 − 231 framing → 0) must REFUSE to
+// start with a clear error naming the numbers — never silently fall back to
+// the 8 MiB default (round 4's gateway setter did exactly that for 0).
+TEST(BrokerNodeRegression, EffectiveMaxBelowMinimumRefusesStartRegression) {
+    const fs::path dir = makeTempDataDir("effmaxzero_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerIngressRingBytes = 1024;
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 0u);
+    auto err = validateEffectiveMaxProduceBatch(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("workerIngress=0"), std::string::npos) << *err;
+
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+
+    // Exactly one record-batch header + 1 byte is the minimum accepted.
+    cfg.workerIngressRingBytes = 32 * 1024 * 1024;
+    cfg.maxProduceBatchBytes   = static_cast<int64_t>(kMinSaneMaxProduceBatchBytes) - 1;
+    EXPECT_TRUE(validateEffectiveMaxProduceBatch(cfg).has_value());
+    cfg.maxProduceBatchBytes   = static_cast<int64_t>(kMinSaneMaxProduceBatchBytes);
+    EXPECT_FALSE(validateEffectiveMaxProduceBatch(cfg).has_value());
+    std::error_code ec; fs::remove_all(dir, ec);
+}
 
 TEST(BrokerNodeRegression, StartNeverPumpsNodeDriverFromCallerThread) {
     const fs::path dir = makeTempDataDir("drvrace_");

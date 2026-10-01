@@ -32,6 +32,7 @@
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/Worker.h>
 #include <rune/node/ShardAgent.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
@@ -47,6 +48,7 @@
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/storage/InMemoryLog.h>
 
 #include <rune/consensus/NodeStateFile.h>
@@ -84,67 +86,77 @@ extern "C" {
 namespace rune::node {
 
 // ---------------------------------------------------------------------------
-// F3 round 4 (corrects round 3): rather than refusing to start whenever the
-// gateway's configured max produce-batch size exceeds a transport's hard
-// maximum, derive the gateway's EFFECTIVE max produce-batch size from the
-// transport and use THAT to reject oversize produce batches at the gateway —
-// loudly, immediately, with the existing MessageTooLarge error — so a batch
-// that could never be replicated is simply never accepted in the first
-// place.  This closes the real bug (an accepted-but-unreplicable batch
-// stalls its follower permanently) without an unbenchmarked latency/chunking
-// change (round 2's mistake) and without a startup refusal for the default
-// config on every small-buffer test/dev deployment (round 3's side effect).
+// Max produce-batch size (F3 rounds 4-5).
 //
-// Startup still refuses — but ONLY when the operator EXPLICITLY configured a
-// max produce batch (NodeConfig::maxProduceBatchBytes.has_value()) that
-// exceeds what the transport can actually carry.  The default (unset) config
-// always passes: there is nothing to refuse, because the effective value is
-// silently (and safely) derived down instead of ever being compared against
-// a promise that was never made.
+// The broker derives the EFFECTIVE max produce-batch size it accepts from the
+// exact per-message maximum of every transport/ring a produced batch must
+// cross, and enforces it on EVERY produce path (gateway handleProduce AND
+// each Worker's per-worker ingress handler) with MessageTooLarge — so a batch
+// that could never be ingested or replicated is never accepted (an accepted-
+// but-unreplicable batch would stall its follower forever).
+//
+// Single source of truth (round 5): BrokerNode does NOT re-derive transport
+// limits by hand.  Each limit below CALLS the function the transport/ring
+// itself uses at send/enqueue time (the static, config-only form of it, since
+// the transports do not exist yet at derivation time):
+//   - replication: AeronPartitionTransport::maxFetchResponseBytesFor() (legacy
+//     ring path) and WorkerReplicationTransport::maxFetchResponseBytesFor()
+//     (per-worker gather path) — what a FetchResponse/push can actually carry;
+//   - worker ingress ring: Worker::maxOpTailBytesFor() — what a WorkerOp tail
+//     can carry through the O2O ring (ring maxMsgLength − WorkerOp framing);
+//   - Aeron ingress: computeMaxMessageLength(term) − Produce framing — what a
+//     Produce frame on this broker's own term can carry.  NOTE: on UDP the
+//     CLIENT's term governs the image frame, so this does NOT by itself bound
+//     what arrives — the explicit size checks at the gateway and in every
+//     worker do.
+//
+// Startup refuses (before any side effect) when (a) the operator EXPLICITLY
+// configured a max that exceeds the transport maximum, or (b) the effective
+// max is below a sane minimum (cannot carry even one record).  The unset
+// default otherwise always starts: the effective value is derived down.
 // ---------------------------------------------------------------------------
 
-/// The ingress (client → worker, PRODUCE) transport's hard per-message
-/// maximum, computed from config alone (before any Aeron driver/pub exists):
-/// min(the per-worker ingress SPSC ring's capacity, the Aeron embedded
-/// driver's term buffer length) / 8 (Aeron's maxMessageLength = termLength/8
-/// rule; agrona's ring maxMsgLength = capacity/8 rule — see Worker.h's own
-/// "maxMsgLength() = capacity/8" comments on workerIngressRingBytes).  No
-/// framing-overhead subtraction: the produce batch bytes ARE the payload
-/// here, not wrapped in a further response envelope (contrast
-/// replicationHardTransportMaxBytes(), which does subtract one).
+/// Worker ingress ring: largest record batch a Produce WorkerOp can carry
+/// (= Worker::maxOpTailBytesFor(workerIngressRingBytes)).
+[[nodiscard]] std::size_t workerIngressMaxBatchBytes(const NodeConfig& config) noexcept;
+
+/// Aeron ingress: largest record batch a key-less Produce frame can carry on
+/// this broker's term (computeMaxMessageLength(term) − Produce framing).
+[[nodiscard]] int32_t aeronIngressMaxBatchBytes(const NodeConfig& config) noexcept;
+
+/// min(workerIngressMaxBatchBytes, aeronIngressMaxBatchBytes).
 [[nodiscard]] int32_t ingressHardTransportMaxBytes(const NodeConfig& config) noexcept;
 
-/// The replication transport's hard per-message maximum — unchanged from F3
-/// round 3: min(the outbound marshalling ring's capacity, the Aeron embedded
-/// driver's term buffer length) / 8, minus the FetchResponse framing
-/// overhead.  Still used by effectiveMaxProduceBatchBytes() for multi-node
-/// configs (see isSingleNode() handling there).
+/// Replication: min over BOTH replication transport kinds of what a
+/// FetchResponse/push can carry (their own maxFetchResponseBytesFor()).
 [[nodiscard]] int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept;
 
-/// The gateway's CONFIGURED max produce-batch size: the operator's EXPLICIT
-/// override (config.maxProduceBatchBytes) if set, else the gateway's own
-/// compile-time default (rune::gateway::ClientGateway::kMaxProduceBatchBytes).
+/// Replication fetch/push chunk for USER partitions: min(kDefaultMaxFetchBytes,
+/// workerIngressMaxBatchBytes) — replicated records are forwarded through the
+/// worker ingress ring, so a chunk must fit it (F3 round 5, item I1).
+[[nodiscard]] int32_t userTopicMaxFetchBytes(const NodeConfig& config) noexcept;
+
+/// The CONFIGURED max: the operator's EXPLICIT override
+/// (config.maxProduceBatchBytes) if set, else ClientGateway::kMaxProduceBatchBytes.
 [[nodiscard]] std::size_t configuredMaxProduceBatchBytes(const NodeConfig& config) noexcept;
 
-/// The EFFECTIVE max produce-batch size the gateway must actually enforce:
-/// min(configuredMaxProduceBatchBytes(config), ingressHardTransportMaxBytes(config),
-/// and — for a multi-node config ONLY — replicationHardTransportMaxBytes(config)).
-/// Single-node configs exclude the replication term: with no follower,
-/// PartitionReplica::onFetchRequest()/pushToFollowers() never run regardless
-/// of batch size (see round 3's single-node exemption reasoning) — but the
-/// INGRESS limit still applies even in single-node, since the local worker
-/// must still be able to receive and hold the batch.  ALWAYS safe to use —
-/// by construction it never exceeds what the transport can carry, whether
-/// the configured value came from an explicit override or the default.
+/// The EFFECTIVE max enforced by the gateway and every worker:
+/// min(configured, ingressHardTransportMaxBytes, and — multi-node only —
+/// replicationHardTransportMaxBytes).  Single-node excludes replication (no
+/// follower ever fetches) but never ingress.
 [[nodiscard]] std::size_t effectiveMaxProduceBatchBytes(const NodeConfig& config) noexcept;
 
-/// Startup refusal — ONLY when the operator EXPLICITLY configured a max
-/// produce batch that exceeds the hard maximum it would be capped to (the
-/// min of the ingress hard max and, for multi-node, the replication hard
-/// max).  Pure/testable.  BrokerNode::start() calls this before any other
-/// side effect, same pattern as NodeConfig::validateShardConfig().  Returns
-/// an error message (naming the exact numbers) if refused, else nullopt —
-/// including always-nullopt when config.maxProduceBatchBytes is unset.
+/// A record batch must at least hold its fixed header; an effective max at or
+/// below this cannot carry a single record → startup refusal (M3).
+inline constexpr std::size_t kMinSaneMaxProduceBatchBytes =
+    static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) + 1;
+
+/// Startup refusal when the EFFECTIVE max is below kMinSaneMaxProduceBatchBytes
+/// (e.g. tiny rings/term) — names the numbers; never silently falls back.
+[[nodiscard]] std::optional<std::string> validateEffectiveMaxProduceBatch(const NodeConfig& config);
+
+/// Startup refusal ONLY when an EXPLICIT max exceeds the hard maximum it
+/// would be capped to.  nullopt for the unset default.
 [[nodiscard]] std::optional<std::string> validateExplicitMaxProduceBatch(const NodeConfig& config);
 
 // ---------------------------------------------------------------------------

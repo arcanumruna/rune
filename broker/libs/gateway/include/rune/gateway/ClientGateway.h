@@ -478,9 +478,13 @@ public:
     // become a batch that is permanently unfetchable by replication.
     // Must be called before the gateway starts polling produce frames
     // (single-writer: duty-cycle thread only after this point).
+    // F3 round 5, item M3: installed VERBATIM — no silent fallback to the
+    // 8 MiB default.  BrokerNode::start() refuses to start when the derived
+    // effective max is below a sane minimum, so 0 never reaches here from a
+    // real broker; a 0 installed by a test means "reject every batch".
     // -----------------------------------------------------------------------
     void setMaxProduceBatchBytes(std::size_t bytes) noexcept {
-        maxProduceBatchBytes_ = bytes > 0 ? bytes : kMaxProduceBatchBytes;
+        maxProduceBatchBytes_ = bytes;
     }
     [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept {
         return maxProduceBatchBytes_;
@@ -1260,13 +1264,12 @@ public:
         return maxBatchesPerSubPerCycle_;
     }
 
-    // F3 fix-round-2, item A.4: the default max accepted produce-batch WIRE
-    // size (see maxProduceBatchBytes_ below) — named/public so it can be
-    // startup-validated against rune::replication::kDefaultMaxFetchBytes
-    // (BrokerNode.cpp's validateReplicationFetchCeiling()): a batch this
-    // gateway can accept must never be larger than what replication's fetch
-    // path can ever deliver to a follower, or it becomes permanently
-    // unfetchable (kErrRecordTooLarge forever).
+    // The CONFIGURED default max accepted produce-batch size (used when
+    // RUNE_MAX_PRODUCE_BATCH_BYTES is unset).  Never enforced as-is in a
+    // running broker: BrokerNode installs effectiveMaxProduceBatchBytes() =
+    // min(this, every transport's exact per-message maximum) via
+    // setMaxProduceBatchBytes(), so an accepted batch can always be ingested
+    // and replicated (F3 round 5).
     static constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u;
 
 private:

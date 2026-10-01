@@ -58,6 +58,9 @@
 namespace rune::node { class WorkerPool; }
 
 #include <rune/replication/PartitionReplica.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/OutboundFrame.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 #include <rune/replication/ReplicationMessages.h>
 
 #include <rune/consensus/IngressRing.h>  // agrona ManyToOne ring (outbound marshalling)
@@ -99,13 +102,39 @@ public:
     /// The ingress Subscription is registered synchronously (bounded 5 s wait)
     /// in the constructor — this is the only synchronous resolve; it runs once
     /// at startup, never on the duty-cycle hot path.
+    /// \param termBufferBytes The Aeron term length of the peer publications
+    ///        (NodeConfig::aeronTermBufferBytes — the embedded driver's term).
+    ///        F3 round 5, item I3: REQUIRED (no default) — it bounds every
+    ///        frame sendOnPub() can offer (maxMessageLength = term/8), so a
+    ///        wrong default would make maxFetchResponseBytes() claim
+    ///        "sendable" for frames the pub then drops.
     /// \param outboundRingBytes Payload bytes of the outbound ManyToOne ring
     ///        (NodeConfig::replicationOutboundRingBytes). Power of two.
     AeronPartitionTransport(std::shared_ptr<aeron::Aeron> aeron,
                             const std::string&             ingressChannel,
                             int32_t                        ingressStreamId,
                             NodeId                         selfId,
+                            int32_t                        termBufferBytes,
                             int                            outboundRingBytes = 4 * 1024 * 1024);
+
+    /// Fixed overhead of the SBE OutboundFrame envelope (SBE header +
+    /// targetNodeId block + varData length prefix) that wraps every frame in
+    /// the worker→control outbound ring.  From the generated codec.
+    static constexpr std::size_t kOutboundEnvelopeOverhead =
+        ::rune::protocol::internal::sbe::MessageHeader::encodedLength() +
+        ::rune::protocol::internal::sbe::OutboundFrame::sbeBlockLength() +
+        sizeof(std::uint32_t);
+
+    /// F3 round 5 (single source of truth): the records payload a FetchResponse
+    /// (or push) can ACTUALLY carry over this transport, from config alone —
+    /// min(outbound ring bound, Aeron term bound):
+    ///   ring: ringMaxMsgLength(=ringBytes/8) − kOutboundEnvelopeOverhead − framing
+    ///   term: computeMaxMessageLength(term)(=min(term/8,16 MiB)) − framing
+    /// framing = FetchResponseMsg::encodedSize(0).  maxFetchResponseBytes()
+    /// returns exactly this for the live instance, and poll()'s FetchRequest
+    /// clamp starts from it — derivation and enforcement cannot drift.
+    [[nodiscard]] static int32_t maxFetchResponseBytesFor(int outboundRingBytes,
+                                                          int32_t termBufferBytes) noexcept;
 
     ~AeronPartitionTransport() override = default;
 
@@ -357,9 +386,18 @@ private:
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
 
+    // F3 round 5, item I3: Aeron maxMessageLength of the peer publications
+    // (computeMaxMessageLength(termBufferBytes)), fixed at construction —
+    // safe to read from any thread.
+    int32_t termMaxMessageLength_ = 0;
+
     // Back-pressure observability: bumped when the outbound ring is full and a
     // (retriable) send had to be skipped. Control-thread reads for logging.
     uint64_t outboundRingFullCount_ = 0;
+
+    // F3 round 5, item I1: replicated-records frames dropped because they can
+    // never fit the owning worker's ingress ring (control-thread only).
+    uint64_t unfittableApplyDrops_ = 0;
 
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.

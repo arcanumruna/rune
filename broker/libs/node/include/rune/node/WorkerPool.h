@@ -215,6 +215,17 @@ public:
     // is stable within a duty cycle and only changes on reconcile(), which is
     // driven before doWork() on the same thread.
     // -----------------------------------------------------------------------
+    // F3 round 5, item I1: true when a variable tail of tailLen bytes fits the
+    // owning worker's ingress ring (Worker::fitsIngressTail).  Callers that
+    // forward variable-size payloads (the replication transport's
+    // ApplyReplicated / ReconcileFetchResp) check this BEFORE building the op
+    // so an unfittable frame is dropped, never retried forever.
+    [[nodiscard]] bool fitsIngressTail(int32_t topicId, int32_t partition,
+                                       std::size_t tailLen) {
+        const int32_t wid = ownerWorkerId(topicId, partition);
+        return workers_[static_cast<std::size_t>(wid)]->fitsIngressTail(tailLen);
+    }
+
     [[nodiscard]] bool tryEnqueueOp(int32_t topicId, int32_t partition,
                                     WorkerOp op) {
         const int32_t wid = ownerWorkerId(topicId, partition);

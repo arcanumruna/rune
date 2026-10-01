@@ -720,8 +720,14 @@ void Log::truncateTo(int64_t truncateOffset) {
     // heals the gap.  Construct the replacement BEFORE erasing the old
     // entry, so a failure here leaves segments_ holding the OLD (stale but
     // structurally valid) segment right up until the abort.
+    //
+    // F3 round 5, item I4: the guard covers EVERYTHING after the truncate —
+    // the index removal, the segment reopen, the install into segments_, the
+    // rebuilt segment's recover() (index rebuild: .index.tmp remove/write/
+    // rename) AND the logEndOffset_ assignment.  Round 2 left recover() and
+    // the LEO assignment outside the guard, so a throw there escaped as an
+    // ordinary exception with the .log already truncated and LEO stale.
     int64_t base = seg.baseOffset();
-    std::unique_ptr<LogSegment> newSeg;
     try {
         // Also truncate the index — simplest: just let recover() rebuild it.
         std::string ipath = indexPathForLog(lpath);
@@ -729,11 +735,19 @@ void Log::truncateTo(int64_t truncateOffset) {
         // Rebuild the active segment from disk.  It IS the active segment
         // (this code only reaches here when truncateOffset falls inside it)
         // — F3: eagerReadMap=true.
-        newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
-                                               indexMaxBytes_, /*prefaultIndex*/false,
-                                               /*eagerReadMap*/true);
+        auto newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
+                                                    indexMaxBytes_, /*prefaultIndex*/false,
+                                                    /*eagerReadMap*/true);
+        segments_.erase(base);
+        segments_[base] = std::move(newSeg);
+        // Re-run recover to rebuild the index and set nextOffset correctly.
+        // Use the segment's actual nextOffset_ (derived from the physically
+        // truncated file) rather than hard-coding truncateOffset, so that LEO
+        // and the segment's nextOffset_ can never diverge.
+        activeSegment().recover();
+        logEndOffset_ = activeSegment().nextOffset();
     } catch (const std::exception& ex) {
-        fatalHalt("Log::truncateTo: post-truncate storage failure reopening segment "
+        fatalHalt("Log::truncateTo: post-truncate storage failure rebuilding segment "
                   "dir=" + dir_ + " base=" + std::to_string(base) + " path=" + lpath +
                   ": " + ex.what() + ".  The .log file is ALREADY truncated on disk "
                   "(cutPos=" + std::to_string(cutPos) + "); disk and memory would now "
@@ -741,19 +755,11 @@ void Log::truncateTo(int64_t truncateOffset) {
                   "rather than risk SIGBUS or silent corruption — restart recovers "
                   "cleanly from disk.");
     } catch (...) {
-        fatalHalt("Log::truncateTo: post-truncate storage failure reopening segment "
+        fatalHalt("Log::truncateTo: post-truncate storage failure rebuilding segment "
                   "dir=" + dir_ + " base=" + std::to_string(base) + " path=" + lpath +
                   ": unknown exception.  The .log file is ALREADY truncated on disk "
                   "(cutPos=" + std::to_string(cutPos) + ").  Halting.");
     }
-    segments_.erase(base);
-    segments_[base] = std::move(newSeg);
-    // Re-run recover to rebuild the index and set nextOffset correctly.
-    // Use the segment's actual nextOffset_ (derived from the physically truncated
-    // file) rather than hard-coding truncateOffset, so that LEO and the segment's
-    // nextOffset_ can never diverge.
-    activeSegment().recover();
-    logEndOffset_ = activeSegment().nextOffset();
 }
 
 void Log::reloadSegments() {
