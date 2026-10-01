@@ -256,6 +256,8 @@ public:
     static constexpr int kExitStorageFailure = 74;   // EX_IOERR
     using HaltHandler = void (*)(void* ctx, int exitCode);
     void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
+    /// Test-only: drive the runtime's storage-failure path directly.
+    void raiseStorageFailureForTest(const std::string& logDir, int err) { onStorageFailure_(logDir, err); }
 
     // -----------------------------------------------------------------------
     // Observers (thread-safe: atomic reads)

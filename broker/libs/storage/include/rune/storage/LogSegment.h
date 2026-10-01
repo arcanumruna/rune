@@ -20,6 +20,7 @@ namespace rune::storage {
 ///   faultForTest   — test-only: while non-zero every inline sync fails with it.
 struct LogStorageState {
     uint64_t syncCalls    = 0;
+    uint64_t roleChangeSyncs = 0;   ///< recover()'s index msync + dir fsync (truncate / startup)
     int      failedErrno  = 0;
     int      faultForTest = 0;
 };

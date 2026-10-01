@@ -601,6 +601,7 @@ void Log::retire_(std::unique_ptr<LogSegment> seg) {
     for (std::size_t i = 0; i < pendingSealCount_; ) {
         if (pendingSeals_[i] == seg.get()) {
             seg->unpinFlush();
+            ++droppedPendingSeals_;
             for (std::size_t j = i + 1; j < pendingSealCount_; ++j) pendingSeals_[j - 1] = pendingSeals_[j];
             --pendingSealCount_;
         } else {

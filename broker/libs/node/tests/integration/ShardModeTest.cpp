@@ -547,3 +547,14 @@ TEST(ShardModeRegression, RefusesIoBackendThatCannotSubmit) {
     }
     ::unsetenv("RUNE_IO_BACKEND");
 }
+
+TEST(ShardModeRegression, NoHaltHandlerExitsWithStorageFailureCode) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    TmpDir dir{"nohalt"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    EXPECT_EXIT({
+        BrokerNode node{cfg};
+        node.raiseStorageFailureForTest("/data/x", EIO);
+    }, ::testing::ExitedWithCode(BrokerNode::kExitStorageFailure), "");
+}

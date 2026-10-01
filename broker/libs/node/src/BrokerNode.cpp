@@ -1178,12 +1178,12 @@ void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
         haltHandler_(haltCtx_, kExitStorageFailure);
         return;
     }
-    // No owner-installed handler: stop through the normal path from a helper
-    // thread (stop() joins this runtime thread), then exit with the code.
-    std::thread([this] {
-        stop();
-        std::_Exit(kExitStorageFailure);
-    }).detach();
+    // No owner-installed handler: fail-stop immediately.  Restart recovery
+    // truncates the torn tail; nothing on this node may run past a failed fsync.
+    spdlog::critical("BrokerNode[{}]: no halt handler installed — exiting {} now",
+                     config_.nodeId, kExitStorageFailure);
+    spdlog::default_logger()->flush();
+    std::_Exit(kExitStorageFailure);
 }
 
 void BrokerNode::buildGateway() {
@@ -1741,6 +1741,11 @@ void BrokerNode::buildGateway() {
         txnCoordService_.get(),   // TX-3: txn coordinator (null-safe if setup failed)
         metadataService_.get(),   // MD1: metadata service (null-safe if setup failed)
         workerPool_.get());       // E1: shard→worker pool (null-safe if no topics)
+    // fsyncgate (Task 10 fix 2 / I-1): control-thread-driven replicas (internal
+    // partitions) whose fsync failed → halt.
+    runtimeAgent_->setStorageFailureHook([this](const std::string& dir, int err) {
+        onStorageFailure_(dir, err);
+    });
 
     // -----------------------------------------------------------------------
     // Task 8a (RULING-2 B): wire the admin control-plane servicing hook.

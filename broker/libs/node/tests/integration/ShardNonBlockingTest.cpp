@@ -11,6 +11,8 @@
 // control completion delivery (setReapPausedForTest / deliverCompletionForTest)
 // so durability ordering is asserted deterministically.
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/NodeRuntimeAgent.h>
+#include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ShardAgent.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
@@ -631,4 +633,170 @@ TEST(StorageFailStopRegression, LegacySyncFailurePropagatesRegression) {
         if (r.type == WorkerReturn::Type::StorageFailure) { ++failures; EXPECT_EQ(r.errorCode, EIO); }
     });
     EXPECT_EQ(failures, 1) << "legacy mode fail-stops too";
+}
+
+// ============================================================================
+// Fix round 2.
+// ============================================================================
+
+TEST(StorageFailStopRegression, ErrorCompletionAfterOwnershipMoveHaltsAndNeverAcksOkRegression) {
+    // C-1: a Strict entry + an async seal in flight; ownership moves the log
+    // away; the seal then completes with an error.  The error is NOT swallowed
+    // by the purged slot (halt signal), no OK ack is ever sent, and this worker
+    // never writes the (now foreign) Log object.
+    StrictShard s(/*rollBytes=*/512);
+    TmpDir d2;
+    Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
+    PartitionReplica other(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &log2, &s.t);
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll → async seal
+    s.w.doWork(1);
+    ASSERT_EQ(s.w.sealSubmitsForTest(), 1u);
+    ASSERT_EQ(s.w.durablePendingCountForTest(), 2u);
+    const auto active = s.w.durablePendingTokenForTest(0);
+    // The seal is the token submitted just before the active flush.
+    const auto seal = active - 1;
+    WorkerOp op;
+    op.type = WorkerOp::Type::SetOwnership;
+    op.ownedSet = {&other};
+    ASSERT_TRUE(s.w.tryEnqueueOp(std::move(op)));
+    s.w.doWork(2);
+    std::vector<WorkerReturn> all;
+    auto drainAll = [&] { s.w.drainReturn([&](WorkerReturn r) { all.push_back(r); }); };
+    drainAll();
+    s.w.deliverCompletionForTest(FlushCompletion{seal, EIO, 0});
+    s.w.deliverCompletionForTest(FlushCompletion{active, 0, 0});
+    s.w.doWork(3);
+    drainAll();
+    int produce = 0, ok = 0, signals = 0;
+    for (const auto& r : all) {
+        if (r.type == WorkerReturn::Type::ProduceResult) { ++produce; ok += r.errorCode == 0; }
+        if (r.type == WorkerReturn::Type::StorageFailure) { ++signals; EXPECT_EQ(r.errorCode, EIO); }
+    }
+    EXPECT_EQ(produce, 2) << "both entries answered (retriable NotLeader at the move)";
+    EXPECT_EQ(ok, 0) << "never an OK ack after a failed seal";
+    EXPECT_EQ(signals, 1) << "the error on a purged slot still halts the broker";
+    EXPECT_FALSE(s.log->storageFailed()) << "the foreign Log object is never written by this worker";
+}
+
+TEST(StorageFailStopRegression, LegacyFollowerFlushFailureHaltsNotTerminates) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&follower});
+    applyOneBatch(follower, 0);
+    log.setSyncFaultForTest(EIO);
+    EXPECT_NO_THROW(w.doWork(25 * kMs)) << "a failed follower fsync never escapes the loop";
+    EXPECT_TRUE(log.storageFailed());
+    int signals = 0;
+    w.drainReturn([&](WorkerReturn r) { signals += r.type == WorkerReturn::Type::StorageFailure; });
+    EXPECT_EQ(signals, 1);
+}
+
+namespace {
+class NoopConsensus final : public rune::consensus::Agent {
+public:
+    int doWork(int64_t) override { return 0; }
+};
+} // namespace
+
+TEST(StorageFailStopRegression, InternalPartitionFlushFailureReachesHalt) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    auto rep = std::make_unique<PartitionReplica>(cfg(2, 1, /*internal topic*/-2, 0), Role::Follower, 1,
+        std::vector<rune::replication::NodeId>{1, 2}, std::vector<rune::replication::NodeId>{1, 2}, &log, &t);
+    rep->becomeFollower(1, 1);
+    rune::replication::FetchResponseMsg resp{1, 0, 0, 0, rune::replication::kErrNone, -2,
+                                             std::span<const uint8_t>(batchAt(0))};
+    const auto b = batchAt(0);
+    resp.records = std::span<const uint8_t>(b);
+    rep->applyReplicated(resp);
+    ReplicaRegistry reg;
+    reg.add(-2, 0, std::move(rep));
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &reg, nullptr);
+    std::string haltedDir; int haltedErr = 0; int calls = 0;
+    rt.setStorageFailureHook([&](const std::string& dir, int err) { haltedDir = dir; haltedErr = err; ++calls; });
+    log.setSyncFaultForTest(EIO);
+    EXPECT_NO_THROW(rt.doWork(25 * kMs)) << "control-thread flush failure must not terminate";
+    EXPECT_NO_THROW(rt.doWork(50 * kMs));
+    EXPECT_EQ(calls, 1) << "an internal-partition fsync failure reaches the halt exactly once";
+    EXPECT_EQ(haltedErr, EIO);
+    EXPECT_EQ(haltedDir, log.dir());
+}
+
+TEST(ShardNonBlockingRegression, TruncateDroppingPendingSealFailsGatedEntriesRetriably) {
+    StrictShard s(/*rollBytes=*/512);
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);   // segment A
+    s.w.doWork(1);                                            // T1 (fd A)
+    const auto t1 = s.w.durablePendingTokenForTest(0);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 2), 1);    // rolls: A pending seal (unsubmitted)
+    ASSERT_EQ(s.log->pendingSealCount(), 1u);
+    s.w.deliverCompletionForTest(FlushCompletion{t1, 0, 0}); // P1 now gated on A's seal
+    s.log->truncateTo(0);                                     // role change drops the pending seal
+    s.w.doWork(3);
+    Acks a;
+    a.drain(s.w);
+    ASSERT_EQ(a.n, 2) << "gated entries never wedge (or hold ack reservations)";
+    for (const auto& r : a.rets)
+        EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "retriable, never OK";
+    EXPECT_EQ(s.w.durablePendingCountForTest(), 0u);
+    EXPECT_EQ(s.w.reservedAckSlotsForTest(), 0);
+}
+
+TEST(ShardNonBlockingRegression, TruncateClampsSyncedLeo) {
+    StrictShard s;
+    s.leader->append(std::span<const uint8_t>(std::vector<uint8_t>(8, 1)));
+    s.leader->append(std::span<const uint8_t>(std::vector<uint8_t>(8, 2)));
+    s.w.doWork(1);
+    for (int i = 0; i < kCap && s.w.bgFlushInFlightForTest() > 0; ++i) { s.w.doWork(2); std::this_thread::yield(); }
+    ASSERT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), 2);
+    const uint64_t roleSyncsBefore = s.log->roleChangeSyncCallsForTest();
+    s.log->truncateTo(1);
+    EXPECT_GT(s.log->roleChangeSyncCallsForTest(), roleSyncsBefore)
+        << "truncate's index msync + dir fsync are counted as accepted role-change sync work";
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u);
+    s.w.doWork(3);
+    EXPECT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), 1) << "clamped to the new LEO";
+    s.leader->append(std::span<const uint8_t>(std::vector<uint8_t>(8, 3)));   // LEO back to 2
+    const uint64_t before = s.w.bgFlushSubmitsForTest();
+    s.w.doWork(4);
+    EXPECT_GT(s.w.bgFlushSubmitsForTest(), before) << "re-appended data below the stale mark is flushed";
+}
+
+TEST(StorageFailStopRegression, FailedLogIsNeverSubmittedAgain) {
+    StrictShard s;
+    ASSERT_EQ(s.produce(1, batchAt(0), 0, 1), 1);            // appended, not yet submitted
+    s.log->markStorageFailed(EIO);
+    s.w.doWork(1);
+    EXPECT_EQ(s.w.ioSubmitCountForTest(), 0u) << "no io submission on a failed log";
+    EXPECT_EQ(s.w.submitBgFlushForTest(s.log.get()), kNoToken);
+    Acks a;
+    a.drain(s.w);
+    ASSERT_EQ(a.n, 1);
+    EXPECT_EQ(a.rets[0].errorCode, kStorageError);
+}
+
+TEST(StorageFailStopRegression, InlineStrictSyncFailureIsStorageError) {
+    // Legacy (non-shard) WorkerIngress Strict path: the inline fsync fails.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica leader(cfg(1, /*tier=*/2), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setWorkerIngress(nullptr, true);
+    log.setSyncFaultForTest(EIO);
+    const auto f = produceFrame(1, batchAt(0), 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(f.data(), f.size(), 1), 1);
+    Acks a;
+    a.drain(w);
+    ASSERT_EQ(a.n, 1);
+    EXPECT_EQ(a.rets[0].errorCode, kStorageError);
 }

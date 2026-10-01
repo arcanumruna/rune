@@ -482,8 +482,12 @@ int64_t LogSegment::recover() {
 
     // B3: msync the rebuilt index then atomically rename .index.tmp → .index,
     // then fsync the directory so the renamed entry survives power loss.
+    // Accepted role-change sync work (truncateTo on a role / epoch change, and
+    // startup recovery) — counted, and an error is fail-stop (sticky per log)
+    // rather than an exception escaping a worker loop.
+    if (storage_) ++storage_->roleChangeSyncs;
     if (const int e = index_->sync(); e != 0) {
-        throw std::system_error(e, std::generic_category(), "LogSegment::recover msync " + indexTmp);
+        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
     }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
         throw std::system_error(errno, std::system_category(),
@@ -493,7 +497,11 @@ int64_t LogSegment::recover() {
     {
         std::string dir = logPath_.substr(0, logPath_.rfind('/'));
         int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+        if (dfd >= 0) {
+            if (storage_) ++storage_->roleChangeSyncs;
+            if (::fsync(dfd) != 0 && storage_ && storage_->failedErrno == 0) storage_->failedErrno = errno;
+            ::close(dfd);
+        }
     }
     // Reopen index_ from the canonical path and recount entries from mmap data.
     index_ = std::make_unique<OffsetIndex>(indexPath, baseOffset_, indexMaxBytes_);

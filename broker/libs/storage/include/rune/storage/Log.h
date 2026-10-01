@@ -141,6 +141,14 @@ public:
     /// the log (truncate / retention / reload) is closed when this reaches 0.
     void unpinSegmentFlush(LogSegment* seg) noexcept;
     [[nodiscard]] std::size_t retiredSegmentsForTest() const noexcept { return retiredSegments_.size(); }
+    /// Pending (un-submitted) async seals dropped because their segment was
+    /// removed (truncate / retention / reload).  The owning worker fails its
+    /// seal-gated durable entries retriably when this changes.
+    [[nodiscard]] uint64_t droppedPendingSeals() const noexcept { return droppedPendingSeals_; }
+    /// Accepted role-change sync work (not on the steady-state loop): the index
+    /// msync + directory fsync of LogSegment::recover (run by truncateTo on a
+    /// role / epoch change, and at startup recovery).
+    [[nodiscard]] uint64_t roleChangeSyncCallsForTest() const noexcept { return storage_.roleChangeSyncs; }
 
     /// Owner-defined O(1) tag (the owning worker's flush-slot index); UINT32_MAX = none.
     void     setOwnerTag(uint32_t t) noexcept { ownerTag_ = t; }
@@ -345,6 +353,7 @@ private:
     static constexpr std::size_t kMaxPendingSeals = 16;
     std::array<LogSegment*, kMaxPendingSeals> pendingSeals_{};
     std::size_t pendingSealCount_ = 0;
+    uint64_t droppedPendingSeals_ = 0;
     /// M1: segments removed from segments_ while an async flush was in flight on
     /// their fd.  Destroyed (fd closed) by unpinSegmentFlush.  Rare, cold.
     std::vector<std::unique_ptr<LogSegment>> retiredSegments_;

@@ -1559,7 +1559,17 @@ int PartitionReplica::doWork(int64_t nowNs)
         } else {
             RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,
                                  static_cast<uint32_t>(cfg_.partitionId));
-            onLog([&](auto& L){ L.sync(); });
+            // fsyncgate: a failed fsync never escapes doWork (callers run on
+            // AgentRunner threads with no catch → std::terminate).  The log is now
+            // permanently failed (LogSegment::sync marks it); the OWNER's loop
+            // sees storageFailed() and routes it to the broker halt (exit 74).
+            try {
+                onLog([&](auto& L){ L.sync(); });
+            } catch (const std::exception& ex) {
+                if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->markStorageFailed(5 /*EIO*/);
+                spdlog::critical("PartitionReplica[topic={} part={}]: follower flush fsync failed: {}",
+                                 cfg_.topicId, cfg_.partitionId, ex.what());
+            }
         }
         ++work;
     }

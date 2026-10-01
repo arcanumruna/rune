@@ -40,6 +40,8 @@
 #include <rune_fr/FlightRecorder.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/LogCleaner.h>
+#include <rune/storage/Log.h>
+#include <spdlog/spdlog.h>
 #include <rune/storage/OffsetMap.h>
 #include <rune/consensus/Election.h>
 #include <rune/metadata/RoutingImage.h>
@@ -149,6 +151,12 @@ public:
     void setAdminControlHook(std::function<int(int64_t)> hook) noexcept {
         adminControlHook_ = std::move(hook);
     }
+
+    // fsyncgate fail-stop (Task 10 fix 2 / I-1): replicas this control thread
+    // drives (internal partitions; all partitions without a WorkerPool) whose
+    // log fsync failed are reported here ONCE → BrokerNode halts (exit 74).
+    using StorageFailureHook = std::function<void(const std::string& logDir, int err)>;
+    void setStorageFailureHook(StorageFailureHook hook) { storageFailureHook_ = std::move(hook); }
 
     // -----------------------------------------------------------------------
     // Agent::doWork — single-writer duty cycle.
@@ -422,13 +430,17 @@ public:
                 for (auto* replica : registry_->allReplicas()) {
                     if (replica && replica->topicId() < 0) {
                         work += replica->doWork(nowNs);
+                        checkReplicaStorage_(replica);
                     }
                 }
             }
         } else if (registry_) {
             // Pre-E1 path: iterate registry directly (all replicas).
             for (auto* replica : registry_->allReplicas()) {
-                if (replica) work += replica->doWork(nowNs);
+                if (replica) {
+                    work += replica->doWork(nowNs);
+                    checkReplicaStorage_(replica);
+                }
             }
         }
 
@@ -754,6 +766,18 @@ private:
     WorkerPool*                                        workerPool_;      // non-owning; null = pre-E1 path
     // Task 8a: admin control-plane servicing hook (RULING-2 B). Null = no admin plane.
     std::function<int(int64_t)>                        adminControlHook_;
+    StorageFailureHook                                 storageFailureHook_;
+    bool                                               storageFailureReported_ = false;
+    void checkReplicaStorage_(rune::replication::PartitionReplica* replica) {
+        if (!replica->isDiskBacked()) return;
+        rune::storage::Log* log = replica->log();
+        if (!log->storageFailed()) [[likely]] return;
+        if (storageFailureReported_) return;
+        storageFailureReported_ = true;
+        spdlog::critical("NodeRuntimeAgent: fsync FAILED on {} (errno={}) — halting the broker",
+                         log->dir(), log->storageErrno());
+        if (storageFailureHook_) storageFailureHook_(log->dir(), log->storageErrno());
+    }
 };
 
 } // namespace rune::node

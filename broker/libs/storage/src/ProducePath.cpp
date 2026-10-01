@@ -254,12 +254,13 @@ ProduceOutcome handleProduceBatch(
             log.sync();
             out.syncDone = true;
         } catch (const std::exception& ex) {
-            spdlog::error("ProducePath: Strict-tier sync() failed: {}; Internal", ex.what());
-            out.error = pc::ErrorCode::Internal;
+            spdlog::error("ProducePath: Strict-tier sync() failed: {}; StorageError (log failed)", ex.what());
+            out.error = pc::ErrorCode::StorageError;
             return out;
         } catch (...) {
-            spdlog::error("ProducePath: Strict-tier sync() threw unknown; Internal");
-            out.error = pc::ErrorCode::Internal;
+            spdlog::error("ProducePath: Strict-tier sync() threw unknown; StorageError");
+            log.markStorageFailed(5 /*EIO*/);
+            out.error = pc::ErrorCode::StorageError;
             return out;
         }
     }

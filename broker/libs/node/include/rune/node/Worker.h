@@ -824,6 +824,7 @@ private:
             work += slot.log->drainRetentionDeletes();
             work += slot.log->drainStagingRenamesDone();
             if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);   // async roll seals
+            reconcileTruncation_(slot);
             checkStorageFailure_(slot.log);
         }
         work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
@@ -935,6 +936,13 @@ private:
             // Async roll seals first: a Strict entry may live in a segment sealed
             // this pass, and its ack waits for that seal (onFlushCompletion_).
             LogFlushSlot* slot = slotOf_(log);
+            if (log->storageFailed()) [[unlikely]] {
+                // fsyncgate: never touch a failed log's disk again; its pending
+                // entries fail (StorageError), never OK.
+                failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), false);
+                ++work;
+                continue;
+            }
             if (slot) work += submitPendingSeals_(*slot);
             CompletionToken t = submitActive_(log, RouteKind::Durable, slot ? slot->epoch : 0,
                                               /*pin=*/slot != nullptr);
@@ -1019,15 +1027,28 @@ private:
         // still owns the log — a purged slot's log may belong to another worker).
         if (routed && r.seg && slot) r.log->unpinSegmentFlush(r.seg);
 
-        if (routed && r.kind != RouteKind::Durable) {
-            if (r.kind == RouteKind::Background) {
-                if (slot && slot->bgToken == c.token) { slot->bgToken = kNoToken; if (bgInFlight_) --bgInFlight_; }
-                if (c.errorCode != 0) ++bgFlushErrors_;
-            } else if (slot && slot->sealsInFlight > 0) {
-                --slot->sealsInFlight;
+        if (routed && r.kind == RouteKind::Background && slot && slot->bgToken == c.token) {
+            slot->bgToken = kNoToken;
+            if (bgInFlight_) --bgInFlight_;
+        }
+        if (routed && r.kind == RouteKind::Seal && slot && slot->sealsInFlight > 0) --slot->sealsInFlight;
+
+        // C-1: the error FIRST — before any purged-slot early return.  An fsync
+        // error is fail-stop whoever owns the log now (never retried).
+        if (c.errorCode != 0) {
+            if (routed && r.kind == RouteKind::Background) ++bgFlushErrors_;
+            const rune::storage::Log* failed = routed ? r.log : nullptr;
+            for (const auto& e : durablePending_)
+                if (!failed && e.token == c.token) failed = e.logPtr;
+            if (failed) {
+                if (LogFlushSlot* owner = slotOf_(failed)) failLog_(owner->log, c.errorCode);
+                else failForeignLog_(failed, c.errorCode);
             }
-            if (!slot) return 1;                               // purged (M2): ignored safely
-            if (c.errorCode != 0) { failLog_(slot->log, c.errorCode); return 1; }   // fail-stop, no retry
+            return 1;
+        }
+
+        if (routed && r.kind != RouteKind::Durable) {
+            if (!slot) return 1;                               // purged (M2): success ignored safely
             if (r.kind == RouteKind::Background) {
                 if (slot->bgLeo > slot->lastSyncedLeo) slot->lastSyncedLeo = slot->bgLeo;
                 if (slot->bgAgain) { slot->bgAgain = false; (void)requestBgFlush_(*slot); }
@@ -1038,13 +1059,6 @@ private:
         }
 
         // Durable token (or an unrouted one: synthetic / already-retired).
-        if (c.errorCode != 0) {
-            rune::storage::Log* failed = routed ? r.log : nullptr;
-            for (const auto& e : durablePending_)
-                if (!failed && e.token == c.token && !e.awaitSeal) failed = e.logPtr;
-            if (failed) failLog_(failed, c.errorCode);
-            return 1;
-        }
         int fired = 0;
         for (std::size_t i = 0; i < durablePending_.size(); ) {
             auto& entry = durablePending_[i];
@@ -2538,6 +2552,7 @@ private:
         int64_t         lastSyncedLeo   = 0;
         uint32_t        sealsInFlight   = 0;
         bool            failureReported = false;
+        uint64_t        sealDropsSeen   = 0;          ///< Log::droppedPendingSeals() last seen
     };
     std::vector<LogFlushSlot> slots_;
     uint32_t                  slotEpochSeq_ = 0;
@@ -2567,6 +2582,7 @@ private:
     bool        reapPausedForTest_ = false;
     int         forcedFlushErrorForTest_ = 0;
     std::vector<WorkerReturn> pendingSignals_;       ///< StorageFailure signals awaiting ring space (cold)
+    std::vector<const rune::storage::Log*> foreignFailed_;   ///< C-1: signalled failures on un-owned logs (cold)
 
     static std::size_t pow2AtLeast_(std::size_t n) noexcept {
         std::size_t p = 1;
@@ -2606,6 +2622,18 @@ private:
                 fresh.log = log; fresh.replica = replica; fresh.epoch = ++slotEpochSeq_;
                 next.push_back(fresh);
             }
+        }
+        // C-1 / M2: logs this worker no longer owns.  Their still-pending durable
+        // entries would lose their seal gating (the slot goes) — fail them
+        // RETRIABLY now (NotLeader: the client retries on the new owner), and
+        // never submit for them again this pass.
+        for (const auto& old : slots_) {
+            bool kept = false;
+            for (const auto& n : next) kept = kept || n.log == old.log;
+            if (kept) continue;
+            failOwnPending_(old.log, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), false);
+            dirtyThisCycle_.erase(std::remove(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), old.log),
+                                  dirtyThisCycle_.end());
         }
         slots_ = std::move(next);
         const std::size_t cap = pow2AtLeast_(2 * slots_.size() + 2);
@@ -2662,6 +2690,7 @@ private:
     // kNoToken on back-pressure.
     CompletionToken submitActive_(rune::storage::Log* log, RouteKind kind, uint32_t epoch,
                                   bool pin = true) noexcept {
+        if (log->storageFailed()) [[unlikely]] return kNoToken;   // never touch a failed log's disk again
         rune::storage::LogSegment* seg = log->activeSegmentForFlush();
         if (pin) seg->pinFlush();
         const CompletionToken t = io_.submit(seg->logFd(), log->flushBoundary());
@@ -2791,10 +2820,8 @@ private:
     // The FIRST fsync error on a log: the log is permanently failed, every
     // durable/acks=all ack pending on it fails with StorageError (never OK),
     // and the runtime is signalled once to halt the broker.
-    void failLog_(rune::storage::Log* log, int err) {
-        if (!log) return;
-        log->markStorageFailed(err);
-        const int16_t code = static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
+    // Fail THIS worker's pending acks on `log` with `code` (never touches the Log).
+    void failOwnPending_(const rune::storage::Log* log, int16_t code, bool includeAcksAll) {
         for (std::size_t i = 0; i < durablePending_.size(); ) {
             if (durablePending_[i].logPtr == log) {
                 durablePending_[i].ret.errorCode = code;
@@ -2805,9 +2832,10 @@ private:
                 ++i;
             }
         }
+        if (!includeAcksAll) return;
         for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
             auto* r = pendingAcksAll_[i].replica;
-            if (r && r->isDiskBacked() && r->log() == log) {
+            if (r && r->isDiskBacked() && r->log() == log) {   // log() is immutable: safe to read
                 pendingAcksAll_[i].ret.errorCode = code;
                 enqueueReturn_(pendingAcksAll_[i].ret);
                 pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
@@ -2816,23 +2844,58 @@ private:
                 ++i;
             }
         }
-        LogFlushSlot* slot = slotOf_(log);
-        if (slot && slot->failureReported) return;
-        if (slot) slot->failureReported = true;
-        const int e = log->storageErrno();
+    }
+    void signalStorageFailure_(const rune::storage::Log* log, int err, int32_t topicId, int32_t partition) {
         spdlog::critical("Worker {}: fsync FAILED on {} (errno={}) — log permanently failed; "
-                         "signalling the runtime to halt the broker", workerId_, log->dir(), e);
+                         "signalling the runtime to halt the broker", workerId_, log->dir(), err);
         WorkerReturn sig;
         sig.type      = WorkerReturn::Type::StorageFailure;
-        sig.errorCode = static_cast<int16_t>(e);
-        if (slot && slot->replica) {
-            sig.topicId   = slot->replica->topicId();
-            sig.partition = static_cast<int32_t>(slot->replica->partitionId());
-        }
-        const std::string& dir = log->dir();
+        sig.errorCode = static_cast<int16_t>(err);
+        sig.topicId   = topicId;
+        sig.partition = partition;
+        const std::string& dir = log->dir();   // immutable after construction: safe to read
         sig.chunk.assign(dir.begin(), dir.end());
         ++storageFailureSignals_;
         enqueueSignal_(sig);
+    }
+    // The FIRST fsync error on a log THIS worker owns: the log is permanently
+    // failed, every durable/acks=all ack pending on it fails with StorageError
+    // (never OK), and the runtime is signalled once to halt the broker.
+    void failLog_(rune::storage::Log* log, int err) {
+        if (!log) return;
+        log->markStorageFailed(err);
+        failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), true);
+        LogFlushSlot* slot = slotOf_(log);
+        if (slot && slot->failureReported) return;
+        if (slot) slot->failureReported = true;
+        signalStorageFailure_(log, log->storageErrno(),
+                              slot && slot->replica ? slot->replica->topicId() : -1,
+                              slot && slot->replica ? static_cast<int32_t>(slot->replica->partitionId()) : -1);
+    }
+    // C-1: an fsync error on a log this worker NO LONGER owns (its slot was
+    // purged by an ownership move while the token was in flight).  The kernel
+    // error state was consumed by THIS fsync, so the new owner's next fsync can
+    // succeed over lost pages — the broker must halt.  Never write the other
+    // worker's Log object: fail only this worker's own pending entries, signal.
+    void failForeignLog_(const rune::storage::Log* log, int err) {
+        failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), false);
+        for (const auto* f : foreignFailed_) if (f == log) return;
+        foreignFailed_.push_back(log);   // cold
+        signalStorageFailure_(log, err, -1, -1);
+    }
+    // After a truncate (role change): clamp the slot's LEO bookkeeping, and if
+    // the truncate dropped an UNSUBMITTED pending seal, this worker's durable
+    // entries on the log can no longer prove durability (their seal is gone) —
+    // fail them RETRIABLY instead of wedging (and holding ack reservations).
+    void reconcileTruncation_(LogFlushSlot& slot) {
+        const int64_t leo = slot.log->logEndOffset();
+        if (slot.lastSyncedLeo > leo) slot.lastSyncedLeo = leo;
+        if (slot.bgLeo > leo) slot.bgLeo = leo;
+        const uint64_t drops = slot.log->droppedPendingSeals();
+        if (drops != slot.sealDropsSeen) [[unlikely]] {
+            slot.sealDropsSeen = drops;
+            failOwnPending_(slot.log, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), false);
+        }
     }
     // Any inline sync failure (legacy Log::sync / durable append / seal) marks
     // the log failed in storage; this cold check turns it into the fail-stop.
