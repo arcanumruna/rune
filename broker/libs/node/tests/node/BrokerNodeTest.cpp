@@ -1072,6 +1072,67 @@ TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
+// ---------------------------------------------------------------------------
+// F3 round 3 (corrects fix-round-2 item A.4): validateReplicationFetchCeiling()
+// must check the max produce batch size against the TRANSPORT's hard
+// per-message maximum, NOT against replication's requested fetch chunk size
+// (rune::replication::kDefaultMaxFetchBytes).  F3 round 2's progress rule
+// means a batch larger than the requested chunk size is still served ALONE
+// whenever it fits the transport's real hard maximum — the fetch chunk size
+// is irrelevant to whether a batch is PERMANENTLY unfetchable.
+// ---------------------------------------------------------------------------
+
+// A config where the requested fetch chunk (1 MiB, round 3 reverted this
+// back down from round 2's wrong 8 MiB) is SMALLER than the max produce
+// batch (8 MiB) must still be ALLOWED, as long as the hard transport maximum
+// covers the produce batch.  Round 2's original (now-corrected) check would
+// have wrongly refused exactly this — the whole point of this round's fix.
+TEST(BrokerNodeRegression, ConfigValidationAllowsFetchBelowMaxBatchRegression) {
+    constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u; // ClientGateway default
+    constexpr int32_t kFetchChunkBytes = 1 << 20;                     // kDefaultMaxFetchBytes
+    ASSERT_LT(static_cast<std::size_t>(kFetchChunkBytes), kMaxProduceBatchBytes)
+        << "test setup: proving the (smaller) fetch chunk size no longer matters";
+    // Hard transport maximum (10 MiB) comfortably covers the 8 MiB produce
+    // batch, even though it exceeds the 1 MiB fetch chunk size.
+    auto err = validateReplicationFetchCeiling(kMaxProduceBatchBytes,
+                                               /*hardTransportMaxBytes=*/10 * 1024 * 1024);
+    EXPECT_FALSE(err.has_value()) << (err ? *err : "(no error)");
+}
+
+// The pure decision function: a produce batch exceeding the hard transport
+// maximum must be refused, with the exact numbers named in the message.
+TEST(BrokerNodeRegression, ConfigValidationRefusesBatchAboveHardTransportMaxRegression) {
+    auto err = validateReplicationFetchCeiling(/*maxProduceBatchBytes=*/8 * 1024 * 1024,
+                                               /*hardTransportMaxBytes=*/1 * 1024 * 1024);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find(std::to_string(8 * 1024 * 1024)), std::string::npos) << *err;
+    EXPECT_NE(err->find(std::to_string(1 * 1024 * 1024)), std::string::npos) << *err;
+}
+
+// End-to-end: BrokerNode::start() refuses, before any side effect, a
+// genuinely multi-node config whose Aeron/ring sizing cannot carry the
+// gateway's max accepted produce batch.  Single-node is deliberately exempt
+// (no follower can ever hit this — see BrokerNode.cpp's comment), so this
+// test must use a 2-node config to exercise the check at all.
+TEST(BrokerNodeRegression, ReplicationFetchCeilingTooSmallRefusesStartBeforeAnySideEffect) {
+    const fs::path dir = makeTempDataDir("replceiling_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    PeerConfig peer1;
+    peer1.id = 1;
+    peer1.host = "127.0.0.1";
+    peer1.consensusPort = 40113;
+    cfg.peers.push_back(peer1);
+    ASSERT_FALSE(cfg.isSingleNode()) << "test setup: must be multi-node to exercise the check";
+    // Shrink both knobs replicationHardTransportMaxBytes() takes the min of,
+    // far below the gateway's 8 MiB default max produce batch.
+    cfg.aeronTermBufferBytes = 64 * 1024;
+    cfg.replicationOutboundRingBytes = 64 * 1024;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
 
 TEST(BrokerNodeRegression, StartNeverPumpsNodeDriverFromCallerThread) {
     const fs::path dir = makeTempDataDir("drvrace_");

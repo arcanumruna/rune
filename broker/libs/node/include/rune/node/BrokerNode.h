@@ -84,18 +84,43 @@ extern "C" {
 namespace rune::node {
 
 // ---------------------------------------------------------------------------
-// F3 fix-round-2, item A.4: startup config validation — a produced batch must
-// never be larger than what replication's fetch path can ever deliver to a
-// follower (otherwise it is PERMANENTLY unfetchable: kErrRecordTooLarge
-// forever, with no config knob to fix it after the fact).  Pure/testable —
-// BrokerNode::start() calls this with the two actual compile-time defaults
-// (rune::gateway::ClientGateway::kMaxProduceBatchBytes and
-// rune::replication::kDefaultMaxFetchBytes) before any other side effect,
-// same pattern as NodeConfig::validateShardConfig().
-// Returns an error message if maxFetchBytes < maxProduceBatchBytes, else nullopt.
+// F3 round 3 (corrects fix-round-2 item A.4): startup config validation — a
+// produced batch must never be larger than the TRANSPORT'S HARD PER-MESSAGE
+// MAXIMUM (the only case that is genuinely, permanently unfetchable —
+// kErrRecordTooLarge forever, no config knob fixes it after the fact).
+//
+// This is deliberately NOT a check against replication's requested fetch
+// chunk size (rune::replication::kDefaultMaxFetchBytes): F3 round 2's
+// progress rule means a batch larger than that value is still served ALONE
+// whenever it fits the transport's real hard maximum — see
+// PartitionReplica::onFetchRequest / pushToFollowers and
+// PartitionTransport::maxFetchResponseBytes().  Checking against the fetch
+// chunk size (round 2's original, now-corrected mistake) would wrongly
+// refuse configs the progress rule already handles correctly, and "fixing"
+// a refusal by raising the fetch chunk size (round 2's actual mistake)
+// changes replication chunking/latency for every topic with no benchmark —
+// a real risk against the p99 <=100µs target — for no benefit.
+//
+// Pure/testable.  BrokerNode::start() calls this with the gateway's actual
+// max accepted produce-batch size and the ACTIVE transport's real hard
+// per-message maximum (computed from NodeConfig's Aeron/ring sizing —
+// before any side effect), same pattern as NodeConfig::validateShardConfig().
+// Returns an error message (naming the exact numbers) if maxProduceBatchBytes
+// exceeds hardTransportMaxBytes, else nullopt.
 // ---------------------------------------------------------------------------
 [[nodiscard]] std::optional<std::string> validateReplicationFetchCeiling(
-        int32_t maxFetchBytes, std::size_t maxProduceBatchBytes);
+        std::size_t maxProduceBatchBytes, int32_t hardTransportMaxBytes);
+
+/// F3 round 3: compute the ACTIVE replication transport's real hard
+/// per-message maximum from config, mirroring the same conservative formula
+/// PartitionTransport::maxFetchResponseBytes()'s overrides use at runtime —
+/// min(the outbound marshalling ring's capacity, the Aeron embedded driver's
+/// term buffer length) / 8 (Aeron's maxMessageLength = termLength/8 rule;
+/// agrona's ring maxMsgLength = capacity/8 rule), minus the FetchResponse
+/// framing overhead.  Computable at startup, before any Aeron driver/pub
+/// exists (NodeConfig values only) — used by BrokerNode::start()'s
+/// validateReplicationFetchCeiling() call.
+[[nodiscard]] int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept;
 
 // ---------------------------------------------------------------------------
 // NullSink — no-op outbound transport (sufficient for 1-node; BR-3 replaces)

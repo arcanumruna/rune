@@ -46,18 +46,36 @@ namespace rune::node {
 static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 
 // ---------------------------------------------------------------------------
-// F3 fix-round-2, item A.4
+// F3 round 3 (corrects fix-round-2 item A.4) — see BrokerNode.h doc comments.
 // ---------------------------------------------------------------------------
+int32_t replicationHardTransportMaxBytes(const NodeConfig& config) noexcept {
+    // Aeron: maxMessageLength = termLength/8.  Agrona ManyToOneRingBuffer:
+    // maxMsgLength = capacity/8.  The ACTIVE transport is bounded by
+    // whichever applies to it; take the min of both so this is a safe
+    // (never-too-large) estimate regardless of which transport kind is
+    // configured — same conservative-estimate spirit as
+    // AeronPartitionTransport::maxFetchResponseBytes()'s own ring-only choice.
+    const int64_t ringBound = static_cast<int64_t>(config.replicationOutboundRingBytes) / 8;
+    const int64_t termBound = static_cast<int64_t>(config.aeronTermBufferBytes) / 8;
+    int64_t ceiling = std::min(ringBound, termBound);
+    ceiling -= static_cast<int64_t>(rune::replication::FetchResponseMsg::encodedSize(0));
+    if (ceiling < 0) ceiling = 0;
+    if (ceiling > INT32_MAX) ceiling = INT32_MAX;
+    return static_cast<int32_t>(ceiling);
+}
+
 std::optional<std::string> validateReplicationFetchCeiling(
-        int32_t maxFetchBytes, std::size_t maxProduceBatchBytes) {
-    if (static_cast<std::size_t>(maxFetchBytes) < maxProduceBatchBytes) {
-        return "replication maxFetchBytes (" + std::to_string(maxFetchBytes) +
-               ") is smaller than the max accepted produce-batch size (" +
-               std::to_string(maxProduceBatchBytes) + ") — a producible batch "
-               "would be PERMANENTLY unfetchable by replication "
-               "(kErrRecordTooLarge forever, no way to recover without a code "
-               "change).  See rune::replication::kDefaultMaxFetchBytes and "
-               "rune::gateway::ClientGateway::kMaxProduceBatchBytes.";
+        std::size_t maxProduceBatchBytes, int32_t hardTransportMaxBytes) {
+    if (hardTransportMaxBytes < 0 ||
+        maxProduceBatchBytes > static_cast<std::size_t>(hardTransportMaxBytes)) {
+        return "the max accepted produce-batch size (" + std::to_string(maxProduceBatchBytes) +
+               " bytes) exceeds this transport's hard per-message maximum (" +
+               std::to_string(hardTransportMaxBytes) + " bytes) — such a batch would be "
+               "PERMANENTLY unfetchable by replication (kErrRecordTooLarge forever, no way "
+               "to recover without a config change).  Raise replicationOutboundRingBytes "
+               "and/or aeronTermBufferBytes so the hard transport maximum covers the largest "
+               "producible batch (rune::gateway::ClientGateway::kMaxProduceBatchBytes), or "
+               "lower the gateway's accepted max batch size.";
     }
     return std::nullopt;
 }
@@ -93,16 +111,30 @@ void BrokerNode::start() {
                                  "]: refusing to start — " + *err);
     }
 
-    // F3 fix-round-2, item A.4: refuse to start if replication's fetch ceiling
-    // could never deliver the largest batch the gateway accepts — see
-    // validateReplicationFetchCeiling().  Same hard-refusal-before-any-side-
-    // effect pattern as the shard-config check above.
-    if (auto err = validateReplicationFetchCeiling(
-            rune::replication::kDefaultMaxFetchBytes,
-            rune::gateway::ClientGateway::kMaxProduceBatchBytes);
-        err.has_value()) {
-        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
-                                 "]: refusing to start — " + *err);
+    // F3 round 3 (corrects fix-round-2 item A.4): refuse to start if the
+    // gateway's largest accepted produce batch could never be delivered at
+    // all by the ACTIVE transport's hard per-message maximum — see
+    // validateReplicationFetchCeiling()'s doc comment for why this checks
+    // the hard transport maximum, not replication's requested fetch chunk
+    // size.  Same hard-refusal-before-any-side-effect pattern as the
+    // shard-config check above.
+    //
+    // Single-node (isSingleNode(): no peers) is exempt: with no follower to
+    // ever fetch from or push to, PartitionReplica::onFetchRequest()/
+    // pushToFollowers() are never reached regardless of batch size (both
+    // bail out immediately when the ISR has no member other than self) — the
+    // invariant this check protects is vacuously true, not merely untested.
+    // A node that later joins a multi-node cluster via dynamic membership is
+    // outside this startup check's scope, same as every other startup-only
+    // validation in this function.
+    if (!config_.isSingleNode()) {
+        if (auto err = validateReplicationFetchCeiling(
+                rune::gateway::ClientGateway::kMaxProduceBatchBytes,
+                replicationHardTransportMaxBytes(config_));
+            err.has_value()) {
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                     "]: refusing to start — " + *err);
+        }
     }
 
     using sclock = std::chrono::steady_clock;

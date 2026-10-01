@@ -107,20 +107,23 @@ inline constexpr int16_t kErrReconcileDeferred = -5;
 // PartitionReplica::onFetchRequest / FollowerSync::forceBehind().
 inline constexpr int16_t kErrRecordTooLarge    = -6;
 
-// F3 fix-round-2, item A.4: the default replication fetch-ceiling used for
-// every PartitionConfig across the broker (see BrokerNode.cpp).  MUST be >=
-// rune::gateway::ClientGateway::kMaxProduceBatchBytes (currently also 8 MiB —
-// replication cannot depend on the gateway library, so the two are each
-// named constants in their own layer, cross-checked at startup rather than
-// sharing a single definition) — see validateReplicationFetchCeiling() in
-// BrokerNode.cpp, which refuses to start otherwise.
+// The default replication fetch-ceiling (requested chunk size) used for
+// every PartitionConfig across the broker (see BrokerNode.cpp).  This is
+// deliberately NOT required to cover the gateway's max accepted produce
+// batch: F3 round 2's progress rule means a first batch larger than this
+// value is still served ALONE whenever it fits the transport's real hard
+// per-message maximum (see onFetchRequest/pushToFollowers and
+// PartitionTransport::maxFetchResponseBytes()) — only a batch that exceeds
+// even that hard transport maximum is genuinely unfetchable
+// (kErrRecordTooLarge).  See validateReplicationFetchCeiling() in
+// BrokerNode.cpp, which startup-validates THAT constraint instead.
 //
-// Was 1 MiB before F3 fix-round-2: strictly smaller than the gateway's 8 MiB
-// kMaxProduceBatchBytes, meaning any produced batch between 1 and 8 MiB was
-// PERMANENTLY unfetchable by replication (kErrRecordTooLarge forever, no
-// recovery) — a real, reachable-by-default latent bug the review's item A.4
-// surfaced, not a hypothetical misconfiguration.  Raised to match.
-inline constexpr int32_t kDefaultMaxFetchBytes = 8 * 1024 * 1024;
+// F3 round 2 briefly raised this to 8 MiB to (wrongly) paper over a gap that
+// the progress rule above already closes correctly; round 3 reverted it to
+// 1 MiB — raising it changes replication chunking/latency for every topic
+// with no benchmark, a real risk against the p99 <=100µs target, and is not
+// needed now that the progress rule handles the oversize case correctly.
+inline constexpr int32_t kDefaultMaxFetchBytes = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // PartitionConfig — constructor argument bundle
