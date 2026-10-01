@@ -1037,6 +1037,12 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
         workerPool_->worker(i).setMaxOwedReturns(static_cast<std::size_t>(config_.workerMaxOwedReturns));
+        // F15 S3 (re-review 2 B-1): ONE client-visible batch limit on every path.
+        workerPool_->worker(i).setMaxBatchBytes(Worker::maxAcceptableBatchBytes(
+            static_cast<std::size_t>(config_.workerIngressRingBytes),
+            static_cast<std::size_t>(config_.workerReturnRingBytes),
+            static_cast<std::size_t>(config_.replicationOutboundRingBytes),
+            static_cast<std::size_t>(config_.aeronTermBufferBytes)));
     }
 
     // F15 S3 (§6): each worker re-checks its own return ring (defence in depth
@@ -1806,7 +1812,7 @@ void BrokerNode::buildGateway() {
     // worker's SPSC ingress ring.  Both setters are null-safe (no-op when
     // workerPool_ is null, which happens when no topics are configured).
     if (gateway_ && workerPool_) {
-        gateway_->setWorkerPool(workerPool_.get());
+        gateway_->setWorkerPool(workerPool_.get());   // narrows the batch limit to the workers'
     }
     // Round 5: an incarnation wrap must skip values the F7 owner map still holds.
     if (workerPool_ && replicaRegistry_)

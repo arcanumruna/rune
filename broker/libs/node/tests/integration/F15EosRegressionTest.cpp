@@ -2294,7 +2294,7 @@ TEST(ReturnOverflowRegression, ShardIngressOversizeBatchRejectedMessageTooLarge)
     Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
     NullTransport t;
     PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
-    Worker w(0, 1 << 20, 64u << 20);   // 8 MiB max return message: the 8 MiB produce cap binds
+    Worker w(0, 64u << 20, 64u << 20);   // 8 MiB max op / return message: the 8 MiB produce cap binds
     w.setOwnedDirect(Worker::OwnedSet{&rep});
     w.setWorkerIngress(nullptr, true);
     const auto over = produceFrame(1, 9, bigBatch(Worker::kMaxProduceBatchBytes + 1024), /*acks=*/0, 1, 0);
@@ -2515,6 +2515,10 @@ namespace {
             R.gw.applySubscribeForTest(frame.data(), frame.size());
         };
         LegacyAcksRig R({1});                                // pool rings 64 KiB: 8 KiB max message
+        // Records pushed to a test session (no egress publication) arrive here.
+        R.gw.setOnEgressFrame([&R](int64_t, const uint8_t* b, std::size_t n) {
+            if (auto rec = pc::Records::decode(b, n)) R.records.emplace_back(rec->subscriptionId, rec->baseOffset);
+        });
         const auto big = bigBatch(16 * 1024);
         (void)R.r->log()->append(big, 0);                    // on disk from an earlier config
         const auto small = batchAt(1);

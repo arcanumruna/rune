@@ -1240,6 +1240,13 @@ void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
     }
 }
 
+void ClientGateway::setWorkerPool(rune::node::WorkerPool* pool) noexcept {
+    workerPool_ = pool;
+    if (!pool) return;
+    for (int32_t i = 0; i < pool->workerCount(); ++i)
+        maxProduceBatchBytes_ = std::min(maxProduceBatchBytes_, pool->worker(i).maxIntakeBatchBytes());
+}
+
 void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
                                        rune::protocol::client::ErrorCode code)
 {
@@ -3228,9 +3235,27 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                               "worker answered error {} (a stored batch exceeds the worker return ring)",
                               ret.subscriptionId, ret.readTopicId, ret.readPartition, ret.newNextOffset,
                               ret.errorCode);
-                if (Session* session = sessions_.find(ret.sessionId))
-                    sendErrorResponse_(*session, ret.sessionId, ret.subscriptionId,
-                                       static_cast<pc::ErrorCode>(ret.errorCode));
+                // Re-review 2 m-f: correlationId 0 — a subscription id shares no
+                // namespace with client correlation ids (the C++ client would
+                // match it against a pending connect / ping); the subscription is
+                // named in the message.  Client routing of subscription-scoped
+                // errors: client-track ticket.
+                if (Session* session = sessions_.find(ret.sessionId)) {
+                    pc::ErrorResponse errResp;
+                    errResp.sessionId     = ret.sessionId;
+                    errResp.correlationId = 0;
+                    errResp.code          = ret.errorCode;
+                    char msg[160];
+                    const int m = std::snprintf(msg, sizeof msg,
+                        "subscription %lld topic %d partition %d offset %lld: batch exceeds the broker return ring",
+                        static_cast<long long>(ret.subscriptionId), ret.readTopicId, ret.readPartition,
+                        static_cast<long long>(ret.newNextOffset));
+                    errResp.message = std::string_view(msg, m > 0 ? static_cast<std::size_t>(std::min(m, 159)) : 0);
+                    const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 +
+                                               errResp.message.size();
+                    if (needed <= scratch_.size())
+                        enqueueOrBestEffort_(*session, scratch_.data(), errResp.encode(scratch_.data()));
+                }
                 return;
             }
 

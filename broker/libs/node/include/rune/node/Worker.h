@@ -73,6 +73,7 @@
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/WorkerOp.h>
 #include <rune_protocol_internal_sbe/WorkerReturn.h>
+#include <rune_protocol_internal_sbe/OutboundFrame.h>
 #include <rune_protocol_internal_sbe/OpType.h>
 #include <rune_protocol_internal_sbe/ReturnType.h>
 #include <rune_protocol_internal_sbe/TailKind.h>
@@ -173,6 +174,10 @@ public:
     static constexpr int kExitInvariantViolation = 70;
     /// Op-ring drain pauses while the return FIFO holds at least this many.
     static constexpr std::size_t kOverflowHighWater = 1024;
+    /// A high-water pause EPISODE (logged on entry / exit) ends only at or
+    /// below this (hysteresis, re-review 2 B-2); the drain itself still resumes
+    /// below kOverflowHighWater.
+    static constexpr std::size_t kOverflowLowWater = kOverflowHighWater / 2;
     /// Default static cap on owed returns (G-A6 reservation): parked acks=all +
     /// durablePending_ + owed Strict facts.  Configurable per worker
     /// (RUNE_WORKER_MAX_OWED_RETURNS → setMaxOwedReturns) within
@@ -234,15 +239,58 @@ public:
     [[nodiscard]] bool returnRingCoversMaxPushChunk() const {
         return static_cast<std::size_t>(ret_.maxMsgLength()) >= maxPushReadResultBytes();
     }
-    /// Largest batch the Legacy intake path (gateway → op ring) can store:
-    /// min(max produce batch, ingress max message − op framing).  The shard
-    /// intake path (client → worker ingress) is bounded PER WORKER by its own
-    /// return ring (maxIntakeBatchBytes_, MessageTooLarge above it — re-review 1
-    /// I-3), so the Aeron term size never enters.  Replication only copies
-    /// batches a leader stored.
-    [[nodiscard]] static constexpr std::size_t maxStorableBatchBytes(std::size_t ingressRingBytes) noexcept {
-        const std::size_t ingressMax = ingressRingBytes / 8;
-        return std::min(kMaxProduceBatchBytes, ingressMax > opFixedBytes() ? ingressMax - opFixedBytes() : 0);
+    /// Fixed framing of one replicated FetchResponse on the wire (header + block
+    /// + records length) and of its OutboundFrame envelope on the control
+    /// transport's outbound ring.
+    [[nodiscard]] static std::size_t replicationFrameFixedBytes() {
+        return rune::replication::FetchResponseMsg::encodedSize(0);
+    }
+    [[nodiscard]] static constexpr std::size_t outboundEnvelopeFixedBytes() noexcept {
+        return static_cast<std::size_t>(sbe::MessageHeader::encodedLength()) +
+               sbe::OutboundFrame::sbeBlockLength() +
+               static_cast<std::size_t>(sbe::OutboundFrame::payloadHeaderLength());
+    }
+    /// Re-review 2 B-1 / m-g: THE client-visible batch limit — the largest
+    /// record batch any intake path accepts (the gateway's MessageTooLarge
+    /// guard and the shard-ingress guard both use exactly this value, set by
+    /// BrokerNode), and therefore the largest batch the broker can store:
+    ///   min(8 MiB ceiling,
+    ///       worker op ring max message − op framing      (gateway → worker op),
+    ///       worker return ring max message − return framing  (one PushReadResult),
+    ///       replication outbound ring max message − envelope − FetchResponse framing,
+    ///       replication Aeron max message (min(16 MiB, term / 8)) − FetchResponse framing).
+    /// F18 (large-batch replication) adopts this function as is.
+    [[nodiscard]] static std::size_t maxAcceptableBatchBytes(std::size_t ingressRingBytes,
+                                                             std::size_t returnRingBytes,
+                                                             std::size_t replOutboundRingBytes,
+                                                             std::size_t aeronTermBufferBytes) {
+        auto fit = [](std::size_t maxMsg, std::size_t fixed) { return maxMsg > fixed ? maxMsg - fixed : 0; };
+        const std::size_t repl = replicationFrameFixedBytes();
+        const std::size_t aeronMax = std::min<std::size_t>(16u * 1024u * 1024u, aeronTermBufferBytes / 8);
+        return std::min({kMaxProduceBatchBytes,
+                         fit(ingressRingBytes / 8, opFixedBytes()),
+                         fit(returnRingBytes / 8, returnFixedBytes()),
+                         fit(replOutboundRingBytes / 8, outboundEnvelopeFixedBytes() + repl),
+                         fit(aeronMax, repl)});
+    }
+    /// The part of the limit this worker's own rings impose (op + return ring,
+    /// under the 8 MiB ceiling) — the default and the upper bound for
+    /// setMaxBatchBytes.
+    [[nodiscard]] std::size_t ringBatchFit_() const {
+        const std::size_t opMax  = static_cast<std::size_t>(ingress_.maxMsgLength());
+        const std::size_t retMax = static_cast<std::size_t>(ret_.maxMsgLength());
+        return std::min({kMaxProduceBatchBytes,
+                         opMax > opFixedBytes() ? opMax - opFixedBytes() : 0,
+                         retMax > returnFixedBytes() ? retMax - returnFixedBytes() : 0});
+    }
+    /// Startup (before the runner starts): this worker's intake limit, normally
+    /// maxAcceptableBatchBytes(config).  Refused loudly if 0 or above what its
+    /// own rings can carry.
+    void setMaxBatchBytes(std::size_t n) {
+        if (n == 0 || n > ringBatchFit_())
+            throw std::invalid_argument("Worker::setMaxBatchBytes: " + std::to_string(n) +
+                                        " outside (0, " + std::to_string(ringBatchFit_()) + "]");
+        maxIntakeBatchBytes_ = n;
     }
     /// F15 §6 + review S3 I-1 / re-review 1 I-3: the return ring's max message
     /// must hold max(one full PushReadResult chunk, the largest batch the Legacy
@@ -255,14 +303,15 @@ public:
     /// halt: re-review 1 I-4.)
     [[nodiscard]] static std::optional<std::string> validateRingConfig(
         std::size_t returnRingBytes, std::size_t ingressRingBytes, int64_t maxOwedReturns) {
-        const std::size_t retMax   = returnRingBytes / 8;
-        const std::size_t storable = maxStorableBatchBytes(ingressRingBytes);
-        const std::size_t need     = std::max(maxPushReadResultBytes(), storable + returnFixedBytes());
+        // Every intake path refuses a batch above maxAcceptableBatchBytes (which
+        // is <= the return-ring fit), so a stored batch always fits one
+        // PushReadResult; what remains is one full 512 KiB PushRead chunk.
+        const std::size_t retMax = returnRingBytes / 8;
+        const std::size_t need   = maxPushReadResultBytes();
         if (retMax < need)
             return "RUNE_WORKER_RETURN_RING_BYTES=" + std::to_string(returnRingBytes) +
                    " is too small: its max message (capacity / 8 = " + std::to_string(retMax) +
-                   " B) must hold " + std::to_string(need) + " B (the largest storable batch " +
-                   std::to_string(storable) + " B or a 512 KiB PushRead chunk, plus the return header)";
+                   " B) must hold one " + std::to_string(need) + " B PushReadResult (512 KiB chunk + header)";
         if (returnRingBytes < ingressRingBytes)
             return "RUNE_WORKER_RETURN_RING_BYTES=" + std::to_string(returnRingBytes) +
                    " must be >= RUNE_WORKER_INGRESS_RING_BYTES=" + std::to_string(ingressRingBytes);
@@ -296,12 +345,7 @@ public:
     [[nodiscard]] uint64_t pushReadOversizeForTest() const noexcept { return pushReadOversize_; }
     [[nodiscard]] uint64_t retFifoPauseEpisodesForTest() const noexcept { return retFifoPauseEpisodes_; }
     [[nodiscard]] uint64_t owedCapEpisodesForTest() const noexcept { return owedCapEpisodes_; }
-    // F15 S3 fix round 3 — RED stubs (behaviour-preserving) / accessors.
-    [[nodiscard]] static std::size_t maxAcceptableBatchBytes(std::size_t /*ingressRingBytes*/,
-        std::size_t /*returnRingBytes*/, std::size_t /*replOutboundRingBytes*/, std::size_t /*aeronTermBufferBytes*/) {
-        return kMaxProduceBatchBytes;
-    }
-    void setMaxBatchBytes(std::size_t /*n*/) {}
+    // F15 S3 fix round 3 accessors.
     [[nodiscard]] std::size_t maxIntakeBatchBytes() const noexcept { return maxIntakeBatchBytes_; }
     [[nodiscard]] bool retFifoPausedForTest() const noexcept { return retFifoPaused_; }
     [[nodiscard]] bool owedCapThrottlingForTest() const noexcept { return owedCapThrottling_; }
@@ -340,7 +384,7 @@ public:
         subs_.reserve(kSubsReserve);
         validators_.reserve(kValidatorsReserve);
         egressScratch_.resize(kEgressScratchSize);
-        maxIntakeBatchBytes_ = std::min(kMaxProduceBatchBytes, pushReadChunkFit_());
+        maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
 
@@ -1345,7 +1389,8 @@ private:
         // the control thread drains ret_ every cycle and never waits on an op
         // ring, so the FIFO always flushes (no deadlock).
         int limit = ingressDrainLimit_;
-        if (retFifoPaused_ && retFifo_.size() < kOverflowHighWater) [[unlikely]] leaveRetFifoPause_();
+        // Re-review 2 B-2: hysteresis — the episode ends only at low water.
+        if (retFifoPaused_ && retFifo_.size() <= kOverflowLowWater) [[unlikely]] leaveRetFifoPause_();
         if (const std::size_t backlog = retFifo_.size(); backlog != 0) [[unlikely]] {
             if (backlog >= kOverflowHighWater) {
                 ++retFifoHighWaterPauses_;
@@ -3889,9 +3934,10 @@ private:
         spdlog::warn("Worker {}: owed-return cap {} reached ({}) — intake throttled, episode {} "
                      "(RUNE_WORKER_MAX_OWED_RETURNS)", workerId_, maxOwedReturns_, where, owedCapEpisodes_);
     }
-    // Leaves the episode once one more owed return fits again (checked each pass).
+    // Re-review 2 B-2: hysteresis — the episode ends only once owed <= cap / 2
+    // (checked each pass), so owed oscillating at the cap is one episode.
     void checkOwedCapEpisodeEnd_() noexcept {
-        if (owedCapThrottling_ && owedCapAllows_(1)) [[unlikely]] {
+        if (owedCapThrottling_ && reservedAckSlots_() <= static_cast<int64_t>(maxOwedReturns_ / 2)) [[unlikely]] {
             owedCapThrottling_ = false;
             spdlog::info("Worker {}: owed-return cap episode {} ended — {} throttled intake events over {} ns "
                          "(total {})", workerId_, owedCapEpisodes_, owedCapThrottles_ - owedCapThrottlesAtEntry_,

@@ -352,8 +352,15 @@ public:
     // Must be called before doWork() on the duty-cycle thread (single-writer).
     // The pointer is non-owning; the WorkerPool must outlive the gateway.
     // -----------------------------------------------------------------------
-    void setWorkerPool(rune::node::WorkerPool* pool) noexcept {
-        workerPool_ = pool;
+    // F15 S3 (re-review 2 B-1): also narrows the produce batch limit to the
+    // pool's worker intake limit, so a gateway-routed batch the worker op /
+    // return ring cannot carry is answered MessageTooLarge, never thrown.
+    void setWorkerPool(rune::node::WorkerPool* pool) noexcept;
+    /// F15 S3 (re-review 2 B-1): THE client-visible batch limit
+    /// (rune::node::Worker::maxAcceptableBatchBytes(config), set by BrokerNode;
+    /// <= kMaxProduceBatchBytes).  The same value bounds the shard guard.
+    void setMaxProduceBatchBytes(std::size_t n) noexcept {
+        maxProduceBatchBytes_ = std::min(n, kMaxProduceBatchBytes);
     }
 
     [[nodiscard]] rune::node::WorkerPool* workerPool() const noexcept {
