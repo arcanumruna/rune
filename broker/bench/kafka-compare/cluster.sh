@@ -38,9 +38,11 @@ rune_start_cluster() {
   local termb="${RUNE_AERON_TERM_BUFFER_BYTES:-33554432}"
   local iring="${RUNE_WORKER_INGRESS_RING_BYTES:-33554432}"
   local rring="${RUNE_WORKER_RETURN_RING_BYTES:-33554432}"
-  # F18: the replication outbound ring's frame (/8) bounds the largest replicable
-  # batch; 32 MiB → ~4 MiB, so the bench's 1-2 MiB client batches are accepted
-  # (the 4 MiB default would auto-limit produce batches to ~512 KiB).
+  # F18: the replication outbound ring's frame (/8) bounds the produce intake
+  # limit AND each replication message.  32 MiB → ~4 MiB frames: the intake limit
+  # matches the 32 MiB term, and a full 1 MiB (maxFetchBytes) push/fetch prefix
+  # fits one frame (the 4 MiB default caps both at ~512 KiB).  NB the bench client
+  # emits batches <= min(RUNE_BATCH_BYTES, RUNE_MAX_FRAME_BYTES = 64 KiB default).
   local oring="${RUNE_REPL_OUTBOUND_RING_BYTES:-33554432}"
   local peers; peers="$(rune_cluster_peers)"
   pkill -9 -x rune_broker 2>/dev/null; sleep 0.5

@@ -100,7 +100,9 @@ net.core.netdev_max_backlog=100000
 4. Produce intake limit (F18) = min(8M, every hop's one-frame capacity): `RUNE_WORKER_INGRESS_RING_BYTES/8`
    and, multi-node, `RUNE_REPL_OUTBOUND_RING_BYTES/8` and `min(RUNE_AERON_TERM_BUFFER_BYTES/8, 16M)` (each minus
    a few hundred bytes of framing).  Larger batches → MessageTooLarge (never a startup refusal).  Defaults
-   give ~512 KiB; the profile above gives ~4 MiB — keep the client's `RUNE_BATCH_BYTES` below it.
+   give ~512 KiB; the profile above gives ~4 MiB — keep the client's `min(RUNE_BATCH_BYTES, RUNE_MAX_FRAME_BYTES)`
+   below it.  A batch STORED above the current frame (e.g. after shrinking these sizes) is unreplicable: the
+   leader answers kErrRecordTooLarge and followers wedge at that offset and leave the ISR (logged + counted).
 
 ### ccx23 runtime note
 gcc-13 binaries need newer libstdc++ → copy build-agent's `libstdc++.so.6` to `/root/rune-libs` +
