@@ -41,6 +41,18 @@
 
 namespace rune::client {
 
+namespace {
+// F8c fix round 1 (I1): the Client this thread is closing (set right after the
+// runner join, cleared when closeImpl_ returns).  Per-THREAD state — never
+// shared: it lets a Completions released by user code that close() itself runs
+// (a callable destroyed by the final drain, a callback during teardown)
+// recognise that its thread already owns every duty structure, and release
+// directly instead of waiting for a hand-back only this thread would perform.
+thread_local const Client* tClosing = nullptr;
+// F8c fix round 1 (I3 / m6): a distinct token per *AndWait call on this thread.
+thread_local Token tWaitToken = 0;
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Helper: build AgentConfig from ClientConfig
 // ---------------------------------------------------------------------------
@@ -161,7 +173,7 @@ Client::Client(ClientConfig cfg)
     pendingCtl_.reserve(64);
     ctlScratch_.reserve(512);
     cqSlots_.reserve(kMaxCqs);
-    cqFree_.reserve(kMaxCqs);
+    cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
     subscriberHub_.setSessionConnected(false);
     // F8a fix2: Unsubscribe / OffsetCommit frames go straight to the transport
@@ -275,20 +287,17 @@ void Client::closeImpl_() {
     // From here this thread owns every duty-side structure (the join / the
     // Invoker contract orders it after the last duty cycle).
     closing_ = true;
+    struct ClosingMark {  // I1: this thread is the closer until closeImpl_ returns
+        const Client* prev;
+        explicit ClosingMark(const Client* c) : prev(tClosing) { tClosing = c; }
+        ~ClosingMark() { tClosing = prev; }
+    } closingMark(this);
 
     // Single-threaded from here.  Drain the command ring up to its (now frozen)
     // tail: registrations are adopted (their holders freed, the failAll below
     // reaches them), hub commands applied, completion queues added / released,
     // and every accepted control op completes — Closed (closing_).
     (void)agent_.drainRegistrationsForClose();
-
-    // F8c C2/C3: every outstanding control op completes Closed, then every
-    // registered Completions is handed back (producer-closed: its owner sees
-    // the Closed records, then finished()).  Done BEFORE the teardown below
-    // fires user callbacks (onRevoked, ...), so a callback that destroys a
-    // Completions finds it already handed back and never waits on this close.
-    failAllControl_(OpStatus::Closed);
-    closeCqRegistry_();
 
     // fix1 C2/I3: mark every producer's ring closed NOW — the Client (and its
     // pump-hook contexts, each `this`) is still fully valid, and this runs
@@ -342,6 +351,19 @@ void Client::closeImpl_() {
     // latch.  Safe as a plain write: the runner thread was joined above, so this
     // runs single-threaded (no concurrent agent-thread access) — Task 1.1.
     redirectPending() = false;
+
+    // F8c (spec §4 order): after producers, txn producers and group consumers
+    // have failed their ops, the control tables complete Closed, and only then
+    // is every registered Completions handed back (producer-closed: its owner
+    // sees every Closed record, then finished()) — so no completion delivered
+    // during close is dropped.  A queue released by user code that this close
+    // runs (above) was freed directly (tClosing, I1), never waited on.
+    failAllControl_(OpStatus::Closed);
+    closeCqRegistry_();
+    // I2: nothing reads the command ring any more — even if the drain above
+    // was abandoned behind an orphaned claim.  A Completions constructor still
+    // waiting for a CqAdd stranded there sees this and is born finished.
+    agent_.finishCommandRingConsumer();
 
     // F8c C3: handler-target completions deferred during the close (Closed),
     // now that every queue is handed back.
@@ -482,10 +504,25 @@ void Client::registerCq_(Completions& q) {
             idle.idle(0);  // full: the duty thread drains it (progress-based, no time bound)
         }
     }
-    // One duty round trip: the duty side answers in the queue's own ring.
+    // One duty round trip: the duty side answers in the queue's own ring.  The
+    // wait ends on ring words only: the registration record, the hand-back
+    // (producer-closed), or — I2 — the command ring's consumer finished with
+    // the CqAdd never read (an abandoned close drain).  Never a time bound.
     int64_t answer = -2;
-    const auto w = q.waitFor(Completions::kRegistrationToken, std::chrono::hours(24 * 365),
-                             [&](const Completion& c, std::span<const uint8_t>) { answer = c.value; });
+    auto onAnswer = [&](const Completion& c, std::span<const uint8_t>) { answer = c.value; };
+    DefaultWaitIdle idle;
+    Completions::Wait w = Completions::Wait::TimedOut;
+    for (;;) {
+        w = q.waitFor(Completions::kRegistrationToken, std::chrono::nanoseconds(0), onAnswer);
+        if (w != Completions::Wait::TimedOut) break;
+        if (agent_.commandRingConsumerFinished()) {
+            // Everything close() delivered happens-before that word: one more
+            // pass sees the answer if the CqAdd was ever applied.
+            w = q.waitFor(Completions::kRegistrationToken, std::chrono::nanoseconds(0), onAnswer);
+            break;
+        }
+        idle.idle(0);
+    }
     if (w == Completions::Wait::Done && answer >= 0) {
         q.cqRef_ = static_cast<CqRef>(answer);
         return;
@@ -495,7 +532,11 @@ void Client::registerCq_(Completions& q) {
         throw std::runtime_error("Completions: the Client's completion-queue registry is full (" +
                                  std::to_string(kMaxCqs) + " queues)");
     }
-    // NotPending: the Client closed and handed it back already — born finished.
+    // Never registered: the Client closed and handed it back (NotPending), or
+    // its CqAdd was stranded by an abandoned close drain (TimedOut).  Born
+    // finished: the registration credit returns, no duty side owns the ring.
+    q.unreserve(rec);
+    if (!q.ring_->producerClosed()) q.ring_->producerClose();
 }
 
 void Client::releaseCq_(Completions& q) noexcept {
@@ -503,7 +544,10 @@ void Client::releaseCq_(Completions& q) noexcept {
     const CqRef             ref  = q.cqRef_;
     // On the duty thread the registry is ours: unlink + free right here (also
     // inside a callback — a delivery never iterates the registry).
-    if (std::this_thread::get_id() == dutyThreadId_) {
+    // I1: likewise on the thread running this Client's close() (it owns every
+    // duty structure from the runner join on; a hand-back it is waiting for
+    // would be its own, later).
+    if (std::this_thread::get_id() == dutyThreadId_ || tClosing == this) {
         applyCqRelease_(ref, ring);
         return;
     }
@@ -530,13 +574,17 @@ void Client::applyCqAdd_(detail::CompletionRing* ring) {
     Completion reg;
     reg.token         = Completions::kRegistrationToken;
     reg.reservedBytes = detail::CompletionRing::completionRecordBytes(0);
+    // I3: fresh slots first, then the OLDEST released slot (FIFO), so a
+    // (slot, generation) pair repeats only after kMaxCqs x 32 releases (see
+    // kCqRefGenMask) — a stale op never matches a reused slot before that.
     uint32_t idx = 0;
-    if (!cqFree_.empty()) {
-        idx = cqFree_.back();
-        cqFree_.pop_back();
-    } else if (cqSlots_.size() < kMaxCqs) {
+    if (cqSlots_.size() < kMaxCqs) {
         idx = static_cast<uint32_t>(cqSlots_.size());
         cqSlots_.push_back({});
+    } else if (cqFreeCount_ != 0) {
+        idx = cqFree_[cqFreeHead_];
+        cqFreeHead_ = (cqFreeHead_ + 1) & (kMaxCqs - 1);
+        --cqFreeCount_;
     } else {
         reg.value = -1;  // full: not adopted — the queue keeps (and frees) its ring
         (void)ring->deliver(reg, {});
@@ -553,7 +601,8 @@ void Client::applyCqRelease_(CqRef ref, detail::CompletionRing* ring) {
         cqSlots_[idx].gen == cqRefGen(ref)) {
         cqSlots_[idx].ring = nullptr;
         cqSlots_[idx].gen  = static_cast<uint8_t>((cqSlots_[idx].gen + 1) & kCqRefGenMask);
-        cqFree_.push_back(static_cast<uint16_t>(idx));
+        cqFree_[(cqFreeHead_ + cqFreeCount_) & (kMaxCqs - 1)] = static_cast<uint16_t>(idx);
+        ++cqFreeCount_;
     }
     // An accepted release always transfers the ring to this side (§3.3 (a)).
     delete ring;
@@ -617,6 +666,9 @@ OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
     if (token > kMaxToken) return OpResult::InvalidArgument;
     if (target.cq == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
     if (frame.size() > agent_.maxFrameLength()) return OpResult::InvalidArgument;
+    // Liveness: a record the command ring can never carry is not "full" (a
+    // retry would loop forever) — it is rejected here, synchronously.
+    if (sizeof(ControlOpHeader) + frame.size() > agent_.commandMsgLimit()) return OpResult::InvalidArgument;
     const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
     if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) return OpResult::WrongThread;
 
@@ -838,9 +890,9 @@ void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux
 }
 
 Client::PendingCtl Client::takeCtl_(std::size_t i) {
+    // Ordered erase (m3): unsent frames keep their order; the table is small.
     PendingCtl p = std::move(pendingCtl_[i]);
-    if (i + 1 != pendingCtl_.size()) pendingCtl_[i] = std::move(pendingCtl_.back());
-    pendingCtl_.pop_back();
+    pendingCtl_.erase(pendingCtl_.begin() + static_cast<std::ptrdiff_t>(i));
     if (!p.unsentFrame.empty()) --unsentCtl_;
     return p;
 }
@@ -965,7 +1017,11 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
     qc.capacityBytes = cap;
     Completions q(*this, qc);
 
-    constexpr Token kToken = 1;
+    // A distinct token per call (m6): a completion for an earlier call can
+    // never be taken for this one's answer.
+    tWaitToken = (tWaitToken % kMaxToken) + 1;
+    const Token kToken = tWaitToken;
+    const auto issueDeadline = std::chrono::steady_clock::now() + timeout;
     aeron::concurrent::BackoffIdleStrategy backoff(
         10, 20, std::chrono::duration<long, std::nano>(1'000),
         std::chrono::duration<long, std::nano>(100'000));
@@ -973,6 +1029,9 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
         const OpResult r = issue(q, kToken);
         if (r == OpResult::Accepted) break;
         if (r == OpResult::BackPressured) {  // the command ring is full: let the duty thread drain
+            if (std::chrono::steady_clock::now() >= issueDeadline) {
+                throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
+            }
             if (cfg_.runnerMode == RunnerMode::Invoker) (void)doWork(); else backoff.idle(0);
             continue;
         }

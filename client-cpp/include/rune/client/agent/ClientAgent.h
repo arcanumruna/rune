@@ -245,6 +245,21 @@ public:
     bool closeCommandRing() noexcept { return ring_.close(); }
     /// Any thread: has closeCommandRing() run?  (acquire)
     [[nodiscard]] bool commandRingClosed() const noexcept { return ring_.closed(); }
+    /// F8c fix round 1 (I2): close() marks the command ring's consumer
+    /// finished once nothing will ever read it again (after its drain, even an
+    /// abandoned one); any thread may observe it (acquire).
+    void finishCommandRingConsumer() noexcept { ring_.consumerFinish(); }
+    [[nodiscard]] bool commandRingConsumerFinished() const noexcept { return ring_.consumerFinished(); }
+    /// Any thread: the command ring's tail position (acquire; test observer).
+    [[nodiscard]] std::int64_t commandRingTail() const noexcept { return ring_.tailPosition(); }
+    /// The largest command record (header + payload) the ring accepts.
+    [[nodiscard]] std::size_t commandMsgLimit() const noexcept {
+        const auto m = static_cast<std::size_t>(ring_.maxMsgLength());
+        return (testCommandMsgCap_ != 0 && testCommandMsgCap_ < m) ? testCommandMsgCap_ : m;
+    }
+    /// Test seams (set before the threads they affect run).
+    void testCapCommandMsgLength(std::size_t cap) noexcept { testCommandMsgCap_ = cap; }
+    void testDisableCloseDrainUnblock() noexcept { testCloseDrainNoUnblock_ = true; }
 
     /// Submit a CONNECT command.  Returns false if the ring is full.
     bool submitConnect() noexcept;
@@ -740,6 +755,8 @@ private:
     int testForcedOffers_ = 0;
     transport::AeronTransport::OfferResult testForcedOffer_ = transport::AeronTransport::OfferResult::Accepted;
     std::size_t testMaxFrameCap_ = 0;  // fix4 test seam (0 = uncapped)
+    std::size_t testCommandMsgCap_ = 0;  // F8c fix1 test seam (0 = uncapped)
+    bool        testCloseDrainNoUnblock_ = false;  // F8c fix1 test seam
     transport::AeronTransport::OfferResult offerIngress_(const uint8_t* buf, std::size_t len) noexcept;
     void noteFatalDrop_(std::size_t len) noexcept;
 

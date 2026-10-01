@@ -67,6 +67,7 @@ public:
         m_headPositionIndex         = m_capacity + HEAD_POSITION_OFFSET;
         m_correlationIdCounterIndex = m_capacity + CORRELATION_COUNTER_OFFSET;
         m_consumerHeartbeatIndex    = m_capacity + CONSUMER_HEARTBEAT_OFFSET;
+        m_consumerFinishedIndex     = m_capacity + CONSUMER_FINISHED_OFFSET;
     }
 
     M2ORingBuffer(const M2ORingBuffer&)            = delete;
@@ -112,6 +113,17 @@ public:
     }
     [[nodiscard]] std::int64_t consumerHeartbeatTime() const noexcept {
         return loadRelaxed64_(m_consumerHeartbeatIndex);
+    }
+
+    /// F8c fix round 1 (I2): the consumer will never read this ring again
+    /// (release).  Set after a close drain finished — even an ABANDONED one
+    /// (fix5): a producer still waiting for the outcome of a record it
+    /// committed observes this (acquire) and knows the record will never be
+    /// read.  A Rune extension in the trailer's spare cache line (the second
+    /// line of Aeron's padded heartbeat slot); the trailer length is unchanged.
+    void consumerFinish() noexcept { storeRelease64_(m_consumerFinishedIndex, 1); }
+    [[nodiscard]] bool consumerFinished() const noexcept {
+        return loadAcquire64_(m_consumerFinishedIndex) != 0;
     }
 
     /// tryClaim() result when the ring is closed (INSUFFICIENT_CAPACITY is -2).
@@ -462,6 +474,7 @@ private:
     static constexpr aeron::util::index_t HEAD_POSITION_OFFSET       = CL * 6;
     static constexpr aeron::util::index_t CORRELATION_COUNTER_OFFSET = CL * 8;
     static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10; // matches Aeron
+    static constexpr aeron::util::index_t CONSUMER_FINISHED_OFFSET   = CL * 11; // Rune (I2): spare line
     static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 12; // matches Aeron
     static constexpr aeron::util::index_t INSUFFICIENT_CAPACITY      = -2;
     // The tail word: bit 63 = closed (positions never reach 2^63), bits 0..62 =
@@ -657,6 +670,7 @@ private:
     aeron::util::index_t m_tailPositionIndex        = 0;
     aeron::util::index_t m_correlationIdCounterIndex = 0;
     aeron::util::index_t m_consumerHeartbeatIndex   = 0;
+    aeron::util::index_t m_consumerFinishedIndex = 0;
 };
 
 } // namespace rune::client::detail

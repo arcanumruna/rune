@@ -97,6 +97,10 @@ using CqRef = uint16_t;
 inline constexpr CqRef    kNoCqRef        = 0xFFFF;
 inline constexpr uint32_t kCqRefIndexBits = 10;
 inline constexpr uint32_t kMaxCqs         = 1u << kCqRefIndexBits;  // registry capacity
+/// 5-bit generation.  The registry hands out fresh slots first and then
+/// reuses the OLDEST released slot (FIFO), so a (slot, generation) pair can
+/// repeat only after kMaxCqs x 32 = 32768 releases while one stale op is
+/// still outstanding — the bound on "dropped, never misdelivered".
 inline constexpr uint32_t kCqRefGenMask   = 0x1F;
 [[nodiscard]] constexpr CqRef makeCqRef(uint32_t index, uint32_t gen) noexcept {
     return static_cast<CqRef>((index & (kMaxCqs - 1)) | ((gen & kCqRefGenMask) << kCqRefIndexBits));

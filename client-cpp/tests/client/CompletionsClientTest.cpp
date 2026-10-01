@@ -193,8 +193,7 @@ TEST(CompletionsClient, StaleCqRefIsDroppedByGenerationRegression) {
 
     rc::Completions b(client);
     const rc::CqRef refB = b.cqRef();
-    ASSERT_EQ(rc::cqRefIndex(refB), rc::cqRefIndex(refA)) << "the slot is reused";
-    ASSERT_NE(rc::cqRefGen(refB), rc::cqRefGen(refA)) << "with a new generation";
+    ASSERT_NE(refB, refA) << "never the released (slot, generation)";
 
     g_now += 200'000'000;  // past connectTimeoutMs and a sweep interval
     for (int i = 0; i < 10 && client.testPendingControlOps() != 0; ++i) client.doWork();
@@ -776,4 +775,169 @@ TEST(CompletionsClient, SubscribeCorrelationIdIsDutyAssignedRegression) {
     s1.reset();
     s2.reset();
     r.client.close();
+}
+
+// ===========================================================================
+// F8c C2+C3 fix round 1
+// ===========================================================================
+namespace {
+/// Hang guard: a deadlock FAILS the test (the process exits non-zero with a
+/// message) instead of hanging CI.  The watchdog's own wait is a backstop only.
+struct Watchdog {
+    std::atomic<bool> done{false};
+    std::thread       t;
+    explicit Watchdog(const char* what, int seconds = 30)
+        : t([this, what, seconds] {
+              for (int i = 0; i < seconds * 100 && !done.load(); ++i) {
+                  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+              }
+              if (!done.load()) {
+                  std::fprintf(stderr, "[  FAILED  ] watchdog: %s did not return within %d s (deadlock)\n",
+                               what, seconds);
+                  std::fflush(stderr);
+                  std::_Exit(3);
+              }
+          }) {}
+    ~Watchdog() {
+        done.store(true);
+        t.join();
+    }
+};
+
+std::atomic<bool> g_parkRunner{false};
+std::atomic<bool> g_runnerParked{false};
+void parkRunnerHook() {
+    if (!g_parkRunner.load()) return;
+    g_runnerParked.store(true);
+    while (g_parkRunner.load()) std::this_thread::yield();
+}
+void noopHandler(void*, const rc::Completion&, std::span<const uint8_t>) noexcept {}
+} // namespace
+
+// I1: a registered Completions whose last owner is a user callable replaced
+// while its setter command is still in the command ring at close(): the final
+// drain (on the CLOSING thread) destroys the callable and so the queue.  Its
+// release must not wait for a hand-back that only this same thread would do.
+TEST(CompletionsClient, QueueReleasedOnTheClosingThreadDuringTheDrainRegression) {
+    Watchdog wd("close() with a queue released inside its own final drain");
+    rc::Client client(cfgFor(5250, rc::RunnerMode::Thread));
+    auto cq = std::make_shared<rc::Completions>(client);  // owner: this thread
+    g_parkRunner.store(true);
+    g_runnerParked.store(false);
+    client.testSetDutyCycleHook(&parkRunnerHook);
+    while (!g_runnerParked.load()) std::this_thread::yield();  // runner parked at the top of a cycle
+    for (int i = 0; i < 200; ++i) client.onError([](const std::string&) {});  // > ringDrainLimit
+    client.onError([keep = cq](const std::string&) {});  // holds the queue
+    client.onError([](const std::string&) {});           // replacing it destroys `keep`
+    cq.reset();                                          // the callable holds the last reference
+    std::thread unpark([&] {
+        rc::CompletionHandler h{&noopHandler, nullptr};
+        while (client.listTopics(h, 1) != rc::OpResult::Closed) std::this_thread::yield();
+        g_parkRunner.store(false);  // the runner resumes only after the ring closed
+    });
+    client.close();  // the drain on THIS thread destroys the queue
+    unpark.join();
+    EXPECT_EQ(client.testRegisteredCqs(), 0u);
+}
+
+// I1, Invoker variant: the Client is driven on a worker and destroyed on main
+// (the supported off-owner destroy); the drain on main frees the queue.
+TEST(CompletionsClient, QueueReleasedDuringAnOffOwnerCloseDrainRegression) {
+    Watchdog wd("off-owner close() with a queue released inside its drain");
+    std::unique_ptr<rc::Client>      client;
+    std::shared_ptr<rc::Completions> cq;
+    std::thread owner([&] {
+        client = std::make_unique<rc::Client>(cfgFor(5252, rc::RunnerMode::Invoker));
+        cq     = std::make_shared<rc::Completions>(*client);
+    });
+    owner.join();
+    // Off the owner thread a setter is a ring command (applied by the drain).
+    client->onError([keep = cq](const std::string&) {});
+    client->onError([](const std::string&) {});
+    cq.reset();
+    client.reset();  // close() on main: its drain destroys the queue
+    SUCCEED();
+}
+
+// I2: close()'s drain gives up behind a claim it cannot unblock (fix5) with a
+// CqAdd behind it — the registration is never applied.  The constructor must
+// not wait forever: it returns a born-finished (Closed) queue.
+TEST(CompletionsClient, AbandonedCloseDrainLeavesTheQueueBornFinishedRegression) {
+    Watchdog wd("Completions constructor behind an abandoned close drain");
+    rc::Client client(cfgFor(5254, rc::RunnerMode::Thread));
+    const auto idx = client.testClaimCommandRingWithoutCommitting(8);  // the orphan
+    ASSERT_GE(idx, 0);
+    client.testZeroCommandRingClaimHeader(idx);  // header-less: the runner stalls behind it
+    client.testDisableCloseDrainUnblock();       // ... and close() cannot unblock it
+    client.testSetCloseDrainUnblockAfterYields(16);
+    const std::int64_t tailBefore = client.testCommandRingTail();
+    std::unique_ptr<rc::Completions> q;
+    rc::OpResult afterwards = rc::OpResult::Accepted;
+    uint32_t     outstanding = 99;
+    std::thread ctor([&] {  // CqAdd behind the orphan; this thread owns the queue
+        q = std::make_unique<rc::Completions>(client);
+        afterwards  = q->reserve(q->reservationFor(rc::OpKind::Ping));
+        outstanding = q->outstanding();
+        q.reset();  // born finished: freed locally
+    });
+    while (client.testCommandRingTail() == tailBefore) std::this_thread::yield();
+    client.close();  // abandons its drain: the CqAdd is never applied
+    ctor.join();
+    EXPECT_EQ(afterwards, rc::OpResult::Closed) << "born finished";
+    EXPECT_EQ(outstanding, 0u) << "the registration credit was returned";
+    EXPECT_EQ(client.testCloseDrainUnblockCalls(), rc::agent::ClientAgent::kCloseDrainMaxFailedUnblocks);
+}
+
+// I3: the 5-bit generation must not wrap on one hot slot.  A stale op on queue
+// A, A released, 31 more register/release cycles, then queue B: the stale
+// completion is dropped and B is untouched.  And a (slot, generation) pair
+// never repeats within kMaxCqs x 32 registrations (fresh slots first, FIFO reuse).
+TEST(CompletionsClient, GenerationNeverWrapsOnAHotSlotRegression) {
+    g_now = 1'000'000'000;
+    rc::ClientConfig c = cfgFor(5256, rc::RunnerMode::Invoker, &fakeNow);
+    c.connectTimeoutMs = 50;
+    rc::Client client(c);
+    rc::CompletionsConfig tiny;
+    tiny.capacityBytes  = 1024;
+    tiny.maxResultBytes = 64;
+    tiny.maxErrorText   = 64;
+    auto a = std::make_unique<rc::Completions>(client, tiny);
+    ASSERT_EQ(client.connect(*a, 1), rc::OpResult::Accepted);
+    client.doWork();
+    a.reset();
+    for (int i = 0; i < 31; ++i) rc::Completions tmp(client, tiny);
+    rc::Completions b(client, tiny);
+    g_now += 200'000'000;
+    for (int i = 0; i < 10 && client.testPendingControlOps() != 0; ++i) client.doWork();
+    ASSERT_EQ(client.testPendingControlOps(), 0u);
+    int n = 0;
+    b.poll([&](const rc::Completion&, std::span<const uint8_t>) { ++n; });
+    EXPECT_EQ(n, 0) << "a stale completion was misdelivered after a generation wrap";
+    EXPECT_EQ(client.testStaleCqDrops(), 1u);
+    EXPECT_EQ(b.outstanding(), 0u);
+    EXPECT_EQ(b.reservedBytes(), 0u);
+
+    // No (slot, generation) repeats within kMaxCqs x 32 registrations.
+    std::vector<uint8_t> seen(1u << 15, 0);
+    for (uint32_t i = 0; i < rc::kMaxCqs * 32 - 64; ++i) {
+        rc::Completions q(client, tiny);
+        const rc::CqRef r = q.cqRef();
+        ASSERT_NE(r, rc::kNoCqRef);
+        ASSERT_EQ(seen[r & 0x7FFF], 0) << "(slot, generation) " << r << " repeated after " << i;
+        seen[r & 0x7FFF] = 1;
+    }
+}
+
+// Liveness: a control record larger than the command ring can ever carry is
+// rejected synchronously (InvalidArgument) — not reported as a full ring that
+// *AndWait would retry forever, ignoring its timeout.
+TEST(CompletionsClient, OversizeControlRecordIsRejectedNotRetriedForeverRegression) {
+    Watchdog wd("pingAndWait with a record over the command ring's limit");
+    Rig r(cfgFor(5258));
+    r.client.testCapCommandMsgLength(256);
+    rc::Completions q(r.client);
+    const std::vector<uint8_t> big(512, 0x42);
+    EXPECT_EQ(r.client.ping(big, q, 1), rc::OpResult::InvalidArgument);
+    EXPECT_EQ(q.outstanding(), 0u);
+    EXPECT_THROW((void)r.client.pingAndWait(big, std::chrono::seconds(2)), std::runtime_error);
 }

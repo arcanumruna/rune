@@ -294,6 +294,16 @@ public:
     [[nodiscard]] std::size_t testMaxFrameLength() const noexcept { return agent_.maxFrameLength(); }
     /// fix4 test seam (Invoker, owner thread only): cap the max frame length.
     void testCapMaxFrameLength(std::size_t cap) noexcept { agent_.testCapMaxFrameLength(cap); }
+    /// F8c fix round 1 test seams (set before the threads they affect run):
+    /// make a claim from testClaimCommandRingWithoutCommitting() header-less;
+    /// make close()'s drain unable to unblock (forces the fix5 abandonment);
+    /// cap the command ring's message length (0 = uncapped); read its tail.
+    void testZeroCommandRingClaimHeader(aeron::util::index_t claimIndex) noexcept {
+        agent_.testZeroClaimHeader(claimIndex);
+    }
+    void testDisableCloseDrainUnblock() noexcept { agent_.testDisableCloseDrainUnblock(); }
+    void testCapCommandMsgLength(std::size_t cap) noexcept { agent_.testCapCommandMsgLength(cap); }
+    [[nodiscard]] std::int64_t testCommandRingTail() const noexcept { return agent_.commandRingTail(); }
     void testForceIngressOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
         agent_.testForceIngressOffers(r, n);
     }
@@ -855,7 +865,9 @@ private:
         uint8_t                 gen  = 0;
     };
     std::vector<CqSlot>   cqSlots_;
-    std::vector<uint16_t> cqFree_;
+    std::vector<uint16_t> cqFree_;          // FIFO ring of released slots (I3)
+    uint32_t              cqFreeHead_  = 0;
+    uint32_t              cqFreeCount_ = 0;
     uint64_t              staleCqDrops_ = 0;
 
     // ---- F8c C3: seed-session status for app threads (duty -> owner ring) ---

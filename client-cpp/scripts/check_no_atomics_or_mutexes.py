@@ -93,6 +93,19 @@ SLICE_B = {
     },
 }
 
+# PERMANENT per-thread state (F8c fix round 1, controller ruling): a
+# thread_local is not shared state — each thread owns its own copy.  Allowed
+# only as an EXACT multiset of ('tls', 'thread_local') sites per file, with the
+# reason next to each declaration; any other kind here is a violation.
+PER_THREAD = {
+    # tClosing (the Client this thread is closing: a Completions released by
+    # user code that close() runs frees directly — I1) and tWaitToken (a
+    # distinct token per *AndWait call — I3/m6).
+    "src/Client.cpp": {("tls", "thread_local"): 2},
+}
+for _rel, _ms in PER_THREAD.items():
+    assert all(k[0] == "tls" for k in _ms), f"PER_THREAD entry {_rel} allows a non-tls construct"
+
 CHAR_PREFIXES = {"L", "u", "U", "u8"}
 
 
@@ -346,7 +359,7 @@ def main(argv):
         for rel in args[1:]:
             print(rel, dict(sorted(multiset(find_matches(files[rel])).items())))
         return 0
-    violations = evaluate(files, RING_FILES, SLICE_B)
+    violations = evaluate(files, RING_FILES, {**SLICE_B, **PER_THREAD})
     if violations:
         print(f"check_no_atomics_or_mutexes: {len(violations)} violation(s)")
         for v in violations:

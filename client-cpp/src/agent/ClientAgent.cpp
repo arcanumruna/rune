@@ -353,7 +353,7 @@ ClientAgent::Submit ClientAgent::writeCommand3_(int32_t msgTypeId, const uint8_t
 ClientAgent::Submit ClientAgent::submitControlOp(const void* hdr, std::size_t hdrLen,
                                                  std::span<const uint8_t> frame) noexcept {
     const std::size_t total = hdrLen + frame.size();
-    if (total > static_cast<std::size_t>(ring_.maxMsgLength())) return Submit::Full;
+    if (total > commandMsgLimit()) return Submit::Full;
     bool ok = false;
     try {
         ok = ring_.writeWith(kMsgControlOp, static_cast<aeron::util::index_t>(total),
@@ -580,7 +580,7 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
                              "(Aeron ManyToOneRingBuffer::unblock)\n",
                              static_cast<long long>(headAfter), closeDrainUnblockAfterYields_);
             }
-            if (ring_.unblock()) {
+            if (!testCloseDrainNoUnblock_ && ring_.unblock()) {
                 failedUnblocks = 0;
                 continue;
             }
