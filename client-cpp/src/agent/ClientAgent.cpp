@@ -813,13 +813,35 @@ bool SessionEndpointIo::retargetToBootstrap() noexcept {
     return agent->retargetSeedToBootstrap_();
 }
 
+bool SessionEndpointIo::retargetToLastKnownLeader() noexcept {
+    if (endpoint != agent->cfg_.transport.ingressChannel) return true;  // leader session: no-op
+    return agent->retargetSeedToLastKnownLeader_();
+}
+
 bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     const std::string& bootstrap = cfg_.transport.ingressChannel;  // never retargeted
     if (transport_.ingressChannel() == bootstrap) return true;
+    // fix2 A-B1: remember where we were stuck BEFORE leaving — the bootstrap may
+    // be the dead node, and the next odd Backoff attempt returns here.  Captured
+    // from the transport (the real current channel) and copied, since retarget()
+    // replaces the transport's channel string.
+    const std::string leaving = transport_.ingressChannel();
     if (!transport_.retarget(bootstrap)) return false;  // old pub intact; next attempt retries
-    Session& seed             = seedSession();
-    seed.currentLeaderChannel = bootstrap;
-    seed.currentLeaderNode    = -1;  // unknown until the gateway redirects us again
+    Session& seed               = seedSession();
+    seed.lastKnownLeaderChannel = leaving;
+    seed.lastKnownLeaderNode    = seed.currentLeaderNode;
+    seed.currentLeaderChannel   = bootstrap;
+    seed.currentLeaderNode      = -1;  // unknown until the gateway redirects us again
+    return true;
+}
+
+bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
+    Session& seed = seedSession();
+    if (seed.lastKnownLeaderChannel.empty()) return true;  // never stuck to a leader
+    if (transport_.ingressChannel() == seed.lastKnownLeaderChannel) return true;
+    if (!transport_.retarget(seed.lastKnownLeaderChannel)) return false;  // next odd attempt retries
+    seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
+    seed.currentLeaderNode    = seed.lastKnownLeaderNode;
     return true;
 }
 

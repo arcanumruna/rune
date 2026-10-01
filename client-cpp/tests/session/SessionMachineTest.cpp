@@ -40,6 +40,7 @@ struct FakeIo final : sm::SessionIo {
     bool sendFrame(const uint8_t* buf, std::size_t len) override {
         sends.push_back(Frame{std::vector<uint8_t>(buf, buf + len)});
         events.push_back('S');
+        sentTo.push_back(current);
         return sendSucceeds;
     }
 
@@ -49,6 +50,21 @@ struct FakeIo final : sm::SessionIo {
     bool retargetToBootstrap() noexcept override {
         events.push_back('B');
         ++bootstrapFallbacks;
+        if (current != bootstrap) {  // models the seed IO: remember the stuck-to leader
+            lastKnownLeader = current;
+            current         = bootstrap;
+        }
+        return true;
+    }
+
+    // T15a fix2 A-B1: endpoint model.  `current` is where the next frame goes.
+    std::string              bootstrap = "bootstrap";
+    std::string              current   = "bootstrap";
+    std::string              lastKnownLeader;  // "" = none known
+    std::vector<std::string> sentTo;           // endpoint of every sendFrame, in order
+    bool retargetToLastKnownLeader() noexcept override {
+        events.push_back('L');
+        if (!lastKnownLeader.empty()) current = lastKnownLeader;
         return true;
     }
 
@@ -2202,8 +2218,11 @@ TEST(SessionMachineRegression, BackoffFallsBackToBootstrapEndpoint) {
         if (attempt % 2 == 0) {
             EXPECT_EQ(io.events, "BS") << "attempt " << attempt
                                        << ": fall back to bootstrap BEFORE the ConnectRequest";
+        } else if (attempt == 1) {
+            EXPECT_EQ(io.events, "S") << "attempt 1: retry the current endpoint";
         } else {
-            EXPECT_EQ(io.events, "S") << "attempt " << attempt << ": retry the current endpoint";
+            EXPECT_EQ(io.events, "LS") << "attempt " << attempt
+                                       << ": back to the last-known leader BEFORE the ConnectRequest";
         }
     }
     EXPECT_EQ(io.bootstrapFallbacks, 3);
@@ -2239,4 +2258,44 @@ TEST(SessionMachineRegression, DisconnectFromBackoffSendsDisconnectAndCloses) {
     auto d = io.lastDisconnect();
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->sessionId, 11);
+}
+
+// T15a fix2 A-B1: after a bootstrap fallback the seed must NOT stay on the
+// bootstrap — the bootstrap node may be the dead one while the leader lives.
+// Backoff attempts genuinely alternate (attempt 1 = current endpoint, even =
+// bootstrap, odd >= 3 = last-known leader), so either live endpoint converges
+// within two attempts, whatever the outage length.
+TEST(SessionMachineRegression, BackoffAlternatesBootstrapAndLastKnownLeader) {
+    FakeIo io;
+    auto cfg = foreverConfig();
+    cfg.maxConnectRetries = 0;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = goLive(m, 21, T0);
+    io.current = "leader-1";  // the Client stuck the seed to the leader
+    m.onTransportDisconnected(now);
+    m.tick(++now);
+    for (int attempt = 1; attempt <= 8; ++attempt) {
+        now = timeOutUntilNotConnecting(m, cfg, now);
+        ASSERT_EQ(m.state(), sm::SessionState::Backoff);
+        io.sentTo.clear();
+        now = m.nextAttemptNs();
+        m.tick(now);
+        ASSERT_EQ(io.sentTo.size(), 1u) << "attempt " << attempt;
+        const char* expect = (attempt % 2 == 0) ? "bootstrap" : "leader-1";
+        EXPECT_EQ(io.sentTo[0], expect) << "attempt " << attempt;
+    }
+    // A session never stuck to a leader just stays on the bootstrap.
+    FakeIo io2;
+    sm::SessionMachine m2(io2, cfg);
+    now = goLive(m2, 22, T0);
+    m2.onTransportDisconnected(now);
+    m2.tick(++now);
+    for (int attempt = 1; attempt <= 4; ++attempt) {
+        now = timeOutUntilNotConnecting(m2, cfg, now);
+        io2.sentTo.clear();
+        now = m2.nextAttemptNs();
+        m2.tick(now);
+        ASSERT_EQ(io2.sentTo.size(), 1u);
+        EXPECT_EQ(io2.sentTo[0], "bootstrap") << "attempt " << attempt;
+    }
 }

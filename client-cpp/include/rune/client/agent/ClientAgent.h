@@ -104,6 +104,8 @@ struct SessionEndpointIo : session::SessionIo {
     bool retarget(const std::string& newIngressChannel) noexcept override;
     /// T15a fix1 I1: the seed's bootstrap fallback (leader sessions: no-op).
     bool retargetToBootstrap() noexcept override;
+    /// T15a fix2 A-B1: the seed's return to the last-known leader (leader sessions: no-op).
+    bool retargetToLastKnownLeader() noexcept override;
 };
 
 struct Session {
@@ -135,6 +137,14 @@ struct Session {
     /// unknown (the initial gateway connection — we don't know which node it is
     /// until a REDIRECT teaches us).
     int32_t     currentLeaderNode    = -1;
+
+    /// T15a fix2 A-B1 (seed only): the leader the seed was stuck to when a Backoff
+    /// attempt fell back to the bootstrap ("" = none).  Captured at the fallback,
+    /// NEVER cleared by it, so the next odd Backoff attempt can return there:
+    /// Backoff alternates bootstrap <-> last-known leader.  A later redirect while
+    /// on the bootstrap moves the transport, and the next fallback captures that.
+    std::string lastKnownLeaderChannel;
+    int32_t     lastKnownLeaderNode  = -1;
 
     /// Task 1.3: has this session's connect been submitted yet?  Lazy multi-node
     /// sessions are opened async — connect is submitted once; frames for the
@@ -701,6 +711,9 @@ private:
     /// control path) back at the configured gateway and forget the stuck-to
     /// leader.  No-op when already there.  Agent thread only (cold path).
     bool retargetSeedToBootstrap_() noexcept;
+    /// T15a fix2 A-B1: the inverse — back to seed.lastKnownLeaderChannel (no-op
+    /// when none is known or already there).  Agent thread only (cold path).
+    bool retargetSeedToLastKnownLeader_() noexcept;
 
     // ---- Task 1.4: shared produce→leader routing (drain path + redirect resend) --
     // Probe the route slot, resolve its session / pub once, hold if the session is not

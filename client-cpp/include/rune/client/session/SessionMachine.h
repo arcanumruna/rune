@@ -67,6 +67,13 @@ struct SessionIo {
     /// no-op success (an IO whose endpoint never moves).
     virtual bool retargetToBootstrap() noexcept { return true; }
 
+    /// T15a fix2 A-B1: point this session back at the last-known leader it was
+    /// stuck to before the most recent retargetToBootstrap() (no-op when none is
+    /// known).  Odd Backoff attempts >= 3 call it, so Backoff genuinely alternates
+    /// bootstrap <-> last-known leader and converges if EITHER is alive.  Cold
+    /// path.  Default: no-op success.
+    virtual bool retargetToLastKnownLeader() noexcept { return true; }
+
     virtual ~SessionIo() = default;
 };
 
@@ -640,18 +647,27 @@ private:
 
     /// Backoff: nothing before nextAttemptNs; then one resume-first attempt (the
     /// last sessionId is the hint; a SessionExpired answer drops it); even
-    /// attempts go through the bootstrap endpoint (retargetToBootstrap).  The
+    /// attempts go through the bootstrap endpoint (retargetToBootstrap), odd
+    /// attempts >= 3 back through the last-known leader (retargetToLastKnownLeader).  The
     /// redirect budget is renewed so the attempt can follow a leader change; the
     /// connect/resume budgets stay spent, so a failed attempt backs off again.
     void tickBackoff_(int64_t nowNs) noexcept {
         if (nowNs < backoff_.nextAttemptNs) return;
-        // fix1 I1 (Kafka-style bootstrap fallback): attempt 1 retries the current
-        // (possibly redirected) endpoint — a fast resume when only the link
-        // blipped.  Every even attempt first falls back to the configured
-        // bootstrap endpoint: the redirected leader may be dead for good, and
-        // only the bootstrap can redirect us to the current one.  Driven by the
-        // Backoff attempt count on the injected clock — no timers of its own.
-        if ((backoff_.attempt % 2) == 0) (void)io_.retargetToBootstrap();
+        // fix1 I1 + fix2 A-B1 (Kafka-style bootstrap fallback, real alternation):
+        //   attempt 1     the current (possibly redirected) endpoint — a fast
+        //                 resume when only the link blipped;
+        //   even attempts the configured bootstrap — the leader may be dead for
+        //                 good, and only the bootstrap can redirect us;
+        //   odd >= 3      back to the last-known leader — the BOOTSTRAP may be
+        //                 the dead one.
+        // Either live endpoint is reached within two attempts, whatever the
+        // outage length.  Driven by the Backoff attempt count on the injected
+        // clock — no timers of its own.
+        if ((backoff_.attempt % 2) == 0) {
+            (void)io_.retargetToBootstrap();
+        } else if (backoff_.attempt >= 3) {
+            (void)io_.retargetToLastKnownLeader();
+        }
         redirectCount_ = 0;
         doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
     }

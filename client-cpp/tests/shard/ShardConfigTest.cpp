@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -208,7 +209,7 @@ TEST(ShardConfigRegression, CoresOutsideAffinityMaskRejected) {
     ASSERT_FALSE(allowed.empty());
     g.shardCount = 1;
     if (rs::platformPinningSupported()) {
-        g.firstCore = allowed.back() + 1;
+        g.firstCore = *std::max_element(allowed.begin(), allowed.end()) + 1;
         EXPECT_THROW((void)rs::assignShardCores(g, 1, allowed, true), std::invalid_argument);
         g.firstCore = allowed.front();
         EXPECT_EQ(rs::assignShardCores(g, 1, allowed, true), (std::vector<int32_t>{allowed.front()}));
@@ -689,10 +690,80 @@ TEST(ShardConfigRegression, SingleIndexOverloadAppliesCoreChecks) {
     // firstCore outside the mask is rejected by the overload too (Linux), and
     // rejected outright where pinning is unsupported (macOS).
     g.pin       = false;
-    g.firstCore = allowed.back() + 1;
+    g.firstCore = *std::max_element(allowed.begin(), allowed.end()) + 1;
     EXPECT_THROW((void)rs::shardClientConfig(g, 0), std::invalid_argument);
 
     // No pinning requested: nobody is pinned.
     g.firstCore = -1;
     EXPECT_EQ(rs::shardClientConfig(g, 1).runnerCore, -1);
+}
+
+// T15a fix2 A-B1, real transport, the other direction: the BOOTSTRAP gateway is
+// dead for good while the stuck-to leader is alive but unresponsive for longer
+// than Backoff attempt 2 (the bootstrap fallback).  The seed must come back to
+// the leader and reconnect — before the fix it stayed on the dead bootstrap.
+TEST(ShardConfigRegression, SeedBackoffReturnsToLiveLeaderWhenBootstrapDead) {
+    namespace rca = rune::client::agent;
+    namespace rcs = rune::client::session;
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = 4120;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = 4121;
+    cfg.transport.dataDir         = uniqueDir("seed_leader_alive");
+    cfg.transport.driverMode      = rt::DriverMode::Invoker;
+    cfg.session.egressChannel     = "aeron:ipc";
+    cfg.session.egressStreamId    = 4121;
+    cfg.session.reconnectForeverAfterLive = true;
+    cfg.session.maxConnectRetries = 0;
+    cfg.session.connectTimeoutNs  = 200'000'000;  // 200 ms of injected time
+    // Each Backoff alternation re-creates the UDP publication to the leader; its
+    // first ConnectRequest offer fails until the new image connects, so the
+    // fast-retry cadence must fit inside one attempt (production: 200 ms vs 5 s).
+    cfg.session.connectRetryIntervalNs = 1'000'000;
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    const std::string leaderCh = "aeron:udp?endpoint=127.0.0.1:24811";
+    auto bootstrap = std::make_unique<test_support::InvokerGateway>(
+        cfg.transport.dataDir + "/aeron", "aeron:ipc", 4120, "aeron:ipc", 4121);
+    auto leader = std::make_unique<test_support::InvokerGateway>(
+        cfg.transport.dataDir + "/aeron", leaderCh, 4120, "aeron:ipc", 4121);
+    leader->assignedSessionId = 77;
+    int64_t now = 1'000'000'000;
+    bool pumpLeader = true;
+    auto drive = [&](int64_t stepNs, int cap, auto&& pred) {
+        for (int i = 0; i < cap; ++i) {
+            now += stepNs;
+            agent.doWork(now);
+            if (bootstrap) bootstrap->pump();
+            if (pumpLeader) leader->pump();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    ASSERT_TRUE(drive(0, 400'000, [&] { return bootstrap->ready() && leader->ready(); }));
+    ASSERT_TRUE(agent.submitConnect());
+    ASSERT_TRUE(drive(0, 400'000, [&] { return agent.sessionState() == rcs::SessionState::Connected; }));
+
+    // Stick-to-leader, then the bootstrap node dies for good.
+    ASSERT_TRUE(agent.testRetargetSeed(leaderCh));
+    bootstrap.reset();
+    const int leaderConnectsBefore = leader->connects;
+
+    // The session expires; the leader stays unresponsive for 2 s of injected
+    // time — far past Backoff attempt 2 (the bootstrap fallback).
+    now += cfg.session.responseTimeoutNs + 1;
+    pumpLeader = false;
+    (void)drive(1'000'000, 2'000, [] { return false; });
+    EXPECT_NE(agent.sessionState(), rcs::SessionState::Connected);
+
+    // The leader answers again: the seed must find it.
+    pumpLeader = true;
+    ASSERT_TRUE(drive(1'000'000, 400'000, [&] { return agent.sessionState() == rcs::SessionState::Connected; }))
+        << "stuck on the dead bootstrap: Backoff never returned to the last-known leader";
+    EXPECT_GT(leader->connects, leaderConnectsBefore);
+    EXPECT_EQ(agent.testTransport().ingressChannel(), leaderCh);
+    leader.reset();
+    agent.stop();
+    std::filesystem::remove_all(cfg.transport.dataDir);
 }
