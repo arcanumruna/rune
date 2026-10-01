@@ -9,6 +9,7 @@
 // only waits are condition waits with a hard iteration cap.
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
@@ -797,4 +798,315 @@ TEST(ProtocolRegression, WorkerReturnLayoutUnchanged) {
     EXPECT_EQ(isbe::WorkerReturn::sbeBlockLength(), 123);
     WorkerReturn produceResult;   // empty chunk
     EXPECT_EQ(workerReturnEncodedLength(produceResult), 8u + 123u + 4u);
+}
+
+// ============================================================================
+// F15 S7 — coordinator load state machine (K4), coordinatorEpoch, persisted
+// pid block ceiling (I7).  Design note §5.1, §5.6, §8 S7 row.
+// ============================================================================
+
+namespace {
+// A store-backed TransactionCoordinationService over a configurable
+// __transaction_state replica.  No gateway: markers go through the
+// appendFnOverride seam and are recorded (direction + coordinatorEpoch).
+struct CoordRig {
+    TmpDir d;
+    std::unique_ptr<Log> log;
+    NullTransport t;
+    std::unique_ptr<PartitionReplica> rep;
+    std::unique_ptr<tx::ReplicatedTxnStateStore> store;
+    bool consensusLeader = true;
+    std::unique_ptr<TransactionCoordinationService> tcs;
+    struct Marker { bool commit; int32_t coordinatorEpoch; };
+    std::vector<Marker> markers;
+    std::array<uint8_t, 1024> out{};
+    int64_t corr = 0;
+    struct Init { int16_t err = -1; int64_t pid = -1; int16_t epoch = -1; };
+
+    CoordRig(Role role, rune::replication::Epoch epoch, std::vector<NodeId> replicas, std::vector<NodeId> isr) {
+        log = std::make_unique<Log>(d.path.string(), 64LL * 1024 * 1024);
+        log->recover();
+        rep = std::make_unique<PartitionReplica>(cfg(1, 1, 99, 0), role, epoch, std::move(replicas),
+                                                 std::move(isr), log.get(), &t);
+        newCoordinator();
+    }
+    // A fresh coordinator (store + service) over the SAME replicated log: what a
+    // failover to this node's next coordinator incarnation looks like.
+    void newCoordinator() {
+        tcs.reset();
+        store = std::make_unique<tx::ReplicatedTxnStateStore>(rep.get());
+        tcs = std::make_unique<TransactionCoordinationService>(store.get(), nullptr,
+                                                              [this] { return consensusLeader; },
+                                                              [] { return NodeId{1}; });
+        tcs->setAppendFnOverride([this](std::string_view, int32_t, std::span<const uint8_t> b) -> int64_t {
+            tx::ControlMarkerPayload p;
+            if (tx::ControlMarker::extract(b.data(), 0, p, b.size()))
+                markers.push_back({p.controlType == tx::ControlType::Commit, p.coordinatorEpoch});
+            return static_cast<int64_t>(markers.size()) - 1;
+        });
+    }
+    Init initPid(const std::string& txnId, int32_t timeoutMs = 60'000, int64_t now = 1) {
+        pc::InitProducerId q; q.sessionId = 1; q.correlationId = ++corr; q.transactionTimeoutMs = timeoutMs;
+        q.transactionalId = {reinterpret_cast<const uint8_t*>(txnId.data()), txnId.size()};
+        std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
+        const auto n = tcs->handleInitProducerId(f.data(), f.size(), now, out.data(), out.size());
+        auto r = pc::InitProducerIdResponse::decode(out.data(), n);
+        if (!r) return {};
+        return {r->errorCode, r->producerId, r->producerEpoch};
+    }
+    int16_t addPartition(const std::string& txnId, const Init& ip, int64_t now = 1) {
+        const std::span<const uint8_t> tid(reinterpret_cast<const uint8_t*>(txnId.data()), txnId.size());
+        pc::AddPartitionsToTxn q; q.sessionId = 1; q.correlationId = ++corr; q.producerId = ip.pid;
+        q.producerEpoch = ip.epoch; q.transactionalId = tid;
+        const pc::TxnTopicPartition tp{0, 0};
+        std::vector<uint8_t> f(pc::AddPartitionsToTxn::encodedSizeFor(tid, 1));
+        q.encode(f.data(), std::span<const pc::TxnTopicPartition>(&tp, 1));
+        const auto n = tcs->handleAddPartitions(f.data(), f.size(), now, out.data(), out.size());
+        auto r = pc::AddPartitionsToTxnResponse::decode(out.data(), n);
+        return (r && r->results.size() == 1) ? r->results[0].errorCode : int16_t{-1};
+    }
+    // Follower 2 reports its log end (a FetchRequest at `offset`).
+    void fetchFrom2(int64_t offset, int64_t now) {
+        rune::replication::FetchRequestMsg q{};
+        q.leaderEpoch = rep->epoch(); q.partition = 0; q.followerId = 2; q.fetchOffset = offset;
+        q.maxBytes = 1 << 20; q.topicId = 99;
+        (void)rep->onFetchRequest(q, now);
+    }
+    // One txn-state record written straight to the replica (a previous coordinator's put).
+    void putRecord(const std::string& txnId, tx::TxnState s, int64_t pid) {
+        tx::ReplicatedTxnStateStore other(rep.get());
+        tx::TransactionMetadata m;
+        m.txnId = txnId; m.producerId = pid; m.producerEpoch = 0; m.state = s; m.txnStartNs = 1;
+        m.partitions.insert(tx::TopicPartition{"t", 0});
+        ASSERT_TRUE(other.put(m, 1));
+    }
+};
+} // namespace
+
+TEST(TxnCoordinatorLoadRegression, NotCoordinatorUntilLeaderComplete) {
+    // K4: a new txn-state leader whose leadership is not yet complete serves an
+    // HW held at the old floor — the coordinator must not load (nor answer, nor
+    // write) until leaderComplete_ holds.
+    CoordRig R(Role::Follower, 1, {1, 2}, {1, 2});
+    R.rep->becomeLeader(2, {1, 2});
+    ASSERT_FALSE(R.rep->isLeaderComplete()) << "precondition: follower 2 has not reported in";
+    EXPECT_EQ(R.initPid("t").err, kNotCoordinator) << "loaded before leaderComplete_";
+    EXPECT_EQ(R.log->logEndOffset(), 0) << "an unloaded coordinator wrote to the txn-state log";
+    R.fetchFrom2(0, 2);
+    ASSERT_TRUE(R.rep->isLeaderComplete());
+    EXPECT_NE(R.initPid("t").err, kNotCoordinator) << "loaded once leaderComplete_ and HW == LEO hold";
+    R.fetchFrom2(R.log->logEndOffset(), 3);                 // the pid-block ceiling commits
+    EXPECT_EQ(R.initPid("t").err, 0);
+}
+
+TEST(TxnCoordinatorLoadRegression, NotCoordinatorUntilHwEqualsLeo) {
+    // K4/Q2: a previous coordinator's record above the HW may still be truncated;
+    // the coordinator loads only once HW == LEO (it is then committed).
+    CoordRig R(Role::Leader, 1, {1, 2}, {1, 2});
+    R.putRecord("t-prev", tx::TxnState::Ongoing, 5);
+    ASSERT_EQ(R.log->logEndOffset(), 1);
+    ASSERT_EQ(R.rep->highWatermark(), 0) << "precondition: follower 2 has not replicated it";
+    EXPECT_EQ(R.initPid("t").err, kNotCoordinator) << "loaded while HW < LEO";
+    EXPECT_EQ(R.log->logEndOffset(), 1) << "an unloaded coordinator wrote to the txn-state log";
+    R.fetchFrom2(1, 2);
+    ASSERT_EQ(R.rep->highWatermark(), R.rep->logEndOffset());
+    EXPECT_NE(R.initPid("t").err, kNotCoordinator);
+    const auto* prev = R.store->get("t-prev");
+    ASSERT_NE(prev, nullptr) << "the load folds the committed log";
+    EXPECT_EQ(prev->state, tx::TxnState::Ongoing);
+}
+
+TEST(TxnCoordinatorLoadRegression, NoTimeoutsWhileUnloaded) {
+    CoordRig R(Role::Leader, 1, {1}, {1});
+    const auto ip = R.initPid("t", /*timeoutMs=*/100, /*now=*/1);
+    ASSERT_EQ(ip.err, 0);
+    ASSERT_EQ(R.addPartition("t", ip, 1), 0);
+    // The txn-state leadership moved away; the consensus view has not caught up.
+    R.rep->becomeFollower(2, 2);
+    const int64_t leo = R.log->logEndOffset();
+    (void)R.tcs->doWork(10'000'000'000LL);
+    EXPECT_TRUE(R.markers.empty()) << "an unloaded coordinator decided a timeout ABORT";
+    EXPECT_EQ(R.log->logEndOffset(), leo);
+    // Leadership returns (epoch 3): the Ongoing timeout clock restarts at the load.
+    R.rep->becomeLeader(3, {1});
+    (void)R.tcs->doWork(10'000'000'000LL);
+    EXPECT_TRUE(R.markers.empty()) << "the reloaded Ongoing txn must get a fresh timeout window";
+    (void)R.tcs->doWork(10'000'000'000LL + 200'000'000LL);
+    ASSERT_EQ(R.markers.size(), 1u) << "the timeout runs once loaded";
+    EXPECT_FALSE(R.markers[0].commit);
+    EXPECT_EQ(R.markers[0].coordinatorEpoch, 3);
+}
+
+TEST(TxnCoordinatorLoadRegression, CommittedPrepareAboveStaleFloorIsNeverMissed) {
+    // Replaces revision 1's RebuildLoadsCommittedPrepareAboveLocalHw.  Node 1
+    // replicated the old leader's Ongoing + PrepareCommit records but never
+    // learned that the PrepareCommit committed (its HW view is 0).  On election
+    // its served HW is held at that stale floor until leadership completes; a
+    // coordinator that loaded to it would see Ongoing and later time it out to
+    // ABORT — breaking the committed decision.
+    TmpDir od;
+    Log oldLog(od.path.string(), 64LL * 1024 * 1024); oldLog.recover();
+    NullTransport ot;
+    PartitionReplica oldLeader(cfg(2, 1, 99, 0), Role::Leader, 1, {2}, {2}, &oldLog, &ot);
+    {
+        tx::ReplicatedTxnStateStore s(&oldLeader);
+        tx::TransactionMetadata m;
+        m.txnId = "t-fo"; m.producerId = 5; m.producerEpoch = 0; m.txnTimeoutMs = 100; m.txnStartNs = 1;
+        m.partitions.insert(tx::TopicPartition{"t", 0});
+        m.state = tx::TxnState::Ongoing;       ASSERT_TRUE(s.put(m, 1));
+        m.state = tx::TxnState::PrepareCommit; ASSERT_TRUE(s.put(m, 1));
+    }
+    const auto bytes = oldLog.read(0, 1 << 20);
+    CoordRig R(Role::Follower, 1, {1, 2}, {1, 2});
+    rune::replication::FetchResponseMsg resp{};
+    resp.leaderEpoch = 1; resp.partition = 0; resp.highWatermark = 0; resp.logStartOffset = 0;
+    resp.errorCode = 0; resp.topicId = 99; resp.records = std::span<const uint8_t>(bytes);
+    R.rep->applyReplicated(resp);
+    ASSERT_EQ(R.log->logEndOffset(), 2) << "precondition: both records replicated";
+    R.rep->becomeLeader(2, {1, 2});
+    ASSERT_FALSE(R.rep->isLeaderComplete());
+    ASSERT_EQ(R.rep->highWatermark(), 0) << "precondition: served HW held at the stale floor";
+    for (int i = 0; i < 4; ++i) (void)R.tcs->doWork(10'000'000'000LL + i);
+    EXPECT_TRUE(R.markers.empty()) << "decided before leadership completed";
+    EXPECT_EQ(R.initPid("x").err, kNotCoordinator);
+    // The old leader (node 2) rejoins as a follower at the same log end.
+    R.fetchFrom2(2, 3);
+    ASSERT_TRUE(R.rep->isLeaderComplete());
+    for (int i = 0; i < 4; ++i) (void)R.tcs->doWork(20'000'000'000LL + i);
+    const auto* meta = R.store->get("t-fo");
+    ASSERT_NE(meta, nullptr) << "the load must see the committed records";
+    EXPECT_NE(meta->state, tx::TxnState::PrepareAbort) << "an ABORT was decided over a committed PrepareCommit";
+    ASSERT_EQ(R.markers.size(), 1u) << "the committed PrepareCommit must be re-driven exactly once";
+    EXPECT_TRUE(R.markers[0].commit) << "the re-driven marker must be the COMMIT";
+}
+
+TEST(TxnCoordinatorLoadRegression, ConsensusLeaderButTxnReplicaFollowerIsNotCoordinator) {
+    // No put may reach a follower replica (on base: appendKeyed asserts in Debug,
+    // appends on the follower under NDEBUG) — so this runs in a child process.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        CoordRig R(Role::Follower, 1, {1, 2}, {1, 2});
+        R.consensusLeader = true;
+        const auto r = R.initPid("t");
+        (void)R.tcs->doWork(1);
+        std::_Exit(r.err == kNotCoordinator && R.log->logEndOffset() == 0 ? 0 : 1);
+    }, ::testing::ExitedWithCode(0), "");
+}
+
+TEST(TxnCoordinatorLoadRegression, CoordinatorEpochIsTxnReplicaLeaderEpoch) {
+    CoordRig R(Role::Leader, 7, {1}, {1});
+    const auto ip = R.initPid("t", /*timeoutMs=*/100, 1);
+    ASSERT_EQ(ip.err, 0);
+    ASSERT_EQ(R.addPartition("t", ip, 1), 0);
+    const auto* meta = R.store->get("t");
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->coordinatorEpoch, 7) << "persisted records carry the txn replica's leader epoch";
+    (void)R.tcs->doWork(1'000'000'000LL);                    // timeout ABORT
+    ASSERT_EQ(R.markers.size(), 1u);
+    EXPECT_EQ(R.markers[0].coordinatorEpoch, 7) << "markers carry the txn replica's leader epoch";
+}
+
+TEST(TxnCoordinatorLoadRegression, CoordinatorRoutedToTxnStateLeader) {
+    // Routing invariant (§5.1 Minor): FindCoordinator (coordinatorFor) routes to
+    // the consensus leader; the coordinator loads only where the
+    // __transaction_state replica is Leader.  Today the bridge makes the
+    // consensus leader the txn-state leader, so the routed node is the loaded one
+    // and its coordinatorEpoch is that leadership's epoch.  When multi-node
+    // partition leadership lands (F15-FU2) coordinatorFor must switch to the
+    // __transaction_state partition leader; this test then still pins it.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    ReplicaRegistry reg;
+    reg.add(-2, 0, std::make_unique<PartitionReplica>(cfg(1, 1, -2, 0), Role::Follower, 0,
+                                                      std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &t));
+    PartitionReplica* txnRep = reg.lookup(-2, 0);
+    ReplicationMetadataBridge bridge(1, {1}, reg);
+    int32_t consensusLeader = -1;
+    tx::ReplicatedTxnStateStore store(txnRep);
+    TransactionCoordinationService tcs(&store, nullptr, [&] { return consensusLeader == 1; },
+                                       [&] { return NodeId{consensusLeader}; });
+    std::array<uint8_t, 1024> out{};
+    auto init = [&](const std::string& id) {
+        pc::InitProducerId q; q.sessionId = 1; q.correlationId = 1; q.transactionTimeoutMs = 60'000;
+        q.transactionalId = {reinterpret_cast<const uint8_t*>(id.data()), id.size()};
+        std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
+        auto r = pc::InitProducerIdResponse::decode(out.data(),
+                                                    tcs.handleInitProducerId(f.data(), f.size(), 1, out.data(), out.size()));
+        return r ? r->errorCode : int16_t{-1};
+    };
+    const std::string id = "t-route";
+    for (const auto& [leader, term] : std::vector<std::pair<int32_t, int64_t>>{{1, 4}, {2, 5}, {1, 6}}) {
+        consensusLeader = leader;
+        (void)bridge.doWork(leader, term);
+        const bool routedHere = tcs.coordinatorFor(id) == 1;
+        const bool txnLeaderHere = txnRep->role() == Role::Leader;
+        ASSERT_EQ(routedHere, txnLeaderHere) << "term " << term << ": FindCoordinator and the txn-state leader diverged";
+        const int64_t leo = log.logEndOffset();
+        const auto err = init(id);
+        if (routedHere) {
+            EXPECT_EQ(err, 0) << "term " << term << ": the routed node must serve";
+            const auto* meta = store.get(id);
+            ASSERT_NE(meta, nullptr);
+            EXPECT_EQ(meta->coordinatorEpoch, term) << "coordinatorEpoch == the txn-state leader epoch (term)";
+        } else {
+            EXPECT_EQ(err, kNotCoordinator) << "term " << term;
+            EXPECT_EQ(log.logEndOffset(), leo);
+        }
+    }
+}
+
+TEST(TxnCoordinatorLoadRegression, EpochChangeUnloadsAndReloads) {
+    // m3: an epoch change while still leader = unload (deferred EndTxn answered
+    // NotCoordinator, marker tasks dropped) then load under the new epoch, which
+    // re-drives the committed PrepareCommit and persists its completion.
+    TxnRig T(1, /*withStore=*/true);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    T.stateReplica->becomeLeader(2, {1});
+    (void)T.tcs->doWork(50);
+    ASSERT_EQ(T.controlFrames.size(), 1u) << "the deferred EndTxn must be answered on unload";
+    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), kNotCoordinator);
+    T.runUntilNoMarkerAwaited(60);
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u);
+    const auto* meta = T.store->get(T.txnId);
+    ASSERT_NE(meta, nullptr);
+    EXPECT_EQ(meta->state, tx::TxnState::CompleteCommit) << "the reloaded PrepareCommit completes";
+    EXPECT_EQ(meta->coordinatorEpoch, 2) << "under the new coordinatorEpoch";
+    EXPECT_EQ(T.controlFrames.size(), 1u) << "no second answer to the old EndTxn";
+}
+
+// ============================================================================
+// I7 — the pid block ceiling is persisted in __transaction_state.
+// ============================================================================
+
+TEST(TxnPidBlockRegression, IdempotentPidsNotReissuedAfterFailover) {
+    CoordRig R(Role::Leader, 1, {1}, {1});
+    int64_t maxIssued = -1;
+    for (int i = 0; i < 3; ++i) {
+        const auto r = R.initPid("");                          // idempotent: nothing else is persisted
+        ASSERT_EQ(r.err, 0);
+        maxIssued = std::max(maxIssued, r.pid);
+    }
+    R.newCoordinator();                                        // failover to a fresh coordinator
+    const auto idem = R.initPid("");
+    ASSERT_EQ(idem.err, 0);
+    EXPECT_GT(idem.pid, maxIssued) << "an idempotent pid issued by the previous coordinator was reissued";
+    const auto txn = R.initPid("t");
+    ASSERT_EQ(txn.err, 0);
+    EXPECT_GT(txn.pid, maxIssued);
+}
+
+TEST(TxnPidBlockRegression, AllocationWaitsForCommittedCeiling) {
+    CoordRig R(Role::Leader, 1, {1, 2}, {1, 2});               // HW moves only when follower 2 fetches
+    const auto r = R.initPid("t");
+    EXPECT_EQ(r.err, kConcurrent) << "a pid was handed out before its block ceiling committed";
+    EXPECT_EQ(R.log->logEndOffset(), 1) << "only the ceiling record is written";
+    EXPECT_EQ(R.initPid("").err, kConcurrent) << "idempotent InitProducerId waits too";
+    R.fetchFrom2(R.log->logEndOffset(), 2);
+    const auto ok = R.initPid("t");
+    EXPECT_EQ(ok.err, 0) << "allocates once the ceiling is committed";
+    EXPECT_GE(ok.pid, 0);
 }

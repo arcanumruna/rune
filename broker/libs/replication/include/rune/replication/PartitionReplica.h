@@ -434,6 +434,11 @@ public:
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
+    /// F15: true once this leader has proven it holds the majority committed
+    /// frontier (DR-BUG-6 completeness gate released) — the served HW is no
+    /// longer held at the pre-failover floor.  True for a follower's last
+    /// leadership state / a replica constructed as Leader.  Owner thread only.
+    [[nodiscard]] bool        isLeaderComplete() const noexcept { return leaderComplete_; }
 
     /// Soft per-replica position snapshot for the controller's election path.
     /// leaderEpoch = epoch(); logEndPosition = logEndOffset().
