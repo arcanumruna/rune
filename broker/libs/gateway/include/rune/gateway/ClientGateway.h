@@ -872,6 +872,14 @@ private:
         // non-retriable ErrorResponse; the subscription is parked (no further
         // PushRead, no spin) until the client unsubscribes.
         bool    failed = false;
+        // F15 S4 addendum R-1 / R-3 (worker-pool PushRead path): the cursor and
+        // the HW snapshot of the PushRead in flight, and the HW snapshot at
+        // which the owning worker answered "nothing below its bound" (-1: not
+        // parked).  The subscription is not re-read until the gateway's HW
+        // snapshot moves past parkedAtHw, or its isolation carrier arrives.
+        int64_t issuedNextOffset = -1;
+        int64_t issuedHw         = -1;
+        int64_t parkedAtHw       = -1;
     };
 
     // -----------------------------------------------------------------------
@@ -1506,7 +1514,11 @@ private:
     // -----------------------------------------------------------------------
     void drainWorkerReturns_();
 
-    // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index.
+    // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index — F15 S4:
+    // ONLY for the no-worker-pool inline path (unit rigs: the control thread
+    // appends and reads those logs itself).  With a worker pool (every
+    // production mode) the OWNING worker holds and serves the read_committed
+    // state (RcState, design note §2.1-§2.4); this map is never fed or read.
     //
     // Maintains read_committed isolation state for each (topicId, partition)
     // that has received at least one transactional data batch or control marker.
@@ -1544,19 +1556,6 @@ private:
     // Map from partition key → LsoTracker + AbortedTxnIndex.
     // Single-writer: only accessed on the duty-cycle thread.
     std::unordered_map<int64_t, PartitionTxnState> partitionTxnStates_;
-public:
-    /// Test-only: the recorded aborted-txn ranges for (topicId, partition).
-    [[nodiscard]] std::vector<rune::transaction::AbortedTxnRange>
-    abortedRangesForTest(int32_t topicId, int32_t partition) const {
-        const auto* ts = getTxnStateRO(topicId, partition);
-        return ts ? ts->abortedIndex.ranges() : std::vector<rune::transaction::AbortedTxnRange>{};
-    }
-    /// Test-only: open transactions tracked for (topicId, partition).
-    [[nodiscard]] std::size_t openTxnsForTest(int32_t topicId, int32_t partition) const {
-        const auto* ts = getTxnStateRO(topicId, partition);
-        return ts ? ts->lsoTracker.openCount() : 0;
-    }
-private:
 
     // -----------------------------------------------------------------------
     // G0.1: Egress retry queue — bounded, pre-allocated, no hot-path alloc.

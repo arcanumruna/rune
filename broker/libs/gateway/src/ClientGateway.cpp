@@ -509,7 +509,13 @@ void ClientGateway::rebuildProducerStateFromLogs()
             //
             // scanTo == hw (same bound used for PSM rebuild above) — bounded to
             // committed records, never seeding from the uncommitted ahead-tail.
-            {
+            //
+            // F15 S4 (Option B): with a worker pool (every production mode) the
+            // OWNING worker builds and serves the read_committed state (§2.3) —
+            // the gateway holds none for those partitions.  Only the no-pool
+            // inline path (unit rigs; the control thread is the single reader
+            // and writer there) keeps this gateway-side state.
+            if (!workerPool_) {
                 PartitionTxnState& ts = getTxnState(topicId, partition);
                 ts.lsoTracker.clear();
                 ts.abortedIndex.clear();
@@ -1200,9 +1206,10 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 // Zero heap allocation on hot path: restampScratch_ is a reusable member array.
 // ---------------------------------------------------------------------------
 // F15 S2: the gateway-mirror facts of one successful worker append (idempotent
-// PSM update, LsoTracker feed for TRANSACTIONAL batches, dirty-log mark).  From a
-// facts-only return (deferAck) or an immediate final result.  TEMPORARY: S4
-// moves the LSO and S5 the PSM onto the owning worker.
+// PSM update, dirty-log mark).  From a facts-only return (deferAck) or an
+// immediate final result.  TEMPORARY: S5 moves the PSM onto the owning worker
+// (and deletes this function with the facts-only return).  F15 S4 deleted the
+// LsoTracker feed: the owning worker updates its own RC state at append.
 void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
 {
     // Success: TX-2 idempotent PSM update.
@@ -1213,13 +1220,6 @@ void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
             ret.topicId, ret.producerId, ret.partition,
             ret.producerEpoch, ret.baseSequence, lastSeqInBatch,
             ret.baseOffset);
-
-        // TX-4 Task 9: Feed LsoTracker for transactional data batches.
-        constexpr uint16_t kTransactionalBit = 0x10u;
-        if (ret.batchAttrs & kTransactionalBit) {
-            getTxnState(ret.topicId, ret.partition)
-                .lsoTracker.onProduceBatch(ret.producerId, ret.baseOffset);
-        }
     }
 
     // Mark log dirty for group-commit fsync.
@@ -2418,6 +2418,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
                     // permanent record loss.
                     gsub.isolation            = msg.isolation;
                     gsub.groupCarrierReceived = true;
+                    gsub.parkedAtHw           = -1;   // F15 R-3: a new isolation → read again
                     spdlog::debug("ClientGateway: Subscribe carries isolation={} to group "
                                   "sub sessionId={} subId={} topic={} partition={} "
                                   "(no duplicate subscription)",
@@ -2591,8 +2592,15 @@ void ClientGateway::pushSubscriptions()
         // internal coordinator data, not application records).
         //
         // No heap alloc: getTxnStateRO is O(unordered_map lookup) = O(1) amortised.
+        //
+        // F15 S4 (I-B): with a worker pool the gateway makes NO read_committed
+        // decision.  Its HW snapshot only bounds (loosens) the PushRead request;
+        // the owning worker clamps the answer to its own LSO and strips aborted
+        // and control batches (executePushReadWire_).  Only the no-pool inline
+        // path below keeps a gateway-side LSO.
         int64_t bound = hw;
-        if (sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted)) {
+        if (!workerPool_ &&
+            sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted)) {
             if (const PartitionTxnState* ts = getTxnStateRO(sub.topicId, sub.partition)) {
                 bound = ts->lsoTracker.lso(hw);
             }
@@ -2614,6 +2622,12 @@ void ClientGateway::pushSubscriptions()
                 // In-flight — skip until the return is processed.
                 continue;
             }
+            // F15 addendum R-3: the owning worker answered "nothing below its
+            // bound" (an open txn pins the LSO, a pre-carrier cut, the HW) for
+            // this cursor at HW snapshot parkedAtHw — re-issue only once the HW
+            // snapshot moved past it (any LSO advance needs a marker append,
+            // which moves the HW).  No empty-PushRead spin.
+            if (sub.parkedAtHw >= 0 && hw <= sub.parkedAtHw) continue;
 
             // Look up the owning replica (for the log accessor in the worker).
             const rune::replication::PartitionReplica* repForRead = nullptr;
@@ -2643,6 +2657,9 @@ void ClientGateway::pushSubscriptions()
             } else {
                 // Successfully enqueued — mark as in-flight.
                 pendingWorkerReads_.insert(subId);
+                sub.issuedNextOffset = sub.nextOffset;   // R-1: the cursor this read answers
+                sub.issuedHw         = bound;
+                sub.parkedAtHw       = -1;
             }
             continue; // Gateway will process the return in the next cycle.
         }
@@ -3034,8 +3051,8 @@ void ClientGateway::onControlRecordAppended_(const rune::node::WorkerReturn& ret
                                                              m.coordinatorEpoch);
         return;
     }
-    // The AUTHORITATIVE offset: where the worker actually appended the marker.
-    notifyControlMarker(m.topicId, m.partition, m.producerId, ret.baseOffset, m.commit);
+    // F15 S4 (Option B): the owning worker applied the marker to its own RC
+    // state in the same invocation as the append — the gateway holds none.
     // Round 5: only now may the coordinator count this partition's marker as
     // written (the transaction completes when the last one lands).
     if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId, m.coordinatorEpoch);
@@ -3259,17 +3276,33 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 return;
             }
 
-            if (ret.chunk.empty()) return; // nothing to push this cycle
-
-            // Find the owning session.
-            Session* session = sessions_.find(ret.sessionId);
-            if (!session) return;
-
             // Find the subscription (it may have been removed if the client
             // unsubscribed while the read was in-flight).
             auto subIt = subscriptions_.find(ret.subscriptionId);
             if (subIt == subscriptions_.end()) return;
             Subscription& sub = subIt->second;
+            // A result for a cursor the subscription no longer holds (rewound /
+            // re-seeded meanwhile) carries nothing to adopt.
+            const bool current = sub.nextOffset == sub.issuedNextOffset;
+
+            if (ret.chunk.empty()) {
+                // F15 addendum R-1: the worker may have consumed batches without
+                // returning any (a trailing marker, an aborted tail stripped on
+                // the worker) — adopt its cursor, else the partition is re-read
+                // every cycle.  R-3: a cursor at the worker's effective bound
+                // parks until the gateway's HW snapshot moves.
+                if (current) {
+                    if (ret.newNextOffset > sub.nextOffset) sub.nextOffset = ret.newNextOffset;
+                    if (!ret.pushRcNotReady() && sub.nextOffset >= ret.pushEffectiveBound())
+                        sub.parkedAtHw = sub.issuedHw;
+                }
+                return;
+            }
+
+            // Find the owning session.
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            if (!current) return;   // stale cursor: the next push cycle re-reads
 
             // Iterate whole record batches in the chunk — mirrors the inline
             // pushSubscriptions() loop exactly.
@@ -3360,39 +3393,10 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                     continue;
                 }
 
-                // TX-4: Aborted-txn filter for read_committed.
-                if (ret.isolation == static_cast<uint8_t>(
-                        rune::transaction::IsolationLevel::ReadCommitted)
-                    && (batchAttrs & kTransactionalBit))
-                {
-                    constexpr std::size_t kPidOff =
-                        static_cast<std::size_t>(kProducerIdOffset);
-                    if (chunkPos + kPidOff + 8u <= chunkSize) {
-                        int64_t batchPid = 0;
-                        for (int bi = 0; bi < 8; ++bi)
-                            batchPid |= (static_cast<int64_t>(
-                                batchPtr[kPidOff + bi]) << (bi * 8));
-
-                        if (const PartitionTxnState* ts =
-                                getTxnStateRO(ret.readTopicId, ret.readPartition))
-                        {
-                            if (ts->abortedIndex.isAborted(batchPid, baseOffset)) {
-                                if (sub.isGroup && !sub.groupCarrierReceived) {
-                                    spdlog::debug(
-                                        "ClientGateway: push (worker) sub={} "
-                                        "pre-carrier group sub stalling at aborted "
-                                        "batch offset={}",
-                                        ret.subscriptionId, baseOffset);
-                                    break;
-                                }
-                                chunkPos += batchSize;
-                                sub.nextOffset =
-                                    baseOffset + static_cast<int64_t>(recordCount);
-                                continue;
-                            }
-                        }
-                    }
-                }
+                // F15 S4 (I-B): aborted transactional batches were stripped by
+                // the owning worker (and, before a group's isolation carrier,
+                // the chunk was CUT at the first one — addendum R-2): the
+                // gateway makes no read_committed decision.
 
                 // Guard: batch too large for scratch.
                 const std::size_t needed =
@@ -3476,6 +3480,14 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                         "offset={} (pos={})",
                         ret.subscriptionId, baseOffset, pos);
                 }
+            }
+            // F15 addendum R-1 / R-3: every batch of the chunk was delivered →
+            // adopt the worker's cursor (it is past the batches it stripped
+            // after the last one returned) and park at its effective bound.
+            if (!backPressured && chunkPos >= chunkSize) {
+                if (ret.newNextOffset > sub.nextOffset) sub.nextOffset = ret.newNextOffset;
+                if (!ret.pushRcNotReady() && sub.nextOffset >= ret.pushEffectiveBound())
+                    sub.parkedAtHw = sub.issuedHw;
             }
             return;
         }
