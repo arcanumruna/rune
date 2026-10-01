@@ -628,6 +628,10 @@ void Log::unpinSegmentFlush(LogSegment* seg) noexcept {
         }
     }
 }
+int64_t Log::nextSegmentBaseAfter(int64_t offset) const noexcept {
+    const auto it = segments_.upper_bound(offset);
+    return it == segments_.end() ? -1 : it->first;
+}
 std::vector<int64_t> Log::segmentBaseOffsets() const {
     std::vector<int64_t> v; for (auto& [b, _] : segments_) v.push_back(b); return v;
 }

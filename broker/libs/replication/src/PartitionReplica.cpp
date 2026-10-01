@@ -229,6 +229,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     Offset committedHw = highWatermark();
 
     epoch_ = newEpoch;
+    if (role_ != Role::Leader) ++leadershipGeneration_;   // F15 S4: a new leadership (not an epoch bump)
     role_  = Role::Leader;
 
     // Use the full assigned replica set (RF), NOT the (possibly leader-only) ISR,
@@ -408,6 +409,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     }
 
     epoch_    = leaderEpoch;
+    if (role_ != Role::Follower) ++leadershipGeneration_;   // F15 S4
     role_     = Role::Follower;
     leaderId_ = leaderId;
     followerHw_ = 0;
@@ -634,6 +636,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         // Step ourselves down to follower (fence against further leader activity).
         // We adopt the follower's higher epoch and the same leaderId as ourselves
         // (the control plane will correct the leaderId via the next metadata push).
+        ++leadershipGeneration_;   // F15 S4: self-demotion ends this leadership
         role_     = Role::Follower;
         epoch_    = req.leaderEpoch;
         leaderId_ = req.followerId; // best-effort; coordinator will correct

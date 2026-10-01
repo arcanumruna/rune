@@ -159,6 +159,11 @@ public:
     /// The active segment is physically truncated at the correct byte boundary.
     void truncateTo(int64_t truncateOffset);
     std::vector<int64_t> segmentBaseOffsets() const;
+    /// F15 S4 (I-C): the base offset of the first segment whose base is
+    /// strictly above `offset`, or -1 if none.  Non-allocating, O(log segments);
+    /// owner (append) thread only.  The read_committed build skips an empty
+    /// view (a gap below its target) with it.
+    [[nodiscard]] int64_t nextSegmentBaseAfter(int64_t offset) const noexcept;
     int64_t totalBytes() const;
     int deleteOldSegments(int64_t retainBytes);
     /// Directory that contains this log's segment files.

@@ -444,6 +444,13 @@ public:
     /// logGeneration() (a reconcile append records the LEO before it): every
     /// offset below it is unchanged by that change.  Owner thread only.
     [[nodiscard]] Offset      lastTruncationOffset() const noexcept { return lastTruncationOffset_; }
+    /// F15 S4: bumped on every Leader <-> Follower transition (becomeLeader from
+    /// a non-leader, becomeFollower, self-demotion in onFetchRequest) — NOT on a
+    /// leader-epoch bump while still Leader.  While Follower the log may grow by
+    /// replicated appends that a leader-side incremental state never saw, so the
+    /// worker's read_committed state is valid only within one leadership.
+    /// Owner thread only (plain member, no atomic).
+    [[nodiscard]] uint64_t    leadershipGeneration() const noexcept { return leadershipGeneration_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
 
@@ -860,6 +867,7 @@ private:
     uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
     uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation / reconcile append
     Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
+    uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     void checkpointEpochs_();
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker
