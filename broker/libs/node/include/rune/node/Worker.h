@@ -331,6 +331,17 @@ public:
     // Per-tick drain batch limits (NodeConfig knobs — see NodeConfig.h).  Call
     // before the worker's AgentRunner starts (startup, single-threaded).
     void setIngressDrainLimit(int32_t n) noexcept { ingressDrainLimit_ = (n >= 1) ? n : 1024; }
+    /// F18: largest produce batch the per-worker ingress path accepts (larger →
+    /// MessageTooLarge, before append), = NodeConfig::produceIntakeLimit().  Cold setter.
+    void setMaxProduceBatchBytes(std::size_t n) noexcept { maxProduceBatchBytes_ = n; }
+    [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept { return maxProduceBatchBytes_; }
+    /// F18: can an op carrying a `tailLen`-byte variable tail (record batch /
+    /// replicated records) be claimed in ONE ingress-ring frame?  Callers that
+    /// cannot back off by retrying (the follower apply path) check this first.
+    [[nodiscard]] bool opTailFits(std::size_t tailLen) const {
+        return workerOpFrameBytes(tailLen) <= static_cast<std::size_t>(ingress_.maxMsgLength());
+    }
+    [[nodiscard]] uint64_t oversizedOpsRefusedForTest() const noexcept { return oversizedOpsRefused_; }
     void setReturnDrainLimit(int32_t n)  noexcept { returnDrainLimit_  = (n >= 1) ? n : 1024; }
 
     // Configure the per-produce-ack return-ring reservation slot size (bytes).  The
@@ -378,6 +389,12 @@ public:
     // WorkerPool) pass a WorkerOp and observe the same false-on-full contract.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
+        return enqueueOp(std::move(op)) == EnqueueResult::Enqueued;
+    }
+
+    /// F18 (m-1): tryEnqueueOp with the failure kind exposed — Full (ring
+    /// back-pressure: retry) vs TooLarge (can never fit: never retry).
+    [[nodiscard]] EnqueueResult enqueueOp(WorkerOp op) {
         // SBE wrap-in-place: reserve the exact ring slot (computeLength — no
         // hand-rolled size), then encode the WorkerOp DIRECTLY into the claimed
         // buffer via the SBE flyweight (no intermediate struct, no memcpy).
@@ -433,11 +450,21 @@ public:
 
         // Total frame = SBE MessageHeader (8) + block + varData.  computeLength()
         // covers block+varData only, so add the header explicitly.
-        const std::size_t n =
-            sbe::MessageHeader::encodedLength() + sbe::WorkerOp::computeLength(tailLen);
+        const std::size_t n = workerOpFrameBytes(tailLen);
+        // F18: an op larger than one ring frame would make tryClaim THROW (agrona
+        // checkMsgLength) and terminate the control thread.  Unreachable when
+        // intake is bounded (produceIntakeLimit) and the follower apply path
+        // pre-checks opTailFits(); refuse loudly instead of crashing.
+        if (n > static_cast<std::size_t>(ingress_.maxMsgLength())) [[unlikely]] {
+            ++oversizedOpsRefused_;
+            spdlog::error("Worker {}: op type={} tail {} B exceeds the ingress ring frame "
+                          "({} B); refused (TooLarge, not retriable)", workerId_,
+                          static_cast<int>(op.type), tailLen, ingress_.maxMsgLength());
+            return EnqueueResult::TooLarge;
+        }
         const aeron::util::index_t idx =
             ingress_.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
-        if (idx < 0) return false;  // ring full — back-pressure
+        if (idx < 0) return EnqueueResult::Full;  // ring full — back-pressure
 
         sbe::WorkerOp enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(ingress_.base() + idx), 0, n);
@@ -492,7 +519,7 @@ public:
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
         ingress_.commit(idx);
-        return true;
+        return EnqueueResult::Enqueued;
     }
 
     // -----------------------------------------------------------------------
@@ -1794,6 +1821,14 @@ private:
             return;
         }
 
+        // F18 (B-1): the transport could not hand us the batch at op.nextOffset()
+        // (too large for this ring on its own) — the replica decides whether that
+        // is the batch at its LEO (wedge) or not (ignore).
+        if (op.replErrorCode() == rune::replication::kErrRecordTooLarge) [[unlikely]] {
+            replica->onUnapplicableBatch(op.nextOffset(), op.replLeaderEpoch());
+            return;
+        }
+
         const uint32_t tailLen = op.tailLength();
         const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
 
@@ -2650,6 +2685,8 @@ private:
     // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
     // default so routed replication ops / acks don't queue behind a tiny cap).
     int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
+    std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;  // F18; BrokerNode sets it
+    uint64_t    oversizedOpsRefused_  = 0;                    // F18: ops > one ring frame
     int32_t returnDrainLimit_  = 1024;  // RUNE_WORKER_RETURN_DRAIN_LIMIT
     // FR trace: monotonic count of routed replication ops (fetch/apply) dequeued
     // from the ingress ring — pairs 1:1 (FIFO) with the control thread's
@@ -3544,6 +3581,17 @@ private:
                          workerId_, msg.topicId, msg.partition);
             // E5.1.3 review fix #2: use enum, not magic literal.
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // F18: the same LOUD intake guard as the gateway path — a batch above the
+        // intake limit could be appended but never replicated in one frame.
+        if (rbSpan.size() > maxProduceBatchBytes_) [[unlikely]] {
+            spdlog::warn("Worker {}: WorkerIngress: produce batch too large ({} > {}); "
+                         "rejected (MessageTooLarge)", workerId_, rbSpan.size(),
+                         maxProduceBatchBytes_);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
             enqueueReturn_(ret);
             return 1;
         }

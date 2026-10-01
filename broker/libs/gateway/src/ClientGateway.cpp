@@ -1732,7 +1732,18 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // same batch (same producer sequence) — never Internal: nothing was
         // appended, so a retry is always safe.  (The client frame aliases the
         // Aeron fragment, so the gateway cannot hold it for its own retry.)
-        if (!workerPool_->tryEnqueueOp(msg.topicId, partition, std::move(op))) {
+        const rune::node::EnqueueResult er =
+            workerPool_->enqueueOp(msg.topicId, partition, std::move(op));
+        if (er == rune::node::EnqueueResult::TooLarge) [[unlikely]] {
+            // F18 (m-1): the batch can NEVER fit one worker-ingress frame — not
+            // back-pressure.  NotLeader would make the client retry it forever;
+            // answer the non-retriable MessageTooLarge instead (loud).  Unreachable
+            // while maxProduceBatchBytes_ <= the intake limit.
+            spdlog::error("ClientGateway: produce batch {} B for topicId={} partition={} exceeds "
+                          "the worker ingress frame; MessageTooLarge",
+                          batchLen, msg.topicId, partition);
+            sendResp(pc::ErrorCode::MessageTooLarge, partition, 0);
+        } else if (er != rune::node::EnqueueResult::Enqueued) {
             ++produceBackPressured_;
             if (produceBackPressured_ == 1 || (produceBackPressured_ & 1023u) == 0)
                 spdlog::warn("ClientGateway: worker back-pressure for topicId={} partition={}; "

@@ -472,6 +472,12 @@ public:
     // Default: 1 (single-node safe; for 3-node clusters, set to 2).
     // Thread-safe (atomic store): may be called from any thread.
     // -----------------------------------------------------------------------
+    /// F18: largest produce batch accepted (larger → MessageTooLarge, before
+    /// append).  BrokerNode sets NodeConfig::produceIntakeLimit() — at most one
+    /// replication frame — before the gateway serves.  Cold setter.
+    void setMaxProduceBatchBytes(std::size_t n) noexcept { maxProduceBatchBytes_ = n; }
+    [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept { return maxProduceBatchBytes_; }
+
     void setMinIsr(int minIsr) noexcept {
         minIsr_.store((minIsr >= 1) ? minIsr : 1, std::memory_order_relaxed);
     }
@@ -1118,7 +1124,10 @@ private:
     // longer needs a fixed restamp scratch — the base offset is patched into the
     // page cache / ring slot via pwritev — so this bound only guards against an
     // absurd/malformed length overrunning the worker ingress ring or a segment.
-    // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
+    // F18: BrokerNode overrides it with NodeConfig::produceIntakeLimit(), which fits
+    // ONE frame on every hop (worker-ingress op ring, replication outbound ring,
+    // Aeron term/8) so an accepted batch is always replicable.  8 MiB is only the
+    // standalone-gateway (test) default.
     std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().

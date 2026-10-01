@@ -29,6 +29,8 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/storage/Log.h>
 
 #include <Aeron.h>
@@ -2240,4 +2242,317 @@ TEST(ReplicaLifetimeRegression, IncarnationWrapSkipsValuesTheOwnerMapStillHolds)
     R.add(1, 2);                                             // 0xFFFFFFFE (pre-wrap)
     auto* c = R.add(1, 3);                                   // wraps: FFFFFFFF, 0, 1 (live), 2 (held) skipped
     EXPECT_EQ(c->incarnation(), 3u) << "an incarnation still held by the owner map is never reissued";
+}
+
+// ============================================================================
+// F18: the per-worker ingress path enforces the same validated produce-batch
+// limit as the gateway — an over-limit batch is refused LOUDLY (MessageTooLarge)
+// and never appended (it could be appended but never replicated in one frame).
+// ============================================================================
+TEST(ProduceBatchLimitRegression, WorkerIngressRejectsOverLimitBatchMessageTooLarge) {
+    StrictShard s;
+    const auto b = batchAt(0, 1, 512);
+    s.w.setMaxProduceBatchBytes(b.size() - 1);
+    ASSERT_EQ(s.produce(1, b, 0, 1), 1);
+    Acks a;
+    a.drain(s.w);
+    ASSERT_EQ(a.n, 1);
+    EXPECT_EQ(a.rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(s.log->logEndOffset(), 0) << "an over-limit batch must never be appended";
+
+    s.w.setMaxProduceBatchBytes(b.size());                 // exactly at the limit: accepted
+    ASSERT_EQ(s.produce(2, b, 0, 2), 1);
+    EXPECT_EQ(s.log->logEndOffset(), 1);
+}
+
+// ============================================================================
+// F18: the FOLLOWER apply path (FetchResponse / reconcile response → worker op
+// ring) must never terminate the process on records larger than one worker
+// ingress frame (tryClaim THROWS on an oversized claim), nor livelock the
+// subscription by ABORTing (redelivered forever).  It is refused as a counted
+// replication error and the fragment is consumed; normal frames still route.
+// ============================================================================
+namespace {
+std::vector<uint8_t> encodeBigFetchResp(int32_t topic, int32_t part, std::size_t valueBytes,
+                                        uint16_t tid = rune::replication::FetchResponseMsg::TEMPLATE_ID) {
+    const auto b = batchAt(0, 1, valueBytes);
+    std::vector<uint8_t> f(rune::replication::FetchResponseMsg::encodedSize(b.size()));
+    rune::replication::FetchResponseMsg::encode(f.data(), 0, 1, part, 0, 0, rune::replication::kErrNone,
+                                                std::span<const uint8_t>(b), topic);
+    rune::replication::stampTemplateId(f.data(), 0, tid);
+    return f;
+}
+} // namespace
+
+TEST(ProduceBatchLimitRegression, FollowerApplyOfOversizedRecordsIsRefusedNotFatal) {
+    TmpDir ad;
+    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rune::replication::AeronPartitionTransport tr(client, "aeron:ipc", 7303, /*self*/1, 1 << 20);
+    // A FOLLOWER replica (node 1 follows leader 2) owned by a worker with 8 KiB frames.
+    Reg R;
+    fs::create_directories(R.d.path / "follower");
+    Log flog((R.d.path / "follower").string(), 64LL * 1024 * 1024);
+    flog.recover();
+    auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 5, 0), Role::Follower, 1,
+        std::vector<rune::replication::NodeId>{1, 2}, std::vector<rune::replication::NodeId>{1, 2},
+        &flog, &R.t);
+    rep->becomeFollower(1, 2);
+    PartitionReplica* const follower = rep.get();
+    R.reg.add(5, 0, std::move(rep));
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), /*ingress*/ 1 << 16, 1 << 16, 16, 16);   // 8 KiB frames
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    tr.setReplicaRegistry(&R.reg);
+    tr.setWorkerPool(&pool);
+    pool.reconcile(R.reg);
+    ackAll(pool);
+
+    const auto big = encodeBigFetchResp(5, 0, 16 * 1024);
+    ASSERT_FALSE(pool.opTailFits(5, 0, big.size()));
+    bool consumed = false;
+    EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(big.data(), big.size(), 1));
+    EXPECT_TRUE(consumed) << "never ABORT (redelivered forever → subscription livelock)";
+    EXPECT_EQ(tr.oversizedApplyRefused(), 1u);
+    // F18 fix round 1 (I-1): the follower is TOLD (on its owning worker) and wedges
+    // at its LEO — it stops fetching and leaves the ISR instead of a silent stall.
+    pool.worker(0).doWork(2);
+    EXPECT_EQ(follower->wedgedAtOffset(), 0) << "the follower must wedge, not re-fetch forever";
+    EXPECT_EQ(follower->wedgedRefusals(), 1u);
+
+    const auto bigRec = encodeBigFetchResp(5, 0, 16 * 1024, rune::replication::kReconcileFetchRespTemplateId);
+    EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(bigRec.data(), bigRec.size(), 3));
+    EXPECT_TRUE(consumed);
+    EXPECT_EQ(tr.oversizedApplyRefused(), 2u);
+
+    // A normal-size response still routes to the worker (no false refusals).
+    const auto small = encodeFetchResp(5, 0);
+    EXPECT_TRUE(tr.deliverFrameForTest(small.data(), small.size(), 4));
+    EXPECT_EQ(tr.oversizedApplyRefused(), 2u);
+    pool.worker(0).doWork(5);
+    EXPECT_EQ(pool.worker(0).oversizedOpsRefusedForTest(), 0u);
+}
+
+TEST(ProduceBatchLimitRegression, WorkerEnqueueOfOversizedOpRefusesInsteadOfThrowing) {
+    Worker w(0, /*ingress*/ 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{});
+    WorkerOp op;
+    op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 5; op.partition = 0;
+    op.replicatedPayload.records.assign(16 * 1024, 0xAB);
+    ASSERT_FALSE(w.opTailFits(op.replicatedPayload.records.size()));
+    EnqueueResult r = EnqueueResult::Enqueued;
+    EXPECT_NO_THROW(r = w.enqueueOp(std::move(op)));
+    EXPECT_EQ(r, EnqueueResult::TooLarge) << "distinguishable from ring-full (never retried)";
+    EXPECT_EQ(w.oversizedOpsRefusedForTest(), 1u);
+
+    // A full ring is reported as Full, not TooLarge.
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (w.tryEnqueueOp(filler)) {}
+    EXPECT_EQ(w.enqueueOp(filler), EnqueueResult::Full);
+}
+
+// F18: the GATEWAY produce intake answers MessageTooLarge for a batch above the
+// intake limit (BrokerNode sets it to NodeConfig::produceIntakeLimit(), at most
+// one replication frame) — before any append; a batch at the limit is accepted.
+TEST(ProduceBatchLimitRegression, GatewayIntakeRejectsBatchAboveLimitBeforeAppend) {
+    MarkerRig m;
+    const int64_t sid = m.gw.injectTestSession();
+    const auto batch = batchAt(0, 1, 2048);
+    auto produce = [&](int64_t corr) {
+        pc::Produce msg;
+        msg.sessionId = sid; msg.correlationId = corr; msg.topicId = 0; msg.partition = 0;
+        msg.partitionKnown = 1; msg.acks = 0; msg.producerId = -1;
+        msg.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        msg.encode(frame.data());
+        m.gw.applyProduceForTest(frame.data(), frame.size());
+    };
+    m.gw.setMaxProduceBatchBytes(batch.size() - 1);
+    produce(1);
+    ASSERT_EQ(m.cap.produceErrors.size(), 1u);
+    EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    m.runWorker(1);
+    EXPECT_EQ(m.r->log()->logEndOffset(), 0) << "refused before append";
+
+    m.gw.setMaxProduceBatchBytes(batch.size());
+    produce(2);
+    for (int i = 0; i < 64 && m.r->log()->logEndOffset() == 0; ++i) m.runWorker(10 + i);   // bounded
+    EXPECT_EQ(m.r->log()->logEndOffset(), 1) << "a batch at the limit is accepted";
+}
+
+// F18 fix round 1 (m-1): a produce batch the gateway admits but the worker ring
+// can never hold is answered the NON-retriable MessageTooLarge — not the
+// retriable NotLeader (which made the client re-send it forever).
+TEST(ProduceBatchLimitRegression, GatewayAnswersMessageTooLargeWhenWorkerFrameIsSmaller) {
+    MarkerRig m;                                           // worker ingress 64 KiB → 8 KiB frames
+    const int64_t sid = m.gw.injectTestSession();
+    const auto batch = batchAt(0, 1, 16 * 1024);           // < gateway limit, > worker frame
+    ASSERT_GE(m.gw.maxProduceBatchBytes(), batch.size());
+    pc::Produce msg;
+    msg.sessionId = sid; msg.correlationId = 1; msg.topicId = 0; msg.partition = 0;
+    msg.partitionKnown = 1; msg.acks = 0; msg.producerId = -1;
+    msg.recordBatch = std::span<const uint8_t>(batch);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    msg.encode(frame.data());
+    EXPECT_NO_THROW(m.gw.applyProduceForTest(frame.data(), frame.size()));
+    ASSERT_EQ(m.cap.produceErrors.size(), 1u);
+    EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(m.r->log()->logEndOffset(), 0);
+}
+
+// ============================================================================
+// F18 fix round 2 (B-1): the follower-side check must look at the BATCH at the
+// follower's LEO, not the whole response.  A multi-batch response (fetch
+// prefix / push / overlapping duplicate) larger than this node's worker frame,
+// where every batch fits on its own, must NOT wedge a healthy follower — it is
+// dropped (the follower's capped fetch then gets it one frame at a time).  An
+// oversized batch that is NOT at the follower's LEO must not wedge either.
+// ============================================================================
+namespace {
+std::vector<uint8_t> encodeFetchRespOf(int32_t topic, int32_t part, const std::vector<uint8_t>& recs) {
+    std::vector<uint8_t> f(rune::replication::FetchResponseMsg::encodedSize(recs.size()));
+    rune::replication::FetchResponseMsg::encode(f.data(), 0, 1, part, 0, 0, rune::replication::kErrNone,
+                                                std::span<const uint8_t>(recs), topic);
+    return f;
+}
+struct FollowerRig {
+    TmpDir ad;
+    EmbeddedDriverConfig dc;
+    std::unique_ptr<EmbeddedDriver> drv;
+    std::shared_ptr<aeron::Aeron> client;
+    std::unique_ptr<rune::replication::AeronPartitionTransport> tr;
+    Reg R;
+    std::unique_ptr<Log> flog;
+    PartitionReplica* follower = nullptr;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1), /*ingress*/ 1 << 16, 1 << 16, 16, 16};   // 8 KiB frames
+    explicit FollowerRig(int32_t stream) {
+        dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+        drv = std::make_unique<EmbeddedDriver>(dc, DriverMode::Threaded);
+        aeron::Context ctx; ctx.aeronDir(ad.path.string());
+        client = aeron::Aeron::connect(ctx);
+        tr = std::make_unique<rune::replication::AeronPartitionTransport>(client, "aeron:ipc", stream, 1, 1 << 20);
+        fs::create_directories(R.d.path / "follower");
+        flog = std::make_unique<Log>((R.d.path / "follower").string(), 64LL * 1024 * 1024);
+        flog->recover();
+        auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 5, 0), Role::Follower, 1,
+            std::vector<rune::replication::NodeId>{1, 2}, std::vector<rune::replication::NodeId>{1, 2},
+            flog.get(), &R.t);
+        rep->becomeFollower(1, 2);
+        follower = rep.get();
+        R.reg.add(5, 0, std::move(rep));
+        pool.assignFromRegistry(R.reg);
+        pool.setRegistry(&R.reg);
+        pool.setRunnersStartedForTest(true);
+        tr->setReplicaRegistry(&R.reg);
+        tr->setWorkerPool(&pool);
+        pool.reconcile(R.reg);
+        ackAll(pool);
+    }
+};
+} // namespace
+
+TEST(ProduceBatchLimitRegression, MultiBatchResponseAboveWorkerFrameDoesNotWedgeHealthyFollower) {
+    FollowerRig rig(7304);
+    // Two batches [0] and [1], ~5 KiB each: each fits the 8 KiB frame, the pair does not.
+    std::vector<uint8_t> recs = batchAt(0, 1, 5 * 1024);
+    const auto b1 = batchAt(1, 1, 5 * 1024);
+    recs.insert(recs.end(), b1.begin(), b1.end());
+    ASSERT_FALSE(rig.pool.opTailFits(5, 0, recs.size()));
+    ASSERT_TRUE(rig.pool.opTailFits(5, 0, b1.size()));
+    const auto f = encodeFetchRespOf(5, 0, recs);
+    EXPECT_TRUE(rig.tr->deliverFrameForTest(f.data(), f.size(), 1));
+    rig.pool.worker(0).doWork(2);
+    EXPECT_EQ(rig.follower->wedgedAtOffset(), -1) << "every batch fits: a healthy follower must never wedge";
+    EXPECT_EQ(rig.follower->wedgedRefusals(), 0u);
+    // ...and a single fitting batch is then applied normally.
+    const auto f0 = encodeFetchRespOf(5, 0, batchAt(0, 1, 5 * 1024));
+    EXPECT_TRUE(rig.tr->deliverFrameForTest(f0.data(), f0.size(), 3));
+    rig.pool.worker(0).doWork(4);
+    EXPECT_EQ(rig.follower->logEndOffset(), 1);
+    EXPECT_EQ(rig.follower->wedgedAtOffset(), -1);
+}
+
+TEST(ProduceBatchLimitRegression, OversizedBatchNotAtFollowerLeoDoesNotWedge) {
+    FollowerRig rig(7305);
+    // An oversized batch at base 7 (e.g. a push from further ahead) while LEO = 0.
+    const auto f = encodeFetchRespOf(5, 0, batchAt(7, 1, 16 * 1024));
+    EXPECT_TRUE(rig.tr->deliverFrameForTest(f.data(), f.size(), 1));
+    rig.pool.worker(0).doWork(2);
+    EXPECT_EQ(rig.follower->wedgedAtOffset(), -1) << "only the batch AT the follower's LEO can wedge it";
+}
+
+// ============================================================================
+// F18 fix round 3 (B-3): the DR-BUG-6 reverse pull (a deficient leader pulling
+// committed records from an ahead survivor) must be capped to the PULLING node's
+// own worker apply frame, exactly like a follower fetch (B-1).  Before: the pull
+// asked maxFetchBytes (1 MiB), the survivor answered a multi-batch prefix bounded
+// only by ITS frame, and the puller refused the whole reply (above its worker
+// frame although every batch fits) on every retry — reconcile never completed,
+// the partition stayed unwritable.  Two REAL AeronPartitionTransports over
+// aeron:ipc on one driver: A (deficient leader, 8 KiB worker frames, the
+// production apply cap) pulls ~30 KiB of SMALL batches from B (ahead survivor,
+// large frames).  Bounded progress loop; no sleeps.
+// ============================================================================
+TEST(ProduceBatchLimitRegression, ReconcilePullOfSmallBatchesAboveOwnFrameCompletes) {
+    TmpDir ad;
+    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 1 << 20;   // pub frame 128 KiB
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    constexpr int32_t kStreamA = 7320, kStreamB = 7321;
+    rune::replication::AeronPartitionTransport trA(client, "aeron:ipc", kStreamA, /*self*/1, 1 << 20);
+    rune::replication::AeronPartitionTransport trB(client, "aeron:ipc", kStreamB, /*self*/2, 1 << 20);
+    trA.addPeer(2, "aeron:ipc", kStreamB);
+    trB.addPeer(1, "aeron:ipc", kStreamA);
+    trA.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(dc.termBufferBytes));
+    trB.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(dc.termBufferBytes));
+    constexpr int kIngressRing = 1 << 16;                                   // 8 KiB op frames on A
+    trA.setApplyRecordsCap(kIngressRing / 8 - static_cast<int64_t>(workerOpFrameBytes(0)));   // as BrokerNode
+
+    TmpDir la, lb;
+    Log logA(la.path.string(), 64LL * 1024 * 1024); logA.recover();
+    Log logB(lb.path.string(), 64LL * 1024 * 1024); logB.recover();
+    const std::vector<rune::replication::NodeId> both{1, 2};
+    auto repA = std::make_unique<PartitionReplica>(cfg(1, 1, 5, 0), Role::Leader, 1, both,
+                                                   std::vector<rune::replication::NodeId>{1}, &logA, &trA);
+    auto repB = std::make_unique<PartitionReplica>(cfg(2, 1, 5, 0), Role::Leader, 1, both,
+                                                   std::vector<rune::replication::NodeId>{2}, &logB, &trB);
+    PartitionReplica* const deficient = repA.get();
+    for (int i = 0; i < 30; ++i)                                            // ~30 KiB of 1 KiB batches
+        ASSERT_EQ(repB->append(std::vector<uint8_t>(1024, static_cast<uint8_t>(i)), false), i);
+    ReplicaRegistry regA, regB;
+    regA.add(5, 0, std::move(repA));
+    regB.add(5, 0, std::move(repB));
+    trB.setReplicaRegistry(&regB);                                          // B serves inline
+    WorkerPool poolA(1, rune::metadata::ShardRouter(1), kIngressRing, 1 << 16, 16, 16);
+    poolA.assignFromRegistry(regA);
+    poolA.setRegistry(&regA);
+    poolA.setRunnersStartedForTest(true);
+    trA.setReplicaRegistry(&regA);
+    trA.setWorkerPool(&poolA);
+    poolA.reconcile(regA);
+    ackAll(poolA);
+
+    rune::replication::FetchRequestMsg pull{};
+    pull.leaderEpoch = 1; pull.partition = 0; pull.followerId = 1;
+    pull.fetchOffset = 0; pull.maxBytes = 1 << 20; pull.topicId = 5;        // = cfg maxFetchBytes
+    constexpr int kSpin = 400'000;                                          // hard cap (no sleeps)
+    int i = 0;
+    for (; i < kSpin && deficient->logEndOffset() == 0 && trA.oversizedApplyRefused() == 0; ++i) {
+        if (i % 4'000 == 0) {                                               // (re)issue: pubs resolve lazily
+            pull.fetchOffset = deficient->logEndOffset();
+            trA.sendReconcileRequest(2, pull);
+        }
+        trA.poll(i);
+        trB.poll(i);
+        poolA.worker(0).doWork(i);
+        std::this_thread::yield();
+    }
+    ASSERT_LT(i, kSpin) << "no reconcile reply arrived at all (transport wiring)";
+    EXPECT_EQ(trA.oversizedApplyRefused(), 0u)
+        << "the survivor's reply exceeded the puller's own frame: reconcile can never complete";
+    EXPECT_GT(deficient->logEndOffset(), 0) << "the pulled committed records must be applied";
 }

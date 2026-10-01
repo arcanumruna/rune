@@ -125,6 +125,15 @@ public:
         return router_;
     }
 
+    /// F18: does an op with a `tailLen`-byte tail fit ONE frame of the owning
+    /// worker's ingress ring?  (See Worker::opTailFits.)  Called once per follower
+    /// FetchResponse on the control thread: the router lookup is pure arithmetic
+    /// (ShardRouter::workerForPartition), the same one tryEnqueueOp already does.
+    [[nodiscard]] bool opTailFits(int32_t topicId, int32_t partition, std::size_t tailLen) const {
+        return workers_[static_cast<std::size_t>(router_.workerForPartition(topicId, partition))]
+            ->opTailFits(tailLen);
+    }
+
     // Return the worker that owns (topicId, partition) per the router.
     // ASSIGNMENT-TIME only — do not call on the doWork hot path.
     [[nodiscard]] int32_t ownerWorkerId(int32_t topicId,
@@ -351,6 +360,12 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] bool tryEnqueueOp(int32_t topicId, int32_t partition,
                                     WorkerOp op) {
+        return enqueueOp(topicId, partition, std::move(op)) == EnqueueResult::Enqueued;
+    }
+
+    /// F18 (m-1): tryEnqueueOp with the failure kind exposed (Full vs TooLarge).
+    [[nodiscard]] EnqueueResult enqueueOp(int32_t topicId, int32_t partition,
+                                          WorkerOp op) {
         // Task 10 fix 3 (I2): never route an op ahead of the SetOwnership that
         // governs it.  Round 4 (Important 1): re-compute ONLY when the registry
         // generation moved (once per generation, cold); otherwise retry at most
@@ -360,7 +375,7 @@ public:
         const int32_t wid = ownerWorkerId(topicId, partition);
         const auto w = static_cast<std::size_t>(wid);
         if (w < deliveredGen_.size() && deliveredGen_[w] != computedGen_ && !deliverTo_(w)) [[unlikely]]
-            return false;
+            return EnqueueResult::Full;
         // Task 10 round 4 (Critical 1): the target identity comes from the
         // registry at ROUTING time — never from a pointer a caller held across
         // cycles.  A (topic, partition) no longer registered is stamped stale:
@@ -378,7 +393,7 @@ public:
                 ++staleOpsRouted_;
             }
         }
-        return workers_[w]->tryEnqueueOp(std::move(op));
+        return workers_[w]->enqueueOp(std::move(op));
     }
 
     /// Ops that target one partition replica (ownership-gated on the worker).

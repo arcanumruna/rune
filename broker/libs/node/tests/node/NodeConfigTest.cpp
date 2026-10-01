@@ -2099,4 +2099,82 @@ TEST(NodeConfigRegression, EgressControlBasePortUnsetResolvesLegacyDefault) {
     EXPECT_EQ(r.config->effectiveWorkerEgressControlBasePort(), 40300);
 }
 
+// ---------------------------------------------------------------------------
+// F18: an accepted produce batch must ALWAYS be replicable in one frame.  The
+// intake limit is DERIVED from every hop a batch crosses (worker-ingress op ring;
+// replication outbound ring + Aeron term/8 when replicated) and enforced at intake
+// (MessageTooLarge) — never a startup refusal: every config starts.
+// ---------------------------------------------------------------------------
+namespace {
+NodeConfig parsedOrDie(std::map<std::string, std::string> env) {
+    auto r = parseNodeConfig(fakeEnv(std::move(env)));
+    EXPECT_TRUE(r.error.empty()) << r.error;
+    return *r.config;
+}
+} // namespace
+
+TEST(ProduceBatchLimitRegression, IntakeLimitNeverExceedsOneFrameOnAnyHop) {
+    for (auto env : {base3node(), base1node()}) {
+        const NodeConfig c = parsedOrDie(env);
+        EXPECT_GT(c.produceIntakeLimit(), 0);
+        EXPECT_LE(c.produceIntakeLimit(), c.produceBatchFrameCeiling());
+        EXPECT_LE(c.produceIntakeLimit(), NodeConfig::kDefaultMaxProduceBatchBytes);
+    }
+}
+
+TEST(ProduceBatchLimitRegression, DefaultThreeNodeLimitIsTheOutboundRingFrame) {
+    // Default outbound ring 4 MiB → 512 KiB frames: an 8 MiB batch must NOT be
+    // accepted (it would be appended but never replicated) — and the default
+    // config still starts (no refusal; the limit simply shrinks).
+    const NodeConfig c = parsedOrDie(base3node());
+    EXPECT_LT(c.produceIntakeLimit(), 512 * 1024);
+    EXPECT_GT(c.produceIntakeLimit(), 511 * 1024);
+}
+
+TEST(ProduceBatchLimitRegression, OutboundRingFrameBoundsTheLimit) {
+    auto env = base3node();
+    env["RUNE_AERON_TERM_BUFFER_BYTES"]   = "33554432";   // term/8 = 4 MiB
+    env["RUNE_WORKER_INGRESS_RING_BYTES"] = "33554432";   // /8 = 4 MiB
+    env["RUNE_REPL_OUTBOUND_RING_BYTES"]  = "16777216";   // /8 = 2 MiB - framing
+    const NodeConfig c = parsedOrDie(env);
+    EXPECT_LT(c.produceIntakeLimit(), 2 * 1024 * 1024) << "a 2 MiB batch cannot cross a 2 MiB ring frame";
+    EXPECT_GT(c.produceIntakeLimit(), 2 * 1024 * 1024 - 1024);
+}
+
+TEST(ProduceBatchLimitRegression, AeronTermFrameBoundsTheLimit) {
+    auto env = base3node();
+    env["RUNE_REPL_OUTBOUND_RING_BYTES"]  = "33554432";
+    env["RUNE_WORKER_INGRESS_RING_BYTES"] = "33554432";
+    env["RUNE_AERON_TERM_BUFFER_BYTES"]   = "16777216";   // term/8 = 2 MiB - framing
+    const NodeConfig c = parsedOrDie(env);
+    EXPECT_LT(c.produceIntakeLimit(), 2 * 1024 * 1024);
+    EXPECT_GT(c.produceIntakeLimit(), 2 * 1024 * 1024 - 1024);
+}
+
+TEST(ProduceBatchLimitRegression, WorkerIngressFrameBoundsTheLimitEvenSingleNode) {
+    auto env = base1node();
+    env["RUNE_WORKER_INGRESS_RING_BYTES"] = "16777216";   // /8 = 2 MiB - op framing
+    const NodeConfig c = parsedOrDie(env);
+    EXPECT_LT(c.produceIntakeLimit(), 2 * 1024 * 1024) << "an op that cannot be claimed would throw";
+    EXPECT_GT(c.produceIntakeLimit(), 2 * 1024 * 1024 - 1024);
+}
+
+TEST(ProduceBatchLimitRegression, SingleNodeIgnoresReplicationHops) {
+    auto env = base1node();
+    env["RUNE_REPL_OUTBOUND_RING_BYTES"] = "1048576";     // tiny, but nothing replicates
+    env["RUNE_AERON_TERM_BUFFER_BYTES"]  = "1048576";
+    const NodeConfig c = parsedOrDie(env);
+    EXPECT_GT(c.produceIntakeLimit(), 1 * 1024 * 1024);
+}
+
+TEST(ProduceBatchLimitRegression, BenchProfileAccepts2MiBBatches) {
+    // The documented bench profile (CLAUDE.md / bench/kafka-compare/cluster.sh).
+    auto env = base3node();
+    env["RUNE_REPL_OUTBOUND_RING_BYTES"]  = "33554432";
+    env["RUNE_AERON_TERM_BUFFER_BYTES"]   = "33554432";
+    env["RUNE_WORKER_INGRESS_RING_BYTES"] = "33554432";
+    const NodeConfig c = parsedOrDie(env);
+    EXPECT_GE(c.produceIntakeLimit(), 2 * 1024 * 1024 + 64 * 1024);
+}
+
 } // namespace rune::node

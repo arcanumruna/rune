@@ -256,6 +256,26 @@ static rune::node::NodeConfig makePwConfig(
 }
 
 // ---------------------------------------------------------------------------
+// resolvePartitionLeader — F17 regression fix: the PARTITION leader is the node
+// whose (topicId=0, partition=0) replica reports Role::Leader on its owner
+// thread.  It is NOT necessarily the CONSENSUS leader (node->leaderId()): the
+// partition's leadership is assigned by the metadata balancer and is applied
+// asynchronously, so under slow scheduling (e.g. TSan) the consensus leader's
+// replica can still be a follower.  Deadline-bounded condition wait over LIVE
+// nodes only.  Returns the index into `ns`, or -1.
+// ---------------------------------------------------------------------------
+static int resolvePartitionLeader(const std::vector<rune::node::BrokerNode*>& ns,
+                                  std::chrono::seconds within = std::chrono::seconds(30)) {
+    const auto deadline = std::chrono::steady_clock::now() + within;
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (std::size_t i = 0; i < ns.size(); ++i)
+            if (hasReplica(*ns[i]) && roleOnOwner(*ns[i]) == Role::Leader) return static_cast<int>(i);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
 // scanCommittedRecordPayloads — walk the raw log bytes returned by Log::read()
 // and extract the first-byte of each record's VALUE field from each RecordBatch.
 //
@@ -342,16 +362,14 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
     ASSERT_TRUE(node1->awaitLeader(30s)) << "node1 must converge to a leader";
     ASSERT_TRUE(node2->awaitLeader(30s)) << "node2 must converge to a leader";
 
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0->leaderId();
-    ASSERT_GE(lid, 0) << "no leader elected";
-    ASSERT_LE(lid, 2);
+    // F17: resolve the PARTITION leader (not node0->leaderId(), the consensus leader).
+    std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
+    const int lid = resolvePartitionLeader({nodes.begin(), nodes.end()});
+    ASSERT_GE(lid, 0) << "no partition leader emerged";
 
     rune::node::BrokerNode* leaderNode  = nullptr;
     rune::node::BrokerNode* follower1   = nullptr;
     rune::node::BrokerNode* follower2   = nullptr;
-    std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
     for (int i = 0; i < 3; ++i) {
         if (i == lid) leaderNode = nodes[i];
         else if (!follower1) follower1 = nodes[i];
@@ -360,19 +378,6 @@ TEST(PerWorkerReplication, AcksAllThreeNodeReplicatesAndCommits) {
     ASSERT_NE(leaderNode, nullptr);
     ASSERT_NE(follower1,  nullptr);
     ASSERT_NE(follower2,  nullptr);
-
-    // Wait for the leader's replication bridge to report isLeader.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest())
-        << "Leader's replication bridge must report isLeader after election";
-
-    ASSERT_TRUE(hasReplica(*leaderNode)) << "Leader must have a partition replica for (topicId=0, partition=0)";
     ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
     // Produce N=6 records via the leader replica directly (on its OWNING thread).
@@ -497,16 +502,14 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     ASSERT_TRUE(node1->awaitLeader(30s)) << "node1 must converge to a leader";
     ASSERT_TRUE(node2->awaitLeader(30s)) << "node2 must converge to a leader";
 
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
-    rune::node::BrokerNode* leaderNode = nullptr;
-    rune::node::BrokerNode* follower1  = nullptr;
-    rune::node::BrokerNode* follower2  = nullptr;
+    // F17: resolve the PARTITION leader (not node0->leaderId(), the consensus leader).
     std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
+    const int lid = resolvePartitionLeader({nodes.begin(), nodes.end()});
+    ASSERT_GE(lid, 0) << "no partition leader emerged";
+
+    rune::node::BrokerNode* leaderNode  = nullptr;
+    rune::node::BrokerNode* follower1   = nullptr;
+    rune::node::BrokerNode* follower2   = nullptr;
     for (int i = 0; i < 3; ++i) {
         if (i == lid) leaderNode = nodes[i];
         else if (!follower1) follower1 = nodes[i];
@@ -515,18 +518,6 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     ASSERT_NE(leaderNode, nullptr);
     ASSERT_NE(follower1,  nullptr);
     ASSERT_NE(follower2,  nullptr);
-
-    // Wait for leader's replication bridge.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
-
-    ASSERT_TRUE(hasReplica(*leaderNode));
     ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
     // Produce K=5 records with DISTINCT known payloads (fill byte 0xB0+i).
@@ -572,51 +563,13 @@ TEST(PerWorkerReplication, RollingLeaderKillNoCommittedLossRegression) {
     // Kill the leader.
     leaderNode->stop();
 
-    // Wait for surviving nodes to re-elect a new leader.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 45s;
-        bool reElected = false;
-        while (std::chrono::steady_clock::now() < deadline && !reElected) {
-            const auto l1 = follower1->leaderId();
-            const auto l2 = follower2->leaderId();
-            reElected = (l1 >= 0 && l1 != lid && l2 >= 0 && l1 == l2);
-            if (!reElected) std::this_thread::sleep_for(50ms);
-        }
-        ASSERT_TRUE(reElected) << "Surviving nodes must re-elect a new leader after kill";
-    }
-
-    std::this_thread::sleep_for(500ms);
-
-    const rune::consensus::NodeId newLid = follower1->leaderId();
-    ASSERT_NE(newLid, lid) << "New leader must differ from the stopped leader";
-
-    rune::node::BrokerNode* newLeaderNode =
-        (follower1->isLeader()) ? follower1 : follower2;
-    rune::node::BrokerNode* survivingFollowerNode =
-        (follower1->isLeader()) ? follower2 : follower1;
-    ASSERT_TRUE(newLeaderNode->isLeader());
-
-    // Wait for new leader's replication bridge.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (newLeaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
-        << "New leader's replication bridge must report isLeader";
-
-    ASSERT_TRUE(hasReplica(*newLeaderNode));
-
-    // Poll for Leader role on new leader's partition replica.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline &&
-               roleOnOwner(*newLeaderNode) != Role::Leader) {
-            std::this_thread::sleep_for(20ms);
-        }
-    }
+    // F17: wait for a SURVIVING node's partition replica to become Leader (the
+    // killed node was the partition leader; the consensus leader may be elsewhere).
+    const int nl = resolvePartitionLeader({follower1, follower2}, std::chrono::seconds(45));
+    ASSERT_GE(nl, 0) << "Surviving nodes must elect a new partition leader after the kill";
+    rune::node::BrokerNode* newLeaderNode        = (nl == 0) ? follower1 : follower2;
+    rune::node::BrokerNode* survivingFollowerNode = (nl == 0) ? follower2 : follower1;
+    ASSERT_EQ(roleOnOwner(*newLeaderNode), Role::Leader);
 
     // --- [Critical-1] Core assertions: committed-data content + count survive ---
     //
@@ -830,17 +783,15 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     ASSERT_TRUE(node1->awaitLeader(30s));
     ASSERT_TRUE(node2->awaitLeader(30s));
 
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
+    // F17: resolve the PARTITION leader (not node0->leaderId(), the consensus leader).
+    std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
+    const int lid = resolvePartitionLeader({nodes.begin(), nodes.end()});
+    ASSERT_GE(lid, 0) << "no partition leader emerged";
 
     rune::node::BrokerNode* leaderNode   = nullptr;
     rune::node::BrokerNode* f1Node       = nullptr;   // will be stopped first; restarts
     rune::node::BrokerNode* f2Node       = nullptr;   // stays alive through M produces
     int f1Idx = -1;
-    std::array<rune::node::BrokerNode*, 3> nodes = {node0.get(), node1.get(), node2.get()};
     for (int i = 0; i < 3; ++i) {
         if (i == lid) leaderNode = nodes[i];
         else if (!f1Node) { f1Node = nodes[i]; f1Idx = i; }
@@ -849,18 +800,6 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     ASSERT_NE(leaderNode, nullptr);
     ASSERT_NE(f1Node, nullptr);
     ASSERT_NE(f2Node, nullptr);
-
-    // Wait for leader's replication bridge.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
-
-    ASSERT_TRUE(hasReplica(*leaderNode));
     ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
     // Phase 1: produce N=4 records on the 3-node cluster with distinct fill bytes.
@@ -981,37 +920,13 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     ASSERT_TRUE(restartedF1->awaitLeader(30s))
         << "Restarted F1 must converge to a new leader";
 
-    std::this_thread::sleep_for(500ms);
-
-    // Determine the new leader (either f2Node or restartedF1).
-    rune::node::BrokerNode* newLeaderNode =
-        (f2Node->isLeader()) ? f2Node : restartedF1.get();
-    rune::node::BrokerNode* newFollowerNode =
-        (f2Node->isLeader()) ? restartedF1.get() : f2Node;
-
-    // Wait for new leader's replication bridge.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (newLeaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
-        << "New leader's replication bridge must report isLeader";
-
-    ASSERT_TRUE(hasReplica(*newLeaderNode));
+    // F17: the new PARTITION leader is whichever survivor's replica becomes Leader.
+    const int nl = resolvePartitionLeader({f2Node, restartedF1.get()});
+    ASSERT_GE(nl, 0) << "a new partition leader must emerge after the leader kill";
+    rune::node::BrokerNode* newLeaderNode   = (nl == 0) ? f2Node : restartedF1.get();
+    rune::node::BrokerNode* newFollowerNode = (nl == 0) ? restartedF1.get() : f2Node;
     ASSERT_TRUE(hasReplica(*newFollowerNode));
-
-    // Poll for Leader role on new leader's partition replica.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline &&
-               roleOnOwner(*newLeaderNode) != Role::Leader) {
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    EXPECT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
+    ASSERT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
         << "New leader's partition replica must be in Leader role";
 
     // --- Phase 7: invariant checks ---
@@ -1175,4 +1090,284 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     node0->stop();
     node1->stop();
     node2->stop();
+}
+
+// ===========================================================================
+// F18 (*Regression*): a stored batch LARGER than the followers' fetch maxBytes
+// (1 MiB) must still replicate — an acks=all produce of a legal 2 MiB batch at
+// RF=3 commits (leader HW advances past it) and both followers apply it, then a
+// following small produce commits too (replication continues normally).
+// Before the fix the leader trimmed every response to whole batches <= maxBytes,
+// so the 2 MiB batch was never sent and HW stayed at 0 forever.
+//
+// Runs on both replication planes: the per-worker plane (WorkerReplicationTransport,
+// bounded by the publication term/8) and the legacy AeronPartitionTransport
+// (outbound ring + publication).  Sizes are the documented bench profile (32 MiB
+// term / outbound ring), whose produce intake limit admits a 2 MiB batch.
+// Waits are deadline-bounded condition polls (same pattern as the suite above).
+// ===========================================================================
+namespace {
+void runLargeBatchAcksAllCommits(bool perWorkerReplication, std::string_view tag) {
+    PwTempDir dir0{std::string(tag) + "0_"}, dir1{std::string(tag) + "1_"},
+              dir2{std::string(tag) + "2_"};
+    const auto cPorts = pwDiscoverFreePorts(3);
+    const auto kPorts = pwDiscoverFreePorts(3);
+    const auto rPorts = pwDiscoverFreePorts(3);
+
+    std::array<rune::node::NodeConfig, 3> cfgs{
+        makePwConfig(0, dir0.path, cPorts, kPorts, rPorts),
+        makePwConfig(1, dir1.path, cPorts, kPorts, rPorts),
+        makePwConfig(2, dir2.path, cPorts, kPorts, rPorts)};
+    for (auto& c : cfgs) {
+        c.perWorkerReplication          = perWorkerReplication;
+        c.aeronTermBufferBytes          = 32 * 1024 * 1024;
+        c.replicationOutboundRingBytes  = 32 * 1024 * 1024;
+        c.workerIngressRingBytes        = 32 * 1024 * 1024;
+        ASSERT_GE(c.produceIntakeLimit(), 2 * 1024 * 1024) << "the profile must accept the batch";
+    }
+
+    std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+
+    // The PARTITION leader (the replica whose owner-thread role is Leader) — not
+    // assumed to be the consensus leader, which may lag/differ under slow
+    // (e.g. TSan) scheduling.  Deadline-bounded condition wait.
+    rune::node::BrokerNode* leaderPtr = nullptr;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && leaderPtr == nullptr) {
+            for (auto& n : nodes)
+                if (hasReplica(*n) && roleOnOwner(*n) == Role::Leader) { leaderPtr = n.get(); break; }
+            if (leaderPtr == nullptr) std::this_thread::sleep_for(20ms);
+        }
+    }
+    ASSERT_NE(leaderPtr, nullptr) << "no partition leader emerged";
+    rune::node::BrokerNode& leader = *leaderPtr;
+
+    // The follower fetch cap is 1 MiB (BrokerNode); this batch is ~2 MiB on disk.
+    const std::size_t kValue = 2 * 1024 * 1024 - 256;
+    const auto big = makePwPayload(0xF1, kValue);
+    ASSERT_EQ(appendOnOwner(leader, std::span<const uint8_t>(big.data(), big.size()),
+                            /*acksAll=*/true), 0);
+    const auto small = makePwPayload(0xF2, 32);
+
+    auto waitAll = [&](Offset target, const char* what) {
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
+        bool ok = false;
+        while (std::chrono::steady_clock::now() < deadline && !ok) {
+            ok = hwOnOwner(leader) >= target;
+            for (auto& n : nodes) ok = ok && leoOnOwner(*n) >= target;
+            if (!ok) std::this_thread::sleep_for(20ms);
+        }
+        EXPECT_TRUE(ok) << what << ": leader HW=" << hwOnOwner(leader) << " LEOs="
+                        << leoOnOwner(*nodes[0]) << "," << leoOnOwner(*nodes[1]) << ","
+                        << leoOnOwner(*nodes[2]) << " target=" << target;
+        return ok;
+    };
+    ASSERT_TRUE(waitAll(1, "acks=all 2 MiB batch must commit on every replica"));
+
+    // Replication continues normally after the oversized batch.
+    ASSERT_EQ(appendOnOwner(leader, std::span<const uint8_t>(small.data(), small.size()),
+                            /*acksAll=*/true), 1);
+    EXPECT_TRUE(waitAll(2, "the next produce after the oversized batch must commit"));
+
+    // Content: every follower holds the whole 2 MiB batch intact.
+    for (auto& n : nodes) {
+        if (n.get() == &leader) continue;
+        const auto raw = readLogOnOwner(*n, 0, 4 * 1024 * 1024);
+        ASSERT_GE(raw.size(), kValue);
+        rune::protocol::RecordBatchReader r(raw.data(), raw.size());
+        ASSERT_TRUE(r.ensureValid()) << "follower copy of the 2 MiB batch is corrupt";
+        std::size_t seen = 0;
+        r.forEach([&](std::string_view, std::string_view v, int64_t, int64_t) {
+            seen = v.size();
+            EXPECT_EQ(static_cast<uint8_t>(v.front()), 0xF1);
+            EXPECT_EQ(static_cast<uint8_t>(v.back()), 0xF1);
+        });
+        EXPECT_EQ(seen, kValue);
+    }
+    for (auto& n : nodes) n->stop();
+}
+} // namespace
+
+TEST(LargeBatchReplicationRegression, AcksAll2MiBBatchCommitsPerWorkerPlane) {
+    runLargeBatchAcksAllCommits(/*perWorkerReplication=*/true, "f18pw_");
+}
+
+TEST(LargeBatchReplicationRegression, AcksAll2MiBBatchCommitsLegacyTransport) {
+    runLargeBatchAcksAllCommits(/*perWorkerReplication=*/false, "f18lg_");
+}
+
+// ===========================================================================
+// F18 fix round 1 (I-1, *Regression*): a stored batch LARGER than the leader's
+// own replication frame (accepted earlier under a larger config / by an older
+// broker — appended here directly on the owner to model it) must NOT stall the
+// partition silently.  Default sizes: 4 MiB outbound ring / term → ~512 KiB
+// frames; the batch is ~1 MiB.  Before: every serve was dropped by the
+// transport, the followers re-fetched forever, each re-fetch refreshed their ISR
+// liveness → HW pinned below the batch forever, nothing but a drop log.
+// Required (time-independent, the existing lag check only): the leader answers
+// kErrRecordTooLarge (counted), each follower wedges (counted, stops fetching),
+// both leave the ISR, and acks=all with minIsr=2 fails loudly (MinIsr) instead
+// of hanging.  Both planes.
+// ===========================================================================
+namespace {
+void runUnservableBatchEvictsFollowers(bool perWorkerReplication, std::string_view tag) {
+    PwTempDir dir0{std::string(tag) + "0_"}, dir1{std::string(tag) + "1_"},
+              dir2{std::string(tag) + "2_"};
+    const auto cPorts = pwDiscoverFreePorts(3);
+    const auto kPorts = pwDiscoverFreePorts(3);
+    const auto rPorts = pwDiscoverFreePorts(3);
+    std::array<rune::node::NodeConfig, 3> cfgs{
+        makePwConfig(0, dir0.path, cPorts, kPorts, rPorts, /*minIsr=*/2),
+        makePwConfig(1, dir1.path, cPorts, kPorts, rPorts, 2),
+        makePwConfig(2, dir2.path, cPorts, kPorts, rPorts, 2)};
+    for (auto& c : cfgs) {
+        c.perWorkerReplication = perWorkerReplication;
+        c.replicaLagMaxMs      = 1'500;                    // the EXISTING lag check
+        ASSERT_LT(c.produceIntakeLimit(), 1 * 1024 * 1024) << "defaults: frame ~512 KiB";
+    }
+    std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+
+    rune::node::BrokerNode* leaderPtr = nullptr;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && leaderPtr == nullptr) {
+            for (auto& n : nodes)
+                if (hasReplica(*n) && roleOnOwner(*n) == Role::Leader) { leaderPtr = n.get(); break; }
+            if (leaderPtr == nullptr) std::this_thread::sleep_for(20ms);
+        }
+    }
+    ASSERT_NE(leaderPtr, nullptr);
+    rune::node::BrokerNode& leader = *leaderPtr;
+    {   // full ISR first, so the eviction below is caused by the batch
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && rune::node::test::isrSizeOnOwner(leader) < 3)
+            std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_EQ(rune::node::test::isrSizeOnOwner(leader), 3);
+
+    const auto big = makePwPayload(0xD1, 1024 * 1024);     // ~1 MiB > ~512 KiB frame
+    ASSERT_EQ(appendOnOwner(leader, std::span<const uint8_t>(big.data(), big.size()), false), 0);
+
+    // The followers leave the ISR (deadline-bounded condition wait; the lag check
+    // is 1.5 s — nothing here is a sleep-to-pass-time).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 45s;
+        while (std::chrono::steady_clock::now() < deadline && rune::node::test::isrSizeOnOwner(leader) != 1)
+            std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_EQ(rune::node::test::isrSizeOnOwner(leader), 1) << "the stuck followers must leave the ISR";
+    const uint64_t served = leader.onOwnerThreadForTest(0, 0,
+        [](PartitionReplica& r) { return r.recordTooLargeServed(); });
+    EXPECT_GE(served, 1u) << "the leader must answer kErrRecordTooLarge (counted)";
+    for (auto& n : nodes) {
+        if (n.get() == &leader) continue;
+        const auto [at, count] = n->onOwnerThreadForTest(0, 0, [](PartitionReplica& r) {
+            return std::pair<Offset, uint64_t>{r.wedgedAtOffset(), r.wedgedRefusals()};
+        });
+        EXPECT_EQ(at, 0) << "follower must be wedged at the unservable offset";
+        EXPECT_GE(count, 1u);
+        EXPECT_EQ(leoOnOwner(*n), 0);
+    }
+    // acks=all now fails loudly (min-ISR 2 > ISR 1) instead of hanging.
+    const auto small = makePwPayload(0xD2, 32);
+    EXPECT_EQ(appendOnOwner(leader, std::span<const uint8_t>(small.data(), small.size()), true), -1);
+    // No infinite silent re-fetch: once both followers are wedged (and evicted)
+    // the leader's counter STOPS growing.  (Requests already in flight when the
+    // first answer went out are answered too — a bounded burst, not a loop.)
+    // Progress-bounded: the leader's owner thread keeps running its duty cycle
+    // between these owner-thread round trips; the followers' wedged state is
+    // re-checked so a re-fetch would have to come from a still-wedged follower.
+    for (auto& n : nodes) {
+        if (n.get() == &leader) continue;
+        EXPECT_EQ(n->onOwnerThreadForTest(0, 0, [](PartitionReplica& r) { return r.wedgedAtOffset(); }), 0);
+    }
+    const uint64_t servedLater = leader.onOwnerThreadForTest(0, 0,
+        [](PartitionReplica& r) { return r.recordTooLargeServed(); });
+    EXPECT_EQ(servedLater, served) << "a wedged follower kept re-fetching the unservable batch";
+    for (auto& n : nodes) n->stop();
+}
+} // namespace
+
+TEST(LargeBatchReplicationRegression, UnservableStoredBatchEvictsFollowersPerWorkerPlane) {
+    runUnservableBatchEvictsFollowers(/*perWorkerReplication=*/true, "f18uw_");
+}
+
+TEST(LargeBatchReplicationRegression, UnservableStoredBatchEvictsFollowersLegacyTransport) {
+    runUnservableBatchEvictsFollowers(/*perWorkerReplication=*/false, "f18ul_");
+}
+
+// ===========================================================================
+// F18 fix round 2 (B-1, *Regression*): a uniform RUNE_WORKER_INGRESS_RING_BYTES =
+// 4 MiB gives a follower apply frame (~524,037 B) just BELOW the leader's
+// push/fetch frame (~524,226 B).  Two ~262 KiB batches — each far below every
+// limit — coalesced into ONE push (gateway-style direct append + one push) make
+// a ~524,1xx B response: above the follower frame, every batch fitting.  Before:
+// the follower transport compared the WHOLE response and falsely, permanently
+// wedged the healthy followers (they left the ISR).  Required: no wedge, the
+// followers converge (their fetch is capped to their own frame), HW = 2.
+// Legacy transport (the per-worker plane applies inline: no worker ring hop).
+// ===========================================================================
+TEST(LargeBatchReplicationRegression, MultiBatchPushAboveFollowerFrameNeverWedges4MiBRing) {
+    PwTempDir dir0{"f18b1_0_"}, dir1{"f18b1_1_"}, dir2{"f18b1_2_"};
+    const auto cPorts = pwDiscoverFreePorts(3);
+    const auto kPorts = pwDiscoverFreePorts(3);
+    const auto rPorts = pwDiscoverFreePorts(3);
+    std::array<rune::node::NodeConfig, 3> cfgs{
+        makePwConfig(0, dir0.path, cPorts, kPorts, rPorts),
+        makePwConfig(1, dir1.path, cPorts, kPorts, rPorts),
+        makePwConfig(2, dir2.path, cPorts, kPorts, rPorts)};
+    for (auto& c : cfgs) {
+        c.perWorkerReplication   = false;
+        c.workerIngressRingBytes = 4 * 1024 * 1024;           // the reviewer's config
+    }
+    std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
+    std::array<rune::node::BrokerNode*, 3> raw{nodes[0].get(), nodes[1].get(), nodes[2].get()};
+    const int lid = resolvePartitionLeader({raw.begin(), raw.end()});
+    ASSERT_GE(lid, 0);
+    rune::node::BrokerNode& leader = *raw[static_cast<std::size_t>(lid)];
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        while (std::chrono::steady_clock::now() < deadline && rune::node::test::isrSizeOnOwner(leader) < 3)
+            std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_EQ(rune::node::test::isrSizeOnOwner(leader), 3);
+
+    // Two ~262 KiB batches appended straight to the leader's log in ONE owner task,
+    // then one onLeaderLogAppended(): the next duty cycle pushes them as ONE frame.
+    const std::size_t kVal = 262'000;
+    const bool ok = leader.onOwnerThreadForTest(0, 0, [&](PartitionReplica& r) {
+        for (int64_t base = 0; base < 2; ++base) {
+            rune::protocol::RecordBatchBuilder b(base, 1000);
+            b.append("k", std::string(kVal, static_cast<char>(0x40 + base)), 1000);
+            if (r.log()->append(b.build(), base) < 0) return false;
+        }
+        r.onLeaderLogAppended();
+        return true;
+    });
+    ASSERT_TRUE(ok);
+
+    const auto deadline = std::chrono::steady_clock::now() + 45s;
+    bool converged = false;
+    while (std::chrono::steady_clock::now() < deadline && !converged) {
+        converged = hwOnOwner(leader) >= 2;
+        for (auto& n : nodes) converged = converged && leoOnOwner(*n) >= 2;
+        if (!converged) std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_TRUE(converged) << "leader HW=" << hwOnOwner(leader);
+    for (auto& n : nodes) {
+        EXPECT_EQ(n->onOwnerThreadForTest(0, 0, [](PartitionReplica& r) { return r.wedgedRefusals(); }), 0u)
+            << "a healthy follower was falsely wedged";
+    }
+    EXPECT_EQ(rune::node::test::isrSizeOnOwner(leader), 3);
+    for (auto& n : nodes) n->stop();
 }

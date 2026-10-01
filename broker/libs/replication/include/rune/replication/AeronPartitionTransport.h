@@ -169,7 +169,38 @@ public:
     /// Test hook: number of raw replica pointers the transport holds.
     [[nodiscard]] std::size_t heldReplicaPointersForTest() const noexcept { return replicas_.size(); }
     /// Test hook: feed one reassembled replication frame through onFragment.
-    void deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs);
+    /// Returns false iff the frame was NOT consumed (ABORT → would be redelivered).
+    bool deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs);
+    /// F18: follower apply/reconcile frames refused because their records cannot
+    /// fit one worker-ingress frame (a replication error; never a crash/livelock).
+    [[nodiscard]] uint64_t oversizedApplyRefused() const noexcept { return oversizedApplyRefused_; }
+    /// F18: outbound frames dropped because they exceed one frame (ring
+    /// maxMsgLength / publication maxMessageLength) — NOT back-pressure; counted
+    /// apart from outboundRingFullCount_.  Unreachable once the replica answers an
+    /// unservable batch with kErrRecordTooLarge; a non-zero value is a bug signal.
+    [[nodiscard]] uint64_t oversizedFrameDropped() const noexcept { return oversizedFrameDropped_; }
+
+    /// F18: the replication publication's maxMessageLength (min(term/8, 16 MiB)),
+    /// set ONCE before any worker runs (BrokerNode, from aeronTermBufferBytes) so
+    /// worker-thread replicas can bound a FetchResponse without touching the
+    /// control-owned peers_/pubs.  0 = unknown (outbound-ring bound only).
+    void setPublicationMaxMessageBytes(int64_t n) noexcept { pubMaxMessageBytes_ = n; }
+
+    /// F18 (B-1): the largest records payload this node's worker ingress ring can
+    /// take in ONE apply op (ring/8 − op framing).  Set ONCE before any worker
+    /// runs.  Caps this node's outgoing follower fetch AND reconcile-pull (B-3)
+    /// maxBytes so the answering peer never sends more than this node can apply.
+    /// 0 = no cap.
+    void setApplyRecordsCap(int64_t n) noexcept { applyRecordsCap_ = n; }
+    /// F18 (B-1): responses dropped (NOT wedged) because the whole response was
+    /// above the apply frame while its batch at the front fit — recovered by the
+    /// capped fetch.
+    [[nodiscard]] uint64_t oversizedApplyDropped() const noexcept { return oversizedApplyDropped_; }
+
+    /// F18: largest records payload ONE FetchResponse can carry (worker-safe:
+    /// reads only state immutable after start).  = outbound-ring frame and, when
+    /// known, the publication frame, each minus its framing.
+    [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override;
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -376,6 +407,11 @@ private:
     // Size is NodeConfig-configurable (replicationOutboundRingBytes) — passed to
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
+    uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
+    uint64_t oversizedFrameDropped_ = 0;   // F18; see oversizedFrameDropped()
+    int64_t  pubMaxMessageBytes_    = 0;   // F18; immutable after start
+    int64_t  applyRecordsCap_       = 0;   // F18 (B-1); immutable after start
+    uint64_t oversizedApplyDropped_ = 0;   // F18 (B-1); control thread only
 
     // Back-pressure observability: bumped when the outbound ring is full and a
     // (retriable) send had to be skipped. Control-thread reads for logging.

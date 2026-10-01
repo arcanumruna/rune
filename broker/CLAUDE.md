@@ -82,7 +82,7 @@ net.core.netdev_max_backlog=100000
 - `RUNE_IDLE_MAX_PARK_US=10` | 200  — control/worker loop park cap (was the ~230µs loop period)
 - `RUNE_AERON_SOCKET_BUFFER_BYTES=16777216` | 2M  — SO_SND/RCVBUF (clamped by sysctl above)
 - `RUNE_AERON_TERM_BUFFER_BYTES=67108864` | 4M
-- `RUNE_REPL_OUTBOUND_RING_BYTES=16777216` | 4M
+- `RUNE_REPL_OUTBOUND_RING_BYTES=33554432` | 4M
 - `RUNE_WORKER_INGRESS_RING_BYTES=33554432` `RUNE_WORKER_RETURN_RING_BYTES=33554432` | 32M
 - `RUNE_WORKERS=2`, `RUNE_PER_WORKER_INGRESS=true`, `RUNE_PER_WORKER_EGRESS=true`
 - `RUNE_WORKER_IDLE=backoff` `RUNE_RUNTIME_IDLE=backoff` (busyspin pegs cores on a shared box)
@@ -97,6 +97,18 @@ net.core.netdev_max_backlog=100000
 1. `RUNE_AERON_RCV_WINDOW ≤ RUNE_AERON_SOCKET_BUFFER_BYTES` ("Initial window greater than SO_SNDBUF")
 2. `RUNE_AERON_SOCKET_BUFFER_BYTES ≤ net.core.rmem_max/wmem_max` (else silently clamped)
 3. `RUNE_AERON_RCV_WINDOW ≤ term_buffer/2`  and must be a power of two
+4. Produce intake limit (F18) = min(8M, every hop's one-frame capacity): `RUNE_WORKER_INGRESS_RING_BYTES/8`
+   and, multi-node, `RUNE_REPL_OUTBOUND_RING_BYTES/8` and `min(RUNE_AERON_TERM_BUFFER_BYTES/8, 16M)` (each minus
+   a few hundred bytes of framing).  Larger batches → MessageTooLarge (never a startup refusal).  Defaults
+   give ~512 KiB; the profile above gives ~4 MiB — keep the client's `min(RUNE_BATCH_BYTES, RUNE_MAX_FRAME_BYTES)`
+   below it.  A batch STORED above the current frame (e.g. after shrinking these sizes) is unreplicable: the
+   leader answers kErrRecordTooLarge and followers wedge at that offset and leave the ISR (logged + counted).
+5. Frame uniformity (F18): keep every node's follower apply frame (`RUNE_WORKER_INGRESS_RING_BYTES/8`) ≥
+   `min(maxFetchBytes = 1 MiB, the leader's push frame = min(RUNE_REPL_OUTBOUND_RING_BYTES/8, RUNE_AERON_TERM_BUFFER_BYTES/8))`.
+   Otherwise a coalesced multi-batch push above the follower's frame is dropped (never wedged) and the follower
+   catches up via its capped fetch — ~20 ms per dropped push.  Equal sizes are NOT enough (a uniform 4 MiB worker
+   ring gives a 524,037 B apply frame < the default 524,226 B push frame); the default 32 MiB worker ring (~4 MiB
+   frame ≥ 1 MiB) always satisfies it.
 
 ### ccx23 runtime note
 gcc-13 binaries need newer libstdc++ → copy build-agent's `libstdc++.so.6` to `/root/rune-libs` +

@@ -385,6 +385,11 @@ struct NodeConfig {
     //     of two in [64 KiB, 1 GiB].  Default 4 MiB; deployments raise it (e.g.
     //     32 MiB via RUNE_AERON_TERM_BUFFER_BYTES) for deep in-flight throughput.
     int32_t aeronTermBufferBytes         = 4 * 1024 * 1024;
+    //   - produce intake limit (F18): the largest produce batch the broker accepts
+    //     is DERIVED, never refused at startup — produceIntakeLimit() below.  A
+    //     batch above it is answered MessageTooLarge at intake (gateway + worker
+    //     ingress), so an accepted batch always fits one replication frame.
+    static constexpr int32_t kDefaultMaxProduceBatchBytes = 8 * 1024 * 1024;
     //   - aeronMtuBytes: Aeron UDP MTU (bytes) for the embedded media driver.
     //     RUNE_AERON_MTU.  Not required to be a power of two.  Default 1408
     //     (Aeron's own AERON_MTU_LENGTH_DEFAULT — the max that fits the default
@@ -550,6 +555,19 @@ struct NodeConfig {
     /// valid (always nullopt in legacy mode unless placement=fused).  BrokerNode
     /// refuses to start on an error (no silent fallback).
     std::optional<std::string> validateShardConfig() const;
+
+    /// F18: the largest produce batch (wire bytes) that fits ONE frame on every hop
+    /// an accepted batch crosses: the worker-ingress op ring (maxMsgLength =
+    /// workerIngressRingBytes/8, minus the WorkerOp framing) and — when this node
+    /// replicates (peers > 1) — the replication outbound ring and the replication
+    /// publication (min(term/8, 16 MiB)), minus FetchResponse framing.
+    [[nodiscard]] int64_t produceBatchFrameCeiling() const;
+    /// F18: the produce INTAKE limit = min(kDefaultMaxProduceBatchBytes,
+    /// produceBatchFrameCeiling()).  Larger → MessageTooLarge at the gateway and the
+    /// worker ingress, before append.  Never a startup refusal (every config starts;
+    /// small rings/terms only lower the limit).  To be unified with the S3 intake
+    /// limit (return-ring framing) on merge — keep it this ONE function.
+    [[nodiscard]] int32_t produceIntakeLimit() const;
 
     /// Host part of clientEndpoint.channel (the client-facing bind host).
     std::string clientBindHost() const;

@@ -1,4 +1,6 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/replication/ReplicationFrameLimits.h>
+#include <rune/node/WorkerOp.h>
 #include <rune/node/RoleCounter.h>
 
 #include <spdlog/spdlog.h>
@@ -487,6 +489,14 @@ void BrokerNode::buildReplication() {
             replTransport_ = std::make_unique<rune::replication::AeronPartitionTransport>(
                 aeron_, ingressChannel, ingressStream, selfId,
                 config_.replicationOutboundRingBytes);
+            // F18: every replication publication uses the embedded driver's term
+            // (no channel overrides term-length) — fixed before any worker runs.
+            replTransport_->setPublicationMaxMessageBytes(
+                rune::replication::aeronMaxMessageLength(config_.aeronTermBufferBytes));
+            // F18 (B-1): follower fetches never ask for more than one worker apply op.
+            replTransport_->setApplyRecordsCap(
+                static_cast<int64_t>(config_.workerIngressRingBytes) / 8 -
+                static_cast<int64_t>(rune::node::workerOpFrameBytes(0)));
 
             // Add each peer (excluding self) as an egress destination.
             for (const auto& peer : config_.peers) {
@@ -1050,6 +1060,8 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
+        workerPool_->worker(i).setMaxProduceBatchBytes(
+            static_cast<std::size_t>(config_.produceIntakeLimit()));
     }
 
     if (config_.shardMode()) {
@@ -1361,6 +1373,10 @@ void BrokerNode::buildGateway() {
         // gatewayMinIsr is computed from the peer count (or RUNE_MIN_ISR env override)
         // during parseNodeConfig; single-node → 1 (leader-only ISR is sufficient).
         gateway_->setMinIsr(config_.gatewayMinIsr);
+        gateway_->setMaxProduceBatchBytes(
+            static_cast<std::size_t>(config_.produceIntakeLimit()));
+        spdlog::info("BrokerNode[{}]: produce intake limit {} B (frame ceiling {} B)", nodeId,
+                     config_.produceIntakeLimit(), config_.produceBatchFrameCeiling());
         spdlog::info("BrokerNode[{}]: gateway minIsr set to {} (cluster size={})",
                      nodeId, config_.gatewayMinIsr, config_.peers.size());
 
