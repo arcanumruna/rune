@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/TransactionLog.h>
+#include <rune/transaction/detail/Crc32c.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -13,7 +14,6 @@
 
 #include <cassert>
 #include <cstring>
-#include <mutex>
 #include <stdexcept>
 #include <system_error>
 
@@ -35,33 +35,10 @@ static T read_le(const uint8_t* p) noexcept { T v; std::memcpy(&v, p, sizeof(T))
 // ---------------------------------------------------------------------------
 // CRC32C software table (Castagnoli)
 // ---------------------------------------------------------------------------
-static uint32_t     crc32c_tbl[256];
-static std::once_flag crc32c_tbl_once;
-
-static void build_crc32c_table() noexcept {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ (0x82F63B78u & -(crc & 1u));
-        }
-        crc32c_tbl[i] = crc;
-    }
-}
-
-// A6: thread-safe one-time table init. build/extract are static and could be
-// called from a non-writer thread (e.g. a read-committed consumer verifying a
-// batch); std::call_once removes the data race on the lazy table fill.
-static void init_crc32c_table() noexcept {
-    std::call_once(crc32c_tbl_once, build_crc32c_table);
-}
-
 /*static*/
 uint32_t TransactionLog::crc32c(const uint8_t* data, std::size_t len, uint32_t crc) noexcept {
-    init_crc32c_table();
-    for (std::size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ crc32c_tbl[(crc ^ data[i]) & 0xFFu];
-    }
-    return crc ^ 0xFFFFFFFFu;
+    // F15 S1: constexpr table (no std::call_once — shared-nothing law).
+    return detail::crc32c(data, len, crc);
 }
 
 // ---------------------------------------------------------------------------
