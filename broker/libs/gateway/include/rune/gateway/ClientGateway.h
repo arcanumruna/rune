@@ -979,6 +979,9 @@ private:
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
+    /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
+    void sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
+                            rune::protocol::client::ErrorCode code);
 
     // -----------------------------------------------------------------------
     // G0.1: sendRespReliable_ — private production implementation.

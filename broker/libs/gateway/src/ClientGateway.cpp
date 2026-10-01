@@ -3,6 +3,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/gateway/GatewayReplicaView.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
@@ -1197,6 +1198,22 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 // Single-writer: called only from onFragment → doWork duty-cycle thread.
 // Zero heap allocation on hot path: restampScratch_ is a reusable member array.
 // ---------------------------------------------------------------------------
+void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
+                                       rune::protocol::client::ErrorCode code)
+{
+    namespace pc = rune::protocol::client;
+    pc::ErrorResponse errResp;
+    errResp.sessionId     = sessionId;
+    errResp.correlationId = correlationId;
+    errResp.code          = static_cast<int16_t>(code);
+    const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2;
+    if (needed <= scratch_.size()) {
+        const std::size_t encoded = errResp.encode(scratch_.data());
+        // G0.1: reliable delivery (retry on back-pressure).
+        enqueueOrBestEffort_(session, scratch_.data(), encoded);
+    }
+}
+
 void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
@@ -1380,87 +1397,34 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // GR-4: Per-partition NotLeader defence-in-depth.
+    // GR-4 / F15 §3.1 (I1): per-partition NotLeader.
     //
-    // If the ReplicaRegistry is wired in, look up the PartitionReplica for this
-    // (topicId, partition).  If the replica exists and is NOT in Leader role,
-    // reject the produce BEFORE touching the Log.  This is belt-and-suspenders
-    // beyond the cluster-level leaderView_ check above: the cluster check uses a
-    // coarse atomic observer that may lag a partition-level role transition
-    // (particularly during epoch changes).
+    // A worker-owned replica's role is the OWNING worker's state: reading
+    // role() here (control thread) was a data race and a check-then-act race —
+    // the role can change between this check and the worker's append.  The
+    // owning worker is the authority (role gate in executeProduceWire_ /
+    // handleWorkerIngressFrame_).  The gateway holds only a GatewayReplicaView
+    // (no role()) and consults the control-owned intended-role HINT the bridge
+    // records when it routes a role op:
+    //   - Follower → fast NotLeader (nothing routed);
+    //   - Leader or absent → route; W decides.
+    // The hint may lead or lag W; both are safe (W is authoritative, both
+    // answers are retriable).  The bootstrap window (committedMetadataReady_
+    // false, replicas still Follower) is answered NotLeader by W (Q4).
+    // The INLINE path below (no worker pool / gateway-owned internal partition)
+    // is the replica's owner thread and keeps its own role check there.
     //
-    // GATE: committedMetadataReady_ (NOT routingImage_)
-    //
-    //   The GR-4 check is gated on committedMetadataReady_, not on whether
-    //   routingImage_ is non-null.  Since MD1-13 Fix 5, routingImage_ is ALWAYS
-    //   set — even during bootstrap — using a StaticBalancer-derived image
-    //   (deterministic across all nodes).  The StaticBalancer image assigns each
-    //   partition a designated leader node, but user replicas are still in Follower
-    //   role at this point because bridge Step B (committedMap → per-partition role
-    //   promotion) has not yet fired.
-    //
-    //   committedMetadataReady_ becomes true only when committedMap() is non-empty
-    //   (i.e., the metadata log has replicated, committed, and been applied by the
-    //   MetadataStateMachine).  At that point bridge Step B fires and promotes user
-    //   replicas to the correct roles — GR-4 can then correctly enforce the role
-    //   invariant.
-    //
-    // BOOTSTRAP WINDOW (committedMetadataReady_ false):
-    //   User replicas start in Follower role and are only promoted to Leader AFTER
-    //   the metadata log records replicate and commit (bridge Step B).  Applying
-    //   GR-4 here would reject every produce from the designated partition leader
-    //   (whose replica is still Follower) with NotLeader — incorrect during bootstrap.
-    //   The replica is looked up for later use (acks=All ISR path) but the role
-    //   check is suppressed.
-    //
-    // STEADY STATE (committedMetadataReady_ true):
-    //   Bridge Step B has fired, replicas are in the correct roles.  If routingImage_
-    //   says "local" but the replica is Follower, that IS a genuine conflict and
-    //   the NotLeader rejection is correct.
-    //
-    // We accept the produce when:
-    //   a) replicaRegistry_ is null (replication not wired in — passthrough).
-    //   b) no replica found for this (topicId, partition) — sparse replica map.
-    //   c) replica.role() == Leader.
-    //   d) committedMetadataReady_ is false (bootstrap window — bridge Step B not
-    //      yet fired; Follower role is expected, not an error).
-    //
-    // We reject (NotLeader) when replica.role() == Follower AND
-    // committedMetadataReady_ is true (steady state: genuine role conflict).
-    //
-    // O(1) lookup (unordered_map): zero per-op alloc, lock-free (single-writer).
-    rune::replication::PartitionReplica* replica = nullptr;
-    if (replicaRegistry_ && committedMetadataReady_) {
-        // GR-4 check: only in steady state (committedMetadataReady_ true —
-        // committedMap non-empty, bridge Step B has promoted replicas to correct
-        // roles).  Skipped during bootstrap (committedMetadataReady_ false).
-        //
-        replica = replicaRegistry_->lookup(msg.topicId, partition);
-        if (replica && replica->role() != rune::replication::Role::Leader) {
-            // Per-partition NotLeader: reject without appending.
-            // Use the same errResp path as the cluster-level check above.
-            pc::ErrorResponse errResp;
-            errResp.sessionId     = msg.sessionId;
-            errResp.correlationId = msg.correlationId;
-            errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            spdlog::debug("ClientGateway: Produce per-partition NotLeader "
+    // O(1) lookup (unordered_map): zero per-op alloc, single-writer.
+    GatewayReplicaView replica;
+    if (replicaRegistry_) {
+        replica = GatewayReplicaView{replicaRegistry_->lookupHandle(msg.topicId, partition)};
+        if (replica.intendedRole() == GatewayReplicaView::IntendedRole::Follower) [[unlikely]] {
+            spdlog::debug("ClientGateway: Produce per-partition NotLeader (intended-role hint) "
                           "(topicId={} partition={}) sessionId={}",
                           msg.topicId, partition, msg.sessionId);
-            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                       pc::ErrorResponse::BODY_FIXED + 2;
-            if (needed <= scratch_.size()) {
-                const std::size_t encoded = errResp.encode(scratch_.data());
-                // G0.1: reliable delivery (retry on back-pressure).
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
-            }
-            return;  // engine untouched — no append
+            sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
+            return;  // engine untouched — no append, nothing routed
         }
-        // replica is either nullptr (no replica for this partition — passthrough)
-        // or role == Leader (allow produce through).
-    } else if (replicaRegistry_ && !committedMetadataReady_) {
-        // Bootstrap window: look up replica for later (acks=All ISR check) but
-        // do NOT reject based on role — bridge Step B has not yet fired.
-        replica = replicaRegistry_->lookup(msg.topicId, partition);
     }
 
     // 5. Assign offsets (CRC-safe restamp).
@@ -1696,7 +1660,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.type         = rune::node::WorkerOp::Type::Produce;
         op.topicId      = msg.topicId;
         op.partition    = partition;
-        op.replica      = replica;
+        op.replica      = replica.routingPtr();
         op.logPtr       = log;
         op.sessionId    = msg.sessionId;
         op.correlationId = msg.correlationId;
@@ -1706,13 +1670,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.baseSequence  = msg.baseSequence;
         op.lastOffsetDelta = lastOffsetDelta;
         op.recordCount   = recordCount;
-        op.deferAck      = acksAll && replica && committedMetadataReady_;
+        op.deferAck      = acksAll && static_cast<bool>(replica) && committedMetadataReady_;
         op.minIsr        = cachedMinIsr_;   // the admission policy; the worker gates on its own ISR
         op.enqueuedAtNs  = nowNs_;
         // E3 Task 5: plumb the topic's async-durability tier so the worker
         // knows whether to defer the ack until fsync completion (Strict=2).
         // Majority (1) is the default — keeps existing behavior unchanged.
-        op.durabilityTier = replica ? replica->durabilityTier() : 1;
+        op.durabilityTier = replica.durabilityTier();
 
         // Capture batch attributes for LSO tracking (forwarded in return).
         constexpr std::size_t kAttrOffset =
@@ -1767,13 +1731,24 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //   appendNoSync() and sync() may lose the most-recent un-flushed acked
     //   records.  True crash-durability requires acks=All + ISR replication
     //   (GR-5/Milestone C).
-    const uint8_t effectiveTier = replica ? replica->durabilityTier() : 1;
+    // F15 §3.1: the inline path runs on the replica's OWNER thread (no worker
+    // pool, or a gateway-owned internal partition) — its live state is ours.
+    rune::replication::PartitionReplica* const ownedReplica = replica.controlOwned();
+    if (ownedReplica && committedMetadataReady_ &&
+        ownedReplica->role() != rune::replication::Role::Leader) {
+        spdlog::debug("ClientGateway: Produce per-partition NotLeader (inline owner) "
+                      "(topicId={} partition={}) sessionId={}",
+                      msg.topicId, partition, msg.sessionId);
+        sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
+        return;  // engine untouched — no append
+    }
+    const uint8_t effectiveTier = replica.durabilityTier();
     // ISR size for min-ISR gate: only applies in steady state (committedMetadataReady_
     // true) and when a replica is wired.  Zero causes the helper to skip the gate
     // (passthrough — single-node / bootstrap).
     // Note: bootstrap-window acks=All is already rejected above before we reach here.
-    const int isrSizeForHelper = (acksAll && replica && committedMetadataReady_)
-                                 ? static_cast<int>(replica->isr().size()) : 0;
+    const int isrSizeForHelper = (acksAll && ownedReplica && committedMetadataReady_)
+                                 ? static_cast<int>(ownedReplica->isr().size()) : 0;
 
     const auto outcome = rune::node::handleProduceBatch(
         rbData, batchLen,
@@ -1835,8 +1810,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     // No double-append: the Log was written once by the helper's appendNoSync().
     // onLeaderLogAppended() only reads the Log's LEO and updates in-memory state.
-    if (replica) {
-        replica->onLeaderLogAppended();
+    if (ownedReplica) {
+        ownedReplica->onLeaderLogAppended();
     }
 
     // 6. Reply ProduceResponse or enqueue deferred ack.
@@ -1848,7 +1823,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // acks=All during the bootstrap window (!committedMetadataReady_) is rejected
     // ABOVE before reaching here; by this point either acks != All or
     // committedMetadataReady_ is true.
-    const bool deferAck = acksAll && replica && committedMetadataReady_;
+    const bool deferAck = acksAll && ownedReplica && committedMetadataReady_;
     if (!deferAck) {
         // Immediate ack: acks=Leader or no replica wired (passthrough).
         sendResp(pc::ErrorCode::OK, partition, outcome.baseOffset);
@@ -1871,8 +1846,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         entry.lastOffset    = outcome.lastOffset;
         entry.enqueuedAtNs  = nowNs_;
         entry.topicId       = msg.topicId;
-        entry.incarnation   = replicaRegistry_
-            ? replicaRegistry_->lookupHandle(msg.topicId, partition).incarnation : 0u;
+        entry.incarnation   = replica.incarnation();
 
         pendingAcks_.push_back(entry);  // no heap alloc (capacity pre-reserved)
 
