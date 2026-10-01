@@ -261,6 +261,7 @@ if(BUILD_BENCHMARKS)
         benchmark/ProduceValidateBench.cpp
         benchmark/FusedRuntimePassBench.cpp
         benchmark/WorkerReturnCodecBench.cpp
+        benchmark/SessionAckSinkBench.cpp
         benchmark/RcBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     # FusedRuntimePassBench drives a real broker with the shard tests' wire client.
