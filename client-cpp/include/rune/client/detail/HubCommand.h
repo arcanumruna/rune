@@ -38,8 +38,9 @@ struct HubCommand {
         /// handle = GroupConsumerImpl* (identity only; resolved against the
         /// hub's own list, never dereferenced unless found there).
         GroupCommit     = 11,
-        /// handle = GroupConsumerImpl* (identity); a = heap std::promise<void>*
-        /// (ownership passes to the duty thread, which resolves it).
+        /// handle = GroupConsumerImpl* (identity); a = the app's Token; b / c =
+        /// the completion target (detail::encodeTarget, F8c C4).  Exactly one
+        /// completion follows (the duty thread / close() delivers it).
         GroupCommitSync = 12,
         /// handle = GroupConsumerImpl* (identity).
         GroupClose      = 13,
@@ -68,6 +69,8 @@ struct HubCommand {
     uint64_t handle = 0;
     int64_t  a      = 0;
     int64_t  b      = 0;
+    int64_t  c      = 0;  ///< F8c C4: second completion-target word
+    int64_t  d      = 0;  ///< F8c C5: op payload (a heap holder for txn sends / offsets)
 };
 
 /// Result of handing a HubCommand to a sink.

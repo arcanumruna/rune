@@ -311,7 +311,7 @@ public:
     /// close() path, single-threaded (runner joined / Invoker owner): drain the
     /// WHOLE command ring once, adopting producer + txn-producer registrations
     /// and applying F8a hub commands through their hooks (so their holders are
-    /// freed and the owner can fail them — a commitSync promise or subscribe
+    /// freed and the owner can fail them — a commitSync token or subscribe
     /// still in the ring is never stranded) and dropping every other command
     /// (sends carry no completion).
     ///

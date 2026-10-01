@@ -52,6 +52,7 @@
 #include <rune/client/TypedTopic.h>
 #include <rune/client/Completion.h>
 #include <rune/client/Completions.h>
+#include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
 
 #include <chrono>
@@ -566,13 +567,9 @@ private:
 
     friend class Completions;
 
-    /// A completion's destination as the duty thread holds it.
-    struct DutyTarget {
-        CompletionHandler handler{};          // fn != nullptr: the callback form
-        uint32_t          reservedBytes = 0;  // CQ form: the issuer's reservation
-        CqRef             cqRef = kNoCqRef;   // CQ form: registry reference
-        bool              counted = false;    // CQ form: pins its slot (I3 quarantine)
-    };
+    /// A completion's destination as the duty thread holds it (shared with
+    /// the group / txn libraries since F8c C4).
+    using DutyTarget = detail::OpTarget;
 
     /// One pending control op (duty-thread owned; cold path).
     struct PendingCtl {
@@ -632,6 +629,20 @@ private:
     /// Deliver one completion to its target (duty thread / closing thread).
     void deliver_(const DutyTarget& t, Completion c, std::span<const uint8_t> payload,
                   detail::CompletionRing::Overflow ov = detail::CompletionRing::Overflow::Truncate);
+    /// F8c C4: detail::CompletionSink bound to the group hub / txn producers.
+    static void deliverTrampoline_(void* ctx, const detail::OpTarget& t, const Completion& c,
+                                   std::span<const uint8_t> payload) noexcept;
+    /// F8c C4: detail::TargetedOpSink bound to handles that issue token ops
+    /// (GroupConsumer::commitSync, the txn ops): validate + reserve, encode the
+    /// target into the command, apply directly on the duty thread or submit.
+    static OpResult targetedOpTrampoline_(void* ctx, detail::HubCommand& cmd,
+                                          const CompletionTarget& target, Token token, OpKind op);
+    OpResult issueTargeted_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op);
+    /// F8c C4: detail::AndWaitSink — the handles' *AndWait sugar.
+    static Completion andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
+                                         detail::AndWaitIssue issue, void* issueCtx, std::string* text);
+    /// I3: pin the completion target a command carries (re-encoded counted).
+    void pinCommandTarget_(detail::HubCommand& cmd) noexcept;
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
     OpResult issueControl_(OpKind op, CompletionTarget target, Token token,

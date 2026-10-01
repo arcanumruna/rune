@@ -41,7 +41,7 @@
 //         commit() sets commitRequested; doWork sends OffsetCommit (captured).
 //
 //   7.  CommitSyncResolvesOnOffsetCommitResponse
-//         commitSync() returns future; onOffsetCommitResponse resolves it.
+//         commitSync(token) completes Ok on the matching OffsetCommitResponse.
 //
 //   8.  HeartbeatResponseRebalanceInProgress_TransitionsToRejoining
 //         HeartbeatResponse{RebalanceInProgress} → state = Rejoining.
@@ -60,7 +60,7 @@
 //         close() → active() false; subsequent onRecords not delivered.
 //
 //  13.  CommitSyncFailsOnClose
-//         commitSync() pending when close() → future throws.
+//         commitSync(token) pending when close() → completes Closed.
 //
 //  14.  NotCoordinatorResponse_TransitionsToRejoining
 //         HeartbeatResponse{NotCoordinator} → Rejoining.
@@ -86,7 +86,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <future>
+#include <map>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -108,6 +108,48 @@ static rune::client::detail::HubSubmit directSink(void* ctx,
                                                   const rune::client::detail::HubCommand& cmd) {
     static_cast<GroupConsumerHub*>(ctx)->applyCommand(cmd);
     return rune::client::detail::HubSubmit::Accepted;
+}
+
+// F8c C4: commitSync completions land in this ledger (exactly-once counts).
+// The hub-level sink applies the command synchronously with a handler target
+// (the test thread IS the duty thread here).
+struct SyncLedger {
+    struct Entry { int times = 0; Completion c{}; };
+    std::map<Token, Entry> e;
+    Token next = 0;
+    static void on(void* ctx, const Completion& c, std::span<const uint8_t>) noexcept {
+        auto& x = static_cast<SyncLedger*>(ctx)->e[c.token];
+        ++x.times;
+        x.c = c;
+    }
+    CompletionHandler handler() { return CompletionHandler{&SyncLedger::on, this}; }
+};
+static SyncLedger g_ledger;         // test thread only; reset per test
+static int64_t    g_hubNowNs = 0;   // duty clock handed to applyCommand
+
+struct SyncOp {
+    Token    t = 0;
+    OpResult r = OpResult::InvalidArgument;
+    [[nodiscard]] bool ready() const { return g_ledger.e.count(t) != 0 && g_ledger.e.at(t).times > 0; }
+    [[nodiscard]] int times() const { return g_ledger.e.count(t) != 0 ? g_ledger.e.at(t).times : 0; }
+    [[nodiscard]] const Completion& c() const { return g_ledger.e.at(t).c; }
+    [[nodiscard]] OpStatus status() const { return c().status; }
+};
+
+static SyncOp commitSyncOp(GroupConsumer& gc) {
+    const Token t = ++g_ledger.next;
+    return SyncOp{t, gc.commitSync(g_ledger.handler(), t)};
+}
+
+static OpResult directOpSink(void* ctx, rune::client::detail::HubCommand& cmd,
+                             const CompletionTarget& target, Token token, OpKind) {
+    if (target.handler.fn == nullptr) return OpResult::InvalidArgument;
+    rune::client::detail::OpTarget t;
+    t.handler = target.handler;
+    cmd.a = static_cast<int64_t>(token);
+    rune::client::detail::encodeTarget(t, cmd);
+    static_cast<GroupConsumerHub*>(ctx)->applyCommand(cmd, g_hubNowNs);
+    return OpResult::Accepted;
 }
 
 static constexpr int32_t kTopicId    = 42;
@@ -351,6 +393,8 @@ static int64_t lastCommitCorrId(const CaptureSink& sink);
 class GroupConsumerHubTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        g_ledger   = SyncLedger{};
+        g_hubNowNs = 0;
         hub_ = std::make_unique<GroupConsumerHub>();
         impl_ = std::make_shared<GroupConsumerImpl>();
         impl_->groupId  = "test-group";
@@ -364,6 +408,8 @@ protected:
     }
 
     void TearDown() override {
+        // F8c C4: every commitSync completion in any test arrived exactly once.
+        for (const auto& [t, e] : g_ledger.e) EXPECT_EQ(e.times, 1) << "token " << t;
         hub_.reset();
         impl_.reset();
     }
@@ -516,8 +562,8 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesOnOffsetCommitResponse) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
 
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     const int64_t corr = lastCommitCorrId(sink_);
     ASSERT_NE(corr, 0) << "commitSync's OffsetCommit carries its own correlationId";
@@ -525,79 +571,80 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesOnOffsetCommitResponse) {
     auto ocr = makeOffsetCommitResponse(corr);
     hub_->onOffsetCommitResponse(ocr.data(), ocr.size());
 
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_NO_THROW(fut.get());
-    EXPECT_FALSE(impl_->commitSyncPromise);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Ok);
+    EXPECT_FALSE(impl_->hasCommitSync);
 }
 
 // fix1 I6: only the response to THIS commitSync's OffsetCommit resolves it.
 TEST_F(GroupConsumerHubTest, CommitSyncIgnoresUnrelatedOffsetCommitResponsesRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
 
     auto early = makeOffsetCommitResponse(0);  // e.g. an auto-commit's response
     hub_->onOffsetCommitResponse(early.data(), early.size());
-    EXPECT_NE(fut.wait_for(0ms), std::future_status::ready) << "not even sent yet";
+    EXPECT_FALSE(fut.ready()) << "not even sent yet";
 
     doWorkNow(*hub_, sink_);
     const int64_t corr = lastCommitCorrId(sink_);
     auto other = makeOffsetCommitResponse(corr + 1000);
     hub_->onOffsetCommitResponse(other.data(), other.size());
     hub_->onOffsetCommitResponse(early.data(), early.size());
-    EXPECT_NE(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_FALSE(fut.ready());
 
     auto mine = makeOffsetCommitResponse(corr);
     hub_->onOffsetCommitResponse(mine.data(), mine.size());
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_NO_THROW(fut.get());
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Ok);
 }
 
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnCommitErrorCodeRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     auto ocr = makeOffsetCommitResponse(lastCommitCorrId(sink_),
                                         static_cast<int16_t>(rpc::ErrorCode::NotCoordinator));
     hub_->onOffsetCommitResponse(ocr.data(), ocr.size());
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::BrokerError);
+    EXPECT_EQ(fut.c().errorCode, static_cast<uint16_t>(rpc::ErrorCode::NotCoordinator));
 }
 
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnRejoinRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     auto hbr = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress));
     hub_->onHeartbeatResponse(hbr.data(), hbr.size(), kSessionId, sink_.fn());
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready) << "a rejoin is a progress event";
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(fut.ready()) << "a rejoin is a progress event";
+    EXPECT_EQ(fut.status(), OpStatus::Rejoined);
 }
 
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionLossRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     hub_->onConnected(kSessionId + 1, sink_.fn());  // a new session: the old one was lost
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::SessionLost);
 }
 
 // A commitSync requested before the commit can go out (not Stable) stays
 // pending — it is neither dropped (old code: never resolved) nor failed by the
 // first connect.
 TEST_F(GroupConsumerHubTest, CommitSyncBeforeStableWaitsAndIsSentOnceStableRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
-    EXPECT_NE(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_FALSE(fut.ready());
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 3);
     doWorkNow(*hub_, sink_);
@@ -605,17 +652,17 @@ TEST_F(GroupConsumerHubTest, CommitSyncBeforeStableWaitsAndIsSentOnceStableRegre
     ASSERT_NE(corr, 0);
     auto ocr = makeOffsetCommitResponse(corr);
     hub_->onOffsetCommitResponse(ocr.data(), ocr.size());
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_NO_THROW(fut.get());
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Ok);
 }
 
 TEST_F(GroupConsumerHubTest, CommitSyncWithNothingToCommitResolvesRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);  // position still unseeded
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_NO_THROW(fut.get());
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Ok);
 }
 
 // ---------------------------------------------------------------------------
@@ -745,16 +792,16 @@ TEST_F(GroupConsumerHubTest, CloseDeactivates_NoDispatchAfterClose) {
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnClose) {
     // Create a GroupConsumer handle.
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
 
     bringToStable(*hub_, sink_, kTopicId, kPartition);
 
-    auto fut = gc.commitSync();
+    auto fut = commitSyncOp(gc);
     gc.close();
 
     // Future should be failed (not block forever).
-    ASSERT_EQ(fut.wait_for(100ms), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::exception);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Closed);
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +917,7 @@ TEST_F(GroupConsumerHubTest, PositionNotRegressOnNewRecords) {
 // 19. GroupConsumer_CloseIsIdempotent
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, GroupConsumer_CloseIsIdempotent) {
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
     EXPECT_TRUE(gc.active());
 
     gc.close();
@@ -1344,6 +1391,15 @@ struct GroupRingChannel {
         }
         return rune::client::detail::HubSubmit::Accepted;
     }
+    static OpResult opFn(void* ctx, rune::client::detail::HubCommand& c, const CompletionTarget& target,
+                         Token token, OpKind) {
+        rune::client::detail::OpTarget t;
+        t.handler = target.handler;
+        c.a = static_cast<int64_t>(token);
+        rune::client::detail::encodeTarget(t, c);
+        (void)fn(ctx, c);
+        return OpResult::Accepted;
+    }
     void drainInto(GroupConsumerHub& hub) {
         ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at,
                       aeron::util::index_t) {
@@ -1361,8 +1417,20 @@ TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRaceRegression) {
     hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
 
     GroupRingChannel ch;
-    GroupConsumer gc(impl_, &GroupRingChannel::fn, &ch);
+    GroupConsumer gc(impl_, &GroupRingChannel::fn, &ch, {}, &GroupRingChannel::opFn);
     constexpr int kIterations = 500;
+    // The completion is delivered on the DUTY thread: it signals the app
+    // thread through a test-harness atomic (the production form is a
+    // Completions ring; here the hub has no registry).
+    struct Done {
+        std::atomic<int>      n{0};
+        std::atomic<uint8_t>  st{0};
+        static void on(void* ctx, const Completion& c, std::span<const uint8_t>) noexcept {
+            auto* d = static_cast<Done*>(ctx);
+            d->st.store(static_cast<uint8_t>(c.status), std::memory_order_relaxed);
+            d->n.fetch_add(1, std::memory_order_release);
+        }
+    } done;
     std::atomic<bool> appDone{false};   // test-harness flags only
     std::atomic<int>  commitsSent{0};
 
@@ -1380,7 +1448,7 @@ TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRaceRegression) {
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             hub_->doWork(nowNs, kSessionId, send);
             // Play the broker: acknowledge an in-flight commitSync.
-            if (impl_->commitSyncPromise && impl_->commitSyncCorrId != 0) {
+            if (impl_->hasCommitSync && impl_->commitSyncCorrId != 0) {
                 const auto mine = makeOffsetCommitResponse(impl_->commitSyncCorrId);
                 hub_->onOffsetCommitResponse(mine.data(), mine.size());
             }
@@ -1389,8 +1457,11 @@ TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRaceRegression) {
     });
 
     for (int i = 0; i < kIterations; ++i) gc.commit();
-    auto fut = gc.commitSync();
-    EXPECT_NO_THROW(fut.get()) << "the duty thread resolves the promise it owns";
+    ASSERT_EQ(gc.commitSync(CompletionHandler{&Done::on, &done}, 1), OpResult::Accepted);
+    while (done.n.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+    EXPECT_EQ(done.n.load(), 1);
+    EXPECT_EQ(static_cast<OpStatus>(done.st.load()), OpStatus::Ok)
+        << "the duty thread completes the commitSync it owns";
     gc.close();
     while (!impl_->status.closed()) std::this_thread::yield();  // duty applied close
     EXPECT_FALSE(gc.active());
@@ -1414,13 +1485,22 @@ struct CapturingGroupSink {
         self->cmds.push_back(c);
         return rune::client::detail::HubSubmit::Accepted;
     }
+    static OpResult opFn(void* ctx, rune::client::detail::HubCommand& c, const CompletionTarget& target,
+                         Token token, OpKind) {
+        rune::client::detail::OpTarget t;
+        t.handler = target.handler;
+        c.a = static_cast<int64_t>(token);
+        rune::client::detail::encodeTarget(t, c);
+        (void)fn(ctx, c);
+        return OpResult::Accepted;
+    }
 };
 } // namespace
 
 TEST_F(GroupConsumerHubTest, CommitAndCloseAreCommandsNotSharedWritesRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     CapturingGroupSink cap;
-    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap);
+    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap, {}, &CapturingGroupSink::opFn);
 
     gc.commit();
     ASSERT_EQ(cap.cmds.size(), 1u);
@@ -1429,22 +1509,22 @@ TEST_F(GroupConsumerHubTest, CommitAndCloseAreCommandsNotSharedWritesRegression)
     hub_->applyCommand(cap.cmds[0]);
     EXPECT_TRUE(impl_->commitRequested);
 
-    auto fut = gc.commitSync();
+    auto fut = commitSyncOp(gc);
     ASSERT_EQ(cap.cmds.size(), 2u);
-    EXPECT_FALSE(impl_->commitSyncPromise) << "the promise travels in the command";
+    EXPECT_FALSE(impl_->hasCommitSync) << "the token + target travel in the command";
     hub_->applyCommand(cap.cmds[1]);
-    ASSERT_TRUE(impl_->commitSyncPromise);
+    ASSERT_TRUE(impl_->hasCommitSync);
 
     gc.close();
     EXPECT_FALSE(gc.active()) << "handle-local: inactive at once";
     EXPECT_TRUE(impl_->active) << "duty-owned flag untouched until the command is applied";
-    EXPECT_NE(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_FALSE(fut.ready());
     ASSERT_EQ(cap.cmds.size(), 3u);
     hub_->applyCommand(cap.cmds[2]);
     EXPECT_FALSE(impl_->active);
     EXPECT_TRUE(impl_->status.closed());
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Closed);
 
     gc.close();  // idempotent
     EXPECT_EQ(cap.calls, 3);
@@ -1452,25 +1532,25 @@ TEST_F(GroupConsumerHubTest, CommitAndCloseAreCommandsNotSharedWritesRegression)
 
 TEST_F(GroupConsumerHubTest, CommitSyncSupersededFailsOlderFutureRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto f1 = gc.commitSync();
-    auto f2 = gc.commitSync();
-    ASSERT_EQ(f1.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(f1.get(), std::runtime_error);
-    EXPECT_NE(f2.wait_for(0ms), std::future_status::ready);
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto f1 = commitSyncOp(gc);
+    auto f2 = commitSyncOp(gc);
+    ASSERT_TRUE(f1.ready());
+    EXPECT_EQ(f1.status(), OpStatus::Superseded);
+    EXPECT_FALSE(f2.ready());
     doWorkNow(*hub_, sink_);  // nothing seeded: resolves with nothing to commit
-    ASSERT_EQ(f2.wait_for(0ms), std::future_status::ready);
-    EXPECT_NO_THROW(f2.get());
+    ASSERT_TRUE(f2.ready());
+    EXPECT_EQ(f2.status(), OpStatus::Ok);
 }
 
 // A commitSync for a consumer the hub does not hold (never adopted / foreign)
 // is failed, never stranded.
 TEST_F(GroupConsumerHubTest, CommitSyncForUnknownConsumerFailsNeverStrandsRegression) {
     auto other = std::make_shared<GroupConsumerImpl>();  // never added to hub_
-    GroupConsumer gc(other, &directSink, hub_.get());
-    auto f = gc.commitSync();
-    ASSERT_EQ(f.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(f.get(), std::runtime_error);
+    GroupConsumer gc(other, &directSink, hub_.get(), {}, &directOpSink);
+    auto f = commitSyncOp(gc);
+    ASSERT_TRUE(f.ready());
+    EXPECT_EQ(f.status(), OpStatus::Closed);
 }
 
 // After the Client closes (closeAll), a surviving handle never touches the
@@ -1478,15 +1558,15 @@ TEST_F(GroupConsumerHubTest, CommitSyncForUnknownConsumerFailsNeverStrandsRegres
 TEST_F(GroupConsumerHubTest, HandleNeverTouchesClientAfterCloseAllRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     CapturingGroupSink cap;
-    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap);
+    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap, {}, &CapturingGroupSink::opFn);
     EXPECT_TRUE(gc.active());
 
     hub_->closeAll(kSessionId, sink_.fn());
     EXPECT_FALSE(gc.active());
     gc.commit();
-    auto f = gc.commitSync();
-    ASSERT_EQ(f.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(f.get(), std::runtime_error);
+    auto f = commitSyncOp(gc);
+    EXPECT_EQ(f.r, OpResult::Closed) << "rejected synchronously: no completion will follow";
+    EXPECT_FALSE(f.ready());
     gc.close();
     EXPECT_EQ(cap.calls, 0);
 }
@@ -1510,7 +1590,7 @@ TEST(GroupConsumerHubCommand, GroupAddAdoptsAndFreesHolderRegression) {
 
 // I2: the generation reaches the owning app thread only through the status ring.
 TEST_F(GroupConsumerHubTest, GenerationPublishedThroughStatusRingRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
     EXPECT_EQ(gc.generation(), 0);
     bringToStable(*hub_, sink_, kTopicId, kPartition, /*genId=*/5);
     EXPECT_EQ(gc.generation(), 5);
@@ -1524,7 +1604,7 @@ TEST_F(GroupConsumerHubTest, GenerationPublishedThroughStatusRingRegression) {
 
 // Calls from inside a callback (duty thread) act on duty-owned state directly.
 TEST_F(GroupConsumerHubTest, HandleCallsOnDutyThreadActDirectlyRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get(), std::this_thread::get_id());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), std::this_thread::get_id(), &directOpSink);
     int32_t seenGen = -1;
     bool finishedInside = true;
     int records = 0;
@@ -1615,8 +1695,8 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesAfterARefusedOffsetCommitRegressi
     seedPosition(*hub_, 7);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
 
     tx.refuseNext = 1;
     EXPECT_EQ(hub_->flushRequestedCommits(kSessionId), 0) << "refused";
@@ -1631,26 +1711,26 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesAfterARefusedOffsetCommitRegressi
 
     auto ocr = makeOffsetCommitResponse(oc->correlationId);
     hub_->onOffsetCommitResponse(ocr.data(), ocr.size());
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_NO_THROW(fut.get());
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Ok);
 }
 
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionDownRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();  // not even sent
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);  // not even sent
     hub_->onSessionDown();
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::SessionLost);
 }
 
 // fix3 I2: commitSync applied while the session is down fails at once.
 TEST_F(GroupConsumerHubTest, CommitSyncAppliedWhileSessionDownFailsAtOnceRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     hub_->setSessionConnected(false);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
-    auto fut = gc.commitSync();
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    auto fut = commitSyncOp(gc);
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::SessionLost);
     impl_->commitRequested = true;
     EXPECT_EQ(hub_->flushRequestedCommits(kSessionId), 0) << "no commit offered while down";
 }
@@ -1663,7 +1743,7 @@ TEST_F(GroupConsumerHubTest, LeaveGroupOnCloseRetriedWhenRefusedRegression) {
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
     tx.refuseNext = 1;
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
     gc.close();
     EXPECT_EQ(hub_->pendingLeaves(), 1u);
     EXPECT_EQ(hub_->retryPendingLeaves(kSessionId), 1);
@@ -1679,7 +1759,7 @@ TEST_F(GroupConsumerHubTest, PendingLeaveGroupDroppedOnSessionChangeRegression) 
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
     tx.refuseNext = 1;
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
     gc.close();
     ASSERT_EQ(hub_->pendingLeaves(), 1u);
     EXPECT_EQ(hub_->retryPendingLeaves(kSessionId + 1), 0);
@@ -1699,13 +1779,13 @@ TEST_F(GroupConsumerHubTest, FatalOffsetCommitFailsCommitSyncAndIsNotReofferedRe
     seedPosition(*hub_, 7);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
 
-    auto fut = gc.commitSync();
+    auto fut = commitSyncOp(gc);
     tx.fatalNext = 1;
     (void)hub_->flushRequestedCommits(kSessionId);
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready) << "a Fatal OffsetCommit must fail commitSync";
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(fut.ready()) << "a Fatal OffsetCommit must fail commitSync";
+    EXPECT_EQ(fut.status(), OpStatus::NotConnected);
     EXPECT_FALSE(impl_->commitRequested) << "dropped, not kept for retry";
     (void)hub_->flushRequestedCommits(kSessionId);
     EXPECT_EQ(tx.fatals, 1);
@@ -1727,7 +1807,7 @@ TEST_F(GroupConsumerHubTest, FatalLeaveGroupIsDroppedNotRetriedRegression) {
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
     tx.fatalNext = 1;
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
     gc.close();
     EXPECT_EQ(hub_->pendingLeaves(), 0u);
     EXPECT_EQ(hub_->retryPendingLeaves(kSessionId), 0);
@@ -1742,7 +1822,7 @@ TEST_F(GroupConsumerHubTest, CloseAllSendsOneLeaveGroupWhenOnRevokedClosesRegres
     hub_->setSessionConnected(true, kSessionId);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), std::this_thread::get_id());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), std::this_thread::get_id(), &directOpSink);
     impl_->cbRevoked = [&](std::vector<TopicPartition>) { gc.close(); };
     sink_.clear();
     hub_->closeAll(kSessionId, sink_.fn());
@@ -1765,57 +1845,51 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsWhenANewSessionReplacesItsOwnRegress
     hub_->setSessionConnected(true, kSessionId, /*episode=*/1);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
 
-    auto f1 = gc.commitSync();
+    auto f1 = commitSyncOp(gc);
     ASSERT_EQ(hub_->flushRequestedCommits(kSessionId), 1);
     ASSERT_NE(impl_->commitSyncCorrId, 0);
     hub_->setSessionConnected(true, kSessionId + 1, /*episode=*/2);  // new session, never "down"
-    ASSERT_EQ(f1.wait_for(0ms), std::future_status::ready) << "stranded on a dead session";
-    EXPECT_THROW(f1.get(), SessionLostError);
+    ASSERT_TRUE(f1.ready()) << "stranded on a dead session";
+    EXPECT_EQ(f1.status(), OpStatus::SessionLost);
 
     // Same sessionId resumed in a new connect episode: the commit's fate is
     // just as unknown.
-    auto f2 = gc.commitSync();
+    auto f2 = commitSyncOp(gc);
     ASSERT_EQ(hub_->flushRequestedCommits(kSessionId + 1), 1);
     hub_->setSessionConnected(true, kSessionId + 1, /*episode=*/3);
-    ASSERT_EQ(f2.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(f2.get(), SessionLostError);
+    ASSERT_TRUE(f2.ready());
+    EXPECT_EQ(f2.status(), OpStatus::SessionLost);
 
     // An unchanged observation fails nothing.
-    auto f3 = gc.commitSync();
+    auto f3 = commitSyncOp(gc);
     hub_->setSessionConnected(true, kSessionId + 1, /*episode=*/3);
-    EXPECT_NE(f3.wait_for(0ms), std::future_status::ready);
+    EXPECT_FALSE(f3.ready());
 }
 
 // M6: a commitSync failed by session loss is a distinguishable, retriable
 // error (SessionLostError); other failures (rejoin, close) are not.
 TEST_F(GroupConsumerHubTest, CommitSyncSessionLossIsADistinctRetriableErrorRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
-    GroupConsumer gc(impl_, &directSink, hub_.get());
+    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
 
-    auto down = gc.commitSync();
+    auto down = commitSyncOp(gc);
     hub_->onSessionDown();
-    ASSERT_EQ(down.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(down.get(), SessionLostError);
+    ASSERT_TRUE(down.ready());
+    EXPECT_EQ(down.status(), OpStatus::SessionLost);
 
     hub_->setSessionConnected(false);
-    auto whileDown = gc.commitSync();
-    ASSERT_EQ(whileDown.wait_for(0ms), std::future_status::ready);
-    EXPECT_THROW(whileDown.get(), SessionLostError);
+    auto whileDown = commitSyncOp(gc);
+    ASSERT_TRUE(whileDown.ready());
+    EXPECT_EQ(whileDown.status(), OpStatus::SessionLost);
     hub_->setSessionConnected(true, kSessionId);
 
-    auto rejoin = gc.commitSync();
+    auto rejoin = commitSyncOp(gc);
     auto hb = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress));
     hub_->onHeartbeatResponse(hb.data(), hb.size(), kSessionId, sink_.fn());
-    ASSERT_EQ(rejoin.wait_for(0ms), std::future_status::ready);
-    try {
-        rejoin.get();
-        ADD_FAILURE() << "expected a failure";
-    } catch (const SessionLostError&) {
-        ADD_FAILURE() << "a rejoin is not a session loss";
-    } catch (const std::runtime_error&) {
-    }
+    ASSERT_TRUE(rejoin.ready());
+    EXPECT_EQ(rejoin.status(), OpStatus::Rejoined) << "a rejoin is not a session loss";
 }
 
 // M7: a direct GroupCommit and GroupCommitSync applied to an impl whose
@@ -1831,19 +1905,22 @@ TEST(GroupConsumerHubCommand, DirectCommitAndCommitSyncBeforeAdoptionAreHonoured
     impl->topicIds = {kTopicId};
     impl->active   = true;
 
-    auto prom = std::make_unique<std::promise<void>>();
-    auto fut  = prom->get_future();
+    g_ledger = SyncLedger{};
     HubCommand sync;
     sync.op     = HubCommand::Op::GroupCommitSync;
     sync.handle = reinterpret_cast<uint64_t>(impl.get());
-    sync.a      = static_cast<int64_t>(reinterpret_cast<uintptr_t>(prom.release()));
+    sync.a      = 1;
+    rune::client::detail::OpTarget tgt;
+    tgt.handler = g_ledger.handler();
+    rune::client::detail::encodeTarget(tgt, sync);
     hub.applyCommandDirect(sync);  // not adopted yet
+    const SyncOp fut{1, OpResult::Accepted};
     HubCommand commit;
     commit.op     = HubCommand::Op::GroupCommit;
     commit.handle = reinterpret_cast<uint64_t>(impl.get());
     hub.applyCommandDirect(commit);
     EXPECT_TRUE(hub.empty());
-    EXPECT_NE(fut.wait_for(0ms), std::future_status::ready) << "must not fail as 'closed'";
+    EXPECT_FALSE(fut.ready()) << "must not fail as 'closed'";
 
     HubCommand add;  // the queued GroupAdd, drained later
     add.op     = HubCommand::Op::GroupAdd;
@@ -1861,6 +1938,6 @@ TEST(GroupConsumerHubCommand, DirectCommitAndCommitSyncBeforeAdoptionAreHonoured
     EXPECT_NE(oc->correlationId, 0) << "the commitSync owns this commit";
     auto ocr = makeOffsetCommitResponse(oc->correlationId);
     hub.onOffsetCommitResponse(ocr.data(), ocr.size());
-    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
-    EXPECT_NO_THROW(fut.get());
+    ASSERT_TRUE(fut.ready());
+    EXPECT_EQ(fut.status(), OpStatus::Ok);
 }

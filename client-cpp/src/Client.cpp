@@ -181,6 +181,8 @@ Client::Client(ClientConfig cfg)
     cqSlots_.reserve(kMaxCqs);
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
+    // F8c C4: commitSync completions go through the completion-queue registry.
+    groupConsumerHub_.setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
     subscriberHub_.setSessionConnected(false);
     // F8a fix2: Unsubscribe / OffsetCommit frames go straight to the transport
     // from the duty thread (retried every duty cycle on refusal), never via the
@@ -742,6 +744,90 @@ void Client::deliver_(const DutyTarget& t, Completion c, std::span<const uint8_t
             freeCqSlot_(idx);
         }
     }
+}
+
+void Client::deliverTrampoline_(void* ctx, const detail::OpTarget& t, const Completion& c,
+                                std::span<const uint8_t> payload) noexcept {
+    static_cast<Client*>(ctx)->deliver_(t, c, payload);
+}
+
+void Client::pinCommandTarget_(detail::HubCommand& cmd) noexcept {
+    detail::OpTarget t = detail::decodeTarget(cmd);
+    pinCqSlot_(t);
+    detail::encodeTarget(t, cmd);
+}
+
+// ---------------------------------------------------------------------------
+// F8c C4/C5: token ops issued through handles (commitSync, txn ops)
+// ---------------------------------------------------------------------------
+
+OpResult Client::targetedOpTrampoline_(void* ctx, detail::HubCommand& cmd, const CompletionTarget& target,
+                                       Token token, OpKind op) {
+    return static_cast<Client*>(ctx)->issueTargeted_(cmd, target, token, op);
+}
+
+OpResult Client::issueTargeted_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op) {
+    if (token > kMaxToken) return OpResult::InvalidArgument;
+    if (target.cq == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) return OpResult::WrongThread;
+
+    detail::OpTarget t;
+    Completions* q = target.cq;
+    if (q != nullptr) {
+        if (q->client_ != this) return OpResult::InvalidArgument;
+        if (!q->onOwnerThread()) return OpResult::WrongThread;
+        const uint32_t r  = q->reservationFor(op);
+        const OpResult rr = q->reserve(r);
+        if (rr != OpResult::Accepted) return rr;
+        t.reservedBytes = r;
+        t.cqRef         = q->cqRef_;
+    } else {
+        t.handler = target.handler;
+    }
+    cmd.a = static_cast<int64_t>(token);
+    detail::encodeTarget(t, cmd);
+    auto unreserve = [&] { if (q != nullptr) q->unreserve(t.reservedBytes); };
+
+    if (agent_.commandRingClosed()) {
+        unreserve();
+        return OpResult::Closed;
+    }
+    // The duty thread itself (the Invoker owner — in or outside a cycle — or
+    // a Thread-mode runner callback): the state is ours, apply now (the
+    // command is pinned and owned before this returns; nothing is queued).
+    if (onDuty) {
+        applyHubCommandDirect_(cmd);
+        return OpResult::Accepted;
+    }
+    // fix5 test seam: close() racing this submit (the ring linearizes it).
+    if (testBeforeRegistrationSubmitHook_) [[unlikely]] testBeforeRegistrationSubmitHook_();
+    switch (agent_.submitHubCommand(cmd)) {
+    case agent::ClientAgent::Submit::Accepted:
+        // I3': the queue's ring fence — the op lies before this tail.
+        if (q != nullptr) q->issueFence_ = agent_.commandRingTail();
+        return OpResult::Accepted;
+    case agent::ClientAgent::Submit::Full:
+        unreserve();
+        return OpResult::BackPressured;
+    case agent::ClientAgent::Submit::Closed:
+        break;
+    }
+    unreserve();
+    return OpResult::Closed;
+}
+
+Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
+                                      detail::AndWaitIssue issue, void* issueCtx, std::string* text) {
+    auto* self = static_cast<Client*>(ctx);
+    Completion out;
+    self->andWait_(what, timeout, 0,
+                   [&](Completions& q, Token t) { return issue(issueCtx, CompletionTarget(q), t); },
+                   [&](const Completion& c, std::span<const uint8_t> p) {
+                       out = c;
+                       if (text != nullptr) text->assign(reinterpret_cast<const char*>(p.data()), p.size());
+                   });
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,6 +1500,8 @@ void Client::sweepTimeouts(int64_t nowNs) {
             return agent_.submitSend(fb, fl);
         };
         groupConsumerHub_.doWork(wallNs, snap.sessionId, sendFn);
+        // F8c C4: commitSync deadlines on the duty clock -> Timeout.
+        (void)groupConsumerHub_.sweepCommitSyncTimeouts(nowNs);
     }
 
     // --- MD1 IMPORTANT-3: fire an armed background metadata refresh if due ------
@@ -2302,8 +2390,14 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
             });
         return;
     }
-    if (cmd.op == Op::GroupClose || cmd.op == Op::GroupCommit || cmd.op == Op::GroupCommitSync) {
-        groupConsumerHub_.applyCommandDirect(cmd);
+    if (cmd.op == Op::GroupCommitSync) {
+        detail::HubCommand pinned = cmd;
+        pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+        groupConsumerHub_.applyCommandDirect(pinned, now());
+        return;
+    }
+    if (cmd.op == Op::GroupClose || cmd.op == Op::GroupCommit) {
+        groupConsumerHub_.applyCommandDirect(cmd, now());
         return;
     }
     applyHubCommand_(cmd);
@@ -2355,8 +2449,12 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                 return agent_.submitSend(fb, fl);
             });
+    } else if (cmd.op == Op::GroupCommitSync) {
+        detail::HubCommand pinned = cmd;
+        pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+        groupConsumerHub_.applyCommand(pinned, now());
     } else {
-        groupConsumerHub_.applyCommand(cmd);
+        groupConsumerHub_.applyCommand(cmd, now());
     }
 }
 
@@ -2365,14 +2463,8 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     auto* self = static_cast<Client*>(ctx);
     const bool onDuty = std::this_thread::get_id() == self->dutyThreadId_;
 
-    // fix1 I6: a commitSync() future created inside a duty-cycle callback can
-    // never resolve while that callback blocks the duty thread — fail loudly
-    // instead of deadlocking.  (inDutyCycle_ is read on the duty thread only.)
-    if (cmd.op == Op::GroupCommitSync && onDuty && self->inDutyCycle_) {
-        throw std::logic_error(
-            "GroupConsumer::commitSync() called from inside a duty-cycle callback: its "
-            "future can never resolve while the callback runs — use commit()");
-    }
+    // F8c C4: GroupCommitSync is a token op (targetedOpTrampoline_), never
+    // submitted here; the token form is allowed from a duty-cycle callback.
     if (self->agent_.commandRingClosed()) return detail::HubSubmit::Closed;
 
     // fix1 C1(a): on the duty thread the state is ours — apply directly (never
@@ -2383,7 +2475,7 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
                    cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
-                   cmd.op == Op::GroupCommit || cmd.op == Op::GroupCommitSync)) {
+                   cmd.op == Op::GroupCommit)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
     }
@@ -2483,7 +2575,8 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
         break;
     }
 
-    return GroupConsumer(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_());
+    return GroupConsumer(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
+                         &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
 }
 
 // ---------------------------------------------------------------------------

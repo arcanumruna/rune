@@ -15,6 +15,7 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 namespace rune::client {
 
@@ -25,10 +26,14 @@ namespace rune::client {
 GroupConsumer::GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl,
                              detail::HubCommandSink             sink,
                              void*                              sinkCtx,
-                             std::thread::id                    dutyThread) noexcept
+                             std::thread::id                    dutyThread,
+                             detail::TargetedOpSink             opSink,
+                             detail::AndWaitSink                waitSink) noexcept
     : impl_(std::move(impl))
     , sink_(sink)
     , sinkCtx_(sinkCtx)
+    , opSink_(opSink)
+    , waitSink_(waitSink)
     , dutyThread_(dutyThread)
 {}
 
@@ -42,6 +47,8 @@ GroupConsumer::GroupConsumer(GroupConsumer&& o) noexcept
     : impl_(std::move(o.impl_))
     , sink_(o.sink_)
     , sinkCtx_(o.sinkCtx_)
+    , opSink_(o.opSink_)
+    , waitSink_(o.waitSink_)
     , dutyThread_(o.dutyThread_)
     , moved_(o.moved_)
     , closed_(o.closed_)
@@ -56,6 +63,8 @@ GroupConsumer& GroupConsumer::operator=(GroupConsumer&& o) noexcept {
         impl_       = std::move(o.impl_);
         sink_       = o.sink_;
         sinkCtx_    = o.sinkCtx_;
+        opSink_     = o.opSink_;
+        waitSink_   = o.waitSink_;
         dutyThread_ = o.dutyThread_;
         moved_      = o.moved_;
         closed_     = o.closed_;
@@ -123,35 +132,51 @@ void GroupConsumer::commit() {
 }
 
 // ---------------------------------------------------------------------------
-// commitSync() — the duty thread owns + resolves the promise
+// commitSync(target, token) — F8c C4: a token op, completed exactly once by the
+// duty thread (or close()).  No promise, no future.
 // ---------------------------------------------------------------------------
 
-std::future<void> GroupConsumer::commitSync() {
-    assert(impl_);
-
-    auto failed = [](const char* why) {
-        std::promise<void> p;
-        p.set_exception(std::make_exception_ptr(std::runtime_error(why)));
-        return p.get_future();
-    };
-    if (!onDutyThread_() && closed_) return failed("GroupConsumer closed");
-
-    auto prom = std::make_unique<std::promise<void>>();
-    auto fut  = prom->get_future();
-
+OpResult GroupConsumer::commitSync(CompletionTarget target, Token token) {
+    // Finished on the duty side (closed / Client closed): the Client may be
+    // gone — never touch the sink again.
+    if (!impl_ || moved_ || opSink_ == nullptr || impl_->status.closed()) return OpResult::Closed;
+    if (!onDutyThread_() && closed_) return OpResult::Closed;
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::GroupCommitSync;
     cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
-    cmd.a      = static_cast<int64_t>(reinterpret_cast<uintptr_t>(prom.get()));
+    return opSink_(sinkCtx_, cmd, target, token, OpKind::CommitSync);
+}
 
-    switch (submit_(cmd)) {  // may throw (in-callback logic_error / ring full): prom frees itself
-    case detail::HubSubmit::Accepted:
-        (void)prom.release();  // the duty thread (or close()'s drain) owns it now
-        return fut;
-    case detail::HubSubmit::Closed:
-        return failed(impl_->status.closed() ? "GroupConsumer closed" : "Client closed");
+OpResult GroupConsumer::issueCommitSync_(void* self, const CompletionTarget& target, Token token) {
+    return static_cast<GroupConsumer*>(self)->commitSync(target, token);
+}
+
+void GroupConsumer::commitSyncAndWait(std::chrono::nanoseconds timeout) {
+    if (!impl_ || moved_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
+        throw std::runtime_error("commitSync(): GroupConsumer closed");
     }
-    return failed("Client closed");  // unreachable
+    std::string text;
+    const Completion c = waitSink_(sinkCtx_, "commitSync()", timeout, &GroupConsumer::issueCommitSync_, this, &text);
+    switch (c.status) {
+    case OpStatus::Ok:
+        return;
+    case OpStatus::SessionLost:
+        throw SessionLostError("commitSync() aborted: the session to the broker was lost");
+    case OpStatus::BrokerError:
+        throw std::runtime_error("commitSync() failed: OffsetCommit errorCode " + std::to_string(c.errorCode));
+    case OpStatus::Superseded:
+        throw std::runtime_error("commitSync() superseded by a newer call");
+    case OpStatus::Rejoined:
+        throw std::runtime_error("commitSync() aborted: the group is rebalancing (rejoin)");
+    case OpStatus::Timeout:
+        throw std::runtime_error("commitSync() timed out");
+    case OpStatus::NotConnected:
+        throw std::runtime_error("commitSync() failed: the OffsetCommit frame can never be sent");
+    case OpStatus::Closed:
+        throw std::runtime_error("commitSync(): GroupConsumer closed");
+    default:
+        throw std::runtime_error("commitSync() failed (status " + std::to_string(static_cast<int>(c.status)) + ")");
+    }
 }
 
 // ---------------------------------------------------------------------------

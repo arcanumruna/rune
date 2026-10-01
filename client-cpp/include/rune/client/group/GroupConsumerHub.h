@@ -65,13 +65,22 @@ public:
 
     /// Apply one group HubCommand drained from the agent ring.  Non-group ops
     /// are ignored.  A command naming an impl this hub does not hold is
-    /// ignored (a commitSync promise it carries is failed, never dropped).
-    void applyCommand(const detail::HubCommand& cmd);
+    /// ignored (a commitSync it carries completes Closed, never dropped).
+    /// `nowNs`: the duty clock (a commitSync's deadline starts here).
+    void applyCommand(const detail::HubCommand& cmd, int64_t nowNs = 0);
 
     /// fix3 I3: the same command applied DIRECTLY on the duty thread by a
     /// caller whose handle holds the impl (cmd.handle is dereferenced): acts on
     /// the impl even before its GroupAdd (still in the ring) is adopted.
-    void applyCommandDirect(const detail::HubCommand& cmd);
+    void applyCommandDirect(const detail::HubCommand& cmd, int64_t nowNs = 0);
+
+    /// F8c C4: where commitSync completions go (the Client's registry).  Set
+    /// before start; without one a handler target is called directly.
+    void setCompletionSink(detail::CompletionSink sink) noexcept { completions_ = sink; }
+
+    /// F8c C4: complete every commitSync whose deadline (duty clock) passed
+    /// with OpStatus::Timeout.  Returns how many.
+    int sweepCommitSyncTimeouts(int64_t nowNs);
 
     /// fix3 M4: LeaveGroup frames the transport refused (GroupConsumer close),
     /// retried every duty cycle; dropped on a session change.
@@ -138,7 +147,7 @@ public:
     int flushRequestedCommits(int64_t sessionId);
 
     /// F8a fix2 (IM-2): the session went down (Connected -> anything else):
-    /// fail every pending commitSync now — progress-driven, no timeout.
+    /// complete every pending commitSync SessionLost now — progress-driven.
     void onSessionDown();
 
     /// F8a fix3 I2 (level-triggered session state, duty thread).  While not
@@ -191,7 +200,7 @@ private:
     int64_t currentSessionId_ = 0;
     int64_t sessionEpisode_   = 0;
     std::size_t pendingLeaves_ = 0;
-    void applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl);
+    void applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl, int64_t nowNs);
     static std::size_t encodeLeave_(GroupConsumerImpl& impl, int64_t sessionId);
     void sendLeave_(GroupConsumerImpl& impl);
     // F8a fix2.
@@ -212,8 +221,9 @@ private:
 
     enum class CommitSend : uint8_t { Nothing, Sent, SendFailed, Fatal };
 
-    static void failCommitSync_(GroupConsumerImpl& impl, const char* why);
-    static void failCommitSyncSessionLost_(GroupConsumerImpl& impl, const char* why);
+    /// F8c C4: complete impl's pending commitSync (if any) exactly once.
+    void completeCommitSync_(GroupConsumerImpl& impl, OpStatus st, uint16_t errorCode = 0);
+    detail::CompletionSink completions_{};
     int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     static void closeStatus_(GroupConsumerImpl& impl);
     void toRejoining_(GroupConsumerImpl& impl);
@@ -260,9 +270,9 @@ private:
     /// The registered impl whose address is `handle`, or nullptr.
     GroupConsumerImpl* find_(uint64_t handle) const noexcept;
 
-    /// Deactivate impl: inactive, fail a pending commitSync with `why`, close
+    /// Deactivate impl: inactive, complete a pending commitSync Closed, close
     /// its status ring (deferred to the end of its running callback, if any).
-    void finish_(GroupConsumerImpl& impl, const char* why);
+    void finish_(GroupConsumerImpl& impl);
 
     /// Apply a new assignment to impl: fire revoked+assigned callbacks. Not
     /// static (fix1 C1): catches/counts a throwing callback via callbackExceptions_.

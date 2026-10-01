@@ -536,7 +536,7 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
                 const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
                 if (msgTypeId == kMsgHubCommand) {
                     // F8a: adopt/apply so heap payloads (subscribe requests,
-                    // commitSync promises, group registrations, completion
+                    // commitSync tokens, group registrations, completion
                     // queues) are owned and then finished by the close path —
                     // never stranded.
                     if (!hubCommandFn_) return;

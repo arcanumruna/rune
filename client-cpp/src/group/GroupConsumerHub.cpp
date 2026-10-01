@@ -39,7 +39,6 @@
 #include <cstring>
 #include <exception>
 #include <string>
-#include <future>
 #include <memory>
 #include <stdexcept>
 
@@ -89,25 +88,31 @@ GroupConsumerImpl* GroupConsumerHub::find_(uint64_t handle) const noexcept {
     return nullptr;
 }
 
-/*static*/
-void GroupConsumerHub::failCommitSync_(GroupConsumerImpl& impl, const char* why) {
-    if (!impl.commitSyncPromise) return;
-    try {
-        impl.commitSyncPromise->set_exception(std::make_exception_ptr(std::runtime_error(why)));
-    } catch (...) {}
-    impl.commitSyncPromise.reset();
+void GroupConsumerHub::completeCommitSync_(GroupConsumerImpl& impl, OpStatus st, uint16_t errorCode) {
+    if (!impl.hasCommitSync) return;
+    // Cleared BEFORE delivery: a handler may issue a new commitSync (applied
+    // directly on this thread) — it must find no pending one to supersede.
+    const GroupConsumerImpl::PendingCommitSync p = impl.commitSync;
+    impl.hasCommitSync    = false;
+    impl.commitSync       = {};
     impl.commitSyncCorrId = 0;
+    Completion c;
+    c.token     = p.token;
+    c.op        = OpKind::CommitSync;
+    c.status    = st;
+    c.errorCode = errorCode;
+    completions_.deliver(p.target, c);
 }
 
-/*static*/
-void GroupConsumerHub::failCommitSyncSessionLost_(GroupConsumerImpl& impl, const char* why) {
-    // fix4 M6: the distinguishable, retriable session-loss failure.
-    if (!impl.commitSyncPromise) return;
-    try {
-        impl.commitSyncPromise->set_exception(std::make_exception_ptr(SessionLostError(why)));
-    } catch (...) {}
-    impl.commitSyncPromise.reset();
-    impl.commitSyncCorrId = 0;
+int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
+    int n = 0;
+    for (auto& impl : impls_) {
+        if (impl->hasCommitSync && nowNs >= impl->commitSync.deadlineNs) {
+            completeCommitSync_(*impl, OpStatus::Timeout);
+            ++n;
+        }
+    }
+    return n;
 }
 
 void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, int64_t episode) noexcept {
@@ -116,9 +121,7 @@ void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, in
     // observed "down") still strands every commitSync of the old session.
     if (sessionConnected_ &&
         (!connected || sessionId != currentSessionId_ || episode != sessionEpisode_)) {
-        for (auto& impl : impls_) {
-            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session to the broker was lost");
-        }
+        for (auto& impl : impls_) completeCommitSync_(*impl, OpStatus::SessionLost);
     }
     sessionConnected_ = connected;
     currentSessionId_ = sessionId;
@@ -133,9 +136,9 @@ void GroupConsumerHub::closeStatus_(GroupConsumerImpl& impl) {
     impl.status.close();
 }
 
-void GroupConsumerHub::finish_(GroupConsumerImpl& impl, const char* why) {
+void GroupConsumerHub::finish_(GroupConsumerImpl& impl) {
     impl.active = false;
-    failCommitSync_(impl, why);
+    completeCommitSync_(impl, OpStatus::Closed);
     if (impl.statusDirty) { impl.statusDirty = false; --dirtyCount_; }
     // A callback of this consumer is running (it closed itself): the ring is
     // closed when the callback returns (DispatchScope), so finished() never
@@ -146,7 +149,7 @@ void GroupConsumerHub::finish_(GroupConsumerImpl& impl, const char* why) {
 
 void GroupConsumerHub::toRejoining_(GroupConsumerImpl& impl) {
     impl.state = GroupConsumerState::Rejoining;
-    failCommitSync_(impl, "commitSync() aborted: the group is rebalancing (rejoin)");
+    completeCommitSync_(impl, OpStatus::Rejoined);
 }
 
 void GroupConsumerHub::publishGeneration_(GroupConsumerImpl& impl) {
@@ -180,21 +183,21 @@ GroupConsumerHub::DispatchScope::~DispatchScope() {
     if (!impl.active && prev != &impl) closeStatus_(impl);
 }
 
-void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd) {
+void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd, int64_t nowNs) {
     // Ring path: commands are FIFO behind their GroupAdd — resolve the
     // identity against the hub's own list (never dereference an unknown one).
-    applyTo_(cmd, cmd.op == detail::HubCommand::Op::GroupAdd ? nullptr : find_(cmd.handle));
+    applyTo_(cmd, cmd.op == detail::HubCommand::Op::GroupAdd ? nullptr : find_(cmd.handle), nowNs);
 }
 
-void GroupConsumerHub::applyCommandDirect(const detail::HubCommand& cmd) {
+void GroupConsumerHub::applyCommandDirect(const detail::HubCommand& cmd, int64_t nowNs) {
     // fix3 I3: direct path (duty thread, the caller's handle keeps the impl
     // alive): act on the IMPL itself, even if its GroupAdd is still queued in
     // the ring — add() honours what was done (closed => never added).
     applyTo_(cmd, cmd.op == detail::HubCommand::Op::GroupAdd
-                      ? nullptr : reinterpret_cast<GroupConsumerImpl*>(cmd.handle));
+                      ? nullptr : reinterpret_cast<GroupConsumerImpl*>(cmd.handle), nowNs);
 }
 
-void GroupConsumerHub::applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl) {
+void GroupConsumerHub::applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl, int64_t nowNs) {
     using Op = detail::HubCommand::Op;
     switch (cmd.op) {
     case Op::GroupAdd: {
@@ -210,31 +213,33 @@ void GroupConsumerHub::applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl
         break;
     }
     case Op::GroupCommitSync: {
-        std::unique_ptr<std::promise<void>> prom(
-            reinterpret_cast<std::promise<void>*>(static_cast<uintptr_t>(cmd.a)));
+        // F8c C4: an accepted commitSync completes exactly once.
+        GroupConsumerImpl::PendingCommitSync p;
+        p.target = detail::decodeTarget(cmd);
+        p.token  = static_cast<Token>(cmd.a);
         if (!impl || !impl->active) {
-            if (prom) {
-                try {
-                    prom->set_exception(std::make_exception_ptr(
-                        std::runtime_error("GroupConsumer closed")));
-                } catch (...) {}
-            }
+            Completion c;
+            c.token  = p.token;
+            c.op     = OpKind::CommitSync;
+            c.status = OpStatus::Closed;
+            completions_.deliver(p.target, c);
             break;
         }
-        // Already one in flight — fail the old one and replace.
-        failCommitSync_(*impl, "commitSync() superseded by a newer call");
-        impl->commitSyncPromise = std::move(prom);
-        impl->commitRequested   = true;  // send the commit promptly
+        // Already one in flight — it is superseded (exactly once) and replaced.
+        completeCommitSync_(*impl, OpStatus::Superseded);
+        p.deadlineNs          = nowNs + static_cast<int64_t>(impl->cfg.commitSyncTimeoutMs) * 1'000'000LL;
+        impl->commitSync      = p;
+        impl->hasCommitSync   = true;
+        impl->commitSyncCorrId = 0;
+        impl->commitRequested = true;  // send the commit promptly
         // fix3 I2 (level-triggered): applied while the session is down — it can
-        // never be acknowledged; fail it now.
-        if (!sessionConnected_) {
-            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session to the broker is down");
-        }
+        // never be acknowledged; complete it now.
+        if (!sessionConnected_) completeCommitSync_(*impl, OpStatus::SessionLost);
         break;
     }
     case Op::GroupClose: {
         if (impl && impl->active) {
-            finish_(*impl, "GroupConsumer closed");
+            finish_(*impl);
             sendLeave_(*impl);  // fix3 M4: direct, retried per cycle
         }
         break;
@@ -695,7 +700,7 @@ int GroupConsumerHub::drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, c
     // rejoin or session loss fails it) and until the transport accepts it.
     if (!impl.commitRequested || impl.state != GroupConsumerState::Stable || !sessionConnected_) return 0;
     impl.commitRequested = false;
-    const bool forSync = impl.commitSyncPromise && impl.commitSyncCorrId == 0;
+    const bool forSync = impl.hasCommitSync && impl.commitSyncCorrId == 0;
     const int64_t corr = forSync ? nextCommitCorrId_++ : 0;
     const CommitSend r = sendOffsetCommit(impl, sessionId, sendFn, corr);
     if (r == CommitSend::SendFailed) {
@@ -704,9 +709,9 @@ int GroupConsumerHub::drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, c
     }
     if (r == CommitSend::Fatal) {
         // fix4 M1: the transport can never carry it — dropped (not re-offered
-        // forever); a commitSync waiting on it fails now.
-        failCommitSync_(impl, "commitSync() failed: the OffsetCommit frame can never be sent "
-                              "(the transport rejected it permanently)");
+        // forever); a commitSync waiting on it completes now (NotConnected:
+        // the transport cannot reach the broker with it).
+        completeCommitSync_(impl, OpStatus::NotConnected);
         return 1;
     }
     if (forSync) {
@@ -714,8 +719,7 @@ int GroupConsumerHub::drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, c
             impl.commitSyncCorrId = corr;  // resolved by the matching response
         } else {
             // Nothing to commit (no seeded position): done.
-            try { impl.commitSyncPromise->set_value(); } catch (...) {}
-            impl.commitSyncPromise.reset();
+            completeCommitSync_(impl, OpStatus::Ok);
         }
     }
     return 1;
@@ -733,7 +737,7 @@ int GroupConsumerHub::flushRequestedCommits(int64_t sessionId)
 bool GroupConsumerHub::hasPendingCommitSync() const noexcept
 {
     for (const auto& impl : impls_) {
-        if (impl->commitSyncPromise) return true;
+        if (impl->hasCommitSync) return true;
     }
     return false;
 }
@@ -741,9 +745,7 @@ bool GroupConsumerHub::hasPendingCommitSync() const noexcept
 void GroupConsumerHub::onSessionDown()
 {
     for (auto& impl : impls_) {
-        if (impl->active) {
-            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session to the broker went down");
-        }
+        if (impl->active) completeCommitSync_(*impl, OpStatus::SessionLost);
     }
 }
 
@@ -945,7 +947,7 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
         // fix1 I6: only the response to THIS commitSync's OffsetCommit (echoed
         // correlationId) resolves it — never an auto-commit / plain commit
         // response (correlationId 0) or a stale one.
-        if (!impl->commitSyncPromise || impl->commitSyncCorrId == 0 ||
+        if (!impl->hasCommitSync || impl->commitSyncCorrId == 0 ||
             opt->correlationId != impl->commitSyncCorrId) {
             continue;
         }
@@ -955,12 +957,9 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
             if (r.errorCode != 0) { err = r.errorCode; break; }
         }
         if (err != 0) {
-            const std::string why = "commitSync() failed: OffsetCommit errorCode " + std::to_string(err);
-            failCommitSync_(*impl, why.c_str());
+            completeCommitSync_(*impl, OpStatus::BrokerError, static_cast<uint16_t>(err));
         } else {
-            try { impl->commitSyncPromise->set_value(); } catch (...) {}
-            impl->commitSyncPromise.reset();
-            impl->commitSyncCorrId = 0;
+            completeCommitSync_(*impl, OpStatus::Ok);
         }
         break;
     }
@@ -1049,9 +1048,7 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 
         // fix1 I6: a NEW session (reconnect) means the old one was lost — a
         // commitSync whose OffsetCommit went out on it can never be answered.
-        if (impl->commitSyncCorrId != 0) {
-            failCommitSyncSessionLost_(*impl, "commitSync() aborted: the session was lost before the commit was acknowledged");
-        }
+        if (impl->commitSyncCorrId != 0) completeCommitSync_(*impl, OpStatus::SessionLost);
 
         if (impl->state == GroupConsumerState::Unjoined  ||
             impl->state == GroupConsumerState::Rejoining) {
@@ -1109,8 +1106,8 @@ void GroupConsumerHub::closeAll(int64_t sessionId, const SendFn& sendFn)
             if (len > 0) sendFn(0, impl->sendBuf.data(), len);
         }
 
-        // Inactive + fail any pending commitSync + close the status ring.
-        finish_(*impl, "Client closed");
+        // Inactive + complete any pending commitSync Closed + close the status ring.
+        finish_(*impl);
     }
 
     // Consumers already closed by their handle still get their ring closed

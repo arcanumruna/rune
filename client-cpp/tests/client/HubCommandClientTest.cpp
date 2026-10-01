@@ -10,7 +10,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <future>
 #include "../support/TestCompletions.h"
 #include <memory>
 #include <stdexcept>
@@ -42,8 +41,23 @@ rc::ClientConfig hubCfg(int32_t in, int32_t eg, rc::RunnerMode mode) {
     return c;
 }
 
-template <class F>
-bool readyNow(F& f) { return f.wait_for(0s) == std::future_status::ready; }
+/// F8c C4: a handler-target ledger (exactly-once counts per token).  The
+/// handler runs on the duty thread (or the closing thread): only read it once
+/// that thread is this one (Invoker) or joined (after close()).
+struct HandlerLedger {
+    int             times = 0;
+    rc::Completion  last{};
+    static void on(void* ctx, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+        auto* self = static_cast<HandlerLedger*>(ctx);
+        ++self->times;
+        self->last = c;
+    }
+    rc::CompletionHandler handler() { return rc::CompletionHandler{&HandlerLedger::on, this}; }
+};
+
+test_support::PendingOp commitSyncOp(test_support::TestCq& cq, rc::GroupConsumer& gc) {
+    return cq.issue([&](rc::Completions& q, rc::Token t) { return gc.commitSync(q, t); });
+}
 
 rc::Subscription subscribeT(rc::Client& c) {
     return c.subscribe(c.topic("t"), /*partition=*/0, rc::SubscribeOptions{rc::From::earliest()},
@@ -56,22 +70,28 @@ const char* modeName(rc::RunnerMode m) { return m == rc::RunnerMode::Invoker ? "
 
 // Commands still sitting in the agent ring when close() runs (Invoker: nothing
 // ever drained them) are applied by close()'s final drain and then finished —
-// a commitSync future fails, handles report inactive.  Never a hang.
+// a commitSync completes Closed (exactly once), handles report inactive.
 TEST(HubCommandClient, CommandsStillInTheRingAreFinishedByCloseRegression) {
     int port = 3960;
     for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
         SCOPED_TRACE(modeName(mode));
         rc::Client client(hubCfg(port, port + 1, mode));
         port += 2;
+        test_support::TestCq cq(client);
         auto sub = subscribeT(client);
         auto gc  = client.subscribeGroup("g", {"t"});
-        auto f   = gc.commitSync();
+        auto f   = commitSyncOp(cq, gc);
+        ASSERT_TRUE(f.accepted()) << f.describe();
         EXPECT_TRUE(sub.active());
         EXPECT_TRUE(gc.active());
 
         client.close();
-        ASSERT_TRUE(readyNow(f)) << "commitSync must be failed by close(), not stranded";
-        EXPECT_THROW(f.get(), std::runtime_error);
+        ASSERT_TRUE(f.ready()) << "commitSync must be completed by close(), not stranded";
+        // Never connected: the hub completes it SessionLost when it applies it
+        // (level-triggered, fix3 I2) — by the runner, or by close()'s drain.
+        EXPECT_EQ(f.status(), rc::OpStatus::SessionLost);
+        EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+        EXPECT_TRUE(cq.q().finished());
         EXPECT_FALSE(sub.active());
         EXPECT_FALSE(gc.active());
     }
@@ -93,9 +113,11 @@ TEST(HubCommandClient, HandlesOutliveTheirClientRegression) {
         EXPECT_EQ(sub.position(), 0);
         EXPECT_NO_THROW(sub.unsubscribe());
         EXPECT_NO_THROW(gc.commit());
-        auto f = gc.commitSync();
-        ASSERT_TRUE(readyNow(f));
-        EXPECT_THROW(f.get(), std::runtime_error);
+        HandlerLedger led;
+        EXPECT_EQ(gc.commitSync(led.handler(), 1), rc::OpResult::Closed)
+            << "rejected synchronously: the handle never touches the dead Client";
+        EXPECT_EQ(led.times, 0);
+        EXPECT_THROW(gc.commitSyncAndWait(1s), std::runtime_error);
         EXPECT_NO_THROW(gc.close());
         // Destructors run here, after the Client is gone.
     }
@@ -110,14 +132,14 @@ TEST(HubCommandClient, SubscribeAfterCloseReturnsFinishedHandlesRegression) {
     EXPECT_FALSE(sub.active());
     auto gc = client.subscribeGroup("g", {"t"});
     EXPECT_FALSE(gc.active());
-    auto f = gc.commitSync();
-    ASSERT_TRUE(readyNow(f));
-    EXPECT_THROW(f.get(), std::runtime_error);
+    HandlerLedger led;
+    EXPECT_EQ(gc.commitSync(led.handler(), 1), rc::OpResult::Closed);
+    EXPECT_EQ(led.times, 0);
 }
 
 // A command committed to the ring AFTER close()'s final drain already ran (the
 // exact window the post-submit re-check exists for) is reported as closed:
-// the handle is finished and a commitSync future is failed — never stranded.
+// the handle is finished and a commitSync is rejected Closed — never stranded.
 TEST(HubCommandClient, CommandRacingCloseIsNeverStrandedRegression) {
     {
         // Thread mode: the app thread's registration goes through the ring (on
@@ -139,9 +161,10 @@ TEST(HubCommandClient, CommandRacingCloseIsNeverStrandedRegression) {
         rc::Client client(hubCfg(3978, 3979, rc::RunnerMode::Thread));
         auto gc = client.subscribeGroup("g", {"t"});
         client.testSetBeforeRegistrationSubmitHook([&] { client.close(); });
-        auto f = gc.commitSync();
-        ASSERT_TRUE(readyNow(f)) << "a commitSync racing close() must fail at once";
-        EXPECT_THROW(f.get(), std::runtime_error);
+        HandlerLedger led;
+        EXPECT_EQ(gc.commitSync(led.handler(), 1), rc::OpResult::Closed)
+            << "a commitSync racing close() is rejected (linearized by the ring), never stranded";
+        EXPECT_EQ(led.times, 0);
         EXPECT_FALSE(gc.active());
     }
 }
@@ -360,23 +383,83 @@ TEST(HubCommandClient, UnsubscribeInsideHandlerAppliesDirectlyRegression) {
     EXPECT_EQ(r.gw.unsubscribed[0], r.gw.subscribed[0].subscriptionId);
 }
 
-// I6: commitSync() from inside a duty-cycle callback throws instead of
-// creating a future that can never resolve.
-TEST(HubCommandClient, CommitSyncFromDutyCallbackThrowsRegression) {
+// F8c C4 (was I6): the TOKEN form of commitSync is allowed from inside a
+// duty-cycle callback (it is just a command applied there) and completes
+// exactly once; only the blocking commitSyncAndWait() throws there (it would
+// wait for the very duty thread it blocks).
+TEST(HubCommandClient, CommitSyncTokenFromCallbackIsAllowedRegression) {
     HubRig r(3990);
     auto gc = r.client.subscribeGroup("g", {"t"});
-    bool threw = false;
+    HandlerLedger led;
+    rc::OpResult inCbHandler = rc::OpResult::Closed;
+    rc::OpResult inCbCq      = rc::OpResult::Closed;
+    test_support::PendingOp cqOp;
+    bool waitThrew = false;
+    bool threwOther = false;
     r.client.onConnected([&](int64_t) {
         try {
-            (void)gc.commitSync();
+            inCbHandler = gc.commitSync(led.handler(), 7);
+            cqOp        = commitSyncOp(r.cq, gc);  // supersedes the handler one
+            inCbCq      = cqOp.issued();
+        } catch (...) {
+            threwOther = true;
+        }
+        try {
+            gc.commitSyncAndWait(1s);
         } catch (const std::logic_error&) {
-            threw = true;
+            waitThrew = true;
         }
     });
     r.connect();
-    EXPECT_TRUE(threw);
-    // Outside a callback, on the owner thread, it is allowed (the app pumps).
-    EXPECT_NO_THROW((void)gc.commitSync());
+    EXPECT_FALSE(threwOther) << "the token form must not throw inside a callback";
+    EXPECT_EQ(inCbHandler, rc::OpResult::Accepted);
+    EXPECT_EQ(inCbCq, rc::OpResult::Accepted);
+    EXPECT_TRUE(waitThrew) << "the blocking form must refuse inside a callback";
+    // The first was superseded by the second (both applied directly, in order).
+    ASSERT_EQ(led.times, 1);
+    EXPECT_EQ(led.last.token, 7u);
+    EXPECT_EQ(led.last.status, rc::OpStatus::Superseded);
+    EXPECT_FALSE(cqOp.ready()) << "pending: the consumer never became Stable";
+    // Outside a callback, on the owner thread, both forms are allowed.
+    auto later = commitSyncOp(r.cq, gc);
+    ASSERT_TRUE(later.accepted()) << later.describe();
+    ASSERT_TRUE(cqOp.ready());
+    EXPECT_EQ(cqOp.status(), rc::OpStatus::Superseded);
+    r.client.close();
+    ASSERT_TRUE(later.ready());
+    EXPECT_EQ(later.status(), rc::OpStatus::Closed);
+    EXPECT_EQ(led.times, 1) << "exactly once";
+    EXPECT_EQ(r.cq.timesCompleted(cqOp.token()), 1);
+    EXPECT_EQ(r.cq.timesCompleted(later.token()), 1);
+}
+
+// F8c C4 (spec Q6): a commitSync that never gets an answer completes Timeout
+// after GroupConfig::commitSyncTimeoutMs of DUTY time — a stepped injected
+// clock, no sleeps — exactly once (close() later delivers nothing more).
+namespace {
+int64_t g_csNow = 1'000'000'000;  // test thread only
+int64_t csNow() noexcept { return g_csNow; }
+} // namespace
+
+TEST(HubCommandClient, CommitSyncTimesOutRegression) {
+    HubRig r(4014, 0, &csNow);
+    r.connect();
+    rc::GroupConfig gcfg;
+    gcfg.commitSyncTimeoutMs = 500;
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    auto f  = commitSyncOp(r.cq, gc);  // never Stable (no group protocol here): no answer
+    ASSERT_TRUE(f.accepted()) << f.describe();
+    r.settle(200);
+    ASSERT_FALSE(f.ready()) << "the clock has not moved";
+    g_csNow += 400'000'000LL;  // 400 ms: still inside the deadline
+    r.settle(200);
+    ASSERT_FALSE(f.ready()) << "completed before its deadline";
+    g_csNow += 200'000'000LL;  // 600 ms total > 500 ms
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 2'000)) << "never timed out on the duty clock";
+    EXPECT_EQ(f.status(), rc::OpStatus::Timeout);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected) << "not a session loss";
+    r.client.close();
+    EXPECT_EQ(r.cq.timesCompleted(f.token()), 1) << "exactly once";
 }
 
 // ===========================================================================
@@ -446,22 +529,22 @@ TEST(HubCommandClient, CommitSyncFailsWhenTheSessionGoesDownRegression) {
     HubRig r(3996, 0, &hubNow);
     r.connect();
     auto gc = r.client.subscribeGroup("g", {"t"});
-    auto f = gc.commitSync();  // owner thread: applied directly; pending (not Stable)
+    auto f = commitSyncOp(r.cq, gc);  // owner thread: applied directly; pending (not Stable)
     r.settle(100);
-    ASSERT_FALSE(readyNow(f));
+    ASSERT_FALSE(f.ready());
     ASSERT_EQ(r.client.state(), rc::session::SessionState::Connected);
 
     // The broker is gone: no more egress, no reconnect.  Advance the duty
     // clock past the session's response timeout and pump ONLY the client.
     g_hubNow += 11'000'000'000LL;
     bool down = false;
-    for (int i = 0; i < 1'000 && !readyNow(f); ++i) {
+    for (int i = 0; i < 1'000 && !f.ready(); ++i) {
         r.client.doWork();
         down = down || r.client.state() != rc::session::SessionState::Connected;
     }
     EXPECT_TRUE(down);
-    ASSERT_TRUE(readyNow(f)) << "commitSync must fail on the session-down transition";
-    EXPECT_THROW(f.get(), std::runtime_error);
+    ASSERT_TRUE(f.ready()) << "commitSync must complete on the session-down transition";
+    EXPECT_EQ(f.status(), rc::OpStatus::SessionLost);
 }
 
 // fix2 (found while writing the IM-2 test): on the Invoker owner a direct
@@ -471,9 +554,9 @@ TEST(HubCommandClient, DirectCommandNeverOvertakesItsOwnRegistrationRegression) 
     r.connect();
     {
         auto gc = r.client.subscribeGroup("g", {"t"});
-        auto f = gc.commitSync();  // before any doWork(): the add must already be applied
+        auto f = commitSyncOp(r.cq, gc);  // before any doWork(): the add must already be applied
         r.settle(100);
-        EXPECT_FALSE(readyNow(f)) << "commitSync failed as if the consumer did not exist";
+        EXPECT_FALSE(f.ready()) << "commitSync failed as if the consumer did not exist";
         EXPECT_TRUE(gc.active());
     }
     int got = 0;
@@ -534,10 +617,10 @@ TEST(HubCommandClient, CommitSyncAfterTheBrokerIsGoneFailsPromptlyRegression) {
         r.client.doWork();
     }
     ASSERT_NE(r.client.state(), rc::session::SessionState::Connected);
-    auto f = gc.commitSync();  // issued AFTER the session-down transition
-    for (int i = 0; i < 100 && !readyNow(f); ++i) r.client.doWork();
-    ASSERT_TRUE(readyNow(f)) << "a commitSync issued while the session is down must fail promptly";
-    EXPECT_THROW(f.get(), std::runtime_error);
+    auto f = commitSyncOp(r.cq, gc);  // issued AFTER the session-down transition
+    for (int i = 0; i < 100 && !f.ready(); ++i) r.client.doWork();
+    ASSERT_TRUE(f.ready()) << "a commitSync issued while the session is down must fail promptly";
+    EXPECT_EQ(f.status(), rc::OpStatus::SessionLost);
 }
 
 // I3 (Invoker): handles created on a NON-owner thread (their Add still queued
