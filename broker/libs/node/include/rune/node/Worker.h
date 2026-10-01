@@ -611,6 +611,11 @@ public:
         return handleWorkerIngressFrame_(data, len, nowNs);
     }
     [[nodiscard]] const char* ioBackendNameForTest() const noexcept { return io_.name(); }
+    [[nodiscard]] uint64_t opsRefusedNotOwnedForTest() const noexcept { return opsRefusedNotOwned_; }
+    /// Bench / test: the per-op ownership check.
+    [[nodiscard]] bool ownsReplicaForTest(const rune::replication::PartitionReplica* r) const noexcept {
+        return ownsReplica_(r);
+    }
     /// False when RUNE_IO_BACKEND selects a backend that cannot submit — shard
     /// mode refuses to start on such a worker (BrokerNode).
     [[nodiscard]] bool ioAcceptsSubmissions() const noexcept { return io_.acceptsSubmissions(); }
@@ -1129,7 +1134,24 @@ private:
         sbe::WorkerOp op;
         op.wrapForDecode(cbuf, sbe::MessageHeader::encodedLength(),
                          mh.blockLength(), mh.version(), len);
-        switch (static_cast<WorkerOp::Type>(static_cast<std::uint8_t>(op.opType()))) {
+        const auto type = static_cast<WorkerOp::Type>(static_cast<std::uint8_t>(op.opType()));
+        // Ownership guard (shared-nothing): an op routed to this worker under a
+        // stale ownership view must not dereference a replica / log another
+        // worker now owns.  One hashed index load + compare + branch (the owned
+        // table is rebuilt cold on SetOwnership, on this thread).  Ops with no
+        // replica (passthrough / no ownership) and the ownership-neutral ops
+        // (SetOwnership, Unsubscribe, SchemaUpdate, TestTask) are not gated.
+        // Role ops (BecomeLeader / BecomeFollower) are not gated either: the
+        // bridge routes them by the deterministic shard router to the GAINING
+        // worker, where they legitimately precede SetOwnership (ownership-gain
+        // hand-off: PSM rebuild before intake), and the losing worker processes
+        // its own BecomeFollower before its SetOwnership (ring FIFO).
+        if (const uint64_t rp = op.replica(); rp != 0 && gatedByOwnership_(type) &&
+            !ownsReplica_(reinterpret_cast<const rune::replication::PartitionReplica*>(rp))) [[unlikely]] {
+            refuseNotOwned_(op, type);
+            return;
+        }
+        switch (type) {
         case WorkerOp::Type::Produce:
             executeProduceWire_(op);
             break;
@@ -2599,6 +2621,96 @@ private:
     static std::size_t ptrHash_(const void* p) noexcept {
         return static_cast<std::size_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull);
     }
+    // ---- Ownership table: owned replica pointers (open addressing, pow2 ≥ 2n+2).
+    std::vector<const rune::replication::PartitionReplica*> ownedIndex_;
+    std::size_t ownedMask_ = 0;
+    uint64_t    opsRefusedNotOwned_ = 0;
+    static constexpr bool gatedByOwnership_(WorkerOp::Type t) noexcept {
+        switch (t) {
+        case WorkerOp::Type::Produce:
+        case WorkerOp::Type::PushRead:
+        case WorkerOp::Type::ApplyReplicated:
+        case WorkerOp::Type::FetchRequest:
+        case WorkerOp::Type::OffsetsForLeaderEpochReq:
+        case WorkerOp::Type::ReconcileFetchResp:
+        case WorkerOp::Type::AppendControlRecord:
+        case WorkerOp::Type::Subscribe:
+            return true;
+        default:
+            return false;
+        }
+    }
+    [[nodiscard]] bool ownsReplica_(const rune::replication::PartitionReplica* r) const noexcept {
+        if (ownedIndex_.empty()) return false;
+        for (std::size_t i = ptrHash_(r) & ownedMask_;; i = (i + 1) & ownedMask_) {
+            const auto* e = ownedIndex_[i];
+            if (e == r) return true;
+            if (e == nullptr) return false;
+        }
+    }
+    void rebuildOwnedIndex_() {
+        const std::size_t cap = pow2AtLeast_(2 * owned_.size() + 2);
+        ownedIndex_.assign(cap, nullptr);
+        ownedMask_ = cap - 1;
+        for (const auto* r : owned_) {
+            if (!r) continue;
+            std::size_t i = ptrHash_(r) & ownedMask_;
+            while (ownedIndex_[i] != nullptr && ownedIndex_[i] != r) i = (i + 1) & ownedMask_;
+            ownedIndex_[i] = r;
+        }
+    }
+    // A partition op for a replica this worker does not own: answer through the
+    // op's normal response path (retriable), never touching the replica / log.
+    [[gnu::cold]] [[gnu::noinline]] void refuseNotOwned_(sbe::WorkerOp& op, WorkerOp::Type type) {
+        ++opsRefusedNotOwned_;
+        namespace pc = rune::protocol::client;
+        switch (type) {
+        case WorkerOp::Type::Produce: {
+            WorkerReturn ret;
+            ret.type          = WorkerReturn::Type::ProduceResult;
+            ret.sessionId     = op.sessionId();
+            ret.correlationId = op.correlationId();
+            ret.partition     = op.partition();
+            ret.topicId       = op.topicId();
+            ret.deferAck      = op.deferAck() != 0;
+            ret.producerId    = op.producerId();
+            ret.producerEpoch = op.producerEpoch();
+            ret.baseSequence  = op.baseSequence();
+            ret.recordCount   = op.recordCount();
+            ret.enqueuedAtNs  = op.enqueuedAtNs();
+            ret.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return;
+        }
+        case WorkerOp::Type::PushRead: {
+            // Empty result: the gateway clears its in-flight marker and re-issues
+            // the read to the (new) owner on its next push cycle.
+            WorkerReturn ret;
+            ret.type           = WorkerReturn::Type::PushReadResult;
+            ret.sessionId      = op.sessionId();
+            ret.subscriptionId = op.subscriptionId();
+            ret.readTopicId    = op.topicId();
+            ret.readPartition  = op.partition();
+            enqueueReturn_(ret);
+            return;
+        }
+        case WorkerOp::Type::Subscribe:
+            // Registered PARKED (no reads) — activated if the partition arrives here.
+            executeSubscribeWire_(op);
+            for (auto& sub : subs_) if (sub.subscriptionId == op.subscriptionId()) sub.active = false;
+            return;
+        default:
+            // Apply / fetch / epoch / reconcile / role / marker ops carry no
+            // response: the replication protocol re-drives them against the new
+            // owner (follower re-fetch, leader re-push, bridge role re-derive).
+            if (opsRefusedNotOwned_ == 1 || (opsRefusedNotOwned_ & 1023u) == 0)
+                spdlog::warn("Worker {}: refused op type={} for un-owned topic={} partition={} "
+                             "(stale ownership routing; total={})", workerId_,
+                             static_cast<int>(type), op.topicId(), op.partition(), opsRefusedNotOwned_);
+            return;
+        }
+    }
+
     LogFlushSlot* slotOf_(const rune::storage::Log* log) noexcept {
         if (slotIndex_.empty() || log == nullptr) return nullptr;
         for (std::size_t i = ptrHash_(log) & slotIndexMask_;; i = (i + 1) & slotIndexMask_) {
@@ -2611,6 +2723,7 @@ private:
     // slots for logs no longer owned are purged — their in-flight tokens are
     // then ignored on completion (epoch / identity mismatch) (M2).
     void rebuildFlushSlots_() {
+        rebuildOwnedIndex_();
         std::vector<LogFlushSlot> next;
         next.reserve(owned_.size());
         for (auto* replica : owned_) {

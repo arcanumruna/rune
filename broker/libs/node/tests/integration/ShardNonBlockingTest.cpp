@@ -853,3 +853,48 @@ TEST(StorageFailStopRegression, RecoveryMsyncFailureMarksLogFailed) {
     EXPECT_TRUE(log.storageFailed());
     EXPECT_EQ(log.storageErrno(), EIO);
 }
+
+TEST(StorageFailStopRegression, OpQueuedBeforeOwnershipMoveAnswersNotLeaderRegression) {
+    // A produce + a replicated apply routed to this worker under a stale
+    // ownership view, processed AFTER a SetOwnership moved the partition away:
+    // answered NotLeader / refused, the moved log is never touched.
+    TmpDir d, d2;
+    auto log = std::make_unique<Log>(d.path.string(), 64LL * 1024 * 1024); log->recover();
+    Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
+    NullTransport t;
+    auto moved = std::make_unique<PartitionReplica>(cfg(1), Role::Leader, 1,
+        std::vector<rune::replication::NodeId>{1}, std::vector<rune::replication::NodeId>{1}, log.get(), &t);
+    PartitionReplica other(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &log2, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{moved.get(), &other});
+    ASSERT_TRUE(w.ownsReplicaForTest(moved.get()));
+    WorkerOp own;
+    own.type = WorkerOp::Type::SetOwnership;
+    own.ownedSet = {&other};
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(own)));
+    WorkerOp prod;
+    prod.type = WorkerOp::Type::Produce; prod.topicId = 1; prod.partition = 0;
+    prod.replica = moved.get(); prod.logPtr = log.get(); prod.sessionId = 5; prod.correlationId = 77;
+    prod.recordCount = 1; prod.durabilityTier = 1; prod.recordBatchBytes = batchAt(0);
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(prod)));
+    WorkerOp apply;
+    apply.type = WorkerOp::Type::ApplyReplicated; apply.topicId = 1; apply.partition = 0;
+    apply.replica = moved.get(); apply.logPtr = log.get();
+    const auto b = batchAt(0);
+    apply.replicatedPayload.records = b; apply.replicatedPayload.leaderEpoch = 1; apply.replicatedPayload.topicId = 1;
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(apply)));
+    const int64_t leoBefore = log->logEndOffset();
+    // The moved replica + log now belong to another worker: destroy them so any
+    // dereference by this worker would be caught (ASan / crash).
+    moved.reset();
+    log.reset();
+    w.doWork(1);
+    Acks a;
+    a.drain(w);
+    ASSERT_EQ(a.n, 1);
+    EXPECT_EQ(a.rets[0].correlationId, 77);
+    EXPECT_EQ(a.rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "retriable on the new owner";
+    EXPECT_EQ(w.opsRefusedNotOwnedForTest(), 2u) << "the apply is refused too";
+    EXPECT_EQ(leoBefore, 0);
+    EXPECT_EQ(log2.logEndOffset(), 0) << "no op is redirected to another log either";
+}
