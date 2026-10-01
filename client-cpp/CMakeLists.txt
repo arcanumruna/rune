@@ -914,6 +914,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerSendTest.cpp
+            tests/detail/M2ORingBufferTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/support/AllocCounter.cpp
         )

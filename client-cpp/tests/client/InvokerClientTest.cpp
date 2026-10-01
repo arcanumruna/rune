@@ -33,6 +33,15 @@ int64_t realNow() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// fix2 I4: a SEPARATE, genuinely thread-safe injected clock for the two tests
+// below, which (unlike every other test in this file) have a real second
+// thread (an app thread blocked in sendBlocking) reading the clock
+// concurrently with the owner thread advancing it — g_fakeNow/fakeNow() above
+// are "test thread only" and would be a real data race if shared across
+// threads.
+std::atomic<int64_t> g_fakeNowMt{1};
+int64_t fakeNowMt() noexcept { return g_fakeNowMt.load(std::memory_order_relaxed); }
+
 rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     rc::ClientConfig c;
     c.gatewayChannel  = "aeron:ipc";
@@ -590,4 +599,104 @@ TEST(InvokerClient, ProducerOutlivesClientNoUseAfterFreeRegression) {
 
     EXPECT_EQ(p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), rc::SendResult::Closed);
     EXPECT_THROW(p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), std::logic_error);
+}
+
+// ---------------------------------------------------------------------------
+// fix2 I4: clock coherence — the heartbeat's writer (the duty cycle, via
+// cfg_.nanoClock) and its reader (sendBlocking's liveness check, via
+// ProducerImpl::clock_, wired by Client::producer()/testProducerWithRingCap()
+// calling setClockForTesting(cfg_.nanoClock)) must agree on "now". Without
+// that wiring, sendBlocking would fall back to a real steady_clock read
+// against a heartbeat published on an unrelated injected timeline, producing
+// a spurious immediate throw even while the runner is actively draining.
+// Both tests use a thread-safe injected clock (fakeNowMt/g_fakeNowMt) deliberately
+// far from real steady_clock's epoch, so a wiring regression (falling back to
+// steady_clock on either side) would misbehave immediately and obviously.
+// ---------------------------------------------------------------------------
+
+TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingRegression) {
+    rc::ClientConfig c = invokerCfg(3790, 3791);
+    g_fakeNowMt.store(1, std::memory_order_relaxed);
+    c.nanoClock = &fakeNowMt;
+    Rig r(c);
+
+    rc::ProducerConfig pcfg;
+    pcfg.acks                   = rc::Acks::None;
+    pcfg.lingerUs               = 0;
+    pcfg.agentLivenessTimeoutMs = 50; // tight: a clock mismatch would fire almost instantly
+    auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
+    auto topic = r.client.topic("t");
+    uint64_t ok = 0;
+    for (; ok < 10'000; ++ok) {
+        if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+    }
+    ASSERT_GT(ok, 0u);
+
+    std::atomic<bool> threw{false};
+    std::atomic<bool> succeeded{false};
+    std::thread appThread([&] {
+        try {
+            p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
+            succeeded.store(true, std::memory_order_release);
+        } catch (const std::runtime_error&) {
+            threw.store(true, std::memory_order_release);
+        }
+    });
+
+    // The owner thread plays "the runner": advance the SAME injected clock by
+    // small steps and pump doWork(), draining the ring and refreshing the
+    // heartbeat every cycle. appThread's blocking send must succeed — never
+    // spuriously time out — despite the clock being nowhere near real time.
+    for (int i = 0; i < 1000 &&
+                    !succeeded.load(std::memory_order_acquire) &&
+                    !threw.load(std::memory_order_acquire);
+         ++i) {
+        g_fakeNowMt.fetch_add(1'000'000, std::memory_order_relaxed); // +1ms injected
+        r.client.doWork();
+        r.gw.pump();
+    }
+    appThread.join();
+
+    EXPECT_TRUE(succeeded.load());
+    EXPECT_FALSE(threw.load()) << "spurious timeout: the heartbeat writer/reader clocks disagreed";
+}
+
+TEST(InvokerClient, HeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegression) {
+    rc::ClientConfig c = invokerCfg(3792, 3793);
+    g_fakeNowMt.store(1, std::memory_order_relaxed);
+    c.nanoClock = &fakeNowMt;
+    Rig r(c);
+
+    rc::ProducerConfig pcfg;
+    pcfg.acks                   = rc::Acks::None;
+    pcfg.lingerUs               = 0;
+    pcfg.agentLivenessTimeoutMs = 5;
+    auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
+    auto topic = r.client.topic("t");
+    uint64_t ok = 0;
+    for (; ok < 10'000; ++ok) {
+        if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+    }
+    ASSERT_GT(ok, 0u);
+
+    std::atomic<bool> threw{false};
+    std::thread appThread([&] {
+        try {
+            p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
+        } catch (const std::runtime_error&) {
+            threw.store(true, std::memory_order_release);
+        }
+    });
+
+    // The runner NEVER runs here (no doWork() calls — simulating "wedged"):
+    // just advance the SAME injected clock past the liveness window.
+    // appThread's own reads of that same clock must see this and throw.
+    for (int i = 0; i < 1000 && !threw.load(std::memory_order_acquire); ++i) {
+        g_fakeNowMt.fetch_add(1'000'000, std::memory_order_relaxed); // +1ms injected
+        std::this_thread::yield();
+    }
+    appThread.join();
+
+    EXPECT_TRUE(threw.load()) << "must time out once the SAME injected clock exceeds "
+                                 "agentLivenessTimeoutMs with nothing draining";
 }

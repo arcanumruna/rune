@@ -220,8 +220,26 @@ void Client::close() {
 }
 
 void Client::closeImpl_() {
-    // Atomically transition to stopped; only the first caller does the work.
-    bool alreadyStopped = stopped_.exchange(true, std::memory_order_acq_rel);
+    // fix2 Important-3 (Dekker reasoning): this exchange and
+    // producerWithRingCap_'s post-submit re-check of stopped_ are the two
+    // halves of a classic "flag + re-check" race across independent memory
+    // locations (this flag vs. the agent command ring's own tail/head): a
+    // plain release store here paired with a plain acquire load there does
+    // NOT by itself rule out the interleaving where producer() reads stopped_
+    // false, submits its registration into the ring, and this call's drain
+    // (drainRegistrationsForClose(), below) already ran and missed it — a
+    // registration-ring write can be reordered past a later load of a
+    // DIFFERENT atomic (stopped_) on either side (StoreLoad reordering), which
+    // acquire/release does not forbid. Using seq_cst on BOTH this store and
+    // producerWithRingCap_'s re-check puts them in one global total order: if
+    // the re-check does not yet observe `true` here, this exchange has not
+    // taken effect yet in that total order, so this call's own drain (which
+    // strictly follows this exchange in program order) cannot have run before
+    // the registration became visible — the drain adopts it. If the exchange
+    // HAS taken effect, the re-check is guaranteed to observe it and the
+    // producer side self-closes the ring instead. Atomically transition to
+    // stopped; only the first caller does the work.
+    bool alreadyStopped = stopped_.exchange(true, std::memory_order_seq_cst);
     if (alreadyStopped) return;
 
     // Join the runner thread (it checks stopped_ in its loop condition).
@@ -342,7 +360,7 @@ session::SessionState Client::state() const noexcept {
 }
 
 uint64_t Client::testCallbackExceptionCount() const noexcept {
-    return callbackExceptions_.load(std::memory_order_relaxed)
+    return callbackExceptions_
          + subscriberHub_.testCallbackExceptionCount()
          + groupConsumerHub_.testCallbackExceptionCount();
 }
@@ -641,6 +659,10 @@ int Client::doWork() {
         throw std::logic_error("Client::doWork(): call from the owner (constructing) thread");
     }
     if (inDutyCycle_) return 0;  // re-entered from a callback: never nest the duty cycle
+    // fix2 minor: a no-op after close() (mirrors ClientAgent::doWork's own
+    // stopped_ guard) — belt-and-suspenders against a stray post-close call
+    // (e.g. from an app loop that has not yet noticed close() happened).
+    if (stopped_.load(std::memory_order_seq_cst)) return 0;
     return dutyCycle(now());
 }
 
@@ -1616,7 +1638,11 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
     // ordinary app thread still falls back to the heartbeat-bounded wait (a
     // genuinely separate runner thread may yet drain the ring for real). Plain
     // function pointer + `this`: no std::function, no virtual call, no new atomic.
-    impl->setPumpFn(&Client::pumpTrampoline_, this);
+    // fix2 Important-2: dutyThreadId_ is copied in by value — immutable for the
+    // rest of this Client's lifetime (already finalized by the time any
+    // producer() call can run), so ProducerImpl can decide NotOwner itself
+    // without ever touching `this` from a non-duty thread.
+    impl->setPumpFn(&Client::pumpTrampoline_, this, dutyThreadId_);
 
     // fix1 I4: clock coherence — when an injected clock is configured, the ring's
     // heartbeat writer (the duty cycle, via dutyCycle(now())) and its reader
@@ -1641,36 +1667,51 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
     submitRegistration_([&] { return agent_.submitRegisterProducer(holder); },
                         [&] { delete holder; });
 
+    // fix2 Important-3 (Dekker reasoning — see closeImpl_'s seq_cst exchange
+    // for the full argument): submitRegistration_'s initial stopped_ check
+    // above can read false and then succeed in submitting the registration
+    // into the agent ring CONCURRENTLY with a close() on another thread whose
+    // own drainRegistrationsForClose() already ran and so never adopts (or
+    // closes) this producer. Re-checking stopped_ here, seq_cst, after the
+    // submit has landed, closes that window: either the close-side drain
+    // already adopted this registration (closeAllRings() already marked this
+    // producer's ring closed — markRingClosed() below is then a harmless
+    // idempotent no-op), or it ran first and this check is guaranteed to
+    // observe stopped_==true, in which case THIS thread closes the ring itself
+    // so the Producer returned below reports Closed instead of silently
+    // accepting sends into a ring nobody will ever drain or mark closed.
+    if (stopped_.load(std::memory_order_seq_cst)) {
+        impl->markRingClosed();
+    }
+
     return Producer(std::move(impl));
 }
 
 producer::PumpResult Client::pumpTrampoline_(void* ctx) noexcept {
     auto* self = static_cast<Client*>(ctx);
-    // inDutyCycle_ is duty-cycle-thread-only state (no cross-thread read) — only
-    // read once we have confirmed we ARE on that thread (dutyThreadId_: the
-    // Invoker owner, or the Thread-mode runner).
-    const bool onDutyThread = std::this_thread::get_id() == self->dutyThreadId_;
-    if (onDutyThread) {
-        if (self->inDutyCycle_) {
-            // fix1 C1: we ARE the duty-cycle thread, already mid-cycle (this call
-            // came from inside a user callback the cycle itself invoked).
-            // Pumping would recursively re-enter the agent's own poll on the same
-            // thread — decline so sendBlocking fails fast instead.
-            return producer::PumpResult::DeclinedInCycle;
-        }
-        if (self->cfg_.runnerMode == RunnerMode::Invoker) {
-            // The owner thread, outside any cycle: safe to drive one ourselves.
-            (void)self->dutyCycle(self->now());
-            return producer::PumpResult::Pumped;
-        }
-        // Thread mode's runner thread calling from outside dutyCycle() should not
-        // happen in practice (the runner's entire body IS the cycle loop), but
-        // fall through to NotOwner rather than assume.
+    // fix2 Important-2: ProducerImpl::sendBlocking only ever calls this hook
+    // when std::this_thread::get_id() == the dutyThreadId_ it copied from
+    // setPumpFn() — NotOwner is decided there, without ever reaching here, so
+    // this function is only ever entered ON the duty-cycle thread (the Invoker
+    // owner, or the Thread-mode runner). inDutyCycle_ is duty-cycle-thread-only
+    // state; reading it here is therefore safe (no cross-thread read).
+    if (self->inDutyCycle_) {
+        // We ARE the duty-cycle thread, already mid-cycle (this call came from
+        // inside a user callback the cycle itself invoked). Pumping would
+        // recursively re-enter the agent's own poll on the same thread —
+        // decline so sendBlocking fails fast instead.
+        return producer::PumpResult::DeclinedInCycle;
     }
-    // Thread mode's ordinary app thread, or a foreign thread touching an Invoker
-    // producer off its owner thread: a genuinely separate thread may still drain
-    // the ring for real, so fall back to the heartbeat-bounded wait.
-    return producer::PumpResult::NotOwner;
+    if (self->cfg_.runnerMode == RunnerMode::Invoker) {
+        // The owner thread, outside any cycle: safe to drive one ourselves.
+        (void)self->dutyCycle(self->now());
+        return producer::PumpResult::Pumped;
+    }
+    // Thread mode's runner thread calling from outside dutyCycle() should not
+    // happen in practice (the runner's entire body IS the cycle loop) — never
+    // pump proactively in Thread mode from here regardless; decline rather
+    // than assume it is safe.
+    return producer::PumpResult::DeclinedInCycle;
 }
 
 // ---------------------------------------------------------------------------

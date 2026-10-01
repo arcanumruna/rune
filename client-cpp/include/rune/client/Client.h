@@ -248,6 +248,15 @@ public:
     /// throwing callback escape a noexcept frame / a runner thread and
     /// terminate the process). Sums this Client's own onConnected/onError/
     /// onDisconnected catches with the subscriber and group-consumer hubs'.
+    /// (ProducerImpl's own PendingAck/batchAck callback catches — fix2 minor —
+    /// are counted separately per producer; see ProducerImpl::testCallbackExceptionCount().)
+    ///
+    /// fix2 minor-5: backed by PLAIN counters (no atomics — shared-nothing
+    /// rule), so this is only safe to call: in Invoker mode, from the owner
+    /// thread (the only thread that ever writes them); in Thread mode, AFTER
+    /// close() has returned (which joins the runner first — no writer is left
+    /// running). Calling it from another thread while a Thread-mode Client is
+    /// still live is a data race.
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept;
 
     // -------------------------------------------------------------------------
@@ -560,12 +569,12 @@ private:
         try {
             fn();
         } catch (const std::exception& e) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: user callback '%s' threw: %s (caught; the duty cycle continues)\n",
                 name, e.what());
         } catch (...) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: user callback '%s' threw a non-std::exception "
                 "(caught; the duty cycle continues)\n", name);
@@ -590,7 +599,10 @@ private:
     void submitRegistration_(Submit&& submit, OnFail&& onFail) {
         // After close() no duty cycle will ever adopt the holder (and Thread mode
         // would park 5 s on a ring nobody drains): fail fast, nothing leaks.
-        if (stopped_.load(std::memory_order_acquire)) {
+        // seq_cst: paired with closeImpl_'s seq_cst exchange (fix2 Important-3;
+        // see the Dekker-reasoning comment there) for the producer-registration
+        // race this guards against.
+        if (stopped_.load(std::memory_order_seq_cst)) {
             onFail();
             throw std::logic_error("client closed");
         }
@@ -696,14 +708,17 @@ private:
     static constexpr int64_t kSweepIntervalMs = 100;
     int64_t         nextSweepNs_ = 0;       // duty-cycle thread only
     bool            inDutyCycle_ = false;   // duty-cycle thread only
-    // fix1 C1: count of user-callback exceptions caught at this Client's own
-    // cbConnected_/cbError_/cbDisconnected_ call sites. Written only on the
-    // duty-cycle thread (a cold/rare path — an actual exception), but a test
-    // thread may poll testCallbackExceptionCount() without first establishing
-    // its own happens-before edge (it cannot: the exception's catch is itself
-    // the event being waited for), so this is a relaxed atomic rather than the
-    // single-writer plain counters elsewhere in this class.
-    std::atomic<uint64_t> callbackExceptions_ {0};
+    // fix2 minor-5: count of user-callback exceptions caught at this Client's
+    // own cbConnected_/cbError_/cbDisconnected_ call sites. PLAIN uint64_t, no
+    // atomic (shared-nothing rule — single-writer, like nextSweepNs_/
+    // inDutyCycle_ above): written ONLY on the duty-cycle thread while the
+    // Client is live, and from closeImpl_'s thread strictly AFTER the runner
+    // join (Thread mode) / on the owner thread (Invoker mode) — never
+    // concurrently with the duty-cycle thread's own writes. See
+    // testCallbackExceptionCount()'s doc for the read-side contract this
+    // implies for callers (a test thread may NOT poll this while the Client is
+    // still running in Thread mode).
+    uint64_t callbackExceptions_ = 0;
     std::thread::id ownerThread_;           // constructing thread (Invoker owner)
     std::thread::id dutyThreadId_;          // thread running dutyCycle(): owner or runner
     // Built ONCE: the txn producers' send paths (no per-cycle std::function build).

@@ -47,6 +47,7 @@
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -201,8 +202,12 @@ struct PendingAck {
     std::promise<int64_t>        promise;
 
     /// error empty = success (callback gets offset, future gets value);
-    /// otherwise callback(-1) / future exception(error).
-    static void complete(uint64_t handle, int64_t offset, std::string_view error) noexcept;
+    /// otherwise callback(-1) / future exception(error). A throwing user
+    /// callback/promise never escapes (fix2 minor): caught, counted into
+    /// *exceptionCounter (if non-null — duty-thread-only plain counter, no
+    /// atomic, per the shared-nothing rule), and logged.
+    static void complete(uint64_t handle, int64_t offset, std::string_view error,
+                         uint64_t* exceptionCounter) noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -220,6 +225,13 @@ struct PendingAck {
 //                     an Invoker producer off its owner thread): a genuinely
 //                     separate thread may still drain the ring in real time, so
 //                     sendBlocking falls back to the heartbeat-bounded wait.
+//
+// fix2 Important-2: NotOwner is decided by sendBlocking() itself (comparing the
+// calling thread against the dutyThreadId_ copy from setPumpFn), BEFORE the
+// pump hook (fn, below) is ever called — so a non-duty thread never touches
+// the hook's context (the Client), which could otherwise race a concurrent
+// Client destruction. The hook itself therefore only ever returns Pumped or
+// DeclinedInCycle; it is never asked to decide NotOwner.
 // ---------------------------------------------------------------------------
 enum class PumpResult : uint8_t { Pumped, DeclinedInCycle, NotOwner };
 
@@ -290,8 +302,25 @@ public:
     /// may be destroyed by then). A plain function pointer + opaque context: no
     /// std::function, no virtual call, no new atomics (shared-nothing: this is
     /// set once, before any send(), by the single thread that owns the producer).
+    ///
+    /// fix2 Important-2: `dutyThreadId` is the Client's OWN duty-cycle thread id
+    /// (the Invoker owner, or the Thread-mode runner), copied in BY VALUE here —
+    /// it is immutable for the Client's whole lifetime once set (established
+    /// before any producer() call can run), so this copy never goes stale and
+    /// never requires touching the Client again to read it. sendBlocking()
+    /// compares the CALLING thread against this copy BEFORE ever invoking `fn`:
+    /// a thread that is not the duty thread (Thread mode's app thread; a
+    /// foreign thread) is decided as NotOwner entirely inside ProducerImpl,
+    /// without dereferencing `ctx` (the Client) — so it can never race the
+    /// Client's destruction (the duty thread itself cannot race the destructor:
+    /// the runner is joined before teardown in Thread mode, and the owner IS
+    /// the destroyer in the Invoker off-owner-thread-destroy pattern).
     using PumpFn = PumpResult (*)(void* ctx) noexcept;
-    void setPumpFn(PumpFn fn, void* ctx) noexcept { pumpFn_ = fn; pumpCtx_ = ctx; }
+    void setPumpFn(PumpFn fn, void* ctx, std::thread::id dutyThreadId) noexcept {
+        pumpFn_ = fn;
+        pumpCtx_ = ctx;
+        dutyThreadId_ = dutyThreadId;
+    }
 
     /// fix1 minor 9: publish the ring's consumer-liveness heartbeat ONCE per
     /// duty cycle (called by ProducerHub::drainAndFlush before its drainRing()
@@ -358,6 +387,13 @@ public:
         completedAcks_.clear();  // keeps capacity
         return n;
     }
+
+    /// fix2 minor: user-callback exceptions caught at the PendingAck::complete
+    /// and onBatchAck call sites (never let a throwing ack callback escape and
+    /// terminate the duty-cycle thread). PLAIN counter (shared-nothing rule —
+    /// no atomic): written only on the duty thread; read-safe under the same
+    /// contract as Client::testCallbackExceptionCount().
+    [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept { return callbackExceptions_; }
 
     // ---- Agent-thread API (single-writer) ------------------------------------
 
@@ -655,12 +691,19 @@ private:
     std::function<void(const BatchAck&)> batchAckCb_;   // set before the first send
     bool                                 collectBatchAcks_ = false;
     std::vector<BatchAck>                completedAcks_;
+    // fix2 minor: plain counter (see testCallbackExceptionCount()).
+    uint64_t                             callbackExceptions_ = 0;
 
     // ---- sendBlocking() support (app thread only) -----------------------------
     static int64_t steadyNowNs_() noexcept;
     ClockFn clock_   = &steadyNowNs_;   // overridable by setClockForTesting()
-    PumpFn  pumpFn_  = nullptr;         // wired by Client::producer() in Invoker mode
+    PumpFn  pumpFn_  = nullptr;         // wired by Client::producer(), both modes (fix1 C1)
     void*   pumpCtx_ = nullptr;
+    // fix2 Important-2: the Client's duty-cycle thread id, copied in by
+    // setPumpFn(); set-once / immutable thereafter. Compared against the
+    // calling thread BEFORE pumpFn_ is ever invoked, so a non-duty thread
+    // never touches pumpCtx_ (the Client) at all.
+    std::thread::id dutyThreadId_{};
 };
 
 } // namespace rune::client::producer

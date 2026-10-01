@@ -410,14 +410,20 @@ void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition
             throw std::logic_error("Producer::send: client closed");
         }
         bool pumped = false;
-        if (pumpFn_ != nullptr) {
-            // fix1 C1: a 3-way result. DeclinedInCycle means pumping would
-            // re-enter the agent's own poll (we ARE the duty-cycle thread,
-            // already mid-cycle) — fail fast, never spin, never wait on a
-            // heartbeat that is literally this same stalled call. NotOwner falls
-            // back to the heartbeat-bounded wait: a genuinely separate thread
-            // (Thread mode's app thread, or a foreign thread) may still drain
-            // the ring for real.
+        // fix2 Important-2: NotOwner is decided HERE, by comparing the calling
+        // thread against the duty-thread id copied in by setPumpFn(), BEFORE
+        // ever calling pumpFn_ — so a thread that is not the duty thread never
+        // dereferences pumpCtx_ (the Client), and can never race a concurrent
+        // Client destruction on that thread. The duty thread itself cannot race
+        // the destructor (Thread mode joins the runner before teardown; Invoker
+        // mode's owner thread IS the one destroying it in the off-owner-thread
+        // pattern).
+        if (pumpFn_ != nullptr && std::this_thread::get_id() == dutyThreadId_) {
+            // fix1 C1: a 2-way result from here (NotOwner is pre-decided above).
+            // DeclinedInCycle means pumping would re-enter the agent's own poll
+            // (we ARE the duty-cycle thread, already mid-cycle) — fail fast,
+            // never spin, never wait on a heartbeat that is literally this same
+            // stalled call.
             const PumpResult pr = pumpFn_(pumpCtx_);
             if (pr == PumpResult::DeclinedInCycle) {
                 throw std::runtime_error(
@@ -426,6 +432,8 @@ void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition
             }
             pumped = (pr == PumpResult::Pumped);
         }
+        // else: NotOwner (no hook wired, or a genuinely separate thread) — falls
+        // back to the heartbeat-bounded wait below, same as "no hook wired".
         if (!pumped) {
             idle.idle(0);
             const int64_t nowNs = clock_();
@@ -476,7 +484,8 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
 // the ack handle whose ownership travels through the ring — no map, no lock)
 // ---------------------------------------------------------------------------
 
-void PendingAck::complete(uint64_t handle, int64_t offset, std::string_view error) noexcept {
+void PendingAck::complete(uint64_t handle, int64_t offset, std::string_view error,
+                          uint64_t* exceptionCounter) noexcept {
     std::unique_ptr<PendingAck> pa(reinterpret_cast<PendingAck*>(static_cast<uintptr_t>(handle)));
     if (!pa) return;
     try {
@@ -488,8 +497,18 @@ void PendingAck::complete(uint64_t handle, int64_t offset, std::string_view erro
             pa->promise.set_exception(
                 std::make_exception_ptr(std::runtime_error(std::string(error))));
         }
+    } catch (const std::exception& e) {
+        // fix2 minor: a throwing user callback must not escape the duty cycle
+        // — caught, counted, and logged instead of silently swallowed.
+        if (exceptionCounter) ++*exceptionCounter;
+        std::fprintf(stderr,
+            "rune-client: producer ack callback threw: %s (caught; the duty cycle continues)\n",
+            e.what());
     } catch (...) {
-        // A throwing user callback must not escape the duty cycle.
+        if (exceptionCounter) ++*exceptionCounter;
+        std::fprintf(stderr,
+            "rune-client: producer ack callback threw a non-std::exception "
+            "(caught; the duty cycle continues)\n");
     }
 }
 
@@ -508,7 +527,7 @@ std::pair<int64_t, std::future<int64_t>> ProducerImpl::registerFuture() {
 }
 
 void ProducerImpl::failUnsubmitted(int64_t ackHandle, const std::string& reason) noexcept {
-    PendingAck::complete(static_cast<uint64_t>(ackHandle), -1, reason);
+    PendingAck::complete(static_cast<uint64_t>(ackHandle), -1, reason, &callbackExceptions_);
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,7 +1060,7 @@ bool ProducerImpl::encodeAndSendTier2(
         emitBatchAck_(ps, batchSeq, entry.recordCount, -1, 0);
         const uint64_t h = entry.ackHandle;
         entry.ackHandle = 0;
-        PendingAck::complete(h, -1, {});  // "sent, offset unknown"
+        PendingAck::complete(h, -1, {}, &callbackExceptions_);  // "sent, offset unknown"
     } else {
         if (ps.ackHead - ps.ackTail >= ps.ackRing.size()) growAckRing(ps);
         const uint64_t slice = ps.ackHead;
@@ -1237,7 +1256,7 @@ void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t
         if (h == 0) continue;
         RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAckComplete, static_cast<uint32_t>(h),
                                  static_cast<double>(baseOffset + i));
-        PendingAck::complete(h, baseOffset + i, error);
+        PendingAck::complete(h, baseOffset + i, error, &callbackExceptions_);
     }
 }
 
@@ -1247,7 +1266,7 @@ void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
         uint64_t& slot = ps.ackRing[(ps.batchAckStart + static_cast<uint64_t>(i)) & ps.ackMask];
         const uint64_t h = slot;
         slot = 0;
-        if (h != 0) PendingAck::complete(h, -1, {});
+        if (h != 0) PendingAck::complete(h, -1, {}, &callbackExceptions_);
     }
     // The builder slice is always the newest one and acks=None never has an
     // in-flight slice, so the slice is reclaimed by rewinding the head.
@@ -1262,7 +1281,21 @@ void ProducerImpl::emitBatchAck_(const PartitionState& ps, int32_t baseSequence,
     const BatchAck a{ps.topicId, ps.partition, errorCode == 0 ? baseOffset : -1,
                      baseSequence, recordCount, errorCode};
     if (batchAckCb_) {
-        try { batchAckCb_(a); } catch (...) {}  // a throwing user callback must not escape
+        // fix2 minor: a throwing user callback must not escape the duty cycle
+        // — caught, counted, and logged instead of silently swallowed.
+        try {
+            batchAckCb_(a);
+        } catch (const std::exception& e) {
+            ++callbackExceptions_;
+            std::fprintf(stderr,
+                "rune-client: producer onBatchAck callback threw: %s (caught; the duty "
+                "cycle continues)\n", e.what());
+        } catch (...) {
+            ++callbackExceptions_;
+            std::fprintf(stderr,
+                "rune-client: producer onBatchAck callback threw a non-std::exception "
+                "(caught; the duty cycle continues)\n");
+        }
     }
     if (collectBatchAcks_) completedAcks_.push_back(a);
 }
@@ -1337,7 +1370,7 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
         while (!ps.pendingTier2Entries.empty() &&
                nowNs - ps.pendingTier2Entries.front().enqueuedNs >= deliveryNs) {
             PendingAck::complete(ps.pendingTier2Entries.front().ackHandle, -1,
-                                 "produce delivery timed out (never sent)");
+                                 "produce delivery timed out (never sent)", &callbackExceptions_);
             ps.pendingTier2Entries.pop_front();
         }
     }
@@ -1469,7 +1502,9 @@ void ProducerImpl::drainAppRingHandles_(OnHandle&& onHandle) {
 }
 
 void ProducerImpl::failAllPending(const std::string& reason) {
-    drainAppRingHandles_([&](uint64_t handle) { PendingAck::complete(handle, -1, reason); });
+    drainAppRingHandles_([&](uint64_t handle) {
+        PendingAck::complete(handle, -1, reason, &callbackExceptions_);
+    });
     // Everything the producer accepted: in-flight slices + the current builder slice.
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
@@ -1481,13 +1516,15 @@ void ProducerImpl::failAllPending(const std::string& reason) {
         for (uint64_t i = ps.ackTail; i < ps.ackHead; ++i) {
             uint64_t& h = ps.ackRing[i & ps.ackMask];
             if (h != 0) {
-                PendingAck::complete(h, -1, reason);
+                PendingAck::complete(h, -1, reason, &callbackExceptions_);
                 h = 0;
             }
         }
         ps.ackTail = ps.ackHead;
         ps.batchAckCount = 0;
-        for (Tier2Entry& e : ps.pendingTier2Entries) PendingAck::complete(e.ackHandle, -1, reason);
+        for (Tier2Entry& e : ps.pendingTier2Entries) {
+            PendingAck::complete(e.ackHandle, -1, reason, &callbackExceptions_);
+        }
         ps.pendingTier2Entries.clear();
         if (ps.builder) {
             const int64_t resetWall = wallNs();

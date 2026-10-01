@@ -116,3 +116,59 @@ TEST(InvokerAgent, AckBurstBeyondReserveDoesNotAllocateRegression) {
     for (int i = 0; i < kBurst; ++i) EXPECT_EQ(seen[static_cast<std::size_t>(i)], 1000 + i);
     EXPECT_EQ(agent.testProduceAckCapacity(), cap0);
 }
+
+// ---------------------------------------------------------------------------
+// fix2 Important-1: drainRegistrationsForClose() must not miss a registration
+// sitting right past a ring wrap, when the single read() call that reaches it
+// consumes ONLY wrap padding (reports 0 "nothing to do", pre-fix).
+// ---------------------------------------------------------------------------
+TEST(InvokerAgent, CloseAdoptsRegistrationPastRingWrapRegression) {
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = 3600;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = 3601;
+    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+                            std::to_string(g_ctr.fetch_add(1));
+    cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
+    cfg.session.egressChannel  = "aeron:ipc";
+    cfg.session.egressStreamId = 3601;
+    // Small, precise command ring: 12 x 40-byte records (8-byte header + the
+    // 32-byte RegisterProducer payload = ENCODED_SIZE) exactly fill 480/512 B.
+    cfg.ringCapacity = 512;
+    rca::ClientAgent agent(cfg);
+    agent.start();
+
+    int   registerCalls = 0;
+    void* registeredHandle = nullptr;
+    agent.setProducerRegisterFn([&](void* h) {
+        ++registerCalls;
+        registeredHandle = h;
+    });
+
+    // Fill with 12 x 32-byte-payload fillers (480/512 B used), then drain them
+    // ALL in one doWork() cycle (ringDrainLimit default 128 covers all 12 in
+    // a single read()) — head lands exactly at the tail (480), with nothing
+    // real between head and the physical buffer end.
+    for (int i = 0; i < 12; ++i) {
+        ASSERT_TRUE(agent.testWriteNoopCommand(32)) << "filler " << i;
+    }
+    agent.doWork(monoNs());
+
+    // Submit the registration: tail is at 480; the 40-byte record does not fit
+    // the 32 B remaining to the physical buffer end, so it pads that remainder
+    // and wraps, landing the WHOLE record at offset 0.
+    void* const fakeHandle = reinterpret_cast<void*>(0x1234);
+    ASSERT_TRUE(agent.submitRegisterProducer(fakeHandle));
+
+    // Before the fix: the first (and, since drainRegistrationsForClose() stops
+    // on n==0, ONLY) read() call sees head(480)..bufferEnd(512) as pure
+    // padding, reports 0, and the outer loop breaks — the registration is
+    // never adopted (leaked holder; its producer's ring never gets marked
+    // closed either). After the fix, the same call continues past the padding
+    // within itself and adopts it.
+    const int total = agent.drainRegistrationsForClose();
+    EXPECT_EQ(total, 1);
+    EXPECT_EQ(registerCalls, 1);
+    EXPECT_EQ(registeredHandle, fakeHandle);
+}

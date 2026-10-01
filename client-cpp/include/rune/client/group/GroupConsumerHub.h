@@ -132,11 +132,13 @@ public:
     /// fix1 C1: onAssigned/onRevoked/onRecords run inside the noexcept
     /// ClientAgent::doWork chain (or, for closeAll's final onRevoked, inside
     /// Client::closeImpl_); a throwing callback is caught, counted here, and
-    /// logged instead of terminating the process. Runner/duty-cycle-thread-only
-    /// write (closeAll runs single-threaded, after the runner was joined); safe
-    /// to read after a sync pump.
+    /// logged instead of terminating the process. PLAIN counter (fix2
+    /// minor-5 — shared-nothing rule, no atomics): written only on the
+    /// runner/duty-cycle thread, or from closeAll()'s thread strictly after
+    /// the runner is joined. See Client::testCallbackExceptionCount()'s doc
+    /// for the exact read-side contract this implies.
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept {
-        return callbackExceptions_.load(std::memory_order_relaxed);
+        return callbackExceptions_;
     }
 
 private:
@@ -147,8 +149,8 @@ private:
     std::vector<const ImplList*> owned_;
     std::mutex addMtx_;
 
-    // fix1 C1: written on the runner/duty-cycle thread, read from a test thread.
-    std::atomic<uint64_t> callbackExceptions_ {0};
+    // fix1 C1 / fix2 minor-5: plain counter (see testCallbackExceptionCount()).
+    uint64_t callbackExceptions_ = 0;
 
     // ---- Internal helpers (runner thread only) ------------------------------
 

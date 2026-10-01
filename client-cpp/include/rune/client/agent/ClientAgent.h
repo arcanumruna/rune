@@ -322,6 +322,16 @@ public:
     /// Fill the command ring with no-op commands until no registration fits
     /// (cold, allocates a scratch buffer).  The duty cycle drops no-ops.
     void testFillCommandRing();
+    /// fix2 Important-1: write exactly ONE no-op command with the given payload
+    /// length (ring record size = align(8 + payloadLen, 8)), for tests that
+    /// need to position the ring's tail at a precise byte offset (e.g. to land
+    /// a subsequent registration exactly on a wrap boundary). Returns false if
+    /// the ring has no room. The duty cycle drops no-ops, same as the filler
+    /// above.
+    bool testWriteNoopCommand(std::size_t payloadLen) noexcept {
+        std::vector<uint8_t> scratch(payloadLen, 0);
+        return writeCommand(kMsgTestNoop, scratch.data(), payloadLen);
+    }
 
     /// Task 1.4 (redirect convergence): route ONE pre-encoded produce frame to its
     /// partition leader session — the SAME routing the produce drain path uses

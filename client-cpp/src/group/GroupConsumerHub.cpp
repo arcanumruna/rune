@@ -345,12 +345,12 @@ void GroupConsumerHub::applyAssignment(GroupConsumerImpl& impl,
         try {
             impl.cbRevoked(revoked);
         } catch (const std::exception& e) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: group onRevoked threw: %s (caught; the duty cycle continues)\n",
                 e.what());
         } catch (...) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: group onRevoked threw a non-std::exception "
                 "(caught; the duty cycle continues)\n");
@@ -374,12 +374,12 @@ void GroupConsumerHub::applyAssignment(GroupConsumerImpl& impl,
         try {
             impl.cbAssigned(added);
         } catch (const std::exception& e) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: group onAssigned threw: %s (caught; the duty cycle continues)\n",
                 e.what());
         } catch (...) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: group onAssigned threw a non-std::exception "
                 "(caught; the duty cycle continues)\n");
@@ -487,12 +487,12 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
             try {
                 impl->cbRecords(rv);
             } catch (const std::exception& e) {
-                callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+                ++callbackExceptions_;
                 std::fprintf(stderr,
                     "rune-client: group onRecords threw: %s (caught; the duty cycle continues)\n",
                     e.what());
             } catch (...) {
-                callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+                ++callbackExceptions_;
                 std::fprintf(stderr,
                     "rune-client: group onRecords threw a non-std::exception "
                     "(caught; the duty cycle continues)\n");
@@ -793,11 +793,11 @@ void GroupConsumerHub::closeAll(int64_t sessionId, const SendFn& sendFn)
             try {
                 impl->cbRevoked(all);
             } catch (const std::exception& e) {
-                callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+                ++callbackExceptions_;
                 std::fprintf(stderr,
                     "rune-client: group onRevoked (close) threw: %s (caught)\n", e.what());
             } catch (...) {
-                callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+                ++callbackExceptions_;
                 std::fprintf(stderr,
                     "rune-client: group onRevoked (close) threw a non-std::exception (caught)\n");
             }

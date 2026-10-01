@@ -15,8 +15,14 @@
 //      indirect call + potential heap alloc on the hot path.  Templating removes
 //      that entirely (ULL).
 //
-// Layout + wire format are byte-identical to Aeron's ManyToOneRingBuffer, so
-// write()/read() interoperate with the same RecordDescriptor framing.
+// Record framing (length/type headers, alignment, padding) is byte-identical
+// to Aeron's ManyToOneRingBuffer, so write()/read() interoperate with the same
+// RecordDescriptor framing. The TRAILER layout is NOT fully byte-identical to
+// Aeron's RingBufferDescriptor: the first five words (tail, head cache, head,
+// correlation counter, consumer heartbeat — CL*0..CL*10) match Aeron's offsets
+// exactly, but this ring extends the trailer with one more word, `closed`, at
+// CL*12 (fix1 C2/I3) — a Rune-only extension with no Aeron counterpart. See
+// the trailer layout comment above the offset constants, below.
 //
 // Threading: many producer threads may call tryClaim()/write(); exactly ONE
 // consumer thread may call read()/controlledRead().
@@ -165,11 +171,20 @@ public:
         int messagesRead = 0;
 
         const aeron::util::index_t headPositionIndex = m_headPositionIndex;
-        const std::int64_t head = m_buffer.getInt64(headPositionIndex);
+        std::int64_t head = m_buffer.getInt64(headPositionIndex);
         const aeron::util::index_t capacity = m_capacity;
-        const aeron::util::index_t headIndex = static_cast<std::int32_t>(head) & (capacity - 1);
-        const aeron::util::index_t maxBlockLength = capacity - headIndex;
+        aeron::util::index_t headIndex = static_cast<std::int32_t>(head) & (capacity - 1);
+        aeron::util::index_t maxBlockLength = capacity - headIndex;
         aeron::util::index_t bytesRead = 0;
+        // fix2 Important-1: same continuation as controlledRead() — at most ONE
+        // end-of-buffer padding region can exist per wrap (claimCapacity only
+        // pads the tail-end gap once), so at most one same-call continuation is
+        // ever needed. Without this, a call that consumes only wrap padding
+        // reports 0 ("nothing to do") even though a real message — e.g. a
+        // producer registration — sits right past the wrap, which left
+        // ClientAgent::drainRegistrationsForClose() able to miss a registration
+        // at close time (leaked holder, ring never marked closed).
+        bool canWrapOnce = true;
 
         ScopeExit cleanup([&]() {
             if (bytesRead != 0) {
@@ -178,22 +193,37 @@ public:
             }
         });
 
-        while ((bytesRead < maxBlockLength) && (messagesRead < messageCountLimit)) {
-            const aeron::util::index_t recordIndex = headIndex + bytesRead;
-            const std::int32_t recordLength =
-                loadAcquire32_(RD::RecordDescriptor::lengthOffset(recordIndex));
-            if (recordLength <= 0) break;
+        for (;;) {
+            bool stop = false;
+            while ((bytesRead < maxBlockLength) && (messagesRead < messageCountLimit)) {
+                const aeron::util::index_t recordIndex = headIndex + bytesRead;
+                const std::int32_t recordLength =
+                    loadAcquire32_(RD::RecordDescriptor::lengthOffset(recordIndex));
+                if (recordLength <= 0) { stop = true; break; }
 
-            bytesRead += aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
+                bytesRead += aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
 
-            const std::int32_t msgTypeId =
-                m_buffer.getInt32(RD::RecordDescriptor::typeOffset(recordIndex));
-            if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) continue;
+                const std::int32_t msgTypeId =
+                    m_buffer.getInt32(RD::RecordDescriptor::typeOffset(recordIndex));
+                if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) continue;
 
-            handler(msgTypeId, m_buffer,
-                    RD::RecordDescriptor::encodedMsgOffset(recordIndex),
-                    recordLength - RD::RecordDescriptor::HEADER_LENGTH);
-            ++messagesRead;
+                handler(msgTypeId, m_buffer,
+                        RD::RecordDescriptor::encodedMsgOffset(recordIndex),
+                        recordLength - RD::RecordDescriptor::HEADER_LENGTH);
+                ++messagesRead;
+            }
+            if (stop) break;
+            if (canWrapOnce && messagesRead == 0 && bytesRead == maxBlockLength && bytesRead > 0) {
+                m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
+                storeRelease64_(headPositionIndex, head + bytesRead);
+                head          += bytesRead;
+                headIndex      = 0;
+                maxBlockLength = capacity;
+                bytesRead      = 0;
+                canWrapOnce    = false;
+                continue;
+            }
+            break;
         }
         return messagesRead;
     }
@@ -282,14 +312,21 @@ public:
     }
 
 private:
-    // Trailer layout — byte-identical to Aeron's RingBufferDescriptor.
+    // Trailer layout. CL*0..CL*10 (tail, head cache, head, correlation counter,
+    // consumer heartbeat) are byte-identical to Aeron's RingBufferDescriptor —
+    // this is what lets write()/read() interoperate with Aeron's own
+    // RecordDescriptor record framing. CLOSED_OFFSET (CL*12) is a Rune-only
+    // extension (fix1 C2/I3): Aeron's RingBufferDescriptor has no such word,
+    // and no external Aeron-side reader ever looks past CL*10 on this ring (it
+    // is never shared outside rune::client::detail — see the class comment),
+    // so extending the trailer here is safe.
     static constexpr aeron::util::index_t CL = aeron::util::BitUtil::CACHE_LINE_LENGTH;
     static constexpr aeron::util::index_t TAIL_POSITION_OFFSET       = CL * 2;
     static constexpr aeron::util::index_t HEAD_CACHE_POSITION_OFFSET = CL * 4;
     static constexpr aeron::util::index_t HEAD_POSITION_OFFSET       = CL * 6;
     static constexpr aeron::util::index_t CORRELATION_COUNTER_OFFSET = CL * 8;
-    static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10;
-    static constexpr aeron::util::index_t CLOSED_OFFSET              = CL * 12;
+    static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10; // matches Aeron
+    static constexpr aeron::util::index_t CLOSED_OFFSET              = CL * 12; // Rune extension
     static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 14;
     static constexpr aeron::util::index_t INSUFFICIENT_CAPACITY      = -2;
 

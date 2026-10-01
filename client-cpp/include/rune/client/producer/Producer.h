@@ -185,6 +185,15 @@ public:
 
     /// Non-blocking send (ZERO per-send heap allocation, lock-free).  Never drops
     /// silently: anything but Ok means the record was NOT accepted.
+    ///
+    /// fix2 minor: Ok is a point-in-time answer, not a durability guarantee — a
+    /// send() racing a concurrent close() can still observe Ok (the record was
+    /// written into the ring before Closed became visible) and then have that
+    /// record FAILED (an ack-expecting send) or simply DISCARDED (the
+    /// fire-and-forget void path: close() does not flush records still queued
+    /// in the ring, it only stops draining them) once close() actually runs.
+    /// Acks-expecting callers must treat a late close() the same as any other
+    /// failure path; the void path has no acknowledgement to lose.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
                                      std::span<const uint8_t> value) noexcept;
 

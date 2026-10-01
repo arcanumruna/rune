@@ -1041,9 +1041,6 @@ TEST(Client, BlockingSendFromCallbackDoesNotTerminateThreadRegression) {
         << "connect() future did not resolve — the runner thread may have died";
     ASSERT_NO_THROW(fut.get());
     EXPECT_TRUE(ran.load());
-    EXPECT_GT(h.client->testCallbackExceptionCount(), 0u)
-        << "the uncaught throw inside onConnected must be caught by "
-           "Client::invokeUserCallback_ around the callback dispatch, not escape it";
 
     // The runner thread survived: a subsequent ping still completes.
     auto pingFut = h.client->ping({'o', 'k'});
@@ -1052,7 +1049,16 @@ TEST(Client, BlockingSendFromCallbackDoesNotTerminateThreadRegression) {
         << "runner thread did not survive the uncaught callback exception";
     EXPECT_NO_THROW(pingFut.get());
 
+    // fix2 minor-5: callbackExceptions_ is a PLAIN counter (shared-nothing
+    // rule — no atomics), written only on the runner thread. Reading it from
+    // this (test) thread is only safe once close() has joined the runner —
+    // we already waited on the test's own flag (`ran`, via pumpGwUntil above)
+    // before getting here, but that only proves the callback STARTED; close()
+    // is what actually guarantees no writer is left running.
     h.client->close();
+    EXPECT_GT(h.client->testCallbackExceptionCount(), 0u)
+        << "the uncaught throw inside onConnected must be caught by "
+           "Client::invokeUserCallback_ around the callback dispatch, not escape it";
 }
 
 // ===========================================================================

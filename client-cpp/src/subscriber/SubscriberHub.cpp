@@ -232,12 +232,12 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
         try {
             impl->handler(rec);
         } catch (const std::exception& e) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: subscription record handler threw: %s (caught; the duty "
                 "cycle continues)\n", e.what());
         } catch (...) {
-            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            ++callbackExceptions_;
             std::fprintf(stderr,
                 "rune-client: subscription record handler threw a non-std::exception "
                 "(caught; the duty cycle continues)\n");

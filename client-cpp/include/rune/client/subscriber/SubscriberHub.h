@@ -186,12 +186,12 @@ public:
     /// fix1 C1: record handlers run inside the noexcept ClientAgent::doWork
     /// chain (onRecords is called from Client::onEgressFrame); a throwing
     /// handler is caught, counted here, and logged instead of terminating the
-    /// process. A relaxed atomic (not the single-writer plain counters
-    /// elsewhere in this class): a test thread polling this has no other way
-    /// to establish happens-before with the exception that is itself the
-    /// event being waited for.
+    /// process. PLAIN counter (fix2 minor-5 — shared-nothing rule, no
+    /// atomics): written only on the agent/duty-cycle thread. Only safe to
+    /// read once no concurrent writer remains — see
+    /// Client::testCallbackExceptionCount()'s doc for the exact contract.
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept {
-        return callbackExceptions_.load(std::memory_order_relaxed);
+        return callbackExceptions_;
     }
 
 private:
@@ -212,8 +212,8 @@ private:
     // Key: subscriptionId.
     std::map<int64_t, std::shared_ptr<SubscriptionImpl>> activeById_;
 
-    // fix1 C1: written on the agent thread (onRecords), read from a test thread.
-    std::atomic<uint64_t> callbackExceptions_ {0};
+    // fix1 C1 / fix2 minor-5: plain counter, written only on the agent thread.
+    uint64_t callbackExceptions_ = 0;
 };
 
 } // namespace rune::client::subscriber

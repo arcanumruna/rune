@@ -226,7 +226,7 @@ TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
             c->impl->flushBatches(steadyNs(), 42, sink);
             return PumpResult::Pumped; // "owner thread, outside a duty-cycle callback"
         },
-        &ctx);
+        &ctx, std::this_thread::get_id());
 
     EXPECT_NO_THROW(p.send(kTopic, Key(uint64_t{ok}), kVal));
     EXPECT_GT(ctx.calls, 0) << "the pump hook must be used instead of idling on the heartbeat";
@@ -249,17 +249,22 @@ TEST(ProducerSend, VoidSendThrowsInsteadOfPumpingWhenPumpDeclinesRegression) {
             ++*static_cast<int*>(raw);
             return PumpResult::DeclinedInCycle; // e.g. called from inside a duty-cycle callback
         },
-        &declineCalls);
+        &declineCalls, std::this_thread::get_id());
 
     EXPECT_THROW(p.send(kTopic, Key(uint64_t{ok}), kVal), std::runtime_error);
     EXPECT_EQ(declineCalls, 1) << "must fail on the FIRST decline, never retry/spin";
 }
 
-// Regression (fix1 C1 3-way result): NotOwner falls back to the SAME
-// heartbeat-bounded wait as "no hook wired" — a genuinely separate thread
-// (Thread mode's app thread) may still drain the ring for real, so this must
-// NOT throw immediately the way DeclinedInCycle does.
-TEST(ProducerSend, VoidSendFallsBackToHeartbeatWaitWhenPumpReportsNotOwnerRegression) {
+// Regression (fix1 C1 + fix2 Important-2): NotOwner is now decided INSIDE
+// ProducerImpl by comparing the calling thread against the duty-thread id
+// copied in by setPumpFn() — BEFORE the hook is ever invoked. A thread that
+// does not match (the test thread here, vs. a duty-thread id that can never
+// equal any real thread's id) must never call the hook at all (so it never
+// dereferences the hook's context, which could otherwise race a concurrent
+// destruction of whatever owns that context), and falls back to the SAME
+// heartbeat-bounded wait as "no hook wired" — this must NOT throw immediately
+// the way DeclinedInCycle does.
+TEST(ProducerSend, NonDutyThreadNeverInvokesPumpHookFallsBackToHeartbeatWaitRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.agentLivenessTimeoutMs = 5;
     std::atomic<int64_t> corr{1};
@@ -272,16 +277,18 @@ TEST(ProducerSend, VoidSendFallsBackToHeartbeatWaitWhenPumpReportsNotOwnerRegres
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
 
-    int notOwnerCalls = 0;
+    int pumpCalls = 0;
+    // std::thread::id{} (the default, "no thread") can never equal this test
+    // thread's real id — every call from here is therefore off the duty thread.
     impl->setPumpFn(
         +[](void* raw) noexcept -> PumpResult {
             ++*static_cast<int*>(raw);
-            return PumpResult::NotOwner;
+            return PumpResult::Pumped; // would succeed instantly if ever called
         },
-        &notOwnerCalls);
+        &pumpCalls, std::thread::id{});
 
     EXPECT_THROW(p.send(kTopic, Key(uint64_t{ok}), kVal), std::runtime_error);
-    EXPECT_GT(notOwnerCalls, 1) << "NotOwner must retry the heartbeat-bounded wait, not fail on the first call";
+    EXPECT_EQ(pumpCalls, 0) << "a non-duty thread must never call the pump hook";
 }
 
 // Regression (fix1 C2/I3): a Producer that outlives its (now-closed) ring
@@ -301,7 +308,7 @@ TEST(ProducerSend, ClosedRingNeverInvokesThePumpHookRegression) {
             ++*static_cast<int*>(raw);
             return PumpResult::Pumped;
         },
-        &pumpCalls);
+        &pumpCalls, std::this_thread::get_id());
 
     impl->markRingClosed();
 
@@ -355,4 +362,65 @@ TEST(ProducerSend, FailUnsubmittedReasonIsDistinctPerSendResultRegression) {
 
     EXPECT_NE(backPressuredMsg, tooLargeMsg)
         << "BackPressured and ValueTooLarge must report DISTINCT reasons, not one generic string";
+}
+
+// ---------------------------------------------------------------------------
+// fix2 minor: close() arriving while a (Thread-mode-style) app thread is
+// already blocked in sendBlocking's heartbeat-wait must be decided promptly
+// by the in-loop closed check — never by waiting out agentLivenessTimeoutMs.
+//
+// A real Thread-mode Client's background runner drains a ring this small
+// almost instantly in real time, making the exact interleaving ("blocked,
+// then close() arrives") impossible to force deterministically through a live
+// Client. Exercised directly at the ProducerImpl level instead: with no pump
+// hook wired, sendBlocking takes the heartbeat-wait path deterministically
+// (nothing ever drains this ring) — then markRingClosed() is flipped WHILE it
+// is blocked there, exactly what Client::closeImpl_'s closeAllRings() does to
+// a live producer's ring.
+// ---------------------------------------------------------------------------
+TEST(ProducerSend, CloseWhileSendBlockingIsWaitingThrowsPromptlyRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.agentLivenessTimeoutMs = 60'000; // would hang ~a minute if the in-loop check regressed
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    Producer p(impl);
+    const uint64_t ok = fillUntilBackPressured(p);
+    ASSERT_GT(ok, 0u);
+
+    // No pump hook wired (equivalent to NotOwner — see
+    // NonDutyThreadNeverInvokesPumpHookFallsBackToHeartbeatWaitRegression,
+    // above, for the thread-id-mismatch path that reaches the same branch
+    // through a real Client): sendBlocking takes the heartbeat-wait path
+    // deterministically, forever (nothing ever drains this ring, so the
+    // heartbeat is never published either) — until markRingClosed() below.
+
+    std::atomic<bool> threw{false};
+    std::atomic<bool> enteredWait{false};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread blocker([&] {
+        enteredWait.store(true, std::memory_order_release);
+        try {
+            p.send(kTopic, Key(uint64_t{ok}), kVal);
+        } catch (const std::logic_error&) {
+            threw.store(true, std::memory_order_release);
+        }
+    });
+
+    while (!enteredWait.load(std::memory_order_acquire)) std::this_thread::yield();
+    // Bounded settle: give the blocker a few real backoff iterations so it is
+    // genuinely inside the wait loop (not merely about to enter it) before the
+    // close signal arrives — this does not wait out any timeout, just a few µs
+    // of BackoffIdleStrategy's initial spin.
+    for (int i = 0; i < 1000; ++i) std::this_thread::yield();
+
+    impl->markRingClosed(); // simulates Client::closeImpl_'s closeAllRings()
+
+    blocker.join();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT_TRUE(threw.load()) << "must throw std::logic_error(\"client closed\")";
+    EXPECT_LT(elapsedMs, 5000)
+        << "sendBlocking waited instead of being decided promptly by the in-loop closed "
+           "check (agentLivenessTimeoutMs=60s would otherwise make this take a minute)";
 }
