@@ -149,13 +149,42 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // only while the writer is descheduled; unblocking risks corruption. The
     // one place that must terminate regardless — close(), after the runner is
     // joined — has its own bounded unblock (drainRegistrationsForClose).
-    int ringWork = ring_.read(
+    //
+    // F8a fix2/fix3 (root cause): a wire frame accepted into the ring is NEVER
+    // silently dropped by the drain.  Rule for kMsgSend (every app/hub control
+    // frame on the default ingress publication: Ping, DefineTopic,
+    // GetTopicSchema, MetadataRequest, JoinGroup/SyncGroup/Heartbeat/
+    // OffsetFetch, group Subscribe, txn control frames, redirect/connect
+    // resends of pending Subscribes):
+    //   * seed session Connected AND the frame carries its sessionId -> offer:
+    //       Accepted -> consumed;
+    //       Retry (back-pressured / publication not connected / admin action /
+    //         not resolved yet — transient) -> the record is LEFT at the head
+    //         of the ring (ABORT) and offered again next duty cycle, in order;
+    //         nothing behind it is read this cycle.  It is held exactly as
+    //         long as the transport stays transiently unavailable — there is
+    //         no time bound of its own;
+    //       Fatal (publication closed / max position exceeded / Aeron threw,
+    //         e.g. a frame over the publication max message length — permanent)
+    //         -> dropped, logged, counted (ingressFatalDropped()).  Oversize
+    //         frames are rejected synchronously by submitSend() already.
+    //   * otherwise (session not Connected, or the frame carries an OLD
+    //     sessionId): the frame belongs to a session that no longer exists —
+    //     dropped deliberately, counted (staleFramesDropped()), logged
+    //     rate-limited (first + every 1024th), never resent from here.  Owners
+    //     re-issue what must survive a session change with the new sessionId
+    //     (pending Subscribes on every connect, JoinGroup on connect/rejoin).
+    // Unsubscribe / adoption-time Subscribe / OffsetCommit / LeaveGroup do
+    // not use the ring at all (duty-thread direct send with per-cycle retry).
+    // Every other command type is consumed (CONTINUE).
+    int ringWork = ring_.controlledRead(
         [this, nowNs](
             std::int32_t                         msgTypeId,
             aeron::concurrent::AtomicBuffer&     buf,
             aeron::util::index_t                 offset,
             aeron::util::index_t                 len)
         {
+            using CA = rune::client::detail::ControlledAction;
             switch (msgTypeId) {
             case kMsgConnect:
                 seedSession().machine.connect(nowNs);
@@ -181,7 +210,34 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 if (len > 0) {
                     const auto* p = reinterpret_cast<const uint8_t*>(
                         buf.buffer() + offset);
-                    transport_.offer(p, static_cast<std::size_t>(len));
+                    const auto n = static_cast<std::size_t>(len);
+                    const auto& m = seedSession().machine;
+                    const int64_t frameSid = (n >= 16)
+                        ? ::rune::protocol::client::detail::getLE64(p, 8) : 0;
+                    if (m.state() != session::SessionState::Connected ||
+                        frameSid != m.sessionId()) {
+                        if ((staleFramesDropped_++ & 1023u) == 0) {
+                            std::fprintf(stderr,
+                                "rune-client: dropped control frame(s) of a session that no "
+                                "longer exists (frame sessionId %lld, current %lld, "
+                                "connected=%d; %llu dropped so far)\n",
+                                static_cast<long long>(frameSid),
+                                static_cast<long long>(m.sessionId()),
+                                m.state() == session::SessionState::Connected ? 1 : 0,
+                                static_cast<unsigned long long>(staleFramesDropped_));
+                        }
+                        break;
+                    }
+                    switch (offerIngress_(p, n)) {
+                    case transport::AeronTransport::OfferResult::Accepted:
+                        break;
+                    case transport::AeronTransport::OfferResult::Retry:
+                        ++ingressOfferRefused_;
+                        return CA::ABORT;  // stays at the head; retried next cycle
+                    case transport::AeronTransport::OfferResult::Fatal:
+                        noteFatalDrop_(n);  // fix4 M2: rate-limited log, every drop counted
+                        break;
+                    }
                 }
                 break;
 
@@ -209,10 +265,21 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 }
                 break;
 
+            case kMsgHubCommand:
+                // F8a: subscriber / group-consumer command, applied by the hub
+                // that owns the state — on THIS (duty) thread.
+                if (hubCommandFn_) {
+                    const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                    auto cmd = ring_msg::HubCommandMsg::decode(p, static_cast<std::size_t>(len));
+                    if (cmd) hubCommandFn_(*cmd);
+                }
+                break;
+
             default:
                 // Unknown command: drop silently.
                 break;
             }
+            return CA::CONTINUE;
         },
         cfg_.ringDrainLimit);
 
@@ -337,7 +404,37 @@ bool ClientAgent::submitClose() noexcept {
 }
 
 bool ClientAgent::submitSend(const uint8_t* frame, std::size_t len) noexcept {
+    // F8a fix3 I1(a): a frame no ingress publication can ever carry is
+    // rejected HERE, synchronously — it must never reach the ring (where it
+    // would be a permanent offer failure).
+    if (len > maxFrameLength()) return false;
     return writeCommand(kMsgSend, frame, len);
+}
+
+transport::AeronTransport::OfferResult ClientAgent::offerDefault(const uint8_t* buf,
+                                                                std::size_t len) noexcept {
+    const auto r = offerIngress_(buf, len);
+    if (r == transport::AeronTransport::OfferResult::Fatal) [[unlikely]] noteFatalDrop_(len);
+    return r;
+}
+
+void ClientAgent::noteFatalDrop_(std::size_t len) noexcept {
+    // F8a fix4 M2: counted every time, logged on the first and every 1024th.
+    if ((ingressFatalDropped_++ & 1023u) == 0) {
+        std::fprintf(stderr,
+            "rune-client: dropped a control frame the transport can never accept "
+            "(len %zu; %llu dropped so far)\n",
+            len, static_cast<unsigned long long>(ingressFatalDropped_));
+    }
+}
+
+transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t* buf,
+                                                                 std::size_t len) noexcept {
+    if (testForcedOffers_ > 0) [[unlikely]] {
+        --testForcedOffers_;
+        return testForcedOffer_;
+    }
+    return transport_.offerResult(buf, len);
 }
 
 bool ClientAgent::submitRegisterProducer(void* holder) noexcept {
@@ -413,12 +510,21 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
         const int n = ring_.read(
             [this](std::int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf,
                    aeron::util::index_t offset, aeron::util::index_t len) {
+                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+                if (msgTypeId == kMsgHubCommand) {
+                    // F8a: adopt/apply so heap payloads (subscribe requests,
+                    // commitSync promises, group registrations) are owned and
+                    // then finished by the close path — never stranded.
+                    if (!hubCommandFn_) return;
+                    auto cmd = ring_msg::HubCommandMsg::decode(p, static_cast<std::size_t>(len));
+                    if (cmd) hubCommandFn_(*cmd);
+                    return;
+                }
                 const ProducerRegisterFn* fn =
                     (msgTypeId == kMsgRegisterProducer)      ? &producerRegisterFn_
                     : (msgTypeId == kMsgRegisterTxnProducer) ? &txnProducerRegisterFn_
                                                              : nullptr;
                 if (fn == nullptr || !*fn) return;  // sends / lifecycle: dropped
-                const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
                 auto msg = ring_msg::RegisterProducer::decode(p, static_cast<std::size_t>(len));
                 if (msg) (*fn)(reinterpret_cast<void*>(msg->handle));
             },
@@ -469,6 +575,12 @@ void ClientAgent::testFillCommandRing() {
     for (std::size_t len = scratch.size(); len >= 1; len /= 2) {
         while (writeCommand(kMsgTestNoop, scratch.data(), len)) {}
     }
+}
+
+bool ClientAgent::submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept {
+    uint8_t buf[ring_msg::HubCommandMsg::ENCODED_SIZE];
+    const std::size_t n = ring_msg::HubCommandMsg::encode(cmd, buf);
+    return writeCommand(kMsgHubCommand, buf, n);
 }
 
 bool ClientAgent::submitRegisterTxnProducer(void* holder) noexcept {

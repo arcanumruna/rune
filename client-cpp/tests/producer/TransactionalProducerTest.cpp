@@ -761,7 +761,7 @@ TEST(GroupConsumerReadCommittedTest, HubPreservesIsolationConfig)
     impl->groupId  = "rc-group";
     impl->topicIds = {10};
     impl->cfg      = cfg;
-    impl->active.store(true, std::memory_order_relaxed);
+    impl->active = true;
 
     hub.add(impl);
 
@@ -804,7 +804,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
     impl->memberId  = "member-1";
     impl->generationId = 1;
     impl->state     = GroupConsumerState::Syncing; // ready to receive SyncGroupResponse
-    impl->active.store(true, std::memory_order_relaxed);
+    impl->active = true;
     impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
     hub.add(impl);
@@ -889,7 +889,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     impl->memberId   = "m-2";
     impl->generationId = 1;
     impl->state      = GroupConsumerState::Syncing;
-    impl->active.store(true, std::memory_order_relaxed);
+    impl->active = true;
     impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
     hub.add(impl);

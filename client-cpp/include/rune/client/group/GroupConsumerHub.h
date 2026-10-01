@@ -2,13 +2,14 @@
 //
 // CG-5 — GroupConsumerHub: manages all registered GroupConsumerImpl instances.
 //
-// Mirrors ProducerHub's atomic COW snapshot pattern (DR-BUG-1 discipline):
-//   - add() (cold path, app thread): allocates a new ImplList, publishes it
-//     with memory_order_release into snapshot_, retains old pointer in owned_.
-//   - Hot-path methods (runner thread): one snapshot_.load(acquire) → iterate.
-//     No locks, no refcount churn, no per-cycle heap allocation.
+// F8a — shared-nothing: the hub (its consumer list and every duty-side
+// GroupConsumerImpl field) is OWNED by the duty thread.  No COW snapshot, no
+// mutex, no atomics: app threads reach it only through HubCommands drained from
+// the agent command ring (applyCommand), and learn "finished" only through each
+// impl's status ring (closed when the consumer is closed or the Client closes).
 //
-// Duty-cycle entry points (runner thread):
+// Duty-cycle entry points (duty thread):
+//   applyCommand(cmd)               — GroupAdd / GroupCommit / GroupCommitSync / GroupClose
 //   doWork(nowNs, sessionId, sendFn) — heartbeat + autocommit + rejoin timers
 //   onRecords(rv)                   — route Records frame to assigned consumer
 //   onJoinGroupResponse(...)        — state machine: Joining → Syncing
@@ -17,32 +18,27 @@
 //   onOffsetCommitResponse(...)     — resolve commitSync promise
 //   onAssign(...)                   — inline assignment update (Assign frame 44)
 //   closeAll()                      — deactivate all consumers on Client::close()
-//
-// Threading:
-//   All hot-path methods are called exclusively on the runner/agent thread.
-//   add() acquires addMtx_ (cold path) and is the only app-thread writer.
 
 #pragma once
 
 #include <rune/client/group/GroupConsumer.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/detail/HubCommand.h>
 
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <vector>
 
 namespace rune::client::group {
 
-// Alias for the immutable consumer list (same COW pattern as ProducerHub).
+// The duty-thread-owned consumer list.
 using ImplList = std::vector<std::shared_ptr<GroupConsumerImpl>>;
 
 // SendFn: (ingressStreamId, buf, len) -> bool.
@@ -53,16 +49,7 @@ using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
 
 class GroupConsumerHub {
 public:
-    GroupConsumerHub() {
-        auto* empty = new ImplList{};
-        snapshot_.store(empty, std::memory_order_relaxed);
-        owned_.push_back(empty);
-    }
-
-    ~GroupConsumerHub() {
-        for (auto* p : owned_) delete p;
-        owned_.clear();
-    }
+    GroupConsumerHub() = default;
 
     // Non-copyable / non-movable.
     GroupConsumerHub(const GroupConsumerHub&) = delete;
@@ -70,10 +57,26 @@ public:
     GroupConsumerHub(GroupConsumerHub&&) = delete;
     GroupConsumerHub& operator=(GroupConsumerHub&&) = delete;
 
-    // ---- Registration (app thread, cold path) --------------------------------
+    // ---- Registration + commands (duty thread) --------------------------------
 
-    /// Register a new GroupConsumerImpl.  Thread-safe (under addMtx_).
+    /// Register a GroupConsumerImpl (duty thread; Client reaches it via
+    /// HubCommand{GroupAdd}).  Cold path.
     void add(std::shared_ptr<GroupConsumerImpl> impl);
+
+    /// Apply one group HubCommand drained from the agent ring.  Non-group ops
+    /// are ignored.  A command naming an impl this hub does not hold is
+    /// ignored (a commitSync promise it carries is failed, never dropped).
+    void applyCommand(const detail::HubCommand& cmd);
+
+    /// fix3 I3: the same command applied DIRECTLY on the duty thread by a
+    /// caller whose handle holds the impl (cmd.handle is dereferenced): acts on
+    /// the impl even before its GroupAdd (still in the ring) is adopted.
+    void applyCommandDirect(const detail::HubCommand& cmd);
+
+    /// fix3 M4: LeaveGroup frames the transport refused (GroupConsumer close),
+    /// retried every duty cycle; dropped on a session change.
+    [[nodiscard]] std::size_t pendingLeaves() const noexcept { return pendingLeaves_; }
+    int retryPendingLeaves(int64_t currentSessionId);
 
     // ---- Agent-thread duty cycle --------------------------------------------
 
@@ -124,10 +127,39 @@ public:
     /// Deactivate all consumers (send LeaveGroup where possible + fire onRevoked).
     void closeAll(int64_t sessionId, const SendFn& sendFn);
 
-    /// True if there are any registered consumers.
-    [[nodiscard]] bool empty() const noexcept {
-        return snapshot_.load(std::memory_order_acquire)->empty();
-    }
+    /// F8a fix2: duty-thread direct send on the default ingress publication for
+    /// OffsetCommit frames (plain fn pointer + ctx, set once before start).
+    using DirectSendFn = detail::SendResult (*)(void* ctx, const uint8_t* buf, std::size_t len);
+    void setDirectSend(DirectSendFn fn, void* ctx) noexcept { directSend_ = fn; directSendCtx_ = ctx; }
+
+    /// F8a fix2: send every requested commit now (duty cycle; a refused offer
+    /// keeps commitRequested set and is retried next cycle).  Requires the
+    /// direct send to be wired.
+    int flushRequestedCommits(int64_t sessionId);
+
+    /// F8a fix2 (IM-2): the session went down (Connected -> anything else):
+    /// fail every pending commitSync now — progress-driven, no timeout.
+    void onSessionDown();
+
+    /// F8a fix3 I2 (level-triggered session state, duty thread).  While not
+    /// connected: a commitSync applied is failed at once, and commits are not
+    /// offered.  Default true (hub-level tests have no session).
+    /// fix4 M5: called AT THE TRANSITION (the Client's ConnectResponse /
+    /// ErrorResponse handlers, before applying any hub command, and once per
+    /// duty cycle).  Leaving a connected (sessionId, episode) — going down, or
+    /// replaced by a new session / connect episode without ever being seen
+    /// down — fails every pending commitSync with SessionLostError.
+    void setSessionConnected(bool connected, int64_t sessionId = 0, int64_t episode = 0) noexcept;
+    [[nodiscard]] bool sessionConnected() const noexcept { return sessionConnected_; }
+    [[nodiscard]] bool hasPendingCommitSync() const noexcept;
+
+    /// fix1 I4: consumers whose generation snapshot a near-full status ring
+    /// refused; the duty cycle calls republishDirty() while non-zero.
+    [[nodiscard]] std::size_t dirtyCount() const noexcept { return dirtyCount_; }
+    int republishDirty();
+
+    /// True if there are no registered consumers (duty thread).
+    [[nodiscard]] bool empty() const noexcept { return impls_.empty(); }
 
     /// fix1 C1: onAssigned/onRevoked/onRecords run inside the noexcept
     /// ClientAgent::doWork chain (or, for closeAll's final onRevoked, inside
@@ -142,15 +174,50 @@ public:
     }
 
 private:
-    // ---- Wait-free snapshot pointer -----------------------------------------
-    std::atomic<const ImplList*> snapshot_{nullptr};
-
-    // ---- Retire list (cold path, under addMtx_) ----------------------------
-    std::vector<const ImplList*> owned_;
-    std::mutex addMtx_;
+    // ---- Registered consumers (duty-thread owned; never shrinks) -------------
+    ImplList impls_;
 
     // fix1 C1 / fix2 minor-5: plain counter (see testCallbackExceptionCount()).
     uint64_t callbackExceptions_ = 0;
+
+    // F8a fix1 C1: the consumer whose callback is running (null otherwise).
+    GroupConsumerImpl* dispatching_ = nullptr;
+    // F8a fix1 I6: correlationIds for commitSync's OffsetCommit (0 = untracked).
+    int64_t nextCommitCorrId_ = 1;
+    // F8a fix1 I4.
+    std::size_t dirtyCount_ = 0;
+    // F8a fix3 I2 / M4.
+    bool sessionConnected_ = true;
+    int64_t currentSessionId_ = 0;
+    int64_t sessionEpisode_   = 0;
+    std::size_t pendingLeaves_ = 0;
+    void applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl);
+    static std::size_t encodeLeave_(GroupConsumerImpl& impl, int64_t sessionId);
+    void sendLeave_(GroupConsumerImpl& impl);
+    // F8a fix2.
+    DirectSendFn directSend_    = nullptr;
+    void*        directSendCtx_ = nullptr;
+
+    /// RAII: marks impl as "callback running"; on exit, if the callback
+    /// finished the consumer, closes its status ring (now that no callback runs).
+    struct DispatchScope {
+        GroupConsumerHub&  hub;
+        GroupConsumerImpl& impl;
+        GroupConsumerImpl* prev;
+        DispatchScope(GroupConsumerHub& h, GroupConsumerImpl& i) noexcept;
+        ~DispatchScope();
+        DispatchScope(const DispatchScope&) = delete;
+        DispatchScope& operator=(const DispatchScope&) = delete;
+    };
+
+    enum class CommitSend : uint8_t { Nothing, Sent, SendFailed, Fatal };
+
+    static void failCommitSync_(GroupConsumerImpl& impl, const char* why);
+    static void failCommitSyncSessionLost_(GroupConsumerImpl& impl, const char* why);
+    int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
+    static void closeStatus_(GroupConsumerImpl& impl);
+    void toRejoining_(GroupConsumerImpl& impl);
+    void publishGeneration_(GroupConsumerImpl& impl);
 
     // ---- Internal helpers (runner thread only) ------------------------------
 
@@ -169,10 +236,12 @@ private:
                               int64_t sessionId,
                               const SendFn& sendFn);
 
-    /// Send OffsetCommit for impl's current positions (skips unseeded sentinel entries).
-    static void sendOffsetCommit(GroupConsumerImpl& impl,
-                                 int64_t sessionId,
-                                 const SendFn& sendFn);
+    /// Send OffsetCommit for impl's current positions (skips unseeded sentinel
+    /// entries) carrying `correlationId` (0 = no commitSync waits on it).
+    CommitSend sendOffsetCommit(GroupConsumerImpl& impl,
+                                       int64_t sessionId,
+                                       const SendFn& sendFn,
+                                       int64_t correlationId);
 
     /// Send OffsetFetch for all currently-assigned partitions to seed positions
     /// from the broker's committed offsets.  Called after entering Stable.
@@ -187,6 +256,13 @@ private:
     static void sendSubscribeForPartitions(GroupConsumerImpl& impl,
                                            int64_t sessionId,
                                            const SendFn& sendFn);
+
+    /// The registered impl whose address is `handle`, or nullptr.
+    GroupConsumerImpl* find_(uint64_t handle) const noexcept;
+
+    /// Deactivate impl: inactive, fail a pending commitSync with `why`, close
+    /// its status ring (deferred to the end of its running callback, if any).
+    void finish_(GroupConsumerImpl& impl, const char* why);
 
     /// Apply a new assignment to impl: fire revoked+assigned callbacks. Not
     /// static (fix1 C1): catches/counts a throwing callback via callbackExceptions_.

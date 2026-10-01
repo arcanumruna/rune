@@ -29,6 +29,29 @@ endif()
 option(BUILD_TESTING "Build tests" OFF)
 if(BUILD_TESTING)
     enable_testing()
+
+    # F8a shared-nothing guard: no std::atomic / mutex / lock / condition_variable
+    # / thread_local anywhere in src/ or include/ except the ring implementation's
+    # own memory ordering (M2ORingBuffer) and the TEMPORARY "SLICE-B" caps listed
+    # in scripts/check_no_atomics_or_mutexes.py.  Self-test first: pins that the
+    # detector still catches every banned shape and stays false-positive-free,
+    # independent of the current tree.
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(NOT Python3_Interpreter_FOUND)
+        message(FATAL_ERROR
+            "Python3 interpreter not found, but BUILD_TESTING=ON requires it for the "
+            "NoAtomicsOrMutexesGuardSelfTestRegression / "
+            "NoAtomicsOrMutexesOutsideAllowlistRegression ctests "
+            "(scripts/check_no_atomics_or_mutexes.py). Install Python3 or configure "
+            "with -DBUILD_TESTING=OFF.")
+    endif()
+    add_test(NAME NoAtomicsOrMutexesGuardSelfTestRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --selftest)
+    add_test(NAME NoAtomicsOrMutexesOutsideAllowlistRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
@@ -831,6 +854,7 @@ if(BUILD_TESTING)
     if(aeron_FOUND)
         add_executable(rune_subscriber_tests
             tests/subscriber/SubscriberTest.cpp
+            tests/subscriber/SubscriberHubCommandTest.cpp
         )
         target_include_directories(rune_subscriber_tests PRIVATE
             ${RUNE_PROTOCOL_INCLUDE}
@@ -938,8 +962,10 @@ if(BUILD_TESTING)
             tests/producer/DirectIngressTest.cpp
             tests/producer/ProducerFlushDirtyTest.cpp
             tests/detail/M2ORingBufferTest.cpp
+            tests/detail/OneToOneRingBufferTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/shard/ShardConfigTest.cpp
+            tests/client/HubCommandClientTest.cpp
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

@@ -13,6 +13,7 @@
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/OffsetMessages.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -74,8 +75,23 @@ struct InvokerGateway {
     // Acks sent immediately BEFORE the next ConnectResponse, from the same
     // publication, so the client receives [ack..., ConnectResponse] in one poll.
     std::vector<Produced> ackBeforeNextConnect;
+    // F8a fix4: Records pushed immediately AFTER the next ConnectResponse, from
+    // the same publication, so the client receives [ConnectResponse, Records...]
+    // in one poll.  Element: (subscription, baseOffset).
     int connects = 0;
     int metadataRequests = 0;
+    // F8a: direct subscriptions (Subscribe -> SubscribeResponse; Records pushes).
+    struct Subscribed { int64_t subscriptionId; int32_t topicId; int32_t partition; int64_t sessionId; };
+    std::vector<Subscribed> subscribed;
+    std::vector<int64_t>    unsubscribed;  // subscriptionIds
+    std::vector<std::pair<Subscribed, int64_t>> recordsAfterNextConnect;
+    int64_t nextSubscriptionId = 500;
+    // F8a fix2: stop consuming client ingress (the client's publication then
+    // back-pressures once its term window is full).
+    bool pauseIngress = false;
+    int  pings        = 0;
+    std::vector<std::vector<uint8_t>> offsetCommits;  // raw OffsetCommit frames received
+    bool replyOffsetCommits = true;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -132,8 +148,10 @@ struct InvokerGateway {
                 ++i;
             }
         }
-        for (auto& ep : endpoints) {
-            if (ep->sub) work += ep->sub->poll(ep->assembler->handler(), 16);
+        if (!pauseIngress) {
+            for (auto& ep : endpoints) {
+                if (ep->sub) work += ep->sub->poll(ep->assembler->handler(), 16);
+            }
         }
         return work;
     }
@@ -185,6 +203,19 @@ struct InvokerGateway {
         send(pr.endpoint, buf, n);
     }
 
+    /// Push one Records frame of `count` records at baseOffset to a subscription.
+    void pushRecords(const Subscribed& sub, int64_t baseOffset, int32_t count) {
+        namespace rcc = rune::client::codec;
+        rune::protocol::RecordBatchBuilder b(baseOffset, 1'000'000);
+        for (int32_t i = 0; i < count; ++i) b.append("k", "v", 1'000'000 + i);
+        const std::vector<uint8_t> batch = b.build();
+        std::vector<uint8_t> out(batch.size() + 256);
+        const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId,
+                                                 sub.topicId, sub.partition, baseOffset,
+                                                 std::span<const uint8_t>(batch), sub.sessionId, 0);
+        send(0, out.data(), n);
+    }
+
     void releaseHeld() {
         std::vector<Produced> h;
         h.swap(held);
@@ -217,6 +248,8 @@ private:
                 out, sizeof out, static_cast<int16_t>(rcc::ErrorCode::OK), 0, assignedSessionId,
                 c->sessionId, c->correlationId);
             send(0, out, n);
+            for (const auto& [sub, base] : recordsAfterNextConnect) pushRecords(sub, base, 1);
+            recordsAfterNextConnect.clear();
             return;
         }
         case rcc::TemplateId::MetadataRequest: {
@@ -239,6 +272,39 @@ private:
                 return;
             }
             ack(pr);
+            return;
+        }
+        case rcc::TemplateId::Subscribe: {
+            const auto sv = rcc::decodeSubscribe(buf, len);
+            if (!sv) return;
+            const Subscribed sub{nextSubscriptionId++, sv->topicId, sv->partition, sv->sessionId};
+            subscribed.push_back(sub);
+            uint8_t out[64];
+            const std::size_t n = rcc::encodeSubscribeResponse(
+                out, sizeof out, 0, sv->partition, sub.subscriptionId, sv->sessionId,
+                sv->correlationId);
+            send(0, out, n);
+            return;
+        }
+        case rcc::TemplateId::Ping: {
+            ++pings;
+            return;
+        }
+        case rcc::TemplateId::OffsetCommit: {
+            offsetCommits.emplace_back(buf, buf + len);
+            const auto oc = rp::OffsetCommit::decode(buf, len);
+            if (!oc || !replyOffsetCommits) return;
+            rp::OffsetCommitResponse rsp;
+            rsp.sessionId     = oc->sessionId;
+            rsp.correlationId = oc->correlationId;
+            std::vector<uint8_t> out(rp::OffsetCommitResponse::encodedSizeFor(0));
+            const std::size_t n = rsp.encode(out.data(), {});
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::Unsubscribe: {
+            const auto uv = rcc::decodeUnsubscribe(buf, len);
+            if (uv) unsubscribed.push_back(uv->subscriptionId);
             return;
         }
         default:

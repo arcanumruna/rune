@@ -3,44 +3,65 @@
 // CG-5 — Consumer-group API: GroupConsumer + GroupConfig.
 // Namespace: rune::client
 //
-// Threading model:
+// Threading model (F8a — shared-nothing, no mutex, no atomics):
 //   - All state-machine transitions (join/sync/stable/rejoin), Records routing,
-//     heartbeat, and auto-commit duty-cycle run on the RUNNER (agent) thread.
+//     heartbeat, and auto-commit duty-cycle run on the RUNNER (duty) thread,
+//     which OWNS the GroupConsumerHub and every duty-side GroupConsumerImpl field.
 //   - App thread only calls: onAssigned/onRevoked/onRecords (setup-phase
-//     callback registration), commit(), commitSync(), and close().
-//   - commit() / commitSync() are wait-free from the app thread: they enqueue a
-//     commit request via an atomic flag + position snapshot (no lock on hot path).
-//   - GroupConsumer registration in Client uses the same ProducerHub-style
-//     atomic COW snapshot (GroupConsumerHub) — no locks on the runner hot path.
+//     callback registration), commit(), commitSync(), close() and active().
+//   - commit() / commitSync() / close() hand a HubCommand to the duty thread
+//     through the agent command ring; commitSync()'s promise is owned and
+//     resolved by the duty thread.  subscribeGroup() registers the impl the
+//     same way (HubCommand{GroupAdd}) — the hub's consumer list is single-owner.
+//   - The duty thread signals "this consumer is finished" (close(), or the
+//     Client closed) by closing the impl's status ring; the handle checks it
+//     and then never touches the Client again.
 //
 // Public API:
 //   GroupConsumer& Client::subscribeGroup(groupId, topics, GroupConfig)
 //   gc.onAssigned(fn)  — called on runner thread when partitions are assigned
 //   gc.onRevoked(fn)   — called on runner thread when partitions are revoked
 //   gc.onRecords(fn)   — called on runner thread when records arrive (assigned partitions)
-//   gc.commit()        — async, enqueues commit of current positions (wait-free)
+//   gc.commit()        — async: a commit command for the duty thread
 //   gc.commitSync()    — returns a future resolved when OffsetCommitResponse arrives
-//   gc.close()         — deactivate (idempotent, any thread)
+//   gc.close()         — deactivate (idempotent; the handle's owner thread)
 
 #pragma once
 
 #include <rune/client/subscriber/Subscription.h>  // TopicPartition, Record types
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/detail/HubCommand.h>
+#include <rune/client/detail/StatusRing.h>
 
 #include <rune/protocol/client/OffsetMessages.h>  // OffsetCommitEntry (for commitEntriesScratch)
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace rune::client {
+
+// ---------------------------------------------------------------------------
+// SessionLostError — F8a fix4 M6: commitSync() failed because the session to
+// the broker was lost (it went down, or a new session / connect episode
+// replaced the one the commit was sent on) or was down when commitSync() was
+// applied.  The commit's fate is UNKNOWN (it may or may not have been
+// applied).  RETRIABLE: wait for the next onAssigned (the consumer rejoins
+// after the reconnect and re-seeds its positions), then commit again.  Every
+// other commitSync failure (closed, superseded, rejoin, broker error code) is
+// a plain std::runtime_error.
+// ---------------------------------------------------------------------------
+class SessionLostError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // ---------------------------------------------------------------------------
 // TopicPartition — (topicId, partition) pair used in assignments.
@@ -106,10 +127,23 @@ enum class GroupConsumerState : uint8_t {
 };
 
 // ---------------------------------------------------------------------------
-// GroupConsumerImpl — internal state owned by Client (heap-allocated,
-// shared_ptr between GroupConsumer handle and GroupConsumerHub routing table).
+// GroupConsumerStatus — duty thread -> app handle snapshot (fix1 I2: the
+// assignment generation reaches app threads only through the status ring).
+// ---------------------------------------------------------------------------
+struct GroupConsumerStatus {
+    int32_t generationId = 0;
+    int32_t reserved     = 0;
+};
+
+// ---------------------------------------------------------------------------
+// GroupConsumerImpl — internal state (heap-allocated, shared_ptr between the
+// GroupConsumer handle and the GroupConsumerHub's consumer list).
 //
-// RUNNER-THREAD WRITES; APP-THREAD reads only via wait-free atomic accessors.
+// F8a ownership: config is written by the app thread BEFORE the GroupAdd
+// command is put on the agent ring (publishing it); EVERYTHING else — callbacks
+// included (fix1 I1: the setters travel as GroupSetCallback commands) — is
+// owned by the duty thread.  The app thread reads only `status` (the ring's own
+// memory ordering is the only synchronisation).
 // ---------------------------------------------------------------------------
 struct GroupConsumerImpl {
     // ---- Config (immutable after construction) --------------------------------
@@ -117,57 +151,59 @@ struct GroupConsumerImpl {
     std::vector<int32_t>     topicIds;     // resolved from topic names on creation
     GroupConfig              cfg;
 
-    // ---- Callbacks (set at setup time; read on runner thread) ----------------
+    // ---- Callbacks (duty thread; installed by GroupSetCallback commands) ------
     std::function<void(std::vector<TopicPartition>)> cbAssigned;
     std::function<void(std::vector<TopicPartition>)> cbRevoked;
     std::function<void(const RecordSet&)>             cbRecords;
 
-    // ---- State machine (runner thread only) ----------------------------------
+    // ---- State machine (duty thread only) -------------------------------------
     GroupConsumerState                  state        {GroupConsumerState::Unjoined};
     std::string                         memberId;      // assigned by broker; empty = new
     int32_t                             generationId {0};
 
     // Current assignment: partition → nextOffset to commit.
-    // Written only on the runner thread.
     // Sentinel value -1 means "position not yet seeded from OffsetFetch".
     // sendOffsetCommit MUST skip any entry whose value is kUnseededSentinel.
     static constexpr int64_t kUnseededSentinel = -1;
     std::map<TopicPartition, int64_t>   assignment;   // topicPartition → nextOffset (or sentinel)
 
-    // ---- Timers (runner thread) ----------------------------------------------
+    // ---- Timers (duty thread) -------------------------------------------------
     std::chrono::steady_clock::time_point nextHeartbeat;
     std::chrono::steady_clock::time_point nextAutoCommit;
     std::chrono::steady_clock::time_point joinDeadline;  // for rejoin backoff guard
 
-    // ---- Send scratch buffers (runner thread, zero-alloc hot path) -----------
-    // Reused on every heartbeat / join / sync / commit send.
+    // ---- Send scratch buffers (duty thread, zero-alloc hot path) --------------
     std::vector<uint8_t> sendBuf;
-    // Reusable OffsetCommit entries scratch — avoids per-commit heap allocation.
-    // Only accessed on the runner thread; no locking needed.
     std::vector<rune::protocol::client::OffsetCommitEntry> commitEntriesScratch;
 
-    // ---- Wait-free commit request from app thread ---------------------------
-    // commitRequested_ is set (release) by the app thread's commit().
-    // Runner thread clears it (acquire) and sends OffsetCommit.
-    std::atomic<bool> commitRequested {false};
+    // ---- Commit requests (duty thread; set by GroupCommit/GroupCommitSync) ----
+    bool commitRequested {false};
+    // The in-flight commitSync() promise (null = none).  Owned by the duty
+    // thread — no lock.  Resolved by the OffsetCommitResponse whose
+    // correlationId == commitSyncCorrId (error code checked); failed when
+    // superseded, on close, on rejoin, or on session loss once sent.
+    std::unique_ptr<std::promise<void>> commitSyncPromise;
+    int64_t commitSyncCorrId {0};   // 0 = its OffsetCommit not sent yet
 
-    // commitSyncPending_: if true, runner must resolve commitSyncPromise_ after
-    // the next OffsetCommitResponse.
-    // Access: commitSyncMtx_ guards promise + flag (rare cold path).
-    std::mutex              commitSyncMtx;
-    bool                    commitSyncPending {false};
-    std::promise<void>      commitSyncPromise;
+    // A generation snapshot the near-full status ring refused (fix1 I4).
+    bool statusDirty {false};
 
-    // ---- Liveness ------------------------------------------------------------
-    // active: cleared by close() (any thread); runner checks before dispatching.
-    std::atomic<bool> active {true};
+    // fix3 M4: a LeaveGroup the transport refused, retried per duty cycle.
+    bool    leavePending {false};
+    int64_t leaveSessionId {0};
+
+    // ---- Liveness (duty thread) -----------------------------------------------
+    bool active {true};
+
+    // ---- Duty thread -> app handle ------------------------------------------------
+    detail::StatusRing<GroupConsumerStatus, 256> status;
 
     // ---- Construction --------------------------------------------------------
     GroupConsumerImpl() {
         sendBuf.resize(4096);  // pre-allocate scratch (avoids per-send allocation)
     }
 
-    // Non-copyable / non-movable (shared_ptr ownership + atomics).
+    // Non-copyable / non-movable (shared_ptr ownership; the ring is pinned).
     GroupConsumerImpl(const GroupConsumerImpl&) = delete;
     GroupConsumerImpl& operator=(const GroupConsumerImpl&) = delete;
     GroupConsumerImpl(GroupConsumerImpl&&) = delete;
@@ -178,17 +214,39 @@ struct GroupConsumerImpl {
 // GroupConsumer — user-facing handle returned by Client::subscribeGroup().
 //
 // Threading:
-//   - Callback setters (onAssigned/onRevoked/onRecords) are SETUP PHASE ONLY
-//     (must be called before the first connect() — same contract as Client
-//     lifecycle callbacks).
-//   - commit() / commitSync() are safe from any thread (wait-free flag).
-//   - close() is safe from any thread (atomic store).
-//   - The handle is movable (unique ownership, like Subscription).
+//   - Callback setters (onAssigned/onRevoked/onRecords) are SETUP PHASE: call
+//     them before connect().  Each travels to the duty thread as a command (the
+//     callback is installed there, in ring order — before the connect), so the
+//     duty-owned std::functions are never written from an app thread.
+//   - The handle is OWNED by one app thread at a time (move-only, like
+//     Subscription): its app-side methods must not be called concurrently.
+//   - Calls from INSIDE a callback (duty thread, Thread mode) are allowed:
+//     commit() / close() / active() / generation() act directly on duty-owned
+//     state.  commitSync() there throws std::logic_error (its future could
+//     never resolve while the callback blocks the duty thread) — use commit().
+//   - finished(): the duty side is done with this consumer — no further
+//     callback will run.  A finished handle never touches the Client again, so
+//     a handle may outlive its Client (not be used CONCURRENTLY with its
+//     destruction); commitSync() then returns an already-failed future.
+//   - HANDLE LIFETIME (fix4 M6): the handle must NOT be destroyed, moved from
+//     or moved into while ANY thread may still be calling it — its owner app
+//     thread, or a runner callback (onAssigned / onRevoked / onRecords calling
+//     commit() / close() on it).  The direct (duty-thread) path acts on the
+//     impl through the caller's handle for the whole call; a concurrent
+//     destroy/move is a data race on the handle itself.
 // ---------------------------------------------------------------------------
 class GroupConsumer {
 public:
-    // Constructed by Client::subscribeGroup().
-    explicit GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl) noexcept;
+    using AssignmentCallback = std::function<void(std::vector<TopicPartition>)>;
+    using RecordsCallback    = std::function<void(const RecordSet&)>;
+
+    /// Constructed by Client::subscribeGroup().  `sink`/`sinkCtx` deliver the
+    /// handle's commands to the duty thread.  `dutyThread`: the Thread-mode
+    /// runner (calls from it take the duty path); default id disables that.
+    GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl,
+                  detail::HubCommandSink             sink,
+                  void*                              sinkCtx,
+                  std::thread::id                    dutyThread = {}) noexcept;
 
     ~GroupConsumer();
 
@@ -201,51 +259,77 @@ public:
     // ---- Callback registration (SETUP PHASE: call before connect()) ----------
 
     /// Called on the runner thread when the broker assigns partitions.
-    void onAssigned(std::function<void(std::vector<TopicPartition>)> cb);
+    void onAssigned(AssignmentCallback cb);
 
     /// Called on the runner thread when the broker revokes partitions.
-    void onRevoked(std::function<void(std::vector<TopicPartition>)> cb);
+    void onRevoked(AssignmentCallback cb);
 
     /// Called on the runner thread when records arrive for assigned partitions.
-    void onRecords(std::function<void(const RecordSet&)> cb);
+    void onRecords(RecordsCallback cb);
 
-    // ---- Async commit API (safe from any thread) ----------------------------
+    // ---- Commit API ----------------------------------------------------------
 
-    /// Enqueue a commit of current per-partition positions (wait-free from app
-    /// thread).  The commit is sent on the runner thread on the next duty cycle.
-    /// At-least-once: only positions of records already delivered via onRecords
-    /// are committed.
+    /// Ask the duty thread to commit the current per-partition positions (sent
+    /// on a following duty cycle once Stable).  At-least-once: only positions
+    /// of records already delivered via onRecords are committed.  No-op once
+    /// finished.  App thread: throws only if the command ring stays full past
+    /// the bounded wait.
     void commit();
 
-    /// Submit a commit and return a future resolved when the broker acknowledges
-    /// the OffsetCommitResponse (or when close() is called).
+    /// Commit and return a future that resolves when the broker acknowledges
+    /// THIS commit (OffsetCommitResponse matched by correlationId, error codes
+    /// checked — a failed commit throws from get()), or resolves at once when
+    /// there is nothing to commit.  It fails when superseded by a newer
+    /// commitSync(), on close(), on a group rejoin, or when the Client closes
+    /// (std::runtime_error).
+    /// SESSION LOSS (fix4 M6) throws rune::client::SessionLostError (a
+    /// std::runtime_error): the session to the broker went DOWN (the session
+    /// machine's own liveness verdict — no timeout of its own), a new session
+    /// or connect episode replaced the one its commit was sent on, or the
+    /// session was already down when commitSync() was applied.  The commit's
+    /// fate is unknown; it is RETRIABLE — retry after the next onAssigned
+    /// (the consumer rejoins after the reconnect).
+    /// An OffsetCommit the transport transiently refuses is retried every duty
+    /// cycle; one it can never carry (Fatal) fails the commitSync at once.
+    /// Waiting: Thread mode — get() from an app thread.  Invoker mode — keep
+    /// calling Client::doWork() until it is ready.  NEVER from inside a duty-
+    /// cycle callback: commitSync() throws std::logic_error there.
     std::future<void> commitSync();
 
-    /// Deactivate this consumer: no more dispatch occurs.  Idempotent, any thread.
+    /// Deactivate this consumer: no more dispatch occurs, a pending commitSync
+    /// fails.  Idempotent.  Delivery is guaranteed (a full command ring is
+    /// waited out on duty-thread progress, never a timeout); never throws.
     void close();
 
-    /// True if the consumer is still active.
+    /// True until close(), or until the duty side finished the consumer.
     [[nodiscard]] bool active() const noexcept;
 
-    /// Current assignment generation as last set by the broker
-    /// (JoinGroupResponse / Assign).  Increments on every rebalance.
-    ///
-    /// THREADING: generationId is written on the runner thread (during
-    /// JoinGroupResponse / Assign handling) and MUST only be read from the
-    /// runner thread — i.e. from inside an onAssigned / onRevoked / onRecords
-    /// callback, which is exactly where the generation of the current
-    /// assignment/record is meaningful.  Reading it from the app thread is a
-    /// data race and is not supported.
+    /// True once the duty side finished this consumer: no further callback
+    /// (onAssigned / onRevoked / onRecords) will run.
+    [[nodiscard]] bool finished() const noexcept;
+
+    /// Current assignment generation (JoinGroupResponse / Assign).  Inside a
+    /// callback: the duty thread's live value.  On the owning app thread: the
+    /// latest generation the duty thread published (eventually consistent).
     [[nodiscard]] int32_t generation() const noexcept;
 
-    /// Access the raw impl (for hub wiring — not part of user API).
-    [[nodiscard]] std::shared_ptr<GroupConsumerImpl> impl() const noexcept {
-        return impl_;
-    }
-
 private:
+    [[nodiscard]] bool onDutyThread_() const noexcept {
+        return dutyThread_ != std::thread::id{} && std::this_thread::get_id() == dutyThread_;
+    }
+    /// Submit `cmd` unless the consumer is already finished.  Returns the
+    /// sink's verdict (Closed when finished / no sink).
+    detail::HubSubmit submit_(const detail::HubCommand& cmd);
+    template <class Fn>
+    void setCallback_(int which, Fn cb);
+
     std::shared_ptr<GroupConsumerImpl> impl_;
-    bool moved_ = false;
+    detail::HubCommandSink             sink_    = nullptr;
+    void*                              sinkCtx_ = nullptr;
+    std::thread::id                    dutyThread_{};
+    bool moved_  = false;
+    bool closed_ = false;   // handle-local (app-owned): close() was called
+    mutable GroupConsumerStatus cache_{};  // app-owned: last drained status snapshot
 };
 
 } // namespace rune::client

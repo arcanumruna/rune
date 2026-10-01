@@ -34,6 +34,7 @@
 
 #include <concurrent/AtomicBuffer.h>
 #include <rune/client/detail/FlatIndexMap.h>
+#include <rune/client/detail/HubCommand.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
 #include <atomic>
@@ -254,10 +255,17 @@ public:
     /// std::shared_ptr<TransactionalProducerImpl>* adopted on the duty-cycle thread.
     bool submitRegisterTxnProducer(void* holder) noexcept;
 
+    /// F8a: hand a subscriber / group-consumer command to the duty thread
+    /// (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty thread drains it
+    /// and invokes the hub-command hook.  Returns false if the ring is full.
+    bool submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept;
+
     /// close() path, single-threaded (runner joined / Invoker owner): drain the
     /// WHOLE command ring once, adopting producer + txn-producer registrations
-    /// through their hooks (so their holders are freed and the owner can fail
-    /// them) and dropping every other command (sends carry no completion).
+    /// and applying F8a hub commands through their hooks (so their holders are
+    /// freed and the owner can fail them — a commitSync promise or subscribe
+    /// still in the ring is never stranded) and dropping every other command
+    /// (sends carry no completion).
     ///
     /// fix5 Important-2(c): always terminates. If the drain makes no progress
     /// for kCloseDrainUnblockAfterYields consecutive yields (stuck behind a
@@ -424,6 +432,42 @@ public:
         txnProducerRegisterFn_ = std::move(fn);
     }
 
+    /// F8a fix2: control frames dropped because their session no longer exists,
+    /// and ring-drained frames the transport refused (each retried later).
+    /// Duty thread only (or after the runner is joined).
+    [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
+    [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
+    [[nodiscard]] uint64_t ingressFatalDropped() const noexcept { return ingressFatalDropped_; }
+    /// F8a fix3: the transport's max frame length (immutable; any thread).
+    [[nodiscard]] std::size_t maxFrameLength() const noexcept {
+        const std::size_t m = transport_.maxMessageLength();
+        return (testMaxFrameCap_ != 0 && testMaxFrameCap_ < m) ? testMaxFrameCap_ : m;
+    }
+    /// fix4 test seam (Invoker tests, owner thread only — a plain field):
+    /// cap maxFrameLength() below the transport's (0 = uncapped).
+    void testCapMaxFrameLength(std::size_t cap) noexcept { testMaxFrameCap_ = cap; }
+    /// fix3 test seam (duty thread): the next `n` ring-drained kMsgSend offers
+    /// return `r` instead of reaching the transport.
+    void testForceIngressOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
+        testForcedOffer_ = r;
+        testForcedOffers_ = n;
+    }
+
+    /// F8a fix2/fix4: duty-thread direct send on the default ingress
+    /// publication (the one kMsgSend frames use) — for frames whose owner
+    /// retries them itself instead of going through the ring.  Returns the
+    /// 3-way verdict: Retry = transiently refused (the owner retries), Fatal =
+    /// never deliverable (counted in ingressFatalDropped, rate-limited log; the
+    /// owner drops it).  Honours testForceIngressOffers.
+    transport::AeronTransport::OfferResult offerDefault(const uint8_t* buf, std::size_t len) noexcept;
+
+    /// F8a: hook invoked (duty thread, or close()'s drain) for every drained
+    /// kMsgHubCommand.  Set before start().  Cold path (control-plane commands).
+    using HubCommandFn = std::function<void(const ::rune::client::detail::HubCommand&)>;
+    void setHubCommandFn(HubCommandFn fn) noexcept {
+        hubCommandFn_ = std::move(fn);
+    }
+
     // -------------------------------------------------------------------------
     // Observers
     // -------------------------------------------------------------------------
@@ -534,6 +578,7 @@ private:
     static constexpr int32_t kMsgReconnect  = 5; // CB-5 B: force fresh reconnect
     static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
     static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
+    static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
     static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
@@ -675,6 +720,18 @@ private:
     ProduceResendFn    produceResendFn_;    // Task 1.4: fired on session-connect (multi-node)
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
     ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
+    HubCommandFn       hubCommandFn_;          // F8a subscriber / group-consumer commands
+    // F8a fix2: duty-thread counters for the kMsgSend drain rule (plain; read
+    // only on the duty thread / after the runner is joined).
+    uint64_t staleFramesDropped_  = 0;
+    uint64_t ingressOfferRefused_ = 0;
+    uint64_t ingressFatalDropped_ = 0;
+    // fix3 test seam: force the next N ring-drained offers' verdicts.
+    int testForcedOffers_ = 0;
+    transport::AeronTransport::OfferResult testForcedOffer_ = transport::AeronTransport::OfferResult::Accepted;
+    std::size_t testMaxFrameCap_ = 0;  // fix4 test seam (0 = uncapped)
+    transport::AeronTransport::OfferResult offerIngress_(const uint8_t* buf, std::size_t len) noexcept;
+    void noteFatalDrop_(std::size_t len) noexcept;
 
     // fix3 I1: test-only observability hook for drainRegistrationsForClose()'s
     // wait loop (see testSetCloseDrainYieldHook()). Empty by default.

@@ -287,6 +287,25 @@ public:
     /// every dutyCycle(), inside its in-cycle guard (nullptr = none). A throwing
     /// fn simulates a duty cycle that throws.
     void testSetDutyCycleHook(void (*fn)()) noexcept { testDutyCycleHook_ = fn; }
+    /// F8a fix2 test hooks (duty thread / owner in Invoker mode only).
+    [[nodiscard]] uint64_t testIngressOfferRefused() const noexcept { return agent_.ingressOfferRefused(); }
+    [[nodiscard]] uint64_t testStaleFramesDropped() const noexcept { return agent_.staleFramesDropped(); }
+    [[nodiscard]] std::size_t testPendingUnsubscribes() const noexcept { return subscriberHub_.pendingUnsubscribes(); }
+    [[nodiscard]] uint64_t testIngressFatalDropped() const noexcept { return agent_.ingressFatalDropped(); }
+    [[nodiscard]] bool testGroupHubEmpty() const noexcept { return groupConsumerHub_.empty(); }
+    [[nodiscard]] std::size_t testUnsentSubscribes() const noexcept { return subscriberHub_.unsentSubscribes(); }
+    [[nodiscard]] std::size_t testMaxFrameLength() const noexcept { return agent_.maxFrameLength(); }
+    /// fix4 test seam (Invoker, owner thread only): cap the max frame length.
+    void testCapMaxFrameLength(std::size_t cap) noexcept { agent_.testCapMaxFrameLength(cap); }
+    void testForceIngressOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
+        agent_.testForceIngressOffers(r, n);
+    }
+    /// F8a fix1 test hook: called on the submitting thread each time a
+    /// lifecycle hub command (unsubscribe / GroupConsumer close) finds the
+    /// command ring full and waits for duty-thread progress.  Set before use.
+    void testSetHubCommandRingFullHook(std::function<void()> fn) {
+        testHubCommandRingFullHook_ = std::move(fn);
+    }
     /// Test hook (duty-cycle thread only): install a partition route as metadata would.
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
@@ -470,8 +489,15 @@ public:
     ///   - The handler fires on the RUNNER (agent) thread.  Must NOT block.
     ///   - The record spans (key, value) are zero-copy views into the Aeron
     ///     buffer, valid ONLY during the handler call.  Copy data to retain it.
-    ///   - unsubscribe() / Subscription dtor are safe from any thread.
-    ///   - Do NOT call unsubscribe() from inside the handler.
+    ///   - unsubscribe() / the Subscription dtor (owning thread, or from inside
+    ///     the handler) have guaranteed delivery; wait for finished() to know no
+    ///     handler call can run any more (then position() is final).
+    ///   - After close(): returns an already-finished Subscription (active() and
+    ///     finished() report it at once; nothing is submitted).
+    ///   - Throws std::length_error (nothing submitted) if the Subscribe frame
+    ///     can never be carried by the transport (over its max message length).
+    ///     A Subscribe the transport later rejects permanently (Fatal) finishes
+    ///     the Subscription instead (finished() turns true, never bound).
     ///
     /// Demand / back-pressure: default is broker-paced push (the broker pauses
     /// when egress back-pressure applies, per GB-3).
@@ -534,11 +560,12 @@ public:
     /// broker's server-side subscription and routed through onRecords.
     ///
     /// Threading:
-    ///   - subscribeGroup() is called on the APP thread (setup phase, before
-    ///     connect() or right after — same contract as producer()).
+    ///   - subscribeGroup() and the handle's callback setters are called on the
+    ///     APP thread in the setup phase, BEFORE connect() (the setters travel
+    ///     to the duty thread as commands, in ring order ahead of the connect).
     ///   - onAssigned / onRevoked / onRecords callbacks fire on the RUNNER thread.
-    ///   - commit() / commitSync() are wait-free from the APP thread.
-    ///   - close() on the handle is safe from any thread.
+    ///   - commit() / commitSync() / close() on the handle are commands for
+    ///     the duty thread (agent command ring; F8a — no shared state).
     ///
     /// topicNames are resolved against ClientConfig::topics.  Topics not found
     /// in the static list are silently skipped (topicId lookup fails).
@@ -641,6 +668,38 @@ private:
     /// wait instead.
     static producer::PumpResult pumpTrampoline_(void* ctx);  // fix1 I2: may throw (dutyCycle)
 
+    /// F8a: HubCommandSink bound to every Subscription / GroupConsumer handle
+    /// (ctx = this).  Submits the command on the agent ring with
+    /// submitRegistration_'s bounded back-pressure, plus the same post-submit
+    /// close() re-check as producer() (see detail::HubSubmit).
+    static detail::HubSubmit hubCommandTrampoline_(void* ctx, const detail::HubCommand& cmd);
+    /// F8a fix3: the error for a failed submitSend (oversize vs ring full).
+    [[nodiscard]] std::exception_ptr submitError_(const char* what, std::size_t frameLen) const;
+    /// F8a fix2: duty-thread direct send on the default ingress publication.
+    static detail::SendResult directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
+    /// F8a fix2: last observed seed-session state (duty thread only).
+    session::SessionState lastSeedState_ = session::SessionState::Disconnected;
+    // fix4 M5: the last (state, sessionId, connect episode) of the seed session
+    // the hubs were told about (duty thread only).
+    int64_t lastSeedSessionId_ = 0;
+    int64_t lastSeedEpisode_   = 0;
+    /// fix4 I-1/M5: tell both hubs the seed session's current (connected,
+    /// sessionId, episode) if it changed since the last call.  Called AT the
+    /// transition points: the ConnectResponse / ErrorResponse handlers (before
+    /// any resend or callback of that poll), before applying any hub command,
+    /// and once per duty cycle (step 3c).  Duty thread only; O(1) when unchanged.
+    void syncSeedSession_() noexcept;
+    /// F8a: apply one hub command on the duty thread (ring drain, close drain,
+    /// or directly when a handle is used on the duty thread).
+    void applyHubCommand_(const detail::HubCommand& cmd);
+    /// fix3 I3: the duty-thread DIRECT application (acts on the impl).
+    void applyHubCommandDirect_(const detail::HubCommand& cmd);
+    /// The thread whose handle calls take the duty path: the Thread-mode runner;
+    /// none in Invoker mode (the owner is both app and duty thread).
+    [[nodiscard]] std::thread::id handleDutyThread_() const noexcept {
+        return cfg_.runnerMode == RunnerMode::Thread ? dutyThreadId_ : std::thread::id{};
+    }
+
     /// Setup-phase ring submit, bounded (5 s).  Invoker mode runs the duty cycle
     /// between attempts — this thread IS the ring's consumer; thread mode parks
     /// 100 µs.  On timeout runs `onFail` and throws.
@@ -730,6 +789,7 @@ private:
     // Task 14 fix1 I2 test hook: called at the top of every dutyCycle() (inside
     // the in-cycle guard). Plain function pointer, duty-cycle thread only.
     void (*testDutyCycleHook_)() = nullptr;
+    std::function<void()> testHubCommandRingFullHook_;  // F8a fix1; empty by default
     std::thread       runnerThread_;
 
     // ---- Callback-contract guard (FIX F4) ------------------------------------
@@ -795,12 +855,15 @@ private:
     std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnProducers_;
 
     // ---- CB-4: SubscriberHub -------------------------------------------------
-    // Owned by Client.  subscribe() / onEgressFrame() / close() all access it.
+    // Duty-thread owned (F8a): subscribe()/unsubscribe() reach it via the agent ring.
     subscriber::SubscriberHub subscriberHub_;
 
     // ---- CG-5: GroupConsumerHub ---------------------------------------------
-    // Owned by Client.  subscribeGroup() / onEgressFrame() / close() access it.
+    // Duty-thread owned (F8a): subscribeGroup() registers through the agent ring.
     group::GroupConsumerHub groupConsumerHub_;
+    // subscribeGroup()'s one-group-per-Client guard (app side; setup phase —
+    // the hub itself is duty-thread owned and is never read by an app thread).
+    bool groupSubscribed_ = false;
 
     // ---- CB-5 B: data-op leader-redirect state -------------------------------
     // Task 1.1: the redirect latch (redirectPending) and the current-leader

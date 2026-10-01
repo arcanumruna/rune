@@ -93,7 +93,25 @@ int AeronTransport::dutyCycle() noexcept {
 
 AeronTransport::AeronTransport(TransportConfig cfg)
     : cfg_(std::move(cfg))
+    , maxMessageLength_(computeMaxMessageLength(cfg_))
 {}
+
+std::size_t AeronTransport::computeMaxMessageLength(const TransportConfig& c) noexcept {
+    std::size_t term = c.termBufferLength;
+    const std::string key = "term-length=";
+    const auto pos = c.ingressChannel.find(key);
+    if (pos != std::string::npos) {
+        std::size_t v = 0;
+        for (std::size_t i = pos + key.size();
+             i < c.ingressChannel.size() && c.ingressChannel[i] >= '0' && c.ingressChannel[i] <= '9'; ++i) {
+            v = v * 10 + static_cast<std::size_t>(c.ingressChannel[i] - '0');
+        }
+        if (v != 0 && v < term) term = v;
+    }
+    constexpr std::size_t kAeronMaxMessage = 16u * 1024 * 1024;  // AERON_FRAME_MAX_MESSAGE_LENGTH cap
+    const std::size_t m = term / 8;
+    return m < kAeronMaxMessage ? m : kAeronMaxMessage;
+}
 
 AeronTransport::~AeronTransport() {
     stop();
@@ -235,10 +253,21 @@ void AeronTransport::stop() noexcept {
 // offerToPub — shared implementation for default and per-worker offer paths
 // ---------------------------------------------------------------------------
 
-bool AeronTransport::offerToPub(aeron::ExclusivePublication& pub,
-                                 const uint8_t* buf,
-                                 std::size_t    len) noexcept
+AeronTransport::OfferResult AeronTransport::offerToPub(aeron::ExclusivePublication& pub,
+                                                       const uint8_t* buf,
+                                                       std::size_t    len) noexcept
 {
+    // Aeron result codes: NOT_CONNECTED(-1), BACK_PRESSURED(-2),
+    // ADMIN_ACTION(-3) are transient; PUBLICATION_CLOSED(-4) and
+    // MAX_POSITION_EXCEEDED(-5) are permanent; a throw (e.g. a frame over the
+    // publication's max message length) is permanent too.
+    auto verdict = [](int64_t pos) noexcept {
+        if (pos > 0) return OfferResult::Accepted;
+        if (pos == aeron::PUBLICATION_CLOSED || pos == aeron::MAX_POSITION_EXCEEDED) {
+            return OfferResult::Fatal;
+        }
+        return OfferResult::Retry;
+    };
     const auto ilen = static_cast<aeron::util::index_t>(len);
     try {
         if (len > 0 && ilen <= pub.maxPayloadLength()) {
@@ -247,17 +276,17 @@ bool AeronTransport::offerToPub(aeron::ExclusivePublication& pub,
             if (claimPos > 0) {
                 std::memcpy(claim.buffer().buffer() + claim.offset(), buf, len);
                 claim.commit();
-                return true;
+                return OfferResult::Accepted;
             }
+            return verdict(claimPos);
         }
         static uint8_t kEmptyBuf[1] = {};
         aeron::concurrent::AtomicBuffer ab(
             const_cast<uint8_t*>(len > 0 ? buf : kEmptyBuf),
             ilen);
-        const int64_t pos = pub.offer(ab, 0, ilen);
-        return pos > 0;
+        return verdict(pub.offer(ab, 0, ilen));
     } catch (...) {
-        return false;
+        return OfferResult::Fatal;
     }
 }
 
@@ -273,6 +302,11 @@ bool AeronTransport::offer(const uint8_t* buf, std::size_t len) noexcept {
     // The single-writer lifetime contract makes that unreachable in normal use,
     // but a throw escaping a noexcept fn would std::terminate — so we contain it
     // and report a failed send instead. Aeron never mutates the source buffer.
+    return offerToPub(*ingressPub_, buf, len) == OfferResult::Accepted;
+}
+
+AeronTransport::OfferResult AeronTransport::offerResult(const uint8_t* buf, std::size_t len) noexcept {
+    if (!ingressPub_) return OfferResult::Retry;  // not resolved yet
     return offerToPub(*ingressPub_, buf, len);
 }
 
@@ -296,11 +330,11 @@ AeronTransport::PubHandle AeronTransport::publicationHandle(const std::string& c
 bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len) noexcept {
     if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
     PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
-    if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len);
+    if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len) == OfferResult::Accepted;
     if (!aeron_) return false;
     PubRegistry reg{*aeron_, s.channel, s.streamId};
     if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) return false;
-    return offerToPub(*s.res.ready(), buf, len);
+    return offerToPub(*s.res.ready(), buf, len) == OfferResult::Accepted;
 }
 
 // ---------------------------------------------------------------------------
