@@ -1748,18 +1748,29 @@ TEST(ReplicaLifetimeRegression, MarkerOffsetIsTheWorkersActualAppendOffset) {
     // coordinator's bookkeeping must record the marker where it ACTUALLY landed
     // (3), not log->logEndOffset() at enqueue time (0).
     MarkerRig m;
-    m.gw.notifyTransactionalBatch(0, 0, /*pid*/7, /*base*/0);   // txn opened at offset 0
-    for (int i = 0; i < 3; ++i) ASSERT_TRUE(m.pool.tryEnqueueOp(0, 0, produceOp(m.r, 100 + i)));
+    // F15 S4: the read_committed state lives on the OWNING worker (Option B) —
+    // the txn is opened by a real transactional batch at offset 0 (the first of
+    // the three produces queued ahead of the marker), observed on the worker.
+    for (int i = 0; i < 3; ++i) {
+        WorkerOp p = produceOp(m.r, 100 + i);
+        if (i == 0) {
+            rune::protocol::RecordBatchBuilder b(0, 1000);
+            b.setTransactional(true); b.setProducerId(7); b.setProducerEpoch(0); b.setBaseSequence(0);
+            b.append("k", "txn", 1000);
+            p.recordBatchBytes = b.build(); p.producerId = 7;   // txn opened at offset 0
+        }
+        ASSERT_TRUE(m.pool.tryEnqueueOp(0, 0, std::move(p)));
+    }
     const auto marker = txnBatch(7);
     const int64_t rc = m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, /*commit=*/false, /*coordinatorEpoch=*/0);
     EXPECT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync) << "never a pre-computed offset";
-    EXPECT_TRUE(m.gw.abortedRangesForTest(0, 0).empty()) << "nothing recorded before the append happened";
+    EXPECT_TRUE(m.pool.worker(0).rcAbortedRangesForTest(0, 0).empty()) << "nothing recorded before the append happened";
     m.runWorker(1);
-    const auto ranges = m.gw.abortedRangesForTest(0, 0);
+    const auto ranges = m.pool.worker(0).rcAbortedRangesForTest(0, 0);
     ASSERT_EQ(ranges.size(), 1u);
     EXPECT_EQ(ranges[0].producerId, 7);
     EXPECT_EQ(ranges[0].lastOffset, 3) << "the marker's AUTHORITATIVE offset (3 produces landed first)";
-    EXPECT_EQ(m.gw.openTxnsForTest(0, 0), 0u);
+    EXPECT_EQ(m.pool.worker(0).rcOpenTxnsForTest(0, 0), 0u);
     EXPECT_EQ(m.gw.markersInFlightForTest(), 0u);
 }
 
@@ -2177,7 +2188,8 @@ TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
     for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(200 + i);
     ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u);
     // Log: [0]=txn1 data, [1]=ABORT marker, [2]=txn2 data, [3]=ABORT marker.
-    const auto ranges = t.m.gw.abortedRangesForTest(0, 0);
+    // F15 S4: observed on the OWNING worker (Option B).
+    const auto ranges = t.m.pool.worker(0).rcAbortedRangesForTest(0, 0);
     ASSERT_EQ(ranges.size(), 2u);
     auto covered = [&](int64_t off) {
         for (const auto& rg : ranges) if (rg.contains(off)) return true;
@@ -2188,7 +2200,7 @@ TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
     EXPECT_EQ(ranges[0].lastOffset, 1);
     EXPECT_EQ(ranges[1].firstOffset, 2);
     EXPECT_EQ(ranges[1].lastOffset, 3);
-    EXPECT_EQ(t.m.gw.openTxnsForTest(0, 0), 0u);
+    EXPECT_EQ(t.m.pool.worker(0).rcOpenTxnsForTest(0, 0), 0u);
 }
 
 TEST(ReplicaLifetimeRegression, MinIsrViolationIsReturnedByTheOwningWorker) {
