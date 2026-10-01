@@ -2800,3 +2800,555 @@ TEST(ReturnOverflowRegression, OscillatingOwedAtCapStaysOneThrottleEpisode) {
     EXPECT_FALSE(w.owedCapThrottlingForTest()) << "the episode ends once owed <= cap / 2";
     EXPECT_EQ(w.owedCapEpisodesForTest(), 1u);
 }
+
+// ============================================================================
+// F15 S4 — Option B: read_committed state owned by the OWNING worker (design
+// note §2.1-§2.4, §2.8, §8 S4 row; step addendum S4: R-1, R-2, R-3, m5, I-C).
+//
+// RcRig: one user partition (topic 1 / partition 0) on a real disk Log, a real
+// PartitionReplica over it and a Worker that owns it, driven by explicit
+// doWork passes on the test thread (no sleeps; every wait is a bounded loop).
+// Batches written straight to the Log model data that was on disk before the
+// worker gained the partition (the build must find it).
+// ============================================================================
+namespace {
+int32_t lodOf(const std::vector<uint8_t>& b) {
+    return rune::protocol::RecordBatchReader(b.data(), b.size()).lastOffsetDelta();
+}
+int64_t appendAt(Log& log, const std::vector<uint8_t>& b) {
+    int64_t base = 0;
+    (void)log.appendNoSyncRestamp(b.data(), b.size(), lodOf(b), base);
+    return base;
+}
+// The same bytes re-based at `base` (base offset is outside the CRC region),
+// with an UNSET partition leader epoch (accepted by every apply path).
+std::vector<uint8_t> rebased(std::vector<uint8_t> b, int64_t base) {
+    for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (i * 8));
+    rune::protocol::RecordBatchReader::stampLeaderEpoch(b.data(), -1);
+    return b;
+}
+std::vector<uint8_t> marker(int64_t pid, bool commit, int16_t epoch = 0) {
+    return tx::ControlMarker::build(pid, epoch, commit ? tx::ControlType::Commit : tx::ControlType::Abort, 0);
+}
+WorkerOp pushReadIso(PartitionReplica* r, int64_t subId, int64_t next, int64_t hw, uint8_t iso,
+                     bool isGroup = false, bool carrier = true) {
+    WorkerOp op = pushReadOp(r, subId, next, hw);
+    op.isolation = iso; op.isGroup = isGroup; op.groupCarrierReceived = carrier;
+    return op;
+}
+// (baseOffset, lastOffset) of every whole batch in a PushRead chunk.
+std::vector<std::pair<int64_t, int64_t>> batchesIn(const std::vector<uint8_t>& c) {
+    std::vector<std::pair<int64_t, int64_t>> out;
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= c.size()) {
+        rune::protocol::RecordBatchReader r(c.data() + pos, c.size() - pos);
+        if (r.totalLength() <= 0 || pos + static_cast<std::size_t>(r.totalLength()) > c.size()) break;
+        out.emplace_back(r.baseOffset(), r.baseOffset() + r.lastOffsetDelta());
+        pos += static_cast<std::size_t>(r.totalLength());
+    }
+    return out;
+}
+bool controlIn(const std::vector<uint8_t>& c) {
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= c.size()) {
+        rune::protocol::RecordBatchReader r(c.data() + pos, c.size() - pos);
+        if (r.totalLength() <= 0) break;
+        if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0)
+            return true;
+        pos += static_cast<std::size_t>(r.totalLength());
+    }
+    return false;
+}
+
+struct RcRig {
+    TmpDir d;
+    std::unique_ptr<Log> log;
+    NullTransport t;
+    std::unique_ptr<PartitionReplica> rep;
+    std::unique_ptr<Worker> w;
+    int64_t now = 1;
+    explicit RcRig(std::vector<NodeId> isr = {1}, int64_t rollBytes = 64LL * 1024 * 1024,
+                   Role role = Role::Leader, int32_t topicId = 1)
+        : log(std::make_unique<Log>(d.path.string(), rollBytes)) {
+        log->recover();
+        rep = std::make_unique<PartitionReplica>(cfg(1, 1, topicId, 0), role, 1, isr, isr, log.get(), &t);
+    }
+    int32_t topic() const { return rep->topicId(); }
+    // Data on disk under the replica (leader: LEO / HW resynchronised).
+    int64_t append(const std::vector<uint8_t>& b) {
+        const int64_t base = appendAt(*log, b);
+        if (rep->role() == Role::Leader) rep->onLeaderLogAppended();
+        return base;
+    }
+    void own(int32_t budget = 0) {
+        w = std::make_unique<Worker>(0, 1 << 22, 1 << 23, 64, 64);
+        if (budget > 0) w->setRcScanBytesPerPass(budget);
+        w->setOwnedDirect(Worker::OwnedSet{rep.get()});
+    }
+    void pass() { w->doWork(++now); }
+    int status() const { return w->rcStatusForTest(topic(), 0); }
+    std::size_t open() const { return w->rcOpenTxnsForTest(topic(), 0); }
+    bool covers(int64_t pid, int64_t off) const {
+        for (const auto& rg : w->rcAbortedRangesForTest(topic(), 0))
+            if (rg.producerId == pid && rg.contains(off)) return true;
+        return false;
+    }
+    bool runUntilReady(int cap) {
+        for (int i = 0; i < cap && status() != Worker::kRcReady; ++i) pass();
+        return status() == Worker::kRcReady;
+    }
+    // One PushRead op executed by the owning worker; its single result.
+    WorkerReturn pushRead(int64_t next, int64_t hw, uint8_t iso, bool isGroup = false, bool carrier = true) {
+        EXPECT_TRUE(w->tryEnqueueOp(pushReadIso(rep.get(), 7, next, hw, iso, isGroup, carrier)));
+        pass();
+        std::vector<WorkerReturn> rs;
+        for (auto& r : drainAll(*w)) if (r.type == WorkerReturn::Type::PushReadResult) rs.push_back(std::move(r));
+        EXPECT_EQ(rs.size(), 1u);
+        return rs.empty() ? WorkerReturn{} : std::move(rs[0]);
+    }
+    std::vector<WorkerReturn> run(WorkerOp op) {
+        EXPECT_TRUE(w->tryEnqueueOp(std::move(op)));
+        pass();
+        return drainAll(*w);
+    }
+    std::size_t logBytes() { return log->read(0, 1 << 26).size(); }
+};
+
+// EosRig helpers: a non-transactional produce on the shard's own ingress, and
+// a COMMIT / ABORT marker dispatched by the gateway to the owning worker.
+int ingressData(EosRig& R, int64_t sid, int64_t corr, int64_t now) {
+    const auto f = produceFrame(sid, corr, batchAt(0), /*acks=*/0, 0, 0);
+    return R.w().handleIngressFrameForTest(f.data(), f.size(), now);
+}
+void gatewayMarker(EosRig& R, int64_t pid, bool commit, int64_t now) {
+    const auto m = marker(pid, commit);
+    ASSERT_EQ(R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), pid, commit, /*coordinatorEpoch=*/0),
+              rune::gateway::ClientGateway::kControlRecordAsync);
+    for (int i = 0; i < 64 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(now + i);
+    ASSERT_EQ(R.gw.markersInFlightForTest(), 0u);
+}
+} // namespace
+
+TEST(TxnRcRegression, BuildWaitsForLeaderComplete) {
+    // I2: a deficient leader (follower 2 has not reported) must not build its
+    // RC state before leaderComplete_ — the reconcile may still append old-term
+    // batches.  Here it appends an old-term ABORT for the txn at 0: the build,
+    // started only at leaderComplete_, sees it.
+    RcRig R({1, 2}, 64LL * 1024 * 1024, Role::Follower);
+    appendAt(*R.log, txnBatch(7, 0, 0));                    // the previous term's txn data at 0
+    R.rep->becomeLeader(2, {1, 2});
+    R.own();
+    for (int i = 0; i < 8; ++i) R.pass();
+    ASSERT_FALSE(R.rep->isLeaderComplete()) << "precondition: a deficient leader";
+    EXPECT_EQ(R.status(), Worker::kRcUnbuilt) << "the RC build started before leaderComplete_";
+    const auto m = rebased(marker(7, /*commit=*/false), 1);
+    rune::replication::FetchResponseMsg fr{};
+    fr.leaderEpoch = R.rep->epoch(); fr.partition = 0; fr.highWatermark = 2; fr.logStartOffset = 0;
+    fr.errorCode = 0; fr.topicId = R.topic(); fr.records = std::span<const uint8_t>(m);
+    R.rep->applyReconcileResponse(fr);
+    ASSERT_EQ(R.log->logEndOffset(), 2) << "precondition: the reconcile appended the old-term ABORT at 1";
+    followerCaughtUp(*R.rep, R.now);
+    ASSERT_TRUE(R.rep->isLeaderComplete()) << "precondition: the survivor reported in";
+    ASSERT_TRUE(R.runUntilReady(64)) << "status " << R.status();
+    EXPECT_TRUE(R.covers(7, 0)) << "the build missed the reconciled ABORT marker (aborted data would be served)";
+    EXPECT_EQ(R.open(), 0u);
+}
+
+TEST(TxnRcRegression, BuildIsBoundedPerPass) {
+    // I5: the build reads at most kRcScanBytesPerPass per pass — a log of
+    // k x budget bytes takes >= k passes, each pass within the budget.
+    RcRig R;
+    R.append(txnBatch(7, 0, 0));                            // an open txn at 0
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    constexpr int32_t kBudget = 4096;
+    const std::size_t total = R.logBytes();
+    R.own(kBudget);
+    ASSERT_TRUE(R.runUntilReady(4096)) << "status " << R.status();
+    EXPECT_GE(R.w->rcScanPassesForTest(R.topic(), 0), total / kBudget);
+    EXPECT_GT(R.w->rcMaxPassBytesForTest(), 0u);
+    EXPECT_LE(R.w->rcMaxPassBytesForTest(), static_cast<std::size_t>(kBudget));
+    EXPECT_EQ(R.open(), 1u) << "the open txn at 0 was not found by the build";
+}
+
+TEST(TxnRcRegression, AppendsDuringBuildAreReplayed) {
+    // §2.3: markers appended while the build scans [logStart, target) land in
+    // the tail list and are replayed in order when the scan reaches target.
+    RcRig R;
+    R.append(txnBatch(7, 0, 0));                            // pid 7 open at 0
+    R.append(txnBatch(8, 0, 0));                            // pid 8 open at 1
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning) << "precondition: the build is in progress";
+    ASSERT_TRUE(R.w->tryEnqueueOp(markerOp(R.rep.get(), 1, marker(7, /*commit=*/false))));
+    ASSERT_TRUE(R.w->tryEnqueueOp(markerOp(R.rep.get(), 2, marker(8, /*commit=*/true))));
+    R.pass();
+    const auto rets = drainAll(*R.w);
+    ASSERT_EQ(rets.size(), 2u);
+    for (const auto& r : rets) ASSERT_EQ(r.errorCode, 0) << "a marker was refused during the build";
+    ASSERT_TRUE(R.runUntilReady(4096));
+    EXPECT_EQ(R.open(), 0u) << "a marker appended during the build was not replayed";
+    EXPECT_TRUE(R.covers(7, 0)) << "the ABORT appended during the build is missing";
+    EXPECT_FALSE(R.covers(8, 1)) << "the COMMIT was taken for an abort";
+}
+
+TEST(TxnRcRegression, TruncationRebuilds) {
+    // I2 / §2.1 step 3: a truncation bumps logGeneration — the next pass resets
+    // RC and rebuilds it from the surviving log.
+    RcRig R({1, 2});
+    R.append(batchAt(0));
+    R.append(txnBatch(7, 0, 0));                            // pid 7 open at 1
+    R.own();
+    ASSERT_TRUE(R.runUntilReady(64));
+    ASSERT_EQ(R.open(), 1u) << "precondition: the open txn at 1 is registered";
+    selfDemote(*R.rep, 2, R.now);
+    truncateTo(*R.rep, 1);
+    refetch(*R.rep, otherBatchAt(1), /*leaderHw=*/2);       // non-transactional data now at 1
+    R.rep->becomeLeader(3, {1});
+    ASSERT_EQ(R.log->logEndOffset(), 2);
+    R.pass();
+    ASSERT_TRUE(R.runUntilReady(64));
+    EXPECT_EQ(R.open(), 0u) << "RC still holds a txn whose batch was truncated away (LSO pinned)";
+}
+
+TEST(TxnRcRegression, SelfDemotionStopsServing) {
+    // I1 + §2.3: self-demotion in onFetchRequest (no op, no hook) → the next
+    // pass resets RC; a read_committed PushRead then returns an empty chunk with
+    // the cursor unchanged (held back, never exposed).
+    RcRig R({1, 2});
+    R.append(batchAt(0));
+    followerCaughtUp(*R.rep, 1);                            // HW 1
+    R.own();
+    EXPECT_TRUE(R.runUntilReady(64));
+    const auto served = R.pushRead(0, 1, /*read_committed*/1);
+    ASSERT_FALSE(served.chunk.empty()) << "precondition: the leader serves read_committed";
+    selfDemote(*R.rep, 2, R.now);
+    ASSERT_EQ(R.rep->role(), Role::Follower);
+    const auto r = R.pushRead(0, 1, 1);
+    EXPECT_TRUE(r.chunk.empty()) << "a self-demoted replica served read_committed data";
+    EXPECT_EQ(r.newNextOffset, 0);
+    EXPECT_TRUE(r.pushRcNotReady());
+    EXPECT_NE(R.status(), Worker::kRcReady);
+}
+
+TEST(TxnRcRegression, GatewayPushUsesWorkerBoundNotGatewayHw) {
+    // K2 / I-B: the gateway's HW snapshot is past an open txn batch; the owning
+    // worker clamps the PushRead to its own LSO — nothing at or above the open
+    // txn's first offset is returned.
+    RcRig R;
+    R.append(batchAt(0));
+    R.append(txnBatch(7, 0, 0));                            // open at 1
+    R.append(batchAt(0));                                   // at 2
+    R.own();
+    EXPECT_TRUE(R.runUntilReady(64));
+    const auto r = R.pushRead(0, /*gateway HW snapshot*/3, /*read_committed*/1);
+    const auto bs = batchesIn(r.chunk);
+    ASSERT_EQ(bs.size(), 1u) << "read_committed PushRead returned data at / above the open txn";
+    EXPECT_EQ(bs[0].first, 0);
+    EXPECT_EQ(r.newNextOffset, 1);
+    EXPECT_EQ(r.pushEffectiveBound(), 1) << "the worker must echo the LSO it applied";
+    EXPECT_FALSE(r.pushRcNotReady());
+    const auto ru = R.pushRead(0, 3, /*read_uncommitted*/0);
+    EXPECT_EQ(batchesIn(ru.chunk).size(), 3u) << "read_uncommitted is bounded by the HW only";
+}
+
+TEST(TxnRcRegression, GatewayPushFiltersAbortedBatchAndAdvances) {
+    // I-B: the worker strips control batches (both isolations) and, for
+    // read_committed, aborted batches; newNextOffset is past every batch it
+    // examined, so the gateway never re-reads them.
+    {
+        RcRig R;
+        R.own();
+        EXPECT_TRUE(R.runUntilReady(8));
+        ASSERT_TRUE(R.w->tryEnqueueOp(stamp([&] {
+            WorkerOp p = produceOp(R.rep.get(), 1);
+            p.recordBatchBytes = txnBatch(7, 0, 0); p.producerId = 7; p.batchAttrs = 0x10;
+            return p;
+        }())));
+        ASSERT_TRUE(R.w->tryEnqueueOp(markerOp(R.rep.get(), 2, marker(7, /*commit=*/false))));
+        ASSERT_TRUE(R.w->tryEnqueueOp(produceOp(R.rep.get(), 3)));
+        R.pass();
+        (void)drainAll(*R.w);
+        ASSERT_EQ(R.log->logEndOffset(), 3) << "txn @0, ABORT @1, data @2";
+        const auto rc = R.pushRead(0, 3, /*read_committed*/1);
+        const auto bs = batchesIn(rc.chunk);
+        ASSERT_EQ(bs.size(), 1u) << "aborted / control batches reached the chunk";
+        EXPECT_EQ(bs[0].first, 2);
+        EXPECT_EQ(rc.newNextOffset, 3);
+        const auto ru = R.pushRead(0, 3, /*read_uncommitted*/0);
+        EXPECT_FALSE(controlIn(ru.chunk)) << "a control batch reached a read_uncommitted chunk";
+        EXPECT_EQ(batchesIn(ru.chunk).size(), 2u);
+        EXPECT_EQ(ru.newNextOffset, 3);
+    }
+    {   // end to end through the gateway push path
+        EosRig R;
+        const int64_t sid = R.gw.injectTestSession();
+        const int64_t sub = R.subscribe(sid, /*read_committed*/1);
+        ASSERT_GT(sub, 0);
+        ASSERT_EQ(R.ingressTxn(sid, 1, 7, 0, 0, 0, 2), 1);
+        R.abortMarker(7, 0, 10);
+        ASSERT_EQ(ingressData(R, sid, 2, 80), 1);
+        R.runWorker(81);
+        R.push(16, 100);
+        ASSERT_EQ(R.deliveredCount(sub), 1u);
+        EXPECT_TRUE(R.delivered(sub, 2));
+        const uint64_t reads = R.w().pushReadsForTest();
+        R.push(16, 200);
+        EXPECT_EQ(R.w().pushReadsForTest(), reads) << "the cursor did not advance past the stripped batches";
+    }
+}
+
+TEST(TxnRcRegression, GatewayPushReadCommittedEmptyWhileBuilding) {
+    // §2.3: while RC is not Ready, a read_committed PushRead returns an empty
+    // chunk (cursor unchanged, notReady echoed); read_uncommitted is unaffected.
+    RcRig R;
+    R.append(txnBatch(7, 0, 0));
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    const int64_t hw = R.log->logEndOffset();
+    R.own(4096);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning) << "precondition: building";
+    const auto rc = R.pushRead(0, hw, 1);
+    EXPECT_TRUE(rc.chunk.empty()) << "read_committed served while the RC state is still building";
+    EXPECT_EQ(rc.newNextOffset, 0);
+    EXPECT_TRUE(rc.pushRcNotReady());
+    const auto ru = R.pushRead(0, hw, 0);
+    EXPECT_FALSE(ru.chunk.empty()) << "read_uncommitted must not wait for the RC build";
+}
+
+TEST(TxnRcRegression, RetentionDuringBuildCompletes) {
+    // I-C: retention deletes the segment under the build cursor between passes;
+    // the cursor is clamped to logStartOffset and the build completes in
+    // bounded passes (Log::readView below the first segment is empty forever).
+    RcRig R({1}, /*rollBytes=*/8 * 1024);
+    R.append(txnBatch(7, 0, 0));
+    for (int i = 0; i < 40; ++i) R.append(bigBatch(900));
+    const auto segs = R.log->segmentBaseOffsets();
+    ASSERT_GE(segs.size(), 4u) << "precondition: several segments";
+    const std::size_t total = R.logBytes();
+    R.own(1024);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning);
+    ASSERT_TRUE(R.log->enqueueDeletedSegment(segs[0]));
+    ASSERT_TRUE(R.log->enqueueDeletedSegment(segs[1]));
+    EXPECT_TRUE(R.runUntilReady(static_cast<int>(total / 1024) + 32)) << "the build is stuck after retention";
+    EXPECT_GT(R.log->logStartOffset(), 0) << "precondition: retention ran";
+    EXPECT_EQ(R.open(), 0u) << "the deleted txn batch is gone with its segment";
+}
+
+TEST(TxnRcRegression, EpochBumpSameLogKeepsReady) {
+    // Minor (rev 3): a leader-epoch bump while still Leader with an unchanged
+    // log keeps Ready — no O(log) rebuild, the state is still exact.
+    RcRig R({1, 2});
+    R.append(batchAt(0));
+    R.append(txnBatch(7, 0, 0));
+    R.own();
+    ASSERT_TRUE(R.runUntilReady(64));
+    const uint64_t passes = R.w->rcScanPassesForTest(R.topic(), 0);
+    ASSERT_GT(passes, 0u);
+    WorkerOp bl;
+    bl.type = WorkerOp::Type::BecomeLeader; bl.topicId = R.topic(); bl.partition = 0; bl.replica = R.rep.get();
+    bl.logPtr = R.log.get(); bl.roleEpoch = 2; bl.isr = {1, 2};
+    (void)R.run(stamp(std::move(bl)));
+    ASSERT_EQ(R.rep->epoch(), 2);
+    for (int i = 0; i < 4; ++i) R.pass();
+    EXPECT_EQ(R.status(), Worker::kRcReady);
+    EXPECT_EQ(R.w->rcScanPassesForTest(R.topic(), 0), passes) << "an epoch bump on the same log rebuilt RC";
+    EXPECT_EQ(R.open(), 1u);
+}
+
+TEST(TxnRcRegression, InternalPartitionsNeverCarryTxnBatches) {
+    // §1: internal partitions are written only by coordinators with pid -1 —
+    // never a transactional batch.  So they hold no read_committed state and
+    // their PushRead is HW-bounded only.
+    TxnRig T(/*minIsr=*/1, /*withStore=*/true);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_GT(T.stateLog->logEndOffset(), 0) << "precondition: the coordinator wrote __transaction_state";
+    const auto raw = T.stateLog->read(0, 1 << 24);
+    std::size_t pos = 0, n = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= raw.size()) {
+        rune::protocol::RecordBatchReader r(raw.data() + pos, raw.size() - pos);
+        if (r.totalLength() <= 0) break;
+        EXPECT_EQ(static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional), 0)
+            << "a transactional batch in an internal partition at " << r.baseOffset();
+        EXPECT_LT(r.producerId(), 0) << "an internal batch with a producer id at " << r.baseOffset();
+        pos += static_cast<std::size_t>(r.totalLength());
+        ++n;
+    }
+    EXPECT_GT(n, 0u);
+    RcRig I({1}, 64LL * 1024 * 1024, Role::Leader, /*topicId=*/-2);
+    I.append(batchAt(0));
+    I.own();
+    EXPECT_EQ(I.status(), Worker::kRcNone) << "an internal partition must hold no RC state";
+    const auto r = I.pushRead(0, 1, /*read_committed*/1);
+    EXPECT_EQ(batchesIn(r.chunk).size(), 1u) << "an internal read_committed PushRead is HW-bounded only";
+    EXPECT_FALSE(r.pushRcNotReady());
+}
+
+TEST(TxnRcRegression, IdempotentProduceWhileBuildingIsNotLeader) {
+    // §2.3 produce gate: a producerId >= 0 batch arriving while RC is not Ready
+    // (after one inline build step) is refused NotLeader, log untouched — both
+    // produce paths.  producerId -1 is unaffected.
+    RcRig R;
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    R.w->setWorkerIngress(nullptr, true);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning) << "precondition: building";
+    const int64_t leo = R.log->logEndOffset();
+    const auto f = produceFrame(1, 9, idemBatch(9, 0, 0), /*acks=*/0, R.topic(), 0, 9, 0, 0);
+    ASSERT_EQ(R.w->handleIngressFrameForTest(f.data(), f.size(), R.now), 1);
+    auto rets = drainAll(*R.w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, kNotLeader) << "shard ingress: an idempotent batch was taken before RC is Ready";
+    WorkerOp p = produceOp(R.rep.get(), 10);
+    p.producerId = 9; p.recordBatchBytes = idemBatch(9, 0, 0);
+    rets = R.run(stamp(std::move(p)));
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, kNotLeader) << "gateway path: an idempotent batch was taken before RC is Ready";
+    EXPECT_EQ(R.log->logEndOffset(), leo) << "a refused batch reached the log";
+    ASSERT_EQ(ingressAcks0(*R.w, 11, R.now), 1);
+    rets = drainAll(*R.w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, 0) << "a non-idempotent batch must not wait for the build";
+}
+
+TEST(TxnRcRegression, RcTrackerPreReservedAtOwnershipApply) {
+    // Addendum m5: the RC tracker storage is reserved when ownership is applied
+    // (cold), so the partition's first transactional batch never allocates on
+    // the produce path.
+    RcRig R;
+    R.own();
+    const std::size_t cap = R.w->rcTrackerCapacityForTest(R.topic(), 0);
+    EXPECT_GE(cap, rune::transaction::LsoTracker::kDefaultOpenTxnCapacity)
+        << "the tracker is not reserved at ownership apply";
+    R.w->setWorkerIngress(nullptr, true);
+    R.pass();
+    const auto f = produceFrame(1, 9, txnBatch(7, 0, 0), /*acks=*/0, R.topic(), 0, 7, 0, 0);
+    ASSERT_EQ(R.w->handleIngressFrameForTest(f.data(), f.size(), R.now), 1);
+    ASSERT_EQ(R.open(), 1u);
+    EXPECT_EQ(R.w->rcTrackerCapacityForTest(R.topic(), 0), cap);
+    EXPECT_EQ(R.w->rcTrackerGrowthsForTest(R.topic(), 0), 0u);
+}
+
+TEST(TxnRcRegression, FollowerPeriodBetweenPassesRebuilds) {
+    // Between two passes the replica is demoted, appends a REPLICATED txn batch
+    // as a follower (no truncation: logGeneration unchanged) and is promoted
+    // again.  RC never saw that append — it must rebuild, not stay Ready.
+    RcRig R({1, 2});
+    R.append(batchAt(0));
+    R.own();
+    ASSERT_TRUE(R.runUntilReady(64));
+    ASSERT_EQ(R.open(), 0u);
+    const uint64_t gen = R.rep->logGeneration();
+    R.rep->becomeFollower(1, 2);
+    refetch(*R.rep, rebased(txnBatch(7, 0, 0), 1), /*leaderHw=*/2);
+    ASSERT_EQ(R.log->logEndOffset(), 2) << "precondition: the follower appended the replicated txn batch";
+    R.rep->becomeLeader(2, {1});
+    ASSERT_EQ(R.rep->logGeneration(), gen) << "precondition: no truncation (same log generation)";
+    R.pass();
+    ASSERT_TRUE(R.runUntilReady(64));
+    EXPECT_EQ(R.open(), 1u) << "RC stayed Ready over a follower period: the replicated open txn is missing";
+}
+
+// ---- addendum R-1 / R-2 / R-3 (gateway push path) ---------------------------
+
+TEST(TxnRcRegression, TrailingMarkerOnlyChunkAdvancesCursor) {
+    // R-1: the worker strips a trailing marker → an EMPTY chunk with
+    // newNextOffset past it.  The gateway must adopt it; else the cursor sits
+    // below the HW and the partition is re-read every cycle (a spin).
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    const int64_t sub = R.subscribe(sid, /*read_uncommitted*/0);
+    ASSERT_GT(sub, 0);
+    ASSERT_EQ(ingressData(R, sid, 1, 2), 1);
+    R.runWorker(3);
+    R.push(4, 10);
+    ASSERT_TRUE(R.delivered(sub, 0));
+    gatewayMarker(R, 7, /*commit=*/true, 20);              // marker-only tail at 1
+    ASSERT_EQ(R.r->log()->logEndOffset(), 2);
+    const uint64_t reads = R.w().pushReadsForTest();
+    R.push(32, 100);
+    EXPECT_LE(R.w().pushReadsForTest() - reads, 1u) << "PushRead re-issued every cycle over a marker-only tail";
+    EXPECT_EQ(R.deliveredCount(sub), 1u);
+}
+
+TEST(TxnRcRegression, AbortedTailAdvancesCursor) {
+    // R-1: an aborted txn + its ABORT marker are both stripped (read_committed)
+    // → empty chunk, cursor adopted past them; then the partition is idle.
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    const int64_t sub = R.subscribe(sid, /*read_committed*/1);
+    ASSERT_GT(sub, 0);
+    ASSERT_EQ(R.ingressTxn(sid, 1, 7, 0, 0, 0, 2), 1);
+    R.abortMarker(7, 0, 10);
+    const uint64_t reads = R.w().pushReadsForTest();
+    R.push(32, 100);
+    EXPECT_LE(R.w().pushReadsForTest() - reads, 1u) << "PushRead re-issued every cycle over an aborted tail";
+    EXPECT_EQ(R.deliveredCount(sub), 0u);
+}
+
+TEST(TxnRcRegression, IdlePartitionIssuesNoFurtherPushRead) {
+    // R-1: once the cursor reached the HW (both isolations), no PushRead.
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    const int64_t su = R.subscribe(sid, 0);
+    const int64_t sc = R.subscribe(sid, 1);
+    ASSERT_GT(su, 0);
+    ASSERT_GT(sc, 0);
+    ASSERT_EQ(ingressData(R, sid, 1, 2), 1);
+    gatewayMarker(R, 7, /*commit=*/true, 10);
+    R.push(8, 100);
+    ASSERT_TRUE(R.delivered(su, 0));
+    ASSERT_TRUE(R.delivered(sc, 0));
+    const uint64_t reads = R.w().pushReadsForTest();
+    R.push(32, 200);
+    EXPECT_EQ(R.w().pushReadsForTest(), reads) << "an idle partition keeps issuing PushRead";
+}
+
+TEST(TxnRcRegression, PreCarrierGroupAbortedBatchNotLost) {
+    // R-2 (TX-6b): before a group's isolation carrier arrives the sub defaults
+    // to read_committed; the worker must CUT the chunk at the first aborted
+    // batch (never strip it): a read_uncommitted carrier then delivers it.
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    ASSERT_EQ(R.ingressTxn(sid, 1, 7, 0, 0, 0, 2), 1);
+    R.abortMarker(7, 0, 10);
+    ASSERT_EQ(ingressData(R, sid, 2, 20), 1);
+    R.runWorker(21);
+    const int64_t g = R.gw.addGroupSubscription(sid, 0, 0, /*from=*/0, /*isolation=*/1, /*pendingCarrier=*/true);
+    ASSERT_GT(g, 0);
+    R.push(16, 100);
+    EXPECT_EQ(R.deliveredCount(g), 0u) << "pre-carrier: delivered past an aborted batch under a guessed isolation";
+    (void)R.subscribe(sid, /*read_uncommitted carrier*/0);
+    R.push(16, 200);
+    EXPECT_TRUE(R.delivered(g, 0)) << "the aborted batch was lost before the read_uncommitted carrier arrived";
+    EXPECT_TRUE(R.delivered(g, 2));
+    EXPECT_FALSE(R.delivered(g, 1)) << "a control batch was delivered";
+}
+
+TEST(TxnRcRegression, OpenTxnHeldIssuesAtMostOnePushReadPerHwChange) {
+    // R-3 (§9): an open txn pins the LSO; the gateway must not spin empty
+    // PushReads — at most one per change of its HW snapshot.
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    const int64_t sub = R.subscribe(sid, /*read_committed*/1);
+    ASSERT_GT(sub, 0);
+    ASSERT_EQ(R.ingressTxn(sid, 1, 7, 0, 0, 0, 2), 1);     // open at 0
+    ASSERT_EQ(ingressData(R, sid, 2, 3), 1);               // data at 1 (held behind the LSO)
+    R.runWorker(4);
+    uint64_t reads = R.w().pushReadsForTest();
+    R.push(32, 100);
+    EXPECT_LE(R.w().pushReadsForTest() - reads, 1u) << "empty PushRead spin on an open txn";
+    ASSERT_EQ(ingressData(R, sid, 3, 200), 1);             // HW changes
+    R.runWorker(201);
+    reads = R.w().pushReadsForTest();
+    R.push(32, 300);
+    EXPECT_LE(R.w().pushReadsForTest() - reads, 1u) << "more than one PushRead for one HW change";
+    EXPECT_EQ(R.deliveredCount(sub), 0u) << "read_committed received data behind the open txn";
+}
