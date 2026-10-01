@@ -2227,3 +2227,55 @@ TEST(ReturnOverflowRegression, ShardIngressPollBudgetHonoursStaticBound) {
     ASSERT_EQ(w.reservedAckSlotsForTest(), static_cast<int64_t>(Worker::kMaxOwedReturns));
     EXPECT_EQ(w.ingressPollBudgetForTest(), 0) << "the poll budget ignores the static owed-return cap";
 }
+
+TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) {
+    // The S2 temporary facts-only return (acks=all: at append; Strict: at fsync
+    // completion) and the final answer share the ONE FIFO: through a full ring
+    // neither is dropped and, per produce, the facts arrive before the answer.
+    for (const uint8_t tier : {uint8_t{1}, uint8_t{2}}) {
+        SCOPED_TRACE(tier == 2 ? "Strict acks=all" : "acks=all");
+        TmpDir d;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1, tier), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+        Worker w(0, 1 << 23, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        int64_t now = 1;
+        constexpr int kFill = 600, kParked = 60;
+        // The parked produces are admitted first (their G-A6 reservation needs
+        // ring room); then acks=leader answers fill the ring, so the Strict
+        // facts (emitted at fsync completion) and every final answer are
+        // emitted into a FULL ring and must queue in the FIFO.
+        w.setReapPausedForTest(true);
+        for (int i = 0; i < kParked; ++i) {
+            WorkerOp op = acksAllOp(&rep, 10'000 + i);
+            op.durabilityTier = tier;
+            ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+        }
+        w.doWork(++now);
+        ASSERT_EQ(w.reservedAckSlotsForTest(), tier == 2 ? 2 * kParked : kParked) << "precondition: all parked";
+        for (int i = 0; i < kFill; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 1 + i)));
+        std::vector<std::pair<int64_t, bool>> seq;   // (correlationId, facts-only?)
+        auto drain = [&] { w.drainReturn([&](WorkerReturn r) { seq.emplace_back(r.correlationId, r.deferAck); }); };
+        w.doWork(++now);                 // ring full of acks=leader answers
+        w.setReapPausedForTest(false);
+        EXPECT_GT(w.retFifoSizeForTest(), 0u) << "the ring is full: returns must queue in the FIFO";
+        // Strict: run until every fsync completed (facts emitted at completion).
+        for (int i = 0; i < kCap && w.durablePendingCountForTest() > 0; ++i) { w.doWork(++now); std::this_thread::yield(); }
+        followerCaughtUp(rep, now);
+        for (int i = 0; i < 4096 && seq.size() < static_cast<std::size_t>(kFill + 2 * kParked); ++i) { drain(); w.doWork(++now); }
+        drain();
+        ASSERT_EQ(seq.size(), static_cast<std::size_t>(kFill + 2 * kParked)) << "a facts-only return or an answer was dropped";
+        for (int i = 0; i < kParked; ++i) {
+            const int64_t corr = 10'000 + i;
+            std::ptrdiff_t facts = -1, answer = -1;
+            for (std::size_t k = 0; k < seq.size(); ++k) {
+                if (seq[k].first != corr) continue;
+                (seq[k].second ? facts : answer) = static_cast<std::ptrdiff_t>(k);
+            }
+            ASSERT_GE(facts, 0) << "facts dropped for " << corr;
+            ASSERT_GE(answer, 0) << "answer dropped for " << corr;
+            EXPECT_LT(facts, answer) << "the answer overtook its facts for " << corr;
+        }
+    }
+}

@@ -283,6 +283,8 @@ public:
     // -----------------------------------------------------------------------
     static constexpr int kExitStorageFailure = 74;   // EX_IOERR
     static constexpr int kExitInvariantViolation = 70;   // EX_SOFTWARE (F7 ownership invariant)
+    static_assert(kExitInvariantViolation == Worker::kExitInvariantViolation,
+                  "a worker-thread invariant halt (F15 §6) exits with the same code");
     using HaltHandler = void (*)(void* ctx, int exitCode);
     void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
     /// Test-only: drive the runtime's storage-failure path directly.

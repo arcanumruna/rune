@@ -40,15 +40,13 @@
 //             Encode (worker): encodeWorkerReturn → returnScratch_ → ret_.write().
 //             Decode (gateway): drainReturn() decodes each frame into a WorkerReturn
 //             (scalars from WorkerReturnWire + chunk copied from tail) and calls fn.
-//             Back-pressure: ret_.write() returns false when full → the encode+write
-//             is skipped (the return is dropped for that cycle).
-//             OLD BEHAVIOUR (SpscRing): ret_.tryEnqueue() was [[nodiscard]] but its
-//             return value was NEVER checked at any call site — i.e. full = silent drop.
-//             NEW BEHAVIOUR (R3): write() returns false on full → same silent-drop
-//             semantics. A TODO/warn is left to make this observable.
-//             NOTE: this is safe for best-effort acks (acks=Leader/None), but could
-//             in theory delay a deferred-ack (acks=All) by one drain cycle.
-//             TODO(R5): audit full-ret_ back-pressure; add retry logic if needed.
+//             Back-pressure (F15 S3, design note §6): ONE local return FIFO
+//             (retFifo_) in front of ret_ in EVERY mode — a refused claim
+//             queues the return, the FIFO flushes front-to-back each pass, and
+//             nothing is ever dropped.  A claim / encode exception or a full
+//             FIFO is an invariant-violation halt (exit 70).  ret_ carries two
+//             SBE templates (WorkerReturn id 2, TxnReturn id 6); drainReturn
+//             dispatches on the template id.
 //
 //   doWork order:
 //     1. Drain ingress_ (execute ops, enqueue returns).
@@ -69,6 +67,7 @@
 #include <rune_fr/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
+#include <rune/node/ReturnFifo.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerReturnCodec.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
@@ -97,6 +96,7 @@
 #include <cstring>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -137,31 +137,71 @@ public:
     static constexpr std::size_t kIoSubmitDepth     = 1024;
     static constexpr std::size_t kIoCompletionDepth = 1024;
 
-    // Pre-reserve capacity for the durablePending_ vector (no alloc on hot path).
-    static constexpr std::size_t kDurablePendingReserve = 1024;
 
     // Pre-reserve capacity for the per-cycle dirty-log set (dedup, small).
     static constexpr std::size_t kDirtySetReserve = 64;
 
-    // Pre-reserve capacity for the acks=all pending-ack list (worker ingress path).
-    // F15 S2: every gateway-routed acks=all parks here too (I-A) — at least the
-    // gateway's old kMaxPendingAcks (1024) so the default config does not grow
-    // where it used not to.  S3 adds the static bound.
-    static constexpr std::size_t kPendingAcksAllReserve = 1024;
-
-    // Pre-reserve capacity for the overflow ack queue (G-A6: acks that could not
-    // be written to ret_ in the same cycle — flushed before next ingress poll).
-    static constexpr std::size_t kRetOverflowReserve = 64;
-
-    // F15 S3 (design note §6, m5 + I8) — S3 RED stub: the constants the
-    // ReturnOverflowRegression tests pin (behaviour lands with the fix).
+    // -----------------------------------------------------------------------
+    // F15 S3 (design note §6, m5 + I8): ONE return FIFO in every mode, bounded.
+    //
+    // Returns go to ret_ only while the local FIFO (retFifo_) is empty, else to
+    // its back; nothing is ever dropped.  The FIFO is bounded by construction:
+    //   |FIFO| <= max(kOverflowHighWater, kMaxIngressDrainLimit) * R
+    //             + kMaxFragmentLimit + kMaxOwedReturns
+    // where R = 1 is the most returns one op / one polled frame emits outside
+    // the owed (parked) set:
+    //   * the op-ring drain pauses once |FIFO| >= kOverflowHighWater and, with a
+    //     non-empty FIFO, drains at most kOverflowHighWater - |FIFO| ops (every
+    //     mode; with an empty FIFO at most the ingress drain limit);
+    //   * shard / per-worker ingress polls only while the FIFO is empty (G-A6),
+    //     at most kMaxFragmentLimit frames;
+    //   * owed returns that fire later (parked acks=all, Strict acks on their
+    //     fsync, owed Strict facts; S6 adds commit waiters / parked markers) are
+    //     capped at kMaxOwedReturns by the G-A6 reservation
+    //     (ackReservationAvailable_ / ingressPollBudget_).
+    // The capacity is static_assert-ed against that bound; exceeding it, a
+    // tryClaim exception or an encode error is an invariant-violation halt.
+    // -----------------------------------------------------------------------
+    /// Invariant-violation halt code (== BrokerNode::kExitInvariantViolation).
+    static constexpr int kExitInvariantViolation = 70;
+    /// Op-ring drain pauses while the return FIFO holds at least this many.
     static constexpr std::size_t kOverflowHighWater = 1024;
+    /// Static cap on owed returns (G-A6 reservation): parked acks=all +
+    /// durablePending_ + owed Strict facts.  Both vectors are reserved to it,
+    /// so parking never allocates.  4096 waiters/worker = 4 M acks/s per
+    /// worker at a 1 ms replication round trip.
     static constexpr std::size_t kMaxOwedReturns    = 4096;
+    /// Clamps for the configurable per-pass limits (NodeConfig knobs).
+    static constexpr int32_t     kMaxIngressDrainLimit = 4096;
+    static constexpr int32_t     kMaxFragmentLimit     = 4096;
+    /// Most returns one op / one polled frame emits beyond the owed set.
+    static constexpr std::size_t kMaxReturnsPerOp = 1;
+    static constexpr std::size_t kRetFifoBound =
+        (kOverflowHighWater > static_cast<std::size_t>(kMaxIngressDrainLimit)
+             ? kOverflowHighWater : static_cast<std::size_t>(kMaxIngressDrainLimit)) * kMaxReturnsPerOp +
+        static_cast<std::size_t>(kMaxFragmentLimit) * kMaxReturnsPerOp + kMaxOwedReturns;
     static constexpr std::size_t kRetFifoCapacity   = 16384;
+    static_assert(kRetFifoCapacity >= kRetFifoBound, "F15 §6: the return FIFO must hold its static bound");
+    static_assert((kRetFifoCapacity & (kRetFifoCapacity - 1)) == 0, "power of two (O(1) index mask)");
+
+    /// Largest chunk one PushRead reads (mirrored by ClientGateway).
     static constexpr int32_t     kMaxPushReadChunkBytes = 512 * 1024;
-    /// S3 RED stub: the startup check (§6) is not implemented yet.
-    [[nodiscard]] static constexpr bool returnRingCoversMaxPushChunk(std::size_t /*returnRingBytes*/) noexcept {
-        return true;
+    /// Framed bytes of a PushReadResult carrying a full chunk.
+    [[nodiscard]] static constexpr std::size_t maxPushReadResultBytes() noexcept {
+        return static_cast<std::size_t>(sbe::MessageHeader::encodedLength()) +
+               sbe::WorkerReturn::sbeBlockLength() +
+               static_cast<std::size_t>(sbe::WorkerReturn::chunkHeaderLength()) +
+               static_cast<std::size_t>(kMaxPushReadChunkBytes);
+    }
+    /// F15 §6 startup check: a tryClaim exception halts, so the return ring's
+    /// max message (capacity / 8) must hold one full PushReadResult chunk plus
+    /// its header.  BrokerNode refuses to start otherwise (the default, 32 MiB
+    /// — max message 4 MiB — does).
+    [[nodiscard]] static constexpr bool returnRingCoversMaxPushChunk(std::size_t returnRingBytes) noexcept {
+        return returnRingBytes / 8 >= maxPushReadResultBytes();
+    }
+    [[nodiscard]] bool returnRingCoversMaxPushChunk() const {
+        return static_cast<std::size_t>(ret_.maxMsgLength()) >= maxPushReadResultBytes();
     }
 
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
@@ -189,11 +229,10 @@ public:
         , ret_(static_cast<int>(returnRingBytes))
         , io_(ioSubmitDepth, ioComplDepth)
     {
-        durablePending_.reserve(kDurablePendingReserve);
+        durablePending_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         initRoutes_(ioSubmitDepth > ioComplDepth ? ioSubmitDepth : ioComplDepth);
         dirtyThisCycle_.reserve(kDirtySetReserve);
-        pendingAcksAll_.reserve(kPendingAcksAllReserve);
-        retOverflow_.reserve(kRetOverflowReserve);
+        pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         subs_.reserve(kSubsReserve);
         validators_.reserve(kValidatorsReserve);
         egressScratch_.resize(kEgressScratchSize);
@@ -334,17 +373,19 @@ public:
     // E5.1.3: setDesiredFragmentLimit — configure the reservation-before-poll
     // fragment limit K used in pollWorkerIngress_.
     //
-    // K = min(desiredFragmentLimit_, freeMaxMsgSlots − retOverflow_.size())
+    // K = ingressPollBudget_() (ring reservation AND the static owed cap)
     //
     // Source: NodeConfig::gatewayFragmentLimit (RUNE_GATEWAY_FRAGMENT_LIMIT, default 256).
     // Must be called before doWork() on the worker's thread (before runners start).
     // -----------------------------------------------------------------------
     void setDesiredFragmentLimit(int32_t limit) noexcept {
-        desiredFragmentLimit_ = (limit >= 1) ? limit : 256;
+        desiredFragmentLimit_ = (limit >= 1) ? std::min(limit, kMaxFragmentLimit) : 256;   // F15 §6 bound
     }
     // Per-tick drain batch limits (NodeConfig knobs — see NodeConfig.h).  Call
     // before the worker's AgentRunner starts (startup, single-threaded).
-    void setIngressDrainLimit(int32_t n) noexcept { ingressDrainLimit_ = (n >= 1) ? n : 1024; }
+    void setIngressDrainLimit(int32_t n) noexcept {
+        ingressDrainLimit_ = (n >= 1) ? std::min(n, kMaxIngressDrainLimit) : 1024;   // F15 §6 bound
+    }
     void setReturnDrainLimit(int32_t n)  noexcept { returnDrainLimit_  = (n >= 1) ? n : 1024; }
 
     // Configure the per-produce-ack return-ring reservation slot size (bytes).  The
@@ -512,29 +553,52 @@ public:
     // -----------------------------------------------------------------------
     // R3: return ring drain (consumer = gateway, on control thread).
     //
-    // ret_ is now a OneToOneByteRing carrying flat [WorkerReturnWire][tail]
-    // messages.  This template drains the ring, decodes each frame into a
-    // WorkerReturn struct (scalars from WorkerReturnWire; chunk copied from the
-    // tail view), and calls fn(WorkerReturn) — same callback signature as before.
+    // ret_ carries two SBE templates, discriminated by the template id in each
+    // frame's message header (F15 §7, review m7):
+    //   * WorkerReturn (id 2): decoded into a WorkerReturn struct (scalars in
+    //     place; the PushReadResult chunk copied from the tail view) → fn.
+    //   * TxnReturn (id 6): decoded (fixed block) → txnFn.
+    // Frames stay in emission order across both templates (§1.1 L2).  The tail
+    // view is fully consumed before the callback returns; no view escapes it.
     //
-    // The tail view (PushReadResult chunk) is fully consumed (copied into
-    // WorkerReturn.chunk) before fn returns.  No view escapes the callback.
-    //
-    // fn must be callable as fn(rune::node::WorkerReturn).
+    // fn must be callable as fn(rune::node::WorkerReturn); txnFn as
+    // txnFn(const rune::node::TxnReturn&).  The one-callback overload is for
+    // consumers that never receive a TxnReturn: one arriving there — or any
+    // unknown template id — is an invariant violation (std::logic_error; on the
+    // runtime thread NodeRuntimeAgent turns it into the exit-70 halt), never a
+    // silent skip.
     // -----------------------------------------------------------------------
     template <typename Fn>
     std::size_t drainReturn(Fn&& fn) {
+        return drainReturn(std::forward<Fn>(fn), [](const TxnReturn&) {
+            throw std::logic_error("Worker::drainReturn: a TxnReturn reached a consumer without a TxnReturn handler");
+        });
+    }
+
+    template <typename Fn, typename TxnFn>
+    std::size_t drainReturn(Fn&& fn, TxnFn&& txnFn) {
         int drained = ret_.drain(
-            [&fn](int32_t /*typeId*/,
-                  aeron::concurrent::AtomicBuffer& buf,
-                  aeron::util::index_t off,
-                  aeron::util::index_t /*len*/)
+            [&fn, &txnFn](int32_t /*typeId*/,
+                          aeron::concurrent::AtomicBuffer& buf,
+                          aeron::util::index_t off,
+                          aeron::util::index_t len)
             {
                 char* frame = reinterpret_cast<char*>(buf.buffer()) + off;
 
                 // SBE zero-copy decode: wrap the ring frame, read fields in place.
                 sbe::MessageHeader mh;
                 mh.wrap(frame, 0, 0, static_cast<std::uint64_t>(buf.capacity()) - off);
+                const auto templateId = mh.templateId();
+                if (templateId == kTxnReturnTemplateId) [[unlikely]] {
+                    TxnReturn txn;
+                    if (!decodeTxnReturn(frame, static_cast<std::size_t>(len), txn)) [[unlikely]]
+                        throw std::logic_error("Worker::drainReturn: malformed TxnReturn frame");
+                    txnFn(txn);
+                    return;
+                }
+                if (templateId != sbe::WorkerReturn::sbeTemplateId()) [[unlikely]]
+                    throw std::logic_error("Worker::drainReturn: unknown return template id " +
+                                           std::to_string(templateId));
                 sbe::WorkerReturn dec;
                 dec.wrapForDecode(frame, sbe::MessageHeader::encodedLength(),
                                   mh.blockLength(), mh.version(),
@@ -585,12 +649,6 @@ public:
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
-    // F15 S3 RED stub: the two-callback drain (TxnReturn dispatch, m7) — the
-    // TxnReturn callback is not wired yet.
-    template <typename Fn, typename TxnFn>
-    std::size_t drainReturn(Fn&& fn, TxnFn&& /*txnFn*/) {
-        return drainReturn(std::forward<Fn>(fn));
-    }
 
     // -----------------------------------------------------------------------
     // E3 Task 5: test accessor — cumulative count of successful io_.submit calls
@@ -617,17 +675,13 @@ public:
     [[nodiscard]] CompletionToken durableAckTokenForTest() const noexcept { return durableAckToken_; }
     [[nodiscard]] std::size_t durablePendingCountForTest() const noexcept { return durablePending_.size(); }
     [[nodiscard]] int64_t     reservedAckSlotsForTest() const noexcept { return reservedAckSlots_(); }
-    // F15 S3 RED stubs (behaviour-preserving): FIFO size, high-water pauses,
-    // TxnReturn emission and the shard-ingress poll budget.
-    [[nodiscard]] std::size_t retFifoSizeForTest() const noexcept { return retOverflow_.size(); }
-    [[nodiscard]] uint64_t    retFifoHighWaterPausesForTest() const noexcept { return 0; }
-    void enqueueTxnReturnForTest(const TxnReturn& /*r*/) {}
-    [[nodiscard]] int64_t ingressPollBudgetForTest() const noexcept {
-        const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
-        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) + reservedAckSlots_();
-        const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
-        return std::min(static_cast<int64_t>(desiredFragmentLimit_), available);
-    }
+    // F15 S3: the return FIFO (§6) — size, op-drain high-water pauses
+    // (retFifoHighWaterPauses, watched by the DR matrix), TxnReturn emission
+    // (S6 emits them; tests drive it directly) and the ingress poll budget.
+    [[nodiscard]] std::size_t retFifoSizeForTest() const noexcept { return retFifo_.size(); }
+    [[nodiscard]] uint64_t    retFifoHighWaterPausesForTest() const noexcept { return retFifoHighWaterPauses_; }
+    void enqueueTxnReturnForTest(const TxnReturn& r) { enqueueTxnReturn_(r); }
+    [[nodiscard]] int64_t ingressPollBudgetForTest() const noexcept { return ingressPollBudget_(); }
     /// -1 when this worker has no flush slot for `log`.
     [[nodiscard]] int64_t lastSyncedLeoForTest(const rune::storage::Log* log) noexcept {
         const LogFlushSlot* slot = slotOf_(log);
@@ -733,20 +787,18 @@ public:
 
         // E5.1.2d: G-A6 backpressure path (only active when perWorkerIngressActive_).
         //
-        // 2a. Flush overflow acks FIRST — acks that could not be written to ret_
-        //     in a prior cycle.  Stops as soon as ret_ is full again.
-        //     While retOverflow_ is non-empty, no new ingress polling occurs.
+        // 2a. Flush the return FIFO FIRST (F15 §6, every mode) — returns that
+        //     could not be written to ret_ in a prior cycle, in emission order.
+        //     Stops as soon as ret_ is full again.  While the FIFO is non-empty,
+        //     no new ingress polling occurs and the op drain is capped / paused
+        //     at kOverflowHighWater (drainIngress_).
         // 2b. Flush owed acks=all — checks each pending ack's replica HW;
         //     fires the ack when HW >= lastOffset, or a timeout error if overdue.
-        //     While pendingAcksAll_ is non-empty, no new ingress polling occurs.
-        // 3.  Poll WorkerIngress ONLY IF ret_ has space AND retOverflow_ is empty
-        //     AND pendingAcksAll_ is empty.
-        //     Skipping the poll when any ack backlog exists ensures Aeron's term
-        //     buffer fills → client offer() back-pressures.  No ack is ever
-        //     dropped (G-A6 structural enforcement).
-        // Round 5: ordered must-deliver returns (markers) may sit in retOverflow_
-        // in every mode — flush them first, before any newer return is produced.
-        work += flushRetOverflow_();
+        // 3.  Poll WorkerIngress ONLY IF the FIFO is empty and the reservation
+        //     (ring room + static owed cap) has room.  Skipping the poll lets
+        //     Aeron's term buffer fill → client offer() back-pressures.  No
+        //     return is ever dropped (G-A6 structural enforcement).
+        work += flushRetFifo_();
         // F15 S2 (I-A, addendum R-4a): acks=all waiters are parked on THIS worker
         // in EVERY mode (gateway-routed produces included), so the per-pass fire
         // + §3.2 re-validation runs in every mode — not only with per-worker
@@ -760,7 +812,7 @@ public:
             // replication round-trip (no new intake while any ack was in flight →
             // throughput = batch / round-trip).  Now the owed acks are bounded by
             // ret_ capacity (reservation below subtracts them) instead of 1.
-            if (retOverflow_.empty() &&
+            if (retFifo_.empty() &&
                 ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
                 work += pollWorkerIngress_(nowNs);
             }
@@ -860,10 +912,10 @@ private:
         //     session announcements) must be applied before the intake they govern.
         work += static_cast<int>(drainIngress_());
         // 3. client ingress → append (G-A6 gate unchanged).
-        work += flushRetOverflow_();
+        work += flushRetFifo_();
         // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
         // into ret_ later: reserve for every one of them (G-A6, never drop).
-        if (retOverflow_.empty() &&
+        if (retFifo_.empty() &&
             ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
             work += pollWorkerIngress_(nowNs);
         }
@@ -901,79 +953,96 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // enqueueReturn_ — R3: encode a WorkerReturn into returnScratch_ and
-    //                  write it to the ret_ OneToOneByteRing.
+    // F15 S3 (§6, m5 + I8; §1.1 L2): ONE return path in every mode.
     //
-    // G-A6 (WorkerIngress path): if ret_.write() fails (ring full), the ack is
-    // pushed to retOverflow_ — a per-worker "ack overflow queue".  The overflow
-    // queue is flushed at the TOP of the perWorkerIngressActive_ block on the
-    // NEXT doWork cycle (before any new ingress polling).  This ensures:
-    //   (a) No ack is ever silently dropped.
-    //   (b) The worker holds back (does not poll more frames) when ret_ is full
-    //       or an overflow ack is pending — G-A6 structural enforcement.
+    // enqueueReturn_ / enqueueTxnReturn_: if the local FIFO (retFifo_) is
+    // non-empty, append to its back (a later return never overtakes an earlier
+    // one through a ring slot that freed up in between); else tryClaim a ret_
+    // slot and encode in place (SBE wrap-in-place, no intermediate copy); on a
+    // refusal (ring full), append to the FIFO.  flushRetFifo_ drains it
+    // front-to-back each pass and stops at the first refusal.
     //
-    // Non-WorkerIngress path (existing gateway ingress ring): silent drop is
-    // preserved (same as original R3 behaviour — TODO(R5)).
+    // Never a drop, in any mode (the Legacy-mode silent drop is gone).  A
+    // tryClaim exception (a return the ring can never hold), an encode error,
+    // or a full FIFO (beyond its static bound) is an invariant-violation halt
+    // (exit 70) — never a drop, never a retry loop.
     //
+    // Bypass (L2): enqueueSignal_ for StorageFailure / OwnershipAck only.
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
-    // SBE wrap-in-place encode of a WorkerReturn into the claimed ring slot at
-    // ret_.base()+idx (no intermediate struct/memcpy).  Shared by enqueueReturn_
-    // and flushRetOverflow_.
-    void encodeReturnSbe_(const WorkerReturn& ret, aeron::util::index_t idx, std::size_t n) {
-        encodeWorkerReturnSbe(reinterpret_cast<char*>(ret_.base() + idx), n, ret);
+    void enqueueReturn_(const WorkerReturn& ret) {
+        if (retFifo_.empty() && tryWriteReturn_(ret)) [[likely]] return;
+        if (!retFifo_.push(ret)) [[unlikely]] haltRetFifoFull_();
+    }
+    void enqueueReturn_(WorkerReturn&& ret) {
+        if (retFifo_.empty() && tryWriteReturn_(ret)) [[likely]] return;
+        if (!retFifo_.push(std::move(ret))) [[unlikely]] haltRetFifoFull_();
+    }
+    void enqueueTxnReturn_(const TxnReturn& r) {
+        if (retFifo_.empty() && tryWriteTxnReturn_(r)) return;
+        if (!retFifo_.push(r)) [[unlikely]] haltRetFifoFull_();
     }
 
-    void enqueueReturn_(const WorkerReturn& ret) {
-        // Task 10 round 5: FIFO with anything already waiting in retOverflow_ — a
-        // later return must never overtake an earlier one through a ring slot
-        // that freed up in between (ProduceResult vs ControlRecordAppended).
-        if (!retOverflow_.empty()) {
-            retOverflow_.push_back(ret);
-            return;
-        }
-        // SBE wrap-in-place: reserve the exact ring slot (computeLength) then encode
-        // the return DIRECTLY into it.  tryClaim() < 0 = explicit back-pressure.
-        const std::size_t n = sbe::MessageHeader::encodedLength() +
-                              sbe::WorkerReturn::computeLength(ret.chunk.size());
-        aeron::util::index_t idx;
+    // One claim + in-place encode + commit of a WorkerReturn.  False = ring
+    // full (back-pressure); any exception halts.
+    [[nodiscard]] bool tryWriteReturn_(const WorkerReturn& ret) {
+        aeron::util::index_t idx = -1;
+        std::size_t n = 0;
         try {
+            n   = workerReturnEncodedLength(ret);
             idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
         } catch (const std::exception& ex) {
-            spdlog::error("Worker {}: enqueueReturn_ tryClaim failed: {}", workerId_, ex.what());
-            return;
+            haltInvariant_("return-ring tryClaim threw", ex.what(), ret.chunk.size());
+        } catch (...) {
+            haltInvariant_("return-ring tryClaim threw", "non-std exception", ret.chunk.size());
         }
-        if (idx < 0) {
-            if (perWorkerIngressActive_) {
-                // G-A6: push to overflow queue instead of dropping.
-                // flushRetOverflow_ will retry on the next doWork cycle.
-                retOverflow_.push_back(ret);
-            } else {
-                // Non-WorkerIngress path: preserve existing silent-drop behaviour.
-                // TODO(R5): add retry or back-pressure propagation for this path too.
-                spdlog::warn("Worker {}: ret_ ring full — WorkerReturn type={} dropped",
-                             workerId_, static_cast<int>(ret.type));
-            }
-            return;
+        if (idx < 0) return false;
+        try {
+            encodeWorkerReturnSbe(reinterpret_cast<char*>(ret_.base() + idx), n, ret);
+        } catch (const std::exception& ex) {
+            ret_.abort(idx);
+            haltInvariant_("WorkerReturn encode threw", ex.what(), ret.chunk.size());
+        } catch (...) {
+            ret_.abort(idx);
+            haltInvariant_("WorkerReturn encode threw", "non-std exception", ret.chunk.size());
         }
-        encodeReturnSbe_(ret, idx, n);
         ret_.commit(idx);
+        return true;
+    }
+    [[nodiscard]] bool tryWriteTxnReturn_(const TxnReturn& r) {
+        constexpr std::size_t n = txnReturnEncodedLength();
+        aeron::util::index_t idx = -1;
+        try {
+            idx = ret_.tryClaim(kTxnReturnTemplateId, n);
+        } catch (const std::exception& ex) {
+            haltInvariant_("return-ring tryClaim threw (TxnReturn)", ex.what(), 0);
+        } catch (...) {
+            haltInvariant_("return-ring tryClaim threw (TxnReturn)", "non-std exception", 0);
+        }
+        if (idx < 0) return false;
+        if (encodeTxnReturn(reinterpret_cast<char*>(ret_.base() + idx), n, r) != n) [[unlikely]] {
+            ret_.abort(idx);
+            haltInvariant_("TxnReturn encode failed", "short buffer", 0);
+        }
+        ret_.commit(idx);
+        return true;
     }
 
-    // Task 10 round 5: a must-deliver return that is ORDERED with the produce
-    // results (ControlRecordAppended / ControlRecordRefused): the same FIFO as
-    // ProduceResults (retOverflow_), never dropped in any mode — unlike
-    // pendingSignals_, which is flushed at the END of a pass and so could be
-    // overtaken by a later ProduceResult (the next transaction's batch).
-    void enqueueOrderedReturn_(const WorkerReturn& ret) {
-        if (!retOverflow_.empty()) { retOverflow_.push_back(ret); return; }
-        const std::size_t n = sbe::MessageHeader::encodedLength() +
-                              sbe::WorkerReturn::computeLength(ret.chunk.size());
-        aeron::util::index_t idx = -1;
-        try { idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n); } catch (...) { idx = -1; }
-        if (idx < 0) { retOverflow_.push_back(ret); return; }
-        encodeReturnSbe_(ret, idx, n);
-        ret_.commit(idx);
+    // Invariant-violation halt from the worker thread (exit 70, the same code
+    // as BrokerNode::kExitInvariantViolation).  Fail-stop: the worker cannot
+    // deliver a return it owes, and dropping it would silently lose an answer
+    // or a transactional fact.  Cold, never returns.
+    [[noreturn]] [[gnu::cold]] [[gnu::noinline]]
+    void haltInvariant_(const char* what, const char* detail, std::size_t chunkBytes) const noexcept {
+        spdlog::critical("Worker {}: INVARIANT VIOLATION — {} ({}; chunk={} B, ret_ maxMsgLength={}, "
+                         "return FIFO {}/{}) — halting (exit {})",
+                         workerId_, what, detail, chunkBytes, ret_.maxMsgLength(), retFifo_.size(),
+                         retFifo_.capacity(), kExitInvariantViolation);
+        spdlog::default_logger()->flush();
+        std::_Exit(kExitInvariantViolation);
+    }
+    [[noreturn]] [[gnu::cold]] [[gnu::noinline]] void haltRetFifoFull_() const noexcept {
+        haltInvariant_("return FIFO full (beyond its static bound)", "F15 §6 bound exceeded", 0);
     }
 
     // -----------------------------------------------------------------------
@@ -1156,6 +1225,21 @@ private:
         // the HW-advancing fast-acks) must not queue behind a small per-tick cap.
         // (Default was 16 → under the acks=majority fast-ack storm the ingress ring
         // backed up multiple ticks; see control→worker handoff p99.)
+        //
+        // F15 S3 (§6), every mode: with a non-empty return FIFO, drain at most
+        // kOverflowHighWater − |FIFO| ops (each emits at most one return), and
+        // none once |FIFO| >= kOverflowHighWater — the rest waits in the op ring
+        // (control-side producers already queue on a full op ring).  Transient:
+        // the control thread drains ret_ every cycle and never waits on an op
+        // ring, so the FIFO always flushes (no deadlock).
+        int limit = ingressDrainLimit_;
+        if (const std::size_t backlog = retFifo_.size(); backlog != 0) [[unlikely]] {
+            if (backlog >= kOverflowHighWater) {
+                ++retFifoHighWaterPauses_;
+                return 0;
+            }
+            limit = std::min(limit, static_cast<int>(kOverflowHighWater - backlog));
+        }
         int drained = ingress_.drain(
             [this](int32_t /*typeId*/,
                    aeron::concurrent::AtomicBuffer& buf,
@@ -1168,7 +1252,7 @@ private:
                     reinterpret_cast<const uint8_t*>(buf.buffer()) + off;
                 executeFromWire_(frame, static_cast<std::size_t>(len));
             },
-            ingressDrainLimit_);   // configurable (RUNE_WORKER_INGRESS_DRAIN_LIMIT); was the 16 default
+            limit);   // configurable (RUNE_WORKER_INGRESS_DRAIN_LIMIT, ≤ kMaxIngressDrainLimit); was the 16 default
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
@@ -1864,11 +1948,15 @@ private:
         // Only read if there are records available (within the HW-bound).
         if (nextOffset < hwBound) {
             try {
-                // kMaxChunkBytes constant mirrored here; must stay in sync with
-                // ClientGateway.  Gateway sets hwBound before enqueuing.
-                static constexpr int32_t kMaxChunkBytes =
-                    static_cast<int32_t>(512 * 1024); // 512 KiB
-                ret.chunk = log->read(nextOffset, kMaxChunkBytes);
+                // kMaxPushReadChunkBytes is mirrored by ClientGateway.  Gateway
+                // sets hwBound before enqueuing.
+                ret.chunk = log->read(nextOffset, kMaxPushReadChunkBytes);
+                // F15 S3: Log::read can return MORE than the budget (its window
+                // grows to reach a batch larger than it).  A return the ring can
+                // never hold would halt (§6) — cut the chunk at whole batches so
+                // it fits; only a single batch larger than the ring's max message
+                // is left to the claim's invariant halt.
+                if (ret.chunk.size() > pushReadChunkFit_()) [[unlikely]] trimToWholeBatches_(ret.chunk, pushReadChunkFit_());
             } catch (const std::exception& ex) {
                 spdlog::warn("Worker {}: log->read threw for topicId={} partition={}: {}",
                              workerId_, topicId, partition, ex.what());
@@ -1878,7 +1966,28 @@ private:
             }
         }
 
-        enqueueReturn_(ret);
+        enqueueReturn_(std::move(ret));   // chunk moved (never copied) into the FIFO if queued
+    }
+
+    // Largest PushReadResult chunk the return ring's max message can carry.
+    [[nodiscard]] std::size_t pushReadChunkFit_() const {
+        const std::size_t maxMsg = static_cast<std::size_t>(ret_.maxMsgLength());
+        const std::size_t fixed  = static_cast<std::size_t>(sbe::MessageHeader::encodedLength()) +
+                                   sbe::WorkerReturn::sbeBlockLength() +
+                                   static_cast<std::size_t>(sbe::WorkerReturn::chunkHeaderLength());
+        return maxMsg > fixed ? maxMsg - fixed : 0;
+    }
+    // Cut `chunk` to its longest prefix of whole record batches within `fit`
+    // bytes (cold).  A first batch alone larger than `fit` is left untouched.
+    [[gnu::cold]] static void trimToWholeBatches_(std::vector<uint8_t>& chunk, std::size_t fit) {
+        std::size_t pos = 0;
+        while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= chunk.size()) {
+            rune::protocol::RecordBatchReader r(chunk.data() + pos, chunk.size() - pos);
+            const int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > fit) break;
+            pos += static_cast<std::size_t>(total);
+        }
+        if (pos != 0) chunk.resize(pos);
     }
 
     // -------------------------------------------------------------------
@@ -2264,7 +2373,7 @@ private:
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ — {} for topicId={} partition={}",
                          workerId_, replica ? "empty marker tail" : "null replica", topicId, partition);
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
-            enqueueOrderedReturn_(ret);
+            enqueueReturn_(ret);
             return;
         }
         const std::span<const uint8_t> markerSpan(tail, static_cast<std::size_t>(tailLen));
@@ -2304,7 +2413,7 @@ private:
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw unknown", workerId_);
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
         }
-        enqueueOrderedReturn_(ret);   // same FIFO as ProduceResults, never dropped
+        enqueueReturn_(ret);   // same FIFO as ProduceResults, never dropped
     }
 
     // -------------------------------------------------------------------
@@ -2750,16 +2859,15 @@ private:
     };
     std::vector<PendingAcksAll> pendingAcksAll_;
 
-    // E5.1.2d: G-A6 overflow ack queue.
-    //
-    // When ret_.write() fails inside enqueueReturn_ (ring full) on the
-    // WorkerIngress path, the ack is pushed here instead of being dropped.
-    // flushRetOverflow_() retries these acks at the top of the next doWork
-    // cycle.  The G-A6 gate (retOverflow_.empty()) prevents new ingress
-    // polling while overflow acks are pending.
-    //
-    // Worker-thread only — plain vector, reserved in ctor.
-    std::vector<WorkerReturn> retOverflow_;
+    // F15 S3 (§6): the ONE local return FIFO in front of ret_, every mode.
+    // Pre-allocated fixed-capacity ring of tagged entries (WorkerReturn |
+    // TxnReturn), O(1) push / pop-front.  While it is non-empty: new ingress
+    // polling is gated (G-A6) and the op drain pauses at kOverflowHighWater.
+    // Worker-thread only.
+    ReturnFifo<kRetFifoCapacity> retFifo_;
+    // Passes whose op drain was paused at the high-water mark (DR matrix
+    // watches it for ISR-lag interaction in Legacy mode).
+    uint64_t retFifoHighWaterPauses_ = 0;
 
     // E5.1.2d: acks=all commit-wait timeout (ns).
     int64_t ackTimeoutNs_ = kDefaultAckTimeoutNs;
@@ -2802,16 +2910,10 @@ private:
     static constexpr std::size_t kValidatorsReserve = 16;
     std::unordered_map<int32_t, rune::codec::Validator> validators_;
 
-    // E5.1.3: desired fragment poll limit for reservation-before-poll.
-    // K = min(desiredFragmentLimit_, freeMaxMsgSlots − retOverflow_.size()).
-    // Source: NodeConfig::gatewayFragmentLimit (RUNE_GATEWAY_FRAGMENT_LIMIT, default 256).
-    // Set via setDesiredFragmentLimit() before the runner starts.
-    //
-    // retOverflow_ hard cap: retOverflow_ is structurally bounded at K entries
-    // per poll call since K ack slots were reserved before the poll.  When
-    // retOverflow_ is non-empty, the G-A6 gate in doWork suppresses new polling
-    // entirely (retOverflow_.empty() is required) — so the overflow vector never
-    // accumulates more than one poll-batch (K entries) of acks.
+    // E5.1.3: desired fragment poll limit for reservation-before-poll (see
+    // ingressPollBudget_).  Source: NodeConfig::gatewayFragmentLimit
+    // (RUNE_GATEWAY_FRAGMENT_LIMIT, default 256), clamped to kMaxFragmentLimit
+    // (F15 §6 bound).  Polling runs only while the return FIFO is empty (G-A6).
     int32_t desiredFragmentLimit_ = 256;
 
     // Expected ProduceResult return size (bytes) for the return-ring reservation.
@@ -3022,7 +3124,7 @@ private:
             const uint32_t n = op.tailLength();
             const auto* t = reinterpret_cast<const uint8_t*>(op.tail());
             if (t && n) ret.chunk.assign(t, t + n);
-            enqueueOrderedReturn_(ret);
+            enqueueReturn_(ret);
             return;
         }
         default:
@@ -3312,14 +3414,11 @@ private:
     }
 
     // ---- fsyncgate fail-stop -------------------------------------------------
+    // L2 bypass (StorageFailure / OwnershipAck): straight to ret_, else to
+    // pendingSignals_ (retried at the end of the pass) — never dropped; a claim
+    // or encode exception halts like every other return (F15 §6).
     void enqueueSignal_(const WorkerReturn& r) {
-        const std::size_t n = sbe::MessageHeader::encodedLength() +
-                              sbe::WorkerReturn::computeLength(r.chunk.size());
-        aeron::util::index_t idx = -1;
-        try { idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n); } catch (...) { idx = -1; }
-        if (idx < 0) { pendingSignals_.push_back(r); return; }   // retried next pass, never dropped
-        encodeReturnSbe_(r, idx, n);
-        ret_.commit(idx);
+        if (!tryWriteReturn_(r)) pendingSignals_.push_back(r);   // retried next pass, never dropped
     }
     int flushPendingSignals_() {
         if (pendingSignals_.empty()) return 0;
@@ -3467,41 +3566,21 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // flushRetOverflow_ — retry acks that could not be written to ret_ in a
-    //                     prior cycle (G-A6: no silent drop on WorkerIngress path).
+    // flushRetFifo_ — F15 §6: flush the return FIFO into ret_ front-to-back,
+    // stopping at the first refusal (ring still full; retried next pass).  O(1)
+    // per entry (fixed ring, pop-front by index).  A claim / encode exception
+    // halts inside tryWrite*_ — never an erase-and-continue drop.
     //
-    // Iterates retOverflow_; writes each ack to ret_ using enqueueReturn_.
-    // Stops as soon as a write fails (ring still full) so as not to spin.
-    // Entries that succeed are removed from the front of the vector.
-    //
-    // Worker-thread only.  Returns number of acks flushed.
+    // Worker-thread only.  Returns the number of returns flushed.
     // -----------------------------------------------------------------------
-    int flushRetOverflow_() {
-        if (retOverflow_.empty()) return 0;
-
+    int flushRetFifo_() {
         int flushed = 0;
-        // Iterate front-to-back; stop on first failure (ring still full).
-        // We temporarily disable perWorkerIngressActive_ guard in enqueueReturn_
-        // to avoid re-queuing into retOverflow_ during this flush pass.
-        // We do this by calling ret_.write() directly here.
-        while (!retOverflow_.empty()) {
-            const WorkerReturn& ret = retOverflow_.front();
-            const std::size_t n = sbe::MessageHeader::encodedLength() +
-                                  sbe::WorkerReturn::computeLength(ret.chunk.size());
-            aeron::util::index_t idx;
-            try {
-                idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
-            } catch (...) {
-                // Encode/size error: discard this entry and continue.
-                retOverflow_.erase(retOverflow_.begin());
-                continue;
-            }
-            if (idx < 0) {
-                break; // ring still full — stop; retry next cycle
-            }
-            encodeReturnSbe_(ret, idx, n);  // SBE wrap-in-place
-            ret_.commit(idx);
-            retOverflow_.erase(retOverflow_.begin());
+        while (!retFifo_.empty()) {
+            ReturnFifoEntry& e = retFifo_.front();
+            const bool ok = e.tag == ReturnFifoEntry::Tag::Txn ? tryWriteTxnReturn_(e.txn)
+                                                               : tryWriteReturn_(e.worker);
+            if (!ok) break;   // ring still full — stop; retry next cycle
+            retFifo_.popFront();
             ++flushed;
         }
         return flushed;
@@ -3630,7 +3709,13 @@ private:
     // facts-only return: now for acks=all, at fsync completion for Strict).
     [[nodiscard]] bool ackReservationAvailable_(int64_t returnsNow = 0) const noexcept {
         return ret_.freeSlotsForMsgSize(ackSlotBytes_) >
-               reservedAckSlots_() + static_cast<int64_t>(retOverflow_.size()) + returnsNow;
+               reservedAckSlots_() + static_cast<int64_t>(retFifo_.size()) + returnsNow &&
+               // F15 S3 (addendum S3): the STATIC owed-return cap — the answer
+               // parked now (+1) plus any further owed return (returnsNow:
+               // Strict owes its facts at fsync) must stay within
+               // kMaxOwedReturns, so pendingAcksAll_ / durablePending_ never
+               // outgrow their reservation and the §6 FIFO bound holds.
+               reservedAckSlots_() + 1 + returnsNow <= static_cast<int64_t>(kMaxOwedReturns);
     }
 
     // -----------------------------------------------------------------------
@@ -3668,20 +3753,14 @@ private:
     //
     // E5.1.3: Reservation-before-poll (G-A6 + throughput).
     //
-    // K = min(desiredFragmentLimit_, freeSlots − retOverflow_.size())
-    //   where freeSlots = ret_.freeMaxMsgSlots().
+    // K = ingressPollBudget_(): the ring reservation (free slots minus the FIFO
+    // and every owed return) AND the static owed-return cap (F15 S3) — each
+    // polled frame emits at most one return now or parks at most one owed one.
     //
     // This preserves G-A6 (never poll more frames than there are available
     // return slots) while allowing K > 1 per doWork cycle — removing the
-    // fragmentLimit=1 throughput cap from E5.1.2d.
-    //
-    // retOverflow_ cap: retOverflow_.size() is subtracted from the free-slot
-    // count before computing K.  retOverflow_ is structurally bounded because
-    // a non-empty overflow suppresses new ingress polling entirely (the G-A6
-    // gate in doWork_ requires retOverflow_.empty() to proceed to this function).
-    // When this function is called, retOverflow_.empty() is guaranteed by the
-    // caller, so the subtraction is always zero at this call site — it is
-    // included for defensive correctness if the call-site invariant ever changes.
+    // fragmentLimit=1 throughput cap from E5.1.2d.  The caller polls only while
+    // the return FIFO is empty (G-A6 gate in doWork).
     //
     // Never drops an ack: errors return error acks on ret_; acks=all go to
     // pendingAcksAll_ for deferred fire.
@@ -3695,20 +3774,27 @@ private:
                strictFactsOwed_;   // TEMPORARY (S5): owed Strict facts-only returns
     }
 
+    // Reservation-before-poll (E5.1.3 deliverable b), G-A6: never poll more
+    // frames than can be answered without dropping.  Reserve return-ring slots
+    // for BOTH the returns about to be polled AND every owed return (they fire
+    // into ret_ later), and — F15 S3 — keep the owed set within the STATIC cap
+    // kMaxOwedReturns (each polled frame parks at most one owed return), so
+    // pendingAcksAll_ / durablePending_ never outgrow their reservation and the
+    // §6 FIFO bound holds.
+    [[nodiscard]] int64_t ingressPollBudget_() const noexcept {
+        const int64_t owed      = reservedAckSlots_();
+        const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
+        const int64_t reserved  = static_cast<int64_t>(retFifo_.size()) + owed;
+        const int64_t ringRoom  = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
+        const int64_t capRoom   = static_cast<int64_t>(kMaxOwedReturns) > owed
+                                      ? static_cast<int64_t>(kMaxOwedReturns) - owed : 0;
+        return std::min({static_cast<int64_t>(desiredFragmentLimit_), ringRoom, capRoom});
+    }
+
     int pollWorkerIngress_(int64_t nowNs) {
         if (!workerIngress_ || !workerIngress_->resolved()) return 0;
 
-        // Reservation-before-poll (E5.1.3 deliverable b):
-        //   K = min(desiredFragmentLimit_, freeSlots − retOverflow_.size())
-        // Guard G-A6: never poll more frames than we can ack without dropping.
-        // Reserve return-ring slots for BOTH the acks about to be polled AND the
-        // acks already parked in pendingAcksAll_ (they fire into ret_ later).  This
-        // bounds pendingAcksAll_ by ret_ capacity while allowing acks=all pipelining.
-        const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
-        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) + reservedAckSlots_();
-        const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
-        const int32_t K = static_cast<int32_t>(
-            std::min(static_cast<int64_t>(desiredFragmentLimit_), available));
+        const int32_t K = static_cast<int32_t>(ingressPollBudget_());
         if (K <= 0) return 0; // no free slots — skip poll (G-A6 preserved)
 
         int polled = 0;
