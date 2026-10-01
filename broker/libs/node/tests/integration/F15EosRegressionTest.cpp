@@ -24,6 +24,8 @@
 #include <rune/storage/Log.h>
 #include <rune/transaction/ControlMarker.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
 
 #include <gtest/gtest.h>
 
@@ -1366,4 +1368,109 @@ TEST(TxnRoleGateRegression, NoOpEpochTruncationKeepsLogGeneration) {
     EXPECT_EQ(rep.logGeneration(), gen) << "a no-op truncation bumped logGeneration";
     truncateTo(rep, 5);                                       // OLE answer above the LEO: no-op
     EXPECT_EQ(rep.logGeneration(), gen);
+}
+
+// ============================================================================
+// F15 S2 fix round 2 (re-review 1).  B1: an ERROR result must never be taken
+// for the append-time facts-only return — the client must be answered and the
+// gateway mirrors (PSM / LSO) must never record a batch that was not appended.
+// Strict ruling: Strict facts are applied at fsync completion, never at
+// append — a retry after a failed fsync must not be answered duplicate-OK.
+// ============================================================================
+namespace {
+// Replace the worker's owned set (as a SetOwnership op from the runtime would).
+void setWorkerOwns(LegacyAcksRig& R, std::vector<PartitionReplica*> owned) {
+    WorkerOp op;
+    op.type = WorkerOp::Type::SetOwnership;
+    op.ownedSet = std::move(owned);
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(op)));
+    R.runWorker();
+}
+} // namespace
+
+TEST(LegacyAcksAllRegression, NotOwnedRefusalIsAnsweredAndNeverRecorded) {
+    // Ownership moved between the gateway's route and the worker's execution:
+    // the worker refuses the acks=all produce NotLeader.  The client is answered
+    // and the retry (ownership back) is APPENDED — never a duplicate-OK at 0.
+    LegacyAcksRig R({1, 2});
+    setWorkerOwns(R, {});
+    produceIdem(R, 1, 7, 0);
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0);
+    ASSERT_EQ(R.answers.size(), 1u) << "the not-owned refusal was swallowed as a facts-only return";
+    EXPECT_EQ(R.answers[0].code, kNotLeader);
+    setWorkerOwns(R, {R.r});
+    produceIdem(R, 2, 7, 0);                                  // the client's retry
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the retry was answered from a PSM entry for a never-appended batch";
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.size() < 2; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, 0);
+    EXPECT_EQ(R.answers[1].base, 0);
+}
+
+TEST(LegacyAcksAllRegression, SchemaRejectIsAnsweredAndNeverRecorded) {
+    // A schema-validation reject of an acks=all produce: answered
+    // SchemaValidationFailed, PSM untouched (a retry is validated again and
+    // rejected again — not a duplicate-OK), txn never registered.
+    LegacyAcksRig R({1, 2});
+    WorkerOp su;
+    su.type = WorkerOp::Type::SchemaUpdate; su.topicId = 0;
+    su.schemaUpdateBlob = rune::codec::serialize(rune::codec::DescriptorBuilder("s")
+        .add("id", rune::codec::PrimType::Int64).build());
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(su)));
+    R.runWorker();
+    ASSERT_TRUE(R.w().hasValidatorForTest(0));
+    constexpr int16_t kSchemaFailed = static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed);
+    produceIdem(R, 1, 7, 0, /*txn=*/true);                    // value "idem" is not a valid record
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0);
+    ASSERT_EQ(R.answers.size(), 1u) << "the schema reject was swallowed as a facts-only return";
+    EXPECT_EQ(R.answers[0].code, kSchemaFailed);
+    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 0u) << "a rejected txn batch was registered as open (LSO pinned)";
+    produceIdem(R, 2, 7, 0, /*txn=*/true);                    // retry
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, kSchemaFailed) << "the retry was answered from a PSM entry for a rejected batch";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0);
+}
+
+TEST(LegacyAcksAllRegression, StrictRetryAfterFsyncFailureIsNotDuplicateOk) {
+    // Strict acks=all whose fsync FAILS: the batch is not durable.  A retry must
+    // never be answered duplicate-OK (Strict facts are applied at fsync
+    // completion, not at append).
+    LegacyAcksRig R({1, 2}, /*tier=*/2);
+    R.w().forceFlushErrorForTest(EIO);
+    produceIdem(R, 1, 7, 0);
+    for (int i = 0; i < kCap && R.answers.empty(); ++i) { R.runWorker(); std::this_thread::yield(); }
+    ASSERT_EQ(R.answers.size(), 1u);
+    ASSERT_NE(R.answers[0].code, 0) << "precondition: the fsync failed";
+    produceIdem(R, 2, 7, 0);                                  // the client's retry
+    for (int i = 0; i < kCap && R.answers.size() < 2; ++i) { R.runWorker(); std::this_thread::yield(); }
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_NE(R.answers[1].code, 0) << "a Strict retry was answered duplicate-OK for data that is not durable";
+}
+
+TEST(LegacyAcksAllRegression, StrictAcksAllDedupsAfterFsync) {
+    // Strict acks=all success path: once the fsync completed, the facts are
+    // applied — a retry is a duplicate (one copy, original offset) and the next
+    // sequence is accepted (not OutOfOrderSequence) while the ack waits on the HW.
+    LegacyAcksRig R({1, 2}, /*tier=*/2);
+    produceIdem(R, 1, 7, 0);
+    R.runWorker();
+    for (int i = 0; i < kCap && R.w().durablePendingCountForTest() > 0; ++i) { R.runWorker(); std::this_thread::yield(); }
+    R.runWorker();
+    ASSERT_EQ(R.w().reservedAckSlotsForTest(), 1) << "precondition: fsynced, parked on the HW";
+    ASSERT_TRUE(R.answers.empty());
+    produceIdem(R, 2, 7, 0);                                  // retry of seq 0
+    R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, 0);
+    EXPECT_EQ(R.answers[0].base, 0);
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "one copy";
+    produceIdem(R, 3, 7, 1);                                  // seq 1
+    R.runWorker();
+    EXPECT_EQ(R.answers.size(), 1u) << "seq 1 answered (OutOfOrderSequence?) instead of being parked";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 2);
 }

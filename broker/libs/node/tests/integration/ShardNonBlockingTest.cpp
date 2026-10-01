@@ -118,7 +118,8 @@ struct Acks {
     int drain(Worker& w) {
         return static_cast<int>(w.drainReturn([&](WorkerReturn r) {
             if (r.type != WorkerReturn::Type::ProduceResult) return;
-            if (r.deferAck) { ++facts; return; }
+            if (r.deferAck && r.errorCode == 0) { ++facts; return; }
+            if (r.deferAck) ADD_FAILURE() << "an error result carries deferAck (would be swallowed as facts-only)";
             ++n; rets.push_back(r);
         }));
     }
@@ -1674,7 +1675,10 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         w.doWork(1);
         ASSERT_EQ(w.reservedAckSlotsForTest(), 1) << "precondition: parked on the owning worker";
         std::vector<WorkerReturn> rets;
-        w.drainReturn([&](WorkerReturn r) { if (!r.deferAck) rets.push_back(std::move(r)); });
+        w.drainReturn([&](WorkerReturn r) {
+            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
+            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
+        });
         ASSERT_TRUE(rets.empty()) << "only the append-time facts-only return before the move";
         R.reg.remove(5, 0);
         PartitionReplica* again = recreate ? R.add(5, 0) : nullptr;
@@ -1687,7 +1691,9 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         w.doWork(3);                                          // no read of the freed replica
         w.drainReturn([&](WorkerReturn r) {
             // answers only (skip OwnershipAck and the append-time facts-only return)
-            if (r.type == WorkerReturn::Type::ProduceResult && !r.deferAck) rets.push_back(std::move(r));
+            if (r.type != WorkerReturn::Type::ProduceResult) return;
+            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
+            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
         });
         EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
         ASSERT_EQ(rets.size(), 1u) << "recreate=" << recreate;

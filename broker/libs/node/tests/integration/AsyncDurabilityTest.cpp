@@ -172,7 +172,10 @@ struct WorkerHarness {
     int drainReturns() {
         int count = 0;
         worker->drainReturn([&](WorkerReturn ret) {
-            if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) { ++factsReturns; return; }
+            if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) {
+                if (ret.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
+                else { ++factsReturns; return; }
+            }
             lastReturn = ret;
             ++totalReturns;
             ++count;
@@ -464,7 +467,10 @@ TEST(AsyncDurability, SubmitRingFullHoldsProduce) {
     int returned = 0;
     bool sawNonOk = false;
     auto drainFn = [&](WorkerReturn ret) {
-        if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) return;   // facts-only, not an ack
+        if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) {
+            if (ret.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
+            else return;                                                          // facts-only, not an ack
+        }
         ++returned;
         if (ret.errorCode != 0) sawNonOk = true;
     };
