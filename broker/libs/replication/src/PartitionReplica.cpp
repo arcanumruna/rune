@@ -708,8 +708,10 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
         const rune::storage::LogReadView v =
             onLog([&](auto& L) { return L.readView(req.fetchOffset, req.maxBytes); });
-        // GR-1: whole batches only and never above req.maxBytes (the transport's
-        // frame ceiling); a first batch larger than the cap is not sent (as before).
+        // GR-1: whole batches only.  F18 / KIP-74: the first batch at fetchOffset
+        // is ALWAYS served whole even above req.maxBytes (readView already always
+        // includes it); later batches stay bounded by req.maxBytes.  The startup
+        // config check guarantees any accepted batch fits one replication frame.
         const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
                                                  static_cast<std::size_t>(req.maxBytes),
                                                  kNoPushCeiling);
@@ -1314,24 +1316,13 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
     if (req.maxBytes > 0 && req.fetchOffset < leo) {
         logBytes = onLog([&](auto& L){ return L.read(req.fetchOffset, req.maxBytes); });
 
-        // Whole-batch alignment (same as onFetchRequest) so the encoded frame
-        // fits transport limits.
+        // Whole-batch alignment — the SAME walk as onFetchRequest/push (GR-1).
+        // F18 / KIP-74: an oversized first batch is served whole (L.read always
+        // returns it), later batches stay bounded by req.maxBytes.
         if (!logBytes.empty()) {
-            const std::size_t cap = static_cast<std::size_t>(req.maxBytes);
-            std::size_t pos = 0, committedEnd = 0;
-            while (pos < logBytes.size()) {
-                std::size_t rem = logBytes.size() - pos;
-                if (rem < static_cast<std::size_t>(
-                        rune::protocol::batch::kRecordBatchOverhead)) break;
-                rune::protocol::RecordBatchReader r(logBytes.data() + pos, rem);
-                int32_t total = r.totalLength();
-                if (total <= 0) break;
-                std::size_t nextEnd = pos + static_cast<std::size_t>(total);
-                if (nextEnd > logBytes.size() || nextEnd > cap) break;
-                committedEnd = nextEnd;
-                pos = committedEnd;
-            }
-            logBytes.resize(committedEnd);
+            logBytes.resize(wholeBatchPrefix(logBytes.data(), logBytes.size(),
+                                             static_cast<std::size_t>(req.maxBytes),
+                                             kNoPushCeiling).bytes);
         }
 
         // DR-BUG-6 divergence guard — stamp each served batch's partitionLeaderEpoch
@@ -2212,7 +2203,8 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
         onLog([&](auto& L) { return L.readView(fromOffset, cfg_.maxFetchBytes); });
     // Advance lastPushedOffset_ by ONLY what is actually pushed (ceiling + cap bound).
     // The read is capped at maxFetchBytes; under a large backlog one push covers a
-    // prefix and the next duty cycle pushes the rest.  FLOW CONTROL: no batch that
+    // prefix and the next duty cycle pushes the rest.  F18 / KIP-74: a first batch
+    // larger than maxFetchBytes is still pushed whole (never stuck).  FLOW CONTROL: no batch that
     // begins at or beyond pushCeiling is pushed (in-flight <= kPushFlowWindow).
     const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
                                              static_cast<std::size_t>(cfg_.maxFetchBytes),

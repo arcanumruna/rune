@@ -35,12 +35,36 @@ TEST(BatchPrefix, CeilingStopsBeforeBatchAtOrAboveIt) {
     EXPECT_EQ(p.endOffset, 1);
 }
 
-TEST(BatchPrefixRegression, FirstBatchLargerThanCapYieldsNothing) {
+// F18 (KIP-74): a first batch larger than the cap is still served WHOLE — never
+// "nothing" (that stalled the follower at that offset forever).  Later batches
+// stay bounded by the cap.
+TEST(BatchPrefixRegression, FirstBatchLargerThanCapIsStillServedWhole) {
     std::size_t one = 0;
     const auto all = threeBatches(one);
     const auto p = wholeBatchPrefix(all.data(), all.size(), one - 1, 1LL << 62);
+    EXPECT_EQ(p.bytes, one);
+    EXPECT_EQ(p.endOffset, 1);
+    // cap 0 → still exactly the first batch.
+    const auto z = wholeBatchPrefix(all.data(), all.size(), 0, 1LL << 62);
+    EXPECT_EQ(z.bytes, one);
+    EXPECT_EQ(z.endOffset, 1);
+}
+
+// The flow-control ceiling still applies to the first batch (push window).
+TEST(BatchPrefixRegression, CeilingStillGatesAnOversizedFirstBatch) {
+    std::size_t one = 0;
+    const auto all = threeBatches(one);
+    const auto p = wholeBatchPrefix(all.data(), all.size(), one - 1, /*ceiling=*/0);
     EXPECT_EQ(p.bytes, 0u);
     EXPECT_EQ(p.endOffset, -1);
+}
+
+// A torn (incomplete) first batch is never served, whatever the cap.
+TEST(BatchPrefixRegression, TornOversizedFirstBatchNotServed) {
+    std::size_t one = 0;
+    auto all = threeBatches(one);
+    all.resize(one - 1);
+    EXPECT_EQ(wholeBatchPrefix(all.data(), all.size(), 1, 1LL << 62).bytes, 0u);
 }
 
 TEST(BatchPrefix, TornTailIgnoredAndNullSafe) {
