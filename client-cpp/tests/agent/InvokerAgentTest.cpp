@@ -21,7 +21,6 @@ int64_t monoNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-constexpr int kCap = 200'000;
 } // namespace
 
 TEST(InvokerAgent, ProduceResponsesAreBufferedForTheOwnerWhenNoHookIsSet) {
@@ -40,7 +39,8 @@ TEST(InvokerAgent, ProduceResponsesAreBufferedForTheOwnerWhenNoHookIsSet) {
     test_support::InvokerGateway gw(cfg.transport.dataDir + "/aeron", "aeron:ipc", 3500,
                                     "aeron:ipc", 3501);
     auto drive = [&](auto&& pred) {
-        for (int i = 0; i < kCap; ++i) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
             agent.doWork(monoNs());
             gw.pump();
             if (pred()) return true;
@@ -81,8 +81,10 @@ TEST(InvokerAgent, AckBurstBeyondReserveDoesNotAllocateRegression) {
     agent.start();
     test_support::InvokerGateway gw(cfg.transport.dataDir + "/aeron", "aeron:ipc", 3510,
                                     "aeron:ipc", 3511);
-    auto drive = [&](auto&& pred, int cap = kCap) {
-        for (int i = 0; i < cap; ++i) {
+    // cap < 0 (default): until pred holds, 10 s failure deadline; explicit caps stay strict.
+    auto drive = [&](auto&& pred, int cap = -1) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (int i = 0; cap < 0 ? std::chrono::steady_clock::now() < deadline : i < cap; ++i) {
             agent.doWork(monoNs());
             gw.pump();
             if (pred()) return true;

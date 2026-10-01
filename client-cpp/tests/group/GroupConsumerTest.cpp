@@ -1591,7 +1591,7 @@ TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression
     rv.topicId = kTopicId;
     rv.partition = kPartition;
     hub_->onRecords(rv);
-    EXPECT_GT(dispatched.load(), 0) << "the installed callback ran on the duty thread";
+    EXPECT_GT(dispatched.load(), 0) << "the setter was applied by the duty thread (only it drains the channel)";
 }
 
 // ---------------------------------------------------------------------------

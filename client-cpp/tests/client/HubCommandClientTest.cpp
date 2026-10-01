@@ -179,7 +179,8 @@ TEST(HubCommandClient, HubCommandFromCallbackWithFullRingFailsFastRegression) {
         }
     });
     auto drive = [&](auto pred) {
-        for (int i = 0; i < 200'000; ++i) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
             client.doWork();
             gw.pump();
             if (pred()) return true;

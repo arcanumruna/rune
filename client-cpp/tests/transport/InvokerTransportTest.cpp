@@ -1,5 +1,5 @@
 // tests/transport/InvokerTransportTest.cpp — AeronTransport in DriverMode::Invoker.
-// Every drive loop is bounded by kPumpCap duty cycles and needs no sleep: the
+// Every drive loop is bounded by a 10 s failure deadline and needs no sleep: the
 // test thread IS the driver.
 #include <rune/client/transport/AeronTransport.h>
 
@@ -41,11 +41,13 @@ Config invokerConfig(const std::string& ingress, const std::string& egress, int3
     return c;
 }
 
-constexpr int kPumpCap = 200'000;
+// Real Aeron setup needs real progress, not a CPU-speed-dependent iteration
+// count: loops run until pred holds; the 10 s deadline only ends a FAILING test.
 
 template <class Pred>
 bool pumpUntil(Transport& t, Pred&& pred) {
-    for (int i = 0; i < kPumpCap; ++i) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
         t.dutyCycle();
         if (pred()) return true;
     }
