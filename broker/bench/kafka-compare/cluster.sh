@@ -38,6 +38,10 @@ rune_start_cluster() {
   local termb="${RUNE_AERON_TERM_BUFFER_BYTES:-33554432}"
   local iring="${RUNE_WORKER_INGRESS_RING_BYTES:-33554432}"
   local rring="${RUNE_WORKER_RETURN_RING_BYTES:-33554432}"
+  # F18: the replication outbound ring's frame (/8) bounds the largest replicable
+  # batch; 32 MiB → ~4 MiB, so the bench's 1-2 MiB client batches are accepted
+  # (the 4 MiB default would auto-limit produce batches to ~512 KiB).
+  local oring="${RUNE_REPL_OUTBOUND_RING_BYTES:-33554432}"
   local peers; peers="$(rune_cluster_peers)"
   pkill -9 -x rune_broker 2>/dev/null; sleep 0.5
   RUNE_CLUSTER_PIDS=()
@@ -54,6 +58,7 @@ rune_start_cluster() {
         RUNE_PER_WORKER_INGRESS=true RUNE_PER_WORKER_EGRESS=true RUNE_TOPICS="$topics" \
         RUNE_IO_BACKEND="$io" RUNE_AERON_TERM_BUFFER_BYTES="$termb" \
         RUNE_WORKER_INGRESS_RING_BYTES="$iring" RUNE_WORKER_RETURN_RING_BYTES="$rring" \
+        RUNE_REPL_OUTBOUND_RING_BYTES="$oring" \
         RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$egbase \
         $(rune_shard_env "$i") \
         RUNE_ELECTION_TIMEOUT_MS="${RUNE_ELECTION_TIMEOUT_MS:-300}" \
