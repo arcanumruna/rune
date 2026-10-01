@@ -42,6 +42,10 @@ if(aeron_FOUND)
     # per-worker schema validation hook.  Any consumer of rune_replication_aeron
     # that includes Worker.h (directly or transitively) needs rune_codec headers.
     target_link_libraries(rune_replication_aeron PUBLIC rune_codec)
+    # F15 S4: Worker.h holds the worker-owned read_committed state (LsoTracker +
+    # AbortedTxnIndex, rune/transaction/ReadCommittedView.h).  No cycle:
+    # rune_transaction depends on storage / coordination / replication only.
+    target_link_libraries(rune_replication_aeron PUBLIC rune_transaction)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING

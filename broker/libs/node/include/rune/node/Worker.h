@@ -84,6 +84,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/ProducePath.h>
+#include <rune/transaction/ReadCommittedView.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>  // E5.1.3: pc::ErrorCode enum (replaces magic literals)
@@ -351,6 +352,27 @@ public:
     [[nodiscard]] bool owedCapThrottlingForTest() const noexcept { return owedCapThrottling_; }
     /// Test seam: emit an arbitrary return through the one return path.
     void enqueueReturnForTest(const WorkerReturn& r) { enqueueReturn_(r); }
+
+    // -----------------------------------------------------------------------
+    // F15 S4 (design note §2.1-§2.4, Option B): worker-owned read_committed
+    // state.  RED STUBS — behaviour-preserving; the real state lands with S4.
+    // -----------------------------------------------------------------------
+    static constexpr int kRcNone     = -1;   ///< no RC state for the partition
+    static constexpr int kRcUnbuilt  = 0;
+    static constexpr int kRcScanning = 1;
+    static constexpr int kRcReady    = 2;
+    [[nodiscard]] std::size_t rcOpenTxnsForTest(int32_t, int32_t) const { return 0; }
+    [[nodiscard]] std::vector<rune::transaction::AbortedTxnRange> rcAbortedRangesForTest(int32_t, int32_t) const {
+        return {};
+    }
+    [[nodiscard]] int rcStatusForTest(int32_t, int32_t) const { return kRcNone; }
+    [[nodiscard]] uint64_t rcScanPassesForTest(int32_t, int32_t) const { return 0; }
+    [[nodiscard]] std::size_t rcMaxPassBytesForTest() const { return 0; }
+    [[nodiscard]] std::size_t rcTrackerCapacityForTest(int32_t, int32_t) const { return 0; }
+    [[nodiscard]] uint64_t rcTrackerGrowthsForTest(int32_t, int32_t) const { return 0; }
+    void setRcScanBytesPerPass(int32_t) noexcept {}
+    /// PushRead ops executed by this worker (both answers and refusals).
+    [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
 
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
     // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the
@@ -2082,6 +2104,7 @@ private:
     void executePushReadWire_(sbe::WorkerOp& op) {
         RUNE_FR_SPAN_READ(rune_fr::Site::ReadEncodePush,
                           static_cast<uint32_t>(op.sessionId()));
+        ++pushReads_;
         const int32_t topicId    = op.topicId();
         const int32_t partition  = op.partition();
         const int64_t nextOffset = op.nextOffset();
@@ -3063,6 +3086,7 @@ private:
     // Re-review 1 I-4: PushReads answered MessageTooLarge because a stored
     // batch is larger than this worker's return ring's max message.
     uint64_t    pushReadOversize_ = 0;
+    uint64_t    pushReads_ = 0;            // F15 S4: PushRead ops executed (R-1 / R-3 tests)
     // Largest client batch the shard intake stores: min(the gateway's max
     // produce batch, one PushReadResult chunk of this worker's ret_).  Set in
     // the ctor (ret_ is fixed).
@@ -3292,6 +3316,7 @@ private:
             return;
         }
         case WorkerOp::Type::PushRead: {
+            ++pushReads_;
             // Empty result: the gateway clears its in-flight marker and re-issues
             // the read to the (new) owner on its next push cycle.
             WorkerReturn ret;

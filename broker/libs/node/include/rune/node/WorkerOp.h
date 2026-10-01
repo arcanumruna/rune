@@ -381,6 +381,21 @@ struct WorkerReturn {
 
     // The data chunk returned by log->read().  Moved out of the worker.
     std::vector<uint8_t> chunk;
+
+    // -----------------------------------------------------------------------
+    // F15 S4 (addendum R-3): a PushReadResult echoes the bound the OWNING
+    // worker applied and whether its read_committed state was ready.  The
+    // WorkerReturn layout is pinned (ProtocolRegression.WorkerReturnLayoutUnchanged),
+    // so two fields that a PushReadResult never otherwise uses carry them:
+    //   lastOffset → the effective bound W read up to (exclusive): min(op hwBound,
+    //                live HW) for read_uncommitted, min(op hwBound, LSO(live HW))
+    //                for read_committed; -1 when nothing was bounded (not ready).
+    //   deferAck   → read_committed state of the partition not yet Ready (§2.3).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int64_t pushEffectiveBound() const noexcept { return lastOffset; }
+    [[nodiscard]] bool    pushRcNotReady()     const noexcept { return deferAck; }
+    void setPushEffectiveBound(int64_t b) noexcept { lastOffset = b; }
+    void setPushRcNotReady(bool v) noexcept { deferAck = v; }
 };
 
 } // namespace rune::node

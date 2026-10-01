@@ -157,6 +157,10 @@ struct EosRig {
     Captured cap;
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(cap.fn());
     PartitionReplica* r = nullptr;
+    // F15 S4 retarget (design note §8 S4 row, I-E): Records the gateway pushed
+    // to a test session (no egress publication): (subscriptionId, baseOffset).
+    std::vector<std::pair<int64_t, int64_t>> recs;
+    int64_t lastSubId = 0;
     explicit EosRig(std::vector<NodeId> isr = {1}, uint8_t tier = 1, int minIsr = 1) {
         auto c = cfg(1, tier, 0, 0);
         c.minIsr = minIsr;
@@ -173,9 +177,38 @@ struct EosRig {
         gw.setPerWorkerIngressActive(true);
         w().setWorkerIngress(nullptr, true);
         if (tier == 2) w().setShardMode(true);
+        gw.setOnEgressFrame([this](int64_t, const uint8_t* b, std::size_t n) {
+            if (auto rec = pc::Records::decode(b, n)) recs.emplace_back(rec->subscriptionId, rec->baseOffset);
+            else if (auto sr = pc::SubscribeResponse::decode(b, n)) lastSubId = sr->subscriptionId;
+        });
         runWorker(1);   // ownership applied
     }
     Worker& w() { return pool.worker(0); }
+    // A GATEWAY-pushed subscription (the default egress path: the gateway reads
+    // worker-owned logs through the owning worker's PushRead op) from `from`.
+    int64_t subscribe(int64_t sid, uint8_t isolation, int64_t from = 0) {
+        pc::Subscribe sub;
+        sub.sessionId = sid; sub.correlationId = 9000 + static_cast<int64_t>(recs.size()); sub.topicId = 0;
+        sub.partition = 0; sub.partitionKnown = 1; sub.fromOffset = from; sub.isolation = isolation;
+        std::vector<uint8_t> frame(sub.encodedSize());
+        sub.encode(frame.data());
+        lastSubId = 0;
+        gw.applySubscribeForTest(frame.data(), frame.size());
+        return lastSubId;
+    }
+    // Gateway push passes interleaved with worker passes (PushRead → result).
+    void push(int passes, int64_t now) {
+        for (int i = 0; i < passes; ++i) { gw.pushSubscriptionsForTest(); runWorker(now + i); }
+    }
+    bool delivered(int64_t subId, int64_t base) const {
+        for (const auto& [s, b] : recs) if (s == subId && b == base) return true;
+        return false;
+    }
+    std::size_t deliveredCount(int64_t subId) const {
+        std::size_t n = 0;
+        for (const auto& [s, b] : recs) n += s == subId ? 1u : 0u;
+        return n;
+    }
     void runWorker(int64_t now) {
         w().doWork(now);
         w().drainReturn([&](WorkerReturn ret) { gw.handleWorkerReturnForTest(ret); });
@@ -193,8 +226,9 @@ struct EosRig {
         for (int i = 0; i < 64 && gw.markersInFlightForTest() > 0; ++i) runWorker(now + i);
         ASSERT_EQ(gw.markersInFlightForTest(), 0u) << "the marker reply reached the gateway";
     }
-    bool abortCovers(int64_t off) const {
-        for (const auto& rg : gw.abortedRangesForTest(0, 0)) if (rg.contains(off)) return true;
+    // F15 S4 retarget: the aborted ranges live on the OWNING worker (Option B).
+    bool abortCovers(int64_t off) {
+        for (const auto& rg : w().rcAbortedRangesForTest(0, 0)) if (rg.contains(off)) return true;
         return false;
     }
 };
@@ -338,8 +372,11 @@ TEST(ControlBatchRegression, GatewayInlineMarkerLandsAsControlBatch) {
 TEST(TxnFactOrderRegression, AcksAllParkedBatchBeforeAbortIsCovered) {
     EosRig R({1, 2});                                       // follower 2 in ISR: acks=all parks on HW
     const int64_t sid = R.gw.injectTestSession();
+    const int64_t rcSub = R.subscribe(sid, /*read_committed*/1);   // S4 retarget: declared scenario addition
+    ASSERT_GT(rcSub, 0);
     ASSERT_EQ(R.ingressTxn(sid, 1, /*pid=*/7, 0, 0, /*acks=all*/1, 2), 1);
     ASSERT_EQ(R.r->log()->logEndOffset(), 1) << "txn batch appended at 0";
+    ASSERT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
     R.runWorker(3);
     ASSERT_TRUE(R.cap.produceErrors.empty()) << "precondition: the ack is parked on the HW";
     R.abortMarker(7, 0, 10);                                // marker lands at 1; its reply overtakes the parked ack
@@ -352,14 +389,22 @@ TEST(TxnFactOrderRegression, AcksAllParkedBatchBeforeAbortIsCovered) {
     for (int i = 0; i < 64 && R.cap.produceErrors.empty(); ++i) R.runWorker(200 + i);
     ASSERT_EQ(R.cap.produceErrors.size(), 1u);
     EXPECT_EQ(R.cap.produceErrors[0], 0);
-    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 0u) << "the late result re-opened a resolved txn: the LSO is pinned forever";
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "the late result re-opened a resolved txn: the LSO is pinned forever";
+    const uint64_t reads = R.w().pushReadsForTest();
+    R.push(16, 300);
+    EXPECT_GT(R.w().pushReadsForTest(), reads) << "the read_committed subscription was served (non-vacuous)";
+    EXPECT_FALSE(R.delivered(rcSub, 0)) << "read_committed received the aborted batch";
+    EXPECT_EQ(R.deliveredCount(rcSub), 0u);
 }
 
 TEST(TxnFactOrderRegression, StrictDeferredBatchBeforeAbortIsCovered) {
     EosRig R({1}, /*tier=*/2);
     R.w().setReapPausedForTest(true);                       // the Strict ack waits on its fsync
     const int64_t sid = R.gw.injectTestSession();
+    const int64_t rcSub = R.subscribe(sid, /*read_committed*/1);   // S4 retarget: declared scenario addition
+    ASSERT_GT(rcSub, 0);
     ASSERT_EQ(R.ingressTxn(sid, 1, 7, 0, 0, /*acks=*/0, 2), 1);
+    ASSERT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
     R.runWorker(3);
     ASSERT_TRUE(R.cap.produceErrors.empty()) << "precondition: the Strict ack is parked on its fsync";
     R.abortMarker(7, 0, 10);
@@ -367,17 +412,31 @@ TEST(TxnFactOrderRegression, StrictDeferredBatchBeforeAbortIsCovered) {
     R.w().setReapPausedForTest(false);
     for (int i = 0; i < kCap && R.cap.produceErrors.empty(); ++i) { R.runWorker(100 + i); std::this_thread::yield(); }
     ASSERT_EQ(R.cap.produceErrors.size(), 1u);
-    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 0u) << "the late Strict result re-opened the aborted txn (LSO pinned)";
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "the late Strict result re-opened the aborted txn (LSO pinned)";
+    const uint64_t reads = R.w().pushReadsForTest();
+    R.push(16, 10'000'000);
+    EXPECT_GT(R.w().pushReadsForTest(), reads) << "the read_committed subscription was served (non-vacuous)";
+    EXPECT_FALSE(R.delivered(rcSub, 0)) << "read_committed received the aborted Strict batch";
+    EXPECT_EQ(R.deliveredCount(rcSub), 0u);
 }
 
 TEST(TxnFactOrderRegression, SessionGoneBatchStillRegistered) {
     EosRig R;
+    const int64_t reader = R.gw.injectTestSession();
+    const int64_t rcSub = R.subscribe(reader, /*read_committed*/1);   // S4 retarget: declared scenario addition
+    ASSERT_GT(rcSub, 0);
     // The producer's session is gone before its ProduceResult drains.
     ASSERT_EQ(R.ingressTxn(/*sid=*/424242, 1, 7, 0, 0, 0, 2), 1);
+    ASSERT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
     R.abortMarker(7, 0, 10);                                // result (dropped) then marker reply, in order
     ASSERT_EQ(R.r->log()->logEndOffset(), 2);
     EXPECT_TRUE(R.abortCovers(0)) << "the batch was appended (offset 0) but never registered: "
                                      "read_committed would deliver aborted data";
+    const uint64_t reads = R.w().pushReadsForTest();
+    R.push(16, 100);
+    EXPECT_GT(R.w().pushReadsForTest(), reads) << "the read_committed subscription was served (non-vacuous)";
+    EXPECT_FALSE(R.delivered(rcSub, 0)) << "read_committed received the aborted batch of a gone session";
+    EXPECT_EQ(R.deliveredCount(rcSub), 0u);
 }
 
 TEST(TxnFactOrderRegression, ZombieBatchAfterAbortMarkerIsFencedShardIngress) {
@@ -385,7 +444,10 @@ TEST(TxnFactOrderRegression, ZombieBatchAfterAbortMarkerIsFencedShardIngress) {
     // batch with an older epoch arriving AFTER the ABORT marker is refused.
     EosRig R;
     const int64_t sid = R.gw.injectTestSession();
+    const int64_t rcSub = R.subscribe(sid, /*read_committed*/1);   // S4 retarget: declared scenario addition
+    ASSERT_GT(rcSub, 0);
     ASSERT_EQ(R.ingressTxn(sid, 1, 7, /*epoch=*/0, 0, 0, 2), 1);
+    ASSERT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
     R.abortMarker(7, /*markerEpoch=*/1, 10);                // fence-abort: bumped epoch
     ASSERT_EQ(R.r->log()->logEndOffset(), 2);
     ASSERT_EQ(R.ingressTxn(sid, 2, 7, /*zombie epoch=*/0, 1, 0, 100), 1);
@@ -393,7 +455,12 @@ TEST(TxnFactOrderRegression, ZombieBatchAfterAbortMarkerIsFencedShardIngress) {
     ASSERT_EQ(R.cap.produceErrors.size(), 2u);
     EXPECT_EQ(R.cap.produceErrors[1], kInvalidProducerEpoch) << "the zombie must be fenced by the marker's epoch";
     EXPECT_EQ(R.r->log()->logEndOffset(), 2) << "the zombie batch was appended after the abort marker";
-    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 0u) << "the zombie opened a txn that never closes (LSO pinned)";
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "the zombie opened a txn that never closes (LSO pinned)";
+    const uint64_t reads = R.w().pushReadsForTest();
+    R.push(16, 200);
+    EXPECT_GT(R.w().pushReadsForTest(), reads) << "the read_committed subscription was served (non-vacuous)";
+    EXPECT_FALSE(R.delivered(rcSub, 0)) << "read_committed received the aborted batch";
+    EXPECT_FALSE(R.delivered(rcSub, 2)) << "read_committed received the zombie batch";
 }
 
 // ============================================================================
@@ -516,11 +583,14 @@ TEST(TxnRoleGateRegression, DemotionFailsParkedStrictAckNotLeader) {
 
 TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: acks=all marker refused
+    const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);   // S4 retarget: declared scenario addition
+    ASSERT_GT(rcSub, 0);
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
     T.produceTxn();                                          // acks=0: no ISR gate, lands at 0
     for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
     ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    ASSERT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
     ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "EndTxn deferred while the marker is in flight";
     T.runUntilNoMarkerAwaited(10);
     EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "no marker in the log";
@@ -531,7 +601,12 @@ TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
         << "an EndTxn response was sent (error=" << T.endTxnFrameError(0).value_or(-1)
         << ") while no COMMIT marker exists";
     EXPECT_EQ(T.addPartition(), kConcurrent) << "the next txn may not start while the marker is unwritten";
-    EXPECT_EQ(T.m.gw.openTxnsForTest(0, 0), 1u) << "the LSO stays pinned at the open txn (correct)";
+    EXPECT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u) << "the LSO stays pinned at the open txn (correct)";
+    const uint64_t reads = T.m.w().pushReadsForTest();
+    T.m.push(16, 100);
+    (void)reads;   // the LSO (== the open txn's first offset, 0) holds the read itself back
+    EXPECT_FALSE(T.m.delivered(rcSub, 0)) << "read_committed received the open txn's batch";
+    EXPECT_EQ(T.m.deliveredCount(rcSub), 0u);
 }
 
 // ============================================================================
@@ -1299,8 +1374,9 @@ TEST(LegacyAcksAllRegression, TxnBatchRegisteredAtAppendAndCoveredAfterFailedAck
     R.runWorker();
     ASSERT_EQ(R.r->log()->logEndOffset(), 1);
     ASSERT_TRUE(R.answers.empty()) << "precondition: the ack is parked";
-    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 1u) << "the open txn is not registered while its ack is parked "
-                                                 "(read_committed bound not held)";
+    // F15 S4: observed on the OWNING worker (the gateway mirror is deleted, Option B).
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "the open txn is not registered while its ack is parked "
+                                                    "(read_committed bound not held)";
     R.now += 31'000'000'000LL;
     for (int i = 0; i < 4 && R.answers.empty(); ++i) R.runWorker();
     ASSERT_EQ(R.answers.size(), 1u);
@@ -1312,9 +1388,9 @@ TEST(LegacyAcksAllRegression, TxnBatchRegisteredAtAppendAndCoveredAfterFailedAck
     ASSERT_EQ(R.gw.markersInFlightForTest(), 0u);
     ASSERT_EQ(R.r->log()->logEndOffset(), 2) << "the ABORT marker landed at 1";
     bool covered = false;
-    for (const auto& rg : R.gw.abortedRangesForTest(0, 0)) covered = covered || rg.contains(0);
+    for (const auto& rg : R.w().rcAbortedRangesForTest(0, 0)) covered = covered || rg.contains(0);
     EXPECT_TRUE(covered) << "the appended txn batch whose ack failed is not covered by the abort";
-    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 0u);
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u);
 }
 
 TEST(LegacyAcksAllRegression, InlinePathStaleAckFailsNotLeaderWithoutDereference) {
@@ -1432,7 +1508,7 @@ TEST(LegacyAcksAllRegression, SchemaRejectIsAnsweredAndNeverRecorded) {
     EXPECT_EQ(R.r->log()->logEndOffset(), 0);
     ASSERT_EQ(R.answers.size(), 1u) << "the schema reject was swallowed as a facts-only return";
     EXPECT_EQ(R.answers[0].code, kSchemaFailed);
-    EXPECT_EQ(R.gw.openTxnsForTest(0, 0), 0u) << "a rejected txn batch was registered as open (LSO pinned)";
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "a rejected txn batch was registered as open (LSO pinned)";
     produceIdem(R, 2, 7, 0, /*txn=*/true);                    // retry
     for (int i = 0; i < 4; ++i) R.runWorker();
     ASSERT_EQ(R.answers.size(), 2u);
