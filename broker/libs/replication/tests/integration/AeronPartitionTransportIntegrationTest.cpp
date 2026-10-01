@@ -574,3 +574,39 @@ TEST(WorkerReplicationTransportInteg, GatherSendArrivesByteIdenticalRegression) 
     const std::vector<uint8_t> huge(static_cast<std::size_t>(maxRecords) + 1, 0x22);
     EXPECT_NO_THROW(a.sendFetchResponse(2, mk(huge)));
 }
+
+// F16 regression: transport traffic counters / flight-recorder sequences were
+// file-static globals shared by every AeronPartitionTransport in the process, so
+// two transports polled on two threads (two in-process nodes, or per-worker
+// transports) raced on them (TSan: GR5_Integration.AcksAll_Deferred_HWGate).
+// Each transport must own its counters: polling/draining A never moves B's.
+TEST(AeronPartitionTransportRegression, TrafficCountersArePerInstance) {
+    TempDir driverTd("rune_f16_driver_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    const uint16_t portA = discoverFreeUdpPort();
+    const uint16_t portB = discoverFreeUdpPort();
+    ASSERT_NE(portA, portB);
+    constexpr int32_t kStream = 501;
+    AeronPartitionTransport a(aeronClient, udpChannel(portA), kStream, /*selfId=*/1);
+    AeronPartitionTransport b(aeronClient, udpChannel(portB), kStream, /*selfId=*/2);
+    a.addPeer(2, udpChannel(portB), kStream);
+    b.addPeer(1, udpChannel(portA), kStream);
+
+    const auto b0 = b.txStatsForTest();
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1; req.partition = 0; req.followerId = 1;
+    req.fetchOffset = 0; req.maxBytes = 1024; req.topicId = 0;
+    a.sendFetchRequest(req);          // enqueue on A's outbound ring
+    (void)a.poll(1'000'000);          // A drains it (and counts one poll)
+
+    const auto a1 = a.txStatsForTest();
+    const auto b1 = b.txStatsForTest();
+    EXPECT_GE(a1.outDrained, 1) << "A drained its own outbound frame";
+    EXPECT_GE(a1.polls, 0);
+    EXPECT_EQ(b1.outDrained, b0.outDrained) << "draining A must not move B's counter";
+    EXPECT_EQ(b1.polls, b0.polls) << "polling A must not move B's counter";
+}

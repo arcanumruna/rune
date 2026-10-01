@@ -163,6 +163,10 @@ public:
     [[nodiscard]] std::size_t heldReplicaPointersForTest() const noexcept { return replicas_.size(); }
     /// Test hook: feed one reassembled replication frame through onFragment.
     void deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs);
+    /// F16: this transport's own traffic counters (shared-nothing: per instance,
+    /// written only by the thread that polls it).  Control thread / tests.
+    struct TxStats { int64_t polls = 0; int64_t fragsRecv = 0; int64_t outDrained = 0; };
+    [[nodiscard]] TxStats txStatsForTest() const noexcept;
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -367,6 +371,14 @@ private:
     // Back-pressure observability: bumped when the outbound ring is full and a
     // (retriable) send had to be skipped. Control-thread reads for logging.
     uint64_t outboundRingFullCount_ = 0;
+
+    // F16: traffic counters + FR receive sequence — per instance, written only by
+    // the thread that polls this transport (no process-wide globals, no atomics).
+    int64_t  txRateLastNs_ = 0;
+    int64_t  txPolls_      = 0;   ///< poll() calls (RUNE_FS_LOG only)
+    int64_t  txFragsRecv_  = 0;   ///< fragments received
+    int64_t  txOutDrained_ = 0;   ///< outbound messages drained to Aeron
+    uint32_t inRecvSeq_    = 0;   ///< FR ReplFragRecv correlation
 
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.
