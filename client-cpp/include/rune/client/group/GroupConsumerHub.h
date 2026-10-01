@@ -117,6 +117,11 @@ public:
     /// Deactivate all consumers (send LeaveGroup where possible + fire onRevoked).
     void closeAll(int64_t sessionId, const SendFn& sendFn);
 
+    /// fix1 I4: consumers whose generation snapshot a near-full status ring
+    /// refused; the duty cycle calls republishDirty() while non-zero.
+    [[nodiscard]] std::size_t dirtyCount() const noexcept { return dirtyCount_; }
+    int republishDirty();
+
     /// True if there are no registered consumers (duty thread).
     [[nodiscard]] bool empty() const noexcept { return impls_.empty(); }
 
@@ -139,6 +144,32 @@ private:
     // fix1 C1 / fix2 minor-5: plain counter (see testCallbackExceptionCount()).
     uint64_t callbackExceptions_ = 0;
 
+    // F8a fix1 C1: the consumer whose callback is running (null otherwise).
+    GroupConsumerImpl* dispatching_ = nullptr;
+    // F8a fix1 I6: correlationIds for commitSync's OffsetCommit (0 = untracked).
+    int64_t nextCommitCorrId_ = 1;
+    // F8a fix1 I4.
+    std::size_t dirtyCount_ = 0;
+
+    /// RAII: marks impl as "callback running"; on exit, if the callback
+    /// finished the consumer, closes its status ring (now that no callback runs).
+    struct DispatchScope {
+        GroupConsumerHub&  hub;
+        GroupConsumerImpl& impl;
+        GroupConsumerImpl* prev;
+        DispatchScope(GroupConsumerHub& h, GroupConsumerImpl& i) noexcept;
+        ~DispatchScope();
+        DispatchScope(const DispatchScope&) = delete;
+        DispatchScope& operator=(const DispatchScope&) = delete;
+    };
+
+    enum class CommitSend : uint8_t { Nothing, Sent, SendFailed };
+
+    static void failCommitSync_(GroupConsumerImpl& impl, const char* why);
+    static void closeStatus_(GroupConsumerImpl& impl);
+    void toRejoining_(GroupConsumerImpl& impl);
+    void publishGeneration_(GroupConsumerImpl& impl);
+
     // ---- Internal helpers (runner thread only) ------------------------------
 
     /// Send JoinGroup for impl; transitions to Joining.
@@ -156,10 +187,12 @@ private:
                               int64_t sessionId,
                               const SendFn& sendFn);
 
-    /// Send OffsetCommit for impl's current positions (skips unseeded sentinel entries).
-    static void sendOffsetCommit(GroupConsumerImpl& impl,
-                                 int64_t sessionId,
-                                 const SendFn& sendFn);
+    /// Send OffsetCommit for impl's current positions (skips unseeded sentinel
+    /// entries) carrying `correlationId` (0 = no commitSync waits on it).
+    static CommitSend sendOffsetCommit(GroupConsumerImpl& impl,
+                                       int64_t sessionId,
+                                       const SendFn& sendFn,
+                                       int64_t correlationId);
 
     /// Send OffsetFetch for all currently-assigned partitions to seed positions
     /// from the broker's committed offsets.  Called after entering Stable.
@@ -179,8 +212,8 @@ private:
     GroupConsumerImpl* find_(uint64_t handle) const noexcept;
 
     /// Deactivate impl: inactive, fail a pending commitSync with `why`, close
-    /// its status ring (the handle then never touches the Client again).
-    static void finish_(GroupConsumerImpl& impl, const char* why);
+    /// its status ring (deferred to the end of its running callback, if any).
+    void finish_(GroupConsumerImpl& impl, const char* why);
 
     /// Apply a new assignment to impl: fire revoked+assigned callbacks. Not
     /// static (fix1 C1): catches/counts a throwing callback via callbackExceptions_.

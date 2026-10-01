@@ -27,6 +27,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <thread>
 
 namespace rune::client {
 
@@ -99,10 +100,10 @@ struct Record {
 // RecordHandler — called once per record on the AGENT thread.
 //
 // Contract:
-//   - Must NOT block (sleep, mutex wait, I/O, call close()).
-//   - Must NOT call unsubscribe() from within the handler (that would attempt
-//     a ring write from the agent thread — deadlock).  Unsubscribe from the
-//     app thread instead.
+//   - Must NOT block (sleep, mutex wait, I/O, call Client::close()).
+//   - MAY call unsubscribe() (or destroy the Subscription) — on the duty thread
+//     the unsubscribe is applied directly: no further record of the batch is
+//     delivered, and the routing entry is removed once this handler returns.
 //   - The record's key/value spans are valid only during this call.
 // ---------------------------------------------------------------------------
 using RecordHandler = std::function<void(const Record&)>;
@@ -125,7 +126,7 @@ struct SubscriptionStatus {
 //     the SubscribeAdd command is put on the agent ring, whose release/acquire
 //     publishes them): correlationId, topicId, partition, handler;
 //   - duty-thread owned (plain fields, never touched by an app thread):
-//     subscriptionId, nextOffset, active, statusDirty;
+//     subscriptionId, nextOffset, active, statusDirty, the dirty-list links;
 //   - the cross-thread channel: `status` (StatusRing — the ring's own memory
 //     ordering is the only synchronisation; its single consumer is the
 //     Subscription handle).
@@ -142,6 +143,9 @@ struct SubscriptionImpl {
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
+    // Intrusive links of the hub's dirty list (no allocation on the dispatch path).
+    SubscriptionImpl* prevDirty = nullptr;
+    SubscriptionImpl* nextDirty = nullptr;
 
     // ---- Duty thread -> app handle ------------------------------------------------
     detail::StatusRing<SubscriptionStatus> status;
@@ -159,21 +163,26 @@ struct SubscriptionImpl {
 // Subscription — user-facing RAII handle returned by Client::subscribe().
 //
 // Threading (F8a):
-//   - The handle is OWNED by one app thread at a time (it is move-only).  All
-//     of its methods must be called by that owner — never concurrently from
-//     two threads on the same handle.
+//   - The handle is OWNED by one app thread at a time (it is move-only).  Its
+//     app-side methods must be called by that owner — never concurrently from
+//     two app threads on the same handle.
+//   - Calls from INSIDE a callback (i.e. on the duty thread, Thread mode) are
+//     allowed: they act directly on duty-owned state and never touch the
+//     handle's app-side cache.  In Invoker mode the owner thread is the duty
+//     thread and every call is the owner's.
 //   - unsubscribe() / the dtor hand an Unsubscribe command to the duty thread
-//     through the agent command ring; the duty thread removes the routing
-//     entry and sends the Unsubscribe frame.  No shared state is touched.
-//   - position() / subscriptionId() / active() drain the subscription's status
-//     ring and answer from the handle's own cache (eventually consistent: the
-//     duty thread publishes after each delivered Records frame and on every
-//     lifecycle change).
-//   - Do NOT call unsubscribe() from within the RecordHandler.  Unsubscribe
-//     from the app thread.
-//   - Once the subscription is finished on the duty side (unsubscribed, timed
-//     out, or the Client closed), the handle never touches the Client again —
-//     a handle may safely outlive its Client.
+//     (applied directly when already on it).  Delivery is GUARANTEED: a full
+//     command ring is waited out on duty-thread progress, never a timeout,
+//     never a throw.
+//   - position() / subscriptionId() drain the subscription's status ring and
+//     answer from the handle's own cache (eventually consistent).
+//   - finished(): the duty side is done with this subscription.  Once it
+//     returns true, NO further handler call will run and position() is final.
+//     Resume pattern: unsubscribe(); wait until finished(); then read
+//     position() and re-subscribe with From::offset(position()).
+//   - Once finished, the handle never touches the Client again — a handle may
+//     safely outlive its Client (but must not be used CONCURRENTLY with the
+//     Client's destruction).
 //
 // Records start arriving once the broker acknowledges (SubscribeResponse).
 // There is no wait for the ack in subscribe() itself; the Subscription is
@@ -183,11 +192,13 @@ class Subscription {
 public:
     // ---- Construction (called by Client::subscribe()) -----------------------
 
-    /// Constructed by Client::subscribe().  `sink`/`sinkCtx` deliver the
-    /// Unsubscribe command to the duty thread (the Client's command ring).
+    /// Constructed by Client::subscribe().  `sink`/`sinkCtx` deliver commands
+    /// to the duty thread.  `dutyThread`: the Thread-mode runner (calls from it
+    /// take the duty path); a default id (Invoker mode, tests) disables that.
     Subscription(std::shared_ptr<SubscriptionImpl> impl,
                  detail::HubCommandSink            sink,
-                 void*                             sinkCtx) noexcept;
+                 void*                             sinkCtx,
+                 std::thread::id                   dutyThread = {}) noexcept;
 
     // RAII: dtor calls unsubscribe() if still active (never throws).
     ~Subscription();
@@ -202,32 +213,38 @@ public:
 
     // ---- API ----------------------------------------------------------------
 
-    /// Ask the duty thread to unsubscribe (Unsubscribe frame + stop local
-    /// dispatch).  Idempotent.  After it returns, active() is false; the
-    /// handler may still fire for records already being dispatched on the duty
-    /// thread before it applies the command.
-    /// Throws only if the command ring stays full past the bounded wait (see
-    /// Client::producer()); the destructor swallows (and logs) that.
+    /// Unsubscribe (Unsubscribe frame + stop local dispatch).  Idempotent.
+    /// After it returns, active() is false; the handler may still fire for
+    /// records the duty thread dispatches before it applies the command — wait
+    /// for finished() to know it no longer can.  Never throws for a full ring.
     void unsubscribe();
 
-    /// Return the next expected offset (lastDelivered + 1); 0 before any record.
-    /// The resume point: re-subscribe with From::offset(position()).
+    /// Next expected offset (lastDelivered + 1); 0 before any record.  Final
+    /// once finished() is true.
     [[nodiscard]] int64_t position() const;
 
-    /// True until unsubscribe(), or until the duty thread finished the
-    /// subscription (subscribe timed out / failed, or the Client closed).
+    /// True until unsubscribe(), or until the duty side finished the
+    /// subscription (unsubscribed, subscribe timed out / failed, Client closed).
     [[nodiscard]] bool active() const;
+
+    /// True once the duty side finished this subscription: no further handler
+    /// call will run, and position() is final.
+    [[nodiscard]] bool finished() const noexcept;
 
     /// The subscriptionId assigned by the broker (0 until the SubscribeResponse
     /// has been processed — records cannot arrive before then).
     [[nodiscard]] int64_t subscriptionId() const;
 
 private:
+    [[nodiscard]] bool onDutyThread_() const noexcept {
+        return dutyThread_ != std::thread::id{} && std::this_thread::get_id() == dutyThread_;
+    }
     void drainStatus_() const;
 
     std::shared_ptr<SubscriptionImpl> impl_;
     detail::HubCommandSink            sink_    = nullptr;
     void*                             sinkCtx_ = nullptr;
+    std::thread::id                   dutyThread_{};
     bool                              moved_        = false;
     bool                              unsubscribed_ = false;  // handle-local (app-owned)
     // App-owned cache of the latest status snapshot drained from impl_->status.

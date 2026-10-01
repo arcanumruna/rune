@@ -87,9 +87,14 @@ fires on the agent thread with zero-copy spans. F8a (shared-nothing): the
 thread; `subscribe()`/`unsubscribe()`/RAII dtor send `HubCommand`s on the agent
 command ring, and `position()`/`subscriptionId()`/`active()` drain a
 per-subscription `StatusRing` the agent publishes to (once per Records frame +
-lifecycle changes; eventually consistent). The handle is owned by one thread at
-a time and may outlive its Client (closed status ring ⇒ it never touches the
-Client again).
+lifecycle changes; eventually consistent; dirty snapshots retried every duty
+cycle). Status rings are SPSC `detail::OneToOneRingBuffer` (faithful Aeron port).
+Unsubscribe / GroupConsumer close have guaranteed delivery (applied directly on
+the duty thread; otherwise a full ring is waited out on duty progress — never a
+timeout, never a throw). `finished()` ⇒ no further callback, `position()` final:
+resume = unsubscribe(), wait for finished(), then read position(). The handle is
+owned by one thread at a time (calls from inside its callbacks are allowed) and
+may outlive its Client.
 
 ### 2.3 Group consumer (`group/`)
 `GroupConsumer` runs the full join/sync/stable/rejoin state machine, heartbeat,

@@ -76,6 +76,11 @@ struct InvokerGateway {
     std::vector<Produced> ackBeforeNextConnect;
     int connects = 0;
     int metadataRequests = 0;
+    // F8a: direct subscriptions (Subscribe -> SubscribeResponse; Records pushes).
+    struct Subscribed { int64_t subscriptionId; int32_t topicId; int32_t partition; int64_t sessionId; };
+    std::vector<Subscribed> subscribed;
+    std::vector<int64_t>    unsubscribed;  // subscriptionIds
+    int64_t nextSubscriptionId = 500;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -185,6 +190,19 @@ struct InvokerGateway {
         send(pr.endpoint, buf, n);
     }
 
+    /// Push one Records frame of `count` records at baseOffset to a subscription.
+    void pushRecords(const Subscribed& sub, int64_t baseOffset, int32_t count) {
+        namespace rcc = rune::client::codec;
+        rune::protocol::RecordBatchBuilder b(baseOffset, 1'000'000);
+        for (int32_t i = 0; i < count; ++i) b.append("k", "v", 1'000'000 + i);
+        const std::vector<uint8_t> batch = b.build();
+        std::vector<uint8_t> out(batch.size() + 256);
+        const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId,
+                                                 sub.topicId, sub.partition, baseOffset,
+                                                 std::span<const uint8_t>(batch), sub.sessionId, 0);
+        send(0, out.data(), n);
+    }
+
     void releaseHeld() {
         std::vector<Produced> h;
         h.swap(held);
@@ -239,6 +257,23 @@ private:
                 return;
             }
             ack(pr);
+            return;
+        }
+        case rcc::TemplateId::Subscribe: {
+            const auto sv = rcc::decodeSubscribe(buf, len);
+            if (!sv) return;
+            const Subscribed sub{nextSubscriptionId++, sv->topicId, sv->partition, sv->sessionId};
+            subscribed.push_back(sub);
+            uint8_t out[64];
+            const std::size_t n = rcc::encodeSubscribeResponse(
+                out, sizeof out, 0, sv->partition, sub.subscriptionId, sv->sessionId,
+                sv->correlationId);
+            send(0, out, n);
+            return;
+        }
+        case rcc::TemplateId::Unsubscribe: {
+            const auto uv = rcc::decodeUnsubscribe(buf, len);
+            if (uv) unsubscribed.push_back(uv->subscriptionId);
             return;
         }
         default:

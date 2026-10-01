@@ -939,6 +939,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerSendTest.cpp
             tests/detail/M2ORingBufferTest.cpp
+            tests/detail/OneToOneRingBufferTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/client/HubCommandClientTest.cpp
             tests/support/AllocCounter.cpp

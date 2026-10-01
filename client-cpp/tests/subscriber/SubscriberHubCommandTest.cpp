@@ -236,9 +236,9 @@ TEST(SubscriberHubCommand, StatusRingNearFullNeverLosesFinalPositionRegression) 
     EXPECT_EQ(sub.subscriptionId(), 5);
 }
 
-// A refused (dirty) snapshot is republished by the periodic sweep once the app
-// drained — position() converges without any further Records frame.
-TEST(SubscriberHubCommand, DirtyStatusRepublishedBySweepRegression) {
+// fix1 I4: a refused (dirty) snapshot is retried by the duty cycle as soon as
+// the app has drained (progress-based) — not by the 100 ms sweep.
+TEST(SubscriberHubCommand, DirtyStatusRepublishedEveryDutyCycleRegression) {
     SubscriberHub hub;
     CaptureSend   send;
     CapturingSink sink;
@@ -250,11 +250,12 @@ TEST(SubscriberHubCommand, DirtyStatusRepublishedBySweepRegression) {
     std::vector<uint8_t> st;
     constexpr int kFrames = 300;
     for (int i = 0; i < kFrames; ++i) hub.onRecords(records(st, 6, i, 1));
-    ASSERT_TRUE(impl->statusDirty);
-    EXPECT_LT(sub.position(), kFrames) << "stale until the duty thread republishes";
+    ASSERT_EQ(hub.dirtyCount(), 1u);
+    EXPECT_EQ(hub.republishDirty(), 0) << "app has not drained: still refused";
+    EXPECT_LT(sub.position(), kFrames) << "stale until the duty cycle republishes";
 
-    hub.sweepTimedOut(std::chrono::steady_clock::now());
-    EXPECT_FALSE(impl->statusDirty);
+    EXPECT_EQ(hub.republishDirty(), 1) << "the app drained: next duty cycle publishes";
+    EXPECT_EQ(hub.dirtyCount(), 0u);
     EXPECT_EQ(sub.position(), kFrames);
 }
 
@@ -290,6 +291,86 @@ TEST(SubscriberHubCommand, TimedOutSubscribeFinishesHandleRegression) {
     hub.sweepTimedOut(std::chrono::steady_clock::now() + std::chrono::seconds(1));
     EXPECT_EQ(hub.pendingCount(), 0u);
     EXPECT_FALSE(sub.active());
+}
+
+// ---------------------------------------------------------------------------
+// fix1 C1(a): a handle used ON the duty thread (from inside its own handler)
+// applies the unsubscribe directly; the hub defers the erase / ring close to
+// the end of the dispatch.
+// ---------------------------------------------------------------------------
+namespace {
+struct DirectSubSink {
+    SubscriberHub* hub;
+    CaptureSend*   send;
+    int            calls = 0;
+    static rcd::HubSubmit fn(void* ctx, const rcd::HubCommand& c) {
+        auto* self = static_cast<DirectSubSink*>(ctx);
+        ++self->calls;
+        self->hub->applyCommand(c, 700 + self->calls, kSession, self->send->fn());
+        return rcd::HubSubmit::Accepted;
+    }
+};
+} // namespace
+
+TEST(SubscriberHubCommand, UnsubscribeInsideHandlerStopsTheBatchAndDefersFinishRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    DirectSubSink ds{&hub, &send};
+    auto impl = makeImpl(30);
+    // dutyThread = this thread: the handle takes the duty path, like a call
+    // from inside a callback on the runner.
+    rc::Subscription sub(impl, &DirectSubSink::fn, &ds, std::this_thread::get_id());
+    int delivered = 0;
+    bool finishedInsideHandler = true;
+    impl->handler = [&](const rc::Record&) {
+        ++delivered;
+        sub.unsubscribe();
+        finishedInsideHandler = sub.finished();
+    };
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.onSubscribeResponse(bindRsp(30, 40), 0, kSession, send.fn());
+
+    std::vector<uint8_t> st;
+    hub.onRecords(records(st, 40, 0, 5));
+    EXPECT_EQ(delivered, 1) << "no further record of the batch after the in-handler unsubscribe";
+    EXPECT_FALSE(finishedInsideHandler) << "finished() must not be true while a handler runs";
+    EXPECT_TRUE(sub.finished());
+    EXPECT_EQ(hub.activeCount(), 0u);
+    EXPECT_EQ(send.countUnsubscribe(40), 1);
+    EXPECT_EQ(sub.position(), 1) << "final position = last delivered + 1";
+
+    hub.onRecords(records(st, 40, 5, 2));
+    EXPECT_EQ(delivered, 1) << "no callbacks after finished()";
+}
+
+// Destroying the Subscription from inside its own handler must not free the
+// running std::function: the routing entry (and its impl reference) lives until
+// the dispatch ends.
+TEST(SubscriberHubCommand, DestroyHandleInsideHandlerKeepsImplAliveUntilDispatchEndsRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    DirectSubSink ds{&hub, &send};
+    auto impl = makeImpl(31);
+    std::weak_ptr<rc::SubscriptionImpl> weak = impl;
+    auto sub = std::make_unique<rc::Subscription>(impl, &DirectSubSink::fn, &ds,
+                                                  std::this_thread::get_id());
+    bool aliveAfterReset = false;
+    int delivered = 0;
+    impl->handler = [&](const rc::Record&) {
+        ++delivered;
+        sub.reset();  // dtor -> unsubscribe -> applied directly on this thread
+        aliveAfterReset = !weak.expired();
+    };
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.onSubscribeResponse(bindRsp(31, 41), 0, kSession, send.fn());
+    impl.reset();  // only the hub (and the handle) hold it now
+
+    std::vector<uint8_t> st;
+    hub.onRecords(records(st, 41, 0, 3));
+    EXPECT_EQ(delivered, 1);
+    EXPECT_TRUE(aliveAfterReset) << "the impl (and the running handler) must outlive the reset";
+    EXPECT_TRUE(weak.expired()) << "released once the dispatch ended";
+    EXPECT_EQ(hub.activeCount(), 0u);
 }
 
 // ---------------------------------------------------------------------------

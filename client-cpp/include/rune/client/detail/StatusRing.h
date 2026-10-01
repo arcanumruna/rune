@@ -2,29 +2,30 @@
 // StatusRing — F8a single-producer / single-consumer "latest status" channel.
 //
 // Shared-nothing law: a value the duty thread owns (a subscription's bound
-// subscriptionId / resume position, a consumer's liveness) is NEVER read by an
-// app thread directly.  The duty thread PUBLISHES snapshots of it into this
-// ring; the app-side handle (the ring's single consumer) drains the ring and
-// keeps the latest snapshot in its own, app-owned cache.  The only cross-thread
-// memory ordering is the ring's own (M2ORingBuffer head/tail/length/closed
-// words) — no std::atomic, no lock, anywhere in this class.
+// subscriptionId / resume position, a consumer's generation) is NEVER read by an
+// app thread directly.  The duty thread (the ONE producer) PUBLISHES snapshots
+// of it into this ring; the app-side handle (the ONE consumer) drains the ring
+// and keeps the latest snapshot in its own, app-owned cache.  The only cross-
+// thread memory ordering is the ring's own (OneToOneRingBuffer header/head/tail
+// and its two closed words) — no std::atomic, no lock, anywhere in this class.
 //
-// The ring's `closed` trailer word doubles as the "this channel is finished"
-// signal: the duty thread (or Client::close()) publishes the final snapshot and
-// THEN closes the ring.  An app thread that observes closed() (acquire) and
-// drains afterwards therefore always sees that final snapshot, and knows its
-// handle must never again submit a command to a Client that may be gone.
+// Two "finished" words, ONE WRITER EACH (fix round 1):
+//   - producer side: close() — the duty thread (or Client::close() after the
+//     duty thread is gone) publishes the FINAL snapshot and THEN closes.  An app
+//     thread that observes producerClosed() (acquire) and drains afterwards sees
+//     that final snapshot, and knows no callback for this channel will run again.
+//   - consumer side: abandon() — the app thread that created the handle marks a
+//     registration that was never (or indeterminately) delivered.
 //
 // Back-pressure (latest-value semantics, never a lost final state):
-//   - tryPublish(): ordinary updates (e.g. a position advance per Records
-//     frame).  Written only while at least kReserveRecords record slots remain
-//     free; otherwise refused (the caller marks itself dirty and retries on a
-//     later duty cycle — a newer snapshot supersedes it anyway).
-//   - publishFinal(): lifecycle snapshots (bind, final/close).  Always fits:
-//     ordinary updates never consume the reserve, and at most a couple of
-//     lifecycle snapshots are ever written per channel.
+//   - tryPublish(): ordinary updates.  Written only while kReserveRecords slots
+//     stay free (checked through the producer's head cache — no per-publish read
+//     of the consumer's head); otherwise refused (the caller marks itself dirty
+//     and retries on a following duty cycle — a newer snapshot supersedes it).
+//   - publishFinal(): lifecycle snapshots.  Always fits: ordinary updates never
+//     consume the reserve, and at most a couple are written per channel.
 
-#include <rune/client/detail/M2ORingBuffer.h>
+#include <rune/client/detail/OneToOneRingBuffer.h>
 
 #include <concurrent/AtomicBuffer.h>
 
@@ -59,52 +60,57 @@ public:
     // ---- Producer side (the duty thread only) ------------------------------
 
     /// Ordinary update.  false = refused (ring near-full: the consumer has not
-    /// drained for a while) or the channel is already closed.
+    /// drained for a while) or the channel is already finished.
     bool tryPublish(const T& v) {
         if (ring_.closed()) return false;
-        const std::int64_t used = ring_.tailPosition() - ring_.headPosition();
-        if (static_cast<std::int64_t>(Capacity) - used <
-            static_cast<std::int64_t>(kRecordBytes) * (2 + kReserveRecords)) {
-            return false;
-        }
+        if (!ring_.hasCapacityFor(kRecordBytes * (2 + kReserveRecords))) return false;
         return write_(v);
     }
 
-    /// Lifecycle update — uses the reserve.  false only if already closed (or,
-    /// impossibly given the reserve, the ring is completely full).
+    /// Lifecycle update — uses the reserve.  false only if already closed.
     bool publishFinal(const T& v) {
-        if (ring_.closed()) return false;
+        if (ring_.producerClosed()) return false;
         return write_(v);
     }
 
-    /// Mark the channel finished (release).  Idempotent.  Any thread that
-    /// established it is the channel's last writer (duty thread, or the
-    /// closing thread after the duty thread is gone).
-    void close() noexcept { ring_.closed(true); }
+    /// Producer side: the channel is finished (release).  Idempotent.
+    void close() noexcept { ring_.producerClose(); }
 
     // ---- Consumer side (the app-side handle only) --------------------------
 
     /// Drain everything published so far; `latest` receives the newest
-    /// snapshot.  Returns true if anything was read.
+    /// snapshot.  Returns true if anything was read.  Loops until the head stops
+    /// moving, so a read that consumed only end-of-buffer padding is followed
+    /// by the one that reaches the record past the wrap.
     bool drainLatest(T& latest) {
         bool any = false;
-        ring_.read([&](std::int32_t, aeron::concurrent::AtomicBuffer& buf,
-                       aeron::util::index_t offset, aeron::util::index_t len) {
-            if (len == static_cast<aeron::util::index_t>(sizeof(T))) {
-                std::memcpy(&latest, buf.buffer() + offset, sizeof(T));
-                any = true;
-            }
-        });
+        for (;;) {
+            const std::int64_t before = ring_.consumerPosition();
+            ring_.read([&](std::int32_t, aeron::concurrent::AtomicBuffer& buf,
+                           aeron::util::index_t offset, aeron::util::index_t len) {
+                if (len == static_cast<aeron::util::index_t>(sizeof(T))) {
+                    std::memcpy(&latest, buf.buffer() + offset, sizeof(T));
+                    any = true;
+                }
+            });
+            if (ring_.consumerPosition() == before) break;
+        }
         return any;
     }
 
-    /// Either side: has the channel been closed (acquire)?
+    /// Consumer side: abandon the channel (release).  Idempotent.
+    void abandon() noexcept { ring_.consumerClose(); }
+
+    /// Either side: finished by the producer (no further callbacks; the last
+    /// published snapshot is final)?
+    [[nodiscard]] bool producerClosed() const noexcept { return ring_.producerClosed(); }
+    /// Either side: finished by either side?
     [[nodiscard]] bool closed() const noexcept { return ring_.closed(); }
 
 private:
     static constexpr std::size_t totalBytes() noexcept {
         return static_cast<std::size_t>(Capacity) +
-               static_cast<std::size_t>(M2ORingBuffer::trailerLength());
+               static_cast<std::size_t>(OneToOneRingBuffer::trailerLength());
     }
 
     bool write_(const T& v) {
@@ -115,7 +121,7 @@ private:
     }
 
     std::unique_ptr<std::uint8_t[]> storage_;
-    M2ORingBuffer                   ring_;
+    OneToOneRingBuffer              ring_;
 };
 
 } // namespace rune::client::detail

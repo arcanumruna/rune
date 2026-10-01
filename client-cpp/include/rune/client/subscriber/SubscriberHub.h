@@ -156,8 +156,6 @@ public:
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.
     /// Called from Client::sweepTimeouts() on the runner thread.
-    /// F8a: also re-publishes any status snapshot a near-full status ring
-    /// refused earlier (the app drained since), so position() converges.
     void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 
     /// CB-5 B: resend every PENDING Subscribe frame after a leader redirect +
@@ -169,6 +167,14 @@ public:
     /// Returns the number of Subscribe frames resent.
     int resendPending(int64_t newSessionId,
                       const SendFn& submitFn);
+
+    /// F8a fix1 I4: number of subscriptions whose latest status snapshot a
+    /// near-full status ring refused.  The duty cycle calls republishDirty()
+    /// whenever it is non-zero (one branch when zero) — progress-based: the
+    /// snapshot lands as soon as the app has drained, not on a timer.
+    [[nodiscard]] std::size_t dirtyCount() const noexcept { return dirtyCount_; }
+    /// Retry every dirty snapshot; returns how many were published.
+    int republishDirty();
 
     /// CB-5 B: true if there is at least one pending (unbound) subscription.
     [[nodiscard]] bool hasPending() const;
@@ -209,11 +215,27 @@ private:
     // fix1 C1 / fix2 minor-5: plain counter, written only on the agent thread.
     uint64_t callbackExceptions_ = 0;
 
-    /// Publish impl's current snapshot (ordinary update; a refusal marks it
-    /// dirty for the sweep to retry).
-    static void publishStatus_(SubscriptionImpl& impl);
-    /// Mark impl finished: inactive, final snapshot, status ring closed.
-    static void finish_(SubscriptionImpl& impl);
+    // F8a fix1 C1(a): the subscription whose handler is running right now
+    // (null outside onRecords' dispatch).  Finishing it is deferred: its
+    // routing entry is erased and its status ring closed only AFTER the
+    // handler returns, so a handler that unsubscribes (or destroys its own
+    // Subscription) never frees the std::function it is running, and
+    // finished() never turns true while a callback is still executing.
+    SubscriptionImpl* dispatching_ = nullptr;
+
+    // F8a fix1 I4: intrusive dirty list (no allocation on the dispatch path).
+    SubscriptionImpl* dirtyHead_  = nullptr;
+    std::size_t       dirtyCount_ = 0;
+    void markDirty_(SubscriptionImpl& impl) noexcept;
+    void clearDirty_(SubscriptionImpl& impl) noexcept;
+
+    /// Publish impl's current snapshot (ordinary update; a refusal marks it dirty).
+    void publishStatus_(SubscriptionImpl& impl);
+    /// Mark impl finished: inactive, final snapshot, status ring closed
+    /// (deferred to the end of its dispatch if its handler is running).
+    void finish_(SubscriptionImpl& impl);
+    /// Publish the final snapshot and close the status ring.
+    static void closeStatus_(SubscriptionImpl& impl);
 };
 
 } // namespace rune::client::subscriber

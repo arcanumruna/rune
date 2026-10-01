@@ -42,6 +42,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace rune::client {
@@ -110,9 +111,8 @@ enum class GroupConsumerState : uint8_t {
 };
 
 // ---------------------------------------------------------------------------
-// GroupConsumerStatus — duty thread -> app handle snapshot.  Only the status
-// ring's closed word carries information today (liveness); the record type
-// exists so the channel can carry more without a layout change.
+// GroupConsumerStatus — duty thread -> app handle snapshot (fix1 I2: the
+// assignment generation reaches app threads only through the status ring).
 // ---------------------------------------------------------------------------
 struct GroupConsumerStatus {
     int32_t generationId = 0;
@@ -123,10 +123,11 @@ struct GroupConsumerStatus {
 // GroupConsumerImpl — internal state (heap-allocated, shared_ptr between the
 // GroupConsumer handle and the GroupConsumerHub's consumer list).
 //
-// F8a ownership: config + callbacks are written by the app thread BEFORE the
-// GroupAdd command is put on the agent ring (publishing them); EVERYTHING else
-// is owned by the duty thread.  The app thread reads only `status` (the ring's
-// own memory ordering is the only synchronisation).
+// F8a ownership: config is written by the app thread BEFORE the GroupAdd
+// command is put on the agent ring (publishing it); EVERYTHING else — callbacks
+// included (fix1 I1: the setters travel as GroupSetCallback commands) — is
+// owned by the duty thread.  The app thread reads only `status` (the ring's own
+// memory ordering is the only synchronisation).
 // ---------------------------------------------------------------------------
 struct GroupConsumerImpl {
     // ---- Config (immutable after construction) --------------------------------
@@ -134,7 +135,7 @@ struct GroupConsumerImpl {
     std::vector<int32_t>     topicIds;     // resolved from topic names on creation
     GroupConfig              cfg;
 
-    // ---- Callbacks (setup phase; read on the duty thread) ---------------------
+    // ---- Callbacks (duty thread; installed by GroupSetCallback commands) ------
     std::function<void(std::vector<TopicPartition>)> cbAssigned;
     std::function<void(std::vector<TopicPartition>)> cbRevoked;
     std::function<void(const RecordSet&)>             cbRecords;
@@ -161,10 +162,15 @@ struct GroupConsumerImpl {
 
     // ---- Commit requests (duty thread; set by GroupCommit/GroupCommitSync) ----
     bool commitRequested {false};
-    // The in-flight commitSync() promise (null = none).  Resolved on the next
-    // OffsetCommitResponse, superseded by a newer commitSync(), or failed on
-    // close.  Owned by the duty thread — no lock.
+    // The in-flight commitSync() promise (null = none).  Owned by the duty
+    // thread — no lock.  Resolved by the OffsetCommitResponse whose
+    // correlationId == commitSyncCorrId (error code checked); failed when
+    // superseded, on close, on rejoin, or on session loss once sent.
     std::unique_ptr<std::promise<void>> commitSyncPromise;
+    int64_t commitSyncCorrId {0};   // 0 = its OffsetCommit not sent yet
+
+    // A generation snapshot the near-full status ring refused (fix1 I4).
+    bool statusDirty {false};
 
     // ---- Liveness (duty thread) -----------------------------------------------
     bool active {true};
@@ -188,25 +194,33 @@ struct GroupConsumerImpl {
 // GroupConsumer — user-facing handle returned by Client::subscribeGroup().
 //
 // Threading:
-//   - Callback setters (onAssigned/onRevoked/onRecords) are SETUP PHASE ONLY
-//     (must be called before the first connect() — same contract as Client
-//     lifecycle callbacks).
-//   - The handle is OWNED by one thread at a time (move-only, like
-//     Subscription): commit()/commitSync()/close()/active() must not be called
-//     concurrently on the same handle.  Each submits a command to the duty
-//     thread (commit() may also be called from inside onRecords/onAssigned —
-//     the command is applied on a later duty cycle).
-//   - A handle may outlive its Client: once the consumer is finished on the
-//     duty side its status ring is closed and the handle never touches the
-//     Client again (commitSync() then returns an already-failed future).
+//   - Callback setters (onAssigned/onRevoked/onRecords) are SETUP PHASE: call
+//     them before connect().  Each travels to the duty thread as a command (the
+//     callback is installed there, in ring order — before the connect), so the
+//     duty-owned std::functions are never written from an app thread.
+//   - The handle is OWNED by one app thread at a time (move-only, like
+//     Subscription): its app-side methods must not be called concurrently.
+//   - Calls from INSIDE a callback (duty thread, Thread mode) are allowed:
+//     commit() / close() / active() / generation() act directly on duty-owned
+//     state.  commitSync() there throws std::logic_error (its future could
+//     never resolve while the callback blocks the duty thread) — use commit().
+//   - finished(): the duty side is done with this consumer — no further
+//     callback will run.  A finished handle never touches the Client again, so
+//     a handle may outlive its Client (not be used CONCURRENTLY with its
+//     destruction); commitSync() then returns an already-failed future.
 // ---------------------------------------------------------------------------
 class GroupConsumer {
 public:
+    using AssignmentCallback = std::function<void(std::vector<TopicPartition>)>;
+    using RecordsCallback    = std::function<void(const RecordSet&)>;
+
     /// Constructed by Client::subscribeGroup().  `sink`/`sinkCtx` deliver the
-    /// handle's commands to the duty thread (the Client's command ring).
+    /// handle's commands to the duty thread.  `dutyThread`: the Thread-mode
+    /// runner (calls from it take the duty path); default id disables that.
     GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl,
                   detail::HubCommandSink             sink,
-                  void*                              sinkCtx) noexcept;
+                  void*                              sinkCtx,
+                  std::thread::id                    dutyThread = {}) noexcept;
 
     ~GroupConsumer();
 
@@ -219,64 +233,68 @@ public:
     // ---- Callback registration (SETUP PHASE: call before connect()) ----------
 
     /// Called on the runner thread when the broker assigns partitions.
-    void onAssigned(std::function<void(std::vector<TopicPartition>)> cb);
+    void onAssigned(AssignmentCallback cb);
 
     /// Called on the runner thread when the broker revokes partitions.
-    void onRevoked(std::function<void(std::vector<TopicPartition>)> cb);
+    void onRevoked(AssignmentCallback cb);
 
     /// Called on the runner thread when records arrive for assigned partitions.
-    void onRecords(std::function<void(const RecordSet&)> cb);
+    void onRecords(RecordsCallback cb);
 
-    // ---- Async commit API (safe from any thread) ----------------------------
+    // ---- Commit API ----------------------------------------------------------
 
     /// Ask the duty thread to commit the current per-partition positions (sent
-    /// on a following duty cycle).  At-least-once: only positions of records
-    /// already delivered via onRecords are committed.  No-op once finished.
-    /// Throws only if the command ring stays full past the bounded wait.
+    /// on a following duty cycle once Stable).  At-least-once: only positions
+    /// of records already delivered via onRecords are committed.  No-op once
+    /// finished.  App thread: throws only if the command ring stays full past
+    /// the bounded wait.
     void commit();
 
-    /// Submit a commit and return a future resolved when the broker acknowledges
-    /// the OffsetCommitResponse — or failed when superseded by a newer
-    /// commitSync(), on close(), or when the Client closes.  Never hangs.
-    /// Invoker mode: the owner thread must keep calling Client::doWork() while
-    /// it waits on the future.
+    /// Commit and return a future that resolves when the broker acknowledges
+    /// THIS commit (OffsetCommitResponse matched by correlationId, error codes
+    /// checked — a failed commit throws from get()), or resolves at once when
+    /// there is nothing to commit.  It fails when superseded by a newer
+    /// commitSync(), on close(), on a group rejoin, on session loss after the
+    /// commit was sent, or when the Client closes.
+    /// Waiting: Thread mode — get() from an app thread.  Invoker mode — keep
+    /// calling Client::doWork() until it is ready.  NEVER from inside a duty-
+    /// cycle callback: commitSync() throws std::logic_error there.
     std::future<void> commitSync();
 
     /// Deactivate this consumer: no more dispatch occurs, a pending commitSync
-    /// fails.  Idempotent.  Never throws (a command that cannot be delivered
-    /// is logged; the Client's close() deactivates the consumer anyway).
+    /// fails.  Idempotent.  Delivery is guaranteed (a full command ring is
+    /// waited out on duty-thread progress, never a timeout); never throws.
     void close();
 
-    /// True until close(), or until the duty side finished the consumer (the
-    /// Client closed).
+    /// True until close(), or until the duty side finished the consumer.
     [[nodiscard]] bool active() const noexcept;
 
-    /// Current assignment generation as last set by the broker
-    /// (JoinGroupResponse / Assign).  Increments on every rebalance.
-    ///
-    /// THREADING: generationId is written on the runner thread (during
-    /// JoinGroupResponse / Assign handling) and MUST only be read from the
-    /// runner thread — i.e. from inside an onAssigned / onRevoked / onRecords
-    /// callback, which is exactly where the generation of the current
-    /// assignment/record is meaningful.  Reading it from the app thread is a
-    /// data race and is not supported.
+    /// True once the duty side finished this consumer: no further callback
+    /// (onAssigned / onRevoked / onRecords) will run.
+    [[nodiscard]] bool finished() const noexcept;
+
+    /// Current assignment generation (JoinGroupResponse / Assign).  Inside a
+    /// callback: the duty thread's live value.  On the owning app thread: the
+    /// latest generation the duty thread published (eventually consistent).
     [[nodiscard]] int32_t generation() const noexcept;
 
-    /// Access the raw impl (for hub wiring — not part of user API).
-    [[nodiscard]] std::shared_ptr<GroupConsumerImpl> impl() const noexcept {
-        return impl_;
-    }
-
 private:
+    [[nodiscard]] bool onDutyThread_() const noexcept {
+        return dutyThread_ != std::thread::id{} && std::this_thread::get_id() == dutyThread_;
+    }
     /// Submit `cmd` unless the consumer is already finished.  Returns the
     /// sink's verdict (Closed when finished / no sink).
     detail::HubSubmit submit_(const detail::HubCommand& cmd);
+    template <class Fn>
+    void setCallback_(int which, Fn cb);
 
     std::shared_ptr<GroupConsumerImpl> impl_;
     detail::HubCommandSink             sink_    = nullptr;
     void*                              sinkCtx_ = nullptr;
+    std::thread::id                    dutyThread_{};
     bool moved_  = false;
     bool closed_ = false;   // handle-local (app-owned): close() was called
+    mutable GroupConsumerStatus cache_{};  // app-owned: last drained status snapshot
 };
 
 } // namespace rune::client

@@ -23,21 +23,69 @@ namespace rune::client::subscriber {
 // Status publication helpers — duty thread
 // ---------------------------------------------------------------------------
 
+void SubscriberHub::markDirty_(SubscriptionImpl& impl) noexcept
+{
+    if (impl.statusDirty) return;
+    impl.statusDirty = true;
+    impl.prevDirty   = nullptr;
+    impl.nextDirty   = dirtyHead_;
+    if (dirtyHead_) dirtyHead_->prevDirty = &impl;
+    dirtyHead_ = &impl;
+    ++dirtyCount_;
+}
+
+void SubscriberHub::clearDirty_(SubscriptionImpl& impl) noexcept
+{
+    if (!impl.statusDirty) return;
+    if (impl.prevDirty) impl.prevDirty->nextDirty = impl.nextDirty;
+    else                dirtyHead_ = impl.nextDirty;
+    if (impl.nextDirty) impl.nextDirty->prevDirty = impl.prevDirty;
+    impl.prevDirty = impl.nextDirty = nullptr;
+    impl.statusDirty = false;
+    --dirtyCount_;
+}
+
 void SubscriberHub::publishStatus_(SubscriptionImpl& impl)
 {
-    const SubscriptionStatus st{impl.subscriptionId, impl.nextOffset};
-    impl.statusDirty = !impl.status.tryPublish(st) && !impl.status.closed();
+    if (impl.status.tryPublish(SubscriptionStatus{impl.subscriptionId, impl.nextOffset})) {
+        clearDirty_(impl);
+    } else if (!impl.status.closed()) {
+        markDirty_(impl);
+    }
+}
+
+int SubscriberHub::republishDirty()
+{
+    int published = 0;
+    for (SubscriptionImpl* p = dirtyHead_; p != nullptr; ) {
+        SubscriptionImpl* next = p->nextDirty;
+        if (p->status.tryPublish(SubscriptionStatus{p->subscriptionId, p->nextOffset})) {
+            clearDirty_(*p);
+            ++published;
+        } else if (p->status.closed()) {
+            clearDirty_(*p);  // abandoned by the app: nobody will read it
+        }
+        p = next;
+    }
+    return published;
+}
+
+/*static*/
+void SubscriberHub::closeStatus_(SubscriptionImpl& impl)
+{
+    if (impl.status.producerClosed()) return;
+    // Final snapshot (uses the ring's reserve — always fits), THEN close: an
+    // app thread that observes finished() and drains afterwards sees it.
+    (void)impl.status.publishFinal(SubscriptionStatus{impl.subscriptionId, impl.nextOffset});
+    impl.status.close();
 }
 
 void SubscriberHub::finish_(SubscriptionImpl& impl)
 {
     impl.active = false;
-    if (impl.status.closed()) return;
-    // Final snapshot (uses the ring's reserve — always fits), THEN close: an
-    // app thread that observes closed() and drains afterwards sees it.
-    (void)impl.status.publishFinal(SubscriptionStatus{impl.subscriptionId, impl.nextOffset});
-    impl.statusDirty = false;
-    impl.status.close();
+    clearDirty_(impl);
+    if (&impl == dispatching_) return;  // closed by onRecords once the handler returns
+    closeStatus_(impl);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,9 +181,14 @@ void SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
     // Bound: find it by its correlationId (cold path; a handful of entries).
     for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
         if (it->second->correlationId != subscribeCorrId) continue;
+        if (!it->second->active) return;  // already unsubscribed (erase deferred)
         const int64_t subId = it->first;
+        const bool running = it->second.get() == dispatching_;
         finish_(*it->second);
-        activeById_.erase(it);
+        // Its handler is running (it unsubscribed itself): onRecords erases the
+        // entry after the handler returns — erasing now could free the
+        // std::function mid-call.
+        if (!running) activeById_.erase(it);
 
         uint8_t frameBuf[64]{};
         const std::size_t frameLen = codec::encodeUnsubscribe(
@@ -187,7 +240,6 @@ void SubscriberHub::onSubscribeResponse(
 
     // Bind: lifecycle snapshot (uses the reserve — always fits).
     (void)impl->status.publishFinal(SubscriptionStatus{impl->subscriptionId, impl->nextOffset});
-    impl->statusDirty = false;
     activeById_.emplace(rsp.subscriptionId, std::move(impl));
 }
 
@@ -216,11 +268,16 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
     }
 
     const int64_t before = impl.nextOffset;
+    dispatching_ = &impl;
     reader.forEach([&](std::string_view keyView,
                        std::string_view valView,
                        int64_t          absOffset,
                        int64_t          timestamp)
     {
+        // The handler may have unsubscribed this subscription (directly, on
+        // this thread): deliver nothing more of the batch.
+        if (!impl.active) return;
+
         Record rec;
         rec.offset    = absOffset;
         rec.timestamp = timestamp;
@@ -248,7 +305,16 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
 
         impl.nextOffset = absOffset + 1;
     });
+    dispatching_ = nullptr;
 
+    if (!impl.active) {
+        // Finished from inside its own handler: now that no handler is running,
+        // publish the final snapshot, close the ring, and drop the entry (this
+        // may free impl — nothing below touches it).
+        closeStatus_(impl);
+        activeById_.erase(it);
+        return;
+    }
     // One status snapshot per Records frame (not per record).
     if (impl.nextOffset != before || impl.statusDirty) publishStatus_(impl);
 }
@@ -338,11 +404,6 @@ void SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& n
         } else {
             ++it;
         }
-    }
-
-    // F8a: retry snapshots a near-full status ring refused earlier.
-    for (auto& [subId, impl] : activeById_) {
-        if (impl->statusDirty) publishStatus_(*impl);
     }
 }
 

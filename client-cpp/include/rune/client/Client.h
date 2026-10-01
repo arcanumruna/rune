@@ -261,6 +261,12 @@ public:
     void testSetBeforeRegistrationSubmitHook(std::function<void()> fn) {
         testBeforeRegistrationSubmitHook_ = std::move(fn);
     }
+    /// F8a fix1 test hook: called on the submitting thread each time a
+    /// lifecycle hub command (unsubscribe / GroupConsumer close) finds the
+    /// command ring full and waits for duty-thread progress.  Set before use.
+    void testSetHubCommandRingFullHook(std::function<void()> fn) {
+        testHubCommandRingFullHook_ = std::move(fn);
+    }
     /// Test hook (duty-cycle thread only): install a partition route as metadata would.
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
@@ -444,8 +450,11 @@ public:
     ///   - The handler fires on the RUNNER (agent) thread.  Must NOT block.
     ///   - The record spans (key, value) are zero-copy views into the Aeron
     ///     buffer, valid ONLY during the handler call.  Copy data to retain it.
-    ///   - unsubscribe() / Subscription dtor are safe from any thread.
-    ///   - Do NOT call unsubscribe() from inside the handler.
+    ///   - unsubscribe() / the Subscription dtor (owning thread, or from inside
+    ///     the handler) have guaranteed delivery; wait for finished() to know no
+    ///     handler call can run any more (then position() is final).
+    ///   - After close(): returns an already-finished Subscription (active() and
+    ///     finished() report it at once; nothing is submitted).
     ///
     /// Demand / back-pressure: default is broker-paced push (the broker pauses
     /// when egress back-pressure applies, per GB-3).
@@ -508,8 +517,9 @@ public:
     /// broker's server-side subscription and routed through onRecords.
     ///
     /// Threading:
-    ///   - subscribeGroup() is called on the APP thread (setup phase, before
-    ///     connect() or right after — same contract as producer()).
+    ///   - subscribeGroup() and the handle's callback setters are called on the
+    ///     APP thread in the setup phase, BEFORE connect() (the setters travel
+    ///     to the duty thread as commands, in ring order ahead of the connect).
     ///   - onAssigned / onRevoked / onRecords callbacks fire on the RUNNER thread.
     ///   - commit() / commitSync() / close() on the handle are commands for
     ///     the duty thread (agent command ring; F8a — no shared state).
@@ -618,6 +628,14 @@ private:
     /// submitRegistration_'s bounded back-pressure, plus the same post-submit
     /// close() re-check as producer() (see detail::HubSubmit).
     static detail::HubSubmit hubCommandTrampoline_(void* ctx, const detail::HubCommand& cmd);
+    /// F8a: apply one hub command on the duty thread (ring drain, close drain,
+    /// or directly when a handle is used on the duty thread).
+    void applyHubCommand_(const detail::HubCommand& cmd);
+    /// The thread whose handle calls take the duty path: the Thread-mode runner;
+    /// none in Invoker mode (the owner is both app and duty thread).
+    [[nodiscard]] std::thread::id handleDutyThread_() const noexcept {
+        return cfg_.runnerMode == RunnerMode::Thread ? dutyThreadId_ : std::thread::id{};
+    }
 
     /// Setup-phase ring submit, bounded (5 s).  Invoker mode runs the duty cycle
     /// between attempts — this thread IS the ring's consumer; thread mode parks
@@ -705,6 +723,7 @@ private:
     std::atomic<bool> stopped_   {false};
     // fix5: see testSetBeforeRegistrationSubmitHook(). Empty by default.
     std::function<void()> testBeforeRegistrationSubmitHook_;
+    std::function<void()> testHubCommandRingFullHook_;  // F8a fix1; empty by default
     std::thread       runnerThread_;
 
     // ---- Callback-contract guard (FIX F4) ------------------------------------

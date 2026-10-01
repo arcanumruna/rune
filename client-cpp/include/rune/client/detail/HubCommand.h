@@ -43,6 +43,12 @@ struct HubCommand {
         GroupCommitSync = 12,
         /// handle = GroupConsumerImpl* (identity).
         GroupClose      = 13,
+        /// handle = GroupConsumerImpl* (identity); a = which callback
+        /// (0 onAssigned, 1 onRevoked, 2 onRecords); b = heap std::function*
+        /// of the matching type (ownership passes to the duty thread, which
+        /// installs it and frees the holder).  Always via the ring (never
+        /// applied directly: replacing a callback while it runs is UB).
+        GroupSetCallback = 14,
     };
 
     Op       op     = Op::SubscribeAdd;
@@ -66,9 +72,16 @@ enum class HubSubmit : uint8_t {
     ClosedAfterSubmit,
 };
 
+/// Lifecycle ops: delivery is guaranteed (applied directly on the duty thread;
+/// otherwise a full ring is waited out on duty-thread progress) — never throw
+/// for a full ring.
+[[nodiscard]] constexpr bool isLifecycle(HubCommand::Op op) noexcept {
+    return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::GroupClose;
+}
+
 /// Plain function pointer + opaque context (no std::function, no virtual):
-/// set once when the handle is created, invoked on the caller's (app) thread.
-/// May throw (ring full and the bounded wait timed out / cannot pump).
+/// set once when the handle is created, invoked on the caller's thread.
+/// Non-lifecycle ops may throw (ring full past the bounded wait / cannot pump).
 using HubCommandSink = HubSubmit (*)(void* ctx, const HubCommand& cmd);
 
 } // namespace rune::client::detail
