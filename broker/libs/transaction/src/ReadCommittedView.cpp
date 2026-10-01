@@ -16,6 +16,7 @@
 #include <rune/transaction/ControlMarker.h>
 
 #include <rune/storage/Log.h>
+#include <rune/storage/LogReadView.h>
 // rune-protocol RecordBatch: little-endian field accessors (unified).
 #include <rune/protocol/RecordBatch.h>
 
@@ -274,7 +275,46 @@ bool AbortedTxnIndex::isAborted(ProducerId producerId,
 }
 
 // ===========================================================================
-// ReadCommittedView — rebuild
+// RcBuilder — step (F15 §2.3, N2 + N3)
+// ===========================================================================
+
+RcBuilder::Result RcBuilder::step(const uint8_t* batch, std::size_t avail)
+{
+    using namespace rune::protocol::batch;
+    Result res;
+    if (batch == nullptr || avail < static_cast<std::size_t>(kRecordBatchOverhead)) return res;
+    rune::protocol::RecordBatchReader reader(batch, avail);
+    const int32_t totalLen = reader.totalLength();
+    if (totalLen <= 0 || static_cast<std::size_t>(totalLen) > avail) return res;
+    res.totalLength = totalLen;
+    res.baseOffset  = reader.baseOffset();
+    res.outcome     = Outcome::Ignored;
+
+    const auto attrs = static_cast<uint16_t>(reader.attributes());
+    if ((attrs & static_cast<uint16_t>(kAttrControl)) != 0) [[unlikely]] {
+        // Markers are recognised ONLY as real control batches (CRC-verified).
+        ControlMarkerPayload payload;
+        if (!ControlMarker::extract(batch, 0, payload, static_cast<std::size_t>(totalLen))) return res;
+        const bool commit = (payload.controlType == ControlType::Commit);
+        const int64_t firstOff = tracker_->onControlMarker(payload.producerId, res.baseOffset, commit);
+        if (!commit && firstOff >= 0)
+            abortedIndex_->onAbortMarker(payload.producerId, firstOff, res.baseOffset);
+        res.outcome = commit ? Outcome::CommitMarker : Outcome::AbortMarker;
+        return res;
+    }
+    // N3: only a TRANSACTIONAL batch opens a transaction.
+    if ((attrs & static_cast<uint16_t>(kAttrTransactional)) != 0) {
+        const int64_t producerId = reader.producerId();
+        if (producerId >= 0) {
+            tracker_->onProduceBatch(producerId, res.baseOffset);
+            res.outcome = Outcome::TxnData;
+        }
+    }
+    return res;
+}
+
+// ===========================================================================
+// ReadCommittedView — rebuild: a loop of RcBuilder::step over Log::readView
 // ===========================================================================
 
 void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
@@ -282,67 +322,38 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     assert(log != nullptr);
     tracker_->clear();
     abortedIndex_->clear();
-
     if (hw <= 0) return;
 
-    // Read all bytes up to hw in one shot (or in large chunks).
-    // We use a large maxBytes to get the full range; the HW clamping is done
-    // during the batch walk below.
-    constexpr int32_t kMaxScanBytes = std::numeric_limits<int32_t>::max() / 2;
-    auto raw = log->read(0, kMaxScanBytes);
-    if (raw.empty()) return;
-
-    // Single-pass scan using the unified little-endian RecordBatchReader for ALL batches.
-    // all-LE fix: control batches share the LE record-batch format, so RecordBatchReader
-    // can walk them. Control batches are identified by ControlMarker::isControlBatch()
-    // which reads the CONTROL attribute bit from the LE attributes field [21..22].
-    {
-        std::size_t pos = 0;
-        const uint8_t* data = raw.data();
-        std::size_t rawSize = raw.size();
-
-        while (pos < rawSize) {
-            std::size_t rem = rawSize - pos;
-            if (rem < static_cast<std::size_t>(
-                    rune::protocol::batch::kRecordBatchOverhead)) break;
-
-            // Use RecordBatchReader for ALL batches (data + control both little-endian now).
-            rune::protocol::RecordBatchReader reader(data + pos, rem);
-            int32_t totalLen   = reader.totalLength();
-            int64_t baseOffset = reader.baseOffset();
-
-            if (totalLen <= 0 || pos + static_cast<std::size_t>(totalLen) > rawSize)
-                break;
-
-            // Stop scanning beyond HW.
-            if (baseOffset >= hw) break;
-
-            bool ctrl = ControlMarker::isControlBatch(data, pos, rem);
-            int64_t producerId = extractProducerId(data, pos, rem);
-
-            if (ctrl) {
-                // Control batch: decode the marker payload and update LSO/aborted index.
-                ControlMarkerPayload payload;
-                if (ControlMarker::extract(data, pos, payload, rem)) {
-                    bool commit = (payload.controlType == ControlType::Commit);
-                    int64_t firstOff = tracker_->onControlMarker(payload.producerId,
-                                                                   baseOffset,
-                                                                   commit);
-                    if (!commit && firstOff >= 0) {
-                        abortedIndex_->onAbortMarker(payload.producerId,
-                                                      firstOff,
-                                                      baseOffset);
-                    }
-                }
-            } else {
-                // Data batch: track open transactions.
-                if (producerId >= 0) {
-                    tracker_->onProduceBatch(producerId, baseOffset);
-                }
-            }
-
-            pos += static_cast<std::size_t>(totalLen);
+    // Zero-copy chunks of whole batches; the same classification step the
+    // owning worker's incremental build runs (S4).
+    constexpr int32_t kChunkBytes = 1 << 20;
+    RcBuilder builder(tracker_, abortedIndex_);
+    int64_t cursor = log->logStartOffset();
+    const int64_t end = std::min(hw, log->logEndOffset());
+    while (cursor < end) {
+        const rune::storage::LogReadView v = log->readView(cursor, kChunkBytes);
+        if (v.empty()) {
+            // A gap (e.g. compaction emptied a segment): resume at the next
+            // segment base above the cursor.  Cold (rebuild is not a hot path).
+            int64_t next = -1;
+            for (const int64_t b : log->segmentBaseOffsets())
+                if (b > cursor) { next = b; break; }
+            if (next < 0) break;
+            cursor = next;
+            continue;
         }
+        std::size_t pos = 0;
+        bool done = false;
+        while (pos < v.len) {
+            rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
+            if (v.len - pos < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) ||
+                r.baseOffset() >= hw) { done = true; break; }   // stop at HW
+            const RcBuilder::Result res = builder.step(v.data + pos, v.len - pos);
+            if (res.outcome == RcBuilder::Outcome::Invalid) { done = true; break; }
+            pos += static_cast<std::size_t>(res.totalLength);
+        }
+        if (done || v.nextOffset <= cursor) break;
+        cursor = v.nextOffset;
     }
 }
 
@@ -410,7 +421,9 @@ std::vector<uint8_t> ReadCommittedView::read(rune::storage::Log* log,
         }
 
         // ── Filter: skip aborted batches (read_committed only) ──
-        if (level == IsolationLevel::ReadCommitted && producerId >= 0) {
+        if (level == IsolationLevel::ReadCommitted && producerId >= 0 &&
+            (static_cast<uint16_t>(reader.attributes()) &
+             static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional)) != 0) {
             if (abortedIndex_->isAborted(producerId, baseOffset)) {
                 pos += static_cast<std::size_t>(totalLen);
                 continue;

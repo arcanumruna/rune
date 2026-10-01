@@ -326,3 +326,28 @@ TEST(LsoTrackerRegression, LongOpenFrontCompactsInPlaceWithoutGrowth) {
     EXPECT_EQ(tracker.growths(), 0u) << "dead entries behind the front must be compacted, not grown";
     EXPECT_EQ(tracker.capacity(), 64u);
 }
+
+// ===========================================================================
+// F15 S1 (fix-on-sight in the rebuild → RcBuilder::step loop): rebuild must
+// scan EVERY segment up to HW.  The old rebuild did one Log::read(0, …), which
+// returns a single segment, so a marker in a later segment was never seen.
+// ===========================================================================
+
+TEST(ControlBatchRegression, RebuildSpansEverySegment) {
+    TmpDir d;
+    rune::storage::Log log(d.path.string(), /*segmentBytes=*/1024);   // tiny segments
+    log.recover();
+    appendRaw(log, dataBatch(0, /*pid=*/7, /*transactional=*/true));
+    while (log.segmentBaseOffsets().size() < 3)
+        appendRaw(log, dataBatch(0, /*pid=*/-1, /*transactional=*/false));
+    auto marker = ControlMarker::build(7, 0, ControlType::Abort, 0);
+    const int64_t markerOff = appendRaw(log, marker);
+    ASSERT_GE(log.segmentBaseOffsets().size(), 3u) << "precondition: the marker is not in the first segment";
+    LsoTracker tracker;
+    AbortedTxnIndex aborted;
+    ReadCommittedView view(&tracker, &aborted);
+    view.rebuild(&log, log.logEndOffset());
+    EXPECT_EQ(tracker.openCount(), 0u) << "the ABORT marker at " << markerOff << " (a later segment) was never scanned";
+    ASSERT_EQ(aborted.size(), 1u);
+    EXPECT_TRUE(aborted.isAborted(7, 0));
+}

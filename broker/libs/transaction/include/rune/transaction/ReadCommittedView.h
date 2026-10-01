@@ -260,6 +260,51 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// RcBuilder — the ONE read_committed classification step (F15 §2.3, §2.7).
+//
+// Feeds ONE whole record batch into an LsoTracker + AbortedTxnIndex:
+//   - a REAL control batch (CONTROL attribute bit AND a valid control-batch
+//     CRC, N2) resolves its producer's open txn; an ABORT records the aborted
+//     range [firstOffset, markerOffset];
+//   - a data batch opens a txn ONLY if producerId >= 0 AND the TRANSACTIONAL
+//     attribute (0x10) is set (N3 — an idempotent, non-transactional producer
+//     never opens a transaction);
+//   - anything else (pid -1 data, a corrupt CONTROL-flagged batch) is ignored.
+//
+// ReadCommittedView::rebuild is a loop of step() over Log::readView, and the
+// owning worker's incremental build (S4) runs the same step(), so the unit
+// tests exercise exactly the classification the worker runs.
+//
+// Zero allocation in steady state (tracker/index are pre-reserved); no virtual
+// calls; non-transactional data batches cost one attribute-bit test.
+// ---------------------------------------------------------------------------
+class RcBuilder {
+public:
+    enum class Outcome : uint8_t {
+        Invalid,        ///< not a whole batch (truncated / torn): nothing consumed
+        Ignored,        ///< non-transactional data, or a corrupt CONTROL-flagged batch
+        TxnData,        ///< transactional data batch (txn opened or already open)
+        CommitMarker,   ///< COMMIT control batch applied
+        AbortMarker,    ///< ABORT control batch applied
+    };
+    struct Result {
+        Outcome outcome    = Outcome::Invalid;
+        int32_t totalLength = 0;   ///< bytes of the batch (0 when Invalid)
+        int64_t baseOffset  = 0;
+    };
+
+    RcBuilder(LsoTracker* tracker, AbortedTxnIndex* abortedIndex) noexcept
+        : tracker_(tracker), abortedIndex_(abortedIndex) {}
+
+    /// Classify and apply the batch at `batch` (`avail` bytes readable).
+    Result step(const uint8_t* batch, std::size_t avail);
+
+private:
+    LsoTracker*      tracker_;
+    AbortedTxnIndex* abortedIndex_;
+};
+
+// ---------------------------------------------------------------------------
 // ReadCommittedView
 //
 // Combines LsoTracker + AbortedTxnIndex to provide a consumer-facing read
