@@ -127,6 +127,12 @@ public:
 
     // Return the worker that owns (topicId, partition) per the router.
     // ASSIGNMENT-TIME only — do not call on the doWork hot path.
+    /// F18: does an op with a `tailLen`-byte tail fit ONE frame of the owning
+    /// worker's ingress ring?  (See Worker::opTailFits.)
+    [[nodiscard]] bool opTailFits(int32_t topicId, int32_t partition, std::size_t tailLen) const {
+        return workers_[static_cast<std::size_t>(ownerWorkerId(topicId, partition))]->opTailFits(tailLen);
+    }
+
     [[nodiscard]] int32_t ownerWorkerId(int32_t topicId,
                                         int32_t partition) const noexcept {
         return router_.workerForPartition(topicId, partition);

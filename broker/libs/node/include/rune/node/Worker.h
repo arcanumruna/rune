@@ -330,6 +330,17 @@ public:
     // Per-tick drain batch limits (NodeConfig knobs — see NodeConfig.h).  Call
     // before the worker's AgentRunner starts (startup, single-threaded).
     void setIngressDrainLimit(int32_t n) noexcept { ingressDrainLimit_ = (n >= 1) ? n : 1024; }
+    /// F18: largest produce batch the per-worker ingress path accepts (larger →
+    /// MessageTooLarge, before append), = NodeConfig::produceIntakeLimit().  Cold setter.
+    void setMaxProduceBatchBytes(std::size_t n) noexcept { maxProduceBatchBytes_ = n; }
+    [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept { return maxProduceBatchBytes_; }
+    /// F18: can an op carrying a `tailLen`-byte variable tail (record batch /
+    /// replicated records) be claimed in ONE ingress-ring frame?  Callers that
+    /// cannot back off by retrying (the follower apply path) check this first.
+    [[nodiscard]] bool opTailFits(std::size_t tailLen) const {
+        return workerOpFrameBytes(tailLen) <= static_cast<std::size_t>(ingress_.maxMsgLength());
+    }
+    [[nodiscard]] uint64_t oversizedOpsRefusedForTest() const noexcept { return oversizedOpsRefused_; }
     void setReturnDrainLimit(int32_t n)  noexcept { returnDrainLimit_  = (n >= 1) ? n : 1024; }
 
     // Configure the per-produce-ack return-ring reservation slot size (bytes).  The
@@ -432,8 +443,18 @@ public:
 
         // Total frame = SBE MessageHeader (8) + block + varData.  computeLength()
         // covers block+varData only, so add the header explicitly.
-        const std::size_t n =
-            sbe::MessageHeader::encodedLength() + sbe::WorkerOp::computeLength(tailLen);
+        const std::size_t n = workerOpFrameBytes(tailLen);
+        // F18: an op larger than one ring frame would make tryClaim THROW (agrona
+        // checkMsgLength) and terminate the control thread.  Unreachable when
+        // intake is bounded (produceIntakeLimit) and the follower apply path
+        // pre-checks opTailFits(); refuse loudly instead of crashing.
+        if (n > static_cast<std::size_t>(ingress_.maxMsgLength())) [[unlikely]] {
+            ++oversizedOpsRefused_;
+            spdlog::error("Worker {}: op type={} tail {} B exceeds the ingress ring frame "
+                          "({} B); refused", workerId_, static_cast<int>(op.type), tailLen,
+                          ingress_.maxMsgLength());
+            return false;
+        }
         const aeron::util::index_t idx =
             ingress_.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
         if (idx < 0) return false;  // ring full — back-pressure
@@ -2682,6 +2703,8 @@ private:
     // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
     // default so routed replication ops / acks don't queue behind a tiny cap).
     int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
+    std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;  // F18; BrokerNode sets it
+    uint64_t    oversizedOpsRefused_  = 0;                    // F18: ops > one ring frame
     int32_t returnDrainLimit_  = 1024;  // RUNE_WORKER_RETURN_DRAIN_LIMIT
     // FR trace: monotonic count of routed replication ops (fetch/apply) dequeued
     // from the ingress ring — pairs 1:1 (FIFO) with the control thread's
@@ -3576,6 +3599,17 @@ private:
                          workerId_, msg.topicId, msg.partition);
             // E5.1.3 review fix #2: use enum, not magic literal.
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // F18: the same LOUD intake guard as the gateway path — a batch above the
+        // intake limit could be appended but never replicated in one frame.
+        if (rbSpan.size() > maxProduceBatchBytes_) [[unlikely]] {
+            spdlog::warn("Worker {}: WorkerIngress: produce batch too large ({} > {}); "
+                         "rejected (MessageTooLarge)", workerId_, rbSpan.size(),
+                         maxProduceBatchBytes_);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
             enqueueReturn_(ret);
             return 1;
         }

@@ -2241,3 +2241,123 @@ TEST(ReplicaLifetimeRegression, IncarnationWrapSkipsValuesTheOwnerMapStillHolds)
     auto* c = R.add(1, 3);                                   // wraps: FFFFFFFF, 0, 1 (live), 2 (held) skipped
     EXPECT_EQ(c->incarnation(), 3u) << "an incarnation still held by the owner map is never reissued";
 }
+
+// ============================================================================
+// F18: the per-worker ingress path enforces the same validated produce-batch
+// limit as the gateway — an over-limit batch is refused LOUDLY (MessageTooLarge)
+// and never appended (it could be appended but never replicated in one frame).
+// ============================================================================
+TEST(ProduceBatchLimitRegression, WorkerIngressRejectsOverLimitBatchMessageTooLarge) {
+    StrictShard s;
+    const auto b = batchAt(0, 1, 512);
+    s.w.setMaxProduceBatchBytes(b.size() - 1);
+    ASSERT_EQ(s.produce(1, b, 0, 1), 1);
+    Acks a;
+    a.drain(s.w);
+    ASSERT_EQ(a.n, 1);
+    EXPECT_EQ(a.rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(s.log->logEndOffset(), 0) << "an over-limit batch must never be appended";
+
+    s.w.setMaxProduceBatchBytes(b.size());                 // exactly at the limit: accepted
+    ASSERT_EQ(s.produce(2, b, 0, 2), 1);
+    EXPECT_EQ(s.log->logEndOffset(), 1);
+}
+
+// ============================================================================
+// F18: the FOLLOWER apply path (FetchResponse / reconcile response → worker op
+// ring) must never terminate the process on records larger than one worker
+// ingress frame (tryClaim THROWS on an oversized claim), nor livelock the
+// subscription by ABORTing (redelivered forever).  It is refused as a counted
+// replication error and the fragment is consumed; normal frames still route.
+// ============================================================================
+namespace {
+std::vector<uint8_t> encodeBigFetchResp(int32_t topic, int32_t part, std::size_t valueBytes,
+                                        uint16_t tid = rune::replication::FetchResponseMsg::TEMPLATE_ID) {
+    const auto b = batchAt(0, 1, valueBytes);
+    std::vector<uint8_t> f(rune::replication::FetchResponseMsg::encodedSize(b.size()));
+    rune::replication::FetchResponseMsg::encode(f.data(), 0, 1, part, 0, 0, rune::replication::kErrNone,
+                                                std::span<const uint8_t>(b), topic);
+    rune::replication::stampTemplateId(f.data(), 0, tid);
+    return f;
+}
+} // namespace
+
+TEST(ProduceBatchLimitRegression, FollowerApplyOfOversizedRecordsIsRefusedNotFatal) {
+    TmpDir ad;
+    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rune::replication::AeronPartitionTransport tr(client, "aeron:ipc", 7303, /*self*/1, 1 << 20);
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), /*ingress*/ 1 << 16, 1 << 16, 16, 16);   // 8 KiB frames
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    tr.setReplicaRegistry(&R.reg);
+    tr.setWorkerPool(&pool);
+    R.add(5, 0);
+    pool.reconcile(R.reg);
+    ackAll(pool);
+
+    const auto big = encodeBigFetchResp(5, 0, 16 * 1024);
+    ASSERT_FALSE(pool.opTailFits(5, 0, big.size()));
+    bool consumed = false;
+    EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(big.data(), big.size(), 1));
+    EXPECT_TRUE(consumed) << "never ABORT (redelivered forever → subscription livelock)";
+    EXPECT_EQ(tr.oversizedApplyRefused(), 1u);
+
+    const auto bigRec = encodeBigFetchResp(5, 0, 16 * 1024, rune::replication::kReconcileFetchRespTemplateId);
+    EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(bigRec.data(), bigRec.size(), 2));
+    EXPECT_TRUE(consumed);
+    EXPECT_EQ(tr.oversizedApplyRefused(), 2u);
+
+    // A normal-size response still routes to the worker (no false refusals).
+    const auto small = encodeFetchResp(5, 0);
+    EXPECT_TRUE(tr.deliverFrameForTest(small.data(), small.size(), 3));
+    EXPECT_EQ(tr.oversizedApplyRefused(), 2u);
+    pool.worker(0).doWork(4);
+    EXPECT_EQ(pool.worker(0).oversizedOpsRefusedForTest(), 0u);
+}
+
+TEST(ProduceBatchLimitRegression, WorkerEnqueueOfOversizedOpRefusesInsteadOfThrowing) {
+    Worker w(0, /*ingress*/ 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{});
+    WorkerOp op;
+    op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 5; op.partition = 0;
+    op.replicatedPayload.records.assign(16 * 1024, 0xAB);
+    ASSERT_FALSE(w.opTailFits(op.replicatedPayload.records.size()));
+    bool ok = true;
+    EXPECT_NO_THROW(ok = w.tryEnqueueOp(std::move(op)));
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(w.oversizedOpsRefusedForTest(), 1u);
+}
+
+// F18: the GATEWAY produce intake answers MessageTooLarge for a batch above the
+// intake limit (BrokerNode sets it to NodeConfig::produceIntakeLimit(), at most
+// one replication frame) — before any append; a batch at the limit is accepted.
+TEST(ProduceBatchLimitRegression, GatewayIntakeRejectsBatchAboveLimitBeforeAppend) {
+    MarkerRig m;
+    const int64_t sid = m.gw.injectTestSession();
+    const auto batch = batchAt(0, 1, 2048);
+    auto produce = [&](int64_t corr) {
+        pc::Produce msg;
+        msg.sessionId = sid; msg.correlationId = corr; msg.topicId = 0; msg.partition = 0;
+        msg.partitionKnown = 1; msg.acks = 0; msg.producerId = -1;
+        msg.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        msg.encode(frame.data());
+        m.gw.applyProduceForTest(frame.data(), frame.size());
+    };
+    m.gw.setMaxProduceBatchBytes(batch.size() - 1);
+    produce(1);
+    ASSERT_EQ(m.cap.produceErrors.size(), 1u);
+    EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    m.runWorker(1);
+    EXPECT_EQ(m.r->log()->logEndOffset(), 0) << "refused before append";
+
+    m.gw.setMaxProduceBatchBytes(batch.size());
+    produce(2);
+    for (int i = 0; i < 64 && m.r->log()->logEndOffset() == 0; ++i) m.runWorker(10 + i);   // bounded
+    EXPECT_EQ(m.r->log()->logEndOffset(), 1) << "a batch at the limit is accepted";
+}

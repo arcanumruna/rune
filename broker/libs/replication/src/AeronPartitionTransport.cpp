@@ -5,6 +5,7 @@
 
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/replication/ReplicationFrameLimits.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/OutboundFrame.h>
@@ -29,12 +30,9 @@ namespace rune::replication {
 
 namespace isbe = ::rune::protocol::internal::sbe;
 
-// Fixed overhead of the SBE OutboundFrame envelope (SBE header + targetNodeId block
-// + varData length prefix), from the generated codec — the records tail must be
-// capped so the whole envelope fits the outbound ring's maxMsgLength.
-static constexpr std::size_t kOutboundEnvelopeOverhead =
-    isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::sbeBlockLength() +
-    sizeof(std::uint32_t); // varDataEncoding length field
+// kOutboundEnvelopeOverhead (ReplicationFrameLimits.h): the OutboundFrame envelope
+// overhead, from the generated codec — the records tail must be capped so the whole
+// envelope fits the outbound ring's maxMsgLength.  Shared with startup validation.
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -129,10 +127,10 @@ PartitionReplica* AeronPartitionTransport::resolveReplica_(int32_t topicId,
     return it == replicas_.end() ? nullptr : it->second;
 }
 
-void AeronPartitionTransport::deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs)
+bool AeronPartitionTransport::deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs)
 {
     nowNs_ = nowNs;
-    (void)handleFrame_(frame, len);
+    return handleFrame_(frame, len) != aeron::ControlledPollAction::ABORT;
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +587,20 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
                           resp.topicId, resp.partition);
             return Action::CONTINUE;
         }
+        if (workerPool_ && resp.topicId >= 0 &&
+            !workerPool_->opTailFits(resp.topicId, resp.partition, resp.records.size())) [[unlikely]] {
+            // F18: records that cannot fit ONE frame of the owning worker's ingress
+            // ring would THROW in tryClaim (terminating the process), and treating it
+            // as back-pressure (ABORT) would redeliver it forever and stall every
+            // partition on this subscription.  Unreachable when intake is bounded by
+            // produceIntakeLimit(); refuse it as a replication error (counted, logged),
+            // consume the fragment — the follower stays at its offset and re-fetches.
+            ++oversizedApplyRefused_;
+            spdlog::error("AeronPartitionTransport: FetchResponse for (topicId={}, partition={}) "
+                          "carries {} B of records — exceeds the worker ingress frame; refused",
+                          resp.topicId, resp.partition, resp.records.size());
+            return Action::CONTINUE;
+        }
         // E2 inc2a: when a WorkerPool is wired, route the applyReplicated call
         // through the owning worker's SPSC ingress ring instead of calling it
         // inline within the Aeron fragment callback.
@@ -741,6 +753,20 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
         PartitionReplica* const rep = resolveReplica_(resp.topicId, resp.partition);
         if (rep == nullptr) return Action::CONTINUE;
+        if (workerPool_ && resp.topicId >= 0 &&
+            !workerPool_->opTailFits(resp.topicId, resp.partition, resp.records.size())) [[unlikely]] {
+            // F18: records that cannot fit ONE frame of the owning worker's ingress
+            // ring would THROW in tryClaim (terminating the process), and treating it
+            // as back-pressure (ABORT) would redeliver it forever and stall every
+            // partition on this subscription.  Unreachable when intake is bounded by
+            // produceIntakeLimit(); refuse it as a replication error (counted, logged),
+            // consume the fragment — the follower stays at its offset and re-fetches.
+            ++oversizedApplyRefused_;
+            spdlog::error("AeronPartitionTransport: ReconcileFetchResponse for (topicId={}, partition={}) "
+                          "carries {} B of records — exceeds the worker ingress frame; refused",
+                          resp.topicId, resp.partition, resp.records.size());
+            return Action::CONTINUE;
+        }
         // E5.1.2c: route to owning worker (applyReconcileResponse touches
         // leaderState_.setLeaderLogEndOffset + recomputeHw).
         // Copy records bytes before returning from the Aeron callback (buffer lifetime).

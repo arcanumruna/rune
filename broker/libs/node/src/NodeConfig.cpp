@@ -1,4 +1,6 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/WorkerOp.h>                       // workerOpFrameBytes
+#include <rune/replication/ReplicationFrameLimits.h>   // F18 frame ceilings
 
 #include <stdexcept>
 
@@ -278,6 +280,24 @@ std::string NodeConfig::shardIngressEndpoint(const PeerConfig& p, int32_t w) {
         throw std::logic_error("shardIngressEndpoint: peer " + std::to_string(p.id) +
                                " has no ingressBasePort / bad worker " + std::to_string(w));
     return p.host + ":" + std::to_string(static_cast<int32_t>(p.ingressBasePort) + w);
+}
+
+// F18: the per-message frame of every hop an accepted produce batch crosses.
+int64_t NodeConfig::produceBatchFrameCeiling() const {
+    namespace rr = rune::replication;
+    // Worker-ingress op ring (gateway produce → worker; follower apply → worker).
+    int64_t ceiling = static_cast<int64_t>(workerIngressRingBytes) / 8 -
+                      static_cast<int64_t>(workerOpFrameBytes(0));
+    if (!isSingleNode()) {
+        ceiling = std::min(ceiling, rr::maxFetchRecordsViaOutboundRing(replicationOutboundRingBytes));
+        ceiling = std::min(ceiling, rr::maxFetchRecordsViaPublication(aeronTermBufferBytes));
+    }
+    return std::max<int64_t>(0, ceiling);
+}
+
+int32_t NodeConfig::produceIntakeLimit() const {
+    return static_cast<int32_t>(std::min<int64_t>(kDefaultMaxProduceBatchBytes,
+                                                  produceBatchFrameCeiling()));
 }
 
 std::optional<std::string> NodeConfig::validateShardConfig() const {

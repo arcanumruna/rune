@@ -22,6 +22,10 @@
 #include "support/TestWorkerCount.h"
 
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -1216,6 +1220,35 @@ TEST(BrokerNodeTest, OwnerThreadHookTimeoutCancelsTaskRegression) {
     EXPECT_EQ(node.onControlThreadForTest([] { return 7; }), 7);
     EXPECT_FALSE(ran) << "a cancelled (timed-out) task must never run";
 
+    node.stop();
+}
+
+// F18: the started node enforces the derived intake limit on the gateway (not the
+// old hardcoded 8 MiB, which a default worker-ingress op frame cannot carry).
+TEST(BrokerNodeRegression, GatewayEnforcesProduceIntakeLimit) {
+    TempDir tmp{"f18_wire_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    // A kernel-assigned free port (the fixed 50001 collides with parallel suites).
+    {
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        ASSERT_GE(fd, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0);
+        socklen_t len = sizeof(a);
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+        ::close(fd);
+        cfg.clientEndpoint.channel =
+            "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ntohs(a.sin_port));
+    }
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_NE(node.gatewayForTest(), nullptr);
+    EXPECT_EQ(node.gatewayForTest()->maxProduceBatchBytes(),
+              static_cast<std::size_t>(cfg.produceIntakeLimit()));
+    EXPECT_LE(node.gatewayForTest()->maxProduceBatchBytes(),
+              static_cast<std::size_t>(cfg.produceBatchFrameCeiling()));
     node.stop();
 }
 

@@ -1024,6 +1024,8 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
+        workerPool_->worker(i).setMaxProduceBatchBytes(
+            static_cast<std::size_t>(config_.produceIntakeLimit()));
     }
 
     if (config_.shardMode()) {
@@ -1335,6 +1337,10 @@ void BrokerNode::buildGateway() {
         // gatewayMinIsr is computed from the peer count (or RUNE_MIN_ISR env override)
         // during parseNodeConfig; single-node → 1 (leader-only ISR is sufficient).
         gateway_->setMinIsr(config_.gatewayMinIsr);
+        gateway_->setMaxProduceBatchBytes(
+            static_cast<std::size_t>(config_.produceIntakeLimit()));
+        spdlog::info("BrokerNode[{}]: produce intake limit {} B (frame ceiling {} B)", nodeId,
+                     config_.produceIntakeLimit(), config_.produceBatchFrameCeiling());
         spdlog::info("BrokerNode[{}]: gateway minIsr set to {} (cluster size={})",
                      nodeId, config_.gatewayMinIsr, config_.peers.size());
 

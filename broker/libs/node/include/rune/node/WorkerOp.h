@@ -37,6 +37,8 @@
 
 #include <rune/replication/ReplicationMessages.h>  // FetchResponseMsg
 #include <rune/storage/Log.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/WorkerOp.h>
 
 #include <cstdint>
 #include <memory>
@@ -377,5 +379,17 @@ struct WorkerReturn {
     // The data chunk returned by log->read().  Moved out of the worker.
     std::vector<uint8_t> chunk;
 };
+
+// ---------------------------------------------------------------------------
+// workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a
+// `tailLen`-byte variable tail (record batch / replicated records): SBE header +
+// block + varData.  The ONE formula Worker::tryEnqueueOp claims with, and the one
+// the produce intake limit (NodeConfig::produceIntakeLimit, F18) and the follower
+// apply guard check a batch against (ingress ring maxMsgLength = capacity / 8).
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline std::size_t workerOpFrameBytes(std::size_t tailLen) {
+    return ::rune::protocol::internal::sbe::MessageHeader::encodedLength() +
+           ::rune::protocol::internal::sbe::WorkerOp::computeLength(tailLen);
+}
 
 } // namespace rune::node

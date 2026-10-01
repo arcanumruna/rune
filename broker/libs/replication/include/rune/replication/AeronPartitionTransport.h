@@ -162,7 +162,11 @@ public:
     /// Test hook: number of raw replica pointers the transport holds.
     [[nodiscard]] std::size_t heldReplicaPointersForTest() const noexcept { return replicas_.size(); }
     /// Test hook: feed one reassembled replication frame through onFragment.
-    void deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs);
+    /// Returns false iff the frame was NOT consumed (ABORT → would be redelivered).
+    bool deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs);
+    /// F18: follower apply/reconcile frames refused because their records cannot
+    /// fit one worker-ingress frame (a replication error; never a crash/livelock).
+    [[nodiscard]] uint64_t oversizedApplyRefused() const noexcept { return oversizedApplyRefused_; }
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -363,6 +367,7 @@ private:
     // Size is NodeConfig-configurable (replicationOutboundRingBytes) — passed to
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
+    uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
 
     // Back-pressure observability: bumped when the outbound ring is full and a
     // (retriable) send had to be skipped. Control-thread reads for logging.

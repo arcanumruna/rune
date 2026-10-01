@@ -19,8 +19,8 @@ struct BatchPrefix {
 /// follower's fetch maxBytes is never replicated and the follower stalls at that
 /// offset forever — F18); every LATER batch is included only while the total stays
 /// <= cap.  A torn tail is ignored.  Pure, allocation-free.  (That the oversized
-/// batch fits one replication frame is guaranteed at startup by
-/// NodeConfig::validateProduceBatchLimit.)
+/// batch fits one replication frame is guaranteed at intake by
+/// NodeConfig::produceIntakeLimit — larger batches are refused MessageTooLarge.)
 [[nodiscard]] inline BatchPrefix wholeBatchPrefix(const uint8_t* data, std::size_t len,
                                                   std::size_t cap, Offset ceiling) noexcept
 {
