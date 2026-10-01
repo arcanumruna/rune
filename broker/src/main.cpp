@@ -131,7 +131,10 @@ int main() {
         node.start();
     } catch (const std::exception& ex) {
         spdlog::error("rune-broker: failed to start: {}", ex.what());
-        return 1;
+        // A storage failure found during startup (failed log recovery) exits
+        // through the halt path's code (74, EX_IOERR).
+        const int halted = g_exitCode.load(std::memory_order_acquire);
+        return halted != 0 ? halted : 1;
     }
 
     // For a 1-node cluster, await self-election.

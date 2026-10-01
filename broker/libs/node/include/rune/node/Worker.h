@@ -294,6 +294,9 @@ public:
         uint8_t isolation            = 0;
         bool    isGroup              = false;
         bool    groupCarrierReceived = false;
+        /// False while the partition is not owned by this worker (ownership
+        /// moved): parked, no reads of the moved replica / log.
+        bool    active               = true;
         // Hybrid egress: per-consumer UNICAST egress publication for this
         // subscription's consumer session.  Created + lifetime-owned by the
         // gateway; written ONLY here on the worker thread (single-writer,
@@ -1342,7 +1345,7 @@ private:
 
         int work = 0;
         for (auto& s : subs_) {
-            if (!s.logPtr) continue;
+            if (!s.logPtr || !s.active) continue;   // parked: partition moved away
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
             // per-consumer offsets); fall back to the shared MDC pub (broadcast).
@@ -2553,7 +2556,11 @@ private:
         uint32_t        sealsInFlight   = 0;
         bool            failureReported = false;
         uint64_t        sealDropsSeen   = 0;          ///< Log::droppedPendingSeals() last seen
+        std::string     dir;                          ///< cached at slot creation (C-1 signal)
     };
+    /// Logs purged by an ownership move with tokens possibly still in flight:
+    /// their cached dir, so a late error can be signalled without reading the Log.
+    std::vector<std::pair<const rune::storage::Log*, std::string>> purgedDirs_;
     std::vector<LogFlushSlot> slots_;
     uint32_t                  slotEpochSeq_ = 0;
     // Log* → slots_ index (open addressing, capacity pow2 ≥ 2×slots).
@@ -2620,8 +2627,34 @@ private:
             } else {
                 LogFlushSlot fresh;
                 fresh.log = log; fresh.replica = replica; fresh.epoch = ++slotEpochSeq_;
+                fresh.dir = log->dir();   // cached while owned: never read the Log after a move
                 next.push_back(fresh);
             }
+        }
+        // Ownership move (shared-nothing): after this, the worker holds no
+        // reference to — and makes no reads of — a moved replica or log.
+        std::vector<const rune::replication::PartitionReplica*> ownedNow(owned_.begin(), owned_.end());
+        std::sort(ownedNow.begin(), ownedNow.end());
+        auto isOwned = [&](const rune::replication::PartitionReplica* r) {
+            return r != nullptr && std::binary_search(ownedNow.begin(), ownedNow.end(), r);
+        };
+        // acks=all waiters on a moved replica would read its HW cross-thread:
+        // fail them RETRIABLY (NotLeader) — the client retries on the new owner.
+        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
+            if (!isOwned(pendingAcksAll_[i].replica)) {
+                pendingAcksAll_[i].ret.errorCode =
+                    static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+                enqueueReturn_(pendingAcksAll_[i].ret);
+                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
+                pendingAcksAll_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        // Push subscriptions on a moved partition are parked (cursor kept, no
+        // reads); re-activated if the partition comes back to this worker.
+        for (auto& sub : subs_) {
+            if (sub.replica) sub.active = isOwned(sub.replica);
         }
         // C-1 / M2: logs this worker no longer owns.  Their still-pending durable
         // entries would lose their seal gating (the slot goes) — fail them
@@ -2632,10 +2665,27 @@ private:
             for (const auto& n : next) kept = kept || n.log == old.log;
             if (kept) continue;
             failOwnPending_(old.log, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), false);
+            // Tokens still in flight for it resolve through purgedDirs_ (its dir
+            // was cached while owned) — the moved Log itself is never read again.
+            purgedDirs_.emplace_back(old.log, old.dir);
             dirtyThisCycle_.erase(std::remove(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), old.log),
                                   dirtyThisCycle_.end());
         }
         slots_ = std::move(next);
+        // Prune purged entries that are owned again or have no token in flight.
+        for (std::size_t i = 0; i < purgedDirs_.size(); ) {
+            bool live = false;
+            for (const auto& n : slots_) live = live || n.log == purgedDirs_[i].first;
+            bool inFlight = false;
+            if (!live)
+                for (const auto& r : routes_) inFlight = inFlight || (r.token != kNoToken && r.log == purgedDirs_[i].first);
+            if (live || !inFlight) {
+                purgedDirs_[i] = std::move(purgedDirs_.back());
+                purgedDirs_.pop_back();
+            } else {
+                ++i;
+            }
+        }
         const std::size_t cap = pow2AtLeast_(2 * slots_.size() + 2);
         slotIndex_.assign(cap, {nullptr, 0u});
         slotIndexMask_ = cap - 1;
@@ -2845,15 +2895,14 @@ private:
             }
         }
     }
-    void signalStorageFailure_(const rune::storage::Log* log, int err, int32_t topicId, int32_t partition) {
+    void signalStorageFailure_(const std::string& dir, int err, int32_t topicId, int32_t partition) {
         spdlog::critical("Worker {}: fsync FAILED on {} (errno={}) — log permanently failed; "
-                         "signalling the runtime to halt the broker", workerId_, log->dir(), err);
+                         "signalling the runtime to halt the broker", workerId_, dir, err);
         WorkerReturn sig;
         sig.type      = WorkerReturn::Type::StorageFailure;
         sig.errorCode = static_cast<int16_t>(err);
         sig.topicId   = topicId;
         sig.partition = partition;
-        const std::string& dir = log->dir();   // immutable after construction: safe to read
         sig.chunk.assign(dir.begin(), dir.end());
         ++storageFailureSignals_;
         enqueueSignal_(sig);
@@ -2868,7 +2917,7 @@ private:
         LogFlushSlot* slot = slotOf_(log);
         if (slot && slot->failureReported) return;
         if (slot) slot->failureReported = true;
-        signalStorageFailure_(log, log->storageErrno(),
+        signalStorageFailure_(log->dir(), log->storageErrno(),
                               slot && slot->replica ? slot->replica->topicId() : -1,
                               slot && slot->replica ? static_cast<int32_t>(slot->replica->partitionId()) : -1);
     }
@@ -2881,7 +2930,9 @@ private:
         failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), false);
         for (const auto* f : foreignFailed_) if (f == log) return;
         foreignFailed_.push_back(log);   // cold
-        signalStorageFailure_(log, err, -1, -1);
+        std::string dir = "<moved log>";
+        for (const auto& pd : purgedDirs_) if (pd.first == log) dir = pd.second;
+        signalStorageFailure_(dir, err, -1, -1);
     }
     // After a truncate (role change): clamp the slot's LEO bookkeeping, and if
     // the truncate dropped an UNSUBMITTED pending seal, this worker's durable

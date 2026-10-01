@@ -258,6 +258,9 @@ public:
     void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
     /// Test-only: drive the runtime's storage-failure path directly.
     void raiseStorageFailureForTest(const std::string& logDir, int err) { onStorageFailure_(logDir, err); }
+    /// Test-only: during start(), re-run one user log's recovery with this msync
+    /// errno injected (exercises the refuse-to-start path).
+    void setRecoveryFaultForTest(int err) noexcept { recoveryFaultForTest_ = err; }
 
     // -----------------------------------------------------------------------
     // Observers (thread-safe: atomic reads)
@@ -697,6 +700,8 @@ private:
     void*                                        haltCtx_     = nullptr;
     bool                                         haltRaised_  = false;   // runtime thread only
     void onStorageFailure_(const std::string& logDir, int err);
+    void refuseStartOnFailedRecovery_();
+    int  recoveryFaultForTest_ = 0;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();

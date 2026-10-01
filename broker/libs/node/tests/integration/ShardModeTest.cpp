@@ -558,3 +558,15 @@ TEST(ShardModeRegression, NoHaltHandlerExitsWithStorageFailureCode) {
         node.raiseStorageFailureForTest("/data/x", EIO);
     }, ::testing::ExitedWithCode(BrokerNode::kExitStorageFailure), "");
 }
+
+TEST(ShardModeRegression, StartRefusesWhenALogFailedRecovery) {
+    TmpDir dir{"recfail"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    HaltCapture halt;
+    node.setHaltHandler(&HaltCapture::handler, &halt);
+    node.setRecoveryFaultForTest(EIO);
+    EXPECT_THROW(node.start(), std::runtime_error) << "a log that failed recovery never serves";
+    EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure) << "through the halt path (exit 74)";
+    node.stop();
+}

@@ -137,6 +137,11 @@ void BrokerNode::start() {
     // 7. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
     buildGateway();
 
+    // 7.0 fsyncgate: a log whose recovery failed (index msync / dir fsync — the
+    //     log is marked storage-failed) must never serve.  Refuse to start —
+    //     critical log with the path, the halt path (exit 74), nothing served.
+    refuseStartOnFailedRecovery_();
+
     // 7a. Self-contained worker shards (spec §3.1; Task 9 fix round 1 I2): the
     //     per-worker invoker drivers + clients are created only NOW — after every
     //     long phase (consensus build, offset/txn/metadata rebuilds, admin build)
@@ -1184,6 +1189,31 @@ void BrokerNode::onStorageFailure_(const std::string& logDir, int err) {
                      config_.nodeId, kExitStorageFailure);
     spdlog::default_logger()->flush();
     std::_Exit(kExitStorageFailure);
+}
+
+void BrokerNode::refuseStartOnFailedRecovery_() {
+    if (!replicaRegistry_) return;
+    if (recoveryFaultForTest_ != 0) {
+        // Test-only: re-run the first disk-backed user log's recovery with an
+        // injected msync fault — the real recover() failure path.
+        for (auto* r : replicaRegistry_->allReplicas()) {
+            if (r && r->topicId() >= 0 && r->isDiskBacked()) {
+                r->log()->setSyncFaultForTest(recoveryFaultForTest_);
+                r->log()->recover();
+                r->log()->setSyncFaultForTest(0);
+                break;
+            }
+        }
+    }
+    for (auto* r : replicaRegistry_->allReplicas()) {
+        if (!r || !r->isDiskBacked() || !r->log()->storageFailed()) continue;
+        const std::string dir = r->log()->dir();
+        const int err = r->log()->storageErrno();
+        spdlog::critical("BrokerNode[{}]: log {} FAILED recovery (errno={}) — refusing to start",
+                         config_.nodeId, dir, err);
+        onStorageFailure_(dir, err);   // halt path: handler (exit 74) or _Exit(74)
+        throw std::runtime_error("BrokerNode: log " + dir + " failed recovery (storage failure) — refusing to start");
+    }
 }
 
 void BrokerNode::buildGateway() {

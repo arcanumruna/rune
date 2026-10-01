@@ -800,3 +800,56 @@ TEST(StorageFailStopRegression, InlineStrictSyncFailureIsStorageError) {
     ASSERT_EQ(a.n, 1);
     EXPECT_EQ(a.rets[0].errorCode, kStorageError);
 }
+
+TEST(StorageFailStopRegression, OwnershipMoveFailsAcksAllWaitersNoCrossThreadReadRegression) {
+    // After an ownership move this worker holds no reference to — and makes no
+    // reads of — the moved replica or log: acks=all waiters (which read the
+    // replica's HW) fail retriably, push subscriptions are parked.
+    auto s = std::make_unique<StrictShard>(64LL * 1024 * 1024, std::vector<rune::replication::NodeId>{1, 2});
+    TmpDir d2;
+    Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
+    PartitionReplica other(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &log2, &s->t);
+    s->w.setReapPausedForTest(true);
+    ASSERT_EQ(s->produce(7, batchAt(0, 2), /*acks=all*/1, 1), 1);
+    s->w.doWork(1);
+    const auto tok = s->w.durablePendingTokenForTest(0);
+    s->w.deliverCompletionForTest(FlushCompletion{tok, 0, 0});   // fsynced → parked on HW (follower 2 behind)
+    ASSERT_EQ(s->w.reservedAckSlotsForTest(), 1);
+    WorkerOp sub;
+    sub.type = WorkerOp::Type::Subscribe; sub.topicId = 1; sub.partition = 0;
+    sub.replica = s->leader.get(); sub.logPtr = s->log.get(); sub.subscriptionId = 42; sub.sessionId = 1;
+    ASSERT_TRUE(s->w.tryEnqueueOp(std::move(sub)));
+    s->w.doWork(2);
+    ASSERT_EQ(s->w.subscriptionsForTest().size(), 1u);
+    EXPECT_TRUE(s->w.subscriptionsForTest()[0].active);
+    WorkerOp op;
+    op.type = WorkerOp::Type::SetOwnership;
+    op.ownedSet = {&other};
+    ASSERT_TRUE(s->w.tryEnqueueOp(std::move(op)));
+    s->w.doWork(3);
+    Acks a;
+    a.drain(s->w);
+    ASSERT_EQ(a.n, 1) << "the acks=all waiter is answered at the move";
+    EXPECT_EQ(a.rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "retriable, never OK";
+    EXPECT_EQ(s->w.reservedAckSlotsForTest(), 0) << "no waiter holds the moved replica";
+    EXPECT_FALSE(s->w.subscriptionsForTest()[0].active) << "the push cursor on the moved log is parked";
+    // The moved replica + log are now another worker's: destroy them here — this
+    // worker must never touch them again (ASan / a crash would catch a read).
+    s->leader.reset();
+    s->log.reset();
+    s->w.deliverCompletionForTest(FlushCompletion{tok + 1, EIO, 0});   // unrelated late error: no crash
+    for (int i = 0; i < 50; ++i) s->w.doWork(4 + i * 11 * kMs);
+    a.drain(s->w);
+    EXPECT_EQ(a.n, 1);
+}
+
+TEST(StorageFailStopRegression, RecoveryMsyncFailureMarksLogFailed) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    ASSERT_FALSE(log.storageFailed());
+    log.setSyncFaultForTest(EIO);
+    EXPECT_NO_THROW(log.recover()) << "a recovery msync failure never escapes as an exception";
+    log.setSyncFaultForTest(0);
+    EXPECT_TRUE(log.storageFailed());
+    EXPECT_EQ(log.storageErrno(), EIO);
+}

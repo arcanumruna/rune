@@ -486,7 +486,7 @@ int64_t LogSegment::recover() {
     // startup recovery) — counted, and an error is fail-stop (sticky per log)
     // rather than an exception escaping a worker loop.
     if (storage_) ++storage_->roleChangeSyncs;
-    if (const int e = index_->sync(); e != 0) {
+    if (const int e = (storage_ && storage_->faultForTest) ? storage_->faultForTest : index_->sync(); e != 0) {
         if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
     }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
