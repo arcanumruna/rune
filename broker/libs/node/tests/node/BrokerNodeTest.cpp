@@ -1095,8 +1095,15 @@ TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxStorableBatch) {
         << "Legacy: an 8 MiB return ring cannot hold a 2-4 MiB batch the 32 MiB ingress ring accepts";
     EXPECT_TRUE(Worker::validateRingConfig(16 * MiB, 32 * MiB, false, 4 * MiB, 4096).has_value())
         << "return ring smaller than the ingress ring";
-    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, true, 64 * MiB, 4096).has_value())
-        << "shard: a 64 MiB term admits 8 MiB batches; a 4 MiB return max message cannot hold one";
+    // Re-review 1 I-3: shard intake is bounded per worker by its own return
+    // ring (MessageTooLarge above it), so the Aeron term size never makes a
+    // config refuse.  The SHIPPED shard configs must start:
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, true, 32 * MiB, 4096).has_value())
+        << "bench/kafka-compare/cluster.sh RUNE_SHARD=1 (rings 32/32, term 32 MiB)";
+    EXPECT_FALSE(Worker::validateRingConfig(64 * MiB, 64 * MiB, true, 64 * MiB, 4096).has_value())
+        << "replbench.sh RUNE_SHARD=1 (rings 64/64, term 64 MiB)";
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, true, 64 * MiB, 4096).has_value())
+        << "CLAUDE.md broker env (rings 32/32, term 64 MiB) in shard mode";
     EXPECT_FALSE(Worker::validateRingConfig(128 * MiB, 32 * MiB, true, 64 * MiB, 4096).has_value());
     EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, false, 4 * MiB, 9000).has_value())
         << "owed-return cap above the ceiling";

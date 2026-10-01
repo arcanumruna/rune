@@ -291,6 +291,10 @@ public:
     /// Produces refused (gateway path) / shard polls skipped because the
     /// owed-return cap — not the ring — was the limiter.
     [[nodiscard]] uint64_t owedCapThrottlesForTest() const noexcept { return owedCapThrottles_; }
+    // F15 S3 fix round 2 — RED stub / test seam.
+    [[nodiscard]] uint64_t pushReadOversizeForTest() const noexcept { return 0; }
+    /// Test seam: emit an arbitrary return through the one return path.
+    void enqueueReturnForTest(const WorkerReturn& r) { enqueueReturn_(r); }
 
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
     // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the

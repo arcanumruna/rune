@@ -711,6 +711,9 @@ public:
     void applySubscribeForTest(const uint8_t* buf, std::size_t len) {
         handleSubscribe(buf, len);
     }
+    /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
+    /// Aeron polling.
+    void pushSubscriptionsForTest() { pushSubscriptions(); }
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real

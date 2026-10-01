@@ -2093,33 +2093,28 @@ TEST(ReturnOverflowRegression, OpDrainPausesAtHighWater) {
 }
 
 TEST(ReturnOverflowRegression, ClaimExceptionHalts) {
-    // A return the ring can never hold (a PushRead chunk of one 16 KiB batch
-    // vs the 64 KiB ring's 8 KiB max message): tryClaim throws.  Base logs
-    // "tryClaim failed" and DROPS it (the subscription silently stalls).  Now:
-    // an invariant-violation halt (exit 70), never a drop.
+    // A return the ring can never hold makes tryClaim throw.  Base logged
+    // "tryClaim failed" and DROPPED it.  Now: an invariant-violation halt (exit
+    // 70), never a drop.  (Fix round 2: a PushRead of an oversize STORED batch
+    // is no longer this case — it answers the subscription an error, see
+    // PushReadOfBatchLargerThanReturnRingAnswersErrorNoHalt — so the fault is
+    // injected as a return carrying a chunk larger than the ring's 8 KiB max
+    // message, e.g. a refused marker echo.)
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT({
-        TmpDir d;
-        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
-        NullTransport t;
-        PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
         Worker w(0, 1 << 20, 1 << 16, 64, 64);
-        w.setOwnedDirect(Worker::OwnedSet{&rep});
-        WorkerOp p = produceOp(&rep, 1);
-        p.recordBatchBytes = bigBatch(16 * 1024);
-        (void)w.tryEnqueueOp(std::move(p));
-        (void)w.tryEnqueueOp(pushReadOp(&rep, 7, 0, 1));
-        w.doWork(1);
-        (void)drainAll(w);
-        w.doWork(2);
+        WorkerReturn r;
+        r.type = WorkerReturn::Type::ControlRecordRefused;
+        r.chunk.assign(16 * 1024, 0xAB);
+        w.enqueueReturnForTest(r);
         std::_Exit(0);
     }, ::testing::ExitedWithCode(kExitInvariant), "");
 }
 
 TEST(ReturnOverflowRegression, FlushClaimExceptionHalts) {
     // The same oversize return queued BEHIND a full ring: the FIFO flush hits
-    // the claim exception.  Base: flushRetOverflow_'s catch erases it and
-    // continues (a silent drop).  Now: halt (exit 70).
+    // the claim exception.  Base: flushRetOverflow_'s catch erased it and
+    // continued (a silent drop).  Now: halt (exit 70).
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT({
         TmpDir d;
@@ -2128,12 +2123,13 @@ TEST(ReturnOverflowRegression, FlushClaimExceptionHalts) {
         PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
         Worker w(0, 1 << 22, 1 << 16, 64, 64);
         w.setOwnedDirect(Worker::OwnedSet{&rep});
-        w.setWorkerIngress(nullptr, true);
-        WorkerOp p = produceOp(&rep, 1);
-        p.recordBatchBytes = bigBatch(16 * 1024);
-        (void)w.tryEnqueueOp(std::move(p));
-        for (int i = 0; i < 800; ++i) (void)w.tryEnqueueOp(produceOp(&rep, 2 + i));   // fill the ring
-        (void)w.tryEnqueueOp(pushReadOp(&rep, 7, 0, 1));                            // queued behind
+        for (int i = 0; i < 800; ++i) (void)w.tryEnqueueOp(produceOp(&rep, 1 + i));   // fill the ring
+        w.doWork(1);
+        if (w.retFifoSizeForTest() == 0) std::_Exit(2);                              // precondition
+        WorkerReturn r;
+        r.type = WorkerReturn::Type::ControlRecordRefused;
+        r.chunk.assign(16 * 1024, 0xAB);
+        w.enqueueReturnForTest(r);                                                   // queued behind
         int64_t now = 1;
         for (int i = 0; i < 64; ++i) { w.doWork(++now); (void)drainAll(w); }
         std::_Exit(0);
@@ -2433,4 +2429,102 @@ TEST(ReturnOverflowRegression, ConfiguredOwedCapBoundsParkedWaiters) {
         for (int i = 0; i < 256; ++i) ASSERT_EQ(ingressAcksAll(w, i + 1, 1), 1);
         EXPECT_EQ(w.ingressPollBudgetForTest(), 0) << "the shard poll budget ignores the configured cap";
     }
+}
+
+// ============================================================================
+// F15 S3 fix round 2 (re-review 1: I-3, I-4).
+// ============================================================================
+TEST(ReturnOverflowRegression, ShardIngressBatchLargerThanReturnRingRejectedMessageTooLarge) {
+    // I-3: shard intake is bounded by THIS worker's return ring (a batch it
+    // stores must fit one PushReadResult), not by the Aeron term size — so the
+    // shipped shard configs (term >= ring) start, and no batch the ring cannot
+    // carry is ever stored.  1 MiB return ring: max message 128 KiB.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 22, 1 << 20, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    const auto over = produceFrame(1, 9, bigBatch(200 * 1024), /*acks=*/0, 1, 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(over.data(), over.size(), 1), 1);
+    auto rets = drainAll(w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(log.logEndOffset(), 0) << "a batch the return ring cannot carry must never be stored";
+    const auto fits = produceFrame(1, 10, bigBatch(100 * 1024), /*acks=*/0, 1, 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(fits.data(), fits.size(), 2), 1);
+    rets = drainAll(w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, 0);
+    EXPECT_EQ(log.logEndOffset(), 1);
+}
+
+namespace {
+[[noreturn]] void oversizeStoredBatchChild() {
+        TmpDir d, d2;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+        PartitionReplica rep2(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &log2, &t);
+        const auto big = bigBatch(16 * 1024);
+        (void)log.append(big, 0);                          // stored under a bigger config
+        const auto small = batchAt(0);
+        (void)log2.append(small, 0);
+        Worker w(0, 1 << 20, 1 << 16, 64, 64);             // now: 8 KiB return max message
+        w.setOwnedDirect(Worker::OwnedSet{&rep, &rep2});
+        (void)w.tryEnqueueOp(pushReadOp(&rep, 7, 0, 1));
+        (void)w.tryEnqueueOp(pushReadOp(&rep2, 8, 0, 1));
+        w.doWork(1);
+        const auto rets = drainAll(w);
+        const bool ok = rets.size() == 2u &&
+            rets[0].subscriptionId == 7 && rets[0].chunk.empty() &&
+            rets[0].errorCode == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge) &&
+            rets[1].subscriptionId == 8 && rets[1].errorCode == 0 && !rets[1].chunk.empty() &&
+            w.pushReadOversizeForTest() == 1u;
+        std::_Exit(ok ? 0 : 1);
+}
+} // namespace
+
+TEST(ReturnOverflowRegression, PushReadOfBatchLargerThanReturnRingAnswersErrorNoHalt) {
+    // I-4: a batch ALREADY on disk that is larger than the current return
+    // ring's max message (stored under a bigger earlier config, or received
+    // from a peer and then led).  Base: the PushRead claim throws → exit 70 on
+    // every restart (crash loop).  Now: that read answers MessageTooLarge with
+    // an empty chunk, the oversize read is counted, and the worker keeps
+    // serving other partitions.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(oversizeStoredBatchChild(), ::testing::ExitedWithCode(0), "");
+}
+
+namespace {
+[[noreturn]] void gatewayOversizeChild() {
+        LegacyAcksRig R({1});                                // pool rings 64 KiB: 8 KiB max message
+        const auto big = bigBatch(16 * 1024);
+        (void)R.r->log()->append(big, 0);                    // on disk from an earlier config
+        R.r->onLeaderLogAppended();
+        R.runWorker();
+        pc::Subscribe sub;
+        sub.sessionId = R.sid; sub.correlationId = 77; sub.topicId = 0; sub.partition = 0;
+        sub.partitionKnown = 1; sub.fromOffset = 0; sub.isolation = 0;
+        std::vector<uint8_t> frame(sub.encodedSize());
+        sub.encode(frame.data());
+        R.gw.applySubscribeForTest(frame.data(), frame.size());
+        for (int i = 0; i < 8; ++i) { R.gw.pushSubscriptionsForTest(); R.runWorker(); }
+        std::size_t tooLarge = 0;
+        for (const auto& a : R.answers)
+            tooLarge += (a.inlineError && a.code == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) ? 1u : 0u;
+        const bool ok = tooLarge == 1u && R.w().pushReadOversizeForTest() == 1u;
+        std::_Exit(ok ? 0 : 1);
+}
+} // namespace
+
+TEST(ReturnOverflowRegression, GatewayFailsSubscriptionOnOversizeBatchWithoutSpinning) {
+    // I-4, gateway side (default config): the subscription whose next batch
+    // the return ring cannot carry gets ONE non-retriable ErrorResponse
+    // (MessageTooLarge, correlationId = subscriptionId) and is parked — the
+    // gateway issues no further PushRead for it (no spin on the batch).
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(gatewayOversizeChild(), ::testing::ExitedWithCode(0), "");
 }

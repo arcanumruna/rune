@@ -1404,6 +1404,19 @@ TEST(ReturnOverflowRegression, MaxOwedReturnsParsedFromEnv) {
     auto res2 = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res2.config.has_value()) << res2.error;
     EXPECT_EQ(res2.config->workerMaxOwedReturns, 20000);
+    // Re-review 1 m-a: 0 / negative are kept (start() refuses them loudly),
+    // non-numeric is a configuration error — never silently the default.
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "0";
+    auto res3 = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res3.config.has_value()) << res3.error;
+    EXPECT_EQ(res3.config->workerMaxOwedReturns, 0);
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "-5";
+    auto res4 = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res4.config.has_value()) << res4.error;
+    EXPECT_EQ(res4.config->workerMaxOwedReturns, -5);
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "lots";
+    auto res5 = rune::node::parseNodeConfig(fakeEnv(base));
+    EXPECT_FALSE(res5.config.has_value()) << "a non-numeric value must be a configuration error";
 }
 
 TEST(NodeConfig, WorkerRingBytesDefaultValues) {
