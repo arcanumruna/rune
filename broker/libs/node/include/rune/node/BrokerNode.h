@@ -41,6 +41,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/OwnerThreadTestTask.h>
+#include <rune/node/LeaderObserver.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -69,12 +70,10 @@ extern "C" {
 }
 #include <Aeron.h>
 
-#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -287,15 +286,22 @@ public:
     void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
 
     // -----------------------------------------------------------------------
-    // Observers (thread-safe: atomic reads)
+    // Observers (F9a: ring-fed, no atomics)
+    //
+    // The leadership view is owned by the CONTROL thread, which publishes a
+    // {leaderId, term, isLeader} snapshot on LeaderObserver's ring whenever it
+    // changes.  isLeader()/leaderId()/leadershipTermId()/awaitLeader()/
+    // publishRole()/leaderClientEndpoint() DRAIN that ring: they must be called
+    // from ONE external thread at a time (main()'s poll loop, or the test
+    // thread driving the node).  Node-internal (control-thread) code uses
+    // LeaderObserver::computeOnControl() instead — never these.
     // -----------------------------------------------------------------------
 
     bool   isLeader()  const noexcept;
     rune::consensus::NodeId leaderId() const noexcept;
 
-    /// Return the current leadershipTermId from the election state.
-    /// Observer-thread-safe: reads the atomic stateCode to decide the path,
-    /// then reads the duty-cycle-written term from the Election.
+    /// Return the current leadershipTermId (from the same ring snapshot as
+    /// leaderId(), so the pair is never torn).
     /// Used by main.cpp to annotate leadership log messages with the term so
     /// the DR-5 oracle can distinguish stale pre-election announcements from
     /// current-term announcements (term-aware assert_single_leader).
@@ -305,13 +311,13 @@ public:
     /// counter (RoleCounter.h) in the driver's CnC file.  Idempotent + cheap:
     /// call it from the main poll loop on every tick.  No-op until the driver
     /// has acked the counter allocation (findCounter returns the live Counter).
-    /// Observer-thread-safe: reads the same atomic leaderId()/term accessors the
-    /// leadership log uses; the counter is the machine-readable signal the
-    /// dr-e2e harness reads (via rune_role) instead of scraping logs.
+    /// Observer thread (see above): one ring-drained snapshot; the counter is the
+    /// machine-readable signal the dr-e2e harness reads (via rune_role) instead
+    /// of scraping logs.
     void publishRole() noexcept;
 
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
-    /// Observer-thread-safe: reads atomic leaderId() + immutable peer config.
+    /// Observer thread (see above): ring-drained snapshot + immutable peer config.
     /// - If this node IS the leader → returns empty string (no self-redirect).
     /// - If leader id is known and that peer has a clientPort → returns its
     ///   clientChannel() ("aeron:udp?endpoint=host:port").
@@ -343,8 +349,8 @@ public:
     // Preconditions (fail loudly with std::logic_error / invalid_argument):
     //   node started and not stopped; topicId != kSchemaTopicId (-4, the
     //   __topic_schemas replica is AdminWorker-owned — not routable here).
-    // Callers may be on any test thread; test-side producers are serialised by
-    // testHookMu_ (touched ONLY by test threads — never by a node thread).
+    // Callers may be on any test thread: the control test-task ring is
+    // many-to-one (F9a — no test-side mutex).
     // -----------------------------------------------------------------------
     template <class F>
     auto onOwnerThreadForTest(int32_t topicId, int32_t partition, F&& f,
@@ -503,28 +509,27 @@ private:
     auto submitOwnerThreadTestTask_(int32_t topicId, int32_t partition, F&& f,
                                     std::chrono::milliseconds timeout) {
         using Impl = detail::OwnerThreadTestTaskImpl<std::decay_t<F>, T>;
-        if (!started_.load(std::memory_order_acquire) ||
-            stopped_.load(std::memory_order_acquire) || !runtimeAgent_) {
+        if (!started_ || stopped_ || !runtimeAgent_) {
             throw std::logic_error(
                 "onOwnerThreadForTest: node is not running (start() not called, or "
                 "already stopped) — no owner thread to run the task on");
         }
-        auto task = std::make_shared<Impl>(topicId, partition, std::forward<F>(f));
+        // Deadline fixed BEFORE the ref is enqueued: the owner decides run-or-skip
+        // from it alone (see OwnerThreadTestTask.h, F9a).
+        auto task = std::make_shared<Impl>(topicId, partition, std::forward<F>(f),
+                                           OwnerThreadTestTask::Clock::now() + timeout);
         auto fut  = task->future();
         auto* ref = new OwnerThreadTestTaskRef(task);   // the ring's reference
-        {
-            std::lock_guard<std::mutex> lk(testHookMu_);
-            if (!runtimeAgent_->offerOwnerThreadTestTask(ref)) {
-                delete ref;
-                throw std::runtime_error("onOwnerThreadForTest: control test-task ring full");
-            }
+        if (!runtimeAgent_->offerOwnerThreadTestTask(ref)) {
+            delete ref;
+            throw std::runtime_error("onOwnerThreadForTest: control test-task ring full");
         }
         return awaitOwnerThreadTestTask(*task, fut, timeout);
     }
 
-    // F1: serialises TEST-thread producers onto the SPSC test-task ring.  Never
-    // touched by any node thread (not on any production path).
-    std::mutex testHookMu_;
+    // F9a: control-thread-side helper for the gateway leaderView — pure function
+    // of a snapshot + the immutable peer config.
+    std::string leaderClientEndpointFor_(const LeaderSnapshot& v) const noexcept;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -800,10 +805,17 @@ private:
     std::shared_ptr<aeron::Counter>  termCounter_;
 
     // -----------------------------------------------------------------------
-    // State flags
+    // State flags — CONTROLLER-owned (F9a: no atomics).  Written only by the
+    // thread calling start()/stop(); the controller role may move to another
+    // thread only across a happens-before edge (thread start/join), e.g.
+    // ShardModeTest stops the node from a helper thread it then joins.
     // -----------------------------------------------------------------------
-    std::atomic<bool> started_{false};
-    std::atomic<bool> stopped_{false};
+    bool started_ = false;
+    bool stopped_ = false;
+
+    // F9a: control thread → observer thread leadership ring (see Observers).
+    // mutable: the const observer accessors drain it.
+    mutable LeaderObserver leaderObserver_{static_cast<rune::consensus::NodeId>(config_.nodeId)};
 };
 
 } // namespace rune::node

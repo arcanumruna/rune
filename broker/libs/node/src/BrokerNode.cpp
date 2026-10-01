@@ -63,11 +63,8 @@ BrokerNode::~BrokerNode() {
 // BrokerNode::start
 // ---------------------------------------------------------------------------
 void BrokerNode::start() {
-    bool expected = false;
-    if (!started_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return; // idempotent
-    }
+    if (started_) return; // idempotent (controller-owned flag, F9a)
+    started_ = true;
 
     // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
     // side effect (no dataDir, no driver, no ports).
@@ -1165,9 +1162,11 @@ void BrokerNode::buildWorkerPool() {
 // Called AFTER buildConsensusObjects() (so agent_ / nodeAgent_ are valid)
 // and AFTER the aeron_ client is connected (so addSubscription succeeds).
 //
-// The leaderView lambda is safe: it reads this->isLeader() which is an atomic
-// observer — safe to call from the gateway's duty-cycle thread (same thread
-// as the AgentRunner).
+// The leaderView lambda runs on the gateway's duty-cycle thread (the control
+// thread, same as the AgentRunner) and reads the leadership view DIRECTLY from
+// control-thread-owned state (LeaderObserver::computeOnControl — F9a).  It must
+// never call the observer accessors (isLeader()/leaderId()), which drain the
+// observer ring and belong to the external (main/test) thread.
 //
 // leaderView ruling (BR-7a / Milestone A):
 //   isLeader = node.isLeader()
@@ -1269,12 +1268,12 @@ void BrokerNode::buildGateway() {
     //   - follower + known leader endpoint → {isLeader=false, leaderClientEndpoint=<peer channel>}
     //   - follower + unknown endpoint → {isLeader=false, leaderClientEndpoint=""}
     //     (gateway degrades to local-accept for Connect; data ops return NotLeader)
-    // Both isLeader() and leaderClientEndpoint() are observer-thread-safe (atomic reads).
+    // Control thread: owner-state reads via LeaderObserver::computeOnControl (F9a).
     auto leaderViewFn = [this]() -> rune::gateway::LeaderView {
-        const bool leader = this->isLeader();
+        const LeaderSnapshot v = leaderObserver_.computeOnControl();
         return rune::gateway::LeaderView{
-            /*isLeader=*/leader,
-            /*leaderClientEndpoint=*/leader ? std::string{} : this->leaderClientEndpoint()
+            /*isLeader=*/v.isLeader,
+            /*leaderClientEndpoint=*/v.isLeader ? std::string{} : this->leaderClientEndpointFor_(v)
         };
     };
 
@@ -1472,8 +1471,9 @@ void BrokerNode::buildGateway() {
             groupCoordService_ = std::make_unique<GroupCoordinationService>(
                 offsetStore_.get(),
                 topicRegistry_.get(),
-                [this]() -> bool { return this->isLeader(); },
-                [this]() -> NodeId { return static_cast<NodeId>(this->leaderId()); });
+                // Control thread (F9a): owner-state view, never the observer ring.
+                [this]() -> bool { return leaderObserver_.computeOnControl().isLeader; },
+                [this]() -> NodeId { return leaderObserver_.computeOnControl().leaderId; });
 
             // Wire both directions.
             gateway_->setGroupService(groupCoordService_.get());
@@ -1574,8 +1574,9 @@ void BrokerNode::buildGateway() {
             txnCoordService_ = std::make_unique<TransactionCoordinationService>(
                 txnState_.get(),
                 topicRegistry_.get(),
-                [this]() -> bool { return this->isLeader(); },
-                [this]() -> NodeId { return static_cast<NodeId>(this->leaderId()); });
+                // Control thread (F9a): owner-state view, never the observer ring.
+                [this]() -> bool { return leaderObserver_.computeOnControl().isLeader; },
+                [this]() -> NodeId { return leaderObserver_.computeOnControl().leaderId; });
 
             txnCoordService_->setGateway(gateway_.get());
 
@@ -1813,6 +1814,11 @@ void BrokerNode::buildGateway() {
         txnCoordService_.get(),   // TX-3: txn coordinator (null-safe if setup failed)
         metadataService_.get(),   // MD1: metadata service (null-safe if setup failed)
         workerPool_.get());       // E1: shard→worker pool (null-safe if no topics)
+    // F9a: the runtime publishes the leadership view to the observer thread over
+    // LeaderObserver's ring once per duty cycle (only on change).  Bound here,
+    // before the control thread starts (ordered by its start).
+    leaderObserver_.bind(election_.get(), nodeAgent_.get());
+    runtimeAgent_->setLeaderObserver(&leaderObserver_);
     // fsyncgate (Task 10 fix 2 / I-1): control-thread-driven replicas (internal
     // partitions) whose fsync failed → halt.
     runtimeAgent_->setStorageFailureHook([this](const std::string& dir, int err) {
@@ -1844,13 +1850,15 @@ void BrokerNode::buildGateway() {
                 if (!agent) return 0;
 
                 // (1) Post a role event on a leadership-state change.
-                const bool leaderNow = this->isLeader();
-                const int32_t epochNow = static_cast<int32_t>(this->leadershipTermId());
+                // Control thread: owner-state view (F9a — never the observer ring).
+                const LeaderSnapshot v = leaderObserver_.computeOnControl();
+                const bool leaderNow = v.isLeader;
+                const int32_t epochNow = static_cast<int32_t>(v.term);
                 if (leaderNow != adminLastLeader_ || epochNow != adminLastEpoch_) {
                     AdminRoleMsg rm;
                     rm.leader   = leaderNow;
                     rm.epoch    = epochNow;
-                    rm.leaderId = static_cast<int32_t>(this->leaderId());
+                    rm.leaderId = static_cast<int32_t>(v.leaderId);
                     if (encodeAdminRole(agent->roleRing(), rm)) {
                         adminLastLeader_ = leaderNow;
                         adminLastEpoch_  = epochNow;
@@ -2002,20 +2010,21 @@ void BrokerNode::buildGateway() {
 }
 
 // ---------------------------------------------------------------------------
-// BrokerNode::awaitLeader
+// Observer accessors (F9a).
+//
+// The leadership view is owned by the control thread.  It publishes a snapshot
+// on LeaderObserver's ring whenever the view changes; these accessors are the
+// ring's ONE consumer — the external thread driving the node (main()'s poll
+// loop or a test thread).  No atomics, no torn reads: every value comes from
+// one ring message.  Control-thread code must use computeOnControl() instead.
 // ---------------------------------------------------------------------------
 bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + timeout;
 
-    // For single-node: wait for isLeader().
-    // For multi-node: wait for leaderId() >= 0 (any leader, leader or follower).
-    auto hasLeader = [this]() -> bool {
-        if (nodeAgent_) {
-            return nodeAgent_->leaderId() >= 0;
-        }
-        return isLeader();
-    };
+    // Any decided leader: single-node → this node leads; multi-node → a leader
+    // (this node or a peer) is known.
+    auto hasLeader = [this]() -> bool { return leaderObserver_.observe().leaderId >= 0; };
 
     while (clock::now() < deadline) {
         if (hasLeader()) return true;
@@ -2024,62 +2033,20 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
     return hasLeader(); // one final check at deadline
 }
 
-// ---------------------------------------------------------------------------
-// BrokerNode::isLeader
-// ---------------------------------------------------------------------------
 bool BrokerNode::isLeader() const noexcept {
-    if (!election_) return false;
-
-    // For the multi-node path, rely SOLELY on the atomic observedLeaderId_ mirror
-    // written by NodeConsensusAgent::updateObservedLeader() after each duty cycle.
-    // This avoids reading TWO independent atomics (stateCode_ + observedLeaderId_)
-    // which have a TOCTOU race: the duty-cycle thread could transition the state
-    // between the two reads, causing isLeader() to return false for a node that IS
-    // the leader but is momentarily in a pass-through state (LeaderReplay, LeaderInit)
-    // not covered by the stateCode_ check — which produced the observed ~1/14 flake.
-    if (nodeAgent_) {
-        return nodeAgent_->leaderId() == static_cast<NodeId>(config_.nodeId);
-    }
-
-    // Single-node (no nodeAgent_): fall back to stateCode_.
-    // All leader states including pass-through ones: LeaderLogReplication, LeaderReplay,
-    // LeaderInit, LeaderReady, Closed.  Missing LeaderReplay/LeaderInit here was safe for
-    // single-node (their pass-through is near-instantaneous and the caller is the same
-    // thread that drives doWork), but we include them for correctness completeness.
-    // Use the atomic stateCode() — release-written by the agent thread on every
-    // state transition — instead of the non-atomic state() accessor.
-    const int32_t c = election_->stateCode();
-    return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
-           c == static_cast<int32_t>(ElectionState::LeaderReplay)         ||
-           c == static_cast<int32_t>(ElectionState::LeaderInit)           ||
-           c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
-           c == static_cast<int32_t>(ElectionState::Closed);
+    // One snapshot carries leaderId + isLeader together, so the old TOCTOU
+    // between stateCode_ and observedLeaderId_ cannot occur.
+    return leaderObserver_.observe().isLeader;
 }
 
-// ---------------------------------------------------------------------------
-// BrokerNode::leaderId
-// ---------------------------------------------------------------------------
 NodeId BrokerNode::leaderId() const noexcept {
-    // Multi-node path: read the atomic mirror updated by NodeConsensusAgent.
-    if (nodeAgent_) {
-        return nodeAgent_->leaderId();
-    }
-    // Single-node (BR-2) path: derive from atomic stateCode.
-    if (isLeader()) return static_cast<NodeId>(config_.nodeId);
-    return -1; // kNullValue — no leader known yet
+    return leaderObserver_.observe().leaderId;
 }
 
-// ---------------------------------------------------------------------------
-// BrokerNode::leadershipTermId
-// ---------------------------------------------------------------------------
 Term BrokerNode::leadershipTermId() const noexcept {
-    if (!election_) return 0;
-    // election_->leadershipTermId() is written on the duty-cycle thread; reading
-    // it from an observer thread (main's polling loop) is a benign data race on
-    // a plain Term (int64_t) — same pattern used by leaderId() observers.  We
-    // accept the rare torn-read risk here because this value is used only for
-    // logging and the oracle filter, never for consensus decisions.
-    return election_->leadershipTermId();
+    // Previously a racy plain read of election_ from the observer thread; now
+    // the term travels in the same ring snapshot as the leader id.
+    return leaderObserver_.observe().term;
 }
 
 // ---------------------------------------------------------------------------
@@ -2096,8 +2063,8 @@ Term BrokerNode::leadershipTermId() const noexcept {
 // for the first few calls — we simply retry on the next poll tick.  Once
 // resolved, the Counter is cached and set() is a single relaxed store.
 //
-// Observer-thread-safe: reads the same atomic isLeader()/leaderId()/term
-// accessors the leadership log uses.  Called from main's 100 ms poll loop.
+// Observer thread: one ring-drained snapshot (role + term together, F9a).
+// Called from main's 100 ms poll loop.
 // ---------------------------------------------------------------------------
 void BrokerNode::publishRole() noexcept {
     if (!aeron_) return;
@@ -2115,17 +2082,16 @@ void BrokerNode::publishRole() noexcept {
     // Determine this node's current role.  We expose Leader vs Follower vs None;
     // Candidate is not separately observable via the BrokerNode accessors, so a
     // node that observes no leader yet is reported as None (pre-election gap).
-    const bool leader = isLeader();
-    const NodeId lid  = leaderId();
-    const RoleCode role = leader ? RoleCode::Leader
-                        : (lid >= 0 ? RoleCode::Follower : RoleCode::None);
+    const LeaderSnapshot v = leaderObserver_.observe();
+    const RoleCode role = v.isLeader ? RoleCode::Leader
+                        : (v.leaderId >= 0 ? RoleCode::Follower : RoleCode::None);
 
     if (roleCounter_) {
         roleCounter_->set(static_cast<std::int64_t>(role));
     }
     if (termCounter_) {
         // Publish the term this node observes (its own leadership term id).
-        termCounter_->set(static_cast<std::int64_t>(leadershipTermId()));
+        termCounter_->set(static_cast<std::int64_t>(v.term));
     }
 }
 
@@ -2133,10 +2099,17 @@ void BrokerNode::publishRole() noexcept {
 // BrokerNode::leaderClientEndpoint (GB-4)
 // ---------------------------------------------------------------------------
 std::string BrokerNode::leaderClientEndpoint() const noexcept {
-    // If this node is the leader, no redirect to self.
-    if (isLeader()) return {};
+    // Observer thread (F9a): one ring-drained snapshot.
+    return leaderClientEndpointFor_(leaderObserver_.observe());
+}
 
-    const NodeId lid = leaderId();
+// Pure function of a snapshot + the immutable peer config — callable on any
+// thread with a snapshot that thread legitimately owns.
+std::string BrokerNode::leaderClientEndpointFor_(const LeaderSnapshot& v) const noexcept {
+    // If this node is the leader, no redirect to self.
+    if (v.isLeader) return {};
+
+    const NodeId lid = v.leaderId;
     if (lid < 0) return {};  // leader unknown — no endpoint
 
     // Find the leader peer in the immutable config and return its clientChannel.
@@ -2447,11 +2420,8 @@ void BrokerNode::buildAdminWorker() {
 // BrokerNode::stop
 // ---------------------------------------------------------------------------
 void BrokerNode::stop() {
-    bool expected = false;
-    if (!stopped_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return; // idempotent
-    }
+    if (stopped_) return; // idempotent (controller-owned flag, F9a)
+    stopped_ = true;
 
     // 1a. E2 inc2b: stop per-worker AgentRunner threads FIRST.
     //     Workers hold non-owning replica pointers; they must be quiesced before
