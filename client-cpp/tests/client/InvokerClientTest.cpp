@@ -70,8 +70,13 @@ struct Rig {
                         c.egressChannel, c.egressStreamId) {}
 
     template <class P>
-    bool drive(P&& pred, int cap = 200'000, int64_t stepNs = 0) {
-        for (int i = 0; i < cap; ++i) {
+    // cap < 0 (default): drive until pred holds — real Aeron work (connects,
+    // IPC images) needs real progress, not a CPU-speed-dependent iteration
+    // count; the 10 s deadline only bounds a FAILING test.  An explicit cap is
+    // a deliberate "within N cycles" bound and stays strict.
+    bool drive(P&& pred, int cap = -1, int64_t stepNs = 0) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (int i = 0; cap < 0 ? std::chrono::steady_clock::now() < deadline : i < cap; ++i) {
             g_fakeNow += stepNs;
             client.doWork();
             gw.pump();
