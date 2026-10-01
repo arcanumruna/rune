@@ -117,7 +117,8 @@ public:
     /// p99 16.6 µs @16 KiB, 18.4 µs @32 KiB, 21.9 µs @64 KiB → 32 KiB.
     static constexpr int32_t     kDefaultScanBytesPerPass = 32 * 1024;
     static constexpr std::size_t kTailReserve             = 256;
-    /// Read-ahead depth: MADV_WILLNEED this many budgets beyond the cursor.
+    /// Read-ahead depth: request (async FADVISE / sync MADV_WILLNEED) this many
+    /// budgets beyond the cursor (m7).
     static constexpr std::size_t kReadAheadBudgets        = 8;
     static constexpr int         kExitInvariantViolation  = 70;
 
@@ -135,6 +136,9 @@ public:
         std::size_t oversizeAt  = SIZE_MAX;   ///< N3: byte cursor of a waiting oversized batch
         uint64_t    oversizeNext = 0;         ///< step at which its extent is re-requested
         uint64_t    oversizeGap  = 1;         ///< doubling pass backoff (<= 64)
+        std::size_t waitAt   = SIZE_MAX;      ///< m2: byte cursor of a non-resident window
+        uint64_t    waitNext = 0;             ///< step at which it is re-requested
+        uint64_t    waitGap  = 1;             ///< doubling pass backoff (<= 64)
     };
     struct Ready {
         int32_t  epoch   = 0;
@@ -384,9 +388,16 @@ private:
         if (profile_) profile_->probeNs += clock_() - tp;
         if (res < want) {
             // RR1-1: the cursor window is not wholly resident — re-request it
-            // (and the read-ahead in front of it) on EVERY such pass; a dropped
-            // hint or evicted pages can never stall the build.
-            (void)requestReadAhead_(s, m, s.bytePos, aheadTo);
+            // (and the read-ahead in front of it) until it is: a dropped hint or
+            // evicted pages can never stall the build.  m2: while the cursor
+            // waits at the same place, re-requests double their pass gap
+            // (1, 2, 4 … 64 passes) — an async hint is anyway gated to one in
+            // flight; a synchronous one is never a madvise per pass.
+            if (s.waitAt != s.bytePos) { s.waitAt = s.bytePos; s.waitGap = 1; s.waitNext = 0; }
+            if (scanSteps_ >= s.waitNext && requestReadAhead_(s, m, s.bytePos, aheadTo)) {
+                s.waitNext = scanSteps_ + s.waitGap;
+                s.waitGap  = std::min<uint64_t>(s.waitGap * 2, 64);
+            }
         } else if (aheadTo > s.readAheadTo) {
             // Resident window: keep the read-ahead front kReadAheadBudgets ahead.
             (void)requestReadAhead_(s, m, std::max(s.readAheadTo, s.bytePos + want), aheadTo);

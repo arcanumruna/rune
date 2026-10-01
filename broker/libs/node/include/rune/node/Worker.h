@@ -97,6 +97,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cerrno>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -436,6 +437,7 @@ public:
     void setRcSyncHintForTest(RcSyncHint fn, void* ctx) noexcept { rcSyncHintFn_ = fn; rcSyncHintCtx_ = ctx; }
     [[nodiscard]] std::size_t rcHintsInFlightForTest() const noexcept { return rcHintsInFlight_; }
     [[nodiscard]] bool ioAsyncHintsForTest() const noexcept { return io_.asyncHints(); }
+    [[nodiscard]] bool rcAsyncHintsDisabledForTest() const noexcept { return rcAsyncHintsDisabled_; }
     /// Test seam: an async read-ahead hint of (topicId, partition) completed.
     void completeRcHintForTest(int32_t topicId, int32_t partition) {
         if (RcState* rc = const_cast<RcState*>(rcFor_(topicId, partition))) rc->onHintCompleted();
@@ -3558,13 +3560,22 @@ private:
         std::unique_ptr<RcHintCtx>           hint;
     };
     // The default read-ahead issuer: an async IORING_OP_FADVISE(WILLNEED) on the
-    // segment fd where the worker's io backend is io_uring (token routed as
-    // RouteKind::Hint: <= 1 in flight per partition, SQ full → skipped this
-    // pass), else a synchronous MADV_WILLNEED (counted).
+    // segment fd where the worker's io backend is io_uring AND the kernel
+    // supports the opcode (probed at backend start, RR2-1) AND async hints
+    // have not been latched off; token routed as RouteKind::Hint; <= 1 in
+    // flight per partition (RcState) and <= kMaxRcHintsInFlight per worker
+    // (m1: fsyncs keep their headroom in the shared io cap); SQ / cap full →
+    // skipped this pass.  Otherwise a synchronous MADV_WILLNEED (counted).
+    // m8: a hint does not pin its segment (fsyncs do): io-wq resolves the fd
+    // when it runs, so a hint on a closed-and-reused fd advises an unrelated
+    // file — benign for WILLNEED (a wasted read-ahead, never a correctness
+    // effect).
     static bool rcIssueHint_(void* c, const RcReadAheadReq& req) {
         auto* h = static_cast<RcHintCtx*>(c);
         Worker& w = *h->w;
-        if ((w.io_.asyncHints() || w.rcFakeAsyncHints_) && req.fd >= 0 && h->log != nullptr) [[likely]] {
+        if ((w.io_.asyncHints() || w.rcFakeAsyncHints_) && !w.rcAsyncHintsDisabled_ && req.fd >= 0 &&
+            h->log != nullptr) [[likely]] {
+            if (w.rcHintsInFlight_ >= kMaxRcHintsInFlight) { ++w.rcHintsSkipped_; return false; }   // m1
             const auto len = static_cast<uint32_t>(std::min<std::size_t>(req.len, UINT32_MAX));
             const CompletionToken t = w.rcFakeAsyncHints_ ? ++w.rcFakeHintSeq_
                                                           : w.io_.submitWillNeed(req.fd, req.fileOff, len);
@@ -3590,9 +3601,27 @@ private:
     }
     // A hint's CQE: clear its partition's in-flight flag (by log identity; a
     // purged partition is ignored).  Errors are counted, never fatal.
+    // m3: matching by Log* means a CQE from a previous incarnation's hint can
+    // clear a new incarnation's flag (a transient second hint in flight) —
+    // harmless and bounded by the per-worker cap.
+    // RR2-1: an "unsupported" completion (EINVAL / EOPNOTSUPP), or
+    // kMaxConsecutiveHintErrors errors in a row, latches this worker onto the
+    // synchronous hint — a hint that fails forever must never stall a build.
+    static constexpr uint32_t kMaxConsecutiveHintErrors = 4;
     void onRcHintCompleted_(const rune::storage::Log* log, int err) noexcept {
         if (rcHintsInFlight_ > 0) --rcHintsInFlight_;
-        if (err != 0) ++rcHintErrors_;
+        if (err != 0) {
+            ++rcHintErrors_;
+            ++rcConsecutiveHintErrors_;
+            if (!rcAsyncHintsDisabled_ &&
+                (err == EINVAL || err == EOPNOTSUPP || rcConsecutiveHintErrors_ >= kMaxConsecutiveHintErrors)) {
+                rcAsyncHintsDisabled_ = true;
+                spdlog::warn("Worker {}: async read-ahead hints failing (errno {}, {} in a row) — using "
+                             "synchronous hints from now on", workerId_, err, rcConsecutiveHintErrors_);
+            }
+        } else {
+            rcConsecutiveHintErrors_ = 0;
+        }
         for (auto& sl : rcSlots_)
             if (sl.hint && sl.hint->log == log) { sl.rc->onHintCompleted(); return; }
     }
@@ -3647,6 +3676,8 @@ private:
     RcSyncHint       rcSyncHintFn_     = nullptr;
     void*            rcSyncHintCtx_    = nullptr;
     std::size_t      rcHintsInFlight_  = 0;   // async hints submitted, CQE not reaped yet
+    bool             rcAsyncHintsDisabled_ = false;   // RR2-1 latch
+    uint32_t         rcConsecutiveHintErrors_ = 0;
     RcReadAhead      rcReadAheadOverride_    = nullptr;
     void*            rcReadAheadOverrideCtx_ = nullptr;
     RcResidencyProbe rcProbeFn_  = nullptr;
