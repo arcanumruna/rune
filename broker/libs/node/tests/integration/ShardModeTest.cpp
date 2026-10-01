@@ -583,3 +583,25 @@ TEST(ShardModeRegression, StartRefusesWhenTheSchemaLogFailedRecovery) {
     EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure);
     node.stop();
 }
+
+TEST(ShardMode, MetadataAdvertisesTheLeaderWorkerEndpoint) {
+    TmpDir dir{"md"}, cdir{"mdc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, false)};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ShardTestClient c(cdir.path);
+    const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0);
+    std::string ep;
+    // Condition wait: metadata is served once the committed routing image lands.
+    ASSERT_TRUE(eventually([&] {
+        for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid))
+            if (pi.topicId == 0 && pi.partition == 0) ep = pi.ingressEndpoint;
+        return !ep.empty();
+    }, 400)) << "no ingressEndpoint advertised for topic 0 partition 0";
+    EXPECT_EQ(ep, "127.0.0.1:" + std::to_string(ports.ib[0]));
+    ASSERT_TRUE(c.produceUntilOk("aeron:udp?endpoint=" + ep, kIngressStream, sid, 0, 0, 1, makeBatch(1)))
+        << "the advertised endpoint is the live worker ingress";
+    node.stop();
+}

@@ -106,6 +106,13 @@ struct LeaderView {
     std::string leaderClientEndpoint;           // leader's client-facing channel; empty if unknown
 };
 
+/// Shard mode (spec §3.3): a node's explicitly configured per-worker ingress base.
+struct ShardIngressEndpoint {
+    int32_t     nodeId   = -1;
+    std::string host;
+    int32_t     basePort = 0;
+};
+
 // ---------------------------------------------------------------------------
 // ClientGateway
 // ---------------------------------------------------------------------------
@@ -375,6 +382,15 @@ public:
 
     [[nodiscard]] bool perWorkerIngressActive() const noexcept {
         return perWorkerIngressActive_;
+    }
+
+    // Self-contained worker shards (spec §3.3): every node's explicitly configured
+    // per-worker ingress base (RUNE_PEERS, never derived).  handleMetadata advertises
+    // ingressEndpoint = "<leader.host>:<leader.basePort + ownerWorker>" per partition;
+    // a leader with no entry (or basePort 0) gets an empty endpoint.  Empty vector
+    // (legacy default) → no endpoint, no trailer.  Set before doWork() runs.
+    void setShardIngressEndpoints(std::vector<ShardIngressEndpoint> eps) noexcept {
+        shardIngressEndpoints_ = std::move(eps);
     }
 
     // read-rework T3/T4 (I3b): setPerWorkerEgressActive — when active, the gateway
@@ -1128,6 +1144,7 @@ private:
     // Set via setPerWorkerIngressActive() from BrokerNode::buildWorkerPool()
     // when RUNE_PER_WORKER_INGRESS=true.
     bool perWorkerIngressActive_ = false;
+    std::vector<ShardIngressEndpoint> shardIngressEndpoints_;  // spec §3.3; empty = legacy
 
     // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions
     // are routed to the owning worker (which pushes on its own egress) and the

@@ -1046,6 +1046,16 @@ void BrokerNode::buildWorkerPool() {
         // record egress and plane are attached in attachShardRuntimes_() on its
         // OWN client, after the long startup phases (fix round 1 I2).
         for (int32_t i = 0; i < wc; ++i) workerPool_->worker(i).setShardMode(true);
+        // Spec §3.3: Metadata advertises each partition's LEADER-worker ingress
+        // endpoint, from explicit RUNE_PEERS configuration (never derived).  Set
+        // here, before the control thread runs (single-writer, no sharing).
+        if (gateway_) {
+            std::vector<rune::gateway::ShardIngressEndpoint> eps;
+            eps.reserve(config_.peers.size());
+            for (const auto& peer : config_.peers)
+                eps.push_back({peer.id, peer.host, static_cast<int32_t>(peer.ingressBasePort)});
+            gateway_->setShardIngressEndpoints(std::move(eps));
+        }
     } else {
         if (config_.perWorkerIngressEnabled && aeron_) {
             const std::string& channel  = config_.clientEndpoint.channel;

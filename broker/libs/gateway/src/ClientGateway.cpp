@@ -36,6 +36,7 @@
 #include <cstring>
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <thread>
 
@@ -4393,6 +4394,9 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     // to only those topics.
     // -----------------------------------------------------------------------
     using rune::metadata::kMaxGpidPartitions;
+    // Stable storage for the per-partition ingressEndpoint views (deque: element
+    // addresses never move).  Control path (Metadata), not the per-record path.
+    std::deque<std::string> endpointStore;
     std::vector<pc::PartitionEntry> parts;
 
     if (routingImage_) {
@@ -4469,6 +4473,20 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
                 const int32_t wid = workerPool_->ownerWorkerId(topicId, partition);
                 p.egressControlPort = workerEgressControlBasePort_ + wid;
                 p.egressStreamId    = workerEgressBaseStreamId_ + wid;
+            }
+            // Shard mode (spec §3.3): advertise the LEADER's owning-worker ingress
+            // endpoint from explicit configuration (worker index is symmetric across
+            // nodes); no entry / unadvertised base → empty → node endpoint.
+            if (!shardIngressEndpoints_.empty() && workerPool_) {
+                for (const auto& ep : shardIngressEndpoints_) {
+                    if (ep.nodeId != entry.leaderNodeId) continue;
+                    if (ep.basePort > 0 && !ep.host.empty()) {
+                        endpointStore.push_back(ep.host + ":" +
+                            std::to_string(ep.basePort + workerPool_->ownerWorkerId(topicId, partition)));
+                        p.ingressEndpoint = endpointStore.back();
+                    }
+                    break;
+                }
             }
             parts.push_back(p);
         }

@@ -15,6 +15,7 @@
 #include <rune/metadata/Gpid.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -22,6 +23,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace rune::gateway {
@@ -70,6 +72,13 @@ findEntry(const pc::MetadataResponse::Decoded& resp, int32_t topicId, int32_t pa
         if (p.topicId == topicId && p.partition == partition) return p;
     }
     return std::nullopt;
+}
+
+// Size of a trailer-less (legacy layout) MetadataResponse.
+static std::size_t rpcLegacySize(const std::vector<pc::BrokerEntry>& brokers, std::size_t parts) {
+    std::size_t sz = pc::MessageHeader::ENCODED_SIZE + 2u;
+    for (const auto& b : brokers) sz += 4u + 4u + 2u + b.host.size();
+    return sz + 2u + parts * 28u;
 }
 
 // Egress callback that always succeeds (needed by makeForTest).
@@ -307,6 +316,79 @@ TEST(MetadataResponseIngressStreamIdRegression, InactiveAdvertisesClientStream)
                "client can route per-partition to the true leader (NOT the disabling "
                "sentinel 0); topic=" << p.topicId << " part=" << p.partition;
     }
+}
+
+// ===========================================================================
+// Self-contained worker shards: per-partition ingressEndpoint (spec §3.3).
+// ===========================================================================
+TEST(MetadataResponseIngressEndpoint, ShardModeAdvertisesLeaderWorkerEndpoint)
+{
+    constexpr int32_t kWorkers = 2;
+    const std::vector<std::pair<int32_t,int32_t>> kParts = {{10, 0}, {10, 1}, {10, 2}, {20, 0}};
+    md::ShardRouter router(kWorkers);
+    auto pool = std::make_unique<rune::node::WorkerPool>(kWorkers, router, 4096, 4096, 16, 16);
+    ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, 1);
+    gw.setRoutingImageSnapshot(makeImage(kParts, /*leader=*/1));
+    gw.setCommittedMetadataReady(true);
+    gw.setWorkerPool(pool.get());
+    gw.setPerWorkerIngressActive(true);
+    gw.setShardIngressEndpoints({{0, "10.0.0.1", 40500}, {1, "10.0.0.2", 40520}});
+    std::optional<pc::MetadataResponse::Decoded> captured;
+    std::vector<uint8_t> frameCopy;
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) {
+        frameCopy.assign(buf, buf + len);
+        captured = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
+    });
+    const int64_t sid = gw.injectTestSession();
+    const auto frame = makeMetadataRequestFrame(sid);
+    gw.applyMetadataForTest(frame.data(), frame.size());
+    ASSERT_TRUE(captured.has_value());
+    for (const auto& [tid, pid] : kParts) {
+        auto e = findEntry(*captured, tid, pid);
+        ASSERT_TRUE(e.has_value());
+        EXPECT_EQ(std::string(e->ingressEndpoint),
+                  "10.0.0.2:" + std::to_string(40520 + router.workerForPartition(tid, pid)))
+            << "topic=" << tid << " part=" << pid;
+    }
+}
+
+TEST(MetadataResponseIngressEndpoint, LegacyModeAdvertisesNoEndpoint)
+{
+    md::ShardRouter router(1);
+    auto pool = std::make_unique<rune::node::WorkerPool>(1, router, 4096, 4096, 16, 16);
+    ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, 1);
+    gw.setRoutingImageSnapshot(makeImage({{10, 0}}));
+    gw.setCommittedMetadataReady(true);
+    gw.setWorkerPool(pool.get());
+    std::vector<uint8_t> frameCopy;
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) { frameCopy.assign(buf, buf + len); });
+    const int64_t sid = gw.injectTestSession();
+    const auto frame = makeMetadataRequestFrame(sid);
+    gw.applyMetadataForTest(frame.data(), frame.size());
+    auto dec = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
+    ASSERT_TRUE(dec.has_value());
+    EXPECT_TRUE(findEntry(*dec, 10, 0)->ingressEndpoint.empty());
+    EXPECT_EQ(frameCopy.size(), rpcLegacySize(dec->brokers, dec->partitions.size()))
+        << "default config frames are byte-identical (no trailer)";
+}
+
+TEST(MetadataResponseIngressEndpointRegression, LeaderWithoutAdvertisedBaseGetsEmptyEndpoint)
+{
+    md::ShardRouter router(1);
+    auto pool = std::make_unique<rune::node::WorkerPool>(1, router, 4096, 4096, 16, 16);
+    ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, 1);
+    gw.setRoutingImageSnapshot(makeImage({{10, 0}}, /*leader=*/2));
+    gw.setCommittedMetadataReady(true);
+    gw.setWorkerPool(pool.get());
+    gw.setShardIngressEndpoints({{0, "10.0.0.1", 40500}});
+    std::vector<uint8_t> frameCopy;
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) { frameCopy.assign(buf, buf + len); });
+    const int64_t sid = gw.injectTestSession();
+    const auto frame = makeMetadataRequestFrame(sid);
+    gw.applyMetadataForTest(frame.data(), frame.size());
+    auto dec = pc::MetadataResponse::decode(frameCopy.data(), frameCopy.size());
+    ASSERT_TRUE(dec.has_value());
+    EXPECT_TRUE(findEntry(*dec, 10, 0)->ingressEndpoint.empty()) << "client falls back to the node endpoint";
 }
 
 } // namespace
