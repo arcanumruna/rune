@@ -23,6 +23,8 @@
 #include <climits>
 #include <cstdint>
 #include <filesystem>
+#include <map>
+#include <random>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -264,4 +266,63 @@ TEST(TxnCoordinatorFailoverRegression, EndTxnRetryAfterCompleteSameDirectionIsOk
     const auto retry = coord.endTransaction("t-idem", ip.producerId, ip.producerEpoch, /*commit=*/true, 0);
     EXPECT_EQ(retry.errorCode, EndTransactionResult::kOk)
         << "a same-direction EndTxn retry after completion is idempotent OK (got " << retry.errorCode << ")";
+}
+
+// ===========================================================================
+// F15 S1 (N4, §2.2): the compact tracker (flat pid table + first-offset FIFO)
+// must match a reference model under churn: growth, in-place compaction behind
+// a long-open front, out-of-order registration, re-open after close, clear().
+// ===========================================================================
+
+TEST(LsoTrackerRegression, CompactTrackerMatchesReferenceModelUnderChurn) {
+    LsoTracker tracker(/*openTxnCapacity=*/4);       // tiny: forces compaction + growth
+    std::map<ProducerId, int64_t> model;             // pid -> firstOffset
+    std::mt19937_64 rng(12345);
+    int64_t offset = 0;
+    auto modelLso = [&](int64_t hw) {
+        int64_t m = hw;
+        for (const auto& [p, f] : model) m = std::min(m, f);
+        return std::max<int64_t>(0, std::min(m, hw));
+    };
+    // A long-open transaction at the front pins the FIFO head while many others churn.
+    tracker.onProduceBatch(1'000'000, offset); model[1'000'000] = offset; ++offset;
+    for (int step = 0; step < 20'000; ++step) {
+        const auto op = rng() % 10;
+        const ProducerId pid = static_cast<ProducerId>(rng() % 64);
+        if (op < 5) {
+            // In-order (L1) registration; ~1/16 of them out of order.
+            const bool ooo = (rng() % 16) == 0 && offset > 10;
+            const int64_t at = ooo ? offset - 1 - static_cast<int64_t>(rng() % 10) : offset++;
+            tracker.onProduceBatch(pid, at);
+            if (!model.count(pid)) model[pid] = at;
+        } else if (op < 9) {
+            const int64_t got = tracker.onControlMarker(pid, offset++, (rng() & 1) != 0);
+            const auto it = model.find(pid);
+            ASSERT_EQ(got, it == model.end() ? -1 : it->second) << "step " << step;
+            if (it != model.end()) model.erase(it);
+        } else if (step % 997 == 0) {
+            tracker.clear();
+            model.clear();
+        }
+        ASSERT_EQ(tracker.openCount(), model.size()) << "step " << step;
+        ASSERT_EQ(tracker.lso(offset), modelLso(offset)) << "step " << step;
+        ASSERT_EQ(tracker.firstOffsetOf(pid), model.count(pid) ? model[pid] : -1) << "step " << step;
+    }
+    EXPECT_GT(tracker.growths(), 0u) << "the churn exercised the cold doubling";
+    EXPECT_GT(tracker.outOfOrderInserts(), 0u) << "the churn exercised out-of-order placement";
+}
+
+TEST(LsoTrackerRegression, LongOpenFrontCompactsInPlaceWithoutGrowth) {
+    // One open txn pins the front; thousands of short txns open and close behind
+    // it.  Steady state must stay within the reserved capacity (no doubling).
+    LsoTracker tracker(/*openTxnCapacity=*/64);
+    tracker.onProduceBatch(1, 0);
+    for (int64_t i = 1; i < 10'000; ++i) {
+        tracker.onProduceBatch(2, i);
+        ASSERT_EQ(tracker.onControlMarker(2, i + 1, true), i);
+    }
+    EXPECT_EQ(tracker.lso(20'000), 0);
+    EXPECT_EQ(tracker.openCount(), 1u);
+    EXPECT_EQ(tracker.growths(), 0u) << "dead entries behind the front must be compacted, not grown";
+    EXPECT_EQ(tracker.capacity(), 64u);
 }
