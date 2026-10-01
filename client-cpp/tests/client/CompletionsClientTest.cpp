@@ -318,6 +318,7 @@ TEST(CompletionsClient, ConnectCompletesOnceViaCqAndHandlerRegression) {
     EXPECT_EQ(log.last.status, rc::OpStatus::Ok) << "already Connected: completes Ok at once";
     EXPECT_EQ(log.last.value, 42);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1) << "the first connect completed again";
 }
 
 // The Pong's echo is the completion's inline payload — binary bytes, the empty
