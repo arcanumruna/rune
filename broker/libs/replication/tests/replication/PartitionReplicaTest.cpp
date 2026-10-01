@@ -3657,6 +3657,126 @@ TEST(PartitionReplicaTest, OnFetchRequest_WholeBatchAlignment) {
     std::filesystem::remove_all(logDir);
 }
 
+// ---------------------------------------------------------------------------
+// F3 fix-round-1, item 3 (MINOR -> fix): a FETCH where fetchOffset < LEO but
+// the zero-copy readView() comes back empty (a transient local read-map
+// failure, NOT genuine end-of-log) must NOT send a Data response with zero
+// records.  The follower's FollowerSync treats an empty-but-kErrNone Data
+// response as "caught up" and would stop re-fetching, even though there is
+// genuinely more committed data past fetchOffset.  The leader must skip
+// responding this cycle; the follower's own un-acked fetch naturally resends.
+//
+// Reproduced with a REAL disk-backed Log (no mock/fake Log — onLog() dispatches
+// to a concrete rune::storage::Log, there is no injectable seam): a sealed,
+// not-yet-mapped segment's .log is replaced with a symlink to /dev/null (same
+// technique as MappedFileRegression.FailedMmapAfterOpenLeaksNoFd / F3 round 0)
+// so its lazy ensureReadMap() fails every time — open() succeeds (resolves to
+// /dev/null) but mmap() fails with ENODEV — producing a REAL, organically
+// empty LogReadView below LEO, exactly the condition under review.
+//
+// A segment only maps LAZILY after a RECOVER (reopen) — a segment created via
+// a live roll's synchronous fallback is always eagerly mapped (it genuinely
+// IS the new active segment at creation time; see F3 round 0).  So the data
+// is seeded with a throwaway Log, which is then closed and reopened +
+// recover()'d before the PartitionReplica under test is built on top of it —
+// exactly how a real broker restart leaves sealed segments lazily-unmapped.
+// ---------------------------------------------------------------------------
+TEST(PartitionReplicaRegression, FetchMapFailureDoesNotReportCaughtUp) {
+    auto logDir = std::filesystem::temp_directory_path() /
+                  ("rune_f3r1_fetchmapfail_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(logDir);
+    std::filesystem::create_directories(logDir);
+
+    // Seed >= 3 segments, then close (destructor) so the next Log reopens
+    // them all from scratch via recover() — the lazy-mapping path.
+    {
+        rune::storage::Log seedLog(logDir.string(), /*rollBytes=*/256);
+        int64_t off = 0;
+        for (int i = 0; i < 15; ++i) {
+            rune::protocol::RecordBatchBuilder b(off, 8000 + i);
+            b.append("k", "v" + std::to_string(i), 8000 + i);
+            off = seedLog.append(b.build(), off);
+        }
+        ASSERT_GE(seedLog.segmentBaseOffsets().size(), 3u)
+            << "test setup: need >= 3 segments for a real sealed-but-unmapped one";
+    }
+
+    struct CaptureTransport : public PartitionTransport {
+        int calls = 0;
+        FetchResponseMsg last{};
+        void sendFetchRequest(const FetchRequestMsg&) override {}
+        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+            ++calls;
+            last = r;
+        }
+    };
+
+    rune::storage::Log log(logDir.string(), /*rollBytes=*/256);
+    log.recover();
+    CaptureTransport transport;
+
+    PartitionConfig cfg;
+    cfg.partitionId         = 0;
+    cfg.selfId              = 1;
+    cfg.minIsr              = 1;
+    cfg.replicaLagMaxMs     = 5000;
+    cfg.replicaLagMaxOffset = 100000;
+    cfg.fetchIntervalNs     = 5'000'000LL;
+    cfg.isrCheckIntervalNs  = 10'000'000LL;
+    cfg.maxFetchBytes       = 1 << 20;
+    cfg.pushOnAppend        = false;   // force the FETCH-serve path (see OnFetchRequest_WholeBatchAlignment)
+
+    PartitionReplica leader(cfg, Role::Leader, 1,
+                            {1, 2}, {1, 2}, &log, &transport);
+
+    auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 3u);
+    int64_t sealedBase = bases[1];   // a sealed segment, not the first and not active
+    rune::storage::LogSegment* sealedSeg = log.segmentForTest(sealedBase);
+    ASSERT_NE(sealedSeg, nullptr);
+    ASSERT_FALSE(sealedSeg->hasReadMapForTest()) << "sealed segment must still be lazily-unmapped (F3)";
+
+    // Break this segment's lazy map: open() succeeds (resolves to /dev/null),
+    // mmap() fails with ENODEV, every retry — readView() returns {} forever.
+    std::string sealedLogPath = sealedSeg->logPath();
+    std::filesystem::remove(sealedLogPath);
+    std::filesystem::create_symlink("/dev/null", sealedLogPath);
+
+    // Fetch at sealedBase: fetchOffset < LEO (more segments were appended after
+    // it), so the ONLY correct interpretation of an empty readView() here is
+    // "transient failure, retry" — never "caught up".
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1;
+    req.partition   = 0;
+    req.followerId  = 2;
+    req.fetchOffset = sealedBase;
+    req.maxBytes    = 1 << 20;
+
+    int16_t rc = leader.onFetchRequest(req, /*nowNs=*/1);
+    EXPECT_EQ(rc, 0) << "onFetchRequest itself must still report success (kErrNone) — "
+                         "the fix is to skip the SEND, not to error out";
+    EXPECT_EQ(transport.calls, 0)
+        << "a map-failure empty view below LEO must NOT be sent as a Data response "
+           "(the follower would wrongly treat empty+kErrNone as caught-up)";
+    EXPECT_EQ(sealedSeg->readMapFailures(), 1u);
+
+    // The leader must not be globally wedged by one broken sealed segment: a
+    // fetch against an UNAFFECTED segment (the active one — never touched)
+    // must still be served normally.
+    FetchRequestMsg reqActive{};
+    reqActive.leaderEpoch = 1;
+    reqActive.partition   = 0;
+    reqActive.followerId  = 2;
+    reqActive.fetchOffset = bases.back();
+    reqActive.maxBytes    = 1 << 20;
+    int16_t rc2 = leader.onFetchRequest(reqActive, /*nowNs=*/2);
+    EXPECT_EQ(rc2, 0);
+    EXPECT_EQ(transport.calls, 1)
+        << "a fetch against an UNAFFECTED (active) segment must still be served normally";
+
+    std::filesystem::remove_all(logDir);
+}
+
 // ===========================================================================
 // GR-10: Push-on-append + fast-ack tests
 //

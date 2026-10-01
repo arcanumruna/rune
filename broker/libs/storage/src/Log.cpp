@@ -277,9 +277,21 @@ void Log::installNextSegment(int64_t base) {
         // progress will publish a segment that the NEXT roll consumes; we do NOT
         // touch preprovInFlight_ here.  This IS a brand-new ACTIVE segment (F3):
         // eagerReadMap=true, matching prepareStaging's own openReadMap() call.
-        segments_[base] = std::make_unique<LogSegment>(
+        //
+        // F3 fix-round-1: construct into a LOCAL first, and only install into
+        // segments_ once construction has fully succeeded.  LogSegment's ctor
+        // can now throw (e.g. open() failing — see item 2), and segments_[base]
+        // = make_unique<...>(...) would otherwise risk std::map::operator[]
+        // inserting a null entry for `base` before the throwing RHS is fully
+        // evaluated.  With this ordering, a failed roll leaves segments_
+        // completely untouched — the OLD (just-sealed) segment stays the
+        // active segment (still a valid, if over-size, entry), the exception
+        // propagates to the append() caller, and the next append() retries
+        // the roll.  Log is NEVER left without an active segment.
+        auto seg = std::make_unique<LogSegment>(
             dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_,
             /*prefaultIndex*/false, /*eagerReadMap*/true);
+        segments_[base] = std::move(seg);
     }
 }
 
@@ -580,10 +592,16 @@ void Log::truncateTo(int64_t truncateOffset) {
     if (segments_.empty()) {
         // Re-create a fresh segment at truncateOffset (or 0 if negative).  This
         // is the ONLY (hence active) segment — F3: eagerReadMap=true.
+        // F3 fix-round-1: construct into a LOCAL first (see installNextSegment's
+        // comment) — segments_ is already empty here (the loop above erased
+        // everything), so this is the only chance to get an active segment at
+        // all; a throw must leave segments_ cleanly empty (clean exception,
+        // retryable) rather than risk a null entry via operator[].
         int64_t base = std::max<int64_t>(0, truncateOffset);
-        segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
-                                                        indexMaxBytes_, /*prefaultIndex*/false,
-                                                        /*eagerReadMap*/true);
+        auto seg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
+                                                 indexMaxBytes_, /*prefaultIndex*/false,
+                                                 /*eagerReadMap*/true);
+        segments_[base] = std::move(seg);
         logEndOffset_ = base;
         return;
     }
@@ -658,11 +676,15 @@ void Log::truncateTo(int64_t truncateOffset) {
     // Rebuild the active segment from disk.  It IS the active segment (the code
     // above only reaches here when truncateOffset falls inside it) — F3:
     // eagerReadMap=true.
+    // F3 fix-round-1: construct into a LOCAL first — segments_.erase(base) just
+    // ran, so segments_ is momentarily empty of an active entry; a throwing
+    // ctor must leave it cleanly empty (clean exception), never a null entry.
     int64_t base = seg.baseOffset();
     segments_.erase(base);
-    segments_[base] = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
-                                                    indexMaxBytes_, /*prefaultIndex*/false,
-                                                    /*eagerReadMap*/true);
+    auto newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
+                                                indexMaxBytes_, /*prefaultIndex*/false,
+                                                /*eagerReadMap*/true);
+    segments_[base] = std::move(newSeg);
     // Re-run recover to rebuild the index and set nextOffset correctly.
     // Use the segment's actual nextOffset_ (derived from the physically truncated
     // file) rather than hard-coding truncateOffset, so that LEO and the segment's
@@ -682,10 +704,16 @@ void Log::reloadSegments() {
     std::sort(bases.begin(), bases.end());
     if (bases.empty()) bases.push_back(0);
     // F3: same eager-only-for-the-active-segment rule as the constructor.
-    for (int64_t b : bases)
-        segments_[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
-                                                     indexMaxBytes_, /*prefaultIndex*/false,
-                                                     /*eagerReadMap*/ b == bases.back());
+    // F3 fix-round-1: construct into a LOCAL first — if the LAST (active,
+    // eagerReadMap=true) segment's ctor throws, this guarantees segments_
+    // simply lacks that entry (clean exception) rather than risking a null
+    // entry at the highest base, which activeSegment() would dereference.
+    for (int64_t b : bases) {
+        auto seg = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
+                                                 indexMaxBytes_, /*prefaultIndex*/false,
+                                                 /*eagerReadMap*/ b == bases.back());
+        segments_[b] = std::move(seg);
+    }
     // Run recover() to rebuild indices and set nextOffset_ for each segment.
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();

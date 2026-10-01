@@ -700,6 +700,21 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
         const rune::storage::LogReadView v =
             onLog([&](auto& L) { return L.readView(req.fetchOffset, req.maxBytes); });
+        // F3 fix-round-1, item 3: fetchOffset < LEO means there IS more
+        // committed data past this point, so an empty view here can only mean
+        // a transient local read-map failure (readView()/ensureReadMap() are
+        // noexcept and return/leave empty on failure — see
+        // LogSegment::readMapFailures()) — it can NEVER mean "caught up".
+        // Sending a Data response with zero records would still be kErrNone,
+        // and the follower's FollowerSync treats an empty-but-kErrNone Data
+        // response as caught-up, stopping its re-fetch even though more data
+        // exists.  Skip responding entirely this cycle: the follower's own
+        // un-acked fetch naturally resends, and the lazy map typically
+        // succeeds on a later attempt.  ISR liveness/HW bookkeeping above is
+        // unaffected — only this response is skipped.
+        if (v.empty()) {
+            return kErrNone;
+        }
         // GR-1: whole batches only and never above req.maxBytes (the transport's
         // frame ceiling); a first batch larger than the cap is not sent (as before).
         const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,

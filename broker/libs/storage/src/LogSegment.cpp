@@ -56,6 +56,17 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     if (!seg->log_.is_open()) { std::ofstream(seg->logPath_, std::ios::binary).close();
         seg->log_.open(seg->logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app); }
     seg->fd_ = ::open(seg->logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT, 0644);
+    // F3 fix-round-1, item 2: an unchecked open() failure used to leave fd_ at
+    // -1 and silently continue — sync() would then silently skip the
+    // fdatasync forever (fd_ < 0 is a no-op in sync()), a silent durability
+    // loss.  Surface it exactly like the other construction failures below
+    // (OffsetIndex, MappedFile) already do: throw.  The caller
+    // (Log::preprovisionPending) already wraps this call in try/catch(...)
+    // and retries next cycle — unchanged by this fix.
+    if (seg->fd_ < 0) {
+        throw std::system_error(errno, std::system_category(),
+            "LogSegment::prepareStaging: open failed for " + seg->logPath_);
+    }
     // Right-sized index, PREFAULTED so the append/roll hot path never faults it.
     seg->index_ = std::make_unique<OffsetIndex>(idxPath, /*base*/0, indexMaxBytes,
                                                 /*prefault*/true);
@@ -96,6 +107,19 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // mixed-mode slowdown on macOS.  Writes still go through fstream for
     // simplicity; fd_ is used for fdatasync and pread only.
     fd_ = ::open(logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT, 0644);
+    // F3 fix-round-1, item 2: see prepareStaging()'s identical check above —
+    // an unchecked open() failure used to leave fd_ at -1 and silently
+    // continue, so sync() would silently skip the fdatasync forever (a
+    // silent durability loss).  Throw instead, exactly like OffsetIndex's and
+    // MappedFile's construction failures already do.  Call sites that
+    // construct a LogSegment (Log's ctor/installNextSegment/truncateTo/
+    // reloadSegments) all construct into a LOCAL first and only install into
+    // segments_ on success, so a throw here never leaves Log without an
+    // active segment — see those call sites' comments.
+    if (fd_ < 0) {
+        throw std::system_error(errno, std::system_category(),
+            "LogSegment: open failed for " + logPath_);
+    }
     // Right-sized .index mmap (was a fixed 8 MiB / ~64x over-provision).  A full
     // rollBytes segment at indexIntervalBytes interval needs only a few KiB of
     // real entries; OffsetIndex grows the mapping on demand if a segment ever

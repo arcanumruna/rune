@@ -1493,3 +1493,81 @@ TEST(LogSegmentRegression, ReadViewNoexceptOnMapFailure) {
     std::filesystem::remove_all(dir);
 }
 
+// F3 fix-round-1, item 2 (roll-safety check): now that LogSegment's ctor can
+// throw on an open() failure, a failed ROLL (the synchronous
+// installNextSegment() fallback) must NEVER leave Log without an active
+// segment.  Forced by pre-creating a DIRECTORY at the exact path the next
+// segment's .log would use (EISDIR on open(), independent of uid/perms) —
+// the OLD active segment must remain fully valid and usable, and a retry
+// after removing the obstruction must succeed.
+TEST(LogRegression, FailedRollKeepsOldActiveSegmentAndRetrySucceeds) {
+    auto dir = makeTempDir("rune_f3_failed_roll");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    Log log(dir.string(), /*rollBytes=*/256);
+    int64_t off = 0;
+    // Append a small batch, then one deliberately oversized batch — both
+    // succeed and land in the SAME (still single) segment, but push its
+    // sizeBytes() past rollBytes=256.  maybeRoll() decides to roll BEFORE
+    // writing the NEXT batch (Kafka-style — see Log::maybeRoll()'s own
+    // comment), so the roll attempt only fires on the append AFTER this one.
+    {
+        RecordBatchBuilder b(off, 8000); b.append("k", "v0", 8000);
+        off = log.append(b.build(), off);
+    }
+    {
+        RecordBatchBuilder big(off, 8001); big.append("k", std::string(300, 'x'), 8001);
+        off = log.append(big.build(), off);
+    }
+    ASSERT_EQ(log.segmentBaseOffsets().size(), 1u) << "test setup: must still be a single segment";
+    int64_t beforeEndOffset = log.logEndOffset();
+    auto basesBefore = log.segmentBaseOffsets();
+
+    // Block the NEXT roll's target path: maybeRoll() uses base == logEndOffset_
+    // for the new segment.  A pre-existing DIRECTORY at that exact .log path
+    // makes LogSegment's open() fail with EISDIR when the fallback tries to
+    // create it synchronously (no staging segment is ever pre-provisioned by
+    // a bare Log in a unit test, so installNextSegment() always takes the
+    // synchronous fallback branch).
+    std::ostringstream blockedPath;
+    blockedPath << dir.string() << "/" << std::setw(20) << std::setfill('0')
+                << beforeEndOffset << ".log";
+    std::filesystem::create_directory(blockedPath.str());
+
+    // This append sees the active segment already >= rollBytes (from the
+    // oversized batch above) and triggers maybeRoll() ->
+    // installNextSegment() -> the failing fallback construction, BEFORE this
+    // batch's own bytes are written.
+    RecordBatchBuilder triggerB(off, 9000); triggerB.append("k", "trigger", 9000);
+    auto triggerBatch = triggerB.build();
+    EXPECT_THROW(log.append(triggerBatch, off), std::system_error)
+        << "the failed roll must surface as a clean exception, not a crash";
+
+    // Log must still have exactly the OLD active segment — no null/partial
+    // entry, no segments_ left empty — and logEndOffset_ must be UNCHANGED
+    // (the write never happened: maybeRoll() throws before writeAndUpdateState).
+    auto basesAfter = log.segmentBaseOffsets();
+    ASSERT_EQ(basesAfter, basesBefore) << "a failed roll must not touch segments_ at all";
+    EXPECT_EQ(log.logEndOffset(), beforeEndOffset);
+
+    // The old active segment must still be fully usable: a read for data
+    // appended before the failed roll must still return correct data.
+    {
+        auto bytes = log.read(0, 1 << 20);
+        ASSERT_FALSE(bytes.empty());
+        RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), 0);
+    }
+
+    // Remove the obstruction and retry: the SAME append must now succeed, and
+    // the roll must actually complete (two segments now).
+    std::filesystem::remove_all(blockedPath.str());
+    int64_t next = log.append(triggerBatch, off);
+    EXPECT_EQ(next, off + 1);
+    EXPECT_GT(log.segmentBaseOffsets().size(), basesBefore.size())
+        << "the retried append must complete the roll (a new segment now exists)";
+
+    std::filesystem::remove_all(dir);
+}
+
