@@ -64,7 +64,9 @@ public:
 
     Completions(const Completions&)            = delete;
     Completions& operator=(const Completions&) = delete;
-    Completions(Completions&&) noexcept            = default;  // the ring stays put (heap)
+    /// Moving keeps the ring in place (heap).  A moved-from Completions has no
+    /// ring and must not be used again (review m10) — only destroyed/assigned.
+    Completions(Completions&&) noexcept            = default;
     Completions& operator=(Completions&&) noexcept = default;
 
     // ---- Issuing side (owner thread) --------------------------------------
@@ -90,10 +92,14 @@ public:
     /// Reserve `bytes` of credit for one op about to be issued.  Accepted: the
     /// op may be issued (and must complete exactly once, or be unreserve()d if
     /// it is then rejected).  QueueFull: poll() first.  Closed: the producer
-    /// side closed this queue.  InvalidArgument: larger than one maximal record.
+    /// side closed this queue.  InvalidArgument: not an 8-aligned record size
+    /// (use reservationFor()) or larger than one maximal record.
     [[nodiscard]] OpResult reserve(uint32_t bytes) noexcept {
         if (ring_->producerClosed()) return OpResult::Closed;
-        if (bytes < detail::CompletionRing::completionRecordBytes(0) || bytes > maxRecordBytes_) {
+        // A reservation is a ring record size: 8-aligned (review m2) — an
+        // unaligned one could under-reserve the aligned record by up to 7 bytes.
+        if (bytes < detail::CompletionRing::completionRecordBytes(0) || bytes > maxRecordBytes_ ||
+            (bytes & 7u) != 0) {
             return OpResult::InvalidArgument;
         }
         // The slack of one maximal record covers the at-most-one end-of-buffer

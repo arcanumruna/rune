@@ -1041,7 +1041,12 @@ RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
     entry->batchBytes  = std::move(batchBytes);
     uint8_t tok[kT2TokenSize];
     writeLE64(tok, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.get())));
-    if (!writeToRing(kMsgTier2Batch, tok, kT2TokenSize)) return RejectReason::BackPressured;  // caller fails the handle
+    if (!writeToRing(kMsgTier2Batch, tok, kT2TokenSize)) {
+        // F8c fix round 1 (review m1): a close that landed after the pre-check
+        // above is reported as Closed, not back-pressure (the claim failed on
+        // the ring's closed bit).  The caller fails the handle either way.
+        return ring_.closed() ? RejectReason::Closed : RejectReason::BackPressured;
+    }
     entry.release();  // ownership now travels through the ring
     return RejectReason::None;
 }

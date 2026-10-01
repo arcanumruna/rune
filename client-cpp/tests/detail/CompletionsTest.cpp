@@ -348,4 +348,5 @@ TEST(Completions, DeliverStaysWithinReservationRegression) {
     EXPECT_EQ(got[1].value, 300);
     EXPECT_EQ(lens[1], 0u);
     EXPECT_EQ(cq.reserve(cq.maxRecordBytes() + 8), OpResult::InvalidArgument);
+    EXPECT_EQ(cq.reserve(err + 3), OpResult::InvalidArgument) << "an unaligned reservation is refused";
 }

@@ -94,6 +94,57 @@ struct MetaGateway {
     std::unique_ptr<aeron::FragmentAssembler>    gwAsm;
     uint8_t replyBuf[4096]{};
 
+    // F8c fix round 1 (I-2): invoker mode — the gateway's Aeron client runs in
+    // invoker mode and is driven ONLY by pump(), on the test thread, which also
+    // drives the RunnerMode::Invoker Client's doWork() (and so its embedded
+    // driver).  Registrations resolve inside pump(); replies wait in `outbox`
+    // until the publication accepts them.  No sleeps, no other thread.
+    bool invoker = false;
+    int64_t subReg = -1;
+    int64_t pubReg = -1;
+    std::vector<std::vector<uint8_t>> outbox;
+
+    struct InvokerTag {};
+    MetaGateway(InvokerTag, const std::string& aeronDir, int32_t inStr, int32_t egStr,
+                std::string leaderEp)
+        : leaderEndpoint(std::move(leaderEp)), invoker(true)
+    {
+        aeron::Context ctx;
+        ctx.errorHandler(test_support::countAeronError);
+        ctx.aeronDir(aeronDir);
+        ctx.useConductorAgentInvoker(true);
+        gwAeron = aeron::Aeron::connect(ctx);
+        subReg = gwAeron->addSubscription("aeron:ipc", inStr);
+        pubReg = gwAeron->addExclusivePublication("aeron:ipc", egStr);
+        makeAssembler();
+    }
+
+    /// Invoker mode: one gateway duty cycle (conductor, registrations, outbox, poll).
+    int pump() {
+        int work = gwAeron->conductorAgentInvoker().invoke();
+        if (!gwSub) gwSub = gwAeron->findSubscription(subReg);
+        if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubReg);
+        while (!outbox.empty() && gwPub) {
+            const auto& f = outbox.front();
+            aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(f.data()),
+                                               static_cast<aeron::util::index_t>(f.size()));
+            if (gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) <= 0) break;
+            outbox.erase(outbox.begin());
+            ++work;
+        }
+        return work + poll(16);
+    }
+
+    void makeAssembler() {
+        gwAsm = std::make_unique<aeron::FragmentAssembler>(
+            [this](aeron::concurrent::AtomicBuffer& b,
+                   aeron::util::index_t off, aeron::util::index_t len,
+                   aeron::Header&) {
+                onFrame(reinterpret_cast<const uint8_t*>(b.buffer() + off),
+                        static_cast<std::size_t>(len));
+            });
+    }
+
     MetaGateway(const std::string& aeronDir, int32_t inStr, int32_t egStr,
                 std::string leaderEp)
         : leaderEndpoint(std::move(leaderEp))
@@ -130,6 +181,10 @@ struct MetaGateway {
     }
 
     bool gwSend(const uint8_t* b, std::size_t l) {
+        if (invoker) {  // offered by pump(), in order
+            outbox.emplace_back(b, b + l);
+            return true;
+        }
         const auto il = static_cast<aeron::util::index_t>(l);
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), il);
         for (int i = 0; i < 500; ++i) {
@@ -254,6 +309,48 @@ static Client* makeConnectedClient(std::unique_ptr<Client>& holder,
     return holder.get();
 }
 
+// F8c fix round 1 (I-2): MR1/MR2 run the Client in RunnerMode::Invoker.  The
+// test thread is the owner: every step is `client->doWork(); gw->pump();`, and
+// the duty-owned metadata cache is read through the test hooks only BETWEEN
+// those pumps — on the duty thread, race-free by construction, deterministic,
+// no sleeps.  (They used to read it from the test thread while a Thread-mode
+// runner wrote it: a TSan data race.)
+struct InvokerRig {
+    std::unique_ptr<Client>      client;  // constructed first: owns the driver
+    std::unique_ptr<MetaGateway> gw;      // destroyed first
+    template <class P>
+    bool drive(P&& pred, int cap = 400'000) {
+        for (int i = 0; i < cap; ++i) {
+            client->doWork();
+            gw->pump();
+            if (pred()) return true;
+        }
+        return false;
+    }
+    ~InvokerRig() { gw.reset(); client.reset(); }
+};
+
+static void makeInvokerConnectedClient(InvokerRig& rig, const std::string& agentDir,
+                                       int32_t inStr, int32_t egStr, const std::string& leaderEp) {
+    ClientConfig cfg;
+    cfg.gatewayChannel   = "aeron:ipc";
+    cfg.gatewayStreamId  = inStr;
+    cfg.egressChannel    = "aeron:ipc";
+    cfg.egressStreamId   = egStr;
+    cfg.dataDir          = agentDir;
+    cfg.connectTimeoutMs = 8000;
+    cfg.runnerMode       = RunnerMode::Invoker;
+    TopicSpec ts; ts.name = "t"; ts.topicId = 1; ts.partitionCount = 1;
+    cfg.topics.push_back(ts);
+    rig.client = std::make_unique<Client>(cfg);
+    rig.gw = std::make_unique<MetaGateway>(MetaGateway::InvokerTag{}, agentDir + "/aeron",
+                                           inStr, egStr, leaderEp);
+    auto connFut = rig.client->connect();
+    ASSERT_TRUE(rig.drive([&] { return connFut.wait_for(0s) == std::future_status::ready; }))
+        << "invoker client never connected";
+    connFut.get();
+}
+
 // ===========================================================================
 // MR1 (IMPORTANT-1): REAL redirect frame → zero-RTT cache update, no full
 // metadata round-trip needed for the reroute.
@@ -265,23 +362,17 @@ TEST(MetadataRouting, RealRedirectFrameUpdatesCacheZeroRtt) {
     // the cache flip, which happens on the redirect frame BEFORE any reconnect).
     const std::string leaderEp = "127.0.0.1:24591";
 
-    std::unique_ptr<Client> client;
-    std::unique_ptr<MetaGateway> gw;
-    makeConnectedClient(client, agentDir, kInStr, kEgStr, gw, leaderEp);
+    InvokerRig rig;
+    makeInvokerConnectedClient(rig, agentDir, kInStr, kEgStr, leaderEp);
+    if (HasFatalFailure()) return;
+    Client* client = rig.client.get();
+    MetaGateway* gw = rig.gw.get();
 
-    // Wait for the on-connect MetadataResponse to populate the cache: leader for
-    // (1,0) must become node 0 (epoch 1).
-    bool cachePopulated = false;
-    for (int i = 0; i < kPumpMax; ++i) {
-        gw->poll(16);
-        if (client->testLeaderFor(1, 0) == 0 && client->testEpochFor(1, 0) == 1) {
-            cachePopulated = true;
-            break;
-        }
-        std::this_thread::sleep_for(kPumpSleep);
-    }
-    ASSERT_TRUE(cachePopulated)
-        << "on-connect MetadataResponse must populate cache (leader node 0, epoch 1)";
+    // Drive until the on-connect MetadataResponse populates the cache: leader
+    // for (1,0) must become node 0 (epoch 1).
+    ASSERT_TRUE(rig.drive([&] {
+        return client->testLeaderFor(1, 0) == 0 && client->testEpochFor(1, 0) == 1;
+    })) << "on-connect MetadataResponse must populate cache (leader node 0, epoch 1)";
     ASSERT_EQ(gw->metadataReqSeen.load(), 1)
         << "exactly one MetadataRequest so far (the on-connect one)";
 
@@ -297,18 +388,13 @@ TEST(MetadataRouting, RealRedirectFrameUpdatesCacheZeroRtt) {
     const std::vector<uint8_t> val = {0x01};
     auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
 
-    // Pump until the redirect is processed and the cache flips to node 1.
-    bool flipped = false;
-    int  metaReqAtFlip = -1;
-    for (int i = 0; i < kPumpMax; ++i) {
-        gw->poll(16);
-        if (client->testLeaderFor(1, 0) == 1) {
-            flipped        = true;
-            metaReqAtFlip  = gw->metadataReqSeen.load();
-            break;
-        }
-        std::this_thread::sleep_for(kPumpSleep);
-    }
+    // Drive until the redirect is processed and the cache flips to node 1.
+    int metaReqAtFlip = -1;
+    const bool flipped = rig.drive([&] {
+        if (client->testLeaderFor(1, 0) != 1) return false;
+        metaReqAtFlip = gw->metadataReqSeen.load();
+        return true;
+    });
 
     ASSERT_TRUE(flipped)
         << "cache leader for (1,0) must flip to node 1 after the redirect frame";
@@ -336,18 +422,13 @@ TEST(MetadataRouting, KeyedProduceResolvesPartitionLeaderEndpoint) {
     const std::string agentDir = uniqueDir("md_mr2");
     const std::string leaderEp = "127.0.0.1:24601";
 
-    std::unique_ptr<Client> client;
-    std::unique_ptr<MetaGateway> gw;
-    makeConnectedClient(client, agentDir, kInStr, kEgStr, gw, leaderEp);
+    InvokerRig rig;
+    makeInvokerConnectedClient(rig, agentDir, kInStr, kEgStr, leaderEp);
+    if (HasFatalFailure()) return;
+    Client* client = rig.client.get();
 
-    // Wait for the cache to be populated by the on-connect MetadataResponse.
-    bool populated = false;
-    for (int i = 0; i < kPumpMax; ++i) {
-        gw->poll(16);
-        if (client->testLeaderFor(1, 0) == 0) { populated = true; break; }
-        std::this_thread::sleep_for(kPumpSleep);
-    }
-    ASSERT_TRUE(populated);
+    // Drive until the cache is populated by the on-connect MetadataResponse.
+    ASSERT_TRUE(rig.drive([&] { return client->testLeaderFor(1, 0) == 0; }));
 
     // The produce path uses PartitionRouter::routeKey(topic,key) to resolve the
     // target.  For key→partition 0 (single partition), the leader is node 0 whose
@@ -369,16 +450,7 @@ TEST(MetadataRouting, KeyedProduceResolvesPartitionLeaderEndpoint) {
     const std::vector<uint8_t> val = {0x02};
     auto fut = p.send(th, key0, std::span<const uint8_t>(val), want_future);
 
-    bool routedToLeader = false;
-    for (int i = 0; i < kPumpMax; ++i) {
-        gw->poll(16);
-        if (client->testRouteEndpoint(1, key0) == leaderEp) {
-            routedToLeader = true;
-            break;
-        }
-        std::this_thread::sleep_for(kPumpSleep);
-    }
-    EXPECT_TRUE(routedToLeader)
+    EXPECT_TRUE(rig.drive([&] { return client->testRouteEndpoint(1, key0) == leaderEp; }))
         << "after redirect, keyed produce must route to the new partition leader's endpoint";
 
     client->close();
@@ -445,4 +517,37 @@ TEST(MetadataRouting, BackgroundRefreshWithBackoffOnNoProgress) {
 
     client->close();
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
+}
+
+// ===========================================================================
+// F8c fix round 1 (I-2): the duty-owned test hooks enforce their precondition.
+// Reading them from the test thread while a Thread-mode runner is live (what
+// MR1/MR2 used to do — a TSan-only data race) aborts deterministically in debug
+// builds; after close() (runner joined) the same read is allowed.
+// ===========================================================================
+TEST(MetadataRoutingDeathTest, TestHookOffDutyThreadAbortsRegression) {
+#ifdef NDEBUG
+    GTEST_SKIP() << "the hook owner check is a debug-build assertion";
+#else
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    const std::string agentDir = uniqueDir("md_hook");
+    ClientConfig cfg;
+    cfg.gatewayChannel  = "aeron:ipc";
+    cfg.gatewayStreamId = 4530;
+    cfg.egressChannel   = "aeron:ipc";
+    cfg.egressStreamId  = 4531;
+    cfg.dataDir         = agentDir;
+    EXPECT_DEATH(
+        {
+            Client c(cfg);                    // Thread mode: the runner is live
+            (void)c.testLeaderFor(1, 0);      // off the duty thread
+        },
+        "off the duty thread");
+    {
+        Client c(cfg);
+        c.close();                            // runner joined
+        EXPECT_EQ(c.testLeaderFor(1, 0), c.testLeaderFor(1, 0)) << "allowed after close()";
+    }
+    try { std::filesystem::remove_all(agentDir); } catch (...) {}
+#endif
 }

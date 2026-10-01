@@ -319,8 +319,11 @@ public:
     /// Force-flush all pending batches: a flush token goes through this
     /// producer's ring; the duty thread flushes every record accepted before it
     /// on its next cycle.  Ring full: an app thread backs off until the token
-    /// fits (the duty cycle drains the ring) or the producer closes; called from
-    /// a duty-cycle callback it never waits (the next flush pass flushes all).
+    /// fits (the duty cycle drains the ring) or the producer closes — bounded by
+    /// the ring consumer's heartbeat: stale for > agentLivenessTimeoutMs (a
+    /// wedged runner) logs and drops the flush request (records still flush on
+    /// linger / batch size).  Called from a duty-cycle callback it never waits
+    /// (the next flush pass flushes all).
     void flush() noexcept;
 
     // ---- Instrumentation counters (agent-thread written, caller-read after sync)

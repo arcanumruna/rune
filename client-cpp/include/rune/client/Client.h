@@ -60,6 +60,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -949,17 +950,38 @@ public:
     // These expose the routing decision so tests can assert a keyed produce
     // resolves to the correct partition leader's endpoint via cached metadata,
     // and that a redirect updates the cache with zero full-refresh round-trip.
-    // NOT part of the production API surface; safe to call only when the runner
-    // is quiescent (tests pump deterministically).
+    // NOT part of the production API surface.  They read duty-owned state, so
+    // they may be called only on the duty thread (the Invoker owner between
+    // doWork() calls, or a duty-cycle callback), or once a Thread-mode runner
+    // has been joined (after close()).  F8c fix round 1: debug builds abort on
+    // any other caller, turning a would-be TSan-only data race (a test thread
+    // reading while the runner writes) into a deterministic failure.
     [[nodiscard]] std::string testRouteEndpoint(int32_t topicId,
                                                 const Key& key) const {
+        testHookOwnerCheck_();
         return partitionRouter_.routeKey(topicId, key).channel;
     }
     [[nodiscard]] int32_t testLeaderFor(int32_t topicId, int32_t partition) const {
+        testHookOwnerCheck_();
         return metadataCache_.leaderFor(topicId, partition);
     }
     [[nodiscard]] int32_t testEpochFor(int32_t topicId, int32_t partition) const {
+        testHookOwnerCheck_();
         return metadataCache_.epochFor(topicId, partition);
+    }
+    void testHookOwnerCheck_() const noexcept {
+#ifndef NDEBUG
+        const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+        const bool runnerGone =
+            cfg_.runnerMode == RunnerMode::Thread && !runnerThread_.joinable();
+        if (!onDuty && !runnerGone) {
+            std::fprintf(stderr,
+                         "rune-client: FATAL: duty-owned test hook read off the duty thread "
+                         "while the runner is live (data race); aborting\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+#endif
     }
     [[nodiscard]] std::string testCurrentLeaderChannel() const {
         return agent_.seedSession().currentLeaderChannel;
