@@ -1872,6 +1872,10 @@ void BrokerNode::buildGateway() {
     });
     // F7 ownership invariant violation (a runtime replica move) → halt.
     runtimeAgent_->setFatalHook([this](const std::string& what) { onInvariantViolation_(what); });
+    // Fused placement (spec §3.2, Task 11): every runtime cycle is part of a
+    // worker-0 pass — its O(partitions) failover/rebalance scan becomes an Aeron
+    // slow tick.  Thread placement: every cycle (unchanged).
+    if (config_.fused()) runtimeAgent_->setSlowTickIntervalNs(NodeRuntimeAgent::kSlowTickIntervalNs);
 
     // -----------------------------------------------------------------------
     // Task 8a (RULING-2 B): wire the admin control-plane servicing hook.

@@ -790,3 +790,49 @@ TEST(ShardModeFusedRegression, RoutingImageIsRepublishedOnlyWhenItsInputsChange)
         node.stop();
     }
 }
+
+// Fused placement runs the failover/rebalance scan as an Aeron slow tick (not
+// every cycle): a dead partition leader must still fail over to a survivor, and
+// acks=all must commit on the new leader's worker shard.
+TEST(ShardModeFusedRegression, PartitionLeaderFailsOverBetweenFusedRuntimes) {
+    TmpDir d0{"ff0"}, d1{"ff1"}, d2{"ff2"}, cdir{"ffc"};
+    const auto ports = ShardPorts::discover(3, 1);
+    auto nodes = std::vector<std::unique_ptr<BrokerNode>>{};
+    for (int i = 0; i < 3; ++i)
+        nodes.push_back(std::make_unique<BrokerNode>(
+            makeShardConfig(i, (i == 0 ? d0 : i == 1 ? d1 : d2).path, ports, 3, 1, /*fused=*/true)));
+    for (auto& n : nodes) n->start();
+    ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(cdir.path);
+    auto leaderSeenBy = [&](int via, int64_t sid) {
+        int32_t l = -1;
+        for (const auto& pi : c.metadata(gatewayChannel(ports, via), kClientStream, sid))
+            if (pi.topicId == 0 && pi.partition == 0) l = pi.leaderId;
+        return l;
+    };
+    const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid0, 0);
+    int32_t oldLeader = -1;
+    ASSERT_TRUE(eventually([&] { return (oldLeader = leaderSeenBy(0, sid0)) >= 0; }, 400));
+    {
+        const int64_t sid = c.connect(gatewayChannel(ports, oldLeader), kClientStream);
+        ASSERT_GT(sid, 0);
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, oldLeader, 0), kIngressStream, sid, 0, 0,
+                                     /*acks=all*/1, makeBatch(2)));
+    }
+    nodes[static_cast<std::size_t>(oldLeader)]->stop();                  // the partition leader dies
+    const int via = oldLeader == 0 ? 1 : 0;
+    const int64_t sidVia = c.connect(gatewayChannel(ports, via), kClientStream);
+    ASSERT_GT(sidVia, 0);
+    int32_t newLeader = -1;
+    ASSERT_TRUE(eventually([&] {
+        newLeader = leaderSeenBy(via, sidVia);
+        return newLeader >= 0 && newLeader != oldLeader;
+    })) << "partition 0 never failed over from dead node " << oldLeader;
+    const int64_t sid = c.connect(gatewayChannel(ports, newLeader), kClientStream);
+    ASSERT_GT(sid, 0);
+    EXPECT_TRUE(c.produceUntilOk(workerIngressChannel(ports, newLeader, 0), kIngressStream, sid, 0, 0,
+                                 /*acks=all*/1, makeBatch(2)))
+        << "acks=all must commit on the surviving pair";
+    for (auto& n : nodes) n->stop();
+}

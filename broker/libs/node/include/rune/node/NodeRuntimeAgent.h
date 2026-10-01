@@ -45,6 +45,7 @@
 #include <spdlog/spdlog.h>
 #include <rune/storage/OffsetMap.h>
 #include <rune/consensus/Election.h>
+#include <rune/consensus/SlowTick.h>
 #include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/Gpid.h>
 
@@ -191,6 +192,14 @@ public:
     }
     [[nodiscard]] std::uint64_t cleanerAckedGenForTest() const noexcept { return cleanerAckedGen_; }
 
+    /// Aeron's io.aeron.cluster.ConsensusModuleAgent.SLOW_TICK_INTERVAL_NS.
+    static constexpr int64_t kSlowTickIntervalNs = 10'000'000;   // 10 ms
+
+    /// Task 11 (fused placement): run the O(partitions) failover / rebalance scan
+    /// as a slow tick every `ns` instead of every duty cycle.  0 (default, thread
+    /// placement) = every cycle.  Set before the agent runs.
+    void setSlowTickIntervalNs(int64_t ns) noexcept { failoverTick_.intervalNs = ns > 0 ? ns : 0; }
+
     /// Test-only (this agent's thread): duty cycles run / routing images published.
     [[nodiscard]] std::uint64_t cyclesForTest() const noexcept { return cycles_; }
     [[nodiscard]] std::uint64_t routingImagePublishesForTest() const noexcept { return routingImagePublishes_; }
@@ -261,7 +270,13 @@ private:
             // Without this, a killed node's partitions stay assigned to it in the
             // committed map forever, so the surviving nodes' replicas never get
             // promoted to Leader (GR-7 / TX-2b failover would hang).
-            if (election_) {
+            //
+            // Task 11: O(partitions) — a SLOW-TICK step (Aeron ConsensusModule-
+            // Agent::slowTickWork): due every failoverTick_.intervalNs, and again
+            // on the very next cycle while it still emits records.  Interval 0
+            // (thread placement) = every cycle, exactly as before.
+            if (election_ && failoverTick_.due(nowNs)) {
+                int slowWork = 0;
                 // BIDIRECTIONAL partition-leadership rebalance on eligible-set change.
                 //
                 // Failure detection uses the consensus heartbeat eligible set (the
@@ -372,11 +387,13 @@ private:
                             "dead/rebalanced\n",
                             (long long)(nowNs / 1'000'000), emitted, maxPref, n);
                     work += static_cast<int>(emitted);
+                    slowWork += static_cast<int>(emitted);
                     std::copy(eligBuf_.begin(), eligBuf_.begin() + n,
                               prevEligBuf_.begin());
                     prevEligLen_  = n;
                     prevEligInit_ = true;
                 }
+                failoverTick_.done(nowNs, slowWork);
             }
 
             // Rebuild the RoutingImage and push it to the gateway WHEN ITS INPUTS
@@ -877,6 +894,7 @@ private:
         }
         return work;
     }
+    rune::consensus::SlowTick                          failoverTick_;
     std::uint64_t                                      cycles_                = 0;
     std::uint64_t                                      routingImagePublishes_ = 0;
     bool                                               routingBuilt_          = false;
