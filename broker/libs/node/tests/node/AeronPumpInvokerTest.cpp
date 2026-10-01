@@ -231,3 +231,17 @@ TEST(PartitionTransportKindRegression, AeronAndNullTransportsAreConcreteKinds) {
                                                 {1}, {1}, &log2, &nullT);
     EXPECT_EQ(viaNull.transportKindForTest(), rune::replication::TransportKind::Null);
 }
+
+// Task 11 fix 3 (m-a): the production replication plane is polled through the
+// TYPED pointer (direct call every shard pass), never the test-seam trampoline.
+#include <rune/node/Worker.h>
+
+TEST(WorkerReplicationPollRegression, ProductionTransportIsPolledDirectly) {
+    InvokerShard s;
+    WorkerReplicationTransport t(s.client, 0, "aeron:ipc", 7401, {{2, std::string("aeron:ipc")}}, 7401, s.pump());
+    Worker w{0, 1 << 16, 1 << 16, 16, 16};
+    w.setReplicationTransport(&t);
+    EXPECT_EQ(w.replicationTransport(), &t);
+    EXPECT_FALSE(w.replicationPollIsIndirectForTest()) << "production poll must be a direct call";
+    (void)w.doWork(1);   // drives the direct poll (no frames) without crashing
+}

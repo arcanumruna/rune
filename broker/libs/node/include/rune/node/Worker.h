@@ -260,13 +260,20 @@ public:
     // trampoline is a non-capturing lambda → plain function pointer.
     // -----------------------------------------------------------------------
     void setReplicationTransport(WorkerReplicationTransport* transport) noexcept {
-        setReplicationTransportImpl_(transport);
+        // Task 11 fix 3 (m-a): production is polled through the TYPED pointer — a
+        // direct call every pass.  The (ctx, fn*) trampoline is the test seam only.
+        replTransportCtx_    = nullptr;
+        replTransportPollFn_ = nullptr;
         workerReplTransport_ = transport;
     }
 
-    // Test-seam overload: accepts any WorkerReplicationTransportImpl<T>.
-    // Sets the trampoline but leaves the typed workerReplTransport_ null so
-    // the replicationTransport() accessor remains production-only.
+    /// Test-only: true when the replication poll goes through the indirect
+    /// (function-pointer) test seam instead of the direct production call.
+    [[nodiscard]] bool replicationPollIsIndirectForTest() const noexcept { return replTransportPollFn_ != nullptr; }
+
+    // Test-seam overload: accepts any WorkerReplicationTransportImpl<T> (e.g. a
+    // fake pub registry).  Sets the indirect trampoline (TEST ONLY) and leaves the
+    // typed workerReplTransport_ null so replicationTransport() stays production-only.
     template <typename T>
     void setReplicationTransportForTest(WorkerReplicationTransportImpl<T>* transport) noexcept {
         setReplicationTransportImpl_(transport);
@@ -758,19 +765,14 @@ public:
         // only inside the callback; the replica copies into its log before the
         // callback returns (same contract as executeApplyReplicatedWire_ ~1443-1471).
         //
-        // replTransportCtx_ / replTransportPollFn_ is a (void* ctx, fn*) trampoline
-        // set by setReplicationTransportImpl_<T>: the function pointer casts ctx back
-        // to the concrete WorkerReplicationTransportImpl<T> and calls its templated
-        // poll() with the dispatch lambda.  No std::function, no virtual dispatch —
-        // identical idiom to WorkerReplicationTransportImpl's own ctx_/trampoline_.
-        //
-        // Shared-nothing: replTransportCtx_ is null when the transport is not wired
-        // → the poll is never called (flag-off path unchanged).  The dispatch lambda
-        // passed to poll() is a non-capturing function pointer (zero overhead).
-        if (replTransportCtx_) {
+        // Production: a DIRECT call on the typed transport (Task 11 fix 3, m-a).
+        // Test seam only: the (ctx, fn*) trampoline for fake pub registries.
+        // Neither wired → no poll (flag-off path unchanged).
+        if (workerReplTransport_) {
             RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplPollDrive, 0);
-            work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit,
-                                        this, nowNs);
+            work += pollReplTransport_(*workerReplTransport_, nowNs);
+        } else if (replTransportCtx_) [[unlikely]] {
+            work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);
         }
 
         // read-rework T3/T4 (I3): in-worker push — read owned partitions and push
@@ -831,7 +833,9 @@ private:
         work += submitCoalescedFlushes_();
         // 4. replication on this worker's plane: apply inbound (inline, fast-acks),
         //    then push / ISR / HW per owned replica.
-        if (replTransportCtx_) work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);
+        if (workerReplTransport_) work += pollReplTransport_(*workerReplTransport_, nowNs);   // direct
+        else if (replTransportCtx_) [[unlikely]]
+            work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);   // test seam
         for (auto* replica : owned_) {
             if (replica) work += replica->doWork(nowNs);
         }
@@ -2189,16 +2193,25 @@ private:
     }
 
     // -------------------------------------------------------------------
-    // setReplicationTransportImpl_ — template helper that wires the (ctx,
-    //   trampoline) pair from a concrete WorkerReplicationTransportImpl<T>.
-    //
-    // The trampoline is a non-capturing lambda (→ plain function pointer) that:
-    //   1. Casts ctx back to the concrete type.
-    //   2. Calls poll(limit, dispatch) where dispatch is also a non-capturing
-    //      lambda (→ function pointer) forwarding to pollReplTransportDispatch_.
-    //
-    // No std::function, no heap allocation, no virtual dispatch.
-    // Mirrors WorkerReplicationTransportImpl's own ctx_/trampoline_ pattern.
+    // pollReplTransport_ — one replication-plane poll on a concrete transport:
+    // handshake drive + templated poll with an inlined dispatch.  Production
+    // calls it directly on the typed pointer; the test seam via the trampoline.
+    // -------------------------------------------------------------------
+    template <typename T>
+    int pollReplTransport_(WorkerReplicationTransportImpl<T>& t, int64_t nowNs) {
+        // Shard plane handshake (spec §3.3): one predicted branch unless a peer
+        // is unverified / refused (then a hello on the retry cadence).
+        const int hs = t.driveHandshake(nowNs);
+        return hs + t.poll(kReplFetchLimit,
+                           [this, nowNs](int32_t topicId, int32_t partition, uint16_t templateId,
+                                         const uint8_t* frame, std::size_t len) {
+                               pollReplTransportDispatch_(topicId, partition, templateId, frame, len, nowNs);
+                           });
+    }
+
+    // -------------------------------------------------------------------
+    // setReplicationTransportImpl_ — TEST SEAM ONLY: wires the (ctx, fn*)
+    // trampoline for a WorkerReplicationTransportImpl<T> with a fake registry.
     // -------------------------------------------------------------------
     template <typename T>
     void setReplicationTransportImpl_(WorkerReplicationTransportImpl<T>* transport) noexcept
@@ -2208,33 +2221,9 @@ private:
             replTransportPollFn_ = nullptr;
             return;
         }
-        replTransportCtx_ = static_cast<void*>(transport);
-        // The trampoline is a non-capturing lambda → implicitly converts to
-        // a plain function pointer (ReplPollFn).  Safe because it is stored as
-        // a function pointer and never invoked after the transport is destroyed
-        // (BrokerNode owns the lifetime and tears down workers first).
-        replTransportPollFn_ = [](void* ctx, int limit, Worker* self, int64_t nowNs) -> int
-        {
-            auto* t = static_cast<WorkerReplicationTransportImpl<T>*>(ctx);
-            // Shard plane handshake (spec §3.3): one predicted branch unless a
-            // peer is unverified / refused (then a hello on the retry cadence).
-            const int hs = t->driveHandshake(nowNs);
-            return hs + t->poll(
-                limit,
-                // Inner dispatch: also non-capturing → function pointer.
-                // GCC/Clang: a non-capturing lambda with a non-capturing
-                // closure may capture (Worker*, int64_t) via a Dispatch
-                // parameter (templated, inlined) without being a std::function.
-                // Here we use a struct-based callable to make the intent
-                // explicit and guarantee zero heap allocation.
-                [self, nowNs]
-                (int32_t topicId, int32_t partition,
-                 uint16_t templateId,
-                 const uint8_t* frame, std::size_t len)
-                {
-                    self->pollReplTransportDispatch_(topicId, partition, templateId,
-                                                    frame, len, nowNs);
-                });
+        replTransportCtx_    = static_cast<void*>(transport);
+        replTransportPollFn_ = [](void* ctx, int /*limit*/, Worker* self, int64_t nowNs) -> int {
+            return self->pollReplTransport_(*static_cast<WorkerReplicationTransportImpl<T>*>(ctx), nowNs);
         };
     }
 
@@ -2560,20 +2549,9 @@ private:
     // BrokerNode owns the WorkerReplicationTransport lifetime.
     WorkerReplicationTransport* workerReplTransport_ = nullptr;
 
-    // Task 6: type-erased (ctx, trampoline) pair for calling
-    // WorkerReplicationTransportImpl<T>::poll() from doWork() without std::function
-    // and without virtual dispatch.  Set by setReplicationTransportImpl_<T>.
-    //
-    // Trampoline signature:
-    //   int(*)(void* ctx, int limit, Worker* self, int64_t nowNs)
-    //
-    // The trampoline casts ctx back to WorkerReplicationTransportImpl<T>* and
-    // calls poll(limit, dispatch) where dispatch is a non-capturing lambda
-    // (plain function pointer) that forwards to self->pollReplTransportDispatch_.
-    // This is the same ctx_/trampoline_ idiom WorkerReplicationTransportImpl uses
-    // internally and matches WorkerIngress::poll exactly.
-    //
-    // replTransportCtx_ == nullptr when no transport is wired (flag-off path).
+    // TEST SEAM ONLY (Task 11 fix 3): (ctx, fn*) trampoline for a
+    // WorkerReplicationTransportImpl<T> with a fake registry.  Production polls
+    // workerReplTransport_ directly.  Null when the seam is not used.
     using ReplPollFn = int(*)(void* ctx, int limit, Worker* self, int64_t nowNs);
     void*       replTransportCtx_    = nullptr;
     ReplPollFn  replTransportPollFn_ = nullptr;
