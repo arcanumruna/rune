@@ -126,7 +126,8 @@ struct SubscriptionStatus {
 //     the SubscribeAdd command is put on the agent ring, whose release/acquire
 //     publishes them): correlationId, topicId, partition, handler;
 //   - duty-thread owned (plain fields, never touched by an app thread):
-//     subscriptionId, nextOffset, active, statusDirty, the dirty-list links;
+//     subscriptionId, nextOffset, active, statusDirty, the dirty-list links,
+//     the pending-Unsubscribe fields;
 //   - the cross-thread channel: `status` (StatusRing — the ring's own memory
 //     ordering is the only synchronisation; its single consumer is the
 //     Subscription handle).
@@ -143,6 +144,10 @@ struct SubscriptionImpl {
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
+    // F8a fix2: an Unsubscribe the transport refused, retried by the duty cycle.
+    bool    unsubPending   = false;
+    int64_t unsubCorrId    = 0;
+    int64_t unsubSessionId = 0;
     // Intrusive links of the hub's dirty list (no allocation on the dispatch path).
     SubscriptionImpl* prevDirty = nullptr;
     SubscriptionImpl* nextDirty = nullptr;

@@ -149,13 +149,32 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // only while the writer is descheduled; unblocking risks corruption. The
     // one place that must terminate regardless — close(), after the runner is
     // joined — has its own bounded unblock (drainRegistrationsForClose).
-    int ringWork = ring_.read(
+    //
+    // F8a fix2 (root cause): a wire frame accepted into the ring is NEVER
+    // silently dropped by the drain.  Rule for kMsgSend (every app/hub control
+    // frame on the default ingress publication: Subscribe, Ping, DefineTopic,
+    // GetTopicSchema, MetadataRequest, JoinGroup/SyncGroup/Heartbeat/
+    // OffsetCommit/OffsetFetch/LeaveGroup, group Subscribe, txn control frames):
+    //   * seed session Connected AND the frame carries its sessionId -> offer;
+    //     if the transport refuses (back-pressure / admin action / publication
+    //     not connected) the record is LEFT at the head of the ring (ABORT) and
+    //     retried on the next duty cycle, in order.  Nothing behind it is read
+    //     this cycle.
+    //   * otherwise (session not Connected, or the frame carries an OLD
+    //     sessionId): the frame belongs to a session that no longer exists —
+    //     dropped deliberately, logged and counted (staleFramesDropped()),
+    //     never resent from here.  Owners re-issue what must survive a session
+    //     change with the new sessionId (pending Subscribes on every connect,
+    //     JoinGroup on connect/rejoin, redirect resends).
+    // Every other command type is consumed (CONTINUE).
+    int ringWork = ring_.controlledRead(
         [this, nowNs](
             std::int32_t                         msgTypeId,
             aeron::concurrent::AtomicBuffer&     buf,
             aeron::util::index_t                 offset,
             aeron::util::index_t                 len)
         {
+            using CA = rune::client::detail::ControlledAction;
             switch (msgTypeId) {
             case kMsgConnect:
                 seedSession().machine.connect(nowNs);
@@ -181,7 +200,25 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 if (len > 0) {
                     const auto* p = reinterpret_cast<const uint8_t*>(
                         buf.buffer() + offset);
-                    transport_.offer(p, static_cast<std::size_t>(len));
+                    const auto n = static_cast<std::size_t>(len);
+                    const auto& m = seedSession().machine;
+                    const int64_t frameSid = (n >= 16)
+                        ? ::rune::protocol::client::detail::getLE64(p, 8) : 0;
+                    if (m.state() != session::SessionState::Connected ||
+                        frameSid != m.sessionId()) {
+                        ++staleFramesDropped_;
+                        std::fprintf(stderr,
+                            "rune-client: dropped a control frame of a session that no longer "
+                            "exists (frame sessionId %lld, current %lld, connected=%d)\n",
+                            static_cast<long long>(frameSid),
+                            static_cast<long long>(m.sessionId()),
+                            m.state() == session::SessionState::Connected ? 1 : 0);
+                        break;
+                    }
+                    if (!transport_.offer(p, n)) {
+                        ++ingressOfferRefused_;
+                        return CA::ABORT;  // stays at the head; retried next cycle
+                    }
                 }
                 break;
 
@@ -223,6 +260,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 // Unknown command: drop silently.
                 break;
             }
+            return CA::CONTINUE;
         },
         cfg_.ringDrainLimit);
 

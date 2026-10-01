@@ -13,6 +13,7 @@
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/OffsetMessages.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -81,6 +82,12 @@ struct InvokerGateway {
     std::vector<Subscribed> subscribed;
     std::vector<int64_t>    unsubscribed;  // subscriptionIds
     int64_t nextSubscriptionId = 500;
+    // F8a fix2: stop consuming client ingress (the client's publication then
+    // back-pressures once its term window is full).
+    bool pauseIngress = false;
+    int  pings        = 0;
+    std::vector<std::vector<uint8_t>> offsetCommits;  // raw OffsetCommit frames received
+    bool replyOffsetCommits = true;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -137,8 +144,10 @@ struct InvokerGateway {
                 ++i;
             }
         }
-        for (auto& ep : endpoints) {
-            if (ep->sub) work += ep->sub->poll(ep->assembler->handler(), 16);
+        if (!pauseIngress) {
+            for (auto& ep : endpoints) {
+                if (ep->sub) work += ep->sub->poll(ep->assembler->handler(), 16);
+            }
         }
         return work;
     }
@@ -269,6 +278,22 @@ private:
                 out, sizeof out, 0, sv->partition, sub.subscriptionId, sv->sessionId,
                 sv->correlationId);
             send(0, out, n);
+            return;
+        }
+        case rcc::TemplateId::Ping: {
+            ++pings;
+            return;
+        }
+        case rcc::TemplateId::OffsetCommit: {
+            offsetCommits.emplace_back(buf, buf + len);
+            const auto oc = rp::OffsetCommit::decode(buf, len);
+            if (!oc || !replyOffsetCommits) return;
+            rp::OffsetCommitResponse rsp;
+            rsp.sessionId     = oc->sessionId;
+            rsp.correlationId = oc->correlationId;
+            std::vector<uint8_t> out(rp::OffsetCommitResponse::encodedSizeFor(0));
+            const std::size_t n = rsp.encode(out.data(), {});
+            send(0, out.data(), n);
             return;
         }
         case rcc::TemplateId::Unsubscribe: {

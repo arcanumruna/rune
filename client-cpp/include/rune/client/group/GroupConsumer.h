@@ -254,8 +254,11 @@ public:
     /// THIS commit (OffsetCommitResponse matched by correlationId, error codes
     /// checked — a failed commit throws from get()), or resolves at once when
     /// there is nothing to commit.  It fails when superseded by a newer
-    /// commitSync(), on close(), on a group rejoin, on session loss after the
-    /// commit was sent, or when the Client closes.
+    /// commitSync(), on close(), on a group rejoin, as soon as the session to
+    /// the broker goes DOWN (the session machine's Connected -> not-Connected
+    /// transition — no timeout of its own) or a new session replaces the one
+    /// its commit was sent on, or when the Client closes.  An OffsetCommit the
+    /// transport refuses is retried every duty cycle (never dropped).
     /// Waiting: Thread mode — get() from an app thread.  Invoker mode — keep
     /// calling Client::doWork() until it is ready.  NEVER from inside a duty-
     /// cycle callback: commitSync() throws std::logic_error there.

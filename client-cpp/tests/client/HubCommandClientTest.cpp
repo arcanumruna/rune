@@ -119,13 +119,15 @@ TEST(HubCommandClient, SubscribeAfterCloseReturnsFinishedHandlesRegression) {
 // the handle is finished and a commitSync future is failed — never stranded.
 TEST(HubCommandClient, CommandRacingCloseIsNeverStrandedRegression) {
     {
-        rc::Client client(hubCfg(3974, 3975, rc::RunnerMode::Invoker));
+        // Thread mode: the app thread's registration goes through the ring (on
+        // the Invoker owner it is applied directly and cannot race close()).
+        rc::Client client(hubCfg(3974, 3975, rc::RunnerMode::Thread));
         client.testSetBeforeRegistrationSubmitHook([&] { client.close(); });
         auto sub = subscribeT(client);  // close() runs inside, before the submit
         EXPECT_FALSE(sub.active());
     }
     {
-        rc::Client client(hubCfg(3976, 3977, rc::RunnerMode::Invoker));
+        rc::Client client(hubCfg(3976, 3977, rc::RunnerMode::Thread));
         client.testSetBeforeRegistrationSubmitHook([&] { client.close(); });
         auto gc = client.subscribeGroup("g", {"t"});
         EXPECT_FALSE(gc.active());
@@ -201,12 +203,20 @@ TEST(HubCommandClient, HubCommandFromCallbackWithFullRingFailsFastRegression) {
 // ===========================================================================
 namespace {
 
+rc::ClientConfig withOpts(rc::ClientConfig c, std::size_t termBytes, rc::NanoClock clock) {
+    // IPC publications take their term length from the channel (the driver's
+    // IPC default is 64 MiB): a small term makes back-pressure reachable.
+    if (termBytes != 0) c.gatewayChannel = "aeron:ipc?term-length=" + std::to_string(termBytes);
+    c.nanoClock = clock;
+    return c;
+}
+
 struct HubRig {
     rc::ClientConfig             cfg;
     rc::Client                   client;
     test_support::InvokerGateway gw;
-    explicit HubRig(int32_t in)
-        : cfg(hubCfg(in, in + 1, rc::RunnerMode::Invoker)), client(cfg),
+    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr)
+        : cfg(withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock)), client(cfg),
           gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
              cfg.egressChannel, cfg.egressStreamId) {}
 
@@ -231,6 +241,21 @@ struct HubRig {
     }
 };
 
+/// M2: a two-outcome event the OTHER thread always completes — it either hit
+/// the full ring (kFull, set by the ring-full hook) or finished without ever
+/// meeting it (kNoFull).  Waiting on it is therefore bounded: no hang, and the
+/// test FAILS (instead of hanging) if the full ring was never met.
+enum : int { kPending = 0, kFull = 1, kNoFull = 2 };
+void signal(std::atomic<int>& ev, int v) {
+    int expected = kPending;
+    ev.compare_exchange_strong(expected, v);
+    ev.notify_all();
+}
+int waitEvent(std::atomic<int>& ev) {
+    for (int v = ev.load(); v == kPending; v = ev.load()) ev.wait(kPending);
+    return ev.load();
+}
+
 } // namespace
 
 // C1(b): a full command ring cannot stop an unsubscribe.  A non-owner thread's
@@ -246,18 +271,19 @@ TEST(HubCommandClient, RingFullUnsubscribeStillStopsDispatchRegression) {
     r.gw.pushRecords(r.gw.subscribed[0], 0, 1);
     ASSERT_TRUE(r.drive([&] { return got.load() == 1; }));
 
-    std::atomic<bool> sawFull{false};
-    r.client.testSetHubCommandRingFullHook([&] {
-        sawFull.store(true);
-        sawFull.notify_one();
-    });
+    std::atomic<int> ev{kPending};
+    r.client.testSetHubCommandRingFullHook([&] { signal(ev, kFull); });
     r.client.testFillCommandRing();
     std::atomic<bool> returned{false};
     std::thread t([&] {
         sub.unsubscribe();  // the handle's owner for this call; never throws
         returned.store(true);
+        signal(ev, kNoFull);
     });
-    sawFull.wait(false);  // the unsubscribe really met a full ring
+    if (waitEvent(ev) != kFull) {
+        t.join();
+        FAIL() << "the unsubscribe never met the full ring";
+    }
     ASSERT_TRUE(r.drive([&] { return returned.load() && sub.finished(); }));
     t.join();
 
@@ -281,18 +307,19 @@ TEST(HubCommandClient, DestructorUnderFullRingStopsDispatchRegression) {
         [&](const rc::Record&) { got.fetch_add(1); }));
     ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub->subscriptionId() > 0; }));
 
-    std::atomic<bool> sawFull{false};
-    r.client.testSetHubCommandRingFullHook([&] {
-        sawFull.store(true);
-        sawFull.notify_one();
-    });
+    std::atomic<int> ev{kPending};
+    r.client.testSetHubCommandRingFullHook([&] { signal(ev, kFull); });
     r.client.testFillCommandRing();
     std::atomic<bool> destroyed{false};
     std::thread t([&] {
         sub.reset();
         destroyed.store(true);
+        signal(ev, kNoFull);
     });
-    sawFull.wait(false);
+    if (waitEvent(ev) != kFull) {
+        t.join();
+        FAIL() << "the destructor never met the full ring";
+    }
     ASSERT_TRUE(r.drive([&] { return destroyed.load() && !r.gw.unsubscribed.empty(); }));
     t.join();
     r.gw.pushRecords(r.gw.subscribed[0], 0, 2);
@@ -319,6 +346,11 @@ TEST(HubCommandClient, UnsubscribeInsideHandlerAppliesDirectlyRegression) {
     ASSERT_TRUE(r.drive([&] { return sub->finished(); }));
     EXPECT_EQ(got, 1);
     EXPECT_EQ(sub->position(), 1);
+    // fix2 REQUIRED 1: the Unsubscribe frame itself must not depend on the
+    // (full) command ring — the gateway sees it.
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }))
+        << "the Unsubscribe frame was lost to the full command ring";
+    EXPECT_EQ(r.gw.unsubscribed[0], r.gw.subscribed[0].subscriptionId);
 }
 
 // I6: commitSync() from inside a duty-cycle callback throws instead of
@@ -338,4 +370,108 @@ TEST(HubCommandClient, CommitSyncFromDutyCallbackThrowsRegression) {
     EXPECT_TRUE(threw);
     // Outside a callback, on the owner thread, it is allowed (the app pumps).
     EXPECT_NO_THROW((void)gc.commitSync());
+}
+
+// ===========================================================================
+// F8a fix round 2
+// ===========================================================================
+
+// ROOT CAUSE: a frame accepted into the command ring is never dropped by the
+// drain when the transport refuses it (back-pressure): it stays at the head of
+// the ring and is delivered once the publication drains.
+TEST(HubCommandClient, RingDrainedFrameRetriedUnderTransportBackPressureRegression) {
+    HubRig r(3992, /*termBytes=*/64 * 1024);
+    r.connect();
+    r.gw.pauseIngress = true;  // the gateway stops consuming: the publication fills
+    constexpr int kPings = 120;  // ~120 KiB >> the 64 KiB term's window
+    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
+    for (int i = 0; i < kPings; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, static_cast<uint8_t>(i))));
+    r.settle(5'000);
+    ASSERT_GT(r.client.testIngressOfferRefused(), 0u) << "the transport must have refused (back-pressure)";
+    r.gw.pauseIngress = false;
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings == kPings; }))
+        << "only " << r.gw.pings << " of " << kPings << " pings delivered — refused frames were dropped";
+    EXPECT_EQ(r.client.testStaleFramesDropped(), 0u);
+}
+
+// fix2 REQUIRED 1: the transport refuses the Unsubscribe (back-pressure): it
+// stays pending and is retried by the duty cycle until the gateway sees it.
+TEST(HubCommandClient, UnsubscribeRetriedWhenTheTransportRefusesItRegression) {
+    HubRig r(3994, /*termBytes=*/64 * 1024);
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() > 0; }));
+
+    r.gw.pauseIngress = true;
+    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
+    for (int i = 0; i < 120; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, 1)));
+    r.settle(5'000);
+    ASSERT_GT(r.client.testIngressOfferRefused(), 0u) << "the publication must be back-pressured";
+
+    sub.unsubscribe();  // owner thread = duty thread: applied directly, offer refused
+    r.settle(100);
+    EXPECT_TRUE(sub.finished()) << "dispatch stops at once, independent of the wire";
+    EXPECT_EQ(r.client.testPendingUnsubscribes(), 1u) << "refused: kept for retry, not dropped";
+
+    r.gw.pauseIngress = false;
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }))
+        << "the refused Unsubscribe was never retried";
+    EXPECT_EQ(r.gw.unsubscribed[0], r.gw.subscribed[0].subscriptionId);
+    EXPECT_EQ(r.client.testPendingUnsubscribes(), 0u);
+}
+
+// fix2 REQUIRED 3 (IM-2): the broker goes away and never comes back — the
+// session-DOWN transition itself fails a pending commitSync promptly (no
+// timeout of its own: driven by the session machine's liveness verdict).
+namespace {
+int64_t g_hubNow = 1'000'000'000;  // test thread only
+int64_t hubNow() noexcept { return g_hubNow; }
+} // namespace
+
+TEST(HubCommandClient, CommitSyncFailsWhenTheSessionGoesDownRegression) {
+    HubRig r(3996, 0, &hubNow);
+    r.connect();
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    auto f = gc.commitSync();  // owner thread: applied directly; pending (not Stable)
+    r.settle(100);
+    ASSERT_FALSE(readyNow(f));
+    ASSERT_EQ(r.client.state(), rc::session::SessionState::Connected);
+
+    // The broker is gone: no more egress, no reconnect.  Advance the duty
+    // clock past the session's response timeout and pump ONLY the client.
+    g_hubNow += 11'000'000'000LL;
+    bool down = false;
+    for (int i = 0; i < 1'000 && !readyNow(f); ++i) {
+        r.client.doWork();
+        down = down || r.client.state() != rc::session::SessionState::Connected;
+    }
+    EXPECT_TRUE(down);
+    ASSERT_TRUE(readyNow(f)) << "commitSync must fail on the session-down transition";
+    EXPECT_THROW(f.get(), std::runtime_error);
+}
+
+// fix2 (found while writing the IM-2 test): on the Invoker owner a direct
+// command must never overtake its own registration still queued in the ring.
+TEST(HubCommandClient, DirectCommandNeverOvertakesItsOwnRegistrationRegression) {
+    HubRig r(3998);
+    r.connect();
+    {
+        auto gc = r.client.subscribeGroup("g", {"t"});
+        auto f = gc.commitSync();  // before any doWork(): the add must already be applied
+        r.settle(100);
+        EXPECT_FALSE(readyNow(f)) << "commitSync failed as if the consumer did not exist";
+        EXPECT_TRUE(gc.active());
+    }
+    int got = 0;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [&](const rc::Record&) { ++got; });
+    sub.unsubscribe();  // before any doWork()
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    r.settle(500);
+    if (!r.gw.subscribed.empty()) {
+        r.gw.pushRecords(r.gw.subscribed[0], 0, 2);
+        r.settle(500);
+    }
+    EXPECT_EQ(got, 0) << "an unsubscribed subscription came alive after its late adoption";
 }

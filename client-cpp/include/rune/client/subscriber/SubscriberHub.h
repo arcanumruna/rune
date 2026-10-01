@@ -176,6 +176,21 @@ public:
     /// Retry every dirty snapshot; returns how many were published.
     int republishDirty();
 
+    /// F8a fix2: duty-thread direct send on the default ingress publication
+    /// (plain function pointer + context; set once before start).  Used for
+    /// Unsubscribe frames so they never depend on command-ring space.  Unset
+    /// (hub-level tests): the SendFn passed to the call is used.
+    using DirectSendFn = bool (*)(void* ctx, const uint8_t* buf, std::size_t len);
+    void setDirectSend(DirectSendFn fn, void* ctx) noexcept { directSend_ = fn; directSendCtx_ = ctx; }
+
+    /// F8a fix2: Unsubscribe frames the transport refused, retried by the duty
+    /// cycle (gated: one branch when zero).  A retry for a session that is no
+    /// longer the current one is dropped (logged + counted) — the broker ended
+    /// the subscription with that session.
+    [[nodiscard]] std::size_t pendingUnsubscribes() const noexcept { return pendingUnsubCount_; }
+    int retryPendingUnsubscribes(int64_t currentSessionId);
+    [[nodiscard]] uint64_t unsubscribesDropped() const noexcept { return unsubscribesDropped_; }
+
     /// CB-5 B: true if there is at least one pending (unbound) subscription.
     [[nodiscard]] bool hasPending() const;
 
@@ -231,6 +246,14 @@ private:
 
     /// Publish impl's current snapshot (ordinary update; a refusal marks it dirty).
     void publishStatus_(SubscriptionImpl& impl);
+
+    // F8a fix2: direct Unsubscribe send + retry.
+    DirectSendFn directSend_    = nullptr;
+    void*        directSendCtx_ = nullptr;
+    std::size_t  pendingUnsubCount_  = 0;
+    uint64_t     unsubscribesDropped_ = 0;
+    bool trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn);
+    void markUnsubPending_(SubscriptionImpl& impl) noexcept;
     /// Mark impl finished: inactive, final snapshot, status ring closed
     /// (deferred to the end of its dispatch if its handler is running).
     void finish_(SubscriptionImpl& impl);

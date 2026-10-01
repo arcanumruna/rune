@@ -1586,3 +1586,52 @@ TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression
     EXPECT_TRUE(monotonic);
     EXPECT_GT(dispatched.load(), 0) << "the installed callback ran on the duty thread";
 }
+
+// ---------------------------------------------------------------------------
+// F8a fix round 2 — REQUIRED 2 / 3 at hub level.
+// ---------------------------------------------------------------------------
+namespace {
+struct RefusingGroupTransport {
+    int refuseNext = 0;
+    std::vector<std::vector<uint8_t>> accepted;
+    static bool fn(void* ctx, const uint8_t* b, std::size_t n) {
+        auto* self = static_cast<RefusingGroupTransport*>(ctx);
+        if (self->refuseNext > 0) { --self->refuseNext; return false; }
+        self->accepted.emplace_back(b, b + n);
+        return true;
+    }
+};
+} // namespace
+
+TEST_F(GroupConsumerHubTest, CommitSyncResolvesAfterARefusedOffsetCommitRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 7);
+    RefusingGroupTransport tx;
+    hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+    auto fut = gc.commitSync();
+
+    tx.refuseNext = 1;
+    EXPECT_EQ(hub_->flushRequestedCommits(kSessionId), 0) << "refused";
+    EXPECT_TRUE(impl_->commitRequested) << "stays requested until the offer succeeds";
+    EXPECT_EQ(impl_->commitSyncCorrId, 0);
+    EXPECT_EQ(hub_->flushRequestedCommits(kSessionId), 1);
+    ASSERT_EQ(tx.accepted.size(), 1u);
+    auto oc = rpc::OffsetCommit::decode(tx.accepted[0].data(), tx.accepted[0].size());
+    ASSERT_TRUE(oc.has_value());
+    EXPECT_EQ(oc->correlationId, impl_->commitSyncCorrId);
+    EXPECT_TRUE(sink_.frames.empty() || lastCommitCorrId(sink_) == 0) << "never via the ring";
+
+    auto ocr = makeOffsetCommitResponse(oc->correlationId);
+    hub_->onOffsetCommitResponse(ocr.data(), ocr.size());
+    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_NO_THROW(fut.get());
+}
+
+TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionDownRegression) {
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+    auto fut = gc.commitSync();  // not even sent
+    hub_->onSessionDown();
+    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(fut.get(), std::runtime_error);
+}

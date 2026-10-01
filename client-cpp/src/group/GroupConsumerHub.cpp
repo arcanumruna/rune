@@ -311,7 +311,6 @@ void GroupConsumerHub::sendHeartbeat(GroupConsumerImpl& impl,
 // sendOffsetCommit — runner thread
 // ---------------------------------------------------------------------------
 
-/*static*/
 GroupConsumerHub::CommitSend GroupConsumerHub::sendOffsetCommit(GroupConsumerImpl& impl,
                                                                 int64_t sessionId,
                                                                 const SendFn& sendFn,
@@ -354,7 +353,12 @@ GroupConsumerHub::CommitSend GroupConsumerHub::sendOffsetCommit(GroupConsumerImp
     const std::size_t len = msg.encode(impl.sendBuf.data(), impl.commitEntriesScratch);
     if (len == 0) return CommitSend::Nothing;
 
-    return sendFn(0, impl.sendBuf.data(), len) ? CommitSend::Sent : CommitSend::SendFailed;
+    // F8a fix2: straight to the transport from the duty thread when wired (the
+    // caller keeps commitRequested set and retries every duty cycle on refusal).
+    const bool ok = directSend_ != nullptr
+        ? directSend_(directSendCtx_, impl.sendBuf.data(), len)
+        : sendFn(0, impl.sendBuf.data(), len);
+    return ok ? CommitSend::Sent : CommitSend::SendFailed;
 }
 
 // ---------------------------------------------------------------------------
@@ -529,25 +533,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
         if (!impl->active) continue;
 
         // ---- Drain pending commit() / commitSync() requests --------------------
-        // Kept pending until Stable (a commitSync waits for it; a rejoin fails it).
-        if (impl->commitRequested && impl->state == GroupConsumerState::Stable) {
-            impl->commitRequested = false;
-            const bool forSync = impl->commitSyncPromise && impl->commitSyncCorrId == 0;
-            const int64_t corr = forSync ? nextCommitCorrId_++ : 0;
-            const CommitSend r = sendOffsetCommit(*impl, sessionId, sendFn, corr);
-            if (r == CommitSend::SendFailed) {
-                impl->commitRequested = true;  // retry next cycle (never silently lost)
-            } else if (forSync) {
-                if (r == CommitSend::Sent) {
-                    impl->commitSyncCorrId = corr;  // resolved by the matching response
-                } else {
-                    // Nothing to commit (no seeded position): done.
-                    try { impl->commitSyncPromise->set_value(); } catch (...) {}
-                    impl->commitSyncPromise.reset();
-                }
-            }
-            ++work;
-        }
+        work += drainCommit_(*impl, sessionId, sendFn);
 
         switch (impl->state) {
 
@@ -599,6 +585,53 @@ int GroupConsumerHub::doWork(int64_t nowNs,
     }
 
     return work;
+}
+
+// ---------------------------------------------------------------------------
+// drainCommit_ / flushRequestedCommits / onSessionDown — duty thread (fix2)
+// ---------------------------------------------------------------------------
+
+int GroupConsumerHub::drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn)
+{
+    // Kept pending until Stable (a commitSync waits for it; a rejoin or session
+    // loss fails it) and until the transport accepts the OffsetCommit.
+    if (!impl.commitRequested || impl.state != GroupConsumerState::Stable) return 0;
+    impl.commitRequested = false;
+    const bool forSync = impl.commitSyncPromise && impl.commitSyncCorrId == 0;
+    const int64_t corr = forSync ? nextCommitCorrId_++ : 0;
+    const CommitSend r = sendOffsetCommit(impl, sessionId, sendFn, corr);
+    if (r == CommitSend::SendFailed) {
+        impl.commitRequested = true;  // retried next duty cycle (never silently lost)
+        return 0;
+    }
+    if (forSync) {
+        if (r == CommitSend::Sent) {
+            impl.commitSyncCorrId = corr;  // resolved by the matching response
+        } else {
+            // Nothing to commit (no seeded position): done.
+            try { impl.commitSyncPromise->set_value(); } catch (...) {}
+            impl.commitSyncPromise.reset();
+        }
+    }
+    return 1;
+}
+
+int GroupConsumerHub::flushRequestedCommits(int64_t sessionId)
+{
+    int work = 0;
+    for (auto& impl : impls_) {
+        if (impl->active && impl->commitRequested) work += drainCommit_(*impl, sessionId, SendFn{});
+    }
+    return work;
+}
+
+void GroupConsumerHub::onSessionDown()
+{
+    for (auto& impl : impls_) {
+        if (impl->active) {
+            failCommitSync_(*impl, "commitSync() aborted: the session to the broker went down");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

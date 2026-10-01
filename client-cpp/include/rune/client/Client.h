@@ -261,6 +261,10 @@ public:
     void testSetBeforeRegistrationSubmitHook(std::function<void()> fn) {
         testBeforeRegistrationSubmitHook_ = std::move(fn);
     }
+    /// F8a fix2 test hooks (duty thread / owner in Invoker mode only).
+    [[nodiscard]] uint64_t testIngressOfferRefused() const noexcept { return agent_.ingressOfferRefused(); }
+    [[nodiscard]] uint64_t testStaleFramesDropped() const noexcept { return agent_.staleFramesDropped(); }
+    [[nodiscard]] std::size_t testPendingUnsubscribes() const noexcept { return subscriberHub_.pendingUnsubscribes(); }
     /// F8a fix1 test hook: called on the submitting thread each time a
     /// lifecycle hub command (unsubscribe / GroupConsumer close) finds the
     /// command ring full and waits for duty-thread progress.  Set before use.
@@ -628,6 +632,10 @@ private:
     /// submitRegistration_'s bounded back-pressure, plus the same post-submit
     /// close() re-check as producer() (see detail::HubSubmit).
     static detail::HubSubmit hubCommandTrampoline_(void* ctx, const detail::HubCommand& cmd);
+    /// F8a fix2: duty-thread direct send on the default ingress publication.
+    static bool directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
+    /// F8a fix2: last observed seed-session state (duty thread only).
+    session::SessionState lastSeedState_ = session::SessionState::Disconnected;
     /// F8a: apply one hub command on the duty thread (ring drain, close drain,
     /// or directly when a handle is used on the duty thread).
     void applyHubCommand_(const detail::HubCommand& cmd);

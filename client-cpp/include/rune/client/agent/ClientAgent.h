@@ -430,6 +430,19 @@ public:
         txnProducerRegisterFn_ = std::move(fn);
     }
 
+    /// F8a fix2: control frames dropped because their session no longer exists,
+    /// and ring-drained frames the transport refused (each retried later).
+    /// Duty thread only (or after the runner is joined).
+    [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
+    [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
+
+    /// F8a fix2: duty-thread direct send on the default ingress publication
+    /// (the one kMsgSend frames use) — for frames whose owner retries them
+    /// itself instead of going through the ring.  false = refused.
+    bool offerDefault(const uint8_t* buf, std::size_t len) noexcept {
+        return transport_.offer(buf, len);
+    }
+
     /// F8a: hook invoked (duty thread, or close()'s drain) for every drained
     /// kMsgHubCommand.  Set before start().  Cold path (control-plane commands).
     using HubCommandFn = std::function<void(const ::rune::client::detail::HubCommand&)>;
@@ -690,6 +703,10 @@ private:
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
     ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
     HubCommandFn       hubCommandFn_;          // F8a subscriber / group-consumer commands
+    // F8a fix2: duty-thread counters for the kMsgSend drain rule (plain; read
+    // only on the duty thread / after the runner is joined).
+    uint64_t staleFramesDropped_  = 0;
+    uint64_t ingressOfferRefused_ = 0;
 
     // fix3 I1: test-only observability hook for drainRegistrationsForClose()'s
     // wait loop (see testSetCloseDrainYieldHook()). Empty by default.

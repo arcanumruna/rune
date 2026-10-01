@@ -142,6 +142,11 @@ Client::Client(ClientConfig cfg)
     // F8a: subscriber / group-consumer commands from app threads, applied on the
     // duty thread (or by close()'s final drain) by the hub that owns the state.
     agent_.setHubCommandFn([this](const detail::HubCommand& cmd) { applyHubCommand_(cmd); });
+    // F8a fix2: Unsubscribe / OffsetCommit frames go straight to the transport
+    // from the duty thread (retried every duty cycle on refusal), never via the
+    // command ring.
+    subscriberHub_.setDirectSend(&Client::directSendTrampoline_, this);
+    groupConsumerHub_.setDirectSend(&Client::directSendTrampoline_, this);
 
     // MD1 Task 10: Wire the MetadataResponse hook so the cache is populated
     // on the duty-cycle thread without any extra lock.
@@ -687,11 +692,27 @@ int Client::dutyCycle(int64_t nowNs) {
     // 3. Producer drain/flush through AgentProduceSink (no per-cycle std::function).
     work += producerDuty_(nowNs);
 
-    // 3b. F8a fix1 I4: status snapshots a near-full status ring refused —
-    //     retried every cycle while any exist (one branch when none).
-    if ((subscriberHub_.dirtyCount() | groupConsumerHub_.dirtyCount()) != 0) [[unlikely]] {
-        work += subscriberHub_.republishDirty();
-        work += groupConsumerHub_.republishDirty();
+    // 3b. F8a fix1 I4 / fix2: status snapshots a near-full status ring refused,
+    //     Unsubscribes / OffsetCommits the transport refused — retried every
+    //     cycle while any exist (one branch when none; a group consumer's
+    //     commit flags are checked while one is registered — at most one).
+    if (((subscriberHub_.dirtyCount() | groupConsumerHub_.dirtyCount() |
+          subscriberHub_.pendingUnsubscribes()) != 0) || !groupConsumerHub_.empty()) [[unlikely]] {
+        const int64_t sid = agent_.seedSession().machine.sessionId();
+        if (subscriberHub_.dirtyCount() != 0)          work += subscriberHub_.republishDirty();
+        if (groupConsumerHub_.dirtyCount() != 0)       work += groupConsumerHub_.republishDirty();
+        if (subscriberHub_.pendingUnsubscribes() != 0) work += subscriberHub_.retryPendingUnsubscribes(sid);
+        if (!groupConsumerHub_.empty())                work += groupConsumerHub_.flushRequestedCommits(sid);
+    }
+
+    // 3c. F8a fix2 (IM-2): the session-DOWN transition fails pending commitSyncs
+    //     at once (progress-driven: the session machine's own liveness verdict).
+    {
+        const session::SessionState st = agent_.seedSession().machine.state();
+        if (st != lastSeedState_) [[unlikely]] {
+            if (lastSeedState_ == session::SessionState::Connected) groupConsumerHub_.onSessionDown();
+            lastSeedState_ = st;
+        }
     }
 
     // 4. Periodic sweep on the duty-cycle clock.
@@ -947,6 +968,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         return agent_.submitSend(fb, fl);
                     };
                 subscriberHub_.resendPending(newSessionId, subSendFn);
+            } else if (subscriberHub_.hasPending()) {
+                // F8a fix2: a pending Subscribe sent before this session existed
+                // was dropped by the ring drain (stale session) — re-issue every
+                // pending one stamped with the new session.
+                subscriberHub_.resendPending(
+                    opt->assignedSessionId,
+                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                        return agent_.submitSend(fb, fl);
+                    });
             }
 
             // CG-5: Trigger group consumers to send JoinGroup on connect.
@@ -1835,6 +1865,10 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
 // F8a: hubCommandTrampoline_ — the HubCommandSink bound to every handle
 // ---------------------------------------------------------------------------
 
+bool Client::directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
+    return static_cast<Client*>(ctx)->agent_.offerDefault(buf, len);
+}
+
 void Client::applyHubCommand_(const detail::HubCommand& cmd) {
     using Op = detail::HubCommand::Op;
     if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
@@ -1867,9 +1901,13 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     if (self->stopped_.load(std::memory_order_seq_cst)) return detail::HubSubmit::Closed;
 
     // fix1 C1(a): on the duty thread the state is ours — apply directly (never
-    // through the ring, so never blocked by it).  Not GroupSetCallback (it
-    // could replace a running callback) nor the registrations (ring order).
-    if (onDuty && (cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
+    // through the ring, so never blocked by it).  fix2: the registrations
+    // (SubscribeAdd / GroupAdd) too — otherwise a direct Unsubscribe / commit /
+    // close on the owner could OVERTAKE its own still-queued registration and
+    // be applied to a subscription/consumer the hub does not hold yet.  Not
+    // GroupSetCallback (it could replace a running callback): ring order.
+    if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
+                   cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
                    cmd.op == Op::GroupCommit || cmd.op == Op::GroupCommitSync)) {
         self->applyHubCommand_(cmd);
         return detail::HubSubmit::Accepted;

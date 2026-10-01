@@ -464,3 +464,100 @@ TEST(SubscriberHubCommand, AppAndDutyThreadsShareOnlyRingsRegression) {
     EXPECT_EQ(finalPos, delivered.load()) << "final snapshot == last delivered + 1";
     EXPECT_EQ(hub.activeCount(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// F8a fix round 2 — REQUIRED 1: Unsubscribe frames go straight to the
+// transport (direct send) and are retried by the duty cycle when refused.
+// ---------------------------------------------------------------------------
+namespace {
+struct RefusingTransport {
+    int refuseNext = 0;          // refuse this many offers, then accept
+    std::vector<Frame> accepted;
+    static bool fn(void* ctx, const uint8_t* b, std::size_t n) {
+        auto* self = static_cast<RefusingTransport*>(ctx);
+        if (self->refuseNext > 0) { --self->refuseNext; return false; }
+        self->accepted.push_back({std::vector<uint8_t>(b, b + n)});
+        return true;
+    }
+    int unsubscribesFor(int64_t subId) const {
+        int c = 0;
+        for (const auto& f : accepted) {
+            auto u = rc::codec::decodeUnsubscribe(f.bytes.data(), f.bytes.size());
+            if (u && u->subscriptionId == subId) ++c;
+        }
+        return c;
+    }
+};
+} // namespace
+
+TEST(SubscriberHubCommand, RefusedUnsubscribeRetriedNextDutyCycleRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    auto impl = makeImpl(50);
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.onSubscribeResponse(bindRsp(50, 60), 0, kSession, send.fn());
+
+    tx.refuseNext = 2;
+    rcd::HubCommand u;
+    u.op = rcd::HubCommand::Op::Unsubscribe;
+    u.a  = 50;
+    hub.applyCommand(u, 900, kSession, send.fn());
+    EXPECT_TRUE(impl->status.closed()) << "dispatch stops independent of the wire";
+    EXPECT_EQ(hub.pendingUnsubscribes(), 1u);
+    EXPECT_EQ(send.countUnsubscribe(60), 0) << "never via the command ring";
+
+    std::vector<uint8_t> st;
+    int before = 0;
+    impl->handler = [&](const rc::Record&) { ++before; };
+    hub.onRecords(records(st, 60, 0, 2));
+    EXPECT_EQ(before, 0) << "a pending-unsubscribe entry never dispatches";
+
+    EXPECT_EQ(hub.retryPendingUnsubscribes(kSession), 0);  // refused again
+    EXPECT_EQ(hub.retryPendingUnsubscribes(kSession), 1);
+    EXPECT_EQ(tx.unsubscribesFor(60), 1);
+    EXPECT_EQ(hub.pendingUnsubscribes(), 0u);
+    EXPECT_EQ(hub.activeCount(), 0u);
+}
+
+TEST(SubscriberHubCommand, PendingUnsubscribeDroppedWhenTheSessionChangesRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    auto impl = makeImpl(51);
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.onSubscribeResponse(bindRsp(51, 61), 0, kSession, send.fn());
+    tx.refuseNext = 1;
+    rcd::HubCommand u;
+    u.op = rcd::HubCommand::Op::Unsubscribe;
+    u.a  = 51;
+    hub.applyCommand(u, 901, kSession, send.fn());
+    ASSERT_EQ(hub.pendingUnsubscribes(), 1u);
+    hub.retryPendingUnsubscribes(kSession + 1);  // a new session: the old one is gone
+    EXPECT_EQ(hub.pendingUnsubscribes(), 0u);
+    EXPECT_EQ(hub.unsubscribesDropped(), 1u);
+    EXPECT_EQ(tx.unsubscribesFor(61), 0) << "never sent under a session it does not belong to";
+    EXPECT_EQ(hub.activeCount(), 0u);
+}
+
+// The late-response (CB-5 A2) Unsubscribe gets the same direct send + retry.
+TEST(SubscriberHubCommand, LateResponseUnsubscribeRetriedWhenRefusedRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    RefusingTransport tx;
+    hub.setDirectSend(&RefusingTransport::fn, &tx);
+    auto impl = makeImpl(52);
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    rcd::HubCommand u;
+    u.op = rcd::HubCommand::Op::Unsubscribe;
+    u.a  = 52;
+    hub.applyCommand(u, 902, kSession, send.fn());  // still pending: no frame yet
+    tx.refuseNext = 1;
+    hub.onSubscribeResponse(bindRsp(52, 62), 903, kSession, send.fn());
+    EXPECT_EQ(hub.pendingUnsubscribes(), 1u);
+    EXPECT_EQ(hub.retryPendingUnsubscribes(kSession), 1);
+    EXPECT_EQ(tx.unsubscribesFor(62), 1);
+    EXPECT_EQ(hub.activeCount(), 0u);
+}

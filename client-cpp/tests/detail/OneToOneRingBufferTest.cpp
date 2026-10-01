@@ -161,19 +161,27 @@ TEST(OneToOneRingBuffer, OversizedMessageThrows) {
 TEST(OneToOneRingBuffer, TwoThreadSpscDeliversEverythingInOrder) {
     Ring r(4096);
     constexpr uint32_t kN = 50'000;
+    // M1: both loops are iteration-capped — a broken ring FAILS, never hangs.
+    constexpr long kMaxIdlePolls = 50'000'000;
+    std::atomic<bool> giveUp{false};  // harness flag only
+    bool producerCapped = false;      // producer thread only (read after join)
     std::thread producer([&] {
-        for (uint32_t i = 0; i < kN;) {
+        long idle = 0;
+        for (uint32_t i = 0; i < kN && !giveUp.load(std::memory_order_relaxed);) {
             const bool ok = r.ring.writeWith(
                 kMsgTypeId, sizeof(uint32_t),
                 [&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t at) {
                     std::memcpy(b.buffer() + at, &i, sizeof i);
                 });
-            if (ok) ++i; else std::this_thread::yield();
+            if (ok) { ++i; idle = 0; continue; }
+            if (++idle > kMaxIdlePolls) { producerCapped = true; break; }
+            std::this_thread::yield();
         }
         r.ring.producerClose();
     });
     uint32_t expected = 0;
     bool inOrder = true;
+    long idle = 0;
     while (expected < kN) {
         const int n = r.ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& b,
                                       aeron::util::index_t off, aeron::util::index_t) {
@@ -182,9 +190,14 @@ TEST(OneToOneRingBuffer, TwoThreadSpscDeliversEverythingInOrder) {
             if (v != expected) inOrder = false;
             ++expected;
         });
-        if (n == 0) std::this_thread::yield();
+        if (n > 0) { idle = 0; continue; }
+        if (++idle > kMaxIdlePolls) break;
+        std::this_thread::yield();
     }
+    giveUp.store(true, std::memory_order_relaxed);
     producer.join();
+    ASSERT_FALSE(producerCapped) << "producer made no progress for " << kMaxIdlePolls << " attempts";
+    ASSERT_EQ(expected, kN) << "consumer made no progress for " << kMaxIdlePolls << " polls";
     EXPECT_TRUE(inOrder);
     EXPECT_TRUE(r.ring.producerClosed());
     EXPECT_EQ(r.ring.size(), 0);

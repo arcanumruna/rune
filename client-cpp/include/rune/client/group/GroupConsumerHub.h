@@ -117,6 +117,20 @@ public:
     /// Deactivate all consumers (send LeaveGroup where possible + fire onRevoked).
     void closeAll(int64_t sessionId, const SendFn& sendFn);
 
+    /// F8a fix2: duty-thread direct send on the default ingress publication for
+    /// OffsetCommit frames (plain fn pointer + ctx, set once before start).
+    using DirectSendFn = bool (*)(void* ctx, const uint8_t* buf, std::size_t len);
+    void setDirectSend(DirectSendFn fn, void* ctx) noexcept { directSend_ = fn; directSendCtx_ = ctx; }
+
+    /// F8a fix2: send every requested commit now (duty cycle; a refused offer
+    /// keeps commitRequested set and is retried next cycle).  Requires the
+    /// direct send to be wired.
+    int flushRequestedCommits(int64_t sessionId);
+
+    /// F8a fix2 (IM-2): the session went down (Connected -> anything else):
+    /// fail every pending commitSync now — progress-driven, no timeout.
+    void onSessionDown();
+
     /// fix1 I4: consumers whose generation snapshot a near-full status ring
     /// refused; the duty cycle calls republishDirty() while non-zero.
     [[nodiscard]] std::size_t dirtyCount() const noexcept { return dirtyCount_; }
@@ -150,6 +164,9 @@ private:
     int64_t nextCommitCorrId_ = 1;
     // F8a fix1 I4.
     std::size_t dirtyCount_ = 0;
+    // F8a fix2.
+    DirectSendFn directSend_    = nullptr;
+    void*        directSendCtx_ = nullptr;
 
     /// RAII: marks impl as "callback running"; on exit, if the callback
     /// finished the consumer, closes its status ring (now that no callback runs).
@@ -166,6 +183,7 @@ private:
     enum class CommitSend : uint8_t { Nothing, Sent, SendFailed };
 
     static void failCommitSync_(GroupConsumerImpl& impl, const char* why);
+    int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     static void closeStatus_(GroupConsumerImpl& impl);
     void toRejoining_(GroupConsumerImpl& impl);
     void publishGeneration_(GroupConsumerImpl& impl);
@@ -189,7 +207,7 @@ private:
 
     /// Send OffsetCommit for impl's current positions (skips unseeded sentinel
     /// entries) carrying `correlationId` (0 = no commitSync waits on it).
-    static CommitSend sendOffsetCommit(GroupConsumerImpl& impl,
+    CommitSend sendOffsetCommit(GroupConsumerImpl& impl,
                                        int64_t sessionId,
                                        const SendFn& sendFn,
                                        int64_t correlationId);

@@ -131,11 +131,19 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
                                  const SendFn&             submitFn)
 {
     switch (cmd.op) {
-    case detail::HubCommand::Op::SubscribeAdd:
-        adoptSubscribe(std::unique_ptr<SubscribeRequest>(
-                           reinterpret_cast<SubscribeRequest*>(cmd.handle)),
-                       submitFn);
+    case detail::HubCommand::Op::SubscribeAdd: {
+        std::unique_ptr<SubscribeRequest> req(reinterpret_cast<SubscribeRequest*>(cmd.handle));
+        // F8a fix2: stamp the frame with the CURRENT session (the app thread's
+        // snapshot may be stale); a frame of a dead session is dropped by the
+        // ring drain, and pending subscribes are re-sent on every connect.
+        if (req && req->subscribeFrame.size() >= 16) {
+            const auto u = static_cast<uint64_t>(sessionId);
+            for (int i = 0; i < 8; ++i)
+                req->subscribeFrame[8 + i] = static_cast<uint8_t>(u >> (i * 8));
+        }
+        adoptSubscribe(std::move(req), submitFn);
         break;
+    }
     case detail::HubCommand::Op::Unsubscribe:
         unsubscribe(cmd.a, unsubCorrId, sessionId, submitFn);
         break;
@@ -174,31 +182,78 @@ void SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
     // finish it for the app now.
     if (auto pit = pendingByCorrelation_.find(subscribeCorrId);
         pit != pendingByCorrelation_.end()) {
-        if (pit->second->impl) finish_(*pit->second->impl);
+        if (pit->second->impl) {
+            pit->second->impl->unsubCorrId = unsubCorrId;  // used by the late Unsubscribe
+            finish_(*pit->second->impl);
+        }
         return;
     }
 
     // Bound: find it by its correlationId (cold path; a handful of entries).
     for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
         if (it->second->correlationId != subscribeCorrId) continue;
-        if (!it->second->active) return;  // already unsubscribed (erase deferred)
-        const int64_t subId = it->first;
-        const bool running = it->second.get() == dispatching_;
-        finish_(*it->second);
+        if (!it->second->active) return;  // already unsubscribed (erase deferred / pending)
+        SubscriptionImpl& impl = *it->second;
+        const bool running = &impl == dispatching_;
+        finish_(impl);
+        // F8a fix2: the Unsubscribe goes straight to the transport from this
+        // (duty) thread; if refused, the entry stays (active=false,
+        // unsubPending) and the duty cycle retries it — never dropped.
+        impl.unsubCorrId    = unsubCorrId;
+        impl.unsubSessionId = sessionId;
+        const bool sent = trySendUnsubscribe_(impl, submitFn);
+        if (!sent) markUnsubPending_(impl);
         // Its handler is running (it unsubscribed itself): onRecords erases the
         // entry after the handler returns — erasing now could free the
         // std::function mid-call.
-        if (!running) activeById_.erase(it);
-
-        uint8_t frameBuf[64]{};
-        const std::size_t frameLen = codec::encodeUnsubscribe(
-            frameBuf, sizeof(frameBuf), subId, sessionId, unsubCorrId);
-        if (frameLen > 0 && submitFn) {
-            (void)submitFn(0, frameBuf, frameLen);
-        }
+        if (sent && !running) activeById_.erase(it);
         return;
     }
     // Unknown: already finished (timed out / failed / A2) — nothing to do.
+}
+
+bool SubscriberHub::trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn)
+{
+    uint8_t frameBuf[64]{};
+    const std::size_t frameLen = codec::encodeUnsubscribe(
+        frameBuf, sizeof(frameBuf), impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId);
+    if (frameLen == 0) return true;  // cannot encode: nothing to retry
+    if (directSend_ != nullptr) return directSend_(directSendCtx_, frameBuf, frameLen);
+    return submitFn ? submitFn(0, frameBuf, frameLen) : true;
+}
+
+void SubscriberHub::markUnsubPending_(SubscriptionImpl& impl) noexcept
+{
+    if (impl.unsubPending) return;
+    impl.unsubPending = true;
+    ++pendingUnsubCount_;
+}
+
+int SubscriberHub::retryPendingUnsubscribes(int64_t currentSessionId)
+{
+    int sent = 0;
+    for (auto it = activeById_.begin(); it != activeById_.end() && pendingUnsubCount_ != 0; ) {
+        SubscriptionImpl& impl = *it->second;
+        if (!impl.unsubPending || &impl == dispatching_) { ++it; continue; }
+        if (impl.unsubSessionId != currentSessionId) {
+            // Its session is gone: the broker dropped the subscription with it.
+            ++unsubscribesDropped_;
+            std::fprintf(stderr,
+                "rune-client: pending Unsubscribe for subscription %lld dropped: session %lld "
+                "no longer exists\n",
+                static_cast<long long>(impl.subscriptionId),
+                static_cast<long long>(impl.unsubSessionId));
+        } else if (!trySendUnsubscribe_(impl, SendFn{})) {
+            ++it;
+            continue;
+        } else {
+            ++sent;
+        }
+        impl.unsubPending = false;
+        --pendingUnsubCount_;
+        it = activeById_.erase(it);
+    }
+    return sent;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,16 +279,13 @@ void SubscriberHub::onSubscribeResponse(
 
     if (!impl->active) {
         // CB-5 A2 FIX: unsubscribe() ran before SubscribeResponse arrived.  Now
-        // that we know the real id, send a proper Unsubscribe.  Do NOT insert
-        // into activeById_ — the impl is already logically dead (its status
-        // ring was closed by unsubscribe()).
-        if (submitFn) {
-            uint8_t frameBuf[64]{};
-            const std::size_t frameLen = codec::encodeUnsubscribe(
-                frameBuf, sizeof(frameBuf), rsp.subscriptionId, sessionId, unsubCorrId);
-            if (frameLen > 0) {
-                (void)submitFn(0, frameBuf, frameLen);
-            }
+        // that we know the real id, send a proper Unsubscribe (direct, with
+        // duty-cycle retry: an inactive entry is kept only while it is pending).
+        if (impl->unsubCorrId == 0) impl->unsubCorrId = unsubCorrId;
+        impl->unsubSessionId = sessionId;
+        if (!trySendUnsubscribe_(*impl, submitFn)) {
+            markUnsubPending_(*impl);
+            activeById_.emplace(rsp.subscriptionId, std::move(impl));  // cold path
         }
         return;
     }
@@ -312,7 +364,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
         // publish the final snapshot, close the ring, and drop the entry (this
         // may free impl — nothing below touches it).
         closeStatus_(impl);
-        activeById_.erase(it);
+        if (!impl.unsubPending) activeById_.erase(it);  // pending: the retry erases it
         return;
     }
     // One status snapshot per Records frame (not per record).
@@ -333,6 +385,7 @@ void SubscriberHub::deactivateAll()
     }
     pendingByCorrelation_.clear();
     activeById_.clear();
+    pendingUnsubCount_ = 0;  // their sessions end with the Client
 }
 
 // ---------------------------------------------------------------------------
