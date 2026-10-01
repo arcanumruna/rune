@@ -1065,3 +1065,52 @@ TEST(ThreeNodeDefaultConfigBatchLimitRegression, BatchAtExactLimitIsAcceptedRepl
 TEST(SingleNodeDefaultConfigBatchLimitRegression, BatchAtExactLimitIsAcceptedAndPushed) {
     runBatchAtExactLimitAcceptedReplicatedAndPushed(1);
 }
+
+// Task 13 (spec §3.4): the produce ack comes from the WORKER's own publication to
+// the client session (announced before ConnectResponse), not relayed by the
+// runtime; a session closed by Disconnect is forgotten and a new one is
+// announced and acked.  Real client ↔ real broker over UDP, fused placement.
+TEST(ShardModeRegression, WorkerSideAcksEndToEndAndSessionReconnect) {
+    TmpDir dir{"wsa"}, cdir{"wsac"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true)};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid1 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid1, 0);
+        auto ack1 = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid1, 0, 0, 1, makeBatch(2));
+        ASSERT_TRUE(ack1.has_value());
+        EXPECT_NE(c.ackImageSessionId(ack1->correlationId), 0);
+        EXPECT_NE(c.ackImageSessionId(ack1->correlationId), c.connectImageSessionId())
+            << "the ack must arrive on the worker's own publication, not the runtime's session publication";
+        ASSERT_TRUE(c.disconnect(gatewayChannel(ports, 0), kClientStream, sid1));
+        const int64_t sid2 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid2, 0);
+        ASSERT_NE(sid2, sid1);
+        auto ack2 = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid2, 0, 0, 1, makeBatch(2));
+        ASSERT_TRUE(ack2.has_value()) << "a new session is announced and acked by the worker after the old one closed";
+        EXPECT_NE(c.ackImageSessionId(ack2->correlationId), c.connectImageSessionId());
+    }
+    node.stop();
+}
+
+// Thread placement + 2 workers: the runtime on its own thread announces to EVERY
+// worker over the cross-thread rings before it accepts the session.
+TEST(ShardModeRegression, WorkerSideAcksEndToEndThreadPlacement) {
+    TmpDir dir{"wsat"}, cdir{"wsatc"};
+    const auto ports = ShardPorts::discover(1, 2);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 2, /*fused=*/false)};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid, 0);
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(4));
+        ASSERT_TRUE(ack.has_value());
+        EXPECT_NE(c.ackImageSessionId(ack->correlationId), c.connectImageSessionId());
+    }
+    node.stop();
+}

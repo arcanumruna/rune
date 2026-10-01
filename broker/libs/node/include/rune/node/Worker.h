@@ -69,6 +69,7 @@
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/RcState.h>
 #include <rune/node/ReturnFifo.h>
+#include <rune/node/SessionAckSink.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/detail/NoTypeErasure.h>
 #include <rune/node/WorkerReturnCodec.h>
@@ -546,6 +547,30 @@ public:
     [[nodiscard]] bool shardMode() const noexcept { return shardMode_; }
 
     // -----------------------------------------------------------------------
+    // Task 13 (spec §3.4): worker-side produce acks.  In shard mode the worker
+    // acks clients on its OWN exclusive publications (SessionAckSink), created
+    // on its own invoker client from the runtime's SessionAnnounce ops; every
+    // ProduceResult ANSWER goes there instead of ret_, and a post-ack facts-only
+    // notification (PSM-mirror facts + session liveness) goes to ret_.
+    // setShardClient: before the runner starts.  releaseShardClient: after the
+    // runner joined and BEFORE the client is closed (the publications release
+    // through the client's conductor).  The sink is heap-allocated once (cold):
+    // ~0.9 MiB of fixed tables must not live on a thread stack.
+    // -----------------------------------------------------------------------
+    void setShardClient(aeron::Aeron* client) {
+        ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client}) : nullptr;
+    }
+    void releaseShardClient() noexcept { ackSink_.reset(); }
+    [[nodiscard]] bool workerSideAcks() const noexcept { return ackSink_ != nullptr; }
+    [[nodiscard]] uint64_t sessionAnnouncesSeenForTest() const noexcept { return sessionAnnouncesSeen_; }
+    [[nodiscard]] uint64_t sessionClosesSeenForTest() const noexcept { return sessionClosesSeen_; }
+    /// Acks dropped by the sink (closed / failed / stalled sessions).
+    [[nodiscard]] uint64_t sessionAcksDroppedForTest() const noexcept { return ackSink_ ? ackSink_->droppedForTest() : 0; }
+    [[nodiscard]] std::size_t sessionAcksPendingForTest() const noexcept { return ackSink_ ? ackSink_->pending() : 0; }
+    /// Test seam: write one return straight to ret_ (false = ring full).
+    bool injectReturnForTest(const WorkerReturn& r) { return tryWriteReturn_(r); }
+
+    // -----------------------------------------------------------------------
     // E5.1.2d: per-worker ingress produce path.
     //
     // setWorkerIngress — wire up a WorkerIngress and (optionally) activate the
@@ -806,6 +831,12 @@ public:
             tailSrc  = op.schemaUpdateBlob.data();
             tailLen  = op.schemaUpdateBlob.size();
             break;
+        case WorkerOp::Type::SessionAnnounce:
+            // Task 13: the client session's egress channel (view, copied once).
+            tailKind = sbe::TailKind::Value::EGRESS_CHANNEL;
+            tailSrc  = reinterpret_cast<const uint8_t*>(op.egressChannel.data());
+            tailLen  = op.egressChannel.size();
+            break;
         default:
             break;  // NONE tail
         }
@@ -874,6 +905,7 @@ public:
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
            .oleFollowerLeo(static_cast<std::int64_t>(op.offsEpochReqPayload.followerLeo))
            .egressPub(reinterpret_cast<std::uint64_t>(op.egressPub))
+           .egressStreamId(op.egressStreamId)
            // Task 10 round 4: identity comes from the op (stamped from a registry
            // lookup at routing time) — never read through op.replica here.
            .targetReplicaId(op.targetReplicaId)
@@ -1246,11 +1278,21 @@ private:
         // 2b. runtime→worker ring first: ownership / role changes (and, Task 13,
         //     session announcements) must be applied before the intake they govern.
         work += static_cast<int>(drainIngress_());
+        // Task 13 (announce-before-accept, spec §3.4): a client's first Produce
+        // can only follow its ConnectResponse, which the runtime sends AFTER
+        // queueing the session's announcement on this ring — so with the ring
+        // empty, every announcement a polled frame can depend on is applied.  A
+        // ring read stops at the buffer's wrap point: one more read covers it.
+        // Ops still pending (drain limit / high-water pause / a runtime enqueue
+        // racing this check) → skip this pass's poll (never a wait; the next
+        // pass drains first).
+        if (ackSink_ && !ingress_.empty()) work += static_cast<int>(drainIngress_());
+        const bool opsCaughtUp = !ackSink_ || ingress_.empty();
         // 3. client ingress → append (G-A6 gate unchanged).
         work += flushRetFifo_();
         // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
         // into ret_ later: reserve for every one of them (G-A6, never drop).
-        if (retFifo_.empty() &&
+        if (opsCaughtUp && retFifo_.empty() &&
             ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
             work += pollWorkerIngress_(nowNs);
         }
@@ -1289,6 +1331,10 @@ private:
         }
         work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
         work += flushPendingSignals_();
+        // Task 13 (spec §3.4): claim EVERY ack due this pass — appends, HW fires,
+        // fsync completions, failures — on its session's own publication, last,
+        // so the next driver duty cycle ships each session's acks together.
+        if (ackSink_) work += ackSink_->flush(nowNs);
         return work;
     }
 
@@ -1311,12 +1357,55 @@ private:
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
     void enqueueReturn_(const WorkerReturn& ret) {
+        if (ackSink_ && ret.type == WorkerReturn::Type::ProduceResult && !ret.deferAck) {
+            emitProduceAck_(ret);   // Task 13: worker-side ack + post-ack notification
+            return;
+        }
+        enqueueToRuntime_(ret);
+    }
+    void enqueueReturn_(WorkerReturn&& ret) {
+        if (ackSink_ && ret.type == WorkerReturn::Type::ProduceResult && !ret.deferAck) {
+            emitProduceAck_(ret);
+            return;
+        }
+        if (retFifo_.empty() && tryWriteReturn_(ret)) [[likely]] return;
+        if (!retFifo_.push(std::move(ret))) [[unlikely]] haltRetFifoFull_();
+    }
+    void enqueueToRuntime_(const WorkerReturn& ret) {
         if (retFifo_.empty() && tryWriteReturn_(ret)) [[likely]] return;
         if (!retFifo_.push(ret)) [[unlikely]] haltRetFifoFull_();
     }
-    void enqueueReturn_(WorkerReturn&& ret) {
-        if (retFifo_.empty() && tryWriteReturn_(ret)) [[likely]] return;
-        if (!retFifo_.push(std::move(ret))) [[unlikely]] haltRetFifoFull_();
+
+    // -----------------------------------------------------------------------
+    // Task 13 (spec §3.4): every ProduceResult ANSWER, in shard mode with
+    // worker-side acks (ackSink_ engaged), takes this path — whatever produced
+    // it (append, HW fire, §3.2 fail, fsync completion / failure, ownership
+    // purge, refusal).  1. the ack is queued on the session's own publication,
+    // claimed in this pass's flush (coalesced per session, before the next
+    // driver duty cycle);  2. AFTER it, a fire-and-forget notification goes to
+    // the runtime on the one return FIFO (never dropped, never delaying an
+    // ack): the facts-only ProduceResult of F15 S2 (deferAck == true — PSM-
+    // mirror facts of a successful append, and the session's liveness, which
+    // shard-mode produces no longer refresh on the runtime).  An error carries
+    // no facts (producerId -1).  WorkerReturn PRODUCE_NOTIFY stays retired
+    // (F15 §7).  Reservation: the notification takes exactly the ret_ slot the
+    // relayed answer took before (kMaxReturnsPerOp unchanged); the ack queue is
+    // bounded by the same static bound (static_assert below) and gated by the
+    // poll budget + op-drain high water.  A full queue is an invariant halt.
+    // -----------------------------------------------------------------------
+    void emitProduceAck_(const WorkerReturn& ret) {
+        const bool ok = ret.errorCode == 0;
+        if (!ackSink_->enqueue(AckEntry{ret.sessionId, ret.correlationId, ok ? ret.baseOffset : 0,
+                                        ret.partition, ret.errorCode})) [[unlikely]]
+            haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
+        WorkerReturn n = ret;
+        n.deferAck = true;            // facts only — never an answer
+        if (!ok) {
+            n.errorCode  = 0;         // the facts-only invariant: deferAck ⇒ errorCode 0 …
+            n.producerId = -1;        // … and an error carries no facts
+            n.batchAttrs = 0;
+        }
+        enqueueToRuntime_(n);
     }
     void enqueueTxnReturn_(const TxnReturn& r) {
         if (retFifo_.empty() && tryWriteTxnReturn_(r)) return;
@@ -1584,9 +1673,13 @@ private:
         // the control thread drains ret_ every cycle and never waits on an op
         // ring, so the FIFO always flushes (no deadlock).
         int limit = ingressDrainLimit_;
+        // Task 13: with worker-side acks, acks held on back-pressured session
+        // publications count as backlog too (each op answers at most once, into
+        // either queue) — the same high-water gate bounds both.
+        const std::size_t backlogNow = returnBacklog_();
         // Re-review 2 B-2: hysteresis — the episode ends only at low water.
-        if (retFifoPaused_ && retFifo_.size() <= kOverflowLowWater) [[unlikely]] leaveRetFifoPause_();
-        if (const std::size_t backlog = retFifo_.size(); backlog != 0) [[unlikely]] {
+        if (retFifoPaused_ && backlogNow <= kOverflowLowWater) [[unlikely]] leaveRetFifoPause_();
+        if (const std::size_t backlog = backlogNow; backlog != 0) [[unlikely]] {
             if (backlog >= kOverflowHighWater) {
                 ++retFifoHighWaterPauses_;
                 if (!retFifoPaused_) [[unlikely]] enterRetFifoPause_(backlog);
@@ -1705,6 +1798,33 @@ private:
         case WorkerOp::Type::TestTask:
             executeTestTaskWire_(op);
             break;
+        // Task 13 (spec §3.4): session lifecycle from the runtime (cold).
+        case WorkerOp::Type::SessionAnnounce:
+            executeSessionAnnounceWire_(op);
+            break;
+        case WorkerOp::Type::SessionClose:
+            ++sessionClosesSeen_;
+            if (ackSink_) ackSink_->close(op.sessionId());
+            break;
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Task 13: SessionAnnounce — remember the session's reply destination; the
+    // sink adds this worker's own exclusive publication on its next flush.
+    // Workers without worker-side acks (legacy, unit rigs) only count it.
+    // -------------------------------------------------------------------
+    [[gnu::cold]] void executeSessionAnnounceWire_(sbe::WorkerOp& op) {
+        ++sessionAnnouncesSeen_;
+        const int64_t sid       = op.sessionId();
+        const int32_t stream    = op.egressStreamId();
+        const std::uint32_t len = op.tailLength();
+        const char* p           = op.tail();
+        if (!ackSink_) return;
+        if (!ackSink_->announce(sid, std::string_view(p, len), stream)) [[unlikely]] {
+            spdlog::warn("Worker {}: session {} announcement refused (session table full ({}) or channel "
+                         "{} B > {}) — its acks are dropped", workerId_, sid, ackSink_->sessionCount(), len,
+                         SessionAckSink::kMaxChannelBytes);
         }
     }
 
@@ -2030,6 +2150,42 @@ private:
     }
 
     // -------------------------------------------------------------------
+    // Task 7 per-worker schema validation (shared by both produce paths).
+    // HARD RULE 4 (zero hot-path alloc): validators_ was built off-hot-path by
+    // executeSchemaUpdateWire_; validate() runs on a zero-copy span.  I1 fast-
+    // out: no validator ever installed → one load + one predicted branch.
+    // HARD RULE 5: concrete calls; HARD RULE 1: validators_ is worker-owned.
+    // True = reject the batch (SchemaValidationFailed, never appended).
+    // -------------------------------------------------------------------
+    [[nodiscard]] bool schemaRejects_(int32_t topicId, const uint8_t* tail, std::size_t tailLen) const {
+        if (validators_.empty()) [[likely]] return false;
+        auto it = validators_.find(topicId);
+        if (it == validators_.end()) return false;
+        const rune::codec::Validator& v = it->second;
+        if (tailLen < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
+            return true;   // batch too short to parse header — malformed
+        bool validationFailed = false;
+        rune::protocol::RecordBatchReader rdr(tail, tailLen);
+        // Task 11 fix 3 (B4, HARD RULE #4): templated record visitor — inlined,
+        // no std::function per record.  The NoTypeErasure capture makes the
+        // visitor move-only, so a regression to the type-erased forEach() fails
+        // to COMPILE.
+        rdr.forEachRecord([&, guard = detail::NoTypeErasure{}](std::string_view /*key*/,
+                                                              std::string_view val,
+                                                              int64_t /*offset*/,
+                                                              int64_t /*ts*/) {
+            if (validationFailed) return;
+            const rune::codec::ValResult res = v.validate(
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+            if (!res.ok) validationFailed = true;
+        });
+        if (validationFailed)
+            spdlog::debug("Worker {}: schema validation FAILED for topicId={}; rejecting produce",
+                          workerId_, topicId);
+        return validationFailed;
+    }
+
+    // -------------------------------------------------------------------
     // executeProduceWire_ — append the batch to the owning Log and update
     // the replica's tracked LEO/HW via onLeaderLogAppended().
     //
@@ -2045,6 +2201,30 @@ private:
     void executeProduceWire_(sbe::WorkerOp& op) {
         RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerAppend,
                              static_cast<uint32_t>(op.correlationId()));
+        // Task 13 (spec §3.4): with worker-side acks (shard mode) a gateway-
+        // received user produce joins the ONE produce path of the shard — the
+        // worker psm_ validates it (the runtime no longer does) and the answer
+        // is acked on the session's own publication like a worker-ingress one.
+        if (ackSink_) {
+            ProduceFields f;
+            f.sessionId     = op.sessionId();
+            f.correlationId = op.correlationId();
+            f.producerId    = op.producerId();
+            f.topicId       = op.topicId();
+            f.partition     = op.partition();
+            f.baseSequence  = op.baseSequence();
+            f.minIsr        = op.minIsr();
+            f.producerEpoch = op.producerEpoch();
+            auto* rep       = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+            f.acksAll       = op.deferAck() != 0 && rep != nullptr;
+            f.fromOp        = true;
+            const std::uint32_t tl = op.tailLength();
+            const char* tp = op.tail();
+            (void)produceCore_(f, getLogFromWire_(op), rep,
+                               std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(tp), tl),
+                               passNowNs_);
+            return;
+        }
         const int32_t topicId   = op.topicId();
         const int32_t partition = op.partition();
         WorkerReturn ret;
@@ -2181,44 +2361,11 @@ private:
         // reduces the default produce path to one integer load + one
         // well-predicted branch; the hash+bucket+pointer-chase is paid only when
         // at least one schema has been pushed to this worker.
-        if (!validators_.empty()) [[unlikely]] {
-            auto it = validators_.find(topicId);
-            if (it != validators_.end()) [[unlikely]] {
-                const rune::codec::Validator& v = it->second;
-                bool validationFailed = false;
-                if (tailLen >= static_cast<uint32_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-                    rune::protocol::RecordBatchReader rdr(tail, static_cast<std::size_t>(tailLen));
-                    // Task 11 fix 3 (B4, HARD RULE #4): templated record visitor —
-                    // inlined, no std::function per record.  The NoTypeErasure
-                    // capture makes the visitor move-only, so a regression to the
-                    // type-erased forEach() fails to COMPILE.
-                    rdr.forEachRecord([&, guard = detail::NoTypeErasure{}](std::string_view /*key*/,
-                                    std::string_view val,
-                                    int64_t /*offset*/,
-                                    int64_t /*ts*/) {
-                        if (validationFailed) return;
-                        const rune::codec::ValResult res = v.validate(
-                            std::span<const uint8_t>(
-                                reinterpret_cast<const uint8_t*>(val.data()),
-                                val.size()));
-                        if (!res.ok) {
-                            validationFailed = true;
-                        }
-                    });
-                } else {
-                    // Batch too short to parse header — reject as malformed.
-                    validationFailed = true;
-                }
-                if (validationFailed) {
-                    spdlog::debug("Worker {}: schema validation FAILED for "
-                                  "topicId={} partition={}; rejecting produce",
-                                  workerId_, topicId, partition);
-                    ret.errorCode = static_cast<int16_t>(
-                        rune::protocol::client::ErrorCode::SchemaValidationFailed);
-                    enqueueReturn_(ret);
-                    return;
-                }
-            }
+        if (schemaRejects_(topicId, tail, tailLen)) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(
+                rune::protocol::client::ErrorCode::SchemaValidationFailed);
+            enqueueReturn_(ret);
+            return;
         }
         // ── end Task 7 validation hook ─────────────────────────────────────
 
@@ -3332,6 +3479,13 @@ private:
     // before the AgentRunner starts.  Read-only at runtime (single writer).
     int  coreId_ = -1;
     bool shardMode_ = false;   // spec §3.1: set before the runner starts, then read-only
+    // Task 13 (spec §3.4): worker-side acks — engaged iff shard mode with this
+    // worker's own client (setShardClient).  Worker-thread only once running.
+    std::unique_ptr<SessionAckSink> ackSink_;
+    static_assert(SessionAckSink::kAckCapacity >= kRetFifoBound,
+                  "Task 13 G-A6: the session ack queue must hold the same static bound as the return FIFO");
+    uint64_t sessionAnnouncesSeen_ = 0;
+    uint64_t sessionClosesSeen_    = 0;
 
     // E4: true after the one-shot self-pin attempt fires in doWork.
     // Prevents repeated pin attempts on every doWork call.
@@ -4687,7 +4841,17 @@ private:
         const int64_t ringRoom  = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
         const int64_t capRoom   = static_cast<int64_t>(maxOwedReturns_) > owed
                                       ? static_cast<int64_t>(maxOwedReturns_) - owed : 0;
-        return std::min({static_cast<int64_t>(desiredFragmentLimit_), ringRoom, capRoom});
+        // Task 13: every polled frame answers into the session ack queue and
+        // every owed waiter fires into it later — reserve for both (G-A6).
+        const int64_t ackRoom   = ackSink_ ? std::max<int64_t>(0, static_cast<int64_t>(ackSink_->freeAckSlots()) - owed)
+                                           : ringRoom;
+        return std::min({static_cast<int64_t>(desiredFragmentLimit_), ringRoom, capRoom, ackRoom});
+    }
+    // Task 13: the larger of the two answer backlogs (return FIFO; acks held on
+    // back-pressured session publications) — what the op-drain high water gates.
+    [[nodiscard]] std::size_t returnBacklog_() const noexcept {
+        const std::size_t acks = ackSink_ ? ackSink_->pending() : 0;
+        return retFifo_.size() > acks ? retFifo_.size() : acks;
     }
 
     int pollWorkerIngress_(int64_t nowNs) {
@@ -4743,16 +4907,59 @@ private:
         // Look up the owned Log + replica for this partition.
         auto [log, replica] = getLogAndReplicaForPartition_(msg.topicId, msg.partition);
 
+        // E5.1.3 review fix #3: acksAll = (acks != 0).
+        // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.
+        // Using acks != 0 is safer than acks == 1 (the gateway's rule) because
+        // it covers any non-zero acks field including potential future extension
+        // values, preventing silent false-durability on unknown acks values.
+        ProduceFields f;
+        f.sessionId     = msg.sessionId;
+        f.correlationId = msg.correlationId;
+        f.producerId    = msg.producerId;
+        f.topicId       = msg.topicId;
+        f.partition     = msg.partition;
+        f.baseSequence  = msg.baseSequence;
+        f.producerEpoch = msg.producerEpoch;
+        f.acksAll       = (msg.acks != 0);
+        f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
+        return produceCore_(f, log, replica, msg.recordBatch, nowNs);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 13 (spec §3.4): THE produce path of a worker shard — worker-ingress
+    // frames AND, with worker-side acks, gateway-received user produces
+    // (executeProduceWire_).  The worker psm_ is the single idempotency owner
+    // (validate → append → update in handleProduceBatch): the runtime no longer
+    // consults its mirror for user partitions in shard mode.
+    // -----------------------------------------------------------------------
+    struct ProduceFields {
+        int64_t sessionId     = 0;
+        int64_t correlationId = 0;
+        int64_t producerId    = -1;
+        int32_t topicId       = 0;
+        int32_t partition     = 0;
+        int32_t baseSequence  = 0;
+        int32_t minIsr        = 0;      ///< admission policy override (0 = the replica's)
+        int16_t producerEpoch = 0;
+        bool    acksAll       = false;
+        bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
+    };
+
+    int produceCore_(const ProduceFields& f, rune::storage::Log* log,
+                     rune::replication::PartitionReplica* replica,
+                     std::span<const uint8_t> rbSpan, int64_t nowNs) {
+        namespace pc = rune::protocol::client;
+
         // Build a WorkerReturn shell for this ack.
         WorkerReturn ret;
         ret.type          = WorkerReturn::Type::ProduceResult;
-        ret.sessionId     = msg.sessionId;
-        ret.correlationId = msg.correlationId;
-        ret.partition     = msg.partition;
-        ret.topicId       = msg.topicId;
-        ret.producerId    = msg.producerId;
-        ret.producerEpoch = msg.producerEpoch;
-        ret.baseSequence  = msg.baseSequence;
+        ret.sessionId     = f.sessionId;
+        ret.correlationId = f.correlationId;
+        ret.partition     = f.partition;
+        ret.topicId       = f.topicId;
+        ret.producerId    = f.producerId;
+        ret.producerEpoch = f.producerEpoch;
+        ret.baseSequence  = f.baseSequence;
         ret.replica       = replica;
         if (replica) { ret.targetReplicaId = replica->registryId(); ret.incarnation = replica->incarnation(); }
 
@@ -4775,13 +4982,13 @@ private:
                 // Not owned: retriable NotLeader so client re-routes.
                 spdlog::debug("Worker {}: WorkerIngress: partition not owned (topicId={} "
                               "partition={}); returning NotLeader (retriable)",
-                              workerId_, msg.topicId, msg.partition);
+                              workerId_, f.topicId, f.partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             } else {
                 // Owned but memory-backed: Internal.
                 spdlog::warn("Worker {}: WorkerIngress: owned but memory-backed log for "
                              "topicId={} partition={}; Internal error ack",
-                             workerId_, msg.topicId, msg.partition);
+                             workerId_, f.topicId, f.partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
             }
             enqueueReturn_(ret);
@@ -4797,7 +5004,7 @@ private:
         }
         // F15 §2.3 produce gate (see executeProduceWire_).
         RcState* rc = nullptr;
-        if (msg.producerId >= 0 && replica != nullptr && msg.topicId >= 0) [[unlikely]] {
+        if (f.producerId >= 0 && replica != nullptr && f.topicId >= 0) [[unlikely]] {
             rc = rcGate_(replica);
             if (rc == nullptr) {
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
@@ -4808,11 +5015,10 @@ private:
 
         // Zero-copy: handleProduceBatch now takes a READ-ONLY view and the log
         // restamps the base offset in place via pwritev — no mutable local copy.
-        const std::span<const uint8_t> rbSpan = msg.recordBatch;
         if (rbSpan.empty()) {
             spdlog::warn("Worker {}: WorkerIngress: empty recordBatch topicId={} "
                          "partition={}; Internal error ack",
-                         workerId_, msg.topicId, msg.partition);
+                         workerId_, f.topicId, f.partition);
             // E5.1.3 review fix #2: use enum, not magic literal.
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
             enqueueReturn_(ret);
@@ -4836,25 +5042,27 @@ private:
                 spdlog::warn("Worker {}: WorkerIngress: produce batch too large ({} > {}) "
                              "topicId={} partition={}; rejected (MessageTooLarge, rejects={})",
                              workerId_, rbSpan.size(), maxIntakeBatchBytes_,
-                             msg.topicId, msg.partition, oversizeProduceRejects_);
+                             f.topicId, f.partition, oversizeProduceRejects_);
             }
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
             enqueueReturn_(ret);
             return 1;
         }
 
-        // E5.1.3 review fix #3: acksAll = (acks != 0).
-        // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.
-        // Using acks != 0 is safer than acks == 1 (the gateway's rule) because
-        // it covers any non-zero acks field including potential future extension
-        // values, preventing silent false-durability on unknown acks values.
-        // The gateway uses acks == 1 for its inline path; both rules are equivalent
-        // for the current two-value (0 / 1) protocol but we document the difference.
-        const bool acksAll = (msg.acks != 0);
+        // Task 7 schema validation — the SAME hook as executeProduceWire_ (fix on
+        // sight, Task 13: the worker-ingress path skipped it, so a schema'd topic
+        // accepted invalid records over shard ingress).
+        if (schemaRejects_(f.topicId, rbSpan.data(), rbSpan.size())) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        const bool acksAll = f.acksAll;
 
         // ISR size for the min-ISR gate.
         const int isrSize = replica ? static_cast<int>(replica->isr().size()) : 0;
-        const int minIsr  = replica ? replica->minIsr() : 1;
+        const int minIsr  = f.minIsr > 0 ? f.minIsr : (replica ? replica->minIsr() : 1);
 
         // Durability tier — honor the topic/replica's configured tier so a
         // tier=strict (D2) topic actually acks after fdatasync (handleProduceBatch
@@ -4868,11 +5076,22 @@ private:
         // HW gate for acks=all).
         const bool asyncStrict = shardMode_ && durabilityTier == 2;
 
+        // Op-ring produce (gateway-received, Task 13): its parked answer was not
+        // covered by a poll budget — reserve it here BEFORE the append (G-A6, the
+        // F15 S2 R-4c rule); no slot → retriable NotLeader, log untouched.
+        if (f.fromOp && (acksAll || asyncStrict) && !ackReservationAvailable_(0)) [[unlikely]] {
+            ++acksAllRefusedNoReservation_;
+            if (!owedCapAllows_(0)) noteOwedCapThrottle_("gateway-routed produce");
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
         // Call the shared produce helper.
         rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
             rbSpan.data(), rbSpan.size(),
-            msg.topicId, msg.partition,
-            msg.producerId, msg.producerEpoch, msg.baseSequence,
+            f.topicId, f.partition,
+            f.producerId, f.producerEpoch, f.baseSequence,
             *log, psm_,
             acksAll, isrSize, minIsr, asyncStrict ? uint8_t{1} : durabilityTier);
 
@@ -4890,7 +5109,7 @@ private:
 
         // Waterfall: leader appended [baseOffset..lastOffset].  Keyed by lastOffset.
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplLeaderAppend,
-            (static_cast<uint32_t>(msg.partition) << 24) |
+            (static_cast<uint32_t>(f.partition) << 24) |
                 (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
         if (replica) {
@@ -4900,7 +5119,7 @@ private:
         // F15 §2.1 (C1): RC update in the same invocation as the append; a
         // duplicate retry was registered with its original.
         if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]]
-            rc->onTxnBatch(msg.producerId, outcome.baseOffset);
+            rc->onTxnBatch(f.producerId, outcome.baseOffset);
 
         if (asyncStrict) {
             // Park on the coalesced fsync (submitCoalescedFlushes_ stamps the token

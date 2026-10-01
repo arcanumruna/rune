@@ -98,6 +98,13 @@ public:
 
     const std::string& egressChannel() const noexcept { return egressChannel_; }
 
+    /// Aeron image session id of the last ConnectResponse / of the ack for `corr` (0 = none).
+    int32_t connectImageSessionId() const noexcept { return connectImage_; }
+    int32_t ackImageSessionId(int64_t corr) const {
+        auto it = ackImages_.find(corr);
+        return it == ackImages_.end() ? 0 : it->second;
+    }
+
     int64_t connect(const std::string& gatewayChannel, int32_t stream) {
         connect_.reset();                                  // each connect waits for ITS response
         pc::ConnectRequest req;
@@ -274,15 +281,18 @@ private:
         if (!egress_) return;
         egress_->poll(assembler_.handler(), 64);
     }
-    void onFrame_(const uint8_t* p, std::size_t n) {
+    void onFrame_(const uint8_t* p, std::size_t n, int32_t imageSessionId) {
         auto hdr = pc::MessageHeader::decode(p, n);
         if (!hdr) return;
         switch (static_cast<pc::TemplateId>(hdr->templateId)) {
             case pc::TemplateId::ConnectResponse:
-                if (auto r = pc::ConnectResponse::decode(p, n)) connect_ = *r;
+                if (auto r = pc::ConnectResponse::decode(p, n)) { connect_ = *r; connectImage_ = imageSessionId; }
                 break;
             case pc::TemplateId::ProduceResponse:
-                if (auto r = pc::ProduceResponse::decode(p, n)) acks_[r->correlationId] = *r;
+                if (auto r = pc::ProduceResponse::decode(p, n)) {
+                    acks_[r->correlationId] = *r;
+                    ackImages_[r->correlationId] = imageSessionId;
+                }
                 break;
             case pc::TemplateId::DefineTopicResponse:
                 if (auto r = pc::DefineTopicResponse::decode(p, n)) defines_[r->correlationId] = *r;
@@ -315,9 +325,13 @@ private:
     std::shared_ptr<aeron::Subscription>             egress_;
     std::map<std::pair<std::string, int32_t>, std::shared_ptr<aeron::Publication>> pubs_;
     aeron::FragmentAssembler assembler_{[this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                                               aeron::util::index_t len, aeron::Header&) {
-        onFrame_(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len));
+                                               aeron::util::index_t len, aeron::Header& h) {
+        onFrame_(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len), h.sessionId());
     }};
+    // Aeron image (publication) session id each response arrived on — tells the
+    // runtime's session publication from a worker's own (Task 13 worker acks).
+    int32_t                                         connectImage_ = 0;
+    std::map<int64_t, int32_t>                      ackImages_;
     std::optional<pc::ConnectResponse>              connect_;
     std::map<int64_t, pc::ProduceResponse>          acks_;
     std::map<int64_t, pc::DefineTopicResponse>      defines_;

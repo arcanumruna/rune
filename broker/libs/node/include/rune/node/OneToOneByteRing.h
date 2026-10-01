@@ -98,6 +98,13 @@ public:
     // Introspection / back-pressure gates
     // -----------------------------------------------------------------------
 
+    /// Consumer side: nothing unconsumed (tail == head, acquire loads — ring
+    /// internals).  Task 13: a shard polls client ingress only once every op
+    /// the runtime enqueued before it is executed (announce-before-accept).
+    [[nodiscard]] bool empty() const {
+        return const_cast<detail::O2ORingBuffer&>(ring_).size() == 0;
+    }
+
     /// Maximum single-message payload the ring can hold (capacity / 8).
     index_t maxMsgLength() const { return ring_.maxMsgLength(); }
 

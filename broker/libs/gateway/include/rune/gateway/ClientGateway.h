@@ -71,6 +71,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
 #include <rune/node/RecordsPush.h>
+#include <rune/node/SessionAnnouncer.h>
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
 
@@ -128,6 +129,9 @@ public:
 
     // Maximum in-flight pending connects.  Beyond this cap, the oldest is evicted.
     static constexpr std::size_t kMaxPendingConnects = 64;
+    /// Task 13: most concurrent sessions in shard mode — one worker ack table's
+    /// capacity (SessionAckSink::kMaxSessions − 1; static_assert in the .cpp).
+    static constexpr std::size_t kShardMaxSessions = 4095;
 
     // @param aeron                    Shared Aeron client (connected to a media driver).
     // @param clientChannel            Aeron channel the gateway listens on (clients publish here).
@@ -972,6 +976,11 @@ private:
         // be created lazily on the first subscribe.
         std::string egressChannel;
         int32_t     egressStreamId = 0;
+
+        // Task 13 (spec §3.4): every worker has this session's reply destination
+        // queued (announce-before-accept) — set once, so a ConnectResponse retry
+        // never re-announces; a timeout after it closes the session everywhere.
+        bool        announced = false;
     };
 
     // -----------------------------------------------------------------------
@@ -1253,6 +1262,8 @@ private:
     // Set via setPerWorkerIngressActive() from BrokerNode::buildWorkerPool()
     // when RUNE_PER_WORKER_INGRESS=true.
     bool perWorkerIngressActive_ = false;
+    bool shardMode_ = false;   // Task 13 (spec §3.4); set before the runtime runs
+    rune::node::SessionAnnouncer sessionAnnouncer_;   // Task 13: runtime thread only
     std::vector<ShardIngressEndpoint> shardIngressEndpoints_;  // spec §3.3; empty = legacy
 
     // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions
@@ -1465,6 +1476,21 @@ public:
     int pumpRetryQueuesForTest() { return pumpMarkerQueue_() + pumpSubOps_(); }
     /// Test-only: feed a worker return through the real drain handler.
     void handleWorkerReturnForTest(const rune::node::WorkerReturn& ret);
+    // Task 13 (spec §3.4): shard mode — announce-before-accept (every worker
+    // learns a session's reply destination before ConnectResponse), worker-side
+    // produce acks (the runtime consumes post-ack notifications, never relays
+    // answers), worker psm_ authority for user partitions, SessionClose on every
+    // worker at Disconnect / reap / connect timeout.  Set before the runtime runs.
+    void setShardMode(bool on) noexcept { shardMode_ = on; }
+    [[nodiscard]] bool shardMode() const noexcept { return shardMode_; }
+    [[nodiscard]] std::size_t pendingSessionClosesForTest() const noexcept { return sessionAnnouncer_.pendingCloses(); }
+    void drainWorkerReturnsForTest(int64_t nowNs) { nowNs_ = nowNs; drainWorkerReturns_(); }
+    rune::storage::ProducerStateManager& producerStateManagerForTest() noexcept { return producerStateManager_; }
+    [[nodiscard]] int64_t sessionLastSeenNsForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s ? s->lastSeenNs : -1;
+    }
+    void reapExpiredForTest(int64_t nowNs) { reapExpired(nowNs); }
 private:
     int64_t                                 lastFlushNs_ = 0;
 

@@ -58,6 +58,14 @@ if(BUILD_TESTING)
     # not stopped at first). A real rune-side race still fails the build either way.
     set(RUNE_TSAN_AERON_SUPP
         "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
+
+    # Task 13 (spec §3.4): worker-side ack sink + announce-before-accept (no driver).
+    add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp)
+    target_link_libraries(rune_session_ack_sink_tests PRIVATE rune_node GTest::gtest_main)
+    gtest_discover_tests(rune_session_ack_sink_tests)
+    add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp)
+    target_link_libraries(rune_session_announcer_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
+    gtest_discover_tests(rune_session_announcer_tests)
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
@@ -763,6 +771,12 @@ if(BUILD_TESTING)
             add_executable(rune_shard_agent_tests tests/node/ShardAgentTest.cpp)
             target_link_libraries(rune_shard_agent_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_agent_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Task 13 (spec §3.4): worker-side acks on the worker's own session
+            # publication, REAL invoker driver over aeron:ipc.
+            add_executable(rune_shard_worker_ack_tests tests/node/ShardWorkerAckTest.cpp)
+            target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Spec §3.1 never-block: follower flush / owned-log sync / Strict tier
             # go through the worker's io backend; background-token routing.

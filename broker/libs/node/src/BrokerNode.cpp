@@ -2594,6 +2594,11 @@ void BrokerNode::stop() {
     // Shard agents reference workers + their drivers/clients; the runners that
     // drove them are joined, so nothing pumps a shard driver any more.
     shardAgents_.clear();
+    // Task 13: the workers' session-ack publications release through their
+    // shard clients — explicitly here (runners joined, clients alive), never
+    // implicitly after a client closed.
+    if (workerPool_)
+        for (int32_t i = 0; i < workerPool_->workerCount(); ++i) workerPool_->worker(i).releaseShardClient();
     // Fused placement (spec §3.2): the runtime driver's pumper — worker 0, or
     // the interim startup pump runner if start() failed before the hand-off —
     // is joined.  Hand the runtime's invoker driver to THIS thread: it drains +
@@ -3030,6 +3035,9 @@ void BrokerNode::attachShardRuntimes_() {
         Worker& wk = workerPool_->worker(w);
         wk.setWorkerIngress(ing.get(), /*active=*/true);
         wk.setWorkerEgress(eg.get());
+        // Task 13 (spec §3.4): produce acks on this worker's OWN publications to
+        // each announced session, created on its own invoker client.
+        wk.setShardClient(shardClients_[idx].get());
         workerIngresses_.push_back(std::move(ing));
         workerEgresses_.push_back(std::move(eg));
         shardAgents_.push_back(std::make_unique<ShardAgent>(wk, *shardDrivers_[idx], *shardClients_[idx], clock_));
@@ -3038,6 +3046,8 @@ void BrokerNode::attachShardRuntimes_() {
         gateway_->setPerWorkerIngressActive(true);
         gateway_->setPerWorkerEgressActive(true);
         gateway_->setWorkerEgressParams(egressControlBase, egressBase);
+        // Task 13: announce-before-accept, worker-side acks, worker PSM authority.
+        gateway_->setShardMode(true);
         if (topicRegistry_)
             for (const auto& ts : config_.topics)
                 for (int32_t p = 0; p < ts.partitionCount; ++p)

@@ -107,6 +107,11 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_gateway_metadata_response_tests)
 
+    # Task 13 (spec §3.4): post-ack notifications + session close on every worker.
+    add_executable(rune_gateway_shard_notify_tests tests/gateway/ShardNotifyTest.cpp)
+    target_link_libraries(rune_gateway_shard_notify_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_shard_notify_tests)
+
     # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.
     # Gated behind BUILD_GATEWAY_TESTS (default ON when BUILD_TESTING=ON).

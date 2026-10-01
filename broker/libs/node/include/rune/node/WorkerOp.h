@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace rune::replication { class PartitionReplica; }
@@ -85,9 +86,13 @@ struct WorkerOp {
         // Worker builds a local rune::codec::Validator from the blob on its own thread
         // (shared-nothing: validators_ is worker-owned, never touched by any other thread).
         SchemaUpdate,             ///< admin → worker: install/update a per-topic Validator
+        // Self-contained worker shards (spec §3.4, Task 13) — values 13/14 = the
+        // schema's SESSION_ANNOUNCE / SESSION_CLOSE.  Runtime → EVERY worker,
+        // control plane (connect / disconnect rate), never ownership-gated.
+        SessionAnnounce,          ///< runtime → worker: session reply destination (tail = egress channel)
+        SessionClose,             ///< runtime → worker: forget the session + its queued acks
         // Task 10 round 4: follower/peer-side handlers on a USER replica, routed
-        // to the owning worker (they touch the replica's log/state).  13/14 are
-        // the schema's SESSION_ANNOUNCE / SESSION_CLOSE (shard-runtime ops).
+        // to the owning worker (they touch the replica's log/state).
         OffsetsForLeaderEpochResp = 15, ///< transport → worker: follower applies a KIP-101 answer
         ReconcileFetchReq         = 16, ///< transport → worker: survivor serves a reconcile pull
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
@@ -161,6 +166,12 @@ struct WorkerOp {
     // only by the owning worker.  Passed through the ring as a uint64 (like
     // replica/logPtr).  nullptr → worker uses the shared MDC pub (broadcast).
     void* egressPub = nullptr;
+
+    // SessionAnnounce (Task 13): the client session's egress stream + channel.
+    // egressChannel is a VIEW valid only for the synchronous tryEnqueueOp call
+    // (copied once into the ring slot as the tail, TailKind = EGRESS_CHANNEL).
+    int32_t          egressStreamId = 0;
+    std::string_view egressChannel;
 
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
     // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.

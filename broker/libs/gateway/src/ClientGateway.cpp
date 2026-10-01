@@ -19,6 +19,7 @@
 // avoid a circular CMake target dep; rune_gateway does NOT link rune_node).
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/SessionAckSink.h>
 // E5.1.2d: shared produce-batch helper now in rune_storage (leaf lib, no circular dep).
 #include <rune/storage/ProducePath.h>
 
@@ -34,6 +35,10 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <spdlog/spdlog.h>
+
+static_assert(rune::gateway::ClientGateway::kShardMaxSessions ==
+                  rune::node::SessionAckSink::kMaxSessions - 1,
+              "Task 13: the runtime's shard session cap is a worker ack table's capacity");
 
 #include <cstring>
 
@@ -458,6 +463,8 @@ int ClientGateway::doWork(int64_t nowNs) {
         fragmentLimit_);
     imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
     pollPendingConnects(nowNs);
+    // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
+    if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
     pollPendingRecordEgress_(nowNs);  // hybrid egress: resolve unicast pubs + drain deferred subscribes
     reapExpired(nowNs);
     // GB-5p2: group-commit flush — time-based cadence (kGroupCommitIntervalNs).
@@ -606,6 +613,9 @@ void ClientGateway::reapExpired(int64_t nowNs) {
 
     for (int64_t sid : reapScratch_) {
         sessions_.remove(sid);
+        // Task 13: the workers forget it too (its queued acks drop, its
+        // publications are released) — retried until every worker has it.
+        if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
         // Hybrid egress: drop any in-flight record-egress resolves for this session
         // (all workers — its buffered subscribes die with the session).
         for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
@@ -946,6 +956,9 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // state and we must poll it until it resolves so we can drop it.
             const int64_t timedOutRegId = pending.registrationId;
             const bool alreadyResolved  = (pending.resolvedPub != nullptr);
+            // Task 13: a session announced (fully or partly) but never accepted
+            // is closed on every worker — the client never learned its id.
+            if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, pending.sessionId);
             it = pendingConnects_.erase(it); // drops resolvedPub shared_ptr if non-null
             if (!alreadyResolved) {
                 // Publication not yet resolved: enqueue in drain table.
@@ -1038,6 +1051,27 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             }
             encoded = err.encode(scratch_.data());
         } else {
+            // Task 13 (spec §3.4) announce-before-accept: every worker must know
+            // this session's reply destination before the client can learn its
+            // session id (its first Produce may reach a worker before any later
+            // runtime message).  A full worker ring defers the accept to the next
+            // cycle (bounded by the connect timeout, never a wait); workers
+            // already reached are not re-sent.  The worker ack table's capacity
+            // bounds concurrent shard sessions (pending closes still hold slots).
+            if (shardMode_ && workerPool_ && !pending.announced) {
+                if (sessions_.size() + sessionAnnouncer_.pendingCloses() >= kShardMaxSessions) [[unlikely]] {
+                    spdlog::warn("ClientGateway: shard session cap {} reached; session={} held until the "
+                                 "connect timeout", kShardMaxSessions, pending.sessionId);
+                    ++it;
+                    continue;
+                }
+                if (!sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
+                                                pending.egressChannel, pending.egressStreamId)) {
+                    ++it;
+                    continue;   // a worker ring is full — retry next cycle
+                }
+                pending.announced = true;
+            }
             // Invariant (FIX A): a session must NEVER be added to the table unless
             // the client received a ConnectResponse for it.  Only promote to a
             // session after a successful send.
@@ -1189,6 +1223,8 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
     if (!msgOpt) return;
     const int64_t sid = msgOpt->sessionId;
     sessions_.remove(sid);
+    // Task 13: close the session on every worker (Disconnect).
+    if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
 
     // GB-3: drop all subscriptions belonging to this session.
     auto it = subscriptions_.begin();
@@ -1761,7 +1797,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         }
 
         // TX-2: Idempotent-producer dedup gate (worker path).
-        if (msg.producerId >= 0) {
+        // Task 13 (spec §3.4): in shard mode the owning worker's psm_ is the
+        // single owner for user partitions (it validates in its produce core) —
+        // the runtime mirror is not consulted (two authorities for one pid would
+        // be a check-then-act race).
+        if (msg.producerId >= 0 && !(shardMode_ && msg.topicId >= 0)) {
             const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
             const auto vr = producerStateManager_.validate(
                 msg.topicId, msg.producerId, partition,
@@ -3233,6 +3273,11 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                    "worker invariant: an error ProduceResult never carries deferAck");
             if (ret.deferAck && ret.errorCode == 0) {
                 applyProduceFacts_(ret);
+                // Task 13: in shard mode this is the post-ack notification of an
+                // ack the worker already sent — and the only produce traffic the
+                // runtime sees for the session (F23 liveness, ack time >=
+                // request time: never early).  One lookup; nothing is sent.
+                if (shardMode_) [[likely]] sessions_.touch(ret.sessionId, nowNs_);
                 return;
             }
             Session* session = sessions_.find(ret.sessionId);
