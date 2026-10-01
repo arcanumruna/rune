@@ -60,6 +60,13 @@
            SESSION_CLOSE: sessionId; the worker drops the session and its queued acks. -->
       <validValue name="SESSION_ANNOUNCE">13</validValue>
       <validValue name="SESSION_CLOSE">14</validValue>
+      <!-- Task 10 round 4: follower/peer-side replication handlers that touch a
+           USER replica's log/state, routed to the owning worker (never executed on
+           the control thread).  OLE_RESP reuses ole*/replErrorCode scalars
+           (leaderEpoch→oleCurrentEpoch, responseEpoch→oleRequestedEpoch,
+           endOffset→oleFollowerLeo); RECONCILE_FETCH_REQ reuses the fr* scalars. -->
+      <validValue name="OFFSETS_FOR_LEADER_EPOCH_RESP">15</validValue>
+      <validValue name="RECONCILE_FETCH_REQ">16</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -101,6 +108,11 @@
            routing): topicId / partition / producerId, the marker in chunk.  The
            runtime re-routes it or surfaces NotLeader to the txn coordinator. -->
       <validValue name="CONTROL_RECORD_REFUSED">5</validValue>
+      <!-- Task 10 round 4: an APPEND_CONTROL_RECORD executed by the owning worker.
+           correlationId = the runtime's marker token, baseOffset = the offset the
+           marker ACTUALLY landed at (authoritative; never pre-computed), or
+           errorCode != 0 when the append itself failed (e.g. min-ISR gate). -->
+      <validValue name="CONTROL_RECORD_APPENDED">6</validValue>
     </enum>
   </types>
 
@@ -204,6 +216,11 @@
     <field name="isolation"       id="22" type="uint8"/>
     <field name="isGroup"         id="23" type="uint8"/>
     <field name="groupCarrierReceived" id="24" type="uint8"/>
+    <!-- Task 10 round 4: the target replica's identity (registry id + incarnation)
+         echoed from the op, so the runtime refers to replicas by identity (and
+         resolves them through the registry) instead of holding a raw pointer. -->
+    <field name="targetReplicaId" id="26" type="uint32"/>
+    <field name="incarnation"     id="27" type="uint32"/>
     <!-- PushReadResult chunk (raw record-batch bytes) -->
     <data  name="chunk"           id="25" type="varDataEncoding"/>
   </sbe:message>

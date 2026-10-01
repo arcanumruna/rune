@@ -48,6 +48,8 @@ public:
         SCHEMA_UPDATE = static_cast<std::uint8_t>(12),
         SESSION_ANNOUNCE = static_cast<std::uint8_t>(13),
         SESSION_CLOSE = static_cast<std::uint8_t>(14),
+        OFFSETS_FOR_LEADER_EPOCH_RESP = static_cast<std::uint8_t>(15),
+        RECONCILE_FETCH_REQ = static_cast<std::uint8_t>(16),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -71,6 +73,8 @@ public:
             case static_cast<std::uint8_t>(12): return SCHEMA_UPDATE;
             case static_cast<std::uint8_t>(13): return SESSION_ANNOUNCE;
             case static_cast<std::uint8_t>(14): return SESSION_CLOSE;
+            case static_cast<std::uint8_t>(15): return OFFSETS_FOR_LEADER_EPOCH_RESP;
+            case static_cast<std::uint8_t>(16): return RECONCILE_FETCH_REQ;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -97,6 +101,8 @@ public:
             case SCHEMA_UPDATE: return "SCHEMA_UPDATE";
             case SESSION_ANNOUNCE: return "SESSION_ANNOUNCE";
             case SESSION_CLOSE: return "SESSION_CLOSE";
+            case OFFSETS_FOR_LEADER_EPOCH_RESP: return "OFFSETS_FOR_LEADER_EPOCH_RESP";
+            case RECONCILE_FETCH_REQ: return "RECONCILE_FETCH_REQ";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

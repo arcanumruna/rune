@@ -271,3 +271,31 @@ TEST(RingSbe, OwnershipGuardFieldsAndReturnsRoundTripRegression) {
 }
 
 } // namespace
+
+TEST(RingSbe, ControlRecordAppendedCarriesIdentityAndOffsetRegression) {
+    // Task 10 round 4: CONTROL_RECORD_APPENDED (the marker's authoritative
+    // offset) and the replica identity (targetReplicaId / incarnation) on every
+    // WorkerReturn; the new follower-side op types decode (unknown → E103).
+    std::array<char, 512> buf{};
+    sbe::WorkerReturn enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.returnType(sbe::ReturnType::Value::CONTROL_RECORD_APPENDED)
+       .sessionId(0).correlationId(42).partition(1).baseOffset(3).lastOffset(0)
+       .errorCode(0).deferAck(0).replica(0).producerId(7).producerEpoch(0)
+       .baseSequence(0).recordCount(0).topicId(2).batchAttrs(0).enqueuedAtNs(0)
+       .subscriptionId(0).readTopicId(0).readPartition(0).newNextOffset(0).hwBound(0)
+       .isolation(0).isGroup(0).groupCarrierReceived(0)
+       .targetReplicaId(9).incarnation(0xFFFFFFFEu);
+    enc.putChunk(nullptr, 0);
+    auto dec = decodeAt<sbe::WorkerReturn>(buf.data(), buf.size());
+    EXPECT_EQ(dec.returnType(), sbe::ReturnType::Value::CONTROL_RECORD_APPENDED);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::CONTROL_RECORD_APPENDED), 6);
+    EXPECT_EQ(dec.correlationId(), 42);
+    EXPECT_EQ(dec.baseOffset(), 3);
+    EXPECT_EQ(dec.targetReplicaId(), 9u);
+    EXPECT_EQ(dec.incarnation(), 0xFFFFFFFEu);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::OFFSETS_FOR_LEADER_EPOCH_RESP), 15);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::RECONCILE_FETCH_REQ), 16);
+    EXPECT_EQ(sbe::OpType::get(15), sbe::OpType::Value::OFFSETS_FOR_LEADER_EPOCH_RESP);
+    EXPECT_EQ(sbe::OpType::get(16), sbe::OpType::Value::RECONCILE_FETCH_REQ);
+}

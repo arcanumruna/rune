@@ -119,7 +119,7 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(115);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(123);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(2);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(7);
     static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(0);
@@ -177,7 +177,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(115);
+        return static_cast<std::uint16_t>(123);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -1822,6 +1822,132 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *targetReplicaIdMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t targetReplicaIdId() SBE_NOEXCEPT
+    {
+        return 26;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t targetReplicaIdSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool targetReplicaIdInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t targetReplicaIdEncodingOffset() SBE_NOEXCEPT
+    {
+        return 115;
+    }
+
+    static SBE_CONSTEXPR std::uint32_t targetReplicaIdNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_UINT32;
+    }
+
+    static SBE_CONSTEXPR std::uint32_t targetReplicaIdMinValue() SBE_NOEXCEPT
+    {
+        return UINT32_C(0x0);
+    }
+
+    static SBE_CONSTEXPR std::uint32_t targetReplicaIdMaxValue() SBE_NOEXCEPT
+    {
+        return UINT32_C(0xfffffffe);
+    }
+
+    static SBE_CONSTEXPR std::size_t targetReplicaIdEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::uint32_t targetReplicaId() const SBE_NOEXCEPT
+    {
+        std::uint32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 115, sizeof(std::uint32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    WorkerReturn &targetReplicaId(const std::uint32_t value) SBE_NOEXCEPT
+    {
+        std::uint32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 115, &val, sizeof(std::uint32_t));
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *incarnationMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t incarnationId() SBE_NOEXCEPT
+    {
+        return 27;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t incarnationSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool incarnationInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t incarnationEncodingOffset() SBE_NOEXCEPT
+    {
+        return 119;
+    }
+
+    static SBE_CONSTEXPR std::uint32_t incarnationNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_UINT32;
+    }
+
+    static SBE_CONSTEXPR std::uint32_t incarnationMinValue() SBE_NOEXCEPT
+    {
+        return UINT32_C(0x0);
+    }
+
+    static SBE_CONSTEXPR std::uint32_t incarnationMaxValue() SBE_NOEXCEPT
+    {
+        return UINT32_C(0xfffffffe);
+    }
+
+    static SBE_CONSTEXPR std::size_t incarnationEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::uint32_t incarnation() const SBE_NOEXCEPT
+    {
+        std::uint32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 119, sizeof(std::uint32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    WorkerReturn &incarnation(const std::uint32_t value) SBE_NOEXCEPT
+    {
+        std::uint32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 119, &val, sizeof(std::uint32_t));
+        return *this;
+    }
+
     SBE_NODISCARD static const char *chunkMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
@@ -2108,6 +2234,14 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("groupCarrierReceived": )";
     builder << +writer.groupCarrierReceived();
+
+    builder << ", ";
+    builder << R"("targetReplicaId": )";
+    builder << +writer.targetReplicaId();
+
+    builder << ", ";
+    builder << R"("incarnation": )";
+    builder << +writer.incarnation();
 
     builder << ", ";
     builder << R"("chunk": )";

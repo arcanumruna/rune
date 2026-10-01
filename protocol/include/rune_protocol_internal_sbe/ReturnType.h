@@ -39,6 +39,7 @@ public:
         STORAGE_FAILURE = static_cast<std::uint8_t>(3),
         OWNERSHIP_ACK = static_cast<std::uint8_t>(4),
         CONTROL_RECORD_REFUSED = static_cast<std::uint8_t>(5),
+        CONTROL_RECORD_APPENDED = static_cast<std::uint8_t>(6),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -52,6 +53,7 @@ public:
             case static_cast<std::uint8_t>(3): return STORAGE_FAILURE;
             case static_cast<std::uint8_t>(4): return OWNERSHIP_ACK;
             case static_cast<std::uint8_t>(5): return CONTROL_RECORD_REFUSED;
+            case static_cast<std::uint8_t>(6): return CONTROL_RECORD_APPENDED;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -68,6 +70,7 @@ public:
             case STORAGE_FAILURE: return "STORAGE_FAILURE";
             case OWNERSHIP_ACK: return "OWNERSHIP_ACK";
             case CONTROL_RECORD_REFUSED: return "CONTROL_RECORD_REFUSED";
+            case CONTROL_RECORD_APPENDED: return "CONTROL_RECORD_APPENDED";
             case NULL_VALUE: return "NULL_VALUE";
         }
 
