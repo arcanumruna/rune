@@ -686,6 +686,161 @@ TEST(HandleLifetime, InvokerOffOwnerReleaseUnderAbortedHeadStillAppliesRegressio
     EXPECT_EQ(r.client->testSubscriptionImplsHeld(), 0u);
 }
 
+// ---- N1 / N2 rigs: the command-ring head stuck behind an ABORTed send ------
+namespace {
+// Thread mode: the runner performs the stuck-head seams itself (they touch
+// duty state) — from the injected duty clock, which only the runner calls in
+// these tests (the app thread never reads it: a Ring producer, no heartbeat
+// wait).  Test-only globals; atomics are fine in tests.
+std::atomic<rc::Client*>    g_seamClient{nullptr};
+std::atomic<int>            g_seamAction{0};  // 1: stick the head, 2: lift it
+std::atomic<long>           g_runnerClockCalls{0};
+std::thread::id             g_testThread{};
+int64_t seamClock() noexcept {
+    if (std::this_thread::get_id() != g_testThread) {
+        g_runnerClockCalls.fetch_add(1);
+        rc::Client* c = g_seamClient.load();
+        const int a = g_seamAction.exchange(0);
+        if (c != nullptr && a == 1) {
+            c->testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Retry, 1 << 30);
+            (void)c->testSubmitSessionPing();
+        } else if (c != nullptr && a == 2) {
+            c->testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Accepted, 0);
+        }
+    }
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+/// The runner advanced at least `n` more duty-clock reads (cycles).
+void awaitRunner(long n) {
+    const long target = g_runnerClockCalls.load() + n;
+    while (g_runnerClockCalls.load() < target) std::this_thread::yield();
+}
+} // namespace
+
+// N1: an orphaned release keeps FIFO order behind the handle's own queued ops.
+// Thread mode: an app thread begin-closes its Producer (records still in the
+// builder) — the BeginClose command queues behind a head stuck on an ABORTed
+// send — then fills the ring and destroys the Producer: the release is
+// orphaned.  The runner notes it, but may apply it only once the head passed
+// its fence, i.e. after the BeginClose: the close DRAINS (every record Ok)
+// instead of the destructor's closeImmediately discarding them; then the impl
+// is freed without closing the Client.  RED (mutation `true ||` on the fence
+// in applyDueOrphans_): applied early, the records complete Closed.
+TEST(HandleLifetime, InvokerOffOwnerOrphanedReleaseKeepsFifoRegression) {
+    Watchdog wd("orphaned release behind a queued begin-close");
+    FreeHook hook;
+    g_testThread = std::this_thread::get_id();
+    g_seamAction.store(0);
+    rc::ClientConfig cfg = cfgFor(5444, rc::RunnerMode::Thread);
+    cfg.nanoClock = &seamClock;
+    cfg.idleMode  = rc::IdleMode::LowLatency;
+    auto client = std::make_unique<rc::Client>(cfg);  // owns the embedded driver
+    g_seamClient.store(client.get());
+    auto gwp = std::make_unique<test_support::InvokerGateway>(
+        cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId, cfg.egressChannel, cfg.egressStreamId);
+    test_support::InvokerGateway& gw = *gwp;
+    {
+        GatewayPump pump(gw);  // the gateway answers on its own thread from here on
+        client->connectAndWait(std::chrono::seconds(10));
+        const auto topic = client->topic("t");
+        TestCq cq(*client);
+        std::optional<rc::Producer> p(client->producer(ackCfg()));  // linger 60 s: records wait in the builder
+        std::vector<PendingOp> recs;
+        for (int i = 0; i < 3; ++i) recs.push_back(cq.send(*p, topic, rc::Key(uint64_t{1}), kVal));
+        g_seamAction.store(1);  // the runner sticks the head (forced Retry + a session frame)
+        awaitRunner(200);
+        auto tok = cq.issue([&](rc::Completions& q, rc::Token t) { return p->close(q, t); });
+        ASSERT_TRUE(tok.accepted()) << tok.describe();  // its BeginClose queues behind the stuck head
+        client->testFillCommandRing();
+        p.reset();  // ring full: the release is orphaned
+        awaitRunner(500);  // the hint is taken and the orphan noted while the head is stuck
+        EXPECT_EQ(totalFrees(), 0);
+        for (const auto& rec : recs) EXPECT_FALSE(rec.ready()) << "nothing applied before the head moved";
+        g_seamAction.store(2);  // lift the back-pressure
+        for (const auto& rec : recs) {
+            ASSERT_TRUE(rec.waitReady()) << "a record never completed";
+            EXPECT_EQ(rec.status(), OpStatus::Ok) << "discarded (the release overtook the close): " << rec.describe();
+            EXPECT_EQ(cq.timesCompleted(rec.token()), 1);
+        }
+        ASSERT_TRUE(tok.waitReady());
+        EXPECT_EQ(tok.status(), OpStatus::Ok);
+        const auto backstop = std::chrono::steady_clock::now() + std::chrono::seconds(20);  // hang guard only
+        while (frees(rcd::HandleKind::Producer) == 0 && std::chrono::steady_clock::now() < backstop) awaitRunner(1);
+        EXPECT_EQ(frees(rcd::HandleKind::Producer), 1) << "freed without closing the Client";
+        client->closeImmediately();
+        pump.stop();
+    }
+    g_seamClient.store(nullptr);
+    gwp.reset();
+    client.reset();
+    EXPECT_EQ(frees(rcd::HandleKind::Producer), 1);
+}
+
+// N2: a handle destroyed BEFORE its registration was adopted (its Add /
+// register command queued behind a head stuck on an ABORTed send, the ring
+// full): the release is orphaned, the orphan hint is taken and the scan runs
+// while the impl is not held yet — only the adoption-time check notes it.
+// Once the head moves, the impl is adopted, its release applied (closed /
+// unsubscribed) and it is freed without closing the Client.  All four handle
+// kinds.  RED (mutation: the four adoption checks removed): never freed until
+// close (a Subscription would keep dispatching after its destructor).
+TEST(HandleLifetime, InvokerOffOwnerReleaseOrphanedBeforeAdoptionRegression) {
+    for (const rcd::HandleKind kind : {rcd::HandleKind::Subscription, rcd::HandleKind::Producer,
+                                       rcd::HandleKind::GroupConsumer, rcd::HandleKind::TxnProducer}) {
+        SCOPED_TRACE("kind " + std::to_string(static_cast<int>(kind)));
+        Watchdog wd("orphaned release before adoption");
+        FreeHook hook;
+        Rig r(cfgFor(5446 + 2 * static_cast<int>(kind)));
+        r.connect();
+        const auto topic = r.client->topic("t");
+        r.client->testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Retry, 1 << 30);
+        ASSERT_TRUE(r.client->testSubmitSessionPing());
+        for (int i = 0; i < 50; ++i) r.doWork();  // the head is stuck now
+        auto held = [&]() -> std::size_t {
+            switch (kind) {
+            case rcd::HandleKind::Subscription:  return r.client->testSubscriptionImplsHeld();
+            case rcd::HandleKind::Producer:      return r.client->testProducerCount();
+            case rcd::HandleKind::GroupConsumer: return r.client->testGroupImplsHeld();
+            case rcd::HandleKind::TxnProducer:   return r.client->testTxnProducerCount();
+            }
+            return 0;
+        };
+        // A worker (off the owner: every registration goes through the ring)
+        // creates the handle, fills the ring and destroys the handle.
+        std::thread worker([&] {
+            std::optional<rc::Subscription>          sub;
+            std::optional<rc::Producer>              p;
+            std::optional<rc::GroupConsumer>         gc;
+            std::optional<rc::TransactionalProducer> tp;
+            switch (kind) {
+            case rcd::HandleKind::Subscription:  sub.emplace(r.client->subscribe(topic, 0, {}, &noopRecords)); break;
+            case rcd::HandleKind::Producer:      p.emplace(r.client->producer(ackCfg())); break;
+            case rcd::HandleKind::GroupConsumer: gc.emplace(r.client->subscribeGroup("g-early", {"t"})); break;
+            case rcd::HandleKind::TxnProducer:   tp.emplace(r.client->transactionalProducer("tx-early")); break;
+            }
+            r.client->testFillCommandRing();
+            sub.reset();  // ring full: orphaned before its Add was adopted
+            p.reset();
+            gc.reset();
+            tp.reset();
+        });
+        worker.join();
+        for (int i = 0; i < 200; ++i) r.doWork(), r.gw.pump();  // hint taken, scan ran: not held yet
+        EXPECT_EQ(held(), 0u) << "the registration is still behind the stuck head";
+        EXPECT_EQ(totalFrees(), 0);
+        r.client->testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Accepted, 0);
+        EXPECT_TRUE(r.drive([&] { return frees(kind) == 1; })) << "the orphaned release was never applied";
+        EXPECT_EQ(held(), 0u);
+        if (kind == rcd::HandleKind::Subscription) {
+            EXPECT_FALSE(r.gw.unsubscribed.empty()) << "the subscription was unsubscribed";
+        }
+        r.client->closeImmediately();
+        r.client.reset();
+        EXPECT_EQ(totalFrees(), 1) << "no impl freed twice";
+    }
+}
+
 // I-2: handles owned by a worker thread are destroyed while the Invoker owner
 // keeps pumping (records flowing to the subscription, the group / txn
 // producers registered): each release travels the command ring and is applied
