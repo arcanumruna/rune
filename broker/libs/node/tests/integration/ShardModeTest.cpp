@@ -49,8 +49,21 @@ struct ShardPorts {
     static ShardPorts discover(int nodes, int workers) {
         ShardPorts p;
         auto blocks = freeUdpPortBlocks(3 * nodes, workers);
+        // Single ports must avoid every block and each other: a block's ports are
+        // probed then released, so the OS may hand one out again.
+        std::vector<std::pair<int, int>> taken;   // [lo, hi)
+        for (uint16_t b : blocks) taken.push_back({b, b + workers});
+        auto single = [&taken] {
+            for (int attempt = 0; attempt < 2000; ++attempt) {
+                const int q = freeUdpPort();
+                bool clash = q == 0;
+                for (const auto& [lo, hi] : taken) clash = clash || (q >= lo && q < hi);
+                if (!clash) { taken.push_back({q, q + 1}); return static_cast<uint16_t>(q); }
+            }
+            throw std::runtime_error("ShardPorts: no collision-free UDP port");
+        };
         for (int i = 0; i < nodes; ++i) {
-            p.cons.push_back(freeUdpPort()); p.client.push_back(freeUdpPort()); p.repl.push_back(freeUdpPort());
+            p.cons.push_back(single()); p.client.push_back(single()); p.repl.push_back(single());
             p.ib.push_back(blocks[3 * i]); p.rb.push_back(blocks[3 * i + 1]); p.eg.push_back(blocks[3 * i + 2]);
         }
         return p;
@@ -835,4 +848,25 @@ TEST(ShardModeFusedRegression, PartitionLeaderFailsOverBetweenFusedRuntimes) {
                                  /*acks=all*/1, makeBatch(2)))
         << "acks=all must commit on the surviving pair";
     for (auto& n : nodes) n->stop();
+}
+
+// Harness fix (Task 11 TSan run: "refusing to start — port collision with
+// co-located peer 2: our workerEgressControl[w0] and its consensusPort both use
+// 53473"): single ports were drawn independently of the per-worker blocks, so a
+// port freed after probing a block could be handed out again.  Every port and
+// block ShardPorts::discover returns must be pairwise disjoint.
+TEST(ShardTestHarnessRegression, DiscoveredPortsNeverCollide) {
+    for (int round = 0; round < 300; ++round) {
+        constexpr int kNodes = 3, kWorkers = 4;
+        const auto p = ShardPorts::discover(kNodes, kWorkers);
+        std::vector<std::pair<int, int>> ranges;   // [lo, hi)
+        for (int i = 0; i < kNodes; ++i) {
+            for (uint16_t s : {p.cons[i], p.client[i], p.repl[i]}) ranges.push_back({s, s + 1});
+            for (uint16_t b : {p.ib[i], p.rb[i], p.eg[i]}) ranges.push_back({b, b + kWorkers});
+        }
+        for (std::size_t a = 0; a < ranges.size(); ++a)
+            for (std::size_t b = a + 1; b < ranges.size(); ++b)
+                ASSERT_FALSE(ranges[a].first < ranges[b].second && ranges[b].first < ranges[a].second)
+                    << "round " << round << ": ports " << ranges[a].first << " and " << ranges[b].first << " overlap";
+    }
 }
