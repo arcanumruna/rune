@@ -27,27 +27,41 @@ ctest --test-dir "$B" -E "$HEAVY_RE" -j "$LIGHT_J" --timeout 300 "$@"; rc1=$?
 
 echo "== tier 2: heavy multi-node tests (-j2, waiting for /tmp/rune-heavy.lock)"
 LOCK=/tmp/rune-heavy.lock
-# Owned lock = a SYMLINK whose target is the owner pid: `ln -s` creates it and
-# records the owner in one atomic step (no mkdir→write-pid gap).  Legacy holders
-# (plain mkdir/rmdir) still exclude us: ln -s fails on an existing dir, and their
-# rmdir cannot remove our symlink.  A lock whose owner process no longer exists
-# is reclaimed — under a separate reclaim mutex, re-reading the owner inside it,
-# so two waiters can never both reclaim (and then both hold) the lock.
-owner_alive() { ps -p "$1" >/dev/null 2>&1; }   # EPERM-safe (unlike kill -0)
+# Owned lock = a SYMLINK whose target is the owner pid, created with symlink(2)
+# directly (perl): it fails with EEXIST on ANY existing path — including a
+# legacy holder's mkdir'd directory, which plain `ln -s` would silently write
+# INTO.  Create + record-owner is one atomic step.  A lock whose owner process is
+# gone is reclaimed under a separate $LOCK.reclaim mutex that re-reads the owner
+# AND re-checks it is still dead before removing.  A reclaim mutex left behind by
+# a killed reclaimer is broken after RECLAIM_STALE_S seconds (logged).
+RECLAIM_STALE_S=60
+mklock() { perl -e 'symlink($ARGV[0], $ARGV[1]) or exit 1' "$1" "$LOCK"; }
+# ps -p works on macOS + procps; containers with a separate PID namespace sharing
+# /tmp would see live owners as dead — the heavy lock is host-local by design.
+owner_alive() { ps -p "$1" >/dev/null 2>&1; }
+mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
 acquire_lock() {
   local owner warned=0
   while :; do
-    if ln -s "$$" "$LOCK" 2>/dev/null; then return 0; fi
+    if mklock "$$" 2>/dev/null; then return 0; fi
     owner=$(readlink "$LOCK" 2>/dev/null || true)
-    if [ -n "$owner" ] && ! owner_alive "$owner" && mkdir "$LOCK.reclaim" 2>/dev/null; then
-      if [ "$(readlink "$LOCK" 2>/dev/null)" = "$owner" ] && rm -f "$LOCK"; then
-        echo "reclaimed stale $LOCK (owner pid $owner is gone)" >&2
+    if [ -n "$owner" ] && ! owner_alive "$owner"; then
+      if mkdir "$LOCK.reclaim" 2>/dev/null; then
+        if [ "$(readlink "$LOCK" 2>/dev/null)" = "$owner" ] && ! owner_alive "$owner" && rm -f "$LOCK"; then
+          echo "reclaimed stale $LOCK (owner pid $owner is gone)" >&2
+        fi
+        rmdir "$LOCK.reclaim" 2>/dev/null || true
+        continue
       fi
-      rmdir "$LOCK.reclaim" 2>/dev/null || true
-      continue
+      age=$(( $(date +%s) - $(mtime "$LOCK.reclaim") ))
+      if [ "$age" -gt "$RECLAIM_STALE_S" ]; then
+        echo "breaking stale $LOCK.reclaim (${age}s old; a reclaimer was killed)" >&2
+        rmdir "$LOCK.reclaim" 2>/dev/null || true
+        continue
+      fi
     fi
     if [ -z "$owner" ] && [ "$warned" = 0 ]; then
-      echo "waiting on $LOCK held by a legacy (pid-less) holder" >&2; warned=1
+      echo "waiting on $LOCK held by a legacy (pid-less, mkdir) holder" >&2; warned=1
     fi
     sleep 5
   done
