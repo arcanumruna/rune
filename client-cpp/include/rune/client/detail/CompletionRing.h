@@ -117,8 +117,11 @@ public:
         return ok;
     }
 
-    /// The producer will deliver nothing more (release).  Idempotent.
-    void producerClose() noexcept { ring_.producerClose(); }
+    /// STANDALONE use only (tests, a custom producer with no Client): the
+    /// producer will deliver nothing more (release).  A Client-registered ring
+    /// is closed with producerCloseAndDetach() — this form never detaches, so
+    /// on a registered ring the owner's release would leak it (review m3).
+    void testProducerClose() noexcept { ring_.producerClose(); }
 
     /// F8c fix round 2 (I5): the two halves of a last-one-frees hand-off of
     /// the ring between the duty side (Client close) and its owner.  The

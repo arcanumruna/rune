@@ -627,6 +627,8 @@ private:
     /// I3: count / uncount a pending op's target slot; recycle a free slot.
     void pinCqSlot_(DutyTarget& t) noexcept;
     void freeCqSlot_(uint32_t idx) noexcept;
+    /// I3': apply deferred releases whose fence the drain has passed (all: close).
+    int applyDeferredReleases_(bool all) noexcept;
     /// Deliver one completion to its target (duty thread / closing thread).
     void deliver_(const DutyTarget& t, Completion c, std::span<const uint8_t> payload,
                   detail::CompletionRing::Overflow ov = detail::CompletionRing::Overflow::Truncate);
@@ -870,6 +872,13 @@ private:
         bool                    quarantined = false;  // released, still targeted (I3)
         uint32_t                targets     = 0;      // pending ops that target this slot
     };
+    /// I3': an Invoker-owner release fenced on the command ring tail.
+    struct DeferredRelease {
+        detail::CompletionRing* ring  = nullptr;
+        std::int64_t            fence = 0;
+        CqRef                   ref   = kNoCqRef;
+    };
+    std::vector<DeferredRelease> deferredReleases_;  // duty-thread owned
     std::vector<CqSlot>   cqSlots_;
     std::vector<uint16_t> cqFree_;          // FIFO ring of released slots (I3)
     uint32_t              cqFreeHead_  = 0;

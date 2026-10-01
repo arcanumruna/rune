@@ -250,7 +250,9 @@ public:
     /// abandoned one); any thread may observe it (acquire).
     void finishCommandRingConsumer() noexcept { ring_.consumerFinish(); }
     [[nodiscard]] bool commandRingConsumerFinished() const noexcept { return ring_.consumerFinished(); }
-    /// Any thread: the command ring's tail position (acquire; test observer).
+    /// The command ring's consumer position (duty thread: its own progress).
+    [[nodiscard]] std::int64_t commandRingHead() const noexcept { return ring_.headPosition(); }
+    /// Any thread: the command ring's tail position (acquire).
     [[nodiscard]] std::int64_t commandRingTail() const noexcept { return ring_.tailPosition(); }
     /// The largest command record (header + payload) the ring accepts.
     [[nodiscard]] std::size_t commandMsgLimit() const noexcept {

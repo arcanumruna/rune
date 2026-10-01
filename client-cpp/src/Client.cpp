@@ -300,6 +300,10 @@ void Client::closeImpl_() {
     // reaches them), hub commands applied, completion queues added / released,
     // and every accepted control op completes — Closed (closing_).
     (void)agent_.drainRegistrationsForClose();
+    // I3': the drain read up to the frozen tail (or was abandoned — nothing
+    // behind the orphan is ever applied): every deferred release is safe now,
+    // and must happen before the registry hand-back (the owner gave it up).
+    (void)applyDeferredReleases_(true);
 
     // fix1 C2/I3: mark every producer's ring closed NOW — the Client (and its
     // pump-hook contexts, each `this`) is still fully valid, and this runs
@@ -546,18 +550,32 @@ void Client::registerCq_(Completions& q) {
 void Client::releaseCq_(Completions& q) noexcept {
     detail::CompletionRing* ring = q.ring_;
     const CqRef             ref  = q.cqRef_;
-    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
-    // Inside a duty cycle (a callback; the Thread-mode runner is always in
-    // one) the registry is ours: unlink + free right here — a delivery never
-    // iterates the registry, and any op of this queue was applied before it
-    // (ops issued on this thread inside a cycle are applied directly).
-    // I1: likewise on the thread running this Client's close().
-    // The Invoker owner BETWEEN cycles goes through the ring (fix round 2):
-    // its ops issued since the last cycle are still there, ahead of the
-    // release — ring order keeps "every op is counted before its queue's
-    // slot can be recycled" (I3 quarantine) absolute.
-    if ((onDuty && inDutyCycle_) || tClosing == this) {
+    // I1: on the thread running this Client's close() — its drain already
+    // read up to the frozen tail (or was abandoned: nothing behind the orphan
+    // is ever applied), so no op of this queue is left unapplied.
+    if (tClosing == this) {
         applyCqRelease_(ref, ring);
+        return;
+    }
+    if (std::this_thread::get_id() == dutyThreadId_) {
+        // Thread-mode runner: every op it issues is applied directly.
+        if (cfg_.runnerMode == RunnerMode::Thread) {
+            applyCqRelease_(ref, ring);
+            return;
+        }
+        // I3' (fix round 3): the Invoker owner, inside or between cycles.  Its
+        // ops issued between cycles may still sit in the command ring (past a
+        // bounded drain, or behind a Retry head).  The queue records the ring
+        // tail after its LAST ring-submitted op (owner-thread state, written
+        // only by this thread): release directly once the drain has passed
+        // that fence, otherwise defer the release until it does.  Duty-side
+        // state only; nobody waits.
+        const std::int64_t fence = q.issueFence_;
+        if (agent_.commandRingHead() >= fence) {
+            applyCqRelease_(ref, ring);
+        } else {
+            deferredReleases_.push_back(DeferredRelease{ring, fence, ref});
+        }
         return;
     }
     detail::HubCommand cmd;
@@ -571,22 +589,31 @@ void Client::releaseCq_(Completions& q) noexcept {
         const auto r = agent_.submitHubCommand(cmd);
         if (r == agent::ClientAgent::Submit::Accepted) return;  // §3.3 (a): the duty side frees it
         if (r == agent::ClientAgent::Submit::Closed) break;
-        // Full: the duty thread drains it (progress-based, never a time bound).
-        // The Invoker owner IS the duty thread: drive a cycle itself.
-        if (onDuty && cfg_.runnerMode == RunnerMode::Invoker) {
-            try {
-                (void)dutyCycle(now());
-            } catch (...) {
-            }
-        } else {
-            idle.idle(0);
-        }
+        idle.idle(0);  // full: another thread (the duty thread) drains it — progress-based
     }
     // §3.3 (b) + I5: close() is in progress on another thread.  Never wait for
     // its hand-back (the closer may be running user code blocked on THIS
     // thread): detach the consumer side; if the closer already handed the
     // ring back (producer detached), free it here, else the closer frees it.
     if (ring->consumerDetach()) delete ring;
+}
+
+int Client::applyDeferredReleases_(bool all) noexcept {
+    if (deferredReleases_.empty()) return 0;
+    const std::int64_t head = agent_.commandRingHead();
+    int n = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < deferredReleases_.size(); ++i) {
+        const DeferredRelease d = deferredReleases_[i];
+        if (all || head >= d.fence) {
+            applyCqRelease_(d.ref, d.ring);  // every op it fenced has been applied (counted)
+            ++n;
+        } else {
+            deferredReleases_[keep++] = d;
+        }
+    }
+    deferredReleases_.resize(keep);
+    return n;
 }
 
 void Client::applyCqAdd_(detail::CompletionRing* ring) {
@@ -750,7 +777,10 @@ OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
         return OpResult::Accepted;
     }
     switch (agent_.submitControlOp(&h, sizeof h, frame)) {
-    case agent::ClientAgent::Submit::Accepted: return OpResult::Accepted;
+    case agent::ClientAgent::Submit::Accepted:
+        // I3': the queue's ring fence — every op of it lies before this tail.
+        if (q != nullptr) q->issueFence_ = agent_.commandRingTail();
+        return OpResult::Accepted;
     case agent::ClientAgent::Submit::Full:     unreserve(); return OpResult::BackPressured;
     case agent::ClientAgent::Submit::Closed:   break;
     }
@@ -1198,6 +1228,8 @@ int Client::dutyCycle(int64_t nowNs) {
     // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
     //    ProduceResponses are decoded and buffered, not dispatched through hooks.
     int work = agent_.doWork(nowNs);
+    // I3': owner releases fenced on the command ring apply once the drain passed them.
+    if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);
 
     // 2. ProduceResponses → hub with plain calls (O(1) ordinal routing).
     work += routeBufferedAcks_();

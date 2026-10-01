@@ -293,6 +293,7 @@ private:
         client_         = std::exchange(o.client_, nullptr);
         owner_          = o.owner_;
         cqRef_          = std::exchange(o.cqRef_, kNoCqRef);
+        issueFence_     = o.issueFence_;
     }
     /// The §3.3 release (out of line: it talks to the Client).
     void release_() noexcept;
@@ -394,6 +395,7 @@ private:
     Client*         client_ = nullptr;   // registered with (nullptr: standalone)
     std::thread::id owner_;              // the constructing thread
     CqRef           cqRef_  = kNoCqRef;  // duty-assigned at registration
+    std::int64_t    issueFence_ = 0;     // I3': command-ring tail after its last ring-submitted op (owner)
 };
 
 /// Where an op's single completion goes (spec §2.1): a Completions queue the

@@ -1094,3 +1094,79 @@ TEST(CompletionsClient, AndWaitOnAFullCommandRingTimesOutRegression) {
         EXPECT_NE(std::string(e.what()).find("timed out (command ring full)"), std::string::npos) << e.what();
     }
 }
+
+// ===========================================================================
+// F8c C2+C3 fix round 3
+// ===========================================================================
+namespace {
+rc::Client*                      g_icClient = nullptr;
+std::unique_ptr<rc::Completions> g_icQ;
+std::unique_ptr<rc::Completions> g_icB;
+rc::CompletionsConfig            g_icTiny{4096, 256, 64};
+rc::CqRef                        g_icRefQ = rc::kNoCqRef;
+int                              g_icCalls = 0;
+int                              g_icReleaseAt = 0;  // handler call that releases Q
+int                              g_icChurnUntil = 0;  // handler calls that churn
+void inCycleChurn(void*, const rc::Completion&, std::span<const uint8_t>) noexcept {
+    const int call = g_icCalls++;
+    if (call == g_icReleaseAt) {
+        g_icRefQ = g_icQ->cqRef();
+        g_icQ.reset();  // in-cycle release while Q's op is still in the command ring
+    }
+    if (call >= g_icReleaseAt && call < g_icChurnUntil) {
+        rc::Completions tmp(*g_icClient, g_icTiny);  // in-cycle churn of the free slots
+    }
+    if (call == g_icChurnUntil) g_icB = std::make_unique<rc::Completions>(*g_icClient, g_icTiny);
+}
+
+/// The review's InCycleRelease shape: kMaxCqs-2 live queues + Q (one spare
+/// slot, so the churn can proceed while Q's slot is held); `backlog`
+/// handler-form ops, then Q's op (beyond one bounded drain); a handler releases
+/// Q in-cycle and churns `churn` register/release pairs; B registers after.
+void runInCycleRelease(int32_t stream, int backlog, int releaseAt, int churn) {
+    g_now = 1'000'000'000;
+    rc::Client client(cfgFor(stream, rc::RunnerMode::Invoker, &fakeNow));
+    g_icClient = &client;
+    g_icCalls = 0;
+    g_icReleaseAt  = releaseAt;
+    g_icChurnUntil = releaseAt + churn;
+    std::vector<std::unique_ptr<rc::Completions>> live;
+    for (uint32_t i = 0; i < rc::kMaxCqs - 2; ++i) live.push_back(std::make_unique<rc::Completions>(client, g_icTiny));
+    g_icQ = std::make_unique<rc::Completions>(client, g_icTiny);
+    const rc::CompletionHandler h{&inCycleChurn, nullptr};
+    for (int i = 0; i < backlog; ++i) ASSERT_EQ(client.listTopics(h, 1), rc::OpResult::Accepted);
+    ASSERT_EQ(client.listTopics(*g_icQ, 777), rc::OpResult::Accepted);  // behind the backlog
+    for (int i = 0; i < 8 && client.testPendingControlOps() == 0 && g_icCalls <= backlog; ++i) client.doWork();
+    for (int i = 0; i < 8; ++i) client.doWork();
+    ASSERT_TRUE(g_icB != nullptr);
+    int n = 0;
+    g_icB->poll([&](const rc::Completion&, std::span<const uint8_t>) { ++n; });
+    EXPECT_EQ(n, 0) << "Q's op (refQ " << g_icRefQ << ") misdelivered to B (ref " << g_icB->cqRef() << ")";
+    EXPECT_NE(g_icB->cqRef(), g_icRefQ);
+    EXPECT_EQ(g_icB->outstanding(), 0u);
+    EXPECT_EQ(g_icB->reservedBytes(), 0u);
+    g_icB.reset();
+    g_icQ.reset();
+    g_icClient = nullptr;
+}
+} // namespace
+
+// I3': the Invoker owner releases a queue INSIDE a duty cycle while one of its
+// ops (issued between cycles) is still in the command ring (past the bounded
+// drain).  The release must not free the slot before that op is applied
+// (counted): its completion is dropped, never delivered to the slot's next owner.
+TEST(CompletionsClient, InCycleReleaseWithARingQueuedOpNeverMisdeliversRegression) {
+    // Without the fence, the free ring alternates {spare, Q's slot}: Q's slot
+    // is reused every 2nd registration, so 63 churns + B land B on Q's slot
+    // with Q's generation (32 reuses).
+    runInCycleRelease(5270, /*backlog=*/128, /*releaseAt=*/0, /*churn=*/63);
+}
+
+// I3', variant: the op is held behind a backlog across TWO bounded drains;
+// the release and the churn span both cycles.
+TEST(CompletionsClient, InCycleReleaseWithAnOpHeldAcrossTwoCyclesNeverMisdeliversRegression) {
+    // Release at handler call 100 of the first drain; the 127 churns span it
+    // and the second drain (64 reuses of Q's slot without the fence); Q's op
+    // (record 301) is applied in the third.
+    runInCycleRelease(5272, /*backlog=*/300, /*releaseAt=*/100, /*churn=*/127);
+}

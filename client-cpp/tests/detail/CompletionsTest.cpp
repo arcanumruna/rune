@@ -99,7 +99,7 @@ TEST(Completions, CompletionRingTwoThreadExactlyOnceRegression) {
                 ++delivered;
             });
         }
-        cq.ring().producerClose();
+        cq.ring().testProducerClose();
     });
 
     Token next = 0;
@@ -311,7 +311,7 @@ TEST(Completions, FinalDrainAfterProducerCloseRegression) {
     for (int i = 0; i < kK; ++i) ASSERT_EQ(cq.reserve(r), OpResult::Accepted);
     std::thread duty([&] {
         for (int i = 0; i < kK; ++i) deliver(cq, static_cast<Token>(i), r, 16);
-        cq.ring().producerClose();
+        cq.ring().testProducerClose();
     });
     int got = 0;
     auto count = [&](const Completion&, std::span<const uint8_t>) { ++got; };
