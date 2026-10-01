@@ -1433,12 +1433,41 @@ TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegress
         .build();
     const std::vector<uint8_t> blob = rune::codec::serialize(desc);
     constexpr uint32_t kParts = 8;              // spread partitions over both workers
-    std::optional<rune::protocol::client::DefineTopicResponse> def;
-    for (int a = 0; a < 50 && !(def && def->errorCode == 0); ++a)   // admin leadership settling
-        def = client.defineTopic(gw, stream, sid, "characters", kParts, /*validate=*/true, blob);
-    ASSERT_TRUE(def.has_value());
-    ASSERT_EQ(def->errorCode, 0);
-    const int32_t topicId = def->topicId;
+
+    // F3 round 8: ONE overall deadline (well under ctest's 300 s), checked by
+    // every wait; only the documented "settling" codes are retried (short
+    // backoff); a missing response ends the test immediately.  The gateway
+    // reaps a session idle for 10 s (kDefaultSessionTimeoutNs), so no single
+    // client-silent phase may approach that — the validator wait is capped at 5 s.
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto testDeadline = Clock::now() + 20s;
+    auto remaining = [&] { return std::chrono::duration_cast<std::chrono::milliseconds>(testDeadline - Clock::now()); };
+    constexpr uint16_t kDdlInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);      // admin not leader yet
+    constexpr uint16_t kDdlExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+
+    int32_t topicId = -1;
+    bool    sawInternal = false;
+    while (topicId < 0) {
+        ASSERT_GT(remaining().count(), 0) << "DefineTopic did not commit within the test deadline";
+        auto def = client.defineTopicUntil(gw, stream, sid, "characters", kParts, /*validate=*/true,
+                                           blob, std::min(testDeadline, Clock::now() + 5s));
+        ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse — gateway/admin path did not answer";
+        if (def->errorCode == 0) { topicId = def->topicId; break; }
+        if (def->errorCode == kDdlExists && sawInternal) {
+            // A retry after a reply we treated as failed: the DDL had actually
+            // committed.  Treat as success ONLY if the topic really exists.
+            ASSERT_GE(def->topicId, 0) << "TopicExists without a topic id";
+            ASSERT_TRUE(rune::node::test::hasReplica(node, def->topicId, 0))
+                << "TopicExists but the topic has no replica";
+            topicId = def->topicId;
+            break;
+        }
+        ASSERT_EQ(def->errorCode, kDdlInternal)
+            << "DefineTopic failed with a non-retryable code " << def->errorCode;
+        sawInternal = true;
+        std::this_thread::sleep_for(20ms);        // admin leadership settling (short backoff)
+    }
     ASSERT_GE(topicId, 0);
 
     // Condition-driven: EVERY worker has the validator.  Each probe runs ON the
@@ -1450,44 +1479,50 @@ TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegress
     for (int32_t p = 0; p < static_cast<int32_t>(kParts); ++p)
         probePartitionForWorker.emplace(router.workerForPartition(topicId, p), p);
     ASSERT_EQ(probePartitionForWorker.size(), 2u) << "test setup: partitions must span both workers";
-    for (auto [w, p] : probePartitionForWorker) {
-        bool installed = false;
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (!installed && std::chrono::steady_clock::now() < deadline) {
-            if (rune::node::test::hasReplica(node, topicId, p)) {
-                installed = node.onOwnerThreadForTest(topicId, p,
+    {
+        const auto validatorDeadline = std::min(testDeadline, Clock::now() + 5s);   // < session idle reap
+        std::map<int32_t, bool> installed;
+        auto allInstalled = [&] {
+            for (auto [w, p] : probePartitionForWorker) {
+                if (installed[w]) continue;
+                if (!rune::node::test::hasReplica(node, topicId, p)) return false;
+                installed[w] = node.onOwnerThreadForTest(topicId, p,
                     [&node, w = w, topicId](rune::replication::PartitionReplica&) {
                         return node.workerForTest(w)->hasValidatorForTest(topicId);
                     });
+                if (!installed[w]) return false;
             }
-            if (!installed) std::this_thread::sleep_for(5ms);   // poll interval, not correctness
-        }
-        // Fatal: the produce phase below is meaningless without validators
-        // (and a long wait would also outlive the client session's keepalive).
-        ASSERT_TRUE(installed) << "worker " << w << " never installed the validator";
+            return true;
+        };
+        while (!allInstalled() && Clock::now() < validatorDeadline)
+            std::this_thread::sleep_for(5ms);    // poll interval, not correctness
+        // Fatal: the produce phase is meaningless without validators.
+        for (auto [w, p] : probePartitionForWorker)
+            ASSERT_TRUE(installed[w]) << "worker " << w << " never installed the validator";
     }
 
-    // Produce: non-conforming rejected, conforming accepted (retry only while
-    // leadership of the runtime topic settles: NotLeader).
-    namespace pc = rune::protocol::client;
-    int64_t nextCorr = 1'000'000;   // unique per produce (never reuse a correlation id)
-    auto produceSettled = [&](const std::vector<uint8_t>& batch, int32_t partition) -> int16_t {
-        for (int a = 0; a < 200; ++a) {
-            const int64_t corr = ++nextCorr;
-            if (!client.produce(gw, stream, sid, corr, topicId, partition, 0, batch)) continue;
-            auto ack = client.awaitProduceResponse(corr);
-            if (!ack) continue;
+    // Produce: non-conforming rejected, conforming accepted.  Retry ONLY
+    // NotLeader (runtime-topic leadership settling) with a short backoff; a
+    // missing response or the overall deadline fails at once.
+    auto produceSettled = [&](const std::vector<uint8_t>& batch, int32_t partition) -> std::optional<int16_t> {
+        while (remaining().count() > 0) {
+            const int64_t corr = client.nextCorrelationId();   // never reuse a correlation id
+            if (!client.produce(gw, stream, sid, corr, topicId, partition, 0, batch)) return std::nullopt;
+            auto ack = client.awaitProduceResponseUntil(corr, std::min(testDeadline, Clock::now() + 2s));
+            if (!ack) return std::nullopt;               // no response: do not retry
             if (ack->errorCode != static_cast<int16_t>(pc::ErrorCode::NotLeader)) return ack->errorCode;
             std::this_thread::sleep_for(20ms);
         }
-        return -999;
+        return std::nullopt;
     };
     for (auto [w, p] : probePartitionForWorker) {
-        EXPECT_EQ(produceSettled(charactersBatch(false), p),
-                  static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed))
+        const auto bad = produceSettled(charactersBatch(false), p);
+        ASSERT_TRUE(bad.has_value()) << "worker " << w << ": no ProduceResponse (or test deadline)";
+        EXPECT_EQ(*bad, static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed))
             << "worker " << w << ": a non-conforming record must be rejected";
-        EXPECT_EQ(produceSettled(charactersBatch(true), p), 0)
-            << "worker " << w << ": a conforming record must be accepted";
+        const auto good = produceSettled(charactersBatch(true), p);
+        ASSERT_TRUE(good.has_value()) << "worker " << w << ": no ProduceResponse (or test deadline)";
+        EXPECT_EQ(*good, 0) << "worker " << w << ": a conforming record must be accepted";
     }
 
     node.stop();

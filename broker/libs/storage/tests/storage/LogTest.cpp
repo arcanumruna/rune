@@ -1596,16 +1596,29 @@ TEST(LogRegression, ReloadSegmentsAllocFailureLeavesLogIntactRegression) {
     ASSERT_GT(basesBefore.size(), 2u);
     const int64_t leoBefore = log.logEndOffset();
 
+    // F3 round 8: pin the active segment as an in-flight async flush would
+    // (T10 M1), so the reload must RETIRE it into the reserved
+    // retiredSegments_ capacity (its fd stays open until the flush completes).
+    rune::storage::LogSegment* pinned = log.activeSegmentForFlush();
+    pinned->pinFlush();
+    ASSERT_EQ(log.retiredSegmentsForTest(), 0u);
+
     log.setReloadAllocFaultForTest(true);
     EXPECT_THROW(log.reloadSegments(), std::bad_alloc);
     EXPECT_EQ(log.segmentBaseOffsets(), basesBefore) << "segments_ must be untouched";
     EXPECT_EQ(log.logEndOffset(), leoBefore);
+    EXPECT_EQ(log.retiredSegmentsForTest(), 0u) << "nothing retired before the fault point";
+    EXPECT_EQ(pinned->flushPins(), 1u) << "the pinned segment is still live and pinned";
     RecordBatchBuilder b(off, 9999); b.append("k", "still-alive", 9999);
     EXPECT_EQ(log.append(b.build(), off), off + 1) << "old active segment still usable";
 
     log.setReloadAllocFaultForTest(false);
     EXPECT_NO_THROW(log.reloadSegments());
     EXPECT_EQ(log.logEndOffset(), off + 1);
+    EXPECT_EQ(log.retiredSegmentsForTest(), 1u)
+        << "the pinned old segment is RETIRED (reserved capacity path), not closed";
+    log.unpinSegmentFlush(pinned);                 // flush completion → retired segment closed
+    EXPECT_EQ(log.retiredSegmentsForTest(), 0u);
     std::filesystem::remove_all(dir);
 }
 
