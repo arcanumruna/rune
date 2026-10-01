@@ -740,11 +740,9 @@ private:
         // 2b. runtime→worker ring first: ownership / role changes (and, Task 13,
         //     session announcements) must be applied before the intake they govern.
         work += static_cast<int>(drainIngress_());
-        // 3. client ingress → append (G-A6 gate unchanged).  A plane that refused a
-        //    mismatched peer (asymmetric worker count) stops serving new produce:
-        //    never accept records a split replication plane cannot replicate.
+        // 3. client ingress → append (G-A6 gate unchanged).
         work += flushRetOverflow_();
-        if (!replPlaneRefused_ && retOverflow_.empty() &&
+        if (retOverflow_.empty() &&
             ret_.freeSlotsForMsgSize(ackSlotBytes_) > static_cast<int64_t>(pendingAcksAll_.size())) {
             work += pollWorkerIngress_(nowNs);
         }
@@ -1929,9 +1927,8 @@ private:
         {
             auto* t = static_cast<WorkerReplicationTransportImpl<T>*>(ctx);
             // Shard plane handshake (spec §3.3): one predicted branch unless a
-            // peer is still unverified; a refused peer stops this shard's intake.
-            int hs = t->driveHandshake(nowNs);
-            self->replPlaneRefused_ = t->planeRefused();
+            // peer is unverified / refused (then a hello on the retry cadence).
+            const int hs = t->driveHandshake(nowNs);
             return hs + t->poll(
                 limit,
                 // Inner dispatch: also non-capturing → function pointer.
@@ -2214,7 +2211,6 @@ private:
     // before the AgentRunner starts.  Read-only at runtime (single writer).
     int  coreId_ = -1;
     bool shardMode_ = false;   // spec §3.1: set before the runner starts, then read-only
-    bool replPlaneRefused_ = false;   // shard plane handshake refused a peer (worker-thread only)
 
     // E4: true after the one-shot self-pin attempt fires in doWork.
     // Prevents repeated pin attempts on every doWork call.

@@ -96,11 +96,6 @@ void BrokerNode::start() {
 
     // 3. Start embedded Aeron media driver.
     startEmbeddedDriver();
-    // 3b. Self-contained worker shards (spec §3.1): one invoker driver + invoker
-    //     client per worker under <aeronDir>/w<w>.  Built (and pumped for every
-    //     startup resolve) on THIS thread; each ShardAgent takes ownership on its
-    //     worker thread's first pass (bindPumpThread).
-    if (config_.shardMode()) buildShardRuntimes_();
     const auto t1 = sclock::now();
 
     // 4. Connect Aeron client — must point at the same dir as the driver.
@@ -141,6 +136,19 @@ void BrokerNode::start() {
 
     // 7. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
     buildGateway();
+
+    // 7a. Self-contained worker shards (spec §3.1; Task 9 fix round 1 I2): the
+    //     per-worker invoker drivers + clients are created only NOW — after every
+    //     long phase (consensus build, offset/txn/metadata rebuilds, admin build)
+    //     — then their planes/ingress/egress are resolved (pumped by each shard's
+    //     own AeronPump on THIS thread) and the shard runners start right after.
+    //     Nothing ever leaves a shard driver/client unpumped for a long phase
+    //     (a gap > the client liveness timeout kills the client).  Each ShardAgent
+    //     takes pump ownership on its worker thread's first pass.
+    if (config_.shardMode()) {
+        buildShardRuntimes_();
+        attachShardRuntimes_();
+    }
 
     // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
     //    consensus + gateway on the single-writer thread).
@@ -487,39 +495,20 @@ void BrokerNode::buildReplication() {
     // plane silently drops messages for the partitions assigned to that worker.
     // -----------------------------------------------------------------------
     if (config_.shardMode()) {
-        // Self-contained worker shards (spec §3.1/§3.3): worker w's plane binds
-        // shardReplBindChannel(w) on ITS OWN client and sends to each peer's
-        // explicit replBasePort + w; resolved by pumping the worker's own driver
-        // on this (startup) thread.  Any unresolved plane is a hard refusal.
-        const int32_t wc = static_cast<int32_t>(shardClients_.size());
-        for (int32_t w = 0; w < wc; ++w) {
-            const auto idx = static_cast<std::size_t>(w);
-            std::vector<std::pair<rune::replication::NodeId, std::string>> peersW;
-            std::vector<rune::replication::NodeId> peerIds;
-            for (const auto& peer : config_.peers) {
-                if (peer.id == config_.nodeId) continue;
-                peersW.push_back({static_cast<rune::replication::NodeId>(peer.id),
-                                  NodeConfig::shardPeerReplChannel(peer, w)});
-                peerIds.push_back(static_cast<rune::replication::NodeId>(peer.id));
-            }
-            if (peersW.empty()) break;                           // single node: no planes
-            const int32_t streamId = config_.replBaseStreamId + w;
-            auto t = std::make_unique<WorkerReplicationTransport>(
-                shardClients_[idx], w, config_.shardReplBindChannel(w),
-                streamId, peersW, streamId,
-                shardDrivers_[idx]->pumpWith(shardClients_[idx].get()));
-            if (!t->resolved())
-                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
-                                         "]: shard " + std::to_string(w) +
-                                         " replication plane did not resolve — refusing to start");
-            // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
-            // are unknown at parse time, so each plane verifies them in-band.
-            t->enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds);
-            perWorkerReplTransports_.push_back(std::move(t));
+        // Self-contained worker shards (spec §3.1/§3.3): one DEFERRED plane per
+        // worker (replicas bind their concrete transport pointer now).  The planes
+        // attach to their shard's own client in attachShardRuntimes_(), after the
+        // long startup phases (fix round 1 I2).  Single node: no planes.
+        bool hasPeers = false;
+        for (const auto& peer : config_.peers) hasPeers |= (peer.id != config_.nodeId);
+        if (hasPeers) {
+            const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
+            perWorkerReplTransports_.reserve(static_cast<std::size_t>(wc));
+            for (int32_t w = 0; w < wc; ++w)
+                perWorkerReplTransports_.push_back(std::make_unique<WorkerReplicationTransport>(
+                    w, config_.shardReplBindChannel(w), config_.replBaseStreamId + w,
+                    WorkerReplicationTransport::DeferredAttach{}));
         }
-        if (!perWorkerReplTransports_.empty())
-            spdlog::info("BrokerNode[{}]: {} shard replication plane(s) built (replBaseStreamId={})",
-                         config_.nodeId, perWorkerReplTransports_.size(), config_.replBaseStreamId);
     } else if (config_.perWorkerReplication && aeron_) {
         // Collect (peerId, peerChannel) pairs for all peers with a replication port.
         std::vector<std::pair<rune::replication::NodeId, std::string>> replPeers;
@@ -1011,44 +1000,10 @@ void BrokerNode::buildWorkerPool() {
     }
 
     if (config_.shardMode()) {
-        // Self-contained worker shards (spec §3.1): worker i's client ingress,
-        // record egress and (buildReplication) plane live on ITS OWN client and are
-        // resolved by pumping ITS OWN invoker driver on this (startup) thread.
-        // Any unresolved per-worker resource is a hard refusal — no fallback.
-        int32_t egressBase = config_.workerEgressBaseStreamId;
-        if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
-        const int32_t egressControlBase = config_.effectiveWorkerEgressControlBasePort();
-        shardAgents_.reserve(static_cast<std::size_t>(wc));
-        for (int32_t i = 0; i < wc; ++i) {
-            const auto idx = static_cast<std::size_t>(i);
-            auto pump = shardDrivers_[idx]->pumpWith(shardClients_[idx].get());
-            auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(i),
-                                                       config_.workerIngressBaseStreamId + i, pump);
-            const std::string control = config_.workerEgressControlHost + ":" +
-                                        std::to_string(egressControlBase + i);
-            auto eg = std::make_unique<WorkerEgress>(shardClients_[idx], control, egressBase + i, pump);
-            if (!ing->resolved() || !eg->resolved())
-                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
-                                         std::to_string(i) + " ingress/egress did not resolve — refusing to start");
-            Worker& wk = workerPool_->worker(i);
-            wk.setWorkerIngress(ing.get(), /*active=*/true);
-            wk.setWorkerEgress(eg.get());
-            wk.setShardMode(true);
-            workerIngresses_.push_back(std::move(ing));
-            workerEgresses_.push_back(std::move(eg));
-            shardAgents_.push_back(std::make_unique<ShardAgent>(wk, *shardDrivers_[idx], *shardClients_[idx]));
-        }
-        if (gateway_) {
-            gateway_->setPerWorkerIngressActive(true);
-            gateway_->setPerWorkerEgressActive(true);
-            gateway_->setWorkerEgressParams(egressControlBase, egressBase);
-            if (topicRegistry_)
-                for (const auto& ts : config_.topics)
-                    for (int32_t p = 0; p < ts.partitionCount; ++p)
-                        if (auto* log = topicRegistry_->log(ts.topicId, p)) gateway_->addWorkerOwnedLog(log);
-        }
-        spdlog::info("BrokerNode[{}]: {} worker shard(s) wired (own driver + client + ingress + egress)",
-                     config_.nodeId, wc);
+        // Self-contained worker shards (spec §3.1): each worker's client ingress,
+        // record egress and plane are attached in attachShardRuntimes_() on its
+        // OWN client, after the long startup phases (fix round 1 I2).
+        for (int32_t i = 0; i < wc; ++i) workerPool_->worker(i).setShardMode(true);
     } else {
         if (config_.perWorkerIngressEnabled && aeron_) {
             const std::string& channel  = config_.clientEndpoint.channel;
@@ -1193,6 +1148,7 @@ void BrokerNode::buildWorkerPool() {
 //   TODO(Milestone B): per-peer client endpoints for exact REDIRECT.
 // ---------------------------------------------------------------------------
 void BrokerNode::buildGateway() {
+    if (startupPhaseHookForTest_) startupPhaseHookForTest_("build-gateway");   // test-only fault injection
     // Capture config_ by value (immutable after construction).
     const std::string clientChannel  = config_.clientEndpoint.channel;
     const int32_t     clientStreamId = config_.clientEndpoint.streamId;
@@ -2525,18 +2481,21 @@ void BrokerNode::buildShardRuntimes_() {
     const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
     std::error_code ec;
     const auto space = fs::space(config_.effectiveAeronDir(), ec);
-    if (!ec) {
-        if (auto err = checkAeronSpace(space.available, wc, config_.aeronTermBufferBytes)) {
-            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
-                                     "]: refusing shard mode — " + *err);
-        }
+    if (ec) {
+        spdlog::warn("BrokerNode[{}]: cannot stat free space of aeron dir {} ({}) — shard tmpfs budget "
+                     "NOT checked", config_.nodeId, config_.effectiveAeronDir(), ec.message());
+    } else if (auto err = checkAeronSpace(space.available, wc + 1, config_.aeronTermBufferBytes)) {
+        // wc shard drivers + the node driver share the aeron filesystem.
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing shard mode — " + *err);
     }
     shardDrivers_.reserve(static_cast<std::size_t>(wc));
     shardClients_.reserve(static_cast<std::size_t>(wc));
     for (int32_t w = 0; w < wc; ++w) {
         const std::string dir = (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
-        shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(
-            EmbeddedDriverConfig::fromNode(config_, dir), DriverMode::Invoker));
+        auto dcfg = EmbeddedDriverConfig::fromNode(config_, dir);
+        dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
+        shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
         aeron::Context ctx;
         ctx.aeronDir(dir);
         ctx.useConductorAgentInvoker(true);
@@ -2551,6 +2510,69 @@ void BrokerNode::buildShardRuntimes_() {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::attachShardRuntimes_ — right after buildShardRuntimes_(), right
+// before the runners start (no long phase in between).  Per worker w, on its OWN
+// client, resolved by pumping its OWN invoker driver from this thread: the
+// deferred replication plane (handshake enabled), client ingress, record egress,
+// then its ShardAgent.  Any unresolved resource is a hard refusal (throw).
+// ---------------------------------------------------------------------------
+void BrokerNode::attachShardRuntimes_() {
+    const int32_t wc = static_cast<int32_t>(shardClients_.size());
+    if (!workerPool_ || workerPool_->workerCount() != wc)
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: shard runtime count does not match the worker pool — refusing to start");
+    int32_t egressBase = config_.workerEgressBaseStreamId;
+    if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
+    const int32_t egressControlBase = config_.effectiveWorkerEgressControlBasePort();
+    shardAgents_.reserve(static_cast<std::size_t>(wc));
+    for (int32_t w = 0; w < wc; ++w) {
+        const auto idx = static_cast<std::size_t>(w);
+        auto pump = shardDrivers_[idx]->pumpWith(shardClients_[idx].get());
+        if (!perWorkerReplTransports_.empty()) {
+            std::vector<std::pair<rune::replication::NodeId, std::string>> peersW;
+            std::vector<rune::replication::NodeId> peerIds;
+            for (const auto& peer : config_.peers) {
+                if (peer.id == config_.nodeId) continue;
+                peersW.push_back({static_cast<rune::replication::NodeId>(peer.id),
+                                  NodeConfig::shardPeerReplChannel(peer, w)});
+                peerIds.push_back(static_cast<rune::replication::NodeId>(peer.id));
+            }
+            auto& plane = *perWorkerReplTransports_[idx];
+            if (!plane.attach(shardClients_[idx], peersW, config_.replBaseStreamId + w, pump))
+                throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
+                                         std::to_string(w) + " replication plane did not resolve — refusing to start");
+            // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
+            // are unknown at parse time, so each plane verifies them in-band.
+            plane.enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds);
+        }
+        auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(w),
+                                                   config_.workerIngressBaseStreamId + w, pump);
+        const std::string control = config_.workerEgressControlHost + ":" + std::to_string(egressControlBase + w);
+        auto eg = std::make_unique<WorkerEgress>(shardClients_[idx], control, egressBase + w, pump);
+        if (!ing->resolved() || !eg->resolved())
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
+                                     std::to_string(w) + " ingress/egress did not resolve — refusing to start");
+        Worker& wk = workerPool_->worker(w);
+        wk.setWorkerIngress(ing.get(), /*active=*/true);
+        wk.setWorkerEgress(eg.get());
+        workerIngresses_.push_back(std::move(ing));
+        workerEgresses_.push_back(std::move(eg));
+        shardAgents_.push_back(std::make_unique<ShardAgent>(wk, *shardDrivers_[idx], *shardClients_[idx], clock_));
+    }
+    if (gateway_) {
+        gateway_->setPerWorkerIngressActive(true);
+        gateway_->setPerWorkerEgressActive(true);
+        gateway_->setWorkerEgressParams(egressControlBase, egressBase);
+        if (topicRegistry_)
+            for (const auto& ts : config_.topics)
+                for (int32_t p = 0; p < ts.partitionCount; ++p)
+                    if (auto* log = topicRegistry_->log(ts.topicId, p)) gateway_->addWorkerOwnedLog(log);
+    }
+    spdlog::info("BrokerNode[{}]: {} worker shard(s) attached (own driver + client + plane + ingress + egress)",
+                 config_.nodeId, wc);
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::teardownShardRuntimes_ — precondition: every shard runner joined.
 // Hand-off (EmbeddedDriver one-pumper contract): the closing thread binds itself
 // as each invoker driver's pumper, clients close (their close commands queue in
@@ -2561,16 +2583,36 @@ void BrokerNode::teardownShardRuntimes_() noexcept {
     if (shardDrivers_.empty() && shardClients_.empty()) return;
     shardAgents_.clear();
     for (auto& d : shardDrivers_) if (d) d->bindPumpThread();
+    // Every close is isolated: a throwing client/driver close is logged and the
+    // rest still close (noexcept must never terminate the process here).
+    for (std::size_t w = 0; w < shardClients_.size(); ++w) {
+        try {
+            shardClients_[w].reset();
+        } catch (const std::exception& e) {
+            spdlog::error("BrokerNode[{}]: shard {} client close threw: {}", config_.nodeId, w, e.what());
+        } catch (...) {
+            spdlog::error("BrokerNode[{}]: shard {} client close threw (unknown)", config_.nodeId, w);
+        }
+    }
     shardClients_.clear();
     for (auto& d : shardDrivers_) {
         if (!d) continue;
-        d->close();
-        if (d->isOpen()) {
+        bool open = true;
+        try {
+            d->close();
+            open = d->isOpen();
+        } catch (const std::exception& e) {
+            spdlog::error("BrokerNode[{}]: shard driver {} close threw: {}", config_.nodeId, d->dir(), e.what());
+        } catch (...) {
+            spdlog::error("BrokerNode[{}]: shard driver {} close threw (unknown)", config_.nodeId, d->dir());
+        }
+        if (open) {
             spdlog::critical("BrokerNode[{}]: shard driver {} did not close on the stopping thread — LEAK",
                              config_.nodeId, d->dir());
 #ifndef NDEBUG
             std::abort();
 #endif
+            (void)d.release();   // never re-run a failing close from the destructor
         }
     }
     shardDrivers_.clear();

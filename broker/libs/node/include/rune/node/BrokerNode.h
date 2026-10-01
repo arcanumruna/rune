@@ -77,6 +77,7 @@ extern "C" {
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -419,6 +420,19 @@ public:
     /// drivers built (0 in legacy mode).  Startup/stop-time state (no worker access).
     [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept { return shardDrivers_.size(); }
 
+    /// Test-only fault injection: called (on the start() thread) at named startup
+    /// phases ("build-gateway" = offset/txn/metadata rebuilds + admin build).
+    /// Set before start().
+    void setStartupPhaseHookForTest(std::function<void(std::string_view)> hook) {
+        startupPhaseHookForTest_ = std::move(hook);
+    }
+
+    /// Test-only: is worker w's shard Aeron client closed?  Call ONLY inside
+    /// onOwnerThreadForTest on worker w (the client is worker-owned).
+    [[nodiscard]] bool shardClientClosedForTest(int32_t w) const {
+        return shardClients_.at(static_cast<std::size_t>(w))->isClosed();
+    }
+
     /// Test-only: worker w's replication plane (nullptr if none).  The vector is
     /// startup-immutable; the transport's STATE is worker-owned — read it only
     /// inside onOwnerThreadForTest on that worker.
@@ -650,7 +664,9 @@ private:
     std::vector<std::unique_ptr<EmbeddedDriver>> shardDrivers_;
     std::vector<std::shared_ptr<aeron::Aeron>>   shardClients_;
     std::vector<std::unique_ptr<ShardAgent>>     shardAgents_;
+    std::function<void(std::string_view)>        startupPhaseHookForTest_;
     void buildShardRuntimes_();
+    void attachShardRuntimes_();
     void teardownShardRuntimes_() noexcept;
 
     // E5.1.3: per-worker Aeron ingress subscriptions.

@@ -1,6 +1,8 @@
 // ShardAgentTest.cpp — the shard pass drives its OWN driver + conductor; the
-// loop-duration alarm uses only the injected clock (no wall time).
+// loop-duration alarm measures the pass's WORK duration from the injected clock
+// only (no wall time; idle parks between passes are never counted).
 #include <rune/node/ShardAgent.h>
+#include <rune/node/WorkerPool.h>
 
 #include <Aeron.h>
 #include <gtest/gtest.h>
@@ -31,19 +33,40 @@ struct Shard {
 };
 }
 
-TEST(ShardAgent, SlowPassAlarmCountsOnlyFromInjectedClock) {
+// Injected clock for the pass-end sample: the test sets what "now" is when the
+// pass finishes its work.
+struct TestClock final : rune::consensus::NanoClock {
+    int64_t endNs = 0;
+    int64_t nowNs() const override { return endNs; }
+};
+using TestShardAgent = BasicShardAgent<TestClock>;
+
+TEST(ShardAgentRegression, SlowPassAlarmMeasuresPassDurationNotGaps) {
     Shard s;
-    ShardAgent a(s.worker, *s.driver, *s.client);
-    a.doWork(1'000'000);
-    a.doWork(1'050'000);                        // 50 µs gap
+    TestClock clk;
+    TestShardAgent a(s.worker, *s.driver, *s.client, clk);
+    clk.endNs = 1'000'000 + 50'000;
+    a.doWork(1'000'000);                                   // 50 µs pass
     EXPECT_EQ(a.slowPassesForTest(), 0u);
-    a.doWork(1'050'000 + ShardAgent::kSlowPassNs + 1);
+    clk.endNs = 90'000'000 + 10'000;
+    a.doWork(90'000'000);                                  // 89 ms idle park before it, 10 µs pass
+    EXPECT_EQ(a.slowPassesForTest(), 0u) << "an idle gap between passes is not a slow pass";
+    clk.endNs = 100'000'000 + TestShardAgent::kSlowPassNs + 1;
+    a.doWork(100'000'000);                                 // the pass itself exceeds the budget
     EXPECT_EQ(a.slowPassesForTest(), 1u);
+}
+
+TEST(ShardAgentRegression, StartShardRunnersRefusesAgentCountMismatch) {
+    WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
+    std::vector<std::unique_ptr<ShardAgent>> none;
+    rune::consensus::MonotonicNanoClock clk;
+    EXPECT_THROW(pool.startShardRunners(none, clk, /*busySpin=*/false, 200), std::logic_error);
 }
 
 TEST(ShardAgent, PassDrivesOwnDriverAndConductor) {
     Shard s;
-    ShardAgent a(s.worker, *s.driver, *s.client);
+    rune::consensus::MonotonicNanoClock clk;
+    ShardAgent a(s.worker, *s.driver, *s.client, clk);
     const int64_t reg = s.client->addSubscription("aeron:ipc", 9100);
     std::shared_ptr<aeron::Subscription> sub;
     int64_t now = 1'000;

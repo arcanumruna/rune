@@ -45,6 +45,8 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -303,12 +305,15 @@ public:
 
     // Shard mode (spec §3.1): one runner per ShardAgent.  Busy-spin ONLY when the
     // worker is pinned to its own core; otherwise the backoff idle (§1a.3).
-    // Idempotent (no-op if runners are already started).
+    // Idempotent (no-op if runners are already started).  Throws (startup
+    // refusal) when there is not exactly one agent per worker.
     void startShardRunners(std::vector<std::unique_ptr<ShardAgent>>& agents,
                            rune::consensus::NanoClock& clock,
                            bool busySpin, int64_t maxParkUs) {
         if (!runners_.empty()) return;
-        assert(agents.size() == workers_.size() && "one ShardAgent per worker");
+        if (agents.size() != workers_.size())      // hard check in release too (startup refusal)
+            throw std::logic_error("WorkerPool::startShardRunners: " + std::to_string(agents.size()) +
+                                   " ShardAgent(s) for " + std::to_string(workers_.size()) + " worker(s)");
         idles_.reserve(agents.size());
         runners_.reserve(agents.size());
         for (auto& a : agents) {
