@@ -17,12 +17,11 @@
 //     BrokerNode::start() — makes the CALLING thread the only observer.
 //     observe() drains ring_ and returns the latest snapshot; observed_ is owned
 //     by that thread.  observe() from any OTHER thread is refused: logged
-//     critical, std::abort() in debug builds, a "no leader" snapshot in release
-//     (same pattern as EmbeddedDriver's pump owner).  Before bindObserver()
-//     nothing is published (the control thread is not running) and observe()
-//     returns the initial view without draining.  Rebinding (bindObserver() on
-//     another thread) is allowed only across a happens-before edge with the
-//     previous observer (thread start / join).
+//     critical then std::abort() in ALL builds — a second consumer is a
+//     programming error and a silent "no leader" in release would hide it.
+//     Before bindObserver() nothing is published (the control thread is not
+//     running) and observe() returns the initial view without draining.
+//     There is no rebinding: bindObserver() runs once, from start().
 //
 //   Everything the CONTROL thread itself needs (gateway leaderView, group / txn
 //   coordinators, admin role hook) MUST use computeOnControl(), never observe():
@@ -110,7 +109,7 @@ public:
     void bindObserver() noexcept { observer_ = std::this_thread::get_id(); }
 
     /// OBSERVER thread only (enforced): drain published snapshots; return the
-    /// latest.  Another thread is refused (critical log; abort in debug).
+    /// latest.  Another thread is refused (critical log + abort, all builds).
     LeaderSnapshot observe() noexcept {
         if (observer_ == std::thread::id{}) return observed_;   // unbound: nothing published
         if (std::this_thread::get_id() != observer_) [[unlikely]] {
@@ -130,9 +129,7 @@ private:
         spdlog::critical("LeaderObserver: observe() from a thread that is not the bound "
                          "observer — the leadership ring has exactly ONE consumer (F9a); "
                          "refused");
-#ifndef NDEBUG
         std::abort();
-#endif
     }
 
     static constexpr std::int32_t kNotLeaderMsg = 1;

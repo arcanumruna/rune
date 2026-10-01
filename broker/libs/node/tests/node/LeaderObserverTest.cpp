@@ -79,23 +79,16 @@ TEST(LeaderObserverRegression, CrossThreadSnapshotsAreNeverTorn) {
 }
 
 // Fix round 1: single reader BY CONSTRUCTION.  The bound observer thread drains;
-// any other thread is refused (critical log + abort in debug, "no leader"
-// snapshot in release) — it can never become a second ring consumer.
+// any other thread is refused (critical log + abort, all builds) — it can never
+// become a second ring consumer.
 TEST(LeaderObserverRegression, SecondThreadObserverIsRefused) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     LeaderObserver o{1};
     o.bindObserver();                                  // this thread observes
     o.publish({/*leaderId=*/1, /*term=*/4, /*isLeader=*/true});
-#ifndef NDEBUG
     EXPECT_DEATH({
         std::thread t([&o] { (void)o.observe(); });
         t.join();
     }, "");
-#else
-    LeaderSnapshot foreign{7, 7, true};
-    std::thread t([&o, &foreign] { foreign = o.observe(); });
-    t.join();
-    EXPECT_EQ(foreign, LeaderSnapshot{}) << "a foreign observer gets nothing";
-#endif
     EXPECT_EQ(o.observe().term, 4) << "the bound observer still drains (ring untouched)";
 }

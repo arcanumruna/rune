@@ -140,7 +140,8 @@ void NodeStateFile::updateCandidateTermId(
 Term NodeStateFile::proposeMaxCandidateTermId(
     Term candidateTermId, int64_t logPosition, int64_t timestampMs)
 {
-    // ACQUIRE read — mirrors Java's getLongVolatile.
+    // Plain read: the file is single-writer (this thread); ordering for crash
+    // consistency is provided at the store side (CRASH-ORDER barrier).
     const Term current = this->candidateTermId();
 
     if (candidateTermId > current) {

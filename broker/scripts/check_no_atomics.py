@@ -104,7 +104,7 @@ def strip_comments_and_strings(text: str) -> str:
 
 STD_NAMES = (
     r"atomic\w*|memory_order\w*|kill_dependency"
-    r"|(?:recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex"
+    r"|(?:recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex|lock|try_lock"
     r"|condition_variable(?:_any)?|lock_guard|unique_lock|shared_lock|scoped_lock"
     r"|counting_semaphore|binary_semaphore|latch|barrier|once_flag|call_once"
     r"|jthread|stop_source|stop_token|stop_callback"
@@ -126,7 +126,9 @@ PLAIN_FAMILIES = [
     (r"(?<![\w])(?:asm|__asm|__asm__)\b", "inline asm"),
     (r"#\s*include\s*<(?:atomic|mutex|shared_mutex|condition_variable|semaphore|latch|barrier"
      r"|stop_token|future|stdatomic\.h|semaphore\.h)>", "sync header include"),
-    (r"\b(?:put|get)\w*(?:Ordered|Volatile)\s*\(", "Aeron ordered/volatile accessor"),
+    (r"\b\w*(?:Ordered|Volatile|Release|Acquire)\s*\(", "Aeron ordered/volatile/release/acquire accessor"),
+    (r"\bproposeM(?:ax|in)(?:Ordered|Release)?\s*\(", "Aeron propose* accessor"),
+    (r"\bAtomicArrayUpdater\b", "Aeron AtomicArrayUpdater"),
     (r"\b(?:compareAndSet|getAndAdd|getAndSet|addAndGet)\w*\s*\(", "Aeron CAS/RMW accessor"),
     (r"\baeron::concurrent::atomic::", "aeron::concurrent::atomic"),
     (r"\bAtomicCounter\b", "Aeron AtomicCounter"),
@@ -135,6 +137,15 @@ PLAIN_RE = [(re.compile(p), label) for p, label in PLAIN_FAMILIES]
 
 USING_STD_RE = re.compile(r"\busing\s+namespace\s+(?:::)?std\s*;")
 ALIAS_RE = re.compile(r"\bnamespace\s+(\w+)\s*=\s*(?:::)?std\s*;")
+AERON_NS_RE = re.compile(r"\busing\s+namespace\s+(?:::)?aeron::concurrent(?:::atomic)?\s*;"
+                         r"|\bnamespace\s+\w+\s*=\s*(?:::)?aeron::concurrent(?:::atomic)?\s*;")
+AERON_ALIAS_RE = re.compile(r"\bnamespace\s+(\w+)\s*=\s*(?:::)?aeron::concurrent(?:::atomic)?\s*;")
+AERON_OPS = r"(?:cmpxchg|xchg|thread_fence|fence|acquire|release|loadFence|storeFence|getAndAddInt32|getAndAddInt64)"
+# Mutex / condvar / once_flag declarations: their identifiers are tracked like
+# atomics so a new `mu_.lock()` critical section on an allowlisted mutex is caught.
+MUTEX_DECL_RE = re.compile(
+    r"\b(?:\w+::)*(?:(?:recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex"
+    r"|condition_variable(?:_any)?|once_flag)\s+(\w+)\s*[{=;\[(]")
 ATOMIC_DECL_RE = re.compile(
     r"(?:\b(?:\w+::)*atomic(?:_ref)?\s*<[^;{}()]*?>|\b_Atomic\s*\([^)]*\)|\b_Atomic\s+[\w:\s*]+?)"
     r"\s*[*&]?\s*(\w+)\s*(?:[{=;\[]|\()")
@@ -173,6 +184,8 @@ def collect_atomic_names(cleans: dict):
     for rel, clean in cleans.items():
         for m in ATOMIC_DECL_RE.finditer(clean):
             names.setdefault(stem(rel), set()).add(m.group(1))
+        for m in MUTEX_DECL_RE.finditer(clean):
+            names.setdefault(stem(rel), set()).add(m.group(1))
     return names
 
 
@@ -187,10 +200,18 @@ def find_hits(raw: str, clean: str, atomic_names, rel: str = ""):
     # name (MetadataService::minIsr_ is a plain int).
     all_names = set().union(*atomic_names.values()) if atomic_names else set()
     own = atomic_names.get(stem(rel), set()) if atomic_names else set()
-    decl_rx = use_rx = None
+    decl_rx = use_rx = member_rx = aeron_rx = None
+    if AERON_NS_RE.search(clean):
+        apre = "|".join(re.escape(a) for a in sorted(set(AERON_ALIAS_RE.findall(clean)) | {"atomic"}))
+        aeron_rx = re.compile(r"(?<![\w])(?:(?:" + apre + r")\s*::\s*)?" + AERON_OPS + r"\s*\(")
     if all_names:
         decl_rx = re.compile(r"\bdecltype\s*\([^;]*?\b(?:" +
                              "|".join(re.escape(n) for n in sorted(all_names)) + r")\b")
+    if all_names:
+        # m1: member access to ANY atomic/mutex-declared identifier from ANY file
+        # (a split implementation file, friend or derived class) is flagged.
+        member_rx = re.compile(r"(?:\.|->)\s*(?:" +
+                               "|".join(re.escape(n) for n in sorted(all_names)) + r")\b")
     if own:
         use_rx = re.compile(r"(?<![\w])(?:" + "|".join(re.escape(n) for n in sorted(own)) + r")\b")
     raw_lines = raw.splitlines()
@@ -204,6 +225,10 @@ def find_hits(raw: str, clean: str, atomic_names, rel: str = ""):
                 if rx.search(line):
                     label = lab
                     break
+        if label is None and aeron_rx is not None and aeron_rx.search(line):
+            label = "Aeron atomic op via namespace using/alias"
+        if label is None and member_rx is not None and member_rx.search(line):
+            label = "member access to an atomic/mutex-declared identifier"
         if label is None and decl_rx is not None and decl_rx.search(line):
             label = "decltype of an atomic"
         if label is None and use_rx is not None and use_rx.search(line):
@@ -331,6 +356,18 @@ SELFTEST_FILES = {
     "libs/a/CountExact.h": "std::atomic_thread_fence(std::memory_order_release);\n"
                            "std::atomic_thread_fence(std::memory_order_release);\n",
     "libs/a/DigitSep.h": "constexpr long k = 1'000'000; std::atomic<int> hidden{0};\n",
+    "libs/a/AeronSetOrdered.h": "void o5(C& c) { c.setOrdered(1); }\n",
+    "libs/a/AeronSetRelease.h": "void o6(C& c) { c.setRelease(1); }\n",
+    "libs/a/AeronPropose.h": "void o7(C& c) { c.proposeMaxOrdered(1); c.proposeMax(2); }\n",
+    "libs/a/AeronAddOrdered.h": "void o8(B& b) { b.addInt64Ordered(0, 1); }\n",
+    "libs/a/AeronUpdater.h": "AtomicArrayUpdater<int*> up;\n",
+    "libs/a/AeronAlias.h": "namespace atm = aeron::concurrent::atomic;\nvoid o9() { atm::release(); atm::fence(); }\n",
+    "libs/a/AeronUsingConc.h": "using namespace aeron::concurrent;\nvoid o10(long* p) { atomic::cmpxchg(p, 0, 1); }\n",
+    "libs/a/AeronUsingAtomic.h": "using namespace aeron::concurrent::atomic;\nvoid o11(long* p) { xchg(p, 1); thread_fence(); }\n",
+    "libs/a/MuDecl.h": "struct M { std::mutex muX_; };\n",
+    "libs/a/MuDecl.cpp": "void M2() { muX_.lock(); muX_.unlock(); }\n",
+    "libs/a/StdLock.h": "void l2() { std::lock(a, b); std::try_lock(a, b); }\n",
+    "libs/a/SplitImpl.cpp": "int v(AllowedTok& t) { return t.allowedMember_.load(std::memory_order_relaxed) + t.allowedMember_++; }\n",
 }
 SELFTEST_ALLOWLIST = """
 # comment
@@ -352,6 +389,10 @@ SELFTEST_EXPECT_VIOLATION_PATHS = {
     "libs/a/AeronOrdered.h", "libs/a/AeronVolatile.h", "libs/a/AeronCas.h", "libs/a/AeronRmw.h",
     "libs/a/AeronNs.h", "libs/a/AeronCounter.h", "libs/a/AllowedTok.h", "libs/a/Decltype.h", "libs/a/AllowedTok.cpp",
     "libs/a/CountTwice.h", "libs/a/DigitSep.h",
+    "libs/a/AeronSetOrdered.h", "libs/a/AeronSetRelease.h", "libs/a/AeronPropose.h",
+    "libs/a/AeronAddOrdered.h", "libs/a/AeronUpdater.h", "libs/a/AeronAlias.h",
+    "libs/a/AeronUsingConc.h", "libs/a/AeronUsingAtomic.h", "libs/a/MuDecl.h",
+    "libs/a/MuDecl.cpp", "libs/a/StdLock.h", "libs/a/SplitImpl.cpp",
 }
 
 
