@@ -457,7 +457,9 @@ TEST(ProducerClose, DutyTailCloseOnFailureCompletesPreCloseClaimsClosedOnceRegre
                     failed = true;
                 }
                 (void)dutyPass(impl, cs, sink, kNow, /*ack=*/false);  // nothing acks: all must close
-                if (failed && appsDone.load(std::memory_order_acquire) == kThreads &&
+                const int br = beginRes.load(std::memory_order_acquire);
+                const bool beginSettled = br == 0 || (br == 1 && began);
+                if (failed && beginSettled && appsDone.load(std::memory_order_acquire) == kThreads &&
                     impl.testRingHead() >= impl.testRingTail()) {
                     break;
                 }
