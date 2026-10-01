@@ -926,8 +926,7 @@ TEST(PerWorkerReplication, EpochChangeNoCommittedLossAndConverges) {
     rune::node::BrokerNode* newLeaderNode   = (nl == 0) ? f2Node : restartedF1.get();
     rune::node::BrokerNode* newFollowerNode = (nl == 0) ? restartedF1.get() : f2Node;
     ASSERT_TRUE(hasReplica(*newFollowerNode));
-    ASSERT_EQ(roleOnOwner(*newLeaderNode), Role::Leader);
-    EXPECT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
+    ASSERT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
         << "New leader's partition replica must be in Leader role";
 
     // --- Phase 7: invariant checks ---
