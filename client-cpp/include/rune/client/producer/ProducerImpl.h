@@ -348,6 +348,23 @@ private:
 enum class PumpResult : uint8_t { Pumped, DeclinedInCycle, NotOwner };
 
 // ---------------------------------------------------------------------------
+// RejectReason — Task 14 fix4: WHY a submit was not accepted, RETURNED to the
+// caller (trySubmit's out-param, submitTier2Batch's return value) — never kept
+// as producer member state (which a foreign thread would read while the owner
+// writes it, and which goes stale).
+// ---------------------------------------------------------------------------
+enum class RejectReason : uint8_t {
+    None,               ///< accepted
+    Closed,             ///< the producer's Client was closed
+    WrongThread,        ///< Direct (Invoker) producer used off its owner thread
+    ValueTooLarge,
+    BackPressured,      ///< ring full / builder full (retry)
+    DeferredFull,       ///< Direct: in-duty deferral arena / partition share full (retry later)
+    PartitionDeferred,  ///< Direct: this partition still has deferred records that cannot go yet
+    Unaddressable,      ///< Direct: the producer's partition table is full
+};
+
+// ---------------------------------------------------------------------------
 // ProducerImpl
 // ---------------------------------------------------------------------------
 class ProducerImpl {
@@ -389,8 +406,11 @@ public:
     /// own maxMsgLength (fix1 minor 11 — a message too big for a small ring maps
     /// to ValueTooLarge, not BackPressured, so it can never livelock a retry),
     /// then writes the SEND_RECORD. Never drops silently — see SendResult.
+    /// fix4: `why` (optional) receives the reject reason, set before every
+    /// return (None when accepted).
     [[nodiscard]] SendResult trySubmit(int32_t topicId, int32_t partition, const Key& key,
-                                       std::span<const uint8_t> value, int64_t ackHandle) noexcept;
+                                       std::span<const uint8_t> value, int64_t ackHandle,
+                                       RejectReason* why = nullptr) noexcept;
 
     /// Slow path of the void send: retries until accepted; throws on non-retryable
     /// results (see Producer.h's send() doc for the exact exception per case).
@@ -461,16 +481,6 @@ public:
     void enableDirectIngress(const DirectIngress& d);
     [[nodiscard]] IngressMode ingressMode() const noexcept { return mode_; }
 
-    /// Task 14 fix1: true when the last Direct trySubmit/submitTier2Batch on the
-    /// owner thread was rejected because the DEFERRED buffer was full (a send
-    /// from a callback fired inside the producer's own duty work) — lets the
-    /// callback/future overloads report a distinct reason.  Owner thread only;
-    /// never written in Ring mode.
-    [[nodiscard]] bool lastRejectWasDeferredFull() const noexcept { return lastRejectDeferredFull_; }
-    /// fix3: why the last Direct submitTier2Batch on the owner thread returned
-    /// false, or nullptr when no specific reason applies (closed / foreign
-    /// thread).  Owner thread only.
-    [[nodiscard]] const char* tier2RejectReason() const noexcept { return tier2RejectReason_; }
     /// Diagnostics / tests (owner thread): records + Tier-2 tokens deferred.
     [[nodiscard]] uint32_t deferredCount() const noexcept { return deferred_.live(); }
     /// Void deferred records failed by the delivery timeout (counted + logged).
@@ -522,8 +532,9 @@ public:
     /// batchBytes: pre-built RecordBatch bytes (baseSequence field = 0; will be
     ///             patched by the agent).
     ///
-    /// Returns false if the ring is full (caller should handle as an error).
-    bool submitTier2Batch(int32_t topicId,
+    /// fix4: returns RejectReason::None when accepted; otherwise why not (the
+    /// caller still owns the handle and fails it with a reason-specific text).
+    RejectReason submitTier2Batch(int32_t topicId,
                           int32_t partition,
                           int64_t ackHandle,
                           int32_t recordCount,
@@ -748,9 +759,14 @@ public:
     /// count, the unknown-partition counters and every partition's deferred
     /// counters.  true = consistent.
     [[nodiscard]] bool debugArenaConsistent() noexcept;
-    /// The n-th live record visited by the NEXT apply pass fails as if its
-    /// apply threw (the loss path).  0 = off.
-    void debugFailDeferredAppliesFrom(uint32_t n) noexcept { debugFailAt_ = n; }
+    /// The NEXT apply pass's apply ATTEMPTS (Tier-1 records it tries to append,
+    /// numbered from 1; records kept without an attempt are not counted) in
+    /// [from, from + count) fail as if appendRecord_ threw (the loss path).
+    /// from = 0: off.
+    void debugFailDeferredApplies(uint32_t from, uint32_t count) noexcept {
+        debugFailAt_    = from;
+        debugFailCount_ = count;
+    }
     /// Apply passes run so far.
     [[nodiscard]] uint64_t debugDeferPasses() const noexcept { return deferPasses_; }
     [[nodiscard]] std::size_t debugDeferPartitionCap() const noexcept { return deferPartitionCap_; }
@@ -776,8 +792,12 @@ private:
         return mode_ == IngressMode::Direct ? directClosed_ : ring_.closed();
     }
     /// Task 14: trySubmit's Direct path (owner thread; no ring, no atomic).
+    /// Ring-mode body of trySubmit (unchanged hot path).
+    SendResult trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
+                              std::span<const uint8_t> value, int64_t ackHandle) noexcept;
     SendResult tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
-                                std::span<const uint8_t> value, int64_t ackHandle) noexcept;
+                                std::span<const uint8_t> value, int64_t ackHandle,
+                                RejectReason& why) noexcept;
 
     /// One record into its partition builder — the single append path shared by
     /// the ring drain (Ring) and trySubmit (Direct).  Owner/duty thread only.
@@ -945,8 +965,6 @@ private:
     std::size_t  maxPartitions_ = static_cast<std::size_t>(batchcorr::kMaxSlot) + 1;
     uint64_t     deferredApplyFailures_ = 0;
     bool         inDuty_ = false;
-    bool         lastRejectDeferredFull_ = false;
-    const char*  tier2RejectReason_ = nullptr;
     DeferredArena deferred_;
     uint32_t     deferredUnknown_ = 0;   // deferred records for not-yet-created partitions
     std::size_t  deferredUnknownBytes_ = 0;  // fix3: their arena bytes (aggregate cap = deferPartitionCap_)
@@ -966,7 +984,8 @@ private:
     bool         deferScanning_ = false;
     uint64_t     deferredTimedOutVoid_ = 0;
     uint64_t     deferPasses_ = 0;           // apply passes run (diagnostics / tests)
-    uint32_t     debugFailAt_ = 0;           // test seam: see debugFailDeferredAppliesFrom
+    uint32_t     debugFailAt_ = 0;           // test seam: see debugFailDeferredApplies
+    uint32_t     debugFailCount_ = 0;
 
     struct DutyScope {
         ProducerImpl& p;
@@ -996,8 +1015,9 @@ private:
     /// Accept one record / Tier-2 token into the arena (inDuty_).  Validates the
     /// partition first (an unaddressable one is InvalidTopic at send time).
     SendResult deferRecord_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
-                            std::span<const uint8_t> value, uint8_t flags, int64_t ackHandle) noexcept;
-    bool deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept;
+                            std::span<const uint8_t> value, uint8_t flags, int64_t ackHandle,
+                            RejectReason& why) noexcept;
+    RejectReason deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept;
     uint8_t* pushDeferred_(const DeferredHdr& h) noexcept;
     PartitionState* findPartition_(int32_t topicId, int32_t partition) noexcept;
     /// Removes a record's per-partition / unknown accounting.

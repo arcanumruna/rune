@@ -702,9 +702,10 @@ struct Fx {
             return true;
         };
     }
-    rc::SendResult send(int32_t part, char marker, int64_t h = 0) {
+    rc::SendResult send(int32_t part, char marker, int64_t h = 0,
+                        rc::producer::RejectReason* why = nullptr) {
         std::vector<uint8_t> v(16, static_cast<uint8_t>(marker));
-        return impl.trySubmit(1, part, rc::Key(uint64_t{1}), v, h);
+        return impl.trySubmit(1, part, rc::Key(uint64_t{1}), v, h, why);
     }
     void flush(int64_t now) { impl.flushBatches(now, 42, sink); }
     int64_t inflightCorr(int32_t part) {
@@ -894,7 +895,10 @@ TEST(DirectIngress, LossCallbackFlushAndCloseMidPassNoCorruptionRegression) {
     bool consistentInCallback = false;
     bool consistentAfterFlush = false;
     int64_t dOutcome = 0;
-    // Arm: the 2nd deferred record applied in the next pass fails (C below).
+    // Arm (inside the callback, i.e. before the pass that runs at the end of
+    // this duty work): the pass's apply ATTEMPTS are numbered from 1 — A (1,
+    // applied), B (2, ABORTs: p0 is stalled -> kept), C (3) — so attempt 3, C,
+    // takes the loss path.  D makes no attempt (p0 already ABORTed this pass).
     fx.inDuty(1, 2, [&] {
         (void)fx.send(2, 'A');  // applied (fresh partition) -> leaves a gap
         (void)fx.send(0, 'B');  // kept (p0 stalled) -> slid forward over A's slot
@@ -909,7 +913,7 @@ TEST(DirectIngress, LossCallbackFlushAndCloseMidPassNoCorruptionRegression) {
         if (fx.send(3, 'C', h) != rc::SendResult::Ok) fx.impl.failUnsubmitted(h, "x");
         const int64_t hd = fx.impl.registerCallback([&](int64_t off) { dOutcome = off == -1 ? -1 : 1; });
         if (fx.send(0, 'D', hd) != rc::SendResult::Ok) fx.impl.failUnsubmitted(hd, "x");
-        fx.impl.debugFailDeferredAppliesFrom(3);  // the 3rd record of the coming pass (C) fails
+        fx.impl.debugFailDeferredApplies(3, 1);  // attempt 3 (C) fails
     });
     EXPECT_TRUE(lossFired);
     EXPECT_TRUE(consistentInCallback) << "the loss callback must never see a half-compacted arena";
@@ -947,8 +951,9 @@ TEST(DirectIngress, UnknownPartitionDeferralsShareAnAggregateCapRegression) {
     bool hitDeferredFull = false;
     fx.inDuty(0, 1, [&] {
         for (int32_t part = 100; part < 2'000; ++part) {
-            if (fx.send(part, 'u') != rc::SendResult::Ok) {
-                hitDeferredFull = fx.impl.lastRejectWasDeferredFull();
+            rc::producer::RejectReason why = rc::producer::RejectReason::None;
+            if (fx.send(part, 'u', 0, &why) != rc::SendResult::Ok) {
+                hitDeferredFull = (why == rc::producer::RejectReason::DeferredFull);
                 break;
             }
             ++accepted;
@@ -998,4 +1003,82 @@ TEST(DirectIngress, Tier2RejectReasonIsSpecificRegression) {
     std::string err2;
     try { (void)f2.get(); } catch (const std::exception& e) { err2 = e.what(); }
     EXPECT_NE(err2.find("unaddressable"), std::string::npos) << err2;
+}
+
+// ===========================================================================
+// Task 14 fix round 4 — reject reasons are RETURNED (no shared member state).
+// ===========================================================================
+
+// A Tier-2 batch on a closed Direct producer says "closed" (not a stale
+// reason left over from an earlier reject, nor "ring full").
+TEST(DirectIngress, Tier2RejectAfterCloseSaysClosedRegression) {
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(stallCfg(), corr);
+    impl->enableDirectIngress(ownerDirect());
+    rc::Producer p(impl);
+    const rc::TopicHandle topic{1, 4};
+    impl->debugSetMaxPartitionsForTest(0);  // leave an "unaddressable" reject behind first
+    auto b0 = p.batch(topic, keyFor(0, 4));
+    b0.add(kVal);
+    auto f0 = b0.send();
+    try { (void)f0.get(); } catch (const std::exception&) {}
+    impl->markRingClosed();
+    auto b = p.batch(topic, keyFor(0, 4));
+    b.add(kVal);
+    auto f = b.send();
+    std::string err;
+    try { (void)f.get(); } catch (const std::exception& e) { err = e.what(); }
+    EXPECT_NE(err.find("closed"), std::string::npos) << err;
+}
+
+// A Tier-2 batch sent from a foreign thread on a Direct producer says "wrong
+// thread" — decided from the returned reason, no producer member is read
+// (TSan: the owner thread keeps rejecting / sending concurrently).
+TEST(DirectIngress, Tier2FromForeignThreadSaysWrongThreadRegression) {
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(stallCfg(), corr);
+    impl->enableDirectIngress(ownerDirect());
+    rc::Producer p(impl);
+    const rc::TopicHandle topic{1, 4};
+    std::atomic<bool> done{false};
+    std::string err;
+    std::thread other([&] {
+        auto b = p.batch(topic, keyFor(1, 4));
+        b.add(kVal);
+        auto f = b.send();
+        try { (void)f.get(); } catch (const std::exception& e) { err = e.what(); }
+        done.store(true, std::memory_order_release);
+    });
+    // The owner keeps producing rejects of its own meanwhile.
+    while (!done.load(std::memory_order_acquire)) {
+        (void)p.trySend(topic, keyFor(0, 4), kVal);
+        std::this_thread::yield();
+    }
+    other.join();
+    EXPECT_NE(err.find("wrong thread"), std::string::npos) << err;
+}
+
+// More than 16 losses in one pass: the first 16 are completed after the pass,
+// the rest are KEPT (not lost) and applied by the next pass; the arena stays
+// consistent throughout.
+TEST(DirectIngress, MoreLossesThanTheLostBufferKeepsTheRestRegression) {
+    Fx fx(stallCfg());
+    constexpr int kN = 20;
+    int failed = 0;
+    int succeeded = 0;
+    fx.inDuty(0, 1, [&] {
+        for (int i = 0; i < kN; ++i) {
+            const int64_t h = fx.impl.registerCallback([&](int64_t off) { (off == -1 ? failed : succeeded)++; });
+            if (fx.send(100 + i, 'L', h) != rc::SendResult::Ok) fx.impl.failUnsubmitted(h, "x");
+        }
+        fx.impl.debugFailDeferredApplies(1, kN);  // every apply in the coming pass fails
+    });
+    EXPECT_EQ(failed, 16) << "the lost-handle buffer holds 16 per pass";
+    EXPECT_TRUE(fx.impl.debugArenaConsistent());
+    EXPECT_EQ(fx.impl.deferredCount(), static_cast<uint32_t>(kN - 16)) << "the rest are kept, not lost";
+    fx.flush(2);  // next pass: no forced failures
+    EXPECT_TRUE(fx.impl.debugArenaConsistent());
+    EXPECT_EQ(fx.impl.deferredCount(), 0u);
+    for (int i = 16; i < kN; ++i) EXPECT_EQ(builderRecords(fx.impl, 100 + i), 1) << i;
+    EXPECT_EQ(failed, 16);
 }

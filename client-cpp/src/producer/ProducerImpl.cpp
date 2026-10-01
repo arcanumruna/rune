@@ -375,8 +375,26 @@ int64_t ProducerImpl::steadyNowNs_() noexcept {
 }
 
 SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
-                                   std::span<const uint8_t> value, int64_t ackHandle) noexcept {
-    if (mode_ == IngressMode::Direct) return tryAppendDirect_(topicId, partition, key, value, ackHandle);
+                                   std::span<const uint8_t> value, int64_t ackHandle,
+                                   RejectReason* why) noexcept {
+    if (mode_ == IngressMode::Direct) {
+        RejectReason w = RejectReason::None;
+        const SendResult r = tryAppendDirect_(topicId, partition, key, value, ackHandle, w);
+        if (why != nullptr) *why = w;
+        return r;
+    }
+    const SendResult r = trySubmitRing_(topicId, partition, key, value, ackHandle);
+    if (why != nullptr) [[unlikely]] {
+        *why = r == SendResult::Ok            ? RejectReason::None
+             : r == SendResult::Closed        ? RejectReason::Closed
+             : r == SendResult::ValueTooLarge ? RejectReason::ValueTooLarge
+                                              : RejectReason::BackPressured;
+    }
+    return r;
+}
+
+SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
+                                        std::span<const uint8_t> value, int64_t ackHandle) noexcept {
     // fix1 C2/I3: closed is a terminal state, checked first — a Producer whose
     // Client has gone through close() never reaches submitSendRecord(), and
     // (critically) sendBlocking() never gets far enough to touch the pump hook's
@@ -396,45 +414,63 @@ SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key
 }
 
 SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
-                                          std::span<const uint8_t> value, int64_t ackHandle) noexcept {
+                                          std::span<const uint8_t> value, int64_t ackHandle,
+                                          RejectReason& why) noexcept {
     // Task 14: the owner thread IS the duty-cycle thread — append straight into
     // the partition builder (no ring, no CAS, no second copy).  Every piece of
     // state touched here is owner-thread-only; any other thread is rejected
     // FIRST, before it reads any of it (incl. the closed bool).
-    if (std::this_thread::get_id() != dutyThreadId_) return SendResult::WrongThread;
+    if (std::this_thread::get_id() != dutyThreadId_) {
+        why = RejectReason::WrongThread;
+        return SendResult::WrongThread;
+    }
     // Closed is terminal, checked before anything else on the owner thread: a
     // Producer outliving its Client never appends, never reaches the pump hook.
-    if (directClosed_) return SendResult::Closed;
-    if (value.size() > rune::client::Producer::kMaxSendValueBytes) return SendResult::ValueTooLarge;
+    if (directClosed_) {
+        why = RejectReason::Closed;
+        return SendResult::Closed;
+    }
+    if (value.size() > rune::client::Producer::kMaxSendValueBytes) {
+        why = RejectReason::ValueTooLarge;
+        return SendResult::ValueTooLarge;
+    }
     const auto kb = key.bytes();
     const uint8_t flags = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
-    lastRejectDeferredFull_ = false;
     // Task 14 fix1 C1 / fix2: inside this producer's own duty work (a callback
     // it fired mid-walk / mid-reset) the record is DEFERRED into the arena and
     // applied when that work completes.
-    if (inDuty_) [[unlikely]] return deferRecord_(topicId, partition, kb, value, flags, ackHandle);
+    if (inDuty_) [[unlikely]] return deferRecord_(topicId, partition, kb, value, flags, ackHandle, why);
     // Outside: only THIS partition's deferred records (and, conservatively,
     // records for not-yet-created partitions) must go first — applied inline
     // now.  If this partition is still stalled the send must not overtake them.
     if (!deferred_.empty()) [[unlikely]] {
-        if (!settleDeferredFor_(topicId, partition)) return SendResult::BackPressured;
+        if (!settleDeferredFor_(topicId, partition)) {
+            why = RejectReason::PartitionDeferred;
+            return SendResult::BackPressured;
+        }
     }
     try {
         const auto a = appendRecord_(topicId, partition, kb.data(), static_cast<uint8_t>(kb.size()),
                                      value.data(), static_cast<uint32_t>(value.size()), flags,
                                      static_cast<uint64_t>(ackHandle), lastNowNs_);
-        if (a == rune::client::detail::ControlledAction::ABORT) return SendResult::BackPressured;
+        if (a == rune::client::detail::ControlledAction::ABORT) {
+            why = RejectReason::BackPressured;
+            return SendResult::BackPressured;
+        }
     } catch (const std::length_error&) {
         // getOrCreatePartition's partition-table cap (nothing was appended; the
         // caller still owns the ack handle): a partition this producer can never
         // address — reported, never retried as back-pressure.
+        why = RejectReason::Unaddressable;
         return SendResult::InvalidTopic;
     } catch (...) {
         // fix1 M1: anything else (bad_alloc growing a builder / the ack ring) —
         // nothing was committed (appendRecord_'s ordering), the caller still owns
         // the handle: "not accepted right now".
+        why = RejectReason::BackPressured;
         return SendResult::BackPressured;
     }
+    why = RejectReason::None;
     RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientAppSend, static_cast<uint32_t>(ackHandle));
     return SendResult::Ok;
 }
@@ -475,12 +511,13 @@ uint8_t* ProducerImpl::pushDeferred_(const DeferredHdr& h) noexcept {
 
 SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
                                       std::span<const uint8_t> key, std::span<const uint8_t> value,
-                                      uint8_t flags, int64_t ackHandle) noexcept {
+                                      uint8_t flags, int64_t ackHandle, RejectReason& why) noexcept {
     PartitionState* ps = findPartition_(topicId, partition);
     // fix2 minor 4: validate BEFORE accepting — a partition the table can never
     // hold is reported now, never accepted and then lost at apply time.
     // Conservative: every unknown deferred record counts as a new partition.
     if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) {
+        why = RejectReason::Unaddressable;
         return SendResult::InvalidTopic;
     }
     const uint32_t len = static_cast<uint32_t>(kRecHeaderSize + value.size());
@@ -489,7 +526,7 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
     // aggregate share (fix3) — neither can exhaust the arena.
     if (ps != nullptr ? ps->deferredBytes + size > deferPartitionCap_
                       : deferredUnknownBytes_ + size > deferPartitionCap_) {
-        lastRejectDeferredFull_ = true;
+        why = RejectReason::DeferredFull;
         return SendResult::BackPressured;
     }
     DeferredHdr h;
@@ -501,7 +538,7 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
     h.submitNs  = lastNowNs_;
     uint8_t* d = pushDeferred_(h);
     if (d == nullptr) {
-        lastRejectDeferredFull_ = true;
+        why = RejectReason::DeferredFull;
         return SendResult::BackPressured;
     }
     writeLE32(d, kRecTopicIdOff, topicId);
@@ -520,21 +557,19 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
         ++deferredUnknown_;
         deferredUnknownBytes_ += size;
     }
+    why = RejectReason::None;
     return SendResult::Ok;  // the handle (if any) is owned by the producer now
 }
 
-bool ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
+RejectReason ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
     PartitionState* ps = findPartition_(entry->topicId, entry->partition);
     if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) {
-        tier2RejectReason_ = "Tier-2 batch rejected — unaddressable partition (the producer's "
-                             "partition table is full) — batch dropped";
-        return false;
+        return RejectReason::Unaddressable;
     }
     const std::size_t size = DeferredArena::recordSize(kT2TokenSize);
     if (ps != nullptr ? ps->deferredBytes + size > deferPartitionCap_
                       : deferredUnknownBytes_ + size > deferPartitionCap_) {
-        lastRejectDeferredFull_ = true;
-        return false;
+        return RejectReason::DeferredFull;
     }
     DeferredHdr h;
     h.len       = kT2TokenSize;
@@ -544,10 +579,7 @@ bool ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
     h.partition = entry->partition;
     h.submitNs  = lastNowNs_;
     uint8_t* d = pushDeferred_(h);
-    if (d == nullptr) {
-        lastRejectDeferredFull_ = true;
-        return false;
-    }
+    if (d == nullptr) return RejectReason::DeferredFull;
     writeLE64(d, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.release())));
     if (ps != nullptr) {
         ++ps->deferredCount;
@@ -556,7 +588,7 @@ bool ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
         ++deferredUnknown_;
         deferredUnknownBytes_ += size;
     }
-    return true;
+    return RejectReason::None;
 }
 
 void ProducerImpl::unaccountDeferred_(const DeferredHdr& h) noexcept {
@@ -616,7 +648,9 @@ void ProducerImpl::applyDeferred_() noexcept {
     ++deferPasses_;
     if (++deferPass_ == 0) deferPass_ = 1;
     const uint32_t failAt = debugFailAt_;
+    const uint32_t failEnd = debugFailAt_ + debugFailCount_;
     debugFailAt_ = 0;
+    debugFailCount_ = 0;
     uint32_t visited = 0;
     // fix3: user code (a lost record's failure callback) NEVER runs inside the
     // pass — [w, r) holds stale bytes until the slide-down.  Lost handles are
@@ -658,7 +692,7 @@ void ProducerImpl::applyDeferred_() noexcept {
             const uint8_t flags = p[kRecFlagsOff];
             const uint64_t handle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
             try {
-                if (failAt != 0 && ++visited == failAt) [[unlikely]] {
+                if (failAt != 0 && ++visited >= failAt && visited < failEnd) [[unlikely]] {
                     throw std::runtime_error("test seam: forced deferred apply failure");
                 }
                 const auto a = appendRecord_(h->topicId, h->partition, p + kRecKeyBytesOff,
@@ -909,7 +943,7 @@ void ProducerImpl::submitFlush() noexcept {
 // App-thread: Tier-2 explicit batch submission
 // ---------------------------------------------------------------------------
 
-bool ProducerImpl::submitTier2Batch(int32_t topicId,
+RejectReason ProducerImpl::submitTier2Batch(int32_t topicId,
                                      int32_t partition,
                                      int64_t ackHandle,
                                      int32_t recordCount,
@@ -919,9 +953,9 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
         // Task 14: queue straight onto the partition (owner thread only — the same
         // state the ring drain's kMsgTier2Batch branch would touch).  Closed (or a
         // foreign thread): not accepted, the caller fails the handle.
-        if (std::this_thread::get_id() != dutyThreadId_ || directClosed_) return false;
-        lastRejectDeferredFull_ = false;
-        tier2RejectReason_ = nullptr;
+        // Foreign thread decided FIRST, before any member read (owner-thread state).
+        if (std::this_thread::get_id() != dutyThreadId_) return RejectReason::WrongThread;
+        if (directClosed_) return RejectReason::Closed;
         if (inDuty_) {
             // fix1 C1 / fix2: deferred like a Tier-1 record (same per-partition
             // order, same validation and full policy).
@@ -931,21 +965,16 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
             entry->ackHandle   = static_cast<uint64_t>(ackHandle);
             entry->recordCount = recordCount;
             entry->batchBytes  = std::move(batchBytes);
-            return deferTier2_(entry);  // false: caller fails the handle; entry freed here
+            return deferTier2_(entry);  // not None: caller fails the handle; entry freed here
         }
         if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) {
-            tier2RejectReason_ = "Tier-2 batch rejected — its partition still has deferred records "
-                                 "(sends made from a duty-cycle callback) that cannot be sent yet; "
-                                 "retry later — batch dropped";
-            return false;  // this partition's deferred records must go first
+            return RejectReason::PartitionDeferred;  // its deferred records must go first
         }
         PartitionState* psp = nullptr;
         try {
             psp = &getOrCreatePartition(topicId, partition);
         } catch (const std::length_error&) {
-            tier2RejectReason_ = "Tier-2 batch rejected — unaddressable partition (the producer's "
-                                 "partition table is full) — batch dropped";
-            return false;
+            return RejectReason::Unaddressable;
         }
         PartitionState& ps = *psp;
         Tier2Entry e;
@@ -958,8 +987,9 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
         ps.pendingTier2Entries.push_back(std::move(e));  // may throw: nothing changed yet
         if (ps.builder && ps.builder->recordCount() > 0) ps.flushRequested = true;
         recordsSent_ += static_cast<uint64_t>(recordCount);
-        return true;
+        return RejectReason::None;
     }
+    if (ring_.closed()) return RejectReason::Closed;
     auto entry = std::make_unique<Tier2Entry>();
     entry->topicId     = topicId;
     entry->partition   = partition;
@@ -968,9 +998,9 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
     entry->batchBytes  = std::move(batchBytes);
     uint8_t tok[kT2TokenSize];
     writeLE64(tok, 0, static_cast<int64_t>(reinterpret_cast<uintptr_t>(entry.get())));
-    if (!writeToRing(kMsgTier2Batch, tok, kT2TokenSize)) return false;  // caller fails the handle
+    if (!writeToRing(kMsgTier2Batch, tok, kT2TokenSize)) return RejectReason::BackPressured;  // caller fails the handle
     entry.release();  // ownership now travels through the ring
-    return true;
+    return RejectReason::None;
 }
 
 // ---------------------------------------------------------------------------

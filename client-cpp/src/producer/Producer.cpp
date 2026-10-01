@@ -27,15 +27,23 @@ const char* sendFailureReason(SendResult r) noexcept {
     return "producer send not accepted";
 }
 
-// Task 14 fix1: Direct (Invoker) ingress — a send made from a callback the
-// producer fired inside its own duty work is deferred; when that deferred
-// buffer is full the rejection gets its own reason (not "ring full").
-const char* rejectReason(const producer::ProducerImpl& impl, SendResult r) noexcept {
-    if (r == SendResult::BackPressured && impl.lastRejectWasDeferredFull()) {
+// Task 14 fix1/fix4: Direct (Invoker) ingress reasons, from the reason the
+// submit RETURNED (never from producer member state).
+const char* rejectReason(SendResult r, producer::RejectReason why) noexcept {
+    using producer::RejectReason;
+    switch (why) {
+    case RejectReason::DeferredFull:
         return "producer send rejected — deferred buffer full (send from inside the producer's "
                "own duty-cycle callback; raise ProducerConfig::directDeferredBytes or retry later)";
+    case RejectReason::PartitionDeferred:
+        return "producer send rejected — its partition still has deferred records (sends made "
+               "from a duty-cycle callback) that cannot be sent yet — back-pressure (retry)";
+    case RejectReason::Unaddressable:
+        return "producer send rejected — unaddressable partition (the producer's partition table "
+               "is full)";
+    default:
+        return sendFailureReason(r);
     }
-    return sendFailureReason(r);
 }
 } // namespace
 
@@ -119,9 +127,10 @@ void Producer::send(TopicHandle              topic,
     // invalid) the record never reaches the agent, so the ack would never arrive
     // — fail the pending callback immediately (callback fires with offset=-1)
     // rather than stranding it forever.
-    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle);
+    producer::RejectReason why = producer::RejectReason::None;
+    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle, &why);
     if (r != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, rejectReason(*impl_, r));
+        impl_->failUnsubmitted(ackHandle, rejectReason(r, why));
     }
 }
 
@@ -142,9 +151,10 @@ std::future<int64_t> Producer::send(TopicHandle              topic,
     // invalid) the record never reaches the agent, so the ack would never
     // arrive and future.get() would hang forever. Reject the future
     // immediately with a specific error instead of stranding it.
-    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle);
+    producer::RejectReason why = producer::RejectReason::None;
+    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle, &why);
     if (r != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, rejectReason(*impl_, r));
+        impl_->failUnsubmitted(ackHandle, rejectReason(r, why));
     }
     return std::move(fut);
 }

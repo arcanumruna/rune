@@ -11,6 +11,30 @@
 namespace rune::client {
 
 namespace {
+const char* tier2RejectText(producer::RejectReason why) noexcept {
+    using producer::RejectReason;
+    switch (why) {
+    case RejectReason::Closed:
+        return "Tier-2 batch rejected — client closed — batch dropped";
+    case RejectReason::WrongThread:
+        return "Tier-2 batch rejected — wrong thread (invoker-mode producer used off its owner "
+               "thread) — batch dropped";
+    case RejectReason::DeferredFull:
+        return "Tier-2 batch rejected — deferred buffer full (sent from inside the producer's own "
+               "duty-cycle callback) — batch dropped";
+    case RejectReason::PartitionDeferred:
+        return "Tier-2 batch rejected — its partition still has deferred records (sends made from a "
+               "duty-cycle callback) that cannot be sent yet; retry later — batch dropped";
+    case RejectReason::Unaddressable:
+        return "Tier-2 batch rejected — unaddressable partition (the producer's partition table is "
+               "full) — batch dropped";
+    default:
+        return "Tier-2 batch ring full — batch dropped";
+    }
+}
+} // namespace
+
+namespace {
 
 // Current wall-clock timestamp (ns) for batch baseTimestamp.
 inline int64_t wallNs() noexcept {
@@ -93,21 +117,14 @@ std::future<int64_t> BatchBuilder::send() {
     // Submit to ProducerImpl: the heap Tier2Entry's address travels through the
     // ring (kMsgTier2Batch token) so the agent processes it in submission order
     // relative to Tier-1 records on the same partition.
-    const bool ok = impl_->submitTier2Batch(
+    const producer::RejectReason why = impl_->submitTier2Batch(
         topicId_, partition_, ackHandle, recordCount, std::move(batchBytes));
 
-    if (!ok) {
-        // CB-5 A3: ring full — fail the specific promise immediately.
-        // The ring token was never written so the agent will never see this
-        // batch; the future would otherwise hang until produceTimeoutMs.
-        // Fail it now so the caller gets an error without waiting.
-        const char* specific = impl_->tier2RejectReason();  // Direct: partition deferred / unaddressable
-        impl_->failUnsubmitted(ackHandle,
-            specific != nullptr ? specific
-            : impl_->lastRejectWasDeferredFull()
-                ? "Tier-2 batch rejected — deferred buffer full (sent from inside the producer's "
-                  "own duty-cycle callback) — batch dropped"
-                : "Tier-2 batch ring full — batch dropped");
+    if (why != producer::RejectReason::None) {
+        // CB-5 A3: not accepted — fail the specific promise immediately (the
+        // batch never reached the producer; the future would otherwise hang).
+        // Task 14 fix4: the text comes from the RETURNED reason only.
+        impl_->failUnsubmitted(ackHandle, tier2RejectText(why));
     }
 
     return std::move(fut);
