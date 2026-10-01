@@ -1998,32 +1998,11 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
 // BrokerNode::isLeader
 // ---------------------------------------------------------------------------
 bool BrokerNode::isLeader() const noexcept {
-    if (!election_) return false;
-
-    // For the multi-node path, rely SOLELY on the atomic observedLeaderId_ mirror
-    // written by NodeConsensusAgent::updateObservedLeader() after each duty cycle.
-    // This avoids reading TWO independent atomics (stateCode_ + observedLeaderId_)
-    // which have a TOCTOU race: the duty-cycle thread could transition the state
-    // between the two reads, causing isLeader() to return false for a node that IS
-    // the leader but is momentarily in a pass-through state (LeaderReplay, LeaderInit)
-    // not covered by the stateCode_ check — which produced the observed ~1/14 flake.
-    if (nodeAgent_) {
-        return nodeAgent_->leaderId() == static_cast<NodeId>(config_.nodeId);
-    }
-
-    // Single-node (no nodeAgent_): fall back to stateCode_.
-    // All leader states including pass-through ones: LeaderLogReplication, LeaderReplay,
-    // LeaderInit, LeaderReady, Closed.  Missing LeaderReplay/LeaderInit here was safe for
-    // single-node (their pass-through is near-instantaneous and the caller is the same
-    // thread that drives doWork), but we include them for correctness completeness.
-    // Use the atomic stateCode() — release-written by the agent thread on every
-    // state transition — instead of the non-atomic state() accessor.
-    const int32_t c = election_->stateCode();
-    return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
-           c == static_cast<int32_t>(ElectionState::LeaderReplay)         ||
-           c == static_cast<int32_t>(ElectionState::LeaderInit)           ||
-           c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
-           c == static_cast<int32_t>(ElectionState::Closed);
+    // The ONE leadership predicate (shared with the runtime's per-cycle push).
+    // Multi-node: the atomic observedLeaderId_ mirror written by
+    // NodeConsensusAgent::updateObservedLeader() (no TOCTOU across two atomics);
+    // single-node: the atomic stateCode() in a leader state or Closed.
+    return isLocalLeader(nodeAgent_.get(), election_.get(), static_cast<NodeId>(config_.nodeId));
 }
 
 // ---------------------------------------------------------------------------

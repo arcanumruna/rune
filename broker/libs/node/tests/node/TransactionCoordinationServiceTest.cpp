@@ -537,3 +537,13 @@ TEST_F(TransactionCoordinationServiceTest, HandleAddOffsetsAndTxnOffsetCommitFlo
     ASSERT_TRUE(addOffsResp);
     EXPECT_EQ(addOffsResp->errorCode, 0) << "AddOffsetsToTxn should succeed while Ongoing";
 }
+
+// Task 11 fix 2 (B1): see GroupCoordinationServiceRegression twin.
+TEST(TransactionCoordinationServiceRegression, PushedLeadershipNeverCallsTheLeaderFunction) {
+    int calls = 0;
+    rune::node::TransactionCoordinationService svc(nullptr, nullptr, [&calls] { ++calls; return false; });
+    svc.setLocalLeadership(false);
+    for (int i = 0; i < 100; ++i) (void)svc.doWork(i);
+    EXPECT_FALSE(svc.isLocalCoordinator());
+    EXPECT_EQ(calls, 0) << "isLeaderFn_ called on the duty cycle after a leadership push";
+}

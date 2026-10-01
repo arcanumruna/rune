@@ -155,4 +155,24 @@ private:
     std::atomic<rune::consensus::NodeId> observedLeaderId_{-1};
 };
 
+// ---------------------------------------------------------------------------
+// isLocalLeader — THE one leadership predicate (BrokerNode::isLeader() and the
+// runtime's per-cycle leadership push both call it; Task 11 fix 2, review m1).
+//   multi-node: the NodeConsensusAgent's observed leader id == self (atomic mirror)
+//   single-node: the election is in a leader state (incl. pass-through ones) or Closed
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline bool isLocalLeader(const NodeConsensusAgent*        multi,
+                                        const rune::consensus::Election* election,
+                                        rune::consensus::NodeId          self) noexcept {
+    if (!election) return false;
+    if (multi) return multi->leaderId() == self;
+    using rune::consensus::ElectionState;
+    const int32_t c = election->stateCode();
+    return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
+           c == static_cast<int32_t>(ElectionState::LeaderReplay)         ||
+           c == static_cast<int32_t>(ElectionState::LeaderInit)           ||
+           c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
+           c == static_cast<int32_t>(ElectionState::Closed);
+}
+
 } // namespace rune::node

@@ -91,6 +91,7 @@ TransactionCoordinationService::TransactionCoordinationService(
 // isLocalCoordinator
 // ---------------------------------------------------------------------------
 bool TransactionCoordinationService::isLocalCoordinator() const {
+    if (localLeader_ >= 0) return localLeader_ == 1;
     return isLeaderFn_ ? isLeaderFn_() : true;
 }
 

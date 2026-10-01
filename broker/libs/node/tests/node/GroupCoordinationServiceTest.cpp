@@ -947,3 +947,15 @@ TEST_F(CG3ServiceTest, OffsetCommitDefensiveIterationTruncatedFrame) {
     }
     // Either decode-fail (0) or bounded iteration: both are correct.
 }
+
+// Task 11 fix 2 (B1): once the runtime pushes leadership as a value, the
+// per-cycle doWork (worker 0's pass under fused placement) never calls the
+// isLeader std::function.
+TEST(GroupCoordinationServiceRegression, PushedLeadershipNeverCallsTheLeaderFunction) {
+    int calls = 0;
+    GroupCoordinationService svc(nullptr, nullptr, [&calls] { ++calls; return false; });
+    svc.setLocalLeadership(false);
+    for (int i = 0; i < 100; ++i) (void)svc.doWork(i);
+    EXPECT_FALSE(svc.isLocalCoordinator());
+    EXPECT_EQ(calls, 0) << "isLeaderFn_ called on the duty cycle after a leadership push";
+}

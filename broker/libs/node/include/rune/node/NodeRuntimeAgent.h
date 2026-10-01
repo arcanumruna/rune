@@ -230,7 +230,12 @@ private:
         // Task 11 fix 1: hand the gateway this cycle's leadership as a plain value
         // (was a per-cycle std::function LeaderView — which also built a
         // std::string on followers).  Same value BrokerNode::isLeader() reads.
-        if (gateway_ && selfId_ >= 0) gateway_->setLocalLeadership(isLocalLeader_());
+        if (selfId_ >= 0) {
+            const bool leader = isLocalLeader_();
+            if (gateway_)      gateway_->setLocalLeadership(leader);
+            if (groupService_) groupService_->setLocalLeadership(leader);   // fix 2 (B1)
+            if (txnService_)   txnService_->setLocalLeadership(leader);     // fix 2 (B1)
+        }
 
         // 1b. Task 10 fix 3 (I2a): fan ownership out BEFORE anything this cycle
         //     can route ops (bridge role ops, transport poll, gateway), and free
@@ -886,17 +891,10 @@ private:
     // Task 8a: admin control-plane servicing hook (RULING-2 B). Null = no admin plane.
     AdminControlPlane*                                 adminControl_ = nullptr;
     int32_t                                            selfId_       = -1;
-    // == BrokerNode::isLeader(), evaluated on this (owning) thread.
+    // The same predicate as BrokerNode::isLeader() (one shared function).
     [[nodiscard]] bool isLocalLeader_() const noexcept {
-        if (consensus_.kind == ConsensusKind::Multi) return consensus_.multi->leaderId() == selfId_;
-        if (!election_) return false;
-        using rune::consensus::ElectionState;
-        const int32_t c = election_->stateCode();
-        return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
-               c == static_cast<int32_t>(ElectionState::LeaderReplay)         ||
-               c == static_cast<int32_t>(ElectionState::LeaderInit)           ||
-               c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
-               c == static_cast<int32_t>(ElectionState::Closed);
+        return isLocalLeader(consensus_.kind == ConsensusKind::Multi ? consensus_.multi : nullptr,
+                             election_, selfId_);
     }
     // RUNE_CTRL_LOG temp diagnostic — read once at construction (not per scan).
     const bool                                         ctrlLog_ = ::getenv("RUNE_CTRL_LOG") != nullptr;

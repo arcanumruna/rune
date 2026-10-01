@@ -122,6 +122,13 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] bool isLocalCoordinator() const;
 
+    // Task 11 fix 2 (B1): this node's leadership for the current runtime duty
+    // cycle, pushed as a VALUE by NodeRuntimeAgent (same thread) right after
+    // consensus runs.  Once pushed, isLocalCoordinator() never calls the
+    // isLeader std::function (per-cycle, worker 0's pass under fused placement).
+    // Unpushed (-1): the callable is used (service-only tests).
+    void setLocalLeadership(bool leader) noexcept { localLeader_ = leader ? 1 : 0; }
+
     // -----------------------------------------------------------------------
     // coordinatorFor — returns the cluster-leader nodeId for any txnId.
     // v1 seam (future: per-txnId hash routing).
@@ -186,6 +193,7 @@ private:
     rune::transaction::ReplicatedTxnStateStore* txnState_;    // non-owning
     rune::gateway::TopicRegistry*               topics_;      // non-owning; may be null
     std::function<bool()>                       isLeaderFn_;
+    int8_t                                     localLeader_ = -1;   // see setLocalLeadership()
     std::function<NodeId()>                     leaderIdFn_;
 
     // CG-4 failover pattern: detect Follower→Leader transition to rebuild index.
