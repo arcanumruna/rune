@@ -14,6 +14,7 @@
 // Unique temp paths use getpid() + atomic counter.
 
 #include <rune/node/BrokerNode.h>
+#include <rune/node/Worker.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <utility>
 #include <rune/node/NodeConfig.h>
@@ -1060,6 +1061,23 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
     }
 
     node.stop();
+}
+
+// F15 S3 (design note §6): a tryClaim exception now HALTS, so the return ring
+// size is a correctness setting — its max message must hold one 512 KiB
+// PushReadResult chunk plus its header.  A smaller ring refuses to start,
+// before any side effect.
+TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxPushChunk) {
+    EXPECT_TRUE(Worker::returnRingCoversMaxPushChunk(32u << 20)) << "the default must pass";
+    EXPECT_TRUE(Worker::returnRingCoversMaxPushChunk(8u << 20));
+    EXPECT_FALSE(Worker::returnRingCoversMaxPushChunk(4u << 20)) << "4 MiB ring: max message 512 KiB < chunk + header";
+    const fs::path dir = makeTempDataDir("retring_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerReturnRingBytes = 1 << 20;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {

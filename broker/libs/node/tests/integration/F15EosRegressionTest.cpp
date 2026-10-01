@@ -1925,3 +1925,305 @@ TEST(TxnStateStoreRegression, RebuildCrossesCompactionGaps) {
     ASSERT_NE(reloaded.get("late"), nullptr) << "the rebuild stopped at a compaction gap";
     EXPECT_EQ(reloaded.get("late")->state, tx::TxnState::PrepareCommit);
 }
+
+// ============================================================================
+// F15 S3 — m5 + I8 (design note §6, §1.1 L2): ONE return FIFO in every mode.
+// Nothing the worker emits is ever dropped (Legacy included); the FIFO is
+// bounded (op drain pauses at kOverflowHighWater; parked waiters statically
+// capped by the G-A6 reservation); a claim / encode exception halts (exit 70);
+// drainReturn dispatches on the SBE template id (TxnReturn = 6, review m7).
+// ============================================================================
+namespace {
+constexpr int kExitInvariant = 70;   // BrokerNode::kExitInvariantViolation
+WorkerOp acksAllOp(PartitionReplica* r, int64_t corr) {
+    WorkerOp op = produceOp(r, corr);
+    op.deferAck = true;   // acks=all
+    return op;
+}
+WorkerOp pushReadOp(PartitionReplica* r, int64_t subId, int64_t nextOffset, int64_t hwBound) {
+    WorkerOp op;
+    op.type = WorkerOp::Type::PushRead; op.topicId = r->topicId();
+    op.partition = static_cast<int32_t>(r->partitionId()); op.replica = r; op.logPtr = r->log();
+    op.sessionId = 1; op.subscriptionId = subId; op.nextOffset = nextOffset; op.hwBound = hwBound;
+    return stamp(std::move(op));
+}
+std::vector<uint8_t> bigBatch(std::size_t valueBytes) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(valueBytes, 'x'), 1000);
+    return b.build();
+}
+void followerCaughtUp(PartitionReplica& r, int64_t now) {
+    rune::replication::FetchRequestMsg fr{r.epoch(), 0, 2, r.log()->logEndOffset(), 1 << 20, r.topicId()};
+    (void)r.onFetchRequest(fr, now);
+}
+// Answers only (the S2 temporary facts-only return carries deferAck == true).
+void collectAnswers(Worker& w, std::vector<WorkerReturn>& out) {
+    w.drainReturn([&](WorkerReturn r) { if (!r.deferAck) out.push_back(std::move(r)); });
+}
+// Drain + run until `want` answers arrived (bounded passes; no sleeps).
+void drainUntil(Worker& w, std::vector<WorkerReturn>& out, std::size_t want, int64_t& now) {
+    for (int i = 0; i < 4096 && out.size() < want; ++i) {
+        collectAnswers(w, out);
+        w.doWork(++now);
+    }
+    collectAnswers(w, out);
+}
+bool correlationsAscending(const std::vector<WorkerReturn>& v) {
+    for (std::size_t i = 1; i < v.size(); ++i)
+        if (v[i].correlationId <= v[i - 1].correlationId) return false;
+    return true;
+}
+} // namespace
+
+TEST(ReturnOverflowRegression, LegacyFullRingNeverDropsProduceResult) {
+    // Default (Legacy) config: no per-worker ingress.  The 64 KiB return ring
+    // holds ~400 ProduceResults; the control thread does not drain while the
+    // worker answers 1000 produces.  Base: "ret_ ring full — WorkerReturn
+    // dropped" (Worker.h ~925) — every answer past the ring is lost.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 23, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    int64_t now = 1;
+    // Phase 1 — immediate answers (acks=leader) through a full ring.
+    constexpr int kN = 1000;
+    for (int i = 0; i < kN; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, i + 1)));
+    w.doWork(++now);
+    ASSERT_EQ(log.logEndOffset(), kN);
+    std::vector<WorkerReturn> answers;
+    drainUntil(w, answers, kN, now);
+    ASSERT_EQ(answers.size(), static_cast<std::size_t>(kN)) << "Legacy dropped ProduceResults on a full return ring";
+    EXPECT_TRUE(correlationsAscending(answers)) << "answers reordered";
+    for (const auto& a : answers) EXPECT_EQ(a.errorCode, 0);
+    // Phase 2 — the acks=all FIRE path (addendum S3): 100 waiters parked, the
+    // ring then filled by 600 acks=leader answers, then the HW passes: every
+    // fired acks=all answer must reach the gateway — never dropped.
+    answers.clear();
+    constexpr int kParked = 100;
+    for (int i = 0; i < kParked; ++i) ASSERT_TRUE(w.tryEnqueueOp(acksAllOp(&rep, 10'000 + i)));
+    w.doWork(++now);
+    collectAnswers(w, answers);   // facts-only returns drained; nothing answered yet
+    ASSERT_TRUE(answers.empty());
+    ASSERT_EQ(w.reservedAckSlotsForTest(), kParked) << "precondition: acks=all parked on the worker";
+    constexpr int kFill = 600;
+    for (int i = 0; i < kFill; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 20'000 + i)));
+    w.doWork(++now);              // ring full of acks=leader answers
+    followerCaughtUp(rep, now);   // HW passes every parked waiter
+    w.doWork(++now);              // fire into a full ring
+    drainUntil(w, answers, kParked + kFill, now);
+    std::size_t firedOk = 0, fillOk = 0;
+    for (const auto& a : answers) {
+        if (a.errorCode != 0) continue;
+        if (a.correlationId >= 10'000 && a.correlationId < 10'000 + kParked) ++firedOk;
+        if (a.correlationId >= 20'000) ++fillOk;
+    }
+    EXPECT_EQ(fillOk, static_cast<std::size_t>(kFill)) << "acks=leader answers dropped";
+    EXPECT_EQ(firedOk, static_cast<std::size_t>(kParked)) << "fired acks=all answers dropped on a full ring";
+    EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
+}
+
+TEST(ReturnOverflowRegression, BoundedAndNeverDrops) {
+    // Both modes.  6 × 1000 produces while the control thread never drains:
+    // the return FIFO must stay bounded (op drain pauses at the high-water
+    // mark; the rest waits in the op ring) and, once drained, every answer
+    // arrives exactly once and in order.  Base: Legacy drops; per-worker mode
+    // grows retOverflow_ without bound (and erases in O(n)).
+    for (const bool perWorker : {false, true}) {
+        SCOPED_TRACE(perWorker ? "per-worker ingress" : "Legacy");
+        TmpDir d;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+        Worker w(0, 1 << 23, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        w.setWorkerIngress(nullptr, perWorker);
+        int64_t now = 1;
+        std::size_t maxFifo = 0;
+        constexpr int kRounds = 6, kPer = 1000;
+        for (int r = 0; r < kRounds; ++r) {
+            for (int i = 0; i < kPer; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, r * kPer + i + 1)));
+            for (int p = 0; p < 4; ++p) {
+                w.doWork(++now);
+                maxFifo = std::max(maxFifo, w.retFifoSizeForTest());
+            }
+        }
+        EXPECT_LE(maxFifo, Worker::kOverflowHighWater + 1024u) << "return FIFO unbounded (high water + one op drain)";
+        EXPECT_LE(maxFifo, Worker::kRetFifoCapacity);
+        std::vector<WorkerReturn> answers;
+        drainUntil(w, answers, kRounds * kPer, now);
+        ASSERT_EQ(answers.size(), static_cast<std::size_t>(kRounds * kPer)) << "answers dropped";
+        EXPECT_TRUE(correlationsAscending(answers)) << "answers reordered";
+        EXPECT_EQ(log.logEndOffset(), kRounds * kPer);
+        EXPECT_EQ(w.retFifoSizeForTest(), 0u);
+    }
+}
+
+TEST(ReturnOverflowRegression, OpDrainPausesAtHighWater) {
+    // Every mode: once the FIFO holds >= kOverflowHighWater returns, the worker
+    // stops draining its op ring (control-side producers already queue on a
+    // full op ring), and resumes once the control thread drains.
+    for (const bool perWorker : {false, true}) {
+        SCOPED_TRACE(perWorker ? "per-worker ingress" : "Legacy");
+        TmpDir d;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+        Worker w(0, 1 << 23, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        w.setWorkerIngress(nullptr, perWorker);
+        int64_t now = 1;
+        constexpr int kN = 2000;
+        for (int i = 0; i < kN; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, i + 1)));
+        for (int p = 0; p < 8 && w.retFifoSizeForTest() < Worker::kOverflowHighWater; ++p) w.doWork(++now);
+        ASSERT_GE(w.retFifoSizeForTest(), Worker::kOverflowHighWater)
+            << "precondition: the return FIFO holds the answers the full ring refused";
+        const int64_t leo = log.logEndOffset();
+        ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, kN + 1)));
+        w.doWork(++now);
+        EXPECT_EQ(log.logEndOffset(), leo) << "the op drain must pause at the high-water mark";
+        EXPECT_GT(w.retFifoHighWaterPausesForTest(), 0u);
+        std::vector<WorkerReturn> answers;
+        drainUntil(w, answers, kN + 1, now);
+        ASSERT_EQ(answers.size(), static_cast<std::size_t>(kN + 1));
+        EXPECT_TRUE(correlationsAscending(answers));
+        EXPECT_EQ(log.logEndOffset(), kN + 1) << "the paused ops run once the FIFO drains";
+    }
+}
+
+TEST(ReturnOverflowRegression, ClaimExceptionHalts) {
+    // A return the ring can never hold (a PushRead chunk of one 16 KiB batch
+    // vs the 64 KiB ring's 8 KiB max message): tryClaim throws.  Base logs
+    // "tryClaim failed" and DROPS it (the subscription silently stalls).  Now:
+    // an invariant-violation halt (exit 70), never a drop.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        TmpDir d;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+        Worker w(0, 1 << 20, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        WorkerOp p = produceOp(&rep, 1);
+        p.recordBatchBytes = bigBatch(16 * 1024);
+        (void)w.tryEnqueueOp(std::move(p));
+        (void)w.tryEnqueueOp(pushReadOp(&rep, 7, 0, 1));
+        w.doWork(1);
+        (void)drainAll(w);
+        w.doWork(2);
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(kExitInvariant), "");
+}
+
+TEST(ReturnOverflowRegression, FlushClaimExceptionHalts) {
+    // The same oversize return queued BEHIND a full ring: the FIFO flush hits
+    // the claim exception.  Base: flushRetOverflow_'s catch erases it and
+    // continues (a silent drop).  Now: halt (exit 70).
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT({
+        TmpDir d;
+        Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+        NullTransport t;
+        PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+        Worker w(0, 1 << 22, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{&rep});
+        w.setWorkerIngress(nullptr, true);
+        WorkerOp p = produceOp(&rep, 1);
+        p.recordBatchBytes = bigBatch(16 * 1024);
+        (void)w.tryEnqueueOp(std::move(p));
+        for (int i = 0; i < 800; ++i) (void)w.tryEnqueueOp(produceOp(&rep, 2 + i));   // fill the ring
+        (void)w.tryEnqueueOp(pushReadOp(&rep, 7, 0, 1));                            // queued behind
+        int64_t now = 1;
+        for (int i = 0; i < 64; ++i) { w.doWork(++now); (void)drainAll(w); }
+        std::_Exit(0);
+    }, ::testing::ExitedWithCode(kExitInvariant), "");
+}
+
+TEST(ReturnOverflowRegression, TxnReturnDispatchedByTemplateIdInFifoOrder) {
+    // Review m7: drainReturn dispatches on the SBE template id; a TxnReturn
+    // (id 6) reaches its own callback, in emission order with the
+    // ProduceResults — directly through the ring and through the FIFO.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 23, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    std::vector<int64_t> seq;   // ProduceResult → correlationId; TxnReturn → -token
+    auto drain = [&] {
+        w.drainReturn([&](WorkerReturn r) { seq.push_back(r.correlationId); },
+                      [&](const TxnReturn& r) { seq.push_back(-r.token); });
+    };
+    TxnReturn txn;
+    txn.kind = TxnReturn::Kind::ControlRecordCommitted; txn.topicId = 1; txn.partition = 0;
+    txn.incarnation = 3; txn.leaderEpoch = 1; txn.token = 77;
+    ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 1)));
+    w.doWork(1);
+    w.enqueueTxnReturnForTest(txn);
+    ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 2)));
+    w.doWork(2);
+    drain();
+    ASSERT_EQ(seq, (std::vector<int64_t>{1, -77, 2}));
+    // Through the FIFO: the ring is full when the TxnReturn is emitted.
+    seq.clear();
+    constexpr int kFill = 800;
+    for (int i = 0; i < kFill; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 100 + i)));
+    w.doWork(3);
+    txn.token = 78;
+    w.enqueueTxnReturnForTest(txn);
+    ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 5000)));
+    int64_t now = 3;
+    for (int i = 0; i < 64 && seq.size() < kFill + 2u; ++i) { drain(); w.doWork(++now); }
+    drain();
+    ASSERT_EQ(seq.size(), kFill + 2u);
+    EXPECT_EQ(seq[kFill], -78) << "the TxnReturn must follow every earlier ProduceResult";
+    EXPECT_EQ(seq[kFill + 1], 5000) << "and precede every later one";
+}
+
+TEST(ReturnOverflowRegression, ParkedAcksAllStaticallyBounded) {
+    // Addendum S3 (S2 concern 5): pendingAcksAll_ is bounded by a STATIC cap
+    // tied to the G-A6 reservation, not by ret-ring capacity (~127k on the
+    // default 32 MiB ring).  A gateway-routed burst beyond the cap: the excess
+    // is answered retriable (NotLeader) before any append, nothing dropped, no
+    // halt; one HW advance then fires every parked waiter exactly once.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 23);   // default 32 MiB return ring
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    const int total = static_cast<int>(Worker::kMaxOwedReturns) + 500;
+    for (int i = 0; i < total; ++i) ASSERT_TRUE(w.tryEnqueueOp(acksAllOp(&rep, i + 1)));
+    std::vector<WorkerReturn> answers;
+    int64_t now = 1;
+    for (int p = 0; p < 16; ++p) { w.doWork(++now); collectAnswers(w, answers); }
+    const int64_t parked = w.reservedAckSlotsForTest();
+    EXPECT_LE(parked, static_cast<int64_t>(Worker::kMaxOwedReturns)) << "parked acks=all waiters exceed the static cap";
+    EXPECT_EQ(parked + static_cast<int64_t>(answers.size()), total) << "every produce answered or parked";
+    for (const auto& a : answers) EXPECT_EQ(a.errorCode, kNotLeader);
+    EXPECT_EQ(log.logEndOffset(), parked) << "a refused produce must not be appended";
+    followerCaughtUp(rep, now);
+    answers.clear();
+    drainUntil(w, answers, static_cast<std::size_t>(parked), now);
+    std::size_t ok = 0;
+    for (const auto& a : answers) ok += a.errorCode == 0 ? 1u : 0u;
+    EXPECT_EQ(ok, static_cast<std::size_t>(parked)) << "every parked waiter fires exactly once";
+    EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
+}
+
+TEST(ReturnOverflowRegression, ShardIngressPollBudgetHonoursStaticBound) {
+    // The shard / per-worker ingress poll budget K also respects the static
+    // owed-return cap: with kMaxOwedReturns waiters parked, K == 0.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 20);   // default 32 MiB return ring
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    for (std::size_t i = 0; i < Worker::kMaxOwedReturns; ++i)
+        ASSERT_EQ(ingressAcksAll(w, static_cast<int64_t>(i) + 1, 1), 1);
+    ASSERT_EQ(w.reservedAckSlotsForTest(), static_cast<int64_t>(Worker::kMaxOwedReturns));
+    EXPECT_EQ(w.ingressPollBudgetForTest(), 0) << "the poll budget ignores the static owed-return cap";
+}

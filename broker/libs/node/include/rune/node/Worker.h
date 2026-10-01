@@ -153,6 +153,17 @@ public:
     // be written to ret_ in the same cycle — flushed before next ingress poll).
     static constexpr std::size_t kRetOverflowReserve = 64;
 
+    // F15 S3 (design note §6, m5 + I8) — S3 RED stub: the constants the
+    // ReturnOverflowRegression tests pin (behaviour lands with the fix).
+    static constexpr std::size_t kOverflowHighWater = 1024;
+    static constexpr std::size_t kMaxOwedReturns    = 4096;
+    static constexpr std::size_t kRetFifoCapacity   = 16384;
+    static constexpr int32_t     kMaxPushReadChunkBytes = 512 * 1024;
+    /// S3 RED stub: the startup check (§6) is not implemented yet.
+    [[nodiscard]] static constexpr bool returnRingCoversMaxPushChunk(std::size_t /*returnRingBytes*/) noexcept {
+        return true;
+    }
+
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
     // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the
     // timeout is not too tight.  Configurable via setAckTimeoutNs.
@@ -574,6 +585,13 @@ public:
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
 
+    // F15 S3 RED stub: the two-callback drain (TxnReturn dispatch, m7) — the
+    // TxnReturn callback is not wired yet.
+    template <typename Fn, typename TxnFn>
+    std::size_t drainReturn(Fn&& fn, TxnFn&& /*txnFn*/) {
+        return drainReturn(std::forward<Fn>(fn));
+    }
+
     // -----------------------------------------------------------------------
     // E3 Task 5: test accessor — cumulative count of successful io_.submit calls
     // in submitCoalescedFlushes_().  Used by the GroupCommit test to assert
@@ -599,6 +617,17 @@ public:
     [[nodiscard]] CompletionToken durableAckTokenForTest() const noexcept { return durableAckToken_; }
     [[nodiscard]] std::size_t durablePendingCountForTest() const noexcept { return durablePending_.size(); }
     [[nodiscard]] int64_t     reservedAckSlotsForTest() const noexcept { return reservedAckSlots_(); }
+    // F15 S3 RED stubs (behaviour-preserving): FIFO size, high-water pauses,
+    // TxnReturn emission and the shard-ingress poll budget.
+    [[nodiscard]] std::size_t retFifoSizeForTest() const noexcept { return retOverflow_.size(); }
+    [[nodiscard]] uint64_t    retFifoHighWaterPausesForTest() const noexcept { return 0; }
+    void enqueueTxnReturnForTest(const TxnReturn& /*r*/) {}
+    [[nodiscard]] int64_t ingressPollBudgetForTest() const noexcept {
+        const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
+        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) + reservedAckSlots_();
+        const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
+        return std::min(static_cast<int64_t>(desiredFragmentLimit_), available);
+    }
     /// -1 when this worker has no flush slot for `log`.
     [[nodiscard]] int64_t lastSyncedLeoForTest(const rune::storage::Log* log) noexcept {
         const LogFlushSlot* slot = slotOf_(log);
