@@ -14,7 +14,7 @@
 //   kInvalidPid          (2) → ErrorCode::ProducerFenced       (18)  [wrong pid]
 //   kInvalidTransition   (3) → ErrorCode::InvalidTxnState      (19)
 //   kUnknownTxnId        (4) → ErrorCode::InvalidTxnState      (19)  [not found]
-//   kConcurrentTransactions (6) → ErrorCode::ConcurrentTransactions (20)
+//   kConcurrentTransactions (6) → ErrorCode::ConcurrentTransactions (27)  [retriable]
 //
 // Zero-alloc: txnIdScratch_ / groupIdScratch_ are member std::strings reused
 // via assign(). Partition vectors are pre-reserved. TopicPartition topic names
