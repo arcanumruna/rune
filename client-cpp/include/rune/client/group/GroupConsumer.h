@@ -252,8 +252,9 @@ struct GroupConsumerImpl {
 //     a handle may outlive its Client (not be used CONCURRENTLY with its
 //     destruction); commitSync() then returns OpResult::Closed.
 //   - Destruction (F8c C7) = close() + the handle's share of the impl handed
-//     to the duty side (one HandleRelease; Invoker mode: duty work, applied
-//     directly on any thread, never waits on the ring); the impl is freed by
+//     to the duty side (one HandleRelease: applied directly on the duty
+//     thread, through the command ring elsewhere — Invoker: bounded by
+//     aeronClientLivenessTimeoutNs when nobody pumps); the impl is freed by
 //     whichever side lets go last — never while one of its callbacks runs.
 //   - HANDLE LIFETIME (fix4 M6): the handle must NOT be destroyed, moved from
 //     or moved into while ANY thread may still be calling it — its owner app
@@ -281,8 +282,8 @@ public:
 
     /// F8c C7 release (§3.3): closes the consumer (the duty side applies it)
     /// and gives the handle's share of the impl to the duty side.  Never
-    /// throws, never waits for the duty side; Invoker mode: duty work (applied
-    /// directly on any thread — same contract as doWork()).  After Client
+    /// throws; routed like ~Producer (duty thread: direct; elsewhere: the
+    /// command ring, Invoker-bounded by the liveness timeout).  After Client
     /// close the handle frees the impl, never touching the Client.
     ~GroupConsumer();
 

@@ -116,6 +116,9 @@ OpResult reserveUnit(Completions* bq) noexcept {
 }
 } // namespace
 
+// Review m3: a deliberate deviation from the spec's "debug check" — it runs in
+// every build: one acquire load of a cache line written once per lifetime,
+// per batch (cold relative to the per-record path).
 void BatchBuilder::checkProducer_() const {
     // F8c C7 (spec §3.1 rule 1): a BatchBuilder borrows its producer and must
     // not outlive the Producer handle.  Caught while the duty side still holds

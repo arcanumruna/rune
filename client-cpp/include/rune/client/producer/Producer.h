@@ -250,10 +250,12 @@ public:
     Producer& operator=(Producer&& o) noexcept;
 
     /// F8c C7: closeImmediately() (unless a close already started) + the §3.3
-    /// release.  Never throws, never waits for the duty side; Invoker mode:
-    /// duty work — applied directly on whichever thread destroys it (the
-    /// doWork() contract: never concurrently with doWork() / close() on
-    /// another thread), so the off-owner destroy pattern works.
+    /// release.  Never throws.  The release: the duty thread (the Invoker
+    /// owner, a Thread-mode runner callback) applies it directly; any other
+    /// thread hands it over on the command ring (a full ring is waited out on
+    /// the consumer's progress — in Invoker mode bounded by the liveness
+    /// contract, aeronClientLivenessTimeoutNs: with nobody pumping, the handle
+    /// lets go and Client close frees the impl).
     ~Producer();
 
     /// The handle owns no producer (moved-from).

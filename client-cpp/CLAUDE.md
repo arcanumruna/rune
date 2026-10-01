@@ -91,8 +91,10 @@ alloc-free handoff). The agent drains, accumulates records into per-
   (Producer / TransactionalProducer: `closeImmediately()` unless a close already
   started; Subscription: unsubscribe; GroupConsumer: close); the duty side
   frees at the end of a duty cycle once nothing references the impl (never
-  under a running callback).  Invoker mode: releasing a handle is duty work
-  (applied directly on any thread — the `doWork()` contract).  Client close
+  under a running callback).  The duty thread (Invoker owner, runner callback)
+  applies a release directly; any other thread uses the command ring (Invoker:
+  a full ring is waited out at most `aeronClientLivenessTimeoutNs` — nobody
+  pumping — then the handle lets go and close frees the impl).  Client close
   hands every still-held impl back to its handle.
 - Shutdown pairs (user decision 2): `Producer::close()` drains /
   `closeImmediately()` discards; `TransactionalProducer::close()` aborts an open

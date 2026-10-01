@@ -193,9 +193,10 @@ struct SubscriptionImpl {
 //     directly when already on it).  Delivery is GUARANTEED: a full command
 //     ring is waited out on duty-thread progress, never a timeout, never a
 //     throw.  The destructor (F8c C7) hands over the handle's share of the
-//     impl in one HandleRelease command, which unsubscribes; in Invoker mode
-//     it is duty work (applied directly on any thread: never waits on the
-//     ring), and the impl is freed by whichever side lets go last — never
+//     impl in one HandleRelease command, which unsubscribes (applied directly
+//     on the duty thread, through the command ring elsewhere — Invoker:
+//     bounded by aeronClientLivenessTimeoutNs when nobody pumps), and the
+//     impl is freed by whichever side lets go last — never
 //     while one of its handlers runs.
 //   - position() / subscriptionId() drain the subscription's status ring and
 //     answer from the handle's own cache (eventually consistent).
@@ -236,9 +237,9 @@ public:
 
     /// F8c C7 release (§3.3): unsubscribes (the duty side applies it) and
     /// gives the handle's share of the impl to the duty side.  Never throws,
-    /// never waits for the duty side (a full command ring is waited out on
-    /// duty progress, as for unsubscribe(); Invoker mode: duty work, applied
-    /// directly on any thread — same contract as doWork()).  After Client
+    /// never waits for the duty side to apply it (a full command ring is
+    /// waited out on duty progress, as for unsubscribe(); Invoker mode:
+    /// bounded by aeronClientLivenessTimeoutNs when nobody pumps).  After Client
     /// close the impl was handed back: the handle frees it, never touching
     /// the Client.
     ~Subscription();
