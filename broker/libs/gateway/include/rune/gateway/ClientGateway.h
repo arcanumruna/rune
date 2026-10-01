@@ -33,8 +33,10 @@
 //       (zero-alloc: pre-sized ring buffer).  Each doWork() cycle, after the
 //       replica's HW may have advanced (replication fetch responses processed by
 //       the duty-cycle thread BEFORE gateway.doWork), drainPendingAcks() checks
-//       every entry: if replica->highWatermark() >= entry.lastOffset, the
-//       ProduceResponse is sent and the entry removed.
+//       every entry: it re-resolves the replica through the ReplicaRegistry by
+//       (topicId, partition, incarnation) — no pointer is held — and if the
+//       published HW > entry.lastOffset the ProduceResponse is sent and the
+//       entry removed; a removed / re-created partition fails it with NotLeader.
 //       min-ISR gate: before enqueuing, canProduce(minIsr, acksAll=true) is
 //       checked via the ISR manager; if ISR is too small, ProduceResponse
 //       MinIsrViolation is sent immediately (no append).
@@ -528,14 +530,26 @@ public:
     // \param partition Partition index.
     // \param marker    Raw control batch bytes (already CRC-covered by build()).
     //
-    // \returns baseOffset of the appended marker, or -1 if the topic/partition
-    //          is unknown or the replica is not in leader role.
+    // \param producerId / commit  the marker's producer + COMMIT/ABORT, used when
+    //          the append is asynchronous (see kControlRecordAsync).
+    //
+    // \returns baseOffset of the appended marker (synchronous paths: the caller
+    //          then calls notifyControlMarker); kControlRecordAsync when the
+    //          marker was handed to the owning worker — the offset is NOT known
+    //          yet and is never pre-computed (Task 10 round 4, P1): the gateway
+    //          itself calls notifyControlMarker with the offset the worker
+    //          ACTUALLY appended at, or surfaces a failure to the txn
+    //          coordinator; or -1 if the topic/partition is unknown or the
+    //          replica refused the append.
     //
     // Single-writer: must be called on the duty-cycle thread.
     // ---------------------------------------------------------------------------
+    static constexpr int64_t kControlRecordAsync = -2;
     int64_t appendControlRecord(int32_t                    topicId,
                                 int32_t                    partition,
-                                std::span<const uint8_t>   marker);
+                                std::span<const uint8_t>   marker,
+                                int64_t                    producerId = -1,
+                                bool                       commit     = false);
 
     // -----------------------------------------------------------------------
     // TX-4 Task 9 test hooks — feed the per-partition LSO tracker from external
@@ -751,22 +765,26 @@ private:
     // alloc on the hot path).  Drained in drainPendingAcks() each doWork()
     // cycle after the replica's HW has advanced for this cycle.
     //
-    // Safety invariants:
-    //   - replica pointer is non-owning; outlives the gateway (same lifetime
-    //     contract as replicaRegistry_ pointer).
+    // Safety invariants (Task 10 round 4, Important 3):
+    //   - NO replica pointer is held.  The entry names its replica by
+    //     (topicId, partition, incarnation) and drainPendingAcks resolves it
+    //     through the ReplicaRegistry on EVERY check.  A miss or a different
+    //     incarnation (the partition was removed / re-created) = stale: the
+    //     ack fails RETRIABLY with NotLeader — nothing freed is dereferenced.
+    //   - incarnation 0 = the replica was not registered (unit-test fixtures):
+    //     resolved by (topicId, partition) alone.
     //   - All fields set once on enqueue; read-only during drain.
     //   - Single-writer: only touched on the duty-cycle thread.
     // -----------------------------------------------------------------------
     struct PendingAck {
         int64_t      sessionId     = 0;   ///< owning session
         int64_t      correlationId = 0;   ///< echoed back in ProduceResponse
+        int32_t      topicId       = 0;   ///< replica identity (with partition + incarnation)
         int32_t      partition     = 0;   ///< partition (echoed in ProduceResponse)
+        uint32_t     incarnation   = 0;   ///< replica incarnation at enqueue (0 = unregistered)
         int64_t      baseOffset    = 0;   ///< first offset of the batch
         int64_t      lastOffset    = 0;   ///< last offset of the batch (HW must reach this)
         int64_t      enqueuedAtNs  = 0;   ///< for timeout eviction
-        // Non-owning: null only when replicaRegistry_ is not set (passthrough mode,
-        // which does not produce acks=All entries).
-        rune::replication::PartitionReplica* replica = nullptr;
     };
 
     // -----------------------------------------------------------------------
@@ -1238,11 +1256,75 @@ private:
     bool                  storageFailureRaised_ = false;
     void raiseStorageFailure_(const std::string& logDir, int err);
     void handleWorkerReturn_(rune::node::WorkerReturn ret);   // by value: WorkerReturn complete in the .cpp
-    void onControlRecordRefused_(int32_t topicId, int32_t partition,
-                                 const std::vector<uint8_t>& marker, int16_t err);
+    void onControlRecordRefused_(const rune::node::WorkerReturn& ret);
+    void onControlRecordAppended_(const rune::node::WorkerReturn& ret);
     uint64_t controlRecordsRefused_ = 0;
+    uint64_t produceBackPressured_  = 0;   // M5: produces answered NotLeader on back-pressure
+
+    // -----------------------------------------------------------------------
+    // Task 10 round 4 (P1): asynchronous control markers.  A marker handed to
+    // a worker gets a token (the op's correlationId); its offset arrives in
+    // the worker's ControlRecordAppended reply and only THEN feeds the LSO /
+    // aborted-txn bookkeeping.  A marker the worker ring could not take waits
+    // in markerSendQueue_ (FIFO, retried every doWork — never dropped); while
+    // one waits for a partition, produces to that partition answer the
+    // retriable NotLeader so no later batch can overtake the marker.  A
+    // refused marker for a partition still on this node is re-routed (safe:
+    // no offset was pre-computed) — a bounded number of times, then it is an
+    // invariant violation (halt).  Cold path (allocation is fine).
+    // -----------------------------------------------------------------------
+    struct MarkerInFlight {
+        int32_t              topicId    = 0;
+        int32_t              partition  = 0;
+        int64_t              producerId = -1;
+        bool                 commit     = false;
+        uint32_t             reroutes   = 0;
+        std::vector<uint8_t> bytes;
+    };
+    static constexpr uint32_t kMaxMarkerReroutes = 4;
+    std::unordered_map<int64_t, MarkerInFlight> markersInFlight_;
+    std::deque<int64_t>                         markerSendQueue_;
+    int64_t                                     nextMarkerToken_ = 1;
+    bool trySendMarker_(int64_t token);
+    int  pumpMarkerQueue_();
+    [[nodiscard]] bool markerQueuedFor_(int32_t topicId, int32_t partition) const noexcept;
+
+    // M5: subscription lifecycle ops the owning worker ring could not take are
+    // queued per worker (FIFO: a Subscribe/Unsubscribe pair keeps its order)
+    // and retried every doWork — never dropped.  A queued Subscribe re-resolves
+    // its session's egress publication at retry time (never a dangling pointer;
+    // a session gone meanwhile drops it).
+    struct PendingSubOp {
+        bool              unsubscribe = false;
+        bool              mdc         = false;   // forwarded with the MDC pub (no unicast)
+        BufferedSubscribe sub;                   // subscribe: everything; unsubscribe: subId/topic/partition
+    };
+    std::vector<std::deque<PendingSubOp>> pendingSubOps_;   // indexed by owning worker
+    bool trySubOp_(const PendingSubOp& p);
+    void queueSubOp_(PendingSubOp p);
+    int  pumpSubOps_();
 public:
     [[nodiscard]] uint64_t controlRecordsRefusedForTest() const noexcept { return controlRecordsRefused_; }
+    [[nodiscard]] std::size_t markersInFlightForTest() const noexcept { return markersInFlight_.size(); }
+    [[nodiscard]] std::size_t markersQueuedForTest() const noexcept { return markerSendQueue_.size(); }
+    [[nodiscard]] std::size_t pendingSubOpsForTest() const noexcept {
+        std::size_t n = 0;
+        for (const auto& q : pendingSubOps_) n += q.size();
+        return n;
+    }
+    [[nodiscard]] std::size_t pendingAcksForTest() const noexcept { return pendingAcks_.size(); }
+    /// Test-only: run the deferred-ack drain once at `nowNs`.
+    void drainPendingAcksForTest(int64_t nowNs) { nowNs_ = nowNs; drainPendingAcks(); }
+    /// Test-only: the subscription lifecycle forwarding (worker routing).
+    void forwardSubscribeForTest(int64_t subId, int64_t sessionId, int32_t topicId, int32_t partition,
+                                 int64_t nextOffset, uint8_t isolation, bool isGroup, bool carrier) {
+        forwardSubscribeToWorker_(subId, sessionId, topicId, partition, nextOffset, isolation, isGroup, carrier);
+    }
+    void forwardUnsubscribeForTest(int64_t subId, int32_t topicId, int32_t partition) {
+        forwardUnsubscribeToWorker_(subId, topicId, partition);
+    }
+    /// Test-only: run the retry pumps (markers + subscription ops) once.
+    int pumpRetryQueuesForTest() { return pumpMarkerQueue_() + pumpSubOps_(); }
     /// Test-only: feed a worker return through the real drain handler.
     void handleWorkerReturnForTest(const rune::node::WorkerReturn& ret);
 private:
@@ -1414,6 +1496,19 @@ private:
     // Map from partition key → LsoTracker + AbortedTxnIndex.
     // Single-writer: only accessed on the duty-cycle thread.
     std::unordered_map<int64_t, PartitionTxnState> partitionTxnStates_;
+public:
+    /// Test-only: the recorded aborted-txn ranges for (topicId, partition).
+    [[nodiscard]] std::vector<rune::transaction::AbortedTxnRange>
+    abortedRangesForTest(int32_t topicId, int32_t partition) const {
+        const auto* ts = getTxnStateRO(topicId, partition);
+        return ts ? ts->abortedIndex.ranges() : std::vector<rune::transaction::AbortedTxnRange>{};
+    }
+    /// Test-only: open transactions tracked for (topicId, partition).
+    [[nodiscard]] std::size_t openTxnsForTest(int32_t topicId, int32_t partition) const {
+        const auto* ts = getTxnStateRO(topicId, partition);
+        return ts ? ts->lsoTracker.openCount() : 0;
+    }
+private:
 
     // -----------------------------------------------------------------------
     // G0.1: Egress retry queue — bounded, pre-allocated, no hot-path alloc.

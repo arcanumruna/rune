@@ -51,6 +51,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <algorithm>
 #include <array>
@@ -204,6 +205,9 @@ private:
             const rune::replication::Epoch epoch =
                 static_cast<rune::replication::Epoch>(election_->leadershipTermId());
             work += bridge_->doWork(lid, epoch);
+            // M1: an invariant violation caught at the bridge's noexcept
+            // boundary joins the uniform halt path below (exit 70).
+            if (std::string what; bridge_->takeFatal(what)) throw std::logic_error(what);
         }
 
         // 2b. Metadata service — apply committed assignment records.

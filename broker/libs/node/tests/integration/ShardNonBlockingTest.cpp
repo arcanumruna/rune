@@ -73,6 +73,13 @@ std::vector<uint8_t> batchAt(int64_t base, int n = 1, std::size_t valueBytes = 1
     for (int i = 0; i < n; ++i) b.append("k", v, 1000 + i);
     return b.build();
 }
+// Round 4: production routing (WorkerPool::tryEnqueueOp) stamps the target
+// identity from the registry; tests that enqueue straight into a Worker stamp
+// it from the (test-owned, live) replica the same way.
+WorkerOp stamp(WorkerOp op) {
+    if (op.replica) { op.targetReplicaId = op.replica->registryId(); op.incarnation = op.replica->incarnation(); }
+    return op;
+}
 PartitionConfig cfg(rune::replication::NodeId self, uint8_t tier = 1, int32_t topicId = 1, int32_t part = 0) {
     PartitionConfig c; c.topicId = topicId; c.partitionId = part; c.selfId = self; c.minIsr = 1; c.durabilityTier = tier;
     c.fetchIntervalNs = 1'000 * kMs; c.isrCheckIntervalNs = 1'000 * kMs; c.pushOnAppend = false;
@@ -814,6 +821,9 @@ TEST(StorageFailStopRegression, OwnershipMoveFailsAcksAllWaitersNoCrossThreadRea
     TmpDir d2;
     Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
     PartitionReplica other(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &log2, &s->t);
+    s->leader->setRegistryHandle(1, 21);   // registered (ReplicaRegistry::add does this)
+    other.setRegistryHandle(2, 22);
+    s->w.setOwnedDirect(Worker::OwnedSet{s->leader.get()});
     s->w.setReapPausedForTest(true);
     ASSERT_EQ(s->produce(7, batchAt(0, 2), /*acks=all*/1, 1), 1);
     s->w.doWork(1);
@@ -823,7 +833,7 @@ TEST(StorageFailStopRegression, OwnershipMoveFailsAcksAllWaitersNoCrossThreadRea
     WorkerOp sub;
     sub.type = WorkerOp::Type::Subscribe; sub.topicId = 1; sub.partition = 0;
     sub.replica = s->leader.get(); sub.logPtr = s->log.get(); sub.subscriptionId = 42; sub.sessionId = 1;
-    ASSERT_TRUE(s->w.tryEnqueueOp(std::move(sub)));
+    ASSERT_TRUE(s->w.tryEnqueueOp(stamp(std::move(sub))));
     s->w.doWork(2);
     ASSERT_EQ(s->w.subscriptionsForTest().size(), 1u);
     EXPECT_TRUE(s->w.subscriptionsForTest()[0].active);
@@ -883,13 +893,13 @@ TEST(StorageFailStopRegression, OpQueuedBeforeOwnershipMoveAnswersNotLeaderRegre
     prod.type = WorkerOp::Type::Produce; prod.topicId = 1; prod.partition = 0;
     prod.replica = moved.get(); prod.logPtr = log.get(); prod.sessionId = 5; prod.correlationId = 77;
     prod.recordCount = 1; prod.durabilityTier = 1; prod.recordBatchBytes = batchAt(0);
-    ASSERT_TRUE(w.tryEnqueueOp(std::move(prod)));
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(std::move(prod))));
     WorkerOp apply;
     apply.type = WorkerOp::Type::ApplyReplicated; apply.topicId = 1; apply.partition = 0;
     apply.replica = moved.get(); apply.logPtr = log.get();
     const auto b = batchAt(0);
     apply.replicatedPayload.records = b; apply.replicatedPayload.leaderEpoch = 1; apply.replicatedPayload.topicId = 1;
-    ASSERT_TRUE(w.tryEnqueueOp(std::move(apply)));
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(std::move(apply))));
     const int64_t leoBefore = log->logEndOffset();
     // The moved replica + log now belong to another worker: destroy them so any
     // dereference by this worker would be caught (ASan / crash).
@@ -933,7 +943,7 @@ WorkerOp produceOp(PartitionReplica* r, int64_t corr) {
     op.type = WorkerOp::Type::Produce; op.topicId = r->topicId(); op.partition = static_cast<int32_t>(r->partitionId());
     op.replica = r; op.logPtr = r->log(); op.sessionId = 1; op.correlationId = corr;
     op.recordCount = 1; op.durabilityTier = 1; op.recordBatchBytes = batchAt(0);
-    return op;
+    return stamp(std::move(op));
 }
 } // namespace
 
@@ -1021,7 +1031,7 @@ TEST(OwnershipGuardRegression, EveryGuardedOpTypeIsRefusedWhenNotOwned) {
         op.type = ty; op.topicId = 1; op.partition = 0; op.replica = rep.get(); op.logPtr = log.get();
         op.subscriptionId = 77; op.sessionId = 1;
         if (ty == WorkerOp::Type::AppendControlRecord) op.recordBatchBytes = batchAt(0);
-        ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+        ASSERT_TRUE(w.tryEnqueueOp(stamp(std::move(op))));
     }
     rep.reset();
     log.reset();
@@ -1054,7 +1064,7 @@ TEST(OwnershipGuardRegression, ParkedSubscriptionReactivatesByIncarnation) {
     WorkerOp sub;
     sub.type = WorkerOp::Type::Subscribe; sub.topicId = 1; sub.partition = 0;
     sub.replica = &rep; sub.logPtr = &log; sub.subscriptionId = 5; sub.sessionId = 1;
-    ASSERT_TRUE(w.tryEnqueueOp(sub));
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(sub)));
     WorkerOp away; away.type = WorkerOp::Type::SetOwnership;
     ASSERT_TRUE(w.tryEnqueueOp(std::move(away)));
     w.doWork(1);
@@ -1068,7 +1078,7 @@ TEST(OwnershipGuardRegression, ParkedSubscriptionReactivatesByIncarnation) {
     w.doWork(3);
     WorkerOp back2; back2.type = WorkerOp::Type::SetOwnership; back2.ownedSet = {&rep};
     ASSERT_TRUE(w.tryEnqueueOp(std::move(back2)));
-    ASSERT_TRUE(w.tryEnqueueOp(sub));                      // re-subscribe while owned
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(sub)));               // re-subscribe while owned
     w.doWork(4);
     EXPECT_TRUE(w.subscriptionsForTest()[0].active) << "a re-subscribe sets active = true";
 }
@@ -1099,7 +1109,7 @@ TEST(OwnershipGuardRegression, MarkerRefusedForRemovedReplicaReachesTheCoordinat
     WorkerOp m;
     m.type = WorkerOp::Type::AppendControlRecord; m.topicId = 1; m.partition = 0;
     m.replica = rep.get(); m.logPtr = log.get(); m.recordBatchBytes = batchAt(0);
-    ASSERT_TRUE(w.tryEnqueueOp(std::move(m)));
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(std::move(m))));
     w.doWork(1);
     std::vector<WorkerReturn> rets;
     w.drainReturn([&](WorkerReturn r) { rets.push_back(r); });
@@ -1290,7 +1300,10 @@ TEST(OwnershipGuardRegression, PendingRoleOpsKeepPerReplicaOrderAndDropRemovedRe
     bridge.routeBecomeFollowerForTest(r, 2, 2);
     bridge.routeBecomeLeaderForTest(r, 3, {1});              // must apply AFTER the follower op
     bridge.routeBecomeFollowerForTest(gone, 2, 2);
-    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 3u);
+    // Round 4 (M2): the Leader op SUPERSEDES the pending Follower op of the same
+    // replica (coalesced in place — latest absolute role wins).
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 2u);
+    EXPECT_EQ(bridge.roleOpsCoalescedForTest(), 1u);
     R.reg.remove(6, 0);                                      // removed before delivery: moot
     for (int i = 0; i < 32 && bridge.pendingRoleOpsForTest() > 0; ++i) {
         pool.worker(0).doWork(1 + i);
@@ -1302,7 +1315,10 @@ TEST(OwnershipGuardRegression, PendingRoleOpsKeepPerReplicaOrderAndDropRemovedRe
     EXPECT_EQ(r->role(), Role::Leader) << "FIFO: follower then leader";
 }
 
-TEST(OwnershipGuardRegression, RefusedMarkerForRegisteredPartitionHaltsInsteadOfReRouting) {
+TEST(OwnershipGuardRegression, RefusedMarkerWithUnknownTokenForRegisteredPartitionHalts) {
+    // Round 4: a refusal the gateway cannot match to a marker it issued, while
+    // the partition is still registered here, is an invariant violation (halt).
+    // (A refusal of a KNOWN marker is re-routed — see MarkerRefusedWhileRegistered...)
     Reg R;
     R.add(5, 0);
     auto gw = rune::gateway::ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; });
@@ -1313,14 +1329,12 @@ TEST(OwnershipGuardRegression, RefusedMarkerForRegisteredPartitionHaltsInsteadOf
     gw.setInvariantViolationHandler([&](const std::string& w) { what = w; });
     WorkerReturn ret;                                        // forced: refused while still on the node
     ret.type = WorkerReturn::Type::ControlRecordRefused;
-    ret.topicId = 5; ret.partition = 0;
+    ret.topicId = 5; ret.partition = 0; ret.correlationId = 999;
     ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-    const auto m = batchAt(0);
-    ret.chunk.assign(m.begin(), m.end());
     const int64_t leoBefore = R.reg.lookup(5, 0)->log()->logEndOffset();
     gw.handleWorkerReturnForTest(ret);
-    EXPECT_NE(what.find("still registered"), std::string::npos) << "halt (exit 70), never a re-land";
-    EXPECT_EQ(R.reg.lookup(5, 0)->log()->logEndOffset(), leoBefore) << "the marker is NOT re-appended";
+    EXPECT_NE(what.find("is registered on this node"), std::string::npos) << what;
+    EXPECT_EQ(R.reg.lookup(5, 0)->log()->logEndOffset(), leoBefore) << "nothing is re-appended";
     EXPECT_EQ(txn.refused, 0);
 }
 
@@ -1351,4 +1365,600 @@ TEST(OwnershipGuardRegression, InvariantMapStaysBoundedUnderChurn) {
     }
     EXPECT_EQ(pool.ownerMapSizeForTest(), R.reg.replicaCount()) << "bounded by the live replicas";
     EXPECT_EQ(R.reg.retiredCountForTest(), 0u);
+}
+
+// ============================================================================
+// Fix round 4 — replica lifetime on the CONTROL thread + residual races.
+// Every control-thread holder refers to a replica by (registryId,
+// incarnation) and resolves it through the registry at use time.
+// ============================================================================
+namespace {
+// Drive every worker once and feed OwnershipAcks back (what the gateway does).
+void ackAll(WorkerPool& pool, int64_t now = 1) {
+    for (int w = 0; w < pool.workerCount(); ++w) {
+        pool.worker(w).doWork(now);
+        pool.worker(w).drainReturn([&](WorkerReturn ret) {
+            if (ret.type == WorkerReturn::Type::OwnershipAck)
+                pool.onOwnershipAck(ret.partition, static_cast<std::uint64_t>(ret.lastOffset));
+        });
+    }
+}
+// Run a worker for a fixed, bounded number of passes (enough to drain a full
+// ingress ring of filler ops — a no-op op may report zero work, so "idle" is
+// not a usable stop condition).  Never sleeps.
+void drainIdle(Worker& w) {
+    for (int i = 0; i < 4'096; ++i) {
+        w.doWork(1 + i);
+        w.drainReturn([](WorkerReturn) {});
+    }
+}
+// Partition of `topic` routed to worker `w` (ShardRouter is a pure function).
+int32_t partitionOn(const WorkerPool& pool, int32_t topic, int32_t w) {
+    for (int32_t p = 0; p < 1024; ++p) if (pool.ownerWorkerId(topic, p) == w) return p;
+    return -1;
+}
+std::vector<uint8_t> encodeFetchReq(int32_t topic, int32_t part, uint16_t tid = rune::replication::FetchRequestMsg::TEMPLATE_ID) {
+    std::vector<uint8_t> f(rune::replication::FetchRequestMsg::TOTAL_SIZE);
+    rune::replication::FetchRequestMsg::encode(f.data(), 0, 1, part, 2, 0, 4096, topic);
+    rune::replication::stampTemplateId(f.data(), 0, tid);
+    return f;
+}
+std::vector<uint8_t> encodeFetchResp(int32_t topic, int32_t part, uint16_t tid = rune::replication::FetchResponseMsg::TEMPLATE_ID) {
+    const auto b = batchAt(0);
+    std::vector<uint8_t> f(rune::replication::FetchResponseMsg::encodedSize(b.size()));
+    rune::replication::FetchResponseMsg::encode(f.data(), 0, 1, part, 0, 0, rune::replication::kErrNone,
+                                                std::span<const uint8_t>(b), topic);
+    rune::replication::stampTemplateId(f.data(), 0, tid);
+    return f;
+}
+std::vector<uint8_t> encodeOleReq(int32_t topic, int32_t part) {
+    std::vector<uint8_t> f(rune::replication::OffsetsForLeaderEpochReqMsg::TOTAL_SIZE);
+    rune::replication::OffsetsForLeaderEpochReqMsg::encode(f.data(), 0, 1, part, 2, 1, 0, topic);
+    return f;
+}
+std::vector<uint8_t> encodeOleResp(int32_t topic, int32_t part) {
+    std::vector<uint8_t> f(rune::replication::OffsetsForLeaderEpochRespMsg::TOTAL_SIZE);
+    rune::replication::OffsetsForLeaderEpochRespMsg::encode(f.data(), 0, 1, part, 1, 0, rune::replication::kErrNone, topic);
+    return f;
+}
+std::vector<std::vector<uint8_t>> everyReplicationFrame(int32_t topic, int32_t part) {
+    return {encodeFetchReq(topic, part), encodeFetchResp(topic, part), encodeOleReq(topic, part),
+            encodeOleResp(topic, part),
+            encodeFetchReq(topic, part, rune::replication::kReconcileFetchReqTemplateId),
+            encodeFetchResp(topic, part, rune::replication::kReconcileFetchRespTemplateId)};
+}
+struct Captured {
+    std::vector<int16_t> produceErrors;
+    rune::gateway::ClientGateway::TestEgressFn fn() {
+        return [this](const uint8_t* b, std::size_t n) -> int64_t {
+            if (auto r = pc::ProduceResponse::decode(b, n)) produceErrors.push_back(r->errorCode);
+            return 1;
+        };
+    }
+};
+} // namespace
+
+TEST(ReplicaLifetimeRegression, WorkerEnqueueNeverReadsThroughTheOpPointer) {
+    // Critical 1 (Worker.h tryEnqueueOp): the identity is carried in the op —
+    // the control thread never dereferences op.replica.  A garbage pointer
+    // (= a freed replica) must not be touched at enqueue NOR by the worker.
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{});
+    WorkerOp op;
+    op.type = WorkerOp::Type::FetchRequest; op.topicId = 5; op.partition = 0;
+    op.replica = reinterpret_cast<PartitionReplica*>(static_cast<std::uintptr_t>(0x10));   // unmapped
+    op.targetReplicaId = 0; op.incarnation = ReplicaRegistry::kStaleIncarnation;
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(op))) << "enqueue reads nothing through the pointer";
+    w.doWork(1);
+    EXPECT_EQ(w.opsRefusedNotOwnedForTest(), 1u) << "refused by identity, the pointer never dereferenced";
+}
+
+TEST(ReplicaLifetimeRegression, LateOpsForAFreedReplicaAreStampedStaleAndRefused) {
+    // Critical 1: remove a partition → every worker acks → collectRetired frees
+    // it → late ops carrying the FREED pointer (what the transport's old
+    // replicas_ map handed out) are routed: WorkerPool stamps them from the
+    // registry at routing time (gone → stale, nullptr) and the worker refuses
+    // them through each op's normal response path.  Nothing is dereferenced.
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    PartitionReplica* stale = R.add(5, 0);
+    pool.reconcile(R.reg);
+    ackAll(pool);
+    ASSERT_EQ(pool.worker(0).ownedCount(), 1u);
+    R.reg.remove(5, 0);
+    pool.reconcile(R.reg);
+    ackAll(pool, 2);
+    ASSERT_EQ(R.reg.collectRetired(pool.minAckedOwnershipGen()), 1u) << "freed: every worker acked";
+    const WorkerOp::Type types[] = {
+        WorkerOp::Type::FetchRequest, WorkerOp::Type::ApplyReplicated,
+        WorkerOp::Type::OffsetsForLeaderEpochReq, WorkerOp::Type::OffsetsForLeaderEpochResp,
+        WorkerOp::Type::ReconcileFetchReq, WorkerOp::Type::ReconcileFetchResp,
+        WorkerOp::Type::Produce, WorkerOp::Type::PushRead, WorkerOp::Type::AppendControlRecord};
+    for (auto ty : types) {
+        WorkerOp op;
+        op.type = ty; op.topicId = 5; op.partition = 0; op.replica = stale;   // dangling
+        op.sessionId = 1; op.correlationId = 77; op.subscriptionId = 3;
+        if (ty == WorkerOp::Type::AppendControlRecord || ty == WorkerOp::Type::Produce) op.recordBatchBytes = batchAt(0);
+        if (ty == WorkerOp::Type::ApplyReplicated || ty == WorkerOp::Type::ReconcileFetchResp) op.replicatedPayload.records = batchAt(0);
+        ASSERT_TRUE(pool.tryEnqueueOp(5, 0, std::move(op)));
+    }
+    EXPECT_EQ(pool.staleOpsRoutedForTest(), 9u) << "every late op stamped stale at routing time";
+    pool.worker(0).doWork(3);
+    int produceNotLeader = 0, markerRefused = 0, pushRead = 0;
+    pool.worker(0).drainReturn([&](WorkerReturn r) {
+        if (r.type == WorkerReturn::Type::ProduceResult &&
+            r.errorCode == static_cast<int16_t>(pc::ErrorCode::NotLeader)) ++produceNotLeader;
+        if (r.type == WorkerReturn::Type::ControlRecordRefused) ++markerRefused;
+        if (r.type == WorkerReturn::Type::PushReadResult) ++pushRead;
+    });
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 9u);
+    EXPECT_EQ(produceNotLeader, 1);
+    EXPECT_EQ(markerRefused, 1);
+    EXPECT_EQ(pushRead, 1);
+
+    // Re-created at the same (topic, partition) — possibly at the SAME address:
+    // a late op carrying the old pointer is routed to the NEW incarnation by the
+    // registry (the wire keys by topic/partition), never by the pointer.
+    PartitionReplica* fresh = R.add(5, 0);
+    WorkerOp late;
+    late.type = WorkerOp::Type::FetchRequest; late.topicId = 5; late.partition = 0; late.replica = stale;
+    late.fetchRequestPayload.followerId = 2; late.fetchRequestPayload.maxBytes = 4096; late.fetchRequestPayload.topicId = 5;
+    ASSERT_TRUE(pool.tryEnqueueOp(5, 0, std::move(late)));
+    pool.worker(0).doWork(4);
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 9u) << "routed to the live incarnation (address reused="
+                                                              << (fresh == stale) << ")";
+}
+
+TEST(ReplicaLifetimeRegression, TransportHoldsNoReplicaPointerAndDropsFramesForAFreedPartition) {
+    // Critical 1 (transport): with the registry wired, the transport holds NO
+    // replica pointer (registerReplica is ignored) and resolves each frame at
+    // use time — a freed partition's late FetchRequest / FetchResponse / OLE /
+    // Reconcile frames are dropped without any dereference.
+    TmpDir ad;
+    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rune::replication::AeronPartitionTransport tr(client, "aeron:ipc", 7301, /*self*/1, 1 << 20);
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    tr.setReplicaRegistry(&R.reg);
+    tr.setWorkerPool(&pool);
+    PartitionReplica* r = R.add(5, 0);
+    tr.registerReplica(5, 0, r);
+    EXPECT_EQ(tr.heldReplicaPointersForTest(), 0u) << "the registry is the only source";
+    pool.reconcile(R.reg);
+    ackAll(pool);
+    // Live: a FetchRequest frame reaches the owning worker.
+    const auto live = encodeFetchReq(5, 0);
+    tr.deliverFrameForTest(live.data(), live.size(), 1);
+    pool.worker(0).doWork(2);
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 0u);
+    R.reg.remove(5, 0);
+    pool.reconcile(R.reg);
+    ackAll(pool, 3);
+    ASSERT_EQ(R.reg.collectRetired(pool.minAckedOwnershipGen()), 1u);
+    for (const auto& f : everyReplicationFrame(5, 0)) tr.deliverFrameForTest(f.data(), f.size(), 4);
+    pool.worker(0).doWork(5);
+    EXPECT_EQ(pool.staleOpsRoutedForTest(), 0u) << "dropped at the transport: nothing routed";
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 0u);
+}
+
+TEST(ReplicaLifetimeRegression, FollowerOleResponseAndReconcileRequestRunOnTheOwningWorker) {
+    // Pre-existing race fixed on sight: OLE responses and reconcile requests for
+    // a USER replica were executed inline on the control thread.  They are now
+    // routed to the owning worker (gated by identity like every partition op).
+    TmpDir ad;
+    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rune::replication::AeronPartitionTransport tr(client, "aeron:ipc", 7302, /*self*/1, 1 << 20);
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    tr.setReplicaRegistry(&R.reg);
+    tr.setWorkerPool(&pool);
+    R.add(5, 0);
+    pool.reconcile(R.reg);
+    ackAll(pool);
+    const uint64_t before = pool.worker(0).followerSideOpsForTest();
+    const auto ole = encodeOleResp(5, 0);
+    const auto rec = encodeFetchReq(5, 0, rune::replication::kReconcileFetchReqTemplateId);
+    tr.deliverFrameForTest(ole.data(), ole.size(), 1);
+    tr.deliverFrameForTest(rec.data(), rec.size(), 1);
+    pool.worker(0).doWork(2);
+    EXPECT_EQ(pool.worker(0).followerSideOpsForTest() - before, 2u) << "both executed by the owning worker";
+    EXPECT_EQ(pool.worker(0).opsRefusedNotOwnedForTest(), 0u);
+}
+
+TEST(ReplicaLifetimeRegression, RingFullWorkerGetsOneSetOwnershipPerGenerationOthersExactlyOne) {
+    // Important 1: one worker's ring is full during a topic create.  The other
+    // worker receives exactly ONE SetOwnership for the generation; routed ops
+    // never trigger a full re-computation; the full worker gets exactly one
+    // once its ring drains.
+    Reg R;
+    WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 12, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    const int32_t pA = partitionOn(pool, 7, 0), pB = partitionOn(pool, 7, 1);
+    ASSERT_GE(pA, 0); ASSERT_GE(pB, 0);
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (pool.worker(0).tryEnqueueOp(filler)) {}          // worker 0: ring full
+    const uint64_t sent0 = pool.setOwnershipSentForTest(0), sent1 = pool.setOwnershipSentForTest(1);
+    R.add(7, pA);
+    R.add(7, pB);                                            // "topic create"
+    pool.reconcile(R.reg);
+    const uint64_t computed = pool.assignmentsComputedForTest();
+    EXPECT_EQ(pool.setOwnershipSentForTest(1) - sent1, 1u);
+    EXPECT_EQ(pool.setOwnershipSentForTest(0) - sent0, 0u) << "ring full: not delivered yet";
+    for (int i = 0; i < 100; ++i) {
+        EXPECT_FALSE(pool.tryEnqueueOp(7, pA, produceOp(R.reg.lookup(7, pA), i))) << "back-pressured";
+        pool.reconcile(R.reg);                               // every control cycle
+    }
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(pool.tryEnqueueOp(7, pB, produceOp(R.reg.lookup(7, pB), i)));
+    EXPECT_EQ(pool.assignmentsComputedForTest(), computed) << "routed ops never re-compute the owned sets";
+    EXPECT_EQ(pool.setOwnershipSentForTest(1) - sent1, 1u) << "the healthy worker got exactly one per generation";
+    pool.worker(0).doWork(1);                               // drains the fillers
+    pool.reconcile(R.reg);
+    EXPECT_EQ(pool.setOwnershipSentForTest(0) - sent0, 1u) << "delivered once, on retry";
+    EXPECT_EQ(pool.setOwnershipSentForTest(1) - sent1, 1u) << "no re-send to the healthy worker";
+    EXPECT_EQ(pool.assignmentsComputedForTest(), computed);
+}
+
+TEST(ReplicaLifetimeRegression, ParkedSubscriptionIsNotReactivatedOntoANewIncarnationAtTheSameAddress) {
+    // Important 2: rebuildFlushSlots_ used to overwrite `active` with a pointer
+    // compare after rebuildOwnedIndex_ set it by incarnation.  Same address, same
+    // id, NEW incarnation = a different replica: the parked subscription stays parked.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.setRegistryHandle(6, 300);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    WorkerOp sub;
+    sub.type = WorkerOp::Type::Subscribe; sub.topicId = 1; sub.partition = 0;
+    sub.replica = &rep; sub.logPtr = &log; sub.subscriptionId = 5; sub.sessionId = 1;
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(sub)));
+    WorkerOp away; away.type = WorkerOp::Type::SetOwnership;
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(away)));
+    w.doWork(1);
+    ASSERT_FALSE(w.subscriptionsForTest()[0].active);
+    rep.setRegistryHandle(6, 301);                          // "destroyed + re-created at the same address"
+    WorkerOp back; back.type = WorkerOp::Type::SetOwnership; back.ownedSet = {&rep};
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(back)));
+    w.doWork(2);
+    EXPECT_FALSE(w.subscriptionsForTest()[0].active) << "a new incarnation never re-activates a parked subscription";
+}
+
+TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWithoutDereference) {
+    // Important 3: an acks=all entry in flight when its partition is removed and
+    // FREED → the drain resolves it through the registry → NotLeader.  Also for a
+    // re-created partition (new incarnation, possibly the same address).
+    for (bool recreate : {false, true}) {
+        Reg R;
+        Captured cap;
+        auto gw = rune::gateway::ClientGateway::makeForTest(cap.fn());
+        gw.setReplicaRegistry(&R.reg);
+        const int64_t sid = gw.injectTestSession();
+        R.add(5, 0);
+        const auto h = R.reg.lookupHandle(5, 0);
+        WorkerReturn ret;
+        ret.type = WorkerReturn::Type::ProduceResult;
+        ret.sessionId = sid; ret.correlationId = 77; ret.topicId = 5; ret.partition = 0;
+        ret.baseOffset = 0; ret.lastOffset = 0; ret.deferAck = true;
+        ret.targetReplicaId = h.id; ret.incarnation = h.incarnation;
+        gw.handleWorkerReturnForTest(ret);
+        ASSERT_EQ(gw.pendingAcksForTest(), 1u);
+        R.reg.remove(5, 0);
+        ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u) << "freed";
+        if (recreate) R.add(5, 0);
+        gw.drainPendingAcksForTest(1);
+        EXPECT_EQ(gw.pendingAcksForTest(), 0u);
+        ASSERT_EQ(cap.produceErrors.size(), 1u);
+        EXPECT_EQ(cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "recreate=" << recreate;
+    }
+}
+
+namespace {
+// A gateway in per-worker mode over one real user partition (topic 0 / part 0).
+struct MarkerRig {
+    TmpDir d;
+    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+    NullTransport t;
+    ReplicaRegistry reg;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
+    Captured cap;
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(cap.fn());
+    PartitionReplica* r = nullptr;
+    MarkerRig() {
+        auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 0, 0), Role::Leader, 1,
+            std::vector<rune::replication::NodeId>{1}, std::vector<rune::replication::NodeId>{1},
+            topics.log(0, 0), &t);
+        r = rep.get();
+        reg.add(0, 0, std::move(rep));
+        pool.assignFromRegistry(reg);
+        pool.setRegistry(&reg);
+        pool.setRunnersStartedForTest(true);
+        gw.setTopicRegistry(&topics);
+        gw.setReplicaRegistry(&reg);
+        gw.setWorkerPool(&pool);
+        gw.setPerWorkerIngressActive(true);
+    }
+    void runWorker(int64_t now) {
+        pool.worker(0).doWork(now);
+        pool.worker(0).drainReturn([&](WorkerReturn ret) { gw.handleWorkerReturnForTest(ret); });
+    }
+};
+std::vector<uint8_t> txnBatch(int64_t pid) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.append("k", "v", 1000);
+    auto v = b.build();
+    for (int i = 0; i < 8; ++i) v[43 + i] = static_cast<uint8_t>(pid >> (8 * i));
+    return v;
+}
+} // namespace
+
+TEST(ReplicaLifetimeRegression, MarkerOffsetIsTheWorkersActualAppendOffset) {
+    // P1: produces queued AHEAD of the marker in the worker ring land first; the
+    // coordinator's bookkeeping must record the marker where it ACTUALLY landed
+    // (3), not log->logEndOffset() at enqueue time (0).
+    MarkerRig m;
+    m.gw.notifyTransactionalBatch(0, 0, /*pid*/7, /*base*/0);   // txn opened at offset 0
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(m.pool.tryEnqueueOp(0, 0, produceOp(m.r, 100 + i)));
+    const auto marker = txnBatch(7);
+    const int64_t rc = m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, /*commit=*/false);
+    EXPECT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync) << "never a pre-computed offset";
+    EXPECT_TRUE(m.gw.abortedRangesForTest(0, 0).empty()) << "nothing recorded before the append happened";
+    m.runWorker(1);
+    const auto ranges = m.gw.abortedRangesForTest(0, 0);
+    ASSERT_EQ(ranges.size(), 1u);
+    EXPECT_EQ(ranges[0].producerId, 7);
+    EXPECT_EQ(ranges[0].lastOffset, 3) << "the marker's AUTHORITATIVE offset (3 produces landed first)";
+    EXPECT_EQ(m.gw.openTxnsForTest(0, 0), 0u);
+    EXPECT_EQ(m.gw.markersInFlightForTest(), 0u);
+}
+
+TEST(ReplicaLifetimeRegression, BackPressuredMarkerIsQueuedNotDroppedAndHoldsLaterProduces) {
+    MarkerRig m;
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (m.pool.worker(0).tryEnqueueOp(filler)) {}       // ring full
+    const auto marker = txnBatch(9);
+    EXPECT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 9, true),
+              rune::gateway::ClientGateway::kControlRecordAsync);
+    EXPECT_EQ(m.gw.markersQueuedForTest(), 1u) << "queued, never dropped";
+    drainIdle(m.pool.worker(0));                            // ring drains (fillers; bounded)
+    // The ring has space again but the marker has not been re-sent yet: a later
+    // produce to the SAME partition must not overtake it (retriable NotLeader).
+    const int64_t sid = m.gw.injectTestSession();
+    {
+        pc::Produce msg;
+        const auto batch = batchAt(0);
+        msg.sessionId = sid; msg.correlationId = 6; msg.topicId = 0; msg.partition = 0; msg.partitionKnown = 1;
+        msg.acks = 0; msg.producerId = -1; msg.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        msg.encode(frame.data());
+        m.gw.applyProduceForTest(frame.data(), frame.size());
+    }
+    ASSERT_EQ(m.cap.produceErrors.size(), 1u);
+    EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "held behind the marker";
+    EXPECT_EQ(m.gw.pumpRetryQueuesForTest(), 1);
+    EXPECT_EQ(m.gw.markersQueuedForTest(), 0u);
+    for (int i = 0; i < 64 && m.gw.markersInFlightForTest() > 0; ++i) m.runWorker(10'000 + i);   // bounded
+    EXPECT_EQ(m.gw.markersInFlightForTest(), 0u) << "appended and acknowledged";
+    EXPECT_EQ(m.r->log()->logEndOffset(), 1);
+}
+
+TEST(ReplicaLifetimeRegression, MarkerRefusedWhileRegisteredIsReRoutedAndLandsOnce) {
+    // P1: re-routing is SAFE now (no pre-computed offset).  A refusal of a known
+    // marker while the partition is registered re-routes it; it lands exactly once.
+    MarkerRig m;
+    const auto marker = txnBatch(11);
+    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true),
+              rune::gateway::ClientGateway::kControlRecordAsync);
+    // Drop the worker's copy and simulate the guard refusing it (token = 1).
+    m.pool.worker(0).doWork(1);
+    std::vector<WorkerReturn> rets;
+    m.pool.worker(0).drainReturn([&](WorkerReturn r) { rets.push_back(r); });
+    ASSERT_EQ(rets.size(), 1u);
+    ASSERT_EQ(rets[0].type, WorkerReturn::Type::ControlRecordAppended);
+    const int64_t leoAfterFirst = m.r->log()->logEndOffset();
+    // A forced refusal for a DIFFERENT issued marker (re-issue a second one).
+    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true),
+              rune::gateway::ClientGateway::kControlRecordAsync);
+    WorkerReturn refused;
+    refused.type = WorkerReturn::Type::ControlRecordRefused;
+    refused.topicId = 0; refused.partition = 0; refused.correlationId = 2;
+    refused.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    std::string what;
+    m.gw.setInvariantViolationHandler([&](const std::string& w) { what = w; });
+    m.gw.handleWorkerReturnForTest(rets[0]);              // the first one's real reply
+    m.gw.handleWorkerReturnForTest(refused);               // refusal of #2 → re-routed
+    EXPECT_TRUE(what.empty()) << what;
+    m.runWorker(2);                                         // #2 original + its re-route
+    EXPECT_EQ(m.gw.markersInFlightForTest(), 0u);
+    EXPECT_GE(m.r->log()->logEndOffset(), leoAfterFirst + 1);
+}
+
+TEST(ReplicaLifetimeRegression, RunnersStartedIsNeverWrittenByStopWhileControlRuns) {
+    // P2: stopAndJoinRunners() must not write the control-thread flag; the pool
+    // is armed before the control thread starts and disarmed after it is joined.
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.armRingOwnership();
+    EXPECT_TRUE(pool.ringOwnershipArmedForTest());
+    pool.stopAndJoinRunners();                              // (never started) — must not touch the flag
+    EXPECT_TRUE(pool.ringOwnershipArmedForTest()) << "stop never writes control-thread state";
+    pool.disarmAfterControlJoined();
+    EXPECT_FALSE(pool.ringOwnershipArmedForTest());
+}
+
+TEST(ReplicaLifetimeRegression, BridgeCatchesAnOwnershipInvariantThrowAndHandsItToTheHaltPath) {
+    // M1: the F7 throw (inside WorkerPool's inline reconcile) used to cross the
+    // bridge's noexcept chain → std::terminate.  Caught at the bridge boundary.
+    Reg R;
+    WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    auto* r = R.add(5, 0);                                  // generation moved, not reconciled yet
+    pool.seedOwnerForTest(r->incarnation(), 1 - pool.ownerWorkerId(5, 0));
+    ReplicationMetadataBridge bridge(1, {1, 2}, R.reg);
+    bridge.setWorkerPool(&pool);
+    bridge.routeBecomeFollowerForTest(r, 2, 2);             // would std::terminate before
+    std::string what;
+    ASSERT_TRUE(bridge.takeFatal(what));
+    EXPECT_NE(what.find("MOVE"), std::string::npos) << what;
+    EXPECT_FALSE(bridge.takeFatal(what)) << "reported once";
+}
+
+TEST(ReplicaLifetimeRegression, RoleOpQueuesArePerWorkerAndCoalesce) {
+    // M2: a full ring on worker 0 never holds back role ops for worker 1.
+    Reg R;
+    WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 12, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    const int32_t pA = partitionOn(pool, 3, 0), pB = partitionOn(pool, 3, 1);
+    auto* a = R.add(3, pA);
+    auto* b = R.add(3, pB);
+    pool.reconcile(R.reg);
+    ackAll(pool);
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (pool.worker(0).tryEnqueueOp(filler)) {}
+    ReplicationMetadataBridge bridge(1, {1, 2}, R.reg);
+    bridge.setWorkerPool(&pool);
+    bridge.routeBecomeFollowerForTest(a, 2, 2);             // worker 0: queued
+    bridge.routeBecomeLeaderForTest(a, 3, {1});             // supersedes it
+    bridge.routeBecomeFollowerForTest(a, 4, 2);             // supersedes again
+    EXPECT_EQ(bridge.pendingRoleOpsForWorkerForTest(0), 1u) << "bounded by replicas, not churn";
+    EXPECT_EQ(bridge.roleOpsCoalescedForTest(), 2u);
+    bridge.routeBecomeFollowerForTest(b, 2, 2);             // worker 1: delivered immediately
+    EXPECT_EQ(bridge.pendingRoleOpsForWorkerForTest(1), 0u) << "no head-of-line blocking across workers";
+    for (int i = 0; i < 8; ++i) pool.worker(1).doWork(10 + i);
+    EXPECT_EQ(b->role(), Role::Follower);
+    pool.worker(0).doWork(20);
+    bridge.flushPendingRoleOpsForTest();
+    for (int i = 0; i < 8; ++i) pool.worker(0).doWork(30 + i);
+    EXPECT_EQ(a->role(), Role::Follower) << "the latest (coalesced) role applied";
+    EXPECT_EQ(bridge.pendingRoleOpsForTest(), 0u);
+}
+
+TEST(ReplicaLifetimeRegression, BackPressuredRemovalFenceIsMootOnceTheReplicaIsDropped) {
+    // M2: a back-pressured removal fence is never silently lost — either
+    // delivered, or provably moot: the SetOwnership dropping the replica is
+    // delivered to the worker, which then never drives it again (and the
+    // replica is freed only after that worker acked).  The drop is counted.
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 12, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    R.add(5, 0);
+    pool.reconcile(R.reg);
+    ackAll(pool);
+    ASSERT_EQ(pool.worker(0).ownedCount(), 1u);
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (pool.worker(0).tryEnqueueOp(filler)) {}
+    ReplicationMetadataBridge bridge(1, {1, 2}, R.reg);
+    bridge.setWorkerPool(&pool);
+    bridge.applyDeleteForTest(5, 0);                        // fence (back-pressured) + registry remove
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 1u) << "the fence waits; it is not dropped";
+    pool.worker(0).doWork(1);                               // ring drains
+    pool.worker(0).drainReturn([](WorkerReturn) {});
+    pool.reconcile(R.reg);                                  // top of the next control cycle
+    bridge.flushPendingRoleOpsForTest();
+    EXPECT_EQ(bridge.pendingRoleOpsForTest(), 0u);
+    EXPECT_EQ(bridge.fencesMootForTest(), 1u) << "moot: the replica is no longer registered";
+    ackAll(pool, 2);
+    EXPECT_EQ(pool.worker(0).ownedCount(), 0u) << "the worker no longer drives it";
+    EXPECT_EQ(R.reg.collectRetired(pool.minAckedOwnershipGen()), 1u) << "freed only after the worker acked";
+}
+
+TEST(ReplicaLifetimeRegression, SchemaFailureWithAnOverlongPathNeverThrowsOnTheAdminThread) {
+    // M3: failureRing_ max message = 4096/8; a longer log dir made write() throw.
+    TmpDir d;
+    fs::path deep = d.path / std::string(200, 'a') / std::string(200, 'b') / std::string(200, 'c');
+    fs::create_directories(deep);
+    Log log(deep.string(), 64LL * 1024 * 1024); log.recover();
+    ASSERT_GT(log.dir().size(), 512u);
+    NullTransport t;
+    PartitionReplica schema(cfg(2, 1, -4, 0), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    schema.becomeFollower(1, 1);
+    const auto b = batchAt(0);
+    rune::replication::FetchResponseMsg resp{1, 0, 0, 0, rune::replication::kErrNone, -4, std::span<const uint8_t>(b)};
+    schema.applyReplicated(resp);
+    SchemaRegistry sreg;
+    AdminWorkerAgent agent(sreg, &schema, 2, {1, 2}, AdminDeps{});
+    log.setSyncFaultForTest(EIO);
+    EXPECT_NO_THROW(agent.doWork(25 * kMs));
+    int msgs = 0; std::string dir;
+    agent.failureRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                                  aeron::util::index_t len) {
+        ++msgs;
+        dir.assign(reinterpret_cast<const char*>(buf.buffer() + off) + 4, static_cast<std::size_t>(len) - 4);
+    }, 4);
+    EXPECT_EQ(msgs, 1) << "signalled (truncated), never thrown";
+    EXPECT_EQ(dir.rfind("...", 0), 0u);
+    EXPECT_EQ(log.dir().substr(log.dir().size() - (dir.size() - 3)), dir.substr(3)) << "the path's tail is kept";
+}
+
+TEST(ReplicaLifetimeRegression, IncarnationWrapSkipsZeroStaleAndLiveValues) {
+    // M4: 32-bit incarnations wrap; 0 (unregistered) / kStaleIncarnation and any
+    // value still held by a live replica are skipped.
+    Reg R;
+    auto* a = R.add(1, 0);
+    ASSERT_EQ(a->incarnation(), 1u);
+    R.reg.setNextIncarnationForTest(0xFFFFFFFEu);
+    auto* b = R.add(1, 1);
+    EXPECT_EQ(b->incarnation(), 0xFFFFFFFEu);
+    auto* c = R.add(1, 2);
+    EXPECT_NE(c->incarnation(), 0u);
+    EXPECT_NE(c->incarnation(), ReplicaRegistry::kStaleIncarnation);
+    EXPECT_NE(c->incarnation(), a->incarnation()) << "never live twice";
+    EXPECT_EQ(c->incarnation(), 2u);
+}
+
+TEST(ReplicaLifetimeRegression, BackPressuredProduceIsRetriableNotInternal) {
+    // M5: a produce the worker ring cannot take answers the RETRIABLE NotLeader.
+    MarkerRig m;
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (m.pool.worker(0).tryEnqueueOp(filler)) {}
+    const int64_t sid = m.gw.injectTestSession();
+    pc::Produce msg;
+    const auto batch = batchAt(0);
+    msg.sessionId = sid; msg.correlationId = 5; msg.topicId = 0; msg.partition = 0; msg.partitionKnown = 1;
+    msg.acks = 0; msg.producerId = -1; msg.recordBatch = std::span<const uint8_t>(batch);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    msg.encode(frame.data());
+    m.gw.applyProduceForTest(frame.data(), frame.size());
+    ASSERT_EQ(m.cap.produceErrors.size(), 1u);
+    EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::NotLeader));
+}
+
+TEST(ReplicaLifetimeRegression, BackPressuredSubscriptionLifecycleOpsAreQueuedInOrder) {
+    // M5: Subscribe / Unsubscribe the ring refused are queued per worker and
+    // retried in order — never dropped.
+    MarkerRig m;
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (m.pool.worker(0).tryEnqueueOp(filler)) {}
+    m.gw.forwardSubscribeForTest(41, /*session*/0, 0, 0, 0, 0, false, false);
+    m.gw.forwardUnsubscribeForTest(41, 0, 0);
+    EXPECT_EQ(m.gw.pendingSubOpsForTest(), 2u);
+    drainIdle(m.pool.worker(0));                            // fillers drain (bounded)
+    EXPECT_EQ(m.gw.pumpRetryQueuesForTest(), 2);
+    drainIdle(m.pool.worker(0));
+    EXPECT_TRUE(m.pool.worker(0).subscriptionsForTest().empty()) << "subscribe then unsubscribe, in order";
+    EXPECT_EQ(m.gw.pendingSubOpsForTest(), 0u);
 }

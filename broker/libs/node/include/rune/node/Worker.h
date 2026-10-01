@@ -481,8 +481,10 @@ public:
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
            .oleFollowerLeo(static_cast<std::int64_t>(op.offsEpochReqPayload.followerLeo))
            .egressPub(reinterpret_cast<std::uint64_t>(op.egressPub))
-           .targetReplicaId(op.replica ? op.replica->registryId() : 0u)
-           .incarnation(op.replica ? op.replica->incarnation() : 0u)
+           // Task 10 round 4: identity comes from the op (stamped from a registry
+           // lookup at routing time) — never read through op.replica here.
+           .targetReplicaId(op.targetReplicaId)
+           .incarnation(op.incarnation)
            .ownershipGen(op.ownershipGen)
            .tailKind(tailKind);
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
@@ -550,6 +552,8 @@ public:
                 ret.isolation            = dec.isolation();
                 ret.isGroup              = dec.isGroup() != 0;
                 ret.groupCarrierReceived = dec.groupCarrierReceived() != 0;
+                ret.targetReplicaId      = dec.targetReplicaId();
+                ret.incarnation          = dec.incarnation();
 
                 // Tail: PushReadResult chunk — copy from the ring view (1 copy) so
                 // fn can access it safely after the callback returns.
@@ -618,6 +622,7 @@ public:
     [[nodiscard]] const char* ioBackendNameForTest() const noexcept { return io_.name(); }
     [[nodiscard]] uint64_t opsRefusedNotOwnedForTest() const noexcept { return opsRefusedNotOwned_; }
     [[nodiscard]] uint64_t ownershipAcksForTest() const noexcept { return ownershipAcks_; }
+    [[nodiscard]] uint64_t followerSideOpsForTest() const noexcept { return followerSideOps_; }
     /// Bench / test: the per-op ownership check.
     [[nodiscard]] bool ownsReplicaForTest(const rune::replication::PartitionReplica* r) const noexcept {
         return ownsIncarnation_(r->registryId(), r->incarnation());
@@ -896,7 +901,9 @@ private:
            .hwBound(ret.hwBound)
            .isolation(ret.isolation)
            .isGroup(ret.isGroup ? 1 : 0)
-           .groupCarrierReceived(ret.groupCarrierReceived ? 1 : 0);
+           .groupCarrierReceived(ret.groupCarrierReceived ? 1 : 0)
+           .targetReplicaId(ret.targetReplicaId)
+           .incarnation(ret.incarnation);
         enc.putChunk(reinterpret_cast<const char*>(ret.chunk.data()),
                      static_cast<std::uint32_t>(ret.chunk.size()));
     }
@@ -1160,6 +1167,9 @@ private:
                 refuseNotOwned_(op, type);
                 return;
             }
+            // Task 10 round 4: execute against THIS worker's own pointer for the
+            // owned incarnation — the pointer the op carried is never trusted.
+            op.replica(reinterpret_cast<std::uint64_t>(ownedPtr_[id]));
         }
         switch (type) {
         case WorkerOp::Type::Produce:
@@ -1193,6 +1203,14 @@ private:
             break;
         case WorkerOp::Type::ReconcileFetchResp:
             executeReconcileFetchRespWire_(op);
+            break;
+        // Task 10 round 4: follower/peer-side handlers (were inline on the
+        // control thread — a cross-thread race on a worker-owned replica).
+        case WorkerOp::Type::OffsetsForLeaderEpochResp:
+            executeOffsetsForLeaderEpochRespWire_(op);
+            break;
+        case WorkerOp::Type::ReconcileFetchReq:
+            executeReconcileFetchReqWire_(op);
             break;
         // Task #13: AppendControlRecord — worker appends txn control marker
         case WorkerOp::Type::AppendControlRecord:
@@ -1391,8 +1409,10 @@ private:
             if (!egressPub) continue;  // nowhere to send yet
 
             // HW bound (read_uncommitted).  Worker owns the replica → live HW.
-            const int64_t bound = s.replica ? s.replica->highWatermark()
-                                            : s.logPtr->logEndOffset();
+            auto* rep = subReplica_(s);
+            if (s.incarnation != 0 && !rep) continue;   // not owned (defensive: active implies owned)
+            const int64_t bound = rep ? rep->highWatermark()
+                                      : s.logPtr->logEndOffset();
             if (s.nextOffset >= bound) continue;
 
             rune::storage::LogReadView view;
@@ -1500,6 +1520,8 @@ private:
         ret.partition     = partition;
         ret.deferAck      = op.deferAck() != 0;
         ret.replica       = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        ret.targetReplicaId = op.targetReplicaId();
+        ret.incarnation     = op.incarnation();
         ret.producerId    = op.producerId();
         ret.producerEpoch = op.producerEpoch();
         ret.baseSequence  = op.baseSequence();
@@ -1983,6 +2005,58 @@ private:
     }
 
     // -------------------------------------------------------------------
+    // Task 10 round 4: executeOffsetsForLeaderEpochRespWire_ — the follower
+    // applies a KIP-101 epoch-boundary answer (may truncate its log) on the
+    // OWNING worker thread.  Scalars: leaderEpoch→oleCurrentEpoch,
+    // responseEpoch→oleRequestedEpoch, endOffset→oleFollowerLeo,
+    // errorCode→replErrorCode.  Fire-and-forget.
+    // -------------------------------------------------------------------
+    void executeOffsetsForLeaderEpochRespWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        if (!replica) return;
+        ++followerSideOps_;
+        rune::replication::OffsetsForLeaderEpochRespMsg resp;
+        resp.leaderEpoch   = static_cast<rune::replication::Epoch>(op.oleCurrentEpoch());
+        resp.partition     = static_cast<rune::replication::PartitionId>(op.partition());
+        resp.responseEpoch = static_cast<rune::replication::Epoch>(op.oleRequestedEpoch());
+        resp.endOffset     = static_cast<rune::replication::Offset>(op.oleFollowerLeo());
+        resp.errorCode     = op.replErrorCode();
+        resp.topicId       = op.topicId();
+        try {
+            replica->applyOffsetsForLeaderEpochResponse(resp);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: applyOffsetsForLeaderEpochResponse threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: applyOffsetsForLeaderEpochResponse threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Task 10 round 4: executeReconcileFetchReqWire_ — a survivor serves a
+    // deficient leader's reconcile pull on the OWNING worker thread (reads the
+    // owned log).  Reuses the fr* scalars.  Fire-and-forget.
+    // -------------------------------------------------------------------
+    void executeReconcileFetchReqWire_(sbe::WorkerOp& op) {
+        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        if (!replica) return;
+        ++followerSideOps_;
+        rune::replication::FetchRequestMsg req;
+        req.leaderEpoch = static_cast<rune::replication::Epoch>(op.frLeaderEpoch());
+        req.partition   = static_cast<rune::replication::PartitionId>(op.partition());
+        req.followerId  = static_cast<rune::replication::NodeId>(op.frFollowerId());
+        req.fetchOffset = static_cast<rune::replication::Offset>(op.frFetchOffset());
+        req.maxBytes    = op.frMaxBytes();
+        req.topicId     = op.topicId();
+        try {
+            replica->onReconcileRequest(req);
+        } catch (const std::exception& ex) {
+            spdlog::warn("Worker {}: onReconcileRequest threw: {}", workerId_, ex.what());
+        } catch (...) {
+            spdlog::warn("Worker {}: onReconcileRequest threw unknown exception", workerId_);
+        }
+    }
+
+    // -------------------------------------------------------------------
     // E5.1.2c: executeReconcileFetchRespWire_ — deficient leader applies
     // reconcile records pulled from an ahead survivor, on the worker thread.
     // Reuses replicatedPayload scalars + records tail (same layout as ApplyReplicated).
@@ -2021,53 +2095,58 @@ private:
 
     // -------------------------------------------------------------------
     // Task #13: executeAppendControlRecordWire_ — append a txn COMMIT/ABORT
-    // control marker to the worker-owned user partition log.
+    // control marker to the worker-owned user partition log (the worker is the
+    // sole appender: no race).
     //
-    // Called when the gateway routes an appendControlRecord op here because
-    // per-worker ingress is active (the worker is the sole appender for this
-    // partition — no race).  The gateway pre-computed the base offset from
-    // log->logEndOffset() before enqueueing and stored the pre-stamped marker
-    // bytes in the tail (same layout as Produce).  Here we just call
-    // replica->append(marker, acksAll=true) on the worker thread; append()
-    // reads logEndOffset() again internally — fine since the worker is the sole
-    // appender and no other thread touched the log in between.
-    //
-    // Fire-and-forget: no WorkerReturn needed (the gateway already has the
-    // pre-computed base offset and calls notifyControlMarker synchronously).
+    // Task 10 round 4 (P1): the marker's offset is AUTHORITATIVE from this
+    // append — the runtime never pre-computes it (produces queued ahead of the
+    // marker would land first and shift it).  The result is returned as
+    // ControlRecordAppended{correlationId = the runtime's marker token,
+    // baseOffset = where it landed}, or errorCode != 0 when the append failed;
+    // the runtime then feeds the LSO / aborted-txn bookkeeping.  Never silent.
     // -------------------------------------------------------------------
     void executeAppendControlRecordWire_(sbe::WorkerOp& op) {
+        namespace pc = rune::protocol::client;
         const int32_t topicId   = op.topicId();
         const int32_t partition = op.partition();
+        WorkerReturn ret;
+        ret.type            = WorkerReturn::Type::ControlRecordAppended;
+        ret.correlationId   = op.correlationId();
+        ret.topicId         = topicId;
+        ret.partition       = partition;
+        ret.producerId      = op.producerId();
+        ret.targetReplicaId = op.targetReplicaId();
+        ret.incarnation     = op.incarnation();
+        ret.baseOffset      = -1;
         auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
-        if (!replica) {
-            spdlog::warn("Worker {}: executeAppendControlRecordWire_ — null replica for "
-                         "topicId={} partition={}", workerId_, topicId, partition);
-            return;
-        }
-
         const uint32_t tailLen = op.tailLength();
         const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
-
-        if (!tail || tailLen == 0) {
-            spdlog::warn("Worker {}: executeAppendControlRecordWire_ — empty marker tail for "
-                         "topicId={} partition={}", workerId_, topicId, partition);
+        if (!replica || !tail || tailLen == 0) {
+            spdlog::warn("Worker {}: executeAppendControlRecordWire_ — {} for topicId={} partition={}",
+                         workerId_, replica ? "empty marker tail" : "null replica", topicId, partition);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            enqueueSignal_(ret);
             return;
         }
-
         const std::span<const uint8_t> markerSpan(tail, static_cast<std::size_t>(tailLen));
-
         try {
             const rune::replication::Offset base = replica->append(markerSpan, /*acksAll=*/true);
             if (base < 0) {
                 spdlog::warn("Worker {}: executeAppendControlRecordWire_ — replica->append returned {} "
                              "(minIsr gate?) topicId={} partition={}",
                              workerId_, base, topicId, partition);
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
+            } else {
+                ret.baseOffset = base;
             }
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw: {}", workerId_, ex.what());
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
         } catch (...) {
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw unknown", workerId_);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
         }
+        enqueueSignal_(ret);   // never dropped (retried next pass on a full ring)
     }
 
     // -------------------------------------------------------------------
@@ -2648,8 +2727,10 @@ private:
     // ---- Ownership table: ownedInc_[registryId] = the incarnation this worker
     // owns (0 = not owned).  Dense, indexed by the registry id carried in the op.
     std::vector<uint32_t> ownedInc_;
+    std::vector<rune::replication::PartitionReplica*> ownedPtr_;   // ownedPtr_[id] valid iff ownedInc_[id] != 0
     uint64_t    opsRefusedNotOwned_ = 0;
     uint64_t    ownershipAcks_      = 0;
+    uint64_t    followerSideOps_    = 0;   // OLE responses + reconcile requests executed here
     static constexpr bool gatedByOwnership_(WorkerOp::Type t) noexcept {
         switch (t) {
         case WorkerOp::Type::Produce:
@@ -2660,6 +2741,8 @@ private:
         case WorkerOp::Type::FetchRequest:
         case WorkerOp::Type::OffsetsForLeaderEpochReq:
         case WorkerOp::Type::ReconcileFetchResp:
+        case WorkerOp::Type::OffsetsForLeaderEpochResp:
+        case WorkerOp::Type::ReconcileFetchReq:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::Subscribe:
             return true;
@@ -2674,16 +2757,27 @@ private:
         uint32_t maxId = 0;
         for (const auto* r : owned_) if (r && r->registryId() > maxId) maxId = r->registryId();
         ownedInc_.assign(static_cast<std::size_t>(maxId) + 1, 0u);
-        for (const auto* r : owned_) if (r && r->incarnation() != 0) ownedInc_[r->registryId()] = r->incarnation();
-        // Parked / active push subscriptions follow ownership by id + incarnation.
-        for (auto& sub : subs_) {
-            if (sub.incarnation != 0) sub.active = ownsIncarnation_(sub.registryId, sub.incarnation);
-            else if (sub.replica) {
-                bool owned = false;
-                for (const auto* r : owned_) owned = owned || r == sub.replica;
-                sub.active = owned;
+        ownedPtr_.assign(static_cast<std::size_t>(maxId) + 1, nullptr);
+        for (auto* r : owned_) {
+            if (r && r->incarnation() != 0) {
+                ownedInc_[r->registryId()] = r->incarnation();
+                ownedPtr_[r->registryId()] = r;
             }
         }
+        // Parked / active push subscriptions follow ownership by id + incarnation
+        // ONLY (Task 10 round 4, Important 2): never by pointer — a new replica at
+        // a reused address is a different incarnation and stays parked.
+        // Unregistered subscriptions (incarnation 0: unit tests / passthrough)
+        // are not ownership-gated, exactly like their ops.
+        for (auto& sub : subs_) {
+            if (sub.incarnation != 0) sub.active = ownsIncarnation_(sub.registryId, sub.incarnation);
+        }
+    }
+    /// The replica a registered subscription reads: this worker's own pointer for
+    /// the owned incarnation (never the pointer carried by the Subscribe op).
+    [[nodiscard]] rune::replication::PartitionReplica* subReplica_(const WorkerSubscription& s) const noexcept {
+        if (s.incarnation == 0) return s.replica;
+        return ownsIncarnation_(s.registryId, s.incarnation) ? ownedPtr_[s.registryId] : nullptr;
     }
     // A partition op for a replica this worker does not own: answer through the
     // op's normal response path (retriable), never touching the replica / log.
@@ -2732,6 +2826,8 @@ private:
             // transaction coordinator.
             WorkerReturn ret;
             ret.type      = WorkerReturn::Type::ControlRecordRefused;
+            ret.correlationId = op.correlationId();   // the runtime's marker token
+            ret.producerId    = op.producerId();
             ret.topicId   = op.topicId();
             ret.partition = op.partition();
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
@@ -2795,8 +2891,12 @@ private:
         };
         // acks=all waiters on a moved replica would read its HW cross-thread:
         // fail them RETRIABLY (NotLeader) — the client retries on the new owner.
+        auto stillOwned = [&](const PendingAcksAll& p) {
+            return p.ret.incarnation != 0 ? ownsIncarnation_(p.ret.targetReplicaId, p.ret.incarnation)
+                                          : isOwned(p.replica);
+        };
         for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
-            if (!isOwned(pendingAcksAll_[i].replica)) {
+            if (!stillOwned(pendingAcksAll_[i])) {
                 pendingAcksAll_[i].ret.errorCode =
                     static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
                 enqueueReturn_(pendingAcksAll_[i].ret);
@@ -2806,11 +2906,8 @@ private:
                 ++i;
             }
         }
-        // Push subscriptions on a moved partition are parked (cursor kept, no
-        // reads); re-activated if the partition comes back to this worker.
-        for (auto& sub : subs_) {
-            if (sub.replica) sub.active = isOwned(sub.replica);
-        }
+        // Push subscriptions: parked / re-activated by id + incarnation in
+        // rebuildOwnedIndex_ above — never overwritten by a pointer compare here.
         // C-1 / M2: logs this worker no longer owns.  Their still-pending durable
         // entries would lose their seal gating (the slot goes) — fail them
         // RETRIABLY now (NotLeader: the client retries on the new owner), and
@@ -3394,6 +3491,7 @@ private:
         ret.producerEpoch = msg.producerEpoch;
         ret.baseSequence  = msg.baseSequence;
         ret.replica       = replica;
+        if (replica) { ret.targetReplicaId = replica->registryId(); ret.incarnation = replica->incarnation(); }
 
         if (!log) {
             // E5.1.5: distinguish "partition not owned by this worker" (retriable

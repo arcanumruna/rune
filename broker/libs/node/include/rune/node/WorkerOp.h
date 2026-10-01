@@ -64,10 +64,11 @@ struct WorkerOp {
         OffsetsForLeaderEpochReq, ///< transport → worker: leader handles KIP-101 epoch probe
         ReconcileFetchResp,       ///< transport → worker: deficient leader applies survivor data
         // Task #13: appendControlRecord race fix — route txn COMMIT/ABORT marker
-        // appends to the owning worker when per-worker ingress is active.
-        // Fire-and-forget (no WorkerReturn): the gateway pre-computes the base
-        // offset from log->logEndOffset() before enqueueing and returns it
-        // synchronously; the worker appends via replica->append(marker, acksAll).
+        // appends to the owning worker when per-worker ingress is active.  The
+        // worker appends via replica->append(marker, acksAll) and answers
+        // ControlRecordAppended{correlationId = marker token, baseOffset = where
+        // it ACTUALLY landed} (Task 10 round 4: never pre-computed) — or
+        // ControlRecordRefused when the ownership guard refuses it.
         // Internal partitions (topicId < 0) never use this path.
         AppendControlRecord,      ///< gateway → worker: append txn control marker to user partition
         // read-rework T3/T4: subscription lifecycle routed to the owning worker so
@@ -81,6 +82,11 @@ struct WorkerOp {
         // Worker builds a local rune::codec::Validator from the blob on its own thread
         // (shared-nothing: validators_ is worker-owned, never touched by any other thread).
         SchemaUpdate,             ///< admin → worker: install/update a per-topic Validator
+        // Task 10 round 4: follower/peer-side handlers on a USER replica, routed
+        // to the owning worker (they touch the replica's log/state).  13/14 are
+        // the schema's SESSION_ANNOUNCE / SESSION_CLOSE (shard-runtime ops).
+        OffsetsForLeaderEpochResp = 15, ///< transport → worker: follower applies a KIP-101 answer
+        ReconcileFetchReq         = 16, ///< transport → worker: survivor serves a reconcile pull
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -97,9 +103,19 @@ struct WorkerOp {
     // -----------------------------------------------------------------------
     // Non-owning pointer to the PartitionReplica for this (topicId, partition).
     // Null if no replica wired (passthrough / single-node).
-    // Lifetime invariant: the replica registry outlives the ring.
+    //
+    // Task 10 round 4: the pointer is NEVER dereferenced on the control thread.
+    // Production routing (WorkerPool::tryEnqueueOp) resolves (topicId,
+    // partition) through the ReplicaRegistry at routing time and stamps the
+    // pointer + identity (targetReplicaId, incarnation) from that lookup; the
+    // worker executes only if it owns that exact incarnation and then uses ITS
+    // OWN pointer for the id.  incarnation 0 = unregistered (not gated: unit
+    // tests / passthrough); ReplicaRegistry::kStaleIncarnation = the target is
+    // gone (always refused through the op's normal response path).
     // -----------------------------------------------------------------------
     rune::replication::PartitionReplica* replica = nullptr;
+    uint32_t targetReplicaId = 0;
+    uint32_t incarnation     = 0;
 
     // -----------------------------------------------------------------------
     // Non-owning Log* — set by the gateway at enqueue time from the
@@ -286,6 +302,10 @@ struct WorkerReturn {
         /// AppendControlRecord refused by the ownership guard: topicId /
         /// partition, the marker in chunk (re-routed or surfaced as NotLeader).
         ControlRecordRefused = 5,
+        /// AppendControlRecord executed: correlationId = the runtime's marker
+        /// token, baseOffset = where the marker ACTUALLY landed (authoritative),
+        /// or errorCode != 0 when the append failed.  Task 10 round 4 (P1).
+        ControlRecordAppended = 6,
     };
 
     Type    type = Type::ProduceResult;
@@ -308,8 +328,12 @@ struct WorkerReturn {
     // AND acks=All AND replica is set AND committedMetadataReady is true.
     bool    deferAck      = false;
 
-    // Non-owning pointer to the replica (for the pending-ack path).
+    // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
+    // dereferences it — it refers to the replica by (targetReplicaId,
+    // incarnation), echoed from the op, and resolves through the registry.
     rune::replication::PartitionReplica* replica = nullptr;
+    uint32_t targetReplicaId = 0;
+    uint32_t incarnation     = 0;
 
     // Producer-state update fields (forwarded from WorkerOp for PSM update).
     // Gateway calls producerStateManager_.update() after receiving the result.

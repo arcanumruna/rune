@@ -37,16 +37,50 @@ public:
         const Key key{topicId, partition};
         if (map_.count(key)) remove(topicId, partition);   // never destroy a live, owned replica in place
         // Task 10 fix 3: a dense id (reused only after the previous holder is
-        // freed) + a never-reused incarnation.  Workers guard every op by
-        // (id, incarnation): pointer reuse can never pass as ownership.
+        // freed) + an incarnation.  Workers guard every op by (id, incarnation):
+        // pointer reuse can never pass as ownership.
         uint32_t id;
         if (!freeIds_.empty()) { id = freeIds_.back(); freeIds_.pop_back(); }
         else id = nextId_++;
-        replica->setRegistryHandle(id, nextIncarnation_++);
-        map_[key] = std::move(replica);
-        ordered_.push_back(map_[key].get());
+        const uint32_t inc = allocIncarnation_();
+        replica->setRegistryHandle(id, inc);
+        auto* raw = replica.get();
+        map_[key] = Entry{std::move(replica), id, inc};
+        ordered_.push_back(raw);
         ++generation_;
     }
+
+    // -----------------------------------------------------------------------
+    // Task 10 round 4 — identity handles.  Control-thread holders (transport,
+    // gateway pending acks, bridge pending role ops, op routing) refer to a
+    // replica by (registryId, incarnation) and resolve it HERE at use time.
+    // The identity is stored in the map entry itself: resolving it never reads
+    // through a replica pointer.  A miss or an incarnation mismatch = stale.
+    // -----------------------------------------------------------------------
+    struct Handle {
+        rune::replication::PartitionReplica* replica     = nullptr;
+        uint32_t                             id          = 0;
+        uint32_t                             incarnation = 0;
+        explicit operator bool() const noexcept { return replica != nullptr; }
+    };
+    /// Never assigned to a live replica: marks an op whose target is gone.
+    static constexpr uint32_t kStaleIncarnation = 0xFFFFFFFFu;
+
+    [[nodiscard]] Handle lookupHandle(int32_t topicId, int32_t partition) const noexcept {
+        auto it = map_.find(Key{topicId, partition});
+        if (it == map_.end()) return {};
+        return Handle{it->second.replica.get(), it->second.id, it->second.inc};
+    }
+    /// The live replica for (topicId, partition) iff it is still `incarnation`.
+    [[nodiscard]] rune::replication::PartitionReplica*
+    resolve(int32_t topicId, int32_t partition, uint32_t incarnation) const noexcept {
+        auto it = map_.find(Key{topicId, partition});
+        if (it == map_.end() || it->second.inc != incarnation) return nullptr;
+        return it->second.replica.get();
+    }
+
+    /// Test seam (M4): start incarnation allocation at `next` (exercise the wrap).
+    void setNextIncarnationForTest(uint32_t next) noexcept { nextIncarnation_ = next; }
 
     /// One past the largest dense id handed out (workers size their tables by it).
     [[nodiscard]] uint32_t idCapacity() const noexcept { return nextId_; }
@@ -58,7 +92,7 @@ public:
     lookup(int32_t topicId, int32_t partition) const noexcept
     {
         auto it = map_.find(Key{topicId, partition});
-        return (it != map_.end()) ? it->second.get() : nullptr;
+        return (it != map_.end()) ? it->second.replica.get() : nullptr;
     }
 
     // -----------------------------------------------------------------------
@@ -89,11 +123,12 @@ public:
     // spec §16 stray-replica quarantine).  After removal, lookup() returns
     // nullptr for that key so the deleted partition can never be routed to again.
     //
-    // The replica's unique_ptr is destroyed here — the underlying Log and disk
-    // data are NOT touched (they are owned by the TopicRegistry / the caller's
-    // layer).  A replica id is never reused: if the same topic/partition is
-    // later recreated with a new (topicId, partition) pair it will be a fresh
-    // add() call; the old quarantined log is never resurrected.
+    // The replica is RETIRED here, not destroyed: it is freed by
+    // collectRetired() once every worker acked the SetOwnership that drops it.
+    // The underlying Log and disk data are NOT touched (owned by the
+    // TopicRegistry / the caller's layer).  Its dense id is reused only after it
+    // is freed; its incarnation never names another live replica, so any holder
+    // that refers to it by (topic, partition, incarnation) resolves to nothing.
     //
     // Complexity: O(n) for the ordered_ erase (n = total registered replicas;
     // typically small).  Hot path is add/lookup; remove is uncommon (assignment
@@ -107,7 +142,7 @@ public:
 
         // Remove the raw pointer from ordered_ before destroying the unique_ptr
         // so ordered_ never holds a dangling pointer even transiently.
-        auto* raw = it->second.get();
+        auto* raw = it->second.replica.get();
         auto  oit = std::find(ordered_.begin(), ordered_.end(), raw);
         if (oit != ordered_.end()) ordered_.erase(oit);
 
@@ -115,7 +150,8 @@ public:
         // applies the SetOwnership for this generation.  Retired here, freed by
         // collectRetired() once every worker acked an ownership gen >= this one.
         ++generation_;
-        retired_.push_back(Retired{generation_, std::move(it->second)});
+        retired_.push_back(Retired{generation_, std::move(it->second.replica), it->second.id,
+                                   it->second.inc});
         map_.erase(it);
     }
 
@@ -126,7 +162,7 @@ public:
         std::size_t freed = 0;
         for (std::size_t i = 0; i < retired_.size(); ) {
             if (retired_[i].gen <= safeGen) {
-                freeIds_.push_back(retired_[i].replica->registryId());
+                freeIds_.push_back(retired_[i].id);
                 retired_[i] = std::move(retired_.back());
                 retired_.pop_back();
                 ++freed;
@@ -168,17 +204,44 @@ private:
         }
     };
 
-    std::unordered_map<Key, std::unique_ptr<rune::replication::PartitionReplica>, KeyHash> map_;
+    struct Entry {
+        std::unique_ptr<rune::replication::PartitionReplica> replica;
+        uint32_t id  = 0;
+        uint32_t inc = 0;
+    };
+    // M4: incarnations are 32-bit on the ring.  On wrap, 0 (unregistered /
+    // not gated) and kStaleIncarnation are skipped, and — once wrapped — any
+    // value still held by a live or retired replica is skipped too (cold: adds
+    // are control-plane events), so an incarnation is never live twice.
+    uint32_t allocIncarnation_() noexcept {
+        for (;;) {
+            const uint32_t v = nextIncarnation_++;
+            if (nextIncarnation_ == 0) wrapped_ = true;
+            if (v == 0 || v == kStaleIncarnation) { wrapped_ = true; continue; }
+            if (wrapped_ && incarnationInUse_(v)) continue;
+            return v;
+        }
+    }
+    [[nodiscard]] bool incarnationInUse_(uint32_t v) const noexcept {
+        for (const auto& [k, e] : map_) { (void)k; if (e.inc == v) return true; }
+        for (const auto& r : retired_) if (r.inc == v) return true;
+        return false;
+    }
+
+    std::unordered_map<Key, Entry, KeyHash> map_;
     std::vector<rune::replication::PartitionReplica*> ordered_;  // stable insertion order
     std::uint64_t generation_ = 0;
     struct Retired {
         std::uint64_t gen;
         std::unique_ptr<rune::replication::PartitionReplica> replica;
+        uint32_t id  = 0;
+        uint32_t inc = 0;
     };
     std::vector<Retired>  retired_;
     std::vector<uint32_t> freeIds_;
     uint32_t              nextId_          = 1;   // 0 = unregistered (not gated)
     uint32_t              nextIncarnation_ = 1;
+    bool                  wrapped_         = false;
 };
 
 } // namespace rune::node

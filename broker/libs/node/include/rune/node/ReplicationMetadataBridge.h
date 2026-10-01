@@ -64,6 +64,7 @@
 
 #include <atomic>
 #include <deque>
+#include <string>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -338,18 +339,45 @@ private:
         rune::replication::Epoch                      epoch,
         std::vector<rune::replication::NodeId>        isr) noexcept;
 
-    // Role ops not yet accepted by the owning worker's ring.  FIFO (order is
-    // preserved per replica: nothing is attempted directly while older ops
-    // wait).  Each entry remembers its replica's (topic, partition,
-    // incarnation): an op whose replica was removed / re-registered meanwhile
-    // is dropped without dereferencing the stale pointer.
+    // -----------------------------------------------------------------------
+    // Role ops not yet accepted by the owning worker's ring (Task 10 round-3
+    // addendum; round 4 M2):
+    //   - one FIFO PER OWNING WORKER: a full ring on one worker never holds back
+    //     role ops for the others (no cross-worker head-of-line blocking);
+    //   - per-replica order is preserved (nothing is attempted directly while an
+    //     older op waits in that worker's queue);
+    //   - a newer role op for a replica that already has one pending SUPERSEDES
+    //     it in place (BecomeLeader / BecomeFollower are absolute, epoch-stamped
+    //     states: only the latest matters) — the queue is bounded by the number
+    //     of replicas, not by the churn rate;
+    //   - each entry refers to its replica by (topic, partition, incarnation)
+    //     ONLY and is re-resolved through the registry at delivery: an op whose
+    //     replica was removed / re-registered meanwhile is dropped without
+    //     dereferencing anything (it would be stamped stale and refused anyway);
+    //   - growth is warned, rate-limited (each doubling past 64).
+    // A back-pressured REMOVAL FENCE (applyDeleteForKey) is either delivered or
+    // provably moot — see flushPendingRoleOps_ in the .cpp for the argument.
+    // -----------------------------------------------------------------------
     struct PendingRoleOp {
         WorkerOp op;
         uint32_t incarnation = 0;
+        bool     fence       = false;   // the removal fence of applyDeleteForKey
     };
-    std::deque<PendingRoleOp> pendingRoleOps_;
-    void enqueueRoleOp_(WorkerOp op) noexcept;
+    std::vector<std::deque<PendingRoleOp>> pendingRoleOps_;   // indexed by owning worker
+    std::size_t pendingRoleOpsTotal_ = 0;
+    std::size_t pendingWarnAt_       = 64;
+    uint64_t    roleOpsCoalesced_    = 0;
+    uint64_t    fencesMoot_          = 0;
+    uint64_t    staleRoleOpsDropped_ = 0;
+    // M1: a std::logic_error from WorkerPool (the F7 ownership invariant, raised
+    // inside the inline reconcile of tryEnqueueOp) must not cross this
+    // noexcept chain (std::terminate).  It is caught at the bridge boundary and
+    // handed to NodeRuntimeAgent, which routes it to the halt path (exit 70).
+    bool        fatalPending_ = false;
+    std::string fatalWhat_;
+    void enqueueRoleOp_(WorkerOp op, bool fence) noexcept;
     int  flushPendingRoleOps_() noexcept;
+    bool tryRoute_(WorkerOp op) noexcept;
 
 public:
     /// Test-only.
@@ -361,14 +389,35 @@ public:
                                     rune::replication::NodeId leader) noexcept {
         routeBecomeFollower_(r, e, leader);
     }
-    [[nodiscard]] std::size_t pendingRoleOpsForTest() const noexcept { return pendingRoleOps_.size(); }
+    [[nodiscard]] std::size_t pendingRoleOpsForTest() const noexcept { return pendingRoleOpsTotal_; }
+    [[nodiscard]] std::size_t pendingRoleOpsForWorkerForTest(std::size_t w) const noexcept {
+        return w < pendingRoleOps_.size() ? pendingRoleOps_[w].size() : 0;
+    }
+    [[nodiscard]] uint64_t roleOpsCoalescedForTest() const noexcept { return roleOpsCoalesced_; }
+    [[nodiscard]] uint64_t fencesMootForTest() const noexcept { return fencesMoot_; }
     int flushPendingRoleOpsForTest() noexcept { return flushPendingRoleOps_(); }
+    void routeRemovalFenceForTest(rune::replication::PartitionReplica* r, rune::replication::Epoch e) noexcept {
+        routeBecomeFollower_(r, e, rune::metadata::NO_LEADER, /*fence=*/true);
+    }
+    void applyDeleteForTest(int32_t topicId, int32_t partition) noexcept {
+        applyDeleteForKey(rune::metadata::PartitionKey{topicId, partition}, prevMap_);
+    }
+
+    /// M1: an invariant violation caught at the bridge boundary (once).
+    /// NodeRuntimeAgent takes it after doWork and halts (exit 70).
+    [[nodiscard]] bool takeFatal(std::string& what) noexcept {
+        if (!fatalPending_) return false;
+        fatalPending_ = false;
+        what = std::move(fatalWhat_);
+        return true;
+    }
 private:
 
     void routeBecomeFollower_(
         rune::replication::PartitionReplica*  replica,
         rune::replication::Epoch              epoch,
-        rune::replication::NodeId             leaderId) noexcept;
+        rune::replication::NodeId             leaderId,
+        bool                                  fence = false) noexcept;
 
     void applyBecomeLeaderForKey(
         const rune::metadata::PartitionKey& key,
@@ -450,7 +499,7 @@ private:
         // Task 10 fix 3: a USER replica is owned by a worker — fence it on the
         // owner's thread (routed role op, FIFO before the SetOwnership that drops
         // it), never by a direct cross-thread call.  Internal: direct (control).
-        routeBecomeFollower_(replica, fenceEpoch, rune::metadata::NO_LEADER);
+        routeBecomeFollower_(replica, fenceEpoch, rune::metadata::NO_LEADER, /*fence=*/true);
 
         // Quarantine: erase from routing.  The replica is RETIRED in the registry
         // and freed only after every worker acked the SetOwnership that drops it.

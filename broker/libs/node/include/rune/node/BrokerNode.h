@@ -197,11 +197,18 @@ public:
         if (!storageFailureSignalled_) {
             auto* r = worker_.replica();
             if (r && r->isDiskBacked() && r->log()->storageFailed()) [[unlikely]] {
+                // M3 (Task 10 round 4): the ring's max message is capacity/8;
+                // an over-long path would make write() THROW on this thread.
+                // Keep the path's TAIL (the most specific part) behind "...".
                 const std::string& dir = r->log()->dir();
-                std::vector<uint8_t> msg(4 + dir.size());
+                const std::size_t maxDir =
+                    static_cast<std::size_t>(failureRing_.maxMsgLength()) - 4u;
+                std::string shown = dir;
+                if (shown.size() > maxDir) shown = "..." + dir.substr(dir.size() - (maxDir - 3u));
+                std::vector<uint8_t> msg(4 + shown.size());
                 const int32_t e = r->log()->storageErrno();
                 std::memcpy(msg.data(), &e, 4);
-                std::memcpy(msg.data() + 4, dir.data(), dir.size());
+                std::memcpy(msg.data() + 4, shown.data(), shown.size());
                 if (failureRing_.write(msg.data(), msg.size(), 1)) storageFailureSignalled_ = true;
             }
         }

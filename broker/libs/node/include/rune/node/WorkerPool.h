@@ -155,7 +155,27 @@ public:
     // two-phase API below (releaseReplicaForTestMigration / grant...).
     // -----------------------------------------------------------------------
     void assignFromRegistry(const ReplicaRegistry& registry) {
+        computeAssignment_(registry);
+        deliverOwnership_();
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 10 round 4 (Important 1): ownership fan-out is keyed on the registry
+    // GENERATION and tracked PER WORKER.
+    //   computeAssignment_  — cold, ONCE per generation: the per-worker owned
+    //                         sets + the F7 invariant + the owner-map bound, all
+    //                         O(replicas) (no owner-map × replicas scan).
+    //   deliverOwnership_   — (re)sends the generation's SetOwnership ONLY to the
+    //                         workers that have not received it yet (a ring-full
+    //                         worker never causes a re-send to the others).
+    // Routed ops never trigger a re-computation: tryEnqueueOp re-computes only
+    // when the generation actually moved, and otherwise at most retries the
+    // single target worker's pending SetOwnership.
+    // -----------------------------------------------------------------------
+    void computeAssignment_(const ReplicaRegistry& registry) {
         const std::size_t n = static_cast<std::size_t>(workerCount());
+        const std::uint64_t gen = registry.generation();
+        ++assignmentsComputed_;
 
         std::vector<Worker::OwnedSet> perWorker(n);
         for (auto* r : registry.allReplicas()) {
@@ -166,49 +186,59 @@ public:
             const int32_t wid = ownerWorkerId(tid, pid);
             perWorker[static_cast<std::size_t>(wid)].push_back(r);
             if (r->incarnation() != 0) {
-                auto [it, inserted] = ownerOfIncarnation_.emplace(r->incarnation(), wid);
-                if (!inserted && it->second != wid && runnersStarted_)
+                auto [it, inserted] = ownerOfIncarnation_.emplace(r->incarnation(), OwnerRec{wid, 0, 0});
+                if (!inserted && it->second.worker != wid && runnersStarted_)
                     throw std::logic_error("WorkerPool: replica topic=" + std::to_string(tid) +
                                            " partition=" + std::to_string(pid) + " would MOVE from worker " +
-                                           std::to_string(it->second) + " to " + std::to_string(wid) +
+                                           std::to_string(it->second.worker) + " to " + std::to_string(wid) +
                                            " at runtime — unsupported (ownership invariant)");
-                it->second = wid;
+                it->second.worker   = wid;
+                it->second.seenAt   = computeSeq_ + 1;
+                it->second.removedAt = 0;
             }
         }
-
-        const std::uint64_t gen = registry.generation();
+        ++computeSeq_;
         // Bound the invariant map: an incarnation no longer registered is
         // erased once every worker acked an ownership gen >= this one (the same
-        // ack that frees the retired replica).
-        for (const auto& [inc, w] : ownerOfIncarnation_) {
-            (void)w;
-            bool live = false;
-            for (auto* r : registry.allReplicas()) live = live || (r && r->incarnation() == inc);
-            if (live) continue;
-            bool queued = false;
-            for (const auto& pe : pendingOwnerErase_) queued = queued || pe.second == inc;
-            if (!queued) pendingOwnerErase_.emplace_back(gen, inc);
-        }
-        bool allDelivered = true;
-        ownershipDelivered_.resize(n, true);
-        ackedGen_.resize(n, 0);
-        for (std::size_t i = 0; i < n; ++i) {
-            if (!runnersStarted_) {
-                workers_[i]->setOwnedDirect(std::move(perWorker[i]));
-                ownershipDelivered_[i] = true;
-                ackedGen_[i] = gen;            // applied synchronously: nothing to wait for
-            } else {
-                WorkerOp op;
-                op.type         = WorkerOp::Type::SetOwnership;
-                op.ownedSet     = std::move(perWorker[i]);
-                op.ownershipGen = gen;
-                ownershipDelivered_[i] = workers_[i]->tryEnqueueOp(std::move(op));
-                if (!ownershipDelivered_[i]) allDelivered = false;  // full ring — retry next reconcile
-            }
+        // ack that frees the retired replica).  One pass over the map.
+        for (auto& [inc, rec] : ownerOfIncarnation_) {
+            if (rec.seenAt == computeSeq_ || rec.removedAt != 0) continue;
+            rec.removedAt = gen == 0 ? 1 : gen;
+            pendingOwnerErase_.emplace_back(gen, inc);
         }
 
-        lastGeneration_ = allDelivered ? gen : static_cast<std::uint64_t>(-1);
+        pendingSets_ = std::move(perWorker);
+        computedGen_ = gen;
+        deliveredGen_.resize(n, kNoGen);
+        ackedGen_.resize(n, 0);
+        setOwnershipSent_.resize(n, 0);
+        for (std::size_t i = 0; i < n; ++i) deliveredGen_[i] = kNoGen;   // this generation: nobody yet
+    }
+
+    /// Deliver the computed generation to every worker that has not received it.
+    /// Returns true when all workers have it.
+    bool deliverOwnership_() {
+        bool all = true;
+        for (std::size_t i = 0; i < workers_.size(); ++i) all = deliverTo_(i) && all;
         pruneOwnerMap_();
+        return all;
+    }
+    bool deliverTo_(std::size_t i) {
+        if (deliveredGen_[i] == computedGen_) return true;
+        if (!runnersStarted_) {
+            workers_[i]->setOwnedDirect(pendingSets_[i]);
+            deliveredGen_[i] = computedGen_;
+            ackedGen_[i]     = computedGen_;   // applied synchronously: nothing to wait for
+            return true;
+        }
+        WorkerOp op;
+        op.type         = WorkerOp::Type::SetOwnership;
+        op.ownedSet     = pendingSets_[i];      // copy: a refused enqueue keeps the set for the retry
+        op.ownershipGen = computedGen_;
+        if (!workers_[i]->tryEnqueueOp(std::move(op))) return false;   // full ring — retried later
+        deliveredGen_[i] = computedGen_;
+        ++setOwnershipSent_[i];
+        return true;
     }
 
     void pruneOwnerMap_() {
@@ -247,7 +277,16 @@ public:
     void setRunnersStartedForTest(bool on) noexcept { runnersStarted_ = on; }
     /// Test-only: record that `incarnation` was owned by `workerId` (to exercise
     /// the F7 runtime-move refusal, which no production router can trigger).
-    void seedOwnerForTest(uint32_t incarnation, int32_t workerId) { ownerOfIncarnation_[incarnation] = workerId; }
+    void seedOwnerForTest(uint32_t incarnation, int32_t workerId) { ownerOfIncarnation_[incarnation] = OwnerRec{workerId, 0, 0}; }
+    /// Important 1 observability: full re-computations of the owned sets, and
+    /// SetOwnership ops delivered to worker `w`.
+    [[nodiscard]] uint64_t assignmentsComputedForTest() const noexcept { return assignmentsComputed_; }
+    [[nodiscard]] uint64_t setOwnershipSentForTest(int32_t w) const noexcept {
+        return static_cast<std::size_t>(w) < setOwnershipSent_.size() ? setOwnershipSent_[static_cast<std::size_t>(w)] : 0;
+    }
+    /// Ops routed for a (topic, partition) no longer in the registry: stamped
+    /// stale (ReplicaRegistry::kStaleIncarnation) and refused by the worker.
+    [[nodiscard]] uint64_t staleOpsRoutedForTest() const noexcept { return staleOpsRouted_; }
     [[nodiscard]] std::size_t ownerMapSizeForTest() const noexcept { return ownerOfIncarnation_.size(); }
 
     // ---- Test-only two-phase migration (the ONLY sanctioned move) -----------
@@ -264,6 +303,7 @@ public:
         demote.type = WorkerOp::Type::BecomeFollower;
         demote.topicId = r->topicId(); demote.partition = static_cast<int32_t>(r->partitionId());
         demote.replica = r; demote.roleEpoch = epoch; demote.roleLeaderId = newLeader;
+        demote.targetReplicaId = r->registryId(); demote.incarnation = r->incarnation();
         WorkerOp own;
         own.type = WorkerOp::Type::SetOwnership;
         own.ownedSet = std::move(remaining);
@@ -280,6 +320,7 @@ public:
         lead.type = WorkerOp::Type::BecomeLeader;
         lead.topicId = r->topicId(); lead.partition = static_cast<int32_t>(r->partitionId());
         lead.replica = r; lead.roleEpoch = epoch; lead.isr = std::move(isr);
+        lead.targetReplicaId = r->registryId(); lead.incarnation = r->incarnation();
         return to.tryEnqueueOp(std::move(own)) && to.tryEnqueueOp(std::move(lead));
     }
 
@@ -302,15 +343,54 @@ public:
     [[nodiscard]] bool tryEnqueueOp(int32_t topicId, int32_t partition,
                                     WorkerOp op) {
         // Task 10 fix 3 (I2): never route an op ahead of the SetOwnership that
-        // governs it.  Reconcile inline when the registry moved (control thread:
-        // every caller of this method runs there), and back-pressure (false —
-        // callers retry) while the target worker's latest SetOwnership is still
-        // undelivered (its ring was full during reconcile).
-        if (registry_ && registry_->generation() != lastGeneration_) assignFromRegistry(*registry_);
+        // governs it.  Round 4 (Important 1): re-compute ONLY when the registry
+        // generation moved (once per generation, cold); otherwise retry at most
+        // the target worker's own pending SetOwnership.  Back-pressure (false —
+        // callers retry) while it is still undelivered (its ring is full).
+        if (registry_ && registry_->generation() != computedGen_) reconcile(*registry_);
         const int32_t wid = ownerWorkerId(topicId, partition);
         const auto w = static_cast<std::size_t>(wid);
-        if (w < ownershipDelivered_.size() && !ownershipDelivered_[w]) [[unlikely]] return false;
+        if (w < deliveredGen_.size() && deliveredGen_[w] != computedGen_ && !deliverTo_(w)) [[unlikely]]
+            return false;
+        // Task 10 round 4 (Critical 1): the target identity comes from the
+        // registry at ROUTING time — never from a pointer a caller held across
+        // cycles.  A (topic, partition) no longer registered is stamped stale:
+        // the worker refuses it through the op's normal response path, and
+        // nothing it carries is ever dereferenced.
+        if (registry_ && isPartitionOp_(op.type)) {
+            if (const auto h = registry_->lookupHandle(topicId, partition)) {
+                op.replica         = h.replica;
+                op.targetReplicaId = h.id;
+                op.incarnation     = h.incarnation;
+            } else {
+                op.replica         = nullptr;
+                op.targetReplicaId = 0;
+                op.incarnation     = ReplicaRegistry::kStaleIncarnation;
+                ++staleOpsRouted_;
+            }
+        }
         return workers_[w]->tryEnqueueOp(std::move(op));
+    }
+
+    /// Ops that target one partition replica (ownership-gated on the worker).
+    static constexpr bool isPartitionOp_(WorkerOp::Type t) noexcept {
+        switch (t) {
+        case WorkerOp::Type::Produce:
+        case WorkerOp::Type::PushRead:
+        case WorkerOp::Type::ApplyReplicated:
+        case WorkerOp::Type::BecomeLeader:
+        case WorkerOp::Type::BecomeFollower:
+        case WorkerOp::Type::FetchRequest:
+        case WorkerOp::Type::OffsetsForLeaderEpochReq:
+        case WorkerOp::Type::ReconcileFetchResp:
+        case WorkerOp::Type::OffsetsForLeaderEpochResp:
+        case WorkerOp::Type::ReconcileFetchReq:
+        case WorkerOp::Type::AppendControlRecord:
+        case WorkerOp::Type::Subscribe:
+            return true;
+        default:
+            return false;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -338,10 +418,12 @@ public:
     // pool (workers self-drive on their own threads).  reconcile() remains on the
     // control thread to publish updated owned-sets when the registry changes.
     void reconcile(const ReplicaRegistry& registry) {
-        const std::uint64_t g = registry.generation();
-        if (g != lastGeneration_) {
-            assignFromRegistry(registry);   // updates lastGeneration_
-        }
+        if (registry.generation() != computedGen_) computeAssignment_(registry);
+        // Retry only the workers that have not received this generation yet
+        // (O(workers) compare in steady state; nothing is re-sent otherwise).
+        bool pending = false;
+        for (auto g : deliveredGen_) pending = pending || g != computedGen_;
+        if (pending) deliverOwnership_();
     }
 
     // -----------------------------------------------------------------------
@@ -390,7 +472,10 @@ public:
         }
         // From now on, ownership changes must go via SetOwnership ring ops
         // (workers are live on their own threads — no direct owned_ writes).
-        runnersStarted_ = true;
+        // P2: BrokerNode arms ring ownership BEFORE the control thread starts
+        // (armRingOwnership), so in production this is a no-op read; only
+        // control-thread-less tests (no concurrent reader) take the write.
+        if (!runnersStarted_) runnersStarted_ = true;
     }
 
     // Shard mode (spec §3.1): one runner per ShardAgent.  Busy-spin ONLY when the
@@ -412,8 +497,26 @@ public:
             runners_.emplace_back(std::make_unique<rune::consensus::AgentRunner>(*a, *idles_.back(), clock));
             runners_.back()->start();
         }
-        runnersStarted_ = true;
+        if (!runnersStarted_) runnersStarted_ = true;   // see startRunners (P2)
     }
+
+    // -----------------------------------------------------------------------
+    // P2 (Task 10 round 4): runnersStarted_ is CONTROL-THREAD state (read by
+    // every reconcile / routed op).  It is only ever written while no control
+    // thread runs:
+    //   armRingOwnership()       — BrokerNode::start, BEFORE agentRunner_->start()
+    //                              (single-threaded startup).  From then on every
+    //                              ownership change goes over the rings; ops queued
+    //                              before a worker's runner starts are applied
+    //                              in FIFO order when it does.
+    //   disarmAfterControlJoined() — BrokerNode::stop, AFTER agentRunner_->
+    //                              stopAndJoin() (the control thread is joined).
+    // stopAndJoinRunners() no longer touches it (it ran while the control
+    // thread was still live: a cross-thread plain write — a data race).
+    // -----------------------------------------------------------------------
+    void armRingOwnership() noexcept { runnersStarted_ = true; }
+    void disarmAfterControlJoined() noexcept { runnersStarted_ = false; }
+    [[nodiscard]] bool ringOwnershipArmedForTest() const noexcept { return runnersStarted_; }
 
     // Stop and join every worker AgentRunner.  Called in BrokerNode::stop()
     // BEFORE runtimeAgent_ and replicaRegistry_ are torn down (workers hold
@@ -426,17 +529,30 @@ public:
         }
         runners_.clear();
         idles_.clear();
-        runnersStarted_ = false;  // workers quiesced — direct owned_ writes safe again
+        // P2: runnersStarted_ is NOT written here — the control thread may still
+        // be running (BrokerNode stops workers first).  disarmAfterControlJoined()
+        // resets it once the control thread is joined.
     }
 
 private:
     rune::metadata::ShardRouter          router_;
     std::vector<std::unique_ptr<Worker>> workers_;
-    std::uint64_t                        lastGeneration_ = static_cast<std::uint64_t>(-1); // sentinel: not yet assigned
+    static constexpr std::uint64_t       kNoGen = static_cast<std::uint64_t>(-1);
+    std::uint64_t                        computedGen_ = kNoGen;   // generation the pending sets reflect
     const ReplicaRegistry*               registry_ = nullptr;
-    std::vector<bool>                    ownershipDelivered_;   // per worker: latest SetOwnership enqueued
-    std::vector<std::uint64_t>           ackedGen_;             // per worker: latest OwnershipAck
-    std::unordered_map<uint32_t, int32_t> ownerOfIncarnation_;  // F7 invariant (cold, bounded: live replicas)
+    std::vector<Worker::OwnedSet>        pendingSets_;            // per worker: the computed generation's set
+    std::vector<std::uint64_t>           deliveredGen_;           // per worker: generation last ENQUEUED
+    std::vector<std::uint64_t>           ackedGen_;               // per worker: latest OwnershipAck
+    std::vector<uint64_t>                setOwnershipSent_;       // per worker: SetOwnership ops delivered
+    uint64_t                             assignmentsComputed_ = 0;
+    uint64_t                             staleOpsRouted_      = 0;
+    uint64_t                             computeSeq_          = 0;
+    struct OwnerRec {
+        int32_t  worker    = -1;
+        uint64_t seenAt    = 0;   // computeSeq_ of the last computation that saw it live
+        uint64_t removedAt = 0;   // registry gen it was found removed (0 = live)
+    };
+    std::unordered_map<uint32_t, OwnerRec> ownerOfIncarnation_;  // F7 invariant (cold, bounded: live replicas)
     std::vector<std::pair<std::uint64_t, uint32_t>> pendingOwnerErase_;   // (removal gen, incarnation)
 
     // Shared-nothing: true once per-worker AgentRunners are started. Before this,

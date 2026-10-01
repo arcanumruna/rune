@@ -155,6 +155,13 @@ void BrokerNode::start() {
         attachShardRuntimes_();
     }
 
+    // P2 (Task 10 round 4): switch the pool to ring-delivered ownership BEFORE
+    //    the control thread exists — runnersStarted_ is control-thread state and
+    //    is never written while the control thread runs.  SetOwnership ops the
+    //    control thread enqueues before a worker runner starts are applied, in
+    //    FIFO order, on that worker's first pass.
+    if (workerPool_) workerPool_->armRingOwnership();
+
     // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
     //    consensus + gateway on the single-writer thread).
     agentRunner_->start();
@@ -575,6 +582,13 @@ void BrokerNode::buildReplication() {
     // is available.  This avoids the PartitionReplica assert(transport != nullptr).
     // -----------------------------------------------------------------------
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
+    // Task 10 round 4 (Critical 1): the legacy replication transport resolves
+    // every inbound frame through the registry at USE time and holds no replica
+    // pointer (a removed partition can never be reached through it).  User
+    // replicas on per-worker planes stay off it (E5 Task 5), as before.
+    if (replTransport_)
+        replTransport_->setReplicaRegistry(replicaRegistry_.get(),
+                                           /*userPartitions=*/perWorkerReplTransports_.empty());
 
     // E5 Task 5: build a local ShardRouter for per-worker transport selection
     // when per-worker planes are available.  Mirrors buildWorkerPool() exactly
@@ -2492,6 +2506,9 @@ void BrokerNode::stop() {
     if (agentRunner_) {
         agentRunner_->stopAndJoin();
     }
+    // P2: the control thread is joined — only now may the pool's control-thread
+    // state (ring-ownership mode) change.
+    if (workerPool_) workerPool_->disarmAfterControlJoined();
 
     // Task 8a: main duty cycle is now quiesced — safe to drop the admin agent.
     // Clear the gateway's admin sink first (defensive; gateway is torn down below).

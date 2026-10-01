@@ -13,6 +13,7 @@
 // Included here (not in the header) to avoid pulling consensus/spdlog headers
 // into consumers of rune_replication_aeron that don't need them.
 // rune_replication_aeron has RUNE_NODE_INCLUDE set in its CMakeLists.txt.
+#include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
 
@@ -108,7 +109,30 @@ void AeronPartitionTransport::registerReplica(int32_t           topicId,
                                                PartitionId       partitionId,
                                                PartitionReplica* replica)
 {
+    if (registry_) return;   // the registry is the source of truth (use-time resolve)
     replicas_[ReplicaKey{topicId, partitionId}] = replica;
+}
+
+void AeronPartitionTransport::unregisterReplica(int32_t topicId, PartitionId partitionId)
+{
+    replicas_.erase(ReplicaKey{topicId, partitionId});
+}
+
+PartitionReplica* AeronPartitionTransport::resolveReplica_(int32_t topicId,
+                                                           PartitionId partitionId) const noexcept
+{
+    if (registry_) {
+        if (topicId >= 0 && !registryUserPartitions_) return nullptr;   // on per-worker planes
+        return registry_->lookup(topicId, static_cast<int32_t>(partitionId));
+    }
+    auto it = replicas_.find(ReplicaKey{topicId, partitionId});
+    return it == replicas_.end() ? nullptr : it->second;
+}
+
+void AeronPartitionTransport::deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs)
+{
+    nowNs_ = nowNs;
+    (void)handleFrame_(frame, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -423,15 +447,19 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
     aeron::util::index_t             length,
     aeron::Header&                   /*header*/)
 {
-    using Action = aeron::ControlledPollAction;
     ++g_txFragsRecv;
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOnFragment, 0);
+    return handleFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                        static_cast<std::size_t>(length));
+}
+
+aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t* buf, std::size_t len)
+{
+    using Action = aeron::ControlledPollAction;
     // CONTINUE = consume this fragment and keep polling (success / skip malformed).
     // ABORT    = leave this fragment UNCONSUMED and stop the poll — Aeron re-delivers
     //            it next cycle.  Returned ONLY when a target worker ring is full, so
     //            the frame is never dropped: back-pressure propagates to the sender.
-    const auto* buf = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
-    const auto  len = static_cast<std::size_t>(length);
 
     // Minimum frame: 8-byte SBE header.
     if (len < ReplicationMessageHeader::ENCODED_SIZE) {
@@ -459,8 +487,8 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // Route to the replica owning (topicId, partition).
         // DR-BUG-5: composite key prevents collision across topics that share
         // the same partition index.
-        auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
-        if (it == replicas_.end() || it->second == nullptr) {
+        PartitionReplica* const rep = resolveReplica_(req.topicId, req.partition);
+        if (rep == nullptr) {
             spdlog::trace("AeronPartitionTransport: FetchRequest for unknown (topicId={}, partition={})",
                           req.topicId, req.partition);
             return Action::CONTINUE;
@@ -514,7 +542,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
             op.type                              = rune::node::WorkerOp::Type::FetchRequest;
             op.topicId                           = req.topicId;
             op.partition                         = req.partition;
-            op.replica                           = it->second;
+            op.replica                           = rep;
             op.logPtr                            = nullptr;
             op.fetchRequestPayload.leaderEpoch   = req.leaderEpoch;
             op.fetchRequestPayload.partition     = req.partition;
@@ -534,7 +562,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
             // the gap is the EXACT control→worker handoff latency on this node.
             RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, g_inRecvSeq++);
         } else {
-            it->second->onFetchRequest(req, nowNs_);
+            rep->onFetchRequest(req, nowNs_);
         }
 
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {
@@ -555,8 +583,8 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
 
         // Route to the replica owning (topicId, partition).
         // DR-BUG-5: composite key prevents collision across topics.
-        auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
-        if (it == replicas_.end() || it->second == nullptr) {
+        PartitionReplica* const rep = resolveReplica_(resp.topicId, resp.partition);
+        if (rep == nullptr) {
             spdlog::trace("AeronPartitionTransport: FetchResponse for unknown (topicId={}, partition={})",
                           resp.topicId, resp.partition);
             return Action::CONTINUE;
@@ -580,7 +608,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
             op.type                              = rune::node::WorkerOp::Type::ApplyReplicated;
             op.topicId                           = resp.topicId;
             op.partition                         = resp.partition;
-            op.replica                           = it->second;
+            op.replica                           = rep;
             op.logPtr                            = nullptr; // not needed for ApplyReplicated
             op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
             op.replicatedPayload.partition       = resp.partition;
@@ -605,22 +633,22 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
             RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, g_inRecvSeq++);
         } else {
             // INLINE path (no WorkerPool): call applyReplicated synchronously.
-            it->second->applyReplicated(resp);
+            rep->applyReplicated(resp);
         }
 
     } else if (tid == OffsetsForLeaderEpochReqMsg::TEMPLATE_ID) {
         // DR-BUG-6: KIP-101 epoch-boundary query → leader answers.
         if (len < OffsetsForLeaderEpochReqMsg::TOTAL_SIZE) return Action::CONTINUE;
         auto req = OffsetsForLeaderEpochReqMsg::decode(buf, 0);
-        auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
-        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
+        PartitionReplica* const rep = resolveReplica_(req.topicId, req.partition);
+        if (rep == nullptr) return Action::CONTINUE;
         // E5.1.2c: route to owning worker (touches leaderState_/isrManager_).
         if (workerPool_ && req.topicId >= 0) {
             rune::node::WorkerOp op;
             op.type                              = rune::node::WorkerOp::Type::OffsetsForLeaderEpochReq;
             op.topicId                           = req.topicId;
             op.partition                         = req.partition;
-            op.replica                           = it->second;
+            op.replica                           = rep;
             op.logPtr                            = nullptr;
             op.offsEpochReqPayload.currentEpoch   = req.currentEpoch;
             op.offsEpochReqPayload.partition      = req.partition;
@@ -633,16 +661,33 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
                 return Action::ABORT;
             }
         } else {
-            it->second->onOffsetsForLeaderEpochRequest(req);
+            rep->onOffsetsForLeaderEpochRequest(req);
         }
 
     } else if (tid == OffsetsForLeaderEpochRespMsg::TEMPLATE_ID) {
         // DR-BUG-6: KIP-101 epoch-boundary answer → follower truncates.
         if (len < OffsetsForLeaderEpochRespMsg::TOTAL_SIZE) return Action::CONTINUE;
         auto resp = OffsetsForLeaderEpochRespMsg::decode(buf, 0);
-        auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
-        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
-        it->second->applyOffsetsForLeaderEpochResponse(resp);
+        PartitionReplica* const rep = resolveReplica_(resp.topicId, resp.partition);
+        if (rep == nullptr) return Action::CONTINUE;
+        // Task 10 round 4: a USER replica's follower state / log is owned by
+        // its worker — apply there (was inline on the control thread: a race).
+        if (workerPool_ && resp.topicId >= 0) {
+            rune::node::WorkerOp op;
+            op.type                  = rune::node::WorkerOp::Type::OffsetsForLeaderEpochResp;
+            op.topicId               = resp.topicId;
+            op.partition             = resp.partition;
+            op.offsEpochReqPayload.currentEpoch   = resp.leaderEpoch;
+            op.offsEpochReqPayload.requestedEpoch = resp.responseEpoch;
+            op.offsEpochReqPayload.followerLeo    = resp.endOffset;
+            op.offsEpochReqPayload.partition      = resp.partition;
+            op.offsEpochReqPayload.topicId        = resp.topicId;
+            op.replicatedPayload.errorCode        = resp.errorCode;
+            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition, std::move(op)))
+                return Action::ABORT;   // worker ring full → re-delivered next cycle
+        } else {
+            rep->applyOffsetsForLeaderEpochResponse(resp);
+        }
 
     } else if (tid == kReconcileFetchReqTemplateId) {
         // DR-BUG-6: reverse pull request (deficient leader → survivor).  Reuses
@@ -650,8 +695,8 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // deliverable ceiling (same rationale as the normal FetchRequest path).
         if (len < FetchRequestMsg::TOTAL_SIZE) return Action::CONTINUE;
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
-        auto it = replicas_.find(ReplicaKey{req.topicId, req.partition});
-        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
+        PartitionReplica* const rep = resolveReplica_(req.topicId, req.partition);
+        if (rep == nullptr) return Action::CONTINUE;
         // Cap to the outbound-ring bound UNCONDITIONALLY (same two-hop framing
         // rationale as the normal FetchRequest path), tightened by the pub bound when
         // resolved, minus the outbound header — so the reconcile response never
@@ -669,7 +714,24 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         }
         if (ceiling < 0) ceiling = 0;
         if (req.maxBytes > ceiling) req.maxBytes = ceiling;
-        it->second->onReconcileRequest(req);
+        // Task 10 round 4: serve a USER replica's reconcile pull on its owning
+        // worker (reads the worker-owned log; was inline on the control thread).
+        if (workerPool_ && req.topicId >= 0) {
+            rune::node::WorkerOp op;
+            op.type                            = rune::node::WorkerOp::Type::ReconcileFetchReq;
+            op.topicId                         = req.topicId;
+            op.partition                       = req.partition;
+            op.fetchRequestPayload.leaderEpoch = req.leaderEpoch;
+            op.fetchRequestPayload.partition   = req.partition;
+            op.fetchRequestPayload.followerId  = req.followerId;
+            op.fetchRequestPayload.fetchOffset = req.fetchOffset;
+            op.fetchRequestPayload.maxBytes    = req.maxBytes;
+            op.fetchRequestPayload.topicId     = req.topicId;
+            if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op)))
+                return Action::ABORT;
+        } else {
+            rep->onReconcileRequest(req);
+        }
 
     } else if (tid == kReconcileFetchRespTemplateId) {
         // DR-BUG-6: reverse pull response (survivor → deficient leader).  Reuses
@@ -677,8 +739,8 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         const std::size_t kMinResp = FetchResponseMsg::encodedSize(0);
         if (len < kMinResp) return Action::CONTINUE;
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
-        auto it = replicas_.find(ReplicaKey{resp.topicId, resp.partition});
-        if (it == replicas_.end() || it->second == nullptr) return Action::CONTINUE;
+        PartitionReplica* const rep = resolveReplica_(resp.topicId, resp.partition);
+        if (rep == nullptr) return Action::CONTINUE;
         // E5.1.2c: route to owning worker (applyReconcileResponse touches
         // leaderState_.setLeaderLogEndOffset + recomputeHw).
         // Copy records bytes before returning from the Aeron callback (buffer lifetime).
@@ -687,7 +749,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
             op.type                              = rune::node::WorkerOp::Type::ReconcileFetchResp;
             op.topicId                           = resp.topicId;
             op.partition                         = resp.partition;
-            op.replica                           = it->second;
+            op.replica                           = rep;
             op.logPtr                            = nullptr;
             op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
             op.replicatedPayload.partition       = resp.partition;
@@ -705,7 +767,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
                 return Action::ABORT;
             }
         } else {
-            it->second->applyReconcileResponse(resp);
+            rep->applyReconcileResponse(resp);
         }
 
     } else {

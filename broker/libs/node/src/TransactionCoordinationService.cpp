@@ -175,6 +175,22 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
             int64_t markerOffset = -1;
             int32_t topicId      = -1;
 
+            // Extract producerId from the batch (LE64@kProducerIdOffset=43) and
+            // the commit/abort flag from the snapshot BEFORE the append: an
+            // asynchronous (worker-routed) append needs them to feed the LSO
+            // bookkeeping with the offset the marker actually lands at.
+            int64_t pid = -1;
+            if (batch.size() >= 43u + 8u) {
+                pid = 0;
+                for (int bi = 0; bi < 8; ++bi)
+                    pid |= (static_cast<int64_t>(batch[43u + bi]) << (bi * 8));
+            }
+            bool commit = false;
+            if (pid >= 0) {
+                auto it = pendingByPidScratch_.find(pid);
+                if (it != pendingByPidScratch_.end()) commit = it->second.commit;
+            }
+
             if (haveGateway) {
                 // Production path: resolve topic name → id, append via gateway.
                 const auto topicIdOpt = topics_->topicIdForName(tp.topic);
@@ -186,7 +202,11 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
                 topicId = *topicIdOpt;
                 markerOffset = gateway_->appendControlRecord(
                     topicId, tp.partition,
-                    std::span<const uint8_t>(batch.data(), batch.size()));
+                    std::span<const uint8_t>(batch.data(), batch.size()), pid, commit);
+                // Task 10 round 4 (P1): routed to the owning worker — the gateway
+                // feeds notifyControlMarker itself with the AUTHORITATIVE offset
+                // when the worker reports the append (never pre-computed).
+                if (markerOffset == rune::gateway::ClientGateway::kControlRecordAsync) return;
                 if (markerOffset < 0) {
                     spdlog::warn("TCS::doWork resolvePendingMarkers: appendControlRecord failed "
                                  "topicId={} partition={}", topicId, tp.partition);
@@ -198,20 +218,6 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
                     std::span<const uint8_t>(batch.data(), batch.size()));
                 if (markerOffset < 0) return;
                 // topicId remains -1; notifyControlMarker skipped (test path).
-            }
-
-            // Extract producerId from the batch (LE64@kProducerIdOffset=43).
-            int64_t pid = -1;
-            if (batch.size() >= 43u + 8u) {
-                for (int bi = 0; bi < 8; ++bi)
-                    pid |= (static_cast<int64_t>(batch[43u + bi]) << (bi * 8));
-            }
-
-            // Determine commit/abort from the snapshot.
-            bool commit = false;
-            if (pid >= 0) {
-                auto it = pendingByPidScratch_.find(pid);
-                if (it != pendingByPidScratch_.end()) commit = it->second.commit;
             }
 
             toNotifyScratch_.push_back({topicId, tp.partition, pid, markerOffset, commit});
@@ -606,8 +612,10 @@ size_t TransactionCoordinationService::handleEndTxn(
 
             const int64_t markerOffset = gateway_->appendControlRecord(
                 topicId, tp.partition,
-                std::span<const uint8_t>(batch.data(), batch.size()));
-            if (markerOffset < 0) return;
+                std::span<const uint8_t>(batch.data(), batch.size()), msg.producerId, commit);
+            // P1: asynchronous (worker) append — the gateway notifies with the
+            // authoritative offset when the worker reports it.
+            if (markerOffset < 0) return;   // incl. kControlRecordAsync
 
             toNotifyScratch_.push_back({topicId, tp.partition, msg.producerId,
                                         markerOffset, commit});

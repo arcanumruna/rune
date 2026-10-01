@@ -393,7 +393,11 @@ int ClientGateway::doWork(int64_t nowNs) {
 
     // G0.3: fragment limit is configurable (default 256, was hard-coded 10).
     // Sourced from NodeConfig::gatewayFragmentLimit via setFragmentLimit().
-    int work = sub_->poll(assembler_.handler(), fragmentLimit_);
+    // Task 10 round 4: retry worker-bound ops a full ring refused earlier
+    // (control markers, subscription lifecycle) BEFORE new ingress, in order.
+    int work = 0;
+    if (workerPool_) work += pumpMarkerQueue_() + pumpSubOps_();
+    work += sub_->poll(assembler_.handler(), fragmentLimit_);
     pollPendingConnects(nowNs);
     pollPendingRecordEgress_(nowNs);  // hybrid egress: resolve unicast pubs + drain deferred subscribes
     reapExpired(nowNs);
@@ -1689,6 +1693,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             }
         }
 
+        // P1 (Task 10 round 4): a control marker for this partition is still
+        // waiting for worker-ring space — no later batch may overtake it.
+        if (!markerSendQueue_.empty() && markerQueuedFor_(msg.topicId, partition)) [[unlikely]] {
+            sendResp(pc::ErrorCode::NotLeader, partition, 0);
+            return;
+        }
+
         // Build the op envelope.
         rune::node::WorkerOp op;
         op.type         = rune::node::WorkerOp::Type::Produce;
@@ -1727,14 +1738,19 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // offset (CRC-safe: base-offset field [0..7] precedes the CRC region).
         op.recordBatchView = msg.recordBatch;
 
-        // Enqueue to the worker.  tryEnqueueOp returns false if the ring is full
-        // (back-pressure). In the cooperative single-thread model, the ring drains
-        // on every duty cycle, so this should rarely be full. If it is full, we
-        // send an Internal error (the same outcome as if the append had failed).
+        // Enqueue to the worker.  tryEnqueueOp returns false on back-pressure
+        // (ring full, or the worker's SetOwnership still undelivered).  M5 (Task
+        // 10 round 4): answer the RETRIABLE NotLeader — the client re-sends the
+        // same batch (same producer sequence) — never Internal: nothing was
+        // appended, so a retry is always safe.  (The client frame aliases the
+        // Aeron fragment, so the gateway cannot hold it for its own retry.)
         if (!workerPool_->tryEnqueueOp(msg.topicId, partition, std::move(op))) {
-            spdlog::warn("ClientGateway: worker ring full for topicId={} partition={}; "
-                         "ProduceResponse Internal (back-pressure)", msg.topicId, partition);
-            sendResp(pc::ErrorCode::Internal, partition, 0);
+            ++produceBackPressured_;
+            if (produceBackPressured_ == 1 || (produceBackPressured_ & 1023u) == 0)
+                spdlog::warn("ClientGateway: worker back-pressure for topicId={} partition={}; "
+                             "ProduceResponse NotLeader (retriable; total={})",
+                             msg.topicId, partition, produceBackPressured_);
+            sendResp(pc::ErrorCode::NotLeader, partition, 0);
         }
         // Response (or pending-ack) will be processed in drainWorkerReturns_().
         return;
@@ -1862,7 +1878,9 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         entry.baseOffset    = outcome.baseOffset;
         entry.lastOffset    = outcome.lastOffset;
         entry.enqueuedAtNs  = nowNs_;
-        entry.replica       = replica;
+        entry.topicId       = msg.topicId;
+        entry.incarnation   = replicaRegistry_
+            ? replicaRegistry_->lookupHandle(msg.topicId, partition).incarnation : 0u;
 
         pendingAcks_.push_back(entry);  // no heap alloc (capacity pre-reserved)
 
@@ -1953,11 +1971,74 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
 
-    if (!workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op))) {
-        spdlog::warn("ClientGateway: worker ring full routing Subscribe subId={} "
-                     "topic={} partition={} — client may need to re-subscribe",
-                     s.subId, s.topicId, s.partition);
+    // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
+    // op for the same worker) is queued and retried every doWork, in order.
+    const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(s.topicId, s.partition));
+    const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
+    if (behind || !workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op))) {
+        PendingSubOp p;
+        p.sub = s;
+        p.mdc = egressPub == nullptr;
+        queueSubOp_(std::move(p));
     }
+}
+
+void ClientGateway::queueSubOp_(PendingSubOp p)
+{
+    const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition));
+    if (pendingSubOps_.size() <= w) pendingSubOps_.resize(static_cast<std::size_t>(workerPool_->workerCount()));
+    pendingSubOps_[w].push_back(std::move(p));
+    const std::size_t n = pendingSubOpsForTest();
+    if (n == 1 || (n & (n - 1)) == 0)   // rate limit: first + each power of two
+        spdlog::warn("ClientGateway: {} subscription op(s) waiting for worker ring space — retried every cycle", n);
+}
+
+bool ClientGateway::trySubOp_(const PendingSubOp& p)
+{
+    rune::node::WorkerOp op;
+    if (p.unsubscribe) {
+        op.type           = rune::node::WorkerOp::Type::Unsubscribe;
+        op.subscriptionId = p.sub.subId;
+        op.topicId        = p.sub.topicId;
+        op.partition      = p.sub.partition;
+        return workerPool_->tryEnqueueOp(p.sub.topicId, p.sub.partition, std::move(op));
+    }
+    // Re-resolve the egress publication NOW (never a pointer held across cycles).
+    void* egressPub = nullptr;
+    if (!p.mdc) {
+        rune::gateway::Session* sess = sessions_.find(p.sub.sessionId);
+        if (!sess) return true;   // session gone: the Subscribe is moot (dropped)
+        const int32_t wid = workerPool_->ownerWorkerId(p.sub.topicId, p.sub.partition);
+        auto it = sess->recordEgressByWorker.find(wid);
+        if (it == sess->recordEgressByWorker.end() || !it->second) return true;   // moot
+        egressPub = it->second.get();
+    }
+    const auto& s = p.sub;
+    op.type                 = rune::node::WorkerOp::Type::Subscribe;
+    op.subscriptionId       = s.subId;
+    op.sessionId            = s.sessionId;
+    op.topicId              = s.topicId;
+    op.partition            = s.partition;
+    op.nextOffset           = s.nextOffset;
+    op.isolation            = s.isolation;
+    op.isGroup              = s.isGroup;
+    op.groupCarrierReceived = s.groupCarrierReceived;
+    op.logPtr               = topicRegistry_ ? topicRegistry_->log(s.topicId, s.partition) : nullptr;
+    op.egressPub            = egressPub;
+    return workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
+}
+
+int ClientGateway::pumpSubOps_()
+{
+    int done = 0;
+    for (auto& q : pendingSubOps_) {
+        while (!q.empty()) {
+            if (!trySubOp_(q.front())) break;   // this worker's ring still full; others proceed
+            q.pop_front();
+            ++done;
+        }
+    }
+    return done;
 }
 
 void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
@@ -2060,12 +2141,16 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
 
 void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)
 {
-    rune::node::WorkerOp op;
-    op.type           = rune::node::WorkerOp::Type::Unsubscribe;
-    op.subscriptionId = subId;
-    op.topicId        = topicId;
-    op.partition      = partition;
-    (void)workerPool_->tryEnqueueOp(topicId, partition, std::move(op));
+    // M5: never dropped on a full ring — queued (behind any queued Subscribe of
+    // the same worker, so the pair keeps its order) and retried every doWork.
+    PendingSubOp p;
+    p.unsubscribe   = true;
+    p.sub.subId     = subId;
+    p.sub.topicId   = topicId;
+    p.sub.partition = partition;
+    const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(topicId, partition));
+    const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
+    if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
 }
 
 void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
@@ -2871,32 +2956,111 @@ void ClientGateway::pushSubscriptions()
 //
 // Single-writer: duty-cycle thread only.
 // ---------------------------------------------------------------------------
-void ClientGateway::onControlRecordRefused_(int32_t topicId, int32_t partition,
-                                            const std::vector<uint8_t>& marker, int16_t err)
+bool ClientGateway::trySendMarker_(int64_t token)
 {
-    ++controlRecordsRefused_;
-    if (replicaRegistry_ && replicaRegistry_->lookup(topicId, partition)) [[unlikely]] {
-        // INVARIANT: with ownership fanned out before routing and the
-        // (id, incarnation) guard, a marker can only be refused for a partition
-        // no longer on this node.  The coordinator was already told the marker's
-        // pre-computed offset — re-routing would land it at a DIFFERENT offset
-        // (a silent LSO / abort-index corruption).  Never do that: halt.
-        const std::string what = "control marker refused while topic=" + std::to_string(topicId) +
-                                 " partition=" + std::to_string(partition) +
-                                 " is still registered on this node (would re-land at a new offset)";
-        spdlog::critical("ClientGateway: INVARIANT VIOLATION — {}", what);
-        if (invariantViolationHandler_) invariantViolationHandler_(what);
+    auto it = markersInFlight_.find(token);
+    if (it == markersInFlight_.end()) return true;   // already resolved
+    if (!workerPool_) return false;
+    const MarkerInFlight& m = it->second;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::AppendControlRecord;
+    op.topicId       = m.topicId;
+    op.partition     = m.partition;
+    op.correlationId = token;
+    op.producerId    = m.producerId;
+    op.logPtr        = topicRegistry_ ? topicRegistry_->log(m.topicId, m.partition) : nullptr;
+    op.recordBatchView = std::span<const uint8_t>(m.bytes);   // copied once into the ring slot
+    // Replica identity is stamped by WorkerPool::tryEnqueueOp from the registry.
+    return workerPool_->tryEnqueueOp(m.topicId, m.partition, std::move(op));
+}
+
+int ClientGateway::pumpMarkerQueue_()
+{
+    int sent = 0;
+    while (!markerSendQueue_.empty()) {
+        if (!trySendMarker_(markerSendQueue_.front())) break;   // still back-pressured
+        markerSendQueue_.pop_front();
+        ++sent;
+    }
+    return sent;
+}
+
+bool ClientGateway::markerQueuedFor_(int32_t topicId, int32_t partition) const noexcept
+{
+    for (const int64_t t : markerSendQueue_) {
+        auto it = markersInFlight_.find(t);
+        if (it != markersInFlight_.end() && it->second.topicId == topicId && it->second.partition == partition)
+            return true;
+    }
+    return false;
+}
+
+void ClientGateway::onControlRecordAppended_(const rune::node::WorkerReturn& ret)
+{
+    auto it = markersInFlight_.find(ret.correlationId);
+    if (it == markersInFlight_.end()) {
+        spdlog::warn("ClientGateway: ControlRecordAppended for unknown marker token={} topic={} partition={}",
+                     ret.correlationId, ret.topicId, ret.partition);
         return;
     }
-    int64_t pid = -1;
-    if (marker.size() >= 43u + 8u) {
-        pid = 0;
-        for (int i = 0; i < 8; ++i) pid |= static_cast<int64_t>(marker[43u + i]) << (i * 8);
+    const MarkerInFlight m = std::move(it->second);
+    markersInFlight_.erase(it);
+    if (ret.errorCode != 0) {
+        spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} FAILED "
+                      "to append (error={}) — surfaced to the txn coordinator",
+                      m.topicId, m.partition, m.producerId, ret.errorCode);
+        if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode);
+        return;
+    }
+    // The AUTHORITATIVE offset: where the worker actually appended the marker.
+    notifyControlMarker(m.topicId, m.partition, m.producerId, ret.baseOffset, m.commit);
+}
+
+void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
+{
+    ++controlRecordsRefused_;
+    const bool registered = replicaRegistry_ && replicaRegistry_->lookup(ret.topicId, ret.partition);
+    auto it = markersInFlight_.find(ret.correlationId);
+    if (it == markersInFlight_.end()) {
+        // Not a marker this gateway issued.  Still on this node → an invariant
+        // violation (halt); gone → surface NotLeader to the coordinator.
+        if (registered) {
+            const std::string what = "control marker refused (unknown token " + std::to_string(ret.correlationId) +
+                                     ") while topic=" + std::to_string(ret.topicId) + " partition=" +
+                                     std::to_string(ret.partition) + " is registered on this node";
+            spdlog::critical("ClientGateway: INVARIANT VIOLATION — {}", what);
+            if (invariantViolationHandler_) invariantViolationHandler_(what);
+            return;
+        }
+        if (txnService_) txnService_->onControlMarkerRefused(ret.topicId, ret.partition, ret.producerId, ret.errorCode);
+        return;
+    }
+    MarkerInFlight& m = it->second;
+    if (registered) {
+        // Task 10 round 4 (P1): re-routing is SAFE now — no offset was ever
+        // pre-computed or reported; the offset comes from the append that
+        // finally executes.  WorkerPool re-stamps the CURRENT registry identity.
+        // Bounded: after (a)-(c) of round 3 a registered partition's marker can
+        // only be refused transiently, so repeated refusals = a broken invariant.
+        if (++m.reroutes > kMaxMarkerReroutes) {
+            const std::string what = "control marker for topic=" + std::to_string(m.topicId) + " partition=" +
+                                     std::to_string(m.partition) + " refused " + std::to_string(m.reroutes) +
+                                     " times while registered on this node";
+            spdlog::critical("ClientGateway: INVARIANT VIOLATION — {}", what);
+            if (invariantViolationHandler_) invariantViolationHandler_(what);
+            return;
+        }
+        spdlog::warn("ClientGateway: control marker for topic={} partition={} refused by the worker "
+                     "(stale routing) — re-routed (attempt {})", m.topicId, m.partition, m.reroutes);
+        if (!markerSendQueue_.empty() || !trySendMarker_(ret.correlationId))
+            markerSendQueue_.push_front(ret.correlationId);   // ahead of later markers
+        return;
     }
     spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} REFUSED "
                   "(partition not on this node) — surfaced to the txn coordinator as NotLeader",
-                  topicId, partition, pid);
-    if (txnService_) txnService_->onControlMarkerRefused(topicId, partition, pid, err);
+                  m.topicId, m.partition, m.producerId);
+    if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode);
+    markersInFlight_.erase(it);
 }
 
 void ClientGateway::raiseStorageFailure_(const std::string& logDir, int err)
@@ -2941,12 +3105,17 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             return;
         }
 
-        // Task 10 fix 3: a control marker refused by the worker ownership guard.
-        // Re-route it with the CURRENT routing if the partition is still on this
-        // node (a new incarnation); otherwise surface NotLeader to the txn
-        // coordinator — never a silent drop.
+        // Task 10 fix 3 / round 4: a control marker refused by the worker
+        // ownership guard.  Re-routed with the CURRENT routing if the partition
+        // is still on this node (safe: its offset is never pre-computed);
+        // otherwise NotLeader to the txn coordinator — never a silent drop.
         if (ret.type == rune::node::WorkerReturn::Type::ControlRecordRefused) [[unlikely]] {
-            onControlRecordRefused_(ret.topicId, ret.partition, ret.chunk, ret.errorCode);
+            onControlRecordRefused_(ret);
+            return;
+        }
+        // Task 10 round 4 (P1): the marker's AUTHORITATIVE offset.
+        if (ret.type == rune::node::WorkerReturn::Type::ControlRecordAppended) {
+            onControlRecordAppended_(ret);
             return;
         }
 
@@ -3043,7 +3212,8 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 entry.baseOffset    = ret.baseOffset;
                 entry.lastOffset    = ret.lastOffset;
                 entry.enqueuedAtNs  = ret.enqueuedAtNs;
-                entry.replica       = ret.replica;
+                entry.topicId       = ret.topicId;
+                entry.incarnation   = ret.incarnation;   // echoed from the routed op
                 pendingAcks_.push_back(entry);
 
                 spdlog::debug(
@@ -3389,20 +3559,42 @@ void ClientGateway::drainPendingAcks()
         // is robust to any future HW-exposure change.
         // G1.1: use per-cycle snapshot (plain int) instead of per-iteration atomic load.
         const int drainMinIsr = cachedMinIsr_;
+        // Task 10 round 4 (Important 3): resolve the replica through the
+        // registry on EVERY check — never a pointer held across cycles.  Gone
+        // or re-created (different incarnation) → stale → fail RETRIABLY.
+        const rune::replication::PartitionReplica* rep = nullptr;
+        if (replicaRegistry_) {
+            rep = entry.incarnation != 0
+                ? replicaRegistry_->resolve(entry.topicId, entry.partition, entry.incarnation)
+                : replicaRegistry_->lookup(entry.topicId, entry.partition);
+        }
+        if (rep == nullptr) [[unlikely]] {
+            if (Session* session = sessions_.find(entry.sessionId)) {
+                pc::ProduceResponse resp;
+                resp.sessionId     = entry.sessionId;
+                resp.correlationId = entry.correlationId;
+                resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                resp.partition     = entry.partition;
+                resp.baseOffset    = 0;
+                const std::size_t encoded = resp.encode(scratch_.data());
+                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+            }
+            spdlog::debug("ClientGateway: acks=All pending ack for topic={} partition={} is stale "
+                          "(partition removed / re-created) → NotLeader", entry.topicId, entry.partition);
+            if (i + 1 < pendingAcks_.size()) pendingAcks_[i] = std::move(pendingAcks_.back());
+            pendingAcks_.pop_back();
+            continue;
+        }
         // Task #13: use gatewayIsrSize() (published-snapshot acquire-load)
         // instead of the live isr().size() — closes the ISR vector race.
-        const bool isrHealthy =
-            entry.replica &&
-            entry.replica->gatewayIsrSize() >= drainMinIsr;
+        // (Round 4: pre-existing atomic snapshot — not extended; F9 removes it.)
+        const bool isrHealthy = rep->gatewayIsrSize() >= drainMinIsr;
 
         // Task #13: use gatewayHighWatermark() (published-snapshot acquire-load)
         // instead of the live highWatermark() — closes TSan R5/R6b.
-        const int64_t entryHw = entry.replica
-            ? entry.replica->gatewayHighWatermark()
-            : int64_t{0};
+        const int64_t entryHw = rep->gatewayHighWatermark();
 
-        if (entry.replica && isrHealthy &&
-            entryHw > entry.lastOffset) {
+        if (isrHealthy && entryHw > entry.lastOffset) {
             // HW advanced past this batch AND ISR is healthy — ack OK.
             Session* session = sessions_.find(entry.sessionId);
             if (session) {
@@ -3938,7 +4130,8 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
 // Single-writer: must be called on the duty-cycle thread.
 // ---------------------------------------------------------------------------
 int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
-                                            std::span<const uint8_t> marker)
+                                            std::span<const uint8_t> marker,
+                                            int64_t producerId, bool commit)
 {
     if (!topicRegistry_) {
         spdlog::warn("ClientGateway::appendControlRecord: no TopicRegistry — dropped");
@@ -3965,45 +4158,36 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
     // When per-worker ingress is active, the worker is the SOLE appender for
     // USER partitions (topicId >= 0).  Appending to a worker-owned log from the
     // gateway thread is a write-write race.  Route the append to the owning
-    // worker via the SPSC ingress ring instead — the worker executes
-    // replica->append on its own thread (sole writer).  The gateway pre-computes
-    // the expected base offset from log->logEndOffset() (safe: logEndOffset is
-    // atomic) and returns it synchronously so the caller can proceed with
-    // notifyControlMarker() without stalling.
+    // worker via the SPSC ingress ring instead.
     //
-    // Preconditions for this path:
-    //   - perWorkerIngressActive_ (worker is sole appender for user partitions)
-    //   - topicId >= 0 (user partition — internal partitions keep the gateway path)
-    //   - replica != nullptr (replica guards the log for this partition)
-    //   - workerPool_ != nullptr (ring routing is available)
+    // Task 10 round 4 (P1): the marker's offset is NOT pre-computed here
+    // (log->logEndOffset() is stale whenever produces are queued ahead of the
+    // marker in the worker ring — the marker lands after them).  The worker
+    // returns the offset it ACTUALLY appended at (ControlRecordAppended) and
+    // onControlRecordAppended_ feeds notifyControlMarker with it.  The caller
+    // gets kControlRecordAsync.  A full ring never drops the marker: it waits in
+    // markerSendQueue_ and is retried every doWork, in order.
     if (perWorkerIngressActive_ && topicId >= 0 && replica && workerPool_) {
         if (marker.empty()) return -1;
-
-        // Pre-compute the expected base offset.  Since the worker is the sole
-        // appender, log->logEndOffset() at this moment equals the base offset
-        // the worker will assign when it executes the append.
-        base = log->logEndOffset();
-
-        rune::node::WorkerOp op;
-        op.type      = rune::node::WorkerOp::Type::AppendControlRecord;
-        op.topicId   = topicId;
-        op.partition = partition;
-        op.replica   = replica;
-        op.logPtr    = log;
-        // Copy marker bytes into the op (recordBatchBytes reused as the carrier).
-        op.recordBatchBytes.assign(marker.begin(), marker.end());
-
-        if (!workerPool_->tryEnqueueOp(topicId, partition, std::move(op))) {
-            spdlog::warn("ClientGateway::appendControlRecord: worker ring full for "
-                         "topicId={} partition={} — marker dropped (will retry next TCS cycle)",
-                         topicId, partition);
-            return -1;
+        if (producerId < 0 && marker.size() >= 43u + 8u) {
+            producerId = 0;
+            for (int i = 0; i < 8; ++i) producerId |= static_cast<int64_t>(marker[43u + i]) << (i * 8);
         }
-
-        // Return the pre-computed base offset.  The caller (TCS) will call
-        // notifyControlMarker() with this offset; the actual log append happens
-        // on the worker thread shortly after (single-owner, no race).
-        return base;
+        const int64_t token = nextMarkerToken_++;
+        MarkerInFlight m;
+        m.topicId    = topicId;
+        m.partition  = partition;
+        m.producerId = producerId;
+        m.commit     = commit;
+        m.bytes.assign(marker.begin(), marker.end());
+        markersInFlight_.emplace(token, std::move(m));
+        if (!markerSendQueue_.empty() || !trySendMarker_(token)) {
+            markerSendQueue_.push_back(token);   // FIFO behind earlier markers
+            spdlog::warn("ClientGateway::appendControlRecord: worker back-pressure for topicId={} "
+                         "partition={} — marker queued ({} waiting), retried every cycle",
+                         topicId, partition, markerSendQueue_.size());
+        }
+        return kControlRecordAsync;
     }
 
     if (replica) {

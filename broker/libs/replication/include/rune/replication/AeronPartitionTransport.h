@@ -55,7 +55,7 @@
 // Only the pointer is stored in this header (setWorkerPool takes WorkerPool*).
 // The full WorkerPool.h / WorkerOp.h are included in AeronPartitionTransport.cpp
 // (compiled under rune_replication_aeron which has RUNE_NODE_INCLUDE).
-namespace rune::node { class WorkerPool; }
+namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
@@ -140,7 +140,29 @@ public:
     // -----------------------------------------------------------------------
 
     /// Register a replica so inbound frames can be routed to it.
+    /// Task 10 round 4: ignored once a ReplicaRegistry is wired (the transport
+    /// then holds NO replica pointer at all — it resolves at use time).
     void registerReplica(int32_t topicId, PartitionId partitionId, PartitionReplica* replica);
+    /// Drop a registration (standalone mode — no registry wired).
+    void unregisterReplica(int32_t topicId, PartitionId partitionId);
+
+    /// Task 10 round 4 (Critical 1): resolve every inbound frame's replica
+    /// through the ReplicaRegistry at USE time (a removed partition resolves to
+    /// nothing: the frame is dropped, nothing freed is ever dereferenced).
+    /// Wiring it drops any pointer registered so far.  Control thread only.
+    /// \param userPartitions false when USER (topicId >= 0) replicas live on
+    ///        per-worker replication planes (E5 Task 5): this legacy transport
+    ///        then resolves internal partitions only, exactly as before.
+    void setReplicaRegistry(const rune::node::ReplicaRegistry* registry,
+                            bool userPartitions = true) noexcept {
+        registry_ = registry;
+        registryUserPartitions_ = userPartitions;
+        replicas_.clear();
+    }
+    /// Test hook: number of raw replica pointers the transport holds.
+    [[nodiscard]] std::size_t heldReplicaPointersForTest() const noexcept { return replicas_.size(); }
+    /// Test hook: feed one reassembled replication frame through onFragment.
+    void deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs);
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -295,6 +317,8 @@ private:
                                            aeron::util::index_t             offset,
                                            aeron::util::index_t             length,
                                            aeron::Header&                   header);
+    /// The frame handler proper (onFragment minus the Aeron plumbing).
+    aeron::ControlledPollAction handleFrame_(const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
     // Fields
@@ -347,6 +371,11 @@ private:
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.
     rune::node::WorkerPool* workerPool_ = nullptr;
+
+    // Task 10 round 4: when wired, the ONLY replica source (use-time resolve).
+    const rune::node::ReplicaRegistry* registry_ = nullptr;
+    bool registryUserPartitions_ = true;
+    PartitionReplica* resolveReplica_(int32_t topicId, PartitionId partitionId) const noexcept;
 };
 
 } // namespace rune::replication
