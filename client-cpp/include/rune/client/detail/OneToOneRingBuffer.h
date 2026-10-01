@@ -232,6 +232,11 @@ public:
         return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedConsumer, __ATOMIC_ACQ_REL) &
                 kDetachedProducer) != 0;
     }
+    /// F8c C7: either side (acquire) — has the producer side detached?  Once
+    /// true, the producer side never touches the ring (or its owner) again.
+    [[nodiscard]] bool producerDetached() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kDetachedProducer) != 0;
+    }
 
     [[nodiscard]] std::int64_t producerPosition() const noexcept { return loadAcquire64_(m_tailPositionIndex); }
     [[nodiscard]] std::int64_t consumerPosition() const noexcept { return loadAcquire64_(m_headPositionIndex); }

@@ -101,6 +101,17 @@ public:
     /// Consumer side: abandon the channel (release).  Idempotent.
     void abandon() noexcept { ring_.consumerClose(); }
 
+    /// F8c C7: last-one-frees ownership hand-off of the impl that owns this
+    /// ring, between the duty side (the ring's producer: the hub that owns the
+    /// impl) and the app-side handle (its consumer).  Each side detaches once;
+    /// the call that finds the other side already detached returns true and
+    /// its caller frees the impl.  Nobody waits (OneToOneRingBuffer's I5 word).
+    bool detachProducer() noexcept { return ring_.detachProducer(); }
+    bool detachConsumer() noexcept { return ring_.detachConsumer(); }
+    /// Either side (acquire): the duty side detached — it never touches the
+    /// impl (or its Client) again; the handle owns it alone.
+    [[nodiscard]] bool producerDetached() const noexcept { return ring_.producerDetached(); }
+
     /// Either side: finished by the producer (no further callbacks; the last
     /// published snapshot is final)?
     [[nodiscard]] bool producerClosed() const noexcept { return ring_.producerClosed(); }

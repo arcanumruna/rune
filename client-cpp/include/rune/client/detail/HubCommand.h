@@ -32,8 +32,8 @@ struct HubCommand {
         Unsubscribe     = 2,
 
         // ---- GroupConsumerHub -------------------------------------------------
-        /// handle = heap std::shared_ptr<GroupConsumerImpl>* (adopted + freed by
-        /// the duty thread).
+        /// handle = the GroupConsumerImpl* (F8c C7: no shared_ptr holder) —
+        /// adopted by the duty thread (its share of the impl, §3.3).
         GroupAdd        = 10,
         /// handle = GroupConsumerImpl* (identity only; resolved against the
         /// hub's own list, never dereferenced unless found there).
@@ -87,6 +87,30 @@ struct HubCommand {
         /// handle = producer::ProducerImpl*: closeImmediately (no completion of
         /// its own; a pending begin-close token completes Closed).
         ProducerCloseNow   = 41,
+
+        // ---- TransactionalProducer close (F8c C7) -------------------------------
+        /// Token op (a = Token, b / c = target): close — an open broker
+        /// transaction is aborted (EndTxn(abort)) first; the token completes
+        /// once the producer is closed (Ok, or the abort's failure status).
+        TxnClose        = 35,
+        /// closeImmediately: discard locally (pending ops complete Closed, a
+        /// pending close token completes Closed); no completion of its own.
+        TxnCloseNow     = 36,
+
+        // ---- Handle release (F8c C7, spec §3.3) ---------------------------------
+        /// handle = the impl, a = HandleKind.  The handle gives its share of
+        /// the impl to the duty side: the duty side first applies the handle's
+        /// destructor semantics (Producer / TransactionalProducer:
+        /// closeImmediately unless a close is already in progress;
+        /// Subscription: unsubscribe; GroupConsumer: close), then — once
+        /// nothing on the duty side references the impl any more — detaches
+        /// its side of the impl's ownership word.  Whichever of the two sides
+        /// detaches LAST frees the impl (one RMW each, nobody waits).
+        HandleRelease   = 50,
+        /// F8c C7: Client::close() — begin-close every producer and close every
+        /// transactional producer; a = Token, b / c = target; completes Ok once
+        /// every one of them settled (each bounded by its own deadline).
+        ClientDrain     = 51,
     };
 
     Op       op     = Op::SubscribeAdd;
@@ -96,6 +120,21 @@ struct HubCommand {
     int64_t  c      = 0;  ///< F8c C4: second completion-target word
     int64_t  d      = 0;  ///< F8c C5: op payload (a heap holder for txn sends / offsets)
 };
+
+/// F8c C7: which impl type a HandleRelease carries.
+enum class HandleKind : int64_t {
+    Producer      = 1,
+    TxnProducer   = 2,
+    Subscription  = 3,
+    GroupConsumer = 4,
+};
+
+/// F8c C7 test seam: called by every handle impl's destructor (Producer,
+/// TransactionalProducer, Subscription and GroupConsumer impls) — counts and
+/// attributes frees.  Set it before any thread that may free an impl runs and
+/// clear it after they are joined (never written while another thread reads
+/// it).  nullptr in production.
+inline void (*testOnImplFree)(HandleKind kind, const void* impl) noexcept = nullptr;
 
 /// Result of handing a HubCommand to a sink.
 enum class HubSubmit : uint8_t {
@@ -127,7 +166,8 @@ enum class SendResult : uint8_t { Accepted, Retry, Fatal };
 [[nodiscard]] constexpr bool isLifecycle(HubCommand::Op op) noexcept {
     return op == HubCommand::Op::Unsubscribe || op == HubCommand::Op::GroupClose ||
            op == HubCommand::Op::CqRelease || op == HubCommand::Op::ProducerBeginClose ||
-           op == HubCommand::Op::ProducerCloseNow;
+           op == HubCommand::Op::ProducerCloseNow || op == HubCommand::Op::TxnCloseNow ||
+           op == HubCommand::Op::HandleRelease;
 }
 
 /// Plain function pointer + opaque context (no std::function, no virtual):

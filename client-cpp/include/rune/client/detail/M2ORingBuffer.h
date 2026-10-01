@@ -68,6 +68,7 @@ public:
         m_correlationIdCounterIndex = m_capacity + CORRELATION_COUNTER_OFFSET;
         m_consumerHeartbeatIndex    = m_capacity + CONSUMER_HEARTBEAT_OFFSET;
         m_consumerFinishedIndex     = m_capacity + CONSUMER_FINISHED_OFFSET;
+        m_detachIndex               = m_capacity + DETACH_OFFSET;
     }
 
     M2ORingBuffer(const M2ORingBuffer&)            = delete;
@@ -124,6 +125,33 @@ public:
     void consumerFinish() noexcept { storeRelease64_(m_consumerFinishedIndex, 1); }
     [[nodiscard]] bool consumerFinished() const noexcept {
         return loadAcquire64_(m_consumerFinishedIndex) != 0;
+    }
+
+    /// F8c C7: last-one-frees ownership hand-off of the OBJECT that owns this
+    /// ring (a ProducerImpl) between its two holders — the consumer side (the
+    /// duty registry) and the producer side (the app-thread handle).  Each side
+    /// detaches exactly once with ONE RMW on one word; the call that finds the
+    /// OTHER side already detached returns true and its caller frees the
+    /// owner.  Exactly one of the two calls returns true; nobody waits.  The
+    /// same handshake as OneToOneRingBuffer::detachProducer/detachConsumer
+    /// (F8c fix round 2, I5), in the trailer's spare line after the
+    /// correlation counter (Aeron pads it; nothing else uses it).
+    bool detachConsumer() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedConsumer, __ATOMIC_ACQ_REL) &
+                kDetachedProducer) != 0;
+    }
+    bool detachProducer() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedProducer, __ATOMIC_ACQ_REL) &
+                kDetachedConsumer) != 0;
+    }
+    /// Either side (acquire): has the consumer side (the duty registry)
+    /// detached?  Once true, the consumer never touches the owner again.
+    [[nodiscard]] bool consumerDetached() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kDetachedConsumer) != 0;
+    }
+    /// Either side (acquire): has the producer side (the handle) detached?
+    [[nodiscard]] bool producerDetached() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kDetachedProducer) != 0;
     }
 
     /// Test seam (fix5 / F8c fix round 1): turn a claim returned by tryClaim()
@@ -487,6 +515,9 @@ private:
     static constexpr aeron::util::index_t CORRELATION_COUNTER_OFFSET = CL * 8;
     static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10; // matches Aeron
     static constexpr aeron::util::index_t CONSUMER_FINISHED_OFFSET   = CL * 11; // Rune (I2): spare line
+    static constexpr aeron::util::index_t DETACH_OFFSET              = CL * 9;  // Rune (C7): spare line
+    static constexpr std::int64_t kDetachedProducer = 1;
+    static constexpr std::int64_t kDetachedConsumer = 2;
     static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 12; // matches Aeron
     static constexpr aeron::util::index_t INSUFFICIENT_CAPACITY      = -2;
     // The tail word: bit 63 = closed (positions never reach 2^63), bits 0..62 =
@@ -683,6 +714,7 @@ private:
     aeron::util::index_t m_correlationIdCounterIndex = 0;
     aeron::util::index_t m_consumerHeartbeatIndex   = 0;
     aeron::util::index_t m_consumerFinishedIndex = 0;
+    aeron::util::index_t m_detachIndex           = 0;
 };
 
 } // namespace rune::client::detail
