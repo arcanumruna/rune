@@ -1073,64 +1073,105 @@ TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
 }
 
 // ---------------------------------------------------------------------------
-// F3 round 3 (corrects fix-round-2 item A.4): validateReplicationFetchCeiling()
-// must check the max produce batch size against the TRANSPORT's hard
-// per-message maximum, NOT against replication's requested fetch chunk size
-// (rune::replication::kDefaultMaxFetchBytes).  F3 round 2's progress rule
-// means a batch larger than the requested chunk size is still served ALONE
-// whenever it fits the transport's real hard maximum — the fetch chunk size
-// is irrelevant to whether a batch is PERMANENTLY unfetchable.
+// F3 round 4 (supersedes round 3's validateReplicationFetchCeiling tests,
+// which tested a startup-refusal design the controller replaced): instead of
+// refusing to start whenever the gateway's configured max batch exceeds a
+// transport's hard maximum, derive the gateway's EFFECTIVE max produce-batch
+// size from the actual transport limits and use THAT to reject oversize
+// produce batches at the gateway (see ClientGatewayHotPathTest.cpp's
+// OversizeProduceBatchRejectedNotAcceptedRegression for the gateway-side
+// enforcement).  Startup now refuses ONLY when the operator EXPLICITLY
+// configures a max batch that the transport can never carry.
 // ---------------------------------------------------------------------------
 
-// A config where the requested fetch chunk (1 MiB, round 3 reverted this
-// back down from round 2's wrong 8 MiB) is SMALLER than the max produce
-// batch (8 MiB) must still be ALLOWED, as long as the hard transport maximum
-// covers the produce batch.  Round 2's original (now-corrected) check would
-// have wrongly refused exactly this — the whole point of this round's fix.
-TEST(BrokerNodeRegression, ConfigValidationAllowsFetchBelowMaxBatchRegression) {
-    constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u; // ClientGateway default
-    constexpr int32_t kFetchChunkBytes = 1 << 20;                     // kDefaultMaxFetchBytes
-    ASSERT_LT(static_cast<std::size_t>(kFetchChunkBytes), kMaxProduceBatchBytes)
-        << "test setup: proving the (smaller) fetch chunk size no longer matters";
-    // Hard transport maximum (10 MiB) comfortably covers the 8 MiB produce
-    // batch, even though it exceeds the 1 MiB fetch chunk size.
-    auto err = validateReplicationFetchCeiling(kMaxProduceBatchBytes,
-                                               /*hardTransportMaxBytes=*/10 * 1024 * 1024);
-    EXPECT_FALSE(err.has_value()) << (err ? *err : "(no error)");
-}
-
-// The pure decision function: a produce batch exceeding the hard transport
-// maximum must be refused, with the exact numbers named in the message.
-TEST(BrokerNodeRegression, ConfigValidationRefusesBatchAboveHardTransportMaxRegression) {
-    auto err = validateReplicationFetchCeiling(/*maxProduceBatchBytes=*/8 * 1024 * 1024,
-                                               /*hardTransportMaxBytes=*/1 * 1024 * 1024);
-    ASSERT_TRUE(err.has_value());
-    EXPECT_NE(err->find(std::to_string(8 * 1024 * 1024)), std::string::npos) << *err;
-    EXPECT_NE(err->find(std::to_string(1 * 1024 * 1024)), std::string::npos) << *err;
-}
-
-// End-to-end: BrokerNode::start() refuses, before any side effect, a
-// genuinely multi-node config whose Aeron/ring sizing cannot carry the
-// gateway's max accepted produce batch.  Single-node is deliberately exempt
-// (no follower can ever hit this — see BrokerNode.cpp's comment), so this
-// test must use a 2-node config to exercise the check at all.
-TEST(BrokerNodeRegression, ReplicationFetchCeilingTooSmallRefusesStartBeforeAnySideEffect) {
-    const fs::path dir = makeTempDataDir("replceiling_");
+// Unit test of the derivation itself (effectiveMaxProduceBatchBytes()):
+//   1. Multi-node: effective = min(configured default, ingress hard max,
+//      replication hard max) — whichever of the three is tightest wins.
+//   2. An EXPLICIT override smaller than every hard max is honored exactly
+//      (the min() picks the configured value itself).
+//   3. Single-node EXCLUDES the replication term (round 3's exemption,
+//      narrowed in round 4 to just the replication half of the min) — a tiny
+//      replicationOutboundRingBytes must NOT affect a single-node result,
+//      but a tiny ingress ring/term still must.
+TEST(BrokerNodeRegression, EffectiveMaxBatchDerivedFromTransportRegression) {
+    const fs::path dir = makeTempDataDir("effmaxderive_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
     PeerConfig peer1;
-    peer1.id = 1;
-    peer1.host = "127.0.0.1";
-    peer1.consensusPort = 40113;
+    peer1.id = 1; peer1.host = "127.0.0.1"; peer1.consensusPort = 40114;
     cfg.peers.push_back(peer1);
-    ASSERT_FALSE(cfg.isSingleNode()) << "test setup: must be multi-node to exercise the check";
-    // Shrink both knobs replicationHardTransportMaxBytes() takes the min of,
-    // far below the gateway's 8 MiB default max produce batch.
-    cfg.aeronTermBufferBytes = 64 * 1024;
-    cfg.replicationOutboundRingBytes = 64 * 1024;
+    ASSERT_FALSE(cfg.isSingleNode());
+
+    cfg.aeronTermBufferBytes         = 1 * 1024 * 1024; // term bound = 131072
+    cfg.workerIngressRingBytes       = 8 * 1024 * 1024;  // ring bound = 1048576 -> ingress hard max = 131072
+    cfg.replicationOutboundRingBytes = 2 * 1024 * 1024;  // ring bound = 262144 -> repl hard max = min(131072,262144) - framing
+
+    const int32_t ingressMax = ingressHardTransportMaxBytes(cfg);
+    const int32_t replMax    = replicationHardTransportMaxBytes(cfg);
+    EXPECT_EQ(ingressMax, 131072);
+    EXPECT_LT(replMax, 131072) << "replication subtracts framing overhead; must be strictly smaller";
+
+    // (1) Default config (no explicit override): effective = min(8 MiB, ingressMax, replMax) = replMax.
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), static_cast<std::size_t>(replMax));
+
+    // (2) Explicit override smaller than every hard max wins exactly.
+    cfg.maxProduceBatchBytes = 1000;
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 1000u);
+    cfg.maxProduceBatchBytes.reset();
+
+    // (3) Single-node: the SAME tiny replicationOutboundRingBytes must be
+    // ignored (no follower can ever hit the replication limit), but the
+    // ingress limit still applies.
+    NodeConfig singleCfg = makeSingleNodeConfig(dir);
+    ASSERT_TRUE(singleCfg.isSingleNode());
+    singleCfg.aeronTermBufferBytes         = cfg.aeronTermBufferBytes;
+    singleCfg.workerIngressRingBytes       = cfg.workerIngressRingBytes;
+    singleCfg.replicationOutboundRingBytes = 1024;  // tiny — would dominate if not excluded
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(singleCfg), static_cast<std::size_t>(ingressMax))
+        << "single-node must exclude the replication term from the derivation";
+
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// End-to-end: BrokerNode::start() refuses, before any side effect, ONLY when
+// an EXPLICIT max-produce-batch override exceeds the hard transport maximum.
+// Uses a SINGLE-node config deliberately (round 3's exemption no longer
+// applies wholesale — see point 3 of the round-4 ruling): the ingress limit
+// alone is enough to trigger the refusal, proving single-node is NOT exempt
+// from this check in general, only from the replication half of it.
+TEST(BrokerNodeRegression, ExplicitOversizeMaxBatchConfigRefusedRegression) {
+    const fs::path dir = makeTempDataDir("explicitoversize_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    ASSERT_TRUE(cfg.isSingleNode());
+    cfg.aeronTermBufferBytes   = 64 * 1024; // term bound = 8192
+    cfg.workerIngressRingBytes = 64 * 1024; // ring bound = 8192 -> ingress hard max = 8192
+    cfg.maxProduceBatchBytes   = 10 * 1024 * 1024;  // EXPLICIT 10 MiB >> hard max
+
+    // Pure-function check first (naming the exact numbers).
+    auto err = validateExplicitMaxProduceBatch(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find(std::to_string(10 * 1024 * 1024)), std::string::npos) << *err;
+    EXPECT_NE(err->find("8192"), std::string::npos) << *err;
+
     BrokerNode node{cfg};
     EXPECT_THROW(node.start(), std::runtime_error);
     EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
     std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// The default (unset) config must NEVER be refused, however small the hard
+// transport maximum ends up — this is the behavior that makes all 19
+// previously-failing multi-node integration tests pass again without any
+// per-test config patch (F3 round 4, point 4 of the ruling).
+TEST(BrokerNodeRegression, DefaultMaxBatchConfigNeverRefusedRegression) {
+    NodeConfig cfg = makeSingleNodeConfig(makeTempDataDir("defaultnotrefused_"));
+    PeerConfig peer1;
+    peer1.id = 1; peer1.host = "127.0.0.1"; peer1.consensusPort = 40115;
+    cfg.peers.push_back(peer1);
+    cfg.aeronTermBufferBytes = 64 * 1024;            // tiny — would have refused under round 3
+    cfg.replicationOutboundRingBytes = 64 * 1024;
+    cfg.workerIngressRingBytes = 64 * 1024;
+    ASSERT_FALSE(cfg.maxProduceBatchBytes.has_value()) << "test setup: must be the unset default";
+    EXPECT_FALSE(validateExplicitMaxProduceBatch(cfg).has_value());
 }
 
 

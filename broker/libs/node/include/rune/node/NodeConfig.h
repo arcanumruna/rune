@@ -401,6 +401,20 @@ struct NodeConfig {
     //     old hard-coded 10 to prevent head-of-line blocking on batched ingress).
     //     Also reused for per-worker ingress poll (Task E5.1.2).
     int32_t gatewayFragmentLimit         = 256;
+    //   - maxProduceBatchBytes: F3 round 4 — EXPLICIT override of the gateway's
+    //     max accepted produce-batch wire size (RUNE_MAX_PRODUCE_BATCH_BYTES).
+    //     std::nullopt (default — NOT set) means "use the derived effective
+    //     value" (min of the configured default, the ingress transport's hard
+    //     per-message maximum, and the replication transport's hard per-message
+    //     maximum minus its response framing overhead — see BrokerNode.cpp's
+    //     effectiveMaxProduceBatchBytes()/validateExplicitMaxProduceBatch()).
+    //     A SET value is a deliberate operator request for a LARGER (or
+    //     smaller) ceiling than the derived default would give; BrokerNode::
+    //     start() refuses to start (naming the exact numbers) if an explicit
+    //     value exceeds what the transport can actually carry — silently
+    //     capping an EXPLICIT request would be a silent surprise, unlike
+    //     capping the un-set default, which was never a promise to begin with.
+    std::optional<int64_t> maxProduceBatchBytes;
     // ── Per-tick drain/poll batch limits (all raised from tiny hard-coded 10/16
     //    defaults that throttled the acks=majority replication pipeline; each is a
     //    KNOB so we always know what bounds the per-cycle batch).  A value of 0 is

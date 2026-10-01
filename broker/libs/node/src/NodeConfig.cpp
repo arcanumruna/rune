@@ -1081,6 +1081,15 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_WORKER_INGRESS_BASE_PORT must be a port in [1, 65535], got: ") + raw};
         cfg.workerIngressBasePort = port;
     }
+    // F3 round 4: EXPLICIT override of the gateway's max accepted produce-batch
+    // size.  Left unset (nullopt) by default — BrokerNode::start() then derives
+    // the effective ceiling from the transport instead of refusing startup.
+    if (const char* raw = getenv_fn("RUNE_MAX_PRODUCE_BATCH_BYTES"); raw && *raw) {
+        int64_t bytes{};
+        if (!parseInt64Positive(raw, bytes))
+            return {{}, std::string("RUNE_MAX_PRODUCE_BATCH_BYTES must be a positive integer, got: ") + raw};
+        cfg.maxProduceBatchBytes = bytes;
+    }
     if (const char* raw = getenv_fn("RUNE_WORKER_REPL_BASE_PORT"); raw && *raw) {
         int32_t port{};
         if (!parseInt32(raw, port))

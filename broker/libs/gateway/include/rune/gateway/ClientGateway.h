@@ -469,6 +469,24 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // F3 round 4: setMaxProduceBatchBytes — install the EFFECTIVE max accepted
+    // produce-batch size, derived by BrokerNode from the actual transport
+    // limits (see BrokerNode.cpp's effectiveMaxProduceBatchBytes()) rather
+    // than always using the static kMaxProduceBatchBytes default.  A batch
+    // over this bound is rejected LOUDLY with MessageTooLarge (handleProduce's
+    // existing guard — unchanged) — it is NEVER accepted, so it can never
+    // become a batch that is permanently unfetchable by replication.
+    // Must be called before the gateway starts polling produce frames
+    // (single-writer: duty-cycle thread only after this point).
+    // -----------------------------------------------------------------------
+    void setMaxProduceBatchBytes(std::size_t bytes) noexcept {
+        maxProduceBatchBytes_ = bytes > 0 ? bytes : kMaxProduceBatchBytes;
+    }
+    [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept {
+        return maxProduceBatchBytes_;
+    }
+
+    // -----------------------------------------------------------------------
     // pendingAckCount — number of deferred acks=All entries waiting for HW.
     // For tests and monitoring.
     // -----------------------------------------------------------------------
