@@ -1087,29 +1087,30 @@ TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxPushChunk) {
 // term / 8).  Plus ret ring >= ingress ring, and the owed-return cap in range.
 TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxStorableBatch) {
     constexpr std::size_t MiB = 1u << 20;
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, false, 4 * MiB, 4096).has_value())
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
         << "the defaults must pass";
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, true, 4 * MiB, 4096).has_value())
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
         << "the shard defaults must pass";
-    EXPECT_TRUE(Worker::validateRingConfig(8 * MiB, 32 * MiB, false, 4 * MiB, 4096).has_value())
+    EXPECT_TRUE(Worker::validateRingConfig(8 * MiB, 32 * MiB, 4096).has_value())
         << "Legacy: an 8 MiB return ring cannot hold a 2-4 MiB batch the 32 MiB ingress ring accepts";
-    EXPECT_TRUE(Worker::validateRingConfig(16 * MiB, 32 * MiB, false, 4 * MiB, 4096).has_value())
+    EXPECT_TRUE(Worker::validateRingConfig(16 * MiB, 32 * MiB, 4096).has_value())
         << "return ring smaller than the ingress ring";
     // Re-review 1 I-3: shard intake is bounded per worker by its own return
-    // ring (MessageTooLarge above it), so the Aeron term size never makes a
-    // config refuse.  The SHIPPED shard configs must start:
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, true, 32 * MiB, 4096).has_value())
+    // ring (MessageTooLarge above it; ShardIngressBatchLargerThanReturnRing…),
+    // so the Aeron term size no longer enters the check at all.  The SHIPPED
+    // shard configs' ring sizes must start:
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
         << "bench/kafka-compare/cluster.sh RUNE_SHARD=1 (rings 32/32, term 32 MiB)";
-    EXPECT_FALSE(Worker::validateRingConfig(64 * MiB, 64 * MiB, true, 64 * MiB, 4096).has_value())
+    EXPECT_FALSE(Worker::validateRingConfig(64 * MiB, 64 * MiB, 4096).has_value())
         << "replbench.sh RUNE_SHARD=1 (rings 64/64, term 64 MiB)";
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, true, 64 * MiB, 4096).has_value())
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
         << "CLAUDE.md broker env (rings 32/32, term 64 MiB) in shard mode";
-    EXPECT_FALSE(Worker::validateRingConfig(128 * MiB, 32 * MiB, true, 64 * MiB, 4096).has_value());
-    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, false, 4 * MiB, 9000).has_value())
+    EXPECT_FALSE(Worker::validateRingConfig(128 * MiB, 32 * MiB, 4096).has_value());
+    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 9000).has_value())
         << "owed-return cap above the ceiling";
-    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, false, 4 * MiB, 100).has_value())
+    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 100).has_value())
         << "owed-return cap below the floor";
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, false, 4 * MiB, 8192).has_value());
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 8192).has_value());
     {
         const fs::path dir = makeTempDataDir("retring8_");
         NodeConfig cfg = makeSingleNodeConfig(dir);

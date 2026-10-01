@@ -2544,6 +2544,7 @@ void ClientGateway::pushSubscriptions()
         // gateway must NOT also push them (that would double-deliver).  Internal
         // partitions (topicId < 0) are not worker-owned, so keep gateway-pushing them.
         if (perWorkerEgressActive_ && sub.topicId >= 0) continue;
+        if (sub.failed) [[unlikely]] continue;   // F15 S3 I-4: parked after a non-retriable read error
 
         // Find the owning session.
         Session* session = sessions_.find(sub.sessionId);
@@ -3215,6 +3216,23 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         if (ret.type == rune::node::WorkerReturn::Type::PushReadResult) {
             // Always clear the in-flight marker regardless of outcome.
             pendingWorkerReads_.erase(ret.subscriptionId);
+
+            // F15 S3 re-review 1 I-4: the next stored batch is larger than the
+            // worker's return ring can carry — fail this subscription once,
+            // non-retriably, and park it (never re-issue the read: no spin).
+            if (ret.errorCode != 0) [[unlikely]] {
+                auto it = subscriptions_.find(ret.subscriptionId);
+                if (it == subscriptions_.end() || it->second.failed) return;
+                it->second.failed = true;
+                spdlog::error("ClientGateway: subscription {} (topicId={} partition={} offset={}) failed: "
+                              "worker answered error {} (a stored batch exceeds the worker return ring)",
+                              ret.subscriptionId, ret.readTopicId, ret.readPartition, ret.newNextOffset,
+                              ret.errorCode);
+                if (Session* session = sessions_.find(ret.sessionId))
+                    sendErrorResponse_(*session, ret.sessionId, ret.subscriptionId,
+                                       static_cast<pc::ErrorCode>(ret.errorCode));
+                return;
+            }
 
             if (ret.chunk.empty()) return; // nothing to push this cycle
 

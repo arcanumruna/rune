@@ -2084,6 +2084,9 @@ TEST(ReturnOverflowRegression, OpDrainPausesAtHighWater) {
         w.doWork(++now);
         EXPECT_EQ(log.logEndOffset(), leo) << "the op drain must pause at the high-water mark";
         EXPECT_GT(w.retFifoHighWaterPausesForTest(), 0u);
+        w.doWork(++now);                                     // a second paused pass, same episode
+        EXPECT_GE(w.retFifoHighWaterPausesForTest(), 2u);
+        EXPECT_EQ(w.retFifoPauseEpisodesForTest(), 1u) << "pause episodes are counted (and logged) per episode, not per pass";
         std::vector<WorkerReturn> answers;
         drainUntil(w, answers, kN + 1, now);
         ASSERT_EQ(answers.size(), static_cast<std::size_t>(kN + 1));
@@ -2289,7 +2292,7 @@ TEST(ReturnOverflowRegression, ShardIngressOversizeBatchRejectedMessageTooLarge)
     Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
     NullTransport t;
     PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
-    Worker w(0, 1 << 20);
+    Worker w(0, 1 << 20, 64u << 20);   // 8 MiB max return message: the 8 MiB produce cap binds
     w.setOwnedDirect(Worker::OwnedSet{&rep});
     w.setWorkerIngress(nullptr, true);
     const auto over = produceFrame(1, 9, bigBatch(Worker::kMaxProduceBatchBytes + 1024), /*acks=*/0, 1, 0);
@@ -2416,6 +2419,7 @@ TEST(ReturnOverflowRegression, ConfiguredOwedCapBoundsParkedWaiters) {
         EXPECT_EQ(parked + static_cast<int64_t>(answers.size()), kTotal);
         for (const auto& a : answers) EXPECT_EQ(a.errorCode, kNotLeader);
         EXPECT_EQ(w.owedCapThrottlesForTest(), answers.size()) << "every cap refusal is counted";
+        EXPECT_EQ(w.owedCapEpisodesForTest(), 1u) << "one throttle episode (one enter log), not one per refusal";
     }
     {
         TmpDir d;

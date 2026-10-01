@@ -909,9 +909,15 @@ ConfigResult parseNodeConfig(
     parseLimit("RUNE_WORKER_RETURN_DRAIN_LIMIT",  cfg.workerReturnDrainLimit);
     parseLimit("RUNE_REPL_FRAGMENT_LIMIT",        cfg.replFragmentLimit);
     parseLimit("RUNE_CONSENSUS_FRAGMENT_LIMIT",   cfg.consensusFragmentLimit);
-    // F15 S3: owed-return cap; the [256, 8192] range is enforced at start()
-    // (Worker::validateRingConfig) so a bad value refuses loudly, not silently.
-    parseLimit("RUNE_WORKER_MAX_OWED_RETURNS",    cfg.workerMaxOwedReturns);
+    // F15 S3: owed-return cap.  Strict: any integer is kept as given and the
+    // [256, 8192] range is enforced at start() (Worker::validateRingConfig), so
+    // 0 / negative refuse loudly; a non-integer is a configuration error here.
+    if (const char* raw = getenv_fn("RUNE_WORKER_MAX_OWED_RETURNS"); raw && *raw) {
+        int32_t v{};
+        if (!parseInt32(raw, v))
+            return {{}, std::string("RUNE_WORKER_MAX_OWED_RETURNS is not a valid integer: ") + raw};
+        cfg.workerMaxOwedReturns = v;
+    }
 
     // RUNE_WORKER_ACK_SLOT_BYTES: return-ring reservation slot size for ProduceResult.
     if (const char* raw = getenv_fn("RUNE_WORKER_ACK_SLOT_BYTES")) {

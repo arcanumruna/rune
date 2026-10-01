@@ -859,6 +859,11 @@ private:
         // correct isolation is applied on the next duty cycle — no data loss, no
         // premature skip under a wrong isolation assumption.
         bool    groupCarrierReceived = false;
+        // F15 S3 re-review 1 I-4: the owning worker answered MessageTooLarge (a
+        // stored batch larger than its return ring).  The client got one
+        // non-retriable ErrorResponse; the subscription is parked (no further
+        // PushRead, no spin) until the client unsubscribes.
+        bool    failed = false;
     };
 
     // -----------------------------------------------------------------------

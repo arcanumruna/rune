@@ -82,8 +82,7 @@ void BrokerNode::start() {
     // halts the broker on every restart.  Also the owed-return cap range.
     if (auto err = Worker::validateRingConfig(
             static_cast<std::size_t>(config_.workerReturnRingBytes),
-            static_cast<std::size_t>(config_.workerIngressRingBytes), config_.shardMode(),
-            static_cast<std::size_t>(config_.aeronTermBufferBytes), config_.workerMaxOwedReturns);
+            static_cast<std::size_t>(config_.workerIngressRingBytes), config_.workerMaxOwedReturns);
         err.has_value()) {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
