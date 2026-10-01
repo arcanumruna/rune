@@ -369,3 +369,46 @@ TEST(InvokerTransport, FragmentedMessageStillReassemblesThroughTemplatePoll) {
     EXPECT_EQ(got, big);
     t.stop();
 }
+
+// ---------------------------------------------------------------------------
+// F8c C0: one pump owner, enforced structurally (no atomic).  The driver /
+// conductor of an invoker transport may be pumped by exactly one thread at a
+// time; a duty thread that takes over after a happens-before handoff binds
+// itself first (Client's runner does, at the top of runLoop()).
+// ---------------------------------------------------------------------------
+
+// A real second pumper — another thread calling dutyCycle() on a transport it
+// does not own — is caught deterministically in debug builds (abort), every
+// run, independent of timing.  RED on the parent: no owner check, no death.
+TEST(InvokerTransportDeathTest, SecondPumperThreadAbortsRegression) {
+#ifdef NDEBUG
+    GTEST_SKIP() << "the pump-owner check is a debug-build assertion";
+#else
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3120)};
+            t.start();                                  // this thread owns the pump
+            std::thread second([&t] { t.dutyCycle(); });  // never bound: a second pumper
+            second.join();
+        },
+        "pumped by a second thread");
+#endif
+}
+
+// The legitimate handoff: the owner starts the transport, a duty thread binds
+// itself and pumps it to ready, the owner joins it and stops (stop() rebinds
+// the caller for the final drain).  No violation, no abort.
+TEST(InvokerTransport, PumpOwnershipHandoffViaBindRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3121)};
+    t.start();
+    bool connected = false;
+    std::thread duty([&] {
+        t.bindPumpThread();
+        connected = pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); });
+    });
+    duty.join();
+    EXPECT_TRUE(connected);
+    t.stop();
+    EXPECT_EQ(t.callerPumpViolations(), 0);
+}

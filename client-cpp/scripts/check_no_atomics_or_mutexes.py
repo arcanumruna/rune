@@ -104,10 +104,6 @@ SLICE_B = {
         ("atomic", "std::atomic"): 1,
         ("include", "#include <atomic>"): 1,
     },
-    "include/rune/client/transport/AeronTransport.h": {
-        ("atomic", "std::atomic"): 3,
-        ("include", "#include <atomic>"): 1,
-    },
 }
 
 CHAR_PREFIXES = {"L", "u", "U", "u8"}

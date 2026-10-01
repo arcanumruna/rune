@@ -209,6 +209,13 @@ public:
     /// cross-thread stop signal (use the runner shutdown path or submitClose()).
     void stop() noexcept;
 
+    /// F8c C0: the calling thread becomes the single thread that drives this
+    /// agent's duty cycle (and so pumps the transport's driver/conductor in
+    /// invoker mode).  Call once at the top of a duty thread that takes over
+    /// after a happens-before handoff (the Thread-mode runner; the closing
+    /// thread after the join).  See AeronTransport::bindPumpThread().
+    void bindDutyThread() noexcept { transport_.bindPumpThread(); }
+
     // -------------------------------------------------------------------------
     // doWork — single-writer duty cycle
     // -------------------------------------------------------------------------

@@ -228,14 +228,24 @@ TEST(AeronTransport, DtorAfterStartWithoutStop) {
 // Regression (spec §3.6): a driver is driven by exactly one thread.  start()
 // used to pump aeron_driver_main_do_work() from the caller thread while the
 // driver thread was already running the same duty cycle.
+//
+// F8c C0 rewrite: deterministic, no sleeps.  The check no longer samples a flag
+// the driver thread shares (the old std::atomic driverRunning_, which only
+// caught a second pumper if the timing lined up); "the driver thread is live"
+// is now owner-thread state set BEFORE the launch and cleared AFTER the join,
+// so ANY caller pump in that window is counted, every run.  start() + stop()
+// back to back (no awaitConnected sleep loop) covers both pump sites: the
+// pre-launch priming in start() and the post-join drain in stop().
+// RED by mutation: priming after the launch -> 3 violations.
 // ---------------------------------------------------------------------------
 TEST(AeronTransportRegression, StartupPumpsDriverFromOneThreadOnlyRegression) {
     Transport t{makeLoopbackConfig(1010)};
     t.start();
+    ASSERT_TRUE(t.usesDriverThread());
     EXPECT_EQ(t.callerPumpViolations(), 0)
         << "start() pumped the driver from the caller thread while driverThread_ ran";
-    awaitConnected(t);
     t.stop();
+    EXPECT_FALSE(t.usesDriverThread()) << "stop() must join the driver thread";
     EXPECT_EQ(t.callerPumpViolations(), 0)
         << "stop() may drain the driver only after joining driverThread_";
 }

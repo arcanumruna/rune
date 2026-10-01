@@ -269,6 +269,10 @@ void Client::closeImpl_() {
     if (runnerThread_.joinable()) {
         runnerThread_.join();
     }
+    // F8c C0: no duty thread runs any more — this thread is the single pumper
+    // for whatever the teardown below drives (it is already the owner in
+    // Invoker mode, or the destroying thread in the off-owner-destroy pattern).
+    agent_.bindDutyThread();
 
     // Single-threaded from here.  Adopt registrations still sitting in the command
     // ring (producer()/transactionalProducer() whose registration no duty cycle has
@@ -777,6 +781,7 @@ int Client::producerDuty_(int64_t nowNs) {
 // ---------------------------------------------------------------------------
 
 void Client::runLoop() {
+    agent_.bindDutyThread();  // F8c C0: the runner is now the single pumper
     if (cfg_.runnerCore >= 0 && !detail::pinCurrentThreadToCore(cfg_.runnerCore)) {
         std::fprintf(stderr, "rune-client: could not pin the runner to core %d\n", cfg_.runnerCore);
     }
