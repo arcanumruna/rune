@@ -156,19 +156,15 @@ Client::Client(ClientConfig cfg)
 
     // Shared-nothing producer registration: the duty-cycle thread drains a
     // kMsgRegisterProducer command and lands here, adopting the producer into the
-    // single-owner ProducerHub list.  `holder` is a heap shared_ptr<ProducerImpl>*
-    // created by Client::producer(); we move the shared_ptr out and free the holder.
-    agent_.setProducerRegisterFn([this](void* holder) {
-        auto* sp = static_cast<std::shared_ptr<producer::ProducerImpl>*>(holder);
-        producerHub_.add(std::move(*sp));
-        delete sp;
+    // single-owner ProducerHub list.  F8c C7: the record carries the impl itself
+    // (no shared_ptr holder) — from here the duty side holds its share (§3.3).
+    agent_.setProducerRegisterFn([this](void* impl) {
+        producerHub_.add(static_cast<producer::ProducerImpl*>(impl));
     });
     // Same hand-off for transactional producers (was a mutex-guarded vector that
     // the runner locked and copied every duty cycle).
-    agent_.setTxnProducerRegisterFn([this](void* holder) {
-        auto* sp = static_cast<std::shared_ptr<producer::TransactionalProducerImpl>*>(holder);
-        txnProducers_.push_back(std::move(*sp));
-        delete sp;
+    agent_.setTxnProducerRegisterFn([this](void* impl) {
+        txnProducers_.push_back(static_cast<producer::TransactionalProducerImpl*>(impl));
         agent_.setForwardProduceResponses(true);  // txn producers consume raw ProduceResponses
     });
 
@@ -181,6 +177,7 @@ Client::Client(ClientConfig cfg)
     ctlScratch_.reserve(512);
     cqSlots_.reserve(kMaxCqs);
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
+    releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
     groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
     // F8c C4: commitSync completions go through the completion-queue registry.
     groupConsumerHub_.setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
@@ -253,18 +250,44 @@ Client::~Client() {
 // close() — idempotent shutdown
 // ---------------------------------------------------------------------------
 
-void Client::close() {
+void Client::checkCloseCaller_(const char* what) const {
     if (cfg_.runnerMode == RunnerMode::Invoker) {
         // Cold-path contract checks, enforced in release builds too.
         if (std::this_thread::get_id() != ownerThread_) [[unlikely]] {
-            throw std::logic_error("Client::close(): Invoker mode — call from the owner thread");
+            throw std::logic_error(std::string(what) + ": Invoker mode — call from the owner thread");
         }
         if (inDutyCycle_) [[unlikely]] {
-            throw std::logic_error(
-                "Client::close(): called from a duty-cycle callback (would tear the agent "
-                "down under its own poll)");
+            throw std::logic_error(std::string(what) +
+                                   ": called from a duty-cycle callback (would tear the agent "
+                                   "down under its own poll)");
+        }
+    } else if (std::this_thread::get_id() == dutyThreadId_ && !agent_.commandRingClosed()) [[unlikely]] {
+        throw std::logic_error(std::string(what) +
+                               ": called from a runner callback (it would join its own thread)");
+    }
+}
+
+void Client::close() {
+    checkCloseCaller_("Client::close()");
+    // F8c C7 (user decision 2): drain every producer (and close every
+    // transactional producer) first — one token for all of them, waited for
+    // like the *AndWait sugar — then tear down.  Each drain is bounded by its
+    // own deadline (deliveryTimeoutMs / transactionOpTimeoutMs).
+    if (!agent_.commandRingClosed()) {
+        try {
+            andWait_("Client::close()", std::chrono::hours(24 * 365 * 100), 0,
+                     [this](Completions& q, Token t) { return issueDrain_(q, t); },
+                     [](const Completion&, std::span<const uint8_t>) {});
+        } catch (const std::runtime_error&) {
+            // Another thread closed the Client meanwhile (its close completes
+            // everything): nothing left to drain.
         }
     }
+    closeImpl_();
+}
+
+void Client::closeImmediately() {
+    checkCloseCaller_("Client::closeImmediately()");
     closeImpl_();
 }
 
@@ -300,7 +323,7 @@ void Client::closeImpl_() {
     } closingMark(this);
 
     // Single-threaded from here.  Drain the command ring up to its (now frozen)
-    // tail: registrations are adopted (their holders freed, the failAll below
+    // tail: registrations are adopted (the hubs hold their share; the failAll below
     // reaches them), hub commands applied, completion queues added / released,
     // and every accepted control op completes — Closed (closing_).
     (void)agent_.drainRegistrationsForClose();
@@ -311,7 +334,7 @@ void Client::closeImpl_() {
 
     // fix1 C2/I3: mark every producer's ring closed NOW — the Client (and its
     // pump-hook contexts, each `this`) is still fully valid, and this runs
-    // before the transport is torn down. A Producer whose shared_ptr the app
+    // before the transport is torn down. A Producer handle the app
     // kept past this point then gets SendResult::Closed, never touching the
     // (by-then-dangling) pump hook: no use-after-free, no silent accept.
     producerHub_.closeAllRings();
@@ -345,7 +368,7 @@ void Client::closeImpl_() {
     // producer's status channel is finished, so later operations are rejected
     // Closed at once, never hang.  No lock: the runner was joined above
     // (Thread mode) or this is the owner thread (Invoker mode).
-    for (auto& tp : txnProducers_) {
+    for (producer::TransactionalProducerImpl* tp : txnProducers_) {
         tp->failAll();
     }
 
@@ -375,7 +398,22 @@ void Client::closeImpl_() {
     // during close is dropped.  A queue released by user code that this close
     // runs (above) was freed directly (tClosing, I1), never waited on.
     failAllControl_(OpStatus::Closed);
+    // F8c C7: a Client::close() drain still pending (another thread's close
+    // won, or this is the destructor) completes Closed, exactly once.
+    for (const DrainWaiter& w : drainWaiters_) {
+        Completion c;
+        c.token  = w.token;
+        c.op     = OpKind::ClientDrain;
+        c.status = OpStatus::Closed;
+        deliver_(w.target, c, {});
+    }
+    drainWaiters_.clear();
     closeCqRegistry_();
+    // F8c C7 (§3.3 (b)): every handle impl the hubs still hold is handed back
+    // — the duty side detaches its share (the handle frees it on release, or
+    // it is freed here if its handle already let go).  After every hub
+    // finished (above), before the command ring's consumer-finished word.
+    handBackAll_();
     // I2: nothing reads the command ring any more — even if the drain above
     // was abandoned behind an orphaned claim.  A Completions constructor still
     // waiting for a CqAdd stranded there sees this and is born finished.
@@ -811,7 +849,8 @@ OpResult Client::targetedOpTrampoline_(void* ctx, detail::HubCommand& cmd, const
     return static_cast<Client*>(ctx)->issueTargeted_(cmd, target, token, op);
 }
 
-OpResult Client::issueTargeted_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op) {
+OpResult Client::issueTargeted_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op,
+                                bool viaRing) {
     if (token > kMaxToken) return OpResult::InvalidArgument;
     if (target.cq == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
     const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
@@ -841,7 +880,7 @@ OpResult Client::issueTargeted_(detail::HubCommand& cmd, const CompletionTarget&
     // The duty thread itself (the Invoker owner — in or outside a cycle — or
     // a Thread-mode runner callback): the state is ours, apply now (the
     // command is pinned and owned before this returns; nothing is queued).
-    if (onDuty) {
+    if (onDuty && !viaRing) {
         applyHubCommandDirect_(cmd);
         return OpResult::Accepted;
     }
@@ -1418,6 +1457,12 @@ int Client::dutyCycle(int64_t nowNs) {
         sweepTimeouts(nowNs);
         nextSweepNs_ = nowNs + kSweepIntervalMs * 1'000'000LL;
     }
+
+    // 5. F8c C7: Client::close()'s drain, then handle releases — at the very
+    //    end of the cycle, outside every hub walk (a released impl is freed
+    //    only once nothing references it: never under a running handler).
+    if (!drainWaiters_.empty()) [[unlikely]] work += checkDrain_();
+    if (!releases_.empty()) [[unlikely]] work += reapReleases_();
     return work;
 }
 
@@ -2227,8 +2272,10 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
     // ProducerImpl owns its own ring buffer (its batch correlation ids are
-    // self-tagged — batchcorr — so it takes no shared counter).
-    auto impl = std::make_shared<producer::ProducerImpl>(cfg, ringCap);
+    // self-tagged — batchcorr — so it takes no shared counter).  F8c C7: held
+    // here until the registration is accepted (then the duty side holds its
+    // share and the handle the other — spec §3.3).
+    auto impl = std::make_unique<producer::ProducerImpl>(cfg, ringCap);
 
     // fix1 C1: wire the pump hook in BOTH runner modes — a back-pressured
     // blocking send() must never wait on a ring consumer that IS the calling
@@ -2254,6 +2301,7 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
         hk.sink       = detail::CompletionSink{&Client::deliverTrampoline_, this};
         hk.issueClose = &Client::issueProducerCloseTrampoline_;
         hk.andWait    = &Client::andWaitTrampoline_;
+        hk.release    = &Client::hubCommandTrampoline_;  // C7: HandleRelease
         impl->setHooks(hk);
     }
 
@@ -2281,30 +2329,27 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
     // directly (which would need an atomic snapshot + mutex), hand the ProducerImpl
     // to the runner thread via the agent command ring.  The runner drains
     // kMsgRegisterProducer and calls producerHub_.add() itself, so the list stays
-    // single-owner (no atomic, no lock).  `impl` is copied into a heap holder whose
-    // address travels the ring; the runner adopts the shared_ptr and frees the
-    // holder.  Both `impl` (returned to the caller) and the hub's entry keep the
-    // ProducerImpl alive.  Retry on a transiently full ring (off the hot path).
-    // Bounded setup-phase submit; in Invoker mode the duty cycle runs between
-    // attempts (this thread is the ring's only consumer).
-    auto* holder = new std::shared_ptr<producer::ProducerImpl>(impl);
+    // single-owner (no atomic, no lock).  F8c C7: the impl's own address travels
+    // the ring (no shared_ptr holder): the hub holds the duty share, the returned
+    // handle the other; whichever lets go last frees it (§3.3).  Retry on a
+    // transiently full ring (off the hot path).  Bounded setup-phase submit; in
+    // Invoker mode the duty cycle runs between attempts (this thread is the
+    // ring's only consumer).
     // F8c C2: the submit is linearized against close() by the command ring's
     // closed bit (no post-submit stopped_ CAS, no indeterminate ownership):
     //   * accepted — before the close: the duty cycle, or close()'s final
-    //     drain (which reads up to the frozen tail), adopts it and frees the
-    //     holder; close() then marks its ring closed with every other one;
-    //   * refused as Closed (close() raced this call) — never written: free
-    //     the holder here and hand back a producer whose ring is closed (every
-    //     send reports Closed), as the fix3 race path did.
+    //     drain (which reads up to the frozen tail), adopts it; close() then
+    //     marks its ring closed with every other one and hands it back;
+    //   * refused as Closed (close() raced this call) — never written: the
+    //     producer is born closed (every send reports Closed; the handle
+    //     alone owns it).
     // (Closed on entry still throws logic_error("client closed") from
-    // submitRegistration_, as before.)
-    if (!submitRegistration_([&] { return agent_.submitRegisterProducer(holder); },
-                             [&] { delete holder; })) {
-        delete holder;
-        impl->markRingClosed();
+    // submitRegistration_, as before — the unique_ptr frees the impl.)
+    producer::ProducerImpl* raw = impl.get();
+    if (!submitRegistration_([&] { return agent_.submitRegisterProducer(raw); }, [] {})) {
+        impl->markBornClosed();
     }
-
-    return Producer(std::move(impl));
+    return Producer(impl.release());
 }
 
 OpResult Client::issueProducerCloseTrampoline_(void* ctx, producer::ProducerImpl& impl,
@@ -2395,6 +2440,252 @@ void Client::applyProducerCommand_(const detail::HubCommand& cmd) {
     impl->applyCloseImmediately(OpStatus::Closed);
 }
 
+// ---------------------------------------------------------------------------
+// F8c C7: handle release (spec §3.3) — no shared_ptr, no refcount, no waits
+// ---------------------------------------------------------------------------
+//
+// Every handle impl (Producer / TransactionalProducer / Subscription /
+// GroupConsumer) is owned jointly by its handle and the duty side.  Each side
+// detaches its share of the impl's ownership word (a ring word) exactly once;
+// whichever detaches LAST frees the impl.  The duty side detaches when it
+// reaps a released impl that nothing references any more (end of a duty
+// cycle), or when Client close hands every still-held impl back.
+
+detail::HubSubmit Client::submitRelease_(const detail::HubCommand& cmd) {
+    // I1: this thread runs this Client's close(): it owns every duty structure
+    // (the drain, the hub teardown and the hand-back are its own work).
+    if (tClosing == this) {
+        applyRelease_(cmd, 0, /*closing=*/true);
+        return detail::HubSubmit::Accepted;
+    }
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker || onDuty) {
+        // Invoker mode: duty work on whichever thread (the owner, or the
+        // off-owner destroy pattern: same contract as doWork(), never
+        // concurrently with doWork()/close() elsewhere) — never a ring nobody
+        // drains.  Thread-mode runner (a callback): the duty state is ours
+        // until close() joins this thread, even once it closed the ring.
+        if (cfg_.runnerMode == RunnerMode::Invoker && agent_.commandRingClosed()) {
+            return detail::HubSubmit::Closed;  // closed: the hand-back owns it
+        }
+        // I3': ops of this handle may still sit in the command ring (issued
+        // off this thread, or past a bounded drain): its impl is not forgotten
+        // before the drain passed them (the current tail is a safe fence).
+        applyRelease_(cmd, agent_.commandRingTail(), /*closing=*/false);
+        return detail::HubSubmit::Accepted;
+    }
+    // Any other thread: a lifecycle command — guaranteed delivery (a full
+    // ring is waited out on the runner's progress), FIFO behind this handle's
+    // own ops.  Closed: close() is in progress elsewhere and hands it back.
+    aeron::concurrent::BackoffIdleStrategy idle(
+        10, 20, std::chrono::duration<long, std::nano>(1'000),
+        std::chrono::duration<long, std::nano>(100'000));
+    for (;;) {
+        const auto r = agent_.submitHubCommand(cmd);
+        if (r == agent::ClientAgent::Submit::Accepted) return detail::HubSubmit::Accepted;
+        if (r == agent::ClientAgent::Submit::Closed) return detail::HubSubmit::Closed;
+        if (testHubCommandRingFullHook_) [[unlikely]] testHubCommandRingFullHook_();
+        idle.idle(0);
+    }
+}
+
+void Client::applyRelease_(const detail::HubCommand& cmd, std::int64_t fence, bool closing) {
+    using K = detail::HandleKind;
+    const auto kind = static_cast<K>(cmd.a);
+    void* const impl = reinterpret_cast<void*>(static_cast<uintptr_t>(cmd.handle));
+    // The handle's destructor semantics.  During close() (`closing`) the close
+    // path finishes every producer / txn producer itself (closeFinal /
+    // failAll, before or after this point); subscriptions and consumers are
+    // finished locally here so no further callback reaches a destroyed handle.
+    switch (kind) {
+    case K::Producer:
+        if (!closing) static_cast<producer::ProducerImpl*>(impl)->applyHandleRelease();
+        break;
+    case K::TxnProducer:
+        if (!closing) static_cast<producer::TransactionalProducerImpl*>(impl)->applyHandleRelease();
+        break;
+    case K::Subscription: {
+        auto* sub = static_cast<SubscriptionImpl*>(impl);
+        if (closing) {
+            if (sub->active) subscriberHub_.finishLocal(*sub);
+        } else {
+            detail::HubCommand u;
+            u.op     = detail::HubCommand::Op::Unsubscribe;
+            u.handle = cmd.handle;
+            applyHubCommandDirect_(u);  // the impl is alive: the duty share is still held
+        }
+        break;
+    }
+    case K::GroupConsumer: {
+        auto* gc = static_cast<GroupConsumerImpl*>(impl);
+        if (closing) {
+            if (gc->active) groupConsumerHub_.finishLocal(*gc);
+        } else {
+            detail::HubCommand g;
+            g.op     = detail::HubCommand::Op::GroupClose;
+            g.handle = cmd.handle;
+            groupConsumerHub_.applyCommandDirect(g, now());
+        }
+        break;
+    }
+    }
+    // Reserved in the constructor; a burst beyond it allocates (cold path).
+    try {
+        releases_.push_back(PendingRelease{kind, impl, fence});
+    } catch (...) {
+        // Out of memory: the impl stays with the duty side until close hands it back.
+    }
+}
+
+int Client::reapReleases_() noexcept {
+    using K = detail::HandleKind;
+    const std::int64_t head = agent_.commandRingHead();
+    int n = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < releases_.size(); ++i) {
+        const PendingRelease r = releases_[i];
+        bool done = false;
+        if (head >= r.fence) {
+            switch (r.kind) {
+            case K::Producer: {
+                auto* p = static_cast<producer::ProducerImpl*>(r.impl);
+                if (p->releasable()) {
+                    producerHub_.remove(p);
+                    if (p->detachDuty()) delete p;  // the handle let go first
+                    done = true;
+                }
+                break;
+            }
+            case K::TxnProducer: {
+                auto* t = static_cast<producer::TransactionalProducerImpl*>(r.impl);
+                if (t->closedDuty()) {
+                    std::erase(txnProducers_, t);
+                    if (t->status.detachProducer()) delete t;
+                    done = true;
+                }
+                break;
+            }
+            case K::Subscription: {
+                auto* sub = static_cast<SubscriptionImpl*>(r.impl);
+                if (subscriberHub_.release(sub)) {
+                    if (sub->status.detachProducer()) delete sub;
+                    done = true;
+                }
+                break;
+            }
+            case K::GroupConsumer: {
+                auto* gc = static_cast<GroupConsumerImpl*>(r.impl);
+                if (groupConsumerHub_.release(gc)) {
+                    if (gc->status.detachProducer()) delete gc;
+                    done = true;
+                }
+                break;
+            }
+            }
+        }
+        if (done) ++n;
+        else releases_[keep++] = r;
+    }
+    releases_.resize(keep);
+    return n;
+}
+
+void Client::handBackAll_() noexcept {
+    // Released impls are in the hubs' lists too (forgotten only by a reap).
+    releases_.clear();
+    uint64_t n = 0;
+    producerHub_.handBackAll([&n](producer::ProducerImpl* p) noexcept {
+        ++n;
+        if (p->detachDuty()) delete p;
+    });
+    std::vector<producer::TransactionalProducerImpl*> txns;
+    txns.swap(txnProducers_);
+    for (producer::TransactionalProducerImpl* t : txns) {
+        ++n;
+        if (t->status.detachProducer()) delete t;
+    }
+    subscriberHub_.handBackAll([&n](SubscriptionImpl* sub) noexcept {
+        ++n;
+        if (sub->status.detachProducer()) delete sub;
+    });
+    groupConsumerHub_.handBackAll([&n](GroupConsumerImpl* gc) noexcept {
+        ++n;
+        if (gc->status.detachProducer()) delete gc;
+    });
+    implsHandedBack_ += n;
+    // A free above may have destroyed a user callable that owned another
+    // handle; its release (this closing thread) queued an entry for an impl
+    // the hand-back then let go: the list is dead state now.
+    releases_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// F8c C7: Client::close()'s drain (user decision 2)
+// ---------------------------------------------------------------------------
+
+OpResult Client::issueDrain_(Completions& q, Token token) {
+    detail::HubCommand cmd;
+    cmd.op = detail::HubCommand::Op::ClientDrain;
+    // Always through the ring (also on the Invoker owner): applied after every
+    // registration accepted before it, so a producer created just before
+    // close() is drained too, not only failed by the teardown.
+    return issueTargeted_(cmd, CompletionTarget(q), token, OpKind::ClientDrain, /*viaRing=*/true);
+}
+
+void Client::drainPartDone_(void*, const Completion&, std::span<const uint8_t>) noexcept {
+    // A producer's / txn producer's internal close token: its outcome is its
+    // records' own (each completed with its own status); checkDrain_ decides.
+}
+
+void Client::applyClientDrain_(const detail::HubCommand& cmd) {
+    detail::HubCommand pinned = cmd;
+    pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+    DrainWaiter w;
+    w.target = detail::decodeTarget(pinned);
+    w.token  = static_cast<Token>(cmd.a);
+    drainWaiters_.push_back(w);  // cold: one per close() call
+    (void)checkDrain_();
+}
+
+int Client::checkDrain_() {
+    // Begin-close every open producer and close every transactional producer
+    // (also ones registered after the drain began); settled once none is open
+    // or draining / closing.  Each settles within its own deadline.
+    const CompletionHandler internal{&Client::drainPartDone_, nullptr};
+    const int64_t t = now();
+    bool settled = true;
+    producerHub_.forEach([&](producer::ProducerImpl& p) {
+        // closeIntake() lost: another closer (a begin-close / closeImmediately
+        // still in the command ring) owns this producer's close — wait for it.
+        if (p.lifeOpen() && p.closeIntake()) {
+            detail::OpTarget tgt;
+            tgt.handler = internal;
+            p.applyBeginClose(tgt, 0, t);
+        }
+        if (p.lifeOpen() || p.draining()) settled = false;
+    });
+    for (std::size_t i = 0; i < txnProducers_.size(); ++i) {  // a handler may register one
+        producer::TransactionalProducerImpl* tp = txnProducers_[i];
+        if (tp->closedDuty()) continue;
+        if (!tp->closingDuty()) {
+            detail::OpTarget tgt;
+            tgt.handler = internal;
+            tp->beginClose(tgt, 0, t);
+        }
+        if (!tp->closedDuty()) settled = false;
+    }
+    if (!settled) return 0;
+    std::vector<DrainWaiter> ws;
+    ws.swap(drainWaiters_);
+    for (const DrainWaiter& w : ws) {
+        Completion c;
+        c.token = w.token;
+        c.op    = OpKind::ClientDrain;
+        deliver_(w.target, c, {});
+    }
+    return static_cast<int>(ws.size());
+}
+
 producer::PumpResult Client::pumpTrampoline_(void* ctx) {
     auto* self = static_cast<Client*>(ctx);
     // fix2 Important-2: ProducerImpl::sendBlocking only ever calls this hook
@@ -2463,7 +2754,9 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     // to the duty thread); every other field is duty-thread owned from then on.
     // F8c C3: the correlationId (and the frame's sessionId) are assigned by the
     // duty thread when it adopts the request — no app-thread counter / snapshot.
-    auto impl = std::make_shared<SubscriptionImpl>();
+    // F8c C7: held here until the SubscribeAdd is accepted; then the duty side
+    // holds its share (from adoption) and the handle the other (§3.3).
+    auto impl = std::make_unique<SubscriptionImpl>();
     impl->topicId       = topic.topicId;
     impl->partition     = partition;
     impl->handler       = std::move(handler);
@@ -2476,7 +2769,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     // F8a: encode on this thread (pure), then hand the request to the duty
     // thread, which registers it as pending and sends the Subscribe frame.
     auto req = subscriber::SubscriberHub::makeSubscribeRequest(
-        impl, /*sessionId (stamped on adoption)=*/0, partitionKnown, opts.from.toWire(),
+        impl.get(), /*sessionId (stamped on adoption)=*/0, partitionKnown, opts.from.toWire(),
         static_cast<uint8_t>(opts.isolation), keyBytes, subscribeDL);
     // F8a fix4 M1: a Subscribe frame no ingress publication can carry fails
     // HERE, synchronously — it never reaches the duty thread (where it could
@@ -2496,11 +2789,12 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         (void)req.release();      // the duty thread owns it now
         break;
     case detail::HubSubmit::Closed:
-        impl->status.abandon();   // never submitted (req freed): born finished
+        impl->status.abandon();         // never submitted (req freed): born finished
+        (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
     }
 
-    return Subscription(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_());
+    return Subscription(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_());
 }
 
 // ---------------------------------------------------------------------------
@@ -2575,6 +2869,12 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
     case Op::ProducerCloseNow:
         applyProducerCommand_(cmd);
         return;
+    case Op::HandleRelease:  // F8c C7: via the ring — FIFO behind the handle's own ops
+        applyRelease_(cmd, 0, closing_);
+        return;
+    case Op::ClientDrain:    // F8c C7: Client::close()
+        applyClientDrain_(cmd);
+        return;
     case Op::ClientSetCallback:
         applySetCallback_(static_cast<int>(cmd.a), reinterpret_cast<void*>(cmd.handle));
         return;
@@ -2617,6 +2917,9 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
 detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubCommand& cmd) {
     using Op = detail::HubCommand::Op;
     auto* self = static_cast<Client*>(ctx);
+    // F8c C7: a handle's §3.3 release has its own routing (closer thread,
+    // duty work, or the ring) — decided before the closed-ring check.
+    if (cmd.op == Op::HandleRelease) return self->submitRelease_(cmd);
     const bool onDuty = std::this_thread::get_id() == self->dutyThreadId_;
 
     // F8c C4: GroupCommitSync is a token op (targetedOpTrampoline_), never
@@ -2631,7 +2934,8 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
                    cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
-                   cmd.op == Op::GroupCommit || cmd.op == Op::TxnBegin || cmd.op == Op::TxnSend)) {
+                   cmd.op == Op::GroupCommit || cmd.op == Op::TxnBegin || cmd.op == Op::TxnSend ||
+                   cmd.op == Op::TxnCloseNow)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
     }
@@ -2692,7 +2996,7 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
             "(Multi-group per connection is deferred to CG-6.)");
     }
 
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();  // C7: see subscribeImpl
     impl->groupId = std::move(groupId);
     impl->cfg     = cfg;
 
@@ -2709,29 +3013,22 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
     impl->state = GroupConsumerState::Unjoined;
 
     // F8a: register through the agent ring — the duty thread adopts the impl
-    // into the single-owner hub list and frees the holder.
-    auto* holder = new std::shared_ptr<GroupConsumerImpl>(impl);
+    // into the single-owner hub list.  F8c C7: the impl's own address (no
+    // shared_ptr holder); a throw before the submit frees it here.
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::GroupAdd;
-    cmd.handle = reinterpret_cast<uint64_t>(holder);
-    detail::HubSubmit r = detail::HubSubmit::Closed;
-    try {
-        r = hubCommandTrampoline_(this, cmd);
-    } catch (...) {
-        delete holder;  // never submitted
-        throw;
-    }
-    switch (r) {
+    cmd.handle = reinterpret_cast<uint64_t>(impl.get());
+    switch (hubCommandTrampoline_(this, cmd)) {
     case detail::HubSubmit::Accepted:
         groupSubscribed_ = true;
         break;
     case detail::HubSubmit::Closed:
-        delete holder;            // never submitted
-        impl->status.abandon();   // born finished
+        impl->status.abandon();               // never submitted: born finished
+        (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
     }
 
-    return GroupConsumer(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
+    return GroupConsumer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
                          &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
 }
 
@@ -2744,7 +3041,7 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
 {
     // nextCorrId_ is duty-owned: the txn producer only draws ids on the duty
     // thread (doWork / response handlers), so it shares the plain counter.
-    auto impl = std::make_shared<producer::TransactionalProducerImpl>(
+    auto impl = std::make_unique<producer::TransactionalProducerImpl>(  // C7: see producer()
         transactionalId,
         cfg,
         nextCorrId_);
@@ -2757,16 +3054,16 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
     // Shared-nothing registration through the agent ring (like producer()): the
     // duty-cycle thread adopts it into txnProducers_ — no mutex, no per-cycle copy.
     // F8c C2: linearized against close() by the ring (see producerWithRingCap_):
-    // Closed = never written — free the holder and abandon the producer's
-    // status channel so every later operation is rejected Closed at once
-    // instead of queueing work no duty cycle will ever process.
-    auto* holder = new std::shared_ptr<producer::TransactionalProducerImpl>(impl);
-    if (!submitRegistration_([&] { return agent_.submitRegisterTxnProducer(holder); },
-                             [&] { delete holder; })) {
-        delete holder;
+    // Closed = never written — the producer is born closed: its status channel
+    // abandoned (every later operation is rejected Closed at once instead of
+    // queueing work no duty cycle will ever process) and the duty share
+    // detached (F8c C7: the handle alone owns and frees it).
+    producer::TransactionalProducerImpl* raw = impl.get();
+    if (!submitRegistration_([&] { return agent_.submitRegisterTxnProducer(raw); }, [] {})) {
         impl->status.abandon();
+        (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
     }
-    return TransactionalProducer(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
+    return TransactionalProducer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
                                  &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
 }
 
@@ -2933,8 +3230,8 @@ void Client::rediscoverTrampoline_(void* ctx) noexcept {
 }
 
 producer::TransactionalProducerImpl* Client::findTxn_(uint64_t handle) const noexcept {
-    for (const auto& tp : txnProducers_) {
-        if (reinterpret_cast<uint64_t>(tp.get()) == handle) return tp.get();
+    for (producer::TransactionalProducerImpl* tp : txnProducers_) {
+        if (reinterpret_cast<uint64_t>(tp) == handle) return tp;
     }
     return nullptr;
 }
@@ -2944,7 +3241,9 @@ void Client::applyTxnCommand_(const detail::HubCommand& cmd, bool direct) {
     detail::HubCommand c = cmd;
     // I3: a token op's target is pinned when it is applied (before anything
     // can complete it).  Begin / Send carry no target.
-    if (c.op == Op::TxnInit || c.op == Op::TxnSendOffsets || c.op == Op::TxnEnd) pinCommandTarget_(c);
+    if (c.op == Op::TxnInit || c.op == Op::TxnSendOffsets || c.op == Op::TxnEnd || c.op == Op::TxnClose) {
+        pinCommandTarget_(c);
+    }
     // Ring path: resolve the identity against the duty-owned list (never
     // dereference an unknown one).  Direct path: the caller's handle holds
     // the impl for the whole call (it may still be awaiting adoption).

@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <utility>
 
 namespace rune::client::producer {
@@ -73,6 +74,10 @@ TransactionalProducerImpl::TransactionalProducerImpl(
     reqs_.reserve(16);
 }
 
+TransactionalProducerImpl::~TransactionalProducerImpl() {
+    if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::TxnProducer, this);
+}
+
 // ---------------------------------------------------------------------------
 // Commands (duty thread)
 // ---------------------------------------------------------------------------
@@ -80,7 +85,8 @@ TransactionalProducerImpl::TransactionalProducerImpl(
 bool TransactionalProducerImpl::isTxnOp(detail::HubCommand::Op op) noexcept {
     using Op = detail::HubCommand::Op;
     return op == Op::TxnInit || op == Op::TxnBegin || op == Op::TxnSend ||
-           op == Op::TxnSendOffsets || op == Op::TxnEnd;
+           op == Op::TxnSendOffsets || op == Op::TxnEnd || op == Op::TxnClose ||
+           op == Op::TxnCloseNow;
 }
 
 void TransactionalProducerImpl::discardCommand(const detail::HubCommand& cmd,
@@ -102,6 +108,11 @@ void TransactionalProducerImpl::discardCommand(const detail::HubCommand& cmd,
         break;
     case Op::TxnInit:
         break;
+    case Op::TxnClose:
+        kind = OpKind::TxnClose;
+        break;
+    case Op::TxnCloseNow:
+        return;
     default:
         return;
     }
@@ -125,11 +136,24 @@ void TransactionalProducerImpl::refuse_(const detail::HubCommand& cmd, OpKind ki
 
 void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int64_t nowNs) {
     using Op = detail::HubCommand::Op;
+    if (cmd.op == Op::TxnCloseNow) {  // F8c C7: closeImmediately (idempotent)
+        failAll();
+        return;
+    }
     if (closed_) {
         discardCommand(cmd, completions_);
         return;
     }
     lastNowNs_ = nowNs;
+    if (cmd.op == Op::TxnClose) {  // F8c C7
+        beginClose(detail::decodeTarget(cmd), static_cast<Token>(cmd.a), nowNs);
+        return;
+    }
+    if (closingDuty()) {
+        // Closing: no new work (Kafka: no operation after close()).
+        discardCommand(cmd, completions_);
+        return;
+    }
     const uint16_t kStateErr = static_cast<uint16_t>(kInvalidTxnState);
     // FatalError is terminal: every op completes Fenced, nothing is sent.
     if (const auto* f = std::get_if<SFatalError>(&state_)) {
@@ -340,6 +364,25 @@ void TransactionalProducerImpl::eraseReqsOf_(uint64_t opId) noexcept {
 }
 
 void TransactionalProducerImpl::complete_(UserOp& op, OpStatus st, uint16_t errorCode, std::string_view text) {
+    if (op.internal) {
+        // F8c C7: the close's own abort — its outcome is the close's, never
+        // delivered on its own.  Aborts that joined it are delivered as usual.
+        if (auto* cl = std::get_if<LifeClosing>(&life_); cl != nullptr && cl->abortOpId == op.id) {
+            cl->abortDone   = true;
+            cl->abortStatus = st;
+            cl->abortCode   = errorCode;
+        }
+        Completion j;
+        j.op        = OpKind::AbortTransaction;
+        j.status    = st;
+        j.errorCode = errorCode;
+        const std::span<const uint8_t> payload(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+        for (const auto& [target, token] : op.joiners) {
+            j.token = token;
+            completions_.deliver(target, j, payload);
+        }
+        return;
+    }
     Completion c;
     c.token     = op.token;
     c.op        = op.kind;
@@ -781,7 +824,12 @@ void TransactionalProducerImpl::sweep_(int64_t nowNs) {
 }
 
 int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
-    if (closed_ || std::holds_alternative<SFatalError>(state_)) return 0;
+    if (closed_) return 0;
+    if (closingDuty()) [[unlikely]] {
+        closeStep_(nowNs);  // may close the producer
+        if (closed_) return 1;
+    }
+    if (std::holds_alternative<SFatalError>(state_)) return 0;
     lastNowNs_ = nowNs;
     int work = 0;
     if (statusDirty_) [[unlikely]] publishStatus_();  // a snapshot the ring refused: retried
@@ -845,6 +893,11 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
 
     // TX-6: EndTxn once the data settled (may add the EndTxn request).
     gateEndTxn_(nowNs);
+    // F8c C7: a close whose abort just ended locally completes in this cycle.
+    if (closingDuty()) [[unlikely]] {
+        closeStep_(nowNs);
+        if (closed_) return work + 1;
+    }
 
     if (sessionId == 0) return work;
 
@@ -1103,6 +1156,10 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
 void TransactionalProducerImpl::failAll() {
     if (closed_) return;
     closed_ = true;
+    // F8c C7: a pending close token completes Closed — after every op.
+    std::optional<LifeClosing> closing;
+    if (auto* cl = std::get_if<LifeClosing>(&life_)) closing = *cl;
+    life_ = LifeOpen{};
     reqs_.clear();
     batches_.clear();
     dropWaiting_();
@@ -1117,6 +1174,139 @@ void TransactionalProducerImpl::failAll() {
     std::vector<UserOp> ops = std::move(ops_);
     ops_.clear();
     for (UserOp& op : ops) complete_(op, OpStatus::Closed);
+    if (closing) {
+        Completion c;
+        c.token  = closing->token;
+        c.op     = OpKind::TxnClose;
+        c.status = OpStatus::Closed;
+        completions_.deliver(closing->target, c);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F8c C7: close — abort an open broker transaction first, then close
+// ---------------------------------------------------------------------------
+
+void TransactionalProducerImpl::beginClose(const detail::OpTarget& target, Token token, int64_t nowNs) {
+    if (closed_ || closingDuty()) {
+        // A second close (or one after closeImmediately): exactly one
+        // completion, Closed — the first close owns the outcome.
+        Completion c;
+        c.token  = token;
+        c.op     = OpKind::TxnClose;
+        c.status = OpStatus::Closed;
+        completions_.deliver(target, c);
+        return;
+    }
+    LifeClosing cl;
+    cl.target     = target;
+    cl.token      = token;
+    cl.deadlineNs = opDeadline_(nowNs);
+    life_         = cl;
+    closeStep_(nowNs);
+}
+
+uint64_t TransactionalProducerImpl::startCloseAbort_(int64_t nowNs) {
+    UserOp op;
+    op.id         = nextOpId_++;
+    op.kind       = OpKind::AbortTransaction;
+    op.internal   = true;
+    op.deadlineNs = opDeadline_(nowNs);
+    op.phase      = UserOp::AwaitData{};  // EndTxn once the data settled (TX-6)
+    const uint64_t id = op.id;
+    if (auto* a = std::get_if<SAborting>(&state_)) {
+        if (a->opId != 0) return 0;      // an abort is already running: wait for it
+        ops_.push_back(std::move(op));   // B-2: the in-doubt abort is retried
+        a->opId = id;
+    } else if (const auto* it = std::get_if<SInTransaction>(&state_)) {
+        SAborting next;
+        next.opId         = id;
+        next.started      = it->started;
+        next.maybeStarted = it->maybeStarted;
+        ops_.push_back(std::move(op));
+        dropWaiting_();  // aborted records are never produced
+        state_ = next;
+    } else if (const auto* ae = std::get_if<SAbortableError>(&state_)) {
+        SAborting next;
+        next.opId         = id;
+        next.started      = ae->started;
+        next.bumpEpoch    = ae->bumpEpoch;
+        next.maybeStarted = ae->maybeStarted;
+        ops_.push_back(std::move(op));
+        dropWaiting_();
+        state_ = next;
+    } else {
+        return 0;
+    }
+    publishStatus_();
+    return id;
+}
+
+void TransactionalProducerImpl::closeStep_(int64_t nowNs) {
+    auto* cl = std::get_if<LifeClosing>(&life_);
+    if (cl == nullptr) return;
+    const bool pastDeadline = nowNs >= cl->deadlineNs;
+    const TxnState st = stateDuty();
+    // The close's own abort is still running: wait (it has its own deadline,
+    // equal to the close's — the sweep completes it Timeout).
+    if (cl->abortOpId != 0 && !cl->abortDone) {
+        if (pastDeadline) finishClose_(OpStatus::Timeout, 0);
+        return;
+    }
+    switch (st) {
+    case TxnState::InTransaction:
+    case TxnState::AbortableError:
+        if (cl->abortOpId == 0) {
+            cl->abortOpId = startCloseAbort_(nowNs);  // EndTxn(abort) (or a local end: never started)
+            return;
+        }
+        // Our abort completed yet the transaction is still open: it failed.
+        finishClose_(cl->abortStatus, cl->abortCode);
+        return;
+    case TxnState::AbortingTransaction: {
+        const auto& a = std::get<SAborting>(state_);
+        if (a.opId != 0) {  // a user abort is running (ours completed): wait for it
+            if (pastDeadline) finishClose_(OpStatus::Timeout, 0);
+            return;
+        }
+        // In doubt (an abort timed out): retry it once as the close's own.
+        if (cl->abortOpId == 0) {
+            cl->abortOpId = startCloseAbort_(nowNs);
+            return;
+        }
+        finishClose_(cl->abortStatus, cl->abortCode);
+        return;
+    }
+    case TxnState::CommittingTransaction:
+        // A commit is running: wait for its final answer (never aborted —
+        // Kafka: COMMITTING -> ABORTING is invalid).  In doubt (it timed
+        // out): nothing a close may do — report Timeout.
+        if (std::get<SCommitting>(state_).opId == 0 || pastDeadline) finishClose_(OpStatus::Timeout, 0);
+        return;
+    case TxnState::Initializing:
+        if (pastDeadline) finishClose_(OpStatus::Timeout, 0);
+        return;
+    case TxnState::Uninitialized:
+    case TxnState::Ready:
+    case TxnState::FatalError:
+        // Nothing open on the broker (FatalError: fenced — the coordinator
+        // aborts it).  The close reports its abort's outcome if it ran one.
+        if (cl->abortOpId != 0) finishClose_(cl->abortStatus, cl->abortCode);
+        else finishClose_(OpStatus::Ok, 0);
+        return;
+    }
+}
+
+void TransactionalProducerImpl::finishClose_(OpStatus st, uint16_t errorCode) {
+    const LifeClosing cl = std::get<LifeClosing>(life_);
+    life_ = LifeOpen{};  // failAll() must not complete the token Closed
+    failAll();           // closed_: every remaining op Closed, status finished
+    Completion c;
+    c.token     = cl.token;
+    c.op        = OpKind::TxnClose;
+    c.status    = st;
+    c.errorCode = errorCode;
+    completions_.deliver(cl.target, c);
 }
 
 } // namespace rune::client::producer

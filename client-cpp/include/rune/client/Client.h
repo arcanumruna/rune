@@ -216,8 +216,8 @@ public:
     /// the constructing thread before connect() is called.
     explicit Client(ClientConfig cfg);
 
-    /// Idempotent.  Calls close() which stops the runner, stops the agent,
-    /// completes every outstanding op Closed, and fires onDisconnected.
+    /// = closeImmediately() (user decision 2: a destructor never waits for
+    /// the broker).  Idempotent.  Call close() first when delivery matters.
     ~Client();
 
     // Non-copyable, non-movable.
@@ -230,11 +230,26 @@ public:
     // Lifecycle
     // -------------------------------------------------------------------------
 
-    /// Stop the runner (close the command ring + join), stop the agent,
-    /// complete every outstanding op Closed (each registered Completions then
-    /// finishes), and fire onDisconnected.
+    /// F8c C7 (user decision 2): drain, then tear down.  Every producer's
+    /// intake closes and it drains — its ring and builders flushed, every
+    /// accepted record acknowledged (or failed by the broker / its delivery
+    /// timeout: each producer's drain is bounded by deliveryTimeoutMs); every
+    /// transactional producer closes (an open broker transaction is aborted
+    /// first, bounded by transactionOpTimeoutMs) — then closeImmediately().
+    /// Blocking like the *AndWait sugar: the Invoker owner pumps doWork(), a
+    /// Thread-mode app thread idle-polls; from a duty-cycle callback (or a
+    /// non-owner Invoker thread): std::logic_error.  Subscriptions and group
+    /// consumers are not drained (they are finished by the teardown).
     /// Idempotent: safe to call multiple times or after the dtor.
     void close();
+
+    /// Tear down now: stop the runner (close the command ring + join), stop
+    /// the agent, complete every outstanding op Closed — including every
+    /// record a producer accepted but has not had acknowledged (each
+    /// registered Completions then finishes) — hand every still-held handle
+    /// impl back to its handle, and fire onDisconnected.  Never waits for the
+    /// broker.  Idempotent; the destructor does this.
+    void closeImmediately();
 
     /// Invoker mode: one duty cycle (driver + conductor, commands, egress, sessions,
     /// ProduceResponses, producers, periodic sweep).  Returns the work count
@@ -256,6 +271,15 @@ public:
 
     /// Test hook: transactional producers adopted by the duty-cycle thread.
     [[nodiscard]] std::size_t testTxnProducerCount() const noexcept { return txnProducers_.size(); }
+    /// F8c C7 test hooks (duty thread / owner in Invoker mode, or after close):
+    /// handle releases applied but not yet freed by the duty side; subscription
+    /// / group-consumer impls the hubs still hold.
+    [[nodiscard]] std::size_t testPendingReleases() const noexcept { return releases_.size(); }
+    [[nodiscard]] std::size_t testSubscriptionImplsHeld() const noexcept { return subscriberHub_.ownedCount(); }
+    [[nodiscard]] std::size_t testGroupImplsHeld() const noexcept { return groupConsumerHub_.ownedCount(); }
+    /// Handle impls close() handed back (adopted registrations included) —
+    /// read after close().
+    [[nodiscard]] uint64_t testImplsHandedBack() const noexcept { return implsHandedBack_; }
     /// Test hook: producers adopted by the duty-cycle thread.
     [[nodiscard]] std::size_t testProducerCount() const noexcept { return producerHub_.size(); }
     /// Test hook: fill the agent command ring so the next registration finds it full.
@@ -613,6 +637,34 @@ private:
 
     /// Teardown shared by close() and ~Client (no contract checks; idempotent).
     void closeImpl_();
+    /// The contract checks of close() / closeImmediately().
+    void checkCloseCaller_(const char* what) const;
+
+    // ---- F8c C7: handle release (spec §3.3) -----------------------------------
+    struct PendingRelease {
+        detail::HandleKind kind  = detail::HandleKind::Producer;
+        void*              impl  = nullptr;
+        std::int64_t       fence = 0;  // command-ring tail at a DIRECT release (0: via the ring)
+    };
+    /// HandleRelease from a handle (the hub-command sink's entry for it).
+    detail::HubSubmit submitRelease_(const detail::HubCommand& cmd);
+    /// Duty side: the handle's destructor semantics (unless `closing`: the
+    /// close path finishes everything itself), then queue the release.
+    void applyRelease_(const detail::HubCommand& cmd, std::int64_t fence, bool closing);
+    /// End of a duty cycle (never inside a hub walk): forget every released
+    /// impl that is quiescent and past its fence, and detach the duty share
+    /// (the last of the two sides frees it).
+    int  reapReleases_() noexcept;
+    /// Client close (after every hub finished): hand every still-held impl back.
+    void handBackAll_() noexcept;
+
+    // ---- F8c C7: Client::close()'s drain ----------------------------------------
+    OpResult issueDrain_(Completions& q, Token token);
+    void applyClientDrain_(const detail::HubCommand& cmd);
+    /// Begin-close every open producer / transactional producer; complete the
+    /// drain waiters once all settled.  Every duty cycle while one is pending.
+    int  checkDrain_();
+    static void drainPartDone_(void* ctx, const Completion& c, std::span<const uint8_t> payload) noexcept;
 
     // ---- F8c C2: completion-queue registry (duty-thread owned) --------------
     void registerCq_(Completions& q);
@@ -650,7 +702,8 @@ private:
     /// target into the command, apply directly on the duty thread or submit.
     static OpResult targetedOpTrampoline_(void* ctx, detail::HubCommand& cmd,
                                           const CompletionTarget& target, Token token, OpKind op);
-    OpResult issueTargeted_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op);
+    OpResult issueTargeted_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op,
+                            bool viaRing = false);
     /// F8c C4: detail::AndWaitSink — the handles' *AndWait sugar.
     static Completion andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
                                          detail::AndWaitIssue issue, void* issueCtx, std::string* text);
@@ -963,7 +1016,16 @@ private:
     // ---- TX-5: Transactional producers ---------------------------------------
     // Duty-cycle-thread owned (registered through the agent ring, like producers).
     // Created at setup time (before connect()); rarely more than one per client.
-    std::vector<std::shared_ptr<producer::TransactionalProducerImpl>> txnProducers_;
+    // F8c C7: raw — the duty side's share of each impl (§3.3); removed by
+    // reapReleases_() (never inside a walk) or handed back at close.
+    std::vector<producer::TransactionalProducerImpl*> txnProducers_;
+    std::vector<PendingRelease> releases_;  // duty-thread owned (C7)
+    uint64_t implsHandedBack_ = 0;          // closing thread (C7 test hook)
+    struct DrainWaiter {
+        DutyTarget target{};
+        Token      token = 0;
+    };
+    std::vector<DrainWaiter> drainWaiters_;  // duty-thread owned (C7): Client::close() drains
 
     // ---- CB-4: SubscriberHub -------------------------------------------------
     // Duty-thread owned (F8a): subscribe()/unsubscribe() reach it via the agent ring.

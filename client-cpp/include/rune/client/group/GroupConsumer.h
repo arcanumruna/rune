@@ -143,8 +143,12 @@ struct GroupConsumerStatus {
 };
 
 // ---------------------------------------------------------------------------
-// GroupConsumerImpl — internal state (heap-allocated, shared_ptr between the
-// GroupConsumer handle and the GroupConsumerHub's consumer list).
+// GroupConsumerImpl — internal state (heap-allocated).  F8c C7 ownership (spec
+// §3.3, no shared_ptr): owned jointly by the GroupConsumer handle and the duty
+// side (the GroupConsumerHub, from the GroupAdd's adoption until the handle's
+// HandleRelease is applied and the hub no longer references it — or until
+// Client close hands it back).  Each side detaches its share of `status`'s
+// ownership word once; the side that detaches last frees the impl.
 //
 // F8a ownership: config is written by the app thread BEFORE the GroupAdd
 // command is put on the agent ring (publishing it); EVERYTHING else — callbacks
@@ -215,8 +219,13 @@ struct GroupConsumerImpl {
     GroupConsumerImpl() {
         sendBuf.resize(4096);  // pre-allocate scratch (avoids per-send allocation)
     }
+    // F8c C7: freed by whichever of {the handle, the duty side} detaches its
+    // share of `status`'s ownership word last (see GroupConsumer).
+    ~GroupConsumerImpl() {
+        if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::GroupConsumer, this);
+    }
 
-    // Non-copyable / non-movable (shared_ptr ownership; the ring is pinned).
+    // Non-copyable / non-movable (raw single-owner hand-off; the ring is pinned).
     GroupConsumerImpl(const GroupConsumerImpl&) = delete;
     GroupConsumerImpl& operator=(const GroupConsumerImpl&) = delete;
     GroupConsumerImpl(GroupConsumerImpl&&) = delete;
@@ -242,6 +251,10 @@ struct GroupConsumerImpl {
 //     callback will run.  A finished handle never touches the Client again, so
 //     a handle may outlive its Client (not be used CONCURRENTLY with its
 //     destruction); commitSync() then returns OpResult::Closed.
+//   - Destruction (F8c C7) = close() + the handle's share of the impl handed
+//     to the duty side (one HandleRelease; Invoker mode: duty work, applied
+//     directly on any thread, never waits on the ring); the impl is freed by
+//     whichever side lets go last — never while one of its callbacks runs.
 //   - HANDLE LIFETIME (fix4 M6): the handle must NOT be destroyed, moved from
 //     or moved into while ANY thread may still be calling it — its owner app
 //     thread, or a runner callback (onAssigned / onRevoked / onRecords calling
@@ -259,13 +272,18 @@ public:
     /// runner (calls from it take the duty path); default id disables that.
     /// `opSink` issues token ops (commitSync), `waitSink` backs
     /// commitSyncAndWait() (both nullptr: commitSync is rejected Closed).
-    GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl,
-                  detail::HubCommandSink             sink,
-                  void*                              sinkCtx,
-                  std::thread::id                    dutyThread = {},
-                  detail::TargetedOpSink             opSink     = nullptr,
-                  detail::AndWaitSink                waitSink   = nullptr) noexcept;
+    GroupConsumer(GroupConsumerImpl*     impl,
+                  detail::HubCommandSink sink,
+                  void*                  sinkCtx,
+                  std::thread::id        dutyThread = {},
+                  detail::TargetedOpSink opSink     = nullptr,
+                  detail::AndWaitSink    waitSink   = nullptr) noexcept;
 
+    /// F8c C7 release (§3.3): closes the consumer (the duty side applies it)
+    /// and gives the handle's share of the impl to the duty side.  Never
+    /// throws, never waits for the duty side; Invoker mode: duty work (applied
+    /// directly on any thread — same contract as doWork()).  After Client
+    /// close the handle frees the impl, never touching the Client.
     ~GroupConsumer();
 
     // Non-copyable, movable.
@@ -349,14 +367,15 @@ private:
     void setCallback_(int which, Fn cb);
 
     static OpResult issueCommitSync_(void* self, const CompletionTarget& target, Token token);
+    /// F8c C7: the §3.3 release of the handle's share (see the destructor).
+    void release_() noexcept;
 
-    std::shared_ptr<GroupConsumerImpl> impl_;
+    GroupConsumerImpl*                 impl_    = nullptr;  // the handle's share (§3.3)
     detail::HubCommandSink             sink_    = nullptr;
     void*                              sinkCtx_ = nullptr;
     detail::TargetedOpSink             opSink_   = nullptr;
     detail::AndWaitSink                waitSink_ = nullptr;
     std::thread::id                    dutyThread_{};
-    bool moved_  = false;
     bool closed_ = false;   // handle-local (app-owned): close() was called
     mutable GroupConsumerStatus cache_{};  // app-owned: last drained status snapshot
 };

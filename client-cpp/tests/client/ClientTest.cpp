@@ -1100,7 +1100,7 @@ TEST(Client, SendAfterClientCloseReturnsClosedRegression) {
     }
     ASSERT_GT(ok, 0u);
 
-    h.client->close();
+    h.client->closeImmediately();  // C7: teardown semantics (close() drains)
 
     EXPECT_EQ(p.trySend(topic, Key(ok), std::span<const uint8_t>(val)), SendResult::Closed);
     EXPECT_THROW(p.send(topic, Key(ok), std::span<const uint8_t>(val)), std::logic_error);

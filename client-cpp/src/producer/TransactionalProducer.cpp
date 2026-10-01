@@ -7,23 +7,83 @@
 #include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/producer/TransactionalProducerImpl.h>
 
+#include <cstdio>
+#include <exception>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace rune::client {
 
 TransactionalProducer::TransactionalProducer(
-    std::shared_ptr<producer::TransactionalProducerImpl> impl,
+    producer::TransactionalProducerImpl* impl,
     detail::HubCommandSink sink, void* sinkCtx, std::thread::id dutyThread,
     detail::TargetedOpSink opSink, detail::AndWaitSink waitSink) noexcept
-    : impl_(std::move(impl))
+    : impl_(impl)
     , sink_(sink)
     , sinkCtx_(sinkCtx)
     , dutyThread_(dutyThread)
     , opSink_(opSink)
     , waitSink_(waitSink)
 {}
+
+TransactionalProducer::TransactionalProducer(TransactionalProducer&& o) noexcept
+    : impl_(std::exchange(o.impl_, nullptr))
+    , sink_(o.sink_)
+    , sinkCtx_(o.sinkCtx_)
+    , dutyThread_(o.dutyThread_)
+    , opSink_(o.opSink_)
+    , waitSink_(o.waitSink_)
+    , closeIssued_(o.closeIssued_)
+{}
+
+TransactionalProducer& TransactionalProducer::operator=(TransactionalProducer&& o) noexcept {
+    if (this != &o) {
+        release_();  // the current producer: closeImmediately + released
+        impl_        = std::exchange(o.impl_, nullptr);
+        sink_        = o.sink_;
+        sinkCtx_     = o.sinkCtx_;
+        dutyThread_  = o.dutyThread_;
+        opSink_      = o.opSink_;
+        waitSink_    = o.waitSink_;
+        closeIssued_ = o.closeIssued_;
+    }
+    return *this;
+}
+
+TransactionalProducer::~TransactionalProducer() { release_(); }
+
+// F8c C7: the §3.3 release.  Never throws, never waits for the duty side.
+void TransactionalProducer::release_() noexcept {
+    producer::TransactionalProducerImpl* impl = std::exchange(impl_, nullptr);
+    if (impl == nullptr) return;  // moved-from
+    if (sink_ == nullptr) {
+        // Standalone handle (no duty side was ever attached): ours alone.
+        delete impl;
+        return;
+    }
+    // The duty side already detached (Client close handed it back, or the
+    // registration was refused): never touch the Client — it may be gone.
+    if (!impl->status.producerDetached()) {
+        detail::HubCommand cmd;
+        cmd.op     = detail::HubCommand::Op::HandleRelease;
+        cmd.handle = reinterpret_cast<uint64_t>(impl);
+        cmd.a      = static_cast<int64_t>(detail::HandleKind::TxnProducer);
+        try {
+            // Accepted: the duty side applies closeImmediately (unless a close
+            // already started) and detaches its share once the producer is
+            // closed.  Closed: a close() on another thread hands it back.
+            (void)sink_(sinkCtx_, cmd);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "rune-client: ~TransactionalProducer: release not delivered: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "rune-client: ~TransactionalProducer: release not delivered (unknown error)\n");
+        }
+    }
+    // The handle's last access: the side that detaches last frees the impl.
+    if (impl->status.detachConsumer()) delete impl;
+}
 
 bool TransactionalProducer::finished_() const noexcept {
     // Closed by the duty side (Client close) or abandoned (never registered):
@@ -33,8 +93,8 @@ bool TransactionalProducer::finished_() const noexcept {
 
 OpResult TransactionalProducer::issue_(detail::HubCommand& cmd, const CompletionTarget& target,
                                        Token token, OpKind op) {
-    if (finished_() || opSink_ == nullptr) return OpResult::Closed;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
+    if (finished_() || opSink_ == nullptr || closeIssued_) return OpResult::Closed;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
     return opSink_(sinkCtx_, cmd, target, token, op);
 }
 
@@ -47,7 +107,7 @@ OpResult TransactionalProducer::initTransactions(CompletionTarget target, Token 
 OpResult TransactionalProducer::sendOffsetsToTransaction(const std::map<TopicPartitionKey, int64_t>& offsets,
                                                          const std::string& groupId,
                                                          CompletionTarget target, Token token) {
-    if (finished_() || opSink_ == nullptr) return OpResult::Closed;
+    if (finished_() || opSink_ == nullptr || closeIssued_) return OpResult::Closed;
     auto payload = std::make_unique<producer::TxnOffsetsPayload>();  // cold path
     payload->groupId = groupId;
     payload->offsets = offsets;
@@ -85,7 +145,9 @@ struct OffsetsIssue {
 
 void TransactionalProducer::andWait_(const char* what, std::chrono::nanoseconds timeout,
                                      detail::AndWaitIssue issue, void* ctx) {
-    if (finished_() || waitSink_ == nullptr) throw std::runtime_error(std::string(what) + ": producer closed");
+    if (finished_() || waitSink_ == nullptr || closeIssued_) {
+        throw std::runtime_error(std::string(what) + ": producer closed");
+    }
     std::string text;
     const Completion c = waitSink_(sinkCtx_, what, timeout, issue, ctx, &text);
     if (c.status == OpStatus::Ok) return;
@@ -138,13 +200,60 @@ void TransactionalProducer::abortTransactionAndWait(std::chrono::nanoseconds tim
              this);
 }
 
+// ---- Close (F8c C7) -----------------------------------------------------------
+
+OpResult TransactionalProducer::close(CompletionTarget target, Token token) {
+    detail::HubCommand cmd;
+    cmd.op = detail::HubCommand::Op::TxnClose;
+    const OpResult r = issue_(cmd, target, token, OpKind::TxnClose);
+    if (r == OpResult::Accepted) closeIssued_ = true;
+    return r;
+}
+
+// No wait bound of its own: the close is bounded by transactionOpTimeoutMs
+// (the token completes Timeout then).  ~100 years keeps now + timeout finite.
+OpStatus TransactionalProducer::close() { return closeAndWait(std::chrono::hours(24 * 365 * 100)); }
+
+OpStatus TransactionalProducer::closeAndWait(std::chrono::nanoseconds timeout) {
+    if (finished_() || waitSink_ == nullptr || closeIssued_) return OpStatus::Closed;
+    struct IssueCtx {
+        TransactionalProducer* self;
+        OpResult               last = OpResult::InvalidArgument;
+    } ic{this};
+    const detail::AndWaitIssue issue = [](void* c, const CompletionTarget& t, Token k) {
+        auto* x = static_cast<IssueCtx*>(c);
+        x->last = x->self->close(t, k);
+        return x->last;
+    };
+    try {
+        return waitSink_(sinkCtx_, "TransactionalProducer::close()", timeout, issue, &ic, nullptr).status;
+    } catch (const std::runtime_error&) {
+        if (ic.last == OpResult::Closed) return OpStatus::Closed;  // closed meanwhile: nothing to wait for
+        throw;
+    }
+}
+
+OpResult TransactionalProducer::closeImmediately() {
+    if (finished_() || sink_ == nullptr) return OpResult::Closed;
+    closeIssued_ = true;
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::TxnCloseNow;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
+    try {
+        // Lifecycle: guaranteed delivery (applied directly on the duty thread).
+        return sink_(sinkCtx_, cmd) == detail::HubSubmit::Accepted ? OpResult::Accepted : OpResult::Closed;
+    } catch (const std::exception&) {
+        return OpResult::Closed;
+    }
+}
+
 // ---- No-completion commands ---------------------------------------------------
 
 void TransactionalProducer::beginTransaction() {
-    if (finished_() || sink_ == nullptr) return;
+    if (finished_() || sink_ == nullptr || closeIssued_) return;
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::TxnBegin;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
     (void)sink_(sinkCtx_, cmd);  // Closed: nothing to begin any more
 }
 
@@ -154,7 +263,7 @@ void TransactionalProducer::send(TopicHandle topic, const Key& key, std::span<co
         throw std::invalid_argument("TransactionalProducer::send: invalid topic handle");
     }
     // fix5: never silently accept a send nothing will process.
-    if (finished_() || sink_ == nullptr) throw std::logic_error("client closed");
+    if (finished_() || sink_ == nullptr || closeIssued_) throw std::logic_error("client closed");
     auto rec = std::make_unique<producer::TxnSendRecord>();
     rec->topicId   = topic.topicId;
     rec->partition = key.partition(topic.partitionCount);
@@ -162,7 +271,7 @@ void TransactionalProducer::send(TopicHandle topic, const Key& key, std::span<co
     rec->value.assign(value.begin(), value.end());
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::TxnSend;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
     cmd.d      = static_cast<int64_t>(reinterpret_cast<uintptr_t>(rec.get()));
     switch (sink_(sinkCtx_, cmd)) {  // may throw (ring full): rec frees itself
     case detail::HubSubmit::Accepted:

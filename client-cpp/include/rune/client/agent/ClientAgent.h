@@ -282,18 +282,18 @@ public:
     /// reuse immediately after this call returns).
     bool submitSend(const uint8_t* frame, std::size_t len) noexcept;
 
-    /// Shared-nothing producer registration: hand a heap-allocated
-    /// std::shared_ptr<ProducerImpl>* ("holder") to the RUNNER thread via the
-    /// command ring.  The runner drains kMsgRegisterProducer, invokes the register
-    /// hook (which adopts the shared_ptr into the single-owner ProducerHub list and
-    /// deletes the holder), so the producer list is never touched cross-thread.
-    /// Returns false if the ring is momentarily full (caller retries).  The holder
-    /// pointer is only its 8-byte address — no producer bytes cross the ring.
-    Submit submitRegisterProducer(void* holder) noexcept;
+    /// Shared-nothing producer registration: hand the ProducerImpl* to the
+    /// RUNNER thread via the command ring.  The runner drains
+    /// kMsgRegisterProducer and invokes the register hook, which adopts it into
+    /// the single-owner ProducerHub list (F8c C7: the duty side's share of the
+    /// impl — no shared_ptr holder), so the producer list is never touched
+    /// cross-thread.  Returns false if the ring is momentarily full (caller
+    /// retries).  Only the 8-byte address crosses the ring.
+    Submit submitRegisterProducer(void* impl) noexcept;
 
-    /// Same shared-nothing hand-off for a transactional producer: `holder` is a heap
-    /// std::shared_ptr<TransactionalProducerImpl>* adopted on the duty-cycle thread.
-    Submit submitRegisterTxnProducer(void* holder) noexcept;
+    /// Same shared-nothing hand-off for a transactional producer: `impl` is the
+    /// TransactionalProducerImpl* adopted on the duty-cycle thread.
+    Submit submitRegisterTxnProducer(void* impl) noexcept;
 
     /// F8a: hand a subscriber / group-consumer / completion-queue command to
     /// the duty thread (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty
@@ -470,10 +470,10 @@ public:
     }
 
     /// Shared-nothing producer registration hook: invoked on the RUNNER thread
-    /// when a kMsgRegisterProducer command is drained.  The argument is the holder
-    /// pointer passed to submitRegisterProducer (a std::shared_ptr<ProducerImpl>*).
-    /// The Client wires this to adopt the producer into the ProducerHub list and
-    /// delete the holder.  Set before start().
+    /// when a kMsgRegisterProducer command is drained.  The argument is the impl
+    /// pointer passed to submitRegisterProducer (F8c C7: a ProducerImpl*).  The
+    /// Client wires this to adopt the producer into the ProducerHub list.  Set
+    /// before start().
     using ProducerRegisterFn = std::function<void(void*)>;
     void setProducerRegisterFn(ProducerRegisterFn fn) noexcept {
         producerRegisterFn_ = std::move(fn);

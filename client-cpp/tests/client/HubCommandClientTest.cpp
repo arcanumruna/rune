@@ -330,8 +330,11 @@ TEST(HubCommandClient, RingFullUnsubscribeStillStopsDispatchRegression) {
     EXPECT_EQ(sub.position(), 1) << "position() final after finished()";
 }
 
-// C1(b): the destructor under a full ring blocks only until the duty thread
-// makes progress, then dispatch is stopped.
+// C1(b) / F8c C7: the destructor under a FULL command ring never waits.  In
+// Invoker mode releasing a handle is duty work (the doWork() contract — here
+// the off-owner destroy: the owner is not pumping meanwhile), applied directly
+// even off the owner thread: the subscription is unsubscribed at once and its
+// handler never runs again.
 TEST(HubCommandClient, DestructorUnderFullRingStopsDispatchRegression) {
     HubRig r(3986);
     r.connect();
@@ -341,24 +344,17 @@ TEST(HubCommandClient, DestructorUnderFullRingStopsDispatchRegression) {
         [&](const rc::Record&) { got.fetch_add(1); }));
     ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub->subscriptionId() > 0; }));
 
-    std::atomic<int> ev{kPending};
-    r.client.testSetHubCommandRingFullHook([&] { signal(ev, kFull); });
+    std::atomic<int> fullHits{0};
+    r.client.testSetHubCommandRingFullHook([&] { fullHits.fetch_add(1); });
     r.client.testFillCommandRing();
-    std::atomic<bool> destroyed{false};
-    std::thread t([&] {
-        sub.reset();
-        destroyed.store(true);
-        signal(ev, kNoFull);
-    });
-    if (waitEvent(ev) != kFull) {
-        t.join();
-        FAIL() << "the destructor never met the full ring";
-    }
-    ASSERT_TRUE(r.drive([&] { return destroyed.load() && !r.gw.unsubscribed.empty(); }));
+    std::thread t([&] { sub.reset(); });  // returns without any duty progress
     t.join();
+    EXPECT_EQ(fullHits.load(), 0) << "the release never waited on the full ring";
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }));
     r.gw.pushRecords(r.gw.subscribed[0], 0, 2);
     r.settle();
     EXPECT_EQ(got.load(), 0) << "the destroyed subscription's handler must never run";
+    EXPECT_EQ(r.client.testSubscriptionImplsHeld(), 0u) << "the duty side let go (reaped)";
 }
 
 // C1(a): unsubscribe from inside the handler on the duty thread is applied
@@ -911,7 +907,7 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
         EXPECT_EQ(led.times, 1);
         EXPECT_EQ(led.last.status, rc::OpStatus::BrokerError);
 
-        r.client.close();
+        r.client.closeImmediately();  // C7: the discarding close (close() aborts first)
         for (auto* op : {&offs, &commit}) {
             ASSERT_TRUE(op->ready()) << "stranded by close()";
             EXPECT_EQ(op->status(), rc::OpStatus::Closed);
@@ -932,7 +928,7 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
         ASSERT_EQ(tp.initTransactions(led.handler(), 5), rc::OpResult::Accepted);  // never connected
         r.settle(50);
         EXPECT_EQ(led.times, 0);
-        r.client.close();
+        r.client.closeImmediately();  // C7: the discarding close (close() aborts first)
         EXPECT_EQ(led.times, 1);
         EXPECT_EQ(led.last.status, rc::OpStatus::Closed);
     }
@@ -944,7 +940,7 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
         auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
         ASSERT_TRUE(init.accepted()) << init.describe();
         EXPECT_FALSE(init.ready()) << "never connected: nothing answers it";
-        client.close();
+        client.closeImmediately();
         ASSERT_TRUE(init.ready());
         EXPECT_EQ(init.status(), rc::OpStatus::Closed);
         EXPECT_EQ(cq.timesCompleted(init.token()), 1);

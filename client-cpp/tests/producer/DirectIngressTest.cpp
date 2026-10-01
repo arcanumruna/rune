@@ -351,7 +351,7 @@ TEST(DirectIngress, SendAfterClientCloseReturnsClosedRegression) {
     auto p = r.client->producer(voidCfg());
     const auto topic = r.client->topic("t");
     ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal), rc::SendResult::Ok);
-    r.client->close();
+    r.client->closeImmediately();  // C7: teardown semantics (close() drains)
     EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), kVal), rc::SendResult::Closed);
     EXPECT_THROW(p.send(topic, rc::Key(uint64_t{1}), kVal), std::logic_error);
 }
@@ -986,7 +986,7 @@ TEST(DirectIngress, UnknownPartitionDeferralsShareAnAggregateCapRegression) {
 // 4: a Tier-2 batch rejected because its partition still has deferred records
 // (or is unaddressable) says so — not "ring full".
 TEST(DirectIngress, Tier2RejectReasonIsSpecificRegression) {
-    auto impl = std::make_shared<ProducerImpl>(stallCfg());
+    auto* impl = new ProducerImpl(stallCfg());
     impl->enableDirectIngress(ownerDirect());
     rc::Producer p(impl);
     const rc::TopicHandle topic{1, 4};
@@ -1027,7 +1027,7 @@ TEST(DirectIngress, Tier2RejectReasonIsSpecificRegression) {
 // A Tier-2 batch on a closed Direct producer says "closed" (not a stale
 // reason left over from an earlier reject, nor "ring full").
 TEST(DirectIngress, Tier2RejectAfterCloseSaysClosedRegression) {
-    auto impl = std::make_shared<ProducerImpl>(stallCfg());
+    auto* impl = new ProducerImpl(stallCfg());
     impl->enableDirectIngress(ownerDirect());
     rc::Producer p(impl);
     const rc::TopicHandle topic{1, 4};
@@ -1045,7 +1045,7 @@ TEST(DirectIngress, Tier2RejectAfterCloseSaysClosedRegression) {
 // thread" — decided from the returned reason, no producer member is read
 // (TSan: the owner thread keeps rejecting / sending concurrently).
 TEST(DirectIngress, Tier2FromForeignThreadSaysWrongThreadRegression) {
-    auto impl = std::make_shared<ProducerImpl>(stallCfg());
+    auto* impl = new ProducerImpl(stallCfg());
     impl->enableDirectIngress(ownerDirect());
     rc::Producer p(impl);
     const rc::TopicHandle topic{1, 4};

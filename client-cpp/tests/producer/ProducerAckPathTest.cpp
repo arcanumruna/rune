@@ -124,10 +124,10 @@ TEST(ProducerInFlight, OutOfOrderAckNeverOverwritesALiveSlot) {
 
 TEST(ProducerInFlight, HubRoutesAcksByOrdinal) {
     ProducerHub hub;
-    auto a = std::make_shared<ProducerImpl>(ackCfg(4));
-    auto b = std::make_shared<ProducerImpl>(ackCfg(4));
-    hub.add(a);
-    hub.add(b);
+    auto a = std::make_unique<ProducerImpl>(ackCfg(4));  // F8c C7: the bare hub holds raw pointers
+    auto b = std::make_unique<ProducerImpl>(ackCfg(4));
+    hub.add(a.get());
+    hub.add(b.get());
     EXPECT_EQ(a->ordinal(), 0u);
     EXPECT_EQ(b->ordinal(), 1u);
     Capture cap;
@@ -279,14 +279,14 @@ TEST(ProducerAcks, AcksNoneRetainsNoAckRingEntriesRegression) {
 // retransmitting.  Under acks=None Tier-2 behaves like Tier-1: wire id 0, no
 // slot, the future resolves -1 once the frame is handed to the transport.
 TEST(ProducerAcks, AcksNoneTier2BatchesNeverOccupyInFlightSlotsRegression) {
-    auto impl = std::make_shared<ProducerImpl>(noneCfg(/*maxInFlight=*/2));
+    auto impl = std::make_unique<ProducerImpl>(noneCfg(/*maxInFlight=*/2));
     Capture cap;
     const auto sink = cap.fn();
     constexpr int kBatches = 200;
     AckLedger L;
     L.attach(*impl);
     for (int i = 0; i < kBatches; ++i) {
-        rune::client::BatchBuilder bb(impl, 1, 0);
+        rune::client::BatchBuilder bb(impl.get(), 1, 0);
         bb.add(kVal);
         bb.add(kVal);
         ASSERT_EQ(bb.send(AckToken{static_cast<rune::client::Token>(i + 1)}), OpResult::Accepted);
@@ -537,12 +537,12 @@ TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentRecordsAndDropsThem) {
 // session) past the delivery deadline is failed AND dropped (the per-record map
 // deadline that used to time it out no longer exists).
 TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentTier2BatchesAndDropsThemRegression) {
-    auto impl = std::make_shared<ProducerImpl>(ackCfg(8));
+    auto impl = std::make_unique<ProducerImpl>(ackCfg(8));
     Capture cap;
     const auto sink = cap.fn();
     AckLedger L;
     L.attach(*impl);
-    rune::client::BatchBuilder bb(impl, 1, 0);
+    rune::client::BatchBuilder bb(impl.get(), 1, 0);
     bb.add(kVal);
     ASSERT_EQ(bb.send(AckToken{1}), OpResult::Accepted);
     drainAll(*impl);

@@ -64,12 +64,16 @@ struct AckToken;
 // ---------------------------------------------------------------------------
 // BatchBuilder — returned by Producer::batch(topic, key).
 //
-// Not copyable; movable (ownership transfer only).
+// Not copyable; movable.  F8c C7: BORROWS its Producer's impl — it must not
+// outlive the Producer it came from (spec §3.1 rule 1).
 // ---------------------------------------------------------------------------
 class BatchBuilder {
 public:
-    // Constructed by Producer::batch() — not for direct construction.
-    explicit BatchBuilder(std::shared_ptr<producer::ProducerImpl> impl,
+    // Constructed by Producer::batch() — not for direct construction.  F8c
+    // C7: BORROWS the producer (spec §3.1 rule 1): it must not outlive the
+    // Producer it came from (a send() after that Producer was destroyed
+    // throws std::logic_error while the duty side still holds the impl).
+    explicit BatchBuilder(producer::ProducerImpl* impl,
                           int32_t topicId,
                           int32_t partition) noexcept;
 
@@ -130,7 +134,9 @@ public:
     OpResult send(AckToken token);
 
 private:
-    std::shared_ptr<producer::ProducerImpl> impl_;
+    void checkProducer_() const;
+
+    producer::ProducerImpl* impl_ = nullptr;  // borrowed (owned by the Producer + duty side)
     int32_t topicId_   = -1;
     int32_t partition_ = -1;
 

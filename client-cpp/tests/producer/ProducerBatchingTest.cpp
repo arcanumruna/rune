@@ -243,9 +243,9 @@ struct BatchingHarness {
     }
 
     Producer makeProducer(ProducerConfig pcfg = {}) {
-        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
+        auto* impl = new rprod::ProducerImpl(pcfg);  // F8c C7: the handle owns it (bare)
         hub.add(impl);
-        return Producer(std::move(impl));
+        return Producer(impl);
     }
 
     bool connect(int limit = kPumpMax) {
@@ -619,9 +619,9 @@ struct CapHarness {
     }
 
     Producer makeProducer(ProducerConfig pcfg = {}) {
-        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
+        auto* impl = new rprod::ProducerImpl(pcfg);  // F8c C7: the handle owns it (bare)
         hub.add(impl);
-        return Producer(std::move(impl));
+        return Producer(impl);
     }
 
     bool connect(int limit = kPumpMax) {

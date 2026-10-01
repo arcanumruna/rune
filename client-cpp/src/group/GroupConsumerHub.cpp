@@ -81,17 +81,38 @@ static void ensureBuf(GroupConsumerImpl& impl, std::size_t needed) {
 // add() / applyCommand() — duty thread (cold path)
 // ---------------------------------------------------------------------------
 
-void GroupConsumerHub::add(std::shared_ptr<GroupConsumerImpl> impl) {
+void GroupConsumerHub::add(GroupConsumerImpl* impl) {
+    if (impl == nullptr) return;
+    // F8c C7: the duty side's share is held from adoption on (even if closed).
+    owned_.push_back(impl);
     // fix3 I3: closed (directly, on this thread) before its adoption: honour
-    // it — never added, never joins.
-    if (impl && impl->active) impls_.push_back(std::move(impl));
+    // it — never driven, never joins.
+    if (impl->active) impls_.push_back(impl);
 }
 
 GroupConsumerImpl* GroupConsumerHub::find_(uint64_t handle) const noexcept {
-    for (const auto& impl : impls_) {
-        if (reinterpret_cast<uint64_t>(impl.get()) == handle) return impl.get();
+    for (GroupConsumerImpl* impl : impls_) {
+        if (reinterpret_cast<uint64_t>(impl) == handle) return impl;
     }
     return nullptr;
+}
+
+bool GroupConsumerHub::release(GroupConsumerImpl* impl) noexcept {
+    if (impl == dispatching_ || impl->active || impl->leavePending || impl->statusDirty) return false;
+    for (std::size_t i = 0; i < impls_.size(); ++i) {
+        if (impls_[i] == impl) {
+            impls_.erase(impls_.begin() + static_cast<std::ptrdiff_t>(i));  // keeps the drive order
+            break;
+        }
+    }
+    for (std::size_t i = 0; i < owned_.size(); ++i) {
+        if (owned_[i] == impl) {
+            owned_[i] = owned_.back();
+            owned_.pop_back();
+            break;
+        }
+    }
+    return true;
 }
 
 void GroupConsumerHub::completeCommitSync_(GroupConsumerImpl& impl, OpStatus st, uint16_t errorCode) {
@@ -113,7 +134,7 @@ void GroupConsumerHub::completeCommitSync_(GroupConsumerImpl& impl, OpStatus st,
 int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (impl->hasCommitSync && nowNs >= impl->commitSync.deadlineNs) {
             completeCommitSync_(*impl, OpStatus::Timeout);
             ++n;
@@ -129,7 +150,8 @@ void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, in
     if (sessionConnected_ &&
         (!connected || sessionId != currentSessionId_ || episode != sessionEpisode_)) {
         // I-3: a completion handler may adopt a consumer (impls_ grows): index
-        // loop over the size captured first; impls are never removed.
+        // loop over the size captured first (removal: only release(), never
+        // inside a hub walk).
         for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {
             completeCommitSync_(*impls_[ix], OpStatus::SessionLost);
         }
@@ -175,7 +197,7 @@ void GroupConsumerHub::publishGeneration_(GroupConsumerImpl& impl) {
 int GroupConsumerHub::republishDirty() {
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->statusDirty) continue;
         const std::size_t before = dirtyCount_;
         publishGeneration_(*impl);
@@ -213,11 +235,8 @@ void GroupConsumerHub::applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl
     using Op = detail::HubCommand::Op;
     switch (cmd.op) {
     case Op::GroupAdd: {
-        auto* holder = reinterpret_cast<std::shared_ptr<GroupConsumerImpl>*>(cmd.handle);
-        if (holder) {
-            add(std::move(*holder));
-            delete holder;
-        }
+        // F8c C7: handle = the impl itself (no shared_ptr holder): adopted.
+        add(reinterpret_cast<GroupConsumerImpl*>(cmd.handle));
         break;
     }
     case Op::GroupCommit: {
@@ -303,7 +322,7 @@ void GroupConsumerHub::sendLeave_(GroupConsumerImpl& impl) {
 int GroupConsumerHub::retryPendingLeaves(int64_t currentSessionId) {
     int sent = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->leavePending) continue;
         bool done = true;
         if (impl->leaveSessionId != currentSessionId) {
@@ -646,7 +665,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
     const auto now = std::chrono::steady_clock::now();
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
 
         // ---- Drain pending commit() / commitSync() requests --------------------
@@ -743,7 +762,7 @@ int GroupConsumerHub::flushRequestedCommits(int64_t sessionId)
 {
     int work = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (impl->active && impl->commitRequested) work += drainCommit_(*impl, sessionId, SendFn{});
     }
     return work;
@@ -760,7 +779,7 @@ bool GroupConsumerHub::hasPendingCommitSync() const noexcept
 void GroupConsumerHub::onSessionDown()
 {
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (impl->active) completeCommitSync_(*impl, OpStatus::SessionLost);
     }
 }
@@ -772,7 +791,7 @@ void GroupConsumerHub::onSessionDown()
 void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
 {
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
@@ -830,7 +849,7 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
     if (!opt) return;
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Joining) continue;
 
@@ -871,7 +890,7 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
     if (!opt) return;
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Syncing) continue;
 
@@ -929,7 +948,7 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
     if (!opt) return;
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
@@ -963,7 +982,7 @@ void GroupConsumerHub::onOffsetCommitResponse(const uint8_t* buf, std::size_t le
     if (!opt) return;
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         // fix1 I6: only the response to THIS commitSync's OffsetCommit (echoed
         // correlationId) resolves it — never an auto-commit / plain commit
@@ -997,7 +1016,7 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
     if (!opt) return;
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
@@ -1034,7 +1053,7 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
     if (!opt) return;
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
@@ -1067,7 +1086,7 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
 void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 {
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
 
         // fix1 I6: a NEW session (reconnect) means the old one was lost — a
@@ -1088,7 +1107,7 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 void GroupConsumerHub::closeAll(int64_t sessionId, const SendFn& sendFn)
 {
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
-        GroupConsumerImpl* const impl = impls_[ix].get();
+        GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
 
         // Fire revoked for everything. fix1 C1: catch/count/log.

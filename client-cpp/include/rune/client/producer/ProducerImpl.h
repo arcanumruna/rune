@@ -2,8 +2,9 @@
 //
 // CB-2 — ProducerImpl: agent-side single-writer accumulator + ring handoff.
 //
-// This class is NOT part of the public API.  It is shared between Producer
-// (app thread) and ClientAgent (agent thread) via a shared_ptr.
+// This class is NOT part of the public API.  F8c C7: owned jointly by the
+// Producer handle (app thread) and the duty side (ProducerHub) — raw pointers,
+// the §3.3 release protocol (the last of the two to detach frees it).
 //
 // App threads:
 //   submitSendRecord() — lock-free ring write (the zero-alloc handoff).
@@ -402,6 +403,52 @@ public:
     /// plain tokens: nothing to free, nothing fired).
     ~ProducerImpl();
 
+    // ---- F8c C7: ownership (spec §3.3 — no shared_ptr) --------------------------
+    //
+    // Owned jointly by the Producer handle and the duty side (the ProducerHub,
+    // from the registration's adoption until the handle's HandleRelease was
+    // applied and the producer is quiescent — or until Client close hands it
+    // back).  Each side detaches its share ONCE on the ring's ownership word
+    // (one RMW); the side that detaches LAST frees the impl.  Nobody waits.
+
+    /// Duty side: detach the duty share.  True: the handle already detached —
+    /// the caller frees the impl.  The duty side never touches it afterwards.
+    [[nodiscard]] bool detachDuty() noexcept { return ring_.detachConsumer(); }
+    /// Handle side: detach the handle's share (its last access).  True: the
+    /// duty side already detached — the caller frees the impl.
+    [[nodiscard]] bool detachHandle() noexcept { return ring_.detachProducer(); }
+    /// Either side (acquire): the duty side detached (Client close handed the
+    /// impl back, or it was never registered) — the handle owns it alone and
+    /// must never touch the Client again.
+    [[nodiscard]] bool dutyDetached() const noexcept { return ring_.consumerDetached(); }
+    /// Either side (acquire): the handle detached (debug check of a
+    /// BatchBuilder that outlived its Producer while the duty side still holds
+    /// the impl).
+    [[nodiscard]] bool handleDetached() const noexcept { return ring_.producerDetached(); }
+    /// Duty side: the handle's destructor semantics (closeImmediately unless a
+    /// close — begin-close, closeImmediately, Client close — already started).
+    void applyHandleRelease() {
+        if (lifeOpen()) applyCloseImmediately(OpStatus::Closed);
+    }
+    /// Duty side: nothing of this producer is pending any more — no open /
+    /// draining life, no duty work in progress (a handler of it is not
+    /// running), every accepted record completed, the ring consumed to its
+    /// closed tail.  A released producer is forgotten by its hub only then.
+    /// Duty side: inside this producer's own duty work (a handler it fired).
+    [[nodiscard]] bool inDutyWork() const noexcept { return inDuty_; }
+    [[nodiscard]] bool releasable() const noexcept {
+        return !lifeOpen() && !draining() && !inDuty_ && !pendingFail_.armed && fullyDrained_();
+    }
+    /// Registration refused (the Client was closing): no duty side will ever
+    /// hold it — the intake is closed, the Client is "closed" for the handle,
+    /// and the duty share is detached (the handle frees it alone).
+    void markBornClosed() noexcept {
+        markRingClosed();
+        if (mode_ == IngressMode::Direct) clientClosedDirect_ = true;
+        else ring_.consumerFinish();
+        (void)ring_.detachConsumer();
+    }
+
     // Non-copyable, non-movable (owns the ring buffer).
     ProducerImpl(const ProducerImpl&) = delete;
     ProducerImpl& operator=(const ProducerImpl&) = delete;
@@ -591,6 +638,9 @@ public:
         OpResult (*issueClose)(void* ctx, ProducerImpl& impl, const CompletionTarget* target,
                                Token token) = nullptr;
         detail::AndWaitSink andWait = nullptr;
+        /// F8c C7: the handle's §3.3 release (HubCommand::HandleRelease).
+        /// Absent (bare rig): no duty side — the handle frees the impl alone.
+        detail::HubCommandSink release = nullptr;
     };
     /// Set once by Client::producer() before the handle is returned.
     void setHooks(const Hooks& h) noexcept { hooks_ = h; }

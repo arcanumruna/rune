@@ -200,25 +200,31 @@ struct TxnRig {
     TxnLedger ledger;
     Token     nextToken = 0;
     CaptureSink sink;
-    std::shared_ptr<TransactionalProducerImpl> impl;
+    // F8c C7: the rig owns the impl's memory (its handle never frees it: no
+    // duty side ever detaches here); tp is destroyed first.
+    std::unique_ptr<TransactionalProducerImpl> impl;
     TransactionalProducer tp;
 
     explicit TxnRig(const std::string& txnId = "test-txn-id", ProducerConfig cfg = {})
         : impl(makeImpl(txnId, cfg, nextCorrId)),
-          tp(impl, &TxnRig::hubSink, this, {}, &TxnRig::opSink, nullptr) {
+          tp(impl.get(), &TxnRig::hubSink, this, {}, &TxnRig::opSink, nullptr) {
         impl->setRediscoverHook([](void* ctx) noexcept { ++static_cast<TxnRig*>(ctx)->rediscovers; }, this);
     }
     ~TxnRig() {
         for (const auto& [t, x] : ledger.e) EXPECT_EQ(x.times, 1) << "token " << t << " completed " << x.times;
     }
 
-    static std::shared_ptr<TransactionalProducerImpl> makeImpl(const std::string& id, ProducerConfig cfg,
+    static std::unique_ptr<TransactionalProducerImpl> makeImpl(const std::string& id, ProducerConfig cfg,
                                                                int64_t& corr) {
         cfg.acks = Acks::All;
-        return std::make_shared<TransactionalProducerImpl>(id, cfg, corr, /*txnTimeoutMs=*/60'000);
+        return std::make_unique<TransactionalProducerImpl>(id, cfg, corr, /*txnTimeoutMs=*/60'000);
     }
     static rune::client::detail::HubSubmit hubSink(void* ctx, const rune::client::detail::HubCommand& c) {
         auto* r = static_cast<TxnRig*>(ctx);
+        if (c.op == rune::client::detail::HubCommand::Op::HandleRelease) {
+            r->impl->applyHandleRelease();  // F8c C7: the destructor's closeImmediately (as the Client does)
+            return rune::client::detail::HubSubmit::Accepted;
+        }
         r->impl->applyCommand(c, r->now);
         return rune::client::detail::HubSubmit::Accepted;
     }
@@ -1099,7 +1105,7 @@ TEST(GroupConsumerReadCommittedTest, IsolationLevelStoredCorrectly)
     cfg.isolation            = IsolationLevel::ReadCommitted;
 
     // Build a GroupConsumerImpl with this config.
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();  // F8c C7: the bare hub holds raw pointers
     impl->groupId  = "test-group";
     impl->topicIds = {42};
     impl->cfg      = cfg;
@@ -1134,13 +1140,13 @@ TEST(GroupConsumerReadCommittedTest, HubPreservesIsolationConfig)
     cfg.isolation = IsolationLevel::ReadCommitted;
     cfg.autoCommit = false;
 
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();  // F8c C7: the bare hub holds raw pointers
     impl->groupId  = "rc-group";
     impl->topicIds = {10};
     impl->cfg      = cfg;
     impl->active = true;
 
-    hub.add(impl);
+    hub.add(impl.get());
 
     // Verify that the hub registered the impl with the correct isolation.
     // We access the impl directly (hub does not expose iteration).
@@ -1174,7 +1180,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
     cfg.autoCommit  = false;
     cfg.sessionTimeoutMs = 10000;
 
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();  // F8c C7: the bare hub holds raw pointers
     impl->groupId   = "rc-wire-group";
     impl->topicIds  = {42};
     impl->cfg       = cfg;
@@ -1184,7 +1190,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
     impl->active = true;
     impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
-    hub.add(impl);
+    hub.add(impl.get());
 
     // Capture all frames sent by the hub.
     std::vector<std::vector<uint8_t>> capturedFrames;
@@ -1259,7 +1265,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     cfg.autoCommit       = false;
     cfg.sessionTimeoutMs = 10000;
 
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();  // F8c C7: the bare hub holds raw pointers
     impl->groupId    = "ru-wire-group";
     impl->topicIds   = {10};
     impl->cfg        = cfg;
@@ -1269,7 +1275,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     impl->active = true;
     impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
-    hub.add(impl);
+    hub.add(impl.get());
 
     std::vector<std::vector<uint8_t>> capturedFrames;
     SendFn sendFn = [&capturedFrames](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
@@ -1850,3 +1856,4 @@ TEST(TransactionalProducerTest, LateOriginalEndTxnAnswerAfterRetryIsIgnoredRegre
     EXPECT_EQ(first.times(), 1);
     EXPECT_EQ(r.tp.state(), TxnState::Ready);
 }
+

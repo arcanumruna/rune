@@ -155,7 +155,7 @@ struct Rig {
 TEST(ProducerClose, BeginCloseRejectsLaterSendsSynchronouslyRegression) {
     for (const bool direct : {false, true}) {
         SCOPED_TRACE(direct ? "Direct" : "Ring");
-        auto impl = std::make_shared<ProducerImpl>(ackCfg());
+        auto* impl = new ProducerImpl(ackCfg());
         if (direct) impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, kNow});
         rc::Producer p(impl);
         AckLedger L;
@@ -538,7 +538,7 @@ TEST(ProducerClose, ClientBeginCloseCqBlockingCloseAndClientCloseRegression) {
     auto tok3 = cq.issue([&](rc::Completions& q, rc::Token t) { return p3.close(q, t); });
     ASSERT_TRUE(tok3.accepted());
     for (int i = 0; i < 2'000; ++i) { r.client->doWork(); r.gw.pump(); }
-    r.client->close();
+    r.client->closeImmediately();  // F8c C7: the discarding close (close() would drain)
     ASSERT_TRUE(rec3.ready());
     EXPECT_EQ(rec3.status(), OpStatus::Closed);
     ASSERT_TRUE(tok3.ready());

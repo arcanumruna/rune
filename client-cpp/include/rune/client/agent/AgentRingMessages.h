@@ -39,9 +39,9 @@ inline constexpr uint16_t kInternalVersion  = 1;
 //   [0..23]  MessageHeader (blockLength=8, templateId=1, schemaId=121)
 //   [24..31] handle : uint64
 //
-// `handle` is the address of a heap-allocated std::shared_ptr<ProducerImpl>
-// created by Client::producer().  The runner decodes this message, adopts the
-// shared_ptr into the single-owner ProducerHub list, and frees the holder.  The
+// `handle` is the address of the ProducerImpl created by Client::producer()
+// (F8c C7: no shared_ptr holder).  The runner decodes this message and adopts
+// the impl into the single-owner ProducerHub list (the duty side's share).  The
 // value is a process-local pointer (the message never leaves the process); SBE
 // gives it a self-describing, versioned envelope on the ring like every other
 // message, instead of a raw memcpy of pointer bytes.

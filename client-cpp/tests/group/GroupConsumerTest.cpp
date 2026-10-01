@@ -106,6 +106,14 @@ namespace rpc = rune::protocol::client;
 /// thread IS the duty thread in these hub-level tests).
 static rune::client::detail::HubSubmit directSink(void* ctx,
                                                   const rune::client::detail::HubCommand& cmd) {
+    // F8c C7: a handle's release carries its destructor semantics (close),
+    // as the Client applies it; the test fixture owns the impl's memory.
+    if (cmd.op == rune::client::detail::HubCommand::Op::HandleRelease) {
+        rune::client::detail::HubCommand close = cmd;
+        close.op = rune::client::detail::HubCommand::Op::GroupClose;
+        static_cast<GroupConsumerHub*>(ctx)->applyCommandDirect(close);
+        return rune::client::detail::HubSubmit::Accepted;
+    }
     static_cast<GroupConsumerHub*>(ctx)->applyCommand(cmd);
     return rune::client::detail::HubSubmit::Accepted;
 }
@@ -396,7 +404,7 @@ protected:
         g_ledger   = SyncLedger{};
         g_hubNowNs = 0;
         hub_ = std::make_unique<GroupConsumerHub>();
-        impl_ = std::make_shared<GroupConsumerImpl>();
+        impl_ = std::make_unique<GroupConsumerImpl>();
         impl_->groupId  = "test-group";
         impl_->topicIds = {kTopicId};
         impl_->cfg.sessionTimeoutMs     = 30000;
@@ -404,7 +412,7 @@ protected:
         impl_->cfg.autoCommit           = true;
         impl_->active = true;
         impl_->state = GroupConsumerState::Unjoined;
-        hub_->add(impl_);
+        hub_->add(impl_.get());
     }
 
     void TearDown() override {
@@ -415,7 +423,9 @@ protected:
     }
 
     std::unique_ptr<GroupConsumerHub> hub_;
-    std::shared_ptr<GroupConsumerImpl> impl_;
+    // F8c C7: the fixture owns the impl's memory (the bare hub holds raw
+    // pointers; a handle built on it never frees it: no duty side detaches).
+    std::unique_ptr<GroupConsumerImpl> impl_;
     CaptureSink sink_;
 };
 
@@ -562,7 +572,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesOnOffsetCommitResponse) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
 
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     const int64_t corr = lastCommitCorrId(sink_);
@@ -580,7 +590,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesOnOffsetCommitResponse) {
 TEST_F(GroupConsumerHubTest, CommitSyncIgnoresUnrelatedOffsetCommitResponsesRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
 
     auto early = makeOffsetCommitResponse(0);  // e.g. an auto-commit's response
@@ -603,7 +613,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncIgnoresUnrelatedOffsetCommitResponsesRegr
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnCommitErrorCodeRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     auto ocr = makeOffsetCommitResponse(lastCommitCorrId(sink_),
@@ -617,7 +627,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsOnCommitErrorCodeRegression) {
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnRejoinRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     auto hbr = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress));
@@ -629,7 +639,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsOnRejoinRegression) {
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionLossRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     seedPosition(*hub_, 7);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     hub_->onConnected(kSessionId + 1, sink_.fn());  // a new session: the old one was lost
@@ -641,7 +651,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionLossRegression) {
 // pending — it is neither dropped (old code: never resolved) nor failed by the
 // first connect.
 TEST_F(GroupConsumerHubTest, CommitSyncBeforeStableWaitsAndIsSentOnceStableRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     EXPECT_FALSE(fut.ready());
@@ -658,7 +668,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncBeforeStableWaitsAndIsSentOnceStableRegre
 
 TEST_F(GroupConsumerHubTest, CommitSyncWithNothingToCommitResolvesRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);  // position still unseeded
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
     doWorkNow(*hub_, sink_);
     ASSERT_TRUE(fut.ready());
@@ -792,7 +802,7 @@ TEST_F(GroupConsumerHubTest, CloseDeactivates_NoDispatchAfterClose) {
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnClose) {
     // Create a GroupConsumer handle.
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
 
     bringToStable(*hub_, sink_, kTopicId, kPartition);
 
@@ -917,7 +927,7 @@ TEST_F(GroupConsumerHubTest, PositionNotRegressOnNewRecords) {
 // 19. GroupConsumer_CloseIsIdempotent
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, GroupConsumer_CloseIsIdempotent) {
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     EXPECT_TRUE(gc.active());
 
     gc.close();
@@ -932,7 +942,7 @@ TEST_F(GroupConsumerHubTest, GroupConsumer_CloseIsIdempotent) {
 // 20. GroupConsumer_MoveSemantics
 // ---------------------------------------------------------------------------
 TEST_F(GroupConsumerHubTest, GroupConsumer_MoveSemantics) {
-    GroupConsumer gc1(impl_, &directSink, hub_.get());
+    GroupConsumer gc1(impl_.get(), &directSink, hub_.get());
     EXPECT_TRUE(gc1.active());
 
     GroupConsumer gc2(std::move(gc1));
@@ -1310,13 +1320,13 @@ TEST_F(GroupConsumerHubTest, MultiGroupGuard_OneConsumerPerHub) {
     EXPECT_EQ(impl_->state, GroupConsumerState::Stable);
 
     // Add a second consumer.
-    auto impl2 = std::make_shared<GroupConsumerImpl>();
+    auto impl2 = std::make_unique<GroupConsumerImpl>();
     impl2->groupId  = "group-2";
     impl2->topicIds = {kTopicId + 1};
     impl2->cfg      = impl_->cfg;
     impl2->active = true;
     impl2->state = GroupConsumerState::Unjoined;
-    hub_->add(impl2);
+    hub_->add(impl2.get());
 
     // onConnected triggers join only for Unjoined/Rejoining consumers.
     sink_.clear();
@@ -1417,7 +1427,7 @@ TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRaceRegression) {
     hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
 
     GroupRingChannel ch;
-    GroupConsumer gc(impl_, &GroupRingChannel::fn, &ch, {}, &GroupRingChannel::opFn);
+    GroupConsumer gc(impl_.get(), &GroupRingChannel::fn, &ch, {}, &GroupRingChannel::opFn);
     constexpr int kIterations = 500;
     // The completion is delivered on the DUTY thread: it signals the app
     // thread through a test-harness atomic (the production form is a
@@ -1500,7 +1510,7 @@ struct CapturingGroupSink {
 TEST_F(GroupConsumerHubTest, CommitAndCloseAreCommandsNotSharedWritesRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     CapturingGroupSink cap;
-    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap, {}, &CapturingGroupSink::opFn);
+    GroupConsumer gc(impl_.get(), &CapturingGroupSink::fn, &cap, {}, &CapturingGroupSink::opFn);
 
     gc.commit();
     ASSERT_EQ(cap.cmds.size(), 1u);
@@ -1532,7 +1542,7 @@ TEST_F(GroupConsumerHubTest, CommitAndCloseAreCommandsNotSharedWritesRegression)
 
 TEST_F(GroupConsumerHubTest, CommitSyncSupersededFailsOlderFutureRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto f1 = commitSyncOp(gc);
     auto f2 = commitSyncOp(gc);
     ASSERT_TRUE(f1.ready());
@@ -1546,8 +1556,8 @@ TEST_F(GroupConsumerHubTest, CommitSyncSupersededFailsOlderFutureRegression) {
 // A commitSync for a consumer the hub does not hold (never adopted / foreign)
 // is failed, never stranded.
 TEST_F(GroupConsumerHubTest, CommitSyncForUnknownConsumerFailsNeverStrandsRegression) {
-    auto other = std::make_shared<GroupConsumerImpl>();  // never added to hub_
-    GroupConsumer gc(other, &directSink, hub_.get(), {}, &directOpSink);
+    auto other = std::make_unique<GroupConsumerImpl>();  // never added to hub_
+    GroupConsumer gc(other.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto f = commitSyncOp(gc);
     ASSERT_TRUE(f.ready());
     EXPECT_EQ(f.status(), OpStatus::Closed);
@@ -1558,7 +1568,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncForUnknownConsumerFailsNeverStrandsRegres
 TEST_F(GroupConsumerHubTest, HandleNeverTouchesClientAfterCloseAllRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     CapturingGroupSink cap;
-    GroupConsumer gc(impl_, &CapturingGroupSink::fn, &cap, {}, &CapturingGroupSink::opFn);
+    GroupConsumer gc(impl_.get(), &CapturingGroupSink::fn, &cap, {}, &CapturingGroupSink::opFn);
     EXPECT_TRUE(gc.active());
 
     hub_->closeAll(kSessionId, sink_.fn());
@@ -1571,17 +1581,19 @@ TEST_F(GroupConsumerHubTest, HandleNeverTouchesClientAfterCloseAllRegression) {
     EXPECT_EQ(cap.calls, 0);
 }
 
-// GroupAdd: the duty thread adopts the impl and frees the heap holder.
+// GroupAdd: the duty thread adopts the impl itself (F8c C7: no shared_ptr
+// holder — the hub holds the duty share of the raw impl).
 TEST(GroupConsumerHubCommand, GroupAddAdoptsAndFreesHolderRegression) {
     GroupConsumerHub hub;
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();
+    impl->active = true;
     EXPECT_TRUE(hub.empty());
     rune::client::detail::HubCommand c;
     c.op     = rune::client::detail::HubCommand::Op::GroupAdd;
-    c.handle = reinterpret_cast<uint64_t>(new std::shared_ptr<GroupConsumerImpl>(impl));
+    c.handle = reinterpret_cast<uint64_t>(impl.get());
     hub.applyCommand(c);
     EXPECT_FALSE(hub.empty());
-    EXPECT_EQ(impl.use_count(), 2) << "hub + local; the holder was freed";
+    EXPECT_EQ(hub.ownedCount(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,7 +1602,7 @@ TEST(GroupConsumerHubCommand, GroupAddAdoptsAndFreesHolderRegression) {
 
 // I2: the generation reaches the owning app thread only through the status ring.
 TEST_F(GroupConsumerHubTest, GenerationPublishedThroughStatusRingRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     EXPECT_EQ(gc.generation(), 0);
     bringToStable(*hub_, sink_, kTopicId, kPartition, /*genId=*/5);
     EXPECT_EQ(gc.generation(), 5);
@@ -1604,7 +1616,7 @@ TEST_F(GroupConsumerHubTest, GenerationPublishedThroughStatusRingRegression) {
 
 // Calls from inside a callback (duty thread) act on duty-owned state directly.
 TEST_F(GroupConsumerHubTest, HandleCallsOnDutyThreadActDirectlyRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get(), std::this_thread::get_id(), &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), std::this_thread::get_id(), &directOpSink);
     int32_t seenGen = -1;
     bool finishedInside = true;
     int records = 0;
@@ -1633,7 +1645,7 @@ TEST_F(GroupConsumerHubTest, HandleCallsOnDutyThreadActDirectlyRegression) {
 TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     GroupRingChannel ch;
-    GroupConsumer gc(impl_, &GroupRingChannel::fn, &ch);
+    GroupConsumer gc(impl_.get(), &GroupRingChannel::fn, &ch);
     std::atomic<bool> appDone{false};   // harness flags only
     std::atomic<int>  dispatched{0};
 
@@ -1702,7 +1714,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesAfterARefusedOffsetCommitRegressi
     seedPosition(*hub_, 7);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
 
     tx.refuseNext = 1;
@@ -1723,7 +1735,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncResolvesAfterARefusedOffsetCommitRegressi
 }
 
 TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionDownRegression) {
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);  // not even sent
     hub_->onSessionDown();
     ASSERT_TRUE(fut.ready());
@@ -1734,7 +1746,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionDownRegression) {
 TEST_F(GroupConsumerHubTest, CommitSyncAppliedWhileSessionDownFailsAtOnceRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     hub_->setSessionConnected(false);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     auto fut = commitSyncOp(gc);
     ASSERT_TRUE(fut.ready());
     EXPECT_EQ(fut.status(), OpStatus::SessionLost);
@@ -1750,7 +1762,7 @@ TEST_F(GroupConsumerHubTest, LeaveGroupOnCloseRetriedWhenRefusedRegression) {
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
     tx.refuseNext = 1;
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     gc.close();
     EXPECT_EQ(hub_->pendingLeaves(), 1u);
     EXPECT_EQ(hub_->retryPendingLeaves(kSessionId), 1);
@@ -1766,7 +1778,7 @@ TEST_F(GroupConsumerHubTest, PendingLeaveGroupDroppedOnSessionChangeRegression) 
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
     tx.refuseNext = 1;
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     gc.close();
     ASSERT_EQ(hub_->pendingLeaves(), 1u);
     EXPECT_EQ(hub_->retryPendingLeaves(kSessionId + 1), 0);
@@ -1786,7 +1798,7 @@ TEST_F(GroupConsumerHubTest, FatalOffsetCommitFailsCommitSyncAndIsNotReofferedRe
     seedPosition(*hub_, 7);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
 
     auto fut = commitSyncOp(gc);
     tx.fatalNext = 1;
@@ -1814,7 +1826,7 @@ TEST_F(GroupConsumerHubTest, FatalLeaveGroupIsDroppedNotRetriedRegression) {
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
     tx.fatalNext = 1;
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
     gc.close();
     EXPECT_EQ(hub_->pendingLeaves(), 0u);
     EXPECT_EQ(hub_->retryPendingLeaves(kSessionId), 0);
@@ -1829,7 +1841,7 @@ TEST_F(GroupConsumerHubTest, CloseAllSendsOneLeaveGroupWhenOnRevokedClosesRegres
     hub_->setSessionConnected(true, kSessionId);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), std::this_thread::get_id(), &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), std::this_thread::get_id(), &directOpSink);
     impl_->cbRevoked = [&](std::vector<TopicPartition>) { gc.close(); };
     sink_.clear();
     hub_->closeAll(kSessionId, sink_.fn());
@@ -1852,7 +1864,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsWhenANewSessionReplacesItsOwnRegress
     hub_->setSessionConnected(true, kSessionId, /*episode=*/1);
     RefusingGroupTransport tx;
     hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
 
     auto f1 = commitSyncOp(gc);
     ASSERT_EQ(hub_->flushRequestedCommits(kSessionId), 1);
@@ -1879,7 +1891,7 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsWhenANewSessionReplacesItsOwnRegress
 // error (SessionLostError); other failures (rejoin, close) are not.
 TEST_F(GroupConsumerHubTest, CommitSyncSessionLossIsADistinctRetriableErrorRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
-    GroupConsumer gc(impl_, &directSink, hub_.get(), {}, &directOpSink);
+    GroupConsumer gc(impl_.get(), &directSink, hub_.get(), {}, &directOpSink);
 
     auto down = commitSyncOp(gc);
     hub_->onSessionDown();
@@ -1907,7 +1919,7 @@ TEST(GroupConsumerHubCommand, DirectCommitAndCommitSyncBeforeAdoptionAreHonoured
     GroupConsumerHub hub;
     RefusingGroupTransport tx;
     hub.setDirectSend(&RefusingGroupTransport::fn, &tx);
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();
     impl->groupId  = "g";
     impl->topicIds = {kTopicId};
     impl->active   = true;
@@ -1931,7 +1943,7 @@ TEST(GroupConsumerHubCommand, DirectCommitAndCommitSyncBeforeAdoptionAreHonoured
 
     HubCommand add;  // the queued GroupAdd, drained later
     add.op     = HubCommand::Op::GroupAdd;
-    add.handle = reinterpret_cast<uint64_t>(new std::shared_ptr<GroupConsumerImpl>(impl));
+    add.handle = reinterpret_cast<uint64_t>(impl.get());
     hub.applyCommand(add);
     ASSERT_FALSE(hub.empty());
 
@@ -1961,27 +1973,27 @@ TEST(GroupConsumerHubCommand, CommitSyncHandlerSubscribesGroupRegression) {
     struct Adopter {
         GroupConsumerHub* hub = nullptr;
         int calls = 0;
-        std::vector<std::shared_ptr<GroupConsumerImpl>> made;
+        std::vector<std::unique_ptr<GroupConsumerImpl>> made;
         static void on(void* ctx, const Completion& c, std::span<const uint8_t> p) noexcept {
             auto* self = static_cast<Adopter*>(ctx);
             ++self->calls;
             SyncLedger::on(&g_ledger, c, p);
             for (int i = 0; i < 64; ++i) {  // force impls_ to reallocate
-                auto impl = std::make_shared<GroupConsumerImpl>();
+                auto impl = std::make_unique<GroupConsumerImpl>();
                 impl->active = true;
                 HubCommand add;
                 add.op     = HubCommand::Op::GroupAdd;
-                add.handle = reinterpret_cast<uint64_t>(new std::shared_ptr<GroupConsumerImpl>(impl));
+                add.handle = reinterpret_cast<uint64_t>(impl.get());
                 self->hub->applyCommandDirect(add);
                 self->made.push_back(std::move(impl));
             }
         }
     } adopter{&hub};
-    std::vector<std::shared_ptr<GroupConsumerImpl>> impls;
+    std::vector<std::unique_ptr<GroupConsumerImpl>> impls;
     for (int i = 0; i < 3; ++i) {
-        auto impl = std::make_shared<GroupConsumerImpl>();
+        auto impl = std::make_unique<GroupConsumerImpl>();
         impl->active = true;
-        hub.add(impl);
+        hub.add(impl.get());
         HubCommand sync;
         sync.op     = HubCommand::Op::GroupCommitSync;
         sync.handle = reinterpret_cast<uint64_t>(impl.get());

@@ -140,7 +140,9 @@ public:
         int64_t& nextCorrId,
         int32_t transactionTimeoutMs = 60'000);
 
-    ~TransactionalProducerImpl() = default;
+    // F8c C7: freed by whichever of {the handle, the duty side} detaches its
+    // share of `status`'s ownership word last (see TransactionalProducer).
+    ~TransactionalProducerImpl();
 
     TransactionalProducerImpl(const TransactionalProducerImpl&) = delete;
     TransactionalProducerImpl& operator=(const TransactionalProducerImpl&) = delete;
@@ -183,10 +185,29 @@ public:
     /// re-discovery back off and re-send.
     void onCoordinatorRediscovered() noexcept { ++discoveryGen_; }
 
-    /// Client close: every pending op completes Closed, every request / batch
-    /// / waiting record is dropped, the status channel is finished.  Later
-    /// commands are discarded.
+    /// Client close / closeImmediately: every pending op completes Closed,
+    /// every request / batch / waiting record is dropped, a pending close
+    /// token completes Closed, the status channel is finished.  Later commands
+    /// are discarded.  Idempotent.
     void failAll();
+
+    // ---- F8c C7: close (rich state: Open -> Closing{...} -> closed_) ---------
+    /// Begin closing: an open broker transaction (InTransaction /
+    /// AbortableError, or an in-doubt abort) is aborted with EndTxn(abort)
+    /// first; a commit / abort / init already running is waited for (its own
+    /// completion is delivered as usual).  Then every remaining op completes
+    /// Closed and the token completes: Ok, or the abort's failure status
+    /// (Timeout / Fenced / BrokerError), or Timeout when
+    /// transactionOpTimeoutMs passes first (a commit left in doubt, ...).
+    /// The producer is closed either way.  A second close completes Closed.
+    void beginClose(const detail::OpTarget& target, Token token, int64_t nowNs);
+    /// The handle's destructor semantics (the duty side of HandleRelease):
+    /// closeImmediately unless a close already started.
+    void applyHandleRelease() {
+        if (!closed_ && !std::holds_alternative<LifeClosing>(life_)) failAll();
+    }
+    /// A close (TxnClose / Client::close()'s drain) is in progress.
+    [[nodiscard]] bool closingDuty() const noexcept { return std::holds_alternative<LifeClosing>(life_); }
 
     // ---- Duty-thread reads (a duty-cycle callback; tests) ---------------------
     [[nodiscard]] int64_t  producerIdDuty() const noexcept { return producerId_; }
@@ -252,6 +273,7 @@ private:
 
         uint64_t          id = 0;
         OpKind            kind = OpKind::InitTransactions;
+        bool              internal = false;      // C7: the close's own abort (recorded, not delivered)
         detail::OpTarget  target{};
         Token             token = 0;
         int64_t           deadlineNs = 0;
@@ -321,6 +343,26 @@ private:
     using TxnSm = std::variant<SUninitialized, SInitializing, SReady, SInTransaction, SCommitting,
                                SAborting, SAbortableError, SFatalError>;
     static_assert(std::variant_size_v<TxnSm> == static_cast<std::size_t>(TxnState::FatalError) + 1);
+
+    // ---- F8c C7: close life (duty thread; rich states) -----------------------
+    struct LifeOpen {};
+    struct LifeClosing {
+        detail::OpTarget target{};
+        Token            token      = 0;
+        int64_t          deadlineNs = 0;
+        uint64_t         abortOpId  = 0;      // the close's own EndTxn(abort) op (0: none issued)
+        bool             abortDone  = false;  // that op completed (status below)
+        OpStatus         abortStatus = OpStatus::Ok;
+        uint16_t         abortCode   = 0;
+    };
+    std::variant<LifeOpen, LifeClosing> life_{};
+    /// One close step (beginClose, then every duty cycle while closing).
+    void closeStep_(int64_t nowNs);
+    /// The close's own abort (an internal op: its completion is recorded in
+    /// LifeClosing, never delivered).  Returns its op id (0: nothing to abort).
+    uint64_t startCloseAbort_(int64_t nowNs);
+    /// Close: fail what is left, finish the status channel, complete the token.
+    void finishClose_(OpStatus st, uint16_t errorCode);
 
     // ---- helpers ----------------------------------------------------------------
     void complete_(UserOp& op, OpStatus st, uint16_t errorCode = 0, std::string_view text = {});

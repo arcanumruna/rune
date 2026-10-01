@@ -7,9 +7,12 @@
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/Completions.h>
 
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace rune::client {
 
@@ -53,9 +56,64 @@ ProducerConfig ProducerConfig::fromEnv() noexcept {
     return cfg;
 }
 
-Producer::Producer(std::shared_ptr<producer::ProducerImpl> impl) noexcept
-    : impl_(std::move(impl))
+Producer::Producer(producer::ProducerImpl* impl) noexcept
+    : impl_(impl)
 {}
+
+Producer::Producer(Producer&& o) noexcept
+    : impl_(std::exchange(o.impl_, nullptr))
+{}
+
+Producer& Producer::operator=(Producer&& o) noexcept {
+    if (this != &o) {
+        release_();  // the current producer: closeImmediately + released
+        impl_ = std::exchange(o.impl_, nullptr);
+    }
+    return *this;
+}
+
+Producer::~Producer() { release_(); }
+
+// F8c C7: the §3.3 release.  Never throws, never waits for the duty side.
+void Producer::release_() noexcept {
+    producer::ProducerImpl* p = std::exchange(impl_, nullptr);
+    if (p == nullptr) return;  // moved-from
+    const producer::ProducerImpl::Hooks& hk = p->hooks();
+    if (hk.release == nullptr) {
+        // Bare impl (no Client — unit rigs): the handle is the only owner and
+        // the caller is its duty thread.  Destroying it from inside one of its
+        // own handlers would free it under the walk that fired the handler.
+        if (p->inDutyWork()) {
+            std::fprintf(stderr, "rune-client: FATAL: a bare Producer was destroyed inside one of its "
+                                 "own handlers (use-after-free); aborting\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+        p->applyHandleRelease();
+        delete p;
+        return;
+    }
+    // The duty side already detached (Client close handed it back, or the
+    // registration was refused): never touch the Client — it may be gone.
+    if (!p->dutyDetached()) {
+        detail::HubCommand cmd;
+        cmd.op     = detail::HubCommand::Op::HandleRelease;
+        cmd.handle = reinterpret_cast<uint64_t>(p);
+        cmd.a      = static_cast<int64_t>(detail::HandleKind::Producer);
+        try {
+            // Accepted: the duty side applies closeImmediately (unless a close
+            // already started) and detaches its share once the producer is
+            // quiescent.  Closed: a close() on another thread hands it back.
+            (void)hk.release(hk.ctx, cmd);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "rune-client: ~Producer: release not delivered: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "rune-client: ~Producer: release not delivered (unknown error)\n");
+        }
+    }
+    // The handle's last access: the side that detaches last frees the impl.
+    if (p->detachHandle()) delete p;
+}
 
 // ---------------------------------------------------------------------------
 // Hot path — void send (ZERO per-send heap allocation)
@@ -230,7 +288,7 @@ BatchBuilder Producer::batch(TopicHandle topic, const Key& key) {
         throw std::invalid_argument("Producer::batch: invalid topic handle");
     }
     const int32_t part = key.partition(topic.partitionCount);
-    return BatchBuilder(impl_, topic.topicId, part);
+    return BatchBuilder(impl_, topic.topicId, part);  // borrows: must not outlive this Producer
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +323,7 @@ OpStatus Producer::closeAndWait(std::chrono::nanoseconds timeout) {
     struct IssueCtx {
         producer::ProducerImpl* impl;
         OpResult                last = OpResult::InvalidArgument;
-    } ic{impl_.get()};
+    } ic{impl_};
     const detail::AndWaitIssue issue = [](void* c, const CompletionTarget& t, Token tok) {
         auto* x = static_cast<IssueCtx*>(c);
         x->last = x->impl->beginClose(t, tok);

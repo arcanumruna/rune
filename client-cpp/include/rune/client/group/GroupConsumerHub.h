@@ -39,7 +39,7 @@
 namespace rune::client::group {
 
 // The duty-thread-owned consumer list.
-using ImplList = std::vector<std::shared_ptr<GroupConsumerImpl>>;
+using ImplList = std::vector<GroupConsumerImpl*>;  // F8c C7: not owning (see owned_)
 
 // SendFn: (ingressStreamId, buf, len) -> bool.
 // ingressStreamId=0 means "use the default ingress stream".
@@ -61,7 +61,32 @@ public:
 
     /// Register a GroupConsumerImpl (duty thread; Client reaches it via
     /// HubCommand{GroupAdd}).  Cold path.
-    void add(std::shared_ptr<GroupConsumerImpl> impl);
+    void add(GroupConsumerImpl* impl);
+
+    /// F8c C7: the handle released `impl` (its HandleRelease was applied and
+    /// the consumer closed): once nothing references it any more (no callback
+    /// of it running, no LeaveGroup being retried, no dirty snapshot), forget
+    /// it and return true — the caller detaches the duty side's share (and
+    /// frees the impl if the handle already detached).  Call only between
+    /// duty cycles' hub walks (never from inside a hub iteration).
+    [[nodiscard]] bool release(GroupConsumerImpl* impl) noexcept;
+
+    /// Client close (after closeAll): every impl this hub still owns is
+    /// handed back through `detach(impl)`; the hub holds nothing afterwards.
+    template <class Detach>
+    void handBackAll(Detach&& detach) noexcept {
+        std::vector<GroupConsumerImpl*> owned;
+        owned.swap(owned_);
+        impls_.clear();
+        for (GroupConsumerImpl* impl : owned) detach(impl);
+    }
+
+    /// Finish `impl` locally (inactive, a pending commitSync Closed, status
+    /// closed — deferred past its running callback) with no LeaveGroup sent.
+    void finishLocal(GroupConsumerImpl& impl) { finish_(impl); }
+
+    /// Impls this hub owns (adopted, not yet released and forgotten).
+    [[nodiscard]] std::size_t ownedCount() const noexcept { return owned_.size(); }
 
     /// Apply one group HubCommand drained from the agent ring.  Non-group ops
     /// are ignored.  A command naming an impl this hub does not hold is
@@ -183,8 +208,15 @@ public:
     }
 
 private:
-    // ---- Registered consumers (duty-thread owned; never shrinks) -------------
+    // ---- Registered consumers (duty-thread owned) ------------------------------
+    // impls_: the consumers the duty cycle drives (active at adoption).  Index
+    // loops capture the size first (a handler may adopt one); an entry is
+    // removed only by release(), which never runs inside a hub walk.
     ImplList impls_;
+    // F8c C7: every impl whose GroupAdd this hub adopted (also one closed
+    // before its adoption), until release() forgets it or Client close hands
+    // it back.
+    std::vector<GroupConsumerImpl*> owned_;
 
     // fix1 C1 / fix2 minor-5: plain counter (see testCallbackExceptionCount()).
     uint64_t callbackExceptions_ = 0;

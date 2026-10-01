@@ -414,7 +414,7 @@ TEST(MetadataRouting, RealRedirectFrameUpdatesCacheZeroRtt) {
     EXPECT_GE(gw->producesSeen.load(), 1) << "gateway must have seen the produce";
 
     // Best-effort: fail/close (node 1 endpoint is dead so the produce won't ack).
-    client->close();
+    client->closeImmediately();  // C7: teardown semantics (close() drains)
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }
 
@@ -459,7 +459,7 @@ TEST(MetadataRouting, KeyedProduceResolvesPartitionLeaderEndpoint) {
     EXPECT_TRUE(rig.drive([&] { return client->testRouteEndpoint(1, key0) == leaderEp; }))
         << "after redirect, keyed produce must route to the new partition leader's endpoint";
 
-    client->close();
+    client->closeImmediately();  // C7: teardown semantics (close() drains)
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }
 
@@ -522,7 +522,7 @@ TEST(MetadataRouting, BackgroundRefreshWithBackoffOnNoProgress) {
     EXPECT_LT(gw->metadataReqSeen.load(), 30)
         << "exponential backoff must prevent a metadata-request storm";
 
-    client->close();
+    client->closeImmediately();  // C7: teardown semantics (close() drains)
     try { std::filesystem::remove_all(agentDir); } catch (...) {}
 }
 

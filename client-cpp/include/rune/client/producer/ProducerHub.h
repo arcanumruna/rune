@@ -43,8 +43,10 @@
 
 namespace rune::client::producer {
 
-// Alias for the producer list (runner-thread-owned; plain vector).
-using ImplList = std::vector<std::shared_ptr<ProducerImpl>>;
+// Alias for the producer list (runner-thread-owned; plain vector).  F8c C7:
+// raw pointers to the impls the duty side holds its share of (§3.3); a slot
+// is the producer's ordinal, nullptr once its producer was released (removed).
+using ImplList = std::vector<ProducerImpl*>;
 
 class ProducerHub {
 public:
@@ -56,7 +58,7 @@ public:
     ProducerHub(ProducerHub&&) = delete;
     ProducerHub& operator=(ProducerHub&&) = delete;
 
-    ~ProducerHub() = default;  // vector frees the shared_ptrs; runs after join.
+    ~ProducerHub() = default;  // holds nothing after handBackAll() (Client close).
 
     // ---- Registration — RUNNER-THREAD ONLY -----------------------------------
     //
@@ -66,7 +68,32 @@ public:
     // the producer's ordinal (its index; encoded into its batch correlation ids).
     // Throws std::length_error past batchcorr::kMaxOrdinal + 1 producers.
 
-    void add(std::shared_ptr<ProducerImpl> impl);
+    void add(ProducerImpl* impl);
+
+    /// F8c C7: forget a released, quiescent producer (its slot becomes a
+    /// tombstone; the ordinal is reused only once every fresh one is taken,
+    /// oldest first).  The caller detaches the duty share.
+    void remove(ProducerImpl* impl) noexcept;
+
+    /// Client close (after closeFinalAll): every producer still held is
+    /// handed back through `detach(impl)`; the hub holds nothing afterwards.
+    template <class Detach>
+    void handBackAll(Detach&& detach) noexcept {
+        ImplList all;
+        all.swap(producers_);
+        live_ = 0;
+        for (ProducerImpl* impl : all) {
+            if (impl != nullptr) detach(impl);
+        }
+    }
+
+    /// The producers held (live, non-tombstone slots) — any order.
+    template <class F>
+    void forEach(F&& f) {
+        for (std::size_t i = 0; i < producers_.size(); ++i) {
+            if (producers_[i] != nullptr) f(*producers_[i]);
+        }
+    }
 
     // ---- Agent-thread duty cycle (implemented in ProducerHub.cpp) -----------
 
@@ -75,7 +102,8 @@ public:
     template <class Sink>
     int drainAndFlush(int64_t nowNs, int64_t sessionId, const Sink& sink) {
         int work = 0;
-        for (auto& impl : producers_) {
+        for (ProducerImpl* impl : producers_) {
+            if (impl == nullptr) [[unlikely]] continue;  // F8c C7: a released slot
             // fix1 minor 9: publish the consumer-liveness heartbeat ONCE per
             // producer per cycle (not once per drainRing() call below, which can
             // run up to 256x/cycle — same relaxed store either way, just cheaper).
@@ -125,7 +153,9 @@ public:
     /// F8c C6a: the duty-thread failure tail-close of every producer (T15:
     /// the Aeron client closed under a shard).  Idempotent.
     void failCloseAll(OpStatus st) {
-        for (auto& impl : producers_) impl->failClose(st);
+        for (ProducerImpl* impl : producers_) {
+            if (impl != nullptr) impl->failClose(st);
+        }
     }
 
     /// fix1 C2/I3: mark every registered producer's ring closed. Called by
@@ -134,7 +164,9 @@ public:
     /// outlives this Client then gets SendResult::Closed from trySubmit() and
     /// never touches the (by-then-dangling) pump hook.
     void closeAllRings() noexcept {
-        for (auto& impl : producers_) impl->markRingClosed();
+        for (ProducerImpl* impl : producers_) {
+            if (impl != nullptr) impl->markRingClosed();
+        }
     }
 
     /// Fail every record of the in-flight batch with this wire correlationId
@@ -149,9 +181,10 @@ public:
 
     bool empty() const noexcept {
         // Runner-thread-only read of the single-owner vector — no lock, no atomic.
-        return producers_.empty();
+        return live_ == 0;
     }
-    std::size_t size() const noexcept { return producers_.size(); }
+    /// Producers held (released + forgotten ones excluded).
+    std::size_t size() const noexcept { return live_; }
 
     /// CB-5 B: attempt to resend a redirected Produce identified by correlationId.
     /// Returns true if one producer handled it (resent or failed).
@@ -201,6 +234,9 @@ private:
     // registration via the agent ring (kMsgRegisterProducer), so this vector is
     // never touched concurrently.  Shutdown paths run after the runner is joined.
     ImplList producers_;
+    std::size_t live_ = 0;                // non-tombstone slots
+    std::vector<uint32_t> freeOrdinals_;  // F8c C7: released ordinals, FIFO (reused once fresh run out)
+    std::size_t freeHead_ = 0;            // next freeOrdinals_ entry to reuse
 };
 
 } // namespace rune::client::producer

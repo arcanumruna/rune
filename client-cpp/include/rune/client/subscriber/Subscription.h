@@ -10,10 +10,10 @@
 //   - The record spans (Record::key, Record::value) are ZERO-COPY views into
 //     the Aeron fragment buffer.  They are valid ONLY during the callback; the
 //     handler must copy any data it needs to retain beyond the callback.
-//   - Subscription::unsubscribe() and the RAII dtor submit an Unsubscribe
-//     command via the agent command ring — the actual local-routing removal
-//     happens on the agent thread when the ring is drained (F8a: no shared
-//     state, no atomics, no locks).
+//   - Subscription::unsubscribe() and the RAII dtor (F8c C7: a HandleRelease,
+//     which unsubscribes) submit a command via the agent command ring — the
+//     actual local-routing removal happens on the agent thread when the ring
+//     is drained (F8a: no shared state, no atomics, no locks).
 //   - position() is advanced on the agent thread after each delivered Records
 //     frame and PUBLISHED to the handle through a per-subscription status ring;
 //     reads are eventually consistent.
@@ -120,8 +120,14 @@ struct SubscriptionStatus {
 // ---------------------------------------------------------------------------
 // SubscriptionImpl — internal state for one subscription (F8a: shared-nothing).
 //
-// Held by the Subscription handle (app thread) and the SubscriberHub routing
-// table (duty thread), but NO field is ever read or written by both:
+// F8c C7 ownership (spec §3.3, no shared_ptr): the impl is owned jointly by
+// the Subscription handle and the duty side (the SubscriberHub, from the
+// SubscribeAdd's adoption until the handle's HandleRelease is applied and no
+// hub table references it any more — or until Client close hands it back).
+// Each side detaches its share of `status`'s ownership word exactly once; the
+// side that detaches LAST frees the impl.  Nobody waits, nobody refcounts.
+//
+// Neither side ever reads or writes a field the other owns:
 //   - immutable after construction (written by the creating app thread BEFORE
 //     the SubscribeAdd command is put on the agent ring, whose release/acquire
 //     publishes them): topicId, partition, handler;
@@ -159,8 +165,13 @@ struct SubscriptionImpl {
     detail::StatusRing<SubscriptionStatus> status;
 
     SubscriptionImpl() = default;
+    // F8c C7: freed by whichever of {the handle, the duty side} detaches its
+    // share of `status`'s ownership word last (see Subscription).
+    ~SubscriptionImpl() {
+        if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::Subscription, this);
+    }
 
-    // Non-copyable, non-movable (owned by shared_ptr; the ring is pinned).
+    // Non-copyable, non-movable (raw single-owner hand-off; the ring is pinned).
     SubscriptionImpl(const SubscriptionImpl&) = delete;
     SubscriptionImpl& operator=(const SubscriptionImpl&) = delete;
     SubscriptionImpl(SubscriptionImpl&&) = delete;
@@ -178,10 +189,14 @@ struct SubscriptionImpl {
 //     allowed: they act directly on duty-owned state and never touch the
 //     handle's app-side cache.  In Invoker mode the owner thread is the duty
 //     thread and every call is the owner's.
-//   - unsubscribe() / the dtor hand an Unsubscribe command to the duty thread
-//     (applied directly when already on it).  Delivery is GUARANTEED: a full
-//     command ring is waited out on duty-thread progress, never a timeout,
-//     never a throw.
+//   - unsubscribe() hands an Unsubscribe command to the duty thread (applied
+//     directly when already on it).  Delivery is GUARANTEED: a full command
+//     ring is waited out on duty-thread progress, never a timeout, never a
+//     throw.  The destructor (F8c C7) hands over the handle's share of the
+//     impl in one HandleRelease command, which unsubscribes; in Invoker mode
+//     it is duty work (applied directly on any thread: never waits on the
+//     ring), and the impl is freed by whichever side lets go last — never
+//     while one of its handlers runs.
 //   - position() / subscriptionId() drain the subscription's status ring and
 //     answer from the handle's own cache (eventually consistent).
 //   - finished(): the duty side is done with this subscription.  Once it
@@ -209,19 +224,26 @@ class Subscription {
 public:
     // ---- Construction (called by Client::subscribe()) -----------------------
 
-    /// Constructed by Client::subscribe().  `sink`/`sinkCtx` deliver commands
-    /// to the duty thread.  `dutyThread`: the Thread-mode runner (calls from it
-    /// take the duty path); a default id (Invoker mode, tests) disables that.
-    Subscription(std::shared_ptr<SubscriptionImpl> impl,
-                 detail::HubCommandSink            sink,
-                 void*                             sinkCtx,
-                 std::thread::id                   dutyThread = {}) noexcept;
+    /// Constructed by Client::subscribe(): takes the handle's share of `impl`.
+    /// `sink`/`sinkCtx` deliver commands to the duty thread (nullptr: a
+    /// standalone handle — no duty side, the handle alone frees the impl).
+    /// `dutyThread`: the Thread-mode runner (calls from it take the duty
+    /// path); a default id (Invoker mode, tests) disables that.
+    Subscription(SubscriptionImpl*      impl,
+                 detail::HubCommandSink sink,
+                 void*                  sinkCtx,
+                 std::thread::id        dutyThread = {}) noexcept;
 
-    // RAII: dtor calls unsubscribe() if still active (never throws).
+    /// F8c C7 release (§3.3): unsubscribes (the duty side applies it) and
+    /// gives the handle's share of the impl to the duty side.  Never throws,
+    /// never waits for the duty side (a full command ring is waited out on
+    /// duty progress, as for unsubscribe(); Invoker mode: duty work, applied
+    /// directly on any thread — same contract as doWork()).  After Client
+    /// close the impl was handed back: the handle frees it, never touching
+    /// the Client.
     ~Subscription();
 
-    // Non-copyable (unique ownership of the unsubscribe side-effect).
-    // Movable so Client::subscribe() can return it by value.
+    // Move-only (unique ownership of the handle's share).
     Subscription(const Subscription&) = delete;
     Subscription& operator=(const Subscription&) = delete;
 
@@ -257,12 +279,13 @@ private:
         return dutyThread_ != std::thread::id{} && std::this_thread::get_id() == dutyThread_;
     }
     void drainStatus_() const;
+    /// F8c C7: the §3.3 release of the handle's share (see the destructor).
+    void release_() noexcept;
 
-    std::shared_ptr<SubscriptionImpl> impl_;
+    SubscriptionImpl*                 impl_    = nullptr;  // the handle's share (§3.3)
     detail::HubCommandSink            sink_    = nullptr;
     void*                             sinkCtx_ = nullptr;
     std::thread::id                   dutyThread_{};
-    bool                              moved_        = false;
     bool                              unsubscribed_ = false;  // handle-local (app-owned)
     // App-owned cache of the latest status snapshot drained from impl_->status.
     mutable SubscriptionStatus        cache_{};

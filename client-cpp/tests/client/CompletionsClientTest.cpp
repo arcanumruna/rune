@@ -275,7 +275,7 @@ TEST(CompletionsClient, CqReleaseRacingCloseNeverLeaksNorDoubleFreesRegression) 
         while (ready.load() != kQueues) std::this_thread::yield();
         go.store(true);
         if (it % 2 == 0) std::this_thread::yield();
-        client->close();
+        client->closeImmediately();  // C7: the teardown races the releases (close() adds its own queue)
         for (auto& t : ts) t.join();
         EXPECT_EQ(accepted.load(), kQueues);
         EXPECT_EQ(client->testRegisteredCqs(), 0u) << "iteration " << it;
@@ -497,7 +497,7 @@ TEST(CompletionsClient, CloseCompletesEveryControlTokenClosedRegression) {
         ASSERT_EQ(r.client.listTopics(ringLog.handler(), 78), rc::OpResult::Accepted);
         ASSERT_EQ(r.client.testPendingControlOps(), 3u);
 
-        r.client.close();
+        r.client.closeImmediately();  // F8c C7: close() would first pump the queued ops
         for (const PendingOp* op : {&p, &d, &g, &ring}) {
             ASSERT_TRUE(op->ready()) << "not completed by close()";
             EXPECT_EQ(op->status(), rc::OpStatus::Closed) << op->describe();
@@ -519,7 +519,7 @@ TEST(CompletionsClient, CloseCompletesEveryControlTokenClosedRegression) {
         auto k2 = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
         auto l  = cq.issue([&](rc::Completions& q, rc::Token t) { return client.listTopics(q, t); });
         ASSERT_TRUE(l.waitReady()) << "listTopics needs no broker";
-        client.close();
+        client.closeImmediately();
         ASSERT_TRUE(k.ready());
         ASSERT_TRUE(k2.ready());
         EXPECT_EQ(k.status(), rc::OpStatus::Superseded);
@@ -836,7 +836,7 @@ TEST(CompletionsClient, QueueReleasedOnTheClosingThreadDuringTheDrainRegression)
         while (client.listTopics(h, 1) != rc::OpResult::Closed) std::this_thread::yield();
         g_parkRunner.store(false);  // the runner resumes only after the ring closed
     });
-    client.close();  // the drain on THIS thread destroys the queue
+    client.closeImmediately();  // the drain on THIS thread destroys the queue (C7: teardown only)
     unpark.join();
     EXPECT_EQ(client.testRegisteredCqs(), 0u);
 }
@@ -882,7 +882,7 @@ TEST(CompletionsClient, AbandonedCloseDrainLeavesTheQueueBornFinishedRegression)
         q.reset();  // born finished: freed locally
     });
     while (client.testCommandRingTail() == tailBefore) std::this_thread::yield();
-    client.close();  // abandons its drain: the CqAdd is never applied
+    client.closeImmediately();  // abandons its drain: the CqAdd is never applied (C7: teardown only)
     ctor.join();
     EXPECT_EQ(afterwards, rc::OpResult::Closed) << "born finished";
     EXPECT_EQ(outstanding, 0u) << "the registration credit was returned";
@@ -1050,7 +1050,7 @@ TEST(CompletionsClient, NonCloserReleaseDuringCloseNeverWaitsRegression) {
             while (client.listTopics(h, 1) != rc::OpResult::Closed) std::this_thread::yield();
             g_parkRunner.store(false);
         });
-        client.close();
+        client.closeImmediately();  // C7: the runner is parked — teardown only
         unpark.join();
     }
     EXPECT_EQ(g_ringsFreed.load(), 1) << "the worker's ring was leaked or freed twice";

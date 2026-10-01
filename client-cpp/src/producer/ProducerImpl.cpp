@@ -2497,6 +2497,7 @@ aeron::util::index_t ProducerImpl::testClaimSendRecord(int32_t topicId, int32_t 
 }
 
 ProducerImpl::~ProducerImpl() {
+    if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::Producer, this);
     // Last owner gone (no other thread can reach this producer): free every
     // Tier-2 entry still owned here WITHOUT completing anything (a handler's
     // context may already be dead).  Ack handles are plain tokens: nothing to free.

@@ -218,21 +218,46 @@ enum class SendResult : uint8_t {
 // ---------------------------------------------------------------------------
 // Producer
 //
-// Returned by Client::producer(config).  Owns a shared_ptr to ProducerImpl so
-// it is cheap to copy, and copyable into lambdas etc.
+// Returned by Client::producer(config).  F8c C7: MOVE-ONLY.  The handle holds
+// its share of the ProducerImpl (raw — no shared_ptr, no refcount); the duty
+// side (the Client's ProducerHub) holds the other (spec §3.3).
+//
+// Sharing across threads (Thread mode): keep ONE Producer and lend
+// `Producer&` to the threads that send — trySend/send are safe concurrently
+// (the producer ring is many-to-one).  The Producer must not be destroyed,
+// moved from or moved into while any thread may still be using it (the same
+// contract as any C++ object).  A BatchBuilder borrows the producer and must
+// not outlive it.
+//
+// Destruction = closeImmediately() (user decision 2: a destructor never
+// blocks): every accepted record not yet acknowledged completes Closed,
+// exactly once, unless a close is already in progress (close(target, token)
+// / close(): that drain continues on the duty side and its token still
+// completes).  Call close() first when delivery matters.  The impl itself is
+// freed by whichever of the handle / the duty side lets go last (one ring
+// word; nobody waits) — never while one of its handlers is running.
 // ---------------------------------------------------------------------------
 class Producer {
 public:
-    // Constructed by Client::producer() — not intended for direct construction.
-    explicit Producer(std::shared_ptr<producer::ProducerImpl> impl) noexcept;
+    /// Constructed by Client::producer(): takes the handle's share of `impl`.
+    /// A bare impl (no Client hooks — unit rigs) is owned by the handle alone.
+    explicit Producer(producer::ProducerImpl* impl) noexcept;
 
-    // Copyable, movable (shared_ptr semantics).
-    Producer(const Producer&) = default;
-    Producer& operator=(const Producer&) = default;
-    Producer(Producer&&) = default;
-    Producer& operator=(Producer&&) = default;
+    // Move-only (F8c C7).
+    Producer(const Producer&) = delete;
+    Producer& operator=(const Producer&) = delete;
+    Producer(Producer&& o) noexcept;
+    Producer& operator=(Producer&& o) noexcept;
 
-    ~Producer() = default;
+    /// F8c C7: closeImmediately() (unless a close already started) + the §3.3
+    /// release.  Never throws, never waits for the duty side; Invoker mode:
+    /// duty work — applied directly on whichever thread destroys it (the
+    /// doWork() contract: never concurrently with doWork() / close() on
+    /// another thread), so the off-owner destroy pattern works.
+    ~Producer();
+
+    /// The handle owns no producer (moved-from).
+    [[nodiscard]] bool valid() const noexcept { return impl_ != nullptr; }
 
     // ---- Max value size (named constant) ------------------------------------
 
@@ -459,9 +484,7 @@ public:
     /// completes Closed.  No flush, no wait (Thread mode: applied by the runner
     /// shortly after).  Idempotent.  Accepted, or Closed (the Client is closed:
     /// its close completes everything), or WrongThread (Invoker, off the owner).
-    /// NOTE (F8c C7): the handle destructor will call this once handles are
-    /// move-only; today Producer is copyable, so destroying a copy does not
-    /// close the producer.
+    /// The handle destructor does this (F8c C7) unless a close already started.
     OpResult closeImmediately();
 
     // ---- Instrumentation counters (agent-thread written, caller-read after sync)
@@ -485,7 +508,10 @@ public:
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept;
 
 private:
-    std::shared_ptr<producer::ProducerImpl> impl_;
+    /// F8c C7: the §3.3 release of the handle's share (see the destructor).
+    void release_() noexcept;
+
+    producer::ProducerImpl* impl_ = nullptr;  // the handle's share (§3.3): ONE load per send
 };
 
 } // namespace rune::client

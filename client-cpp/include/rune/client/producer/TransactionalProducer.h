@@ -112,10 +112,18 @@ enum class TxnState : uint8_t {
 // ---------------------------------------------------------------------------
 // TransactionalProducer — user-facing handle for the Tier-3 transactional API.
 //
-// Copies share one impl (shared_ptr).  The status accessors (producerId /
-// producerEpoch / transactionActive) drain ONE status channel: call them
-// from one app thread (or a duty-cycle callback, which reads the live state).
-// A handle may outlive its Client: after close every op returns Closed.
+// F8c C7: MOVE-ONLY.  The handle holds its share of the impl (raw — no
+// shared_ptr); the duty side (the Client) holds the other (spec §3.3).  The
+// status accessors (producerId / producerEpoch / transactionActive) drain ONE
+// status channel: call them from one app thread (or a duty-cycle callback,
+// which reads the live state).  A handle may outlive its Client: after close
+// every op returns Closed.
+//
+// Shutdown (user decision 2): close() aborts an open broker transaction
+// (EndTxn(abort)) before it reports closed; closeImmediately() discards
+// locally (pending ops complete Closed; an open broker transaction is left to
+// the coordinator's transaction timeout); the destructor = closeImmediately()
+// unless a close already started (that close then completes on the duty side).
 // ---------------------------------------------------------------------------
 class TransactionalProducer {
 public:
@@ -125,17 +133,22 @@ public:
     /// sinks).  `sink` carries the no-completion commands (begin / send),
     /// `opSink` the token ops, `waitSink` the *AndWait sugar; `dutyThread` is
     /// the Thread-mode runner (calls from it read the duty state directly).
-    TransactionalProducer(std::shared_ptr<producer::TransactionalProducerImpl> impl,
+    TransactionalProducer(producer::TransactionalProducerImpl* impl,
                           detail::HubCommandSink sink, void* sinkCtx,
                           std::thread::id dutyThread = {},
                           detail::TargetedOpSink opSink = nullptr,
                           detail::AndWaitSink waitSink = nullptr) noexcept;
 
-    TransactionalProducer(const TransactionalProducer&) = default;
-    TransactionalProducer& operator=(const TransactionalProducer&) = default;
-    TransactionalProducer(TransactionalProducer&&) = default;
-    TransactionalProducer& operator=(TransactionalProducer&&) = default;
-    ~TransactionalProducer() = default;
+    // Move-only (F8c C7).
+    TransactionalProducer(const TransactionalProducer&) = delete;
+    TransactionalProducer& operator=(const TransactionalProducer&) = delete;
+    TransactionalProducer(TransactionalProducer&& o) noexcept;
+    TransactionalProducer& operator=(TransactionalProducer&& o) noexcept;
+
+    /// F8c C7: closeImmediately() (unless a close already started) + the §3.3
+    /// release.  Never throws, never waits for the duty side; Invoker mode:
+    /// duty work (applied directly on any thread — the doWork() contract).
+    ~TransactionalProducer();
 
     // ---- Token ops (exactly one completion after Accepted) --------------------
     // Synchronous rejections (no completion): Closed (the Client / producer is
@@ -174,6 +187,32 @@ public:
     void commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
+    // ---- Close (F8c C7) ---------------------------------------------------------
+
+    /// Begin-close (token op, op = OpKind::TxnClose).  The duty side first
+    /// aborts an open broker transaction (EndTxn(abort); one that never
+    /// started ends locally), waits for a commit / abort / init already
+    /// running, then completes every remaining op Closed and the token:
+    ///   Ok        closed (nothing was open, or the abort succeeded);
+    ///   Timeout / Fenced / BrokerError  the abort failed (or a commit was
+    ///             left in doubt: Timeout) — the producer is closed anyway;
+    ///   Closed    closeImmediately() / Client close intervened, or a second
+    ///             close.
+    /// Ops issued after this return Closed (handle-side), and any that were
+    /// still queued complete Closed.
+    OpResult close(CompletionTarget target, Token token);
+    /// Blocking close: begin-close + wait (Invoker owner pumps doWork(); a
+    /// Thread-mode app thread idle-polls; from a duty-cycle callback:
+    /// std::logic_error).  Returns the token's status; Closed at once when
+    /// the producer is already closed.
+    OpStatus close();
+    /// close() with a bound on the wait (std::runtime_error on wait timeout).
+    OpStatus closeAndWait(std::chrono::nanoseconds timeout);
+    /// Discard locally now: pending ops complete Closed, a pending close token
+    /// completes Closed, records not yet produced are dropped (no EndTxn).
+    /// Idempotent.  Accepted, or Closed (already closed / Client closed).
+    OpResult closeImmediately();
+
     // ---- No-completion commands ------------------------------------------------
 
     /// Start a transaction (a command for the duty thread).  Applied only in
@@ -202,10 +241,8 @@ public:
     /// The transaction state machine's state (eventually consistent).
     [[nodiscard]] TxnState state() const noexcept;
 
-    /// Access raw impl (hub wiring / tests — not user API).
-    [[nodiscard]] std::shared_ptr<producer::TransactionalProducerImpl> impl() const noexcept {
-        return impl_;
-    }
+    /// Access raw impl (hub wiring / tests — not user API; borrowed).
+    [[nodiscard]] producer::TransactionalProducerImpl* impl() const noexcept { return impl_; }
 
 private:
     [[nodiscard]] bool onDutyThread_() const noexcept {
@@ -214,13 +251,16 @@ private:
     [[nodiscard]] bool finished_() const noexcept;
     OpResult issue_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op);
     void andWait_(const char* what, std::chrono::nanoseconds timeout, detail::AndWaitIssue issue, void* ctx);
+    /// F8c C7: the §3.3 release of the handle's share (see the destructor).
+    void release_() noexcept;
 
-    std::shared_ptr<producer::TransactionalProducerImpl> impl_;
+    producer::TransactionalProducerImpl* impl_ = nullptr;  // the handle's share (§3.3)
     detail::HubCommandSink sink_     = nullptr;
     void*                  sinkCtx_  = nullptr;
     std::thread::id        dutyThread_{};
     detail::TargetedOpSink opSink_   = nullptr;
     detail::AndWaitSink    waitSink_ = nullptr;
+    bool                   closeIssued_ = false;  // handle-local: close() / closeImmediately() was called
 };
 
 } // namespace rune::client

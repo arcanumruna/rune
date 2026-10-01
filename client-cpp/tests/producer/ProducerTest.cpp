@@ -353,10 +353,9 @@ struct AgentHarness {
 
     /// Create and register a producer with the hub.
     Producer makeProducer(ProducerConfig pcfg = {}) {
-        auto impl = std::make_shared<rprod::ProducerImpl>(
-            pcfg);
+        auto* impl = new rprod::ProducerImpl(pcfg);  // F8c C7: the handle owns it (bare)
         hub.add(impl);
-        return Producer(std::move(impl));
+        return Producer(impl);
     }
 
     /// Connect the agent (submit + pump until Connected).
@@ -1388,7 +1387,7 @@ TEST(Producer, RingFullDropAndRecover) {
     pcfg.maxInFlight = 4;
 
     // Use an impl directly so we can call submitSendRecord and inspect the return value.
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, 4 * 1024);
+    auto* impl = new rprod::ProducerImpl(pcfg, 4 * 1024);
     h.hub.add(impl);
     Producer p(impl);
 

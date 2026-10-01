@@ -274,7 +274,7 @@ TEST(ProducerAckToken, RejectedTrySendReturnsCreditAndNoCompletionRegression) {
 // an in-flight batch, a never-sent builder record and a never-sent Tier-2
 // batch — and a late OK ack afterwards completes nothing.
 TEST(ProducerAckToken, DeliveryTimeoutCompletesDeliveryFailedOnceRegression) {
-    auto impl = std::make_shared<ProducerImpl>(ackCfg());
+    auto impl = std::make_unique<ProducerImpl>(ackCfg());
     AckLedger L;
     L.attach(*impl);
     CorrSink cs;
@@ -283,7 +283,7 @@ TEST(ProducerAckToken, DeliveryTimeoutCompletesDeliveryFailedOnceRegression) {
     pumpBare(*impl, sink);  // in flight
     ASSERT_EQ(cs.corr.size(), 1u);
     ASSERT_TRUE(impl->submitSendRecord(1, 1, rc::Key(uint64_t{1}), kVal, true, AckLedger::hi(2)));
-    rc::BatchBuilder bb(impl, 1, 2);
+    rc::BatchBuilder bb(impl.get(), 1, 2);
     bb.add(kVal);
     ASSERT_EQ(bb.send(AckToken{3}), OpResult::Accepted);
     for (int i = 0; i < 10 && impl->drainRing(kNow) > 0; ++i) {}
@@ -407,7 +407,7 @@ TEST(ProducerAckToken, CloseFailsAllInflightAcksClosedRegression) {
     for (int i = 0; i < 5; ++i) ops.push_back(cq.send(ring, topic, rc::Key(uint64_t{2}), kVal));  // in the ring
     for (const auto& o : ops) ASSERT_TRUE(o.accepted()) << o.describe();
     const uint64_t stale0 = r.client->testStaleCqDrops();
-    r.client->close();
+    r.client->closeImmediately();  // C7: teardown semantics (close() drains)
     EXPECT_EQ(r.client->testStaleCqDrops(), stale0) << "no producer completion after the hand-back";
     for (const auto& o : ops) {
         ASSERT_TRUE(o.ready()) << o.describe();
@@ -679,7 +679,7 @@ TEST(ProducerBatchAcks, EveryAcceptedRecordInExactlyOneBatchAckThroughCloseRegre
     for (const auto& c : sD.raw) EXPECT_EQ(c.status, OpStatus::Closed);
     EXPECT_EQ(bqD.outstanding(), 0u);
     EXPECT_EQ(bqD.reservedBytes(), 0u);
-    r.client->close();  // the ring producer's 4 records are still in its ring
+    r.client->closeImmediately();  // the ring producer's 4 records are still in its ring
     (void)pollBatches(bqR, sR);
     EXPECT_EQ(sR.records(), 4);
     for (const auto& a : sR.acks) {

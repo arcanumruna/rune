@@ -2,7 +2,7 @@
 //
 // CG-5 — GroupConsumer handle implementation.
 //
-// The handle is a thin wrapper around GroupConsumerImpl (shared_ptr).
+// The handle holds its share of GroupConsumerImpl (F8c C7: raw, §3.3 release).
 // All hot-path work (state machine, records routing) runs in GroupConsumerHub
 // on the runner thread.  F8a: every handle operation is a HubCommand for the
 // duty thread — the handle touches no duty-owned state.
@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace rune::client {
 
@@ -23,13 +24,13 @@ namespace rune::client {
 // GroupConsumer — constructor / destructor / move
 // ---------------------------------------------------------------------------
 
-GroupConsumer::GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl,
-                             detail::HubCommandSink             sink,
-                             void*                              sinkCtx,
-                             std::thread::id                    dutyThread,
-                             detail::TargetedOpSink             opSink,
-                             detail::AndWaitSink                waitSink) noexcept
-    : impl_(std::move(impl))
+GroupConsumer::GroupConsumer(GroupConsumerImpl*     impl,
+                             detail::HubCommandSink sink,
+                             void*                  sinkCtx,
+                             std::thread::id        dutyThread,
+                             detail::TargetedOpSink opSink,
+                             detail::AndWaitSink    waitSink) noexcept
+    : impl_(impl)
     , sink_(sink)
     , sinkCtx_(sinkCtx)
     , opSink_(opSink)
@@ -37,39 +38,59 @@ GroupConsumer::GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl,
     , dutyThread_(dutyThread)
 {}
 
-GroupConsumer::~GroupConsumer() {
-    if (!moved_ && impl_) {
-        close();
+GroupConsumer::~GroupConsumer() { release_(); }
+
+void GroupConsumer::release_() noexcept {
+    GroupConsumerImpl* impl = std::exchange(impl_, nullptr);
+    if (impl == nullptr) return;  // moved-from
+    if (sink_ == nullptr) {
+        // Standalone handle (no duty side was ever attached): ours alone.
+        delete impl;
+        return;
     }
+    // The duty side already detached (Client close handed it back, or it was
+    // never registered): never touch the Client — it may be gone.
+    if (!impl->status.producerDetached()) {
+        detail::HubCommand cmd;
+        cmd.op     = detail::HubCommand::Op::HandleRelease;
+        cmd.handle = reinterpret_cast<uint64_t>(impl);
+        cmd.a      = static_cast<int64_t>(detail::HandleKind::GroupConsumer);
+        try {
+            // Accepted: the duty side closes it and later detaches its share.
+            // Closed: a close() on another thread hands it back.
+            (void)sink_(sinkCtx_, cmd);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "rune-client: ~GroupConsumer: release not delivered: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "rune-client: ~GroupConsumer: release not delivered (unknown error)\n");
+        }
+    }
+    // The handle's last access: the side that detaches last frees the impl.
+    if (impl->status.detachConsumer()) delete impl;
 }
 
 GroupConsumer::GroupConsumer(GroupConsumer&& o) noexcept
-    : impl_(std::move(o.impl_))
+    : impl_(std::exchange(o.impl_, nullptr))
     , sink_(o.sink_)
     , sinkCtx_(o.sinkCtx_)
     , opSink_(o.opSink_)
     , waitSink_(o.waitSink_)
     , dutyThread_(o.dutyThread_)
-    , moved_(o.moved_)
     , closed_(o.closed_)
     , cache_(o.cache_)
-{
-    o.moved_ = true;
-}
+{}
 
 GroupConsumer& GroupConsumer::operator=(GroupConsumer&& o) noexcept {
     if (this != &o) {
-        if (!moved_ && impl_) close();
-        impl_       = std::move(o.impl_);
+        release_();  // the current consumer: closed + released
+        impl_       = std::exchange(o.impl_, nullptr);
         sink_       = o.sink_;
         sinkCtx_    = o.sinkCtx_;
         opSink_     = o.opSink_;
         waitSink_   = o.waitSink_;
         dutyThread_ = o.dutyThread_;
-        moved_      = o.moved_;
         closed_     = o.closed_;
         cache_      = o.cache_;
-        o.moved_    = true;
     }
     return *this;
 }
@@ -98,7 +119,7 @@ void GroupConsumer::setCallback_(int which, Fn cb) {
     auto holder = std::make_unique<Fn>(std::move(cb));
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::GroupSetCallback;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
     cmd.a      = which;
     cmd.b      = static_cast<int64_t>(reinterpret_cast<uintptr_t>(holder.get()));
     switch (submit_(cmd)) {  // throws: holder frees itself
@@ -122,7 +143,7 @@ void GroupConsumer::commit() {
     assert(impl_);
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::GroupCommit;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
     if (onDutyThread_()) {  // inside a callback: applied directly by the sink
         (void)submit_(cmd);
         return;
@@ -139,11 +160,11 @@ void GroupConsumer::commit() {
 OpResult GroupConsumer::commitSync(CompletionTarget target, Token token) {
     // Finished on the duty side (closed / Client closed): the Client may be
     // gone — never touch the sink again.
-    if (!impl_ || moved_ || opSink_ == nullptr || impl_->status.closed()) return OpResult::Closed;
+    if (!impl_ || opSink_ == nullptr || impl_->status.closed()) return OpResult::Closed;
     if (!onDutyThread_() && closed_) return OpResult::Closed;
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::GroupCommitSync;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
     return opSink_(sinkCtx_, cmd, target, token, OpKind::CommitSync);
 }
 
@@ -152,7 +173,7 @@ OpResult GroupConsumer::issueCommitSync_(void* self, const CompletionTarget& tar
 }
 
 void GroupConsumer::commitSyncAndWait(std::chrono::nanoseconds timeout) {
-    if (!impl_ || moved_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
+    if (!impl_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
         throw std::runtime_error("commitSync(): GroupConsumer closed");
     }
     std::string text;
@@ -184,10 +205,10 @@ void GroupConsumer::commitSyncAndWait(std::chrono::nanoseconds timeout) {
 // ---------------------------------------------------------------------------
 
 void GroupConsumer::close() {
-    if (!impl_ || moved_) return;
+    if (!impl_) return;
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::GroupClose;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
     if (!onDutyThread_()) {
         if (closed_) return;
         closed_ = true;
@@ -206,7 +227,7 @@ void GroupConsumer::close() {
 // ---------------------------------------------------------------------------
 
 bool GroupConsumer::active() const noexcept {
-    if (!impl_ || moved_) return false;
+    if (!impl_) return false;
     if (onDutyThread_()) return impl_->active;
     return !closed_ && !impl_->status.closed();
 }

@@ -351,9 +351,9 @@ struct CB3AgentHarness {
     TokSender tok;  // F8c C6: every harness producer acks into this ledger
 
     Producer makeProducer(ProducerConfig pcfg = {}) {
-        auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
+        auto* impl = new rprod::ProducerImpl(pcfg);  // F8c C7: the handle owns it (bare)
         hub.add(impl);
-        Producer p(std::move(impl));
+        Producer p(impl);
         tok.attach(p);
         return p;
     }
@@ -1020,7 +1020,7 @@ TEST(BatchBuilder, CrossTierOrderingUnderMaxInFlight) {
     pcfg.batchBytes  = 64*1024;
     pcfg.maxInFlight = 1;        // KEY: only 1 in-flight per partition
 
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg);
+    auto* impl = new rprod::ProducerImpl(pcfg);
     hub.add(impl);
     Producer p(impl);
     TokSender tok;
@@ -1140,7 +1140,7 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
     pcfg.maxInFlight      = 4;
     pcfg.produceTimeoutMs = 30'000; // long timeout — should NOT be reached
 
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, 4 * 1024);
+    auto* impl = new rprod::ProducerImpl(pcfg, 4 * 1024);
     hub.add(impl);
     Producer p(impl);
 
@@ -1216,7 +1216,7 @@ TEST(BatchBuilder, RingFullTier1FutureFailsFast) {
     pcfg.batchBytes       = 64 * 1024;
     pcfg.maxInFlight      = 4;
     pcfg.produceTimeoutMs = 30'000; // long — must NOT be reached
-    auto impl = std::make_shared<rprod::ProducerImpl>(pcfg, 4 * 1024);
+    auto* impl = new rprod::ProducerImpl(pcfg, 4 * 1024);
     hub.add(impl);
     Producer p(impl);
 

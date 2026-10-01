@@ -38,10 +38,10 @@ inline int64_t wallNs() noexcept {
 // Construction
 // ---------------------------------------------------------------------------
 
-BatchBuilder::BatchBuilder(std::shared_ptr<producer::ProducerImpl> impl,
+BatchBuilder::BatchBuilder(producer::ProducerImpl* impl,
                            int32_t topicId,
                            int32_t partition) noexcept
-    : impl_(std::move(impl))
+    : impl_(impl)
     , topicId_(topicId)
     , partition_(partition)
     , sent_(false)
@@ -116,7 +116,18 @@ OpResult reserveUnit(Completions* bq) noexcept {
 }
 } // namespace
 
+void BatchBuilder::checkProducer_() const {
+    // F8c C7 (spec §3.1 rule 1): a BatchBuilder borrows its producer and must
+    // not outlive the Producer handle.  Caught while the duty side still holds
+    // the impl (the handle's share is gone); after the impl is freed this read
+    // itself is the bug (ASan reports it).
+    if (impl_ == nullptr || impl_->handleDetached()) {
+        throw std::logic_error("BatchBuilder: used after its Producer was destroyed");
+    }
+}
+
 OpResult BatchBuilder::send() {
+    checkProducer_();
     Completions* bq = impl_->batchAckCq();
     const OpResult u = reserveUnit(bq);
     if (u != OpResult::Accepted) return u;
@@ -135,6 +146,7 @@ OpResult BatchBuilder::send() {
 }
 
 OpResult BatchBuilder::send(Completions& cq, Token token) {
+    checkProducer_();
     if (token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx ||
         cq.ring_ == nullptr) {
         return OpResult::InvalidArgument;
@@ -167,6 +179,7 @@ OpResult BatchBuilder::send(Completions& cq, Token token) {
 }
 
 OpResult BatchBuilder::send(AckToken token) {
+    checkProducer_();
     if (token.token > kMaxToken) return OpResult::InvalidArgument;
     Completions* bq = impl_->batchAckCq();
     const OpResult u = reserveUnit(bq);

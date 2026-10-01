@@ -82,9 +82,10 @@ public:
         , topicId_(topicId)
     {}
 
-    // Copyable / movable (Producer is shared_ptr-backed for the default ProducerT).
-    TypedTopic(const TypedTopic&) = default;
-    TypedTopic& operator=(const TypedTopic&) = default;
+    // F8c C7 (spec §3.1 rule 3): move-only — it owns its Producer, which is
+    // move-only (one owning thread: the reuse buffer is not thread-safe).
+    TypedTopic(const TypedTopic&) = delete;
+    TypedTopic& operator=(const TypedTopic&) = delete;
     TypedTopic(TypedTopic&&) = default;
     TypedTopic& operator=(TypedTopic&&) = default;
 

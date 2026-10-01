@@ -236,7 +236,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 // Shared-nothing producer registration: decode the SBE
                 // RegisterProducer message and adopt the producer into the
                 // single-owner ProducerHub list ON THIS (runner) thread via the
-                // register hook, which then frees the holder.
+                // register hook (F8c C7: the impl itself — no holder).
                 if (producerRegisterFn_) {
                     const auto* p = reinterpret_cast<const uint8_t*>(
                         buf.buffer() + offset);
@@ -460,12 +460,12 @@ transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t*
     return transport_.offerResult(buf, len);
 }
 
-ClientAgent::Submit ClientAgent::submitRegisterProducer(void* holder) noexcept {
+ClientAgent::Submit ClientAgent::submitRegisterProducer(void* impl) noexcept {
     // Encode an SBE RegisterProducer message (MessageHeader + handle) and enqueue
     // it as the command payload — self-describing/versioned, like every other ring
     // message, rather than a raw pointer memcpy.
     ring_msg::RegisterProducer msg;
-    msg.handle = reinterpret_cast<uint64_t>(holder);
+    msg.handle = reinterpret_cast<uint64_t>(impl);
     uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
     const std::size_t n = msg.encode(buf);
     return writeCommand3_(kMsgRegisterProducer, buf, n);
@@ -613,9 +613,9 @@ ClientAgent::Submit ClientAgent::submitHubCommand(const ::rune::client::detail::
     return writeCommand3_(kMsgHubCommand, buf, n);
 }
 
-ClientAgent::Submit ClientAgent::submitRegisterTxnProducer(void* holder) noexcept {
+ClientAgent::Submit ClientAgent::submitRegisterTxnProducer(void* impl) noexcept {
     ring_msg::RegisterProducer msg;
-    msg.handle = reinterpret_cast<uint64_t>(holder);
+    msg.handle = reinterpret_cast<uint64_t>(impl);
     uint8_t buf[ring_msg::RegisterProducer::ENCODED_SIZE];
     const std::size_t n = msg.encode(buf);
     return writeCommand3_(kMsgRegisterTxnProducer, buf, n);

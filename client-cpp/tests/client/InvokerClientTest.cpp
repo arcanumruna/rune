@@ -205,16 +205,18 @@ TEST(InvokerClient, CloseFailsUnadoptedProducerRegression) {
         auto tp    = client.transactionalProducer("tx-close");
         auto initF = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
         ASSERT_TRUE(initF.accepted()) << initF.describe();
-        client.close();
+        client.closeImmediately();  // F8c C7: the discarding close (close() would drain first)
         ASSERT_TRUE(fut.ready()) << "the produce token must be completed by close(), not hang";
         EXPECT_EQ(fut.status(), rc::OpStatus::Closed);
         EXPECT_EQ(cq.timesCompleted(fut.token()), 1);
         ASSERT_TRUE(initF.ready()) << "txn initTransactions must be completed by close()";
         EXPECT_EQ(initF.status(), rc::OpStatus::Closed);
         EXPECT_EQ(cq.timesCompleted(initF.token()), 1);
-        // Adoption == the ring holder was consumed and freed (no leak).
-        EXPECT_EQ(client.testProducerCount(), 1u);
-        EXPECT_EQ(client.testTxnProducerCount(), 1u);
+        // Adoption == the ring registration was consumed (F8c C7: then handed
+        // back to its handle — no shared_ptr holder, nothing leaked).
+        EXPECT_EQ(client.testImplsHandedBack(), 2u);
+        EXPECT_EQ(client.testProducerCount(), 0u);
+        EXPECT_EQ(client.testTxnProducerCount(), 0u);
     }
 }
 
@@ -571,7 +573,9 @@ TEST(InvokerClient, RingSeamBlockingSendFromCallbackDoesNotTerminateInvokerRegre
     EXPECT_TRUE(ran);
     EXPECT_GT(r.client.testCallbackExceptionCount(), 0u);
     // The duty-cycle thread (the test thread, in Invoker mode) survived: the
-    // client is still fully usable.
+    // client is still fully usable (F8c C7: the callback's producer was
+    // destroyed with the callback — a new one registers).
+    auto again = r.client.producer();
     ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() >= 1; }));
 }
 
@@ -593,7 +597,7 @@ TEST(InvokerClient, RingSeamSendAfterClientCloseReturnsClosedRegression) {
     }
     ASSERT_GT(ok, 0u);
 
-    r.client.close();
+    r.client.closeImmediately();  // C7: teardown semantics (close() drains)
 
     EXPECT_EQ(p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), rc::SendResult::Closed);
     EXPECT_THROW(p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), std::logic_error);
@@ -854,10 +858,13 @@ TEST(InvokerClient, CloseTerminatesPastAnOrphanedClaimAndClosesTheRegisteredRing
               rc::SendResult::Ok);
 
     r.client.testSetCloseDrainUnblockAfterYields(64); // production default: 1M — same path
-    r.client.close();                                 // must return
+    // F8c C7: closeImmediately — the teardown drain under test.  (close()'s
+    // producer drain is a command queued BEHIND the orphan like any other.)
+    r.client.closeImmediately();                      // must return
 
     EXPECT_EQ(r.client.testCloseDrainUnblockCalls(), 1);
-    EXPECT_EQ(r.client.testProducerCount(), 1u) << "the registration behind the orphan is adopted";
+    EXPECT_EQ(r.client.testImplsHandedBack(), 1u)
+        << "the registration behind the orphan is adopted (then handed back to its handle)";
     EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{2}), std::span<const uint8_t>(kVal)),
               rc::SendResult::Closed)
         << "the adopted producer's ring is marked closed";
@@ -917,7 +924,7 @@ TEST(InvokerClient, TxnProducerOpsAfterCloseFailPromptlyRegression) {
     Rig r(invokerCfg(3802, 3803));
     auto tp = r.client.transactionalProducer("tx-adopted");
     r.client.close();
-    EXPECT_EQ(r.client.testTxnProducerCount(), 1u) << "adopted by close()'s drain";
+    EXPECT_EQ(r.client.testImplsHandedBack(), 1u) << "adopted by close()'s drain (then handed back)";
     int calls = 0;
     const rc::CompletionHandler h{[](void* c, const rc::Completion&, std::span<const uint8_t>) noexcept {
                                       ++*static_cast<int*>(c);
