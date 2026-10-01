@@ -22,10 +22,10 @@ proc_name() {
   exe=$(basename -- "$(readlink /proc/$pid/exe 2>/dev/null)" 2>/dev/null)
   case "$exe" in
     bash|sh|dash)
-      a1=$(tr '\0' '\n' < /proc/$pid/cmdline 2>/dev/null | sed -n 2p)
+      a1=$(tr '\0' '\n' 2>/dev/null < /proc/$pid/cmdline | sed -n 2p)
       [ -n "$a1" ] && basename -- "$a1" || echo "$exe" ;;
     *)
-      a0=$(tr '\0' '\n' < /proc/$pid/cmdline 2>/dev/null | sed -n 1p)
+      a0=$(tr '\0' '\n' 2>/dev/null < /proc/$pid/cmdline | sed -n 1p)
       basename -- "${a0:-$exe}" 2>/dev/null ;;
   esac
 }
@@ -41,7 +41,7 @@ targets() {
 targets | while read -r pid n; do kill -KILL "$pid" 2>/dev/null; done
 # Kafka (java) by its main class.
 for pid in $(pgrep -x java 2>/dev/null); do
-  tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -q 'kafka\.Kafka' && kill -KILL "$pid" 2>/dev/null
+  tr '\0' ' ' 2>/dev/null < /proc/$pid/cmdline | grep -q 'kafka\.Kafka' && kill -KILL "$pid" 2>/dev/null
 done
 if command -v docker >/dev/null 2>&1; then
   ids=$(docker ps -aq --filter 'name=^rune-' 2>/dev/null); [ -n "$ids" ] && docker rm -f $ids >/dev/null 2>&1
