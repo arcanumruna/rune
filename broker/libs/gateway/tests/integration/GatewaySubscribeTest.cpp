@@ -46,6 +46,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1771,19 +1772,28 @@ public:
     }
 
     // Append one batch whose single record value is `valueBytes` long; returns
-    // the exact stored bytes (the restamped batch).
+    // the exact stored bytes.  Built once per size and restamped (baseOffset,
+    // bytes 0..7, is not CRC-covered); appended without fsync (page cache is
+    // visible to readers) so a dozen 1 MiB appends never idle the test session
+    // past its timeout.
     std::vector<uint8_t> appendSized(int32_t partition, std::size_t valueBytes) {
         rune::storage::Log* log = registry_->log(kTopicIdA, partition);
         const int64_t base = log->logEndOffset();
-        std::string value(valueBytes, '\0');
-        for (std::size_t i = 0; i < valueBytes; ++i)
-            value[i] = static_cast<char>((i * 31u + static_cast<std::size_t>(base)) & 0xffu);
-        rune::protocol::RecordBatchBuilder b(base, 1000);
-        b.append("k", value, 1000);
-        auto bytes = b.build();
-        log->append(bytes, base);
+        auto& tmpl = built_[valueBytes];
+        if (tmpl.empty()) {
+            std::string value(valueBytes, '\0');
+            for (std::size_t i = 0; i < valueBytes; ++i)
+                value[i] = static_cast<char>((i * 31u) & 0xffu);
+            rune::protocol::RecordBatchBuilder b(0, 1000);
+            b.append("k", value, 1000);
+            tmpl = b.build();
+        }
+        std::vector<uint8_t> bytes = tmpl;
+        for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (8 * i));
+        log->appendNoSync(bytes.data(), bytes.size(), base);   // page cache: visible to readers
         return bytes;
     }
+    std::map<std::size_t, std::vector<uint8_t>> built_;
 
     std::unique_ptr<rune::node::WorkerPool> ownedPool_;
 };
@@ -1864,9 +1874,19 @@ TEST_P(GatewayLargeBatchPushRegression, BackPressuredLargeOfferRetriesWithoutLos
     const int64_t cursorUnderBp = gw_->subscriptionNextOffsetForTest(subId);
     EXPECT_LT(cursorUnderBp, kBatches) << "back-pressure never happened (test precondition)";
 
-    pump([&]() { return eg.recordsFor(subId) >= static_cast<std::size_t>(kBatches) ||
-                        !eg.errors.empty(); },
-         c.egressSub.get(), &eg.fa, kPumpIter, "F19 BP drain");
+    // Drain: the client polls a full window per cycle (pump()'s 10-fragment
+    // poll would take ~750 cycles per 1 MiB frame — on the Debug worker-return
+    // path, which re-reads a 2 MiB chunk per retry, long enough to idle the
+    // session past its timeout).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{15};
+        while (eg.recordsFor(subId) < static_cast<std::size_t>(kBatches) && eg.errors.empty() &&
+               std::chrono::steady_clock::now() < deadline) {
+            gw_->doWork(nowNs());
+            if (pool_) pool_->doWork(nowNs());
+            c.egressSub->poll(eg.fa.handler(), 8192);
+        }
+    }
 
     ASSERT_TRUE(eg.errors.empty());
     ASSERT_EQ(eg.recordsFor(subId), static_cast<std::size_t>(kBatches));

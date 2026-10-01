@@ -28,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -341,16 +342,24 @@ struct F19Egress {
 };
 
 // Append one batch whose single record value is `valueBytes` long at the log's
-// LEO; returns the exact stored bytes.
+// LEO; returns the exact stored bytes.  Built once per size and restamped
+// (baseOffset, bytes 0..7, is not CRC-covered); appended without fsync (the
+// page cache is visible to readers) to keep the 1 MiB cases fast.
 static std::vector<uint8_t> f19AppendSized(rune::storage::Log& log, std::size_t valueBytes) {
+    static std::map<std::size_t, std::vector<uint8_t>> built;
     const int64_t base = log.logEndOffset();
-    std::string value(valueBytes, '\0');
-    for (std::size_t i = 0; i < valueBytes; ++i)
-        value[i] = static_cast<char>((i * 31u + static_cast<std::size_t>(base)) & 0xffu);
-    rune::protocol::RecordBatchBuilder b(base, 1000);
-    b.append("k", value, 1000);
-    auto bytes = b.build();
-    log.append(bytes, base);
+    auto& tmpl = built[valueBytes];
+    if (tmpl.empty()) {
+        std::string value(valueBytes, '\0');
+        for (std::size_t i = 0; i < valueBytes; ++i)
+            value[i] = static_cast<char>((i * 31u) & 0xffu);
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", value, 1000);
+        tmpl = b.build();
+    }
+    std::vector<uint8_t> bytes = tmpl;
+    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (8 * i));
+    log.appendNoSync(bytes.data(), bytes.size(), base);   // page cache: visible to readers
     return bytes;
 }
 
