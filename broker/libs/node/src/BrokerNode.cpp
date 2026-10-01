@@ -104,9 +104,25 @@ void BrokerNode::start() {
             config_.effectiveAeronDir();
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
+        // Spec §3.2 fused placement: the runtime client has no conductor thread
+        // either — its conductor runs in worker 0's pass (startup: in resolves).
+        ctx.useConductorAgentInvoker(config_.fused());
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) {
             throw std::runtime_error("BrokerNode: failed to connect Aeron client");
+        }
+        // Fused: the runtime's invoker driver + conductor are serviced by an
+        // interim pump runner from HERE until worker 0 takes them over (step
+        // 7b) — every startup phase, however long, keeps them live (time-
+        // independent: no phase may out-last the client liveness timeout).
+        // Startup resolves on aeron_ then use the default sleep-poll pump,
+        // exactly as with thread placement's driver/conductor threads.
+        if (config_.fused()) {
+            startupPumpAgent_  = std::make_unique<DriverPumpAgent>(*nodeDriver_, *aeron_);
+            startupPumpIdle_   = makeBackoffIdle(config_.idleMaxParkUs);
+            startupPumpRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+                *startupPumpAgent_, *startupPumpIdle_, clock_);
+            startupPumpRunner_->start();
         }
 
         // Allocate the Aeron node-role counter (RoleCounter.h) in the driver's
@@ -164,7 +180,8 @@ void BrokerNode::start() {
 
     // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
     //    consensus + gateway on the single-writer thread).
-    agentRunner_->start();
+    //    Spec §3.2: in fused placement the runtime has no thread of its own.
+    if (!config_.fused()) agentRunner_->start();
 
     // 7b. E2 inc2b: start per-worker AgentRunner threads.
     //     Must start AFTER buildGateway() (owned sets published in buildWorkerPool
@@ -174,6 +191,14 @@ void BrokerNode::start() {
     //     fed by the control thread, so the ordering: control first, workers after.
     if (workerPool_) {
         if (config_.shardMode()) {
+            if (config_.fused()) {
+                // The fused hook must be set before worker 0's thread exists.
+                // Hand-off: the interim pump runner is joined HERE (it never
+                // pumps again); worker 0 binds the runtime driver at its first
+                // pass — exactly one pumper at any time.
+                shardAgents_.at(0)->setFusedRuntime(runtimeAgent_.get(), nodeDriver_.get(), aeron_.get());
+                stopStartupPump_();
+            }
             // Busy-spin ONLY when pinned to a dedicated core (principle §1a.3);
             // unpinned shard workers use the backoff idle.
             workerPool_->startShardRunners(shardAgents_, clock_,
@@ -2495,6 +2520,12 @@ void BrokerNode::stop() {
     // Shard agents reference workers + their drivers/clients; the runners that
     // drove them are joined, so nothing pumps a shard driver any more.
     shardAgents_.clear();
+    // Fused placement (spec §3.2): the runtime driver's pumper — worker 0, or
+    // the interim startup pump runner if start() failed before the hand-off —
+    // is joined.  Hand the runtime's invoker driver to THIS thread: it drains +
+    // closes it after the runtime client closes (step 5).
+    stopStartupPump_();
+    if (config_.fused() && nodeDriver_) nodeDriver_->bindPumpThread();
 
     // 1b-admin. Task 6: stop AdminWorker thread BEFORE the main agent runner.
     //     The AdminWorker calls appendDurable which uses the schema replica.
@@ -2629,9 +2660,24 @@ void BrokerNode::stop() {
 // BrokerNode::startEmbeddedDriver
 // ---------------------------------------------------------------------------
 void BrokerNode::startEmbeddedDriver() {
+    auto dcfg = EmbeddedDriverConfig::fromNode(config_, config_.effectiveAeronDir());
+    // Fused: the runtime's driver is an invoker driver too (same test-only
+    // liveness knob as the shard drivers; 0 = Aeron default).
+    if (config_.fused()) dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
     nodeDriver_ = std::make_unique<EmbeddedDriver>(
-        EmbeddedDriverConfig::fromNode(config_, config_.effectiveAeronDir()),
-        DriverMode::Threaded);
+        std::move(dcfg), config_.fused() ? DriverMode::Invoker : DriverMode::Threaded);
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::stopStartupPump_ — fused only: stop + JOIN the interim runtime
+// driver pump runner (idempotent).  After it returns nothing pumps the runtime
+// driver until its next owner binds itself.
+// ---------------------------------------------------------------------------
+void BrokerNode::stopStartupPump_() noexcept {
+    if (startupPumpRunner_) startupPumpRunner_->stopAndJoin();
+    startupPumpRunner_.reset();
+    startupPumpAgent_.reset();
+    startupPumpIdle_.reset();
 }
 
 // ---------------------------------------------------------------------------

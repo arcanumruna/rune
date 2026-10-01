@@ -407,6 +407,13 @@ public:
     /// Test-only: the node-level embedded driver (spec §3.6 one-pumper counters).
     EmbeddedDriver* driverForTest() const noexcept { return nodeDriver_.get(); }
 
+    /// Test-only: does the runtime have a thread of its own?  `thread` placement:
+    /// true while running; `fused` placement (spec §3.2): always false — the
+    /// runtime duty cycle runs inside worker 0's pass.
+    [[nodiscard]] bool runtimeThreadStartedForTest() const noexcept {
+        return agentRunner_ && agentRunner_->isRunning();
+    }
+
     /// Test-only: return the MetadataService (for assignment() queries in tests).
     /// Non-null after start() if metadata service construction succeeded.
     /// NOT safe for concurrent use — call only when duty cycle is between
@@ -538,6 +545,7 @@ private:
     // -----------------------------------------------------------------------
     void startEmbeddedDriver();
     void stopEmbeddedDriver() noexcept;
+    void stopStartupPump_() noexcept;   // fused: join the interim runtime-driver pump (idempotent)
     void buildConsensusObjects();
     void buildSingleNodeConsensus();
     void buildMultiNodeConsensus();
@@ -792,6 +800,11 @@ private:
     // Aeron embedded driver + client
     // -----------------------------------------------------------------------
     std::unique_ptr<EmbeddedDriver> nodeDriver_;   // node-level driver (runtime / legacy workers)
+    // Fused placement only: services the runtime's invoker driver + client from
+    // aeron_ connect until worker 0 takes them over (joined at the hand-off).
+    std::unique_ptr<DriverPumpAgent>               startupPumpAgent_;
+    std::unique_ptr<rune::consensus::IdleStrategy> startupPumpIdle_;
+    std::unique_ptr<rune::consensus::AgentRunner>  startupPumpRunner_;
 
     std::shared_ptr<aeron::Aeron> aeron_;
 

@@ -605,3 +605,156 @@ TEST(ShardMode, MetadataAdvertisesTheLeaderWorkerEndpoint) {
         << "the advertised endpoint is the live worker ingress";
     node.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Task 11 — RUNE_RUNTIME_PLACEMENT=fused (spec §3.2): the runtime (consensus,
+// metadata, internal partitions, gateway control) has NO thread of its own; its
+// duty cycle — own invoker driver + own client conductor + NodeRuntimeAgent —
+// runs at the end of worker 0's pass.  `thread` placement is unchanged.
+// ---------------------------------------------------------------------------
+namespace {
+bool runtimeDriverClosed(const NodeConfig& cfg) {
+    return !fs::exists(fs::path(cfg.effectiveAeronDir()) / "cnc.dat");
+}
+} // namespace
+
+TEST(ShardModeFusedRegression, ThreadPlacementStillStartsTheRuntimeThread) {
+    TmpDir dir{"thrplc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    EXPECT_TRUE(node.runtimeThreadStartedForTest()) << "thread placement = today's behaviour";
+    node.stop();
+}
+
+TEST(ShardModeFusedRegression, SingleNodeRunsRuntimeOnWorkerZero) {
+    TmpDir dir{"fused"}, cdir{"fc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms)) << "consensus must run inside worker 0's loop";
+    EXPECT_FALSE(node.runtimeThreadStartedForTest());
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid, 0) << "gateway Connect served by the fused runtime";
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(2));
+        ASSERT_TRUE(ack.has_value());
+    }
+    node.stop();
+    EXPECT_TRUE(runtimeDriverClosed(cfg)) << "the runtime's invoker driver must close on stop()";
+    EXPECT_GE(logEndOffsetAfterStop(dir.path), 2);
+}
+
+TEST(ShardModeFusedRegression, ReturnRingPressureNeverDeadlocksTheFusedLoop) {
+    TmpDir dir{"fusedring"}, cdir{"frc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
+    cfg.workerReturnRingBytes = 64 * 1024;        // tiny: forces intake skips
+    cfg.workerAckSlotBytes = 256;
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ShardTestClient c(cdir.path);
+    const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0);
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 0, makeBatch(1)));
+    constexpr int kN = 2000;
+    for (int i = 0; i < kN; ++i)
+        ASSERT_TRUE(c.produce(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 10'000 + i, 0, 0, 0, makeBatch(1)));
+    int ok = 0;
+    for (int i = 0; i < kN; ++i) {
+        auto a = c.awaitProduceResponse(10'000 + i);
+        ok += (a && a->errorCode == 0) ? 1 : 0;
+    }
+    EXPECT_EQ(ok, kN) << "producer and consumer of ret_ share one thread — no path may wait on the other";
+    node.stop();
+}
+
+TEST(ShardModeFusedRegression, ThreeNodeAcksAllCommitsWithFusedRuntimes) {
+    TmpDir d0{"ft0"}, d1{"ft1"}, d2{"ft2"}, cdir{"ftc"};
+    const auto ports = ShardPorts::discover(3, 1);
+    BrokerNode n0{makeShardConfig(0, d0.path, ports, 3, 1, /*fused=*/true)};
+    BrokerNode n1{makeShardConfig(1, d1.path, ports, 3, 1, /*fused=*/true)};
+    BrokerNode n2{makeShardConfig(2, d2.path, ports, 3, 1, /*fused=*/true)};
+    n0.start(); n1.start(); n2.start();
+    ASSERT_TRUE(n0.awaitLeader(15'000ms)) << "consensus over UDP between three fused runtimes";
+    EXPECT_FALSE(n0.runtimeThreadStartedForTest());
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid0, 0);
+        int32_t leader = -1;
+        ASSERT_TRUE(eventually([&] {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                if (pi.topicId == 0 && pi.partition == 0) leader = pi.leaderId;
+            return leader >= 0;
+        }, 400)) << "no partition leader advertised";
+        const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+        ASSERT_GT(sid, 0);
+        for (int b = 0; b < 5; ++b) {
+            auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kIngressStream, sid, 0, 0,
+                                        /*acks=all*/1, makeBatch(4));
+            ASSERT_TRUE(ack.has_value()) << "acks=all batch " << b << " not committed";
+        }
+    }
+    n0.stop(); n1.stop(); n2.stop();
+    int atLeast20 = 0;
+    for (const auto* d : {&d0, &d1, &d2}) atLeast20 += logEndOffsetAfterStop(d->path) >= 20 ? 1 : 0;
+    EXPECT_GE(atLeast20, 2) << "every acked record must be on a majority";
+}
+
+// The runtime's invoker driver + client exist from step 3 of start() (consensus,
+// replication and gateway are built on them), long before worker 0 runs.  A slow
+// startup phase (offset/txn/metadata rebuilds) must not leave them unpumped for
+// longer than the client liveness timeout — the driver would time the runtime
+// client out (its subscriptions/publications vanish; nothing serves).
+TEST(ShardModeFusedRegression, SlowStartupPhaseDoesNotKillTheRuntimeClient) {
+    TmpDir dir{"fslow"}, cdir{"fslowc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
+    constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
+    cfg.shardClientLivenessTimeoutNs = kLivenessNs;          // every invoker driver of the node
+    BrokerNode node{cfg};
+    node.setStartupPhaseHookForTest([](std::string_view phase) {
+        if (phase == "build-gateway")                         // the injected fault: a slow rebuild
+            std::this_thread::sleep_for(std::chrono::nanoseconds{2 * kLivenessNs});
+    });
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ShardTestClient c(cdir.path);
+    const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0) << "the runtime client died during startup (gateway no longer serves)";
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, 0, 1, makeBatch(1)));
+    node.stop();
+}
+
+TEST(ShardModeFusedRegression, StopFromAnotherThreadClosesTheRuntimeDriver) {
+    TmpDir dir{"fstopthr"};
+    const auto ports = ShardPorts::discover(1, 2);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 2, /*fused=*/true);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    std::thread stopper([&] { node.stop(); });
+    stopper.join();
+    EXPECT_TRUE(runtimeDriverClosed(cfg)) << "runtime driver leaked (debug builds abort)";
+    EXPECT_EQ(node.shardDriverCountForTest(), 0u);
+}
+
+TEST(ShardModeFusedRegression, StartFailureStillClosesTheRuntimeDriver) {
+    TmpDir dir{"fstartfail"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
+    BrokerNode node{cfg};
+    HaltCapture halt;
+    node.setHaltHandler(&HaltCapture::handler, &halt);
+    node.setRecoveryFaultForTest(EIO);
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_EQ(halt.await(1'000ms), BrokerNode::kExitStorageFailure);
+    std::thread stopper([&] { node.stop(); });
+    stopper.join();
+    EXPECT_TRUE(runtimeDriverClosed(cfg)) << "runtime driver leaked after a failed start";
+}
