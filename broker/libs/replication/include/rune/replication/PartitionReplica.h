@@ -432,6 +432,18 @@ public:
 
     [[nodiscard]] Role        role()           const noexcept { return role_; }
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
+    /// F15 §2.3: DR-BUG-6 leader-completeness (the deficient-leader reconcile is
+    /// done).  Owner thread only.
+    [[nodiscard]] bool        isLeaderComplete() const noexcept { return leaderComplete_; }
+    /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
+    /// content — a tail truncation or a reconcile append of foreign (old-term)
+    /// batches.  A parked waiter compares it with the value it parked under.
+    /// Owner thread only (plain member, no atomic).
+    [[nodiscard]] uint64_t    logGeneration()  const noexcept { return logGeneration_; }
+    /// The offset the log was cut to by the change that last bumped
+    /// logGeneration() (a reconcile append records the LEO before it): every
+    /// offset below it is unchanged by that change.  Owner thread only.
+    [[nodiscard]] Offset      lastTruncationOffset() const noexcept { return lastTruncationOffset_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
 
@@ -846,6 +858,8 @@ private:
     bool externalFollowerFlush_ = false;   ///< shard mode: worker submits the flush (async)
     uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
     uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
+    uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation / reconcile append
+    Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     void checkpointEpochs_();
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker

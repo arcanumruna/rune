@@ -8,6 +8,7 @@
 // handleWorkerReturnForTest, so every ordering is deterministic.  No sleeps; the
 // only waits are condition waits with a hard iteration cap.
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/GatewayReplicaView.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/Worker.h>
@@ -17,6 +18,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -797,4 +799,424 @@ TEST(ProtocolRegression, WorkerReturnLayoutUnchanged) {
     EXPECT_EQ(isbe::WorkerReturn::sbeBlockLength(), 123);
     WorkerReturn produceResult;   // empty chunk
     EXPECT_EQ(workerReturnEncodedLength(produceResult), 8u + 123u + 4u);
+}
+
+// ============================================================================
+// F15 S2 — I1 role gate, N1/I1 per-pass waiter validation, I-A acks=all parked
+// on the owning worker in EVERY mode (design note §3, §8 S2 row; step addendum
+// R-4a/R-4b/R-4c + the DR-BUG-3 drain-time min-ISR check on the worker).
+// ============================================================================
+namespace {
+// A full client Produce frame for the owning worker's ingress (shard ingress).
+int ingressAcksAll(Worker& w, int64_t corr, int64_t now, int32_t topicId = 1) {
+    const auto f = produceFrame(1, corr, batchAt(0), /*acks=all*/1, topicId, 0);
+    return w.handleIngressFrameForTest(f.data(), f.size(), now);
+}
+int ingressAcks0(Worker& w, int64_t corr, int64_t now, int32_t topicId = 1) {
+    const auto f = produceFrame(1, corr, batchAt(0), /*acks=*/0, topicId, 0);
+    return w.handleIngressFrameForTest(f.data(), f.size(), now);
+}
+std::vector<uint8_t> otherBatchAt(int64_t base, int n = 1) {   // different bytes at the same offsets
+    rune::protocol::RecordBatchBuilder b(base, 2000);
+    for (int i = 0; i < n; ++i) b.append("other", "DIFFERENT", 2000 + i);
+    return b.build();
+}
+// The node is told (by follower 2's fetch under a higher epoch) that it is a
+// stale leader: self-demotion in onFetchRequest — no op, no bridge hook.
+void selfDemote(PartitionReplica& r, int32_t newEpoch, int64_t now) {
+    rune::replication::FetchRequestMsg up{newEpoch, 0, /*follower*/2, 0, 1 << 20, r.topicId()};
+    (void)r.onFetchRequest(up, now);
+}
+// KIP-101 answer from the new leader: the shared epoch ended at `endOffset`.
+void truncateTo(PartitionReplica& r, int64_t endOffset) {
+    rune::replication::OffsetsForLeaderEpochRespMsg ole{};
+    ole.leaderEpoch = r.epoch(); ole.partition = 0; ole.responseEpoch = 1;
+    ole.endOffset = endOffset; ole.errorCode = 0; ole.topicId = r.topicId();
+    r.applyOffsetsForLeaderEpochResponse(ole);
+}
+// Re-fetch from the new leader: `records` appended at the follower's LEO.
+void refetch(PartitionReplica& r, const std::vector<uint8_t>& records, int64_t leaderHw) {
+    rune::replication::FetchResponseMsg fr{};
+    fr.leaderEpoch = r.epoch(); fr.partition = 0; fr.highWatermark = leaderHw; fr.logStartOffset = 0;
+    fr.errorCode = 0; fr.topicId = r.topicId(); fr.records = std::span<const uint8_t>(records);
+    r.applyReplicated(fr);
+}
+std::vector<uint8_t> concat(std::initializer_list<std::vector<uint8_t>> parts) {
+    std::vector<uint8_t> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+
+// The DEFAULT (Legacy) config with a committed metadata view: acks=all produces
+// go gateway → owning worker (executeProduceWire_).  Captures both answer kinds:
+// the gateway's inline ErrorResponse and the ProduceResponse.
+struct LegacyAcksRig {
+    struct Answer { bool inlineError; int16_t code; int64_t base; };
+    TmpDir d;
+    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+    NullTransport t;
+    ReplicaRegistry reg;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
+    std::vector<Answer> answers;
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
+        [this](const uint8_t* b, std::size_t n) -> int64_t {
+            if (auto r = pc::ProduceResponse::decode(b, n)) answers.push_back({false, r->errorCode, r->baseOffset});
+            else if (auto e = pc::ErrorResponse::decode(b, n)) answers.push_back({true, e->code, -1});
+            return 1;
+        });
+    PartitionReplica* r = nullptr;
+    int64_t sid = 0;
+    int64_t now = 1;
+    explicit LegacyAcksRig(std::vector<NodeId> isr = {1, 2}, uint8_t tier = 1, int minIsr = 1,
+                           int64_t replicaLagMaxMs = 1'000'000) {
+        auto c = cfg(1, tier, 0, 0);
+        c.minIsr = minIsr;
+        c.replicaLagMaxMs = replicaLagMaxMs;
+        auto rep = std::make_unique<PartitionReplica>(c, Role::Leader, 1, isr, isr, topics.log(0, 0), &t);
+        r = rep.get();
+        reg.add(0, 0, std::move(rep));
+        pool.assignFromRegistry(reg);
+        pool.setRegistry(&reg);
+        pool.setRunnersStartedForTest(true);
+        gw.setTopicRegistry(&topics);
+        gw.setReplicaRegistry(&reg);
+        gw.setWorkerPool(&pool);
+        gw.setCommittedMetadataReady(true);   // steady state: acks=all is deferred (not refused)
+        sid = gw.injectTestSession();
+        runWorker();   // ownership applied
+    }
+    Worker& w() { return pool.worker(0); }
+    // One worker pass + the control thread's return drain + its (legacy)
+    // gateway-side acks=all drain, exactly as the duty cycle runs them.
+    void runWorker() {
+        ++now;
+        w().doWork(now);
+        w().drainReturn([&](WorkerReturn ret) { gw.handleWorkerReturnForTest(ret); });
+        gw.drainPendingAcksForTest(now);
+    }
+    void produce(int64_t corr, uint8_t acks, const std::vector<uint8_t>& batch) {
+        const auto f = produceFrame(sid, corr, batch, acks, 0, 0);
+        gw.applyProduceForTest(f.data(), f.size());
+    }
+    void produceAll(int64_t corr) { produce(corr, /*acks=all*/1, batchAt(0)); }
+    void followerFetch(int32_t epoch = 1) {
+        rune::replication::FetchRequestMsg fr{epoch, 0, 2, r->log()->logEndOffset(), 1 << 20, 0};
+        (void)r->onFetchRequest(fr, now);
+    }
+    std::size_t okCount() const {
+        std::size_t n = 0;
+        for (const auto& a : answers) n += (!a.inlineError && a.code == 0) ? 1u : 0u;
+        return n;
+    }
+};
+} // namespace
+
+// The structural guard (design note §8 S2): the gateway's replica handle has no
+// role() — the owning worker is the role authority.
+static_assert(!rune::gateway::ExposesRole<rune::gateway::GatewayReplicaView>,
+              "the gateway must not be able to read the worker-owned role");
+static_assert(rune::gateway::ExposesRole<PartitionReplica>, "the guard's detector works");
+
+TEST(TxnRoleGateRegression, SelfDemotionFailsParkedAcks) {
+    // onFetchRequest with a higher epoch demotes the replica with no op and no
+    // bridge hook: the parked acks=all waiter fails NotLeader within ONE pass.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    ASSERT_EQ(ingressAcksAll(w, 9, 1), 1);
+    ASSERT_EQ(w.reservedAckSlotsForTest(), 1) << "precondition: acks=all parked on the HW";
+    selfDemote(rep, 2, 2);
+    ASSERT_EQ(rep.role(), Role::Follower) << "precondition: self-demoted";
+    w.doWork(3);
+    const auto rets = drainAll(w);
+    ASSERT_EQ(rets.size(), 1u) << "the self-demoted waiter must be answered in the next pass";
+    EXPECT_EQ(rets[0].errorCode, kNotLeader);
+    EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
+}
+
+TEST(TxnRoleGateRegression, EpochBumpWhileLeaderKeepsWaiter) {
+    // becomeLeader at a higher epoch with the SAME log: the waiter keeps waiting
+    // and fires OK once the new term's HW passes it (Kafka DelayedProduce).
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    ASSERT_EQ(ingressAcksAll(w, 9, 1), 1);
+    const uint64_t gen = rep.logGeneration();
+    WorkerOp bl;
+    bl.type = WorkerOp::Type::BecomeLeader; bl.topicId = 1; bl.partition = 0; bl.replica = &rep;
+    bl.logPtr = &log; bl.roleEpoch = 2; bl.isr = {1, 2};
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(std::move(bl))));
+    std::vector<WorkerReturn> rets;
+    for (int i = 0; i < 4; ++i) { w.doWork(2 + i); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rep.role(), Role::Leader);
+    ASSERT_EQ(rep.epoch(), 2);
+    ASSERT_EQ(rep.logGeneration(), gen) << "precondition: an epoch bump does not change the log";
+    EXPECT_TRUE(rets.empty()) << "an epoch bump while still leader must not fail the waiter";
+    rune::replication::FetchRequestMsg fr{2, 0, 2, log.logEndOffset(), 1 << 20, 1};
+    (void)rep.onFetchRequest(fr, 50);
+    for (int i = 0; i < 8 && rets.empty(); ++i) { w.doWork(60 + i); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rets.size(), 1u) << "the waiter fires once the new term's HW passes it";
+    EXPECT_EQ(rets[0].errorCode, 0);
+}
+
+TEST(TxnRoleGateRegression, TruncationBelowWaiterFailsIt) {
+    // Between two worker passes: self-demotion, KIP-101 truncation BELOW the
+    // waiter, a re-fetch of DIFFERENT data at that offset, re-promotion.  The
+    // role is Leader again at the next pass and the HW covers the offset — but
+    // the content there changed: the waiter must fail NotLeader, never fire OK.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    ASSERT_EQ(ingressAcksAll(w, 9, 1), 1);                  // waiter at offset 0
+    w.doWork(2);
+    ASSERT_TRUE(drainAll(w).empty());
+    selfDemote(rep, 2, 3);
+    truncateTo(rep, 0);
+    ASSERT_EQ(log.logEndOffset(), 0) << "precondition: truncated below the waiter";
+    refetch(rep, otherBatchAt(0), /*leaderHw=*/1);
+    ASSERT_EQ(log.logEndOffset(), 1) << "precondition: different data now sits at offset 0";
+    rep.becomeLeader(3, {1});
+    ASSERT_GT(rep.highWatermark(), 0) << "precondition: the HW covers the waiter's offset";
+    std::vector<WorkerReturn> rets;
+    for (int i = 0; i < 4; ++i) { w.doWork(10 + i); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, kNotLeader) << "an acks=all OK over truncated + replaced data";
+}
+
+TEST(TxnRoleGateRegression, TwoTruncationsBetweenPassesFailWaiter) {
+    // Two truncations between passes: the FIRST cuts below the waiter, the
+    // second (the last one) above it.  Tracking only the last cut would keep
+    // the waiter and fire OK over changed data (addendum: min-cut since park).
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    ASSERT_EQ(ingressAcks0(w, 8, 1), 1);                    // offset 0
+    ASSERT_EQ(ingressAcksAll(w, 9, 1), 1);                  // waiter at offset 1
+    w.doWork(2);
+    ASSERT_EQ(drainAll(w).size(), 1u);                       // the acks=0 answer
+    selfDemote(rep, 2, 3);
+    truncateTo(rep, 0);                                      // cut 0 <= waiter
+    refetch(rep, concat({otherBatchAt(0), otherBatchAt(1), otherBatchAt(2), otherBatchAt(3)}), /*hw=*/0);
+    ASSERT_EQ(log.logEndOffset(), 4);
+    rep.becomeFollower(3, 2);                                // uncommitted tail → probe armed
+    truncateTo(rep, 3);                                      // cut 3 > waiter (the LAST cut)
+    ASSERT_EQ(log.logEndOffset(), 3);
+    refetch(rep, otherBatchAt(3), /*leaderHw=*/4);
+    rep.becomeLeader(4, {1});
+    ASSERT_GT(rep.highWatermark(), 1) << "precondition: the HW covers the waiter's offset";
+    std::vector<WorkerReturn> rets;
+    for (int i = 0; i < 4; ++i) { w.doWork(10 + i); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, kNotLeader) << "fired OK although an earlier cut replaced the waiter's data";
+}
+
+TEST(TxnRoleGateRegression, TruncationAboveWaiterKeepsWaiter) {
+    // One truncation strictly ABOVE the waiter between passes: the content at
+    // and below the waiter is unchanged, so it keeps waiting and fires OK once
+    // the HW passes it (the precise min-cut rule, not "fail on any change").
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    ASSERT_EQ(ingressAcksAll(w, 9, 1), 1);                  // waiter at offset 0
+    ASSERT_EQ(ingressAcks0(w, 10, 1), 1);                   // 1
+    ASSERT_EQ(ingressAcks0(w, 11, 1), 1);                   // 2
+    w.doWork(2);
+    ASSERT_EQ(drainAll(w).size(), 2u);
+    const uint64_t gen = rep.logGeneration();
+    selfDemote(rep, 2, 3);
+    truncateTo(rep, 2);                                      // cut 2 > waiter
+    ASSERT_EQ(log.logEndOffset(), 2);
+    rep.becomeLeader(3, {1, 2});
+    ASSERT_EQ(rep.logGeneration(), gen + 1) << "precondition: exactly one change to the log";
+    std::vector<WorkerReturn> rets;
+    for (int i = 0; i < 4; ++i) { w.doWork(10 + i); for (auto& r : drainAll(w)) rets.push_back(r); }
+    EXPECT_TRUE(rets.empty()) << "a cut above the waiter must not fail it";
+    rune::replication::FetchRequestMsg fr{3, 0, 2, log.logEndOffset(), 1 << 20, 1};
+    (void)rep.onFetchRequest(fr, 50);
+    for (int i = 0; i < 8 && rets.empty(); ++i) { w.doWork(60 + i); for (auto& r : drainAll(w)) rets.push_back(r); }
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, 0);
+}
+
+TEST(TxnRoleGateRegression, GatewayUsesIntendedRoleHint) {
+    using IR = ReplicaRegistry::IntendedRole;
+    {   // hint Leader, replica role_ Follower → the gateway routes; W refuses.
+        LegacyAcksRig R({1});
+        const auto h = R.reg.lookupHandle(0, 0);
+        R.reg.setIntendedRole(0, 0, h.incarnation, IR::Leader);
+        R.r->becomeFollower(2, 2);
+        R.produce(1, /*acks=*/0, batchAt(0));
+        EXPECT_TRUE(R.answers.empty())
+            << "the gateway answered inline from the worker-owned role() (a cross-thread read)";
+        for (int i = 0; i < 4 && R.answers.empty(); ++i) R.runWorker();
+        ASSERT_EQ(R.answers.size(), 1u);
+        EXPECT_FALSE(R.answers[0].inlineError) << "the owning worker decides (ProduceResult)";
+        EXPECT_EQ(R.answers[0].code, kNotLeader);
+        EXPECT_EQ(R.r->log()->logEndOffset(), 0);
+    }
+    {   // hint Follower, replica Leader → fast inline NotLeader; nothing routed.
+        LegacyAcksRig R({1});
+        const auto h = R.reg.lookupHandle(0, 0);
+        R.reg.setIntendedRole(0, 0, h.incarnation, IR::Follower);
+        R.produce(1, /*acks=*/0, batchAt(0));
+        ASSERT_EQ(R.answers.size(), 1u) << "a Follower hint must answer NotLeader inline";
+        EXPECT_TRUE(R.answers[0].inlineError);
+        EXPECT_EQ(R.answers[0].code, kNotLeader);
+        for (int i = 0; i < 4; ++i) R.runWorker();
+        EXPECT_EQ(R.r->log()->logEndOffset(), 0) << "the produce was routed although the hint says Follower";
+        EXPECT_EQ(R.answers.size(), 1u);
+    }
+}
+
+TEST(TxnRoleGateRegression, LegacyAcksAllDemotionFailsNotLeader) {
+    // I-A, DEFAULT config: an acks=all produce via the gateway; self-demotion;
+    // truncation + re-fetch past lastOffset with DIFFERENT data; re-promotion.
+    // The gateway's HW-snapshot check would ack it OK over replaced data.
+    LegacyAcksRig R({1, 2});
+    R.produceAll(1);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    ASSERT_TRUE(R.answers.empty()) << "precondition: the acks=all ack is parked";
+    selfDemote(*R.r, 2, R.now);
+    ASSERT_EQ(R.r->role(), Role::Follower);
+    truncateTo(*R.r, 0);
+    ASSERT_EQ(R.r->log()->logEndOffset(), 0);
+    refetch(*R.r, otherBatchAt(0), /*leaderHw=*/1);
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    R.r->becomeLeader(3, {1});
+    for (int i = 0; i < 8 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, kNotLeader) << "acks=all acked over truncated + replaced data";
+}
+
+TEST(LegacyAcksAllRegression, ParkedOnOwningWorkerFiresWhenHwPasses) {
+    // R-4a: in the default config the acks=all waiter lives on the OWNING
+    // worker (pendingAcksAll_), not in the gateway's pendingAcks_, and the
+    // worker's per-pass flush fires it in this mode too.
+    LegacyAcksRig R({1, 2});
+    R.produceAll(1);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    EXPECT_EQ(R.gw.pendingAcksForTest(), 0u) << "the gateway parked a worker-owned acks=all ack";
+    EXPECT_EQ(R.w().reservedAckSlotsForTest(), 1) << "the waiter must be parked on the owning worker";
+    EXPECT_TRUE(R.answers.empty());
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, 0);
+    EXPECT_EQ(R.answers[0].base, 0);
+    EXPECT_EQ(R.w().reservedAckSlotsForTest(), 0);
+}
+
+TEST(LegacyAcksAllRegression, StrictAcksAllAwaitsFsyncThenHw) {
+    // R-4b: Legacy Strict acks=all — fsync first, THEN the HW (thenAwaitHw).
+    LegacyAcksRig R({1, 2}, /*tier=*/2);
+    R.w().setReapPausedForTest(true);
+    R.produceAll(1);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    ASSERT_EQ(R.w().durablePendingCountForTest(), 1u) << "precondition: parked on its fsync";
+    R.followerFetch();                                        // HW passes BEFORE the fsync
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_TRUE(R.answers.empty()) << "a Strict ack must not precede its fsync";
+    R.w().setReapPausedForTest(false);
+    for (int i = 0; i < kCap && R.w().durablePendingCountForTest() > 0; ++i) { R.runWorker(); std::this_thread::yield(); }
+    for (int i = 0; i < 8 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, 0);
+    EXPECT_EQ(R.gw.pendingAcksForTest(), 0u);
+    // And the other order: fsync first, the HW later — the waiter moves from
+    // the fsync to the HW gate on the worker.
+    R.w().setReapPausedForTest(false);
+    R.answers.clear();
+    R.produceAll(2);
+    R.runWorker();
+    for (int i = 0; i < kCap && R.w().durablePendingCountForTest() > 0; ++i) { R.runWorker(); std::this_thread::yield(); }
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_TRUE(R.answers.empty()) << "durable but not committed: the acks=all ack must wait for the HW";
+    EXPECT_EQ(R.w().reservedAckSlotsForTest(), 1) << "after the fsync the waiter parks on the HW (worker)";
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, 0);
+    EXPECT_EQ(R.answers[0].base, 1);
+}
+
+TEST(LegacyAcksAllRegression, BurstBeyondReservationAnsweredRetriableNoHalt) {
+    // R-4c: the worker's G-A6 reservation bounds gateway-routed acks=all
+    // waiters (the gateway's old cap went with pendingAcks_): the excess is
+    // answered retriable (NotLeader) BEFORE any append, nothing is dropped, no
+    // halt, and one HW advance then fires every parked waiter exactly once.
+    LegacyAcksRig R({1, 2});
+    constexpr int kBurst = 600;                               // > the 64 KiB return ring's ~248 slots
+    int sent = 0;
+    while (sent < kBurst) {
+        for (int k = 0; k < 40 && sent < kBurst; ++k) R.produceAll(++sent);
+        R.runWorker();
+    }
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    const int64_t parked = R.w().reservedAckSlotsForTest();
+    std::size_t retriable = 0, other = 0;
+    for (const auto& a : R.answers) (a.code == kNotLeader ? retriable : other) += 1;
+    ASSERT_GT(parked, 0) << "acks=all must park on the owning worker";
+    EXPECT_LT(parked, kBurst) << "the reservation must bound the parked waiters";
+    EXPECT_EQ(other, 0u) << "only retriable answers before the HW advances";
+    EXPECT_EQ(static_cast<int64_t>(retriable) + parked, kBurst) << "every produce answered or parked";
+    EXPECT_EQ(R.r->log()->logEndOffset(), parked) << "a refused produce must not be appended";
+    R.followerFetch();
+    for (int i = 0; i < 64 && R.okCount() < static_cast<std::size_t>(parked); ++i) R.runWorker();
+    EXPECT_EQ(R.okCount(), static_cast<std::size_t>(parked)) << "every parked waiter fires exactly once";
+    EXPECT_EQ(R.answers.size(), static_cast<std::size_t>(kBurst));
+    EXPECT_EQ(R.w().reservedAckSlotsForTest(), 0);
+}
+
+TEST(LegacyAcksAllRegression, HeldWhileIsrBelowMinIsrAtFire) {
+    // DR-BUG-3 moved with I-A: the drain-time min-ISR check runs on the worker's
+    // ack-fire path.  Admitted at ISR {1,2} >= minIsr 2 (the runtime policy);
+    // the ISR then shrinks to {1} while the HW passes the batch (the replica's
+    // own minIsr is 1, so its HW is not clamped) → held, never OK; acked once
+    // the ISR is healthy again.
+    LegacyAcksRig R({1, 2}, /*tier=*/1, /*replica minIsr=*/1, /*replicaLagMaxMs=*/1);
+    R.gw.setMinIsr(2);
+    R.gw.syncMinIsrForTest();
+    R.produceAll(1);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    ASSERT_TRUE(R.answers.empty());
+    // Follower 2 never fetches: the worker's per-replica ISR check evicts it
+    // (the clock advances in 2 s steps, well inside the 30 s ack timeout).
+    for (int i = 0; i < 6 && R.r->isr().size() > 1; ++i) { R.now += 2'000'000'000LL; R.runWorker(); }
+    ASSERT_EQ(R.r->isr().size(), 1u) << "precondition: ISR shrank below the runtime minIsr";
+    ASSERT_GT(R.r->highWatermark(), 0) << "precondition: the HW passed the batch";
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_TRUE(R.answers.empty()) << "acks=all acked OK while the ISR is below minIsr (DR-BUG-3)";
+    for (int i = 0; i < 6 && R.r->isr().size() < 2; ++i) {   // follower 2 catches up → ISR {1,2}
+        R.now += 2'000'000'000LL;                              // next ISR-check tick ...
+        R.followerFetch();                                     // ... with a fresh fetch (lag < 1 ms)
+        R.runWorker();
+    }
+    ASSERT_EQ(R.r->isr().size(), 2u) << "precondition: the ISR recovered";
+    for (int i = 0; i < 8 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, 0);
 }

@@ -633,6 +633,11 @@ public:
     [[nodiscard]] bool ownsIncarnationForTest(uint32_t id, uint32_t inc) const noexcept {
         return ownsIncarnation_(id, inc);
     }
+    /// Bench (BM_WorkerRoleGate): the F15 produce role gate exactly as both
+    /// produce paths run it.
+    [[nodiscard]] static bool produceRoleGatePassesForTest(const rune::replication::PartitionReplica* r) noexcept {
+        return produceRoleGatePasses_(r);
+    }
     /// False when RUNE_IO_BACKEND selects a backend that cannot submit — shard
     /// mode refuses to start on such a worker (BrokerNode).
     [[nodiscard]] bool ioAcceptsSubmissions() const noexcept { return io_.acceptsSubmissions(); }
@@ -2785,6 +2790,13 @@ private:
     }
     [[nodiscard]] bool ownsIncarnation_(uint32_t id, uint32_t inc) const noexcept {
         return inc != 0 && id < ownedInc_.size() && ownedInc_[id] == inc;
+    }
+    // F15 §3.1 (I1): the OWNING worker is the role authority for a produce — one
+    // load + compare on the hot replica line (BM_WorkerRoleGate).  A null replica
+    // is a replication-less partition (passthrough): nothing to gate.
+    [[nodiscard]] [[gnu::always_inline]] static bool
+    produceRoleGatePasses_(const rune::replication::PartitionReplica* r) noexcept {
+        return r == nullptr || r->role() == rune::replication::Role::Leader;
     }
     void rebuildOwnedIndex_() {
         uint32_t maxId = 0;
