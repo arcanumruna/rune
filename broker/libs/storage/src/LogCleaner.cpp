@@ -179,7 +179,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (!r.ensureValid()) break;
 
             bool full = false;
-            r.forEach([&](std::string_view key, std::string_view /*val*/,
+            r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
                 if (full) return;
                 if (offset < fromOffset || offset >= toOffset) return;
@@ -240,7 +240,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
 
-            r.forEach([&](std::string_view key, std::string_view /*val*/,
+            r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
                 if (offset < fromOffset || offset >= toOffset) return;
                 if (key.empty()) return; // skip null-key records (not compactable)
@@ -348,7 +348,7 @@ bool LogCleaner::rewriteSegmentImpl(
         // record becomes a batch with baseOffset == that record's offset).
         // A2: After building, patch in the original producer fields and
         // recompute CRC to preserve idempotent-producer identity.
-        r.forEach([&](std::string_view key, std::string_view val,
+        r.forEachRecord([&](std::string_view key, std::string_view val,
                       int64_t offset, int64_t timestamp) {
             // Helper: emit this record as its own single-record batch,
             // preserving the original batch's producer identity (A2).
@@ -1047,7 +1047,7 @@ void LogCleaner::mergeGroupWithMap(
                     + rune::protocol::batch::kBaseSequenceOffset));
             int64_t batchBaseOffset   = r.baseOffset();
 
-            r.forEach([&](std::string_view key, std::string_view val,
+            r.forEachRecord([&](std::string_view key, std::string_view val,
                           int64_t offset, int64_t timestamp) {
                 auto keepWithHorizon2 = [&](int64_t horizonMs2) {
                     rune::protocol::RecordBatchBuilder b2(offset, timestamp);

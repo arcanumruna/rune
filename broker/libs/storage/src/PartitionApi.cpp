@@ -26,7 +26,7 @@ std::vector<ConsumedRecord> PartitionApi::consume(int64_t fromOffset, int32_t ma
             // chunk; the outer loop re-reads from `cursor` (the last complete batch's
             // end) so the truncated batch is returned whole next pass.
             if (!r.ensureValid()) break;
-            r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t ts) {
+            r.forEachRecord([&](std::string_view k, std::string_view v, int64_t off, int64_t ts) {
                 if (off >= fromOffset && off < hw) out.push_back({std::string(k), std::string(v), off, ts});
             });
             cursor = r.baseOffset() + r.lastOffsetDelta() + 1;

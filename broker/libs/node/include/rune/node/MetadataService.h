@@ -597,7 +597,7 @@ public:
                 if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
 
                 // Compute the log position of this batch.
-                reader.forEach([this, &applied](
+                reader.forEachRecord([this, &applied](
                         std::string_view /*key*/,
                         std::string_view val,
                         int64_t logOffset,  // base + offDelta (absolute log position)
@@ -678,7 +678,7 @@ public:
                 const int32_t tl = reader.totalLength();
                 if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
 
-                reader.forEach([this](
+                reader.forEachRecord([this](
                         std::string_view /*key*/,
                         std::string_view val,
                         int64_t logOffset,  // absolute log position

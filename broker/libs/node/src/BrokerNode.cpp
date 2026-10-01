@@ -2223,7 +2223,7 @@ void BrokerNode::buildAdminWorker() {
                         if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
 
                         // Each record: key=topicId(4 bytes LE), value=TopicSchema payload.
-                        reader.forEach([this](std::string_view /*key*/,
+                        reader.forEachRecord([this](std::string_view /*key*/,
                                               std::string_view val,
                                               int64_t /*offset*/,
                                               int64_t /*ts*/) {

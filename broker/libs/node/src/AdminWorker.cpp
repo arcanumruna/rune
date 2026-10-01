@@ -260,7 +260,7 @@ void AdminWorker::rebuildFromLog_() {
             if (!reader.ensureValid()) break;
             const int32_t tl = reader.totalLength();
             if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
-            reader.forEach([this](std::string_view /*key*/, std::string_view val,
+            reader.forEachRecord([this](std::string_view /*key*/, std::string_view val,
                                   int64_t /*offset*/, int64_t /*ts*/) {
                 auto ts = TopicSchema::deserialize(std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(val.data()), val.size()));

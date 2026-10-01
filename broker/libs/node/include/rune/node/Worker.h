@@ -70,6 +70,7 @@
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/detail/NoTypeErasure.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/WorkerOp.h>
 #include <rune_protocol_internal_sbe/WorkerReturn.h>
@@ -1625,15 +1626,11 @@ private:
                 bool validationFailed = false;
                 if (tailLen >= static_cast<uint32_t>(rune::protocol::batch::kRecordBatchOverhead)) {
                     rune::protocol::RecordBatchReader rdr(tail, static_cast<std::size_t>(tailLen));
-                    // M2 (HARD RULE #4 — zero hot-path alloc): the capturing lambda
-                    // passed to forEach must fit in std::function's small-object
-                    // buffer.  It captures: &v (pointer, 8 B), &validationFailed
-                    // (pointer, 8 B) — 16 bytes total, well within the typical 24–32 B
-                    // SOB limit.  If future changes add captures, re-verify this; a
-                    // larger capture list WILL cause a per-produce heap allocation.
-                    // static_assert cannot gate std::function SOB at compile time
-                    // (it's implementation-defined), so this comment is the pin.
-                    rdr.forEach([&](std::string_view /*key*/,
+                    // Task 11 fix 3 (B4, HARD RULE #4): templated record visitor —
+                    // inlined, no std::function per record.  The NoTypeErasure
+                    // capture makes the visitor move-only, so a regression to the
+                    // type-erased forEach() fails to COMPILE.
+                    rdr.forEachRecord([&, guard = detail::NoTypeErasure{}](std::string_view /*key*/,
                                     std::string_view val,
                                     int64_t /*offset*/,
                                     int64_t /*ts*/) {
