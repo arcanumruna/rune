@@ -96,8 +96,14 @@ public:
     /// is born finished (every op on it is rejected with OpResult::Closed).
     explicit Completions(Client& client, CompletionsConfig cfg = {});
 
-    /// Release protocol (§3.3).  Never blocks unless a Client close() is in
-    /// progress on another thread (then until it hands the ring back).
+    /// Release protocol (§3.3).  Never blocks: during another thread's close()
+    /// the ring is freed by whichever of the two lets go last (one ring word).
+    /// In Invoker mode, destroying a Completions is duty work (same contract as
+    /// doWork(): never concurrently with doWork()/close() on another thread).
+    /// If an op for this queue is still in the command ring, the release is
+    /// deferred until the drain passes it — the slot stays held meanwhile, so
+    /// the registry may report full until then; a late op completes into this
+    /// queue's own (unpolled) ring, never into another queue.
     ~Completions();
 
     Completions(const Completions&)            = delete;

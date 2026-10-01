@@ -121,6 +121,10 @@ Client::Client(ClientConfig cfg)
     , agent_(toAgentConfig(cfg_))
     , partitionRouter_(metadataCache_)
 {
+    // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
+    // never holds more than one entry per registry slot, so reserve it once
+    // here and the push_back there can never allocate (or throw).
+    deferredReleases_.reserve(kMaxCqs);
     // MD1 IMPORTANT-2: the seed session's currentLeaderChannel is initialised to
     // the config ingress channel (== gatewayChannel) inside ClientAgent's Session
     // constructor — Task 1.1 (was Client::currentLeaderChannel_ here).
@@ -550,9 +554,12 @@ void Client::registerCq_(Completions& q) {
 void Client::releaseCq_(Completions& q) noexcept {
     detail::CompletionRing* ring = q.ring_;
     const CqRef             ref  = q.cqRef_;
-    // I1: on the thread running this Client's close() — its drain already
-    // read up to the frozen tail (or was abandoned: nothing behind the orphan
-    // is ever applied), so no op of this queue is left unapplied.
+    // I1: on the thread running this Client's close().  Usually its drain has
+    // already read up to the frozen tail (or was abandoned: nothing behind the
+    // orphan is ever applied).  A release made INSIDE drainRegistrationsForClose
+    // can still have later ops of this queue in that drain: they are dropped as
+    // stale by the generation check (misdelivery would need 32 generation wraps
+    // of this one slot within a single drain — not reachable in practice).
     if (tClosing == this) {
         applyCqRelease_(ref, ring);
         return;
@@ -574,6 +581,11 @@ void Client::releaseCq_(Completions& q) noexcept {
         if (agent_.commandRingHead() >= fence) {
             applyCqRelease_(ref, ring);
         } else {
+            // Never allocates: reserved to kMaxCqs in the constructor (one entry
+            // per registry slot at most).  A deferred release keeps its slot (and
+            // ring) until the drain passes the fence, so the registry can report
+            // "full" meanwhile — bounded by that drain; a late op completes into
+            // this queue's own (unpolled) ring, never into another queue.
             deferredReleases_.push_back(DeferredRelease{ring, fence, ref});
         }
         return;
