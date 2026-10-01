@@ -155,13 +155,34 @@ LogSegment::~LogSegment() {
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
 }
 
+int LogSegment::flushBufferedToPageCache() noexcept {
+    log_.flush();
+    return log_ ? 0 : EIO;
+}
+
 void LogSegment::sync() {
+    if (storage_) {
+        ++storage_->syncCalls;
+        if (storage_->failedErrno != 0) {
+            // fsyncgate: never retry a sync on a failed log — a later success
+            // cannot vouch for dirty pages the kernel already dropped.
+            throw std::system_error(storage_->failedErrno, std::generic_category(),
+                                    "LogSegment::sync on a failed log " + logPath_);
+        }
+    }
+    int err = 0;
     // 1. Flush libc buffer → OS page cache.
     log_.flush();
+    if (!log_) err = EIO;
+    if (err == 0 && storage_ && storage_->faultForTest != 0) err = storage_->faultForTest;
     // 2. fsync: flush page cache → storage device (data + size metadata needed to read).
-    if (fd_ >= 0) ::fsync(fd_);
+    if (err == 0 && fd_ >= 0 && ::fsync(fd_) != 0) err = errno;
     // 3. msync: ensure mmap'd index pages are also written to device.
-    index_->sync();
+    if (err == 0) err = index_->sync();
+    if (err != 0) {
+        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = err;
+        throw std::system_error(err, std::generic_category(), "LogSegment::sync " + logPath_);
+    }
 }
 
 void LogSegment::preallocate(int64_t bytes) noexcept {
@@ -507,16 +528,35 @@ int64_t LogSegment::recover() {
 
     // B3: msync the rebuilt index then atomically rename .index.tmp → .index,
     // then fsync the directory so the renamed entry survives power loss.
-    index_->sync();
+    // Accepted role-change sync work (truncateTo on a role / epoch change, and
+    // startup recovery) — counted, and an error is fail-stop (sticky per log)
+    // rather than an exception escaping a worker loop.
+    if (storage_) ++storage_->roleChangeSyncs;
+    if (const int e = (storage_ && storage_->faultForTest) ? storage_->faultForTest : index_->sync(); e != 0) {
+        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
+    }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
-        throw std::system_error(errno, std::system_category(),
+        const int e = errno;
+        if (storage_) {
+            // Task 10 fix 3: fail-stop, not an exception escaping a worker loop
+            // (truncateTo on a role change runs on the owning worker).  The log
+            // is permanently failed; its owner's loop routes it to the halt.  The
+            // rebuilt in-memory index (on the .tmp file) stays valid meanwhile.
+            if (storage_->failedErrno == 0) storage_->failedErrno = e != 0 ? e : EIO;
+            return nextOffset_;
+        }
+        throw std::system_error(e, std::system_category(),
                                 "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
     }
     // fsync the directory for durability of the rename
     {
         std::string dir = logPath_.substr(0, logPath_.rfind('/'));
         int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-        if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+        if (dfd >= 0) {
+            if (storage_) ++storage_->roleChangeSyncs;
+            if (::fsync(dfd) != 0 && storage_ && storage_->failedErrno == 0) storage_->failedErrno = errno;
+            ::close(dfd);
+        }
     }
     // Reopen index_ from the canonical path and recount entries from mmap data.
     index_ = std::make_unique<OffsetIndex>(indexPath, baseOffset_, indexMaxBytes_);

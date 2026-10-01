@@ -364,7 +364,9 @@ public:
         const auto deadline = clock::now() + std::chrono::seconds{10};
         for (int i = 0; i < iterations && clock::now() < deadline && !done(); ++i) {
             gw_->doWork(nowNs());
-            aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+            // driverThread_ (startDriver()) is the driver's ONE pumper; do not pump
+            // aeron_driver_main_do_work here too (second-pumper race, spec Sec 3.6).
+            std::this_thread::sleep_for(std::chrono::microseconds{100});
         }
     }
 
@@ -418,12 +420,11 @@ protected:
         });
 
         // Wait for CnC file.
+        // No caller-side pumping: aeron_driver_init/start already wrote
+        // cnc.dat and stamped the heartbeat synchronously before driverThread_
+        // even starts; pumping here would be a second concurrent pumper on
+        // the single-pumper driver (spec Sec 3.6).
         const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver_);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
         ASSERT_TRUE(fs::exists(cncPath)) << "Aeron CnC file not created";
     }
 

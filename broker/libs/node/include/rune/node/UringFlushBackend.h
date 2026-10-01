@@ -16,8 +16,8 @@
 //     - Takes the next free SQE slot from the SQ ring.
 //     - Issues IORING_OP_FSYNC with IORING_FSYNC_DATASYNC on the given fd.
 //     - Stores user_data = token so the completion can be matched.
-//     - Stores flushBoundary in a worker-owned token→boundary table (sized to
-//       SQ depth) so reap() can reconstruct the full FlushCompletion.
+//     - flushBoundary is NOT tracked (Task 10 fix 1 / I2: the old token % SQ
+//       depth table aliased); completions report flushBoundary = 0.
 //     - Calls io_uring_enter(2) (syscall 426) with submit_count=1 to push the SQE.
 //     - Returns kNoToken if the SQ is full (back-pressure — caller retries).
 //
@@ -86,7 +86,7 @@ public:
     // submit — worker side (non-blocking, no allocation).
     //
     // Assigns the next token, fills an SQE for IORING_OP_FSYNC|DATASYNC on fd,
-    // stores flushBoundary in the token→boundary table, advances the SQ tail
+    // (flushBoundary is ignored — completions match by token), advances the SQ tail
     // with a release fence, and submits via io_uring_enter.
     //
     // Returns kNoToken if the SQ ring is full (back-pressure).
@@ -143,17 +143,6 @@ private:
     // Depth actually allocated for the SQ ring (== sqRingSize_).
     std::size_t submitDepth_{0};
 
-    // Worker-owned token→flushBoundary lookup table.
-    // Indexed by (token % sqRingSize_) — valid while the SQE is in-flight.
-    // Allocated once in ctor (size = sqRingSize_).  No cross-thread access.
-    std::unique_ptr<int64_t[]> boundaryTable_;
-
-    // portableFallback_: set when RUNE_IO_BACKEND=portable and io_uring is not
-    // available (e.g. Docker Desktop on Apple Silicon / Rosetta x86 emulation).
-    // submit() always returns kNoToken; reap() is a no-op.  Workers operating in
-    // this mode never use durability tier 2 (Strict) — tier 0/1 acks are
-    // enqueued synchronously without io_uring involvement.
-    bool portableFallback_{false};
 
     // Internal helper called by submit() after token allocation.
     CompletionToken submitWithToken(int fd, int64_t flushBoundary,
@@ -166,9 +155,6 @@ private:
 // ---------------------------------------------------------------------------
 template <class H>
 int UringFlushBackend::reap(H&& handler) noexcept {
-    // Portable fallback: no io_uring rings — nothing to reap.
-    if (portableFallback_) { (void)handler; return 0; }
-
     // CQ tail is written by the kernel; acquire fence to observe kernel writes.
     const uint32_t mask = *cqRingMask_;
     int count = 0;
@@ -189,13 +175,9 @@ int UringFlushBackend::reap(H&& handler) noexcept {
         comp.token     = static_cast<CompletionToken>(cqe->user_data);
         comp.errorCode = (cqe->res < 0) ? -cqe->res : 0;
 
-        // Recover flushBoundary from the worker-owned table.
-        if (comp.token != kNoToken) {
-            const uint32_t slot = static_cast<uint32_t>(comp.token) % sqRingSize_;
-            comp.flushBoundary  = boundaryTable_[slot];
-        } else {
-            comp.flushBoundary = 0;
-        }
+        // flushBoundary is informational and not tracked by io_uring (I2: the
+        // old token % ring-size table aliased).  Completions match by token.
+        comp.flushBoundary = 0;
 
         handler(comp);
         ++count;

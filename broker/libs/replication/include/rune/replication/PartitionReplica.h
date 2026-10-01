@@ -591,6 +591,35 @@ public:
     [[nodiscard]] bool isMemoryBacked() const noexcept { return memoryBacked_; }
     [[nodiscard]] bool isDiskBacked()   const noexcept { return !memoryBacked_; }
 
+    /// Shard mode (spec §3.1 never-block): this replica never fsyncs inline.
+    /// The time-gated follower flush, the direct append() (txn markers) and the
+    /// reconcile append become page-cache writes plus a flush REQUEST that the
+    /// owning worker submits to its io backend; the disk log's roll seal is
+    /// deferred to the worker too (Log::setDeferSealSync).  Set before the
+    /// replica is driven; legacy = false (inline fsyncs, unchanged).
+    /// Task 10 fix 3: registry identity (set once by ReplicaRegistry::add on the
+    /// control thread, before any worker learns of the replica).  (0, 0) =
+    /// unregistered: ops for it are not ownership-gated.
+    void setRegistryHandle(uint32_t id, uint32_t incarnation) noexcept {
+        registryId_ = id; incarnation_ = incarnation;
+    }
+    [[nodiscard]] uint32_t registryId()  const noexcept { return registryId_; }
+    [[nodiscard]] uint32_t incarnation() const noexcept { return incarnation_; }
+
+    void setExternalFollowerFlush(bool on) noexcept {
+        externalFollowerFlush_ = on;
+        if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setDeferSealSync(on);
+    }
+    /// Leader-epoch checkpoint writes (the one accepted synchronous disk write
+    /// on a shard loop — see checkpointEpochs_).
+    [[nodiscard]] uint64_t epochCheckpointWritesForTest() const noexcept { return epochCheckpointWrites_; }
+    /// Worker side: consume a pending flush request (true once per request).
+    [[nodiscard]] bool takeFollowerFlushRequest() noexcept {
+        const bool r = followerFlushRequested_;
+        followerFlushRequested_ = false;
+        return r;
+    }
+
     /// Task 9: test accessor — exposes the internal epoch cache for restart-
     /// durability tests.  Disk-backed only (memory-backed partitions have no
     /// checkpoint; their epoch cache is always rebuilt from scratch on restart).
@@ -862,6 +891,12 @@ private:
     int64_t lastKnownNowNs_ = 0;   ///< most-recent doWork() clock, for message handlers
     bool followerApplyDirty_ = false;  ///< follower applied via appendNoSync since last flush
     int64_t lastFollowerSyncNs_ = 0;   ///< last coalesced follower fsync (time-gated)
+    bool externalFollowerFlush_ = false;   ///< shard mode: worker submits the flush (async)
+    uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
+    uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
+    uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
+    void checkpointEpochs_();
+    bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker
     // Per-second rate counters (RUNE_FS_LOG diagnostic) to localise the acks=all
     // throughput bottleneck: appends (LEO growth), applies (follower push-apply),
     // pushes sent, fast-acks received, HW advance.

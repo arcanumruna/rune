@@ -29,6 +29,10 @@ struct EmbeddedDriverConfig {
     NodeConfig::AeronThreadingMode threadingMode = NodeConfig::AeronThreadingMode::Shared;
     std::string idleStrategy      = "sleep-ns";
     bool        deleteDirOnShutdown = true;
+    /// 0 = Aeron default (10 s).  Also the invoker client's inter-service timeout
+    /// (read from CnC).  Must exceed the driver timer interval (1 s).  Test-only
+    /// override (shard startup-gap regression); never set in production.
+    int64_t     clientLivenessTimeoutNs = 0;
 
     static EmbeddedDriverConfig fromNode(const NodeConfig& c, std::string dir);
 };

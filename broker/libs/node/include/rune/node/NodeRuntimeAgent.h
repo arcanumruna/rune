@@ -40,6 +40,8 @@
 #include <rune_fr/FlightRecorder.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/LogCleaner.h>
+#include <rune/storage/Log.h>
+#include <spdlog/spdlog.h>
 #include <rune/storage/OffsetMap.h>
 #include <rune/consensus/Election.h>
 #include <rune/metadata/RoutingImage.h>
@@ -150,6 +152,12 @@ public:
         adminControlHook_ = std::move(hook);
     }
 
+    // fsyncgate fail-stop (Task 10 fix 2 / I-1): replicas this control thread
+    // drives (internal partitions; all partitions without a WorkerPool) whose
+    // log fsync failed are reported here ONCE → BrokerNode halts (exit 74).
+    using StorageFailureHook = std::function<void(const std::string& logDir, int err)>;
+    void setStorageFailureHook(StorageFailureHook hook) { storageFailureHook_ = std::move(hook); }
+
     // -----------------------------------------------------------------------
     // Agent::doWork — single-writer duty cycle.
     // Returns sum of work done by all components.
@@ -157,9 +165,37 @@ public:
     const char* name() const noexcept override { return "rune-runtime"; }
 
     int doWork(int64_t nowNs) override {
+        // F7 ownership invariant (WorkerPool): a runtime replica move is a hard
+        // error → halt (no exception escapes onto the AgentRunner thread).
+        try {
+            return doWorkImpl_(nowNs);
+        } catch (const std::logic_error& e) {
+            if (!fatalReported_) {
+                fatalReported_ = true;
+                spdlog::critical("NodeRuntimeAgent: invariant violation: {} — halting", e.what());
+                if (fatalHook_) fatalHook_(e.what());
+            }
+            return 0;
+        }
+    }
+
+    // Halt on an invariant violation (BrokerNode wires it; called once).
+    void setFatalHook(std::function<void(const std::string&)> hook) { fatalHook_ = std::move(hook); }
+
+private:
+    int doWorkImpl_(int64_t nowNs) {
         RUNE_FR_SPAN_RUNTIME(rune_fr::Site::RuntimeDoWork, 0);
         // 1. Consensus (Election + IngressRing drain).
         int work = consensus_.doWork(nowNs);
+
+        // 1b. Task 10 fix 3 (I2a): fan ownership out BEFORE anything this cycle
+        //     can route ops (bridge role ops, transport poll, gateway), and free
+        //     removed replicas no worker can still reference (all acked).
+        if (workerPool_ && registry_) workerPool_->reconcile(*registry_);
+        if (registry_) {
+            registry_->collectRetired(workerPool_ ? workerPool_->minAckedOwnershipGen()
+                                                  : registry_->generation());
+        }
 
         // 2. Metadata bridge — detect leader/epoch change and flip replica roles.
         //    Reads election_ AFTER consensus step so the state is current.
@@ -422,13 +458,17 @@ public:
                 for (auto* replica : registry_->allReplicas()) {
                     if (replica && replica->topicId() < 0) {
                         work += replica->doWork(nowNs);
+                        checkReplicaStorage_(replica);
                     }
                 }
             }
         } else if (registry_) {
             // Pre-E1 path: iterate registry directly (all replicas).
             for (auto* replica : registry_->allReplicas()) {
-                if (replica) work += replica->doWork(nowNs);
+                if (replica) {
+                    work += replica->doWork(nowNs);
+                    checkReplicaStorage_(replica);
+                }
             }
         }
 
@@ -492,6 +532,8 @@ public:
 
         return work;
     }
+
+public:
 
     // -----------------------------------------------------------------------
     // F1: TEST-ONLY owner-thread hook — producer side (TEST thread).
@@ -754,6 +796,20 @@ private:
     WorkerPool*                                        workerPool_;      // non-owning; null = pre-E1 path
     // Task 8a: admin control-plane servicing hook (RULING-2 B). Null = no admin plane.
     std::function<int(int64_t)>                        adminControlHook_;
+    StorageFailureHook                                 storageFailureHook_;
+    std::function<void(const std::string&)>            fatalHook_;
+    bool                                               fatalReported_ = false;
+    bool                                               storageFailureReported_ = false;
+    void checkReplicaStorage_(rune::replication::PartitionReplica* replica) {
+        if (!replica->isDiskBacked()) return;
+        rune::storage::Log* log = replica->log();
+        if (!log->storageFailed()) [[likely]] return;
+        if (storageFailureReported_) return;
+        storageFailureReported_ = true;
+        spdlog::critical("NodeRuntimeAgent: fsync FAILED on {} (errno={}) — halting the broker",
+                         log->dir(), log->storageErrno());
+        if (storageFailureHook_) storageFailureHook_(log->dir(), log->storageErrno());
+    }
 };
 
 } // namespace rune::node

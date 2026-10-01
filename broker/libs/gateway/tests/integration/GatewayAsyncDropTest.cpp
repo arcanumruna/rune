@@ -241,12 +241,11 @@ private:
             }
         });
 
+        // No caller-side pumping: aeron_driver_init/start already wrote
+        // cnc.dat and stamped the heartbeat synchronously before driverThread_
+        // even starts; pumping here would be a second concurrent pumper on
+        // the single-pumper driver (spec Sec 3.6).
         const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver_);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
         ASSERT_TRUE(fs::exists(cncPath))
             << "Aeron CnC file not created within timeout";
     }

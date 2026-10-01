@@ -2871,11 +2871,78 @@ void ClientGateway::pushSubscriptions()
 //
 // Single-writer: duty-cycle thread only.
 // ---------------------------------------------------------------------------
+void ClientGateway::onControlRecordRefused_(int32_t topicId, int32_t partition,
+                                            const std::vector<uint8_t>& marker, int16_t err)
+{
+    ++controlRecordsRefused_;
+    if (replicaRegistry_ && replicaRegistry_->lookup(topicId, partition) && !marker.empty() &&
+        appendControlRecord(topicId, partition,
+                            std::span<const uint8_t>(marker.data(), marker.size())) >= 0) {
+        spdlog::warn("ClientGateway: control marker for topic={} partition={} refused by a stale "
+                     "owner — re-routed to the current owner", topicId, partition);
+        return;
+    }
+    int64_t pid = -1;
+    if (marker.size() >= 43u + 8u) {
+        pid = 0;
+        for (int i = 0; i < 8; ++i) pid |= static_cast<int64_t>(marker[43u + i]) << (i * 8);
+    }
+    spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} REFUSED "
+                  "(partition not on this node) — surfaced to the txn coordinator as NotLeader",
+                  topicId, partition, pid);
+    if (txnService_) txnService_->onControlMarkerRefused(topicId, partition, pid, err);
+}
+
+void ClientGateway::raiseStorageFailure_(const std::string& logDir, int err)
+{
+    spdlog::critical("ClientGateway: STORAGE FAILURE on {} (errno={}) — fsync failed; "
+                     "halting the broker (fail-stop)", logDir, err);
+    if (storageFailureRaised_) return;
+    storageFailureRaised_ = true;
+    if (storageFailureHandler_) storageFailureHandler_(logDir, err);
+}
+
 void ClientGateway::drainWorkerReturns_()
 {
     using namespace rune::protocol::batch;
 
     workerPool_->drainAllReturns([this](rune::node::WorkerReturn ret) {
+        handleWorkerReturn_(std::move(ret));
+    });
+}
+
+void ClientGateway::handleWorkerReturnForTest(const rune::node::WorkerReturn& ret)
+{
+    handleWorkerReturn_(ret);
+}
+
+void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
+{
+    using namespace rune::protocol::batch;
+
+        // ===================================================================
+        // StorageFailure (fsyncgate fail-stop) — halt the broker.
+        // ===================================================================
+        if (ret.type == rune::node::WorkerReturn::Type::StorageFailure) [[unlikely]] {
+            raiseStorageFailure_(std::string(ret.chunk.begin(), ret.chunk.end()), ret.errorCode);
+            return;
+        }
+
+        // Task 10 fix 3: a worker applied SetOwnership(gen) — lets the runtime
+        // free replicas removed at or below the minimum acked generation.
+        if (ret.type == rune::node::WorkerReturn::Type::OwnershipAck) {
+            workerPool_->onOwnershipAck(ret.partition, static_cast<std::uint64_t>(ret.lastOffset));
+            return;
+        }
+
+        // Task 10 fix 3: a control marker refused by the worker ownership guard.
+        // Re-route it with the CURRENT routing if the partition is still on this
+        // node (a new incarnation); otherwise surface NotLeader to the txn
+        // coordinator — never a silent drop.
+        if (ret.type == rune::node::WorkerReturn::Type::ControlRecordRefused) [[unlikely]] {
+            onControlRecordRefused_(ret.topicId, ret.partition, ret.chunk, ret.errorCode);
+            return;
+        }
 
         // ===================================================================
         // ProduceResult
@@ -3222,7 +3289,6 @@ void ClientGateway::drainWorkerReturns_()
             return;
         }
 
-    }); // drainAllReturns
 }
 
 // ---------------------------------------------------------------------------
@@ -3473,6 +3539,9 @@ void ClientGateway::flushDirtyLogs()
             spdlog::error("ClientGateway: flushDirtyLogs log->sync() threw unknown exception; "
                           "log stays dirty (durability NOT achieved)");
         }
+        // fsyncgate: an fsync failure is never retried — the log is permanently
+        // failed (LogSegment::sync) and the broker halts.
+        if (!synced && log->storageFailed()) raiseStorageFailure_(log->dir(), log->storageErrno());
         if (!synced) stillDirty.insert(log);
     }
     dirtyLogs_ = std::move(stillDirty);

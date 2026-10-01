@@ -105,6 +105,56 @@ public:
     /// callers may batch appends and call sync() once — but MUST NOT advance
     /// the high-watermark past an offset before sync() returns for that offset.
     void sync();
+    /// Test hook: number of inline LogSegment::sync calls on this log's segments
+    /// (append's durable fsync, sync(), the inline seal) — spec §3.1: a shard
+    /// loop must make none; its flushes go through the io backend.
+    [[nodiscard]] uint64_t syncCallsForTest() const noexcept { return storage_.syncCalls; }
+    /// Test hook: while non-zero every inline sync fails with this errno.
+    void setSyncFaultForTest(int err) noexcept { storage_.faultForTest = err; }
+
+    // ---- fsyncgate fail-stop (sticky per-log storage failure) -----------------
+    /// True once ANY fsync/msync on this log failed (inline or async).  Never
+    /// clears: appends throw, Log::sync throws, producers get StorageError and
+    /// the broker halts.  Restart recovery truncates to the last valid batch.
+    [[nodiscard]] bool storageFailed() const noexcept { return storage_.failedErrno != 0; }
+    [[nodiscard]] int  storageErrno()  const noexcept { return storage_.failedErrno; }
+    /// Record an async (io backend) fsync failure.  First error wins.
+    void markStorageFailed(int err) noexcept {
+        if (storage_.failedErrno == 0) storage_.failedErrno = err != 0 ? err : 5 /*EIO*/;
+    }
+
+    // ---- async seal (shard mode, spec §3.1 never-block) ----------------------
+    /// When on, a roll does NOT fsync the sealed segment inline: its buffered
+    /// bytes are pushed to the page cache, the segment is pinned and queued as a
+    /// pending seal for the owning worker to fdatasync through its io backend.
+    /// Legacy (off): the seal fsync stays inline.  Owner thread only.
+    void setDeferSealSync(bool on) noexcept { deferSealSync_ = on; }
+    [[nodiscard]] bool deferSealSync() const noexcept { return deferSealSync_; }
+    [[nodiscard]] std::size_t pendingSealCount() const noexcept { return pendingSealCount_; }
+    /// Oldest pending seal (pinned; the caller submits its logFd()).
+    [[nodiscard]] LogSegment* frontPendingSeal() const noexcept {
+        return pendingSealCount_ ? pendingSeals_[0] : nullptr;
+    }
+    void popPendingSeal() noexcept;
+    /// The active segment, for an async flush: pin it, submit its logFd(), and
+    /// unpinSegmentFlush() on the completion (M1: its fd outlives the flush).
+    [[nodiscard]] LogSegment* activeSegmentForFlush() noexcept { return segments_.rbegin()->second.get(); }
+    /// M1: release one in-flight flush on `seg`; a segment already removed from
+    /// the log (truncate / retention / reload) is closed when this reaches 0.
+    void unpinSegmentFlush(LogSegment* seg) noexcept;
+    [[nodiscard]] std::size_t retiredSegmentsForTest() const noexcept { return retiredSegments_.size(); }
+    /// Pending (un-submitted) async seals dropped because their segment was
+    /// removed (truncate / retention / reload).  The owning worker fails its
+    /// seal-gated durable entries retriably when this changes.
+    [[nodiscard]] uint64_t droppedPendingSeals() const noexcept { return droppedPendingSeals_; }
+    /// Accepted role-change sync work (not on the steady-state loop): the index
+    /// msync + directory fsync of LogSegment::recover (run by truncateTo on a
+    /// role / epoch change, and at startup recovery).
+    [[nodiscard]] uint64_t roleChangeSyncCallsForTest() const noexcept { return storage_.roleChangeSyncs; }
+
+    /// Owner-defined O(1) tag (the owning worker's flush-slot index); UINT32_MAX = none.
+    void     setOwnerTag(uint32_t t) noexcept { ownerTag_ = t; }
+    [[nodiscard]] uint32_t ownerTag() const noexcept { return ownerTag_; }
     /// Truncate all records with baseOffset >= truncateOffset.
     /// The log's logEndOffset is reset to truncateOffset.
     /// Segments entirely beyond truncateOffset are deleted.
@@ -317,6 +367,24 @@ private:
     void publishSealedSnapshot();
 
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
+    LogStorageState storage_{};     ///< fail-stop state + inline-sync accounting (shared with segments)
+    bool deferSealSync_ = false;
+    static constexpr std::size_t kMaxPendingSeals = 16;
+    std::array<LogSegment*, kMaxPendingSeals> pendingSeals_{};
+    std::size_t pendingSealCount_ = 0;
+    uint64_t droppedPendingSeals_ = 0;
+    /// M1: segments removed from segments_ while an async flush was in flight on
+    /// their fd.  Destroyed (fd closed) by unpinSegmentFlush.  Rare, cold.
+    std::vector<std::unique_ptr<LogSegment>> retiredSegments_;
+    uint32_t ownerTag_ = UINT32_MAX;
+    using SegMap = std::map<int64_t, std::unique_ptr<LogSegment>>;
+    /// Wire `seg` into this log (storage state) and store it at `base`, retiring
+    /// any pinned segment it replaces.
+    void install_(int64_t base, std::unique_ptr<LogSegment> seg);
+    /// Remove a segment, retiring it instead of closing its fd if pinned.
+    SegMap::iterator erase_(SegMap::iterator it);
+    void retire_(std::unique_ptr<LogSegment> seg);
+    void throwIfFailed_() const;
     /// CP-8 incremental largestTimestamp: running max of maxTimestamp() across all
     /// batches appended to the ACTIVE segment since the last roll.  Reset to 0 at
     /// each roll (after publishSealedSnapshot captures it for the newly-sealed
@@ -337,7 +405,7 @@ private:
     /// hot-path maybeRoll() call).  The map is cleared after the first
     /// publishSealedSnapshot() call consumes it so it does not persist past recovery.
     std::map<int64_t, int64_t> recoveryMaxTimestamps_;
-    std::map<int64_t, std::unique_ptr<LogSegment>> segments_;
+    SegMap segments_;
 
     // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.
     // Written exclusively on the append thread; read safely on the cleaner thread

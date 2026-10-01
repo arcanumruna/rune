@@ -102,6 +102,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace rune::replication {
@@ -129,6 +130,19 @@ public:
                      const std::vector<std::pair<rune::replication::NodeId, std::string>>& peerChannels,
                      int32_t peerStreamId,
                      rune::aeronutil::AeronPump pump = {}) noexcept
+    {
+        attach(std::move(aeron), peerChannels, peerStreamId, pump);
+    }
+
+    /// Unattached registry (no pubs; allResolved()==false; every send a no-op)
+    /// until attach() — lets a shard plane exist before its client does.
+    AeronPubRegistry() noexcept = default;
+
+    /// Register + resolve every peer pub (the former ctor body).  Once only.
+    void attach(std::shared_ptr<aeron::Aeron>                                       aeron,
+                const std::vector<std::pair<rune::replication::NodeId, std::string>>& peerChannels,
+                int32_t peerStreamId,
+                rune::aeronutil::AeronPump pump = {}) noexcept
     {
         if (!aeron) return;  // no driver → all unresolved
 
@@ -202,17 +216,24 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // dropPeer — forget `peer`'s publication (cold path: shard plane refusal).
-    // Afterwards every send to it is a no-op and broadcasts skip it.
+    // setPeerBlocked — shard plane refusal (cold path).  A blocked peer is
+    // invisible to every DATA send (sendToPeer / sendGatherToPeer / broadcast /
+    // hasPeer); control frames still reach it via sendControlToPeer, so a peer
+    // that is fixed can heal the plane.  Unblocking restores data sends.
     // -----------------------------------------------------------------------
-    void dropPeer(rune::replication::NodeId peer) noexcept
+    void setPeerBlocked(rune::replication::NodeId peer, bool blocked) noexcept
     {
-        for (std::size_t i = 0; i < pubCount_; ++i) {
-            if (pubs_[i].id != peer) continue;
-            for (std::size_t j = i + 1; j < pubCount_; ++j) pubs_[j - 1] = std::move(pubs_[j]);
-            pubs_[--pubCount_] = PeerPub{};
-            return;
-        }
+        for (std::size_t i = 0; i < pubCount_; ++i)
+            if (pubs_[i].id == peer) pubs_[i].blocked = blocked;
+    }
+
+    /// Control frame (PlaneHello) — ignores the data block.
+    int64_t sendControlToPeer(rune::replication::NodeId peer,
+                              const uint8_t* buf, std::size_t len) noexcept
+    {
+        for (std::size_t i = 0; i < pubCount_; ++i)
+            if (pubs_[i].id == peer && pubs_[i].pub) return sendOnPub_(*pubs_[i].pub, buf, len);
+        return -1;
     }
 
     // -----------------------------------------------------------------------
@@ -254,7 +275,7 @@ public:
     {
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerBroadcast, 0);
         for (std::size_t i = 0; i < pubCount_; ++i) {
-            if (pubs_[i].pub) sendOnPub_(*pubs_[i].pub, buf, len);
+            if (pubs_[i].pub && !pubs_[i].blocked) sendOnPub_(*pubs_[i].pub, buf, len);
         }
     }
 
@@ -337,12 +358,14 @@ private:
     struct PeerPub {
         rune::replication::NodeId                    id = -1;
         std::shared_ptr<aeron::ExclusivePublication> pub;
+        bool                                         blocked = false;   // shard plane refusal
     };
     static constexpr std::size_t kMaxPeers = FollowerSlots::kMaxReplicas;
 
     [[nodiscard]] aeron::ExclusivePublication* findPub_(rune::replication::NodeId id) const noexcept
     {
-        for (std::size_t i = 0; i < pubCount_; ++i) if (pubs_[i].id == id) return pubs_[i].pub.get();
+        for (std::size_t i = 0; i < pubCount_; ++i)
+            if (pubs_[i].id == id) return pubs_[i].blocked ? nullptr : pubs_[i].pub.get();
         return nullptr;
     }
 
@@ -383,6 +406,21 @@ public:
             std::vector<std::pair<rune::replication::NodeId, std::string>>           peerChannels,
             int32_t                                                                  peerStreamId,
             rune::aeronutil::AeronPump                                               pump = {}) noexcept
+        : WorkerReplicationTransportImpl(workerId, std::move(inboundChannel), inboundStreamId, DeferredAttach{})
+    {
+        (void)attach(std::move(aeron), peerChannels, peerStreamId, pump);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferred construction (shard mode, Task 9 fix round 1 I2): the plane
+    // object exists (replicas bind their concrete transport pointer to it at
+    // build time) but has NO client yet: resolved()==false, poll() is a no-op,
+    // every send a no-op.  attach() later registers + resolves on the shard's
+    // own client, right before the shard runner starts (no unpumped gap).
+    // -----------------------------------------------------------------------
+    struct DeferredAttach {};
+    WorkerReplicationTransportImpl(int32_t workerId, std::string inboundChannel,
+                                   int32_t inboundStreamId, DeferredAttach) noexcept
         : workerId_(workerId)
         , inboundChannel_(std::move(inboundChannel))
         , inboundStreamId_(inboundStreamId)
@@ -395,7 +433,21 @@ public:
                           static_cast<std::size_t>(length),
                           header);
           })
-        , pubReg_(aeron, peerChannels, peerStreamId, pump)
+    {}
+
+    /// Register + resolve the inbound sub and every peer pub on `aeron`.  Once
+    /// only (startup thread, before the worker runner).  Returns resolved().
+    bool attach(std::shared_ptr<aeron::Aeron> aeron,
+                const std::vector<std::pair<rune::replication::NodeId, std::string>>& peerChannels,
+                int32_t peerStreamId, rune::aeronutil::AeronPump pump = {}) noexcept
+    {
+        pubReg_.attach(aeron, peerChannels, peerStreamId, pump);
+        attachInbound_(aeron, pump);
+        return resolved();
+    }
+
+private:
+    void attachInbound_(const std::shared_ptr<aeron::Aeron>& aeron, rune::aeronutil::AeronPump& pump) noexcept
     {
         if (!aeron) return;  // null aeron → unresolved (test or misconfiguration)
 
@@ -424,6 +476,8 @@ public:
         // sub_ == nullptr → resolved() returns false.
     }
 
+
+public:
     // -----------------------------------------------------------------------
     // Test-seam constructor — injects a pre-built PubRegistry (e.g.
     // FakePubRegistry) and bypasses Aeron entirely (sub_ left null but
@@ -661,30 +715,39 @@ private:
 public:
 
     // =======================================================================
-    // Shard plane handshake (spec §3.3 symmetric worker count; Task 6 ruling I2).
+    // Shard plane handshake (spec §3.3 symmetric worker count; Task 6 ruling I2,
+    // Task 9 fix round 1).
     //
     // Worker-count symmetry cannot be checked at config-parse time (a peer's
-    // RUNE_WORKERS is not in RUNE_PEERS), so in shard mode every plane exchanges
-    // a PlaneHello{nodeId, workerId, workerCount}.  Per peer (flat, <= kMaxPeers):
-    //   Unverified — no hello yet: driveHandshake() sends ours (reply requested)
-    //                every kHelloRetryNs of the injected clock until one arrives.
-    //   Verified   — hello matched (same worker count, same plane index); holds
-    //                the peer's image session id.  A reply-requested hello (peer
-    //                restarted) is answered at once; no timer, no race.
-    //   Refused    — hello mismatched: logged CRITICAL once, the peer's pub is
-    //                dropped (nothing more is sent to it) and every frame from its
-    //                image session is discarded before dispatch.  Terminal for the
-    //                life of this transport (restart the node once fixed) — the
-    //                planes are never split silently.
-    // Frames from a not-yet-verified peer still flow (a mismatched peer's frames
-    // for partitions this worker does not own are dropped by the worker anyway),
-    // so the handshake adds no startup latency to a healthy cluster.
+    // RUNE_WORKERS is not in RUNE_PEERS), so every shard plane exchanges
+    // PlaneHello{nodeId, workerId, workerCount}.  A worker-count-mismatched peer is
+    // treated EXACTLY like an unreachable peer on this plane — nothing more (the
+    // ISR/minIsr logic gives clients the right answer: the peer drops out of the
+    // ISR; acks=all completes with the rest or fails with MinIsrViolation).
+    //
+    // Per-peer rich-state machine (spec §1a.4), transitions ONLY on a hello:
+    //   Unverified{lastHelloSentNs}         -- matching hello -->  Verified{sessionId}
+    //   Unverified / Verified / Refused     -- mismatched hello -> Refused{sessionId, peerWorkerCount, peerPlane, lastHelloSentNs}
+    //   Refused / Verified                  -- matching hello -->  Verified{sessionId}   (heals; new session recorded)
+    // Every hello is (re)evaluated, including from a refused peer: a restarted
+    // peer presents a NEW image session, so a peer that was fixed and restarted
+    // heals both ways without restarting this node (review M3).
+    //   - Dispatch is session-verified: a frame is applied ONLY if its image
+    //     session presented a MATCHING hello (unverified / refused sessions are
+    //     dropped and counted).  A frame racing ahead of its hello is simply
+    //     re-sent by the fetch/push retry path (time-independent), and the
+    //     reply-requested hello makes verification immediate.
+    //   - Unverified and Refused peers get a reply-requested hello every
+    //     kHelloRetryNs of the injected clock (per peer); Verified peers none.
+    //   - Refused peers get NO data frames (pub blocked); hellos still go out.
+    //   - Critical log on refusal is rate-limited (first + every 1024th).
     // Worker-thread only (driven from the worker's replication poll).  Legacy /
-    // flag-off: never enabled → driveHandshake() is one predicted branch.
+    // flag-off never enables it: driveHandshake() is one predicted branch and
+    // dispatch never checks sessions.
     // =======================================================================
     static constexpr int64_t kHelloRetryNs = 10'000'000;   // 10 ms (injected clock)
 
-    enum class PeerPlaneState : uint8_t { Unverified, Verified, Refused };
+    enum class PeerPlaneState : uint8_t { Unverified = 0, Verified = 1, Refused = 2 };   // == variant index
 
     /// Startup only (before the worker runner starts).  `peers` = the remote
     /// node ids on this plane (at most kMaxHandshakePeers; extra ids ignored).
@@ -697,33 +760,40 @@ public:
         hsCount_         = 0;
         for (auto id : peers) {
             if (hsCount_ == kMaxHandshakePeers) break;
-            hs_[hsCount_++] = PeerHandshake{id, PeerPlaneState::Unverified, 0, 0};
+            hs_[hsCount_++] = PeerPlane{id, Unverified{}};
         }
-        unverified_  = static_cast<uint32_t>(hsCount_);
-        nextHelloNs_ = 0;   // first pass sends immediately
+        needHello_ = static_cast<uint32_t>(hsCount_);
     }
 
-    /// One call per worker pass (cold unless a peer is still unverified).
+    /// One call per worker pass (cold unless a peer is unverified / refused).
     int driveHandshake(int64_t nowNs) noexcept
     {
-        if (!hsEnabled_ || unverified_ == 0) [[likely]] return 0;
-        if (nowNs < nextHelloNs_) return 0;
-        nextHelloNs_ = nowNs + kHelloRetryNs;
+        if (!hsEnabled_ || needHello_ == 0) [[likely]] return 0;
         int sent = 0;
         for (std::size_t i = 0; i < hsCount_; ++i) {
-            if (hs_[i].state != PeerPlaneState::Unverified) continue;
+            int64_t* last = nullptr;
+            if (auto* u = std::get_if<Unverified>(&hs_[i].st))    last = &u->lastHelloSentNs;
+            else if (auto* r = std::get_if<Refused>(&hs_[i].st))  last = &r->lastHelloSentNs;
+            if (!last || (*last != kNeverNs && nowNs - *last < kHelloRetryNs)) continue;
+            *last = nowNs;
             if (sendHello_(hs_[i].id, rune::replication::PlaneHelloMsg::kReplyRequested) > 0) ++sent;
         }
         return sent;
     }
 
     [[nodiscard]] bool     planeHandshakeEnabled() const noexcept { return hsEnabled_; }
-    [[nodiscard]] bool     planeRefused() const noexcept { return refusedCount_ != 0; }
+    [[nodiscard]] bool     planeRefused() const noexcept
+    {
+        for (std::size_t i = 0; i < hsCount_; ++i)
+            if (std::holds_alternative<Refused>(hs_[i].st)) return true;
+        return false;
+    }
     [[nodiscard]] uint64_t planeRefusals() const noexcept { return refusals_; }
+    [[nodiscard]] uint64_t planeFramesDroppedUnverified() const noexcept { return droppedUnverified_; }
     [[nodiscard]] PeerPlaneState peerPlaneState(rune::replication::NodeId peer) const noexcept
     {
         for (std::size_t i = 0; i < hsCount_; ++i)
-            if (hs_[i].id == peer) return hs_[i].state;
+            if (hs_[i].id == peer) return static_cast<PeerPlaneState>(hs_[i].st.index());
         return PeerPlaneState::Unverified;
     }
 
@@ -864,16 +934,16 @@ private:
         if (len < rune::replication::ReplicationMessageHeader::ENCODED_SIZE)
             [[unlikely]] return;  // too short to have a valid header
 
-        // Shard plane handshake: nothing from a refused peer's image is applied.
-        // refusedCount_ is 0 unless a mismatched peer was seen (branch predicted).
-        if (refusedCount_ != 0) [[unlikely]] {
-            if (isRefusedSession_(sessionId)) return;
-        }
-
         const uint16_t templateId =
             rune::replication::peekTemplateId(frame, 0);
         if (templateId == rune::replication::kPlaneHelloTemplateId) [[unlikely]] {
             onPlaneHello_(frame, len, sessionId);
+            return;
+        }
+        // Shard plane: apply ONLY frames from a session that presented a matching
+        // hello.  Legacy planes (handshake off) never check.
+        if (hsEnabled_ && !sessionVerified_(sessionId)) {
+            ++droppedUnverified_;
             return;
         }
 
@@ -972,15 +1042,21 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // Plane handshake internals (cold path; worker thread only).
+    // Plane handshake internals (cold path except sessionVerified_; worker
+    // thread only).  Each state holds exactly its own variables.
     // -----------------------------------------------------------------------
-    struct PeerHandshake {
-        rune::replication::NodeId id              = -1;
-        PeerPlaneState            state           = PeerPlaneState::Unverified;
-        int32_t                   sessionId       = 0;   // Verified / Refused: the peer's image session
-        int32_t                   peerWorkerCount = 0;   // Refused: what the peer advertised
+    static constexpr int64_t kNeverNs = INT64_MIN;
+    struct Unverified { int64_t lastHelloSentNs = kNeverNs; };
+    struct Verified   { int32_t sessionId = 0; };
+    struct Refused    { int32_t sessionId = 0; int32_t peerWorkerCount = 0; int32_t peerPlane = -1;
+                        int64_t lastHelloSentNs = kNeverNs; };
+    using PlaneState = std::variant<Unverified, Verified, Refused>;   // index == PeerPlaneState
+    struct PeerPlane {
+        rune::replication::NodeId id = -1;
+        PlaneState                st{};
     };
     static constexpr std::size_t kMaxHandshakePeers = FollowerSlots::kMaxReplicas;
+    static constexpr uint64_t    kLogEvery          = 1024;   // rate limit: first + every 1024th
 
     int64_t sendHello_(rune::replication::NodeId peer, int32_t flags) noexcept
     {
@@ -991,13 +1067,16 @@ private:
         m.flags       = flags;
         alignas(8) uint8_t buf[rune::replication::PlaneHelloMsg::TOTAL_SIZE];
         rune::replication::PlaneHelloMsg::encode(buf, m);
-        return pubReg_.sendToPeer(peer, buf, sizeof(buf));
+        return pubReg_.sendControlToPeer(peer, buf, sizeof(buf));
     }
 
-    [[nodiscard]] bool isRefusedSession_(int32_t sessionId) const noexcept
+    // Per data frame in shard mode: a flat scan of <= kMaxHandshakePeers entries.
+    [[nodiscard]] bool sessionVerified_(int32_t sessionId) const noexcept
     {
-        for (std::size_t i = 0; i < hsCount_; ++i)
-            if (hs_[i].state == PeerPlaneState::Refused && hs_[i].sessionId == sessionId) return true;
+        for (std::size_t i = 0; i < hsCount_; ++i) {
+            const auto* v = std::get_if<Verified>(&hs_[i].st);
+            if (v && v->sessionId == sessionId) return true;
+        }
         return false;
     }
 
@@ -1006,38 +1085,41 @@ private:
         namespace rr = rune::replication;
         rr::PlaneHelloMsg h;
         if (!hsEnabled_ || !rr::PlaneHelloMsg::decode(frame, len, h)) return;
-        PeerHandshake* p = nullptr;
+        PeerPlane* p = nullptr;
         for (std::size_t i = 0; i < hsCount_; ++i)
             if (hs_[i].id == static_cast<rr::NodeId>(h.nodeId)) { p = &hs_[i]; break; }
         if (!p) {
-            spdlog::warn("WorkerReplicationTransport[{}]: PlaneHello from unknown node {} ignored",
-                         workerId_, h.nodeId);
+            if ((unknownHellos_++ % kLogEvery) == 0)
+                spdlog::warn("WorkerReplicationTransport[{}]: PlaneHello from unknown node {} ignored "
+                             "({} so far)", workerId_, h.nodeId, unknownHellos_);
             return;
         }
-        if (p->state == PeerPlaneState::Refused) return;   // terminal
+        const bool wasHelloTarget = !std::holds_alternative<Verified>(p->st);
         if (h.workerCount != selfWorkerCount_ || h.workerId != workerId_) {
-            spdlog::critical(
-                "WorkerReplicationTransport[{}]: shard mode REQUIRES a symmetric worker count — "
-                "node {} runs RUNE_WORKERS={} (its plane {}) but this node {} runs {} (plane {}). "
-                "REFUSING to replicate with node {} on this plane (never split planes silently); "
-                "fix RUNE_WORKERS and restart", workerId_, h.nodeId, h.workerCount, h.workerId,
-                selfNodeId_, selfWorkerCount_, workerId_, h.nodeId);
-            if (p->state == PeerPlaneState::Unverified) --unverified_;
-            p->state           = PeerPlaneState::Refused;
-            p->sessionId       = sessionId;
-            p->peerWorkerCount = h.workerCount;
-            ++refusedCount_;
+            // Keep the retry clock across Refused -> Refused (hellos keep flowing).
+            int64_t last = kNeverNs;
+            if (auto* u = std::get_if<Unverified>(&p->st)) last = u->lastHelloSentNs;
+            else if (auto* r = std::get_if<Refused>(&p->st)) last = r->lastHelloSentNs;
+            if ((refusals_ % kLogEvery) == 0)
+                spdlog::critical(
+                    "WorkerReplicationTransport[{}]: shard mode REQUIRES a symmetric worker count — "
+                    "node {} runs RUNE_WORKERS={} (its plane {}) but this node {} runs {} (plane {}). "
+                    "Treating node {} as UNREACHABLE on this plane (never split planes silently); "
+                    "fix RUNE_WORKERS and restart it — the plane heals on its next matching hello "
+                    "({} refusal(s) so far)", workerId_, h.nodeId, h.workerCount, h.workerId,
+                    selfNodeId_, selfWorkerCount_, workerId_, h.nodeId, refusals_ + 1);
             ++refusals_;
-            pubReg_.dropPeer(p->id);
-            return;
+            p->st = Refused{sessionId, h.workerCount, h.workerId, last};
+            if (!wasHelloTarget) ++needHello_;
+            pubReg_.setPeerBlocked(p->id, true);
+        } else {
+            if (!std::holds_alternative<Verified>(p->st))
+                spdlog::info("WorkerReplicationTransport[{}]: peer {} verified on plane {} ({} workers)",
+                             workerId_, h.nodeId, workerId_, h.workerCount);
+            p->st = Verified{sessionId};
+            if (wasHelloTarget) --needHello_;
+            pubReg_.setPeerBlocked(p->id, false);
         }
-        if (p->state == PeerPlaneState::Unverified) {
-            --unverified_;
-            p->state = PeerPlaneState::Verified;
-            spdlog::info("WorkerReplicationTransport[{}]: plane verified with node {} ({} workers)",
-                         workerId_, h.nodeId, h.workerCount);
-        }
-        p->sessionId = sessionId;
         if (h.flags & rr::PlaneHelloMsg::kReplyRequested) (void)sendHello_(p->id, 0);
     }
 
@@ -1117,15 +1199,15 @@ private:
     bool testMode_ = false;
 
     // Shard plane handshake (see enablePlaneHandshake).  Worker-thread only.
-    std::array<PeerHandshake, kMaxHandshakePeers> hs_{};
-    std::size_t               hsCount_         = 0;
-    uint32_t                  unverified_      = 0;
-    uint32_t                  refusedCount_    = 0;
-    uint64_t                  refusals_        = 0;
-    int64_t                   nextHelloNs_     = 0;
-    rune::replication::NodeId selfNodeId_      = -1;
-    int32_t                   selfWorkerCount_ = 0;
-    bool                      hsEnabled_       = false;
+    std::array<PeerPlane, kMaxHandshakePeers> hs_{};
+    std::size_t               hsCount_           = 0;
+    uint32_t                  needHello_         = 0;   // peers in Unverified or Refused
+    uint64_t                  refusals_          = 0;
+    uint64_t                  unknownHellos_     = 0;
+    uint64_t                  droppedUnverified_ = 0;
+    rune::replication::NodeId selfNodeId_        = -1;
+    int32_t                   selfWorkerCount_   = 0;
+    bool                      hsEnabled_         = false;
 };
 
 // ---------------------------------------------------------------------------

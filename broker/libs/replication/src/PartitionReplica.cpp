@@ -303,7 +303,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     // Disk-backed only — memory-backed partitions have no durable log (and their
     // epoch cache is rebuilt from scratch on restart by design).
     if (!memoryBacked_ && diskLog_ != nullptr) {
-        epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+        checkpointEpochs_();
     }
 
     lastIsrCheckNs_ = 0;
@@ -445,7 +445,15 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     // synchronously by the append below before any further makeBatch call.
     const auto& batch = makeBatch_(baseOffset, records);
     // lastOffset = baseOffset + 0 (one record per batch = lastOffsetDelta=0).
-    onLog([&](auto& L){ L.append(batch, baseOffset); });
+    if (externalFollowerFlush_) {
+        // Shard mode (spec §3.1): no inline fsync on the loop (txn markers come
+        // through here).  Page-cache append + a flush request the owning worker
+        // submits to its io backend in the same pass.
+        onLog([&](auto& L){ L.appendNoSync(batch.data(), batch.size(), baseOffset); });
+        if (!memoryBacked_) followerFlushRequested_ = true;
+    } else {
+        onLog([&](auto& L){ L.append(batch, baseOffset); });
+    }
 
     // Leader LEO is now baseOffset + 1.
     leaderState_.setLeaderLogEndOffset(logEndOffset_());
@@ -865,6 +873,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         // Error response — ignore (control plane handles epoch changes externally).
         return;
     }
+    // fsyncgate fail-stop: a log whose fsync failed accepts no further data
+    // (the broker is halting; restart recovery + replication re-heal it).
+    if (!memoryBacked_ && diskLog_ != nullptr && diskLog_->storageFailed()) [[unlikely]] return;
 
     // GR-10 stale-epoch fence: drop any push/response from a deposed leader.
     //
@@ -938,7 +949,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         epochCache_.assign(static_cast<int32_t>(epoch_), logEndOffset_());
         // Task 9: persist the follower's updated epoch history (disk-backed only).
         if (!memoryBacked_ && diskLog_ != nullptr) {
-            epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+            checkpointEpochs_();
         }
     }
 
@@ -1047,7 +1058,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         epochCache_.assign(static_cast<int32_t>(resp.leaderEpoch), preLeo);
         // Task 9: persist follower epoch history on new-epoch adoption (disk-backed only).
         if (!memoryBacked_ && diskLog_ != nullptr) {
-            epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+            checkpointEpochs_();
         }
     }
 
@@ -1443,6 +1454,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
 {
     if (resp.errorCode != kErrNone) { reconcileTarget_ = -1; return; }
     if (role_ != Role::Leader)      { reconcileTarget_ = -1; return; }
+    if (!memoryBacked_ && diskLog_ != nullptr && diskLog_->storageFailed()) { reconcileTarget_ = -1; return; }
 
     // Stale-epoch fence: ignore a reconcile answer from an older epoch.
     if (resp.leaderEpoch < epoch_) { reconcileTarget_ = -1; return; }
@@ -1521,7 +1533,14 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                         raw.data() + rp, -1);
                     rp += static_cast<std::size_t>(tl);
                 }
-                onLog([&](auto& L){ L.append(raw, lastOff); });
+                if (externalFollowerFlush_) {
+                    // Shard mode: page-cache append; durability via the owning
+                    // worker's io backend (flush request), never an inline fsync.
+                    onLog([&](auto& L){ L.appendNoSync(raw.data(), raw.size(), lastOff); });
+                    if (!memoryBacked_) followerFlushRequested_ = true;
+                } else {
+                    onLog([&](auto& L){ L.append(raw, lastOff); });
+                }
             }
         }
     }
@@ -1549,7 +1568,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
             epochCache_.assign(curEp, newLeo);
             // Task 9: persist the corrected epoch boundary (disk-backed only).
             if (!memoryBacked_ && diskLog_ != nullptr) {
-                epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+                checkpointEpochs_();
             }
         }
     }
@@ -1582,6 +1601,17 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
 // doWork
 // ---------------------------------------------------------------------------
 
+// The leader-epoch checkpoint is THE single accepted synchronous disk write on a
+// shard loop (Task 10 fix-1 ruling): it is a correctness ordering point (the
+// epoch must be durable before the replica acts in it), it happens only on role
+// / epoch transitions, and the file is a few KB.  Counted so it is measurable;
+// making it async with role-transition gating is tracked in the plan.
+void PartitionReplica::checkpointEpochs_()
+{
+    ++epochCheckpointWrites_;
+    epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+}
+
 int PartitionReplica::doWork(int64_t nowNs)
 {
     int work = 0;
@@ -1602,9 +1632,25 @@ int PartitionReplica::doWork(int64_t nowNs)
         && nowNs - lastFollowerSyncNs_ >= kFollowerFlushIntervalNs) {
         followerApplyDirty_ = false;
         lastFollowerSyncNs_ = nowNs;
-        RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,
-                             static_cast<uint32_t>(cfg_.partitionId));
-        onLog([&](auto& L){ L.sync(); });
+        if (externalFollowerFlush_) {
+            // Shard mode: the owning worker submits it to its io backend (never
+            // blocks the shard loop).  Raised at most once per interval.
+            followerFlushRequested_ = true;
+        } else {
+            RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,
+                                 static_cast<uint32_t>(cfg_.partitionId));
+            // fsyncgate: a failed fsync never escapes doWork (callers run on
+            // AgentRunner threads with no catch → std::terminate).  The log is now
+            // permanently failed (LogSegment::sync marks it); the OWNER's loop
+            // sees storageFailed() and routes it to the broker halt (exit 74).
+            try {
+                onLog([&](auto& L){ L.sync(); });
+            } catch (const std::exception& ex) {
+                if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->markStorageFailed(5 /*EIO*/);
+                spdlog::critical("PartitionReplica[topic={} part={}]: follower flush fsync failed: {}",
+                                 cfg_.topicId, cfg_.partitionId, ex.what());
+            }
+        }
         ++work;
     }
 
@@ -2147,7 +2193,7 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
 
     // Task 9: persist the pruned epoch history (disk-backed only).
     if (!memoryBacked_ && diskLog_ != nullptr) {
-        epochCache_.checkpointToFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+        checkpointEpochs_();
     }
 
     onLog([&](auto& L){ L.truncateTo(truncateOffset); });

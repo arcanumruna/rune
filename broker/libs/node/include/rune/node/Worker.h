@@ -90,6 +90,7 @@
 #include <rune/codec/Serialize.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -174,6 +175,7 @@ public:
         , io_(ioSubmitDepth, ioComplDepth)
     {
         durablePending_.reserve(kDurablePendingReserve);
+        initRoutes_(ioSubmitDepth > ioComplDepth ? ioSubmitDepth : ioComplDepth);
         dirtyThisCycle_.reserve(kDirtySetReserve);
         pendingAcksAll_.reserve(kPendingAcksAllReserve);
         retOverflow_.reserve(kRetOverflowReserve);
@@ -202,8 +204,9 @@ public:
     // unit tests. At RUNTIME, ownership changes arrive as a SetOwnership ring op
     // (executeSetOwnership_ from the wire) applied on the worker's own thread —
     // never a cross-thread write to owned_.
-    void setOwnedDirect(OwnedSet set) noexcept {
+    void setOwnedDirect(OwnedSet set) {
         owned_ = std::move(set);
+        rebuildFlushSlots_();
     }
 
     [[nodiscard]] int workerId() const noexcept { return workerId_; }
@@ -292,6 +295,11 @@ public:
         uint8_t isolation            = 0;
         bool    isGroup              = false;
         bool    groupCarrierReceived = false;
+        /// False while the partition is not owned by this worker (ownership
+        /// moved): parked, no reads of the moved replica / log.
+        bool    active               = true;
+        uint32_t registryId          = 0;   ///< target replica identity (Task 10 fix 3)
+        uint32_t incarnation         = 0;
         // Hybrid egress: per-consumer UNICAST egress publication for this
         // subscription's consumer session.  Created + lifetime-owned by the
         // gateway; written ONLY here on the worker thread (single-writer,
@@ -374,7 +382,7 @@ public:
     // (record batch / replicated records / ...) a WorkerOp can carry through
     // this worker's ingress O2O ring.  agrona checkMsgLength() THROWS for a
     // message above maxMsgLength (= capacity/8), and the framed op is
-    //   SBE header (8) + WorkerOp block (219) + tail length prefix (4) + tail
+    //   SBE header (8) + WorkerOp sbeBlockLength() + tail length prefix (4) + tail
     // (generated-codec constants).  maxOpTailBytesFor() computes it from the
     // configured ring size (BrokerNode's derivation); maxOpTailBytes() from the
     // live ring; tryEnqueueOp() enforces it before tryClaim().
@@ -533,6 +541,9 @@ public:
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
            .oleFollowerLeo(static_cast<std::int64_t>(op.offsEpochReqPayload.followerLeo))
            .egressPub(reinterpret_cast<std::uint64_t>(op.egressPub))
+           .targetReplicaId(op.replica ? op.replica->registryId() : 0u)
+           .incarnation(op.replica ? op.replica->incarnation() : 0u)
+           .ownershipGen(op.ownershipGen)
            .tailKind(tailKind);
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
@@ -623,6 +634,61 @@ public:
     [[nodiscard]] uint64_t ioSubmitCountForTest() const noexcept {
         return io_submitCount_;
     }
+
+    // Task 10 (spec §3.1 never-block / fail-stop) test hooks — owner thread or
+    // single-threaded tests only.
+    [[nodiscard]] std::size_t bgFlushInFlightForTest() const noexcept { return bgInFlight_; }
+    [[nodiscard]] uint64_t    bgFlushSubmitsForTest() const noexcept { return bgFlushSubmits_; }
+    [[nodiscard]] uint64_t    bgFlushErrorsForTest() const noexcept { return bgFlushErrors_; }
+    [[nodiscard]] uint64_t    bgFlushDeferredForTest() const noexcept { return bgFlushDeferred_; }
+    [[nodiscard]] uint64_t    sealSubmitsForTest() const noexcept { return sealSubmits_; }
+    [[nodiscard]] uint64_t    storageFailureSignalsForTest() const noexcept { return storageFailureSignals_; }
+    [[nodiscard]] std::size_t flushSlotCountForTest() const noexcept { return slots_.size(); }
+    /// Completions drained from io_ by reapDurableCompletions_ (any token).
+    [[nodiscard]] uint64_t    ioCompletionsReapedForTest() const noexcept { return ioCompletionsReaped_; }
+    /// Token whose completion fired the most recent durable (Strict) ack.
+    [[nodiscard]] CompletionToken durableAckTokenForTest() const noexcept { return durableAckToken_; }
+    [[nodiscard]] std::size_t durablePendingCountForTest() const noexcept { return durablePending_.size(); }
+    [[nodiscard]] int64_t     reservedAckSlotsForTest() const noexcept { return reservedAckSlots_(); }
+    /// -1 when this worker has no flush slot for `log`.
+    [[nodiscard]] int64_t lastSyncedLeoForTest(const rune::storage::Log* log) noexcept {
+        const LogFlushSlot* slot = slotOf_(log);
+        return slot ? slot->lastSyncedLeo : -1;
+    }
+    /// Hold io completions in the backend (no reap) so tests deliver them.
+    void setReapPausedForTest(bool on) noexcept { reapPausedForTest_ = on; }
+    /// Every reaped completion is rewritten to carry `err` (0 = off).
+    void forceFlushErrorForTest(int err) noexcept { forcedFlushErrorForTest_ = err; }
+    /// Requests a background flush of an OWNED log; returns its token, or
+    /// kNoToken when coalesced into one already in flight / deferred.
+    CompletionToken submitBgFlushForTest(rune::storage::Log* log) {
+        LogFlushSlot* slot = slotOf_(log);
+        if (!slot) return kNoToken;
+        return requestBgFlush_(*slot) ? slot->bgToken : kNoToken;
+    }
+    [[nodiscard]] CompletionToken durablePendingTokenForTest(std::size_t i) const {
+        return durablePending_.at(i).token;
+    }
+    /// Routes a completion exactly as a real reap does (token routing first).
+    void deliverCompletionForTest(const FlushCompletion& c) { (void)onFlushCompletion_(c); }
+    /// Feeds one client Produce frame to the worker-ingress handler.
+    int handleIngressFrameForTest(const uint8_t* data, std::size_t len, int64_t nowNs) {
+        return handleWorkerIngressFrame_(data, len, nowNs);
+    }
+    [[nodiscard]] const char* ioBackendNameForTest() const noexcept { return io_.name(); }
+    [[nodiscard]] uint64_t opsRefusedNotOwnedForTest() const noexcept { return opsRefusedNotOwned_; }
+    [[nodiscard]] uint64_t ownershipAcksForTest() const noexcept { return ownershipAcks_; }
+    /// Bench / test: the per-op ownership check.
+    [[nodiscard]] bool ownsReplicaForTest(const rune::replication::PartitionReplica* r) const noexcept {
+        return ownsIncarnation_(r->registryId(), r->incarnation());
+    }
+    /// Bench: the per-op guard exactly as the dispatch runs it.
+    [[nodiscard]] bool ownsIncarnationForTest(uint32_t id, uint32_t inc) const noexcept {
+        return ownsIncarnation_(id, inc);
+    }
+    /// False when RUNE_IO_BACKEND selects a backend that cannot submit — shard
+    /// mode refuses to start on such a worker (BrokerNode).
+    [[nodiscard]] bool ioAcceptsSubmissions() const noexcept { return io_.acceptsSubmissions(); }
 
     // Task 7: test accessor — true if a Validator is installed for the given topic.
     // Worker-thread only; call only from single-threaded tests.
@@ -771,8 +837,11 @@ public:
                 work += replica->log()->drainCleanerSwaps();
                 work += replica->log()->drainRetentionDeletes();
                 work += replica->log()->drainStagingRenamesDone();
+                // fsyncgate: any inline sync failure on this log → fail-stop.
+                checkStorageFailure_(replica->log());
             }
         }
+        work += flushPendingSignals_();
 
         // E5.1.3 (d) R7 fix: time-based Log::sync on owned user-partition logs.
         //
@@ -800,12 +869,12 @@ private:
         // 2b. runtime→worker ring first: ownership / role changes (and, Task 13,
         //     session announcements) must be applied before the intake they govern.
         work += static_cast<int>(drainIngress_());
-        // 3. client ingress → append (G-A6 gate unchanged).  A plane that refused a
-        //    mismatched peer (asymmetric worker count) stops serving new produce:
-        //    never accept records a split replication plane cannot replicate.
+        // 3. client ingress → append (G-A6 gate unchanged).
         work += flushRetOverflow_();
-        if (!replPlaneRefused_ && retOverflow_.empty() &&
-            ret_.freeSlotsForMsgSize(ackSlotBytes_) > static_cast<int64_t>(pendingAcksAll_.size())) {
+        // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
+        // into ret_ later: reserve for every one of them (G-A6, never drop).
+        if (retOverflow_.empty() &&
+            ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
             work += pollWorkerIngress_(nowNs);
         }
         work += submitCoalescedFlushes_();
@@ -815,20 +884,29 @@ private:
         for (auto* replica : owned_) {
             if (replica) work += replica->doWork(nowNs);
         }
+        // 4b. follower flushes raised by the replicas (shard replicas run with
+        //     setExternalFollowerFlush) → io backend, never an inline fsync.
+        for (auto* replica : owned_) {
+            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
+                if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
+            }
+        }
         // 5. fire due produce acks.
         work += flushOwedAcksAll_(nowNs);
         // 6. reap durability completions.
         work += reapDurableCompletions_();
         // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
         work += pushOwnedSubscriptions_(nowNs);
-        for (auto* replica : owned_) {
-            if (replica && replica->isDiskBacked()) {
-                work += replica->log()->drainCleanerSwaps();
-                work += replica->log()->drainRetentionDeletes();
-                work += replica->log()->drainStagingRenamesDone();
-            }
+        for (auto& slot : slots_) {
+            work += slot.log->drainCleanerSwaps();
+            work += slot.log->drainRetentionDeletes();
+            work += slot.log->drainStagingRenamesDone();
+            if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);   // async roll seals
+            reconcileTruncation_(slot);
+            checkStorageFailure_(slot.log);
         }
-        work += syncOwnedLogs_(nowNs);   // made asynchronous in Task 10
+        work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
+        work += flushPendingSignals_();
         return work;
     }
 
@@ -933,7 +1011,19 @@ private:
 
         int work = 0;
         for (rune::storage::Log* log : dirtyThisCycle_) {
-            CompletionToken t = io_.submit(log->activeSegmentFd(), log->flushBoundary());
+            // Async roll seals first: a Strict entry may live in a segment sealed
+            // this pass, and its ack waits for that seal (onFlushCompletion_).
+            LogFlushSlot* slot = slotOf_(log);
+            if (log->storageFailed()) [[unlikely]] {
+                // fsyncgate: never touch a failed log's disk again; its pending
+                // entries fail (StorageError), never OK.
+                failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), false);
+                ++work;
+                continue;
+            }
+            if (slot) work += submitPendingSeals_(*slot);
+            CompletionToken t = submitActive_(log, RouteKind::Durable, slot ? slot->epoch : 0,
+                                              /*pin=*/slot != nullptr);
             if (t == kNoToken) {
                 // Submit ring full — back-pressure: ack all pending entries for
                 // this log with Internal error immediately.  Never drop; never
@@ -981,48 +1071,89 @@ private:
     // Shared-nothing: io_, durablePending_, and ret_ are all owned by this
     // worker thread.  No locks, no atomics outside the SPSC ring internals.
     // -----------------------------------------------------------------------
+    //
+    // Task 10 token routing: every completion is offered to the background-flush
+    // table FIRST (retireBgFlush_); a background token is retired there and can
+    // never reach the produce-ack matching below.  Completions are always drained
+    // (also when durablePending_ is empty) so background tokens are retired.
     int reapDurableCompletions_() {
-        if (durablePending_.empty()) {
-            // Fast path: nothing pending — still drain completions to keep the
-            // completion ring from filling (the flusher may emit completions
-            // even for submits that were not strict-tier, though in practice
-            // this doesn't happen; the drain is cheap either way).
-            return io_.reap([](const FlushCompletion&) {});
-        }
-
+        if (reapPausedForTest_) [[unlikely]] return 0;
         int fired = 0;
         io_.reap([&](const FlushCompletion& c) {
-            // Group-commit semantics: a completion with token T and flushBoundary B
-            // covers EVERY pending entry with the same token whose lastOffset <= B.
-            // Entries with token==0 (not yet submitted) are never matched here.
-            for (std::size_t i = 0; i < durablePending_.size(); ) {
-                auto& entry = durablePending_[i];
-                if (entry.token != 0 &&
-                    entry.token == c.token &&
-                    entry.lastOffset <= c.flushBoundary) {
-                    if (c.errorCode != 0) {
-                        // fsync failure: ack with a non-OK error code — never ack OK.
-                        spdlog::error("Worker {}: IoBackend fsync completion error={} "
-                                      "for token={} lastOffset={}; acking Internal error",
-                                      workerId_, c.errorCode, c.token, entry.lastOffset);
-                        entry.ret.errorCode = static_cast<int16_t>(6); // Internal
-                        // No replica unhealthy-flag exists on PartitionReplica yet
-                        // (noted for Task 9 wiring); log the error here so it is
-                        // observable without silently swallowing the failure.
-                    } else {
-                        entry.ret.errorCode = 0; // OK
-                    }
-                    enqueueReturn_(entry.ret);
-                    // Erase by swap-with-back + pop (O(1), order irrelevant for acks).
-                    durablePending_[i] = std::move(durablePending_.back());
-                    durablePending_.pop_back();
-                    ++fired;
-                    // Do NOT advance i — the swapped entry needs to be checked.
-                } else {
-                    ++i;
-                }
+            ++ioCompletionsReaped_;
+            if (forcedFlushErrorForTest_ != 0) [[unlikely]] {
+                FlushCompletion forced = c;
+                forced.errorCode = forcedFlushErrorForTest_;
+                fired += onFlushCompletion_(forced);
+            } else {
+                fired += onFlushCompletion_(c);
             }
         });
+        return fired;
+    }
+
+    // One completion.  Token routing first: a Background / Seal token is retired
+    // here and never reaches produce-ack matching.  Durable entries match by
+    // TOKEN ONLY (I2): an entry is stamped with T after its append and the
+    // fdatasync covers every write issued before the submit — the completion's
+    // flushBoundary is informational and never gates an ack.
+    int onFlushCompletion_(const FlushCompletion& c) {
+        TokenRoute r;
+        const bool routed = routeTake_(c.token, r);
+        LogFlushSlot* slot = routed ? liveSlot_(r) : nullptr;
+        // M1: release the segment pin taken at submit (only while this worker
+        // still owns the log — a purged slot's log may belong to another worker).
+        if (routed && r.seg && slot) r.log->unpinSegmentFlush(r.seg);
+
+        if (routed && r.kind == RouteKind::Background && slot && slot->bgToken == c.token) {
+            slot->bgToken = kNoToken;
+            if (bgInFlight_) --bgInFlight_;
+        }
+        if (routed && r.kind == RouteKind::Seal && slot && slot->sealsInFlight > 0) --slot->sealsInFlight;
+
+        // C-1: the error FIRST — before any purged-slot early return.  An fsync
+        // error is fail-stop whoever owns the log now (never retried).
+        if (c.errorCode != 0) {
+            if (routed && r.kind == RouteKind::Background) ++bgFlushErrors_;
+            const rune::storage::Log* failed = routed ? r.log : nullptr;
+            for (const auto& e : durablePending_)
+                if (!failed && e.token == c.token) failed = e.logPtr;
+            if (failed) {
+                if (LogFlushSlot* owner = slotOf_(failed)) failLog_(owner->log, c.errorCode);
+                else failForeignLog_(failed, c.errorCode);
+            }
+            return 1;
+        }
+
+        if (routed && r.kind != RouteKind::Durable) {
+            if (!slot) return 1;                               // purged (M2): success ignored safely
+            if (r.kind == RouteKind::Background) {
+                if (slot->bgLeo > slot->lastSyncedLeo) slot->lastSyncedLeo = slot->bgLeo;
+                if (slot->bgAgain) { slot->bgAgain = false; (void)requestBgFlush_(*slot); }
+            } else {
+                fireSealGated_(*slot);
+            }
+            return 1;
+        }
+
+        // Durable token (or an unrouted one: synthetic / already-retired).
+        int fired = 0;
+        for (std::size_t i = 0; i < durablePending_.size(); ) {
+            auto& entry = durablePending_[i];
+            if (entry.token != kNoToken && entry.token == c.token && !entry.awaitSeal) {
+                if (sealsOutstanding_(entry.logPtr)) {
+                    entry.awaitSeal = true;                     // durable in its active segment;
+                    ++i;                                        // fires once the seals complete
+                    continue;
+                }
+                fireDurable_(entry);
+                durablePending_[i] = std::move(durablePending_.back());
+                durablePending_.pop_back();
+                ++fired;
+            } else {
+                ++i;
+            }
+        }
         return fired;
     }
 
@@ -1073,7 +1204,24 @@ private:
         sbe::WorkerOp op;
         op.wrapForDecode(cbuf, sbe::MessageHeader::encodedLength(),
                          mh.blockLength(), mh.version(), len);
-        switch (static_cast<WorkerOp::Type>(static_cast<std::uint8_t>(op.opType()))) {
+        const auto type = static_cast<WorkerOp::Type>(static_cast<std::uint8_t>(op.opType()));
+        // Ownership guard (Task 10 fix 3): every partition op — role ops
+        // included — carries the target replica's (registry id, incarnation).
+        // It runs only if THIS worker currently owns that exact incarnation: one
+        // indexed load + compare + branch (ownedInc_ is rebuilt cold, on this
+        // thread, when SetOwnership is applied).  A stale op (ownership moved,
+        // replica removed, or a new replica at a reused address) is refused
+        // without dereferencing anything it carries.  Unregistered replicas
+        // (incarnation 0: tests / passthrough) and ownership-neutral ops
+        // (SetOwnership, Unsubscribe, SchemaUpdate, TestTask) are not gated.
+        if (const uint32_t inc = op.incarnation(); inc != 0 && gatedByOwnership_(type)) {
+            const uint32_t id = op.targetReplicaId();
+            if (id >= ownedInc_.size() || ownedInc_[id] != inc) [[unlikely]] {
+                refuseNotOwned_(op, type);
+                return;
+            }
+        }
+        switch (type) {
         case WorkerOp::Type::Produce:
             executeProduceWire_(op);
             break;
@@ -1163,6 +1311,9 @@ private:
                 s.isGroup              = op.isGroup() != 0;
                 s.groupCarrierReceived = op.groupCarrierReceived() != 0;
                 s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
+                s.registryId           = op.targetReplicaId();
+                s.incarnation          = op.incarnation();
+                s.active               = true;   // re-subscribe (passed the guard) re-activates
                 return;
             }
         }
@@ -1178,6 +1329,8 @@ private:
         s.isGroup              = op.isGroup() != 0;
         s.groupCarrierReceived = op.groupCarrierReceived() != 0;
         s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
+        s.registryId           = op.targetReplicaId();
+        s.incarnation          = op.incarnation();
         subs_.push_back(s);
     }
 
@@ -1289,7 +1442,7 @@ private:
 
         int work = 0;
         for (auto& s : subs_) {
-            if (!s.logPtr) continue;
+            if (!s.logPtr || !s.active) continue;   // parked: partition moved away
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
             // per-consumer offsets); fall back to the shared MDC pub (broadcast).
@@ -1423,6 +1576,13 @@ private:
                           "sending Internal error",
                           workerId_, topicId, partition);
             ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal
+            enqueueReturn_(ret);
+            return;
+        }
+
+        // fsyncgate fail-stop: a failed log refuses every produce.
+        if (log->storageFailed()) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
             enqueueReturn_(ret);
             return;
         }
@@ -1808,6 +1968,16 @@ private:
                 owned_.push_back(reinterpret_cast<rune::replication::PartitionReplica*>(pval));
             }
         }
+        rebuildFlushSlots_();   // cold: carry still-owned slots, purge the rest (M2)
+        // Task 10 fix 3: ack the registry generation this SetOwnership reflects.
+        // The runtime frees a removed replica only once EVERY worker acked a
+        // generation >= its removal (no worker can still hold / reach it).
+        WorkerReturn ack;
+        ack.type       = WorkerReturn::Type::OwnershipAck;
+        ack.partition  = workerId_;
+        ack.lastOffset = static_cast<int64_t>(op.ownershipGen());
+        enqueueSignal_(ack);
+        ++ownershipAcks_;
     }
 
     // -------------------------------------------------------------------
@@ -1989,9 +2159,8 @@ private:
         {
             auto* t = static_cast<WorkerReplicationTransportImpl<T>*>(ctx);
             // Shard plane handshake (spec §3.3): one predicted branch unless a
-            // peer is still unverified; a refused peer stops this shard's intake.
-            int hs = t->driveHandshake(nowNs);
-            self->replPlaneRefused_ = t->planeRefused();
+            // peer is unverified / refused (then a hello on the retry cadence).
+            const int hs = t->driveHandshake(nowNs);
             return hs + t->poll(
                 limit,
                 // Inner dispatch: also non-capturing → function pointer.
@@ -2257,6 +2426,13 @@ private:
         int64_t                 lastOffset = 0;
         rune::storage::Log*     logPtr     = nullptr; ///< which log (for coalescing)
         WorkerReturn            ret;
+        /// Shard Strict acks=all (Task 10): after the fsync completes the ack
+        /// moves to pendingAcksAll_ (HW gate) instead of firing.  null = fire.
+        rune::replication::PartitionReplica* thenAwaitHw = nullptr;
+        int64_t                 deadlineNs = 0;       ///< acks=all deadline (thenAwaitHw only)
+        /// Its token completed, but an async roll seal on the same log was still
+        /// outstanding: fires when the seals complete (fireSealGated_).
+        bool                    awaitSeal  = false;
     };
     std::vector<DurablePending> durablePending_;
 
@@ -2274,7 +2450,6 @@ private:
     // before the AgentRunner starts.  Read-only at runtime (single writer).
     int  coreId_ = -1;
     bool shardMode_ = false;   // spec §3.1: set before the runner starts, then read-only
-    bool replPlaneRefused_ = false;   // shard plane handshake refused a peer (worker-thread only)
 
     // E4: true after the one-shot self-pin attempt fires in doWork.
     // Prevents repeated pin attempts on every doWork call.
@@ -2401,12 +2576,8 @@ private:
     // Worker-thread only — no atomic needed.
     int64_t lastSyncNs_ = 0;
 
-    // Per-log LEO at its last successful sync.  syncOwnedLogs_ skips (and returns
-    // NO work for) any log whose logEndOffset has not advanced since — otherwise a
-    // time-based sync of an idle log reported work>0 every interval, resetting the
-    // worker's backoff idle so it never parked (phantom work → CPU-hogging spin,
-    // starving nothing to do).  Worker-thread only.
-    std::unordered_map<rune::storage::Log*, int64_t> lastSyncedLeo_;
+    // Per-log LEO at its last successful sync lives in LogFlushSlot::lastSyncedLeo
+    // (Task 10 fix 1 / I3: fixed per-owned-log slots, no hot-path map insert).
 
     // Task 7: per-worker topic → Validator map.
     //
@@ -2462,6 +2633,551 @@ private:
     uint32_t workerRunSeq_ = 0;
 
     // -----------------------------------------------------------------------
+    // Task 10 (spec §3.1 never-block) — per-owned-log flush slots + token routing.
+    //
+    // ONE slot per owned disk log (fixed set, rebuilt cold on an ownership
+    // change; a worker-local Log*→slot open-addressing map gives O(1) lookup):
+    //   * the background flush (replica requests: follower flush, txn marker,
+    //     reconcile; and the 10 ms owned-log sync) — at most ONE in flight per
+    //     log, plus a "dirty again" bit when newer data arrives meanwhile;
+    //   * lastSyncedLeo — advanced by ANY successful background flush, so a
+    //     follower flush also satisfies the time-based sync (no double fsync);
+    //   * sealsInFlight — async roll seals (Log::setDeferSealSync); Strict acks
+    //     on the log wait until every seal has completed;
+    //   * failureReported — fail-stop signalled once.
+    // Every io_ token is ROUTED (open-addressing table sized ≥ 2× the io depth,
+    // so it never fills): Durable (Strict / produce acks), Background or Seal,
+    // with the segment it pinned (M1: the fd outlives the flush).  A Background
+    // or Seal token is retired by routing and can never reach produce-ack
+    // matching.  A refused background submit is NOT retried per pass: the next
+    // owned-log sync interval re-requests it (LEO > lastSyncedLeo).
+    // fsync errors are FAIL-STOP (fsyncgate): never retried.
+    // Only fdatasync of the .log fd: Log::recover rebuilds the .index from the
+    // .log, so the .index msync is not a durability point.
+    // Worker-thread only (shared-nothing).
+    // -----------------------------------------------------------------------
+    struct LogFlushSlot {
+        rune::storage::Log*                  log     = nullptr;
+        rune::replication::PartitionReplica* replica = nullptr;
+        uint32_t        epoch           = 0;          ///< identity across rebuilds (M2)
+        CompletionToken bgToken         = kNoToken;   ///< background flush in flight
+        int64_t         bgLeo           = 0;          ///< LEO covered by bgToken
+        bool            bgAgain         = false;      ///< newer data requested meanwhile
+        int64_t         lastSyncedLeo   = 0;
+        uint32_t        sealsInFlight   = 0;
+        bool            failureReported = false;
+        uint64_t        sealDropsSeen   = 0;          ///< Log::droppedPendingSeals() last seen
+        std::string     dir;                          ///< cached at slot creation (C-1 signal)
+    };
+    /// Logs purged by an ownership move with tokens possibly still in flight:
+    /// their cached dir, so a late error can be signalled without reading the Log.
+    std::vector<std::pair<const rune::storage::Log*, std::string>> purgedDirs_;
+    std::vector<LogFlushSlot> slots_;
+    uint32_t                  slotEpochSeq_ = 0;
+    // Log* → slots_ index (open addressing, capacity pow2 ≥ 2×slots).
+    std::vector<std::pair<rune::storage::Log*, uint32_t>> slotIndex_;
+    std::size_t               slotIndexMask_ = 0;
+
+    enum class RouteKind : uint8_t { Durable, Background, Seal };
+    struct TokenRoute {
+        CompletionToken            token = kNoToken;   ///< kNoToken = empty bucket
+        rune::storage::Log*        log   = nullptr;
+        rune::storage::LogSegment* seg   = nullptr;     ///< pinned segment (unpin on completion)
+        uint32_t                   epoch = 0;
+        RouteKind                  kind  = RouteKind::Durable;
+    };
+    std::vector<TokenRoute> routes_;
+    std::size_t             routeMask_ = 0;
+
+    std::size_t bgInFlight_     = 0;
+    uint64_t    bgFlushSubmits_ = 0;
+    uint64_t    bgFlushErrors_  = 0;
+    uint64_t    bgFlushDeferred_ = 0;
+    uint64_t    sealSubmits_    = 0;
+    uint64_t    ioCompletionsReaped_ = 0;
+    uint64_t    storageFailureSignals_ = 0;
+    CompletionToken durableAckToken_ = kNoToken;     ///< token whose completion fired the last durable ack
+    bool        reapPausedForTest_ = false;
+    int         forcedFlushErrorForTest_ = 0;
+    std::vector<WorkerReturn> pendingSignals_;       ///< StorageFailure signals awaiting ring space (cold)
+    std::vector<const rune::storage::Log*> foreignFailed_;   ///< C-1: signalled failures on un-owned logs (cold)
+
+    static std::size_t pow2AtLeast_(std::size_t n) noexcept {
+        std::size_t p = 1;
+        while (p < n) p <<= 1;
+        return p;
+    }
+    static std::size_t ptrHash_(const void* p) noexcept {
+        return static_cast<std::size_t>((reinterpret_cast<uintptr_t>(p) >> 4) * 0x9E3779B97F4A7C15ull);
+    }
+    // ---- Ownership table: ownedInc_[registryId] = the incarnation this worker
+    // owns (0 = not owned).  Dense, indexed by the registry id carried in the op.
+    std::vector<uint32_t> ownedInc_;
+    uint64_t    opsRefusedNotOwned_ = 0;
+    uint64_t    ownershipAcks_      = 0;
+    static constexpr bool gatedByOwnership_(WorkerOp::Type t) noexcept {
+        switch (t) {
+        case WorkerOp::Type::Produce:
+        case WorkerOp::Type::PushRead:
+        case WorkerOp::Type::ApplyReplicated:
+        case WorkerOp::Type::BecomeLeader:
+        case WorkerOp::Type::BecomeFollower:
+        case WorkerOp::Type::FetchRequest:
+        case WorkerOp::Type::OffsetsForLeaderEpochReq:
+        case WorkerOp::Type::ReconcileFetchResp:
+        case WorkerOp::Type::AppendControlRecord:
+        case WorkerOp::Type::Subscribe:
+            return true;
+        default:
+            return false;
+        }
+    }
+    [[nodiscard]] bool ownsIncarnation_(uint32_t id, uint32_t inc) const noexcept {
+        return inc != 0 && id < ownedInc_.size() && ownedInc_[id] == inc;
+    }
+    void rebuildOwnedIndex_() {
+        uint32_t maxId = 0;
+        for (const auto* r : owned_) if (r && r->registryId() > maxId) maxId = r->registryId();
+        ownedInc_.assign(static_cast<std::size_t>(maxId) + 1, 0u);
+        for (const auto* r : owned_) if (r && r->incarnation() != 0) ownedInc_[r->registryId()] = r->incarnation();
+        // Parked / active push subscriptions follow ownership by id + incarnation.
+        for (auto& sub : subs_) {
+            if (sub.incarnation != 0) sub.active = ownsIncarnation_(sub.registryId, sub.incarnation);
+            else if (sub.replica) {
+                bool owned = false;
+                for (const auto* r : owned_) owned = owned || r == sub.replica;
+                sub.active = owned;
+            }
+        }
+    }
+    // A partition op for a replica this worker does not own: answer through the
+    // op's normal response path (retriable), never touching the replica / log.
+    [[gnu::cold]] [[gnu::noinline]] void refuseNotOwned_(sbe::WorkerOp& op, WorkerOp::Type type) {
+        ++opsRefusedNotOwned_;
+        namespace pc = rune::protocol::client;
+        switch (type) {
+        case WorkerOp::Type::Produce: {
+            WorkerReturn ret;
+            ret.type          = WorkerReturn::Type::ProduceResult;
+            ret.sessionId     = op.sessionId();
+            ret.correlationId = op.correlationId();
+            ret.partition     = op.partition();
+            ret.topicId       = op.topicId();
+            ret.deferAck      = op.deferAck() != 0;
+            ret.producerId    = op.producerId();
+            ret.producerEpoch = op.producerEpoch();
+            ret.baseSequence  = op.baseSequence();
+            ret.recordCount   = op.recordCount();
+            ret.enqueuedAtNs  = op.enqueuedAtNs();
+            ret.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return;
+        }
+        case WorkerOp::Type::PushRead: {
+            // Empty result: the gateway clears its in-flight marker and re-issues
+            // the read to the (new) owner on its next push cycle.
+            WorkerReturn ret;
+            ret.type           = WorkerReturn::Type::PushReadResult;
+            ret.sessionId      = op.sessionId();
+            ret.subscriptionId = op.subscriptionId();
+            ret.readTopicId    = op.topicId();
+            ret.readPartition  = op.partition();
+            enqueueReturn_(ret);
+            return;
+        }
+        case WorkerOp::Type::Subscribe:
+            // Registered PARKED (no reads) — activated (by id + incarnation) if
+            // that exact replica incarnation is later granted to this worker.
+            executeSubscribeWire_(op);
+            for (auto& sub : subs_) if (sub.subscriptionId == op.subscriptionId()) sub.active = false;
+            return;
+        case WorkerOp::Type::AppendControlRecord: {
+            // Never silently lost: the marker goes back to the runtime, which
+            // re-routes it with the current routing or surfaces NotLeader to the
+            // transaction coordinator.
+            WorkerReturn ret;
+            ret.type      = WorkerReturn::Type::ControlRecordRefused;
+            ret.topicId   = op.topicId();
+            ret.partition = op.partition();
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            const uint32_t n = op.tailLength();
+            const auto* t = reinterpret_cast<const uint8_t*>(op.tail());
+            if (t && n) ret.chunk.assign(t, t + n);
+            enqueueSignal_(ret);
+            return;
+        }
+        default:
+            // Apply / fetch / epoch / reconcile / role / marker ops carry no
+            // response: the replication protocol re-drives them against the new
+            // owner (follower re-fetch, leader re-push, bridge role re-derive).
+            if (opsRefusedNotOwned_ == 1 || (opsRefusedNotOwned_ & 1023u) == 0)
+                spdlog::warn("Worker {}: refused op type={} for un-owned topic={} partition={} "
+                             "(stale ownership routing; total={})", workerId_,
+                             static_cast<int>(type), op.topicId(), op.partition(), opsRefusedNotOwned_);
+            return;
+        }
+    }
+
+    LogFlushSlot* slotOf_(const rune::storage::Log* log) noexcept {
+        if (slotIndex_.empty() || log == nullptr) return nullptr;
+        for (std::size_t i = ptrHash_(log) & slotIndexMask_;; i = (i + 1) & slotIndexMask_) {
+            if (slotIndex_[i].first == log) return &slots_[slotIndex_[i].second];
+            if (slotIndex_[i].first == nullptr) return nullptr;
+        }
+    }
+    // Cold: called on every ownership change (setOwnedDirect / SetOwnership op).
+    // Slots for logs still owned are carried over (in-flight state intact);
+    // slots for logs no longer owned are purged — their in-flight tokens are
+    // then ignored on completion (epoch / identity mismatch) (M2).
+    void rebuildFlushSlots_() {
+        rebuildOwnedIndex_();
+        std::vector<LogFlushSlot> next;
+        next.reserve(owned_.size());
+        for (auto* replica : owned_) {
+            if (!replica || !replica->isDiskBacked()) continue;
+            rune::storage::Log* log = replica->log();
+            if (!log) continue;
+            bool dup = false;
+            for (const auto& n : next) dup = dup || n.log == log;
+            if (dup) continue;
+            if (LogFlushSlot* old = slotOf_(log)) {
+                LogFlushSlot carried = *old;
+                carried.replica = replica;
+                next.push_back(carried);
+            } else {
+                LogFlushSlot fresh;
+                fresh.log = log; fresh.replica = replica; fresh.epoch = ++slotEpochSeq_;
+                fresh.dir = log->dir();   // cached while owned: never read the Log after a move
+                next.push_back(fresh);
+            }
+        }
+        // Ownership move (shared-nothing): after this, the worker holds no
+        // reference to — and makes no reads of — a moved replica or log.
+        std::vector<const rune::replication::PartitionReplica*> ownedNow(owned_.begin(), owned_.end());
+        std::sort(ownedNow.begin(), ownedNow.end());
+        auto isOwned = [&](const rune::replication::PartitionReplica* r) {
+            return r != nullptr && std::binary_search(ownedNow.begin(), ownedNow.end(), r);
+        };
+        // acks=all waiters on a moved replica would read its HW cross-thread:
+        // fail them RETRIABLY (NotLeader) — the client retries on the new owner.
+        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
+            if (!isOwned(pendingAcksAll_[i].replica)) {
+                pendingAcksAll_[i].ret.errorCode =
+                    static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+                enqueueReturn_(pendingAcksAll_[i].ret);
+                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
+                pendingAcksAll_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        // Push subscriptions on a moved partition are parked (cursor kept, no
+        // reads); re-activated if the partition comes back to this worker.
+        for (auto& sub : subs_) {
+            if (sub.replica) sub.active = isOwned(sub.replica);
+        }
+        // C-1 / M2: logs this worker no longer owns.  Their still-pending durable
+        // entries would lose their seal gating (the slot goes) — fail them
+        // RETRIABLY now (NotLeader: the client retries on the new owner), and
+        // never submit for them again this pass.
+        for (const auto& old : slots_) {
+            bool kept = false;
+            for (const auto& n : next) kept = kept || n.log == old.log;
+            if (kept) continue;
+            failOwnPending_(old.log, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), false);
+            // Tokens still in flight for it resolve through purgedDirs_ (its dir
+            // was cached while owned) — the moved Log itself is never read again.
+            purgedDirs_.emplace_back(old.log, old.dir);
+            dirtyThisCycle_.erase(std::remove(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), old.log),
+                                  dirtyThisCycle_.end());
+        }
+        slots_ = std::move(next);
+        // Prune purged entries that are owned again or have no token in flight.
+        for (std::size_t i = 0; i < purgedDirs_.size(); ) {
+            bool live = false;
+            for (const auto& n : slots_) live = live || n.log == purgedDirs_[i].first;
+            bool inFlight = false;
+            if (!live)
+                for (const auto& r : routes_) inFlight = inFlight || (r.token != kNoToken && r.log == purgedDirs_[i].first);
+            if (live || !inFlight) {
+                purgedDirs_[i] = std::move(purgedDirs_.back());
+                purgedDirs_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        const std::size_t cap = pow2AtLeast_(2 * slots_.size() + 2);
+        slotIndex_.assign(cap, {nullptr, 0u});
+        slotIndexMask_ = cap - 1;
+        bgInFlight_ = 0;
+        for (uint32_t s = 0; s < slots_.size(); ++s) {
+            std::size_t i = ptrHash_(slots_[s].log) & slotIndexMask_;
+            while (slotIndex_[i].first != nullptr) i = (i + 1) & slotIndexMask_;
+            slotIndex_[i] = {slots_[s].log, s};
+            if (slots_[s].bgToken != kNoToken) ++bgInFlight_;
+        }
+    }
+
+    void initRoutes_(std::size_t ioDepth) {
+        const std::size_t cap = 2 * pow2AtLeast_(ioDepth < 2 ? 2 : ioDepth);
+        routes_.assign(cap, TokenRoute{});
+        routeMask_ = cap - 1;
+    }
+    bool routeInsert_(const TokenRoute& r) noexcept {
+        for (std::size_t n = 0, i = static_cast<std::size_t>(r.token) & routeMask_; n <= routeMask_;
+             ++n, i = (i + 1) & routeMask_) {
+            if (routes_[i].token == kNoToken) { routes_[i] = r; return true; }
+        }
+        return false;   // impossible: in-flight tokens ≤ io depth ≤ capacity / 2
+    }
+    // Find + remove (backward-shift deletion keeps probe chains intact).
+    bool routeTake_(CompletionToken t, TokenRoute& out) noexcept {
+        if (t == kNoToken) return false;
+        std::size_t i = static_cast<std::size_t>(t) & routeMask_;
+        for (std::size_t n = 0;; ++n, i = (i + 1) & routeMask_) {
+            if (n > routeMask_ || routes_[i].token == kNoToken) return false;
+            if (routes_[i].token == t) break;
+        }
+        out = routes_[i];
+        std::size_t hole = i;
+        for (std::size_t j = (i + 1) & routeMask_; routes_[j].token != kNoToken; j = (j + 1) & routeMask_) {
+            const std::size_t home = static_cast<std::size_t>(routes_[j].token) & routeMask_;
+            // Move j into the hole iff its home is not in the cyclic range (hole, j].
+            const bool inRange = (hole <= j) ? (home > hole && home <= j) : (home > hole || home <= j);
+            if (!inRange) { routes_[hole] = routes_[j]; hole = j; }
+        }
+        routes_[hole] = TokenRoute{};
+        return true;
+    }
+    // A route is still meaningful only while this worker owns the same slot.
+    LogFlushSlot* liveSlot_(const TokenRoute& r) noexcept {
+        LogFlushSlot* slot = slotOf_(r.log);
+        return (slot && slot->epoch == r.epoch) ? slot : nullptr;
+    }
+
+    // Pin the active segment (only for a log this worker owns a slot for — the
+    // pin is released on the completion through that slot) and submit its fd.
+    // kNoToken on back-pressure.
+    CompletionToken submitActive_(rune::storage::Log* log, RouteKind kind, uint32_t epoch,
+                                  bool pin = true) noexcept {
+        if (log->storageFailed()) [[unlikely]] return kNoToken;   // never touch a failed log's disk again
+        rune::storage::LogSegment* seg = log->activeSegmentForFlush();
+        if (pin) seg->pinFlush();
+        const CompletionToken t = io_.submit(seg->logFd(), log->flushBoundary());
+        if (t == kNoToken) { if (pin) log->unpinSegmentFlush(seg); return kNoToken; }
+        if (!pin) seg = nullptr;
+        if (!routeInsert_(TokenRoute{t, log, seg, epoch, kind})) {
+            spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
+        }
+        return t;
+    }
+
+    // Async roll seals queued by the log (shard mode).  A refused submit leaves
+    // the seal queued (still pinned) for the next pass.
+    int submitPendingSeals_(LogFlushSlot& slot) noexcept {
+        int n = 0;
+        rune::storage::Log* log = slot.log;
+        while (log->pendingSealCount() > 0 && !log->storageFailed()) {
+            rune::storage::LogSegment* seg = log->frontPendingSeal();
+            const CompletionToken t = io_.submit(seg->logFd(), 0);
+            if (t == kNoToken) break;
+            log->popPendingSeal();   // the seal's pin now belongs to the route
+            if (!routeInsert_(TokenRoute{t, log, seg, slot.epoch, RouteKind::Seal})) {
+                spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
+            }
+            ++slot.sealsInFlight;
+            ++sealSubmits_;
+            ++n;
+        }
+        return n;
+    }
+
+    // Request a background flush of `slot`'s log.  Returns true iff submitted now.
+    bool requestBgFlush_(LogFlushSlot& slot) noexcept {
+        rune::storage::Log* log = slot.log;
+        if (log->storageFailed()) return false;                   // fail-stop: never again
+        if (slot.bgToken != kNoToken) {                           // coalesce
+            if (log->logEndOffset() > slot.bgLeo) slot.bgAgain = true;
+            return false;
+        }
+        const CompletionToken t = submitActive_(log, RouteKind::Background, slot.epoch);
+        if (t == kNoToken) {
+            // Back-pressure (io in-flight depth): no retry table, no per-pass
+            // spin — the next owned-log sync interval re-requests it.
+            ++bgFlushDeferred_;
+            if (bgFlushDeferred_ == 1 || (bgFlushDeferred_ & 1023u) == 0)
+                spdlog::warn("Worker {}: background flush deferred (io back-pressure, total={})",
+                             workerId_, bgFlushDeferred_);
+            return false;
+        }
+        slot.bgToken = t;
+        slot.bgLeo   = log->logEndOffset();
+        slot.bgAgain = false;
+        ++bgInFlight_;
+        ++bgFlushSubmits_;
+        return true;
+    }
+
+    // Shard-mode replacement for syncOwnedLogs_: same 10 ms gate and the same
+    // "unchanged log = no work" rule, but each due log is an io_ submission.
+    int syncOwnedLogsAsync_(int64_t nowNs) {
+        if (lastSyncNs_ == 0) { lastSyncNs_ = nowNs; return 0; }
+        if (nowNs - lastSyncNs_ < kWorkerSyncIntervalNs) return 0;
+        lastSyncNs_ = nowNs;
+        int n = 0;
+        for (auto& slot : slots_) {
+            if (slot.log->storageFailed()) continue;
+            if (slot.log->logEndOffset() <= slot.lastSyncedLeo) continue;   // unchanged: no phantom work
+            if (requestBgFlush_(slot)) ++n;
+        }
+        return n;
+    }
+
+    bool sealsOutstanding_(rune::storage::Log* log) noexcept {
+        LogFlushSlot* slot = slotOf_(log);
+        if (!slot) return false;
+        return slot->sealsInFlight > 0 || log->pendingSealCount() > 0;
+    }
+    void fireDurable_(DurablePending& entry) {
+        durableAckToken_ = entry.token;
+        if (entry.thenAwaitHw) {
+            // Shard Strict acks=all: durable locally — now the HW gate.  (M4: for
+            // a single-ISR Strict log, HW / consumer visibility can precede the
+            // fsync in shard mode — Kafka semantics; the PRODUCER ack never does.)
+            entry.ret.errorCode = 0;
+            PendingAcksAll pending;
+            pending.replica    = entry.thenAwaitHw;
+            pending.lastOffset = entry.lastOffset;
+            pending.deadlineNs = entry.deadlineNs;
+            pending.ret        = std::move(entry.ret);
+            pendingAcksAll_.push_back(std::move(pending));
+        } else {
+            entry.ret.errorCode = 0; // OK
+            enqueueReturn_(entry.ret);
+        }
+    }
+    void fireSealGated_(LogFlushSlot& slot) {
+        if (sealsOutstanding_(slot.log)) return;
+        for (std::size_t i = 0; i < durablePending_.size(); ) {
+            auto& entry = durablePending_[i];
+            if (entry.awaitSeal && entry.logPtr == slot.log) {
+                fireDurable_(entry);
+                durablePending_[i] = std::move(durablePending_.back());
+                durablePending_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    // ---- fsyncgate fail-stop -------------------------------------------------
+    void enqueueSignal_(const WorkerReturn& r) {
+        const std::size_t n = sbe::MessageHeader::encodedLength() +
+                              sbe::WorkerReturn::computeLength(r.chunk.size());
+        aeron::util::index_t idx = -1;
+        try { idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n); } catch (...) { idx = -1; }
+        if (idx < 0) { pendingSignals_.push_back(r); return; }   // retried next pass, never dropped
+        encodeReturnSbe_(r, idx, n);
+        ret_.commit(idx);
+    }
+    int flushPendingSignals_() {
+        if (pendingSignals_.empty()) return 0;
+        std::vector<WorkerReturn> again;
+        again.swap(pendingSignals_);
+        for (const auto& r : again) enqueueSignal_(r);
+        return static_cast<int>(again.size() - pendingSignals_.size());
+    }
+    // The FIRST fsync error on a log: the log is permanently failed, every
+    // durable/acks=all ack pending on it fails with StorageError (never OK),
+    // and the runtime is signalled once to halt the broker.
+    // Fail THIS worker's pending acks on `log` with `code` (never touches the Log).
+    void failOwnPending_(const rune::storage::Log* log, int16_t code, bool includeAcksAll) {
+        for (std::size_t i = 0; i < durablePending_.size(); ) {
+            if (durablePending_[i].logPtr == log) {
+                durablePending_[i].ret.errorCode = code;
+                enqueueReturn_(durablePending_[i].ret);
+                durablePending_[i] = std::move(durablePending_.back());
+                durablePending_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        if (!includeAcksAll) return;
+        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
+            auto* r = pendingAcksAll_[i].replica;
+            if (r && r->isDiskBacked() && r->log() == log) {   // log() is immutable: safe to read
+                pendingAcksAll_[i].ret.errorCode = code;
+                enqueueReturn_(pendingAcksAll_[i].ret);
+                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
+                pendingAcksAll_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+    }
+    void signalStorageFailure_(const std::string& dir, int err, int32_t topicId, int32_t partition) {
+        spdlog::critical("Worker {}: fsync FAILED on {} (errno={}) — log permanently failed; "
+                         "signalling the runtime to halt the broker", workerId_, dir, err);
+        WorkerReturn sig;
+        sig.type      = WorkerReturn::Type::StorageFailure;
+        sig.errorCode = static_cast<int16_t>(err);
+        sig.topicId   = topicId;
+        sig.partition = partition;
+        sig.chunk.assign(dir.begin(), dir.end());
+        ++storageFailureSignals_;
+        enqueueSignal_(sig);
+    }
+    // The FIRST fsync error on a log THIS worker owns: the log is permanently
+    // failed, every durable/acks=all ack pending on it fails with StorageError
+    // (never OK), and the runtime is signalled once to halt the broker.
+    void failLog_(rune::storage::Log* log, int err) {
+        if (!log) return;
+        log->markStorageFailed(err);
+        failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), true);
+        LogFlushSlot* slot = slotOf_(log);
+        if (slot && slot->failureReported) return;
+        if (slot) slot->failureReported = true;
+        signalStorageFailure_(log->dir(), log->storageErrno(),
+                              slot && slot->replica ? slot->replica->topicId() : -1,
+                              slot && slot->replica ? static_cast<int32_t>(slot->replica->partitionId()) : -1);
+    }
+    // C-1: an fsync error on a log this worker NO LONGER owns (its slot was
+    // purged by an ownership move while the token was in flight).  The kernel
+    // error state was consumed by THIS fsync, so the new owner's next fsync can
+    // succeed over lost pages — the broker must halt.  Never write the other
+    // worker's Log object: fail only this worker's own pending entries, signal.
+    void failForeignLog_(const rune::storage::Log* log, int err) {
+        failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), false);
+        for (const auto* f : foreignFailed_) if (f == log) return;
+        foreignFailed_.push_back(log);   // cold
+        std::string dir = "<moved log>";
+        for (const auto& pd : purgedDirs_) if (pd.first == log) dir = pd.second;
+        signalStorageFailure_(dir, err, -1, -1);
+    }
+    // After a truncate (role change): clamp the slot's LEO bookkeeping, and if
+    // the truncate dropped an UNSUBMITTED pending seal, this worker's durable
+    // entries on the log can no longer prove durability (their seal is gone) —
+    // fail them RETRIABLY instead of wedging (and holding ack reservations).
+    void reconcileTruncation_(LogFlushSlot& slot) {
+        const int64_t leo = slot.log->logEndOffset();
+        if (slot.lastSyncedLeo > leo) slot.lastSyncedLeo = leo;
+        if (slot.bgLeo > leo) slot.bgLeo = leo;
+        const uint64_t drops = slot.log->droppedPendingSeals();
+        if (drops != slot.sealDropsSeen) [[unlikely]] {
+            slot.sealDropsSeen = drops;
+            failOwnPending_(slot.log, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), false);
+        }
+    }
+    // Any inline sync failure (legacy Log::sync / durable append / seal) marks
+    // the log failed in storage; this cold check turns it into the fail-stop.
+    void checkStorageFailure_(rune::storage::Log* log) {
+        if (!log->storageFailed()) [[likely]] return;
+        LogFlushSlot* slot = slotOf_(log);
+        if (slot && slot->failureReported) return;
+        failLog_(log, log->storageErrno());
+    }
+
+    // -----------------------------------------------------------------------
     // syncOwnedLogs_ — time-gated Log::sync for worker-owned user-partition logs.
     //
     // E5.1.3 (d) R7 fix: called from doWork when perWorkerIngressActive_ is true.
@@ -2487,28 +3203,24 @@ private:
         lastSyncNs_ = nowNs;
 
         int synced = 0;
-        for (auto* replica : owned_) {
-            if (!replica || !replica->isDiskBacked()) continue;
-            rune::storage::Log* log = replica->log();
-            if (!log) continue;
+        for (auto& slot : slots_) {
+            rune::storage::Log* log = slot.log;
+            if (log->storageFailed()) continue;
             // Skip logs with no new appends since their last sync — syncing an
             // unchanged log is a no-op fdatasync that must NOT count as work (else
             // the backoff idle never parks on an otherwise-idle worker).
             const int64_t leo = log->logEndOffset();
-            int64_t& lastLeo = lastSyncedLeo_[log];
-            if (leo <= lastLeo) continue;
+            if (leo <= slot.lastSyncedLeo) continue;
             try {
                 log->sync();
-                lastLeo = leo;
+                slot.lastSyncedLeo = leo;
                 ++synced;
             } catch (const std::exception& ex) {
-                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw for "
-                              "topicId={} partition={}: {}; log may be dirty",
-                              workerId_, replica->topicId(), replica->partitionId(), ex.what());
-            } catch (...) {
-                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() threw unknown exception "
-                              "for topicId={} partition={}",
-                              workerId_, replica->topicId(), replica->partitionId());
+                // fsyncgate: the log is now permanently failed (LogSegment::sync);
+                // fail-stop it (pending acks failed, runtime signalled to halt).
+                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() failed for {}: {}",
+                              workerId_, log->dir(), ex.what());
+                checkStorageFailure_(log);
             }
         }
         return synced;
@@ -2669,6 +3381,13 @@ private:
     // Never drops an ack: errors return error acks on ret_; acks=all go to
     // pendingAcksAll_ for deferred fire.
     // -----------------------------------------------------------------------
+    // Acks already owed that will fire into ret_ later: acks=all parked on HW and,
+    // in shard mode, Strict acks parked on their fsync (G-A6 reservation).
+    [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
+        return static_cast<int64_t>(pendingAcksAll_.size()) +
+               (shardMode_ ? static_cast<int64_t>(durablePending_.size()) : 0);
+    }
+
     int pollWorkerIngress_(int64_t nowNs) {
         if (!workerIngress_ || !workerIngress_->resolved()) return 0;
 
@@ -2679,8 +3398,7 @@ private:
         // acks already parked in pendingAcksAll_ (they fire into ret_ later).  This
         // bounds pendingAcksAll_ by ret_ capacity while allowing acks=all pipelining.
         const int64_t freeSlots = ret_.freeSlotsForMsgSize(ackSlotBytes_);
-        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) +
-                                  static_cast<int64_t>(pendingAcksAll_.size());
+        const int64_t reserved  = static_cast<int64_t>(retOverflow_.size()) + reservedAckSlots_();
         const int64_t available = (freeSlots > reserved) ? (freeSlots - reserved) : 0;
         const int32_t K = static_cast<int32_t>(
             std::min(static_cast<int64_t>(desiredFragmentLimit_), available));
@@ -2822,6 +3540,10 @@ private:
         // was hardcoded to 1, so RUNE_TOPICS tier=strict was silently ignored on the
         // per-worker ingress path.)
         const uint8_t durabilityTier = replica ? replica->durabilityTier() : 1;
+        // Task 10 (spec §3.1): shard mode never fsyncs inline on the loop.  Strict
+        // appends page-cache only and acks from its own io_ completion (then the
+        // HW gate for acks=all).
+        const bool asyncStrict = shardMode_ && durabilityTier == 2;
 
         // Call the shared produce helper.
         rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
@@ -2829,7 +3551,7 @@ private:
             msg.topicId, msg.partition,
             msg.producerId, msg.producerEpoch, msg.baseSequence,
             *log, psm_,
-            acksAll, isrSize, minIsr, durabilityTier);
+            acksAll, isrSize, minIsr, asyncStrict ? uint8_t{1} : durabilityTier);
 
         ret.baseOffset  = outcome.baseOffset;
         ret.lastOffset  = outcome.lastOffset;
@@ -2850,6 +3572,28 @@ private:
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
         if (replica) {
             replica->onLeaderLogAppended();
+        }
+
+        if (asyncStrict) {
+            // Park on the coalesced fsync (submitCoalescedFlushes_ stamps the token
+            // this pass).  A duplicate retry is parked too: its original may still
+            // be awaiting its own fsync, and a Strict ack is never sent before the
+            // data it acknowledges is durable.
+            const int64_t lastOff = outcome.isDuplicate
+                ? outcome.baseOffset + static_cast<int64_t>(outcome.recordCount) - 1
+                : outcome.lastOffset;
+            ret.errorCode = 0;
+            DurablePending dp;
+            dp.token       = kNoToken;
+            dp.lastOffset  = lastOff;
+            dp.logPtr      = log;
+            dp.ret         = std::move(ret);
+            dp.thenAwaitHw = acksAll ? replica : nullptr;
+            dp.deadlineNs  = nowNs + ackTimeoutNs_;
+            durablePending_.push_back(std::move(dp));
+            if (std::find(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), log) == dirtyThisCycle_.end())
+                dirtyThisCycle_.push_back(log);
+            return 1;
         }
 
         if (!acksAll || outcome.isDuplicate) {

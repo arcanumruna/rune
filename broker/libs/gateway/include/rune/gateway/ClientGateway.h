@@ -53,7 +53,7 @@
 // Forward-declared to avoid pulling the full WorkerPool header (and its heavy
 // chain: Worker → SpscRing → WorkerOp → ReplicationMessages) into the gateway
 // header.  All WorkerPool calls are in ClientGateway.cpp.
-namespace rune::node { class WorkerPool; }
+namespace rune::node { class WorkerPool; struct WorkerReturn; }
 
 #include <Aeron.h>
 #include <Subscription.h>
@@ -618,6 +618,15 @@ public:
     // session's egress.  Reuses the same sendTo path as all other responses.
     // Returns true if the frame was accepted by the egress publication.
     bool sendControlFrame(int64_t sessionId, const uint8_t* buf, std::size_t len);
+
+    // -----------------------------------------------------------------------
+    // fsyncgate fail-stop (Task 10 fix 1): invoked on THIS duty-cycle thread when
+    // a worker signals StorageFailure over its return ring, or when the gateway's
+    // own flushDirtyLogs sync fails.  BrokerNode wires it to its halt path.
+    // Cold path (std::function is fine).  Called at most once.
+    // -----------------------------------------------------------------------
+    using StorageFailureHandler = std::function<void(const std::string& logDir, int err)>;
+    void setStorageFailureHandler(StorageFailureHandler h) { storageFailureHandler_ = std::move(h); }
 
     // -----------------------------------------------------------------------
     // CG-4 test / introspection hooks — not used in production code paths.
@@ -1243,6 +1252,18 @@ private:
     // gateway); raw pointer equality is the correct identity key.
     static constexpr int64_t kGroupCommitIntervalNs = 10LL * 1'000'000LL; // 10 ms
     std::unordered_set<rune::storage::Log*> dirtyLogs_;
+    StorageFailureHandler storageFailureHandler_;
+    bool                  storageFailureRaised_ = false;
+    void raiseStorageFailure_(const std::string& logDir, int err);
+    void handleWorkerReturn_(rune::node::WorkerReturn ret);   // by value: WorkerReturn complete in the .cpp
+    void onControlRecordRefused_(int32_t topicId, int32_t partition,
+                                 const std::vector<uint8_t>& marker, int16_t err);
+    uint64_t controlRecordsRefused_ = 0;
+public:
+    [[nodiscard]] uint64_t controlRecordsRefusedForTest() const noexcept { return controlRecordsRefused_; }
+    /// Test-only: feed a worker return through the real drain handler.
+    void handleWorkerReturnForTest(const rune::node::WorkerReturn& ret);
+private:
     int64_t                                 lastFlushNs_ = 0;
 
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription

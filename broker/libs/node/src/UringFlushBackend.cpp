@@ -75,19 +75,9 @@ UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
                                      std::size_t /*completionDepth*/) {
     if (submitDepth == 0) submitDepth = 1;
 
-    // RUNE_IO_BACKEND=portable: skip io_uring and degrade to synchronous-only
-    // mode.  submit() will always return kNoToken (no token → Worker falls back
-    // to synchronous ack on the same cycle), and reap() is a no-op.  Use this
-    // on environments where io_uring_setup is unavailable (e.g. Docker Desktop
-    // on Apple Silicon / Rosetta x86 emulation where the syscall is not translated).
-    const char* ioBackendEnv = ::getenv("RUNE_IO_BACKEND");
-    if (ioBackendEnv != nullptr && std::string_view(ioBackendEnv) == "portable") {
-        portableFallback_ = true;
-        // Initialise with a valid non-zero submitDepth so the capacity is sane.
-        sqRingSize_  = nextPow2(static_cast<uint32_t>(submitDepth));
-        submitDepth_ = sqRingSize_;
-        return;  // All pointer members stay nullptr / MAP_FAILED (default state).
-    }
+    // RUNE_IO_BACKEND=portable no longer reaches this class: IoBackend
+    // constructs the REAL PortableFlushBackend instead (Task 10 fix 1 / C1 —
+    // the old in-class "portable fallback" silently returned kNoToken forever).
 
     // Round up to power of two — the kernel adjusts entries to the next pow2
     // anyway; doing it ourselves lets us reason about the ring size precisely.
@@ -107,10 +97,6 @@ UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
     sqRingSize_ = params.sq_entries;  // power-of-two
 
     submitDepth_ = sqRingSize_;
-
-    // Allocate the token→boundary table (indexed by token % sqRingSize_).
-    boundaryTable_ = std::make_unique<int64_t[]>(sqRingSize_);
-    std::memset(boundaryTable_.get(), 0, sqRingSize_ * sizeof(int64_t));
 
     // -----------------------------------------------------------------------
     // mmap 1: SQ ring  (IORING_OFF_SQ_RING = 0)
@@ -211,12 +197,6 @@ UringFlushBackend::~UringFlushBackend() {
 // ---------------------------------------------------------------------------
 CompletionToken UringFlushBackend::submit(int fd,
                                           int64_t flushBoundary) noexcept {
-    // Portable fallback: no io_uring rings — return kNoToken so tier-2 (Strict)
-    // produces back-pressure immediately.  Tier 0/1 (Leader/Majority) produce
-    // acks are enqueued synchronously before submitCoalescedFlushes_ is called,
-    // so kNoToken here only affects Strict-tier acks (none in the E2E test suite).
-    if (portableFallback_) { (void)fd; (void)flushBoundary; return kNoToken; }
-
     // Deterministic back-pressure: bound in-flight (submitted-not-yet-reaped)
     // completions to the configured depth.  The SQ ring itself drains on every
     // io_uring_enter (the kernel consumes SQEs immediately), so an SQ-fullness
@@ -277,9 +257,10 @@ CompletionToken UringFlushBackend::submitWithToken(int fd,
     // Map sqe index into the SQ index array (one-to-one for simple rings).
     sqArray_[sqeIdx] = sqeIdx;
 
-    // Store flushBoundary in the worker-owned table (no cross-thread access).
-    const uint32_t slot = static_cast<uint32_t>(tok) % sqRingSize_;
-    boundaryTable_[slot] = flushBoundary;
+    // flushBoundary is not tracked (I2): a token % ring-size table aliased when
+    // completions arrived out of order (T and T+ringSize both in flight) and
+    // could wedge acks forever.  Completions are matched by token only.
+    (void)flushBoundary;
 
     // Advance the SQ tail — store-release so the kernel sees the new SQE.
     __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE);

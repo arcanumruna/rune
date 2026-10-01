@@ -61,6 +61,7 @@
 // Integration-only headers (require Aeron)
 #include <rune/replication/PartitionReplica.h>
 #include <rune/node/BrokerNode.h>
+#include <rune/node/EmbeddedDriver.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -338,59 +339,27 @@ static rune::node::NodeConfig makeTx2bConfig(
 
 // Test-client embedded Aeron driver (mirrors Gr5ClientDriver exactly).
 struct Tx2bClientDriver {
-    aeron_driver_context_t*       driverCtx = nullptr;
-    aeron_driver_t*               driver    = nullptr;
-    std::atomic<bool>             running{false};
-    std::thread                   thread;
+    // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+    // readiness pumping — aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before the driver thread even starts.
+    rune::node::EmbeddedDriver    driver;
     std::shared_ptr<aeron::Aeron> aeron;
 
-    explicit Tx2bClientDriver(const fs::path& aeronDir) {
-        fs::create_directories(aeronDir);
-        aeron_driver_context_init(&driverCtx);
-        aeron_driver_context_set_dir(driverCtx, aeronDir.string().c_str());
-        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
-
-        EXPECT_EQ(aeron_driver_init(&driver, driverCtx), 0);
-        EXPECT_EQ(aeron_driver_start(driver, /*manual_main_loop=*/true), 0);
-        running.store(true, std::memory_order_release);
-        thread = std::thread([this]() {
-            while (running.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver, aeron_driver_main_do_work(driver));
-            }
-        });
-
-        const std::string cncPath = aeronDir.string() + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(1ms);
-        }
-
+    explicit Tx2bClientDriver(const fs::path& aeronDir)
+        : driver(makeCfg(aeronDir), rune::node::DriverMode::Threaded)
+    {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
         aeron = aeron::Aeron::connect(ctx);
     }
 
-    ~Tx2bClientDriver() {
-        aeron.reset();
-        if (running.exchange(false, std::memory_order_acq_rel)) {
-            if (thread.joinable()) thread.join();
-        }
-        if (driver) {
-            const auto dl = std::chrono::steady_clock::now() + 50ms;
-            while (std::chrono::steady_clock::now() < dl) {
-                if (aeron_driver_main_do_work(driver) == 0) break;
-                std::this_thread::sleep_for(200us);
-            }
-            aeron_driver_close(driver);
-        }
-        if (driverCtx) aeron_driver_context_close(driverCtx);
+private:
+    static rune::node::EmbeddedDriverConfig makeCfg(const fs::path& aeronDir) {
+        fs::create_directories(aeronDir);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir.string();
+        cfg.termBufferBytes = 64 * 1024;
+        return cfg;
     }
 };
 

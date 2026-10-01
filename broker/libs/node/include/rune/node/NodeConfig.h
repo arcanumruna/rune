@@ -209,6 +209,9 @@ struct NodeConfig {
     std::optional<int32_t> workerIngressBasePort;   // RUNE_WORKER_INGRESS_BASE_PORT (nullopt = unset)
     std::optional<int32_t> workerReplBasePort;      // RUNE_WORKER_REPL_BASE_PORT    (nullopt = unset)
     static constexpr int32_t kMaxShardWorkers = 64;   // runtime→worker announce mask width
+    /// Test-only: shard drivers' client liveness timeout (= the invoker clients'
+    /// inter-service timeout).  0 = Aeron default (10 s).  No env var.
+    int64_t shardClientLivenessTimeoutNs = 0;
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
     [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
 

@@ -756,6 +756,12 @@ if(BUILD_TESTING)
             target_link_libraries(rune_shard_agent_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_agent_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # Spec §3.1 never-block: follower flush / owned-log sync / Strict tier
+            # go through the worker's io backend; background-token routing.
+            add_executable(rune_shard_nonblocking_tests tests/integration/ShardNonBlockingTest.cpp)
+            target_link_libraries(rune_shard_nonblocking_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_shard_nonblocking_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # RoleCounter publish→read integration test: BrokerNode publishes the
             # Aeron node-role/term counters; CncFileReader reads them back (the
             # rune_role path).  Embeds the media driver → gated with the others.

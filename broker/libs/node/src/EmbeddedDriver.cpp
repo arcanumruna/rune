@@ -72,6 +72,8 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_SHARED);
         aeron_driver_context_set_shared_idle_strategy(ctx_, idle);
     }
+    if (cfg_.clientLivenessTimeoutNs > 0)
+        aeron_driver_context_set_client_liveness_timeout_ns(ctx_, static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
     aeron_driver_context_set_term_buffer_sparse_file(ctx_, true);

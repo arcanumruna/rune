@@ -80,6 +80,7 @@ extern "C" {
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -265,8 +266,27 @@ public:
 
         // 4. Advance the DDL state machine + drive the replica.
         work += worker_.doWork(nowNs);
+
+        // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
+        //    failed an fsync → hand it to the control thread (ring, no shared
+        //    state), which halts the broker.  Signalled once (retried while the
+        //    ring is full).
+        if (!storageFailureSignalled_) {
+            auto* r = worker_.replica();
+            if (r && r->isDiskBacked() && r->log()->storageFailed()) [[unlikely]] {
+                const std::string& dir = r->log()->dir();
+                std::vector<uint8_t> msg(4 + dir.size());
+                const int32_t e = r->log()->storageErrno();
+                std::memcpy(msg.data(), &e, 4);
+                std::memcpy(msg.data() + 4, dir.data(), dir.size());
+                if (failureRing_.write(msg.data(), msg.size(), 1)) storageFailureSignalled_ = true;
+            }
+        }
         return work;
     }
+
+    /// admin → control: schema-log storage failure ([errno:i32][dir]).
+    OneToOneByteRing& failureRing() noexcept { return failureRing_; }
 
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
@@ -289,6 +309,8 @@ private:
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
     OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    OneToOneByteRing failureRing_{4096};                     // admin → control (storage failure)
+    bool             storageFailureSignalled_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -318,6 +340,28 @@ public:
     /// Signal the agent thread to stop, join it, then close the Aeron client
     /// and embedded media driver.  Idempotent.
     void stop();
+
+    // -----------------------------------------------------------------------
+    // fsyncgate fail-stop (Task 10 fix 1; Kafka LogDirFailure / PostgreSQL
+    // data_sync_retry=off).  When any log's fsync fails, the runtime logs
+    // critical and HALTS the broker with kExitStorageFailure.  The process
+    // owner (main) installs a HaltHandler before start(): it is called ONCE on
+    // the runtime thread and must stop the node through the normal stop path
+    // (from another thread) and exit with exitCode.  Without a handler the
+    // node stops itself on a helper thread and _Exit()s with the code.
+    // Restart recovery truncates the torn tail; replication re-heals it.
+    // -----------------------------------------------------------------------
+    static constexpr int kExitStorageFailure = 74;   // EX_IOERR
+    static constexpr int kExitInvariantViolation = 70;   // EX_SOFTWARE (F7 ownership invariant)
+    using HaltHandler = void (*)(void* ctx, int exitCode);
+    void setHaltHandler(HaltHandler h, void* ctx) noexcept { haltHandler_ = h; haltCtx_ = ctx; }
+    /// Test-only: drive the runtime's storage-failure path directly.
+    void raiseStorageFailureForTest(const std::string& logDir, int err) { onStorageFailure_(logDir, err); }
+    /// Test-only: during start(), re-run one user log's recovery with this msync
+    /// errno injected (exercises the refuse-to-start path).
+    void setRecoveryFaultForTest(int err) noexcept { recoveryFaultForTest_ = err; }
+    /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
+    void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
 
     // -----------------------------------------------------------------------
     // Observers (thread-safe: atomic reads)
@@ -495,6 +539,31 @@ public:
     /// Self-contained worker shards (spec §3.1): number of per-worker invoker
     /// drivers built (0 in legacy mode).  Startup/stop-time state (no worker access).
     [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept { return shardDrivers_.size(); }
+    /// Worker w (owned by its own thread — touch only inside onOwnerThreadForTest).
+    [[nodiscard]] Worker* workerForTest(int32_t w) const noexcept {
+        return workerPool_ && w >= 0 && w < workerPool_->workerCount() ? &workerPool_->worker(w) : nullptr;
+    }
+
+    /// Test-only fault injection: called (on the start() thread) at named startup
+    /// phases ("build-gateway" = offset/txn/metadata rebuilds + admin build).
+    /// Set before start().
+    void setStartupPhaseHookForTest(std::function<void(std::string_view)> hook) {
+        startupPhaseHookForTest_ = std::move(hook);
+    }
+
+    /// Test-only fault injection: while attaching shard `worker` at startup, run a
+    /// resolve that cannot complete for `stall` (pumping like a slow real resolve).
+    /// Set before start().
+    void setShardResolveStallForTest(int32_t worker, std::chrono::milliseconds stall) noexcept {
+        shardResolveStallWorkerForTest_ = worker;
+        shardResolveStallForTest_       = stall;
+    }
+
+    /// Test-only: is worker w's shard Aeron client closed?  Call ONLY inside
+    /// onOwnerThreadForTest on worker w (the client is worker-owned).
+    [[nodiscard]] bool shardClientClosedForTest(int32_t w) const {
+        return shardClients_.at(static_cast<std::size_t>(w))->isClosed();
+    }
 
     /// Test-only: worker w's replication plane (nullptr if none).  The vector is
     /// startup-immutable; the transport's STATE is worker-owned — read it only
@@ -727,7 +796,19 @@ private:
     std::vector<std::unique_ptr<EmbeddedDriver>> shardDrivers_;
     std::vector<std::shared_ptr<aeron::Aeron>>   shardClients_;
     std::vector<std::unique_ptr<ShardAgent>>     shardAgents_;
+    std::function<void(std::string_view)>        startupPhaseHookForTest_;
+    HaltHandler                                  haltHandler_ = nullptr;
+    void*                                        haltCtx_     = nullptr;
+    bool                                         haltRaised_  = false;   // runtime thread only
+    void onStorageFailure_(const std::string& logDir, int err);
+    void refuseStartOnFailedRecovery_();
+    void onInvariantViolation_(const std::string& what);
+    int  recoveryFaultForTest_ = 0;
+    int  schemaRecoveryFaultForTest_ = 0;
+    int32_t                                      shardResolveStallWorkerForTest_ = -1;
+    std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();
+    void attachShardRuntimes_();
     void teardownShardRuntimes_() noexcept;
 
     // E5.1.3: per-worker Aeron ingress subscriptions.

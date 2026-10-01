@@ -45,6 +45,13 @@ namespace {
 // ---------------------------------------------------------------------------
 // Unique temp-path generator  (getpid + atomic counter)
 // ---------------------------------------------------------------------------
+// F3 round 6, item 7: WorkerOp ring framing computed from the GENERATED codec
+// constants (never a literal) — it moves whenever rune-protocol grows WorkerOp.
+static constexpr std::size_t kWorkerOpFramingFromCodec =
+    rune::protocol::internal::sbe::MessageHeader::encodedLength() +
+    rune::protocol::internal::sbe::WorkerOp::sbeBlockLength() +
+    rune::protocol::internal::sbe::WorkerOp::tailHeaderLength();
+
 static fs::path makeTempDataDir(std::string_view tag = "") {
     static std::atomic<uint32_t> g_seq{0};
     auto seq  = g_seq.fetch_add(1, std::memory_order_relaxed);
@@ -1108,10 +1115,11 @@ TEST(BrokerNodeRegression, EffectiveMaxBatchDerivedFromTransportRegression) {
     const int32_t ingressMax = ingressHardTransportMaxBytes(cfg);
     const int32_t replMax    = replicationHardTransportMaxBytes(cfg);
     // F3 round 5: exact numbers (real framing constants, no hand /8 shortcut):
-    //   worker ring tail  = 8 MiB/8 − (8 + 219 + 4)          = 1048345
+    //   worker ring tail  = 8 MiB/8 − WorkerOp framing (SBE header + block + tail
+    //                       prefix, from the generated codec — 247 with rune-protocol fb82500)
     //   aeron ingress     = term max msg 131072 − Produce framing (24 hdr? + 24 + 2 + 4)
     //   replication       = min(ring 262144 − 16 − 46, term 131072 − 46) = 131026
-    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 1048576u - 231u);
+    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 1048576u - kWorkerOpFramingFromCodec);
     EXPECT_EQ(ingressMax, aeronIngressMaxBatchBytes(cfg));
     EXPECT_LT(ingressMax, 131072);
     EXPECT_EQ(replMax, 131072 - static_cast<int32_t>(
@@ -1193,7 +1201,9 @@ TEST(BrokerNodeRegression, DefaultMaxBatchConfigNeverRefusedRegression) {
 //   legacy (AeronPartitionTransport, 4 MiB outbound ring):
 //     min(524288 − 16 envelope − 46 framing, 524288 − 46) = 524226
 //   per-worker (WorkerReplicationTransport, gather send): 524288 − 46 = 524242
-//   worker ingress ring (32 MiB): 4194304 − 231 = 4194073
+//   worker ingress ring (32 MiB): 4194304 − WorkerOp framing from the codec
+//     (8 SBE header + sbeBlockLength + 4 tail prefix: 4194073 with rune-protocol
+//     66bf9e6, 4194057 with fb82500's targetReplicaId/incarnation fields)
 //   aeron ingress (4 MiB term):   524288 − Produce framing
 // → effective (multi-node) = 524226 = the ENFORCED legacy ceiling (round 4
 //   derived 524242, 16 bytes above what the legacy ring path can carry).
@@ -1210,7 +1220,7 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     ASSERT_EQ(cfg.workerIngressRingBytes, 32 * 1024 * 1024);
 
     EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524226);
-    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 4194073u);
+    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 4194304u - kWorkerOpFramingFromCodec);
     EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524226u);
     EXPECT_EQ(userTopicMaxFetchBytes(cfg), 1 << 20) << "default fetch chunk unchanged";
 
@@ -1246,7 +1256,7 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
 }
 
 // F3 round 5, item M3: an effective max too small to carry a single record
-// (here: a 1 KiB worker ingress ring → 128 − 231 framing → 0) must REFUSE to
+// (here: a 1 KiB worker ingress ring → 128 − WorkerOp framing → 0) must REFUSE to
 // start with a clear error naming the numbers — never silently fall back to
 // the 8 MiB default (round 4's gateway setter did exactly that for 0).
 TEST(BrokerNodeRegression, EffectiveMaxBelowMinimumRefusesStartRegression) {

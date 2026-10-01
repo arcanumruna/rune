@@ -43,6 +43,16 @@ ProduceOutcome handleProduceBatch(
     ProduceOutcome out;
 
     // -------------------------------------------------------------------------
+    // 0. fsyncgate fail-stop: a log whose fsync ever failed refuses EVERY
+    //    produce — including idempotent duplicates (checked before the dedup
+    //    gate, so a retry of a batch whose durability failed is never acked OK).
+    // -------------------------------------------------------------------------
+    if (log.storageFailed()) [[unlikely]] {
+        out.error = pc::ErrorCode::StorageError;
+        return out;
+    }
+
+    // -------------------------------------------------------------------------
     // 1. Batch size / header sanity guards.
     //    (Caller already checked batchLen > 0; we re-check here for safety.)
     // -------------------------------------------------------------------------
@@ -244,12 +254,13 @@ ProduceOutcome handleProduceBatch(
             log.sync();
             out.syncDone = true;
         } catch (const std::exception& ex) {
-            spdlog::error("ProducePath: Strict-tier sync() failed: {}; Internal", ex.what());
-            out.error = pc::ErrorCode::Internal;
+            spdlog::error("ProducePath: Strict-tier sync() failed: {}; StorageError (log failed)", ex.what());
+            out.error = pc::ErrorCode::StorageError;
             return out;
         } catch (...) {
-            spdlog::error("ProducePath: Strict-tier sync() threw unknown; Internal");
-            out.error = pc::ErrorCode::Internal;
+            spdlog::error("ProducePath: Strict-tier sync() threw unknown; StorageError");
+            log.markStorageFailed(5 /*EIO*/);
+            out.error = pc::ErrorCode::StorageError;
             return out;
         }
     }

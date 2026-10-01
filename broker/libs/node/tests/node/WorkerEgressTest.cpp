@@ -5,6 +5,7 @@
 //
 // Uses an embedded UDP-capable Aeron media driver (same pattern validated by the
 // MDC egress spike).
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/WorkerEgress.h>
 
 #include <Aeron.h>
@@ -32,10 +33,7 @@ constexpr const char* kControl = "127.0.0.1:24720";
 
 class WorkerEgressFixture : public ::testing::Test {
 protected:
-    aeron_driver_context_t* driverCtx_ = nullptr;
-    aeron_driver_t*         driver_    = nullptr;
-    std::thread             driverThread_;
-    std::atomic<bool>       driverRunning_{false};
+    std::unique_ptr<rune::node::EmbeddedDriver> driver_;
     std::shared_ptr<aeron::Aeron> aeron_;
     std::string aeronDir_;
 
@@ -52,26 +50,20 @@ protected:
         aeronDir_ = (std::filesystem::temp_directory_path() /
                      ("rune_wegress_" + std::to_string(::getpid()))).string();
         std::filesystem::remove_all(aeronDir_);
-        aeron_driver_context_init(&driverCtx_);
-        aeron_driver_context_set_dir(driverCtx_, aeronDir_.c_str());
-        aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
-        ASSERT_EQ(aeron_driver_init(&driver_, driverCtx_), 0) << aeron_errmsg();
-        ASSERT_EQ(aeron_driver_start(driver_, /*manual_main_loop=*/true), 0) << aeron_errmsg();
-        driverRunning_.store(true, std::memory_order_release);
-        driverThread_ = std::thread([this]() {
-            while (driverRunning_.load(std::memory_order_acquire))
-                aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
-        });
+        // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+        // readiness pumping needed — aeron_driver_init already wrote cnc.dat and
+        // stamped the heartbeat synchronously before the driver thread starts.
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir_;
+        cfg.termBufferBytes = 64 * 1024;
+        try {
+            driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        } catch (const std::exception& e) {
+            FAIL() << "EmbeddedDriver failed to start: " << e.what();
+        }
     }
     void stopDriver() {
-        if (driverRunning_.exchange(false) && driverThread_.joinable()) driverThread_.join();
-        if (driver_) { aeron_driver_close(driver_); driver_ = nullptr; }
-        if (driverCtx_) { aeron_driver_context_close(driverCtx_); driverCtx_ = nullptr; }
+        driver_.reset();
     }
 
     template <typename Pred>
