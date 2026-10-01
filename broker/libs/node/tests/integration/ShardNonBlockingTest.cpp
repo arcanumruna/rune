@@ -258,14 +258,16 @@ TEST(ShardNonBlockingRegression, BackgroundFlushCompletionNeverFiresProduceAck) 
     ASSERT_NE(t1, t2);
     Acks a;
     a.drain(w);
-    EXPECT_EQ(a.facts, 1) << "the gateway-routed Strict produce emits its append-time facts";
+    EXPECT_EQ(a.facts, 0) << "a gateway-routed Strict produce's facts wait for its fsync";
     w.deliverCompletionForTest(FlushCompletion{t2, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 0) << "a background flush token must never fire a produce ack";
+    EXPECT_EQ(a.facts, 0) << "nor release the produce's facts";
     EXPECT_EQ(w.bgFlushInFlightForTest(), 0u) << "the background token is retired by routing";
     w.deliverCompletionForTest(FlushCompletion{t1, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 1);
+    EXPECT_EQ(a.facts, 1) << "the produce's own fsync completion emits its facts";
     EXPECT_EQ(w.durableAckTokenForTest(), t1);
     // The real completions for T1 and T2 arrive later through io_.reap: wait for
     // exactly those two (condition, capped) and prove neither fires anything.

@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <cassert>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/GatewayReplicaView.h>
@@ -3144,7 +3145,12 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // it parks (acks=all / Strict).  Apply the PSM / LSO / dirty-log
             // facts now — whatever the session state — and answer nothing: the
             // final result follows when the worker's waiter fires.
-            if (ret.deferAck) {
+            // Only a SUCCESS can be facts-only (fix round 2, B1): an error result
+            // is always an answer — it must reach the client and must never
+            // feed the mirrors (the batch was not appended).
+            assert(!(ret.deferAck && ret.errorCode != 0) &&
+                   "worker invariant: an error ProduceResult never carries deferAck");
+            if (ret.deferAck && ret.errorCode == 0) {
                 applyProduceFacts_(ret);
                 return;
             }

@@ -327,9 +327,13 @@ struct WorkerReturn {
     // Result code: 0 = success, non-zero = error (mirrors pc::ErrorCode).
     int16_t errorCode     = 0;
 
-    // Whether the gateway should enqueue a deferred ack (acks=All) instead of
-    // sending immediately.  True only when the produce was appended successfully
-    // AND acks=All AND replica is set AND committedMetadataReady is true.
+    // F15 S2 (review m6): on a ProduceResult, true means "FACTS ONLY, NO
+    // ANSWER" — the owning worker's copy of a SUCCESSFUL append (errorCode 0)
+    // that it parks the answer of (acks=all: emitted at append; Strict: at fsync
+    // completion), so the gateway's PSM / LsoTracker / dirty-log mirrors learn
+    // it.  Every answer (OK or error) has deferAck == false; an error result
+    // never carries it.  TEMPORARY: deleted with the mirrors by S4 (LSO) and S5
+    // (PSM).  (On the op side, WorkerOp::deferAck still means "acks=all".)
     bool    deferAck      = false;
 
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never

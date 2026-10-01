@@ -204,7 +204,8 @@ TEST(AsyncDurability, StrictProduceAcksOnlyAfterFlushCompletion) {
     h.worker->doWork(/*nowNs=*/1);
     EXPECT_EQ(h.drainReturns(), 0)
         << "Strict produce ack must wait for fsync completion — must not fire immediately";
-    EXPECT_EQ(h.factsReturns, 1) << "the append-time facts-only return (no answer)";
+    EXPECT_EQ(h.factsReturns, 0)
+        << "Strict facts wait for the fsync (never applied for non-durable data)";
 
     // Spin doWork until the completion is reaped and the ack fires.
     int acks = 0;
@@ -214,6 +215,7 @@ TEST(AsyncDurability, StrictProduceAcksOnlyAfterFlushCompletion) {
     }
 
     ASSERT_EQ(acks, 1) << "Exactly one ProduceResult must be acked after flush completes";
+    EXPECT_EQ(h.factsReturns, 1) << "the facts-only return is emitted at fsync completion";
     EXPECT_EQ(h.lastReturn.errorCode, 0) << "Successful fsync must yield errorCode == OK";
     EXPECT_EQ(h.lastReturn.lastOffset, 3)
         << "lastOffset must be base(0) + lastOffsetDelta(3) = 3 for 4 records";

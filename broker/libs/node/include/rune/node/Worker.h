@@ -993,9 +993,7 @@ private:
                     if (entry.token == kNoToken && entry.logPtr == log) {
                         entry.ret.errorCode = static_cast<int16_t>(6); // Internal
                         enqueueReturn_(entry.ret);
-                        // O(1) erase by swap-with-back.
-                        durablePending_[i] = std::move(durablePending_.back());
-                        durablePending_.pop_back();
+                        eraseDurable_(i);   // O(1) swap-with-back
                         ++work;
                         // Do NOT advance i — the swapped entry must be checked.
                     } else {
@@ -1104,8 +1102,7 @@ private:
                     continue;
                 }
                 fireDurable_(entry);
-                durablePending_[i] = std::move(durablePending_.back());
-                durablePending_.pop_back();
+                eraseDurable_(i);
                 ++fired;
             } else {
                 ++i;
@@ -1528,7 +1525,11 @@ private:
         ret.sessionId     = op.sessionId();
         ret.correlationId = op.correlationId();
         ret.partition     = partition;
-        ret.deferAck      = op.deferAck() != 0;
+        // F15 S2 fix round 2 (B1): a worker result is an ANSWER (deferAck false)
+        // unless it is the append-time facts-only copy emitted below — never
+        // inherit op.deferAck (an error result marked deferAck would be taken
+        // for facts by the gateway: no answer, mirrors poisoned).
+        ret.deferAck      = false;
         ret.replica       = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
         ret.targetReplicaId = op.targetReplicaId();
         ret.incarnation     = op.incarnation();
@@ -1592,7 +1593,8 @@ private:
         // A produce whose answer is PARKED (acks=all on the HW, Strict on its
         // fsync) also emits an append-time facts-only return (see below): it
         // needs TWO return slots — the facts now, the final answer later.
-        const bool parks = acksAll || (op.durabilityTier() == 2 && log->isDiskBacked());
+        const bool strict = op.durabilityTier() == 2 && log->isDiskBacked();
+        const bool parks  = acksAll || strict;
         if (parks && !ackReservationAvailable_(/*returnsNow=*/1)) [[unlikely]] {
             ++acksAllRefusedNoReservation_;
             if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
@@ -1725,22 +1727,18 @@ private:
         // its fsync, or when the HW passes it) — the final result is final, the
         // gateway never parks it.
         ret.deferAck = false;
-        if (parks) [[unlikely]] {
+        if (acksAll && !strict) [[unlikely]] {
             // TEMPORARY (F15 S2 fix round 1, review C1; DELETED by S4 — LSO on
             // W — and S5 — PSM on W): until then the gateway still mirrors the
             // idempotent PSM, the LsoTracker and the dirty-log set for
             // gateway-received produces.  They must learn the append NOW, in the
             // same invocation as the append and before any ack decision — not
             // with the final answer, which comes a replication RTT later or as
-            // an error that carries no facts.  WorkerReturn::deferAck == true
-            // means "facts only, no answer".  The final result then carries no
-            // facts (producerId -1, no attrs): never applied twice.
-            WorkerReturn facts = ret;
-            facts.deferAck  = true;
-            facts.errorCode = 0;
-            enqueueReturn_(facts);   // slot reserved above (ackReservationAvailable_(1))
-            ret.producerId = -1;
-            ret.batchAttrs = 0;
+            // an error that carries no facts (pre-S2 semantics for acks=all).
+            // A Strict produce's facts wait for its fsync (fireDurable_, ruling
+            // of re-review 1): a duplicate is never answered OK for data that
+            // is not durable.
+            emitFactsOnly_(ret);   // slot reserved above (ackReservationAvailable_(1))
         }
 
         // E3 Task 5: Strict durability tier — defer ack until fsync completion is reaped.
@@ -1752,7 +1750,7 @@ private:
         // After ALL this-cycle produces are appended (drainIngress_ returns),
         // submitCoalescedFlushes_() submits ONE io_.submit per dirty log and stamps
         // the resulting token onto every pending entry for that log.
-        if (op.durabilityTier() == 2 && log->isDiskBacked()) {
+        if (strict) {
             ret.errorCode = 0; // tentatively OK; updated in submitCoalescedFlushes_ or on completion
             // token=0 means "not yet submitted" — reapDurableCompletions_ will never fire this.
             // F15 R-4b: a Strict acks=all ack waits for its fsync, THEN the HW
@@ -1767,6 +1765,8 @@ private:
             dp.replica     = replica;
             dp.logGen      = replica ? replica->logGeneration() : 0;
             dp.minIsr      = acksAll ? (op.minIsr() > 0 ? op.minIsr() : replica->minIsr()) : 1;
+            dp.factsOwed   = true;   // TEMPORARY (S5): facts emitted at fsync completion
+            ++strictFactsOwed_;      // reserved above (ackReservationAvailable_(1))
             durablePending_.push_back(std::move(dp));
 
             // Record this log as dirty for this cycle (dedup).
@@ -2586,6 +2586,10 @@ private:
         rune::replication::PartitionReplica* replica = nullptr;
         uint64_t                logGen     = 0;
         int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
+        /// TEMPORARY (F15 S2 fix round 2; deleted by S5): a gateway-routed
+        /// Strict produce owes the gateway its facts-only return, emitted at
+        /// fsync completion (fireDurable_) — counted in strictFactsOwed_.
+        bool                    factsOwed  = false;
     };
     std::vector<DurablePending> durablePending_;
 
@@ -2735,6 +2739,9 @@ private:
     int64_t passNowNs_ = 0;
     // F15 S2 (R-4c): gateway-routed acks=all refused for lack of a reservation.
     uint64_t acksAllRefusedNoReservation_ = 0;
+    // TEMPORARY (F15 S2 fix round 2; deleted by S5): durablePending_ entries
+    // whose facts-only return is still owed (DurablePending::factsOwed).
+    int64_t strictFactsOwed_ = 0;
 
     // E5.1.3 (d) R7 fix: last time syncOwnedLogs_ was run (ns). 0 = never.
     // Worker-thread only — no atomic needed.
@@ -2944,7 +2951,7 @@ private:
             ret.correlationId = op.correlationId();
             ret.partition     = op.partition();
             ret.topicId       = op.topicId();
-            ret.deferAck      = op.deferAck() != 0;
+            ret.deferAck      = false;   // an answer, never facts-only (F15 S2 fix round 2, B1)
             ret.producerId    = op.producerId();
             ret.producerEpoch = op.producerEpoch();
             ret.baseSequence  = op.baseSequence();
@@ -3224,6 +3231,15 @@ private:
     }
     void fireDurable_(DurablePending& entry) {
         durableAckToken_ = entry.token;
+        // TEMPORARY (F15 S2 fix round 2, Strict ruling; deleted by S5): the
+        // batch is now durable — hand the gateway mirrors its facts (before the
+        // §3.2 validation: the batch was appended and is durable either way;
+        // for Strict-then-HW, before the HW wait).
+        if (entry.factsOwed) {
+            entry.factsOwed = false;
+            --strictFactsOwed_;
+            emitFactsOnly_(entry.ret);
+        }
         // F15 §3.2: a durable ack may fire OK only while this worker still owns
         // the replica, it is still Leader and the acked content is unchanged —
         // a Strict ack whose fsync completes after a demotion fails NotLeader.
@@ -3259,8 +3275,7 @@ private:
             auto& entry = durablePending_[i];
             if (entry.awaitSeal && entry.logPtr == slot.log) {
                 fireDurable_(entry);
-                durablePending_[i] = std::move(durablePending_.back());
-                durablePending_.pop_back();
+                eraseDurable_(i);
             } else {
                 ++i;
             }
@@ -3291,10 +3306,9 @@ private:
     void failOwnPending_(const rune::storage::Log* log, int16_t code, bool includeAcksAll) {
         for (std::size_t i = 0; i < durablePending_.size(); ) {
             if (durablePending_[i].logPtr == log) {
-                durablePending_[i].ret.errorCode = code;
+                durablePending_[i].ret.errorCode = code;   // an error carries no facts (deferAck false)
                 enqueueReturn_(durablePending_[i].ret);
-                durablePending_[i] = std::move(durablePending_.back());
-                durablePending_.pop_back();
+                eraseDurable_(i);
             } else {
                 ++i;
             }
@@ -3564,8 +3578,27 @@ private:
 
     // F15 S2 (R-4c): one more owed ack (fires into ret_ later) still fits the
     // G-A6 return-ring reservation — the same rule the shard-ingress poll uses.
-    // `returnsNow` = extra returns the caller enqueues right away (the
-    // append-time facts-only return) on top of the owed answer.
+    // TEMPORARY (F15 S2 fix rounds 1-2; deleted by S4/S5): emit the facts-only
+    // copy of a successful append (deferAck == true, errorCode 0) and strip the
+    // facts from `ret` (producerId -1, no attrs) so the final answer never
+    // re-applies them.  The caller has reserved the slot.
+    void emitFactsOnly_(WorkerReturn& ret) {
+        WorkerReturn facts = ret;
+        facts.deferAck  = true;
+        facts.errorCode = 0;
+        enqueueReturn_(facts);
+        ret.producerId = -1;
+        ret.batchAttrs = 0;
+    }
+    // O(1) swap-with-back erase of durablePending_[i], keeping strictFactsOwed_
+    // exact (an entry dropped with facts still owed releases its reservation).
+    void eraseDurable_(std::size_t i) noexcept {
+        if (durablePending_[i].factsOwed) --strictFactsOwed_;
+        durablePending_[i] = std::move(durablePending_.back());
+        durablePending_.pop_back();
+    }
+    // `returnsNow` = extra returns the caller owes on top of the answer (the
+    // facts-only return: now for acks=all, at fsync completion for Strict).
     [[nodiscard]] bool ackReservationAvailable_(int64_t returnsNow = 0) const noexcept {
         return ret_.freeSlotsForMsgSize(ackSlotBytes_) >
                reservedAckSlots_() + static_cast<int64_t>(retOverflow_.size()) + returnsNow;
@@ -3629,7 +3662,8 @@ private:
     // gateway-routed acks=all / Strict produces park on this worker too.
     [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
         return static_cast<int64_t>(pendingAcksAll_.size()) +
-               static_cast<int64_t>(durablePending_.size());
+               static_cast<int64_t>(durablePending_.size()) +
+               strictFactsOwed_;   // TEMPORARY (S5): owed Strict facts-only returns
     }
 
     int pollWorkerIngress_(int64_t nowNs) {
