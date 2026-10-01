@@ -1701,6 +1701,44 @@ TEST(NodeConfigRegression, AeronDirHonorsRuneAeronDirEnv) {
     EXPECT_EQ(res.config->effectiveAeronDir(), "/dev/shm/rune-node-0-aeron");
 }
 
+// The embedded Aeron driver runs with dir_delete_on_start + delete-on-shutdown and
+// recursively deletes its directory. An Aeron dir equal to (or an ancestor of) the
+// data dir would wipe every log segment, so it must be refused at parse time.
+TEST(NodeConfigRegression, AeronDirEqualToDataDirRefused) {
+    auto base = base1node();
+    base["RUNE_AERON_DIR"] = "/data/rune";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    EXPECT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("RUNE_AERON_DIR"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigRegression, AeronDirAncestorOfDataDirRefused) {
+    for (const char* bad : {"/data", "/data/", "/data/rune/..", "/data/./rune/", "/"}) {
+        auto base = base1node();
+        base["RUNE_AERON_DIR"] = bad;
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        EXPECT_FALSE(res.config.has_value()) << "accepted dangerous RUNE_AERON_DIR=" << bad;
+    }
+}
+
+TEST(NodeConfigRegression, AeronDirSiblingOrChildOfDataDirAccepted) {
+    for (const char* ok : {"/data/rune/aeron", "/data/rune-aeron", "/dev/shm/rune-0"}) {
+        auto base = base1node();
+        base["RUNE_AERON_DIR"] = ok;
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        EXPECT_TRUE(res.config.has_value()) << ok << ": " << res.error;
+    }
+}
+
+TEST(NodeConfigRegression, ValidateAeronDirCatchesProgrammaticConfig) {
+    rune::node::NodeConfig cfg;
+    cfg.dataDir  = "/data/rune";
+    cfg.aeronDir = "/data";
+    EXPECT_TRUE(cfg.validateAeronDir().has_value());
+    cfg.aeronDir = "";  // default → dataDir/aeron, always safe
+    EXPECT_FALSE(cfg.validateAeronDir().has_value());
+}
+
 TEST(NodeConfig, PeerWorkerCountDefaultsToZero) {
     // PeerConfig::workerCount defaults to 0 (unknown) for peers parsed from RUNE_PEERS.
     auto res = rune::node::parseNodeConfig(fakeEnv(base3node()));

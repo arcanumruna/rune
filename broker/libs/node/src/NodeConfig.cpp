@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <filesystem>
 #include <optional>
 #include <cstdlib>
 #include <sstream>
@@ -239,6 +240,40 @@ std::string NodeConfig::clientBindHost() const {
     const auto colon = hp.rfind(':');
     return std::string(colon == std::string_view::npos ? hp : hp.substr(0, colon));
 }
+namespace {
+// Absolute, symlink-resolved (for the existing prefix), lexically normal, with no
+// trailing empty element, so "/a/b/", "/a/./b" and "/a/b/c/.." compare equal.
+std::filesystem::path normalizedDir(const std::string& p) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path abs = fs::absolute(p, ec);
+    if (ec) abs = fs::path{p};
+    fs::path canon = fs::weakly_canonical(abs, ec);
+    fs::path out = (ec ? abs : canon).lexically_normal();
+    if (!out.has_filename() && out != out.root_path()) out = out.parent_path();
+    return out;
+}
+} // namespace
+
+std::optional<std::string> NodeConfig::validateAeronDir() const {
+    if (aeronDir.empty()) return std::nullopt;   // default dataDir/aeron is always safe
+    const auto a = normalizedDir(aeronDir);
+    if (a == a.root_path())
+        return "RUNE_AERON_DIR must not be a filesystem root (" + aeronDir +
+               "): the embedded Aeron driver deletes its directory on start/shutdown";
+    if (dataDir.empty()) return std::nullopt;
+    const auto d = normalizedDir(dataDir);
+    auto ai = a.begin();
+    auto di = d.begin();
+    for (; ai != a.end() && di != d.end(); ++ai, ++di)
+        if (*ai != *di) return std::nullopt;     // diverged → neither contains the other
+    if (ai == a.end())                           // aeronDir == dataDir or is its ancestor
+        return "RUNE_AERON_DIR (" + aeronDir + ") equals or contains RUNE_DATA_DIR (" +
+               dataDir + "): the embedded Aeron driver recursively deletes its directory "
+               "on start/shutdown and would wipe the log";
+    return std::nullopt;
+}
+
 // Shard channel helpers are only meaningful after validateShardConfig() passed
 // (shard mode, explicit base ports, w in [0, W)).  Called on anything else they
 // refuse loudly (logic_error) instead of dereferencing an unset optional or
@@ -503,6 +538,7 @@ ConfigResult parseNodeConfig(
     cfg.replBaseStreamId        = replBaseStreamId;
     // RUNE_AERON_DIR (optional): Aeron dir override (empty → dataDir/aeron).
     if (const char* ad = getenv_fn("RUNE_AERON_DIR")) cfg.aeronDir = ad;
+    if (auto err = cfg.validateAeronDir()) return {{}, *err};
 
     // E5.1: resolve workerIngressBaseStreamId — default to clientStreamId+1 when unset.
     cfg.workerIngressBaseStreamId = (workerIngressBaseStreamId == 0)

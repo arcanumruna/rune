@@ -165,6 +165,39 @@ TEST(BrokerNodeTest, SingleNode_SelfElects) {
     node.stop();
 }
 
+// Boot-level proof that every driver/client site honours aeronDir (the parse-level
+// NodeConfigRegression tests can't see BrokerNode's call sites).
+TEST(BrokerNodeRegression, AeronDirOverrideIsWhereTheDriverRuns) {
+    TempDir data{"aerondir_data_"};
+    TempDir aeron{"aerondir_aeron_"};
+    NodeConfig cfg = makeSingleNodeConfig(data.path);
+    cfg.aeronDir = (aeron.path / "a").string();
+
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(2s));
+    EXPECT_TRUE(fs::exists(fs::path{cfg.aeronDir} / "cnc.dat"))
+        << "driver must run in the configured RUNE_AERON_DIR";
+    EXPECT_FALSE(fs::exists(data.path / "aeron" / "cnc.dat"))
+        << "no driver may fall back to dataDir/aeron when aeronDir is set";
+    node.stop();
+}
+
+// An Aeron dir equal to the data dir would be recursively deleted by the driver
+// (dir_delete_on_start) — start() must refuse before any side effect.
+TEST(BrokerNodeRegression, AeronDirEqualToDataDirRefusedAtStartLogSurvives) {
+    TempDir data{"aerondir_same_"};
+    fs::create_directories(data.path);
+    const auto sentinel = data.path / "00000000000000000000.log";
+    { std::ofstream(sentinel) << "segment"; }
+
+    NodeConfig cfg = makeSingleNodeConfig(data.path);
+    cfg.aeronDir = data.path.string();
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_TRUE(fs::exists(sentinel)) << "refusal must happen before the driver deletes anything";
+}
+
 // ===========================================================================
 // TEST 2: Clean shutdown — stop() twice is safe (idempotent)
 // ===========================================================================
