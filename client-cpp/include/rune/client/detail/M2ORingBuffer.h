@@ -54,6 +54,7 @@ public:
         m_headPositionIndex         = m_capacity + HEAD_POSITION_OFFSET;
         m_correlationIdCounterIndex = m_capacity + CORRELATION_COUNTER_OFFSET;
         m_consumerHeartbeatIndex    = m_capacity + CONSUMER_HEARTBEAT_OFFSET;
+        m_closedIndex               = m_capacity + CLOSED_OFFSET;
     }
 
     M2ORingBuffer(const M2ORingBuffer&)            = delete;
@@ -71,20 +72,33 @@ public:
     static constexpr aeron::util::index_t trailerLength() { return TRAILER_LENGTH; }
 
     /// Aeron ManyToOneRingBuffer::consumerHeartbeatTime: the single consumer
-    /// publishes its liveness (release store) so producers can tell a slow
-    /// consumer from a dead one — the ring primitive's own atomic, no other
-    /// shared state (spec §1a.1).  Uses storeRelease64_/loadAcquire64_ (the
-    /// __atomic builtins this class already uses for head/tail/length), NOT
-    /// AtomicBuffer::putInt64Ordered/getInt64Volatile (plain volatile + asm
-    /// barrier): the latter is invisible to ThreadSanitizer, which reported a
-    /// data race between this store and the cross-thread load in
-    /// ProducerImpl::sendBlocking even though the ordering was correct on
-    /// x86-64 — same reasoning as the class-level comment below.
+    /// publishes its liveness so producers can tell a slow consumer from a dead
+    /// one — a backstop ONLY for a wedged runner (fix1 I5: a cleanly closed
+    /// Client is decided by closed(), below, never by this timer).  It publishes
+    /// nothing else (no other memory is ordered against it), so both sides use a
+    /// RELAXED __atomic op (fix1 minor 9) — still visible to ThreadSanitizer,
+    /// unlike AtomicBuffer::putInt64Ordered/getInt64Volatile (plain volatile +
+    /// asm barrier), which is invisible to it (see the class-level comment
+    /// below) and caused a reported data race against the correct ordering.
     void consumerHeartbeatTime(std::int64_t timeNs) noexcept {
-        storeRelease64_(m_consumerHeartbeatIndex, timeNs);
+        storeRelaxed64_(m_consumerHeartbeatIndex, timeNs);
     }
     [[nodiscard]] std::int64_t consumerHeartbeatTime() const noexcept {
-        return loadAcquire64_(m_consumerHeartbeatIndex);
+        return loadRelaxed64_(m_consumerHeartbeatIndex);
+    }
+
+    /// fix1 C2/I3: a "this producer's Client is gone" word in the ring trailer,
+    /// symmetric with consumerHeartbeatTime — the ring's own state, no other
+    /// shared memory. Set once (release store) by Client::closeImpl_ while the
+    /// Client is still fully valid (before any pump-hook context can dangle);
+    /// trySubmit() / sendBlocking() check it (acquire load) so a Producer that
+    /// outlives its Client gets SendResult::Closed instead of ever touching the
+    /// (by then invalid) pump hook — no use-after-free, no silent accept.
+    void closed(bool v) noexcept {
+        storeRelease64_(m_closedIndex, v ? 1 : 0);
+    }
+    [[nodiscard]] bool closed() const noexcept {
+        return loadAcquire64_(m_closedIndex) != 0;
     }
 
     // ------------------------------------------------------------------
@@ -198,8 +212,12 @@ public:
         std::int64_t head = m_buffer.getInt64(headPositionIndex);
         const aeron::util::index_t capacity = m_capacity;
         aeron::util::index_t headIndex = static_cast<std::int32_t>(head) & (capacity - 1);
-        const aeron::util::index_t maxBlockLength = capacity - headIndex;
+        aeron::util::index_t maxBlockLength = capacity - headIndex;
         aeron::util::index_t bytesRead = 0;
+        // fix1 I6: at most ONE end-of-buffer padding region can exist per wrap
+        // (claimCapacity only pads the tail-end gap once), so at most one
+        // same-call continuation past it is ever needed.
+        bool canWrapOnce = true;
 
         ScopeExit cleanup([&]() {
             if (bytesRead > 0) {
@@ -208,35 +226,57 @@ public:
             }
         });
 
-        while ((bytesRead < maxBlockLength) && (messagesRead < messageCountLimit)) {
-            const aeron::util::index_t recordIndex = headIndex + bytesRead;
-            const std::int32_t recordLength =
-                loadAcquire32_(RD::RecordDescriptor::lengthOffset(recordIndex));
-            if (recordLength <= 0) break;
+        for (;;) {
+            bool stop = false;
+            while ((bytesRead < maxBlockLength) && (messagesRead < messageCountLimit)) {
+                const aeron::util::index_t recordIndex = headIndex + bytesRead;
+                const std::int32_t recordLength =
+                    loadAcquire32_(RD::RecordDescriptor::lengthOffset(recordIndex));
+                if (recordLength <= 0) { stop = true; break; }
 
-            const aeron::util::index_t alignedLength =
-                aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
-            bytesRead += alignedLength;
+                const aeron::util::index_t alignedLength =
+                    aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
+                bytesRead += alignedLength;
 
-            const std::int32_t msgTypeId =
-                m_buffer.getInt32(RD::RecordDescriptor::typeOffset(recordIndex));
-            if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) continue;
+                const std::int32_t msgTypeId =
+                    m_buffer.getInt32(RD::RecordDescriptor::typeOffset(recordIndex));
+                if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) continue;
 
-            const ControlledAction action =
-                handler(msgTypeId, m_buffer,
-                        RD::RecordDescriptor::encodedMsgOffset(recordIndex),
-                        recordLength - RD::RecordDescriptor::HEADER_LENGTH);
+                const ControlledAction action =
+                    handler(msgTypeId, m_buffer,
+                            RD::RecordDescriptor::encodedMsgOffset(recordIndex),
+                            recordLength - RD::RecordDescriptor::HEADER_LENGTH);
 
-            if (action == ControlledAction::ABORT) { bytesRead -= alignedLength; break; }
-            ++messagesRead;
-            if (action == ControlledAction::BREAK) break;
-            if (action == ControlledAction::COMMIT) {
+                if (action == ControlledAction::ABORT) { bytesRead -= alignedLength; stop = true; break; }
+                ++messagesRead;
+                if (action == ControlledAction::BREAK) { stop = true; break; }
+                if (action == ControlledAction::COMMIT) {
+                    m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
+                    storeRelease64_(headPositionIndex, head + bytesRead);
+                    headIndex += bytesRead;
+                    head      += bytesRead;
+                    bytesRead = 0;
+                }
+            }
+            if (stop) break;
+            // The block [headIndex, headIndex+maxBlockLength) is fully consumed
+            // with budget left (messagesRead < messageCountLimit) and NOTHING
+            // real was found (messagesRead == 0): it was pure wrap-around
+            // padding. Continue from index 0 in THIS SAME call instead of
+            // returning 0 — a caller that treats 0 as "ring empty, nothing to
+            // do this cycle" would otherwise wait a full extra cycle for
+            // records that are already sitting right past the wrap.
+            if (canWrapOnce && messagesRead == 0 && bytesRead == maxBlockLength && bytesRead > 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
                 storeRelease64_(headPositionIndex, head + bytesRead);
-                headIndex += bytesRead;
-                head      += bytesRead;
-                bytesRead = 0;
+                head          += bytesRead;
+                headIndex      = 0;
+                maxBlockLength = capacity;
+                bytesRead      = 0;
+                canWrapOnce    = false;
+                continue;
             }
+            break;
         }
         return messagesRead;
     }
@@ -249,7 +289,8 @@ private:
     static constexpr aeron::util::index_t HEAD_POSITION_OFFSET       = CL * 6;
     static constexpr aeron::util::index_t CORRELATION_COUNTER_OFFSET = CL * 8;
     static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10;
-    static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 12;
+    static constexpr aeron::util::index_t CLOSED_OFFSET              = CL * 12;
+    static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 14;
     static constexpr aeron::util::index_t INSUFFICIENT_CAPACITY      = -2;
 
     // Minimal template-based scope guard (no std::function, no heap alloc).
@@ -288,6 +329,14 @@ private:
     }
     void storeRelease64_(aeron::util::index_t off, std::int64_t v) noexcept {
         __atomic_store_n(word64_(off), v, __ATOMIC_RELEASE);
+    }
+    // fix1 minor 9: the heartbeat word orders nothing else, so RELAXED is
+    // sufficient — still an __atomic op (visible to TSan), just the cheapest one.
+    [[nodiscard]] std::int64_t loadRelaxed64_(aeron::util::index_t off) const noexcept {
+        return __atomic_load_n(word64_(off), __ATOMIC_RELAXED);
+    }
+    void storeRelaxed64_(aeron::util::index_t off, std::int64_t v) noexcept {
+        __atomic_store_n(word64_(off), v, __ATOMIC_RELAXED);
     }
     bool compareAndSet64_(aeron::util::index_t off, std::int64_t expected,
                           std::int64_t desired) noexcept {
@@ -401,6 +450,7 @@ private:
     aeron::util::index_t m_tailPositionIndex        = 0;
     aeron::util::index_t m_correlationIdCounterIndex = 0;
     aeron::util::index_t m_consumerHeartbeatIndex   = 0;
+    aeron::util::index_t m_closedIndex              = 0;
 };
 
 } // namespace rune::client::detail

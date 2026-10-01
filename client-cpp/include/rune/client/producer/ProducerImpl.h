@@ -206,6 +206,24 @@ struct PendingAck {
 };
 
 // ---------------------------------------------------------------------------
+// PumpResult — fix1 C1: outcome of ProducerImpl's pump hook (see PumpFn below).
+// A 3-way result so a back-pressured blocking send() never waits on itself AND
+// never silently spins forever when pumping would re-enter the agent's own poll:
+//   Pumped          — the hook ran one duty cycle; retry trySubmit immediately.
+//   DeclinedInCycle — called from INSIDE a duty-cycle callback (Invoker owner's
+//                     or Thread mode's runner thread, already mid-cycle):
+//                     pumping would recursively re-enter the agent's own poll.
+//                     sendBlocking throws immediately — no spin, no waiting out
+//                     its own heartbeat (which it IS, so it would never move).
+//   NotOwner        — the calling thread is not the duty-cycle thread (Thread
+//                     mode's ordinary app thread, or a foreign thread touching
+//                     an Invoker producer off its owner thread): a genuinely
+//                     separate thread may still drain the ring in real time, so
+//                     sendBlocking falls back to the heartbeat-bounded wait.
+// ---------------------------------------------------------------------------
+enum class PumpResult : uint8_t { Pumped, DeclinedInCycle, NotOwner };
+
+// ---------------------------------------------------------------------------
 // ProducerImpl
 // ---------------------------------------------------------------------------
 class ProducerImpl {
@@ -240,37 +258,53 @@ public:
                           bool wantAck,
                           int64_t correlationId) noexcept;
 
-    /// Non-blocking submit (ZERO allocation, lock-free): validates the value
-    /// size, then writes the SEND_RECORD. Never drops silently — see SendResult.
+    /// Non-blocking submit (ZERO allocation, lock-free): checks the ring's closed
+    /// word FIRST (fix1 C2/I3 — a Producer outliving its closed Client gets
+    /// Closed, never touching the pump hook's now-dangling context), then
+    /// validates the value size against both kMaxSendValueBytes AND the ring's
+    /// own maxMsgLength (fix1 minor 11 — a message too big for a small ring maps
+    /// to ValueTooLarge, not BackPressured, so it can never livelock a retry),
+    /// then writes the SEND_RECORD. Never drops silently — see SendResult.
     [[nodiscard]] SendResult trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                        std::span<const uint8_t> value, int64_t ackHandle) noexcept;
 
     /// Slow path of the void send: retries until accepted; throws on non-retryable
-    /// results. In Invoker mode (pumpFn_ wired by Client::producer()), a
-    /// BackPressured retry pumps the owning Client's duty cycle instead of idling
-    /// on the ring's consumer heartbeat (the owner thread IS that consumer, so
-    /// waiting on it would wait on itself forever); the hook declines (returns
-    /// false) when pumping would be unsafe (inside a duty-cycle callback, or off
-    /// the owner thread), in which case this throws immediately rather than spin.
-    /// With no pump hook wired (Thread mode, or a bare ProducerImpl in a test),
-    /// it backs off and bounds the wait by the ring's consumerHeartbeatTime vs.
-    /// agentLivenessTimeoutMs.
+    /// results (see Producer.h's send() doc for the exact exception per case).
+    /// On BackPressured: if a pump hook is wired, it decides (see PumpResult) —
+    /// Pumped retries immediately (no idle), DeclinedInCycle throws immediately
+    /// (never spins, never waits out its own heartbeat), NotOwner falls back to
+    /// the heartbeat-bounded wait below, same as "no hook wired" (Thread mode's
+    /// ordinary app thread, or a bare ProducerImpl in a test). The ring's closed
+    /// word is checked before EVERY pump attempt and in the wait loop, so a
+    /// concurrent close() is decided immediately — never by waiting out the
+    /// timeout (fix1 C2/I3).
     void sendBlocking(SendResult first, int32_t topicId, int32_t partition, const Key& key,
                       std::span<const uint8_t> value);
 
     using ClockFn = int64_t (*)() noexcept;
     void setClockForTesting(ClockFn fn) noexcept { clock_ = fn; }
 
-    /// Invoker-mode pump hook, wired by Client::producer(): called from
-    /// sendBlocking() on BackPressured. Returns true if it pumped the duty cycle
-    /// (retry immediately), false if pumping is unsafe right now (the hook
-    /// enforces its own gate — owner thread, not already inside a duty-cycle
-    /// callback) — sendBlocking then fails fast instead of spinning. A plain
-    /// function pointer + opaque context: no std::function, no virtual call,
-    /// no new atomics (shared-nothing: this is set once, before any send(), by
-    /// the single thread that owns the producer).
-    using PumpFn = bool (*)(void* ctx) noexcept;
+    /// Pump hook, wired by Client::producer() in BOTH runner modes (fix1 C1):
+    /// called from sendBlocking() on BackPressured, checked AFTER the ring's
+    /// closed word (never invoked once closed — the hook's context, the Client,
+    /// may be destroyed by then). A plain function pointer + opaque context: no
+    /// std::function, no virtual call, no new atomics (shared-nothing: this is
+    /// set once, before any send(), by the single thread that owns the producer).
+    using PumpFn = PumpResult (*)(void* ctx) noexcept;
     void setPumpFn(PumpFn fn, void* ctx) noexcept { pumpFn_ = fn; pumpCtx_ = ctx; }
+
+    /// fix1 minor 9: publish the ring's consumer-liveness heartbeat ONCE per
+    /// duty cycle (called by ProducerHub::drainAndFlush before its drainRing()
+    /// retry loop), not once per drainRing() call (which can run up to 256x/cycle
+    /// per producer) — a relaxed store either way (see M2ORingBuffer), just
+    /// cheaper to do it once.
+    void publishHeartbeat(int64_t nowNs) noexcept { ring_.consumerHeartbeatTime(nowNs); }
+
+    /// fix1 C2/I3: mark this producer's ring closed. Called by Client::closeImpl_
+    /// on every still-registered producer WHILE the Client is fully valid (before
+    /// the pump hook's context, `this` Client, can ever dangle). Idempotent;
+    /// safe to call from the duty-cycle thread only (matches close()'s contract).
+    void markRingClosed() noexcept { ring_.closed(true); }
 
     /// Write a flush trigger into the ring.  Zero-alloc.
     void submitFlush() noexcept;

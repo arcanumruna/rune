@@ -515,3 +515,79 @@ TEST(InvokerClient, BlockingSendFromDutyCycleCallbackThrowsRegression) {
     EXPECT_TRUE(ranAtAll);
     EXPECT_TRUE(threwInCallback);
 }
+
+// Regression (fix1 C1): same scenario, but the handler does NOT catch. The
+// process must survive (Client::invokeUserCallback_ catches around the
+// callback dispatch), and the exception count must reflect it.
+TEST(InvokerClient, BlockingSendFromCallbackDoesNotTerminateInvokerRegression) {
+    Rig r(invokerCfg(3784, 3785));
+    bool ran = false;
+    r.client.onConnected([&](int64_t) {
+        ran = true;
+        rc::ProducerConfig pcfg;
+        pcfg.acks     = rc::Acks::None;
+        pcfg.lingerUs = 0;
+        auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
+        auto topic = r.client.topic("t");
+        uint64_t ok = 0;
+        for (; ok < 10'000; ++ok) {
+            if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+        }
+        p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)); // NOT wrapped in try/catch
+    });
+    r.connect();
+    EXPECT_TRUE(ran);
+    EXPECT_GT(r.client.testCallbackExceptionCount(), 0u);
+    // The duty-cycle thread (the test thread, in Invoker mode) survived: the
+    // client is still fully usable.
+    ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() >= 1; }));
+}
+
+// ---------------------------------------------------------------------------
+// Task 13 fix1 C2/I3: a ring "closed" word, so a Producer that outlives (or
+// races) its Client's close() gets Closed, never a use-after-free / silent
+// accept.
+// ---------------------------------------------------------------------------
+
+TEST(InvokerClient, SendAfterClientCloseReturnsClosedRegression) {
+    Rig r(invokerCfg(3786, 3787));
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::None;
+    auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
+    auto topic = r.client.topic("t");
+    uint64_t ok = 0;
+    for (; ok < 10'000; ++ok) {
+        if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+    }
+    ASSERT_GT(ok, 0u);
+
+    r.client.close();
+
+    EXPECT_EQ(p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), rc::SendResult::Closed);
+    EXPECT_THROW(p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), std::logic_error);
+}
+
+// Destroy the Client entirely (not just close()) while a Producer outlives it,
+// then exercise the full back-pressure path (trySend to fill, blocking send()
+// to retry). trySubmit's closed-word check intercepts before sendBlocking ever
+// touches the pump hook's context (the destroyed Client) — no UAF. No ASan
+// build exists in this repo; this relies on TSan (run separately) plus a clean
+// pass here for the use-after-free proof.
+TEST(InvokerClient, ProducerOutlivesClientNoUseAfterFreeRegression) {
+    auto cfg = invokerCfg(3788, 3789);
+    auto client = std::make_unique<rc::Client>(cfg);
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::None;
+    auto p = client->testProducerWithRingCap(pcfg, 4 * 1024);
+    auto topic = client->topic("t");
+    uint64_t ok = 0;
+    for (; ok < 10'000; ++ok) {
+        if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
+    }
+    ASSERT_GT(ok, 0u);
+
+    client.reset(); // the Producer (shared_ptr<ProducerImpl>) survives
+
+    EXPECT_EQ(p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), rc::SendResult::Closed);
+    EXPECT_THROW(p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), std::logic_error);
+}

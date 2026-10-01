@@ -76,6 +76,10 @@ public:
     int drainAndFlush(int64_t nowNs, int64_t sessionId, const Sink& sink) {
         int work = 0;
         for (auto& impl : producers_) {
+            // fix1 minor 9: publish the consumer-liveness heartbeat ONCE per
+            // producer per cycle (not once per drainRing() call below, which can
+            // run up to 256x/cycle — same relaxed store either way, just cheaper).
+            impl->publishHeartbeat(nowNs);
             // Drain ONE message then flush, so flush() boundaries between sends are
             // honoured; bounded at 256 records per producer per cycle.
             static constexpr int kMaxInnerIters = 256;
@@ -96,6 +100,15 @@ public:
 
     /// Fail all pending acks on close.
     void failAll(const std::string& reason);
+
+    /// fix1 C2/I3: mark every registered producer's ring closed. Called by
+    /// Client::closeImpl_ while the Client (and its pump-hook contexts) are
+    /// still fully valid, before the transport is torn down — a Producer that
+    /// outlives this Client then gets SendResult::Closed from trySubmit() and
+    /// never touches the (by-then-dangling) pump hook.
+    void closeAllRings() noexcept {
+        for (auto& impl : producers_) impl->markRingClosed();
+    }
 
     /// Fail every record of the in-flight batch with this wire correlationId
     /// (forwards to ProducerImpl::failBatch; non-batch ids are ignored).

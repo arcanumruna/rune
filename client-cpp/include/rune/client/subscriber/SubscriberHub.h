@@ -183,6 +183,17 @@ public:
     /// Return the number of active (bound) subscriptions.
     [[nodiscard]] std::size_t activeCount() const;
 
+    /// fix1 C1: record handlers run inside the noexcept ClientAgent::doWork
+    /// chain (onRecords is called from Client::onEgressFrame); a throwing
+    /// handler is caught, counted here, and logged instead of terminating the
+    /// process. A relaxed atomic (not the single-writer plain counters
+    /// elsewhere in this class): a test thread polling this has no other way
+    /// to establish happens-before with the exception that is itself the
+    /// event being waited for.
+    [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept {
+        return callbackExceptions_.load(std::memory_order_relaxed);
+    }
+
 private:
     // ---- Routing tables (guarded by mtx_) ------------------------------------
     mutable std::mutex mtx_;
@@ -200,6 +211,9 @@ private:
     // Active subscriptions: SubscribeResponse received, subscriptionId bound.
     // Key: subscriptionId.
     std::map<int64_t, std::shared_ptr<SubscriptionImpl>> activeById_;
+
+    // fix1 C1: written on the agent thread (onRecords), read from a test thread.
+    std::atomic<uint64_t> callbackExceptions_ {0};
 };
 
 } // namespace rune::client::subscriber

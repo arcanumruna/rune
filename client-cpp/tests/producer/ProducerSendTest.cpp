@@ -23,6 +23,7 @@ using rune::client::SendResult;
 using rune::client::TopicHandle;
 using rune::client::producer::CountingSink;
 using rune::client::producer::ProducerImpl;
+using rune::client::producer::PumpResult;
 
 namespace {
 ProducerConfig voidCfg() {
@@ -58,11 +59,15 @@ uint64_t fillUntilBackPressured(Producer& p) {
 // Regression: Producer::send(void) returned silently when the producer ring was
 // full — the record was dropped.  It must back off until the runner drains.
 TEST(ProducerSend, VoidSendNeverDropsOnFullRingRegression) {
+    ProducerConfig cfg = voidCfg();
+    // fix1 minor 14: generous — this test's own drainer thread is the only
+    // consumer, and a loaded CI/TSan run can lag it enough to trip the default
+    // 1 s liveness window, turning a slow-but-fine drain into a spurious throw.
+    cfg.agentLivenessTimeoutMs = 30'000;
     std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, /*ringCap=*/4 * 1024);
+    auto impl = std::make_shared<ProducerImpl>(cfg, corr, /*ringCap=*/4 * 1024);
     Producer p(impl);
     constexpr uint64_t kRecords = 2000;
-    std::atomic<bool> sendsDone{false};
     std::thread drainer([&] {  // plays the runner thread
         uint64_t frames = 0, bytes = 0;
         const CountingSink sink{&frames, &bytes};
@@ -79,7 +84,6 @@ TEST(ProducerSend, VoidSendNeverDropsOnFullRingRegression) {
         }
     });
     for (uint64_t i = 0; i < kRecords; ++i) p.send(kTopic, Key(i), kVal);
-    sendsDone.store(true, std::memory_order_release);
     drainer.join();
     EXPECT_EQ(impl->recordsSent(), kRecords);
 }
@@ -104,7 +108,7 @@ TEST(ProducerSend, VoidSendThrowsWhenTheRunnerStopsDrainingRegression) {
     EXPECT_THROW(p.send(kTopic, Key(uint64_t{1}), kVal), std::runtime_error);
 }
 
-TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothing) {
+TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothingRegression) {
     std::atomic<int64_t> corr{1};
     auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
     Producer p(impl);
@@ -121,7 +125,7 @@ TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothing) {
     EXPECT_EQ(impl->recordsSent(), ok);
 }
 
-TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDropped) {
+TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDroppedRegression) {
     std::atomic<int64_t> corr{1};
     auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr);
     Producer p(impl);
@@ -130,6 +134,62 @@ TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDropped) {
     EXPECT_EQ(p.trySend(TopicHandle{}, Key(uint64_t{1}), kVal), SendResult::InvalidTopic);
     EXPECT_THROW(p.send(kTopic, Key(uint64_t{1}), tooBig), std::length_error);
     EXPECT_THROW(p.send(TopicHandle{}, Key(uint64_t{1}), kVal), std::invalid_argument);
+}
+
+// fix1 minor 11: a value that fits kMaxSendValueBytes but can never fit a tiny
+// ring's maxMsgLength must map to ValueTooLarge (not BackPressured) — otherwise
+// sendBlocking would retry it forever (nothing ever makes room for it).
+TEST(ProducerSend, ValueLargerThanRingMaxMsgLengthIsValueTooLargeNotBackPressuredRegression) {
+    std::atomic<int64_t> corr{1};
+    // Smallest usable ring: 64 B usable capacity -> maxMsgLength = 64/8 = 8 B,
+    // far smaller than kMaxSendValueBytes.
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, /*ringCap=*/64);
+    Producer p(impl);
+    const std::vector<uint8_t> val(32, 0x11); // fits kMaxSendValueBytes, not this ring
+    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), val), SendResult::ValueTooLarge);
+    EXPECT_THROW(p.send(kTopic, Key(uint64_t{1}), val), std::length_error);
+}
+
+// fix1 I6: a controlledRead() call that only consumes wrap-around padding must
+// not report 0 work while a real record waits right past the wrap — drainRing
+// must continue into it within the SAME call.
+TEST(ProducerSend, RingWrapPaddingDoesNotReportIdleRegression) {
+    std::atomic<int64_t> corr{1};
+    // 48-byte records (38-byte header + 2-byte value, aligned to 8): a 512 B
+    // ring holds exactly 10 (480 B) before the 11th hits real back-pressure
+    // (not the wrap case this test targets). Draining 5 reopens total capacity
+    // but leaves only 32 B contiguous to the physical buffer end, so the next
+    // send pads that remainder and wraps to offset 0 — the scenario under test.
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, /*ringCap=*/512);
+    Producer p(impl);
+    const std::vector<uint8_t> val(2, 0x22);
+    for (uint64_t i = 0; i < 10; ++i) {
+        ASSERT_EQ(p.trySend(kTopic, Key(i), val), SendResult::Ok);
+    }
+
+    uint64_t frames = 0, bytes = 0;
+    const CountingSink sink{&frames, &bytes};
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(impl->drainRing(1), 1);
+        impl->flushBatches(1, 42, sink);
+    }
+
+    // Wraps: physical tail is 32 B from the buffer end (< 48 B/record).
+    ASSERT_EQ(p.trySend(kTopic, Key(uint64_t{10}), val), SendResult::Ok);
+
+    // Drain records 5..9 normally, then the wrapped record 10 — whose
+    // drainRing() call first consumes ONLY the padding. Before the fix, that
+    // call returned 0 (reporting idle) even though record 10 sat right past
+    // the wrap; it must now be delivered within the SAME call.
+    constexpr uint64_t kTotal = 11;
+    for (int i = 0; i < 6 && impl->recordsSent() < kTotal; ++i) {
+        const int drained = impl->drainRing(1);
+        impl->flushBatches(1, 42, sink);
+        ASSERT_NE(drained, 0) << "drainRing reported idle (0) with "
+                              << (kTotal - impl->recordsSent())
+                              << " records still undrained — the ring-wrap padding false-idle regressed";
+    }
+    EXPECT_EQ(impl->recordsSent(), kTotal);
 }
 
 // ---------------------------------------------------------------------------
@@ -157,14 +217,14 @@ TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
         int           calls = 0;
     } ctx{impl.get()};
     impl->setPumpFn(
-        +[](void* raw) noexcept -> bool {
+        +[](void* raw) noexcept -> PumpResult {
             auto* c = static_cast<PumpCtx*>(raw);
             ++c->calls;
             uint64_t frames = 0, bytes = 0;
             const CountingSink sink{&frames, &bytes};
             c->impl->drainRing(steadyNs());
             c->impl->flushBatches(steadyNs(), 42, sink);
-            return true; // "owner thread, outside a duty-cycle callback": pump ran
+            return PumpResult::Pumped; // "owner thread, outside a duty-cycle callback"
         },
         &ctx);
 
@@ -172,10 +232,10 @@ TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
     EXPECT_GT(ctx.calls, 0) << "the pump hook must be used instead of idling on the heartbeat";
 }
 
-// Regression: when the pump hook DECLINES (e.g. called from inside a
-// duty-cycle callback, or off the owner thread — the hook itself enforces
-// that gate), the blocking send must fail FAST with std::runtime_error, never
-// spin and never silently wait out the liveness timeout.
+// Regression: when the pump hook DECLINES because we are inside a duty-cycle
+// callback (the hook itself enforces that gate), the blocking send must fail
+// FAST with std::runtime_error, never spin and never silently wait out the
+// liveness timeout.
 TEST(ProducerSend, VoidSendThrowsInsteadOfPumpingWhenPumpDeclinesRegression) {
     std::atomic<int64_t> corr{1};
     auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
@@ -185,12 +245,114 @@ TEST(ProducerSend, VoidSendThrowsInsteadOfPumpingWhenPumpDeclinesRegression) {
 
     int declineCalls = 0;
     impl->setPumpFn(
-        +[](void* raw) noexcept -> bool {
+        +[](void* raw) noexcept -> PumpResult {
             ++*static_cast<int*>(raw);
-            return false; // the hook's own gate said no (callback / non-owner thread)
+            return PumpResult::DeclinedInCycle; // e.g. called from inside a duty-cycle callback
         },
         &declineCalls);
 
     EXPECT_THROW(p.send(kTopic, Key(uint64_t{ok}), kVal), std::runtime_error);
     EXPECT_EQ(declineCalls, 1) << "must fail on the FIRST decline, never retry/spin";
+}
+
+// Regression (fix1 C1 3-way result): NotOwner falls back to the SAME
+// heartbeat-bounded wait as "no hook wired" — a genuinely separate thread
+// (Thread mode's app thread) may still drain the ring for real, so this must
+// NOT throw immediately the way DeclinedInCycle does.
+TEST(ProducerSend, VoidSendFallsBackToHeartbeatWaitWhenPumpReportsNotOwnerRegression) {
+    ProducerConfig cfg = voidCfg();
+    cfg.agentLivenessTimeoutMs = 5;
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    impl->setClockForTesting(+[]() noexcept -> int64_t {
+        static int64_t t = 0;
+        return t += 1'000'000;
+    });
+    Producer p(impl);
+    const uint64_t ok = fillUntilBackPressured(p);
+    ASSERT_GT(ok, 0u);
+
+    int notOwnerCalls = 0;
+    impl->setPumpFn(
+        +[](void* raw) noexcept -> PumpResult {
+            ++*static_cast<int*>(raw);
+            return PumpResult::NotOwner;
+        },
+        &notOwnerCalls);
+
+    EXPECT_THROW(p.send(kTopic, Key(uint64_t{ok}), kVal), std::runtime_error);
+    EXPECT_GT(notOwnerCalls, 1) << "NotOwner must retry the heartbeat-bounded wait, not fail on the first call";
+}
+
+// Regression (fix1 C2/I3): a Producer that outlives its (now-closed) ring
+// never touches the pump hook again — trySubmit intercepts via the ring's
+// closed word before sendBlocking could ever call a (potentially dangling)
+// pumpFn_/pumpCtx_.
+TEST(ProducerSend, ClosedRingNeverInvokesThePumpHookRegression) {
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    Producer p(impl);
+    const uint64_t ok = fillUntilBackPressured(p);
+    ASSERT_GT(ok, 0u);
+
+    int pumpCalls = 0;
+    impl->setPumpFn(
+        +[](void* raw) noexcept -> PumpResult {
+            ++*static_cast<int*>(raw);
+            return PumpResult::Pumped;
+        },
+        &pumpCalls);
+
+    impl->markRingClosed();
+
+    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{ok}), kVal), SendResult::Closed);
+    EXPECT_THROW(p.send(kTopic, Key(uint64_t{ok}), kVal), std::logic_error);
+    EXPECT_EQ(pumpCalls, 0) << "a closed ring must never reach the pump hook";
+}
+
+// ---------------------------------------------------------------------------
+// Task 13 fix1 I8 / minor 13
+// ---------------------------------------------------------------------------
+
+// The callback overload must never destroy an uncalled callback on an invalid
+// topic — it fires with -1 (the same "not accepted" signal failUnsubmitted
+// uses on back-pressure), consistent with every other invalid-input path.
+TEST(ProducerSend, CallbackSendOnInvalidTopicInvokesCallbackWithMinusOneRegression) {
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr);
+    Producer p(impl);
+    bool called = false;
+    int64_t got = 0;
+    p.send(TopicHandle{}, Key(uint64_t{1}), kVal, [&](int64_t offset) {
+        called = true;
+        got = offset;
+    });
+    EXPECT_TRUE(called) << "the callback must never be destroyed uncalled";
+    EXPECT_EQ(got, -1);
+}
+
+// fix1 minor 13: failUnsubmitted's reason string distinguishes BackPressured
+// from ValueTooLarge (previously one generic "back-pressure or invalid value"
+// string covered both). The want_future_t overload surfaces the reason as the
+// rejected future's exception message, so it is observable here.
+TEST(ProducerSend, FailUnsubmittedReasonIsDistinctPerSendResultRegression) {
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    Producer p(impl);
+    const uint64_t ok = fillUntilBackPressured(p);
+    ASSERT_GT(ok, 0u);
+
+    auto backPressuredFut = p.send(kTopic, Key(uint64_t{ok}), kVal, rune::client::want_future);
+    std::string backPressuredMsg;
+    try { backPressuredFut.get(); } catch (const std::exception& e) { backPressuredMsg = e.what(); }
+    ASSERT_FALSE(backPressuredMsg.empty());
+
+    const std::vector<uint8_t> tooBig(Producer::kMaxSendValueBytes + 1, 0);
+    auto tooLargeFut = p.send(kTopic, Key(uint64_t{ok}), tooBig, rune::client::want_future);
+    std::string tooLargeMsg;
+    try { tooLargeFut.get(); } catch (const std::exception& e) { tooLargeMsg = e.what(); }
+    ASSERT_FALSE(tooLargeMsg.empty());
+
+    EXPECT_NE(backPressuredMsg, tooLargeMsg)
+        << "BackPressured and ValueTooLarge must report DISTINCT reasons, not one generic string";
 }

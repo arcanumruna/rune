@@ -61,6 +61,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <future>
@@ -243,6 +244,11 @@ public:
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
     }
+    /// fix1 C1 test hook: total user-callback exceptions caught (never let a
+    /// throwing callback escape a noexcept frame / a runner thread and
+    /// terminate the process). Sums this Client's own onConnected/onError/
+    /// onDisconnected catches with the subscriber and group-consumer hubs'.
+    [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept;
 
     // -------------------------------------------------------------------------
     // Callback registration — MUST be called before connect()  (FIX F4)
@@ -438,10 +444,13 @@ public:
     /// May be called before or after connect(); registration is submitted through
     /// the agent command ring and is thread-safe.
     ///
-    /// Invoker mode: wires the producer's pump hook (ProducerImpl::setPumpFn) to
-    /// this Client, so a back-pressured blocking send() drives the duty cycle
-    /// itself instead of waiting on a consumer that IS the calling (owner)
-    /// thread — see ProducerImpl::sendBlocking.
+    /// Wires the producer's pump hook (ProducerImpl::setPumpFn) to this Client,
+    /// in both runner modes (fix1 C1): a back-pressured blocking send() either
+    /// drives the duty cycle itself (Invoker owner thread, outside a callback),
+    /// fails fast instead of recursively re-entering the agent's own poll (any
+    /// duty-cycle thread already mid-cycle, either mode), or falls back to its
+    /// heartbeat-bounded wait (a genuinely separate thread) — see
+    /// ProducerImpl::sendBlocking / PumpResult.
     Producer producer(ProducerConfig cfg = {});
 
     /// Test hook: like producer(), but with an explicit ring capacity (small ring
@@ -540,12 +549,39 @@ private:
     /// Shared implementation of producer() / testProducerWithRingCap().
     Producer producerWithRingCap_(ProducerConfig cfg, int32_t ringCap);
 
-    /// Invoker-mode pump hook bound to a ProducerImpl via setPumpFn(). Mirrors
-    /// submitRegistration_'s own gate exactly: pumping (running one duty cycle)
-    /// is safe only on the owner thread, outside a duty-cycle callback. Declines
-    /// (returns false) otherwise, so the blocking send() fails fast instead of
-    /// spinning or waiting on a consumer that is the calling thread itself.
-    static bool pumpTrampoline_(void* ctx) noexcept;
+    /// fix1 C1: run a user callback, catching and counting/logging any escaping
+    /// exception instead of letting it unwind into a noexcept frame
+    /// (ClientAgent::doWork / Client::pumpTrampoline_) or off the end of the
+    /// runner thread's body — either of which terminates the process. A user
+    /// callback that needs confirmation of acceptance should use trySend, not
+    /// the throwing blocking send(), from inside a callback (see Producer.h).
+    template <class Fn>
+    void invokeUserCallback_(const char* name, Fn&& fn) noexcept {
+        try {
+            fn();
+        } catch (const std::exception& e) {
+            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "rune-client: user callback '%s' threw: %s (caught; the duty cycle continues)\n",
+                name, e.what());
+        } catch (...) {
+            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "rune-client: user callback '%s' threw a non-std::exception "
+                "(caught; the duty cycle continues)\n", name);
+        }
+    }
+
+    /// fix1 C1: pump hook bound to every ProducerImpl via setPumpFn(), in BOTH
+    /// runner modes. On the duty-cycle thread (Invoker owner, or the Thread-mode
+    /// runner) already inside a cycle: DeclinedInCycle (pumping would recursively
+    /// re-enter the agent's own poll). On the Invoker owner thread, NOT inside a
+    /// cycle: Pumped (runs one dutyCycle()). Anything else (Thread mode's
+    /// ordinary app thread, or a foreign thread touching an Invoker producer off
+    /// its owner thread): NotOwner — a genuinely separate thread may still drain
+    /// the ring in real time, so the caller falls back to its heartbeat-bounded
+    /// wait instead.
+    static producer::PumpResult pumpTrampoline_(void* ctx) noexcept;
 
     /// Setup-phase ring submit, bounded (5 s).  Invoker mode runs the duty cycle
     /// between attempts — this thread IS the ring's consumer; thread mode parks
@@ -660,6 +696,14 @@ private:
     static constexpr int64_t kSweepIntervalMs = 100;
     int64_t         nextSweepNs_ = 0;       // duty-cycle thread only
     bool            inDutyCycle_ = false;   // duty-cycle thread only
+    // fix1 C1: count of user-callback exceptions caught at this Client's own
+    // cbConnected_/cbError_/cbDisconnected_ call sites. Written only on the
+    // duty-cycle thread (a cold/rare path — an actual exception), but a test
+    // thread may poll testCallbackExceptionCount() without first establishing
+    // its own happens-before edge (it cannot: the exception's catch is itself
+    // the event being waited for), so this is a relaxed atomic rather than the
+    // single-writer plain counters elsewhere in this class.
+    std::atomic<uint64_t> callbackExceptions_ {0};
     std::thread::id ownerThread_;           // constructing thread (Invoker owner)
     std::thread::id dutyThreadId_;          // thread running dutyCycle(): owner or runner
     // Built ONCE: the txn producers' send paths (no per-cycle std::function build).

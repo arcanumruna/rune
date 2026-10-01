@@ -11,6 +11,23 @@
 
 namespace rune::client {
 
+namespace {
+// fix1 minor 13: a distinct failUnsubmitted() reason per SendResult, instead
+// of one generic "back-pressure or invalid value" string for every case.
+const char* sendFailureReason(SendResult r) noexcept {
+    switch (r) {
+    case SendResult::Ok:            return "producer send accepted"; // unreachable (caller checks Ok first)
+    case SendResult::BackPressured: return "producer send ring full — back-pressure (retry)";
+    case SendResult::ValueTooLarge: return "producer send rejected — value too large for this producer's ring";
+    case SendResult::InvalidTopic:  return "producer send rejected — invalid topic handle";
+    case SendResult::WrongThread:   return "producer send rejected — wrong thread (ClientShard)";
+    case SendResult::WrongShard:    return "producer send rejected — wrong shard (ClientShard)";
+    case SendResult::Closed:        return "producer send rejected — client closed";
+    }
+    return "producer send not accepted";
+}
+} // namespace
+
 // ---------------------------------------------------------------------------
 // ProducerConfig::fromEnv
 // ---------------------------------------------------------------------------
@@ -78,14 +95,22 @@ void Producer::send(TopicHandle              topic,
                     std::span<const uint8_t> value,
                     std::function<void(int64_t)> callback)
 {
-    if (!impl_ || !topic.valid()) return;
+    if (!impl_ || !topic.valid()) {
+        // fix1 I8: never destroy the callback uncalled — fire it with -1 (the
+        // same "not accepted" signal failUnsubmitted uses below), consistent
+        // with every other invalid-input path reporting rather than dropping.
+        if (callback) callback(-1);
+        return;
+    }
     const int32_t part   = key.partition(topic.partitionCount);
     const int64_t ackHandle = impl_->registerCallback(std::move(callback));
-    // Back-pressure: if the send ring is full the record never reaches the agent,
-    // so the ack would never arrive — fail the pending callback immediately
-    // (callback fires with offset=-1) rather than stranding it forever.
-    if (impl_->trySubmit(topic.topicId, part, key, value, ackHandle) != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, "producer send not accepted (back-pressure or invalid value) — retry");
+    // Back-pressure / rejection: if the send ring is full (or the value/topic is
+    // invalid) the record never reaches the agent, so the ack would never arrive
+    // — fail the pending callback immediately (callback fires with offset=-1)
+    // rather than stranding it forever.
+    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle);
+    if (r != SendResult::Ok) {
+        impl_->failUnsubmitted(ackHandle, sendFailureReason(r));
     }
 }
 
@@ -102,11 +127,13 @@ std::future<int64_t> Producer::send(TopicHandle              topic,
     }
     const int32_t part = key.partition(topic.partitionCount);
     auto [ackHandle, fut] = impl_->registerFuture();
-    // Back-pressure: if the send ring is full the record never reaches the agent,
-    // so the ack would never arrive and future.get() would hang forever. Reject
-    // the future immediately with a retriable error instead of stranding it.
-    if (impl_->trySubmit(topic.topicId, part, key, value, ackHandle) != SendResult::Ok) {
-        impl_->failUnsubmitted(ackHandle, "producer send not accepted (back-pressure or invalid value) — retry");
+    // Back-pressure / rejection: if the send ring is full (or the value/topic is
+    // invalid) the record never reaches the agent, so the ack would never
+    // arrive and future.get() would hang forever. Reject the future
+    // immediately with a specific error instead of stranding it.
+    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, ackHandle);
+    if (r != SendResult::Ok) {
+        impl_->failUnsubmitted(ackHandle, sendFailureReason(r));
     }
     return std::move(fut);
 }

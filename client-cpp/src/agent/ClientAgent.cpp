@@ -120,6 +120,11 @@ void ClientAgent::stop() noexcept {
 // ---------------------------------------------------------------------------
 
 int ClientAgent::doWork(int64_t nowNs) noexcept {
+    // fix1 C2/I3: a no-op after stop() — belt-and-suspenders against any stray
+    // call reaching here once the transport (and everything it touches) is
+    // being/has been torn down.
+    if (stopped_.load(std::memory_order_acquire)) return 0;
+
     int totalWork = transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
 
     // ---- Step 1: Drain the command ring (bounded) ---------------------------

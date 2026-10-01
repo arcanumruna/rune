@@ -129,6 +129,16 @@ public:
         return snapshot_.load(std::memory_order_acquire)->empty();
     }
 
+    /// fix1 C1: onAssigned/onRevoked/onRecords run inside the noexcept
+    /// ClientAgent::doWork chain (or, for closeAll's final onRevoked, inside
+    /// Client::closeImpl_); a throwing callback is caught, counted here, and
+    /// logged instead of terminating the process. Runner/duty-cycle-thread-only
+    /// write (closeAll runs single-threaded, after the runner was joined); safe
+    /// to read after a sync pump.
+    [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept {
+        return callbackExceptions_.load(std::memory_order_relaxed);
+    }
+
 private:
     // ---- Wait-free snapshot pointer -----------------------------------------
     std::atomic<const ImplList*> snapshot_{nullptr};
@@ -136,6 +146,9 @@ private:
     // ---- Retire list (cold path, under addMtx_) ----------------------------
     std::vector<const ImplList*> owned_;
     std::mutex addMtx_;
+
+    // fix1 C1: written on the runner/duty-cycle thread, read from a test thread.
+    std::atomic<uint64_t> callbackExceptions_ {0};
 
     // ---- Internal helpers (runner thread only) ------------------------------
 
@@ -173,9 +186,10 @@ private:
                                            int64_t sessionId,
                                            const SendFn& sendFn);
 
-    /// Apply a new assignment to impl: fire revoked+assigned callbacks.
-    static void applyAssignment(GroupConsumerImpl& impl,
-                                std::vector<TopicPartition> newAssignment);
+    /// Apply a new assignment to impl: fire revoked+assigned callbacks. Not
+    /// static (fix1 C1): catches/counts a throwing callback via callbackExceptions_.
+    void applyAssignment(GroupConsumerImpl& impl,
+                         std::vector<TopicPartition> newAssignment);
 };
 
 } // namespace rune::client::group

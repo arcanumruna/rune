@@ -137,12 +137,14 @@ struct BatchAck {
 // ---------------------------------------------------------------------------
 enum class SendResult : uint8_t {
     Ok = 0,         ///< accepted: will be batched and sent
-    BackPressured,  ///< ring full / partition window full: retry after the duty cycle drains
-    ValueTooLarge,  ///< value > kMaxSendValueBytes (never retryable)
+    BackPressured,  ///< ring full right now: retry after the duty cycle drains
+    ValueTooLarge,  ///< value > kMaxSendValueBytes, OR too big to EVER fit this producer's ring
+                    ///< (> maxMsgLength) — never retryable
     InvalidTopic,   ///< TopicHandle not valid
-    WrongThread,    ///< invoker-mode producer used off its owner thread
-    WrongShard,     ///< ClientShard: partition owned by another shard
-    Closed,         ///< the shard's transport closed
+    WrongThread,    ///< ClientShard only (later tasks): producer used off its owner thread
+    WrongShard,     ///< ClientShard only (later tasks): partition owned by another shard
+    Closed,         ///< this producer's Client has been closed (producer outlived it, or
+                    ///< send() raced a concurrent close())
 };
 
 // ---------------------------------------------------------------------------
@@ -186,13 +188,36 @@ public:
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
                                      std::span<const uint8_t> value) noexcept;
 
-    /// Fire-and-forget send that NEVER drops.  BackPressured → backs off (thread
-    /// mode: spin/yield/park until the runner drains; invoker mode: runs the duty
-    /// cycle itself) and retries.  Throws std::length_error (value too large),
-    /// std::invalid_argument (invalid topic), std::logic_error (off the invoker
-    /// owner thread, or back-pressured inside an invoker duty-cycle callback —
-    /// use trySend there), std::runtime_error (the runner stopped draining for
-    /// agentLivenessTimeoutMs — client closed).  Zero allocation when accepted.
+    /// Fire-and-forget send that NEVER drops.  On BackPressured it retries:
+    /// Invoker mode, called on the owner thread outside a callback, pumps the
+    /// Client's duty cycle itself (no idle); any OTHER genuinely separate thread
+    /// (Thread mode's app thread; a foreign thread) backs off and waits, bounded
+    /// by the ring's consumer-liveness heartbeat — a BACKSTOP for a wedged
+    /// runner ONLY (fix1 I5): a cleanly closed Client is reported immediately
+    /// (see Closed below), never decided by this timer.
+    ///
+    /// **Callbacks must call trySend(), not this.**  Called from inside a
+    /// duty-cycle callback (onConnected/onError, a subscription handler, a
+    /// group-consumer callback, an onBatchAck) while back-pressured, this
+    /// throws immediately instead of pumping (pumping would recursively
+    /// re-enter the agent's own poll on the same thread) — see
+    /// std::runtime_error below. Time spent in ANY callback counts against the
+    /// next agentLivenessTimeoutMs window for every producer on that Client.
+    ///
+    /// Throws:
+    ///   std::length_error    — value too large (> kMaxSendValueBytes, or too
+    ///                          big to ever fit this producer's ring).
+    ///   std::invalid_argument — invalid topic handle.
+    ///   std::logic_error      — this producer's Client has been closed (the
+    ///                          Producer outlived it, or send() raced a
+    ///                          concurrent close()) — consistent with
+    ///                          Client::producer() after close().
+    ///   std::runtime_error    — EITHER back-pressured inside a duty-cycle
+    ///                          callback (cannot pump; use trySend there), OR
+    ///                          back-pressured and the runner stopped draining
+    ///                          for longer than agentLivenessTimeoutMs (a
+    ///                          wedged runner, NOT a closed Client).
+    /// Zero allocation when accepted.
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
     // ---- Opt-in ack paths (may allocate per send) ----------------------------

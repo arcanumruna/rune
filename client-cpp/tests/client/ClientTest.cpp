@@ -61,6 +61,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <span>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -997,4 +998,132 @@ TEST(Client, IdleModeBalancedAndLowLatencyBothConnectAndPing) {
         client->close();
         try { std::filesystem::remove_all(agentDir); } catch (...) {}
     }
+}
+
+// ===========================================================================
+// fix1 C1: a blocking send() from inside a duty-cycle callback must never
+// terminate the process, in either runner mode. These two cover Thread mode
+// (the real background runner thread); InvokerClientTest.cpp covers Invoker.
+// ===========================================================================
+
+// The onConnected handler deliberately does NOT catch: it runs on the runner
+// thread, already inside dutyCycle() (inDutyCycle_ is set) — the pump hook
+// declines with DeclinedInCycle and sendBlocking throws immediately.
+// Client::invokeUserCallback_ must catch it so the runner thread (and the
+// process) survives; the exception count must reflect the catch.
+TEST(Client, BlockingSendFromCallbackDoesNotTerminateThreadRegression) {
+    GatewayHarness h(880, 881);
+    h.build(/*gwReplyOK=*/true);
+
+    std::atomic<bool> ran{false};
+    h.client->onConnected([&](int64_t) {
+        // Set BEFORE the throwing call: p.send() below throws and propagates
+        // OUT of this lambda (caught by Client::invokeUserCallback_, which
+        // wraps the whole callback dispatch) — nothing after it would run.
+        ran.store(true, std::memory_order_release);
+        ProducerConfig pcfg;
+        pcfg.acks     = Acks::None;
+        pcfg.lingerUs = 0;
+        auto p = h.client->testProducerWithRingCap(pcfg, 4 * 1024);
+        const TopicHandle topic{1, 1};
+        const std::vector<uint8_t> val(64, 0x7A);
+        uint64_t ok = 0;
+        for (; ok < 10'000; ++ok) {
+            if (p.trySend(topic, Key(ok), std::span<const uint8_t>(val)) != SendResult::Ok) break;
+        }
+        p.send(topic, Key(ok), std::span<const uint8_t>(val)); // NOT wrapped in try/catch
+    });
+
+    auto fut = h.client->connect();
+    h.pumpGwUntil([&]() { return ran.load(std::memory_order_acquire); });
+
+    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+        << "connect() future did not resolve — the runner thread may have died";
+    ASSERT_NO_THROW(fut.get());
+    EXPECT_TRUE(ran.load());
+    EXPECT_GT(h.client->testCallbackExceptionCount(), 0u)
+        << "the uncaught throw inside onConnected must be caught by "
+           "Client::invokeUserCallback_ around the callback dispatch, not escape it";
+
+    // The runner thread survived: a subsequent ping still completes.
+    auto pingFut = h.client->ping({'o', 'k'});
+    h.pumpGwUntil([&] { return pingFut.wait_for(0ms) == std::future_status::ready; });
+    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+        << "runner thread did not survive the uncaught callback exception";
+    EXPECT_NO_THROW(pingFut.get());
+
+    h.client->close();
+}
+
+// ===========================================================================
+// fix1 C2/I3: a ring "closed" word — send() after close() returns/throws
+// Closed, consistent with producer() after close() (Task 12).
+// ===========================================================================
+TEST(Client, SendAfterClientCloseReturnsClosedRegression) {
+    GatewayHarness h(884, 885);
+    h.build(/*gwReplyOK=*/true);
+
+    ProducerConfig pcfg;
+    pcfg.acks = Acks::None;
+    auto p = h.client->testProducerWithRingCap(pcfg, 4 * 1024);
+    const TopicHandle topic{1, 1};
+    const std::vector<uint8_t> val(64, 0x7C);
+    uint64_t ok = 0;
+    for (; ok < 10'000; ++ok) {
+        if (p.trySend(topic, Key(ok), std::span<const uint8_t>(val)) != SendResult::Ok) break;
+    }
+    ASSERT_GT(ok, 0u);
+
+    h.client->close();
+
+    EXPECT_EQ(p.trySend(topic, Key(ok), std::span<const uint8_t>(val)), SendResult::Closed);
+    EXPECT_THROW(p.send(topic, Key(ok), std::span<const uint8_t>(val)), std::logic_error);
+}
+
+// Proves the DeclinedInCycle path is used (fail FAST) rather than falling back
+// to the heartbeat-bounded wait: agentLivenessTimeoutMs is set absurdly high,
+// so if sendBlocking ever waited it out the test would hang for minutes. It
+// must return almost immediately regardless.
+TEST(Client, ThreadModeRunnerBlockingSendDoesNotStallRegression) {
+    GatewayHarness h(882, 883);
+    h.build(/*gwReplyOK=*/true);
+
+    std::atomic<bool> threw{false};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<int64_t> elapsedMs{-1};
+
+    h.client->onConnected([&](int64_t) {
+        ProducerConfig pcfg;
+        pcfg.acks                   = Acks::None;
+        pcfg.lingerUs               = 0;
+        pcfg.agentLivenessTimeoutMs = 60'000; // would hang minutes if this were ever waited out
+        auto p = h.client->testProducerWithRingCap(pcfg, 4 * 1024);
+        const TopicHandle topic{1, 1};
+        const std::vector<uint8_t> val(64, 0x7B);
+        uint64_t ok = 0;
+        for (; ok < 10'000; ++ok) {
+            if (p.trySend(topic, Key(ok), std::span<const uint8_t>(val)) != SendResult::Ok) break;
+        }
+        try {
+            p.send(topic, Key(ok), std::span<const uint8_t>(val));
+        } catch (const std::runtime_error&) {
+            threw.store(true, std::memory_order_release);
+        }
+        elapsedMs.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count(),
+            std::memory_order_release);
+    });
+
+    auto fut = h.client->connect();
+    h.pumpGwUntil([&]() { return elapsedMs.load(std::memory_order_acquire) >= 0; });
+
+    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready);
+    ASSERT_NO_THROW(fut.get());
+    EXPECT_TRUE(threw.load());
+    EXPECT_LT(elapsedMs.load(), 5000)
+        << "sendBlocking waited instead of failing fast on DeclinedInCycle "
+           "(agentLivenessTimeoutMs=60s would otherwise make this take minutes)";
+
+    h.client->close();
 }

@@ -316,7 +316,9 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
 
     // Public contract: a single SEND_RECORD is capped at kMaxSendValueBytes
     // (a fixed 8 KiB message, independent of the ring's larger maxMsgLength).
-    // Oversized values are silently dropped (return false).
+    // Returns false (not accepted) on an oversized value; callers (trySubmit /
+    // Producer::trySend / Producer::send) map that to SendResult::ValueTooLarge
+    // — never a silent drop (fix1 minor 12).
     if (valueLen > rune::client::Producer::kMaxSendValueBytes) {
         return false;
     }
@@ -358,7 +360,19 @@ int64_t ProducerImpl::steadyNowNs_() noexcept {
 
 SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                    std::span<const uint8_t> value, int64_t ackHandle) noexcept {
+    // fix1 C2/I3: closed is a terminal state, checked first — a Producer whose
+    // Client has gone through close() never reaches submitSendRecord(), and
+    // (critically) sendBlocking() never gets far enough to touch the pump hook's
+    // context (which may by then be a destroyed Client).
+    if (ring_.closed()) return SendResult::Closed;
     if (value.size() > rune::client::Producer::kMaxSendValueBytes) return SendResult::ValueTooLarge;
+    // fix1 minor 11: a value that can NEVER fit this ring (maxMsgLength is a
+    // function of ringCap, which can be far smaller than kMaxSendValueBytes —
+    // e.g. a small test ring) must not be reported as retryable back-pressure:
+    // no amount of draining ever makes room for a message the ring cannot hold,
+    // so BackPressured here would livelock sendBlocking's retry loop forever.
+    const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + value.size();
+    if (totalLen > static_cast<std::size_t>(ring_.maxMsgLength())) return SendResult::ValueTooLarge;
     return submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle)
                ? SendResult::Ok
                : SendResult::BackPressured;
@@ -376,7 +390,8 @@ void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition
         case SendResult::Ok:            return;
         case SendResult::BackPressured: break;
         case SendResult::ValueTooLarge:
-            throw std::length_error("Producer::send: value exceeds Producer::kMaxSendValueBytes");
+            throw std::length_error("Producer::send: value exceeds Producer::kMaxSendValueBytes "
+                                     "or this producer's ring maxMsgLength");
         case SendResult::InvalidTopic:
             throw std::invalid_argument("Producer::send: invalid topic handle");
         case SendResult::WrongThread:
@@ -384,22 +399,39 @@ void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition
         case SendResult::WrongShard:
             throw std::logic_error("Producer::send: partition owned by another shard");
         case SendResult::Closed:
-            throw std::runtime_error("Producer::send: producer closed");
+            // fix1 C2: consistent with producer()-after-close (Client::producer()
+            // throws logic_error("client closed") once stopped_ is set).
+            throw std::logic_error("Producer::send: client closed");
         }
+        // fix1 C2/I3: re-check closed every iteration, BEFORE the pump attempt —
+        // decided immediately, never by waiting out agentLivenessTimeoutMs, and
+        // the (possibly by-now-dangling) pump context is never touched once closed.
+        if (ring_.closed()) {
+            throw std::logic_error("Producer::send: client closed");
+        }
+        bool pumped = false;
         if (pumpFn_ != nullptr) {
-            // Invoker mode: the owner thread IS the ring's only consumer. Waiting
-            // on the ring's heartbeat here would wait on ourselves forever, so we
-            // drive the duty cycle ourselves instead of backing off. pumpFn_ runs
-            // the SAME gate as Client::submitRegistration_ (owner thread, not
-            // already inside a duty-cycle callback) and declines otherwise.
-            if (!pumpFn_(pumpCtx_)) {
+            // fix1 C1: a 3-way result. DeclinedInCycle means pumping would
+            // re-enter the agent's own poll (we ARE the duty-cycle thread,
+            // already mid-cycle) — fail fast, never spin, never wait on a
+            // heartbeat that is literally this same stalled call. NotOwner falls
+            // back to the heartbeat-bounded wait: a genuinely separate thread
+            // (Thread mode's app thread, or a foreign thread) may still drain
+            // the ring for real.
+            const PumpResult pr = pumpFn_(pumpCtx_);
+            if (pr == PumpResult::DeclinedInCycle) {
                 throw std::runtime_error(
-                    "Producer::send: back-pressured (invoker mode: cannot pump the duty "
-                    "cycle from a callback or a non-owner thread) — use trySend here");
+                    "Producer::send: back-pressured inside a duty-cycle callback — cannot "
+                    "pump (would re-enter the agent's own poll); use trySend there instead");
             }
-        } else {
+            pumped = (pr == PumpResult::Pumped);
+        }
+        if (!pumped) {
             idle.idle(0);
             const int64_t nowNs = clock_();
+            if (ring_.closed()) {
+                throw std::logic_error("Producer::send: client closed");
+            }
             if (nowNs - std::max(ring_.consumerHeartbeatTime(), startNs) > livenessNs) {
                 throw std::runtime_error(
                     "Producer::send: back-pressured and the runner stopped draining for "
@@ -567,7 +599,9 @@ void ProducerImpl::growAckRing(PartitionState& ps) {
 
 int ProducerImpl::drainRing(int64_t nowNs) {
     using rune::client::detail::ControlledAction;
-    ring_.consumerHeartbeatTime(nowNs);
+    // fix1 minor 9: the heartbeat is published once per duty cycle by
+    // ProducerHub::drainAndFlush (publishHeartbeat()), not here — drainRing can
+    // run up to 256x per producer per cycle.
 
     // controlledRead with limit=1: drain ONE message per call so ProducerHub can
     // interleave flushBatches() between records (keeps every builder ≤ batchBytes).

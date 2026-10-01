@@ -1361,3 +1361,17 @@ TEST_F(TransactionalProducerTest, BeginTransactionClearsPoisonFlag)
     EXPECT_FALSE(tp.transactionActive())
         << "TXN-2: txn must be inactive after successful commit";
 }
+
+// ===========================================================================
+// Task 13 fix1 I8: TransactionalProducer::send on an invalid topic must never
+// be silently dropped — it throws (TransactionalProducer has no callback to
+// report through, unlike Producer::send's opt-in overloads).
+// ===========================================================================
+TEST_F(TransactionalProducerTest, SendOnInvalidTopicThrowsRegression)
+{
+    auto impl = makeImpl();
+    TransactionalProducer tp(impl);
+    const std::vector<uint8_t> val{1, 2, 3};
+    EXPECT_THROW(tp.send(TopicHandle{}, Key(uint64_t{1}), std::span<const uint8_t>(val)),
+                 std::invalid_argument);
+}

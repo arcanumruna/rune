@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 
@@ -225,8 +226,22 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv)
         rec.value = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(valView.data()), valView.size());
 
-        // Invoke the handler (agent thread; must not block).
-        impl->handler(rec);
+        // Invoke the handler (agent thread; must not block). fix1 C1: this runs
+        // inside the noexcept ClientAgent::doWork chain (Client::onEgressFrame ->
+        // SubscriberHub::onRecords) — a throwing handler must never escape it.
+        try {
+            impl->handler(rec);
+        } catch (const std::exception& e) {
+            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "rune-client: subscription record handler threw: %s (caught; the duty "
+                "cycle continues)\n", e.what());
+        } catch (...) {
+            callbackExceptions_.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "rune-client: subscription record handler threw a non-std::exception "
+                "(caught; the duty cycle continues)\n");
+        }
 
         // Update offset tracking: nextOffset = absOffset + 1.
         // Release store so app-thread reads via position() are consistent.

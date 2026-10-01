@@ -5,6 +5,8 @@
 #include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/producer/TransactionalProducerImpl.h>
 
+#include <stdexcept>
+
 namespace rune::client {
 
 TransactionalProducer::TransactionalProducer(
@@ -26,7 +28,12 @@ void TransactionalProducer::send(TopicHandle topic,
                                   const Key& key,
                                   std::span<const uint8_t> value)
 {
-    if (!topic.valid()) return;
+    // fix1 I8: never silently drop an invalid topic (TransactionalProducer has
+    // no callback to report through, unlike Producer::send's opt-in overloads,
+    // so — consistent with the void Producer::send() policy — report via throw).
+    if (!topic.valid()) {
+        throw std::invalid_argument("TransactionalProducer::send: invalid topic handle");
+    }
     const int32_t partition = key.partition(topic.partitionCount);
     impl_->submitSend(topic.topicId, partition, key, value);
 }

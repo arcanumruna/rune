@@ -239,6 +239,13 @@ void Client::closeImpl_() {
     // drained yet) so their holders are freed and the failAll below reaches them.
     (void)agent_.drainRegistrationsForClose();
 
+    // fix1 C2/I3: mark every producer's ring closed NOW — the Client (and its
+    // pump-hook contexts, each `this`) is still fully valid, and this runs
+    // before the transport is torn down. A Producer whose shared_ptr the app
+    // kept past this point then gets SendResult::Closed, never touching the
+    // (by-then-dangling) pump hook: no use-after-free, no silent accept.
+    producerHub_.closeAllRings();
+
     // Stop the agent (idempotent — CC-5 contract).
     agent_.stop();
 
@@ -291,7 +298,7 @@ void Client::closeImpl_() {
     if (disconnectedFired_.compare_exchange_strong(expected, true,
             std::memory_order_acq_rel, std::memory_order_relaxed)) {
         if (cbDisconnected_) {
-            cbDisconnected_();
+            invokeUserCallback_("onDisconnected", [&] { cbDisconnected_(); });
         }
     }
 }
@@ -332,6 +339,12 @@ void Client::onError(std::function<void(const std::string&)> cb) {
 
 session::SessionState Client::state() const noexcept {
     return agent_.sessionState();
+}
+
+uint64_t Client::testCallbackExceptionCount() const noexcept {
+    return callbackExceptions_.load(std::memory_order_relaxed)
+         + subscriberHub_.testCallbackExceptionCount()
+         + groupConsumerHub_.testCallbackExceptionCount();
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +788,9 @@ void Client::sweepTimeouts(int64_t nowNs) {
             subscriberHub_.failPendingSubscribes(
                 "Redirect reconnect failed: endpoint unreachable");
             if (cbError_) {
-                cbError_("Redirect reconnect failed: endpoint unreachable");
+                invokeUserCallback_("onError", [&] {
+                    cbError_("Redirect reconnect failed: endpoint unreachable");
+                });
             }
         }
     }
@@ -793,7 +808,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
 
         // Fire onError.
         if (cbError_) {
-            cbError_("connect() timed out");
+            invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
         }
     }
 
@@ -915,9 +930,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // refresh so the cache is populated for zero-RTT partition routing.
             sendMetadataRequest(opt->assignedSessionId);
 
-            // Fire onConnected.
+            // Fire onConnected. fix1 C1: this runs inside the noexcept
+            // ClientAgent::doWork chain (dispatchEgressFrame -> egressObserver_ ->
+            // onEgressFrame) — a throwing callback (e.g. a blocking send() that
+            // throws because it is back-pressured inside this very callback) must
+            // never escape it and terminate the process.
             if (cbConnected_) {
-                cbConnected_(opt->assignedSessionId);
+                invokeUserCallback_("onConnected", [&] { cbConnected_(opt->assignedSessionId); });
             }
         } else {
             // Error response via ConnectResponse — fail the promise and fire onError.
@@ -935,7 +954,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 } catch (...) {}
             }
             if (cbError_) {
-                cbError_(msg);
+                invokeUserCallback_("onError", [&] { cbError_(msg); });
             }
         }
         break;
@@ -1135,7 +1154,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 subscriberHub_.failPendingSubscribes("Redirect retarget failed");
                 redirectPending() = false;
                 if (cbError_) {
-                    cbError_(retargetReason);
+                    invokeUserCallback_("onError", [&] { cbError_(retargetReason); });
                 }
             }
             break; // Redirect is handled; don't fall through to the error path.
@@ -1255,7 +1274,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             } catch (...) {}
         }
         if (cbError_) {
-            cbError_(msg);
+            invokeUserCallback_("onError", [&] { cbError_(msg); });
         }
         break;
     }
@@ -1589,14 +1608,22 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
         nextCorrId_,
         ringCap);
 
-    // Invoker mode: a back-pressured blocking send() must not wait on a ring
-    // consumer that IS the calling (owner) thread. Wire the pump hook so
-    // ProducerImpl::sendBlocking runs one duty cycle itself instead — gated by
-    // pumpTrampoline_ exactly like submitRegistration_'s own safe path (owner
-    // thread, not already inside a duty-cycle callback). Plain function pointer
-    // + `this`: no std::function, no virtual call, no new atomic.
-    if (cfg_.runnerMode == RunnerMode::Invoker) {
-        impl->setPumpFn(&Client::pumpTrampoline_, this);
+    // fix1 C1: wire the pump hook in BOTH runner modes — a back-pressured
+    // blocking send() must never wait on a ring consumer that IS the calling
+    // thread (Invoker owner), and must never spin/wait-out-the-heartbeat when
+    // called from inside a duty-cycle callback (either mode: Invoker owner or
+    // Thread-mode runner). pumpTrampoline_ decides (PumpResult); Thread mode's
+    // ordinary app thread still falls back to the heartbeat-bounded wait (a
+    // genuinely separate runner thread may yet drain the ring for real). Plain
+    // function pointer + `this`: no std::function, no virtual call, no new atomic.
+    impl->setPumpFn(&Client::pumpTrampoline_, this);
+
+    // fix1 I4: clock coherence — when an injected clock is configured, the ring's
+    // heartbeat writer (the duty cycle, via dutyCycle(now())) and its reader
+    // (sendBlocking's liveness check) must agree on "now", or an injected-clock
+    // test can see a stale heartbeat race a real steady_clock read.
+    if (cfg_.nanoClock != nullptr) {
+        impl->setClockForTesting(cfg_.nanoClock);
     }
 
     // Shared-nothing registration: producer() may be called from any app thread,
@@ -1617,19 +1644,33 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
     return Producer(std::move(impl));
 }
 
-bool Client::pumpTrampoline_(void* ctx) noexcept {
+producer::PumpResult Client::pumpTrampoline_(void* ctx) noexcept {
     auto* self = static_cast<Client*>(ctx);
-    // Only ever wired in Invoker mode (see producerWithRingCap_), but checked
-    // again here defensively — this runs off a bare function pointer with no
-    // other type safety net.
-    if (self->cfg_.runnerMode != RunnerMode::Invoker) return false;
-    if (std::this_thread::get_id() != self->ownerThread_) return false;
-    // inDutyCycle_ is duty-cycle-thread-only state (no cross-thread read); safe
-    // here because in Invoker mode dutyThreadId_ == ownerThread_ always, and we
-    // just confirmed we ARE the owner thread.
-    if (self->inDutyCycle_) return false;
-    (void)self->dutyCycle(self->now());
-    return true;
+    // inDutyCycle_ is duty-cycle-thread-only state (no cross-thread read) — only
+    // read once we have confirmed we ARE on that thread (dutyThreadId_: the
+    // Invoker owner, or the Thread-mode runner).
+    const bool onDutyThread = std::this_thread::get_id() == self->dutyThreadId_;
+    if (onDutyThread) {
+        if (self->inDutyCycle_) {
+            // fix1 C1: we ARE the duty-cycle thread, already mid-cycle (this call
+            // came from inside a user callback the cycle itself invoked).
+            // Pumping would recursively re-enter the agent's own poll on the same
+            // thread — decline so sendBlocking fails fast instead.
+            return producer::PumpResult::DeclinedInCycle;
+        }
+        if (self->cfg_.runnerMode == RunnerMode::Invoker) {
+            // The owner thread, outside any cycle: safe to drive one ourselves.
+            (void)self->dutyCycle(self->now());
+            return producer::PumpResult::Pumped;
+        }
+        // Thread mode's runner thread calling from outside dutyCycle() should not
+        // happen in practice (the runner's entire body IS the cycle loop), but
+        // fall through to NotOwner rather than assume.
+    }
+    // Thread mode's ordinary app thread, or a foreign thread touching an Invoker
+    // producer off its owner thread: a genuinely separate thread may still drain
+    // the ring for real, so fall back to the heartbeat-bounded wait.
+    return producer::PumpResult::NotOwner;
 }
 
 // ---------------------------------------------------------------------------
