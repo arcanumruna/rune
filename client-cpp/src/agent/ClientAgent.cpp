@@ -383,13 +383,26 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
     // in a row, stop: close() must terminate. Any registration still behind
     // such a claim is then left unread — the same accepted shutdown leak as
     // Client::producerWithRingCap_'s fix3 M1 branch, never a hang.
-    // Residual hazard (inherent to unblock(); see its doc and Step 1 of
-    // doWork for why the runner never does this): if the "orphan" was really
-    // a writer descheduled for the whole cap, its late commit() is refused
-    // (writeCommand returns false; nothing is published), but its payload
-    // memcpy may land on ring bytes this drain already consumed. That memory
-    // is never read again after close(), so it is harmless while the ring is
-    // alive — the cap is sized so this needs a ~1M-yield stall.
+    // Residual hazard (Aeron's own unblock() hazard, accepted here — NOT
+    // harmless; see unblock()'s doc and Step 1 of doWork for why the runner
+    // never does this): if the "orphan" was really a writer descheduled for the
+    // whole cap, it can resume while THIS drain is still running. Its commit()
+    // is refused (writeCommand returns false; nothing is published), but its
+    // payload memcpy races this drain: it lands on bytes the drain has turned
+    // into padding or may be reading right now, so the same drain can observe
+    // a torn/overwritten region — exactly the corruption risk Aeron documents
+    // for ManyToOneRingBuffer::unblock(). It is accepted only because it needs
+    // a writer stalled for the whole ~1M-yield cap at close(), and close()
+    // must terminate (a hang is the worse failure).
+    //
+    // A stall unblock() CANNOT clear: a writer that won the tail CAS for an
+    // end-of-buffer wrap (padding to the buffer end + its record at index 0)
+    // and stalled before writing the padding header leaves only zero words
+    // from head to the buffer end — unblock()'s forward scan finds nothing to
+    // pad up to and returns false (as Aeron's does). A registration committed
+    // behind such a claim is never reached: after kCloseDrainMaxFailedUnblocks
+    // rounds the drain stops, and that registration falls under the documented
+    // accepted shutdown leak above (fix3 M1), never a hang.
     const std::int64_t targetTail = ring_.tailPosition();
     int total = 0;
     int stalledYields = 0;

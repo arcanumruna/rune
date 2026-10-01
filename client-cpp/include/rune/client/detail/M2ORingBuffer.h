@@ -227,10 +227,19 @@ public:
     ///
     /// Hazard (inherent to Aeron's unblock, documented there too): if the
     /// "blocking" writer was merely stalled rather than gone, its later
-    /// commit() throws ("Claimed space previously released") or, worse, it
-    /// may write its payload bytes over space the consumer has since recycled.
-    /// Callers must therefore only unblock when the writer cannot be live —
-    /// see ClientAgent::drainRegistrationsForClose() for this client's sole use.
+    /// commit() throws ("Claimed space previously released") or, worse, its
+    /// payload write races the consumer: it can land on the region just turned
+    /// into padding, on bytes the consumer is reading in the same drain, or on
+    /// space the consumer has since recycled — a torn read is possible. Never
+    /// "harmless": a caller unblocks only when it accepts that risk. This
+    /// client's sole use is ClientAgent::drainRegistrationsForClose(), which
+    /// accepts it at close() after an iteration cap (a hang is worse).
+    ///
+    /// Not every stall is unblockable: a claim whose tail CAS covered an
+    /// end-of-buffer wrap but whose writer stalled before writing the padding
+    /// header leaves only zero words from head to the buffer end — there is no
+    /// later non-zero length to pad up to, so this returns false (as Aeron's
+    /// does) and anything behind that claim stays unreachable.
     bool unblock() {
         namespace RD = aeron::concurrent::ringbuffer;
         const std::int64_t headPosition = loadAcquire64_(m_headPositionIndex);

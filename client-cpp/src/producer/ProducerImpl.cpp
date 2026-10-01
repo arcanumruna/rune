@@ -327,9 +327,14 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
     // it — the value is copied ONCE (app buffer → ring), versus the old path which
     // built the record in a stack scratch and then copied scratch → ring (value
     // copied twice).  No stack scratch, no intermediate copy, no heap, no lock.
+    //
+    // Task 13 review carry-over: "never an orphaned claim" is STRUCTURAL — once a
+    // claim succeeded, every exit that does not commit it aborts it (an orphaned
+    // claim would wedge the consumer at this record forever).
+    aeron::util::index_t idx = -1;
+    bool committed = false;
     try {
-        const aeron::util::index_t idx =
-            ring_.tryClaim(kMsgSendRecord, totalLen);
+        idx = ring_.tryClaim(kMsgSendRecord, totalLen);
         if (idx < 0) return false; // INSUFFICIENT_CAPACITY → back-pressure
 
         uint8_t* dst = ring_.base() + idx;
@@ -344,11 +349,21 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
         if (valueLen > 0) std::memcpy(dst + kRecValBytesOff, value.data(), valueLen);
 
         ring_.commit(idx);
+        committed = true;
         // App-thread: record handed to the app→agent ring (corr=correlationId).
         RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientAppSend,
                              static_cast<uint32_t>(correlationId));
         return true;
     } catch (...) {
+        if (committed) return true;  // published; only the trailing mark threw
+        if (idx >= 0) {
+            try {
+                ring_.abort(idx);  // the claim becomes padding: the consumer skips it
+            } catch (...) {
+                // abort() refuses only a claim the consumer already released
+                // (unblock()), i.e. one that is no longer ours to abort.
+            }
+        }
         return false; // preserve noexcept contract
     }
 }
