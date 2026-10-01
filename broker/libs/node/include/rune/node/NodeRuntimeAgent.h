@@ -31,6 +31,7 @@
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/CleanerViewChannel.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/OneToOneByteRing.h>
@@ -51,6 +52,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
@@ -180,6 +182,15 @@ public:
         }
     }
 
+    // Task 10 round 4: the LogCleanerAgent's replica view channel (rings only).
+    // BrokerNode calls this before any runner starts and attaches the result to
+    // the cleaner.  The channel lives here (outlives the cleaner on shutdown).
+    CleanerViewChannel* enableCleanerView() {
+        if (!cleanerChannel_) cleanerChannel_ = std::make_unique<CleanerViewChannel>();
+        return cleanerChannel_.get();
+    }
+    [[nodiscard]] std::uint64_t cleanerAckedGenForTest() const noexcept { return cleanerAckedGen_; }
+
     // Halt on an invariant violation (BrokerNode wires it; called once).
     void setFatalHook(std::function<void(const std::string&)> hook) { fatalHook_ = std::move(hook); }
 
@@ -194,8 +205,14 @@ private:
         //     removed replicas no worker can still reference (all acked).
         if (workerPool_ && registry_) workerPool_->reconcile(*registry_);
         if (registry_) {
-            registry_->collectRetired(workerPool_ ? workerPool_->minAckedOwnershipGen()
-                                                  : registry_->generation());
+            // Round 4: the off-thread cleaner holds replica pointers too (its own
+            // ring-delivered view) — a retired replica is freed only once every
+            // worker AND the cleaner acked a generation at or above its removal.
+            work += publishCleanerView_();
+            std::uint64_t safe = workerPool_ ? workerPool_->minAckedOwnershipGen()
+                                             : registry_->generation();
+            if (cleanerChannel_ && cleanerAckedGen_ < safe) safe = cleanerAckedGen_;
+            registry_->collectRetired(safe);
         }
 
         // 2. Metadata bridge — detect leader/epoch change and flip replica roles.
@@ -802,6 +819,52 @@ private:
     std::function<int(int64_t)>                        adminControlHook_;
     StorageFailureHook                                 storageFailureHook_;
     std::function<void(const std::string&)>            fatalHook_;
+
+    // Task 10 round 4: cleaner view publication (control-thread side).
+    std::unique_ptr<CleanerViewChannel>                cleanerChannel_;
+    std::vector<rune::replication::PartitionReplica*>  cleanerSnapshot_;   // generation being published
+    std::uint64_t cleanerPublishingGen_ = static_cast<std::uint64_t>(-1);
+    std::size_t   cleanerNextIndex_     = 0;
+    bool          cleanerPublished_     = true;
+    std::uint64_t cleanerAckedGen_      = 0;
+    std::vector<uint8_t>                               cleanerScratch_;
+    int publishCleanerView_() {
+        if (!cleanerChannel_) return 0;
+        int work = cleanerChannel_->ack.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf,
+                                                     aeron::util::index_t off, aeron::util::index_t) {
+            std::uint64_t g;
+            std::memcpy(&g, buf.buffer() + off, 8);
+            if (g > cleanerAckedGen_) cleanerAckedGen_ = g;
+        }, 16);
+        const std::uint64_t gen = registry_->generation();
+        if (gen != cleanerPublishingGen_) {   // cold: on registry change only
+            cleanerSnapshot_      = registry_->allReplicas();
+            cleanerPublishingGen_ = gen;
+            cleanerNextIndex_     = 0;
+            cleanerPublished_     = false;
+        }
+        while (!cleanerPublished_) {
+            const std::size_t total = cleanerSnapshot_.size();
+            const std::size_t count = std::min<std::size_t>(CleanerViewChannel::kPtrsPerChunk,
+                                                            total - cleanerNextIndex_);
+            cleanerScratch_.resize(CleanerViewChannel::kHeaderBytes + 8 * count);
+            uint8_t* p = cleanerScratch_.data();
+            const uint32_t t32 = static_cast<uint32_t>(total), i32 = static_cast<uint32_t>(cleanerNextIndex_),
+                           c32 = static_cast<uint32_t>(count), pad = 0;
+            std::memcpy(p, &gen, 8); std::memcpy(p + 8, &t32, 4); std::memcpy(p + 12, &i32, 4);
+            std::memcpy(p + 16, &c32, 4); std::memcpy(p + 20, &pad, 4);
+            for (std::size_t i = 0; i < count; ++i) {
+                const std::uint64_t v = reinterpret_cast<std::uintptr_t>(cleanerSnapshot_[cleanerNextIndex_ + i]);
+                std::memcpy(p + CleanerViewChannel::kHeaderBytes + 8 * i, &v, 8);
+            }
+            if (!cleanerChannel_->view.write(p, cleanerScratch_.size(), CleanerViewChannel::kViewMsgType))
+                break;   // ring full: resumed next cycle (time-independent)
+            cleanerNextIndex_ += count;
+            ++work;
+            if (cleanerNextIndex_ >= total) cleanerPublished_ = true;
+        }
+        return work;
+    }
     bool                                               fatalReported_ = false;
     bool                                               storageFailureReported_ = false;
     void checkReplicaStorage_(rune::replication::PartitionReplica* replica) {

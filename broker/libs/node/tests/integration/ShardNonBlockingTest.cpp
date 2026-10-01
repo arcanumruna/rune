@@ -11,6 +11,7 @@
 // control completion delivery (setReapPausedForTest / deliverCompletionForTest)
 // so durability ordering is asserted deterministically.
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/LogCleanerAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -1961,4 +1962,31 @@ TEST(ReplicaLifetimeRegression, BackPressuredSubscriptionLifecycleOpsAreQueuedIn
     drainIdle(m.pool.worker(0));
     EXPECT_TRUE(m.pool.worker(0).subscriptionsForTest().empty()) << "subscribe then unsubscribe, in order";
     EXPECT_EQ(m.gw.pendingSubOpsForTest(), 0u);
+}
+
+TEST(ReplicaLifetimeRegression, CleanerUsesItsOwnRingViewAndGatesTheFree) {
+    // Found on sight: the LogCleanerAgent thread iterated the registry vector the
+    // control thread mutates, and could hold a replica collectRetired then freed.
+    // It now works off a ring-delivered view; a removed replica is freed only
+    // after the cleaner acked the generation that dropped it.
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    LogCleanerAgent cleaner(&R.reg);
+    cleaner.attachViewChannel(rt.enableCleanerView());
+    R.add(5, 0);
+    R.add(5, 1);
+    rt.doWork(1);                                          // publishes generation 2
+    EXPECT_EQ(cleaner.viewSizeForTest(), 0u) << "nothing until the cleaner runs";
+    cleaner.doWork(1);
+    EXPECT_EQ(cleaner.viewSizeForTest(), 2u);
+    EXPECT_EQ(cleaner.viewGenerationForTest(), R.reg.generation());
+    R.reg.remove(5, 0);
+    rt.doWork(2);                                          // ack of the OLD view only
+    EXPECT_EQ(R.reg.retiredCountForTest(), 1u) << "the cleaner may still hold it: not freed";
+    cleaner.doWork(2);                                     // swaps to the new view + acks
+    EXPECT_EQ(cleaner.viewSizeForTest(), 1u);
+    rt.doWork(3);
+    EXPECT_EQ(rt.cleanerAckedGenForTest(), R.reg.generation());
+    EXPECT_EQ(R.reg.retiredCountForTest(), 0u) << "freed once the cleaner acked";
 }

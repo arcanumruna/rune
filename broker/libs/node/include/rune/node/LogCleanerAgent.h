@@ -73,6 +73,7 @@
 //   never included in cleanableBytes and are never passed to produceCleanedFile.
 
 #include <rune/consensus/ConsensusAgent.h>
+#include <rune/node/CleanerViewChannel.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
@@ -86,6 +87,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -139,6 +141,21 @@ public:
     LogCleanerAgent(const LogCleanerAgent&)            = delete;
     LogCleanerAgent& operator=(const LogCleanerAgent&) = delete;
 
+    // -----------------------------------------------------------------------
+    // Task 10 round 4: production (BrokerNode) wiring.  From now on the cleaner
+    // NEVER touches the ReplicaRegistry (registry_ = nullptr): it works off its
+    // own replica view, delivered generation by generation over `ch` (rings
+    // only), and acks each generation it swapped to so the control thread knows
+    // when a removed replica is unreachable here too.  Before the first view
+    // arrives the cleaner is idle.  Call before the runner starts.
+    // -----------------------------------------------------------------------
+    void attachViewChannel(CleanerViewChannel* ch) noexcept {
+        channel_  = ch;
+        registry_ = nullptr;
+    }
+    [[nodiscard]] uint64_t viewGenerationForTest() const noexcept { return viewGen_; }
+    [[nodiscard]] std::size_t viewSizeForTest() const noexcept { return view_.size(); }
+
     /// Test-only accessor: return the configured I/O throttle rate.
     /// -1 = unlimited.  Used by BrokerNodeTest to prove Fix-1 wiring.
     [[nodiscard]] int64_t throttleRateForTest() const noexcept {
@@ -165,7 +182,8 @@ public:
     const char* name() const noexcept override { return "rune-cleaner"; }
 
     int doWork(int64_t nowNs) override {
-        if (!registry_) return 0;
+        if (channel_) applyViewUpdates_();
+        if (!registry_ && !channel_) return 0;
 
         // Append-p99 fix: keep every log's NEXT segment pre-provisioned on THIS
         // (background) thread, and finalize any deferred staging→base renames the
@@ -181,7 +199,7 @@ public:
         // callers treat >0 as "a segment was compacted / retention ran").  Pre-
         // provisioning is background housekeeping that reaches steady state (returns
         // 0) after building one segment, so excluding it keeps that signal clean.
-        for (auto* r : registry_->allReplicas()) {
+        for (auto* r : replicas_()) {
             // Task M1 precondition #2: skip memory-backed replicas.
             // r->log() asserts isDiskBacked() — never call it on an InMemoryLog.
             if (r && r->isDiskBacked()) {
@@ -203,8 +221,8 @@ public:
         {
             int64_t minCheckMs = retentionCheckMs_; // default from ctor
             // Scan replicas for the smallest retentionCheckMs configured.
-            if (registry_) {
-                for (auto* r : registry_->allReplicas()) {
+            {
+                for (auto* r : replicas_()) {
                     if (!r) continue;
                     const int64_t rc = r->retentionCheckMs();
                     if (rc > 0 && rc < minCheckMs) minCheckMs = rc;
@@ -238,7 +256,7 @@ public:
         };
         Candidate best;
 
-        for (auto* replica : registry_->allReplicas()) {
+        for (auto* replica : replicas_()) {
             if (!replica) continue;
             // TSan race fix: gate on the cleaner-visible role snapshot (atomic
             // acquire), NOT role() which reads the duty-thread-mutated role_.
@@ -563,9 +581,9 @@ private:
     //         on disk; retention renames that latest file to .deleted.
     // -----------------------------------------------------------------------
     void runRetention(int64_t nowMs) {
-        if (!registry_) return;
+        if (!registry_ && !channel_) return;
 
-        for (auto* replica : registry_->allReplicas()) {
+        for (auto* replica : replicas_()) {
             if (!replica) continue;
             // Retention is leader-only (failover-safe: a demoted leader stops
             // retention because cleanerRole() != Leader).
@@ -776,7 +794,47 @@ private:
         checkpoints_.emplace(log, std::move(ckpt));
     }
 
-    ReplicaRegistry*        registry_;            // non-owning
+    ReplicaRegistry*        registry_;            // non-owning; nullptr once a view channel is attached
+
+    // Task 10 round 4: cleaner-owned replica view (see CleanerViewChannel.h).
+    CleanerViewChannel*                               channel_ = nullptr;
+    std::vector<rune::replication::PartitionReplica*> view_;
+    std::vector<rune::replication::PartitionReplica*> building_;
+    uint64_t viewGen_     = 0;
+    uint64_t buildingGen_ = 0;
+    bool     ackPending_  = false;
+
+    [[nodiscard]] const std::vector<rune::replication::PartitionReplica*>& replicas_() const noexcept {
+        return channel_ ? view_ : registry_->allReplicas();
+    }
+    void applyViewUpdates_() {
+        channel_->view.drain([this](int32_t type, aeron::concurrent::AtomicBuffer& buf,
+                                    aeron::util::index_t off, aeron::util::index_t len) {
+            if (type != CleanerViewChannel::kViewMsgType ||
+                static_cast<std::size_t>(len) < CleanerViewChannel::kHeaderBytes) return;
+            const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + off);
+            uint64_t gen; uint32_t total, index, count;
+            std::memcpy(&gen, p, 8); std::memcpy(&total, p + 8, 4);
+            std::memcpy(&index, p + 12, 4); std::memcpy(&count, p + 16, 4);
+            if (index == 0) { building_.clear(); buildingGen_ = gen; }
+            else if (gen != buildingGen_ || building_.size() != index) return;   // stale partial
+            for (uint32_t i = 0; i < count; ++i) {
+                uint64_t v; std::memcpy(&v, p + CleanerViewChannel::kHeaderBytes + 8u * i, 8);
+                building_.push_back(reinterpret_cast<rune::replication::PartitionReplica*>(
+                    static_cast<std::uintptr_t>(v)));
+            }
+            if (building_.size() == total) {
+                view_.swap(building_);
+                building_.clear();
+                viewGen_    = gen;
+                ackPending_ = true;
+            }
+        }, 64);
+        if (ackPending_ && channel_->ack.write(reinterpret_cast<const uint8_t*>(&viewGen_), 8,
+                                               CleanerViewChannel::kAckMsgType))
+            ackPending_ = false;   // a full ring is retried next pass (never lost)
+    }
+
     int64_t                 cycleBudgetBytes_;    // 0 = unlimited; >0 = soft bytes-per-window cap
     int64_t                 dedupeBufferBytes_;   // dedupe map byte budget (SkimpyOffsetMap, > 0 always)
     int64_t                 bytesUsed_ = 0;       // bytes consumed so far in the current budget window

@@ -2006,6 +2006,10 @@ void BrokerNode::buildGateway() {
             /*ioMaxBytesPerSec=*/   cleanerIoMaxBytesPerSec,
             /*useCoalescing=*/      config_.enableCompactionCoalescing,
             /*coalescingRollBytes=*/64LL * 1024 * 1024);
+        // Task 10 round 4: the cleaner never reads the registry — it gets its
+        // own replica view over a ring from the control thread, which frees a
+        // removed replica only after the cleaner acked the generation dropping it.
+        if (runtimeAgent_) cleanerAgent_->attachViewChannel(runtimeAgent_->enableCleanerView());
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
         spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas, coalescing={}, ioThrottle={})",
