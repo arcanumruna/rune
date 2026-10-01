@@ -17,7 +17,23 @@
 //                            20 µs at the default kRcScanBytesPerPass.  macOS has
 //                            no page-cache drop without root: there the step is
 //                            mapping-cold (page faults) but page-cache-warm.
+//                            Fix round 1: the step parses only RESIDENT bytes
+//                            (mincore gate + MADV_WILLNEED read-ahead), so a cold
+//                            step returns at once; nonres_frac = steps that found
+//                            nothing resident (waiting on read-ahead).
+//   BM_RcWorkerPush/<iso>  — the worker-push egress arm (pushOwnedSubscriptions_)
+//                            of 64 x ~1 KiB non-txn batches on an embedded-driver
+//                            IPC publication (review I-3).  iso 0 / 1 as above.
+//
+// Base comparison (review I-3): the RU arms (BM_RcPushNonTxn/0,
+// BM_RcWorkerPush/0) compile on the pre-S4 base 614ae96 too (every S4-only API
+// is behind __has_include(<rune/node/RcState.h>)): copy this file into a base
+// checkout's benchmark/ (add it to CMakeLists) and run ABAB against S4.
+#if __has_include(<rune/node/RcState.h>)
 #include <rune/node/RcState.h>
+#define RUNE_RCBENCH_S4 1
+#endif
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/protocol/RecordBatch.h>
@@ -26,6 +42,7 @@
 #include <rune/transaction/ControlMarker.h>
 
 #include <benchmark/benchmark.h>
+#include <Aeron.h>
 
 #include <algorithm>
 #include <atomic>
@@ -34,6 +51,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -43,8 +61,10 @@
 namespace {
 
 namespace fs = std::filesystem;
+#if defined(RUNE_RCBENCH_S4)
 using rune::node::RcFacts;
 using rune::node::RcState;
+#endif
 using rune::node::Worker;
 using rune::node::WorkerOp;
 using rune::node::WorkerReturn;
@@ -87,10 +107,17 @@ void appendAt(rune::storage::Log& log, const std::vector<uint8_t>& b) {
 void dropCache(rune::storage::Log& log, const fs::path& dir) {
     const long page = ::sysconf(_SC_PAGESIZE);
     for (const int64_t base : log.segmentBaseOffsets()) {
+#if defined(RUNE_RCBENCH_S4)
+        const auto v = log.segmentBytesAt(base);   // the mapping, no page touched
+        if (v.data == nullptr) continue;
+        const auto start = reinterpret_cast<uintptr_t>(v.data) & ~static_cast<uintptr_t>(page - 1);
+        const auto end   = reinterpret_cast<uintptr_t>(v.data) + v.size;
+#else
         const auto v = log.readView(base, INT32_MAX);
         if (v.empty()) continue;
         const auto start = reinterpret_cast<uintptr_t>(v.data) & ~static_cast<uintptr_t>(page - 1);
         const auto end   = reinterpret_cast<uintptr_t>(v.data) + v.len;
+#endif
         (void)::madvise(reinterpret_cast<void*>(start), end - start, MADV_DONTNEED);
     }
 #if defined(__linux__)
@@ -122,8 +149,12 @@ void BM_RcPushNonTxn(benchmark::State& state) {
     Worker w(0, 1 << 22, 1 << 23, 64, 64);
     w.setOwnedDirect(Worker::OwnedSet{&rep});
     int64_t now = 1;
+#if defined(RUNE_RCBENCH_S4)
     for (int i = 0; i < 8 && w.rcStatusForTest(1, 0) != Worker::kRcReady; ++i) w.doWork(++now);
     if (w.rcStatusForTest(1, 0) != Worker::kRcReady) { state.SkipWithError("RC never Ready"); return; }
+#else
+    for (int i = 0; i < 8; ++i) w.doWork(++now);
+#endif
     const int64_t hw = log.logEndOffset();
     std::size_t bytes = 0;
     for (auto _ : state) {
@@ -139,6 +170,67 @@ void BM_RcPushNonTxn(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 
+void BM_RcWorkerPush(benchmark::State& state) {
+    const auto iso = static_cast<uint8_t>(state.range(0));
+    BenchDir d, ad;
+    rune::node::EmbeddedDriverConfig dc;
+    dc.dir = (ad.path / "aeron").string();
+    dc.termBufferBytes = 16 * 1024 * 1024;
+    std::unique_ptr<rune::node::EmbeddedDriver> driver;
+    try {
+        driver = std::make_unique<rune::node::EmbeddedDriver>(dc, rune::node::DriverMode::Threaded);
+    } catch (const std::exception& e) { state.SkipWithError(e.what()); return; }
+    aeron::Context ctx;
+    ctx.aeronDir(dc.dir);
+    auto aeron = aeron::Aeron::connect(ctx);
+    const int64_t pubReg = aeron->addExclusivePublication("aeron:ipc", 9101);
+    const int64_t subReg = aeron->addSubscription("aeron:ipc", 9101);
+    std::shared_ptr<aeron::ExclusivePublication> pub;
+    std::shared_ptr<aeron::Subscription> sub;
+    for (int i = 0; i < 1'000'000 && (!pub || !sub || !pub->isConnected()); ++i) {
+        if (!pub) pub = aeron->findExclusivePublication(pubReg);
+        if (!sub) sub = aeron->findSubscription(subReg);
+        std::this_thread::yield();
+    }
+    if (!pub || !sub || !pub->isConnected()) { state.SkipWithError("IPC not connected"); return; }
+
+    rune::storage::Log log(d.path.string(), 64LL * 1024 * 1024);
+    log.recover();
+    for (int i = 0; i < 64; ++i) appendAt(log, dataBatch(1000));
+    rune::replication::PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.pushOnAppend = false;
+    c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL;
+    NullTransport t;
+    PartitionReplica rep(c, rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+    Worker w(0, 1 << 22, 1 << 23, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    int64_t now = 1;
+    for (int i = 0; i < 8; ++i) w.doWork(++now);
+    auto subscribe = [&] {
+        WorkerOp op;
+        op.type = WorkerOp::Type::Subscribe; op.subscriptionId = 1; op.sessionId = 1; op.topicId = 1;
+        op.partition = 0; op.nextOffset = 0; op.logPtr = &log; op.replica = &rep; op.isolation = iso;
+        op.egressPub = pub.get();
+        (void)w.tryEnqueueOp(std::move(op));
+    };
+    std::size_t frames = 0;
+    auto drain = [&] {
+        while (sub->poll([&](aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t,
+                             aeron::Header&) { ++frames; }, 256) > 0) {}
+    };
+    for (auto _ : state) {
+        subscribe();            // rewinds the cursor to 0 (updates the existing entry)
+        w.doWork(++now);        // drain op + push the 64 batches
+        state.PauseTiming();
+        drain();
+        state.ResumeTiming();
+    }
+    state.counters["frames_per_iter"] = static_cast<double>(frames) / static_cast<double>(state.iterations());
+    state.SetItemsProcessed(state.iterations() * 64);
+}
+
+#if defined(RUNE_RCBENCH_S4)
 void BM_RcBuildStep(benchmark::State& state) {
     const auto budget = static_cast<int32_t>(state.range(0));
     BenchDir d;
@@ -182,11 +274,17 @@ void BM_RcBuildStep(benchmark::State& state) {
     state.counters["p50_us"] = us[us.size() / 2];
     state.counters["p99_us"] = us[std::min(us.size() - 1, us.size() * 99 / 100)];
     state.counters["max_us"] = us.back();
+    state.counters["nonres_frac"] = static_cast<double>(rc->nonResidentSteps()) /
+                                    static_cast<double>(std::max<uint64_t>(1, rc->scanSteps()));
     state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * budget);
 }
+#endif
 
 } // namespace
 
 BENCHMARK(BM_RcPushNonTxn)->Arg(0)->Arg(1)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_RcWorkerPush)->Arg(0)->Arg(1)->Unit(benchmark::kMicrosecond);
+#if defined(RUNE_RCBENCH_S4)
 BENCHMARK(BM_RcBuildStep)->Arg(16 * 1024)->Arg(32 * 1024)->Arg(64 * 1024)->Arg(256 * 1024)
     ->Unit(benchmark::kMicrosecond)->Iterations(20000);
+#endif
