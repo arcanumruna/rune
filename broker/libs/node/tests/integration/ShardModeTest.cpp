@@ -6,6 +6,7 @@
 
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/metadata/StaticBalancer.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 
@@ -232,6 +233,27 @@ uint64_t refusals(BrokerNode& n, int32_t w) {
     return onPlane(n, w, [](WorkerReplicationTransport& t) { return t.planeRefusals(); });
 }
 
+/// Static (preferred) leader of topic 0 partition p for an n-node cluster:
+/// exactly what the metadata leader emits (BrokerNode: rf = cluster size).
+int32_t staticLeader(int32_t p, int nodes) {
+    rune::metadata::TopicSpec t; t.topicId = 0; t.partitionCount = kAsymPartitions;
+    t.rf = static_cast<int16_t>(nodes);
+    std::vector<rune::metadata::NodeId> live;
+    for (int i = 0; i < nodes; ++i) live.push_back(i);
+    for (const auto& r : rune::metadata::StaticBalancer::assign({t}, live))
+        if (r.rec.partition == p) return r.rec.leaderNode;
+    return -1;
+}
+
+/// Advertised leader of topic 0 partition p, polled until it equals `want`.
+bool leaderBecomes(ShardTestClient& c, const ShardPorts& ports, int64_t sid, int32_t p, int32_t want) {
+    return eventually([&] {
+        for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid))
+            if (pi.topicId == 0 && pi.partition == p && pi.leaderId == want) return true;
+        return false;
+    }, 400);
+}
+
 NodeConfig asymConfig(int32_t nodeId, const fs::path& dir, const ShardPorts& ports, int nodes,
                       int32_t workers) {
     auto c = makeShardConfig(nodeId, dir, ports, nodes, workers, false);
@@ -259,26 +281,49 @@ TEST(ShardModeRegression, AsymmetricWorkerCountRefusedAtRuntime) {
 }
 
 TEST(ShardModeRegression, PeerRestartStillMismatchedStaysRefused) {
-    TmpDir d0{"rst0"}, d1{"rst1"};
+    TmpDir d0{"rst0"}, d1{"rst1"}, cdir{"rstc"};
     const auto ports = ShardPorts::discover(2, 2);
     const auto c0 = asymConfig(0, d0.path, ports, 2, 1);
     const auto c1 = asymConfig(1, d1.path, ports, 2, 2);
     BrokerNode n0{c0};
     n0.start();
-    uint64_t before = 0;
     {
         BrokerNode n1{c1};
         n1.start();
         ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 1) == PS::Refused; }));
-        before = refusals(n0, 0);
         n1.stop();
     }
-    BrokerNode n1b{c1};                                   // restarted: new image session, same wrong W
+    const uint64_t before = refusals(n0, 0);                 // read AFTER the old peer is gone
+    BrokerNode n1b{c1};                                       // restarted: new image session, same wrong W
     n1b.start();
     ASSERT_TRUE(eventually([&] { return refusals(n0, 0) > before; }))
         << "the restarted peer's new session was never re-evaluated";
     EXPECT_EQ(peerState(n0, 0, 1), PS::Refused) << "still mismatched: must stay refused (no split)";
     ASSERT_TRUE(eventually([&] { return peerState(n1b, 0, 0) == PS::Refused; }));
+    // An affected partition on the one plane both nodes share (node 1's shard 0),
+    // statically led by node 0 (node 0 never stops, so it leads it throughout).
+    // Records acked by node 0 after both sides refused never reach node 1, and
+    // node 0 never applies anything for partitions only node 1 could have led.
+    int32_t part = -1, peerLed = -1;
+    for (int32_t p = 0; p < kAsymPartitions; ++p) {
+        if (n1b.workerForPartitionForTest(0, p) != 0) continue;
+        if (staticLeader(p, 2) == 0 && part < 0) part = p;
+        if (staticLeader(p, 2) == 1 && peerLed < 0) peerLed = p;
+    }
+    ASSERT_GE(part, 0) << "no node-0-led partition on node 1's shard 0";
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid, 0);
+        ASSERT_TRUE(leaderBecomes(c, ports, sid, part, 0));
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kIngressStream, sid, 0, part,
+                                    /*acks=leader*/0, makeBatch(3));
+        ASSERT_TRUE(ack.has_value());
+    }
+    EXPECT_GE(rune::node::test::leoOnOwner(n0, 0, part), 3);
+    EXPECT_EQ(rune::node::test::leoOnOwner(n1b, 0, part), 0) << "records crossed a refused plane (split)";
+    if (peerLed >= 0)
+        EXPECT_EQ(rune::node::test::leoOnOwner(n0, 0, peerLed), 0) << "node 0 applied a refused peer's records";
     n1b.stop(); n0.stop();
 }
 
@@ -329,41 +374,33 @@ TEST(ShardModeRegression, LargerWorkerCountExtraShardsDoNotSplit) {
     auto c0 = asymConfig(0, d0.path, ports, 2, 1);
     auto c1 = asymConfig(1, d1.path, ports, 2, 2);
     c0.replicaLagMaxMs = c1.replicaLagMaxMs = 500;          // unreachable follower leaves the ISR fast
-    BrokerNode n0{c0}, n1{c1};
-    n0.start(); n1.start();
-    ASSERT_TRUE(n0.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms));
-    const int32_t part = partitionOnWorker(n1, 1);          // a shard index the 1-worker peer lacks
-    ASSERT_GE(part, 0);
+    BrokerNode n1{c1}, n0{c0};
+    n1.start(); n0.start();
+    // Pin the scenario: a partition whose static (preferred) leader is node 1 and
+    // which node 1 routes to shard 1 — a shard index the 1-worker peer lacks.
+    int32_t part = -1;
+    for (int32_t p = 0; p < kAsymPartitions && part < 0; ++p)
+        if (staticLeader(p, 2) == 1 && n1.workerForPartitionForTest(0, p) == 1) part = p;
+    ASSERT_GE(part, 0) << "no partition statically led by node 1 on its shard 1";
     ShardTestClient c(cdir.path);
     const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
     ASSERT_GT(sid0, 0);
-    int32_t leader = -1;
-    ASSERT_TRUE(eventually([&] {
-        for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
-            if (pi.topicId == 0 && pi.partition == part) leader = pi.leaderId;
-        return leader >= 0;
-    }, 400));
-    const int32_t w = (leader == 1) ? 1 : 0;                // the leader's owning shard
-    const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+    ASSERT_TRUE(leaderBecomes(c, ports, sid0, part, 1)) << "node 1 never became the partition's leader";
+    // The leader's ISR shrinks to itself: the follower's shard 0 can never reach
+    // node 1's plane 1.  Condition, read on node 1's shard 1 (the owner).
+    ASSERT_TRUE(eventually([&] { return rune::node::test::isrSizeOnOwner(n1, 0, part) == 1; }))
+        << "the unreachable follower never left the ISR";
+    const int64_t sid = c.connect(gatewayChannel(ports, 1), kClientStream);
     ASSERT_GT(sid, 0);
-    // Every produce gets an answer (never a silent hang); once the unreachable
-    // follower has left the ISR the answer is MinIsrViolation (minIsr=2).
-    bool sawMinIsr = false;
-    for (int attempt = 0; attempt < 40 && !sawMinIsr; ++attempt) {
-        const int64_t corr = 50'000 + attempt;
-        ASSERT_TRUE(c.produce(workerIngressChannel(ports, leader, w), kIngressStream + w, sid, corr, 0, part,
-                              /*acks=all*/1, makeBatch(1)));
-        auto r = c.awaitProduceResponse(corr);
-        ASSERT_TRUE(r.has_value()) << "produce " << attempt << " got no answer (silent hang)";
-        sawMinIsr = r->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation);
-        if (!sawMinIsr) std::this_thread::sleep_for(50ms);   // pacing only; outcome asserted below
-    }
-    EXPECT_TRUE(sawMinIsr) << "acks=all never reported the shrunken ISR";
-    // No split: the other node never applied this partition's records.
-    BrokerNode& follower = (leader == 1) ? n0 : n1;
-    EXPECT_LE(follower.onOwnerThreadForTest(0, part, [](rune::replication::PartitionReplica& r) {
-                  return r.logEndOffset(); }), 0);
-    n1.stop(); n0.stop();
+    constexpr int64_t kCorr = 50'000;
+    ASSERT_TRUE(c.produce(workerIngressChannel(ports, 1, 1), kIngressStream + 1, sid, kCorr, 0, part,
+                          /*acks=all*/1, makeBatch(1)));
+    auto r = c.awaitProduceResponse(kCorr);
+    ASSERT_TRUE(r.has_value()) << "acks=all got no answer (silent hang)";
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation))
+        << "ISR {1} < minIsr 2 must be reported to the client";
+    EXPECT_EQ(rune::node::test::leoOnOwner(n0, 0, part), 0) << "no split: node 0 never applied it";
+    n0.stop(); n1.stop();
 }
 
 // Fix round 1 (I2): no long startup phase may run between shard-runtime creation
@@ -400,6 +437,40 @@ TEST(ShardModeRegression, SlowStartupPhaseDoesNotKillShardClient) {
         auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, w), kIngressStream + w, sid, 0, part,
                                     /*acks=*/0, makeBatch(2), /*maxAttempts=*/20);
         EXPECT_TRUE(ack.has_value()) << "shard " << w << " does not serve after a slow startup phase";
+    }
+    node.stop();
+}
+
+// Fix round 2 (item 5): shards are attached one after another at startup.  While
+// a LATER shard resolves (here: a stalled resolve of shard 2 for 2x the client
+// liveness timeout), every other shard's driver + client must keep being pumped,
+// so total liveness is independent of the shard count and of resolve time.
+TEST(ShardModeRegression, SequentialShardResolveKeepsEarlierShardsAlive) {
+    TmpDir dir{"seqres"}, cdir{"seqresc"};
+    constexpr int32_t kWorkers = 3;
+    const auto ports = ShardPorts::discover(1, kWorkers);
+    auto cfg = makeShardConfig(0, dir.path, ports, 1, kWorkers, /*fused=*/false);
+    cfg.topics[0].partitionCount = 12;
+    constexpr int64_t kLivenessNs = 2'000'000'000;           // > driver timer interval (1 s)
+    cfg.shardClientLivenessTimeoutNs = kLivenessNs;
+    BrokerNode node{cfg};
+    node.setShardResolveStallForTest(kWorkers - 1, std::chrono::milliseconds{2 * kLivenessNs / 1'000'000});
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    ShardTestClient c(cdir.path);
+    const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0);
+    for (int32_t w = 0; w < kWorkers; ++w) {
+        int32_t part = -1;
+        for (int32_t p = 0; p < cfg.topics[0].partitionCount && part < 0; ++p)
+            if (node.workerForPartitionForTest(0, p) == w) part = p;
+        ASSERT_GE(part, 0) << "no partition routed to worker " << w;
+        EXPECT_FALSE(node.onOwnerThreadForTest(0, part, [&node, w](rune::replication::PartitionReplica*) {
+            return node.shardClientClosedForTest(w);
+        })) << "shard " << w << " client died while a later shard resolved";
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, w), kIngressStream + w, sid, 0, part,
+                                    /*acks=*/0, makeBatch(2), /*maxAttempts=*/20);
+        EXPECT_TRUE(ack.has_value()) << "shard " << w << " does not serve";
     }
     node.stop();
 }

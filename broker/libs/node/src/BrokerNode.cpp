@@ -2509,6 +2509,24 @@ void BrokerNode::buildShardRuntimes_() {
                  config_.nodeId, wc, config_.effectiveAeronDir());
 }
 
+namespace {
+// Startup-only composite pump: one pass of every shard's own AeronPump (driver
+// duty cycle + client conductor).  A refusal from any shard (not its pump
+// thread) fails the resolve fast, exactly like a single shard pump.
+struct ShardStartupPump {
+    std::vector<rune::aeronutil::AeronPump> pumps;
+    static int pumpAll(void* self) noexcept {
+        int work = 0;
+        for (auto& p : static_cast<ShardStartupPump*>(self)->pumps) {
+            const int w = p.pump();
+            if (w < 0) return rune::aeronutil::AeronPump::kRefused;
+            work += w;
+        }
+        return work;
+    }
+};
+} // namespace
+
 // ---------------------------------------------------------------------------
 // BrokerNode::attachShardRuntimes_ — right after buildShardRuntimes_(), right
 // before the runners start (no long phase in between).  Per worker w, on its OWN
@@ -2525,9 +2543,23 @@ void BrokerNode::attachShardRuntimes_() {
     if (egressBase <= 0) egressBase = config_.workerIngressBaseStreamId + wc;
     const int32_t egressControlBase = config_.effectiveWorkerEgressControlBasePort();
     shardAgents_.reserve(static_cast<std::size_t>(wc));
+    // Every resolve below pumps EVERY shard's driver + client (each through its
+    // own AeronPump; all are still owned by this start thread), so no shard goes
+    // unpumped while another one resolves: startup liveness is independent of
+    // the shard count and of how long any single resolve takes (fix round 2).
+    ShardStartupPump startupPump;
+    startupPump.pumps.reserve(static_cast<std::size_t>(wc));
+    for (int32_t w = 0; w < wc; ++w)
+        startupPump.pumps.push_back(shardDrivers_[static_cast<std::size_t>(w)]->pumpWith(
+            shardClients_[static_cast<std::size_t>(w)].get()));
     for (int32_t w = 0; w < wc; ++w) {
         const auto idx = static_cast<std::size_t>(w);
-        auto pump = shardDrivers_[idx]->pumpWith(shardClients_[idx].get());
+        rune::aeronutil::AeronPump pump(&ShardStartupPump::pumpAll, &startupPump, nullptr);
+        if (w == shardResolveStallWorkerForTest_) [[unlikely]] {
+            // Test-only fault: a resolve of THIS shard that cannot complete for the
+            // configured time (pumping exactly as a real slow resolve would).
+            (void)pump.resolve([] { return false; }, shardResolveStallForTest_);
+        }
         if (!perWorkerReplTransports_.empty()) {
             std::vector<std::pair<rune::replication::NodeId, std::string>> peersW;
             std::vector<rune::replication::NodeId> peerIds;
@@ -2583,29 +2615,16 @@ void BrokerNode::teardownShardRuntimes_() noexcept {
     if (shardDrivers_.empty() && shardClients_.empty()) return;
     shardAgents_.clear();
     for (auto& d : shardDrivers_) if (d) d->bindPumpThread();
-    // Every close is isolated: a throwing client/driver close is logged and the
-    // rest still close (noexcept must never terminate the process here).
-    for (std::size_t w = 0; w < shardClients_.size(); ++w) {
-        try {
-            shardClients_[w].reset();
-        } catch (const std::exception& e) {
-            spdlog::error("BrokerNode[{}]: shard {} client close threw: {}", config_.nodeId, w, e.what());
-        } catch (...) {
-            spdlog::error("BrokerNode[{}]: shard {} client close threw (unknown)", config_.nodeId, w);
-        }
-    }
+    // Clients first (their close commands queue in each driver's CnC ring), then
+    // drivers.  ~Aeron and EmbeddedDriver::close() are both noexcept and Aeron
+    // exposes no throwing close() to wrap, so there is nothing to catch here: a
+    // failing close terminates per the C++ contract.  What CAN go wrong without
+    // throwing — a driver close refused (wrong pump thread) — is checked below.
     shardClients_.clear();
     for (auto& d : shardDrivers_) {
         if (!d) continue;
-        bool open = true;
-        try {
-            d->close();
-            open = d->isOpen();
-        } catch (const std::exception& e) {
-            spdlog::error("BrokerNode[{}]: shard driver {} close threw: {}", config_.nodeId, d->dir(), e.what());
-        } catch (...) {
-            spdlog::error("BrokerNode[{}]: shard driver {} close threw (unknown)", config_.nodeId, d->dir());
-        }
+        d->close();
+        const bool open = d->isOpen();
         if (open) {
             spdlog::critical("BrokerNode[{}]: shard driver {} did not close on the stopping thread — LEAK",
                              config_.nodeId, d->dir());

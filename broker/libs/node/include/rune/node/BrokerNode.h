@@ -427,6 +427,14 @@ public:
         startupPhaseHookForTest_ = std::move(hook);
     }
 
+    /// Test-only fault injection: while attaching shard `worker` at startup, run a
+    /// resolve that cannot complete for `stall` (pumping like a slow real resolve).
+    /// Set before start().
+    void setShardResolveStallForTest(int32_t worker, std::chrono::milliseconds stall) noexcept {
+        shardResolveStallWorkerForTest_ = worker;
+        shardResolveStallForTest_       = stall;
+    }
+
     /// Test-only: is worker w's shard Aeron client closed?  Call ONLY inside
     /// onOwnerThreadForTest on worker w (the client is worker-owned).
     [[nodiscard]] bool shardClientClosedForTest(int32_t w) const {
@@ -665,6 +673,8 @@ private:
     std::vector<std::shared_ptr<aeron::Aeron>>   shardClients_;
     std::vector<std::unique_ptr<ShardAgent>>     shardAgents_;
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
+    int32_t                                      shardResolveStallWorkerForTest_ = -1;
+    std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();
     void attachShardRuntimes_();
     void teardownShardRuntimes_() noexcept;
