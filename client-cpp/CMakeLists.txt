@@ -974,6 +974,7 @@ if(BUILD_TESTING)
             tests/client/InvokerClientTest.cpp
             tests/shard/ShardConfigTest.cpp
             tests/client/HubCommandClientTest.cpp
+            tests/client/CompletionsClientTest.cpp
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
