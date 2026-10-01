@@ -165,15 +165,21 @@ struct WorkerHarness {
 
     // Drain the return ring; update lastReturn and totalReturns.
     // Returns number of returns drained in this call.
+    // Counts produce ANSWERS only: F15 S2 fix round 1 adds an append-time
+    // facts-only ProduceResult (deferAck == true, TEMPORARY until S4/S5) for a
+    // parked (Strict / acks=all) gateway-routed produce — gateway-mirror
+    // bookkeeping, not an ack.  Counted separately in factsReturns.
     int drainReturns() {
         int count = 0;
         worker->drainReturn([&](WorkerReturn ret) {
+            if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) { ++factsReturns; return; }
             lastReturn = ret;
             ++totalReturns;
             ++count;
         });
         return count;
     }
+    int factsReturns = 0;
 
     ~WorkerHarness() {
         // worker dtor shuts down its IoBackend (joins flusher thread).
@@ -195,6 +201,7 @@ TEST(AsyncDurability, StrictProduceAcksOnlyAfterFlushCompletion) {
     h.worker->doWork(/*nowNs=*/1);
     EXPECT_EQ(h.drainReturns(), 0)
         << "Strict produce ack must wait for fsync completion — must not fire immediately";
+    EXPECT_EQ(h.factsReturns, 1) << "the append-time facts-only return (no answer)";
 
     // Spin doWork until the completion is reaped and the ack fires.
     int acks = 0;
@@ -457,6 +464,7 @@ TEST(AsyncDurability, SubmitRingFullHoldsProduce) {
     int returned = 0;
     bool sawNonOk = false;
     auto drainFn = [&](WorkerReturn ret) {
+        if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) return;   // facts-only, not an ack
         ++returned;
         if (ret.errorCode != 0) sawNonOk = true;
     };

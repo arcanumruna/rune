@@ -108,12 +108,18 @@ std::vector<uint8_t> produceFrame(int64_t corr, const std::vector<uint8_t>& batc
     msg.encode(frame.data());
     return frame;
 }
+// Produce ANSWERS only.  F15 S2 fix round 1: a parked gateway-routed produce
+// also emits an append-time facts-only ProduceResult (deferAck == true, TEMPORARY
+// until S4/S5) — gateway-mirror bookkeeping, not an answer to the client.
 struct Acks {
     int n = 0;
+    int facts = 0;
     std::vector<WorkerReturn> rets;
     int drain(Worker& w) {
         return static_cast<int>(w.drainReturn([&](WorkerReturn r) {
-            if (r.type == WorkerReturn::Type::ProduceResult) { ++n; rets.push_back(r); }
+            if (r.type != WorkerReturn::Type::ProduceResult) return;
+            if (r.deferAck) { ++facts; return; }
+            ++n; rets.push_back(r);
         }));
     }
 };
@@ -250,6 +256,8 @@ TEST(ShardNonBlockingRegression, BackgroundFlushCompletionNeverFiresProduceAck) 
     ASSERT_NE(t2, kNoToken);
     ASSERT_NE(t1, t2);
     Acks a;
+    a.drain(w);
+    EXPECT_EQ(a.facts, 1) << "the gateway-routed Strict produce emits its append-time facts";
     w.deliverCompletionForTest(FlushCompletion{t2, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 0) << "a background flush token must never fire a produce ack";
@@ -1666,8 +1674,8 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         w.doWork(1);
         ASSERT_EQ(w.reservedAckSlotsForTest(), 1) << "precondition: parked on the owning worker";
         std::vector<WorkerReturn> rets;
-        w.drainReturn([&](WorkerReturn r) { rets.push_back(std::move(r)); });
-        ASSERT_TRUE(rets.empty());
+        w.drainReturn([&](WorkerReturn r) { if (!r.deferAck) rets.push_back(std::move(r)); });
+        ASSERT_TRUE(rets.empty()) << "only the append-time facts-only return before the move";
         R.reg.remove(5, 0);
         PartitionReplica* again = recreate ? R.add(5, 0) : nullptr;
         WorkerOp own;
@@ -1678,7 +1686,8 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u) << "freed";
         w.doWork(3);                                          // no read of the freed replica
         w.drainReturn([&](WorkerReturn r) {
-            if (r.type == WorkerReturn::Type::ProduceResult) rets.push_back(std::move(r));   // (skip OwnershipAck)
+            // answers only (skip OwnershipAck and the append-time facts-only return)
+            if (r.type == WorkerReturn::Type::ProduceResult && !r.deferAck) rets.push_back(std::move(r));
         });
         EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
         ASSERT_EQ(rets.size(), 1u) << "recreate=" << recreate;
