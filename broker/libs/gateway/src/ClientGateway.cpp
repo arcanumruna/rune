@@ -1775,8 +1775,10 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // update), min-ISR gate (acks=All + isrSize vs minIsr), appendNoSync, and
     // Strict-tier sync().  Returns a ProduceOutcome.
     //
-    // The gateway retains ownership of: LSO tracking (getTxnState), dirty-log
-    // set, replica->onLeaderLogAppended(), and deferred-ack queue management.
+    // The gateway retains ownership of (this NO-WORKER-POOL inline path only):
+    // LSO tracking (getTxnState — F15 S4: never used with a worker pool, where
+    // the owning worker holds the read_committed state), dirty-log set,
+    // replica->onLeaderLogAppended(), and deferred-ack queue management.
     //
     // Durability contract — acks=Leader (acks=1):
     //   Records are written to the OS page cache and visible to Log::read()
@@ -2511,12 +2513,12 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 //           in the Kafka sense refers to open TRANSACTIONS (no-op in Milestone B/C
 //           scope here) — it does NOT mean "allow delivery of truncatable records".
 //           We default ALL subscribers to HW-bounded to be safe.
-//         isolation=1 (read_committed): also bounded by HW.  Once transactions land
-//           (Milestone C), read_committed will additionally be bounded by the real
-//           LSO (log-stable-offset).  LSO ≤ HW always, so the HW gate is the outer
-//           bound and LSO will be the inner one.
-//           // TODO(Milestone C): read_committed additionally uses real LSO once
-//           // transactions land.  For now both modes use HW.
+//         isolation=1 (read_committed): additionally bounded by the LSO and
+//           aborted batches are filtered.  F15 S4 (Option B, I-B): with a worker
+//           pool (every production mode) the gateway HW snapshot only bounds the
+//           PushRead REQUEST — the owning worker decides read_committed from its
+//           own RC state (executePushReadWire_).  Only the no-pool inline path
+//           below keeps a gateway-side LSO (unit rigs; deletion scheduled T16).
 //
 //       If no replica is found (topic not replicated, or replicaRegistry_ null),
 //       fall back to logEndOffset() — single-node / non-replicated path where HW
@@ -2544,6 +2546,7 @@ void ClientGateway::pushSubscriptions()
 {
     using namespace rune::protocol::batch;
 
+    ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
     if (subscriptions_.empty()) return;
 
     for (auto& [subId, sub] : subscriptions_) {
@@ -2628,6 +2631,9 @@ void ClientGateway::pushSubscriptions()
             // snapshot moved past it (any LSO advance needs a marker append,
             // which moves the HW).  No empty-PushRead spin.
             if (sub.parkedAtHw >= 0 && hw <= sub.parkedAtHw) continue;
+            // Hold-capacity fallback (the worker could not hold a not-Ready
+            // read_committed read): back off in push cycles, never a spin.
+            if (sub.retryAtCycle > pushCycle_) continue;
 
             // Look up the owning replica (for the log accessor in the worker).
             const rune::replication::PartitionReplica* repForRead = nullptr;
@@ -3116,6 +3122,25 @@ void ClientGateway::raiseStorageFailure_(const std::string& logDir, int err)
     if (storageFailureHandler_) storageFailureHandler_(logDir, err);
 }
 
+// F15 S4 addendum R-3 + review I-1 / I-2: what a PushReadResult tells the
+// scheduler.  Park the subscription (re-read only once the gateway HW snapshot
+// moves past the one the read was issued at) ONLY on an explicit answer: a
+// bound >= 0, ready, and the cursor at / past it.  An unanswered result (a
+// refusal, no log: bound -1) parks nothing — the next push cycle re-issues.  A
+// notReady result (the worker's hold capacity was exhausted) backs off
+// 1, 2, 4 … 1024 push cycles, reset by the next ready answer.
+void ClientGateway::noteWorkerReadAnswer_(Subscription& sub, int64_t effectiveBound, bool notReady) noexcept
+{
+    if (notReady) {
+        sub.notReadyBackoff = sub.notReadyBackoff == 0 ? 1 : std::min<int64_t>(sub.notReadyBackoff * 2, 1024);
+        sub.retryAtCycle    = pushCycle_ + sub.notReadyBackoff;
+        return;
+    }
+    sub.notReadyBackoff = 0;
+    sub.retryAtCycle    = 0;
+    if (effectiveBound >= 0 && sub.nextOffset >= effectiveBound) sub.parkedAtHw = sub.issuedHw;
+}
+
 void ClientGateway::drainWorkerReturns_()
 {
     using namespace rune::protocol::batch;
@@ -3293,8 +3318,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 // parks until the gateway's HW snapshot moves.
                 if (current) {
                     if (ret.newNextOffset > sub.nextOffset) sub.nextOffset = ret.newNextOffset;
-                    if (!ret.pushRcNotReady() && sub.nextOffset >= ret.pushEffectiveBound())
-                        sub.parkedAtHw = sub.issuedHw;
+                    noteWorkerReadAnswer_(sub, ret.pushEffectiveBound(), ret.pushRcNotReady());
                 }
                 return;
             }
@@ -3486,8 +3510,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // after the last one returned) and park at its effective bound.
             if (!backPressured && chunkPos >= chunkSize) {
                 if (ret.newNextOffset > sub.nextOffset) sub.nextOffset = ret.newNextOffset;
-                if (!ret.pushRcNotReady() && sub.nextOffset >= ret.pushEffectiveBound())
-                    sub.parkedAtHw = sub.issuedHw;
+                noteWorkerReadAnswer_(sub, ret.pushEffectiveBound(), ret.pushRcNotReady());
             }
             return;
         }
@@ -4209,7 +4232,8 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
     //
     // Task 10 round 4 (P1): the marker's offset is NOT pre-computed here; the
     // worker returns where it ACTUALLY landed (ControlRecordAppended) and
-    // onControlRecordAppended_ feeds notifyControlMarker with it.  The caller
+    // the owning worker applied it to its own RC state in the same invocation
+    // (F15 S4; no gateway-side LSO with a worker pool).  The caller
     // gets kControlRecordAsync.  A full ring never drops the marker: it waits in
     // markerSendQueue_ and is retried every doWork, in order.  An unregistered
     // partition is stamped stale by WorkerPool and answered through the normal
@@ -4293,7 +4317,8 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         replica->onLeaderLogAppended();
     }
 
-    // Caller must invoke notifyControlMarker() to update LsoTracker + AbortedTxnIndex.
+    // Synchronous (no-pool inline) path: the caller invokes notifyControlMarker()
+    // to update the inline path's LsoTracker + AbortedTxnIndex.
     return base;
 }
 

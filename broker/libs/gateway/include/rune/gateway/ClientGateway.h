@@ -880,6 +880,9 @@ private:
         int64_t issuedNextOffset = -1;
         int64_t issuedHw         = -1;
         int64_t parkedAtHw       = -1;
+        // Review I-2 fallback: push-cycle backoff after a notReady answer.
+        int64_t notReadyBackoff  = 0;
+        int64_t retryAtCycle     = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -1513,6 +1516,8 @@ private:
     // WorkerReturn type is fully defined in the .cpp (WorkerOp.h included there).
     // -----------------------------------------------------------------------
     void drainWorkerReturns_();
+    void noteWorkerReadAnswer_(Subscription& sub, int64_t effectiveBound, bool notReady) noexcept;
+    int64_t pushCycle_ = 0;   ///< pushSubscriptions passes (F15 S4 backoff clock)
 
     // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index — F15 S4:
     // ONLY for the no-worker-pool inline path (unit rigs: the control thread
