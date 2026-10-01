@@ -764,6 +764,14 @@ public:
         return -1;
     }
 
+    // F19: the push cursor (nextOffset) of subscription `subscriptionId`, or -1
+    // if no such subscription.  Tests assert a non-deliverable batch is never
+    // silently skipped (the cursor does not move past it).
+    [[nodiscard]] int64_t subscriptionNextOffsetForTest(int64_t subscriptionId) const {
+        const auto it = subscriptions_.find(subscriptionId);
+        return it == subscriptions_.end() ? -1 : it->second.nextOffset;
+    }
+
     // -----------------------------------------------------------------------
     // pendingConnectCount — number of in-flight async egress-resolve entries.
     // Includes both the main pending table and the draining-release table.
