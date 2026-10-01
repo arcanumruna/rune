@@ -119,7 +119,7 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(235);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(239);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(1);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(7);
     static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(0);
@@ -177,7 +177,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(235);
+        return static_cast<std::uint16_t>(239);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -3145,6 +3145,69 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *minIsrMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t minIsrId() SBE_NOEXCEPT
+    {
+        return 49;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t minIsrSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool minIsrInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t minIsrEncodingOffset() SBE_NOEXCEPT
+    {
+        return 234;
+    }
+
+    static SBE_CONSTEXPR std::int32_t minIsrNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT32;
+    }
+
+    static SBE_CONSTEXPR std::int32_t minIsrMinValue() SBE_NOEXCEPT
+    {
+        return INT32_C(-2147483647);
+    }
+
+    static SBE_CONSTEXPR std::int32_t minIsrMaxValue() SBE_NOEXCEPT
+    {
+        return INT32_C(2147483647);
+    }
+
+    static SBE_CONSTEXPR std::size_t minIsrEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::int32_t minIsr() const SBE_NOEXCEPT
+    {
+        std::int32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 234, sizeof(std::int32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    WorkerOp &minIsr(const std::int32_t value) SBE_NOEXCEPT
+    {
+        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 234, &val, sizeof(std::int32_t));
+        return *this;
+    }
+
     SBE_NODISCARD static const char *tailKindMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
@@ -3171,7 +3234,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingOffset() SBE_NOEXCEPT
     {
-        return 234;
+        return 238;
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingLength() SBE_NOEXCEPT
@@ -3182,21 +3245,21 @@ public:
     SBE_NODISCARD std::uint8_t tailKindRaw() const SBE_NOEXCEPT
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 234, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 238, sizeof(std::uint8_t));
         return (val);
     }
 
     SBE_NODISCARD TailKind::Value tailKind() const
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 234, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 238, sizeof(std::uint8_t));
         return TailKind::get((val));
     }
 
     WorkerOp &tailKind(const TailKind::Value value) SBE_NOEXCEPT
     {
         std::uint8_t val = (value);
-        std::memcpy(m_buffer + m_offset + 234, &val, sizeof(std::uint8_t));
+        std::memcpy(m_buffer + m_offset + 238, &val, sizeof(std::uint8_t));
         return *this;
     }
 
@@ -3570,6 +3633,10 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("ownershipGen": )";
     builder << +writer.ownershipGen();
+
+    builder << ", ";
+    builder << R"("minIsr": )";
+    builder << +writer.minIsr();
 
     builder << ", ";
     builder << R"("tailKind": )";

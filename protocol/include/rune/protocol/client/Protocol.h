@@ -88,6 +88,9 @@ enum class ErrorCode : uint16_t {
     TopicExists            = 25,  // DefineTopic on an existing topic name
     // storage error codes
     StorageError           = 26,  // the partition's log failed an fsync (fail-stop, KafkaStorageError analogue)
+    // txn: the previous transaction's markers have not all landed yet (Kafka
+    // CONCURRENT_TRANSACTIONS) — RETRIABLE: the producer retries the request.
+    ConcurrentTransactions = 27,
 };
 
 } // namespace rune::protocol::client

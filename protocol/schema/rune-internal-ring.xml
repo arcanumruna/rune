@@ -180,6 +180,10 @@
     <field name="targetReplicaId" id="46" type="uint32"/>
     <field name="incarnation"     id="47" type="uint32"/>
     <field name="ownershipGen"    id="48" type="uint64"/>
+    <!-- Task 10 round 5: PRODUCE — the runtime's current min-ISR admission
+         policy (0 = use the replica's configured minIsr).  The OWNING worker
+         applies the acks=all gate against its own ISR (never the control thread). -->
+    <field name="minIsr"          id="49" type="int32"/>
     <!-- which variable field the tail holds -->
     <field name="tailKind"        id="43" type="TailKind"/>
     <!-- variable tail (record batch / replicated records / isr / owned-set) -->
