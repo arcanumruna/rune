@@ -53,6 +53,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <future>
 #include <memory>
@@ -479,8 +480,12 @@ static void BM_ProduceRTT(benchmark::State& state) {
         (frames > 0) ? static_cast<double>(records) / static_cast<double>(frames)
                      : 0.0;
 
+    // Always report (a gate failure skips the benchmark's counters).
+    std::fprintf(stderr, "PRODUCE_RTT mean_us=%.2f p50_us=%.2f p99_us=%.2f p999_us=%.2f samples=%zu\n",
+                 mean, pct(0.50), pct(0.99), pct(0.999), n);
     // Enforce gate: p99 < 100µs.
-    if (pct(0.99) >= 100.0) {
+    // A p99 needs samples: google-benchmark's 1-iteration probe run must not trip the gate.
+    if (n >= 100 && pct(0.99) >= 100.0) {
         state.SkipWithError("GATE FAIL: ProduceRTT p99 >= 100µs");
     }
 }

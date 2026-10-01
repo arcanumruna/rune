@@ -71,8 +71,10 @@ alloc-free handoff). The agent drains, accumulates records into per-
 **linger elapsed OR `batchBytes` reached OR `flush()` requested**.
 - `Acks`: `None` (fire-and-forget; fully alloc-free end-to-end), `Leader`
   (default; awaits `ProduceResponse`), `All` (treated as Leader for now).
-- Per-send heap is allowed **only** on the opt-in callback/future ack paths,
-  never on the void path.
+- F8c C6: no per-send heap on ANY path — acked sends carry a tagged 64-bit
+  token (a `Completions` queue's CqRef + Token, or the producer's `onAck`
+  function pointer + Token) in the record's ack slot; begin-close
+  (`close(target, token)`) / `close()` / `closeImmediately()` per F8c C6a.
 - Idempotence: each partition stamps a monotonic `baseSequence` into the batch
   header (`producerId` is a local stub pending real `InitProducerId`).
 - `ProducerHub` registers producers with the agent via an atomic COW snapshot —

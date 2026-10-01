@@ -505,6 +505,11 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
         endif()
     endif()
 
+    # F8c C6 — acked producer path (token acks) micro-bench (in-process, no Aeron)
+    add_executable(rune_producer_acked_bench bench/ProducerAckedBench.cpp)
+    target_include_directories(rune_producer_acked_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_producer_acked_bench PRIVATE rune_client_api rune_client_producer)
+
     # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
     add_executable(rune_m2o_claim_bench
         bench/M2OClaimBench.cpp
