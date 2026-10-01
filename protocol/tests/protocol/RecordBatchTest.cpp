@@ -2,6 +2,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/Crc32c.h>
 #include <cstdlib>
+#include <memory>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -902,4 +903,21 @@ TEST(DeleteHorizon, ForEachNonHorizonBatchUnchanged) {
     EXPECT_EQ(tsSeen[0], kBaseTs + 0)  << "Non-horizon: tsDelta path must still work.";
     EXPECT_EQ(tsSeen[1], kBaseTs + 10) << "Non-horizon: tsDelta path must still work.";
     EXPECT_EQ(tsSeen[2], kBaseTs + 25) << "Non-horizon: tsDelta path must still work.";
+}
+
+// forEachRecord is templated: a MOVE-ONLY visitor (not convertible to
+// std::function) compiles and visits every record — no type erasure per record.
+TEST(RecordBatchReaderRegression, ForEachRecordTakesAMoveOnlyVisitor) {
+    rune::protocol::RecordBatchBuilder b(100, 1000);
+    b.append("k1", "v1", 1000);
+    b.append("k2", "v2", 1001);
+    const auto bytes = b.build();
+    rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+    auto n = std::make_unique<int>(0);
+    int64_t lastOff = -1;
+    r.forEachRecord([c = std::move(n), &lastOff](std::string_view, std::string_view, int64_t off, int64_t) mutable {
+        ++*c;
+        lastOff = off;
+    });
+    EXPECT_EQ(lastOff, 101);
 }

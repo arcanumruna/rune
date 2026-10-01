@@ -366,7 +366,16 @@ public:
         return stored == actual;
     }
 
+    /// Cold-path convenience (type-erased).  Hot paths use forEachRecord().
     void forEach(const std::function<void(std::string_view,std::string_view,int64_t,int64_t)>& fn) const {
+        forEachRecord(fn);
+    }
+
+    /// Visit every record: fn(key, value, offset, timestamp).  TEMPLATED — the
+    /// visitor inlines; no std::function per record (broker hot paths: schema-
+    /// validated produce on every worker shard pass).
+    template <class Fn>
+    void forEachRecord(Fn&& fn) const {
         size_t pos = batch::kRecordBatchOverhead;
         int64_t base = baseOffset();
         // CP-8 Fix 2: KIP-534 delete-horizon gating.
