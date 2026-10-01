@@ -822,3 +822,66 @@ TEST(InvokerClient, CloseTerminatesPastAnOrphanedClaimAndClosesTheRegisteredRing
               rc::SendResult::Closed)
         << "the adopted producer's ring is marked closed";
 }
+
+// ---------------------------------------------------------------------------
+// fix5 (txn symmetry): the registration-vs-close race, forced
+// deterministically. close() runs AFTER submitRegistration_'s up-front
+// stopped_ fast-fail check but BEFORE the registration reaches the ring (the
+// test hook fires in exactly that window), so close()'s drain has already run
+// and can never adopt it. Only the post-submit compare_exchange re-check can
+// then notice that close() won and self-close the new producer — otherwise it
+// silently accepts work that nothing will ever process (sends accepted into a
+// dead ring; txn futures that never resolve).
+// ---------------------------------------------------------------------------
+TEST(InvokerClient, ProducerRegisteredAfterCloseDrainSelfClosesRegression) {
+    Rig r(invokerCfg(3796, 3797));
+    r.client.testSetBeforeRegistrationSubmitHook([&] { r.client.close(); });
+    rc::ProducerConfig pcfg;
+    pcfg.acks     = rc::Acks::None;
+    pcfg.lingerUs = 0;
+    auto p = r.client.producer(pcfg); // close() ran inside, after the fast-fail check
+    EXPECT_EQ(r.client.testProducerCount(), 0u) << "the drain ran before the submit";
+    EXPECT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
+              rc::SendResult::Closed);
+}
+
+TEST(InvokerClient, TxnProducerRegisteredAfterCloseDrainSelfClosesRegression) {
+    Rig r(invokerCfg(3798, 3799));
+    r.client.testSetBeforeRegistrationSubmitHook([&] { r.client.close(); });
+    auto tp = r.client.transactionalProducer("tx-race"); // close() ran inside
+    EXPECT_EQ(r.client.testTxnProducerCount(), 0u) << "the drain ran before the submit";
+
+    // Every operation must report the close promptly — never hang, never
+    // silently accept.
+    auto initF = tp.initTransactions();
+    ASSERT_TRUE(ready(initF)) << "initTransactions() must fail at once, not wait forever";
+    EXPECT_THROW(initF.get(), std::runtime_error);
+    tp.beginTransaction();
+    EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
+                 std::logic_error);
+    auto offF = tp.sendOffsetsToTransaction({}, "g");
+    ASSERT_TRUE(ready(offF));
+    EXPECT_THROW(offF.get(), std::runtime_error);
+    auto commitF = tp.commitTransaction();
+    ASSERT_TRUE(ready(commitF));
+    EXPECT_THROW(commitF.get(), std::runtime_error);
+    auto abortF = tp.abortTransaction();
+    ASSERT_TRUE(ready(abortF));
+    EXPECT_THROW(abortF.get(), std::runtime_error);
+}
+
+// The ADOPTED path is symmetric too: a txn producer that close() adopted and
+// failed must also fail every LATER operation promptly (Producer gets
+// SendResult::Closed via its ring's closed word; the txn producer had no such
+// state, so a post-close commitTransaction() future hung forever).
+TEST(InvokerClient, TxnProducerOpsAfterCloseFailPromptlyRegression) {
+    Rig r(invokerCfg(3802, 3803));
+    auto tp = r.client.transactionalProducer("tx-adopted");
+    r.client.close();
+    EXPECT_EQ(r.client.testTxnProducerCount(), 1u) << "adopted by close()'s drain";
+    auto commitF = tp.commitTransaction();
+    ASSERT_TRUE(ready(commitF)) << "must fail at once, not wait forever";
+    EXPECT_THROW(commitF.get(), std::runtime_error);
+    EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
+                 std::logic_error);
+}

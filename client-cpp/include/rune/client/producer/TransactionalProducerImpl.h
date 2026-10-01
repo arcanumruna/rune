@@ -174,8 +174,18 @@ public:
     void onProduceResponse(const uint8_t* buf, std::size_t len,
                            std::function<bool(int32_t, const uint8_t*, std::size_t)> sendFn);
 
-    /// Fail all pending ops (called on close).
+    /// Fail all pending ops (called on close). Also markClosed(reason).
     void failAll(const std::string& reason);
+
+    /// fix5 (txn symmetry with ProducerImpl::markRingClosed): any thread. Fails
+    /// every queued-but-undrained command and drops queued sends, and makes
+    /// every LATER submit fail at once — command futures with
+    /// std::runtime_error(reason), submitSend() with std::logic_error("client
+    /// closed") — instead of queueing work no duty cycle will ever process.
+    /// Touches only the two app-facing queues, under their existing mutexes
+    /// (the closed flags are plain bools guarded by those same mutexes — no new
+    /// atomic); duty-thread state (pendingOps_ etc.) is left to failAll().
+    void markClosed(const std::string& reason);
 
 private:
     // ---- Internal command types in the ring ---------------------------------
@@ -298,10 +308,13 @@ private:
     };
     std::mutex           cmdMtx_;
     std::vector<Command> cmdQueue_;    // app threads push, agent drains
+    bool                 cmdsClosed_ = false;  // fix5: guarded by cmdMtx_
+    std::string          closedReason_;        // fix5: guarded by cmdMtx_
 
     // Pending sends queue (separate from cmdQueue_ to avoid extra lock on send path).
     std::mutex               pendingSendsMtx_;
     std::vector<SendRecord>  pendingSends_;
+    bool                     sendsClosed_ = false;  // fix5: guarded by pendingSendsMtx_
 };
 
 } // namespace rune::client::producer

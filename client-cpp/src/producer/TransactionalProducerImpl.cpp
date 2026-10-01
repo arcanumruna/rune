@@ -87,6 +87,10 @@ std::future<void> TransactionalProducerImpl::submitInitTransactions()
     auto fut = p.get_future();
 
     std::lock_guard<std::mutex> lk(cmdMtx_);
+    if (cmdsClosed_) {  // fix5: closed — fail now, never queue unprocessable work
+        p.set_exception(std::make_exception_ptr(std::runtime_error(closedReason_)));
+        return fut;
+    }
     Command cmd;
     cmd.kind    = CmdKind::InitTransactions;
     cmd.promise = std::move(p);
@@ -115,12 +119,19 @@ void TransactionalProducerImpl::submitSend(int32_t topicId,
     // Queue the send record; agent processes it on doWork.
     // NOTE: Tier-3 sends are control-plane (require pid stamp) — app-thread
     // allocation here is acceptable per the brief (no void-path contract).
+    {
+        // fix5: never silently accept a send nothing will process (consistent
+        // with Producer::send(void) after close()).
+        std::lock_guard<std::mutex> lk(pendingSendsMtx_);
+        if (sendsClosed_) throw std::logic_error("client closed");
+    }
     SendRecord sr;
     sr.topicId   = topicId;
     sr.partition = partition;
     sr.key       = key;
     sr.value.assign(value.begin(), value.end());
     std::lock_guard<std::mutex> lk(pendingSendsMtx_);
+    if (sendsClosed_) throw std::logic_error("client closed"); // closed while building sr
     pendingSends_.push_back(std::move(sr));
 }
 
@@ -132,6 +143,10 @@ std::future<void> TransactionalProducerImpl::submitSendOffsets(
     auto fut = p.get_future();
 
     std::lock_guard<std::mutex> lk(cmdMtx_);
+    if (cmdsClosed_) {  // fix5: closed — fail now, never queue unprocessable work
+        p.set_exception(std::make_exception_ptr(std::runtime_error(closedReason_)));
+        return fut;
+    }
     Command cmd;
     cmd.kind    = CmdKind::SendOffsets;
     cmd.groupId = groupId;
@@ -148,6 +163,10 @@ std::future<void> TransactionalProducerImpl::submitCommit()
     auto fut = p.get_future();
 
     std::lock_guard<std::mutex> lk(cmdMtx_);
+    if (cmdsClosed_) {  // fix5: closed — fail now, never queue unprocessable work
+        p.set_exception(std::make_exception_ptr(std::runtime_error(closedReason_)));
+        return fut;
+    }
     Command cmd;
     cmd.kind    = CmdKind::EndTxnCommit;
     cmd.promise = std::move(p);
@@ -162,6 +181,10 @@ std::future<void> TransactionalProducerImpl::submitAbort()
     auto fut = p.get_future();
 
     std::lock_guard<std::mutex> lk(cmdMtx_);
+    if (cmdsClosed_) {  // fix5: closed — fail now, never queue unprocessable work
+        p.set_exception(std::make_exception_ptr(std::runtime_error(closedReason_)));
+        return fut;
+    }
     Command cmd;
     cmd.kind    = CmdKind::EndTxnAbort;
     cmd.promise = std::move(p);
@@ -798,13 +821,17 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
     pendingOps_.erase(it);
 }
 
-void TransactionalProducerImpl::failAll(const std::string& reason)
+void TransactionalProducerImpl::markClosed(const std::string& reason)
 {
     // Commands the duty cycle never drained (e.g. initTransactions() before
-    // close()): their futures must fail, not hang.
+    // close()): their futures must fail, not hang. Later submits fail at once.
     std::vector<Command> cmds;
     {
         std::lock_guard<std::mutex> lk(cmdMtx_);
+        if (!cmdsClosed_) {
+            cmdsClosed_   = true;
+            closedReason_ = reason;
+        }
         cmds.swap(cmdQueue_);
     }
     for (auto& cmd : cmds) {
@@ -814,8 +841,14 @@ void TransactionalProducerImpl::failAll(const std::string& reason)
     }
     {
         std::lock_guard<std::mutex> lk(pendingSendsMtx_);
+        sendsClosed_ = true;
         pendingSends_.clear();  // no completions carried
     }
+}
+
+void TransactionalProducerImpl::failAll(const std::string& reason)
+{
+    markClosed(reason);
 
     for (auto& [corrId, op] : pendingOps_) {
         try {

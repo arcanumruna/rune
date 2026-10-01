@@ -252,6 +252,15 @@ public:
     [[nodiscard]] int testCloseDrainUnblockCalls() const noexcept {
         return agent_.testCloseDrainUnblockCalls();
     }
+    /// fix5 (txn symmetry) test hook: called inside submitRegistration_ AFTER its
+    /// up-front stopped_ fast-fail check and BEFORE the registration is written
+    /// to the ring — the exact window the post-submit compare_exchange re-check
+    /// in producer()/transactionalProducer() exists for. A test calls close()
+    /// from here to force "close() won the race" deterministically. Cold path
+    /// (registration only); empty by default.
+    void testSetBeforeRegistrationSubmitHook(std::function<void()> fn) {
+        testBeforeRegistrationSubmitHook_ = std::move(fn);
+    }
     /// Test hook (duty-cycle thread only): install a partition route as metadata would.
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
@@ -620,6 +629,7 @@ private:
             onFail();
             throw std::logic_error("client closed");
         }
+        if (testBeforeRegistrationSubmitHook_) [[unlikely]] testBeforeRegistrationSubmitHook_();
         if (submit()) return;
         // Ring full.  Pumping is only safe on the duty-cycle thread OUTSIDE a cycle:
         // from a duty-cycle callback it would re-enter the agent's own poll, and in
@@ -687,6 +697,8 @@ private:
 
     // ---- Runner thread -------------------------------------------------------
     std::atomic<bool> stopped_   {false};
+    // fix5: see testSetBeforeRegistrationSubmitHook(). Empty by default.
+    std::function<void()> testBeforeRegistrationSubmitHook_;
     std::thread       runnerThread_;
 
     // ---- Callback-contract guard (FIX F4) ------------------------------------

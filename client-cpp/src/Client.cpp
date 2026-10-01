@@ -296,6 +296,8 @@ void Client::closeImpl_() {
 
     // TX-5: fail all pending txn producer ops.  No lock: the runner was joined
     // above (Thread mode) or this is the owner thread (Invoker mode).
+    // fix5: failAll() also markClosed()s each one (the txn analogue of
+    // closeAllRings() above), so later operations fail at once, never hang.
     for (auto& tp : txnProducers_) {
         tp->failAll("Client closed");
     }
@@ -1889,6 +1891,20 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
     auto* holder = new std::shared_ptr<producer::TransactionalProducerImpl>(impl);
     submitRegistration_([&] { return agent_.submitRegisterTxnProducer(holder); },
                         [&] { delete holder; });
+
+    // fix5 (symmetry with producerWithRingCap_): the same post-submit seq_cst
+    // compare_exchange re-check, for the same registration-vs-close race — see
+    // the fix3 C1 comment in producerWithRingCap_ for the full memory-model
+    // argument. "Setup phase only" is a documented contract, not an
+    // enforcement, so this path must be as race-safe as producer(). If the CAS
+    // fails, close() already ran (possibly including its drain): self-close so
+    // every later operation fails at once instead of queueing work no duty
+    // cycle will ever process. `holder` is intentionally not freed here — the
+    // same fix3 M1 reasoning (it may already have been adopted and freed).
+    bool expectedNotStopped = false;
+    if (!stopped_.compare_exchange_strong(expectedNotStopped, false, std::memory_order_seq_cst)) {
+        impl->markClosed("Client closed");
+    }
     return TransactionalProducer(std::move(impl));
 }
 
