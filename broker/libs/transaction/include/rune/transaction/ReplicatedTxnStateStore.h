@@ -50,6 +50,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rune::transaction {
@@ -99,6 +100,43 @@ public:
     /// the CG-2 bug of reading only the first segment).
     void rebuildFromLog();
 
+    // -----------------------------------------------------------------------
+    // F15 §5.1 / §5.6 — coordinator load + persisted pid block ceiling.
+    // -----------------------------------------------------------------------
+
+    /// The __transaction_state replica this store writes (control-owned).
+    [[nodiscard]] rune::replication::PartitionReplica* replica() const noexcept { return replica_; }
+
+    /// The folded index (txnId → last metadata) — the coordinator load snapshot.
+    [[nodiscard]] const std::map<TransactionalId, TransactionMetadata, std::less<>>& all() const noexcept {
+        return index_;
+    }
+
+    /// F15 I7 (Kafka ProducerIdManager): append a pid BLOCK CEILING record —
+    /// every producerId below @p ceiling may have been handed out.  The record
+    /// is recognised by its own record-type tag (kPidBlockMagic in the value
+    /// header) and written under the RESERVED compaction key kPidBlockKey, so
+    /// the LogCleaner keeps only the latest ceiling (= the max: ceilings are
+    /// monotone) and the load scan stays bounded.  kPidBlockKey can never be a
+    /// transactional id: its leading 0xFF byte is never valid UTF-8 (Kafka
+    /// STRING) and InitProducerId rejects it explicitly
+    /// (isReservedKey) — metadata is only ever created there.
+    /// \returns the record's offset (commit it by HW > offset), or -1 if the
+    ///          replica is min-ISR-gated.
+    rune::replication::Offset putPidBlockCeiling(ProducerId ceiling);
+
+    /// Highest pid block ceiling folded by rebuildFromLog() (-1 if none).
+    [[nodiscard]] ProducerId persistedPidCeiling() const noexcept { return persistedPidCeiling_; }
+
+    /// Value-header tag of a pid block ceiling record ("PIDB", little-endian).
+    static constexpr uint32_t kPidBlockMagic = 0x42444950u;
+
+    /// Reserved compaction key of the pid block ceiling record.
+    static constexpr std::string_view kPidBlockKey{"\xFF__rune_pid_block", 17};
+
+    /// True for a key reserved by this store (never a valid transactional id).
+    [[nodiscard]] static bool isReservedKey(std::string_view txnId) noexcept { return txnId == kPidBlockKey; }
+
 private:
     // -----------------------------------------------------------------------
     // Encode helpers
@@ -125,6 +163,9 @@ private:
     std::map<TransactionalId, TransactionMetadata, std::less<>> index_;
 
     rune::replication::PartitionReplica* replica_;  ///< non-owning
+
+    /// F15 I7: highest pid block ceiling seen by rebuildFromLog() (-1 = none).
+    ProducerId persistedPidCeiling_ = -1;
 
     // Per-store reusable scratch buffer — avoids per-put heap allocation.
     std::vector<uint8_t> recordScratch_;

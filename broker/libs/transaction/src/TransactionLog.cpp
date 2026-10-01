@@ -88,6 +88,7 @@ void TransactionLog::appendFromMetadata(const TransactionMetadata& meta,
     e.pendingNewProducerId    = meta.pendingNewProducerId;    // A2
     e.pendingNewProducerEpoch = meta.pendingNewProducerEpoch; // A2
     e.pendingOffsets          = meta.pendingOffsets;           // F3
+    e.fencingEpoch            = meta.fencingEpoch;             // F15 concern 3
     append(e);
 }
 
@@ -120,8 +121,8 @@ void TransactionLog::applyEntry(const TxnLogEntry& entry) {
     // F3: recover pending consumer-group offsets so a recovered PrepareCommit
     // can re-apply them on resolve (durable-before-visible ordering).
     meta.pendingOffsets          = entry.pendingOffsets;
-    // fencingEpoch is not persisted; reset to false on recover
-    meta.fencingEpoch      = false;
+    // F15 concern 3: fencingEpoch is persisted in header byte 27 (bit0).
+    meta.fencingEpoch      = entry.fencingEpoch;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +135,7 @@ void TransactionLog::applyEntry(const TxnLogEntry& entry) {
 //   [16..23]  int64   producerId
 //   [24..25]  int16   producerEpoch
 //   [26]      uint8   state
-//   [27]      uint8   _pad = 0
+//   [27]      uint8   flags: bit0 = fencingEpoch (F15; was always-0 padding)
 //   [28..31]  int32   coordinatorEpoch
 //   [32..35]  int32   txnTimeoutMs
 //   [36..37]  uint16  txnIdLen
@@ -207,7 +208,7 @@ void TransactionLog::appendRecord(const TxnLogEntry& entry) {
     write_le<int64_t> (p + 16, entry.producerId);
     write_le<int16_t> (p + 24, entry.producerEpoch);
     p[26] = static_cast<uint8_t>(entry.state);
-    p[27] = 0u; // padding
+    p[27] = entry.fencingEpoch ? 0x01u : 0u;   // flags (F15): bit0 = fencingEpoch
     write_le<int32_t> (p + 28, entry.coordinatorEpoch);
     write_le<int32_t> (p + 32, entry.txnTimeoutMs);
     write_le<uint16_t>(p + 36, txnIdLen);
@@ -311,6 +312,7 @@ void TransactionLog::replayAndTruncate() {
         int64_t producerId        = read_le<int64_t> (rb + 16);
         int16_t producerEpoch     = read_le<int16_t> (rb + 24);
         uint8_t stateRaw          = rb[26];
+        const bool fencingFlag    = (rb[27] & 0x01u) != 0;   // F15: flags byte
         int32_t coordinatorEpoch  = read_le<int32_t> (rb + 28);
         int32_t txnTimeoutMs      = read_le<int32_t> (rb + 32);
         uint16_t txnIdLen         = read_le<uint16_t>(rb + 36);
@@ -392,6 +394,7 @@ void TransactionLog::replayAndTruncate() {
         entry.pendingNewProducerId    = pendingNewPid;                              // A2
         entry.pendingNewProducerEpoch = static_cast<ProducerEpoch>(pendingNewEpoch);// A2
         entry.pendingOffsets          = std::move(pendingOffsets);                   // F3
+        entry.fencingEpoch            = fencingFlag;                                 // F15
         applyEntry(entry);
 
         pos         += static_cast<int64_t>(totalLength);

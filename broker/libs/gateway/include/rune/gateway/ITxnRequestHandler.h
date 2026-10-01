@@ -13,6 +13,7 @@
 // C++23.
 
 #include <cstddef>
+#include <climits>
 #include <cstdint>
 
 namespace rune::gateway {
@@ -56,15 +57,21 @@ struct ITxnRequestHandler {
     // Task 10 fix 3: a COMMIT/ABORT control marker this node could not append
     // (the partition is no longer here: NotLeader).  Never silently dropped —
     // the coordinator is told.  Cold path; default no-op for test doubles.
+    //
+    // F15 m3: coordinatorEpoch is the epoch the marker was dispatched under
+    // (kAnyCoordinatorEpoch when the gateway no longer knows it); a coordinator
+    // ignores replies for an epoch it no longer serves.
+    static constexpr int32_t kAnyCoordinatorEpoch = INT32_MIN;
     virtual void onControlMarkerRefused(int32_t /*topicId*/, int32_t /*partition*/,
-                                        int64_t /*producerId*/, int16_t /*errorCode*/) {}
+                                        int64_t /*producerId*/, int16_t /*errorCode*/,
+                                        int32_t /*coordinatorEpoch*/) {}
 
     // Task 10 round 5: an asynchronously appended marker LANDED (the gateway
     // already fed its authoritative offset to the LSO / aborted index).  The
     // coordinator completes the transaction only once every participant
     // partition's marker landed.  Cold path; default no-op for test doubles.
     virtual void onControlMarkerLanded(int32_t /*topicId*/, int32_t /*partition*/,
-                                       int64_t /*producerId*/) {}
+                                       int64_t /*producerId*/, int32_t /*coordinatorEpoch*/) {}
 };
 
 } // namespace rune::gateway

@@ -564,9 +564,9 @@ TEST(TransactionLogTest, AbortLifecycleReplay) {
 }
 
 // ---------------------------------------------------------------------------
-// TEST: fencingEpoch is NOT persisted (always false on recovery)
+// TEST: fencingEpoch IS persisted (F15: header byte 27, bit0)
 // ---------------------------------------------------------------------------
-TEST(TransactionLogTest, FencingEpochNotPersisted) {
+TEST(TransactionLogTest, FencingEpochPersistedInFlagsByte) {
     auto path = tmpPath();
     TempFile tf{path};
 
@@ -577,7 +577,7 @@ TEST(TransactionLogTest, FencingEpochNotPersisted) {
     meta.state         = TxnState::PrepareAbort;
     meta.txnStartNs    = 0;
     meta.txnTimeoutMs  = 60'000;
-    meta.fencingEpoch  = true; // this should NOT be persisted
+    meta.fencingEpoch  = true; // F15 S7 fix round 1: persisted (header byte 27, bit0)
 
     {
         TransactionLog log(path);
@@ -587,7 +587,7 @@ TEST(TransactionLogTest, FencingEpochNotPersisted) {
     TransactionLog log2(path);
     const auto* m = log2.metadata("txn-fence");
     ASSERT_NE(m, nullptr);
-    EXPECT_FALSE(m->fencingEpoch); // must be false after recovery
+    EXPECT_TRUE(m->fencingEpoch); // F15 concern 3: the §5.4 fence answers survive recovery
 }
 
 // ===========================================================================

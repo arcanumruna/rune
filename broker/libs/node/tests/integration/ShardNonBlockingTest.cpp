@@ -1107,7 +1107,7 @@ struct CapturingTxn final : rune::gateway::ITxnRequestHandler {
     size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
     size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
     size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    void onControlMarkerRefused(int32_t t, int32_t p, int64_t, int16_t e) override { ++refused; topic = t; part = p; err = e; }
+    void onControlMarkerRefused(int32_t t, int32_t p, int64_t, int16_t e, int32_t) override { ++refused; topic = t; part = p; err = e; }
 };
 } // namespace
 
@@ -1751,7 +1751,7 @@ TEST(ReplicaLifetimeRegression, MarkerOffsetIsTheWorkersActualAppendOffset) {
     m.gw.notifyTransactionalBatch(0, 0, /*pid*/7, /*base*/0);   // txn opened at offset 0
     for (int i = 0; i < 3; ++i) ASSERT_TRUE(m.pool.tryEnqueueOp(0, 0, produceOp(m.r, 100 + i)));
     const auto marker = txnBatch(7);
-    const int64_t rc = m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, /*commit=*/false);
+    const int64_t rc = m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, /*commit=*/false, /*coordinatorEpoch=*/0);
     EXPECT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync) << "never a pre-computed offset";
     EXPECT_TRUE(m.gw.abortedRangesForTest(0, 0).empty()) << "nothing recorded before the append happened";
     m.runWorker(1);
@@ -1768,7 +1768,7 @@ TEST(ReplicaLifetimeRegression, BackPressuredMarkerIsQueuedNotDroppedAndHoldsLat
     WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
     while (m.pool.worker(0).tryEnqueueOp(filler)) {}       // ring full
     const auto marker = txnBatch(9);
-    EXPECT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 9, true),
+    EXPECT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 9, true, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
     EXPECT_EQ(m.gw.markersQueuedForTest(), 1u) << "queued, never dropped";
     drainIdle(m.pool.worker(0));                            // ring drains (fillers; bounded)
@@ -1798,7 +1798,7 @@ TEST(ReplicaLifetimeRegression, MarkerRefusedWhileRegisteredIsReRoutedAndLandsOn
     // marker while the partition is registered re-routes it; it lands exactly once.
     MarkerRig m;
     const auto marker = txnBatch(11);
-    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true),
+    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
     // Drop the worker's copy and simulate the guard refusing it (token = 1).
     m.pool.worker(0).doWork(1);
@@ -1808,7 +1808,7 @@ TEST(ReplicaLifetimeRegression, MarkerRefusedWhileRegisteredIsReRoutedAndLandsOn
     ASSERT_EQ(rets[0].type, WorkerReturn::Type::ControlRecordAppended);
     const int64_t leoAfterFirst = m.r->log()->logEndOffset();
     // A forced refusal for a DIFFERENT issued marker (re-issue a second one).
-    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true),
+    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
     WorkerReturn refused;
     refused.type = WorkerReturn::Type::ControlRecordRefused;

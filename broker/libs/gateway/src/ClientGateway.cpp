@@ -3017,14 +3017,15 @@ void ClientGateway::onControlRecordAppended_(const rune::node::WorkerReturn& ret
         spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} FAILED "
                       "to append (error={}) — surfaced to the txn coordinator",
                       m.topicId, m.partition, m.producerId, ret.errorCode);
-        if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode);
+        if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode,
+                                                             m.coordinatorEpoch);
         return;
     }
     // The AUTHORITATIVE offset: where the worker actually appended the marker.
     notifyControlMarker(m.topicId, m.partition, m.producerId, ret.baseOffset, m.commit);
     // Round 5: only now may the coordinator count this partition's marker as
     // written (the transaction completes when the last one lands).
-    if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId);
+    if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId, m.coordinatorEpoch);
 }
 
 void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
@@ -3043,7 +3044,8 @@ void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
             if (invariantViolationHandler_) invariantViolationHandler_(what);
             return;
         }
-        if (txnService_) txnService_->onControlMarkerRefused(ret.topicId, ret.partition, ret.producerId, ret.errorCode);
+        if (txnService_) txnService_->onControlMarkerRefused(ret.topicId, ret.partition, ret.producerId, ret.errorCode,
+                                                             ITxnRequestHandler::kAnyCoordinatorEpoch);
         return;
     }
     MarkerInFlight& m = it->second;
@@ -3070,7 +3072,8 @@ void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
     spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} REFUSED "
                   "(partition not on this node) — surfaced to the txn coordinator as NotLeader",
                   m.topicId, m.partition, m.producerId);
-    if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode);
+    if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode,
+                                                         m.coordinatorEpoch);
     markersInFlight_.erase(it);
 }
 
@@ -4093,9 +4096,28 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
 //
 // Single-writer: must be called on the duty-cycle thread.
 // ---------------------------------------------------------------------------
+std::size_t ClientGateway::purgeQueuedMarkers(int32_t olderThan)
+{
+    std::size_t purged = 0;
+    for (auto q = markerSendQueue_.begin(); q != markerSendQueue_.end();) {
+        auto it = markersInFlight_.find(*q);
+        if (it != markersInFlight_.end() && it->second.coordinatorEpoch < olderThan) {
+            markersInFlight_.erase(it);
+            q = markerSendQueue_.erase(q);
+            ++purged;
+        } else {
+            ++q;
+        }
+    }
+    if (purged > 0)
+        spdlog::info("ClientGateway: purged {} queued control marker(s) of coordinator epochs < {}", purged, olderThan);
+    return purged;
+}
+
 int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
                                             std::span<const uint8_t> marker,
-                                            int64_t producerId, bool commit)
+                                            int64_t producerId, bool commit,
+                                            int32_t coordinatorEpoch)
 {
     if (!topicRegistry_) {
         spdlog::warn("ClientGateway::appendControlRecord: no TopicRegistry — dropped");
@@ -4147,6 +4169,7 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         m.partition  = partition;
         m.producerId = producerId;
         m.commit     = commit;
+        m.coordinatorEpoch = coordinatorEpoch;
         m.bytes.assign(marker.begin(), marker.end());
         markersInFlight_.emplace(token, std::move(m));
         if (!markerSendQueue_.empty() || !trySendMarker_(token)) {

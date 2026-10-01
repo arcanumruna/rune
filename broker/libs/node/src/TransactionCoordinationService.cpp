@@ -6,7 +6,8 @@
 //   - Persist resulting TransactionMetadata via ReplicatedTxnStateStore (acks=All)
 //     BEFORE responding (persist-before-respond contract).
 //   - Encode the client-protocol response (TxnMessages.h structs).
-//   - NotCoordinator fence on every handler when isLocalCoordinator()==false.
+//   - NotCoordinator fence on every handler while the coordinator is not
+//     Loaded (F15 §5.1 load state machine — see the header).
 //   - doWork drives coordinator timeout aborts (marker resolution is Task 8).
 //
 // Error-code mapping (TransactionCoordinator → Protocol.h):
@@ -102,70 +103,162 @@ NodeId TransactionCoordinationService::coordinatorFor(const TransactionalId& /*t
 }
 
 // ---------------------------------------------------------------------------
-// doWork — drive coordinator timeout aborts.
+// F15 §5.1 — coordinator load state machine.
+// ---------------------------------------------------------------------------
+bool TransactionCoordinationService::loadable_() const
+{
+    if (!isLocalCoordinator()) return false;            // FindCoordinator routes here
+    if (txnState_ == nullptr) return true;              // store-less unit rigs
+    const auto* r = txnState_->replica();
+    // All plain reads: the txn-state replica is control-owned (BrokerNode
+    // drives topicId < 0 replicas on the control thread).
+    return r->role() == rune::replication::Role::Leader
+        && r->isLeaderComplete()                        // served HW released from the stale floor
+        && r->highWatermark() == r->logEndOffset();     // nothing uncommitted above HW (Q2)
+}
+
+bool TransactionCoordinationService::stillLoaded_() const
+{
+    if (!isLocalCoordinator()) return false;
+    if (txnState_ == nullptr) return true;
+    const auto* r = txnState_->replica();
+    return r->role() == rune::replication::Role::Leader &&
+           static_cast<int32_t>(r->epoch()) == coordinatorEpoch_;
+}
+
+bool TransactionCoordinationService::ensureLoaded_(int64_t nowNs)
+{
+    if (loadState_ == LoadState::Loaded) {
+        if (stillLoaded_()) {
+            advancePidBlock_();
+            return true;
+        }
+        unload_();                                      // an epoch change reloads below
+    }
+    if (!loadable_()) return false;
+    load_(nowNs);
+    advancePidBlock_();
+    return true;
+}
+
+void TransactionCoordinationService::load_(int64_t nowNs)
+{
+    // While Unloaded this service is the txn-state partition's sole appender
+    // and does not append, so HW == LEO means the whole log is committed: fold
+    // it (rebuildFromLog reads [0, HW)).  Cold, synchronous, control thread.
+    if (txnState_ != nullptr) {
+        txnState_->rebuildFromLog();
+        coordinatorEpoch_ = static_cast<int32_t>(txnState_->replica()->epoch());
+    } else {
+        coordinatorEpoch_ = ++localLoads_;
+    }
+    const tx::ProducerId maxPid =
+        coordinator_.reload(txnState_ ? txnState_->all() : noSnapshot_, coordinatorEpoch_, nowNs);
+    awaiting_.clear();
+    if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_);   // older epochs' leftovers
+    if (txnState_ != nullptr) {
+        // I7: the next pid lies at or above every ceiling a previous coordinator
+        // persisted (idempotent pids are recorded nowhere else) and above every
+        // pid in the log.  Nothing is handed out until a fresh ceiling commits.
+        tx::ProducerId base = txnState_->persistedPidCeiling();
+        if (maxPid + 1 > base) base = maxPid + 1;
+        if (base > 0) coordinator_.allocator().reseedAtLeast(base - 1);
+        coordinator_.allocator().resetGate();             // gated; no limit from an earlier load
+        pidCeilingPending_       = -1;
+        pidCeilingPendingOffset_ = -1;
+    }
+    loadState_ = LoadState::Loaded;
+    spdlog::info("TCS: coordinator LOADED (coordinatorEpoch={}, {} transactional ids, next pid {})",
+                 coordinatorEpoch_, coordinator_.size(), coordinator_.allocator().nextId());
+}
+
+void TransactionCoordinationService::unload_()
+{
+    // m3: every deferred EndTxn is answered NotCoordinator (the client
+    // re-discovers and retries; the new coordinator answers from the durable
+    // state), every marker task is dropped.
+    for (auto& [pid, a] : awaiting_) {
+        if (!a.respPending || gateway_ == nullptr) continue;
+        pc::EndTxnResponse resp;
+        resp.sessionId     = a.sessionId;
+        resp.correlationId = a.correlationId;
+        resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+        std::array<uint8_t, pc::EndTxnResponse::ENCODED_SIZE> buf{};
+        const std::size_t n = resp.encode(buf.data());
+        (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
+    }
+    awaiting_.clear();
+    if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_ + 1);   // this (now old) epoch
+    coordinator_.clear();
+    pidCeilingPending_       = -1;
+    pidCeilingPendingOffset_ = -1;
+    spdlog::info("TCS: coordinator UNLOADED (coordinatorEpoch={})", coordinatorEpoch_);
+    loadState_ = LoadState::Unloaded;
+}
+
+bool TransactionCoordinationService::currentEpoch_(int32_t coordinatorEpoch) const noexcept
+{
+    return loadState_ == LoadState::Loaded &&
+           (coordinatorEpoch == rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch ||
+            coordinatorEpoch == coordinatorEpoch_);
+}
+
+// ---------------------------------------------------------------------------
+// F15 §5.6 — persisted pid block ceiling (Kafka ProducerIdManager).
+// ---------------------------------------------------------------------------
+void TransactionCoordinationService::requestPidCeiling_(int64_t ceiling)
+{
+    const int64_t off = txnState_->putPidBlockCeiling(ceiling);
+    if (off < 0) return;                               // min-ISR: retried on the next pass
+    pidCeilingPending_       = ceiling;
+    pidCeilingPendingOffset_ = off;
+}
+
+void TransactionCoordinationService::advancePidBlock_()
+{
+    if (txnState_ == nullptr || loadState_ != LoadState::Loaded) return;
+    auto& alloc = coordinator_.allocator();
+    if (pidCeilingPendingOffset_ < 0) {
+        // Prefetch: keep a committed half-block ahead so steady state never waits.
+        const int64_t limit = alloc.committedLimit();
+        const int64_t next  = alloc.nextId();
+        if (limit - next > tx::ProducerIdAllocator::kBlockSize / 2) return;
+        requestPidCeiling_((limit > next ? limit : next) + tx::ProducerIdAllocator::kBlockSize);
+        if (pidCeilingPendingOffset_ < 0) return;
+    }
+    // Hand pids out of the new block only once its ceiling record is committed.
+    if (txnState_->replica()->highWatermark() > pidCeilingPendingOffset_) {
+        alloc.commitLimit(pidCeilingPending_);
+        pidCeilingPending_       = -1;
+        pidCeilingPendingOffset_ = -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// doWork — drive coordinator timeout aborts (only while Loaded).
 // ---------------------------------------------------------------------------
 int TransactionCoordinationService::doWork(int64_t nowNs) {
-    // CG-6 pattern: detect Follower→Leader TRANSITION (not every doWork while
-    // already leader) to rebuild the in-memory txn index from the replicated log.
-    // Guard mirrors GroupCoordinationService::doWork exactly:
-    //   - rebuild fires once on the first duty cycle after becoming leader.
-    //   - losing leadership resets wasLeader_ so the next election triggers again.
-    // Without this guard, rebuildFromLog() would clear index_ every cycle,
-    // wiping freshly-put in-memory state before TX-4 marker resolution completes.
-    const bool leader = isLocalCoordinator();
-    if (leader && !wasLeader_) {
-        // Follower→Leader: rebuild index from replicated log.
-        if (txnState_) txnState_->rebuildFromLog();
-        wasLeader_ = true;
-    } else if (!leader && wasLeader_) {
-        // Leader→Follower: reset so the next election triggers another rebuild.
-        wasLeader_ = false;
-    }
-
-    if (!leader) return 0;
+    // F15 §5.1: replaces the CG-6 Follower→Leader "rebuild the store" edge — the
+    // coordinator is LOADED (store folded to the committed HW + coordinator
+    // reloaded) only when the load predicate holds, and serves only then.
+    if (!ensureLoaded_(nowNs)) return 0;
 
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     int work = coordinator_.doWork(nowNs);
 
-    // TX-4 Task 8: Resolve pending markers (internally-initiated aborts).
-    //
-    // pendingMarkerTransactions() returns all PrepareCommit/PrepareAbort entries
-    // whose markersPending==true (set by doWork() timeout path or epoch-fence
-    // abort in initProducerId).  For each, ControlMarker::resolvePendingMarkers()
-    // builds a COMMIT or ABORT control batch for every partition in the txn and
-    // calls appendFn(tp, batch).
-    //
-    // We:
-    //   1. Snapshot pendingMarkerTransactions() BEFORE resolving to get the
-    //      commit/abort info for each (producerId, partition) — needed to feed
-    //      notifyControlMarker() after the append.
-    //   2. Build an appendFn that:
-    //        a. Looks up topicId from the topic name via topics_->topicIdForName.
-    //        b. Calls gateway_->appendControlRecord(topicId, partition, bytes).
-    //        c. Records the (topicId, partition, producerId, markerOffset, commit)
-    //           in toNotifyScratch_ for notifyControlMarker() calls.
-    //   3. Call resolvePendingMarkers() (which also calls completeTransaction()).
-    //   4. Feed notifyControlMarker() for all successfully-appended markers.
-    //
-    // Design note: we do NOT call notifyControlMarker() inside appendFn because
-    // completeTransaction() is called AFTER all appendFn calls for a txn — we
-    // want both appendFn and completeTransaction to succeed before feeding LSO.
-    //
-    // Zero-alloc: pendingByPidScratch_ and toNotifyScratch_ are pre-reserved
-    // member containers (clear+refill each cycle, no heap alloc in steady state).
-    //
-    // Single-writer (duty-cycle thread): no locks needed.
-    // Task 10 round 5 (Kafka semantics): the transaction STAYS PrepareAbort /
-    // PrepareCommit until every participant partition's marker has LANDED
-    // (onControlMarkerLanded); only then completeTransaction.  dispatchMarkers_
-    // hands the markers out and clears markersPending so they are not re-driven.
+    // TX-4 Task 8: Resolve pending markers (internally-initiated aborts and the
+    // Prepare* re-driven after a load).  Task 10 round 5 (Kafka semantics): the
+    // transaction STAYS PrepareAbort / PrepareCommit until every participant
+    // partition's marker has LANDED (onControlMarkerLanded); only then
+    // completeTransaction.  dispatchMarkers_ hands the markers out and clears
+    // markersPending so they are not re-driven.
     const bool haveGateway = (gateway_ != nullptr) && (topics_ != nullptr);
     const bool haveOverride = static_cast<bool>(appendFnOverride_);
     if (haveGateway || haveOverride) {
         const auto pending = coordinator_.pendingMarkerTransactions();
         for (const auto& p : pending) {
             coordinator_.markersDispatched(p.txnId);
-            dispatchMarkers_(p.txnId, p.producerId, p.producerEpoch, p.coordinatorEpoch,
+            dispatchMarkers_(p.txnId, p.producerId, p.producerEpoch, coordinatorEpoch_,
                              p.commit, p.partitions);
             ++work;
         }
@@ -190,8 +283,8 @@ size_t TransactionCoordinationService::handleInitProducerId(
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
 
-    // NotCoordinator fence.
-    if (!isLocalCoordinator()) {
+    // NotCoordinator fence (F15 §5.1: served only while Loaded).
+    if (!ensureLoaded_(nowNs)) {
         resp.producerId    = -1;
         resp.producerEpoch = -1;
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
@@ -208,9 +301,23 @@ size_t TransactionCoordinationService::handleInitProducerId(
         txnIdOpt = txnIdScratch_;
     }
 
+    // F15 I1: the pid block ceiling's reserved compaction key is never a
+    // transactional id (a txn record under it would be compacted against the
+    // ceiling).  Non-retriable, nothing created or persisted.
+    if (txnIdOpt.has_value() && tx::ReplicatedTxnStateStore::isReservedKey(*txnIdOpt)) {
+        resp.producerId    = -1;
+        resp.producerEpoch = -1;
+        resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
+        if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return 0;
+        return resp.encode(out);
+    }
+
     // Call coordinator.
     const auto result = coordinator_.initProducerId(
         txnIdOpt, msg.transactionTimeoutMs, nowNs);
+
+    // F15 I7: the allocation may have crossed half a block — prefetch the next.
+    advancePidBlock_();
 
     // Persist metadata BEFORE responding (persist-before-respond).
     if (result.ok() && txnIdOpt.has_value()) {
@@ -219,7 +326,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
             // Ignore persist failure here: the coordinator already updated
             // in-memory state; a log failure is a degraded-durability condition
             // not a protocol error (minIsr-gate on startup would have prevented this).
-            txnState_->put(*meta, meta->coordinatorEpoch);
+            txnState_->put(*meta, coordinatorEpoch_);
         }
     }
 
@@ -241,8 +348,8 @@ size_t TransactionCoordinationService::handleAddPartitions(
     if (!msgOpt) return 0;
     const auto& msg = *msgOpt;
 
-    // NotCoordinator fence — build minimal response.
-    if (!isLocalCoordinator()) {
+    // NotCoordinator fence — build minimal response (F15 §5.1: only while Loaded).
+    if (!ensureLoaded_(nowNs)) {
         // Encode all partitions with NotCoordinator using partResultScratch_ directly
         // (no per-call vector alloc — member scratch cleared+refilled).
         const size_t partCount = msg.partitions.size();
@@ -308,7 +415,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, meta->coordinatorEpoch);
+            txnState_->put(*meta, coordinatorEpoch_);
         }
     }
 
@@ -345,7 +452,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
 
-    if (!isLocalCoordinator()) {
+    if (!ensureLoaded_(nowNs)) {
         resp.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return 0;
         return resp.encode(out);
@@ -373,7 +480,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, meta->coordinatorEpoch);
+            txnState_->put(*meta, coordinatorEpoch_);
         }
     }
 
@@ -395,7 +502,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
 
     // NotCoordinator fence — encode all entries with NotCoordinator using
     // partResultScratch_ directly (no per-call vector alloc).
-    if (!isLocalCoordinator()) {
+    if (!ensureLoaded_(nowNs)) {
         const size_t entryCount = msg.entries.size();
         const size_t needed = pc::TxnOffsetCommitResponse::encodedSizeFor(entryCount);
         if (outCap < needed) return 0;
@@ -453,7 +560,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     if (result.ok()) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, meta->coordinatorEpoch);
+            txnState_->put(*meta, coordinatorEpoch_);
         }
     }
 
@@ -490,7 +597,7 @@ size_t TransactionCoordinationService::handleEndTxn(
     resp.sessionId     = msg.sessionId;
     resp.correlationId = msg.correlationId;
 
-    if (!isLocalCoordinator()) {
+    if (!ensureLoaded_(nowNs)) {
         resp.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
         if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return 0;
         return resp.encode(out);
@@ -505,12 +612,15 @@ size_t TransactionCoordinationService::handleEndTxn(
     const auto result = coordinator_.endTransaction(
         txnIdScratch_, msg.producerId, msg.producerEpoch, commit, nowNs);
 
+    // F15 §5.4: an OK for a same-direction retry of a COMPLETED transaction is
+    // the idempotent answer — no transition, nothing persisted, no markers.
+    const bool transitioned = result.ok() && !result.alreadyComplete;
+
     // Persist before responding (endTxn sets PREPARE state — durable).
-    // Pass the real coordinatorEpoch from metadata (not literal 0).
-    if (result.ok()) {
+    if (transitioned) {
         const auto* meta = coordinator_.metadata(txnIdScratch_);
         if (meta && txnState_) {
-            txnState_->put(*meta, meta->coordinatorEpoch);
+            txnState_->put(*meta, coordinatorEpoch_);
         }
     }
 
@@ -519,20 +629,23 @@ size_t TransactionCoordinationService::handleEndTxn(
     // DEFERRED until every marker has landed — the producer cannot start its
     // next transaction (whose batches could otherwise land ahead of a marker, or
     // be closed by it in the LSO bookkeeping) before then.
-    if (result.ok() && gateway_ && topics_) {
+    if (transitioned && gateway_ && topics_) {
         const auto* m = coordinator_.metadata(txnIdScratch_);
         if (m) {
             const std::vector<tx::TopicPartition> parts(m->partitions.begin(), m->partitions.end());
             const bool isCommit = (m->state == tx::TxnState::PrepareCommit);
             const tx::TransactionalId txnId = txnIdScratch_;
-            if (dispatchMarkers_(txnId, m->producerId, m->producerEpoch, m->coordinatorEpoch,
+            if (dispatchMarkers_(txnId, m->producerId, m->producerEpoch, coordinatorEpoch_,
                                  isCommit, parts, msg.sessionId, msg.correlationId)) {
                 return 0;   // response sent by completeAwaiting_ when the last marker lands
             }
         }
     }
 
-    resp.errorCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
+    // F15 §5.4: the coordinator implements the whole EndTxn idempotency table
+    // (Prepare* same direction 27 / opposite 19, Complete* same direction 0 /
+    // opposite 19 or 18) — no InvalidTxnState→27 remapping here.
+    resp.errorCode = txnErrorToProtocol(result.errorCode);
     if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return 0;
     return resp.encode(out);
 }
@@ -571,7 +684,7 @@ bool TransactionCoordinationService::dispatchMarkers_(
             }
             const int64_t off = gateway_->appendControlRecord(
                 *topicIdOpt, tp.partition, std::span<const uint8_t>(batch.data(), batch.size()),
-                producerId, commit);
+                producerId, commit, coordinatorEpoch);
             if (off == rune::gateway::ClientGateway::kControlRecordAsync) {
                 ++a.outstanding;                       // lands later: onControlMarkerLanded
             } else if (off >= 0) {
@@ -580,8 +693,13 @@ bool TransactionCoordinationService::dispatchMarkers_(
                 spdlog::warn("TCS: appendControlRecord failed topicId={} partition={}", *topicIdOpt, tp.partition);
             }
         } else if (appendFnOverride_) {
+            // TEST SEAM: the override returns an APPEND offset only — a marker
+            // counts toward completion once COMMITTED (§4), which the seam
+            // cannot observe.  So the transaction stays Prepare* (awaiting) and
+            // is dispatched exactly once; it is never completed by the seam.
             (void)appendFnOverride_(tp.topic, tp.partition,
                                     std::span<const uint8_t>(batch.data(), batch.size()));
+            ++a.outstanding;
         }
     }
     if (a.outstanding == 0) {
@@ -611,6 +729,13 @@ void TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     awaiting_.erase(it);
     const auto r = coordinator_.completeTransaction(a.txnId);
     ++transactionsCompleted_;
+    // F15 m4: persist the resting Complete* (offsets were applied first, inside
+    // completeTransaction).  It need not commit before the EndTxn OK: if it is
+    // lost, the next coordinator loads Prepare*, re-drives the (idempotent)
+    // markers and offsets, and completes again.
+    if (r.ok() && txnState_ != nullptr) {
+        if (const auto* meta = coordinator_.metadata(a.txnId)) (void)txnState_->put(*meta, coordinatorEpoch_);
+    }
     if (respond && a.respPending && gateway_) {
         pc::EndTxnResponse resp;
         resp.sessionId     = a.sessionId;
@@ -622,15 +747,20 @@ void TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     }
 }
 
-void TransactionCoordinationService::onControlMarkerLanded(int32_t, int32_t, int64_t producerId)
+void TransactionCoordinationService::onControlMarkerLanded(int32_t, int32_t, int64_t producerId,
+                                                           int32_t coordinatorEpoch)
 {
+    // m3: a reply for a marker dispatched by an earlier load matches no task.
+    if (!currentEpoch_(coordinatorEpoch)) return;
     resolveMarker_(producerId);
 }
 
 void TransactionCoordinationService::onControlMarkerRefused(int32_t topicId, int32_t partition,
-                                                            int64_t producerId, int16_t errorCode)
+                                                            int64_t producerId, int16_t errorCode,
+                                                            int32_t coordinatorEpoch)
 {
     ++controlMarkersRefused_;
+    if (!currentEpoch_(coordinatorEpoch)) return;   // m3: an earlier load's marker
     spdlog::error("TCS: control marker REFUSED/FAILED topic={} partition={} producerId={} err={} "
                   "(counted as resolved so the transaction can complete)",
                   topicId, partition, producerId, errorCode);
