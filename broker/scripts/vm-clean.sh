@@ -5,21 +5,54 @@
 # containers, then refuses to proceed unless the box is quiet and has room.
 # Exit 0 = clean and ready; non-zero = do not benchmark.
 set -u
-PROCS=(rune_broker rune_produce_th rune_produce_throughput rune_consume_throughput
-       aeronmd rune_broker_benchmark rune_vm_bench.sh rune_vm_bench_bo.sh bench.sh dr_client)
-for p in "${PROCS[@]}"; do pkill -KILL -x "$p" 2>/dev/null || true; done
-# Kafka (java) by its main class, anchored to the java binary's argv[0].
+PROCS=" rune_broker rune_produce_th rune_produce_throughput rune_consume_throughput aeronmd rune_broker_benchmark rune_vm_bench.sh rune_vm_bench_bo.sh bench.sh dr_client "
+
+# Our own ancestry (this script, its caller script, the ssh session) is never a target.
+declare -A SELF=()
+a=$$
+while [ -n "$a" ] && [ "$a" -gt 1 ]; do
+  SELF[$a]=1
+  a=$(awk '{print $4}' /proc/$a/stat 2>/dev/null)
+done
+
+# Full names, not /proc/comm (truncated to 15 chars): the executable's basename,
+# or for interpreters (bash/sh) the script argument's basename.
+proc_name() {
+  local pid=$1 exe a0 a1
+  exe=$(basename -- "$(readlink /proc/$pid/exe 2>/dev/null)" 2>/dev/null)
+  case "$exe" in
+    bash|sh|dash)
+      a1=$(tr '\0' '\n' < /proc/$pid/cmdline 2>/dev/null | sed -n 2p)
+      [ -n "$a1" ] && basename -- "$a1" || echo "$exe" ;;
+    *)
+      a0=$(tr '\0' '\n' < /proc/$pid/cmdline 2>/dev/null | sed -n 1p)
+      basename -- "${a0:-$exe}" 2>/dev/null ;;
+  esac
+}
+targets() {
+  local d pid n
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ -n "${SELF[$pid]:-}" ] && continue
+    n=$(proc_name "$pid")
+    case "$PROCS" in *" $n "*) echo "$pid $n" ;; esac
+  done
+}
+targets | while read -r pid n; do kill -KILL "$pid" 2>/dev/null; done
+# Kafka (java) by its main class.
 for pid in $(pgrep -x java 2>/dev/null); do
   tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -q 'kafka\.Kafka' && kill -KILL "$pid" 2>/dev/null
 done
 if command -v docker >/dev/null 2>&1; then
   ids=$(docker ps -aq --filter 'name=^rune-' 2>/dev/null); [ -n "$ids" ] && docker rm -f $ids >/dev/null 2>&1
 fi
-rm -rf /tmp/fr* 2>/dev/null   # rune-fr traces fill the root disk (see memory: disk-full masquerade)
+# rune-fr traces (default RUNE_FR_OUT=/tmp/frout*) + broker egress scratch fill the root disk.
+rm -rf /tmp/frout* /tmp/rune_bn_egress_* 2>/dev/null
 
-strays=0
-for p in "${PROCS[@]}"; do pgrep -x "$p" >/dev/null 2>&1 && { echo "STRAY: $p still running" >&2; strays=1; }; done
-[ "$strays" = 0 ] || exit 2
+# Strays: re-check a few times (SIGKILLed processes take a moment to be reaped).
+left=""
+for _ in 1 2 3 4 5; do left=$(targets); [ -z "$left" ] && break; sleep 0.2; done
+[ -z "$left" ] || { echo "STRAY: $left" >&2; exit 2; }
 
 # Wait (bounded) for the box to go quiet: load1 < 1.
 for _ in $(seq 1 60); do
