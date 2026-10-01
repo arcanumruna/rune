@@ -45,6 +45,9 @@ extern "C" {
 
 namespace rune::client::transport {
 
+/// dutyCycle() step, reported to the test-only pump observer (T15 R2 seam).
+enum class PumpStep : uint8_t { Driver, Conductor };
+
 // ---------------------------------------------------------------------------
 // AeronTransport
 // ---------------------------------------------------------------------------
@@ -90,6 +93,26 @@ public:
 
     /// True when a background driver thread exists (Thread mode after start()).
     [[nodiscard]] bool usesDriverThread() const noexcept { return driverThread_.joinable(); }
+
+    /// True when the Aeron client conductor is invoker-driven (no conductor thread).
+    [[nodiscard]] bool usesConductorInvoker() const noexcept {
+        return aeron_ && aeron_->usesAgentInvoker();
+    }
+
+    /// The mediaDriverTimeout (ms) carried by the Aeron client's Context (0 before
+    /// start()).  See mediaDriverTimeoutMsFor().
+    [[nodiscard]] long aeronMediaDriverTimeoutMs() const noexcept {
+        return aeron_ ? aeron_->context().mediaDriverTimeout() : 0;
+    }
+
+    /// Test-only seam (T15 R2): fn(ctx, step) runs after each dutyCycle() step, so
+    /// a test can assert the driver is pumped before the client conductor.  Owner
+    /// thread only; nullptr (the default) = off, one predictable branch per step.
+    using PumpStepObserver = void (*)(void* ctx, PumpStep step) noexcept;
+    void testSetPumpStepObserver(PumpStepObserver fn, void* ctx) noexcept {
+        pumpObserver_    = fn;
+        pumpObserverCtx_ = ctx;
+    }
 
     // -------------------------------------------------------------------------
     // I/O — single-writer, called from ONE thread only
@@ -271,6 +294,8 @@ private:
     /// violation when driverThread_ is concurrently driving the same driver.
     int pumpDriverFromCaller_() noexcept;
     int callerPumpViolations_ = 0;  // written/read by the owning (caller) thread only
+    PumpStepObserver pumpObserver_    = nullptr;  // test seam (owner thread only)
+    void*            pumpObserverCtx_ = nullptr;
 
     /// Pumps THIS transport's driver + conductor (Invoker) or backs off while the
     /// background agents work (Thread) until ready() or timeoutNs elapses.  Never

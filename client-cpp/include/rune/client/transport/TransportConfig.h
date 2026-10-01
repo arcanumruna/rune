@@ -50,6 +50,9 @@ inline constexpr int64_t kMinClientLivenessTimeoutNs = 1'000'000'000LL;
 /// Liveness cap: 1 hour.  The transport derives publication_unblock_timeout =
 /// 1.5x liveness, which the driver conductor casts to int64 (overflow > ~6.1e18).
 inline constexpr int64_t kMaxClientLivenessTimeoutNs = 3'600'000'000'000LL;
+/// aeron::Context DEFAULT_MEDIA_DRIVER_TIMEOUT_MS (Context.h:133): how long the
+/// Aeron C++ client tolerates a stale driver heartbeat before closing itself.
+inline constexpr long kAeronDefaultMediaDriverTimeoutMs = 10'000;
 
 struct TransportConfig {
     std::string ingressChannel;        ///< Channel the client publishes to (→ gateway)
@@ -86,6 +89,21 @@ struct TransportConfig {
     /// Aeron ClientConductor inter-service timeout closes the client.
     int64_t clientLivenessTimeoutNs = 10'000'000'000LL;
 };
+
+/// The aeron::Context::mediaDriverTimeout the transport applies (T15 R2).
+///   Thread:  Aeron's default (10 s) — a separate driver thread can die alone.
+///   Invoker: max(liveness, default).  The driver's only pumper is the duty
+///            thread that also runs the client conductor, so the driver cannot
+///            be dead while the conductor runs; after a stall the conductor would
+///            otherwise see a stale driver heartbeat and close itself (the hidden
+///            third timeout).  Shard clients run 1 h liveness, so 1 h.  A plain
+///            Invoker Client (10 s liveness) keeps exactly today's 10 s.
+[[nodiscard]] constexpr long mediaDriverTimeoutMsFor(const TransportConfig& c) noexcept {
+    if (c.driverMode != DriverMode::Invoker) return kAeronDefaultMediaDriverTimeoutMs;
+    const auto livenessMs = static_cast<long>(c.clientLivenessTimeoutNs / 1'000'000);
+    return livenessMs > kAeronDefaultMediaDriverTimeoutMs ? livenessMs
+                                                          : kAeronDefaultMediaDriverTimeoutMs;
+}
 
 /// Returns an error message if any explicit knob violates Aeron's rules.
 [[nodiscard]] inline std::optional<std::string> validate(const TransportConfig& c) {

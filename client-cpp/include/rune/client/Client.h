@@ -181,6 +181,15 @@ struct ClientConfig {
     NanoClock  nanoClock  = nullptr;
     // Aeron client liveness: in Invoker mode doWork() must run at least this often.
     int64_t    aeronClientLivenessTimeoutNs = 10'000'000'000LL;
+    // T15 D1: run the embedded driver + Aeron conductor on the duty thread even in
+    // RunnerMode::Thread (DriverMode::Invoker: no driver thread, no conductor
+    // thread — the runner pumps both).  Default false: a plain Client keeps its
+    // driver and conductor threads.  Shard clients force true (shardClientConfig).
+    bool       driverOnDutyThread = false;
+    // T15 R1: sessions never give up once Live (SessionConfig::
+    // reconnectForeverAfterLive).  Default false = today's behaviour; shard
+    // clients force true.
+    bool       reconnectForeverAfterLive = false;
 
     // CB-2: Static topic configuration for the producer.
     // Mirrors the broker's RUNE_TOPICS environment variable.
@@ -239,6 +248,13 @@ public:
     /// True once the Aeron client closed itself (invoker owner stalled past
     /// aeronClientLivenessTimeoutNs, or the driver timed out).
     [[nodiscard]] bool transportClosed() const noexcept { return agent_.transportClosed(); }
+
+    /// Test hook (T15a): the transport, for its thread-model observers
+    /// (usesDriverThread / usesConductorInvoker / aeronMediaDriverTimeoutMs, and
+    /// callerPumpViolations once the runner is joined).
+    [[nodiscard]] const transport::AeronTransport& testTransport() const noexcept {
+        return agent_.testTransport();
+    }
 
     /// Test hook: transactional producers adopted by the duty-cycle thread.
     [[nodiscard]] std::size_t testTxnProducerCount() const noexcept { return txnProducers_.size(); }

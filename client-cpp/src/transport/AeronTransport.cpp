@@ -70,7 +70,11 @@ bool AeronTransport::pumpUntil_(Ready&& ready, int64_t timeoutNs) {
 
 int AeronTransport::dutyCycle() noexcept {
     if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) return 0;
-    int work = pumpDriverFromCaller_();  // spec §3.1 order: driver, then client conductor
+    // spec §3.1 order: driver, then client conductor.  T15 R2: the driver
+    // refreshes its heartbeat before the conductor checks it — a second line of
+    // defence after mediaDriverTimeoutMsFor(); nothing relies on it alone.
+    int work = pumpDriverFromCaller_();
+    if (pumpObserver_ != nullptr) [[unlikely]] pumpObserver_(pumpObserverCtx_, PumpStep::Driver);
     if (aeron_) {
         try {
             work += aeron_->conductorAgentInvoker().invoke();
@@ -78,6 +82,7 @@ int AeronTransport::dutyCycle() noexcept {
             // AgentInvoker routes SourcedException to the error handler; anything
             // else is contained here — dutyCycle() is noexcept.
         }
+        if (pumpObserver_ != nullptr) [[unlikely]] pumpObserver_(pumpObserverCtx_, PumpStep::Conductor);
     }
     return work;
 }
@@ -126,6 +131,10 @@ void AeronTransport::start() {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         ctx.useConductorAgentInvoker(cfg_.driverMode == DriverMode::Invoker);
+        // T15 R2: the driver timeout follows the liveness when one thread pumps
+        // both driver and conductor (unchanged 10 s with a driver thread).
+        static_assert(kAeronDefaultMediaDriverTimeoutMs == aeron::DEFAULT_MEDIA_DRIVER_TIMEOUT_MS);
+        ctx.mediaDriverTimeout(mediaDriverTimeoutMsFor(cfg_));
         // Aeron's default handler calls ::exit(-1) (Context.h:145-161).  A client
         // library must never exit its host: log, and let closed() report it.
         ctx.errorHandler([](const std::exception& e) {

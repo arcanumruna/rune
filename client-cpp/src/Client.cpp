@@ -75,9 +75,15 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.transport.socketSndBufBytes = c.socketBufferBytes;
     acfg.transport.socketRcvBufBytes = c.socketBufferBytes;
     // Task 12: RunnerMode::Invoker = no threads (invoker driver + conductor).
-    acfg.transport.driverMode = (c.runnerMode == RunnerMode::Invoker)
-                                    ? transport::DriverMode::Invoker
-                                    : transport::DriverMode::Thread;
+    // T15 D1: driverOnDutyThread also selects the invoker driver under
+    // RunnerMode::Thread — the runner pumps driver + conductor in its duty cycle
+    // (ClientAgent::doWork -> transport_.dutyCycle()): one thread per shard.
+    acfg.transport.driverMode =
+        (c.runnerMode == RunnerMode::Invoker || c.driverOnDutyThread)
+            ? transport::DriverMode::Invoker
+            : transport::DriverMode::Thread;
+    // T15 R1: never give up once Live (shard clients); false = today's behaviour.
+    acfg.session.reconnectForeverAfterLive = c.reconnectForeverAfterLive;
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     // F12: malformed env values are reported (once per Client construction —
     // this runs once per Client, never per cycle), not silently dropped.

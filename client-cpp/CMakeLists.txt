@@ -217,6 +217,7 @@ if(aeron_FOUND)
     add_library(rune_client_api STATIC
         src/Client.cpp
         src/detail/CpuAffinity.cpp
+        src/shard/ShardConfig.cpp
     )
     target_include_directories(rune_client_api PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -916,6 +917,7 @@ if(BUILD_TESTING)
         tests/transport/ResolutionTest.cpp
         tests/detail/FlatIndexMapTest.cpp
         tests/producer/InFlightRingTest.cpp
+        tests/shard/ShardMapTest.cpp
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -937,6 +939,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerFlushDirtyTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/client/InvokerClientTest.cpp
+            tests/shard/ShardConfigTest.cpp
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

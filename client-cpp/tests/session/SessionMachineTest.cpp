@@ -16,6 +16,7 @@
 #include <rune/client/session/SessionMachine.h>
 
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -1830,4 +1831,334 @@ TEST(SessionMachine, RetargetFailureStillResendsNoThrow) {
     auto req = io.lastConnectRequest();
     ASSERT_TRUE(req.has_value());
     EXPECT_NE(req->correlationId, corrId0) << "resend must use a fresh correlationId";
+}
+
+// ===========================================================================
+// T15a R1 — "never give up once Live" (SessionConfig::reconnectForeverAfterLive).
+//
+// Shard clients set the flag.  Once a session has been Live (first
+// ConnectResponse{OK}), every retry-budget exhaustion that used to be terminal
+// Disconnected goes to Backoff{attempt, nextAttemptNs} instead, and Backoff
+// fires a fresh (resume-first) ConnectRequest at nextAttemptNs on the injected
+// clock: capped exponential, 10 ms doubling to 1 s, forever.  A non-retriable
+// answer (ProtocolVersion) goes to the terminal Rejected{errorCode}.  A plain
+// Client (flag false) keeps today's behaviour.  Pure: FakeIo + injected clock.
+// ===========================================================================
+namespace {
+
+sm::SessionConfig foreverConfig() {
+    auto cfg = testConfig();
+    cfg.reconnectForeverAfterLive = true;
+    return cfg;
+}
+
+constexpr int16_t kOk          = static_cast<int16_t>(rpc::ErrorCode::OK);
+constexpr int16_t kRedirect    = static_cast<int16_t>(rpc::ErrorCode::Redirect);
+constexpr int16_t kNotLeader   = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
+constexpr int16_t kProtoVer    = static_cast<int16_t>(rpc::ErrorCode::ProtocolVersion);
+constexpr int16_t kExpired     = static_cast<int16_t>(rpc::ErrorCode::SessionExpired);
+constexpr int16_t kInternal    = static_cast<int16_t>(rpc::ErrorCode::Internal);
+
+// Connect and go Live with sessionId `sid`; returns the time used.
+int64_t goLive(sm::SessionMachine& m, int64_t sid, int64_t now) {
+    m.connect(now);
+    m.onConnectResponse(kOk, 1, sid, m.correlationId(), now);
+    return now;
+}
+
+// Drive connect timeouts until the machine leaves Connecting; returns the time.
+// Every step is one bounded tick past connectTimeoutNs (no sleeps).
+int64_t timeOutUntilNotConnecting(sm::SessionMachine& m, const sm::SessionConfig& cfg,
+                                  int64_t now, int cap = 64) {
+    for (int i = 0; i < cap && m.state() == sm::SessionState::Connecting; ++i) {
+        now += cfg.connectTimeoutNs + 1;
+        m.tick(now);
+    }
+    return now;
+}
+
+} // namespace
+
+TEST(SessionMachineRegression, SeedSessionLostBeyondRetryBudgetStillReconnects) {
+    FakeIo io;
+    auto cfg = foreverConfig();
+    sm::SessionMachine m(io, cfg);
+    int64_t now = goLive(m, 77, T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+
+    // The egress link drops: Resuming -> resume ConnectRequest (carries sid 77).
+    m.onTransportDisconnected(now);
+    m.tick(++now);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+
+    // Burn through far more than maxConnectRetries + maxResumeRetries failures.
+    // Today this is terminal Disconnected after 4 timeouts; with the flag it is
+    // Backoff, and each Backoff deadline fires a new resume attempt — forever.
+    const int failures = (cfg.maxConnectRetries + cfg.maxResumeRetries + 1) * 3;
+    int backoffs = 0;
+    for (int f = 0; f < failures; ++f) {
+        now = timeOutUntilNotConnecting(m, cfg, now);
+        ASSERT_NE(m.state(), sm::SessionState::Disconnected) << "gave up after failure " << f;
+        ASSERT_EQ(m.state(), sm::SessionState::Backoff) << "failure " << f;
+        ++backoffs;
+        EXPECT_EQ(m.backoffAttempt(), backoffs);
+        const int64_t due = m.nextAttemptNs();
+        ASSERT_GT(due, now);
+        io.reset();
+        m.tick(due - 1);
+        EXPECT_EQ(io.sendCount(), 0u) << "no attempt before its deadline";
+        EXPECT_EQ(m.state(), sm::SessionState::Backoff);
+        now = due;
+        m.tick(now);
+        ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+        auto req = io.lastConnectRequest();
+        ASSERT_TRUE(req.has_value());
+        EXPECT_EQ(req->sessionId, 77) << "a backoff attempt resumes first (broker may still know sid)";
+    }
+
+    // The broker finally answers: Live again, backoff reset.
+    m.onConnectResponse(kOk, 1, 77, m.correlationId(), ++now);
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_EQ(m.backoffAttempt(), 0);
+
+    // Resume-budget exhaustion (maxResumeRetries = 0: the very first resume
+    // would give up today) also goes to Backoff once Live.
+    FakeIo io2;
+    auto cfg2 = foreverConfig();
+    cfg2.maxResumeRetries = 0;
+    sm::SessionMachine m2(io2, cfg2);
+    now = goLive(m2, 5, T0);
+    m2.onTransportDisconnected(now);
+    m2.tick(++now);
+    EXPECT_EQ(m2.state(), sm::SessionState::Backoff);
+
+    // The broker forgot the session: SessionExpired to the resume → drop the sid
+    // and connect fresh at once (not terminal, not another backoff wait).
+    m2.tick(m2.nextAttemptNs());
+    ASSERT_EQ(m2.state(), sm::SessionState::Connecting);
+    io2.reset();
+    m2.onConnectResponse(kExpired, 1, 0, m2.correlationId(), m2.nextAttemptNs() + 1);
+    ASSERT_EQ(m2.state(), sm::SessionState::Connecting);
+    auto fresh = io2.lastConnectRequest();
+    ASSERT_TRUE(fresh.has_value());
+    EXPECT_EQ(fresh->sessionId, 0) << "fresh connect after SessionExpired";
+    m2.onConnectResponse(kOk, 1, 9, m2.correlationId(), m2.nextAttemptNs() + 2);
+    EXPECT_EQ(m2.state(), sm::SessionState::Connected);
+    EXPECT_EQ(m2.sessionId(), 9);
+}
+
+TEST(SessionMachineRegression, LeaderSessionLostBeyondRetryBudgetStillReconnects) {
+    // A leader-endpoint session: same machine, its own disjoint corrId range.
+    auto cfg = foreverConfig();
+    cfg.correlationIdBase = int64_t{1} << 40;
+    const std::string leaderEp = "aeron:udp?endpoint=leader:40456";
+
+    // Three redirect-exhaustion paths, each must Backoff (not Disconnected) once Live.
+    enum class Path { ConnectResponseRedirect, ConnectResponseWithEndpoint, ErrorResponseRedirect };
+    for (const Path path : {Path::ConnectResponseRedirect, Path::ConnectResponseWithEndpoint,
+                            Path::ErrorResponseRedirect}) {
+        SCOPED_TRACE(static_cast<int>(path));
+        FakeIo io;
+        sm::SessionMachine m(io, cfg);
+        int64_t now = goLive(m, 1234, T0);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
+        m.onTransportDisconnected(now);
+        m.tick(++now);
+        ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+
+        for (int round = 0; round < 3; ++round) {
+            // maxRedirects redirects are followed; the next one exhausts the cap.
+            for (int r = 0; r <= cfg.maxRedirects; ++r) {
+                ASSERT_EQ(m.state(), sm::SessionState::Connecting) << "round " << round << " r " << r;
+                const int64_t corr = m.correlationId();
+                switch (path) {
+                case Path::ConnectResponseRedirect:
+                    m.onConnectResponse(kNotLeader, 2, 0, corr, ++now);
+                    break;
+                case Path::ConnectResponseWithEndpoint:
+                    m.onConnectResponseRedirect(leaderEp, corr, ++now);
+                    break;
+                case Path::ErrorResponseRedirect:
+                    m.onErrorResponse(kRedirect, leaderEp, corr, ++now);
+                    break;
+                }
+            }
+            ASSERT_EQ(m.state(), sm::SessionState::Backoff) << "redirect cap exhausted after Live";
+            now = m.nextAttemptNs();
+            m.tick(now);
+            ASSERT_EQ(m.state(), sm::SessionState::Connecting)
+                << "a backoff attempt follows redirects again (redirect budget renewed)";
+        }
+        m.onConnectResponse(kOk, 2, 1234, m.correlationId(), ++now);
+        EXPECT_EQ(m.state(), sm::SessionState::Connected);
+        EXPECT_GE(m.correlationId(), cfg.correlationIdBase) << "stays in its own corrId range";
+    }
+
+    // A retriable non-redirect error to the resume (Internal) also backs off.
+    FakeIo io;
+    sm::SessionMachine m(io, cfg);
+    int64_t now = goLive(m, 1, T0);
+    m.onTransportDisconnected(now);
+    m.tick(++now);
+    m.onConnectResponse(kInternal, 0, 0, m.correlationId(), ++now);
+    EXPECT_EQ(m.state(), sm::SessionState::Backoff);
+    m.tick(m.nextAttemptNs());
+    m.onErrorResponse(kInternal, "", m.correlationId(), m.nextAttemptNs() + 1);
+    EXPECT_EQ(m.state(), sm::SessionState::Backoff);
+}
+
+TEST(SessionMachineRegression, BackoffIsCappedExponential) {
+    FakeIo io;
+    auto cfg = foreverConfig();
+    cfg.maxConnectRetries = 0;  // every timeout after Live enters Backoff directly
+    ASSERT_EQ(cfg.backoffInitialNs, 10'000'000LL) << "10 ms first backoff";
+    ASSERT_EQ(cfg.backoffMaxNs, 1'000'000'000LL) << "1 s cap";
+    sm::SessionMachine m(io, cfg);
+    int64_t now = goLive(m, 3, T0);
+    m.onTransportDisconnected(now);
+    m.tick(++now);
+
+    const int64_t expected[] = {10'000'000,  20'000'000,  40'000'000,    80'000'000,
+                                160'000'000, 320'000'000, 640'000'000,   1'000'000'000,
+                                1'000'000'000, 1'000'000'000, 1'000'000'000};
+    for (std::size_t i = 0; i < std::size(expected); ++i) {
+        now = timeOutUntilNotConnecting(m, cfg, now);
+        ASSERT_EQ(m.state(), sm::SessionState::Backoff) << "attempt " << i;
+        EXPECT_EQ(m.backoffAttempt(), static_cast<int>(i) + 1);
+        EXPECT_EQ(m.nextAttemptNs() - now, expected[i]) << "attempt " << i;
+        io.reset();
+        m.tick(m.nextAttemptNs() - 1);
+        EXPECT_EQ(io.sendCount(), 0u) << "attempt " << i << " fired before its deadline";
+        now = m.nextAttemptNs();
+        m.tick(now);
+        EXPECT_EQ(io.sendCount(), 1u) << "attempt " << i << " fires exactly at its deadline";
+    }
+    // A very long outage never overflows the delay.
+    for (int i = 0; i < 200; ++i) {
+        now = timeOutUntilNotConnecting(m, cfg, now);
+        ASSERT_EQ(m.state(), sm::SessionState::Backoff);
+        ASSERT_EQ(m.nextAttemptNs() - now, cfg.backoffMaxNs);
+        now = m.nextAttemptNs();
+        m.tick(now);
+    }
+}
+
+TEST(SessionMachineRegression, NeverLiveSessionKeepsTerminalDisconnected) {
+    // Flag on, but the session was never Live: the first-connect budget is
+    // unchanged — a dead endpoint still fails the connect (terminal Disconnected).
+    {
+        FakeIo io;
+        auto cfg = foreverConfig();
+        sm::SessionMachine m(io, cfg);
+        m.connect(T0);
+        const int64_t now = timeOutUntilNotConnecting(m, cfg, T0);
+        EXPECT_EQ(m.state(), sm::SessionState::Disconnected);
+        EXPECT_EQ(io.sendCount(), static_cast<std::size_t>(cfg.maxConnectRetries) + 1);
+        m.tick(now + 10'000'000'000LL);
+        EXPECT_EQ(m.state(), sm::SessionState::Disconnected) << "no backoff before the first Live";
+    }
+    {
+        FakeIo io;
+        auto cfg = foreverConfig();
+        sm::SessionMachine m(io, cfg);
+        m.connect(T0);
+        int64_t now = T0;
+        for (int r = 0; r <= cfg.maxRedirects; ++r) {
+            m.onConnectResponse(kRedirect, 2, 0, m.correlationId(), ++now);
+        }
+        EXPECT_EQ(m.state(), sm::SessionState::Disconnected);
+    }
+    {
+        FakeIo io;
+        sm::SessionMachine m(io, foreverConfig());
+        m.connect(T0);
+        m.onConnectResponse(kInternal, 0, 0, m.correlationId(), T0 + 1);
+        EXPECT_EQ(m.state(), sm::SessionState::Disconnected);
+    }
+}
+
+TEST(SessionMachineRegression, NonRetriableAnswerStaysTerminalAfterLive) {
+    // ConnectResponse{ProtocolVersion} to a resume after Live.
+    {
+        FakeIo io;
+        auto cfg = foreverConfig();
+        sm::SessionMachine m(io, cfg);
+        int64_t now = goLive(m, 8, T0);
+        m.onTransportDisconnected(now);
+        m.tick(++now);
+        ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+        m.onConnectResponse(kProtoVer, 0, 0, m.correlationId(), ++now);
+        EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+        EXPECT_EQ(m.rejectCode(), kProtoVer);
+        io.reset();
+        for (int i = 0; i < 10; ++i) m.tick(now += cfg.backoffMaxNs);
+        EXPECT_EQ(io.sendCount(), 0u) << "Rejected is terminal: no retries";
+        m.connect(now);
+        m.forceReconnect(now);
+        EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+        m.close();
+        EXPECT_EQ(m.state(), sm::SessionState::Closed);
+    }
+    // ErrorResponse{ProtocolVersion} while Connecting (from a Backoff attempt).
+    {
+        FakeIo io;
+        auto cfg = foreverConfig();
+        cfg.maxConnectRetries = 0;
+        sm::SessionMachine m(io, cfg);
+        int64_t now = goLive(m, 8, T0);
+        m.onTransportDisconnected(now);
+        m.tick(++now);
+        now = timeOutUntilNotConnecting(m, cfg, now);
+        ASSERT_EQ(m.state(), sm::SessionState::Backoff);
+        now = m.nextAttemptNs();
+        m.tick(now);
+        m.onErrorResponse(kProtoVer, "", m.correlationId(), ++now);
+        EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+        EXPECT_EQ(m.rejectCode(), kProtoVer);
+    }
+    // Before the first Live, too: the shard fails Rejected rather than Idle.
+    {
+        FakeIo io;
+        sm::SessionMachine m(io, foreverConfig());
+        m.connect(T0);
+        m.onConnectResponse(kProtoVer, 0, 0, m.correlationId(), T0 + 1);
+        EXPECT_EQ(m.state(), sm::SessionState::Rejected);
+    }
+}
+
+TEST(SessionMachineRegression, PlainClientDefaultStillGivesUp) {
+    ASSERT_FALSE(sm::SessionConfig{}.reconnectForeverAfterLive) << "plain Client default unchanged";
+    auto cfg = testConfig();
+    {
+        FakeIo io;
+        sm::SessionMachine m(io, cfg);
+        int64_t now = goLive(m, 8, T0);
+        m.onTransportDisconnected(now);
+        m.tick(++now);
+        now = timeOutUntilNotConnecting(m, cfg, now);
+        EXPECT_EQ(m.state(), sm::SessionState::Disconnected) << "today: terminal after the budget";
+        io.reset();
+        m.tick(now + 10'000'000'000LL);
+        EXPECT_EQ(io.sendCount(), 0u);
+    }
+    {
+        FakeIo io;
+        sm::SessionMachine m(io, cfg);
+        int64_t now = goLive(m, 8, T0);
+        m.onTransportDisconnected(now);
+        m.tick(++now);
+        m.onConnectResponse(kProtoVer, 0, 0, m.correlationId(), ++now);
+        EXPECT_EQ(m.state(), sm::SessionState::Disconnected) << "no Rejected state without the flag";
+    }
+    {
+        FakeIo io;
+        sm::SessionMachine m(io, cfg);
+        int64_t now = goLive(m, 8, T0);
+        m.onTransportDisconnected(now);
+        m.tick(++now);
+        for (int r = 0; r <= cfg.maxRedirects; ++r) {
+            m.onErrorResponse(kRedirect, "", m.correlationId(), ++now);
+        }
+        EXPECT_EQ(m.state(), sm::SessionState::Disconnected);
+    }
 }

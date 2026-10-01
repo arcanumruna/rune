@@ -35,6 +35,10 @@ enum class SessionState : uint8_t {
     Connected,
     Resuming,  // real waiting state: entered, then doResume() fires on the NEXT tick
     Closed,    // terminal; idempotent after this
+    // T15a R1 — reachable ONLY with SessionConfig::reconnectForeverAfterLive:
+    Backoff,   // was Live, retry budget exhausted: waits until nextAttemptNs(), then
+               // a resume-first ConnectRequest.  Capped exponential, never gives up.
+    Rejected,  // terminal: a non-retriable answer (rejectCode(), e.g. ProtocolVersion)
 };
 
 // ---------------------------------------------------------------------------
@@ -92,6 +96,18 @@ struct SessionConfig {
     // no cross-session collision while multiple sessions connect concurrently.
     // Default 0 (first corrId = 1) → single-session behaviour is byte-identical.
     int64_t correlationIdBase = 0;
+
+    // T15a R1 — "never give up once Live" (shard clients set it; a plain Client
+    // keeps false = today's behaviour).  Once this session has been Live (first
+    // ConnectResponse{OK}), every retry-budget exhaustion above (maxRedirects,
+    // maxConnectRetries, maxResumeRetries) and every retriable error answer goes
+    // to Backoff instead of terminal Disconnected; the budgets then mean
+    // "attempts before Backoff" (the fast first retries are kept).  A
+    // non-retriable answer (ProtocolVersion) goes to terminal Rejected.  A
+    // session that was never Live keeps today's first-connect budget.
+    bool    reconnectForeverAfterLive = false;
+    int64_t backoffInitialNs = 10'000'000LL;     // 10 ms first Backoff delay, doubling...
+    int64_t backoffMaxNs     = 1'000'000'000LL;  // ...capped at 1 s
 };
 
 // ---------------------------------------------------------------------------
@@ -140,6 +156,14 @@ public:
     [[nodiscard]] int64_t      sessionId()     const noexcept { return sessionId_; }
     [[nodiscard]] int64_t      correlationId() const noexcept { return correlationId_; }
     [[nodiscard]] int           redirectCount() const noexcept { return redirectCount_; }
+    /// T15a R1: latched on the first ConnectResponse{OK}.
+    [[nodiscard]] bool    everLive()       const noexcept { return everLive_; }
+    /// Backoff state: consecutive Backoff entries since the last Live (0 when Live).
+    [[nodiscard]] int     backoffAttempt() const noexcept { return backoff_.attempt; }
+    /// Backoff state: injected-clock time of the next attempt.
+    [[nodiscard]] int64_t nextAttemptNs()  const noexcept { return backoff_.nextAttemptNs; }
+    /// Rejected state: the non-retriable error code (0 otherwise).
+    [[nodiscard]] int16_t rejectCode()     const noexcept { return rejectCode_; }
 
     // ------------------------------------------------------------------------
     // External API — called by the application / CC-5 agent.
@@ -164,9 +188,9 @@ public:
     /// sessionId.  Pending redirected data ops are resent — re-stamped with the
     /// new sessionId — once the ConnectResponse{OK} arrives (see Client.cpp).
     ///
-    /// No-op only from Closed (terminal).
+    /// No-op only from Closed and Rejected (both terminal).
     void forceReconnect(int64_t nowNs) noexcept {
-        if (state_ == SessionState::Closed) return;
+        if (state_ == SessionState::Closed || state_ == SessionState::Rejected) return;
         // Force to Disconnected first so doConnect's Connecting transition is
         // a clean fresh episode (reset sessionId + all retry/redirect counters).
         state_ = SessionState::Disconnected;
@@ -174,15 +198,15 @@ public:
     }
 
     /// Connected → Closed: send a Disconnect frame (clean shutdown).
-    /// Resuming → Closed: send a Disconnect frame if a session exists.
-    /// No-op from any state other than Connected or Resuming.
+    /// Resuming / Backoff → Closed: send a Disconnect frame if a session exists.
+    /// No-op from any other state.
     void disconnect() noexcept {
         if (state_ == SessionState::Connected) {
             sendDisconnect();
             transitionTo(SessionState::Closed);
             return;
         }
-        if (state_ == SessionState::Resuming) {
+        if (state_ == SessionState::Resuming || state_ == SessionState::Backoff) {
             // A session was established before; send a polite goodbye if possible.
             if (sessionId_ != 0) {
                 sendDisconnect();
@@ -227,6 +251,8 @@ public:
             // FIX C: reset both retry counters on successful connect/resume.
             connectRetryCount_   = 0;
             resumeRetryCount_    = 0;
+            everLive_            = true;   // T15a R1 latch
+            backoff_             = {};
             transitionTo(SessionState::Connected);
             return;
         }
@@ -240,7 +266,7 @@ public:
             (void)assignedSessionId;
 
             if (redirectCount_ >= cfg_.maxRedirects) {
-                transitionTo(SessionState::Disconnected);
+                onRetryBudgetExhausted_(nowNs);
                 return;
             }
             redirectCount_++;
@@ -249,8 +275,9 @@ public:
             return;
         }
 
-        // Any other error code (ProtocolVersion, SessionExpired, etc.) — disconnect.
-        transitionTo(SessionState::Disconnected);
+        // Any other error code (ProtocolVersion, SessionExpired, etc.) — disconnect
+        // (T15a R1, flag on: Rejected if non-retriable, Backoff once Live).
+        onConnectError_(ec, nowNs);
     }
 
     /// ConnectResponse with a redirect endpoint string.
@@ -264,7 +291,7 @@ public:
         if (incomingCorrelationId != correlationId_) return;
 
         if (redirectCount_ >= cfg_.maxRedirects) {
-            transitionTo(SessionState::Disconnected);
+            onRetryBudgetExhausted_(nowNs);
             return;
         }
 
@@ -304,7 +331,7 @@ public:
 
             if (ec == rpc::ErrorCode::Redirect || ec == rpc::ErrorCode::NotLeader) {
                 if (redirectCount_ >= cfg_.maxRedirects) {
-                    transitionTo(SessionState::Disconnected);
+                    onRetryBudgetExhausted_(nowNs);
                     return;
                 }
                 redirectCount_++;
@@ -319,7 +346,7 @@ public:
                 // Resend ConnectRequest (retargeted if message was an endpoint).
                 doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
             } else {
-                transitionTo(SessionState::Disconnected);
+                onConnectError_(ec, nowNs);
             }
         }
     }
@@ -357,8 +384,12 @@ public:
         case SessionState::Resuming:
             tickResuming(nowNs);
             break;
+        case SessionState::Backoff:
+            tickBackoff_(nowNs);
+            break;
         case SessionState::Disconnected:
         case SessionState::Closed:
+        case SessionState::Rejected:
             break;
         }
     }
@@ -438,7 +469,7 @@ private:
     /// FIX C: resumeRetryCount_ is reset on onConnectResponse{OK}, not here.
     void doResume(int64_t nowNs) noexcept {
         if (resumeRetryCount_ >= cfg_.maxResumeRetries) {
-            transitionTo(SessionState::Disconnected);
+            onRetryBudgetExhausted_(nowNs);
             return;
         }
         resumeRetryCount_++;
@@ -512,7 +543,7 @@ private:
 
         // Connect timed out.
         if (connectRetryCount_ >= cfg_.maxConnectRetries) {
-            transitionTo(SessionState::Disconnected);
+            onRetryBudgetExhausted_(nowNs);
             return;
         }
         connectRetryCount_++;
@@ -532,6 +563,81 @@ private:
         if (n > 0) {
             connectSentOk_ = io_.sendFrame(scratch_.data(), n);
         }
+    }
+
+    // ------------------------------------------------------------------------
+    // T15a R1 — never give up once Live (reconnectForeverAfterLive).
+    // ------------------------------------------------------------------------
+
+    /// Non-retriable broker answers: retrying cannot change them.  The protocol
+    /// has no authentication error code yet; add it here when it does.
+    [[nodiscard]] static bool isNonRetriable_(rune::protocol::client::ErrorCode ec) noexcept {
+        return ec == rune::protocol::client::ErrorCode::ProtocolVersion;
+    }
+
+    [[nodiscard]] bool reconnectsForever_() const noexcept {
+        return cfg_.reconnectForeverAfterLive && everLive_;
+    }
+
+    /// Every retry-budget exhaustion goes through here: terminal Disconnected
+    /// (flag off, or never Live — today's behaviour), else Backoff.
+    void onRetryBudgetExhausted_(int64_t nowNs) noexcept {
+        if (reconnectsForever_()) {
+            enterBackoff_(nowNs);
+        } else {
+            transitionTo(SessionState::Disconnected);
+        }
+    }
+
+    /// A ConnectResponse / ErrorResponse error while Connecting that is neither
+    /// OK nor a redirect.
+    void onConnectError_(rune::protocol::client::ErrorCode ec, int64_t nowNs) noexcept {
+        namespace rpc = rune::protocol::client;
+        if (!cfg_.reconnectForeverAfterLive) {
+            transitionTo(SessionState::Disconnected);  // today's behaviour, unchanged
+            return;
+        }
+        if (isNonRetriable_(ec)) {
+            rejectCode_ = static_cast<int16_t>(static_cast<uint16_t>(ec));
+            transitionTo(SessionState::Rejected);
+            return;
+        }
+        if (!everLive_) {
+            transitionTo(SessionState::Disconnected);  // first-connect budget unchanged
+            return;
+        }
+        if ((ec == rpc::ErrorCode::SessionExpired || ec == rpc::ErrorCode::UnknownSession) &&
+            sessionId_ != 0) {
+            // The broker no longer knows this session: the resume cannot succeed,
+            // so connect FRESH now (bounded: the sid is 0 on the next answer).
+            doConnect(nowNs, /*resetSessionId=*/true, /*freshEpisode=*/false);
+            return;
+        }
+        enterBackoff_(nowNs);
+    }
+
+    /// Enter Backoff{attempt+1, now + min(initial * 2^attempt, max)}.  Overflow-
+    /// free: doubles step by step and stops at the cap.
+    void enterBackoff_(int64_t nowNs) noexcept {
+        const int64_t cap   = cfg_.backoffMaxNs > 0 ? cfg_.backoffMaxNs : 1;
+        int64_t       delay = cfg_.backoffInitialNs > 0 ? cfg_.backoffInitialNs : 1;
+        for (int i = 0; i < backoff_.attempt && delay < cap; ++i) {
+            delay = delay > cap / 2 ? cap : delay * 2;
+        }
+        if (delay > cap) delay = cap;
+        ++backoff_.attempt;
+        backoff_.nextAttemptNs = nowNs + delay;
+        transitionTo(SessionState::Backoff);
+    }
+
+    /// Backoff: nothing before nextAttemptNs; then one resume-first attempt (the
+    /// last sessionId is the hint; a SessionExpired answer drops it).  The
+    /// redirect budget is renewed so the attempt can follow a leader change; the
+    /// connect/resume budgets stay spent, so a failed attempt backs off again.
+    void tickBackoff_(int64_t nowNs) noexcept {
+        if (nowNs < backoff_.nextAttemptNs) return;
+        redirectCount_ = 0;
+        doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
     }
 
     void tickConnected(int64_t nowNs) noexcept {
@@ -588,6 +694,15 @@ private:
     // DR-BUG-2: fast-retry state for the connect path.
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
     bool    connectSentOk_       = false; // true if the last offer() succeeded
+
+    // T15a R1 — Backoff state's own variables + the Live latch + Rejected's code.
+    struct BackoffState {
+        int     attempt       = 0;  // Backoff entries since the last Live
+        int64_t nextAttemptNs = 0;  // injected-clock deadline of the next attempt
+    };
+    BackoffState backoff_{};
+    bool         everLive_   = false;
+    int16_t      rejectCode_ = 0;
 
     // Counters.
     int redirectCount_     = 0;

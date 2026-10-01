@@ -338,6 +338,8 @@ public:
     void setForwardProduceResponses(bool on) noexcept { forwardProduceResponses_ = on; }
 
     [[nodiscard]] bool transportClosed() const noexcept { return transport_.closed(); }
+    /// Test hook (T15a): read-only access to the transport's thread-model observers.
+    [[nodiscard]] const transport::AeronTransport& testTransport() const noexcept { return transport_; }
 
     /// Test hooks.  Reserved ack-buffer capacity (the hot path must never grow it).
     [[nodiscard]] std::size_t testProduceAckCapacity() const noexcept { return produceAcks_.capacity(); }
