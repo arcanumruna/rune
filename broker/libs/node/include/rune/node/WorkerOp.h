@@ -63,9 +63,10 @@ struct WorkerOp {
         FetchRequest,             ///< transport → worker: leader handles follower FetchRequest
         OffsetsForLeaderEpochReq, ///< transport → worker: leader handles KIP-101 epoch probe
         ReconcileFetchResp,       ///< transport → worker: deficient leader applies survivor data
-        // Task #13: appendControlRecord race fix — route txn COMMIT/ABORT marker
-        // appends to the owning worker when per-worker ingress is active.  The
-        // worker appends via replica->append(marker, acksAll) and answers
+        // Task #13 / F15 K3: route txn COMMIT/ABORT marker appends to the owning
+        // worker under the produce-routing predicate (every mode with a worker
+        // pool).  The worker appends via replica->appendControlBatch (F15 N2: a
+        // real control batch, role + min-ISR gated) and answers
         // ControlRecordAppended{correlationId = marker token, baseOffset = where
         // it ACTUALLY landed} (Task 10 round 4: never pre-computed) — or
         // ControlRecordRefused when the ownership guard refuses it.

@@ -2143,15 +2143,34 @@ private:
             return;
         }
         const std::span<const uint8_t> markerSpan(tail, static_cast<std::size_t>(tailLen));
+        using RepT = rune::replication::PartitionReplica;
         try {
-            const rune::replication::Offset base = replica->append(markerSpan, /*acksAll=*/true);
-            if (base < 0) {
-                spdlog::warn("Worker {}: executeAppendControlRecordWire_ — replica->append returned {} "
-                             "(minIsr gate?) topicId={} partition={}",
-                             workerId_, base, topicId, partition);
+            // F15 N2: the marker lands AS a control batch (restamped in place),
+            // with the replica's own role gate (NotLeader, retriable) and min-ISR gate.
+            const rune::replication::Offset base = replica->appendControlBatch(markerSpan, /*acksAll=*/true);
+            if (base >= 0) {
+                ret.baseOffset = base;
+                // N2 (minor): keep append()'s flush request on the worker — a
+                // Strict-tier marker joins this pass's coalesced durable flush
+                // (submitCoalescedFlushes_), exactly like a Strict produce.
+                if (replica->durabilityTier() == 2 && replica->isDiskBacked()) {
+                    rune::storage::Log* log = replica->log();
+                    bool found = false;
+                    for (auto* dl : dirtyThisCycle_) {
+                        if (dl == log) { found = true; break; }
+                    }
+                    if (!found) dirtyThisCycle_.push_back(log);
+                }
+            } else if (base == RepT::kAppendNotLeader) {
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            } else if (base == RepT::kAppendMinIsr) {
+                spdlog::warn("Worker {}: executeAppendControlRecordWire_ — min-ISR gate refused the marker "
+                             "topicId={} partition={}", workerId_, topicId, partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
             } else {
-                ret.baseOffset = base;
+                spdlog::warn("Worker {}: executeAppendControlRecordWire_ — appendControlBatch returned {} "
+                             "topicId={} partition={}", workerId_, base, topicId, partition);
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
             }
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw: {}", workerId_, ex.what());

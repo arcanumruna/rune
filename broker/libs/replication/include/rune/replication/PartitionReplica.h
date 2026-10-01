@@ -278,7 +278,36 @@ public:
     ///
     /// Does NOT block. Does NOT wait for followers. The caller drives doWork()
     /// to pump follower fetches which advance the HW.
+    ///
+    /// F15 N2: a prebuilt control batch (isControlBatch) is never wrapped: it is
+    /// delegated to appendControlBatch (and so may also return kAppendNotLeader).
     Offset append(std::span<const uint8_t> records, bool acksAll = true);
+
+    /// appendControlBatch / append() failure codes (all negative: never an offset).
+    static constexpr Offset kAppendMinIsr       = -1;   ///< gated by min-ISR (retriable)
+    static constexpr Offset kAppendNotLeader    = -2;   ///< this replica is not the leader (retriable)
+    static constexpr Offset kAppendInvalidBatch = -3;   ///< not a whole, CRC-valid control batch
+    static constexpr Offset kAppendBackPressure = -4;   ///< in-memory ring full (retriable)
+
+    /// F15 N2: append a PREBUILT control batch (a txn COMMIT/ABORT marker) AS a
+    /// control batch — the bytes land verbatim (CONTROL|TRANSACTIONAL, the
+    /// marker's producerId), never wrapped as the value of a data batch.
+    ///
+    ///   - role gate: not Leader → kAppendNotLeader (no assert; retriable);
+    ///   - the min-ISR gate of append() → kAppendMinIsr;
+    ///   - the base offset is restamped in place (Log::appendNoSyncRestamp;
+    ///     CRC-safe: [0..7] precede the CRC region), never via makeBatch_;
+    ///   - then append()'s post-append sequence: leader LEO, HW, cleaner
+    ///     publish, push-on-append, and the SAME flush request append() issues
+    ///     (shard: followerFlushRequested_ for the owning worker; legacy: the
+    ///     inline durable sync append() did).
+    ///
+    /// \returns the marker's base offset, or a negative kAppend* code.
+    Offset appendControlBatch(std::span<const uint8_t> controlBatch, bool acksAll = true);
+
+    /// True iff `bytes` is exactly one whole, CRC-valid record batch with the
+    /// CONTROL attribute — i.e. a prebuilt txn marker.
+    [[nodiscard]] static bool isControlBatch(std::span<const uint8_t> bytes) noexcept;
 
     /// CP-1: append a single record with an explicit (non-empty) key.
     ///

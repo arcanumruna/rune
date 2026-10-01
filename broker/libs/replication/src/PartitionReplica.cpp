@@ -431,6 +431,10 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 
 Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 {
+    // F15 N2: a txn marker must land AS a control batch, never as the value of
+    // a wrapper data batch (pid -1, no CONTROL bit) — rebuilds and consumers
+    // would never recognise it.
+    if (isControlBatch(records)) [[unlikely]] return appendControlBatch(records, acksAll);
     assert(role_ == Role::Leader && "append() called on follower");
     ++rtAppends_;
 
@@ -473,6 +477,58 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     if (cfg_.pushOnAppend) {
         pushToFollowers(baseOffset);
     }
+    return baseOffset;
+}
+
+// ---------------------------------------------------------------------------
+// Leader: append a prebuilt control batch (F15 N2)
+// ---------------------------------------------------------------------------
+
+bool PartitionReplica::isControlBatch(std::span<const uint8_t> bytes) noexcept
+{
+    namespace b = rune::protocol::batch;
+    if (bytes.size() < static_cast<std::size_t>(b::kRecordBatchOverhead)) return false;
+    const uint8_t* p = bytes.data();
+    if (p[b::kMagicOffset] != 2) return false;
+    const auto attrs = static_cast<uint16_t>(p[b::kAttributesOffset] |
+                                             (static_cast<uint16_t>(p[b::kAttributesOffset + 1]) << 8));
+    if ((attrs & static_cast<uint16_t>(b::kAttrControl)) == 0) return false;   // the common case: one test
+    rune::protocol::RecordBatchReader r(p, bytes.size());
+    return static_cast<std::size_t>(r.totalLength()) == bytes.size() && r.ensureValid();
+}
+
+Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatch, bool acksAll)
+{
+    if (role_ != Role::Leader) return kAppendNotLeader;          // retriable; never an assert
+    if (!isControlBatch(controlBatch)) return kAppendInvalidBatch;
+    ++rtAppends_;
+    if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) return kAppendMinIsr;
+
+    const int32_t lastOffsetDelta = rune::protocol::RecordBatchReader(
+        controlBatch.data(), controlBatch.size()).lastOffsetDelta();
+    Offset baseOffset = logEndOffset_();
+    if (memoryBacked_) {
+        // InMemoryLog stores the batch bytes verbatim: stamp the base offset
+        // into the reused scratch (capacity persists — no steady-state alloc).
+        batchScratch_.assign(controlBatch.begin(), controlBatch.end());
+        const auto u = static_cast<uint64_t>(baseOffset);
+        for (int i = 0; i < 8; ++i) batchScratch_[static_cast<std::size_t>(i)] = static_cast<uint8_t>(u >> (8 * i));
+        if (memLog_->appendNoSync(batchScratch_.data(), batchScratch_.size(),
+                                  baseOffset + lastOffsetDelta) < 0) return kAppendBackPressure;
+    } else {
+        // Zero-copy restamp (pwritev): the caller's bytes are never mutated.
+        diskLog_->appendNoSyncRestamp(controlBatch.data(), controlBatch.size(), lastOffsetDelta, baseOffset);
+        if (externalFollowerFlush_) {
+            followerFlushRequested_ = true;   // the owning worker submits it (shard, never inline)
+        } else {
+            diskLog_->sync();                 // append()'s durable-by-default fsync, unchanged
+        }
+    }
+
+    leaderState_.setLeaderLogEndOffset(logEndOffset_());
+    recomputeHw();
+    publishCleanerState();
+    if (cfg_.pushOnAppend) pushToFollowers(baseOffset);
     return baseOffset;
 }
 
