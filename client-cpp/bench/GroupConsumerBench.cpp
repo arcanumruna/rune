@@ -123,7 +123,7 @@ static constexpr int kAllocCheckIter = 10'000;
 // ---------------------------------------------------------------------------
 static rccg::SendFn makeSendFn()
 {
-    return [](const uint8_t*, std::size_t) -> bool { return true; };
+    return [](int32_t, const uint8_t*, std::size_t) -> bool { return true; };
 }
 
 // ---------------------------------------------------------------------------
