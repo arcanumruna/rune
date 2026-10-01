@@ -29,6 +29,7 @@
 #include <util/BitUtil.h>
 #include <util/Index.h>
 #include <util/Exceptions.h>
+#include <rune/consensus/detail/TsanAnnotations.h>
 
 namespace rune::consensus::detail {
 
@@ -85,6 +86,7 @@ public:
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
+        RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
     }
 
@@ -93,6 +95,7 @@ public:
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
+        RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
         m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
                           RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
@@ -131,6 +134,7 @@ public:
         ScopeExit cleanup([&]() {
             if (bytesRead != 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
+                RUNE_TSAN_RELEASE(m_buffer.buffer() + headPositionIndex);
                 m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
             }
         });
@@ -140,6 +144,7 @@ public:
             const std::int32_t recordLength =
                 m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex));
             if (recordLength <= 0) break;
+            RUNE_TSAN_ACQUIRE(m_buffer.buffer() + recordIndex);
 
             bytesRead += aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
 
@@ -250,6 +255,7 @@ private:
 
             if (requiredCapacity > availableCapacity) {
                 head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
 
                 if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
                     return INSUFFICIENT_CAPACITY;
@@ -271,6 +277,7 @@ private:
 
                 if (requiredCapacity > headIndex) {
                     head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                    RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
                     headIndex = static_cast<aeron::util::index_t>(head) & mask;
 
                     if (requiredCapacity > headIndex) {
