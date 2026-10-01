@@ -113,7 +113,9 @@ class RcState {
 public:
     /// Per-pass build budget (bytes parsed per advance step).  Set from
     /// BM_RcBuildStep with a cold page cache (p99 per step <= 20 µs target).
-    static constexpr int32_t     kDefaultScanBytesPerPass = 64 * 1024;
+    /// k3s-node-01, 7c814b6 (async FADVISE hints, mincore gate), cold cache:
+    /// p99 16.6 µs @16 KiB, 18.4 µs @32 KiB, 21.9 µs @64 KiB → 32 KiB.
+    static constexpr int32_t     kDefaultScanBytesPerPass = 32 * 1024;
     static constexpr std::size_t kTailReserve             = 256;
     /// Read-ahead depth: MADV_WILLNEED this many budgets beyond the cursor.
     static constexpr std::size_t kReadAheadBudgets        = 8;
