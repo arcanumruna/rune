@@ -855,17 +855,19 @@ std::vector<uint8_t> concat(std::initializer_list<std::vector<uint8_t>> parts) {
 // go gateway → owning worker (executeProduceWire_).  Captures both answer kinds:
 // the gateway's inline ErrorResponse and the ProduceResponse.
 struct LegacyAcksRig {
-    struct Answer { bool inlineError; int16_t code; int64_t base; };
+    struct Answer { bool inlineError; int16_t code; int64_t base; int64_t corr = 0; };
     TmpDir d;
     rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
     NullTransport t;
     ReplicaRegistry reg;
     WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
     std::vector<Answer> answers;
+    std::vector<std::pair<int64_t, int64_t>> records;   // (subscriptionId, baseOffset) pushed
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
         [this](const uint8_t* b, std::size_t n) -> int64_t {
             if (auto r = pc::ProduceResponse::decode(b, n)) answers.push_back({false, r->errorCode, r->baseOffset});
-            else if (auto e = pc::ErrorResponse::decode(b, n)) answers.push_back({true, e->code, -1});
+            else if (auto e = pc::ErrorResponse::decode(b, n)) answers.push_back({true, e->code, -1, e->correlationId});
+            else if (auto rec = pc::Records::decode(b, n)) records.emplace_back(rec->subscriptionId, rec->baseOffset);
             return 1;
         });
     PartitionReplica* r = nullptr;
@@ -2504,31 +2506,217 @@ TEST(ReturnOverflowRegression, PushReadOfBatchLargerThanReturnRingAnswersErrorNo
 
 namespace {
 [[noreturn]] void gatewayOversizeChild() {
+        auto subscribe = [](LegacyAcksRig& R, int64_t corr, int64_t from) {
+            pc::Subscribe sub;
+            sub.sessionId = R.sid; sub.correlationId = corr; sub.topicId = 0; sub.partition = 0;
+            sub.partitionKnown = 1; sub.fromOffset = from; sub.isolation = 0;
+            std::vector<uint8_t> frame(sub.encodedSize());
+            sub.encode(frame.data());
+            R.gw.applySubscribeForTest(frame.data(), frame.size());
+        };
         LegacyAcksRig R({1});                                // pool rings 64 KiB: 8 KiB max message
         const auto big = bigBatch(16 * 1024);
         (void)R.r->log()->append(big, 0);                    // on disk from an earlier config
+        const auto small = batchAt(1);
+        (void)R.r->log()->append(small, 1);
         R.r->onLeaderLogAppended();
         R.runWorker();
-        pc::Subscribe sub;
-        sub.sessionId = R.sid; sub.correlationId = 77; sub.topicId = 0; sub.partition = 0;
-        sub.partitionKnown = 1; sub.fromOffset = 0; sub.isolation = 0;
-        std::vector<uint8_t> frame(sub.encodedSize());
-        sub.encode(frame.data());
-        R.gw.applySubscribeForTest(frame.data(), frame.size());
+        subscribe(R, 77, 0);                                 // will hit the oversize batch
         for (int i = 0; i < 8; ++i) { R.gw.pushSubscriptionsForTest(); R.runWorker(); }
         std::size_t tooLarge = 0;
+        bool corrZero = true;
         for (const auto& a : R.answers)
-            tooLarge += (a.inlineError && a.code == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) ? 1u : 0u;
-        const bool ok = tooLarge == 1u && R.w().pushReadOversizeForTest() == 1u;
-        std::_Exit(ok ? 0 : 1);
+            if (a.inlineError && a.code == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) {
+                ++tooLarge;
+                corrZero = corrZero && a.corr == 0;          // m-f: never a subscription id as a correlation id
+            }
+        if (tooLarge != 1u || !corrZero || R.w().pushReadOversizeForTest() != 1u) std::_Exit(1);
+        // m-i: a healthy subscription (past the oversize batch) keeps flowing while the
+        // failed one stays parked, and re-subscribing past the batch recovers.
+        R.records.clear();
+        subscribe(R, 78, 1);
+        for (int i = 0; i < 8; ++i) { R.gw.pushSubscriptionsForTest(); R.runWorker(); }
+        if (R.records.size() != 1u || R.records[0].second != 1) std::_Exit(2);
+        if (R.w().pushReadOversizeForTest() != 1u) std::_Exit(3);   // the failed one never re-reads
+        R.records.clear();
+        subscribe(R, 79, 1);                                 // the client re-subscribes past the batch
+        for (int i = 0; i < 8; ++i) { R.gw.pushSubscriptionsForTest(); R.runWorker(); }
+        if (R.records.size() != 1u || R.records[0].second != 1) std::_Exit(4);
+        std::_Exit(0);
 }
 } // namespace
 
 TEST(ReturnOverflowRegression, GatewayFailsSubscriptionOnOversizeBatchWithoutSpinning) {
     // I-4, gateway side (default config): the subscription whose next batch
     // the return ring cannot carry gets ONE non-retriable ErrorResponse
-    // (MessageTooLarge, correlationId = subscriptionId) and is parked — the
-    // gateway issues no further PushRead for it (no spin on the batch).
+    // (MessageTooLarge; correlationId 0 — never a subscription id, which the
+    // client would match against a pending connect / ping, re-review 2 m-f)
+    // and is parked — no further PushRead for it (no spin on the batch).
+    // Re-review 2 m-i: a healthy subscription keeps flowing meanwhile, and a
+    // re-subscribe past the batch recovers.
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(gatewayOversizeChild(), ::testing::ExitedWithCode(0), "");
+}
+
+// ============================================================================
+// F15 S3 fix round 3 (re-review 2: B-1, B-2, m-h).
+// ============================================================================
+namespace {
+// A record batch of EXACTLY n bytes (bigBatch's value length searched).
+std::vector<uint8_t> batchOfSize(std::size_t n) {
+    for (std::size_t v = n > 256 ? n - 256 : 0; v <= n; ++v) {
+        auto b = bigBatch(v);
+        if (b.size() == n) return b;
+        if (b.size() > n) break;
+    }
+    return {};
+}
+[[noreturn]] void gatewayOpRingOversizeChild() {
+    LegacyAcksRig R({1});                                // pool rings 64 KiB: 8 KiB max op / return message
+    const std::size_t limit = R.gw.maxProduceBatchBytesForTest();
+    // A batch the op ring cannot carry, but under the 8 MiB gateway ceiling.
+    // Base: tryEnqueueOp throws on the control thread → std::terminate.
+    const auto over = batchOfSize(std::min<std::size_t>(limit, 8 * 1024) + 1);
+    if (over.empty()) std::_Exit(10);
+    R.produce(1, /*acks=all*/1, over);
+    R.runWorker();
+    if (R.answers.size() != 1u || R.answers[0].inlineError ||
+        R.answers[0].code != static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) std::_Exit(1);
+    if (R.r->log()->logEndOffset() != 0) std::_Exit(2);
+    // One limit on every path: the gateway's equals the owning worker's.
+    if (limit != R.w().maxIntakeBatchBytes()) std::_Exit(3);
+    const auto at = batchOfSize(limit);                  // exactly at the limit: appended
+    if (at.empty()) std::_Exit(11);
+    R.answers.clear();
+    R.produce(2, /*acks=all*/1, at);
+    for (int i = 0; i < 8 && R.answers.empty(); ++i) R.runWorker();
+    if (R.answers.size() != 1u || R.answers[0].code != 0 || R.r->log()->logEndOffset() != 1) std::_Exit(4);
+    std::_Exit(0);
+}
+} // namespace
+
+TEST(ReturnOverflowRegression, GatewayBatchOverOpRingAnswersMessageTooLargeNoCrash) {
+    // B-1: the gateway's only guard was 8 MiB; a batch above the worker op
+    // ring's max message made tryEnqueueOp throw uncaught on the control
+    // thread (broker terminates).  Now the gateway applies the SAME limit as
+    // the worker (Worker::maxAcceptableBatchBytes) → MessageTooLarge before
+    // any append; a batch exactly at the limit appends.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(gatewayOpRingOversizeChild(), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(ReturnOverflowRegression, OneBatchLimitOnEveryPath) {
+    // B-1 / m-g / m-h: ONE function bounds the client-visible batch limit on
+    // every path: min(8 MiB, op ring, return ring, replication frame (outbound
+    // ring / 8 and term / 8, minus framing)).
+    constexpr std::size_t MiB = 1u << 20;
+    const std::size_t dflt = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 4 * MiB, 4 * MiB);
+    EXPECT_LE(dflt, 512u * 1024u) << "default: bounded by the replication frame (4 MiB term / 8)";
+    EXPECT_GT(dflt, 512u * 1024u - 512u);
+    // CLAUDE.md env: 64 MiB term, 16 MiB replication outbound ring, 32 MiB rings.
+    const std::size_t claude = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 16 * MiB, 64 * MiB);
+    EXPECT_LE(claude, 2 * MiB) << "CLAUDE.md env: bounded by the 16 MiB outbound ring / 8";
+    EXPECT_GT(claude, 2 * MiB - 512u);
+    // Huge replication budget: the op ring (32 MiB / 8 − op framing) binds.
+    const std::size_t rings = Worker::maxAcceptableBatchBytes(32 * MiB, 32 * MiB, 256 * MiB, 256 * MiB);
+    EXPECT_LT(rings, 4 * MiB);
+    EXPECT_GT(rings, 4 * MiB - 1024u);
+    EXPECT_EQ(Worker::maxAcceptableBatchBytes(256 * MiB, 256 * MiB, 256 * MiB, 256 * MiB),
+              Worker::kMaxProduceBatchBytes) << "the 8 MiB ceiling";
+    // Behavioural (shard path): a worker configured with the default limit
+    // refuses limit + 1 and appends exactly the limit.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 32 * MiB, 32 * MiB);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setWorkerIngress(nullptr, true);
+    w.setMaxBatchBytes(dflt);
+    ASSERT_EQ(w.maxIntakeBatchBytes(), dflt);
+    const auto over = produceFrame(1, 9, batchOfSize(dflt + 1), /*acks=*/0, 1, 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(over.data(), over.size(), 1), 1);
+    auto rets = drainAll(w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(log.logEndOffset(), 0);
+    const auto at = produceFrame(1, 10, batchOfSize(dflt), /*acks=*/0, 1, 0);
+    ASSERT_EQ(w.handleIngressFrameForTest(at.data(), at.size(), 2), 1);
+    rets = drainAll(w);
+    ASSERT_EQ(rets.size(), 1u);
+    EXPECT_EQ(rets[0].errorCode, 0);
+    EXPECT_EQ(log.logEndOffset(), 1);
+}
+
+TEST(ReturnOverflowRegression, OscillatingBacklogStaysOnePauseEpisode) {
+    // B-2: under sustained return back-pressure the FIFO oscillates just
+    // below / at the high-water mark; with hysteresis (the episode ends only at
+    // FIFO <= high-water / 2) that is ONE episode (one enter + one leave log),
+    // not one per control-drain cadence.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 23, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setReturnDrainLimit(100);                      // the control thread drains 100 per cycle
+    constexpr int kN = 4000;
+    for (int i = 0; i < kN; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, i + 1)));
+    int64_t now = 1;
+    for (int p = 0; p < 8 && w.retFifoSizeForTest() < Worker::kOverflowHighWater; ++p) w.doWork(++now);
+    ASSERT_GE(w.retFifoSizeForTest(), Worker::kOverflowHighWater) << "precondition: at high water";
+    // Each control cycle frees ~100 ring slots: the next pass flushes ~100 FIFO
+    // entries into the ring (FIFO dips below high water), drains ~100 more ops
+    // (FIFO back at high water), and the following pass pauses again.
+    std::size_t received = 0, minFifo = SIZE_MAX;
+    const int64_t leo0 = log.logEndOffset();
+    for (int c = 0; c < 20; ++c) {
+        received += w.drainReturn([](WorkerReturn) {});
+        w.doWork(++now);
+        w.doWork(++now);
+        minFifo = std::min(minFifo, w.retFifoSizeForTest());
+    }
+    ASSERT_GT(log.logEndOffset(), leo0 + 1000) << "precondition: the op drain kept resuming (oscillation)";
+    ASSERT_GT(minFifo, Worker::kOverflowHighWater / 2) << "precondition: the backlog stays above low water";
+    EXPECT_EQ(w.retFifoPauseEpisodesForTest(), 1u) << "the pause episode flapped";
+    EXPECT_TRUE(w.retFifoPausedForTest());
+    std::vector<WorkerReturn> answers;
+    drainUntil(w, answers, kN - received, now);
+    w.doWork(++now);
+    EXPECT_FALSE(w.retFifoPausedForTest()) << "the episode ends once the FIFO drains below low water";
+    EXPECT_EQ(w.retFifoPauseEpisodesForTest(), 1u);
+}
+
+TEST(ReturnOverflowRegression, OscillatingOwedAtCapStaysOneThrottleEpisode) {
+    // B-2: owed returns oscillating near the cap (a partial HW advance frees a
+    // few, new produces refill to the cap) is ONE throttle episode; it ends
+    // only once owed <= cap / 2.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    Worker w(0, 1 << 22);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.setMaxOwedReturns(256);
+    int64_t now = 1, corr = 0;
+    std::vector<WorkerReturn> answers;
+    for (int round = 0; round < 6; ++round) {
+        for (int i = 0; i < (round == 0 ? 300 : 100); ++i) ASSERT_TRUE(w.tryEnqueueOp(acksAllOp(&rep, ++corr)));
+        w.doWork(++now);
+        collectAnswers(w, answers);
+        ASSERT_TRUE(w.owedCapThrottlingForTest()) << "precondition: at the cap, round " << round;
+        // A partial commit: the follower catches up 40 offsets → 40 waiters fire.
+        const int64_t hw = rep.highWatermark();
+        rune::replication::FetchRequestMsg fr{rep.epoch(), 0, 2, hw + 40, 1 << 20, rep.topicId()};
+        (void)rep.onFetchRequest(fr, now);
+        w.doWork(++now);
+        collectAnswers(w, answers);
+        ASSERT_GT(w.reservedAckSlotsForTest(), 128) << "precondition: owed stays above cap / 2";
+    }
+    EXPECT_EQ(w.owedCapEpisodesForTest(), 1u) << "the throttle episode flapped";
+    followerCaughtUp(rep, now);
+    w.doWork(++now);
+    w.doWork(++now);
+    EXPECT_FALSE(w.owedCapThrottlingForTest()) << "the episode ends once owed <= cap / 2";
+    EXPECT_EQ(w.owedCapEpisodesForTest(), 1u);
 }

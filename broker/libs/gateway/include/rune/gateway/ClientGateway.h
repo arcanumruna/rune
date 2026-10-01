@@ -714,6 +714,7 @@ public:
     /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
     /// Aeron polling.
     void pushSubscriptionsForTest() { pushSubscriptions(); }
+    [[nodiscard]] std::size_t maxProduceBatchBytesForTest() const noexcept { return maxProduceBatchBytes_; }
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real

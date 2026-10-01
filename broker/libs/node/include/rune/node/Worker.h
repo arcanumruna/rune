@@ -296,6 +296,15 @@ public:
     [[nodiscard]] uint64_t pushReadOversizeForTest() const noexcept { return pushReadOversize_; }
     [[nodiscard]] uint64_t retFifoPauseEpisodesForTest() const noexcept { return retFifoPauseEpisodes_; }
     [[nodiscard]] uint64_t owedCapEpisodesForTest() const noexcept { return owedCapEpisodes_; }
+    // F15 S3 fix round 3 — RED stubs (behaviour-preserving) / accessors.
+    [[nodiscard]] static std::size_t maxAcceptableBatchBytes(std::size_t /*ingressRingBytes*/,
+        std::size_t /*returnRingBytes*/, std::size_t /*replOutboundRingBytes*/, std::size_t /*aeronTermBufferBytes*/) {
+        return kMaxProduceBatchBytes;
+    }
+    void setMaxBatchBytes(std::size_t /*n*/) {}
+    [[nodiscard]] std::size_t maxIntakeBatchBytes() const noexcept { return maxIntakeBatchBytes_; }
+    [[nodiscard]] bool retFifoPausedForTest() const noexcept { return retFifoPaused_; }
+    [[nodiscard]] bool owedCapThrottlingForTest() const noexcept { return owedCapThrottling_; }
     /// Test seam: emit an arbitrary return through the one return path.
     void enqueueReturnForTest(const WorkerReturn& r) { enqueueReturn_(r); }
 

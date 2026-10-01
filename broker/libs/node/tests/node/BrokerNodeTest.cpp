@@ -1089,22 +1089,17 @@ TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxStorableBatch) {
     constexpr std::size_t MiB = 1u << 20;
     EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
         << "the defaults must pass";
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
-        << "the shard defaults must pass";
     EXPECT_TRUE(Worker::validateRingConfig(8 * MiB, 32 * MiB, 4096).has_value())
         << "Legacy: an 8 MiB return ring cannot hold a 2-4 MiB batch the 32 MiB ingress ring accepts";
     EXPECT_TRUE(Worker::validateRingConfig(16 * MiB, 32 * MiB, 4096).has_value())
         << "return ring smaller than the ingress ring";
-    // Re-review 1 I-3: shard intake is bounded per worker by its own return
-    // ring (MessageTooLarge above it; ShardIngressBatchLargerThanReturnRing…),
-    // so the Aeron term size no longer enters the check at all.  The SHIPPED
-    // shard configs' ring sizes must start:
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
-        << "bench/kafka-compare/cluster.sh RUNE_SHARD=1 (rings 32/32, term 32 MiB)";
+    // Re-review 1 I-3 / re-review 2 m-h: the Aeron term no longer enters the
+    // startup check (every intake path refuses an oversize batch with
+    // MessageTooLarge — ReturnOverflowRegression.OneBatchLimitOnEveryPath), so
+    // the shipped configs' ring sizes start: cluster.sh / CLAUDE.md (32/32)
+    // above, replbench.sh (64/64) here.
     EXPECT_FALSE(Worker::validateRingConfig(64 * MiB, 64 * MiB, 4096).has_value())
-        << "replbench.sh RUNE_SHARD=1 (rings 64/64, term 64 MiB)";
-    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
-        << "CLAUDE.md broker env (rings 32/32, term 64 MiB) in shard mode";
+        << "replbench.sh (rings 64/64)";
     EXPECT_FALSE(Worker::validateRingConfig(128 * MiB, 32 * MiB, 4096).has_value());
     EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 9000).has_value())
         << "owed-return cap above the ceiling";
