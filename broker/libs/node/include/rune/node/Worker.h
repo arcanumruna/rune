@@ -417,8 +417,12 @@ public:
     }
     /// Test seam (RR1-1 / RR1-4): the read-ahead issuer every RC build uses.
     void setRcReadAheadForTest(RcReadAhead fn, void* ctx) {
-        for (auto& sl : rcSlots_) sl.rc->setReadAhead(fn, ctx);
+        rcReadAheadOverride_ = fn; rcReadAheadOverrideCtx_ = ctx;
+        for (auto& sl : rcSlots_) installReadAhead_(sl);
     }
+    [[nodiscard]] uint64_t rcHintsSyncForTest() const noexcept { return rcHintsSync_; }
+    [[nodiscard]] uint64_t rcHintsSkippedForTest() const noexcept { return rcHintsSkipped_; }
+    [[nodiscard]] uint64_t rcHintErrorsForTest() const noexcept { return rcHintErrors_; }
     /// Test seam: an async read-ahead hint of (topicId, partition) completed.
     void completeRcHintForTest(int32_t topicId, int32_t partition) {
         if (RcState* rc = const_cast<RcState*>(rcFor_(topicId, partition))) rc->onHintCompleted();
@@ -1391,6 +1395,12 @@ private:
     int onFlushCompletion_(const FlushCompletion& c) {
         TokenRoute r;
         const bool routed = routeTake_(c.token, r);
+        // F15 S4 fix round 2 (RR1-4): an RC read-ahead hint — never a flush:
+        // success or error, it only re-arms its partition's next hint.
+        if (routed && r.kind == RouteKind::Hint) [[unlikely]] {
+            onRcHintCompleted_(r.log, c.errorCode);
+            return 1;
+        }
         LogFlushSlot* slot = routed ? liveSlot_(r) : nullptr;
         // M1: release the segment pin taken at submit (only while this worker
         // still owns the log — a purged slot's log may belong to another worker).
@@ -2264,6 +2274,7 @@ private:
         ret.isolation            = a.isolation;
         ret.isGroup              = a.isGroup;
         ret.groupCarrierReceived = a.carrier;
+        ret.setPushEffectiveBound(-1);   // N5: unanswered unless a path below answers explicitly
 
         rune::storage::Log* log = a.logPtr;
         if (!log) {
@@ -2298,7 +2309,10 @@ private:
             if (a.isolation == kIsolationReadCommitted && topicId >= 0) {
                 rc = rcServe_(replica, rcOf_(replica));
                 if (rc == nullptr) [[unlikely]] {
-                    if (mayHold && rcOf_(replica) != nullptr && heldPushReads_.size() < kMaxHeldPushReads &&
+                    // RR1-2: hold only while the partition is Leader (building);
+                    // a follower / demoted partition answers at once (notReady).
+                    if (mayHold && replica->role() == rune::replication::Role::Leader &&
+                        rcOf_(replica) != nullptr && heldPushReads_.size() < kMaxHeldPushReads &&
                         owedCapAllows_(0)) {
                         heldPushReads_.push_back(a);   // reserved: never allocates
                         return;
@@ -3445,7 +3459,7 @@ private:
     std::vector<std::pair<rune::storage::Log*, uint32_t>> slotIndex_;
     std::size_t               slotIndexMask_ = 0;
 
-    enum class RouteKind : uint8_t { Durable, Background, Seal };
+    enum class RouteKind : uint8_t { Durable, Background, Seal, Hint };
     struct TokenRoute {
         CompletionToken            token = kNoToken;   ///< kNoToken = empty bucket
         rune::storage::Log*        log   = nullptr;
@@ -3518,11 +3532,52 @@ private:
     // ones (incarnation 0: unit rigs / passthrough) are found by a scan of the
     // small slot vector.  Worker thread only.
     // -----------------------------------------------------------------------
+    // F15 S4 fix round 2 (RR1-4): the per-partition context of the default
+    // read-ahead issuer (stable address: owned by the slot through a pointer).
+    struct RcHintCtx {
+        Worker*             w   = nullptr;
+        rune::storage::Log* log = nullptr;
+    };
     struct RcSlot {
         rune::replication::PartitionReplica* replica = nullptr;
         uint32_t                             inc     = 0;
         std::unique_ptr<RcState>             rc;
+        std::unique_ptr<RcHintCtx>           hint;
     };
+    // The default read-ahead issuer: an async IORING_OP_FADVISE(WILLNEED) on the
+    // segment fd where the worker's io backend is io_uring (token routed as
+    // RouteKind::Hint: <= 1 in flight per partition, SQ full → skipped this
+    // pass), else a synchronous MADV_WILLNEED (counted).
+    static bool rcIssueHint_(void* c, const RcReadAheadReq& req) {
+        auto* h = static_cast<RcHintCtx*>(c);
+        Worker& w = *h->w;
+        if (w.io_.asyncHints() && req.fd >= 0 && h->log != nullptr) [[likely]] {
+            const auto len = static_cast<uint32_t>(std::min<std::size_t>(req.len, UINT32_MAX));
+            const CompletionToken t = w.io_.submitWillNeed(req.fd, req.fileOff, len);
+            if (t == kNoToken) { ++w.rcHintsSkipped_; return false; }
+            if (!w.routeInsert_(TokenRoute{t, h->log, nullptr, 0, RouteKind::Hint}))
+                spdlog::critical("Worker {}: io token route table full (hint token={})", w.workerId_, t);
+            ++w.rcHintsSubmitted_;
+            return true;
+        }
+        ++w.rcHintsSync_;
+        RcState::syncWillNeed(req);
+        return false;
+    }
+    void installReadAhead_(RcSlot& sl) {
+        if (rcReadAheadOverride_ != nullptr) { sl.rc->setReadAhead(rcReadAheadOverride_, rcReadAheadOverrideCtx_); return; }
+        if (!sl.hint) sl.hint = std::make_unique<RcHintCtx>();
+        sl.hint->w   = this;
+        sl.hint->log = sl.replica->isDiskBacked() ? sl.replica->log() : nullptr;
+        sl.rc->setReadAhead(&Worker::rcIssueHint_, sl.hint.get());
+    }
+    // A hint's CQE: clear its partition's in-flight flag (by log identity; a
+    // purged partition is ignored).  Errors are counted, never fatal.
+    void onRcHintCompleted_(const rune::storage::Log* log, int err) noexcept {
+        if (err != 0) ++rcHintErrors_;
+        for (auto& sl : rcSlots_)
+            if (sl.hint && sl.hint->log == log) { sl.rc->onHintCompleted(); return; }
+    }
     std::vector<RcSlot>   rcSlots_;
     // Review I-2: read_committed PushReads held while their partition's RC
     // state builds — answered on Ready (or unanswered on ownership loss).
@@ -3543,7 +3598,9 @@ private:
             }
             RcState* rc = r != nullptr ? rcOf_(r) : nullptr;
             const bool owned = rc != nullptr;
-            if (owned && !rc->revalidate(rcFacts_(r))) { ++i; continue; }   // still building: keep holding
+            // Still building AND still Leader: keep holding.  Not Leader (RR1-2):
+            // answered now (notReady) — never held for a follower period.
+            if (owned && !rc->revalidate(rcFacts_(r)) && r->role() == rune::replication::Role::Leader) { ++i; continue; }
             PushReadArgs a = h;
             heldPushReads_[i] = heldPushReads_.back();
             heldPushReads_.pop_back();
@@ -3562,7 +3619,12 @@ private:
     std::vector<RcState*> rcById_;
     int32_t     rcScanBytesPerPass_ = RcState::kDefaultScanBytesPerPass;
     std::size_t rcOpenTxnCapacity_  = rune::transaction::LsoTracker::kDefaultOpenTxnCapacity;
-    uint64_t         rcHintsSubmitted_ = 0;
+    uint64_t         rcHintsSubmitted_ = 0;   // async IORING_OP_FADVISE hints submitted
+    uint64_t         rcHintsSync_      = 0;   // synchronous fallback hints (no io_uring)
+    uint64_t         rcHintsSkipped_   = 0;   // SQ / in-flight cap full: skipped this pass
+    uint64_t         rcHintErrors_     = 0;   // hint completions with an error (counted, never fatal)
+    RcReadAhead      rcReadAheadOverride_    = nullptr;
+    void*            rcReadAheadOverrideCtx_ = nullptr;
     RcResidencyProbe rcProbeFn_  = nullptr;
     void*            rcProbeCtx_ = nullptr;
     static constexpr uint16_t kTxnAttrBit = static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional);
@@ -3594,13 +3656,18 @@ private:
             slot.replica = r;
             slot.inc     = r->incarnation();
             for (auto& old : rcSlots_) {
-                if (old.replica == r && old.inc == slot.inc && old.rc) { slot.rc = std::move(old.rc); break; }
+                if (old.replica == r && old.inc == slot.inc && old.rc) {
+                    slot.rc = std::move(old.rc);
+                    slot.hint = std::move(old.hint);
+                    break;
+                }
             }
             if (!slot.rc) {
                 slot.rc = std::make_unique<RcState>();
                 slot.rc->reserve(rcOpenTxnCapacity_);
                 slot.rc->setResidencyProbe(rcProbeFn_, rcProbeCtx_);
             }
+            installReadAhead_(slot);
             next.push_back(std::move(slot));
         }
         rcSlots_ = std::move(next);

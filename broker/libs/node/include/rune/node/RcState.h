@@ -33,6 +33,16 @@
 //              that prefix and inside `budget` (one batch larger than the budget
 //              is taken alone once fully resident);
 //            - a pass with nothing resident reads nothing and returns at once.
+//          Fix round 2: read-ahead is best-effort (dropped hints, evicted pages),
+//          so a cursor window that is not wholly resident is RE-REQUESTED on
+//          every pass (RR1-1) — unless a hint for this partition is still in
+//          flight (<= 1 per partition, RR1-4): the worker issues it as an async
+//          IORING_OP_FADVISE(WILLNEED) on the segment fd where io_uring is
+//          available, synchronously (counted) elsewhere.  An oversized batch's
+//          extent is re-requested with a doubling pass backoff (<= 64; N3).
+//          N4: mincore → access is inherently racy — a page reclaimed between
+//          the probe and the parse still takes a major fault (rare; the gate
+//          removes the systematic cold-read class, not this window).
 //          Per-pass cost is CPU-bounded; liveness is progress-driven (completed
 //          read-ahead), never time-driven: target is fixed at entry, so the scan
 //          ends once ceil((target - logStart) / budget) resident windows were
@@ -56,6 +66,10 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <climits>
+#include <cstdint>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -114,8 +128,11 @@ public:
         uint64_t    leadGen     = 0;
         int64_t     segBase     = 0;   ///< segment being walked
         std::size_t bytePos     = 0;   ///< byte cursor inside it
-        const void* segId       = nullptr;
-        std::size_t readAheadTo = 0;   ///< bytes of this segment already WILLNEED-ed
+        uint64_t    segGen      = 0;   ///< N1: the segment's install generation (identity)
+        std::size_t readAheadTo = 0;   ///< bytes of this segment already requested
+        std::size_t oversizeAt  = SIZE_MAX;   ///< N3: byte cursor of a waiting oversized batch
+        uint64_t    oversizeNext = 0;         ///< step at which its extent is re-requested
+        uint64_t    oversizeGap  = 1;         ///< doubling pass backoff (<= 64)
     };
     struct Ready {
         int32_t  epoch   = 0;
@@ -137,10 +154,18 @@ public:
         residency_.reserve(static_cast<std::size_t>(kDefaultScanBytesPerPass) / 4096 + 2);
     }
     void setResidencyProbe(RcResidencyProbe fn, void* ctx) noexcept { probeFn_ = fn; probeCtx_ = ctx; }
-    /// RED stub (fix round 2): the read-ahead issuer is not consulted yet.
-    void setReadAhead(RcReadAhead, void*) noexcept {}
-    void onHintCompleted() noexcept {}
-    [[nodiscard]] bool hintInFlight() const noexcept { return false; }
+    /// The read-ahead issuer (nullptr = synchronous MADV_WILLNEED).
+    void setReadAhead(RcReadAhead fn, void* ctx) noexcept { readAheadFn_ = fn; readAheadCtx_ = ctx; }
+    /// The async hint issued for this partition completed (its CQE was reaped).
+    void onHintCompleted() noexcept { hintInFlight_ = false; }
+    [[nodiscard]] bool hintInFlight() const noexcept { return hintInFlight_; }
+    /// Bench: per-phase time split of each step (nullptr = off: no clock reads).
+    struct StepProfile {
+        uint64_t hintNs  = 0;
+        uint64_t probeNs = 0;
+        uint64_t parseNs = 0;
+    };
+    void setProfile(StepProfile* p) noexcept { profile_ = p; }
 
     [[nodiscard]] bool ready() const noexcept { return std::holds_alternative<Ready>(st_); }
     [[nodiscard]] bool scanning() const noexcept { return std::holds_alternative<Scanning>(st_); }
@@ -222,6 +247,12 @@ public:
     [[nodiscard]] uint64_t    scannedBytes() const noexcept { return scannedBytes_; }
     /// Passes that found nothing resident at the cursor (waited on read-ahead).
     [[nodiscard]] uint64_t    nonResidentSteps() const noexcept { return nonResidentSteps_; }
+    [[nodiscard]] uint64_t    readAheadRequests() const noexcept { return readAheadRequests_; }
+    [[nodiscard]] uint64_t    readAheadSkippedInFlight() const noexcept { return readAheadSkippedInFlight_; }
+    /// N2: mincore failures (each fell back to treating the window as resident).
+    [[nodiscard]] uint64_t    probeErrors() const noexcept { return probeErrors_; }
+    /// N8: cold growths of the residency vector (an oversized batch).
+    [[nodiscard]] uint64_t    residencyGrowths() const noexcept { return residencyGrowths_; }
 
 private:
     [[noreturn]] [[gnu::cold]] [[gnu::noinline]] static void haltInvariant_(const char* what) noexcept {
@@ -256,15 +287,23 @@ private:
         const uintptr_t   start = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(page - 1);
         const uintptr_t   end   = reinterpret_cast<uintptr_t>(p) + len;
         const std::size_t pages = (end - start + page - 1) / page;
-        if (residency_.size() < pages) residency_.resize(pages);   // cold: a batch above the budget
+        if (residency_.size() < pages) [[unlikely]] {   // cold: a batch above the budget (N8: counted)
+            ++residencyGrowths_;
+            residency_.resize(pages);
+        }
 #if defined(__APPLE__)
         if (::mincore(reinterpret_cast<caddr_t>(start), end - start, reinterpret_cast<char*>(residency_.data())) != 0)
 #else
         if (::mincore(reinterpret_cast<void*>(start), end - start, residency_.data()) != 0)
 #endif
         {
-            ++probeErrors_;
-            return len;   // cannot tell (never expected on a live mapping): behave as before
+            // N2: never expected on a live mapping.  Counted (and logged once):
+            // the window is treated as resident — a possibly blocking read,
+            // never a silent one.
+            if (probeErrors_++ == 0)
+                spdlog::error("RcState: mincore failed (errno {}) — RC build window treated as resident "
+                              "(counted: probeErrors)", errno);
+            return len;
         }
         std::size_t i = 0;
         while (i < pages && (residency_[i] & 1u) != 0) ++i;
@@ -272,14 +311,38 @@ private:
         const std::size_t residentEnd = start + i * page;
         return residentEnd > reinterpret_cast<uintptr_t>(p) ? residentEnd - reinterpret_cast<uintptr_t>(p) : 0;
     }
-    // Asynchronous read-ahead of [from, to) of the segment mapping (Linux:
-    // page-cache readahead submitted, not waited for).
-    static void readAhead_(const uint8_t* seg, std::size_t from, std::size_t to) noexcept {
-        if (to <= from) return;
+public:
+    /// The synchronous fallback hint (no io_uring): MADV_WILLNEED on the range.
+    static void syncWillNeed(const RcReadAheadReq& r) noexcept {
+        if (r.len == 0) return;
         const std::size_t page  = pageSize_();
-        const uintptr_t   start = reinterpret_cast<uintptr_t>(seg + from) & ~static_cast<uintptr_t>(page - 1);
-        const uintptr_t   end   = reinterpret_cast<uintptr_t>(seg + to);
+        const uintptr_t   start = reinterpret_cast<uintptr_t>(r.addr) & ~static_cast<uintptr_t>(page - 1);
+        const uintptr_t   end   = reinterpret_cast<uintptr_t>(r.addr) + r.len;
         (void)::madvise(reinterpret_cast<void*>(start), end - start, MADV_WILLNEED);
+    }
+private:
+    // Request read-ahead of [from, to) of the segment.  At most one async hint
+    // in flight per partition (RR1-4): while one is, the request is skipped —
+    // its completion re-arms the next pass.  Returns true if issued.
+    bool requestReadAhead_(Scanning& s, const rune::storage::Log::SegmentBytes& m, std::size_t from, std::size_t to) {
+        if (to <= from) return false;
+        if (hintInFlight_) { ++readAheadSkippedInFlight_; return false; }
+        RcReadAheadReq req;
+        req.addr    = m.data + from;
+        req.len     = to - from;
+        req.fd      = m.fd;
+        req.fileOff = static_cast<int64_t>(from);
+        const auto t0 = profile_ ? clock_() : 0;
+        if (readAheadFn_ != nullptr) hintInFlight_ = readAheadFn_(readAheadCtx_, req);
+        else                         syncWillNeed(req);
+        if (profile_) profile_->hintNs += clock_() - t0;
+        ++readAheadRequests_;
+        if (to > s.readAheadTo) s.readAheadTo = to;
+        return true;
+    }
+    static uint64_t clock_() noexcept {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     }
     std::size_t step_(Scanning& s, rune::storage::Log& log, int32_t budget) {
         ++scanSteps_;
@@ -288,16 +351,16 @@ private:
         // and so is any data they could hide: skipping them is exact.
         const int64_t logStart = log.logStartOffset();
         if (s.cursor < logStart) s.cursor = logStart;
-        if (s.segBase < logStart) { s.segBase = logStart; s.bytePos = 0; s.segId = nullptr; s.readAheadTo = 0; }
+        if (s.segBase < logStart) { s.segBase = logStart; s.bytePos = 0; s.segGen = 0; s.readAheadTo = 0; }
         std::size_t bytes = 0;
         if (s.cursor < s.target) {
             const auto m = log.segmentBytesAt(s.segBase);
-            if (m.id != s.segId) { s.segId = m.id; s.bytePos = 0; s.readAheadTo = 0; }
+            if (m.gen != s.segGen) { s.segGen = m.gen; s.bytePos = 0; s.readAheadTo = 0; }
             if (m.data == nullptr || s.bytePos >= m.size) {
                 // This segment is walked (or gone / empty): the next one.
                 const int64_t next = log.nextSegmentBaseAfter(s.segBase);
                 if (next < 0) s.cursor = s.target;   // nothing beyond: the LEO is reached
-                else { s.segBase = next; s.bytePos = 0; s.segId = nullptr; s.readAheadTo = 0; }
+                else { s.segBase = next; s.bytePos = 0; s.segGen = 0; s.readAheadTo = 0; }
             } else {
                 bytes = scanResident_(s, m, static_cast<std::size_t>(budget > 0 ? budget : 1));
             }
@@ -313,14 +376,24 @@ private:
         const uint8_t*    p     = m.data + s.bytePos;
         const std::size_t avail = m.size - s.bytePos;
         const std::size_t want  = std::min(avail, budget);
-        // Keep the read-ahead kReadAheadBudgets budgets in front of the cursor.
         const std::size_t aheadTo = std::min(m.size, s.bytePos + kReadAheadBudgets * budget);
-        if (aheadTo > s.readAheadTo) {
-            readAhead_(m.data, std::max(s.readAheadTo, s.bytePos), aheadTo);
-            s.readAheadTo = aheadTo;
-        }
+        const auto tp = profile_ ? clock_() : 0;
         std::size_t res = resident_(p, want);
+        if (profile_) profile_->probeNs += clock_() - tp;
+        if (res < want) {
+            // RR1-1: the cursor window is not wholly resident — re-request it
+            // (and the read-ahead in front of it) on EVERY such pass; a dropped
+            // hint or evicted pages can never stall the build.
+            (void)requestReadAhead_(s, m, s.bytePos, aheadTo);
+        } else if (aheadTo > s.readAheadTo) {
+            // Resident window: keep the read-ahead front kReadAheadBudgets ahead.
+            (void)requestReadAhead_(s, m, std::max(s.readAheadTo, s.bytePos + want), aheadTo);
+        }
         if (res < kOverhead) [[unlikely]] { ++nonResidentSteps_; return 0; }   // nothing resident: never block
+        struct ParseClock {
+            StepProfile* prof; uint64_t t0;
+            ~ParseClock() { if (prof) prof->parseNs += clock_() - t0; }
+        } parseClock{profile_, profile_ ? clock_() : 0};
         rune::transaction::RcBuilder builder(&tracker_, &aborted_);
         std::size_t pos = 0;
         while (pos + kOverhead <= res) {
@@ -333,8 +406,18 @@ private:
                 // One batch larger than the budget is taken alone, once it is
                 // wholly resident (its read-ahead is in flight meanwhile).
                 if (pos != 0 || len <= want) break;
-                readAhead_(m.data, s.bytePos, s.bytePos + len);
-                if (resident_(p, len) < len) { ++nonResidentSteps_; break; }
+                if (resident_(p, len) < len) {
+                    // N3: re-request the oversized extent with a doubling pass
+                    // backoff (<= 64 passes), reset when the cursor moves.
+                    if (s.oversizeAt != s.bytePos) { s.oversizeAt = s.bytePos; s.oversizeGap = 1; s.oversizeNext = 0; }
+                    if (scanSteps_ >= s.oversizeNext &&
+                        requestReadAhead_(s, m, s.bytePos, std::min(m.size, s.bytePos + len))) {
+                        s.oversizeNext = scanSteps_ + s.oversizeGap;
+                        s.oversizeGap  = std::min<uint64_t>(s.oversizeGap * 2, 64);
+                    }
+                    ++nonResidentSteps_;
+                    break;
+                }
                 res = len;
             }
             const int64_t base = r.baseOffset();
@@ -370,6 +453,13 @@ private:
     std::variant<Unbuilt, Scanning, Ready> st_{Unbuilt{}};
     RcResidencyProbe probeFn_  = nullptr;
     void*            probeCtx_ = nullptr;
+    RcReadAhead      readAheadFn_  = nullptr;
+    void*            readAheadCtx_ = nullptr;
+    bool             hintInFlight_ = false;   ///< survives reset_(): the kernel still owns the hint
+    StepProfile*     profile_      = nullptr;
+    uint64_t    readAheadRequests_        = 0;
+    uint64_t    readAheadSkippedInFlight_ = 0;
+    uint64_t    residencyGrowths_         = 0;
     uint64_t    scanSteps_        = 0;
     std::size_t maxStepBytes_     = 0;
     uint64_t    tailGrowths_      = 0;
