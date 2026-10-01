@@ -105,7 +105,8 @@ void BrokerNode::start() {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         // Spec §3.2 fused placement: the runtime client has no conductor thread
-        // either — its conductor runs in worker 0's pass (startup: in resolves).
+        // either — its conductor runs in worker 0's pass (during start(): in the
+        // interim pump runner below).
         ctx.useConductorAgentInvoker(config_.fused());
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) {
