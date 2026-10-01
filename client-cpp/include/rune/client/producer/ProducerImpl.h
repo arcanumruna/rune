@@ -727,7 +727,10 @@ public:
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
     /// record — in the app ring (committed so far), the deferred arena, a
     /// builder, queued Tier-2, or in flight — with `st`, exactly once.
-    void failAllPending(OpStatus st);
+    /// noexcept (fix round 2, N1): run from ~DutyScope (the deferred fail-all
+    /// of a close applied inside a handler).  Everything it calls is non-
+    /// throwing (handlers are noexcept function pointers; no allocation).
+    void failAllPending(OpStatus st) noexcept;
 
     /// Duty-cycle thread: fail every record of an in-flight batch (wire id)
     /// with DeliveryFailed.  Non-batch ids are ignored (they can come from any
@@ -1120,7 +1123,7 @@ private:
         LifeDraining drain{};
     };
     PendingFail pendingFail_{};
-    void runPendingFail_();
+    void runPendingFail_() noexcept;
     bool clientClosedDirect_ = false;  // Direct only: closeFinal ran (owner state)
 
     // ---- sendBlocking() support (app thread only) -----------------------------

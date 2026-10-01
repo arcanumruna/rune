@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
@@ -123,9 +124,12 @@ struct Rig {
     explicit Rig(const rc::ClientConfig& c)
         : client(std::make_unique<rc::Client>(c)),
           gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel, c.egressStreamId) {}
+    // cap < 0 (default): drive until pred holds, bounded by a 10 s deadline that
+    // only a FAILING test reaches (iteration counts depend on CPU speed).
     template <class P>
-    bool drive(P&& pred, int cap = 200'000) {
-        for (int i = 0; i < cap; ++i) {
+    bool drive(P&& pred, int cap = -1) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (int i = 0; cap < 0 ? std::chrono::steady_clock::now() < deadline : i < cap; ++i) {
             client->doWork();
             gw.pump();
             if (pred()) return true;
@@ -777,5 +781,54 @@ TEST(ProducerClose, CloseImmediatelyDuringFailAllAndSweepCompletesEachRecordOnce
                 expectExactlyOnce(R, 1, 4, 3);
             }
         }
+    }
+}
+
+// Regression (fix round 2, re-review blocker 2): begin-close Draining, then
+// closeImmediately() from the onAck handler while onProduceResponse completes
+// the acked batch.  The deferred fail-all carries the begin-close token: it
+// completes exactly once, Closed, AFTER every record completed (each once).
+// Ring and Direct.  RED (mutation): runPendingFail_ dropping the token (never
+// completes) or delivering it before the fail-all (records not yet complete).
+TEST(ProducerClose, BeginCloseThenCloseImmediatelyFromOnAckDeliversTokenOnceAfterRecordsRegression) {
+    for (const bool direct : {false, true}) {
+        SCOPED_TRACE(direct ? "Direct" : "Ring");
+        ReentryRig R(ackCfg(), direct, /*cq=*/false);
+        struct TokenSeen {
+            std::vector<rc::Completion> got;
+            size_t recsAt = 0;
+            const ReentryRig* rig = nullptr;
+            static void fn(void* c, const rc::Completion& done, std::span<const uint8_t>) noexcept {
+                auto* self = static_cast<TokenSeen*>(c);
+                self->got.push_back(done);
+                self->recsAt = self->rig->recs.size();
+            }
+        } T;
+        T.rig = &R;
+        CorrSink cs;
+        const auto sink = cs.fn();
+        ASSERT_TRUE(R.send(0, 1));
+        R.impl.submitFlush();
+        (void)R.impl.drainRing(kNow, 256);
+        (void)R.impl.flushBatches(kNow, 42, sink);
+        ASSERT_EQ(cs.corr.size(), 1u);
+        ASSERT_TRUE(R.send(0, 2));
+        ASSERT_TRUE(R.send(1, 3));
+        ASSERT_EQ(R.impl.beginClose(rc::CompletionTarget(rc::CompletionHandler{&TokenSeen::fn, &T}), 50),
+                  OpResult::Accepted);
+        EXPECT_TRUE(T.got.empty()) << "records outstanding: Draining";
+        R.closeOnToken = 1;
+        R.impl.onProduceResponse(cs.corr[0], 100);
+        EXPECT_EQ(R.closes, 1);
+        for (int i = 0; i < 5; ++i) {
+            (void)R.impl.drainRing(kNow, 256);
+            (void)R.impl.closeDuty(kNow);
+        }
+        ASSERT_EQ(T.got.size(), 1u) << "the begin-close token completes exactly once";
+        EXPECT_EQ(T.got[0].status, OpStatus::Closed);
+        EXPECT_EQ(T.got[0].token, 50u);
+        EXPECT_EQ(T.recsAt, 3u) << "delivered after every record completed";
+        expectExactlyOnce(R, 1, 4, 3);
+        EXPECT_EQ(R.recs.front().status, OpStatus::Ok);
     }
 }

@@ -20,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <unistd.h>
@@ -72,9 +73,12 @@ struct Rig {
     explicit Rig(const rc::ClientConfig& c)
         : client(std::make_unique<rc::Client>(c)),
           gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel, c.egressStreamId) {}
+    // cap < 0 (default): drive until pred holds, bounded by a 10 s deadline that
+    // only a FAILING test reaches (iteration counts depend on CPU speed).
     template <class P>
-    bool drive(P&& pred, int cap = 200'000) {
-        for (int i = 0; i < cap; ++i) {
+    bool drive(P&& pred, int cap = -1) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (int i = 0; cap < 0 ? std::chrono::steady_clock::now() < deadline : i < cap; ++i) {
             client->doWork();
             gw.pump();
             if (pred()) return true;

@@ -449,7 +449,7 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader1");
     test_support::TestCq cq(r.client);
     auto fx = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
-    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && !r.gw.produced.empty(); }, 5'000'000)) << "connects=" << r.gw.connects << " produced=" << r.gw.produced.size() << " fx=" << fx.describe();
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && !r.gw.produced.empty(); })) << "connects=" << r.gw.connects << " produced=" << r.gw.produced.size() << " fx=" << fx.describe();
     for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // settle
     const auto X = r.gw.produced.front();
     auto countCorr = [&](int64_t corr) {
@@ -465,9 +465,7 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     r.gw.ackBeforeNextConnect.push_back(X);
     r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader2");
     auto fy = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
-    // Iteration cap sized for the slow (ASan) builds: the second leader session's
-    // connect needs the embedded driver's conductor to progress.
-    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 3 && fx.ready(); }, 5'000'000))
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 3 && fx.ready(); }))
         << "connects=" << r.gw.connects << " fx=" << fx.describe();
     for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // let any resend land
     EXPECT_EQ(countCorr(X.corrId), base) << "acked batch X must not be re-driven by the resend fn";

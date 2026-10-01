@@ -2251,7 +2251,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit) {
         limit);
 }
 
-void ProducerImpl::failAllPending(OpStatus st) {
+void ProducerImpl::failAllPending(OpStatus st) noexcept {
     const DutyScope duty(*this);  // fix1 C1: sends from these callbacks are deferred
     // Records committed to the app ring so far (Ring mode; a closed ring's
     // later commits are completed by the Discarding drain / closeFinal).
@@ -2378,7 +2378,7 @@ void ProducerImpl::applyCloseImmediately(OpStatus st) {
     }
 }
 
-void ProducerImpl::runPendingFail_() {
+void ProducerImpl::runPendingFail_() noexcept {
     const PendingFail pf = pendingFail_;
     pendingFail_ = PendingFail{};
     failAllPending(pf.status);  // nested DutyScope: inDuty_ is still set
@@ -2415,7 +2415,10 @@ int ProducerImpl::closeDuty(int64_t nowNs) {
     } else {
         return 0;
     }
-    life_ = LifeClosed{};  // before user code: the handler may close again (a no-op)
+    // Before user code.  A handler that then calls closeImmediately() moves
+    // Closed -> Discarding and fails whatever is still outstanding (nothing
+    // after Ok; the stragglers once after Timeout) — idempotent, never twice.
+    life_ = LifeClosed{};
     Completion c;
     c.token  = d.token;
     c.op     = OpKind::ProducerClose;
