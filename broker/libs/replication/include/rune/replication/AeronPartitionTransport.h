@@ -66,7 +66,7 @@ namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 #include <Subscription.h>
-#include <ControlledFragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 
@@ -345,7 +345,7 @@ private:
 
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
-    aeron::ControlledFragmentAssembler     assembler_;
+    rune::aeronutil::ControlledFragmentAssembler assembler_;   // templated (Task 11 fix 2, B3)
 
     NodeId                                 selfId_;
     int64_t                                nowNs_ = 0; ///< updated at top of poll()

@@ -47,12 +47,6 @@ AeronPartitionTransport::AeronPartitionTransport(
         int                            outboundRingBytes,
         rune::aeronutil::AeronPump     pump)
     : aeron_(std::move(aeron))
-    , assembler_([this](aeron::concurrent::AtomicBuffer& buf,
-                        aeron::util::index_t             offset,
-                        aeron::util::index_t             length,
-                        aeron::Header&                   hdr) {
-          return onFragment(buf, offset, length, hdr);
-      })
     , selfId_(selfId)
     , outboundRing_(outboundRingBytes)  // NodeConfig-configurable ring size
 {
@@ -417,7 +411,18 @@ int AeronPartitionTransport::poll(int64_t nowNs)
     // Drain ingress subscription with a CONTROLLED poll so onFragment can apply
     // back-pressure: a fragment whose target worker ring is full returns ABORT and
     // is re-delivered next cycle (not dropped).  See onFragment.
-    const int fragged = sub_->controlledPoll(assembler_.handler(), kFragmentLimit);
+    // Task 11 fix 2 (B3): rune templated controlled assembler — no std::function.
+    const int fragged = sub_->controlledPoll(
+        [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
+               aeron::Header& h) {
+            return assembler_.onFragment(
+                [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+                       aeron::util::index_t length, aeron::Header& hdr) {
+                    return onFragment(buf, offset, length, hdr);
+                },
+                b, o, l, h);
+        },
+        kFragmentLimit);
     work += fragged;
 
     if (g_txRateLog) {

@@ -74,7 +74,7 @@
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
-#include <FragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 #include <util/Index.h>
@@ -423,15 +423,6 @@ public:
         : workerId_(workerId)
         , inboundChannel_(std::move(inboundChannel))
         , inboundStreamId_(inboundStreamId)
-        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
-                            aeron::util::index_t             offset,
-                            aeron::util::index_t             length,
-                            aeron::Header&                   header) {
-              trampoline_(ctx_,
-                          reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                          static_cast<std::size_t>(length),
-                          header);
-          })
     {}
 
     /// Register + resolve the inbound sub and every peer pub on `aeron`.  Once
@@ -486,15 +477,6 @@ public:
     explicit WorkerReplicationTransportImpl(int32_t workerId, PubRegistry pubReg) noexcept
         : workerId_(workerId)
         , inboundStreamId_(0)
-        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
-                            aeron::util::index_t             offset,
-                            aeron::util::index_t             length,
-                            aeron::Header&                   header) {
-              trampoline_(ctx_,
-                          reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                          static_cast<std::size_t>(length),
-                          header);
-          })
         , pubReg_(std::move(pubReg))
         , testMode_(true)
     {}
@@ -592,31 +574,21 @@ public:
             return count;
         }
 
-        // Production path: FragmentAssembler + trampoline, mirroring
-        // WorkerIngress::poll exactly.
-        //
-        // ctx_ points to a PollCtx on this call's stack frame — valid for the
-        // synchronous duration of sub_->poll() (single-threaded, no reentry).
-        // The trampoline is a plain function pointer (no capture, no heap).
-        struct PollCtx {
-            WorkerReplicationTransportImpl* self;
-            D*                              dispatch;
-        };
-        PollCtx pctx{ this, std::addressof(dispatch) };
-        ctx_ = static_cast<void*>(&pctx);
-        trampoline_ = [](void*          ctx,
-                         const uint8_t* data,
-                         std::size_t    len,
-                         aeron::Header& hdr) {
-            auto* pc = static_cast<PollCtx*>(ctx);
-            pc->self->dispatchFrame_(data, len, hdr.sessionId(), *pc->dispatch);
-        };
-
-        int result = sub_->poll(assembler_.handler(), fragmentLimit);
-
-        ctx_        = nullptr;
-        trampoline_ = nullptr;
-        return result;
+        // Production path (Task 11 fix 2, B3): rune templated assembler + the
+        // concrete dispatch, inlined into Aeron's templated poll — no
+        // std::function, no trampoline.
+        return sub_->poll(
+            [this, &dispatch](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
+                              aeron::util::index_t l, aeron::Header& h) {
+                assembler_.onFragment(
+                    [this, &dispatch](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                                      aeron::util::index_t length, aeron::Header& header) {
+                        dispatchFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                       static_cast<std::size_t>(length), header.sessionId(), dispatch);
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit);
     }
 
     // -----------------------------------------------------------------------
@@ -1134,23 +1106,8 @@ private:
 
     std::shared_ptr<aeron::Subscription> sub_;  // inbound (resolved by ctor)
 
-    // -----------------------------------------------------------------------
-    // Fragment assembler + trampoline — mirrors WorkerIngress EXACTLY.
-    //
-    // assembler_ is a member (lambda captures `this`) so it outlives any
-    // poll() call.  trampoline_/ctx_ are set for the duration of each poll()
-    // call and cleared immediately after.  No std::function of our own on the
-    // hot path — Aeron's fragment_handler_t is the ONLY type-erasure boundary.
-    // -----------------------------------------------------------------------
-    using TrampolineFn = void(*)(void*              ctx,
-                                 const uint8_t*     data,
-                                 std::size_t        len,
-                                 aeron::Header&     hdr);
-
-    void*          ctx_        = nullptr;
-    TrampolineFn   trampoline_ = nullptr;
-
-    aeron::FragmentAssembler assembler_;
+    // Rune templated fragment assembler (Task 11 fix 2, B3) — no std::function.
+    rune::aeronutil::FragmentAssembler assembler_;
 
     PubRegistry pubReg_;  // per-peer pub management + send policy
 

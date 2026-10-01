@@ -70,12 +70,6 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     , sessionTimeoutNs_(sessionTimeoutNs)
     , connectResolveTimeoutNs_(connectResolveTimeoutNs)
     , leaderView_(std::move(leaderView))
-    , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
-                        aeron::util::index_t             offset,
-                        aeron::util::index_t             length,
-                        aeron::Header&                   header) {
-          onFragment(buffer, offset, length, header);
-      })
 {
     // Pre-allocate the draining-release vector (bounded by kMaxPendingConnects).
     // pendingConnects_ is a deque — no reserve() needed; O(1) front push/pop.
@@ -112,10 +106,6 @@ ClientGateway::ClientGateway(TestConstructTag,
     , sessionTimeoutNs_(kDefaultSessionTimeoutNs)
     , connectResolveTimeoutNs_(kDefaultConnectResolveTimeoutNs)
     , leaderView_(nullptr)
-    , assembler_([](aeron::concurrent::AtomicBuffer&,
-                    aeron::util::index_t,
-                    aeron::util::index_t,
-                    aeron::Header&) {})   // no-op fragment handler
     , testEgressFn_(std::move(egressFn))
     , currentProduceSessionId_(currentSessionId)
 {
@@ -135,10 +125,6 @@ ClientGateway::ClientGateway(TestConstructTag,
     , sessionTimeoutNs_(kDefaultSessionTimeoutNs)
     , connectResolveTimeoutNs_(kDefaultConnectResolveTimeoutNs)
     , leaderView_(std::move(leaderView))
-    , assembler_([](aeron::concurrent::AtomicBuffer&,
-                    aeron::util::index_t,
-                    aeron::util::index_t,
-                    aeron::Header&) {})   // no-op fragment handler
     , testEgressFn_(std::move(egressFn))
     , currentProduceSessionId_(currentSessionId)
 {
@@ -395,7 +381,18 @@ int ClientGateway::doWork(int64_t nowNs) {
     // (control markers, subscription lifecycle) BEFORE new ingress, in order.
     int work = 0;
     if (workerPool_) work += pumpMarkerQueue_() + pumpSubOps_();
-    work += sub_->poll(assembler_.handler(), fragmentLimit_);
+    // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
+    work += sub_->poll(
+        [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
+               aeron::Header& h) {
+            assembler_.onFragment(
+                [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                       aeron::util::index_t length, aeron::Header& header) {
+                    onFragment(buffer, offset, length, header);
+                },
+                b, o, l, h);
+        },
+        fragmentLimit_);
     pollPendingConnects(nowNs);
     pollPendingRecordEgress_(nowNs);  // hybrid egress: resolve unicast pubs + drain deferred subscribes
     reapExpired(nowNs);

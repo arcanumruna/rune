@@ -39,7 +39,7 @@
 #include <Aeron.h>
 #include <spdlog/spdlog.h>
 #include <Subscription.h>
-#include <FragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <util/Index.h>
 
@@ -72,19 +72,6 @@ public:
         : aeron_(std::move(aeron))
         , channel_(std::move(channel))
         , streamId_(streamId)
-        // The assembler's fixed callback dispatches to the per-poll trampoline
-        // via raw void* + function pointer.  No std::function of our own.
-        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
-                            aeron::util::index_t             offset,
-                            aeron::util::index_t             length,
-                            aeron::Header&                   header) {
-              // Invoke trampoline: trampoline_(ctx_, data, len, hdr).
-              // ctx_/trampoline_ are set for the duration of each poll() call.
-              trampoline_(ctx_,
-                          reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                          static_cast<std::size_t>(length),
-                          header);
-          })
     {
         if (!aeron_) return;  // null aeron_ → unresolved
 
@@ -142,54 +129,39 @@ public:
     // Returns the number of fragments handled (add to doWork work count).
     // Returns 0 if not resolved().
     //
-    // No std::function of our own.  The only type-erasure is Aeron's own
-    // fragment_handler_t at the Subscription::poll boundary.
+    // No std::function anywhere (Task 11 fix 2: rune templated assembler).
     // -----------------------------------------------------------------------
     template <class Handler>
     int poll(int fragmentLimit, Handler&& handler) {
         if (!sub_) [[unlikely]] return 0;
 
-        // Install the concrete handler as a raw trampoline for this call.
-        // poll() is synchronous and single-threaded — the raw pointer is
-        // valid for the entire duration of sub_->poll(...).
-        using H = std::remove_reference_t<Handler>;
-        ctx_        = static_cast<void*>(std::addressof(handler));
-        trampoline_ = [](void* ctx,
-                         const uint8_t*   data,
-                         std::size_t      len,
-                         aeron::Header&   hdr) {
-            (*static_cast<H*>(ctx))(data, len, hdr);
-        };
-
-        int result = sub_->poll(assembler_.handler(), fragmentLimit);
-
-        // Clear trampoline to prevent accidental use after the call stack is gone.
-        ctx_        = nullptr;
-        trampoline_ = nullptr;
-        return result;
+        // Task 11 fix 2 (B3): templated assembler + the caller's handler, all
+        // inlined into Aeron's templated Subscription/Image poll — no
+        // std::function, no trampoline.
+        return sub_->poll(
+            [this, &handler](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
+                             aeron::util::index_t l, aeron::Header& h) {
+                assembler_.onFragment(
+                    [&handler](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                               aeron::util::index_t length, aeron::Header& header) {
+                        handler(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                static_cast<std::size_t>(length), header);
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit);
     }
 
 private:
     // Mirror the exact constants from ClientGateway.cpp:49-50.
     static constexpr int kResolveMaxMs   = 5000;  // 5 s
 
-    // Raw-pointer trampoline: set for the duration of each poll() call.
-    // No std::function, no heap allocation, no virtual call of our own.
-    using TrampolineFn = void(*)(void* ctx,
-                                 const uint8_t* data,
-                                 std::size_t    len,
-                                 aeron::Header& hdr);
-
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::string                            channel_;
     int32_t                                streamId_;
     std::shared_ptr<aeron::Subscription>   sub_;
 
-    // Per-poll trampoline state (valid only during sub_->poll()).
-    void*          ctx_        = nullptr;
-    TrampolineFn   trampoline_ = nullptr;
-
-    aeron::FragmentAssembler               assembler_;
+    rune::aeronutil::FragmentAssembler     assembler_;
 };
 
 } // namespace rune::node

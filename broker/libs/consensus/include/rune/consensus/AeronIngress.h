@@ -17,7 +17,7 @@
 
 #include <Aeron.h>
 #include <Subscription.h>
-#include <FragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <util/Index.h>
 
@@ -46,17 +46,6 @@ public:
                  rune::aeronutil::AeronPump    pump = {})
         : aeron_(std::move(aeron))
         , ingressRing_(ingressRing)
-        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
-                            aeron::util::index_t             offset,
-                            aeron::util::index_t             length,
-                            aeron::Header&                   /*header*/)
-          {
-              // Write fragment bytes into the ingress ring.
-              // IngressRing::write() accepts uint8_t* and size_t.
-              ingressRing_.write(
-                  reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                  static_cast<std::size_t>(length));
-          })
     {
         int64_t regId = aeron_->addSubscription(channel, streamId);
 
@@ -77,8 +66,21 @@ public:
     // poll — drive the subscription; returns fragment count.
     // Must be called from ONE thread only.
     // -----------------------------------------------------------------------
+    // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
     int poll(int fragmentLimit = 10) {
-        return sub_->poll(assembler_.handler(), fragmentLimit);
+        return sub_->poll(
+            [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
+                   aeron::Header& h) {
+                assembler_.onFragment(
+                    [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                           aeron::util::index_t length, aeron::Header&) {
+                        // Write the (reassembled) frame into the ingress ring.
+                        ingressRing_.write(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                           static_cast<std::size_t>(length));
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit);
     }
 
     aeron::Subscription& subscription() { return *sub_; }
@@ -87,7 +89,7 @@ private:
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
     IngressRing&                           ingressRing_;
-    aeron::FragmentAssembler               assembler_;
+    rune::aeronutil::FragmentAssembler     assembler_;
 };
 
 } // namespace rune::consensus

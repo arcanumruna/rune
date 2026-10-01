@@ -61,7 +61,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <Aeron.h>
 #include <Subscription.h>
 #include <ExclusivePublication.h>
-#include <FragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 #include <util/Index.h>
@@ -1078,7 +1078,7 @@ private:
     std::function<LeaderView()>          leaderView_;
 
     std::shared_ptr<aeron::Subscription> sub_;
-    aeron::FragmentAssembler             assembler_;
+    rune::aeronutil::FragmentAssembler   assembler_;
 
     SessionTable                         sessions_;
 
