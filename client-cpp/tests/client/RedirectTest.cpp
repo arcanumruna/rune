@@ -42,7 +42,6 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <string>
 #include <thread>

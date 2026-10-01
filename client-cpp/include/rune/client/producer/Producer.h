@@ -344,9 +344,10 @@ public:
     /// partition report BackPressured until they are applied — while every
     /// other partition proceeds normally.  One partition may hold at most
     /// directDeferredPartitionBytes of the arena.  When its share (or the
-    /// arena) is full: trySend() returns BackPressured, a void send() inside
-    /// the duty cycle throws std::runtime_error, and the callback/future
-    /// overloads fail with a distinct "deferred buffer full" reason.  A deferred
+    /// arena) is full: every trySend() form returns BackPressured and every
+    /// blocking send() form (void, AckToken, Completions) inside the duty cycle
+    /// throws std::runtime_error — the record is not accepted, so no completion
+    /// follows.  A deferred
     /// record has the normal delivery deadline (deliveryTimeoutMs from
     /// acceptance; a void one is counted + logged), and flush() covers it.  Only
     /// the owner thread may send (others get WrongThread).

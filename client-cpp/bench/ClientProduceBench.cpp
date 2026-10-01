@@ -12,7 +12,7 @@
 //
 //   BM_SubscribeDeliveryLatency
 //     Produces one record, then measures the wall-clock from the final byte of
-//     the produce future resolution (gateway has sent ProduceResponse) until the
+//     the produce completion (gateway has sent ProduceResponse) until the
 //     SubscribeResponse + first delivered record hits the RecordHandler.
 //     This is the end-to-end "write-to-read" delivery latency.
 //     Gate: p99 < 100µs.
@@ -26,7 +26,7 @@
 //       Subscribe      → SubscribeResponse{subscriptionId=1, startOffset}
 //                        then pushes a RecordBatch back for each subscribe
 //   - Produce RTT: the full app→ring→agent→transport→gateway→transport→agent→
-//                  promise path.
+//                  completion-ring path.
 //   - Subscribe delivery: gap from produce-ack to first RecordHandler call.
 
 #include <rune/client/Client.h>
@@ -55,7 +55,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>

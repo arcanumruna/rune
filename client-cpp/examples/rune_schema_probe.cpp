@@ -54,7 +54,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
-#include <future>
 #include <optional>
 #include <string_view>
 #include <iostream>

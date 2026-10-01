@@ -35,7 +35,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <future>
 #include <iostream>
 #include <string>
 #include <thread>

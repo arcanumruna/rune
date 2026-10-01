@@ -246,7 +246,6 @@ Client::Client(ClientConfig cfg)
                 std::abort();  // unreachable: an empty ring of capacity 64 takes one empty record
             }
             startRing.producerClose();  // the runner never touches `startRing` again
-            runnerStartSawDutyId_ = dutyThreadId_;
             runLoop();
         });
         bool started = false;

@@ -123,7 +123,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <future>
 #include <iostream>
 #include <mutex>
 #include <sstream>

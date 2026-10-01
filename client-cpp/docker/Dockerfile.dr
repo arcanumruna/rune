@@ -8,8 +8,9 @@
 # Build command (from rune-client-cpp repo root):
 #   docker build --platform linux/amd64 \
 #     --build-context rune-protocol=../rune-protocol \
+#     --build-context rune-fr=../rune-fr \
 #     -f docker/Dockerfile.dr \
-#     -t rune-dr-client:dev .
+#     -t rune-dr-client:$(git rev-parse --short HEAD) .   # always a git-SHA tag, never dev/latest
 #
 # The rune-protocol sibling repo is supplied via a BuildKit named build context.
 

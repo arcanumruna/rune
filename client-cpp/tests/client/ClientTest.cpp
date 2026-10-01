@@ -1238,7 +1238,10 @@ TEST(ClientLifecycle, CloseStopsAgentOnlyAfterRunnerJoinRegression) {
 // OneToOneRingBuffer; the constructor returns only after reading that record.
 //   * App side: the moment the constructor returns, dutyThreadId_ IS the
 //     runner's id, and reading it is ordered after the runner's write (TSan).
-//   * Runner side: before its first duty cycle the runner sees its own id.
+//   (F8c C9, C8 review nit 4: the former runner-side "saw its own id" check was
+//   dropped with its production-state test hook — the runner reads its own
+//   write a statement earlier, so it could only fail for a design in which the
+//   runner does not write the id at all, which the app-side check covers.)
 // RED by mutation: (a) the constructor not waiting for the record -> stale id
 // (the owner's) and a TSan race; (b) the runner publishing before writing its
 // id -> TSan race.  No sleeps; nothing waits on time.
@@ -1260,10 +1263,29 @@ TEST(ClientLifecycle, RunnerSeesDutyThreadIdBeforeFirstCycleRegression) {
         ASSERT_NE(runner, std::thread::id{});
         ASSERT_NE(runner, std::this_thread::get_id());
         ASSERT_EQ(duty, runner) << "iteration " << i;
-        client->close();  // joins the runner: its start observation is now visible
-        ASSERT_EQ(client->testRunnerStartSawDutyId(), runner) << "iteration " << i;
+        client->close();
         client.reset();
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
     }
+}
+
+// F8c C9 (C8 review nit 6): the Invoker-mode side of the same invariant — no
+// runner exists and the constructing (owner) thread IS the duty thread.
+TEST(ClientLifecycle, InvokerOwnerIsDutyThreadRegression) {
+    const std::string dir = uniqueDir();
+    ClientConfig cfg;
+    cfg.gatewayChannel  = "aeron:ipc";
+    cfg.gatewayStreamId = 994;
+    cfg.egressChannel   = "aeron:ipc";
+    cfg.egressStreamId  = 995;
+    cfg.dataDir         = dir;
+    cfg.runnerMode      = RunnerMode::Invoker;
+    auto client = std::make_unique<Client>(cfg);
+    EXPECT_EQ(client->testDutyThreadId(), std::this_thread::get_id());
+    EXPECT_EQ(client->testRunnerThreadId(), std::thread::id{});
+    client->close();
+    client.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }

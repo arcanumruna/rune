@@ -57,7 +57,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <set>
 #include <string>

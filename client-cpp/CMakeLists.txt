@@ -61,6 +61,18 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+    # F8c C9: no std::future / promise / shared_future / packaged_task / async /
+    # launch / #include <future> in src/ include/ examples/ bench/ tools/ (the
+    # script self-tests its fixtures first), and no shared ownership in the
+    # public handle headers — allowlist or not.
+    add_test(NAME NoFuturesOrPromisesGuardRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --futures
+            ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME NoSharedPtrHandlesGuardRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --handles
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
