@@ -34,6 +34,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace rune::aeronutil {
@@ -63,6 +64,18 @@ public:
             }
     }
     [[nodiscard]] std::size_t sessionCount() const noexcept { return slots_.size(); }
+    /// Erase every session whose image is gone (live(sessionId) == false).
+    template <class IsLive>
+    std::size_t purge(IsLive&& live) {
+        std::size_t erased = 0;
+        for (std::size_t i = 0; i < slots_.size();) {
+            if (live(slots_[i].sessionId)) { ++i; continue; }
+            if (i + 1 != slots_.size()) slots_[i] = std::move(slots_.back());
+            slots_.pop_back();
+            ++erased;
+        }
+        return erased;
+    }
 
 private:
     struct Slot {
@@ -125,6 +138,8 @@ public:
     }
 
     void deleteSessionBuffer(std::int32_t sessionId) { builders_.erase(sessionId); }
+    template <class IsLive> std::size_t purgeSessions(IsLive&& live) { return builders_.purge(std::forward<IsLive>(live)); }
+    [[nodiscard]] std::size_t sessionCount() const noexcept { return builders_.sessionCount(); }
     [[nodiscard]] std::size_t sessionCountForTest() const noexcept { return builders_.sessionCount(); }
 
 private:
@@ -173,10 +188,40 @@ public:
     }
 
     void deleteSessionBuffer(std::int32_t sessionId) { builders_.erase(sessionId); }
+    template <class IsLive> std::size_t purgeSessions(IsLive&& live) { return builders_.purge(std::forward<IsLive>(live)); }
+    [[nodiscard]] std::size_t sessionCount() const noexcept { return builders_.sessionCount(); }
     [[nodiscard]] std::size_t sessionCountForTest() const noexcept { return builders_.sessionCount(); }
 
 private:
     detail::SessionBuilders builders_;
+};
+
+/// Frees per-session reassembly buffers of images that went away (review m-c;
+/// Aeron frees them from an unavailable-image handler, which runs on the client
+/// conductor thread — a cross-thread mutation here, so instead this runs on the
+/// POLLING thread, after each poll):
+///   - one relaxed load per poll (Subscription::imageCount(), the same image
+///     array Aeron's poll already loads);
+///   - when the image count changed OR the table grew (a new session started a
+///     fragmented message), drop every slot whose sessionId has no image.
+/// So the table never exceeds the images live at its last growth, and returns
+/// to empty once all images are gone — no timers, no cross-thread state.
+class ImageLossWatch {
+public:
+    template <class Sub, class Asm>
+    void afterPoll(const Sub& sub, Asm& assembler) {
+        const int images = sub.imageCount();
+        const std::size_t sessions = assembler.sessionCount();
+        if (images == lastImages_ && sessions <= lastSessions_) [[likely]] return;
+        lastImages_ = images;
+        if (sessions != 0)
+            assembler.purgeSessions([&sub](std::int32_t id) { return sub.imageBySessionId(id) != nullptr; });
+        lastSessions_ = assembler.sessionCount();
+    }
+
+private:
+    int         lastImages_   = -1;
+    std::size_t lastSessions_ = 0;
 };
 
 } // namespace rune::aeronutil

@@ -423,6 +423,7 @@ int AeronPartitionTransport::poll(int64_t nowNs)
                 b, o, l, h);
         },
         kFragmentLimit);
+    imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost images (m-c)
     work += fragged;
 
     if (g_txRateLog) {

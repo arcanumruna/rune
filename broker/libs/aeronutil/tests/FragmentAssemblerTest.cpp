@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -110,4 +111,45 @@ TEST(FragmentAssemblerRegression, ControlledAbortRedeliversTheEndFragment) {
     EXPECT_EQ(deliver(f2), aeron::ControlledPollAction::ABORT);
     EXPECT_EQ(deliver(f2), aeron::ControlledPollAction::CONTINUE) << "the image re-delivers END after ABORT";
     EXPECT_EQ(got, std::vector<std::string>{"abcdef"});
+}
+
+// Review m-c: per-session buffers of images that went away are freed (on the
+// polling thread), so the table cannot grow without bound.
+namespace {
+struct FakeSub {
+    std::vector<std::int32_t> live;
+    int imageCount() const { return static_cast<int>(live.size()); }
+    std::shared_ptr<int> imageBySessionId(std::int32_t id) const {
+        for (auto s : live) if (s == id) return std::make_shared<int>(id);
+        return nullptr;
+    }
+};
+}
+
+TEST(FragmentAssemblerRegression, SessionBuffersAreFreedWhenTheirImagesGoAway) {
+    constexpr int kSessions = 32;
+    Term t; Sink s; FragmentAssembler a; FakeSub sub; rune::aeronutil::ImageLossWatch watch;
+    for (int id = 1; id <= kSessions; ++id) {
+        sub.live.push_back(id);
+        feed(a, t, t.put(id, B, "partial-"), s);          // each session leaves a partial message
+        watch.afterPoll(sub, a);
+    }
+    EXPECT_EQ(a.sessionCountForTest(), static_cast<std::size_t>(kSessions));
+    sub.live.clear();                                       // every image goes away
+    watch.afterPoll(sub, a);
+    EXPECT_EQ(a.sessionCountForTest(), 0u) << "per-session buffers of lost images must be freed";
+}
+
+TEST(FragmentAssemblerRegression, ChurnAtConstantImageCountStaysBounded) {
+    // One image leaves and another arrives between polls: the count never changes,
+    // but the new session's fragment grows the table → purge.
+    Term t; Sink s; FragmentAssembler a; FakeSub sub; rune::aeronutil::ImageLossWatch watch;
+    sub.live = {1};
+    feed(a, t, t.put(1, B, "x"), s); watch.afterPoll(sub, a);
+    for (int id = 2; id <= 100; ++id) {
+        sub.live = {id};
+        feed(a, t, t.put(id, B, "y"), s);
+        watch.afterPoll(sub, a);
+        ASSERT_LE(a.sessionCountForTest(), 1u) << "table grew past the live images at id " << id;
+    }
 }

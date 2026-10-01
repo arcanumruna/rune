@@ -68,7 +68,7 @@ public:
     // -----------------------------------------------------------------------
     // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
     int poll(int fragmentLimit = 10) {
-        return sub_->poll(
+        const int n = sub_->poll(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
                    aeron::Header& h) {
                 assembler_.onFragment(
@@ -81,6 +81,8 @@ public:
                     b, o, l, h);
             },
             fragmentLimit);
+        imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost images (m-c)
+        return n;
     }
 
     aeron::Subscription& subscription() { return *sub_; }
@@ -90,6 +92,7 @@ private:
     std::shared_ptr<aeron::Subscription>   sub_;
     IngressRing&                           ingressRing_;
     rune::aeronutil::FragmentAssembler     assembler_;
+    rune::aeronutil::ImageLossWatch        imageWatch_;
 };
 
 } // namespace rune::consensus

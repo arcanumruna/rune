@@ -534,9 +534,8 @@ public:
     //
     // Returns the number of fragments handled; 0 if not resolved().
     //
-    // No std::function of our own — the only type-erasure is Aeron's own
-    // fragment_handler_t at the Subscription::poll boundary (mirrors
-    // WorkerIngress::poll exactly).
+    // No std::function, no trampoline: rune templated assembler inlined into
+    // Aeron's templated poll (mirrors WorkerIngress::poll exactly).
     // -----------------------------------------------------------------------
     template <class Dispatch>
     int poll(int fragmentLimit, Dispatch&& dispatch)
@@ -577,7 +576,7 @@ public:
         // Production path (Task 11 fix 2, B3): rune templated assembler + the
         // concrete dispatch, inlined into Aeron's templated poll — no
         // std::function, no trampoline.
-        return sub_->poll(
+        const int n = sub_->poll(
             [this, &dispatch](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
                               aeron::util::index_t l, aeron::Header& h) {
                 assembler_.onFragment(
@@ -589,6 +588,8 @@ public:
                     b, o, l, h);
             },
             fragmentLimit);
+        imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost images (m-c)
+        return n;
     }
 
     // -----------------------------------------------------------------------
@@ -862,7 +863,7 @@ private:
     // dispatchFrame_ — decode the SBE header and fixed fields, apply maxBytes
     // cap for FetchRequest variants, then invoke dispatch.
     //
-    // Called from both the production trampoline (term-buffer pointer, valid
+    // Called from both the production poll (term-buffer pointer, valid
     // only for the call) and the test-mode queue drain (heap buffer, but same
     // zero-copy contract enforced: dispatch MUST NOT store the pointer).
     //
@@ -1108,6 +1109,7 @@ private:
 
     // Rune templated fragment assembler (Task 11 fix 2, B3) — no std::function.
     rune::aeronutil::FragmentAssembler assembler_;
+    rune::aeronutil::ImageLossWatch    imageWatch_;
 
     PubRegistry pubReg_;  // per-peer pub management + send policy
 

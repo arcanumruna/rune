@@ -346,6 +346,7 @@ private:
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
     rune::aeronutil::ControlledFragmentAssembler assembler_;   // templated (Task 11 fix 2, B3)
+    rune::aeronutil::ImageLossWatch              imageWatch_;  // review m-c
 
     NodeId                                 selfId_;
     int64_t                                nowNs_ = 0; ///< updated at top of poll()

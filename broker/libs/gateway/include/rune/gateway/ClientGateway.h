@@ -1079,6 +1079,7 @@ private:
 
     std::shared_ptr<aeron::Subscription> sub_;
     rune::aeronutil::FragmentAssembler   assembler_;
+    rune::aeronutil::ImageLossWatch      imageWatch_;   // review m-c
 
     SessionTable                         sessions_;
 

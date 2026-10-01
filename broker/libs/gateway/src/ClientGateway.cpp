@@ -393,6 +393,7 @@ int ClientGateway::doWork(int64_t nowNs) {
                 b, o, l, h);
         },
         fragmentLimit_);
+    imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
     pollPendingConnects(nowNs);
     pollPendingRecordEgress_(nowNs);  // hybrid egress: resolve unicast pubs + drain deferred subscribes
     reapExpired(nowNs);

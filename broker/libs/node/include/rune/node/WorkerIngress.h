@@ -10,15 +10,12 @@
 //     ClientGateway.cpp:85-99 exactly: addSubscription + findSubscription loop,
 //     kResolveMaxMs=5000 ms; via AeronPump (1 ms sleep with the default pump,
 //     invoker pumping of the shard's own driver + conductor otherwise, §3.6).
-//   - Wraps an aeron::FragmentAssembler (member) to reassemble multi-fragment
-//     messages (produces can exceed a single Aeron MTU) — same as the gateway.
-//   - poll<Handler>(fragmentLimit, handler) is TEMPLATED on Handler so OUR
-//     call site stays concrete and inlined.
-//   - The only std::function / type-erasure crossing is Aeron's own
-//     fragment_handler_t at the Subscription::poll boundary.  We bridge from
-//     the fixed assembler callback to the concrete Handler via a raw-function-
-//     pointer + void* trampoline (zero overhead, zero additional std::function
-//     of our own).
+//   - Reassembles multi-fragment messages (produces can exceed a single Aeron
+//     MTU) with rune::aeronutil::FragmentAssembler — same as the gateway;
+//     buffers of lost images are freed by an ImageLossWatch after each poll.
+//   - poll<Handler>(fragmentLimit, handler) is TEMPLATED on Handler and the
+//     assembler delegate is a template argument, all inlined into Aeron's
+//     templated Subscription/Image poll: no std::function, no trampoline.
 //   - ZERO-COPY: the handler receives a pointer into Aeron's term buffer valid
 //     ONLY for the duration of the handler call.  Do NOT store the pointer.
 //   - SINGLE-OWNER / SINGLE-THREAD: one WorkerIngress per worker, polled only
@@ -138,7 +135,7 @@ public:
         // Task 11 fix 2 (B3): templated assembler + the caller's handler, all
         // inlined into Aeron's templated Subscription/Image poll — no
         // std::function, no trampoline.
-        return sub_->poll(
+        const int n = sub_->poll(
             [this, &handler](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
                              aeron::util::index_t l, aeron::Header& h) {
                 assembler_.onFragment(
@@ -150,6 +147,8 @@ public:
                     b, o, l, h);
             },
             fragmentLimit);
+        imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost images (m-c)
+        return n;
     }
 
 private:
@@ -162,6 +161,7 @@ private:
     std::shared_ptr<aeron::Subscription>   sub_;
 
     rune::aeronutil::FragmentAssembler     assembler_;
+    rune::aeronutil::ImageLossWatch        imageWatch_;
 };
 
 } // namespace rune::node
