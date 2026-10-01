@@ -89,7 +89,7 @@
 
 **Deleted:** `TxnBatchAppended` (and the reserved `PRODUCE_NOTIFY` slot), `TxnStateSnapshot`, gateway `partitionTxnStates_` for worker-owned partitions, gateway `lsoTracker.onProduceBatch` in `handleWorkerReturn_` (~ClientGateway.cpp:3158-3162) and in the produce path (~1811), the LSO block of `rebuildProducerStateFromLogs` (~489-517), `ClientGateway::notifyControlMarker` for worker-owned partitions, the gateway PSM mirror for worker-owned partitions.
 
-**Gateway-owned partitions** (internal, topicId < 0, written on control): they keep the gateway inline path. Internal topics are written only by coordinators with pid −1, so they hold no transactional batches. S4 verifies this with a test (`…InternalPartitionsNeverCarryTxnBatches`). If it holds, the gateway `LsoTracker`/`AbortedTxnIndex` are **deleted outright** and the RC mirror is the only gateway-side read_committed state. If it ever fails, the gateway keeps an `LsoTracker` for topicId < 0 only, fed inline on the control thread, which is a single thread with no race.
+**Gateway-owned partitions** (internal, topicId < 0, written on control): they keep the gateway inline path. Internal topics are written only by coordinators with pid −1, so they hold no transactional batches. S4 verifies this with a test (`TxnRcRegression.InternalPartitionsNeverCarryTxnBatches`), and `executePushReadWire_` bounds an internal partition by its HW only. **As built in S4:** with a worker pool (every production mode) the gateway holds **no** read_committed state at all — there is no RC mirror (deleted in revision 3, I-B); it neither feeds nor reads `PartitionTxnState` for any partition. The gateway `LsoTracker`/`AbortedTxnIndex` survive only for the **no-worker-pool inline path** (unit rigs), where the control thread is the single appender and reader of those logs.
 
 All cross-thread traffic for F15 uses exactly two channel kinds:
 - **op ring** (control → W): `OneToOneByteRing`, SPSC, FIFO, with control as its only producer.
@@ -597,7 +597,7 @@ The commit is additive except for dropping WorkerOp field 49 (Q5), which changes
 
 ---
 
-## 9. Performance (re-checked for revision 2)
+## 9. Performance (re-checked for revision 3; S4 numbers in the S4 report)
 
 **Non-transactional produce, both paths, every mode: O(1), allocation-free, no new ring traffic.**
 
@@ -628,7 +628,7 @@ The commit is additive except for dropping WorkerOp field 49 (Q5), which changes
 - the budget is set by `BM_RcBuildStep`, **run with a cold page cache** (a byte budget does not bound page-fault time), so one step's p99 stays under the per-pass latency budget (target: ≤ 20 µs, within the 100 µs p99 law);
 - the build never runs on the produce hot path except as one bounded inline step for an idempotent or transactional batch on a not-yet-Ready partition.
 
-**Gateway push path:** no new ring traffic. The `PushRead` op already carries `isolation`; W adds one `lso(hw)` per read_committed read and one attribute check per batch in the existing copy loop. The revision-2 `RC_BOUND` traffic is gone with the mirror.
+**Gateway push path:** no new ring traffic. The `PushRead` op already carries `isolation`; W adds one `lso(hw)` per read_committed read and one attribute check per batch in the existing copy loop. The revision-2 `RC_BOUND` traffic is gone with the mirror. **No empty-PushRead spin (addendum R-3):** the `PushReadResult` echoes W's effective bound and its RC readiness (in two fields a PushReadResult never otherwise uses — `lastOffset`, `deferAck` — so the WorkerReturn layout is unchanged); a subscription whose cursor reached that bound is parked at the gateway's HW snapshot and re-read only when the snapshot moves (or its isolation carrier arrives): at most one PushRead per HW change while an open txn pins the LSO. While RC is not Ready the gateway re-issues each cycle — bounded by the build's ⌈size / budget⌉ passes.
 
 **Control thread:** the coordinator load, the decision gate and the pid block are all cold paths.
 
