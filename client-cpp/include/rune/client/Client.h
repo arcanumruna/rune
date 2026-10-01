@@ -240,6 +240,18 @@ public:
     [[nodiscard]] std::size_t testProducerCount() const noexcept { return producerHub_.size(); }
     /// Test hook: fill the agent command ring so the next registration finds it full.
     void testFillCommandRing() { agent_.testFillCommandRing(); }
+    /// fix5 Important-2(c) test hooks: orphan a claim on the agent command ring
+    /// (claimed, never committed), lower the close-drain unblock threshold, and
+    /// read how often close()'s drain had to unblock.
+    aeron::util::index_t testClaimCommandRingWithoutCommitting(std::size_t payloadLen) {
+        return agent_.testClaimNoopWithoutCommitting(payloadLen);
+    }
+    void testSetCloseDrainUnblockAfterYields(int n) noexcept {
+        agent_.testSetCloseDrainUnblockAfterYields(n);
+    }
+    [[nodiscard]] int testCloseDrainUnblockCalls() const noexcept {
+        return agent_.testCloseDrainUnblockCalls();
+    }
     /// Test hook (duty-cycle thread only): install a partition route as metadata would.
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
@@ -599,9 +611,11 @@ private:
     void submitRegistration_(Submit&& submit, OnFail&& onFail) {
         // After close() no duty cycle will ever adopt the holder (and Thread mode
         // would park 5 s on a ring nobody drains): fail fast, nothing leaks.
-        // seq_cst: paired with closeImpl_'s seq_cst exchange (fix2 Important-3;
-        // see the Dekker-reasoning comment there) for the producer-registration
-        // race this guards against.
+        // A fast-fail only: correctness of the registration-vs-close race does
+        // NOT rest on this load (a load creates no happens-before edge from the
+        // later ring commit to close()'s drain). It rests on the post-submit
+        // seq_cst compare_exchange in producerWithRingCap_ (fix3 C1; the full
+        // argument is there and at closeImpl_'s exchange).
         if (stopped_.load(std::memory_order_seq_cst)) {
             onFail();
             throw std::logic_error("client closed");

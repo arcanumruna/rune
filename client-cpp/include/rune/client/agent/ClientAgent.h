@@ -39,6 +39,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <span>
@@ -257,7 +258,28 @@ public:
     /// WHOLE command ring once, adopting producer + txn-producer registrations
     /// through their hooks (so their holders are freed and the owner can fail
     /// them) and dropping every other command (sends carry no completion).
+    ///
+    /// fix5 Important-2(c): always terminates. If the drain makes no progress
+    /// for kCloseDrainUnblockAfterYields consecutive yields (stuck behind a
+    /// claimed-but-never-committed record), it calls M2ORingBuffer::unblock()
+    /// (Aeron's own recovery for exactly this), logs one warning, and
+    /// continues; if unblock() cannot make progress kCloseDrainMaxFailedUnblocks
+    /// times in a row, it gives up (warning) rather than wedge close().
     int drainRegistrationsForClose() noexcept;
+
+    /// fix5 Important-2(c): consecutive no-progress yields before
+    /// drainRegistrationsForClose() unblocks the ring. An ITERATION cap, not a
+    /// time: the claim->commit window it waits out is a handful of noexcept
+    /// instructions (writeCommand -> M2ORingBuffer::writeWith, which aborts its
+    /// claim on any throw), so only a writer that is descheduled mid-window —
+    /// or a bug that orphaned a claim — can reach it. 1M yields is many
+    /// scheduler quanta even on a loaded box, so a merely-preempted writer
+    /// commits long before it; a real orphan costs close() one bounded wait.
+    static constexpr int kCloseDrainUnblockAfterYields = 1'000'000;
+    /// fix5 Important-2(c): consecutive unblock() calls that make no progress
+    /// (nothing unblockable: e.g. a header-less claim with nothing committed
+    /// behind it) before drainRegistrationsForClose() stops waiting.
+    static constexpr int kCloseDrainMaxFailedUnblocks = 2;
 
     /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
     /// subscription so the client receives Records pushed by the owning worker.
@@ -344,6 +366,12 @@ public:
     /// fix3 I1: commit a claim previously returned by
     /// testClaimNoopWithoutCommitting().
     void testCommitClaim(aeron::util::index_t claimIndex) { ring_.commit(claimIndex); }
+    /// fix5 Important-2(c): turn a claim from testClaimNoopWithoutCommitting()
+    /// into a HEADER-LESS claim (length + type words zeroed) — the state of a
+    /// writer that won the tail CAS but never wrote its record header.
+    void testZeroClaimHeader(aeron::util::index_t claimIndex) noexcept {
+        std::memset(ring_.base() + claimIndex - 8, 0, 8);
+    }
     /// fix3 I1: called (if set) every time drainRegistrationsForClose() yields
     /// waiting on an uncommitted claim — lets a test commit the claim
     /// deterministically, from inside the wait loop, on the SAME thread,
@@ -352,6 +380,13 @@ public:
     void testSetCloseDrainYieldHook(std::function<void()> fn) noexcept {
         testCloseDrainYieldHook_ = std::move(fn);
     }
+    /// fix5 Important-2(c): override kCloseDrainUnblockAfterYields so a test
+    /// can reach the unblock path without a million real yields. Set before
+    /// close(); single-threaded.
+    void testSetCloseDrainUnblockAfterYields(int n) noexcept { closeDrainUnblockAfterYields_ = n; }
+    /// fix5 Important-2(c): number of times drainRegistrationsForClose() has
+    /// called M2ORingBuffer::unblock() (owner / post-join reads only).
+    [[nodiscard]] int testCloseDrainUnblockCalls() const noexcept { return closeDrainUnblockCalls_; }
 
     /// Task 1.4 (redirect convergence): route ONE pre-encoded produce frame to its
     /// partition leader session — the SAME routing the produce drain path uses
@@ -642,6 +677,10 @@ private:
     // fix3 I1: test-only observability hook for drainRegistrationsForClose()'s
     // wait loop (see testSetCloseDrainYieldHook()). Empty by default.
     std::function<void()> testCloseDrainYieldHook_;
+    // fix5 Important-2(c): close-drain unblock threshold (test-overridable)
+    // and how many times it fired. Close-path / owner only — plain ints.
+    int closeDrainUnblockAfterYields_ = kCloseDrainUnblockAfterYields;
+    int closeDrainUnblockCalls_       = 0;
 
     // ---- MD1 Task 10: Metadata response hook (agent thread only) -------------
     MetadataResponseFn metadataResponseFn_;

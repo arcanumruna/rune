@@ -647,6 +647,7 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
     pcfg.acks                   = rc::Acks::None;
     pcfg.lingerUs               = 0;
     pcfg.agentLivenessTimeoutMs = 1; // smallest positive unit: see the comment above
+                                     // (phase 2 below steps the clock 500 us: a 2x margin)
     auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
     auto topic = r.client.topic("t");
 
@@ -693,12 +694,18 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
         << "nothing drains the ring above — a success here is unexpected regardless of wiring";
 
     // Now actually let it succeed (drain for real), so appThread can be
-    // joined cleanly.
-    for (int i = 0; i < 1000 &&
+    // joined cleanly. fix5 minor 4: step the injected clock by 500 us, HALF
+    // the 1 ms liveness window. Each doWork() republishes the heartbeat at
+    // the just-advanced value, so the largest gap the reader can ever observe
+    // (it reads the clock between this fetch_add and the doWork() that
+    // follows) is one step = 500 us < 1 ms — a real 2x margin. (A 1 ms step
+    // made that worst-case gap EQUAL to the window, passing only because the
+    // check is a strict `>`.)
+    for (int i = 0; i < 2000 &&
                     !succeeded.load(std::memory_order_acquire) &&
                     !threw.load(std::memory_order_acquire);
          ++i) {
-        g_fakeNowMt.fetch_add(1'000'000, std::memory_order_relaxed); // +1ms injected
+        g_fakeNowMt.fetch_add(500'000, std::memory_order_relaxed); // +500us injected
         r.client.doWork();
         r.gw.pump();
     }
@@ -708,18 +715,24 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
     EXPECT_FALSE(threw.load()) << "spurious timeout: the heartbeat writer/reader clocks disagreed";
 }
 
-// fix3 I2: previously used agentLivenessTimeoutMs=5 (ms) and an unbounded
-// appThread.join() — both too weak/dangerous to actually detect the wiring
-// regression: a 5 ms liveness window is trivially crossed by EITHER the
-// injected clock OR a wrongly-defaulted real steady_clock within
-// milliseconds, so this passed either way (confirmed: see the fix3 report);
-// and an unbounded join would have HUNG the suite had the wiring genuinely
-// been broken in a way that never progresses. Fixed: a deliberately large
-// (60 s) liveness window that the injected clock crosses in a fraction of a
-// real second (pure atomic increments, no sleep) but a real steady_clock
-// fallback could only cross by actually waiting 60 REAL seconds — and the
-// join is bounded via a future with wait_for(), so a wiring regression FAILS
-// this test instead of hanging the suite.
+// fix3 I2: a deliberately large (60 s) liveness window that the injected
+// clock crosses in a fraction of a real second (pure atomic increments, no
+// sleep) but a real steady_clock fallback could only cross by actually
+// waiting 60 REAL seconds — so a wiring regression is detected.
+//
+// fix5 Important 1: the fix3/fix4 version stopped advancing the injected
+// clock at a 120 s injected "safety stop" — under load the app thread could
+// be descheduled long enough for the advancing loop to hit that stop before
+// sendBlocking ever re-read the clock, after which nothing advanced the clock
+// again and the test HUNG in join(). Now the clock keeps advancing until the
+// app thread's future is ready; the ONLY bound is a real-time hang guard
+// (wait_for(100 us) per iteration, 5 s total) — the one real-time bound this
+// suite permits, never needed in a passing run (a correctly-wired reader
+// throws as soon as it next reads an injected time 60 s past its start). On
+// failure, close() runs BEFORE join() so the blocked sender exits promptly
+// through the ring's closed word (SendResult::Closed -> std::logic_error)
+// instead of waiting out 60 real seconds; the thread catches everything so a
+// logic_error can never terminate the process.
 TEST(InvokerClient, HeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegression) {
     rc::ClientConfig c = invokerCfg(3792, 3793);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
@@ -738,39 +751,74 @@ TEST(InvokerClient, HeartbeatTimeoutFiresWhenRunnerIsWedgedWithInjectedClockRegr
     }
     ASSERT_GT(ok, 0u);
 
-    std::promise<bool> threwPromise; // true = threw std::runtime_error, as expected
-    std::future<bool>  threwFuture = threwPromise.get_future();
+    enum class Outcome { Timeout, Succeeded, OtherException };
+    std::promise<Outcome> outcomePromise;
+    std::future<Outcome>  outcomeFuture = outcomePromise.get_future();
     std::thread appThread([&] {
-        bool threw = false;
+        Outcome o = Outcome::Succeeded;
         try {
             p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
         } catch (const std::runtime_error&) {
-            threw = true;
+            o = Outcome::Timeout;          // the liveness timeout: expected
+        } catch (...) {
+            o = Outcome::OtherException;   // e.g. logic_error("client closed") after close()
         }
-        threwPromise.set_value(threw);
+        outcomePromise.set_value(o);
     });
 
     // The runner NEVER runs here (no doWork() calls — simulating "wedged"):
-    // just advance the SAME injected clock past the (huge) liveness window,
-    // as fast as the atomic increments themselves run (no real sleep).
-    while (threwFuture.wait_for(0ms) != std::future_status::ready) {
-        g_fakeNowMt.fetch_add(1'000'000, std::memory_order_relaxed); // +1ms injected
-        if (g_fakeNowMt.load(std::memory_order_relaxed) > 120'000'000'000LL) break; // 120s injected: safety stop
+    // advance the SAME injected clock until the app thread finishes. Real time
+    // only bounds the loop as a hang guard (see above).
+    const auto hangGuard = std::chrono::steady_clock::now() + 5s;
+    bool ready = false;
+    while (!(ready = outcomeFuture.wait_for(100us) == std::future_status::ready) &&
+           std::chrono::steady_clock::now() < hangGuard) {
+        // +100 ms injected per iteration: each iteration also waits (up to)
+        // 100 us of real time in wait_for above, so a 1 ms step would need
+        // >= 60'000 iterations (>= 6 REAL seconds) to cross the 60 s window —
+        // longer than the hang guard itself. 100 ms crosses it in ~600.
+        g_fakeNowMt.fetch_add(100'000'000, std::memory_order_relaxed);
     }
 
-    // Bounded: FAILS (does not hang the suite) if a wiring regression left the
-    // reader on real steady_clock, which would need 60 REAL seconds. (If this
-    // ever genuinely fails, appThread is still running and the join below can
-    // take up to that long — acceptable for a one-off RED/regression check,
-    // never expected in normal CI runs against the fixed code.)
-    const bool ready = threwFuture.wait_for(5s) == std::future_status::ready;
     EXPECT_TRUE(ready)
-        << "appThread did not finish within 5 real seconds — the injected clock is likely "
-           "not being used by sendBlocking's reader (a steady_clock fallback needs 60 REAL "
-           "seconds to cross this test's liveness window)";
-    if (ready) {
-        EXPECT_TRUE(threwFuture.get())
-            << "must time out once the injected clock exceeds agentLivenessTimeoutMs";
-    }
+        << "appThread did not finish within the 5 s real-time hang guard — sendBlocking's "
+           "reader is likely not using the injected clock (a steady_clock fallback needs 60 "
+           "REAL seconds to cross this test's liveness window)";
+    if (!ready) r.client.close(); // closed word -> the blocked sender exits now, not in 60 s
     appThread.join();
+    if (ready) {
+        EXPECT_EQ(outcomeFuture.get(), Outcome::Timeout)
+            << "must time out (std::runtime_error) once the injected clock exceeds "
+               "agentLivenessTimeoutMs";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fix5 Important-2(c): Client::close() must terminate even when the agent
+// command ring holds an ORPHANED claim (claimed, never committed) in front of
+// a committed producer registration — and that registration must still be
+// adopted and its ring marked closed. Pre-fix: close() hung forever in
+// drainRegistrationsForClose().
+// ---------------------------------------------------------------------------
+TEST(InvokerClient, CloseTerminatesPastAnOrphanedClaimAndClosesTheRegisteredRingRegression) {
+    Rig r(invokerCfg(3794, 3795));
+
+    ASSERT_GE(r.client.testClaimCommandRingWithoutCommitting(8), 0); // the orphan
+    rc::ProducerConfig pcfg;
+    pcfg.acks     = rc::Acks::None;
+    pcfg.lingerUs = 0;
+    auto p = r.client.producer(pcfg); // registration committed BEHIND the orphan; no doWork()
+    auto topic = r.client.topic("t");
+    ASSERT_EQ(r.client.testProducerCount(), 0u) << "not adopted yet: nothing drained the ring";
+    ASSERT_EQ(p.trySend(topic, rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
+              rc::SendResult::Ok);
+
+    r.client.testSetCloseDrainUnblockAfterYields(64); // production default: 1M — same path
+    r.client.close();                                 // must return
+
+    EXPECT_EQ(r.client.testCloseDrainUnblockCalls(), 1);
+    EXPECT_EQ(r.client.testProducerCount(), 1u) << "the registration behind the orphan is adopted";
+    EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{2}), std::span<const uint8_t>(kVal)),
+              rc::SendResult::Closed)
+        << "the adopted producer's ring is marked closed";
 }

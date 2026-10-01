@@ -129,6 +129,26 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     int totalWork = transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
 
     // ---- Step 1: Drain the command ring (bounded) ---------------------------
+    // fix5 Important-2(d): deliberately NO unblock-on-no-progress here (nor in
+    // ProducerImpl::drainRing for the producer rings). Aeron's consumers
+    // unblock because their producers are OTHER PROCESSES that can die
+    // mid-claim, detected by a ~10 s client-liveness timeout. Here every
+    // producer is a thread of this process: a claim can only be orphaned by an
+    // exception (now impossible — M2ORingBuffer::writeWith() aborts the claim
+    // on any throw, and ProducerImpl's in-place writers only memcpy between
+    // tryClaim and commit) or by the process dying (which takes this consumer
+    // with it). So a claim that is not yet committed is, by construction, a
+    // LIVE writer that was preempted — and unblocking a live writer is
+    // memory-unsafe: its later payload write lands on ring space the consumer
+    // has already recycled (another record's bytes, or a registration's
+    // holder pointer). A progress-based trigger ("head unmoved for N
+    // non-empty polls") cannot tell "preempted" from "dead" — N polls of a
+    // busy-spin runner is microseconds, far shorter than one scheduler
+    // quantum — and on the producer rings an unmoved head is also the NORMAL
+    // state under controlledRead ABORT back-pressure. Waiting costs latency
+    // only while the writer is descheduled; unblocking risks corruption. The
+    // one place that must terminate regardless — close(), after the runner is
+    // joined — has its own bounded unblock (drainRegistrationsForClose).
     int ringWork = ring_.read(
         [this, nowNs](
             std::int32_t                         msgTypeId,
@@ -289,7 +309,9 @@ bool ClientAgent::writeCommand(int32_t msgTypeId,
 
     // Defense-in-depth: if the ring throws for any other reason (e.g. a future
     // Aeron version introduces a new check), catch and return false rather than
-    // propagating through noexcept.
+    // propagating through noexcept. fix5 Important-2(a): write() (writeWith())
+    // aborts its own claim before any such throw leaves it, so returning false
+    // here never leaves an orphaned claim wedging the consumer (or close()).
     try {
         return ring_.write(msgTypeId, ab, 0,
                            static_cast<aeron::util::index_t>(payloadLen));
@@ -341,16 +363,40 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
     // Fix: snapshot the ring's tail ONCE (acquire) as the drain target before
     // looping. `n == 0` now only means "stop" once head has caught up to that
     // snapshot — otherwise there is a committed-or-committing record still
-    // ahead of head, and we yield + retry. This is bounded and safe to spin
-    // on: writeCommand() (the only path that claims on this ring) is a plain
-    // claim+memcpy+commit with no syscalls and is noexcept, so the window
-    // between claim and commit is a handful of instructions; this function
-    // itself only ever runs once, at close(). No new shared state — head and
-    // tail are the ring's own existing protocol words (shared-nothing
-    // preserved).
+    // ahead of head, and we yield + retry. writeCommand() (the only path that
+    // claims on this ring) is claim+memcpy+commit via
+    // M2ORingBuffer::writeWith(), which aborts its claim on any throw (fix5
+    // Important-2(a)), so the claim->commit window is a handful of
+    // instructions; this function itself only ever runs once, at close(). No
+    // new shared state — head and tail are the ring's own existing protocol
+    // words (shared-nothing preserved).
+    //
+    // fix5 Important-2(c): "a handful of instructions" is not a termination
+    // proof — a writer descheduled mid-window, or any future bug that orphans
+    // a claim, would wedge close() forever. So the wait is iteration-capped
+    // (closeDrainUnblockAfterYields_ consecutive no-progress yields; see
+    // kCloseDrainUnblockAfterYields for why an iteration count, not a time)
+    // and then does what Aeron's own consumer does for a blocked
+    // ManyToOneRingBuffer: unblock() — the stuck claim becomes padding and the
+    // drain continues to whatever is committed behind it. If unblock() cannot
+    // make progress (nothing unblockable) kCloseDrainMaxFailedUnblocks rounds
+    // in a row, stop: close() must terminate. Any registration still behind
+    // such a claim is then left unread — the same accepted shutdown leak as
+    // Client::producerWithRingCap_'s fix3 M1 branch, never a hang.
+    // Residual hazard (inherent to unblock(); see its doc and Step 1 of
+    // doWork for why the runner never does this): if the "orphan" was really
+    // a writer descheduled for the whole cap, its late commit() is refused
+    // (writeCommand returns false; nothing is published), but its payload
+    // memcpy may land on ring bytes this drain already consumed. That memory
+    // is never read again after close(), so it is harmless while the ring is
+    // alive — the cap is sized so this needs a ~1M-yield stall.
     const std::int64_t targetTail = ring_.tailPosition();
     int total = 0;
+    int stalledYields = 0;
+    int failedUnblocks = 0;
+    bool warned = false;
     for (;;) {
+        const std::int64_t headBefore = ring_.headPosition();
         const int n = ring_.read(
             [this](std::int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf,
                    aeron::util::index_t offset, aeron::util::index_t len) {
@@ -365,14 +411,42 @@ int ClientAgent::drainRegistrationsForClose() noexcept {
             },
             cfg_.ringDrainLimit);
         total += n;
-        if (ring_.headPosition() >= targetTail) break; // caught up to the snapshot: done
-        if (n == 0) {
-            // Nothing currently readable, but the snapshot says more exists:
-            // it must be an in-flight claim. Test-only observability hook
-            // (fix3 I1 regression), then yield and retry.
-            if (testCloseDrainYieldHook_) testCloseDrainYieldHook_();
-            std::this_thread::yield();
+        const std::int64_t headAfter = ring_.headPosition();
+        if (headAfter >= targetTail) break; // caught up to the snapshot: done
+        if (n > 0 || headAfter != headBefore) {
+            stalledYields  = 0;  // progress: reset both caps
+            failedUnblocks = 0;
+            continue;
         }
+        // Nothing currently readable, but the snapshot says more exists: it
+        // must be an in-flight (or orphaned) claim.
+        if (++stalledYields >= closeDrainUnblockAfterYields_) {
+            stalledYields = 0;
+            ++closeDrainUnblockCalls_;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "rune-client: close(): command ring blocked by a claimed-but-"
+                             "uncommitted record at position %lld for %d yields; unblocking "
+                             "(Aeron ManyToOneRingBuffer::unblock)\n",
+                             static_cast<long long>(headAfter), closeDrainUnblockAfterYields_);
+            }
+            if (ring_.unblock()) {
+                failedUnblocks = 0;
+                continue;
+            }
+            if (++failedUnblocks >= kCloseDrainMaxFailedUnblocks) {
+                std::fprintf(stderr,
+                             "rune-client: close(): command ring cannot be unblocked at "
+                             "position %lld (target %lld); abandoning the close drain\n",
+                             static_cast<long long>(headAfter),
+                             static_cast<long long>(targetTail));
+                break;
+            }
+        }
+        // Test-only observability hook (fix3 I1 regression), then yield and retry.
+        if (testCloseDrainYieldHook_) testCloseDrainYieldHook_();
+        std::this_thread::yield();
     }
     return total;
 }

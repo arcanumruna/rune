@@ -220,25 +220,22 @@ void Client::close() {
 }
 
 void Client::closeImpl_() {
-    // fix2 Important-3 (Dekker reasoning): this exchange and
-    // producerWithRingCap_'s post-submit re-check of stopped_ are the two
-    // halves of a classic "flag + re-check" race across independent memory
-    // locations (this flag vs. the agent command ring's own tail/head): a
-    // plain release store here paired with a plain acquire load there does
-    // NOT by itself rule out the interleaving where producer() reads stopped_
-    // false, submits its registration into the ring, and this call's drain
-    // (drainRegistrationsForClose(), below) already ran and missed it — a
-    // registration-ring write can be reordered past a later load of a
-    // DIFFERENT atomic (stopped_) on either side (StoreLoad reordering), which
-    // acquire/release does not forbid. Using seq_cst on BOTH this store and
-    // producerWithRingCap_'s re-check puts them in one global total order: if
-    // the re-check does not yet observe `true` here, this exchange has not
-    // taken effect yet in that total order, so this call's own drain (which
-    // strictly follows this exchange in program order) cannot have run before
-    // the registration became visible — the drain adopts it. If the exchange
-    // HAS taken effect, the re-check is guaranteed to observe it and the
-    // producer side self-closes the ring instead. Atomically transition to
-    // stopped; only the first caller does the work.
+    // Registration-vs-close race (fix2 Important-3, corrected in fix3 C1; the
+    // full argument is at the compare_exchange in producerWithRingCap_): a
+    // producer() call on another thread commits its registration into the
+    // agent command ring and THEN performs a seq_cst RMW on stopped_
+    // (compare_exchange false->false). This exchange is the other RMW on
+    // stopped_; the two are totally ordered in stopped_'s modification order:
+    //   * CAS first: the CAS succeeds (reads false), and this exchange
+    //     reads-from it (or from a later RMW in its release sequence), so the
+    //     CAS synchronizes-with this exchange. The ring commit is
+    //     sequenced-before the CAS, hence happens-before this exchange and the
+    //     drainRegistrationsForClose() below — which therefore sees the
+    //     committed record (write-read coherence) and adopts it.
+    //   * Exchange first: the CAS fails (reads true) and that producer() call
+    //     marks its own ring closed instead.
+    // Either way, no registration is ever left unread with its ring open.
+    // Atomically transition to stopped; only the first caller does the work.
     bool alreadyStopped = stopped_.exchange(true, std::memory_order_seq_cst);
     if (alreadyStopped) return;
 
@@ -1673,31 +1670,32 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap) {
     // thread whose own drainRegistrationsForClose() already ran and so never
     // adopts (or closes) this producer.
     //
-    // A plain `stopped_.load(seq_cst)` here is NOT sufficient to close that
-    // window. The registration's ring commit (inside submitRegistration_,
-    // above) is a RELEASE store, not seq_cst — a plain load, even a seq_cst
-    // one, does not by itself create a happens-before edge with that commit:
-    // on x86, a store can still sit in this core's store buffer when a
-    // *later, unrelated* load executes (the classic "store buffering"
-    // reordering), so there is no guarantee the commit is globally visible to
-    // another thread's drain by the time a plain load here would read
-    // stopped_==false.
+    // A plain load of stopped_ here (even seq_cst) is NOT sufficient: a load
+    // that reads `false` only tells us the exchange is not yet visible to us;
+    // it creates no happens-before edge from our ring commit (a RELEASE store
+    // to a different location) to the close side's drain.
     //
-    // Fix: use a read-modify-write (compare_exchange) instead of a load. An
-    // RMW on a seq_cst atomic is required to read the immediately-preceding
-    // write in that atomic's modification order, and — unlike a plain load —
-    // is implemented as a LOCKed instruction, which acts as a full fence and
-    // cannot be reordered ahead of this thread's own preceding ring commit.
-    // So: if the CAS below reads false (succeeds), it does so having
-    // synchronized with closeImpl_'s stopped_.exchange(true, seq_cst) in the
-    // SAME modification-order chain — meaning that exchange has not
-    // completed yet, so closeImpl_'s drainRegistrationsForClose() (which
-    // strictly follows the exchange in program order) cannot have run yet
-    // either, and is still to come (it will adopt this registration). If the
-    // CAS instead reads true (fails), the exchange — and therefore, possibly,
-    // the drain — already happened; this thread closes the ring itself so the
-    // Producer returned below reports Closed instead of silently accepting
-    // sends into a ring nobody will ever drain or mark closed.
+    // Fix (fix5 minor 3 — the precise C++ memory-model argument): a seq_cst
+    // read-modify-write, compare_exchange(false -> false). closeImpl_'s
+    // stopped_.exchange(true) is also an RMW, and all RMWs on stopped_ are
+    // totally ordered in its modification order (MO), each reading the value
+    // written by its immediate MO predecessor ([atomics.order]/10).
+    //   * CAS succeeds (reads false): the CAS precedes the exchange in MO. The
+    //     exchange therefore reads-from this CAS's write, or from a later
+    //     RMW's write — which is part of this CAS's release sequence. The CAS
+    //     is a release operation and the exchange an acquire operation, so the
+    //     CAS synchronizes-with the exchange. Our ring commit is
+    //     sequenced-before the CAS, so: commit happens-before exchange
+    //     happens-before (sequenced-before, program order in closeImpl_)
+    //     drainRegistrationsForClose(). By write-read coherence
+    //     ([intro.races]/18), the drain's acquire loads of the ring's tail
+    //     and of this record's length word cannot read values older than
+    //     those writes — the drain sees the committed registration and
+    //     adopts it.
+    //   * CAS fails (reads true): the exchange — and therefore, possibly, the
+    //     drain — already happened; this thread closes the ring itself so the
+    //     Producer returned below reports Closed instead of silently accepting
+    //     sends into a ring nobody will ever drain or mark closed.
     bool expectedNotStopped = false;
     if (!stopped_.compare_exchange_strong(expectedNotStopped, false, std::memory_order_seq_cst)) {
         // fix3 M1: intentional leak, not a bug. We cannot tell from here

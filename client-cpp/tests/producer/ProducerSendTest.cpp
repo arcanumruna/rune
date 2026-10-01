@@ -430,51 +430,74 @@ TEST(ProducerSend, CloseWhileSendBlockingIsWaitingThrowsPromptlyRegression) {
 // callback/future overloads, BatchBuilder::send()) and must never write the
 // duty-thread-only callbackExceptions_ counter — this producer's ring is
 // MPSC, so even multiple app threads could race each other on it, not just
-// the duty thread. Exercises both paths concurrently, each with a throwing
-// callback, under TSan.
+// the duty thread.
+//
+// fix5 minor 5: made non-vacuous. The fix3 version let its "duty" thread
+// drain the ring continuously, so the app thread's sends mostly SUCCEEDED and
+// the failUnsubmitted path was hit rarely or never. Now the path is forced and
+// counted:
+//   1. kDrained callback-sends (throwing callbacks) are committed to the ring
+//      first — failAllPending() will later complete them on the DUTY thread
+//      through the COUNTED path.
+//   2. The rest of the ring is filled with void sends, so every app-thread
+//      callback-send below back-pressures and is failed RIGHT THERE by
+//      failUnsubmitted() (callback fires on the app thread with offset -1,
+//      synchronously inside send()).
+//   3. Only after the app thread is done does the duty thread run
+//      failAllPending() — gated by a RELAXED flag, which creates no
+//      happens-before edge (for TSan or the memory model), so the app
+//      thread's failUnsubmitted() and the duty thread's counted completions
+//      are genuinely unordered: if failUnsubmitted() still wrote the counter,
+//      TSan reports the race (verified RED with the old counting restored —
+//      see the fix5 report), and the count check below fails in any build.
 // ---------------------------------------------------------------------------
 TEST(ProducerSend, AppThreadFailUnsubmittedNeverRacesDutyThreadCounterRegression) {
     std::atomic<int64_t> corr{1};
     auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
     Producer p(impl);
-    impl->onBatchAck([](const rune::client::BatchAck&) {
-        throw std::runtime_error("duty-side throw");
-    });
 
-    std::atomic<bool> stop{false};
-    std::atomic<int>  appThrows{0};
+    // 1. Committed callback-sends: completed later by the duty thread (counted).
+    constexpr int kDrained = 3;
+    for (int i = 0; i < kDrained; ++i) {
+        p.send(kTopic, Key(static_cast<uint64_t>(i)), kVal, [](int64_t) {
+            throw std::runtime_error("duty-side throw");
+        });
+    }
+    // 2. Fill the remainder: from here every send back-pressures.
+    ASSERT_GT(fillUntilBackPressured(p), 0u);
 
-    // Plays "the duty thread": the one legitimate writer of
-    // callbackExceptions_. Repeatedly drains whatever the app thread below
-    // submitted (completing those acks via the COUNTED path) and fails
-    // anything else pending.
+    constexpr int kUnsubmitted = 50;
+    std::atomic<bool> appDone{false};
+    std::atomic<int>  unsubmittedHits{0}; // callbacks run on the app thread, inside send()
+    std::atomic<int>  wrongOffset{0};
+    std::thread::id   appId;              // written before any callback can read it
+
     std::thread duty([&] {
-        while (!stop.load(std::memory_order_acquire)) {
-            impl->failAllPending("races with app-thread failUnsubmitted");
-        }
+        // Event wait (not passing time): RELAXED on purpose — see above.
+        while (!appDone.load(std::memory_order_relaxed)) std::this_thread::yield();
+        impl->failAllPending("duty-thread failAllPending");
     });
 
-    // Plays "the app thread": keeps submitting callback-sends. Depending on
-    // timing, trySubmit either succeeds (the record is later drained and
-    // failed by the "duty" thread above — the COUNTED path) or back-pressures
-    // (failed right here, via failUnsubmitted — the UNCOUNTED app-thread
-    // path). Both callbacks throw.
     std::thread app([&] {
-        for (int i = 0; i < 1'000; ++i) {
-            p.send(kTopic, Key(static_cast<uint64_t>(i)), kVal, [&](int64_t) {
-                ++appThrows;
+        appId = std::this_thread::get_id();
+        for (int i = 0; i < kUnsubmitted; ++i) {
+            p.send(kTopic, Key(static_cast<uint64_t>(1000 + i)), kVal, [&](int64_t offset) {
+                if (std::this_thread::get_id() == appId) unsubmittedHits.fetch_add(1);
+                if (offset != -1) wrongOffset.fetch_add(1);
                 throw std::runtime_error("app-side throw");
             });
         }
+        appDone.store(true, std::memory_order_relaxed);
     });
 
     app.join();
-    stop.store(true, std::memory_order_release);
     duty.join();
 
-    EXPECT_GT(appThrows.load(), 0);
-    // Reading testCallbackExceptionCount() here (main thread) is safe: both
-    // writer threads above have been joined. Its exact value is a
-    // timing-dependent mix of drained-vs-dropped and is not the point — the
-    // point is that running the two paths concurrently is TSan-clean.
+    EXPECT_EQ(unsubmittedHits.load(), kUnsubmitted)
+        << "every app-thread send must have been failed by failUnsubmitted() on the app "
+           "thread (ring full, nothing drained) — otherwise this test exercises nothing";
+    EXPECT_EQ(wrongOffset.load(), 0) << "failUnsubmitted() reports offset -1";
+    // Both writers joined: reading the plain counter is safe here.
+    EXPECT_EQ(impl->testCallbackExceptionCount(), static_cast<uint64_t>(kDrained))
+        << "only the duty thread's completions may be counted; failUnsubmitted() logs only";
 }

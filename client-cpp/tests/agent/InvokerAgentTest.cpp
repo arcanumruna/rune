@@ -231,3 +231,79 @@ TEST(InvokerAgent, CloseDrainWaitsPastUncommittedClaimRegression) {
     EXPECT_EQ(registerCalls, 1);
     EXPECT_EQ(registeredHandle, fakeHandle);
 }
+
+// ---------------------------------------------------------------------------
+// fix5 Important-2(c): close() can no longer wedge forever on an ORPHANED claim
+// (claimed, never committed — the writer is gone). The drain waits a bounded
+// number of no-progress yields, then unblocks the ring (Aeron's
+// ManyToOneRingBuffer::unblock) and adopts the committed registration behind
+// the orphan. Pre-fix: drainRegistrationsForClose() yielded forever (hang).
+// ---------------------------------------------------------------------------
+namespace {
+rca::AgentConfig closeDrainCfg(int32_t in, int32_t eg) {
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = in;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = eg;
+    cfg.transport.dataDir = "/tmp/inv_agent_" + std::to_string(::getpid()) + "_" +
+                            std::to_string(g_ctr.fetch_add(1));
+    cfg.transport.driverMode = rune::client::transport::DriverMode::Invoker;
+    cfg.session.egressChannel  = "aeron:ipc";
+    cfg.session.egressStreamId = eg;
+    cfg.ringCapacity = 512;
+    return cfg;
+}
+} // namespace
+
+TEST(InvokerAgent, CloseDrainUnblocksAnOrphanedClaimAndAdoptsWhatIsBehindRegression) {
+    rca::AgentConfig cfg = closeDrainCfg(3604, 3605);
+    rca::ClientAgent agent(cfg);
+    agent.start();
+
+    int   registerCalls = 0;
+    void* registeredHandle = nullptr;
+    agent.setProducerRegisterFn([&](void* h) {
+        ++registerCalls;
+        registeredHandle = h;
+    });
+
+    // The orphan: claimed and NEVER committed (no hook commits it here).
+    ASSERT_GE(agent.testClaimNoopWithoutCommitting(8), 0);
+    void* const fakeHandle = reinterpret_cast<void*>(0x9abc);
+    ASSERT_TRUE(agent.submitRegisterProducer(fakeHandle));
+
+    constexpr int kCap = 64; // instead of the 1M production default — same code path
+    agent.testSetCloseDrainUnblockAfterYields(kCap);
+    int yields = 0;
+    agent.testSetCloseDrainYieldHook([&] { ++yields; });
+
+    const int total = agent.drainRegistrationsForClose(); // must return
+
+    EXPECT_EQ(total, 1) << "the registration behind the orphan (the orphan is now padding)";
+    EXPECT_EQ(registerCalls, 1);
+    EXPECT_EQ(registeredHandle, fakeHandle);
+    EXPECT_EQ(agent.testCloseDrainUnblockCalls(), 1);
+    EXPECT_EQ(yields, kCap - 1) << "unblocks exactly at the cap, not before";
+}
+
+// Nothing unblockable (a header-less orphan with nothing committed behind it):
+// the drain must still terminate, after kCloseDrainMaxFailedUnblocks rounds.
+TEST(InvokerAgent, CloseDrainTerminatesWhenTheRingCannotBeUnblockedRegression) {
+    rca::AgentConfig cfg = closeDrainCfg(3606, 3607);
+    rca::ClientAgent agent(cfg);
+    agent.start();
+
+    // A header-less orphan: the tail is advanced but the record's length word
+    // is 0, and nothing is committed anywhere behind it — unblock() has
+    // nothing to pad up to and returns false every time.
+    const auto idx = agent.testClaimNoopWithoutCommitting(8);
+    ASSERT_GE(idx, 0);
+    agent.testZeroClaimHeader(idx);
+
+    agent.testSetCloseDrainUnblockAfterYields(16);
+    const int total = agent.drainRegistrationsForClose(); // must return
+
+    EXPECT_EQ(total, 0);
+    EXPECT_EQ(agent.testCloseDrainUnblockCalls(), rca::ClientAgent::kCloseDrainMaxFailedUnblocks);
+}

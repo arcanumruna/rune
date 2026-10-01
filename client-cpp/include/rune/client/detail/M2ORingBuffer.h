@@ -165,12 +165,111 @@ public:
     /// Returns false on insufficient capacity (caller applies back-pressure).
     bool write(std::int32_t msgTypeId, const aeron::concurrent::AtomicBuffer& src,
                aeron::util::index_t srcIndex, aeron::util::index_t length) {
+        return writeWith(msgTypeId, length,
+                         [&](aeron::concurrent::AtomicBuffer& dst, aeron::util::index_t at) {
+                             dst.putBytes(at, src, srcIndex, length);
+                         });
+    }
+
+    /// fix5 Important-2(a): claim + fill + commit with the tryClaim()/commit()/
+    /// abort() contract Aeron documents for its claim API (Java
+    /// ManyToOneRingBuffer.tryClaim: "the claimed space MUST be committed or
+    /// aborted"): once tryClaim() succeeds, the claim is ALWAYS resolved — if
+    /// `fill(buffer, encodedOffset)` throws (e.g. AtomicBuffer::putBytes's
+    /// bounds check), the claim is abort()ed (turned into padding the consumer
+    /// skips) BEFORE the exception propagates, so a throw can never leave an
+    /// orphaned claim that blocks the single consumer forever.
+    ///
+    /// commit() itself throws only when the claimed space was already released
+    /// (verifyClaimedSpaceNotReleased — i.e. unblock() converted it to padding
+    /// while this writer stalled): nothing is orphaned in that case (the
+    /// consumer already skips it), and abort() would throw the same error, so
+    /// that exception propagates unchanged.
+    ///
+    /// Templated (`fill` is inlined): no std::function, no allocation.
+    template <typename Fill>
+    bool writeWith(std::int32_t msgTypeId, aeron::util::index_t length, Fill&& fill) {
         const aeron::util::index_t claimIndex =
             tryClaim(msgTypeId, static_cast<std::size_t>(length));
         if (claimIndex < 0) return false;
-        m_buffer.putBytes(claimIndex, src, srcIndex, length);
+        try {
+            fill(m_buffer, claimIndex);
+        } catch (...) {
+            abort(claimIndex);
+            throw;
+        }
         commit(claimIndex);
         return true;
+    }
+
+    /// fix5 Important-2(b): faithful port of Aeron's
+    /// ManyToOneRingBuffer::unblock() (Java agrona / C++ aeron-client). Called
+    /// by the single consumer when it has decided a claimed-but-never-committed
+    /// record at the consumer position is blocking progress:
+    ///   * length < 0 at head: a claim whose header was written but never
+    ///     committed — rewrite it as PADDING of the same length.
+    ///   * length == 0 at head: a claim whose tail CAS happened but whose header
+    ///     was never written — scan forward (ALIGNMENT steps, up to the
+    ///     producer index, or the buffer end if the tail has wrapped) for the
+    ///     first non-zero length word; if every word between head and it is
+    ///     still zero (scanBackToConfirmStillZeroed), pad head up to it.
+    /// Returns true if it converted a region to padding (the next read() then
+    /// skips it). Consumer thread only.
+    ///
+    /// Two deliberate deviations, both from the C++ port toward the Java
+    /// original: (1) the forward-scan limit for the wrapped case is the DATA
+    /// capacity (`m_capacity`, Java's `capacity`), not the C++ port's
+    /// `m_buffer.capacity()` (which includes the trailer and would scan into
+    /// the head/tail words); (2) the padding header is written as Java does —
+    /// type word, then a release store of the (positive) length word — using
+    /// this class's own __atomic accessors (TSan-visible) instead of
+    /// putInt64Ordered.
+    ///
+    /// Hazard (inherent to Aeron's unblock, documented there too): if the
+    /// "blocking" writer was merely stalled rather than gone, its later
+    /// commit() throws ("Claimed space previously released") or, worse, it
+    /// may write its payload bytes over space the consumer has since recycled.
+    /// Callers must therefore only unblock when the writer cannot be live —
+    /// see ClientAgent::drainRegistrationsForClose() for this client's sole use.
+    bool unblock() {
+        namespace RD = aeron::concurrent::ringbuffer;
+        const std::int64_t headPosition = loadAcquire64_(m_headPositionIndex);
+        const std::int64_t tailPosition = loadAcquire64_(m_tailPositionIndex);
+
+        if (tailPosition == headPosition) return false;
+
+        const aeron::util::index_t mask = m_capacity - 1;
+        const auto consumerIndex = static_cast<std::int32_t>(headPosition & mask);
+        const auto producerIndex = static_cast<std::int32_t>(tailPosition & mask);
+
+        bool unblocked = false;
+        std::int32_t length = loadAcquire32_(RD::RecordDescriptor::lengthOffset(consumerIndex));
+        if (length < 0) {
+            m_buffer.putInt32(RD::RecordDescriptor::typeOffset(consumerIndex),
+                              RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
+            storeRelease32_(RD::RecordDescriptor::lengthOffset(consumerIndex), -length);
+            unblocked = true;
+        } else if (0 == length) {
+            // go from (consumerIndex to producerIndex) or (consumerIndex to capacity)
+            const std::int32_t limit = producerIndex > consumerIndex ? producerIndex : m_capacity;
+            std::int32_t i = consumerIndex + RD::RecordDescriptor::ALIGNMENT;
+            do {
+                // read the length word of every ALIGNMENT-aligned slot
+                length = loadAcquire32_(RD::RecordDescriptor::lengthOffset(i));
+                if (0 != length) {
+                    if (scanBackToConfirmStillZeroed(i, consumerIndex)) {
+                        m_buffer.putInt32(RD::RecordDescriptor::typeOffset(consumerIndex),
+                                          RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
+                        storeRelease32_(RD::RecordDescriptor::lengthOffset(consumerIndex),
+                                        i - consumerIndex);
+                        unblocked = true;
+                    }
+                    break;
+                }
+                i += RD::RecordDescriptor::ALIGNMENT;
+            } while (i < limit);
+        }
+        return unblocked;
     }
 
     // ------------------------------------------------------------------
@@ -432,6 +531,21 @@ private:
             m_buffer.getInt32(RD::RecordDescriptor::lengthOffset(recordIndex));
         if (recordLength < 0) return recordLength;
         throw aeron::util::IllegalStateException("Claimed space previously released", SOURCEINFO);
+    }
+
+    // Aeron ManyToOneRingBuffer::scanBackToConfirmStillZeroed (for unblock()).
+    [[nodiscard]] bool scanBackToConfirmStillZeroed(std::int32_t from, std::int32_t limit) const noexcept {
+        namespace RD = aeron::concurrent::ringbuffer;
+        std::int32_t i = from - RD::RecordDescriptor::ALIGNMENT;
+        bool allZeroes = true;
+        while (i >= limit) {
+            if (0 != loadAcquire32_(RD::RecordDescriptor::lengthOffset(i))) {
+                allZeroes = false;
+                break;
+            }
+            i -= RD::RecordDescriptor::ALIGNMENT;
+        }
+        return allZeroes;
     }
 
     aeron::util::index_t claimCapacity(aeron::util::index_t recordLength) {

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 using rune::client::detail::ControlledAction;
@@ -170,4 +171,136 @@ TEST(M2ORingBuffer, ClosedDefaultsFalseAndIsSticky) {
     EXPECT_FALSE(r.ring.closed());
     r.ring.closed(true);
     EXPECT_TRUE(r.ring.closed());
+}
+
+// ---------------------------------------------------------------------------
+// fix5 Important-2(a): a throw after tryClaim() must never orphan the claim.
+// An orphaned claim (length word left negative forever) blocks the single
+// consumer at that record for good — every committed record behind it is
+// unreachable. Aeron's claim contract: a successful claim is ALWAYS either
+// committed or aborted.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Reads everything currently readable; returns the payload's first byte of
+// each message, in order.
+std::vector<uint8_t> readAll(M2ORingBuffer& ring) {
+    std::vector<uint8_t> seen;
+    for (int pass = 0; pass < 4; ++pass) {
+        ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& buf,
+                      aeron::util::index_t offset, aeron::util::index_t) {
+            seen.push_back(*(buf.buffer() + offset));
+        });
+    }
+    return seen;
+}
+} // namespace
+
+TEST(M2ORingBuffer, WriteWithAbortsTheClaimWhenFillThrowsRegression) {
+    Ring r(512);
+    const auto tail0 = r.ring.tailPosition();
+    EXPECT_THROW(r.ring.writeWith(kMsgTypeId, static_cast<aeron::util::index_t>(kPayloadLen),
+                                  [](aeron::concurrent::AtomicBuffer&, aeron::util::index_t) {
+                                      throw std::runtime_error("injected after claim");
+                                  }),
+                 std::runtime_error);
+    EXPECT_GT(r.ring.tailPosition(), tail0) << "the claim really happened (space consumed)";
+
+    ASSERT_TRUE(r.writeOne(9)); // committed, right behind the failed write
+    const auto seen = readAll(r.ring);
+    ASSERT_EQ(seen.size(), 1u) << "the aborted claim must be padding, and the consumer must "
+                                  "proceed past it to the committed record";
+    EXPECT_EQ(seen[0], 9);
+    EXPECT_EQ(r.ring.headPosition(), r.ring.tailPosition());
+}
+
+// The same contract through write() itself: AtomicBuffer::putBytes's source
+// bounds check throws (Debug builds; Aeron compiles bounds checks out of
+// non-Debug configs via DISABLE_BOUNDS_CHECKS) AFTER the claim succeeded.
+TEST(M2ORingBuffer, WriteAbortsTheClaimWhenPutBytesThrowsRegression) {
+#if defined(DISABLE_BOUNDS_CHECKS)
+    GTEST_SKIP() << "Aeron bounds checks compiled out in this config";
+#else
+    Ring r(512);
+    uint8_t small[4] = {};
+    aeron::concurrent::AtomicBuffer src(small, sizeof(small));
+    // length 32 > the 4-byte source: src.boundsCheck throws inside putBytes.
+    EXPECT_ANY_THROW(r.ring.write(kMsgTypeId, src, 0, static_cast<aeron::util::index_t>(kPayloadLen)));
+
+    ASSERT_TRUE(r.writeOne(7));
+    const auto seen = readAll(r.ring);
+    ASSERT_EQ(seen.size(), 1u) << "pre-fix: the orphaned claim blocked the consumer forever";
+    EXPECT_EQ(seen[0], 7);
+    EXPECT_EQ(r.ring.headPosition(), r.ring.tailPosition());
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// fix5 Important-2(b): unblock() — faithful port of Aeron's
+// ManyToOneRingBuffer::unblock().
+// ---------------------------------------------------------------------------
+
+TEST(M2ORingBuffer, UnblockOnEmptyRingReturnsFalse) {
+    Ring r(512);
+    EXPECT_FALSE(r.ring.unblock());
+    ASSERT_TRUE(r.writeOne(1));
+    ASSERT_EQ(readAll(r.ring).size(), 1u);
+    EXPECT_FALSE(r.ring.unblock()) << "head == tail after a full drain";
+}
+
+TEST(M2ORingBuffer, UnblockLeavesACommittedRecordAtHeadAlone) {
+    Ring r(512);
+    ASSERT_TRUE(r.writeOne(3));
+    EXPECT_FALSE(r.ring.unblock()) << "length > 0 at head: nothing is blocked";
+    const auto seen = readAll(r.ring);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0], 3);
+}
+
+// Claimed (header written, length negative) but never committed.
+TEST(M2ORingBuffer, UnblockTurnsAnUncommittedClaimAtHeadIntoPadding) {
+    Ring r(512);
+    const auto orphan = r.ring.tryClaim(kMsgTypeId, kPayloadLen);
+    ASSERT_GE(orphan, 0);
+    ASSERT_TRUE(r.writeOne(5));
+    ASSERT_TRUE(r.writeOne(6));
+    EXPECT_TRUE(readAll(r.ring).empty()) << "blocked behind the uncommitted claim";
+
+    EXPECT_TRUE(r.ring.unblock());
+    const auto seen = readAll(r.ring);
+    ASSERT_EQ(seen.size(), 2u);
+    EXPECT_EQ(seen[0], 5);
+    EXPECT_EQ(seen[1], 6);
+    EXPECT_EQ(r.ring.headPosition(), r.ring.tailPosition());
+    EXPECT_THROW(r.ring.commit(orphan), aeron::util::IllegalStateException)
+        << "a late commit of an unblocked claim must be refused, never published";
+}
+
+// Tail CAS'd but the header never written (length word still 0): unblock
+// scans forward to the next non-zero length word and pads up to it.
+TEST(M2ORingBuffer, UnblockPadsAHeaderlessClaimUpToTheNextRecord) {
+    Ring r(512);
+    const auto orphan = r.ring.tryClaim(kMsgTypeId, kPayloadLen);
+    ASSERT_GE(orphan, 0);
+    std::memset(r.ring.base() + orphan - 8, 0, 8); // simulate: header not yet written
+    ASSERT_TRUE(r.writeOne(8));
+    EXPECT_TRUE(readAll(r.ring).empty());
+
+    EXPECT_TRUE(r.ring.unblock());
+    const auto seen = readAll(r.ring);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0], 8);
+    EXPECT_EQ(r.ring.headPosition(), r.ring.tailPosition());
+}
+
+// A headerless claim with NOTHING written behind it: the scan finds no
+// non-zero length word before the producer index, so there is nothing to pad
+// up to — Aeron returns false (and so must we).
+TEST(M2ORingBuffer, UnblockHeaderlessClaimWithNothingBehindReturnsFalse) {
+    Ring r(512);
+    const auto orphan = r.ring.tryClaim(kMsgTypeId, kPayloadLen);
+    ASSERT_GE(orphan, 0);
+    std::memset(r.ring.base() + orphan - 8, 0, 8);
+    EXPECT_FALSE(r.ring.unblock());
+    EXPECT_NE(r.ring.headPosition(), r.ring.tailPosition());
 }
