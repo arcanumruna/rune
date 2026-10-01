@@ -391,8 +391,8 @@ TEST_F(TxnMarkerDirectTest, WriteMarkersCommitLandsOnEachPartition) {
     // The local coordinator should now be in CompleteCommit → Empty.
     const auto state = localCoord.state("tx_commit");
     ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(*state, tx::TxnState::Empty)
-        << "[TX-4] After writeMarkers, coordinator should reach Empty (via CompleteCommit)";
+    EXPECT_EQ(*state, tx::TxnState::CompleteCommit)
+        << "[TX-4] After writeMarkers, coordinator rests in CompleteCommit (F15 §5.4)";
 }
 
 // ===========================================================================
@@ -434,8 +434,8 @@ TEST_F(TxnMarkerDirectTest, WriteMarkersAbortLandsOnEachPartition) {
 
     const auto state = localCoord.state("tx_abort");
     ASSERT_TRUE(state.has_value());
-    EXPECT_EQ(*state, tx::TxnState::Empty)
-        << "[TX-4] After abort writeMarkers, coordinator should reach Empty";
+    EXPECT_EQ(*state, tx::TxnState::CompleteAbort)
+        << "[TX-4] After abort writeMarkers, coordinator rests in CompleteAbort (F15 §5.4)";
 }
 
 // ===========================================================================
@@ -473,11 +473,11 @@ TEST_F(TxnMarkerDirectTest, ResolvePendingMarkersResolvesPrepareAbort) {
 
     EXPECT_GT(n, 0) << "[TX-4] resolvePendingMarkers should write at least one marker";
 
-    // Coordinator should now be Empty (CompleteAbort → Empty).
+    // Coordinator now rests in CompleteAbort (F15 §5.4).
     const auto stateAfter = localCoord.state("tx_timeout");
     ASSERT_TRUE(stateAfter.has_value());
-    EXPECT_EQ(*stateAfter, tx::TxnState::Empty)
-        << "[TX-4] After resolvePendingMarkers, txn should be Empty";
+    EXPECT_EQ(*stateAfter, tx::TxnState::CompleteAbort)
+        << "[TX-4] After resolvePendingMarkers, txn should rest in CompleteAbort";
 
     // Both partition logs should have control batches.
     EXPECT_TRUE(lastBatchIsControl(&log0_)) << "[TX-4] Partition 0: timeout-abort control batch expected";
@@ -587,5 +587,5 @@ TEST_F(TxnMarkerDirectTest, WriteMarkersViaCoordinatorAfterEndTxn) {
     EXPECT_EQ(n, 2);
     EXPECT_TRUE(lastBatchIsControl(&log0_));
     EXPECT_TRUE(lastBatchIsControl(&log1_));
-    EXPECT_EQ(localCoord.state("tx_green"), std::optional<tx::TxnState>{tx::TxnState::Empty});
+    EXPECT_EQ(localCoord.state("tx_green"), std::optional<tx::TxnState>{tx::TxnState::CompleteCommit});
 }

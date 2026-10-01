@@ -545,11 +545,23 @@ public:
     // Single-writer: must be called on the duty-cycle thread.
     // ---------------------------------------------------------------------------
     static constexpr int64_t kControlRecordAsync = -2;
+    /// \param coordinatorEpoch  the epoch of the coordinator dispatching the
+    ///          marker (F15 m3): queued entries are tagged with it, purged by
+    ///          purgeQueuedMarkers() when that coordinator unloads, and echoed
+    ///          to onControlMarkerLanded / onControlMarkerRefused.
     int64_t appendControlRecord(int32_t                    topicId,
                                 int32_t                    partition,
                                 std::span<const uint8_t>   marker,
                                 int64_t                    producerId = -1,
-                                bool                       commit     = false);
+                                bool                       commit     = false,
+                                int32_t                    coordinatorEpoch = 0);
+
+    /// F15 m3: drop every marker still waiting in markerSendQueue_ (never
+    /// handed to a worker) whose coordinatorEpoch < @p olderThan.  Markers
+    /// already on a worker ring land (they carry a durable decision and are
+    /// idempotent); their replies are then ignored by the coordinator.
+    /// \returns the number of markers purged.  Control thread only.
+    std::size_t purgeQueuedMarkers(int32_t olderThan);
 
     // -----------------------------------------------------------------------
     // TX-4 Task 9 test hooks — feed the per-partition LSO tracker from external
@@ -1279,6 +1291,7 @@ private:
         int64_t              producerId = -1;
         bool                 commit     = false;
         uint32_t             reroutes   = 0;
+        int32_t              coordinatorEpoch = 0;   ///< F15 m3
         std::vector<uint8_t> bytes;
     };
     static constexpr uint32_t kMaxMarkerReroutes = 4;

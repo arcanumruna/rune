@@ -13,6 +13,7 @@
 
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader (for rebuildFromLog)
 
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <set>
@@ -172,6 +173,22 @@ bool ReplicatedTxnStateStore::put(const TransactionMetadata& meta,
 }
 
 // ---------------------------------------------------------------------------
+// putPidBlockCeiling — F15 I7: magic(4) totalLength(4) ceiling(8) crc32c(4).
+// ---------------------------------------------------------------------------
+rune::replication::Offset ReplicatedTxnStateStore::putPidBlockCeiling(ProducerId ceiling)
+{
+    constexpr uint32_t kLen = 4u + 4u + 8u + kChecksumSize;
+    std::array<uint8_t, kLen> rec{};
+    write_le<uint32_t>(rec.data() + 0, kPidBlockMagic);
+    write_le<uint32_t>(rec.data() + 4, kLen);
+    write_le<int64_t> (rec.data() + 8, ceiling);
+    write_le<uint32_t>(rec.data() + 16, crc32c(rec.data(), 16));
+    const rune::replication::Offset base = replica_->appendKeyed(
+        std::span<const uint8_t>{}, std::span<const uint8_t>(rec.data(), rec.size()), /*acksAll=*/true);
+    return base < 0 ? -1 : base;   // persistedPidCeiling_ folds only committed records (rebuild)
+}
+
+// ---------------------------------------------------------------------------
 // get
 // ---------------------------------------------------------------------------
 const TransactionMetadata*
@@ -193,6 +210,15 @@ void ReplicatedTxnStateStore::applyRecord(std::string_view payload)
 {
     const auto* p = reinterpret_cast<const uint8_t*>(payload.data());
     const std::size_t sz = payload.size();
+
+    // F15 I7: a pid block ceiling record (its own record-type tag).
+    if (sz >= 4u + 4u + 8u + kChecksumSize && read_le<uint32_t>(p) == kPidBlockMagic) {
+        if (read_le<uint32_t>(p + 4) != 4u + 4u + 8u + kChecksumSize) return;
+        if (read_le<uint32_t>(p + 16) != crc32c(p, 16)) return;
+        const int64_t ceiling = read_le<int64_t>(p + 8);
+        if (ceiling > persistedPidCeiling_) persistedPidCeiling_ = ceiling;
+        return;
+    }
 
     // Need at least the fixed header + CRC.
     if (sz < kFixedHeaderSize + kChecksumSize) return;
@@ -297,6 +323,7 @@ void ReplicatedTxnStateStore::applyRecord(std::string_view payload)
 void ReplicatedTxnStateStore::rebuildFromLog()
 {
     index_.clear();
+    persistedPidCeiling_ = -1;
 
     const rune::replication::Offset hw = replica_->highWatermark();
     if (hw <= 0) return;
