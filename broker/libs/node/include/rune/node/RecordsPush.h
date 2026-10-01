@@ -25,7 +25,9 @@
 // No allocation, no locks/atomics, no virtual calls: the vectored offer goes
 // through the C++ client's templated iterator overload over a std::array.
 // ---------------------------------------------------------------------------
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Protocol.h>
 
 #include <ExclusivePublication.h>
 #include <concurrent/AtomicBuffer.h>
@@ -34,6 +36,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <string_view>
 
 namespace rune::node {
 
@@ -90,6 +94,38 @@ inline RecordsSendResult sendRecordsFrame(aeron::ExclusivePublication&          
                                         static_cast<aeron::util::index_t>(rec.recordBatch.size()))};
     const int64_t pos = pub.offer(parts);
     return {pos > 0 ? RecordsSendKind::Sent : RecordsSendKind::Retry, pos};
+}
+
+/// Upper bound of encodePushTooLargeError's output (header + code + message).
+inline constexpr std::size_t kPushTooLargeErrorMaxBytes =
+    rune::protocol::client::MessageHeader::ENCODED_SIZE +
+    rune::protocol::client::ErrorResponse::BODY_FIXED + 2u + 192u;
+
+/// Encode the error that fails a push subscription whose next batch at
+/// `atOffset` (Records frame `frameLen` B) exceeds the egress maxMessageLength
+/// `maxMessage`.  F15 S3 convention (re-review 2 m-f): correlationId = 0 — a
+/// subscription id shares no namespace with client correlation ids (the client
+/// would fail an unrelated pending ping/connect with the same number); the
+/// subscription is named in the message "subscription S topic T partition P
+/// offset O: ...".  `buf` must hold kPushTooLargeErrorMaxBytes.  No allocation.
+inline std::size_t encodePushTooLargeError(uint8_t* buf, int64_t sessionId, int64_t subscriptionId,
+                                           int32_t topicId, int32_t partition, int64_t atOffset,
+                                           std::size_t frameLen, int64_t maxMessage) noexcept
+{
+    namespace pc = rune::protocol::client;
+    char msg[192];
+    const int m = std::snprintf(msg, sizeof msg,
+        "subscription %lld topic %d partition %d offset %lld: Records frame %zu B exceeds the "
+        "egress max message %lld B",
+        static_cast<long long>(subscriptionId), topicId, partition,
+        static_cast<long long>(atOffset), frameLen, static_cast<long long>(maxMessage));
+    pc::ErrorResponse err;
+    err.sessionId     = sessionId;
+    err.correlationId = 0;
+    err.code          = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
+    err.message       = std::string_view(
+        msg, m > 0 ? static_cast<std::size_t>(m < static_cast<int>(sizeof msg) ? m : sizeof msg - 1) : 0u);
+    return err.encode(buf);
 }
 
 } // namespace rune::node

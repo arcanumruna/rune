@@ -251,52 +251,59 @@ void ClientGateway::enqueueOrBestEffort_(Session&       session,
 // Real egress → rune::node::sendRecordsFrame (tryClaim fast path for one-MTU
 // frames, unchanged; vectored [fixed | batch] offer above it; TooLarge above
 // maxMessageLength).  Null egress (injectTestSession) → the test capture hook
-// with the contiguous frame (treated as sent); no hook → Retry.
+// (treated as sent); no hook → Retry.
 // ---------------------------------------------------------------------------
 rune::node::RecordsSendResult ClientGateway::pushRecords_(Session& session, const pc::Records& rec)
 {
     if (session.egress) [[likely]]
         return rune::node::sendRecordsFrame(*session.egress, rec, scratch_.data(), scratch_.size());
-
     if (!onEgressFrame_) return {rune::node::RecordsSendKind::Retry, -1};
+    captureTestRecordsFrame_(session, rec);
+    return {rune::node::RecordsSendKind::Sent, 1};
+}
+
+void ClientGateway::captureTestRecordsFrame_(Session& session, const pc::Records& rec)
+{
     const std::size_t frameLen = rec.encodedSize();
     if (frameLen <= scratch_.size()) {
-        const std::size_t encoded = rec.encode(scratch_.data());
-        onEgressFrame_(session.sessionId, scratch_.data(), encoded);
-    } else {
-        // Test-only capture of a frame larger than scratch_ (no real egress).
-        std::vector<uint8_t> frame(frameLen);
-        const std::size_t encoded = rec.encode(frame.data());
-        onEgressFrame_(session.sessionId, frame.data(), encoded);
+        onEgressFrame_(session.sessionId, scratch_.data(), rec.encode(scratch_.data()));
+        return;
     }
-    return {rune::node::RecordsSendKind::Sent, 1};
+    std::vector<uint8_t> frame(frameLen);   // test-only: frame larger than scratch_
+    onEgressFrame_(session.sessionId, frame.data(), rec.encode(frame.data()));
 }
 
 // ---------------------------------------------------------------------------
 // F19: failPushSubscriptionTooLarge_ — the next stored batch of `sub` can never
 // be delivered on this session's egress publication (frame > maxMessageLength).
-// Fail the subscription ONCE, explicitly: one reliable ErrorResponse
-// {MessageTooLarge, correlationId = subscriptionId} (the F15 S3 convention), and
-// park it AT the batch — nextOffset is NOT advanced, so nothing is lost silently;
-// pushSubscriptions() skips it (no spin) until the client unsubscribes.
+// Fail the subscription ONCE, explicitly, and park it AT the batch — nextOffset
+// is NOT advanced, so nothing is lost silently; pushSubscriptions() skips it
+// (no spin) until the client unsubscribes.  The error (F15 S3 m-f convention:
+// correlationId 0, subscription named in the message) is owed until sent.
 // ---------------------------------------------------------------------------
 void ClientGateway::failPushSubscriptionTooLarge_(Subscription& sub, Session& session,
-                                                  int64_t atOffset, std::size_t frameLen)
+                                                  std::size_t frameLen)
 {
     if (sub.failed) return;
-    sub.failed = true;
+    sub.failed         = true;
+    sub.errorOwed      = true;
+    sub.failedFrameLen = frameLen;
     spdlog::error("ClientGateway: push sub={} (topicId={} partition={}) failed at offset={}: "
                   "Records frame {} B exceeds the egress maxMessageLength {} B — "
-                  "MessageTooLarge sent, subscription parked (cursor not advanced)",
-                  sub.subscriptionId, sub.topicId, sub.partition, atOffset, frameLen,
+                  "MessageTooLarge, subscription parked (cursor not advanced)",
+                  sub.subscriptionId, sub.topicId, sub.partition, sub.nextOffset, frameLen,
                   session.egress ? session.egress->maxMessageLength() : 0);
-    pc::ErrorResponse err;
-    err.sessionId     = sub.sessionId;
-    err.correlationId = sub.subscriptionId;
-    err.code          = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
-    static_assert(pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2u <= kScratchSize);
-    const std::size_t encoded = err.encode(scratch_.data());
-    enqueueOrBestEffort_(session, scratch_.data(), encoded);
+    trySendOwedPushError_(sub, session);
+}
+
+void ClientGateway::trySendOwedPushError_(Subscription& sub, Session& session)
+{
+    static_assert(rune::node::kPushTooLargeErrorMaxBytes <= kScratchSize);
+    const std::size_t n = rune::node::encodePushTooLargeError(
+        scratch_.data(), sub.sessionId, sub.subscriptionId, sub.topicId, sub.partition,
+        sub.nextOffset, sub.failedFrameLen,
+        session.egress ? session.egress->maxMessageLength() : 0);
+    if (offerBytes_(&session, scratch_.data(), n) > 0) sub.errorOwed = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2578,10 +2585,12 @@ void ClientGateway::pushSubscriptions()
         // gateway must NOT also push them (that would double-deliver).  Internal
         // partitions (topicId < 0) are not worker-owned, so keep gateway-pushing them.
         if (perWorkerEgressActive_ && sub.topicId >= 0) continue;
-        if (sub.failed) [[unlikely]] continue;   // F19: parked after an undeliverable batch
-
         // Find the owning session.
         Session* session = sessions_.find(sub.sessionId);
+        if (sub.failed) [[unlikely]] {   // F19: parked at an undeliverable batch
+            if (sub.errorOwed && session) trySendOwedPushError_(sub, *session);
+            continue;
+        }
         if (!session) {
             // Session gone — subscription will be reaped; skip this cycle.
             continue;
@@ -2904,7 +2913,7 @@ void ClientGateway::pushSubscriptions()
 
             const rune::node::RecordsSendResult sent = pushRecords_(*session, rec);
             if (sent.kind == rune::node::RecordsSendKind::TooLarge) [[unlikely]] {
-                failPushSubscriptionTooLarge_(sub, *session, baseOffset, rec.encodedSize());
+                failPushSubscriptionTooLarge_(sub, *session, rec.encodedSize());
                 break;
             }
             const int64_t pos = sent.position;
@@ -3394,8 +3403,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
 
                 const rune::node::RecordsSendResult sent = pushRecords_(*session, rec);
                 if (sent.kind == rune::node::RecordsSendKind::TooLarge) [[unlikely]] {
-                    failPushSubscriptionTooLarge_(sub, *session, baseOffset,
-                                                  rec.encodedSize());
+                    failPushSubscriptionTooLarge_(sub, *session, rec.encodedSize());
                     break;
                 }
                 const int64_t pos = sent.position;

@@ -871,11 +871,14 @@ private:
         bool    groupCarrierReceived = false;
         // F19 (same shape as F15 S3 I-4): the next stored batch cannot be
         // delivered on this session's egress (its Records frame exceeds the
-        // publication's maxMessageLength).  The client got one non-retriable
-        // ErrorResponse{MessageTooLarge, correlationId = subscriptionId}; the
-        // subscription is parked AT that batch (nextOffset not advanced, no
-        // further reads/pushes: no spin) until the client unsubscribes.
-        bool    failed = false;
+        // publication's maxMessageLength).  The subscription is parked AT that
+        // batch (nextOffset not advanced, no further reads/pushes: no spin)
+        // until the client unsubscribes, and owes the client one non-retriable
+        // ErrorResponse{MessageTooLarge, correlationId 0, message naming the
+        // subscription} — re-offered each cycle until sent (errorOwed).
+        bool    failed         = false;
+        bool    errorOwed      = false;
+        std::size_t failedFrameLen = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -1012,13 +1015,24 @@ private:
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
 
-    // F19: fail push subscription `sub` once — its next batch (at `atOffset`,
-    // Records frame `frameLen` bytes) exceeds the session egress
-    // maxMessageLength.  Sets sub.failed, logs, and sends one reliable
-    // ErrorResponse{MessageTooLarge, correlationId = subscriptionId}.  The cursor
-    // is NOT advanced.  Cold path.  Single-writer: duty-cycle thread only.
-    void failPushSubscriptionTooLarge_(Subscription& sub, Session& session,
-                                       int64_t atOffset, std::size_t frameLen);
+    // F19: fail push subscription `sub` once — its next batch (at
+    // sub.nextOffset, Records frame `frameLen` bytes) exceeds the session
+    // egress maxMessageLength.  Sets sub.failed + errorOwed, logs, and tries the
+    // error (trySendOwedPushError_).  The cursor is NOT advanced.  Cold path.
+    // Single-writer: duty-cycle thread only.
+    void failPushSubscriptionTooLarge_(Subscription& sub, Session& session, std::size_t frameLen);
+
+    // F19: offer the owed ErrorResponse{MessageTooLarge, correlationId 0,
+    // message "subscription S topic T partition P offset O: ..."} directly on
+    // the session egress; clears errorOwed only once sent (retry-until-sent,
+    // like the worker's ErrorOwed — never best-effort).  Cold path.
+    void trySendOwedPushError_(Subscription& sub, Session& session);
+
+    // F19: test-only capture of a Records frame for a null-egress session
+    // (injectTestSession) via onEgressFrame_.  Kept out of pushRecords_ so the
+    // production send helper never allocates.
+    [[gnu::cold]] void captureTestRecordsFrame_(Session& session,
+                                                const rune::protocol::client::Records& rec);
 
     // F19: send one Records frame for `rec` on `session` (tryClaim fast path /
     // vectored offer / null-egress test hook).  Returns the RecordsSendResult.

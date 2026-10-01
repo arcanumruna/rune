@@ -309,12 +309,14 @@ public:
         aeron::ExclusivePublication* egressPub = nullptr;
         /// F19 push state.  Live: pushing.  ErrorOwed: the next batch's Records
         /// frame exceeds the egress maxMessageLength — the cursor is parked AT
-        /// it and one ErrorResponse{MessageTooLarge, correlationId =
-        /// subscriptionId} is owed (retried each pass while back-pressured).
+        /// it and one ErrorResponse{MessageTooLarge, correlationId 0, message
+        /// naming the subscription} is owed (retried each pass until sent).
         /// Failed: the error was sent; parked until Unsubscribe (no reads, no
         /// spin).  A same-id re-Subscribe keeps the state (one error per sub).
         enum class PushState : uint8_t { Live, ErrorOwed, Failed };
         PushState pushState = PushState::Live;
+        /// ErrorOwed/Failed: the undeliverable Records frame size (named in the error).
+        std::size_t failedFrameLen = 0;
     };
 
     /// Test-only: the worker-local subscription table (worker-thread state).
@@ -1431,19 +1433,17 @@ private:
         return pub->offer(buf, 0, static_cast<aeron::util::index_t>(len));
     }
 
-    // F19: send the owed ErrorResponse{MessageTooLarge, correlationId =
-    // subscriptionId} for a subscription parked at an undeliverable batch.
+    // F19: send the owed ErrorResponse{MessageTooLarge} for a subscription
+    // parked at an undeliverable batch (cursor == that batch's offset).
     // ErrorOwed → Failed on success; stays ErrorOwed (retried next pass, same
     // as back-pressured Records) otherwise.  Returns 1 if sent.  Cold path.
+    // correlationId 0 + a message naming subscription/topic/partition/offset
+    // (encodePushTooLargeError — the F15 S3 m-f convention).
     int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub) {
-        namespace pc = rune::protocol::client;
-        pc::ErrorResponse err;
-        err.sessionId     = s.sessionId;
-        err.correlationId = s.subscriptionId;
-        err.code          = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
-        static_assert(pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2u
-                      <= kEgressScratchSize);
-        const std::size_t n = err.encode(egressScratch_.data());
+        static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
+        const std::size_t n = encodePushTooLargeError(
+            egressScratch_.data(), s.sessionId, s.subscriptionId, s.topicId, s.partition,
+            s.nextOffset, s.failedFrameLen, pub->maxMessageLength());
         if (sendEncodedToPub_(pub, egressScratch_.data(), n) <= 0) return 0;
         s.pushState = WorkerSubscription::PushState::Failed;
         return 1;
@@ -1547,7 +1547,8 @@ private:
                                   "(cursor not advanced)",
                                   workerId_, s.subscriptionId, s.topicId, s.partition, baseOffset,
                                   rec.encodedSize(), egressPub->maxMessageLength());
-                    s.pushState = WorkerSubscription::PushState::ErrorOwed;
+                    s.pushState      = WorkerSubscription::PushState::ErrorOwed;
+                    s.failedFrameLen = rec.encodedSize();
                     work += sendPushTooLarge_(s, egressPub);
                     break;
                 }
