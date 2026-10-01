@@ -19,6 +19,7 @@
 #include <concurrent/BackOffIdleStrategy.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <climits>
@@ -484,8 +485,11 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
     }
     const uint32_t len = static_cast<uint32_t>(kRecHeaderSize + value.size());
     const std::size_t size = DeferredArena::recordSize(len);
-    if (ps != nullptr && ps->deferredBytes + size > deferPartitionCap_) {
-        lastRejectDeferredFull_ = true;  // this partition's share is used up
+    // Per-partition share; records for not-yet-created partitions share ONE
+    // aggregate share (fix3) — neither can exhaust the arena.
+    if (ps != nullptr ? ps->deferredBytes + size > deferPartitionCap_
+                      : deferredUnknownBytes_ + size > deferPartitionCap_) {
+        lastRejectDeferredFull_ = true;
         return SendResult::BackPressured;
     }
     DeferredHdr h;
@@ -514,15 +518,21 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
         ps->deferredBytes += static_cast<uint32_t>(size);
     } else {
         ++deferredUnknown_;
+        deferredUnknownBytes_ += size;
     }
     return SendResult::Ok;  // the handle (if any) is owned by the producer now
 }
 
 bool ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
     PartitionState* ps = findPartition_(entry->topicId, entry->partition);
-    if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) return false;
+    if (ps == nullptr && partitions_.size() + deferredUnknown_ >= maxPartitions_) {
+        tier2RejectReason_ = "Tier-2 batch rejected — unaddressable partition (the producer's "
+                             "partition table is full) — batch dropped";
+        return false;
+    }
     const std::size_t size = DeferredArena::recordSize(kT2TokenSize);
-    if (ps != nullptr && ps->deferredBytes + size > deferPartitionCap_) {
+    if (ps != nullptr ? ps->deferredBytes + size > deferPartitionCap_
+                      : deferredUnknownBytes_ + size > deferPartitionCap_) {
         lastRejectDeferredFull_ = true;
         return false;
     }
@@ -544,6 +554,7 @@ bool ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
         ps->deferredBytes += static_cast<uint32_t>(size);
     } else {
         ++deferredUnknown_;
+        deferredUnknownBytes_ += size;
     }
     return true;
 }
@@ -551,6 +562,7 @@ bool ProducerImpl::deferTier2_(std::unique_ptr<Tier2Entry>& entry) noexcept {
 void ProducerImpl::unaccountDeferred_(const DeferredHdr& h) noexcept {
     if (h.flags & kDefUnknownPartition) {
         --deferredUnknown_;
+        deferredUnknownBytes_ -= DeferredArena::recordSize(h.len);
         return;
     }
     if (PartitionState* ps = findPartition_(h.topicId, h.partition)) {
@@ -582,6 +594,12 @@ void ProducerImpl::noteDeferredLoss_(const char* what) noexcept {
 bool ProducerImpl::settleDeferredFor_(int32_t topicId, int32_t partition) noexcept {
     const PartitionState* ps = findPartition_(topicId, partition);
     if (deferredUnknown_ == 0 && (ps == nullptr || ps->deferredCount == 0)) return true;
+    // fix3: this partition's deferred records already failed to apply in the
+    // LATEST pass.  Outside duty work its state cannot have changed since:
+    // everything that can unblock it (an ack, a flush, a sweep, failAll) runs in
+    // a DutyScope whose end runs a new pass (deferPass_ moves on).  So another
+    // pass now is futile — refuse in O(1).
+    if (ps != nullptr && ps->deferredCount > 0 && ps->deferBlockedPass == deferPass_) return false;
     { const DutyScope apply(*this); }  // outermost: its end runs the apply pass
     ps = findPartition_(topicId, partition);
     return ps == nullptr || ps->deferredCount == 0;
@@ -595,7 +613,19 @@ void ProducerImpl::applyDeferred_() noexcept {
     // processed by the next pass.
     const bool prevScan = deferScanning_;
     deferScanning_ = true;
+    ++deferPasses_;
     if (++deferPass_ == 0) deferPass_ = 1;
+    const uint32_t failAt = debugFailAt_;
+    debugFailAt_ = 0;
+    uint32_t visited = 0;
+    // fix3: user code (a lost record's failure callback) NEVER runs inside the
+    // pass — [w, r) holds stale bytes until the slide-down.  Lost handles are
+    // collected here (fixed, no allocation) and completed after setTail(); if
+    // more records fail than fit, the rest of the pass keeps its records
+    // (applied by the next pass).
+    static constexpr std::size_t kMaxLost = 16;
+    std::array<uint64_t, kMaxLost> lost{};
+    std::size_t lostN = 0;
     const std::size_t end = deferred_.tail();
     std::size_t w = 0;
     for (std::size_t r = 0; r < end;) {
@@ -603,7 +633,8 @@ void ProducerImpl::applyDeferred_() noexcept {
         DeferredHdr* h = deferred_.hdr(r);
         if (h->type == 0) { r += size; continue; }  // dead: dropped by compaction
         PartitionState* ps = findPartition_(h->topicId, h->partition);
-        bool keep = (ps != nullptr && ps->deferBlockedPass == deferPass_);
+        const bool lostFull = (lostN == kMaxLost);
+        bool keep = lostFull || (ps != nullptr && ps->deferBlockedPass == deferPass_);
         bool applied = false;
         uint64_t lostHandle = 0;
         const char* lostWhat = nullptr;
@@ -627,6 +658,9 @@ void ProducerImpl::applyDeferred_() noexcept {
             const uint8_t flags = p[kRecFlagsOff];
             const uint64_t handle = static_cast<uint64_t>(readLE64(p, kRecCorrIdOff));
             try {
+                if (failAt != 0 && ++visited == failAt) [[unlikely]] {
+                    throw std::runtime_error("test seam: forced deferred apply failure");
+                }
                 const auto a = appendRecord_(h->topicId, h->partition, p + kRecKeyBytesOff,
                                              p[kRecKeyLenOff], p + kRecValBytesOff,
                                              readLE32u(p, kRecValLenOff), flags, handle, h->submitNs);
@@ -641,10 +675,13 @@ void ProducerImpl::applyDeferred_() noexcept {
         if (keep) {
             ps = findPartition_(h->topicId, h->partition);  // may have been created this pass
             if (ps != nullptr) {
-                ps->deferBlockedPass = deferPass_;  // later records of it: kept too (order)
+                // later records of it: kept too (order).  Not when kept only
+                // because the lost-handle buffer is full (it is not blocked).
+                if (!lostFull) ps->deferBlockedPass = deferPass_;
                 if (h->flags & kDefUnknownPartition) {  // now a known (stalled) partition
                     h->flags = static_cast<uint8_t>(h->flags & ~kDefUnknownPartition);
                     --deferredUnknown_;
+                    deferredUnknownBytes_ -= size;
                     ++ps->deferredCount;
                     ps->deferredBytes += static_cast<uint32_t>(size);
                 }
@@ -652,6 +689,7 @@ void ProducerImpl::applyDeferred_() noexcept {
             deferred_.move(w, r, size);
             w += size;
             r += size;
+            if (w < r) deferred_.writeFiller(w, r);  // stale gap: one dead record
             continue;
         }
         const DeferredHdr done = *h;
@@ -661,19 +699,57 @@ void ProducerImpl::applyDeferred_() noexcept {
             if (PartitionState* aps = findPartition_(done.topicId, done.partition)) aps->flushRequested = true;
         }
         r += size;
+        if (w < r) deferred_.writeFiller(w, r);  // stale gap: one dead record
         if (lostWhat != nullptr) {
-            noteDeferredLoss_(lostWhat);
-            if (lostHandle != 0) {
-                PendingAck::complete(lostHandle, -1, "deferred send could not be applied",
-                                     &callbackExceptions_);
-            }
+            noteDeferredLoss_(lostWhat);  // counter + stderr only: no user code
+            if (lostHandle != 0) lost[lostN++] = lostHandle;
         }
     }
-    // Records pushed by callbacks during this pass sit in [end, tail): slide down.
+    // No push can happen during the pass (no user code runs in it), so [end,
+    // tail) is empty here — kept general (slide down whatever is there).
     const std::size_t extra = deferred_.tail() - end;
     deferred_.move(w, end, extra);
     deferred_.setTail(w + extra);
     deferScanning_ = prevScan;
+    // The arena is compact and consistent again: now user code may run (it may
+    // flush, send — deferred, inDuty_ is still set — or close the producer).
+    for (std::size_t i = 0; i < lostN; ++i) {
+        PendingAck::complete(lost[i], -1, "deferred send could not be applied", &callbackExceptions_);
+    }
+}
+
+bool ProducerImpl::debugArenaConsistent() noexcept {
+    uint32_t live = 0, unknown = 0;
+    std::size_t r = 0;
+    const std::size_t tail = deferred_.tail();
+    while (r < tail) {
+        const DeferredHdr* h = deferred_.hdr(r);
+        const std::size_t n = DeferredArena::recordSize(h->len);
+        if (n < sizeof(DeferredHdr) || r + n > tail) return false;
+        if (h->type != 0 && h->type != kMsgSendRecord && h->type != kMsgTier2Batch) return false;
+        if (h->type != 0) {
+            ++live;
+            if (h->flags & kDefUnknownPartition) {
+                ++unknown;
+            } else if (findPartition_(h->topicId, h->partition) == nullptr) {
+                return false;  // a known record for a partition that does not exist
+            }
+        }
+        r += n;
+    }
+    if (r != tail || live != deferred_.live() || unknown != deferredUnknown_) return false;
+    for (const auto& up : partitions_) {
+        uint32_t cnt = 0;
+        for (std::size_t o = 0; o < tail; o += deferred_.sizeAt(o)) {
+            const DeferredHdr* h = deferred_.hdr(o);
+            if (h->type != 0 && !(h->flags & kDefUnknownPartition) &&
+                h->topicId == up->topicId && h->partition == up->partition) {
+                ++cnt;
+            }
+        }
+        if (cnt != up->deferredCount) return false;
+    }
+    return true;
 }
 
 void ProducerImpl::failDeferred_(const std::string& reason) {
@@ -845,6 +921,7 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
         // foreign thread): not accepted, the caller fails the handle.
         if (std::this_thread::get_id() != dutyThreadId_ || directClosed_) return false;
         lastRejectDeferredFull_ = false;
+        tier2RejectReason_ = nullptr;
         if (inDuty_) {
             // fix1 C1 / fix2: deferred like a Tier-1 record (same per-partition
             // order, same validation and full policy).
@@ -857,9 +934,20 @@ bool ProducerImpl::submitTier2Batch(int32_t topicId,
             return deferTier2_(entry);  // false: caller fails the handle; entry freed here
         }
         if (!deferred_.empty() && !settleDeferredFor_(topicId, partition)) {
+            tier2RejectReason_ = "Tier-2 batch rejected — its partition still has deferred records "
+                                 "(sends made from a duty-cycle callback) that cannot be sent yet; "
+                                 "retry later — batch dropped";
             return false;  // this partition's deferred records must go first
         }
-        PartitionState& ps = getOrCreatePartition(topicId, partition);
+        PartitionState* psp = nullptr;
+        try {
+            psp = &getOrCreatePartition(topicId, partition);
+        } catch (const std::length_error&) {
+            tier2RejectReason_ = "Tier-2 batch rejected — unaddressable partition (the producer's "
+                                 "partition table is full) — batch dropped";
+            return false;
+        }
+        PartitionState& ps = *psp;
         Tier2Entry e;
         e.topicId     = topicId;
         e.partition   = partition;

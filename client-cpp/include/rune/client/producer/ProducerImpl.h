@@ -293,6 +293,14 @@ public:
         if (to != from && n != 0) std::memmove(buf_.data() + to, buf_.data() + from, n);
     }
     void setTail(std::size_t t) noexcept { tail_ = t; }
+    /// fix3: mark [from, to) — stale bytes behind the apply pass's write cursor
+    /// — as ONE dead record, so the arena stays parseable at every instant.
+    void writeFiller(std::size_t from, std::size_t to) noexcept {
+        DeferredHdr f;
+        f.len  = static_cast<uint32_t>(to - from - sizeof(DeferredHdr));
+        f.type = 0;
+        std::memcpy(buf_.data() + from, &f, sizeof f);
+    }
     /// Slide live records forward over dead ones (order preserved).  Only when
     /// no scan holds an offset.
     void compactDead() noexcept {
@@ -459,6 +467,10 @@ public:
     /// callback/future overloads report a distinct reason.  Owner thread only;
     /// never written in Ring mode.
     [[nodiscard]] bool lastRejectWasDeferredFull() const noexcept { return lastRejectDeferredFull_; }
+    /// fix3: why the last Direct submitTier2Batch on the owner thread returned
+    /// false, or nullptr when no specific reason applies (closed / foreign
+    /// thread).  Owner thread only.
+    [[nodiscard]] const char* tier2RejectReason() const noexcept { return tier2RejectReason_; }
     /// Diagnostics / tests (owner thread): records + Tier-2 tokens deferred.
     [[nodiscard]] uint32_t deferredCount() const noexcept { return deferred_.live(); }
     /// Void deferred records failed by the delivery timeout (counted + logged).
@@ -731,6 +743,18 @@ public:
     /// were failed through their handle / counted + logged if void). Owner thread.
     [[nodiscard]] uint64_t deferredApplyFailures() const noexcept { return deferredApplyFailures_; }
 
+    // ---- Task 14 fix3 test seams (owner thread; never used in production) ----
+    /// Parses the whole deferred arena and cross-checks it against the live
+    /// count, the unknown-partition counters and every partition's deferred
+    /// counters.  true = consistent.
+    [[nodiscard]] bool debugArenaConsistent() noexcept;
+    /// The n-th live record visited by the NEXT apply pass fails as if its
+    /// apply threw (the loss path).  0 = off.
+    void debugFailDeferredAppliesFrom(uint32_t n) noexcept { debugFailAt_ = n; }
+    /// Apply passes run so far.
+    [[nodiscard]] uint64_t debugDeferPasses() const noexcept { return deferPasses_; }
+    [[nodiscard]] std::size_t debugDeferPartitionCap() const noexcept { return deferPartitionCap_; }
+
     // ---- Global flush flag (written by app thread, read by agent) -------------
     // Set by submitFlush(); cleared by flushBatches() after processing.
     std::atomic<bool> globalFlushPending_ {false};
@@ -922,12 +946,27 @@ private:
     uint64_t     deferredApplyFailures_ = 0;
     bool         inDuty_ = false;
     bool         lastRejectDeferredFull_ = false;
+    const char*  tier2RejectReason_ = nullptr;
     DeferredArena deferred_;
     uint32_t     deferredUnknown_ = 0;   // deferred records for not-yet-created partitions
+    std::size_t  deferredUnknownBytes_ = 0;  // fix3: their arena bytes (aggregate cap = deferPartitionCap_)
     std::size_t  deferPartitionCap_ = 0; // per-partition arena share (bytes)
     uint32_t     deferPass_ = 0;         // apply-pass id (PartitionState::deferBlockedPass)
-    bool         deferScanning_ = false; // a scan holds arena offsets: no compaction
+    // A scan holds arena offsets: push() must not compact.  fix3 (minor 5):
+    //  * During an APPLY pass no push can happen at all — no user code runs
+    //    inside it (lost handles are completed after the slide-down), and the
+    //    stale gap [w, r) is always covered by one dead filler record — so the
+    //    free space in [w, end) is never needed by a concurrent push.
+    //  * During the fail / expire scans (failDeferred_, expireDeferred_) user
+    //    callbacks DO run, but those scans only kill records in place (no
+    //    gap); a push from a callback appends at the tail without compacting
+    //    (and back-pressures if the tail is full) — the dead space is reclaimed
+    //    by the next pass / non-scanning push.  Reusing [w, end) is therefore
+    //    neither needed nor attempted.
+    bool         deferScanning_ = false;
     uint64_t     deferredTimedOutVoid_ = 0;
+    uint64_t     deferPasses_ = 0;           // apply passes run (diagnostics / tests)
+    uint32_t     debugFailAt_ = 0;           // test seam: see debugFailDeferredAppliesFrom
 
     struct DutyScope {
         ProducerImpl& p;

@@ -878,3 +878,124 @@ TEST(DirectIngress, UnaddressablePartitionRejectedBeforeDeferralRegression) {
     EXPECT_EQ(fx.impl.deferredCount(), 0u);
     EXPECT_EQ(fx.impl.deferredApplyFailures(), 0u);
 }
+
+// ===========================================================================
+// Task 14 fix round 3
+// ===========================================================================
+
+// 1: a loss-path callback (an accepted deferred record that could not be
+// applied) that calls flush() and close() must never see the apply pass's
+// half-compacted arena: lost handles are completed AFTER the pass, and the
+// arena stays parseable (a dead filler spans any gap).
+TEST(DirectIngress, LossCallbackFlushAndCloseMidPassNoCorruptionRegression) {
+    Fx fx(stallCfg());
+    fx.stall(0, 'f', 1);
+    bool lossFired = false;
+    bool consistentInCallback = false;
+    bool consistentAfterFlush = false;
+    int64_t dOutcome = 0;
+    // Arm: the 2nd deferred record applied in the next pass fails (C below).
+    fx.inDuty(1, 2, [&] {
+        (void)fx.send(2, 'A');  // applied (fresh partition) -> leaves a gap
+        (void)fx.send(0, 'B');  // kept (p0 stalled) -> slid forward over A's slot
+        const int64_t h = fx.impl.registerCallback([&](int64_t off) {
+            lossFired = (off == -1);
+            consistentInCallback = fx.impl.debugArenaConsistent();
+            fx.impl.submitFlush();
+            consistentAfterFlush = fx.impl.debugArenaConsistent();
+            fx.impl.markRingClosed();
+            fx.impl.failAllPending("Client closed");
+        });
+        if (fx.send(3, 'C', h) != rc::SendResult::Ok) fx.impl.failUnsubmitted(h, "x");
+        const int64_t hd = fx.impl.registerCallback([&](int64_t off) { dOutcome = off == -1 ? -1 : 1; });
+        if (fx.send(0, 'D', hd) != rc::SendResult::Ok) fx.impl.failUnsubmitted(hd, "x");
+        fx.impl.debugFailDeferredAppliesFrom(3);  // the 3rd record of the coming pass (C) fails
+    });
+    EXPECT_TRUE(lossFired);
+    EXPECT_TRUE(consistentInCallback) << "the loss callback must never see a half-compacted arena";
+    EXPECT_TRUE(consistentAfterFlush);
+    EXPECT_EQ(dOutcome, -1) << "close() from the callback fails the still-deferred D exactly once";
+    EXPECT_TRUE(fx.impl.debugArenaConsistent());
+    EXPECT_EQ(fx.impl.deferredCount(), 0u);
+    EXPECT_EQ(fx.impl.deferredApplyFailures(), 1u);
+}
+
+// 2: a refused send to a partition whose deferred records already failed to
+// apply in the latest pass (nothing changed since, outside duty work) is O(1):
+// no futile apply pass per attempt.
+TEST(DirectIngress, RefusedSendToStalledPartitionRunsNoPassRegression) {
+    Fx fx(stallCfg());
+    fx.stall(0, 'f', 1);
+    fx.inDuty(1, 2, [&] { (void)fx.send(0, 'd'); });
+    ASSERT_EQ(fx.impl.deferredCount(), 1u);
+    const uint64_t before = fx.impl.debugDeferPasses();
+    for (int i = 0; i < 100; ++i) ASSERT_EQ(fx.send(0, 'e'), rc::SendResult::BackPressured);
+    EXPECT_EQ(fx.impl.debugDeferPasses(), before) << "no pass while p0's state cannot have changed";
+    // Once p0 can move (its in-flight batch acked + the next pass), it applies.
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);
+    fx.flush(3);
+    EXPECT_EQ(fx.impl.deferredCount(), 0u);
+}
+
+// 3: records for not-yet-created partitions share ONE aggregate cap (the
+// per-partition share) — a burst to fresh partitions cannot exhaust the arena.
+TEST(DirectIngress, UnknownPartitionDeferralsShareAnAggregateCapRegression) {
+    rc::ProducerConfig cfg = stallCfg();
+    cfg.directDeferredBytes = 64 * 1024;
+    Fx fx(cfg);
+    int accepted = 0;
+    bool hitDeferredFull = false;
+    fx.inDuty(0, 1, [&] {
+        for (int32_t part = 100; part < 2'000; ++part) {
+            if (fx.send(part, 'u') != rc::SendResult::Ok) {
+                hitDeferredFull = fx.impl.lastRejectWasDeferredFull();
+                break;
+            }
+            ++accepted;
+        }
+    });
+    EXPECT_TRUE(hitDeferredFull);
+    const auto recSize = static_cast<int>(rc::producer::DeferredArena::recordSize(
+        static_cast<std::size_t>(rc::producer::kRecHeaderSize) + kVal.size()));
+    EXPECT_LE(accepted * recSize, static_cast<int>(fx.impl.debugDeferPartitionCap()));
+    EXPECT_LT(accepted * recSize, cfg.directDeferredBytes / 2);
+}
+
+// 4: a Tier-2 batch rejected because its partition still has deferred records
+// (or is unaddressable) says so — not "ring full".
+TEST(DirectIngress, Tier2RejectReasonIsSpecificRegression) {
+    std::atomic<int64_t> corr{1};
+    auto impl = std::make_shared<ProducerImpl>(stallCfg(), corr);
+    impl->enableDirectIngress(ownerDirect());
+    rc::Producer p(impl);
+    const rc::TopicHandle topic{1, 4};
+    uint64_t frames = 0, bytes = 0;
+    const CountingSink sink{&frames, &bytes};
+    const rc::Key k0 = keyFor(0, 4), k1 = keyFor(1, 4);
+    // Stall p0 (one batch in flight, full builder) and defer a record for it.
+    ASSERT_EQ(p.trySend(topic, k0, kVal), rc::SendResult::Ok);
+    impl->flushBatches(1, 42, sink);
+    rc::SendResult r = rc::SendResult::Ok;
+    for (int i = 0; i < 10'000 && r == rc::SendResult::Ok; ++i) r = p.trySend(topic, k0, kVal);
+    ASSERT_EQ(r, rc::SendResult::BackPressured);
+    p.send(topic, k1, kVal, [&](int64_t) { (void)p.trySend(topic, k0, kVal); });
+    impl->flushBatches(2, 42, sink);
+    auto* ps1 = const_cast<rc::producer::PartitionState*>(impl->partitionState(1, 1));
+    impl->onProduceResponse(ps1->inflight.oldestLive()->corrId, 100);
+    ASSERT_EQ(impl->deferredCount(), 1u);
+
+    auto b = p.batch(topic, k0);
+    b.add(kVal);
+    auto f = b.send();
+    std::string err;
+    try { (void)f.get(); } catch (const std::exception& e) { err = e.what(); }
+    EXPECT_NE(err.find("deferred records"), std::string::npos) << err;
+
+    impl->debugSetMaxPartitionsForTest(2);  // p0, p1 exist: p2 is unaddressable
+    auto b2 = p.batch(topic, keyFor(2, 4));
+    b2.add(kVal);
+    auto f2 = b2.send();
+    std::string err2;
+    try { (void)f2.get(); } catch (const std::exception& e) { err2 = e.what(); }
+    EXPECT_NE(err2.find("unaddressable"), std::string::npos) << err2;
+}

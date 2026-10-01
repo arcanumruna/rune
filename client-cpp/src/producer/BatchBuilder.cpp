@@ -101,8 +101,10 @@ std::future<int64_t> BatchBuilder::send() {
         // The ring token was never written so the agent will never see this
         // batch; the future would otherwise hang until produceTimeoutMs.
         // Fail it now so the caller gets an error without waiting.
+        const char* specific = impl_->tier2RejectReason();  // Direct: partition deferred / unaddressable
         impl_->failUnsubmitted(ackHandle,
-            impl_->lastRejectWasDeferredFull()
+            specific != nullptr ? specific
+            : impl_->lastRejectWasDeferredFull()
                 ? "Tier-2 batch rejected — deferred buffer full (sent from inside the producer's "
                   "own duty-cycle callback) — batch dropped"
                 : "Tier-2 batch ring full — batch dropped");
