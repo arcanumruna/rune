@@ -98,6 +98,9 @@ struct MetaGateway {
         : leaderEndpoint(std::move(leaderEp))
     {
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);

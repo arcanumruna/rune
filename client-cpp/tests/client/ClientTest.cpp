@@ -159,6 +159,9 @@ struct TestGateway {
         egressStream  = egStream;
 
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         aeron_ = aeron::Aeron::connect(ctx);
         if (!aeron_) throw std::runtime_error("TestGateway: Aeron::connect failed");

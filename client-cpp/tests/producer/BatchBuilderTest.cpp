@@ -129,6 +129,9 @@ struct CB3Gateway {
                          int32_t egressStream)
     {
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         if (!gwAeron) throw std::runtime_error("CB3Gateway: connect failed");
@@ -797,6 +800,9 @@ struct SlowAckGateway {
                              int32_t egressStream)
     {
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         if (!gwAeron) throw std::runtime_error("SlowAckGateway: connect failed");

@@ -118,6 +118,9 @@ struct RedirectGateway {
                               int32_t egressStream)
     {
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         if (!gwAeron)
@@ -532,6 +535,9 @@ struct M1Gateway {
     M1Gateway(const std::string& aeronDir, int32_t inStr, int32_t egStr)
     {
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
@@ -758,6 +764,9 @@ struct DeadGateway {
     DeadGateway(const std::string& aeronDir, int32_t inStr, int32_t egStr)
     {
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
@@ -961,6 +970,9 @@ struct MaxRedirectGateway {
     MaxRedirectGateway(const std::string& aeronDir, int32_t inStr, int32_t egStr)
     {
         aeron::Context ctx;
+        // Aeron's default handler ::exit(-1)s the test process when the client's
+        // embedded driver stops before this test-side client is closed.
+        ctx.errorHandler([](const std::exception&) {});
         ctx.aeronDir(aeronDir);
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", inStr);
