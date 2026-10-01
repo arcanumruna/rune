@@ -1584,6 +1584,13 @@ TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression
     appDone.store(true, std::memory_order_release);
     duty.join();
     EXPECT_TRUE(monotonic);
+    // The race above may end before the duty loop dispatches after applying a
+    // setter (fast Release builds); its final drain applied the last setter, so
+    // one more dispatch (this thread is now the only one) must reach it.
+    codec::RecordsView rv;
+    rv.topicId = kTopicId;
+    rv.partition = kPartition;
+    hub_->onRecords(rv);
     EXPECT_GT(dispatched.load(), 0) << "the installed callback ran on the duty thread";
 }
 
