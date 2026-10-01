@@ -35,10 +35,28 @@ std::optional<std::string> checkAeronSpace(uint64_t freeBytes, int32_t drivers, 
 // reintroducing a caller-side pump while thread_ runs, such as the old startup
 // readiness loop (the two-thread race, spec §3.6).
 // EmbeddedDriverRegression.ThreadedStartNeverPumpsFromCaller pins it at 0.
+// threadRunning_ is controller-owned; in Threaded mode callerPump_ is only
+// reachable from close() on the controller (doWork / the trampoline refuse
+// Threaded mode), and in Invoker mode threadRunning_ is never written after
+// construction — so this read never races a write (F9a).
 int EmbeddedDriver::callerPump_() noexcept {
-    if (running_.load(std::memory_order_acquire))
-        callerPumpsWhileThreadRunning_.fetch_add(1, std::memory_order_relaxed);
+    if (threadRunning_) [[unlikely]] {
+        spdlog::error("EmbeddedDriver: caller-side pump while the driver thread runs (dir={}) — "
+                      "two pumpers (spec §3.6)", cfg_.dir);
+        reportMisuse_(kCallerPumpWhileRunning);
+    }
     return aeron_driver_main_do_work(driver_);
+}
+
+void EmbeddedDriver::drainMisuse_() const noexcept {
+    misuseRing_.poll([this](std::int32_t type, std::int64_t, std::int64_t) noexcept {
+        switch (type) {
+            case kForeignPump:            ++foreignPumps_; break;
+            case kForeignClose:           ++foreignCloses_; break;
+            case kCallerPumpWhileRunning: ++callerPumpsWhileRunning_; break;
+            default: break;
+        }
+    });
 }
 
 EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
@@ -97,32 +115,40 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_start failed: ") + aeron_errmsg());
     }
     if (mode_ == DriverMode::Threaded) {
-        running_.store(true, std::memory_order_release);
         try {
+            // F9a: the thread exits on a Stop command (stopRing_), drained every
+            // loop iteration — no shared flag.
             thread_ = std::thread([this] {
-                while (running_.load(std::memory_order_acquire))
+                bool stop = false;
+                while (!stop) {
                     aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+                    stopRing_.poll([&stop](std::int32_t type, std::int64_t, std::int64_t) noexcept {
+                        if (type == kStopCmd) stop = true;
+                    });
+                }
             });
+            threadRunning_ = true;
         } catch (...) {
-            // No thread was started: clear the flag so close() does not join,
-            // then drain and close the initialised driver/context (no leak).
-            running_.store(false, std::memory_order_release);
+            // No thread was started (threadRunning_ stays false, so close() does
+            // not join): drain and close the initialised driver/context (no leak).
             close();
             throw;
         }
         // No caller-side readiness pumping: aeron_driver_init already wrote cnc.dat
         // (aeron_driver.c:864) and stamped the heartbeat (:911); only thread_ drives.
     } else {
-        pumpOwner_.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        pumpOwner_ = std::this_thread::get_id();
     }
     spdlog::info("EmbeddedDriver: started (dir={}, mode={})", cfg_.dir,
                  mode_ == DriverMode::Invoker ? "invoker" : "threaded");
 }
 
 int EmbeddedDriver::doWork() noexcept {
-    if (mode_ == DriverMode::Threaded ||
-        std::this_thread::get_id() != pumpOwner_.load(std::memory_order_relaxed)) {
-        foreignPumpAttempts_.fetch_add(1, std::memory_order_relaxed);   // exactly one pumper
+    if (mode_ == DriverMode::Threaded || std::this_thread::get_id() != pumpOwner_) [[unlikely]] {
+        spdlog::error("EmbeddedDriver: doWork() refused — not this driver's pump thread "
+                      "(dir={}, mode={})", cfg_.dir,
+                      mode_ == DriverMode::Invoker ? "invoker" : "threaded");
+        reportMisuse_(kForeignPump);   // exactly one pumper
         return 0;
     }
     return callerPump_();
@@ -130,9 +156,8 @@ int EmbeddedDriver::doWork() noexcept {
 
 int EmbeddedDriver::pumpTrampoline_(void* self) noexcept {
     auto* d = static_cast<EmbeddedDriver*>(self);
-    if (d->mode_ == DriverMode::Threaded ||
-        std::this_thread::get_id() != d->pumpOwner_.load(std::memory_order_relaxed)) {
-        d->foreignPumpAttempts_.fetch_add(1, std::memory_order_relaxed);
+    if (d->mode_ == DriverMode::Threaded || std::this_thread::get_id() != d->pumpOwner_) [[unlikely]] {
+        d->reportMisuse_(kForeignPump);
         spdlog::error("EmbeddedDriver: AeronPump refused — not this driver's pump thread "
                       "(dir={}, mode={}); resolve fails fast", d->cfg_.dir,
                       d->mode_ == DriverMode::Invoker ? "invoker" : "threaded");
@@ -143,18 +168,22 @@ int EmbeddedDriver::pumpTrampoline_(void* self) noexcept {
 
 void EmbeddedDriver::close() noexcept {
     if (mode_ == DriverMode::Invoker && driver_ &&
-        std::this_thread::get_id() != pumpOwner_.load(std::memory_order_relaxed)) {
+        std::this_thread::get_id() != pumpOwner_) [[unlikely]] {
         // Draining here would make this thread a SECOND pumper while the bound
         // owner may still be running.  Refuse loudly and leave the driver intact.
         // The owner closes it, or a closer takes over via bindPumpThread() after
         // joining the owner.
-        foreignCloseAttempts_.fetch_add(1, std::memory_order_relaxed);
+        reportMisuse_(kForeignClose);
         spdlog::error("EmbeddedDriver: close() refused from non-pumper thread (dir={}); "
                       "the bound pump thread must close, or bindPumpThread() first", cfg_.dir);
         return;
     }
-    if (mode_ == DriverMode::Threaded && running_.exchange(false, std::memory_order_acq_rel)) {
+    if (mode_ == DriverMode::Threaded && threadRunning_) {
+        // Controller-only (Threaded close is a controller operation): one Stop
+        // command — the ring is otherwise empty, so the offer cannot fail.
+        (void)stopRing_.offer(kStopCmd);
         if (thread_.joinable()) thread_.join();
+        threadRunning_ = false;
     }
     // The driver thread (if any) has exited: the closing thread is now the ONLY
     // pumper.  Drain the client-close commands still queued in the CnC ring before

@@ -2,10 +2,8 @@
 //
 // See PortableFlushBackend.h for the design notes and thread-ownership rules.
 //
-// Ring encoding (both rings, msgTypeId=1):
-//   write:  memcpy the trivially-copyable POD struct into a stack scratch buffer,
-//           then OneToOneByteRing::write(scratch, sizeof(T), 1).
-//   read:   agrona zero-copy view — reinterpret_cast<const T*>(buf.buffer()+off).
+// Ring encoding (both rings): SBE FlushRequest / FlushCompletion, encoded
+// wrap-in-place into the claimed slot and decoded in place (zero-copy view).
 //
 // Back-pressure:
 //   submit() enforces inFlight_ < submitDepth_ (worker-side only, no synchronisation)
@@ -30,27 +28,48 @@ static int rune_fdatasync(int fd) { return ::fdatasync(fd); }
 
 namespace rune::node {
 
+namespace {
+// SBE-decode one submit-ring slot (zero-copy view).  The ONE decoder for both
+// the duty loop and the teardown drain.
+FlushRequest decodeFlushRequest(aeron::concurrent::AtomicBuffer& buf,
+                                aeron::util::index_t offset,
+                                aeron::util::index_t length) noexcept {
+    char* rp = reinterpret_cast<char*>(buf.buffer() + offset);
+    const std::uint64_t rcap = static_cast<std::uint64_t>(length);
+    flushsbe::MessageHeader rhdr;
+    rhdr.wrap(rp, 0, 0, rcap);
+    flushsbe::FlushRequest req;
+    req.wrapForDecode(rp, flushsbe::MessageHeader::encodedLength(),
+                      rhdr.blockLength(), rhdr.version(), rcap);
+    FlushRequest r;
+    r.fd            = req.fd();
+    r.flushBoundary = req.flushBoundary();
+    r.token         = static_cast<CompletionToken>(req.token());
+    return r;
+}
+} // namespace
+
 PortableFlushBackend::PortableFlushBackend(std::size_t submitDepth,
-                                           std::size_t completionDepth)
+                                           std::size_t completionDepth,
+                                           SyncFn      syncFn)
     : submitRing_(detail::flushRingByteCapacity(submitDepth, kFlushRequestWireLen))
     , completionRing_(detail::flushRingByteCapacity(completionDepth, kFlushCompletionWireLen))
     , nextToken_(0)
     , submitDepth_(submitDepth)
     , inFlight_(0)
-    , stop_(false)
+    , syncFn_(syncFn ? syncFn : &rune_fdatasync)
     , flusher_([this]{ flusherLoop_(); })
 {
 }
 
 PortableFlushBackend::~PortableFlushBackend() {
-    // Task #12 fix: signal the flusher to stop via the atomic stop_ flag —
-    // NOT by writing a sentinel to the submit ring.  The submit ring is a
-    // single-producer/single-consumer ring whose sole producer is the worker's
-    // submit(); if the dtor (which may run on a DIFFERENT thread than the worker)
-    // also wrote to it, that would be a two-producer data race on the ring's
-    // producer position (TSan-flagged).  A release-store here pairs with the
-    // flusher's acquire-load; join() then establishes happens-before for teardown.
-    stop_.store(true, std::memory_order_release);
+    // Task #12 fix: signal the flusher to stop on its own stop ring — NOT by
+    // writing a sentinel to the submit ring.  The submit ring's sole producer is
+    // the worker's submit(); if the dtor (which may run on a DIFFERENT thread than
+    // the worker) also wrote to it, that would be a two-producer race on the
+    // ring's producer position (TSan-flagged).  F9a: the stop travels as a ring
+    // command (no atomic flag); join() establishes happens-before for teardown.
+    (void)stopRing_.offer(kStopCmd);   // one command, otherwise-empty ring
     flusher_.join();
 }
 
@@ -84,9 +103,8 @@ CompletionToken PortableFlushBackend::submit(int fd,
 
 void PortableFlushBackend::flusherLoop_() {
     // The flusher loop: drain submit ring → fdatasync → post completion.
-    // Runs until the dtor sets the atomic stop_ flag (acquire-load below pairs
-    // with the dtor's release-store).  No sentinel: submit() is the ring's sole
-    // producer, so the dtor never writes to it (Task #12).
+    // Runs until the dtor posts Stop on stopRing_ (F9a).  No sentinel: submit()
+    // is the submit ring's sole producer, so the dtor never writes to it (#12).
     // Idle strategy for the flusher: when the submit ring is empty, back off
     // (spin → yield → progressively longer parks) instead of a raw
     // std::this_thread::yield() spin, which pegged a whole core PER WORKER even
@@ -98,26 +116,27 @@ void PortableFlushBackend::flusherLoop_() {
     // ("always use the backoff aeron idle strategy".)
     rune::consensus::BackoffIdleStrategy idle;
 
-    while (!stop_.load(std::memory_order_acquire)) {
+    bool stop = false;
+    auto pollStop = [this, &stop]() noexcept {
+        stopRing_.poll([&stop](std::int32_t type, std::int64_t, std::int64_t) noexcept {
+            if (type == kStopCmd) stop = true;
+        });
+    };
+    pollStop();
+    while (!stop) {
         const int drained = submitRing_.drain(
             [this](int32_t /*msgTypeId*/,
                    aeron::concurrent::AtomicBuffer& buf,
                    aeron::util::index_t offset,
                    aeron::util::index_t length) {
                 // read-rework SBE-C: SBE-decode the request in place (zero-copy).
-                char* rp = reinterpret_cast<char*>(buf.buffer() + offset);
-                const std::uint64_t rcap = static_cast<std::uint64_t>(length);
-                flushsbe::MessageHeader rhdr;
-                rhdr.wrap(rp, 0, 0, rcap);
-                flushsbe::FlushRequest req;
-                req.wrapForDecode(rp, flushsbe::MessageHeader::encodedLength(),
-                                  rhdr.blockLength(), rhdr.version(), rcap);
-                const int             reqFd    = req.fd();
-                const int64_t         reqBound = req.flushBoundary();
-                const CompletionToken reqTok   = static_cast<CompletionToken>(req.token());
+                const FlushRequest    r        = decodeFlushRequest(buf, offset, length);
+                const int             reqFd    = r.fd;
+                const int64_t         reqBound = r.flushBoundary;
+                const CompletionToken reqTok   = r.token;
 
                 // Perform the datasync (may block — intentional; off the worker path).
-                int rc = rune_fdatasync(reqFd);
+                int rc = syncFn_(reqFd);
                 int saved_errno = (rc != 0) ? errno : 0;
                 const int32_t ec = (rc == 0) ? 0 : saved_errno;
 
@@ -144,23 +163,25 @@ void PortableFlushBackend::flusherLoop_() {
             },
             /*limit=*/16);
 
-        if (!stop_.load(std::memory_order_acquire)) {
+        pollStop();   // checked before idling
+        if (!stop) {
             idle.idle(drained); // parks when idle; resets to spin when draining
         }
     }
 
-    // Teardown final drain: complete any requests enqueued before stop_ so their
+    // Teardown final drain: complete any requests enqueued before Stop so their
     // data is durable on graceful shutdown.  We do the fdatasync but do NOT post
     // completions — the worker has stopped reaping, so writing to the (possibly
     // full) completion ring could spin forever and hang join().
     submitRing_.drain(
-        [](int32_t /*msgTypeId*/,
-           aeron::concurrent::AtomicBuffer& buf,
-           aeron::util::index_t offset,
-           aeron::util::index_t /*length*/) {
-            const FlushRequest* req =
-                reinterpret_cast<const FlushRequest*>(buf.buffer() + offset);
-            (void)rune_fdatasync(req->fd);
+        [this](int32_t /*msgTypeId*/,
+               aeron::concurrent::AtomicBuffer& buf,
+               aeron::util::index_t offset,
+               aeron::util::index_t length) {
+            // F9a fix: the slot is SBE-encoded — decode it exactly like the main
+            // loop (it was reinterpret_cast as the POD FlushRequest, syncing the
+            // SBE header bytes as an fd).
+            (void)syncFn_(decodeFlushRequest(buf, offset, length).fd);
         },
         /*limit=*/1 << 30);
 }

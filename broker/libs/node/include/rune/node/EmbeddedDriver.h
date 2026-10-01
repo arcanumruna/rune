@@ -5,6 +5,22 @@
 //             cycle; no other thread may pump it (doWork() refuses and counts).
 //   Invoker : AERON_THREADING_MODE_INVOKER — conductor+sender+receiver run ONLY
 //             inside doWork() on the bound thread (shard worker / fused runtime).
+//
+// F9a (no atomics):
+//   - Threaded stop: the controller (the thread that constructed / closes the
+//     driver) posts Stop on stopRing_; the driver thread drains it every loop
+//     iteration; join() orders everything after.  threadRunning_ is
+//     controller-owned.
+//   - pumpOwner_ is a plain thread id: written at construction (Invoker) or by
+//     bindPumpThread() on the NEW pumper, which only happens after the previous
+//     pumper stopped (ShardAgent's first pass runs after the startup thread
+//     handed off; a closer binds after joining the worker) — so every legit
+//     write/read pair is ordered by a thread start/join.
+//   - Misuse detection (a second pumper / foreign close / caller pump while the
+//     thread runs) compares this_thread to pumpOwner_ with NO shared counter:
+//     the offending thread refuses, logs, and posts a misuse EVENT on
+//     misuseRing_ (many-to-one).  The *Attempts() accessors drain that ring on
+//     the ONE observer thread (tests) into observer-owned tallies.
 #include <cstddef>   // aeronmd.h uses size_t without including <stddef.h>
 #include <cstdint>
 extern "C" {
@@ -13,7 +29,8 @@ extern "C" {
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/node/NodeConfig.h>
 
-#include <atomic>
+#include <rune/consensus/ControlRing.h>
+
 #include <optional>
 #include <string>
 #include <thread>
@@ -56,7 +73,7 @@ public:
     /// The calling thread becomes the only pumper (Invoker).  Calling it also
     /// asserts that the previous pumper has stopped, e.g. a closer takes ownership
     /// after joining the worker thread and before close().
-    void bindPumpThread() noexcept { pumpOwner_.store(std::this_thread::get_id(), std::memory_order_relaxed); }
+    void bindPumpThread() noexcept { pumpOwner_ = std::this_thread::get_id(); }
     /// Idempotent.  Invoker: only the bound pumper may close.  A close from any other
     /// thread is REFUSED (logged, counted in foreignCloseAttempts(), driver left
     /// untouched) because draining would make it a second pumper.
@@ -78,26 +95,38 @@ public:
     [[nodiscard]] bool               isOpen() const noexcept { return driver_ != nullptr; }
     [[nodiscard]] DriverMode         mode() const noexcept { return mode_; }
     [[nodiscard]] const std::string& dir() const noexcept { return cfg_.dir; }
-    [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { return foreignPumpAttempts_.load(std::memory_order_relaxed); }
-    [[nodiscard]] uint64_t foreignCloseAttempts() const noexcept { return foreignCloseAttempts_.load(std::memory_order_relaxed); }
-    [[nodiscard]] uint64_t callerPumpsWhileThreadRunning() const noexcept { return callerPumpsWhileThreadRunning_.load(std::memory_order_relaxed); }
+    /// Misuse tallies (diagnostics).  OBSERVER thread only (one at a time —
+    /// tests): each call drains misuseRing_ into the observer-owned tallies.
+    [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { drainMisuse_(); return foreignPumps_; }
+    [[nodiscard]] uint64_t foreignCloseAttempts() const noexcept { drainMisuse_(); return foreignCloses_; }
+    [[nodiscard]] uint64_t callerPumpsWhileThreadRunning() const noexcept { drainMisuse_(); return callerPumpsWhileRunning_; }
 
 private:
     static int pumpTrampoline_(void* self) noexcept;   // AeronPump::kRefused off the pump thread
     int callerPump_() noexcept;   // any pump NOT made by the driver thread
 
+    enum Misuse : std::int32_t { kForeignPump = 1, kForeignClose = 2, kCallerPumpWhileRunning = 3 };
+    static constexpr std::int32_t kStopCmd = 1;
+
+    /// Any thread: report a misuse event (cold path; dropped + already logged
+    /// by the caller if the ring is full — diagnostics, never coordination).
+    void reportMisuse_(Misuse m) noexcept { (void)misuseRing_.offer(m); }
+    void drainMisuse_() const noexcept;
+
     EmbeddedDriverConfig    cfg_;
     DriverMode              mode_;
     aeron_driver_context_t* ctx_    = nullptr;
     aeron_driver_t*         driver_ = nullptr;
-    std::atomic<bool>       running_{false};   // Threaded: stop flag for the driver thread
+    bool                    threadRunning_ = false;   // Threaded: CONTROLLER-owned
+    rune::consensus::ControlRing<256> stopRing_;       // controller → driver thread
     std::thread             thread_;
-    // Diagnostics only (never used for coordination): relaxed atomics because
-    // foreign threads touch them by definition (spec §3.6 one-pumper contract).
-    std::atomic<std::thread::id> pumpOwner_{};
-    std::atomic<uint64_t>        foreignPumpAttempts_{0};
-    std::atomic<uint64_t>        foreignCloseAttempts_{0};
-    std::atomic<uint64_t>        callerPumpsWhileThreadRunning_{0};
+    std::thread::id         pumpOwner_{};             // see F9a note above
+    // any thread → observer: misuse events (many-to-one).
+    mutable rune::consensus::ControlRing<1024> misuseRing_;
+    // Observer-owned tallies (drained from misuseRing_).
+    mutable uint64_t        foreignPumps_            = 0;
+    mutable uint64_t        foreignCloses_           = 0;
+    mutable uint64_t        callerPumpsWhileRunning_ = 0;
 };
 
 } // namespace rune::node

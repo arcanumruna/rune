@@ -19,10 +19,11 @@
 //
 // Lifecycle:
 //   - ctor: spawns the flusher thread.
-//   - dtor: sets the atomic stop_ flag (release) and joins the thread.  The dtor
-//     NEVER writes to the submit ring — that ring stays strictly single-producer
-//     (only the worker's submit() ever writes it), so there is no two-producer
-//     data race between the worker and the destroying thread (Task #12 fix).
+//   - dtor: posts a Stop command on the dedicated stopRing_ (F9a: no atomic
+//     flag) and joins the thread.  The dtor NEVER writes to the submit ring —
+//     that ring stays strictly single-producer (only the worker's submit() ever
+//     writes it), so there is no two-producer data race between the worker and
+//     the destroying thread (Task #12 fix).
 //
 // Thread ownership:
 //   - submit(), nextToken_, inFlight_, and submitDepth_ are WORKER-side (only
@@ -46,10 +47,10 @@
 //   = capacity/8) while fitting at least `depth` messages byte-wise.
 
 #include <rune/node/OneToOneByteRing.h>
+#include <rune/consensus/ControlRing.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/FlushRequest.h>
 #include <rune_protocol_internal_sbe/FlushCompletion.h>
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -112,10 +113,16 @@ inline int flushRingByteCapacity(std::size_t depth, std::size_t msgSize) {
 // ---------------------------------------------------------------------------
 class PortableFlushBackend {
 public:
+    /// The data-sync primitive the flusher calls (fdatasync; fsync on macOS).
+    /// Injectable for tests ONLY (fixed at construction, before the flusher
+    /// thread starts — immutable afterwards).  nullptr = the platform default.
+    using SyncFn = int (*)(int fd);
+
     // ctor: allocate the two rings and spawn the flusher thread.
     // submitDepth and completionDepth are in messages (>= 2).
     explicit PortableFlushBackend(std::size_t submitDepth,
-                                  std::size_t completionDepth);
+                                  std::size_t completionDepth,
+                                  SyncFn      syncFn = nullptr);
 
     // Non-copyable, non-movable (OneToOneByteRing + std::thread).
     PortableFlushBackend(const PortableFlushBackend&)            = delete;
@@ -123,7 +130,7 @@ public:
     PortableFlushBackend(PortableFlushBackend&&)                  = delete;
     PortableFlushBackend& operator=(PortableFlushBackend&&)       = delete;
 
-    // dtor: signal stop via the atomic stop_ flag and join (no ring write).
+    // dtor: post Stop on stopRing_ and join (never writes the submit ring).
     ~PortableFlushBackend();
 
     // -----------------------------------------------------------------------
@@ -186,10 +193,13 @@ private:
     std::size_t     submitDepth_{0};  // max in-flight submits
     std::size_t     inFlight_{0};     // current in-flight count (worker-side only)
 
-    // Stop flag — set by the DTOR (release) on the destroying thread, read by the
-    // flusher (acquire).  Atomic because it crosses threads; this replaces the old
-    // submit-ring sentinel so the submit ring stays strictly single-producer.
-    std::atomic<bool> stop_{false};
+    // Stop command ring — destroying thread → flusher (F9a: replaces the atomic
+    // stop flag; also keeps the submit ring strictly single-producer).
+    rune::consensus::ControlRing<256> stopRing_;
+    static constexpr std::int32_t kStopCmd = 1;
+
+    // Immutable after construction (set before the flusher thread starts).
+    SyncFn syncFn_;
 
     // The dedicated flusher thread — must be last so it starts after all
     // members are initialised.

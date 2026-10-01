@@ -76,3 +76,62 @@ TEST(PortableFlushBackend, SubmitRingFullReturnsNoToken) {
     }
     EXPECT_TRUE(sawFull);
 }
+
+// ---------------------------------------------------------------------------
+// F9a regression: the TEARDOWN drain (requests still in the submit ring when
+// the dtor's Stop arrives) must sync the SAME fd the request carries.  It used
+// to reinterpret the SBE-encoded slot as the old POD FlushRequest, reading the
+// SBE message header as the fd — syncing a garbage (possibly unrelated, live)
+// fd and never the requested one.
+//
+// Determinism: the first sync blocks (test gate) while 40 more requests queue
+// up; the flusher's drain pass handles at most 16, so once the gate opens (after
+// the dtor posted Stop) the remaining ones are synced by the teardown path.
+// Test-side sync state is test harness code (atomics allowed in tests).
+// ---------------------------------------------------------------------------
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+namespace {
+constexpr int kTeardownReqs = 41;
+std::array<int, 128>  g_syncedFds{};
+int                   g_syncedCount = 0;           // flusher-thread only; read after join
+std::atomic<bool>     g_firstSyncEntered{false};
+std::atomic<bool>     g_gateOpen{false};
+
+int recordingSync(int fd) {
+    if (g_syncedCount == 0) {
+        g_firstSyncEntered.store(true);
+        while (!g_gateOpen.load()) std::this_thread::sleep_for(std::chrono::microseconds{50});
+    }
+    if (g_syncedCount < static_cast<int>(g_syncedFds.size())) g_syncedFds[g_syncedCount] = fd;
+    ++g_syncedCount;
+    return 0;
+}
+} // namespace
+
+TEST(PortableFlushBackendRegression, TeardownDrainSyncsTheRequestedFd) {
+    g_syncedCount = 0;
+    g_firstSyncEntered = false;
+    g_gateOpen = false;
+
+    auto* be = new rune::node::PortableFlushBackend(/*submitDepth=*/64, /*completionDepth=*/64,
+                                                    &recordingSync);
+    ASSERT_NE(be->submit(1000, 1), rune::node::kNoToken);
+    while (!g_firstSyncEntered.load()) std::this_thread::sleep_for(std::chrono::microseconds{50});
+    for (int i = 1; i < kTeardownReqs; ++i) {
+        ASSERT_NE(be->submit(1000 + i, 1 + i), rune::node::kNoToken);
+    }
+    std::thread destroyer([be] { delete be; });          // posts Stop, then joins
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});   // let Stop land first
+    g_gateOpen = true;
+    destroyer.join();                                     // join = happens-before
+
+    ASSERT_EQ(g_syncedCount, kTeardownReqs) << "every queued request synced exactly once";
+    for (int i = 0; i < kTeardownReqs; ++i) {
+        EXPECT_EQ(g_syncedFds[static_cast<std::size_t>(i)], 1000 + i)
+            << "request " << i << " synced the wrong fd";
+    }
+}
