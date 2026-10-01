@@ -161,10 +161,12 @@ struct EosRig {
     // to a test session (no egress publication): (subscriptionId, baseOffset).
     std::vector<std::pair<int64_t, int64_t>> recs;
     int64_t lastSubId = 0;
-    explicit EosRig(std::vector<NodeId> isr = {1}, uint8_t tier = 1, int minIsr = 1) {
+    explicit EosRig(std::vector<NodeId> isr = {1}, uint8_t tier = 1, int minIsr = 1,
+                    std::vector<NodeId> replicas = {}) {
         auto c = cfg(1, tier, 0, 0);
         c.minIsr = minIsr;
-        auto rep = std::make_unique<PartitionReplica>(c, Role::Leader, 1, isr, isr, topics.log(0, 0), &t);
+        if (replicas.empty()) replicas = isr;
+        auto rep = std::make_unique<PartitionReplica>(c, Role::Leader, 1, replicas, isr, topics.log(0, 0), &t);
         if (tier == 2) rep->setExternalFollowerFlush(true);
         r = rep.get();
         reg.add(0, 0, std::move(rep));
@@ -247,7 +249,8 @@ struct TxnRig {
     std::string txnId = "tx-f15";
     int64_t pid = -1; int16_t epoch = 0; int32_t seq = 0; int64_t corr = 100; int64_t sid = 0;
     std::array<uint8_t, 4096> out{};
-    explicit TxnRig(int minIsr = 1, bool withStore = false) : m({1}, 1, minIsr) {
+    explicit TxnRig(int minIsr = 1, bool withStore = false, std::vector<NodeId> replicas = {})
+        : m({1}, 1, minIsr, std::move(replicas)) {
         if (withStore) {
             stateLog = std::make_unique<Log>(sd.path.string(), 64LL * 1024 * 1024);
             stateLog->recover();
@@ -3043,18 +3046,16 @@ TEST(TxnRcRegression, SelfDemotionStopsServing) {
     ASSERT_FALSE(served.chunk.empty()) << "precondition: the leader serves read_committed";
     selfDemote(*R.rep, 2, R.now);
     ASSERT_EQ(R.rep->role(), Role::Follower);
-    // Fix round 1 (review I-2): a read_committed read on a not-Ready partition
-    // is HELD on the worker (no answer, nothing served) …
-    const auto held = R.pushReads(0, 1, 1);
-    for (const auto& r : held) EXPECT_TRUE(r.chunk.empty()) << "a self-demoted replica served read_committed data";
-    EXPECT_TRUE(held.empty()) << "the read was answered instead of held while RC is not Ready";
+    // Fix round 2 (RR1-2): a read is held only while the partition is LEADER
+    // (building).  A demoted partition answers at once: empty, nothing served,
+    // notReady (the gateway backs off) — never held for the follower period.
+    const auto r = R.pushReads(0, 1, 1);
+    ASSERT_EQ(r.size(), 1u) << "a read on a demoted partition was held (no answer)";
+    EXPECT_TRUE(r[0].chunk.empty()) << "a self-demoted replica served read_committed data";
+    EXPECT_EQ(r[0].newNextOffset, 0);
+    EXPECT_TRUE(r[0].pushRcNotReady());
+    EXPECT_EQ(R.w->heldPushReadsForTest(), 0u);
     EXPECT_NE(R.status(), Worker::kRcReady);
-    // … and answered once the partition is Ready again (leader, rebuilt).
-    R.rep->becomeLeader(3, {1});
-    std::vector<WorkerReturn> later;
-    for (int i = 0; i < 64 && later.empty(); ++i) { R.pass(); later = R.pushResults(); }
-    ASSERT_EQ(later.size(), 1u);
-    EXPECT_EQ(batchesIn(later[0].chunk).size(), 1u);
 }
 
 TEST(TxnRcRegression, GatewayPushUsesWorkerBoundNotGatewayHw) {
@@ -3529,4 +3530,147 @@ TEST(TxnRcRegression, HoldCapacityExhaustedAnswersNotReady) {
     EXPECT_TRUE(rs[0].pushRcNotReady());
     EXPECT_EQ(rs[0].pushEffectiveBound(), -1);
     EXPECT_EQ(R.w->heldPushReadsForTest(), Worker::kMaxHeldPushReads);
+}
+
+// ---- F15 S4 fix round 2 (re-review 1: RR1-1 .. RR1-4) -------------------------
+namespace {
+// A page-cache model: residency is granted only for ranges a read-ahead call
+// covered — and the FIRST read-ahead is dropped (a best-effort hint the kernel
+// discarded, or pages evicted before the cursor reached them).
+struct DroppingCache {
+    int calls = 0;
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+    static bool readAhead(void* c, const RcReadAheadReq& r) {
+        auto* k = static_cast<DroppingCache*>(c);
+        if (++k->calls == 1) return false;                // dropped
+        k->ranges.emplace_back(reinterpret_cast<uintptr_t>(r.addr), reinterpret_cast<uintptr_t>(r.addr) + r.len);
+        return false;                                     // synchronous (no completion)
+    }
+    static std::size_t probe(void* c, const uint8_t* p, std::size_t len) {
+        auto* k = static_cast<DroppingCache*>(c);
+        uintptr_t at = reinterpret_cast<uintptr_t>(p);
+        const uintptr_t end = at + len;
+        bool grew = true;
+        while (grew && at < end) {
+            grew = false;
+            for (const auto& [b, e] : k->ranges)
+                if (b <= at && at < e) { at = std::min(e, end); grew = true; }
+        }
+        return at - reinterpret_cast<uintptr_t>(p);
+    }
+};
+// An async read-ahead that stays IN FLIGHT until the test completes it.
+struct AsyncHints {
+    int calls = 0;
+    static bool readAhead(void* c, const RcReadAheadReq&) { ++static_cast<AsyncHints*>(c)->calls; return true; }
+    static std::size_t nothingResident(void*, const uint8_t*, std::size_t) { return 0; }
+};
+} // namespace
+
+TEST(TxnRcRegression, BuildCompletesAfterDroppedReadAhead) {
+    // RR1-1: read-ahead is best-effort.  A dropped / evicted range must be
+    // re-requested on every pass whose cursor window is not resident — never
+    // fire-once, else the build (and every txn produce / read_committed read
+    // on the partition) stalls forever.
+    RcRig R;
+    R.append(txnBatch(7, 0, 0));
+    for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    DroppingCache cache;
+    R.w->setRcResidencyProbeForTest(&DroppingCache::probe, &cache);
+    R.w->setRcReadAheadForTest(&DroppingCache::readAhead, &cache);
+    EXPECT_TRUE(R.runUntilReady(4096)) << "the build stalled after a dropped read-ahead (read-ahead calls="
+                                       << cache.calls << ")";
+    EXPECT_EQ(R.open(), 1u);
+}
+
+TEST(TxnRcRegression, AsyncReadAheadAtMostOneInFlightPerPartition) {
+    // RR1-4: an async read-ahead hint is only ENQUEUED by the scan; at most one
+    // is in flight per building partition; the next is issued only after it
+    // completes (then re-requested while the window is still not resident).
+    RcRig R;
+    for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    AsyncHints h;
+    R.w->setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
+    R.w->setRcReadAheadForTest(&AsyncHints::readAhead, &h);
+    for (int i = 0; i < 16; ++i) R.pass();
+    EXPECT_EQ(h.calls, 1) << "more than one read-ahead in flight for one partition";
+    R.w->completeRcHintForTest(R.topic(), 0);
+    for (int i = 0; i < 16; ++i) R.pass();
+    EXPECT_EQ(h.calls, 2) << "after its completion the window must be re-requested exactly once";
+    EXPECT_EQ(R.w->rcScannedBytesForTest(R.topic(), 0), 0u);
+}
+
+TEST(TxnRcRegression, UringReadAheadIsSubmittedAsynchronously) {
+    // RR1-4 (Linux io_uring only): the worker's default read-ahead is an
+    // IORING_OP_FADVISE(WILLNEED) on the segment fd — submitted, not executed
+    // on the worker — and its completion is reaped (no fail-stop on a hint).
+    RcRig R;
+    for (int i = 0; i < 32; ++i) R.append(bigBatch(1000));
+    R.own(4096);
+    if (std::string(R.w->ioBackendNameForTest()) != "uring") GTEST_SKIP() << "io_uring backend not selected";
+    R.w->setRcResidencyProbeForTest(&AsyncHints::nothingResident, nullptr);
+    for (int i = 0; i < 4; ++i) R.pass();
+    EXPECT_GE(R.w->rcHintsSubmittedForTest(), 1u);
+    R.w->setRcResidencyProbeForTest(nullptr, nullptr);
+    EXPECT_TRUE(R.runUntilReady(4096));
+    EXPECT_EQ(R.w->storageFailureSignalsForTest(), 0u) << "a hint completion was taken for an fsync error";
+}
+
+TEST(TxnRcRegression, HeldPushReadAnsweredWhenPartitionLosesLeadership) {
+    // RR1-2: a read held while the partition builds is answered at once when
+    // the partition stops being Leader (follower / demoted / self-demoted) —
+    // never kept for the follower period (it would pin hold capacity and the
+    // reserved return slots, and the subscription would never be answered).
+    RcRig R({1, 2});
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    R.own(1024);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning);
+    ASSERT_TRUE(R.pushReads(0, R.log->logEndOffset(), 1).empty()) << "precondition: held while building";
+    ASSERT_EQ(R.w->heldPushReadsForTest(), 1u);
+    R.rep->becomeFollower(2, 2);
+    R.pass();
+    const auto rs = R.pushResults();
+    ASSERT_EQ(rs.size(), 1u) << "a held read was kept although the partition is no longer Leader";
+    EXPECT_TRUE(rs[0].chunk.empty());
+    EXPECT_TRUE(rs[0].pushRcNotReady());
+    EXPECT_EQ(R.w->heldPushReadsForTest(), 0u);
+    EXPECT_EQ(R.w->reservedAckSlotsForTest(), 0);
+}
+
+TEST(TxnRcRegression, MinIsrPinnedOpenTxnHoldsRcAfterIsrRestore) {
+    // RR1-3 (review m3 ruling): the S0 MinIsr scenario (ISR {1} < minIsr 2: the
+    // HW is pinned at 0 and the marker refused) with a declared extension — the
+    // ISR is restored, the HW passes the open txn's first offset — and BEFORE any
+    // marker re-drive: a read_uncommitted witness receives offset 0 (egress ran)
+    // while read_committed receives nothing at / past the LSO (0).
+    TxnRig T(/*minIsr=*/2, /*withStore=*/false, /*replicas=*/{1, 2});
+    const int64_t rc = T.m.subscribe(T.sid, /*read_committed*/1);
+    const int64_t ru = T.m.subscribe(T.sid, /*read_uncommitted*/0);
+    ASSERT_GT(rc, 0);
+    ASSERT_GT(ru, 0);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();                                          // acks=0: lands at 0
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1) << "precondition: the marker was refused (min-ISR)";
+    ASSERT_EQ(T.m.r->highWatermark(), 0) << "precondition: min-ISR pins the HW";
+    // Extension: follower 2 catches up → ISR {1, 2} >= minIsr → HW passes 0.
+    // (The ISR check runs on the rig's 1 s cadence: drive the clock past it.)
+    for (int i = 0; i < 8 && T.m.r->highWatermark() == 0; ++i) {
+        const int64_t now = 2'000'000'000LL * (i + 1);
+        followerCaughtUp(*T.m.r, now);
+        T.m.runWorker(now);
+    }
+    ASSERT_GT(T.m.r->highWatermark(), 0) << "precondition: the restored ISR advances the HW";
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1) << "precondition: no marker re-drive landed";
+    T.m.push(16, 40'000'000'000LL);
+    EXPECT_TRUE(T.m.delivered(ru, 0)) << "non-vacuity witness: read_uncommitted egress must deliver offset 0";
+    EXPECT_EQ(T.m.deliveredCount(rc), 0u) << "read_committed received data at / past the LSO (the open txn)";
+    EXPECT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u);
 }

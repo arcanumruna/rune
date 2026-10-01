@@ -415,6 +415,15 @@ public:
         rcProbeFn_ = fn; rcProbeCtx_ = ctx;
         for (auto& sl : rcSlots_) sl.rc->setResidencyProbe(fn, ctx);
     }
+    /// Test seam (RR1-1 / RR1-4): the read-ahead issuer every RC build uses.
+    void setRcReadAheadForTest(RcReadAhead fn, void* ctx) {
+        for (auto& sl : rcSlots_) sl.rc->setReadAhead(fn, ctx);
+    }
+    /// Test seam: an async read-ahead hint of (topicId, partition) completed.
+    void completeRcHintForTest(int32_t topicId, int32_t partition) {
+        if (RcState* rc = const_cast<RcState*>(rcFor_(topicId, partition))) rc->onHintCompleted();
+    }
+    [[nodiscard]] uint64_t rcHintsSubmittedForTest() const noexcept { return rcHintsSubmitted_; }
     /// PushRead ops executed by this worker (both answers and refusals).
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
 
@@ -3553,6 +3562,7 @@ private:
     std::vector<RcState*> rcById_;
     int32_t     rcScanBytesPerPass_ = RcState::kDefaultScanBytesPerPass;
     std::size_t rcOpenTxnCapacity_  = rune::transaction::LsoTracker::kDefaultOpenTxnCapacity;
+    uint64_t         rcHintsSubmitted_ = 0;
     RcResidencyProbe rcProbeFn_  = nullptr;
     void*            rcProbeCtx_ = nullptr;
     static constexpr uint16_t kTxnAttrBit = static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional);

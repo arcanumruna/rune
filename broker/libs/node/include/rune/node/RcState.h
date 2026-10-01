@@ -72,6 +72,20 @@ namespace rune::node {
 /// context (no std::function, no virtual).  nullptr = the default (mincore).
 using RcResidencyProbe = std::size_t (*)(void* ctx, const uint8_t* p, std::size_t len);
 
+/// F15 S4 fix round 2 (RR1-1, RR1-4): one read-ahead request — a byte range of
+/// a segment, both as its mapping address and as (fd, file offset).
+struct RcReadAheadReq {
+    const uint8_t* addr    = nullptr;
+    std::size_t    len     = 0;
+    int            fd      = -1;
+    int64_t        fileOff = 0;
+};
+/// Issue a read-ahead hint.  Returns true when the hint is now IN FLIGHT
+/// asynchronously (the issuer later calls RcState::onHintCompleted()); false
+/// when it was done synchronously or skipped.  fn-pointer + ctx (no
+/// std::function, no virtual).  nullptr = synchronous MADV_WILLNEED.
+using RcReadAhead = bool (*)(void* ctx, const RcReadAheadReq& req);
+
 /// The replica facts one advance() step reads (owner thread, plain loads).
 struct RcFacts {
     bool     leader               = false;
@@ -123,6 +137,10 @@ public:
         residency_.reserve(static_cast<std::size_t>(kDefaultScanBytesPerPass) / 4096 + 2);
     }
     void setResidencyProbe(RcResidencyProbe fn, void* ctx) noexcept { probeFn_ = fn; probeCtx_ = ctx; }
+    /// RED stub (fix round 2): the read-ahead issuer is not consulted yet.
+    void setReadAhead(RcReadAhead, void*) noexcept {}
+    void onHintCompleted() noexcept {}
+    [[nodiscard]] bool hintInFlight() const noexcept { return false; }
 
     [[nodiscard]] bool ready() const noexcept { return std::holds_alternative<Ready>(st_); }
     [[nodiscard]] bool scanning() const noexcept { return std::holds_alternative<Scanning>(st_); }
