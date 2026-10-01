@@ -322,17 +322,6 @@ void Client::closeImpl_() {
     // MUST be called after agent_.stop() so no agent thread is in onRecords().
     subscriberHub_.deactivateAll();
 
-    // CG-5: Deactivate all group consumers (fire onRevoked, send LeaveGroup).
-    // MUST be called after agent_.stop() so no agent thread is in onRecords().
-    // sendFn here is a best-effort last send (transport may be stopping).
-    {
-        const auto snap = agent_.stateAndSessionId();
-        const group::SendFn gcSendFn = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-            return agent_.submitSend(fb, fl);
-        };
-        groupConsumerHub_.closeAll(snap.sessionId, gcSendFn);
-    }
-
     // M2 FIX: Fail any still-pending (unbound) subscribes so their active flag
     // is cleared and any polling app-code sees the subscription is dead.
     // Must be called after deactivateAll() (which already clears pending), but
@@ -356,6 +345,20 @@ void Client::closeImpl_() {
     for (auto& tp : txnProducers_) {
         tp->failAll();
     }
+
+    // CG-5: Deactivate all group consumers (fire onRevoked, send LeaveGroup).
+    // F8c fix round 1 (M-1): spec §4 order — producers, txn producers, THEN
+    // group consumers, then the control tables.
+    // MUST be called after agent_.stop() so no agent thread is in onRecords().
+    // sendFn here is a best-effort last send (transport may be stopping).
+    {
+        const auto snap = agent_.stateAndSessionId();
+        const group::SendFn gcSendFn = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+            return agent_.submitSend(fb, fl);
+        };
+        groupConsumerHub_.closeAll(snap.sessionId, gcSendFn);
+    }
+
 
     // M2 FIX: clear the seed session's redirect latch on close so it does not
     // latch.  Safe as a plain write: the runner thread was joined above, so this

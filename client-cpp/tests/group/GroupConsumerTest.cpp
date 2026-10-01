@@ -1941,3 +1941,56 @@ TEST(GroupConsumerHubCommand, DirectCommitAndCommitSyncBeforeAdoptionAreHonoured
     ASSERT_TRUE(fut.ready());
     EXPECT_EQ(fut.status(), OpStatus::Ok);
 }
+
+// F8c fix round 1 (I-3): a commitSync completion handler runs INLINE inside
+// the hub's loops over its consumers; one that adopts consumers on the duty
+// thread (a direct GroupAdd -> impls_.push_back, reallocating the vector) must
+// not invalidate the loop (heap use-after-free under ASan before the fix), and
+// every pending commitSync still completes exactly once.
+TEST(GroupConsumerHubCommand, CommitSyncHandlerSubscribesGroupRegression) {
+    using rune::client::detail::HubCommand;
+    g_ledger = SyncLedger{};
+    GroupConsumerHub hub;
+    struct Adopter {
+        GroupConsumerHub* hub = nullptr;
+        int calls = 0;
+        std::vector<std::shared_ptr<GroupConsumerImpl>> made;
+        static void on(void* ctx, const Completion& c, std::span<const uint8_t> p) noexcept {
+            auto* self = static_cast<Adopter*>(ctx);
+            ++self->calls;
+            SyncLedger::on(&g_ledger, c, p);
+            for (int i = 0; i < 64; ++i) {  // force impls_ to reallocate
+                auto impl = std::make_shared<GroupConsumerImpl>();
+                impl->active = true;
+                HubCommand add;
+                add.op     = HubCommand::Op::GroupAdd;
+                add.handle = reinterpret_cast<uint64_t>(new std::shared_ptr<GroupConsumerImpl>(impl));
+                self->hub->applyCommandDirect(add);
+                self->made.push_back(std::move(impl));
+            }
+        }
+    } adopter{&hub};
+    std::vector<std::shared_ptr<GroupConsumerImpl>> impls;
+    for (int i = 0; i < 3; ++i) {
+        auto impl = std::make_shared<GroupConsumerImpl>();
+        impl->active = true;
+        hub.add(impl);
+        HubCommand sync;
+        sync.op     = HubCommand::Op::GroupCommitSync;
+        sync.handle = reinterpret_cast<uint64_t>(impl.get());
+        sync.a      = i + 1;
+        rune::client::detail::OpTarget tgt;
+        tgt.handler = CompletionHandler{&Adopter::on, &adopter};
+        rune::client::detail::encodeTarget(tgt, sync);
+        hub.applyCommand(sync);
+        impls.push_back(std::move(impl));
+    }
+    hub.onSessionDown();  // completes all three inside one loop over impls_
+    EXPECT_EQ(adopter.calls, 3);
+    for (Token t = 1; t <= 3; ++t) {
+        ASSERT_EQ(g_ledger.e.count(t), 1u);
+        EXPECT_EQ(g_ledger.e.at(t).times, 1);
+        EXPECT_EQ(g_ledger.e.at(t).c.status, OpStatus::SessionLost);
+    }
+    EXPECT_FALSE(hub.hasPendingCommitSync());
+}

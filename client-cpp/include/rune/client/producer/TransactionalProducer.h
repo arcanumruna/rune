@@ -84,6 +84,28 @@ struct TopicPartitionKey {
 };
 
 // ---------------------------------------------------------------------------
+// TxnState — Kafka's TransactionManager states (F8c fix round 1), owned by
+// the duty thread; app threads see it through TransactionalProducer::state().
+//   Uninitialized -> Initializing -> Ready -> InTransaction
+//     -> CommittingTransaction | AbortingTransaction -> Ready
+//   AbortableError: the transaction failed (a refused AddPartitions, a lost
+//     batch, failed offsets, a timed-out commit / abort): commit completes
+//     with that error; the app MUST abortTransaction().
+//   FatalError: fenced (17 / 18) or InvalidTxnState on EndTxn — terminal:
+//     every op completes Fenced, no network op is ever sent again.
+// ---------------------------------------------------------------------------
+enum class TxnState : uint8_t {
+    Uninitialized = 0,
+    Initializing,
+    Ready,
+    InTransaction,
+    CommittingTransaction,
+    AbortingTransaction,
+    AbortableError,
+    FatalError,
+};
+
+// ---------------------------------------------------------------------------
 // TransactionalProducer — user-facing handle for the Tier-3 transactional API.
 //
 // Copies share one impl (shared_ptr).  The status accessors (producerId /
@@ -117,8 +139,17 @@ public:
     // another Client), WrongThread (Invoker off the owner, a Completions off
     // its owner), QueueFull, BackPressured (command ring full).
     // Completion statuses: Ok, BrokerError (errorCode, payload = text),
-    // Fenced, Timeout (produceTimeoutMs of duty time), Closed; a commit whose
-    // records were not all durably acked: DeliveryFailed.
+    // Fenced, Timeout (transactionOpTimeoutMs of duty time), Closed; a commit
+    // whose records were not all durably acked: DeliveryFailed.
+    // State gating (Kafka TransactionManager; see TxnState): init only when
+    // Uninitialized; sendOffsets / commit only InTransaction; abort in
+    // InTransaction or AbortableError.  A commit in AbortableError completes
+    // with the transaction's error; any other misuse completes
+    // BrokerError(19 InvalidTxnState) — a client-side verdict reported with
+    // the broker's code for it.  In FatalError every op completes Fenced.
+    // One issuing thread per producer (Thread mode: an app thread's ops travel
+    // the command ring, a runner callback's apply at once — mixing them can
+    // reorder a commit ahead of a queued send).
 
     /// InitProducerId.  Ok: value = producerId, aux = producerEpoch.
     OpResult initTransactions(CompletionTarget target, Token token);
@@ -141,13 +172,15 @@ public:
 
     // ---- No-completion commands ------------------------------------------------
 
-    /// Mark the start of a transaction (a command for the duty thread).  A
-    /// no-op once closed.
+    /// Start a transaction (a command for the duty thread).  Applied only in
+    /// Ready; otherwise ignored (the following sends are dropped and the
+    /// commit completes BrokerError(19)).  A no-op once closed.
     void beginTransaction();
 
     /// Transactional send (a command for the duty thread).  The first send to
     /// a partition within a transaction emits AddPartitionsToTxn; the record
-    /// is produced once that is OK.  Throws std::invalid_argument (invalid
+    /// is produced once that is OK.  Outside InTransaction the record is
+    /// dropped (never produced: no frame, no transactional bit).  Throws std::invalid_argument (invalid
     /// topic), std::logic_error("client closed") once closed, and — like a
     /// registration — std::runtime_error / std::logic_error when the command
     /// ring stays full (or is full inside a callback).
@@ -159,8 +192,11 @@ public:
     [[nodiscard]] int64_t producerId() const noexcept;
     /// Current producerEpoch.  0 if not acquired.
     [[nodiscard]] int16_t producerEpoch() const noexcept;
-    /// True while a transaction is in progress (beginTransaction .. EndTxn).
+    /// True while a transaction is open on the broker side: InTransaction,
+    /// Committing, Aborting or AbortableError (until EndTxn's final answer).
     [[nodiscard]] bool transactionActive() const noexcept;
+    /// The transaction state machine's state (eventually consistent).
+    [[nodiscard]] TxnState state() const noexcept;
 
     /// Access raw impl (hub wiring / tests — not user API).
     [[nodiscard]] std::shared_ptr<producer::TransactionalProducerImpl> impl() const noexcept {

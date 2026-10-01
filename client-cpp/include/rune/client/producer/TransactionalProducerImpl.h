@@ -35,8 +35,17 @@
 //     new session (re-stamped; same correlationId — every txn request is
 //     idempotent at the coordinator, produce batches dedup by sequence).
 //
-// Fencing: ProducerFenced / InvalidProducerEpoch (and OutOfOrderSequence on a
-// produce) reset the identity; every pending op completes OpStatus::Fenced.
+// Transaction state machine (F8c fix round 1 — Kafka's TransactionManager,
+// rich-state: each state holds its own variables; see TxnState):
+//   * every command is gated by the state (begin only in Ready, send /
+//     sendOffsets / commit only InTransaction, abort in InTransaction /
+//     AbortableError, init only Uninitialized; FatalError -> Fenced);
+//   * a poisoned transaction (refused AddPartitions, lost / out-of-order
+//     batch, failed offsets, a timed-out commit / abort) goes AbortableError:
+//     commit completes with the error, the app must abort — EndTxn(abort) is
+//     sent — and the local transaction state resets ONLY on EndTxn's final
+//     answer, never when it is created;
+//   * fencing (17 / 18), and 19 on EndTxn, is FatalError: terminal.
 
 #pragma once
 
@@ -81,7 +90,8 @@ struct TxnStatus {
     int64_t producerId    = -1;
     int16_t producerEpoch = 0;
     uint8_t txnActive     = 0;
-    uint8_t pad[5]{};
+    uint8_t state         = 0;  // TxnState
+    uint8_t pad[4]{};
 };
 
 // ---------------------------------------------------------------------------
@@ -166,23 +176,31 @@ public:
     void failAll();
 
     // ---- Duty-thread reads (a duty-cycle callback; tests) ---------------------
-    [[nodiscard]] int64_t producerIdDuty() const noexcept { return producerId_; }
-    [[nodiscard]] int16_t producerEpochDuty() const noexcept { return producerEpoch_; }
-    [[nodiscard]] bool    transactionActiveDuty() const noexcept { return txnActive_; }
-    [[nodiscard]] bool    closedDuty() const noexcept { return closed_; }
+    [[nodiscard]] int64_t  producerIdDuty() const noexcept { return producerId_; }
+    [[nodiscard]] int16_t  producerEpochDuty() const noexcept { return producerEpoch_; }
+    [[nodiscard]] TxnState stateDuty() const noexcept { return static_cast<TxnState>(state_.index()); }
+    [[nodiscard]] bool     transactionActiveDuty() const noexcept { return txnOpen_(stateDuty()); }
+    [[nodiscard]] bool     closedDuty() const noexcept { return closed_; }
+    [[nodiscard]] static bool txnOpen_(TxnState s) noexcept {
+        return s == TxnState::InTransaction || s == TxnState::CommittingTransaction ||
+               s == TxnState::AbortingTransaction || s == TxnState::AbortableError;
+    }
 
     // ---- Test hooks (duty thread) ---------------------------------------------
     [[nodiscard]] std::size_t testPendingRequests() const noexcept { return reqs_.size(); }
     [[nodiscard]] std::size_t testPendingOps() const noexcept { return ops_.size(); }
     [[nodiscard]] std::size_t testInFlightBatches() const noexcept { return batches_.size(); }
     [[nodiscard]] std::size_t testWaitingRecords() const noexcept;
+    /// Sends / begins refused by the state machine (dropped, never produced).
+    [[nodiscard]] uint64_t testRefusedSends() const noexcept { return refusedSends_; }
+    [[nodiscard]] uint64_t testRefusedBegins() const noexcept { return refusedBegins_; }
     /// The correlationId of the (single) pending request of `kind` (0: none).
     [[nodiscard]] int64_t testRequestCorrId(uint8_t kind) const noexcept;
 
     // ---- App side ---------------------------------------------------------------
     /// Duty -> app snapshots (producer id / epoch / txn active).  Closed by
     /// failAll(); abandoned by the Client when the registration was refused.
-    detail::StatusRing<TxnStatus, 256> status;
+    detail::StatusRing<TxnStatus, 4096> status;  // room for many unread transitions
     /// App-owned: the latest snapshot drained by the handle (one app thread).
     TxnStatus appStatusCache{};
 
@@ -242,6 +260,20 @@ private:
     enum class Verdict : uint8_t { Ok, Retry, Rediscover, Fenced, Fail };
     [[nodiscard]] static Verdict classify_(ReqKind kind, int16_t errorCode) noexcept;
 
+    // ---- Transaction state machine (Kafka TransactionManager; the variant's
+    //      alternative index IS the TxnState value) ------------------------------
+    struct SUninitialized {};
+    struct SInitializing { uint64_t opId = 0; };
+    struct SReady {};
+    struct SInTransaction {};
+    struct SCommitting { uint64_t opId = 0; };
+    struct SAborting { uint64_t opId = 0; };
+    struct SAbortableError { OpStatus status = OpStatus::BrokerError; uint16_t errorCode = 0; };
+    struct SFatalError { uint16_t errorCode = 0; };
+    using TxnSm = std::variant<SUninitialized, SInitializing, SReady, SInTransaction, SCommitting,
+                               SAborting, SAbortableError, SFatalError>;
+    static_assert(std::variant_size_v<TxnSm> == static_cast<std::size_t>(TxnState::FatalError) + 1);
+
     // ---- helpers ----------------------------------------------------------------
     void complete_(UserOp& op, OpStatus st, uint16_t errorCode = 0, std::string_view text = {});
     void completeAndErase_(uint64_t opId, OpStatus st, uint16_t errorCode = 0, std::string_view text = {});
@@ -252,9 +284,11 @@ private:
     int64_t addRequest_(ReqKind kind, uint64_t opId, int64_t deadlineNs);  // encodes; Unsent
     bool encode_(TxnRequest& r, const UserOp* op);
     void retry_(TxnRequest& r, Verdict v);
-    void handleFencing_();
-    void poison_(uint16_t errorCode);
-    void resetTxn_();
+    void enterFatal_(uint16_t errorCode, uint64_t exceptOpId = 0);
+    void poison_(OpStatus st, uint16_t errorCode);
+    void finishTxn_();
+    void dropWaiting_() noexcept;
+    void refuse_(const detail::HubCommand& cmd, OpKind kind, OpStatus st, uint16_t code, std::string_view why);
     void publishStatus_();
     TxnPartitionState& partition_(int32_t topicId, int32_t partition);
     void produce_(TxnPartitionState& ps, TxnSendRecord& rec, int64_t nowNs, int64_t sessionId,
@@ -263,6 +297,9 @@ private:
     void sweep_(int64_t nowNs);
     bool dataSettled_() const noexcept;
     void gateEndTxn_(int64_t nowNs);
+    [[nodiscard]] int64_t opDeadline_(int64_t nowNs) const noexcept {
+        return nowNs + cfg_.transactionOpTimeoutMs * 1'000'000LL;
+    }
 
     // ---- configuration --------------------------------------------------------
     std::string    transactionalId_;
@@ -277,13 +314,10 @@ private:
     // ---- duty-thread state ------------------------------------------------------
     int64_t  producerId_    = kNoPid;
     int16_t  producerEpoch_ = 0;
-    bool     txnActive_     = false;
-    /// TX-6b: a record of the current txn will never be durable (a batch
-    /// dropped, an AddPartitions refused): a commit must fail.  failCode_: the
-    /// broker error (0: a delivery failure).
-    bool     txnFailed_     = false;
-    uint16_t failCode_      = 0;
+    TxnSm    state_{SUninitialized{}};
     bool     closed_        = false;
+    uint64_t refusedSends_  = 0;
+    uint64_t refusedBegins_ = 0;
 
     uint64_t nextOpId_      = 1;
     uint64_t discoveryGen_  = 0;

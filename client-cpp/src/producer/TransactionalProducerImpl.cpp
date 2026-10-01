@@ -111,6 +111,17 @@ void TransactionalProducerImpl::discardCommand(const detail::HubCommand& cmd,
     sink.deliver(detail::decodeTarget(cmd), c);
 }
 
+void TransactionalProducerImpl::refuse_(const detail::HubCommand& cmd, OpKind kind, OpStatus st,
+                                        uint16_t code, std::string_view why) {
+    Completion c;
+    c.token     = static_cast<Token>(cmd.a);
+    c.op        = kind;
+    c.status    = st;
+    c.errorCode = code;
+    completions_.deliver(detail::decodeTarget(cmd), c,
+                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(why.data()), why.size()));
+}
+
 void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int64_t nowNs) {
     using Op = detail::HubCommand::Op;
     if (closed_) {
@@ -118,71 +129,134 @@ void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int6
         return;
     }
     lastNowNs_ = nowNs;
-    const int64_t deadline = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
+    const uint16_t kStateErr = static_cast<uint16_t>(kInvalidTxnState);
+    // FatalError is terminal: every op completes Fenced, nothing is sent.
+    if (const auto* f = std::get_if<SFatalError>(&state_)) {
+        switch (cmd.op) {
+        case Op::TxnSend:
+            delete reinterpret_cast<TxnSendRecord*>(static_cast<uintptr_t>(cmd.d));
+            ++refusedSends_;
+            return;
+        case Op::TxnBegin:
+            ++refusedBegins_;
+            return;
+        case Op::TxnSendOffsets:
+            delete reinterpret_cast<TxnOffsetsPayload*>(static_cast<uintptr_t>(cmd.d));
+            refuse_(cmd, OpKind::SendOffsets, OpStatus::Fenced, f->errorCode, "producer fenced (fatal)");
+            return;
+        case Op::TxnInit:
+            refuse_(cmd, OpKind::InitTransactions, OpStatus::Fenced, f->errorCode, "producer fenced (fatal)");
+            return;
+        case Op::TxnEnd:
+            refuse_(cmd, cmd.d != 0 ? OpKind::CommitTransaction : OpKind::AbortTransaction, OpStatus::Fenced,
+                    f->errorCode, "producer fenced (fatal)");
+            return;
+        default:
+            return;
+        }
+    }
     switch (cmd.op) {
     case Op::TxnBegin: {
-        // TX-6b: a new transaction always starts clean (no stuck poison).
-        txnFailed_ = false;
-        failCode_  = 0;
-        for (auto& [k, ps] : partitions_) {
-            if (ps.add != TxnPartitionState::Add::Adding) ps.add = TxnPartitionState::Add::NotAdded;
+        if (!std::holds_alternative<SReady>(state_)) {
+            ++refusedBegins_;  // Kafka: begin only in Ready (the next sends / end op are refused)
+            return;
         }
-        txnActive_ = true;
+        state_ = SInTransaction{};
         publishStatus_();
         return;
     }
     case Op::TxnSend: {
         std::unique_ptr<TxnSendRecord> rec(reinterpret_cast<TxnSendRecord*>(static_cast<uintptr_t>(cmd.d)));
         if (!rec) return;
-        TxnPartitionState& ps = partition_(rec->topicId, rec->partition);
-        if (txnActive_ && ps.add == TxnPartitionState::Add::Failed) return;  // poisoned txn: dropped
-        ps.waiting.push_back(std::move(*rec));
+        if (!std::holds_alternative<SInTransaction>(state_)) {
+            ++refusedSends_;  // outside a transaction: never produced (no frame, no txn bit)
+            return;
+        }
+        partition_(rec->topicId, rec->partition).waiting.push_back(std::move(*rec));
         return;
     }
     case Op::TxnInit: {
+        if (!std::holds_alternative<SUninitialized>(state_)) {
+            refuse_(cmd, OpKind::InitTransactions, OpStatus::BrokerError, kStateErr,
+                    "initTransactions: only once, from Uninitialized");
+            return;
+        }
         UserOp op;
         op.id         = nextOpId_++;
         op.kind       = OpKind::InitTransactions;
         op.target     = detail::decodeTarget(cmd);
         op.token      = static_cast<Token>(cmd.a);
-        op.deadlineNs = deadline;
+        op.deadlineNs = opDeadline_(nowNs);
         const uint64_t id = op.id;
+        const int64_t  dl = op.deadlineNs;
         ops_.push_back(std::move(op));
-        const int64_t corr = addRequest_(ReqKind::InitProducerId, id, deadline);
+        const int64_t corr = addRequest_(ReqKind::InitProducerId, id, dl);
         if (UserOp* o = findOp_(id)) o->phase = UserOp::Init{corr};
+        state_ = SInitializing{id};
+        publishStatus_();
         return;
     }
     case Op::TxnSendOffsets: {
         std::unique_ptr<TxnOffsetsPayload> pl(
             reinterpret_cast<TxnOffsetsPayload*>(static_cast<uintptr_t>(cmd.d)));
+        if (const auto* ae = std::get_if<SAbortableError>(&state_)) {
+            refuse_(cmd, OpKind::SendOffsets, ae->status, ae->errorCode,
+                    "sendOffsetsToTransaction: the transaction failed — abort it");
+            return;
+        }
+        if (!std::holds_alternative<SInTransaction>(state_)) {
+            refuse_(cmd, OpKind::SendOffsets, OpStatus::BrokerError, kStateErr,
+                    "sendOffsetsToTransaction: no transaction in progress");
+            return;
+        }
         UserOp op;
         op.id         = nextOpId_++;
         op.kind       = OpKind::SendOffsets;
         op.target     = detail::decodeTarget(cmd);
         op.token      = static_cast<Token>(cmd.a);
-        op.deadlineNs = deadline;
+        op.deadlineNs = opDeadline_(nowNs);
         if (pl) op.offsets = std::move(*pl);
         const uint64_t id = op.id;
+        const int64_t  dl = op.deadlineNs;
         ops_.push_back(std::move(op));
-        if (producerId_ == kNoPid) {
-            completeAndErase_(id, OpStatus::BrokerError, static_cast<uint16_t>(kInvalidTxnState),
-                              "sendOffsetsToTransaction: no producerId — call initTransactions first");
-            return;
-        }
-        const int64_t corr = addRequest_(ReqKind::AddOffsets, id, deadline);
+        const int64_t corr = addRequest_(ReqKind::AddOffsets, id, dl);
         if (UserOp* o = findOp_(id)) o->phase = UserOp::AddOffsets{corr};
         return;
     }
     case Op::TxnEnd: {
+        const bool commit = cmd.d != 0;
+        const OpKind kind = commit ? OpKind::CommitTransaction : OpKind::AbortTransaction;
+        const bool inTxn  = std::holds_alternative<SInTransaction>(state_);
+        if (const auto* ae = std::get_if<SAbortableError>(&state_); ae != nullptr && commit) {
+            // Kafka: a failed transaction can only be aborted.
+            refuse_(cmd, kind, ae->status, ae->errorCode,
+                    "commitTransaction: the transaction failed — abortTransaction() it");
+            return;
+        }
+        const bool abortable = std::holds_alternative<SAbortableError>(state_);
+        if (!(inTxn || (!commit && abortable))) {
+            refuse_(cmd, kind, OpStatus::BrokerError, kStateErr,
+                    commit ? "commitTransaction: no transaction in progress"
+                           : "abortTransaction: no transaction to abort");
+            return;
+        }
         UserOp op;
         op.id         = nextOpId_++;
-        op.commit     = cmd.d != 0;
-        op.kind       = op.commit ? OpKind::CommitTransaction : OpKind::AbortTransaction;
+        op.commit     = commit;
+        op.kind       = kind;
         op.target     = detail::decodeTarget(cmd);
         op.token      = static_cast<Token>(cmd.a);
-        op.deadlineNs = deadline;
-        op.phase      = UserOp::AwaitData{};  // TX-6: EndTxn only after every record is acked
+        op.deadlineNs = opDeadline_(nowNs);
+        op.phase      = UserOp::AwaitData{};  // TX-6: EndTxn only once the data settled
+        const uint64_t id = op.id;
         ops_.push_back(std::move(op));
+        if (commit) {
+            state_ = SCommitting{id};
+        } else {
+            dropWaiting_();  // aborted records are never produced
+            state_ = SAborting{id};
+        }
+        publishStatus_();
         return;
     }
     default:
@@ -371,7 +445,7 @@ void TransactionalProducerImpl::retry_(TxnRequest& r, Verdict v) {
 }
 
 // ---------------------------------------------------------------------------
-// Transaction state
+// Transaction state machine
 // ---------------------------------------------------------------------------
 
 TxnPartitionState& TransactionalProducerImpl::partition_(int32_t topicId, int32_t partition) {
@@ -381,21 +455,36 @@ TxnPartitionState& TransactionalProducerImpl::partition_(int32_t topicId, int32_
     return it->second;
 }
 
-void TransactionalProducerImpl::poison_(uint16_t errorCode) {
-    if (!txnActive_) return;
-    if (!txnFailed_) {
-        txnFailed_ = true;
-        failCode_  = errorCode;
-    }
+void TransactionalProducerImpl::dropWaiting_() noexcept {
+    for (auto& [k, ps] : partitions_) ps.waiting.clear();
 }
 
-void TransactionalProducerImpl::resetTxn_() {
-    txnActive_ = false;
-    txnFailed_ = false;
-    failCode_  = 0;
-    for (auto& [k, ps] : partitions_) {
-        if (ps.add != TxnPartitionState::Add::Adding) ps.add = TxnPartitionState::Add::NotAdded;
+void TransactionalProducerImpl::poison_(OpStatus st, uint16_t errorCode) {
+    // The transaction can no longer commit: AbortableError (the app aborts).
+    if (std::holds_alternative<SInTransaction>(state_)) {
+        state_ = SAbortableError{st, errorCode};
+        dropWaiting_();
+        publishStatus_();
+        return;
     }
+    if (const auto* c = std::get_if<SCommitting>(&state_)) {
+        const uint64_t id = c->opId;
+        const UserOp*  op = findOp_(id);
+        if (op != nullptr && std::holds_alternative<UserOp::Ending>(op->phase)) return;  // already decided
+        state_ = SAbortableError{st, errorCode};
+        dropWaiting_();
+        publishStatus_();
+        // TX-6b: never a commit marker over this data — the commit fails and
+        // the app must abort (which sends EndTxn(abort)).
+        completeAndErase_(id, st, errorCode, "commitTransaction: the transaction failed — abortTransaction() it");
+    }
+    // Aborting / AbortableError / others: the abort proceeds; first error kept.
+}
+
+void TransactionalProducerImpl::finishTxn_() {
+    // EndTxn's final answer: only now is the transaction closed locally.
+    for (auto& [k, ps] : partitions_) ps.add = TxnPartitionState::Add::NotAdded;
+    state_ = SReady{};
     publishStatus_();
 }
 
@@ -403,32 +492,33 @@ void TransactionalProducerImpl::publishStatus_() {
     TxnStatus s;
     s.producerId    = producerId_;
     s.producerEpoch = producerEpoch_;
-    s.txnActive     = txnActive_ ? 1 : 0;
+    s.state         = static_cast<uint8_t>(stateDuty());
+    s.txnActive     = txnOpen_(stateDuty()) ? 1 : 0;
     if (!statusDirty_ && s.producerId == statusLast_.producerId &&
-        s.producerEpoch == statusLast_.producerEpoch && s.txnActive == statusLast_.txnActive) {
+        s.producerEpoch == statusLast_.producerEpoch && s.state == statusLast_.state) {
         return;
     }
     statusLast_  = s;
     statusDirty_ = !status.tryPublish(s) && !status.closed();
 }
 
-void TransactionalProducerImpl::handleFencing_() {
-    producerId_    = kNoPid;
-    producerEpoch_ = 0;
-    txnActive_     = false;
-    txnFailed_     = false;
-    failCode_      = 0;
-    partitions_.clear();  // sequences restart under the next identity
-    batches_.clear();     // cannot be retried after the identity reset
+void TransactionalProducerImpl::enterFatal_(uint16_t errorCode, uint64_t exceptOpId) {
+    // Terminal (Kafka ProducerFencedException): nothing is ever sent again.
+    state_ = SFatalError{errorCode};
+    partitions_.clear();
+    batches_.clear();
     reqs_.clear();
     publishStatus_();
-    // Every pending op completes Fenced — after the table is emptied (a
-    // handler may issue a new op, e.g. initTransactions).
-    std::vector<UserOp> ops = std::move(ops_);
-    ops_.clear();
+    // Every pending op completes Fenced — after the tables are emptied (a
+    // handler may issue a new op: it is refused Fenced).
+    std::vector<UserOp> ops;
+    for (std::size_t i = 0; i < ops_.size();) {
+        if (ops_[i].id == exceptOpId) { ++i; continue; }
+        ops.push_back(std::move(ops_[i]));
+        ops_.erase(ops_.begin() + static_cast<std::ptrdiff_t>(i));
+    }
     for (UserOp& op : ops) {
-        complete_(op, OpStatus::Fenced, static_cast<uint16_t>(kProducerFenced),
-                  "TransactionalProducer: ProducerFenced — re-initialize");
+        complete_(op, OpStatus::Fenced, errorCode, "TransactionalProducer: fenced — fatal");
     }
 }
 
@@ -444,7 +534,6 @@ int64_t TransactionalProducerImpl::testRequestCorrId(uint8_t kind) const noexcep
     }
     return 0;
 }
-
 // ---------------------------------------------------------------------------
 // Duty cycle
 // ---------------------------------------------------------------------------
@@ -513,56 +602,45 @@ bool TransactionalProducerImpl::dataSettled_() const noexcept {
 }
 
 void TransactionalProducerImpl::gateEndTxn_(int64_t nowNs) {
-    (void)nowNs;
-    for (const auto& op : ops_) {
-        if (std::holds_alternative<UserOp::Ending>(op.phase)) return;  // one EndTxn at a time
-    }
     uint64_t id = 0;
-    bool commit = false;
-    int64_t deadline = 0;
-    for (const auto& op : ops_) {
-        if (std::holds_alternative<UserOp::AwaitData>(op.phase)) {
-            id = op.id;
-            commit = op.commit;
-            deadline = op.deadlineNs;
-            break;
-        }
-    }
-    if (id == 0 || !dataSettled_()) return;
-    if (commit && txnFailed_) {
-        // TX-6b: a record of this txn never became durable (or its partition
-        // was refused): never write a commit marker over it.
-        const uint16_t code = failCode_;
-        resetTxn_();
-        if (code != 0) {
-            completeAndErase_(id, OpStatus::BrokerError, code,
-                              "EndTxn: commit refused — AddPartitionsToTxn failed for a partition");
-        } else {
-            completeAndErase_(id, OpStatus::DeliveryFailed, 0,
-                              "EndTxn: commit aborted — a data batch was not durably acknowledged");
-        }
-        return;
-    }
-    if (producerId_ == kNoPid) {
-        completeAndErase_(id, OpStatus::BrokerError, static_cast<uint16_t>(kInvalidTxnState),
-                          "EndTxn: no producerId — call initTransactions first");
-        return;
-    }
+    if (const auto* c = std::get_if<SCommitting>(&state_)) id = c->opId;
+    else if (const auto* a = std::get_if<SAborting>(&state_)) id = a->opId;
+    if (id == 0) return;
+    UserOp* op = findOp_(id);
+    if (op == nullptr || !std::holds_alternative<UserOp::AwaitData>(op->phase) || !dataSettled_()) return;
+    // I-4: EndTxn's retry budget starts now (the data wait does not consume it).
+    op->deadlineNs = opDeadline_(nowNs);
+    const int64_t deadline = op->deadlineNs;
     const int64_t corr = addRequest_(ReqKind::EndTxn, id, deadline);
     if (UserOp* o = findOp_(id)) o->phase = UserOp::Ending{corr};
-    resetTxn_();  // the transaction is decided: no longer active
+    // The local transaction state resets only on EndTxn's final answer.
 }
 
 void TransactionalProducerImpl::sweep_(int64_t nowNs) {
     // User ops past their deadline: Timeout (exactly once; their requests go).
     for (;;) {
         uint64_t expired = 0;
+        OpKind   kind    = OpKind::InitTransactions;
         for (const auto& op : ops_) {
-            if (nowNs >= op.deadlineNs) { expired = op.id; break; }
+            if (nowNs >= op.deadlineNs) { expired = op.id; kind = op.kind; break; }
         }
         if (expired == 0) break;
         eraseReqsOf_(expired);
+        if (const auto* in = std::get_if<SInitializing>(&state_); in != nullptr && in->opId == expired) {
+            state_ = SUninitialized{};  // init may be retried
+            publishStatus_();
+        } else if (const auto* c = std::get_if<SCommitting>(&state_); c != nullptr && c->opId == expired) {
+            // In doubt (EndTxn may or may not have landed): never Ready with an
+            // open broker transaction — the app aborts (retriable).
+            state_ = SAbortableError{OpStatus::Timeout, 0};
+            dropWaiting_();
+            publishStatus_();
+        } else if (const auto* a = std::get_if<SAborting>(&state_); a != nullptr && a->opId == expired) {
+            state_ = SAbortableError{OpStatus::Timeout, 0};  // abort again
+            publishStatus_();
+        }
         completeAndErase_(expired, OpStatus::Timeout);
+        if (kind == OpKind::SendOffsets) poison_(OpStatus::Timeout, 0);  // offsets in doubt
     }
     // AddPartitions past its deadline: the partition is refused, the txn poisoned.
     for (std::size_t i = 0; i < reqs_.size();) {
@@ -571,25 +649,27 @@ void TransactionalProducerImpl::sweep_(int64_t nowNs) {
             TxnPartitionState& ps = partition_(r.tp.topicId, r.tp.partition);
             ps.add = TxnPartitionState::Add::Failed;
             ps.waiting.clear();
-            poison_(0);
             reqs_.erase(reqs_.begin() + static_cast<std::ptrdiff_t>(i));
+            poison_(OpStatus::DeliveryFailed, 0);
         } else {
             ++i;
         }
     }
     // Produce batches past their deadline: dropped, the txn poisoned (TX-6b).
+    bool lost = false;
     for (auto it = batches_.begin(); it != batches_.end();) {
         if (nowNs >= it->second.deadlineNs) {
             it = batches_.erase(it);
-            poison_(0);
+            lost = true;
         } else {
             ++it;
         }
     }
+    if (lost) poison_(OpStatus::DeliveryFailed, 0);
 }
 
 int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
-    if (closed_) return 0;
+    if (closed_ || std::holds_alternative<SFatalError>(state_)) return 0;
     lastNowNs_ = nowNs;
     int work = 0;
     if (statusDirty_) [[unlikely]] publishStatus_();  // a snapshot the ring refused: retried
@@ -610,7 +690,8 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
         lastSessionId_ = sessionId;
     }
 
-    // F14 backoff / re-discovery (duty cycles, no wall clock).
+    // F14 backoff / re-discovery, counted in duty cycles (no wall clock; the
+    // cap's duration therefore follows the runner's idle strategy).
     for (auto& r : reqs_) {
         if (auto* b = std::get_if<TxnRequest::Backoff>(&r.state)) {
             if (b->cyclesLeft <= 1) r.state = TxnRequest::Unsent{};
@@ -624,10 +705,13 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
     }
 
     // F14 gate: AddPartitions first; a partition's records are produced only
-    // once its AddPartitions result is OK (outside a transaction: at once).
-    for (auto& [k, ps] : partitions_) {
-        if (ps.waiting.empty()) continue;
-        if (txnActive_) {
+    // once its AddPartitions result is OK.  Records exist only in an open
+    // transaction (InTransaction, or Committing — flushed before EndTxn).
+    const bool flowing = std::holds_alternative<SInTransaction>(state_) ||
+                         std::holds_alternative<SCommitting>(state_);
+    if (flowing) {
+        for (auto& [k, ps] : partitions_) {
+            if (ps.waiting.empty()) continue;
             if (ps.add == TxnPartitionState::Add::NotAdded) {
                 ps.add = TxnPartitionState::Add::Adding;
                 TxnRequest r;
@@ -639,16 +723,15 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
                 reqs_.push_back(std::move(r));
                 ++work;
             }
-            if (ps.add != TxnPartitionState::Add::Added) continue;
-        }
-        if (sessionId == 0) continue;
-        while (!ps.waiting.empty()) {
-            produce_(ps, ps.waiting.front(), nowNs, sessionId, sendFn, work);
-            ps.waiting.pop_front();
+            if (ps.add != TxnPartitionState::Add::Added || sessionId == 0) continue;
+            while (!ps.waiting.empty()) {
+                produce_(ps, ps.waiting.front(), nowNs, sessionId, sendFn, work);
+                ps.waiting.pop_front();
+            }
         }
     }
 
-    // TX-6: EndTxn once every record is acked (may add the EndTxn request).
+    // TX-6: EndTxn once the data settled (may add the EndTxn request).
     gateEndTxn_(nowNs);
 
     if (sessionId == 0) return work;
@@ -687,8 +770,8 @@ void TransactionalProducerImpl::onInitProducerIdResponse(const uint8_t* buf, std
         eraseReq_(opt->correlationId);
         producerId_    = opt->producerId;
         producerEpoch_ = opt->producerEpoch;
-        // A fresh identity restarts every partition's sequence.
-        for (auto& [k, ps] : partitions_) ps.nextBaseSequence = 0;
+        for (auto& [k, ps] : partitions_) ps.nextBaseSequence = 0;  // a fresh identity
+        state_ = SReady{};
         publishStatus_();  // published BEFORE the completion: the app reads it after
         completeAndErase_(opId, OpStatus::Ok);
         return;
@@ -697,10 +780,13 @@ void TransactionalProducerImpl::onInitProducerIdResponse(const uint8_t* buf, std
         retry_(*r, v);
         return;
     case Verdict::Fenced:
-        handleFencing_();
+        eraseReq_(opt->correlationId);
+        enterFatal_(static_cast<uint16_t>(opt->errorCode));
         return;
     case Verdict::Fail:
         eraseReq_(opt->correlationId);
+        state_ = SUninitialized{};  // init may be retried
+        publishStatus_();
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode),
                           "InitProducerId failed");
         return;
@@ -727,16 +813,17 @@ void TransactionalProducerImpl::onAddPartitionsToTxnResponse(const uint8_t* buf,
         retry_(*r, v);
         return;
     case Verdict::Fenced:
-        handleFencing_();
+        eraseReq_(opt->correlationId);
+        enterFatal_(static_cast<uint16_t>(ec));
         return;
     case Verdict::Fail: {
         // F14: no longer ignored — the partition is not in the transaction:
-        // its records are never produced, and a commit must fail.
+        // its records are never produced, the transaction is abortable only.
         eraseReq_(opt->correlationId);
         TxnPartitionState& ps = partition_(tp.topicId, tp.partition);
         ps.add = TxnPartitionState::Add::Failed;
         ps.waiting.clear();
-        poison_(static_cast<uint16_t>(ec));
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec));
         return;
     }
     }
@@ -763,12 +850,14 @@ void TransactionalProducerImpl::onAddOffsetsToTxnResponse(const uint8_t* buf, st
         retry_(*r, v);
         return;
     case Verdict::Fenced:
-        handleFencing_();
+        eraseReq_(opt->correlationId);
+        enterFatal_(static_cast<uint16_t>(opt->errorCode));
         return;
     case Verdict::Fail:
         eraseReq_(opt->correlationId);
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode),
                           "AddOffsetsToTxn failed");
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode));
         return;
     }
 }
@@ -779,11 +868,25 @@ void TransactionalProducerImpl::onTxnOffsetCommitResponse(const uint8_t* buf, st
     TxnRequest* r = findReq_(opt->correlationId);
     if (r == nullptr || r->kind != ReqKind::TxnOffsetCommit) return;
     const uint64_t opId = r->opId;
+    // M-12: the most severe per-partition verdict decides (fenced > failed >
+    // re-discover > retry > ok) — a 27 never masks a non-retriable error.
+    Verdict v = Verdict::Ok;
     int16_t ec = 0;
+    auto rank = [](Verdict x) {
+        switch (x) {
+        case Verdict::Fenced:     return 4;
+        case Verdict::Fail:       return 3;
+        case Verdict::Rediscover: return 2;
+        case Verdict::Retry:      return 1;
+        default:                  return 0;
+        }
+    };
     for (std::size_t i = 0; i < opt->results.size(); ++i) {
-        if (opt->results[i].errorCode != 0) { ec = opt->results[i].errorCode; break; }
+        const int16_t code = opt->results[i].errorCode;
+        const Verdict x    = classify_(ReqKind::TxnOffsetCommit, code);
+        if (rank(x) > rank(v)) { v = x; ec = code; }
     }
-    switch (const Verdict v = classify_(ReqKind::TxnOffsetCommit, ec)) {
+    switch (v) {
     case Verdict::Ok:
         eraseReq_(opt->correlationId);
         completeAndErase_(opId, OpStatus::Ok);
@@ -793,11 +896,13 @@ void TransactionalProducerImpl::onTxnOffsetCommitResponse(const uint8_t* buf, st
         retry_(*r, v);
         return;
     case Verdict::Fenced:
-        handleFencing_();
+        eraseReq_(opt->correlationId);
+        enterFatal_(static_cast<uint16_t>(ec));
         return;
     case Verdict::Fail:
         eraseReq_(opt->correlationId);
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(ec), "TxnOffsetCommit failed");
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec));
         return;
     }
 }
@@ -811,6 +916,7 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
     switch (const Verdict v = classify_(ReqKind::EndTxn, opt->errorCode)) {
     case Verdict::Ok:
         eraseReq_(opt->correlationId);
+        finishTxn_();  // the final answer: only now is the transaction closed locally
         completeAndErase_(opId, OpStatus::Ok);
         return;
     case Verdict::Retry:
@@ -818,12 +924,14 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
         retry_(*r, v);
         return;
     case Verdict::Fenced:
-        handleFencing_();
-        return;
-    case Verdict::Fail:  // 19 InvalidTxnState
         eraseReq_(opt->correlationId);
+        enterFatal_(static_cast<uint16_t>(opt->errorCode));
+        return;
+    case Verdict::Fail:  // 19 InvalidTxnState: fatal in Kafka
+        eraseReq_(opt->correlationId);
+        enterFatal_(static_cast<uint16_t>(opt->errorCode), /*except=*/opId);
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode),
-                          "EndTxn failed: InvalidTxnState");
+                          "EndTxn failed: InvalidTxnState (fatal)");
         return;
     }
 }
@@ -838,16 +946,22 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
         batches_.erase(it);
         return;
     }
-    if (ec == kOutOfOrderSequence || ec == kInvalidProducerEpoch || ec == kProducerFenced) {
+    if (ec == kInvalidProducerEpoch || ec == kProducerFenced) {
         batches_.erase(it);
-        handleFencing_();
+        enterFatal_(static_cast<uint16_t>(ec));
+        return;
+    }
+    if (ec == kOutOfOrderSequence) {
+        // M-2: a sequence error, not a fence — the transaction is abortable.
+        batches_.erase(it);
+        poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec));
         return;
     }
     InFlightBatch& ib = it->second;
     if (ib.retryCount >= InFlightBatch::kMaxRetries) {
-        // Exhausted: this data never became durable — a commit must fail (TX-6b).
+        // Exhausted: this data never became durable — the txn must abort (TX-6b).
         batches_.erase(it);
-        poison_(0);
+        poison_(OpStatus::DeliveryFailed, 0);
         return;
     }
     ++ib.retryCount;
@@ -863,12 +977,13 @@ void TransactionalProducerImpl::failAll() {
     closed_ = true;
     reqs_.clear();
     batches_.clear();
-    for (auto& [k, ps] : partitions_) ps.waiting.clear();
+    dropWaiting_();
     // The final snapshot, then the channel is finished (handles stop calling in).
     TxnStatus s;
     s.producerId    = producerId_;
     s.producerEpoch = producerEpoch_;
-    s.txnActive     = txnActive_ ? 1 : 0;
+    s.state         = static_cast<uint8_t>(stateDuty());
+    s.txnActive     = txnOpen_(stateDuty()) ? 1 : 0;
     (void)status.publishFinal(s);
     status.close();
     std::vector<UserOp> ops = std::move(ops_);

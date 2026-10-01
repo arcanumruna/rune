@@ -83,6 +83,12 @@ struct ProducerConfig {
                                           //  hard — 32 batches keeps the pipe full while the
                                           //  idempotent seq window / ackRing bound memory)
     int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
+    // F8c fix round 1 (I-4): TransactionalProducer only — the deadline of
+    // initTransactions / sendOffsetsToTransaction / commit / abort (Kafka
+    // max.block.ms; >= the default transaction timeout).  EndTxn gets a fresh
+    // one when it is created (the wait for in-flight data does not consume
+    // its retry budget).  Data batches and AddPartitions use produceTimeoutMs.
+    int64_t transactionOpTimeoutMs = 60'000;
     int32_t maxFrameBytes    = 65536;   // hard per-FRAME wire cap (≤ this many bytes/frame),
                                          // independent of batchBytes — bounds fragmentation.
     int64_t deliveryTimeoutMs = 30000;  // total time to keep retransmitting before failing.

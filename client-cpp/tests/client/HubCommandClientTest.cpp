@@ -869,9 +869,10 @@ const std::vector<uint8_t> kTxnVal{1, 2, 3};
 
 // Client close completes EVERY outstanding txn token Closed, exactly once,
 // whatever its phase (InitProducerId in flight, two-phase sendOffsets, an
-// EndTxn waiting for its records, another queued behind it): CQ targets
-// before the queue is handed back (finished()), handler targets after.  Later
-// ops are rejected synchronously.  Both runner modes.
+// EndTxn waiting for its records): CQ targets before the queue is handed back
+// (finished()), handler targets after.  Ops the transaction state machine
+// refuses (abort / init while committing — fix round 1) complete at once,
+// also exactly once.  Later ops are rejected synchronously.  Both runner modes.
 TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
     {
         SCOPED_TRACE("Invoker");
@@ -891,27 +892,45 @@ TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
         auto commit = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
         auto abort  = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.abortTransaction(q, t); });
         auto init2  = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        // A handler target on a refused op: delivered once, at once.
         HandlerLedger led;
         ASSERT_EQ(tp.initTransactions(led.handler(), 99), rc::OpResult::Accepted);
         for (auto* op : {&offs, &commit, &abort, &init2}) ASSERT_TRUE(op->accepted()) << op->describe();
-        ASSERT_TRUE(r.drive([&] {
-            return r.gw.addPartitions >= 1 && r.gw.addOffsets >= 1 && r.gw.initPids >= 3;
-        })) << "the requests never reached the coordinator";
+        ASSERT_TRUE(r.drive([&] { return r.gw.addPartitions >= 1 && r.gw.addOffsets >= 1; }))
+            << "the requests never reached the coordinator";
         r.settle(200);
-        for (auto* op : {&offs, &commit, &abort, &init2}) EXPECT_FALSE(op->ready()) << op->describe();
-        EXPECT_EQ(led.times, 0);
+        for (auto* op : {&offs, &commit}) EXPECT_FALSE(op->ready()) << op->describe();
+        for (auto* op : {&abort, &init2}) {  // refused by state (Committing): at once
+            ASSERT_TRUE(op->ready());
+            EXPECT_EQ(op->status(), rc::OpStatus::BrokerError);
+        }
+        EXPECT_EQ(led.times, 1);
+        EXPECT_EQ(led.last.status, rc::OpStatus::BrokerError);
 
         r.client.close();
-        for (auto* op : {&offs, &commit, &abort, &init2}) {
+        for (auto* op : {&offs, &commit}) {
             ASSERT_TRUE(op->ready()) << "stranded by close()";
             EXPECT_EQ(op->status(), rc::OpStatus::Closed);
             EXPECT_EQ(r.cq.timesCompleted(op->token()), 1);
         }
+        for (auto* op : {&abort, &init2}) EXPECT_EQ(r.cq.timesCompleted(op->token()), 1);
         EXPECT_TRUE(r.cq.q().finished());
         EXPECT_EQ(led.times, 1);
-        EXPECT_EQ(led.last.status, rc::OpStatus::Closed);
         EXPECT_EQ(tp.commitTransaction(led.handler(), 100), rc::OpResult::Closed);
         EXPECT_EQ(led.times, 1);
+        // A handler-target op still pending at close completes Closed (after the hand-back).
+    }
+    {
+        SCOPED_TRACE("Invoker, handler pending at close");
+        HubRig r(4022);
+        auto tp = r.client.transactionalProducer("tx-close-handler");
+        HandlerLedger led;
+        ASSERT_EQ(tp.initTransactions(led.handler(), 5), rc::OpResult::Accepted);  // never connected
+        r.settle(50);
+        EXPECT_EQ(led.times, 0);
+        r.client.close();
+        EXPECT_EQ(led.times, 1);
+        EXPECT_EQ(led.last.status, rc::OpStatus::Closed);
     }
     {
         SCOPED_TRACE("Thread");

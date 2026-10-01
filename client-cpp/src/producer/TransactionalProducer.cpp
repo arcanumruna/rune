@@ -197,4 +197,11 @@ bool TransactionalProducer::transactionActive() const noexcept {
     return impl_->appStatusCache.txnActive != 0;
 }
 
+TxnState TransactionalProducer::state() const noexcept {
+    if (!impl_) return TxnState::FatalError;
+    if (onDutyThread_()) return impl_->stateDuty();
+    (void)impl_->status.drainLatest(impl_->appStatusCache);
+    return static_cast<TxnState>(impl_->appStatusCache.state);
+}
+
 } // namespace rune::client
