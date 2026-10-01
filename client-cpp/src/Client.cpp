@@ -18,9 +18,9 @@
 //     Completions back (producer-close).
 
 #include <rune/client/Client.h>
-#include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
+#include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/GroupMessages.h>
@@ -424,7 +424,7 @@ void Client::closeImpl_() {
 
 
     // M2 FIX: clear the seed session's redirect latch on close so it does not
-    // startRing.  Safe as a plain write: the runner thread was joined above, so this
+    // stay latched.  Safe as a plain write: the runner thread was joined above, so this
     // runs single-threaded (no concurrent agent-thread access) — Task 1.1.
     redirectPending() = false;
 

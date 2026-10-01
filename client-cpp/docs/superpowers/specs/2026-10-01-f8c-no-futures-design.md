@@ -407,11 +407,11 @@ Client::close():  stopped_ -> join runner -> close command ring (3.2) -> final d
 ### 3.4 Runner start handshake (I1)
 
 `std::promise go` is replaced by a stack-local 1-record `OneToOneRingBuffer` start latch:
-1. the runner writes `dutyThreadId_` as its first action;
-2. it then publishes a record;
-3. the constructor spins with `YieldingIdleStrategy` until it reads that record (bounded), then returns.
+1. the runner writes `dutyThreadId_` (its own id) as its first action;
+2. it then publishes one record, and then calls `producerClose()` as its last access to the ring;
+3. the constructor spins with `YieldingIdleStrategy` until it has read that record **and** observes `producerClosed()`, then returns. There is no timeout: the runner publishes in its first statements, so the wait ends as soon as the runner is scheduled (time-independent).
 
-The ring read gives the happens-before edge; the thread id is read after it.
+The ring read (acquire on the record header, paired with the runner's release) gives the happens-before edge; the thread id is read after it. Waiting for the producer-closed word as well is required for memory safety: `write()` stores the tail after the record header and the ring lives in the constructor's frame, so returning on the record alone would let the runner's tail and closed stores land in a dead stack frame. The producer-closed word is the runner's final store to the ring, so observing it proves the ring is no longer in use.
 
 ---
 
