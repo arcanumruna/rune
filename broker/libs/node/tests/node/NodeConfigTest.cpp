@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/Worker.h>   // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <filesystem>
 
@@ -1390,6 +1391,35 @@ TEST(NodeConfig, IoRingDepthsAllThreeOverridden) {
     EXPECT_EQ(res.config->memoryLogRingBytes,    4 * 1024 * 1024);
 }
 
+// F15 S3 fix round 1 (owed-cap ruling): RUNE_WORKER_MAX_OWED_RETURNS.
+TEST(ReturnOverflowRegression, MaxOwedReturnsParsedFromEnv) {
+    auto res0 = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res0.config.has_value()) << res0.error;
+    EXPECT_EQ(res0.config->workerMaxOwedReturns, 4096);
+    auto base = base1node();
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "8192";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->workerMaxOwedReturns, 8192);
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "20000";   // parsed; the range is enforced at start()
+    auto res2 = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res2.config.has_value()) << res2.error;
+    EXPECT_EQ(res2.config->workerMaxOwedReturns, 20000);
+    // Re-review 1 m-a: 0 / negative are kept (start() refuses them loudly),
+    // non-numeric is a configuration error — never silently the default.
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "0";
+    auto res3 = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res3.config.has_value()) << res3.error;
+    EXPECT_EQ(res3.config->workerMaxOwedReturns, 0);
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "-5";
+    auto res4 = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res4.config.has_value()) << res4.error;
+    EXPECT_EQ(res4.config->workerMaxOwedReturns, -5);
+    base["RUNE_WORKER_MAX_OWED_RETURNS"] = "lots";
+    auto res5 = rune::node::parseNodeConfig(fakeEnv(base));
+    EXPECT_FALSE(res5.config.has_value()) << "a non-numeric value must be a configuration error";
+}
+
 TEST(NodeConfig, WorkerRingBytesDefaultValues) {
     // No overrides — both per-worker ring byte capacities carry the 32 MiB default.
     auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
@@ -2117,7 +2147,14 @@ TEST(ProduceBatchLimitRegression, IntakeLimitNeverExceedsOneFrameOnAnyHop) {
     for (auto env : {base3node(), base1node()}) {
         const NodeConfig c = parsedOrDie(env);
         EXPECT_GT(c.produceIntakeLimit(), 0);
-        EXPECT_LE(c.produceIntakeLimit(), c.produceBatchFrameCeiling());
+        // Integration wave 2: a thin wrapper over THE one formula.
+        EXPECT_EQ(static_cast<std::size_t>(c.produceIntakeLimit()),
+                  Worker::maxAcceptableBatchBytes(
+                      static_cast<std::size_t>(c.workerIngressRingBytes),
+                      static_cast<std::size_t>(c.workerReturnRingBytes),
+                      static_cast<std::size_t>(c.replicationOutboundRingBytes),
+                      static_cast<std::size_t>(c.aeronTermBufferBytes),
+                      static_cast<std::size_t>(c.aeronTermBufferBytes)));
         EXPECT_LE(c.produceIntakeLimit(), NodeConfig::kDefaultMaxProduceBatchBytes);
     }
 }
@@ -2154,17 +2191,30 @@ TEST(ProduceBatchLimitRegression, AeronTermFrameBoundsTheLimit) {
 TEST(ProduceBatchLimitRegression, WorkerIngressFrameBoundsTheLimitEvenSingleNode) {
     auto env = base1node();
     env["RUNE_WORKER_INGRESS_RING_BYTES"] = "16777216";   // /8 = 2 MiB - op framing
+    // Integration wave 2: replication terms apply single-node too — give them
+    // room so the op ring is the binding hop.
+    env["RUNE_REPL_OUTBOUND_RING_BYTES"]  = "33554432";
+    env["RUNE_AERON_TERM_BUFFER_BYTES"]   = "33554432";
     const NodeConfig c = parsedOrDie(env);
     EXPECT_LT(c.produceIntakeLimit(), 2 * 1024 * 1024) << "an op that cannot be claimed would throw";
     EXPECT_GT(c.produceIntakeLimit(), 2 * 1024 * 1024 - 1024);
 }
 
-TEST(ProduceBatchLimitRegression, SingleNodeIgnoresReplicationHops) {
-    auto env = base1node();
-    env["RUNE_REPL_OUTBOUND_RING_BYTES"] = "1048576";     // tiny, but nothing replicates
-    env["RUNE_AERON_TERM_BUFFER_BYTES"]  = "1048576";
-    const NodeConfig c = parsedOrDie(env);
-    EXPECT_GT(c.produceIntakeLimit(), 1 * 1024 * 1024);
+// Integration wave 2 (F18 ⇄ F15 S3 merge plan): single-node ALWAYS applies the
+// replication terms — the limit must not change when a node later joins a
+// cluster (F18's original single-node exemption is overruled).
+TEST(ProduceBatchLimitRegression, SingleNodeAppliesReplicationHops) {
+    auto env1 = base1node();
+    env1["RUNE_REPL_OUTBOUND_RING_BYTES"] = "1048576";     // /8 = 128 KiB frame
+    env1["RUNE_AERON_TERM_BUFFER_BYTES"]  = "1048576";
+    const NodeConfig c1 = parsedOrDie(env1);
+    EXPECT_LT(c1.produceIntakeLimit(), 128 * 1024);
+    auto env3 = base3node();
+    env3["RUNE_REPL_OUTBOUND_RING_BYTES"] = "1048576";
+    env3["RUNE_AERON_TERM_BUFFER_BYTES"]  = "1048576";
+    const NodeConfig c3 = parsedOrDie(env3);
+    EXPECT_EQ(c1.produceIntakeLimit(), c3.produceIntakeLimit())
+        << "the limit must not change when a node joins a cluster";
 }
 
 TEST(ProduceBatchLimitRegression, BenchProfileAccepts2MiBBatches) {

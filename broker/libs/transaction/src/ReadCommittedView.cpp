@@ -16,6 +16,7 @@
 #include <rune/transaction/ControlMarker.h>
 
 #include <rune/storage/Log.h>
+#include <rune/storage/LogReadView.h>
 // rune-protocol RecordBatch: little-endian field accessors (unified).
 #include <rune/protocol/RecordBatch.h>
 
@@ -56,51 +57,177 @@ inline int64_t extractProducerId(const uint8_t* buf, std::size_t pos,
 } // anonymous namespace
 
 // ===========================================================================
-// LsoTracker
+// LsoTracker — flat pid table + first-offset FIFO (F15 §2.2, N4)
 // ===========================================================================
 
-void LsoTracker::onProduceBatch(ProducerId producerId,
-                                 int64_t    batchBaseOffset) noexcept
-{
-    if (producerId < 0) return; // non-transactional batch; no effect on LSO
+namespace {
+// splitmix64 finaliser: spreads sequential pids across the table.
+inline uint64_t mixPid(int64_t pid) noexcept {
+    uint64_t x = static_cast<uint64_t>(pid);
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+inline std::size_t roundUpPow2(std::size_t n) noexcept {
+    std::size_t c = 1;
+    while (c < n) c <<= 1;
+    return c;
+}
+} // namespace
 
-    auto it = openTxns_.find(producerId);
-    if (it == openTxns_.end()) {
-        // First data batch for this producer: open a new transaction.
-        openTxns_[producerId]           = batchBaseOffset;
-        byFirstOffset_[batchBaseOffset] = producerId;
+void LsoTracker::reserve(std::size_t openTxnCapacity)
+{
+    const std::size_t want = roundUpPow2(openTxnCapacity == 0 ? 1 : openTxnCapacity);
+    if (want <= fifo_.size()) return;
+    rebuild_(want);
+}
+
+std::size_t LsoTracker::slotFor_(ProducerId pid) const noexcept
+{
+    return static_cast<std::size_t>(mixPid(pid)) & tableMask_;
+}
+
+const LsoTracker::Slot* LsoTracker::find_(ProducerId pid) const noexcept
+{
+    if (table_.empty()) return nullptr;
+    // Load factor <= 1/2 (live_ <= fifo capacity == table size / 2): a free
+    // slot always terminates the probe.
+    for (std::size_t i = slotFor_(pid);; i = (i + 1) & tableMask_) {
+        const Slot& s = table_[i];
+        if (s.producerId == pid) return &s;
+        if (s.producerId == kEmptyPid) return nullptr;
     }
-    // If already tracked, the firstOffset stays (the earlier write).
+}
+
+LsoTracker::Slot* LsoTracker::find_(ProducerId pid) noexcept
+{
+    return const_cast<Slot*>(static_cast<const LsoTracker*>(this)->find_(pid));
+}
+
+void LsoTracker::insertSlot_(ProducerId pid, uint64_t pos) noexcept
+{
+    std::size_t i = slotFor_(pid);
+    while (table_[i].producerId != kEmptyPid) i = (i + 1) & tableMask_;
+    table_[i].producerId = pid;
+    table_[i].pos        = pos;
+}
+
+void LsoTracker::eraseSlot_(Slot* s) noexcept
+{
+    // Backward-shift deletion (no tombstones): pull every later member of the
+    // probe run whose home slot is not cyclically in (hole, j] into the hole.
+    std::size_t hole = static_cast<std::size_t>(s - table_.data());
+    std::size_t j = hole;
+    for (;;) {
+        j = (j + 1) & tableMask_;
+        if (table_[j].producerId == kEmptyPid) break;
+        const std::size_t home = slotFor_(table_[j].producerId);
+        const bool stays = (hole <= j) ? (hole < home && home <= j)
+                                       : (hole < home || home <= j);
+        if (!stays) {
+            table_[hole] = table_[j];
+            hole = j;
+        }
+    }
+    table_[hole].producerId = kEmptyPid;
+}
+
+void LsoTracker::rebuild_(std::size_t newFifoCap)
+{
+    // Cold: re-linearise the live entries (in FIFO order) into fresh storage.
+    std::vector<FifoEntry> nf(newFifoCap);
+    std::size_t n = 0;
+    for (uint64_t p = head_; p != tail_; ++p) {
+        const FifoEntry& e = fifo_[p & fifoMask_];
+        if (e.live) nf[n++] = e;
+    }
+    fifo_.swap(nf);
+    table_.assign(newFifoCap * 2, Slot{});
+    fifoMask_  = newFifoCap - 1;
+    tableMask_ = newFifoCap * 2 - 1;
+    head_ = 0;
+    tail_ = n;
+    for (uint64_t p = 0; p < n; ++p) insertSlot_(fifo_[p].producerId, p);
+}
+
+void LsoTracker::ensureRoom_()
+{
+    if (fifo_.empty()) {                       // first insert: lazy default reserve
+        rebuild_(kDefaultOpenTxnCapacity);
+        return;
+    }
+    if (tail_ - head_ < fifo_.size()) return;  // room at the tail
+    if (live_ * 2 <= fifo_.size()) {
+        // Mostly dead entries behind a long-open front: compact IN PLACE
+        // (allocation-free; amortised O(1) per insert).
+        uint64_t w = head_;
+        for (uint64_t r = head_; r != tail_; ++r) {
+            const FifoEntry e = fifo_[r & fifoMask_];
+            if (!e.live) continue;
+            if (w != r) {
+                fifo_[w & fifoMask_] = e;
+                find_(e.producerId)->pos = w;
+            }
+            ++w;
+        }
+        tail_ = w;
+        return;
+    }
+    rebuild_(fifo_.size() * 2);                // cold doubling
+    ++growths_;
+}
+
+void LsoTracker::popDeadFront_() noexcept
+{
+    while (head_ != tail_ && !fifo_[head_ & fifoMask_].live) ++head_;
+    if (head_ == tail_) head_ = tail_ = 0;     // empty: restart at slot 0
+}
+
+void LsoTracker::onProduceBatch(ProducerId producerId, int64_t batchBaseOffset)
+{
+    if (producerId < 0) return;               // non-transactional batch; no effect on LSO
+    if (find_(producerId) != nullptr) return; // already open: keep the earlier firstOffset
+
+    ensureRoom_();
+    uint64_t pos = tail_;
+    // Keep the FIFO in firstOffset order.  Under L1 this loop never runs.
+    if (pos != head_ && fifo_[(pos - 1) & fifoMask_].firstOffset > batchBaseOffset) [[unlikely]] {
+        ++outOfOrderInserts_;
+        while (pos != head_ && fifo_[(pos - 1) & fifoMask_].firstOffset > batchBaseOffset) {
+            const FifoEntry prev = fifo_[(pos - 1) & fifoMask_];
+            fifo_[pos & fifoMask_] = prev;
+            if (prev.live) find_(prev.producerId)->pos = pos;
+            --pos;
+        }
+    }
+    fifo_[pos & fifoMask_] = FifoEntry{batchBaseOffset, producerId, true};
+    ++tail_;
+    insertSlot_(producerId, pos);
+    ++live_;
 }
 
 int64_t LsoTracker::onControlMarker(ProducerId producerId,
-                                     int64_t    /*markerBaseOffset*/,
-                                     bool       /*commit*/) noexcept
+                                    int64_t    /*markerBaseOffset*/,
+                                    bool       /*commit*/) noexcept
 {
-    auto it = openTxns_.find(producerId);
-    if (it == openTxns_.end()) return -1; // not tracked
-
-    int64_t firstOff = it->second;
-    openTxns_.erase(it);
-
-    // Remove from byFirstOffset_.
-    auto fit = byFirstOffset_.find(firstOff);
-    if (fit != byFirstOffset_.end() && fit->second == producerId) {
-        byFirstOffset_.erase(fit);
-    }
-
+    if (producerId < 0) return -1;
+    Slot* s = find_(producerId);
+    if (s == nullptr) return -1;              // not tracked (non-txn or duplicate marker)
+    FifoEntry& e = fifo_[s->pos & fifoMask_];
+    const int64_t firstOff = e.firstOffset;
+    e.live = false;
+    eraseSlot_(s);
+    --live_;
+    popDeadFront_();
     return firstOff;
 }
 
 int64_t LsoTracker::lso(int64_t hw) const noexcept
 {
-    if (openTxns_.empty()) {
-        return hw; // no open transactions → LSO == HW
-    }
-    // LSO = min firstOffset over all open txns.
-    assert(!byFirstOffset_.empty());
-    int64_t minFirst = byFirstOffset_.begin()->first;
-    // Clamp to [0, hw].
+    if (live_ == 0) return hw;                // no open transactions → LSO == HW
+    // The front is always the oldest LIVE entry (dead ones are popped eagerly).
+    const int64_t minFirst = fifo_[head_ & fifoMask_].firstOffset;
     if (minFirst > hw) return hw;
     if (minFirst < 0)  return 0;
     return minFirst;
@@ -108,8 +235,17 @@ int64_t LsoTracker::lso(int64_t hw) const noexcept
 
 int64_t LsoTracker::firstOffsetOf(ProducerId producerId) const noexcept
 {
-    auto it = openTxns_.find(producerId);
-    return (it != openTxns_.end()) ? it->second : -1;
+    if (producerId < 0) return -1;
+    const Slot* s = find_(producerId);
+    return s ? fifo_[s->pos & fifoMask_].firstOffset : -1;
+}
+
+void LsoTracker::clear() noexcept
+{
+    // N4: both indexes are reset here, in one place.
+    for (auto& sl : table_) sl.producerId = kEmptyPid;
+    head_ = tail_ = 0;
+    live_ = 0;
 }
 
 // ===========================================================================
@@ -118,28 +254,88 @@ int64_t LsoTracker::firstOffsetOf(ProducerId producerId) const noexcept
 
 void AbortedTxnIndex::onAbortMarker(ProducerId producerId,
                                      int64_t    firstDataOffset,
-                                     int64_t    abortMarkerOffset) noexcept
+                                     int64_t    abortMarkerOffset)
 {
-    // Keep sorted by firstOffset ascending for consistent ordering.
-    AbortedTxnRange range{producerId, firstDataOffset, abortMarkerOffset};
-    auto it = std::lower_bound(ranges_.begin(), ranges_.end(), range,
-                                [](const AbortedTxnRange& a, const AbortedTxnRange& b) {
-                                    return a.firstOffset < b.firstOffset;
-                                });
+    const AbortedTxnRange range{producerId, firstDataOffset, abortMarkerOffset};
+    if (ranges_.size() == ranges_.capacity()) [[unlikely]] ++growths_;   // cold growth (counted)
+    const int64_t span = abortMarkerOffset - firstDataOffset;
+    if (span > maxSpan_) maxSpan_ = span;
+    if (ranges_.empty() || ranges_.back().lastOffset <= abortMarkerOffset) [[likely]] {
+        ranges_.push_back(range);                      // marker order (L1): O(1)
+        return;
+    }
+    // Out of order (cold): keep lastOffset order.
+    auto it = std::upper_bound(ranges_.begin(), ranges_.end(), abortMarkerOffset,
+                               [](int64_t off, const AbortedTxnRange& r) { return off < r.lastOffset; });
     ranges_.insert(it, range);
 }
 
 bool AbortedTxnIndex::isAborted(ProducerId producerId,
                                   int64_t    batchBaseOffset) const noexcept
 {
-    for (const auto& r : ranges_) {
-        if (r.producerId == producerId && r.contains(batchBaseOffset)) return true;
+    if (ranges_.empty()) return false;
+    auto it = std::lower_bound(ranges_.begin(), ranges_.end(), batchBaseOffset,
+                               [](const AbortedTxnRange& r, int64_t off) { return r.lastOffset < off; });
+    const int64_t scanEnd = batchBaseOffset > std::numeric_limits<int64_t>::max() - maxSpan_
+                                ? std::numeric_limits<int64_t>::max() : batchBaseOffset + maxSpan_;
+    for (; it != ranges_.end() && it->lastOffset <= scanEnd; ++it) {
+        if (it->producerId == producerId && it->contains(batchBaseOffset)) return true;
     }
     return false;
 }
 
+void AbortedTxnIndex::pruneBelow(int64_t logStartOffset)
+{
+    auto it = std::lower_bound(ranges_.begin(), ranges_.end(), logStartOffset,
+                               [](const AbortedTxnRange& r, int64_t off) { return r.lastOffset < off; });
+    if (it == ranges_.begin()) return;
+    ranges_.erase(ranges_.begin(), it);   // cold (retention); capacity kept
+    int64_t span = 0;
+    for (const auto& r : ranges_) span = std::max(span, r.lastOffset - r.firstOffset);
+    maxSpan_ = span;
+}
+
 // ===========================================================================
-// ReadCommittedView — rebuild
+// RcBuilder — step (F15 §2.3, N2 + N3)
+// ===========================================================================
+
+RcBuilder::Result RcBuilder::step(const uint8_t* batch, std::size_t avail)
+{
+    using namespace rune::protocol::batch;
+    Result res;
+    if (batch == nullptr || avail < static_cast<std::size_t>(kRecordBatchOverhead)) return res;
+    rune::protocol::RecordBatchReader reader(batch, avail);
+    const int32_t totalLen = reader.totalLength();
+    if (totalLen <= 0 || static_cast<std::size_t>(totalLen) > avail) return res;
+    res.totalLength = totalLen;
+    res.baseOffset  = reader.baseOffset();
+    res.outcome     = Outcome::Ignored;
+
+    const auto attrs = static_cast<uint16_t>(reader.attributes());
+    if ((attrs & static_cast<uint16_t>(kAttrControl)) != 0) [[unlikely]] {
+        // Markers are recognised ONLY as real control batches (CRC-verified).
+        ControlMarkerPayload payload;
+        if (!ControlMarker::extract(batch, 0, payload, static_cast<std::size_t>(totalLen))) return res;
+        const bool commit = (payload.controlType == ControlType::Commit);
+        const int64_t firstOff = tracker_->onControlMarker(payload.producerId, res.baseOffset, commit);
+        if (!commit && firstOff >= 0)
+            abortedIndex_->onAbortMarker(payload.producerId, firstOff, res.baseOffset);
+        res.outcome = commit ? Outcome::CommitMarker : Outcome::AbortMarker;
+        return res;
+    }
+    // N3: only a TRANSACTIONAL batch opens a transaction.
+    if ((attrs & static_cast<uint16_t>(kAttrTransactional)) != 0) {
+        const int64_t producerId = reader.producerId();
+        if (producerId >= 0) {
+            tracker_->onProduceBatch(producerId, res.baseOffset);
+            res.outcome = Outcome::TxnData;
+        }
+    }
+    return res;
+}
+
+// ===========================================================================
+// ReadCommittedView — rebuild: a loop of RcBuilder::step over Log::readView
 // ===========================================================================
 
 void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
@@ -147,67 +343,38 @@ void ReadCommittedView::rebuild(rune::storage::Log* log, int64_t hw)
     assert(log != nullptr);
     tracker_->clear();
     abortedIndex_->clear();
-
     if (hw <= 0) return;
 
-    // Read all bytes up to hw in one shot (or in large chunks).
-    // We use a large maxBytes to get the full range; the HW clamping is done
-    // during the batch walk below.
-    constexpr int32_t kMaxScanBytes = std::numeric_limits<int32_t>::max() / 2;
-    auto raw = log->read(0, kMaxScanBytes);
-    if (raw.empty()) return;
-
-    // Single-pass scan using the unified little-endian RecordBatchReader for ALL batches.
-    // all-LE fix: control batches share the LE record-batch format, so RecordBatchReader
-    // can walk them. Control batches are identified by ControlMarker::isControlBatch()
-    // which reads the CONTROL attribute bit from the LE attributes field [21..22].
-    {
-        std::size_t pos = 0;
-        const uint8_t* data = raw.data();
-        std::size_t rawSize = raw.size();
-
-        while (pos < rawSize) {
-            std::size_t rem = rawSize - pos;
-            if (rem < static_cast<std::size_t>(
-                    rune::protocol::batch::kRecordBatchOverhead)) break;
-
-            // Use RecordBatchReader for ALL batches (data + control both little-endian now).
-            rune::protocol::RecordBatchReader reader(data + pos, rem);
-            int32_t totalLen   = reader.totalLength();
-            int64_t baseOffset = reader.baseOffset();
-
-            if (totalLen <= 0 || pos + static_cast<std::size_t>(totalLen) > rawSize)
-                break;
-
-            // Stop scanning beyond HW.
-            if (baseOffset >= hw) break;
-
-            bool ctrl = ControlMarker::isControlBatch(data, pos, rem);
-            int64_t producerId = extractProducerId(data, pos, rem);
-
-            if (ctrl) {
-                // Control batch: decode the marker payload and update LSO/aborted index.
-                ControlMarkerPayload payload;
-                if (ControlMarker::extract(data, pos, payload, rem)) {
-                    bool commit = (payload.controlType == ControlType::Commit);
-                    int64_t firstOff = tracker_->onControlMarker(payload.producerId,
-                                                                   baseOffset,
-                                                                   commit);
-                    if (!commit && firstOff >= 0) {
-                        abortedIndex_->onAbortMarker(payload.producerId,
-                                                      firstOff,
-                                                      baseOffset);
-                    }
-                }
-            } else {
-                // Data batch: track open transactions.
-                if (producerId >= 0) {
-                    tracker_->onProduceBatch(producerId, baseOffset);
-                }
-            }
-
-            pos += static_cast<std::size_t>(totalLen);
+    // Zero-copy chunks of whole batches; the same classification step the
+    // owning worker's incremental build runs (S4).
+    constexpr int32_t kChunkBytes = 1 << 20;
+    RcBuilder builder(tracker_, abortedIndex_);
+    int64_t cursor = log->logStartOffset();
+    const int64_t end = std::min(hw, log->logEndOffset());
+    while (cursor < end) {
+        const rune::storage::LogReadView v = log->readView(cursor, kChunkBytes);
+        if (v.empty()) {
+            // A gap (e.g. compaction emptied a segment): resume at the next
+            // segment base above the cursor.  Cold (rebuild is not a hot path).
+            int64_t next = -1;
+            for (const int64_t b : log->segmentBaseOffsets())
+                if (b > cursor) { next = b; break; }
+            if (next < 0) break;
+            cursor = next;
+            continue;
         }
+        std::size_t pos = 0;
+        bool done = false;
+        while (pos < v.len) {
+            rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
+            if (v.len - pos < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) ||
+                r.baseOffset() >= hw) { done = true; break; }   // stop at HW
+            const RcBuilder::Result res = builder.step(v.data + pos, v.len - pos);
+            if (res.outcome == RcBuilder::Outcome::Invalid) { done = true; break; }
+            pos += static_cast<std::size_t>(res.totalLength);
+        }
+        if (done || v.nextOffset <= cursor) break;
+        cursor = v.nextOffset;
     }
 }
 
@@ -275,7 +442,9 @@ std::vector<uint8_t> ReadCommittedView::read(rune::storage::Log* log,
         }
 
         // ── Filter: skip aborted batches (read_committed only) ──
-        if (level == IsolationLevel::ReadCommitted && producerId >= 0) {
+        if (level == IsolationLevel::ReadCommitted && producerId >= 0 &&
+            (static_cast<uint16_t>(reader.attributes()) &
+             static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional)) != 0) {
             if (abortedIndex_->isAborted(producerId, baseOffset)) {
                 pos += static_cast<std::size_t>(totalLen);
                 continue;

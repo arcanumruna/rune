@@ -14,10 +14,24 @@
 //     frame (TxnMessages.h), call TransactionCoordinator, persist the resulting
 //     TransactionMetadata via ReplicatedTxnStateStore::put(acksAll=true) BEFORE
 //     responding, then encode the response into the caller-supplied buffer.
-//   - NotCoordinator fence: when isLocalCoordinator()==false every handler
-//     encodes a response with errorCode=NotCoordinator.
-//   - doWork(nowNs): drives TransactionCoordinator::doWork (timeout aborts);
-//     resolves pending markers (Task 8).
+//   - F15 §5.1 coordinator LOAD state machine (Unloaded | Loaded{epoch}).
+//     Loaded only while: this node is the consensus leader (FindCoordinator
+//     routes here) AND the __transaction_state replica is Leader AND its
+//     leadership is complete (leaderComplete_) AND HW == LEO — then the store
+//     is folded to the (committed) HW and the coordinator reloaded under
+//     coordinatorEpoch = that replica's leader epoch.  Evaluated at the top of
+//     doWork and of every handler (progress-driven, no timer).  Unloaded: every
+//     handler answers NotCoordinator, no timeouts run, nothing is written.
+//     Unload (consensus or replica leadership lost, or epoch change): deferred
+//     EndTxns answered NotCoordinator, marker tasks dropped, the gateway's
+//     queued markers of the old epoch purged, the coordinator cleared.
+//     Store-less (unit rigs): the predicate is isLeader(), coordinatorEpoch a
+//     local counter bumped per load.
+//   - F15 §5.6 persisted pid block ceiling (store-backed): pids are handed out
+//     only below a COMMITTED ceiling record; the next block is prefetched at
+//     half use; InitProducerId answers ConcurrentTransactions (27) meanwhile.
+//   - doWork(nowNs): drives TransactionCoordinator::doWork (timeout aborts,
+//     only while Loaded); resolves pending markers (Task 8).
 //
 // ## Constructor deps
 //
@@ -117,7 +131,8 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // isLocalCoordinator — true when this node is the cluster leader.
+    // isLocalCoordinator — true when this node is the cluster leader (where
+    // FindCoordinator routes).  NOT sufficient to serve: see isLoaded().
     // v1 seam: all transactions are coordinated by the cluster leader.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool isLocalCoordinator() const;
@@ -129,6 +144,13 @@ public:
     // Unpushed (-1): the callable is used (service-only tests).
     void setLocalLeadership(bool leader) noexcept { localLeader_ = leader ? 1 : 0; }
 
+    /// F15 §5.1: true while the coordinator is Loaded (serving).
+    [[nodiscard]] bool isLoaded() const noexcept { return loadState_ == LoadState::Loaded; }
+    /// F15 §5.1: the loaded coordinatorEpoch (-1 while Unloaded).
+    [[nodiscard]] int32_t coordinatorEpoch() const noexcept {
+        return loadState_ == LoadState::Loaded ? coordinatorEpoch_ : -1;
+    }
+
     // -----------------------------------------------------------------------
     // coordinatorFor — returns the cluster-leader nodeId for any txnId.
     // v1 seam (future: per-txnId hash routing).
@@ -139,8 +161,8 @@ public:
     // Handlers — decode the request from buf[0..len-1], act, encode the
     // response into out[] (reused by caller), return bytes written.
     //
-    // When isLocalCoordinator()==false: encode the protocol response with
-    // errorCode = NotCoordinator and return that size.
+    // While the coordinator is not Loaded (F15 §5.1): encode the protocol
+    // response with errorCode = NotCoordinator and return that size.
     //
     // buf and out MUST NOT overlap.
     // Never throws.  Never allocates from heap in steady state.
@@ -159,9 +181,11 @@ public:
     /// Task 10 fix 3: a control marker this node could not append (NotLeader /
     /// append failure).  Recorded + logged — never silent; counts as resolved.
     void onControlMarkerRefused(int32_t topicId, int32_t partition,
-                                int64_t producerId, int16_t errorCode) override;
+                                int64_t producerId, int16_t errorCode,
+                                int32_t coordinatorEpoch) override;
     /// Task 10 round 5: an asynchronously appended marker landed.
-    void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId) override;
+    void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
+                               int32_t coordinatorEpoch) override;
     [[nodiscard]] std::size_t awaitingMarkerTxnsForTest() const noexcept { return awaiting_.size(); }
     [[nodiscard]] uint64_t transactionsCompletedForTest() const noexcept { return transactionsCompleted_; }
     [[nodiscard]] uint64_t controlMarkersRefusedForTest() const noexcept { return controlMarkersRefused_; }
@@ -187,6 +211,30 @@ private:
     void resolveMarker_(int64_t producerId);
     void completeAwaiting_(int64_t producerId, bool respond);
     [[nodiscard]] int concurrentIfPreparing_(int err) const;
+
+    // F15 §5.1 — coordinator load state machine (control thread only).
+    enum class LoadState : uint8_t { Unloaded, Loaded };
+    LoadState loadState_        = LoadState::Unloaded;
+    int32_t   coordinatorEpoch_ = -1;   ///< valid while Loaded
+    int32_t   localLoads_       = 0;    ///< store-less coordinatorEpoch counter
+    /// Store-less load snapshot (always empty; a member, not a function-local
+    /// static, so no static-init guard — shared-nothing law).
+    const std::map<rune::transaction::TransactionalId, rune::transaction::TransactionMetadata,
+                   std::less<>> noSnapshot_;
+    /// Load if loadable_, unload if the Loaded predicate broke; true = serving.
+    bool ensureLoaded_(int64_t nowNs);
+    [[nodiscard]] bool loadable_() const;
+    [[nodiscard]] bool stillLoaded_() const;
+    void load_(int64_t nowNs);
+    void unload_();
+    /// Reply epoch filter: a marker reply counts only for the loaded epoch.
+    [[nodiscard]] bool currentEpoch_(int32_t coordinatorEpoch) const noexcept;
+
+    // F15 §5.6 — persisted pid block ceiling (store-backed only).
+    int64_t                  pidCeilingPending_       = -1;   ///< ceiling put, not yet committed
+    int64_t                  pidCeilingPendingOffset_ = -1;   ///< its record offset (-1: none)
+    void advancePidBlock_();
+    void requestPidCeiling_(int64_t ceiling);
     // -----------------------------------------------------------------------
     // Members
     // -----------------------------------------------------------------------
@@ -195,9 +243,6 @@ private:
     std::function<bool()>                       isLeaderFn_;
     int8_t                                     localLeader_ = -1;   // see setLocalLeadership()
     std::function<NodeId()>                     leaderIdFn_;
-
-    // CG-4 failover pattern: detect Follower→Leader transition to rebuild index.
-    bool wasLeader_ = false;
 
     // ClientGateway — non-owning; may be null (Task 8 marker append).
     rune::gateway::ClientGateway*               gateway_ = nullptr;

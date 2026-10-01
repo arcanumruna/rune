@@ -5,10 +5,12 @@
 
 #include <concurrent/AtomicBuffer.h>
 #include <gtest/gtest.h>
+#include <chrono>
 
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 using rune::node::detail::O2ORingBuffer;
@@ -186,3 +188,51 @@ TEST(O2ORingBuffer, TooLargeMessageThrows) {
 }
 
 } // namespace
+
+// F16 regression (run under TSan): a payload written by the producer thread and
+// read by the consumer thread is ordered by the ring's ordered length store /
+// volatile load.  Those are inline-asm fences TSan cannot see, so without the
+// ring's TSan annotations every handoff (and the consumer's zeroing of freed
+// space that the producer then reuses) was reported as a data race.  A small
+// ring forces many wraps — with padding records — exercising every edge.  Functionally: every message
+// arrives once, in order, intact.
+TEST(O2ORingBufferRegression, CrossThreadPayloadHandoffIsOrdered) {
+    Backing b(4096);
+    O2ORingBuffer ring(b.bytes.data(), b.bytes.size());
+    constexpr std::uint32_t kN = 50'000;
+    constexpr std::size_t   kLen = 40;   // 48 B records don't divide 4096 → padding on wrap
+
+    // A lost message must FAIL, not hang until the ctest timeout.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::thread producer([&] {
+        for (std::uint32_t i = 0; i < kN; ++i) {
+            aeron::util::index_t idx;
+            while ((idx = ring.tryClaim(kType, kLen)) < 0) {
+                if (std::chrono::steady_clock::now() >= deadline) return;
+                std::this_thread::yield();
+            }
+            std::uint8_t* p = ring.base() + idx;
+            std::memcpy(p, &i, sizeof(i));
+            std::memset(p + sizeof(i), static_cast<int>(i & 0xFF), kLen - sizeof(i));
+            ring.commit(idx);
+        }
+    });
+
+    std::uint32_t next = 0;
+    bool ok = true;
+    while (next < kN && std::chrono::steady_clock::now() < deadline) {
+        const int n = ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& buf,
+                                    aeron::util::index_t off, aeron::util::index_t len) {
+            const std::uint8_t* p = buf.buffer() + off;
+            std::uint32_t seq;
+            std::memcpy(&seq, p, sizeof(seq));
+            if (seq != next || static_cast<std::size_t>(len) != kLen ||
+                p[kLen - 1] != static_cast<std::uint8_t>(seq & 0xFF)) ok = false;
+            ++next;
+        }, 64);
+        if (n == 0) std::this_thread::yield();
+    }
+    producer.join();
+    EXPECT_TRUE(ok) << "a message arrived out of order or corrupted";
+    EXPECT_EQ(next, kN);
+}

@@ -14,6 +14,7 @@
 // Unique temp paths use getpid() + atomic counter.
 
 #include <rune/node/BrokerNode.h>
+#include <rune/node/Worker.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <utility>
 #include <rune/node/NodeConfig.h>
@@ -1066,6 +1067,69 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
     node.stop();
 }
 
+// F15 S3 (design note §6): a tryClaim exception now HALTS, so the return ring
+// size is a correctness setting — its max message must hold one 512 KiB
+// PushReadResult chunk plus its header.  A smaller ring refuses to start,
+// before any side effect.
+TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxPushChunk) {
+    EXPECT_TRUE(Worker::returnRingCoversMaxPushChunk(32u << 20)) << "the default must pass";
+    EXPECT_TRUE(Worker::returnRingCoversMaxPushChunk(8u << 20));
+    EXPECT_FALSE(Worker::returnRingCoversMaxPushChunk(4u << 20)) << "4 MiB ring: max message 512 KiB < chunk + header";
+    const fs::path dir = makeTempDataDir("retring_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerReturnRingBytes = 1 << 20;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// F15 S3 fix round 1 (review I-1): the return ring must also hold the largest
+// batch any intake path can store (a PushRead of one whole batch that does not
+// fit would halt on every restart: a crash loop).  Legacy: min(gateway max
+// produce batch, ingress max message); shard: min(max produce batch, 16 MiB,
+// term / 8).  Plus ret ring >= ingress ring, and the owed-return cap in range.
+TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxStorableBatch) {
+    constexpr std::size_t MiB = 1u << 20;
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
+        << "the defaults must pass";
+    EXPECT_TRUE(Worker::validateRingConfig(8 * MiB, 32 * MiB, 4096).has_value())
+        << "Legacy: an 8 MiB return ring cannot hold a 2-4 MiB batch the 32 MiB ingress ring accepts";
+    EXPECT_TRUE(Worker::validateRingConfig(16 * MiB, 32 * MiB, 4096).has_value())
+        << "return ring smaller than the ingress ring";
+    // Re-review 1 I-3 / re-review 2 m-h: the Aeron term no longer enters the
+    // startup check (every intake path refuses an oversize batch with
+    // MessageTooLarge — ReturnOverflowRegression.OneBatchLimitOnEveryPath), so
+    // the shipped configs' ring sizes start: cluster.sh / CLAUDE.md (32/32)
+    // above, replbench.sh (64/64) here.
+    EXPECT_FALSE(Worker::validateRingConfig(64 * MiB, 64 * MiB, 4096).has_value())
+        << "replbench.sh (rings 64/64)";
+    EXPECT_FALSE(Worker::validateRingConfig(128 * MiB, 32 * MiB, 4096).has_value());
+    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 9000).has_value())
+        << "owed-return cap above the ceiling";
+    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 100).has_value())
+        << "owed-return cap below the floor";
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 8192).has_value());
+    {
+        const fs::path dir = makeTempDataDir("retring8_");
+        NodeConfig cfg = makeSingleNodeConfig(dir);
+        cfg.workerReturnRingBytes = 8 << 20;   // ingress stays 32 MiB
+        BrokerNode node{cfg};
+        EXPECT_THROW(node.start(), std::runtime_error);
+        EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+        std::error_code ec; fs::remove_all(dir, ec);
+    }
+    {
+        const fs::path dir = makeTempDataDir("owedcap_");
+        NodeConfig cfg = makeSingleNodeConfig(dir);
+        cfg.workerMaxOwedReturns = 9000;
+        BrokerNode node{cfg};
+        EXPECT_THROW(node.start(), std::runtime_error);
+        EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+        std::error_code ec; fs::remove_all(dir, ec);
+    }
+}
+
 TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
     const fs::path dir = makeTempDataDir("shardbad_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
@@ -1247,8 +1311,53 @@ TEST(BrokerNodeRegression, GatewayEnforcesProduceIntakeLimit) {
     ASSERT_NE(node.gatewayForTest(), nullptr);
     EXPECT_EQ(node.gatewayForTest()->maxProduceBatchBytes(),
               static_cast<std::size_t>(cfg.produceIntakeLimit()));
-    EXPECT_LE(node.gatewayForTest()->maxProduceBatchBytes(),
-              static_cast<std::size_t>(cfg.produceBatchFrameCeiling()));
+    node.stop();
+}
+
+// Integration wave 2 (F18 ⇄ F15 S3 ⇄ F19, S3 re-review 3 minor 1): ONE batch
+// limit.  The started node's gateway limit == EVERY worker's intake limit ==
+// the config formula (Worker::maxAcceptableBatchBytes over the raw ring / term
+// sizes, replication and egress terms included even single-node).
+TEST(BrokerNodeRegression, GatewayAndEveryWorkerShareTheOneBatchLimit) {
+    TempDir tmp{"wave2_limit_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    {
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        ASSERT_GE(fd, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0);
+        socklen_t len = sizeof(a);
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+        ::close(fd);
+        cfg.clientEndpoint.channel =
+            "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ntohs(a.sin_port));
+    }
+    cfg.workerCount = 2;
+    TopicSpec ts;
+    ts.name           = "wave2-limit";
+    ts.partitionCount = 4;
+    ts.topicId        = 0;
+    cfg.topics        = {ts};
+
+    const std::size_t formula = Worker::maxAcceptableBatchBytes(
+        static_cast<std::size_t>(cfg.workerIngressRingBytes),
+        static_cast<std::size_t>(cfg.workerReturnRingBytes),
+        static_cast<std::size_t>(cfg.replicationOutboundRingBytes),
+        static_cast<std::size_t>(cfg.aeronTermBufferBytes),
+        static_cast<std::size_t>(cfg.aeronTermBufferBytes));
+    ASSERT_EQ(static_cast<std::size_t>(cfg.produceIntakeLimit()), formula) << "a thin wrapper";
+
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_NE(node.gatewayForTest(), nullptr);
+    EXPECT_EQ(node.gatewayForTest()->maxProduceBatchBytes(), formula);
+    int workers = 0;
+    // Set once at startup, before any worker thread runs; immutable after.
+    for (int32_t w = 0; Worker* wk = node.workerForTest(w); ++w, ++workers)
+        EXPECT_EQ(wk->maxIntakeBatchBytes(), formula) << "worker " << w;
+    EXPECT_EQ(workers, 2);
     node.stop();
 }
 

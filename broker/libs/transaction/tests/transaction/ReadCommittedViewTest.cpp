@@ -51,12 +51,16 @@ static std::string makeTmpDir()
 
 /// Build a little-endian data batch with a specific producerId.
 /// Uses RecordBatchBuilder's setProducerId() for clean LE encoding.
+/// A producerId >= 0 here models a TRANSACTIONAL producer, so the batch carries
+/// the TRANSACTIONAL attribute (0x10) exactly as a real txn producer's batch
+/// does (F15 N3: only a transactional batch opens a transaction).
 static std::vector<uint8_t> makeDataBatch(int64_t baseOffset,
                                            int64_t producerId,
                                            std::string_view value = "payload")
 {
     rune::protocol::RecordBatchBuilder builder(baseOffset, 0);
     builder.setProducerId(producerId);
+    builder.setTransactional(producerId >= 0);
     builder.append({}, value, 0);
     return builder.build();
 }

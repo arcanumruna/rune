@@ -101,24 +101,40 @@ inline constexpr std::size_t kPushTooLargeErrorMaxBytes =
     rune::protocol::client::MessageHeader::ENCODED_SIZE +
     rune::protocol::client::ErrorResponse::BODY_FIXED + 2u + 192u;
 
+/// Why a push subscription failed (integration wave 2: F19 ⇄ F15 S3 — one
+/// failure state, two error paths, one error encoding).
+enum class PushTooLargeCause : uint8_t {
+    EgressFrame,   ///< F19: the Records frame exceeds the egress maxMessageLength
+    ReturnRing,    ///< F15 S3 I-4: a stored batch exceeds the worker return ring
+};
+
 /// Encode the error that fails a push subscription whose next batch at
-/// `atOffset` (Records frame `frameLen` B) exceeds the egress maxMessageLength
-/// `maxMessage`.  F15 S3 convention (re-review 2 m-f): correlationId = 0 — a
-/// subscription id shares no namespace with client correlation ids (the client
-/// would fail an unrelated pending ping/connect with the same number); the
-/// subscription is named in the message "subscription S topic T partition P
-/// offset O: ...".  `buf` must hold kPushTooLargeErrorMaxBytes.  No allocation.
+/// `atOffset` cannot be delivered: EgressFrame — its Records frame (`frameLen`
+/// B) exceeds the egress maxMessageLength `maxMessage`; ReturnRing — the owning
+/// worker answered its PushRead MessageTooLarge (the stored batch exceeds the
+/// worker return ring; `frameLen` / `maxMessage` unused).  F15 S3 convention
+/// (re-review 2 m-f): correlationId = 0 — a subscription id shares no namespace
+/// with client correlation ids (the client would fail an unrelated pending
+/// ping/connect with the same number); the subscription is named in the
+/// message "subscription S topic T partition P offset O: ...".  `buf` must hold
+/// kPushTooLargeErrorMaxBytes.  No allocation.
 inline std::size_t encodePushTooLargeError(uint8_t* buf, int64_t sessionId, int64_t subscriptionId,
                                            int32_t topicId, int32_t partition, int64_t atOffset,
-                                           std::size_t frameLen, int64_t maxMessage) noexcept
+                                           std::size_t frameLen, int64_t maxMessage,
+                                           PushTooLargeCause cause = PushTooLargeCause::EgressFrame) noexcept
 {
     namespace pc = rune::protocol::client;
     char msg[192];
-    const int m = std::snprintf(msg, sizeof msg,
-        "subscription %lld topic %d partition %d offset %lld: Records frame %zu B exceeds the "
-        "egress max message %lld B",
-        static_cast<long long>(subscriptionId), topicId, partition,
-        static_cast<long long>(atOffset), frameLen, static_cast<long long>(maxMessage));
+    const int m = cause == PushTooLargeCause::EgressFrame
+        ? std::snprintf(msg, sizeof msg,
+              "subscription %lld topic %d partition %d offset %lld: Records frame %zu B exceeds the "
+              "egress max message %lld B",
+              static_cast<long long>(subscriptionId), topicId, partition,
+              static_cast<long long>(atOffset), frameLen, static_cast<long long>(maxMessage))
+        : std::snprintf(msg, sizeof msg,
+              "subscription %lld topic %d partition %d offset %lld: batch exceeds the broker return ring",
+              static_cast<long long>(subscriptionId), topicId, partition,
+              static_cast<long long>(atOffset));
     pc::ErrorResponse err;
     err.sessionId     = sessionId;
     err.correlationId = 0;

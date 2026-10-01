@@ -338,6 +338,9 @@ private:
         rune::replication::PartitionReplica*          replica,
         rune::replication::Epoch                      epoch,
         std::vector<rune::replication::NodeId>        isr) noexcept;
+    /// F15 §3.1: record the role just routed as the gateway's intended-role hint.
+    void recordIntendedRole_(rune::replication::PartitionReplica* replica,
+                             ReplicaRegistry::IntendedRole role) noexcept;
 
     // -----------------------------------------------------------------------
     // Role ops not yet accepted by the owning worker's ring (Task 10 round-3

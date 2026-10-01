@@ -374,8 +374,17 @@ public:
     // Must be called before doWork() on the duty-cycle thread (single-writer).
     // The pointer is non-owning; the WorkerPool must outlive the gateway.
     // -----------------------------------------------------------------------
-    void setWorkerPool(rune::node::WorkerPool* pool) noexcept {
-        workerPool_ = pool;
+    // F15 S3 (re-review 2 B-1): also narrows the produce batch limit to the
+    // pool's worker intake limit, so a gateway-routed batch the worker op /
+    // return ring cannot carry is answered MessageTooLarge, never thrown.
+    void setWorkerPool(rune::node::WorkerPool* pool) noexcept;
+    /// F15 S3 (re-review 2 B-1) ⇄ F18: THE client-visible batch limit — the ONE
+    /// gateway setter.  BrokerNode sets NodeConfig::produceIntakeLimit()
+    /// (= rune::node::Worker::maxAcceptableBatchBytes(config): rings, replication
+    /// frame, egress frame) before the gateway serves; clamped to the 8 MiB
+    /// kMaxProduceBatchBytes.  The same value bounds every worker's guard.
+    void setMaxProduceBatchBytes(std::size_t n) noexcept {
+        maxProduceBatchBytes_ = std::min(n, kMaxProduceBatchBytes);
     }
 
     [[nodiscard]] rune::node::WorkerPool* workerPool() const noexcept {
@@ -473,10 +482,7 @@ public:
     // Default: 1 (single-node safe; for 3-node clusters, set to 2).
     // Thread-safe (atomic store): may be called from any thread.
     // -----------------------------------------------------------------------
-    /// F18: largest produce batch accepted (larger → MessageTooLarge, before
-    /// append).  BrokerNode sets NodeConfig::produceIntakeLimit() — at most one
-    /// replication frame — before the gateway serves.  Cold setter.
-    void setMaxProduceBatchBytes(std::size_t n) noexcept { maxProduceBatchBytes_ = n; }
+    /// The effective client-visible batch limit (see setMaxProduceBatchBytes).
     [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept { return maxProduceBatchBytes_; }
 
     void setMinIsr(int minIsr) noexcept {
@@ -582,11 +588,23 @@ public:
     // Single-writer: must be called on the duty-cycle thread.
     // ---------------------------------------------------------------------------
     static constexpr int64_t kControlRecordAsync = -2;
+    /// \param coordinatorEpoch  the epoch of the coordinator dispatching the
+    ///          marker (F15 m3): queued entries are tagged with it, purged by
+    ///          purgeQueuedMarkers() when that coordinator unloads, and echoed
+    ///          to onControlMarkerLanded / onControlMarkerRefused.
     int64_t appendControlRecord(int32_t                    topicId,
                                 int32_t                    partition,
                                 std::span<const uint8_t>   marker,
-                                int64_t                    producerId = -1,
-                                bool                       commit     = false);
+                                int64_t                    producerId,
+                                bool                       commit,
+                                int32_t                    coordinatorEpoch);
+
+    /// F15 m3: drop every marker still waiting in markerSendQueue_ (never
+    /// handed to a worker) whose coordinatorEpoch < @p olderThan.  Markers
+    /// already on a worker ring land (they carry a durable decision and are
+    /// idempotent); their replies are then ignored by the coordinator.
+    /// \returns the number of markers purged.  Control thread only.
+    std::size_t purgeQueuedMarkers(int32_t olderThan);
 
     // -----------------------------------------------------------------------
     // TX-4 Task 9 test hooks — feed the per-partition LSO tracker from external
@@ -736,6 +754,9 @@ public:
     void applySubscribeForTest(const uint8_t* buf, std::size_t len) {
         handleSubscribe(buf, len);
     }
+    /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
+    /// Aeron polling.
+    void pushSubscriptionsForTest() { pushSubscriptions(); }
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real
@@ -889,16 +910,33 @@ private:
         // correct isolation is applied on the next duty cycle — no data loss, no
         // premature skip under a wrong isolation assumption.
         bool    groupCarrierReceived = false;
-        // F19 (same shape as F15 S3 I-4): the next stored batch cannot be
-        // delivered on this session's egress (its Records frame exceeds the
-        // publication's maxMessageLength).  The subscription is parked AT that
-        // batch (nextOffset not advanced, no further reads/pushes: no spin)
-        // until the client unsubscribes, and owes the client one non-retriable
+        // ONE failure state for a push subscription (F15 S3 re-review 1 I-4 ⇄
+        // F19, merged in integration wave 2), two error paths:
+        //   - the owning worker answered a PushRead MessageTooLarge (a stored
+        //     batch larger than its return ring), or
+        //   - the next stored batch's Records frame exceeds this session's
+        //     egress publication maxMessageLength (F19).
+        // Either way the subscription is parked AT that batch (nextOffset not
+        // advanced, no further PushRead / reads / pushes: no spin) until the
+        // client unsubscribes, and owes the client one non-retriable
         // ErrorResponse{MessageTooLarge, correlationId 0, message naming the
-        // subscription} — re-offered each cycle until sent (errorOwed).
+        // subscription} (rune::node::encodePushTooLargeError) — re-offered each
+        // cycle until sent (errorOwed).
         bool    failed         = false;
         bool    errorOwed      = false;
-        std::size_t failedFrameLen = 0;
+        rune::node::PushTooLargeCause failedCause = rune::node::PushTooLargeCause::EgressFrame;
+        std::size_t failedFrameLen = 0;   // EgressFrame: the undeliverable Records frame size
+        // F15 S4 addendum R-1 / R-3 (worker-pool PushRead path): the cursor and
+        // the HW snapshot of the PushRead in flight, and the HW snapshot at
+        // which the owning worker answered "nothing below its bound" (-1: not
+        // parked).  The subscription is not re-read until the gateway's HW
+        // snapshot moves past parkedAtHw, or its isolation carrier arrives.
+        int64_t issuedNextOffset = -1;
+        int64_t issuedHw         = -1;
+        int64_t parkedAtHw       = -1;
+        // Review I-2 fallback: push-cycle backoff after a notReady answer.
+        int64_t notReadyBackoff  = 0;
+        int64_t retryAtCycle     = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -1034,6 +1072,11 @@ private:
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
+    /// F15 S2 (TEMPORARY until S4/S5): apply a worker append's gateway-mirror facts.
+    void applyProduceFacts_(const rune::node::WorkerReturn& ret);
+    /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
+    void sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
+                            rune::protocol::client::ErrorCode code);
 
     // F19: fail push subscription `sub` once — its next batch (at
     // sub.nextOffset, Records frame `frameLen` bytes) exceeds the session
@@ -1167,11 +1210,12 @@ private:
     // longer needs a fixed restamp scratch — the base offset is patched into the
     // page cache / ring slot via pwritev — so this bound only guards against an
     // absurd/malformed length overrunning the worker ingress ring or a segment.
-    // F18: BrokerNode overrides it with NodeConfig::produceIntakeLimit(), which fits
-    // ONE frame on every hop (worker-ingress op ring, replication outbound ring,
-    // Aeron term/8) so an accepted batch is always replicable.  8 MiB is only the
-    // standalone-gateway (test) default.
-    std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;
+    // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
+    // F15 S3: == rune::node::Worker::kMaxProduceBatchBytes (static_assert in
+    // ClientGateway.cpp) — the shard-ingress guard and the return-ring startup
+    // check use the same bound.
+    static constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u;
+    std::size_t maxProduceBatchBytes_ = kMaxProduceBatchBytes;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.
@@ -1354,6 +1398,7 @@ private:
         int64_t              producerId = -1;
         bool                 commit     = false;
         uint32_t             reroutes   = 0;
+        int32_t              coordinatorEpoch = 0;   ///< F15 m3
         std::vector<uint8_t> bytes;
     };
     static constexpr uint32_t kMaxMarkerReroutes = 4;
@@ -1361,6 +1406,13 @@ private:
     std::deque<int64_t>                         markerSendQueue_;
     int64_t                                     nextMarkerToken_ = 1;
     bool trySendMarker_(int64_t token);
+    /// F15 K3: THE routing predicate for worker-owned appends — used by the
+    /// produce path AND marker routing (appendControlRecord), in every mode,
+    /// so a marker is queued on the same op ring as the produces it must
+    /// follow (L4) and the control thread never appends to a worker-owned log.
+    [[nodiscard]] bool routesToWorker_(int32_t topicId) const noexcept {
+        return workerPool_ != nullptr && (!perWorkerIngressActive_ || topicId >= 0);
+    }
     int  pumpMarkerQueue_();
     [[nodiscard]] bool markerQueuedFor_(int32_t topicId, int32_t partition) const noexcept;
 
@@ -1536,8 +1588,14 @@ private:
     // WorkerReturn type is fully defined in the .cpp (WorkerOp.h included there).
     // -----------------------------------------------------------------------
     void drainWorkerReturns_();
+    void noteWorkerReadAnswer_(Subscription& sub, int64_t effectiveBound, bool notReady) noexcept;
+    int64_t pushCycle_ = 0;   ///< pushSubscriptions passes (F15 S4 backoff clock)
 
-    // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index.
+    // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index — F15 S4:
+    // ONLY for the no-worker-pool inline path (unit rigs: the control thread
+    // appends and reads those logs itself).  With a worker pool (every
+    // production mode) the OWNING worker holds and serves the read_committed
+    // state (RcState, design note §2.1-§2.4); this map is never fed or read.
     //
     // Maintains read_committed isolation state for each (topicId, partition)
     // that has received at least one transactional data batch or control marker.
@@ -1575,19 +1633,6 @@ private:
     // Map from partition key → LsoTracker + AbortedTxnIndex.
     // Single-writer: only accessed on the duty-cycle thread.
     std::unordered_map<int64_t, PartitionTxnState> partitionTxnStates_;
-public:
-    /// Test-only: the recorded aborted-txn ranges for (topicId, partition).
-    [[nodiscard]] std::vector<rune::transaction::AbortedTxnRange>
-    abortedRangesForTest(int32_t topicId, int32_t partition) const {
-        const auto* ts = getTxnStateRO(topicId, partition);
-        return ts ? ts->abortedIndex.ranges() : std::vector<rune::transaction::AbortedTxnRange>{};
-    }
-    /// Test-only: open transactions tracked for (topicId, partition).
-    [[nodiscard]] std::size_t openTxnsForTest(int32_t topicId, int32_t partition) const {
-        const auto* ts = getTxnStateRO(topicId, partition);
-        return ts ? ts->lsoTracker.openCount() : 0;
-    }
-private:
 
     // -----------------------------------------------------------------------
     // G0.1: Egress retry queue — bounded, pre-allocated, no hot-path alloc.

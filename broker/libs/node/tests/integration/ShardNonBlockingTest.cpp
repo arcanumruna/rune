@@ -32,6 +32,7 @@
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/storage/Log.h>
+#include <rune/transaction/ControlMarker.h>
 
 #include <Aeron.h>
 #include <gtest/gtest.h>
@@ -109,12 +110,19 @@ std::vector<uint8_t> produceFrame(int64_t corr, const std::vector<uint8_t>& batc
     msg.encode(frame.data());
     return frame;
 }
+// Produce ANSWERS only.  F15 S2 fix round 1: a parked gateway-routed produce
+// also emits an append-time facts-only ProduceResult (deferAck == true, TEMPORARY
+// until S4/S5) — gateway-mirror bookkeeping, not an answer to the client.
 struct Acks {
     int n = 0;
+    int facts = 0;
     std::vector<WorkerReturn> rets;
     int drain(Worker& w) {
         return static_cast<int>(w.drainReturn([&](WorkerReturn r) {
-            if (r.type == WorkerReturn::Type::ProduceResult) { ++n; rets.push_back(r); }
+            if (r.type != WorkerReturn::Type::ProduceResult) return;
+            if (r.deferAck && r.errorCode == 0) { ++facts; return; }
+            if (r.deferAck) ADD_FAILURE() << "an error result carries deferAck (would be swallowed as facts-only)";
+            ++n; rets.push_back(r);
         }));
     }
 };
@@ -211,7 +219,8 @@ TEST(ShardNonBlockingRegression, OwnedLogSyncIsAsyncAndIdleLogIsNotResubmitted) 
 
 TEST(ShardNonBlockingRegression, TxnMarkerAppendIsAsyncInShardMode) {
     StrictShard s;
-    const auto marker = batchAt(0);
+    // A real control batch (F15 N2: appendControlBatch refuses non-markers).
+    const auto marker = rune::transaction::ControlMarker::build(7, 0, rune::transaction::ControlType::Commit, 0);
     WorkerOp op;
     op.type = WorkerOp::Type::AppendControlRecord; op.topicId = 1; op.partition = 0;
     op.replica = s.leader.get(); op.logPtr = s.log.get();
@@ -250,13 +259,17 @@ TEST(ShardNonBlockingRegression, BackgroundFlushCompletionNeverFiresProduceAck) 
     ASSERT_NE(t2, kNoToken);
     ASSERT_NE(t1, t2);
     Acks a;
+    a.drain(w);
+    EXPECT_EQ(a.facts, 0) << "a gateway-routed Strict produce's facts wait for its fsync";
     w.deliverCompletionForTest(FlushCompletion{t2, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 0) << "a background flush token must never fire a produce ack";
+    EXPECT_EQ(a.facts, 0) << "nor release the produce's facts";
     EXPECT_EQ(w.bgFlushInFlightForTest(), 0u) << "the background token is retired by routing";
     w.deliverCompletionForTest(FlushCompletion{t1, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 1);
+    EXPECT_EQ(a.facts, 1) << "the produce's own fsync completion emits its facts";
     EXPECT_EQ(w.durableAckTokenForTest(), t1);
     // The real completions for T1 and T2 arrive later through io_.reap: wait for
     // exactly those two (condition, capped) and prove neither fires anything.
@@ -1096,7 +1109,7 @@ struct CapturingTxn final : rune::gateway::ITxnRequestHandler {
     size_t handleAddOffsets(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
     size_t handleTxnOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
     size_t handleEndTxn(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
-    void onControlMarkerRefused(int32_t t, int32_t p, int64_t, int16_t e) override { ++refused; topic = t; part = p; err = e; }
+    void onControlMarkerRefused(int32_t t, int32_t p, int64_t, int16_t e, int32_t) override { ++refused; topic = t; part = p; err = e; }
 };
 } // namespace
 
@@ -1648,30 +1661,47 @@ TEST(ReplicaLifetimeRegression, ParkedSubscriptionIsNotReactivatedOntoANewIncarn
 
 TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWithoutDereference) {
     // Important 3: an acks=all entry in flight when its partition is removed and
-    // FREED → the drain resolves it through the registry → NotLeader.  Also for a
-    // re-created partition (new incarnation, possibly the same address).
+    // FREED → it fails NotLeader without dereferencing the freed replica.  Also
+    // for a re-created partition (new incarnation, same registry id).
+    // F15 I-A: the waiter lives on the OWNING worker in every mode (the gateway's
+    // pendingAcks_ no longer holds worker-owned acks), so the invariant is pinned
+    // where the waiter is: a gateway-routed acks=all produce (executeProduceWire_,
+    // deferAck) parked on the worker; the ownership drop answers it.
     for (bool recreate : {false, true}) {
         Reg R;
-        Captured cap;
-        auto gw = rune::gateway::ClientGateway::makeForTest(cap.fn());
-        gw.setReplicaRegistry(&R.reg);
-        const int64_t sid = gw.injectTestSession();
-        R.add(5, 0);
-        const auto h = R.reg.lookupHandle(5, 0);
-        WorkerReturn ret;
-        ret.type = WorkerReturn::Type::ProduceResult;
-        ret.sessionId = sid; ret.correlationId = 77; ret.topicId = 5; ret.partition = 0;
-        ret.baseOffset = 0; ret.lastOffset = 0; ret.deferAck = true;
-        ret.targetReplicaId = h.id; ret.incarnation = h.incarnation;
-        gw.handleWorkerReturnForTest(ret);
-        ASSERT_EQ(gw.pendingAcksForTest(), 1u);
+        auto* rep = R.add(5, 0);
+        rep->becomeLeader(2, {1, 2});                         // follower 2 behind → the ack parks on the HW
+        Worker w(0, 1 << 16, 1 << 16, 64, 64);
+        w.setOwnedDirect(Worker::OwnedSet{rep});
+        WorkerOp op = produceOp(rep, 77);
+        op.deferAck = true;                                   // acks=all, steady state
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+        w.doWork(1);
+        ASSERT_EQ(w.reservedAckSlotsForTest(), 1) << "precondition: parked on the owning worker";
+        std::vector<WorkerReturn> rets;
+        w.drainReturn([&](WorkerReturn r) {
+            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
+            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
+        });
+        ASSERT_TRUE(rets.empty()) << "only the append-time facts-only return before the move";
         R.reg.remove(5, 0);
+        PartitionReplica* again = recreate ? R.add(5, 0) : nullptr;
+        WorkerOp own;
+        own.type = WorkerOp::Type::SetOwnership;
+        if (again) own.ownedSet = {again};
+        ASSERT_TRUE(w.tryEnqueueOp(std::move(own)));
+        w.doWork(2);
         ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u) << "freed";
-        if (recreate) R.add(5, 0);
-        gw.drainPendingAcksForTest(1);
-        EXPECT_EQ(gw.pendingAcksForTest(), 0u);
-        ASSERT_EQ(cap.produceErrors.size(), 1u);
-        EXPECT_EQ(cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "recreate=" << recreate;
+        w.doWork(3);                                          // no read of the freed replica
+        w.drainReturn([&](WorkerReturn r) {
+            // answers only (skip OwnershipAck and the append-time facts-only return)
+            if (r.type != WorkerReturn::Type::ProduceResult) return;
+            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
+            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
+        });
+        EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
+        ASSERT_EQ(rets.size(), 1u) << "recreate=" << recreate;
+        EXPECT_EQ(rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "recreate=" << recreate;
     }
 }
 
@@ -1707,12 +1737,11 @@ struct MarkerRig {
         pool.worker(0).drainReturn([&](WorkerReturn ret) { gw.handleWorkerReturnForTest(ret); });
     }
 };
+// A REAL txn marker (control batch) for `pid`.  F15 N2: markers are appended
+// as control batches (appendControlBatch), which refuses anything else — the
+// old stand-in (a data batch with the pid stamped in) is no longer a marker.
 std::vector<uint8_t> txnBatch(int64_t pid) {
-    rune::protocol::RecordBatchBuilder b(0, 1000);
-    b.append("k", "v", 1000);
-    auto v = b.build();
-    for (int i = 0; i < 8; ++i) v[43 + i] = static_cast<uint8_t>(pid >> (8 * i));
-    return v;
+    return rune::transaction::ControlMarker::build(pid, 0, rune::transaction::ControlType::Abort, 0);
 }
 } // namespace
 
@@ -1721,18 +1750,29 @@ TEST(ReplicaLifetimeRegression, MarkerOffsetIsTheWorkersActualAppendOffset) {
     // coordinator's bookkeeping must record the marker where it ACTUALLY landed
     // (3), not log->logEndOffset() at enqueue time (0).
     MarkerRig m;
-    m.gw.notifyTransactionalBatch(0, 0, /*pid*/7, /*base*/0);   // txn opened at offset 0
-    for (int i = 0; i < 3; ++i) ASSERT_TRUE(m.pool.tryEnqueueOp(0, 0, produceOp(m.r, 100 + i)));
+    // F15 S4: the read_committed state lives on the OWNING worker (Option B) —
+    // the txn is opened by a real transactional batch at offset 0 (the first of
+    // the three produces queued ahead of the marker), observed on the worker.
+    for (int i = 0; i < 3; ++i) {
+        WorkerOp p = produceOp(m.r, 100 + i);
+        if (i == 0) {
+            rune::protocol::RecordBatchBuilder b(0, 1000);
+            b.setTransactional(true); b.setProducerId(7); b.setProducerEpoch(0); b.setBaseSequence(0);
+            b.append("k", "txn", 1000);
+            p.recordBatchBytes = b.build(); p.producerId = 7;   // txn opened at offset 0
+        }
+        ASSERT_TRUE(m.pool.tryEnqueueOp(0, 0, std::move(p)));
+    }
     const auto marker = txnBatch(7);
-    const int64_t rc = m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, /*commit=*/false);
+    const int64_t rc = m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, /*commit=*/false, /*coordinatorEpoch=*/0);
     EXPECT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync) << "never a pre-computed offset";
-    EXPECT_TRUE(m.gw.abortedRangesForTest(0, 0).empty()) << "nothing recorded before the append happened";
+    EXPECT_TRUE(m.pool.worker(0).rcAbortedRangesForTest(0, 0).empty()) << "nothing recorded before the append happened";
     m.runWorker(1);
-    const auto ranges = m.gw.abortedRangesForTest(0, 0);
+    const auto ranges = m.pool.worker(0).rcAbortedRangesForTest(0, 0);
     ASSERT_EQ(ranges.size(), 1u);
     EXPECT_EQ(ranges[0].producerId, 7);
     EXPECT_EQ(ranges[0].lastOffset, 3) << "the marker's AUTHORITATIVE offset (3 produces landed first)";
-    EXPECT_EQ(m.gw.openTxnsForTest(0, 0), 0u);
+    EXPECT_EQ(m.pool.worker(0).rcOpenTxnsForTest(0, 0), 0u);
     EXPECT_EQ(m.gw.markersInFlightForTest(), 0u);
 }
 
@@ -1741,7 +1781,7 @@ TEST(ReplicaLifetimeRegression, BackPressuredMarkerIsQueuedNotDroppedAndHoldsLat
     WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
     while (m.pool.worker(0).tryEnqueueOp(filler)) {}       // ring full
     const auto marker = txnBatch(9);
-    EXPECT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 9, true),
+    EXPECT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 9, true, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
     EXPECT_EQ(m.gw.markersQueuedForTest(), 1u) << "queued, never dropped";
     drainIdle(m.pool.worker(0));                            // ring drains (fillers; bounded)
@@ -1771,7 +1811,7 @@ TEST(ReplicaLifetimeRegression, MarkerRefusedWhileRegisteredIsReRoutedAndLandsOn
     // marker while the partition is registered re-routes it; it lands exactly once.
     MarkerRig m;
     const auto marker = txnBatch(11);
-    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true),
+    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
     // Drop the worker's copy and simulate the guard refusing it (token = 1).
     m.pool.worker(0).doWork(1);
@@ -1781,7 +1821,7 @@ TEST(ReplicaLifetimeRegression, MarkerRefusedWhileRegisteredIsReRoutedAndLandsOn
     ASSERT_EQ(rets[0].type, WorkerReturn::Type::ControlRecordAppended);
     const int64_t leoAfterFirst = m.r->log()->logEndOffset();
     // A forced refusal for a DIFFERENT issued marker (re-issue a second one).
-    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true),
+    ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
     WorkerReturn refused;
     refused.type = WorkerReturn::Type::ControlRecordRefused;
@@ -2150,7 +2190,8 @@ TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
     for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(200 + i);
     ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u);
     // Log: [0]=txn1 data, [1]=ABORT marker, [2]=txn2 data, [3]=ABORT marker.
-    const auto ranges = t.m.gw.abortedRangesForTest(0, 0);
+    // F15 S4: observed on the OWNING worker (Option B).
+    const auto ranges = t.m.pool.worker(0).rcAbortedRangesForTest(0, 0);
     ASSERT_EQ(ranges.size(), 2u);
     auto covered = [&](int64_t off) {
         for (const auto& rg : ranges) if (rg.contains(off)) return true;
@@ -2161,7 +2202,7 @@ TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
     EXPECT_EQ(ranges[0].lastOffset, 1);
     EXPECT_EQ(ranges[1].firstOffset, 2);
     EXPECT_EQ(ranges[1].lastOffset, 3);
-    EXPECT_EQ(t.m.gw.openTxnsForTest(0, 0), 0u);
+    EXPECT_EQ(t.m.pool.worker(0).rcOpenTxnsForTest(0, 0), 0u);
 }
 
 TEST(ReplicaLifetimeRegression, MinIsrViolationIsReturnedByTheOwningWorker) {
@@ -2252,7 +2293,7 @@ TEST(ReplicaLifetimeRegression, IncarnationWrapSkipsValuesTheOwnerMapStillHolds)
 TEST(ProduceBatchLimitRegression, WorkerIngressRejectsOverLimitBatchMessageTooLarge) {
     StrictShard s;
     const auto b = batchAt(0, 1, 512);
-    s.w.setMaxProduceBatchBytes(b.size() - 1);
+    s.w.setMaxBatchBytes(b.size() - 1);
     ASSERT_EQ(s.produce(1, b, 0, 1), 1);
     Acks a;
     a.drain(s.w);
@@ -2260,7 +2301,7 @@ TEST(ProduceBatchLimitRegression, WorkerIngressRejectsOverLimitBatchMessageTooLa
     EXPECT_EQ(a.rets[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
     EXPECT_EQ(s.log->logEndOffset(), 0) << "an over-limit batch must never be appended";
 
-    s.w.setMaxProduceBatchBytes(b.size());                 // exactly at the limit: accepted
+    s.w.setMaxBatchBytes(b.size());                 // exactly at the limit: accepted
     ASSERT_EQ(s.produce(2, b, 0, 2), 1);
     EXPECT_EQ(s.log->logEndOffset(), 1);
 }
@@ -2389,7 +2430,14 @@ TEST(ProduceBatchLimitRegression, GatewayIntakeRejectsBatchAboveLimitBeforeAppen
 TEST(ProduceBatchLimitRegression, GatewayAnswersMessageTooLargeWhenWorkerFrameIsSmaller) {
     MarkerRig m;                                           // worker ingress 64 KiB → 8 KiB frames
     const int64_t sid = m.gw.injectTestSession();
-    const auto batch = batchAt(0, 1, 16 * 1024);           // < gateway limit, > worker frame
+    const auto batch = batchAt(0, 1, 16 * 1024);           // > worker frame
+    // Integration wave 2 (F15 S3 ⇄ F18): setWorkerPool narrows the gateway's
+    // limit to the workers' (ONE limit), so the batch is refused by the limit
+    // guard itself ...
+    ASSERT_LT(m.gw.maxProduceBatchBytes(), batch.size());
+    // ... and F18's enqueue-time TooLarge answer stays as defence in depth:
+    // lift the gateway limit to its 8 MiB ceiling to reach it.
+    m.gw.setMaxProduceBatchBytes(8u * 1024u * 1024u);
     ASSERT_GE(m.gw.maxProduceBatchBytes(), batch.size());
     pc::Produce msg;
     msg.sessionId = sid; msg.correlationId = 1; msg.topicId = 0; msg.partition = 0;

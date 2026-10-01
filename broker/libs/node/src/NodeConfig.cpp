@@ -1,6 +1,5 @@
 #include <rune/node/NodeConfig.h>
-#include <rune/node/WorkerOp.h>                       // workerOpFrameBytes
-#include <rune/replication/ReplicationFrameLimits.h>   // F18 frame ceilings
+#include <rune/node/Worker.h>                         // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <stdexcept>
 
@@ -282,22 +281,19 @@ std::string NodeConfig::shardIngressEndpoint(const PeerConfig& p, int32_t w) {
     return p.host + ":" + std::to_string(static_cast<int32_t>(p.ingressBasePort) + w);
 }
 
-// F18: the per-message frame of every hop an accepted produce batch crosses.
-int64_t NodeConfig::produceBatchFrameCeiling() const {
-    namespace rr = rune::replication;
-    // Worker-ingress op ring (gateway produce → worker; follower apply → worker).
-    int64_t ceiling = static_cast<int64_t>(workerIngressRingBytes) / 8 -
-                      static_cast<int64_t>(workerOpFrameBytes(0));
-    if (!isSingleNode()) {
-        ceiling = std::min(ceiling, rr::maxFetchRecordsViaOutboundRing(replicationOutboundRingBytes));
-        ceiling = std::min(ceiling, rr::maxFetchRecordsViaPublication(aeronTermBufferBytes));
-    }
-    return std::max<int64_t>(0, ceiling);
-}
-
+// F18 ⇄ F15 S3 (integration wave 2): a thin wrapper over the ONE batch-limit
+// formula.  Replication terms apply even single-node (the limit must not change
+// when a node joins a cluster); every publication — replication and client
+// egress — uses the embedded driver's term (no channel overrides term-length).
+static_assert(NodeConfig::kDefaultMaxProduceBatchBytes == Worker::kMaxProduceBatchBytes,
+              "one 8 MiB ceiling");
 int32_t NodeConfig::produceIntakeLimit() const {
-    return static_cast<int32_t>(std::min<int64_t>(kDefaultMaxProduceBatchBytes,
-                                                  produceBatchFrameCeiling()));
+    return static_cast<int32_t>(Worker::maxAcceptableBatchBytes(
+        static_cast<std::size_t>(workerIngressRingBytes),
+        static_cast<std::size_t>(workerReturnRingBytes),
+        static_cast<std::size_t>(replicationOutboundRingBytes),
+        static_cast<std::size_t>(aeronTermBufferBytes),
+        static_cast<std::size_t>(aeronTermBufferBytes)));
 }
 
 std::optional<std::string> NodeConfig::validateShardConfig() const {
@@ -929,6 +925,15 @@ ConfigResult parseNodeConfig(
     parseLimit("RUNE_WORKER_RETURN_DRAIN_LIMIT",  cfg.workerReturnDrainLimit);
     parseLimit("RUNE_REPL_FRAGMENT_LIMIT",        cfg.replFragmentLimit);
     parseLimit("RUNE_CONSENSUS_FRAGMENT_LIMIT",   cfg.consensusFragmentLimit);
+    // F15 S3: owed-return cap.  Strict: any integer is kept as given and the
+    // [256, 8192] range is enforced at start() (Worker::validateRingConfig), so
+    // 0 / negative refuse loudly; a non-integer is a configuration error here.
+    if (const char* raw = getenv_fn("RUNE_WORKER_MAX_OWED_RETURNS"); raw && *raw) {
+        int32_t v{};
+        if (!parseInt32(raw, v))
+            return {{}, std::string("RUNE_WORKER_MAX_OWED_RETURNS is not a valid integer: ") + raw};
+        cfg.workerMaxOwedReturns = v;
+    }
 
     // RUNE_WORKER_ACK_SLOT_BYTES: return-ring reservation slot size for ProduceResult.
     if (const char* raw = getenv_fn("RUNE_WORKER_ACK_SLOT_BYTES")) {

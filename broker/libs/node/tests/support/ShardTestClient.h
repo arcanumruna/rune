@@ -81,8 +81,10 @@ public:
     static constexpr int32_t kEgressStream = 4242;
     static constexpr int     kMaxIters     = 50'000;   // × 100 µs ⇒ 5 s hard cap per wait
 
-    explicit ShardTestClient(const std::filesystem::path& aeronDir)
-        : driver_(cfgFor(aeronDir), DriverMode::Threaded)
+    /// `termBufferBytes`: the client driver's term — it bounds the client's own
+    /// publications (a Produce frame must fit term / 8).
+    explicit ShardTestClient(const std::filesystem::path& aeronDir, int32_t termBufferBytes = 1 << 20)
+        : driver_(cfgFor(aeronDir, termBufferBytes), DriverMode::Threaded)
     {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
@@ -158,6 +160,28 @@ public:
         return metadata_.value_or(std::vector<PartitionInfo>{});
     }
 
+    /// Push subscription (read_uncommitted) from `fromOffset`; pushed Records and
+    /// any ErrorResponse are captured (records(), errors()).
+    bool subscribe(const std::string& gatewayChannel, int32_t stream, int64_t sessionId,
+                   int32_t topicId, int32_t partition, int64_t fromOffset) {
+        pc::Subscribe s;
+        s.sessionId = sessionId; s.correlationId = ++corr_;
+        s.topicId = topicId; s.partition = partition; s.partitionKnown = 1;
+        s.fromOffset = fromOffset; s.isolation = 0;
+        std::vector<uint8_t> buf(s.encodedSize());
+        const std::size_t len = s.encode(buf.data());
+        return send(gatewayChannel, stream, buf.data(), len);
+    }
+    struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; };
+    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; };
+    /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).
+    template <class Pred> bool pollUntil(Pred pred) {
+        for (int i = 0; i < kMaxIters; ++i) { poll_(); if (pred()) return true; pause_(); }
+        return pred();
+    }
+    const std::vector<PushedRecords>& records() const noexcept { return records_; }
+    const std::vector<ErrorSeen>&     errors()  const noexcept { return errors_; }
+
     bool disconnect(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
         pc::Disconnect d; d.sessionId = sessionId; d.correlationId = ++corr_;
         std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
@@ -181,8 +205,8 @@ public:
     }
 
 private:
-    static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d) {
-        EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = 1 << 20; return c;
+    static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d, int32_t termBufferBytes) {
+        EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes; return c;
     }
     static void pause_() { std::this_thread::sleep_for(std::chrono::microseconds{100}); }
 
@@ -209,6 +233,15 @@ private:
                     metadata_ = std::move(v);
                 }
                 break;
+            case pc::TemplateId::Records:
+                if (auto r = pc::Records::decode(p, n))
+                    records_.push_back({r->subscriptionId, r->baseOffset,
+                                        {r->recordBatch.begin(), r->recordBatch.end()}});
+                break;
+            case pc::TemplateId::ErrorResponse:
+                if (auto e = pc::ErrorResponse::decode(p, n))
+                    errors_.push_back({e->correlationId, e->code, std::string(e->message)});
+                break;
             default: break;
         }
     }
@@ -225,6 +258,8 @@ private:
     std::optional<pc::ConnectResponse>              connect_;
     std::map<int64_t, pc::ProduceResponse>          acks_;
     std::optional<std::vector<PartitionInfo>>       metadata_;
+    std::vector<PushedRecords>                      records_;
+    std::vector<ErrorSeen>                          errors_;
     int64_t                                         corr_ = 0;
 };
 

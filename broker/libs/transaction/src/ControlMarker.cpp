@@ -12,11 +12,11 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/ControlMarker.h>
+#include <rune/transaction/detail/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <cassert>
 #include <cstring>
-#include <mutex>
 
 namespace rune::transaction {
 
@@ -110,30 +110,10 @@ static bool read_varint_zigzag_safe(const uint8_t* buf,
 // ---------------------------------------------------------------------------
 // CRC32C (Castagnoli) — software table
 // ---------------------------------------------------------------------------
-static uint32_t     cm_crc32c_tbl[256];
-static std::once_flag cm_crc32c_once;
-
-static void cm_build_table() noexcept {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j)
-            crc = (crc >> 1) ^ (0x82F63B78u & -(crc & 1u));
-        cm_crc32c_tbl[i] = crc;
-    }
-}
-
-// A6: thread-safe one-time table init (see TransactionLog.cpp rationale).
-static void cm_init_table() noexcept {
-    std::call_once(cm_crc32c_once, cm_build_table);
-}
-
 /*static*/
 uint32_t ControlMarker::crc32c(const uint8_t* data, std::size_t len) noexcept {
-    cm_init_table();
-    uint32_t crc = 0xFFFFFFFFu;
-    for (std::size_t i = 0; i < len; ++i)
-        crc = (crc >> 8) ^ cm_crc32c_tbl[(crc ^ data[i]) & 0xFFu];
-    return crc ^ 0xFFFFFFFFu;
+    // F15 S1: constexpr table (no std::call_once — shared-nothing law).
+    return detail::crc32c(data, len);
 }
 
 // ---------------------------------------------------------------------------

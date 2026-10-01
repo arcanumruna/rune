@@ -242,16 +242,12 @@ void AeronPartitionTransport::sendReconcileResponse(
     enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
 }
 
-// FR trace correlation via per-endpoint MONOTONIC SEQUENCE (not offset — offsets
-// repeat across fast-acks and collide).  Because each ring is FIFO, the k-th
-// enqueued frame is the k-th drained → ReplOutEnqueue(seq=k) pairs 1:1 with
-// ReplOutDrain(seq=k); likewise ReplFragRecv(recvSeq=k) with ReplWorkerOpRun(k).
-// One transport per node → file-static counters are per-process.
-//   g_outEnqSeq  : atomic (enqueue* may be called from >1 worker thread).
-//   g_outDrainSeq: control-thread only.   g_inRecvSeq: control-thread only.
-static std::atomic<uint32_t> g_outEnqSeq{0};
-static uint32_t              g_outDrainSeq = 0;
-static uint32_t              g_inRecvSeq   = 0;
+// FR trace correlation (F16, shared-nothing):
+//   ReplOutEnqueue/ReplOutDrain: corr = the record's ring offset — tryClaim and
+//   read report the same encodedMsgOffset(recordIndex), and an offset is reused
+//   only after the ring wraps, so each enqueue pairs exactly with the next drain
+//   at that offset.  No cross-thread counter (enqueue runs on several workers).
+//   ReplFragRecv: corr = inRecvSeq_, a per-transport member (polling thread only).
 
 // ---------------------------------------------------------------------------
 // enqueueFetchResponse — WORKER-thread side, ZERO-COPY (#2b).
@@ -279,12 +275,10 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
             "AeronPartitionTransport::enqueueFetchResponse: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++oversizedFrameDropped_;   // F18: an oversize, not back-pressure
         return false;
     }
     const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
     if (idx < 0) {                          // full ring → back-pressure, nothing committed
-        ++outboundRingFullCount_;
         return false;
     }
     char* slot = reinterpret_cast<char*>(outboundRing_.base() + idx);
@@ -307,9 +301,8 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     }
     // Advance the flyweight position so the frame is well-formed (commit uses frameLen).
     enc.sbePosition(lenPos + isbe::OutboundFrame::payloadHeaderLength() + payloadLen);
-    outboundRing_.commit(idx);
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue,
-                             g_outEnqSeq.fetch_add(1, std::memory_order_relaxed));
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    outboundRing_.commit(idx);   // FR mark first: it can never trail the drain
     return true;
 }
 
@@ -321,13 +314,10 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
 // skipped (replication is retriable; caller re-drives next cycle). Never blocks.
 // ---------------------------------------------------------------------------
 
-// Per-second transport rate diagnostic (control-thread only; RUNE_FS_LOG).
-static bool     g_txRateLog     = [] { const char* e = std::getenv("RUNE_FS_LOG");
-                                       return e == nullptr || e[0] != '0'; }();
-static int64_t  g_txRateLastNs  = 0;
-static int64_t  g_txPolls       = 0;   // poll() calls
-static int64_t  g_txFragsRecv   = 0;   // onFragment invocations (fragments received)
-static int64_t  g_txOutDrained  = 0;   // outbound messages offered to Aeron
+// Per-second transport rate diagnostic (RUNE_FS_LOG).  The flag is read-only
+// after static init; the counters are per-transport members (F16).
+static const bool g_txRateLog = [] { const char* e = std::getenv("RUNE_FS_LOG");
+                                     return e == nullptr || e[0] != '0'; }();
 
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
@@ -348,26 +338,23 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
             "AeronPartitionTransport::enqueueOutbound: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++oversizedFrameDropped_;   // F18: an oversize, not back-pressure
         return false;
     }
-    // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: bump the
-    // counter and return false WITHOUT committing (nothing claimed, no torn record).
+    // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: return
+    // false WITHOUT committing (nothing claimed, no torn record).
     // The caller treats the skipped send as retriable (the follower re-fetches).
     const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
     if (idx < 0) {
-        ++outboundRingFullCount_;
         return false;
     }
     isbe::OutboundFrame enc;
     enc.wrapAndApplyHeader(reinterpret_cast<char*>(outboundRing_.base() + idx), 0, frameLen);
     enc.targetNodeId(targetNodeId);
     enc.putPayload(reinterpret_cast<const char*>(wire), static_cast<std::uint32_t>(len));
-    outboundRing_.commit(idx);
     // Worker-clock: frame handed to the outbound ring (→ control thread drains it).
-    // corr = monotonic enqueue seq; pairs 1:1 with ReplOutDrain (FIFO ring).
-    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue,
-                             g_outEnqSeq.fetch_add(1, std::memory_order_relaxed));
+    // corr = the record's ring offset; pairs with the ReplOutDrain at that offset.
+    RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutEnqueue, static_cast<uint32_t>(idx));
+    outboundRing_.commit(idx);   // FR mark first: it can never trail the drain
     return true;
 }
 
@@ -399,8 +386,8 @@ int AeronPartitionTransport::drainOutbound()
         // Control-clock: frame drained from the outbound ring + offered to peer(s).
         // corr = monotonic drain seq; k-th drain == k-th enqueue (FIFO) → the gap
         // ReplOutEnqueue(k)→ReplOutDrain(k) is the EXACT worker→control handoff.
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, g_outDrainSeq++);
-        ++g_txOutDrained;
+        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, static_cast<uint32_t>(offset));
+        ++txOutDrained_;
 
         if (target == kBroadcast) {
             for (auto& [nodeId, peer] : peers_) {
@@ -455,15 +442,19 @@ int AeronPartitionTransport::poll(int64_t nowNs)
     work += fragged;
 
     if (g_txRateLog) {
-        ++g_txPolls;
-        if (g_txRateLastNs == 0) g_txRateLastNs = nowNs;
-        else if (nowNs - g_txRateLastNs >= 1'000'000'000LL) {
+        ++txPolls_;
+        if (txRateLastNs_ == 0) txRateLastNs_ = nowNs;
+        else if (nowNs - txRateLastNs_ >= 1'000'000'000LL) {
             spdlog::info("TXRATE[node={}] polls/s={} fragsRecv/s={} outDrained/s={}",
-                         selfId_, g_txPolls, g_txFragsRecv, g_txOutDrained);
-            g_txRateLastNs = nowNs; g_txPolls = 0; g_txFragsRecv = 0; g_txOutDrained = 0;
+                         selfId_, txPolls_, txFragsRecv_, txOutDrained_);
+            txRateLastNs_ = nowNs; txPolls_ = 0; txFragsRecv_ = 0; txOutDrained_ = 0;
         }
     }
     return work;
+}
+
+AeronPartitionTransport::TxStats AeronPartitionTransport::txStatsForTest() const noexcept {
+    return TxStats{txPolls_, txFragsRecv_, txOutDrained_};
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +466,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
     aeron::util::index_t             length,
     aeron::Header&                   /*header*/)
 {
-    ++g_txFragsRecv;
+    ++txFragsRecv_;
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOnFragment, 0);
     return handleFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
                         static_cast<std::size_t>(length));
@@ -588,7 +579,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             // Control-clock: fetch op enqueued to the worker ring (corr=recvSeq).
             // Pairs 1:1 (FIFO) with ReplWorkerOpRun when the worker dequeues it →
             // the gap is the EXACT control→worker handoff latency on this node.
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, g_inRecvSeq++);
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, inRecvSeq_++);
         } else {
             rep->onFetchRequest(req, nowNs_);
         }
@@ -718,7 +709,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
                 return Action::ABORT;
             }
             // Control-clock: apply op enqueued to the worker ring (corr=recvSeq).
-            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, g_inRecvSeq++);
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, inRecvSeq_++);
         } else {
             // INLINE path (no WorkerPool): call applyReplicated synchronously.
             rep->applyReplicated(resp);

@@ -75,6 +75,10 @@ struct TxnLogEntry {
     /// Applied to OffsetStore on commit resolution; discarded on abort.
     /// Persisted so a recovered PrepareCommit re-applies them on resolve.
     std::vector<PendingTxnOffset> pendingOffsets;
+
+    /// F15 concern 3: the txn was ended by an InitProducerId fence (header
+    /// byte 27, bit0) — the §5.4 fence-caller answers survive a restart.
+    bool                   fencingEpoch{false};
 };
 
 // ---------------------------------------------------------------------------

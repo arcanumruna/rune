@@ -581,6 +581,7 @@ void Log::throwIfFailed_() const {
 
 void Log::install_(int64_t base, std::unique_ptr<LogSegment> seg) {
     seg->setStorageState(&storage_);
+    seg->setInstallGen(++segInstallGen_);   // F15 S4 N1: identity, never reused
     auto it = segments_.find(base);
     if (it != segments_.end()) {
         retire_(std::move(it->second));
@@ -628,6 +629,21 @@ void Log::unpinSegmentFlush(LogSegment* seg) noexcept {
             return;
         }
     }
+}
+int64_t Log::nextSegmentBaseAfter(int64_t offset) const noexcept {
+    const auto it = segments_.upper_bound(offset);
+    return it == segments_.end() ? -1 : it->first;
+}
+Log::SegmentBytes Log::segmentBytesAt(int64_t segmentBase) {
+    const auto it = segments_.find(segmentBase);
+    if (it == segments_.end()) return {};
+    SegmentBytes b;
+    b.gen = it->second->installGen();
+    b.fd  = it->second->logFd();
+    const LogReadView v = it->second->mappedBytes();
+    b.data = v.data;
+    b.size = v.len;
+    return b;
 }
 std::vector<int64_t> Log::segmentBaseOffsets() const {
     std::vector<int64_t> v; for (auto& [b, _] : segments_) v.push_back(b); return v;

@@ -12,6 +12,8 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/replication/PartitionReplica.h>
+#include <rune/transaction/ControlMarker.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -490,5 +492,150 @@ TEST_F(WorkerOversizePushRegression, AboveMaxMessageLengthAnswersErrorNoSilentAd
     std::filesystem::remove_all(dirA);
     std::filesystem::remove_all(dirB);
 }
+
+// ===========================================================================
+// F15 S4 (design note §2.4, K1): the worker-push egress arm serves
+// read_committed from the OWNING worker's RC state — bound = LSO(live HW),
+// aborted batches skipped, a pre-carrier group sub CUT at the first aborted
+// batch (addendum R-2).  The cursor (worker-owned) is the deterministic
+// observation; delivery is checked once the data is releasable.
+// ===========================================================================
+class NullTransportRc final : public rune::replication::PartitionTransport {
+public:
+    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
+    void sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override {}
+};
+class TxnRcRegression : public WorkerPushFixture {
+protected:
+    static rune::replication::PartitionConfig leaderCfg() {
+        rune::replication::PartitionConfig c;
+        c.topicId = 10; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.durabilityTier = 1;
+        c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL; c.pushOnAppend = false;
+        c.replicaLagMaxMs = 1'000'000;
+        return c;
+    }
+    static void appendTxn(rune::storage::Log& log, int64_t base, int64_t pid) {
+        rune::protocol::RecordBatchBuilder b(base, 1000 + base);
+        b.setTransactional(true); b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(0);
+        b.append("k", "txn", 1000 + base);
+        (void)log.append(b.build(), base);
+    }
+    static WorkerOp markerOp(rune::replication::PartitionReplica* r, int64_t pid, bool commit) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::AppendControlRecord; op.topicId = r->topicId(); op.partition = 0;
+        op.replica = r; op.logPtr = r->log(); op.correlationId = pid;
+        op.recordBatchBytes = rune::transaction::ControlMarker::build(
+            pid, 0, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+        return op;
+    }
+    WorkerOp rcSubscribeOp(int64_t subId, rune::replication::PartitionReplica* r, uint8_t iso,
+                           bool isGroup = false, bool carrier = true) {
+        WorkerOp op = subscribeOp(subId, r->topicId(), 0, 0, r->log());
+        op.replica = r; op.isolation = iso; op.isGroup = isGroup; op.groupCarrierReceived = carrier;
+        return op;
+    }
+};
+
+TEST_F(TxnRcRegression, WorkerPushReadCommittedHoldsOpenTxn) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendBatch(log, 0, 1);                       // data @0
+    appendTxn(log, 1, /*pid=*/7);                 // open txn @1
+    appendBatch(log, 2, 1);                       // data @2 (behind the LSO)
+    NullTransportRc t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+    ASSERT_EQ(rep.highWatermark(), 3);
+
+    const char* control = "127.0.0.1:24860";
+    WorkerEgress eg(aeron_, control, 3010);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, "127.0.0.1:24861", 3010);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, /*read_committed*/1)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return !c.baseOffsets.empty(); }, 10s));
+    for (int i = 0; i < 64; ++i) w.doWork(1);
+    ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 1)
+        << "the worker push went past the open txn's first offset (HW-bounded, not LSO-bounded)";
+    // COMMIT → the LSO advances to the HW → the held batches are released, in order.
+    ASSERT_TRUE(w.tryEnqueueOp(markerOp(&rep, 7, /*commit=*/true)));
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 3; }, 10s))
+        << "got " << c.baseOffsets.size();
+    EXPECT_EQ(c.baseOffsets, (std::vector<int64_t>{0, 1, 2}));
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(TxnRcRegression, WorkerPushFiltersAbortedBatch) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendTxn(log, 0, /*pid=*/7);                 // txn @0, aborted below
+    NullTransportRc t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+
+    const char* control = "127.0.0.1:24870";
+    WorkerEgress eg(aeron_, control, 3011);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, "127.0.0.1:24871", 3011);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(markerOp(&rep, 7, /*commit=*/false)));   // ABORT @1
+    w.doWork(1);
+    ASSERT_EQ(log.logEndOffset(), 2);
+    appendBatch(log, 2, 1);                       // committed data @2
+    rep.onLeaderLogAppended();
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, /*read_committed*/1)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64);
+                                return !c.baseOffsets.empty() && c.baseOffsets.back() == 2; }, 10s));
+    EXPECT_EQ(c.baseOffsets, (std::vector<int64_t>{2})) << "read_committed worker push delivered the aborted batch";
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 3);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(TxnRcRegression, WorkerPushPreCarrierGroupCutsAtAbortedBatch) {
+    // R-2 on the worker-push arm: pre-carrier (isolation guessed read_committed)
+    // the cursor stops AT the aborted batch; a read_uncommitted carrier then
+    // delivers it (never stripped before the true isolation is known).
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    appendTxn(log, 0, /*pid=*/7);
+    NullTransportRc t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
+    rep.onLeaderLogAppended();
+
+    const char* control = "127.0.0.1:24880";
+    WorkerEgress eg(aeron_, control, 3012);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, "127.0.0.1:24881", 3012);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(markerOp(&rep, 7, /*commit=*/false)));   // ABORT @1
+    w.doWork(1);
+    appendBatch(log, 2, 1);
+    rep.onLeaderLogAppended();
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, 1, /*isGroup=*/true, /*carrier=*/false)));
+    for (int i = 0; i < 64; ++i) w.doWork(1);
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 0) << "pre-carrier: the cursor passed an aborted batch";
+    ASSERT_TRUE(w.tryEnqueueOp(rcSubscribeOp(1, &rep, /*read_uncommitted carrier*/0, true, true)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64);
+                                return !c.baseOffsets.empty() && c.baseOffsets.back() == 2; }, 10s));
+    EXPECT_EQ(c.baseOffsets, (std::vector<int64_t>{0, 2})) << "the aborted batch was lost before the carrier";
+    std::filesystem::remove_all(dir);
+}
+
 
 } // namespace

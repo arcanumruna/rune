@@ -48,6 +48,12 @@ public:
     /// sentinel and corrupt dedup keying).
     static constexpr ProducerId kExhausted = -1;
 
+    /// F15 I7: sentinel returned by allocate() in GATED mode when the next id
+    /// lies at or above the last COMMITTED block ceiling (the next block's
+    /// ceiling record is not yet majority-durable in __transaction_state).
+    /// Retriable: the caller answers ConcurrentTransactions (27).
+    static constexpr ProducerId kBlockNotCommitted = -2;
+
     /// Construct with a starting base (defaults to 0; P5-3 passes recovered watermark).
     explicit ProducerIdAllocator(ProducerId startingBase = 0) noexcept
         : next_(startingBase)
@@ -73,6 +79,11 @@ public:
         // Exhaustion guard (Part B #15): never wrap past INT64_MAX into negative.
         if (next_ == INT64_MAX) {
             return kExhausted;
+        }
+        // F15 I7 (Kafka ProducerIdManager): in gated mode an id is handed out
+        // only from a block whose ceiling record is committed.
+        if (gated_ && next_ >= committedLimit_) {
+            return kBlockNotCommitted;
         }
         if (next_ >= blockCeiling_) {
             // Replenish from the next block, clamping the ceiling at INT64_MAX so
@@ -118,6 +129,35 @@ public:
         if (blockCeiling_ < next_) blockCeiling_ = next_;
     }
 
+    // -----------------------------------------------------------------------
+    // F15 I7 — persisted pid block ceiling (Kafka ProducerIdManager).
+    //
+    // commitLimit(): switch to GATED mode and raise the committed ceiling: ids
+    // in [nextId(), limit) may be handed out because a ceiling record >= limit
+    // is majority-durable in __transaction_state.  Monotone (never lowers).
+    // Ungated allocators (store-less rigs, the disk TransactionLog coordinator)
+    // keep the original unbounded behaviour.
+    // -----------------------------------------------------------------------
+    void commitLimit(ProducerId limit) noexcept {
+        gated_ = true;
+        if (limit > committedLimit_) committedLimit_ = limit;
+    }
+
+    /// Re-arm the gate at a coordinator LOAD: nothing may be handed out until a
+    /// ceiling written by THIS load commits (a limit committed by an earlier
+    /// load of this node is never reused, even though the reseed would already
+    /// place nextId() above it).
+    void resetGate() noexcept {
+        gated_          = true;
+        committedLimit_ = 0;
+    }
+
+    /// True once commitLimit() has been called (allocation is ceiling-gated).
+    [[nodiscard]] bool gated() const noexcept { return gated_; }
+
+    /// The last committed ceiling (exclusive) — meaningful only when gated().
+    [[nodiscard]] ProducerId committedLimit() const noexcept { return committedLimit_; }
+
     /// The next id that will be allocated (monotonically increasing).
     [[nodiscard]] ProducerId nextId() const noexcept { return next_; }
 
@@ -128,6 +168,8 @@ public:
 private:
     ProducerId next_{0};
     ProducerId blockCeiling_{0};
+    bool       gated_{false};
+    ProducerId committedLimit_{0};
 };
 
 } // namespace rune::transaction

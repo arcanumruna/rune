@@ -172,6 +172,24 @@ UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
     cqTail_       = reinterpret_cast<uint32_t*>(cqBase + params.cq_off.tail);
     cqRingMask_   = reinterpret_cast<uint32_t*>(cqBase + params.cq_off.ring_mask);
     cqes_         = reinterpret_cast<struct io_uring_cqe*>(cqBase + params.cq_off.cqes);
+
+    // F15 S4 fix round 3 (RR2-1): IORING_OP_FADVISE exists from kernel 5.6 —
+    // the same release as IORING_REGISTER_PROBE.  A failing probe (older
+    // kernel, restricted ring, seccomp) or an unsupported opcode → no async
+    // hints: the worker uses the synchronous hint instead (never a hint that
+    // fails forever and stalls a read_committed build).
+    fadviseSupported_ = probeOpcode_(IORING_OP_FADVISE);
+}
+
+bool UringFlushBackend::probeOpcode_(uint8_t opcode) noexcept {
+    constexpr unsigned kOps = 256;
+    alignas(struct io_uring_probe) unsigned char buf[sizeof(struct io_uring_probe) +
+                                                     kOps * sizeof(struct io_uring_probe_op)] = {};
+    auto* probe = reinterpret_cast<struct io_uring_probe*>(buf);
+    const long rc = ::syscall(__NR_io_uring_register, ringFd_, IORING_REGISTER_PROBE, probe, kOps);
+    if (rc < 0) return false;
+    if (opcode > probe->last_op) return false;
+    return (probe->ops[opcode].flags & IO_URING_OP_SUPPORTED) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +295,42 @@ CompletionToken UringFlushBackend::submitWithToken(int fd,
         return kNoToken;
     }
 
+    return tok;
+}
+
+// ---------------------------------------------------------------------------
+// F15 S4 fix round 2 (RR1-4): IORING_OP_FADVISE — an asynchronous page-cache
+// read-ahead hint (POSIX_FADV_WILLNEED) on `fd` for [off, off + len).  The
+// kernel forces FADVISE async (io-wq): the worker pays one SQE write and the
+// shared submit.  Same in-flight cap / token space / reap as the fsyncs; the
+// caller routes the token (RouteKind::Hint) so a hint completion — success or
+// error — never reaches produce-ack matching or the fsync fail-stop.
+// ---------------------------------------------------------------------------
+CompletionToken UringFlushBackend::submitFadvise(int fd, int64_t off, uint32_t len, int advice) noexcept {
+    if (inFlight_ >= submitDepth_) return kNoToken;
+    const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);
+    const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED);
+    const uint32_t mask = *sqRingMask_;
+    if (tail - head >= sqRingSize_) return kNoToken;   // SQ full: the caller skips this pass
+    CompletionToken tok = ++nextToken_;
+    if (tok == kNoToken) tok = ++nextToken_;
+    const uint32_t sqeIdx = tail & mask;
+    struct io_uring_sqe* sqe = sqes_ + sqeIdx;
+    std::memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode         = IORING_OP_FADVISE;
+    sqe->fd             = fd;
+    sqe->off            = static_cast<uint64_t>(off);
+    sqe->len            = len;
+    sqe->fadvise_advice = static_cast<uint32_t>(advice);
+    sqe->user_data      = static_cast<uint64_t>(tok);
+    sqArray_[sqeIdx] = sqeIdx;
+    __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE);
+    const int ret = rune_io_uring_enter(ringFd_, /*to_submit=*/1, /*min_complete=*/0, /*flags=*/0);
+    if (ret < 0) {
+        __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE);
+        return kNoToken;
+    }
+    ++inFlight_;
     return tok;
 }
 

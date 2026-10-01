@@ -35,6 +35,7 @@ void ReplicationMetadataBridge::routeBecomeLeader_(
     rune::replication::Epoch                epoch,
     std::vector<rune::replication::NodeId>  isr) noexcept
 {
+    recordIntendedRole_(replica, ReplicaRegistry::IntendedRole::Leader);
     if (workerPool_ && replica->topicId() >= 0) {
         WorkerOp op;
         op.type      = WorkerOp::Type::BecomeLeader;
@@ -65,6 +66,7 @@ void ReplicationMetadataBridge::routeBecomeFollower_(
     rune::replication::NodeId             leaderId,
     bool                                  fence) noexcept
 {
+    recordIntendedRole_(replica, ReplicaRegistry::IntendedRole::Follower);
     if (workerPool_ && replica->topicId() >= 0) {
         WorkerOp op;
         op.type         = WorkerOp::Type::BecomeFollower;
@@ -78,6 +80,19 @@ void ReplicationMetadataBridge::routeBecomeFollower_(
         // Internal partition (topicId < 0) or no worker pool: direct call.
         replica->becomeFollower(epoch, leaderId);
     }
+}
+
+// F15 §3.1: the control-owned intended-role HINT the gateway consults for a fast
+// NotLeader (the owning worker stays the authority).  Keyed by the registry
+// entry (per incarnation); identity is taken from the registry, never read
+// through the replica pointer.
+void ReplicationMetadataBridge::recordIntendedRole_(rune::replication::PartitionReplica* replica,
+                                                    ReplicaRegistry::IntendedRole role) noexcept
+{
+    const int32_t t = replica->topicId();
+    const int32_t p = static_cast<int32_t>(replica->partitionId());
+    const auto h = registry_.lookupHandle(t, p);
+    if (h && h.replica == replica) registry_.setIntendedRole(t, p, h.incarnation, role);
 }
 
 // M1: the bridge chain is noexcept.  WorkerPool::tryEnqueueOp can throw

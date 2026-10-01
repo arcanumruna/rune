@@ -39,6 +39,16 @@ if(aeron_FOUND)
     target_include_directories(rune_replication_aeron INTERFACE ${RUNE_NODE_INCLUDE})
     target_link_libraries(rune_replication_aeron INTERFACE
         rune_replication rune_consensus rune_metadata aeron::aeron spdlog::spdlog rune_codec)
+    # F15 S4 (merged with T11 fix 2 in integration wave 2): Worker.h (reached via
+    # the node headers above) holds the worker-owned read_committed state
+    # (LsoTracker + AbortedTxnIndex, rune/transaction/ReadCommittedView.h), and
+    # the header-inline worker code the transport instantiates calls into
+    # rune_transaction (e.g. LsoTracker::reserve).  F15 had this edge on the
+    # separate rune_replication_aeron library; T11 folded the transport INTO
+    # rune_replication, so the edge moves here.  It closes a STATIC-library
+    # cycle (rune_transaction → rune_coordination → rune_replication), which
+    # CMake resolves by repeating the archives on the link line.
+    target_link_libraries(rune_replication PUBLIC rune_transaction)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING
@@ -57,7 +67,7 @@ if(BUILD_REPLICATION_INTEGRATION_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_replication_integration_tests
-        PROPERTIES TIMEOUT 60)
+        PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()
 
 if(BUILD_TESTING)
@@ -125,7 +135,7 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_replication_aeron_tests
-            PROPERTIES TIMEOUT 60)
+            PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     elseif(BUILD_AERON_REPLICATION_TESTS AND NOT aeron_FOUND)
         message(WARNING
             "BUILD_AERON_REPLICATION_TESTS=ON requires aeron; disabling rune_replication_aeron_tests")
@@ -163,5 +173,5 @@ if(BUILD_AERON_ARCHIVE_TESTS)
         aeron::aeron
         GTest::gtest_main)
     gtest_discover_tests(rune_aeron_archive_tests
-        PROPERTIES TIMEOUT 60)
+        PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()

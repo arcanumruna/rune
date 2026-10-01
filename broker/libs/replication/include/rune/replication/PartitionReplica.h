@@ -315,7 +315,36 @@ public:
     ///
     /// Does NOT block. Does NOT wait for followers. The caller drives doWork()
     /// to pump follower fetches which advance the HW.
+    ///
+    /// F15 N2: a prebuilt control batch (isControlBatch) is never wrapped: it is
+    /// delegated to appendControlBatch (and so may also return kAppendNotLeader).
     Offset append(std::span<const uint8_t> records, bool acksAll = true);
+
+    /// appendControlBatch / append() failure codes (all negative: never an offset).
+    static constexpr Offset kAppendMinIsr       = -1;   ///< gated by min-ISR (retriable)
+    static constexpr Offset kAppendNotLeader    = -2;   ///< this replica is not the leader (retriable)
+    static constexpr Offset kAppendInvalidBatch = -3;   ///< not a whole, CRC-valid control batch
+    static constexpr Offset kAppendBackPressure = -4;   ///< in-memory ring full (retriable)
+
+    /// F15 N2: append a PREBUILT control batch (a txn COMMIT/ABORT marker) AS a
+    /// control batch — the bytes land verbatim (CONTROL|TRANSACTIONAL, the
+    /// marker's producerId), never wrapped as the value of a data batch.
+    ///
+    ///   - role gate: not Leader → kAppendNotLeader (no assert; retriable);
+    ///   - the min-ISR gate of append() → kAppendMinIsr;
+    ///   - the base offset is restamped in place (Log::appendNoSyncRestamp;
+    ///     CRC-safe: [0..7] precede the CRC region), never via makeBatch_;
+    ///   - then append()'s post-append sequence: leader LEO, HW, cleaner
+    ///     publish, push-on-append, and the SAME flush request append() issues
+    ///     (shard: followerFlushRequested_ for the owning worker; legacy: the
+    ///     inline durable sync append() did).
+    ///
+    /// \returns the marker's base offset, or a negative kAppend* code.
+    Offset appendControlBatch(std::span<const uint8_t> controlBatch, bool acksAll = true);
+
+    /// True iff `bytes` is exactly one whole, CRC-valid record batch with the
+    /// CONTROL attribute — i.e. a prebuilt txn marker.
+    [[nodiscard]] static bool isControlBatch(std::span<const uint8_t> bytes) noexcept;
 
     /// CP-1: append a single record with an explicit (non-empty) key.
     ///
@@ -440,6 +469,25 @@ public:
 
     [[nodiscard]] Role        role()           const noexcept { return role_; }
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
+    /// F15 §2.3: DR-BUG-6 leader-completeness (the deficient-leader reconcile is
+    /// done).  Owner thread only.
+    [[nodiscard]] bool        isLeaderComplete() const noexcept { return leaderComplete_; }
+    /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
+    /// content — a tail truncation or a reconcile append of foreign (old-term)
+    /// batches.  A parked waiter compares it with the value it parked under.
+    /// Owner thread only (plain member, no atomic).
+    [[nodiscard]] uint64_t    logGeneration()  const noexcept { return logGeneration_; }
+    /// The offset the log was cut to by the change that last bumped
+    /// logGeneration() (a reconcile append records the LEO before it): every
+    /// offset below it is unchanged by that change.  Owner thread only.
+    [[nodiscard]] Offset      lastTruncationOffset() const noexcept { return lastTruncationOffset_; }
+    /// F15 S4: bumped on every Leader <-> Follower transition (becomeLeader from
+    /// a non-leader, becomeFollower, self-demotion in onFetchRequest) — NOT on a
+    /// leader-epoch bump while still Leader.  While Follower the log may grow by
+    /// replicated appends that a leader-side incremental state never saw, so the
+    /// worker's read_committed state is valid only within one leadership.
+    /// Owner thread only (plain member, no atomic).
+    [[nodiscard]] uint64_t    leadershipGeneration() const noexcept { return leadershipGeneration_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
 
@@ -870,6 +918,9 @@ private:
     bool externalFollowerFlush_ = false;   ///< shard mode: worker submits the flush (async)
     uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
     uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
+    uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation / reconcile append
+    Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
+    uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     void checkpointEpochs_();
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker

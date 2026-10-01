@@ -120,6 +120,19 @@ if(BUILD_BENCHMARKS)
     find_package(benchmark REQUIRED)
 endif()
 
+# TSan environment for every Aeron-using test target (vendored Aeron client
+# internals are suppressed via cmake/tsan-aeron.supp; rune code is not).
+set(RUNE_TSAN_AERON_SUPP "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
+set(RUNE_AERON_TSAN_ENV "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
+# In a TSan build, link a default-options object into EVERY executable so the
+# Aeron suppressions apply even to test targets registered without the env.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=thread")
+    configure_file(${CMAKE_SOURCE_DIR}/cmake/tsan_default_options.cpp.in
+                   ${CMAKE_BINARY_DIR}/rune_tsan_default_options.cpp @ONLY)
+    add_library(rune_tsan_default_options OBJECT ${CMAKE_BINARY_DIR}/rune_tsan_default_options.cpp)
+    link_libraries(rune_tsan_default_options)
+endif()
+
 add_subdirectory(libs/aeronutil)
 add_subdirectory(libs/metadata)
 add_subdirectory(libs/storage)
@@ -220,7 +233,9 @@ if(BUILD_BENCHMARKS)
         benchmark/MultiLeaderProduceBench.cpp
         benchmark/WorkerProduceLatencyBench.cpp
         benchmark/ProduceValidateBench.cpp
-        benchmark/FusedRuntimePassBench.cpp)
+        benchmark/FusedRuntimePassBench.cpp
+        benchmark/WorkerReturnCodecBench.cpp
+        benchmark/RcBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     # FusedRuntimePassBench drives a real broker with the shard tests' wire client.
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests/support)

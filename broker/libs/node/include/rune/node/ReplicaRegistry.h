@@ -57,10 +57,17 @@ public:
     // The identity is stored in the map entry itself: resolving it never reads
     // through a replica pointer.  A miss or an incarnation mismatch = stale.
     // -----------------------------------------------------------------------
+    // F15 §3.1: the role the control plane last ROUTED for this replica
+    // incarnation (the bridge records it when it routes a role op).  A HINT for
+    // the gateway's fast NotLeader only: it may lead or lag the owning worker,
+    // which stays the sole authority (role gate on W).  Unknown = route.
+    enum class IntendedRole : uint8_t { Unknown = 0, Leader = 1, Follower = 2 };
+
     struct Handle {
         rune::replication::PartitionReplica* replica     = nullptr;
         uint32_t                             id          = 0;
         uint32_t                             incarnation = 0;
+        IntendedRole                         intendedRole = IntendedRole::Unknown;
         explicit operator bool() const noexcept { return replica != nullptr; }
     };
     /// Never assigned to a live replica: marks an op whose target is gone.
@@ -69,7 +76,15 @@ public:
     [[nodiscard]] Handle lookupHandle(int32_t topicId, int32_t partition) const noexcept {
         auto it = map_.find(Key{topicId, partition});
         if (it == map_.end()) return {};
-        return Handle{it->second.replica.get(), it->second.id, it->second.inc};
+        return Handle{it->second.replica.get(), it->second.id, it->second.inc, it->second.intended};
+    }
+    /// F15 §3.1: record the role just routed for (topicId, partition) — only if
+    /// the entry is still `incarnation` (a stale routing never tags a new one).
+    /// Control thread only (the registry is single-writer).
+    void setIntendedRole(int32_t topicId, int32_t partition, uint32_t incarnation,
+                         IntendedRole role) noexcept {
+        auto it = map_.find(Key{topicId, partition});
+        if (it != map_.end() && it->second.inc == incarnation) it->second.intended = role;
     }
     /// The live replica for (topicId, partition) iff it is still `incarnation`.
     [[nodiscard]] rune::replication::PartitionReplica*
@@ -217,6 +232,7 @@ private:
         std::unique_ptr<rune::replication::PartitionReplica> replica;
         uint32_t id  = 0;
         uint32_t inc = 0;
+        IntendedRole intended = IntendedRole::Unknown;   ///< F15 hint (per incarnation)
     };
     // M4: incarnations are 32-bit on the ring.  On wrap, 0 (unregistered /
     // not gated) and kStaleIncarnation are skipped, and — once wrapped — any

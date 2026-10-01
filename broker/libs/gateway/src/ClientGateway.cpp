@@ -1,8 +1,10 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <cassert>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/gateway/GatewayReplicaView.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
@@ -268,6 +270,7 @@ void ClientGateway::failPushSubscriptionTooLarge_(Subscription& sub, Session& se
     if (sub.failed) return;
     sub.failed         = true;
     sub.errorOwed      = true;
+    sub.failedCause    = rune::node::PushTooLargeCause::EgressFrame;
     sub.failedFrameLen = frameLen;
     spdlog::error("ClientGateway: push sub={} (topicId={} partition={}) failed at offset={}: "
                   "Records frame {} B exceeds the egress maxMessageLength {} B — "
@@ -283,7 +286,7 @@ void ClientGateway::trySendOwedPushError_(Subscription& sub, Session& session)
     const std::size_t n = rune::node::encodePushTooLargeError(
         scratch_.data(), sub.sessionId, sub.subscriptionId, sub.topicId, sub.partition,
         sub.nextOffset, sub.failedFrameLen,
-        session.egress ? session.egress->maxMessageLength() : 0);
+        session.egress ? session.egress->maxMessageLength() : 0, sub.failedCause);
     if (offerBytes_(&session, scratch_.data(), n) > 0) sub.errorOwed = false;
 }
 
@@ -563,7 +566,13 @@ void ClientGateway::rebuildProducerStateFromLogs()
             //
             // scanTo == hw (same bound used for PSM rebuild above) — bounded to
             // committed records, never seeding from the uncommitted ahead-tail.
-            {
+            //
+            // F15 S4 (Option B): with a worker pool (every production mode) the
+            // OWNING worker builds and serves the read_committed state (§2.3) —
+            // the gateway holds none for those partitions.  Only the no-pool
+            // inline path (unit rigs; the control thread is the single reader
+            // and writer there) keeps this gateway-side state.
+            if (!workerPool_) {
                 PartitionTxnState& ts = getTxnState(topicId, partition);
                 ts.lsoTracker.clear();
                 ts.abortedIndex.clear();
@@ -1283,6 +1292,64 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 // Single-writer: called only from onFragment → doWork duty-cycle thread.
 // Zero heap allocation on hot path: restampScratch_ is a reusable member array.
 // ---------------------------------------------------------------------------
+// F15 S2: the gateway-mirror facts of one successful worker append (idempotent
+// PSM update, dirty-log mark).  From a facts-only return (deferAck) or an
+// immediate final result.  TEMPORARY: S5 moves the PSM onto the owning worker
+// (and deletes this function with the facts-only return).  F15 S4 deleted the
+// LsoTracker feed: the owning worker updates its own RC state at append.
+void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
+{
+    // Success: TX-2 idempotent PSM update.
+    if (ret.producerId >= 0) {
+        const int32_t lastSeqInBatch =
+            ret.baseSequence + ret.recordCount - 1;
+        producerStateManager_.update(
+            ret.topicId, ret.producerId, ret.partition,
+            ret.producerEpoch, ret.baseSequence, lastSeqInBatch,
+            ret.baseOffset);
+    }
+
+    // Mark log dirty for group-commit fsync.
+    //
+    // E5.1.3 (d) R7 fix: when per-worker ingress is active, USER partitions
+    // (topicId >= 0) are exclusively owned by the worker — the worker's doWork
+    // calls syncOwnedLogs_() which drives Log::sync on the owning thread.
+    // The gateway must NOT call Log::sync on worker-owned logs (that would
+    // race with the worker's own appends/sync — TSan race R7).
+    // Internal partitions (topicId < 0) remain on the gateway sync path.
+    const bool workerOwnedLog = perWorkerIngressActive_ && (ret.topicId >= 0);
+    if (!workerOwnedLog && topicRegistry_) {
+        rune::storage::Log* log =
+            topicRegistry_->log(ret.topicId, ret.partition);
+        if (log) {
+            dirtyLogs_.insert(log);
+        }
+    }
+}
+
+void ClientGateway::setWorkerPool(rune::node::WorkerPool* pool) noexcept {
+    workerPool_ = pool;
+    if (!pool) return;
+    for (int32_t i = 0; i < pool->workerCount(); ++i)
+        maxProduceBatchBytes_ = std::min(maxProduceBatchBytes_, pool->worker(i).maxIntakeBatchBytes());
+}
+
+void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
+                                       rune::protocol::client::ErrorCode code)
+{
+    namespace pc = rune::protocol::client;
+    pc::ErrorResponse errResp;
+    errResp.sessionId     = sessionId;
+    errResp.correlationId = correlationId;
+    errResp.code          = static_cast<int16_t>(code);
+    const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2;
+    if (needed <= scratch_.size()) {
+        const std::size_t encoded = errResp.encode(scratch_.data());
+        // G0.1: reliable delivery (retry on back-pressure).
+        enqueueOrBestEffort_(session, scratch_.data(), encoded);
+    }
+}
+
 void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
@@ -1469,87 +1536,34 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    // GR-4: Per-partition NotLeader defence-in-depth.
+    // GR-4 / F15 §3.1 (I1): per-partition NotLeader.
     //
-    // If the ReplicaRegistry is wired in, look up the PartitionReplica for this
-    // (topicId, partition).  If the replica exists and is NOT in Leader role,
-    // reject the produce BEFORE touching the Log.  This is belt-and-suspenders
-    // beyond the cluster-level leaderView_ check above: the cluster check uses a
-    // coarse atomic observer that may lag a partition-level role transition
-    // (particularly during epoch changes).
+    // A worker-owned replica's role is the OWNING worker's state: reading
+    // role() here (control thread) was a data race and a check-then-act race —
+    // the role can change between this check and the worker's append.  The
+    // owning worker is the authority (role gate in executeProduceWire_ /
+    // handleWorkerIngressFrame_).  The gateway holds only a GatewayReplicaView
+    // (no role()) and consults the control-owned intended-role HINT the bridge
+    // records when it routes a role op:
+    //   - Follower → fast NotLeader (nothing routed);
+    //   - Leader or absent → route; W decides.
+    // The hint may lead or lag W; both are safe (W is authoritative, both
+    // answers are retriable).  The bootstrap window (committedMetadataReady_
+    // false, replicas still Follower) is answered NotLeader by W (Q4).
+    // The INLINE path below (no worker pool / gateway-owned internal partition)
+    // is the replica's owner thread and keeps its own role check there.
     //
-    // GATE: committedMetadataReady_ (NOT routingImage_)
-    //
-    //   The GR-4 check is gated on committedMetadataReady_, not on whether
-    //   routingImage_ is non-null.  Since MD1-13 Fix 5, routingImage_ is ALWAYS
-    //   set — even during bootstrap — using a StaticBalancer-derived image
-    //   (deterministic across all nodes).  The StaticBalancer image assigns each
-    //   partition a designated leader node, but user replicas are still in Follower
-    //   role at this point because bridge Step B (committedMap → per-partition role
-    //   promotion) has not yet fired.
-    //
-    //   committedMetadataReady_ becomes true only when committedMap() is non-empty
-    //   (i.e., the metadata log has replicated, committed, and been applied by the
-    //   MetadataStateMachine).  At that point bridge Step B fires and promotes user
-    //   replicas to the correct roles — GR-4 can then correctly enforce the role
-    //   invariant.
-    //
-    // BOOTSTRAP WINDOW (committedMetadataReady_ false):
-    //   User replicas start in Follower role and are only promoted to Leader AFTER
-    //   the metadata log records replicate and commit (bridge Step B).  Applying
-    //   GR-4 here would reject every produce from the designated partition leader
-    //   (whose replica is still Follower) with NotLeader — incorrect during bootstrap.
-    //   The replica is looked up for later use (acks=All ISR path) but the role
-    //   check is suppressed.
-    //
-    // STEADY STATE (committedMetadataReady_ true):
-    //   Bridge Step B has fired, replicas are in the correct roles.  If routingImage_
-    //   says "local" but the replica is Follower, that IS a genuine conflict and
-    //   the NotLeader rejection is correct.
-    //
-    // We accept the produce when:
-    //   a) replicaRegistry_ is null (replication not wired in — passthrough).
-    //   b) no replica found for this (topicId, partition) — sparse replica map.
-    //   c) replica.role() == Leader.
-    //   d) committedMetadataReady_ is false (bootstrap window — bridge Step B not
-    //      yet fired; Follower role is expected, not an error).
-    //
-    // We reject (NotLeader) when replica.role() == Follower AND
-    // committedMetadataReady_ is true (steady state: genuine role conflict).
-    //
-    // O(1) lookup (unordered_map): zero per-op alloc, lock-free (single-writer).
-    rune::replication::PartitionReplica* replica = nullptr;
-    if (replicaRegistry_ && committedMetadataReady_) {
-        // GR-4 check: only in steady state (committedMetadataReady_ true —
-        // committedMap non-empty, bridge Step B has promoted replicas to correct
-        // roles).  Skipped during bootstrap (committedMetadataReady_ false).
-        //
-        replica = replicaRegistry_->lookup(msg.topicId, partition);
-        if (replica && replica->role() != rune::replication::Role::Leader) {
-            // Per-partition NotLeader: reject without appending.
-            // Use the same errResp path as the cluster-level check above.
-            pc::ErrorResponse errResp;
-            errResp.sessionId     = msg.sessionId;
-            errResp.correlationId = msg.correlationId;
-            errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            spdlog::debug("ClientGateway: Produce per-partition NotLeader "
+    // O(1) lookup (unordered_map): zero per-op alloc, single-writer.
+    GatewayReplicaView replica;
+    if (replicaRegistry_) {
+        replica = GatewayReplicaView{replicaRegistry_->lookupHandle(msg.topicId, partition)};
+        if (replica.intendedRole() == GatewayReplicaView::IntendedRole::Follower) [[unlikely]] {
+            spdlog::debug("ClientGateway: Produce per-partition NotLeader (intended-role hint) "
                           "(topicId={} partition={}) sessionId={}",
                           msg.topicId, partition, msg.sessionId);
-            const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
-                                       pc::ErrorResponse::BODY_FIXED + 2;
-            if (needed <= scratch_.size()) {
-                const std::size_t encoded = errResp.encode(scratch_.data());
-                // G0.1: reliable delivery (retry on back-pressure).
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
-            }
-            return;  // engine untouched — no append
+            sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
+            return;  // engine untouched — no append, nothing routed
         }
-        // replica is either nullptr (no replica for this partition — passthrough)
-        // or role == Leader (allow produce through).
-    } else if (replicaRegistry_ && !committedMetadataReady_) {
-        // Bootstrap window: look up replica for later (acks=All ISR check) but
-        // do NOT reject based on role — bridge Step B has not yet fired.
-        replica = replicaRegistry_->lookup(msg.topicId, partition);
     }
 
     // 5. Assign offsets (CRC-safe restamp).
@@ -1568,6 +1582,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // silently drop.  The zero-copy append path has no fixed scratch cap anymore;
     // this bound only protects the worker ingress ring / log segment from an
     // absurd or malformed length.  The client caps its batch wire-size below this.
+    // F15 S3 (review m4 / I-1): the gateway and the worker share these bounds.
+    static_assert(kMaxProduceBatchBytes == rune::node::Worker::kMaxProduceBatchBytes,
+                  "gateway and shard-ingress max produce batch must match");
+    static_assert(kMaxChunkBytes == rune::node::Worker::kMaxPushReadChunkBytes,
+                  "gateway and worker PushRead chunk budget must match");
     if (batchLen > maxProduceBatchBytes_) {
         spdlog::warn("ClientGateway: Produce batch too large ({} > {}); rejected (MessageTooLarge)",
                      batchLen, maxProduceBatchBytes_);
@@ -1672,8 +1691,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // fell back) — never both — so routing gateway-received produce to the worker
     // appends it exactly once.  Internal partitions (topicId < 0) are gateway-owned
     // and stay on the inline path below.
-    const bool routeToWorker =
-        workerPool_ && (!perWorkerIngressActive_ || msg.topicId >= 0);
+    const bool routeToWorker = routesToWorker_(msg.topicId);   // F15 K3: shared with markers
     if (routeToWorker) {
         // ---------------------------------------------------------------------------
         // WORKER PATH: Parse + validate the batch inline (same logic as before) so
@@ -1786,7 +1804,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.type         = rune::node::WorkerOp::Type::Produce;
         op.topicId      = msg.topicId;
         op.partition    = partition;
-        op.replica      = replica;
+        replica.stampRouting(op);
         op.logPtr       = log;
         op.sessionId    = msg.sessionId;
         op.correlationId = msg.correlationId;
@@ -1796,13 +1814,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.baseSequence  = msg.baseSequence;
         op.lastOffsetDelta = lastOffsetDelta;
         op.recordCount   = recordCount;
-        op.deferAck      = acksAll && replica && committedMetadataReady_;
+        op.deferAck      = acksAll && static_cast<bool>(replica) && committedMetadataReady_;
         op.minIsr        = cachedMinIsr_;   // the admission policy; the worker gates on its own ISR
         op.enqueuedAtNs  = nowNs_;
         // E3 Task 5: plumb the topic's async-durability tier so the worker
         // knows whether to defer the ack until fsync completion (Strict=2).
         // Majority (1) is the default — keeps existing behavior unchanged.
-        op.durabilityTier = replica ? replica->durabilityTier() : 1;
+        op.durabilityTier = replica.durabilityTier();
 
         // Capture batch attributes for LSO tracking (forwarded in return).
         constexpr std::size_t kAttrOffset =
@@ -1858,8 +1876,10 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // update), min-ISR gate (acks=All + isrSize vs minIsr), appendNoSync, and
     // Strict-tier sync().  Returns a ProduceOutcome.
     //
-    // The gateway retains ownership of: LSO tracking (getTxnState), dirty-log
-    // set, replica->onLeaderLogAppended(), and deferred-ack queue management.
+    // The gateway retains ownership of (this NO-WORKER-POOL inline path only):
+    // LSO tracking (getTxnState — F15 S4: never used with a worker pool, where
+    // the owning worker holds the read_committed state), dirty-log set,
+    // replica->onLeaderLogAppended(), and deferred-ack queue management.
     //
     // Durability contract — acks=Leader (acks=1):
     //   Records are written to the OS page cache and visible to Log::read()
@@ -1868,13 +1888,24 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //   appendNoSync() and sync() may lose the most-recent un-flushed acked
     //   records.  True crash-durability requires acks=All + ISR replication
     //   (GR-5/Milestone C).
-    const uint8_t effectiveTier = replica ? replica->durabilityTier() : 1;
+    // F15 §3.1: the inline path runs on the replica's OWNER thread (no worker
+    // pool, or a gateway-owned internal partition) — its live state is ours.
+    rune::replication::PartitionReplica* const ownedReplica = replica.controlOwned();
+    if (ownedReplica && committedMetadataReady_ &&
+        ownedReplica->role() != rune::replication::Role::Leader) {
+        spdlog::debug("ClientGateway: Produce per-partition NotLeader (inline owner) "
+                      "(topicId={} partition={}) sessionId={}",
+                      msg.topicId, partition, msg.sessionId);
+        sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
+        return;  // engine untouched — no append
+    }
+    const uint8_t effectiveTier = replica.durabilityTier();
     // ISR size for min-ISR gate: only applies in steady state (committedMetadataReady_
     // true) and when a replica is wired.  Zero causes the helper to skip the gate
     // (passthrough — single-node / bootstrap).
     // Note: bootstrap-window acks=All is already rejected above before we reach here.
-    const int isrSizeForHelper = (acksAll && replica && committedMetadataReady_)
-                                 ? static_cast<int>(replica->isr().size()) : 0;
+    const int isrSizeForHelper = (acksAll && ownedReplica && committedMetadataReady_)
+                                 ? static_cast<int>(ownedReplica->isr().size()) : 0;
 
     const auto outcome = rune::node::handleProduceBatch(
         rbData, batchLen,
@@ -1936,8 +1967,8 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     // No double-append: the Log was written once by the helper's appendNoSync().
     // onLeaderLogAppended() only reads the Log's LEO and updates in-memory state.
-    if (replica) {
-        replica->onLeaderLogAppended();
+    if (ownedReplica) {
+        ownedReplica->onLeaderLogAppended();
     }
 
     // 6. Reply ProduceResponse or enqueue deferred ack.
@@ -1949,7 +1980,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // acks=All during the bootstrap window (!committedMetadataReady_) is rejected
     // ABOVE before reaching here; by this point either acks != All or
     // committedMetadataReady_ is true.
-    const bool deferAck = acksAll && replica && committedMetadataReady_;
+    const bool deferAck = acksAll && ownedReplica && committedMetadataReady_;
     if (!deferAck) {
         // Immediate ack: acks=Leader or no replica wired (passthrough).
         sendResp(pc::ErrorCode::OK, partition, outcome.baseOffset);
@@ -1972,8 +2003,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         entry.lastOffset    = outcome.lastOffset;
         entry.enqueuedAtNs  = nowNs_;
         entry.topicId       = msg.topicId;
-        entry.incarnation   = replicaRegistry_
-            ? replicaRegistry_->lookupHandle(msg.topicId, partition).incarnation : 0u;
+        entry.incarnation   = replica.incarnation();
 
         pendingAcks_.push_back(entry);  // no heap alloc (capacity pre-reserved)
 
@@ -2457,6 +2487,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
                     // permanent record loss.
                     gsub.isolation            = msg.isolation;
                     gsub.groupCarrierReceived = true;
+                    gsub.parkedAtHw           = -1;   // F15 R-3: a new isolation → read again
                     spdlog::debug("ClientGateway: Subscribe carries isolation={} to group "
                                   "sub sessionId={} subId={} topic={} partition={} "
                                   "(no duplicate subscription)",
@@ -2549,12 +2580,12 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 //           in the Kafka sense refers to open TRANSACTIONS (no-op in Milestone B/C
 //           scope here) — it does NOT mean "allow delivery of truncatable records".
 //           We default ALL subscribers to HW-bounded to be safe.
-//         isolation=1 (read_committed): also bounded by HW.  Once transactions land
-//           (Milestone C), read_committed will additionally be bounded by the real
-//           LSO (log-stable-offset).  LSO ≤ HW always, so the HW gate is the outer
-//           bound and LSO will be the inner one.
-//           // TODO(Milestone C): read_committed additionally uses real LSO once
-//           // transactions land.  For now both modes use HW.
+//         isolation=1 (read_committed): additionally bounded by the LSO and
+//           aborted batches are filtered.  F15 S4 (Option B, I-B): with a worker
+//           pool (every production mode) the gateway HW snapshot only bounds the
+//           PushRead REQUEST — the owning worker decides read_committed from its
+//           own RC state (executePushReadWire_).  Only the no-pool inline path
+//           below keeps a gateway-side LSO (unit rigs; deletion scheduled T16).
 //
 //       If no replica is found (topic not replicated, or replicaRegistry_ null),
 //       fall back to logEndOffset() — single-node / non-replicated path where HW
@@ -2582,6 +2613,7 @@ void ClientGateway::pushSubscriptions()
 {
     using namespace rune::protocol::batch;
 
+    ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
     if (subscriptions_.empty()) return;
 
     for (auto& [subId, sub] : subscriptions_) {
@@ -2632,8 +2664,15 @@ void ClientGateway::pushSubscriptions()
         // internal coordinator data, not application records).
         //
         // No heap alloc: getTxnStateRO is O(unordered_map lookup) = O(1) amortised.
+        //
+        // F15 S4 (I-B): with a worker pool the gateway makes NO read_committed
+        // decision.  Its HW snapshot only bounds (loosens) the PushRead request;
+        // the owning worker clamps the answer to its own LSO and strips aborted
+        // and control batches (executePushReadWire_).  Only the no-pool inline
+        // path below keeps a gateway-side LSO.
         int64_t bound = hw;
-        if (sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted)) {
+        if (!workerPool_ &&
+            sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted)) {
             if (const PartitionTxnState* ts = getTxnStateRO(sub.topicId, sub.partition)) {
                 bound = ts->lsoTracker.lso(hw);
             }
@@ -2655,6 +2694,15 @@ void ClientGateway::pushSubscriptions()
                 // In-flight — skip until the return is processed.
                 continue;
             }
+            // F15 addendum R-3: the owning worker answered "nothing below its
+            // bound" (an open txn pins the LSO, a pre-carrier cut, the HW) for
+            // this cursor at HW snapshot parkedAtHw — re-issue only once the HW
+            // snapshot moved past it (any LSO advance needs a marker append,
+            // which moves the HW).  No empty-PushRead spin.
+            if (sub.parkedAtHw >= 0 && hw <= sub.parkedAtHw) continue;
+            // Hold-capacity fallback (the worker could not hold a not-Ready
+            // read_committed read): back off in push cycles, never a spin.
+            if (sub.retryAtCycle > pushCycle_) continue;
 
             // Look up the owning replica (for the log accessor in the worker).
             const rune::replication::PartitionReplica* repForRead = nullptr;
@@ -2684,6 +2732,9 @@ void ClientGateway::pushSubscriptions()
             } else {
                 // Successfully enqueued — mark as in-flight.
                 pendingWorkerReads_.insert(subId);
+                sub.issuedNextOffset = sub.nextOffset;   // R-1: the cursor this read answers
+                sub.issuedHw         = bound;
+                sub.parkedAtHw       = -1;
             }
             continue; // Gateway will process the return in the next cycle.
         }
@@ -3019,14 +3070,15 @@ void ClientGateway::onControlRecordAppended_(const rune::node::WorkerReturn& ret
         spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} FAILED "
                       "to append (error={}) — surfaced to the txn coordinator",
                       m.topicId, m.partition, m.producerId, ret.errorCode);
-        if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode);
+        if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode,
+                                                             m.coordinatorEpoch);
         return;
     }
-    // The AUTHORITATIVE offset: where the worker actually appended the marker.
-    notifyControlMarker(m.topicId, m.partition, m.producerId, ret.baseOffset, m.commit);
+    // F15 S4 (Option B): the owning worker applied the marker to its own RC
+    // state in the same invocation as the append — the gateway holds none.
     // Round 5: only now may the coordinator count this partition's marker as
     // written (the transaction completes when the last one lands).
-    if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId);
+    if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId, m.coordinatorEpoch);
 }
 
 void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
@@ -3045,7 +3097,8 @@ void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
             if (invariantViolationHandler_) invariantViolationHandler_(what);
             return;
         }
-        if (txnService_) txnService_->onControlMarkerRefused(ret.topicId, ret.partition, ret.producerId, ret.errorCode);
+        if (txnService_) txnService_->onControlMarkerRefused(ret.topicId, ret.partition, ret.producerId, ret.errorCode,
+                                                             ITxnRequestHandler::kAnyCoordinatorEpoch);
         return;
     }
     MarkerInFlight& m = it->second;
@@ -3072,7 +3125,8 @@ void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
     spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} REFUSED "
                   "(partition not on this node) — surfaced to the txn coordinator as NotLeader",
                   m.topicId, m.partition, m.producerId);
-    if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode);
+    if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode,
+                                                         m.coordinatorEpoch);
     markersInFlight_.erase(it);
 }
 
@@ -3083,6 +3137,25 @@ void ClientGateway::raiseStorageFailure_(const std::string& logDir, int err)
     if (storageFailureRaised_) return;
     storageFailureRaised_ = true;
     if (storageFailureHandler_) storageFailureHandler_(logDir, err);
+}
+
+// F15 S4 addendum R-3 + review I-1 / I-2: what a PushReadResult tells the
+// scheduler.  Park the subscription (re-read only once the gateway HW snapshot
+// moves past the one the read was issued at) ONLY on an explicit answer: a
+// bound >= 0, ready, and the cursor at / past it.  An unanswered result (a
+// refusal, no log: bound -1) parks nothing — the next push cycle re-issues.  A
+// notReady result (the worker's hold capacity was exhausted) backs off
+// 1, 2, 4 … 1024 push cycles, reset by the next ready answer.
+void ClientGateway::noteWorkerReadAnswer_(Subscription& sub, int64_t effectiveBound, bool notReady) noexcept
+{
+    if (notReady) {
+        sub.notReadyBackoff = sub.notReadyBackoff == 0 ? 1 : std::min<int64_t>(sub.notReadyBackoff * 2, 1024);
+        sub.retryAtCycle    = pushCycle_ + sub.notReadyBackoff;
+        return;
+    }
+    sub.notReadyBackoff = 0;
+    sub.retryAtCycle    = 0;
+    if (effectiveBound >= 0 && sub.nextOffset >= effectiveBound) sub.parkedAtHw = sub.issuedHw;
 }
 
 void ClientGateway::drainWorkerReturns_()
@@ -3141,6 +3214,21 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // worker→gateway return-ring + duty-cycle latency (same correlationId).
             RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp,
                                  static_cast<uint32_t>(ret.correlationId));
+            // F15 S2 fix round 1 (review C1) — TEMPORARY, deleted by S4 (LSO on
+            // W) and S5 (PSM on W): a facts-only return (deferAck == true) is
+            // emitted by the owning worker AT APPEND for a produce whose answer
+            // it parks (acks=all / Strict).  Apply the PSM / LSO / dirty-log
+            // facts now — whatever the session state — and answer nothing: the
+            // final result follows when the worker's waiter fires.
+            // Only a SUCCESS can be facts-only (fix round 2, B1): an error result
+            // is always an answer — it must reach the client and must never
+            // feed the mirrors (the batch was not appended).
+            assert(!(ret.deferAck && ret.errorCode != 0) &&
+                   "worker invariant: an error ProduceResult never carries deferAck");
+            if (ret.deferAck && ret.errorCode == 0) {
+                applyProduceFacts_(ret);
+                return;
+            }
             Session* session = sessions_.find(ret.sessionId);
             if (!session) {
                 // Session gone — drop result silently.
@@ -3168,78 +3256,16 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 return;
             }
 
-            // Success: TX-2 idempotent PSM update.
-            if (ret.producerId >= 0) {
-                const int32_t lastSeqInBatch =
-                    ret.baseSequence + ret.recordCount - 1;
-                producerStateManager_.update(
-                    ret.topicId, ret.producerId, ret.partition,
-                    ret.producerEpoch, ret.baseSequence, lastSeqInBatch,
-                    ret.baseOffset);
+            // Success: the append facts (no-op for a final result that follows a
+            // facts-only return — the worker strips its producerId / attrs).
+            applyProduceFacts_(ret);
 
-                // TX-4 Task 9: Feed LsoTracker for transactional data batches.
-                constexpr uint16_t kTransactionalBit = 0x10u;
-                if (ret.batchAttrs & kTransactionalBit) {
-                    getTxnState(ret.topicId, ret.partition)
-                        .lsoTracker.onProduceBatch(ret.producerId, ret.baseOffset);
-                }
-            }
-
-            // Mark log dirty for group-commit fsync.
-            //
-            // E5.1.3 (d) R7 fix: when per-worker ingress is active, USER partitions
-            // (topicId >= 0) are exclusively owned by the worker — the worker's doWork
-            // calls syncOwnedLogs_() which drives Log::sync on the owning thread.
-            // The gateway must NOT call Log::sync on worker-owned logs (that would
-            // race with the worker's own appends/sync — TSan race R7).
-            // Internal partitions (topicId < 0) remain on the gateway sync path.
-            const bool workerOwnedLog = perWorkerIngressActive_ && (ret.topicId >= 0);
-            if (!workerOwnedLog && topicRegistry_) {
-                rune::storage::Log* log =
-                    topicRegistry_->log(ret.topicId, ret.partition);
-                if (log) {
-                    dirtyLogs_.insert(log);
-                }
-            }
-
-            // Deferred ack (acks=All) or immediate ack (acks=Leader/None).
-            if (ret.deferAck) {
-                if (pendingAcks_.size() >= kMaxPendingAcks) {
-                    spdlog::warn(
-                        "ClientGateway: drainWorkerReturns_ pendingAcks_ full "
-                        "({} entries); acks=All result rejected with MinIsrViolation "
-                        "sessionId={} topicId={} partition={}",
-                        kMaxPendingAcks, ret.sessionId, ret.topicId, ret.partition);
-                    pc::ProduceResponse errResp;
-                    errResp.sessionId     = ret.sessionId;
-                    errResp.correlationId = ret.correlationId;
-                    errResp.errorCode     =
-                        static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
-                    errResp.partition     = ret.partition;
-                    errResp.baseOffset    = 0;
-                    const std::size_t encoded = errResp.encode(scratch_.data());
-                    // G0.1: reliable delivery (retry on back-pressure).
-                    enqueueOrBestEffort_(*session, scratch_.data(), encoded);
-                    return;
-                }
-
-                PendingAck entry;
-                entry.sessionId     = ret.sessionId;
-                entry.correlationId = ret.correlationId;
-                entry.partition     = ret.partition;
-                entry.baseOffset    = ret.baseOffset;
-                entry.lastOffset    = ret.lastOffset;
-                entry.enqueuedAtNs  = ret.enqueuedAtNs;
-                entry.topicId       = ret.topicId;
-                entry.incarnation   = ret.incarnation;   // echoed from the routed op
-                pendingAcks_.push_back(entry);
-
-                spdlog::debug(
-                    "ClientGateway: drainWorkerReturns_ acks=All produce enqueued "
-                    "pending-ack sessionId={} partition={} baseOffset={} lastOffset={}",
-                    ret.sessionId, ret.partition, ret.baseOffset, ret.lastOffset);
-            } else {
-                // Immediate ack (acks=Leader/None) — encode + reliable egress send.
+            // F15 I-A: every ProduceResult from a worker is FINAL.  The owning
+            // worker answers acks=all itself — parked on W until the HW passes
+            // with |ISR| >= minIsr and the §3.2 role / ownership / log-generation
+            // re-validation holds — so the gateway never parks a worker-owned
+            // ack (its pendingAcks_ serves only the inline, control-owned path).
+            {
                 RUNE_FR_SPAN_PRODUCE(rune_fr::Site::ProduceAckSend,
                                      static_cast<uint32_t>(ret.correlationId));
                 pc::ProduceResponse okResp;
@@ -3262,18 +3288,58 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // Always clear the in-flight marker regardless of outcome.
             pendingWorkerReads_.erase(ret.subscriptionId);
 
-            if (ret.chunk.empty()) return; // nothing to push this cycle
-
-            // Find the owning session.
-            Session* session = sessions_.find(ret.sessionId);
-            if (!session) return;
+            // F15 S3 re-review 1 I-4: the next stored batch is larger than the
+            // worker's return ring can carry — fail this subscription once,
+            // non-retriably, and park it (never re-issue the read: no spin).
+            // Merged with F19 (integration wave 2): the SAME failure state and the
+            // same owed error (encodePushTooLargeError: MessageTooLarge,
+            // correlationId 0, subscription named — re-review 2 m-f), re-offered
+            // each push cycle until sent (errorOwed) — never best-effort.
+            if (ret.errorCode != 0) [[unlikely]] {
+                auto it = subscriptions_.find(ret.subscriptionId);
+                if (it == subscriptions_.end() || it->second.failed) return;
+                Subscription& sub = it->second;
+                sub.failed         = true;
+                sub.errorOwed      = true;
+                sub.failedCause    = rune::node::PushTooLargeCause::ReturnRing;
+                sub.failedFrameLen = 0;
+                spdlog::error("ClientGateway: subscription {} (topicId={} partition={} offset={}) failed: "
+                              "worker answered error {} (a stored batch exceeds the worker return ring) — "
+                              "MessageTooLarge, subscription parked (cursor not advanced)",
+                              ret.subscriptionId, ret.readTopicId, ret.readPartition, ret.newNextOffset,
+                              ret.errorCode);
+                if (Session* session = sessions_.find(sub.sessionId))
+                    trySendOwedPushError_(sub, *session);
+                return;
+            }
 
             // Find the subscription (it may have been removed if the client
             // unsubscribed while the read was in-flight).
             auto subIt = subscriptions_.find(ret.subscriptionId);
             if (subIt == subscriptions_.end()) return;
             Subscription& sub = subIt->second;
-            if (sub.failed) [[unlikely]] return;   // F19: parked — never push past the failed batch
+            if (sub.failed) [[unlikely]] return;   // F19 ⇄ F15 S3: parked — never push past the failed batch
+            // A result for a cursor the subscription no longer holds (rewound /
+            // re-seeded meanwhile) carries nothing to adopt.
+            const bool current = sub.nextOffset == sub.issuedNextOffset;
+
+            if (ret.chunk.empty()) {
+                // F15 addendum R-1: the worker may have consumed batches without
+                // returning any (a trailing marker, an aborted tail stripped on
+                // the worker) — adopt its cursor, else the partition is re-read
+                // every cycle.  R-3: a cursor at the worker's effective bound
+                // parks until the gateway's HW snapshot moves.
+                if (current) {
+                    if (ret.newNextOffset > sub.nextOffset) sub.nextOffset = ret.newNextOffset;
+                    noteWorkerReadAnswer_(sub, ret.pushEffectiveBound(), ret.pushRcNotReady());
+                }
+                return;
+            }
+
+            // Find the owning session.
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            if (!current) return;   // stale cursor: the next push cycle re-reads
 
             // Iterate whole record batches in the chunk — mirrors the inline
             // pushSubscriptions() loop exactly.
@@ -3364,39 +3430,10 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                     continue;
                 }
 
-                // TX-4: Aborted-txn filter for read_committed.
-                if (ret.isolation == static_cast<uint8_t>(
-                        rune::transaction::IsolationLevel::ReadCommitted)
-                    && (batchAttrs & kTransactionalBit))
-                {
-                    constexpr std::size_t kPidOff =
-                        static_cast<std::size_t>(kProducerIdOffset);
-                    if (chunkPos + kPidOff + 8u <= chunkSize) {
-                        int64_t batchPid = 0;
-                        for (int bi = 0; bi < 8; ++bi)
-                            batchPid |= (static_cast<int64_t>(
-                                batchPtr[kPidOff + bi]) << (bi * 8));
-
-                        if (const PartitionTxnState* ts =
-                                getTxnStateRO(ret.readTopicId, ret.readPartition))
-                        {
-                            if (ts->abortedIndex.isAborted(batchPid, baseOffset)) {
-                                if (sub.isGroup && !sub.groupCarrierReceived) {
-                                    spdlog::debug(
-                                        "ClientGateway: push (worker) sub={} "
-                                        "pre-carrier group sub stalling at aborted "
-                                        "batch offset={}",
-                                        ret.subscriptionId, baseOffset);
-                                    break;
-                                }
-                                chunkPos += batchSize;
-                                sub.nextOffset =
-                                    baseOffset + static_cast<int64_t>(recordCount);
-                                continue;
-                            }
-                        }
-                    }
-                }
+                // F15 S4 (I-B): aborted transactional batches were stripped by
+                // the owning worker (and, before a group's isolation carrier,
+                // the chunk was CUT at the first one — addendum R-2): the
+                // gateway makes no read_committed decision.
 
                 // Records frame (zero-copy batch span).  F19: any size up to the
                 // egress maxMessageLength is delivered; above it the subscription
@@ -3430,6 +3467,13 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                         "offset={} (pos={})",
                         ret.subscriptionId, baseOffset, pos);
                 }
+            }
+            // F15 addendum R-1 / R-3: every batch of the chunk was delivered →
+            // adopt the worker's cursor (it is past the batches it stripped
+            // after the last one returned) and park at its effective bound.
+            if (!backPressured && chunkPos >= chunkSize) {
+                if (ret.newNextOffset > sub.nextOffset) sub.nextOffset = ret.newNextOffset;
+                noteWorkerReadAnswer_(sub, ret.pushEffectiveBound(), ret.pushRcNotReady());
             }
             return;
         }
@@ -4098,9 +4142,28 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
 //
 // Single-writer: must be called on the duty-cycle thread.
 // ---------------------------------------------------------------------------
+std::size_t ClientGateway::purgeQueuedMarkers(int32_t olderThan)
+{
+    std::size_t purged = 0;
+    for (auto q = markerSendQueue_.begin(); q != markerSendQueue_.end();) {
+        auto it = markersInFlight_.find(*q);
+        if (it != markersInFlight_.end() && it->second.coordinatorEpoch < olderThan) {
+            markersInFlight_.erase(it);
+            q = markerSendQueue_.erase(q);
+            ++purged;
+        } else {
+            ++q;
+        }
+    }
+    if (purged > 0)
+        spdlog::info("ClientGateway: purged {} queued control marker(s) of coordinator epochs < {}", purged, olderThan);
+    return purged;
+}
+
 int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
                                             std::span<const uint8_t> marker,
-                                            int64_t producerId, bool commit)
+                                            int64_t producerId, bool commit,
+                                            int32_t coordinatorEpoch)
 {
     if (!topicRegistry_) {
         spdlog::warn("ClientGateway::appendControlRecord: no TopicRegistry — dropped");
@@ -4122,21 +4185,26 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         replica = replicaRegistry_->lookup(topicId, partition);
     }
 
-    // Task #13: close appendControlRecord write-write race (TSan).
+    // Task #13 / F15 K3: the marker is appended by the OWNING worker under
+    // EXACTLY the produce-routing predicate (routesToWorker_), in every mode —
+    // including the default (Legacy) config, where produces already go to the
+    // worker: appending the marker inline here was a write-write race with the
+    // worker, and the marker overtook produces still queued on its op ring.
+    // Queued on the same op ring, the marker lands after every produce routed
+    // before it (L4).
     //
-    // When per-worker ingress is active, the worker is the SOLE appender for
-    // USER partitions (topicId >= 0).  Appending to a worker-owned log from the
-    // gateway thread is a write-write race.  Route the append to the owning
-    // worker via the SPSC ingress ring instead.
-    //
-    // Task 10 round 4 (P1): the marker's offset is NOT pre-computed here
-    // (log->logEndOffset() is stale whenever produces are queued ahead of the
-    // marker in the worker ring — the marker lands after them).  The worker
-    // returns the offset it ACTUALLY appended at (ControlRecordAppended) and
-    // onControlRecordAppended_ feeds notifyControlMarker with it.  The caller
+    // Task 10 round 4 (P1): the marker's offset is NOT pre-computed here; the
+    // worker returns where it ACTUALLY landed (ControlRecordAppended) and
+    // the owning worker applied it to its own RC state in the same invocation
+    // (F15 S4; no gateway-side LSO with a worker pool).  The caller
     // gets kControlRecordAsync.  A full ring never drops the marker: it waits in
-    // markerSendQueue_ and is retried every doWork, in order.
-    if (perWorkerIngressActive_ && topicId >= 0 && replica && workerPool_) {
+    // markerSendQueue_ and is retried every doWork, in order.  An unregistered
+    // partition is stamped stale by WorkerPool and answered through the normal
+    // refusal path.
+    //
+    // The inline branch below remains only without a worker pool (unit rigs) and
+    // for gateway-owned internal partitions in shard mode (never markers).
+    if (routesToWorker_(topicId)) {
         if (marker.empty()) return -1;
         if (producerId < 0 && marker.size() >= 43u + 8u) {
             producerId = 0;
@@ -4148,6 +4216,7 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         m.partition  = partition;
         m.producerId = producerId;
         m.commit     = commit;
+        m.coordinatorEpoch = coordinatorEpoch;
         m.bytes.assign(marker.begin(), marker.end());
         markersInFlight_.emplace(token, std::move(m));
         if (!markerSendQueue_.empty() || !trySendMarker_(token)) {
@@ -4160,13 +4229,12 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
     }
 
     if (replica) {
-        // Durable path: append via PartitionReplica with acks=All.
-        // replica->append() stamps the baseOffset, appends to the log,
-        // and returns the base offset (or -1 if gated by minIsr).
-        base = replica->append(marker, /*acksAll=*/true);
+        // Durable path (F15 N2): the marker lands AS a control batch, restamped
+        // in place, role- and min-ISR-gated (acks=All); negative = refused.
+        base = replica->appendControlBatch(marker, /*acksAll=*/true);
         if (base < 0) {
-            spdlog::warn("ClientGateway::appendControlRecord: replica->append returned {} "
-                         "(minIsr gate?) topicId={} partition={}", base, topicId, partition);
+            spdlog::warn("ClientGateway::appendControlRecord: appendControlBatch returned {} "
+                         "topicId={} partition={}", base, topicId, partition);
             return -1;
         }
     } else {
@@ -4212,7 +4280,8 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         replica->onLeaderLogAppended();
     }
 
-    // Caller must invoke notifyControlMarker() to update LsoTracker + AbortedTxnIndex.
+    // Synchronous (no-pool inline) path: the caller invokes notifyControlMarker()
+    // to update the inline path's LsoTracker + AbortedTxnIndex.
     return base;
 }
 

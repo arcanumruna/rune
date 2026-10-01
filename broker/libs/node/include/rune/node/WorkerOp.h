@@ -65,9 +65,10 @@ struct WorkerOp {
         FetchRequest,             ///< transport → worker: leader handles follower FetchRequest
         OffsetsForLeaderEpochReq, ///< transport → worker: leader handles KIP-101 epoch probe
         ReconcileFetchResp,       ///< transport → worker: deficient leader applies survivor data
-        // Task #13: appendControlRecord race fix — route txn COMMIT/ABORT marker
-        // appends to the owning worker when per-worker ingress is active.  The
-        // worker appends via replica->append(marker, acksAll) and answers
+        // Task #13 / F15 K3: route txn COMMIT/ABORT marker appends to the owning
+        // worker under the produce-routing predicate (every mode with a worker
+        // pool).  The worker appends via replica->appendControlBatch (F15 N2: a
+        // real control batch, role + min-ISR gated) and answers
         // ControlRecordAppended{correlationId = marker token, baseOffset = where
         // it ACTUALLY landed} (Task 10 round 4: never pre-computed) — or
         // ControlRecordRefused when the ownership guard refuses it.
@@ -328,9 +329,13 @@ struct WorkerReturn {
     // Result code: 0 = success, non-zero = error (mirrors pc::ErrorCode).
     int16_t errorCode     = 0;
 
-    // Whether the gateway should enqueue a deferred ack (acks=All) instead of
-    // sending immediately.  True only when the produce was appended successfully
-    // AND acks=All AND replica is set AND committedMetadataReady is true.
+    // F15 S2 (review m6): on a ProduceResult, true means "FACTS ONLY, NO
+    // ANSWER" — the owning worker's copy of a SUCCESSFUL append (errorCode 0)
+    // that it parks the answer of (acks=all: emitted at append; Strict: at fsync
+    // completion), so the gateway's PSM / LsoTracker / dirty-log mirrors learn
+    // it.  Every answer (OK or error) has deferAck == false; an error result
+    // never carries it.  TEMPORARY: deleted with the mirrors by S4 (LSO) and S5
+    // (PSM).  (On the op side, WorkerOp::deferAck still means "acks=all".)
     bool    deferAck      = false;
 
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
@@ -378,6 +383,21 @@ struct WorkerReturn {
 
     // The data chunk returned by log->read().  Moved out of the worker.
     std::vector<uint8_t> chunk;
+
+    // -----------------------------------------------------------------------
+    // F15 S4 (addendum R-3): a PushReadResult echoes the bound the OWNING
+    // worker applied and whether its read_committed state was ready.  The
+    // WorkerReturn layout is pinned (ProtocolRegression.WorkerReturnLayoutUnchanged),
+    // so two fields that a PushReadResult never otherwise uses carry them:
+    //   lastOffset → the effective bound W read up to (exclusive): min(op hwBound,
+    //                live HW) for read_uncommitted, min(op hwBound, LSO(live HW))
+    //                for read_committed; -1 when nothing was bounded (not ready).
+    //   deferAck   → read_committed state of the partition not yet Ready (§2.3).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int64_t pushEffectiveBound() const noexcept { return lastOffset; }
+    [[nodiscard]] bool    pushRcNotReady()     const noexcept { return deferAck; }
+    void setPushEffectiveBound(int64_t b) noexcept { lastOffset = b; }
+    void setPushRcNotReady(bool v) noexcept { deferAck = v; }
 };
 
 /// F18 (m-1): outcome of enqueueing a WorkerOp.  Full = back-pressure (retry

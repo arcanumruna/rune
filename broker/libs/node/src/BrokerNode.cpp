@@ -77,6 +77,18 @@ void BrokerNode::start() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
+    // F15 S3 (design note §6, review S3 I-1): a worker return-ring claim
+    // exception is an invariant-violation halt, so the return ring size is a
+    // correctness setting — its max message must hold the largest batch any
+    // intake path can store (and a full PushRead chunk), else a legal batch
+    // halts the broker on every restart.  Also the owed-return cap range.
+    if (auto err = Worker::validateRingConfig(
+            static_cast<std::size_t>(config_.workerReturnRingBytes),
+            static_cast<std::size_t>(config_.workerIngressRingBytes), config_.workerMaxOwedReturns);
+        err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1060,8 +1072,20 @@ void BrokerNode::buildWorkerPool() {
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
-        workerPool_->worker(i).setMaxProduceBatchBytes(
-            static_cast<std::size_t>(config_.produceIntakeLimit()));
+        workerPool_->worker(i).setMaxOwedReturns(static_cast<std::size_t>(config_.workerMaxOwedReturns));
+        // F15 S3 (re-review 2 B-1) ⇄ F18 ⇄ F19: ONE client-visible batch limit on
+        // every path — NodeConfig::produceIntakeLimit() wraps
+        // Worker::maxAcceptableBatchBytes (rings + replication + egress terms).
+        workerPool_->worker(i).setMaxBatchBytes(static_cast<std::size_t>(config_.produceIntakeLimit()));
+    }
+
+    // F15 S3 (§6): each worker re-checks its own return ring (defence in depth
+    // for the config-level check at the top of start()).
+    for (int32_t i = 0; i < wc; ++i) {
+        if (!workerPool_->worker(i).returnRingCoversMaxPushChunk())
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: worker " +
+                                     std::to_string(i) + " return ring cannot hold a full PushReadResult — "
+                                     "refusing to start");
     }
 
     if (config_.shardMode()) {
@@ -1375,8 +1399,12 @@ void BrokerNode::buildGateway() {
         gateway_->setMinIsr(config_.gatewayMinIsr);
         gateway_->setMaxProduceBatchBytes(
             static_cast<std::size_t>(config_.produceIntakeLimit()));
-        spdlog::info("BrokerNode[{}]: produce intake limit {} B (frame ceiling {} B)", nodeId,
-                     config_.produceIntakeLimit(), config_.produceBatchFrameCeiling());
+        spdlog::info("BrokerNode[{}]: effective max batch (produce intake) limit {} B "
+                     "(gateway {} B; ingress ring {} B, return ring {} B, repl outbound ring {} B, "
+                     "aeron term {} B)", nodeId, config_.produceIntakeLimit(),
+                     gateway_->maxProduceBatchBytes(), config_.workerIngressRingBytes,
+                     config_.workerReturnRingBytes, config_.replicationOutboundRingBytes,
+                     config_.aeronTermBufferBytes);
         spdlog::info("BrokerNode[{}]: gateway minIsr set to {} (cluster size={})",
                      nodeId, config_.gatewayMinIsr, config_.peers.size());
 
@@ -1635,7 +1663,9 @@ void BrokerNode::buildGateway() {
 
             txnState_ = std::make_unique<rune::transaction::ReplicatedTxnStateStore>(
                 txnReplicaRaw);
-            txnState_->rebuildFromLog();
+            // F15 §5.1: no startup fold — the TransactionCoordinationService
+            // folds the store at its coordinator LOAD (txn replica Leader,
+            // leadership complete, HW == LEO); nothing reads the store before.
 
             txnCoordService_ = std::make_unique<TransactionCoordinationService>(
                 txnState_.get(),
@@ -1834,7 +1864,7 @@ void BrokerNode::buildGateway() {
     // worker's SPSC ingress ring.  Both setters are null-safe (no-op when
     // workerPool_ is null, which happens when no topics are configured).
     if (gateway_ && workerPool_) {
-        gateway_->setWorkerPool(workerPool_.get());
+        gateway_->setWorkerPool(workerPool_.get());   // narrows the batch limit to the workers'
     }
     // Round 5: an incarnation wrap must skip values the F7 owner map still holds.
     if (workerPool_ && replicaRegistry_)

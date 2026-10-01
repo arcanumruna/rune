@@ -693,8 +693,16 @@ TEST(ShardModeFusedRegression, ReturnRingPressureNeverDeadlocksTheFusedLoop) {
     TmpDir dir{"fusedring"}, cdir{"frc"};
     const auto ports = ShardPorts::discover(1, 1);
     auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
-    cfg.workerReturnRingBytes = 64 * 1024;        // tiny: forces intake skips
-    cfg.workerAckSlotBytes = 256;
+    // Integration wave 2 (T11 ⇄ F15 S3): the return ring must now hold one full
+    // 512 KiB PushReadResult (startup refuses less) and be >= the ingress ring,
+    // so the smallest legal ring is 8 MiB.  Return-ring pressure is forced by a
+    // 64 KiB per-ack reservation (~128 reservable acks per ring) and the
+    // minimum owed-return cap — intake still has to skip, on the one thread
+    // that also drains ret_.
+    cfg.workerReturnRingBytes  = 8 * 1024 * 1024;
+    cfg.workerIngressRingBytes = 8 * 1024 * 1024;
+    cfg.workerAckSlotBytes     = 64 * 1024;
+    cfg.workerMaxOwedReturns   = static_cast<int32_t>(Worker::kMinOwedReturns);
     BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
@@ -901,4 +909,158 @@ TEST(ShardTestHarnessRegression, DiscoveredPortsNeverCollide) {
                 ASSERT_FALSE(ranges[a].first < ranges[b].second && ranges[b].first < ranges[a].second)
                     << "round " << round << ": ports " << ranges[a].first << " and " << ranges[b].first << " overlap";
     }
+}
+
+// ===========================================================================
+// Integration wave 2 (F18 ⇄ F15 S3 ⇄ F19) — REGRESSION: ONE batch limit, and a
+// batch at EXACTLY that limit must be accepted, replicated AND delivered to a
+// push consumer under the DEFAULT config (3 nodes, default rings / Aeron term,
+// legacy worker mode).  Before the unification the limits disagreed: produce
+// intake admitted a batch up to one replication frame while the default 4 MiB
+// egress term (512 KiB frames) could not push it — the subscription was
+// error-parked with MessageTooLarge at delivery.  limit + 1 is refused
+// MessageTooLarge at intake (never appended).
+// ===========================================================================
+namespace {
+NodeConfig makeDefaultConfig(int nodeId, const fs::path& dataDir, const ShardPorts& p, int nodes) {
+    NodeConfig cfg;                                // DEFAULT ring / term / worker sizes
+    cfg.nodeId = nodeId;
+    cfg.dataDir = dataDir.string();
+    cfg.aeronDir = (dataDir / "aeron").string();
+    cfg.consensusStreamId = 90;
+    cfg.replicationStreamId = 100;
+    cfg.replBaseStreamId = 200;
+    cfg.electionTimeoutMs = 150; cfg.electionStatusIntervalMs = 20; cfg.startupCanvassTimeoutMs = 100;
+    cfg.gatewayMinIsr = nodes == 1 ? 1 : 2;        // what parseNodeConfig derives (majority)
+    for (int i = 0; i < nodes; ++i) {
+        PeerConfig pc;
+        pc.id = i; pc.host = "127.0.0.1";
+        pc.consensusPort = p.cons[i]; pc.clientPort = p.client[i]; pc.replicationPort = p.repl[i];
+        cfg.peers.push_back(pc);
+    }
+    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
+    cfg.clientEndpoint.streamId = kClientStream;
+    TopicSpec t; t.name = "st"; t.partitionCount = 1; t.topicId = 0;
+    cfg.topics.push_back(t);
+    return cfg;
+}
+// A record batch of EXACTLY n wire bytes (one record; value length searched).
+std::vector<uint8_t> batchOfExactly(std::size_t n) {
+    auto build = [](std::size_t v) {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", std::string(v, 'x'), 1000);
+        return b.build();
+    };
+    const std::size_t over = build(0).size();
+    if (n < over) return {};
+    for (std::size_t v = n - over > 16 ? n - over - 16 : 0; v <= n; ++v) {
+        auto b = build(v);
+        if (b.size() == n) return b;
+        if (b.size() > n) break;
+    }
+    return {};
+}
+} // namespace
+
+namespace {
+void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
+    TmpDir d0{"bl0"}, d1{"bl1"}, d2{"bl2"}, cdir{"blc"};
+    const auto ports = ShardPorts::discover(nodes, 1);
+    const NodeConfig c0 = makeDefaultConfig(0, d0.path, ports, nodes);
+    ASSERT_EQ(c0.aeronTermBufferBytes, NodeConfig{}.aeronTermBufferBytes) << "default term";
+    ASSERT_EQ(c0.workerMode, NodeConfig::WorkerMode::Legacy) << "default worker mode";
+    const std::size_t limit = static_cast<std::size_t>(c0.produceIntakeLimit());
+    ASSERT_EQ(limit, Worker::maxAcceptableBatchBytes(
+        static_cast<std::size_t>(c0.workerIngressRingBytes), static_cast<std::size_t>(c0.workerReturnRingBytes),
+        static_cast<std::size_t>(c0.replicationOutboundRingBytes),
+        static_cast<std::size_t>(c0.aeronTermBufferBytes), static_cast<std::size_t>(c0.aeronTermBufferBytes)));
+    // Default 4 MiB term: the egress Records frame (term / 8 = 512 KiB) is one
+    // of the binding hops — the case the unification closes.
+    ASSERT_LE(limit + rune::node::kRecordsFixedBytes, 512u * 1024u);
+
+    std::vector<std::unique_ptr<BrokerNode>> ns;
+    ns.push_back(std::make_unique<BrokerNode>(c0));
+    if (nodes == 3) {
+        ns.push_back(std::make_unique<BrokerNode>(makeDefaultConfig(1, d1.path, ports, 3)));
+        ns.push_back(std::make_unique<BrokerNode>(makeDefaultConfig(2, d2.path, ports, 3)));
+    }
+    for (auto& n : ns) n->start();
+    ASSERT_TRUE(ns[0]->awaitLeader(15'000ms));
+    for (auto& n : ns)
+        EXPECT_EQ(n->gatewayForTest()->maxProduceBatchBytes(), limit) << "one limit on every node";
+
+    const auto atLimit = batchOfExactly(limit);
+    ASSERT_EQ(atLimit.size(), limit);
+    const auto over = batchOfExactly(limit + 1);
+    ASSERT_EQ(over.size(), limit + 1);
+    {
+        // The client's own produce frame (limit + 1 + Produce framing) must fit
+        // ITS publication (term / 8): size the client term from the limit.
+        int32_t clientTerm = 8 * 1024 * 1024;
+        while (static_cast<std::size_t>(clientTerm) / 8 < limit + 4096) clientTerm *= 2;
+        ShardTestClient c(cdir.path, clientTerm);
+        const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid0, 0);
+        int32_t leader = -1;
+        for (int i = 0; i < 200 && leader < 0; ++i) {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                if (pi.topicId == 0 && pi.partition == 0) leader = pi.leaderId;
+            if (leader < 0) std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_GE(leader, 0) << "no partition leader advertised";
+        const std::string gw = gatewayChannel(ports, leader);
+        const int64_t sid = c.connect(gw, kClientStream);
+        ASSERT_GT(sid, 0);
+
+        // Accepted (+ replicated, 3 nodes: acks=all with minIsr 2 answers OK only
+        // once a follower holds the batch).
+        auto ack = c.produceUntilOk(gw, kClientStream, sid, 0, 0, /*acks=all*/1, atLimit);
+        ASSERT_TRUE(ack.has_value()) << "a batch at exactly the limit must be accepted (acks=all)";
+        EXPECT_EQ(ack->baseOffset, 0);
+
+        // limit + 1: refused at intake, non-retriable, never appended.
+        ASSERT_TRUE(c.produce(gw, kClientStream, sid, 900001, 0, 0, /*acks=all*/1, over));
+        auto tooLarge = c.awaitProduceResponse(900001);
+        ASSERT_TRUE(tooLarge.has_value());
+        EXPECT_EQ(tooLarge->errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+
+        // Delivered to a push consumer, byte-identical — never error-parked.
+        ASSERT_TRUE(c.subscribe(gw, kClientStream, sid, 0, 0, /*fromOffset=*/0));
+        const bool got = c.pollUntil([&] {
+            for (const auto& r : c.records()) if (r.baseOffset == 0) return true;
+            for (const auto& e : c.errors()) if (e.code == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) return true;
+            return false;
+        });
+        ASSERT_TRUE(got) << "nothing pushed for offset 0";
+        for (const auto& e : c.errors())
+            EXPECT_NE(e.code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge))
+                << "the push subscription was error-parked at the limit batch: " << e.message;
+        ASSERT_FALSE(c.records().empty());
+        EXPECT_EQ(c.records().front().baseOffset, 0);
+        EXPECT_EQ(c.records().front().bytes.size(), limit);
+        auto expected = atLimit;
+        for (int i = 0; i < 8; ++i) expected[i] = 0;   // baseOffset 0 restamped (bytes 0..7)
+        EXPECT_EQ(c.records().front().bytes, expected) << "pushed batch not byte-identical";
+    }
+    for (auto& n : ns) n->stop();
+    int replicas = 0;
+    for (const auto* d : {&d0, &d1, &d2})
+        if (d == &d0 || nodes == 3) replicas += logEndOffsetAfterStop(d->path) == 1 ? 1 : 0;
+    EXPECT_GE(replicas, nodes == 3 ? 2 : 1)
+        << "the acks=all limit batch must be on a majority (and limit+1 nowhere)";
+}
+} // namespace
+
+TEST(ThreeNodeDefaultConfigBatchLimitRegression, BatchAtExactLimitIsAcceptedReplicatedAndPushed) {
+    runBatchAtExactLimitAcceptedReplicatedAndPushed(3);
+}
+
+// Single-node default config — the case that actually diverged before the
+// merge: F18 skipped the replication terms single-node, so intake admitted up
+// to the op-ring frame (~4 MiB) while the default egress term pushes at most
+// ~512 KiB → a batch in between was accepted and then error-parked at delivery.
+// Replication terms now apply even single-node (the limit must not change when
+// a node joins a cluster) and the egress frame is a term of its own.
+TEST(SingleNodeDefaultConfigBatchLimitRegression, BatchAtExactLimitIsAcceptedAndPushed) {
+    runBatchAtExactLimitAcceptedReplicatedAndPushed(1);
 }

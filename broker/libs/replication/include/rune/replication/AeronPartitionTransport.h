@@ -174,10 +174,12 @@ public:
     /// F18: follower apply/reconcile frames refused because their records cannot
     /// fit one worker-ingress frame (a replication error; never a crash/livelock).
     [[nodiscard]] uint64_t oversizedApplyRefused() const noexcept { return oversizedApplyRefused_; }
-    /// F18: outbound frames dropped because they exceed one frame (ring
-    /// maxMsgLength / publication maxMessageLength) — NOT back-pressure; counted
-    /// apart from outboundRingFullCount_.  Unreachable once the replica answers an
-    /// unservable batch with kErrRecordTooLarge; a non-zero value is a bug signal.
+    /// F18: outbound frames dropped because they exceed the publication
+    /// maxMessageLength — NOT back-pressure.  Unreachable once the replica answers
+    /// an unservable batch with kErrRecordTooLarge; a non-zero value is a bug
+    /// signal.  Bumped only by the polling thread (sendOnPub).  (Merge F18⇄F16:
+    /// the outbound-RING oversize sites are entered by several worker threads, so
+    /// they only warn — F16 removed exactly that multi-writer counter class.)
     [[nodiscard]] uint64_t oversizedFrameDropped() const noexcept { return oversizedFrameDropped_; }
 
     /// F18: the replication publication's maxMessageLength (min(term/8, 16 MiB)),
@@ -201,6 +203,10 @@ public:
     /// reads only state immutable after start).  = outbound-ring frame and, when
     /// known, the publication frame, each minus its framing.
     [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override;
+    /// F16: this transport's own traffic counters (shared-nothing: per instance,
+    /// written only by the thread that polls it).  Control thread / tests.
+    struct TxStats { int64_t polls = 0; int64_t fragsRecv = 0; int64_t outDrained = 0; };
+    [[nodiscard]] TxStats txStatsForTest() const noexcept;
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -307,8 +313,8 @@ private:
     // ManyToOneRingBuffer via IngressRing — MPSC, lock-free).  The CONTROL thread
     // drains the ring in poll() and does the actual peers_/pub offers.
     //
-    // Back-pressure: on a full ring, enqueueOutbound() returns false and bumps
-    // outboundRingFullCount_ — the send is skipped (NOT silently "succeeded").
+    // Back-pressure: on a full ring, enqueueOutbound() returns false — the send
+    // is skipped (NOT silently "succeeded") and the worker caller sees it.
     // Replication sends are retriable (follower re-requests / leader re-responds
     // next cycle), so skip-and-retry is the correct policy here.
     // -----------------------------------------------------------------------
@@ -413,9 +419,16 @@ private:
     int64_t  applyRecordsCap_       = 0;   // F18 (B-1); immutable after start
     uint64_t oversizedApplyDropped_ = 0;   // F18 (B-1); control thread only
 
-    // Back-pressure observability: bumped when the outbound ring is full and a
-    // (retriable) send had to be skipped. Control-thread reads for logging.
-    uint64_t outboundRingFullCount_ = 0;
+    // (F16: the write-only outboundRingFullCount_ was removed — several worker
+    // threads bumped it unsynchronised; back-pressure is the false return.)
+
+    // F16: traffic counters + FR receive sequence — per instance, written only by
+    // the thread that polls this transport (no process-wide globals, no atomics).
+    int64_t  txRateLastNs_ = 0;
+    int64_t  txPolls_      = 0;   ///< poll() calls (RUNE_FS_LOG only)
+    int64_t  txFragsRecv_  = 0;   ///< fragments received
+    int64_t  txOutDrained_ = 0;   ///< outbound messages drained to Aeron
+    uint32_t inRecvSeq_    = 0;   ///< FR ReplFragRecv correlation
 
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.
