@@ -204,6 +204,29 @@ TEST(RingSbe, ProduceNotifyReturnTypeRoundTrips) {
     EXPECT_EQ(dec.batchAttrs(), 0x10);
 }
 
+TEST(RingSbe, StorageFailureReturnRoundTripsRegression) {
+    // Task 10 fix 1 (fail-stop): STORAGE_FAILURE must decode (an unknown value
+    // would throw E103) and carry topicId / partition / errno / the log dir.
+    std::array<char, 512> buf{};
+    sbe::WorkerReturn enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.returnType(sbe::ReturnType::Value::STORAGE_FAILURE)
+       .sessionId(0).correlationId(0).partition(4).baseOffset(0).lastOffset(0)
+       .errorCode(5).deferAck(0).replica(0).producerId(-1).producerEpoch(0)
+       .baseSequence(0).recordCount(0).topicId(9).batchAttrs(0).enqueuedAtNs(0)
+       .subscriptionId(0).readTopicId(0).readPartition(0).newNextOffset(0).hwBound(0)
+       .isolation(0).isGroup(0).groupCarrierReceived(0);
+    const char dir[] = "/data/t/4";
+    enc.putChunk(dir, sizeof(dir) - 1);
+    auto dec = decodeAt<sbe::WorkerReturn>(buf.data(), buf.size());
+    EXPECT_EQ(dec.returnType(), sbe::ReturnType::Value::STORAGE_FAILURE);
+    EXPECT_EQ(static_cast<int>(sbe::ReturnType::Value::STORAGE_FAILURE), 3);
+    EXPECT_EQ(dec.topicId(), 9);
+    EXPECT_EQ(dec.partition(), 4);
+    EXPECT_EQ(dec.errorCode(), 5);
+    EXPECT_EQ(dec.getChunkAsString(), "/data/t/4");
+}
+
 TEST(RingSbe, TestTaskOpCarriesOpaquePointersRegression) {
     // F1: test-only owner-thread hook.  TEST_TASK must round-trip through the
     // generated enum decoder (an unknown value would throw E103) and carry the

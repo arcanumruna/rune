@@ -89,6 +89,10 @@
       <!-- Post-ack, fire-and-forget worker → runtime notification (spec §3.4):
            PSM mirror + transaction LSO bookkeeping; never on the ack path. -->
       <validValue name="PRODUCE_NOTIFY">2</validValue>
+      <!-- Worker → runtime fail-stop signal (fsyncgate): a log's fsync failed;
+           the log is permanently failed and the runtime halts the broker.
+           topicId/partition name the log, errorCode carries errno, chunk the dir. -->
+      <validValue name="STORAGE_FAILURE">3</validValue>
     </enum>
   </types>
 

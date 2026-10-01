@@ -36,6 +36,7 @@ public:
         PRODUCE_RESULT = static_cast<std::uint8_t>(0),
         PUSH_READ_RESULT = static_cast<std::uint8_t>(1),
         PRODUCE_NOTIFY = static_cast<std::uint8_t>(2),
+        STORAGE_FAILURE = static_cast<std::uint8_t>(3),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -46,6 +47,7 @@ public:
             case static_cast<std::uint8_t>(0): return PRODUCE_RESULT;
             case static_cast<std::uint8_t>(1): return PUSH_READ_RESULT;
             case static_cast<std::uint8_t>(2): return PRODUCE_NOTIFY;
+            case static_cast<std::uint8_t>(3): return STORAGE_FAILURE;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -59,6 +61,7 @@ public:
             case PRODUCE_RESULT: return "PRODUCE_RESULT";
             case PUSH_READ_RESULT: return "PUSH_READ_RESULT";
             case PRODUCE_NOTIFY: return "PRODUCE_NOTIFY";
+            case STORAGE_FAILURE: return "STORAGE_FAILURE";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

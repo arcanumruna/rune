@@ -86,6 +86,8 @@ enum class ErrorCode : uint16_t {
     InvalidSchema          = 23,  // descriptor blob malformed / invariant-violating
     SchemaValidationFailed = 24,  // produced record failed validation
     TopicExists            = 25,  // DefineTopic on an existing topic name
+    // storage error codes
+    StorageError           = 26,  // the partition's log failed an fsync (fail-stop, KafkaStorageError analogue)
 };
 
 } // namespace rune::protocol::client
