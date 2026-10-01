@@ -1583,8 +1583,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // fell back) — never both — so routing gateway-received produce to the worker
     // appends it exactly once.  Internal partitions (topicId < 0) are gateway-owned
     // and stay on the inline path below.
-    const bool routeToWorker =
-        workerPool_ && (!perWorkerIngressActive_ || msg.topicId >= 0);
+    const bool routeToWorker = routesToWorker_(msg.topicId);   // F15 K3: shared with markers
     if (routeToWorker) {
         // ---------------------------------------------------------------------------
         // WORKER PATH: Parse + validate the batch inline (same logic as before) so
@@ -4149,21 +4148,25 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         replica = replicaRegistry_->lookup(topicId, partition);
     }
 
-    // Task #13: close appendControlRecord write-write race (TSan).
+    // Task #13 / F15 K3: the marker is appended by the OWNING worker under
+    // EXACTLY the produce-routing predicate (routesToWorker_), in every mode —
+    // including the default (Legacy) config, where produces already go to the
+    // worker: appending the marker inline here was a write-write race with the
+    // worker, and the marker overtook produces still queued on its op ring.
+    // Queued on the same op ring, the marker lands after every produce routed
+    // before it (L4).
     //
-    // When per-worker ingress is active, the worker is the SOLE appender for
-    // USER partitions (topicId >= 0).  Appending to a worker-owned log from the
-    // gateway thread is a write-write race.  Route the append to the owning
-    // worker via the SPSC ingress ring instead.
-    //
-    // Task 10 round 4 (P1): the marker's offset is NOT pre-computed here
-    // (log->logEndOffset() is stale whenever produces are queued ahead of the
-    // marker in the worker ring — the marker lands after them).  The worker
-    // returns the offset it ACTUALLY appended at (ControlRecordAppended) and
+    // Task 10 round 4 (P1): the marker's offset is NOT pre-computed here; the
+    // worker returns where it ACTUALLY landed (ControlRecordAppended) and
     // onControlRecordAppended_ feeds notifyControlMarker with it.  The caller
     // gets kControlRecordAsync.  A full ring never drops the marker: it waits in
-    // markerSendQueue_ and is retried every doWork, in order.
-    if (perWorkerIngressActive_ && topicId >= 0 && replica && workerPool_) {
+    // markerSendQueue_ and is retried every doWork, in order.  An unregistered
+    // partition is stamped stale by WorkerPool and answered through the normal
+    // refusal path.
+    //
+    // The inline branch below remains only without a worker pool (unit rigs) and
+    // for gateway-owned internal partitions in shard mode (never markers).
+    if (routesToWorker_(topicId)) {
         if (marker.empty()) return -1;
         if (producerId < 0 && marker.size() >= 43u + 8u) {
             producerId = 0;
@@ -4187,13 +4190,12 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
     }
 
     if (replica) {
-        // Durable path: append via PartitionReplica with acks=All.
-        // replica->append() stamps the baseOffset, appends to the log,
-        // and returns the base offset (or -1 if gated by minIsr).
-        base = replica->append(marker, /*acksAll=*/true);
+        // Durable path (F15 N2): the marker lands AS a control batch, restamped
+        // in place, role- and min-ISR-gated (acks=All); negative = refused.
+        base = replica->appendControlBatch(marker, /*acksAll=*/true);
         if (base < 0) {
-            spdlog::warn("ClientGateway::appendControlRecord: replica->append returned {} "
-                         "(minIsr gate?) topicId={} partition={}", base, topicId, partition);
+            spdlog::warn("ClientGateway::appendControlRecord: appendControlBatch returned {} "
+                         "topicId={} partition={}", base, topicId, partition);
             return -1;
         }
     } else {

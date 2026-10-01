@@ -1286,6 +1286,13 @@ private:
     std::deque<int64_t>                         markerSendQueue_;
     int64_t                                     nextMarkerToken_ = 1;
     bool trySendMarker_(int64_t token);
+    /// F15 K3: THE routing predicate for worker-owned appends — used by the
+    /// produce path AND marker routing (appendControlRecord), in every mode,
+    /// so a marker is queued on the same op ring as the produces it must
+    /// follow (L4) and the control thread never appends to a worker-owned log.
+    [[nodiscard]] bool routesToWorker_(int32_t topicId) const noexcept {
+        return workerPool_ != nullptr && (!perWorkerIngressActive_ || topicId >= 0);
+    }
     int  pumpMarkerQueue_();
     [[nodiscard]] bool markerQueuedFor_(int32_t topicId, int32_t partition) const noexcept;
 
