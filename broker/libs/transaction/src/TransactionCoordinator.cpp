@@ -472,6 +472,12 @@ int TransactionCoordinator::doWork(int64_t nowNs)
     return work;
 }
 
+void TransactionCoordinator::markersDispatched(const TransactionalId& txnId)
+{
+    auto it = txnMap_.find(txnId);
+    if (it != txnMap_.end()) it->second.markersPending = false;
+}
+
 // ---------------------------------------------------------------------------
 // pendingMarkerTransactions — B1/B2 resolution API
 // ---------------------------------------------------------------------------

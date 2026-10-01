@@ -485,6 +485,7 @@ public:
            // lookup at routing time) — never read through op.replica here.
            .targetReplicaId(op.targetReplicaId)
            .incarnation(op.incarnation)
+           .minIsr(op.minIsr)
            .ownershipGen(op.ownershipGen)
            .tailKind(tailKind);
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
@@ -721,6 +722,10 @@ public:
             }
         }
 
+        // Round 5: ordered must-deliver returns (markers) may sit in retOverflow_
+        // in every mode — flush them first, before any newer return is produced.
+        if (!perWorkerIngressActive_) work += flushRetOverflow_();
+
         // Step 0: drain ingress ring (E2 inc2a / R2). This may include SetOwnership
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
         // Strict-tier produces record their log in dirtyThisCycle_ (token=0).
@@ -909,6 +914,13 @@ private:
     }
 
     void enqueueReturn_(const WorkerReturn& ret) {
+        // Task 10 round 5: FIFO with anything already waiting in retOverflow_ — a
+        // later return must never overtake an earlier one through a ring slot
+        // that freed up in between (ProduceResult vs ControlRecordAppended).
+        if (!retOverflow_.empty()) {
+            retOverflow_.push_back(ret);
+            return;
+        }
         // SBE wrap-in-place: reserve the exact ring slot (computeLength) then encode
         // the return DIRECTLY into it.  tryClaim() < 0 = explicit back-pressure.
         const std::size_t n = sbe::MessageHeader::encodedLength() +
@@ -933,6 +945,22 @@ private:
             }
             return;
         }
+        encodeReturnSbe_(ret, idx, n);
+        ret_.commit(idx);
+    }
+
+    // Task 10 round 5: a must-deliver return that is ORDERED with the produce
+    // results (ControlRecordAppended / ControlRecordRefused): the same FIFO as
+    // ProduceResults (retOverflow_), never dropped in any mode — unlike
+    // pendingSignals_, which is flushed at the END of a pass and so could be
+    // overtaken by a later ProduceResult (the next transaction's batch).
+    void enqueueOrderedReturn_(const WorkerReturn& ret) {
+        if (!retOverflow_.empty()) { retOverflow_.push_back(ret); return; }
+        const std::size_t n = sbe::MessageHeader::encodedLength() +
+                              sbe::WorkerReturn::computeLength(ret.chunk.size());
+        aeron::util::index_t idx = -1;
+        try { idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n); } catch (...) { idx = -1; }
+        if (idx < 0) { retOverflow_.push_back(ret); return; }
         encodeReturnSbe_(ret, idx, n);
         ret_.commit(idx);
     }
@@ -1549,6 +1577,20 @@ private:
             return;
         }
 
+        // Task 10 round 5: the min-ISR admission gate for acks=all lives HERE, on
+        // the owning thread (the replica's ISR is worker-owned state).  The
+        // gateway used to read replica->isr() on the control thread — a data race
+        // that could segfault mid-promotion.  deferAck == acks=all on a
+        // replicated partition in steady state (exactly the old gateway gate).
+        if (op.deferAck() != 0 && replica &&
+            static_cast<int>(replica->isr().size()) <
+                (op.minIsr() > 0 ? op.minIsr() : replica->minIsr())) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation);
+            ret.deferAck  = false;
+            enqueueReturn_(ret);   // log untouched — no append, no LEO advance
+            return;
+        }
+
         // Zero-copy restamp append: the base offset is assigned from the log's end
         // offset and patched into the batch header via pwritev (LE64 at bytes
         // [0..7], before the CRC region) — the ring frame is NOT mutated, so
@@ -2125,7 +2167,7 @@ private:
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ — {} for topicId={} partition={}",
                          workerId_, replica ? "empty marker tail" : "null replica", topicId, partition);
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
-            enqueueSignal_(ret);
+            enqueueOrderedReturn_(ret);
             return;
         }
         const std::span<const uint8_t> markerSpan(tail, static_cast<std::size_t>(tailLen));
@@ -2146,7 +2188,7 @@ private:
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw unknown", workerId_);
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
         }
-        enqueueSignal_(ret);   // never dropped (retried next pass on a full ring)
+        enqueueOrderedReturn_(ret);   // same FIFO as ProduceResults, never dropped
     }
 
     // -------------------------------------------------------------------
@@ -2834,7 +2876,7 @@ private:
             const uint32_t n = op.tailLength();
             const auto* t = reinterpret_cast<const uint8_t*>(op.tail());
             if (t && n) ret.chunk.assign(t, t + n);
-            enqueueSignal_(ret);
+            enqueueOrderedReturn_(ret);
             return;
         }
         default:

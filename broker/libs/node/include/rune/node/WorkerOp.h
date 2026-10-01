@@ -116,6 +116,9 @@ struct WorkerOp {
     rune::replication::PartitionReplica* replica = nullptr;
     uint32_t targetReplicaId = 0;
     uint32_t incarnation     = 0;
+    // Produce (Task 10 round 5): the runtime's current min-ISR admission policy
+    // (0 = the replica's configured minIsr).  Applied by the OWNING worker.
+    int32_t  minIsr          = 0;
 
     // -----------------------------------------------------------------------
     // Non-owning Log* — set by the gateway at enqueue time from the

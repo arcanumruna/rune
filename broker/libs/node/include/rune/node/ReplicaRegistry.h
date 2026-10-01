@@ -79,6 +79,15 @@ public:
         return it->second.replica.get();
     }
 
+    /// Round 5: an external holder of incarnations that outlive the registry
+    /// entry (WorkerPool's F7 owner map keeps removed incarnations until every
+    /// worker acked) — consulted after a wrap so a reused value never collides.
+    /// Plain function pointer + context (cold path, control thread only).
+    using IncarnationInUseFn = bool (*)(const void* ctx, uint32_t incarnation);
+    void setIncarnationInUseHook(IncarnationInUseFn fn, const void* ctx) noexcept {
+        inUseFn_ = fn; inUseCtx_ = ctx;
+    }
+
     /// Test seam (M4): start incarnation allocation at `next` (exercise the wrap).
     void setNextIncarnationForTest(uint32_t next) noexcept { nextIncarnation_ = next; }
 
@@ -225,6 +234,7 @@ private:
     [[nodiscard]] bool incarnationInUse_(uint32_t v) const noexcept {
         for (const auto& [k, e] : map_) { (void)k; if (e.inc == v) return true; }
         for (const auto& r : retired_) if (r.inc == v) return true;
+        if (inUseFn_ && inUseFn_(inUseCtx_, v)) return true;   // e.g. WorkerPool pending erase
         return false;
     }
 
@@ -242,6 +252,8 @@ private:
     uint32_t              nextId_          = 1;   // 0 = unregistered (not gated)
     uint32_t              nextIncarnation_ = 1;
     bool                  wrapped_         = false;
+    IncarnationInUseFn    inUseFn_         = nullptr;
+    const void*           inUseCtx_        = nullptr;
 };
 
 } // namespace rune::node

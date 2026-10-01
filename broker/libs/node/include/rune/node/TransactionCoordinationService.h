@@ -149,18 +149,37 @@ public:
     size_t handleEndTxn         (const uint8_t* buf, size_t len,
                                   int64_t nowNs, uint8_t* out, size_t outCap) override;
 
-    /// Task 10 fix 3: a control marker this node could not append (NotLeader:
-    /// the partition is no longer here).  Recorded + logged — never silent.
+    /// Task 10 fix 3: a control marker this node could not append (NotLeader /
+    /// append failure).  Recorded + logged — never silent; counts as resolved.
     void onControlMarkerRefused(int32_t topicId, int32_t partition,
-                                int64_t producerId, int16_t errorCode) override {
-        ++controlMarkersRefused_;
-        spdlog::error("TCS: control marker REFUSED topic={} partition={} producerId={} err={} "
-                      "(partition moved off this node)", topicId, partition, producerId, errorCode);
-    }
+                                int64_t producerId, int16_t errorCode) override;
+    /// Task 10 round 5: an asynchronously appended marker landed.
+    void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId) override;
+    [[nodiscard]] std::size_t awaitingMarkerTxnsForTest() const noexcept { return awaiting_.size(); }
+    [[nodiscard]] uint64_t transactionsCompletedForTest() const noexcept { return transactionsCompleted_; }
     [[nodiscard]] uint64_t controlMarkersRefusedForTest() const noexcept { return controlMarkersRefused_; }
 
 private:
     uint64_t controlMarkersRefused_ = 0;
+    uint64_t transactionsCompleted_ = 0;
+    // Task 10 round 5: Prepare* transactions whose markers are still in flight,
+    // keyed by the markers' producerId (one transaction per producer at a time:
+    // the next one is refused with ConcurrentTransactions until this completes).
+    struct AwaitingMarkers {
+        rune::transaction::TransactionalId txnId;
+        int     outstanding   = 0;
+        bool    respPending   = false;   // a deferred EndTxn response
+        int64_t sessionId     = 0;
+        int64_t correlationId = 0;
+    };
+    std::unordered_map<int64_t, AwaitingMarkers> awaiting_;
+    bool dispatchMarkers_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
+                          int16_t producerEpoch, int32_t coordinatorEpoch, bool commit,
+                          const std::vector<rune::transaction::TopicPartition>& parts,
+                          int64_t respSessionId = 0, int64_t respCorrelationId = 0);
+    void resolveMarker_(int64_t producerId);
+    void completeAwaiting_(int64_t producerId, bool respond);
+    [[nodiscard]] int concurrentIfPreparing_(int err) const;
     // -----------------------------------------------------------------------
     // Members
     // -----------------------------------------------------------------------

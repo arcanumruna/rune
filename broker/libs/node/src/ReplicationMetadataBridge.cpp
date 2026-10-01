@@ -6,6 +6,8 @@
 // in test files that use both namespaces.
 
 #include <rune/node/ReplicationMetadataBridge.h>
+
+#include <cassert>
 #include <rune/node/WorkerPool.h>
 
 #include <spdlog/spdlog.h>
@@ -108,6 +110,9 @@ void ReplicationMetadataBridge::enqueueRoleOp_(WorkerOp op, bool fence) noexcept
     // independent).
     for (auto& p : q) {
         if (p.op.topicId == op.topicId && p.op.partition == op.partition && p.incarnation == h.incarnation) {
+            // Round 5: only a role op at the same or a newer epoch may supersede
+            // (role changes are epoch-monotonic per partition).
+            assert(op.roleEpoch >= p.op.roleEpoch && "role-op coalescing must never go back in epoch");
             p.op    = std::move(op);
             p.fence = fence;
             ++roleOpsCoalesced_;

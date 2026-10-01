@@ -13,6 +13,8 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/LogCleanerAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
+#include <rune/node/TransactionCoordinationService.h>
+#include <rune/protocol/client/TxnMessages.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/WorkerPool.h>
@@ -1682,8 +1684,10 @@ struct MarkerRig {
     Captured cap;
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(cap.fn());
     PartitionReplica* r = nullptr;
-    MarkerRig() {
-        auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 0, 0), Role::Leader, 1,
+    explicit MarkerRig(int minIsr = 1) {
+        auto pc0 = cfg(1, 1, 0, 0);
+        pc0.minIsr = minIsr;
+        auto rep = std::make_unique<PartitionReplica>(pc0, Role::Leader, 1,
             std::vector<rune::replication::NodeId>{1}, std::vector<rune::replication::NodeId>{1},
             topics.log(0, 0), &t);
         r = rep.get();
@@ -1989,4 +1993,251 @@ TEST(ReplicaLifetimeRegression, CleanerUsesItsOwnRingViewAndGatesTheFree) {
     rt.doWork(3);
     EXPECT_EQ(rt.cleanerAckedGenForTest(), R.reg.generation());
     EXPECT_EQ(R.reg.retiredCountForTest(), 0u) << "freed once the cleaner acked";
+}
+
+// ============================================================================
+// Fix round 5 — a transaction completes only after EVERY marker has landed;
+// marker replies are FIFO with produce results; the ISR gate is worker-owned.
+// ============================================================================
+namespace {
+// A coordinator over MarkerRig's gateway (per-worker mode: markers are async).
+struct TxnRig {
+    MarkerRig m;
+    TransactionCoordinationService tcs{nullptr, &m.topics};
+    std::vector<std::vector<uint8_t>> controlFrames;     // deferred responses (gateway egress)
+    std::string txnId = "tx-1";
+    int64_t pid = -1; int16_t epoch = 0; int32_t seq = 0; int64_t corr = 100;
+    std::array<uint8_t, 4096> out{};
+    TxnRig() {
+        tcs.setGateway(&m.gw);
+        m.gw.setTxnService(&tcs);
+        m.gw.setCommittedMetadataReady(true);
+        m.gw.setOnControlFrame([this](int64_t, const uint8_t* b, std::size_t n) {
+            controlFrames.emplace_back(b, b + n);
+        });
+    }
+    std::span<const uint8_t> tid() const {
+        return {reinterpret_cast<const uint8_t*>(txnId.data()), txnId.size()};
+    }
+    int16_t initPid() {
+        pc::InitProducerId q; q.sessionId = 1; q.correlationId = ++corr; q.transactionTimeoutMs = 60'000;
+        q.transactionalId = tid();
+        std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
+        const auto n = tcs.handleInitProducerId(f.data(), f.size(), 1, out.data(), out.size());
+        auto r = pc::InitProducerIdResponse::decode(out.data(), n);
+        if (r && r->errorCode == 0) { pid = r->producerId; epoch = r->producerEpoch; }
+        return r ? r->errorCode : -1;
+    }
+    int16_t addPartition() {
+        pc::AddPartitionsToTxn q; q.sessionId = 1; q.correlationId = ++corr; q.producerId = pid;
+        q.producerEpoch = epoch; q.transactionalId = tid();
+        const pc::TxnTopicPartition tp{0, 0};
+        std::vector<uint8_t> f(pc::AddPartitionsToTxn::encodedSizeFor(tid(), 1));
+        q.encode(f.data(), std::span<const pc::TxnTopicPartition>(&tp, 1));
+        const auto n = tcs.handleAddPartitions(f.data(), f.size(), 1, out.data(), out.size());
+        auto r = pc::AddPartitionsToTxnResponse::decode(out.data(), n);
+        return (r && r->results.size() == 1) ? r->results[0].errorCode : int16_t{-1};
+    }
+    // Returns the EndTxn error code if answered synchronously, or 999 if deferred.
+    int16_t endTxn(bool commit) {
+        pc::EndTxn q; q.sessionId = 1; q.correlationId = ++corr; q.producerId = pid;
+        q.producerEpoch = epoch; q.commit = commit ? 1 : 0; q.transactionalId = tid();
+        std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
+        const auto n = tcs.handleEndTxn(f.data(), f.size(), 1, out.data(), out.size());
+        if (n == 0) return 999;
+        auto r = pc::EndTxnResponse::decode(out.data(), n);
+        return r ? r->errorCode : -1;
+    }
+    // A transactional data batch through the REAL gateway produce path.
+    void produceTxn(const std::string& value) {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.setTransactional(true); b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+        b.append("k", value, 1000);
+        const auto batch = b.build();
+        pc::Produce msg;
+        msg.sessionId = sid; msg.correlationId = ++corr; msg.topicId = 0; msg.partition = 0;
+        msg.partitionKnown = 1; msg.acks = 0; msg.producerId = pid; msg.producerEpoch = epoch;
+        msg.baseSequence = seq++; msg.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        msg.encode(frame.data());
+        m.gw.applyProduceForTest(frame.data(), frame.size());
+    }
+    int64_t sid = 0;
+};
+constexpr int16_t kConcurrent = static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions);
+} // namespace
+
+TEST(ReplicaLifetimeRegression, MarkerAppendedBeforeTxnCompletesRegression) {
+    // The EndTxn response and the producer's next transaction are held until
+    // every participant's marker has LANDED (Kafka CONCURRENT_TRANSACTIONS).
+    TxnRig t;
+    t.sid = t.m.gw.injectTestSession();
+    ASSERT_EQ(t.initPid(), 0);
+    ASSERT_EQ(t.addPartition(), 0);
+    t.produceTxn("a");
+    EXPECT_EQ(t.endTxn(/*commit=*/true), 999) << "EndTxn response deferred while the marker is in flight";
+    EXPECT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 1u);
+    EXPECT_EQ(t.addPartition(), kConcurrent) << "next txn refused (retriable) until the marker lands";
+    EXPECT_EQ(t.endTxn(true), kConcurrent);
+    EXPECT_EQ(t.initPid(), kConcurrent);
+    EXPECT_TRUE(t.controlFrames.empty());
+    for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(1 + i);   // bounded
+    ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u) << "completed when the last marker landed";
+    ASSERT_EQ(t.controlFrames.size(), 1u) << "the deferred EndTxn response is sent now";
+    auto r = pc::EndTxnResponse::decode(t.controlFrames[0].data(), t.controlFrames[0].size());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 0);
+    EXPECT_EQ(t.addPartition(), 0) << "the next transaction may start now";
+}
+
+TEST(ReplicaLifetimeRegression, FullReturnRingDoesNotReorderMarkerVsProduceResultRegression) {
+    // The marker's ControlRecordAppended travels the SAME FIFO as ProduceResults:
+    // a later produce's result never overtakes it — not within a pass, and not
+    // through a ring slot that frees up while earlier returns sit in overflow.
+    Reg R;
+    PartitionReplica* r = R.add(5, 0);
+    Worker w(0, 1 << 16, /*return ring*/ 1 << 12, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{r});
+    w.setWorkerIngress(nullptr, true);
+    for (int i = 0; i < 40; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(r, 1 + i)));   // overflows the return ring
+    WorkerOp mk;
+    mk.type = WorkerOp::Type::AppendControlRecord; mk.topicId = 5; mk.partition = 0;
+    mk.replica = r; mk.correlationId = 999; mk.recordBatchBytes = batchAt(0);
+    ASSERT_TRUE(w.tryEnqueueOp(stamp(std::move(mk))));
+    ASSERT_TRUE(w.tryEnqueueOp(produceOp(r, 1000)));     // the NEXT transaction's batch
+    std::vector<std::pair<int, int64_t>> order;          // (type, correlationId)
+    for (int i = 0; i < 256 && order.size() < 42; ++i) {
+        w.doWork(1 + i);
+        if (i % 3 == 2)   // let returns pile up in overflow between drains
+            w.drainReturn([&](WorkerReturn x) { order.emplace_back(static_cast<int>(x.type), x.correlationId); });
+    }
+    for (int i = 0; i < 64 && order.size() < 42; ++i) {
+        w.doWork(500 + i);
+        w.drainReturn([&](WorkerReturn x) { order.emplace_back(static_cast<int>(x.type), x.correlationId); });
+    }
+    ASSERT_EQ(order.size(), 42u);
+    std::size_t markerAt = order.size(), nextAt = order.size();
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        if (order[i].first == static_cast<int>(WorkerReturn::Type::ControlRecordAppended)) markerAt = i;
+        if (order[i].second == 1000) nextAt = i;
+    }
+    ASSERT_LT(markerAt, order.size());
+    EXPECT_LT(markerAt, nextAt) << "the marker's reply precedes the later produce's result";
+    EXPECT_EQ(markerAt, 40u) << "exactly in op order";
+}
+
+TEST(ReplicaLifetimeRegression, AbortedTxnRangeNeverCoversNextTxnRegression) {
+    // End to end through the gateway: txn1 aborts, the producer then runs txn2
+    // and aborts it too.  Each txn's data must be covered by ITS abort range,
+    // so a read_committed consumer never sees aborted records — the next txn's
+    // batch is never adopted into (or released by) the previous txn's marker.
+    TxnRig t;
+    t.sid = t.m.gw.injectTestSession();
+    ASSERT_EQ(t.initPid(), 0);
+    ASSERT_EQ(t.addPartition(), 0);
+    t.produceTxn("txn1");
+    ASSERT_EQ(t.endTxn(/*commit=*/false), 999);
+    // The producer retries its next transaction (ConcurrentTransactions is
+    // retriable) — it can only begin once txn1's marker landed.
+    int tries = 0;
+    for (; tries < 64 && t.addPartition() == kConcurrent; ++tries) t.m.runWorker(1 + tries);
+    ASSERT_LT(tries, 64);
+    t.produceTxn("txn2");
+    for (int i = 0; i < 8; ++i) t.m.runWorker(100 + i);
+    ASSERT_EQ(t.endTxn(false), 999);
+    for (int i = 0; i < 64 && t.tcs.awaitingMarkerTxnsForTest() > 0; ++i) t.m.runWorker(200 + i);
+    ASSERT_EQ(t.tcs.awaitingMarkerTxnsForTest(), 0u);
+    // Log: [0]=txn1 data, [1]=ABORT marker, [2]=txn2 data, [3]=ABORT marker.
+    const auto ranges = t.m.gw.abortedRangesForTest(0, 0);
+    ASSERT_EQ(ranges.size(), 2u);
+    auto covered = [&](int64_t off) {
+        for (const auto& rg : ranges) if (rg.contains(off)) return true;
+        return false;
+    };
+    EXPECT_TRUE(covered(0)) << "txn1 data aborted";
+    EXPECT_TRUE(covered(2)) << "txn2 data aborted — a read_committed consumer never sees it";
+    EXPECT_EQ(ranges[0].lastOffset, 1);
+    EXPECT_EQ(ranges[1].firstOffset, 2);
+    EXPECT_EQ(ranges[1].lastOffset, 3);
+    EXPECT_EQ(t.m.gw.openTxnsForTest(0, 0), 0u);
+}
+
+TEST(ReplicaLifetimeRegression, MinIsrViolationIsReturnedByTheOwningWorker) {
+    // The gateway no longer reads replica->isr() on the control thread: an
+    // acks=all produce under min-ISR is routed and the OWNING worker answers
+    // MinIsrViolation (log untouched).
+    MarkerRig m(/*minIsr=*/2);
+    m.gw.setCommittedMetadataReady(true);
+    m.gw.setMinIsr(2);                     // the admission policy the op carries
+    m.gw.syncMinIsrForTest();
+    const int64_t sid = m.gw.injectTestSession();
+    pc::Produce msg;
+    const auto batch = batchAt(0);
+    msg.sessionId = sid; msg.correlationId = 7; msg.topicId = 0; msg.partition = 0; msg.partitionKnown = 1;
+    msg.acks = 1; msg.producerId = -1; msg.recordBatch = std::span<const uint8_t>(batch);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    msg.encode(frame.data());
+    m.gw.applyProduceForTest(frame.data(), frame.size());
+    EXPECT_TRUE(m.cap.produceErrors.empty()) << "no control-thread ISR read: the op went to the worker";
+    for (int i = 0; i < 8 && m.cap.produceErrors.empty(); ++i) m.runWorker(1 + i);
+    ASSERT_EQ(m.cap.produceErrors.size(), 1u);
+    EXPECT_EQ(m.cap.produceErrors[0], static_cast<int16_t>(pc::ErrorCode::MinIsrViolation));
+    EXPECT_EQ(m.r->log()->logEndOffset(), 0) << "nothing appended";
+}
+
+TEST(ReplicaLifetimeRegression, PromotionRacingProduceDoesNotCrash) {
+    // The crash: the control thread read replica->isr() while becomeLeader (on
+    // the worker thread) replaced the ISR manager.  With the gate on the worker,
+    // promotions and acks=all produces race freely (worker on its own thread,
+    // bounded iterations, no sleeps).
+    MarkerRig m(/*minIsr=*/1);
+    m.gw.setCommittedMetadataReady(true);
+    const int64_t sid = m.gw.injectTestSession();
+    rune::consensus::MonotonicNanoClock clk;
+    m.pool.startRunners(NodeConfig::WorkerIdleStrategy::BusySpin, clk);
+    int responses = 0;
+    const auto batch = batchAt(0);
+    for (int i = 0; i < 2'000; ++i) {
+        WorkerOp role;
+        role.type = (i % 2) ? WorkerOp::Type::BecomeLeader : WorkerOp::Type::BecomeFollower;
+        role.topicId = 0; role.partition = 0; role.roleEpoch = 1 + i; role.roleLeaderId = 1;
+        role.isr = {1};
+        (void)m.pool.tryEnqueueOp(0, 0, std::move(role));
+        pc::Produce msg;
+        msg.sessionId = sid; msg.correlationId = i; msg.topicId = 0; msg.partition = 0; msg.partitionKnown = 1;
+        msg.acks = 1; msg.producerId = -1; msg.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        msg.encode(frame.data());
+        m.gw.applyProduceForTest(frame.data(), frame.size());
+        m.pool.drainAllReturns([&](WorkerReturn r) { m.gw.handleWorkerReturnForTest(r); });
+    }
+    m.pool.stopAndJoinRunners();
+    m.pool.drainAllReturns([&](WorkerReturn r) { m.gw.handleWorkerReturnForTest(r); });
+    responses = static_cast<int>(m.cap.produceErrors.size());
+    EXPECT_GT(responses, 0) << "produces were answered while the role flipped (no crash)";
+}
+
+TEST(ReplicaLifetimeRegression, IncarnationWrapSkipsValuesTheOwnerMapStillHolds) {
+    // Minor: after a wrap, an incarnation still held by WorkerPool's F7 owner
+    // map (removed, awaiting acks) is never reissued.
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    R.reg.setIncarnationInUseHook(&WorkerPool::tracksIncarnationThunk, &pool);
+    auto* a = R.add(1, 0);                                   // incarnation 1 (stays live)
+    auto* b = R.add(1, 1);                                   // incarnation 2
+    pool.reconcile(R.reg);
+    ackAll(pool);
+    ASSERT_EQ(a->incarnation(), 1u);
+    ASSERT_EQ(b->incarnation(), 2u);
+    R.reg.remove(1, 1);
+    pool.reconcile(R.reg);                                   // inc 2: removed, NOT yet acked
+    ASSERT_TRUE(pool.tracksIncarnation(2)) << "pending erase in the F7 owner map";
+    ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u) << "registry side freed (forced)";
+    R.reg.setNextIncarnationForTest(0xFFFFFFFEu);
+    R.add(1, 2);                                             // 0xFFFFFFFE (pre-wrap)
+    auto* c = R.add(1, 3);                                   // wraps: FFFFFFFF, 0, 1 (live), 2 (held) skipped
+    EXPECT_EQ(c->incarnation(), 3u) << "an incarnation still held by the owner map is never reissued";
 }

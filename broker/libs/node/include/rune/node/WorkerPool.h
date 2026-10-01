@@ -272,6 +272,15 @@ public:
     /// Ops are only routed once the registry is wired: tryEnqueueOp reconciles
     /// inline first (SetOwnership always precedes the ops it governs).
     void setRegistry(const ReplicaRegistry* registry) noexcept { registry_ = registry; }
+    /// Round 5: the F7 owner map still tracks `inc` (live, or removed but not
+    /// yet erased because a worker has not acked).  ReplicaRegistry consults it
+    /// after an incarnation wrap (setIncarnationInUseHook).
+    [[nodiscard]] bool tracksIncarnation(uint32_t inc) const noexcept {
+        return ownerOfIncarnation_.find(inc) != ownerOfIncarnation_.end();
+    }
+    static bool tracksIncarnationThunk(const void* self, uint32_t inc) noexcept {
+        return static_cast<const WorkerPool*>(self)->tracksIncarnation(inc);
+    }
     /// Test-only: treat the pool as running (SetOwnership goes over the rings)
     /// without spawning runner threads; tests drive the workers themselves.
     void setRunnersStartedForTest(bool on) noexcept { runnersStarted_ = on; }
@@ -540,7 +549,16 @@ private:
     static constexpr std::uint64_t       kNoGen = static_cast<std::uint64_t>(-1);
     std::uint64_t                        computedGen_ = kNoGen;   // generation the pending sets reflect
     const ReplicaRegistry*               registry_ = nullptr;
-    std::vector<Worker::OwnedSet>        pendingSets_;            // per worker: the computed generation's set
+    // Per worker: the computed generation's owned set.  These are raw replica
+    // pointers held across cycles by the control thread — sanctioned against the
+    // round-4 design ruling because they are (a) RECOMPUTED from the registry on
+    // every generation change (computeAssignment_), so they only ever name
+    // replicas live in the CURRENT generation, and (b) NEVER dereferenced on the
+    // control thread: they are only copied into a SetOwnership op, and the worker
+    // that receives them owns those replicas.  A replica removed at gen G is
+    // freed only after every worker acked >= G, i.e. after any set naming it
+    // has been superseded.
+    std::vector<Worker::OwnedSet>        pendingSets_;
     std::vector<std::uint64_t>           deliveredGen_;           // per worker: generation last ENQUEUED
     std::vector<std::uint64_t>           ackedGen_;               // per worker: latest OwnershipAck
     std::vector<uint64_t>                setOwnershipSent_;       // per worker: SetOwnership ops delivered

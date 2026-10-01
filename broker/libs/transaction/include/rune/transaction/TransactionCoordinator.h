@@ -399,6 +399,13 @@ public:
     /// the same producerId/epoch.
     CompleteTransactionResult completeTransaction(const TransactionalId& txnId);
 
+    /// Task 10 round 5: the markers of a Prepare* transaction were handed to
+    /// the owning partitions (asynchronously).  Clears markersPending so the
+    /// doWork re-drive does not write them twice; the state STAYS Prepare*
+    /// until completeTransaction() — called once every marker has landed.
+    /// (A failover recovery re-sets markersPending for any Prepare*.)
+    void markersDispatched(const TransactionalId& txnId);
+
     // -----------------------------------------------------------------------
     // doWork — single-writer periodic step (no spin, no sleep)
     // -----------------------------------------------------------------------

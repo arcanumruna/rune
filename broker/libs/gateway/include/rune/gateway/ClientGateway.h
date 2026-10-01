@@ -1313,6 +1313,9 @@ public:
         return n;
     }
     [[nodiscard]] std::size_t pendingAcksForTest() const noexcept { return pendingAcks_.size(); }
+    /// Test-only (single-threaded): take the per-cycle min-ISR snapshot now
+    /// (doWork does it at the top of every cycle).
+    void syncMinIsrForTest() noexcept { cachedMinIsr_ = minIsr_.load(std::memory_order_relaxed); }
     /// Test-only: run the deferred-ack drain once at `nowNs`.
     void drainPendingAcksForTest(int64_t nowNs) { nowNs_ = nowNs; drainPendingAcks(); }
     /// Test-only: the subscription lifecycle forwarding (worker routing).

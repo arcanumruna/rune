@@ -58,6 +58,13 @@ struct ITxnRequestHandler {
     // the coordinator is told.  Cold path; default no-op for test doubles.
     virtual void onControlMarkerRefused(int32_t /*topicId*/, int32_t /*partition*/,
                                         int64_t /*producerId*/, int16_t /*errorCode*/) {}
+
+    // Task 10 round 5: an asynchronously appended marker LANDED (the gateway
+    // already fed its authoritative offset to the LSO / aborted index).  The
+    // coordinator completes the transaction only once every participant
+    // partition's marker landed.  Cold path; default no-op for test doubles.
+    virtual void onControlMarkerLanded(int32_t /*topicId*/, int32_t /*partition*/,
+                                       int64_t /*producerId*/) {}
 };
 
 } // namespace rune::gateway

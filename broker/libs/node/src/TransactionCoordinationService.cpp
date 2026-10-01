@@ -32,6 +32,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <string_view>
@@ -57,7 +58,7 @@ int16_t txnErrorToProtocol(int txnErr) noexcept {
         case 3:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);
         case 4:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);
         case 5:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);
-        case 6:  return static_cast<int16_t>(ErrorCode::InvalidTxnState);  // kConcurrentTransactions
+        case 6:  return static_cast<int16_t>(ErrorCode::ConcurrentTransactions);  // retriable (Kafka)
         default: return static_cast<int16_t>(ErrorCode::Internal);
     }
 }
@@ -154,88 +155,19 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     // member containers (clear+refill each cycle, no heap alloc in steady state).
     //
     // Single-writer (duty-cycle thread): no locks needed.
+    // Task 10 round 5 (Kafka semantics): the transaction STAYS PrepareAbort /
+    // PrepareCommit until every participant partition's marker has LANDED
+    // (onControlMarkerLanded); only then completeTransaction.  dispatchMarkers_
+    // hands the markers out and clears markersPending so they are not re-driven.
     const bool haveGateway = (gateway_ != nullptr) && (topics_ != nullptr);
     const bool haveOverride = static_cast<bool>(appendFnOverride_);
     if (haveGateway || haveOverride) {
-        // Snapshot pending txns → producerId → {commit} map (member scratch).
-        pendingByPidScratch_.clear();
-        {
-            const auto pending = coordinator_.pendingMarkerTransactions();
-            for (const auto& p : pending) {
-                pendingByPidScratch_[p.producerId] = PendingInfo{p.commit};
-            }
-        }
-
-        // Clear post-process scratch (member — no alloc in steady state).
-        toNotifyScratch_.clear();
-
-        auto appendFn = [&](const tx::TopicPartition& tp,
-                             const std::vector<uint8_t>& batch)
-        {
-            int64_t markerOffset = -1;
-            int32_t topicId      = -1;
-
-            // Extract producerId from the batch (LE64@kProducerIdOffset=43) and
-            // the commit/abort flag from the snapshot BEFORE the append: an
-            // asynchronous (worker-routed) append needs them to feed the LSO
-            // bookkeeping with the offset the marker actually lands at.
-            int64_t pid = -1;
-            if (batch.size() >= 43u + 8u) {
-                pid = 0;
-                for (int bi = 0; bi < 8; ++bi)
-                    pid |= (static_cast<int64_t>(batch[43u + bi]) << (bi * 8));
-            }
-            bool commit = false;
-            if (pid >= 0) {
-                auto it = pendingByPidScratch_.find(pid);
-                if (it != pendingByPidScratch_.end()) commit = it->second.commit;
-            }
-
-            if (haveGateway) {
-                // Production path: resolve topic name → id, append via gateway.
-                const auto topicIdOpt = topics_->topicIdForName(tp.topic);
-                if (!topicIdOpt.has_value()) {
-                    spdlog::warn("TCS::doWork resolvePendingMarkers: unknown topic '{}' partition={} — skipped",
-                                 tp.topic, tp.partition);
-                    return;
-                }
-                topicId = *topicIdOpt;
-                markerOffset = gateway_->appendControlRecord(
-                    topicId, tp.partition,
-                    std::span<const uint8_t>(batch.data(), batch.size()), pid, commit);
-                // Task 10 round 4 (P1): routed to the owning worker — the gateway
-                // feeds notifyControlMarker itself with the AUTHORITATIVE offset
-                // when the worker reports the append (never pre-computed).
-                if (markerOffset == rune::gateway::ClientGateway::kControlRecordAsync) return;
-                if (markerOffset < 0) {
-                    spdlog::warn("TCS::doWork resolvePendingMarkers: appendControlRecord failed "
-                                 "topicId={} partition={}", topicId, tp.partition);
-                    return;
-                }
-            } else {
-                // Test-seam path: use override appendFn (no gateway needed).
-                markerOffset = appendFnOverride_(tp.topic, tp.partition,
-                    std::span<const uint8_t>(batch.data(), batch.size()));
-                if (markerOffset < 0) return;
-                // topicId remains -1; notifyControlMarker skipped (test path).
-            }
-
-            toNotifyScratch_.push_back({topicId, tp.partition, pid, markerOffset, commit});
-        };
-
-        const int resolved = tx::ControlMarker::resolvePendingMarkers(coordinator_, appendFn);
-        if (resolved > 0) {
-            work += resolved;
-            // Feed LsoTracker + AbortedTxnIndex for each resolved marker
-            // (production path only — test-seam path skips LSO notify).
-            if (haveGateway) {
-                for (const auto& n : toNotifyScratch_) {
-                    if (n.producerId >= 0) {
-                        gateway_->notifyControlMarker(
-                            n.topicId, n.partition, n.producerId, n.markerOffset, n.commit);
-                    }
-                }
-            }
+        const auto pending = coordinator_.pendingMarkerTransactions();
+        for (const auto& p : pending) {
+            coordinator_.markersDispatched(p.txnId);
+            dispatchMarkers_(p.txnId, p.producerId, p.producerEpoch, p.coordinatorEpoch,
+                             p.commit, p.partitions);
+            ++work;
         }
     }
 
@@ -382,7 +314,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
 
     // Encode response: one result entry per partition with the same error code.
     // Reuse partResultScratch_ (pre-reserved member) — no per-call alloc.
-    const int16_t errCode = txnErrorToProtocol(result.errorCode);
+    const int16_t errCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
     const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
     if (outCap < needed) return 0;
 
@@ -445,7 +377,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
         }
     }
 
-    resp.errorCode = txnErrorToProtocol(result.errorCode);
+    resp.errorCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
     if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return 0;
     return resp.encode(out);
 }
@@ -527,7 +459,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
 
     // Build result entries — all same error code.
     // Reuse partResultScratch_ (pre-reserved member) — no per-call vector alloc.
-    const int16_t errCode = txnErrorToProtocol(result.errorCode);
+    const int16_t errCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
     const size_t entryCount = msg.entries.size();
     const size_t needed = pc::TxnOffsetCommitResponse::encodedSizeFor(entryCount);
     if (outCap < needed) return 0;
@@ -582,59 +514,127 @@ size_t TransactionCoordinationService::handleEndTxn(
         }
     }
 
-    // TX-4 Task 8: Write control markers for client-driven commit/abort.
-    //
-    // endTransaction transitions the txn Ongoing→PrepareCommit or
-    // Ongoing→PrepareAbort (markersPending=false for client-driven).
-    // We now write control markers to each participant partition and
-    // call completeTransaction to transition PrepareCommit→CompleteCommit.
-    //
-    // Mirrors the doWork path (resolvePendingMarkers) but using writeMarkers
-    // which handles Ongoing→Prepare internally (already done) and
-    // PrepareCommit/PrepareAbort directly.
-    //
-    // Single-writer: called on the duty-cycle thread.
+    // TX-4 Task 8 / Task 10 round 5: write the control markers for a client-
+    // driven commit/abort.  The txn stays Prepare* and the EndTxn RESPONSE IS
+    // DEFERRED until every marker has landed — the producer cannot start its
+    // next transaction (whose batches could otherwise land ahead of a marker, or
+    // be closed by it in the LSO bookkeeping) before then.
     if (result.ok() && gateway_ && topics_) {
-        // Reuse member scratch (pre-reserved, no steady-state alloc).
-        toNotifyScratch_.clear();
-
-        const int32_t coordEpoch = [&]() -> int32_t {
-            const auto* m = coordinator_.metadata(txnIdScratch_);
-            return m ? m->coordinatorEpoch : 0;
-        }();
-
-        auto appendFn = [&](const tx::TopicPartition& tp,
-                             const std::vector<uint8_t>& batch)
-        {
-            const auto topicIdOpt = topics_->topicIdForName(tp.topic);
-            if (!topicIdOpt.has_value()) return;
-            const int32_t topicId = *topicIdOpt;
-
-            const int64_t markerOffset = gateway_->appendControlRecord(
-                topicId, tp.partition,
-                std::span<const uint8_t>(batch.data(), batch.size()), msg.producerId, commit);
-            // P1: asynchronous (worker) append — the gateway notifies with the
-            // authoritative offset when the worker reports it.
-            if (markerOffset < 0) return;   // incl. kControlRecordAsync
-
-            toNotifyScratch_.push_back({topicId, tp.partition, msg.producerId,
-                                        markerOffset, commit});
-        };
-
-        tx::ControlMarker::writeMarkers(
-            coordinator_, txnIdScratch_,
-            msg.producerId, msg.producerEpoch,
-            commit, coordEpoch, nowNs, appendFn);
-
-        for (const auto& n : toNotifyScratch_) {
-            gateway_->notifyControlMarker(
-                n.topicId, n.partition, n.producerId, n.markerOffset, n.commit);
+        const auto* m = coordinator_.metadata(txnIdScratch_);
+        if (m) {
+            const std::vector<tx::TopicPartition> parts(m->partitions.begin(), m->partitions.end());
+            const bool isCommit = (m->state == tx::TxnState::PrepareCommit);
+            const tx::TransactionalId txnId = txnIdScratch_;
+            if (dispatchMarkers_(txnId, m->producerId, m->producerEpoch, m->coordinatorEpoch,
+                                 isCommit, parts, msg.sessionId, msg.correlationId)) {
+                return 0;   // response sent by completeAwaiting_ when the last marker lands
+            }
         }
     }
 
-    resp.errorCode = txnErrorToProtocol(result.errorCode);
+    resp.errorCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
     if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return 0;
     return resp.encode(out);
+}
+
+// ---------------------------------------------------------------------------
+// Task 10 round 5 — asynchronous marker completion.
+// ---------------------------------------------------------------------------
+int TransactionCoordinationService::concurrentIfPreparing_(int err) const
+{
+    // Kafka CONCURRENT_TRANSACTIONS: a request the state machine rejects only
+    // because the previous transaction is still writing its markers is
+    // RETRIABLE — not an InvalidTxnState.
+    if (err != 3) return err;   // kInvalidTransition
+    const auto* m = coordinator_.metadata(txnIdScratch_);
+    if (m && (m->state == tx::TxnState::PrepareCommit || m->state == tx::TxnState::PrepareAbort ||
+              m->state == tx::TxnState::PrepareEpochFence))
+        return 6;               // kConcurrentTransactions
+    return err;
+}
+
+bool TransactionCoordinationService::dispatchMarkers_(
+    const tx::TransactionalId& txnId, int64_t producerId, int16_t producerEpoch,
+    int32_t coordinatorEpoch, bool commit, const std::vector<tx::TopicPartition>& parts,
+    int64_t respSessionId, int64_t respCorrelationId)
+{
+    AwaitingMarkers& a = awaiting_[producerId];
+    a.txnId = txnId;
+    const tx::ControlType ct = commit ? tx::ControlType::Commit : tx::ControlType::Abort;
+    for (const auto& tp : parts) {
+        const auto batch = tx::ControlMarker::build(producerId, producerEpoch, ct, coordinatorEpoch);
+        if (gateway_ && topics_) {
+            const auto topicIdOpt = topics_->topicIdForName(tp.topic);
+            if (!topicIdOpt.has_value()) {
+                spdlog::warn("TCS: marker for unknown topic '{}' partition={} — skipped", tp.topic, tp.partition);
+                continue;
+            }
+            const int64_t off = gateway_->appendControlRecord(
+                *topicIdOpt, tp.partition, std::span<const uint8_t>(batch.data(), batch.size()),
+                producerId, commit);
+            if (off == rune::gateway::ClientGateway::kControlRecordAsync) {
+                ++a.outstanding;                       // lands later: onControlMarkerLanded
+            } else if (off >= 0) {
+                gateway_->notifyControlMarker(*topicIdOpt, tp.partition, producerId, off, commit);
+            } else {
+                spdlog::warn("TCS: appendControlRecord failed topicId={} partition={}", *topicIdOpt, tp.partition);
+            }
+        } else if (appendFnOverride_) {
+            (void)appendFnOverride_(tp.topic, tp.partition,
+                                    std::span<const uint8_t>(batch.data(), batch.size()));
+        }
+    }
+    if (a.outstanding == 0) {
+        completeAwaiting_(producerId, /*respond=*/false);
+        return false;                                  // completed synchronously
+    }
+    if (respSessionId != 0 || respCorrelationId != 0) {
+        a.respPending   = true;
+        a.sessionId     = respSessionId;
+        a.correlationId = respCorrelationId;
+    }
+    return true;
+}
+
+void TransactionCoordinationService::resolveMarker_(int64_t producerId)
+{
+    auto it = awaiting_.find(producerId);
+    if (it == awaiting_.end() || it->second.outstanding <= 0) return;
+    if (--it->second.outstanding == 0) completeAwaiting_(producerId, /*respond=*/true);
+}
+
+void TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool respond)
+{
+    auto it = awaiting_.find(producerId);
+    if (it == awaiting_.end()) return;
+    const AwaitingMarkers a = std::move(it->second);
+    awaiting_.erase(it);
+    const auto r = coordinator_.completeTransaction(a.txnId);
+    ++transactionsCompleted_;
+    if (respond && a.respPending && gateway_) {
+        pc::EndTxnResponse resp;
+        resp.sessionId     = a.sessionId;
+        resp.correlationId = a.correlationId;
+        resp.errorCode     = txnErrorToProtocol(r.errorCode);
+        std::array<uint8_t, pc::EndTxnResponse::ENCODED_SIZE> buf{};
+        const std::size_t n = resp.encode(buf.data());
+        (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
+    }
+}
+
+void TransactionCoordinationService::onControlMarkerLanded(int32_t, int32_t, int64_t producerId)
+{
+    resolveMarker_(producerId);
+}
+
+void TransactionCoordinationService::onControlMarkerRefused(int32_t topicId, int32_t partition,
+                                                            int64_t producerId, int16_t errorCode)
+{
+    ++controlMarkersRefused_;
+    spdlog::error("TCS: control marker REFUSED/FAILED topic={} partition={} producerId={} err={} "
+                  "(counted as resolved so the transaction can complete)",
+                  topicId, partition, producerId, errorCode);
+    resolveMarker_(producerId);
 }
 
 } // namespace rune::node

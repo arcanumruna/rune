@@ -1679,19 +1679,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             // Status::Accept — fall through to worker enqueue.
         }
 
-        // GR-5: min-ISR gate for acks=All (worker path — same gate as inline path).
-        if (acksAll && replica && committedMetadataReady_) {
-            // G1.1: use per-cycle snapshot (plain int) instead of per-produce atomic load.
-            const int currentMinIsr = cachedMinIsr_;
-            const int isrSize = static_cast<int>(replica->isr().size());
-            if (isrSize < currentMinIsr) {
-                spdlog::debug("ClientGateway: acks=All produce rejected (ISR size={} < minIsr={}) "
-                              "sessionId={} topicId={} partition={}",
-                              isrSize, currentMinIsr, msg.sessionId, msg.topicId, partition);
-                sendResp(pc::ErrorCode::MinIsrViolation, partition, 0);
-                return;  // log untouched — no append, no LEO advance
-            }
-        }
+        // GR-5 (Task 10 round 5): NO min-ISR gate here.  The replica's ISR is
+        // worker-owned state; reading replica->isr() on this control thread was a
+        // data race (and could segfault while becomeLeader was assigning the ISR
+        // manager).  The OWNING worker applies the gate (executeProduceWire_ /
+        // the shard ingress path) and answers MinIsrViolation in the ProduceResult.
 
         // P1 (Task 10 round 4): a control marker for this partition is still
         // waiting for worker-ring space — no later batch may overtake it.
@@ -1716,6 +1708,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.lastOffsetDelta = lastOffsetDelta;
         op.recordCount   = recordCount;
         op.deferAck      = acksAll && replica && committedMetadataReady_;
+        op.minIsr        = cachedMinIsr_;   // the admission policy; the worker gates on its own ISR
         op.enqueuedAtNs  = nowNs_;
         // E3 Task 5: plumb the topic's async-durability tier so the worker
         // knows whether to defer the ack until fsync completion (Strict=2).
@@ -3014,6 +3007,9 @@ void ClientGateway::onControlRecordAppended_(const rune::node::WorkerReturn& ret
     }
     // The AUTHORITATIVE offset: where the worker actually appended the marker.
     notifyControlMarker(m.topicId, m.partition, m.producerId, ret.baseOffset, m.commit);
+    // Round 5: only now may the coordinator count this partition's marker as
+    // written (the transaction completes when the last one lands).
+    if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId);
 }
 
 void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)

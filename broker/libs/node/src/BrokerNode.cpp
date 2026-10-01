@@ -1784,6 +1784,9 @@ void BrokerNode::buildGateway() {
     if (gateway_ && workerPool_) {
         gateway_->setWorkerPool(workerPool_.get());
     }
+    // Round 5: an incarnation wrap must skip values the F7 owner map still holds.
+    if (workerPool_ && replicaRegistry_)
+        replicaRegistry_->setIncarnationInUseHook(&WorkerPool::tracksIncarnationThunk, workerPool_.get());
     if (replTransport_ && workerPool_) {
         replTransport_->setWorkerPool(workerPool_.get());
     }
