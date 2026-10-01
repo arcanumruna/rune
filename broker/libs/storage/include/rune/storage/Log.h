@@ -164,6 +164,17 @@ public:
     /// owner (append) thread only.  The read_committed build skips an empty
     /// view (a gap below its target) with it.
     [[nodiscard]] int64_t nextSegmentBaseAfter(int64_t offset) const noexcept;
+    /// F15 S4 fix round 1: the segment whose base is exactly `segmentBase` —
+    /// its written bytes as an untouched read-only mapping (see
+    /// LogSegment::mappedBytes) and an identity that changes when the segment
+    /// object is replaced (a compaction swap).  {} / nullptr id when absent or
+    /// empty.  Owner (append) thread only.
+    struct SegmentBytes {
+        const uint8_t* data = nullptr;
+        std::size_t    size = 0;
+        const void*    id   = nullptr;
+    };
+    [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;
     int deleteOldSegments(int64_t retainBytes);
     /// Directory that contains this log's segment files.

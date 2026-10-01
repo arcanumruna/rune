@@ -379,6 +379,18 @@ void LogSegment::ensureReadMap() {
     // only accesses bytes in [0, logSize_), which are backed by the file.
 }
 
+LogReadView LogSegment::mappedBytes() {
+    if (logSize_ <= 0) return {};
+    ensureReadMap();
+    if (!readMap_) return {};
+    LogReadView v;
+    v.data       = readMap_->data();
+    v.len        = std::min(static_cast<std::size_t>(logSize_), readMapSize_);
+    v.baseOffset = baseOffset_;
+    v.nextOffset = nextOffset_;
+    return v;
+}
+
 LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) {
     if (logSize_ <= 0) return {};
     ensureReadMap();

@@ -122,6 +122,12 @@ public:
     /// startOffset is at/after the segment's next offset.  See LogReadView for
     /// lifetime rules.  Non-const: may lazily create / grow-remap the read mmap.
     LogReadView readView(int64_t startOffset, int32_t maxBytes);
+    /// F15 S4 fix round 1 (cold-cache build): the read-only mapping of the
+    /// written bytes [0, sizeBytes()) WITHOUT touching any page (an mmap /
+    /// remap syscall at most; no index lookup, no header read).  The caller
+    /// gates every access on page residency.  Owner (append) thread; valid
+    /// until the next append / roll / truncate on this segment.
+    LogReadView mappedBytes();
 
     int64_t recover();
 

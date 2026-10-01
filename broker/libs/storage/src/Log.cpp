@@ -632,6 +632,16 @@ int64_t Log::nextSegmentBaseAfter(int64_t offset) const noexcept {
     const auto it = segments_.upper_bound(offset);
     return it == segments_.end() ? -1 : it->first;
 }
+Log::SegmentBytes Log::segmentBytesAt(int64_t segmentBase) {
+    const auto it = segments_.find(segmentBase);
+    if (it == segments_.end()) return {};
+    SegmentBytes b;
+    b.id = it->second.get();
+    const LogReadView v = it->second->mappedBytes();
+    b.data = v.data;
+    b.size = v.len;
+    return b;
+}
 std::vector<int64_t> Log::segmentBaseOffsets() const {
     std::vector<int64_t> v; for (auto& [b, _] : segments_) v.push_back(b); return v;
 }
