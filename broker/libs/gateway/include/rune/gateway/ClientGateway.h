@@ -47,6 +47,7 @@
 //   - Zero-alloc on the hot path: encode scratch is a fixed member buffer.
 //   - NO busy-spin.
 
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/gateway/SessionTable.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
@@ -134,13 +135,17 @@ public:
     // @param sessionTimeoutNs         Idle session expiry threshold (default 10 s).
     // @param leaderView               Callable returning current LeaderView; default: always leader.
     // @param connectResolveTimeoutNs  How long before a pending-connect egress times out (default 5 s).
+    // @param pump                     Startup resolve pump for the ingress subscription (spec §3.6):
+    //                                 an invoker driver + conductor (fused runtime) is pumped by the
+    //                                 constructing thread; the default pump sleep-polls a threaded driver.
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
                   int32_t                             thisNodeId,
                   int64_t                             sessionTimeoutNs         = kDefaultSessionTimeoutNs,
                   std::function<LeaderView()>         leaderView               = nullptr,
-                  int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs);
+                  int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs,
+                  rune::aeronutil::AeronPump          pump                     = {});
 
     ~ClientGateway() = default;
 
@@ -1048,16 +1053,6 @@ private:
     // Never blocks.
     // -----------------------------------------------------------------------
     void drainPendingReleases();
-
-    // -----------------------------------------------------------------------
-    // Resolve a new ExclusivePublication (bounded wait).
-    // Returns nullptr if the publication cannot be resolved within the deadline.
-    // NOTE: kept for the redirect path (non-leader with known leader endpoint),
-    // which still needs a synchronous resolve to send the ErrorResponse.
-    // The regular (leader-accept) Connect path is now async via pendingConnects_.
-    // -----------------------------------------------------------------------
-    std::shared_ptr<aeron::ExclusivePublication>
-    resolvePublication(const std::string& channel, int32_t streamId);
 
     // -----------------------------------------------------------------------
     // Members

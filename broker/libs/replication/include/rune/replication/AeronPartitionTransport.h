@@ -60,6 +60,7 @@ namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
 
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/consensus/IngressRing.h>  // agrona ManyToOne ring (outbound marshalling)
 
 #include <Aeron.h>
@@ -101,11 +102,15 @@ public:
     /// at startup, never on the duty-cycle hot path.
     /// \param outboundRingBytes Payload bytes of the outbound ManyToOne ring
     ///        (NodeConfig::replicationOutboundRingBytes). Power of two.
+    /// \param pump  Startup resolve pump (spec §3.6): an invoker driver +
+    ///        conductor (fused runtime) is pumped by this thread between probes;
+    ///        the default pump sleep-polls a threaded driver.
     AeronPartitionTransport(std::shared_ptr<aeron::Aeron> aeron,
                             const std::string&             ingressChannel,
                             int32_t                        ingressStreamId,
                             NodeId                         selfId,
-                            int                            outboundRingBytes = 4 * 1024 * 1024);
+                            int                            outboundRingBytes = 4 * 1024 * 1024,
+                            rune::aeronutil::AeronPump     pump = {});
 
     ~AeronPartitionTransport() override = default;
 

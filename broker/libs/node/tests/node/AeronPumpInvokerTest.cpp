@@ -1,6 +1,10 @@
 // AeronPumpInvokerTest.cpp — with NO driver thread and NO client conductor thread,
 // every startup resolve completes by pumping its own driver + conductor (spec §3.6).
+#include <rune/consensus/AeronIngress.h>
+#include <rune/consensus/IngressRing.h>
+#include <rune/gateway/ClientGateway.h>
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/replication/AeronPartitionTransport.h>
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/WorkerIngress.h>
@@ -168,4 +172,31 @@ TEST(AeronPumpInvokerRegression, ErroredPeerIsDroppedOthersResolveRegistryNotRes
     EXPECT_FALSE(reg.hasPeer(3));
     EXPECT_FALSE(reg.allResolved()) << "one errored peer => not allResolved";
     EXPECT_LT(since(t0), kFailFastCap);
+}
+
+// ---------------------------------------------------------------------------
+// Task 11 (fused runtime): the runtime client's startup resolves — consensus
+// ingress, replication ingress, gateway client ingress — complete by pumping
+// the runtime's own invoker driver + conductor (no driver/conductor thread).
+// ---------------------------------------------------------------------------
+TEST(AeronPumpInvokerRegression, ConsensusIngressResolvesOnInvokerDriver) {
+    InvokerShard s;
+    rune::consensus::IngressRing ring(64 * 1024);
+    rune::consensus::AeronIngress ing(s.client, "aeron:ipc", 7201, ring, s.pump());
+    SUCCEED() << "constructor would throw 'subscription not resolved' without the pump";
+}
+
+TEST(AeronPumpInvokerRegression, PartitionTransportResolvesOnInvokerDriver) {
+    InvokerShard s;
+    rune::replication::AeronPartitionTransport t(s.client, "aeron:ipc", 7202, /*selfId=*/0,
+                                                 64 * 1024, s.pump());
+    SUCCEED() << "constructor would throw 'ingress subscription not resolved' without the pump";
+}
+
+TEST(AeronPumpInvokerRegression, ClientGatewayResolvesOnInvokerDriver) {
+    InvokerShard s;
+    rune::gateway::ClientGateway gw(s.client, "aeron:ipc", 7203, /*thisNodeId=*/0,
+                                    rune::gateway::ClientGateway::kDefaultSessionTimeoutNs, nullptr,
+                                    rune::gateway::ClientGateway::kDefaultConnectResolveTimeoutNs, s.pump());
+    SUCCEED() << "constructor would throw 'ingress subscription not resolved' without the pump";
 }

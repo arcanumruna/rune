@@ -38,21 +38,19 @@
 #include <algorithm>
 #include <deque>
 #include <chrono>
-#include <thread>
+
 
 namespace rune::gateway {
 
 namespace pc = rune::protocol::client;
 
 // ---------------------------------------------------------------------------
-// Redirect-path synchronous resolution timeout.
-// Used for:
-//   (a) The non-leader redirect path (resolvePublication / sendOnPub).
-//   (b) The ingress subscription resolve in the constructor.
-// NOT used for the normal leader-accept path (that is async via pendingConnects_).
+// Startup-only synchronous resolve budget: the ingress subscription in the
+// constructor.  Every duty-cycle resolve (Connect / redirect egress) is async
+// via pendingConnects_ — the blocking resolvePublication() was deleted (Task 11:
+// a duty-cycle sleep-poll would stall worker 0's loop under fused placement).
 // ---------------------------------------------------------------------------
-static constexpr int kResolveMaxMs   = 5000; // 5 s
-static constexpr int kResolveSliceMs = 1;
+static constexpr int kResolveMaxMs = 5000; // 5 s
 
 // ---------------------------------------------------------------------------
 // ClientGateway constructor
@@ -63,7 +61,8 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
                              int32_t                         thisNodeId,
                              int64_t                         sessionTimeoutNs,
                              std::function<LeaderView()>     leaderView,
-                             int64_t                         connectResolveTimeoutNs)
+                             int64_t                         connectResolveTimeoutNs,
+                             rune::aeronutil::AeronPump      pump)
     : aeron_(std::move(aeron))
     , clientChannel_(std::move(clientChannel))
     , clientStreamId_(clientStreamId)
@@ -90,14 +89,10 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     // Register the ingress subscription.
     int64_t regId = aeron_->addSubscription(clientChannel_, clientStreamId_);
 
-    // Bounded resolve — same pattern as AeronIngress.
-    using clock = std::chrono::steady_clock;
-    auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-    while (clock::now() < deadline) {
-        sub_ = aeron_->findSubscription(regId);
-        if (sub_) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
-    }
+    // Bounded resolve — same pattern as AeronIngress (spec §3.6: an invoker
+    // driver + conductor is pumped by this thread between probes).
+    sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); },
+                        std::chrono::milliseconds{kResolveMaxMs});
     if (!sub_) {
         throw std::runtime_error(
             "ClientGateway: ingress subscription not resolved within timeout");
@@ -656,9 +651,8 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 // BR-5 leader-awareness:
 //   - Query leaderView_ (if set).
 //   - If NOT leader AND leaderClientEndpoint non-empty → send ErrorResponse
-//     {code=Redirect, message=leaderClientEndpoint}.  The redirect path still
-//     uses the synchronous resolvePublication — it's a one-off transient pub
-//     to an already-running client endpoint, not on the hot consensus thread.
+//     {code=Redirect, message=leaderClientEndpoint} — over the same async
+//     pending-connect machinery (DR-BUG-2; no synchronous resolve exists).
 //   - If leader (or hook unset/leader-unknown) → ASYNC: register
 //     addExclusivePublication and enqueue a PendingConnect.  The publication
 //     is polled across doWork() cycles via pollPendingConnects().
@@ -1882,40 +1876,6 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                       "sessionId={} partition={} baseOffset={} lastOffset={}",
                       msg.sessionId, partition, outcome.baseOffset, outcome.lastOffset);
     }
-}
-
-// ---------------------------------------------------------------------------
-// resolvePublication — bounded wait for ExclusivePublication, mirrors
-// AeronMessageSink::resolvePublications().
-//
-// Exception-safe: if Aeron rejects the channel (malformed URI, unknown
-// transport, etc.) the conductor stores an error and findExclusivePublication
-// throws on the next poll.  We catch that and return nullptr so the caller can
-// treat it identically to a timeout (log-and-drop, no session created).
-// ---------------------------------------------------------------------------
-std::shared_ptr<aeron::ExclusivePublication>
-ClientGateway::resolvePublication(const std::string& channel, int32_t streamId)
-{
-    int64_t regId;
-    try {
-        regId = aeron_->addExclusivePublication(channel, streamId);
-    } catch (...) {
-        return nullptr; // channel rejected by the media driver
-    }
-
-    using clock = std::chrono::steady_clock;
-    auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-
-    while (clock::now() < deadline) {
-        try {
-            auto pub = aeron_->findExclusivePublication(regId);
-            if (pub) return pub;
-        } catch (...) {
-            return nullptr; // conductor signalled an error (bad channel, etc.)
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
-    }
-    return nullptr; // timed out
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@
 //
 // Thread-safety: poll() must be called from ONE thread only.
 
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/consensus/IngressRing.h>
 
 #include <Aeron.h>
@@ -23,7 +24,6 @@
 #include <memory>
 #include <stdexcept>
 #include <chrono>
-#include <thread>
 
 namespace rune::consensus {
 
@@ -36,10 +36,12 @@ public:
     // @param channel      Aeron channel URI, e.g. "aeron:ipc".
     // @param streamId     The stream this node listens on.
     // @param ingressRing  Ring to write decoded frames into.
+    // @param pump         Startup resolve pump (default: sleep-poll a threaded driver).
     AeronIngress(std::shared_ptr<aeron::Aeron> aeron,
                  const std::string&            channel,
                  int32_t                       streamId,
-                 IngressRing&                  ingressRing)
+                 IngressRing&                  ingressRing,
+                 rune::aeronutil::AeronPump    pump = {})
         : aeron_(std::move(aeron))
         , ingressRing_(ingressRing)
         , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
@@ -56,14 +58,9 @@ public:
     {
         int64_t regId = aeron_->addSubscription(channel, streamId);
 
-        // Wait up to 5 s for the subscription to be resolved.
-        using namespace std::chrono;
-        auto deadline = steady_clock::now() + seconds{5};
-        while (steady_clock::now() < deadline) {
-            sub_ = aeron_->findSubscription(regId);
-            if (sub_) break;
-            std::this_thread::sleep_for(milliseconds{1});
-        }
+        // Up to 5 s.  Spec §3.6: an invoker driver/conductor (fused runtime) is
+        // pumped by this thread between probes; the default pump sleeps 1 ms.
+        sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, std::chrono::seconds{5});
         if (!sub_) {
             throw std::runtime_error("AeronIngress: subscription not resolved within timeout");
         }

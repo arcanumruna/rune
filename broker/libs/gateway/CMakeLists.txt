@@ -21,7 +21,7 @@ target_include_directories(rune_gateway PUBLIC
 # (raw path) to avoid a circular target dependency (rune_node → PUBLIC rune_gateway → rune_node).
 # rune_replication is linked PUBLIC so ReplicaRegistry.h (which includes PartitionReplica.h)
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
-target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus)
+target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus rune_aeron_util)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
 # rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
 # includes rune/codec/Validator.h for the Task 7 per-worker schema validation

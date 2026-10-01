@@ -44,7 +44,8 @@ AeronPartitionTransport::AeronPartitionTransport(
         const std::string&             ingressChannel,
         int32_t                        ingressStreamId,
         NodeId                         selfId,
-        int                            outboundRingBytes)
+        int                            outboundRingBytes,
+        rune::aeronutil::AeronPump     pump)
     : aeron_(std::move(aeron))
     , assembler_([this](aeron::concurrent::AtomicBuffer& buf,
                         aeron::util::index_t             offset,
@@ -57,18 +58,11 @@ AeronPartitionTransport::AeronPartitionTransport(
 {
     // Register ingress subscription.  One bounded synchronous wait at
     // construction — never called on the duty-cycle hot path.
-    static constexpr int kResolveMaxMs  = 5000;
-    static constexpr int kResolveSliceMs = 1;
+    static constexpr int kResolveMaxMs = 5000;
 
     int64_t regId = aeron_->addSubscription(ingressChannel, ingressStreamId);
-
-    using clk = std::chrono::steady_clock;
-    auto deadline = clk::now() + std::chrono::milliseconds{kResolveMaxMs};
-    while (clk::now() < deadline) {
-        sub_ = aeron_->findSubscription(regId);
-        if (sub_) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
-    }
+    sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); },
+                        std::chrono::milliseconds{kResolveMaxMs});
     if (!sub_) {
         throw std::runtime_error(
             "AeronPartitionTransport: ingress subscription not resolved within 5 s");

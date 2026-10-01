@@ -948,13 +948,11 @@ TEST_F(GatewayLoopbackFixture, MultiplePings_AllPongsReceived) {
 //
 // Strategy: send a ConnectRequest whose egressChannel is "aeron:bogus" — a
 // syntactically parseable-but-invalid channel that Aeron's media driver will
-// reject.  resolvePublication() catches the resulting exception and returns
-// nullptr; handleConnect() sees nullptr and returns early (no session added).
+// reject.  The async pending-connect path sees the registration error and
+// drops the connect (no session added).
 //
-// Note on timing: Aeron rejects the channel at the driver level without
-// waiting the full kResolveMaxMs=5s timeout, so the test completes quickly.
-// In the unlikely event the rejection is delayed, this test is still bounded
-// by a single occurrence of the resolve path and by the outer pump() deadline.
+// Note on timing: Aeron rejects the channel at the driver level, so the test
+// completes quickly; it is bounded by the outer pump() deadline.
 // ===========================================================================
 TEST_F(GatewayLoopbackFixture, UnresolvableEgressChannel_NoSession_GatewayKeepsServing) {
     // We need a raw ingress publication to send the bad ConnectRequest.

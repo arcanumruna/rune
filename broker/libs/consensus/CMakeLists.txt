@@ -10,7 +10,7 @@ target_include_directories(rune_consensus PUBLIC
         ${RUNE_PROTOCOL_INCLUDE})
 # Aeron headers needed for IngressRing, IdleStrategy, AgentRunner
 if(aeron_FOUND)
-    target_link_libraries(rune_consensus PUBLIC aeron::aeron)
+    target_link_libraries(rune_consensus PUBLIC aeron::aeron rune_aeron_util)
 endif()
 
 if(BUILD_TESTING)
