@@ -1091,14 +1091,22 @@ private:
     // ProducerImpl owns its ring so SEND_RECORD messages are separate from the
     // ClientAgent command ring (agent command type IDs 1-4 are unrelated).
     static constexpr std::size_t kRingAlignment = 64; // cache-line aligned
-    std::unique_ptr<uint8_t, void(*)(void*)> ringBuf_;
+    // F8c C7 (perf): the fields EVERY app-thread send reads — the ring object
+    // (buffer pointer, capacity, index words), the ingress mode and the
+    // batch-ack queue pointer — sit on cache lines of their own, written only
+    // at setup.  Next to a field the duty thread writes per record
+    // (recordsSent_, lastNowNs_) each send paid a cross-core miss (false
+    // sharing that depended on member layout).
+    alignas(64) std::unique_ptr<uint8_t, void(*)(void*)> ringBuf_;
     rune::client::detail::M2ORingBuffer      ring_;
+    IngressMode  mode_       = IngressMode::Ring;  // set once before any send (Task 14)
+    Completions* batchAckCq_ = nullptr;            // app side: reserve one unit per send (C6)
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 
     // Flat partition table (spec §1a.5): FlatIndexMap key -> dense slot, slots own
     // their PartitionState (stable address; slotIndex == position).
-    detail::FlatIndexMap                          partitionIndex_;
+    alignas(64) detail::FlatIndexMap              partitionIndex_;
     std::vector<std::unique_ptr<PartitionState>>  partitions_;
     // F12: slots of the partitions with flush work (PartitionState::dirty), in
     // the order they became dirty.  capacity() >= partitions_.size() always
@@ -1142,7 +1150,6 @@ private:
     BatchAckFn   batchAckFn_    = nullptr;
     void*        batchAckCtx_   = nullptr;
     CqRef        batchAckCqRef_ = kNoCqRef;   // duty side: the BatchAck queue's registry ref
-    Completions* batchAckCq_    = nullptr;    // app side: reserve one unit per send
     // fix2 minor: plain counter (see testCallbackExceptionCount()).
     uint64_t     callbackExceptions_ = 0;
 
@@ -1188,7 +1195,6 @@ private:
     std::thread::id dutyThreadId_{};
 
     // ---- Task 14: ingress mode (set once before any send; owner thread only) --
-    IngressMode mode_      = IngressMode::Ring;
     bool        directClosed_ = false;  // Direct only: see markRingClosed()
     // Duty-cycle clock of the last drainRing()/flushBatches() (Direct appends
     // stamp batchStartNs with it — the clock is sampled per pass, never per send).
