@@ -77,7 +77,9 @@ static void ensureBuf(GroupConsumerImpl& impl, std::size_t needed) {
 // ---------------------------------------------------------------------------
 
 void GroupConsumerHub::add(std::shared_ptr<GroupConsumerImpl> impl) {
-    if (impl) impls_.push_back(std::move(impl));
+    // fix3 I3: closed (directly, on this thread) before its adoption: honour
+    // it — never added, never joins.
+    if (impl && impl->active) impls_.push_back(std::move(impl));
 }
 
 GroupConsumerImpl* GroupConsumerHub::find_(uint64_t handle) const noexcept {
@@ -153,6 +155,20 @@ GroupConsumerHub::DispatchScope::~DispatchScope() {
 }
 
 void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd) {
+    // Ring path: commands are FIFO behind their GroupAdd — resolve the
+    // identity against the hub's own list (never dereference an unknown one).
+    applyTo_(cmd, cmd.op == detail::HubCommand::Op::GroupAdd ? nullptr : find_(cmd.handle));
+}
+
+void GroupConsumerHub::applyCommandDirect(const detail::HubCommand& cmd) {
+    // fix3 I3: direct path (duty thread, the caller's handle keeps the impl
+    // alive): act on the IMPL itself, even if its GroupAdd is still queued in
+    // the ring — add() honours what was done (closed => never added).
+    applyTo_(cmd, cmd.op == detail::HubCommand::Op::GroupAdd
+                      ? nullptr : reinterpret_cast<GroupConsumerImpl*>(cmd.handle));
+}
+
+void GroupConsumerHub::applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl) {
     using Op = detail::HubCommand::Op;
     switch (cmd.op) {
     case Op::GroupAdd: {
@@ -164,14 +180,12 @@ void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd) {
         break;
     }
     case Op::GroupCommit: {
-        GroupConsumerImpl* impl = find_(cmd.handle);
         if (impl && impl->active) impl->commitRequested = true;
         break;
     }
     case Op::GroupCommitSync: {
         std::unique_ptr<std::promise<void>> prom(
             reinterpret_cast<std::promise<void>*>(static_cast<uintptr_t>(cmd.a)));
-        GroupConsumerImpl* impl = find_(cmd.handle);
         if (!impl || !impl->active) {
             if (prom) {
                 try {
@@ -185,15 +199,21 @@ void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd) {
         failCommitSync_(*impl, "commitSync() superseded by a newer call");
         impl->commitSyncPromise = std::move(prom);
         impl->commitRequested   = true;  // send the commit promptly
+        // fix3 I2 (level-triggered): applied while the session is down — it can
+        // never be acknowledged; fail it now.
+        if (!sessionConnected_) {
+            failCommitSync_(*impl, "commitSync() aborted: the session to the broker is down");
+        }
         break;
     }
     case Op::GroupClose: {
-        GroupConsumerImpl* impl = find_(cmd.handle);
-        if (impl && impl->active) finish_(*impl, "GroupConsumer closed");
+        if (impl && impl->active) {
+            finish_(*impl, "GroupConsumer closed");
+            sendLeave_(*impl);  // fix3 M4: direct, retried per cycle
+        }
         break;
     }
     case Op::GroupSetCallback: {
-        GroupConsumerImpl* impl = find_(cmd.handle);
         const auto raw = static_cast<uintptr_t>(cmd.b);
         if (cmd.a == 2) {
             std::unique_ptr<GroupConsumer::RecordsCallback> fn(
@@ -209,6 +229,48 @@ void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd) {
     default:
         break;  // not a group op
     }
+}
+
+std::size_t GroupConsumerHub::encodeLeave_(GroupConsumerImpl& impl, int64_t sessionId) {
+    rpc::LeaveGroup msg;
+    msg.sessionId     = sessionId;
+    msg.correlationId = 0;
+    msg.groupId       = strSpan(impl.groupId);
+    msg.memberId      = strSpan(impl.memberId);
+    ensureBuf(impl, msg.encodedSize());
+    return msg.encode(impl.sendBuf.data());
+}
+
+void GroupConsumerHub::sendLeave_(GroupConsumerImpl& impl) {
+    // A member that never joined has nothing to leave; while the session is
+    // down the broker expires the member with the session.
+    if (impl.memberId.empty() || !sessionConnected_ || directSend_ == nullptr) return;
+    impl.leaveSessionId = currentSessionId_;
+    const std::size_t len = encodeLeave_(impl, impl.leaveSessionId);
+    if (len == 0) return;
+    if (!directSend_(directSendCtx_, impl.sendBuf.data(), len) && !impl.leavePending) {
+        impl.leavePending = true;
+        ++pendingLeaves_;
+    }
+}
+
+int GroupConsumerHub::retryPendingLeaves(int64_t currentSessionId) {
+    int sent = 0;
+    for (auto& impl : impls_) {
+        if (!impl->leavePending) continue;
+        bool done = true;
+        if (impl->leaveSessionId != currentSessionId) {
+            // The session is gone: the broker expires the member with it.
+        } else if (!sessionConnected_ || directSend_ == nullptr) {
+            done = false;
+        } else {
+            const std::size_t len = encodeLeave_(*impl, impl->leaveSessionId);
+            done = len == 0 || directSend_(directSendCtx_, impl->sendBuf.data(), len);
+            if (done) ++sent;
+        }
+        if (done) { impl->leavePending = false; --pendingLeaves_; }
+    }
+    return sent;
 }
 
 // ---------------------------------------------------------------------------
@@ -593,9 +655,9 @@ int GroupConsumerHub::doWork(int64_t nowNs,
 
 int GroupConsumerHub::drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn)
 {
-    // Kept pending until Stable (a commitSync waits for it; a rejoin or session
-    // loss fails it) and until the transport accepts the OffsetCommit.
-    if (!impl.commitRequested || impl.state != GroupConsumerState::Stable) return 0;
+    // Kept pending until Stable and Connected (a commitSync waits for it; a
+    // rejoin or session loss fails it) and until the transport accepts it.
+    if (!impl.commitRequested || impl.state != GroupConsumerState::Stable || !sessionConnected_) return 0;
     impl.commitRequested = false;
     const bool forSync = impl.commitSyncPromise && impl.commitSyncCorrId == 0;
     const int64_t corr = forSync ? nextCommitCorrId_++ : 0;
@@ -623,6 +685,14 @@ int GroupConsumerHub::flushRequestedCommits(int64_t sessionId)
         if (impl->active && impl->commitRequested) work += drainCommit_(*impl, sessionId, SendFn{});
     }
     return work;
+}
+
+bool GroupConsumerHub::hasPendingCommitSync() const noexcept
+{
+    for (const auto& impl : impls_) {
+        if (impl->commitSyncPromise) return true;
+    }
+    return false;
 }
 
 void GroupConsumerHub::onSessionDown()

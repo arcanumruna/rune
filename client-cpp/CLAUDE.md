@@ -96,12 +96,17 @@ resume = unsubscribe(), wait for finished(), then read position(). The handle is
 owned by one thread at a time (calls from inside its callbacks are allowed) and
 may outlive its Client.
 
-Command-ring drain rule (F8a fix2): a `kMsgSend` control frame is offered only
-while the seed session is Connected AND the frame carries its sessionId; a
-transport refusal leaves it at the ring head (ABORT, retried next cycle — never
-dropped); a frame of a session that no longer exists is dropped, logged and
-counted. Unsubscribe and OffsetCommit frames bypass the ring (duty-thread direct
-send on the default ingress publication, retried every duty cycle).
+Command-ring drain rule (F8a fix2/fix3): a `kMsgSend` control frame is offered
+only while the seed session is Connected AND the frame carries its sessionId.
+The transport's verdict is 3-way: Accepted; Retry (back-pressure / not connected
+/ admin action) leaves it at the ring head (ABORT, re-offered next cycle — held
+for exactly as long as the transport stays transiently unavailable; there is NO
+fixed time bound); Fatal (publication closed / max position / Aeron threw) is
+dropped, logged and counted. Frames over the transport's max message length are
+rejected synchronously by `submitSend()`. A frame of a session that no longer
+exists is dropped, counted, logged rate-limited. Subscribe (adoption + reconnect
+resend), Unsubscribe, OffsetCommit and LeaveGroup bypass the ring (duty-thread
+direct send on the default ingress publication, retried every duty cycle).
 
 ### 2.3 Group consumer (`group/`)
 `GroupConsumer` runs the full join/sync/stable/rejoin state machine, heartbeat,

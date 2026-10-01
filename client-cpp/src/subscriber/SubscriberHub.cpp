@@ -11,6 +11,7 @@
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -156,6 +157,9 @@ void SubscriberHub::adoptSubscribe(std::unique_ptr<SubscribeRequest> req,
                                    const SendFn&                     submitFn)
 {
     if (!req || !req->impl) return;
+    // fix3 I3: unsubscribed (directly, on this thread) before its adoption —
+    // honour it: never register, never send the Subscribe.
+    if (!req->impl->active) return;
     SubscribeRequest& r = *req;
     const int64_t corrId = r.impl->correlationId;
 
@@ -164,15 +168,58 @@ void SubscriberHub::adoptSubscribe(std::unique_ptr<SubscribeRequest> req,
     auto [it, inserted] = pendingByCorrelation_.emplace(corrId, std::move(req));
     if (!inserted) return;  // duplicate correlationId: impossible (unique counter)
 
-    // Stream id 0 = default ingress stream.  A failed submit (ring full) leaves
-    // the entry pending; the timeout sweep / close path finishes it.
-    const auto& frame = it->second->subscribeFrame;
-    if (!frame.empty() && submitFn) {
-        (void)submitFn(0, frame.data(), frame.size());
+    SubscribeRequest& pr = *it->second;
+    if (directSend_ == nullptr) {
+        // Hub-level tests without a transport: the given SendFn.
+        if (!pr.subscribeFrame.empty() && submitFn) (void)submitFn(0, pr.subscribeFrame.data(), pr.subscribeFrame.size());
+        return;
     }
+    // fix3 I4: straight to the transport (never the command ring).  While the
+    // session is down the next ConnectResponse re-sends every pending one
+    // (resendPending); a refused offer is retried every duty cycle.
+    if (!sessionConnected_) return;
+    if (!sendSubscribeFrame_(pr)) markUnsent_(pr);
 }
 
-void SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
+bool SubscriberHub::sendSubscribeFrame_(const SubscribeRequest& req)
+{
+    if (req.subscribeFrame.empty()) return true;
+    assert(directSend_ != nullptr && "SubscriberHub: direct send not wired");
+    if (directSend_ == nullptr) return false;  // never claim "sent"
+    return directSend_(directSendCtx_, req.subscribeFrame.data(), req.subscribeFrame.size());
+}
+
+void SubscriberHub::markUnsent_(SubscribeRequest& req) noexcept
+{
+    if (req.unsent) return;
+    req.unsent = true;
+    ++unsentSubscribes_;
+}
+
+void SubscriberHub::clearUnsent_(SubscribeRequest& req) noexcept
+{
+    if (!req.unsent) return;
+    req.unsent = false;
+    --unsentSubscribes_;
+}
+
+int SubscriberHub::retryUnsentSubscribes()
+{
+    if (!sessionConnected_) return 0;  // the next connect re-sends every pending one
+    int sent = 0;
+    for (auto& [corrId, req] : pendingByCorrelation_) {
+        if (unsentSubscribes_ == 0) break;
+        if (!req->unsent) continue;
+        if (!req->impl || !req->impl->active) { clearUnsent_(*req); continue; }
+        if (sendSubscribeFrame_(*req)) {
+            clearUnsent_(*req);
+            ++sent;
+        }
+    }
+    return sent;
+}
+
+bool SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
                                 int64_t       unsubCorrId,
                                 int64_t       sessionId,
                                 const SendFn& submitFn)
@@ -186,13 +233,13 @@ void SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
             pit->second->impl->unsubCorrId = unsubCorrId;  // used by the late Unsubscribe
             finish_(*pit->second->impl);
         }
-        return;
+        return true;
     }
 
     // Bound: find it by its correlationId (cold path; a handful of entries).
     for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
         if (it->second->correlationId != subscribeCorrId) continue;
-        if (!it->second->active) return;  // already unsubscribed (erase deferred / pending)
+        if (!it->second->active) return true;  // already unsubscribed (erase deferred / pending)
         SubscriptionImpl& impl = *it->second;
         const bool running = &impl == dispatching_;
         finish_(impl);
@@ -207,9 +254,20 @@ void SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
         // entry after the handler returns — erasing now could free the
         // std::function mid-call.
         if (sent && !running) activeById_.erase(it);
-        return;
+        return true;
     }
-    // Unknown: already finished (timed out / failed / A2) — nothing to do.
+    // Unknown: not adopted yet, or already finished (timed out / failed / A2).
+    return false;
+}
+
+void SubscriberHub::unsubscribeDirect(SubscriptionImpl& impl, int64_t unsubCorrId,
+                                      int64_t sessionId, const SendFn& submitFn)
+{
+    // fix3 I3: act on the impl itself.  Not (yet) in the hub: its SubscribeAdd
+    // is still queued in the ring — finish it now; adoptSubscribe() honours it.
+    if (!unsubscribe(impl.correlationId, unsubCorrId, sessionId, submitFn) && impl.active) {
+        finish_(impl);
+    }
 }
 
 bool SubscriberHub::trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn)
@@ -220,6 +278,17 @@ bool SubscriberHub::trySendUnsubscribe_(const SubscriptionImpl& impl, const Send
     if (frameLen == 0) return true;  // cannot encode: nothing to retry
     if (directSend_ != nullptr) return directSend_(directSendCtx_, frameBuf, frameLen);
     return submitFn ? submitFn(0, frameBuf, frameLen) : true;
+}
+
+bool SubscriberHub::retrySendUnsubscribe_(const SubscriptionImpl& impl)
+{
+    assert(directSend_ != nullptr && "SubscriberHub: direct send not wired");
+    if (directSend_ == nullptr) return false;  // never claim "sent"
+    uint8_t frameBuf[64]{};
+    const std::size_t frameLen = codec::encodeUnsubscribe(
+        frameBuf, sizeof(frameBuf), impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId);
+    if (frameLen == 0) return true;
+    return directSend_(directSendCtx_, frameBuf, frameLen);
 }
 
 void SubscriberHub::markUnsubPending_(SubscriptionImpl& impl) noexcept
@@ -243,7 +312,7 @@ int SubscriberHub::retryPendingUnsubscribes(int64_t currentSessionId)
                 "no longer exists\n",
                 static_cast<long long>(impl.subscriptionId),
                 static_cast<long long>(impl.unsubSessionId));
-        } else if (!trySendUnsubscribe_(impl, SendFn{})) {
+        } else if (!retrySendUnsubscribe_(impl)) {
             ++it;
             continue;
         } else {
@@ -266,10 +335,18 @@ void SubscriberHub::onSubscribeResponse(
         int64_t                             sessionId,
         const SendFn&                       submitFn)
 {
+    // fix3: a response of a session that is no longer current must not bind
+    // (its subscription died with that session; binding would leak it).  The
+    // pending entry stays and is re-sent on the current session.
+    if (rsp.sessionId != sessionId) {
+        ++staleResponsesIgnored_;
+        return;
+    }
     auto it = pendingByCorrelation_.find(rsp.correlationId);
     if (it == pendingByCorrelation_.end()) {
         return; // unknown correlationId — race with close/timeout; safe
     }
+    clearUnsent_(*it->second);
     std::shared_ptr<SubscriptionImpl> impl = std::move(it->second->impl);
     pendingByCorrelation_.erase(it);
     if (!impl) return;
@@ -385,7 +462,8 @@ void SubscriberHub::deactivateAll()
     }
     pendingByCorrelation_.clear();
     activeById_.clear();
-    pendingUnsubCount_ = 0;  // their sessions end with the Client
+    pendingUnsubCount_ = 0;
+    unsentSubscribes_  = 0;  // their sessions end with the Client
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +492,11 @@ int SubscriberHub::resendPending(
         for (int i = 0; i < 8; ++i)
             frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
 
-        if (submitFn && submitFn(0, frame.data(), frame.size())) {
+        if (directSend_ != nullptr) {
+            // fix3 I4: direct, with per-cycle retry on refusal.
+            if (sendSubscribeFrame_(*req)) { clearUnsent_(*req); ++resent; }
+            else markUnsent_(*req);
+        } else if (submitFn && submitFn(0, frame.data(), frame.size())) {
             ++resent;
         }
     }
@@ -439,6 +521,7 @@ void SubscriberHub::failPendingSubscribes(const std::string& reason)
         if (req && req->impl) finish_(*req->impl);
     }
     pendingByCorrelation_.clear();
+    unsentSubscribes_ = 0;
     (void)reason;
 }
 
@@ -453,6 +536,7 @@ void SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& n
     {
         if (now >= it->second->deadline) {
             if (it->second->impl) finish_(*it->second->impl);
+            clearUnsent_(*it->second);
             it = pendingByCorrelation_.erase(it);
         } else {
             ++it;

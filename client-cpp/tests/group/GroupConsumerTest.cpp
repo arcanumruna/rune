@@ -1635,3 +1635,47 @@ TEST_F(GroupConsumerHubTest, CommitSyncFailsOnSessionDownRegression) {
     ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
     EXPECT_THROW(fut.get(), std::runtime_error);
 }
+
+// fix3 I2: commitSync applied while the session is down fails at once.
+TEST_F(GroupConsumerHubTest, CommitSyncAppliedWhileSessionDownFailsAtOnceRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    hub_->setSessionConnected(false);
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+    auto fut = gc.commitSync();
+    ASSERT_EQ(fut.wait_for(0ms), std::future_status::ready);
+    EXPECT_THROW(fut.get(), std::runtime_error);
+    impl_->commitRequested = true;
+    EXPECT_EQ(hub_->flushRequestedCommits(kSessionId), 0) << "no commit offered while down";
+}
+
+// fix3 M4: GroupConsumer close sends LeaveGroup directly, retried when refused,
+// dropped when the session changes.
+TEST_F(GroupConsumerHubTest, LeaveGroupOnCloseRetriedWhenRefusedRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    hub_->setSessionConnected(true, kSessionId);
+    RefusingGroupTransport tx;
+    hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
+    tx.refuseNext = 1;
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+    gc.close();
+    EXPECT_EQ(hub_->pendingLeaves(), 1u);
+    EXPECT_EQ(hub_->retryPendingLeaves(kSessionId), 1);
+    ASSERT_EQ(tx.accepted.size(), 1u);
+    EXPECT_EQ(static_cast<uint16_t>(tx.accepted[0][2] | (tx.accepted[0][3] << 8)),
+              static_cast<uint16_t>(rpc::TemplateId::LeaveGroup));
+    EXPECT_EQ(hub_->pendingLeaves(), 0u);
+}
+
+TEST_F(GroupConsumerHubTest, PendingLeaveGroupDroppedOnSessionChangeRegression) {
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    hub_->setSessionConnected(true, kSessionId);
+    RefusingGroupTransport tx;
+    hub_->setDirectSend(&RefusingGroupTransport::fn, &tx);
+    tx.refuseNext = 1;
+    GroupConsumer gc(impl_, &directSink, hub_.get());
+    gc.close();
+    ASSERT_EQ(hub_->pendingLeaves(), 1u);
+    EXPECT_EQ(hub_->retryPendingLeaves(kSessionId + 1), 0);
+    EXPECT_EQ(hub_->pendingLeaves(), 0u);
+    EXPECT_TRUE(tx.accepted.empty());
+}

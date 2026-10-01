@@ -42,6 +42,7 @@ struct SubscribeRequest {
     std::shared_ptr<SubscriptionImpl>     impl;
     std::vector<uint8_t>                  subscribeFrame;  // encoded Subscribe (resend on redirect)
     std::chrono::steady_clock::time_point deadline;        // M2: subscribe-request timeout
+    bool                                  unsent = false;  // fix3 I4: refused, retried per cycle
 };
 
 class SubscriberHub {
@@ -105,8 +106,16 @@ public:
     /// (unsubCorrId), close its status ring.  Still pending: mark it inactive
     /// and close its status ring; the late SubscribeResponse then triggers the
     /// CB-5 A2 Unsubscribe with the real id.  Unknown: no-op.
-    void unsubscribe(int64_t subscribeCorrId, int64_t unsubCorrId,
+    /// Returns false if no such subscription is in the hub (not adopted yet,
+    /// or already finished).
+    bool unsubscribe(int64_t subscribeCorrId, int64_t unsubCorrId,
                      int64_t sessionId, const SendFn& submitFn);
+
+    /// fix3 I3: unsubscribe applied DIRECTLY on the duty thread for a handle
+    /// whose impl the caller holds: acts on the impl even if its SubscribeAdd
+    /// is still queued in the ring (adoption then drops it).
+    void unsubscribeDirect(SubscriptionImpl& impl, int64_t unsubCorrId,
+                           int64_t sessionId, const SendFn& submitFn);
 
     // -------------------------------------------------------------------------
     // Agent-thread callbacks (called from ClientAgent's egress observer)
@@ -191,6 +200,16 @@ public:
     int retryPendingUnsubscribes(int64_t currentSessionId);
     [[nodiscard]] uint64_t unsubscribesDropped() const noexcept { return unsubscribesDropped_; }
 
+    /// fix3 I4: adoption-time / reconnect Subscribe frames the transport
+    /// refused, retried every duty cycle while Connected (gated: one branch
+    /// when zero).  On a session change they are re-stamped by resendPending.
+    [[nodiscard]] std::size_t unsentSubscribes() const noexcept { return unsentSubscribes_; }
+    int retryUnsentSubscribes();
+
+    /// fix3: session state (duty thread; default connected for hub-level tests).
+    void setSessionConnected(bool connected) noexcept { sessionConnected_ = connected; }
+    [[nodiscard]] uint64_t staleResponsesIgnored() const noexcept { return staleResponsesIgnored_; }
+
     /// CB-5 B: true if there is at least one pending (unbound) subscription.
     [[nodiscard]] bool hasPending() const;
 
@@ -253,6 +272,14 @@ private:
     std::size_t  pendingUnsubCount_  = 0;
     uint64_t     unsubscribesDropped_ = 0;
     bool trySendUnsubscribe_(const SubscriptionImpl& impl, const SendFn& submitFn);
+    bool retrySendUnsubscribe_(const SubscriptionImpl& impl);
+    // fix3 I4.
+    bool        sessionConnected_      = true;
+    std::size_t unsentSubscribes_      = 0;
+    uint64_t    staleResponsesIgnored_ = 0;
+    bool sendSubscribeFrame_(const SubscribeRequest& req);
+    void markUnsent_(SubscribeRequest& req) noexcept;
+    void clearUnsent_(SubscribeRequest& req) noexcept;
     void markUnsubPending_(SubscriptionImpl& impl) noexcept;
     /// Mark impl finished: inactive, final snapshot, status ring closed
     /// (deferred to the end of its dispatch if its handler is running).

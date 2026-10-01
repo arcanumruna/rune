@@ -150,22 +150,32 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // one place that must terminate regardless — close(), after the runner is
     // joined — has its own bounded unblock (drainRegistrationsForClose).
     //
-    // F8a fix2 (root cause): a wire frame accepted into the ring is NEVER
+    // F8a fix2/fix3 (root cause): a wire frame accepted into the ring is NEVER
     // silently dropped by the drain.  Rule for kMsgSend (every app/hub control
-    // frame on the default ingress publication: Subscribe, Ping, DefineTopic,
+    // frame on the default ingress publication: Ping, DefineTopic,
     // GetTopicSchema, MetadataRequest, JoinGroup/SyncGroup/Heartbeat/
-    // OffsetCommit/OffsetFetch/LeaveGroup, group Subscribe, txn control frames):
-    //   * seed session Connected AND the frame carries its sessionId -> offer;
-    //     if the transport refuses (back-pressure / admin action / publication
-    //     not connected) the record is LEFT at the head of the ring (ABORT) and
-    //     retried on the next duty cycle, in order.  Nothing behind it is read
-    //     this cycle.
+    // OffsetFetch, group Subscribe, txn control frames, redirect/connect
+    // resends of pending Subscribes):
+    //   * seed session Connected AND the frame carries its sessionId -> offer:
+    //       Accepted -> consumed;
+    //       Retry (back-pressured / publication not connected / admin action /
+    //         not resolved yet — transient) -> the record is LEFT at the head
+    //         of the ring (ABORT) and offered again next duty cycle, in order;
+    //         nothing behind it is read this cycle.  It is held exactly as
+    //         long as the transport stays transiently unavailable — there is
+    //         no time bound of its own;
+    //       Fatal (publication closed / max position exceeded / Aeron threw,
+    //         e.g. a frame over the publication max message length — permanent)
+    //         -> dropped, logged, counted (ingressFatalDropped()).  Oversize
+    //         frames are rejected synchronously by submitSend() already.
     //   * otherwise (session not Connected, or the frame carries an OLD
     //     sessionId): the frame belongs to a session that no longer exists —
-    //     dropped deliberately, logged and counted (staleFramesDropped()),
-    //     never resent from here.  Owners re-issue what must survive a session
-    //     change with the new sessionId (pending Subscribes on every connect,
-    //     JoinGroup on connect/rejoin, redirect resends).
+    //     dropped deliberately, counted (staleFramesDropped()), logged
+    //     rate-limited (first + every 1024th), never resent from here.  Owners
+    //     re-issue what must survive a session change with the new sessionId
+    //     (pending Subscribes on every connect, JoinGroup on connect/rejoin).
+    // Unsubscribe / adoption-time Subscribe / OffsetCommit / LeaveGroup do
+    // not use the ring at all (duty-thread direct send with per-cycle retry).
     // Every other command type is consumed (CONTINUE).
     int ringWork = ring_.controlledRead(
         [this, nowNs](
@@ -206,18 +216,31 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                         ? ::rune::protocol::client::detail::getLE64(p, 8) : 0;
                     if (m.state() != session::SessionState::Connected ||
                         frameSid != m.sessionId()) {
-                        ++staleFramesDropped_;
-                        std::fprintf(stderr,
-                            "rune-client: dropped a control frame of a session that no longer "
-                            "exists (frame sessionId %lld, current %lld, connected=%d)\n",
-                            static_cast<long long>(frameSid),
-                            static_cast<long long>(m.sessionId()),
-                            m.state() == session::SessionState::Connected ? 1 : 0);
+                        if ((staleFramesDropped_++ & 1023u) == 0) {
+                            std::fprintf(stderr,
+                                "rune-client: dropped control frame(s) of a session that no "
+                                "longer exists (frame sessionId %lld, current %lld, "
+                                "connected=%d; %llu dropped so far)\n",
+                                static_cast<long long>(frameSid),
+                                static_cast<long long>(m.sessionId()),
+                                m.state() == session::SessionState::Connected ? 1 : 0,
+                                static_cast<unsigned long long>(staleFramesDropped_));
+                        }
                         break;
                     }
-                    if (!transport_.offer(p, n)) {
+                    switch (offerIngress_(p, n)) {
+                    case transport::AeronTransport::OfferResult::Accepted:
+                        break;
+                    case transport::AeronTransport::OfferResult::Retry:
                         ++ingressOfferRefused_;
                         return CA::ABORT;  // stays at the head; retried next cycle
+                    case transport::AeronTransport::OfferResult::Fatal:
+                        ++ingressFatalDropped_;
+                        std::fprintf(stderr,
+                            "rune-client: dropped a control frame the transport can never "
+                            "accept (len %zu; %llu dropped so far)\n",
+                            n, static_cast<unsigned long long>(ingressFatalDropped_));
+                        break;
                     }
                 }
                 break;
@@ -385,7 +408,20 @@ bool ClientAgent::submitClose() noexcept {
 }
 
 bool ClientAgent::submitSend(const uint8_t* frame, std::size_t len) noexcept {
+    // F8a fix3 I1(a): a frame no ingress publication can ever carry is
+    // rejected HERE, synchronously — it must never reach the ring (where it
+    // would be a permanent offer failure).
+    if (len > transport_.maxMessageLength()) return false;
     return writeCommand(kMsgSend, frame, len);
+}
+
+transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t* buf,
+                                                                 std::size_t len) noexcept {
+    if (testForcedOffers_ > 0) [[unlikely]] {
+        --testForcedOffers_;
+        return testForcedOffer_;
+    }
+    return transport_.offerResult(buf, len);
 }
 
 bool ClientAgent::submitRegisterProducer(void* holder) noexcept {

@@ -142,6 +142,8 @@ Client::Client(ClientConfig cfg)
     // F8a: subscriber / group-consumer commands from app threads, applied on the
     // duty thread (or by close()'s final drain) by the hub that owns the state.
     agent_.setHubCommandFn([this](const detail::HubCommand& cmd) { applyHubCommand_(cmd); });
+    groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
+    subscriberHub_.setSessionConnected(false);
     // F8a fix2: Unsubscribe / OffsetCommit frames go straight to the transport
     // from the duty thread (retried every duty cycle on refusal), never via the
     // command ring.
@@ -491,8 +493,7 @@ std::future<Bytes> Client::ping(Bytes payload) {
         if (it != pendingPings_.end()) {
             try {
                 it->second.promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("ping(): ring full, could not submit")));
+                    submitError_("ping()", frameLen));
             } catch (...) {}
             pendingPings_.erase(it);
         }
@@ -569,8 +570,7 @@ std::future<DefineTopicResult> Client::defineTopic(std::string              name
         if (it != pendingDefine_.end()) {
             try {
                 it->second.promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("defineTopic(): ring full, could not submit")));
+                    submitError_("defineTopic()", frameLen));
             } catch (...) {}
             pendingDefine_.erase(it);
         }
@@ -635,8 +635,7 @@ std::future<TopicSchemaResult> Client::getTopicSchema(std::string name)
         if (it != pendingGet_.end()) {
             try {
                 it->second.promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("getTopicSchema(): ring full, could not submit")));
+                    submitError_("getTopicSchema()", frameLen));
             } catch (...) {}
             pendingGet_.erase(it);
         }
@@ -697,21 +696,34 @@ int Client::dutyCycle(int64_t nowNs) {
     //     cycle while any exist (one branch when none; a group consumer's
     //     commit flags are checked while one is registered — at most one).
     if (((subscriberHub_.dirtyCount() | groupConsumerHub_.dirtyCount() |
-          subscriberHub_.pendingUnsubscribes()) != 0) || !groupConsumerHub_.empty()) [[unlikely]] {
+          subscriberHub_.pendingUnsubscribes() | subscriberHub_.unsentSubscribes()) != 0) ||
+        !groupConsumerHub_.empty()) [[unlikely]] {
         const int64_t sid = agent_.seedSession().machine.sessionId();
         if (subscriberHub_.dirtyCount() != 0)          work += subscriberHub_.republishDirty();
         if (groupConsumerHub_.dirtyCount() != 0)       work += groupConsumerHub_.republishDirty();
         if (subscriberHub_.pendingUnsubscribes() != 0) work += subscriberHub_.retryPendingUnsubscribes(sid);
-        if (!groupConsumerHub_.empty())                work += groupConsumerHub_.flushRequestedCommits(sid);
+        if (subscriberHub_.unsentSubscribes() != 0)    work += subscriberHub_.retryUnsentSubscribes();
+        if (!groupConsumerHub_.empty()) {
+            work += groupConsumerHub_.flushRequestedCommits(sid);
+            if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(sid);
+        }
     }
 
-    // 3c. F8a fix2 (IM-2): the session-DOWN transition fails pending commitSyncs
-    //     at once (progress-driven: the session machine's own liveness verdict).
+    // 3c. F8a fix2/fix3 (IM-2, I2): session state is LEVEL-triggered for
+    //     commitSync — it fails on the Connected -> not-Connected transition,
+    //     and on every cycle the session is not Connected while one is pending
+    //     (a commitSync applied while down fails at once inside the hub).
     {
         const session::SessionState st = agent_.seedSession().machine.state();
         if (st != lastSeedState_) [[unlikely]] {
-            if (lastSeedState_ == session::SessionState::Connected) groupConsumerHub_.onSessionDown();
+            const bool connected = st == session::SessionState::Connected;
+            groupConsumerHub_.setSessionConnected(connected, agent_.seedSession().machine.sessionId());
+            subscriberHub_.setSessionConnected(connected);
             lastSeedState_ = st;
+        }
+        if (st != session::SessionState::Connected && !groupConsumerHub_.empty() &&
+            groupConsumerHub_.hasPendingCommitSync()) [[unlikely]] {
+            groupConsumerHub_.onSessionDown();
         }
     }
 
@@ -1865,6 +1877,38 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
 // F8a: hubCommandTrampoline_ — the HubCommandSink bound to every handle
 // ---------------------------------------------------------------------------
 
+std::exception_ptr Client::submitError_(const char* what, std::size_t frameLen) const {
+    if (frameLen > agent_.maxFrameLength()) {
+        return std::make_exception_ptr(std::length_error(
+            std::string(what) + ": frame of " + std::to_string(frameLen) +
+            " bytes exceeds the transport max message length of " +
+            std::to_string(agent_.maxFrameLength())));
+    }
+    return std::make_exception_ptr(std::runtime_error(std::string(what) + ": ring full, could not submit"));
+}
+
+void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
+    // fix3 I3: the caller's handle holds the impl (cmd.handle) for the whole
+    // call, so the hubs may act on the impl itself — even when its Add is still
+    // queued in the ring (created on another thread) — and adoption honours it.
+    using Op = detail::HubCommand::Op;
+    if (cmd.op == Op::Unsubscribe && cmd.handle != 0) {
+        const auto snap = agent_.stateAndSessionId();
+        subscriberHub_.unsubscribeDirect(
+            *reinterpret_cast<SubscriptionImpl*>(cmd.handle),
+            nextCorrId_.fetch_add(1, std::memory_order_relaxed), snap.sessionId,
+            [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                return agent_.submitSend(fb, fl);
+            });
+        return;
+    }
+    if (cmd.op == Op::GroupClose || cmd.op == Op::GroupCommit || cmd.op == Op::GroupCommitSync) {
+        groupConsumerHub_.applyCommandDirect(cmd);
+        return;
+    }
+    applyHubCommand_(cmd);
+}
+
 bool Client::directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
     return static_cast<Client*>(ctx)->agent_.offerDefault(buf, len);
 }
@@ -1909,7 +1953,7 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
                    cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
                    cmd.op == Op::GroupCommit || cmd.op == Op::GroupCommitSync)) {
-        self->applyHubCommand_(cmd);
+        self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
     }
 

@@ -68,6 +68,16 @@ public:
     /// ignored (a commitSync promise it carries is failed, never dropped).
     void applyCommand(const detail::HubCommand& cmd);
 
+    /// fix3 I3: the same command applied DIRECTLY on the duty thread by a
+    /// caller whose handle holds the impl (cmd.handle is dereferenced): acts on
+    /// the impl even before its GroupAdd (still in the ring) is adopted.
+    void applyCommandDirect(const detail::HubCommand& cmd);
+
+    /// fix3 M4: LeaveGroup frames the transport refused (GroupConsumer close),
+    /// retried every duty cycle; dropped on a session change.
+    [[nodiscard]] std::size_t pendingLeaves() const noexcept { return pendingLeaves_; }
+    int retryPendingLeaves(int64_t currentSessionId);
+
     // ---- Agent-thread duty cycle --------------------------------------------
 
     /// Drive heartbeat, autocommit, and rejoin timers for all consumers.
@@ -131,6 +141,16 @@ public:
     /// fail every pending commitSync now — progress-driven, no timeout.
     void onSessionDown();
 
+    /// F8a fix3 I2 (level-triggered session state, duty thread).  While not
+    /// connected: a commitSync applied is failed at once, and commits are not
+    /// offered.  Default true (hub-level tests have no session).
+    void setSessionConnected(bool connected, int64_t sessionId = 0) noexcept {
+        sessionConnected_ = connected;
+        currentSessionId_ = sessionId;
+    }
+    [[nodiscard]] bool sessionConnected() const noexcept { return sessionConnected_; }
+    [[nodiscard]] bool hasPendingCommitSync() const noexcept;
+
     /// fix1 I4: consumers whose generation snapshot a near-full status ring
     /// refused; the duty cycle calls republishDirty() while non-zero.
     [[nodiscard]] std::size_t dirtyCount() const noexcept { return dirtyCount_; }
@@ -164,6 +184,13 @@ private:
     int64_t nextCommitCorrId_ = 1;
     // F8a fix1 I4.
     std::size_t dirtyCount_ = 0;
+    // F8a fix3 I2 / M4.
+    bool sessionConnected_ = true;
+    int64_t currentSessionId_ = 0;
+    std::size_t pendingLeaves_ = 0;
+    void applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl);
+    static std::size_t encodeLeave_(GroupConsumerImpl& impl, int64_t sessionId);
+    void sendLeave_(GroupConsumerImpl& impl);
     // F8a fix2.
     DirectSendFn directSend_    = nullptr;
     void*        directSendCtx_ = nullptr;

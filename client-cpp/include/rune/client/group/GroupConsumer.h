@@ -172,6 +172,10 @@ struct GroupConsumerImpl {
     // A generation snapshot the near-full status ring refused (fix1 I4).
     bool statusDirty {false};
 
+    // fix3 M4: a LeaveGroup the transport refused, retried per duty cycle.
+    bool    leavePending {false};
+    int64_t leaveSessionId {0};
+
     // ---- Liveness (duty thread) -----------------------------------------------
     bool active {true};
 

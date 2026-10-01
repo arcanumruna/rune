@@ -561,3 +561,18 @@ TEST(SubscriberHubCommand, LateResponseUnsubscribeRetriedWhenRefusedRegression) 
     EXPECT_EQ(tx.unsubscribesFor(62), 1);
     EXPECT_EQ(hub.activeCount(), 0u);
 }
+
+// fix3: a SubscribeResponse of a session that is no longer current never binds
+// (its subscription died with that session).
+TEST(SubscriberHubCommand, ResponseOfAnOldSessionNeverBindsRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    auto impl = makeImpl(70);
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    auto old = bindRsp(70, 80);
+    old.sessionId = kSession - 1;
+    hub.onSubscribeResponse(old, 0, kSession, send.fn());
+    EXPECT_EQ(hub.activeCount(), 0u);
+    EXPECT_EQ(hub.pendingCount(), 1u) << "kept pending for the current session";
+    EXPECT_EQ(hub.staleResponsesIgnored(), 1u);
+}

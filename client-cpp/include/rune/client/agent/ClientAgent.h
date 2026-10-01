@@ -435,6 +435,15 @@ public:
     /// Duty thread only (or after the runner is joined).
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
+    [[nodiscard]] uint64_t ingressFatalDropped() const noexcept { return ingressFatalDropped_; }
+    /// F8a fix3: the transport's max frame length (immutable; any thread).
+    [[nodiscard]] std::size_t maxFrameLength() const noexcept { return transport_.maxMessageLength(); }
+    /// fix3 test seam (duty thread): the next `n` ring-drained kMsgSend offers
+    /// return `r` instead of reaching the transport.
+    void testForceIngressOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
+        testForcedOffer_ = r;
+        testForcedOffers_ = n;
+    }
 
     /// F8a fix2: duty-thread direct send on the default ingress publication
     /// (the one kMsgSend frames use) — for frames whose owner retries them
@@ -707,6 +716,11 @@ private:
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
     uint64_t ingressOfferRefused_ = 0;
+    uint64_t ingressFatalDropped_ = 0;
+    // fix3 test seam: force the next N ring-drained offers' verdicts.
+    int testForcedOffers_ = 0;
+    transport::AeronTransport::OfferResult testForcedOffer_ = transport::AeronTransport::OfferResult::Accepted;
+    transport::AeronTransport::OfferResult offerIngress_(const uint8_t* buf, std::size_t len) noexcept;
 
     // fix3 I1: test-only observability hook for drainRegistrationsForClose()'s
     // wait loop (see testSetCloseDrainYieldHook()). Empty by default.

@@ -475,3 +475,156 @@ TEST(HubCommandClient, DirectCommandNeverOvertakesItsOwnRegistrationRegression) 
     }
     EXPECT_EQ(got, 0) << "an unsubscribed subscription came alive after its late adoption";
 }
+
+// ===========================================================================
+// F8a fix round 3
+// ===========================================================================
+
+// I1(a): a frame no publication can carry fails at submit (synchronously) and
+// never reaches the ring — later commands are not wedged behind it.
+TEST(HubCommandClient, OversizePingFailsAtSubmitAndNeverWedgesTheRingRegression) {
+    HubRig r(4000, /*termBytes=*/64 * 1024);  // max message = 8 KiB
+    r.connect();
+    ASSERT_EQ(r.client.testMaxFrameLength(), 8u * 1024);
+    auto big = r.client.ping(rc::Bytes(16 * 1024, 7));
+    ASSERT_TRUE(readyNow(big)) << "an oversize frame must fail at submit";
+    EXPECT_THROW(big.get(), std::length_error);
+    auto small = r.client.ping(rc::Bytes(64, 1));
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings == 1; })) << "a later command was wedged";
+}
+
+// I1(b): an offer the transport can never accept (Fatal) is dropped, logged and
+// counted; later commands proceed.
+TEST(HubCommandClient, FatalOfferIsDroppedAndLaterCommandsProceedRegression) {
+    HubRig r(4002);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));  // ring idle
+    r.settle(200);
+    r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 1);
+    auto a = r.client.ping(rc::Bytes(8, 1));
+    auto b = r.client.ping(rc::Bytes(8, 2));
+    ASSERT_TRUE(r.drive([&] { return r.gw.pings >= 1; })) << "the ring was wedged by a Fatal offer";
+    r.settle(200);
+    EXPECT_EQ(r.gw.pings, 1);
+    EXPECT_EQ(r.client.testIngressFatalDropped(), 1u);
+}
+
+// I2: a commitSync issued while the session is ALREADY down fails promptly
+// (level-triggered), instead of waiting forever for a commit that cannot go out.
+TEST(HubCommandClient, CommitSyncAfterTheBrokerIsGoneFailsPromptlyRegression) {
+    HubRig r(4004, 0, &hubNow);
+    r.connect();
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.settle(50);
+    g_hubNow += 11'000'000'000LL;  // the broker is gone: no egress, no reconnect
+    for (int i = 0; i < 1'000 && r.client.state() == rc::session::SessionState::Connected; ++i) {
+        r.client.doWork();
+    }
+    ASSERT_NE(r.client.state(), rc::session::SessionState::Connected);
+    auto f = gc.commitSync();  // issued AFTER the session-down transition
+    for (int i = 0; i < 100 && !readyNow(f); ++i) r.client.doWork();
+    ASSERT_TRUE(readyNow(f)) << "a commitSync issued while the session is down must fail promptly";
+    EXPECT_THROW(f.get(), std::runtime_error);
+}
+
+// I3 (Invoker): handles created on a NON-owner thread (their Add still queued
+// in the ring) then closed / unsubscribed on the owner (direct path) — the
+// later adoption must honour it.
+TEST(HubCommandClient, DirectCloseBeforeAdoptionOfAForeignThreadHandleIsHonouredRegression) {
+    HubRig r(4006);
+    r.connect();
+    std::unique_ptr<rc::GroupConsumer> gc;
+    std::unique_ptr<rc::Subscription>  sub;
+    int got = 0;
+    std::thread t([&] {  // non-owner: both registrations go through the ring
+        gc  = std::make_unique<rc::GroupConsumer>(r.client.subscribeGroup("g", {"t"}));
+        sub = std::make_unique<rc::Subscription>(r.client.subscribe(
+            r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+            [&](const rc::Record&) { ++got; }));
+    });
+    t.join();  // hand-off to the owner; nothing has been drained yet
+    gc->close();         // owner = duty thread: applied directly, before adoption
+    sub->unsubscribe();
+    r.settle(1'000);
+    EXPECT_TRUE(gc->finished());
+    EXPECT_TRUE(r.client.testGroupHubEmpty()) << "a closed consumer was revived by its late adoption";
+    EXPECT_TRUE(sub->finished());
+    EXPECT_TRUE(r.gw.subscribed.empty()) << "an unsubscribed subscription was revived by its late adoption";
+}
+
+// I4: the adoption-time Subscribe never depends on command-ring space.
+TEST(HubCommandClient, SubscribeAdoptedWithAFullRingStillReachesTheBrokerRegression) {
+    HubRig r(4008);
+    r.connect();
+    r.client.testFillCommandRing();
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});  // owner: adopted directly
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); }))
+        << "the Subscribe frame was lost to the full command ring";
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() > 0; }));
+}
+
+// I4: a Subscribe the transport refuses at adoption is retried per duty cycle.
+TEST(HubCommandClient, SubscribeRefusedAtAdoptionIsRetriedRegression) {
+    HubRig r(4010, /*termBytes=*/64 * 1024);
+    r.connect();
+    r.gw.pauseIngress = true;
+    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
+    for (int i = 0; i < 120; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, 1)));
+    r.settle(5'000);
+    ASSERT_GT(r.client.testIngressOfferRefused(), 0u);
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    r.settle(100);
+    EXPECT_EQ(r.client.testUnsentSubscribes(), 1u);
+    r.gw.pauseIngress = false;
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() > 0; }));
+    EXPECT_EQ(r.client.testUnsentSubscribes(), 0u);
+}
+
+// I3 (Thread mode): an app-thread handle whose SubscribeAdd is still queued in
+// the ring, unsubscribed from inside a runner callback (direct path) — the
+// later adoption must drop it (no Subscribe ever sent, finished()).
+TEST(HubCommandClient, RunnerCallbackUnsubscribesAnUnadoptedAppHandleRegression) {
+    rc::ClientConfig c = hubCfg(4012, 4013, rc::RunnerMode::Thread);
+    rc::Client client(c);
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId,
+                                    c.egressChannel, c.egressStreamId);
+    auto pump = [&](auto pred, int cap = 2'000'000) {
+        for (int i = 0; i < cap; ++i) {
+            gw.pump();
+            if (pred()) return true;
+            std::this_thread::yield();
+        }
+        return false;
+    };
+    ASSERT_TRUE(pump([&] { return gw.ready(); }));
+    auto cf = client.connect();
+    ASSERT_TRUE(pump([&] { return readyNow(cf); }));
+
+    std::unique_ptr<rc::Subscription> b;  // written by the test thread before `ev`
+    std::atomic<int> inHandler{kPending}; // runner -> test: "blocked in A's handler"
+    std::atomic<int> bReady{kPending};    // test -> runner: "b exists (Add queued)"
+    std::atomic<bool> handled{false};
+    auto a = client.subscribe(client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+        [&](const rc::Record&) {
+            if (handled.exchange(true)) return;
+            signal(inHandler, kFull);
+            if (waitEvent(bReady) == kFull && b) b->unsubscribe();  // runner: direct path
+        });
+    ASSERT_TRUE(pump([&] { return gw.subscribed.size() == 1; }));
+    ASSERT_TRUE(pump([&] { return a.subscriptionId() > 0; }));
+    gw.pushRecords(gw.subscribed[0], 0, 1);
+    if (!pump([&] { return inHandler.load() == kFull; })) {
+        signal(bReady, kNoFull);
+        FAIL() << "the runner never entered the handler";
+    }
+    // The runner is parked inside A's handler: B's SubscribeAdd stays queued.
+    b = std::make_unique<rc::Subscription>(client.subscribe(
+        client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, [](const rc::Record&) {}));
+    signal(bReady, kFull);
+    ASSERT_TRUE(pump([&] { return b->finished(); })) << "the direct unsubscribe was lost";
+    for (int i = 0; i < 20'000; ++i) gw.pump();
+    EXPECT_EQ(gw.subscribed.size(), 1u) << "the unsubscribed handle was revived by its late adoption";
+    client.close();
+}

@@ -101,6 +101,22 @@ public:
     /// No busy-spin — call site retries if needed.
     bool offer(const uint8_t* buf, std::size_t len) noexcept;
 
+    /// F8a fix3: the 3-way verdict of an offer.
+    ///   Accepted — published.
+    ///   Retry    — transient: back-pressured, not connected, admin action, or
+    ///              the publication is not resolved yet.  Offer it again later.
+    ///   Fatal    — will never succeed: publication closed, max position
+    ///              exceeded, or Aeron threw (e.g. the frame exceeds the
+    ///              publication's max message length).  Drop it.
+    enum class OfferResult : uint8_t { Accepted, Retry, Fatal };
+    OfferResult offerResult(const uint8_t* buf, std::size_t len) noexcept;
+
+    /// F8a fix3: the largest frame any ingress publication of this transport
+    /// can carry (Aeron: termLength/8, capped at 16 MiB), computed once from
+    /// the configuration (the smaller of the driver term length and a
+    /// `term-length=` on the ingress channel).  Immutable: safe from any thread.
+    [[nodiscard]] std::size_t maxMessageLength() const noexcept { return maxMessageLength_; }
+
     /// Publish buf[0..len-1] to the per-worker ingress ExclusivePublication
     /// for the given ingressStreamId (0 or the default stream id -> the default
     /// publication).  The (currentChannel, ingressStreamId) publication resolves
@@ -300,7 +316,9 @@ private:
 
     // ---- Internal helpers ----------------------------------------------------
     /// Offer buf to a specific ExclusivePublication (shared implementation).
-    bool offerToPub(aeron::ExclusivePublication& pub,
+    std::size_t maxMessageLength_ = 0;  // immutable after construction
+    static std::size_t computeMaxMessageLength(const TransportConfig& c) noexcept;
+    OfferResult offerToPub(aeron::ExclusivePublication& pub,
                     const uint8_t* buf, std::size_t len) noexcept;
 
     // ---- Resolution constants ------------------------------------------------

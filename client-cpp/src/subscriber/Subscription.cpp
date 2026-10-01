@@ -90,8 +90,9 @@ void Subscription::unsubscribe() {
     if (!impl_ || moved_ || sink_ == nullptr) return;
 
     detail::HubCommand cmd;
-    cmd.op = detail::HubCommand::Op::Unsubscribe;
-    cmd.a  = impl_->correlationId;
+    cmd.op     = detail::HubCommand::Op::Unsubscribe;
+    cmd.a      = impl_->correlationId;
+    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());  // direct path only (fix3 I3)
 
     if (onDutyThread_()) {
         // Inside a callback (Thread mode): the sink applies it directly on this
