@@ -21,6 +21,12 @@
 //                            (mincore gate + MADV_WILLNEED read-ahead), so a cold
 //                            step returns at once; nonres_frac = steps that found
 //                            nothing resident (waiting on read-ahead).
+//                            Fix round 2 (RR1-4): hints go through the same
+//                            policy as the worker (async IORING_OP_FADVISE on
+//                            io_uring, else sync MADV_WILLNEED); reported split
+//                            per step: hint_ns / probe_ns (mincore) / parse_ns,
+//                            minflt / majflt per step (whole run incl. drops),
+//                            async_hints / sync_hints totals.
 //   BM_RcWorkerPush/<iso>  — the worker-push egress arm (pushOwnedSubscriptions_)
 //                            of 64 x ~1 KiB non-txn batches on an embedded-driver
 //                            IPC publication (review I-3).  iso 0 / 1 as above.
@@ -56,6 +62,8 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <climits>
 #include <unistd.h>
 
 namespace {
@@ -231,6 +239,27 @@ void BM_RcWorkerPush(benchmark::State& state) {
 }
 
 #if defined(RUNE_RCBENCH_S4)
+// Read-ahead issuer for the bench: exactly the worker's policy — an async
+// IORING_OP_FADVISE(WILLNEED) where the io backend is io_uring, else the
+// synchronous MADV_WILLNEED.
+struct BenchHints {
+    rune::node::IoBackend* io = nullptr;
+    uint64_t asyncIssued = 0, syncIssued = 0, skipped = 0;
+    static bool fn(void* c, const rune::node::RcReadAheadReq& r) {
+        auto* h = static_cast<BenchHints*>(c);
+        if (h->io->asyncHints() && r.fd >= 0) {
+            const auto t = h->io->submitWillNeed(r.fd, r.fileOff,
+                                                 static_cast<uint32_t>(std::min<std::size_t>(r.len, UINT32_MAX)));
+            if (t == rune::node::kNoToken) { ++h->skipped; return false; }
+            ++h->asyncIssued;
+            return true;
+        }
+        ++h->syncIssued;
+        RcState::syncWillNeed(r);
+        return false;
+    }
+};
+
 void BM_RcBuildStep(benchmark::State& state) {
     const auto budget = static_cast<int32_t>(state.range(0));
     BenchDir d;
@@ -251,16 +280,32 @@ void BM_RcBuildStep(benchmark::State& state) {
     }
     log.sync();
     const RcFacts f{true, true, 0, 0, 1};
+    rune::node::IoBackend io(1024, 1024);
+    BenchHints hints;
+    hints.io = &io;
+    RcState::StepProfile prof;
     std::vector<double> us;
     us.reserve(1 << 20);
-    auto rc = std::make_unique<RcState>();
-    rc->reserve(1024);
+    uint64_t nonRes = 0, steps = 0;
+    auto fresh = [&] {
+        auto rc = std::make_unique<RcState>();
+        rc->reserve(1024);
+        rc->setReadAhead(&BenchHints::fn, &hints);
+        rc->setProfile(&prof);
+        return rc;
+    };
+    auto rc = fresh();
     dropCache(log, d.path);
+    struct rusage ru0{}, ru1{};
+    ::getrusage(RUSAGE_SELF, &ru0);
     for (auto _ : state) {
         if (rc->ready()) {
             state.PauseTiming();
-            rc = std::make_unique<RcState>();
-            rc->reserve(1024);
+            nonRes += rc->nonResidentSteps(); steps += rc->scanSteps();
+            while (rc->hintInFlight() && io.reap([&](const rune::node::FlushCompletion&) { rc->onHintCompleted(); }) >= 0) {
+                if (!rc->hintInFlight()) break;
+            }
+            rc = fresh();
             dropCache(log, d.path);
             state.ResumeTiming();
         }
@@ -268,14 +313,27 @@ void BM_RcBuildStep(benchmark::State& state) {
         benchmark::DoNotOptimize(rc->advance(f, &log, budget));
         const auto t1 = std::chrono::steady_clock::now();
         us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+        // The worker reaps completions every pass (its existing drain).
+        state.PauseTiming();
+        (void)io.reap([&](const rune::node::FlushCompletion&) { rc->onHintCompleted(); });
+        state.ResumeTiming();
     }
+    ::getrusage(RUSAGE_SELF, &ru1);
+    nonRes += rc->nonResidentSteps(); steps += rc->scanSteps();
     if (us.empty()) return;
     std::sort(us.begin(), us.end());
+    const double n = static_cast<double>(us.size());
     state.counters["p50_us"] = us[us.size() / 2];
     state.counters["p99_us"] = us[std::min(us.size() - 1, us.size() * 99 / 100)];
     state.counters["max_us"] = us.back();
-    state.counters["nonres_frac"] = static_cast<double>(rc->nonResidentSteps()) /
-                                    static_cast<double>(std::max<uint64_t>(1, rc->scanSteps()));
+    state.counters["nonres_frac"] = static_cast<double>(nonRes) / static_cast<double>(std::max<uint64_t>(1, steps));
+    state.counters["hint_ns"]  = static_cast<double>(prof.hintNs) / n;     // mean per step
+    state.counters["probe_ns"] = static_cast<double>(prof.probeNs) / n;
+    state.counters["parse_ns"] = static_cast<double>(prof.parseNs) / n;
+    state.counters["minflt"]   = static_cast<double>(ru1.ru_minflt - ru0.ru_minflt) / n;
+    state.counters["majflt"]   = static_cast<double>(ru1.ru_majflt - ru0.ru_majflt) / n;
+    state.counters["async_hints"] = static_cast<double>(hints.asyncIssued);
+    state.counters["sync_hints"]  = static_cast<double>(hints.syncIssued);
     state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * budget);
 }
 #endif
