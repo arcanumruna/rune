@@ -1509,6 +1509,10 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                         raw.data() + rp, -1);
                     rp += static_cast<std::size_t>(tl);
                 }
+                // F15 §2.1 step 3: a reconcile append adds FOREIGN (old-term)
+                // batches; nothing below the pre-append LEO changes.
+                lastTruncationOffset_ = logEndOffset_();
+                ++logGeneration_;
                 if (externalFollowerFlush_) {
                     // Shard mode: page-cache append; durability via the owning
                     // worker's io backend (flush request), never an inline fsync.
@@ -2172,6 +2176,11 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
     }
 
     onLog([&](auto& L){ L.truncateTo(truncateOffset); });
+
+    // F15 §2.1 step 3: the log's existing content changed at and above
+    // truncateOffset — every parked waiter / RC build re-validates against it.
+    lastTruncationOffset_ = truncateOffset;
+    ++logGeneration_;
 
     // Task 11: PSM re-rebuild on low truncation.
     //
