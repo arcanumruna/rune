@@ -344,6 +344,14 @@ private:
     // (retriable) send had to be skipped. Control-thread reads for logging.
     uint64_t outboundRingFullCount_ = 0;
 
+    // F9a: control-thread-owned diagnostics (were file statics shared by every
+    // in-process node's control thread).  FR inbound seq + RUNE_FS_LOG rates.
+    uint32_t inRecvSeq_     = 0;
+    int64_t  txRateLastNs_  = 0;
+    int64_t  txPolls_       = 0;   // poll() calls
+    int64_t  txFragsRecv_   = 0;   // onFragment invocations (fragments received)
+    int64_t  txOutDrained_  = 0;   // outbound messages offered to Aeron
+
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.
     rune::node::WorkerPool* workerPool_ = nullptr;
