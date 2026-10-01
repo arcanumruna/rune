@@ -81,7 +81,7 @@ public:
     void handBackAll(Detach&& detach) noexcept {
         ImplList all;
         all.swap(producers_);
-        live_ = 0;
+        active_.clear();
         for (ProducerImpl* impl : all) {
             if (impl != nullptr) detach(impl);
         }
@@ -90,8 +90,8 @@ public:
     /// The producers held (live, non-tombstone slots) — any order.
     template <class F>
     void forEach(F&& f) {
-        for (std::size_t i = 0; i < producers_.size(); ++i) {
-            if (producers_[i] != nullptr) f(*producers_[i]);
+        for (std::size_t i = 0; i < active_.size(); ++i) {
+            if (active_[i] != nullptr) f(*active_[i]);
         }
     }
 
@@ -102,7 +102,7 @@ public:
     template <class Sink>
     int drainAndFlush(int64_t nowNs, int64_t sessionId, const Sink& sink) {
         int work = 0;
-        for (ProducerImpl* impl : producers_) {
+        for (ProducerImpl* impl : active_) {
             if (impl == nullptr) [[unlikely]] continue;  // F8c C7: a released slot
             // fix1 minor 9: publish the consumer-liveness heartbeat ONCE per
             // producer per cycle (not once per drainRing() call below, which can
@@ -153,7 +153,7 @@ public:
     /// F8c C6a: the duty-thread failure tail-close of every producer (T15:
     /// the Aeron client closed under a shard).  Idempotent.
     void failCloseAll(OpStatus st) {
-        for (ProducerImpl* impl : producers_) {
+        for (ProducerImpl* impl : active_) {
             if (impl != nullptr) impl->failClose(st);
         }
     }
@@ -164,7 +164,7 @@ public:
     /// outlives this Client then gets SendResult::Closed from trySubmit() and
     /// never touches the (by-then-dangling) pump hook.
     void closeAllRings() noexcept {
-        for (ProducerImpl* impl : producers_) {
+        for (ProducerImpl* impl : active_) {
             if (impl != nullptr) impl->markRingClosed();
         }
     }
@@ -181,10 +181,10 @@ public:
 
     bool empty() const noexcept {
         // Runner-thread-only read of the single-owner vector — no lock, no atomic.
-        return live_ == 0;
+        return active_.empty();
     }
     /// Producers held (released + forgotten ones excluded).
-    std::size_t size() const noexcept { return live_; }
+    std::size_t size() const noexcept { return active_.size(); }
 
     /// CB-5 B: attempt to resend a redirected Produce identified by correlationId.
     /// Returns true if one producer handled it (resent or failed).
@@ -233,10 +233,11 @@ private:
     // runner thread.  No atomic, no lock: the shared-nothing law delivers
     // registration via the agent ring (kMsgRegisterProducer), so this vector is
     // never touched concurrently.  Shutdown paths run after the runner is joined.
-    ImplList producers_;
-    std::size_t live_ = 0;                // non-tombstone slots
+    ImplList producers_;                  // by ordinal (ProduceResponse routing); nullptr = released
+    ImplList active_;                     // m2: the live producers, dense (every duty walk)
     std::vector<uint32_t> freeOrdinals_;  // F8c C7: released ordinals, FIFO (reused once fresh run out)
     std::size_t freeHead_ = 0;            // next freeOrdinals_ entry to reuse
+    std::vector<uint32_t> generations_;   // per ordinal, bumped on reuse (I-1)
 };
 
 } // namespace rune::client::producer

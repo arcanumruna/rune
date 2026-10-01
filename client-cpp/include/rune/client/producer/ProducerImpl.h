@@ -889,6 +889,15 @@ public:
 
     /// Ordinal inside the owning ProducerHub; encoded into batch correlation ids.
     void setOrdinal(uint32_t o) noexcept { ordinal_ = o; }
+    /// F8c C7 fix round 1 (I-1): the ordinal plus its generation (ProducerHub
+    /// bumps it on reuse): every partition's in-flight sequence starts in the
+    /// generation's range, so a late response for a previous producer on this
+    /// ordinal never matches one of this producer's batches.
+    void setOrdinal(uint32_t o, uint32_t generation) noexcept {
+        ordinal_ = o;
+        seqBase_ = static_cast<uint64_t>(generation & batchcorr::kGenMask) << batchcorr::kGenShift;
+        for (auto& up : partitions_) up->inflight.rebase(seqBase_);  // created before adoption
+    }
     [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
 
     /// Total Aeron frames offered to transport (agent-thread only; plain uint64_t).
@@ -1139,6 +1148,7 @@ private:
     // In-flight batches live in each PartitionState::inflight ring; a batch
     // correlation id encodes (ordinal_, partition slot, ring sequence).
     uint32_t ordinal_ = 0;
+    uint64_t seqBase_ = 0;  // F8c C7 fix round 1 (I-1): the ordinal generation's sequence base
     // Lower bound of every live batch's attemptDeadlineNs: retransmitStalled()
     // returns in O(1) until it passes (spec §1a.5; replaces the ordered map front).
     int64_t earliestAttemptDeadlineNs_ = INT64_MAX;

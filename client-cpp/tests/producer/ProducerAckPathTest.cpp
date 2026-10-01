@@ -147,6 +147,47 @@ TEST(ProducerInFlight, ReleasedOrdinalReusedOnlyAfterFreshOnesRegression) {
     EXPECT_EQ(b->ordinal(), 3u);
 }
 
+// F8c C7 fix round 1 (I-1): an ordinal reused by a new producer must never
+// match a late ProduceResponse of the producer that held it before: the
+// ordinal's generation is folded into the sequence, so the old corrId is
+// dropped and the new producer's record completes only from its own response
+// (with its own offset).  RED (pre-fix): both producers' first batch on slot 0
+// was batchcorr::make(ord, 0, 0) — the stale response completed the new
+// producer's record Ok with the old producer's offset.
+TEST(ProducerInFlight, ReusedOrdinalDropsStaleResponseOfPreviousProducerRegression) {
+    ProducerHub hub;
+    std::vector<std::unique_ptr<ProducerImpl>> impls;
+    for (uint32_t i = 0; i <= batchcorr::kMaxOrdinal; ++i) {
+        impls.push_back(std::make_unique<ProducerImpl>(ackCfg(4), 1024));
+        hub.add(impls.back().get());
+    }
+    ProducerImpl& old = *impls[9];
+    Capture capOld;
+    ASSERT_TRUE(old.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));
+    pump(old, capOld.fn());
+    ASSERT_EQ(capOld.frames.size(), 1u);
+    const int64_t staleCorr = capOld.frames[0].corrId;  // its response is still "in the network"
+    hub.remove(&old);
+
+    auto fresh = std::make_unique<ProducerImpl>(ackCfg(4), 1024);
+    AckLedger L;
+    L.attach(*fresh);
+    hub.add(fresh.get());
+    ASSERT_EQ(fresh->ordinal(), 9u) << "the released ordinal is reused";
+    Capture capNew;
+    ASSERT_TRUE(fresh->submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(2)));
+    pump(*fresh, capNew.fn());
+    ASSERT_EQ(capNew.frames.size(), 1u);
+    EXPECT_NE(capNew.frames[0].corrId, staleCorr) << "a new incarnation, a new sequence range";
+
+    hub.onProduceResponse(staleCorr, 111);  // the previous producer's late answer
+    EXPECT_EQ(L.times(2), 0) << "a stale response completed another producer's record";
+    hub.onProduceResponse(capNew.frames[0].corrId, 222);
+    ASSERT_EQ(L.times(2), 1);
+    EXPECT_EQ(L.status(2), OpStatus::Ok);
+    EXPECT_EQ(L.value(2), 222) << "its own offset";
+}
+
 TEST(ProducerInFlight, HubRoutesAcksByOrdinal) {
     ProducerHub hub;
     auto a = std::make_unique<ProducerImpl>(ackCfg(4));  // F8c C7: the bare hub holds raw pointers
