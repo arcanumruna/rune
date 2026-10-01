@@ -645,6 +645,37 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 
     // Step 2: dispatch on templateId.
     const auto tid = static_cast<pc::TemplateId>(fc.templateId);
+
+    // F23: every client->broker request refreshes its session's liveness, not
+    // only Keepalive/Ping (Kafka: a connection is idle only when it sends no
+    // requests).  Produce refreshes inside handleProduce (it already looks the
+    // session up); Connect has no session yet; Keepalive/Ping touch in their
+    // handlers.  Cold request types pay one session lookup here.
+    switch (tid) {
+        case pc::TemplateId::MetadataRequest:
+        case pc::TemplateId::Subscribe:
+        case pc::TemplateId::Unsubscribe:
+        case pc::TemplateId::JoinGroup:
+        case pc::TemplateId::SyncGroup:
+        case pc::TemplateId::Heartbeat:
+        case pc::TemplateId::LeaveGroup:
+        case pc::TemplateId::OffsetCommit:
+        case pc::TemplateId::OffsetFetch:
+        case pc::TemplateId::InitProducerId:
+        case pc::TemplateId::AddPartitionsToTxn:
+        case pc::TemplateId::AddOffsetsToTxn:
+        case pc::TemplateId::TxnOffsetCommit:
+        case pc::TemplateId::EndTxn:
+        case pc::TemplateId::DefineTopic:
+        case pc::TemplateId::GetTopicSchema:
+            if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
+                sessions_.touch(hdr->sessionId, nowNs_);
+            }
+            break;
+        default:
+            break;
+    }
+
     switch (tid) {
         case pc::TemplateId::Connect:
             handleConnect(buf, len, nowNs_);
@@ -1270,6 +1301,9 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         spdlog::debug("ClientGateway: Produce for unknown sessionId={} — dropped", msg.sessionId);
         return;
     }
+    // F23: any request is liveness (Kafka: idle == no requests).  Reuses the
+    // lookup above — no extra cost on the produce hot path.
+    session->lastSeenNs = nowNs_;
     // G0.1: capture session id so the public sendRespReliable() test-seam knows
     // which session to target for the duration of this handleProduce() call.
     currentProduceSessionId_ = msg.sessionId;
@@ -3112,6 +3146,11 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 // Session gone — drop result silently.
                 return;
             }
+            // F23: per-worker ingress (forced on in shard mode) delivers Produce
+            // straight to the worker, bypassing onFragment, and every such
+            // produce (acks=0 included) returns here — refresh liveness on the
+            // lookup we already do (ack time >= request time: never early).
+            session->lastSeenNs = nowNs_;
 
             // Error path: worker failed to append (e.g. Log threw).
             if (ret.errorCode != 0) {
