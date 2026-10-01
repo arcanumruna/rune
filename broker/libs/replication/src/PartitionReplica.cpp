@@ -786,6 +786,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // lets the leader's real (majority) HW advance and the ISR re-expand.  Only
     // the follower's *committed view* (followerHw_) is held at the majority floor
     // until the ISR heals.
+    if (!records.empty()) ++fetchDataServes_;
     const Offset advertiseHw = highWatermark();
     auto resp = makeFetchResponse(advertiseHw, kErrNone, records);
     onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
@@ -2289,14 +2290,25 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
     ++rtPushes_;
     // Zero-copy: a view into the log (same path as onFetchRequest()); the
     // transport copies the bytes once, straight into each follower's term buffer.
+    //
+    // F3 round 6, item 1: the push chunk is capped at min(maxFetchBytes, the
+    // transport's LIVE ceiling).  A coalesced push larger than what the
+    // transport carries is DROPPED by it after lastPushedOffset_/pushedThrough
+    // have advanced — the follower then recovers only via the 20 ms re-serve
+    // (an acks=all stall).  0 = no publication resolved yet: fall back to
+    // maxFetchBytes (nothing is deliverable anyway; the sends are no-ops).
+    const int32_t liveCeiling =
+        onTransport([&](auto& t) { return t.maxFetchResponseBytes(); });
+    const int32_t pushCap = (liveCeiling > 0 && liveCeiling < cfg_.maxFetchBytes)
+                            ? liveCeiling : cfg_.maxFetchBytes;
     const rune::storage::LogReadView v =
-        onLog([&](auto& L) { return L.readView(fromOffset, cfg_.maxFetchBytes); });
+        onLog([&](auto& L) { return L.readView(fromOffset, pushCap); });
     // Advance lastPushedOffset_ by ONLY what is actually pushed (ceiling + cap bound).
-    // The read is capped at maxFetchBytes; under a large backlog one push covers a
+    // The read is capped at pushCap; under a large backlog one push covers a
     // prefix and the next duty cycle pushes the rest.  FLOW CONTROL: no batch that
     // begins at or beyond pushCeiling is pushed (in-flight <= kPushFlowWindow).
     const BatchPrefix pre = wholeBatchPrefix(v.data, v.len,
-                                             static_cast<std::size_t>(cfg_.maxFetchBytes),
+                                             static_cast<std::size_t>(pushCap),
                                              pushCeiling);
     std::size_t sendBytes;
     Offset      pushedThrough;
@@ -2326,9 +2338,12 @@ void PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) no
         // transport-hard-ceiling relaxation as onFetchRequest().  pushCeiling
         // itself is NEVER relaxed — only confirmed above that this one batch
         // is within it; a batch beyond pushCeiling still returns at (a).
-        const int32_t hardCeiling =
-            onTransport([&](auto& t) { return t.maxFetchResponseBytes(); });
-        if (hardCeiling > 0 && static_cast<std::size_t>(total) <= static_cast<std::size_t>(hardCeiling)) {
+        const int32_t hardCeiling = liveCeiling;
+        // F3 round 6, item 8: ceiling 0 = no publication resolved yet — not a
+        // property of this batch.  Never arm the unsendable memo / log
+        // "hard ceiling of 0"; re-evaluate once a publication resolves.
+        if (hardCeiling <= 0) return;
+        if (static_cast<std::size_t>(total) <= static_cast<std::size_t>(hardCeiling)) {
             sendBytes     = static_cast<std::size_t>(total);
             pushedThrough = firstBase + r.lastOffsetDelta() + 1;
         } else {

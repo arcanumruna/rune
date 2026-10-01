@@ -96,9 +96,17 @@ int32_t userTopicMaxFetchBytes(const NodeConfig& config) noexcept {
     // to the owning worker through its ingress ring (ApplyReplicated) on the
     // legacy transport — so a fetch/push chunk must never exceed what that
     // ring can carry.  Unchanged (1 MiB) for the default 32 MiB ring.
-    return clampI32(std::min<int64_t>(
-        rune::replication::kDefaultMaxFetchBytes,
-        static_cast<int64_t>(workerIngressMaxBatchBytes(config))));
+    //
+    // F3 round 6, item 1: multi-node also bounds it by the replication hard
+    // max (the same single-source transport functions) — a coalesced push
+    // larger than what the transport carries is dropped, stalling acks=all
+    // for the 20 ms re-serve.  (PartitionReplica additionally caps each push
+    // at the transport's LIVE ceiling.)
+    int64_t cap = std::min<int64_t>(rune::replication::kDefaultMaxFetchBytes,
+                                    static_cast<int64_t>(workerIngressMaxBatchBytes(config)));
+    if (!config.isSingleNode())
+        cap = std::min<int64_t>(cap, replicationHardTransportMaxBytes(config));
+    return clampI32(cap);
 }
 
 std::size_t configuredMaxProduceBatchBytes(const NodeConfig& config) noexcept {
@@ -1478,6 +1486,18 @@ void BrokerNode::buildGateway() {
                          nodeId, effectiveMaxBatch, configuredMaxProduceBatchBytes(config_),
                          workerIngressMaxBatchBytes(config_), aeronIngressMaxBatchBytes(config_),
                          config_.isSingleNode() ? -1 : replicationHardTransportMaxBytes(config_));
+            // F3 round 6, item 6: the max produce batch is a CLUSTER-WIDE
+            // constraint (a follower must carry what any leader accepted).
+            // Shard mode verifies it per plane (PlaneHello → Refused on
+            // mismatch); legacy mode cannot, so the config MUST be homogeneous.
+            if (!config_.isSingleNode() && !config_.shardMode()) {
+                spdlog::info("BrokerNode[{}]: legacy replication mode — effective max produce "
+                             "batch {} B (worker ingress ring {} B) is NOT verified against peers: "
+                             "RUNE_AERON_TERM_BUFFER_BYTES / RUNE_WORKER_INGRESS_RING_BYTES / "
+                             "RUNE_REPLICATION_OUTBOUND_RING_BYTES / RUNE_MAX_PRODUCE_BATCH_BYTES "
+                             "MUST be identical on every node", nodeId, effectiveMaxBatch,
+                             config_.workerIngressRingBytes);
+            }
         }
 
         // E5.1: Apply per-worker ingress base stream id (RUNE_WORKER_INGRESS_BASE_STREAM).
@@ -2018,17 +2038,28 @@ void BrokerNode::buildGateway() {
                     // else: ring full (impossible for 1-deep role churn) → retry next cycle
                 }
 
-                // (1b) Task 10 fix 3 / I1: schema-log storage failure (admin →
-                //      control ring) → the same halt path as every other log.
+                // (1b) admin → control ring:
+                //   kA2cStorageFailure (Task 10 fix 3 / I1): schema-log storage
+                //     failure → the same halt path as every other log.
+                //   kA2cSchemaUpdate (F3 round 6, item 3): queue for the
+                //     control-thread fan-out to the worker rings.
                 work += agent->failureRing().drain(
-                    [this](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b,
+                    [this](int32_t tid, aeron::concurrent::AtomicBuffer& b,
                            aeron::util::index_t off, aeron::util::index_t len) {
                         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                        const auto  n = static_cast<std::size_t>(len);
+                        if (tid == kA2cSchemaUpdate) {
+                            SchemaUpdateMsg m = decodeSchemaUpdate(p, n);
+                            schemaFanout_.post(m.topicId, std::move(m.blob));
+                            return;
+                        }
                         int32_t e = 0;
                         std::memcpy(&e, p, 4);
                         onStorageFailure_(std::string(reinterpret_cast<const char*>(p) + 4,
-                                                      static_cast<std::size_t>(len) - 4), e);
-                    }, 4);
+                                                      n - 4), e);
+                    }, 16);
+                // Control thread = the single producer of every worker ring.
+                if (workerPool_) work += schemaFanout_.pump(*workerPool_);
 
                 // (2) Drain create-topic requests (admin → control).
                 work += agent->createReqRing().drain(
@@ -2482,47 +2513,17 @@ void BrokerNode::buildAdminWorker() {
             return encodeCreateTopicReq(adminWorkerAgent_->createReqRing(), m);
         };
 
-        // Task 7: pushValidators — enqueue a SchemaUpdate WorkerOp to EVERY
-        // produce worker's ingress ring.
-        //
-        // Admin→worker hand-off: this lambda is called on the AdminWorker thread
-        // after a DefineTopic DDL commit (validate=true).  It fans out a
-        // SchemaUpdate op to each worker in the pool by calling
-        // worker.tryEnqueueOp().  Each worker builds a local rune::codec::Validator
-        // from the blob on ITS OWN thread (shared-nothing — single-writer per
-        // validators_ map entry).
-        //
-        // Back-pressure: if a worker's ingress ring is full, we log a warning and
-        // skip that worker for this cycle.  The validator will be retried when a
-        // later DefineTopic DDL commit fires (rare admin path — not a problem in
-        // practice, and a full ring means the worker is processing under load).
-        // A TODO(T8) can add a retry queue if needed.
-        //
-        // No blocking: the lambda enqueues and returns.  The worker thread applies
-        // the op the next time it drains its ingress ring.
+        // Task 7 / F3 round 6, item 3: pushValidators runs on the ADMIN thread
+        // (AdminWorker::advance_ after a validate=true DefineTopic commit).  It
+        // must NOT enqueue into the worker SPSC ingress rings — the control
+        // thread is their single producer (round 5 review: confirmed data race,
+        // two producers on an SPSC ring).  It posts on the admin→control ring
+        // (T10's ring, kA2cSchemaUpdate); the control thread's admin hook drains
+        // it into schemaFanout_, which fans out to every worker with
+        // retry-on-full (each worker builds its Validator on ITS OWN thread).
         deps.pushValidators = [this](const RegistryEntry& entry, int32_t topicId) {
-            if (!workerPool_) {
-                spdlog::warn(
-                    "BrokerNode: pushValidators — no WorkerPool; "
-                    "validator for topicId={} not pushed", topicId);
-                return;
-            }
-            const int32_t nWorkers = workerPool_->workerCount();
-            for (int32_t i = 0; i < nWorkers; ++i) {
-                WorkerOp op;
-                op.type              = WorkerOp::Type::SchemaUpdate;
-                op.topicId           = topicId;
-                op.schemaUpdateBlob  = entry.descriptorBlob; // copy (admin-path, not hot)
-                if (!workerPool_->worker(i).tryEnqueueOp(std::move(op))) {
-                    spdlog::warn(
-                        "BrokerNode: pushValidators — worker {} ingress ring full; "
-                        "SchemaUpdate for topicId={} dropped (back-pressure)",
-                        i, topicId);
-                }
-            }
-            spdlog::info(
-                "BrokerNode: pushValidators — SchemaUpdate for topicId={} "
-                "enqueued to {} workers", topicId, nWorkers);
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postSchemaUpdate(topicId, entry.descriptorBlob);
         };
 
         // respondDefine / respondGet (RULING-2 F): encode the protocol response
@@ -2869,7 +2870,11 @@ void BrokerNode::attachShardRuntimes_() {
                                          std::to_string(w) + " replication plane did not resolve — refusing to start");
             // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
             // are unknown at parse time, so each plane verifies them in-band.
-            plane.enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds);
+            // F3 round 6, item 6: the max-batch constraint is cluster-wide —
+            // advertise this node's effective max + worker ingress ring size.
+            plane.enablePlaneHandshake(static_cast<rune::replication::NodeId>(config_.nodeId), wc, peerIds,
+                                       static_cast<int64_t>(effectiveMaxProduceBatchBytes(config_)),
+                                       config_.workerIngressRingBytes);
         }
         auto ing = std::make_unique<WorkerIngress>(shardClients_[idx], config_.shardIngressBindChannel(w),
                                                    config_.workerIngressBaseStreamId + w, pump);

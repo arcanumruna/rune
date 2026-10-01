@@ -654,6 +654,10 @@ public:
     [[nodiscard]] uint64_t unsendablePushLogEmitsForTest() const noexcept {
         return unsendablePushLogEmits_;
     }
+    /// F3 round 6: FETCH responses that carried records (Data serves) — with
+    /// push on, a non-zero count means the follower had to be re-served
+    /// (lost/dropped push → 20 ms resend window).
+    [[nodiscard]] uint64_t fetchDataServesForTest() const noexcept { return fetchDataServes_; }
 
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
@@ -913,6 +917,7 @@ private:
     // F3 round 5, item I2: critical log lines actually emitted by the push path
     // (rate-limited to once per unsendable-offset transition).
     uint64_t unsendablePushLogEmits_ = 0;
+    uint64_t fetchDataServes_ = 0;   // F3 r6: Data fetch responses with records
     // F3 round 5, item I2: memo of the last unsendable push head.  Armed
     // (fromOffset >= 0) by pushToFollowers() when the head batch exceeds the
     // transport's hard ceiling; cleared by any successful push.

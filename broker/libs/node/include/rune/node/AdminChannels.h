@@ -56,6 +56,19 @@ enum : int32_t {
 };
 
 // ---------------------------------------------------------------------------
+// Admin → control ring (AdminWorkerAgent::failureRing_; T10) message ids.
+// One SPSC ring, producer = admin thread, consumer = control thread.
+//   kA2cStorageFailure : [errno:i32][logDir bytes]   (Task 10 fix 3 / I1)
+//   kA2cSchemaUpdate   : [topicId:i32][descriptor blob] (F3 round 6, item 3:
+//                        the control thread — the ONLY producer of the worker
+//                        SPSC ingress rings — fans it out to every worker)
+// ---------------------------------------------------------------------------
+enum : int32_t {
+    kA2cStorageFailure = 1,
+    kA2cSchemaUpdate   = 2,
+};
+
+// ---------------------------------------------------------------------------
 // Ring capacities.  DDL is rare; a small ring is plenty.  Power-of-two payload.
 // ---------------------------------------------------------------------------
 inline constexpr int kAdminRequestRingBytes     = 1 << 20;  // 1 MiB (descriptor blobs)
@@ -279,6 +292,38 @@ inline AdminRoleMsg decodeAdminRole(const uint8_t* buf, std::size_t len) {
     m.leader   = buf[0] != 0;
     m.epoch    = getI32(buf + 1);
     m.leaderId = getI32(buf + 5);
+    return m;
+}
+
+// ---- SchemaUpdate (admin → control; F3 round 6, item 3) ----
+struct SchemaUpdateMsg {
+    int32_t              topicId = -1;
+    std::vector<uint8_t> blob;
+};
+
+/// Wire size of a SchemaUpdate message for `blobLen` descriptor bytes.
+[[nodiscard]] inline constexpr std::size_t schemaUpdateWireLen(std::size_t blobLen) noexcept {
+    return 4 + blobLen;
+}
+
+inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId,
+                               std::span<const uint8_t> blob) {
+    using namespace admin_wire;
+    const auto idx = ring.tryClaim(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()));
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    putI32(p, topicId);
+    if (!blob.empty()) std::memcpy(p + 4, blob.data(), blob.size());
+    ring.commit(idx);
+    return true;
+}
+
+inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
+    using namespace admin_wire;
+    SchemaUpdateMsg m;
+    if (len < 4) return m;
+    m.topicId = getI32(buf);
+    m.blob.assign(buf + 4, buf + len);
     return m;
 }
 

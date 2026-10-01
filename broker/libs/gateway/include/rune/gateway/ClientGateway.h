@@ -489,6 +489,9 @@ public:
     [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept {
         return maxProduceBatchBytes_;
     }
+    [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept {
+        return oversizeProduceRejectLogs_;
+    }
 
     // -----------------------------------------------------------------------
     // pendingAckCount — number of deferred acks=All entries waiting for HW.
@@ -1100,6 +1103,9 @@ private:
     // absurd/malformed length overrunning the worker ingress ring or a segment.
     // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
     std::size_t maxProduceBatchBytes_ = kMaxProduceBatchBytes;
+    // F3 round 6, item 2: oversize-reject log rate limiting (control thread only).
+    uint64_t oversizeProduceRejects_    = 0;
+    uint64_t oversizeProduceRejectLogs_ = 0;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.

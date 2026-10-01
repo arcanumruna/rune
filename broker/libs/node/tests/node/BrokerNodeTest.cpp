@@ -1222,7 +1222,14 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524226);
     EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 4194304u - kWorkerOpFramingFromCodec);
     EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524226u);
-    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 1 << 20) << "default fetch chunk unchanged";
+    // F3 round 6, item 1: the multi-node fetch/push chunk is bounded by the
+    // replication hard max too (a 1 MiB coalesced push over the 524226 B
+    // ceiling was dropped → 20 ms re-serve stall).  Single-node keeps 1 MiB.
+    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 524226);
+    {
+        NodeConfig single = makeSingleNodeConfig(dir);
+        EXPECT_EQ(userTopicMaxFetchBytes(single), 1 << 20);
+    }
 
     fs::create_directories(dir);
     EmbeddedDriverConfig dcfg = EmbeddedDriverConfig::fromNode(cfg, (dir / "aeron").string());
@@ -1278,6 +1285,92 @@ TEST(BrokerNodeRegression, EffectiveMaxBelowMinimumRefusesStartRegression) {
     EXPECT_TRUE(validateEffectiveMaxProduceBatch(cfg).has_value());
     cfg.maxProduceBatchBytes   = static_cast<int64_t>(kMinSaneMaxProduceBatchBytes);
     EXPECT_FALSE(validateEffectiveMaxProduceBatch(cfg).has_value());
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 6, item 6: heterogeneous LEGACY config — the leader's transport can
+// carry a batch the follower's worker ingress ring can never hold.  The
+// follower's AeronPartitionTransport drop path (FetchResponse → fitsIngressTail)
+// must log (rate-limited) and stay BOUNDED: one drop per leader serve (push,
+// then one re-serve per 20 ms resend window), never a per-cycle spin and never
+// an ABORT-retry loop that would wedge the subscription.  Simulated replica
+// clock; the yield only waits for real Aeron IO.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, HeterogeneousFollowerDropIsBoundedRegression) {
+    const fs::path dir = makeTempDataDir("hetero_");
+    fs::create_directories(dir);
+    NodeConfig ncfg = makeSingleNodeConfig(dir);
+    ncfg.aeronTermBufferBytes = 1 << 20;                 // leader ceiling ~131 KB
+    EmbeddedDriverConfig dcfg = EmbeddedDriverConfig::fromNode(ncfg, (dir / "aeron").string());
+    EmbeddedDriver driver(dcfg, DriverMode::Threaded);
+    aeron::Context ctx;
+    ctx.aeronDir(dcfg.dir);
+    auto aeron = aeron::Aeron::connect(ctx);
+
+    const std::string chanL = "aeron:udp?endpoint=127.0.0.1:40121";
+    const std::string chanF = "aeron:udp?endpoint=127.0.0.1:40122";
+    rune::replication::AeronPartitionTransport ldrT(aeron, chanL, 910, 1, ncfg.aeronTermBufferBytes, 4 << 20);
+    rune::replication::AeronPartitionTransport flwT(aeron, chanF, 910, 2, ncfg.aeronTermBufferBytes, 4 << 20);
+    ldrT.addPeer(2, chanF, 910);
+    flwT.addPeer(1, chanL, 910);
+
+    rune::replication::PartitionConfig pc;
+    pc.topicId = 0; pc.partitionId = 0; pc.minIsr = 1;
+    pc.replicaLagMaxMs = 1'000'000; pc.replicaLagMaxOffset = 1'000'000;
+    pc.fetchIntervalNs = 5'000'000LL; pc.isrCheckIntervalNs = 10'000'000LL;
+    pc.maxFetchBytes = 1 << 20; pc.pushOnAppend = true;
+    auto lc = pc; lc.selfId = 1;
+    auto fc = pc; fc.selfId = 2;
+    fs::create_directories(dir / "l"); fs::create_directories(dir / "f");
+    rune::storage::Log logL((dir / "l").string());
+    rune::storage::Log logF((dir / "f").string());
+    rune::replication::PartitionReplica leader(lc, rune::replication::Role::Leader, 1, {1, 2}, {1, 2}, &logL, &ldrT);
+    rune::replication::PartitionReplica follower(fc, rune::replication::Role::Follower, 1, {1, 2}, {1, 2}, &logF, &flwT);
+    follower.becomeFollower(1, 1);
+    ldrT.registerReplica(0, 0, &leader);
+    flwT.registerReplica(0, 0, &follower);
+
+    // The follower's worker ring (64 KiB → ~7.9 KB max tail) is SMALLER than
+    // what the leader's transport carries — the heterogeneous config.
+    rune::metadata::ShardRouter router(1);
+    WorkerPool pool(1, router, /*ingressRingBytes=*/64 * 1024);
+    pool.worker(0).setOwnedDirect({&follower});
+    flwT.setWorkerPool(&pool);
+
+    {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", std::string(20000, 'z'), 1000);   // fits the leader, never the follower ring
+        logL.append(b.build(), 0);
+    }
+    leader.onLeaderLogAppended();
+
+    int64_t sim = 1'000'000'000;
+    auto cycle = [&](int64_t step) {
+        sim += step;
+        (void)ldrT.poll(sim);
+        (void)flwT.poll(sim);
+        (void)leader.doWork(sim);
+        (void)pool.worker(0).doWork(sim);
+        pool.worker(0).drainReturn([](const WorkerReturn&) {});
+    };
+    // Phase 1: wait (real IO) until the first oversize frame reached the follower.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (flwT.unfittableApplyDropsForTest() == 0 && std::chrono::steady_clock::now() < deadline) {
+        cycle(100'000);                                  // 100 µs of replica time
+        std::this_thread::yield();
+    }
+    ASSERT_GE(flwT.unfittableApplyDropsForTest(), 1u) << "the oversize frame must be dropped, not applied";
+    const uint64_t d1 = flwT.unfittableApplyDropsForTest();
+
+    // Phase 2: 2000 cycles = 200 ms of replica time.  Drops are bounded by the
+    // leader's serve cadence (20 ms resend window → ≤ ~10 re-serves), NOT by
+    // the number of cycles (a spin would be ~2000).
+    for (int i = 0; i < 2000; ++i) cycle(100'000);
+    const uint64_t extra = flwT.unfittableApplyDropsForTest() - d1;
+    EXPECT_LE(extra, 12u) << "drops must be bounded by the re-serve cadence, not the cycle count";
+    EXPECT_EQ(follower.logEndOffset(), 0) << "the unfittable batch is never applied";
+
     std::error_code ec; fs::remove_all(dir, ec);
 }
 

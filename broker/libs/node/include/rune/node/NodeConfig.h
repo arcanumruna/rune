@@ -411,6 +411,12 @@ struct NodeConfig {
     //     per-message maximum, and the replication transport's hard per-message
     //     maximum minus its response framing overhead — see BrokerNode.cpp's
     //     effectiveMaxProduceBatchBytes()/validateExplicitMaxProduceBatch()).
+    //   F3 round 6: the effective max is a CLUSTER-WIDE constraint.  Shard
+    //   mode verifies it per replication plane (PlaneHello carries it; a
+    //   mismatch is Refused like a worker-count mismatch).  Legacy mode does
+    //   NOT verify it: aeronTermBufferBytes / workerIngressRingBytes /
+    //   replicationOutboundRingBytes / maxProduceBatchBytes MUST be identical
+    //   on every node (logged at startup).
     //     A SET value is a deliberate operator request for a LARGER (or
     //     smaller) ceiling than the derived default would give; BrokerNode::
     //     start() refuses to start (naming the exact numbers) if an explicit

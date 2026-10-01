@@ -210,6 +210,9 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] bool allResolved() const noexcept { return allResolved_; }
 
+    /// F3 round 6: frames dropped because they exceeded a pub's maxMessageLength.
+    [[nodiscard]] uint64_t oversizeDrops() const noexcept { return oversizeDrops_; }
+
     [[nodiscard]] bool hasPeer(rune::replication::NodeId peer) const noexcept
     {
         return findPub_(peer) != nullptr;
@@ -294,9 +297,12 @@ public:
         const std::size_t len = prefixLen + body.size();
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSendOnPub,
                                  static_cast<uint32_t>(len));
-        if (len > static_cast<std::size_t>(pub->maxMessageLength())) {
-            spdlog::error("WorkerReplicationTransport: drop oversized frame len={} max={}",
-                          len, pub->maxMessageLength());
+        if (len > static_cast<std::size_t>(pub->maxMessageLength())) [[unlikely]] {
+            // F3 round 6: counted + rate-limited (first, then every 1024th).
+            if (oversizeDrops_++ % 1024 == 0) {
+                spdlog::error("WorkerReplicationTransport: drop oversized frame len={} max={} "
+                              "(drops={})", len, pub->maxMessageLength(), oversizeDrops_);
+            }
             return -1;
         }
         if (len <= static_cast<std::size_t>(pub->maxPayloadLength())) {
@@ -322,17 +328,19 @@ private:
     // Zero-copy tryClaim for ≤ maxPayloadLength; offer() for larger frames.
     // Mirrors Worker::sendEncodedToPub_ (Worker.h:1064-1085) plus the
     // defence-in-depth maxMessageLength guard from AeronPartitionTransport::sendOnPub.
-    static int64_t sendOnPub_(aeron::ExclusivePublication& pub,
-                              const uint8_t* buf, std::size_t len) noexcept
+    int64_t sendOnPub_(aeron::ExclusivePublication& pub,
+                       const uint8_t* buf, std::size_t len) noexcept
     {
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSendOnPub,
                                  static_cast<uint32_t>(len));
         // Guard: offer() THROWS IllegalArgumentException if len > maxMessageLength.
-        // Drop and log — the follower will retry on the next fetch cycle.
-        if (len > static_cast<std::size_t>(pub.maxMessageLength())) {
-            spdlog::error("WorkerReplicationTransport::sendOnPub_: drop oversized frame "
-                          "len={} maxMessageLength={} — replication term too small",
-                          len, pub.maxMessageLength());
+        // Drop and log (rate-limited, F3 r6) — the follower retries on its next fetch.
+        if (len > static_cast<std::size_t>(pub.maxMessageLength())) [[unlikely]] {
+            if (oversizeDrops_++ % 1024 == 0) {
+                spdlog::error("WorkerReplicationTransport::sendOnPub_: drop oversized frame "
+                              "len={} maxMessageLength={} — replication term too small "
+                              "(drops={})", len, pub.maxMessageLength(), oversizeDrops_);
+            }
             return -1;
         }
 
@@ -370,6 +378,7 @@ private:
     }
 
     bool                           allResolved_ = false;
+    uint64_t                       oversizeDrops_ = 0;   // F3 r6: owner-worker-thread only
     std::array<PeerPub, kMaxPeers> pubs_{};
     std::size_t                    pubCount_    = 0;
 };
@@ -751,12 +760,20 @@ public:
 
     /// Startup only (before the worker runner starts).  `peers` = the remote
     /// node ids on this plane (at most kMaxHandshakePeers; extra ids ignored).
+    /// F3 round 6, item 6: also advertises — and requires every peer to match —
+    /// this node's effective max produce batch and worker ingress ring size
+    /// (the max-batch constraint is cluster-wide; a mismatch is treated exactly
+    /// like a worker-count mismatch: Refused).
     void enablePlaneHandshake(rune::replication::NodeId selfNodeId, int32_t selfWorkerCount,
-                              const std::vector<rune::replication::NodeId>& peers) noexcept
+                              const std::vector<rune::replication::NodeId>& peers,
+                              int64_t selfMaxProduceBatchBytes = 0,
+                              int32_t selfWorkerIngressRingBytes = 0) noexcept
     {
         hsEnabled_       = true;
         selfNodeId_      = selfNodeId;
         selfWorkerCount_ = selfWorkerCount;
+        selfMaxProduceBatchBytes_   = selfMaxProduceBatchBytes;
+        selfWorkerIngressRingBytes_ = selfWorkerIngressRingBytes;
         hsCount_         = 0;
         for (auto id : peers) {
             if (hsCount_ == kMaxHandshakePeers) break;
@@ -1049,7 +1066,9 @@ private:
     struct Unverified { int64_t lastHelloSentNs = kNeverNs; };
     struct Verified   { int32_t sessionId = 0; };
     struct Refused    { int32_t sessionId = 0; int32_t peerWorkerCount = 0; int32_t peerPlane = -1;
-                        int64_t lastHelloSentNs = kNeverNs; };
+                        int64_t lastHelloSentNs = kNeverNs;
+                        int64_t peerMaxProduceBatchBytes = 0;     // F3 r6 item 6
+                        int32_t peerWorkerIngressRingBytes = 0; };
     using PlaneState = std::variant<Unverified, Verified, Refused>;   // index == PeerPlaneState
     struct PeerPlane {
         rune::replication::NodeId id = -1;
@@ -1065,6 +1084,8 @@ private:
         m.workerId    = workerId_;
         m.workerCount = selfWorkerCount_;
         m.flags       = flags;
+        m.maxProduceBatchBytes   = selfMaxProduceBatchBytes_;
+        m.workerIngressRingBytes = selfWorkerIngressRingBytes_;
         alignas(8) uint8_t buf[rune::replication::PlaneHelloMsg::TOTAL_SIZE];
         rune::replication::PlaneHelloMsg::encode(buf, m);
         return pubReg_.sendControlToPeer(peer, buf, sizeof(buf));
@@ -1095,12 +1116,25 @@ private:
             return;
         }
         const bool wasHelloTarget = !std::holds_alternative<Verified>(p->st);
-        if (h.workerCount != selfWorkerCount_ || h.workerId != workerId_) {
+        const bool countMismatch = h.workerCount != selfWorkerCount_ || h.workerId != workerId_;
+        const bool batchMismatch = h.maxProduceBatchBytes != selfMaxProduceBatchBytes_ ||
+                                   h.workerIngressRingBytes != selfWorkerIngressRingBytes_;
+        if (countMismatch || batchMismatch) {
             // Keep the retry clock across Refused -> Refused (hellos keep flowing).
             int64_t last = kNeverNs;
             if (auto* u = std::get_if<Unverified>(&p->st)) last = u->lastHelloSentNs;
             else if (auto* r = std::get_if<Refused>(&p->st)) last = r->lastHelloSentNs;
-            if ((refusals_ % kLogEvery) == 0)
+            if ((refusals_ % kLogEvery) == 0 && !countMismatch)
+                spdlog::critical(
+                    "WorkerReplicationTransport[{}]: the max produce batch is a CLUSTER-WIDE "
+                    "constraint — node {} advertises effective max produce batch {} B / worker "
+                    "ingress ring {} B but this node {} has {} B / {} B; a batch one node accepts "
+                    "may be unreplicable to the other.  Treating node {} as UNREACHABLE on this "
+                    "plane; make the term/ring/max-batch config homogeneous and restart it — the "
+                    "plane heals on its next matching hello ({} refusal(s) so far)", workerId_,
+                    h.nodeId, h.maxProduceBatchBytes, h.workerIngressRingBytes, selfNodeId_,
+                    selfMaxProduceBatchBytes_, selfWorkerIngressRingBytes_, h.nodeId, refusals_ + 1);
+            else if ((refusals_ % kLogEvery) == 0)
                 spdlog::critical(
                     "WorkerReplicationTransport[{}]: shard mode REQUIRES a symmetric worker count — "
                     "node {} runs RUNE_WORKERS={} (its plane {}) but this node {} runs {} (plane {}). "
@@ -1109,7 +1143,8 @@ private:
                     "({} refusal(s) so far)", workerId_, h.nodeId, h.workerCount, h.workerId,
                     selfNodeId_, selfWorkerCount_, workerId_, h.nodeId, refusals_ + 1);
             ++refusals_;
-            p->st = Refused{sessionId, h.workerCount, h.workerId, last};
+            p->st = Refused{sessionId, h.workerCount, h.workerId, last,
+                            h.maxProduceBatchBytes, h.workerIngressRingBytes};
             if (!wasHelloTarget) ++needHello_;
             pubReg_.setPeerBlocked(p->id, true);
         } else {
@@ -1207,6 +1242,8 @@ private:
     uint64_t                  droppedUnverified_ = 0;
     rune::replication::NodeId selfNodeId_        = -1;
     int32_t                   selfWorkerCount_   = 0;
+    int64_t                   selfMaxProduceBatchBytes_   = 0;   // F3 r6 item 6
+    int32_t                   selfWorkerIngressRingBytes_ = 0;
     bool                      hsEnabled_         = false;
 };
 

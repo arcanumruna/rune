@@ -317,6 +317,39 @@ static std::vector<uint8_t> makeBatchOfExactSizeGw(std::size_t target) {
     return {};
 }
 
+// F3 round 6, item 2: the gateway's oversize-produce reject log is rate-
+// limited (first, then every 1024th); every batch is still rejected.
+TEST(ClientGatewayHotPath, OversizeRejectLogRateLimitedRegression)
+{
+    const fs::path dir = makeTempDir();
+    using rune::node::TopicSpec;
+    std::vector<TopicSpec> specs;
+    { TopicSpec ts; ts.name = "events"; ts.partitionCount = 1; ts.topicId = 0; specs.push_back(ts); }
+    rune::gateway::TopicRegistry registry(specs, dir.string());
+    int rejects = 0;
+    ClientGateway::TestEgressFn egress = [&rejects](const uint8_t* buf, std::size_t len) -> int64_t {
+        auto r = pc::ProduceResponse::decode(buf, len);
+        if (r && r->errorCode == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) ++rejects;
+        return 1;
+    };
+    ClientGateway gw = ClientGateway::makeForTest(egress, 1);
+    gw.setTopicRegistry(&registry);
+    gw.setMaxProduceBatchBytes(256);
+    const int64_t sid = gw.injectTestSession(0);
+    std::vector<uint8_t> batch(257, 0xAB);
+    pc::Produce prod;
+    prod.sessionId = sid; prod.correlationId = 1; prod.topicId = 0; prod.partition = 0;
+    prod.partitionKnown = 1; prod.acks = 0; prod.producerId = -1; prod.key = {};
+    prod.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> frame(prod.encodedSize());
+    prod.encode(frame.data());
+    for (int i = 0; i < 2100; ++i) gw.applyProduceForTest(frame.data(), frame.size());
+    EXPECT_EQ(rejects, 2100);
+    EXPECT_EQ(gw.oversizeProduceRejectLogsForTest(), 3u) << "logged at #1, #1025, #2049";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
 TEST(ClientGatewayHotPath, ProduceBatchExactEffectiveMaxBoundaryRegression)
 {
     const fs::path dir = makeTempDir();

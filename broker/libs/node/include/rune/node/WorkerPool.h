@@ -104,6 +104,9 @@ public:
                 workers_.back()->setCoreId(static_cast<int>(workerCoreBase + i));
             }
         }
+        // F3 round 6, item 4: every worker is built with the SAME ingress ring
+        // size, so the replicated-frame fit check is one pool-level compare.
+        maxIngressTail_ = workers_.empty() ? 0 : workers_.front()->maxOpTailBytes();
     }
 
     // Non-copyable; movable (runners not yet started at construction).
@@ -190,7 +193,22 @@ public:
                 op.type         = WorkerOp::Type::SetOwnership;
                 op.ownedSet     = std::move(perWorker[i]);
                 op.ownershipGen = gen;
-                ownershipDelivered_[i] = workers_[i]->tryEnqueueOp(std::move(op));
+                const std::size_t setBytes = op.ownedSet.size() * sizeof(uintptr_t);
+                const EnqueueResult r = workers_[i]->tryEnqueueOp(std::move(op));
+                if (r.tooLarge()) [[unlikely]] {
+                    // F3 round 6, item 5: an owned set that can NEVER fit the
+                    // worker ingress ring is not back-pressure — retrying it
+                    // forever would silently freeze ownership.  Fail-stop like
+                    // the F7 invariant (the control loop halts the broker).
+                    const std::string what =
+                        "WorkerPool: SetOwnership for worker " + std::to_string(i) + " (" +
+                        std::to_string(setBytes) + " B owned set) can never fit the worker "
+                        "ingress ring (max tail " + std::to_string(maxIngressTail_) +
+                        " B) — raise RUNE_WORKER_INGRESS_RING_BYTES";
+                    spdlog::critical("{}", what);
+                    throw std::logic_error(what);
+                }
+                ownershipDelivered_[i] = static_cast<bool>(r);
                 if (!ownershipDelivered_[i]) allDelivered = false;  // full ring — retry next reconcile
             }
         }
@@ -238,7 +256,8 @@ public:
         WorkerOp own;
         own.type = WorkerOp::Type::SetOwnership;
         own.ownedSet = std::move(remaining);
-        return from.tryEnqueueOp(std::move(demote)) && from.tryEnqueueOp(std::move(own));
+        return static_cast<bool>(from.tryEnqueueOp(std::move(demote))) &&
+               static_cast<bool>(from.tryEnqueueOp(std::move(own)));
     }
     static bool grantReplicaForTestMigration(Worker& to, rune::replication::PartitionReplica* r,
                                              Worker::OwnedSet owned,
@@ -251,7 +270,8 @@ public:
         lead.type = WorkerOp::Type::BecomeLeader;
         lead.topicId = r->topicId(); lead.partition = static_cast<int32_t>(r->partitionId());
         lead.replica = r; lead.roleEpoch = epoch; lead.isr = std::move(isr);
-        return to.tryEnqueueOp(std::move(own)) && to.tryEnqueueOp(std::move(lead));
+        return static_cast<bool>(to.tryEnqueueOp(std::move(own))) &&
+               static_cast<bool>(to.tryEnqueueOp(std::move(lead)));
     }
 
     int doWork(int64_t nowNs) {
@@ -275,14 +295,17 @@ public:
     // forward variable-size payloads (the replication transport's
     // ApplyReplicated / ReconcileFetchResp) check this BEFORE building the op
     // so an unfittable frame is dropped, never retried forever.
-    [[nodiscard]] bool fitsIngressTail(int32_t topicId, int32_t partition,
-                                       std::size_t tailLen) {
-        const int32_t wid = ownerWorkerId(topicId, partition);
-        return workers_[static_cast<std::size_t>(wid)]->fitsIngressTail(tailLen);
+    // F3 round 6, item 4: ONE compare against the pool-level cached max (all
+    // workers share one ring size) — no per-frame owner lookup.
+    [[nodiscard]] bool fitsIngressTail(std::size_t tailLen) const noexcept {
+        return tailLen <= maxIngressTail_;
     }
+    [[nodiscard]] std::size_t maxIngressTail() const noexcept { return maxIngressTail_; }
 
-    [[nodiscard]] bool tryEnqueueOp(int32_t topicId, int32_t partition,
-                                    WorkerOp op) {
+    // F3 round 6, item 5: returns {Ok, Full, TooLarge}.  "SetOwnership still
+    // undelivered" (Task 10 ordering) is back-pressure → Full.
+    EnqueueResult tryEnqueueOp(int32_t topicId, int32_t partition,
+                               WorkerOp op) {
         // Task 10 fix 3 (I2): never route an op ahead of the SetOwnership that
         // governs it.  Reconcile inline when the registry moved (control thread:
         // every caller of this method runs there), and back-pressure (false —
@@ -291,7 +314,8 @@ public:
         if (registry_ && registry_->generation() != lastGeneration_) assignFromRegistry(*registry_);
         const int32_t wid = ownerWorkerId(topicId, partition);
         const auto w = static_cast<std::size_t>(wid);
-        if (w < ownershipDelivered_.size() && !ownershipDelivered_[w]) [[unlikely]] return false;
+        if (w < ownershipDelivered_.size() && !ownershipDelivered_[w]) [[unlikely]]
+            return {EnqueueStatus::Full};
         return workers_[w]->tryEnqueueOp(std::move(op));
     }
 
@@ -423,6 +447,8 @@ private:
     // Shared-nothing: true once per-worker AgentRunners are started. Before this,
     // ownership is set directly (single-threaded); after, via SetOwnership ring ops.
     bool runnersStarted_ = false;
+    // F3 round 6, item 4: max WorkerOp tail of every worker's ingress ring.
+    std::size_t maxIngressTail_ = 0;
 
     // E2 inc2b: per-worker idle strategies and agent runners.
     // Populated by startRunners(); cleared by stopAndJoinRunners().

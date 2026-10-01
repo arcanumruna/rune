@@ -159,7 +159,7 @@ struct WorkerHarness {
         op.durabilityTier   = tier;
         op.recordBatchBytes = std::move(batch);
 
-        bool ok = worker->tryEnqueueOp(std::move(op));
+        bool ok = static_cast<bool>(worker->tryEnqueueOp(std::move(op)));
         ASSERT_TRUE(ok) << "Worker ingress ring full — test harness error";
     }
 
@@ -534,7 +534,7 @@ TEST(BackPressure, WorkerIngressFullReturnsFalseNoFalseOK) {
         op.durabilityTier   = 0; // immediate ack (tier=0: Leader)
         op.recordBatchBytes = std::move(batch);
 
-        bool ok = h.worker->tryEnqueueOp(std::move(op));
+        bool ok = static_cast<bool>(h.worker->tryEnqueueOp(std::move(op)));
         if (!ok) {
             gotFull = true;
             break;

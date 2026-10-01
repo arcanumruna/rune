@@ -1244,6 +1244,13 @@ void runExactEffectiveMaxReplicates(bool perWorker) {
     for (auto& n : nodes) {
         ASSERT_EQ(n->gatewayForTest()->maxProduceBatchBytes(), effMax)
             << "the gateway enforces exactly the derived effective max";
+        // F3 round 6, item 7: every worker enforces the SAME value on its
+        // per-worker ingress path (installed before the runners start; never
+        // written afterwards).
+        for (int32_t w = 0; w < cfgs[0].workerCount; ++w) {
+            ASSERT_NE(n->workerForTest(w), nullptr);
+            EXPECT_EQ(n->workerForTest(w)->maxProduceBatchBytes(), effMax) << "worker " << w;
+        }
     }
 
     // Append ONE batch of exactly effMax bytes on the leader's owning thread

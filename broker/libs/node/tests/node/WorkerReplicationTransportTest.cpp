@@ -1148,8 +1148,10 @@ TEST(WorkerReplicationTransportRegression, GatherSendIsByteIdenticalForLargeReco
 // ===========================================================================
 namespace {
 using PS = SharedTestTransport::PeerPlaneState;
-std::vector<uint8_t> helloFrame(int32_t nodeId, int32_t workerId, int32_t workerCount, int32_t flags) {
+std::vector<uint8_t> helloFrame(int32_t nodeId, int32_t workerId, int32_t workerCount, int32_t flags,
+                                int64_t maxProduceBatchBytes = 0, int32_t workerIngressRingBytes = 0) {
     PlaneHelloMsg m; m.nodeId = nodeId; m.workerId = workerId; m.workerCount = workerCount; m.flags = flags;
+    m.maxProduceBatchBytes = maxProduceBatchBytes; m.workerIngressRingBytes = workerIngressRingBytes;
     std::vector<uint8_t> f(PlaneHelloMsg::TOTAL_SIZE);
     PlaneHelloMsg::encode(f.data(), m);
     return f;
@@ -1286,6 +1288,48 @@ TEST(ShardPlaneRegression, RefusedPeerHealsOnMatchingHelloFromNewSession)
     h.transport->sendFetchResponse(1, emptyResp());
     EXPECT_EQ(h.pubs.offersTo(1).size(), before + 1) << "data flows again after healing";
     EXPECT_EQ(h.transport->driveHandshake(INT64_MAX / 2), 0);
+}
+
+// F3 round 6, item 6: the effective max produce batch is per NODE but the
+// constraint is cluster-wide (a follower must be able to carry what the leader
+// accepted).  In shard mode each plane advertises its node's effective max
+// produce batch and worker ingress ring size in PlaneHello; a mismatch is
+// treated EXACTLY like a worker-count mismatch: Refused (same SM; it heals
+// only on a later MATCHING hello, never silently).
+TEST(ShardPlaneRegression, MaxProduceBatchMismatchRefusedRegression)
+{
+    auto h = makeTestPair(/*workerId=*/0, {1, 2});
+    h.transport->enablePlaneHandshake(/*self=*/0, /*workers=*/2, {1, 2},
+                                      /*maxProduceBatchBytes=*/524226,
+                                      /*workerIngressRingBytes=*/32 * 1024 * 1024);
+    // Our own hello advertises both values.
+    EXPECT_EQ(h.transport->driveHandshake(1'000), 2);
+    const auto mine = decodeHello(h.pubs.offersTo(1)[0]);
+    EXPECT_EQ(mine.maxProduceBatchBytes, 524226);
+    EXPECT_EQ(mine.workerIngressRingBytes, 32 * 1024 * 1024);
+    // Peer 1 matches → Verified.
+    auto ok = helloFrame(1, 0, 2, 0, 524226, 32 * 1024 * 1024);
+    h.transport->injectFrameForTest(ok.data(), ok.size(), 11);
+    int n = 0;
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_EQ(h.transport->peerPlaneState(1), SharedTestTransport::PeerPlaneState::Verified);
+    // Peer 2 has a different effective max (heterogeneous term/ring config) → Refused.
+    auto bad = helloFrame(2, 0, 2, 0, 1 << 20, 32 * 1024 * 1024);
+    h.transport->injectFrameForTest(bad.data(), bad.size(), 22);
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_EQ(h.transport->peerPlaneState(2), SharedTestTransport::PeerPlaneState::Refused);
+    EXPECT_EQ(h.transport->planeRefusals(), 1u);
+}
+
+TEST(ShardPlaneRegression, WorkerIngressRingMismatchRefusedRegression)
+{
+    auto h = makeTestPair(/*workerId=*/0, {1});
+    h.transport->enablePlaneHandshake(0, 2, {1}, 524226, 32 * 1024 * 1024);
+    auto bad = helloFrame(1, 0, 2, 0, 524226, 8 * 1024 * 1024);
+    h.transport->injectFrameForTest(bad.data(), bad.size(), 5);
+    int n = 0;
+    h.transport->poll(8, CountingDispatch{&n});
+    EXPECT_TRUE(h.transport->planeRefused());
 }
 
 TEST(ShardPlaneRegression, PlaneIndexMismatchRefused)

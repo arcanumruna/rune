@@ -114,6 +114,17 @@ namespace rune::node {
 // read-rework SBE-B: the worker ring codec now uses the SBE-generated flyweights.
 namespace sbe = rune::protocol::internal::sbe;
 
+// F3 round 6, item 5: tryEnqueueOp outcome.  Full = back-pressure (retry next
+// cycle); TooLarge = the op can NEVER fit this worker's ingress ring (the
+// caller must not retry it — drop/refuse with an error naming the size).
+enum class EnqueueStatus : uint8_t { Ok, Full, TooLarge };
+struct [[nodiscard]] EnqueueResult {
+    EnqueueStatus status = EnqueueStatus::Ok;
+    constexpr explicit operator bool() const noexcept { return status == EnqueueStatus::Ok; }
+    [[nodiscard]] constexpr bool full() const noexcept     { return status == EnqueueStatus::Full; }
+    [[nodiscard]] constexpr bool tooLarge() const noexcept { return status == EnqueueStatus::TooLarge; }
+};
+
 class Worker final : public rune::consensus::Agent {
 public:
     // Non-owning pointer set published as an immutable snapshot.
@@ -414,6 +425,8 @@ public:
     // -----------------------------------------------------------------------
     void setMaxProduceBatchBytes(std::size_t bytes) noexcept { maxProduceBatchBytes_ = bytes; }
     [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept { return maxProduceBatchBytes_; }
+    [[nodiscard]] uint64_t oversizeProduceRejectsForTest() const noexcept { return oversizeProduceRejects_; }
+    [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept { return oversizeProduceRejectLogs_; }
 
     /// Test seam: run one per-worker ingress Produce frame through the real
     /// handler (no Aeron subscription needed).
@@ -421,7 +434,7 @@ public:
         return handleWorkerIngressFrame_(data, len, nowNs);
     }
 
-    [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
+    EnqueueResult tryEnqueueOp(WorkerOp op) {
         // SBE wrap-in-place: reserve the exact ring slot (computeLength — no
         // hand-rolled size), then encode the WorkerOp DIRECTLY into the claimed
         // buffer via the SBE flyweight (no intermediate struct, no memcpy).
@@ -487,7 +500,7 @@ public:
                               static_cast<int>(op.type), tailLen, maxOpTailBytes(),
                               oversizeOpRejects_);
             }
-            return false;
+            return {EnqueueStatus::TooLarge};
         }
 
         // Total frame = SBE MessageHeader (8) + block + varData.  computeLength()
@@ -496,7 +509,7 @@ public:
             sbe::MessageHeader::encodedLength() + sbe::WorkerOp::computeLength(tailLen);
         const aeron::util::index_t idx =
             ingress_.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
-        if (idx < 0) return false;  // ring full — back-pressure
+        if (idx < 0) return {EnqueueStatus::Full};  // ring full — back-pressure
 
         sbe::WorkerOp enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(ingress_.base() + idx), 0, n);
@@ -548,7 +561,7 @@ public:
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
         ingress_.commit(idx);
-        return true;
+        return {EnqueueStatus::Ok};
     }
 
     // -----------------------------------------------------------------------
@@ -2623,6 +2636,9 @@ private:
     // tryEnqueueOp touches it; single producer per SPSC ring).
     std::size_t maxProduceBatchBytes_ = 0;
     uint64_t    oversizeOpRejects_    = 0;
+    // F3 round 6, item 2: worker-thread-owned reject counters (per-worker ingress).
+    uint64_t    oversizeProduceRejects_    = 0;
+    uint64_t    oversizeProduceRejectLogs_ = 0;
     // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
     // default so routed replication ops / acks don't queue behind a tiny cap).
     int32_t ingressDrainLimit_ = 1024;  // RUNE_WORKER_INGRESS_DRAIN_LIMIT
@@ -3511,10 +3527,15 @@ private:
         // bounds it.  One compare; covers idempotent/transactional produce too
         // (same frame, same handler).  Rejected loudly, never appended.
         if (rbSpan.size() > maxProduceBatchBytes_) [[unlikely]] {
-            spdlog::warn("Worker {}: WorkerIngress: Produce batch too large ({} > {}) "
-                         "topicId={} partition={}; rejected (MessageTooLarge)",
-                         workerId_, rbSpan.size(), maxProduceBatchBytes_,
-                         msg.topicId, msg.partition);
+            // F3 round 6, item 2: rate-limited (first, then every 1024th) —
+            // worker-thread-owned counter, same convention as oversizeOpRejects_.
+            if (oversizeProduceRejects_++ % 1024 == 0) {
+                ++oversizeProduceRejectLogs_;
+                spdlog::warn("Worker {}: WorkerIngress: Produce batch too large ({} > {}) "
+                             "topicId={} partition={}; rejected (MessageTooLarge, rejects={})",
+                             workerId_, rbSpan.size(), maxProduceBatchBytes_,
+                             msg.topicId, msg.partition, oversizeProduceRejects_);
+            }
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
             enqueueReturn_(ret);
             return 1;

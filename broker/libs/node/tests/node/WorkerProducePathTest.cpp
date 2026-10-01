@@ -697,19 +697,45 @@ TEST(WorkerProduceRegression, OversizeEnqueueNeverThrowsRegression) {
         return op;
     };
     bool ok = true;
-    EXPECT_NO_THROW(ok = worker.tryEnqueueOp(produceOp(kExpectedTail + 1)));
+    EXPECT_NO_THROW(ok = static_cast<bool>(worker.tryEnqueueOp(produceOp(kExpectedTail + 1))));
     EXPECT_FALSE(ok) << "an oversize Produce op must be refused, not thrown";
 
     WorkerOp apply;
     apply.type = WorkerOp::Type::ApplyReplicated;
     apply.replicatedPayload.records.assign(kExpectedTail + 1, 0xCD);
     ok = true;
-    EXPECT_NO_THROW(ok = worker.tryEnqueueOp(std::move(apply)));
+    EXPECT_NO_THROW(ok = static_cast<bool>(worker.tryEnqueueOp(std::move(apply))));
     EXPECT_FALSE(ok) << "an oversize ApplyReplicated op must be refused, not thrown";
 
     ok = false;
-    EXPECT_NO_THROW(ok = worker.tryEnqueueOp(produceOp(kExpectedTail)));
+    EXPECT_NO_THROW(ok = static_cast<bool>(worker.tryEnqueueOp(produceOp(kExpectedTail))));
     EXPECT_TRUE(ok) << "exactly the max tail must fit the ring";
+}
+
+// F3 round 6, item 2: the per-worker oversize-produce reject log is rate-
+// limited (first, then every 1024th) — a client spamming oversize batches must
+// not flood the log.  Every frame is still rejected with MessageTooLarge.
+TEST(WorkerProduceRegression, OversizeRejectLogRateLimitedRegression) {
+    TempDir dir("f3r6_ratelimit_");
+    rune::storage::Log log(dir.path.string());
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    worker.setMaxProduceBatchBytes(256);
+    const auto over  = makeBatchOfExactSize(257);
+    const auto frame = encodeProduceFrameIdem(1, over, -1);
+    int rejects = 0;
+    for (int i = 0; i < 2100; ++i) {
+        (void)worker.handleWorkerIngressFrameForTest(frame.data(), frame.size(), 1);
+        worker.drainReturn([&](const WorkerReturn& r) {
+            if (r.errorCode == static_cast<int16_t>(pc::ErrorCode::MessageTooLarge)) ++rejects;
+        });
+    }
+    EXPECT_EQ(rejects, 2100) << "every oversize frame is rejected";
+    EXPECT_EQ(worker.oversizeProduceRejectsForTest(), 2100u);
+    EXPECT_EQ(worker.oversizeProduceRejectLogsForTest(), 3u) << "logged at #1, #1025, #2049";
+    EXPECT_EQ(log.logEndOffset(), 0);
 }
 
 } // namespace

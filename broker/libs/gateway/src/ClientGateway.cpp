@@ -1475,9 +1475,15 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // silently drop.  The zero-copy append path has no fixed scratch cap anymore;
     // this bound only protects the worker ingress ring / log segment from an
     // absurd or malformed length.  The client caps its batch wire-size below this.
-    if (batchLen > maxProduceBatchBytes_) {
-        spdlog::warn("ClientGateway: Produce batch too large ({} > {}); rejected (MessageTooLarge)",
-                     batchLen, maxProduceBatchBytes_);
+    if (batchLen > maxProduceBatchBytes_) [[unlikely]] {
+        // F3 round 6, item 2: rate-limited (first, then every 1024th) —
+        // control-thread-owned counter (single-writer).
+        if (oversizeProduceRejects_++ % 1024 == 0) {
+            ++oversizeProduceRejectLogs_;
+            spdlog::warn("ClientGateway: Produce batch too large ({} > {}); rejected "
+                         "(MessageTooLarge, rejects={})",
+                         batchLen, maxProduceBatchBytes_, oversizeProduceRejects_);
+        }
         sendResp(pc::ErrorCode::MessageTooLarge, partition, 0);
         return;
     }
@@ -1731,7 +1737,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // (back-pressure). In the cooperative single-thread model, the ring drains
         // on every duty cycle, so this should rarely be full. If it is full, we
         // send an Internal error (the same outcome as if the append had failed).
-        if (!workerPool_->tryEnqueueOp(msg.topicId, partition, std::move(op))) {
+        const rune::node::EnqueueResult er =
+            workerPool_->tryEnqueueOp(msg.topicId, partition, std::move(op));
+        if (er.tooLarge()) [[unlikely]] {
+            // F3 round 6, item 5: unreachable while the effective max (which
+            // includes the worker ring tail) is installed — never "ring full".
+            sendResp(pc::ErrorCode::MessageTooLarge, partition, 0);
+        } else if (!er) {
             spdlog::warn("ClientGateway: worker ring full for topicId={} partition={}; "
                          "ProduceResponse Internal (back-pressure)", msg.topicId, partition);
             sendResp(pc::ErrorCode::Internal, partition, 0);

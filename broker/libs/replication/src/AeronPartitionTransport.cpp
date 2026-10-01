@@ -275,17 +275,19 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
         isbe::MessageHeader::encodedLength() + isbe::OutboundFrame::computeLength(payloadLen);
     // Oversized guard (identical policy to enqueueOutbound): a frame beyond the
     // ring's maxMsgLength is a caller cap bug — reject as retriable back-pressure.
+    // F3 round 6: unreachable by construction — every FetchResponse/push is
+    // capped at maxFetchResponseBytes() (which includes this envelope) before it
+    // gets here.  This runs on ANY worker thread (multi-producer), so it keeps
+    // no counter (no shared state); the log is the backstop.
     if (frameLen > outboundRing_.maxMsgLength()) {
         spdlog::error(
             "AeronPartitionTransport::enqueueFetchResponse: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++outboundRingFullCount_;
         return false;
     }
     const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
     if (idx < 0) {                          // full ring → back-pressure, nothing committed
-        ++outboundRingFullCount_;
         return false;
     }
     char* slot = reinterpret_cast<char*>(outboundRing_.base() + idx);
@@ -349,7 +351,6 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
             "AeronPartitionTransport::enqueueOutbound: framed message {} B exceeds "
             "outbound ring maxMsgLength {} B (target={}); dropping (caller must cap)",
             frameLen, outboundRing_.maxMsgLength(), targetNodeId);
-        ++outboundRingFullCount_;
         return false;
     }
     // tryClaim returns a NEGATIVE index on a full ring → BACK-PRESSURE: bump the
@@ -357,7 +358,6 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
     // The caller treats the skipped send as retriable (the follower re-fetches).
     const aeron::util::index_t idx = outboundRing_.tryClaim(frameLen);
     if (idx < 0) {
-        ++outboundRingFullCount_;
         return false;
     }
     isbe::OutboundFrame enc;
@@ -620,8 +620,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
             // worker's ingress ring must be DROPPED (the follower re-fetches;
             // BrokerNode caps fetch maxBytes to the worker ring), never
             // ABORT-retried forever and never thrown out of tryClaim().
-            if (!workerPool_->fitsIngressTail(resp.topicId, resp.partition,
-                                              resp.records.size())) [[unlikely]] {
+            if (!workerPool_->fitsIngressTail(resp.records.size())) [[unlikely]] {
                 if (unfittableApplyDrops_++ % 1024 == 0) {
                     spdlog::error("AeronPartitionTransport: FetchResponse records {} B do not fit "
                                   "the worker ingress ring (topicId={} partition={}); dropped "
@@ -648,8 +647,10 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
                     resp.records.data(),
                     resp.records.data() + resp.records.size());
             }
-            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition,
-                                           std::move(op))) {
+            const auto er = workerPool_->tryEnqueueOp(resp.topicId, resp.partition,
+                                                      std::move(op));
+            if (er.tooLarge()) [[unlikely]] return Action::CONTINUE;   // never fits: drop (pre-checked above)
+            if (!er) {
                 // Worker ring full → back-pressure: leave unconsumed, retry next cycle.
                 // The records span still lives in the term buffer (fragment not
                 // consumed), so the re-delivered fragment re-copies correctly. No drop.
@@ -734,8 +735,7 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
         // leaderState_.setLeaderLogEndOffset + recomputeHw).
         // Copy records bytes before returning from the Aeron callback (buffer lifetime).
         if (workerPool_ && resp.topicId >= 0) {
-            if (!workerPool_->fitsIngressTail(resp.topicId, resp.partition,
-                                              resp.records.size())) [[unlikely]] {
+            if (!workerPool_->fitsIngressTail(resp.records.size())) [[unlikely]] {
                 if (unfittableApplyDrops_++ % 1024 == 0) {
                     spdlog::error("AeronPartitionTransport: reconcile response records {} B do "
                                   "not fit the worker ingress ring (topicId={} partition={}); "
@@ -761,7 +761,9 @@ aeron::ControlledPollAction AeronPartitionTransport::onFragment(
                     resp.records.data(),
                     resp.records.data() + resp.records.size());
             }
-            if (!workerPool_->tryEnqueueOp(resp.topicId, resp.partition, std::move(op))) {
+            const auto er = workerPool_->tryEnqueueOp(resp.topicId, resp.partition, std::move(op));
+            if (er.tooLarge()) [[unlikely]] return Action::CONTINUE;   // never fits: drop (pre-checked above)
+            if (!er) {
                 // Worker ring full → back-pressure: leave unconsumed, retry next cycle.
                 return Action::ABORT;
             }

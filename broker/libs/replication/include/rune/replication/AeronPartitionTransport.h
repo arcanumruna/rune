@@ -211,6 +211,10 @@ public:
     /// dropped at the pub layer).
     [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept override;
 
+    /// F3 round 6: replicated-records frames dropped because they can never fit
+    /// the owning worker's ingress ring (heterogeneous config).  Control thread.
+    [[nodiscard]] uint64_t unfittableApplyDropsForTest() const noexcept { return unfittableApplyDrops_; }
+
     // -----------------------------------------------------------------------
     // Duty-cycle step
     // -----------------------------------------------------------------------
@@ -288,8 +292,8 @@ private:
     // ManyToOneRingBuffer via IngressRing — MPSC, lock-free).  The CONTROL thread
     // drains the ring in poll() and does the actual peers_/pub offers.
     //
-    // Back-pressure: on a full ring, enqueueOutbound() returns false and bumps
-    // outboundRingFullCount_ — the send is skipped (NOT silently "succeeded").
+    // Back-pressure: on a full ring, enqueueOutbound() returns false — the send
+    // is skipped (NOT silently "succeeded").
     // Replication sends are retriable (follower re-requests / leader re-responds
     // next cycle), so skip-and-retry is the correct policy here.
     // -----------------------------------------------------------------------
@@ -391,9 +395,9 @@ private:
     // safe to read from any thread.
     int32_t termMaxMessageLength_ = 0;
 
-    // Back-pressure observability: bumped when the outbound ring is full and a
-    // (retriable) send had to be skipped. Control-thread reads for logging.
-    uint64_t outboundRingFullCount_ = 0;
+    // F3 round 6: the former outboundRingFullCount_ was a write-only counter
+    // bumped from EVERY worker thread (multi-producer ring) — a data race with
+    // no reader; removed (back-pressure is signalled by enqueue* returning false).
 
     // F3 round 5, item I1: replicated-records frames dropped because they can
     // never fit the owning worker's ingress ring (control-thread only).
