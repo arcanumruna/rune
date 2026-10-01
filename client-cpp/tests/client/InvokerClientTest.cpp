@@ -614,18 +614,29 @@ TEST(InvokerClient, ProducerOutlivesClientNoUseAfterFreeRegression) {
 // steady_clock on either side) would misbehave immediately and obviously.
 // ---------------------------------------------------------------------------
 
-// fix3 I2: this test must actually be ABLE to detect the wiring regression.
-// The previous version drained the (tiny) ring on the very first doWork()
-// call, so the blocking send succeeded in well under a millisecond of REAL
-// time regardless of which clock sendBlocking's reader used — it passed even
-// with setClockForTesting's wiring removed (confirmed: see the fix3 report).
-// Fixed by deliberately holding off ANY doWork() call — nothing drains this
-// ring and the injected heartbeat is never republished — for LONGER than
-// agentLivenessTimeoutMs in REAL wall-clock time. A correctly-wired reader
-// uses the SAME injected (frozen) clock for "now", so its gap against the
-// heartbeat cannot grow no matter how much real time passes. A reader that
-// fell back to real steady_clock reads real elapsed time directly and WOULD
-// throw well within that real hold.
+// fix4: no sleep_for anywhere (tests never sleep/spin to pass time). The
+// fix3 version held off draining for 150ms of REAL wall-clock time to force
+// a real reader/writer gap — effective, but a forbidden sleep.
+//
+// Redesigned to need NO real-time gap at all: agentLivenessTimeoutMs is set
+// to 1 — the smallest POSITIVE unit the ms-granularity config allows. (0 was
+// tried first: it works for the "stays frozen, never throws" phase below, but
+// then makes the later "finish draining" phase itself flaky — the instant the
+// clock resumes advancing, there is an inherent, unavoidable microseconds-
+// scale window between advancing it and this test's own doWork() call
+// republishing the heartbeat at the new value, and a ZERO-tolerance
+// threshold has no slack for that window even in CORRECTLY wired code. 1 ms
+// is ample slack for that real-world microseconds-scale window while still
+// being far smaller than any realistic real-steady_clock fallback delay.)
+// With the injected clock FROZEN and a FRESH heartbeat just published at that
+// same frozen value, a correctly-wired reader's gap is EXACTLY 0 forever
+// (`0 > 1ms-in-ns` is false, so it never throws, no matter how many times or
+// how long it is checked). A reader that wrongly fell back to real
+// steady_clock reads real elapsed time directly: real time reliably exceeds
+// 1 ms within a handful of this producer's BackoffIdleStrategy retries (spin
+// -> yield -> park, capped at 100 us/park), so it throws quickly. The test's
+// own wait is bounded by a plain iteration cap (yields, no sleep) — ample
+// either way.
 TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingRegression) {
     rc::ClientConfig c = invokerCfg(3790, 3791);
     g_fakeNowMt.store(1, std::memory_order_relaxed);
@@ -635,9 +646,17 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
     rc::ProducerConfig pcfg;
     pcfg.acks                   = rc::Acks::None;
     pcfg.lingerUs               = 0;
-    pcfg.agentLivenessTimeoutMs = 50; // the real-time hold below deliberately exceeds this
+    pcfg.agentLivenessTimeoutMs = 1; // smallest positive unit: see the comment above
     auto p = r.client.testProducerWithRingCap(pcfg, 4 * 1024);
     auto topic = r.client.topic("t");
+
+    // Adopt the registration and publish a FRESH heartbeat at the current
+    // (frozen) fake-clock value — ProducerHub::drainAndFlush publishes a
+    // heartbeat for every registered producer every cycle, even with nothing
+    // to drain yet.
+    ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() >= 1; }));
+
+    // Fill to back-pressure.
     uint64_t ok = 0;
     for (; ok < 10'000; ++ok) {
         if (p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)) != rc::SendResult::Ok) break;
@@ -655,15 +674,26 @@ TEST(InvokerClient, HeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDrainingReg
         }
     });
 
-    // Deliberate REAL sleep (this specific test is exactly about real-elapsed-
-    // time independence — it cannot be simulated via the injected clock,
-    // since the bug it catches IS a fallback to real-time reads).
-    std::this_thread::sleep_for(150ms);
+    // The injected clock is NEVER touched here (stays frozen) and nothing
+    // drains the ring — bounded purely by an iteration cap (yields, not a
+    // sleep): a wrongly-wired reader throws within the first couple of its
+    // own retry iterations, so this cap only needs to be "long enough to let
+    // appThread actually run a few times", not "long enough to pass a real
+    // time threshold".
+    for (int i = 0; i < 100'000 &&
+                    !threw.load(std::memory_order_acquire) &&
+                    !succeeded.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::yield();
+    }
     EXPECT_FALSE(threw.load(std::memory_order_acquire))
-        << "spurious timeout: the heartbeat reader is not using the injected clock "
+        << "spurious timeout: the heartbeat reader is not using the injected (frozen) clock "
            "(fell back to real steady_clock)";
+    EXPECT_FALSE(succeeded.load(std::memory_order_acquire))
+        << "nothing drains the ring above — a success here is unexpected regardless of wiring";
 
-    // Now let it actually succeed (no further real-time dependency).
+    // Now actually let it succeed (drain for real), so appThread can be
+    // joined cleanly.
     for (int i = 0; i < 1000 &&
                     !succeeded.load(std::memory_order_acquire) &&
                     !threw.load(std::memory_order_acquire);
