@@ -968,6 +968,8 @@ if(BUILD_TESTING)
             tests/producer/ProducerSendTest.cpp
             tests/producer/DirectIngressTest.cpp
             tests/producer/ProducerFlushDirtyTest.cpp
+            tests/producer/ProducerAckTokenTest.cpp
+            tests/producer/ProducerCloseTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/detail/OneToOneRingBufferTest.cpp
             tests/detail/CompletionsTest.cpp

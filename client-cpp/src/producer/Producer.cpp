@@ -249,7 +249,10 @@ OpResult Producer::close(const CompletionTarget& target, Token token) {
     return impl_->beginClose(target, token);
 }
 
-OpStatus Producer::close() { return closeAndWait(std::chrono::nanoseconds::max()); }
+// No wait bound of its own: the drain is bounded by deliveryTimeoutMs (the
+// token completes Timeout then).  ~100 years keeps the deadline arithmetic
+// (now + timeout) from overflowing.
+OpStatus Producer::close() { return closeAndWait(std::chrono::hours(24 * 365 * 100)); }
 
 OpStatus Producer::closeAndWait(std::chrono::nanoseconds timeout) {
     if (!impl_) return OpStatus::Closed;
