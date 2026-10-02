@@ -20,7 +20,6 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -446,8 +445,14 @@ TEST(ShardConfigRegression, DriverOnDutyThreadRunsNoDriverOrConductorThread) {
     // the deltas measure only the Client's own threads (ctest runs this test
     // alone, so the Client would otherwise be the first pthread_create).  A
     // joined thread would not do: macOS may still list an exited thread.
-    std::promise<void> release;
-    std::thread parked([f = release.get_future()]() mutable { f.wait(); });
+    // Released through a pipe (blocking read; the kernel orders the write
+    // before it) — no future / atomic in tests (F8c).
+    int release[2] = {-1, -1};
+    ASSERT_EQ(::pipe(release), 0);
+    std::thread parked([fd = release[0]] {
+        char b = 0;
+        (void)!::read(fd, &b, 1);
+    });
     const int before = processThreadCount();
     ASSERT_GT(before, 0);
     {
@@ -462,8 +467,11 @@ TEST(ShardConfigRegression, DriverOnDutyThreadRunsNoDriverOrConductorThread) {
         // counter only moves while a driver THREAD runs, which never exists.
     }
     EXPECT_EQ(processThreadCount(), before);
-    release.set_value();
+    const char go = 1;
+    (void)!::write(release[1], &go, 1);
     parked.join();
+    ::close(release[0]);
+    ::close(release[1]);
 }
 
 TEST(ShardConfigRegression, DutyThreadLivenessDefaultsUnbounded) {
