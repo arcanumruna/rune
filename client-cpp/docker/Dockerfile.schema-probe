@@ -11,6 +11,7 @@
 #   rune-codec    → ../../rune-codec        (0a codec: Serialize/Record/Validator/Generator
 #                                            + tools/rune_codec_gen_main.cpp)
 #   rune-fr       → ../../rune-fr           (flight recorder; rune_client_api links it)
+#   rune-ql       → ../../rune-ql           (rune_ql is always defined by CMakeLists; C9 fix 1)
 #
 # The checked-in descriptor blob tests/generated/characters.blob is part of the
 # client repo build context; the CMake add_custom_command runs rune_codec_gen at
@@ -54,6 +55,8 @@ COPY --from=rune-codec tools   /rune-codec/tools
 # rune-fr: compiled sibling (src + include); rune_client_api links it.
 COPY --from=rune-fr src     /rune-fr/src
 COPY --from=rune-fr include /rune-fr/include
+COPY --from=rune-ql src     /rune-ql/src
+COPY --from=rune-ql include /rune-ql/include
 
 # ── Application sources (last; edits do not bust the conan cache) ─────────────
 COPY . .
@@ -68,6 +71,7 @@ RUN cmake -S . -B build -G Ninja \
         -DBUILD_EXAMPLES=ON \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_QL_ROOT=/rune-ql \
         -DRUNE_FR_DIR=/rune-fr \
     && cmake --build build --target rune_schema_probe -j2
 

@@ -61,7 +61,7 @@ fi
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-CLIENT_IMAGE="rune-client-ping:e2e-$(date +%s)"
+CLIENT_IMAGE="rune-client-ping:$(cd "${CLIENT_REPO}" && git rev-parse --short HEAD)"  # git SHA, never dev/latest
 CLIENT_HOSTNAME="rune-client"
 CLIENT_EGRESS_PORT="40400"
 
@@ -176,6 +176,9 @@ log "Step 4: Building rune-client-ping image (${CLIENT_IMAGE})..."
 docker build \
     --platform linux/amd64 \
     --build-context rune-protocol="${CLIENT_REPO}/../rune-protocol" \
+    --build-context rune-fr="${CLIENT_REPO}/../rune-fr" \
+    --build-context rune-codec="${CLIENT_REPO}/../rune-codec" \
+    --build-context rune-ql="${CLIENT_REPO}/../rune-ql" \
     -f "${CLIENT_REPO}/docker/Dockerfile.client" \
     -t "${CLIENT_IMAGE}" \
     "${CLIENT_REPO}" 2>&1 \

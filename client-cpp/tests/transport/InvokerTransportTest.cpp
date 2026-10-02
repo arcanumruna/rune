@@ -3,6 +3,8 @@
 // test thread IS the driver.
 #include <rune/client/transport/AeronTransport.h>
 
+#include <Aeron.h>  // aeron::currentTimeMillis — the conductor's own clock (stall test)
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -118,20 +120,25 @@ TEST(InvokerTransport, UdpLoopbackMovesOnlyWhenOwnerRunsDutyCycle) {
 
 // Regression (Review Focus 1): an owner stall past the client-liveness timeout
 // must close the Aeron client and report closed() — never ::exit(-1) the process
-// (Aeron's default error handler) and never hang.  This is the one test that
-// needs a real pause: Aeron's ClientConductor reads its own epoch clock
-// (ClientConductor.h:436) and cannot be injected.
+// (Aeron's default error handler) and never hang.  Aeron's ClientConductor reads
+// its own epoch clock (Aeron.cpp:43 hard-wires currentTimeMillis) and cannot be
+// injected, so the stall waits on THAT clock for THAT condition — no tuned sleep
+// (F8c C9 fix round 1).
 TEST(InvokerTransport, StalledOwnerSurfacesClosedInsteadOfExitingRegression) {
     Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3102);
     // The smallest liveness validate() accepts (1 s = 2x the client's 500 ms
-    // keepalive).  Sleep 2.5x it: > liveness trips the client conductor's
-    // inter-service check (strict '>' on a millisecond epoch clock) and the
-    // driver's client-timeout scan (every liveness/10) with ample margin.
+    // keepalive).
     c.clientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
     Transport t{c};
     t.start();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
-    std::this_thread::sleep_for(std::chrono::milliseconds(2'500));
+    // Every conductor doWork checks ClientConductor.h:436
+    //   nowMs > timeOfLastDoWorkMs + interServiceTimeoutMs   (nowMs = currentTimeMillis())
+    // and t0 is read after pumpUntil's last doWork (t0 >= timeOfLastDoWorkMs), so
+    // once currentTimeMillis() > t0 + liveness the next doWork must trip it.
+    const long long livenessMs = c.clientLivenessTimeoutNs / 1'000'000;
+    const long long t0 = aeron::currentTimeMillis();
+    while (aeron::currentTimeMillis() <= t0 + livenessMs) std::this_thread::yield();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.closed(); }))
         << "inter-service timeout must close the client and be observable";
     const uint8_t b[] = {1};

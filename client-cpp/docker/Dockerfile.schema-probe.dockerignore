@@ -5,6 +5,9 @@
 
 # Build outputs (large; do NOT send to the daemon)
 build/
+build_release/
+build_tsan/
+build_asan/
 cov/
 cmake-build-debug/
 cmake-build-release/
@@ -26,6 +29,10 @@ tests/*
 !tests/generated
 tests/generated/*
 !tests/generated/characters.blob
+# C9 fix 1: configure needs the EXCLUDE_FROM_ALL rune_ql_probe source.
+!tests/e2e
+tests/e2e/*
+!tests/e2e/rune_ql_probe.cpp
 
 # Editor / OS
 .vscode/

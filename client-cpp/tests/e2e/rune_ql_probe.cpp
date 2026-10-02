@@ -56,7 +56,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <future>
 #include <iostream>
 #include <mutex>
 #include <optional>

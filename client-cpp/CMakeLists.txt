@@ -54,10 +54,12 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR})
     # F8c C7: move-only handles — no std::shared_ptr / weak_ptr / make_shared in
     # src/ or include/ except the Aeron transport objects (exact allowlist).
-    add_test(NAME NoSharedPtrInPublicHandlesGuardSelfTestRegression
+    # (Renamed in C9 fix round 1 from NoSharedPtrInPublicHandlesGuard*: it scans
+    # the whole tree; the handle-header-only check is NoSharedPtrHandlesGuard.)
+    add_test(NAME NoSharedOwnershipOutsideTransportGuardSelfTestRegression
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --selftest)
-    add_test(NAME NoSharedPtrInPublicHandlesGuardRegression
+    add_test(NAME NoSharedOwnershipOutsideTransportGuardRegression
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py
             ${CMAKE_CURRENT_SOURCE_DIR})

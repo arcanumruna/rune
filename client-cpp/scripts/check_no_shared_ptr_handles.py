@@ -23,7 +23,8 @@ one (which must then be removed from the allowlist):
     are created on the constructing thread before the runner starts and
     released after the join — never shared across live threads by us.
 
-F8c C9: the PUBLIC HANDLE HEADERS (HANDLE_HEADERS) may never hold one of
+F8c C9: the PUBLIC HANDLE HEADERS (selected by rule: HANDLE_DIRS minus
+*Impl.h / *Hub.h, plus REQUIRED_HANDLE_HEADERS) may never hold one of
 those constructs — an allowlist entry for a handle header is itself a
 violation, and every listed header must exist.  `--handles` checks only that
 (ctest NoSharedPtrHandlesGuardRegression); the default run checks both.
@@ -83,9 +84,23 @@ def evaluate(files: dict, allow: dict):
     return violations
 
 
-# F8c C9: the public handle headers.  Move-only handles over single-owner impls
-# (§3.1/§3.3) — shared ownership here is banned outright, allowlist or not.
-HANDLE_HEADERS = {
+# F8c C9: the public handle headers — move-only handles over single-owner impls
+# (§3.1/§3.3); shared ownership there is banned outright, allowlist or not.
+# Selected BY RULE (C9 fix round 1): every header directly in one of
+# HANDLE_DIRS except *Impl.h / *Hub.h (duty-side internals, still covered by
+# the tree-wide C7 rule).  detail/ transport/ agent/ session/ codec/ metadata/
+# are internal plumbing, not handles.
+HANDLE_DIRS = (
+    "include/rune/client",
+    "include/rune/client/producer",
+    "include/rune/client/subscriber",
+    "include/rune/client/group",
+    "include/rune/client/shard",
+)
+HANDLE_EXCLUDE_SUFFIXES = ("Impl.h", "Hub.h")
+# Must exist AND be selected by the rule (a rename or a rule change that drops
+# one of them fails loudly).
+REQUIRED_HANDLE_HEADERS = {
     "include/rune/client/Client.h",
     "include/rune/client/Completions.h",
     "include/rune/client/TypedTopic.h",
@@ -97,14 +112,24 @@ HANDLE_HEADERS = {
 }
 
 
-def evaluate_handles(files: dict, allow: dict, handles: set):
+def is_handle_header(rel: str) -> bool:
+    d, _, name = rel.rpartition("/")
+    return (d in HANDLE_DIRS and name.endswith((".h", ".hpp"))
+            and not name.endswith(HANDLE_EXCLUDE_SUFFIXES))
+
+
+def evaluate_handles(files: dict, allow: dict, required: set):
     violations = []
+    for rel in sorted(required):
+        if rel in files and not is_handle_header(rel) and rel.startswith("include/rune/client/"):
+            violations.append(f"{rel}: required handle header is not selected by the HANDLE_DIRS rule")
+    handles = {rel for rel in files if is_handle_header(rel)} | set(required)
     for rel in sorted(handles):
         if rel in allow:
             violations.append(f"{rel}: public handle header is in the TRANSPORT allowlist — "
                               f"handles may never share ownership (remove the entry)")
         if rel not in files:
-            violations.append(f"{rel}: public handle header not found (update HANDLE_HEADERS)")
+            violations.append(f"{rel}: public handle header not found (update REQUIRED_HANDLE_HEADERS)")
             continue
         for line, snip in find_matches(files[rel]):
             violations.append(f"{rel}:{line}: `{snip}` in a public handle header — handles are "
@@ -143,7 +168,7 @@ SELFTEST_ALLOW = [
 
 # F8c C9 (NoSharedPtrHandlesGuardRegression): the public handle headers may
 # NEVER hold shared ownership — not even through an allowlist entry, and each
-# listed header must exist (a rename must update HANDLE_HEADERS, not silently
+# listed header must exist (a rename must update REQUIRED_HANDLE_HEADERS, not silently
 # drop the check).  (name, files, transport allowlist, handle headers, expected)
 SELFTEST_HANDLES = [
     ("clean_handles_ok", {"include/h/P.h": "class P { Impl* impl_ = nullptr; };"}, {}, {"include/h/P.h"}, 0),
@@ -156,6 +181,20 @@ SELFTEST_HANDLES = [
     ("handle_allowlisted_still_fails", {"include/h/P.h": "std::shared_ptr<I> p;"},
      {"include/h/P.h": {"std::shared_ptr": 1}}, {"include/h/P.h"}, 2),
     ("handle_missing_fails", {}, {}, {"include/h/P.h"}, 1),
+    # C9 fix round 1 (review finding 9): handle headers are selected BY RULE, so
+    # a new public handle header (Task 15: shard/ClientShard.h, ShardGroup.h) is
+    # covered without editing a list.
+    ("rule_selects_new_shard_header", {"include/rune/client/shard/ClientShard.h": "std::shared_ptr<I> p;"},
+     {}, set(), 1),
+    ("rule_selects_top_level_header", {"include/rune/client/NewHandle.h": "std::weak_ptr<I> w;"}, {}, set(), 1),
+    ("rule_allowlisted_shard_header_fails", {"include/rune/client/shard/ShardGroup.h": "std::shared_ptr<I> p;"},
+     {"include/rune/client/shard/ShardGroup.h": {"std::shared_ptr": 1}}, set(), 2),
+    ("rule_skips_internal_headers",
+     {"include/rune/client/producer/ProducerImpl.h": "std::shared_ptr<I> p;",
+      "include/rune/client/producer/ProducerHub.h": "std::shared_ptr<I> p;",
+      "include/rune/client/detail/X.h": "std::shared_ptr<I> p;",
+      "include/rune/client/transport/T.h": "std::shared_ptr<I> p;",
+      "include/rune/client/agent/A.h": "std::shared_ptr<I> p;"}, {}, set(), 0),
     ("transport_allowlist_not_a_handle_ok",
      {"include/t/A.h": "std::shared_ptr<aeron::Aeron> a;", "include/h/P.h": "class P {};"},
      {"include/t/A.h": {"std::shared_ptr": 1}}, {"include/h/P.h"}, 0),
@@ -196,15 +235,16 @@ def main(argv):
     files = base.collect(root)
     if "--handles" in argv:
         # NoSharedPtrHandlesGuardRegression: only the public handle headers.
-        violations = evaluate_handles(files, TRANSPORT, HANDLE_HEADERS)
+        violations = evaluate_handles(files, TRANSPORT, REQUIRED_HANDLE_HEADERS)
         if violations:
             print(f"check_no_shared_ptr_handles --handles: {len(violations)} violation(s)")
             for v in violations:
                 print("  " + v)
             return 1
-        print(f"check_no_shared_ptr_handles --handles: OK ({len(HANDLE_HEADERS)} public handle headers)")
+        n = sum(1 for rel in files if is_handle_header(rel))
+        print(f"check_no_shared_ptr_handles --handles: OK ({n} public handle headers by rule)")
         return 0
-    violations = evaluate(files, TRANSPORT) + evaluate_handles(files, TRANSPORT, HANDLE_HEADERS)
+    violations = evaluate(files, TRANSPORT) + evaluate_handles(files, TRANSPORT, REQUIRED_HANDLE_HEADERS)
     if violations:
         print(f"check_no_shared_ptr_handles: {len(violations)} violation(s)")
         for v in violations:
