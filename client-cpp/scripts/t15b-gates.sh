@@ -27,22 +27,21 @@ OUT="$G/results"; mkdir -p "$OUT" "$DISK_ROOT"
 cd "$K" || exit 1
 set +u; source env.sh; source lib.sh; source cluster.sh; set -u
 
-# The box is shared with other Rune sessions: never clean (kill) while someone
-# else's run is live.  Wait — bounded (WAIT_MAX_S, default 3 h) — until no Rune
-# process (exact names) other than ours has existed for 3 checks 30 s apart and
-# load1 < 1; then vm-clean.
+# Never clean (kill) while another session's Rune run is live: wait — bounded
+# (WAIT_MAX_S, default 3 h) — until none of the FOREIGN processes (exact names)
+# has existed for 3 checks 10 s apart; then vm-clean.sh.  (No load1 wait here:
+# the box is dedicated and vm-clean.sh has its own quiet check.)
 FOREIGN="rune_broker rune_broker_benchmark rune_produce_throughput rune_consume_throughput aeronmd dr_client"
 wait_free() {
     local quiet=0 waited=0 p busy
     while [ "$quiet" -lt 3 ]; do
         busy=""
         for p in $FOREIGN; do pgrep -x "$p" >/dev/null 2>&1 && busy="$busy $p"; done
-        local l; l=$(cut -d' ' -f1 /proc/loadavg)
-        if [ -z "$busy" ] && awk -v l="$l" 'BEGIN{exit !(l<1.0)}'; then quiet=$((quiet + 1)); else quiet=0; fi
+        if [ -z "$busy" ]; then quiet=$((quiet + 1)); else quiet=0; fi
         [ "$quiet" -ge 3 ] && break
-        [ "$waited" -ge "${WAIT_MAX_S:-10800}" ] && { echo "BOX-BUSY: gave up after ${waited}s (busy:${busy:- load1=$l})"; exit 8; }
-        [ "$quiet" -eq 0 ] && [ $((waited % 300)) -eq 0 ] && echo "waiting for a free box (busy:${busy:- load1=$l}) $(date +%T)"
-        sleep 30; waited=$((waited + 30))
+        [ "$waited" -ge "${WAIT_MAX_S:-10800}" ] && { echo "BOX-BUSY: gave up after ${waited}s (busy:$busy)"; exit 8; }
+        [ "$quiet" -eq 0 ] && [ $((waited % 300)) -eq 0 ] && echo "waiting for a free box (busy:$busy) $(date +%T)"
+        sleep 10; waited=$((waited + 10))
     done
 }
 
@@ -76,9 +75,9 @@ produce_verify() {  # <tag> <shard_gate args...>
     echo "$tag $r"; echo "$tag $v"
 }
 
-gate2() {
+gate2() {  # GATE2_MODES="0 1" (0 legacy, 1 shard broker) — resume a partial run
     local mode
-    for mode in 0 1; do
+    for mode in ${GATE2_MODES:-0 1}; do
         local kind=legacy; [ "$mode" = "1" ] && kind=shard
         for shards in 0 1; do
             clean; start "$mode" || continue
