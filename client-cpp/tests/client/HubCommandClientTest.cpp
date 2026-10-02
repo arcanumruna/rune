@@ -1024,3 +1024,50 @@ TEST(HubCommandClient, TxnFramesRouteCoordinatorToSeedAndDataToPartitionLeaderRe
     }
     EXPECT_EQ(r.cq.timesCompleted(commit.token()), 1);
 }
+
+// Re-review 1 NEW-3 end to end: a transactional batch answered
+// ProduceResponse{NotLeader} by the old owner (the partition moved to another
+// worker) is re-offered — after the Client's metadata refresh installed the
+// new route — to the NEW owner with the same identity; the transaction
+// commits, the record is written once.
+TEST(HubCommandClient, TxnNotLeaderReoffersOnTheNewRouteAndCommitsRegression) {
+    HubRig r(4040);
+    const std::string chA = "aeron:udp?endpoint=127.0.0.1:24795";
+    const std::string chB = "aeron:udp?endpoint=127.0.0.1:24796";
+    const int wA = r.gw.addEndpoint(chA, 4040);
+    const int wB = r.gw.addEndpoint(chB, 4040);
+    r.gw.partitions = {{1, 0, 0, 1, 4040, "127.0.0.1:24795"}};
+    auto tp = r.client.transactionalProducer("tx-move");
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == chA; }));
+    r.gw.initPidReply = true;
+    r.gw.replyTxn     = true;
+    r.gw.idempotence  = true;
+    auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+    ASSERT_TRUE(init.ok()) << init.describe();
+
+    // The partition moves to worker B: A refuses, metadata names B.
+    r.gw.notLeaderEndpoints = {wA};
+    r.gw.partitions         = {{1, 0, 0, 2, 4040, "127.0.0.1:24796"}};
+    tp.beginTransaction();
+    tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+    auto commit = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+    ASSERT_TRUE(r.drive([&] { return commit.ready(); })) << commit.describe();
+    EXPECT_EQ(commit.status(), rc::OpStatus::Ok) << commit.describe();
+    EXPECT_GE(r.gw.notLeaderAnswers, 1) << "precondition: the old owner refused";
+    ASSERT_EQ(r.gw.log.size(), 1u) << "written exactly once";
+    EXPECT_EQ(r.gw.log[0].producerEpoch, 0) << "the same identity (no bump)";
+    EXPECT_EQ(r.gw.log[0].baseSequence, 0);
+    int atA = 0, atB = 0;
+    for (const auto& pr : r.gw.produced) {
+        atA += pr.endpoint == wA;
+        atB += pr.endpoint == wB;
+        EXPECT_EQ(pr.producerEpoch, 0);
+        EXPECT_EQ(pr.baseSequence, 0);
+    }
+    EXPECT_EQ(atB, 1) << "re-offered to the new owner once";
+    EXPECT_LE(atA, 1) << "re-sent to the old owner before fresh metadata";
+    EXPECT_EQ(r.gw.crcFailures + r.gw.identityMismatches, 0);
+    EXPECT_EQ(r.cq.timesCompleted(commit.token()), 1);
+}

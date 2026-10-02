@@ -407,6 +407,7 @@ TEST(TransactionalProducerTest, IdempotentRetryReusesBaseSequence) {
         auto err = makeProduceResponse(ids[0], ecOf(rpc::ErrorCode::NotLeader));
         r.impl->onProduceResponse(err.data(), err.size());
     }
+    r.impl->onCoordinatorRediscovered();  // NEW-3: a NotLeader re-offers after fresh metadata
     r.doWork();  // the retry goes out on the next cycle
     const auto retry = r.sink.last(rpc::TemplateId::Produce);
     ASSERT_FALSE(retry.empty()) << "a retriable error must re-send";
@@ -2096,6 +2097,7 @@ TEST(TransactionalProducerTest, ErrorOfASupersededAttemptIsIgnoredRegression) {
     const auto first = sendData(r, 1);
     ASSERT_EQ(first.size(), 1u);
     answer(r, corrIdOf(first[0]), ecOf(rpc::ErrorCode::NotLeader));  // retriable
+    r.impl->onCoordinatorRediscovered();  // NEW-3: re-offered after fresh metadata
     r.sink.clear();
     r.doWork();
     const auto retry = produceFrames(r.sink);
@@ -2129,4 +2131,52 @@ TEST(TransactionalProducerTest, SequenceCounterNeverOverflowsInt32Regression) {
     ASSERT_EQ(frames.size(), 1u) << "only INT32_MAX - 1 fits (the next counter value must stay <= INT32_MAX)";
     EXPECT_EQ(decodeBaseSeqFromProduce(frames[0]), INT32_MAX - 1);
     EXPECT_EQ(r.tp.state(), TxnState::AbortableError) << "abortable with an epoch bump before the overflow";
+}
+
+// Re-review 1 NEW-3: ProduceResponse{NotLeader} is a routine partition move,
+// never a reason to abort the transaction (Kafka NOT_LEADER_OR_FOLLOWER:
+// refresh metadata, retry).  The batch parks — not re-sent to the old owner,
+// no retry budget spent, nothing new produced on the partition — until a
+// MetadataResponse arrived (the Client asks for one on every NotLeader); then
+// it is re-offered (on the partition's new route, via the send function) with
+// the SAME frame identity (producerId, epoch, baseSequence) as a NEW attempt
+// (fresh correlationId).  RED (pre-fix): re-sent at once to the old owner and,
+// after kMaxRetries NotLeaders, the transaction became abortable.
+TEST(TransactionalProducerTest, NotLeaderParksUntilMetadataThenReoffersSameIdentityRegression) {
+    TxnRig r;
+    r.acquire(77, 3);
+    auto cur = sendData(r, 2);
+    ASSERT_EQ(cur.size(), 2u);
+    const auto first = cur;
+    for (int round = 0; round < 8; ++round) {
+        SCOPED_TRACE(round);
+        for (const auto& f : cur) answer(r, corrIdOf(f), ecOf(rpc::ErrorCode::NotLeader));
+        if (round == 0) r.tp.send(TopicHandle{1, 1}, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+        r.sink.clear();
+        for (int i = 0; i < 5; ++i) r.doWork();
+        EXPECT_TRUE(produceFrames(r.sink).empty()) << "re-sent (or a new batch sent) before fresh metadata";
+        ASSERT_EQ(r.tp.state(), TxnState::InTransaction) << "a partition move aborted the transaction";
+        r.impl->onCoordinatorRediscovered();  // the MetadataResponse arrived (new route installed)
+        r.doWork();
+        cur = produceFrames(r.sink);
+        ASSERT_EQ(cur.size(), 2u) << "both batches re-offered, nothing new before them";
+        for (std::size_t i = 0; i < cur.size(); ++i) {
+            const auto pv = rune::client::codec::decodeProduce(cur[i].data(), cur[i].size());
+            ASSERT_TRUE(pv);
+            EXPECT_EQ(pv->producerId, 77);
+            EXPECT_EQ(pv->producerEpoch, 3);
+            EXPECT_EQ(pv->baseSequence, static_cast<int32_t>(i)) << "same identity, in order";
+            EXPECT_EQ(decodeBaseSeqFromProduce(cur[i]), static_cast<int32_t>(i));
+            EXPECT_NE(corrIdOf(cur[i]), corrIdOf(first[i])) << "a new attempt";
+        }
+    }
+    for (const auto& f : cur) answer(r, corrIdOf(f), 0, 100);
+    r.sink.clear();
+    r.doWork();  // the record held while parked goes out now
+    const auto held = produceFrames(r.sink);
+    ASSERT_EQ(held.size(), 1u);
+    EXPECT_EQ(decodeBaseSeqFromProduce(held[0]), 2);
+    answer(r, corrIdOf(held[0]), 0, 102);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
 }

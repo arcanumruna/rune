@@ -52,6 +52,7 @@ constexpr int16_t kProducerFenced         = static_cast<int16_t>(rpc::ErrorCode:
 constexpr int16_t kInvalidTxnState        = static_cast<int16_t>(rpc::ErrorCode::InvalidTxnState);
 constexpr int16_t kOutOfOrderSequence     = static_cast<int16_t>(rpc::ErrorCode::OutOfOrderSequence);
 constexpr int16_t kConcurrentTransactions = static_cast<int16_t>(rpc::ErrorCode::ConcurrentTransactions);
+constexpr int16_t kNotLeader              = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
 
 } // namespace
 
@@ -892,7 +893,8 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
             // I-1: nothing new while batches are parked (they would meet the
             // same gap — Kafka stops draining a partition with a retry outstanding).
             constexpr uint32_t kWindow = static_cast<uint32_t>(rpc::kIdempotentMaxInFlightBatches);
-            while (!ps.waiting.empty() && ps.parked == 0 && ps.inFlight < kWindow) {
+            // NEW-3: nor while a batch waits for the partition's new route.
+            while (!ps.waiting.empty() && ps.parked == 0 && ps.awaitingRoute == 0 && ps.inFlight < kWindow) {
                 // int32 sequence space (one record per batch): never wrapped —
                 // the broker compares sequences signed.  The epoch belongs to the
                 // coordinator, so the transaction becomes abortable with an epoch
@@ -924,8 +926,17 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
     {
         std::vector<int64_t>& due = dueScratch_;  // reused: no per-cycle allocation
         due.clear();
-        for (const auto& [corr, b] : batches_) {
-            if (b.sentSessionId == 0 && !b.parked) due.push_back(corr);
+        for (auto& [corr, b] : batches_) {
+            // NEW-3: a NotLeader'd batch waits for a MetadataResponse that
+            // arrived after its NotLeader (the new route is installed by then).
+            if (b.awaitRoute && b.awaitGen != discoveryGen_) {
+                b.awaitRoute = false;
+                if (auto pit = partitions_.find(rune::client::TopicPartitionKey{b.topicId, b.partition});
+                    pit != partitions_.end() && pit->second.awaitingRoute > 0) {
+                    --pit->second.awaitingRoute;
+                }
+            }
+            if (b.sentSessionId == 0 && !b.parked && !b.awaitRoute) due.push_back(corr);
         }
         std::sort(due.begin(), due.end(), [&](int64_t x, int64_t y) {
             const InFlightBatch& a = batches_.at(x);
@@ -1172,6 +1183,7 @@ void TransactionalProducerImpl::eraseBatch_(std::map<int64_t, InFlightBatch>::it
     TxnPartitionState& ps = pit->second;
     if (ps.inFlight > 0) --ps.inFlight;
     if (b.parked && ps.parked > 0) --ps.parked;
+    if (b.awaitRoute && ps.awaitingRoute > 0) --ps.awaitingRoute;
     armParked_(ps);
 }
 
@@ -1179,8 +1191,9 @@ void TransactionalProducerImpl::clearBatches_() noexcept {
     batches_.clear();
     superseded_.clear();
     for (auto& [k, ps] : partitions_) {
-        ps.inFlight = 0;
-        ps.parked   = 0;
+        ps.inFlight      = 0;
+        ps.parked        = 0;
+        ps.awaitingRoute = 0;
     }
 }
 
@@ -1239,6 +1252,25 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
         return;
     }
     InFlightBatch& ib = it->second;
+    if (ec == kNotLeader) {
+        // Re-review 1 NEW-3 (Kafka NOT_LEADER_OR_FOLLOWER parity, as ProducerImpl
+        // C1): the partition moved — retriable, never a reason to abort.  No
+        // retry budget is spent and the identity is unchanged.  The batch waits
+        // for a MetadataResponse (the Client requests one on every
+        // ProduceResponse{NotLeader}, rate-limited) so the re-offer takes the
+        // partition's NEW route; then it goes out again as a new attempt (fresh
+        // correlationId; the old owner's late answers are superseded).  The
+        // partition produces nothing new meanwhile.  Bounded by the batch
+        // deadline (sweep_).  Only the CURRENT attempt's NotLeader gets here: a
+        // superseded attempt's error never does (I-2).
+        if (!ib.awaitRoute) {
+            ib.awaitRoute = true;
+            if (ps != nullptr) ++ps->awaitingRoute;
+        }
+        ib.awaitGen      = discoveryGen_;
+        ib.sentSessionId = 0;
+        return;
+    }
     if (ec == kOutOfOrderSequence && ps != nullptr) {
         // I-1 (Kafka parity, ruling 3): an older batch of this partition is
         // still unresolved -> an earlier frame was lost: park, retry later.

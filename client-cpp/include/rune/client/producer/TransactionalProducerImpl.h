@@ -124,6 +124,8 @@ struct TxnPartitionState {
     // send tick when the latest OK was processed.
     uint32_t inFlight     = 0;
     uint32_t parked       = 0;
+    /// Re-review 1 NEW-3: batches answered NotLeader, waiting for fresh metadata.
+    uint32_t awaitingRoute = 0;
     int32_t  lastAckedSeq = -1;
     uint64_t lastAckTick  = 0;
 
@@ -184,13 +186,16 @@ public:
     void onAddOffsetsToTxnResponse(const uint8_t* buf, std::size_t len);
     void onTxnOffsetCommitResponse(const uint8_t* buf, std::size_t len);
     void onEndTxnResponse(const uint8_t* buf, std::size_t len);
-    /// ProduceResponse for a txn produce: Ok removes the batch; a retriable
-    /// error re-sends the SAME frame (same baseSequence) on the next cycle;
-    /// OutOfOrderSequence / fencing errors fence.
+    /// ProduceResponse for a txn produce: Ok removes the batch; NotLeader waits
+    /// for fresh metadata, then re-offers the SAME frame on the new route (no
+    /// retry budget — NEW-3); another retriable error re-sends the SAME frame
+    /// (same baseSequence) on the next cycle; OutOfOrderSequence / fencing
+    /// errors fence.
     void onProduceResponse(const uint8_t* buf, std::size_t len);
 
     /// F14: a MetadataResponse arrived — requests waiting for coordinator
-    /// re-discovery back off and re-send.
+    /// re-discovery back off and re-send; NotLeader'd batches are re-offered
+    /// (NEW-3: the routes it carried are installed before this is called).
     void onCoordinatorRediscovered() noexcept { ++discoveryGen_; }
 
     /// Client close / closeImmediately: every pending op completes Closed,
@@ -315,6 +320,10 @@ private:
         // decides the batch; its OK still does — stored is stored).
         bool                 offered  = false;
         bool                 parked   = false;  // I-1: OOS behind an older live batch
+        // NEW-3: answered NotLeader — re-offered once a MetadataResponse arrived
+        // after it (discoveryGen_ moved past awaitGen).
+        bool                 awaitRoute = false;
+        uint64_t             awaitGen   = 0;
         uint64_t             sendTick = 0;      // TransactionalProducerImpl::sendTick_ at the latest offer
         std::vector<int64_t> priorCorrIds;      // the superseded attempts' ids
     };
