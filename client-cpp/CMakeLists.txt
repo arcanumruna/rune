@@ -390,7 +390,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     # DR-1 — configurable disaster-recovery driver (rune-broker/dr-e2e harness)
     # T15b gates 2-5: real-broker driver for every client arm (see its header).
     add_executable(shard_gate examples/shard_gate.cpp)
-    target_include_directories(shard_gate PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_include_directories(shard_gate PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/examples/bench)
     target_link_libraries(shard_gate PRIVATE rune_client_api rune_client_producer rune_client_subscriber rune_fr)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB_SHARD_GATE uuid)

@@ -43,6 +43,8 @@
 #include <rune/client/detail/CpuAffinity.h>
 #include <rune/client/shard/ClientShard.h>
 
+#include "OpenLoopSchedule.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -384,11 +386,13 @@ void sendLoop(const Args& a, Ledger& L, int64_t cap, TrySend&& trySend, Pump&& p
               int64_t& tLast) {
     std::vector<uint8_t> val(static_cast<std::size_t>(a.valueBytes), 0x5a);
     const int64_t        t0     = AckCtx::nowNs();
-    const int64_t        period = a.rate > 0 ? 1'000'000'000LL / a.rate : 0;
+    // Exact integer schedule (no per-record truncation drift at rates that do
+    // not divide 1e9) — shared with rune_produce_throughput's invoker bench.
+    const rune::bench::OpenLoopSchedule schedule(t0, a.rate > 0 ? static_cast<uint64_t>(a.rate) : 1);
     const int64_t        stopAt = a.seconds > 0 ? t0 + static_cast<int64_t>(a.seconds * 1e9) : INT64_MAX;
     tFirst = t0;
     for (int64_t id = 0; id < cap; ++id) {
-        const int64_t due = a.rate > 0 ? t0 + id * period : 0;
+        const int64_t due = a.rate > 0 ? schedule.scheduledNs(static_cast<uint64_t>(id)) : 0;
         for (;;) {  // pace (open loop): busy-wait to the schedule, pumping
             const int64_t now = AckCtx::nowNs();
             if (now >= stopAt || (a.sigstop && stdinReady())) {
