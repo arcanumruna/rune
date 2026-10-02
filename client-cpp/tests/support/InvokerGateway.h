@@ -75,6 +75,13 @@ struct InvokerGateway {
     std::vector<PartitionAd> partitions;
     std::string brokerHost;           // "" = advertise no broker entry (routes fall back to the seed)
     int32_t     brokerPort = 0;
+    // Re-review 1 (NEW-1): more advertised brokers (nodeId, host, port) besides node 0;
+    // holdMetadata: MetadataRequests are counted (corrIds kept), never answered —
+    // the test sends each MetadataResponse itself (sendMetadata), in any order.
+    struct BrokerAd { int32_t nodeId = 1; std::string host; int32_t port = 0; };
+    std::vector<BrokerAd> moreBrokers;
+    bool                  holdMetadata = false;
+    std::vector<int64_t>  metadataCorrIds;  // correlationIds of the MetadataRequests received
     int64_t     assignedSessionId = 42;
     int64_t     nextOffset = 100;
     bool        replyAcks = true;
@@ -357,6 +364,13 @@ struct InvokerGateway {
             b.nodeId = 0;
             b.host   = brokerHost;  // view into a member: valid through encode()
             b.port   = brokerPort;
+            brokers.push_back(b);
+        }
+        for (const BrokerAd& ad : moreBrokers) {
+            rp::BrokerEntry b;
+            b.nodeId = ad.nodeId;
+            b.host   = ad.host;
+            b.port   = ad.port;
             brokers.push_back(b);
         }
         std::vector<rp::PartitionEntry> parts;
@@ -668,6 +682,8 @@ private:
             const auto m = rp::MetadataRequest::decode(buf, len);
             if (!m) return;
             ++metadataRequests;
+            metadataCorrIds.push_back(m->correlationId);
+            if (holdMetadata) return;
             sendMetadata(m->sessionId, m->correlationId);
             return;
         }

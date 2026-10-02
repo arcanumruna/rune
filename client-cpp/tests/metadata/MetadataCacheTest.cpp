@@ -236,3 +236,41 @@ TEST(MetadataCache, NoLeader_NegativeLeaderIdStoredAndReturned) {
     EXPECT_EQ(cache.leaderFor(5, 2), mc::MetadataCache::kNoLeader);
     EXPECT_EQ(cache.epochFor(5, 2), 0);
 }
+
+// ===========================================================================
+// Re-review 1 NEW-1: the redirect ordering rule.  A Redirect's provisional
+// leader (epoch confirmed + 1) is undone only by an answer to a request sent
+// AFTER the redirect (M5: a spurious redirect restores the old leader) or by a
+// higher epoch; an equal-epoch answer requested before it (or unsolicited)
+// is discarded.
+// ===========================================================================
+TEST(MetadataCache, RedirectOrderingRule_EqualEpochAnswerMustPostdateTheRedirectRegression) {
+    mc::MetadataCache cache;
+    const std::vector<mc::BrokerEntry> brokers;
+    const std::vector<mc::PartitionEntry> old = {makePartition(1, 0, /*leader=*/0, /*epoch=*/4)};
+    cache.updateFromResponse(brokers, old, /*requestCorrId=*/10);
+    cache.updatePartitionLeaderProvisional(1, 0, /*leader=*/1, /*epoch=*/5, /*nextRequestCorrId=*/20);
+    ASSERT_EQ(cache.leaderFor(1, 0), 1);
+
+    cache.updateFromResponse(brokers, old, 19);  // requested before the redirect
+    EXPECT_EQ(cache.leaderFor(1, 0), 1) << "a pre-redirect answer undid the redirect";
+    EXPECT_EQ(cache.epochFor(1, 0), 5);
+    cache.updateFromResponse(brokers, old, 0);   // unsolicited
+    EXPECT_EQ(cache.leaderFor(1, 0), 1) << "an unsolicited old-epoch answer undid the redirect";
+
+    cache.updateFromResponse(brokers, old, 20);  // requested after it: spurious redirect (M5)
+    EXPECT_EQ(cache.leaderFor(1, 0), 0) << "M5: the post-redirect answer must restore the old leader";
+    EXPECT_EQ(cache.epochFor(1, 0), 4);
+
+    // A higher epoch is accepted whatever its request order.
+    cache.updatePartitionLeaderProvisional(1, 0, 1, 5, 30);
+    const std::vector<mc::PartitionEntry> moved = {makePartition(1, 0, 2, 6)};
+    cache.updateFromResponse(brokers, moved, 25);
+    EXPECT_EQ(cache.leaderFor(1, 0), 2);
+    EXPECT_EQ(cache.epochFor(1, 0), 6);
+    // Confirmed again: plain epoch ordering, the equal epoch is accepted at any order.
+    cache.updateFromResponse(brokers, moved, 0);
+    EXPECT_EQ(cache.epochFor(1, 0), 6);
+    cache.updateFromResponse(brokers, old, 99);
+    EXPECT_EQ(cache.leaderFor(1, 0), 2) << "a lower epoch is never accepted";
+}

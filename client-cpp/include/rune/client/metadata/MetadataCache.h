@@ -11,6 +11,27 @@
 //   Lower-epoch updates are silently discarded to avoid regressing to a stale
 //   leader after a flapping or out-of-order MetadataResponse.
 //
+// Redirect ordering rule (Task 16 M5 + re-review 1 NEW-1):
+//   A Redirect frame names only an endpoint, so the client GUESSES the leader
+//   with a provisional epoch (confirmed + 1) and asks for metadata at once.
+//   While that guess stands, an authoritative answer is accepted when
+//     (a) its epoch is ABOVE the last confirmed epoch (a real newer view), or
+//     (b) its epoch EQUALS the confirmed epoch and it answers a request sent
+//         AFTER the redirect (request correlationId >= provisionalSince):
+//         the cluster still names the old leader after the redirect, so the
+//         redirect was spurious and the old route is restored (M5: never
+//         stranded on the redirect target);
+//   and discarded otherwise — an equal-epoch answer requested BEFORE the
+//   redirect (in flight, or a lagging re-delivery) can never undo it (NEW-1).
+//   Request correlationIds come from one monotonic duty-thread counter, so
+//   "requested after" is a plain comparison.  An unsolicited response
+//   (correlationId 0) counts as requested before.  Residual: an answer
+//   requested after the redirect from a node whose view still lags is
+//   indistinguishable from a spurious redirect; it is applied, the next
+//   produce meets the redirect again, and the client converges as soon as the
+//   metadata carries the new epoch (bounded per batch by kMaxRedirects and
+//   the delivery timeout — never a duplicate: the same identity is re-sent).
+//
 // Usage:
 //   1. On MetadataResponse, call updateFromResponse().
 //   2. On NotLeader/Redirect with embedded leaderId + leaderEpoch, call
@@ -62,6 +83,10 @@ struct RoutingEntry {
     /// authoritative answer that follows is accepted even when its epoch did not
     /// move (a spurious redirect) — the route is restored instead of stranded.
     int32_t confirmedEpoch = -1;
+    /// Re-review 1 (NEW-1): != 0 while a Redirect's provisional leader stands —
+    /// the first MetadataRequest correlationId sent after that redirect.  An
+    /// equal-to-confirmed-epoch answer to an earlier request is discarded.
+    int64_t provisionalSince = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -87,8 +112,13 @@ public:
     /// Apply a full MetadataResponse: update all broker endpoints and partition
     /// leaders.  The staleness rule is applied per-partition: an update is
     /// accepted only if newEpoch >= lastSeenLeaderEpoch for that partition.
+    ///
+    /// `requestCorrId`: the correlationId of the MetadataRequest this answers
+    /// (0 = unsolicited; the default = "requested now", for callers without
+    /// a redirect in play) — the redirect ordering rule above.
     void updateFromResponse(std::span<const BrokerEntry>    brokers,
-                            std::span<const PartitionEntry> partitions) noexcept
+                            std::span<const PartitionEntry> partitions,
+                            int64_t requestCorrId = INT64_MAX) noexcept
     {
         // Update broker → endpoint mapping.
         for (const auto& b : brokers) {
@@ -101,7 +131,8 @@ public:
         for (const auto& p : partitions) {
             if (p.topicId < 0 || p.partition < 0) continue;
             applyPartitionUpdate(p.topicId, p.partition,
-                                 p.leaderId, p.leaderEpoch, p.ingressStreamId, /*authoritative=*/true);
+                                 p.leaderId, p.leaderEpoch, p.ingressStreamId, /*authoritative=*/true,
+                                 requestCorrId);
         }
     }
 
@@ -116,21 +147,25 @@ public:
                                int32_t newLeaderEpoch) noexcept
     {
         applyPartitionUpdate(topicId, partition, newLeaderId, newLeaderEpoch,
-                             existingStreamId_(topicId, partition), /*authoritative=*/true);
+                             existingStreamId_(topicId, partition), /*authoritative=*/true, INT64_MAX);
     }
 
     /// Task 16 fix round 1 (M5): a GUESSED leader (a Redirect frame carries only
     /// an endpoint; the caller invents epoch current+1 so the staleness rule
     /// accepts it).  Unlike updatePartitionLeader it never raises the confirmed
     /// epoch, so the authoritative MetadataResponse that follows is applied even
-    /// when its epoch did not move (a spurious redirect).
+    /// when its epoch did not move (a spurious redirect) — provided it answers
+    /// a request sent after the redirect: `nextRequestCorrId` is the first
+    /// correlationId a MetadataRequest sent from now on can carry (NEW-1).
     void updatePartitionLeaderProvisional(int32_t topicId,
                                           int32_t partition,
                                           int32_t newLeaderId,
-                                          int32_t newLeaderEpoch) noexcept
+                                          int32_t newLeaderEpoch,
+                                          int64_t nextRequestCorrId) noexcept
     {
         applyPartitionUpdate(topicId, partition, newLeaderId, newLeaderEpoch,
-                             existingStreamId_(topicId, partition), /*authoritative=*/false);
+                             existingStreamId_(topicId, partition), /*authoritative=*/false,
+                             nextRequestCorrId);
     }
 
     /// Update (or add) a broker endpoint without touching partition state.
@@ -241,9 +276,12 @@ private:
     }
 
     // Staleness-gated update for a single partition.
+    // `order`: authoritative — the answered request's correlationId; provisional
+    // — the first correlationId a request sent after this redirect can carry.
     void applyPartitionUpdate(int32_t topicId, int32_t partition,
                               int32_t newLeaderId, int32_t newEpoch,
-                              int32_t newIngressStreamId, bool authoritative) noexcept
+                              int32_t newIngressStreamId, bool authoritative,
+                              int64_t order) noexcept
     {
         const int64_t key = makeKey(topicId, partition);
         auto [it, inserted] = table_.emplace(key, RoutingEntry{});
@@ -251,16 +289,27 @@ private:
 
         // §11 staleness rule: only accept if newEpoch >= lastSeen.  A MetadataResponse
         // is compared with the last CONFIRMED epoch (a provisional redirect epoch
-        // must not make the authoritative answer look stale — M5).
+        // must not make the authoritative answer look stale — M5) ...
         const int32_t floor = authoritative ? entry.confirmedEpoch : entry.leaderEpoch;
         if (!inserted && newEpoch < floor) {
             return;  // stale update — discard
+        }
+        // ... but while a redirect's guess stands, an equal-epoch answer counts
+        // only if it was requested after the redirect (NEW-1, rule above).
+        if (!inserted && authoritative && entry.provisionalSince != 0 &&
+            newEpoch <= entry.confirmedEpoch && order < entry.provisionalSince) {
+            return;  // may predate the redirect — discard
         }
 
         entry.leaderNodeId    = newLeaderId;
         entry.leaderEpoch     = newEpoch;
         entry.ingressStreamId = newIngressStreamId;
-        if (authoritative) entry.confirmedEpoch = newEpoch;
+        if (authoritative) {
+            entry.confirmedEpoch   = newEpoch;
+            entry.provisionalSince = 0;
+        } else {
+            entry.provisionalSince = order > 0 ? order : 1;
+        }
     }
 
     // ---- Members -----

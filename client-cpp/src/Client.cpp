@@ -1995,8 +1995,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         const int32_t curEpoch =
                             metadataCache_.epochFor(rTopicId, rPartition);
                         const int32_t newEpoch = (curEpoch >= 0) ? (curEpoch + 1) : 0;
-                        metadataCache_.updatePartitionLeaderProvisional(  // M5
-                            rTopicId, rPartition, newNodeId, newEpoch);
+                        metadataCache_.updatePartitionLeaderProvisional(  // M5 / NEW-1
+                            rTopicId, rPartition, newNodeId, newEpoch, nextCorrId_);
                         // IMPORTANT-2: we now KNOW which node the session is
                         // following — record it so proactive routing can avoid
                         // re-sending to the wrong node.
@@ -2004,10 +2004,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     }
                 }
                 // Reconcile with the authoritative map NOW (M5): the provisional
-                // epoch above never blocks it (MetadataCache confirmedEpoch), so
-                // a spurious redirect does not strand the partition's worker route
-                // on the node relay — the answer restores it.  Rate-limited; falls
-                // back to the backoff refresh.
+                // epoch above never blocks the answer to THIS (or any later)
+                // request (MetadataCache confirmedEpoch), so a spurious redirect
+                // does not strand the partition's worker route on the node relay —
+                // the answer restores it; an answer to a request sent BEFORE the
+                // redirect cannot undo it (NEW-1, provisionalSince).  Rate-limited;
+                // falls back to the backoff refresh.
                 requestMetadataNow_();
             }
 
@@ -3443,7 +3445,8 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         partitions.push_back(std::move(e));
     }
 
-    metadataCache_.updateFromResponse(brokers, partitions);
+    // NEW-1: the answered request's correlationId orders it against redirects.
+    metadataCache_.updateFromResponse(brokers, partitions, resp.correlationId);
 
     // Task 1.3: (re)build the agent-owned partition routing table IN PLACE.  For
     // each partition with a known leader + per-worker ingressStreamId, map the

@@ -514,6 +514,66 @@ TEST(IngressEndpointRouting, SpuriousRedirectRestoresTheWorkerRouteRegression) {
     EXPECT_EQ(r.gw.produced.back().endpoint, w);
 }
 
+// Re-review 1 NEW-1: a MetadataResponse REQUESTED BEFORE a real Redirect (in
+// flight, or a lagging re-delivery) still carries the old leader at the old
+// epoch.  It must never undo the redirect: while the redirect's provisional
+// leader stands, an answer at the confirmed epoch is accepted only when it was
+// requested after the redirect (MetadataCache provisionalSince, by request
+// correlationId).  The answer requested after it then decides (M5 kept: the
+// SpuriousRedirect test above).  RED (pre-fix): the stale answer restored the
+// old worker route and the next batch went back to the old owner.
+TEST(IngressEndpointRouting, LaggingMetadataNeverUndoesARealRedirectRegression) {
+    Rig r(3924, 3925, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    const std::string node0 = "aeron:udp?endpoint=127.0.0.1:24792";
+    const std::string node1 = "aeron:udp?endpoint=127.0.0.1:24794";
+    const std::string worker = "aeron:udp?endpoint=127.0.0.1:24793";
+    r.gw.addEndpoint(node0, 3924);
+    const int w  = r.gw.addEndpoint(worker, 3924);
+    const int n1 = r.gw.addEndpoint(node1, 3924);
+    r.gw.brokerHost  = "127.0.0.1";
+    r.gw.brokerPort  = 24792;
+    r.gw.moreBrokers = {{1, "127.0.0.1", 24794}};
+    r.gw.partitions  = {{1, 0, 0, 1, 3924, "127.0.0.1:24793"}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == worker; }));
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, w);
+    ASSERT_FALSE(r.gw.metadataCorrIds.empty());
+    const int64_t preRedirectCorr = r.gw.metadataCorrIds.back();  // answered before the redirect
+
+    // The partition really moved to node 1: the worker redirects.  Metadata
+    // requests are held from now on; the test answers them itself.
+    r.gw.holdMetadata = true;
+    r.gw.redirectNext = 1;
+    r.gw.redirectTo   = node1;
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, n1) << "precondition: the redirected batch went to node 1";
+    ASSERT_EQ(r.client.testLeaderFor(1, 0), 1);
+    ASSERT_EQ(r.client.testEpochFor(1, 0), 2) << "precondition: the provisional epoch";
+    ASSERT_GT(r.gw.metadataCorrIds.back(), preRedirectCorr) << "precondition: the redirect asked for metadata";
+    const int64_t postRedirectCorr = r.gw.metadataCorrIds.back();
+
+    // The stale answer (requested before the redirect): old leader, old epoch.
+    const int before = r.client.testMetadataResponses();
+    r.gw.sendMetadata(r.gw.assignedSessionId, preRedirectCorr);
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > before; }));
+    EXPECT_EQ(r.client.testLeaderFor(1, 0), 1) << "a pre-redirect answer undid the redirect";
+    EXPECT_EQ(r.client.testEpochFor(1, 0), 2);
+    EXPECT_EQ(r.client.testDataChannelFor(1, 0), node1) << "the route went back to the old owner";
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    EXPECT_EQ(r.gw.produced.back().endpoint, n1) << "a batch went back to the old owner";
+
+    // The answer requested after the redirect confirms node 1 at epoch 2.
+    r.gw.partitions = {{1, 0, 1, 2, 3924, ""}};
+    r.gw.sendMetadata(r.gw.assignedSessionId, postRedirectCorr);
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > before + 1; }));
+    EXPECT_EQ(r.client.testLeaderFor(1, 0), 1);
+    EXPECT_EQ(r.client.testEpochFor(1, 0), 2);
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    EXPECT_EQ(r.gw.produced.back().endpoint, n1);
+}
+
 // M6: the node endpoint advertised in metadata names the seed with different URI
 // params — the same destination: no route, no second Session.
 TEST(IngressEndpointRouting, NodeEndpointWithOtherUriParamsIsTheSeedRegression) {
