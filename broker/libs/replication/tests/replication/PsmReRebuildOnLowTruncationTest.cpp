@@ -123,8 +123,8 @@ static int64_t seedLog(InMemoryLog& log,
 // ===========================================================================
 // TEST 1 — Re-rebuild fires when truncation is BELOW the rebuild HW
 //
-// Key: kRetryWindowSize == 5, so with kTotal=6 batches (seqs 0..5):
-//   after rebuild at HW=6, window = {seq1, seq2, seq3, seq4, seq5},
+// Key: with kTotal=6 batches (seqs 0..5, all inside the 32-batch window):
+//   after rebuild at HW=6, window = {seq0 .. seq5},
 //   lastSequence = 5.
 //
 // Truncation to kTruncTo=3 removes offsets 3,4,5 from the log.
@@ -141,8 +141,7 @@ static int64_t seedLog(InMemoryLog& log,
 
 TEST(PsmReRebuildOnLowTruncation, ReRebuildsWhenTruncationBelowRebuildHw)
 {
-    // 6 batches (offsets 0..5, seqs 0..5) → all fit in retry window (size=5)
-    // after the last 5.  HW=6 covers all committed; truncate to 3 (< HW=6).
+    // 6 batches (offsets 0..5, seqs 0..5) → all fit in the retry window.  HW=6 covers all committed; truncate to 3 (< HW=6).
     static constexpr int32_t kTotal     = 6;    // LEO=6 after seeding
     static constexpr int32_t kRebuildHw = 6;    // rebuild PSM at HW=6 (all committed)
     static constexpr int32_t kTruncTo   = 3;    // truncate to offset 3 (< rebuild HW)
@@ -175,7 +174,7 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildsWhenTruncationBelowRebuildHw)
         << "rebuildHighWatermark should equal kRebuildHw after explicit rebuild";
 
     // Before truncation: seq=kTruncTo (= seq 3, offset 3) IS in the retry
-    // window (one of the last 5 batches) → Duplicate.
+    // window → Duplicate.
     {
         int32_t seq = kTruncTo;  // seq=3, offset=3 — committed and in window
         auto r = psm.validate(kTopicId, kPid, kPartition, /*epoch=*/0,

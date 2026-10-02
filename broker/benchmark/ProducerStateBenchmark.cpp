@@ -113,4 +113,31 @@ BENCHMARK(BM_ProducerState_ManyProducers)
     ->Arg(512)
     ->Unit(benchmark::kNanosecond);
 
+// ---------------------------------------------------------------------------
+// BM_ProducerState_Retransmit — EOS-OOS: the cost of answering a retransmit
+// (baseSequence <= lastSequence).  range(0) = how many batches back the
+// retransmit is: 1 = newest, kRetryWindowSize = oldest in the window (worst
+// in-window scan), kRetryWindowSize + 1 = known-old (full scan, then OK -1).
+// Window full (64 batches appended).  The in-order path never scans.
+// ---------------------------------------------------------------------------
+static void BM_ProducerState_Retransmit(benchmark::State& state) {
+    static constexpr int32_t kAppended = 64;
+    const int32_t back = static_cast<int32_t>(state.range(0));
+    rune::storage::ProducerStateManager psm;
+    for (int32_t s = 0; s < kAppended; ++s) {
+        (void)psm.validate(0, 1, 0, 0, s, s);
+        psm.update(0, 1, 0, 0, s, s, s);
+    }
+    const int32_t seq = kAppended - back;
+    for (auto _ : state) {
+        auto r = psm.validate(0, 1, 0, 0, seq, seq);
+        benchmark::DoNotOptimize(r);
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+
+BENCHMARK(BM_ProducerState_Retransmit)
+    ->Arg(1)->Arg(5)->Arg(rune::storage::kRetryWindowSize)->Arg(rune::storage::kRetryWindowSize + 1)
+    ->Unit(benchmark::kNanosecond);
+
 } // namespace

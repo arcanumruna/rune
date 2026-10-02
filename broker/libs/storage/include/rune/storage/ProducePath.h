@@ -17,6 +17,9 @@
 //        at [0..7] is before the CRC region that starts at kAttributesOffset=21).
 //     3. lastOffsetDelta / recordCount parse & consistency check.
 //     4. CRC validation (RecordBatchReader::ensureValid).
+//    4b. Producer identity: frame producerId (always) / epoch + baseSequence
+//        (when producerId >= 0) must equal the RecordBatch header's →
+//        else SchemaValidationFailed (identityMismatch), NO append.
 //     5. Idempotent dedup via `producerState`:
 //          Duplicate     → return prior baseOffset, NO append.
 //          OOS           → return OutOfOrderSequence, NO append.
@@ -76,8 +79,17 @@ namespace rune::storage {
 //
 // On duplicate (error == OK with isDuplicate flag):
 //   baseOffset    — the PRIOR base offset (the original append; do NOT re-ack a
-//                   new offset — return this value to the client).
+//                   new offset — return this value to the client), or -1 for a
+//                   KNOWN-OLD duplicate (EOS-OOS: entirely <= lastSequence but
+//                   out of the window — Kafka DUPLICATE_SEQUENCE_NUMBER: OK,
+//                   offset unknown).
+//   lastOffset    — the log offset the answer's ack condition must cover (HW /
+//                   fsync): the original's last offset, or for a known-old
+//                   duplicate the last offset of the batch holding lastSequence.
 //   isDuplicate   — true; caller must NOT re-append or update PSM.
+//
+// On a producer-identity mismatch (frame vs RecordBatch header, step 4b):
+//   error = SchemaValidationFailed, identityMismatch = true (non-retriable).
 //
 // On any other error (!isOK()):
 //   baseOffset == 0, lastOffset == 0.
@@ -90,6 +102,9 @@ struct ProduceOutcome {
     uint16_t batchAttrs   = 0;   ///< LE16 attributes (bit4 = TRANSACTIONAL) for LSO tracking
     bool     isDuplicate  = false; ///< true → duplicate dedup; baseOffset = prior offset
     bool     syncDone     = false; ///< true → strict-tier inline sync() already completed
+    /// true → rejected: the Produce frame's producer identity disagrees with the
+    /// CRC-covered RecordBatch header (EOS-DUP defense); caller counts + logs.
+    bool     identityMismatch = false;
 
     [[nodiscard]] bool isOK() const noexcept {
         return error == rune::protocol::client::ErrorCode::OK;

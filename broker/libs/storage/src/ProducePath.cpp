@@ -15,6 +15,7 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <cstring>
+#include <limits>
 #include <spdlog/spdlog.h>
 
 namespace rune::storage {
@@ -140,6 +141,39 @@ ProduceOutcome handleProduceBatch(
         }
     }
 
+    // -------------------------------------------------------------------------
+    // 4b. Producer identity cross-check (EOS-DUP defense, eos-dup-fix-review §3).
+    //     The Produce FRAME's producerId / epoch / baseSequence drive dedup but
+    //     are NOT CRC-covered; the RecordBatch HEADER's (offsets 43/51/53, inside
+    //     the CRC region that starts at kAttributesOffset=21) are.  They must
+    //     agree, or dedup runs on an identity the stored batch does not carry
+    //     (the pre-460dd12 client sent frame pid -1 with a header pid >= 0 →
+    //     dedup skipped, every retransmit appended again).
+    //     producerId is ALWAYS compared (frame -1 vs header >= 0 is exactly the
+    //     EOS-DUP signature); epoch + baseSequence only when producerId >= 0
+    //     (a legacy / acks=None frame carries epoch 0 against a header -1).
+    //     Reject: SchemaValidationFailed — the closest existing code to Kafka's
+    //     non-retriable INVALID_RECORD ("the record failed broker validation";
+    //     re-sending the same bytes always fails the same way).  Never appended,
+    //     never shown to the PSM.  The caller counts (identityMismatch) + logs.
+    //     Three fixed-offset loads; batchLen >= kMinBatchSize covers offset 57.
+    // -------------------------------------------------------------------------
+    {
+        namespace rd = rune::protocol::detail;
+        const auto hPid = static_cast<int64_t>(rd::getLE64(batch + rb::kProducerIdOffset));
+        bool mismatch = hPid != producerId;
+        if (!mismatch && producerId >= 0) {
+            const auto hEpoch = static_cast<int16_t>(rd::getLE16(batch + rb::kProducerEpochOffset));
+            const auto hSeq   = static_cast<int32_t>(rd::getLE32(batch + rb::kBaseSequenceOffset));
+            mismatch = hEpoch != producerEpoch || hSeq != baseSequence;
+        }
+        if (mismatch) [[unlikely]] {
+            out.error            = pc::ErrorCode::SchemaValidationFailed;
+            out.identityMismatch = true;
+            return out;
+        }
+    }
+
     // lastOffset is derived after the append assigns the base offset (step 7).
     int64_t lastOffset = 0;
 
@@ -158,7 +192,15 @@ ProduceOutcome handleProduceBatch(
     //    Mutates producerState only on the Accept path (after append).
     // -------------------------------------------------------------------------
     if (producerId >= 0) {
-        const int32_t lastSeqInBatch = baseSequence + recordCount - 1;
+        // Review I2: no signed overflow — a batch whose sequences would run past
+        // INT32_MAX is refused (the producer bumps its epoch before overflow; a
+        // wrap BETWEEN batches, seq 0 after INT32_MAX, is accepted by the PSM).
+        const int64_t lastSeq64 = static_cast<int64_t>(baseSequence) + recordCount - 1;
+        if (lastSeq64 > std::numeric_limits<int32_t>::max()) [[unlikely]] {
+            out.error = pc::ErrorCode::OutOfOrderSequence;
+            return out;
+        }
+        const auto lastSeqInBatch = static_cast<int32_t>(lastSeq64);
         const auto vr = producerState.validate(
             topicId, producerId, partition,
             producerEpoch, baseSequence, lastSeqInBatch);
@@ -170,7 +212,15 @@ ProduceOutcome handleProduceBatch(
                           partition, vr.retryBaseOffset);
             out.error       = pc::ErrorCode::OK;
             out.isDuplicate = true;
+            // In-window: the original base offset.  Known-old (EOS-OOS, Kafka
+            // DUPLICATE_SEQUENCE_NUMBER parity): -1 = offset unknown.
             out.baseOffset  = vr.retryBaseOffset;
+            // The offset the answer's ack condition must cover: the original's
+            // last offset (in-window), or the batch holding lastSequence
+            // (known-old).  Unknown (a window-less entry, corrupt state only) →
+            // everything appended so far (LEO - 1): over-waits, never under.
+            out.lastOffset  = vr.coveredLastOffset >= 0 ? vr.coveredLastOffset
+                                                        : log.logEndOffset() - 1;
             out.recordCount = recordCount;
             out.batchAttrs  = batchAttrs;
             return out;
@@ -238,7 +288,8 @@ ProduceOutcome handleProduceBatch(
     //    original base offset.
     // -------------------------------------------------------------------------
     if (producerId >= 0) {
-        const int32_t lastSeqInBatch = baseSequence + recordCount - 1;
+        const auto lastSeqInBatch = static_cast<int32_t>(
+            static_cast<int64_t>(baseSequence) + recordCount - 1);   // range-checked at step 5
         producerState.update(
             topicId, producerId, partition,
             producerEpoch, baseSequence, lastSeqInBatch,

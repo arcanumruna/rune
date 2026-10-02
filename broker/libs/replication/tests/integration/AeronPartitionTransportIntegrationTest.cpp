@@ -40,6 +40,7 @@ extern "C" {
 #include <rune/replication/WorkerReplicationTransport.h>
 #include <rune/storage/Log.h>
 
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -654,6 +655,25 @@ TEST(AeronPartitionTransportRegression, TrafficCountersArePerInstance) {
     EXPECT_GE(a1.polls, 0);
     EXPECT_EQ(b1.outDrained, b0.outDrained) << "draining A must not move B's counter";
     EXPECT_EQ(b1.polls, b0.polls) << "polling A must not move B's counter";
+}
+
+// Review (eos-dup-fix-review §2.1): the transport per-second rate diagnostic
+// (RUNE_FS_LOG) must be OFF by default at its REAL call site, poll().  Its
+// counters only move while the diagnostic is on, so a default-env poll must
+// leave them at zero (the pre-fix default-ON lambda counted every poll).
+TEST(DiagFlagsRegression, TransportRateLogCallSiteOffByDefaultRegression) {
+    if (std::getenv("RUNE_FS_LOG") != nullptr)
+        GTEST_SKIP() << "RUNE_FS_LOG is set in this environment; the default is not under test";
+    TempDir driverTd("rune_diagflags_driver_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    AeronPartitionTransport t(aeronClient, udpChannel(discoverFreeUdpPort()), 503, /*selfId=*/1);
+    for (int i = 0; i < 3; ++i) (void)t.poll(1'000'000LL * (i + 1));
+    EXPECT_EQ(t.txStatsForTest().polls, 0)
+        << "the transport rate diagnostic ran with RUNE_FS_LOG unset";
 }
 
 // ===========================================================================

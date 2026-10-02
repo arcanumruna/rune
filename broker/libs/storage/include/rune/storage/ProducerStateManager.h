@@ -19,8 +19,14 @@
 //                       update().
 //   Duplicate         — this (epoch, baseSequence..lastSequence) matches a
 //                       cached batch; retryBaseOffset carries the original
-//                       log base offset.  Do NOT re-append.
-//   OutOfOrderSequence— gap or stale sequence that is not a known duplicate.
+//                       log base offset.  Do NOT re-append.  OR (known-old,
+//                       Kafka DUPLICATE_SEQUENCE_NUMBER parity) a same-epoch
+//                       batch entirely <= lastSequence that left the window:
+//                       retryBaseOffset == -1 (offset unknown).  Either way
+//                       coveredLastOffset is the log offset the answer's ack
+//                       condition must cover.
+//   OutOfOrderSequence— forward gap, or a batch partially overlapping
+//                       lastSequence (base <= lastSequence < end).
 //   InvalidProducerEpoch — producerEpoch < tracked epoch (zombie fenced).
 //
 // Epoch semantics (mirror Kafka):
@@ -45,6 +51,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include <rune/protocol/client/Protocol.h>
+
 // De-virtualized (Milestone D Phase 2): the former ILog seam is gone.
 // rebuildFromLog() is now a TEMPLATE over the concrete log type (Log /
 // InMemoryLog) so it never dispatches virtually.  The out-of-line template
@@ -55,12 +63,21 @@ namespace rune::storage {
 
 // ---------------------------------------------------------------------------
 // Number of recent batches kept per producer-partition for retry dedup.
-// Mirrors Kafka's ProducerStateManager.MaxProducerIdExpirationMs / NumBatches.
+//
+// EOS-OOS (2026-10-02): this MUST equal the client's idempotent in-flight bound
+// (rune-protocol kIdempotentMaxInFlightBatches, 32): a retransmit of any batch
+// the client may still have in flight is then answered as a duplicate with its
+// original offset.  (Kafka keeps 5 = its max.in.flight cap under idempotence.)
+// A same-epoch batch older than the window but entirely <= lastSequence is a
+// KNOWN-OLD duplicate (Duplicate with retryBaseOffset -1), never OOS.
 // ---------------------------------------------------------------------------
-inline constexpr int kRetryWindowSize = 5;
+inline constexpr int kRetryWindowSize = rune::protocol::client::kIdempotentMaxInFlightBatches;
+static_assert(kRetryWindowSize > 0 && kRetryWindowSize <= 255,
+              "windowHead / windowCount are uint8_t");
 
 // ---------------------------------------------------------------------------
-// BatchDescriptor — one entry in the per-producer retry window.
+// BatchDescriptor — one batch of the per-producer retry window (a VALUE view;
+// the entry stores the window as parallel arrays, see ProducerStateEntry).
 // ---------------------------------------------------------------------------
 struct BatchDescriptor {
     int32_t baseSequence{-1};   // first seq in batch (-1 == empty slot)
@@ -70,15 +87,49 @@ struct BatchDescriptor {
 
 // ---------------------------------------------------------------------------
 // ProducerStateEntry — per (producerId, partition) tracking state.
+//
+// Layout (cache-friendly, 8 + 32*8 + 32*8 = 520 bytes): a compact 8-byte header,
+// then the window as parallel arrays.  The dedup scan (only for a retransmit,
+// baseSequence <= lastSequence) reads just `seqs` (256 B, 4 cache lines,
+// vectorisable); `baseOffsets` is touched only for the matching slot.  The
+// in-order hot path (baseSequence == lastSequence + 1) touches the header only.
+// Slots [0, windowCount) are filled; when full, windowHead is the oldest slot.
 // ---------------------------------------------------------------------------
 struct ProducerStateEntry {
+    struct SeqRange {
+        int32_t base{-1};        // first seq in batch (-1 == empty slot)
+        int32_t last{-1};        // last  seq in batch
+    };
+
     int16_t producerEpoch{-1};   // -1 = never seen
+    uint8_t windowHead{0};       // next slot to write (oldest when full)
+    uint8_t windowCount{0};      // slots filled so far (capped at kRetryWindowSize)
     int32_t lastSequence{-1};    // last seq appended (-1 = no batch yet)
 
-    // Circular retry window (kRetryWindowSize slots).
-    std::array<BatchDescriptor, kRetryWindowSize> window{};
-    int     windowHead{0};       // next slot to write (oldest when full)
-    int     windowCount{0};      // slots filled so far (capped at kRetryWindowSize)
+    std::array<SeqRange, kRetryWindowSize> seqs{};
+    std::array<int64_t,  kRetryWindowSize> baseOffsets{};
+
+    [[nodiscard]] BatchDescriptor slot(int i) const noexcept {
+        return BatchDescriptor{seqs[static_cast<std::size_t>(i)].base,
+                               seqs[static_cast<std::size_t>(i)].last,
+                               baseOffsets[static_cast<std::size_t>(i)]};
+    }
+    /// Slot of the newest batch (the one holding lastSequence); -1 when empty.
+    [[nodiscard]] int newestSlot() const noexcept {
+        return windowCount == 0 ? -1 : (windowHead + kRetryWindowSize - 1) % kRetryWindowSize;
+    }
+    void resetWindow() noexcept {
+        windowHead = 0;
+        windowCount = 0;
+        seqs        = {};
+        baseOffsets = {};
+    }
+    void push(int32_t baseSeq, int32_t lastSeq, int64_t baseOffset) noexcept {
+        seqs[windowHead]        = SeqRange{baseSeq, lastSeq};
+        baseOffsets[windowHead] = baseOffset;
+        windowHead = static_cast<uint8_t>((windowHead + 1) % kRetryWindowSize);
+        if (windowCount < kRetryWindowSize) ++windowCount;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -94,11 +145,16 @@ struct ValidationResult {
 
     Status  status{Status::Accept};
     int64_t retryBaseOffset{-1};  // valid when status == Duplicate
+    // Duplicate only: the last log offset the duplicate's answer waits on (its
+    // ack condition — HW / fsync — must cover it).  -1 = unknown.
+    int64_t coveredLastOffset{-1};
 
-    static ValidationResult accept()  { return {Status::Accept,  -1}; }
-    static ValidationResult dup(int64_t off) { return {Status::Duplicate, off}; }
-    static ValidationResult oos()     { return {Status::OutOfOrderSequence,  -1}; }
-    static ValidationResult fenced()  { return {Status::InvalidProducerEpoch, -1}; }
+    static ValidationResult accept()  { return {Status::Accept,  -1, -1}; }
+    static ValidationResult dup(int64_t off, int64_t coveredLast = -1) {
+        return {Status::Duplicate, off, coveredLast};
+    }
+    static ValidationResult oos()     { return {Status::OutOfOrderSequence,  -1, -1}; }
+    static ValidationResult fenced()  { return {Status::InvalidProducerEpoch, -1, -1}; }
 
     bool isAccept()   const { return status == Status::Accept; }
     bool isDuplicate() const { return status == Status::Duplicate; }
@@ -221,7 +277,16 @@ public:
 
     // -----------------------------------------------------------------------
     // Snapshot + recover (crash-safe, fsync'd).
+    //
+    // Format version 3 records the window size it was written with (file header
+    // [12..15]); recover() accepts any recorded size and keeps the newest
+    // min(recorded, kRetryWindowSize) batches.  Version 2 (implicit 5-batch
+    // window, pre EOS-OOS) is still read.  Byte layout: ProducerStateManager.cpp.
     // -----------------------------------------------------------------------
+    static constexpr uint32_t kSnapshotFileHeaderBytes = 16u;
+    static constexpr uint32_t kSnapshotEntryBytes =
+        32u + static_cast<uint32_t>(kRetryWindowSize) * 16u + 4u;   // fixed + slots + CRC32C
+
     void takeSnapshot(const std::string& path) const;
 
     /// Recover state from a previous snapshot.  Returns the number of entries

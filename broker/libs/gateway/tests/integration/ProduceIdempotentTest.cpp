@@ -88,9 +88,13 @@ static TopicSpec makeSpec(std::string name, int32_t pc, int32_t id)
 }
 
 // Build a RecordBatch with `recordCount` records, baseOffset placeholder = 0.
-static std::vector<uint8_t> makeBatch(int32_t recordCount)
+// An idempotent batch's header carries the same producer identity as the
+// Produce frame (the broker rejects a mismatch — EOS-DUP defense).
+static std::vector<uint8_t> makeBatch(int32_t recordCount, int64_t pid = -1,
+                                      int16_t epoch = -1, int32_t seq = -1)
 {
     rune::protocol::RecordBatchBuilder b(0, 1000LL);
+    if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); }
     for (int32_t i = 0; i < recordCount; ++i) {
         b.append("k", "v", 1000LL + i);
     }
@@ -394,7 +398,7 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_DuplicateBatchReturnsPriorOff
     const int64_t sid = connResp.assignedSessionId;
 
     constexpr int32_t kRecords = 3;
-    auto batch = makeBatch(kRecords);
+    auto batch = makeBatch(kRecords, /*pid=*/9, /*epoch=*/0, /*seq=*/0);
     std::span<const uint8_t> batchSpan(batch.data(), batch.size());
 
     // First produce (idempotent: pid=9, epoch=0, baseSeq=0).
@@ -441,8 +445,10 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_OutOfOrderRejected)
     const int64_t sid = connResp.assignedSessionId;
 
     constexpr int32_t kRecords = 3;
-    auto batch = makeBatch(kRecords);
+    auto batch = makeBatch(kRecords, /*pid=*/9, /*epoch=*/0, /*seq=*/0);
     std::span<const uint8_t> batchSpan(batch.data(), batch.size());
+    auto gapBatch = makeBatch(kRecords, /*pid=*/9, /*epoch=*/0, /*seq=*/10);
+    std::span<const uint8_t> gapSpan(gapBatch.data(), gapBatch.size());
 
     // First produce OK.
     sendIdempotentProduce(*client.ingressPub, sid, /*corrId=*/20,
@@ -457,7 +463,7 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_OutOfOrderRejected)
     sendIdempotentProduce(*client.ingressPub, sid, /*corrId=*/21,
                           kTopicId, kPartition0,
                           /*pid=*/9, /*epoch=*/0, /*baseSeq=*/10,
-                          batchSpan, "OOSProduce");
+                          gapSpan, "OOSProduce");
     auto r2 = recvProduceResponse(*client.egressSub, "OOSResponse");
     ASSERT_TRUE(r2.has_value()) << "No response for OOS produce";
     EXPECT_EQ(r2->errorCode,
@@ -478,7 +484,7 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_OldEpochFenced)
                               /*correlationId=*/3, scratch_);
     const int64_t sid = connResp.assignedSessionId;
 
-    auto batch1 = makeBatch(1);
+    auto batch1 = makeBatch(1, /*pid=*/9, /*epoch=*/1, /*seq=*/0);
     std::span<const uint8_t> batchSpan1(batch1.data(), batch1.size());
 
     // Produce with epoch=1 (higher epoch). Expected seq=0 for new session.
@@ -491,7 +497,7 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_OldEpochFenced)
     EXPECT_EQ(r1->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
 
     // Zombie: lower epoch=0 attempt.
-    auto batch2 = makeBatch(1);
+    auto batch2 = makeBatch(1, /*pid=*/9, /*epoch=*/0, /*seq=*/1);
     std::span<const uint8_t> batchSpan2(batch2.data(), batch2.size());
     sendIdempotentProduce(*client.ingressPub, sid, /*corrId=*/31,
                           kTopicId, kPartition0,
@@ -541,6 +547,41 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_LegacyProducerPassthrough)
     rune::storage::Log* log = registry_->log(kTopicId, kPartition0);
     ASSERT_NE(log, nullptr);
     EXPECT_EQ(log->logEndOffset(), 4);  // 2 batches × 2 records
+}
+
+// Review I3: the no-worker-pool INLINE path's PSM is rebuilt only on a node-
+// level leadership change, so it refuses a KNOWN-OLD duplicate (older than the
+// window) with OutOfOrderSequence instead of answering OK with an unknown
+// offset; an in-window retransmit is still answered with its original offset.
+TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathRefusesKnownOldDuplicate)
+{
+    auto client = makeClient(kEgressBase + 5);
+    auto connResp = doConnect(*client.ingressPub, *client.egressSub,
+                              client.egressStreamId, client.egressChannel,
+                              /*correlationId=*/5, scratch_);
+    const int64_t sid = connResp.assignedSessionId;
+    const int n = rune::protocol::client::kIdempotentMaxInFlightBatches + 2;
+    std::vector<std::vector<uint8_t>> batches;
+    for (int i = 0; i < n; ++i) batches.push_back(makeBatch(1, /*pid=*/12, /*epoch=*/0, /*seq=*/i));
+    for (int i = 0; i < n; ++i) {
+        sendIdempotentProduce(*client.ingressPub, sid, 500 + i, kTopicId, kPartition0, 12, 0, i,
+                              std::span<const uint8_t>(batches[i]), "Fill");
+        auto r = recvProduceResponse(*client.egressSub, "FillResponse");
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::OK)) << i;
+    }
+    sendIdempotentProduce(*client.ingressPub, sid, 600, kTopicId, kPartition0, 12, 0, 0,
+                          std::span<const uint8_t>(batches[0]), "KnownOld");
+    auto old = recvProduceResponse(*client.egressSub, "KnownOldResponse");
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence));
+    sendIdempotentProduce(*client.ingressPub, sid, 601, kTopicId, kPartition0, 12, 0, n - 1,
+                          std::span<const uint8_t>(batches[n - 1]), "InWindow");
+    auto dup = recvProduceResponse(*client.egressSub, "InWindowResponse");
+    ASSERT_TRUE(dup.has_value());
+    EXPECT_EQ(dup->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(dup->baseOffset, n - 1);
+    EXPECT_EQ(registry_->log(kTopicId, kPartition0)->logEndOffset(), n);
 }
 
 } // namespace

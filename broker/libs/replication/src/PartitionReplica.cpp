@@ -72,14 +72,12 @@ const std::vector<uint8_t>& PartitionReplica::makeBatch_(Offset baseOffset,
 // follower-sync state change and the factors that drive it (onResponse inputs,
 // decide emits, resets).  OPT-IN: off unless RUNE_FS_LOG is set to a value
 // other than "0" — a default deployment never formats a log line per follower
-// fetch.  Checked once (static-init) so it costs nothing on the hot path when off.
+// fetch.  Read once at static init into a namespace-scope const (no function-
+// local static: no guard-variable acquire load per call on the replication path).
+// Only read after main() (replicas are never built by a static initializer).
 // ---------------------------------------------------------------------------
-static bool fsLogEnabled() noexcept {
-    static const bool on = [] {
-        return diagFlagFromEnv(std::getenv("RUNE_FS_LOG"));
-    }();
-    return on;
-}
+static const bool g_fsLogEnabled = diagFlagFromEnv(std::getenv("RUNE_FS_LOG"));
+static bool fsLogEnabled() noexcept { return g_fsLogEnabled; }
 
 
 // ---------------------------------------------------------------------------

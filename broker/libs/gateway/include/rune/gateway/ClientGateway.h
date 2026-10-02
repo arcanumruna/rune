@@ -527,6 +527,9 @@ public:
     [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept {
         return oversizeProduceRejectLogs_;
     }
+    /// EOS-DUP defense (inline path): produces rejected because the frame's
+    /// producer identity disagreed with the RecordBatch header.
+    [[nodiscard]] uint64_t identityMismatchRejects() const noexcept { return identityMismatchRejects_; }
 
     // -----------------------------------------------------------------------
     // pendingAckCount — number of deferred acks=All entries waiting for HW.
@@ -1262,6 +1265,7 @@ private:
     std::size_t maxProduceBatchBytes_ = kMaxProduceBatchBytes;
     // F3 round 6, item 2: oversize-reject log rate limiting (control thread only).
     uint64_t oversizeProduceRejects_    = 0;
+    uint64_t identityMismatchRejects_   = 0;   // inline path: frame identity != batch header
     uint64_t oversizeProduceRejectLogs_ = 0;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().

@@ -1,15 +1,15 @@
 // ---------------------------------------------------------------------------
 // ProducerStateManager.cpp — Kafka-style idempotent producer dedup.
 //
-// On-disk snapshot format (all little-endian):
+// On-disk snapshot format (all little-endian), VERSION 3:
 //
 // File header:
 //   [0..3]   uint32  magic        = kFileMagic (0x50534D47 "PSMG")
-//   [4..7]   uint32  version      = 1
+//   [4..7]   uint32  version      = 3
 //   [8..11]  uint32  entryCount
-//   [12..15] uint32  _pad = 0
+//   [12..15] uint32  windowSlots  = W (kRetryWindowSize at write time)
 //
-// Per-entry (fixed size = kEntrySize):
+// Per-entry (fixed size = 32 + W*16 + 4):
 //   [0..7]   int64   producerId
 //   [8..11]  int32   partition
 //   [12..13] int16   producerEpoch
@@ -17,16 +17,17 @@
 //   [16..19] int32   lastSequence
 //   [20..23] int32   windowHead
 //   [24..27] int32   windowCount
-//   [28..31] int32   _pad = 0
-//   Then kRetryWindowSize * kBatchDescSize bytes of window slots:
+//   [28..31] int32   topicId
+//   Then W * 16 bytes of window slots:
 //     slot: int32 baseSequence, int32 lastSequence, int64 baseOffset (16 bytes)
 //   Trailing uint32 CRC32C of everything in the entry before the checksum.
 //
-// kEntrySize = 32 + kRetryWindowSize * 16 + 4
-//            = 32 + 5 * 16 + 4 = 116 bytes
+// Version 2 (TX-2c .. EOS-OOS): identical except [12..15] was pad (0) and W was
+// implicitly 5.  recover() reads both; a recorded W different from the current
+// kRetryWindowSize is re-windowed (slots replayed oldest-first, the newest
+// min(W, kRetryWindowSize) kept).  Version 1 (no topicId) is rejected.
 //
-// The file is written atomically: entries, then file header, then fsync.
-// Replay: read header, then read each entry verbatim.
+// The file is written atomically: temp file, fsync, rename.
 // A torn entry (file too short, CRC mismatch) stops replay; we keep what we
 // decoded so far — the last snapshot is always consistent.
 // ---------------------------------------------------------------------------
@@ -44,6 +45,7 @@
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -89,20 +91,26 @@ static T rle(const uint8_t* p) noexcept { T v{}; std::memcpy(&v, p, sizeof(T)); 
 // Layout constants
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kFileMagic   = 0x50534D47u; // "PSMG"
-// TX-2c: bumped to version 2 to include topicId in the per-entry header.
-// Version 1 snapshots (no topicId) are rejected cleanly in recover().
-static constexpr uint32_t kFileVersion = 2u;
-static constexpr uint32_t kFileHdrSize = 16u;         // magic+version+count+pad
+// TX-2c: version 2 added topicId to the per-entry header.
+// EOS-OOS: version 3 records the window size in the file header (the window
+// grew 5 -> kIdempotentMaxInFlightBatches).  Version 1 is rejected.
+static constexpr uint32_t kFileVersion   = 3u;
+static constexpr uint32_t kFileVersionV2 = 2u;
+static constexpr uint32_t kV2WindowSlots = 5u;
+static constexpr uint32_t kFileHdrSize   = ProducerStateManager::kSnapshotFileHeaderBytes;
 
 static constexpr uint32_t kBatchDescSize = 16u;       // int32+int32+int64
-// Per-entry fixed header (TX-2c, version 2):
+// Per-entry fixed header:
 //   producerId(8) + partition(4) + epoch(2) + pad(2)
 //   + lastSequence(4) + windowHead(4) + windowCount(4) + topicId(4) = 32
-// topicId replaces the former trailing pad(4) at [28..31].
 static constexpr uint32_t kEntryFixedSize = 32u;
-static constexpr uint32_t kWindowBytes    = kRetryWindowSize * kBatchDescSize; // 80
 static constexpr uint32_t kChecksumSize   = 4u;
-static constexpr uint32_t kEntrySize      = kEntryFixedSize + kWindowBytes + kChecksumSize; // 116
+static constexpr uint32_t entrySizeFor(uint32_t windowSlots) noexcept {
+    return kEntryFixedSize + windowSlots * kBatchDescSize + kChecksumSize;
+}
+static constexpr uint32_t kWindowBytes = static_cast<uint32_t>(kRetryWindowSize) * kBatchDescSize;
+static constexpr uint32_t kEntrySize   = entrySizeFor(static_cast<uint32_t>(kRetryWindowSize));
+static_assert(kEntrySize == ProducerStateManager::kSnapshotEntryBytes);
 
 // -------------------------------------------------------------------------
 // Encode one BatchDescriptor into p (16 bytes, LE)
@@ -164,29 +172,44 @@ ProducerStateManager::validate(int32_t topicId,
         return ValidationResult::accept();
     }
 
-    // Same epoch — check sequence.
-    // First, scan the retry window for an exact duplicate.
+    // Same epoch.  Hot path: the next in-order batch — header only, no scan.
+    if (baseSequence > e.lastSequence) {
+        // lastSequence == -1 means no batch appended yet in this epoch → expect 0.
+        if (baseSequence == e.lastSequence + 1) return ValidationResult::accept();
+        return ValidationResult::oos();   // forward gap
+    }
+
+    // Review I2: sequences wrap INT32_MAX -> 0 (Kafka incrementSequence).  The
+    // batch after lastSequence == INT32_MAX starts at 0 and is IN ORDER — never
+    // a known-old duplicate (that would answer OK without appending: loss).
+    if (e.lastSequence == std::numeric_limits<int32_t>::max() && baseSequence == 0)
+        return ValidationResult::accept();
+
+    // baseSequence <= lastSequence: a retransmit (rare).  An exact match in the
+    // window answers with the original offset.  Filled slots are [0, count)
+    // (circular only once full; the match is order-independent).
     for (int i = 0; i < e.windowCount; ++i) {
-        // Window is stored oldest-first from windowHead when full, or from [0]
-        // when not full. The easiest approach: iterate all filled slots.
-        // Slots 0..windowCount-1 if not yet wrapped; circular otherwise.
-        int slot = (e.windowHead - e.windowCount + kRetryWindowSize + i) % kRetryWindowSize;
-        const auto& bd = e.window[slot];
-        if (bd.baseSequence == baseSequence && bd.lastSequence == lastSequenceInBatch) {
-            return ValidationResult::dup(bd.baseOffset);
+        const auto& r = e.seqs[static_cast<std::size_t>(i)];
+        if (r.base == baseSequence && r.last == lastSequenceInBatch) {
+            const int64_t off = e.baseOffsets[static_cast<std::size_t>(i)];
+            return ValidationResult::dup(off, off + (r.last - r.base));
         }
     }
 
-    // Compute the expected next baseSequence.
-    // lastSequence == -1 means no batch appended yet in this epoch.
-    int32_t expected = (e.lastSequence < 0) ? 0 : e.lastSequence + 1;
-
-    if (baseSequence == expected) {
-        return ValidationResult::accept();
+    // EOS-OOS (Kafka DUPLICATE_SEQUENCE_NUMBER parity): entirely at or below
+    // lastSequence but not in the window → a KNOWN-OLD duplicate.  Every
+    // sequence <= lastSequence of this epoch was appended (in order, from 0), so
+    // the records are stored: OK with an unknown offset, never re-appended.  Its
+    // answer waits on the batch holding lastSequence (the newest slot).
+    if (lastSequenceInBatch <= e.lastSequence) {
+        const int n = e.newestSlot();
+        const int64_t covered = n < 0 ? int64_t{-1}
+            : e.baseOffsets[static_cast<std::size_t>(n)] +
+              (e.seqs[static_cast<std::size_t>(n)].last - e.seqs[static_cast<std::size_t>(n)].base);
+        return ValidationResult::dup(-1, covered);
     }
 
-    // baseSequence < expected and not in retry window → stale / gap
-    // baseSequence > expected → forward gap
+    // Partially overlaps lastSequence (base <= last < end) → OutOfOrderSequence.
     return ValidationResult::oos();
 }
 
@@ -212,17 +235,11 @@ void ProducerStateManager::update(int32_t topicId,
         // New epoch: clear retry window + reset sequence state.
         e.producerEpoch = producerEpoch;
         e.lastSequence  = -1;
-        e.windowHead    = 0;
-        e.windowCount   = 0;
-        e.window        = {};
+        e.resetWindow();
     }
 
     // Record the batch in the retry window (circular, evicts oldest when full).
-    BatchDescriptor bd{baseSequence, lastSequence, baseOffset};
-    e.window[e.windowHead] = bd;
-    e.windowHead = (e.windowHead + 1) % kRetryWindowSize;
-    if (e.windowCount < kRetryWindowSize) ++e.windowCount;
-
+    e.push(baseSequence, lastSequence, baseOffset);
     e.lastSequence = lastSequence;
 }
 
@@ -237,9 +254,7 @@ void ProducerStateManager::fenceEpoch(int32_t topicId, int64_t producerId, int32
     if (producerEpoch <= e.producerEpoch) return;
     e.producerEpoch = producerEpoch;
     e.lastSequence  = -1;
-    e.windowHead    = 0;
-    e.windowCount   = 0;
-    e.window        = {};
+    e.resetWindow();
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +308,7 @@ void ProducerStateManager::takeSnapshot(const std::string& path) const
     wle<uint32_t>(p,      kFileMagic);
     wle<uint32_t>(p + 4,  kFileVersion);
     wle<uint32_t>(p + 8,  static_cast<uint32_t>(count));
-    wle<uint32_t>(p + 12, 0u); // pad
+    wle<uint32_t>(p + 12, static_cast<uint32_t>(kRetryWindowSize)); // v3: window slots
     p += kFileHdrSize;
 
     // Entries.
@@ -305,13 +320,13 @@ void ProducerStateManager::takeSnapshot(const std::string& path) const
         wle<int16_t>(ep + 12, e.producerEpoch);
         wle<int16_t>(ep + 14, 0); // pad
         wle<int32_t>(ep + 16, e.lastSequence);
-        wle<int32_t>(ep + 20, e.windowHead);
-        wle<int32_t>(ep + 24, e.windowCount);
+        wle<int32_t>(ep + 20, static_cast<int32_t>(e.windowHead));
+        wle<int32_t>(ep + 24, static_cast<int32_t>(e.windowCount));
         wle<int32_t>(ep + 28, key.topicId); // TX-2c: topicId (replaces former pad)
 
         uint8_t* wp = ep + kEntryFixedSize;
         for (int i = 0; i < kRetryWindowSize; ++i) {
-            encodeBatch(wp + static_cast<std::size_t>(i) * kBatchDescSize, e.window[i]);
+            encodeBatch(wp + static_cast<std::size_t>(i) * kBatchDescSize, e.slot(i));
         }
 
         // CRC over the entry body (excluding the trailing checksum itself).
@@ -386,21 +401,31 @@ int ProducerStateManager::recover(const std::string& path)
 
     const uint8_t* p = buf.data();
 
-    // Validate file header.
-    if (rle<uint32_t>(p) != kFileMagic || rle<uint32_t>(p + 4) != kFileVersion) {
-        return 0; // wrong magic/version
+    // Validate file header (v3: recorded window size; v2: implicit 5 slots).
+    if (rle<uint32_t>(p) != kFileMagic) return 0;
+    const uint32_t version = rle<uint32_t>(p + 4);
+    uint32_t slots = 0;
+    if (version == kFileVersion) {
+        slots = rle<uint32_t>(p + 12);
+        if (slots == 0 || slots > 255u) return 0;           // corrupt header
+    } else if (version == kFileVersionV2) {
+        slots = kV2WindowSlots;
+    } else {
+        return 0;                                           // v1 / unknown
     }
+    const uint32_t entrySize   = entrySizeFor(slots);
+    const uint32_t windowBytes = slots * kBatchDescSize;
     const uint32_t count = rle<uint32_t>(p + 8);
     p += kFileHdrSize;
 
     // S4: 64-bit arithmetic to prevent overflow for large count values from disk.
     const uint64_t needed = static_cast<uint64_t>(kFileHdrSize) +
-                            static_cast<uint64_t>(count) * static_cast<uint64_t>(kEntrySize);
+                            static_cast<uint64_t>(count) * static_cast<uint64_t>(entrySize);
     if (static_cast<uint64_t>(fileSize) < needed) {
         return 0; // file truncated
     }
     // Bound count against fileSize to prevent over-read if count is forged.
-    const uint32_t maxEntries = static_cast<uint32_t>((fileSize - kFileHdrSize) / kEntrySize);
+    const uint32_t maxEntries = static_cast<uint32_t>((fileSize - kFileHdrSize) / entrySize);
 
     map_.clear();
     int loaded = 0;
@@ -408,11 +433,11 @@ int ProducerStateManager::recover(const std::string& path)
     const uint32_t safeCount = std::min(count, maxEntries);
 
     for (uint32_t i = 0; i < safeCount; ++i) {
-        const uint8_t* ep = p + static_cast<std::size_t>(i) * kEntrySize;
+        const uint8_t* ep = p + static_cast<std::size_t>(i) * entrySize;
 
         // CRC check.
-        uint32_t storedCksum = rle<uint32_t>(ep + kEntryFixedSize + kWindowBytes);
-        uint32_t computed    = crc32c(ep, kEntryFixedSize + kWindowBytes);
+        uint32_t storedCksum = rle<uint32_t>(ep + kEntryFixedSize + windowBytes);
+        uint32_t computed    = crc32c(ep, kEntryFixedSize + windowBytes);
         if (storedCksum != computed) {
             break; // torn/corrupt entry — stop here, keep what we have
         }
@@ -425,19 +450,24 @@ int ProducerStateManager::recover(const std::string& path)
         e.producerEpoch = rle<int16_t>(ep + 12);
         // [14..15] pad
         e.lastSequence  = rle<int32_t>(ep + 16);
-        e.windowHead    = rle<int32_t>(ep + 20);
-        e.windowCount   = rle<int32_t>(ep + 24);
+        int32_t head    = rle<int32_t>(ep + 20);
+        int32_t cnt     = rle<int32_t>(ep + 24);
         key.topicId     = rle<int32_t>(ep + 28); // TX-2c: topicId (was former pad)
 
         // S5: clamp windowHead/windowCount to valid ranges (defense against corrupt snapshots).
-        if (e.windowCount < 0 || e.windowCount > kRetryWindowSize)
-            e.windowCount = std::clamp(e.windowCount, 0, kRetryWindowSize);
-        if (e.windowHead < 0 || e.windowHead >= kRetryWindowSize)
-            e.windowHead = 0;
+        const auto islots = static_cast<int32_t>(slots);
+        cnt = std::clamp(cnt, 0, islots);
+        if (head < 0 || head >= islots) head = 0;
 
+        // Replay the recorded slots oldest-first into the current window: the
+        // newest min(slots, kRetryWindowSize) survive, in order (re-windowing
+        // when the recorded size differs; identity when it is the same).
         const uint8_t* wp = ep + kEntryFixedSize;
-        for (int j = 0; j < kRetryWindowSize; ++j) {
-            e.window[j] = decodeBatch(wp + static_cast<std::size_t>(j) * kBatchDescSize);
+        const int32_t oldest = (cnt < islots) ? 0 : head;
+        for (int32_t j = 0; j < cnt; ++j) {
+            const int32_t s = (oldest + j) % islots;
+            const BatchDescriptor bd = decodeBatch(wp + static_cast<std::size_t>(s) * kBatchDescSize);
+            e.push(bd.baseSequence, bd.lastSequence, bd.baseOffset);
         }
 
         map_.emplace(key, e);

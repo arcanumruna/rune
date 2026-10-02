@@ -52,6 +52,7 @@ services:
       RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
       RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
       RUNE_LOG_LEVEL: "info"
+      # Explicit off; "0" (= unset) is also the default — RUNE_FS_LOG is opt-in.
       RUNE_FS_LOG: "0"
       # NOTE: NO RUNE_TOPICS here — the typed topic "characters" is created at
       # RUNTIME by the probe via defineTopic() (the whole point of Task 13).
