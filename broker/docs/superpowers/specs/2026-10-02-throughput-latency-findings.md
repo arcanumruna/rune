@@ -191,6 +191,14 @@ per hop × ~4 hops).
 
 ## 7. Open tickets found along the way
 
+- **DUR-1 (after the latency work): replication-based durability without per-write fsync.** Measured: the 10 ms
+  background fsync halves the median and costs 6x on p99 (acks=leader, 20k/s: p50 790 -> 424 us, p99 218 -> 37 ms when
+  off). Before relaxing it by default, verify/implement: unclean-shutdown truncation of the unflushed tail (KIP-101),
+  no leadership/ISR/HW eligibility for a replica restarted after an unclean shutdown until caught up (KIP-966-style),
+  explicit flush-interval config (Strict tier unchanged), minIsr gating, rack-aware placement, and DR fault tests
+  (kill -9 all, hard crash with unflushed data: no acknowledged record lost). Details: broker SDD ledger DUR-1.
+
+
 - F26 Aeron shm budget counts per driver, not per publication (SIGBUS mid-run) — partly addressed
   by `RUNE_AERON_TERM_SPARSE=false` (fails at creation instead).
 - F27 R1 dead-peer stall (fix round 2 in flight).
