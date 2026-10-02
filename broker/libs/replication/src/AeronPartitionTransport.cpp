@@ -4,6 +4,7 @@
 // Single-writer. No locks. No hot-path alloc.
 
 #include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/DiagFlags.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/protocol/RecordBatch.h>
@@ -330,11 +331,11 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
 // skipped (replication is retriable; caller re-drives next cycle). Never blocks.
 // ---------------------------------------------------------------------------
 
-// Per-second transport rate diagnostic (RUNE_FS_LOG).  The enable flag is
-// immutable after static init; the counters are per-transport control-thread
-// members (F9a: they were file statics shared by every in-process node).
-static const bool g_txRateLog = [] { const char* e = std::getenv("RUNE_FS_LOG");
-                                     return e == nullptr || e[0] != '0'; }();
+// Per-second transport rate diagnostic (RUNE_FS_LOG, OPT-IN: unset/empty/"0" =
+// off).  The enable flag is immutable after static init; the counters are
+// per-transport control-thread members (F9a: they were file statics shared by
+// every in-process node).
+static const bool g_txRateLog = diagFlagFromEnv(std::getenv("RUNE_FS_LOG"));
 
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,

@@ -12,6 +12,7 @@
 
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/BatchPrefix.h>
+#include <rune/replication/DiagFlags.h>
 
 #include <limits>
 #include <rune/protocol/RecordBatch.h>
@@ -69,14 +70,13 @@ const std::vector<uint8_t>& PartitionReplica::makeBatch_(Offset baseOffset,
 // ---------------------------------------------------------------------------
 // FollowerSync tracing gate.  TEMPORARY high-verbosity diagnostics: logs every
 // follower-sync state change and the factors that drive it (onResponse inputs,
-// decide emits, resets).  On by default; set RUNE_FS_LOG=0 to silence for clean
-// throughput measurement.  Checked once (static-init) so it costs nothing on
-// the hot path when off.
+// decide emits, resets).  OPT-IN: off unless RUNE_FS_LOG is set to a value
+// other than "0" — a default deployment never formats a log line per follower
+// fetch.  Checked once (static-init) so it costs nothing on the hot path when off.
 // ---------------------------------------------------------------------------
 static bool fsLogEnabled() noexcept {
     static const bool on = [] {
-        const char* e = std::getenv("RUNE_FS_LOG");
-        return e == nullptr || (e[0] != '0' || e[1] != '\0');
+        return diagFlagFromEnv(std::getenv("RUNE_FS_LOG"));
     }();
     return on;
 }
