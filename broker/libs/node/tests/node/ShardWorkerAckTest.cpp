@@ -187,6 +187,9 @@ struct Fixture {
     }
     void produce(int64_t corr, uint8_t acksAll, int64_t pid = -1, int32_t seq = -1, int64_t sid = 5) {
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+        // The batch header carries the same producer identity as the frame (the
+        // broker rejects a mismatch — EOS-DUP defense).
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
         const auto batch = b.build();
         pc::Produce m; m.sessionId = sid; m.correlationId = corr; m.topicId = 1; m.partition = 0;
         m.partitionKnown = 1; m.acks = acksAll; m.producerId = pid; m.producerEpoch = 0; m.baseSequence = seq;
@@ -264,6 +267,7 @@ TEST(ShardWorkerAckRegression, GatewayRoutedProduceIsDedupedByTheWorkerPsm) {
     // core as worker ingress, so a retried idempotent batch is appended once.
     Fixture f({1}, 1);
     rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+    b.setProducerId(11); b.setProducerEpoch(0); b.setBaseSequence(0);   // header == frame identity
     const auto batch = b.build();
     auto routed = [&](int64_t corr) {
         WorkerOp op; op.type = WorkerOp::Type::Produce; op.topicId = 1; op.partition = 0;
@@ -291,6 +295,7 @@ TEST(ShardWorkerAckRegression, AcksAllDuplicateAnsweredOnlyWhenTheOriginalCommit
     for (bool routed : {false, true}) {
         Fixture f({1, 2}, /*minIsr=*/1);                       // follower 2 in the ISR: the HW waits for it
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+        b.setProducerId(11); b.setProducerEpoch(0); b.setBaseSequence(0);   // header == frame identity
         const auto batch = b.build();
         auto send = [&](int64_t corr) {
             if (!routed) { f.produce(corr, /*acks=all*/1, /*pid=*/11, /*seq=*/0); return; }
@@ -318,6 +323,63 @@ TEST(ShardWorkerAckRegression, AcksAllDuplicateAnsweredOnlyWhenTheOriginalCommit
         EXPECT_EQ(f.acks[32].errorCode, 0);
         EXPECT_EQ(f.acks[32].baseOffset, f.acks[31].baseOffset);
     }
+}
+
+// EOS-OOS: a retransmit older than the dedup window (32) but entirely below the
+// producer's lastSequence is a KNOWN-OLD duplicate: answered OK with baseOffset
+// -1 (Kafka DUPLICATE_SEQUENCE_NUMBER), never OutOfOrderSequence, never
+// re-appended.  Rule: its acks=all answer waits until the batch holding
+// lastSequence (the newest one; every record of the duplicate is at or below
+// it) is under the HW — not before.  acks=leader answers at once.
+TEST(ShardWorkerAckRegression, KnownOldDuplicateAnsweredOkOnlyOnceTheNewestBatchCommits) {
+    Fixture f({1, 2}, /*minIsr=*/1);                       // follower 2 in the ISR: the HW waits for it
+    const int n = rune::protocol::client::kIdempotentMaxInFlightBatches + 2;   // seq 0..33
+    for (int i = 0; i < n; ++i) {
+        f.produce(100 + i, /*acks=leader*/0, /*pid=*/11, /*seq=*/i);
+        ASSERT_TRUE(f.awaitAck(100 + i));
+        ASSERT_EQ(f.acks[100 + i].errorCode, 0) << i;
+    }
+    ASSERT_EQ(f.log->logEndOffset(), n);
+    ASSERT_EQ(f.replica->highWatermark(), 0) << "precondition: nothing committed yet";
+
+    f.produce(200, /*acks=all*/1, 11, /*seq=*/0);          // known-old: out of the window
+    for (int i = 0; i < 2'000; ++i) f.step();
+    EXPECT_EQ(f.acks.count(200), 0u) << "answered before the batch holding lastSequence committed";
+    rune::replication::FetchRequestMsg part{1, 0, 2, /*fetchOffset=*/n / 2, 1 << 20, 0};
+    (void)f.replica->onFetchRequest(part, f.now);
+    for (int i = 0; i < 2'000; ++i) f.step();
+    EXPECT_EQ(f.acks.count(200), 0u) << "HW below the newest batch: still parked";
+    rune::replication::FetchRequestMsg all{1, 0, 2, /*fetchOffset=*/n, 1 << 20, 0};
+    (void)f.replica->onFetchRequest(all, f.now);
+    ASSERT_TRUE(f.awaitAck(200));
+    EXPECT_EQ(f.acks[200].errorCode, 0) << "a stored batch is never OutOfOrderSequence";
+    EXPECT_EQ(f.acks[200].baseOffset, -1) << "offset unknown (Kafka DUPLICATE_SEQUENCE_NUMBER)";
+
+    f.produce(201, /*acks=leader*/0, 11, /*seq=*/1);       // known-old, acks=leader: at once
+    ASSERT_TRUE(f.awaitAck(201));
+    EXPECT_EQ(f.acks[201].errorCode, 0);
+    EXPECT_EQ(f.acks[201].baseOffset, -1);
+    EXPECT_EQ(f.log->logEndOffset(), n) << "a known-old duplicate is never re-appended";
+}
+
+// EOS-DUP defense: a frame whose producer identity disagrees with the batch
+// header is refused (non-retriable SchemaValidationFailed), never appended, and
+// counted on the worker.
+TEST(ShardWorkerAckRegression, FrameHeaderIdentityMismatchIsRejectedAndCounted) {
+    Fixture f({1}, 1);
+    rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);   // header pid -1
+    const auto batch = b.build();
+    pc::Produce m; m.sessionId = 5; m.correlationId = 77; m.topicId = 1; m.partition = 0;
+    m.partitionKnown = 1; m.acks = 0; m.producerId = 11; m.producerEpoch = 0; m.baseSequence = 0;
+    m.recordBatch = std::span<const uint8_t>(batch);
+    std::vector<uint8_t> fr(m.encodedSize()); m.encode(fr.data());
+    aeron::concurrent::AtomicBuffer ab(fr.data(), static_cast<aeron::util::index_t>(fr.size()));
+    for (int i = 0; i < kCap && f.producePub->offer(ab, 0, static_cast<aeron::util::index_t>(fr.size())) <= 0; ++i)
+        f.pump();
+    ASSERT_TRUE(f.awaitAck(77));
+    EXPECT_EQ(f.acks[77].errorCode, static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed));
+    EXPECT_EQ(f.log->logEndOffset(), 0);
+    EXPECT_EQ(f.worker->identityMismatchRejects(), 1u);
 }
 
 TEST(ShardWorkerAckRegression, ClosedSessionGetsNoAckAndReannounceRestoresIt) {

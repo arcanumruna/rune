@@ -384,5 +384,92 @@ TEST_F(ProducePathTest, DurabilityTier2_StrictSync)
     EXPECT_EQ(log_.logEndOffset(), 1);
 }
 
+// ===========================================================================
+// EOS-DUP defense (eos-dup-fix-review §3): the Produce frame's producer
+// identity (not CRC-covered) must equal the CRC-covered RecordBatch header
+// (offsets 43/51/53).  The pre-460dd12 client sent frame pid -1 with a header
+// pid >= 0: the broker skipped dedup and silently appended every retransmit.
+// A mismatch is now a loud, non-retriable SchemaValidationFailed (the record
+// failed broker validation; resending the same bytes always fails again),
+// never appended, never seen by the PSM.
+// ===========================================================================
+TEST_F(ProducePathTest, IdentityRegression_FramePidMinusOneWithIdempotentHeaderRejected)
+{
+    auto b = makeBatch(1, /*pid=*/42, /*epoch=*/0, /*seq=*/0);
+    auto o = callHelper(b, log_, psm_, 1, 0, /*producerId=*/-1, /*epoch=*/0, /*seq=*/-1);
+    EXPECT_EQ(o.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(o.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 0) << "never appended";
+    EXPECT_EQ(psm_.size(), 0u);
+}
+
+TEST_F(ProducePathTest, IdentityRegression_FramePidWithLegacyHeaderRejected)
+{
+    auto b = makeBatch(1);                                   // header pid -1
+    auto o = callHelper(b, log_, psm_, 1, 0, /*producerId=*/42, /*epoch=*/0, /*seq=*/0);
+    EXPECT_EQ(o.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(o.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 0);
+    EXPECT_EQ(psm_.size(), 0u) << "the PSM never sees a mismatched identity";
+}
+
+TEST_F(ProducePathTest, IdentityRegression_EpochOrSequenceMismatchRejected)
+{
+    auto b = makeBatch(1, /*pid=*/42, /*epoch=*/3, /*seq=*/0);
+    auto oe = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/2, /*seq=*/0);
+    EXPECT_EQ(oe.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(oe.identityMismatch);
+    auto os = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/3, /*seq=*/1);
+    EXPECT_EQ(os.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(os.identityMismatch);
+    auto ok = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/3, /*seq=*/0);
+    EXPECT_TRUE(ok.isOK()) << "the matching frame is accepted";
+    EXPECT_FALSE(ok.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 1);
+}
+
+// Legacy (acks=None / non-idempotent) frames carry epoch 0 against a header
+// epoch of -1 (client m1): only producerId is compared when it is < 0.
+TEST_F(ProducePathTest, IdentityRegression_LegacyFrameEpochZeroAgainstHeaderMinusOneAccepted)
+{
+    auto b = makeBatch(1);                                   // header pid/epoch/seq = -1
+    auto o = callHelper(b, log_, psm_, 1, 0, /*producerId=*/-1, /*epoch=*/0, /*seq=*/-1);
+    EXPECT_TRUE(o.isOK());
+    EXPECT_FALSE(o.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 1);
+}
+
+// EOS-OOS: a retransmit older than the window but entirely <= lastSequence is
+// a KNOWN-OLD duplicate: OK, offset unknown (-1), never appended.  lastOffset
+// carries the offset its ack condition must cover (the batch holding
+// lastSequence), so the caller parks it exactly like an in-window duplicate.
+TEST_F(ProducePathTest, IdempotenceWindowRegression_KnownOldDuplicateIsOkUnknownOffsetNoAppend)
+{
+    constexpr int64_t kPid = 77;
+    const int kBatches = rune::protocol::client::kIdempotentMaxInFlightBatches + 8;
+    for (int i = 0; i < kBatches; ++i) {
+        auto b = makeBatch(2, kPid, 0, 2 * i);
+        ASSERT_TRUE(callHelper(b, log_, psm_, 1, 0, kPid, 0, 2 * i).isOK()) << i;
+    }
+    const int64_t leo = log_.logEndOffset();
+    auto old = makeBatch(2, kPid, 0, 0);
+    auto o = callHelper(old, log_, psm_, 1, 0, kPid, 0, 0);
+    EXPECT_TRUE(o.isOK()) << "never OutOfOrderSequence for a stored batch";
+    EXPECT_TRUE(o.isDuplicate);
+    EXPECT_EQ(o.baseOffset, -1) << "Kafka DUPLICATE_SEQUENCE_NUMBER: offset unknown";
+    EXPECT_EQ(o.lastOffset, leo - 1) << "covers the batch holding lastSequence";
+    EXPECT_EQ(log_.logEndOffset(), leo) << "never re-appended";
+    // An in-window retransmit still reports its original range.
+    auto recent = makeBatch(2, kPid, 0, 2 * (kBatches - 1));
+    auto r = callHelper(recent, log_, psm_, 1, 0, kPid, 0, 2 * (kBatches - 1));
+    EXPECT_TRUE(r.isDuplicate);
+    EXPECT_EQ(r.baseOffset, leo - 2);
+    EXPECT_EQ(r.lastOffset, leo - 1);
+    // A batch partially overlapping lastSequence stays OutOfOrderSequence.
+    auto partial = makeBatch(3, kPid, 0, 2 * kBatches - 1);
+    EXPECT_EQ(callHelper(partial, log_, psm_, 1, 0, kPid, 0, 2 * kBatches - 1).error,
+              pc::ErrorCode::OutOfOrderSequence);
+}
+
 } // namespace
 } // namespace rune::storage

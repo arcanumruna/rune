@@ -502,16 +502,13 @@ TEST(ExactlyOnce, IdempotentProducerRetry_WindowWraps_OldDupAccepted)
         ASSERT_GE(off, 0);
     }
 
-    // Retry batch 0 — it may have been evicted from the window.
-    // If evicted, retryBaseOffset=-1 and the harness returns -1 (OOS).
-    // If still in window (kRetryWindowSize+1 items, window size = 5),
-    // batch 0 is evicted → OOS → -1.  This tests OOS rejection.
+    // Retry batch 0 — evicted from the window (kRetryWindowSize+1 batches).
+    // EOS-OOS: entirely <= lastSequence → a KNOWN-OLD duplicate (Kafka
+    // DUPLICATE_SEQUENCE_NUMBER): OK with an unknown offset, never OOS.
     auto vr = h.partition(0).psm.validate(
                   /*topicId=*/0, ir.producerId, 0, ir.producerEpoch, 0, 0);
-    // With window size = 5, appending 6 batches evicts batch 0.
-    // Retrying an evicted batch is OOS (not a known dup).
-    EXPECT_TRUE(vr.isOos() || vr.isDuplicate())
-        << "Evicted batch either causes OOS or is still in window";
+    EXPECT_TRUE(vr.isDuplicate()) << "an evicted, stored batch is a known-old duplicate";
+    EXPECT_EQ(vr.retryBaseOffset, -1);
     (void)firstOff;
 }
 

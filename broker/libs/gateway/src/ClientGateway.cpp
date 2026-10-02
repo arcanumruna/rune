@@ -2038,15 +2038,28 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     // Handle non-OK / duplicate outcomes (no append occurred).
     if (!outcome.isOK()) {
+        if (outcome.identityMismatch) [[unlikely]] {
+            // EOS-DUP defense: frame identity != CRC-covered batch header.
+            if (identityMismatchRejects_++ % 1024 == 0)
+                spdlog::warn("ClientGateway: produce rejected — frame producer identity (pid={} epoch={} seq={}) "
+                             "!= RecordBatch header; topicId={} partition={} (SchemaValidationFailed, rejects={})",
+                             msg.producerId, msg.producerEpoch, msg.baseSequence,
+                             msg.topicId, partition, identityMismatchRejects_);
+        }
         sendResp(outcome.error, partition, 0);
         return;
     }
-    if (outcome.isDuplicate) {
-        // Dedup path: return prior baseOffset, log untouched.
+    // Dedup path (log untouched).  F15 S5 parity on the inline path (Kafka
+    // DelayedProduce): a duplicate is answered only under its original's ack
+    // condition — acks=all parks below on the HW past outcome.lastOffset (the
+    // original's range, or for a KNOWN-OLD duplicate, baseOffset -1, the batch
+    // holding the producer's lastSequence); otherwise it is answered at once.
+    if (outcome.isDuplicate && !(acksAll && ownedReplica && committedMetadataReady_)) {
         sendResp(pc::ErrorCode::OK, partition, outcome.baseOffset);
         return;
     }
 
+    if (!outcome.isDuplicate) {
     // Successful append — apply post-append gateway-owned side-effects.
 
     // TX-4 Task 9: Feed LsoTracker for transactional data batches.
@@ -2089,6 +2102,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (ownedReplica) {
         ownedReplica->onLeaderLogAppended();
     }
+    } // !outcome.isDuplicate
 
     // 6. Reply ProduceResponse or enqueue deferred ack.
     //

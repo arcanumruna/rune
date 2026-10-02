@@ -209,8 +209,7 @@ TEST_F(ProducerStateDurabilityTest, RebuildFromLogRestoresDedup) {
     // We pass topicId=0 and partition=kPartition (the partition these batches were produced to).
     rebuiltPsm.rebuildFromLog(/*topicId=*/0, log1, log1.logEndOffset(), kPartition);
 
-    // After rebuild: seq=0..N-1 are all in the retry window (kRetryWindowSize=5
-    // and we appended exactly 5 batches, so all fit).
+    // After rebuild: seq=0..N-1 are all in the retry window (kN <= kRetryWindowSize).
     for (int seq = 0; seq < kN; ++seq) {
         auto vr = rebuiltPsm.validate(/*topicId=*/0, kPid, kPartition, kEpoch, seq, seq);
         ASSERT_TRUE(vr.isDuplicate())

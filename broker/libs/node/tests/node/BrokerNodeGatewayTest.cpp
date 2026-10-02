@@ -1009,6 +1009,7 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
         batchBuilder.setTransactional(true);
         batchBuilder.setProducerId(pid);
         batchBuilder.setProducerEpoch(epoch);
+        batchBuilder.setBaseSequence(0);   // header == frame identity (EOS-DUP defense)
         auto batchBytes = batchBuilder.build();
 
         pc::Produce prodReq;

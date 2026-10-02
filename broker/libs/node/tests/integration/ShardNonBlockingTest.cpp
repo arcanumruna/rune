@@ -73,8 +73,12 @@ public:
     void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
     void sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override {}
 };
-std::vector<uint8_t> batchAt(int64_t base, int n = 1, std::size_t valueBytes = 1) {
+std::vector<uint8_t> batchAt(int64_t base, int n = 1, std::size_t valueBytes = 1,
+                             int64_t pid = -1, int32_t seq = -1) {
     rune::protocol::RecordBatchBuilder b(base, 1000);
+    // An idempotent batch's header carries the frame's identity (the broker
+    // rejects a frame/header mismatch — EOS-DUP defense).
+    if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
     const std::string v(valueBytes, 'v');
     for (int i = 0; i < n; ++i) b.append("k", v, 1000 + i);
     return b.build();
@@ -360,12 +364,12 @@ TEST(ShardNonBlockingRegression, StrictAcksAllWaitsForFsyncThenHw) {
 TEST(ShardNonBlockingRegression, StrictDuplicateIsParkedOnFsync) {
     StrictShard s;
     s.w.setReapPausedForTest(true);
-    ASSERT_EQ(s.produce(1, batchAt(0, 2), 0, 1, /*pid=*/7, /*seq=*/0), 1);
+    ASSERT_EQ(s.produce(1, batchAt(0, 2, 1, 7, 0), 0, 1, /*pid=*/7, /*seq=*/0), 1);
     s.w.doWork(1);
     const auto t1 = s.w.durablePendingTokenForTest(0);
     Acks a;
     // Retry of the same idempotent batch BEFORE the original's fsync completed.
-    ASSERT_EQ(s.produce(2, batchAt(0, 2), 0, 2, 7, 0), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 2, 1, 7, 0), 0, 2, 7, 0), 1);
     s.w.doWork(2); a.drain(s.w);
     EXPECT_EQ(a.n, 0) << "a Strict duplicate must not be acked before the data is durable";
     EXPECT_EQ(s.w.durablePendingCountForTest(), 2u);
@@ -599,7 +603,7 @@ TEST(ShardNonBlockingRegression, UnknownIoBackendCannotSubmit) {
 TEST(StorageFailStopRegression, FsyncErrorThenSuccessNeverAcksOkRegression) {
     StrictShard s;
     s.w.setReapPausedForTest(true);
-    ASSERT_EQ(s.produce(1, batchAt(0, 2), 0, 1, /*pid=*/3, /*seq=*/0), 1);
+    ASSERT_EQ(s.produce(1, batchAt(0, 2, 1, 3, 0), 0, 1, /*pid=*/3, /*seq=*/0), 1);
     s.w.doWork(1);
     const auto tok = s.w.durablePendingTokenForTest(0);
     std::vector<WorkerReturn> all;
@@ -624,7 +628,7 @@ TEST(StorageFailStopRegression, FsyncErrorThenSuccessNeverAcksOkRegression) {
     EXPECT_EQ(produceResults, 1);
     EXPECT_EQ(failures, 1) << "the runtime is signalled exactly once (halt)";
     all.clear();
-    ASSERT_EQ(s.produce(2, batchAt(0, 2), 0, 3, 3, 0), 1);     // idempotent retry of the failed batch
+    ASSERT_EQ(s.produce(2, batchAt(0, 2, 1, 3, 0), 0, 3, 3, 0), 1);     // idempotent retry of the failed batch
     ASSERT_EQ(s.produce(3, batchAt(0, 1), 0, 3), 1);           // a new batch
     s.w.doWork(3);
     drainAll();

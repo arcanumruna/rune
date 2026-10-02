@@ -792,6 +792,9 @@ public:
     /// F3 round 6 item 2: oversize-produce rejects on the worker ingress path
     /// (rate-limited log: first, then every 1024th).
     [[nodiscard]] uint64_t oversizeProduceRejectsForTest() const noexcept { return oversizeProduceRejects_; }
+    /// EOS-DUP defense: produces rejected because the frame's producer identity
+    /// disagreed with the RecordBatch header.
+    [[nodiscard]] uint64_t identityMismatchRejects() const noexcept { return identityMismatchRejects_; }
     [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept { return oversizeProduceRejectLogs_; }
 
     /// Task 13 fix round 1 (C1a): ops that ride the session-lifecycle ring.
@@ -3503,6 +3506,7 @@ private:
     int32_t ackSlotBytes_ = 256;
     // F3 round 6, item 2: worker-thread-owned reject counters (per-worker ingress).
     uint64_t    oversizeProduceRejects_    = 0;
+    uint64_t    identityMismatchRejects_   = 0;   // frame identity != batch header (EOS-DUP defense)
     uint64_t    oversizeProduceRejectLogs_ = 0;
     // Per-tick drain batch limits (NodeConfig; raised from the OneToOneByteRing 16
     // default so routed replication ops / acks don't queue behind a tiny cap).
@@ -4931,14 +4935,27 @@ private:
             // validated these exact bytes (the gateway, right after ensureValid).
             /*crcPreverified=*/f.fromOp && f.crcValidated);
 
+        // A duplicate answers its ORIGINAL base offset (-1 for a KNOWN-OLD
+        // duplicate, EOS-OOS: OK, offset unknown — Kafka DUPLICATE_SEQUENCE_NUMBER)
+        // and its answer waits on outcome.lastOffset: the original's last offset,
+        // or for a known-old duplicate the last offset of the batch holding the
+        // producer's lastSequence (all its records are at or below it).  Rule:
+        // a known-old duplicate is answered once THAT batch meets the ack
+        // condition (HW past it for acks=all, fsync for Strict) — never earlier.
         ret.baseOffset  = outcome.baseOffset;
-        // A duplicate carries its ORIGINAL range (handleProduceBatch reports
-        // only the original base): its answer waits on that range (below).
-        ret.lastOffset  = outcome.isDuplicate
-            ? outcome.baseOffset + static_cast<int64_t>(outcome.recordCount) - 1
-            : outcome.lastOffset;
+        ret.lastOffset  = outcome.lastOffset;
         ret.recordCount = outcome.recordCount;
         ret.batchAttrs  = outcome.batchAttrs;
+
+        if (outcome.identityMismatch) [[unlikely]] {
+            // EOS-DUP defense: frame identity != CRC-covered batch header.
+            // Rate-limited (first, then every 1024th) — worker-owned counter.
+            if (identityMismatchRejects_++ % 1024 == 0)
+                spdlog::warn("Worker {}: produce rejected — frame producer identity (pid={} epoch={} seq={}) "
+                             "!= RecordBatch header; topicId={} partition={} (SchemaValidationFailed, rejects={})",
+                             workerId_, f.producerId, f.producerEpoch, f.baseSequence,
+                             f.topicId, f.partition, identityMismatchRejects_);
+        }
 
         if (!outcome.isOK()) {
             ret.errorCode = static_cast<int16_t>(
