@@ -40,6 +40,7 @@ libs/node/include/rune/node/detail/O2ORingBuffer.h | std::atomic_thread_fence(st
 libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead); | 3 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex)); | 2 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t tail = m_buffer.getInt64Volatile(m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | return m_buffer.getInt64Volatile(m_tailPositionIndex); | 1 | RING | agrona ring implementation internals (producerPosition, as M2ORingBuffer; Task 13 fix round 1 I1)
 libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t head = m_buffer.getInt64Volatile(m_headPositionIndex); | 1 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | head = m_buffer.getInt64Volatile(m_headPositionIndex); | 2 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt64Ordered(tailPositionIndex, nextTail); | 2 | RING | agrona ring implementation internals

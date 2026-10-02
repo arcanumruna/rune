@@ -70,6 +70,7 @@
 #include <rune/node/RcState.h>
 #include <rune/node/ReturnFifo.h>
 #include <rune/node/SessionAckSink.h>
+#include <limits>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/detail/NoTypeErasure.h>
 #include <rune/node/WorkerReturnCodec.h>
@@ -139,6 +140,10 @@ public:
     // NodeConfig.workerIngressRingBytes (RUNE_WORKER_INGRESS_RING_BYTES) overrides it.
     // maxMsgLength() = capacity / 8 = 4 MiB — ample for any produce batch.
     static constexpr int kIngressByteCapacity = 32 * 1024 * 1024; // 32 MiB
+    /// Task 13 fix round 1 (C1a): the session-lifecycle ring (announce ≤ ~0.6 KiB
+    /// per op; a full ring defers the runtime's announce / close to its next
+    /// cycle — never dropped).
+    static constexpr int kSessionRingBytes = 64 * 1024;
 
     // Default return ring byte capacity (power-of-two payload bytes).
     // Used when the ctor is called without an explicit returnRingBytes;
@@ -503,6 +508,7 @@ public:
                     std::size_t ioComplDepth     = kIoCompletionDepth) noexcept
         : workerId_(workerId)
         , ingress_(static_cast<int>(ingressRingBytes))
+        , sessionRing_(kSessionRingBytes)
         , ret_(static_cast<int>(returnRingBytes))
         , io_(ioSubmitDepth, ioComplDepth)
     {
@@ -567,6 +573,10 @@ public:
     /// Acks dropped by the sink (closed / failed / stalled sessions).
     [[nodiscard]] uint64_t sessionAcksDroppedForTest() const noexcept { return ackSink_ ? ackSink_->droppedForTest() : 0; }
     [[nodiscard]] std::size_t sessionAcksPendingForTest() const noexcept { return ackSink_ ? ackSink_->pending() : 0; }
+    /// Fix round 1: frames ABORTed because their session held acks (G-A6 per-
+    /// client pause) / op drains skipped because the ack queue had no room.
+    [[nodiscard]] uint64_t intakePausedFramesForTest() const noexcept { return intakePausedFrames_; }
+    [[nodiscard]] uint64_t ackRoomOpPausesForTest() const noexcept { return ackRoomOpPauses_; }
     /// Test seam: write one return straight to ret_ (false = ring full).
     bool injectReturnForTest(const WorkerReturn& r) { return tryWriteReturn_(r); }
 
@@ -775,6 +785,11 @@ public:
     [[nodiscard]] uint64_t oversizeProduceRejectsForTest() const noexcept { return oversizeProduceRejects_; }
     [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept { return oversizeProduceRejectLogs_; }
 
+    /// Task 13 fix round 1 (C1a): ops that ride the session-lifecycle ring.
+    [[nodiscard]] static constexpr bool isSessionLifecycleOp(WorkerOp::Type t) noexcept {
+        return t == WorkerOp::Type::SessionAnnounce || t == WorkerOp::Type::SessionClose;
+    }
+
     [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
         return enqueueOp(std::move(op)) == EnqueueResult::Enqueued;
     }
@@ -841,6 +856,9 @@ public:
             break;  // NONE tail
         }
 
+        // Task 13 fix round 1 (C1a): session lifecycle ops ride their own ring.
+        OneToOneByteRing& ring = isSessionLifecycleOp(op.type) ? sessionRing_ : ingress_;
+
         // Total frame = SBE MessageHeader (8) + block + varData.  computeLength()
         // covers block+varData only, so add the header explicitly.
         const std::size_t n = workerOpFrameBytes(tailLen);
@@ -850,20 +868,20 @@ public:
         // pre-checks opTailFits(); refuse loudly instead of crashing.
         // (F3 round 5 item I1 — the same refusal — is folded in: one check,
         //  rate-limited log: first, then every 1024th.)
-        if (n > static_cast<std::size_t>(ingress_.maxMsgLength())) [[unlikely]] {
+        if (n > static_cast<std::size_t>(ring.maxMsgLength())) [[unlikely]] {
             if (oversizedOpsRefused_++ % 1024 == 0)
                 spdlog::error("Worker {}: op type={} tail {} B exceeds the ingress ring frame "
                               "({} B); refused (TooLarge, not retriable) (refused={})", workerId_,
-                              static_cast<int>(op.type), tailLen, ingress_.maxMsgLength(),
+                              static_cast<int>(op.type), tailLen, ring.maxMsgLength(),
                               oversizedOpsRefused_);
             return EnqueueResult::TooLarge;
         }
         const aeron::util::index_t idx =
-            ingress_.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
+            ring.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
         if (idx < 0) return EnqueueResult::Full;  // ring full — back-pressure
 
         sbe::WorkerOp enc;
-        enc.wrapAndApplyHeader(reinterpret_cast<char*>(ingress_.base() + idx), 0, n);
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(ring.base() + idx), 0, n);
         enc.opType(static_cast<sbe::OpType::Value>(static_cast<std::uint8_t>(op.type)))
            .topicId(op.topicId)
            .partition(op.partition)
@@ -915,7 +933,7 @@ public:
            .tailKind(tailKind);
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
-        ingress_.commit(idx);
+        ring.commit(idx);
         return EnqueueResult::Enqueued;
     }
 
@@ -1147,7 +1165,10 @@ public:
         }
 
         passNowNs_ = nowNs;   // this pass's clock (acks=all deadlines on the op path)
-        if (shardMode_) return doWorkShard_(nowNs);
+        // Task 13 fix round 1 (C1a): session lifecycle first, in full, every
+        // pass and every mode — never behind data ops or any backlog.
+        work += drainSessionOps_();
+        if (shardMode_) return work + doWorkShard_(nowNs);
 
         // Step E3: reap async-durability completions from the IoBackend FIRST so
         // that completions from the previous cycle fire before the next produce
@@ -1275,24 +1296,19 @@ private:
     // component (a full return ring is a non-blocking intake skip, spec §3.6).
     int doWorkShard_(int64_t nowNs) {
         int work = 0;
-        // 2b. runtime→worker ring first: ownership / role changes (and, Task 13,
-        //     session announcements) must be applied before the intake they govern.
+        // 2a. (doWork) session lifecycle ring drained in full.
+        // 2b. runtime→worker ring: ownership / role changes must be applied
+        //     before the intake they govern.
         work += static_cast<int>(drainIngress_());
-        // Task 13 (announce-before-accept, spec §3.4): a client's first Produce
-        // can only follow its ConnectResponse, which the runtime sends AFTER
-        // queueing the session's announcement on this ring — so with the ring
-        // empty, every announcement a polled frame can depend on is applied.  A
-        // ring read stops at the buffer's wrap point: one more read covers it.
-        // Ops still pending (drain limit / high-water pause / a runtime enqueue
-        // racing this check) → skip this pass's poll (never a wait; the next
-        // pass drains first).
-        if (ackSink_ && !ingress_.empty()) work += static_cast<int>(drainIngress_());
-        const bool opsCaughtUp = !ackSink_ || ingress_.empty();
-        // 3. client ingress → append (G-A6 gate unchanged).
+        // 3. client ingress → append.  Never skipped for pending ops (fix round
+        //    1, I1): a frame whose session announcement is not applied yet has
+        //    its ack HELD by the sink until the lifecycle ring is consumed past
+        //    the position sampled after the frame was seen (no gate, no time).
+        //    G-A6: per-session pause inside the poll (controlled ABORT).
         work += flushRetFifo_();
         // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
         // into ret_ later: reserve for every one of them (G-A6, never drop).
-        if (opsCaughtUp && retFifo_.empty() &&
+        if (retFifo_.empty() &&
             ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
             work += pollWorkerIngress_(nowNs);
         }
@@ -1334,7 +1350,13 @@ private:
         // Task 13 (spec §3.4): claim EVERY ack due this pass — appends, HW fires,
         // fsync completions, failures — on its session's own publication, last,
         // so the next driver duty cycle ships each session's acks together.
-        if (ackSink_) work += ackSink_->flush(nowNs);
+        // The lifecycle ring is sampled now, after every frame of this pass was
+        // observed (consumer first: consumer <= producer) — I1 hold rule.
+        if (ackSink_) {
+            const int64_t consumed = sessionRing_.consumerPosition();
+            work += ackSink_->flush(sessionRing_.producerPosition(), consumed);
+            work += reportSessionFailures_();
+        }
         return work;
     }
 
@@ -1382,9 +1404,11 @@ private:
     // it (append, HW fire, §3.2 fail, fsync completion / failure, ownership
     // purge, refusal).  1. the ack is queued on the session's own publication,
     // claimed in this pass's flush (coalesced per session, before the next
-    // driver duty cycle);  2. AFTER it, a fire-and-forget notification goes to
-    // the runtime on the one return FIFO (never dropped, never delaying an
-    // ack): the facts-only ProduceResult of F15 S2 (deferAck == true — PSM-
+    // driver duty cycle);  2. with it (m1: queued at ack ENQUEUE, i.e. before
+    // the ack is claimed — the runtime may see it first; it carries facts the
+    // append already made true and liveness, never an answer), a fire-and-
+    // forget notification goes to the runtime on the one return FIFO (never
+    // dropped, never delaying an ack): the facts-only ProduceResult of F15 S2 (deferAck == true — PSM-
     // mirror facts of a successful append, and the session's liveness, which
     // shard-mode produces no longer refresh on the runtime).  An error carries
     // no facts (producerId -1).  WorkerReturn PRODUCE_NOTIFY stays retired
@@ -1660,6 +1684,40 @@ private:
     // Called from doWork (the consumer side of ingress_).
     // Single-writer invariant: doWork runs on the worker's own thread.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Task 13 fix round 1 (C1a): drain the session-lifecycle ring IN FULL (two
+    // reads: an Agrona read stops at the buffer's wrap point).  Unconditional —
+    // lifecycle ops emit no returns, so no backlog may gate them.
+    // -----------------------------------------------------------------------
+    int drainSessionOps_() {
+        auto exec = [this](int32_t, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                           aeron::util::index_t len) {
+            executeFromWire_(reinterpret_cast<const uint8_t*>(buf.buffer()) + off, static_cast<std::size_t>(len));
+        };
+        int n = sessionRing_.drain(exec, std::numeric_limits<int>::max());
+        if (n > 0) n += sessionRing_.drain(exec, std::numeric_limits<int>::max());
+        return n;
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 13 fix round 1 (C2): a session whose publication can never deliver
+    // is reported to the runtime (WorkerReturn::SessionFailed), which closes it
+    // everywhere — the client reconnects.  Written straight to ret_ only when
+    // nothing is queued ahead (never through the FIFO: its static bound is
+    // unchanged); otherwise the failure stays recorded in the session's state
+    // and is retried next pass.  Never dropped, never a timer.
+    // -----------------------------------------------------------------------
+    int reportSessionFailures_() {
+        return ackSink_->reportFailures([this](int64_t sid) {
+            if (!retFifo_.empty()) return false;
+            WorkerReturn r;
+            r.type      = WorkerReturn::Type::SessionFailed;
+            r.sessionId = sid;
+            r.partition = workerId_;
+            return tryWriteReturn_(r);
+        });
+    }
+
     std::size_t drainIngress_() {
         // Drain a LARGE batch per tick: the routed replication ops (fetch/apply —
         // the HW-advancing fast-acks) must not queue behind a small per-tick cap.
@@ -1673,19 +1731,25 @@ private:
         // the control thread drains ret_ every cycle and never waits on an op
         // ring, so the FIFO always flushes (no deadlock).
         int limit = ingressDrainLimit_;
-        // Task 13: with worker-side acks, acks held on back-pressured session
-        // publications count as backlog too (each op answers at most once, into
-        // either queue) — the same high-water gate bounds both.
-        const std::size_t backlogNow = returnBacklog_();
         // Re-review 2 B-2: hysteresis — the episode ends only at low water.
-        if (retFifoPaused_ && backlogNow <= kOverflowLowWater) [[unlikely]] leaveRetFifoPause_();
-        if (const std::size_t backlog = backlogNow; backlog != 0) [[unlikely]] {
+        if (retFifoPaused_ && retFifo_.size() <= kOverflowLowWater) [[unlikely]] leaveRetFifoPause_();
+        if (const std::size_t backlog = retFifo_.size(); backlog != 0) [[unlikely]] {
             if (backlog >= kOverflowHighWater) {
                 ++retFifoHighWaterPauses_;
                 if (!retFifoPaused_) [[unlikely]] enterRetFifoPause_(backlog);
                 return 0;
             }
             limit = std::min(limit, static_cast<int>(kOverflowHighWater - backlog));
+        }
+        // Task 13 fix round 1 (C1b): acks held for slow sessions are NOT a
+        // drain gate (they drain at the CLIENT's pace — gating ops on them let
+        // one slow client stall role / ownership changes).  Ops answer into the
+        // session ack queue too (one each, at most): throttle on its free ROOM
+        // only — ops pause only while the queue is genuinely full.
+        if (ackSink_) {
+            const int64_t room = ackRoom_();
+            if (room <= 0) [[unlikely]] { ++ackRoomOpPauses_; return 0; }
+            if (room < limit) limit = static_cast<int>(room);
         }
         int drained = ingress_.drain(
             [this](int32_t /*typeId*/,
@@ -1821,10 +1885,15 @@ private:
         const std::uint32_t len = op.tailLength();
         const char* p           = op.tail();
         if (!ackSink_) return;
+        // Fix round 1 (I2): unreachable by construction — the runtime counts
+        // every session a worker table can hold (accepted + announced-pending +
+        // closes not yet queued everywhere) against kMaxSessions − 1, and
+        // refuses longer channels at Connect.  A refusal would leave an
+        // accepted session that is never acked: halt, never a silent drop.
         if (!ackSink_->announce(sid, std::string_view(p, len), stream)) [[unlikely]] {
-            spdlog::warn("Worker {}: session {} announcement refused (session table full ({}) or channel "
-                         "{} B > {}) — its acks are dropped", workerId_, sid, ackSink_->sessionCount(), len,
-                         SessionAckSink::kMaxChannelBytes);
+            spdlog::critical("Worker {}: session {} announcement refused (sessions {}, channel {} B, max {})",
+                             workerId_, sid, ackSink_->sessionCount(), len, SessionAckSink::kMaxChannelBytes);
+            haltInvariant_("session announcement refused", "Task 13 I2: runtime session cap violated", 0);
         }
     }
 
@@ -3410,6 +3479,13 @@ private:
     // Consumer (worker thread):  drainIngress_ drains → zero-copy view → executeFromWire_.
     OneToOneByteRing ingress_;
 
+    // Task 13 fix round 1 (C1a): session-lifecycle ring — SessionAnnounce /
+    // SessionClose only (control rate; they emit no returns).  Drained IN FULL
+    // at the top of every pass, so a session op never waits behind data ops, an
+    // op-drain pause or an ack backlog (lease reap / Disconnect always land).
+    // Same SPSC producer (the runtime thread) and SBE WorkerOp frames as ingress_.
+    OneToOneByteRing sessionRing_;
+
     // R3: return ring — OneToOneByteRing (SPSC, flat byte messages).
     // Producer (worker thread): enqueueReturn_ tryClaim()s + encodes the WorkerReturn
     //   DIRECTLY into the claimed slot (zero-copy) + commit()s.
@@ -3482,10 +3558,26 @@ private:
     // Task 13 (spec §3.4): worker-side acks — engaged iff shard mode with this
     // worker's own client (setShardClient).  Worker-thread only once running.
     std::unique_ptr<SessionAckSink> ackSink_;
-    static_assert(SessionAckSink::kAckCapacity >= kRetFifoBound,
-                  "Task 13 G-A6: the session ack queue must hold the same static bound as the return FIFO");
+    // Fix round 1 (C1b/c) — the session ack queue bound.  A = queued acks, O =
+    // owed returns (reservedAckSlots_, <= kMaxOwedReturnsCeiling).  Every intake
+    // step is limited by ackRoom_() = kAckCapacity − A − O (op drain:
+    // drainIngress_; client poll: ingressPollBudget_), and each op / frame adds
+    // at most one to A + O (an answer now, or one owed); owed → answer
+    // conversions (HW fire, §3.2 fail, fsync, purge) keep A + O; a flush only
+    // lowers A.  So A + O <= kAckCapacity holds for ANY client behaviour —
+    // enqueue never fails (a failure is an invariant halt).  Liveness: with no
+    // held acks a pass still admits a full drain AND a full poll at the owed
+    // ceiling (assert below).  Per session (G-A6), a client whose acks are held
+    // is paused at its next frame (controlled ABORT), so its share is one
+    // pass's frames + its owed acks + gateway-routed ops — never the whole queue.
+    static_assert(SessionAckSink::kAckCapacity >=
+                      kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
+                          static_cast<std::size_t>(kMaxFragmentLimit),
+                  "Task 13 G-A6: an idle ack queue must admit a full op drain and poll at the owed ceiling");
     uint64_t sessionAnnouncesSeen_ = 0;
     uint64_t sessionClosesSeen_    = 0;
+    uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs)
+    uint64_t ackRoomOpPauses_      = 0;   // fix round 1: op drains skipped, ack queue full
 
     // E4: true after the one-shot self-pin attempt fires in doWork.
     // Prevents repeated pin attempts on every doWork call.
@@ -4843,15 +4935,14 @@ private:
                                       ? static_cast<int64_t>(maxOwedReturns_) - owed : 0;
         // Task 13: every polled frame answers into the session ack queue and
         // every owed waiter fires into it later — reserve for both (G-A6).
-        const int64_t ackRoom   = ackSink_ ? std::max<int64_t>(0, static_cast<int64_t>(ackSink_->freeAckSlots()) - owed)
-                                           : ringRoom;
+        const int64_t ackRoom   = ackSink_ ? std::max<int64_t>(0, ackRoom_()) : ringRoom;
         return std::min({static_cast<int64_t>(desiredFragmentLimit_), ringRoom, capRoom, ackRoom});
     }
-    // Task 13: the larger of the two answer backlogs (return FIFO; acks held on
-    // back-pressured session publications) — what the op-drain high water gates.
-    [[nodiscard]] std::size_t returnBacklog_() const noexcept {
-        const std::size_t acks = ackSink_ ? ackSink_->pending() : 0;
-        return retFifo_.size() > acks ? retFifo_.size() : acks;
+    // Task 13 fix round 1 (C1b): free session-ack slots after reserving every
+    // owed return (each fires into the ack queue later).  Every intake step
+    // (op drain, client poll) is limited by it, so A + O <= kAckCapacity always.
+    [[nodiscard]] int64_t ackRoom_() const noexcept {
+        return static_cast<int64_t>(ackSink_->freeAckSlots()) - reservedAckSlots_();
     }
 
     int pollWorkerIngress_(int64_t nowNs) {
@@ -4864,6 +4955,28 @@ private:
         }
 
         int polled = 0;
+        if (ackSink_) {
+            // Task 13 fix round 1 (C1c, spec G-A6): pause intake from THAT client
+            // only.  A frame of a session still holding acks is ABORTed: its
+            // image (one client publication) stops at that frame and the poll
+            // moves on to the other images — Aeron's own per-publisher back-
+            // pressure (§1a.3); the client's offers back-pressure until it reads
+            // its acks.  One branch when nothing is held (the hot case).
+            workerIngress_->controlledPoll(
+                K,
+                [this, nowNs, &polled]
+                (const uint8_t* data, std::size_t len, aeron::Header& /*hdr*/) {
+                    if (ackSink_->heldAcks() != 0 && len >= kProduceSessionIdEnd) [[unlikely]] {
+                        if (ackSink_->holding(produceSessionIdOf_(data))) {
+                            ++intakePausedFrames_;
+                            return aeron::ControlledPollAction::ABORT;
+                        }
+                    }
+                    polled += handleWorkerIngressFrame_(data, len, nowNs);
+                    return aeron::ControlledPollAction::CONTINUE;
+                });
+            return polled;
+        }
         workerIngress_->poll(
             K,   // E5.1.3: poll up to K frames (reservation guarantees K ack slots)
             [this, nowNs, &polled]
@@ -4871,6 +4984,16 @@ private:
                 polled += handleWorkerIngressFrame_(data, len, nowNs);
             });
         return polled;
+    }
+
+    // Client MessageHeader: sessionId is LE64 at byte 8 (blockLength, templateId,
+    // schemaId, version: 4 × u16) — read without decoding the whole frame.
+    static constexpr std::size_t kProduceSessionIdEnd = 16;
+    static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE >= kProduceSessionIdEnd);
+    [[nodiscard]] static int64_t produceSessionIdOf_(const uint8_t* data) noexcept {
+        uint64_t v = 0;
+        for (int i = 7; i >= 0; --i) v = (v << 8) | data[8 + i];
+        return static_cast<int64_t>(v);
     }
 
     // -----------------------------------------------------------------------

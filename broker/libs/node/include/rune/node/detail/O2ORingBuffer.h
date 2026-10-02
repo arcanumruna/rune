@@ -233,6 +233,15 @@ public:
         return messagesRead;
     }
 
+    /// Producer position (tail, bytes ever claimed) — any thread (volatile load).
+    [[nodiscard]] std::int64_t producerPosition() const {
+        return m_buffer.getInt64Volatile(m_tailPositionIndex);
+    }
+    /// Consumer position (head, bytes ever consumed) — the consumer thread.
+    [[nodiscard]] std::int64_t consumerPosition() const {
+        return m_buffer.getInt64(m_headPositionIndex);
+    }
+
     /// Bytes currently unconsumed in the ring (tail - head), clamped to [0, capacity].
     [[nodiscard]] aeron::util::index_t size() {
         const std::int64_t tail = m_buffer.getInt64Volatile(m_tailPositionIndex);

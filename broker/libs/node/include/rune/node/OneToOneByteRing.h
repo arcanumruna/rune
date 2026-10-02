@@ -98,12 +98,13 @@ public:
     // Introspection / back-pressure gates
     // -----------------------------------------------------------------------
 
-    /// Consumer side: nothing unconsumed (tail == head, acquire loads — ring
-    /// internals).  Task 13: a shard polls client ingress only once every op
-    /// the runtime enqueued before it is executed (announce-before-accept).
-    [[nodiscard]] bool empty() const {
-        return const_cast<detail::O2ORingBuffer&>(ring_).size() == 0;
-    }
+    /// Producer position (bytes ever claimed; volatile load — any thread) and
+    /// consumer position (bytes ever consumed — the consumer thread).  Task 13
+    /// fix round 1 (I1): a worker holds an unknown session's ack until its
+    /// lifecycle ring is consumed past the producer position sampled after the
+    /// frame was observed.
+    [[nodiscard]] int64_t producerPosition() const { return ring_.producerPosition(); }
+    [[nodiscard]] int64_t consumerPosition() const { return ring_.consumerPosition(); }
 
     /// Maximum single-message payload the ring can hold (capacity / 8).
     index_t maxMsgLength() const { return ring_.maxMsgLength(); }

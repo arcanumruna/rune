@@ -767,12 +767,97 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 //     addExclusivePublication and enqueue a PendingConnect.  The publication
 //     is polled across doWork() cycles via pollPendingConnects().
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// evictOldestPendingConnect_ — the kMaxPendingConnects cap.
+// The evicted registration must be released: attempt a final
+// findExclusivePublication — see handleConnect.
+// ---------------------------------------------------------------------------
+void ClientGateway::evictOldestPendingConnect_()
+{
+    spdlog::warn("ClientGateway: pending-connect cap reached; dropping oldest entry");
+    const int64_t evictedRegId      = pendingConnects_.front().registrationId;
+    // DR-BUG-2 FIX: if the oldest entry has a stashed resolvedPub, the
+    // shared_ptr destructor (run by pop_front()) is sufficient to release the
+    // registration.  Do NOT call findExclusivePublication again — that would
+    // touch a conductor entry that is already being released, and if it
+    // returns nullptr we would push a stale regId to drainingRegistrations_
+    // that never drains.  Only push to drain when resolvedPub==nullptr (pub
+    // not yet resolved — the conductor still holds it in AWAITING state).
+    const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr);
+    // Fix round 1 (I2): an evicted entry whose announcement began holds
+    // worker ack-table slots — close it on every worker (never leaked).
+    closeDroppedPendingConnect_(pendingConnects_.front());
+    pendingConnects_.pop_front(); // O(1); drops resolvedPub shared_ptr if non-null
+    if (!evictedAlreadyResolved && aeron_) {
+        try {
+            // Attempt immediate release by resolving and dropping the shared_ptr.
+            auto pub = aeron_->findExclusivePublication(evictedRegId);
+            if (!pub) {
+                // Still AWAITING_MEDIA_DRIVER — keep draining until it resolves.
+                drainingRegistrations_.push_back(evictedRegId);
+            }
+            // If pub non-null: drops here → ~ExclusivePublication() releases registration.
+        } catch (...) {
+            // ERRORED_MEDIA_DRIVER: conductor erased the entry and threw — no leak.
+        }
+    }
+    // If evictedAlreadyResolved: the drop of resolvedPub in pop_front() already
+    // releases the registration — no findExclusivePublication needed, no drain entry.
+}
+
+// ---------------------------------------------------------------------------
+// Task 13 fix round 1 — shard-mode session lifecycle helpers.
+// ---------------------------------------------------------------------------
+std::size_t ClientGateway::shardSessionSlotsInUse_() const noexcept
+{
+    std::size_t begun = 0;
+    for (const auto& p : pendingConnects_) begun += p.announceBegun ? 1 : 0;   // <= kMaxPendingConnects
+    return sessions_.size() + sessionAnnouncer_.pendingCloses() + begun;
+}
+
+void ClientGateway::closeDroppedPendingConnect_(const PendingConnect& pending)
+{
+    if (shardMode_ && workerPool_ && pending.announceBegun)
+        sessionAnnouncer_.close(*workerPool_, pending.sessionId);
+}
+
+bool ClientGateway::closeSession_(int64_t sid)
+{
+    if (!sessions_.find(sid)) return false;   // m4: unknown → no worker traffic
+    sessions_.remove(sid);
+    // Task 13: close the session on every worker.
+    if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
+
+    // GB-3: drop all subscriptions belonging to this session.
+    auto it = subscriptions_.begin();
+    while (it != subscriptions_.end()) {
+        if (it->second.sessionId == sid) {
+            it = subscriptions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
+    // does not grow unboundedly under connect/disconnect churn.
+    groupMemberSubs_.erase(sid);
+    return true;
+}
+
 void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto reqOpt = pc::ConnectRequest::decode(buf, len);
     if (!reqOpt) return; // truncated — drop
 
     const auto& req = *reqOpt;
+    // Task 13 fix round 1 (I2): a worker's ack table stores the reply channel in
+    // a fixed slot — refuse a longer one HERE (never accept a session no worker
+    // can ack; the worker treats a refused announcement as an invariant halt).
+    if (shardMode_ && req.egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) [[unlikely]] {
+        spdlog::warn("ClientGateway: egress channel of {} B exceeds the shard limit {} B; dropping Connect",
+                     req.egressChannel.size(), rune::node::SessionAckSink::kMaxChannelBytes);
+        return;
+    }
 
     // -----------------------------------------------------------------------
     // BR-5 / MD1 Fix 6: check leadership before creating a session.
@@ -854,34 +939,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // ~ExclusivePublication()); if it throws (ERRORED), conductor already cleaned
     // up; if still AWAITING (nullptr returned), enqueue in drainingRegistrations_
     // and keep polling until it resolves.
-    if (pendingConnects_.size() >= kMaxPendingConnects) {
-        spdlog::warn("ClientGateway: pending-connect cap reached; dropping oldest entry");
-        const int64_t evictedRegId      = pendingConnects_.front().registrationId;
-        // DR-BUG-2 FIX: if the oldest entry has a stashed resolvedPub, the
-        // shared_ptr destructor (run by pop_front()) is sufficient to release the
-        // registration.  Do NOT call findExclusivePublication again — that would
-        // touch a conductor entry that is already being released, and if it
-        // returns nullptr we would push a stale regId to drainingRegistrations_
-        // that never drains.  Only push to drain when resolvedPub==nullptr (pub
-        // not yet resolved — the conductor still holds it in AWAITING state).
-        const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr);
-        pendingConnects_.pop_front(); // O(1); drops resolvedPub shared_ptr if non-null
-        if (!evictedAlreadyResolved) {
-            try {
-                // Attempt immediate release by resolving and dropping the shared_ptr.
-                auto pub = aeron_->findExclusivePublication(evictedRegId);
-                if (!pub) {
-                    // Still AWAITING_MEDIA_DRIVER — keep draining until it resolves.
-                    drainingRegistrations_.push_back(evictedRegId);
-                }
-                // If pub non-null: drops here → ~ExclusivePublication() releases registration.
-            } catch (...) {
-                // ERRORED_MEDIA_DRIVER: conductor erased the entry and threw — no leak.
-            }
-        }
-        // If evictedAlreadyResolved: the drop of resolvedPub in pop_front() already
-        // releases the registration — no findExclusivePublication needed, no drain entry.
-    }
+    if (pendingConnects_.size() >= kMaxPendingConnects) evictOldestPendingConnect_();
 
     // Pre-allocate sessionId now so it is stable across cycles.
     const int64_t sessionId = sessions_.nextSessionId();
@@ -958,7 +1016,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             const bool alreadyResolved  = (pending.resolvedPub != nullptr);
             // Task 13: a session announced (fully or partly) but never accepted
             // is closed on every worker — the client never learned its id.
-            if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, pending.sessionId);
+            closeDroppedPendingConnect_(pending);
             it = pendingConnects_.erase(it); // drops resolvedPub shared_ptr if non-null
             if (!alreadyResolved) {
                 // Publication not yet resolved: enqueue in drain table.
@@ -987,6 +1045,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // The conductor erased its own entry when throwing — no registration leak.
             spdlog::warn("ClientGateway: findExclusivePublication threw for session={}; dropped",
                          pending.sessionId);
+            closeDroppedPendingConnect_(pending);   // fix round 1 (I2): every drop site
             it = pendingConnects_.erase(it);
             continue;
         }
@@ -1059,12 +1118,17 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // already reached are not re-sent.  The worker ack table's capacity
             // bounds concurrent shard sessions (pending closes still hold slots).
             if (shardMode_ && workerPool_ && !pending.announced) {
-                if (sessions_.size() + sessionAnnouncer_.pendingCloses() >= kShardMaxSessions) [[unlikely]] {
+                // Fix round 1 (I2): count every slot a worker table may hold —
+                // including announced-but-not-accepted connects (this one is
+                // counted once its announcement begins).
+                if (!pending.announceBegun &&
+                    shardSessionSlotsInUse_() + 1 > kShardMaxSessions) [[unlikely]] {
                     spdlog::warn("ClientGateway: shard session cap {} reached; session={} held until the "
                                  "connect timeout", kShardMaxSessions, pending.sessionId);
                     ++it;
                     continue;
                 }
+                pending.announceBegun = true;
                 if (!sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
                                                 pending.egressChannel, pending.egressStreamId)) {
                     ++it;
@@ -1221,24 +1285,7 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::Disconnect::decode(buf, len);
     if (!msgOpt) return;
-    const int64_t sid = msgOpt->sessionId;
-    sessions_.remove(sid);
-    // Task 13: close the session on every worker (Disconnect).
-    if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
-
-    // GB-3: drop all subscriptions belonging to this session.
-    auto it = subscriptions_.begin();
-    while (it != subscriptions_.end()) {
-        if (it->second.sessionId == sid) {
-            it = subscriptions_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
-    // does not grow unboundedly under connect/disconnect churn.
-    groupMemberSubs_.erase(sid);
+    (void)closeSession_(msgOpt->sessionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1335,8 +1382,10 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 // LsoTracker feed: the owning worker updates its own RC state at append.
 void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
 {
-    // Success: TX-2 idempotent PSM update.
-    if (ret.producerId >= 0) {
+    // Success: TX-2 idempotent PSM update.  Task 13 fix round 1 (m2): in shard
+    // mode the owning worker's psm_ is the single owner for user partitions and
+    // the mirror is never read for them (the gate is skipped) — no update.
+    if (ret.producerId >= 0 && !(shardMode_ && ret.topicId >= 0)) {
         const int32_t lastSeqInBatch =
             ret.baseSequence + ret.recordCount - 1;
         producerStateManager_.update(
@@ -3227,6 +3276,29 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         // ===================================================================
         if (ret.type == rune::node::WorkerReturn::Type::StorageFailure) [[unlikely]] {
             raiseStorageFailure_(std::string(ret.chunk.begin(), ret.chunk.end()), ret.errorCode);
+            return;
+        }
+
+        // Task 13 fix round 1 (C2): a worker's ack publication for this session
+        // can never deliver — close the session everywhere (table, workers,
+        // subscriptions) so the client reconnects; its later notifications find
+        // no session (no liveness refresh).  State-driven, never a timer.
+        if (ret.type == rune::node::WorkerReturn::Type::SessionFailed) [[unlikely]] {
+            if (closeSession_(ret.sessionId)) {
+                spdlog::warn("ClientGateway: session {} closed — its ack publication on worker {} can never "
+                             "deliver (the client reconnects)", ret.sessionId, ret.partition);
+                return;
+            }
+            // Not accepted yet (ConnectResponse still retrying): drop the
+            // pending connect — never accept a session no worker can ack.
+            for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
+                if (it->sessionId != ret.sessionId) continue;
+                spdlog::warn("ClientGateway: pending session {} dropped — its ack publication on worker {} can "
+                             "never deliver", ret.sessionId, ret.partition);
+                closeDroppedPendingConnect_(*it);
+                pendingConnects_.erase(it);   // resolvedPub released with the entry
+                break;
+            }
             return;
         }
 

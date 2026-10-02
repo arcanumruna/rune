@@ -1,5 +1,6 @@
-// SessionAckSinkTest.cpp — worker-side ack publication table + backlog state
-// machines (spec §3.4, G-A6).  Fake publication policy; injected clock only.
+// SessionAckSinkTest.cpp — worker-side ack publication table + per-session hold
+// state machines (spec §3.4, G-A6).  Fake publication policy; NO clock: the sink
+// is time-independent (fix round 1, C1/C2) — acks drop only on state events.
 #include <rune/node/SessionAckSink.h>
 #include <rune/protocol/client/DataMessages.h>
 
@@ -50,16 +51,18 @@ struct FakePolicy {
 };
 using Sink = SessionAckSinkT<FakePolicy>;
 static_assert(Sink::kClaimFatal == kFatal);
-constexpr int64_t kMs = 1'000'000;
-
 AckEntry ack(int64_t sid, int64_t corr, int64_t base = 0) { return AckEntry{sid, corr, base, 0, 0}; }
 
+// One pass with the lifecycle ring fully consumed (producer == consumer).
+void pass(Sink& s) { s.flush(0, 0); }
+
 // Announce + resolve (two flushes: Announced→Resolving, Resolving→Ready).
-void ready(Sink& s, int64_t sid, int64_t& now) {
+void ready(Sink& s, int64_t sid) {
     ASSERT_TRUE(s.announce(sid, "aeron:udp?endpoint=127.0.0.1:1", 7));
-    s.flush(now += kMs);
-    s.flush(now += kMs);
+    pass(s);
+    pass(s);
 }
+int64_t corrOf(const std::vector<uint8_t>& f) { return pc::ProduceResponse::decode(f.data(), f.size())->correlationId; }
 } // namespace
 
 TEST(SessionAckSinkRegression, AnnounceResolvesThenSendsEncodedProduceResponse) {
@@ -67,12 +70,13 @@ TEST(SessionAckSinkRegression, AnnounceResolvesThenSendsEncodedProduceResponse) 
     Sink s(pol);
     ASSERT_TRUE(s.announce(7, "aeron:udp?endpoint=h:1", 42));
     ASSERT_TRUE(s.enqueue(AckEntry{7, 100, 5, 2, 0}));
-    s.flush(1 * kMs);                                       // Announced → Resolving; ack held
+    pass(s);                                                // Announced → Resolving; ack held
     EXPECT_TRUE(st->sent.empty());
-    EXPECT_FALSE(s.intakeAllowed());
-    s.flush(2 * kMs);                                       // Resolving → Ready; ack sent
+    EXPECT_TRUE(s.holding(7)) << "G-A6: a session whose acks wait is paused";
+    pass(s);                                                // Resolving → Ready; ack sent
     ASSERT_EQ(st->sent.size(), 1u);
-    EXPECT_TRUE(s.intakeAllowed());
+    EXPECT_FALSE(s.holding(7));
+    EXPECT_EQ(s.heldAcks(), 0u);
     EXPECT_EQ(st->added.begin()->second.first, "aeron:udp?endpoint=h:1");
     EXPECT_EQ(st->added.begin()->second.second, 42);
     auto r = pc::ProduceResponse::decode(st->sent[0].second.data(), st->sent[0].second.size());
@@ -82,11 +86,11 @@ TEST(SessionAckSinkRegression, AnnounceResolvesThenSendsEncodedProduceResponse) 
 }
 
 TEST(SessionAckSinkRegression, CoalescesEveryAckOfAPassOnTheSessionPublication) {
-    FakePolicy pol; auto st = pol.s; Sink s(pol); int64_t now = 0;
-    ready(s, 7, now); ready(s, 8, now);
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8);
     s.enqueue(ack(7, 1)); s.enqueue(ack(7, 2)); s.enqueue(ack(8, 3)); s.enqueue(ack(7, 4));
     EXPECT_TRUE(st->sent.empty()) << "nothing leaves before the pass flush";
-    s.flush(now += kMs);
+    pass(s);
     ASSERT_EQ(st->sent.size(), 4u);
     std::vector<int64_t> corrs7;
     for (auto& [pub, f] : st->sent)
@@ -94,74 +98,153 @@ TEST(SessionAckSinkRegression, CoalescesEveryAckOfAPassOnTheSessionPublication) 
     EXPECT_EQ(corrs7, (std::vector<int64_t>{1, 2, 4}));
 }
 
-TEST(SessionAckSinkRegression, BackPressureBacklogsPausesIntakeAndPreservesOrder) {
-    FakePolicy pol; auto st = pol.s; Sink s(pol); int64_t now = 0;
-    ready(s, 7, now);
-    st->blocked.insert(1);                                  // the session's pub (reg 1)
-    s.enqueue(ack(7, 10)); s.enqueue(ack(7, 11));
-    s.flush(now += kMs);
-    EXPECT_FALSE(s.intakeAllowed()) << "G-A6: back-pressured acks pause intake";
-    EXPECT_EQ(s.pendingForTest(), 2u);
+TEST(SessionAckSinkRegression, BackPressureHoldsInOrderAndPausesOnlyThatSession) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8);
+    st->blocked.insert(1);                                  // session 7's pub (reg 1)
+    s.enqueue(ack(7, 10)); s.enqueue(ack(8, 20)); s.enqueue(ack(7, 11));
+    pass(s);
+    EXPECT_TRUE(s.holding(7)) << "G-A6: back-pressured acks pause THAT client";
+    EXPECT_FALSE(s.holding(8)) << "... and only that client";
+    EXPECT_EQ(s.heldAcks(), 2u);
+    ASSERT_EQ(st->sent.size(), 1u);
+    EXPECT_EQ(corrOf(st->sent[0].second), 20);
     st->blocked.clear();
-    s.flush(now += kMs);
-    ASSERT_EQ(st->sent.size(), 2u);
-    EXPECT_EQ(pc::ProduceResponse::decode(st->sent[0].second.data(), st->sent[0].second.size())->correlationId, 10);
-    EXPECT_EQ(pc::ProduceResponse::decode(st->sent[1].second.data(), st->sent[1].second.size())->correlationId, 11);
-    EXPECT_TRUE(s.intakeAllowed());
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 3u);
+    EXPECT_EQ(corrOf(st->sent[1].second), 10);
+    EXPECT_EQ(corrOf(st->sent[2].second), 11);
+    EXPECT_FALSE(s.holding(7));
 }
 
-TEST(SessionAckSinkRegression, CloseWhileBackloggedClearsAndResumesIntake) {
-    FakePolicy pol; auto st = pol.s; Sink s(pol); int64_t now = 0;
-    ready(s, 7, now);
+TEST(SessionAckSinkRegression, CloseWhileHoldingDropsItsAcksAndResumes) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7);
     st->blocked.insert(1);
     s.enqueue(ack(7, 10));
-    s.flush(now += kMs);
-    ASSERT_FALSE(s.intakeAllowed());
+    pass(s);
+    ASSERT_TRUE(s.holding(7));
     s.close(7);
-    s.flush(now += kMs);
-    EXPECT_TRUE(s.intakeAllowed()) << "a closed session's acks must not pause the shard";
+    pass(s);
+    EXPECT_EQ(s.heldAcks(), 0u) << "a closed session's acks must not stay queued";
     EXPECT_EQ(s.droppedForTest(), 1u);
 }
 
-TEST(SessionAckSinkRegression, StalledSessionDroppedAfterStallWindow) {
-    FakePolicy pol; auto st = pol.s; Sink s(pol); int64_t now = 0;
-    ready(s, 7, now);                                       // pub id 1
-    ready(s, 8, now);                                       // pub id 2
+// Fix round 1 (C2): no ack of an OPEN session is ever dropped on time — a slow
+// or stalled client keeps every ack, however many passes go by, and gets them
+// all, in order, once it reads again.  (Was: dropped after kStallDropNs, the
+// session silently Failed while the runtime kept it alive.)
+TEST(SessionAckSinkRegression, BlockedSessionKeepsItsAcksWithoutAnyTimer) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8);
     st->blocked.insert(1);
     s.enqueue(ack(7, 1));
-    const int64_t t0 = (now += kMs);
-    s.flush(t0);
+    for (int i = 0; i < 100'000; ++i) pass(s);
     s.enqueue(ack(8, 2));
-    s.flush(t0 + kMs);
-    EXPECT_FALSE(s.intakeAllowed());
-    EXPECT_EQ(st->sent.size(), 1u) << "other sessions keep flowing";
-    s.flush(t0 + Sink::kStallDropNs);
-    EXPECT_TRUE(s.intakeAllowed()) << "a never-connecting client cannot block the shard";
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 1u) << "other sessions keep flowing";
+    EXPECT_TRUE(s.holding(7));
     ASSERT_NE(s.stateForTest(7), nullptr);
-    EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
-    s.enqueue(ack(7, 3));
-    s.flush(t0 + Sink::kStallDropNs + kMs);
-    EXPECT_TRUE(s.intakeAllowed());
+    EXPECT_TRUE(std::holds_alternative<Sink::PubReady>(*s.stateForTest(7))) << "never failed by a timer";
+    st->blocked.clear();
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 2u);
+    EXPECT_EQ(corrOf(st->sent[1].second), 1);
+    EXPECT_EQ(s.droppedForTest(), 0u);
 }
 
-TEST(SessionAckSinkRegression, ResolveTimeoutFailsTheSession) {
+TEST(SessionAckSinkRegression, ResolvingSessionNeverFailsOnTime) {
     FakePolicy pol; auto st = pol.s; Sink s(pol);
     st->findReady = false;
     ASSERT_TRUE(s.announce(7, "c", 1));
     s.enqueue(ack(7, 1));
-    s.flush(1 * kMs);
-    s.flush(2 * kMs);
-    EXPECT_FALSE(s.intakeAllowed());
-    s.flush(1 * kMs + Sink::kResolveTimeoutNs + 1);
-    EXPECT_TRUE(s.intakeAllowed());
-    EXPECT_EQ(s.droppedForTest(), 1u);
+    for (int i = 0; i < 10'000; ++i) pass(s);
+    EXPECT_TRUE(std::holds_alternative<Sink::PubResolving>(*s.stateForTest(7)));
+    EXPECT_TRUE(s.holding(7));
+    st->findReady = true;
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 1u);
+    EXPECT_EQ(s.droppedForTest(), 0u);
 }
 
-TEST(SessionAckSinkRegression, UnknownSessionAckIsDroppedAndCounted) {
+// Fix round 1 (C2): a publication that can never deliver is REPORTED (the
+// worker emits SessionFailed; the runtime closes the session) — exactly once,
+// retried while the report cannot be delivered, never silent.
+TEST(SessionAckSinkRegression, ClosedPublicationFailsAtOnceAndIsReportedExactlyOnce) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7);
+    st->closed.insert(1);
+    s.enqueue(ack(7, 1)); s.enqueue(ack(7, 2));
+    pass(s);
+    ASSERT_NE(s.stateForTest(7), nullptr);
+    EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
+    EXPECT_EQ(s.droppedForTest(), 2u);
+    EXPECT_FALSE(s.holding(7)) << "nothing held for a failed session";
+    EXPECT_EQ(s.unreportedFailures(), 1u);
+    std::vector<int64_t> reported;
+    EXPECT_EQ(s.reportFailures([&](int64_t) { return false; }), 0) << "return ring full: retried later";
+    EXPECT_EQ(s.unreportedFailures(), 1u);
+    EXPECT_EQ(s.reportFailures([&](int64_t sid) { reported.push_back(sid); return true; }), 1);
+    EXPECT_EQ(s.reportFailures([&](int64_t sid) { reported.push_back(sid); return true; }), 0);
+    EXPECT_EQ(reported, (std::vector<int64_t>{7}));
+}
+
+TEST(SessionAckSinkRegression, AddAndFindErrorsAreReportedAndCloseForgetsAnUnreportedFailure) {
+    {
+        FakePolicy pol; auto st = pol.s; Sink s(pol);
+        st->findError = true;
+        ASSERT_TRUE(s.announce(7, "c", 1));
+        pass(s); pass(s);
+        EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
+        EXPECT_EQ(s.unreportedFailures(), 1u);
+        s.close(7);                                        // the runtime closed it meanwhile
+        EXPECT_EQ(s.unreportedFailures(), 0u) << "nothing left to report for a closed session";
+        EXPECT_EQ(s.reportFailures([](int64_t) { ADD_FAILURE(); return true; }), 0);
+    }
+    {
+        struct AddFails : FakePolicy {
+            int64_t add(std::string_view, int32_t) noexcept { return -1; }
+        };
+        AddFails pol; SessionAckSinkT<AddFails> s(pol);
+        ASSERT_TRUE(s.announce(9, "c", 1));
+        s.flush(0, 0);
+        int64_t got = 0;
+        EXPECT_EQ(s.reportFailures([&](int64_t sid) { got = sid; return true; }), 1);
+        EXPECT_EQ(got, 9);
+    }
+}
+
+// Fix round 1 (I1): a frame can be visible before its session's announcement is
+// drained (aeron:ipc commits straight into the log buffer).  Its ack is HELD
+// until the lifecycle ring is consumed past the producer position sampled at
+// the flush that first saw it — then a still-unknown session is truly gone.
+TEST(SessionAckSinkRegression, UnknownSessionAckHeldUntilTheLifecycleRingIsConsumedPastIt) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    s.enqueue(ack(9, 1));
+    s.flush(/*producer=*/100, /*consumer=*/40);             // announcement may still be in the ring
+    EXPECT_EQ(s.droppedForTest(), 0u);
+    EXPECT_EQ(s.heldAcks(), 1u);
+    ASSERT_TRUE(s.announce(9, "c", 1));                      // ...the next pass drains it
+    s.flush(140, 140);                                       // Announced → Resolving
+    s.flush(140, 140);                                       // Ready → sent
+    ASSERT_EQ(st->sent.size(), 1u);
+    EXPECT_EQ(s.droppedForTest(), 0u);
+
+    s.enqueue(ack(10, 2));                                   // never announced
+    s.flush(200, 150);
+    EXPECT_EQ(s.droppedForTest(), 0u);
+    s.flush(260, 199);                                       // tag stays 200 (first sighting)
+    EXPECT_EQ(s.droppedForTest(), 0u);
+    s.flush(260, 200);
+    EXPECT_EQ(s.droppedForTest(), 1u) << "consumed past every announcement that could name it";
+    EXPECT_EQ(s.heldAcks(), 0u);
+}
+
+TEST(SessionAckSinkRegression, UnknownSessionAckWithTheRingConsumedIsDroppedAndCounted) {
     FakePolicy pol; Sink s(pol);
     s.enqueue(ack(99, 1));
-    s.flush(1 * kMs);
-    EXPECT_TRUE(s.intakeAllowed());
+    pass(s);
+    EXPECT_EQ(s.heldAcks(), 0u);
     EXPECT_EQ(s.droppedForTest(), 1u);
 }
 
@@ -170,54 +253,52 @@ TEST(SessionAckSinkRegression, OversizedChannelAnnouncementRefused) {
     EXPECT_FALSE(s.announce(7, std::string(Sink::kMaxChannelBytes + 1, 'x'), 1));
 }
 
-TEST(SessionAckSinkRegression, ClosedPublicationFailsTheSessionAtOnce) {
-    FakePolicy pol; auto st = pol.s; Sink s(pol); int64_t now = 0;
-    ready(s, 7, now);
-    st->closed.insert(1);
-    s.enqueue(ack(7, 1)); s.enqueue(ack(7, 2));
-    s.flush(now += kMs);
-    EXPECT_TRUE(s.intakeAllowed()) << "a CLOSED publication can never deliver: fail now, not after the stall window";
-    ASSERT_NE(s.stateForTest(7), nullptr);
-    EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
-    EXPECT_EQ(s.droppedForTest(), 2u);
-}
-
 TEST(SessionAckSinkRegression, NotYetConnectedPublicationHoldsAcksUntilItConnects) {
     // A freshly announced session's publication is NOT_CONNECTED until the
     // client's image is up (Aeron setup): its first acks wait, they are not lost.
-    FakePolicy pol; auto st = pol.s; Sink s(pol); int64_t now = 0;
-    ready(s, 7, now);
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7);
     st->blocked.insert(1);
     s.enqueue(ack(7, 1));
-    for (int i = 0; i < 3; ++i) s.flush(now += kMs);
+    for (int i = 0; i < 3; ++i) pass(s);
     EXPECT_TRUE(st->sent.empty());
     st->blocked.clear();
-    s.flush(now += kMs);
+    pass(s);
     ASSERT_EQ(st->sent.size(), 1u);
     EXPECT_EQ(s.droppedForTest(), 0u);
 }
 
 TEST(SessionAckSinkRegression, ReannounceAfterCloseOpensAFreshPublication) {
-    FakePolicy pol; auto st = pol.s; Sink s(pol); int64_t now = 0;
-    ready(s, 7, now);
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7);
     s.close(7);
     EXPECT_EQ(s.stateForTest(7), nullptr);
-    ready(s, 7, now);
+    ready(s, 7);
     EXPECT_EQ(st->added.size(), 2u);
     s.enqueue(ack(7, 1));
-    s.flush(now += kMs);
+    pass(s);
     ASSERT_EQ(st->sent.size(), 1u);
     EXPECT_EQ(st->sent[0].first, 2) << "acked on the new registration";
+}
+
+// m3: re-announcing a session still Announced / Resolving must not queue a
+// second resolution (one add, one publication).
+TEST(SessionAckSinkRegression, ReannounceWhileUnresolvedResolvesOnce) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c", 1));
+    ASSERT_TRUE(s.announce(7, "c", 1));
+    pass(s); pass(s); pass(s);
+    EXPECT_EQ(st->added.size(), 1u);
+    EXPECT_TRUE(std::holds_alternative<Sink::PubReady>(*s.stateForTest(7)));
 }
 
 TEST(SessionAckSinkRegression, ManySessionsSurviveBackwardShiftDeletion) {
     // Open addressing with backward-shift deletion: closing every other
     // session must leave every remaining one findable.
-    FakePolicy pol; Sink s(pol); int64_t now = 0;
+    FakePolicy pol; Sink s(pol);
     constexpr int64_t kN = 600;
     for (int64_t sid = 1; sid <= kN; ++sid) ASSERT_TRUE(s.announce(sid, "c", 1));
-    s.flush(now += kMs); s.flush(now += kMs);   // all resolved (within kMaxUnresolved batches)
-    for (int i = 0; i < 16; ++i) s.flush(now += kMs);
+    for (int i = 0; i < 18; ++i) pass(s);
     for (int64_t sid = 1; sid <= kN; sid += 2) s.close(sid);
     for (int64_t sid = 1; sid <= kN; ++sid) {
         if (sid % 2 == 1) EXPECT_EQ(s.stateForTest(sid), nullptr) << sid;

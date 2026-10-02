@@ -775,7 +775,7 @@ if(BUILD_TESTING)
             # Task 13 (spec §3.4): worker-side acks on the worker's own session
             # publication, REAL invoker driver over aeron:ipc.
             add_executable(rune_shard_worker_ack_tests tests/node/ShardWorkerAckTest.cpp)
-            target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Spec §3.1 never-block: follower flush / owned-log sync / Strict tier

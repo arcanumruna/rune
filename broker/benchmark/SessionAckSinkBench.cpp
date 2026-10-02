@@ -42,8 +42,8 @@ std::unique_ptr<Sink> readySink(std::array<uint8_t, 1 << 16>& buf, std::size_t& 
     BumpPolicy p; p.buf = &buf; p.off = &off;
     auto s = std::make_unique<Sink>(p);
     for (int64_t sid = 1; sid <= sessions; ++sid) s->announce(sid, "aeron:udp?endpoint=10.0.0.1:40123", 1001);
-    int64_t now = 1;
-    for (int i = 0; i < 4; ++i) s->flush(now += 1000);
+
+    for (int i = 0; i < 4; ++i) s->flush(0, 0);
     return s;
 }
 } // namespace
@@ -53,11 +53,11 @@ static void BM_SessionAckSinkFlush(benchmark::State& state) {
     auto buf = std::make_unique<std::array<uint8_t, 1 << 16>>();
     std::size_t off = 0;
     auto s = readySink(*buf, off, sessions);
-    int64_t corr = 0, now = 1'000'000;
+    int64_t corr = 0;
     for (auto _ : state) {
         for (int64_t i = 0; i < acks; ++i)
             s->enqueue(AckEntry{1 + (i % sessions), ++corr, corr, 0, 0});
-        benchmark::DoNotOptimize(s->flush(now += 1000));
+        benchmark::DoNotOptimize(s->flush(0, 0));
         benchmark::ClobberMemory();
     }
     state.SetItemsProcessed(state.iterations() * acks);
@@ -70,11 +70,11 @@ static void BM_SessionAckSinkLookupAtScale(benchmark::State& state) {
     auto buf = std::make_unique<std::array<uint8_t, 1 << 16>>();
     std::size_t off = 0;
     auto s = readySink(*buf, off, sessions);
-    int64_t corr = 0, now = 1'000'000, sid = 0;
+    int64_t corr = 0, sid = 0;
     for (auto _ : state) {
         sid = sid % sessions + 1;
         s->enqueue(AckEntry{sid, ++corr, corr, 0, 0});
-        benchmark::DoNotOptimize(s->flush(now += 1000));
+        benchmark::DoNotOptimize(s->flush(0, 0));
     }
 }
 BENCHMARK(BM_SessionAckSinkLookupAtScale)->Arg(1)->Arg(64)->Arg(1024)->Arg(4000)->Unit(benchmark::kNanosecond);

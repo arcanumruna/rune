@@ -4,33 +4,43 @@
 // In shard mode the worker encodes each ProduceResponse itself and claims it on
 // ITS OWN exclusive publication to the client session (single writer, zero-copy
 // tryClaim/BufferClaim).  Sessions are announced by the runtime over the
-// runtime→worker ring BEFORE the client learns its session id (announce-before-
-// accept); the publication is added on the first flush after the announcement
-// and resolved without ever blocking the loop.
+// worker's session-lifecycle ring BEFORE the client learns its session id
+// (announce-before-accept); the publication is added on the first flush after
+// the announcement and resolved without ever blocking the loop.
 //
 // Rich state (spec §1a.4) — each state holds exactly what it needs:
 //   per session  PubState = Announced(chan, len, stream)        add() pending
-//                         → Resolving(regId, deadlineNs)         find() pending
-//                         → Ready(pub, stalledSinceNs, blockedPass)
-//                         | Failed(sinceNs)                      acks dropped (client gone)
-//   whole sink   Backlog  = Clear | Backlogged(pending, sinceNs) — G-A6
+//                         → Resolving(regId)                     find() pending
+//                         → Ready(pub, blockedPass)
+//                         | Failed(reported)                     can never deliver
+//   per ack      sessionPos — the lifecycle-ring producer position an ack of a
+//                not-yet-known session is held against (fix round 1, I1).
 //
 // Coalescing: every ack due in a pass is claimed in one flush, before the shard's
 // next driver duty cycle, so the sender ships each session's acks together (one
 // datagram up to the MTU).  The client protocol, frames and correlation ids are
 // unchanged (resolution of the §3.4 "one frame" wording).
 //
-// Never-drop (G-A6): an ack that cannot be claimed (back-pressured, or the
-// client's image not yet connected) stays queued in order (per-session order is
-// kept: once a session blocks in a pass, its later acks in that pass wait too).
-// Acks are dropped ONLY when the client can never receive them: the session was
-// closed by the runtime (Disconnect / reap / connect timeout), its publication
-// failed (driver error, CLOSED, resolve deadline), or it stayed unclaimable for
-// kStallDropNs (a client that vanished without Disconnect — its session is
-// reaped by the runtime later; this bounds what it can hold here).  The worker
-// sizes the queue (kAckCapacity) against the same static bound as its return
-// FIFO and gates intake on its free slots, so enqueue never fails in steady
-// state; a full queue is an invariant violation for the caller.
+// Never-drop, time-independent (G-A6, §1a.9 — fix round 1, C1/C2).  An ack that
+// cannot be claimed (back-pressured, or the client image not yet connected) stays
+// queued in order, for as long as it takes — there is NO timer: a slow client
+// drains at its own pace while the worker pauses ONLY that session's intake
+// (holding() → the worker ABORTs its frames in a controlled poll).  Acks are
+// dropped only on STATE events:
+//   * the session was closed by the runtime (Disconnect / lease reap / connect
+//     timeout / SessionFailed) — the client is gone;
+//   * its publication can never deliver (add / find error, CLOSED,
+//     MAX_POSITION_EXCEEDED) → Failed(reported = false); the worker reports it
+//     (reportFailures → WorkerReturn::SessionFailed) and the runtime closes the
+//     session everywhere, so the client reconnects — never a silent black hole;
+//   * the ack's session is unknown AND the lifecycle ring's consumer position
+//     reached the producer position sampled at the flush that first saw it: every
+//     announcement enqueued before its frame existed has been applied, so the
+//     session is truly unknown (closed).  Until then the ack is held (a frame
+//     can be visible before its announcement is drained: aeron:ipc commits
+//     straight into the log buffer).
+// Bound: the worker gates every intake step (op drain, client poll) on free
+// slots minus owed acks, so the queue never overflows (Worker.h, kAckCapacity).
 //
 // Zero allocation per pass: fixed arrays, open addressing (backward-shift
 // delete), no node containers.  std::string only inside the policy's add()
@@ -58,6 +68,9 @@ struct AckEntry {
     int64_t baseOffset    = 0;
     int32_t partition     = 0;
     int16_t errorCode     = 0;
+    /// Unknown-session hold (I1): the lifecycle-ring producer position sampled
+    /// at the first flush that saw this ack with no session; -1 = not held.
+    int64_t sessionPos    = -1;
 };
 
 enum class PubFind : uint8_t { Pending, Ready, Error };
@@ -69,23 +82,18 @@ public:
 
     static constexpr std::size_t kMaxSessions      = 4096;             // power of two (one slot stays empty)
     static constexpr std::size_t kMaxChannelSlots  = 256;              // announcements awaiting add()
-    static constexpr std::size_t kAckCapacity      = 16384;            // >= Worker::kRetFifoBound (static_assert there)
+    static constexpr std::size_t kAckCapacity      = 16384;            // bound: Worker.h (static_assert there)
     static constexpr std::size_t kMaxChannelBytes  = 255;
-    static constexpr int64_t     kResolveTimeoutNs = 5'000'000'000LL;
-    static constexpr int64_t     kStallDropNs      = 5'000'000'000LL;
     /// A claim result meaning "this publication can never deliver" (Aeron CLOSED
     /// / MAX_POSITION_EXCEEDED, mapped by the policy) → the session fails now.
     static constexpr int64_t     kClaimFatal       = -4;
 
     struct PubAnnounced { uint16_t chan = 0; uint16_t chanLen = 0; int32_t streamId = 0; };
-    struct PubResolving { int64_t regId = -1; int64_t deadlineNs = 0; };
-    struct PubReady     { PubHandle pub{}; int64_t stalledSinceNs = kNotStalled; uint64_t blockedPass = 0; };
-    struct PubFailed    { int64_t sinceNs = 0; };
+    struct PubResolving { int64_t regId = -1; };
+    struct PubReady     { PubHandle pub{}; uint64_t blockedPass = 0; };
+    /// reported == false: the runtime has not yet been told (reportFailures).
+    struct PubFailed    { bool reported = true; };
     using PubState = std::variant<PubAnnounced, PubResolving, PubReady, PubFailed>;
-
-    struct Clear {};
-    struct Backlogged { uint32_t pending = 0; int64_t sinceNs = 0; };
-    using Backlog = std::variant<Clear, Backlogged>;
 
     explicit SessionAckSinkT(PubPolicy policy) noexcept : policy_(std::move(policy)) {
         for (std::size_t i = 0; i < kMaxChannelSlots; ++i) freeChan_[i] = static_cast<uint16_t>(i);
@@ -96,42 +104,42 @@ public:
 
     /// Runtime announcement (ring op, cold).  Re-announcing a known session
     /// restarts it on a fresh publication.  False = refused (session id <= 0,
-    /// table full, channel too long) — the session's acks are then dropped.
+    /// table full, channel too long) — unreachable by construction: the runtime
+    /// caps sessions at kMaxSessions − 1 and refuses longer channels at Connect
+    /// (the worker treats a refusal as an invariant violation).
     bool announce(int64_t sessionId, std::string_view channel, int32_t streamId) noexcept {
         if (sessionId <= 0 || channel.size() > kMaxChannelBytes) return false;
         std::size_t idx = find_(sessionId);
         if (idx == kNone) idx = insert_(sessionId);
         if (idx == kNone) return false;                                   // table full
-        releaseChan_(states_[idx]);
-        if (unresolvedCount_ == kMaxSessions) [[unlikely]] {              // unreachable (one entry per session)
-            states_[idx] = PubFailed{0};
-            return false;
-        }
+        PubState& st = states_[idx];
+        // m3: an Announced / Resolving session is already in unresolved_.
+        const bool listed = std::holds_alternative<PubAnnounced>(st) || std::holds_alternative<PubResolving>(st);
+        leaveState_(st);
         if (freeChanCount_ > 0) [[likely]] {
             const uint16_t c = freeChan_[--freeChanCount_];
             std::memcpy(chanPool_[c].data(), channel.data(), channel.size());
-            states_[idx] = PubAnnounced{c, static_cast<uint16_t>(channel.size()), streamId};
+            st = PubAnnounced{c, static_cast<uint16_t>(channel.size()), streamId};
         } else {
             // Connect burst beyond the channel pool: register now (the channel
             // view is still valid here) instead of refusing the session.
-            states_[idx] = addNow_(channel, streamId, lastNowNs_);
-            if (std::holds_alternative<PubFailed>(states_[idx])) return false;
+            addNow_(st, channel, streamId);
         }
-        unresolved_[unresolvedCount_++] = sessionId;
+        if (!listed && !std::holds_alternative<PubFailed>(st)) unresolved_[unresolvedCount_++] = sessionId;
         return true;
     }
 
-    /// Runtime close (Disconnect / reap / connect timeout): forget the session;
-    /// its queued acks drop at the next flush; its publication is released.
+    /// Runtime close (Disconnect / reap / connect timeout / SessionFailed):
+    /// forget the session; its queued acks drop at the next flush (once the
+    /// lifecycle ring is consumed past them); its publication is released.
     void close(int64_t sessionId) noexcept {
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return;
-        releaseChan_(states_[idx]);
         erase_(idx);
     }
 
     /// Queue one ack for this pass's flush.  False only when the queue is full
-    /// (the caller's intake gate makes that an invariant violation).
+    /// (the worker's intake gate makes that an invariant violation).
     bool enqueue(const AckEntry& a) noexcept {
         if (ackCount_ == kAckCapacity) [[unlikely]] return false;
         acks_[ackCount_++] = a;
@@ -139,66 +147,93 @@ public:
     }
 
     /// One pass: advance announcements, then claim every queued ack on its
-    /// session publication in order.  Returns work done.
-    int flush(int64_t nowNs) noexcept {
-        lastNowNs_ = nowNs;
+    /// session publication in order.  `ringProducerPos` / `ringConsumerPos`:
+    /// the worker's session-lifecycle ring, sampled now (after every frame of
+    /// this pass was observed) — they decide when an unknown session's ack is
+    /// truly orphaned (I1).  Returns work done.
+    int flush(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
         ++pass_;
-        int work = unresolvedCount_ ? resolvePending_(nowNs) : 0;
+        int work = unresolvedCount_ ? resolvePending_() : 0;
         if (ackCount_ == 0) [[likely]] {
-            backlog_ = Clear{};
+            heldAfterFlush_ = 0;
             return work;
         }
         std::size_t keep = 0;
         for (std::size_t i = 0; i < ackCount_; ++i) {
-            const AckEntry a = acks_[i];
+            AckEntry a = acks_[i];
             const std::size_t idx = find_(a.sessionId);
-            if (idx == kNone) { ++dropped_; continue; }             // closed / never announced
+            if (idx == kNone) [[unlikely]] {
+                // Unknown: hold until every announcement enqueued before its
+                // frame existed is applied, then it is orphaned (closed session).
+                if (a.sessionPos < 0) a.sessionPos = ringProducerPos;
+                if (ringConsumerPos >= a.sessionPos) { ++dropped_; continue; }
+                acks_[keep++] = a;
+                continue;
+            }
             PubState& st = states_[idx];
             if (auto* r = std::get_if<PubReady>(&st)) [[likely]] {
                 if (r->blockedPass != pass_) {                      // per-session order kept
                     const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, dst); });
                     if (pos > 0) [[likely]] {
-                        r->stalledSinceNs = kNotStalled;
                         ++work;
                         continue;
                     }
                     if (pos == kClaimFatal) [[unlikely]] {           // can never deliver
-                        st = PubFailed{nowNs};
+                        fail_(st);
                         ++dropped_;
                         ++work;
                         continue;
                     }
                     r->blockedPass = pass_;                         // back-pressured / not yet connected
-                    if (r->stalledSinceNs == kNotStalled) r->stalledSinceNs = nowNs;
-                }
-                if (nowNs - r->stalledSinceNs >= kStallDropNs) [[unlikely]] {   // client gone
-                    st = PubFailed{nowNs};
-                    ++dropped_;
-                    ++work;
-                    continue;
                 }
             } else if (std::holds_alternative<PubFailed>(st)) {
-                ++dropped_;
+                ++dropped_;                                          // reported → the runtime closes it
                 continue;
             }
-            acks_[keep++] = a;                                       // Announced / Resolving / blocked
+            heldPass_[idx] = pass_;                                  // Announced / Resolving / blocked
+            acks_[keep++] = a;
         }
         ackCount_ = keep;
-        if (keep == 0) {
-            backlog_ = Clear{};
-        } else if (auto* b = std::get_if<Backlogged>(&backlog_)) {
-            b->pending = static_cast<uint32_t>(keep);
-        } else {
-            backlog_ = Backlogged{static_cast<uint32_t>(keep), nowNs};
-        }
+        heldAfterFlush_ = keep;
         return work;
     }
 
-    /// No ack is waiting (nothing held after the last flush).
-    [[nodiscard]] bool        intakeAllowed() const noexcept { return std::holds_alternative<Clear>(backlog_); }
+    /// G-A6 per-client pause: `sessionId` still holds acks after the last flush
+    /// (its publication back-pressured / not yet resolved).  O(1) when nothing
+    /// is held (the hot case) — one hash probe otherwise.
+    [[nodiscard]] bool holding(int64_t sessionId) const noexcept {
+        if (heldAfterFlush_ == 0) [[likely]] return false;
+        const std::size_t idx = find_(sessionId);
+        return idx != kNone && heldPass_[idx] == pass_;
+    }
+
+    /// Report every failed session not yet reported: `tryReport(sessionId)`
+    /// returns false when it cannot deliver now (return ring full) — the
+    /// failure stays recorded in its state and is retried next pass (never
+    /// dropped, never through an unbounded queue).  Cold: scans only while an
+    /// unreported failure exists.  Returns how many were reported.
+    template <class TryReport>
+    int reportFailures(TryReport&& tryReport) noexcept {
+        if (unreported_ == 0) [[likely]] return 0;
+        int n = 0;
+        for (std::size_t i = 0; i < kMaxSessions && unreported_ != 0; ++i) {
+            if (keys_[i] == 0) continue;
+            auto* f = std::get_if<PubFailed>(&states_[i]);
+            if (!f || f->reported) continue;
+            if (!tryReport(keys_[i])) break;
+            f->reported = true;
+            --unreported_;
+            ++n;
+        }
+        return n;
+    }
+
     [[nodiscard]] std::size_t freeAckSlots() const noexcept { return kAckCapacity - ackCount_; }
     [[nodiscard]] std::size_t pending() const noexcept { return ackCount_; }
+    /// Acks still queued after the last flush (held for their sessions).
+    [[nodiscard]] std::size_t heldAcks() const noexcept { return heldAfterFlush_; }
     [[nodiscard]] std::size_t sessionCount() const noexcept { return count_; }
+    [[nodiscard]] std::size_t unreportedFailures() const noexcept { return unreported_; }
     [[nodiscard]] std::size_t pendingForTest() const noexcept { return ackCount_; }
     [[nodiscard]] uint64_t    droppedForTest() const noexcept { return dropped_; }
     [[nodiscard]] const PubState* stateForTest(int64_t sessionId) const noexcept {
@@ -207,7 +242,6 @@ public:
     }
 
 private:
-    static constexpr int64_t     kNotStalled = INT64_MIN;
     static constexpr std::size_t kNone     = static_cast<std::size_t>(-1);
     static constexpr std::size_t kMask     = kMaxSessions - 1;
     static constexpr int         kBits     = std::countr_zero(kMaxSessions);
@@ -231,13 +265,16 @@ private:
         std::size_t i = hash_(sid);
         while (keys_[i] != 0) i = (i + 1) & kMask;
         keys_[i] = sid;
-        states_[i] = PubFailed{0};
+        states_[i] = PubFailed{};                                    // neutral (reported) placeholder
+        heldPass_[i] = 0;
         ++count_;
         return i;
     }
     void erase_(std::size_t i) noexcept {                            // backward-shift deletion
+        leaveState_(states_[i]);
         keys_[i] = 0;
-        states_[i] = PubFailed{0};                                   // releases a Ready publication
+        states_[i] = PubFailed{};                                    // releases a Ready publication
+        heldPass_[i] = 0;
         --count_;
         std::size_t j = i;
         for (;;) {
@@ -248,21 +285,32 @@ private:
             if (stays) continue;
             keys_[i] = keys_[j];
             states_[i] = std::move(states_[j]);
+            heldPass_[i] = heldPass_[j];
             keys_[j] = 0;
-            states_[j] = PubFailed{0};
+            states_[j] = PubFailed{};
+            heldPass_[j] = 0;
             i = j;
         }
     }
-    void releaseChan_(const PubState& st) noexcept {
+    /// Bookkeeping when a state is replaced: return its channel slot; forget an
+    /// unreported failure (closed / re-announced: nothing left to report).
+    void leaveState_(const PubState& st) noexcept {
         if (const auto* a = std::get_if<PubAnnounced>(&st); a && freeChanCount_ < kMaxChannelSlots)
             freeChan_[freeChanCount_++] = a->chan;
+        else if (const auto* f = std::get_if<PubFailed>(&st); f && !f->reported)
+            --unreported_;
     }
-    PubState addNow_(std::string_view channel, int32_t streamId, int64_t nowNs) noexcept {
+    void fail_(PubState& st) noexcept {
+        leaveState_(st);
+        st = PubFailed{false};
+        ++unreported_;
+    }
+    void addNow_(PubState& st, std::string_view channel, int32_t streamId) noexcept {
         const int64_t reg = policy_.add(channel, streamId);
-        if (reg < 0) return PubFailed{nowNs};
-        return PubResolving{reg, nowNs + kResolveTimeoutNs};
+        if (reg < 0) { st = PubFailed{false}; ++unreported_; return; }
+        st = PubResolving{reg};
     }
-    int resolvePending_(int64_t nowNs) noexcept {
+    int resolvePending_() noexcept {
         int work = 0;
         std::size_t keep = 0;
         for (std::size_t k = 0; k < unresolvedCount_; ++k) {
@@ -273,8 +321,8 @@ private:
             if (const auto* a = std::get_if<PubAnnounced>(&st)) {
                 const std::string_view ch(chanPool_[a->chan].data(), a->chanLen);
                 const int32_t stream = a->streamId;
-                releaseChan_(st);
-                st = addNow_(ch, stream, nowNs);
+                leaveState_(st);                                     // slot freed; ch still readable
+                addNow_(st, ch, stream);
                 ++work;
                 if (std::holds_alternative<PubResolving>(st)) unresolved_[keep++] = sid;
                 continue;
@@ -282,9 +330,9 @@ private:
             if (auto* r = std::get_if<PubResolving>(&st)) {
                 PubHandle pub{};
                 const PubFind f = policy_.find(r->regId, pub);
-                if (f == PubFind::Ready) { st = PubReady{std::move(pub), kNotStalled, 0}; ++work; continue; }
-                if (f == PubFind::Error || nowNs >= r->deadlineNs) { st = PubFailed{nowNs}; ++work; continue; }
-                unresolved_[keep++] = sid;
+                if (f == PubFind::Ready) { st = PubReady{std::move(pub), 0}; ++work; continue; }
+                if (f == PubFind::Error) { fail_(st); ++work; continue; }
+                unresolved_[keep++] = sid;                           // driver answers in a pass or two
             }
         }
         unresolvedCount_ = keep;
@@ -303,6 +351,7 @@ private:
     PubPolicy                                                        policy_;
     std::array<int64_t, kMaxSessions>                                keys_{};      // 0 = empty
     std::array<PubState, kMaxSessions>                               states_{};
+    std::array<uint64_t, kMaxSessions>                               heldPass_{};  // pass that last held acks
     std::size_t                                                      count_ = 0;
     std::array<int64_t, kMaxSessions>                                unresolved_{};
     std::size_t                                                      unresolvedCount_ = 0;
@@ -311,10 +360,10 @@ private:
     std::size_t                                                      freeChanCount_ = 0;
     std::array<AckEntry, kAckCapacity>                               acks_{};
     std::size_t                                                      ackCount_ = 0;
-    Backlog                                                          backlog_{Clear{}};
+    std::size_t                                                      heldAfterFlush_ = 0;
+    std::size_t                                                      unreported_ = 0;
     uint64_t                                                         pass_    = 0;
     uint64_t                                                         dropped_ = 0;
-    int64_t                                                          lastNowNs_ = 0;
 };
 
 /// Production policy: the worker's own invoker-mode Aeron client (spec §3.1).

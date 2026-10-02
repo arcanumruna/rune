@@ -310,6 +310,12 @@ struct WorkerReturn {
     enum class Type : uint8_t {
         ProduceResult,   ///< result of a Produce op
         PushReadResult,  ///< result of a PushRead op
+        /// Task 13 fix round 1 (C2): sessionId's ack publication on worker
+        /// `partition` can never deliver (add / find error, CLOSED,
+        /// MAX_POSITION_EXCEEDED).  The runtime closes the session everywhere
+        /// (the client reconnects).  Rides sbe ReturnType value 2 — RESERVED_2
+        /// (PRODUCE_NOTIFY, retired by F15 §7); in-process ring only.
+        SessionFailed = 2,
         /// fsyncgate fail-stop (Task 10 fix 1): a log's fsync failed.  topicId /
         /// partition name it, errorCode = errno, chunk = the log directory.  The
         /// runtime logs critical and halts the broker (kExitStorageFailure).

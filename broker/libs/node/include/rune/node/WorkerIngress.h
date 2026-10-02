@@ -151,6 +151,32 @@ public:
         return n;
     }
 
+    // -----------------------------------------------------------------------
+    // controlledPoll — as poll(), but the handler returns aeron::Controlled-
+    // PollAction (Task 13 fix round 1, G-A6 per-client pause).  ABORT leaves
+    // the message (its END fragment) on ITS image — one client publication —
+    // and Aeron moves on to the other images.  Use ONE poll flavour per
+    // WorkerIngress (separate reassembly state; a shard uses only this one).
+    // -----------------------------------------------------------------------
+    template <class Handler>
+    int controlledPoll(int fragmentLimit, Handler&& handler) {
+        if (!sub_) [[unlikely]] return 0;
+        const int n = sub_->controlledPoll(
+            [this, &handler](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
+                             aeron::util::index_t l, aeron::Header& h) {
+                return controlledAssembler_.onFragment(
+                    [&handler](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                               aeron::util::index_t length, aeron::Header& header) {
+                        return handler(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                       static_cast<std::size_t>(length), header);
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit);
+        controlledImageWatch_.afterPoll(*sub_, controlledAssembler_);
+        return n;
+    }
+
 private:
     // Mirror the exact constants from ClientGateway.cpp:49-50.
     static constexpr int kResolveMaxMs   = 5000;  // 5 s
@@ -162,6 +188,8 @@ private:
 
     rune::aeronutil::FragmentAssembler     assembler_;
     rune::aeronutil::ImageLossWatch        imageWatch_;
+    rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;   // controlledPoll only
+    rune::aeronutil::ImageLossWatch              controlledImageWatch_;
 };
 
 } // namespace rune::node

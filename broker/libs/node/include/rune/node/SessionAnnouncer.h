@@ -16,9 +16,13 @@
 // announcement of a reused id is executed first (§1.1 L4 of the F15 note).
 //
 // Control plane (connect / disconnect rate), runtime thread only.  The vectors
-// grow only with concurrent connects / pending closes (cold).
+// grow only with concurrent connects / pending closes (cold); a growing backlog
+// (a worker's lifecycle ring permanently full) is logged at each doubling past
+// kBacklogWarnAt (fix round 1, m9) and visible via pendingCloses().
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
+
+#include <spdlog/spdlog.h>
 
 #include <cstdint>
 #include <string_view>
@@ -54,6 +58,11 @@ public:
         eraseAnnouncing_(sessionId);
         closing_.push_back({sessionId, allMask_(pool)});
         (void)retryCloses(pool);
+        if (closing_.size() >= closeWarnAt_) [[unlikely]] {
+            spdlog::warn("SessionAnnouncer: {} session closes not yet accepted by every worker "
+                         "(a lifecycle ring stays full)", closing_.size());
+            closeWarnAt_ *= 2;
+        }
     }
 
     /// Re-offer every pending SessionClose; returns how many completed.
@@ -75,7 +84,9 @@ public:
         return done;
     }
 
+    static constexpr std::size_t kBacklogWarnAt = 1024;
     [[nodiscard]] std::size_t pendingCloses() const noexcept { return closing_.size(); }
+    [[nodiscard]] std::size_t pendingAnnounces() const noexcept { return announcing_.size(); }
     [[nodiscard]] std::size_t pendingClosesForTest() const noexcept { return closing_.size(); }
 
 private:
@@ -97,6 +108,7 @@ private:
 
     std::vector<Announcing> announcing_;
     std::vector<Closing>    closing_;
+    std::size_t             closeWarnAt_ = kBacklogWarnAt;
 };
 
 } // namespace rune::node

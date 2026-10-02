@@ -785,6 +785,7 @@ public:
     // the real handleMetadata() path (test seam), parallel to applyProduceForTest.
     // Single-writer: call only on the duty-cycle thread or before doWork().
     // -----------------------------------------------------------------------
+    void applyDisconnectForTest(const uint8_t* buf, std::size_t len) { handleDisconnect(buf, len); }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
         handleMetadata(buf, len);
     }
@@ -979,8 +980,12 @@ private:
 
         // Task 13 (spec §3.4): every worker has this session's reply destination
         // queued (announce-before-accept) — set once, so a ConnectResponse retry
-        // never re-announces; a timeout after it closes the session everywhere.
-        bool        announced = false;
+        // never re-announces.  announceBegun (fix round 1, I2): at least one
+        // worker may hold it — it counts against the shard session cap, and
+        // EVERY drop of this entry (timeout, eviction, error) closes it on every
+        // worker.
+        bool        announced     = false;
+        bool        announceBegun = false;
     };
 
     // -----------------------------------------------------------------------
@@ -1090,6 +1095,18 @@ private:
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
     /// F15 S2 (TEMPORARY until S4/S5): apply a worker append's gateway-mirror facts.
     void applyProduceFacts_(const rune::node::WorkerReturn& ret);
+    // Task 13 fix round 1: shard-mode session lifecycle helpers.
+    /// Worker ack-table slots in use or about to be (I2): accepted sessions +
+    /// closes not yet queued on every worker + pending connects whose
+    /// announcement has begun.
+    [[nodiscard]] std::size_t shardSessionSlotsInUse_() const noexcept;
+    /// A dropped pending connect whose announcement began → close everywhere.
+    void closeDroppedPendingConnect_(const PendingConnect& pending);
+    /// Close an accepted session (Disconnect / SessionFailed): table, workers,
+    /// subscriptions, group-member tracking.  False = unknown session (no-op).
+    bool closeSession_(int64_t sid);
+    /// Evict the oldest pending connect (the kMaxPendingConnects cap).
+    void evictOldestPendingConnect_();
     /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
     void sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
                             rune::protocol::client::ErrorCode code);
@@ -1491,6 +1508,16 @@ public:
         return s ? s->lastSeenNs : -1;
     }
     void reapExpiredForTest(int64_t nowNs) { reapExpired(nowNs); }
+    // Fix round 1 (I2) seams: a resolved-or-not pending connect with the given
+    // announce state (no Aeron publication), the cap accounting, eviction.
+    void injectPendingConnectForTest(int64_t sessionId, bool announceBegun) {
+        PendingConnect p;
+        p.sessionId = sessionId; p.registrationId = -1; p.announceBegun = announceBegun;
+        p.announced = announceBegun; p.egressChannel = "aeron:ipc";
+        pendingConnects_.push_back(std::move(p));
+    }
+    [[nodiscard]] std::size_t shardSessionSlotsInUseForTest() const noexcept { return shardSessionSlotsInUse_(); }
+    void evictOldestPendingConnectForTest() { evictOldestPendingConnect_(); }
 private:
     int64_t                                 lastFlushNs_ = 0;
 
