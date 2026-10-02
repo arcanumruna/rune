@@ -283,6 +283,42 @@ TEST(ShardWorkerAckRegression, GatewayRoutedProduceIsDedupedByTheWorkerPsm) {
     EXPECT_EQ(f.log->logEndOffset(), 1) << "the retried batch must not be appended twice";
 }
 
+// F15 S5 (Kafka parity, re-review 1 I1 residual): a retry of an acks=all
+// batch whose original is still below the HW is answered only when the
+// original commits — on shard ingress AND on the gateway-routed op path.
+TEST(ShardWorkerAckRegression, AcksAllDuplicateAnsweredOnlyWhenTheOriginalCommits) {
+    for (bool routed : {false, true}) {
+        Fixture f({1, 2}, /*minIsr=*/1);                       // follower 2 in the ISR: the HW waits for it
+        rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+        const auto batch = b.build();
+        auto send = [&](int64_t corr) {
+            if (!routed) { f.produce(corr, /*acks=all*/1, /*pid=*/11, /*seq=*/0); return; }
+            WorkerOp op; op.type = WorkerOp::Type::Produce; op.topicId = 1; op.partition = 0;
+            op.replica = f.replica.get(); op.logPtr = f.log.get();
+            op.sessionId = 5; op.correlationId = corr; op.acks = 1; op.deferAck = true;
+            op.producerId = 11; op.producerEpoch = 0; op.baseSequence = 0;
+            op.lastOffsetDelta = 0; op.recordCount = 1; op.durabilityTier = 1;
+            op.recordBatchView = std::span<const uint8_t>(batch);
+            ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(op)));
+        };
+        send(31);
+        for (int i = 0; i < 2'000; ++i) f.step();
+        ASSERT_EQ(f.acks.count(31), 0u) << "precondition: the original is parked on the HW (routed=" << routed << ")";
+        send(32);                                              // the client's retry
+        for (int i = 0; i < 2'000; ++i) f.step();
+        EXPECT_EQ(f.log->logEndOffset(), 1) << "one copy (routed=" << routed << ")";
+        EXPECT_EQ(f.acks.count(32), 0u)
+            << "the duplicate was acked before its original reached the HW (routed=" << routed << ")";
+        rune::replication::FetchRequestMsg fr{1, 0, 2, f.log->logEndOffset(), 1 << 20, 0};
+        (void)f.replica->onFetchRequest(fr, f.now);
+        ASSERT_TRUE(f.awaitAck(31));
+        ASSERT_TRUE(f.awaitAck(32));
+        EXPECT_EQ(f.acks[31].errorCode, 0);
+        EXPECT_EQ(f.acks[32].errorCode, 0);
+        EXPECT_EQ(f.acks[32].baseOffset, f.acks[31].baseOffset);
+    }
+}
+
 TEST(ShardWorkerAckRegression, ClosedSessionGetsNoAckAndReannounceRestoresIt) {
     Fixture f({1}, 1);
     f.produce(/*corr=*/1, /*acks=*/0);
