@@ -62,7 +62,13 @@ start() {
     sleep 6  # startup churn -> ISR=3
     GW="127.0.0.1:$((40200 + LEADER))"
 }
-stop() { rune_stop_cluster >/dev/null 2>&1; }
+# stop <tag>: keep the run's broker logs ($OUT/<tag>-b{0,1,2}.log) before the
+# cluster is stopped and the next run's cleanup wipes $WORK.
+stop() {
+    local tag="${1:-run}" i
+    for i in 0 1 2; do cp "$WORK/rune-c$i/broker.log" "$OUT/$tag-b$i.log" 2>/dev/null; done
+    rune_stop_cluster >/dev/null 2>&1
+}
 sg() { "$SG" --gateway "$GW" --topic bench --topic-id 0 --partitions 8 "$@"; }
 
 # one produce + read-back verify; prints RESULT and VERIFY lines
@@ -83,7 +89,7 @@ gate2() {  # GATE2_MODES="0 1" (0 legacy, 1 shard broker) — resume a partial r
             clean; start "$mode" || continue
             produce_verify "gate2-$kind-shards$shards" --arm shard-agent --shards "$shards" --records 100000 \
                 --value-bytes 1024 --acks all --egress 127.0.0.1:41000
-            stop
+            stop "gate2-$kind-shards$shards"
         done
     done
 }
@@ -92,7 +98,7 @@ gate3() {
     clean; start 1 || return 1
     produce_verify "gate3-udp-n2" --arm shard-agent --shards 2 --records 200000 --value-bytes 1024 --acks all \
         --egress 127.0.0.1:41000
-    stop
+    stop gate3-udp-n2
 }
 
 gate4() {
@@ -123,7 +129,7 @@ gate4() {
     local r n; r="$(grep '^RESULT' "$log")"; echo "gate4 $r"
     n="$(echo "$r" | grep -oE 'accepted=[0-9]+' | cut -d= -f2)"
     sg --arm verify --expect "${n:-0}" --egress 127.0.0.1:41900 2>>"$OUT/gate4.err" | grep -E '^VERIFY' | sed 's/^/gate4 /'
-    stop
+    stop gate4
 }
 
 gate5() {
@@ -136,14 +142,14 @@ gate5() {
             clean; start 1 || continue
             sg --arm "$arm" --shards 1 --busy-spin --core 0 --rate "$rate" --seconds "$secs" --records "$recs" \
                 --value-bytes 1024 --acks all --egress 127.0.0.1:41000 2>>"$OUT/gate5.err" | grep '^RESULT' | sed "s/^/gate5 i=$i /"
-            stop
+            stop "gate5-i$i-$arm"
         done
         # A/B: Invoker Client vs Invoker shard, owner on core 0
         for arm in client-invoker shard-invoker; do
             clean; start 1 || continue
             sg --arm "$arm" --core 0 --rate "$rate" --seconds "$secs" --records "$recs" \
                 --value-bytes 1024 --acks all --egress 127.0.0.1:41000 2>>"$OUT/gate5.err" | grep '^RESULT' | sed "s/^/gate5 i=$i /"
-            stop
+            stop "gate5-i$i-$arm"
         done
     done
 }
