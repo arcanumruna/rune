@@ -32,6 +32,7 @@
 #include <rune/storage/Log.h>
 
 #include <benchmark/benchmark.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
@@ -59,6 +60,11 @@ public:
     void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
     void sendFetchResponse(NodeId, const rune::replication::FetchResponseMsg&) override {}
 };
+
+// Hot-path logging off for every arm (house rule: benchmarks run with
+// RUNE_FS_LOG=0 and log level >= warn; the bench binary has no env parsing,
+// so the level is set here).
+void quietLogs() { spdlog::set_level(spdlog::level::warn); }
 
 std::string tempDir(const char* tag) {
     static int seq = 0;
@@ -152,6 +158,7 @@ std::vector<uint8_t> produceFrame(int64_t sid, int64_t corr, const std::vector<u
 
 // ---------------------------------------------------------------------------
 void BM_GatewayPathProduce(benchmark::State& state) {
+    quietLogs();
     const bool idem = state.range(0) != 0;
     GatewayRig R({1});
     constexpr int kPool = 1 << 15;
@@ -189,6 +196,7 @@ BENCHMARK(BM_GatewayPathProduce)->Arg(0)->Arg(1)->Unit(benchmark::kNanosecond)->
 
 // ---------------------------------------------------------------------------
 void BM_FlushOwedAcksAll(benchmark::State& state) {
+    quietLogs();
     const int64_t parked = state.range(0);
     const bool stalled = state.range(1) != 0;
     constexpr int kFire = 16;
@@ -264,6 +272,7 @@ BENCHMARK(BM_FlushOwedAcksAll)
 // (io_uring on Linux).  Window bounded (kMaxInFlight) so the owed cap is
 // never hit.
 void BM_StrictPipelined(benchmark::State& state) {
+    quietLogs();
     const int perPass = static_cast<int>(state.range(0));
     constexpr int kMaxInFlight = 1024;
     const std::string dir = tempDir("strict");
