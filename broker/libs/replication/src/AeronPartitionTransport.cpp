@@ -4,6 +4,7 @@
 // Single-writer. No locks. No hot-path alloc.
 
 #include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/DiagFlags.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
@@ -250,8 +251,7 @@ static uint32_t              g_outDrainSeq = 0;
 static uint32_t              g_inRecvSeq   = 0;
 
 // Per-second transport rate diagnostic (control-thread only; RUNE_FS_LOG).
-static bool     g_txRateLog     = [] { const char* e = std::getenv("RUNE_FS_LOG");
-                                       return e == nullptr || e[0] != '0'; }();
+static bool     g_txRateLog     = diagFlagFromEnv(std::getenv("RUNE_FS_LOG"));   // opt-in
 static int64_t  g_txRateLastNs  = 0;
 static int64_t  g_txPolls       = 0;   // poll() calls
 static int64_t  g_txFragsRecv   = 0;   // onFragment invocations (fragments received)
