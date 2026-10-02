@@ -94,6 +94,21 @@ RUNE_IDLE_MODE=backoff   (client still sends produce via the runtime gateway —
 
 ## 5. Where the time goes now (measured)
 
+> **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
+> 1. **All client-latency numbers here are for the wrong path.** The bench client
+>    (`rune_produce_throughput` @ client 8e3d136) does not consume `MetadataResponse.ingressEndpoint`
+>    (client T16 not implemented), so every produce goes client → node client endpoint → gateway →
+>    runtime → WorkerOp ring → worker → back, instead of the designed client → worker ingress
+>    (40500+w) direct path. These numbers do not measure the shard design; latency benchmarking is
+>    **suspended until client T16 lands**.
+> 2. **Every FR run with `RUNE_FR_RING_BYTES=268435456` was on a degraded 2-node cluster.**
+>    Six `rune_broker` OOM kills in dmesg: 3 brokers × ~1.4–1.9 GB anon (256 MiB per-thread FR
+>    rings) + ~0.7 GB shm each on 7.7 GB. The window=1 "p99 113 ms / 340–586 ms" results are
+>    failover stalls, not service time. Fixes: harness refuses a run with < 3 live brokers
+>    (`INVALID-RUN`), dumps FR one node at a time (waits on the tape, which is written last), and
+>    FR runs use 64 MiB rings. `e2e.py` asserts all 4 traces exist.
+> 3. Treat the per-hop table below as indicative only (gateway path, possibly degraded cluster).
+
 At saturation the client p50 (~65 ms) is window queueing, not service time. The latency floor
 (16 in flight, ~10k rec/s) is far above target:
 
@@ -118,6 +133,10 @@ Also: a message produced by the worker in pass N is sent by pass N+1's driver du
 per hop × ~4 hops).
 
 ## 6. Next steps (in order, each measured with the same FR setup)
+
+0. **PREREQUISITE for any further measurement:** client T15b (ShardGroup) → client T16
+   (`ingressEndpoint`, produce straight to the owning worker) → client T17/T18 (open-loop
+   `--rate`, full histogram). Only then re-baseline latency and throughput.
 
 1. Profile the remaining ~20 µs per tiny loopback send (kernel stacks of `sendmsg`).
 2. Separate tests: `network_publication_max_messages_per_send` + sender/receiver io-vector
