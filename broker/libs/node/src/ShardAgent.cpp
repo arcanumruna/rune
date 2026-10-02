@@ -11,6 +11,9 @@ int fusedRuntimePass(NodeRuntimeAgent& runtime, EmbeddedDriver& driver, aeron::A
     work += runtime.doWork(nowNs);                       // final class → direct call
     return work;
 }
+int fusedRuntimeAgentOnly(NodeRuntimeAgent& runtime, int64_t nowNs) noexcept {
+    return runtime.doWork(nowNs);                        // final class → direct call
+}
 } // namespace detail
 
 template class BasicShardAgent<rune::consensus::MonotonicNanoClock>;
