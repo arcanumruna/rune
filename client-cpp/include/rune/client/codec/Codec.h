@@ -379,6 +379,9 @@ struct PartitionEntryView {
     int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
     int32_t egressControlPort = 0; ///< read-rework: per-worker dynamic-MDC control port (0 = legacy egress)
     int32_t egressStreamId   = 0;  ///< read-rework: per-worker egress stream id
+    /// Task 16: "host:port" of the owning worker's ingress ("" = node).  Owned: the
+    /// protocol's decoded struct (a view into the frame) is local to the decoder.
+    std::string ingressEndpoint;
 };
 
 // ---------------------------------------------------------------------------
@@ -445,7 +448,8 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
         pv.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
         pv.egressControlPort = p.egressControlPort;  // read-rework: per-worker MDC egress
         pv.egressStreamId  = p.egressStreamId;
-        result.partitions.push_back(pv);
+        pv.ingressEndpoint = std::string(p.ingressEndpoint);  // Task 16 (shard brokers)
+        result.partitions.push_back(std::move(pv));
     }
 
     return result;

@@ -136,6 +136,18 @@ int ProducerHub::resendAllViaRoute(
     return resent;
 }
 
+int ProducerHub::resendPartitionViaRoute(
+    int32_t topicId, int32_t partition,
+    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn)
+{
+    int resent = 0;
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
+        resent += impl->resendPartitionViaRoute(topicId, partition, sendFn);
+    }
+    return resent;
+}
+
 bool ProducerHub::hasInFlight() const noexcept {
     for (const ProducerImpl* impl : active_) {
         if (impl == nullptr) continue;

@@ -292,6 +292,7 @@ struct InvokerGateway {
             p.leaderId        = ad.leaderId;
             p.leaderEpoch     = ad.leaderEpoch;
             p.ingressStreamId = ad.ingressStreamId;
+            p.ingressEndpoint = ad.ingressEndpoint;  // view/copy of a member: valid through encode()
             parts.push_back(p);
         }
         rp::MetadataResponse msg;

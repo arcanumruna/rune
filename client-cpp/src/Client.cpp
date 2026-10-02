@@ -58,6 +58,10 @@ thread_local Token tWaitToken = 0;
 // stack-local OneToOneRingBuffer of the smallest useful capacity.
 constexpr std::size_t   kStartLatchCapacity = 64;
 constexpr std::int32_t  kStartLatchMsgType  = 1;
+// Task 16: "host:port" (or a full Aeron channel) -> an Aeron UDP channel.
+std::string toChannel(const std::string& endpoint) {
+    return endpoint.rfind("aeron:", 0) == 0 ? endpoint : ("aeron:udp?endpoint=" + endpoint);
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -3431,7 +3435,8 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         e.leaderId       = p.leaderId;
         e.leaderEpoch    = p.leaderEpoch;
         e.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
-        partitions.push_back(e);
+        e.ingressEndpoint = p.ingressEndpoint;  // Task 16: owning worker's ingress ("" = node)
+        partitions.push_back(std::move(e));
     }
 
     metadataCache_.updateFromResponse(brokers, partitions);
@@ -3452,26 +3457,70 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // every partition on the seed ⇒ empty route table ⇒ byte-identical hot path).
     // The producer's flush→sendFn boundary then routes each record to its leader
     // session by ingressStreamId — replacing the single-transport retarget model.
-    const bool mnDbg = (std::getenv("RUNE_MN_DEBUG") != nullptr);
+    //
+    // Task 16 (shard-mode brokers, spec §3.3): a non-empty per-partition
+    // ingressEndpoint routes Produce frames STRAIGHT to the owning worker's ingress
+    // (no gateway -> runtime -> worker-ring relay); Connect / the session id stay
+    // on the node endpoint.  Empty keeps the legacy routing above.  A route whose
+    // data channel MOVES (another worker, or the endpoint withdrawn -> back to the
+    // node) re-offers the partition's in-flight batches at once (idempotent: same
+    // frame, same producer id + sequence; a late ack from the old worker is
+    // ignored).  A first install (node -> worker) re-offers nothing: batches
+    // already sent through the node's gateway are still relayed and acked there.
+    const bool mnDbg = (std::getenv("RUNE_MN_DEBUG") != nullptr);  // cold: once per metadata response
     int mnRoutes = 0;
+    std::vector<std::pair<int32_t, int32_t>> moved;  // partitions whose produce channel moved
     for (const auto& p : partitions) {
         const int32_t leaderNode = metadataCache_.leaderFor(p.topicId, p.partition);
         const std::string ep = (leaderNode == metadata::MetadataCache::kNoLeader)
                                    ? std::string() : metadataCache_.endpointFor(leaderNode);
         if (mnDbg) {
-            std::fprintf(stderr, "[MNDBG route] topic=%d part=%d ingressStream=%d leaderNode=%d ep='%s'\n",
-                         p.topicId, p.partition, p.ingressStreamId, leaderNode, ep.c_str());
+            std::fprintf(stderr, "[MNDBG route] topic=%d part=%d ingressStream=%d leaderNode=%d ep='%s' worker='%s'\n",
+                         p.topicId, p.partition, p.ingressStreamId, leaderNode, ep.c_str(),
+                         p.ingressEndpoint.c_str());
         }
-        if (p.ingressStreamId == 0) continue;
-        if (leaderNode == metadata::MetadataCache::kNoLeader) continue;
-        if (ep.empty()) continue;
-        const std::string leaderChannel =
-            (ep.rfind("aeron:", 0) == 0) ? ep : ("aeron:udp?endpoint=" + ep);
-        agent_.setRoute(p.topicId, p.partition, leaderChannel);
-        ++mnRoutes;
+        // Only entries the cache accepted (not stale by epoch) may move a worker route.
+        const bool current = metadataCache_.epochFor(p.topicId, p.partition) == p.leaderEpoch;
+        const std::string prevData    = agent_.dataChannelFor(p.topicId, p.partition);
+        const std::string prevSession = agent_.routeEndpointFor(p.topicId, p.partition);
+        const bool        hadWorker   = !prevData.empty() && prevData != prevSession;
+        if (!p.ingressEndpoint.empty()) {
+            if (!current) continue;
+            const std::string session = ep.empty() ? currentLeaderChannel() : toChannel(ep);
+            const std::string data    = toChannel(p.ingressEndpoint);
+            if (agent_.setRoute(p.topicId, p.partition, session, data) && !prevData.empty() &&
+                prevData != data) {
+                moved.emplace_back(p.topicId, p.partition);
+            }
+            ++mnRoutes;
+            continue;
+        }
+        // Legacy broker (empty ingressEndpoint): unchanged Task-1.3 routing.
+        if (p.ingressStreamId != 0 && leaderNode != metadata::MetadataCache::kNoLeader && !ep.empty()) {
+            const std::string node = toChannel(ep);
+            if (agent_.setRoute(p.topicId, p.partition, node, node) && hadWorker) {
+                moved.emplace_back(p.topicId, p.partition);
+            }
+            ++mnRoutes;
+            continue;
+        }
+        // The endpoint was withdrawn and no leader route replaces it: drop the
+        // worker data channel, keep the session (produce goes back to the node).
+        if (hadWorker && current &&
+            agent_.setRoute(p.topicId, p.partition, prevSession, prevSession)) {
+            moved.emplace_back(p.topicId, p.partition);
+        }
     }
-    if (mnDbg) std::fprintf(stderr, "[MNDBG route] built %d routes from %zu partitions\n",
-                            mnRoutes, partitions.size());
+    if (mnDbg) std::fprintf(stderr, "[MNDBG route] built %d routes from %zu partitions (%zu moved)\n",
+                            mnRoutes, partitions.size(), moved.size());
+    if (!moved.empty()) {
+        (void)routeBufferedAcks_();  // acks earlier in this poll first: never resend an acked batch
+        producer::ProducerImpl::SendFn sendFn =
+            [this](int32_t t, int32_t pp, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
+                return agent_.offerToPartition(t, pp, sid, fb, fl);
+            };
+        for (const auto& [t, pp] : moved) producerHub_.resendPartitionViaRoute(t, pp, sendFn);
+    }
 
     // read-rework I4: open a per-worker dynamic-MDC egress subscription for each
     // partition whose owner advertises one (per-worker egress active on the broker).

@@ -2345,6 +2345,30 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     return resent;
 }
 
+int ProducerImpl::resendPartitionViaRoute(int32_t topicId, int32_t partition, SendFn& sendFn)
+{
+    const uint32_t idx = partitionIndex_.find(partKey(topicId, partition));
+    if (idx == detail::FlatIndexMap::kNone) return 0;
+    const DutyScope duty(*this);  // fix1 C1
+    PartitionState& ps = *partitions_[idx];
+    int resent = 0;
+    ps.inflight.forEachLive([&](InFlightBatch& b) {
+        if (ps.ingressStreamId != 0) b.ingressStreamId = ps.ingressStreamId;  // the new worker's stream
+        b.lastSendNs = lastNowNs_;
+        unpark_(ps, b);
+        if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(), b.wireFrame.size())) {
+            ++resent;
+        } else {
+            // New publication still resolving / not yet connected: due now, so
+            // retransmitStalled() retries it every duty cycle until it goes out
+            // (its delivery deadline still runs from firstSendNs).
+            b.attemptDeadlineNs        = 0;
+            earliestAttemptDeadlineNs_ = 0;
+        }
+    });
+    return resent;
+}
+
 int ProducerImpl::discardRing_(OpStatus st, int limit) {
     // Records still in the app->agent ring (single consumer: we are it) are
     // completed with `st` and never sent.  Tier-2 entries are freed.  NOTE:

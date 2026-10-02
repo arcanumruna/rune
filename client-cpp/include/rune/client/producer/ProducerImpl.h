@@ -833,6 +833,14 @@ public:
     /// offer is not a redirect).  Returns the number of frames actually offered.
     int resendAllViaRoute(SendFn& sendFn);
 
+    /// Task 16: re-offer every in-flight batch of ONE partition through its (new)
+    /// route — used when metadata moves the partition's ingress endpoint (another
+    /// worker / back to the node).  Same frame, same batch id: the broker dedups by
+    /// (producerId, sequence) and a late ack from the old worker is ignored.  A
+    /// refused offer (new publication not yet connected) makes the batch due NOW,
+    /// so retransmitStalled() retries it every duty cycle.  Returns # offered.
+    int resendPartitionViaRoute(int32_t topicId, int32_t partition, SendFn& sendFn);
+
     /// CB-5 B: true if there is at least one in-flight batch awaiting an ack
     /// (i.e. a redirect resend would have something to flush).
     [[nodiscard]] bool hasInFlight() const noexcept {

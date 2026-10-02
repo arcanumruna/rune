@@ -384,6 +384,12 @@ public:
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
     }
+    /// Task 16 test hook (duty-cycle thread only): the channel Produce frames of
+    /// (topicId, partition) are published on — the owning worker's ingress for a
+    /// shard-mode broker, the node for a routed legacy one; "" = the default path.
+    [[nodiscard]] std::string testDataChannelFor(int32_t topicId, int32_t partition) const {
+        return agent_.dataChannelFor(topicId, partition);
+    }
     /// Test hook (duty-cycle thread only): the cached advertised ingress stream (0 = none).
     [[nodiscard]] int32_t testIngressStreamIdFor(int32_t topicId, int32_t partition) const {
         return metadataCache_.ingressStreamIdFor(topicId, partition);

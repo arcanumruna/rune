@@ -38,6 +38,7 @@ struct PartitionEntry {
     int32_t leaderId       = -1;  // NO_LEADER = -1
     int32_t leaderEpoch    = -1;
     int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
+    std::string ingressEndpoint;  ///< Task 16: "host:port" of the owning worker's ingress ("" = node)
 };
 
 // ---------------------------------------------------------------------------
