@@ -61,9 +61,14 @@ struct FollowerSlot {
         // F7 memo: the whole-batch walk of a Data answer is rebuilt only when the
         // leader's LEO moved since it was built (a dead follower's retry is then
         // a readView + send, never a re-walk).
-        Offset      builtLeo   = -1;
-        std::size_t builtBytes = 0;
-        Offset      builtEnd   = -1;
+        Offset         builtLeo        = -1;
+        std::size_t    builtBytes      = 0;
+        Offset         builtEnd        = -1;
+        // R2: a compaction swap can remap/rewrite the bytes at the SAME LEO — the
+        // memo is valid only for the same view and the same log install identity.
+        const uint8_t* builtView       = nullptr;
+        std::size_t    builtLen        = 0;
+        uint64_t       builtInstallGen = 0;
     };
     OwedAnswer owed{};
     // F6: exclusive end of Data this follower's FETCH answers delivered (accepted)
@@ -77,6 +82,22 @@ struct FollowerSlot {
         OffsetsForLeaderEpochRespMsg msg{};
     };
     OwedEpochAnswer owedEpoch{};
+    // F27 R1: the follower's connection generation last seen on its fetch (0 =
+    // none yet in this leadership).
+    uint32_t connGen = 0;
+    // F7 / R2 memo key: the view and the log identity the walk was built on.
+    // (Stored in OwedAnswer; see builtView/builtLen/builtInstallGen.)
+
+    /// F27 R1: the link to this follower went down and came back: anything the
+    /// transport accepted while it was down may be lost — forget every claim of
+    /// "sent" above its reported position so it is re-sent from there.
+    void rewindForReconnect(Offset fetchOffset) noexcept {
+        if (pushedThrough > fetchOffset) pushedThrough = fetchOffset;
+        dataServedThrough = -1;
+        catchUpTarget     = -1;
+        owed              = OwedAnswer{};
+        forgetServe();
+    }
 
     /// Where the next push to this follower starts (F27 per-follower cursor).
     [[nodiscard]] Offset pushCursor() const noexcept {
@@ -93,6 +114,7 @@ struct FollowerSlot {
         servedFetchOffset = -1; servedLeo = -1; servedTimeNs = 0;
         askOffset = -1; askSinceNs = 0; pushedThrough = 0; catchUpTarget = -1;
         ackedLeo = -1; owed = OwedAnswer{}; dataServedThrough = -1; owedEpoch = OwedEpochAnswer{};
+        connGen = 0;
     }
 };
 

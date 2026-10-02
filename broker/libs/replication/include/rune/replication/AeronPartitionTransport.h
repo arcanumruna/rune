@@ -347,17 +347,30 @@ private:
     int64_t sendOnPub(aeron::ExclusivePublication& pub,
                       const uint8_t* buf, std::size_t len);
 
-    /// F27 F1: the hold router's Offer policy — offer `buf` to peer `id`'s pub.
-    /// An unresolved pub is a refusal (-1): the frame is held until it resolves.
+    /// F27 F1 / R1: the hold router's Offer policy — offer `buf` to peer `id`'s
+    /// pub.  No publication (registration failed, or not resolved yet) means the
+    /// peer is DOWN (kOfferPeerDown): its frames are not held; the down→up edge
+    /// bumps its connection generation (see OutboundHoldRouter.h).
     struct PubOffer {
         AeronPartitionTransport* t;
         int64_t operator()(NodeId id, const uint8_t* buf, std::size_t len) {
             PeerPub* p = t->findPeer(id);
-            if (p == nullptr || !p->pub) return -1;
+            if (p == nullptr || !p->registered || !p->pub) return kOfferPeerDown;
             return t->sendOnPub(*p->pub, buf, len);
         }
     };
     friend struct PubOffer;
+
+    /// R1: the connection generation stamped on a FetchRequest from `peer`
+    /// (control thread).  Observes the link first, so a peer that reconnected
+    /// while nothing was being sent to it still raises the edge before its fetch
+    /// reaches the replica.
+    uint32_t peerConnGen_(NodeId peer) noexcept {
+        PeerPub* p = findPeer(peer);
+        holdRouter_.noteLink(peer, p && p->registered && p->pub && p->pub->isConnected());
+        return holdRouter_.connGen(peer);
+    }
+    uint64_t lastPushFailed_ = 0;   ///< R3: last logged OutboundHoldStats::pushFailed
 
     /// Look up a peer's PeerPub entry (or nullptr if not found).
     PeerPub* findPeer(NodeId id);

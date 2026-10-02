@@ -422,7 +422,12 @@ public:
     ///               the actual current time so time-lag eviction is correct.
     ///
     /// \returns kErrNone on success, error code otherwise.
-    int16_t onFetchRequest(const FetchRequestMsg& req, int64_t nowNs);
+    /// \param connGen  F27 R1: the follower's connection generation at the
+    ///                 transport (0 = not tracked).  A CHANGED generation means
+    ///                 the link to that follower went down and came back — frames
+    ///                 the transport accepted meanwhile may never have arrived, so
+    ///                 its push state is rewound to this fetch (re-sent, not lost).
+    int16_t onFetchRequest(const FetchRequestMsg& req, int64_t nowNs, uint32_t connGen = 0);
 
     /// Read committed records (≤ highWatermark) starting at fetchOffset.
     ///

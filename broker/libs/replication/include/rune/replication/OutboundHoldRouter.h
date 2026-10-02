@@ -13,19 +13,29 @@
 //   * Phase B — route() per ring frame (controlled read):
 //       unicast to P:  P unknown           → routing error, counted, consumed
 //                      P's FIFO non-empty  → appended behind it (order kept)
-//                      P's FIFO empty      → offered; refused (back-pressure,
-//                                            admin action, not connected, pub
-//                                            unresolved) → appended to the FIFO
+//                      P's FIFO empty      → offered; BACK_PRESSURED / ADMIN_ACTION
+//                                            (a LIVE peer that is momentarily
+//                                            full) → appended to the FIFO
 //       broadcast:     the unicast rule per peer — only a refusing peer holds a
 //                      copy; every non-empty FIFO is checked for room FIRST so a
 //                      broadcast is never applied to only some peers.
 //       a full FIFO    → route() returns false = ABORT: the frame stays in the
-//                      ring and is re-read next drain.  Nothing is dropped.
-//   One slow peer never blocks the others until it has absorbed a full ring of
-//   backlog (dead/stuck); only then does the shared ring fill and the workers'
-//   own F27 retry (send returns false) take over.
-//   The only frames ever discarded are the permanent refusals: an unknown target
-//   (routing bug) and an oversized frame (F18: unreachable by construction).
+//                      ring and is re-read next drain.
+//   * PEER DOWN (re-review R1): NOT_CONNECTED, CLOSED, MAX_POSITION_EXCEEDED, an
+//     unresolved or failed-registration publication (kOfferPeerDown) — the peer is
+//     not back-pressured, it is GONE.  Its frames are NOT held (holding them would
+//     fill its FIFO with broadcast copies and freeze the shared ring for every live
+//     peer): its FIFO is cleared, the frame's copy for it is discarded (counted),
+//     and the peer is marked down.  Recovery is by re-send, not by replay: the
+//     next ACCEPTED offer to it (or noteLink(peer, true)) is a down→up edge that
+//     bumps the peer's CONNECTION GENERATION; the transport stamps every
+//     FetchRequest from that peer with it, and the leader replica rewinds that
+//     follower's push state when the generation changes (PartitionReplica::
+//     onFetchRequest) — its next fetch is served Data from its own position.
+//   So a slow peer never blocks the others until it has absorbed a full ring of
+//   backlog (stuck but connected); a dead peer never blocks anyone.
+//   Discards: down-peer copies (recovered by the generation rewind), an unknown
+//   target (routing bug) and an oversized frame (F18: unreachable by construction).
 //
 // FIFO memory: one fixed byte ring per peer, allocated ONCE at addPeer (cold),
 // never reallocated.  Records are [u32 len][frame] 4-byte aligned; a record never
@@ -48,6 +58,17 @@ namespace rune::replication {
 /// Offer result for a frame that can NEVER be sent (exceeds the publication's
 /// maxMessageLength) — discarded and counted, never held.
 inline constexpr int64_t kOfferOversized = std::numeric_limits<int64_t>::min();
+/// Aeron Publication results the router classifies (aeron::BACK_PRESSURED, ...).
+inline constexpr int64_t kOfferNotConnected  = -1;   ///< peer down
+inline constexpr int64_t kOfferBackPressured = -2;   ///< live peer, full: HOLD
+inline constexpr int64_t kOfferAdminAction   = -3;   ///< live peer, rotating: HOLD
+/// No publication (unresolved / registration failed) — the peer is down.
+inline constexpr int64_t kOfferPeerDown      = kOfferNotConnected;
+/// true iff a refusal means "momentarily full, retry" (hold); every other
+/// non-positive result means the peer is down (do not hold).
+[[nodiscard]] constexpr bool offerRefusalIsTransient(int64_t r) noexcept {
+    return r == kOfferBackPressured || r == kOfferAdminAction;
+}
 
 class HeldFifo {
 public:
@@ -60,6 +81,7 @@ public:
     }
     [[nodiscard]] bool        empty() const noexcept { return count_ == 0; }
     [[nodiscard]] std::size_t size()  const noexcept { return count_; }
+    [[nodiscard]] uint64_t    wrapsForTest() const noexcept { return wraps_; }
 
     [[nodiscard]] bool hasRoom(std::size_t len) const noexcept { return need_(len) != 0; }
 
@@ -73,6 +95,7 @@ public:
             putU32_(idx, kWrap);
             tail_ += cap_ - idx;
             idx = 0;
+            ++wraps_;
         }
         putU32_(idx, static_cast<uint32_t>(len));
         if (len) std::memcpy(buf_.data() + idx + 4, p, len);
@@ -117,6 +140,7 @@ private:
     uint64_t             head_  = 0;   // monotonic byte positions (mod cap_)
     uint64_t             tail_  = 0;
     std::size_t          count_ = 0;
+    uint64_t             wraps_ = 0;   ///< records placed after a wrap marker (tests)
 };
 
 struct OutboundHoldStats {
@@ -125,6 +149,10 @@ struct OutboundHoldStats {
     uint64_t unroutable      = 0;   ///< unicast to an unknown peer (routing error)
     uint64_t oversizeDropped = 0;   ///< permanent refusal (F18 — never expected)
     uint64_t aborts          = 0;   ///< ring reads aborted on a full FIFO
+    uint64_t downDropped     = 0;   ///< copies for a DOWN peer discarded (+ held ones cleared)
+    uint64_t downEdges       = 0;   ///< up→down transitions
+    uint64_t upEdges         = 0;   ///< down→up transitions (connection generation bumps)
+    uint64_t pushFailed      = 0;   ///< R3: FIFO push failed (invariant breach; never expected)
 };
 
 template <class Offer>
@@ -134,11 +162,28 @@ public:
 
     using Stats = OutboundHoldStats;
 
-    /// Cold: register a peer with a FIFO of `fifoBytes` (allocated once).
+    /// Cold: register a peer with a FIFO of `fifoBytes` (allocated once).  A new
+    /// peer starts UP at connection generation 1 (0 = "not tracked" downstream).
     void addPeer(NodeId id, std::size_t fifoBytes) {
         for (auto& p : peers_) if (p.id == id) return;
-        peers_.push_back(Peer{id, {}});
+        peers_.push_back(Peer{id, {}, false, 1});
         peers_.back().fifo.init(fifoBytes);
+    }
+
+    /// The peer's connection generation (0 if unknown).  Bumped on every
+    /// down→up edge; stamped on every FetchRequest from that peer.
+    [[nodiscard]] uint32_t connGen(NodeId id) const noexcept {
+        for (const auto& p : peers_) if (p.id == id) return p.gen;
+        return 0;
+    }
+    [[nodiscard]] bool isDown(NodeId id) const noexcept {
+        for (const auto& p : peers_) if (p.id == id) return p.down;
+        return false;
+    }
+    /// Link state observed outside an offer (e.g. a FetchRequest arrives from the
+    /// peer and its publication's isConnected()).  Applies the same edges.
+    void noteLink(NodeId id, bool connected) noexcept {
+        if (Peer* p = find_(id)) connected ? markUp_(*p) : markDown_(*p);
     }
 
     /// Phase A: flush held frames in order; a refusal stops that peer only.
@@ -149,9 +194,10 @@ public:
             while (!p.fifo.empty()) {
                 const auto f = p.fifo.front();
                 const int64_t r = offer(p.id, f.data(), f.size());
-                if (r > 0)                       { p.fifo.pop(); ++n; ++stats_.flushed; }
-                else if (r == kOfferOversized)   { p.fifo.pop(); ++stats_.oversizeDropped; }
-                else break;                      // refused: keep it, next peer
+                if (r > 0)                              { p.fifo.pop(); ++n; ++stats_.flushed; markUp_(p); }
+                else if (r == kOfferOversized)          { p.fifo.pop(); ++stats_.oversizeDropped; }
+                else if (offerRefusalIsTransient(r))    break;   // live but full: keep it, next peer
+                else                                    { markDown_(p); break; }   // down: cleared
             }
         }
         return n;
@@ -180,7 +226,23 @@ public:
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
-    struct Peer { NodeId id; HeldFifo fifo; };
+    struct Peer {
+        NodeId   id;
+        HeldFifo fifo;
+        bool     down = false;   ///< last offer said NOT_CONNECTED / no pub (frames not held)
+        uint32_t gen  = 1;       ///< connection generation (bumped on down→up)
+    };
+
+    void markDown_(Peer& p) noexcept {
+        if (!p.fifo.empty()) {                 // held copies are useless to a gone peer
+            stats_.downDropped += p.fifo.size();
+            while (!p.fifo.empty()) p.fifo.pop();
+        }
+        if (!p.down) { p.down = true; ++stats_.downEdges; }
+    }
+    void markUp_(Peer& p) noexcept {
+        if (p.down) { p.down = false; ++p.gen; ++stats_.upEdges; }
+    }
 
     Peer* find_(NodeId id) noexcept {
         for (auto& p : peers_) if (p.id == id) return &p;
@@ -190,10 +252,20 @@ private:
     void deliver_(Offer& offer, Peer& p, const uint8_t* wire, std::size_t len) noexcept {
         if (p.fifo.empty()) {
             const int64_t r = offer(p.id, wire, len);
-            if (r > 0) return;
+            if (r > 0) { markUp_(p); return; }
             if (r == kOfferOversized) { ++stats_.oversizeDropped; return; }
+            if (!offerRefusalIsTransient(r)) {   // peer down: never hold (R1)
+                markDown_(p);
+                ++stats_.downDropped;
+                return;
+            }
         }
-        (void)p.fifo.push(wire, len);   // behind earlier held frames, or refused now
+        // Behind earlier held frames, or refused (back-pressured) now.  route()
+        // checked room for a non-empty FIFO and an empty FIFO holds any frame up
+        // to its capacity (>= the ring's maxMsgLength), so this cannot fail; if
+        // that invariant is ever broken it is a counted, logged-by-caller drop,
+        // never a silent one (R3).
+        if (!p.fifo.push(wire, len)) [[unlikely]] { ++stats_.pushFailed; return; }
         ++stats_.held;
     }
 

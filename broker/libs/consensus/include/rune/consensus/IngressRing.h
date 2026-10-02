@@ -118,12 +118,12 @@ public:
     int64_t producerPosition() const { return ring_.producerPosition(); }
     int64_t consumerPosition() const { return ring_.consumerPosition(); }
 
-    /// Largest single message the ring accepts (agrona: capacity / 8).  write()/
-    /// tryClaim() reject a larger message — callers that frame variable-length
-    /// payloads must bound them to this value first.
     /// Payload capacity in bytes (power of two).
     std::size_t capacity() const { return static_cast<std::size_t>(ring_.capacity()); }
 
+    /// Largest single message the ring accepts (agrona: capacity / 8).  write()/
+    /// tryClaim() reject a larger message — callers that frame variable-length
+    /// payloads must bound them to this value first.
     std::size_t maxMsgLength() const {
         return static_cast<std::size_t>(ring_.maxMsgLength());
     }

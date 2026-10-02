@@ -92,6 +92,10 @@ public:
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
 
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
+    /// F27 R2: Log-wide segment install generation — changes whenever ANY segment
+    /// object is (re)installed (roll, compaction swap, reload, truncation).  A
+    /// cached walk over read bytes is valid only while it is unchanged.
+    [[nodiscard]] uint64_t installGeneration() const noexcept { return segInstallGen_; }
     /// The lowest offset still readable from this log — the base offset of the
     /// first (oldest) on-disk segment.  Advances past 0 when retention/compaction
     /// deletes the earliest segment(s).  An "Earliest" subscriber MUST start here,

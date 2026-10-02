@@ -627,3 +627,27 @@ TEST(F27SendNeverDroppedRegression, FlowWindowHoldsUnderRefusalRetryRegression) 
     EXPECT_LT(maxBase, ceiling) << "no batch starting at/after minFollowerLeo + window is ever pushed";
     EXPECT_GE(c.node(2).r->logEndOffset(), ceiling - kPerBatch) << "follower 2 filled the window";
 }
+
+// ===========================================================================
+// Fix round 2 (re-review f27-rereview-1.md)
+// ===========================================================================
+
+// R1: the legacy transport does NOT hold frames for a DOWN follower; the push it
+// "accepted" meanwhile may be gone.  When the follower's connection generation
+// changes (down→up), its next fetch below the old pushedThrough is served Data
+// at once — no AckOnly, no resend window (frozen clock).
+TEST(F27SendNeverDroppedRegression, ConnectionGenerationBumpRewindsFollowerPushStateRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    (void)c.produce(1024);
+    (void)L.r->doWork(kNow);                                   // push accepted to 2 (pushedThrough = 1)
+    ASSERT_EQ(L.dataFramesTo(2), 1u);
+    const FetchRequestMsg f{1, 0, 2, /*off=*/0, 1 << 20, 0};
+    (void)L.r->onFetchRequest(f, kNow, /*connGen=*/1);         // first sighting: covered by the push
+    EXPECT_EQ(L.dataFramesTo(2), 1u) << "same link: the push covers it (AckOnly)";
+    (void)L.r->onFetchRequest(f, kNow, /*connGen=*/2);         // the link went down and came back
+    EXPECT_EQ(L.dataFramesTo(2), 2u)
+        << "after a reconnect the 'pushed' range may be lost: serve Data immediately";
+    (void)L.r->onFetchRequest(f, kNow, /*connGen=*/2);         // same generation again
+    EXPECT_EQ(L.dataFramesTo(2), 2u) << "no further rewind without a new generation (conflated)";
+}

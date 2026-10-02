@@ -19,6 +19,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
 
+#include <cassert>
 #include <cstdlib>
 #include <spdlog/spdlog.h>
 
@@ -88,6 +89,8 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
     peers_.emplace(peerId, std::move(p));
     // F27 F1: the peer's held FIFO, sized to one full outbound ring (>= 8 max-size
     // frames), allocated once here (cold) and never reallocated.
+    // R3: an empty FIFO must hold any ring frame (capacity >= maxMsgLength).
+    assert(outboundRing_.capacity() >= outboundRing_.maxMsgLength() + 8);
     holdRouter_.addPeer(peerId, outboundRing_.capacity());
 }
 
@@ -417,6 +420,14 @@ int AeronPartitionTransport::drainOutbound()
     // Work = ring frames consumed + held frames flushed (a FIFO that keeps being
     // refused is NOT work, so the IdleStrategy can back off).
     work += outboundRing_.controlledDrain(handler, /*limit=*/kFragmentLimit);
+    // R3: a held-FIFO push can only fail if the FIFO >= ring-maxMsgLength
+    // invariant is broken — never silent: counted by the router, logged here.
+    if (const uint64_t pf = holdRouter_.stats().pushFailed; pf != lastPushFailed_) [[unlikely]] {
+        lastPushFailed_ = pf;
+        spdlog::error("AeronPartitionTransport[node={}]: held-FIFO push failed ({} total) — "
+                      "FIFO smaller than a ring frame; frame DROPPED (invariant breach)",
+                      selfId_, pf);
+    }
     return work;
 }
 
@@ -583,6 +594,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.fetchRequestPayload.maxBytes      = req.maxBytes;
             op.fetchRequestPayload.topicId       = req.topicId;
             op.fetchRequestPayload.nowNs         = nowNs_;
+            op.fetchRequestPayload.connGen       = peerConnGen_(req.followerId);   // R1
             if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
                 // Worker ring full → back-pressure: leave the fragment unconsumed and
                 // retry next cycle (the follower's fetch is served once the worker
@@ -594,7 +606,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             // the gap is the EXACT control→worker handoff latency on this node.
             RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, inRecvSeq_++);
         } else {
-            rep->onFetchRequest(req, nowNs_);
+            rep->onFetchRequest(req, nowNs_, peerConnGen_(req.followerId));   // R1
         }
 
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {

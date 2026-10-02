@@ -610,7 +610,8 @@ void PartitionReplica::onLeaderLogAppended() noexcept
 // Leader: onFetchRequest
 // ---------------------------------------------------------------------------
 
-int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t nowNs)
+int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t nowNs,
+                                         uint32_t connGen)
 {
     if (req.maxBytes == 0) ++rtFastAcks_;   // pure fast-ack (LEO advance only)
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplFetchReqHandle,
@@ -735,6 +736,13 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // Data serve — a conflated or ack-only fetch reads nothing, as before.
     FollowerSlot* const slot = followerSlots_.find(req.followerId);
     if (slot) {
+        // F27 R1: a new connection generation = the link went down and back up;
+        // frames "sent" meanwhile may be gone → rewind so they are re-sent from
+        // this fetch (served Data right now, pushes resume from here).
+        if (connGen != 0 && connGen != slot->connGen) {
+            if (slot->connGen != 0) slot->rewindForReconnect(req.fetchOffset);
+            slot->connGen = connGen;
+        }
         // F27: the follower's own position in this leadership (its push cursor
         // floor), and a real fetch supersedes any answer still owed to it.
         slot->ackedLeo = req.fetchOffset;
@@ -912,15 +920,23 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
             // passes — a cleaner swap may remap the segment between them).
             view = onLog([&](auto& L) { return L.readView(owed.fetchOffset, owed.maxBytes); });
             if (view.empty()) [[unlikely]] continue;   // transient read-map failure: next pass
-            // F7: the whole-batch walk is memoised while the LEO is unchanged.
-            if (s.owed.builtLeo != leo || s.owed.builtBytes > view.len) {
+            // F7 / R2: the whole-batch walk is memoised only while the LEO, the
+            // view (same mapping, same length) AND the log's segment install
+            // generation are unchanged — a compaction swap at the same LEO
+            // rewrites the bytes below it and must rebuild (never a torn batch).
+            const uint64_t installGen = onLog([&](auto& L) { return L.installGeneration(); });
+            if (s.owed.builtLeo != leo || s.owed.builtView != view.data ||
+                s.owed.builtLen != view.len || s.owed.builtInstallGen != installGen) {
                 ++owedRebuilds_;
                 const BatchPrefix pre = wholeBatchPrefix(view.data, view.len,
                                                          static_cast<std::size_t>(owed.maxBytes),
                                                          kNoPushCeiling);
-                s.owed.builtLeo   = leo;
-                s.owed.builtBytes = pre.bytes;
-                s.owed.builtEnd   = pre.endOffset;
+                s.owed.builtLeo        = leo;
+                s.owed.builtBytes      = pre.bytes;
+                s.owed.builtEnd        = pre.endOffset;
+                s.owed.builtView       = view.data;
+                s.owed.builtLen        = view.len;
+                s.owed.builtInstallGen = installGen;
             }
             records = std::span<const uint8_t>(view.data, s.owed.builtBytes);
             dataEnd = s.owed.builtEnd;

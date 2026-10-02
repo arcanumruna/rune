@@ -284,6 +284,11 @@ struct WorkerOp {
         int32_t                        maxBytes     = 0;
         int32_t                        topicId      = 0;
         int64_t                        nowNs        = 0;
+        /// F27 R1: the follower's connection generation at the transport (0 =
+        /// not tracked).  On the SBE ring it rides in `ownershipGen` (a SetOwnership
+        /// -only field; no FetchRequest op uses it) — a dedicated rune-protocol
+        /// schema field is a follow-up.
+        uint32_t                       connGen      = 0;
     } fetchRequestPayload;
 
     // -----------------------------------------------------------------------

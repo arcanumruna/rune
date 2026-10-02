@@ -89,17 +89,88 @@ TEST(OutboundHoldRouterRegression, DrainPreservesPerPeerOrderBehindHeldFrameRegr
     EXPECT_EQ(o.got[2], frames({1, 2}));
 }
 
-TEST(OutboundHoldRouterRegression, DrainNotConnectedFrameHeldUntilImageConnectsRegression) {
+// Re-review R1: a NOT_CONNECTED peer (or no publication: unresolved / failed
+// registration → kOfferPeerDown) is DOWN, not back-pressured — its frames are
+// NOT held; the down→up edge bumps its connection generation (the leader then
+// rewinds that follower's push state and re-sends from its acked position).
+TEST(OutboundHoldRouterRegression, DrainNotConnectedPeerIsNotHeldAndReconnectBumpsGenerationRegression) {
     Router r; ScriptOffer o;
     r.addPeer(2, 4096);
-    o.sticky[2] = kNotConnected;            // also: publication not resolved yet
+    const uint32_t g0 = r.connGen(2);
+    o.sticky[2] = kNotConnected;
     EXPECT_TRUE(route(r, o, 2, frame(1)));
     EXPECT_TRUE(route(r, o, 2, frame(2)));
-    for (int i = 0; i < 5; ++i) EXPECT_EQ(r.flushHeld(o), 0);
-    EXPECT_EQ(r.heldFrames(2), 2u);
+    EXPECT_EQ(r.heldFrames(2), 0u) << "a down peer's frames are never held";
+    EXPECT_EQ(r.stats().downDropped, 2u);
+    EXPECT_TRUE(r.isDown(2));
+    EXPECT_EQ(r.connGen(2), g0) << "no bump while down";
     o.sticky[2] = 0;                         // image connects
-    EXPECT_EQ(r.flushHeld(o), 2);
-    EXPECT_EQ(o.got[2], frames({1, 2}));
+    EXPECT_TRUE(route(r, o, 2, frame(3)));
+    EXPECT_EQ(o.got[2], frames({3}));
+    EXPECT_FALSE(r.isDown(2));
+    EXPECT_EQ(r.connGen(2), g0 + 1) << "down→up edge bumps the connection generation";
+    // A back-pressured peer is still HELD, and that is no edge.
+    o.script[2] = {kBackPressured};
+    EXPECT_TRUE(route(r, o, 2, frame(4)));
+    EXPECT_EQ(r.heldFrames(2), 1u);
+    EXPECT_EQ(r.connGen(2), g0 + 1);
+}
+
+// Re-review R1: a back-pressured peer that then goes DOWN has its held frames
+// cleared (counted) — never left to fill the FIFO.
+TEST(OutboundHoldRouterRegression, DrainHeldFramesClearedWhenPeerGoesDownRegression) {
+    Router r; ScriptOffer o;
+    r.addPeer(2, 4096);
+    o.sticky[2] = kBackPressured;
+    for (uint8_t i = 1; i <= 3; ++i) EXPECT_TRUE(route(r, o, 2, frame(i)));
+    EXPECT_EQ(r.heldFrames(2), 3u);
+    o.sticky[2] = kNotConnected;
+    EXPECT_EQ(r.flushHeld(o), 0);
+    EXPECT_EQ(r.heldFrames(2), 0u);
+    EXPECT_EQ(r.stats().downDropped, 3u);
+}
+
+// Re-review R1: ONE DEAD peer + ONE LIVE peer, more broadcasts (and unicasts)
+// than the dead peer's FIFO could ever hold, through the REAL outbound ring:
+// every frame for the live peer is delivered, the ring never stops, and the dead
+// peer holds nothing (bounded memory).
+TEST(OutboundHoldRouterRegression, DrainDeadPeerNeverBlocksLivePeersRegression) {
+    rune::consensus::IngressRing ring(4096);
+    Router r; ScriptOffer o;
+    r.addPeer(2, 4096);                      // live
+    r.addPeer(3, 4096);                      // dead (NOT_CONNECTED forever)
+    o.sticky[3] = kNotConnected;
+    auto drain = [&] {
+        return ring.controlledDrain(
+            [&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                aeron::util::index_t len) {
+                const uint8_t* p = b.buffer() + off;
+                int32_t target; std::memcpy(&target, p, 4);
+                return r.route(o, target, p + 4, static_cast<std::size_t>(len) - 4);
+            }, 1000);
+    };
+    constexpr int kFrames = 2000;            // 2000 × ~64 B ≫ the 4 KiB FIFO
+    int written = 0;
+    std::size_t expect2 = 0;
+    for (int round = 0; round < 400 && written < kFrames; ++round) {
+        while (written < kFrames) {          // fill the ring as far as it goes
+            uint8_t buf[4 + 48];
+            const int32_t target = (written % 3 == 2) ? 3 : Router::kBroadcast;   // + unicasts to the dead peer
+            std::memcpy(buf, &target, 4);
+            std::memset(buf + 4, written & 0xFF, 48);
+            if (!ring.write(buf, sizeof buf)) break;
+            if (target == Router::kBroadcast) ++expect2;
+            ++written;
+        }
+        r.flushHeld(o);
+        drain();
+    }
+    for (int i = 0; i < 10; ++i) { r.flushHeld(o); drain(); }
+    ASSERT_EQ(written, kFrames) << "the ring never stopped accepting (no freeze)";
+    EXPECT_EQ(o.got[2].size(), expect2) << "every broadcast reached the live peer";
+    EXPECT_EQ(ring.consumerPosition(), ring.producerPosition()) << "ring fully drained";
+    EXPECT_EQ(r.heldFrames(3), 0u) << "nothing held for the dead peer (bounded memory)";
+    EXPECT_EQ(r.stats().aborts, 0u);
 }
 
 TEST(OutboundHoldRouterRegression, DrainBroadcastHoldsOnlyRefusedPeerCopyRegression) {
@@ -169,20 +240,35 @@ TEST(OutboundHoldRouterRegression, UnknownTargetIsCountedNotHeld) {
 }
 
 TEST(OutboundHoldRouterRegression, HeldFifoWrapsWithoutCorruption) {
+    // PARTIAL pops (never draining to empty, which would restart at 0) so records
+    // really wrap the byte ring; checked against a reference deque.
     HeldFifo f; f.init(64);
-    // Interleave pushes/pops so records wrap the byte ring many times.
-    uint8_t next = 0, expect = 0;
-    for (int round = 0; round < 200; ++round) {
-        const std::size_t len = 1 + (round % 13);
+    std::deque<std::vector<uint8_t>> ref;
+    uint8_t next = 1;
+    for (int round = 0; round < 2000; ++round) {
+        const std::size_t len = 1 + (round * 7) % 13;
         std::vector<uint8_t> v(len, next);
-        if (f.hasRoom(len)) { ASSERT_TRUE(f.push(v.data(), len)); ++next; }
-        if (round % 3 == 2) {
-            while (!f.empty()) {
-                const auto s = f.front();
-                ASSERT_EQ(s[0], expect);
-                ++expect;
-                f.pop();
-            }
+        if (f.hasRoom(len)) {
+            ASSERT_TRUE(f.push(v.data(), len));
+            ref.push_back(v);
+            ++next;
+        } else {
+            ASSERT_FALSE(f.push(v.data(), len)) << "hasRoom must equal push";
         }
+        // pop one (keep >= 1 queued so the ring never resets to 0)
+        if (ref.size() > 1 && (round % 2 == 1)) {
+            const auto s = f.front();
+            ASSERT_EQ(std::vector<uint8_t>(s.begin(), s.end()), ref.front());
+            f.pop();
+            ref.pop_front();
+        }
+        ASSERT_EQ(f.size(), ref.size());
     }
+    EXPECT_GT(f.wrapsForTest(), 10u) << "the schedule must actually wrap the byte ring";
+    while (!ref.empty()) {
+        const auto s = f.front();
+        ASSERT_EQ(std::vector<uint8_t>(s.begin(), s.end()), ref.front());
+        f.pop(); ref.pop_front();
+    }
+    EXPECT_TRUE(f.empty());
 }
