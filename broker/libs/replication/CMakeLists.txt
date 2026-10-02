@@ -23,8 +23,8 @@ endif()
 # (Task 11 fix 2).  rune_replication_aeron is kept as a consumer-facing INTERFACE
 # name.  Layering note (review m-d): its .cpp includes node HEADERS (header-
 # inline ReplicaRegistry/WorkerPool routing), a replication→node header
-# inversion that used to be confined to rune_replication_aeron; no node symbols
-# are linked (nm-verified).
+# inversion that used to be confined to rune_replication_aeron; the only node
+# SYMBOLS it needs are the worker io backends (rune_io_backend, a leaf lib).
 # ---------------------------------------------------------------------------
 if(aeron_FOUND)
     # Task 11 fix 2 (B2): AeronPartitionTransport is compiled INTO rune_replication
@@ -49,6 +49,9 @@ if(aeron_FOUND)
     # cycle (rune_transaction → rune_coordination → rune_replication), which
     # CMake resolves by repeating the archives on the link line.
     target_link_libraries(rune_replication PUBLIC rune_transaction)
+    # ...and the worker io backends that header-inline worker code submits to
+    # (UringFlushBackend on Linux) — a leaf library, no cycle (libs/node).
+    target_link_libraries(rune_replication PUBLIC rune_io_backend)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING

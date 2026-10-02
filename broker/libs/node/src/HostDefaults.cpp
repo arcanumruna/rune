@@ -267,6 +267,18 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         // DERIVED one — exactly what every other node computes for it.  A self base
         // set only in RUNE_WORKER_*_BASE_PORT then disagrees with the self entry and
         // validateShardConfig refuses to start (peers would derive another port).
+        // Egress-control base (compat): it was never required in RUNE_PEERS, so an
+        // explicit-but-unadvertised SELF base is kept for self (not refused like
+        // the ingress / repl bases) — but peers derive another value for this node
+        // and advertise THAT to clients asking them: WARN.
+        for (auto& p : cfg.peers) {
+            if (p.id != cfg.nodeId || p.egressControlBasePort != 0 || !cfg.workerEgressControlBasePort) continue;
+            p.egressControlBasePort = static_cast<uint16_t>(*cfg.workerEgressControlBasePort);
+            if (!selfDerived || selfDerived->egressControl != *cfg.workerEgressControlBasePort)
+                appendWarn(out.warnings, "RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=" +
+                           std::to_string(*cfg.workerEgressControlBasePort) + " is not advertised in RUNE_PEERS "
+                           "(6th segment): other nodes advertise the derived base for this node to clients");
+        }
         for (auto& p : cfg.peers) {
             const auto d = deriveShardBasePorts(p.id, W);
             if (!d && (p.ingressBasePort == 0 || p.replBasePort == 0 || p.egressControlBasePort == 0))

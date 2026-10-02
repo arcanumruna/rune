@@ -514,12 +514,23 @@ TEST(HostDefaults, ExplicitSelfBaseNotAdvertisedInPeersRefusesStart) {
     const auto err = c.validateShardConfig();
     ASSERT_TRUE(err.has_value());
     EXPECT_NE(err->find("advertise it in RUNE_PEERS"), std::string::npos) << *err;
+    // The egress-control base was never required in RUNE_PEERS (older harnesses
+    // set only the env var): kept for self, started, but WARNED (peers advertise
+    // the derived base for this node).
     NodeConfig e = threeNodeDefault(1);
     e.workerEgressControlBasePort = 40420;
-    applyHostDerivedDefaults(e, k3sFacts());
-    const auto eerr = e.validateShardConfig();
-    ASSERT_TRUE(eerr.has_value()) << "egress control base unadvertised";
-    EXPECT_NE(eerr->find("6th RUNE_PEERS segment"), std::string::npos) << *eerr;
+    const auto hd = applyHostDerivedDefaults(e, k3sFacts());
+    EXPECT_FALSE(e.validateShardConfig().has_value()) << *e.validateShardConfig();
+    EXPECT_EQ(e.effectiveWorkerEgressControlBasePort(), 40420);
+    EXPECT_NE(hd.warnings.find("not advertised in RUNE_PEERS"), std::string::npos) << hd.warnings;
+    // An ADVERTISED base that disagrees with the env var is still refused.
+    NodeConfig x = threeNodeDefault(1);
+    x.workerEgressControlBasePort = 40420;
+    x.peers[1].egressControlBasePort = 40999;
+    applyHostDerivedDefaults(x, k3sFacts());
+    const auto xerr = x.validateShardConfig();
+    ASSERT_TRUE(xerr.has_value());
+    EXPECT_NE(xerr->find("6th RUNE_PEERS segment"), std::string::npos) << *xerr;
 }
 
 TEST(HostDefaults, EveryNodeComputesTheSamePeerBases) {

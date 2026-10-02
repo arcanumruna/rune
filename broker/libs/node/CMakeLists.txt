@@ -7,11 +7,24 @@ add_library(rune_node
     src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
-    src/PortableFlushBackend.cpp
     src/SchemaRegistry.cpp
-    src/AdminWorker.cpp
+    src/AdminWorker.cpp)
+
+# The worker's io backends, as their own leaf library: Worker.h's header-inline
+# code (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
+# UringFlushBackend::submit/submitFadvise, so rune_replication must link these
+# symbols without linking rune_node (which depends on it).  Linux-only failure
+# before (macOS compiles UringFlushBackend.cpp to an empty TU): replication-only
+# test executables did not link.
+add_library(rune_io_backend
+    src/PortableFlushBackend.cpp
     # UringFlushBackend.cpp compiles to an empty TU on non-Linux (#ifdef __linux__).
     src/UringFlushBackend.cpp)
+target_include_directories(rune_io_backend PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_io_backend PUBLIC rune_consensus spdlog::spdlog)
+target_link_libraries(rune_node PUBLIC rune_io_backend)
 # E5.1.2d: ProducePath.cpp was moved from libs/gateway/src/ to libs/storage/src/
 # (compiled into rune_storage, a true leaf lib). Both rune_gateway and rune_node
 # depend on rune_storage, so the circular-dep workaround is eliminated.

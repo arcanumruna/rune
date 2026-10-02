@@ -12,6 +12,13 @@ set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include"
 set(RUNE_NODE_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/include)
 
 find_package(aeron)
+# The embedded Aeron media driver calls uuid_generate() (libuuid) on Linux and the
+# ConanCenter recipe does not propagate it: attach it to the imported target ONCE,
+# so every driver-embedding executable (broker, every test) links on Linux.
+if(aeron_FOUND AND UNIX AND NOT APPLE AND TARGET aeron::aeron)
+    set_property(TARGET aeron::aeron APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+        "-Wl,--no-as-needed" uuid "-Wl,--as-needed")
+endif()
 # macOS/armv8: the aeron ConanCenter recipe is unsupported there (see conanfile.py),
 # so aeron is skipped and find_package finds nothing.  Provide a stub INTERFACE
 # target so the many `target_link_libraries(... aeron::aeron)` calls still resolve
