@@ -931,9 +931,11 @@ void BrokerNode::buildReplication() {
                 : std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
-            // Task 10 (spec §3.1): user replicas are driven by their shard worker,
-            // which submits the follower flush to its io backend (never inline).
-            if (config_.shardMode() && topicId >= 0) replica->setExternalFollowerFlush(true);
+            // Task 10 (spec §3.1) + F30: user replicas are always driven by a worker
+            // (the pool always exists, >= 1 worker), which submits the follower
+            // flush and roll seals to its io backend — never an inline fsync on the
+            // worker, in shard AND thread placement.
+            if (topicId >= 0) replica->setExternalFollowerFlush(true);
 
             if (replTransport_) {
                 // DR-BUG-5: register with composite (topicId, partitionId) key so

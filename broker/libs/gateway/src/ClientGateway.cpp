@@ -1398,7 +1398,7 @@ void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
     //
     // E5.1.3 (d) R7 fix: when per-worker ingress is active, USER partitions
     // (topicId >= 0) are exclusively owned by the worker — the worker's doWork
-    // calls syncOwnedLogs_() which drives Log::sync on the owning thread.
+    // calls syncOwnedLogsAsync_() which submits the owned-log fsync to its io backend.
     // The gateway must NOT call Log::sync on worker-owned logs (that would
     // race with the worker's own appends/sync — TSan race R7).
     // Internal partitions (topicId < 0) remain on the gateway sync path.

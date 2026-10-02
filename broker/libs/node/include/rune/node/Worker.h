@@ -1233,6 +1233,18 @@ public:
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
             work += serveHeldPushReads_();
         }
+        // F30: never block a worker on disk in ANY mode (spec §3.1; replication
+        // optimization #5 "fsync off the append thread").  Follower flushes raised
+        // by the replicas (setExternalFollowerFlush) and roll seals the logs
+        // deferred go to this worker's io backend — exactly as the shard pass does.
+        for (auto* replica : owned_) {
+            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
+                if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
+            }
+        }
+        for (auto& slot : slots_) {
+            if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);
+        }
 
         // Task 6: per-worker replication transport poll — inline dispatch.
         //
@@ -1283,8 +1295,10 @@ public:
         // Applies only when perWorkerIngressActive_ is true (default: false).
         // Internal partitions (topicId < 0) are not in owned_ so they keep the
         // gateway sync path unaffected.
+        // F30: the time-gated owned-log sync is an io_ submission (never an
+        // inline fsync on the worker) — the shard pass's syncOwnedLogsAsync_.
         if (perWorkerIngressActive_) {
-            work += syncOwnedLogs_(nowNs);
+            work += syncOwnedLogsAsync_(nowNs);
         }
 
         return work;
@@ -3723,7 +3737,7 @@ private:
     // whose facts-only return is still owed (DurablePending::factsOwed).
     int64_t strictFactsOwed_ = 0;
 
-    // E5.1.3 (d) R7 fix: last time syncOwnedLogs_ was run (ns). 0 = never.
+    // E5.1.3 (d) R7 fix: last time syncOwnedLogsAsync_ was run (ns). 0 = never.
     // Worker-thread only — no atomic needed.
     int64_t lastSyncNs_ = 0;
 
@@ -4441,7 +4455,10 @@ private:
         return true;
     }
 
-    // Shard-mode replacement for syncOwnedLogs_: same 10 ms gate and the same
+    // Group-commit sync interval (mirrors gateway's kGroupCommitIntervalNs = 10 ms).
+    static constexpr int64_t kWorkerSyncIntervalNs = 10'000'000LL; // 10 ms
+
+    // Time-gated owned-log sync (every mode, F30): same 10 ms gate and the same
     // "unchanged log = no work" rule, but each due log is an io_ submission.
     int syncOwnedLogsAsync_(int64_t nowNs) {
         if (lastSyncNs_ == 0) { lastSyncNs_ = nowNs; return 0; }
@@ -4617,54 +4634,6 @@ private:
         failLog_(log, log->storageErrno());
     }
 
-    // -----------------------------------------------------------------------
-    // syncOwnedLogs_ — time-gated Log::sync for worker-owned user-partition logs.
-    //
-    // E5.1.3 (d) R7 fix: called from doWork when perWorkerIngressActive_ is true.
-    // Mirrors the gateway's flushDirtyLogs() group-commit interval (10 ms).
-    //
-    // For each owned disk-backed replica (user partition, topicId >= 0):
-    //   - Call log->sync() to flush page-cache writes to disk.
-    //   - If sync throws, log the error (same as gateway: don't crash, just retry).
-    //
-    // Worker-thread only.  Returns number of sync calls that completed.
-    // -----------------------------------------------------------------------
-
-    // Group-commit sync interval (mirrors gateway's kGroupCommitIntervalNs = 10 ms).
-    static constexpr int64_t kWorkerSyncIntervalNs = 10'000'000LL; // 10 ms
-
-    int syncOwnedLogs_(int64_t nowNs) {
-        // Time-gate: only flush when interval has elapsed.
-        if (lastSyncNs_ == 0) {
-            lastSyncNs_ = nowNs;
-            return 0;
-        }
-        if (nowNs - lastSyncNs_ < kWorkerSyncIntervalNs) return 0;
-        lastSyncNs_ = nowNs;
-
-        int synced = 0;
-        for (auto& slot : slots_) {
-            rune::storage::Log* log = slot.log;
-            if (log->storageFailed()) continue;
-            // Skip logs with no new appends since their last sync — syncing an
-            // unchanged log is a no-op fdatasync that must NOT count as work (else
-            // the backoff idle never parks on an otherwise-idle worker).
-            const int64_t leo = log->logEndOffset();
-            if (leo <= slot.lastSyncedLeo) continue;
-            try {
-                log->sync();
-                slot.lastSyncedLeo = leo;
-                ++synced;
-            } catch (const std::exception& ex) {
-                // fsyncgate: the log is now permanently failed (LogSegment::sync);
-                // fail-stop it (pending acks failed, runtime signalled to halt).
-                spdlog::error("Worker {}: syncOwnedLogs_ log->sync() failed for {}: {}",
-                              workerId_, log->dir(), ex.what());
-                checkStorageFailure_(log);
-            }
-        }
-        return synced;
-    }
 
     // -----------------------------------------------------------------------
     // flushRetFifo_ — F15 §6: flush the return FIFO into ret_ front-to-back,

@@ -92,8 +92,8 @@ PartitionConfig cfg(rune::replication::NodeId self, uint8_t tier = 1, int32_t to
     c.replicaLagMaxMs = 1'000'000;
     return c;
 }
-void applyOneBatch(PartitionReplica& follower, int64_t base) {
-    const auto b = batchAt(base);
+void applyOneBatch(PartitionReplica& follower, int64_t base, std::size_t valueBytes = 0) {
+    const auto b = valueBytes ? batchAt(base, 1, valueBytes) : batchAt(base);
     rune::replication::FetchResponseMsg resp{1, 0, 0, 0, rune::replication::kErrNone, 1,
                                              std::span<const uint8_t>(b)};
     follower.applyReplicated(resp);
@@ -215,6 +215,75 @@ TEST(ShardNonBlockingRegression, OwnedLogSyncIsAsyncAndIdleLogIsNotResubmitted) 
     EXPECT_EQ(s.w.bgFlushSubmitsForTest(), settled) << "an unchanged log is not resubmitted (no phantom work)";
     EXPECT_EQ(work, 0) << "an idle shard reports no work (backoff can park)";
     EXPECT_EQ(s.log->syncCallsForTest(), 0u);
+}
+
+// ============================================================================
+// F30: the same never-block rules hold for a NON-shard (thread-placement) worker.
+// Before the fix the non-shard loop fsynced inline on the worker thread (follower
+// flush every 20 ms + time-gated owned-log sync every 10 ms) and never submitted
+// deferred roll seals — stalling every partition the worker owns for ms.
+// ============================================================================
+
+TEST(NonShardNonBlockingRegression, FollowerFlushIsSubmittedNotSyncedInlineRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&follower});
+    w.setWorkerIngress(nullptr, true);                     // per-worker ingress (the optimal config)
+    applyOneBatch(follower, 0);
+    ASSERT_GT(log.logEndOffset(), 0);
+    w.doWork(25 * kMs);                                    // past the 20 ms follower flush interval
+    EXPECT_EQ(log.syncCallsForTest(), 0u) << "the follower flush must not block a non-shard worker";
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), 1u) << "it is submitted to the io backend";
+    for (int i = 0; i < kCap && w.bgFlushInFlightForTest() > 0; ++i) { w.doWork(26 * kMs); std::this_thread::yield(); }
+    EXPECT_EQ(w.bgFlushInFlightForTest(), 0u);
+    EXPECT_EQ(w.bgFlushErrorsForTest(), 0u);
+    EXPECT_EQ(w.lastSyncedLeoForTest(&log), log.logEndOffset());
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+
+TEST(NonShardNonBlockingRegression, OwnedLogTimedSyncIsAsyncRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica leader(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    leader.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setWorkerIngress(nullptr, true);
+    w.doWork(1 * kMs);                                     // arms the owned-log sync interval
+    leader.append(std::span<const uint8_t>(std::vector<uint8_t>(16, 1)));
+    w.doWork(12 * kMs);                                    // > 10 ms: owned-log sync due
+    EXPECT_EQ(log.syncCallsForTest(), 0u) << "the timed owned-log sync must not fsync inline on a non-shard worker";
+    EXPECT_GE(w.bgFlushSubmitsForTest(), 1u);
+    for (int i = 0; i < kCap && w.bgFlushInFlightForTest() > 0; ++i) { w.doWork(13 * kMs); std::this_thread::yield(); }
+    EXPECT_EQ(w.lastSyncedLeoForTest(&log), log.logEndOffset());
+    const uint64_t settled = w.bgFlushSubmitsForTest();
+    w.doWork(30 * kMs);                                    // next interval, unchanged log
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), settled) << "an unchanged log is not resubmitted";
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+
+TEST(NonShardNonBlockingRegression, DeferredRollSealIsSubmittedRegression) {
+    TmpDir d;
+    Log log(d.path.string(), /*rollBytes=*/512); log.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);               // defers the roll seal to the worker
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&follower});
+    w.setWorkerIngress(nullptr, true);
+    applyOneBatch(follower, 0, 600);                       // fills segment A
+    applyOneBatch(follower, 1, 16);                        // rolls: A sealed (deferred)
+    ASSERT_GT(log.pendingSealCount(), 0u);
+    w.doWork(1 * kMs);
+    EXPECT_EQ(w.sealSubmitsForTest(), 1u) << "a non-shard worker must submit the deferred seal (else it is never fsynced)";
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
 }
 
 TEST(ShardNonBlockingRegression, TxnMarkerAppendIsAsyncInShardMode) {
