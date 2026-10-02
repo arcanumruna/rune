@@ -72,6 +72,12 @@ protected:
         rune::node::EmbeddedDriverConfig cfg;
         cfg.dir             = aeronDir_;
         cfg.termBufferBytes = termBufferBytes();
+        // Pinned (test driver, orthogonal to the broker defaults): the
+        // pre-2026-10-02 128 KiB receive window.  The back-pressure tests' depth is
+        // publisher limit = sender position + term/2, the sender bounded by this
+        // window — a host-derived 4 MiB window (Linux, 16 MiB sysctls) let all 12
+        // x 1 MiB offers through and voided the precondition.
+        cfg.rcvWindowBytes  = 128 * 1024;
         try {
             driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
         } catch (const std::exception& e) {

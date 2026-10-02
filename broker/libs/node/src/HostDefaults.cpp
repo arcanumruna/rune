@@ -170,10 +170,15 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
     std::vector<std::string> hosts;
     for (const auto& p : cfg.peers)
         if (std::find(hosts.begin(), hosts.end(), p.host) == hosts.end()) hosts.push_back(p.host);
-    // A wildcard client bind (0.0.0.0) accepts REMOTE clients: never loopback.
+    // The MTU follows where datagrams GO: the peers, and the client-facing
+    // endpoint clients are told to use — the peer host (Metadata advertises
+    // peer.host:clientPort / ingressBase), never the bind address.  A wildcard
+    // bind therefore adds nothing (k3s regression: 0.0.0.0 + 127.0.0.1 peers
+    // derived the NIC's 1472 → 14-18k rec/s instead of 136k at 65504).  A
+    // concrete non-wildcard bind host is where this node receives: included.
     const std::string client = cfg.clientEndpoint.channel.empty() ? std::string{} : cfg.clientBindHost();
-    if (!cfg.clientEndpoint.channel.empty() && std::find(hosts.begin(), hosts.end(), client) == hosts.end())
-        hosts.push_back(isWildcardHost(client) ? std::string("0.0.0.0") : client);
+    if (!isWildcardHost(client) && std::find(hosts.begin(), hosts.end(), client) == hosts.end())
+        hosts.push_back(client);
     return hosts;
 }
 

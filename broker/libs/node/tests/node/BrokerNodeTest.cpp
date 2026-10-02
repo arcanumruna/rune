@@ -15,6 +15,7 @@
 
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
+#include <rune/node/HostDefaults.h>
 #include <rune/node/Worker.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <utility>
@@ -1887,4 +1888,28 @@ TEST(BrokerNodeRegression, GatewayAndEveryWorkerShareTheOneBatchLimit) {
     node.stop();
 }
 
+} // namespace rune::node
+
+namespace rune::node {
+// REGRESSION (k3s, broker 7ad0b2a): the bench's cluster.sh binds the client
+// endpoint on 0.0.0.0 with every peer on 127.0.0.1 — start() derived mtu=1472
+// (the NIC) instead of 65504 (14-18k vs 136,234 rec/s).  A real BrokerNode with
+// exactly those endpoints must resolve the 64 KiB loopback MTU (clamped only by
+// the platform's socket limit).
+TEST(BrokerNodeRegression, ClusterShStyleWildcardBindDerivesLoopbackMtuRegression) {
+    const fs::path dir = makeTempDataDir("wildmtu_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:" + std::to_string(cfg.peers[0].clientPort ? cfg.peers[0].clientPort : 50001);
+    ASSERT_EQ(cfg.aeronMtuBytes, NodeConfig::kAeronAuto) << "default = derived";
+    BrokerNode node{cfg};
+    node.start();
+    const auto& eff = node.effectiveConfigForTest();
+    const auto facts = probeHostNetFacts({"127.0.0.1"});
+    if (std::min(facts.rmemMax, facts.wmemMax) >= 1024 * 1024)
+        EXPECT_EQ(eff.aeronMtuBytes, 65504) << "wildcard bind + loopback peers is loopback";
+    else
+        EXPECT_GT(eff.aeronMtuBytes, 1472) << "loopback, clamped by small socket limits";
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
 } // namespace rune::node

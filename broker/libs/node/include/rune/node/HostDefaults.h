@@ -20,8 +20,9 @@
 //                  (64 KiB datagrams: kernel truesize makes a window near the
 //                  real SO_RCVBUF drop packets — a 16 MiB window on a 16 MiB
 //                  sysctl measured 98 % drops; 4 MiB measured clean)
-//   mtu          = 65504 when every endpoint is loopback (a wildcard client bind
-//                  is NOT loopback: remote clients would get 64 KiB datagrams),
+//   mtu          = 65504 when every endpoint datagrams go to is loopback (the
+//                  peers + the advertised client endpoint = the peer host; a
+//                  wildcard client BIND adds nothing),
 //                  else interface MTU − IP/UDP headers, aligned down to 32; then
 //                  clamped ≤ socketBuffer (aeron_driver_init EINVALs when mtu >
 //                  SO_SNDBUF — the macOS lesson), ≤ the receiver's effective window
@@ -163,8 +164,9 @@ struct HostDerivation {
 HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& facts,
                                         std::string_view ioBackend = "auto");
 
-/// Hosts this node's Aeron endpoints use: every peer host (self included) and
-/// the client bind host.  A wildcard client bind (0.0.0.0) follows the peers.
+/// Hosts this node's datagrams go to: every peer host (self included — clients
+/// are told the peer host) and a concrete client bind host.  A wildcard bind
+/// (0.0.0.0) adds nothing: the peers decide.
 [[nodiscard]] std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg);
 
 /// IMPURE: OS limits, the egress interface MTU for `endpointHosts` (empty =

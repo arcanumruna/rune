@@ -85,8 +85,11 @@ public:
 
     /// `termBufferBytes`: the client driver's term — it bounds the client's own
     /// publications (a Produce frame must fit term / 8).
-    explicit ShardTestClient(const std::filesystem::path& aeronDir, int32_t termBufferBytes = 1 << 20)
-        : driver_(cfgFor(aeronDir, termBufferBytes), DriverMode::Threaded)
+    /// `legacyTransport`: the pre-2026-10-02 client transport (1408 MTU, 2 MiB
+    /// socket buffers, sparse terms) instead of the host-derived one.
+    explicit ShardTestClient(const std::filesystem::path& aeronDir, int32_t termBufferBytes = 1 << 20,
+                             bool legacyTransport = false)
+        : driver_(cfgFor(aeronDir, termBufferBytes, legacyTransport), DriverMode::Threaded)
     {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
@@ -314,8 +317,12 @@ public:
     }
 
 private:
-    static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d, int32_t termBufferBytes) {
+    static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d, int32_t termBufferBytes,
+                                       bool legacyTransport = false) {
         EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes;
+        if (legacyTransport) {
+            c.mtuBytes = 1408; c.socketBufferBytes = 2 * 1024 * 1024; c.termBufferSparse = true;
+        }
         // Pinned (test client, orthogonal to the broker defaults): the pre-2026-10-02
         // 128 KiB receive window, so back-pressure tests (a client that stops
         // reading its acks) hit it at the same depth whatever the host derives.

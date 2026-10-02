@@ -639,6 +639,9 @@ public:
     /// Self-contained worker shards (spec §3.1): number of per-worker invoker
     /// drivers built (0 in legacy mode).  Startup/stop-time state (no worker access).
     /// Shard drivers this node OWNS (fused worker 0 rides the node driver: not counted).
+    /// The config as resolved by start() (host-derived defaults applied).
+    /// Start-thread / test use after start(); immutable afterwards.
+    [[nodiscard]] const NodeConfig& effectiveConfigForTest() const noexcept { return config_; }
     [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept {
         std::size_t n = 0;
         for (const auto& d : shardDrivers_) n += d ? 1u : 0u;

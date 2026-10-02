@@ -298,7 +298,7 @@ TEST(HostDefaults, LoopbackAndWildcardHosts) {
     EXPECT_FALSE(isWildcardHost("127.0.0.1"));
 }
 
-TEST(HostDefaults, EndpointHostsTreatAWildcardClientBindAsNonLoopback) {
+TEST(HostDefaults, EndpointHostsFollowThePeersForAWildcardClientBind) {
     NodeConfig c;
     c.nodeId = 0;
     PeerConfig p0; p0.id = 0; p0.host = "127.0.0.1";
@@ -306,12 +306,10 @@ TEST(HostDefaults, EndpointHostsTreatAWildcardClientBindAsNonLoopback) {
     c.peers = {p0, p1};
     c.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:40200";
     EXPECT_EQ(nodeEndpointHosts(c), std::vector<std::string>{"127.0.0.1"});
-    // Review I2: a wildcard bind accepts REMOTE clients → never loopback.
+    // A wildcard bind is not where datagrams go: the peers (and the advertised
+    // client endpoint = the peer host) decide (k3s regression, see below).
     c.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:40200";
-    EXPECT_EQ(nodeEndpointHosts(c), (std::vector<std::string>{"127.0.0.1", "0.0.0.0"}));
-    bool lo = true;
-    for (const auto& h : nodeEndpointHosts(c)) lo = lo && isLoopbackHost(h);
-    EXPECT_FALSE(lo);
+    EXPECT_EQ(nodeEndpointHosts(c), std::vector<std::string>{"127.0.0.1"});
     c.clientEndpoint.channel = "aeron:udp?endpoint=10.0.0.5:40200";
     EXPECT_EQ(nodeEndpointHosts(c), (std::vector<std::string>{"127.0.0.1", "10.0.0.5"}));
 }
@@ -679,4 +677,40 @@ TEST(HostDefaults, InvalidMtuIsRefusedAndGarbageCoreBaseDisables) {
     ASSERT_TRUE(r.config.has_value()) << r.error;
     EXPECT_EQ(r.config->peers[0].egressControlBasePort, 40400);
     EXPECT_FALSE(parse({{"RUNE_PEERS", "0@127.0.0.1:1:2:3:4:5:6:7"}}).config.has_value()) << "max 6 segments";
+}
+
+// REGRESSION (k3s, broker 7ad0b2a): cluster.sh-style config — client bind
+// 0.0.0.0, every peer 127.0.0.1 — derived mtu=1472 (the egress NIC) instead of
+// 65504: 14-18k rec/s vs 136,234 with 65504.  Datagrams go to the PEERS and to
+// the ADVERTISED client endpoint (the peer host), never to the bind address: a
+// wildcard bind with loopback peers is loopback.
+TEST(HostDefaultsRegression, WildcardBindWithLoopbackPeersIsLoopbackRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    c.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:40200";
+    const auto hosts = nodeEndpointHosts(c);
+    for (const auto& h : hosts) EXPECT_TRUE(isLoopbackHost(h)) << h;
+    const auto facts = probeHostNetFacts(hosts);           // the REAL probe
+    EXPECT_TRUE(facts.loopback);
+    if (std::min(facts.rmemMax, facts.wmemMax) < 1024 * 1024)
+        GTEST_SKIP() << "host socket limits < 1 MiB clamp the MTU below 65504";
+    applyHostDerivedDefaults(c, facts);
+    EXPECT_EQ(c.aeronMtuBytes, 65504) << "loopback peers + wildcard bind must derive the 64 KiB loopback MTU";
+    // Same with the pure facts of the k3s box.
+    NodeConfig k = threeNodeDefault(1);
+    k.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:40201";
+    HostNetFacts kf = k3sFacts();
+    kf.loopback = true;
+    for (const auto& h : nodeEndpointHosts(k)) kf.loopback = kf.loopback && isLoopbackHost(h);
+    applyHostDerivedDefaults(k, kf);
+    EXPECT_EQ(k.aeronMtuBytes, 65504);
+}
+
+TEST(HostDefaultsRegression, MixedPeersUseTheEgressInterfaceRegression) {
+    // A non-loopback peer: the NIC path decides (never 65504 over a real NIC).
+    NodeConfig c = threeNodeDefault(0);
+    c.peers[2].host = "10.1.2.3";
+    c.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:40200";
+    bool lo = true;
+    for (const auto& h : nodeEndpointHosts(c)) lo = lo && isLoopbackHost(h);
+    EXPECT_FALSE(lo);
 }

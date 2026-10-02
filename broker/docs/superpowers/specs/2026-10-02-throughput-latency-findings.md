@@ -59,6 +59,9 @@ Throughput numbers: 3-node acks=all 1 KiB, window 8000, 300k records unless note
 | A4 | Fused runtime rides worker 0's driver (one driver per worker; the extra runtime driver cost ~15–17 µs/pass of idle polling). | `02951ef` | runtime 18–22 → 2–2.6 µs/pass; pass 40 → 20 µs; 61k → 73–79k |
 | SPARSE | `RUNE_AERON_TERM_SPARSE=false`: pre-allocated term buffers (sparse terms page-faulted ~15 % of the shard thread; also F26 SIGBUS). | `bf8527e` | 73–79k → **100–105k** |
 | DEFAULTS | The §4 config is the broker DEFAULT, auto-derived from the host (`HostDefaults.h`): shard + fused, 1 worker; 16 MiB non-sparse terms; 32 MiB rings; uring with auto-fallback to portable; MTU 65504 on loopback / NIC MTU − 28 (IPv6 − 48) aligned 32, clamped ≤ SO_SNDBUF; socket buffer min(16 MiB, rmem/wmem_max) + loud WARN naming the sysctls; window pow2(min(4 MiB, buf/4, term/2)); shard base ports + core layout derived. Explicit env/config always wins (clamped only where `aeron_driver_init` would EINVAL). One startup line logs the effective config. | integ/perf-defaults (wt26) | e2e: see the "defaults = tuned" row below |
+| AUTO-MTU BUG | Integrated defaults, broker `7ad0b2a`: a wildcard client bind (cluster.sh-style `0.0.0.0`, peers `127.0.0.1`) derived the NIC MTU **1472** instead of 65504. Fix: the MTU follows where datagrams go (peers + the advertised client endpoint = the peer host); a wildcard bind adds nothing. RED→GREEN `HostDefaultsRegression.WildcardBindWithLoopbackPeersIsLoopbackRegression` + `BrokerNodeRegression.ClusterShStyleWildcardBindDerivesLoopbackMtuRegression`. | fix on integ/perf-defaults (after `7ad0b2a`) | controller, k3s, shard-invoker saturate client `6c43f00`, 300k acks=all: auto MTU 1472 → **14–18k rec/s**; explicit `RUNE_AERON_MTU=65504` → **136,234 rec/s** |
+| CLIENT | The old client (pre-`460dd12`, which never set the Produce frame's producerId/epoch/baseSequence) is now REJECTED by design: the broker cross-checks frame identity vs the RecordBatch header (idempotence-window merge). | `1540239` merged | old bench client fails; use client ≥ `460dd12` |
+| DEFAULTS = TUNED | 3-node e2e on k3s-node-01: Run 1 = `cluster.sh` with NO tuning env (broker defaults), Run 2 = the explicit §4 env; same topic (`bench:4`, majority/all-in-sync, minIsr 2) and client. Must match (and be ≥ 100k rec/s, 0 failed). | broker: integ/perf-defaults head with the auto-MTU fix; final client | **PENDING — controller re-run with NO env overrides (target ≈ 136k, see §4.1)** |
 | ENV | Loopback fast path on k3s-node-01 (`lo` NOTRACK + ACCEPT ahead of ~1055 kube rules / 201 chains). Revert: `/root/rune-e5/iptables-lo-revert.sh`. | box config | small-send syscall p50 30 → 19.5 µs, p99 110 → 67 µs; throughput unchanged (98–103k) |
 
 Measured and **not** the cause (ruled out with data): storage `pwrite` is not I/O-bound
@@ -99,6 +102,21 @@ RUNE_BENCH_MODE=acked RUNE_BENCH_ACKS=all RUNE_BENCH_VALUE_BYTES=1024
 RUNE_BENCH_WINDOW=RUNE_BENCH_MAX_IN_FLIGHT=8000 RUNE_LINGER_US=1000 RUNE_BATCH_BYTES=2097152
 RUNE_IDLE_MODE=backoff   (client still sends produce via the runtime gateway — not ingressEndpoint yet)
 ```
+
+### 4.1 Defaults = tuned — e2e proof (PENDING)
+
+Run by the controller on the integ/perf-defaults head (auto-MTU fix included; `7ad0b2a` had the
+1472 bug) with the final client (`/root/e2e/rune-client-cpp`), RUNE_FS_LOG=0,
+RUNE_LOG_LEVEL=warn, under `/root/vm.lock`:
+
+| run | broker env | client | RESULT (rec/s, p50, p99, failed) | effective-config line |
+|---|---|---|---|---|
+| 1 default | none (cluster.sh passes only what it needs to start) | §4 client block | _pending_ | _pending_ |
+| 2 tuned | §4 broker env, explicit | §4 client block | _pending_ | _pending_ |
+| shard_gate correctness (both modes) | — | 100k acks=all, `--acked-file` + verify | _pending: failed / duplicates / missing / ok_missing / failed_stored_ | — |
+
+Also to record: /dev/shm and RSS per broker on the 7.7 GB box (16 MiB non-sparse terms on
+tmpfs = 48 MiB per publication/image log), and proof the client goes direct-to-worker.
 
 ## 5. Where the time goes now (measured)
 
