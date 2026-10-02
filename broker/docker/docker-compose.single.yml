@@ -54,6 +54,11 @@ services:
       RUNE_LOG_LEVEL: "info"
       # Explicit off; "0" (= unset) is also the default — RUNE_FS_LOG is opt-in.
       RUNE_FS_LOG: "0"
+      # Container /dev/shm budget (2026-10-02 defaults): the broker DEFAULT term is
+      # 16 MiB and every publication/image maps 3 terms (48 MiB) — on the RECEIVING
+      # side too, so a DR client container (--shm-size=64m) could not hold one broker
+      # image.  Explicit 4 MiB terms (the pre-2026-10-02 size) for the containers.
+      RUNE_AERON_TERM_BUFFER_BYTES: "4194304"
       # NOTE: NO RUNE_TOPICS here — the typed topic "characters" is created at
       # RUNTIME by the probe via defineTopic() (the whole point of Task 13).
       # io_uring portability under Rosetta amd64 emulation (see docker-compose.yml).

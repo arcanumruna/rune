@@ -9,10 +9,12 @@
 RUNE_CLUSTER_PIDS=()
 # Shard mode (RUNE_SHARD=1, spec §3.3): node i gets explicit, distinct per-worker
 # ranges — ingress 40500+20i, replication 40600+20i — advertised in RUNE_PEERS
-# (id@host:consensus:client:repl:replBase:ingressBase).  <= 20 workers per node.
+# (id@host:consensus:client:repl:replBase:ingressBase:egressControlBase).  <= 20
+# workers per node.  RUNE_SHARD unset: plain peers — the broker DERIVES the shard
+# ports and the core layout (the default since 2026-10-02).
 rune_cluster_peers() {
   if [ "${RUNE_SHARD:-0}" = "1" ]; then
-    echo "0@127.0.0.1:40110:40200:40220:40600:40500,1@127.0.0.1:40111:40201:40221:40620:40520,2@127.0.0.1:40112:40202:40222:40640:40540"
+    echo "0@127.0.0.1:40110:40200:40220:40600:40500:40400,1@127.0.0.1:40111:40201:40221:40620:40520:40420,2@127.0.0.1:40112:40202:40222:40640:40540:40440"
   else
     echo "0@127.0.0.1:40110:40200:40220,1@127.0.0.1:40111:40201:40221,2@127.0.0.1:40112:40202:40222"
   fi
@@ -77,11 +79,22 @@ rune_start_cluster() {
     local d="$WORK/rune-c$i"; rm -rf "$d" "$logdir"; mkdir -p "$d/a" "$logdir"
     local pinprefix; pinprefix="$(pin "$CORES_BROKER")"
     [ "${RUNE_SHARD:-0}" = "1" ] && pinprefix=""
-    # Legacy (RUNE_WORKER_MODE=legacy) keeps its fixed egress-control base;
-    # shard mode derives it per node id unless RUNE_SHARD=1 sets the layout.
-    local eg=""; [ "${RUNE_WORKER_MODE:-}" = "legacy" ] && eg="RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$((40400+i*20))"
+    # Legacy (RUNE_WORKER_MODE=legacy) keeps its pre-2026-10-02 harness wiring:
+    # per-worker ingress/egress planes on, a fixed egress-control base per node.
+    # Shard mode derives the base per node id unless RUNE_SHARD=1 sets the layout.
+    local eg=""
+    if [ "${RUNE_WORKER_MODE:-}" = "legacy" ]; then
+      eg="RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$((40400+i*20))"
+      [ -z "${RUNE_PER_WORKER_INGRESS:-}" ] && eg="$eg RUNE_PER_WORKER_INGRESS=true"
+      [ -z "${RUNE_PER_WORKER_EGRESS:-}" ] && eg="$eg RUNE_PER_WORKER_EGRESS=true"
+    fi
+    # A taskset prefix owns placement: never let the broker auto-pin past it.
+    [ -n "$pinprefix" ] && [ -z "${RUNE_WORKER_CORE_BASE:-}" ] && eg="$eg RUNE_WORKER_CORE_BASE=-1"
     # shellcheck disable=SC2086
-    env RUNE_NODE_ID=$i RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="0.0.0.0:$cport" \
+    # Co-located loopback cluster: bind the client endpoint on 127.0.0.1 (a
+    # wildcard bind accepts remote clients, so the broker would derive the NIC MTU
+    # instead of the 64 KiB loopback MTU).
+    env RUNE_NODE_ID=$i RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="${RUNE_CLIENT_BIND:-127.0.0.1}:$cport" \
         RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_TOPICS="$topics" \
         $knobs $eg \
         $(rune_shard_env "$i" "${workers:-1}") \

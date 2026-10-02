@@ -1185,6 +1185,7 @@ TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
     // (65535 + worker 1 overflows the port space).
     cfg.workerMode = NodeConfig::WorkerMode::Shard;
     cfg.workerCount = 2;
+    cfg.workerCoreBase = -1;
     cfg.workerIngressBasePort = 65535;
     BrokerNode node{cfg};
     EXPECT_THROW(node.start(), std::runtime_error);

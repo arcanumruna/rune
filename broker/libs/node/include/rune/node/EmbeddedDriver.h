@@ -48,7 +48,9 @@ struct EmbeddedDriverConfig {
     int32_t     mtuBytes          = NodeConfig::kAeronAuto;
     int32_t     rcvWindowBytes    = NodeConfig::kAeronAuto;
     int32_t     socketBufferBytes = NodeConfig::kAeronAuto;   ///< 0 = OS default
-    bool        termBufferSparse  = false;   ///< false: allocate + zero-fill terms at creation
+    /// false: allocate + zero-fill terms at creation.  nullopt = derived (non-sparse
+    /// only when `dir` is on tmpfs — HostDefaults.h deriveTermSparse).
+    std::optional<bool> termBufferSparse;
     /// Hosts this driver's endpoints use (loopback decides the derived MTU).
     /// Empty = loopback.
     std::vector<std::string> endpointHosts;

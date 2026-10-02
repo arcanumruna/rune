@@ -54,6 +54,11 @@ x-broker-env: &broker-env
   # never floods/starves the data-plane threads (esp. under amd64 emulation on
   # Apple Silicon).  Set to "1" only when debugging replication.
   RUNE_FS_LOG: "0"
+  # Container /dev/shm budget (2026-10-02 defaults): the broker DEFAULT term is
+  # 16 MiB and every publication/image maps 3 terms (48 MiB) — on the RECEIVING
+  # side too, so a DR client container (--shm-size=64m) could not hold one broker
+  # image.  Explicit 4 MiB terms (the pre-2026-10-02 size) for the containers.
+  RUNE_AERON_TERM_BUFFER_BYTES: "4194304"
   # GB-1/CB-5: bootstrap the data-plane topics on every node so the leader (and
   # any post-kill leader) can serve produce/subscribe.  Broker assigns topicIds
   # sequentially from 0 in declaration order → "events" = topicId 0.  The client

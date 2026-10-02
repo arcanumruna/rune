@@ -16,6 +16,12 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <filesystem>
+#include <system_error>
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/vfs.h>
+#endif
 
 namespace rune::node {
 
@@ -70,17 +76,23 @@ AeronTransportDerived deriveAeronTransport(const HostNetFacts& f, const AeronTra
         sndCap = f.defaultSndBuf > 0 ? f.defaultSndBuf : kFallbackMtuBytes;
         rcvCap = f.defaultRcvBuf > 0 ? f.defaultRcvBuf : 128 * 1024;
     } else {
-        d.socketBufferBytes = req.socketBufferBytes;
-        sndCap = rcvCap = std::min<int64_t>(req.socketBufferBytes, osMax);
+        // An explicit value above the OS limit is CLAMPED to it: Linux would cap it
+        // silently, but macOS refuses the setsockopt outright and leaves the 9216
+        // default — then aeron_driver_init EINVALs on the MTU.
+        d.socketBufferBytes = static_cast<int32_t>(std::min<int64_t>(req.socketBufferBytes, osMax));
+        sndCap = rcvCap = d.socketBufferBytes;
         if (req.socketBufferBytes > osMax)
             appendWarn(d.warnings, "explicit socket buffer " + mib(req.socketBufferBytes) +
-                                   " exceeds the OS limit " + mib(osMax) + " (the kernel caps it); set: " +
+                                   " exceeds the OS limit " + mib(osMax) + " — clamped to it; set: " +
                                    socketBufferSysctlAdvice(f.platform));
     }
 
-    // 3. Receive window: <= SO_RCVBUF always; derived = pow2(min(4 MiB, buf/4, term/2)).
+    // 3. Receive window: <= SO_RCVBUF always; derived = pow2(min(4 MiB, kernelBuf/4,
+    //    term/2)) where Linux's kernel buffer is 2 x the requested SO_RCVBUF.
     if (req.rcvWindowBytes == kAeronAuto) {
-        const int64_t w = pow2Floor(std::min({static_cast<int64_t>(kMaxDerivedRcvWindowBytes), rcvCap / 4, term / 2}));
+        const int64_t kernelBuf = f.platform == HostPlatform::Linux ? 2 * rcvCap : rcvCap;
+        const int64_t w = pow2Floor(std::min({static_cast<int64_t>(kMaxDerivedRcvWindowBytes), kernelBuf / 4,
+                                              term / 2, rcvCap}));
         d.rcvWindowBytes = static_cast<int32_t>(std::max<int64_t>(w, kMinMtuBytes));
     } else {
         d.rcvWindowBytes = req.rcvWindowBytes;
@@ -94,14 +106,16 @@ AeronTransportDerived deriveAeronTransport(const HostNetFacts& f, const AeronTra
     // 4. MTU: <= SO_SNDBUF (aeron_driver_init EINVAL), <= window (receive endpoint
     //    EINVAL), <= 65504, multiple of 32.  Derived also <= window/4 (>= 4
     //    datagrams in flight).
-    const int64_t hardMtuCap = std::min({sndCap, static_cast<int64_t>(d.rcvWindowBytes),
+    //    The receiver's effective window is min(window, term/2) (Aeron
+    //    aeron_receiver_window_length) — the receive endpoint refuses mtu above it.
+    const int64_t hardMtuCap = std::min({sndCap, static_cast<int64_t>(d.rcvWindowBytes), term / 2,
                                          static_cast<int64_t>(kLoopbackMtuBytes)});
     if (req.mtuBytes == kAeronAuto) {
         int64_t mtu = kFallbackMtuBytes;
         if (f.loopback) mtu = kLoopbackMtuBytes;
         else if (f.interfaceMtu > 0)
             mtu = f.interfaceMtu - (f.ipv6 ? kIpv6UdpHeaderBytes : kIpv4UdpHeaderBytes);
-        mtu = std::min({mtu, hardMtuCap, static_cast<int64_t>(d.rcvWindowBytes) / 4});
+        mtu = std::min({mtu, hardMtuCap, std::min<int64_t>(d.rcvWindowBytes, term / 2) / 4});
         d.mtuBytes = std::max(alignDown(mtu, kAeronFrameAlignment), kMinMtuBytes);
     } else {
         d.mtuBytes = req.mtuBytes;
@@ -156,9 +170,10 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
     std::vector<std::string> hosts;
     for (const auto& p : cfg.peers)
         if (std::find(hosts.begin(), hosts.end(), p.host) == hosts.end()) hosts.push_back(p.host);
+    // A wildcard client bind (0.0.0.0) accepts REMOTE clients: never loopback.
     const std::string client = cfg.clientEndpoint.channel.empty() ? std::string{} : cfg.clientBindHost();
-    if (!isWildcardHost(client) && std::find(hosts.begin(), hosts.end(), client) == hosts.end())
-        hosts.push_back(client);
+    if (!cfg.clientEndpoint.channel.empty() && std::find(hosts.begin(), hosts.end(), client) == hosts.end())
+        hosts.push_back(isWildcardHost(client) ? std::string("0.0.0.0") : client);
     return hosts;
 }
 
@@ -173,21 +188,22 @@ std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t worke
     return ShardBasePorts{b, b + NodeConfig::kMaxShardWorkers, b + 2 * NodeConfig::kMaxShardWorkers};
 }
 
-int32_t deriveWorkerCoreBase(HostPlatform platform, bool coLocated, int32_t selfIndex, int32_t nodes,
-                             int32_t workers, int32_t cores) noexcept {
-    if (platform != HostPlatform::Linux || workers < 1 || cores < 2) return -1;
-    if (coLocated) {
-        if (nodes < 1 || selfIndex < 0 || selfIndex >= nodes) return -1;
-        if (1 + static_cast<int64_t>(nodes) * workers > cores) return -1;
-        return 1 + selfIndex * workers;
-    }
-    return 1 + workers <= cores ? 1 : -1;
+int32_t deriveWorkerCoreBase(HostPlatform platform, bool allLoopback, int32_t selfIndex, int32_t nodes,
+                             int32_t workers, const std::vector<int32_t>& cpus) noexcept {
+    if (platform != HostPlatform::Linux || !allLoopback || workers < 1 || nodes < 1) return -1;
+    if (selfIndex < 0 || selfIndex >= nodes) return -1;
+    const int64_t first = 1 + static_cast<int64_t>(selfIndex) * workers;   // index into the mask
+    if (1 + static_cast<int64_t>(nodes) * workers > static_cast<int64_t>(cpus.size())) return -1;
+    const int32_t base = cpus[static_cast<std::size_t>(first)];
+    for (int32_t w = 1; w < workers; ++w)   // WorkerPool pins base + w: must be consecutive
+        if (cpus[static_cast<std::size_t>(first + w)] != base + w) return -1;
+    return base;
 }
 
 // ---------------------------------------------------------------------------
 // applyHostDerivedDefaults (PURE given facts + cores)
 // ---------------------------------------------------------------------------
-HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& facts, int32_t cores) {
+HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& facts, std::string_view ioBackend) {
     HostDerivation out;
     std::string derived;   // names of the derived fields
     auto mark = [&derived](const char* n) { if (!derived.empty()) derived += ','; derived += n; };
@@ -210,6 +226,14 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         if (!t.warnings.empty()) appendWarn(out.warnings, t.warnings);
     }
 
+    // Term sparseness (non-sparse only on tmpfs).
+    if (!cfg.aeronTermBufferSparse) mark("sparse");
+    cfg.aeronTermBufferSparse = deriveTermSparse(cfg.aeronTermBufferSparse, facts.aeronDirTmpfs);
+    if (*cfg.aeronTermBufferSparse && !facts.aeronDirTmpfs && cfg.aeronTermBufferBytes >= 16 * 1024 * 1024)
+        appendWarn(out.warnings, "Aeron dir is not on tmpfs — term buffers stay sparse (page faults on the "
+                                 "hot path; findings §4 measured 73-79k vs 100-105k rec/s): set "
+                                 "RUNE_AERON_DIR to a /dev/shm path");
+
     const int32_t W = cfg.workerCount >= 1 ? cfg.workerCount : 1;
 
     // Shard mode: the per-worker planes it implies + derived base ports.
@@ -218,66 +242,72 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         cfg.perWorkerReplication    = true;
         cfg.perWorkerEgressEnabled  = true;
         bool portsDerived = false;
-        if (const auto self = deriveShardBasePorts(cfg.nodeId, W)) {
-            // Self: from its own peer entry when advertised there, else derived.
-            const PeerConfig* me = nullptr;
-            for (const auto& p : cfg.peers) if (p.id == cfg.nodeId) me = &p;
-            if (!cfg.workerIngressBasePort) {
-                cfg.workerIngressBasePort = (me && me->ingressBasePort) ? me->ingressBasePort : self->ingress;
-                portsDerived = true;
-            }
-            if (!cfg.workerReplBasePort) {
-                cfg.workerReplBasePort = (me && me->replBasePort) ? me->replBasePort : self->repl;
-                portsDerived = true;
-            }
-            if (!cfg.workerEgressControlBasePort) {
-                cfg.workerEgressControlBasePort = self->egressControl;
-                portsDerived = true;
-            }
+        const auto selfDerived = deriveShardBasePorts(cfg.nodeId, W);
+        const PeerConfig* me = nullptr;
+        for (const auto& p : cfg.peers) if (p.id == cfg.nodeId) me = &p;
+        // Self: an explicit RUNE_WORKER_*_BASE_PORT wins; else the base RUNE_PEERS
+        // advertises for self; else the derived one.
+        if (!cfg.workerIngressBasePort) {
+            cfg.workerIngressBasePort = (me && me->ingressBasePort) ? me->ingressBasePort
+                                      : selfDerived ? std::optional<int32_t>(selfDerived->ingress) : std::nullopt;
+            portsDerived = true;
         }
+        if (!cfg.workerReplBasePort) {
+            cfg.workerReplBasePort = (me && me->replBasePort) ? me->replBasePort
+                                   : selfDerived ? std::optional<int32_t>(selfDerived->repl) : std::nullopt;
+            portsDerived = true;
+        }
+        if (!cfg.workerEgressControlBasePort) {
+            cfg.workerEgressControlBasePort = (me && me->egressControlBasePort) ? me->egressControlBasePort
+                                            : selfDerived ? std::optional<int32_t>(selfDerived->egressControl)
+                                                          : std::nullopt;
+            portsDerived = true;
+        }
+        // Every peer entry (SELF INCLUDED) that does not advertise a base gets the
+        // DERIVED one — exactly what every other node computes for it.  A self base
+        // set only in RUNE_WORKER_*_BASE_PORT then disagrees with the self entry and
+        // validateShardConfig refuses to start (peers would derive another port).
         for (auto& p : cfg.peers) {
-            const bool isSelf = p.id == cfg.nodeId;
-            if (p.ingressBasePort == 0) {
-                if (isSelf && cfg.workerIngressBasePort) p.ingressBasePort = static_cast<uint16_t>(*cfg.workerIngressBasePort);
-                else if (const auto d = deriveShardBasePorts(p.id, W)) p.ingressBasePort = static_cast<uint16_t>(d->ingress);
-                portsDerived = true;
-            }
-            if (p.replBasePort == 0) {
-                if (isSelf && cfg.workerReplBasePort) p.replBasePort = static_cast<uint16_t>(*cfg.workerReplBasePort);
-                else if (const auto d = deriveShardBasePorts(p.id, W)) p.replBasePort = static_cast<uint16_t>(d->repl);
-                portsDerived = true;
-            }
-            if (isSelf && p.workerCount == 0) p.workerCount = W;
+            const auto d = deriveShardBasePorts(p.id, W);
+            if (!d && (p.ingressBasePort == 0 || p.replBasePort == 0 || p.egressControlBasePort == 0))
+                appendWarn(out.warnings, "node id " + std::to_string(p.id) + " is outside the derived shard "
+                           "port range [0, 126] — advertise its replBase:ingressBase:egressControlBase in RUNE_PEERS");
+            if (p.ingressBasePort == 0 && d)       { p.ingressBasePort = static_cast<uint16_t>(d->ingress); portsDerived = true; }
+            if (p.replBasePort == 0 && d)          { p.replBasePort = static_cast<uint16_t>(d->repl); portsDerived = true; }
+            if (p.egressControlBasePort == 0 && d) { p.egressControlBasePort = static_cast<uint16_t>(d->egressControl); portsDerived = true; }
+            if (p.id == cfg.nodeId && p.workerCount == 0) p.workerCount = W;
         }
         if (portsDerived) mark("shardPorts");
     }
 
     // Worker affinity (shard mode only: a pinned shard worker busy-spins).
-    bool coLocated = !cfg.peers.empty();
-    for (const auto& p : cfg.peers) coLocated = coLocated && isLoopbackHost(p.host);
+    bool allLoopback = !cfg.peers.empty();
+    for (const auto& p : cfg.peers) allLoopback = allLoopback && isLoopbackHost(p.host);
     if (cfg.workerCoreBase == NodeConfig::kWorkerCoreBaseAuto) {
         int32_t selfIndex = 0;
         for (const auto& p : cfg.peers) if (p.id < cfg.nodeId) ++selfIndex;
         const auto nodes = static_cast<int32_t>(std::max<std::size_t>(cfg.peers.size(), 1));
         cfg.workerCoreBase = cfg.shardMode()
-            ? deriveWorkerCoreBase(facts.platform, coLocated, selfIndex, nodes, W, cores)
+            ? deriveWorkerCoreBase(facts.platform, allLoopback, selfIndex, nodes, W, facts.allowedCpus)
             : -1;
         mark("coreBase");
     }
 
-    char line[640];
+    const std::string io(ioBackend);
+    char line[768];
     std::snprintf(line, sizeof line,
-        "mode=%s placement=%s workers=%d coreBase=%d(%s) term=%d sparse=%s mtu=%d socketBuffer=%d "
+        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s term=%d sparse=%s mtu=%d socketBuffer=%d "
         "rcvWindow=%d rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
-        "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cores=%d} derived={%s}",
+        "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
-        cfg.shardMode() ? (cfg.workerCoreBase >= 0 ? "busy-spin" : "backoff") : "idle-cfg",
-        cfg.aeronTermBufferBytes, cfg.aeronTermBufferSparse ? "true" : "false", cfg.aeronMtuBytes,
+        cfg.shardMode() ? (cfg.workerCoreBase >= 0 ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(),
+        cfg.aeronTermBufferBytes, cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,
         cfg.aeronSocketBufferBytes, cfg.aeronRcvWindowBytes, cfg.replicationOutboundRingBytes,
         cfg.workerIngressRingBytes, cfg.workerReturnRingBytes, cfg.workerIngressBasePort.value_or(0),
         cfg.workerReplBasePort.value_or(0), cfg.effectiveWorkerEgressControlBasePort(),
         facts.loopback ? "true" : "false", facts.interfaceMtu, static_cast<long long>(facts.rmemMax),
-        static_cast<long long>(facts.wmemMax), cores, derived.c_str());
+        static_cast<long long>(facts.wmemMax), static_cast<int>(facts.allowedCpus.size()),
+        facts.aeronDirTmpfs ? "true" : "false", derived.c_str());
     out.summary = line;
     return out;
 }
@@ -367,9 +397,39 @@ int32_t egressInterfaceMtu(const std::string& host, bool& ipv6) {
     return mtu;
 }
 
+std::vector<int32_t> allowedCpus() {
+    std::vector<int32_t> cpus;
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (::sched_getaffinity(0, sizeof set, &set) == 0)
+        for (int c = 0; c < CPU_SETSIZE; ++c)
+            if (CPU_ISSET(c, &set)) cpus.push_back(c);
+#endif
+    return cpus;   // empty elsewhere: never auto-pin
+}
+
+/// The nearest existing ancestor of `path` is on tmpfs (Linux statfs).
+bool onTmpfs(const std::string& path) {
+#if defined(__linux__)
+    std::error_code ec;
+    std::filesystem::path p = std::filesystem::absolute(path, ec);
+    while (!p.empty() && !std::filesystem::exists(p, ec)) {
+        if (p == p.parent_path()) break;
+        p = p.parent_path();
+    }
+    struct statfs st{};
+    if (::statfs(p.c_str(), &st) != 0) return false;
+    return static_cast<unsigned long>(st.f_type) == 0x01021994UL;   // TMPFS_MAGIC
+#else
+    (void)path;
+    return false;   // no tmpfs Aeron dir on macOS (disk-backed): sparse terms
+#endif
+}
+
 } // namespace
 
-HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts) {
+HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts, const std::string& aeronDir) {
     HostNetFacts f;
     f.platform = currentHostPlatform();
     f.loopback = true;
@@ -379,7 +439,8 @@ HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts) {
         for (const auto& h : endpointHosts) {
             if (isLoopbackHost(h)) continue;
             bool v6 = false;
-            const int32_t m = egressInterfaceMtu(h, v6);
+            // Wildcard: the interface the default route uses (no packet is sent).
+            const int32_t m = egressInterfaceMtu(isWildcardHost(h) ? std::string("1.1.1.1") : h, v6);
             f.ipv6 = f.ipv6 || v6;
             if (m > 0 && (minMtu == 0 || m < minMtu)) minMtu = m;
         }
@@ -389,16 +450,16 @@ HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts) {
         f.rmemMax = readProcLong("/proc/sys/net/core/rmem_max");
         f.wmemMax = readProcLong("/proc/sys/net/core/wmem_max");
     }
-    if (f.rmemMax <= 0) f.rmemMax = probeSockCap(SO_RCVBUF, 64LL * 1024 * 1024);
-    if (f.wmemMax <= 0) f.wmemMax = probeSockCap(SO_SNDBUF, 64LL * 1024 * 1024);
+    // Fallback probe: Linux reports back DOUBLE the granted size.
+    const int64_t div = f.platform == HostPlatform::Linux ? 2 : 1;
+    if (f.rmemMax <= 0) f.rmemMax = probeSockCap(SO_RCVBUF, 64LL * 1024 * 1024) / div;
+    if (f.wmemMax <= 0) f.wmemMax = probeSockCap(SO_SNDBUF, 64LL * 1024 * 1024) / div;
+    f.allowedCpus   = allowedCpus();
+    f.aeronDirTmpfs = !aeronDir.empty() && onTmpfs(aeronDir);
     f.defaultSndBuf = probeSockDefault(SO_SNDBUF);
     f.defaultRcvBuf = probeSockDefault(SO_RCVBUF);
     return f;
 }
 
-int32_t hostCpuCount() noexcept {
-    const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
-    return n > 0 ? static_cast<int32_t>(n) : 1;
-}
 
 } // namespace rune::node

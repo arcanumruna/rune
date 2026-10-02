@@ -78,14 +78,16 @@ static bool parsePort(std::string_view sv, uint16_t& out) {
 }
 
 /// Parse one peer entry of the form
-///   "id@host:consensusPort[:clientPort[:replPort[:replBasePort[:ingressBasePort]]]]".
+///   "id@host:consensusPort[:clientPort[:replPort[:replBasePort[:ingressBasePort[:egressControlBasePort]]]]]".
 /// Optional segments (backward-compatible; absent → 0):
 ///   - "1@host:40111"                         → consensusPort=40111
 ///   - "1@host:40111:40200"                   → + clientPort=40200
 ///   - "1@host:40111:40200:40300"             → + replPort=40300
 ///   - "1@host:40111:40200:40300:40600:40500" → + replBasePort=40600, ingressBasePort=40500
 ///     (self-contained worker shards, spec §3.3: worker w uses base + w)
-/// More than 5 port segments is an error.
+///   - 6th segment: egressControlBasePort (per-worker dynamic-MDC egress control,
+///     advertised to clients for partitions the peer leads; 2026-10-02).
+/// More than 6 port segments is an error.
 /// Returns an error string on failure or an empty string on success.
 static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     auto at = entry.find('@');
@@ -104,20 +106,21 @@ static std::string parsePeer(std::string_view entry, PeerConfig& out) {
         return std::string("peer host is empty in entry: ") + std::string(entry);
 
     // consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort]]]]
-    static constexpr const char* kNames[5] = {
-        "consensusPort", "clientPort", "replicationPort", "replBasePort", "ingressBasePort"};
-    std::array<std::string_view, 5> parts{};
+    static constexpr const char* kNames[6] = {
+        "consensusPort", "clientPort", "replicationPort", "replBasePort", "ingressBasePort",
+        "egressControlBasePort"};
+    std::array<std::string_view, 6> parts{};
     std::size_t n = 0;
     std::string_view rem = trim(hostPort.substr(firstColon + 1));
     for (;;) {
         if (n == parts.size())
-            return std::string("too many ':' port segments (max 5) in peer entry: ") + std::string(entry);
+            return std::string("too many ':' port segments (max 6) in peer entry: ") + std::string(entry);
         const auto c = rem.find(':');
         parts[n++] = trim(c == std::string_view::npos ? rem : rem.substr(0, c));
         if (c == std::string_view::npos) break;
         rem = rem.substr(c + 1);
     }
-    std::array<uint16_t, 5> ports{};
+    std::array<uint16_t, 6> ports{};
     for (std::size_t i = 0; i < n; ++i) {
         if (!parsePort(parts[i], ports[i]))
             return std::string("peer ") + kNames[i] + " is invalid or out of range in entry: " +
@@ -130,6 +133,7 @@ static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     out.replicationPort = ports[2];
     out.replBasePort    = ports[3];
     out.ingressBasePort = ports[4];
+    out.egressControlBasePort = ports[5];
     return {};
 }
 
@@ -382,10 +386,17 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
     const PeerConfig& me = self();
     if (me.replBasePort != replBase)
         return "RUNE_WORKER_REPL_BASE_PORT=" + std::to_string(replBase) +
-               " disagrees with self RUNE_PEERS replBasePort=" + std::to_string(me.replBasePort);
+               " disagrees with self RUNE_PEERS replBasePort=" + std::to_string(me.replBasePort) +
+               " (an unadvertised base is the DERIVED one every peer computes — advertise it in RUNE_PEERS)";
     if (me.ingressBasePort != ingressBase)
         return "RUNE_WORKER_INGRESS_BASE_PORT=" + std::to_string(ingressBase) +
-               " disagrees with self RUNE_PEERS ingressBasePort=" + std::to_string(me.ingressBasePort);
+               " disagrees with self RUNE_PEERS ingressBasePort=" + std::to_string(me.ingressBasePort) +
+               " (an unadvertised base is the DERIVED one every peer computes — advertise it in RUNE_PEERS)";
+    if (me.egressControlBasePort != 0 && me.egressControlBasePort != egressBase)
+        return "RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=" + std::to_string(egressBase) +
+               " disagrees with self RUNE_PEERS egressControlBasePort=" + std::to_string(me.egressControlBasePort) +
+               " (peers advertise it to clients; an unadvertised base is the DERIVED one — advertise it as the "
+               "6th RUNE_PEERS segment)";
 
     struct Bind { int32_t port; std::string what; };
     std::vector<Bind> binds;
@@ -934,14 +945,14 @@ ConfigResult parseNodeConfig(
     parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);
     parsePow2(getenv_fn("RUNE_AERON_TERM_BUFFER_BYTES"),  cfg.aeronTermBufferBytes);
     // RUNE_AERON_MTU: MTU is not required to be a power of two — use parseInt32.
-    if (const char* raw = getenv_fn("RUNE_AERON_MTU")) {
-        if (raw && !std::string_view(raw).empty()) {
-            int32_t v{};
-            if (parseInt32(raw, v)) {
-                cfg.aeronMtuBytes = v;
-            }
-            // Unparseable → keep default 65504 (safe degradation).
-        }
+    // Unset → derived (HostDefaults).  An explicit value must be a valid Aeron
+    // MTU (> 32-byte data header, <= 65504); 32-byte alignment / socket-buffer fit
+    // are enforced (clamped + WARN) at start.  Garbage is refused, never a 64 B MTU.
+    if (const char* raw = getenv_fn("RUNE_AERON_MTU"); raw && *raw) {
+        int32_t v{};
+        if (!parseInt32(raw, v) || v <= 32 || v > 65504)
+            return {{}, std::string("RUNE_AERON_MTU must be an integer in [33, 65504], got: ") + raw};
+        cfg.aeronMtuBytes = v;
     }
     parsePow2(getenv_fn("RUNE_AERON_RCV_WINDOW"), cfg.aeronRcvWindowBytes);
     for (auto [name, field] : {std::pair{"RUNE_AERON_MAX_MSGS_PER_SEND", &cfg.aeronMaxMessagesPerSend},
@@ -956,7 +967,7 @@ ConfigResult parseNodeConfig(
     }
     if (const char* raw = getenv_fn("RUNE_AERON_TERM_SPARSE"); raw && *raw) {
         const std::string_view v(raw);
-        if (v == "false" || v == "0") cfg.aeronTermBufferSparse = false;
+        if (v == "false" || v == "0") cfg.aeronTermBufferSparse = false;   // explicit (else derived)
         else if (v == "true" || v == "1") cfg.aeronTermBufferSparse = true;
         else return {{}, std::string("RUNE_AERON_TERM_SPARSE must be true|false, got '") + raw + "'"};
     }
@@ -1056,10 +1067,9 @@ ConfigResult parseNodeConfig(
     if (const char* wcb = getenv_fn("RUNE_WORKER_CORE_BASE")) {
         if (wcb && !std::string_view(wcb).empty()) {
             int32_t v{};
-            if (parseInt32(wcb, v)) {
-                cfg.workerCoreBase = (v < -1) ? -1 : v;
-            }
-            // Unparseable → keep default -1 (disabled; no error — safe degradation).
+            // Unparseable → -1 (DISABLED, never the auto layout: garbage must not
+            // turn a busy-spin on).  Values < -1 are clamped to -1.
+            cfg.workerCoreBase = parseInt32(wcb, v) ? ((v < -1) ? -1 : v) : -1;
         }
     }
     // Absent → keep NodeConfig default (-1 = disabled).

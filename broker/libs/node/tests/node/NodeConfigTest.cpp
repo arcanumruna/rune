@@ -1537,14 +1537,15 @@ TEST(NodeConfig, WorkerCoreBaseLessThanNegativeOneClampedToDisabled) {
         << "values < -1 must be clamped to -1 (disabled)";
 }
 
-TEST(NodeConfig, WorkerCoreBaseUnparsableKeepsDefault) {
-    // Unparseable value → default -1 (safe degradation, no error).
+TEST(NodeConfig, WorkerCoreBaseUnparsableDisables) {
+    // Unparseable value → -1 DISABLED (no error); never the auto layout, which
+    // would turn on a busy-spin from garbage input.
     auto base = base1node();
     base["RUNE_WORKER_CORE_BASE"] = "notanumber";
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->workerCoreBase, NodeConfig::kWorkerCoreBaseAuto)
-        << "unparseable RUNE_WORKER_CORE_BASE must keep the (auto) default";
+    EXPECT_EQ(res.config->workerCoreBase, -1)
+        << "unparseable RUNE_WORKER_CORE_BASE must disable pinning";
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,13 +1593,13 @@ TEST(NodeConfig, ParsesAeronTermSparse) {
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
-        EXPECT_FALSE(res.config->aeronTermBufferSparse) << "default: non-sparse (findings §4)";
+        EXPECT_FALSE(res.config->aeronTermBufferSparse.has_value()) << "default: derived (non-sparse on tmpfs)";
     }
     {
         auto kv = base; kv["RUNE_AERON_TERM_SPARSE"] = "false";
         auto res = rune::node::parseNodeConfig(fakeEnv(kv));
         ASSERT_TRUE(res.config.has_value()) << res.error;
-        EXPECT_FALSE(res.config->aeronTermBufferSparse);
+        EXPECT_EQ(res.config->aeronTermBufferSparse, false);
     }
     {
         auto kv = base; kv["RUNE_AERON_TERM_SPARSE"] = "maybe";
@@ -1972,7 +1973,7 @@ TEST(NodeConfig, DefaultsAreShardFusedAndValidOnceDerived) {
     EXPECT_FALSE(r.config->workerIngressBasePort.has_value()) << "not set by the env → derived later";
     NodeConfig c = *r.config;
     HostNetFacts f; f.platform = HostPlatform::Linux; f.rmemMax = f.wmemMax = 16 << 20;
-    applyHostDerivedDefaults(c, f, 4);
+    applyHostDerivedDefaults(c, f);
     EXPECT_TRUE(c.workerIngressBasePort.has_value());
     EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
     // Legacy stays selectable and valid.
@@ -2039,9 +2040,10 @@ TEST(NodeConfigRegression, UnknownRuntimePlacementIsParseError) {
     EXPECT_NE(r.error.find("RUNE_RUNTIME_PLACEMENT"), std::string::npos);
 }
 
-TEST(NodeConfigRegression, PeerEntryWithSixPortsRejected) {
+TEST(NodeConfigRegression, PeerEntryWithSevenPortsRejected) {
+    // 6 segments are valid since 2026-10-02 (6th = egressControlBasePort).
     auto env = base3node();
-    env["RUNE_PEERS"] = "0@h:1:2:3:4:5:6,1@h:11,2@h:12";
+    env["RUNE_PEERS"] = "0@h:1:2:3:4:5:6:7,1@h:11,2@h:12";
     auto r = parseNodeConfig(fakeEnv(env));
     EXPECT_FALSE(r.config.has_value());
 }

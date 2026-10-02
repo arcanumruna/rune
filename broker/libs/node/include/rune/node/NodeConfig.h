@@ -152,6 +152,11 @@ struct PeerConfig {
     // ingressBasePort + w (client produce).  0 = not advertised (legacy peers).
     uint16_t replBasePort    = 0;
     uint16_t ingressBasePort = 0;
+    // 2026-10-02: the peer's per-worker dynamic-MDC egress-control base (worker w
+    // = base + w) — advertised to clients in MetadataResponse for partitions this
+    // peer LEADS.  6th RUNE_PEERS segment; 0 = not advertised (derived at start
+    // in shard mode, HostDefaults.h).
+    uint16_t egressControlBasePort = 0;
 
     /// "aeron:udp?endpoint=<host>:<consensusPort>"
     std::string consensusChannel() const;
@@ -489,9 +494,12 @@ struct NodeConfig {
     //     RUNE_AERON_TERM_SPARSE=true|false.  Sparse terms page-fault on the first
     //     write to every page (measured ~15% of a loaded shard thread) and turn a
     //     full tmpfs into a mid-run SIGBUS; non-sparse moves both to publication
-    //     creation (a full tmpfs then fails the create, loudly).  Default false
-    //     (findings §4 SPARSE: 73–79k → 100–105k rec/s).
-    bool    aeronTermBufferSparse        = false;
+    //     creation (a full tmpfs then fails the create, loudly).  Default
+    //     nullopt = DERIVED at start: non-sparse when the Aeron dir is on tmpfs
+    //     (findings §4 SPARSE: 73–79k → 100–105k rec/s), sparse on a disk-backed
+    //     dir (pre-allocation would zero-fill 48 MiB per log to disk on the
+    //     conductor thread).
+    std::optional<bool> aeronTermBufferSparse;
 
     //   - Aeron sender/receiver batching per syscall (0 = Aeron default 2; 1..16).
     //     RUNE_AERON_MAX_MSGS_PER_SEND  -> network_publication_max_messages_per_send

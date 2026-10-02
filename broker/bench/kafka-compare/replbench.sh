@@ -34,7 +34,7 @@ VBYTES="${REPL_VBYTES:-256}"
 LINGER_US="${REPL_LINGER_US:-200}"     # batching: >0 so records coalesce into batches
 BATCH_BYTES="${REPL_BATCH_BYTES:-1048576}"   # 1 MiB batch cap
 WARMUP_N="${REPL_WARMUP:-50000}"
-# large buffers (override cluster.sh defaults of 32 MiB)
+# large buffers (64 MiB; cluster.sh passes nothing → broker defaults otherwise)
 export RUNE_AERON_TERM_BUFFER_BYTES="${RUNE_AERON_TERM_BUFFER_BYTES:-67108864}"    # 64 MiB
 export RUNE_WORKER_INGRESS_RING_BYTES="${RUNE_WORKER_INGRESS_RING_BYTES:-67108864}"
 export RUNE_WORKER_RETURN_RING_BYTES="${RUNE_WORKER_RETURN_RING_BYTES:-67108864}"
@@ -42,6 +42,9 @@ export RUNE_FS_LOG=0   # explicit off; "0" (= unset) is also the default (RUNE_F
 if [ "${RUNE_SHARD:-0}" = "1" ]; then
   export RUNE_SHARD RUNE_RUNTIME_PLACEMENT="${RUNE_RUNTIME_PLACEMENT:-fused}"
 else
+  # Shard + fused is the broker DEFAULT since 2026-10-02: a non-shard run is
+  # legacy + thread placement, explicitly (comparable with earlier results).
+  export RUNE_WORKER_MODE=legacy RUNE_RUNTIME_PLACEMENT=thread
   export RUNE_WORKER_IDLE=backoff RUNE_RUNTIME_IDLE=backoff
 fi
 export RUNE_BROKER_BIN=/root/rune-e5/rune-broker/build-linux/rune_broker

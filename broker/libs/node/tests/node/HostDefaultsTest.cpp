@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <map>
 #include <set>
 #include <string>
@@ -53,6 +54,11 @@ void expectDriverValid(const AeronTransportDerived& d, int64_t sndCap, int64_t r
     EXPECT_LE(d.mtuBytes, d.rcvWindowBytes) << ctx << " mtu > window → receive endpoint EINVAL";
     EXPECT_LE(d.rcvWindowBytes, rcvCap) << ctx << " window > SO_RCVBUF → aeron_driver_init EINVAL";
 }
+void expectReceiverValid(const AeronTransportDerived& d, int64_t term, const std::string& ctx) {
+    // Aeron's receiver window is min(window, term/2); the receive endpoint
+    // refuses an image whose sender mtu exceeds it (review I5).
+    EXPECT_LE(d.mtuBytes, std::min<int64_t>(d.rcvWindowBytes, term / 2)) << ctx;
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -93,12 +99,12 @@ TEST(HostDefaults, UnknownInterfaceMtuFallsBackToAeronDefault) {
 }
 
 TEST(HostDefaults, TinyRmemMaxCapsBufferWarnsWithExactSysctlsAndStaysValid) {
-    // Stock Ubuntu: rmem_max = wmem_max = 212992.
+    // Stock Ubuntu: rmem_max = wmem_max = 212992 (the kernel doubles: 425984 real).
     const auto d = deriveAeronTransport(linuxFacts(true, 0, 212992, 212992), autoReq());
     EXPECT_EQ(d.socketBufferBytes, 212992);
     EXPECT_TRUE(d.socketBufferCapped);
-    EXPECT_EQ(d.rcvWindowBytes, 32768);     // pow2floor(min(4 MiB, 212992/4 = 53248, 8 MiB))
-    EXPECT_EQ(d.mtuBytes, 8192);            // <= window/4
+    EXPECT_EQ(d.rcvWindowBytes, 65536);     // pow2floor(min(4 MiB, 425984/4 = 106496, 8 MiB))
+    EXPECT_EQ(d.mtuBytes, 16384);           // <= window/4
     for (const char* line : {"net.core.rmem_max=16777216", "net.core.wmem_max=16777216",
                              "net.core.rmem_default=16777216", "net.core.wmem_default=16777216",
                              "net.core.netdev_max_backlog=100000"})
@@ -110,7 +116,7 @@ TEST(HostDefaults, AsymmetricLimitsUseTheSmaller) {
     const auto d = deriveAeronTransport(linuxFacts(true, 0, 16 * MiB, 1 * MiB), autoReq());
     EXPECT_EQ(d.socketBufferBytes, 1 * MiB);
     EXPECT_TRUE(d.socketBufferCapped);
-    EXPECT_EQ(d.rcvWindowBytes, 256 * 1024);
+    EXPECT_EQ(d.rcvWindowBytes, 512 * 1024);   // (2 x 1 MiB kernel) / 4
     expectDriverValid(d, 1 * MiB, 1 * MiB, "asymmetric");
 }
 
@@ -204,13 +210,32 @@ TEST(HostDefaults, ExplicitUnalignedMtuIsAlignedDownLoudly) {
     EXPECT_FALSE(d.warnings.empty());
 }
 
-TEST(HostDefaults, ExplicitSocketBufferAboveTheSysctlWarns) {
+TEST(HostDefaults, ExplicitSocketBufferAboveTheOsLimitIsClampedLoudly) {
     AeronTransportRequest r = autoReq();
     r.socketBufferBytes = 16 * MiB;
     const auto d = deriveAeronTransport(linuxFacts(true, 0, 212992, 212992), r);
-    EXPECT_EQ(d.socketBufferBytes, 16 * MiB);   // kept (the kernel caps it)
+    EXPECT_EQ(d.socketBufferBytes, 212992);
     EXPECT_NE(d.warnings.find("net.core.rmem_max=16777216"), std::string::npos) << d.warnings;
     expectDriverValid(d, 212992, 212992, "explicit buffer > sysctl");
+    // macOS REFUSES (not caps) a setsockopt above kern.ipc.maxsockbuf and keeps
+    // the 9216 default → the clamp is what keeps aeron_driver_init valid (I4).
+    const auto m = deriveAeronTransport(macFacts(8 * MiB), r);
+    EXPECT_EQ(m.socketBufferBytes, 8 * MiB);
+    EXPECT_NE(m.warnings.find("kern.ipc.maxsockbuf"), std::string::npos) << m.warnings;
+}
+
+TEST(HostDefaults, MtuNeverExceedsTheReceiversTermHalfWindow) {
+    // Review I5: explicit 4 MiB window + 64 KiB term: Aeron's receiver window is
+    // min(4 MiB, 32 KiB) — a 65504 MTU would be refused by every receiver.
+    AeronTransportRequest r = autoReq(64 * 1024);
+    r.rcvWindowBytes = 4 * MiB;
+    const auto d = deriveAeronTransport(linuxFacts(true, 0, 16 * MiB, 16 * MiB), r);
+    expectReceiverValid(d, 64 * 1024, "explicit window, small term");
+    EXPECT_LE(d.mtuBytes, 8192);
+    r.mtuBytes = 65504;   // explicit too: clamped loudly
+    const auto e = deriveAeronTransport(linuxFacts(true, 0, 16 * MiB, 16 * MiB), r);
+    expectReceiverValid(e, 64 * 1024, "explicit window + mtu, small term");
+    EXPECT_FALSE(e.warnings.empty());
 }
 
 // Exhaustive sweep: whatever the host and whatever is explicit, the driver
@@ -246,14 +271,17 @@ TEST(HostDefaults, SweepNeverProducesAnInvalidDriverConfig) {
                                 " term=" + std::to_string(term) + " m=" + std::to_string(m) +
                                 " b=" + std::to_string(b) + " w=" + std::to_string(w) + " lo=" + std::to_string(lo);
         expectDriverValid(d, sndCap, rcvCap, ctx);
+        expectReceiverValid(d, term, ctx);
         if (b == kAeronAuto) EXPECT_LE(d.socketBufferBytes, 16 * MiB) << ctx;
         if (w == kAeronAuto) {
             EXPECT_TRUE(isPow2(d.rcvWindowBytes)) << ctx;
             EXPECT_LE(d.rcvWindowBytes, 4 * MiB) << ctx;
             EXPECT_LE(d.rcvWindowBytes, std::max<int64_t>(term / 2, 64)) << ctx;
-            if (b == kAeronAuto) EXPECT_LE(d.rcvWindowBytes, std::max<int64_t>(d.socketBufferBytes / 4, 64)) << ctx;
+            const int64_t kernel = (plat == HostPlatform::Linux ? 2 : 1) * int64_t{d.socketBufferBytes};
+            if (b == kAeronAuto) EXPECT_LE(d.rcvWindowBytes, std::max<int64_t>(kernel / 4, 64)) << ctx;
         }
-        if (m == kAeronAuto && w == kAeronAuto) EXPECT_LE(d.mtuBytes, std::max(d.rcvWindowBytes / 4, 64)) << ctx;
+        if (m == kAeronAuto && w == kAeronAuto)
+            EXPECT_LE(d.mtuBytes, std::max<int64_t>(std::min<int64_t>(d.rcvWindowBytes, term / 2) / 4, 64)) << ctx;
         if (::testing::Test::HasFailure()) return;
         ++cases;
     }
@@ -270,14 +298,20 @@ TEST(HostDefaults, LoopbackAndWildcardHosts) {
     EXPECT_FALSE(isWildcardHost("127.0.0.1"));
 }
 
-TEST(HostDefaults, EndpointHostsFollowPeersForAWildcardClientBind) {
+TEST(HostDefaults, EndpointHostsTreatAWildcardClientBindAsNonLoopback) {
     NodeConfig c;
     c.nodeId = 0;
     PeerConfig p0; p0.id = 0; p0.host = "127.0.0.1";
     PeerConfig p1; p1.id = 1; p1.host = "127.0.0.1";
     c.peers = {p0, p1};
-    c.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:40200";
+    c.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:40200";
     EXPECT_EQ(nodeEndpointHosts(c), std::vector<std::string>{"127.0.0.1"});
+    // Review I2: a wildcard bind accepts REMOTE clients → never loopback.
+    c.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:40200";
+    EXPECT_EQ(nodeEndpointHosts(c), (std::vector<std::string>{"127.0.0.1", "0.0.0.0"}));
+    bool lo = true;
+    for (const auto& h : nodeEndpointHosts(c)) lo = lo && isLoopbackHost(h);
+    EXPECT_FALSE(lo);
     c.clientEndpoint.channel = "aeron:udp?endpoint=10.0.0.5:40200";
     EXPECT_EQ(nodeEndpointHosts(c), (std::vector<std::string>{"127.0.0.1", "10.0.0.5"}));
 }
@@ -319,23 +353,44 @@ TEST(HostDefaults, DerivedShardPortsAreDisjointAcrossCoLocatedNodes) {
     EXPECT_FALSE(deriveShardBasePorts(0, 65)) << "> kMaxShardWorkers";
 }
 
-TEST(HostDefaults, CoreBaseIsTheBenchLayoutOnLinuxOnly) {
-    // 3 co-located nodes x 1 worker on 4 cores → cores 1, 2, 3 (cluster.sh RUNE_SHARD=1).
+TEST(HostDefaults, CoreBaseIsTheBenchLayoutOnlyForAVisibleCoLocatedCluster) {
+    const std::vector<int32_t> four{0, 1, 2, 3};
+    // 3 co-located (loopback) nodes x 1 worker on 4 cores → cores 1, 2, 3 (cluster.sh RUNE_SHARD=1).
     for (int32_t i = 0; i < 3; ++i)
-        EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, i, 3, 1, 4), 1 + i);
-    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 1, 3, 2, 8), 3);
-    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 0, 3, 1, 3), -1) << "does not fit";
-    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 0, 3, 2, 6), -1) << "does not fit";
-    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, false, 2, 3, 2, 4), 1) << "one node per host";
-    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, false, 0, 3, 4, 4), -1);
-    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::MacOS, true, 0, 3, 1, 16), -1) << "no affinity on macOS";
-    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Other, false, 0, 1, 1, 16), -1);
+        EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, i, 3, 1, four), 1 + i);
+    const std::vector<int32_t> eight{0, 1, 2, 3, 4, 5, 6, 7};
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 1, 3, 2, eight), 3);
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 0, 3, 1, {0, 1, 2}), -1) << "does not fit";
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 0, 1, 1, {0, 1}), 1) << "single loopback node";
+    // Review I1: the affinity MASK, not the online count; consecutive per node.
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 2, 3, 1, {4, 5, 6, 7}), 7);
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 0, 1, 2, {0, 2, 3}), 2);
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 0, 1, 2, {0, 1, 3}), -1) << "not consecutive";
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, true, 0, 1, 1, {}), -1) << "unknown mask";
+    // Non-loopback (containers on one VM look like dedicated hosts) → never auto-pinned.
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Linux, false, 0, 3, 1, eight), -1);
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::MacOS, true, 0, 3, 1, eight), -1) << "no affinity on macOS";
+    EXPECT_EQ(deriveWorkerCoreBase(HostPlatform::Other, true, 0, 1, 1, eight), -1);
+}
+
+TEST(HostDefaults, TermsAreNonSparseOnlyOnTmpfs) {
+    EXPECT_FALSE(deriveTermSparse(std::nullopt, /*tmpfs*/true));
+    EXPECT_TRUE(deriveTermSparse(std::nullopt, false)) << "disk-backed dir: no 48 MiB zero-fill per log";
+    EXPECT_TRUE(deriveTermSparse(true, true)) << "explicit wins";
+    EXPECT_FALSE(deriveTermSparse(false, false)) << "explicit wins";
 }
 
 // ---------------------------------------------------------------------------
 // applyHostDerivedDefaults
 // ---------------------------------------------------------------------------
 namespace {
+/// k3s-node-01: Linux, 4 CPUs, sysctls at 16 MiB, Aeron dir on /dev/shm.
+HostNetFacts k3sFacts() {
+    HostNetFacts f = linuxFacts(true, 0, 16 * MiB, 16 * MiB);
+    f.allowedCpus = {0, 1, 2, 3};
+    f.aeronDirTmpfs = true;
+    return f;
+}
 NodeConfig threeNodeDefault(int32_t self) {
     NodeConfig c;
     c.nodeId = self;
@@ -347,7 +402,7 @@ NodeConfig threeNodeDefault(int32_t self) {
         p.replicationPort = static_cast<uint16_t>(40220 + i);
         c.peers.push_back(p);
     }
-    c.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:" + std::to_string(40200 + self);
+    c.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(40200 + self);
     return c;
 }
 } // namespace
@@ -358,7 +413,7 @@ TEST(HostDefaults, DefaultConfigIsShardFusedWithTheFindingsSizes) {
     EXPECT_TRUE(c.fused());
     EXPECT_EQ(c.workerCount, 1);
     EXPECT_EQ(c.aeronTermBufferBytes, 16 * MiB);
-    EXPECT_FALSE(c.aeronTermBufferSparse);
+    EXPECT_FALSE(c.aeronTermBufferSparse.has_value()) << "derived (non-sparse on tmpfs)";
     EXPECT_EQ(c.replicationOutboundRingBytes, 32 * MiB);
     EXPECT_EQ(c.workerIngressRingBytes, 32 * MiB);
     EXPECT_EQ(c.workerReturnRingBytes, 32 * MiB);
@@ -372,11 +427,12 @@ TEST(HostDefaults, ApplyOnTheK3sBoxGivesExactlyTheTunedConfig) {
     // k3s-node-01: Linux, 4 cores, sysctls at 16 MiB, 3 co-located nodes.
     for (int32_t self = 0; self < 3; ++self) {
         NodeConfig c = threeNodeDefault(self);
-        const auto hd = applyHostDerivedDefaults(c, linuxFacts(true, 0, 16 * MiB, 16 * MiB), 4);
+        const auto hd = applyHostDerivedDefaults(c, k3sFacts());
         EXPECT_EQ(c.aeronMtuBytes, 65504);
         EXPECT_EQ(c.aeronSocketBufferBytes, 16 * MiB);
         EXPECT_EQ(c.aeronRcvWindowBytes, 4 * MiB);
         EXPECT_EQ(c.workerCoreBase, 1 + self);
+        EXPECT_EQ(c.aeronTermBufferSparse, false) << "tmpfs → non-sparse (findings §4)";
         EXPECT_TRUE(c.perWorkerIngressEnabled && c.perWorkerReplication && c.perWorkerEgressEnabled);
         const auto p = deriveShardBasePorts(self, 1);
         EXPECT_EQ(c.workerIngressBasePort, p->ingress);
@@ -386,6 +442,7 @@ TEST(HostDefaults, ApplyOnTheK3sBoxGivesExactlyTheTunedConfig) {
             const auto pp = deriveShardBasePorts(peer.id, 1);
             EXPECT_EQ(peer.ingressBasePort, pp->ingress);
             EXPECT_EQ(peer.replBasePort, pp->repl);
+            EXPECT_EQ(peer.egressControlBasePort, pp->egressControl) << "advertised to clients (B1)";
         }
         EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
         EXPECT_TRUE(hd.warnings.empty()) << hd.warnings;
@@ -406,9 +463,11 @@ TEST(HostDefaults, ApplyKeepsEveryExplicitValueAndIsIdempotent) {
     for (auto& p : c.peers) {
         p.ingressBasePort = static_cast<uint16_t>(40500 + 20 * p.id);
         p.replBasePort = static_cast<uint16_t>(40600 + 20 * p.id);
+        p.egressControlBasePort = static_cast<uint16_t>(40400 + 20 * p.id);
     }
+    c.aeronTermBufferSparse = true;
     const NodeConfig before = c;
-    applyHostDerivedDefaults(c, linuxFacts(true, 0, 16 * MiB, 16 * MiB), 4);
+    applyHostDerivedDefaults(c, k3sFacts());
     EXPECT_EQ(c.aeronMtuBytes, 8192);
     EXPECT_EQ(c.aeronSocketBufferBytes, 4 * MiB);
     EXPECT_EQ(c.aeronRcvWindowBytes, 1 * MiB);
@@ -416,6 +475,7 @@ TEST(HostDefaults, ApplyKeepsEveryExplicitValueAndIsIdempotent) {
     EXPECT_EQ(c.workerIngressBasePort, 40520);
     EXPECT_EQ(c.workerReplBasePort, 40620);
     EXPECT_EQ(c.workerEgressControlBasePort, 40420);
+    EXPECT_EQ(c.aeronTermBufferSparse, true);
     for (std::size_t i = 0; i < c.peers.size(); ++i) {
         EXPECT_EQ(c.peers[i].ingressBasePort, before.peers[i].ingressBasePort);
         EXPECT_EQ(c.peers[i].replBasePort, before.peers[i].replBasePort);
@@ -423,7 +483,7 @@ TEST(HostDefaults, ApplyKeepsEveryExplicitValueAndIsIdempotent) {
     EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
     // Idempotent: a second apply changes nothing.
     NodeConfig again = c;
-    applyHostDerivedDefaults(again, linuxFacts(true, 0, 16 * MiB, 16 * MiB), 4);
+    applyHostDerivedDefaults(again, k3sFacts());
     EXPECT_EQ(again.aeronMtuBytes, c.aeronMtuBytes);
     EXPECT_EQ(again.aeronRcvWindowBytes, c.aeronRcvWindowBytes);
     EXPECT_EQ(again.workerIngressBasePort, c.workerIngressBasePort);
@@ -438,17 +498,48 @@ TEST(HostDefaults, SelfPortsComeFromItsAdvertisedPeerEntry) {
         p.ingressBasePort = static_cast<uint16_t>(40500 + 20 * p.id);
         p.replBasePort = static_cast<uint16_t>(40600 + 20 * p.id);
     }
-    applyHostDerivedDefaults(c, linuxFacts(true, 0, 16 * MiB, 16 * MiB), 4);
+    applyHostDerivedDefaults(c, k3sFacts());
     EXPECT_EQ(c.workerIngressBasePort, 40540);
     EXPECT_EQ(c.workerReplBasePort, 40640);
     EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
+}
+
+TEST(HostDefaults, ExplicitSelfBaseNotAdvertisedInPeersRefusesStart) {
+    // Review I3: RUNE_WORKER_INGRESS_BASE_PORT set, RUNE_PEERS silent → every
+    // OTHER node derives 41000+192*id for this node; refuse instead of silently
+    // routing peers / clients to a port nobody binds.
+    NodeConfig c = threeNodeDefault(1);
+    c.workerIngressBasePort = 40520;
+    applyHostDerivedDefaults(c, k3sFacts());
+    const auto err = c.validateShardConfig();
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("advertise it in RUNE_PEERS"), std::string::npos) << *err;
+    NodeConfig e = threeNodeDefault(1);
+    e.workerEgressControlBasePort = 40420;
+    applyHostDerivedDefaults(e, k3sFacts());
+    const auto eerr = e.validateShardConfig();
+    ASSERT_TRUE(eerr.has_value()) << "egress control base unadvertised";
+    EXPECT_NE(eerr->find("6th RUNE_PEERS segment"), std::string::npos) << *eerr;
+}
+
+TEST(HostDefaults, EveryNodeComputesTheSamePeerBases) {
+    // B1/I3: node A's view of node B's bases == node B's own effective bases.
+    std::array<NodeConfig, 3> v{threeNodeDefault(0), threeNodeDefault(1), threeNodeDefault(2)};
+    for (auto& c : v) applyHostDerivedDefaults(c, k3sFacts());
+    for (const auto& viewer : v)
+        for (const auto& p : viewer.peers) {
+            const NodeConfig& owner = v[static_cast<std::size_t>(p.id)];
+            EXPECT_EQ(p.ingressBasePort, *owner.workerIngressBasePort);
+            EXPECT_EQ(p.replBasePort, *owner.workerReplBasePort);
+            EXPECT_EQ(p.egressControlBasePort, owner.effectiveWorkerEgressControlBasePort());
+        }
 }
 
 TEST(HostDefaults, LegacyModeIsUntouchedApartFromTransport) {
     NodeConfig c = threeNodeDefault(0);
     c.workerMode = NodeConfig::WorkerMode::Legacy;
     c.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
-    applyHostDerivedDefaults(c, linuxFacts(true, 0, 16 * MiB, 16 * MiB), 4);
+    applyHostDerivedDefaults(c, k3sFacts());
     EXPECT_EQ(c.workerCoreBase, -1) << "legacy never auto-pins";
     EXPECT_FALSE(c.workerIngressBasePort.has_value());
     EXPECT_FALSE(c.perWorkerIngressEnabled);
@@ -458,11 +549,12 @@ TEST(HostDefaults, LegacyModeIsUntouchedApartFromTransport) {
 
 TEST(HostDefaults, MacHostAppliesTheCappedBufferAndNoPinning) {
     NodeConfig c = threeNodeDefault(0);
-    const auto hd = applyHostDerivedDefaults(c, macFacts(8 * MiB), 12);
+    const auto hd = applyHostDerivedDefaults(c, macFacts(8 * MiB));
     EXPECT_EQ(c.aeronSocketBufferBytes, 8 * MiB);
     EXPECT_EQ(c.aeronRcvWindowBytes, 2 * MiB);
     EXPECT_EQ(c.aeronMtuBytes, 65504);
     EXPECT_EQ(c.workerCoreBase, -1);
+    EXPECT_EQ(c.aeronTermBufferSparse, true) << "no tmpfs on macOS";
     EXPECT_TRUE(hd.socketBufferCapped);
     EXPECT_NE(hd.warnings.find("kern.ipc.maxsockbuf"), std::string::npos);
 }
@@ -482,7 +574,7 @@ TEST(HostDefaults, EnvOverridesSurviveTheDerivation) {
     });
     ASSERT_TRUE(r.config.has_value()) << r.error;
     NodeConfig c = *r.config;
-    applyHostDerivedDefaults(c, linuxFacts(true, 0, 16 * MiB, 16 * MiB), 4);
+    applyHostDerivedDefaults(c, k3sFacts());
     EXPECT_EQ(c.aeronMtuBytes, 1408);
     EXPECT_EQ(c.aeronRcvWindowBytes, 131072);
     EXPECT_EQ(c.aeronSocketBufferBytes, 2 * MiB);
@@ -497,7 +589,7 @@ TEST(HostDefaults, EnvWithNothingSetIsTheDerivedDefault) {
     std::map<std::string, std::string> env = {
         {"RUNE_NODE_ID", "1"},
         {"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220,1@127.0.0.1:40111:40201:40221,2@127.0.0.1:40112:40202:40222"},
-        {"RUNE_CLIENT_ENDPOINT", "0.0.0.0:40201"}, {"RUNE_DATA_DIR", "/tmp/hd"}};
+        {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40201"}, {"RUNE_DATA_DIR", "/tmp/hd"}};
     auto r = parseNodeConfig([&](const char* k) -> const char* {
         auto it = env.find(k);
         return it == env.end() ? nullptr : it->second.c_str();
@@ -506,7 +598,7 @@ TEST(HostDefaults, EnvWithNothingSetIsTheDerivedDefault) {
     NodeConfig c = *r.config;
     EXPECT_TRUE(c.shardMode());
     EXPECT_TRUE(c.fused());
-    applyHostDerivedDefaults(c, linuxFacts(true, 0, 16 * MiB, 16 * MiB), 4);
+    applyHostDerivedDefaults(c, k3sFacts());
     EXPECT_EQ(c.workerCoreBase, 2);
     EXPECT_EQ(c.aeronMtuBytes, 65504);
     EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
@@ -553,4 +645,27 @@ TEST(HostDefaults, PlatformDefaultIoBackendIsAutoSelected) {
 #endif
     IoBackend b(64, 64);
     EXPECT_TRUE(b.acceptsSubmissions()) << "the default backend always works (uring or its fallback)";
+}
+
+// Review I8 / M7: garbage never becomes a crippling MTU or a busy-spin.
+TEST(HostDefaults, InvalidMtuIsRefusedAndGarbageCoreBaseDisables) {
+    auto parse = [](std::map<std::string, std::string> extra) {
+        std::map<std::string, std::string> env = {
+            {"RUNE_NODE_ID", "0"}, {"RUNE_PEERS", "0@127.0.0.1:40110"},
+            {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"}};
+        for (auto& [k, v] : extra) env[k] = v;
+        return parseNodeConfig([env](const char* k) -> const char* {
+            auto it = env.find(k);
+            return it == env.end() ? nullptr : it->second.c_str();
+        });
+    };
+    for (const char* bad : {"0", "-5", "32", "65505", "abc"})
+        EXPECT_FALSE(parse({{"RUNE_AERON_MTU", bad}}).config.has_value()) << bad;
+    EXPECT_EQ(parse({{"RUNE_AERON_MTU", "8192"}}).config->aeronMtuBytes, 8192);
+    EXPECT_EQ(parse({{"RUNE_WORKER_CORE_BASE", "notanumber"}}).config->workerCoreBase, -1);
+    // 6th RUNE_PEERS segment: the egress-control base.
+    auto r = parse({{"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220:40600:40500:40400"}});
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->peers[0].egressControlBasePort, 40400);
+    EXPECT_FALSE(parse({{"RUNE_PEERS", "0@127.0.0.1:1:2:3:4:5:6:7"}}).config.has_value()) << "max 6 segments";
 }

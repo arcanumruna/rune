@@ -15,15 +15,31 @@
 //
 // Aeron transport rules (all sizes bytes):
 //   socketBuffer = min(16 MiB, OS max SO_RCVBUF/SO_SNDBUF)  — capped → loud WARN
-//   rcvWindow    = pow2floor(min(4 MiB, socketBuffer/4, term/2))
-//                  (64 KiB datagrams: kernel truesize makes a window near
-//                  SO_RCVBUF drop packets — 16 MiB window measured 98 % drops)
-//   mtu          = 65504 on loopback, else interface MTU − IP/UDP headers,
-//                  aligned down to 32; then clamped ≤ socketBuffer (aeron_driver_init
-//                  EINVALs when mtu > SO_SNDBUF — the macOS lesson) and ≤ window/4.
+//   rcvWindow    = pow2floor(min(4 MiB, kernelRcvBuf/4, term/2)); kernelRcvBuf =
+//                  2 × socketBuffer on Linux (the kernel doubles SO_RCVBUF), 1× else
+//                  (64 KiB datagrams: kernel truesize makes a window near the
+//                  real SO_RCVBUF drop packets — a 16 MiB window on a 16 MiB
+//                  sysctl measured 98 % drops; 4 MiB measured clean)
+//   mtu          = 65504 when every endpoint is loopback (a wildcard client bind
+//                  is NOT loopback: remote clients would get 64 KiB datagrams),
+//                  else interface MTU − IP/UDP headers, aligned down to 32; then
+//                  clamped ≤ socketBuffer (aeron_driver_init EINVALs when mtu >
+//                  SO_SNDBUF — the macOS lesson), ≤ the receiver's effective window
+//                  min(window, term/2) and (derived only) ≤ window/4 (≥ 4 datagrams
+//                  in flight — a deliberate addition to findings §4: it only binds
+//                  on hosts with small socket limits).
 //   Explicit values are kept but CLAMPED (with a WARN) where they would make
 //   aeron_driver_init / the receive endpoint fail: mtu ≤ SO_SNDBUF cap and ≤
-//   window; window ≤ SO_RCVBUF cap.  A config can never reach the driver EINVAL.
+//   min(window, term/2); window ≤ SO_RCVBUF cap; an explicit socket buffer above
+//   the OS limit is clamped to it.  A config can never reach the driver EINVAL.
+//
+// Term buffers are non-sparse (findings §4) only when the Aeron dir is on tmpfs;
+// on a disk-backed dir, pre-allocating 3 × 16 MiB per publication would zero-fill
+// to disk on the (fused: hot) conductor thread, so they stay sparse there.
+//
+// Derived ports/cores carry the usual caveat: 41000–65383 lie inside the Linux and
+// macOS ephemeral ranges (as do Rune's other default ports), so a rare ephemeral
+// socket can win a bind; production deployments pin explicit ports.
 #include <rune/node/NodeConfig.h>
 
 #include <cstdint>
@@ -65,6 +81,11 @@ inline constexpr int32_t kIpv6UdpHeaderBytes       = 40 + 8;
 /// (what Aeron validates against when the socket buffer is left at 0 = OS default).
 struct HostNetFacts {
     HostPlatform platform      = HostPlatform::Other;
+    /// CPUs this process may run on (Linux sched_getaffinity; empty = unknown →
+    /// never auto-pin).  Sorted ascending.
+    std::vector<int32_t> allowedCpus;
+    /// The Aeron dir (or its nearest existing ancestor) is on tmpfs.
+    bool         aeronDirTmpfs = false;
     bool         loopback      = true;    ///< every Aeron endpoint is a loopback address
     bool         ipv6          = false;   ///< non-loopback endpoints are IPv6
     int32_t      interfaceMtu  = 0;       ///< egress interface MTU (0 = unknown)
@@ -112,14 +133,23 @@ inline constexpr int32_t kDerivedShardPortStride = 3 * NodeConfig::kMaxShardWork
 [[nodiscard]] std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t workers) noexcept;
 
 /// Worker affinity (= busy-spin, BrokerNode): the bench layout as a host-derived
-/// default.  Linux only (affinity is a no-op elsewhere, and an unpinned busy-spin
-/// is never wanted).  Core 0 is left to the client / OS / every other thread.
-///   co-located (all endpoints loopback): node at index i of the sorted peer list
-///     gets cores 1 + i*W .. 1 + i*W + W-1, if 1 + nodes*W <= cores;
-///   otherwise (one node per host): cores 1 .. W, if 1 + W <= cores.
-/// Returns -1 (unpinned → backoff idle) when the layout does not fit.
-[[nodiscard]] int32_t deriveWorkerCoreBase(HostPlatform platform, bool coLocated, int32_t selfIndex,
-                                           int32_t nodes, int32_t workers, int32_t cores) noexcept;
+/// default.  Only where every node is VISIBLE on this host — all peers loopback
+/// (a co-located cluster, the bench): node at index i of the sorted peer list gets
+/// the allowed CPUs [1 + i*W, 1 + i*W + W) of the process affinity mask (index 0
+/// is left to the client / OS / every other thread), if those W CPUs exist and are
+/// consecutive.  Linux only (affinity is a no-op elsewhere and an unpinned
+/// busy-spin is never wanted).  Non-loopback deployments return -1: containers
+/// sharing one VM look exactly like dedicated hosts, and auto-pinning them would
+/// busy-spin several nodes on one core — pin explicitly (RUNE_WORKER_CORE_BASE).
+/// Returns -1 (unpinned → backoff idle) whenever the layout does not fit.
+[[nodiscard]] int32_t deriveWorkerCoreBase(HostPlatform platform, bool allLoopback, int32_t selfIndex,
+                                           int32_t nodes, int32_t workers,
+                                           const std::vector<int32_t>& allowedCpus) noexcept;
+
+/// Non-sparse terms only on tmpfs (see header).  `explicitSparse` wins.
+[[nodiscard]] constexpr bool deriveTermSparse(std::optional<bool> explicitSparse, bool aeronDirTmpfs) noexcept {
+    return explicitSparse ? *explicitSparse : !aeronDirTmpfs;
+}
 
 /// Applies every host-derived default to `cfg` (idempotent; explicit values win):
 /// Aeron mtu / socket buffer / window, shard base ports (self + peers lacking
@@ -130,19 +160,19 @@ struct HostDerivation {
     std::string warnings;             ///< "" = none
     bool        socketBufferCapped = false;
 };
-HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& facts, int32_t cores);
+HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& facts,
+                                        std::string_view ioBackend = "auto");
 
 /// Hosts this node's Aeron endpoints use: every peer host (self included) and
 /// the client bind host.  A wildcard client bind (0.0.0.0) follows the peers.
 [[nodiscard]] std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg);
 
-/// IMPURE: OS limits + the egress interface MTU for `endpointHosts` (empty =
-/// loopback).  Linux reads /proc/sys/net/core/{r,w}mem_max; macOS probes the
-/// SO_SNDBUF/SO_RCVBUF cap.  Never throws: unknown facts stay 0 (derivation then
-/// uses safe fallbacks).
-[[nodiscard]] HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts);
-
-/// IMPURE: online CPU count (>= 1).
-[[nodiscard]] int32_t hostCpuCount() noexcept;
+/// IMPURE: OS limits, the egress interface MTU for `endpointHosts` (empty =
+/// loopback; a wildcard host = the default route's interface), the process CPU
+/// affinity mask and whether `aeronDir` is on tmpfs.  Linux reads
+/// /proc/sys/net/core/{r,w}mem_max; macOS probes the SO_SNDBUF/SO_RCVBUF cap.
+/// Never throws: unknown facts stay 0 / empty (derivation then uses safe fallbacks).
+[[nodiscard]] HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts,
+                                             const std::string& aeronDir = {});
 
 } // namespace rune::node

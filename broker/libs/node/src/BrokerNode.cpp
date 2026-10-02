@@ -206,8 +206,10 @@ void BrokerNode::start() {
     // one line.  The line is emitted at WARN so it is visible in perf runs too
     // (RUNE_LOG_LEVEL=warn) — it proves which config a measurement ran.
     {
-        const auto facts = probeHostNetFacts(nodeEndpointHosts(config_));
-        const auto hd    = applyHostDerivedDefaults(config_, facts, hostCpuCount());
+        const auto facts = probeHostNetFacts(nodeEndpointHosts(config_), config_.effectiveAeronDir());
+        const char* io   = std::getenv(kIoBackendEnv);
+        const auto hd    = applyHostDerivedDefaults(config_, facts,
+                                                    (io && *io) ? std::string_view(io) : std::string_view("auto"));
         spdlog::warn("BrokerNode[{}]: effective config: {}", config_.nodeId, hd.summary);
         if (!hd.warnings.empty())
             spdlog::warn("BrokerNode[{}]: !!! TRANSPORT CONFIG WARNING: {}", config_.nodeId, hd.warnings);
@@ -1303,7 +1305,8 @@ void BrokerNode::buildWorkerPool() {
             std::vector<rune::gateway::ShardIngressEndpoint> eps;
             eps.reserve(config_.peers.size());
             for (const auto& peer : config_.peers)
-                eps.push_back({peer.id, peer.host, static_cast<int32_t>(peer.ingressBasePort)});
+                eps.push_back({peer.id, peer.host, static_cast<int32_t>(peer.ingressBasePort),
+                               static_cast<int32_t>(peer.egressControlBasePort)});
             gateway_->setShardIngressEndpoints(std::move(eps));
         }
     } else {

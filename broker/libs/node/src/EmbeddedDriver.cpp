@@ -30,13 +30,17 @@ namespace {
 /// BrokerNode already passes concrete values).  Clamps explicit values that
 /// aeron_driver_init would reject (never EINVAL at init).
 void resolveTransport(EmbeddedDriverConfig& c) {
-    const auto facts = probeHostNetFacts(c.endpointHosts);
+    const bool autoAny = c.mtuBytes == NodeConfig::kAeronAuto || c.socketBufferBytes == NodeConfig::kAeronAuto ||
+                         c.rcvWindowBytes == NodeConfig::kAeronAuto || !c.termBufferSparse;
+    if (!autoAny) return;   // BrokerNode passes resolved values: no second probe (M2)
+    const auto facts = probeHostNetFacts(c.endpointHosts, c.dir);
     AeronTransportRequest req;
     req.mtuBytes = c.mtuBytes; req.socketBufferBytes = c.socketBufferBytes;
     req.rcvWindowBytes = c.rcvWindowBytes; req.termBufferBytes = c.termBufferBytes;
     const auto d = deriveAeronTransport(facts, req);
     if (!d.warnings.empty()) spdlog::warn("EmbeddedDriver[{}]: {}", c.dir, d.warnings);
     c.mtuBytes = d.mtuBytes; c.socketBufferBytes = d.socketBufferBytes; c.rcvWindowBytes = d.rcvWindowBytes;
+    c.termBufferSparse = deriveTermSparse(c.termBufferSparse, facts.aeronDirTmpfs);
 }
 } // namespace
 
@@ -116,7 +120,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_set_client_liveness_timeout_ns(ctx_, static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
-    aeron_driver_context_set_term_buffer_sparse_file(ctx_, cfg_.termBufferSparse);
+    aeron_driver_context_set_term_buffer_sparse_file(ctx_, cfg_.termBufferSparse.value_or(true));
     if (cfg_.maxMessagesPerSend > 0)
         aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, static_cast<uint32_t>(cfg_.maxMessagesPerSend));
     if (cfg_.senderIoVector > 0)

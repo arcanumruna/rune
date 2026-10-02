@@ -114,6 +114,8 @@ struct ShardIngressEndpoint {
     int32_t     nodeId   = -1;
     std::string host;
     int32_t     basePort = 0;
+    /// The node's per-worker egress-control base (0 = unknown → this node's own).
+    int32_t     egressControlBasePort = 0;
 };
 
 // ---------------------------------------------------------------------------

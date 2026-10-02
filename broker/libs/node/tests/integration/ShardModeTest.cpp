@@ -97,11 +97,13 @@ NodeConfig makeShardConfig(int nodeId, const fs::path& dataDir, const ShardPorts
     cfg.workerIngressBaseStreamId = kIngressStream;
     cfg.gatewayMinIsr = nodes == 1 ? 1 : 2;
     cfg.aeronTermBufferBytes = 1 << 20;
+    cfg.workerCoreBase = -1;   // tests never auto-pin busy-spinning workers (ctest -j)
     for (int i = 0; i < nodes; ++i) {
         PeerConfig pc;
         pc.id = i; pc.host = "127.0.0.1";
         pc.consensusPort = p.cons[i]; pc.clientPort = p.client[i]; pc.replicationPort = p.repl[i];
         pc.replBasePort = p.rb[i]; pc.ingressBasePort = p.ib[i]; pc.workerCount = workers;
+        pc.egressControlBasePort = p.eg[i];   // advertised (clients dial the leader's)
         cfg.peers.push_back(pc);
     }
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
@@ -1015,12 +1017,14 @@ NodeConfig makeDefaultConfig(int nodeId, const fs::path& dataDir, const ShardPor
         // Deployment LAYOUT only (not tuning): the derived per-node-id shard
         // ports are fixed, so concurrent test processes would collide on them.
         pc.replBasePort = p.rb[i]; pc.ingressBasePort = p.ib[i];
+        pc.egressControlBasePort = p.eg[i];
         cfg.peers.push_back(pc);
     }
     cfg.workerIngressBasePort       = p.ib[nodeId];
     cfg.workerReplBasePort          = p.rb[nodeId];
     cfg.workerEgressControlBasePort = p.eg[nodeId];
     cfg.workerIngressBaseStreamId   = kIngressStream;
+    cfg.workerCoreBase              = -1;   // tests never auto-pin busy-spinning workers (ctest -j)
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
     cfg.clientEndpoint.streamId = kClientStream;
     TopicSpec t; t.name = "st"; t.partitionCount = 1; t.topicId = 0;
@@ -1094,6 +1098,22 @@ void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
             if (leader < 0) std::this_thread::sleep_for(50ms);
         }
         ASSERT_GE(leader, 0) << "no partition leader advertised";
+        // Review B1 (regression): metadata answered by ANY node advertises the
+        // LEADER's per-worker egress-control port (per-node bases differ).
+        for (int asker = 0; asker < nodes; ++asker) {
+            const int64_t s = c.connect(gatewayChannel(ports, asker), kClientStream);
+            ASSERT_GT(s, 0);
+            bool seen = false;
+            for (int i = 0; i < 200 && !seen; ++i) {
+                for (const auto& pi : c.metadata(gatewayChannel(ports, asker), kClientStream, s))
+                    if (pi.topicId == 0 && pi.partition == 0 && pi.leaderId == leader) {
+                        EXPECT_EQ(pi.egressControlPort, ports.eg[leader]) << "asked node " << asker;
+                        seen = true;
+                    }
+                if (!seen) std::this_thread::sleep_for(50ms);
+            }
+            EXPECT_TRUE(seen) << "node " << asker << " never advertised the leader";
+        }
         const std::string gw = gatewayChannel(ports, leader);
         const int64_t sid = c.connect(gw, kClientStream);
         ASSERT_GT(sid, 0);

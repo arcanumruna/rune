@@ -4678,6 +4678,11 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             if (!shardIngressEndpoints_.empty() && workerPool_) {
                 for (const auto& ep : shardIngressEndpoints_) {
                     if (ep.nodeId != entry.leaderNodeId) continue;
+                    // The client dials the egress control on the LEADER's host:
+                    // advertise the LEADER's base, not this (answering) node's
+                    // (per-node bases differ — review B1, 2026-10-02).
+                    if (perWorkerEgressActive_ && ep.egressControlBasePort > 0)
+                        p.egressControlPort = ep.egressControlBasePort + workerPool_->ownerWorkerId(topicId, partition);
                     if (ep.basePort > 0 && !ep.host.empty()) {
                         endpointStore.push_back(ep.host + ":" +
                             std::to_string(ep.basePort + workerPool_->ownerWorkerId(topicId, partition)));

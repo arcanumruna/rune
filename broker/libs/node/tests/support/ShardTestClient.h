@@ -69,6 +69,7 @@ inline std::vector<uint16_t> freeUdpPortBlocks(int n, int width) {
 struct PartitionInfo {
     int32_t topicId = 0, partition = 0, leaderId = -1, ingressStreamId = 0;
     std::string ingressEndpoint;
+    int32_t egressControlPort = 0;   ///< per-worker MDC egress control (leader host)
 };
 
 inline std::vector<uint8_t> makeBatch(int records) {
@@ -314,7 +315,12 @@ public:
 
 private:
     static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d, int32_t termBufferBytes) {
-        EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes; return c;
+        EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes;
+        // Pinned (test client, orthogonal to the broker defaults): the pre-2026-10-02
+        // 128 KiB receive window, so back-pressure tests (a client that stops
+        // reading its acks) hit it at the same depth whatever the host derives.
+        c.rcvWindowBytes = 128 * 1024;
+        return c;
     }
     static void pause_() { std::this_thread::sleep_for(std::chrono::microseconds{100}); }
 
@@ -343,7 +349,7 @@ private:
                     std::vector<PartitionInfo> v;
                     for (const auto& e : r->partitions)
                         v.push_back({e.topicId, e.partition, e.leaderId, e.ingressStreamId,
-                                     std::string(e.ingressEndpoint)});
+                                     std::string(e.ingressEndpoint), e.egressControlPort});
                     metadata_ = std::move(v);
                 }
                 break;
