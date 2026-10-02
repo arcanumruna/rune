@@ -1085,6 +1085,12 @@ if(BUILD_TESTING)
         endif()
         gtest_discover_tests(rune_shard_dr_gate_tests PROPERTIES TIMEOUT 180)
     endif()
+
+    # ── Benchmark building blocks (header-only, examples/bench) ──────────────
+    add_executable(rune_bench_util_tests tests/bench/BenchUtilTest.cpp)
+    target_include_directories(rune_bench_util_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/bench)
+    target_link_libraries(rune_bench_util_tests PRIVATE GTest::gtest_main)
+    gtest_discover_tests(rune_bench_util_tests)
 endif()
 
 # ── Task 12: rune_schema_gen executable ───────────────────────────────────────
