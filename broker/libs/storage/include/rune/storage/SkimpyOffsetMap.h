@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+#include <rune/storage/ProducerTails.h>
 
 namespace rune::storage {
 
@@ -228,7 +229,13 @@ public:
         for (auto& e : table_) { e.hash = kEmpty; e.offset = -1; }
         size_          = 0;
         latestOffset_  = -1;
+        tails_.clear();
     }
+
+    /// The last data batch of every producer in the scanned range (retained by
+    /// compaction — see ProducerTails.h).  Filled by buildOffsetMapFromBases.
+    ProducerTails&       producerTails() noexcept { return tails_; }
+    const ProducerTails& producerTails() const noexcept { return tails_; }
 
     // --- Budget helper (static, no instance) --------------------------------
     /// Compute maxSlots from a byte budget and per-entry size.
@@ -262,6 +269,7 @@ private:
     std::size_t          size_         = 0;
     Offset               latestOffset_ = -1;
     std::vector<Entry>   table_;
+    ProducerTails        tails_;
 };
 
 } // namespace rune::storage

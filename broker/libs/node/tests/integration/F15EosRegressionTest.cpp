@@ -34,6 +34,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
@@ -62,8 +63,17 @@ constexpr int16_t kNotCoordinator       = static_cast<int16_t>(pc::ErrorCode::No
 struct TmpDir {
     fs::path path;
     TmpDir() {
+        // pid + sequence alone collide across runs: a test process that halts
+        // (_Exit — no destructors) leaves its directory behind, and a later
+        // process reusing that pid recovered the stale log (seen as a flaky
+        // PsmLogConsistencyRegression failure).  A clock component makes the
+        // name unique; any leftover at the path is removed regardless.
         static std::atomic<int> seq{0};
-        path = fs::temp_directory_path() / ("rune_f15_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
+        const auto t = std::chrono::steady_clock::now().time_since_epoch().count();
+        path = fs::temp_directory_path() / ("rune_f15_" + std::to_string(::getpid()) + "_" + std::to_string(seq++) +
+                                            "_" + std::to_string(t));
+        std::error_code ec;
+        fs::remove_all(path, ec);
         fs::create_directories(path);
     }
     ~TmpDir() { std::error_code ec; fs::remove_all(path, ec); }
@@ -4426,4 +4436,335 @@ TEST(OrderedWaitQueueRegression, CompactionWithAWrappedWindowKeepsOrder) {
     EXPECT_EQ(seen, kept) << "order lost compacting a wrapped window";
     EXPECT_EQ(q.growths(), 0u);
     EXPECT_GT(q.compactions(), 0u);
+}
+
+// ============================================================================
+// PSM <-> log consistency (review of b4594f8).  The contract (Kafka's; the
+// client's rules A-G): OutOfOrderSequence only for a batch that was NOT
+// appended; a stored batch is answered OK (its offset in the window, -1
+// beyond) or duplicate; never re-appended.  A producer state that is not
+// proven consistent with the log cannot vouch either way.
+// ============================================================================
+namespace {
+constexpr int16_t kOos = static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence);
+std::vector<uint8_t> seqBatch(int64_t pid, int16_t epoch, int32_t seq, int64_t base = 0) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+    b.append("k", "v" + std::to_string(seq), 1000);
+    return b.build();
+}
+struct Answer {
+    int16_t err  = -1;
+    int64_t base = -1;
+};
+// The no-worker-pool INLINE path: a real ClientGateway appends to the log of a
+// control-owned replica (the gateway thread is its owner) — or, without a
+// replica registry, to a bare passthrough log.
+struct InlineRig {
+    TmpDir d;
+    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+    NullTransport t;
+    ReplicaRegistry reg;
+    PartitionReplica* r = nullptr;
+    std::vector<Answer> answers;
+    rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
+        [this](const uint8_t* b, std::size_t n) -> int64_t {
+            if (auto pr = pc::ProduceResponse::decode(b, n)) answers.push_back(Answer{pr->errorCode, pr->baseOffset});
+            return 1;
+        });
+    int64_t sid  = 0;
+    int64_t corr = 0;
+    int64_t now  = 1;
+    InlineRig(Role role, std::vector<NodeId> isr, bool withReplica = true) {
+        gw.setTopicRegistry(&topics);
+        if (withReplica) {
+            auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 0, 0), role, 1, isr, isr, topics.log(0, 0), &t);
+            r = rep.get();
+            reg.add(0, 0, std::move(rep));
+            gw.setReplicaRegistry(&reg);
+        }
+        gw.setCommittedMetadataReady(true);
+        gw.syncMinIsrForTest();
+        sid = gw.injectTestSession();
+    }
+    Log& log() { return *topics.log(0, 0); }
+    void send(int64_t pid, int16_t epoch, int32_t seq, uint8_t acks) {
+        const auto f = produceFrame(sid, ++corr, seqBatch(pid, epoch, seq), acks, 0, 0, pid, epoch, seq);
+        gw.applyProduceForTest(f.data(), f.size());
+    }
+    // acks=leader: answered synchronously.
+    Answer produce(int64_t pid, int16_t epoch, int32_t seq) {
+        const std::size_t before = answers.size();
+        send(pid, epoch, seq, /*acks=*/0);
+        EXPECT_EQ(answers.size(), before + 1) << "seq " << seq << " was not answered";
+        return answers.size() > before ? answers.back() : Answer{};
+    }
+};
+// Data that reached the log before this gateway ever saw it (replicated, or
+// recovered from disk on a restart).
+void preload(Log& log, int64_t pid, int16_t epoch, int32_t fromSeq, int32_t toSeq) {
+    for (int32_t s = fromSeq; s <= toSeq; ++s) (void)appendAt(log, seqBatch(pid, epoch, s));
+}
+} // namespace
+
+TEST(PsmLogConsistencyRegression, InlineNewLeaderKeepsItsTailAboveHwAndNeverReappendsIt) {
+    // Finding 1: a new leader keeps its tail between HW and LEO.  The inline
+    // path's node-level rebuild stopped at HW, so a resend of the FIRST tail
+    // batch (seq == lastSequence + 1) was accepted and appended twice.
+    InlineRig R(Role::Follower, {1, 2});
+    preload(R.log(), /*pid=*/7, 0, 0, 2);                    // seq 0..2 at offsets 0..2
+    R.r->becomeLeader(2, {1, 2});
+    rune::replication::FetchRequestMsg fr{R.r->epoch(), 0, /*follower*/2, /*fetchOffset*/1, 1 << 20, R.r->topicId()};
+    (void)R.r->onFetchRequest(fr, ++R.now);                  // follower 2 holds [0, 1)
+    ASSERT_TRUE(R.r->isLeaderComplete()) << "precondition: a complete leader";
+    ASSERT_EQ(R.r->highWatermark(), 1) << "precondition: HW 1";
+    ASSERT_EQ(R.log().logEndOffset(), 3) << "precondition: the tail [1, 3) is kept above HW";
+    R.gw.onNodeLeadershipGainedForTest();                    // the node-level Follower→Leader rebuild
+    const Answer a = R.produce(7, 0, 1);
+    EXPECT_EQ(a.err, 0);
+    EXPECT_EQ(a.base, 1) << "the first tail batch (seq 1) was appended twice — a silent duplicate";
+    const Answer b = R.produce(7, 0, 2);
+    EXPECT_EQ(b.err, 0) << "a stored tail batch was refused (OOS = 'not appended' makes the client re-send it)";
+    EXPECT_EQ(b.base, 2);
+    EXPECT_EQ(R.log().logEndOffset(), 3) << "a stored batch was appended again";
+    const Answer c = R.produce(7, 0, 3);
+    EXPECT_EQ(c.err, 0);
+    EXPECT_EQ(c.base, 3) << "the next in-order batch";
+}
+
+TEST(PsmLogConsistencyRegression, InlinePerPartitionTruncationAndRepromotionRebuildTheProducerState) {
+    // Finding 1 (per partition): demotion + KIP-101 truncation + re-promotion of
+    // ONE partition, no node-level leadership change.  The producer state still
+    // held seq 1 at offset 1 — now another leader's data — so its resend was
+    // answered duplicate-OK at that offset: an acknowledged loss.
+    InlineRig R(Role::Leader, {1, 2});
+    for (int32_t s = 0; s <= 2; ++s) ASSERT_EQ(R.produce(7, 0, s).base, s);
+    selfDemote(*R.r, 2, ++R.now);
+    truncateTo(*R.r, 1);                                     // seq 1, 2 never committed: cut
+    refetch(*R.r, otherBatchAt(1), /*leaderHw=*/2);          // the new leader's data at 1
+    R.r->becomeLeader(3, {1});
+    (void)R.r->doWork(++R.now);                              // leader completeness (lone ISR)
+    ASSERT_TRUE(R.r->isLeaderComplete());
+    ASSERT_EQ(R.log().logEndOffset(), 2);
+    const Answer a = R.produce(7, 0, 1);
+    EXPECT_EQ(a.err, 0);
+    EXPECT_EQ(a.base, 2) << "seq 1 (truncated away) was answered OK at an offset that holds other data";
+    EXPECT_EQ(R.log().logEndOffset(), 3);
+    EXPECT_EQ(R.produce(7, 0, 2).base, 3);
+}
+
+TEST(PsmLogConsistencyRegression, InlineUnrebuiltProducerStateNeverAnswersOosForAStoredBatch) {
+    // Finding 2: the inline path's producer state was never built from the log
+    // (no node-level leadership edge: a restart, a passthrough rig).  With no
+    // entry, trust-on-first-use answered OOS for a stored seq 2 (the client
+    // then re-sequences and writes it twice) and ACCEPTED a resend of seq 0.
+    for (bool withReplica : {true, false}) {
+        InlineRig R(Role::Leader, {1}, withReplica);
+        preload(R.log(), /*pid=*/7, 0, 0, 2);
+        if (R.r != nullptr) R.r->onLeaderLogAppended();
+        const Answer a = R.produce(7, 0, 2);
+        EXPECT_NE(a.err, kOos) << "withReplica=" << withReplica << ": OOS for a STORED batch";
+        EXPECT_EQ(a.err, 0) << "withReplica=" << withReplica;
+        EXPECT_EQ(a.base, 2) << "withReplica=" << withReplica;
+        const Answer b = R.produce(7, 0, 0);
+        EXPECT_EQ(b.err, 0) << "withReplica=" << withReplica;
+        EXPECT_EQ(b.base, 0) << "withReplica=" << withReplica << ": a stored seq 0 was appended again";
+        EXPECT_EQ(R.log().logEndOffset(), 3) << "withReplica=" << withReplica;
+        EXPECT_EQ(R.produce(7, 0, 3).base, 3) << "withReplica=" << withReplica;
+    }
+}
+
+TEST(PsmLogConsistencyRegression, InlineIncompleteLeaderRefusesIdempotentBatchesRetriably) {
+    // Finding 2: a producer state that cannot be proven (a leader still
+    // reconciling to the frontier may append old-term batches) answers a
+    // retriable refusal — never OOS, never an append.
+    InlineRig R(Role::Follower, {1, 2});
+    preload(R.log(), /*pid=*/7, 0, 0, 2);
+    R.r->becomeLeader(2, {1, 2});
+    ASSERT_FALSE(R.r->isLeaderComplete()) << "precondition: follower 2 has not reported in";
+    const Answer a = R.produce(7, 0, 2);
+    EXPECT_EQ(a.err, kNotLeader);
+    EXPECT_EQ(R.log().logEndOffset(), 3);
+    const Answer b = R.produce(7, 0, 0);
+    EXPECT_EQ(b.err, kNotLeader) << "an unproven producer state vouched for seq 0";
+    EXPECT_EQ(R.log().logEndOffset(), 3);
+}
+
+TEST(PsmLogConsistencyRegression, InlineMarkerRaisesTheProducerEpochLikeTheRebuild) {
+    // Markers / epoch fencing: the rebuild applies every control batch as an
+    // epoch raise; the inline marker append did not, so the live producer state
+    // differed from the log (a zombie of the fenced epoch was appended).
+    InlineRig R(Role::Leader, {1});
+    ASSERT_EQ(R.produce(7, 0, 0).err, 0);
+    const auto m = tx::ControlMarker::build(7, /*epoch=*/1, tx::ControlType::Abort, 0);
+    ASSERT_GE(R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false, 0), 0);
+    const Answer z = R.produce(7, 0, 1);
+    EXPECT_EQ(z.err, kInvalidProducerEpoch) << "a zombie batch of the fenced epoch was accepted";
+    EXPECT_EQ(R.log().logEndOffset(), 2) << "the zombie batch was appended";
+}
+
+TEST(PsmLogConsistencyRegression, InlineParkedAcksAllOfATruncatedBatchIsNeverOk) {
+    // Truncation (KIP-101) on the inline path: an acks=all answer parked on
+    // offset 0 must not fire OK once a re-promoted leader's HW passes offset 0
+    // — that offset now holds another leader's data (the worker path fails the
+    // waiter NotLeader on the log-generation change).
+    InlineRig R(Role::Leader, {1, 2});
+    R.send(7, 0, 0, /*acks=all*/1);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 1u) << "precondition: parked on the HW";
+    selfDemote(*R.r, 2, ++R.now);
+    truncateTo(*R.r, 0);
+    refetch(*R.r, otherBatchAt(0), /*leaderHw=*/1);
+    R.r->becomeLeader(3, {1});
+    (void)R.r->doWork(++R.now);
+    ASSERT_GE(R.r->gatewayHighWatermark(), 1) << "precondition: the HW passed offset 0";
+    R.gw.drainPendingAcksForTest(++R.now);
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_NE(R.answers[0].err, 0) << "OK for a batch the truncation removed (acknowledged loss)";
+    EXPECT_EQ(R.answers[0].err, kNotLeader);
+}
+
+TEST(PsmLogConsistencyRegression, WorkerMemoryLogRebuildsTheProducerStateFromTheRing) {
+    // Finding 3 (F22): a memory-backed partition's producer state was CLEARED
+    // on every rebuild edge, so a resend of a stored seq 2 met no entry → OOS
+    // (the client re-sequences and writes it twice).  It is rebuilt from the
+    // InMemoryLog like a disk log.
+    rune::storage::InMemoryLog mlog(1 << 20, 10000);
+    for (int32_t s = 0; s <= 2; ++s) {
+        const auto b = seqBatch(7, 0, s, /*base=*/s);
+        ASSERT_EQ(mlog.append(b, s), s);
+    }
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &mlog, &t);
+    Worker w(0, 1 << 16, 1 << 16, 16, 16);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.doWork(1);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady);
+    const auto v2 = w.psmForTest().validate(1, 7, 0, 0, 2, 2);
+    EXPECT_FALSE(v2.isOos()) << "OOS for a stored batch";
+    EXPECT_TRUE(v2.isDuplicate());
+    EXPECT_EQ(v2.retryBaseOffset, 2);
+    EXPECT_TRUE(w.psmForTest().validate(1, 7, 0, 0, 0, 0).isDuplicate()) << "a stored seq 0 would be re-appended";
+    EXPECT_TRUE(w.psmForTest().validate(1, 7, 0, 0, 3, 3).isAccept());
+}
+
+TEST(PsmLogConsistencyRegression, WorkerReplicaLessPartitionVouchesForStoredBatches) {
+    // The same class on the worker path: a produce op with no replica (a
+    // replication-less passthrough partition) skips the RC gate, so the
+    // worker's producer state was never built from the log — a resend of a
+    // stored seq 2 was answered OOS and a resend of seq 0 appended again.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024);
+    log.recover();
+    preload(log, /*pid=*/7, 0, 0, 2);
+    Worker w(0, 1 << 16, 1 << 16, 16, 16);
+    auto op = [&](int32_t seq, int64_t corr) {
+        WorkerOp o;
+        o.type = WorkerOp::Type::Produce; o.topicId = 1; o.partition = 0; o.replica = nullptr;
+        o.logPtr = &log; o.sessionId = 1; o.correlationId = corr; o.recordCount = 1;
+        o.producerId = 7; o.producerEpoch = 0; o.baseSequence = seq;
+        o.recordBatchBytes = seqBatch(7, 0, seq);
+        return o;
+    };
+    auto run = [&](int32_t seq, int64_t corr) {
+        EXPECT_TRUE(w.tryEnqueueOp(op(seq, corr)));
+        w.doWork(corr);
+        auto rets = drainAll(w);
+        EXPECT_EQ(rets.size(), 1u) << "seq " << seq;
+        return rets.empty() ? Answer{} : Answer{rets[0].errorCode, rets[0].baseOffset};
+    };
+    const Answer a = run(2, 1);
+    EXPECT_NE(a.err, kOos) << "OOS for a STORED batch";
+    EXPECT_EQ(a.err, 0);
+    EXPECT_EQ(a.base, 2);
+    const Answer b = run(0, 2);
+    EXPECT_EQ(b.err, 0);
+    EXPECT_EQ(b.base, 0) << "a stored seq 0 was appended again";
+    EXPECT_EQ(log.logEndOffset(), 3);
+    EXPECT_EQ(run(3, 3).base, 3);
+}
+
+TEST(PsmLogConsistencyRegression, RebuildThatStopsShortOfTheLogEndNeverVouches) {
+    // rebuildFromLog edge case: a batch that fails its CRC stopped the rebuild
+    // SILENTLY — the state then lagged the log (seq 2, stored behind the bad
+    // batch, answered OOS; a resend of it after a fresh rebuild accepted).  A
+    // rebuild that did not reach the log end leaves the state unproven: an
+    // idempotent batch is answered Internal (outcome unknown), never OOS, never
+    // appended.  (The worker's disk RC build halts on an unparseable batch.)
+    InlineRig R(Role::Leader, {1});
+    preload(R.log(), /*pid=*/7, 0, 0, 0);
+    (void)appendAt(R.log(), corrupted(seqBatch(7, 0, 1)));
+    preload(R.log(), /*pid=*/7, 0, 2, 2);
+    R.r->onLeaderLogAppended();
+    const Answer a = R.produce(7, 0, 2);
+    EXPECT_NE(a.err, kOos) << "OOS for a STORED batch the rebuild never reached";
+    EXPECT_EQ(a.err, static_cast<int16_t>(pc::ErrorCode::Internal));
+    const Answer b = R.produce(7, 0, 3);
+    EXPECT_EQ(b.err, static_cast<int16_t>(pc::ErrorCode::Internal)) << "an unproven state accepted a batch";
+    EXPECT_EQ(R.log().logEndOffset(), 3) << "appended past an unproven producer state";
+    rune::storage::ProducerStateManager psm;
+    EXPECT_FALSE(psm.rebuildFromLog(0, R.log(), R.log().logEndOffset(), 0)) << "the short rebuild reported complete";
+    EXPECT_TRUE(psm.rebuildFromLog(0, R.log(), 1, 0)) << "a rebuild that reached its bound";
+}
+
+namespace {
+std::vector<uint8_t> keyedBatch(int64_t pid, int16_t epoch, int32_t seq, std::string_view key) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); }
+    b.append(key, "v", 1000);
+    return b.build();
+}
+// pid 7's two batches (keys A, B at 0, 1) are superseded by a later writer's
+// keys A, B (2, 3); one more record seals them.  Every batch has its own segment.
+void supersedeProducer7(Log& log) {
+    (void)appendAt(log, keyedBatch(7, 0, 0, "A"));
+    (void)appendAt(log, keyedBatch(7, 0, 1, "B"));
+    (void)appendAt(log, keyedBatch(-1, 0, -1, "A"));
+    (void)appendAt(log, keyedBatch(-1, 0, -1, "B"));
+    (void)appendAt(log, keyedBatch(-1, 0, -1, "C"));
+}
+void expectProducer7Vouched(Log& log, const char* path) {
+    rune::storage::ProducerStateManager psm;
+    ASSERT_TRUE(psm.rebuildFromLog(0, log, log.logEndOffset(), 0)) << path;
+    const auto v1 = psm.validate(0, 7, 0, 0, 1, 1);
+    EXPECT_FALSE(v1.isOos()) << path << ": OOS for a stored batch (its record was compacted away)";
+    EXPECT_TRUE(v1.isDuplicate()) << path;
+    EXPECT_FALSE(psm.validate(0, 7, 0, 0, 0, 0).isAccept()) << path << ": a stored seq 0 would be re-appended";
+    EXPECT_TRUE(psm.validate(0, 7, 0, 0, 2, 2).isAccept()) << path;
+}
+} // namespace
+
+TEST(PsmLogConsistencyRegression, CompactionRetainsEachProducersLastBatch) {
+    // rebuildFromLog edge case (compaction): the cleaner dropped a producer's
+    // LAST batch once a later writer superseded its keys, so a producer-state
+    // rebuild (failover / restart) no longer knew it: a resend of a STORED
+    // batch met no entry → OOS (or, for seq == the rebuilt lastSequence + 1, an
+    // accept → written twice).  Kafka's cleaner retains the last batch of every
+    // producer (LogCleaner: isBatchLastRecordOfProducer); so does Rune's — the
+    // superseded LAST record of each producer's last batch survives.
+    {   // the synchronous path (OffsetMap): clean() + reloadSegments()
+        TmpDir d;
+        Log log(d.path.string(), /*segmentBytes=*/1); log.recover();
+        supersedeProducer7(log);
+        rune::storage::LogCleaner cleaner;
+        cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
+        log.reloadSegments();
+        ASSERT_EQ(log.read(2, 1 << 20).empty(), false);
+        expectProducer7Vouched(log, "clean");
+    }
+    for (bool coalesce : {false, true}) {   // the cleaner thread's path (SkimpyOffsetMap)
+        TmpDir d;
+        Log log(d.path.string(), /*segmentBytes=*/1); log.recover();
+        supersedeProducer7(log);
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        std::vector<int64_t> sizes(bases.size(), 1);
+        rune::storage::LogCleaner cleaner;
+        rune::storage::SkimpyOffsetMap map(1024);
+        const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1'000'000, map,
+                                                            coalesce, 1 << 20);
+        ASSERT_TRUE(res.compacted) << "precondition: something was cleaned";
+        log.reloadSegments();
+        expectProducer7Vouched(log, coalesce ? "range+coalesce" : "range");
+    }
 }

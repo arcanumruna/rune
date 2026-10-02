@@ -495,27 +495,30 @@ int ProducerStateManager::recover(const std::string& path)
 // Control batches are applied as epoch raises (fenceEpoch, F15 S5 / I3) —
 // never as sequences.
 //
-// TX-2b: highWatermark MUST be the committed HW (replica->highWatermark()),
-// not the log-end-offset (LEO).  Batches above HW may be truncated by KIP-101
-// divergence resolution; seeding PSM state from them would produce a false-
-// Duplicate for a producer retry of a never-committed sequence, with the
-// duplicate-reported offset pointing at a truncated-away (non-existent) log
-// position — acknowledged data loss.
+// PSM <-> log consistency (review of b4594f8; supersedes TX-2b's HW bound): a
+// state that answers produces is built to the LEO — every stored batch, the
+// leader's kept tail above HW included (Kafka loads producer state to the log
+// end).  Built only to HW it ACCEPTED a resend of the first tail batch (a
+// silent duplicate) and answered OOS for later stored ones.  The tail's
+// possible KIP-101 truncation is handled by invalidation: the owner rebuilds
+// on every log-generation / leadership change (RcState, proveInlinePsm_), so
+// no window ever covers a truncated-away offset.
 //
-// takeSnapshot / recover: not called in the current codebase hot path.  They
-// are a future Phase-5 optimisation for fast restart on large logs (skip the
-// full scan with a pre-built PSM image).
+// takeSnapshot / recover: not called by the broker (no production caller).
+// recover() restores whatever was snapshotted without checking it against the
+// log, so a future caller must re-validate (rebuild the suffix past the
+// snapshot and drop it on a log-generation change) before answering produces.
 //
 // Production callers of rebuildFromLog:
-//   • ClientGateway::rebuildProducerStateFromLogs (ClientGateway.cpp:212) —
-//     called on leader election / restart over every (topicId, partition).
-//   • PartitionReplica::truncateLog (Task 11) — re-rebuild fired atomically
-//     when a KIP-101 divergence truncation lands at or below the rebuild HW.
+//   • ClientGateway::proveInlinePsm_ — the inline path, per partition, to LEO.
+//   • Worker::provePassthroughPsm_ — replica-less partitions, to LEO.
+//   • RcState::advance — a memory-backed partition (InMemoryLog), to LEO.
+//   • PartitionReplica::truncateLog (Task 11) — its own (test-only) state.
 //
 // Cold path: allocations acceptable.
 // ---------------------------------------------------------------------------
 template<class LogT>
-void ProducerStateManager::rebuildFromLog(int32_t topicId,
+bool ProducerStateManager::rebuildFromLog(int32_t topicId,
                                            LogT&    log,
                                            int64_t highWatermark,
                                            int32_t partition)
@@ -537,7 +540,7 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
         return kv.first.topicId == topicId && kv.first.partition == partition;
     });
 
-    if (highWatermark <= 0) return;
+    if (highWatermark <= 0) return true;
 
     static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB per read
 
@@ -579,29 +582,37 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
             // log truly has no more data and we stop.
             const auto segBases = log.segmentBaseOffsets();
             auto it = std::upper_bound(segBases.begin(), segBases.end(), fetchOffset);
-            if (it == segBases.end()) break; // no segment after fetchOffset
+            if (it == segBases.end()) break; // no segment after fetchOffset: the data ends here
             fetchOffset = *it;
             continue;
         }
 
         std::size_t pos = 0;
         int64_t     lastBatchEnd = fetchOffset; // progress sentinel
+        bool        reachedBound = false;
 
         while (pos < data.size()) {
             const uint8_t*    batchStart = data.data() + pos;
             const std::size_t remaining  = data.size() - pos;
 
+            // A read returns whole batches: a fragment, a bad length or a CRC
+            // failure is a batch this scan cannot account for — stop SHORT
+            // (reported: the state then lags the log).
             if (remaining < static_cast<std::size_t>(
                     rune::protocol::batch::kRecordBatchOverhead))
-                break;
+                return false;
 
             rune::protocol::RecordBatchReader reader(batchStart, remaining);
 
             const int32_t tl = reader.totalLength();
-            if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+            if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) return false;
+
+            // A batch at or past the bound is not this scan's business (checked
+            // before its CRC: a bad batch beyond the bound does not matter).
+            if (reader.baseOffset() >= highWatermark) { reachedBound = true; break; }
 
             // Only CRC-valid batches are accepted.
-            if (!reader.ensureValid()) break;
+            if (!reader.ensureValid()) return false;
 
             const int64_t batchBase = reader.baseOffset();
             const int32_t lastDelta = reader.lastOffsetDelta();
@@ -613,14 +624,9 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
             const bool isControl =
                 (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
 
-            // TX-2b: stop processing batches once we reach or exceed the HW bound.
-            // The outer while(fetchOffset < highWatermark) controls which LOG
-            // SEGMENTS are fetched, but within a single read() chunk the segment
-            // may contain batches beyond HW (e.g. the uncommitted tail in the same
-            // segment as the last committed batch).  We must stop here — otherwise
-            // we would seed PSM state from uncommitted batches that may later be
-            // truncated by KIP-101, producing a false-Duplicate for a real produce.
-            if (batchBase >= highWatermark) break;
+            // (The bound itself was checked above: the outer while(fetchOffset <
+            // bound) controls which segments are fetched, but one read() chunk
+            // may hold batches past it.)
 
             const int64_t pid   = reader.producerId();
             const int16_t epoch = reader.producerEpoch();
@@ -648,9 +654,11 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
             pos += static_cast<std::size_t>(tl);
         }
 
-        if (lastBatchEnd <= fetchOffset) break; // no progress — stop
+        if (reachedBound) return true;
+        if (lastBatchEnd <= fetchOffset) return false; // no progress — stopped short
         fetchOffset = lastBatchEnd;
     }
+    return true;
 }
 
 // De-virtualized seam (Milestone D Phase 2): explicit instantiations for the two
@@ -658,9 +666,9 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
 // used with; each instantiation calls read()/segmentBaseOffsets() directly (no
 // vtable).  Keeping the definition out-of-line avoids pulling the segment/
 // filesystem machinery into every translation unit that includes the header.
-template void ProducerStateManager::rebuildFromLog<Log>(
+template bool ProducerStateManager::rebuildFromLog<Log>(
         int32_t, Log&, int64_t, int32_t);
-template void ProducerStateManager::rebuildFromLog<InMemoryLog>(
+template bool ProducerStateManager::rebuildFromLog<InMemoryLog>(
         int32_t, InMemoryLog&, int64_t, int32_t);
 
 } // namespace rune::storage

@@ -325,7 +325,8 @@ private:
                             const std::function<std::optional<Offset>(std::string_view)>& getLatest,
                             Offset fromOffset, Offset cleanBoundaryOffset,
                             int64_t nowNs, int64_t deleteRetentionMs,
-                            int64_t nowMs = -1, bool* changed = nullptr);
+                            int64_t nowMs = -1, bool* changed = nullptr,
+                            const ProducerTails* tails = nullptr);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones

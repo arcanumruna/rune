@@ -3348,11 +3348,44 @@ private:
     // Per-worker ProducerStateManager — idempotency for this worker's owned partitions.
     // Worker-thread only (single-writer per (log, PSM) pair — shared-nothing).
     //
-    // TODO(E5.1.5): At migration time, reconstruct PSM from the log tail via
-    //   reconstructPsmFromLog(partition) seam (left as an explicit hook here).
-    //   For now, a fresh PSM at construction is safe (loses idempotency window
-    //   across restarts, but that is acceptable for the E5.1.2d gate).
+    // It answers a sequence only while PROVEN consistent with the partition's
+    // log (the contract: OOS = "NOT appended"; a stored batch is answered OK /
+    // duplicate, never appended again):
+    //   * a replicated user partition — rebuilt from logStart to LEO by the RC
+    //     build (RcState; a memory-backed one from its InMemoryLog) on every
+    //     leadership / log generation, idempotent batches refused NotLeader
+    //     until Ready (rcGate_);
+    //   * a replica-less (passthrough) partition — rebuilt once per log on its
+    //     first idempotent batch (passthroughPsm_: nothing else writes it);
+    //   * an internal partition (topicId < 0) never carries a producer id —
+    //     such a batch is refused (Internal), never validated.
+    // (The former "a fresh PSM at construction is safe" note was wrong: an
+    // empty state answers OOS for a stored batch with seq > 0 and accepts a
+    // stored seq 0 again.)
     rune::storage::ProducerStateManager psm_{};
+    // Replica-less partitions whose producer state psm_ holds, built from `log`.
+    struct PassthroughPsm {
+        int32_t topicId = 0;
+        int32_t partition = 0;
+        const rune::storage::Log* log = nullptr;
+    };
+    std::vector<PassthroughPsm> passthroughPsm_;
+    // Cold the first time per (partition, log); a short linear scan afterwards
+    // (replica-less partitions exist only in rigs / passthrough deployments).
+    // Returns false when the state cannot be proven (the rebuild stopped short).
+    [[nodiscard]] bool provePassthroughPsm_(int32_t topicId, int32_t partition, rune::storage::Log& log) {
+        for (const auto& p : passthroughPsm_)
+            if (p.topicId == topicId && p.partition == partition && p.log == &log) return true;
+        std::erase_if(passthroughPsm_, [&](const PassthroughPsm& p) {
+            return p.topicId == topicId && p.partition == partition;
+        });
+        if (!psm_.rebuildFromLog(topicId, log, log.logEndOffset(), partition)) {
+            psm_.clearPartition(topicId, partition);
+            return false;
+        }
+        passthroughPsm_.push_back(PassthroughPsm{topicId, partition, &log});
+        return true;
+    }
 
     // E5.1.2d: gate — true when the worker should poll workerIngress_ for produce.
     // Default FALSE so the existing gateway fanout remains the live path and
@@ -3845,7 +3878,8 @@ private:
     }
     // One §2.3 driver step for one partition.
     std::size_t rcAdvance_(rune::replication::PartitionReplica* r, RcState& rc) {
-        return rc.advance(rcFacts_(r), r->isDiskBacked() ? r->log() : nullptr, rcScanBytesPerPass_);
+        return r->isDiskBacked() ? rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_)
+                                 : rc.advance(rcFacts_(r), nullptr, rcScanBytesPerPass_, r->memoryLog());
     }
     // §2.4: the RC state to serve read_committed from — only if Ready AND still
     // valid for the replica's live role / generations (a demotion can land
@@ -4831,14 +4865,39 @@ private:
             enqueueReturn_(ret);
             return 1;
         }
-        // F15 §2.3 produce gate (see executeProduceWire_).
+        // F15 §2.3 produce gate (see executeProduceWire_) + PSM <-> log
+        // consistency: an idempotent batch is validated only against a producer
+        // state proven consistent with this log (see psm_).
         RcState* rc = nullptr;
-        if (f.producerId >= 0 && replica != nullptr && f.topicId >= 0) [[unlikely]] {
-            rc = rcGate_(replica);
-            if (rc == nullptr) {
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        if (f.producerId >= 0) [[unlikely]] {
+            if (replica != nullptr && f.topicId >= 0) {
+                rc = rcGate_(replica);
+                if (rc == nullptr) {
+                    ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                    enqueueReturn_(ret);
+                    return 1;
+                }
+            } else if (replica != nullptr) {
+                // Internal partitions are written by coordinators with pid -1
+                // only; no producer state is ever built for them.
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
                 enqueueReturn_(ret);
                 return 1;
+            } else {
+                bool proven = false;
+                try {
+                    proven = provePassthroughPsm_(f.topicId, f.partition, *log);
+                } catch (const std::exception& ex) {
+                    psm_.clearPartition(f.topicId, f.partition);
+                    spdlog::error("Worker {}: producer-state rebuild threw for topicId={} partition={}: {}",
+                                  workerId_, f.topicId, f.partition, ex.what());
+                }
+                if (!proven) [[unlikely]] {
+                    // Unproven: never OOS ("NOT appended"), never an append.
+                    ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+                    enqueueReturn_(ret);
+                    return 1;
+                }
             }
         }
 

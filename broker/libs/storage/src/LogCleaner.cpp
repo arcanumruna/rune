@@ -140,6 +140,33 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
 
 } // anonymous namespace
 
+
+namespace {
+// Kafka LogCleaner parity (ProducerTails.h): note the batch if it is an
+// idempotent DATA batch starting below `toOffset`.
+void noteProducerTail(const rune::protocol::RecordBatchReader& r, Offset toOffset, ProducerTails& tails) {
+    if (r.producerId() < 0 || r.baseSequence() < 0) return;
+    if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0)
+        return;
+    if (r.baseOffset() >= toOffset) return;
+    tails.note(r.producerId(), r.baseOffset() + r.lastOffsetDelta());
+}
+// Walk the batch headers of one segment file, noting producer tails only (the
+// clean prefix below a pass's dirty range: its producers' last batches must be
+// known too, or a prefix copy superseded by the dirty section would drop one).
+void noteProducerTailsOfFile(const std::vector<uint8_t>& buf, Offset toOffset, ProducerTails& tails) {
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        if (!r.ensureValid()) break;
+        noteProducerTail(r, toOffset, tails);
+        pos += static_cast<std::size_t>(total);
+    }
+}
+} // namespace
+
 // ---------------------------------------------------------------------------
 // buildOffsetMap  (APPEND-THREAD ONLY — derives bases from segments_)
 // ---------------------------------------------------------------------------
@@ -164,8 +191,12 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         int64_t segBase = bases[i];
         int64_t segEnd  = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
 
-        if (segEnd <= fromOffset) continue;
         if (segBase >= toOffset)  break;
+        if (segEnd <= fromOffset) {
+            // Clean prefix: producer tails only (ProducerTails.h).
+            noteProducerTailsOfFile(readFile(segmentLogPath(dir, segBase)), toOffset, map.producerTails());
+            continue;
+        }
 
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
@@ -177,6 +208,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             int32_t total = r.totalLength();
             if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
+            noteProducerTail(r, toOffset, map.producerTails());
 
             bool full = false;
             r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
@@ -222,9 +254,13 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         int64_t segBase = bases[i];
         int64_t segEnd = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
 
-        // Skip segments entirely outside [fromOffset, toOffset).
-        if (segEnd <= fromOffset) continue;
+        // Skip segments entirely outside [fromOffset, toOffset) — except that a
+        // clean-prefix segment's producer tails are still noted (ProducerTails.h).
         if (segBase >= toOffset) break;
+        if (segEnd <= fromOffset) {
+            noteProducerTailsOfFile(readFile(segmentLogPath(dir, segBase)), toOffset, map.producerTails());
+            continue;
+        }
 
         // Read segment from disk.
         auto buf = readFile(segmentLogPath(dir, segBase));
@@ -239,6 +275,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
+            noteProducerTail(r, toOffset, map.producerTails());
 
             r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
@@ -260,7 +297,7 @@ bool LogCleaner::rewriteSegmentImpl(
     const std::function<std::optional<Offset>(std::string_view)>& getLatest,
     Offset fromOffset, Offset cleanBoundaryOffset,
     int64_t nowNs, int64_t deleteRetentionMs,
-    int64_t nowMs, bool* changed)
+    int64_t nowMs, bool* changed, const ProducerTails* tails)
 {
     std::string logPath   = segmentLogPath(dir, segBase);
     std::string newPath   = logPath + ".new";
@@ -329,6 +366,9 @@ bool LogCleaner::rewriteSegmentImpl(
         int32_t origBaseSequence  = static_cast<int32_t>(
             rune::protocol::detail::getLE32(buf.data() + pos + rune::protocol::batch::kBaseSequenceOffset));
         int64_t batchBaseOffset   = r.baseOffset();
+        const int64_t batchLastOffset = batchBaseOffset + r.lastOffsetDelta();
+        const bool batchIsData = origProducerId >= 0 && origBaseSequence >= 0 &&
+            (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) == 0;
 
         // CP-8: does this batch contain any tombstone (for horizon stamping)?
         // We track this as we iterate records and then stamp the batch if needed.
@@ -419,6 +459,12 @@ bool LogCleaner::rewriteSegmentImpl(
 
             // Null-key records: always keep (not compactable).
             if (key.empty()) { keep(); return; }
+
+            // Kafka parity (ProducerTails.h): the LAST record of a producer's
+            // last data batch always survives — even superseded or an expired
+            // tombstone — so a producer-state rebuild still knows the producer.
+            if (batchIsData && tails != nullptr && offset == batchLastOffset &&
+                tails->isTail(origProducerId, offset)) { keep(); return; }
 
             // UNIFIED RETAIN RULE (Kafka LogCleaner.shouldRetainRecord).
             //
@@ -558,7 +604,8 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
                                 int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
+        &map.producerTails());
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +617,8 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyO
                                 int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
+        &map.producerTails());
 }
 
 // ---------------------------------------------------------------------------
@@ -880,7 +928,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     for (int64_t b : inPassBases) {
         bool changed = false;
         rewriteSegmentImpl(dir, b, getLatest, globalDirtyStart, passEnd,
-                           nowNs, deleteRetentionMs, nowMs, &changed);
+                           nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails());
 
         // A segment needs a swap enqueue iff its on-disk content changed (records
         // dropped / tombstone stamped / emptied), OR its .log is now absent (emptied
@@ -1046,6 +1094,9 @@ void LogCleaner::mergeGroupWithMap(
                 rune::protocol::detail::getLE32(buf.data() + pos
                     + rune::protocol::batch::kBaseSequenceOffset));
             int64_t batchBaseOffset   = r.baseOffset();
+            const int64_t batchLastOffset = batchBaseOffset + r.lastOffsetDelta();
+            const bool batchIsData = origProducerId >= 0 && origBaseSequence >= 0 &&
+                (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) == 0;
 
             r.forEachRecord([&](std::string_view key, std::string_view val,
                           int64_t offset, int64_t timestamp) {
@@ -1089,6 +1140,10 @@ void LogCleaner::mergeGroupWithMap(
                 // Records at/past the pass boundary are kept verbatim.
                 if (offset >= passEnd) { keep2(); return; }
                 if (key.empty())       { keep2(); return; }
+                // Kafka parity (ProducerTails.h): a producer's last data batch
+                // keeps its last record.
+                if (batchIsData && offset == batchLastOffset &&
+                    map.producerTails().isTail(origProducerId, offset)) { keep2(); return; }
 
                 // UNIFIED RETAIN RULE (see rewriteSegmentImpl): drop iff the dirty
                 // map holds a strictly higher offset for this key; retain records

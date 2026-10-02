@@ -90,6 +90,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <unordered_map>
 #include <utility>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace rune::node { class ReplicaRegistry; }
@@ -870,6 +871,10 @@ private:
         int64_t      baseOffset    = 0;   ///< first offset of the batch
         int64_t      lastOffset    = 0;   ///< last offset of the batch (HW must reach this)
         int64_t      enqueuedAtNs  = 0;   ///< for timeout eviction
+        /// The replica's logGeneration() the waiter last validated against
+        /// (truncation / reconcile: the worker path's §3.2 rule, see
+        /// inlineWaiterStillValid_).
+        uint64_t     logGen        = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -1498,6 +1503,8 @@ public:
     void syncMinIsrForTest() noexcept { cachedMinIsr_ = minIsr_.load(std::memory_order_relaxed); }
     /// Test-only: run the deferred-ack drain once at `nowNs`.
     void drainPendingAcksForTest(int64_t nowNs) { nowNs_ = nowNs; drainPendingAcks(); }
+    /// Test-only: the node-level Follower→Leader edge doWork reacts to.
+    void onNodeLeadershipGainedForTest() { rebuildProducerStateFromLogs(); }
     /// Test-only: the subscription lifecycle forwarding (worker routing).
     void forwardSubscribeForTest(int64_t subId, int64_t sessionId, int32_t topicId, int32_t partition,
                                  int64_t nextOffset, uint8_t isolation, bool isGroup, bool carrier) {
@@ -1633,13 +1640,12 @@ private:
     // the correct single-writer home: handleProduce() is the only call-site and
     // is always on the duty-cycle thread (no locks needed).
     //
-    // TX-2b: On leader transition (Follower→Leader) or on startup as leader, the
-    // PSM is rebuilt from each partition Log via rebuildProducerStateFromLogs().
-    // This mirrors the TransactionCoordinationService::doWork pattern: wasLeader_
-    // tracks the previous cycle's leadership so the rebuild fires exactly once on
-    // the first duty cycle after becoming leader.  Without this rebuild, a
-    // producer that retries an already-durable batch after failover would be
-    // incorrectly accepted (re-appended), violating exactly-once semantics.
+    // It answers a sequence only while PROVEN consistent with the partition's
+    // log: rebuilt from logStart to LEO per partition, and again whenever the
+    // log / leadership it was built for changes (inlinePsm_ / proveInlinePsm_
+    // below).  The node-level leader edge (rebuildProducerStateFromLogs) only
+    // invalidates it.  Without a proven state a producer that retries an
+    // already-durable batch would be re-appended or answered OOS.
     //
     // No per-op heap allocation: ProducerStateManager::validate() is noexcept,
     // allocation-free; update() inserts into the internal unordered_map only on
@@ -1652,6 +1658,61 @@ private:
     // rebuilt for it.
     rune::storage::ProducerStateManager producerStateManager_;
 
+    // -----------------------------------------------------------------------
+    // PSM <-> log consistency (review of b4594f8).  The contract (Kafka's): an
+    // OutOfOrderSequence answer means "NOT appended"; a stored batch is answered
+    // OK (its offset in the window, -1 beyond it) or duplicate and is never
+    // appended again.  producerStateManager_ can vouch for that only while it is
+    // PROVEN consistent with the partition's log: built from logStart to LEO
+    // (every stored batch, the leader's kept tail above HW included — Kafka
+    // loads producer state to the log end) for exactly the log content and
+    // leadership it now serves.  One state per (topicId, partition):
+    //   Unproven — nothing built for the live log (never, or invalidated by a
+    //              node-level leadership edge); an idempotent batch first
+    //              rebuilds (cold, synchronous) — or is refused retriably
+    //              (NotLeader) while the replica is not a COMPLETE leader (a
+    //              deficient leader may still reconcile-append old-term
+    //              batches).  A rebuild that fails answers Internal (outcome
+    //              unknown) — never OOS.
+    //   Proven   — built for (log, replica incarnation, logGeneration,
+    //              leadershipGeneration); any change of those (per-partition
+    //              promotion, demotion, KIP-101 truncation, reconcile append,
+    //              partition re-creation) is detected on the next idempotent
+    //              batch and triggers the rebuild.  Live appends keep it exact
+    //              (handleProduceBatch's update, markers' fenceEpoch).
+    // Inline path only (the replica is control-owned: its role / generations
+    // are this thread's state).  Cold map insert; hot lookup is alloc-free.
+    // -----------------------------------------------------------------------
+    struct InlinePsmUnproven {};
+    struct InlinePsmProven {
+        const rune::storage::Log* log = nullptr;   ///< the log it was built from
+        uint32_t incarnation = 0;                  ///< replica incarnation (0 = passthrough)
+        uint64_t logGen      = 0;                  ///< replica logGeneration() at the build
+        uint64_t leadGen     = 0;                  ///< replica leadershipGeneration() at the build
+        bool operator==(const InlinePsmProven&) const noexcept = default;
+    };
+    using InlinePsmState = std::variant<InlinePsmUnproven, InlinePsmProven>;
+    std::unordered_map<uint64_t, InlinePsmState> inlinePsm_;
+    enum class InlinePsmGate : uint8_t {
+        Proven,       ///< validate against producerStateManager_
+        NotLeader,    ///< not a complete leader: retriable, nothing appended
+        Unprovable,   ///< the rebuild failed: outcome unknown (Internal)
+    };
+    [[nodiscard]] static uint64_t inlinePsmKey_(int32_t topicId, int32_t partition) noexcept {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 32) |
+               static_cast<uint64_t>(static_cast<uint32_t>(partition));
+    }
+    [[nodiscard]] InlinePsmGate proveInlinePsm_(int32_t topicId, int32_t partition,
+                                                rune::storage::Log& log,
+                                                const rune::replication::PartitionReplica* replica,
+                                                uint32_t incarnation);
+    /// An inline acks=all waiter may still fire OK (the worker path's §3.2
+    /// rule): the replica is Leader and its log generation is unchanged — or
+    /// changed by exactly one cut strictly above the waiter's last offset (the
+    /// waiter re-bases).  Otherwise the data it waits on may be gone.
+    [[nodiscard]] static bool inlineWaiterStillValid_(const rune::replication::PartitionReplica& rep,
+                                                      PendingAck& entry) noexcept;
+
     // TX-2b: Tracks previous-cycle leadership to detect Follower→Leader transitions.
     // Same pattern as TransactionCoordinationService::wasLeader_.
     // true  = was the leader on the previous doWork() call.
@@ -1659,11 +1720,9 @@ private:
     // Initialized to false so the very first doWork() as leader fires the rebuild.
     bool wasLeader_ = false;
 
-    // TX-2b: Rebuild the PSM from all partition Logs in the TopicRegistry.
-    //
-    // Called from doWork() exactly once on Follower→Leader transition.  For each
-    // (topicId, partition) in topicRegistry_, reads the partition Log and calls
-    // ProducerStateManager::rebuildFromLog() to reconstruct the dedup window.
+    // TX-2b / TX-7: node-level Follower→Leader edge — invalidates the inline
+    // producer state of every gateway-appended partition (rebuilt lazily, to
+    // LEO, by proveInlinePsm_) and rebuilds the inline read_committed state.
     //
     // Cold path: allocations acceptable.  Single-writer: duty-cycle thread only.
     void rebuildProducerStateFromLogs();
