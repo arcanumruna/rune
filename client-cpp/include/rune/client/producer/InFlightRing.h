@@ -22,7 +22,14 @@ namespace rune::client::producer {
 ///                attempt is a success (stored is stored)
 ///   bits  0..23  per-partition batch sequence; slot = seq & mask, and an exact
 ///                comparison of the attempt-free id rejects stale ids after the
-///                slot is reused (2^24 batches per slot between reuses)
+///                slot is reused.  The id repeats only after 2^24 batches of the
+///                same producer and partition: a stale answer can alias a live
+///                batch only if it arrives that late — at the ~320k batches/s
+///                per-partition ceiling (32 in flight / ~100 us RTT) that is
+///                >= ~52 s (N-d), far past any delivery timeout in practice.
+///                (Such an alias would be a false success: an OK of any attempt
+///                completes the batch.)  The 8-bit attempt tag wraps after 256
+///                offers of one batch (>= 256 x produceTimeoutMs of retries).
 namespace batchcorr {
 inline constexpr int64_t  kTag          = int64_t{1} << 62;
 inline constexpr int      kOrdinalShift = 50;

@@ -842,6 +842,9 @@ public:
     /// Returns true if resent, false if corrId unknown / max redirects exceeded.
     /// On failure the pending ack is failed immediately.
     static constexpr int kMaxRedirects = 3;
+    /// N-e: the backoff before a retriable error (MinIsrViolation) is re-sent
+    /// (Kafka retry.backoff.ms default), capped by produceTimeoutMs.
+    static constexpr int64_t kRetriableBackoffNs = 100'000'000LL;
     bool retryRedirectedProduce(int64_t corrId,
                                 SendFn& sendFn);
 
@@ -1016,6 +1019,17 @@ public:
         ps.lastAckedSeq     = seq - 1;
     }
 
+    /// Test-only seam (re-review 1 N-a): make the stored frame of the n-th live
+    /// batch (oldest = 0) of a partition undecodable (truncated).  Never called
+    /// from production code.
+    void debugMangleStoredFrameForTest(int32_t topicId, int32_t partition, int n) {
+        PartitionState& ps = getOrCreatePartition(topicId, partition);
+        int i = 0;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            if (i++ == n) b.wireFrame.resize(20);
+        });
+    }
+
     /// Test-only seam (Task 14 fix2): lower the partition-table cap (default
     /// batchcorr::kMaxSlot + 1) so the "unaddressable partition" path can be
     /// exercised without creating 262144 partitions. Never called in production.
@@ -1180,8 +1194,11 @@ private:
     /// Epoch overflow: at INT16_MAX a FRESH unique producerId is drawn (never
     /// the old id+1 — see generateProducerId()) and the epoch restarts at 0.
     void resetPartition_(PartitionState& ps) noexcept;
-    /// Sequence space (int32, never wrapped — the broker compares sequences
-    /// signed and has no Kafka wrap rule): true when a batch of `n` records
+    /// Sequence space (int32; the client chooses never to wrap — N-c: since
+    /// rune-broker 37564ba the broker accepts the Kafka wrap INT32_MAX -> 0 in
+    /// order and refuses a batch crossing INT32_MAX; not wrapping is compatible
+    /// and costs one drain + epoch move per 2^31 records of a partition): true
+    /// when a batch of `n` records
     /// may be stamped at ps.nextBaseSequence with its last sequence AND the
     /// following nextBaseSequence still <= INT32_MAX.  When it may not: with
     /// nothing in flight the partition moves to a new identity at sequence 0

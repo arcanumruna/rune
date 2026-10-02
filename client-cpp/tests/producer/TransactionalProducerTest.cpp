@@ -2110,8 +2110,8 @@ TEST(TransactionalProducerTest, ErrorOfASupersededAttemptIsIgnoredRegression) {
 }
 
 // Sequence overflow (broker-agent concern): the per-partition int32 sequence
-// never overflows — the broker compares sequences signed and has no Kafka wrap
-// rule.  The txn producer's epoch belongs to the coordinator, so before the
+// never overflows — the client chooses not to wrap (the broker accepts the Kafka
+// wrap since 37564ba).  The txn producer's epoch belongs to the coordinator, so before the
 // counter would pass INT32_MAX the transaction becomes abortable with an epoch
 // bump (InitProducerId restarts every sequence at 0); no frame ever carries a
 // wrapped (negative) sequence.  RED (pre-fix): the third record went out at a

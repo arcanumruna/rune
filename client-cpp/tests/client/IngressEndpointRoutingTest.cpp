@@ -147,7 +147,7 @@ TEST(IngressEndpointRouting, EmptyEndpointKeepsNodeRouting) {
 TEST(IngressEndpointRouting, EndpointMoveReoffersInFlightBatchesRegression) {
     Rig r(3904, 3905);
     const int wA = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24761", 5002);
-    const int wB = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24762", 5003);
+    const int wB = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24770", 5003);
     r.gw.partitions = {{1, 0, 0, 1, 5002, "127.0.0.1:24761"}};
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == "aeron:udp?endpoint=127.0.0.1:24761"; }));
@@ -163,7 +163,7 @@ TEST(IngressEndpointRouting, EndpointMoveReoffersInFlightBatchesRegression) {
     ASSERT_TRUE(r.drive([&] { return r.gw.held.size() == 1; }));
     ASSERT_EQ(r.gw.held[0].endpoint, wA);
 
-    r.gw.partitions = {{1, 0, 0, 2, 5003, "127.0.0.1:24762"}};  // epoch 2: moved to B
+    r.gw.partitions = {{1, 0, 0, 2, 5003, "127.0.0.1:24770"}};  // epoch 2: moved to B
     r.gw.holdPartitions.clear();
     r.gw.sendMetadata(r.gw.assignedSessionId, /*correlationId=*/0);  // unsolicited refresh
     ASSERT_TRUE(r.drive([&] { return fired == 1; })) << "in-flight batch not re-offered to the new worker";
@@ -524,16 +524,16 @@ TEST(IngressEndpointRouting, SpuriousRedirectRestoresTheWorkerRouteRegression) {
 // old worker route and the next batch went back to the old owner.
 TEST(IngressEndpointRouting, LaggingMetadataNeverUndoesARealRedirectRegression) {
     Rig r(3924, 3925, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
-    const std::string node0 = "aeron:udp?endpoint=127.0.0.1:24792";
-    const std::string node1 = "aeron:udp?endpoint=127.0.0.1:24794";
-    const std::string worker = "aeron:udp?endpoint=127.0.0.1:24793";
+    const std::string node0 = "aeron:udp?endpoint=127.0.0.1:24776";
+    const std::string node1 = "aeron:udp?endpoint=127.0.0.1:24778";
+    const std::string worker = "aeron:udp?endpoint=127.0.0.1:24777";
     r.gw.addEndpoint(node0, 3924);
     const int w  = r.gw.addEndpoint(worker, 3924);
     const int n1 = r.gw.addEndpoint(node1, 3924);
     r.gw.brokerHost  = "127.0.0.1";
-    r.gw.brokerPort  = 24792;
-    r.gw.moreBrokers = {{1, "127.0.0.1", 24794}};
-    r.gw.partitions  = {{1, 0, 0, 1, 3924, "127.0.0.1:24793"}};
+    r.gw.brokerPort  = 24776;
+    r.gw.moreBrokers = {{1, "127.0.0.1", 24778}};
+    r.gw.partitions  = {{1, 0, 0, 1, 3924, "127.0.0.1:24777"}};
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == worker; }));
     auto p = r.client.producer(noLinger());

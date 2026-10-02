@@ -895,11 +895,14 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
             constexpr uint32_t kWindow = static_cast<uint32_t>(rpc::kIdempotentMaxInFlightBatches);
             // NEW-3: nor while a batch waits for the partition's new route.
             while (!ps.waiting.empty() && ps.parked == 0 && ps.awaitingRoute == 0 && ps.inFlight < kWindow) {
-                // int32 sequence space (one record per batch): never wrapped —
-                // the broker compares sequences signed.  The epoch belongs to the
-                // coordinator, so the transaction becomes abortable with an epoch
-                // bump (InitProducerId restarts every sequence at 0) BEFORE the
-                // counter could overflow.
+                // int32 sequence space (one record per batch): the client
+                // chooses never to wrap (N-c: since rune-broker 37564ba the broker
+                // accepts the Kafka wrap INT32_MAX -> 0 in order, and refuses a
+                // batch crossing INT32_MAX; not wrapping stays compatible and
+                // conservative).  The epoch belongs to the coordinator, so the
+                // transaction becomes abortable with an epoch bump (InitProducerId
+                // restarts every sequence at 0) BEFORE the counter could overflow
+                // — after 2^31 records on one partition within one epoch.
                 if (ps.nextBaseSequence == INT32_MAX) [[unlikely]] {
                     poison_(OpStatus::DeliveryFailed, 0, /*bumpEpoch=*/true);
                     break;

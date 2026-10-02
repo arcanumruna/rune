@@ -1870,10 +1870,7 @@ bool ProducerImpl::resendRoute_(PartitionState& ps, int64_t nowNs, const Sink& s
         b.attemptDeadlineNs  = nowNs + attemptNs;
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
     });
-    if (all) {
-        ps.routeResend = false;
-        ps.routeParked = false;
-    }
+    if (all) ps.routeResend = false;  // N-b: routeParked is a NEW park if set (see queueRouteResend_)
     return all;
 }
 
@@ -1950,12 +1947,11 @@ int ProducerImpl::flushBatches(
         // ---- Task 16: a moved route re-offers the stored batches first, in
         // order; a NotLeader-parked partition sends nothing new while stored
         // batches are in flight (they would only meet the old owner again).
-        if (ps.routeResend) {
-            if (!resendRoute_(ps, nowNs, sink)) {
-                dirty_[keep++] = slot;
-                continue;
-            }
-        } else if (ps.routeParked) {
+        if (ps.routeResend && !resendRoute_(ps, nowNs, sink)) {
+            dirty_[keep++] = slot;
+            continue;
+        }
+        if (ps.routeParked) {  // N-b: also a park that arrived while the re-offer drained
             if (!ps.inflight.empty()) {
                 dirty_[keep++] = slot;
                 continue;
@@ -2117,6 +2113,9 @@ int ProducerImpl::flushBatches(
 //         (BrokerError 20) and the batches behind it are re-sequenced (Kafka:
 //         requestEpochBumpForPartition; startSequencesAtBeginning re-stamps the
 //         in-flight batches).
+//  R. Retriable, same identity (no completion, no bump): NotLeader (park,
+//     re-offer on the new owner's route — Task 16 C1) and MinIsrViolation
+//     (re-sent after kRetriableBackoffNs — Kafka NOT_ENOUGH_REPLICAS, N-e).
 //  D. Any other error answer, the delivery timeout, an exhausted redirect
 //     budget, a close: b FAILS with its outcome UNKNOWN (an earlier attempt
 //     may be stored) -> the partition is UNRESOLVED.
@@ -2225,6 +2224,19 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         ps.inflight.release(*b);
         resequence_(ps);
         reclaimAckRing_(ps);
+        return;
+    }
+    if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation)) {
+        // N-e (Kafka NOT_ENOUGH_REPLICAS / _AFTER_APPEND: both retriable): the
+        // ISR is below minIsr.  Re-sent unchanged (same identity, a new attempt)
+        // after a backoff by the attempt timer — safe whether or not it was
+        // appended (the broker's ProducePath refuses BEFORE the append; the
+        // gateway's full pending-ack queue answers it AFTER: the retry is then a
+        // window duplicate, OK with the original offset).  Bounded by the
+        // delivery timeout.  Followers meet the gap (C1) and wait.
+        const int64_t backoffNs = std::min<int64_t>(kRetriableBackoffNs, cfg_.produceTimeoutMs * 1'000'000LL);
+        b->attemptDeadlineNs = lastNowNs_ + backoffNs;
+        if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
         return;
     }
     // D: rejected, but an earlier attempt may be stored — outcome unknown.
@@ -2386,7 +2398,19 @@ void ProducerImpl::resequence_(PartitionState& ps) noexcept {
         // Re-stamp the stored frame: Produce body + the CRC-covered batch header.
         auto& f = b.wireFrame;
         const auto view = rune::protocol::client::Produce::decode(f.data(), f.size());
-        if (view && view->recordBatch.size() >= static_cast<std::size_t>(rb::kRecordBatchOverhead)) {
+        if (!view || view->recordBatch.size() < static_cast<std::size_t>(rb::kRecordBatchOverhead)) [[unlikely]] {
+            // N-a: never re-send a frame whose identity could not be re-stamped
+            // (the broker would reject it SchemaValidationFailed).  Unreachable
+            // (the frame was encoded and sent by this producer): fail it loudly;
+            // its sequences are not consumed.
+            std::fprintf(stderr,
+                         "ProducerImpl: BUG stored frame of corrId=%lld (topic=%d part=%d) does not decode; "
+                         "failing the batch instead of re-sequencing it\n",
+                         static_cast<long long>(b.corrId), ps.topicId, ps.partition);
+            failBatch_(ps, b, OpStatus::DeliveryFailed);
+            return;
+        }
+        {
             uint8_t* batch = f.data() + (view->recordBatch.data() - f.data());
             const std::size_t len = view->recordBatch.size();
             putLE(f.data() + kFramePidOff, static_cast<uint64_t>(ps.producerId), 8);
@@ -2703,6 +2727,9 @@ void ProducerImpl::queueRouteResend_(PartitionState& ps) noexcept
         b.routeResendPending = true;
     });
     ps.routeResend = true;
+    // N-b: this re-offer consumes the park; a NotLeader arriving while it drains
+    // (for an attempt it already re-offered) parks the partition anew.
+    ps.routeParked = false;
     markDirty_(ps);
 }
 

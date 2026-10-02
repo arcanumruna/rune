@@ -307,3 +307,89 @@ TEST(ProducerRoutePark, DuplicateSequenceIsAStoredBatchWithUnknownOffsetRegressi
     EXPECT_EQ(w.frames[3].epoch, e0) << "no epoch bump";
     EXPECT_EQ(w.frames[3].baseSequence, 3) << "the sequence continues";
 }
+
+// ===========================================================================
+// Re-review 1 nits
+// ===========================================================================
+
+// N-a: resequence_ never sends a frame it could not re-stamp.  A stored frame
+// that no longer decodes fails its batch loudly (DeliveryFailed: an internal
+// error) instead of keeping the old frame identity under a new header identity
+// (the broker would reject it SchemaValidationFailed; here: offered forever).
+// The batches behind it are re-stamped from the next sequence.  RED (pre-fix):
+// the mangled batch stayed live (not failed) and C took sequence 2.
+TEST(ProducerRoutePark, ResequenceFailsABatchWhoseFrameDoesNotDecodeRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    std::vector<rune::client::BatchAck> acks;
+    impl.setOnBatchAck(
+        [](void* c, const rune::client::BatchAck& a) noexcept {
+            static_cast<std::vector<rune::client::BatchAck>*>(c)->push_back(a);
+        },
+        &acks);
+    sendThree(impl, w, sink);
+    const int16_t e0 = impl.producerEpoch();
+    impl.debugMangleStoredFrameForTest(1, 0, 1);  // B's stored frame
+    impl.onProduceResponse(w.frames[0].corrId, -1, kOos);  // C4: A fails, B and C re-sequenced
+    pump(impl, sink);
+    ASSERT_EQ(acks.size(), 2u) << "A (rejected) and B (undecodable) must both fail";
+    EXPECT_NE(acks[1].errorCode, 0);
+    EXPECT_EQ(acks[1].baseSequence, 1) << "B is the failed one";
+    ASSERT_EQ(w.frames.size(), 4u) << "only C is re-sent";
+    EXPECT_EQ(w.frames[3].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(w.frames[3].baseSequence, 0) << "C re-stamped from 0 (B's sequence not consumed)";
+}
+
+// N-b: a NotLeader for an already re-offered batch, arriving while the route
+// re-offer is still draining (a later offer refused), parks the partition
+// again — the drain's completion must not clear that new park.  RED (pre-fix):
+// routeParked was cleared and a new batch went to the refusing owner.
+TEST(ProducerRoutePark, NotLeaderDuringTheReofferDrainIsNotLostRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    sendThree(impl, w, sink);
+    for (int i = 0; i < 3; ++i) impl.onProduceResponse(w.frames[static_cast<std::size_t>(i)].corrId, -1, kNotLeader);
+    ASSERT_EQ(impl.resendRouteParked(), 3);
+    w.refuse = {w.calls + 1};  // B's re-offer is refused: the drain stops after A
+    pump(impl, sink, 1);
+    ASSERT_EQ(w.frames.size(), 4u);
+    impl.onProduceResponse(w.frames[3].corrId, -1, kNotLeader);  // A's re-offer: NotLeader again
+    pump(impl, sink, 1);  // the drain completes (B, C)
+    ASSERT_EQ(w.frames.size(), 6u);
+    EXPECT_TRUE(impl.routeParked(1, 0)) << "the NotLeader that arrived during the drain was lost";
+    const std::vector<uint8_t> v(8, 9);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+    pump(impl, sink);
+    EXPECT_EQ(w.frames.size(), 6u) << "a new batch went to the owner that just refused";
+}
+
+// N-e: MinIsrViolation is a definite non-append (Kafka NOT_ENOUGH_REPLICAS,
+// retriable): the batch is re-sent with the SAME identity after a backoff, not
+// failed.  RED (pre-fix): D — failed with an unknown outcome.
+TEST(ProducerRoutePark, MinIsrViolationIsRetriedNotFailedRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    BatchTally t;
+    impl.setOnBatchAck(&BatchTally::on, &t);
+    const std::vector<uint8_t> v(8, 1);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 1u);
+    impl.onProduceResponse(w.frames[0].corrId, -1,
+                           static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation));
+    EXPECT_EQ(t.failed, 0) << "MinIsrViolation (nothing appended) failed the batch";
+    EXPECT_TRUE(impl.hasInFlight());
+    impl.retransmitStalled(kNow + 1'000'000LL, sink);  // inside the backoff: not yet
+    EXPECT_EQ(w.frames.size(), 1u) << "re-sent without a backoff";
+    impl.retransmitStalled(kNow + 200'000'000LL, sink);  // past the backoff
+    ASSERT_EQ(w.frames.size(), 2u);
+    EXPECT_EQ(batchcorr::base(w.frames[1].corrId), batchcorr::base(w.frames[0].corrId));
+    EXPECT_EQ(w.frames[1].epoch, w.frames[0].epoch);
+    EXPECT_EQ(w.frames[1].baseSequence, w.frames[0].baseSequence);
+    impl.onProduceResponse(w.frames[1].corrId, 100, 0);
+    EXPECT_EQ(t.okRecords, 1);
+    EXPECT_EQ(t.failed, 0);
+}

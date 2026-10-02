@@ -607,15 +607,15 @@ TEST(ProducerAcks, BrokerErrorFailsEveryRecordAndReportsTheCode) {
         ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(i + 1)));
     }
     flushAsOneBatch(impl, sink);
-    impl.onProduceResponse(cap.frames[0].corrId, -1, /*MinIsrViolation*/ 10);
+    impl.onProduceResponse(cap.frames[0].corrId, -1, /*StorageError (outcome unknown; MinIsrViolation is retriable since re-review 1 N-e)*/ 26);
     ASSERT_EQ(L.recs.size(), 2u);
     for (int i = 1; i <= 2; ++i) {
         EXPECT_EQ(L.value(i), -1);
         EXPECT_EQ(L.status(i), OpStatus::BrokerError);
-        EXPECT_EQ(L.last.at(i).ec, 10);
+        EXPECT_EQ(L.last.at(i).ec, 26);
     }
     ASSERT_EQ(acks.size(), 1u);
-    EXPECT_EQ(acks[0].errorCode, 10);
+    EXPECT_EQ(acks[0].errorCode, 26);
     EXPECT_EQ(acks[0].baseOffset, -1);
 }
 
@@ -783,8 +783,8 @@ TEST(ProducerSequence, BatchAckProducerIdIsTheStampedIdentityAcrossRotationRegre
 }
 
 // Sequence overflow (broker-agent concern): the per-partition int32 sequence
-// counter never overflows.  The broker compares sequences signed (no Kafka wrap
-// rule), so the producer moves the partition to a new epoch at sequence 0
+// counter never overflows.  The client chooses not to wrap (the broker accepts
+// the Kafka wrap since 37564ba), so the producer moves the partition to a new epoch at sequence 0
 // BEFORE the counter would pass INT32_MAX — and only once the partition's
 // in-flight batches drained (a bump with A in flight would fence A's stored
 // retransmit, EOS I-4).  A completes Ok, B and C go out at 0 / 1 under
@@ -899,7 +899,7 @@ TEST(ProducerSequence, BrokerRejectionBumpsEpochOnceRegression) {
     sendOne(impl, sink, 0);
     sendOne(impl, sink, 0);
     const int16_t e0 = cap.frames[0].epoch;
-    impl.onProduceResponse(cap.frames[0].corrId, -1, /*MinIsrViolation*/ 10);
+    impl.onProduceResponse(cap.frames[0].corrId, -1, /*StorageError (outcome unknown; MinIsrViolation is retriable since re-review 1 N-e)*/ 26);
     impl.onProduceResponse(cap.frames[1].corrId, -1, /*NotPartitionLeader (any error)*/ 9);
     sendOne(impl, sink, 0);
     ASSERT_EQ(cap.frames.size(), 3u);
@@ -979,7 +979,7 @@ TEST(ProducerSequence, RetransmitResendsTheStoredFrameAcrossAnEpochBumpRegressio
     sendOne(impl, sink, 1);  // B: rejected -> partition 1 unresolved -> its new epoch
     ASSERT_EQ(cap.frames.size(), 2u);
     const int16_t e0 = cap.frames[0].epoch;
-    impl.onProduceResponse(cap.frames[1].corrId, -1, /*MinIsrViolation*/ 10);
+    impl.onProduceResponse(cap.frames[1].corrId, -1, /*StorageError (outcome unknown; MinIsrViolation is retriable since re-review 1 N-e)*/ 26);
     ASSERT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
     // Past produceTimeoutMs (1 s): A is retransmitted.
     const int64_t t1 = kNow + 1'000LL * 1'000'000LL;
