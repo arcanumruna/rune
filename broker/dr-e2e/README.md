@@ -37,7 +37,9 @@ dr-e2e/
 * Docker (Docker Desktop on macOS is fine — netem proven, see caveat below).
 * The broker + client images built once:
   * `rune-broker-rune-{1,2,3}` — `cd rune-broker && docker compose -f docker/docker-compose.yml build`
-  * `rune-dr-client:dev` — `cd rune-client-cpp && docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol -f docker/Dockerfile.dr -t rune-dr-client:dev .`
+  * `rune-dr-client:<client git sha>` — `cd rune-client-cpp && docker build --platform linux/amd64 --build-context rune-protocol=../rune-protocol --build-context rune-fr=../rune-fr --build-context rune-codec=../rune-codec --build-context rune-ql=../rune-ql -f docker/Dockerfile.dr -t rune-dr-client:$(git rev-parse --short HEAD) .`
+    then `export DR_CLIENT_IMAGE=rune-dr-client:$(git -C ../rune-client-cpp rev-parse --short HEAD)`.
+    **Required:** the harness refuses to run without `DR_CLIENT_IMAGE`, or with any tag that is not a git SHA (never `:dev` / `:latest`).
   * `rune-netem:dev` — built automatically on first network-fault use.
 
 ## Run
@@ -93,7 +95,7 @@ matrices stay small and large ones are one edit away.
 ## Multi-client driver
 
 `harness/driver.run_clients(n, network=..., target_service=..., **cfg)` launches
-`n` `rune-dr-client:dev` containers concurrently and parses their output into a
+`n` `rune-dr-client:<sha>` (`DR_CLIENT_IMAGE`) containers concurrently and parses their output into a
 `Results` object. cfg knobs: `mode` (produce/subscribe/produce_subscribe),
 `records`, `keys`, `rate_hz`, `from` (earliest/latest/offset:N), `slow_subscriber_ms`,
 `expect`, `cid_base`, `timeout_ms`, `subscribe_ms`.

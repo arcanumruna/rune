@@ -1,7 +1,7 @@
 """Multi-client driver: launch N rune-dr-client containers + parse their output.
 
 The dr_client binary (rune-client-cpp/examples/dr_client.cpp, image
-`rune-dr-client:dev`) is fully env-driven and emits machine-parseable lines:
+`rune-dr-client:<client git sha>`, see dr_image()) is fully env-driven and emits machine-parseable lines:
 
     PRODUCED  cid=<c> key=<k> seq=<s> part=<p> offset=<o>
     DELIVERED cid=<c> key=<k> seq=<s> part=<p> offset=<o>
@@ -35,9 +35,32 @@ from typing import Optional
 
 from .dockerutil import run
 
-# Client image tag is overridable so each work-context uses a UNIQUE tag (never a
-# generic :dev/:latest that silently overwrites a baseline).  Set DR_CLIENT_IMAGE.
-DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", "rune-dr-client:dev")
+# Client image: DR_CLIENT_IMAGE is REQUIRED and must be tagged with the
+# rune-client-cpp git SHA it was built from (`rune-dr-client:<sha>`).  There is
+# no default: a generic :dev / :latest tag silently ran a stale client (the
+# pre-F8c futures build) and reported green for code not under test.  Build:
+#   cd rune-client-cpp && docker build --platform linux/amd64 \
+#     --build-context rune-protocol=../rune-protocol --build-context rune-fr=../rune-fr \
+#     --build-context rune-codec=../rune-codec --build-context rune-ql=../rune-ql \
+#     -f docker/Dockerfile.dr -t rune-dr-client:$(git rev-parse --short HEAD) .
+_SHA_TAG_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def dr_image() -> str:
+    """The DR client image to run; raises RuntimeError unless it is SHA-tagged."""
+    img = os.environ.get("DR_CLIENT_IMAGE", "").strip()
+    if not img:
+        raise RuntimeError(
+            "DR_CLIENT_IMAGE is required: set it to a git-SHA-tagged rune-dr-client image, "
+            "e.g. DR_CLIENT_IMAGE=rune-dr-client:$(git -C ../rune-client-cpp rev-parse --short HEAD)")
+    # The tag is after the last ':' that follows the last '/' (a registry port is not a tag).
+    name = img.rsplit("/", 1)[-1]
+    tag = name.rsplit(":", 1)[1] if ":" in name else ""
+    if not _SHA_TAG_RE.match(tag):
+        raise RuntimeError(
+            f"DR_CLIENT_IMAGE={img!r} is not tagged with a git SHA (7-40 lowercase hex); "
+            f"never :dev / :latest / ad-hoc names — rebuild with -t rune-dr-client:<client git sha>")
+    return img
 
 _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
@@ -275,7 +298,7 @@ def run_txn(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
-    args.append(DR_IMAGE)
+    args.append(dr_image())
     res = run(args, timeout=timeout_s)
     return _parse_txn_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
 
@@ -325,7 +348,7 @@ def run_txn_consume(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
-    args.append(DR_IMAGE)
+    args.append(dr_image())
     res = run(args, timeout=timeout_s)
     return _parse_txn_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
 
@@ -405,7 +428,7 @@ def _run_one_group_member(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
-    args.append(DR_IMAGE)
+    args.append(dr_image())
 
     res = run(args, timeout=timeout_s)
     return _parse_group_member_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
@@ -634,7 +657,7 @@ def _run_one_client(
         ]
         for k, v in env.items():
             args += ["-e", f"{k}={v}"]
-        args.append(DR_IMAGE)
+        args.append(dr_image())
 
         res = run(args, timeout=timeout_s)
         cr = _parse_client_output(cid, res.returncode, res.stdout + "\n" + res.stderr)

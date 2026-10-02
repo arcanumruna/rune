@@ -6511,12 +6511,13 @@ Runs on k3s-node-01 (Global Constraints). Sync all four repos first, then build 
 
 ```bash
 TAG="$(cd /Users/vradu/Projects/rune-broker && git rev-parse --short HEAD)"
-for r in rune-broker rune-protocol rune-fr rune-client-cpp; do
+for r in rune-broker rune-protocol rune-fr rune-codec rune-ql rune-client-cpp; do
   rsync -az --delete --exclude 'build*' --exclude '.git' /Users/vradu/Projects/$r/ root@178.104.16.102:/root/rune-e5/$r/
 done
 ssh root@178.104.16.102 "bash /root/rune-e5/rune-broker/bench/kafka-compare/vm-clean.sh && \
   cd /root/rune-e5/rune-broker && export RUNE_IMAGE_TAG=$TAG && docker compose -f docker/docker-compose.yml build && \
   cd /root/rune-e5/rune-client-cpp && docker build --build-context rune-protocol=../rune-protocol \
+     --build-context rune-fr=../rune-fr --build-context rune-codec=../rune-codec --build-context rune-ql=../rune-ql \
      -f docker/Dockerfile.dr -t rune-dr-client:$TAG . && \
   export DR_CLIENT_IMAGE=rune-dr-client:$TAG && cd /root/rune-e5/rune-broker/dr-e2e && \
   python3 -m pytest tests/test_dr1_baseline.py -x -q && \

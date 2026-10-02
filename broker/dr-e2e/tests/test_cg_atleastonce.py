@@ -44,7 +44,7 @@ from harness.driver import (
     _parse_group_member_output,
     _run_one_group_member,
     run_clients,
-    DR_IMAGE,
+    dr_image,
 )
 from harness.dockerutil import run as docker_run
 from harness.invariants import (
@@ -120,7 +120,7 @@ def _run_group_member_named(
     ]
     for k, v in env.items():
         args += ["-e", f"{k}={v}"]
-    args.append(DR_IMAGE)
+    args.append(dr_image())
 
     res = docker_run(args, timeout=timeout_s)
     return name, _parse_group_member_output(cid, res.returncode, res.stdout + "\n" + res.stderr)
