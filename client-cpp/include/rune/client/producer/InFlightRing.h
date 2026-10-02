@@ -15,14 +15,23 @@ namespace rune::client::producer {
 ///                session correlation bases are < 2^50; neither reaches 2^62)
 ///   bits 50..61  producer ordinal inside its ProducerHub (<= 4095)
 ///   bits 32..49  partition slot inside the producer      (<= 262143)
-///   bits  0..31  per-partition batch sequence; slot = seq & mask, and an exact
-///                corrId comparison rejects stale ids after the slot is reused
+///   bits 24..31  ATTEMPT tag (EOS follow-ups I-2): bumped on every re-send of
+///                the batch's stored frame, so an answer names the attempt it
+///                answers (Kafka: a new correlation id per request).  An error
+///                answer of a superseded attempt is ignored; an OK of any
+///                attempt is a success (stored is stored)
+///   bits  0..23  per-partition batch sequence; slot = seq & mask, and an exact
+///                comparison of the attempt-free id rejects stale ids after the
+///                slot is reused (2^24 batches per slot between reuses)
 namespace batchcorr {
 inline constexpr int64_t  kTag          = int64_t{1} << 62;
 inline constexpr int      kOrdinalShift = 50;
 inline constexpr int      kSlotShift    = 32;
 inline constexpr uint32_t kMaxOrdinal   = (1u << 12) - 1;
 inline constexpr uint32_t kMaxSlot      = (1u << 18) - 1;
+inline constexpr int      kAttemptShift = 24;
+inline constexpr uint32_t kSeqMask      = (1u << kAttemptShift) - 1;
+inline constexpr int64_t  kAttemptMask  = int64_t{0xFF} << kAttemptShift;
 // F8c C7 fix round 2 (F2): an ordinal reused by a new producer CARRIES ITS
 // SEQUENCES FORWARD — the new incarnation's rings start past the highest
 // sequence the previous one ever used on any partition (ProducerHub::remove
@@ -32,9 +41,19 @@ inline constexpr uint32_t kMaxSlot      = (1u << 18) - 1;
 // batches on one slot while a response is still outstanding), the same bound
 // one producer already relies on against itself.  Zero hot-path cost.
 
-[[nodiscard]] constexpr int64_t make(uint32_t ordinal, uint32_t slot, uint32_t seq) noexcept {
+[[nodiscard]] constexpr int64_t make(uint32_t ordinal, uint32_t slot, uint32_t seq,
+                                     uint8_t attempt = 0) noexcept {
     return kTag | (static_cast<int64_t>(ordinal & kMaxOrdinal) << kOrdinalShift) |
-           (static_cast<int64_t>(slot & kMaxSlot) << kSlotShift) | static_cast<int64_t>(seq);
+           (static_cast<int64_t>(slot & kMaxSlot) << kSlotShift) |
+           (static_cast<int64_t>(attempt) << kAttemptShift) | static_cast<int64_t>(seq & kSeqMask);
+}
+/// The id without its attempt tag (what a live slot stores).
+[[nodiscard]] constexpr int64_t base(int64_t c) noexcept { return c & ~kAttemptMask; }
+[[nodiscard]] constexpr uint8_t attempt(int64_t c) noexcept {
+    return static_cast<uint8_t>((c & kAttemptMask) >> kAttemptShift);
+}
+[[nodiscard]] constexpr int64_t withAttempt(int64_t c, uint8_t a) noexcept {
+    return base(c) | (static_cast<int64_t>(a) << kAttemptShift);
 }
 [[nodiscard]] constexpr bool isBatch(int64_t c) noexcept { return c > 0 && (c & kTag) != 0; }
 [[nodiscard]] constexpr uint32_t ordinal(int64_t c) noexcept {
@@ -43,13 +62,16 @@ inline constexpr uint32_t kMaxSlot      = (1u << 18) - 1;
 [[nodiscard]] constexpr uint32_t slot(int64_t c) noexcept {
     return static_cast<uint32_t>(c >> kSlotShift) & kMaxSlot;
 }
-[[nodiscard]] constexpr uint32_t seq(int64_t c) noexcept { return static_cast<uint32_t>(c); }
+[[nodiscard]] constexpr uint32_t seq(int64_t c) noexcept { return static_cast<uint32_t>(c) & kSeqMask; }
 } // namespace batchcorr
 
 struct InFlightBatch {
-    int64_t  corrId            = 0;  ///< 0 = free slot
+    int64_t  corrId            = 0;  ///< 0 = free slot; attempt-free (batchcorr::base)
+    uint8_t  attemptTag        = 0;  ///< the attempt of the frame on the wire (batchcorr::attempt)
+    int64_t  producerId        = -1; ///< identity the frame was (last) stamped with
+    uint64_t lastSendTick      = 0;  ///< ProducerImpl::sendTick_ at the latest offer (ordering, not time)
     int64_t  firstSendNs       = 0;
-    int64_t  lastSendNs        = 0;  ///< duty clock of the latest offer of wireFrame (fast retransmit)
+    int64_t  lastSendNs        = 0;  ///< duty clock of the latest offer of wireFrame
     int64_t  attemptDeadlineNs = 0;
     uint64_t ackStart          = 0;  ///< this batch's slice of the partition ack ring
     int32_t  ackCount          = 0;
@@ -73,6 +95,8 @@ public:
     explicit InFlightRing(uint32_t minCapacity = 1) {
         uint32_t cap = 1;
         while (cap < minCapacity) cap <<= 1;
+        // The slot index is the low bits of the 24-bit sequence.
+        if (cap > batchcorr::kSeqMask + 1u) cap = batchcorr::kSeqMask + 1u;
         slots_.resize(cap);
         mask_ = cap - 1;
     }
@@ -98,17 +122,18 @@ public:
     /// Claims the next slot (caller checked !full()) and stamps its corrId.
     InFlightBatch& claim(uint32_t ordinal, uint32_t partitionSlot) noexcept {
         InFlightBatch& b = slots_[head_ & mask_];
-        b.corrId = batchcorr::make(ordinal, partitionSlot, static_cast<uint32_t>(head_));
+        b.corrId     = batchcorr::make(ordinal, partitionSlot, static_cast<uint32_t>(head_));
+        b.attemptTag = 0;
         ++head_;
         claimed_ = true;
         ++live_;
         return b;
     }
 
-    /// The live batch with exactly this corrId, else nullptr (duplicate / stale).
+    /// The live batch this corrId (any attempt) names, else nullptr (duplicate / stale).
     [[nodiscard]] InFlightBatch* find(int64_t corrId) noexcept {
         InFlightBatch& b = slots_[batchcorr::seq(corrId) & mask_];
-        return (corrId != 0 && b.corrId == corrId) ? &b : nullptr;
+        return (corrId != 0 && b.corrId == batchcorr::base(corrId)) ? &b : nullptr;
     }
 
     /// Frees a live batch (idempotent) and advances the tail past freed slots.

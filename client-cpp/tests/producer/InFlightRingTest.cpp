@@ -6,11 +6,14 @@
 using namespace rune::client::producer;
 
 TEST(BatchCorrId, RoundTripsAndIsDistinctFromClientCounterIds) {
-    const int64_t c = batchcorr::make(4095, 262143, 0xFFFFFFFFu);
+    const int64_t c = batchcorr::make(4095, 262143, 0xFFFFFFFFu, 0xAB);
     EXPECT_TRUE(batchcorr::isBatch(c));
     EXPECT_EQ(batchcorr::ordinal(c), 4095u);
     EXPECT_EQ(batchcorr::slot(c), 262143u);
-    EXPECT_EQ(batchcorr::seq(c), 0xFFFFFFFFu);
+    EXPECT_EQ(batchcorr::seq(c), batchcorr::kSeqMask) << "24-bit sequence";
+    EXPECT_EQ(batchcorr::attempt(c), 0xAB);
+    EXPECT_EQ(batchcorr::base(c), batchcorr::make(4095, 262143, 0xFFFFFFFFu));
+    EXPECT_EQ(batchcorr::withAttempt(batchcorr::base(c), 0xAB), c);
     EXPECT_GT(c, 0);
     EXPECT_FALSE(batchcorr::isBatch(1));                   // Client::nextCorrId_ range
     EXPECT_FALSE(batchcorr::isBatch(3'000'000'000'000LL)); // SessionMachine corr bases
@@ -68,4 +71,18 @@ TEST(InFlightRing, DuplicateAndStaleAcksAreIgnoredRegression) {
     EXPECT_EQ(r.find(first), nullptr) << "stale id must not match the reused slot";
     EXPECT_NE(r.find(reused), nullptr);
     EXPECT_EQ(r.live(), 2u);
+}
+
+// EOS follow-ups I-2: every attempt of a live batch is found (find ignores the
+// attempt tag); the slot keeps the attempt-free id.
+TEST(InFlightRing, FindMatchesEveryAttemptOfALiveBatchRegression) {
+    InFlightRing r(4);
+    InFlightBatch& b = r.claim(2, 7);
+    EXPECT_EQ(batchcorr::attempt(b.corrId), 0);
+    for (uint8_t a : {uint8_t{0}, uint8_t{1}, uint8_t{255}}) {
+        EXPECT_EQ(r.find(batchcorr::withAttempt(b.corrId, a)), &b) << int(a);
+    }
+    const int64_t id = b.corrId;
+    r.release(b);
+    EXPECT_EQ(r.find(batchcorr::withAttempt(id, 3)), nullptr);
 }
