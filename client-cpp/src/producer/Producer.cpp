@@ -131,24 +131,38 @@ namespace {
 }
 } // namespace
 
-SendResult Producer::trySend(TopicHandle            topic,
-                             const Key&             key,
-                             std::span<const uint8_t> value) noexcept
-{
-    if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
-    Completions* bq = impl_->batchAckCq();
+// The one send body (T15b M3): the partition is computed by the caller, once.
+SendResult Producer::trySendPart_(TopicHandle topic, int32_t part, const Key& key,
+                                  std::span<const uint8_t> value) noexcept {
+    producer::ProducerImpl* impl = impl_;
+    Completions* bq = impl->batchAckCq();
     if (bq == nullptr) [[likely]] {
-        return impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value, 0);
+        return impl->trySubmit(topic.topicId, part, key, value, 0);
     }
     const SendResult u = reserveBatchUnit(*bq);
     if (u != SendResult::Ok) return u;
-    const SendResult r = impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value, 0);
+    const SendResult r = impl->trySubmit(topic.topicId, part, key, value, 0);
     if (r == SendResult::Ok) {
         ++bq->producerIssued_;
     } else {
         bq->unreserve(producer::kAckRecordBytes);
     }
     return r;
+}
+
+SendResult Producer::trySend(TopicHandle            topic,
+                             const Key&             key,
+                             std::span<const uint8_t> value) noexcept
+{
+    if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
+    return trySendPart_(topic, key.partition(topic.partitionCount), key, value);
+}
+
+SendResult Producer::trySendTo(TopicHandle topic, int32_t partition, const Key& key,
+                               std::span<const uint8_t> value) noexcept {
+    if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
+    if (partition < 0 || partition >= topic.partitionCount) [[unlikely]] return SendResult::InvalidArgument;
+    return trySendPart_(topic, partition, key, value);
 }
 
 void Producer::send(TopicHandle            topic,
@@ -158,18 +172,27 @@ void Producer::send(TopicHandle            topic,
     if (!impl_ || !topic.valid()) {
         throw std::invalid_argument("Producer::send: invalid topic handle");
     }
+    sendTo(topic, key.partition(topic.partitionCount), key, value);
+}
+
+void Producer::sendTo(TopicHandle topic, int32_t part, const Key& key, std::span<const uint8_t> value) {
+    if (!impl_ || !topic.valid()) {
+        throw std::invalid_argument("Producer::send: invalid topic handle");
+    }
+    if (part < 0 || part >= topic.partitionCount) {
+        throw std::invalid_argument("Producer::sendTo: partition out of range");
+    }
     if (impl_->batchAckCq() != nullptr) [[unlikely]] {
         // Credit-reserving path: retry back-pressure only (QueueFull is the
         // caller's to resolve — it must poll its queue).
         producer::ProducerImpl::BlockingWait w = impl_->beginBlockingWait();
         for (;;) {
-            const SendResult r = trySend(topic, key, value);
+            const SendResult r = trySendPart_(topic, part, key, value);
             if (r == SendResult::Ok) return;
             producer::ProducerImpl::throwForSendResult(r);  // QueueFull included: poll it
             impl_->blockingWaitStep(w);
         }
     }
-    const int32_t part = key.partition(topic.partitionCount);
     const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, 0);
     if (r == SendResult::Ok) [[likely]] return;
     impl_->sendBlocking(r, topic.topicId, part, key, value);
@@ -360,6 +383,16 @@ uint64_t Producer::testCallbackExceptionCount() const noexcept {
 
 uint64_t Producer::recordsSent() const noexcept {
     return impl_ ? impl_->recordsSent() : 0u;
+}
+
+long Producer::testClaimRecord(TopicHandle topic, int32_t partition, const Key& key,
+                               std::span<const uint8_t> value) noexcept {
+    if (!impl_ || !topic.valid()) return -1;
+    return static_cast<long>(impl_->testClaimSendRecord(topic.topicId, partition, key, value, 0));
+}
+
+void Producer::testCommitClaim(long claimIndex) noexcept {
+    if (impl_ && claimIndex >= 0) impl_->testCommitClaim(static_cast<aeron::util::index_t>(claimIndex));
 }
 
 } // namespace rune::client

@@ -362,6 +362,16 @@ public:
     /// sends report BackPressured.
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
+    /// Router forms (T15b M3: a ShardGroup / ClientShard hashes the key ONCE to
+    /// route and passes the result down): `partition` is the caller's
+    /// key.partition(topic.partitionCount) — it is used as is, never re-hashed.
+    /// trySendTo: InvalidArgument for a partition outside [0, partitionCount),
+    /// otherwise exactly trySend().  sendTo: exactly send() (std::invalid_argument
+    /// for a bad partition).
+    [[nodiscard]] SendResult trySendTo(TopicHandle topic, int32_t partition, const Key& key,
+                                       std::span<const uint8_t> value) noexcept;
+    void sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value);
+
     // ---- Opt-in ack paths (F8c C6: ZERO per-send allocation) ----------------
 
     /// Send with a polled completion: exactly one Completion{op = Send,
@@ -512,7 +522,18 @@ public:
     /// close() in Thread mode).
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept;
 
+    /// Test seams (T15b R3, Ring ingress only): claim a void record in the
+    /// producer ring WITHOUT committing it (returns the claim index; < 0: not
+    /// claimed), then commit it — the "claimed before the close, committed
+    /// after it" window a begin-close must wait for.
+    [[nodiscard]] long testClaimRecord(TopicHandle topic, int32_t partition, const Key& key,
+                                       std::span<const uint8_t> value) noexcept;
+    void testCommitClaim(long claimIndex) noexcept;
+
 private:
+    /// T15b M3: the one send body; `part` computed once by the caller.
+    [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
+                                          std::span<const uint8_t> value) noexcept;
     /// F8c C7: the §3.3 release of the handle's share (see the destructor).
     void release_() noexcept;
 

@@ -23,7 +23,9 @@
 #include <Subscription.h>
 
 #include <cstdint>
+#include <chrono>
 #include <deque>
+#include <map>
 #include <memory>
 #include <set>
 #include <span>
@@ -123,6 +125,23 @@ struct InvokerGateway {
     // commit flag of every EndTxn received (1 commit / 0 abort).
     bool                 replyTxn = false;
     std::vector<uint8_t> endTxnCommits;
+    // T15b fix round 1 (shard lifecycle / gates):
+    std::set<int> silentEndpoints;   // ConnectRequests arriving on these endpoints are never answered
+    int16_t       connectErrorCode = 0;  // != 0: every ConnectRequest -> ConnectResponse{code}
+    int           framesReceived   = 0;  // every frame from the client, any template
+    bool          uniqueSessionIds = false;  // each fresh connect (sessionId 0) gets its own id
+    // A slow broker: ConnectResponses go out this long after the request (real
+    // time — the stimulus of a test about the caller's own wait budget).
+    std::chrono::milliseconds connectReplyDelay{0};
+    // Replies (ConnectResponse, ProduceResponse, ...) of a session go to the
+    // egress channel/stream ITS ConnectRequest announced (a real broker's rule),
+    // not the fixed constructor egress.  acksPerEgress counts ProduceResponses
+    // per announced egress channel.
+    bool                       replyOnAnnouncedEgress = false;
+    std::map<std::string, int> acksPerEgress;
+    // Record values per partition, in arrival order (keepValues).
+    bool                                                   keepValues = false;
+    std::map<int32_t, std::vector<std::vector<uint8_t>>> values;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -137,6 +156,7 @@ struct InvokerGateway {
 
     ~InvokerGateway() {
         endpoints.clear();
+        sessionPubs.clear();  // publications before their Aeron client
         aeron.reset();
     }
 
@@ -164,12 +184,43 @@ struct InvokerGateway {
         return true;
     }
 
+    /// ErrorResponse{SessionExpired} to `sessionId` (the broker expired it).
+    void expireSession(int64_t sessionId) {
+        namespace rcc = rune::client::codec;
+        std::vector<uint8_t> out(128);
+        const std::size_t    n = rcc::encodeErrorResponse(
+            out.data(), out.size(),
+            static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "expired", sessionId, 0);
+        sendToSession(sessionId, out.data(), n);
+    }
+
     /// One gateway duty cycle: conductor, registrations, outbox, polls.
     int pump() {
         int work = aeron->conductorAgentInvoker().invoke();
         for (auto& ep : endpoints) {
             if (!ep->sub) ep->sub = aeron->findSubscription(ep->subReg);
             if (!ep->pub) ep->pub = aeron->findExclusivePublication(ep->pubReg);
+        }
+        for (auto& [sid, sp] : sessionPubs) {
+            if (!sp.pub) sp.pub = aeron->findExclusivePublication(sp.reg);
+        }
+        for (std::size_t i = 0; i < delayedConnects.size();) {
+            if (std::chrono::steady_clock::now() >= delayedConnects[i].first) {
+                const std::vector<uint8_t> f = std::move(delayedConnects[i].second);
+                delayedConnects.erase(delayedConnects.begin() + static_cast<std::ptrdiff_t>(i));
+                onFrame(0, f.data(), f.size(), /*replay=*/true);
+                ++work;
+            } else {
+                ++i;
+            }
+        }
+        for (std::size_t i = 0; i < sessionOutbox.size();) {
+            if (offerSession(sessionOutbox[i].first, sessionOutbox[i].second)) {
+                sessionOutbox.erase(sessionOutbox.begin() + static_cast<std::ptrdiff_t>(i));
+                ++work;
+            } else {
+                ++i;
+            }
         }
         for (std::size_t i = 0; i < outbox.size();) {
             if (offerNow(outbox[i].first, outbox[i].second)) {
@@ -220,7 +271,7 @@ struct InvokerGateway {
         msg.partitions    = std::span<const rp::PartitionEntry>(parts);
         std::vector<uint8_t> buf(msg.encodedSize());
         const std::size_t n = msg.encode(buf.data());
-        send(0, buf.data(), n);
+        sendToSession(sessionId, buf.data(), n);
     }
 
     /// ProduceResponse from the endpoint that received the batch.
@@ -231,7 +282,24 @@ struct InvokerGateway {
         nextOffset += pr.records;
         const std::size_t n = rcc::encodeProduceResponse(buf, sizeof buf, errorCode, pr.partition,
                                                          base, pr.sessionId, pr.corrId);
+        if (replyOnAnnouncedEgress) {
+            const auto it = sessionPubs.find(pr.sessionId);
+            if (it != sessionPubs.end()) ++acksPerEgress[it->second.channel];
+            sendToSession(pr.sessionId, buf, n);
+            return;
+        }
         send(pr.endpoint, buf, n);
+    }
+
+    /// A reply to one session: its announced egress (replyOnAnnouncedEgress),
+    /// else the node endpoint's publication.
+    void sendToSession(int64_t sessionId, const uint8_t* b, std::size_t n) {
+        if (!replyOnAnnouncedEgress || sessionPubs.count(sessionId) == 0) {
+            send(0, b, n);
+            return;
+        }
+        std::vector<uint8_t> frame(b, b + n);
+        if (!offerSession(sessionId, frame)) sessionOutbox.emplace_back(sessionId, std::move(frame));
     }
 
     /// Push one Records frame of `count` records at baseOffset to a subscription.
@@ -254,6 +322,24 @@ struct InvokerGateway {
     }
 
 private:
+    struct SessionPub {
+        std::string                                  channel;
+        int64_t                                      reg = -1;
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+    };
+    std::map<int64_t, SessionPub>                     sessionPubs;
+    std::vector<std::pair<std::chrono::steady_clock::time_point, std::vector<uint8_t>>> delayedConnects;
+    std::vector<std::pair<int64_t, std::vector<uint8_t>>> sessionOutbox;
+    int64_t                                           nextUniqueSessionId = 1000;
+
+    bool offerSession(int64_t sessionId, const std::vector<uint8_t>& f) {
+        auto& sp = sessionPubs[sessionId];
+        if (!sp.pub) return false;
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(f.data()),
+                                           static_cast<aeron::util::index_t>(f.size()));
+        return sp.pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
+    }
+
     bool offerNow(int endpoint, const std::vector<uint8_t>& f) {
         auto& ep = endpoints[static_cast<std::size_t>(endpoint)];
         if (!ep->pub) return false;
@@ -262,24 +348,38 @@ private:
         return ep->pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
     }
 
-    void onFrame(int endpoint, const uint8_t* buf, std::size_t len) {
+    void onFrame(int endpoint, const uint8_t* buf, std::size_t len, bool replay = false) {
         namespace rcc = rune::client::codec;
         namespace rp  = rune::protocol::client;
         const auto tid = rcc::peekTemplate(buf, len);
         if (!tid) return;
+        if (!replay) ++framesReceived;
         switch (static_cast<rcc::TemplateId>(*tid)) {
         case rcc::TemplateId::Connect: {
             const auto c = rcc::decodeConnectRequest(buf, len);
             if (!c) return;
+            if (!replay && connectReplyDelay.count() > 0) {
+                delayedConnects.emplace_back(std::chrono::steady_clock::now() + connectReplyDelay,
+                                             std::vector<uint8_t>(buf, buf + len));
+                return;
+            }
             ++connects;
-            if (!replyConnects) return;
+            if (!replyConnects || silentEndpoints.count(endpoint) != 0) return;
             for (const Produced& pr : ackBeforeNextConnect) ack(pr);
             ackBeforeNextConnect.clear();
+            int64_t sid = assignedSessionId;
+            if (uniqueSessionIds) sid = c->sessionId != 0 ? c->sessionId : nextUniqueSessionId++;
+            if (replyOnAnnouncedEgress && sessionPubs.count(sid) == 0) {
+                SessionPub sp;
+                sp.channel = std::string(c->egressChannel);
+                sp.reg     = aeron->addExclusivePublication(sp.channel, c->egressStreamId);
+                sessionPubs.emplace(sid, std::move(sp));
+            }
             uint8_t out[64];
             const std::size_t n = rcc::encodeConnectResponse(
-                out, sizeof out, static_cast<int16_t>(rcc::ErrorCode::OK), 0, assignedSessionId,
-                c->sessionId, c->correlationId);
-            send(0, out, n);
+                out, sizeof out, connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK),
+                0, sid, c->sessionId, c->correlationId);
+            sendToSession(sid, out, n);
             for (const auto& [sub, base] : recordsAfterNextConnect) pushRecords(sub, base, 1);
             recordsAfterNextConnect.clear();
             return;
@@ -298,6 +398,12 @@ private:
             const Produced pr{pv->topicId, pv->partition, pv->sessionId, pv->correlationId,
                               r.recordCount(), r.baseSequence(), endpoint};
             produced.push_back(pr);
+            if (keepValues) {
+                auto& vs = values[pv->partition];
+                r.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
+                    vs.emplace_back(v.begin(), v.end());
+                });
+            }
             if (pv->correlationId == 0) return;  // acks=None
             if (!replyAcks || holdPartitions.count(pv->partition) != 0) {
                 held.push_back(pr);

@@ -97,7 +97,10 @@ struct TransportConfig {
 ///            be dead while the conductor runs; after a stall the conductor would
 ///            otherwise see a stale driver heartbeat and close itself (the hidden
 ///            third timeout).  Shard clients run 1 h liveness, so 1 h.  A plain
-///            Invoker Client (10 s liveness) keeps exactly today's 10 s.
+///            Invoker Client keeps exactly today's 10 s at the default 10 s
+///            liveness; one configured with a liveness ABOVE 10 s now gets that
+///            liveness as its driver timeout too (T15a m11: a deliberate,
+///            benign change — the same stall budget for both timeouts).
 [[nodiscard]] constexpr long mediaDriverTimeoutMsFor(const TransportConfig& c) noexcept {
     if (c.driverMode != DriverMode::Invoker) return kAeronDefaultMediaDriverTimeoutMs;
     const auto livenessMs = static_cast<long>(c.clientLivenessTimeoutNs / 1'000'000);

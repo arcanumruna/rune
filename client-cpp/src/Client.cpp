@@ -130,6 +130,12 @@ Client::Client(ClientConfig cfg)
     // never holds more than one entry per registry slot, so reserve it once
     // here and the push_back there can never allocate (or throw).
     deferredReleases_.reserve(kMaxCqs);
+    // T15b: the shard-status ring exists before the runner starts (it is the
+    // ring's producer from its first cycle).
+    if (cfg_.shardStatus) {
+        shardRing_ = std::make_unique<detail::StatusRing<shard::ShardStatus, 64 * 1024>>();
+        shardDuty_.shard = shardPublished_.shard = cfg_.shardIndex;
+    }
     // MD1 IMPORTANT-2: the seed session's currentLeaderChannel is initialised to
     // the config ingress channel (== gatewayChannel) inside ClientAgent's Session
     // constructor — Task 1.1 (was Client::currentLeaderChannel_ here).
@@ -1119,7 +1125,9 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     p.target.reservedBytes = h.reservedBytes;
     p.target.cqRef         = h.cqRef;
     pinCqSlot_(p.target);  // I3: the slot stays out of reuse until this op completes
-    if (closing_) {  // close()'s final drain: an accepted op completes exactly once
+    // close()'s final drain, or T15b: failed for good (no session can answer) —
+    // an accepted op completes exactly once, Closed.
+    if (closing_ || transportFailed_) {
         completeCtl_(p, OpStatus::Closed);
         return;
     }
@@ -1459,6 +1467,11 @@ int Client::dutyCycle(int64_t nowNs) {
         ~InCycle() { flag = prev; }
     } inCycle(inDutyCycle_);
     if (testDutyCycleHook_ != nullptr) [[unlikely]] testDutyCycleHook_();
+    if (transportFailed_) [[unlikely]] {
+        const int w = failedDutyCycle_(nowNs);
+        if (cfg_.shardStatus) publishShardStatus_();
+        return w;
+    }
 
     // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
     //    ProduceResponses are decoded and buffered, not dispatched through hooks.
@@ -1520,7 +1533,91 @@ int Client::dutyCycle(int64_t nowNs) {
     if (agent_.takeOrphanHint()) [[unlikely]] scanOrphans_();
     if (!orphans_.empty()) [[unlikely]] work += applyDueOrphans_();
     if (!releases_.empty()) [[unlikely]] work += reapReleases_();
+
+    // 6. T15b: the failure path — the Aeron client closed itself (or the seed
+    //    got a terminal Rejected answer): fail for good, once.
+    if (agent_.transportClosed() || agent_.seedMachine().state() == session::SessionState::Rejected)
+        [[unlikely]] {
+        enterFailed_();
+        ++work;
+    }
+    // 7. T15b: shard status (ClientShard) — derived and published on change.
+    if (cfg_.shardStatus) [[unlikely]] publishShardStatus_();
     return work;
+}
+
+void Client::enterFailed_() {
+    if (transportFailed_) return;
+    transportFailed_ = true;
+    const bool rejected = !agent_.transportClosed();
+    std::fprintf(stderr,
+                 "rune-client: %s — failing for good: every accepted record completes Closed, "
+                 "no further I/O\n",
+                 rejected ? "the broker rejected the session (non-retriable)" : "the Aeron client closed");
+    // Stop all I/O first, so nothing below can reach the transport.
+    agent_.enterFailedMode();
+    // Tail-close every producer's intake (a claim before the close is still read
+    // from the ring and completed) and complete every accepted, unacknowledged
+    // record Closed — exactly once (ProducerImpl's Discarding life).
+    producerHub_.failCloseAll(OpStatus::Closed);
+    // Pending control ops can never be answered now.
+    failAllControl_(OpStatus::Closed);
+}
+
+int Client::failedDutyCycle_(int64_t nowNs) {
+    ++failedDutyCycles_;
+    // Commands only (no driver pumping, no poll, no ticks; sends dropped).
+    int work = agent_.doWork(nowNs);
+    if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);
+    // Producers in Discarding: records still read from their closed rings
+    // complete Closed; nothing is sent (every offer is refused).
+    work += producerDuty_(nowNs);
+    // A control op issued after the failure completes Closed at once.
+    if (hasPendingConnect_ || !pendingCtl_.empty()) failAllControl_(OpStatus::Closed);
+    if (!drainWaiters_.empty()) work += checkDrain_();
+    if (agent_.takeOrphanHint()) scanOrphans_();
+    if (!orphans_.empty()) work += applyDueOrphans_();
+    if (!releases_.empty()) work += reapReleases_();
+    return work;
+}
+
+void Client::publishShardStatus_() noexcept {
+    const auto& m = agent_.seedMachine();
+    DutyView    v;
+    v.seedState          = m.state();
+    v.seedEverLive       = m.everLive();
+    v.seedRejectCode     = m.rejectCode();
+    v.seedSessionId      = m.sessionId();
+    v.seedBackoffAttempt = m.backoffAttempt();
+    v.leaderSessions     = agent_.leaderSessionCount();
+    v.leadersDownMask    = agent_.leaderSessionsDownMask();
+    v.transportFailed    = transportFailed_ && agent_.transportClosed();
+    v.producerClosing    = producerHub_.anyClosing();
+    shardDuty_ = shard::deriveShardStatus(v, cfg_.shardIndex);
+    if (!shardDirty_ && shard::sameStatus(shardDuty_, shardPublished_)) [[likely]] return;
+    // Ordinary updates are latest-value (a refused one is retried next cycle and
+    // superseded by a newer one); Failed is a lifecycle snapshot: it always fits
+    // and does NOT finish the ring (Closed still follows at teardown).
+    const bool ok = shardDuty_.state == shard::ShardState::Failed ? shardRing_->publishFinal(shardDuty_)
+                                                                    : shardRing_->tryPublish(shardDuty_);
+    if (ok) {
+        shardPublished_ = shardDuty_;
+        shardDirty_     = false;
+    } else {
+        shardDirty_ = true;
+    }
+}
+
+void Client::publishShardClosed() noexcept {
+    if (!shardRing_ || shardClosed_) return;
+    shardClosed_         = true;
+    shard::ShardStatus c = shardDuty_;
+    c.state              = shard::ShardState::Closed;
+    c.failure            = shard::ShardFailure::None;
+    c.downMask           = 0;
+    (void)shardRing_->publishFinal(c);
+    shardRing_->close();
+    shardDuty_ = c;
 }
 
 void Client::syncSeedSession_() noexcept {
@@ -1573,16 +1670,19 @@ void Client::runLoop() {
     if (cfg_.runnerCore >= 0 && !detail::pinCurrentThreadToCore(cfg_.runnerCore)) {
         std::fprintf(stderr, "rune-client: could not pin the runner to core %d\n", cfg_.runnerCore);
     }
+    // T15b: every loop also ends when the Client failed for good (M2): the
+    // runner then parks 1 ms per cycle below — it only drains the command ring
+    // (close, releases) and the producers' closed rings, with no I/O.
     if (cfg_.idleMode == IdleMode::LowLatency) {
         // spin 5, yield 3, park 1 µs .. 100 µs: the runner drives the producer drain
         // AND the ack poll, so its park ceiling is the client floor on ack latency.
         aeron::concurrent::BackoffIdleStrategy idle(
             5, 3, std::chrono::duration<long, std::nano>(1'000),
             std::chrono::duration<long, std::nano>(100'000));
-        while (!agent_.commandRingClosed()) idle.idle(dutyCycle(now()));
+        while (!agent_.commandRingClosed() && !transportFailed_) idle.idle(dutyCycle(now()));
     } else if (cfg_.idleMode == IdleMode::BusySpin) {
         // Never park or yield: pin this runner to a dedicated core.
-        while (!agent_.commandRingClosed()) {
+        while (!agent_.commandRingClosed() && !transportFailed_) {
             if (dutyCycle(now()) == 0) {
 #if defined(__x86_64__) || defined(__i386__)
                 __asm__ volatile("pause" ::: "memory");
@@ -1597,7 +1697,12 @@ void Client::runLoop() {
         // Balanced: spins -> yields -> parks (max 1 ms).
         aeron::concurrent::BackoffIdleStrategy idle(
             10, 20, std::chrono::duration<long, std::nano>(1'000), std::chrono::milliseconds(1));
-        while (!agent_.commandRingClosed()) idle.idle(dutyCycle(now()));
+        while (!agent_.commandRingClosed() && !transportFailed_) idle.idle(dutyCycle(now()));
+    }
+    // T15b M2: failed for good — a parked loop until close() (no I/O, no spin).
+    while (!agent_.commandRingClosed()) {
+        (void)dutyCycle(now());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 

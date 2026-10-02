@@ -233,6 +233,13 @@ def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     root = Path(args[0]) if args else Path(__file__).resolve().parent.parent
     files = base.collect(root)
+    # T15b: --expect-covered=a,b,...  every listed path must be among the scanned files.
+    for a in argv:
+        if a.startswith("--expect-covered="):
+            missing = [rel for rel in a.split("=", 1)[1].split(",") if rel and rel not in files]
+            if missing:
+                print("check_no_shared_ptr_handles: NOT SCANNED: " + ", ".join(missing))
+                return 1
     if "--handles" in argv:
         # NoSharedPtrHandlesGuardRegression: only the public handle headers.
         violations = evaluate_handles(files, TRANSPORT, REQUIRED_HANDLE_HEADERS)

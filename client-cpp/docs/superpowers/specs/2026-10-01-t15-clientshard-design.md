@@ -90,6 +90,7 @@ There is no cross-shard state.
   1. **Explicit `firstCore ≥ 0`:** shard i goes to `firstCore + i`. Every one of those cores must be in the allowed set, otherwise `invalid_argument`.
   2. **`pin = true` with no `firstCore`:** shard i goes to the i-th core of the allowed set in ascending order, after skipping the reserved cores. The reserved cores are the **lowest** `reservedCores` cores of the calling thread's affinity mask (documented, e.g. for a co-located broker or the app's main thread).
   3. **macOS:** pinning is unsupported, so `pin = true` or `firstCore ≥ 0` is rejected with `invalid_argument` rather than a silent no-pin.
+  4. **Invoker mode:** `pin = true` or `firstCore ≥ 0` is rejected with `invalid_argument` (T15a m12). The owner is an app thread the app pins itself; in the target configuration the app pins its owner thread to core 0.
 - **Invoker mode:** AUTO is **rejected** (`invalid_argument`). Each app thread constructs its own `ClientShard(cfg, i)`, so N must equal the number of driving threads, which only the app knows. Each thread's affinity mask can also differ, so the threads could not all derive the same N.
 - **Guidance (documented on `ShardGroupConfig`):**
   - **A dedicated box:** leave AUTO. A 16-core box with ≥ 16 partitions gets 16 shard threads; use `reservedCores` for cores the app or a co-located process needs.

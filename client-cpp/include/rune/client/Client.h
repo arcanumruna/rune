@@ -54,6 +54,8 @@
 #include <rune/client/Completions.h>
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
+#include <rune/client/DutyView.h>
+#include <rune/client/shard/ShardState.h>
 
 #include <chrono>
 #include <cstddef>
@@ -127,6 +129,7 @@ enum class RunnerMode : uint8_t { Thread, Invoker };
 // Injected monotonic clock (ns), sampled once per duty cycle.  nullptr = steady clock.
 using NanoClock = int64_t (*)() noexcept;
 
+
 // ---------------------------------------------------------------------------
 // ClientConfig
 // ---------------------------------------------------------------------------
@@ -187,6 +190,13 @@ struct ClientConfig {
     // reconnectForeverAfterLive).  Default false = today's behaviour; shard
     // clients force true.
     bool       reconnectForeverAfterLive = false;
+    // T15b: shard status (ClientShard sets it; a plain Client keeps false = no
+    // cost beyond one predictable branch per duty cycle).  The duty thread
+    // derives this Client's ShardStatus every cycle (shard/ShardState.h — plain
+    // code, no indirect call) and publishes it on change into a StatusRing the
+    // owner / control thread drains with pollShardStatus().
+    bool     shardStatus = false;
+    uint32_t shardIndex  = 0;
 
     // CB-2: Static topic configuration for the producer.
     // Mirrors the broker's RUNE_TOPICS environment variable.
@@ -261,6 +271,30 @@ public:
     /// True once the Aeron client closed itself (invoker owner stalled past
     /// aeronClientLivenessTimeoutNs, or the driver timed out).
     [[nodiscard]] bool transportClosed() const noexcept { return agent_.transportClosed(); }
+
+    /// T15b test seam (any thread): the transport fault path, as if the Aeron
+    /// client had closed itself — delivered through the command ring and
+    /// applied by the duty thread on its next cycle.  The Client then fails for
+    /// good (see dutyCycle: producers' intakes tail-closed, every accepted
+    /// record completed Closed exactly once, no further I/O).
+    void testInjectTransportFault() { (void)agent_.submitTestFault(); }
+    /// T15b test hook: duty cycles run in failed mode (Invoker owner, or after
+    /// close() in Thread mode — a plain duty-thread counter).
+    [[nodiscard]] uint64_t testFailedDutyCycles() const noexcept { return failedDutyCycles_; }
+
+    // ---- T15b: shard status (ClientConfig::shardStatus) -------------------------
+    /// The ring's one consumer (the Invoker owner / an Agent control thread):
+    /// h(const shard::ShardStatus&) for every status the duty thread published
+    /// since the last call, in order.  0 when shardStatus is off.
+    template <class H>
+    int pollShardStatus(H&& h) {
+        return shardRing_ ? shardRing_->drainAll(std::forward<H>(h)) : 0;
+    }
+    /// The duty side's current status (duty thread / Invoker owner only).
+    [[nodiscard]] const shard::ShardStatus& shardStatusDuty() const noexcept { return shardDuty_; }
+    /// After close() / closeImmediately() returned (no duty thread left): publish
+    /// the final Closed status and finish the ring.  Idempotent.
+    void publishShardClosed() noexcept;
 
     /// Test hook (T15a): the transport, for its thread-model observers
     /// (usesDriverThread / usesConductorInvoker / aeronMediaDriverTimeoutMs, and
@@ -828,6 +862,26 @@ private:
     [[nodiscard]] std::exception_ptr submitError_(const char* what, std::size_t frameLen) const;
     /// F8a fix2: duty-thread direct send on the default ingress publication.
     static detail::SendResult directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
+    /// T15b: the failure path (duty thread).  Latched once, when the Aeron
+    /// client closed (or the seed session was Rejected, a terminal answer):
+    /// every producer's intake is tail-closed and every accepted record
+    /// completes Closed exactly once; pending control ops complete Closed; the
+    /// agent stops all I/O; a Thread-mode runner switches to a parked loop.
+    void enterFailed_();
+    /// One duty cycle once failed: the command ring (no I/O), the producers'
+    /// discard of their closed rings, and the close / release machinery.
+    int  failedDutyCycle_(int64_t nowNs);
+    /// T15b: derive this cycle's ShardStatus; publish it on change.
+    void publishShardStatus_() noexcept;
+    bool transportFailed_ = false;  // duty thread only
+    uint64_t failedDutyCycles_ = 0;  // duty thread only (test hook)
+    // T15b shard status (cfg_.shardStatus): ring created in the ctor before the
+    // runner starts; duty-side state below is the duty thread's.
+    std::unique_ptr<detail::StatusRing<shard::ShardStatus, 64 * 1024>> shardRing_;
+    shard::ShardStatus shardDuty_{};
+    shard::ShardStatus shardPublished_{};
+    bool               shardDirty_  = false;
+    bool               shardClosed_ = false;  // the closing thread
     /// F8a fix2: last observed seed-session state (duty thread only).
     session::SessionState lastSeedState_ = session::SessionState::Disconnected;
     // fix4 M5: the last (state, sessionId, connect episode) of the seed session

@@ -409,12 +409,46 @@ public:
     /// producers need them).  Default true (historical behaviour).
     void setForwardProduceResponses(bool on) noexcept { forwardProduceResponses_ = on; }
 
-    [[nodiscard]] bool transportClosed() const noexcept { return transport_.closed(); }
+    /// The Aeron client closed itself — or the T15b test fault was applied.
+    [[nodiscard]] bool transportClosed() const noexcept { return testFault_ || transport_.closed(); }
+
+    /// T15b: the Client failed for good (Aeron client closed / seed Rejected).
+    /// From now on doWork() only drains the command ring: no driver / conductor
+    /// pumping, no egress poll, no session ticks, no producer drain, and every
+    /// offer is refused — no I/O at all.  Duty thread only.  Idempotent.
+    void enterFailedMode() noexcept { failed_ = true; }
+    [[nodiscard]] bool failedMode() const noexcept { return failed_; }
+
+    /// T15b test seam (any thread): put the transport-fault command on the ring
+    /// (the duty thread applies it: transportClosed() turns true).
+    bool submitTestFault() noexcept { return writeCommand(kMsgTestFault, nullptr, 0); }
+
+    /// T15b: the routed leader-node sessions (every session but the seed) and
+    /// which of them are not Connected (bit i = session i + 1; the first 64).
+    /// Duty thread only.
+    [[nodiscard]] uint32_t leaderSessionCount() const noexcept {
+        return static_cast<uint32_t>(sessions_.size() - 1);
+    }
+    [[nodiscard]] uint64_t leaderSessionsDownMask() const noexcept {
+        uint64_t mask = 0;
+        const std::size_t n = sessions_.size() < 65 ? sessions_.size() : 65;
+        for (std::size_t i = 1; i < n; ++i) {
+            if (sessions_[i]->machine.state() != session::SessionState::Connected) mask |= uint64_t{1} << (i - 1);
+        }
+        return mask;
+    }
+    /// T15b: the seed session's machine (read-only; duty thread only).
+    [[nodiscard]] const session::SessionMachine& seedMachine() const noexcept { return seedSession().machine; }
     /// Test hook (T15a): read-only access to the transport's thread-model observers.
     [[nodiscard]] const transport::AeronTransport& testTransport() const noexcept { return transport_; }
     /// Test hook (T15a fix1): retarget the seed's default ingress publication, as
     /// the Client's stick-to-leader redirect path does.  Agent thread only.
     bool testRetargetSeed(const std::string& channel) noexcept { return retarget(channel); }
+    /// Test hooks (T15a r2-m1): the seed's two Backoff fallbacks, and where the
+    /// seed's default publication points now.  Agent thread only.
+    bool testRetargetSeedToBootstrap() noexcept { return retargetSeedToBootstrap_(); }
+    bool testRetargetSeedToLastKnownLeader() noexcept { return retargetSeedToLastKnownLeader_(); }
+    [[nodiscard]] const std::string& testSeedIngressChannel() const noexcept { return transport_.ingressChannel(); }
 
     /// Test hooks.  Reserved ack-buffer capacity (the hot path must never grow it).
     [[nodiscard]] std::size_t testProduceAckCapacity() const noexcept { return produceAcks_.capacity(); }
@@ -476,6 +510,7 @@ public:
     /// AGENT-THREAD ONLY.
     bool offerToPartition(int32_t topicId, int32_t partition, int32_t ingressStreamId,
                           const uint8_t* buf, std::size_t len) noexcept {
+        if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
         return offerProduceToLeader_(topicId, partition, ingressStreamId, buf, len);
     }
 
@@ -642,6 +677,7 @@ private:
     static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
     static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
     static constexpr int32_t kMsgControlOp  = 9;          // F8c C3 client control op (header + frame)
+    static constexpr int32_t kMsgTestFault = 98;          // T15b test seam: transportClosed() -> true
     static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
@@ -764,6 +800,8 @@ private:
     // edges order every access, so doWork()'s read below is race-free.
     bool started_ = false;
     bool stopped_ = false;
+    bool failed_    = false;  // T15b failed mode (duty thread only)
+    bool testFault_ = false;  // T15b test seam (duty thread only)
 
     // ---- Egress observer (agent thread only; must be set before start()) ----
     EgressObserver egressObserver_;

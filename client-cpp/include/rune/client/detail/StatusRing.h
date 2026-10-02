@@ -98,6 +98,27 @@ public:
         return any;
     }
 
+    /// T15b: drain everything published so far IN ORDER: h(const T&) per
+    /// snapshot (an event log, not only the latest).  Returns the count.
+    template <class H>
+    int drainAll(H&& h) {
+        int n = 0;
+        for (;;) {
+            const std::int64_t before = ring_.consumerPosition();
+            ring_.read([&](std::int32_t, aeron::concurrent::AtomicBuffer& buf,
+                           aeron::util::index_t offset, aeron::util::index_t len) {
+                if (len == static_cast<aeron::util::index_t>(sizeof(T))) {
+                    T v;
+                    std::memcpy(&v, buf.buffer() + offset, sizeof(T));
+                    ++n;
+                    h(static_cast<const T&>(v));
+                }
+            });
+            if (ring_.consumerPosition() == before) break;
+        }
+        return n;
+    }
+
     /// Consumer side: abandon the channel (release).  Idempotent.
     void abandon() noexcept { ring_.consumerClose(); }
 

@@ -452,6 +452,14 @@ def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     root = Path(args[0]) if args else Path(__file__).resolve().parent.parent
     files = collect(root)
+    # T15b: --expect-covered=a,b,...  every listed path must be among the scanned
+    # files (proves a subsystem — e.g. src/shard/** — is under the guard).
+    for a in argv:
+        if a.startswith("--expect-covered="):
+            missing = [rel for rel in a.split("=", 1)[1].split(",") if rel and rel not in files]
+            if missing:
+                print("check_no_atomics_or_mutexes: NOT SCANNED: " + ", ".join(missing))
+                return 1
     if "--dump" in argv:
         for rel in args[1:]:
             print(rel, dict(sorted(multiset(find_matches(files[rel])).items())))

@@ -81,6 +81,16 @@ struct ShardGroupConfig {
     /// stall then ends in the ordinary path (session expiry -> reconnect).
     /// Overridable; a lower value is warned about.
     int64_t      aeronClientLivenessTimeoutNs = transport::kMaxClientLivenessTimeoutNs;
+    /// Test seam (T15b): called on the tearing-down thread just before ShardGroup
+    /// tears shard i down (construction failure, close, destructor) — proves the
+    /// reverse order.  nullptr = none.
+    void (*testTeardownHook)(void* ctx, uint32_t shard) noexcept = nullptr;
+    void* testTeardownCtx = nullptr;
+    /// Test seam (T15b M3): replaces Key::partition in ShardGroup's routing
+    /// (nullptr = none: one predictable branch per send).  Lets a counting
+    /// hasher prove the key is hashed once per send and that the shard and the
+    /// producer route by the partition they are given.
+    int32_t (*testPartitioner)(const Key& key, int32_t partitionCount) noexcept = nullptr;
 };
 
 /// A resolved shard count and the one-line reason the group logs.

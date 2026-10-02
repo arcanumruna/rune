@@ -43,9 +43,24 @@ namespace {
 
 int g_ctr = 0;  // gtest runs tests on one thread
 
+// T15a m13: every directory a test creates is removed at process exit (the
+// drivers delete their aeron/ subdirectory; the parents used to accumulate).
+struct DirSweeper {
+    std::vector<std::string> dirs;
+    ~DirSweeper() {
+        for (const auto& d : dirs) {
+            std::error_code ec;
+            std::filesystem::remove_all(d, ec);
+        }
+    }
+};
+DirSweeper g_sweeper;  // test thread only
+
 std::string uniqueDir(const char* prefix) {
-    return std::string("/tmp/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) + "_" +
-           std::to_string(g_ctr++);
+    std::string d = std::string("/tmp/") + prefix + "_" + std::to_string(static_cast<long>(::getpid())) + "_" +
+                    std::to_string(g_ctr++);
+    g_sweeper.dirs.push_back(d);
+    return d;
 }
 
 rc::TopicSpec topic(const char* name, int32_t id, int32_t partitions) {
@@ -599,6 +614,41 @@ struct ScopedEnv {
 };
 } // namespace
 
+// T15a r2-m1: the odd-attempt fallback to the last-known leader must never move
+// the seed OFF a newer leader (it only applies from the bootstrap).  Reachable
+// when attempt 2's retarget to the bootstrap failed (the seed stayed on the
+// current leader L2) while lastKnownLeader still held L from an earlier episode.
+TEST(ShardConfigRegression, LastKnownLeaderFallbackNeverReplacesANewerLeader) {
+    namespace rca = rune::client::agent;
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel  = "aeron:ipc";
+    cfg.transport.ingressStreamId = 4110;
+    cfg.transport.egressChannel   = "aeron:ipc";
+    cfg.transport.egressStreamId  = 4111;
+    cfg.transport.dataDir         = uniqueDir("seed_lastknown");
+    cfg.transport.driverMode      = rt::DriverMode::Invoker;
+    cfg.session.egressChannel     = "aeron:ipc";
+    cfg.session.egressStreamId    = 4111;
+    cfg.session.reconnectForeverAfterLive = true;
+    rca::ClientAgent agent(cfg);
+    agent.start();
+    const std::string l1 = "aeron:udp?endpoint=127.0.0.1:24801";
+    const std::string l2 = "aeron:udp?endpoint=127.0.0.1:24802";
+    ASSERT_TRUE(agent.testRetargetSeed(l1));             // stuck to leader L
+    ASSERT_TRUE(agent.testRetargetSeedToBootstrap());     // attempt 2: bootstrap; lastKnown = L
+    EXPECT_EQ(agent.testSeedIngressChannel(), "aeron:ipc");
+    ASSERT_TRUE(agent.testRetargetSeed(l2));             // now on a NEWER leader L2
+    ASSERT_TRUE(agent.testRetargetSeedToLastKnownLeader());  // odd attempt
+    EXPECT_EQ(agent.testSeedIngressChannel(), l2) << "a stale last-known leader never replaces a newer one";
+    // From the bootstrap the fallback still returns to the last-known leader.
+    ASSERT_TRUE(agent.testRetargetSeedToBootstrap());     // lastKnown = L2
+    ASSERT_TRUE(agent.testRetargetSeedToLastKnownLeader());
+    EXPECT_EQ(agent.testSeedIngressChannel(), l2);
+    agent.stop();
+    std::error_code ec;
+    std::filesystem::remove_all(cfg.transport.dataDir, ec);
+}
+
 // I1, real transport: the seed session stuck to a leader that died (a retarget
 // of the default publication onto an endpoint nobody listens on) must find its
 // way back through the configured bootstrap gateway once in R1 Backoff, instead
@@ -774,8 +824,15 @@ TEST(ShardConfigRegression, SeedBackoffReturnsToLiveLeaderWhenBootstrapDead) {
     // time — far past Backoff attempt 2 (the bootstrap fallback).
     now += cfg.session.responseTimeoutNs + 1;
     pumpLeader = false;
-    (void)drive(1'000'000, 2'000, [] { return false; });
+    // T15a r2-m3: assert the alternation itself — during the unresponsive window
+    // the seed's publication went to the bootstrap at least once.
+    bool fellBackToBootstrap = false;
+    (void)drive(1'000'000, 2'000, [&] {
+        fellBackToBootstrap = fellBackToBootstrap || agent.testSeedIngressChannel() == "aeron:ipc";
+        return false;
+    });
     EXPECT_NE(agent.sessionState(), rcs::SessionState::Connected);
+    EXPECT_TRUE(fellBackToBootstrap) << "Backoff attempt 2 never fell back to the bootstrap";
 
     // The leader answers again: the seed must find it.
     pumpLeader = true;

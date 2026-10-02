@@ -9,10 +9,13 @@
 namespace {
 std::atomic<bool> g_on{false};
 std::atomic<long> g_count{0};
+thread_local bool t_on    = false;  // test instrumentation (startThisThread)
+thread_local long t_count = 0;
 } // namespace
 
 void* operator new(std::size_t n) {
     if (g_on.load(std::memory_order_relaxed)) g_count.fetch_add(1, std::memory_order_relaxed);
+    if (t_on) ++t_count;
     if (void* p = std::malloc(n != 0 ? n : 1)) return p;
     throw std::bad_alloc{};
 }
@@ -30,5 +33,13 @@ void start() noexcept {
 long stop() noexcept {
     g_on.store(false, std::memory_order_seq_cst);
     return g_count.load(std::memory_order_relaxed);
+}
+void startThisThread() noexcept {
+    t_count = 0;
+    t_on    = true;
+}
+long stopThisThread() noexcept {
+    t_on = false;
+    return t_count;
 }
 } // namespace alloc_counter

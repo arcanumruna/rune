@@ -75,6 +75,18 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --handles
             ${CMAKE_CURRENT_SOURCE_DIR})
+    # T15b design §7: the client-shard sources are under both guards (atomics /
+    # mutex / futures, and shared ownership) — the run fails if one is not scanned.
+    set(RUNE_SHARD_SOURCES
+        "src/shard/ClientShard.cpp,src/shard/ShardConfig.cpp,include/rune/client/shard/ClientShard.h,include/rune/client/shard/ShardConfig.h,include/rune/client/shard/ShardMap.h,include/rune/client/shard/ShardState.h")
+    add_test(NAME NoAtomicsMutexFuturesSharedPtrInShardSourcesRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py
+            --expect-covered=${RUNE_SHARD_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME NoAtomicsMutexFuturesSharedPtrInShardSourcesSharedOwnershipRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py
+            --expect-covered=${RUNE_SHARD_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
@@ -368,6 +380,17 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     endif()
 
     # DR-1 — configurable disaster-recovery driver (rune-broker/dr-e2e harness)
+    # T15b gates 2-5: real-broker driver for every client arm (see its header).
+    add_executable(shard_gate examples/shard_gate.cpp)
+    target_include_directories(shard_gate PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(shard_gate PRIVATE rune_client_api)
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_SHARD_GATE uuid)
+        if(UUID_LIB_SHARD_GATE)
+            target_link_libraries(shard_gate PRIVATE ${UUID_LIB_SHARD_GATE})
+        endif()
+    endif()
+
     add_executable(dr_client
         examples/dr_client.cpp
     )
@@ -535,6 +558,10 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
     target_link_libraries(rune_producer_acked_bench PRIVATE rune_client_api rune_client_producer)
 
     # F8c C7 — the producer hot path THROUGH THE HANDLE (Producer::trySend, void + acked)
+    add_executable(rune_shard_route_bench bench/ShardRouteBench.cpp)
+    target_include_directories(rune_shard_route_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_shard_route_bench PRIVATE rune_client_api)
+
     add_executable(rune_producer_handle_bench bench/ProducerHandleBench.cpp)
     target_include_directories(rune_producer_handle_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_producer_handle_bench PRIVATE rune_client_api rune_client_producer)
@@ -1010,6 +1037,8 @@ if(BUILD_TESTING)
             tests/client/InvokerClientTest.cpp
             tests/shard/ShardConfigTest.cpp
             tests/shard/ClientShardTest.cpp
+            tests/shard/ShardGroupTest.cpp
+            tests/shard/ShardStateTest.cpp
             tests/client/HubCommandClientTest.cpp
             tests/client/CompletionsClientTest.cpp
             tests/client/HandleLifetimeTest.cpp
@@ -1024,6 +1053,16 @@ if(BUILD_TESTING)
             endif()
         endif()
         gtest_discover_tests(rune_invoker_tests)
+
+        # T15b Gate 4: SIGSTOP DR gate (fork: a client process under SIGSTOP /
+        # SIGCONT; own binary so the fork happens in a single-threaded process).
+        add_executable(rune_shard_dr_gate_tests tests/shard/ShardSigstopDrGateTest.cpp)
+        target_include_directories(rune_shard_dr_gate_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_shard_dr_gate_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
+            target_link_libraries(rune_shard_dr_gate_tests PRIVATE ${UUID_LIB_INVOKER})
+        endif()
+        gtest_discover_tests(rune_shard_dr_gate_tests PROPERTIES TIMEOUT 180)
     endif()
 endif()
 

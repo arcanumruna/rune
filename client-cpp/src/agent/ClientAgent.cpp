@@ -117,7 +117,8 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // being/has been torn down.
     if (stopped_) return 0;
 
-    int totalWork = transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
+    // T15b failed mode: no driver / conductor pumping, no I/O of any kind.
+    int totalWork = failed_ ? 0 : transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
 
     // ---- Step 1: Drain the command ring (bounded) ---------------------------
     // fix5 Important-2(d): deliberately NO unblock-on-no-progress here (nor in
@@ -178,6 +179,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
             using CA = rune::client::detail::ControlledAction;
             switch (msgTypeId) {
             case kMsgConnect:
+                if (failed_) break;  // T15b: a failed client never connects again
                 seedSession().machine.connect(nowNs);
                 break;
 
@@ -186,7 +188,12 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 // transport was already retarget()ed to the leader; drop the
                 // stale follower session and connect fresh so the leader
                 // assigns a new sessionId.
+                if (failed_) break;
                 seedSession().machine.forceReconnect(nowNs);
+                break;
+
+            case kMsgTestFault:
+                testFault_ = true;
                 break;
 
             case kMsgDisconnect:
@@ -198,6 +205,10 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 break;
 
             case kMsgSend:
+                if (failed_) {  // T15b: no I/O — the frame's session is gone for good
+                    ++staleFramesDropped_;
+                    break;
+                }
                 if (len > 0) {
                     const auto* p = reinterpret_cast<const uint8_t*>(
                         buf.buffer() + offset);
@@ -284,6 +295,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
         cfg_.ringDrainLimit);
 
     totalWork += ringWork;
+    if (failed_) [[unlikely]] return totalWork;  // T15b: commands only — no poll, ticks or drain
 
     // ---- Step 2: Poll egress (bounded) --------------------------------------
     // The fragment budget never exceeds the free room in the reserved ack buffer
@@ -453,6 +465,7 @@ void ClientAgent::noteFatalDrop_(std::size_t len) noexcept {
 
 transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t* buf,
                                                                  std::size_t len) noexcept {
+    if (failed_) [[unlikely]] return transport::AeronTransport::OfferResult::Fatal;  // T15b: no I/O
     if (testForcedOffers_ > 0) [[unlikely]] {
         --testForcedOffers_;
         return testForcedOffer_;
@@ -660,6 +673,7 @@ ClientAgent::StateSnapshot ClientAgent::stateAndSessionId() const noexcept {
 // ---------------------------------------------------------------------------
 
 bool ClientAgent::sendFrame(const uint8_t* buf, std::size_t len) {
+    if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
     return transport_.offer(buf, len);
 }
 
@@ -851,6 +865,10 @@ bool ClientAgent::retargetSeedToBootstrap_() noexcept {
 bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     Session& seed = seedSession();
     if (seed.lastKnownLeaderChannel.empty()) return true;  // never stuck to a leader
+    // T15a r2-m1: only from the bootstrap.  Anywhere else the seed is on a leader
+    // NEWER than lastKnownLeader (attempt 2's retarget failed, or a redirect
+    // moved it) — never trade it for the stale one.
+    if (transport_.ingressChannel() != cfg_.transport.ingressChannel) return true;
     if (transport_.ingressChannel() == seed.lastKnownLeaderChannel) return true;
     if (!transport_.retarget(seed.lastKnownLeaderChannel)) return false;  // next odd attempt retries
     seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
@@ -860,6 +878,7 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
 
 bool ClientAgent::offerControlTo(const std::string& channel,
                                  const uint8_t* buf, std::size_t len) noexcept {
+    if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
     // Seed endpoint == transport default ingress channel → byte-identical default
     // offer (single-node fast path).  Otherwise route the control frame to the
     // session's own endpoint over the shared transport (default ingress stream id).

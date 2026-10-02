@@ -150,6 +150,15 @@ public:
     /// frozen tail (bounded by the close-drain unblock rule).
     void closeFinalAll(OpStatus st, int stalledYieldsBeforeUnblock);
 
+    /// T15b: true when any producer's intake is closed (begin-close draining,
+    /// closed, or discarding).  Duty thread; O(producers).
+    [[nodiscard]] bool anyClosing() const noexcept {
+        for (const ProducerImpl* impl : active_) {
+            if (impl != nullptr && !impl->lifeOpen()) return true;
+        }
+        return false;
+    }
+
     /// F8c C6a: the duty-thread failure tail-close of every producer (T15:
     /// the Aeron client closed under a shard).  Idempotent.
     void failCloseAll(OpStatus st) {
