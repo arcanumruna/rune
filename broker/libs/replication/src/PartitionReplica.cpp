@@ -485,7 +485,7 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     // won't double-send after this one: pushToFollowers advances each follower's
     // accepted cursor to the current LEO, so doWork's `leo > pushFloor_()` is false.
     if (cfg_.pushOnAppend) {
-        (void)pushToFollowers(baseOffset);
+        (void)pushToFollowers();
     }
     return baseOffset;
 }
@@ -538,7 +538,7 @@ Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatc
     leaderState_.setLeaderLogEndOffset(logEndOffset_());
     recomputeHw();
     publishCleanerState();
-    if (cfg_.pushOnAppend) (void)pushToFollowers(baseOffset);
+    if (cfg_.pushOnAppend) (void)pushToFollowers();
     return baseOffset;
 }
 
@@ -576,7 +576,7 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
 
     // Direct append API → immediate push (see append() note); hot path coalesces.
     if (cfg_.pushOnAppend) {
-        (void)pushToFollowers(baseOffset);
+        (void)pushToFollowers();
     }
     return baseOffset;
 }
@@ -626,7 +626,10 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // Epoch fence: reject stale leader epochs.
     if (isStaleEpoch(req.leaderEpoch, epoch_)) {
         auto resp = makeFetchResponse(leaderState_.highWatermark(), kErrStaleEpoch, {});
-        onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
+        // F27: an error answer is not owed — the metadata role/epoch change that
+        // fences this follower drives its recovery; a refusal is only counted.
+        if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, resp); }))
+            ++sendRefusals_;
         return kErrStaleEpoch;
     }
 
@@ -676,7 +679,9 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
 
         // A-NEW-5: kErrNotLeader — the follower is ahead of this stale leader.
         auto resp = makeFetchResponse(committedHw, kErrNotLeader, {});
-        onTransport([&](auto& t) { t.sendFetchResponse(req.followerId, resp); });
+        // F27: not owed (see the stale-epoch answer above); counted.
+        if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, resp); }))
+            ++sendRefusals_;
         return kErrNotLeader;
     }
 
@@ -712,7 +717,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
             pull.fetchOffset = logEndOffset_();      // from our LEO
             pull.maxBytes    = cfg_.maxFetchBytes;
             pull.topicId     = cfg_.topicId;
-            onTransport([&](auto& t) { t.sendReconcileRequest(req.followerId, pull); });
+            (void)sendReconcilePull_(req.followerId, pull);
         }
         // Serve nothing forward to an ahead follower: forward-serving under the
         // new epoch could stamp divergent bytes.  The follower keeps its tail
@@ -733,7 +738,12 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         // F27: the follower's own position in this leadership (its push cursor
         // floor), and a real fetch supersedes any answer still owed to it.
         slot->ackedLeo = req.fetchOffset;
-        slot->owed     = FollowerSlot::OwedAnswer{};
+        // F2: only a request that SUPERSEDES the owed answer discharges it — a
+        // data fetch, or a position beyond it.  A pure ack at the same offset
+        // (e.g. after an HW-only answer arrived) must not clear an owed Data
+        // answer, or the follower's catch-up would wait out its resend window.
+        if (req.maxBytes > 0 || req.fetchOffset > slot->owed.fetchOffset)
+            slot->owed = FollowerSlot::OwedAnswer{};
     }
     const FetchServe serve = slot
         ? decideFetchServe(*slot, req.fetchOffset, req.maxBytes, logEndOffset_(),
@@ -770,7 +780,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
                 if (slot) slot->servedTimeNs = 0;
                 auto resp = makeFetchResponse(highWatermark(), kErrRecordTooLarge, {});
                 sendFetchAnswer_(slot, req.followerId, resp, req.fetchOffset, req.maxBytes,
-                                 /*data=*/false);
+                                 /*data=*/false, /*dataEnd=*/-1);
                 return kErrRecordTooLarge;
             }
         }
@@ -818,6 +828,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // memory ring).  The transport copies the bytes ONCE, straight into the
     // publication term.  (No append/truncate/readView ran in between.)
     std::span<const uint8_t> records{};
+    Offset servedEnd = -1;   // F6: exclusive end of the Data served (if any)
     // F3 fix-round-1, item 3 (merged onto F18's single read): fetchOffset < LEO
     // means there IS more data past this point, so an EMPTY view can only be a
     // transient local read-map failure (readView()/ensureReadMap() are noexcept
@@ -837,6 +848,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
                                                  static_cast<std::size_t>(req.maxBytes),
                                                  kNoPushCeiling);
         records = std::span<const uint8_t>(view.data, pre.bytes);
+        servedEnd = pre.endOffset;
     }
 
     // DR-BUG-3: advertise the min-ISR-GATED committed HW to followers via the
@@ -851,7 +863,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     const Offset advertiseHw = highWatermark();
     auto resp = makeFetchResponse(advertiseHw, kErrNone, records);
     if (sendFetchAnswer_(slot, req.followerId, resp, req.fetchOffset, req.maxBytes,
-                         /*data=*/!records.empty()) && !records.empty())
+                         /*data=*/!records.empty(), records.empty() ? -1 : servedEnd) &&
+        !records.empty())
         ++fetchDataServes_;   // counts answers that actually LEFT (F27)
 
     return kErrNone;
@@ -865,10 +878,13 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
 // ---------------------------------------------------------------------------
 bool PartitionReplica::sendFetchAnswer_(FollowerSlot* slot, NodeId follower,
                                         const FetchResponseMsg& resp, Offset fetchOffset,
-                                        int32_t maxBytes, bool data)
+                                        int32_t maxBytes, bool data, Offset dataEnd)
 {
     const bool ok = onTransport([&](auto& t) { return t.sendFetchResponse(follower, resp); });
-    if (ok) [[likely]] return true;
+    if (ok) [[likely]] {
+        if (slot && dataEnd > slot->dataServedThrough) slot->dataServedThrough = dataEnd;   // F6
+        return true;
+    }
     ++sendRefusals_;
     if (slot != nullptr) {
         slot->forgetServe();
@@ -889,18 +905,31 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
         // evidence the follower is alive.
         rune::storage::LogReadView view{};
         std::span<const uint8_t> records{};
-        if (owed.data && owed.fetchOffset < logEndOffset_()) {
+        Offset dataEnd = -1;
+        const Offset leo = logEndOffset_();
+        if (owed.data && owed.fetchOffset < leo) {
+            // The view itself is re-taken every attempt (cheap; never cached across
+            // passes — a cleaner swap may remap the segment between them).
             view = onLog([&](auto& L) { return L.readView(owed.fetchOffset, owed.maxBytes); });
             if (view.empty()) [[unlikely]] continue;   // transient read-map failure: next pass
-            const BatchPrefix pre = wholeBatchPrefix(view.data, view.len,
-                                                     static_cast<std::size_t>(owed.maxBytes),
-                                                     kNoPushCeiling);
-            records = std::span<const uint8_t>(view.data, pre.bytes);
+            // F7: the whole-batch walk is memoised while the LEO is unchanged.
+            if (s.owed.builtLeo != leo || s.owed.builtBytes > view.len) {
+                ++owedRebuilds_;
+                const BatchPrefix pre = wholeBatchPrefix(view.data, view.len,
+                                                         static_cast<std::size_t>(owed.maxBytes),
+                                                         kNoPushCeiling);
+                s.owed.builtLeo   = leo;
+                s.owed.builtBytes = pre.bytes;
+                s.owed.builtEnd   = pre.endOffset;
+            }
+            records = std::span<const uint8_t>(view.data, s.owed.builtBytes);
+            dataEnd = s.owed.builtEnd;
         }
         auto resp = makeFetchResponse(highWatermark(), owed.errorCode, records);
         const bool ok = onTransport([&](auto& t) { return t.sendFetchResponse(s.id, resp); });
         if (ok) {
             s.owed = FollowerSlot::OwedAnswer{};
+            if (dataEnd > s.dataServedThrough) s.dataServedThrough = dataEnd;   // F6
             if (!records.empty()) ++fetchDataServes_;
             ++sent;
         } else {
@@ -1333,7 +1362,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         resp.endOffset     = 0;
         resp.errorCode     = kErrNotLeader;
         resp.topicId       = cfg_.topicId;
-        onTransport([&](auto& t) { t.sendOffsetsForLeaderEpochResponse(req.followerId, resp); });
+        sendEpochAnswer_(req.followerId, resp);
         return;
     }
 
@@ -1407,7 +1436,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
             pull.fetchOffset = logEndOffset_();      // from our LEO
             pull.maxBytes    = cfg_.maxFetchBytes;
             pull.topicId     = cfg_.topicId;
-            onTransport([&](auto& t) { t.sendReconcileRequest(req.followerId, pull); });
+            (void)sendReconcilePull_(req.followerId, pull);
         }
         // Fallback-race hardening (the Major): send an EXPLICIT defer keep-alive
         // instead of silently dropping the answer.  Silence lets the follower's
@@ -1422,7 +1451,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         defer.endOffset     = req.followerLeo;   // "keep everything up to your LEO"
         defer.errorCode     = kErrReconcileDeferred;
         defer.topicId       = cfg_.topicId;
-        onTransport([&](auto& t) { t.sendOffsetsForLeaderEpochResponse(req.followerId, defer); });
+        sendEpochAnswer_(req.followerId, defer);
         return;
     }
 
@@ -1437,7 +1466,65 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
     resp.endOffset     = r.second;
     resp.errorCode     = kErrNone;
     resp.topicId       = cfg_.topicId;
-    onTransport([&](auto& t) { t.sendOffsetsForLeaderEpochResponse(req.followerId, resp); });
+    sendEpochAnswer_(req.followerId, resp);
+}
+
+// ---------------------------------------------------------------------------
+// F27 F3: DR sends are never dropped either.  A refused epoch answer, reverse-
+// reconcile pull or reconcile answer is OWED and re-sent on the next doWork pass
+// (retryOwedDrSends_) — never left to the follower's re-probe cadence.
+// ---------------------------------------------------------------------------
+void PartitionReplica::sendEpochAnswer_(NodeId to, const OffsetsForLeaderEpochRespMsg& m)
+{
+    FollowerSlot* const slot = followerSlots_.find(to);
+    if (slot) slot->owedEpoch = FollowerSlot::OwedEpochAnswer{};   // superseded by this one
+    if (onTransport([&](auto& t) { return t.sendOffsetsForLeaderEpochResponse(to, m); })) [[likely]]
+        return;
+    ++sendRefusals_;
+    if (slot) slot->owedEpoch = FollowerSlot::OwedEpochAnswer{true, m};
+}
+
+bool PartitionReplica::sendReconcilePull_(NodeId peer, const FetchRequestMsg& pull)
+{
+    if (onTransport([&](auto& t) { return t.sendReconcileRequest(peer, pull); })) [[likely]] {
+        owedPull_ = OwedPull{};
+        return true;
+    }
+    ++sendRefusals_;
+    owedPull_ = OwedPull{peer, pull};
+    return false;
+}
+
+int PartitionReplica::retryOwedDrSends_() noexcept
+{
+    int sent = 0;
+    for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
+        FollowerSlot& s = followerSlots_.at(i);
+        if (!s.owedEpoch.valid) [[likely]] continue;
+        const OffsetsForLeaderEpochRespMsg m = s.owedEpoch.msg;
+        if (onTransport([&](auto& t) { return t.sendOffsetsForLeaderEpochResponse(s.id, m); })) {
+            s.owedEpoch = FollowerSlot::OwedEpochAnswer{};
+            ++sent;
+        } else {
+            ++sendRefusals_;
+        }
+    }
+    if (owedPull_.peer >= 0) [[unlikely]] {
+        // Still wanted only while we lead and the pull targets the same survivor.
+        if (role_ == Role::Leader && reconcileTarget_ == owedPull_.peer) {
+            const OwedPull o = owedPull_;
+            if (sendReconcilePull_(o.peer, o.req)) ++sent;
+        } else {
+            owedPull_ = OwedPull{};
+        }
+    }
+    if (owedReconResp_.peer >= 0) [[unlikely]] {
+        const FetchRequestMsg req = owedReconResp_.req;
+        owedReconResp_ = OwedReconResp{};
+        onReconcileRequest(req);                          // re-owes itself on refusal
+        if (owedReconResp_.peer < 0) ++sent;
+    }
+    return sent;
 }
 
 // (Follower) Apply the leader's answer: the DEFERRED, epoch-correct truncation.
@@ -1570,7 +1657,11 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
     auto resp = makeFetchResponse(
         leo, kErrNone,
         std::span<const uint8_t>(logBytes.data(), logBytes.size()));
-    onTransport([&](auto& t) { t.sendReconcileResponse(req.followerId, resp); });
+    // F27 F3: a refused answer is owed and rebuilt + re-sent next pass.
+    if (onTransport([&](auto& t) { return t.sendReconcileResponse(req.followerId, resp); }))
+        [[likely]] return;
+    ++sendRefusals_;
+    owedReconResp_ = OwedReconResp{req.followerId, req};
 }
 
 // (Leader) Apply reconcile records pulled from an ahead survivor.
@@ -1721,7 +1812,7 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
     // GR-10: push the freshly-reconciled records to ISR followers so the whole
     // cluster converges on the recovered committed prefix.
     if (cfg_.pushOnAppend) {
-        (void)pushToFollowers(0);
+        (void)pushToFollowers();
     }
 }
 
@@ -1802,6 +1893,9 @@ int PartitionReplica::doWork(int64_t nowNs)
         }
     }
 
+    // F27 F3: owed DR frames (epoch answers, reconcile pull / answer) — any role.
+    work += retryOwedDrSends_();
+
     if (role_ == Role::Leader) {
         // DR-BUG-6: reset the follower-lag TIME clock on the first tick after
         // becoming leader (becomeLeader has no clock).  This MUST happen before
@@ -1857,11 +1951,11 @@ int PartitionReplica::doWork(int64_t nowNs)
             }
             const Offset pushCeiling = minFollowerLeo + kPushFlowWindow;
             if (pushCeiling > pushFloor &&
-                !unsendablePushSuppressed_(pushCeiling)) {
+                !unsendablePushSuppressed_(pushCeiling, pushFloor)) {
                 // F27: work only for ACCEPTED pushes — a follower whose pushes are
                 // refused (back-pressured / not connected) is retried every pass,
                 // but lets the idle strategy back off instead of spinning a core.
-                if (pushToFollowers(pushFloor, pushCeiling) > 0) ++work;
+                if (pushToFollowers(pushCeiling, pushFloor) > 0) ++work;
             }
         }
 
@@ -1959,15 +2053,9 @@ int PartitionReplica::doWork(int64_t nowNs)
                         pull.fetchOffset = myLeo;                // from our LEO
                         pull.maxBytes    = cfg_.maxFetchBytes;
                         pull.topicId     = cfg_.topicId;
-                        const bool ok = onTransport([&](auto& t) { return t.sendReconcileRequest(aheadPeer, pull); });
-                        if (!ok) {
-                            // F27: the pull never left — do not latch it as in flight
-                            // (no kReconcileStuckNs wait for our own refusal).
-                            ++sendRefusals_;
-                            reconcileTarget_   = -1;
-                            reconcileIssuedNs_ = -1;
-                        }
-                        ++work;
+                        // F27 F3/F4: a refused pull is owed (re-sent next pass);
+                        // work only when it actually left.
+                        if (sendReconcilePull_(aheadPeer, pull)) ++work;
                     }
                 }
             }
@@ -2042,12 +2130,13 @@ int PartitionReplica::doWork(int64_t nowNs)
                     return t.sendOffsetsForLeaderEpochRequest(leaderId_, req); });
                 if (!ok) {
                     // F27: a refused probe never left — re-send it next pass and do
-                    // not count it as an (unanswered) attempt.
+                    // not count it as an (unanswered) attempt, nor as work (F4).
                     ++sendRefusals_;
                     lastFetchEmitNs_ = prevProbeEmitNs;
                     --epochProbeAttempts_;
+                } else {
+                    ++work;
                 }
-                ++work;
             }
         } else {
             // Follower normal fetch — driven ENTIRELY by the FollowerSync state
@@ -2074,9 +2163,12 @@ int PartitionReplica::doWork(int64_t nowNs)
                 if (!act.wantData) req.maxBytes = 0;   // pure-ack keepalive
                 // F27: a refused fetch never left — undo the emit so the NEXT pass
                 // re-sends it (no resend-timer wait for our own refusal).
-                if (sendFetchToLeader_(req)) followerSync_.onFetchSent();
+                const bool sent = sendFetchToLeader_(req);
+                if (sent) followerSync_.onFetchSent();
                 else { followerSync_.onFetchRefused(); ++sendRefusals_; }
-                if (act.wantData) ++work;              // real catch-up counts as work
+                // F4: real catch-up counts as work only when it LEFT — a refused
+                // fetch is retried next pass but lets the idle strategy back off.
+                if (sent && act.wantData) ++work;
                 if (fsLogEnabled()) {
                     spdlog::info(
                         "FollowerSync[node={} part={}] EMIT state={} wantData={} "
@@ -2449,7 +2541,7 @@ Offset PartitionReplica::pushFloor_() const noexcept
     return floor;
 }
 
-int PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) noexcept
+int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexcept
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplPushToFollowers,
                              static_cast<uint32_t>(cfg_.partitionId));
@@ -2458,7 +2550,7 @@ int PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) noe
 
     const std::vector<NodeId>& isrList = isrManager_->isr();
     const Offset currentLeo = logEndOffset_();
-    const Offset floor      = pushFloor_();
+    const Offset floor      = floorIn >= 0 ? floorIn : pushFloor_();   // F9: passed by doWork
 
     // m-3: the push prefix is bounded by the transport's deliverable FRAME, not
     // only maxFetchBytes (1 MiB).  Queried once, lazily (only if a push is due).
@@ -2477,7 +2569,8 @@ int PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) noe
     for (NodeId followerId : isrList) {
         if (followerId == cfg_.selfId) continue;
         FollowerSlot* const slot = followerSlots_.find(followerId);
-        const Offset from = slot ? slot->pushCursor() : fromOffset;
+        if (slot == nullptr) [[unlikely]] continue;     // impossible: ISR ⊆ replica set
+        const Offset from = slot->pushCursor();
         if (from >= currentLeo) continue;               // this follower has (been sent) it all
 
         if (from != builtFrom) {
@@ -2540,7 +2633,7 @@ int PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) noe
         if (ok) [[likely]] {
             ++accepted;
             rtPushBytes_ += static_cast<int64_t>(pre.bytes);
-            if (slot && pre.endOffset > slot->pushedThrough) slot->pushedThrough = pre.endOffset;
+            if (pre.endOffset > slot->pushedThrough) slot->pushedThrough = pre.endOffset;
         } else {
             ++sendRefusals_;   // cursor unchanged: re-sent from it on the next pass
         }
@@ -2551,10 +2644,10 @@ int PartitionReplica::pushToFollowers(Offset fromOffset, Offset pushCeiling) noe
 // ---------------------------------------------------------------------------
 // F3 round 5, item I2: unsendable-push suppression (see header).
 // ---------------------------------------------------------------------------
-bool PartitionReplica::unsendablePushSuppressed_(Offset pushCeiling) const noexcept
+bool PartitionReplica::unsendablePushSuppressed_(Offset pushCeiling, Offset floor) const noexcept
 {
     if (unsendablePush_.fromOffset < 0) [[likely]] return false;   // unarmed
-    return unsendablePush_.fromOffset  == pushFloor_() &&
+    return unsendablePush_.fromOffset  == floor &&
            unsendablePush_.leo         == logEndOffset_() &&
            unsendablePush_.pushCeiling == pushCeiling &&
            unsendablePush_.epoch       == epoch_ &&

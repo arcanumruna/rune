@@ -957,7 +957,9 @@ public:
     int dropped   = 0;
     bool sendReconcileResponse(NodeId toPeer,
                                const FetchResponseMsg& resp) override {
-        if (dropped < dropCount) { ++dropped; return false; } // swallow (lost)
+        // Accepted by the transport, then LOST in flight (image loss) — not a
+        // refusal (F27: a refusal would be retried by the sender next pass).
+        if (dropped < dropCount) { ++dropped; return true; }
         InMemoryTransport::sendReconcileResponse(toPeer, resp);
         return true;
     }

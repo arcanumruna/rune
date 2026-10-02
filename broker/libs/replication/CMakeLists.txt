@@ -87,7 +87,8 @@ if(BUILD_TESTING)
         tests/replication/DurabilityQuorumTest.cpp
         tests/replication/LeaderEpochCacheRestartTest.cpp
         tests/replication/BatchPrefixTest.cpp
-        tests/replication/LargeBatchServeTest.cpp)
+        tests/replication/LargeBatchServeTest.cpp
+        tests/replication/OutboundHoldRouterTest.cpp)
     target_link_libraries(rune_replication_tests PRIVATE rune_replication GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_replication_tests)

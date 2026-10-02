@@ -162,6 +162,14 @@ struct Node {
                                                std::vector<NodeId>{1, 2, 3},
                                                std::vector<NodeId>{1, 2, 3}, &log, t.get());
     }
+    /// Accepted frames to `peer` with this SBE templateId.
+    [[nodiscard]] std::size_t framesTo(NodeId peer, uint16_t templateId) const {
+        std::size_t n = 0;
+        auto it = wire->out.find(peer);
+        if (it == wire->out.end()) return 0;
+        for (const auto& f : it->second) if (peekTemplateId(f.data(), 0) == templateId) ++n;
+        return n;
+    }
     /// Accepted frames to `peer` that carry records (pushes / data fetch answers).
     [[nodiscard]] std::size_t dataFramesTo(NodeId peer) const {
         std::size_t n = 0;
@@ -242,6 +250,7 @@ TEST(F27SendNeverDroppedRegression, PushBackPressuredIsResentNextPassWithoutTime
     L.wire->script[3].push_back(kAeronBackPressured);   // the next send to 3 is refused
 
     (void)L.r->doWork(kNow);                            // pass 1: push
+    EXPECT_LE(L.r->highWatermark(), base) << "acks=all: nothing committed before 3 has it";
     EXPECT_EQ(L.dataFramesTo(2), 1u) << "follower 2 got the push";
     EXPECT_EQ(L.dataFramesTo(3), 0u) << "the push to follower 3 was back-pressured";
 
@@ -454,4 +463,167 @@ TEST(F27SendNeverDroppedRegression, TransportReportsRefusalForEverySendRegressio
     EXPECT_TRUE(base.sendOffsetsForLeaderEpochResponse(2, oresp));
     EXPECT_TRUE(base.sendFetchRequest(req));
     EXPECT_FALSE(base.sendFetchResponse(/*unknown peer=*/9, resp)) << "no publication → refused";
+}
+
+// ===========================================================================
+// Fix round 1 (review f27-review.md)
+// ===========================================================================
+
+std::vector<uint8_t> multiBatchAt(Offset base, int records) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    for (int i = 0; i < records; ++i) b.append("k", "v", 1000);
+    return b.build();
+}
+
+// F2: an owed Data answer survives a pure ack at the SAME offset (a non-ISR,
+// catching-up follower has no push to cover it).
+TEST(F27SendNeverDroppedRegression, OwedDataAnswerSurvivesSameOffsetPureAckRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    L.r->becomeLeader(1, {1, 2});                      // follower 3 is NOT in the ISR
+    (void)c.produce(1024);
+    L.wire->script[3].push_back(kAeronBackPressured);
+    (void)L.r->onFetchRequest(FetchRequestMsg{1, 0, 3, /*off=*/0, 1 << 20, 0}, kNow);   // Data → refused → owed
+    (void)L.r->onFetchRequest(FetchRequestMsg{1, 0, 3, /*off=*/0, /*max=*/0, 0}, kNow); // pure ack, same offset
+    ASSERT_EQ(L.dataFramesTo(3), 0u);
+    (void)L.r->doWork(kNow);
+    EXPECT_EQ(L.dataFramesTo(3), 1u)
+        << "a same-offset pure ack must not discharge the owed Data answer";
+}
+
+// F3: a refused OffsetsForLeaderEpoch response is re-sent on the leader's next pass.
+TEST(F27SendNeverDroppedRegression, RefusedEpochResponseIsResentNextPassRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    const uint16_t kEpochResp = static_cast<uint16_t>(ReplicationTemplateId::OffsetsForLeaderEpochResp);
+    L.wire->script[2].push_back(kAeronBackPressured);
+    OffsetsForLeaderEpochReqMsg req{};
+    req.currentEpoch = 1; req.partition = 0; req.followerId = 2;
+    req.requestedEpoch = 1; req.followerLeo = 0; req.topicId = 0;
+    L.r->onOffsetsForLeaderEpochRequest(req);
+    ASSERT_EQ(L.framesTo(2, kEpochResp), 0u);
+    (void)L.r->doWork(kNow);
+    EXPECT_EQ(L.framesTo(2, kEpochResp), 1u) << "refused epoch answer re-sent next pass";
+    (void)L.r->doWork(kNow);
+    EXPECT_EQ(L.framesTo(2, kEpochResp), 1u) << "exactly once";
+}
+
+// F3: a refused reverse-reconcile PULL (deficient leader → ahead survivor) is
+// re-sent on the next pass (no re-probe / stuck-window wait).
+TEST(F27SendNeverDroppedRegression, RefusedReconcilePullIsResentNextPassRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    L.r->becomeLeader(2, {1, 2, 3});                   // open epoch 2 at LEO 0
+    L.wire->script[2].push_back(kAeronBackPressured);  // the pull is refused
+    OffsetsForLeaderEpochReqMsg req{};
+    req.currentEpoch = 2; req.partition = 0; req.followerId = 2;
+    req.requestedEpoch = 2; req.followerLeo = 5; req.topicId = 0;   // ahead, shared epoch
+    L.r->onOffsetsForLeaderEpochRequest(req);
+    ASSERT_EQ(L.framesTo(2, kReconcileFetchReqTemplateId), 0u);
+    (void)L.r->doWork(kNow);
+    EXPECT_EQ(L.framesTo(2, kReconcileFetchReqTemplateId), 1u) << "refused pull re-sent next pass";
+}
+
+// F3: a refused survivor ReconcileResponse is re-sent on the survivor's next pass.
+TEST(F27SendNeverDroppedRegression, RefusedReconcileResponseIsResentNextPassRegression) {
+    Cluster c;
+    Node& F = c.node(2);
+    F.log.append(batchAt(0, 64), 0);                   // the survivor holds offset 0
+    F.wire->script[1].push_back(kAeronAdminAction);
+    F.r->onReconcileRequest(FetchRequestMsg{1, 0, /*puller=*/1, /*off=*/0, 1 << 20, 0});
+    ASSERT_EQ(F.framesTo(1, kReconcileFetchRespTemplateId), 0u);
+    (void)F.r->doWork(kNow);
+    EXPECT_EQ(F.framesTo(1, kReconcileFetchRespTemplateId), 1u) << "refused reconcile answer re-sent";
+}
+
+// F4: a follower whose sends are all refused (leader image not connected) does
+// not report work — the idle strategy must be able to back off.
+TEST(F27SendNeverDroppedRegression, RefusedFollowerSendsAreNotWorkRegression) {
+    Cluster c;
+    Node& F = c.node(2);
+    F.wire->notConnected = {1, 3};
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(F.r->doWork(kNow), 0) << "pass " << i;
+    F.wire->notConnected.clear();
+    EXPECT_GT(F.r->doWork(kNow), 0) << "the accepted re-send is work";
+}
+
+// F6: a Data range already SERVED (accepted) to a follower by its fetch is not
+// pushed to it again.
+TEST(F27SendNeverDroppedRegression, DataServedRangeIsNotRePushedRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    (void)c.produce(1024);
+    (void)L.r->onFetchRequest(FetchRequestMsg{1, 0, 2, 0, 1 << 20, 0}, kNow);   // Data → accepted
+    ASSERT_EQ(L.dataFramesTo(2), 1u);
+    (void)L.r->doWork(kNow);
+    EXPECT_EQ(L.dataFramesTo(2), 1u) << "the served range is not pushed again";
+    EXPECT_EQ(L.dataFramesTo(3), 1u) << "3 still gets its push";
+}
+
+// F7: an owed Data answer to a dead follower is rebuilt (log walk) once, not
+// every pass, while nothing changed.
+TEST(F27SendNeverDroppedRegression, OwedAnswerToDeadFollowerIsNotRebuiltEveryPassRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    (void)c.produce(1024);
+    L.wire->notConnected = {3};
+    (void)L.r->onFetchRequest(FetchRequestMsg{1, 0, 3, 0, 1 << 20, 0}, kNow);   // refused → owed
+    for (int i = 0; i < 20; ++i) (void)L.r->doWork(kNow);
+    EXPECT_LE(L.r->owedAnswerRebuildsForTest(), 1u);
+    L.wire->notConnected.clear();
+    (void)L.r->doWork(kNow);
+    EXPECT_GE(L.dataFramesTo(3), 1u) << "and it is still delivered once the image connects";
+}
+
+// F8: HW holds while one follower's pushes are refused; it advances once they land.
+TEST(F27SendNeverDroppedRegression, HwHoldsWhilePushToFollowerIsRefusedRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    L.wire->notConnected = {3};
+    const Offset base = c.produce(4096);
+    for (int i = 0; i < 6; ++i) c.pass();
+    EXPECT_GT(c.node(2).r->logEndOffset(), base) << "follower 2 has it";
+    EXPECT_LE(L.r->highWatermark(), base) << "acks=all HW never counts the refused follower";
+    L.wire->notConnected.clear();
+    bool done = false;
+    for (int i = 0; i < 8 && !done; ++i) { c.pass(); done = L.r->highWatermark() > base; }
+    EXPECT_TRUE(done);
+}
+
+// F8: retries after refusals never push past the flow window
+// (minFollowerLeo + kPushFlowWindow).
+TEST(F27SendNeverDroppedRegression, FlowWindowHoldsUnderRefusalRetryRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    L.wire->notConnected = {3};                        // 3 never acks: ceiling = 0 + window
+    constexpr int kPerBatch = 300;
+    constexpr int kBatches  = 70;                      // 21000 offsets > window (16384)
+    Offset next = 0;
+    for (int b = 0; b < kBatches; ++b) {
+        L.log.append(multiBatchAt(next, kPerBatch), next + kPerBatch - 1);
+        next += kPerBatch;
+    }
+    c.nextOffset = next;
+    L.r->onLeaderLogAppended();
+    const Offset ceiling = PartitionReplica::kPushFlowWindowForTest;
+    Offset maxBase = -1;
+    for (int pass = 0; pass < 60; ++pass) {
+        if (pass % 2 == 0) L.wire->script[2].push_back(kAeronBackPressured);   // intermittent refusals
+        // Only the LEADER runs (followers apply pushes + fast-ack via route()):
+        // every data frame to 2 is then a PUSH (fetch answers are not windowed).
+        (void)L.r->doWork(kNow);
+        for (const auto& f : L.wire->out[2]) {
+            const Decoded d = decode(f);
+            if (d.templateId != static_cast<uint16_t>(ReplicationTemplateId::FetchResponse)) continue;
+            std::size_t pos = 0;
+            while (pos + 61 <= d.resp.records.size()) {
+                rune::protocol::RecordBatchReader r(d.resp.records.data() + pos, d.resp.records.size() - pos);
+                if (r.baseOffset() > maxBase) maxBase = r.baseOffset();
+                pos += static_cast<std::size_t>(r.totalLength());
+            }
+        }
+        (void)c.route();
+    }
+    EXPECT_LT(maxBase, ceiling) << "no batch starting at/after minFollowerLeo + window is ever pushed";
+    EXPECT_GE(c.node(2).r->logEndOffset(), ceiling - kPerBatch) << "follower 2 filled the window";
 }

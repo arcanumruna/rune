@@ -121,6 +121,25 @@ public:
     /// (msgTypeId, AtomicBuffer&, encodedOffset, length).  Returns messages read.
     template <typename Handler>
     int read(Handler&& handler, int messageCountLimit) {
+        // One ring walk (controlledRead) — a plain read always consumes.
+        return controlledRead(
+            [&handler](std::int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf,
+                       aeron::util::index_t offset, aeron::util::index_t length) {
+                handler(msgTypeId, buf, offset, length);
+                return true;
+            },
+            messageCountLimit);
+    }
+
+    template <typename Handler>
+    int read(Handler&& handler) { return read(std::forward<Handler>(handler), INT_MAX); }
+
+    /// Controlled read (Agrona's controlledRead with CONTINUE / ABORT only):
+    /// handler(msgTypeId, buf, offset, length) returns true to CONSUME the message
+    /// and continue, false to ABORT — that message is NOT consumed (it is re-read
+    /// on the next call) and the read stops.  Returns messages consumed.
+    template <typename Handler>
+    int controlledRead(Handler&& handler, int messageCountLimit) {
         namespace RD = aeron::concurrent::ringbuffer;
         int messagesRead = 0;
 
@@ -146,22 +165,24 @@ public:
             if (recordLength <= 0) break;
             RUNE_TSAN_ACQUIRE(m_buffer.buffer() + recordIndex);
 
-            bytesRead += aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
-
+            const aeron::util::index_t aligned =
+                aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
             const std::int32_t msgTypeId =
                 m_buffer.getInt32(RD::RecordDescriptor::typeOffset(recordIndex));
-            if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) continue;
-
-            handler(msgTypeId, m_buffer,
-                    RD::RecordDescriptor::encodedMsgOffset(recordIndex),
-                    recordLength - RD::RecordDescriptor::HEADER_LENGTH);
+            if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) {
+                bytesRead += aligned;
+                continue;
+            }
+            if (!handler(msgTypeId, m_buffer,
+                         RD::RecordDescriptor::encodedMsgOffset(recordIndex),
+                         recordLength - RD::RecordDescriptor::HEADER_LENGTH)) {
+                break;                                   // ABORT: leave this record
+            }
+            bytesRead += aligned;
             ++messagesRead;
         }
         return messagesRead;
     }
-
-    template <typename Handler>
-    int read(Handler&& handler) { return read(std::forward<Handler>(handler), INT_MAX); }
 
     [[nodiscard]] std::int64_t producerPosition() const {
         return m_buffer.getInt64Volatile(m_tailPositionIndex);

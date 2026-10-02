@@ -274,8 +274,12 @@ public:
     // -----------------------------------------------------------------------
     // broadcastToPeers — send to ALL registered peer pubs (individual back-
     // pressure does not abort the broadcast).  F27: true iff at least one
-    // peer exists and EVERY data peer accepted (a refused peer makes the caller
-    // re-send next pass; duplicates are idempotent at the receiver).
+    // peer exists and EVERY data peer accepted.  Deliberately all-or-nothing
+    // (review F5): the broadcast is only used for a FetchRequest whose leader is
+    // unknown/unresolved, so we cannot tell WHICH peer must get it — a partial
+    // success re-sends next pass to every peer.  The duplicates are tiny and
+    // idempotent at the leader (non-leaders drop them by role), and a refused
+    // follower send is not counted as work (F4), so this never spins a core.
     // -----------------------------------------------------------------------
     bool broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
     {

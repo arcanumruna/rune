@@ -57,6 +57,7 @@
 // (compiled under rune_replication_aeron which has RUNE_NODE_INCLUDE).
 namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 
+#include <rune/replication/OutboundHoldRouter.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
@@ -233,6 +234,10 @@ public:
     /// written only by the thread that polls it).  Control thread / tests.
     struct TxStats { int64_t polls = 0; int64_t fragsRecv = 0; int64_t outDrained = 0; };
     [[nodiscard]] TxStats txStatsForTest() const noexcept;
+    /// F27 F1: held-FIFO counters (control thread / tests).
+    [[nodiscard]] const OutboundHoldStats& holdStatsForTest() const noexcept {
+        return holdRouter_.stats();
+    }
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -336,11 +341,23 @@ private:
     /// One non-blocking findExclusivePublication per unresolved peer.
     void resolvePendingPubs();
 
-    /// Send a raw buffer on a peer's ExclusivePublication.
-    /// Returns true if the frame was accepted (> 0 from tryClaim/offer).
-    /// Non-blocking; caller bears the drop silently.
-    bool sendOnPub(aeron::ExclusivePublication& pub,
-                   const uint8_t* buf, std::size_t len);
+    /// Send a raw buffer on a peer's ExclusivePublication.  Returns the Aeron
+    /// result (> 0 accepted; BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED ...
+    /// refused — the caller HOLDS the frame, F27) or kOfferOversized (permanent).
+    int64_t sendOnPub(aeron::ExclusivePublication& pub,
+                      const uint8_t* buf, std::size_t len);
+
+    /// F27 F1: the hold router's Offer policy — offer `buf` to peer `id`'s pub.
+    /// An unresolved pub is a refusal (-1): the frame is held until it resolves.
+    struct PubOffer {
+        AeronPartitionTransport* t;
+        int64_t operator()(NodeId id, const uint8_t* buf, std::size_t len) {
+            PeerPub* p = t->findPeer(id);
+            if (p == nullptr || !p->pub) return -1;
+            return t->sendOnPub(*p->pub, buf, len);
+        }
+    };
+    friend struct PubOffer;
 
     /// Look up a peer's PeerPub entry (or nullptr if not found).
     PeerPub* findPeer(NodeId id);
@@ -456,6 +473,9 @@ private:
     // Size is NodeConfig-configurable (replicationOutboundRingBytes) — passed to
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
+    // F27 F1: per-peer held FIFOs (control thread only) — a frame the ring
+    // accepted is never dropped by drainOutbound (see OutboundHoldRouter.h).
+    OutboundHoldRouter<PubOffer> holdRouter_;
     uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
     uint64_t oversizedFrameDropped_ = 0;   // F18; see oversizedFrameDropped()
     int64_t  pubMaxMessageBytes_    = 0;   // F18; immutable after start

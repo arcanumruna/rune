@@ -86,6 +86,9 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
         // Leave registered=false; peer will be silently dropped on send.
     }
     peers_.emplace(peerId, std::move(p));
+    // F27 F1: the peer's held FIFO, sized to one full outbound ring (>= 8 max-size
+    // frames), allocated once here (cold) and never reallocated.
+    holdRouter_.addPeer(peerId, outboundRing_.capacity());
 }
 
 // ---------------------------------------------------------------------------
@@ -378,10 +381,17 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
 int AeronPartitionTransport::drainOutbound()
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOutboundDrain, 0);
-    auto handler = [this](std::int32_t /*msgTypeId*/,
-                          aeron::concurrent::AtomicBuffer& buf,
-                          aeron::util::index_t offset,
-                          aeron::util::index_t length) {
+    // F27 F1: NOTHING the ring accepted is ever dropped here.  Phase A flushes
+    // each peer's held frames in order (a refusal stops that peer only); phase B
+    // routes ring frames through the hold router under a CONTROLLED read — a
+    // frame a full FIFO cannot take stays in the ring (ABORT) for the next drain.
+    PubOffer offer{this};
+    int work = holdRouter_.flushHeld(offer);
+
+    auto handler = [this, &offer](std::int32_t /*msgTypeId*/,
+                                  aeron::concurrent::AtomicBuffer& buf,
+                                  aeron::util::index_t offset,
+                                  aeron::util::index_t length) -> bool {
         // Decode the SBE OutboundFrame envelope: targetNodeId + a ZERO-COPY payload
         // view into the ring frame (no memcpy, no hand-rolled offsets).
         char* fbase = reinterpret_cast<char*>(buf.buffer()) + offset;
@@ -395,27 +405,19 @@ int AeronPartitionTransport::drainOutbound()
         const std::string_view pv = dec.getPayloadAsStringView();
         const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
         const std::size_t wlen = pv.size();
-        // Control-clock: frame drained from the outbound ring + offered to peer(s).
-        // corr = ring slot offset == the enqueue's tryClaim index → the gap
-        // ReplOutEnqueue(slot)→ReplOutDrain(slot) is the EXACT worker→control handoff.
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, static_cast<uint32_t>(offset));
-        ++txOutDrained_;
-
-        if (target == kBroadcast) {
-            for (auto& [nodeId, peer] : peers_) {
-                if (peer.pub && peer.pub->isConnected())
-                    sendOnPub(*peer.pub, wire, wlen);
-            }
-        } else {
-            PeerPub* peer = findPeer(target);
-            if (peer && peer->pub && peer->pub->isConnected())
-                sendOnPub(*peer->pub, wire, wlen);
+        const bool consumed = holdRouter_.route(offer, target, wire, wlen);
+        if (consumed) {
+            // Control-clock: frame drained from the outbound ring (offered or held).
+            // corr = ring slot offset == the enqueue's tryClaim index.
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, static_cast<uint32_t>(offset));
+            ++txOutDrained_;
         }
+        return consumed;
     };
-    // Mirror the ConsensusAgent pattern: return the count of ring messages
-    // drained so poll()/doWork() folds it into workCount and the AgentRunner's
-    // IdleStrategy idles only when there was genuinely no work.
-    return outboundRing_.drain(handler, /*limit=*/kFragmentLimit);
+    // Work = ring frames consumed + held frames flushed (a FIFO that keeps being
+    // refused is NOT work, so the IdleStrategy can back off).
+    work += outboundRing_.controlledDrain(handler, /*limit=*/kFragmentLimit);
+    return work;
 }
 
 // ---------------------------------------------------------------------------
@@ -913,7 +915,7 @@ void AeronPartitionTransport::resolvePendingPubs()
 // ---------------------------------------------------------------------------
 // sendOnPub — non-blocking zero-copy send (tryClaim → commit; fallback offer).
 // ---------------------------------------------------------------------------
-bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
+int64_t AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
                                          const uint8_t*               buf,
                                          std::size_t                  len)
 {
@@ -934,7 +936,7 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
                      "len={} maxMessageLength={} — fetch ceiling not applied correctly",
                      len, pub.maxMessageLength());
         ++oversizedFrameDropped_;   // F18: an oversize, not back-pressure
-        return false;
+        return kOfferOversized;     // permanent: never held
     }
 
     auto* mutableBuf = const_cast<uint8_t*>(buf);
@@ -950,7 +952,7 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
             claim.buffer().putBytes(claim.offset(), atomicBuf, 0,
                                     static_cast<aeron::util::index_t>(len));
             claim.commit();
-            return true;
+            return pos;
         }
         // BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED — fall through to offer.
     }
@@ -958,7 +960,7 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
     // Fallback: offer (copies into term buffer).
     const int64_t result = pub.offer(atomicBuf, 0,
                                       static_cast<aeron::util::index_t>(len));
-    return result > 0;
+    return result;
 }
 
 // ---------------------------------------------------------------------------

@@ -711,8 +711,9 @@ public:
     /// F3 fix-round-2, item A.3 test accessor: drive the private pushToFollowers()
     /// directly, so a test can control fromOffset/pushCeiling precisely without
     /// needing GR-10's real coalesced-push cadence.
-    void pushToFollowersForTest(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept {
-        (void)pushToFollowers(fromOffset, pushCeiling);
+    /// F27: `fromOffset` is ignored — every follower is pushed from its own cursor.
+    void pushToFollowersForTest(Offset /*fromOffset*/, Offset pushCeiling = kNoPushCeiling) noexcept {
+        (void)pushToFollowers(pushCeiling);
     }
 
     /// F3 round 5, item I2 test accessors: how many times the "batch exceeds the
@@ -731,6 +732,10 @@ public:
     /// F27: replication sends this replica had REFUSED by its transport (pushes,
     /// fetch answers, follower fetches/acks) — each one was retried next pass.
     [[nodiscard]] uint64_t sendRefusalsForTest() const noexcept { return sendRefusals_; }
+    /// Test view of the push flow window (== kPushFlowWindow, asserted below).
+    static constexpr Offset kPushFlowWindowForTest = 16384;
+    /// F27 F7: times an owed Data answer's whole-batch walk was (re)built.
+    [[nodiscard]] uint64_t owedAnswerRebuildsForTest() const noexcept { return owedRebuilds_; }
 
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
@@ -834,12 +839,16 @@ private:
     // leader to the follower's apply rate instead → stable.  Well under an Aeron term
     // buffer's record capacity so a full window never overflows the publication.
     static constexpr Offset kPushFlowWindow  = 16384;
+    static_assert(kPushFlowWindow == kPushFlowWindowForTest);
     static constexpr Offset kNoPushCeiling   = (1LL << 62);
     /// Push [cursor_f, min(LEO, pushCeiling)) to each ISR follower f (whole-batch
-    /// aligned, capped at the frame).  `fromOffset` is only the start for a
-    /// follower without a slot (none in practice: the ISR is within the replica set).
+    /// aligned, capped at the frame).  `floor` = pushFloor_() when the caller
+    /// already has it (doWork, F9), else kFloorUnknown (computed here).  An ISR
+    /// follower without a slot cannot exist (the ISR is within the replica set the
+    /// slots are built from) and is skipped.
     /// Returns the number of pushes the transport ACCEPTED (doWork's work count).
-    int pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
+    static constexpr Offset kFloorUnknown = -1;
+    int pushToFollowers(Offset pushCeiling = kNoPushCeiling, Offset floor = kFloorUnknown) noexcept;
     /// F27: the lowest push cursor over the ISR followers (LEO when there are none)
     /// — the derived replacement of the former shared lastPushedOffset_.
     [[nodiscard]] Offset pushFloor_() const noexcept;
@@ -849,13 +858,18 @@ private:
     /// F27: send a fetch answer to `slot`'s follower; on refusal record it as owed
     /// and forget it as served (never conflate against an unsent answer).
     bool sendFetchAnswer_(FollowerSlot* slot, NodeId follower, const FetchResponseMsg& resp,
-                          Offset fetchOffset, int32_t maxBytes, bool data);
+                          Offset fetchOffset, int32_t maxBytes, bool data, Offset dataEnd);
+    /// F27 F3: DR sends that are OWED when refused and re-sent next pass.
+    void sendEpochAnswer_(NodeId to, const OffsetsForLeaderEpochRespMsg& m);
+    bool sendReconcilePull_(NodeId peer, const FetchRequestMsg& pull);
+    /// F27 F3: re-send owed DR frames (any role).  Returns sends accepted.
+    int retryOwedDrSends_() noexcept;
 
     /// F3 round 5, item I2: true while the push head is a remembered UNSENDABLE
     /// batch and nothing that could change the outcome (LEO, ISR, follower
     /// position via pushCeiling, epoch) has changed — doWork() then skips the
     /// push entirely (no readView/parse, no work count).  One compare when unarmed.
-    [[nodiscard]] bool unsendablePushSuppressed_(Offset pushCeiling) const noexcept;
+    [[nodiscard]] bool unsendablePushSuppressed_(Offset pushCeiling, Offset floor) const noexcept;
     /// Order-sensitive signature of the current ISR (cold: only computed while
     /// an unsendable-push memo is armed or being armed).
     [[nodiscard]] uint64_t isrSignature_() const noexcept;
@@ -1096,6 +1110,12 @@ private:
     // pushCursor(); the old shared lastPushedOffset_ advanced even when a push to
     // one follower was refused, so that follower's data waited for a timer.
     uint64_t sendRefusals_ = 0;   // F27: transport-refused replication sends (retried)
+    uint64_t owedRebuilds_ = 0;   // F27 F7: owed Data answer rebuilds (log walk)
+    // F27 F3: owed DR sends (one each; a newer one replaces it).
+    struct OwedPull      { NodeId peer = -1; FetchRequestMsg req{}; };
+    struct OwedReconResp { NodeId peer = -1; FetchRequestMsg req{}; };
+    OwedPull      owedPull_{};        ///< refused reverse-reconcile pull (leader)
+    OwedReconResp owedReconResp_{};   ///< refused reconcile answer (survivor)
 
     // Durability: effective minIsr for the acksAll produce gate.
     // Majority mode: cfg_.minIsr.

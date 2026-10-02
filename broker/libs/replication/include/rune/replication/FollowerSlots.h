@@ -20,6 +20,7 @@
 //     re-sends it on its next pass (no wait for the follower's resend timer) and
 //     the refused serve is never remembered for conflation.
 // Single-writer: the thread that owns the replica.  Reset on every role change.
+#include <rune/replication/ReplicationMessages.h>   // OffsetsForLeaderEpochRespMsg (owed DR answer)
 #include <rune/replication/Types.h>
 
 #include <array>
@@ -57,12 +58,30 @@ struct FollowerSlot {
         int32_t maxBytes    = 0;
         bool    data        = false;   ///< Data serve (records) vs HW-only answer
         int16_t errorCode   = 0;       ///< HW-only answer's error code (kErrNone = 0)
+        // F7 memo: the whole-batch walk of a Data answer is rebuilt only when the
+        // leader's LEO moved since it was built (a dead follower's retry is then
+        // a readView + send, never a re-walk).
+        Offset      builtLeo   = -1;
+        std::size_t builtBytes = 0;
+        Offset      builtEnd   = -1;
     };
     OwedAnswer owed{};
+    // F6: exclusive end of Data this follower's FETCH answers delivered (accepted)
+    // in this leadership — the push cursor skips it (no duplicate push).  Never
+    // feeds the AckOnly gate (catch-up semantics unchanged).
+    Offset dataServedThrough = -1;
+    // F27 F3: an OffsetsForLeaderEpoch answer the transport refused, re-sent on
+    // the next pass; superseded by the follower's next probe.
+    struct OwedEpochAnswer {
+        bool                         valid = false;
+        OffsetsForLeaderEpochRespMsg msg{};
+    };
+    OwedEpochAnswer owedEpoch{};
 
     /// Where the next push to this follower starts (F27 per-follower cursor).
     [[nodiscard]] Offset pushCursor() const noexcept {
-        return pushedThrough > ackedLeo ? pushedThrough : ackedLeo;
+        Offset c = pushedThrough > ackedLeo ? pushedThrough : ackedLeo;
+        return dataServedThrough > c ? dataServedThrough : c;
     }
     /// F27: the answer to the current fetch was REFUSED by the transport — forget
     /// it as served (an identical retry must never be conflated against it).
@@ -73,7 +92,7 @@ struct FollowerSlot {
     void resetLeadership() noexcept {
         servedFetchOffset = -1; servedLeo = -1; servedTimeNs = 0;
         askOffset = -1; askSinceNs = 0; pushedThrough = 0; catchUpTarget = -1;
-        ackedLeo = -1; owed = OwedAnswer{};
+        ackedLeo = -1; owed = OwedAnswer{}; dataServedThrough = -1; owedEpoch = OwedEpochAnswer{};
     }
 };
 
