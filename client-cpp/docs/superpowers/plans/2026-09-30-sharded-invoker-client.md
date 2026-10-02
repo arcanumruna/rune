@@ -1261,6 +1261,7 @@ Create `tests/transport/InvokerTransportTest.cpp`:
 // test thread IS the driver.
 #include <rune/client/transport/AeronTransport.h>
 
+#include <Aeron.h>  // aeron::currentTimeMillis — the conductor's own clock (stall test)
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -1357,7 +1358,14 @@ TEST(InvokerTransport, StalledOwnerSurfacesClosedInsteadOfExitingRegression) {
     Transport t{c};
     t.start();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
-    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    // Stall exactly past the condition Aeron checks — no tuned duration.  The
+    // conductor's clock (aeron::currentTimeMillis, hard-wired in Aeron.cpp:43)
+    // cannot be injected, so wait on THAT clock with THAT comparison
+    // (ClientConductor.h:436: nowMs > timeOfLastDoWorkMs + interServiceTimeoutMs).
+    // t0 is taken after the last conductor doWork, so t0 >= timeOfLastDoWorkMs.
+    const long long livenessMs = c.clientLivenessTimeoutNs / 1'000'000;
+    const long long t0 = aeron::currentTimeMillis();
+    while (aeron::currentTimeMillis() <= t0 + livenessMs) std::this_thread::yield();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.closed(); }))
         << "inter-service timeout must close the client and be observable";
     const uint8_t b[] = {1};
@@ -5679,7 +5687,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 Spec §4.1: "`ClientShard`: one thread owning a subset of partitions, with its own embedded driver in invoker mode (tmpfs dir, explicit MTU, default 8 KB, configurable), its own Aeron client with conductor invoker, its partitions' batch builders, publications to whichever worker endpoints they map to, its ack subscription, and its pending-ack table … Shard count = client cores given (config, default 1) … Deterministic partition → shard mapping … Agent mode (existing default, kept): a background thread per shard … any app thread may `send()` to any partition (routed to the owning shard)." A shard is one `Client` (its own dataDir → own driver; own egress port → own ack subscription; own sessions) plus its producer. Ownership is enforced: two shards writing one partition would collide on the shared idempotent producer id (`ProducerImpl.h:492-499`).
 
-**F8c API (2026-10-02, spec `2026-10-01-f8c-no-futures-design.md` step C9 — this text supersedes the pre-F8 draft):** the client has no futures, promises, `std::async`, `shared_ptr` handles or atomics. `ClientShard::connect(CompletionTarget, Token)` returns an `OpResult` and completes exactly once into a `Completions` (polled on the issuing thread) or a `CompletionHandler`; `connectAndWait(timeout)` is the blocking sugar (Invoker owner: pumps `doWork()`; Thread mode: idle-strategy poll). Invoker batch acks arrive as `OpKind::BatchAck` completions in a shard-owned `Completions` (`Producer::batchAcksTo`, decoded with `batchAckOf`) — `collectBatchAcks`/`drainBatchAcks` and `Producer::implForInternalUse` no longer exist. Handles are move-only. Tests use no atomics and poll instead of sleeping; the one real-time wait left is `StalledOwnerTurnsSendsIntoClosed` (Aeron's conductor liveness clock cannot be injected).
+**F8c API (2026-10-02, spec `2026-10-01-f8c-no-futures-design.md` step C9 — this text supersedes the pre-F8 draft):** the client has no futures, promises, `std::async`, `shared_ptr` handles or atomics. `ClientShard::connect(CompletionTarget, Token)` returns an `OpResult` and completes exactly once into a `Completions` (polled on the issuing thread) or a `CompletionHandler`; `connectAndWait(timeout)` is the blocking sugar (Invoker owner: pumps `doWork()`; Thread mode: idle-strategy poll). Invoker batch acks arrive as `OpKind::BatchAck` completions in a shard-owned `Completions` (`Producer::batchAcksTo`, decoded with `batchAckOf`) — `collectBatchAcks`/`drainBatchAcks` and `Producer::implForInternalUse` no longer exist. Handles are move-only. Tests use no atomics and never sleep. The only real-time waits in tests are the two stalled-owner tests (Task 6 `StalledOwnerSurfacesClosedInsteadOfExitingRegression`, Task 15 `StalledOwnerTurnsSendsIntoClosed`): Aeron's conductor clock cannot be injected (`Aeron.cpp:43` hard-wires `currentTimeMillis`), so each yields on `aeron::currentTimeMillis()` until `ClientConductor.h:436`'s own condition (`nowMs > timeOfLastDoWorkMs + interServiceTimeoutMs`) holds — the exact minimal stall (~200 ms), no tuned multiple. (Task 18's 500 ms `IDLE_CHECK` sampling window is a measurement interval, not synchronization.)
 
 Resolved ambiguity: spec §4.1 says agent mode hands records "through a per-shard single-producer ring" but also "any app thread may send() to any partition" — several app threads can target one shard, so the per-shard ring stays the existing ManyToOne ring (§1a.2: "ManyToOne only where genuinely multi-producer"). Invoker mode has no ring at all (Task 14).
 
@@ -5766,6 +5774,7 @@ Create `tests/shard/ClientShardTest.cpp`:
 
 #include <rune/client/shard/ClientShard.h>
 
+#include <Aeron.h>  // aeron::currentTimeMillis — the conductor's own clock (stall test)
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -5914,14 +5923,20 @@ TEST(ClientShard, RejectsPartitionsOwnedByAnotherShard) {
 }
 
 // Review Focus 1: an owner stall past the Aeron client liveness timeout turns
-// sends into Closed — no ::exit, no hang.  Real pause: Aeron's conductor clock
-// (ClientConductor.h:436) cannot be injected.
+// sends into Closed — no ::exit, no hang.  Aeron's conductor clock cannot be
+// injected (Aeron.cpp:43 hard-wires currentTimeMillis), so the test yields on
+// that clock until ClientConductor.h:436's condition holds — no tuned sleep.
 TEST(ClientShard, StalledOwnerTurnsSendsIntoClosed) {
     auto g = group(3806, 3807, 1, rs::ShardMode::Invoker);
     g.base.aeronClientLivenessTimeoutNs = 200'000'000;
     ShardRig r(g, 0);
     r.connect();
-    std::this_thread::sleep_for(600ms);
+    // Stall exactly past Aeron's own condition (same clock, same comparison as
+    // ClientConductor.h:436: nowMs > timeOfLastDoWorkMs + interServiceTimeoutMs);
+    // t0 is taken after connect()'s last doWork.  No tuned sleep.
+    const long long livenessMs = g.base.aeronClientLivenessTimeoutNs / 1'000'000;
+    const long long t0 = aeron::currentTimeMillis();
+    while (aeron::currentTimeMillis() <= t0 + livenessMs) std::this_thread::yield();
     ASSERT_TRUE(r.drive([&] { return r.shard.closed(); }, 10'000));
     EXPECT_EQ(r.shard.trySend(r.shard.topic("t"), rc::Key(uint64_t{1}), kVal), rc::SendResult::Closed);
 }
@@ -8083,6 +8098,6 @@ Gaps: none on the client side. Tasks 16 (Step 1 gate) and 19 (Steps 4–5, 7) de
 **4. Review Focus placement:** (1) owner stall → Task 6 Step 1 + Task 15 Step 1; (2) void send inside a duty-cycle callback → Task 14 Step 1; (3) mixed void + callback batch → Task 10 Step 1; (4) duplicate / stale acks → Task 9 Step 1 + Task 10 Step 1; (5) endpoint move with batches in flight → Task 16 Step 2. Each is a named test in its owning task.
 
 **Deliberate decisions recorded for the executor:**
-- Two tests (Task 6, Task 15) pause 600 ms of real time: Aeron's `ClientConductor` inter-service timeout reads Aeron's own epoch clock (`ClientConductor.h:436`), which cannot be injected; every other new test is iteration-capped with no sleeping, except the agent-mode `ShardGroup` test, which must wait for other threads (bounded 20 000 × 100 µs).
+- Two tests (Task 6, Task 15) wait on real time: Aeron's `ClientConductor` inter-service timeout reads Aeron's own epoch clock (`ClientConductor.h:436`), which cannot be injected (`Aeron.cpp:43`). Neither sleeps a tuned duration: each yields on `aeron::currentTimeMillis()` until that exact condition holds (F8c C9 fix round 1). Every other new test is iteration-capped with no sleeping, including the agent-mode `ShardGroup` test, which yields between bounded gateway-pump rounds (F8c C9).
 - The void `send` now throws on invalid input (value too large, invalid topic) instead of silently dropping; `TypedTopic::send` loses `noexcept` accordingly and `ProducerTest.OversizedValueRejected` asserts the new contract.
 - Client-specific env names (`RUNE_CLIENT_AERON_MTU`, `RUNE_CLIENT_AERON_DRIVER_IDLE`) keep broker tuning exported by the VM scripts (`RUNE_AERON_MTU`, `RUNE_AERON_DRIVER_IDLE`) from silently changing the client; `RUNE_AERON_SOCKET_BUFFER_BYTES` keeps its historical client meaning.
