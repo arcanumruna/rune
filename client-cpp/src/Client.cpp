@@ -171,6 +171,12 @@ Client::Client(ClientConfig cfg)
     agent_.setProducerRegisterFn([this](void* impl) {
         auto* p = static_cast<producer::ProducerImpl*>(impl);
         producerHub_.add(p);
+        // Task 16 regression: a producer adopted AFTER a MetadataResponse learns
+        // the advertised per-partition ingress streams now (updateIngressRoute in
+        // onMetadataResponse reached only the producers registered back then).
+        metadataCache_.forEachIngressStream([p](int32_t t, int32_t part, int32_t sid) {
+            p->updateIngressRoute(t, part, sid);
+        });
         // F1: its handle orphaned the release before this adoption: a scan
         // could not see it yet — queue it now (its fence keeps FIFO).
         if (p->releaseOrphaned() && !p->releaseNoted) {

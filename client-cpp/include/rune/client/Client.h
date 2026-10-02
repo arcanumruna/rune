@@ -384,6 +384,10 @@ public:
     void testSetRoute(int32_t topicId, int32_t partition, const std::string& endpoint) {
         agent_.setRoute(topicId, partition, endpoint);
     }
+    /// Test hook (duty-cycle thread only): the cached advertised ingress stream (0 = none).
+    [[nodiscard]] int32_t testIngressStreamIdFor(int32_t topicId, int32_t partition) const {
+        return metadataCache_.ingressStreamIdFor(topicId, partition);
+    }
     /// fix1 C1 test hook: total user-callback exceptions caught (never let a
     /// throwing callback escape a noexcept frame / a runner thread and
     /// terminate the process). Sums this Client's own onConnected/onError/

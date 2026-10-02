@@ -185,6 +185,17 @@ public:
         return it->second.ingressStreamId;
     }
 
+    /// Visit every partition with an advertised per-worker ingress stream:
+    /// f(topicId, partition, ingressStreamId).  Cold path (producer registration).
+    template <class F>
+    void forEachIngressStream(F&& f) const {
+        for (const auto& [key, e] : table_) {
+            if (e.ingressStreamId == 0) continue;
+            f(static_cast<int32_t>(key >> 32), static_cast<int32_t>(static_cast<uint32_t>(key)),
+              e.ingressStreamId);
+        }
+    }
+
     /// Number of known partitions in the cache.
     [[nodiscard]] std::size_t partitionCount() const noexcept {
         return table_.size();
