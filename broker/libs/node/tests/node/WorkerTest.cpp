@@ -63,9 +63,9 @@ namespace {
 // TransactionCoordinationServiceTest (the ground-truth call site per the brief).
 class NullTransport : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(rune::replication::NodeId,
-                           const rune::replication::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId,
+                           const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -78,23 +78,24 @@ public:
     rune::replication::NodeId lastToFollower = -1;
     rune::replication::Offset lastHw = -1;
 
-    void sendFetchRequest(const FetchRequestMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
 
-    void sendFetchResponse(NodeId toFollower,
+    bool sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override {
         lastToFollower = toFollower;
         lastHw         = resp.highWatermark;
         fetchResponseCount.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
-    void sendOffsetsForLeaderEpochRequest(
-            NodeId, const rune::replication::OffsetsForLeaderEpochReqMsg&) override {}
-    void sendOffsetsForLeaderEpochResponse(
-            NodeId, const rune::replication::OffsetsForLeaderEpochRespMsg&) override {}
-    void sendReconcileRequest(
-            NodeId, const FetchRequestMsg&) override {}
-    void sendReconcileResponse(
-            NodeId, const FetchResponseMsg&) override {}
+    bool sendOffsetsForLeaderEpochRequest(
+            NodeId, const rune::replication::OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(
+            NodeId, const rune::replication::OffsetsForLeaderEpochRespMsg&) override { return true; }
+    bool sendReconcileRequest(
+            NodeId, const FetchRequestMsg&) override { return true; }
+    bool sendReconcileResponse(
+            NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 struct ReplicaFixture {
@@ -331,7 +332,7 @@ public:
 
     // No real sends needed for receive-path tests.
     int64_t sendToPeer(rune::replication::NodeId, const uint8_t*, std::size_t) noexcept { return 1; }
-    void    broadcastToPeers(const uint8_t*, std::size_t) noexcept {}
+    bool    broadcastToPeers(const uint8_t*, std::size_t) noexcept { return true; }
     int64_t sendGatherToPeer(rune::replication::NodeId, const uint8_t*, std::size_t,
                              std::span<const uint8_t>) noexcept { return 1; }
     void    setPeerBlocked(rune::replication::NodeId, bool) noexcept {}

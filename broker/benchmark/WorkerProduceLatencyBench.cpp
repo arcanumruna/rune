@@ -69,9 +69,9 @@ static std::vector<uint8_t> makeBatch(std::size_t payloadSize) {
 // (minIsr=1, leader-only), but the ctor requires one.
 class NullTransport : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(rune::replication::NodeId,
-                           const rune::replication::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId,
+                           const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // Builds the REAL Worker + disk Log + leader PartitionReplica + real IoBackend.

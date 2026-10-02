@@ -142,7 +142,7 @@ int64_t AeronPartitionTransport::maxFetchRecordsBytes() const noexcept
 // ---------------------------------------------------------------------------
 // sendFetchRequest — (Follower → Leader)  non-blocking
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
+bool AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 {
     // Shared-nothing: encode into a per-call STACK buffer (no shared state),
     // then marshal to the control thread via the outbound ring. FetchRequest is
@@ -161,13 +161,13 @@ void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
         req.fetchOffset,
         maxBytes,
         req.topicId);
-    enqueueOutbound(kBroadcast, wire, len);
+    return enqueueOutbound(kBroadcast, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // sendFetchResponse — (Leader → Follower)  non-blocking
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
+bool AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
                                                  const FetchResponseMsg& resp)
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplSendFetchResp, 0);
@@ -176,13 +176,13 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
     // the old encode-into-`wire` + putPayload-into-ring double copy.  Shared-nothing:
     // the worker only writes the ring; peers_/pubs stay control-owned (drainOutbound
     // offers).  Back-pressure (full ring) → false; the follower re-fetches.
-    enqueueFetchResponse(toFollower, resp, /*reconcile=*/false);
+    return enqueueFetchResponse(toFollower, resp, /*reconcile=*/false);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: OffsetsForLeaderEpoch request  (Follower → new Leader)
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
+bool AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
         NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req)
 {
     uint8_t wire[kMaxWireFrame];
@@ -190,13 +190,13 @@ void AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
         wire, 0,
         req.currentEpoch, req.partition, req.followerId,
         req.requestedEpoch, req.followerLeo, req.topicId);
-    enqueueOutbound(toLeader, wire, len);
+    return enqueueOutbound(toLeader, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: OffsetsForLeaderEpoch response  (Leader → Follower)
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
+bool AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
         NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp)
 {
     uint8_t wire[kMaxWireFrame];
@@ -204,14 +204,14 @@ void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
         wire, 0,
         resp.leaderEpoch, resp.partition, resp.responseEpoch,
         resp.endOffset, resp.errorCode, resp.topicId);
-    enqueueOutbound(toFollower, wire, len);
+    return enqueueOutbound(toFollower, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: reconcile request  (deficient Leader → ahead survivor)
 // Reuses the FetchRequest layout, re-stamped with the reconcile templateId.
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendReconcileRequest(
+bool AeronPartitionTransport::sendReconcileRequest(
         NodeId toPeer, const FetchRequestMsg& req)
 {
     // F18 (B-3): the reverse pull lands on THIS node's worker ingress ring exactly
@@ -227,19 +227,19 @@ void AeronPartitionTransport::sendReconcileRequest(
         req.leaderEpoch, req.partition, req.followerId,
         req.fetchOffset, maxBytes, req.topicId);
     stampTemplateId(wire, 0, kReconcileFetchReqTemplateId);
-    enqueueOutbound(toPeer, wire, len);
+    return enqueueOutbound(toPeer, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: reconcile response  (ahead survivor → deficient Leader)
 // Reuses the FetchResponse layout, re-stamped with the reconcile templateId.
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendReconcileResponse(
+bool AeronPartitionTransport::sendReconcileResponse(
         NodeId toPeer, const FetchResponseMsg& resp)
 {
     // #2b zero-copy: encode the FetchResponse straight into the outbound-ring slot,
     // then re-stamp the reconcile templateId in place (see enqueueFetchResponse).
-    enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
+    return enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
 }
 
 // FR trace correlation (F9a: no file-static / atomic sequence counters).

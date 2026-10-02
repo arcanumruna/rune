@@ -23,7 +23,7 @@ public:
     [[nodiscard]] int32_t maxMessageLength() const noexcept { return 1 << 20; }
     [[nodiscard]] bool    hasPeer(NodeId) const noexcept { return true; }
     int64_t sendToPeer(NodeId, const uint8_t*, std::size_t) noexcept { ++sends; return 1; }
-    void    broadcastToPeers(const uint8_t*, std::size_t) noexcept { ++sends; }
+    bool    broadcastToPeers(const uint8_t*, std::size_t) noexcept { ++sends; return true; }
     int64_t sendGatherToPeer(NodeId peer, const uint8_t* prefix, std::size_t prefixLen,
                              std::span<const uint8_t> body) noexcept
     {

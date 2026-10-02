@@ -75,25 +75,29 @@ public:
     int     oversizeDropped = 0;
     int     fetchRequests   = 0;                       // every follower FetchRequest
     int     oleRequests     = 0;                       // every OffsetsForLeaderEpoch probe
-    void sendOffsetsForLeaderEpochRequest(NodeId to, const OffsetsForLeaderEpochReqMsg& req) override {
+    bool sendOffsetsForLeaderEpochRequest(NodeId to, const OffsetsForLeaderEpochReqMsg& req) override {
         ++oleRequests;
         InMemoryTransport::sendOffsetsForLeaderEpochRequest(to, req);
+        return true;
     }
 
     [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return frameCap; }
-    void sendFetchRequest(const FetchRequestMsg& req) override {
+    bool sendFetchRequest(const FetchRequestMsg& req) override {
         ++fetchRequests;
         InMemoryTransport::sendFetchRequest(req);
+        return true;
     }
-    void sendFetchResponse(NodeId to, const FetchResponseMsg& resp) override {
-        if (static_cast<int64_t>(resp.records.size()) > frameCap) { ++oversizeDropped; return; }
+    bool sendFetchResponse(NodeId to, const FetchResponseMsg& resp) override {
+        if (static_cast<int64_t>(resp.records.size()) > frameCap) { ++oversizeDropped; return false; }
         fetchResponses.emplace_back(resp.records.begin(), resp.records.end());
         fetchErrors.push_back(resp.errorCode);
         InMemoryTransport::sendFetchResponse(to, resp);
+        return true;
     }
-    void sendReconcileResponse(NodeId to, const FetchResponseMsg& resp) override {
+    bool sendReconcileResponse(NodeId to, const FetchResponseMsg& resp) override {
         reconcileResponses.emplace_back(resp.records.begin(), resp.records.end());
         InMemoryTransport::sendReconcileResponse(to, resp);
+        return true;
     }
 };
 

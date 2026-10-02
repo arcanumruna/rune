@@ -43,8 +43,8 @@ std::string uniqDir(const char* tag) {
 
 class NullPartitionTransport : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 // Harness: real single-node leader schema replica + AdminWorker + a simulated

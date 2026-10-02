@@ -29,14 +29,16 @@ struct RecordingTransport final : PartitionTransport {
     std::vector<Resp> responses;
     std::vector<Req>  requests;
 
-    void sendFetchRequest(const FetchRequestMsg& r) override { requests.push_back({-1, r, false}); }
-    void sendFetchRequestTo(NodeId leader, const FetchRequestMsg& r) override {
+    bool sendFetchRequest(const FetchRequestMsg& r) override { requests.push_back({-1, r, false}); return true; }
+    bool sendFetchRequestTo(NodeId leader, const FetchRequestMsg& r) override {
         requests.push_back({leader, r, true});
+        return true;
     }
-    void sendFetchResponse(NodeId to, const FetchResponseMsg& m) override {
+    bool sendFetchResponse(NodeId to, const FetchResponseMsg& m) override {
         Resp x{to, m, std::vector<uint8_t>(m.records.begin(), m.records.end())};
         x.msg.records = {};
         responses.push_back(std::move(x));
+        return true;
     }
     // Responses addressed to `to` since the last call; clears ALL recorded responses.
     std::vector<Resp> takeFor(NodeId to) {

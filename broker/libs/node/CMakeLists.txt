@@ -153,7 +153,8 @@ if(BUILD_TESTING)
     if(aeron_FOUND)
         add_executable(rune_worker_replication_transport_tests
             tests/node/WorkerReplicationTransportTest.cpp
-            tests/node/ReplicaTransportKindTest.cpp)
+            tests/node/ReplicaTransportKindTest.cpp
+            tests/node/F27SendNeverDroppedRegressionTest.cpp)
         target_link_libraries(rune_worker_replication_transport_tests PRIVATE
             rune_node
             rune_replication

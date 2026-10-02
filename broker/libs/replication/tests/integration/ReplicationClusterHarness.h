@@ -116,21 +116,22 @@ public:
     // --- PartitionTransport interface ---
 
     // Called by a follower's doWork() when it wants to send a FetchRequest.
-    void sendFetchRequest(const FetchRequestMsg& req) override {
+    bool sendFetchRequest(const FetchRequestMsg& req) override {
         // Drop if sender (follower) is isolated.
-        if (isolated_.count(req.followerId)) return;
+        if (isolated_.count(req.followerId)) return false;
         // Drop if the current leader is isolated.
-        if (isolated_.count(currentLeaderId_)) return;
+        if (isolated_.count(currentLeaderId_)) return false;
         pendingRequests_.push_back({req});
+        return true;
     }
 
     // Called by the leader's onFetchRequest() to send a FetchResponse.
-    void sendFetchResponse(NodeId toFollower,
+    bool sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override {
         // Drop if recipient follower is isolated.
-        if (isolated_.count(toFollower)) return;
+        if (isolated_.count(toFollower)) return false;
         // Drop if leader is isolated (this call is from the leader).
-        if (isolated_.count(currentLeaderId_)) return;
+        if (isolated_.count(currentLeaderId_)) return false;
 
         PendingResponse pr;
         pr.toFollower = toFollower;
@@ -139,27 +140,31 @@ public:
         pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
                                                     pr.recordsBuf.size());
         pendingResponses_.push_back(std::move(pr));
+        return true;
     }
 
     // DR-BUG-6: OffsetsForLeaderEpoch + reconcile peer-routed messages.
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendOffsetsForLeaderEpochRequest(
             NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override {
-        if (isolated_.count(req.followerId) || isolated_.count(toLeader)) return;
+        if (isolated_.count(req.followerId) || isolated_.count(toLeader)) return false;
         pendingEpochReqs_.push_back({toLeader, req});
+        return true;
     }
-    void sendOffsetsForLeaderEpochResponse(
+    bool sendOffsetsForLeaderEpochResponse(
             NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override {
-        if (isolated_.count(toFollower)) return;
+        if (isolated_.count(toFollower)) return false;
         pendingEpochResps_.push_back({toFollower, resp});
+        return true;
     }
-    void sendReconcileRequest(
+    bool sendReconcileRequest(
             NodeId toPeer, const FetchRequestMsg& req) override {
-        if (isolated_.count(toPeer) || isolated_.count(req.followerId)) return;
+        if (isolated_.count(toPeer) || isolated_.count(req.followerId)) return false;
         pendingReconcileReqs_.push_back({toPeer, req});
+        return true;
     }
-    void sendReconcileResponse(
+    bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override {
-        if (isolated_.count(toPeer)) return;
+        if (isolated_.count(toPeer)) return false;
         PendingResponse pr;
         pr.toFollower = toPeer;
         pr.recordsBuf.assign(resp.records.begin(), resp.records.end());
@@ -167,6 +172,7 @@ public:
         pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
                                                     pr.recordsBuf.size());
         pendingReconcileResps_.push_back(std::move(pr));
+        return true;
     }
 
     // Deliver all pending messages.

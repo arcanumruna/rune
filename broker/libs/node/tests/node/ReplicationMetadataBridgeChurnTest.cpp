@@ -88,12 +88,12 @@ struct ChurnTmpDir {
 // ---------------------------------------------------------------------------
 class ChurnMockTransport : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&)                              override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&)                    override {}
-    void sendOffsetsForLeaderEpochRequest(NodeId, const OffsetsForLeaderEpochReqMsg&)  override {}
-    void sendOffsetsForLeaderEpochResponse(NodeId, const OffsetsForLeaderEpochRespMsg&) override {}
-    void sendReconcileRequest(NodeId, const FetchRequestMsg&)                  override {}
-    void sendReconcileResponse(NodeId, const FetchResponseMsg&)                override {}
+    bool sendFetchRequest(const FetchRequestMsg&)                              override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&)                    override { return true; }
+    bool sendOffsetsForLeaderEpochRequest(NodeId, const OffsetsForLeaderEpochReqMsg&)  override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(NodeId, const OffsetsForLeaderEpochRespMsg&) override { return true; }
+    bool sendReconcileRequest(NodeId, const FetchRequestMsg&)                  override { return true; }
+    bool sendReconcileResponse(NodeId, const FetchResponseMsg&)                override { return true; }
 };
 
 // ---------------------------------------------------------------------------

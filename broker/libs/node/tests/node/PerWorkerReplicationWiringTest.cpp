@@ -59,7 +59,7 @@ struct FakePubRegistry {
     [[nodiscard]] bool hasPeer(NodeId) const noexcept { return peerCount > 0; }
 
     int64_t sendToPeer(NodeId, const uint8_t*, std::size_t) noexcept { return 1; }
-    void    broadcastToPeers(const uint8_t*, std::size_t) noexcept {}
+    bool    broadcastToPeers(const uint8_t*, std::size_t) noexcept { return true; }
     int64_t sendGatherToPeer(NodeId, const uint8_t*, std::size_t,
                              std::span<const uint8_t>) noexcept { return 1; }
 };

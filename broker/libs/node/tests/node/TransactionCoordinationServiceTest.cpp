@@ -69,8 +69,8 @@ struct TmpDir {
 
 class NullTransport : public rep::PartitionTransport {
 public:
-    void sendFetchRequest(const rep::FetchRequestMsg&) override {}
-    void sendFetchResponse(rep::NodeId, const rep::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rep::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rep::NodeId, const rep::FetchResponseMsg&) override { return true; }
 };
 
 static rep::PartitionConfig makeSingleNodeConfig() {

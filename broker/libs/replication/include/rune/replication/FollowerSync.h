@@ -69,6 +69,8 @@ public:
         leaderHw_        = 0;
         fetchDeadlineNs_ = 0;
         lastEmitNs_      = 0;
+        prevEmitNs_      = 0;
+        ackOwed_         = false;
     }
 
     /// A FetchResponse or GR-10 push from the current (or a newer) leader was
@@ -109,6 +111,7 @@ public:
                                 int64_t resendNs) noexcept {
         if (state_ == State::InSync) {
             if (nowNs - lastEmitNs_ < keepNs) return {false, false};
+            prevEmitNs_ = lastEmitNs_;
             lastEmitNs_ = nowNs;
             // DATA keepalive, NOT a pure ack.  A caught-up follower that goes InSync
             // must still periodically PULL: the leader's GR-10 push is best-effort and
@@ -126,10 +129,27 @@ public:
         if (nowNs - lastEmitNs_ < fastNs) return {false, false};
         const bool outstanding = fetchDeadlineNs_ != 0 && nowNs < fetchDeadlineNs_;
         if (outstanding) return {false, false};    // one data-fetch already in flight
+        prevEmitNs_      = lastEmitNs_;
         lastEmitNs_      = nowNs;
         fetchDeadlineNs_ = nowNs + resendNs;        // arm resend; cleared by onResponse
         return {true, true};                        // single-outstanding catch-up fetch
     }
+
+    /// F27: the fetch decide() just emitted was REFUSED by the transport (Aeron
+    /// back-pressure / not connected).  It never left, so nothing is outstanding:
+    /// undo the emit — the next tick re-sends it, whatever the clock says
+    /// (time-independent; never wait out resendNs for a frame that was not sent).
+    void onFetchRefused() noexcept {
+        lastEmitNs_      = prevEmitNs_;
+        fetchDeadlineNs_ = 0;
+    }
+
+    /// F27: a pure fast-ack (LEO report) was refused by the transport — owe it;
+    /// the next tick re-sends it.  Any fetch that IS sent carries the same LEO
+    /// and discharges it (onFetchSent).
+    void onAckRefused() noexcept { ackOwed_ = true; }
+    void onFetchSent()  noexcept { ackOwed_ = false; }
+    [[nodiscard]] bool ackOwed() const noexcept { return ackOwed_; }
 
     // ── Observability / test accessors (also keep fields "used" for -Werror) ──
     [[nodiscard]] State   state()     const noexcept { return state_; }
@@ -144,6 +164,8 @@ private:
     Offset  leaderHw_        = 0;              ///< highest leader HW heard (observational)
     int64_t fetchDeadlineNs_ = 0;              ///< 0 = no outstanding fetch; else resend deadline
     int64_t lastEmitNs_      = 0;              ///< last fetch emit (throttles fast/keepalive)
+    int64_t prevEmitNs_      = 0;              ///< lastEmitNs_ before the latest emit (F27 undo)
+    bool    ackOwed_         = false;          ///< F27: a refused fast-ack awaits re-send
 };
 
 } // namespace rune::replication

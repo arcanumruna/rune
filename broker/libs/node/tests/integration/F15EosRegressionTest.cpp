@@ -68,8 +68,8 @@ struct TmpDir {
 };
 class NullTransport final : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const rune::replication::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
 };
 std::vector<uint8_t> batchAt(int64_t base, int n = 1) {
     rune::protocol::RecordBatchBuilder b(base, 1000);

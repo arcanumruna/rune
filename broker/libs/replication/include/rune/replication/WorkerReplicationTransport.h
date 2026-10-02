@@ -57,7 +57,7 @@
 //   The class is templated on PubRegistry, a policy that owns the per-peer
 //   pub handles and provides:
 //     int64_t sendToPeer(NodeId, const uint8_t* buf, std::size_t len)
-//     void    broadcastToPeers(const uint8_t* buf, std::size_t len)
+//     bool    broadcastToPeers(const uint8_t* buf, std::size_t len)   // true iff EVERY peer accepted
 //     int64_t sendGatherToPeer(NodeId, const uint8_t* prefix, std::size_t prefixLen,
 //                              std::span<const uint8_t> body)
 //   The default AeronPubRegistry resolves real ExclusivePublications and calls
@@ -272,15 +272,23 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // broadcastToPeers — send to ALL registered peer pubs (best-effort;
-    // individual back-pressure does not abort the broadcast).
+    // broadcastToPeers — send to ALL registered peer pubs (individual back-
+    // pressure does not abort the broadcast).  F27: true iff at least one
+    // peer exists and EVERY data peer accepted (a refused peer makes the caller
+    // re-send next pass; duplicates are idempotent at the receiver).
     // -----------------------------------------------------------------------
-    void broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
+    bool broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
     {
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerBroadcast, 0);
+        bool all = false;
+        bool anyRefused = false;
         for (std::size_t i = 0; i < pubCount_; ++i) {
-            if (pubs_[i].pub && !pubs_[i].blocked) sendOnPub_(*pubs_[i].pub, buf, len);
+            if (pubs_[i].pub && !pubs_[i].blocked) {
+                all = true;
+                if (sendOnPub_(*pubs_[i].pub, buf, len) <= 0) anyRefused = true;
+            }
         }
+        return all && !anyRefused;
     }
 
     // -----------------------------------------------------------------------
@@ -791,8 +799,12 @@ public:
     // broadcastToPeers (tryClaim).  FetchResponse / ReconcileResponse encode only
     // their SBE prefix on the stack and gather-send the records view
     // (sendGatherToPeer: tryClaim <= maxPayloadLength, else 2-buffer offer()).
-    // On back-pressure (tryClaim/offer <= 0 / peer not found): drop.
-    //      Replication is retriable; the follower re-issues its fetch.
+    // F27: every send returns whether the frame was ACCEPTED (Aeron position
+    // > 0).  BACK_PRESSURED (-2) / ADMIN_ACTION (-3) / NOT_CONNECTED (-1) /
+    // no pub / oversized → false, and the replica retries on its next pass
+    // from its own cursor (never a resend timer).  Once accepted, Aeron is a
+    // reliable, ordered stream — the frame reaches the peer's image unless the
+    // image itself is lost (peer restart), which the follower's fetch covers.
     // =======================================================================
 
     // -----------------------------------------------------------------------
@@ -800,7 +812,7 @@ public:
     // FetchRequest has no explicit target on the wire; the current leader
     // responds; non-leaders drop via the role guard.
     // -----------------------------------------------------------------------
-    void sendFetchRequest(const rune::replication::FetchRequestMsg& req) override
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg& req) override
     {
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerFetchReqSend,
                                  static_cast<uint32_t>(req.partition));
@@ -810,14 +822,14 @@ public:
             claimBuf, 0,
             req.leaderEpoch, req.partition, req.followerId,
             req.fetchOffset, req.maxBytes, req.topicId);
-        pubReg_.broadcastToPeers(claimBuf, kSize);
+        return pubReg_.broadcastToPeers(claimBuf, kSize);
     }
 
     // -----------------------------------------------------------------------
     // sendFetchRequestTo — spec §3.5.2: UNICAST to the replica's known leader.
     // A leader that is not (yet) a registered peer falls back to the broadcast.
     // -----------------------------------------------------------------------
-    void sendFetchRequestTo(rune::replication::NodeId leader,
+    bool sendFetchRequestTo(rune::replication::NodeId leader,
                             const rune::replication::FetchRequestMsg& req) override
     {
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerFetchReqSend,
@@ -827,8 +839,8 @@ public:
         rune::replication::FetchRequestMsg::encode(
             claimBuf, 0, req.leaderEpoch, req.partition, req.followerId,
             req.fetchOffset, req.maxBytes, req.topicId);
-        if (pubReg_.hasPeer(leader)) pubReg_.sendToPeer(leader, claimBuf, kSize);
-        else                         pubReg_.broadcastToPeers(claimBuf, kSize);
+        if (pubReg_.hasPeer(leader)) return pubReg_.sendToPeer(leader, claimBuf, kSize) > 0;
+        return pubReg_.broadcastToPeers(claimBuf, kSize);
     }
 
     // -----------------------------------------------------------------------
@@ -836,18 +848,18 @@ public:
     // Variable-length (records tail) → size computed; fast path uses tryClaim
     // with in-claim encode (zero-copy for ≤ MTU frames).
     // -----------------------------------------------------------------------
-    void sendFetchResponse(rune::replication::NodeId toFollower,
+    bool sendFetchResponse(rune::replication::NodeId toFollower,
                            const rune::replication::FetchResponseMsg& resp) override
     {
         RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerSend,
                                  static_cast<uint32_t>(resp.records.size()));
-        sendFetchResponseImpl_(toFollower, resp, /*reconcile=*/false);
+        return sendFetchResponseImpl_(toFollower, resp, /*reconcile=*/false);
     }
 
     // -----------------------------------------------------------------------
     // sendOffsetsForLeaderEpochRequest — fixed-size, single peer.
     // -----------------------------------------------------------------------
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendOffsetsForLeaderEpochRequest(
             rune::replication::NodeId toLeader,
             const rune::replication::OffsetsForLeaderEpochReqMsg& req) override
     {
@@ -857,13 +869,13 @@ public:
             claimBuf, 0,
             req.currentEpoch, req.partition, req.followerId,
             req.requestedEpoch, req.followerLeo, req.topicId);
-        pubReg_.sendToPeer(toLeader, claimBuf, kSize);
+        return pubReg_.sendToPeer(toLeader, claimBuf, kSize) > 0;
     }
 
     // -----------------------------------------------------------------------
     // sendOffsetsForLeaderEpochResponse — fixed-size, single peer.
     // -----------------------------------------------------------------------
-    void sendOffsetsForLeaderEpochResponse(
+    bool sendOffsetsForLeaderEpochResponse(
             rune::replication::NodeId toFollower,
             const rune::replication::OffsetsForLeaderEpochRespMsg& resp) override
     {
@@ -873,13 +885,13 @@ public:
             claimBuf, 0,
             resp.leaderEpoch, resp.partition, resp.responseEpoch,
             resp.endOffset, resp.errorCode, resp.topicId);
-        pubReg_.sendToPeer(toFollower, claimBuf, kSize);
+        return pubReg_.sendToPeer(toFollower, claimBuf, kSize) > 0;
     }
 
     // -----------------------------------------------------------------------
     // sendReconcileRequest — FetchRequest re-stamped as ReconcileFetchReq.
     // -----------------------------------------------------------------------
-    void sendReconcileRequest(rune::replication::NodeId toPeer,
+    bool sendReconcileRequest(rune::replication::NodeId toPeer,
                               const rune::replication::FetchRequestMsg& req) override
     {
         constexpr std::size_t kSize = rune::replication::FetchRequestMsg::TOTAL_SIZE;
@@ -890,16 +902,16 @@ public:
             req.fetchOffset, req.maxBytes, req.topicId);
         rune::replication::stampTemplateId(
             claimBuf, 0, rune::replication::kReconcileFetchReqTemplateId);
-        pubReg_.sendToPeer(toPeer, claimBuf, kSize);
+        return pubReg_.sendToPeer(toPeer, claimBuf, kSize) > 0;
     }
 
     // -----------------------------------------------------------------------
     // sendReconcileResponse — FetchResponse re-stamped as ReconcileFetchResp.
     // -----------------------------------------------------------------------
-    void sendReconcileResponse(rune::replication::NodeId toPeer,
+    bool sendReconcileResponse(rune::replication::NodeId toPeer,
                                const rune::replication::FetchResponseMsg& resp) override
     {
-        sendFetchResponseImpl_(toPeer, resp, /*reconcile=*/true);
+        return sendFetchResponseImpl_(toPeer, resp, /*reconcile=*/true);
     }
 
 private:
@@ -1139,7 +1151,7 @@ private:
     // -----------------------------------------------------------------------
     static constexpr std::size_t kFetchResponsePrefixMax = 64;   // encodedSize(0) == 46
 
-    void sendFetchResponseImpl_(rune::replication::NodeId peer,
+    bool sendFetchResponseImpl_(rune::replication::NodeId peer,
                                 const rune::replication::FetchResponseMsg& resp,
                                 bool reconcile) noexcept
     {
@@ -1157,7 +1169,7 @@ private:
         rr::detail::write_le<uint32_t>(prefix + prefixLen - rr::FetchResponseMsg::VAR_HEADER_SIZE,
                                        static_cast<uint32_t>(resp.records.size()));
         if (reconcile) rr::stampTemplateId(prefix, 0, rr::kReconcileFetchRespTemplateId);
-        pubReg_.sendGatherToPeer(peer, prefix, prefixLen, resp.records);
+        return pubReg_.sendGatherToPeer(peer, prefix, prefixLen, resp.records) > 0;
     }
 
     // -----------------------------------------------------------------------

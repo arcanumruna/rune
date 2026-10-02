@@ -955,10 +955,11 @@ class DroppingReconcileTransport : public InMemoryTransport {
 public:
     int dropCount = 0;
     int dropped   = 0;
-    void sendReconcileResponse(NodeId toPeer,
+    bool sendReconcileResponse(NodeId toPeer,
                                const FetchResponseMsg& resp) override {
-        if (dropped < dropCount) { ++dropped; return; } // swallow (lost)
+        if (dropped < dropCount) { ++dropped; return false; } // swallow (lost)
         InMemoryTransport::sendReconcileResponse(toPeer, resp);
+        return true;
     }
 };
 
@@ -3580,9 +3581,10 @@ TEST(PartitionReplicaTest, OnFetchRequest_WholeBatchAlignment) {
     // Capture transport: records the size of the last FetchResponse records blob.
     struct CaptureTransport : public PartitionTransport {
         std::size_t lastResponseRecordsSize = SIZE_MAX;
-        void sendFetchRequest(const FetchRequestMsg&) override {}
-        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
             lastResponseRecordsSize = r.records.size();
+            return true;
         }
     };
 
@@ -3705,10 +3707,11 @@ TEST(PartitionReplicaRegression, FetchMapFailureDoesNotReportCaughtUp) {
     struct CaptureTransport : public PartitionTransport {
         int calls = 0;
         FetchResponseMsg last{};
-        void sendFetchRequest(const FetchRequestMsg&) override {}
-        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
             ++calls;
             last = r;
+            return true;
         }
     };
 
@@ -3796,10 +3799,11 @@ TEST(PartitionReplicaRegression, FetchOversizeFirstBatchIsServedAloneRegression)
         int calls = 0;
         FetchResponseMsg last{};
         int32_t ceiling = INT32_MAX;
-        void sendFetchRequest(const FetchRequestMsg&) override {}
-        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
             ++calls;
             last = r;
+            return true;
         }
         [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
             return ceiling;
@@ -3863,10 +3867,11 @@ TEST(PartitionReplicaRegression, FetchUnsendableBatchRepliesErrorNotCaughtUpRegr
         int calls = 0;
         FetchResponseMsg last{};
         int32_t ceiling = INT32_MAX;
-        void sendFetchRequest(const FetchRequestMsg&) override {}
-        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
             ++calls;
             last = r;
+            return true;
         }
         [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
             return ceiling;
@@ -3941,10 +3946,11 @@ TEST(PartitionReplicaRegression, PushOversizeFirstBatchIsDeliveredRegression) {
         int calls = 0;
         FetchResponseMsg last{};
         int32_t ceiling = INT32_MAX;
-        void sendFetchRequest(const FetchRequestMsg&) override {}
-        void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
             ++calls;
             last = r;
+            return true;
         }
         [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
             return ceiling;
@@ -4019,8 +4025,8 @@ TEST(PartitionReplicaRegression, PushUnsendableHeadDoesNotSpinRegression) {
     struct CaptureTransport : public PartitionTransport {
         int calls = 0;
         int32_t ceiling = INT32_MAX;
-        void sendFetchRequest(const FetchRequestMsg&) override {}
-        void sendFetchResponse(NodeId, const FetchResponseMsg&) override { ++calls; }
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { ++calls; return true; }
         [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override {
             return ceiling;
         }
@@ -4104,10 +4110,10 @@ struct CeilingLoopback {
 struct CeilingLeaderTransport : PartitionTransport {
     CeilingLoopback* lb;
     explicit CeilingLeaderTransport(CeilingLoopback* l) : lb(l) {}
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
         // Mirrors the real transports: a frame over the ceiling is DROPPED.
-        if (r.records.size() > static_cast<std::size_t>(lb->ceiling)) { ++lb->drops; return; }
+        if (r.records.size() > static_cast<std::size_t>(lb->ceiling)) { ++lb->drops; return false; }
         lb->maxSent = std::max(lb->maxSent, r.records.size());
         CeilingLoopback::Resp x;
         x.buf.assign(r.records.begin(), r.records.end());
@@ -4115,14 +4121,15 @@ struct CeilingLeaderTransport : PartitionTransport {
         lb->toFollower.push_back(std::move(x));
         lb->toFollower.back().msg.records =
             std::span<const uint8_t>(lb->toFollower.back().buf.data(), lb->toFollower.back().buf.size());
+        return true;
     }
     [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return lb->ceiling; }
 };
 struct CeilingFollowerTransport : PartitionTransport {
     CeilingLoopback* lb;
     explicit CeilingFollowerTransport(CeilingLoopback* l) : lb(l) {}
-    void sendFetchRequest(const FetchRequestMsg& q) override { lb->toLeader.push_back(q); }
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg& q) override { lb->toLeader.push_back(q); return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 } // namespace
 
@@ -4202,8 +4209,8 @@ TEST(PartitionReplicaRegression, PushMemoNotArmedWhileCeilingUnresolvedRegressio
     struct ZeroCeiling : PartitionTransport {
         int calls = 0;
         int32_t ceiling = 0;
-        void sendFetchRequest(const FetchRequestMsg&) override {}
-        void sendFetchResponse(NodeId, const FetchResponseMsg&) override { ++calls; }
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { ++calls; return true; }
         [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return ceiling; }
     } t;
     PartitionConfig cfg;

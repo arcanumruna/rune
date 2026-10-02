@@ -142,8 +142,8 @@ static int countDeletedFiles(const fs::path& dir) {
 // Null transport (no replication needed for cleaner tests).
 class Cp9NullTransport : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 // Minimal consensus agent (no-op for in-process tests).
