@@ -91,8 +91,20 @@ struct GatewayRig {
     rune::node::ReplicaRegistry reg;
     rune::node::WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 22, 1 << 23, 64, 64};
     int64_t answers = 0;
+    int64_t errors  = 0;     ///< answers with a non-zero code (the bench must measure the OK path)
+    int16_t lastErr = 0;
+    int16_t firstErr = 0;
+    int64_t firstErrAt = 0;
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
-        [this](const uint8_t*, std::size_t) -> int64_t { ++answers; return 1; });
+        [this](const uint8_t* b, std::size_t n) -> int64_t {
+            ++answers;
+            if (auto r = pc::ProduceResponse::decode(b, n); r && r->errorCode != 0) {
+                if (errors == 0) { firstErr = r->errorCode; firstErrAt = answers; }
+                ++errors; lastErr = r->errorCode;
+            }
+            else if (!r) { ++errors; lastErr = -1; }
+            return 1;
+        });
     PartitionReplica* r = nullptr;
     int64_t sid = 0;
     int64_t now = 1;
@@ -149,11 +161,19 @@ void BM_GatewayPathProduce(benchmark::State& state) {
     for (auto _ : state) {
         if (next == kPool) [[unlikely]] { state.PauseTiming(); refill(); state.ResumeTiming(); }
         const auto& f = frames[static_cast<std::size_t>(next++)];
+        const int64_t before = R.answers;
         R.gw.applyProduceForTest(f.data(), f.size());
-        R.pass();
+        // Until THIS produce is answered (a pass may not drain the op — e.g.
+        // a background flush pass): the next sequence is never validated
+        // before the previous one landed (base's mirror window, review minor 6).
+        for (int k = 0; k < 1024 && R.answers == before; ++k) R.pass();
     }
     if (R.answers < static_cast<int64_t>(state.iterations()))
         state.SkipWithError("a produce was not answered");
+    else if (R.errors != 0)
+        state.SkipWithError(("produces answered with an error: first code " + std::to_string(R.firstErr) +
+                             " at answer " + std::to_string(R.firstErrAt) + ", last code " +
+                             std::to_string(R.lastErr) + ", errors " + std::to_string(R.errors)).c_str());
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_GatewayPathProduce)->Arg(0)->Arg(1)->Unit(benchmark::kNanosecond)->MinTime(0.5);
@@ -199,6 +219,8 @@ void BM_FlushOwedAcksAll(benchmark::State& state) {
     }
     if (R.answers - answered0 != static_cast<int64_t>(state.iterations()) * kFire)
         state.SkipWithError("fired count mismatch");
+    else if (R.errors != 0)
+        state.SkipWithError("waiters answered with an error");
     state.SetItemsProcessed(state.iterations() * kFire);
 }
 BENCHMARK(BM_FlushOwedAcksAll)->Arg(64)->Arg(512)->Arg(4096)->Unit(benchmark::kNanosecond)->MinTime(0.5);
