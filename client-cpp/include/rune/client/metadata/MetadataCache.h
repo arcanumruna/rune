@@ -307,11 +307,24 @@ private:
         if (authoritative) {
             entry.confirmedEpoch   = newEpoch;
             entry.provisionalSince = 0;
-        } else {
+        } else if (entry.provisionalSince == 0) {
+            // R2-1: keep the FIRST guess's order while a guess already stands —
+            // a later redirect in the same burst must not make the answer to the
+            // first redirect's request look "earlier" and get discarded.
             entry.provisionalSince = order > 0 ? order : 1;
         }
     }
 
+public:
+    /// R2-1: true while any partition still holds a redirect's unconfirmed guess
+    /// (cold path: called once per MetadataResponse).
+    [[nodiscard]] bool anyProvisional() const noexcept {
+        for (const auto& kv : table_)
+            if (kv.second.provisionalSince != 0) return true;
+        return false;
+    }
+
+private:
     // ---- Members -----
     // Flat hash map: (topicId<<32 | partition) → RoutingEntry
     std::unordered_map<int64_t, RoutingEntry> table_;

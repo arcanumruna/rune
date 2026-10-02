@@ -599,3 +599,53 @@ TEST(IngressEndpointRouting, NodeEndpointWithOtherUriParamsIsTheSeedRegression) 
     EXPECT_TRUE(r.client.testDataChannelFor(1, 0).empty()) << "a route to the seed itself";
     EXPECT_EQ(r.client.testSessionCount(), 1u) << "a second Session to the seed node";
 }
+
+
+
+// Re-review 2 R2-1 (M5 regression): a BURST of spurious redirects for one
+// partition (two in-flight batches each redirected).  The second redirect
+// re-provisions with a later provisionalSince; the only request (sent by the
+// first) then predates it and its equal-epoch answer is discarded -- and the
+// answer also disarms the backoff refresh the rate-limited second redirect armed.
+TEST(IngressEndpointRoutingRegression, SpuriousRedirectBurstRestoresTheWorkerRouteRegression) {
+    Rig r(3961, 3962, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    const std::string node = "aeron:udp?endpoint=127.0.0.1:24841";
+    const int n = r.gw.addEndpoint(node, 3961);
+    const int w = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24842", 3961);
+    (void)n;
+    r.gw.brokerHost = "127.0.0.1";
+    r.gw.brokerPort = 24841;
+    r.gw.partitions = {{1, 0, 0, 1, 3961, "127.0.0.1:24842"}};
+    r.connect();
+    const std::string worker = "aeron:udp?endpoint=127.0.0.1:24842";
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == worker; }));
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, w);
+
+    r.gw.redirectNext = 2;
+    r.gw.redirectTo   = node;  // spurious: the same leader node
+    const rc::Token t1 = r.nextToken++;
+    const rc::Token t2 = r.nextToken++;
+    ASSERT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), r.cq, t1),
+              rc::SendResult::Ok);
+    r.client.doWork();
+    ASSERT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), r.cq, t2),
+              rc::SendResult::Ok);
+    int okCount = 0;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+            if ((c.token == t1 || c.token == t2) && c.status == rc::OpStatus::Ok) ++okCount;
+        });
+        return okCount == 2;
+    }));
+    // Give it ~3 s of wall time (>> the 100 ms urgent gap and the initial backoff).
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool restored = false;
+    while (std::chrono::steady_clock::now() < until && !restored) {
+        r.client.doWork();
+        r.gw.pump();
+        restored = r.client.testDataChannelFor(1, 0) == worker;
+    }
+    EXPECT_TRUE(restored) << "worker route stranded on the node after a burst of spurious redirects";
+}

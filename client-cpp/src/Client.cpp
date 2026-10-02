@@ -2025,7 +2025,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (havePart && rTopicId >= 0 && rPartition >= 0 &&
                 agent_.multiNodeRouting() && !newEndpoint.empty()) {
                 const std::string leaderChannel = toChannel(newEndpoint);  // N2
-                agent_.setRoute(rTopicId, rPartition, leaderChannel);
+                // R2-2: a changed route is a new lane even if the redirected batch
+                // is not re-offered below (superseded / budget / unknown) — older
+                // attempts must not count as the current lane (NEW-4(b)).
+                if (agent_.setRoute(rTopicId, rPartition, leaderChannel, leaderChannel))
+                    producerHub_.noteRouteChanged(rTopicId, rPartition);
                 std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> mnSendFn =
                     [this](int32_t t, int32_t p, int32_t sid,
                            const uint8_t* fb, std::size_t fl) -> bool {
@@ -3584,6 +3588,10 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // and disarm any pending refresh (we just refreshed).
     metadataBackoffNs_     = kMetadataBackoffInitNs;
     nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max();
+    // R2-1: an answer that leaves a redirect's guess unconfirmed (e.g. it was
+    // requested before a later redirect of the same burst) must not end the
+    // refresh cycle — re-arm so a later request confirms or corrects the guess.
+    if (metadataCache_.anyProvisional()) scheduleMetadataRefresh();
 
     // F14: a fresh cluster view — txn requests waiting for the coordinator to
     // be re-discovered (NotCoordinator) back off and re-send.
