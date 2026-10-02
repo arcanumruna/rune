@@ -130,6 +130,29 @@ Caveats / found along the way:
   p99 14.0 s; 50k/s → 42.5k, p50 3.9 ms, p99 4.9 s.  Multi-second stall + 1.4 ms base hop:
   next = full per-hop FR instrumentation (feat/fr-hop-instrumentation) and diagnosis.
 
+### 4.2 Latency work, 2026-10-02 evening (k3s-node-01, clean box, logs off, FR off unless stated)
+
+**Harness correction:** every controller harness script sourced the t15b-gates header, which EXPORTS
+term 16 MiB / rcv window 4 MiB / socket 16 MiB / rings 16 MiB.  So the §4.1 "no tuning env" run was not a
+pure-default run (term/window/socket equal the derived defaults; rings 16 vs 32 MiB).  Overrides are now
+applied after the header; a true pure-default run is still owed.
+
+| finding | evidence (single node unless stated) |
+|---|---|
+| single node vs 3 node, acks=leader 20k/s open-loop | p50 80-84 us vs 218-243 us (replication + cluster contention ~3x) |
+| background fsync (10 ms/log) | acks=leader 3-node: p50 790 -> 424 us, p99 218 -> 37 ms when off (journal + io_uring io-wq preemption) |
+| busy-spin vs backoff workers | no difference in p50/p99 (ABAB) -> backoff (frees cores) |
+| client pinning / CPU steal / UDP loss / netfilter | ruled out (0% runq wait, 0% steal, no drops, NOTRACK active) |
+| **16 MiB terms on low-volume ack/egress pubs** | term fills ~10 s -> rotation cleaning stalls 100+ ms -> client back-pressure: p99 11-31 ms. 1 MiB ack/egress terms: p99 **311-352 us** (from ~30 ms) |
+| duty cap 1 + early ack flush + end-of-pass send (ABAB n=10) | p50 75.5 -> **66.3 us** (-12%, 9/10), p99 246 -> **211 us** (-14%, 7/10) |
+| **3-node acks=all saturation, 1 KiB, combo + no fsync + 1 MiB control terms** | global term 16 MiB: 127.6/120.9/121.8/119.3k (median ~121k); **global term 1 MiB: 124.3/124.1/130.4/125.1k (median ~125k)** -> 1 MiB terms are not slower; drop 16 MiB terms (no rotation stalls, ~16x less /dev/shm) |
+
+Single node now: p50 ~66 us, p99 ~211 us.  Remaining p99 = ~2 worker passes (pass p50 42 us / p99 115 us,
+dominated by ~3 in-pass Aeron driver duty cycles).  Next lever under test: dedicated driver thread.
+Experimental patches (env-gated, VM build /root/frcap only): RUNE_IOWQ_CORES, RUNE_WORKER_SYNC_INTERVAL_MS,
+RUNE_SHARD_BACKOFF, RUNE_END_PASS_SEND, RUNE_EARLY_ACK_FLUSH, RUNE_DRIVER_DUTY_PER_PASS,
+RUNE_AERON_CONTROL_TERM_BYTES; rune-fr: bounded tape (RUNE_FR_TAPE_RECORDS_PER_THREAD), Aeron site mask.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
