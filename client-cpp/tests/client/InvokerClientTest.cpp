@@ -6,6 +6,7 @@
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
+#include <rune/client/producer/InFlightRing.h>
 #include <rune/client/detail/CpuAffinity.h>
 
 #include <gtest/gtest.h>
@@ -314,7 +315,9 @@ TEST(InvokerClient, AckThenConnectResponseInOnePollDoesNotResendRegression) {
 
     auto countCorr = [&](int64_t corr) {
         int k = 0;
-        for (const auto& pr : r.gw.produced) k += (pr.corrId == corr) ? 1 : 0;
+        // EOS follow-ups I-2: a re-send is a new attempt of the same batch id.
+        namespace bc = rune::client::producer::batchcorr;
+        for (const auto& pr : r.gw.produced) k += (bc::base(pr.corrId) == bc::base(corr)) ? 1 : 0;
         return k;
     };
     ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && fx.ready(); }));
@@ -456,7 +459,9 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     const auto X = r.gw.produced.front();
     auto countCorr = [&](int64_t corr) {
         int k = 0;
-        for (const auto& pr : r.gw.produced) k += (pr.corrId == corr) ? 1 : 0;
+        // EOS follow-ups I-2: a re-send is a new attempt of the same batch id.
+        namespace bc = rune::client::producer::batchcorr;
+        for (const auto& pr : r.gw.produced) k += (bc::base(pr.corrId) == bc::base(corr)) ? 1 : 0;
         return k;
     };
     const int base = countCorr(X.corrId);

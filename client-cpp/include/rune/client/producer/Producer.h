@@ -188,6 +188,11 @@ struct BatchAck {
     int32_t recordCount  = 0;
     int16_t errorCode    = 0;   ///< 0 OK; >0 broker ErrorCode; kClientFailure
     int16_t producerEpoch = -1; ///< epoch the batch was stamped with; -1 = not sequenced
+    /// producerId the batch was stamped with (with producerEpoch and
+    /// baseSequence it names the batch, also across an epoch-overflow id
+    /// rotation).  Handler form (onBatchAck) only; -1 in the Completions form
+    /// (batchAcksTo / batchAckOf: no room in a Completion) and when not sequenced.
+    int64_t producerId = -1;
 };
 
 /// Per-batch handler (Producer::onBatchAck): called on the duty thread, one

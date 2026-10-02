@@ -751,6 +751,37 @@ TEST(ProducerSequence, EpochOverflowRotatesToFreshProducerIdRegression) {
     EXPECT_EQ(cap.frames[1].baseSequence, 0);
 }
 
+// EOS follow-ups review: BatchAck::producerId names the identity the batch
+// was STAMPED with — across an INT16_MAX rotation the failed batch reports the
+// old id and the next batch the fresh one (never the producer's current id
+// read at completion time).
+TEST(ProducerSequence, BatchAckProducerIdIsTheStampedIdentityAcrossRotationRegression) {
+    ProducerImpl impl(ackCfg(8));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    const int64_t oldId = impl.producerId();
+    impl.debugSetEpochForTest(INT16_MAX);
+    sendOne(impl, sink, 0);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    const int64_t late = kNow + 10'000LL * 1'000'000LL;  // past deliveryTimeoutMs: fails + rotates
+    impl.retransmitStalled(late, sink);
+    ASSERT_EQ(L.batchAcks.size(), 1u);
+    EXPECT_EQ(L.batchAcks[0].producerId, oldId) << "the failed batch was stamped with the old id";
+    EXPECT_EQ(L.batchAcks[0].producerEpoch, INT16_MAX);
+    const int64_t newId = impl.producerId();
+    ASSERT_NE(newId, oldId);
+    sendOne(impl, sink, 0, late);
+    ASSERT_EQ(cap.frames.size(), 2u);
+    impl.onProduceResponse(cap.frames[1].corrId, 77, 0);
+    ASSERT_EQ(L.batchAcks.size(), 2u);
+    EXPECT_EQ(L.batchAcks[1].errorCode, 0);
+    EXPECT_EQ(L.batchAcks[1].producerId, newId);
+    EXPECT_EQ(L.batchAcks[1].producerId, cap.frames[1].producerId) << "== the frame's stamped id";
+    EXPECT_EQ(L.batchAcks[1].producerEpoch, 0);
+}
+
 TEST(ProducerSequence, CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegression) {
     ProducerImpl impl(ackCfg(8));
     SeqCapture cap;
@@ -789,8 +820,10 @@ TEST(ProducerSequence, DeliveryTimeoutBumpsEpochAndRestartsSequenceRegression) {
     ASSERT_EQ(cap.frames.size(), 5u);
     EXPECT_EQ(cap.frames[3].epoch, static_cast<int16_t>(e0 + 1)) << "two timeouts, one bump";
     EXPECT_EQ(cap.frames[3].baseSequence, 0);
-    EXPECT_EQ(cap.frames[4].epoch, static_cast<int16_t>(e0 + 1));
-    EXPECT_EQ(cap.frames[4].baseSequence, 0) << "every partition restarts at 0";
+    // EOS follow-ups I-4 (Kafka): the bump moves only the partition with the
+    // unresolved sequence; partition 1 keeps its identity and sequence.
+    EXPECT_EQ(cap.frames[4].epoch, e0) << "an unaffected partition is not moved";
+    EXPECT_EQ(cap.frames[4].baseSequence, 1);
 }
 
 TEST(ProducerSequence, AckedBatchesKeepEpochAndSequenceRegression) {
@@ -869,15 +902,34 @@ TEST(ProducerSequence, FrameIdentityEqualsHeaderAtNonZeroEpochTier1AndTier2Regre
     }
 }
 
-// EOS-DUP review M1: a retransmit re-sends the STORED frame, byte for byte —
-// even across an epoch bump in between (the in-flight batch keeps the identity
-// it was first sent with, on the frame and in the header alike).
+namespace {
+constexpr int16_t kOos = static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence);
+/// Two offers of one stored frame: identical but for the attempt tag in the
+/// correlationId (EOS follow-ups I-2: every re-send is a new attempt).
+::testing::AssertionResult sameFrameNewAttempt(const SeqFrame& a, const SeqFrame& b) {
+    if (a.bytes.size() != b.bytes.size()) return ::testing::AssertionFailure() << "sizes differ";
+    for (std::size_t i = 0; i < a.bytes.size(); ++i) {
+        if (i >= 16 && i < 24) continue;  // MessageHeader.correlationId
+        if (a.bytes[i] != b.bytes[i]) return ::testing::AssertionFailure() << "byte " << i << " differs";
+    }
+    if (batchcorr::base(a.corrId) != batchcorr::base(b.corrId)) return ::testing::AssertionFailure() << "other batch";
+    if (batchcorr::attempt(a.corrId) == batchcorr::attempt(b.corrId)) {
+        return ::testing::AssertionFailure() << "same attempt tag";
+    }
+    return ::testing::AssertionSuccess();
+}
+}  // namespace
+
+// EOS-DUP review M1: a retransmit re-sends the STORED frame — byte for byte but
+// for its attempt tag (I-2) — even across another partition's epoch bump in
+// between (the in-flight batch keeps the identity it was sent with, on the
+// frame and in the header alike; I-4: its partition is not moved at all).
 TEST(ProducerSequence, RetransmitResendsTheStoredFrameAcrossAnEpochBumpRegression) {
     ProducerImpl impl(ackCfg(8));
     SeqCapture cap;
     const auto sink = cap.fn();
     sendOne(impl, sink, 0);  // A: stays in flight
-    sendOne(impl, sink, 1);  // B: rejected -> bump
+    sendOne(impl, sink, 1);  // B: rejected -> partition 1 unresolved -> its new epoch
     ASSERT_EQ(cap.frames.size(), 2u);
     const int16_t e0 = cap.frames[0].epoch;
     impl.onProduceResponse(cap.frames[1].corrId, -1, /*MinIsrViolation*/ 10);
@@ -886,27 +938,30 @@ TEST(ProducerSequence, RetransmitResendsTheStoredFrameAcrossAnEpochBumpRegressio
     const int64_t t1 = kNow + 1'000LL * 1'000'000LL;
     ASSERT_EQ(impl.retransmitStalled(t1, sink), 1);
     ASSERT_EQ(cap.frames.size(), 3u);
-    EXPECT_EQ(cap.frames[2].bytes, cap.frames[0].bytes) << "the stored frame, byte for byte";
+    EXPECT_TRUE(sameFrameNewAttempt(cap.frames[0], cap.frames[2])) << "the stored frame";
     EXPECT_EQ(cap.frames[2].epoch, e0);
     EXPECT_EQ(cap.frames[2].baseSequence, 0);
-    sendOne(impl, sink, 0, t1);  // a NEW batch carries the new identity
-    ASSERT_EQ(cap.frames.size(), 4u);
-    EXPECT_EQ(cap.frames[3].epoch, static_cast<int16_t>(e0 + 1));
-    EXPECT_EQ(cap.frames[3].baseSequence, 0);
+    sendOne(impl, sink, 0, t1);  // partition 0 keeps its identity
+    sendOne(impl, sink, 1, t1);  // partition 1 starts its new one at 0
+    ASSERT_EQ(cap.frames.size(), 5u);
+    EXPECT_EQ(cap.frames[3].epoch, e0);
+    EXPECT_EQ(cap.frames[3].baseSequence, 1);
+    EXPECT_EQ(cap.frames[4].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames[4].baseSequence, 0);
 }
 
 // ---------------------------------------------------------------------------
 // EOS-OOS (unit level; the end-to-end fault-injection runs are in
 // ProducerEosTest.cpp).
 // ---------------------------------------------------------------------------
-namespace {
-constexpr int16_t kOos = static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence);
-}
 
-// Kafka rule kept: OutOfOrderSequence on the OLDEST in-flight batch of its
-// epoch fails it (BrokerError 20) and bumps the epoch once.
-TEST(ProducerSequence, OutOfOrderOnOldestInFlightBatchFailsAndBumpsRegression) {
-    ProducerImpl impl(ackCfg(8));
+
+// Kafka rule (C4): OutOfOrderSequence on the next-in-line batch (oldest, and
+// nothing acked after its send) fails THAT batch; the batches behind it are
+// re-sequenced under a new epoch from 0 and re-sent — not failed.  The
+// superseded attempt's own late OOS is ignored.
+TEST(ProducerSequence, OutOfOrderOnTheNextInLineBatchFailsItAndResequencesTheRestRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
     AckLedger L;
     L.attachBatches(impl);
     SeqCapture cap;
@@ -919,11 +974,21 @@ TEST(ProducerSequence, OutOfOrderOnOldestInFlightBatchFailsAndBumpsRegression) {
     EXPECT_EQ(L.batchAcks[0].errorCode, kOos);
     EXPECT_EQ(L.batchAcks[0].producerEpoch, e0);
     EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
-    // The second batch is now the oldest of its (old) epoch: OOS fails it, no second bump.
-    impl.onProduceResponse(cap.frames[1].corrId, -1, kOos);
+    impl.flushBatches(kNow, 42, sink);  // the follower, re-stamped
+    ASSERT_EQ(cap.frames.size(), 3u);
+    EXPECT_EQ(batchcorr::base(cap.frames[2].corrId), batchcorr::base(cap.frames[1].corrId));
+    EXPECT_EQ(cap.frames[2].epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames[2].baseSequence, 0) << "re-sequenced from 0";
+    impl.onProduceResponse(cap.frames[1].corrId, -1, kOos);  // the superseded attempt's late OOS
+    EXPECT_EQ(L.batchAcks.size(), 1u) << "ignored";
+    impl.onProduceResponse(cap.frames[2].corrId, 500, 0);
     ASSERT_EQ(L.batchAcks.size(), 2u);
-    EXPECT_EQ(L.batchAcks[1].errorCode, kOos);
-    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(L.batchAcks[1].errorCode, 0);
+    EXPECT_EQ(L.batchAcks[1].producerEpoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(L.batchAcks[1].baseSequence, 0);
+    EXPECT_EQ(L.batchAcks[1].producerId, impl.producerId()) << "N-1: the identity names the batch";
+    EXPECT_EQ(L.batchAcks[0].producerId, impl.producerId());
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1)) << "one bump";
     EXPECT_FALSE(impl.hasInFlight());
 }
 
@@ -956,8 +1021,7 @@ TEST(ProducerSequence, OutOfOrderBehindAnOlderBatchIsParkedAndResentInOrderRegre
     // Fast retransmit: A (the frame before the gap) is due NOW — not B or C.
     ASSERT_EQ(impl.retransmitStalled(kNow, sink), 1);
     ASSERT_EQ(cap.frames.size(), 4u);
-    EXPECT_EQ(cap.frames[3].corrId, a);
-    EXPECT_EQ(cap.frames[3].bytes, cap.frames[0].bytes);
+    EXPECT_TRUE(sameFrameNewAttempt(cap.frames[0], cap.frames[3]));
     EXPECT_EQ(impl.retransmitStalled(kNow, sink), 0) << "one fast retransmit, not one per OOS answer";
     // A new record D waits in the builder; then A resolves.
     ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(4)));
@@ -966,9 +1030,9 @@ TEST(ProducerSequence, OutOfOrderBehindAnOlderBatchIsParkedAndResentInOrderRegre
     EXPECT_TRUE(ps->resendParked);
     impl.flushBatches(kNow, 42, sink);
     ASSERT_EQ(cap.frames.size(), 7u);
-    EXPECT_EQ(cap.frames[4].corrId, b) << "parked batches first, in sequence order";
-    EXPECT_EQ(cap.frames[5].corrId, c);
-    EXPECT_EQ(cap.frames[4].bytes, cap.frames[1].bytes) << "the stored frame";
+    EXPECT_EQ(batchcorr::base(cap.frames[4].corrId), b) << "parked batches first, in sequence order";
+    EXPECT_EQ(batchcorr::base(cap.frames[5].corrId), c);
+    EXPECT_TRUE(sameFrameNewAttempt(cap.frames[1], cap.frames[4])) << "the stored frame";
     EXPECT_EQ(cap.frames[6].baseSequence, 3) << "then the new batch";
     EXPECT_FALSE(ps->resendParked);
     EXPECT_EQ(ps->parkedCount, 0u);
@@ -989,10 +1053,11 @@ TEST(ProducerSequence, OutOfOrderBehindAnOlderBatchIsParkedAndResentInOrderRegre
     EXPECT_FALSE(impl.hasInFlight());
 }
 
-// A parked batch whose older batch then FAILS (delivery timeout: unresolved ->
-// bump) is still re-sent once it is the oldest; the broker's OOS on it (now the
-// oldest of its old epoch) fails it — exactly once, no second bump.
-TEST(ProducerSequence, ParkedBatchAfterOlderBatchFailsIsResentThenFailsOnceRegression) {
+// I-4: a parked batch whose older batch then FAILS by its delivery timeout
+// (outcome unknown -> the partition is unresolved; no bump yet: B is in
+// flight) is re-sent once it is the oldest; the broker's OOS on it then proves
+// the gap (C3): B is re-sequenced under a new epoch and written — not failed.
+TEST(ProducerSequence, ParkedBatchBehindATimedOutHeadIsResequencedNotFailedRegression) {
     ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
     AckLedger L;
     L.attach(impl);
@@ -1013,15 +1078,22 @@ TEST(ProducerSequence, ParkedBatchAfterOlderBatchFailsIsResentThenFailsOnceRegre
     impl.retransmitStalled(late, sink);
     ASSERT_EQ(L.times(1), 1);
     EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
-    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1)) << "unresolved sequence: one bump";
+    EXPECT_EQ(impl.producerEpoch(), e0) << "unresolved: no bump while B is in flight (Kafka)";
     impl.flushBatches(late, 42, sink);  // B is the oldest now: re-sent (stored, old-epoch frame)
     ASSERT_EQ(cap.frames.size(), before + 1) << "B re-sent exactly once (timer or parked resend, not both)";
-    EXPECT_EQ(cap.frames.back().corrId, cap.frames[1].corrId);
+    EXPECT_EQ(batchcorr::base(cap.frames.back().corrId), batchcorr::base(cap.frames[1].corrId));
     EXPECT_EQ(cap.frames.back().epoch, e0);
-    impl.onProduceResponse(cap.frames[1].corrId, -1, kOos);
+    impl.onProduceResponse(cap.frames.back().corrId, -1, kOos);  // the gap is proven
+    EXPECT_EQ(L.times(2), 0) << "re-sequenced, not failed";
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1));
+    impl.flushBatches(late, 42, sink);
+    ASSERT_EQ(cap.frames.size(), before + 2);
+    EXPECT_EQ(cap.frames.back().epoch, static_cast<int16_t>(e0 + 1));
+    EXPECT_EQ(cap.frames.back().baseSequence, 0);
+    impl.onProduceResponse(cap.frames.back().corrId, 300, 0);
     ASSERT_EQ(L.times(2), 1);
-    EXPECT_EQ(L.status(2), OpStatus::BrokerError);
-    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1)) << "an old-epoch batch never bumps again";
+    EXPECT_EQ(L.status(2), OpStatus::Ok);
+    EXPECT_EQ(L.value(2), 300);
     EXPECT_FALSE(impl.hasInFlight());
 }
 
@@ -1067,6 +1139,44 @@ TEST(ProducerAcks, KnownOldDuplicateCompletesOkWithUnknownOffsetRegression) {
     ASSERT_EQ(cap.frames.size(), 3u);
     EXPECT_EQ(cap.frames[2].epoch, e0);
     EXPECT_EQ(cap.frames[2].baseSequence, 4);
+}
+
+// M-1: while a partition has parked batches, NO new batch of it goes out (each
+// would only meet the same gap: a wasted OutOfOrderSequence round trip, Kafka
+// stops draining a partition with a retry outstanding), and a later OOS behind
+// a parked batch never re-sends the gap frame again (the gap is upstream of the
+// parked batch, already being retried).  RED (pre-fix): the new batch was sent
+// at once and A was fast-retransmitted a second time.
+TEST(ProducerSequence, ParkedPartitionHoldsNewBatchesAndRetransmitsTheGapOnceRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    for (int i = 0; i < 3; ++i) sendOne(impl, sink, 0);  // A B C
+    ASSERT_EQ(cap.frames.size(), 3u);
+    impl.onProduceResponse(cap.frames[1].corrId, -1, kOos);  // B parks: A is the gap
+    ASSERT_EQ(impl.retransmitStalled(kNow, sink), 1);        // A fast-retransmitted
+    ASSERT_EQ(cap.frames.size(), 4u);
+    sendOne(impl, sink, 0);  // D: held while B is parked
+    EXPECT_EQ(cap.frames.size(), 4u) << "no new batch while the partition has parked batches";
+    impl.onProduceResponse(cap.frames[2].corrId, -1, kOos);  // C parks behind parked B
+    EXPECT_EQ(impl.retransmitStalled(kNow, sink), 0) << "A is not re-sent again for C's OOS";
+    EXPECT_EQ(cap.frames.size(), 4u);
+}
+
+// N-3: a close (failAllPending) leaves no resend armed for a partition with no
+// parked batch left.  RED (pre-fix): resendParked stayed armed.
+TEST(ProducerSequence, FailAllPendingDisarmsTheParkedResendRegression) {
+    ProducerImpl impl(ackCfg(8, /*lingerUs=*/0));
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    for (int i = 0; i < 3; ++i) sendOne(impl, sink, 0);
+    impl.onProduceResponse(cap.frames[1].corrId, -1, kOos);
+    impl.onProduceResponse(cap.frames[2].corrId, -1, kOos);
+    impl.failAllPending(OpStatus::Closed);
+    const PartitionState* ps = impl.partitionState(1, 0);
+    ASSERT_NE(ps, nullptr);
+    EXPECT_EQ(ps->parkedCount, 0u);
+    EXPECT_FALSE(ps->resendParked) << "nothing parked: nothing to re-send";
 }
 
 // ---------------------------------------------------------------------------

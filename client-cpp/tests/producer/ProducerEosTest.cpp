@@ -20,6 +20,7 @@
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/shard/ClientShard.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/Protocol.h>
 
 #include <gtest/gtest.h>
 
@@ -67,7 +68,7 @@ std::string freshDir(const char* tag) {
     return d;
 }
 
-rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
+rc::ClientConfig invokerCfg(int32_t in, int32_t eg, int32_t partitions = 1) {
     rc::ClientConfig c;
     c.gatewayChannel  = "aeron:ipc";
     c.gatewayStreamId = in;
@@ -80,9 +81,17 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     rc::TopicSpec ts;
     ts.name           = "t";
     ts.topicId        = 1;
-    ts.partitionCount = 1;
+    ts.partitionCount = partitions;
     c.topics.push_back(ts);
     return c;
+}
+
+// A key that maps to `partition` (of `partitions`).
+rc::Key keyFor(int32_t partition, int32_t partitions) {
+    for (uint64_t k = 0; k < 1'000'000; ++k) {
+        if (rc::Key(k).partition(partitions) == partition) return rc::Key(k);
+    }
+    return rc::Key(uint64_t{0});
 }
 
 std::vector<uint8_t> idValue(uint64_t id) {
@@ -149,9 +158,12 @@ struct Rig {
     // One record per batch (batchRecords = 1): the Direct builder takes the next
     // record only after a duty pass flushed the previous one.
     void sendRecord(rc::Producer& p, rc::TopicHandle topic, uint64_t id, rc::Token token) {
+        sendRecordKeyed(p, topic, rc::Key(id), id, token);
+    }
+    void sendRecordKeyed(rc::Producer& p, rc::TopicHandle topic, const rc::Key& key, uint64_t id, rc::Token token) {
         const auto v = idValue(id);
         for (int i = 0; i < 100'000; ++i) {
-            const rc::SendResult r = p.trySend(topic, rc::Key(id), std::span<const uint8_t>(v), rc::AckToken{token});
+            const rc::SendResult r = p.trySend(topic, key, std::span<const uint8_t>(v), rc::AckToken{token});
             if (r == rc::SendResult::Ok) return;
             ASSERT_EQ(r, rc::SendResult::BackPressured);
             step();
@@ -160,9 +172,9 @@ struct Rig {
     }
 };
 
-rc::ProducerConfig eosProducer(int32_t maxInFlight, int64_t produceTimeoutMs) {
+rc::ProducerConfig eosProducer(int32_t maxInFlight, int64_t produceTimeoutMs, rc::Acks acks = rc::Acks::Leader) {
     rc::ProducerConfig p;
-    p.acks              = rc::Acks::Leader;
+    p.acks              = acks;
     p.lingerUs          = 0;
     p.batchRecords      = 1;
     p.maxInFlight       = maxInFlight;
@@ -447,18 +459,21 @@ rc::ProducerConfig bareCfg(rc::Acks acks, int32_t maxInFlight) {
 // acks=None is not idempotent: not clamped (and has no in-flight window).
 TEST(EosOosRegression, IdempotentMaxInFlightClampedToBrokerWindowRegression) {
     for (const rc::Acks acks : {rc::Acks::Leader, rc::Acks::All}) {
-        rc::producer::ProducerImpl impl(bareCfg(acks, 64));
-        EXPECT_EQ(impl.config().maxInFlight, 32);
+        constexpr int32_t kWindow = rune::protocol::client::kIdempotentMaxInFlightBatches;
+        rc::producer::ProducerImpl impl(bareCfg(acks, 2 * kWindow));
+        EXPECT_EQ(impl.config().maxInFlight, kWindow);
         Capture    cap;
         const auto sink = cap.fn();
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < 2 * kWindow; ++i) {
             ASSERT_TRUE(impl.submitSendRecord(1, 0, rc::Key(uint64_t{1}), kVal, false, 0));
             pump(impl, sink);  // one record per batch
         }
-        EXPECT_EQ(cap.frames.size(), 32u) << "no more than the broker's dedup window outstanding";
+        EXPECT_EQ(cap.frames.size(), static_cast<std::size_t>(kWindow))
+            << "no more than the broker's dedup window outstanding";
     }
     rc::producer::ProducerImpl none(bareCfg(rc::Acks::None, 64));
     EXPECT_EQ(none.config().maxInFlight, 64) << "acks=None is not idempotent: never clamped";
+    static_assert(rune::protocol::client::kIdempotentMaxInFlightBatches < 64);
     rc::producer::ProducerImpl small(bareCfg(rc::Acks::Leader, 8));
     EXPECT_EQ(small.config().maxInFlight, 8) << "a value inside the window is kept";
 }
@@ -490,4 +505,180 @@ TEST(EosOosRegression, AcksNoneFrameIdentityIsMinusOneLikeTheHeaderRegression) {
         EXPECT_EQ(f.headerEpoch, -1);
         EXPECT_EQ(f.headerSeq, -1);
     }
+}
+
+// ===========================================================================
+// EOS follow-ups fix round 1 (review eos-followups-review.md).  acks=All with
+// the gateway's deferred OK answers (M-3): an error answer can overtake an
+// earlier OK, as on a real broker.
+// ===========================================================================
+
+namespace {
+// Produced entry (in arrival order, dropped frames excluded) for a baseSequence.
+int producedWithSeq(const test_support::InvokerGateway& gw, int32_t partition, int32_t seq) {
+    int n = 0;
+    for (const auto& pr : gw.produced) n += (pr.partition == partition && pr.baseSequence == seq) ? 1 : 0;
+    return n;
+}
+} // namespace
+
+// I-2: an error answer of a SUPERSEDED attempt (B's first send got OOS while A
+// was lost; the answer is delayed) must never fail B once B's later attempt may
+// be stored.  A and B are both retransmitted; A is acked; THEN B's first OOS
+// arrives — B is now the oldest batch.  RED (pre-fix: one id for every attempt):
+// B completes BrokerError(20) and the epoch is bumped, although B's
+// retransmit is stored (the log has it).
+TEST(EosOosRegression, ErrorOfSupersededAttemptNeverFailsTheBatchRegression) {
+    Rig r(invokerCfg(3970, 3971));
+    r.connect();
+    r.gw.idempotence  = true;
+    r.gw.okDelayPumps = 3;        // acks=All: OKs are deferred, errors are not
+    r.gw.dropProduce  = {1};      // A's first frame is lost
+    r.gw.holdAnswer   = {2, 4};   // B's first answer (OOS) and B's retransmit's answer
+    AckLedger    L;
+    rc::Producer p = r.client.producer(eosProducer(8, /*produceTimeoutMs=*/50, rc::Acks::All));
+    L.attach(p);
+    const rc::TopicHandle topic = r.client.topic("t");
+    r.sendRecord(p, topic, 0, 1);  // A
+    r.sendRecord(p, topic, 1, 2);  // B
+    // Past produceTimeoutMs both are retransmitted (A first): frames 3 (A), 4 (B).
+    ASSERT_TRUE(r.drive([&] { return r.gw.produceFrames >= 4; }, /*advanceNs=*/1'000'000));
+    ASSERT_EQ(producedWithSeq(r.gw, 0, 1), 2) << "precondition: frames 2 and 4 are B's";
+    ASSERT_TRUE(r.drive([&] { return L.times(1) > 0; }));  // A's retransmit acked (deferred OK)
+    ASSERT_EQ(L.status(1), rc::OpStatus::Ok);
+    r.gw.releaseAnswer(2);  // B's FIRST attempt's OOS arrives now, after A resolved
+    for (int i = 0; i < 50; ++i) r.step();
+    EXPECT_EQ(L.times(2), 0) << "an error of a superseded attempt must be ignored";
+    r.gw.releaseAnswer(4);
+    ASSERT_TRUE(r.drive([&] { return L.times(2) > 0; }));
+    EXPECT_EQ(L.status(2), rc::OpStatus::Ok) << "B is stored: it must not be reported failed";
+    EXPECT_EQ(loggedIds(r.gw, 0), (std::vector<uint64_t>{0, 1}));
+    for (const auto& b : r.gw.log) EXPECT_EQ(b.producerEpoch, 0) << "no epoch bump";
+}
+
+// I-2: an OOS of the CURRENT attempt that was sent before the predecessor's ack
+// arrived may predate that ack (answers reorder: errors are immediate, acks=all
+// OKs are deferred, routes differ).  It is retried, not taken as a rejection of
+// the next-in-line batch.  RED (pre-fix): B fails BrokerError(20).
+TEST(EosOosRegression, OosSentBeforeThePredecessorsAckIsRetriedRegression) {
+    Rig r(invokerCfg(3972, 3973));
+    r.connect();
+    r.gw.idempotence  = true;
+    r.gw.okDelayPumps = 3;
+    r.gw.dropProduce  = {1};  // A's first frame is lost
+    r.gw.holdAnswer   = {2};  // B's OOS is delayed past A's ack
+    AckLedger    L;
+    rc::Producer p = r.client.producer(eosProducer(8, /*produceTimeoutMs=*/50, rc::Acks::All));
+    L.attach(p);
+    const rc::TopicHandle topic = r.client.topic("t");
+    r.sendRecord(p, topic, 0, 1);  // A at t0
+    r.step(30'000'000);
+    r.sendRecord(p, topic, 1, 2);  // B at t0 + 30 ms: its timer fires after A's
+    ASSERT_TRUE(r.drive([&] { return r.gw.produceFrames >= 3; }, /*advanceNs=*/1'000'000));  // A retransmitted
+    ASSERT_TRUE(r.drive([&] { return L.times(1) > 0; }));  // frozen clock: B is not retransmitted
+    ASSERT_EQ(L.status(1), rc::OpStatus::Ok);
+    ASSERT_EQ(producedWithSeq(r.gw, 0, 1), 1) << "precondition: B was sent once";
+    r.gw.releaseAnswer(2);
+    ASSERT_TRUE(r.drive([&] { return L.times(2) > 0; }));
+    EXPECT_EQ(L.status(2), rc::OpStatus::Ok);
+    EXPECT_EQ(loggedIds(r.gw, 0), (std::vector<uint64_t>{0, 1}));
+    for (const auto& b : r.gw.log) EXPECT_EQ(b.producerEpoch, 0) << "no epoch bump";
+}
+
+// I-4: a failure on partition 0 must not fence an already-STORED retransmit on
+// partition 1.  X (P1) is written but its answer is lost; Y (P0) is rejected;
+// Z (P1) is then sent; X's retransmit follows.  Kafka: the epoch bump of P0's
+// unresolved sequence never moves P1, whose in-flight batches finish under the
+// epoch they were sent with.  RED (pre-fix: producer-wide immediate bump): Z
+// goes out at epoch 1 seq 0, the broker moves P1 to epoch 1, X's retransmit is
+// fenced (InvalidProducerEpoch) and X is reported FAILED although stored.
+TEST(EosOosRegression, EpochBumpNeverFencesAStoredRetransmitOfAnotherPartitionRegression) {
+    Rig r(invokerCfg(3974, 3975, /*partitions=*/2));
+    r.connect();
+    r.gw.idempotence = true;
+    r.gw.dropAnswer  = {1};                                                     // X: stored, answer lost
+    r.gw.errorFor    = {{2, static_cast<int16_t>(rcc::ErrorCode::NotPartitionLeader)}};  // Y rejected
+    AckLedger    L;
+    rc::Producer p = r.client.producer(eosProducer(8, /*produceTimeoutMs=*/50));
+    L.attach(p);
+    const rc::TopicHandle topic = r.client.topic("t");
+    const rc::Key k0 = keyFor(0, 2), k1 = keyFor(1, 2);
+    r.sendRecordKeyed(p, topic, k1, 10, 1);  // X on P1
+    r.sendRecordKeyed(p, topic, k0, 20, 2);  // Y on P0
+    ASSERT_TRUE(r.drive([&] { return L.times(2) > 0; }));
+    ASSERT_EQ(L.status(2), rc::OpStatus::BrokerError) << "precondition: Y rejected";
+    r.sendRecordKeyed(p, topic, k1, 11, 3);  // Z on P1
+    ASSERT_TRUE(r.drive([&] { return L.times(3) > 0; }));
+    EXPECT_EQ(L.status(3), rc::OpStatus::Ok);
+    // X's retransmit (past produceTimeoutMs).
+    ASSERT_TRUE(r.drive([&] { return L.times(1) > 0; }, /*advanceNs=*/1'000'000));
+    EXPECT_EQ(L.status(1), rc::OpStatus::Ok) << "X is stored: an epoch bump must not fail it";
+    EXPECT_EQ(r.gw.fencedAnswers, 0);
+    EXPECT_EQ(loggedIds(r.gw, 1), (std::vector<uint64_t>{10, 11})) << "X and Z exactly once";
+}
+
+// I-4: the batches parked behind a head the broker REJECTED (OutOfOrderSequence
+// on the next-in-line batch: its sequences were never written) are
+// re-sequenced under a new epoch (sequence 0..) and re-sent — not failed
+// (Kafka: requestEpochBumpForPartition + startSequencesAtBeginning).  Only the
+// head fails.  RED (pre-fix): F1 and F2 fail too.
+TEST(EosOosRegression, FollowersOfARejectedHeadAreResequencedNotFailedRegression) {
+    Rig r(invokerCfg(3976, 3977));
+    r.connect();
+    r.gw.idempotence = true;
+    // H (epoch 0, seq 0) is rejected on every attempt; its first answer arrives
+    // after F1's and F2's.
+    r.gw.errorIf = [](int32_t part, int16_t epoch, int32_t seq) -> int16_t {
+        return (part == 0 && epoch == 0 && seq == 0) ? static_cast<int16_t>(rcc::ErrorCode::OutOfOrderSequence) : 0;
+    };
+    r.gw.holdAnswer = {1};
+    AckLedger    L;
+    rc::Producer p = r.client.producer(eosProducer(8, /*produceTimeoutMs=*/60'000));
+    L.attach(p);
+    const rc::TopicHandle topic = r.client.topic("t");
+    r.sendRecord(p, topic, 0, 1);  // H
+    r.sendRecord(p, topic, 1, 2);  // F1
+    r.sendRecord(p, topic, 2, 3);  // F2
+    ASSERT_TRUE(r.drive([&] { return r.gw.oosAnswers >= 3; }));  // F1, F2 met the gap
+    for (int i = 0; i < 20; ++i) r.step();
+    r.gw.releaseAnswer(1);
+    ASSERT_TRUE(r.drive([&] { return L.count.size() >= 3; })) << "completed " << L.count.size();
+    for (int i = 0; i < 20; ++i) r.step();
+    EXPECT_EQ(L.status(1), rc::OpStatus::BrokerError) << "the rejected head fails";
+    EXPECT_EQ(L.status(2), rc::OpStatus::Ok) << "F1 is re-sequenced and re-sent, not failed";
+    EXPECT_EQ(L.status(3), rc::OpStatus::Ok) << "F2 is re-sequenced and re-sent, not failed";
+    EXPECT_TRUE(L.exactlyOnce(1, 4));
+    EXPECT_EQ(loggedIds(r.gw, 0), (std::vector<uint64_t>{1, 2}));
+    ASSERT_EQ(r.gw.log.size(), 2u);
+    EXPECT_EQ(r.gw.log[0].producerEpoch, 1);
+    EXPECT_EQ(r.gw.log[0].baseSequence, 0) << "re-sequenced from 0 under the new epoch";
+    EXPECT_EQ(r.gw.log[1].baseSequence, 1);
+}
+
+// I-4: same for a head that FAILS by its delivery timeout (lost on every
+// attempt): once the parked followers meet the gap as the oldest batches, the
+// gap is proven (the head was never written) — they are re-sequenced and
+// written, not failed.  RED (pre-fix): they fail BrokerError(20).
+TEST(EosOosRegression, FollowersOfATimedOutHeadAreResequencedNotFailedRegression) {
+    Rig r(invokerCfg(3978, 3979));
+    r.connect();
+    r.gw.idempotence = true;
+    r.gw.dropIf = [](int32_t part, int16_t epoch, int32_t seq) { return part == 0 && epoch == 0 && seq == 0; };
+    AckLedger          L;
+    rc::ProducerConfig pc = eosProducer(8, /*produceTimeoutMs=*/50);
+    pc.deliveryTimeoutMs  = 500;
+    rc::Producer p = r.client.producer(pc);
+    L.attach(p);
+    const rc::TopicHandle topic = r.client.topic("t");
+    r.sendRecord(p, topic, 0, 1);  // H: never arrives
+    r.step();                      // H's first send at t0
+    r.step(20'000'000);
+    r.sendRecord(p, topic, 1, 2);  // F1
+    r.sendRecord(p, topic, 2, 3);  // F2
+    ASSERT_TRUE(r.drive([&] { return L.times(1) > 0; }, /*advanceNs=*/1'000'000));
+    EXPECT_EQ(L.status(1), rc::OpStatus::DeliveryFailed);
+    ASSERT_TRUE(r.drive([&] { return L.count.size() >= 3; })) << "completed " << L.count.size();
+    EXPECT_EQ(L.status(2), rc::OpStatus::Ok) << "F1 re-sequenced, not failed";
+    EXPECT_EQ(L.status(3), rc::OpStatus::Ok) << "F2 re-sequenced, not failed";
+    EXPECT_EQ(loggedIds(r.gw, 0), (std::vector<uint64_t>{1, 2}));
 }
