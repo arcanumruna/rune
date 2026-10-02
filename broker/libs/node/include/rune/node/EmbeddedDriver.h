@@ -43,6 +43,7 @@ struct EmbeddedDriverConfig {
     int32_t     mtuBytes          = 1408;
     int32_t     rcvWindowBytes    = 128 * 1024;
     int32_t     socketBufferBytes = 2 * 1024 * 1024;
+    bool        termBufferSparse  = true;    ///< false: allocate + zero-fill terms at creation
     NodeConfig::AeronThreadingMode threadingMode = NodeConfig::AeronThreadingMode::Shared;
     std::string idleStrategy      = "sleep-ns";
     bool        deleteDirOnShutdown = true;

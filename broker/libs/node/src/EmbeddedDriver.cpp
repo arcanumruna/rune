@@ -14,6 +14,7 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.mtuBytes          = c.aeronMtuBytes;
     e.rcvWindowBytes    = c.aeronRcvWindowBytes;
     e.socketBufferBytes = c.aeronSocketBufferBytes;
+    e.termBufferSparse  = c.aeronTermBufferSparse;
     e.threadingMode     = c.aeronThreadingMode;
     e.idleStrategy      = c.driverIdleStrategy;
     return e;
@@ -94,7 +95,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_set_client_liveness_timeout_ns(ctx_, static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
-    aeron_driver_context_set_term_buffer_sparse_file(ctx_, true);
+    aeron_driver_context_set_term_buffer_sparse_file(ctx_, cfg_.termBufferSparse);
     aeron_driver_context_set_term_buffer_length(ctx_, static_cast<uint64_t>(cfg_.termBufferBytes));
     aeron_driver_context_set_mtu_length(ctx_, static_cast<size_t>(cfg_.mtuBytes));
     aeron_driver_context_set_rcv_initial_window_length(ctx_, static_cast<size_t>(cfg_.rcvWindowBytes));

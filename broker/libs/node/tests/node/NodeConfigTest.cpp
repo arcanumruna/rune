@@ -1555,6 +1555,27 @@ TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
     EXPECT_EQ(res.config->aeronRcvWindowBytes, 262144);
 }
 
+TEST(NodeConfig, ParsesAeronTermSparse) {
+    std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+    {
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_TRUE(res.config->aeronTermBufferSparse) << "default unchanged";
+    }
+    {
+        auto kv = base; kv["RUNE_AERON_TERM_SPARSE"] = "false";
+        auto res = rune::node::parseNodeConfig(fakeEnv(kv));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_FALSE(res.config->aeronTermBufferSparse);
+    }
+    {
+        auto kv = base; kv["RUNE_AERON_TERM_SPARSE"] = "maybe";
+        auto res = rune::node::parseNodeConfig(fakeEnv(kv));
+        EXPECT_FALSE(res.config.has_value()) << "an invalid value refuses to start";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // G0.3: Configurable gateway fragment poll limit (RUNE_GATEWAY_FRAGMENT_LIMIT)
 // ---------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 // EmbeddedDriverTest.cpp — one embedded driver is driven by exactly one thread
 // (spec §3.6); invoker mode has no driver thread; stale/active dir handling.
+#include <sys/stat.h>
 #include <rune/node/EmbeddedDriver.h>
 
 #include <Aeron.h>
@@ -171,4 +172,42 @@ TEST(EmbeddedDriverRegression, InvokerDestroyedAfterHandOffClosesCleanly) {
     std::thread t([&] { drv->bindPumpThread(); drv.reset(); });
     t.join();
     EXPECT_FALSE(fs::exists(d.path / "cnc.dat")) << "hand-off close must release the driver dir";
+}
+
+// Non-sparse term buffers are fully allocated (and zero-filled) when the
+// publication is created — no first-write page faults on the hot path, and a full
+// tmpfs fails the create instead of SIGBUS-ing a running sender.
+namespace {
+uint64_t allocatedLogBufferBytes(const fs::path& dir, bool sparse) {
+    TmpDir d;
+    EmbeddedDriverConfig c = cfgAt(d.path);
+    c.termBufferBytes = 1024 * 1024;
+    c.termBufferSparse = sparse;
+    EmbeddedDriver drv(c, DriverMode::Invoker);
+    auto a = connect(d.path, /*invoker=*/true);
+    const int64_t preg = a->addExclusivePublication("aeron:ipc", 9301);
+    std::shared_ptr<aeron::ExclusivePublication> pub;
+    for (int i = 0; i < 100'000 && !pub; ++i) {
+        drv.doWork();
+        a->conductorAgentInvoker().invoke();
+        pub = a->findExclusivePublication(preg);
+    }
+    uint64_t bytes = 0;
+    for (const auto& e : fs::recursive_directory_iterator(d.path))
+        if (e.path().extension() == ".logbuffer") {
+            struct stat st{};
+            if (::stat(e.path().c_str(), &st) == 0) bytes += static_cast<uint64_t>(st.st_blocks) * 512u;
+        }
+    (void)dir;
+    pub.reset(); a.reset();
+    return bytes;
+}
+}
+
+TEST(EmbeddedDriverRegression, NonSparseTermsAreFullyAllocatedAtCreationRegression) {
+    const uint64_t full = 3u * 1024u * 1024u;                        // three 1 MiB terms
+    EXPECT_GE(allocatedLogBufferBytes({}, /*sparse=*/false), full)
+        << "non-sparse terms must be allocated up front";
+    EXPECT_LT(allocatedLogBufferBytes({}, /*sparse=*/true), full / 2)
+        << "sparse terms stay unallocated until written (the default is unchanged)";
 }

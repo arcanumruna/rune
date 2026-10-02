@@ -465,6 +465,14 @@ struct NodeConfig {
     //     avoid receiver window throttling on large batched produces.
     int32_t aeronRcvWindowBytes          = 128 * 1024;
 
+    //   - aeronTermBufferSparse: create term buffers as sparse files (true, Aeron's
+    //     default here) or fully allocated + zero-filled at creation (false).
+    //     RUNE_AERON_TERM_SPARSE=true|false.  Sparse terms page-fault on the first
+    //     write to every page (measured ~15% of a loaded shard thread) and turn a
+    //     full tmpfs into a mid-run SIGBUS; non-sparse moves both to publication
+    //     creation (a full tmpfs then fails the create, loudly).
+    bool    aeronTermBufferSparse        = true;
+
     //   - aeronSocketBufferBytes: OS UDP socket SO_SNDBUF / SO_RCVBUF (bytes) for
     //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.
     //     Larger socket buffers absorb produce/ack bursts on loopback/LAN so the
