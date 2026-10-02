@@ -271,6 +271,12 @@ per hop × ~4 hops).
   Each item: RED-first test where it is a behavior change, *Regression* marker where it fixes a bug (rotation stall),
   no allocation/virtual/std::function on the hot path, numbers in this doc.
 
+- **GSO-1 (proper implementation, after the quick-and-dirty assessment): Aeron UDP GSO/GRO transport bindings.**
+  Spec: docs/superpowers/specs/2026-10-03-aeron-udp-gso-gro-design.md.  Plan (TDD, 7 tasks, real-driver tests for
+  mixed peers / EAGAIN / loss+NAK / EIO fallback / IPv6, full suites + DR e2e, perf ABAB, Kafka-vs-Rune over veth
+  MTU 1500): docs/superpowers/plans/2026-10-03-aeron-udp-gso-gro.md.  Motivation: MTU 1408 = 47.8k vs MTU 65504 =
+  166.9k rec/s (§4.3).  The quick-and-dirty assessment build (env-gated, VM only) is NOT the deliverable.
+
 - F26 Aeron shm budget counts per driver, not per publication (SIGBUS mid-run) — partly addressed
   by `RUNE_AERON_TERM_SPARSE=false` (fails at creation instead).
 - F27 R1 dead-peer stall (fix round 2 in flight).
