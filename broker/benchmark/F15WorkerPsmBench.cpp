@@ -33,6 +33,8 @@
 
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -250,5 +252,72 @@ BENCHMARK(BM_FlushOwedAcksAll)
     ->Args({64, 0})->Args({512, 0})->Args({4096 - 64, 0})
     ->Args({64, 1})->Args({512, 1})->Args({4096 - 64, 1})
     ->Unit(benchmark::kNanosecond)->MinTime(0.5);
+
+// ---------------------------------------------------------------------------
+// BM_StrictPipelined/<perPass> (re-review 2 M-7): Strict-tier (fsync-acked)
+// gateway-routed produces PIPELINED on one log — every worker pass enqueues
+// `perPass` new batches and reaps whatever fsync completed.  Measures the
+// per-log Strict throughput (items/s = acked batches) and the enqueue→ack
+// latency (p50/p99 µs).  Before F15 S5 fix round 2 several coalesced fsyncs
+// could be in flight on the log; since M-6 one is (the next one covers every
+// batch appended meanwhile).  Real disk log + the worker's real io backend
+// (io_uring on Linux).  Window bounded (kMaxInFlight) so the owed cap is
+// never hit.
+void BM_StrictPipelined(benchmark::State& state) {
+    const int perPass = static_cast<int>(state.range(0));
+    constexpr int kMaxInFlight = 1024;
+    const std::string dir = tempDir("strict");
+    rune::storage::Log log(dir, 64LL * 1024 * 1024);
+    log.recover();
+    NullTransport t;
+    PartitionConfig c = partCfg();
+    c.durabilityTier = 2;
+    PartitionReplica rep(c, Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 22, 1 << 25, 256, 256);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    const auto b = batch(-1, 0);
+    WorkerOp op;
+    op.type = WorkerOp::Type::Produce; op.topicId = 0; op.partition = 0;
+    op.replica = &rep; op.logPtr = &log; op.sessionId = 1; op.acks = 0;
+    op.producerId = -1; op.baseSequence = -1; op.lastOffsetDelta = 0; op.recordCount = 1;
+    op.durabilityTier = 2;
+    op.recordBatchView = std::span<const uint8_t>(b);
+    using Clock = std::chrono::steady_clock;
+    std::vector<Clock::time_point> sent;
+    sent.reserve(1 << 22);
+    std::vector<int64_t> latNs;
+    latNs.reserve(1 << 22);
+    int64_t corr = 0, acked = 0, errors = 0, now = 1;
+    auto drain = [&] {
+        w.drainReturn([&](WorkerReturn r) {
+            if (r.type != WorkerReturn::Type::ProduceResult) return;
+            if (r.errorCode != 0) { ++errors; return; }
+            const auto i = static_cast<std::size_t>(r.correlationId - 1);
+            if (i < sent.size() && latNs.size() < latNs.capacity())
+                latNs.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - sent[i]).count());
+            ++acked;
+        });
+    };
+    for (auto _ : state) {
+        for (int k = 0; k < perPass && corr - acked < kMaxInFlight && sent.size() < sent.capacity(); ++k) {
+            op.correlationId = ++corr;
+            sent.push_back(Clock::now());
+            if (!w.tryEnqueueOp(op)) { state.SkipWithError("op ring full"); break; }
+        }
+        w.doWork(++now);
+        drain();
+    }
+    for (int i = 0; i < 50'000'000 && acked + errors < corr; ++i) { w.doWork(++now); drain(); }   // settle (bounded)
+    if (errors != 0) state.SkipWithError("Strict produces answered with an error");
+    std::sort(latNs.begin(), latNs.end());
+    if (!latNs.empty()) {
+        state.counters["p50us"] = static_cast<double>(latNs[latNs.size() / 2]) / 1000.0;
+        state.counters["p99us"] = static_cast<double>(latNs[latNs.size() * 99 / 100]) / 1000.0;
+    }
+    state.counters["acked_per_s"] = benchmark::Counter(static_cast<double>(acked), benchmark::Counter::kIsRate);
+    state.SetItemsProcessed(acked);
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+BENCHMARK(BM_StrictPipelined)->Arg(1)->Arg(16)->Unit(benchmark::kMicrosecond)->MinTime(2.0)->UseRealTime();
 
 } // namespace

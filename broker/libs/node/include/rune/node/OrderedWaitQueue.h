@@ -21,11 +21,14 @@
 // `take` claims is marked dead in place (no move) and dead slots are popped
 // off the front — O(1) per fired front entry.  A dead slot in the middle
 // (fired behind a still-waiting older entry) stays a tombstone until the
-// front reaches it OR until the window span exceeds 2 × live + kSlack: then
+// front reaches it OR until the window span exceeds 1.5 × live + kSlack: then
 // the window is compacted in order (eager compaction).  A compaction costs
-// O(span) = O(live + kSlack) and runs only after more than live + kSlack
-// removals since the last one — amortised O(1) per removal, and every pass
-// walks at most 2 × live + kSlack slots (spanForTest()).  push_back on a full
+// O(span) = O(live + kSlack) and runs only after at least (live/2 + kSlack)/1.5
+// removals since the last one — amortised O(1) per removal (≤ ~4.5 slot visits
+// per removal), and every pass walks at most 1.5 × live + kSlack slots
+// (spanForTest()).  N-6: when the compacted survivors fit wholly in front of
+// the head's physical slot, the window is rebased to slot 0 — the hot set
+// returns to the start of the ring instead of sliding through all of it.  push_back on a full
 // ring compacts first; only if still full does it grow (cold, counted).
 //
 // Single owner thread.  No atomics, no virtual calls, no std::function
@@ -42,13 +45,15 @@ namespace rune::node {
 template <typename T>
 class OrderedWaitQueue {
 public:
-    /// Span slack above 2 × live before an eager compaction (bounds the
+    /// Span slack above 1.5 × live before an eager compaction (bounds the
     /// compaction rate for tiny queues).
     static constexpr std::size_t kSlack = 64;
 
-    /// Reserve room for `n` LIVE entries (ring = pow2 >= 2n + kSlack).  Cold.
+    /// Reserve room for `n` LIVE entries (ring = pow2 >= 1.5n + kSlack — the
+    /// largest span the eager compaction allows; 8192 slots for the 4096 owed
+    /// cap, re-review 2 N-6).  Cold.
     void reserve(std::size_t n) {
-        const std::size_t want = pow2_(n * 2 + kSlack);
+        const std::size_t want = pow2_(n + n / 2 + kSlack);
         if (want <= slots_.size()) return;
         regrow_(want);
     }
@@ -97,7 +102,7 @@ public:
 #endif
         if (removed != 0) {
             popDeadFront_();
-            if (tail_ - head_ > 2 * live_ + kSlack) [[unlikely]] compact_();   // I-2: span bounded by live
+            if (tail_ - head_ > live_ + live_ / 2 + kSlack) [[unlikely]] compact_();   // I-2: span bounded by live
         }
         return removed;
     }
@@ -149,6 +154,26 @@ private:
     // physically wrapped window is handled by the masked index).
     void compact_() {
         ++compactions_;
+        // N-6 rebase: the window does not wrap physically and the survivors
+        // (<= span) fit in [0, idx(head)) — the write region ends before the
+        // read region starts, so an in-order copy to slot 0 never overwrites
+        // an unread entry.
+        const std::size_t hi = idx_(head_);
+        if (hi + (tail_ - head_) <= slots_.size() && live_ <= hi) {
+            uint64_t w = 0;
+            for (uint64_t r = head_; r < tail_; ++r) {
+                const std::size_t ri = idx_(r);
+                if (live_flags_[ri] == 0) continue;
+                slots_[w] = std::move(slots_[ri]);
+                live_flags_[w] = 1;
+                slots_[ri] = T{};
+                live_flags_[ri] = 0;
+                ++w;
+            }
+            head_ = 0;
+            tail_ = w;
+            return;
+        }
         uint64_t w = head_;
         for (uint64_t r = head_; r < tail_; ++r) {
             const std::size_t ri = idx_(r);

@@ -516,7 +516,6 @@ public:
         durablePending_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         initRoutes_(ioSubmitDepth > ioComplDepth ? ioSubmitDepth : ioComplDepth);
         dirtyThisCycle_.reserve(kDirtySetReserve);
-        stillDirty_.reserve(kDirtySetReserve);
         pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         subs_.reserve(kSubsReserve);
         validators_.reserve(kValidatorsReserve);
@@ -1061,6 +1060,11 @@ public:
     // single-threaded tests only.
     [[nodiscard]] std::size_t bgFlushInFlightForTest() const noexcept { return bgInFlight_; }
     [[nodiscard]] uint64_t    bgFlushSubmitsForTest() const noexcept { return bgFlushSubmits_; }
+    /// The background token in flight on `log` (kNoToken if none).
+    [[nodiscard]] CompletionToken lastBgTokenForTest(const rune::storage::Log* log) noexcept {
+        LogFlushSlot* slot = slotOf_(const_cast<rune::storage::Log*>(log));
+        return slot ? slot->bgToken : kNoToken;
+    }
     [[nodiscard]] uint64_t    bgFlushErrorsForTest() const noexcept { return bgFlushErrors_; }
     [[nodiscard]] uint64_t    bgFlushDeferredForTest() const noexcept { return bgFlushDeferred_; }
     [[nodiscard]] uint64_t    sealSubmitsForTest() const noexcept { return sealSubmits_; }
@@ -1552,8 +1556,16 @@ private:
             // stay un-stamped (kNoToken) and the log stays dirty: the next pass
             // after the in-flight fsync completes submits ONE fsync covering
             // all of them (state-driven retry, no timer).
+            //
+            // Strict latency bound (fix round 3, I-3): a deferred Strict waiter
+            // marks the log strictWaiting, which blocks every NEW background
+            // fsync on it (requestBgFlush_), so the next fsync on the log is
+            // its durable one.  A Strict ack therefore waits for at most ONE
+            // in-flight fsync (durable or background) plus its own — never a
+            // chain of re-armed background flushes.
             if (slot && (slot->durableToken != kNoToken || slot->bgToken != kNoToken)) {
                 ++durableSubmitsDeferred_;
+                slot->strictWaiting = true;
                 stillDirty_.push_back(log);
                 continue;
             }
@@ -1566,6 +1578,7 @@ private:
                 spdlog::warn("Worker {}: submitCoalescedFlushes_ ring full for log@{}; "
                              "back-pressure: acking pending entries Internal",
                              workerId_, static_cast<const void*>(log));
+                if (slot) slot->strictWaiting = false;   // its waiters are answered below
                 work += static_cast<int>(durablePending_.sweep([&](DurablePending& entry) {
                     if (entry.token != kNoToken || entry.logPtr != log) return false;
                     entry.ret.errorCode = static_cast<int16_t>(6); // Internal
@@ -1578,7 +1591,7 @@ private:
                 durablePending_.forEach([&](DurablePending& entry) {
                     if (entry.token == kNoToken && entry.logPtr == log) entry.token = t;
                 });
-                if (slot) { slot->durableToken = t; slot->durableLeo = log->logEndOffset(); }
+                if (slot) { slot->durableToken = t; slot->durableLeo = log->logEndOffset(); slot->strictWaiting = false; }
                 ++io_submitCount_;
                 ++work;
             }
@@ -1639,21 +1652,27 @@ private:
         // still owns the log — a purged slot's log may belong to another worker).
         if (routed && r.seg && slot) r.log->unpinSegmentFlush(r.seg);
 
-        if (routed && r.kind == RouteKind::Background && slot && slot->bgToken == c.token) {
-            slot->bgToken = kNoToken;
+        // M-6 / N-5: the one-in-flight gate belongs to the LOG — it is cleared on
+        // the log's CURRENT slot whatever its epoch (a log purged and re-owned
+        // while this fsync was in flight seeded its fresh slot from the route).
+        LogFlushSlot* gate = routed ? slotOf_(r.log) : nullptr;
+        if (routed && r.kind == RouteKind::Background && gate && gate->bgToken == c.token) {
+            gate->bgToken = kNoToken;
             if (bgInFlight_) --bgInFlight_;
         }
         if (routed && r.kind == RouteKind::Seal && slot && slot->sealsInFlight > 0) --slot->sealsInFlight;
         // M-6: the log's one durable fsync is no longer in flight.  A success
         // syncs everything below its LEO (it also serves a background request
         // deferred behind it); data appended since is re-requested.
-        if (routed && r.kind == RouteKind::Durable && slot && slot->durableToken == c.token) {
-            slot->durableToken = kNoToken;
-            if (c.errorCode == 0) {
-                if (slot->durableLeo > slot->lastSyncedLeo) slot->lastSyncedLeo = slot->durableLeo;
-                if (slot->bgAgain) {
-                    slot->bgAgain = false;
-                    if (slot->log->logEndOffset() > slot->lastSyncedLeo) (void)requestBgFlush_(*slot);
+        if (routed && r.kind == RouteKind::Durable && gate && gate->durableToken == c.token) {
+            gate->durableToken = kNoToken;
+            if (c.errorCode == 0 && gate == slot) {
+                if (gate->durableLeo > gate->lastSyncedLeo) gate->lastSyncedLeo = gate->durableLeo;
+                // I-3: re-request background only if no Strict waiter is queued
+                // (requestBgFlush_ keeps bgAgain set while strictWaiting).
+                if (gate->bgAgain) {
+                    gate->bgAgain = false;
+                    if (gate->log->logEndOffset() > gate->lastSyncedLeo) (void)requestBgFlush_(*gate);
                 }
             }
         }
@@ -3550,6 +3569,11 @@ private:
         /// a concurrent one on the same file succeeds and acks OK.
         CompletionToken durableToken    = kNoToken;
         int64_t         durableLeo      = 0;          ///< LEO covered by durableToken
+        /// F15 S5 fix round 3 (I-3): Strict waiters on this log are deferred
+        /// behind the in-flight fsync.  While set, NO background fsync may be
+        /// submitted on the log — the next fsync is the durable one, and it
+        /// serves any background request (bgAgain) too.
+        bool            strictWaiting   = false;
         int64_t         bgLeo           = 0;          ///< LEO covered by bgToken
         bool            bgAgain         = false;      ///< newer data requested meanwhile
         int64_t         lastSyncedLeo   = 0;
@@ -4017,6 +4041,14 @@ private:
                 LogFlushSlot fresh;
                 fresh.log = log; fresh.replica = replica; fresh.epoch = ++slotEpochSeq_;
                 fresh.dir = log->dir();   // cached while owned: never read the Log after a move
+                // N-5 (cold): a log re-owned while an fsync this worker issued on it
+                // is still in flight keeps its one-in-flight gate — seeded from the
+                // route table (cleared by that completion through slotOf_(log)).
+                for (const TokenRoute& rt : routes_) {
+                    if (rt.token == kNoToken || rt.log != log) continue;
+                    if (rt.kind == RouteKind::Durable)    fresh.durableToken = rt.token;
+                    if (rt.kind == RouteKind::Background) fresh.bgToken      = rt.token;
+                }
                 next.push_back(fresh);
             }
         }
@@ -4161,6 +4193,14 @@ private:
     bool requestBgFlush_(LogFlushSlot& slot) noexcept {
         rune::storage::Log* log = slot.log;
         if (log->storageFailed()) return false;                   // fail-stop: never again
+        // I-3: a Strict waiter is queued on this log — its durable fsync goes
+        // next and covers this request; a background fsync submitted now
+        // would defer the Strict waiter again (starvation when fsync >= the
+        // sync interval).  Remembered in bgAgain, served by the durable.
+        if (slot.strictWaiting) {
+            if (log->logEndOffset() > slot.lastSyncedLeo) slot.bgAgain = true;
+            return false;
+        }
         if (slot.bgToken != kNoToken) {                           // coalesce
             if (log->logEndOffset() > slot.bgLeo) slot.bgAgain = true;
             return false;
