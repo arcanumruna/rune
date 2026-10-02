@@ -5679,25 +5679,25 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 Spec §4.1: "`ClientShard`: one thread owning a subset of partitions, with its own embedded driver in invoker mode (tmpfs dir, explicit MTU, default 8 KB, configurable), its own Aeron client with conductor invoker, its partitions' batch builders, publications to whichever worker endpoints they map to, its ack subscription, and its pending-ack table … Shard count = client cores given (config, default 1) … Deterministic partition → shard mapping … Agent mode (existing default, kept): a background thread per shard … any app thread may `send()` to any partition (routed to the owning shard)." A shard is one `Client` (its own dataDir → own driver; own egress port → own ack subscription; own sessions) plus its producer. Ownership is enforced: two shards writing one partition would collide on the shared idempotent producer id (`ProducerImpl.h:492-499`).
 
+**F8c API (2026-10-02, spec `2026-10-01-f8c-no-futures-design.md` step C9 — this text supersedes the pre-F8 draft):** the client has no futures, promises, `std::async`, `shared_ptr` handles or atomics. `ClientShard::connect(CompletionTarget, Token)` returns an `OpResult` and completes exactly once into a `Completions` (polled on the issuing thread) or a `CompletionHandler`; `connectAndWait(timeout)` is the blocking sugar (Invoker owner: pumps `doWork()`; Thread mode: idle-strategy poll). Invoker batch acks arrive as `OpKind::BatchAck` completions in a shard-owned `Completions` (`Producer::batchAcksTo`, decoded with `batchAckOf`) — `collectBatchAcks`/`drainBatchAcks` and `Producer::implForInternalUse` no longer exist. Handles are move-only. Tests use no atomics and poll instead of sleeping; the one real-time wait left is `StalledOwnerTurnsSendsIntoClosed` (Aeron's conductor liveness clock cannot be injected).
+
 Resolved ambiguity: spec §4.1 says agent mode hands records "through a per-shard single-producer ring" but also "any app thread may send() to any partition" — several app threads can target one shard, so the per-shard ring stays the existing ManyToOne ring (§1a.2: "ManyToOne only where genuinely multi-producer"). Invoker mode has no ring at all (Task 14).
 
 **Files:**
 - Create: `include/rune/client/shard/ShardMap.h`, `include/rune/client/shard/ClientShard.h`, `src/shard/ClientShard.cpp`
-- Modify: `include/rune/client/producer/Producer.h:196-200` (`implForInternalUse`)
 - Create: `tests/shard/ShardMapTest.cpp` (pure), `tests/shard/ClientShardTest.cpp`
 - Modify: `CMakeLists.txt` (`rune_client_api` sources; `rune_pure_tests`, `rune_invoker_tests`)
 
 **Interfaces:**
-- Consumes: `RunnerMode`, `runnerCore`, `aeronClientLivenessTimeoutNs`, `Client::doWork`, `Client::transportClosed` (Task 12); `SendResult` (Task 13); Direct ingress (Task 14); `BatchAck`, `collectBatchAcks`, `drainBatchAcks` (Task 10); `InvokerGateway` (Task 11).
+- Consumes: `RunnerMode`, `runnerCore`, `aeronClientLivenessTimeoutNs`, `Client::doWork`, `Client::transportClosed` (Task 12); `SendResult` (Task 13); Direct ingress (Task 14); `BatchAck` (Task 10); `InvokerGateway` (Task 11); F8c: `Token`, `OpResult`, `OpStatus`, `Completion`, `Completions`, `CompletionTarget`, `Client::connect(target, token)`, `Client::connectAndWait`, `Producer::batchAcksTo(Completions&)`, `batchAckOf(const Completion&)`.
 - Produces:
   - `[[nodiscard]] constexpr uint32_t rune::client::shard::shardFor(int32_t topicId, int32_t partition, uint32_t shardCount) noexcept;` = `(uint32(topicId) + uint32(partition)) % shardCount` (0 when `shardCount <= 1`)
   - `[[nodiscard]] std::string rune::client::shard::channelWithPortOffset(const std::string& channel, int32_t offset);`
   - `enum class ShardMode : uint8_t { Agent, Invoker };`
   - `struct ShardGroupConfig { ClientConfig base; uint32_t shardCount = 1; ShardMode mode = ShardMode::Agent; int32_t firstCore = -1; ProducerConfig producer = {}; int64_t invokerLingerUs = 0; };`
   - `[[nodiscard]] ClientConfig shardClientConfig(const ShardGroupConfig&, uint32_t index);` `[[nodiscard]] ProducerConfig shardProducerConfig(const ShardGroupConfig&);`
-  - `class ClientShard { ClientShard(const ShardGroupConfig&, uint32_t index); std::future<void> connect(); SendResult trySend(TopicHandle, const Key&, std::span<const uint8_t>) noexcept; void send(...); int doWork(); template<class H> int pollBatchAcks(H&&); bool owns(int32_t, int32_t) const noexcept; bool closed() const noexcept; uint32_t index() const noexcept; TopicHandle topic(const std::string&) const noexcept; Client& client() noexcept; Producer& producer() noexcept; };`
-  - `class ShardGroup { explicit ShardGroup(ShardGroupConfig); void connectAll(); SendResult trySend(...) noexcept; void send(...); ClientShard& shard(uint32_t); ClientShard& owner(int32_t, int32_t) noexcept; uint32_t size() const noexcept; };` (Agent mode only)
-  - `[[nodiscard]] const std::shared_ptr<producer::ProducerImpl>& Producer::implForInternalUse() const noexcept;`
+  - `class ClientShard { ClientShard(const ShardGroupConfig&, uint32_t index); [[nodiscard]] OpResult connect(CompletionTarget target, Token token); void connectAndWait(std::chrono::nanoseconds timeout = Client::kDefaultWaitTimeout); SendResult trySend(TopicHandle, const Key&, std::span<const uint8_t>) noexcept; void send(...); int doWork(); template<class H> int pollBatchAcks(H&&) /* Invoker: h(const BatchAck&) per polled batch ack */; bool owns(int32_t, int32_t) const noexcept; bool closed() const noexcept; uint32_t index() const noexcept; TopicHandle topic(const std::string&) const noexcept; Client& client() noexcept; Producer& producer() noexcept; };`
+  - `class ShardGroup { explicit ShardGroup(ShardGroupConfig); void connectAll(std::chrono::nanoseconds timeout = Client::kDefaultWaitTimeout); SendResult trySend(...) noexcept; void send(...); ClientShard& shard(uint32_t); ClientShard& owner(int32_t, int32_t) noexcept; uint32_t size() const noexcept; };` (Agent mode only)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5768,10 +5768,9 @@ Create `tests/shard/ClientShardTest.cpp`:
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
-#include <future>
 #include <map>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -5783,7 +5782,7 @@ namespace rs = rune::client::shard;
 using namespace std::chrono_literals;
 
 namespace {
-std::atomic<int> g_ctr{0};
+int g_ctr = 0;  // test thread only
 const std::vector<uint8_t> kVal(32, 0x21);
 
 rs::ShardGroupConfig group(int32_t in, int32_t eg, uint32_t count, rs::ShardMode mode) {
@@ -5792,7 +5791,7 @@ rs::ShardGroupConfig group(int32_t in, int32_t eg, uint32_t count, rs::ShardMode
     g.base.gatewayStreamId = in;
     g.base.egressChannel   = "aeron:ipc";
     g.base.egressStreamId  = eg;
-    g.base.dataDir = "/tmp/shard_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    g.base.dataDir = "/tmp/shard_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     rc::TopicSpec ts;
     ts.name = "t";
     ts.topicId = 1;
@@ -5828,11 +5827,21 @@ struct ShardRig {
         }
         return false;
     }
+    // F8c: connect(target, Token) into a Completions owned by this (owner)
+    // thread; the completion is polled while driving shard + gateway.
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
-        auto f = shard.connect();
-        ASSERT_TRUE(drive([&] { return f.wait_for(0s) == std::future_status::ready; }));
-        f.get();
+        rc::Completions cq(shard.client());
+        ASSERT_EQ(shard.connect(cq, 1), rc::OpResult::Accepted);
+        bool done = false;
+        rc::OpStatus st = rc::OpStatus::Closed;
+        ASSERT_TRUE(drive([&] {
+            cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+                if (c.token == 1) { done = true; st = c.status; }
+            });
+            return done;
+        }));
+        ASSERT_EQ(st, rc::OpStatus::Ok);
     }
 };
 } // namespace
@@ -5926,24 +5935,34 @@ TEST(ShardGroup, AgentModeRoutesEachSendToTheOwningShard) {
     test_support::InvokerGateway gw1(rs::shardClientConfig(g, 1).dataDir + "/aeron", "aeron:ipc", 3810,
                                      "aeron:ipc", 3811);
     // Agent mode: each shard's runner + driver threads work on their own; the
-    // test thread pumps only the gateways, bounded, parking 100 µs per round.
+    // test thread pumps only the gateways, bounded by iterations (no sleep:
+    // yield between rounds).
     auto pumpUntil = [&](auto&& pred) {
-        for (int i = 0; i < 20'000; ++i) {
+        for (int i = 0; i < 2'000'000; ++i) {
             gw0.pump();
             gw1.pump();
             if (pred()) return true;
-            std::this_thread::sleep_for(100us);
+            std::this_thread::yield();
         }
         return false;
     };
     ASSERT_TRUE(pumpUntil([&] { return gw0.ready() && gw1.ready(); }));
-    auto f0 = grp.shard(0).connect();
-    auto f1 = grp.shard(1).connect();
+    // F8c: one Completions per shard, owned by this thread; each shard's runner
+    // completes its connect token into it.
+    rc::Completions cq0(grp.shard(0).client());
+    rc::Completions cq1(grp.shard(1).client());
+    ASSERT_EQ(grp.shard(0).connect(cq0, 10), rc::OpResult::Accepted);
+    ASSERT_EQ(grp.shard(1).connect(cq1, 11), rc::OpResult::Accepted);
+    int connected = 0, failed = 0;
+    auto onConnect = [&](const rc::Completion& c, std::span<const uint8_t>) {
+        (c.status == rc::OpStatus::Ok ? connected : failed) += 1;
+    };
     ASSERT_TRUE(pumpUntil([&] {
-        return f0.wait_for(0s) == std::future_status::ready && f1.wait_for(0s) == std::future_status::ready;
+        cq0.poll(onConnect);
+        cq1.poll(onConnect);
+        return connected + failed == 2;
     }));
-    f0.get();
-    f1.get();
+    ASSERT_EQ(failed, 0);
     const auto topic = grp.shard(0).topic("t");
     for (int32_t p = 0; p < 8; ++p) grp.send(topic, keyFor(p, 8), kVal);
     ASSERT_TRUE(pumpUntil([&] { return gw0.produced.size() + gw1.produced.size() == 8; }));
@@ -6011,7 +6030,7 @@ namespace rune::client::shard {
 
 - [ ] **Step 4: Implement `ClientShard`**
 
-`Producer.h` public: `[[nodiscard]] const std::shared_ptr<producer::ProducerImpl>& implForInternalUse() const noexcept { return impl_; }`.
+No `Producer.h` change (F8c): the shard does not reach into `ProducerImpl`; Invoker batch acks go through `Producer::batchAcksTo(Completions&)` into a shard-owned `Completions`.
 
 `include/rune/client/shard/ClientShard.h`:
 
@@ -6032,11 +6051,12 @@ namespace rune::client::shard {
 #pragma once
 
 #include <rune/client/Client.h>
-#include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/Completions.h>
 #include <rune/client/shard/ShardMap.h>
 
-#include <future>
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -6064,9 +6084,24 @@ public:
     ClientShard(const ClientShard&)            = delete;
     ClientShard& operator=(const ClientShard&) = delete;
 
-    [[nodiscard]] std::future<void> connect() { return client_->connect(); }
+    /// F8c: exactly one Connect completion into `target` when Accepted (a
+    /// Completions registered with client() and owned by the calling thread, or
+    /// a CompletionHandler on the duty thread).  Invoker: owner thread only,
+    /// then drive doWork() and poll.
+    [[nodiscard]] OpResult connect(CompletionTarget target, Token token) {
+        return client_->connect(target, token);
+    }
+    /// Blocking sugar: Invoker owner pumps doWork(); Agent polls under the idle
+    /// strategy.  Throws std::runtime_error on any non-Ok outcome or timeout.
+    void connectAndWait(std::chrono::nanoseconds timeout = Client::kDefaultWaitTimeout) {
+        client_->connectAndWait(timeout);
+    }
 
-    /// Non-blocking; zero allocation when accepted.
+    /// Invoker batch-ack queue: 8 MiB = ~174k accepted-but-unpolled records.
+    static constexpr uint32_t kBatchAckQueueBytes = 8u << 20;
+
+    /// Non-blocking; zero allocation when accepted.  Invoker: QueueFull when
+    /// the batch-ack queue has no credit — pollBatchAcks(), then retry.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
                                      std::span<const uint8_t> value) noexcept {
         if (closed_) return SendResult::Closed;
@@ -6075,15 +6110,21 @@ public:
         return producer_.trySend(topic, key, value);
     }
 
-    /// Never drops (Producer::send semantics); WrongShard -> logic_error, Closed -> runtime_error.
+    /// Never drops (Producer::send semantics); WrongShard -> logic_error, Closed -> runtime_error,
+    /// Invoker QueueFull -> runtime_error (only this thread can pollBatchAcks()).
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
 
     /// Invoker mode: one shard duty cycle.  Returns the work count.
     int doWork();
 
-    /// Invoker mode: BatchAcks completed since the last call (plain template call).
+    /// Invoker mode: h(const BatchAck&) for every batch ack completed since the
+    /// last call (F8c: OpKind::BatchAck completions in the shard-owned queue).
+    /// Agent mode: 0 (no queue).
     template <class H>
-    int pollBatchAcks(H&& h) { return impl_->drainBatchAcks(std::forward<H>(h)); }
+    int pollBatchAcks(H&& h) {
+        if (!acks_) return 0;
+        return acks_->poll([&](const Completion& c, std::span<const uint8_t>) { h(batchAckOf(c)); });
+    }
 
     [[nodiscard]] bool owns(int32_t topicId, int32_t partition) const noexcept {
         return shardFor(topicId, partition, count_) == index_;
@@ -6095,21 +6136,26 @@ public:
     [[nodiscard]] Producer&   producer() noexcept { return producer_; }
 
 private:
-    uint32_t                                index_;
-    uint32_t                                count_;
-    ShardMode                               mode_;
-    std::unique_ptr<Client>                 client_;
-    Producer                                producer_;
-    std::shared_ptr<producer::ProducerImpl> impl_;
-    bool                                    closed_ = false;  // owner thread (Invoker) only
+    uint32_t                   index_;
+    uint32_t                   count_;
+    ShardMode                  mode_;
+    std::unique_ptr<Client>    client_;
+    std::optional<Completions> acks_;      // Invoker: batch acks; owner thread.  Never
+                                           // moved (the producer holds its address);
+                                           // declared before producer_: outlives it
+    Producer                   producer_;  // move-only handle (F8c §3)
+    bool                       closed_ = false;  // owner thread (Invoker) only
 };
 
 class ShardGroup {
 public:
     /// Agent mode only: in invoker mode each app thread builds its own ClientShard.
     explicit ShardGroup(ShardGroupConfig cfg);
-    /// Connects every shard and waits (each future is bounded by base.connectTimeoutMs).
-    void connectAll();
+    /// Issues every shard's connect (they proceed in parallel on the runners),
+    /// then waits for each token; the broker side of each is bounded by
+    /// base.connectTimeoutMs.  Throws std::runtime_error naming the first shard
+    /// whose connect did not complete Ok within `timeout`.
+    void connectAll(std::chrono::nanoseconds timeout = Client::kDefaultWaitTimeout);
     /// Any app thread: routed to the owning shard.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
                                      std::span<const uint8_t> value) noexcept;
@@ -6164,9 +6210,18 @@ ClientShard::ClientShard(const ShardGroupConfig& g, uint32_t index)
       count_(g.shardCount),
       mode_(g.mode),
       client_(std::make_unique<Client>(shardClientConfig(g, index))),
-      producer_(client_->producer(shardProducerConfig(g))),
-      impl_(producer_.implForInternalUse()) {
-    if (mode_ == ShardMode::Invoker) impl_->collectBatchAcks(true);
+      producer_(client_->producer(shardProducerConfig(g))) {
+    if (mode_ == ShardMode::Invoker) {
+        // The constructing thread is the Invoker owner: it owns the queue too.
+        // Credit (Producer::batchAcksTo): every send reserves 48 B until its
+        // batch ack is polled; BatchAck records carry no payload.
+        CompletionsConfig qc;
+        qc.capacityBytes  = kBatchAckQueueBytes;
+        qc.maxResultBytes = 0;
+        qc.maxErrorText   = 0;
+        acks_.emplace(*client_, qc);
+        producer_.batchAcksTo(*acks_);  // setup phase: before the first send
+    }
 }
 
 void ClientShard::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value) {
@@ -6204,11 +6259,27 @@ ShardGroup::ShardGroup(ShardGroupConfig cfg) : cfg_(std::move(cfg)) {
     }
 }
 
-void ShardGroup::connectAll() {
-    std::vector<std::future<void>> fs;
-    fs.reserve(shards_.size());
-    for (auto& s : shards_) fs.push_back(s->connect());
-    for (auto& f : fs) f.get();
+void ShardGroup::connectAll(std::chrono::nanoseconds timeout) {
+    // Agent mode: the runners make progress by themselves; this thread owns the
+    // queues and only polls them (Completions::waitFor, no pump).
+    std::vector<Completions> cqs;
+    cqs.reserve(shards_.size());
+    for (uint32_t i = 0; i < shards_.size(); ++i) {
+        cqs.emplace_back(shards_[i]->client());
+        if (shards_[i]->connect(cqs.back(), i) != OpResult::Accepted) {
+            throw std::runtime_error("ShardGroup::connectAll: shard " + std::to_string(i) +
+                                     " rejected connect");
+        }
+    }
+    for (uint32_t i = 0; i < shards_.size(); ++i) {
+        OpStatus st = OpStatus::Closed;
+        const auto w = cqs[i].waitFor(i, timeout,
+                                      [&](const Completion& c, std::span<const uint8_t>) { st = c.status; });
+        if (w != Completions::Wait::Done || st != OpStatus::Ok) {
+            throw std::runtime_error("ShardGroup::connectAll: shard " + std::to_string(i) +
+                                     " did not connect (status " + std::to_string(static_cast<int>(st)) + ")");
+        }
+    }
 }
 
 SendResult ShardGroup::trySend(TopicHandle topic, const Key& key,
@@ -6259,6 +6330,8 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 ### Task 16: Consume `MetadataResponse.ingressEndpoint` — produce straight to the owning worker
 
+**F8c API (2026-10-02, C9):** the tests below issue `Client::connect(cq, token)` and acked sends `Producer::trySend(..., cq, token)` / `trySend(..., AckToken{t})` + `onAck(fn, ctx)`, and poll the `Completions` while driving — no futures, no `std::function` acks, no atomics.
+
 Shared interface with the broker plan (FIXED): per-partition `ingressEndpoint` = "host:port" of the owning worker's ingress; EMPTY means "use the node endpoint". The session (Connect / session id / control) stays on the node endpoint; produce frames go to the worker on its `ingressStreamId`; worker ProduceResponses come from a different publication on the session egress stream (Tasks 9–11 match by batch id, never by publisher). When the endpoint moves (ownership move / leader change) the partition's in-flight batches are re-offered to the new worker at once — idempotent (same producer id + sequence), so a late ack from the old worker is ignored (Review Focus 5).
 
 **Files:**
@@ -6298,12 +6371,11 @@ Create `tests/client/IngressEndpointRoutingTest.cpp`:
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
-#include <future>
 #include <span>
 #include <string>
 #include <unistd.h>
@@ -6313,7 +6385,7 @@ namespace rc = rune::client;
 using namespace std::chrono_literals;
 
 namespace {
-std::atomic<int> g_ctr{0};
+int g_ctr = 0;  // test thread only
 int64_t frozenNow() noexcept { return 1'000'000'000'000LL; }
 const std::vector<uint8_t> kVal{7, 7, 7};
 // The clock is frozen: linger must be 0 or a batch would wait forever.
@@ -6337,7 +6409,7 @@ struct Rig {
         c.gatewayStreamId = in;
         c.egressChannel = "aeron:ipc";
         c.egressStreamId = eg;
-        c.dataDir = "/tmp/ingress_ep_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+        c.dataDir = "/tmp/ingress_ep_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
         c.runnerMode = rc::RunnerMode::Invoker;
         c.nanoClock = &frozenNow;
         rc::TopicSpec ts;
@@ -6356,11 +6428,46 @@ struct Rig {
         }
         return false;
     }
+    // F8c: completion tokens polled while driving (no future).  The frozen
+    // clock never expires an op, so the drive cap is the only bound.
+    rc::Completions cq{client};  // this (owner) thread's queue
+    rc::Token       nextToken = 1;
+    // Drive until `t` completes; returns its Completion (status Closed if the cap hit).
+    rc::Completion awaitToken(rc::Token t) {
+        rc::Completion got{};
+        got.status = rc::OpStatus::Closed;
+        bool done = false;
+        (void)drive([&] {
+            cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+                if (c.token == t) { done = true; got = c; }
+            });
+            return done;
+        });
+        return got;
+    }
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
-        auto f = client.connect();
-        ASSERT_TRUE(drive([&] { return f.wait_for(0s) == std::future_status::ready; }));
-        f.get();
+        const rc::Token t = nextToken++;
+        ASSERT_EQ(client.connect(cq, t), rc::OpResult::Accepted);
+        ASSERT_EQ(awaitToken(t).status, rc::OpStatus::Ok);
+    }
+    // One acked send into `cq`; returns its Completion.
+    rc::Completion sendAndAwait(rc::Producer& p) {
+        const rc::Token t = nextToken++;
+        EXPECT_EQ(p.trySend(client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), cq, t),
+                  rc::SendResult::Ok);
+        return awaitToken(t);
+    }
+};
+
+// onAck handler target (F8c: plain function pointer + context, duty thread).
+struct AckSeen {
+    int     fired  = 0;
+    int64_t offset = -2;
+    static void on(void* ctx, rc::Token, int64_t off, rc::OpStatus, uint16_t) noexcept {
+        auto* s = static_cast<AckSeen*>(ctx);
+        ++s->fired;
+        s->offset = off;
     }
 };
 } // namespace
@@ -6373,9 +6480,9 @@ TEST(IngressEndpointRouting, ProduceGoesToTheAdvertisedWorkerEndpoint) {
     ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 0).empty(); }));
     EXPECT_EQ(r.client.testDataChannelFor(1, 0), "aeron:udp?endpoint=127.0.0.1:24751");
     auto p = r.client.producer(noLinger());
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return fut.wait_for(0s) == std::future_status::ready; }));
-    EXPECT_EQ(fut.get(), 100) << "acked by the worker's own publication";
+    const rc::Completion c = r.sendAndAwait(p);
+    ASSERT_EQ(c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(c.value, 100) << "acked by the worker's own publication";
     ASSERT_EQ(r.gw.produced.size(), 1u);
     EXPECT_EQ(r.gw.produced[0].endpoint, w) << "produce must reach the worker, not the node";
     EXPECT_EQ(r.gw.produced[0].sessionId, r.gw.assignedSessionId) << "session id from the node Connect";
@@ -6387,8 +6494,7 @@ TEST(IngressEndpointRouting, EmptyEndpointKeepsNodeRouting) {
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
     auto p = r.client.producer(noLinger());
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return fut.wait_for(0s) == std::future_status::ready; }));
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
     ASSERT_EQ(r.gw.produced.size(), 1u);
     EXPECT_EQ(r.gw.produced[0].endpoint, 0);
     EXPECT_TRUE(r.client.testDataChannelFor(1, 0).empty());
@@ -6407,10 +6513,13 @@ TEST(IngressEndpointRouting, EndpointMoveReoffersInFlightBatchesRegression) {
     ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == "aeron:udp?endpoint=127.0.0.1:24761"; }));
     r.gw.holdPartitions = {0};
     auto p = r.client.producer(noLinger());
-    int fired = 0;
-    int64_t offset = -2;
-    p.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal),
-           [&](int64_t off) { ++fired; offset = off; });
+    AckSeen seen;
+    p.onAck(&AckSeen::on, &seen);  // setup phase: before the first AckToken send
+    ASSERT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal),
+                        rc::AckToken{1}),
+              rc::SendResult::Ok);
+    const int& fired = seen.fired;
+    const int64_t& offset = seen.offset;
     ASSERT_TRUE(r.drive([&] { return r.gw.held.size() == 1; }));
     ASSERT_EQ(r.gw.held[0].endpoint, wA);
 
@@ -7093,6 +7202,8 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 ### Task 18: `rune_produce_throughput` on invoker shards — open-loop `--rate`, full histogram, saturation mode, pinning
 
+**F8c API (2026-10-02, C9):** each shard thread connects with `ClientShard::connectAndWait` (Invoker owner pumps its own `doWork()`); the shard/main start barrier is a pair of one-record `OneToOneRingBuffer`s per shard (no atomics, no sleeps); batch acks come from `ClientShard::pollBatchAcks` (Task 15, `Completions`-backed).
+
 Spec §5: "`rune_produce_throughput` rewritten on client invoker mode: open-loop fixed rate (`--rate N`) …; every record recorded … p50/p99/p99.9/max; secondary saturation mode (max throughput, large window); every run verifies the box is idle first and reports core layout + per-thread CPU split; VM layout for the pass run: client shard pinned to core 0." Any command-line argument selects the new invoker bench; an env-only invocation keeps the legacy agent-mode path byte-for-byte (the VM scripts `rune_vm_bench.sh`, `bench/kafka-compare/run-rune.sh`, `e2e.sh` depend on it), so the default configuration stays measurable for A/B.
 
 **Files:**
@@ -7314,13 +7425,13 @@ Expected: PASS (3 tests).
 #include "SeqTimestampRing.h"
 
 #include <rune/client/detail/CpuAffinity.h>
+#include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/shard/ClientShard.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <future>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -7380,22 +7491,56 @@ struct ShardResult {
     std::string error;
 };
 
+// Start barrier with no atomics (F8 law: cross-thread state only through rings):
+// per shard, two one-record OneToOneRingBuffers — shard -> main "ready" (connected,
+// or failed), then main -> shard "start" carrying the common schedule origin.  The
+// ring's release/acquire on the record header is the only ordering needed.
+struct StartLink {
+    static constexpr std::size_t kBytes = 64 + rc::detail::OneToOneRingBuffer::trailerLength();
+    alignas(64) std::uint8_t readyBuf[kBytes] = {};
+    alignas(64) std::uint8_t startBuf[kBytes] = {};
+    rc::detail::OneToOneRingBuffer ready{readyBuf, kBytes};
+    rc::detail::OneToOneRingBuffer start{startBuf, kBytes};
+};
+constexpr std::int32_t kMsgReady = 1;
+constexpr std::int32_t kMsgStart = 2;
+
+void signalReady(StartLink& l) {
+    if (!l.ready.writeWith(kMsgReady, 0, [](aeron::concurrent::AtomicBuffer&, aeron::util::index_t) {})) {
+        std::abort();  // unreachable: one record into an empty 64-byte ring
+    }
+}
+bool tryReadReady(StartLink& l) {
+    return l.ready.read([](std::int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                           aeron::util::index_t) {}, 1) == 1;
+}
+void sendStart(StartLink& l, int64_t startNs) {
+    if (!l.start.writeWith(kMsgStart, static_cast<aeron::util::index_t>(sizeof(int64_t)),
+                           [&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off) {
+                               b.putInt64(off, startNs);
+                           })) {
+        std::abort();  // unreachable: one record into an empty 64-byte ring
+    }
+}
+int64_t tryReadStart(StartLink& l) {  // 0 = not yet
+    int64_t v = 0;
+    l.start.read([&](std::int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                     aeron::util::index_t) { v = b.getInt64(off); }, 1);
+    return v;
+}
+
 void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
-              const std::string& topicName, std::atomic<uint32_t>& ready,
-              std::atomic<int64_t>& startAt, ShardResult& out) {
+              const std::string& topicName, StartLink& link, ShardResult& out) {
     if (a.core >= 0 && !rc::detail::pinCurrentThreadToCore(a.core + static_cast<int>(index))) {
         std::fprintf(stderr, "WARN: could not pin shard %u to core %d\n", index, a.core + static_cast<int>(index));
     }
     out.core = rc::detail::currentCore();
+    bool signaled = false;
     try {
         rs::ClientShard shard(g, index);
-        auto connected = shard.connect();
-        const int64_t connectDeadline = monoNs() + 10'000'000'000LL;
-        while (connected.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-            shard.doWork();
-            if (monoNs() > connectDeadline) throw std::runtime_error("connect timed out");
-        }
-        connected.get();
+        // F8c: Invoker owner — connectAndWait pumps this shard's doWork() itself
+        // and throws on any non-Ok outcome or after 10 s.
+        shard.connectAndWait(std::chrono::seconds(10));
         const rc::TopicHandle topic = shard.topic(topicName);
         if (!topic.valid()) throw std::runtime_error("unknown topic " + topicName);
 
@@ -7411,9 +7556,10 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
         if (owned.empty()) throw std::runtime_error("shard owns no partition of " + topicName);
         const std::vector<uint8_t> value(static_cast<std::size_t>(a.valueBytes), uint8_t{0xAB});
 
-        ready.fetch_add(1, std::memory_order_release);
+        signalReady(link);
+        signaled = true;
         int64_t startNs = 0;
-        while ((startNs = startAt.load(std::memory_order_acquire)) == 0) shard.doWork();
+        while ((startNs = tryReadStart(link)) == 0) shard.doWork();
 
         const uint64_t shardRate = a.rate / a.shards + (index == 0 ? a.rate % a.shards : 0);
         const OpenLoopSchedule schedule(startNs, shardRate);
@@ -7447,7 +7593,9 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
                 SeqTimestampRing& ring = *sched[static_cast<std::size_t>(p)];
                 if (ring.full()) break;
                 const rc::SendResult r = shard.trySend(topic, keyOf[static_cast<std::size_t>(p)], value);
-                if (r == rc::SendResult::BackPressured) break;  // stays due: its latency keeps accruing
+                // Stays due (its latency keeps accruing).  QueueFull: the batch-ack
+                // queue is out of credit until pollBatchAcks() below drains it.
+                if (r == rc::SendResult::BackPressured || r == rc::SendResult::QueueFull) break;
                 if (r != rc::SendResult::Ok) {
                     throw std::runtime_error("trySend failed: SendResult=" + std::to_string(static_cast<int>(r)));
                 }
@@ -7468,7 +7616,7 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
     } catch (const std::exception& e) {
         out.ok = false;
         out.error = e.what();
-        ready.fetch_add(1, std::memory_order_release);  // never leave main waiting
+        if (!signaled) signalReady(link);  // never leave main waiting
     }
     out.cpuSeconds = readThreadSelfCpuSeconds();
 }
@@ -7529,19 +7677,27 @@ int invokerBenchMain(int argc, char** argv) {
     std::cout << "CORES online=" << std::thread::hardware_concurrency() << " affinity=" << cpuAffinityList()
               << " shards=" << a.shards << " first_core=" << a.core << "\n";
 
-    std::atomic<uint32_t> ready{0};
-    std::atomic<int64_t>  startAt{0};
+    const auto links = std::make_unique<StartLink[]>(a.shards);  // rings point into themselves: never moved
     std::vector<ShardResult> results(a.shards);
     std::vector<std::thread> threads;
     for (uint32_t i = 0; i < a.shards; ++i) {
         threads.emplace_back(runShard, std::cref(a), std::cref(g), i, g.base.topics[0].name,
-                             std::ref(ready), std::ref(startAt), std::ref(results[i]));
+                             std::ref(links[i]), std::ref(results[i]));
     }
-    const int64_t readyDeadline = monoNs() + 30'000'000'000LL;
-    while (ready.load(std::memory_order_acquire) < a.shards && monoNs() < readyDeadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));  // main thread only waits for startup
+    // Every shard reports exactly once (connected, or failed — connectAndWait is
+    // itself bounded), so this wait needs no deadline of its own.
+    std::vector<bool> isReady(a.shards, false);
+    for (uint32_t readyCount = 0; readyCount < a.shards;) {
+        for (uint32_t i = 0; i < a.shards; ++i) {
+            if (!isReady[i] && tryReadReady(links[i])) {
+                isReady[i] = true;
+                ++readyCount;
+            }
+        }
+        std::this_thread::yield();
     }
-    startAt.store(monoNs() + 100'000'000LL, std::memory_order_release);  // common schedule origin
+    const int64_t origin = monoNs() + 100'000'000LL;  // common schedule origin
+    for (uint32_t i = 0; i < a.shards; ++i) sendStart(links[i], origin);
     for (auto& t : threads) t.join();
     const double wallS =
         static_cast<double>(monoNs() - startAt.load(std::memory_order_acquire)) / 1e9;
