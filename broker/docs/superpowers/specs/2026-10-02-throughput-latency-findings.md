@@ -222,6 +222,20 @@ per hop × ~4 hops).
   (kill -9 all, hard crash with unflushed data: no acknowledged record lost). Details: broker SDD ledger DUR-1.
 
 
+- **LAT-1 (after throughput/p99 analysis): productionize the env-gated latency experiments.** Today they exist only as
+  uncommitted, env-gated patches in the VM build /root/frcap/rune-broker. Turn each into real code, default-derived
+  config, tests and an Opus review, then re-prove with ABAB on k3s-node-01:
+  (a) per-stream term sizing: 1 MiB terms on low-volume ack/egress/control publications (RUNE_AERON_CONTROL_TERM_BYTES;
+      removes 100+ ms rotation stalls) and evaluate 1 MiB as the global default (3-node 1 MiB >= 16 MiB, §4.2);
+  (b) early ack flush right after the ingress stage (RUNE_EARLY_ACK_FLUSH);
+  (c) end-of-pass driver send when the pass did work (RUNE_END_PASS_SEND);
+  (d) driver duty cap per pass = 1 (RUNE_DRIVER_DUTY_PER_PASS);
+  (e) worker fsync interval as config (RUNE_WORKER_SYNC_INTERVAL_MS; final semantics owned by DUR-1);
+  (f) io_uring io-wq affinity (IORING_REGISTER_IOWQ_AFF, RUNE_IOWQ_CORES) keeping io-wq off worker cores;
+  (g) backoff vs busy-spin worker idle (RUNE_SHARD_BACKOFF; no measured latency difference -> backoff frees cores).
+  Each item: RED-first test where it is a behavior change, *Regression* marker where it fixes a bug (rotation stall),
+  no allocation/virtual/std::function on the hot path, numbers in this doc.
+
 - F26 Aeron shm budget counts per driver, not per publication (SIGBUS mid-run) — partly addressed
   by `RUNE_AERON_TERM_SPARSE=false` (fails at creation instead).
 - F27 R1 dead-peer stall (fix round 2 in flight).
