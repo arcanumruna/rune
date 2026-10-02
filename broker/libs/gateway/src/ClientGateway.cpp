@@ -2058,12 +2058,15 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // truncation + re-promotion it can still cover truncated sequences.  An
     // exact window match points at a concrete offset, but a KNOWN-OLD duplicate
     // (baseOffset -1) would answer OK for every sequence <= lastSequence — so
-    // this path, whose PSM is not proven consistent with the log, refuses it
-    // OutOfOrderSequence (the pre-EOS-OOS behaviour).  The worker path (shard
-    // ingress + gateway-routed, every production user topic) rebuilds its PSM
-    // per partition before admitting produces and answers it OK.
+    // this path, whose PSM is not proven consistent with the log, cannot vouch
+    // for it either way.  It answers an outcome-UNKNOWN error (Internal) — never
+    // OutOfOrderSequence: the client's (Kafka's) OOS contract is "NOT appended",
+    // and an OOS for a stored batch makes it re-sequence and write the batch
+    // twice.  The worker path (shard ingress + gateway-routed, every production
+    // user topic) rebuilds its PSM per partition before admitting produces and
+    // answers it OK -1.  TODO(ticket): rebuild this path's PSM per partition too.
     if (outcome.isDuplicate && outcome.baseOffset < 0) [[unlikely]] {
-        sendResp(pc::ErrorCode::OutOfOrderSequence, partition, 0);
+        sendResp(pc::ErrorCode::Internal, partition, 0);
         return;
     }
     if (outcome.isDuplicate && !(acksAll && ownedReplica && committedMetadataReady_)) {

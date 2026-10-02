@@ -553,7 +553,7 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_LegacyProducerPassthrough)
 // level leadership change, so it refuses a KNOWN-OLD duplicate (older than the
 // window) with OutOfOrderSequence instead of answering OK with an unknown
 // offset; an in-window retransmit is still answered with its original offset.
-TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathRefusesKnownOldDuplicate)
+TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathKnownOldDuplicateIsOutcomeUnknown)
 {
     auto client = makeClient(kEgressBase + 5);
     auto connResp = doConnect(*client.ingressPub, *client.egressSub,
@@ -574,7 +574,12 @@ TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathRefusesKn
                           std::span<const uint8_t>(batches[0]), "KnownOld");
     auto old = recvProduceResponse(*client.egressSub, "KnownOldResponse");
     ASSERT_TRUE(old.has_value());
-    EXPECT_EQ(old->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence));
+    // The client's OOS contract (Kafka): OOS means "NOT appended" and makes the
+    // client re-sequence (re-stamp under a new epoch → a stored batch written
+    // twice).  This path cannot vouch for the sequence, so it answers an
+    // outcome-UNKNOWN error (Internal), never OOS and never OK -1.
+    EXPECT_NE(old->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence));
+    EXPECT_EQ(old->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal));
     sendIdempotentProduce(*client.ingressPub, sid, 601, kTopicId, kPartition0, 12, 0, n - 1,
                           std::span<const uint8_t>(batches[n - 1]), "InWindow");
     auto dup = recvProduceResponse(*client.egressSub, "InWindowResponse");
