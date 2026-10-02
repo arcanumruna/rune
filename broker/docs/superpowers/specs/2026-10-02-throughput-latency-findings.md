@@ -153,6 +153,25 @@ Experimental patches (env-gated, VM build /root/frcap only): RUNE_IOWQ_CORES, RU
 RUNE_SHARD_BACKOFF, RUNE_END_PASS_SEND, RUNE_EARLY_ACK_FLUSH, RUNE_DRIVER_DUTY_PER_PASS,
 RUNE_AERON_CONTROL_TERM_BYTES; rune-fr: bounded tape (RUNE_FR_TAPE_RECORDS_PER_THREAD), Aeron site mask.
 
+### 4.3 MTU 1408 vs 65504 (2026-10-03, k3s-node-01, interleaved ABAB n=5, clean box, logs off)
+
+3-node acks=all, 1 KiB, saturate, 1.5M records, linger 0, term 1 MiB / rcvWindow 256 KiB, ack/egress term 1 MiB,
+duty1+early+send, fsync off; broker RUNE_AERON_MTU and client --mtu set to the same value.  Build: /root/frcap
+(env-gated experiments; FR compiled in but OFF; VM Aeron = FR-hooked lib whose wrappers rdtscp unconditionally,
+~4-5% of a worker core — restore stock Aeron before final numbers).
+
+| mtu | rec/s (5 rounds) | median | p50 / p99 (saturation = queueing) | CPU busy |
+|---|---|---|---|---|
+| 1408  | 43,137 / 48,347 / 45,468 / 47,810 / 49,033 | **47,810** | ~86 ms / ~420 ms | all 4 cores ~98% |
+| 65504 | 167,271 / 154,628 / 171,834 / 166,445 / 166,930 | **166,930** | ~26 ms / ~115 ms | cpu0 ~98%, workers ~90% |
+
+All 10 runs errors=0.  65504 (loopback only) beats Kafka's 156k on this box; 1408 (the real-network MTU) is 3.5x
+slower: per-datagram kernel UDP cost (~45x more datagrams).  64 KiB MTU is not usable over real networks
+(IP fragmentation) -> fix = UDP GSO/GRO transport bindings (spec 2026-10-03-aeron-udp-gso-gro-design.md).
+Longer runs (1.5M vs 300k records) explain the higher 65504 numbers vs §4.2 (more steady state).
+Client saturation profile (same day): crc32c = 28% of client CPU from ~6.6 rebuilds per sent frame on back-pressure
+(LAT-1 h); clear_page from 64 KiB skb allocation ~7% of client CPU.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
