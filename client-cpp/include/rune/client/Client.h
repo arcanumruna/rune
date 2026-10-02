@@ -390,6 +390,15 @@ public:
     [[nodiscard]] std::string testDataChannelFor(int32_t topicId, int32_t partition) const {
         return agent_.dataChannelFor(topicId, partition);
     }
+    /// Task 16 fix round 1 test hooks (duty-cycle thread only).
+    [[nodiscard]] int  testMetadataResponses() const noexcept { return metadataResponses_; }
+    [[nodiscard]] bool testRouteParked(int32_t topicId, int32_t partition) const noexcept {
+        return producerHub_.routeParked(topicId, partition);
+    }
+    [[nodiscard]] bool testPublicationOpen(const std::string& channel, int32_t streamId) const noexcept {
+        return agent_.testPublicationOpen(channel, streamId);
+    }
+    [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
     /// Test hook (duty-cycle thread only): the cached advertised ingress stream (0 = none).
     [[nodiscard]] int32_t testIngressStreamIdFor(int32_t topicId, int32_t partition) const {
         return metadataCache_.ingressStreamIdFor(topicId, partition);
@@ -1191,6 +1200,11 @@ private:
     // tickMetadataRefresh() — fire an armed refresh if its backoff window has
     // elapsed and the session is Connected.  Called from sweepTimeouts().
     void tickMetadataRefresh() noexcept;
+    // Task 16 fix round 1: request metadata now (owner moved), rate-limited.
+    void requestMetadataNow_() noexcept;
+    static constexpr int64_t kUrgentMetadataMinGapNs = 100'000'000LL;  // 100 ms (duty clock)
+    int64_t lastUrgentMetadataNs_ = INT64_MIN;
+    int     metadataResponses_    = 0;  // MetadataResponses applied (test hook)
 
     // Task 1.3: produce routing moved to the agent's flush→sendFn boundary
     // (ClientAgent partition routing table + per-leader sessions).  The old

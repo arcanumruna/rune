@@ -212,10 +212,14 @@ public:
     /// per-leader sessionId).  Returns the total number of frames offered.
     int resendAllViaRoute(std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn);
 
-    /// Task 16: re-offer one partition's in-flight batches across all producers
-    /// through its (moved) route.  Cold path (metadata).  Returns # offered.
-    int resendPartitionViaRoute(int32_t topicId, int32_t partition,
-                                std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn);
+    /// Task 16: queue one partition's in-flight batches, across all producers, for
+    /// an in-order re-offer through its (moved) route by the next flush pass.
+    /// Cold path (metadata).  Returns # batches queued.
+    int resendPartitionViaRoute(int32_t topicId, int32_t partition) noexcept;
+    /// Task 16 (C1): the same for every NotLeader-parked partition (fresh metadata).
+    int resendRouteParked() noexcept;
+    /// Test/diagnostics: any producer holds (topicId, partition) route-parked.
+    [[nodiscard]] bool routeParked(int32_t topicId, int32_t partition) const noexcept;
 
     /// CB-5 B: true if any producer has an in-flight (unacked) batch.
     [[nodiscard]] bool hasInFlight() const noexcept;

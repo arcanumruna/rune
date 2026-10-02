@@ -1838,6 +1838,29 @@ bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t n
 }
 
 template <class Sink>
+bool ProducerImpl::resendRoute_(PartitionState& ps, int64_t nowNs, const Sink& sink) {
+    const int64_t attemptNs = cfg_.produceTimeoutMs * 1'000'000LL;
+    bool all = true;
+    ps.inflight.forEachLive([&](InFlightBatch& b) {
+        if (!all || !b.routeResendPending) return;
+        // A NEW attempt (same frame, same identity): the old owner's late
+        // answers to the earlier attempts are ignored from now on (EOS I-2).
+        if (!offerAttempt_(ps, b, nowNs, sink)) {
+            all = false;  // new publication resolving / back-pressure: keep order
+            return;
+        }
+        b.routeResendPending = false;
+        b.attemptDeadlineNs  = nowNs + attemptNs;
+        if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
+    });
+    if (all) {
+        ps.routeResend = false;
+        ps.routeParked = false;
+    }
+    return all;
+}
+
+template <class Sink>
 bool ProducerImpl::resendParked_(PartitionState& ps, int64_t nowNs, const Sink& sink) {
     const int64_t attemptNs = cfg_.produceTimeoutMs * 1'000'000LL;
     bool all  = true;
@@ -1907,6 +1930,21 @@ int ProducerImpl::flushBatches(
         // ---- EOS-OOS: parked batches whose older batches all resolved go out
         // again FIRST, oldest-first — a new batch sent ahead of them would only
         // meet the same sequence gap.  Back-pressure: nothing new this pass.
+        // ---- Task 16: a moved route re-offers the stored batches first, in
+        // order; a NotLeader-parked partition sends nothing new while stored
+        // batches are in flight (they would only meet the old owner again).
+        if (ps.routeResend) {
+            if (!resendRoute_(ps, nowNs, sink)) {
+                dirty_[keep++] = slot;
+                continue;
+            }
+        } else if (ps.routeParked) {
+            if (!ps.inflight.empty()) {
+                dirty_[keep++] = slot;
+                continue;
+            }
+            ps.routeParked = false;  // everything stored resolved: nothing to re-offer
+        }
         if (ps.resendParked && !resendParked_(ps, nowNs, sink)) {
             dirty_[keep++] = slot;
             continue;
@@ -2084,6 +2122,20 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         return;
     }
     if (batchcorr::attempt(correlationId) != b->attemptTag) return;  // A: a superseded attempt's error
+    if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader)) {
+        // Task 16 fix round 1 (C1): the partition moved (Kafka NOT_LEADER_OR_FOLLOWER
+        // parity): retriable — no completion, no epoch bump, the SAME identity.
+        // The partition parks (no new batches to the old owner); the owner
+        // (Client) asks for metadata at once and, when it names the new owner,
+        // every stored batch is re-offered unchanged as a new attempt
+        // (resendPartitionViaRoute / resendRouteParked) — the new owner dedups
+        // by (producerId, epoch, sequence).  Only the CURRENT attempt's NotLeader
+        // gets here (A): a superseded attempt's late NotLeader is ignored.  The
+        // attempt timer stays the backstop; the delivery timeout bounds it.
+        ps.routeParked = true;
+        markDirty_(ps);
+        return;
+    }
     if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence) &&
         b->baseSequence >= 0) {
         const bool olderLive = ps.inflight.anyOlderLive(*b, [&](const InFlightBatch& o) {
@@ -2453,7 +2505,8 @@ int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
                 failBatch_(ps, b, OpStatus::DeliveryFailed);  // no ProduceResponse in time
                 return;
             }
-            if (nowNs >= b.attemptDeadlineNs && offerAttempt_(ps, b, nowNs, sink)) {
+            if (nowNs >= b.attemptDeadlineNs && !b.routeResendPending &&
+                offerAttempt_(ps, b, nowNs, sink)) {
                 b.attemptDeadlineNs = nowNs + attemptNs;  // same frame, a new attempt: broker dedups
                 ++resent;
             }
@@ -2530,28 +2583,46 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     return resent;
 }
 
-int ProducerImpl::resendPartitionViaRoute(int32_t topicId, int32_t partition, SendFn& sendFn)
+void ProducerImpl::queueRouteResend_(PartitionState& ps) noexcept
+{
+    if (ps.inflight.empty()) {  // nothing stored: just stop holding new batches
+        ps.routeParked = false;
+        ps.routeResend = false;
+        return;
+    }
+    ps.inflight.forEachLive([&](InFlightBatch& b) {
+        if (ps.ingressStreamId != 0) b.ingressStreamId = ps.ingressStreamId;  // the new owner's stream
+        b.routeResendPending = true;
+    });
+    ps.routeResend = true;
+    markDirty_(ps);
+}
+
+int ProducerImpl::resendPartitionViaRoute(int32_t topicId, int32_t partition) noexcept
 {
     const uint32_t idx = partitionIndex_.find(partKey(topicId, partition));
     if (idx == detail::FlatIndexMap::kNone) return 0;
-    const DutyScope duty(*this);  // fix1 C1
     PartitionState& ps = *partitions_[idx];
-    int resent = 0;
-    ps.inflight.forEachLive([&](InFlightBatch& b) {
-        if (ps.ingressStreamId != 0) b.ingressStreamId = ps.ingressStreamId;  // the new worker's stream
-        b.lastSendNs = lastNowNs_;
-        unpark_(ps, b);
-        if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(), b.wireFrame.size())) {
-            ++resent;
-        } else {
-            // New publication still resolving / not yet connected: due now, so
-            // retransmitStalled() retries it every duty cycle until it goes out
-            // (its delivery deadline still runs from firstSendNs).
-            b.attemptDeadlineNs        = 0;
-            earliestAttemptDeadlineNs_ = 0;
-        }
-    });
-    return resent;
+    queueRouteResend_(ps);
+    return ps.routeResend ? static_cast<int>(ps.inflight.live()) : 0;
+}
+
+int ProducerImpl::resendRouteParked() noexcept
+{
+    int queued = 0;
+    for (auto& up : partitions_) {
+        PartitionState& ps = *up;
+        if (!ps.routeParked || ps.routeResend) continue;
+        queueRouteResend_(ps);
+        if (ps.routeResend) queued += static_cast<int>(ps.inflight.live());
+    }
+    return queued;
+}
+
+bool ProducerImpl::routeParked(int32_t topicId, int32_t partition) const noexcept
+{
+    const uint32_t idx = partitionIndex_.find(partKey(topicId, partition));
+    return idx != detail::FlatIndexMap::kNone && partitions_[idx]->routeParked;
 }
 
 int ProducerImpl::discardRing_(OpStatus st, int limit) {

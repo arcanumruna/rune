@@ -201,6 +201,15 @@ struct PartitionState {
     // flushBatches visit.
     uint32_t parkedCount  = 0;
     bool     resendParked = false;
+    // Task 16 fix round 1 (C1): the partition's owner answered NotLeader (retriable,
+    // Kafka NOT_LEADER_OR_FOLLOWER parity).  New batches are held (never sent to the
+    // old owner) while stored ones are in flight; the stored ones are re-offered,
+    // unchanged, once metadata names the new owner (routeResend).  Cleared when
+    // the re-offer completes or nothing is in flight any more.
+    bool     routeParked  = false;
+    // Every in-flight batch flagged routeResendPending is re-offered, oldest
+    // first, on the next flushBatches visit — before anything new.
+    bool     routeResend  = false;
 
     // RecordBatchBuilder (reused; reset after each flush).
     // Lazy-initialised on first append.
@@ -846,13 +855,20 @@ public:
     /// offer is not a redirect).  Returns the number of frames actually offered.
     int resendAllViaRoute(SendFn& sendFn);
 
-    /// Task 16: re-offer every in-flight batch of ONE partition through its (new)
-    /// route — used when metadata moves the partition's ingress endpoint (another
-    /// worker / back to the node).  Same frame, same batch id: the broker dedups by
-    /// (producerId, sequence) and a late ack from the old worker is ignored.  A
-    /// refused offer (new publication not yet connected) makes the batch due NOW,
-    /// so retransmitStalled() retries it every duty cycle.  Returns # offered.
-    int resendPartitionViaRoute(int32_t topicId, int32_t partition, SendFn& sendFn);
+    /// Task 16: queue every in-flight batch of ONE partition for a re-offer through
+    /// its (new) route — used when metadata moves the partition's ingress endpoint
+    /// (another worker / back to the node) or names a new owner after NotLeader.
+    /// Same frame, same batch id, same producer identity: the broker dedups by
+    /// (producerId, epoch, sequence); a late ack from the old owner is ignored.
+    /// The re-offer itself runs in the next flushBatches pass (same duty cycle),
+    /// oldest first, stopping at the first refused offer (order is kept; the rest
+    /// go on the next pass), before any new batch.  Returns # batches queued.
+    int resendPartitionViaRoute(int32_t topicId, int32_t partition) noexcept;
+    /// Task 16 (C1): resendPartitionViaRoute for every route-parked partition
+    /// (fresh metadata arrived after a NotLeader).  Returns # batches queued.
+    int resendRouteParked() noexcept;
+    /// Test/diagnostics: true while (topicId, partition) is route-parked.
+    [[nodiscard]] bool routeParked(int32_t topicId, int32_t partition) const noexcept;
 
     /// CB-5 B: true if there is at least one in-flight batch awaiting an ack
     /// (i.e. a redirect resend would have something to flush).
@@ -1098,6 +1114,11 @@ private:
     /// frames).  False on transport back-pressure (retried next pass).
     template <class Sink>
     bool resendParked_(PartitionState& ps, int64_t nowNs, const Sink& sink);
+    /// flushBatches: Task 16 route re-offer of `ps`'s flagged in-flight batches,
+    /// oldest first.  False on a refused offer (the rest wait for the next pass).
+    template <class Sink>
+    bool resendRoute_(PartitionState& ps, int64_t nowNs, const Sink& sink);
+    void queueRouteResend_(PartitionState& ps) noexcept;
 
     [[nodiscard]] bool canFlight_(const PartitionState& ps) const noexcept {
         return static_cast<int32_t>(ps.inflight.live()) < cfg_.maxInFlight && !ps.inflight.full();

@@ -200,6 +200,29 @@ public:
         resolveNow_ = nowNs != nullptr ? nowNs : &monoNs_;
     }
 
+    /// Task 16 fix round 1 (M4): close the publication of `h` when it is Ready (an
+    /// unreferenced route's old worker endpoint).  The slot stays (handles are
+    /// stable); a later publicationHandle()/offerOn() on it re-resolves.  A slot
+    /// still Resolving is left alone (resetting it would orphan its pending
+    /// driver registration).  Cold path, owner thread.
+    void releasePublication(PubHandle h) noexcept {
+        if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return;
+        PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
+        if (s.res.ready() != nullptr) s.res.reset();
+    }
+    /// The channel of `h` (nullptr for an unknown handle).  Cold path.
+    [[nodiscard]] const std::string* publicationChannel(PubHandle h) const noexcept {
+        if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return nullptr;
+        return &pubSlots_[static_cast<std::size_t>(h)].channel;
+    }
+    /// Test/diagnostics: a Ready publication exists for (channel, streamId).
+    [[nodiscard]] bool publicationOpen(const std::string& channel, int32_t streamId) const noexcept {
+        for (const PubSlot& s : pubSlots_) {
+            if (s.streamId == streamId && s.channel == channel && s.res.ready() != nullptr) return true;
+        }
+        return false;
+    }
+
     [[nodiscard]] bool publicationReady(PubHandle h) const noexcept {
         return h >= 0 && static_cast<std::size_t>(h) < pubSlots_.size() &&
                pubSlots_[static_cast<std::size_t>(h)].res.ready() != nullptr;

@@ -55,6 +55,7 @@ struct InvokerGateway {
         int32_t records;
         int32_t baseSequence;
         int     endpoint;  // index of the endpoint that received it (0 = node)
+        int16_t producerEpoch = -1;  // the frame's producer epoch (Task 16 fix round 1)
     };
     struct Endpoint {
         std::string channel;
@@ -78,6 +79,16 @@ struct InvokerGateway {
     int64_t     nextOffset = 100;
     bool        replyAcks = true;
     std::set<int32_t>     holdPartitions;  // partitions whose acks are held
+    // Task 16 fix round 1: a worker that no longer owns its partitions — every
+    // Produce arriving on these endpoints is answered ProduceResponse{NotLeader}
+    // (the broker's refuseNotOwned_ / moved-replica answer).
+    std::set<int>     notLeaderEndpoints;
+    int               notLeaderAnswers = 0;
+    // The next N Produce frames (any endpoint) are answered with a bare
+    // ErrorResponse{NotLeader, ""} / an ErrorResponse{Redirect, redirectTo}.
+    int               errorNotLeaderNext = 0;
+    int               redirectNext = 0;
+    std::string       redirectTo;
     std::vector<Produced> produced;
     std::vector<Produced> held;
     // Acks sent immediately BEFORE the next ConnectResponse, from the same
@@ -190,6 +201,19 @@ struct InvokerGateway {
     };
     std::vector<LogBatch> log;
     int oosAnswers = 0, windowDupAnswers = 0, oldDupAnswers = 0, fencedAnswers = 0;
+    /// Task 16 fix round 1 (the broker's moved-replica answer): every pending
+    /// (deferred acks=all / held) answer to a frame received on `endpoint` —
+    /// the frame IS appended — goes out NOW as `ec` (e.g. NotLeader).
+    void failPendingAt(int endpoint, int16_t ec) {
+        for (auto& pa : pendingAnswers_) {
+            if (pa.pr.endpoint != endpoint) continue;
+            pa.ec    = ec;
+            pa.off   = -1;
+            pa.held  = false;
+            pa.dueAt = 0;
+        }
+        flushAnswers_();
+    }
     /// The answers awaiting their pump (delayed / held), by Produce ordinal.
     [[nodiscard]] std::size_t pendingAnswers() const { return pendingAnswers_.size(); }
     /// Sends a held answer now (no-op when not held).
@@ -480,7 +504,7 @@ private:
         if (dropIf && dropIf(pv.partition, pv.producerEpoch, pv.baseSequence)) return;
         rune::protocol::RecordBatchReader r(pv.recordBatch.data(), pv.recordBatch.size());
         const Produced pr{pv.topicId, pv.partition, pv.sessionId, pv.correlationId,
-                          r.recordCount(), r.baseSequence(), endpoint};
+                          r.recordCount(), r.baseSequence(), endpoint, pv.producerEpoch};
         produced.push_back(pr);
         const bool answer = pv.correlationId != 0 && dropAnswer.count(ordinal) == 0;
         const bool acksAll = pv.acks == 1;
@@ -491,6 +515,11 @@ private:
         if (injected != 0) {  // rejected, not processed
             if (injected == static_cast<int16_t>(rp::ErrorCode::OutOfOrderSequence)) ++oosAnswers;
             if (answer) ackAt(pr, injected, 0);
+            return;
+        }
+        if (notLeaderEndpoints.count(endpoint) != 0) {  // refuseNotOwned_: not processed
+            ++notLeaderAnswers;
+            if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::NotLeader), -1);
             return;
         }
         auto append = [&]() -> int64_t {
@@ -615,8 +644,9 @@ private:
                 return;
             }
             rune::protocol::RecordBatchReader r(pv->recordBatch.data(), pv->recordBatch.size());
-            const Produced pr{pv->topicId, pv->partition, pv->sessionId, pv->correlationId,
-                              r.recordCount(), r.baseSequence(), endpoint};
+            Produced pr{pv->topicId, pv->partition, pv->sessionId, pv->correlationId,
+                        r.recordCount(), r.baseSequence(), endpoint};
+            pr.producerEpoch = pv->producerEpoch;
             produced.push_back(pr);
             if (keepValues) {
                 auto& vs = values[pv->partition];
@@ -625,6 +655,23 @@ private:
                 });
             }
             if (pv->correlationId == 0) return;  // acks=None
+            if (notLeaderEndpoints.count(endpoint) != 0) {
+                ++notLeaderAnswers;
+                ackAt(pr, static_cast<int16_t>(rp::ErrorCode::NotLeader), -1);
+                return;
+            }
+            if (errorNotLeaderNext > 0 || redirectNext > 0) {
+                const bool redirect = errorNotLeaderNext == 0;
+                (redirect ? redirectNext : errorNotLeaderNext) -= 1;
+                std::vector<uint8_t> out(256 + redirectTo.size());
+                const std::size_t n = rcc::encodeErrorResponse(
+                    out.data(), out.size(),
+                    static_cast<int16_t>(redirect ? rp::ErrorCode::Redirect : rp::ErrorCode::NotLeader),
+                    redirect ? std::string_view(redirectTo) : std::string_view(), pv->sessionId,
+                    pv->correlationId);
+                send(endpoint, out.data(), n);
+                return;
+            }
             if (!replyAcks || holdPartitions.count(pv->partition) != 0) {
                 held.push_back(pr);
                 return;

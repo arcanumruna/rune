@@ -1659,8 +1659,15 @@ void Client::syncSeedSession_() noexcept {
 int Client::routeBufferedAcks_() {
     const auto acks = agent_.produceAcks();
     const int n = static_cast<int>(acks.size());
-    for (const auto& a : acks) producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode);
+    bool notLeader = false;
+    for (const auto& a : acks) {
+        producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode);
+        notLeader |= a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+    }
     agent_.clearProduceAcks();
+    // Task 16 fix round 1 (C1): a ProduceResponse{NotLeader} parked its partition
+    // (retriable) — ask who owns it now (coalesced: once per poll).
+    if (notLeader) [[unlikely]] requestMetadataNow_();
     return n;
 }
 
@@ -1988,7 +1995,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         const int32_t curEpoch =
                             metadataCache_.epochFor(rTopicId, rPartition);
                         const int32_t newEpoch = (curEpoch >= 0) ? (curEpoch + 1) : 0;
-                        metadataCache_.updatePartitionLeader(
+                        metadataCache_.updatePartitionLeaderProvisional(  // M5
                             rTopicId, rPartition, newNodeId, newEpoch);
                         // IMPORTANT-2: we now KNOW which node the session is
                         // following — record it so proactive routing can avoid
@@ -1996,10 +2003,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         currentLeaderNode() = newNodeId;
                     }
                 }
-                // No-progress (unknown corrId / endpoint not in broker set):
-                // arm a background metadata refresh with exponential backoff so
-                // the authoritative map is reconciled without storming.
-                scheduleMetadataRefresh();
+                // Reconcile with the authoritative map NOW (M5): the provisional
+                // epoch above never blocks it (MetadataCache confirmedEpoch), so
+                // a spurious redirect does not strand the partition's worker route
+                // on the node relay — the answer restores it.  Rate-limited; falls
+                // back to the backoff refresh.
+                requestMetadataNow_();
             }
 
             // Task 1.4 (multi-node redirect convergence): when per-partition routing
@@ -2013,10 +2022,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // client converges from the stale bootstrap image to the elected leaders.
             if (havePart && rTopicId >= 0 && rPartition >= 0 &&
                 agent_.multiNodeRouting() && !newEndpoint.empty()) {
-                const std::string leaderChannel =
-                    (newEndpoint.rfind("aeron:", 0) == 0)
-                        ? newEndpoint
-                        : ("aeron:udp?endpoint=" + newEndpoint);
+                const std::string leaderChannel = toChannel(newEndpoint);  // N2
                 agent_.setRoute(rTopicId, rPartition, leaderChannel);
                 std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> mnSendFn =
                     [this](int32_t t, int32_t p, int32_t sid,
@@ -2036,10 +2042,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // "aeron:"), use it as-is (test / ipc scenarios).  Otherwise treat
             // it as host:port and build a UDP channel.  This allows both
             // production UDP redirects and in-process ipc test redirects.
-            const std::string newChannel =
-                (newEndpoint.rfind("aeron:", 0) == 0)
-                    ? newEndpoint
-                    : ("aeron:udp?endpoint=" + newEndpoint);
+            const std::string newChannel = toChannel(newEndpoint);  // N2
 
             // Retarget is noexcept; if it fails the old publication is kept.
             const bool retargeted = agent_.retarget(newChannel);
@@ -2138,9 +2141,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // Mark the affected partition (from our own in-flight request
             // context) for metadata refresh so the very next route reconciles the
             // new leader.  We do not know the new leaderNodeId (no endpoint in the
-            // frame), so we cannot update the cache in place — we arm a background
-            // MetadataRequest (exponential-backoff-gated) instead.
-            scheduleMetadataRefresh();
+            // frame), so we cannot update the cache in place — ask for metadata
+            // now (rate-limited; falls back to the backoff refresh).
+            requestMetadataNow_();
 
             // Re-enqueue the produce that hit the stale leader.  The stored wire
             // frame is resent on the SAME session (leadership is expected to have
@@ -2148,12 +2151,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // lands; the background refresh reroutes if it has genuinely moved).
             // retryRedirectedProduce() bumps the per-corrId redirect counter and,
             // on exhausting kMaxRedirects, fails the pending ack itself.
-            const auto snap = agent_.stateAndSessionId();
-            (void)snap;
+            // I1 (Task 16 fix round 1): through the partition's route — the
+            // same rules as every other resend (worker data channel / leader
+            // session, re-stamped session id, its stream) — never the seed's
+            // default publication.
             std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn =
-                [this](int32_t /*topicId*/, int32_t /*partition*/,
-                       int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                    return agent_.submitSend(fb, fl);
+                [this](int32_t t, int32_t pp, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.offerToPartition(t, pp, sid, fb, fl);
                 };
             producerHub_.retryRedirectedProduce(opt->correlationId, sendFn);
 
@@ -3441,15 +3445,6 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
 
     metadataCache_.updateFromResponse(brokers, partitions);
 
-    // E5.1: propagate per-worker ingressStreamIds to all registered producers.
-    // Called on the agent thread (single-writer) — ProducerImpl::updateIngressRoute
-    // is agent-thread-only, so no lock is needed.
-    for (const auto& p : partitions) {
-        if (p.ingressStreamId != 0) {
-            producerHub_.updateIngressRoute(p.topicId, p.partition, p.ingressStreamId);
-        }
-    }
-
     // Task 1.3: (re)build the agent-owned partition routing table IN PLACE.  For
     // each partition with a known leader + per-worker ingressStreamId, map the
     // stream id → the leader node's ingress endpoint channel.  setRoute() drops the
@@ -3461,16 +3456,37 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // Task 16 (shard-mode brokers, spec §3.3): a non-empty per-partition
     // ingressEndpoint routes Produce frames STRAIGHT to the owning worker's ingress
     // (no gateway -> runtime -> worker-ring relay); Connect / the session id stay
-    // on the node endpoint.  Empty keeps the legacy routing above.  A route whose
-    // data channel MOVES (another worker, or the endpoint withdrawn -> back to the
-    // node) re-offers the partition's in-flight batches at once (idempotent: same
-    // frame, same producer id + sequence; a late ack from the old worker is
-    // ignored).  A first install (node -> worker) re-offers nothing: batches
-    // already sent through the node's gateway are still relayed and acked there.
+    // on the node endpoint.  Empty keeps the legacy routing.
+    //
+    // Only entries the cache accepted (current epoch) change anything (M1, N1): a
+    // stale entry neither moves nor withdraws a route nor changes a stream.
+    //
+    // Re-offer rule (one rule, every branch — M2): the partition's in-flight
+    // batches are re-offered at once, unchanged (same frame, same producer
+    // identity; the broker dedups; a late ack from the old owner is ignored) when
+    //   (a) the produce channel LEAVES a worker endpoint (worker -> other worker,
+    //       or the endpoint withdrawn -> the node): the old worker no longer owns
+    //       the partition and will not answer them; or
+    //   (b) the partition is NotLeader-parked (C1): the old owner refused them.
+    // Otherwise (a first node -> worker install, or a legacy node route) nothing
+    // is re-offered: the batches already went to a node whose gateway relays them
+    // to the owner (shard brokers, spec §3.3) and are acked there by batch id.
+    // Trade-off: a direct batch N+1 can overtake a relayed batch N — idempotent
+    // producers pay one OutOfOrderSequence park round trip (healed by
+    // parkOutOfOrder_); non-idempotent ones may reorder across that one hand-over
+    // (Kafka max.in.flight>1 without idempotence) rather than duplicate.  Other
+    // resend mechanisms (Redirect retry; resendAllViaRoute when a session
+    // reaches Connected) keep their own rules.
     const bool mnDbg = (std::getenv("RUNE_MN_DEBUG") != nullptr);  // cold: once per metadata response
     int mnRoutes = 0;
-    std::vector<std::pair<int32_t, int32_t>> moved;  // partitions whose produce channel moved
+    std::vector<std::pair<int32_t, int32_t>> moved;  // partitions that left a worker endpoint
     for (const auto& p : partitions) {
+        const bool current = metadataCache_.epochFor(p.topicId, p.partition) == p.leaderEpoch;
+        if (!current) continue;  // stale (lower epoch than the cache): ignored entirely
+        // E5.1: propagate the per-worker ingressStreamId to the registered producers.
+        if (p.ingressStreamId != 0) {
+            producerHub_.updateIngressRoute(p.topicId, p.partition, p.ingressStreamId);
+        }
         const int32_t leaderNode = metadataCache_.leaderFor(p.topicId, p.partition);
         const std::string ep = (leaderNode == metadata::MetadataCache::kNoLeader)
                                    ? std::string() : metadataCache_.endpointFor(leaderNode);
@@ -3479,48 +3495,35 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
                          p.topicId, p.partition, p.ingressStreamId, leaderNode, ep.c_str(),
                          p.ingressEndpoint.c_str());
         }
-        // Only entries the cache accepted (not stale by epoch) may move a worker route.
-        const bool current = metadataCache_.epochFor(p.topicId, p.partition) == p.leaderEpoch;
         const std::string prevData    = agent_.dataChannelFor(p.topicId, p.partition);
         const std::string prevSession = agent_.routeEndpointFor(p.topicId, p.partition);
-        const bool        hadWorker   = !prevData.empty() && prevData != prevSession;
+        const bool hadWorker = !prevData.empty() && !agent::ClientAgent::sameEndpoint(prevData, prevSession);
+        std::string session, data;
         if (!p.ingressEndpoint.empty()) {
-            if (!current) continue;
-            const std::string session = ep.empty() ? currentLeaderChannel() : toChannel(ep);
-            const std::string data    = toChannel(p.ingressEndpoint);
-            if (agent_.setRoute(p.topicId, p.partition, session, data) && !prevData.empty() &&
-                prevData != data) {
-                moved.emplace_back(p.topicId, p.partition);
-            }
-            ++mnRoutes;
+            session = ep.empty() ? currentLeaderChannel() : toChannel(ep);
+            data    = toChannel(p.ingressEndpoint);
+        } else if (p.ingressStreamId != 0 && !ep.empty()) {
+            session = data = toChannel(ep);  // legacy Task-1.3 node route
+        } else if (hadWorker) {
+            session = data = prevSession;    // endpoint withdrawn, no node route: back to the node
+        } else {
             continue;
         }
-        // Legacy broker (empty ingressEndpoint): unchanged Task-1.3 routing.
-        if (p.ingressStreamId != 0 && leaderNode != metadata::MetadataCache::kNoLeader && !ep.empty()) {
-            const std::string node = toChannel(ep);
-            if (agent_.setRoute(p.topicId, p.partition, node, node) && hadWorker) {
-                moved.emplace_back(p.topicId, p.partition);
-            }
-            ++mnRoutes;
-            continue;
-        }
-        // The endpoint was withdrawn and no leader route replaces it: drop the
-        // worker data channel, keep the session (produce goes back to the node).
-        if (hadWorker && current &&
-            agent_.setRoute(p.topicId, p.partition, prevSession, prevSession)) {
+        if (agent_.setRoute(p.topicId, p.partition, session, data) && hadWorker &&
+            !agent::ClientAgent::sameEndpoint(prevData, data)) {
             moved.emplace_back(p.topicId, p.partition);
         }
+        ++mnRoutes;
     }
     if (mnDbg) std::fprintf(stderr, "[MNDBG route] built %d routes from %zu partitions (%zu moved)\n",
                             mnRoutes, partitions.size(), moved.size());
-    if (!moved.empty()) {
-        (void)routeBufferedAcks_();  // acks earlier in this poll first: never resend an acked batch
-        producer::ProducerImpl::SendFn sendFn =
-            [this](int32_t t, int32_t pp, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
-                return agent_.offerToPartition(t, pp, sid, fb, fl);
-            };
-        for (const auto& [t, pp] : moved) producerHub_.resendPartitionViaRoute(t, pp, sendFn);
-    }
+    // The re-offers run in this duty cycle's flush pass (in order, on the new
+    // route); acks that arrived earlier in this poll are applied first so an
+    // acked batch is never re-offered.
+    (void)routeBufferedAcks_();
+    for (const auto& [t, pp] : moved) producerHub_.resendPartitionViaRoute(t, pp);
+    producerHub_.resendRouteParked();  // (b): fresh metadata after a NotLeader
+    ++metadataResponses_;
 
     // read-rework I4: open a per-worker dynamic-MDC egress subscription for each
     // partition whose owner advertises one (per-worker egress active on the broker).
@@ -3655,6 +3658,22 @@ void Client::scheduleMetadataRefresh() noexcept {
 // MetadataRequest iff a refresh is armed, its backoff window has elapsed, and
 // the session is Connected.  After firing it disarms (max()) so we don't spam
 // until the next scheduleMetadataRefresh().
+// Task 16 fix round 1 (C1/I1/M5): an owner moved (NotLeader / Redirect) — ask for
+// metadata NOW rather than after the >= 100 ms refresh backoff; at most one such
+// request per kUrgentMetadataMinGapNs of the duty clock (a burst of NotLeaders —
+// one per in-flight batch — sends one), the rest fall back to the backoff refresh.
+void Client::requestMetadataNow_() noexcept {
+    const auto snap = agent_.stateAndSessionId();
+    const int64_t t = now();
+    const bool due = lastUrgentMetadataNs_ == INT64_MIN || t - lastUrgentMetadataNs_ >= kUrgentMetadataMinGapNs;
+    if (!due || snap.state != session::SessionState::Connected || snap.sessionId == 0) {
+        scheduleMetadataRefresh();
+        return;
+    }
+    lastUrgentMetadataNs_ = t;
+    sendMetadataRequest(snap.sessionId);
+}
+
 void Client::tickMetadataRefresh() noexcept {
     if (nextMetadataRefreshAt_ == std::chrono::steady_clock::time_point::max()) {
         return; // not armed

@@ -87,6 +87,9 @@ struct InFlightBatch {
     /// Not failed (Kafka parity): re-sent, unchanged, once every older batch has
     /// resolved (PartitionState::resendParked).
     bool     oosParked         = false;
+    /// Task 16: queued for an in-order re-offer on the partition's new route
+    /// (PartitionState::routeResend); the attempt timer leaves it to that pass.
+    bool     routeResendPending = false;
     std::vector<uint8_t> wireFrame;  ///< encoded Produce frame; capacity reused
 };
 
@@ -140,6 +143,7 @@ public:
     void release(InFlightBatch& b) noexcept {
         if (b.corrId == 0) return;
         b.corrId = 0;
+        b.routeResendPending = false;  // Task 16: never carried into the slot's next batch
         --live_;
         while (tail_ != head_ && slots_[tail_ & mask_].corrId == 0) ++tail_;
     }

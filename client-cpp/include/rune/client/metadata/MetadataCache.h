@@ -57,6 +57,11 @@ struct RoutingEntry {
     int32_t leaderNodeId   = -1;  // -1 = no known leader
     int32_t leaderEpoch    = -1;  // -1 = never seen
     int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
+    /// Task 16 fix round 1 (M5): the last epoch a MetadataResponse confirmed.  A
+    /// Redirect's provisional leaderEpoch (current+1) never raises it, so the
+    /// authoritative answer that follows is accepted even when its epoch did not
+    /// move (a spurious redirect) — the route is restored instead of stranded.
+    int32_t confirmedEpoch = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -96,7 +101,7 @@ public:
         for (const auto& p : partitions) {
             if (p.topicId < 0 || p.partition < 0) continue;
             applyPartitionUpdate(p.topicId, p.partition,
-                                 p.leaderId, p.leaderEpoch, p.ingressStreamId);
+                                 p.leaderId, p.leaderEpoch, p.ingressStreamId, /*authoritative=*/true);
         }
     }
 
@@ -110,13 +115,22 @@ public:
                                int32_t newLeaderId,
                                int32_t newLeaderEpoch) noexcept
     {
-        // Preserve existing ingressStreamId on zero-RTT leader update.
-        const int64_t key = makeKey(topicId, partition);
-        const auto it     = table_.find(key);
-        const int32_t existingStreamId =
-            (it != table_.end()) ? it->second.ingressStreamId : 0;
         applyPartitionUpdate(topicId, partition, newLeaderId, newLeaderEpoch,
-                             existingStreamId);
+                             existingStreamId_(topicId, partition), /*authoritative=*/true);
+    }
+
+    /// Task 16 fix round 1 (M5): a GUESSED leader (a Redirect frame carries only
+    /// an endpoint; the caller invents epoch current+1 so the staleness rule
+    /// accepts it).  Unlike updatePartitionLeader it never raises the confirmed
+    /// epoch, so the authoritative MetadataResponse that follows is applied even
+    /// when its epoch did not move (a spurious redirect).
+    void updatePartitionLeaderProvisional(int32_t topicId,
+                                          int32_t partition,
+                                          int32_t newLeaderId,
+                                          int32_t newLeaderEpoch) noexcept
+    {
+        applyPartitionUpdate(topicId, partition, newLeaderId, newLeaderEpoch,
+                             existingStreamId_(topicId, partition), /*authoritative=*/false);
     }
 
     /// Update (or add) a broker endpoint without touching partition state.
@@ -214,6 +228,11 @@ public:
     }
 
 private:
+    [[nodiscard]] int32_t existingStreamId_(int32_t topicId, int32_t partition) const noexcept {
+        const auto it = table_.find(makeKey(topicId, partition));
+        return it != table_.end() ? it->second.ingressStreamId : 0;
+    }
+
     // Encode (topicId, partition) → a single int64_t key.
     // topicId occupies the high 32 bits; partition the low 32 bits.
     static int64_t makeKey(int32_t topicId, int32_t partition) noexcept {
@@ -224,20 +243,24 @@ private:
     // Staleness-gated update for a single partition.
     void applyPartitionUpdate(int32_t topicId, int32_t partition,
                               int32_t newLeaderId, int32_t newEpoch,
-                              int32_t newIngressStreamId = 0) noexcept
+                              int32_t newIngressStreamId, bool authoritative) noexcept
     {
         const int64_t key = makeKey(topicId, partition);
         auto [it, inserted] = table_.emplace(key, RoutingEntry{});
         RoutingEntry& entry = it->second;
 
-        // §11 staleness rule: only accept if newEpoch >= lastSeen.
-        if (!inserted && newEpoch < entry.leaderEpoch) {
+        // §11 staleness rule: only accept if newEpoch >= lastSeen.  A MetadataResponse
+        // is compared with the last CONFIRMED epoch (a provisional redirect epoch
+        // must not make the authoritative answer look stale — M5).
+        const int32_t floor = authoritative ? entry.confirmedEpoch : entry.leaderEpoch;
+        if (!inserted && newEpoch < floor) {
             return;  // stale update — discard
         }
 
         entry.leaderNodeId    = newLeaderId;
         entry.leaderEpoch     = newEpoch;
         entry.ingressStreamId = newIngressStreamId;
+        if (authoritative) entry.confirmedEpoch = newEpoch;
     }
 
     // ---- Members -----

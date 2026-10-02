@@ -890,11 +890,11 @@ bool ClientAgent::offerControlTo(const std::string& channel,
 Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
     // Empty / seed endpoint → the seed session (single-node hot path, no scan cost
     // when there is only one session).
-    if (endpoint.empty() || endpoint == seedSession().endpoint) {
+    if (endpoint.empty() || sameEndpoint(endpoint, seedSession().endpoint)) {
         return seedSession();
     }
     for (auto& s : sessions_) {
-        if (s->endpoint == endpoint) return *s;
+        if (sameEndpoint(s->endpoint, endpoint)) return *s;  // M6: one session per node
     }
     // Lazily open a NEW session to this endpoint over the SHARED transport.  Its
     // SessionMachine gets its own IO adapter (offerTo(endpoint,...)) → its own
@@ -941,18 +941,65 @@ uint32_t ClientAgent::sessionIndexFor_(const std::string& endpoint) noexcept {
     return 0;  // unreachable: sessionForEndpoint always returns a member
 }
 
+namespace {
+// "aeron:udp?endpoint=host:port|..." -> "host:port"; a bare "host:port" as is;
+// any other channel (aeron:ipc, no endpoint param) as is.
+std::string_view endpointKey(std::string_view ch) noexcept {
+    if (ch.rfind("aeron:", 0) != 0) return ch;
+    const auto q = ch.find('?');
+    if (q == std::string_view::npos) return ch;
+    std::size_t pos = q + 1;
+    while (pos < ch.size()) {
+        std::size_t end = ch.find('|', pos);
+        if (end == std::string_view::npos) end = ch.size();
+        const std::string_view kv = ch.substr(pos, end - pos);
+        if (kv.rfind("endpoint=", 0) == 0) return kv.substr(9);
+        pos = end + 1;
+    }
+    return ch;
+}
+} // namespace
+
+bool ClientAgent::sameEndpoint(std::string_view a, std::string_view b) noexcept {
+    if (a == b) return true;
+    if (a.empty() || b.empty()) return false;
+    // Only UDP endpoints (an endpoint= value or a bare host:port) are compared by
+    // host:port; any other channel (aeron:ipc, aliases) is its own destination.
+    const std::string_view ka = endpointKey(a);
+    const std::string_view kb = endpointKey(b);
+    if (ka.rfind("aeron:", 0) == 0 || kb.rfind("aeron:", 0) == 0) return false;
+    return ka == kb;
+}
+
+void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept {
+    if (h == transport::AeronTransport::kNoPub) return;
+    for (const PartitionRoute& r : routes_) {
+        if (r.pub == h) return;  // still referenced by another route
+    }
+    // Never a session's own control publication or the default channel's: only a
+    // route-only (worker data) publication is closed.
+    const std::string* ch = transport_.publicationChannel(h);
+    if (ch == nullptr || *ch == cfg_.transport.ingressChannel) return;
+    for (const auto& s : sessions_) {
+        if (s->endpoint == *ch) return;
+    }
+    transport_.releasePublication(h);
+}
+
 bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
                            const std::string& dataChannel) noexcept {
     const int64_t  key  = routeKey(topicId, partition);
     const uint32_t idx  = routeIndex_.find(key);
     const std::string& seed = seedSession().endpoint;
-    const bool isDefault = (sessionEndpoint.empty() || sessionEndpoint == seed) &&
-                           (dataChannel.empty() || dataChannel == seed);
+    const bool isDefault = (sessionEndpoint.empty() || sameEndpoint(sessionEndpoint, seed)) &&
+                           (dataChannel.empty() || sameEndpoint(dataChannel, seed));
     if (isDefault) {
         if (idx == detail::FlatIndexMap::kNone) return false;
+        const auto oldPub = routes_[idx].pub;
         routeIndex_.erase(key);
         routes_[idx] = PartitionRoute{};
         freeRoutes_.push_back(idx);
+        releaseRoutePub_(oldPub);  // M4
         return true;
     }
     try {
@@ -960,7 +1007,9 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
         if (idx != detail::FlatIndexMap::kNone) {
             PartitionRoute& r = routes_[idx];
             if (r.sessionEndpoint == sessionEndpoint && r.dataChannel == data) return false;
+            const auto oldPub = r.pub;
             r = PartitionRoute{sessionEndpoint, data};
+            releaseRoutePub_(oldPub);  // M4: the old worker publication, once unreferenced
             return true;
         }
         uint32_t slot;

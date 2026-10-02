@@ -5,6 +5,8 @@
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
+#include <rune/client/agent/ClientAgent.h>
+#include <rune/client/producer/InFlightRing.h>
 
 #include <gtest/gtest.h>
 
@@ -32,19 +34,24 @@ struct Rig {
     rc::ClientConfig             c;
     rc::Client                   client;
     test_support::InvokerGateway gw;
-    Rig(int32_t in, int32_t eg)
-        : c(makeCfg(in, eg)),
+    // seed = the client's gateway channel; node = the channel the fake node listens on.
+    // realClock: UDP sessions (seed or per-node) need the SessionMachine's connect
+    // retry, which runs on the duty clock — a frozen clock would never retry the
+    // ConnectRequest offered before the UDP publication connected.
+    Rig(int32_t in, int32_t eg, const std::string& seed = "aeron:ipc", const std::string& node = "aeron:ipc",
+        bool realClock = false)
+        : c(makeCfg(in, eg, seed, realClock)),
           client(c),
-          gw(c.dataDir + "/aeron", "aeron:ipc", in, "aeron:ipc", eg) {}
-    static rc::ClientConfig makeCfg(int32_t in, int32_t eg) {
+          gw(c.dataDir + "/aeron", node, in, "aeron:ipc", eg) {}
+    static rc::ClientConfig makeCfg(int32_t in, int32_t eg, const std::string& seed, bool realClock) {
         rc::ClientConfig c;
-        c.gatewayChannel = "aeron:ipc";
+        c.gatewayChannel = seed;
         c.gatewayStreamId = in;
         c.egressChannel = "aeron:ipc";
         c.egressStreamId = eg;
         c.dataDir = "/tmp/ingress_ep_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
         c.runnerMode = rc::RunnerMode::Invoker;
-        c.nanoClock = &frozenNow;
+        c.nanoClock = realClock ? nullptr : &frozenNow;
         rc::TopicSpec ts;
         ts.name = "t";
         ts.topicId = 1;
@@ -161,7 +168,10 @@ TEST(IngressEndpointRouting, EndpointMoveReoffersInFlightBatchesRegression) {
     r.gw.sendMetadata(r.gw.assignedSessionId, /*correlationId=*/0);  // unsolicited refresh
     ASSERT_TRUE(r.drive([&] { return fired == 1; })) << "in-flight batch not re-offered to the new worker";
     EXPECT_EQ(r.gw.produced.back().endpoint, wB);
-    EXPECT_EQ(r.gw.produced.back().corrId, r.gw.held[0].corrId) << "same batch (idempotent re-offer)";
+    // The same batch as a new attempt (EOS I-2: only the attempt tag differs).
+    EXPECT_EQ(rune::client::producer::batchcorr::base(r.gw.produced.back().corrId),
+              rune::client::producer::batchcorr::base(r.gw.held[0].corrId))
+        << "same batch (idempotent re-offer)";
 
     r.gw.releaseHeld();  // the old worker acks late
     for (int i = 0; i < 20'000; ++i) {
@@ -199,7 +209,8 @@ TEST(IngressEndpointRouting, EndpointClearedFallsBackToNode) {
         << "worker route kept after the endpoint was withdrawn";
     ASSERT_TRUE(r.drive([&] { return fired == 1; })) << "in-flight batch not re-offered to the node";
     EXPECT_EQ(r.gw.produced.back().endpoint, 0);
-    EXPECT_EQ(r.gw.produced.back().corrId, r.gw.held[0].corrId);
+    EXPECT_EQ(rune::client::producer::batchcorr::base(r.gw.produced.back().corrId),
+              rune::client::producer::batchcorr::base(r.gw.held[0].corrId));
 
     const std::size_t before = r.gw.produced.size();
     ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
@@ -221,4 +232,306 @@ TEST(IngressEndpointRouting, ProducerCreatedAfterMetadataUsesAdvertisedStreamReg
     ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
     ASSERT_EQ(r.gw.produced.size(), 1u);
     EXPECT_EQ(r.gw.produced[0].endpoint, s) << "published on the default stream, not the advertised one";
+}
+
+// ===========================================================================
+// Task 16 fix round 1
+// ===========================================================================
+namespace {
+// Per-token completion log (onAck target).
+namespace batchcorr = rune::client::producer::batchcorr;
+struct AckLog {
+    std::vector<std::pair<rc::Token, rc::OpStatus>> seen;
+    std::vector<int64_t>                            offsets;  // value, parallel to seen
+    static void on(void* ctx, rc::Token t, int64_t v, rc::OpStatus st, uint16_t) noexcept {
+        static_cast<AckLog*>(ctx)->seen.emplace_back(t, st);
+        static_cast<AckLog*>(ctx)->offsets.push_back(v);
+    }
+    [[nodiscard]] int count(rc::Token t) const {
+        int n = 0;
+        for (const auto& [tok, st] : seen) n += tok == t;
+        return n;
+    }
+    [[nodiscard]] bool allOk() const {
+        for (const auto& [tok, st] : seen) if (st != rc::OpStatus::Ok) return false;
+        return true;
+    }
+};
+bool sendTok(Rig& r, rc::Producer& p, uint64_t t) {
+    return p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), rc::AckToken{t}) ==
+           rc::SendResult::Ok;
+}
+} // namespace
+
+// C1 (Critical): the partition moves while acks=all batches are in flight at the
+// old owner A; A answers ProduceResponse{NotLeader} (retriable — the broker's
+// refuseNotOwned_ / moved-replica answer).  The NotLeader ALONE must trigger the
+// metadata refresh (no unsolicited MetadataResponse); every stored batch is
+// re-offered unchanged to the new owner B; every record completes Ok exactly
+// once and the producer epoch never moves.
+TEST(IngressEndpointRouting, OldOwnerNotLeaderReoffersToNewOwnerRegression) {
+    Rig r(3910, 3911);
+    const int wA = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24781", 3910);
+    const int wB = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24782", 3910);
+    r.gw.partitions = {{1, 0, 0, 1, 3910, "127.0.0.1:24781"}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == "aeron:udp?endpoint=127.0.0.1:24781"; }));
+    rc::ProducerConfig pc = noLinger();
+    pc.acks = rc::Acks::All;
+    auto p = r.client.producer(pc);
+    AckLog log;
+    p.onAck(&AckLog::on, &log);
+    r.gw.holdPartitions = {0};  // three batches in flight at A, unanswered
+    for (uint64_t t = 1; t <= 3; ++t) {
+        ASSERT_TRUE(sendTok(r, p, t));
+        ASSERT_TRUE(r.drive([&] { return r.gw.held.size() == t; }));
+    }
+    for (const auto& h : r.gw.held) ASSERT_EQ(h.endpoint, wA);
+    const std::vector<test_support::InvokerGateway::Produced> atA = r.gw.held;
+
+    // Ownership moves to B: A refuses (NotLeader); the cluster map now names B.
+    r.gw.partitions = {{1, 0, 0, 2, 3910, "127.0.0.1:24782"}};
+    r.gw.holdPartitions.clear();
+    r.gw.held.clear();
+    const int mdBefore = r.gw.metadataRequests;
+    for (const auto& h : atA) r.gw.ackAt(h, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), -1);
+
+    ASSERT_TRUE(r.drive([&] { return log.seen.size() == 3; })) << "stored batches not re-offered to B";
+    EXPECT_GT(r.gw.metadataRequests, mdBefore) << "NotLeader did not request metadata";
+    EXPECT_TRUE(log.allOk()) << "a NotLeader batch completed with an error";
+    for (rc::Token t = 1; t <= 3; ++t) EXPECT_EQ(log.count(t), 1) << "token " << t;
+    // Re-offered to B unchanged, in order, under the original epoch.
+    std::vector<test_support::InvokerGateway::Produced> atB;
+    for (const auto& pr : r.gw.produced) if (pr.endpoint == wB) atB.push_back(pr);
+    ASSERT_EQ(atB.size(), 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        // The same batch (a NEW attempt: only the attempt tag differs — EOS I-2).
+        EXPECT_EQ(batchcorr::base(atB[i].corrId), batchcorr::base(atA[i].corrId)) << i;
+        EXPECT_NE(batchcorr::attempt(atB[i].corrId), batchcorr::attempt(atA[i].corrId)) << i;
+        EXPECT_EQ(atB[i].baseSequence, atA[i].baseSequence) << i;
+        EXPECT_EQ(atB[i].producerEpoch, atA[i].producerEpoch) << i;
+    }
+    // Nothing left parked; a new batch goes to B under the same epoch (no bump).
+    EXPECT_FALSE(r.client.testRouteParked(1, 0));
+    ASSERT_TRUE(sendTok(r, p, 4));
+    ASSERT_TRUE(r.drive([&] { return log.count(4) == 1; }));
+    EXPECT_EQ(r.gw.produced.back().endpoint, wB);
+    EXPECT_EQ(r.gw.produced.back().producerEpoch, atA[0].producerEpoch) << "epoch bumped";
+    EXPECT_TRUE(log.allOk());
+}
+
+// C1 + EOS composition, against the gateway's broker idempotence model (shared
+// partition state = the moved log keeps its producer state): acks=all batches
+// 1..3 are APPENDED at the old owner A with their OKs deferred (HW not reached);
+// batch 4 reaches A after the move and is refused (not appended).  A answers
+// NotLeader for all four (refuseNotOwned_ + the moved-replica waiters).  The
+// client must re-offer the SAME identities to B, where 1..3 are duplicates
+// (OK with their original offsets) and 4 is new.  Every record completes Ok
+// exactly once, the log holds each batch once, no OutOfOrderSequence /
+// fencing answer is produced and the producer epoch never moves.
+TEST(IngressEndpointRouting, PartitionMoveWithAcksAllInFlightCompletesEachRecordOnceRegression) {
+    namespace rp = rune::protocol::client;
+    Rig r(3924, 3925);
+    r.gw.idempotence  = true;
+    r.gw.okDelayPumps = 1 << 30;  // acks=all OKs deferred (until the move turns them into NotLeader)
+    const int wA = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24792", 3924);
+    const int wB = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24793", 3924);
+    r.gw.partitions = {{1, 0, 0, 1, 3924, "127.0.0.1:24792"}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == "aeron:udp?endpoint=127.0.0.1:24792"; }));
+    rc::ProducerConfig pc = noLinger();
+    pc.acks = rc::Acks::All;
+    auto p = r.client.producer(pc);
+    AckLog log;
+    p.onAck(&AckLog::on, &log);
+    for (uint64_t t = 1; t <= 3; ++t) {
+        ASSERT_TRUE(sendTok(r, p, t));
+        ASSERT_TRUE(r.drive([&] { return r.gw.log.size() == t; }));
+    }
+    ASSERT_EQ(r.gw.pendingAnswers(), 3u) << "acks=all OKs deferred at A";
+    std::vector<int64_t> origOffsets;
+    for (const auto& lb : r.gw.log) origOffsets.push_back(lb.baseOffset);
+    const int16_t epoch0 = r.gw.produced.front().producerEpoch;
+
+    // Ownership moves to B.  A refuses what it no longer owns.
+    r.gw.partitions         = {{1, 0, 0, 2, 3924, "127.0.0.1:24793"}};
+    r.gw.notLeaderEndpoints = {wA};
+    ASSERT_TRUE(sendTok(r, p, 4));
+    ASSERT_TRUE(r.drive([&] { return r.gw.notLeaderAnswers == 1; })) << "batch 4 never reached A";
+    r.gw.okDelayPumps = 0;
+    r.gw.failPendingAt(wA, static_cast<int16_t>(rp::ErrorCode::NotLeader));  // moved-replica waiters
+
+    ASSERT_TRUE(r.drive([&] { return log.seen.size() == 4; })) << "stored batches not re-offered to B";
+    for (int i = 0; i < 2'000; ++i) {  // nothing more may complete or be sent anywhere
+        r.client.doWork();
+        r.gw.pump();
+    }
+    ASSERT_EQ(log.seen.size(), 4u) << "a record completed twice";
+    EXPECT_TRUE(log.allOk()) << "a record failed across the move";
+    for (rc::Token t = 1; t <= 4; ++t) EXPECT_EQ(log.count(t), 1) << "token " << t;
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (log.seen[i].first <= 3) {
+            EXPECT_EQ(log.offsets[i], origOffsets[static_cast<std::size_t>(log.seen[i].first - 1)])
+                << "a stored batch must report its original offset (window duplicate at B)";
+        }
+    }
+    ASSERT_EQ(r.gw.log.size(), 4u) << "a batch was written twice";
+    EXPECT_EQ(r.gw.windowDupAnswers, 3) << "B must see 1..3 as duplicates of the same identity";
+    EXPECT_EQ(r.gw.oosAnswers, 0);
+    EXPECT_EQ(r.gw.fencedAnswers, 0);
+    int atB = 0;
+    for (const auto& pr : r.gw.produced) {
+        EXPECT_EQ(pr.producerEpoch, epoch0) << "epoch bumped";
+        atB += pr.endpoint == wB;
+    }
+    EXPECT_EQ(atB, 4) << "each stored frame re-offered to B exactly once";
+    EXPECT_FALSE(r.client.testRouteParked(1, 0));
+}
+
+// I1: the bare ErrorResponse{NotLeader} retry goes through the partition's route
+// (the worker data channel), never the seed's default publication.
+TEST(IngressEndpointRouting, BareNotLeaderRetryFollowsThePartitionRouteRegression) {
+    Rig r(3912, 3913);
+    const int w = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24783", 3912);
+    r.gw.partitions = {{1, 0, 0, 1, 3912, "127.0.0.1:24783"}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 0).empty(); }));
+    auto p = r.client.producer(noLinger());
+    r.gw.errorNotLeaderNext = 1;
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.size(), 2u) << "the NotLeader'd frame was not retried";
+    for (const auto& pr : r.gw.produced) EXPECT_EQ(pr.endpoint, w) << "a retry left the partition route";
+}
+
+// M1: a stale (lower-epoch) entry with no ingressEndpoint — a lagging / legacy
+// node — must not tear down the live worker route.
+TEST(IngressEndpointRouting, StaleMetadataLeavesTheWorkerRouteRegression) {
+    Rig r(3914, 3915);
+    r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24784", 3914);
+    r.gw.partitions = {{1, 0, 0, 2, 3914, "127.0.0.1:24784"}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 0).empty(); }));
+    const int seen = r.client.testMetadataResponses();
+    r.gw.brokerHost = "127.0.0.1";  // a node route the legacy branch could build
+    r.gw.brokerPort = 24785;
+    r.gw.partitions = {{1, 0, 0, 1, 3914, ""}};  // epoch 1 < 2: stale
+    r.gw.sendMetadata(r.gw.assignedSessionId, 0);
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > seen; }));
+    EXPECT_EQ(r.client.testDataChannelFor(1, 0), "aeron:udp?endpoint=127.0.0.1:24784");
+}
+
+// M2 (departure 1 pinned): a batch already sent to the node is NOT re-offered
+// when the first worker route installs — the node's gateway relays it and its
+// ack arrives there: exactly one frame, exactly one completion.
+TEST(IngressEndpointRouting, FirstWorkerInstallDoesNotReofferNodeBatches) {
+    Rig r(3916, 3917);
+    const int w = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24786", 3916);
+    r.gw.partitions = {{1, 0, 0, 1, 3916, ""}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    auto p = r.client.producer(noLinger());
+    AckLog log;
+    p.onAck(&AckLog::on, &log);
+    r.gw.holdPartitions = {0};
+    ASSERT_TRUE(sendTok(r, p, 1));
+    ASSERT_TRUE(r.drive([&] { return r.gw.held.size() == 1; }));
+    ASSERT_EQ(r.gw.held[0].endpoint, 0);
+
+    r.gw.partitions = {{1, 0, 0, 1, 3916, "127.0.0.1:24786"}};
+    r.gw.sendMetadata(r.gw.assignedSessionId, 0);
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 0).empty(); }));
+    for (int i = 0; i < 2'000; ++i) {
+        r.client.doWork();
+        r.gw.pump();
+    }
+    EXPECT_EQ(r.gw.produced.size(), 1u) << "node batch re-offered on the first worker install";
+    r.gw.holdPartitions.clear();
+    r.gw.releaseHeld();
+    ASSERT_TRUE(r.drive([&] { return log.seen.size() == 1; }));
+    EXPECT_EQ(log.count(1), 1);
+    EXPECT_TRUE(log.allOk());
+    // New batches go straight to the worker.
+    ASSERT_TRUE(sendTok(r, p, 2));
+    ASSERT_TRUE(r.drive([&] { return log.count(2) == 1; }));
+    EXPECT_EQ(r.gw.produced.back().endpoint, w);
+    EXPECT_EQ(r.gw.produced.size(), 2u);
+}
+
+// M4: once no route references the old worker endpoint, its publication closes.
+TEST(IngressEndpointRouting, RouteMoveClosesTheOldWorkerPublicationRegression) {
+    Rig r(3918, 3919);
+    const std::string chA = "aeron:udp?endpoint=127.0.0.1:24787";
+    r.gw.addEndpoint(chA, 3918);
+    const int wB = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24788", 3918);
+    r.gw.partitions = {{1, 0, 0, 1, 3918, "127.0.0.1:24787"}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 0).empty(); }));
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    EXPECT_TRUE(r.client.testPublicationOpen(chA, 3918));
+
+    r.gw.partitions = {{1, 0, 0, 2, 3918, "127.0.0.1:24788"}};
+    r.gw.sendMetadata(r.gw.assignedSessionId, 0);
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == "aeron:udp?endpoint=127.0.0.1:24788"; }));
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    EXPECT_EQ(r.gw.produced.back().endpoint, wB);
+    EXPECT_FALSE(r.client.testPublicationOpen(chA, 3918)) << "old worker publication leaked";
+}
+
+// M5: a spurious Redirect (same leader) resets the partition onto the node route
+// and bumps the cache epoch provisionally; the metadata it requests at once must
+// restore the worker route (the provisional epoch never blocks the answer).
+TEST(IngressEndpointRouting, SpuriousRedirectRestoresTheWorkerRouteRegression) {
+    Rig r(3920, 3921, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    const std::string node = "aeron:udp?endpoint=127.0.0.1:24789";
+    const int n = r.gw.addEndpoint(node, 3920);
+    const int w = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24790", 3920);
+    r.gw.brokerHost = "127.0.0.1";
+    r.gw.brokerPort = 24789;
+    r.gw.partitions = {{1, 0, 0, 1, 3920, "127.0.0.1:24790"}};
+    r.connect();
+    const std::string worker = "aeron:udp?endpoint=127.0.0.1:24790";
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == worker; }));
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, w);
+
+    r.gw.redirectNext = 1;
+    r.gw.redirectTo   = node;  // the same leader node: a spurious redirect
+    const int mdBefore = r.gw.metadataRequests;
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    EXPECT_GT(r.gw.metadataRequests, mdBefore) << "a Redirect did not refresh metadata";
+    bool viaNode = false;
+    for (const auto& pr : r.gw.produced) viaNode |= pr.endpoint == n;
+    EXPECT_TRUE(viaNode) << "the redirected batch was not retried on the node";
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == worker; }))
+        << "worker route stranded on the node after a spurious redirect";
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    EXPECT_EQ(r.gw.produced.back().endpoint, w);
+}
+
+// M6: the node endpoint advertised in metadata names the seed with different URI
+// params — the same destination: no route, no second Session.
+TEST(IngressEndpointRouting, NodeEndpointWithOtherUriParamsIsTheSeedRegression) {
+    EXPECT_TRUE(rune::client::agent::ClientAgent::sameEndpoint("aeron:udp?endpoint=10.0.0.1:40500|mtu=8192",
+                                                               "aeron:udp?endpoint=10.0.0.1:40500"));
+    EXPECT_TRUE(rune::client::agent::ClientAgent::sameEndpoint("aeron:udp?term-length=65536|endpoint=10.0.0.1:40500",
+                                                               "10.0.0.1:40500"));
+    EXPECT_FALSE(rune::client::agent::ClientAgent::sameEndpoint("aeron:udp?endpoint=10.0.0.1:40500",
+                                                                "aeron:udp?endpoint=10.0.0.1:40501"));
+    EXPECT_FALSE(rune::client::agent::ClientAgent::sameEndpoint("aeron:ipc", "aeron:udp?endpoint=10.0.0.1:40500"));
+    EXPECT_TRUE(rune::client::agent::ClientAgent::sameEndpoint("aeron:ipc", "aeron:ipc"));
+    EXPECT_FALSE(rune::client::agent::ClientAgent::sameEndpoint("aeron:ipc?alias=a", "aeron:ipc?alias=b"));
+
+    Rig r(3922, 3923, "aeron:udp?endpoint=127.0.0.1:24791|mtu=1408", "aeron:udp?endpoint=127.0.0.1:24791",
+          /*realClock=*/true);
+    r.gw.brokerHost = "127.0.0.1";
+    r.gw.brokerPort = 24791;
+    r.gw.partitions = {{1, 0, 0, 1, 3922, ""}};  // legacy node route == the seed
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0; }));
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    EXPECT_TRUE(r.client.testDataChannelFor(1, 0).empty()) << "a route to the seed itself";
+    EXPECT_EQ(r.client.testSessionCount(), 1u) << "a second Session to the seed node";
 }

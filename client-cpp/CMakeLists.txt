@@ -1044,6 +1044,7 @@ if(BUILD_TESTING)
             tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/client/IngressEndpointRoutingTest.cpp
+            tests/producer/ProducerRouteParkTest.cpp
             tests/shard/ShardConfigTest.cpp
             tests/shard/ClientShardTest.cpp
             tests/shard/ShardGroupTest.cpp

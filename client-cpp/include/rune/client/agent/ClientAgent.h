@@ -44,6 +44,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -389,6 +390,16 @@ public:
 
     /// Task 1.3: number of currently open sessions (test/observer helper).
     [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
+
+    /// Task 16 fix round 1 (M6): two endpoint strings name the same destination —
+    /// equal, or both Aeron channels whose `endpoint=host:port` values match
+    /// (other URI params ignored), or a bare "host:port" equal to the other's
+    /// endpoint value.  Hostnames are not resolved.  Cold path.
+    [[nodiscard]] static bool sameEndpoint(std::string_view a, std::string_view b) noexcept;
+    /// Test hook: a Ready ingress publication exists for (channel, streamId).
+    [[nodiscard]] bool testPublicationOpen(const std::string& channel, int32_t streamId) const noexcept {
+        return transport_.publicationOpen(channel, streamId);
+    }
 
     [[nodiscard]] std::string routeEndpointFor(int32_t topicId, int32_t partition) const noexcept;
     [[nodiscard]] std::string dataChannelFor(int32_t topicId, int32_t partition) const noexcept;
@@ -758,6 +769,7 @@ private:
     bool                        forwardProduceResponses_ = true;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
     uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
+    void releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept;  // M4
 
     // Pack (topicId, partition) into the routing-table key.  partition is masked to
     // its unsigned 32-bit value so negative partitions (never valid) can't alias.

@@ -136,16 +136,32 @@ int ProducerHub::resendAllViaRoute(
     return resent;
 }
 
-int ProducerHub::resendPartitionViaRoute(
-    int32_t topicId, int32_t partition,
-    std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn)
+int ProducerHub::resendPartitionViaRoute(int32_t topicId, int32_t partition) noexcept
 {
-    int resent = 0;
+    int queued = 0;
     for (ProducerImpl* impl : active_) {
         if (impl == nullptr) continue;
-        resent += impl->resendPartitionViaRoute(topicId, partition, sendFn);
+        queued += impl->resendPartitionViaRoute(topicId, partition);
     }
-    return resent;
+    return queued;
+}
+
+int ProducerHub::resendRouteParked() noexcept
+{
+    int queued = 0;
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
+        queued += impl->resendRouteParked();
+    }
+    return queued;
+}
+
+bool ProducerHub::routeParked(int32_t topicId, int32_t partition) const noexcept
+{
+    for (const ProducerImpl* impl : active_) {
+        if (impl != nullptr && impl->routeParked(topicId, partition)) return true;
+    }
+    return false;
 }
 
 bool ProducerHub::hasInFlight() const noexcept {
