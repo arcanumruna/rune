@@ -129,7 +129,7 @@ void BM_ShardPassRuntimePlacement(benchmark::State& state) {
     const int64_t sid = c.connect(gateway, kClientStream);
     if (sid <= 0) { state.SkipWithError("connect failed"); return; }
     const auto batch = makeBatch(1);
-    if (!c.produceUntilOk(ingress, kIngressStream, sid, 0, 0, 1, batch)) {
+    if (!c.produceUntilOk(ingress, kClientStream, sid, 0, 0, 1, batch)) {
         state.SkipWithError("warm-up produce failed"); return;
     }
 
@@ -142,7 +142,7 @@ void BM_ShardPassRuntimePlacement(benchmark::State& state) {
     for (auto _ : state) {
         if (load) {
             const int64_t k = ++corr;
-            if (!c.produce(ingress, kIngressStream, sid, k, 0, part, 1, batch) || !c.awaitProduceResponse(k)) {
+            if (!c.produce(ingress, kClientStream, sid, k, 0, part, 1, batch) || !c.awaitProduceResponse(k)) {
                 state.SkipWithError("produce lost"); break;
             }
             part = (part + 1) % kPartitions;

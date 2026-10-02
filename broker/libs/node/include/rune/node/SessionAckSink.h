@@ -154,8 +154,11 @@ public:
     int flush(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
         ++pass_;
         int work = unresolvedCount_ ? resolvePending_() : 0;
+        if (drainCount_) [[unlikely]] work += drainRegistrations_();
+        heldNowCount_ = 0;
         if (ackCount_ == 0) [[likely]] {
             heldAfterFlush_ = 0;
+            if (heldPrevCount_) [[unlikely]] noteHoldEdges_();
             return work;
         }
         std::size_t keep = 0;
@@ -190,11 +193,15 @@ public:
                 ++dropped_;                                          // reported → the runtime closes it
                 continue;
             }
-            heldPass_[idx] = pass_;                                  // Announced / Resolving / blocked
+            if (heldPass_[idx] != pass_) {                           // first held ack of this session
+                heldPass_[idx] = pass_;
+                heldNow_[heldNowCount_++] = a.sessionId;
+            }
             acks_[keep++] = a;
         }
         ackCount_ = keep;
         heldAfterFlush_ = keep;
+        if (heldPrevCount_ | heldNowCount_) [[unlikely]] noteHoldEdges_();
         return work;
     }
 
@@ -228,6 +235,35 @@ public:
         return n;
     }
 
+    /// Fix round 2 (finding 1): report every session whose held state changed
+    /// since the runtime last heard: `tryReport(sessionId, held)` returns false
+    /// when it cannot deliver now (return ring full) — retried next pass, never
+    /// lost.  One edge per transition (no repeats while the state is stable).
+    /// A closed session needs no report: the runtime's close clears its state.
+    template <class TryReport>
+    int reportHoldChanges(TryReport&& tryReport) noexcept {
+        if (dirtyCount_ == 0) [[likely]] return 0;
+        int n = 0;
+        std::size_t keep = 0, k = 0;
+        for (; k < dirtyCount_; ++k) {
+            const int64_t sid = dirty_[k];
+            const std::size_t idx = find_(sid);
+            if (idx == kNone) continue;                              // closed
+            dirtyFlag_[idx] = 0;
+            const bool held = heldPass_[idx] == pass_ && heldAfterFlush_ != 0;
+            if (held == (reportedHeld_[idx] != 0)) continue;         // flipped back: nothing to say
+            if (!tryReport(sid, held)) { dirtyFlag_[idx] = 1; break; }
+            reportedHeld_[idx] = held ? 1 : 0;
+            ++n;
+        }
+        for (; k < dirtyCount_; ++k) dirty_[keep++] = dirty_[k];      // the unreported tail
+        dirtyCount_ = keep;
+        return n;
+    }
+
+    /// Fix round 2 (finding 8): registrations of sessions closed / re-announced
+    /// while Resolving, still being released (find → drop).
+    [[nodiscard]] std::size_t drainingRegistrations() const noexcept { return drainCount_; }
     [[nodiscard]] std::size_t freeAckSlots() const noexcept { return kAckCapacity - ackCount_; }
     [[nodiscard]] std::size_t pending() const noexcept { return ackCount_; }
     /// Acks still queued after the last flush (held for their sessions).
@@ -266,7 +302,7 @@ private:
         while (keys_[i] != 0) i = (i + 1) & kMask;
         keys_[i] = sid;
         states_[i] = PubFailed{};                                    // neutral (reported) placeholder
-        heldPass_[i] = 0;
+        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0;
         ++count_;
         return i;
     }
@@ -274,7 +310,7 @@ private:
         leaveState_(states_[i]);
         keys_[i] = 0;
         states_[i] = PubFailed{};                                    // releases a Ready publication
-        heldPass_[i] = 0;
+        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0;
         --count_;
         std::size_t j = i;
         for (;;) {
@@ -286,9 +322,11 @@ private:
             keys_[i] = keys_[j];
             states_[i] = std::move(states_[j]);
             heldPass_[i] = heldPass_[j];
+            reportedHeld_[i] = reportedHeld_[j];
+            dirtyFlag_[i] = dirtyFlag_[j];
             keys_[j] = 0;
             states_[j] = PubFailed{};
-            heldPass_[j] = 0;
+            heldPass_[j] = 0; reportedHeld_[j] = 0; dirtyFlag_[j] = 0;
             i = j;
         }
     }
@@ -299,6 +337,46 @@ private:
             freeChan_[freeChanCount_++] = a->chan;
         else if (const auto* f = std::get_if<PubFailed>(&st); f && !f->reported)
             --unreported_;
+        else if (const auto* r = std::get_if<PubResolving>(&st); r && drainCount_ < kMaxSessions)
+            draining_[drainCount_++] = r->regId;                     // finding 8: never leaked
+    }
+    /// Hold edges of this flush: sessions held now that were not reported held,
+    /// and sessions held at the previous flush that no longer are → dirty.
+    void noteHoldEdges_() noexcept {
+        for (std::size_t k = 0; k < heldPrevCount_; ++k) {
+            const std::size_t idx = find_(heldPrev_[k]);
+            if (idx != kNone && heldPass_[idx] != pass_) markDirty_(idx);   // released
+        }
+        for (std::size_t k = 0; k < heldNowCount_; ++k) {
+            const std::size_t idx = find_(heldNow_[k]);
+            if (idx != kNone && reportedHeld_[idx] == 0) markDirty_(idx);   // newly held
+        }
+        for (std::size_t k = 0; k < heldNowCount_; ++k) heldPrev_[k] = heldNow_[k];   // only the live prefix
+        heldPrevCount_ = heldNowCount_;
+        heldNowCount_ = 0;
+    }
+    void markDirty_(std::size_t idx) noexcept {
+        if (dirtyFlag_[idx]) return;
+        if (dirtyCount_ == kMaxSessions) [[unlikely]] {              // closed sessions' entries: compact
+            std::size_t keep = 0;
+            for (std::size_t k = 0; k < dirtyCount_; ++k)
+                if (const std::size_t j = find_(dirty_[k]); j != kNone && dirtyFlag_[j]) dirty_[keep++] = dirty_[k];
+            dirtyCount_ = keep;                                      // < kMaxSessions live sessions
+        }
+        dirtyFlag_[idx] = 1;
+        dirty_[dirtyCount_++] = keys_[idx];                          // <= one entry per live session
+    }
+    /// Release registrations whose session went away while they resolved.
+    int drainRegistrations_() noexcept {
+        std::size_t keep = 0;
+        for (std::size_t k = 0; k < drainCount_; ++k) {
+            PubHandle pub{};
+            if (policy_.find(draining_[k], pub) == PubFind::Pending) draining_[keep++] = draining_[k];
+            // Ready: `pub` drops here (released); Error: the driver already dropped it.
+        }
+        const int done = static_cast<int>(drainCount_ - keep);
+        drainCount_ = keep;
+        return done;
     }
     void fail_(PubState& st) noexcept {
         leaveState_(st);
@@ -352,6 +430,15 @@ private:
     std::array<int64_t, kMaxSessions>                                keys_{};      // 0 = empty
     std::array<PubState, kMaxSessions>                               states_{};
     std::array<uint64_t, kMaxSessions>                               heldPass_{};  // pass that last held acks
+    std::array<uint8_t, kMaxSessions>                                reportedHeld_{};  // what the runtime knows
+    std::array<uint8_t, kMaxSessions>                                dirtyFlag_{};     // in dirty_
+    std::array<int64_t, kMaxSessions>                                dirty_{};         // held state to report
+    std::size_t                                                      dirtyCount_ = 0;
+    std::array<int64_t, kMaxSessions>                                heldNow_{};       // held this flush
+    std::array<int64_t, kMaxSessions>                                heldPrev_{};      // held last flush
+    std::size_t                                                      heldNowCount_ = 0, heldPrevCount_ = 0;
+    std::array<int64_t, kMaxSessions>                                draining_{};      // finding 8
+    std::size_t                                                      drainCount_ = 0;
     std::size_t                                                      count_ = 0;
     std::array<int64_t, kMaxSessions>                                unresolved_{};
     std::size_t                                                      unresolvedCount_ = 0;

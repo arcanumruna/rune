@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <span>
 #include <unistd.h>
@@ -41,6 +42,10 @@ constexpr int32_t kIngress = 7301, kEgress = 7302, kEgress2 = 7303;
 // The ack publications a worker opens to its sessions: a small IPC term (the
 // driver default is 64 MiB) so a client that stops reading back-pressures them.
 constexpr const char* kEgressChannel = "aeron:ipc?term-length=65536";
+bool isFailedSignal(const WorkerReturn& r) {
+    return r.type == WorkerReturn::Type::SessionSignal &&
+           r.lastOffset == static_cast<int64_t>(SessionSignalKind::Failed);
+}
 class NullTransport final : public rune::replication::PartitionTransport {
 public:
     void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
@@ -70,6 +75,7 @@ struct Fixture {
     int egressLimit = 64;                                      // session 5's client reads this many acks / step
     bool runtimeDrainsReturns = false;                         // the runtime's ret_ drain (notifications)
     std::vector<WorkerReturn> sessionFailures;
+    std::function<void(const WorkerReturn&)> onReturn;         // the emulated runtime's return handler
     // A second client: its own ingress publication (own image) + its own egress.
     std::shared_ptr<aeron::ExclusivePublication> pub2;
     std::shared_ptr<aeron::Subscription> egress2;
@@ -126,7 +132,8 @@ struct Fixture {
         if (egress2) egress2->poll(asmb2.handler(), 64);
         if (runtimeDrainsReturns)
             worker->drainReturn([this](WorkerReturn r) {
-                if (r.type == WorkerReturn::Type::SessionFailed) sessionFailures.push_back(r);
+                if (isFailedSignal(r)) sessionFailures.push_back(r);
+                if (onReturn) onReturn(r);
             });
     }
     // The second client: a separate ingress publication (a separate image) and
@@ -159,6 +166,19 @@ struct Fixture {
         m.recordBatch = std::span<const uint8_t>(batch);
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
         return f;
+    }
+    /// A gateway-routed produce (WorkerOp::Produce on the op ring), as the
+    /// runtime enqueues it for a client that ignores ingressEndpoint.
+    bool routedProduce(int64_t sid, int64_t corr, uint8_t acks = 0) {
+        rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+        const auto batch = b.build();
+        WorkerOp op; op.type = WorkerOp::Type::Produce; op.topicId = 1; op.partition = 0;
+        op.replica = replica.get(); op.logPtr = log.get();
+        op.sessionId = sid; op.correlationId = corr; op.acks = acks;
+        op.producerId = -1; op.producerEpoch = 0; op.baseSequence = -1;
+        op.lastOffsetDelta = 0; op.recordCount = 1;
+        op.recordBatchView = std::span<const uint8_t>(batch);
+        return worker->tryEnqueueOp(std::move(op));
     }
     /// ONE offer attempt (never loops: a paused client's offers back-pressure).
     static bool offerOnce(aeron::ExclusivePublication& pub, std::vector<uint8_t>& f) {
@@ -279,24 +299,36 @@ TEST(ShardWorkerAckRegression, ClosedSessionGetsNoAckAndReannounceRestoresIt) {
     EXPECT_TRUE(f.awaitAck(3));
 }
 
-TEST(ShardWorkerAckRegression, ProduceIsNotPolledBeforeItsSessionAnnouncementIsApplied) {
-    // Announce-before-accept end to end on the worker: the runtime queued the
-    // announcement BEFORE the client could produce, but the worker cannot drain
-    // it this pass (drain limit 1, ops ahead of it).  Polling the produce now
-    // would ack an unknown session — dropped, the client hangs.  The shard must
-    // apply every queued op first.
+TEST(ShardWorkerAckRegression, GatewayRoutedProduceDrainedWithItsJustCommittedAnnouncementIsAcked) {
+    // Fix round 2 (finding 5, replaces a test the lifecycle ring made vacuous):
+    // the runtime commits a session's announcement and, right after, a gateway-
+    // routed Produce of that session — both AFTER this pass drained the
+    // lifecycle ring, so the produce op runs in this pass's op drain with its
+    // session still unknown.  Its ack must be held until the announcement is
+    // applied (next pass), never dropped.  A test task on the op ring commits
+    // both exactly there.
     Fixture f({1}, 1);
-    for (int i = 0; i < 4; ++i) f.step();                      // session 5 resolved
-    f.worker->setIngressDrainLimit(1);
-    for (int64_t id = 100; id < 104; ++id) {
-        WorkerOp c; c.type = WorkerOp::Type::SessionClose; c.sessionId = id;
-        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(c)));
-    }
-    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 6;
-    a.egressStreamId = kEgress; a.egressChannel = kEgressChannel;
-    ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(a)));
-    f.produce(/*corr=*/61, /*acks=*/0, -1, -1, /*sid=*/6);
+    f.runtimeDrainsReturns = true;
+    for (int i = 0; i < 4; ++i) f.step();
+    f.connectSecondClient();
+    struct Task : OwnerThreadTestTask {
+        Fixture* f; bool routed = false;
+        explicit Task(Fixture* fx)
+            : OwnerThreadTestTask(Target::Replica, 1, 0, &run, Clock::now() + std::chrono::hours(1)), f(fx) {}
+        static void run(OwnerThreadTestTask& t, PartitionReplica*) noexcept {
+            auto& self = static_cast<Task&>(t);
+            WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 6;
+            a.egressStreamId = kEgress2; a.egressChannel = kEgressChannel;
+            if (!self.f->worker->tryEnqueueOp(std::move(a))) return;
+            self.routed = self.f->routedProduce(6, 61);
+        }
+    };
+    auto task = std::make_shared<Task>(&f);
+    WorkerOp t; t.type = WorkerOp::Type::TestTask;
+    t.egressPub = new OwnerThreadTestTaskRef(task);
+    ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(t)));
     ASSERT_TRUE(f.awaitAck(61)) << "the produce of a just-announced session must be acked";
+    ASSERT_TRUE(task->routed);
     EXPECT_EQ(f.acks[61].sessionId, 6);
     EXPECT_EQ(f.worker->sessionAcksDroppedForTest(), 0u);
 }
@@ -428,14 +460,14 @@ TEST(ShardWorkerAckRegression, UndeliverableSessionPublicationIsReportedToTheRun
     for (int i = 0; i < 5'000 && failed == 0; ++i) {
         f.step();
         f.worker->drainReturn([&](WorkerReturn r) {
-            if (r.type == WorkerReturn::Type::SessionFailed) { ++failed; failedSid = r.sessionId; }
+            if (isFailedSignal(r)) { ++failed; failedSid = r.sessionId; }
         });
     }
     ASSERT_EQ(failed, 1) << "an undeliverable session must be reported";
     EXPECT_EQ(failedSid, 8);
     for (int i = 0; i < 200; ++i) {
         f.step();
-        f.worker->drainReturn([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::SessionFailed) ++failed; });
+        f.worker->drainReturn([&](WorkerReturn r) { if (isFailedSignal(r)) ++failed; });
     }
     EXPECT_EQ(failed, 1) << "reported exactly once";
 }
@@ -518,4 +550,79 @@ TEST(ShardWorkerAckRegression, ShardIngressEnforcesTopicSchema) {
     ASSERT_TRUE(f.awaitAck(31));
     EXPECT_EQ(f.acks[31].errorCode, static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed));
     EXPECT_EQ(f.log->logEndOffset(), 0) << "a schema-invalid batch is never appended";
+}
+
+// Fix round 2 (finding 1, critical): C1 on the GATEWAY-ROUTED path — a client
+// that ignores ingressEndpoint (every Produce through the node endpoint → op
+// ring) and stops reading its acks must not fill the shard's ack queue.  The
+// worker signals Held for the session; the runtime (emulated here exactly as
+// the gateway does it: no more routed frames for a Held session until
+// Released) pauses only that client.  Role ops and other sessions keep flowing
+// and the op drain never pauses for want of ack room.
+TEST(ShardWorkerAckRegression, GatewayRoutedSlowSessionIsPausedNotTheShard) {
+    Fixture f({1}, 1);
+    f.runtimeDrainsReturns = true;
+    for (int i = 0; i < 4; ++i) f.step();
+    f.egressLimit = 0;                                      // session 5 stops reading acks
+    bool held5 = false;
+    int heldEdges = 0, releasedEdges = 0;
+    f.onReturn = [&](const WorkerReturn& r) {
+        if (r.type != WorkerReturn::Type::SessionSignal || r.sessionId != 5) return;
+        if (r.lastOffset == static_cast<int64_t>(SessionSignalKind::Held)) { held5 = true; ++heldEdges; }
+        if (r.lastOffset == static_cast<int64_t>(SessionSignalKind::Released)) { held5 = false; ++releasedEdges; }
+    };
+    const int64_t c0 = 4'000'000;
+    int64_t corr = c0;
+    int pausedPasses = 0;
+    for (int i = 0; i < 40'000 && corr - c0 < 17'000 && pausedPasses < 200; ++i) {
+        if (!held5) {
+            pausedPasses = 0;
+            for (int k = 0; k < 8 && f.routedProduce(5, corr); ++k) ++corr;
+        } else {
+            ++pausedPasses;                                 // the gateway ABORTs session 5's frames
+        }
+        f.step();
+    }
+    ASSERT_GT(corr - c0, 300) << "session 5 out-ran its ack publication";
+    EXPECT_TRUE(held5) << "the worker must report the slow session Held";
+
+    f.addSecondClient(6);
+    ASSERT_TRUE(f.routedProduce(6, 6'000'001));
+    for (int i = 0; i < 2'000 && !f.acks.count(6'000'001); ++i) f.step();
+    EXPECT_EQ(f.acks.count(6'000'001), 1u) << "another session's routed produce is acked";
+    WorkerOp bf; bf.type = WorkerOp::Type::BecomeFollower; bf.topicId = 1; bf.partition = 0;
+    bf.replica = f.replica.get(); bf.roleEpoch = 2; bf.roleLeaderId = 2;
+    ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(bf)));
+    for (int i = 0; i < 2'000 && f.replica->role() != Role::Follower; ++i) f.step();
+    EXPECT_EQ(f.replica->role(), Role::Follower) << "a role op is never stuck behind a slow client's acks";
+    EXPECT_EQ(f.worker->ackRoomOpPausesForTest(), 0u) << "the op drain never ran out of ack room";
+
+    f.egressLimit = 64;                                     // session 5 reads again: nothing lost
+    for (int i = 0; i < 50'000 && !allAcked(f, c0, corr); ++i) f.step();
+    EXPECT_TRUE(allAcked(f, c0, corr));
+    for (int i = 0; i < 100 && held5; ++i) f.step();
+    EXPECT_FALSE(held5) << "Released once its acks drained";
+    EXPECT_EQ(heldEdges, releasedEdges);
+    EXPECT_EQ(f.worker->sessionAcksDroppedForTest(), 0u);
+}
+
+// Fix round 2 (finding 9): a session signal the return ring cannot take now is
+// deferred (counted), never lost — delivered exactly once when there is room.
+TEST(ShardWorkerAckRegression, DeferredSessionSignalIsCountedAndStillDeliveredOnce) {
+    Fixture f({1}, 1);
+    for (int i = 0; i < 4; ++i) f.step();
+    WorkerReturn filler; filler.type = WorkerReturn::Type::OwnershipAck;
+    while (f.worker->injectReturnForTest(filler)) {}        // the runtime is slow: ret_ full
+    ASSERT_TRUE(f.routedProduce(5, 71));                    // its notification goes to the FIFO
+    f.step();
+    WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 8;
+    a.egressStreamId = kEgress2; a.egressChannel = "aeron:udp?endpoint=127.0.0.1:notaport";
+    ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(a)));
+    for (int i = 0; i < 50; ++i) f.step();
+    EXPECT_GT(f.worker->sessionSignalsDeferredForTest(), 0u) << "deferred while the FIFO is non-empty";
+    f.runtimeDrainsReturns = true;                          // the runtime catches up
+    for (int i = 0; i < 2'000 && f.sessionFailures.empty(); ++i) f.step();
+    for (int i = 0; i < 50; ++i) f.step();
+    ASSERT_EQ(f.sessionFailures.size(), 1u);
+    EXPECT_EQ(f.sessionFailures[0].sessionId, 8);
 }

@@ -256,6 +256,31 @@ public:
         return send(gatewayChannel, stream, buf.data(), len);
     }
 
+    /// Offer frames make(i, out) one at a time WITHOUT reading the egress (a
+    /// client that has stopped reading its acks).  Stops at maxFrames, or once
+    /// the broker has refused this publication for idleIters consecutive
+    /// harness waits (it paused the client).  Returns the frames accepted.
+    template <class Make>
+    int64_t offerUntilPaused(const std::string& channel, int32_t stream, Make&& make, int64_t maxFrames,
+                             int idleIters) {
+        auto& pub = pubs_[{channel, stream}];
+        if (!pub) {
+            const int64_t reg = aeron_->addPublication(channel, stream);
+            for (int i = 0; i < kMaxIters && !pub; ++i) { pub = aeron_->findPublication(reg); pause_(); }
+            if (!pub) return 0;
+        }
+        std::vector<uint8_t> f;
+        int64_t accepted = 0;
+        int idle = 0;
+        while (accepted < maxFrames && idle < idleIters) {
+            make(accepted, f);
+            aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
+            if (pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0) { ++accepted; idle = 0; }
+            else { ++idle; pause_(); }
+        }
+        return accepted;
+    }
+
     bool send(const std::string& channel, int32_t stream, const uint8_t* buf, std::size_t len) {
         auto& pub = pubs_[{channel, stream}];
         if (!pub) {

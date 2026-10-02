@@ -1179,3 +1179,46 @@ TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwa
     }
     for (auto& n : nodes) n->stop();
 }
+
+// T13 fix round 2 (finding 1, critical): C1 on the GATEWAY-ROUTED path, end to
+// end.  A client that ignores ingressEndpoint (every Produce to the node
+// endpoint → gateway → op ring) and stops reading its acks must be paused
+// ALONE: the worker reports it Held, the gateway ABORTs its produce frames.
+// Another client keeps producing; the slow one loses nothing once it reads.
+// (Was: its acks filled the worker's ack queue — op drain and every client's
+// intake stopped.)
+TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
+    TmpDir dir{"slowcl"}, ad{"slowa"}, bd{"slowb"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true)};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    const std::string gw = gatewayChannel(ports, 0);
+    {
+        ShardTestClient a(ad.path), b(bd.path);
+        const int64_t sidA = a.connect(gw, kClientStream);
+        ASSERT_GT(sidA, 0);
+        const auto batch = makeBatch(1);
+        ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, batch));
+        constexpr int64_t c0 = 50'000'000;
+        const int64_t n = a.offerUntilPaused(gw, kClientStream, [&](int64_t i, std::vector<uint8_t>& out) {
+            pc::Produce m;
+            m.sessionId = sidA; m.correlationId = c0 + i; m.topicId = 0; m.partition = 0; m.partitionKnown = 1;
+            m.acks = 0; m.producerId = -1; m.producerEpoch = 0; m.baseSequence = -1;
+            m.recordBatch = std::span<const uint8_t>(batch);
+            out.resize(m.encodedSize());
+            m.encode(out.data());
+        }, /*maxFrames=*/40'000, /*idleIters=*/2'000);
+        ASSERT_GT(n, 100) << "client A out-ran its ack stream";
+
+        const int64_t sidB = b.connect(gw, kClientStream);
+        ASSERT_GT(sidB, 0) << "a new session is accepted while A is slow";
+        for (int k = 0; k < 5; ++k)
+            ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB, 0, 0, /*acks=*/1, batch, /*maxAttempts=*/3))
+                << "client B's produce " << k << " starved behind client A's unread acks";
+
+        for (int64_t c = c0; c < c0 + n; ++c)                 // A reads again: nothing lost
+            ASSERT_TRUE(a.awaitProduceResponse(c).has_value()) << "ack " << c - c0 << " of " << n;
+    }
+    node.stop();
+}

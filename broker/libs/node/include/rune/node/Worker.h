@@ -577,6 +577,9 @@ public:
     /// client pause) / op drains skipped because the ack queue had no room.
     [[nodiscard]] uint64_t intakePausedFramesForTest() const noexcept { return intakePausedFrames_; }
     [[nodiscard]] uint64_t ackRoomOpPausesForTest() const noexcept { return ackRoomOpPauses_; }
+    /// Fix round 2 (finding 9): session signals (Failed / Held / Released) the
+    /// return ring could not take at once — deferred to a later pass, never lost.
+    [[nodiscard]] uint64_t sessionSignalsDeferredForTest() const noexcept { return sessionSignalsDeferred_; }
     /// Test seam: write one return straight to ret_ (false = ring full).
     bool injectReturnForTest(const WorkerReturn& r) { return tryWriteReturn_(r); }
 
@@ -1355,7 +1358,7 @@ private:
         if (ackSink_) {
             const int64_t consumed = sessionRing_.consumerPosition();
             work += ackSink_->flush(sessionRing_.producerPosition(), consumed);
-            work += reportSessionFailures_();
+            work += reportSessionSignals_();
         }
         return work;
     }
@@ -1700,22 +1703,36 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // Task 13 fix round 1 (C2): a session whose publication can never deliver
-    // is reported to the runtime (WorkerReturn::SessionFailed), which closes it
-    // everywhere — the client reconnects.  Written straight to ret_ only when
-    // nothing is queued ahead (never through the FIFO: its static bound is
-    // unchanged); otherwise the failure stays recorded in the session's state
-    // and is retried next pass.  Never dropped, never a timer.
     // -----------------------------------------------------------------------
-    int reportSessionFailures_() {
-        return ackSink_->reportFailures([this](int64_t sid) {
-            if (!retFifo_.empty()) return false;
+    // Task 13 session signals (WorkerReturn::SessionSignal), fix rounds 1-2:
+    //   Failed   (C2) — the session's publication can never deliver: the
+    //            runtime closes the session everywhere and tells the client;
+    //   Held / Released (finding 1) — G-A6 on the gateway-routed path: the
+    //            runtime pauses that session's gateway produce frames while any
+    //            worker holds its acks (controlled ABORT on its image).
+    // Written straight to ret_ only when nothing is queued ahead (never through
+    // the FIFO: its static bound is unchanged); otherwise the fact stays
+    // recorded in the sink's per-session state and is retried next pass
+    // (counted: sessionSignalsDeferred_).  Never dropped, never a timer.
+    // -----------------------------------------------------------------------
+    bool trySessionSignal_(int64_t sid, SessionSignalKind kind) {
+        if (retFifo_.empty()) {
             WorkerReturn r;
-            r.type      = WorkerReturn::Type::SessionFailed;
-            r.sessionId = sid;
-            r.partition = workerId_;
-            return tryWriteReturn_(r);
+            r.type       = WorkerReturn::Type::SessionSignal;
+            r.sessionId  = sid;
+            r.partition  = workerId_;
+            r.lastOffset = static_cast<int64_t>(kind);
+            if (tryWriteReturn_(r)) return true;
+        }
+        ++sessionSignalsDeferred_;
+        return false;
+    }
+    int reportSessionSignals_() {
+        int n = ackSink_->reportFailures([this](int64_t sid) { return trySessionSignal_(sid, SessionSignalKind::Failed); });
+        n += ackSink_->reportHoldChanges([this](int64_t sid, bool held) {
+            return trySessionSignal_(sid, held ? SessionSignalKind::Held : SessionSignalKind::Released);
         });
+        return n;
     }
 
     std::size_t drainIngress_() {
@@ -3567,9 +3584,15 @@ private:
     // lowers A.  So A + O <= kAckCapacity holds for ANY client behaviour —
     // enqueue never fails (a failure is an invariant halt).  Liveness: with no
     // held acks a pass still admits a full drain AND a full poll at the owed
-    // ceiling (assert below).  Per session (G-A6), a client whose acks are held
-    // is paused at its next frame (controlled ABORT), so its share is one
-    // pass's frames + its owed acks + gateway-routed ops — never the whole queue.
+    // ceiling (assert below).  Per session (G-A6) — the safety invariant above
+    // holds regardless; this is the FAIRNESS argument: a client whose acks are
+    // held is paused on BOTH intake paths — its direct frames at the next frame
+    // (controlled ABORT here), its gateway-routed frames once the runtime has
+    // the Held signal (fix round 2: controlled ABORT on its gateway image).  Its
+    // share is therefore what it sent before each pause took effect: one pass's
+    // direct frames, its owed acks, and the routed frames already in the op
+    // ring / in flight to the runtime when Held landed (one ret_ hop) — not the
+    // rest of the queue.  The room throttle (ackRoom_) only backs that up.
     static_assert(SessionAckSink::kAckCapacity >=
                       kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
                           static_cast<std::size_t>(kMaxFragmentLimit),
@@ -3578,6 +3601,7 @@ private:
     uint64_t sessionClosesSeen_    = 0;
     uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs)
     uint64_t ackRoomOpPauses_      = 0;   // fix round 1: op drains skipped, ack queue full
+    uint64_t sessionSignalsDeferred_ = 0; // fix round 2 (finding 9)
 
     // E4: true after the one-shot self-pin attempt fires in doWork.
     // Prevents repeated pin attempts on every doWork call.

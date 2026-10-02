@@ -449,19 +449,46 @@ int ClientGateway::doWork(int64_t nowNs) {
     // (control markers, subscription lifecycle) BEFORE new ingress, in order.
     int work = 0;
     if (workerPool_) work += pumpMarkerQueue_() + pumpSubOps_();
-    // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
-    work += sub_->poll(
-        [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
-               aeron::Header& h) {
-            assembler_.onFragment(
-                [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
-                       aeron::util::index_t length, aeron::Header& header) {
-                    onFragment(buffer, offset, length, header);
-                },
-                b, o, l, h);
-        },
-        fragmentLimit_);
-    imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
+    if (shardMode_) {
+        // Task 13 fix round 2 (finding 1, G-A6 on the gateway-routed path): a
+        // Produce frame of a session some worker holds acks for is ABORTed — it
+        // stays on ITS image (one client publication) and the poll moves on to
+        // the other images; the client's offers back-pressure until it reads
+        // its acks (Released).  One branch when nothing is held.
+        work += sub_->controlledPoll(
+            [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
+                   aeron::Header& h) {
+                return controlledAssembler_.onFragment(
+                    [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                           aeron::util::index_t length, aeron::Header& header) {
+                        if (heldSessions_ != 0 &&
+                            produceFrameHeld_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                              static_cast<std::size_t>(length))) [[unlikely]] {
+                            ++heldProduceAborts_;
+                            return aeron::ControlledPollAction::ABORT;
+                        }
+                        onFragment(buffer, offset, length, header);
+                        return aeron::ControlledPollAction::CONTINUE;
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit_);
+        controlledImageWatch_.afterPoll(*sub_, controlledAssembler_);
+    } else {
+        // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
+        work += sub_->poll(
+            [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
+                   aeron::Header& h) {
+                assembler_.onFragment(
+                    [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                           aeron::util::index_t length, aeron::Header& header) {
+                        onFragment(buffer, offset, length, header);
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit_);
+        imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
+    }
     pollPendingConnects(nowNs);
     // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
     if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
@@ -611,36 +638,10 @@ void ClientGateway::reapExpired(int64_t nowNs) {
         }
     });
 
-    for (int64_t sid : reapScratch_) {
-        sessions_.remove(sid);
-        // Task 13: the workers forget it too (its queued acks drop, its
-        // publications are released) — retried until every worker has it.
-        if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
-        // Hybrid egress: drop any in-flight record-egress resolves for this session
-        // (all workers — its buffered subscribes die with the session).
-        for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
-            pit = (pit->first.first == sid) ? pendingRecordEgress_.erase(pit) : std::next(pit);
-        }
-        // Removing from sessions_ resets the shared_ptr → Aeron releases the
-        // ExclusivePublication once no other holder exists.
-
-        // GB-3: drop all subscriptions belonging to this session so we no longer
-        // attempt to push Records to a dead egress.
-        auto it = subscriptions_.begin();
-        while (it != subscriptions_.end()) {
-            if (it->second.sessionId == sid) {
-                it = subscriptions_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
-        // does not grow unboundedly under connect/disconnect churn (session ids are
-        // monotonic, so stale entries are harmless for delivery but constitute a
-        // steady-state memory leak — violates the zero-leak directive).
-        groupMemberSubs_.erase(sid);
-    }
+    // Fix round 2 (finding 4): ONE close path (closeSession_) for reap,
+    // Disconnect and SessionFailed — table, workers, record-egress resolves,
+    // subscriptions, group-member tracking, held state.
+    for (int64_t sid : reapScratch_) (void)closeSession_(sid);
 }
 
 // ---------------------------------------------------------------------------
@@ -821,12 +822,23 @@ void ClientGateway::closeDroppedPendingConnect_(const PendingConnect& pending)
         sessionAnnouncer_.close(*workerPool_, pending.sessionId);
 }
 
-bool ClientGateway::closeSession_(int64_t sid)
+bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
 {
-    if (!sessions_.find(sid)) return false;   // m4: unknown → no worker traffic
-    sessions_.remove(sid);
-    // Task 13: close the session on every worker.
+    Session* s = sessions_.find(sid);
+    if (!s) return false;                     // m4: unknown → no worker traffic
+    // Fix round 2 (finding 2): tell the client before its publication goes —
+    // the rune client reconnects only on SessionExpired / UnknownSession.
+    if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
+    if (s->heldByWorkers != 0) --heldSessions_;
+    sessions_.remove(sid);                    // releases its egress publication
+    // Task 13: the workers forget it too (its queued acks drop, its
+    // publications are released) — retried until every worker has it.
     if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
+    // Hybrid egress: drop any in-flight record-egress resolves for this session
+    // (all workers — its buffered subscribes die with the session).
+    for (auto pit = pendingRecordEgress_.begin(); pit != pendingRecordEgress_.end(); ) {
+        pit = (pit->first.first == sid) ? pendingRecordEgress_.erase(pit) : std::next(pit);
+    }
 
     // GB-3: drop all subscriptions belonging to this session.
     auto it = subscriptions_.begin();
@@ -842,6 +854,63 @@ bool ClientGateway::closeSession_(int64_t sid)
     // does not grow unboundedly under connect/disconnect churn.
     groupMemberSubs_.erase(sid);
     return true;
+}
+
+bool ClientGateway::produceFrameHeld_(const uint8_t* buf, std::size_t len)
+{
+    if (len < pc::MessageHeader::ENCODED_SIZE) return false;
+    const uint16_t templateId = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
+    if (templateId != pc::Produce::TEMPLATE_ID) return false;   // only produce intake is paused
+    uint64_t sid = 0;
+    for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
+    const Session* s = sessions_.find(static_cast<int64_t>(sid));
+    return s && s->heldByWorkers != 0;
+}
+
+void ClientGateway::sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid)
+{
+    pc::ErrorResponse e;
+    e.sessionId     = sid;
+    e.correlationId = 0;
+    e.code          = static_cast<int16_t>(pc::ErrorCode::SessionExpired);
+    const std::size_t encoded = e.encode(scratch_.data());
+    if (session) (void)sendTo(*session, scratch_.data(), encoded);   // best effort
+    else if (pub) (void)sendOnPub(*pub, scratch_.data(), encoded);
+}
+
+void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
+{
+    using K = rune::node::SessionSignalKind;
+    const auto kind = static_cast<K>(ret.lastOffset);
+    if (kind == K::Held || kind == K::Released) {
+        Session* s = sessions_.find(ret.sessionId);
+        if (!s || ret.partition < 0 || ret.partition >= 64) return;   // closed meanwhile
+        const uint64_t bit = uint64_t{1} << ret.partition;
+        const bool was = s->heldByWorkers != 0;
+        if (kind == K::Held) s->heldByWorkers |= bit; else s->heldByWorkers &= ~bit;
+        const bool now = s->heldByWorkers != 0;
+        if (now && !was) ++heldSessions_;
+        if (was && !now) --heldSessions_;
+        return;
+    }
+    // Failed (C2): close the session everywhere and tell the client, so it
+    // reconnects; its later notifications find no session.  State-driven.
+    if (closeSession_(ret.sessionId, /*notifyExpired=*/true)) {
+        spdlog::warn("ClientGateway: session {} closed — its ack publication on worker {} can never "
+                     "deliver (the client was told SessionExpired)", ret.sessionId, ret.partition);
+        return;
+    }
+    // Not accepted yet (ConnectResponse still retrying): drop the pending
+    // connect — never accept a session no worker can ack.
+    for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
+        if (it->sessionId != ret.sessionId) continue;
+        spdlog::warn("ClientGateway: pending session {} dropped — its ack publication on worker {} can "
+                     "never deliver", ret.sessionId, ret.partition);
+        if (it->resolvedPub) sendSessionExpired_(it->resolvedPub.get(), nullptr, ret.sessionId);
+        closeDroppedPendingConnect_(*it);
+        pendingConnects_.erase(it);   // resolvedPub released with the entry
+        break;
+    }
 }
 
 void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t nowNs)
@@ -3283,22 +3352,8 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         // can never deliver — close the session everywhere (table, workers,
         // subscriptions) so the client reconnects; its later notifications find
         // no session (no liveness refresh).  State-driven, never a timer.
-        if (ret.type == rune::node::WorkerReturn::Type::SessionFailed) [[unlikely]] {
-            if (closeSession_(ret.sessionId)) {
-                spdlog::warn("ClientGateway: session {} closed — its ack publication on worker {} can never "
-                             "deliver (the client reconnects)", ret.sessionId, ret.partition);
-                return;
-            }
-            // Not accepted yet (ConnectResponse still retrying): drop the
-            // pending connect — never accept a session no worker can ack.
-            for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
-                if (it->sessionId != ret.sessionId) continue;
-                spdlog::warn("ClientGateway: pending session {} dropped — its ack publication on worker {} can "
-                             "never deliver", ret.sessionId, ret.partition);
-                closeDroppedPendingConnect_(*it);
-                pendingConnects_.erase(it);   // resolvedPub released with the entry
-                break;
-            }
+        if (ret.type == rune::node::WorkerReturn::Type::SessionSignal) [[unlikely]] {
+            onSessionSignal_(ret);
             return;
         }
 

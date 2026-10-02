@@ -37,6 +37,10 @@ struct Session {
     int32_t                                        egressStreamId = 0;
     std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>>
                                                    recordEgressByWorker;
+    // Task 13 fix round 2 (shard mode, G-A6 on the gateway-routed path): bit w
+    // set = worker w holds acks for this session (SessionSignal Held/Released).
+    // Non-zero → the gateway ABORTs this session's Produce frames.
+    uint64_t                                       heldByWorkers = 0;
 };
 
 // ---------------------------------------------------------------------------

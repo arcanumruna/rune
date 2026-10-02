@@ -69,7 +69,7 @@ Every per-worker port is explicit configuration, validated for collisions at sta
 
 | Traffic | Endpoint | Stream | Config |
 |---|---|---|---|
-| Client → worker w (produce) | `host:(RUNE_WORKER_INGRESS_BASE_PORT + w)` | `workerIngressBaseStreamId + w` (unchanged) | new `RUNE_WORKER_INGRESS_BASE_PORT` |
+| Client → worker w (produce) | `host:(RUNE_WORKER_INGRESS_BASE_PORT + w)` (the advertised `ingressEndpoint`) | `clientStreamId` — the stream the metadata advertises as `ingressStreamId` in shard mode, also subscribed by the gateway on the node endpoint (T13 F25: a client that ignores `ingressEndpoint` sends the same stream to the node endpoint) | new `RUNE_WORKER_INGRESS_BASE_PORT` |
 | Worker w ↔ worker w on peer (replication) | `peerHost:(peer.replBasePort + w)` | `replBaseStreamId + w` (#4) | new `RUNE_WORKER_REPL_BASE_PORT`; `RUNE_PEERS` entries gain optional per-peer `replBasePort` |
 | Worker w → client (records, MDC) | existing `RUNE_WORKER_EGRESS_CONTROL_BASE_PORT + w` | unchanged | unchanged |
 | Worker w → client (produce acks) | client's session egress channel (§3.4) | client's egress stream | from Connect |

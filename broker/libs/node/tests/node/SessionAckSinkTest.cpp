@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <set>
@@ -27,6 +28,7 @@ struct FakePolicy {
         std::set<int> blocked;                                  // pub ids that back-pressure
         std::set<int> closed;                                   // pub ids that are CLOSED (fatal)
         std::vector<std::pair<int, std::vector<uint8_t>>> sent; // (pub id, frame)
+        std::vector<int64_t> foundRegs;                         // registrations find() resolved
     };
     std::shared_ptr<State> s = std::make_shared<State>();
     int64_t add(std::string_view ch, int32_t stream) noexcept {
@@ -38,6 +40,7 @@ struct FakePolicy {
         if (s->findError) return PubFind::Error;
         if (!s->findReady) return PubFind::Pending;
         out = std::make_shared<FakePub>(FakePub{static_cast<int>(reg)});
+        s->foundRegs.push_back(reg);
         return PubFind::Ready;
     }
     template <class E> int64_t claim(PubHandle& p, std::size_t len, E&& enc) noexcept {
@@ -304,4 +307,53 @@ TEST(SessionAckSinkRegression, ManySessionsSurviveBackwardShiftDeletion) {
         if (sid % 2 == 1) EXPECT_EQ(s.stateForTest(sid), nullptr) << sid;
         else ASSERT_NE(s.stateForTest(sid), nullptr) << sid;
     }
+}
+
+// Fix round 2 (finding 1): the worker tells the runtime when a session STARTS
+// and STOPS holding acks — exactly once per edge, retried while the return ring
+// refuses it — so the runtime can pause that session's gateway-routed intake.
+TEST(SessionAckSinkRegression, HoldEdgesAreReportedOncePerTransition) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8);
+    std::vector<std::pair<int64_t, bool>> got;
+    auto take = [&](int64_t sid, bool held) { got.push_back({sid, held}); return true; };
+    st->blocked.insert(1);                                  // session 7's publication
+    s.enqueue(ack(7, 1)); s.enqueue(ack(8, 2));
+    pass(s);
+    EXPECT_EQ(s.reportHoldChanges(take), 1);
+    ASSERT_EQ(got.size(), 1u);
+    EXPECT_EQ(got[0], (std::pair<int64_t, bool>{7, true}));
+    s.enqueue(ack(7, 3)); pass(s); pass(s);
+    EXPECT_EQ(s.reportHoldChanges(take), 0) << "still held: no repeat";
+    st->blocked.clear();
+    pass(s);
+    EXPECT_EQ(s.reportHoldChanges([](int64_t, bool) { return false; }), 0) << "return ring full";
+    EXPECT_EQ(s.reportHoldChanges(take), 1) << "retried, not lost";
+    EXPECT_EQ(got.back(), (std::pair<int64_t, bool>{7, false}));
+    st->blocked.insert(2);                                  // session 8 held, then closed
+    s.enqueue(ack(8, 4)); pass(s);
+    s.close(8);
+    pass(s);
+    EXPECT_EQ(s.reportHoldChanges(take), 0) << "a closed session's state dies with the runtime's close";
+}
+
+// Fix round 2 (finding 8): a registration still resolving when its session is
+// closed or re-announced is drained (find → drop) — never leaked in the
+// worker's conductor / driver.
+TEST(SessionAckSinkRegression, RegistrationOfASessionClosedOrReannouncedWhileResolvingIsReleased) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    st->findReady = false;
+    ASSERT_TRUE(s.announce(7, "c", 1));
+    pass(s);                                                // Announced → Resolving(reg 1)
+    s.close(7);
+    ASSERT_TRUE(s.announce(9, "c", 1));
+    pass(s);                                                // 9: Resolving(reg 2)
+    ASSERT_TRUE(s.announce(9, "c", 2));                     // re-announced while resolving
+    EXPECT_EQ(s.drainingRegistrations(), 2u);
+    st->findReady = true;
+    pass(s); pass(s);
+    EXPECT_EQ(s.drainingRegistrations(), 0u);
+    std::vector<int64_t> found = st->foundRegs;
+    std::sort(found.begin(), found.end());
+    EXPECT_EQ(found, (std::vector<int64_t>{1, 2, 3})) << "regs 1, 2 drained; reg 3 is 9's live one";
 }

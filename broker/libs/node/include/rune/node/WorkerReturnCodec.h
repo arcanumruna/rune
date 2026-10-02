@@ -25,6 +25,13 @@
 
 namespace rune::node {
 
+// Task 13 fix round 2 (finding 7): SessionSignal rides the retired PRODUCE_NOTIFY
+// value.  Follow-up: rename RESERVED_2 → SESSION_SIGNAL in rune-protocol.
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::SessionSignal) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::RESERVED_2),
+              "WorkerReturn::SessionSignal must stay on sbe ReturnType::RESERVED_2");
+
+
 // ---------------------------------------------------------------------------
 // WorkerReturn (template id 2)
 // ---------------------------------------------------------------------------

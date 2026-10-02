@@ -7,6 +7,13 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/Protocol.h>
+
+#include <span>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -80,7 +87,7 @@ TEST(GatewayShardNotifyRegression, SessionFailedClosesTheSessionEverywhereAndSto
     gw.setShardMode(true);
     const int64_t sid = gw.injectTestSession(0);
     rune::node::WorkerReturn f;
-    f.type = rune::node::WorkerReturn::Type::SessionFailed;
+    f.type = rune::node::WorkerReturn::Type::SessionSignal;
     f.sessionId = sid; f.partition = 1;
     ASSERT_TRUE(pool.worker(1).injectReturnForTest(f));
     gw.drainWorkerReturnsForTest(1'000);
@@ -153,7 +160,7 @@ TEST(GatewayShardNotifyRegression, SessionFailedBeforeAcceptDropsThePendingConne
     gw.setShardMode(true);
     gw.injectPendingConnectForTest(/*sessionId=*/900'001, /*announceBegun=*/true);
     rune::node::WorkerReturn f;
-    f.type = rune::node::WorkerReturn::Type::SessionFailed;
+    f.type = rune::node::WorkerReturn::Type::SessionSignal;
     f.sessionId = 900'001; f.partition = 0;
     ASSERT_TRUE(pool.worker(0).injectReturnForTest(f));
     gw.drainWorkerReturnsForTest(1'000);
@@ -162,4 +169,108 @@ TEST(GatewayShardNotifyRegression, SessionFailedBeforeAcceptDropsThePendingConne
         pool.worker(w).doWork(1);
         EXPECT_EQ(pool.worker(w).sessionClosesSeenForTest(), 1u) << "worker " << w;
     }
+}
+
+// ===========================================================================
+// Task 13 fix round 2.
+// ===========================================================================
+namespace {
+rune::node::WorkerReturn signal(int64_t sid, int32_t worker, rune::node::SessionSignalKind k) {
+    rune::node::WorkerReturn r;
+    r.type = rune::node::WorkerReturn::Type::SessionSignal;
+    r.sessionId = sid; r.partition = worker; r.lastOffset = static_cast<int64_t>(k);
+    return r;
+}
+std::vector<uint8_t> produceFrame(int64_t sid) {
+    rune::protocol::client::Produce m;
+    m.sessionId = sid; m.correlationId = 1; m.topicId = 0; m.partition = 0; m.partitionKnown = 1;
+    static const std::vector<uint8_t> batch(80, 0);
+    m.recordBatch = std::span<const uint8_t>(batch);
+    std::vector<uint8_t> f(m.encodedSize());
+    m.encode(f.data());
+    return f;
+}
+std::vector<uint8_t> metadataFrame(int64_t sid) {
+    rune::protocol::client::MetadataRequest m; m.sessionId = sid; m.correlationId = 2;
+    std::vector<uint8_t> f(m.encodedSize());
+    m.encode(f.data());
+    return f;
+}
+} // namespace
+
+// Finding 1 (critical): the gateway pauses a session's PRODUCE frames while ANY
+// worker reports it Held (controlled ABORT on its image) and resumes once every
+// such worker reported Released.  Other sessions and the held session's
+// non-produce frames are never paused.
+TEST(GatewayShardNotifyRegression, HeldSessionsProduceFramesArePausedUntilEveryWorkerReleases) {
+    using K = rune::node::SessionSignalKind;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    rune::node::WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    const int64_t a = gw.injectTestSession(0), b = gw.injectTestSession(0);
+    const auto pa = produceFrame(a), pb = produceFrame(b), ma = metadataFrame(a);
+    EXPECT_FALSE(gw.clientFrameHeldForTest(pa.data(), pa.size()));
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(a, 0, K::Held)));
+    ASSERT_TRUE(pool.worker(1).injectReturnForTest(signal(a, 1, K::Held)));
+    gw.drainWorkerReturnsForTest(1'000);
+    EXPECT_TRUE(gw.clientFrameHeldForTest(pa.data(), pa.size())) << "a held session's produce is paused";
+    EXPECT_FALSE(gw.clientFrameHeldForTest(pb.data(), pb.size())) << "other sessions are not";
+    EXPECT_FALSE(gw.clientFrameHeldForTest(ma.data(), ma.size())) << "non-produce frames are not";
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(a, 0, K::Released)));
+    gw.drainWorkerReturnsForTest(2'000);
+    EXPECT_TRUE(gw.clientFrameHeldForTest(pa.data(), pa.size())) << "still held by worker 1";
+    ASSERT_TRUE(pool.worker(1).injectReturnForTest(signal(a, 1, K::Released)));
+    gw.drainWorkerReturnsForTest(3'000);
+    EXPECT_FALSE(gw.clientFrameHeldForTest(pa.data(), pa.size()));
+    ASSERT_TRUE(pool.worker(1).injectReturnForTest(signal(b, 1, K::Held)));   // then b disconnects
+    gw.drainWorkerReturnsForTest(4'000);
+    EXPECT_TRUE(gw.clientFrameHeldForTest(pb.data(), pb.size()));
+    rune::protocol::client::Disconnect d; d.sessionId = b; d.correlationId = 3;
+    std::vector<uint8_t> db(rune::protocol::client::Disconnect::ENCODED_SIZE);
+    d.encode(db.data());
+    gw.applyDisconnectForTest(db.data(), db.size());
+    EXPECT_FALSE(gw.clientFrameHeldForTest(pb.data(), pb.size())) << "the close clears its held state";
+}
+
+// Finding 2: a SessionFailed close tells the client (best effort, on the
+// gateway's own publication) that its session expired — the rune client
+// reconnects only on SessionExpired / UnknownSession.
+TEST(GatewayShardNotifyRegression, SessionFailedTellsTheClientItsSessionExpired) {
+    std::vector<std::vector<uint8_t>> frames;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* p, std::size_t n) { frames.emplace_back(p, p + n); });
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    const int64_t sid = gw.injectTestSession(0);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(sid, 0, rune::node::SessionSignalKind::Failed)));
+    gw.drainWorkerReturnsForTest(1'000);
+    EXPECT_EQ(gw.sessionCount(), 0u);
+    ASSERT_EQ(frames.size(), 1u) << "exactly one frame: the expiry notice";
+    auto e = rune::protocol::client::ErrorResponse::decode(frames[0].data(), frames[0].size());
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->sessionId, sid);
+    EXPECT_EQ(e->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired));
+}
+
+// Finding 4: one close path — Disconnect and SessionFailed purge the session's
+// in-flight record-egress resolves exactly like the lease reap.
+TEST(GatewayShardNotifyRegression, EveryCloseOfASessionPurgesItsPendingRecordEgress) {
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    const int64_t a = gw.injectTestSession(0), b = gw.injectTestSession(0), keep = gw.injectTestSession(0);
+    gw.injectPendingRecordEgressForTest(a, 0);
+    gw.injectPendingRecordEgressForTest(b, 0);
+    gw.injectPendingRecordEgressForTest(keep, 0);
+    rune::protocol::client::Disconnect d; d.sessionId = a; d.correlationId = 3;
+    std::vector<uint8_t> db(rune::protocol::client::Disconnect::ENCODED_SIZE);
+    d.encode(db.data());
+    gw.applyDisconnectForTest(db.data(), db.size());
+    EXPECT_EQ(gw.pendingRecordEgressCountForTest(), 2u) << "Disconnect purges it";
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(b, 0, rune::node::SessionSignalKind::Failed)));
+    gw.drainWorkerReturnsForTest(1'000);
+    EXPECT_EQ(gw.pendingRecordEgressCountForTest(), 1u) << "SessionFailed purges it";
 }

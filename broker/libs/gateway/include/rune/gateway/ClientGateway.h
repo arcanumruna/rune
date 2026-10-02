@@ -1104,7 +1104,12 @@ private:
     void closeDroppedPendingConnect_(const PendingConnect& pending);
     /// Close an accepted session (Disconnect / SessionFailed): table, workers,
     /// subscriptions, group-member tracking.  False = unknown session (no-op).
-    bool closeSession_(int64_t sid);
+    bool closeSession_(int64_t sid, bool notifyExpired = false);
+    /// Fix round 2 (finding 1): a Produce frame of a session some worker holds
+    /// acks for — the shard-mode poll ABORTs it (that client's image only).
+    [[nodiscard]] bool produceFrameHeld_(const uint8_t* buf, std::size_t len);
+    void onSessionSignal_(const rune::node::WorkerReturn& ret);
+    void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
     void evictOldestPendingConnect_();
     /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
@@ -1205,6 +1210,12 @@ private:
     std::shared_ptr<aeron::Subscription> sub_;
     rune::aeronutil::FragmentAssembler   assembler_;
     rune::aeronutil::ImageLossWatch      imageWatch_;   // review m-c
+    // Fix round 2 (finding 1): shard mode polls the client subscription with
+    // controlledPoll (per-session produce pause); separate reassembly state.
+    rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;
+    rune::aeronutil::ImageLossWatch              controlledImageWatch_;
+    std::size_t                                  heldSessions_ = 0;   // sessions with heldByWorkers != 0
+    uint64_t                                     heldProduceAborts_ = 0;
 
     SessionTable                         sessions_;
 
@@ -1518,6 +1529,9 @@ public:
     }
     [[nodiscard]] std::size_t shardSessionSlotsInUseForTest() const noexcept { return shardSessionSlotsInUse_(); }
     void evictOldestPendingConnectForTest() { evictOldestPendingConnect_(); }
+    bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
+    void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
+    [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
 private:
     int64_t                                 lastFlushNs_ = 0;
 

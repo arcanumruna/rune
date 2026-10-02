@@ -306,16 +306,26 @@ struct WorkerOp {
 // ---------------------------------------------------------------------------
 // WorkerReturn — result sent from Worker back to the control thread.
 // ---------------------------------------------------------------------------
+/// WorkerReturn::Type::SessionSignal kinds (carried in WorkerReturn::lastOffset).
+enum class SessionSignalKind : int64_t { Failed = 0, Held = 1, Released = 2 };
+
 struct WorkerReturn {
     enum class Type : uint8_t {
         ProduceResult,   ///< result of a Produce op
         PushReadResult,  ///< result of a PushRead op
-        /// Task 13 fix round 1 (C2): sessionId's ack publication on worker
-        /// `partition` can never deliver (add / find error, CLOSED,
-        /// MAX_POSITION_EXCEEDED).  The runtime closes the session everywhere
-        /// (the client reconnects).  Rides sbe ReturnType value 2 — RESERVED_2
-        /// (PRODUCE_NOTIFY, retired by F15 §7); in-process ring only.
-        SessionFailed = 2,
+        /// Task 13 (fix rounds 1-2): a per-session fact from worker `partition`
+        /// about sessionId; `lastOffset` = SessionSignalKind:
+        ///   Failed   — its ack publication can never deliver (add / find error,
+        ///              CLOSED, MAX_POSITION_EXCEEDED): the runtime closes the
+        ///              session everywhere and tells the client (SessionExpired);
+        ///   Held     — the worker holds acks for it (the client reads slower
+        ///              than it produces): the runtime pauses that session's
+        ///              gateway intake (controlled ABORT) — G-A6 on the
+        ///              gateway-routed path;
+        ///   Released — no longer held on this worker.
+        /// Rides sbe ReturnType value 2 — RESERVED_2 (PRODUCE_NOTIFY, retired by
+        /// F15 §7; static_assert in WorkerReturnCodec.h); in-process ring only.
+        SessionSignal = 2,
         /// fsyncgate fail-stop (Task 10 fix 1): a log's fsync failed.  topicId /
         /// partition name it, errorCode = errno, chunk = the log directory.  The
         /// runtime logs critical and halts the broker (kExitStorageFailure).
