@@ -1,6 +1,8 @@
 // tests/client/ClientTest.cpp
 //
-// CC-6 Acceptance tests — Client public API (connect/ping futures + callbacks).
+// CC-6 Acceptance tests — Client public API (connect/ping + callbacks).
+// F8c C3: ops complete into a Completions queue the test thread polls
+// (test_support::TestCq / PendingOp) — no futures.
 //
 // Test matrix (all bounded, no busy-spin, unique temp dirs):
 //
@@ -44,6 +46,7 @@
 //     attaches to the agent's embedded driver via the same aeronDir).
 
 #include "../support/AeronTestErrors.h"
+#include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
 
@@ -60,7 +63,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <span>
 #include <string>
@@ -319,6 +321,15 @@ struct GatewayHarness {
 
     std::unique_ptr<Client>      client;
     std::unique_ptr<TestGateway> gw;
+    // F8c C3: completions of this test's control ops (owned by the test thread).
+    std::unique_ptr<test_support::TestCq> cq;
+
+    test_support::PendingOp connectOp() {
+        return cq->issue([&](Completions& q, Token t) { return client->connect(q, t); });
+    }
+    test_support::PendingOp pingOp(const Bytes& payload) {
+        return cq->issue([&](Completions& q, Token t) { return client->ping(payload, q, t); });
+    }
 
     /// connectTimeoutMs / pingTimeoutMs for the client (caller can set before
     /// calling build()).
@@ -353,6 +364,7 @@ struct GatewayHarness {
         clientCfg.pingTimeoutMs    = pingTimeoutMs;
 
         client = std::make_unique<Client>(clientCfg);
+        cq     = std::make_unique<test_support::TestCq>(*client);
 
         // Give the embedded driver a moment to write cnc.dat.
         std::this_thread::sleep_for(150ms);
@@ -397,7 +409,7 @@ TEST(Client, ConnectFutureResolvesOnConnected) {
         connectedFired.store(true, std::memory_order_release);
     });
 
-    auto fut = h.client->connect();
+    auto fut = h.connectOp();
 
     // Drive the gateway so it receives the ConnectRequest and replies.
     h.pumpGwUntil([&]() {
@@ -405,10 +417,10 @@ TEST(Client, ConnectFutureResolvesOnConnected) {
     });
 
     // The future must resolve within kFutureTimeout.
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "connect() future did not resolve within timeout";
 
-    ASSERT_NO_THROW(fut.get()) << "connect() future threw unexpectedly";
+    ASSERT_TRUE(fut.ok()) << fut.describe() << "connect() future threw unexpectedly";
 
     EXPECT_TRUE(connectedFired.load())  << "onConnected was not fired";
     EXPECT_EQ(connectedSid.load(), 42LL) << "onConnected received wrong sessionId";
@@ -425,29 +437,30 @@ TEST(Client, PingFutureEchoNonEmpty) {
 
     h.client->onConnected([](int64_t){});
 
-    auto connFut = h.client->connect();
+    auto connFut = h.connectOp();
     h.pumpGwUntil([&]() {
         return h.client->state() == rcs::SessionState::Connected;
     });
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.waitReady());
+    ASSERT_TRUE(connFut.ok()) << connFut.describe();
 
     // Binary-safe payload including NUL and 0xFF bytes.
     Bytes payload = {'h', 'i', 0x00, 0xFF};
 
-    auto pingFut = h.client->ping(payload);
+    auto pingFut = h.pingOp(payload);
 
     bool pingFired = false;
     h.pumpGwUntil([&]() {
         // Check if the future is already ready.
-        return pingFut.wait_for(0ms) == std::future_status::ready;
+        return pingFut.ready();
     });
 
-    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(pingFut.waitReady())
         << "ping() future did not resolve within timeout";
 
     Bytes echo;
-    ASSERT_NO_THROW(echo = pingFut.get()) << "ping() future threw";
+    ASSERT_TRUE(pingFut.ok()) << pingFut.describe() << "ping() future threw";
+    echo = pingFut.bytes();
     ASSERT_EQ(echo, payload) << "Pong echo does not match payload";
 }
 
@@ -460,25 +473,26 @@ TEST(Client, PingFutureEchoEmpty) {
 
     h.client->onConnected([](int64_t){});
 
-    auto connFut = h.client->connect();
+    auto connFut = h.connectOp();
     h.pumpGwUntil([&]() {
         return h.client->state() == rcs::SessionState::Connected;
     });
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.waitReady());
+    ASSERT_TRUE(connFut.ok()) << connFut.describe();
 
     Bytes emptyPayload{};
-    auto pingFut = h.client->ping(emptyPayload);
+    auto pingFut = h.pingOp(emptyPayload);
 
     h.pumpGwUntil([&]() {
-        return pingFut.wait_for(0ms) == std::future_status::ready;
+        return pingFut.ready();
     });
 
-    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(pingFut.waitReady())
         << "empty ping() future did not resolve within timeout";
 
     Bytes echo;
-    ASSERT_NO_THROW(echo = pingFut.get());
+    ASSERT_TRUE(pingFut.ok()) << pingFut.describe();
+    echo = pingFut.bytes();
     ASSERT_TRUE(echo.empty()) << "Expected empty echo, got " << echo.size() << " bytes";
 }
 
@@ -494,37 +508,40 @@ TEST(Client, MultipleConcurrentPings) {
 
     h.client->onConnected([](int64_t){});
 
-    auto connFut = h.client->connect();
+    auto connFut = h.connectOp();
     h.pumpGwUntil([&]() {
         return h.client->state() == rcs::SessionState::Connected;
     });
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.waitReady());
+    ASSERT_TRUE(connFut.ok()) << connFut.describe();
 
     Bytes p1 = {0x01, 0x02, 0x03};
     Bytes p2 = {0xAA, 0xBB};
     Bytes p3 = {'x', 'y', 'z', 0x00, 0xFF};
 
     // Submit all 3 pings from the app thread before any gateway polling.
-    auto f1 = h.client->ping(p1);
-    auto f2 = h.client->ping(p2);
-    auto f3 = h.client->ping(p3);
+    auto f1 = h.pingOp(p1);
+    auto f2 = h.pingOp(p2);
+    auto f3 = h.pingOp(p3);
 
     // Drive the gateway until all 3 futures are ready.
     h.pumpGwUntil([&]() {
-        return (f1.wait_for(0ms) == std::future_status::ready) &&
-               (f2.wait_for(0ms) == std::future_status::ready) &&
-               (f3.wait_for(0ms) == std::future_status::ready);
+        return (f1.ready()) &&
+               (f2.ready()) &&
+               (f3.ready());
     });
 
-    ASSERT_EQ(f1.wait_for(kFutureTimeout), std::future_status::ready) << "f1 not ready";
-    ASSERT_EQ(f2.wait_for(kFutureTimeout), std::future_status::ready) << "f2 not ready";
-    ASSERT_EQ(f3.wait_for(kFutureTimeout), std::future_status::ready) << "f3 not ready";
+    ASSERT_TRUE(f1.waitReady()) << "f1 not ready";
+    ASSERT_TRUE(f2.waitReady()) << "f2 not ready";
+    ASSERT_TRUE(f3.waitReady()) << "f3 not ready";
 
     Bytes e1, e2, e3;
-    ASSERT_NO_THROW(e1 = f1.get()) << "f1 threw";
-    ASSERT_NO_THROW(e2 = f2.get()) << "f2 threw";
-    ASSERT_NO_THROW(e3 = f3.get()) << "f3 threw";
+    ASSERT_TRUE(f1.ok()) << f1.describe() << "f1 threw";
+    e1 = f1.bytes();
+    ASSERT_TRUE(f2.ok()) << f2.describe() << "f2 threw";
+    e2 = f2.bytes();
+    ASSERT_TRUE(f3.ok()) << f3.describe() << "f3 threw";
+    e3 = f3.bytes();
 
     EXPECT_EQ(e1, p1) << "f1 echo mismatch";
     EXPECT_EQ(e2, p2) << "f2 echo mismatch";
@@ -544,14 +561,15 @@ TEST(Client, PingWithoutSessionRejected) {
     ASSERT_NE(h.client->state(), rcs::SessionState::Connected)
         << "Expected non-Connected state before connect()";
 
-    auto fut = h.client->ping({'a', 'b', 'c'});
+    auto fut = h.pingOp(Bytes{'a', 'b', 'c'});
 
-    // The future must already be rejected immediately (no wait for gateway).
-    ASSERT_EQ(fut.wait_for(1s), std::future_status::ready)
-        << "ping-without-session future was not rejected promptly";
+    // F8c C3: "not connected" is decided on the duty thread — a NotConnected
+    // completion, no gateway round trip.
+    ASSERT_TRUE(fut.waitReady())
+        << "ping-without-session was not completed promptly";
 
-    EXPECT_THROW(fut.get(), std::exception)
-        << "ping() without session must throw, not return echo";
+    EXPECT_EQ(fut.status(), OpStatus::NotConnected) << fut.describe()
+        << "ping() without session must complete NotConnected, not return echo";
 }
 
 // ===========================================================================
@@ -571,17 +589,17 @@ TEST(Client, ErrorOnConnectSurfacesOnFuture) {
         errFired.store(true, std::memory_order_release);
     });
 
-    auto fut = h.client->connect();
+    auto fut = h.connectOp();
 
     // Drive the gateway to send the error reply.
     h.pumpGwUntil([&]() {
         return errFired.load(std::memory_order_acquire);
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "connect() future did not resolve after ErrorResponse";
 
-    EXPECT_THROW(fut.get(), std::exception)
+    EXPECT_TRUE(fut.failed()) << fut.describe()
         << "connect() must throw on ErrorResponse";
 
     EXPECT_TRUE(errFired.load()) << "onError was not fired";
@@ -603,22 +621,21 @@ TEST(Client, PingTimeoutNoHang) {
     h.client->onConnected([](int64_t){});
 
     // Establish a connection first (gateway still replies OK to ConnectRequest).
-    auto connFut = h.client->connect();
+    auto connFut = h.connectOp();
     h.pumpGwUntil([&]() {
         return h.client->state() == rcs::SessionState::Connected;
     });
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.waitReady());
+    ASSERT_TRUE(connFut.ok()) << connFut.describe();
 
     // Now send a ping — gateway will NOT reply.
-    auto pingFut = h.client->ping({'x'});
+    auto pingFut = h.pingOp(Bytes{'x'});
 
     // The future must fail within pingTimeoutMs + generous test margin (3 s).
-    const auto status = pingFut.wait_for(3s);
-    ASSERT_EQ(status, std::future_status::ready)
+    ASSERT_TRUE(pingFut.waitReady())
         << "ping() future did not fail within timeout — potential hang";
 
-    EXPECT_THROW(pingFut.get(), std::exception)
+    EXPECT_TRUE(pingFut.failed()) << pingFut.describe()
         << "ping() must throw on timeout, not return a value";
 }
 
@@ -635,20 +652,17 @@ TEST(Client, CloseFailsPendingFutures) {
     h.build(/*gwReplyOK=*/false, /*gwReplyErr=*/false);
 
     // Submit a connect — gateway won't reply so the future hangs... until close().
-    auto fut = h.client->connect();
+    auto fut = h.connectOp();
 
-    // Let it sit for a bit then close.
-    std::this_thread::sleep_for(200ms);
-
-    // close() must join the runner and fail the future.
+    // close() must join the runner and complete the connect (Closed) — the
+    // op is either still in the command ring (close()'s final drain) or
+    // pending on the duty side; either way it completes exactly once.
     ASSERT_NO_THROW(h.client->close())
         << "close() threw while pending connect was in-flight";
 
-    ASSERT_EQ(fut.wait_for(2s), std::future_status::ready)
-        << "connect() future was not failed by close() within 2 s";
-
-    EXPECT_THROW(fut.get(), std::exception)
-        << "connect() future must throw after close()";
+    ASSERT_TRUE(fut.ready()) << "connect was not completed by close()";
+    EXPECT_EQ(fut.status(), OpStatus::Closed) << fut.describe();
+    EXPECT_EQ(h.cq->timesCompleted(fut.token()), 1);
 }
 
 // ===========================================================================
@@ -681,14 +695,14 @@ TEST(Client, DtorAfterConnectClean) {
             connectedFired.store(true, std::memory_order_release);
         });
 
-        auto fut = h.client->connect();
+        auto fut = h.connectOp();
 
         h.pumpGwUntil([&]() {
             return connectedFired.load(std::memory_order_acquire);
         });
 
         // Wait for the future to resolve so we know we're in Connected state.
-        EXPECT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready);
+        EXPECT_TRUE(fut.waitReady());
 
         // Dtor fires here (GatewayHarness destructs client, then gw, then driver).
         // The client dtor calls close() → joins runner → stops agent → cleans up.
@@ -727,14 +741,14 @@ TEST(Client, ConnectThenImmediatePingNotRejected) {
         connectedFired.store(true, std::memory_order_release);
     });
 
-    auto connFut = h.client->connect();
+    auto connFut = h.connectOp();
 
     // Drive the gateway until onConnected has fired.
     h.pumpGwUntil([&]() { return connectedFired.load(std::memory_order_acquire); });
 
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(connFut.waitReady())
         << "connect() future did not resolve";
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.ok()) << connFut.describe();
 
     ASSERT_TRUE(connectedFired.load()) << "onConnected did not fire";
     // The core F1 assertion: at the instant the observer resolved the promise,
@@ -744,15 +758,16 @@ TEST(Client, ConnectThenImmediatePingNotRejected) {
            "(snapshot must be published BEFORE the egress observer runs)";
 
     // Belt-and-braces: a ping issued right now must not be rejected "not connected".
-    auto pingFut = h.client->ping({'p', 'i', 'n', 'g'});
+    auto pingFut = h.pingOp(Bytes{'p', 'i', 'n', 'g'});
     h.pumpGwUntil([&]() {
-        return pingFut.wait_for(0ms) == std::future_status::ready;
+        return pingFut.ready();
     });
-    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(pingFut.waitReady())
         << "immediate ping() future did not resolve";
     Bytes echo;
-    ASSERT_NO_THROW(echo = pingFut.get())
+    ASSERT_TRUE(pingFut.ok()) << pingFut.describe()
         << "immediate ping after connect() was rejected — F1 regression";
+    echo = pingFut.bytes();
     EXPECT_EQ(echo, (Bytes{'p', 'i', 'n', 'g'}));
 }
 
@@ -769,27 +784,27 @@ TEST(Client, ErrorResponseFailsInFlightPing) {
     h.build();
 
     h.client->onConnected([](int64_t){});
-    auto connFut = h.client->connect();
+    auto connFut = h.connectOp();
     h.pumpGwUntil([&]() {
         return h.client->state() == rcs::SessionState::Connected;
     });
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.waitReady());
+    ASSERT_TRUE(connFut.ok()) << connFut.describe();
 
     // Arm the gateway to answer the next Ping with ErrorResponse{SessionExpired}.
     h.gw->pingReplyError = true;
     h.gw->pingErrorCode  = static_cast<int16_t>(rcc::ErrorCode::SessionExpired);
 
     const auto t0 = std::chrono::steady_clock::now();
-    auto pingFut = h.client->ping({'x', 'y'});
+    auto pingFut = h.pingOp(Bytes{'x', 'y'});
 
     h.pumpGwUntil([&]() {
-        return pingFut.wait_for(0ms) == std::future_status::ready;
+        return pingFut.ready();
     });
 
-    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(pingFut.waitReady())
         << "ping() future did not resolve after ErrorResponse{SessionExpired}";
-    EXPECT_THROW(pingFut.get(), std::exception)
+    EXPECT_TRUE(pingFut.failed()) << pingFut.describe()
         << "ping() must FAIL on ErrorResponse{SessionExpired}";
 
     const auto elapsed = std::chrono::steady_clock::now() - t0;
@@ -820,17 +835,15 @@ TEST(Client, ConnectResolveVsTimeoutExactlyOnce) {
         }
     });
 
-    auto fut = h.client->connect();
+    auto fut = h.connectOp();
 
     // Exactly one outcome; must become ready (resolved or timed out), never hang.
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "connect() future neither resolved nor timed out — possible lost resolution";
 
-    // get() yields exactly one deterministic result: either success or a throw.
-    bool threw = false;
-    try { fut.get(); } catch (...) { threw = true; }
-    // Either outcome is acceptable; the point is no double-satisfy / no crash.
-    SUCCEED() << "connect resolved-or-failed exactly once (threw=" << threw << ")";
+    // Exactly one completion: either Ok or Timeout, never both.
+    EXPECT_TRUE(fut.status() == OpStatus::Ok || fut.status() == OpStatus::Timeout) << fut.describe();
+    EXPECT_EQ(h.cq->timesCompleted(fut.token()), 1) << "connect completed more than once";
 
     pumpStop.store(true, std::memory_order_release);
     pump.join();
@@ -854,19 +867,19 @@ TEST(Client, RedirectToUnresolvableEndpointNoTerminate) {
     h.gw->redirectOnConnect = true;
     h.gw->redirectEndpoint  = "aeron:udp?endpoint=192.0.2.1:59999"; // TEST-NET-1, unroutable
 
-    auto fut = h.client->connect();
+    auto fut = h.connectOp();
 
     // Drive the gateway so it delivers the redirect(s); the agent will attempt
     // to retarget to the unresolvable endpoint on the runner thread.
     h.pumpGwUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+        return fut.ready();
     });
 
     // The key assertion: we got here with NO std::terminate.  The future must be
     // resolved (as a failure) within a bounded time — never hang.
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "connect() future never completed after unresolvable redirect";
-    EXPECT_THROW(fut.get(), std::exception)
+    EXPECT_TRUE(fut.failed()) << fut.describe()
         << "connect() to an unresolvable redirect endpoint must fail (not succeed)";
 
     // Client must still be usable / closeable — no crash.
@@ -884,12 +897,12 @@ TEST(Client, CoherentStateSnapshotAfterConnect) {
     GatewayHarness h(950, 951);
     h.build(/*gwReplyOK=*/true);
 
-    auto connFut = h.client->connect();
+    auto connFut = h.connectOp();
     h.pumpGwUntil([&]() {
         return h.client->state() == rcs::SessionState::Connected;
     });
-    ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.waitReady());
+    ASSERT_TRUE(connFut.ok()) << connFut.describe();
 
     // The public state() must be Connected; the assigned sessionId (42) is set.
     EXPECT_EQ(h.client->state(), rcs::SessionState::Connected);
@@ -898,14 +911,15 @@ TEST(Client, CoherentStateSnapshotAfterConnect) {
     // (We can only observe via the public state(); the coherent accessor is
     // exercised inside ping() — a successful ping proves a valid sessionId was
     // stamped, i.e. the pair was coherent.)
-    auto pingFut = h.client->ping({0x01});
+    auto pingFut = h.pingOp(Bytes{0x01});
     h.pumpGwUntil([&]() {
-        return pingFut.wait_for(0ms) == std::future_status::ready;
+        return pingFut.ready();
     });
-    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready);
+    ASSERT_TRUE(pingFut.waitReady());
     Bytes echo;
-    ASSERT_NO_THROW(echo = pingFut.get())
+    ASSERT_TRUE(pingFut.ok()) << pingFut.describe()
         << "ping stamped with a coherent (Connected, sessionId!=0) snapshot must succeed";
+    echo = pingFut.bytes();
     EXPECT_EQ(echo, (Bytes{0x01}));
 }
 
@@ -925,22 +939,23 @@ TEST(Client, IdleModeBalancedAndLowLatencyBothConnectAndPing) {
         // Default ClientConfig has idleMode = IdleMode::Balanced.
         h.build(/*gwReplyOK=*/true);
 
-        auto connFut = h.client->connect();
+        auto connFut = h.connectOp();
         h.pumpGwUntil([&]() {
             return h.client->state() == rcs::SessionState::Connected;
         });
-        ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+        ASSERT_TRUE(connFut.waitReady())
             << "Balanced: connect() future did not resolve";
-        ASSERT_NO_THROW(connFut.get()) << "Balanced: connect() threw";
+        ASSERT_TRUE(connFut.ok()) << connFut.describe() << "Balanced: connect() threw";
 
-        auto pingFut = h.client->ping({'b', 'a', 'l'});
+        auto pingFut = h.pingOp(Bytes{'b', 'a', 'l'});
         h.pumpGwUntil([&]() {
-            return pingFut.wait_for(0ms) == std::future_status::ready;
+            return pingFut.ready();
         });
-        ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+        ASSERT_TRUE(pingFut.waitReady())
             << "Balanced: ping() future did not resolve";
         Bytes echo;
-        ASSERT_NO_THROW(echo = pingFut.get()) << "Balanced: ping() threw";
+        ASSERT_TRUE(pingFut.ok()) << pingFut.describe() << "Balanced: ping() threw";
+    echo = pingFut.bytes();
         EXPECT_EQ(echo, (Bytes{'b', 'a', 'l'})) << "Balanced: echo mismatch";
     }
 
@@ -978,22 +993,26 @@ TEST(Client, IdleModeBalancedAndLowLatencyBothConnectAndPing) {
             return false;
         };
 
-        auto connFut = client->connect();
+        test_support::TestCq cq(*client);
+        auto connFut = cq.issue([&](Completions& q, Token t) { return client->connect(q, t); });
         pumpUntil([&]() { return client->state() == rcs::SessionState::Connected; });
 
-        ASSERT_EQ(connFut.wait_for(kFutureTimeout), std::future_status::ready)
+        ASSERT_TRUE(connFut.waitReady())
             << "LowLatency: connect() future did not resolve";
-        ASSERT_NO_THROW(connFut.get()) << "LowLatency: connect() threw";
+        ASSERT_TRUE(connFut.ok()) << connFut.describe() << "LowLatency: connect() threw";
         ASSERT_EQ(client->state(), rcs::SessionState::Connected)
             << "LowLatency: state() != Connected after connect()";
 
-        auto pingFut = client->ping({'l', 'l', 'p'});
-        pumpUntil([&]() { return pingFut.wait_for(0ms) == std::future_status::ready; });
+        auto pingFut = cq.issue([&](Completions& q, Token t) {
+            return client->ping(Bytes{'l', 'l', 'p'}, q, t);
+        });
+        pumpUntil([&]() { return pingFut.ready(); });
 
-        ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+        ASSERT_TRUE(pingFut.waitReady())
             << "LowLatency: ping() future did not resolve";
         Bytes echo;
-        ASSERT_NO_THROW(echo = pingFut.get()) << "LowLatency: ping() threw";
+        ASSERT_TRUE(pingFut.ok()) << pingFut.describe() << "LowLatency: ping() threw";
+    echo = pingFut.bytes();
         EXPECT_EQ(echo, (Bytes{'l', 'l', 'p'})) << "LowLatency: echo mismatch";
 
         client->close();
@@ -1035,20 +1054,20 @@ TEST(Client, BlockingSendFromCallbackDoesNotTerminateThreadRegression) {
         p.send(topic, Key(ok), std::span<const uint8_t>(val)); // NOT wrapped in try/catch
     });
 
-    auto fut = h.client->connect();
+    auto fut = h.connectOp();
     h.pumpGwUntil([&]() { return ran.load(std::memory_order_acquire); });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    ASSERT_TRUE(fut.waitReady())
         << "connect() future did not resolve — the runner thread may have died";
-    ASSERT_NO_THROW(fut.get());
+    ASSERT_TRUE(fut.ok()) << fut.describe();
     EXPECT_TRUE(ran.load());
 
     // The runner thread survived: a subsequent ping still completes.
-    auto pingFut = h.client->ping({'o', 'k'});
-    h.pumpGwUntil([&] { return pingFut.wait_for(0ms) == std::future_status::ready; });
-    ASSERT_EQ(pingFut.wait_for(kFutureTimeout), std::future_status::ready)
+    auto pingFut = h.pingOp(Bytes{'o', 'k'});
+    h.pumpGwUntil([&] { return pingFut.ready(); });
+    ASSERT_TRUE(pingFut.waitReady())
         << "runner thread did not survive the uncaught callback exception";
-    EXPECT_NO_THROW(pingFut.get());
+    EXPECT_TRUE(pingFut.ok()) << pingFut.describe();
 
     // fix2 minor-5: callbackExceptions_ is a PLAIN counter (shared-nothing
     // rule — no atomics), written only on the runner thread. Reading it from
@@ -1081,7 +1100,7 @@ TEST(Client, SendAfterClientCloseReturnsClosedRegression) {
     }
     ASSERT_GT(ok, 0u);
 
-    h.client->close();
+    h.client->closeImmediately();  // C7: teardown semantics (close() drains)
 
     EXPECT_EQ(p.trySend(topic, Key(ok), std::span<const uint8_t>(val)), SendResult::Closed);
     EXPECT_THROW(p.send(topic, Key(ok), std::span<const uint8_t>(val)), std::logic_error);
@@ -1122,11 +1141,11 @@ TEST(Client, ThreadModeRunnerBlockingSendDoesNotStallRegression) {
             std::memory_order_release);
     });
 
-    auto fut = h.client->connect();
+    auto fut = h.connectOp();
     h.pumpGwUntil([&]() { return elapsedMs.load(std::memory_order_acquire) >= 0; });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready);
-    ASSERT_NO_THROW(fut.get());
+    ASSERT_TRUE(fut.waitReady());
+    ASSERT_TRUE(fut.ok()) << fut.describe();
     EXPECT_TRUE(threw.load());
     EXPECT_LT(elapsedMs.load(), 5000)
         << "sendBlocking waited instead of failing fast on DeclinedInCycle "
@@ -1165,4 +1184,108 @@ TEST(ClientConfigMapping, EnvMtuOverridesClientConfig) {
     const auto a = rune::client::toAgentConfig(c);
     ::unsetenv("RUNE_CLIENT_AERON_MTU");
     EXPECT_EQ(a.transport.mtuLength, 4096u);
+}
+
+// ---------------------------------------------------------------------------
+// F8c C0: ClientAgent's lifecycle flags (started_/stopped_) are plain owner
+// state — no atomics.  A stop requested from another thread goes through the
+// runner shutdown path: Client::close() ends the runner loop, JOINS it, and only
+// then calls ClientAgent::stop().  This connected Thread-mode client (the runner
+// has run many duty cycles, each reading stopped_) is closed from the app
+// thread; under TSan the join edge must order the runner's reads before the
+// stop() write (RED by mutation: stop() before the join -> data race report).
+// No sleeps: the test thread pumps the gateway until each step is observed.
+// ---------------------------------------------------------------------------
+TEST(ClientLifecycle, CloseStopsAgentOnlyAfterRunnerJoinRegression) {
+    const std::string dir = uniqueDir();
+    ClientConfig cfg;
+    cfg.gatewayChannel   = "aeron:ipc";
+    cfg.gatewayStreamId  = 990;
+    cfg.egressChannel    = "aeron:ipc";
+    cfg.egressStreamId   = 991;
+    cfg.dataDir          = dir;
+    cfg.connectTimeoutMs = 30'000;
+    auto client = std::make_unique<Client>(cfg);   // Thread mode: runner is live
+    auto gw = std::make_unique<TestGateway>(dir + "/aeron");
+    gw->replyWithOK = true;
+    gw->start(990, 991);
+    test_support::TestCq cq(*client);
+    auto fut = cq.issue([&](Completions& q, Token t) { return client->connect(q, t); });
+    for (int i = 0; i < 50'000'000 && !fut.ready(); ++i) {
+        gw->poll(16);
+    }
+    ASSERT_TRUE(fut.ready());
+    ASSERT_TRUE(fut.ok()) << fut.describe();
+    // A duty cycle AFTER the last runner->app synchronisation: the runner drains
+    // this ping and offers it over Aeron IPC; the gateway (this thread) seeing it
+    // proves that cycle ran — and its doWork() read of ClientAgent::stopped_ is
+    // ordered before the close only by the join (no Pong: nothing else syncs).
+    gw->echoPong = false;
+    auto pingFut = cq.issue([&](Completions& q, Token t) { return client->ping(Bytes{'z'}, q, t); });
+    for (int i = 0; i < 50'000'000 && gw->pingsSeen.load() == 0; ++i) gw->poll(16);
+    ASSERT_EQ(gw->pingsSeen.load(), 1);
+    client->close();                                // from the app thread
+    EXPECT_THROW((void)client->producer(), std::logic_error);  // closed for good
+    gw.reset();
+    client.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// F8c C8 (spec §3.4): the runner start latch.  The runner writes dutyThreadId_
+// (its own id) as its first action, then publishes one record on a stack-local
+// OneToOneRingBuffer; the constructor returns only after reading that record.
+//   * App side: the moment the constructor returns, dutyThreadId_ IS the
+//     runner's id, and reading it is ordered after the runner's write (TSan).
+//   (F8c C9, C8 review nit 4: the former runner-side "saw its own id" check was
+//   dropped with its production-state test hook — the runner reads its own
+//   write a statement earlier, so it could only fail for a design in which the
+//   runner does not write the id at all, which the app-side check covers.)
+// RED by mutation: (a) the constructor not waiting for the record -> stale id
+// (the owner's) and a TSan race; (b) the runner publishing before writing its
+// id -> TSan race.  No sleeps; nothing waits on time.
+// ---------------------------------------------------------------------------
+TEST(ClientLifecycle, RunnerSeesDutyThreadIdBeforeFirstCycleRegression) {
+    for (int i = 0; i < 20; ++i) {
+        const std::string dir = uniqueDir();
+        ClientConfig cfg;
+        cfg.gatewayChannel  = "aeron:ipc";
+        cfg.gatewayStreamId = 992;
+        cfg.egressChannel   = "aeron:ipc";
+        cfg.egressStreamId  = 993;
+        cfg.dataDir         = dir;
+        cfg.runnerMode      = RunnerMode::Thread;
+        auto client = std::make_unique<Client>(cfg);
+        // Read immediately — no pump, no wait: the latch alone must order it.
+        const std::thread::id duty   = client->testDutyThreadId();
+        const std::thread::id runner = client->testRunnerThreadId();
+        ASSERT_NE(runner, std::thread::id{});
+        ASSERT_NE(runner, std::this_thread::get_id());
+        ASSERT_EQ(duty, runner) << "iteration " << i;
+        client->close();
+        client.reset();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+}
+
+// F8c C9 (C8 review nit 6): the Invoker-mode side of the same invariant — no
+// runner exists and the constructing (owner) thread IS the duty thread.
+TEST(ClientLifecycle, InvokerOwnerIsDutyThreadRegression) {
+    const std::string dir = uniqueDir();
+    ClientConfig cfg;
+    cfg.gatewayChannel  = "aeron:ipc";
+    cfg.gatewayStreamId = 994;
+    cfg.egressChannel   = "aeron:ipc";
+    cfg.egressStreamId  = 995;
+    cfg.dataDir         = dir;
+    cfg.runnerMode      = RunnerMode::Invoker;
+    auto client = std::make_unique<Client>(cfg);
+    EXPECT_EQ(client->testDutyThreadId(), std::this_thread::get_id());
+    EXPECT_EQ(client->testRunnerThreadId(), std::thread::id{});
+    client->close();
+    client.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }

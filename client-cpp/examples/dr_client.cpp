@@ -107,6 +107,7 @@
 // Exit code: 0 on success, 1 on workload assertion failure, 2 on exception.
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
@@ -122,7 +123,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <future>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -132,6 +132,24 @@
 
 using namespace std::chrono_literals;
 using namespace rune::client;
+
+// F8c C6: one acked send waited on a Completions (examples only — the library
+// deliberately offers no per-record *AndWait sugar).  false = rejected or the
+// wait timed out (`out.status` = Timeout then; the op still completes later).
+static bool sendAndWaitAck(Completions& cq, Producer& p, const TopicHandle& th, const Key& key,
+                           std::span<const uint8_t> v, Token t, int timeoutMs, Completion& out) {
+    for (;;) {
+        const SendResult r = p.trySend(th, key, v, cq, t);
+        if (r == SendResult::Ok) break;
+        if (r == SendResult::QueueFull) { (void)cq.poll([](const Completion&, std::span<const uint8_t>) {}); continue; }
+        if (r != SendResult::BackPressured) { out.status = OpStatus::Closed; return false; }
+        std::this_thread::yield();
+    }
+    const auto w = cq.waitFor(t, std::chrono::milliseconds(timeoutMs),
+                              [&](const Completion& c, std::span<const uint8_t>) { out = c; });
+    if (w != Completions::Wait::Done) { out.status = OpStatus::Timeout; return false; }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Env helpers
@@ -212,6 +230,7 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
     pcfg.maxInFlight      = 16;
     pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
     auto p = c.producer(pcfg);
+    Completions cq(c);
 
     const int64_t interNs =
         (rateHz > 0) ? static_cast<int64_t>(1'000'000'000LL / rateHz) : 0;
@@ -233,29 +252,31 @@ static int doProduce(Client& c, const TopicHandle& th, int cid, int records,
 
         Key key(effKey);
         const int32_t part = key.partition(partitionCount);
-        auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-        if (fut.wait_until(deadline) != std::future_status::ready) {
+        Completion done;
+        const bool waited = sendAndWaitAck(cq, p, th, key, std::span<const uint8_t>(val),
+                                           static_cast<Token>(seq) + 1, timeoutMs, done);
+        if (!waited && done.status == OpStatus::Timeout) {
             // MD1 Fix 7c: log the timeout but continue (same resilience as the
             // exception path below — individual timeouts must not abort the batch).
             std::cerr << "CLIENT: FAIL produce cid=" << cid << " seq=" << seq
                       << " TIMEOUT\n";
             continue;
         }
-        try {
-            const int64_t offset = fut.get();
+        if (waited && done.status == OpStatus::Ok) {
+            const int64_t offset = done.value;
             std::cout << "PRODUCED cid=" << cid << " key=" << keyIdx
                       << " seq=" << seq << " part=" << part << " offset=" << offset << "\n";
             std::cout.flush();
             ++acked;
-        } catch (const std::exception& ex) {
+        } else {
+            const std::string why = "produce failed (status=" + std::to_string(static_cast<int>(done.status)) +
+                                    " errorCode=" + std::to_string(done.errorCode) + ")";
             // MD1 Fix 7c: log the failure but continue the produce loop.
             // A single-record failure (e.g. NotLeader / dead partition leader
             // in Phase-1 availability tests) must not abort the entire batch;
             // the alive partitions must still get their records.
             std::cerr << "CLIENT: FAIL produce cid=" << cid << " seq=" << seq
-                      << ": " << ex.what() << "\n";
+                      << ": " << why << "\n";
             continue;
         }
     }
@@ -451,7 +472,7 @@ static int doGroup(Client& client,
 
     // All callbacks registered before connect() — setup-phase contract satisfied.
     std::cerr << "CLIENT: group connecting...\n";
-    client.connect().get();
+    client.connectAndWait();
     std::cerr << "CLIENT: group connected\n";
 
     // Drain the queue until windowMs expires.
@@ -507,13 +528,11 @@ static int doTxnProduce(Client& c, const TopicHandle& th,
 
     auto tp = c.transactionalProducer(txnId, pcfg);
 
-    // initTransactions
-    auto initFut = tp.initTransactions();
-    if (initFut.wait_for(std::chrono::milliseconds(timeoutMs)) != std::future_status::ready) {
-        std::cerr << "CLIENT: FAIL txn initTransactions TIMEOUT\n";
-        return 1;
-    }
-    try { initFut.get(); } catch (const std::exception& ex) {
+    // initTransactions (F8c C5: cold-path blocking form; the op itself is
+    // bounded by produceTimeoutMs of duty time)
+    try {
+        tp.initTransactionsAndWait(std::chrono::milliseconds(timeoutMs * 2));
+    } catch (const std::exception& ex) {
         std::cerr << "CLIENT: FAIL txn initTransactions: " << ex.what() << "\n";
         return 1;
     }
@@ -539,26 +558,16 @@ static int doTxnProduce(Client& c, const TopicHandle& th,
 
     // commit or abort
     const std::string outcome = doCommit ? "committed" : "aborted";
-    if (doCommit) {
-        auto fut = tp.commitTransaction();
-        if (fut.wait_for(std::chrono::milliseconds(timeoutMs * 2)) != std::future_status::ready) {
-            std::cerr << "CLIENT: FAIL txn commitTransaction TIMEOUT\n";
-            return 1;
+    try {
+        if (doCommit) {
+            tp.commitTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
+        } else {
+            tp.abortTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
         }
-        try { fut.get(); } catch (const std::exception& ex) {
-            std::cerr << "CLIENT: FAIL txn commitTransaction: " << ex.what() << "\n";
-            return 1;
-        }
-    } else {
-        auto fut = tp.abortTransaction();
-        if (fut.wait_for(std::chrono::milliseconds(timeoutMs * 2)) != std::future_status::ready) {
-            std::cerr << "CLIENT: FAIL txn abortTransaction TIMEOUT\n";
-            return 1;
-        }
-        try { fut.get(); } catch (const std::exception& ex) {
-            std::cerr << "CLIENT: FAIL txn abortTransaction: " << ex.what() << "\n";
-            return 1;
-        }
+    } catch (const std::exception& ex) {
+        std::cerr << "CLIENT: FAIL txn " << (doCommit ? "commitTransaction" : "abortTransaction")
+                  << ": " << ex.what() << "\n";
+        return 1;
     }
 
     std::cout << "TXNRESULT txn_id=" << txnId << " cid=" << cid
@@ -646,7 +655,7 @@ static int doTxnConsume(Client& c,
     });
 
     std::cerr << "CLIENT: txn_consume group connecting...\n";
-    c.connect().get();
+    c.connectAndWait();
     std::cerr << "CLIENT: txn_consume group connected\n";
 
     const auto deadline =
@@ -803,7 +812,7 @@ int main() {
             std::cerr << "CLIENT: txn_produce mode txnId=" << txnId
                       << " commit=" << txnCommit << " records=" << records << "\n";
             std::cerr << "CLIENT: connecting...\n";
-            c.connect().get();
+            c.connectAndWait();
             std::cerr << "CLIENT: connected\n";
             const TopicHandle thTxn = c.topic(cfg.topics[0].name);
             if (!thTxn.valid()) {
@@ -859,7 +868,7 @@ int main() {
         }
 
         std::cerr << "CLIENT: connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "CLIENT: connected\n";
 
         // No settle window needed: DR-BUG-1 is fixed. Producer registration

@@ -55,8 +55,12 @@ static mc::PartitionEntry makePartitionEntry(int32_t topicId, int32_t partition,
 
 // Build a MetadataResponse wire frame and decode it into MetadataResponseDecoded.
 // The response is built using the rune-protocol MetadataResponse codec directly.
+// The decoded views point INTO `buf` (zero-copy): the caller owns it and keeps
+// it alive while the result is used (a helper-local buffer was a heap
+// use-after-free — ASan).
 static std::optional<rcc::MetadataResponseDecoded>
 buildAndDecodeMetadataResponse(
+    std::vector<uint8_t>&                  buf,
     const std::vector<mc::BrokerEntry>&    brokers,
     const std::vector<mc::PartitionEntry>& partitions,
     int64_t sessionId     = 1,
@@ -88,7 +92,7 @@ buildAndDecodeMetadataResponse(
     msg.brokers       = std::span<const rpc::BrokerEntry>(rpBrokers);
     msg.partitions    = std::span<const rpc::PartitionEntry>(rpParts);
 
-    std::vector<uint8_t> buf(4096);
+    buf.assign(4096, 0);
     const std::size_t n = msg.encode(buf.data());
     if (n == 0) return std::nullopt;
 
@@ -131,7 +135,8 @@ TEST(MetadataIntegration, WireRoundTrip_MetadataResponse_PopulatesCache) {
     std::vector<mc::PartitionEntry> partitions = { makePartitionEntry(1, 0, 0, 3),
                                                     makePartitionEntry(1, 1, 1, 3) };
 
-    auto decoded = buildAndDecodeMetadataResponse(brokers, partitions);
+    std::vector<uint8_t> wire;  // the decoded views point into it
+    auto decoded = buildAndDecodeMetadataResponse(wire, brokers, partitions);
     ASSERT_TRUE(decoded.has_value()) << "decode failed";
 
     mc::MetadataCache cache;
@@ -148,7 +153,8 @@ TEST(MetadataIntegration, WireRoundTrip_MetadataResponse_PopulatesCache) {
 // MI-2: Empty brokers and partitions in MetadataResponse
 // ===========================================================================
 TEST(MetadataIntegration, DecodeMetadataResponse_EmptyBrokers_EmptyPartitions) {
-    auto decoded = buildAndDecodeMetadataResponse({}, {});
+    std::vector<uint8_t> wire;
+    auto decoded = buildAndDecodeMetadataResponse(wire, {}, {});
     ASSERT_TRUE(decoded.has_value());
     EXPECT_TRUE(decoded->brokers.empty());
     EXPECT_TRUE(decoded->partitions.empty());
@@ -166,7 +172,8 @@ TEST(MetadataIntegration, MetadataResponse_Then_Route_CorrectNode) {
     std::vector<mc::BrokerEntry>    brokers    = { makeBrokerEntry(2, "server2", 7002) };
     std::vector<mc::PartitionEntry> partitions = { makePartitionEntry(5, 0, 2, 1) };
 
-    auto decoded = buildAndDecodeMetadataResponse(brokers, partitions);
+    std::vector<uint8_t> wire;  // the decoded views point into it
+    auto decoded = buildAndDecodeMetadataResponse(wire, brokers, partitions);
     ASSERT_TRUE(decoded.has_value());
 
     mc::MetadataCache   cache;
@@ -189,7 +196,8 @@ TEST(MetadataIntegration, ZeroRTT_AfterRedirect_CacheUpdated_RouteChanged) {
                                                     makeBrokerEntry(1, "a1", 9001) };
     std::vector<mc::PartitionEntry> partitions = { makePartitionEntry(8, 0, 0, 1) };
 
-    auto decoded = buildAndDecodeMetadataResponse(brokers, partitions);
+    std::vector<uint8_t> wire;  // the decoded views point into it
+    auto decoded = buildAndDecodeMetadataResponse(wire, brokers, partitions);
     ASSERT_TRUE(decoded.has_value());
 
     mc::MetadataCache   cache;
@@ -228,7 +236,8 @@ TEST(MetadataIntegration, MetadataResponse_StalenessGate_LowerEpochDropped) {
     std::vector<mc::BrokerEntry>    brokers    = { makeBrokerEntry(9, "stale", 9009) };
     std::vector<mc::PartitionEntry> partitions = { makePartitionEntry(3, 0, 9, 7) };
 
-    auto decoded = buildAndDecodeMetadataResponse(brokers, partitions);
+    std::vector<uint8_t> wire;  // the decoded views point into it
+    auto decoded = buildAndDecodeMetadataResponse(wire, brokers, partitions);
     ASSERT_TRUE(decoded.has_value());
 
     populateCache(cache, *decoded);

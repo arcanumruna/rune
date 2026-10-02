@@ -169,7 +169,7 @@ int main() {
         Client c(cfg);
         c.onError([](const std::string& m){ std::cerr << "onError: " << m << "\n"; });
         std::cerr << "connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "connected\n";
         const TopicHandle th = c.topic(cfg.topics[0].name);
         if (!th.valid()) { std::cerr << "topic invalid\n"; return 2; }
@@ -192,6 +192,35 @@ int main() {
             std::vector<int64_t> lat;                 // ack latency samples (ns), sparse
             lat.reserve(1 << 16);
             std::atomic<uint64_t> sampleGate{0};
+            // F8c C6: acks arrive at the producer's onAck handler (a plain
+            // function pointer, runner thread) — token = record index; the
+            // send timestamp is published to the runner by the ring itself
+            // (written before the send, read after its ack).
+            std::vector<clk::time_point> sendTs(static_cast<std::size_t>(nRecords));
+            struct AckCtx {
+                std::atomic<uint64_t>*         acked;
+                std::atomic<uint64_t>*         succeeded;
+                std::atomic<uint64_t>*         failed;
+                std::atomic<uint64_t>*         sampleGate;
+                std::vector<int64_t>*          lat;
+                std::vector<clk::time_point>*  sendTs;
+            } actx{&acked, &succeeded, &failed, &sampleGate, &lat, &sendTs};
+            p.onAck([](void* raw, Token tok, int64_t /*offset*/, OpStatus st, uint16_t) noexcept {
+                auto* a = static_cast<AckCtx*>(raw);
+                RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientDrvAckCb, static_cast<uint32_t>(tok));
+                a->acked->fetch_add(1, std::memory_order_release);
+                if (st == OpStatus::Ok) {
+                    a->succeeded->fetch_add(1, std::memory_order_relaxed);
+                    // sample ~1/256 SUCCESSFUL acks for latency
+                    if ((a->sampleGate->fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0 &&
+                        a->lat->size() < a->lat->capacity()) {
+                        a->lat->push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            clk::now() - (*a->sendTs)[static_cast<std::size_t>(tok)]).count());
+                    }
+                } else {
+                    a->failed->fetch_add(1, std::memory_order_relaxed);
+                }
+            }, &actx);
             const auto t0 = clk::now();
             // DIAG: sample sent/acked every 250ms to see whether acks arrive as a
             // steady rate or in bursts (RUNE_BENCH_PROGRESS=1 to enable).
@@ -226,28 +255,16 @@ int main() {
                 // bounded outstanding — backpressure like Kafka buffer.memory
                 const auto submitTs = clk::now();
                 waitUntil([&]{ return static_cast<int64_t>(i - acked.load(std::memory_order_acquire)) < window; });
-                const auto sendTs = clk::now();
+                const auto sendTs1 = clk::now();
                 // Driver: window cleared → send.  value = µs SPENT waiting on the
                 // MIF window (ack starvation) — the driver's view of pipeline stall.
                 const double windowWaitUs =
-                    std::chrono::duration<double, std::micro>(sendTs - submitTs).count();
+                    std::chrono::duration<double, std::micro>(sendTs1 - submitTs).count();
                 RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientDrvSend,
                     static_cast<uint32_t>(i), windowWaitUs);
+                sendTs[static_cast<std::size_t>(i)] = sendTs1;
                 p.send(th, Key(static_cast<uint64_t>(i % keys)), std::span<const uint8_t>(val),
-                       [&acked, &succeeded, &failed, &lat, &sampleGate, sendTs, i](int64_t offset){
-                           RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientDrvAckCb,
-                                                static_cast<uint32_t>(i));
-                           acked.fetch_add(1, std::memory_order_release);
-                           if (offset >= 0) {
-                               succeeded.fetch_add(1, std::memory_order_relaxed);
-                               // sample ~1/256 SUCCESSFUL acks for latency
-                               if ((sampleGate.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0)
-                                   lat.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       clk::now() - sendTs).count());
-                           } else {
-                               failed.fetch_add(1, std::memory_order_relaxed);
-                           }
-                       });
+                       AckToken{static_cast<Token>(i)});
                 sent.fetch_add(1, std::memory_order_release);
             }
             p.flush();

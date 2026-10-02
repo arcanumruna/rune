@@ -17,31 +17,50 @@ namespace rune::client {
 // Constructor
 // ---------------------------------------------------------------------------
 
-Subscription::Subscription(std::shared_ptr<SubscriptionImpl> impl,
-                           detail::HubCommandSink            sink,
-                           void*                             sinkCtx,
-                           std::thread::id                   dutyThread) noexcept
-    : impl_(std::move(impl))
+Subscription::Subscription(SubscriptionImpl*      impl,
+                           detail::HubCommandSink sink,
+                           void*                  sinkCtx,
+                           std::thread::id        dutyThread) noexcept
+    : impl_(impl)
     , sink_(sink)
     , sinkCtx_(sinkCtx)
     , dutyThread_(dutyThread)
 {}
 
 // ---------------------------------------------------------------------------
-// Destructor — RAII unsubscribe (never throws)
+// Destructor — F8c C7 release (never throws, never waits for the duty side)
 // ---------------------------------------------------------------------------
 
-Subscription::~Subscription() {
-    if (moved_) return;
-    try {
-        unsubscribe();
-    } catch (const std::exception& e) {
-        std::fprintf(stderr,
-            "rune-client: ~Subscription: unsubscribe command not delivered: %s\n", e.what());
-    } catch (...) {
-        std::fprintf(stderr,
-            "rune-client: ~Subscription: unsubscribe command not delivered (unknown error)\n");
+Subscription::~Subscription() { release_(); }
+
+void Subscription::release_() noexcept {
+    SubscriptionImpl* impl = std::exchange(impl_, nullptr);
+    if (impl == nullptr) return;  // moved-from
+    if (sink_ == nullptr) {
+        // Standalone handle (no duty side was ever attached): ours alone.
+        delete impl;
+        return;
     }
+    // The duty side already detached (Client close handed the impl back, or
+    // it was never registered): never touch the Client — it may be gone.
+    if (!impl->status.producerDetached()) {
+        detail::HubCommand cmd;
+        cmd.op     = detail::HubCommand::Op::HandleRelease;
+        cmd.handle = reinterpret_cast<uint64_t>(impl);
+        cmd.a      = static_cast<int64_t>(detail::HandleKind::Subscription);
+        try {
+            // Accepted: the duty side unsubscribes it and later detaches its
+            // share.  Closed: a close() on another thread hands it back.
+            // Orphaned: the sink handed the share over itself (F8c C7 F1).
+            if (sink_(sinkCtx_, cmd) == detail::HubSubmit::Orphaned) return;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "rune-client: ~Subscription: release not delivered: %s\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "rune-client: ~Subscription: release not delivered (unknown error)\n");
+        }
+    }
+    // The handle's last access: the side that detaches last frees the impl.
+    if (impl->status.detachConsumer()) delete impl;
 }
 
 // ---------------------------------------------------------------------------
@@ -49,35 +68,23 @@ Subscription::~Subscription() {
 // ---------------------------------------------------------------------------
 
 Subscription::Subscription(Subscription&& other) noexcept
-    : impl_(std::move(other.impl_))
+    : impl_(std::exchange(other.impl_, nullptr))
     , sink_(other.sink_)
     , sinkCtx_(other.sinkCtx_)
     , dutyThread_(other.dutyThread_)
-    , moved_(other.moved_)
     , unsubscribed_(other.unsubscribed_)
     , cache_(other.cache_)
-{
-    other.moved_ = true; // prevent dtor from unsubscribing
-}
+{}
 
 Subscription& Subscription::operator=(Subscription&& other) noexcept {
     if (this != &other) {
-        // Unsubscribe the current subscription before overwriting.
-        if (!moved_) {
-            try { unsubscribe(); } catch (...) {
-                std::fprintf(stderr,
-                    "rune-client: Subscription move-assign: unsubscribe command not delivered\n");
-            }
-        }
-
-        impl_         = std::move(other.impl_);
+        release_();  // the current subscription: unsubscribed + released
+        impl_         = std::exchange(other.impl_, nullptr);
         sink_         = other.sink_;
         sinkCtx_      = other.sinkCtx_;
         dutyThread_   = other.dutyThread_;
-        moved_        = other.moved_;
         unsubscribed_ = other.unsubscribed_;
         cache_        = other.cache_;
-        other.moved_  = true;
     }
     return *this;
 }
@@ -87,12 +94,15 @@ Subscription& Subscription::operator=(Subscription&& other) noexcept {
 // ---------------------------------------------------------------------------
 
 void Subscription::unsubscribe() {
-    if (!impl_ || moved_ || sink_ == nullptr) return;
+    if (!impl_ || sink_ == nullptr) return;
 
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::Unsubscribe;
-    cmd.a      = impl_->correlationId;
-    cmd.handle = reinterpret_cast<uint64_t>(impl_.get());  // direct path only (fix3 I3)
+    // F8c C3: the identity is the impl ADDRESS (the Subscribe correlationId is
+    // duty-assigned at adoption and never read by an app thread).  The duty
+    // side only compares it against the impls its own tables hold — it never
+    // dereferences it on the ring path (fix3 I3: the direct path may).
+    cmd.handle = reinterpret_cast<uint64_t>(impl_);
 
     if (onDutyThread_()) {
         // Inside a callback (Thread mode): the sink applies it directly on this
@@ -109,7 +119,7 @@ void Subscription::unsubscribe() {
     // touch the sink again.
     if (impl_->status.closed()) return;
     // Lifecycle command: guaranteed delivery (progress-based wait on a full
-    // ring, never a timeout).  Closed / ClosedAfterSubmit: the close path
+    // ring, never a timeout).  Closed: the close path
     // finishes the subscription.
     (void)sink_(sinkCtx_, cmd);
 }
@@ -129,7 +139,7 @@ int64_t Subscription::position() const {
 }
 
 bool Subscription::active() const {
-    if (!impl_ || moved_) return false;
+    if (!impl_) return false;
     if (onDutyThread_()) return impl_->active;
     if (unsubscribed_) return false;
     return !impl_->status.closed();

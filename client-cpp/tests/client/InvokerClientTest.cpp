@@ -1,6 +1,8 @@
 // tests/client/InvokerClientTest.cpp — Client in RunnerMode::Invoker against the
 // single-threaded InvokerGateway.  The test thread is the only thread: every drive
 // loop is iteration-capped and advances an injected clock instead of sleeping.
+#include "../support/AckLedger.h"
+#include "../support/TestCompletions.h"
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
@@ -59,8 +61,6 @@ rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {
     return c;
 }
 
-template <class F>
-bool ready(F& f) { return f.wait_for(0s) == std::future_status::ready; }
 
 struct Rig {
     rc::Client                   client;  // constructed first: owns the driver
@@ -87,9 +87,10 @@ struct Rig {
 
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
-        auto f = client.connect();
-        ASSERT_TRUE(drive([&] { return ready(f); }));
-        f.get();
+        test_support::TestCq cq(client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
         ASSERT_TRUE(drive([&] { return gw.metadataRequests > 0; }));
     }
 };
@@ -105,19 +106,22 @@ TEST(InvokerClient, ConnectsAndProducesWithNoThreads) {
     pcfg.acks = rc::Acks::Leader;
     pcfg.lingerUs = 0;
     auto p = r.client.producer(pcfg);
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                      rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return ready(fut); }));
-    EXPECT_EQ(fut.get(), 100);
+    test_support::TestCq cq(r.client);
+    auto fut = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(fut.accepted());
+    ASSERT_TRUE(r.drive([&] { return fut.ready(); }));
+    EXPECT_EQ(fut.offset(), 100);
 }
 
 TEST(InvokerClient, NothingProgressesUnlessTheOwnerCallsDoWork) {
     Rig r(invokerCfg(3702, 3703));
     ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
-    auto f = r.client.connect();
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(f.accepted());
     for (int i = 0; i < 10'000; ++i) r.gw.pump();
     EXPECT_EQ(r.gw.connects, 0) << "no background runner may drain the connect command";
-    ASSERT_TRUE(r.drive([&] { return ready(f); }));
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
 }
 
 TEST(InvokerClient, InjectedClockDrivesRetransmitAndDeliveryTimeout) {
@@ -133,13 +137,14 @@ TEST(InvokerClient, InjectedClockDrivesRetransmitAndDeliveryTimeout) {
     pcfg.produceTimeoutMs = 50;
     pcfg.deliveryTimeoutMs = 120;
     auto p = r.client.producer(pcfg);
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                      rc::want_future);
+    test_support::TestCq cq(r.client);
+    auto fut = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(fut.accepted());
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; }));
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 2; }, 1'000, 1'000'000))
         << "retransmit after produceTimeoutMs of INJECTED time";
-    ASSERT_TRUE(r.drive([&] { return ready(fut); }, 1'000, 1'000'000));
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_TRUE(r.drive([&] { return fut.ready(); }, 1'000, 1'000'000));
+    EXPECT_EQ(fut.status(), rc::OpStatus::DeliveryFailed);
 }
 
 // Regression: transactionalProducer() pushed into a mutex-guarded vector that the
@@ -194,18 +199,24 @@ TEST(InvokerClient, CloseFailsUnadoptedProducerRegression) {
         pcfg.acks = rc::Acks::Leader;
         pcfg.lingerUs = 0;
         auto p = client.producer(pcfg);
-        auto fut = p.send(client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                          rc::want_future);
+        test_support::TestCq cq(client);
+        auto fut = cq.send(p, client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+        ASSERT_TRUE(fut.accepted());
         auto tp    = client.transactionalProducer("tx-close");
-        auto initF = tp.initTransactions();
-        client.close();
-        ASSERT_TRUE(ready(fut)) << "produce future must be failed by close(), not hang";
-        EXPECT_THROW(fut.get(), std::runtime_error);
-        ASSERT_TRUE(ready(initF)) << "txn initTransactions future must be failed by close()";
-        EXPECT_THROW(initF.get(), std::runtime_error);
-        // Adoption == the ring holder was consumed and freed (no leak).
-        EXPECT_EQ(client.testProducerCount(), 1u);
-        EXPECT_EQ(client.testTxnProducerCount(), 1u);
+        auto initF = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(initF.accepted()) << initF.describe();
+        client.closeImmediately();  // F8c C7: the discarding close (close() would drain first)
+        ASSERT_TRUE(fut.ready()) << "the produce token must be completed by close(), not hang";
+        EXPECT_EQ(fut.status(), rc::OpStatus::Closed);
+        EXPECT_EQ(cq.timesCompleted(fut.token()), 1);
+        ASSERT_TRUE(initF.ready()) << "txn initTransactions must be completed by close()";
+        EXPECT_EQ(initF.status(), rc::OpStatus::Closed);
+        EXPECT_EQ(cq.timesCompleted(initF.token()), 1);
+        // Adoption == the ring registration was consumed (F8c C7: then handed
+        // back to its handle — no shared_ptr holder, nothing leaked).
+        EXPECT_EQ(client.testImplsHandedBack(), 2u);
+        EXPECT_EQ(client.testProducerCount(), 0u);
+        EXPECT_EQ(client.testTxnProducerCount(), 0u);
     }
 }
 
@@ -282,11 +293,10 @@ TEST(InvokerClient, AckThenConnectResponseInOnePollDoesNotResendRegression) {
     pcfg.acks = rc::Acks::Leader;
     pcfg.lingerUs = 0;
     auto p  = r.client.producer(pcfg);
-    auto fx = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
+    test_support::TestCq cq(r.client);
+    auto fx = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; }));
-    auto fy = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
+    auto fy = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
     ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 2; }));
     const auto X = r.gw.produced[0];
     const auto Y = r.gw.produced[1];
@@ -307,11 +317,11 @@ TEST(InvokerClient, AckThenConnectResponseInOnePollDoesNotResendRegression) {
         for (const auto& pr : r.gw.produced) k += (pr.corrId == corr) ? 1 : 0;
         return k;
     };
-    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && ready(fx); }));
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && fx.ready(); }));
     ASSERT_TRUE(r.drive([&] { return countCorr(Y.corrId) >= 2; }))
         << "the redirected batch Y is resent after the reconnect";
     EXPECT_EQ(countCorr(X.corrId), 1) << "acked batch X must not be resent";
-    EXPECT_EQ(fx.get(), 100);
+    EXPECT_EQ(fx.offset(), 100);
 }
 
 // I5 coverage.
@@ -347,10 +357,10 @@ TEST(InvokerClient, TxnAndRegularProducerAcksBothRouteRegression) {
     pcfg.acks = rc::Acks::Leader;
     pcfg.lingerUs = 0;
     auto p   = r.client.producer(pcfg);
-    auto fut = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                      rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return ready(fut); }));
-    EXPECT_EQ(fut.get(), 100);
+    test_support::TestCq cq(r.client);
+    auto fut = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(r.drive([&] { return fut.ready(); }));
+    EXPECT_EQ(fut.offset(), 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,22 +373,25 @@ TEST(InvokerClient, TxnAndRegularProducerAcksBothRouteRegression) {
 TEST(InvokerClient, DestroyInvokerClientOffOwnerThreadTearsDownRegression) {
     const rc::ClientConfig c = invokerCfg(3770, 3771);
     std::unique_ptr<rc::Client> client;
-    std::future<int64_t> fut;
+    test_support::AckLedger     L;  // the ack handler runs on the closing thread (main)
+    rc::SendResult              sent = rc::SendResult::Closed;
     std::thread a([&] {
         client = std::make_unique<rc::Client>(c);
         rc::ProducerConfig pcfg;
         pcfg.acks = rc::Acks::Leader;
         pcfg.lingerUs = 0;
         auto p = client->producer(pcfg);
-        fut = p.send(client->topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
+        p.onAck(&test_support::AckLedger::onAck, &L);
+        sent = p.trySend(client->topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
+                         rc::AckToken{1});
         for (int i = 0; i < 100; ++i) client->doWork();
     });
     a.join();
+    ASSERT_EQ(sent, rc::SendResult::Ok);
     ASSERT_TRUE(std::filesystem::exists(c.dataDir + "/aeron"));
     client.reset();  // NOT the owner thread
-    ASSERT_TRUE(ready(fut));
-    EXPECT_THROW(fut.get(), std::runtime_error);
+    ASSERT_EQ(L.times(1), 1) << "the produce token is completed by the teardown";
+    EXPECT_EQ(L.status(1), rc::OpStatus::Closed);
     EXPECT_FALSE(std::filesystem::exists(c.dataDir + "/aeron")) << "embedded driver not stopped";
 }
 
@@ -398,7 +411,8 @@ TEST(InvokerClientDeathTest, DestroyFromCallbackAbortsRegression) {
                 client->doWork();
                 gw.pump();
             }
-            auto f = client->connect();
+            test_support::TestCq cq(*client);
+            auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client->connect(q, t); });
             for (int i = 0; i < 200'000 && client; ++i) {
                 client->doWork();
                 gw.pump();
@@ -435,9 +449,9 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     pcfg.lingerUs = 0;
     auto p = r.client.producer(pcfg);
     r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader1");
-    auto fx = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && !r.gw.produced.empty(); }));
+    test_support::TestCq cq(r.client);
+    auto fx = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 2 && !r.gw.produced.empty(); })) << "connects=" << r.gw.connects << " produced=" << r.gw.produced.size() << " fx=" << fx.describe();
     for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // settle
     const auto X = r.gw.produced.front();
     auto countCorr = [&](int64_t corr) {
@@ -452,12 +466,12 @@ TEST(InvokerClient, AckThenResendFnInOnePollDoesNotResendRegression) {
     // A second leader session connects; X's ack precedes its ConnectResponse.
     r.gw.ackBeforeNextConnect.push_back(X);
     r.client.testSetRoute(1, 0, "aeron:ipc?alias=leader2");
-    auto fy = p.send(r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal),
-                     rc::want_future);
-    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 3 && ready(fx); }));
+    auto fy = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 3 && fx.ready(); }))
+        << "connects=" << r.gw.connects << " fx=" << fx.describe();
     for (int i = 0; i < 2'000; ++i) { r.client.doWork(); r.gw.pump(); }  // let any resend land
     EXPECT_EQ(countCorr(X.corrId), base) << "acked batch X must not be re-driven by the resend fn";
-    EXPECT_EQ(fx.get(), 100);
+    EXPECT_EQ(fx.offset(), 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +573,9 @@ TEST(InvokerClient, RingSeamBlockingSendFromCallbackDoesNotTerminateInvokerRegre
     EXPECT_TRUE(ran);
     EXPECT_GT(r.client.testCallbackExceptionCount(), 0u);
     // The duty-cycle thread (the test thread, in Invoker mode) survived: the
-    // client is still fully usable.
+    // client is still fully usable (F8c C7: the callback's producer was
+    // destroyed with the callback — a new one registers).
+    auto again = r.client.producer();
     ASSERT_TRUE(r.drive([&] { return r.client.testProducerCount() >= 1; }));
 }
 
@@ -581,7 +597,7 @@ TEST(InvokerClient, RingSeamSendAfterClientCloseReturnsClosedRegression) {
     }
     ASSERT_GT(ok, 0u);
 
-    r.client.close();
+    r.client.closeImmediately();  // C7: teardown semantics (close() drains)
 
     EXPECT_EQ(p.trySend(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), rc::SendResult::Closed);
     EXPECT_THROW(p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal)), std::logic_error);
@@ -677,11 +693,19 @@ TEST(InvokerClient, RingSeamHeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDra
 
     std::atomic<bool> threw{false};
     std::atomic<bool> succeeded{false};
+    // C-F22: catch EVERYTHING and keep the message — an exception escaping this
+    // thread used to std::terminate the whole binary ("Subprocess aborted", no
+    // output) instead of failing this test with a diagnosis.
+    std::string what;   // written only by appThread, read after join()
     std::thread appThread([&] {
         try {
             p.send(topic, rc::Key(ok), std::span<const uint8_t>(kVal));
             succeeded.store(true, std::memory_order_release);
-        } catch (const std::runtime_error&) {
+        } catch (const std::exception& e) {
+            what = e.what();
+            threw.store(true, std::memory_order_release);
+        } catch (...) {
+            what = "non-std exception";
             threw.store(true, std::memory_order_release);
         }
     });
@@ -712,18 +736,27 @@ TEST(InvokerClient, RingSeamHeartbeatWriterAndReaderAgreeNoSpuriousThrowWhileDra
     // follows) is one step = 500 us < 1 ms — a real 2x margin. (A 1 ms step
     // made that worst-case gap EQUAL to the window, passing only because the
     // check is a strict `>`.)
-    for (int i = 0; i < 2000 &&
-                    !succeeded.load(std::memory_order_acquire) &&
-                    !threw.load(std::memory_order_acquire);
-         ++i) {
+    // C-F22: drain until the app thread finishes — bounded by progress, with a
+    // real-time hang guard only for a FAILING run (a fixed 2000-iteration cap
+    // could end before a starved app thread ran, leaving it blocked on a frozen
+    // clock).  On a hang, close() first so the blocked sender exits (Closed →
+    // logic_error, caught above) and join() can never wait forever.
+    const auto hangGuard = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!succeeded.load(std::memory_order_acquire) &&
+           !threw.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < hangGuard) {
         g_fakeNowMt.fetch_add(500'000, std::memory_order_relaxed); // +500us injected
         r.client.doWork();
         r.gw.pump();
     }
+    const bool hung = !succeeded.load(std::memory_order_acquire) &&
+                      !threw.load(std::memory_order_acquire);
+    if (hung) r.client.close();
     appThread.join();
 
-    EXPECT_TRUE(succeeded.load());
-    EXPECT_FALSE(threw.load()) << "spurious timeout: the heartbeat writer/reader clocks disagreed";
+    EXPECT_FALSE(hung) << "app thread never completed while the duty cycle drained (hang guard)";
+    EXPECT_TRUE(succeeded.load()) << "send failed: " << what;
+    EXPECT_FALSE(threw.load()) << "spurious failure in send(): " << what;
 }
 
 // fix3 I2: a deliberately large (60 s) liveness window that the injected
@@ -825,10 +858,13 @@ TEST(InvokerClient, CloseTerminatesPastAnOrphanedClaimAndClosesTheRegisteredRing
               rc::SendResult::Ok);
 
     r.client.testSetCloseDrainUnblockAfterYields(64); // production default: 1M — same path
-    r.client.close();                                 // must return
+    // F8c C7: closeImmediately — the teardown drain under test.  (close()'s
+    // producer drain is a command queued BEHIND the orphan like any other.)
+    r.client.closeImmediately();                      // must return
 
     EXPECT_EQ(r.client.testCloseDrainUnblockCalls(), 1);
-    EXPECT_EQ(r.client.testProducerCount(), 1u) << "the registration behind the orphan is adopted";
+    EXPECT_EQ(r.client.testImplsHandedBack(), 1u)
+        << "the registration behind the orphan is adopted (then handed back to its handle)";
     EXPECT_EQ(p.trySend(topic, rc::Key(uint64_t{2}), std::span<const uint8_t>(kVal)),
               rc::SendResult::Closed)
         << "the adopted producer's ring is marked closed";
@@ -863,22 +899,21 @@ TEST(InvokerClient, TxnProducerRegisteredAfterCloseDrainSelfClosesRegression) {
     EXPECT_EQ(r.client.testTxnProducerCount(), 0u) << "the drain ran before the submit";
 
     // Every operation must report the close promptly — never hang, never
-    // silently accept.
-    auto initF = tp.initTransactions();
-    ASSERT_TRUE(ready(initF)) << "initTransactions() must fail at once, not wait forever";
-    EXPECT_THROW(initF.get(), std::runtime_error);
+    // silently accept: rejected synchronously (no completion will follow).
+    int calls = 0;
+    const rc::CompletionHandler h{[](void* c, const rc::Completion&, std::span<const uint8_t>) noexcept {
+                                      ++*static_cast<int*>(c);
+                                  },
+                                  &calls};
+    EXPECT_EQ(tp.initTransactions(h, 1), rc::OpResult::Closed);
     tp.beginTransaction();
     EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
                  std::logic_error);
-    auto offF = tp.sendOffsetsToTransaction({}, "g");
-    ASSERT_TRUE(ready(offF));
-    EXPECT_THROW(offF.get(), std::runtime_error);
-    auto commitF = tp.commitTransaction();
-    ASSERT_TRUE(ready(commitF));
-    EXPECT_THROW(commitF.get(), std::runtime_error);
-    auto abortF = tp.abortTransaction();
-    ASSERT_TRUE(ready(abortF));
-    EXPECT_THROW(abortF.get(), std::runtime_error);
+    EXPECT_EQ(tp.sendOffsetsToTransaction({}, "g", h, 2), rc::OpResult::Closed);
+    EXPECT_EQ(tp.commitTransaction(h, 3), rc::OpResult::Closed);
+    EXPECT_EQ(tp.abortTransaction(h, 4), rc::OpResult::Closed);
+    EXPECT_THROW(tp.commitTransactionAndWait(1s), std::runtime_error);
+    EXPECT_EQ(calls, 0);
 }
 
 // The ADOPTED path is symmetric too: a txn producer that close() adopted and
@@ -889,10 +924,14 @@ TEST(InvokerClient, TxnProducerOpsAfterCloseFailPromptlyRegression) {
     Rig r(invokerCfg(3802, 3803));
     auto tp = r.client.transactionalProducer("tx-adopted");
     r.client.close();
-    EXPECT_EQ(r.client.testTxnProducerCount(), 1u) << "adopted by close()'s drain";
-    auto commitF = tp.commitTransaction();
-    ASSERT_TRUE(ready(commitF)) << "must fail at once, not wait forever";
-    EXPECT_THROW(commitF.get(), std::runtime_error);
+    EXPECT_EQ(r.client.testImplsHandedBack(), 1u) << "adopted by close()'s drain (then handed back)";
+    int calls = 0;
+    const rc::CompletionHandler h{[](void* c, const rc::Completion&, std::span<const uint8_t>) noexcept {
+                                      ++*static_cast<int*>(c);
+                                  },
+                                  &calls};
+    EXPECT_EQ(tp.commitTransaction(h, 1), rc::OpResult::Closed) << "must be rejected at once, not wait forever";
+    EXPECT_EQ(calls, 0);
     EXPECT_THROW(tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal)),
                  std::logic_error);
 }

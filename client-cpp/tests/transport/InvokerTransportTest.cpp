@@ -3,6 +3,8 @@
 // test thread IS the driver.
 #include <rune/client/transport/AeronTransport.h>
 
+#include <Aeron.h>  // aeron::currentTimeMillis — the conductor's own clock (stall test)
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -118,20 +120,25 @@ TEST(InvokerTransport, UdpLoopbackMovesOnlyWhenOwnerRunsDutyCycle) {
 
 // Regression (Review Focus 1): an owner stall past the client-liveness timeout
 // must close the Aeron client and report closed() — never ::exit(-1) the process
-// (Aeron's default error handler) and never hang.  This is the one test that
-// needs a real pause: Aeron's ClientConductor reads its own epoch clock
-// (ClientConductor.h:436) and cannot be injected.
+// (Aeron's default error handler) and never hang.  Aeron's ClientConductor reads
+// its own epoch clock (Aeron.cpp:43 hard-wires currentTimeMillis) and cannot be
+// injected, so the stall waits on THAT clock for THAT condition — no tuned sleep
+// (F8c C9 fix round 1).
 TEST(InvokerTransport, StalledOwnerSurfacesClosedInsteadOfExitingRegression) {
     Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3102);
     // The smallest liveness validate() accepts (1 s = 2x the client's 500 ms
-    // keepalive).  Sleep 2.5x it: > liveness trips the client conductor's
-    // inter-service check (strict '>' on a millisecond epoch clock) and the
-    // driver's client-timeout scan (every liveness/10) with ample margin.
+    // keepalive).
     c.clientLivenessTimeoutNs = rune::client::transport::kMinClientLivenessTimeoutNs;
     Transport t{c};
     t.start();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
-    std::this_thread::sleep_for(std::chrono::milliseconds(2'500));
+    // Every conductor doWork checks ClientConductor.h:436
+    //   nowMs > timeOfLastDoWorkMs + interServiceTimeoutMs   (nowMs = currentTimeMillis())
+    // and t0 is read after pumpUntil's last doWork (t0 >= timeOfLastDoWorkMs), so
+    // once currentTimeMillis() > t0 + liveness the next doWork must trip it.
+    const long long livenessMs = c.clientLivenessTimeoutNs / 1'000'000;
+    const long long t0 = aeron::currentTimeMillis();
+    while (aeron::currentTimeMillis() <= t0 + livenessMs) std::this_thread::yield();
     ASSERT_TRUE(pumpUntil(t, [&] { return t.closed(); }))
         << "inter-service timeout must close the client and be observable";
     const uint8_t b[] = {1};
@@ -370,4 +377,47 @@ TEST(InvokerTransport, FragmentedMessageStillReassemblesThroughTemplatePoll) {
     }));
     EXPECT_EQ(got, big);
     t.stop();
+}
+
+// ---------------------------------------------------------------------------
+// F8c C0: one pump owner, enforced structurally (no atomic).  The driver /
+// conductor of an invoker transport may be pumped by exactly one thread at a
+// time; a duty thread that takes over after a happens-before handoff binds
+// itself first (Client's runner does, at the top of runLoop()).
+// ---------------------------------------------------------------------------
+
+// A real second pumper — another thread calling dutyCycle() on a transport it
+// does not own — is caught deterministically in debug builds (abort), every
+// run, independent of timing.  RED on the parent: no owner check, no death.
+TEST(InvokerTransportDeathTest, SecondPumperThreadAbortsRegression) {
+#ifdef NDEBUG
+    GTEST_SKIP() << "the pump-owner check is a debug-build assertion";
+#else
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3120)};
+            t.start();                                  // this thread owns the pump
+            std::thread second([&t] { t.dutyCycle(); });  // never bound: a second pumper
+            second.join();
+        },
+        "pumped by a second thread");
+#endif
+}
+
+// The legitimate handoff: the owner starts the transport, a duty thread binds
+// itself and pumps it to ready, the owner joins it and stops (stop() rebinds
+// the caller for the final drain).  No violation, no abort.
+TEST(InvokerTransport, PumpOwnershipHandoffViaBindRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3121)};
+    t.start();
+    bool connected = false;
+    std::thread duty([&] {
+        t.bindPumpThread();
+        connected = pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); });
+    });
+    duty.join();
+    EXPECT_TRUE(connected);
+    t.stop();
+    EXPECT_EQ(t.callerPumpViolations(), 0);
 }

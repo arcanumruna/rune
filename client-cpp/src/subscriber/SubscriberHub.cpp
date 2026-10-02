@@ -94,7 +94,7 @@ void SubscriberHub::finish_(SubscriptionImpl& impl)
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
-        std::shared_ptr<SubscriptionImpl>     impl,
+        SubscriptionImpl*                     impl,
         int64_t                               sessionId,
         uint8_t                               partitionKnown,
         int64_t                               fromOffset,
@@ -116,7 +116,7 @@ std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
         impl->correlationId);
 
     auto req = std::make_unique<SubscribeRequest>();
-    req->impl     = std::move(impl);
+    req->impl     = impl;
     req->deadline = deadline;
     if (frameLen > 0) req->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
     return req;
@@ -134,6 +134,9 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
     switch (cmd.op) {
     case detail::HubCommand::Op::SubscribeAdd: {
         std::unique_ptr<SubscribeRequest> req(reinterpret_cast<SubscribeRequest*>(cmd.handle));
+        // F8c C7: from here the duty side holds its share of the impl (even
+        // if it was unsubscribed before this adoption) until release().
+        if (req && req->impl) owned_.push_back(req->impl);
         // F8a fix2: stamp the frame with the CURRENT session (the app thread's
         // snapshot may be stale); a frame of a dead session is dropped by the
         // ring drain, and pending subscribes are re-sent on every connect.
@@ -145,9 +148,16 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
         adoptSubscribe(std::move(req), submitFn);
         break;
     }
-    case detail::HubCommand::Op::Unsubscribe:
-        unsubscribe(cmd.a, unsubCorrId, sessionId, submitFn);
+    case detail::HubCommand::Op::Unsubscribe: {
+        // F8c C3: identified by the impl address (handle) — resolved against
+        // this hub's own tables only, never dereferenced unless found; the
+        // correlationId form (a) is kept for hub-level callers.
+        const int64_t corr = (cmd.handle != 0)
+            ? correlationIdOf_(reinterpret_cast<const SubscriptionImpl*>(cmd.handle))
+            : cmd.a;
+        if (corr != 0) unsubscribe(corr, unsubCorrId, sessionId, submitFn);
         break;
+    }
     default:
         break;  // not a subscriber op
     }
@@ -236,6 +246,17 @@ int SubscriberHub::retryUnsentSubscribes()
         }
     }
     return sent;
+}
+
+int64_t SubscriberHub::correlationIdOf_(const SubscriptionImpl* key) const noexcept
+{
+    for (const auto& [corr, req] : pendingByCorrelation_) {
+        if (req->impl == key) return corr;
+    }
+    for (const auto& [id, impl] : activeById_) {
+        if (impl == key) return impl->correlationId;
+    }
+    return 0;  // not (or no longer) held: nothing to unsubscribe
 }
 
 bool SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
@@ -369,7 +390,7 @@ void SubscriberHub::onSubscribeResponse(
         return; // unknown correlationId — race with close/timeout; safe
     }
     clearUnsent_(*it->second);
-    std::shared_ptr<SubscriptionImpl> impl = std::move(it->second->impl);
+    SubscriptionImpl* impl = it->second->impl;
     pendingByCorrelation_.erase(it);
     if (!impl) return;
 
@@ -384,14 +405,14 @@ void SubscriberHub::onSubscribeResponse(
         impl->unsubSessionId = sessionId;
         if (trySendUnsubscribe_(*impl, submitFn) == detail::SendResult::Retry) {  // Fatal: dropped
             markUnsubPending_(*impl);
-            activeById_.emplace(rsp.subscriptionId, std::move(impl));  // cold path
+            activeById_.emplace(rsp.subscriptionId, impl);  // cold path
         }
         return;
     }
 
     // Bind: lifecycle snapshot (uses the reserve — always fits).
     (void)impl->status.publishFinal(SubscriptionStatus{impl->subscriptionId, impl->nextOffset});
-    activeById_.emplace(rsp.subscriptionId, std::move(impl));
+    activeById_.emplace(rsp.subscriptionId, impl);
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +590,33 @@ void SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& n
             ++it;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// F8c C7: release — forget an impl its handle released, once unreferenced
+// ---------------------------------------------------------------------------
+
+bool SubscriberHub::release(SubscriptionImpl* impl) noexcept
+{
+    // A running handler of it (its own record handler destroyed the handle),
+    // a dirty-list link, a pending request (the CB-5 A2 late-response path) or
+    // a routing entry (bound, or an Unsubscribe still being retried) all keep
+    // referencing it: not yet.
+    if (impl == dispatching_ || impl->statusDirty) return false;
+    for (const auto& [corr, req] : pendingByCorrelation_) {
+        if (req->impl == impl) return false;
+    }
+    for (const auto& [id, p] : activeById_) {
+        if (p == impl) return false;
+    }
+    for (std::size_t i = 0; i < owned_.size(); ++i) {
+        if (owned_[i] == impl) {
+            owned_[i] = owned_.back();
+            owned_.pop_back();
+            break;
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -39,9 +39,9 @@ inline constexpr uint16_t kInternalVersion  = 1;
 //   [0..23]  MessageHeader (blockLength=8, templateId=1, schemaId=121)
 //   [24..31] handle : uint64
 //
-// `handle` is the address of a heap-allocated std::shared_ptr<ProducerImpl>
-// created by Client::producer().  The runner decodes this message, adopts the
-// shared_ptr into the single-owner ProducerHub list, and frees the holder.  The
+// `handle` is the address of the ProducerImpl created by Client::producer()
+// (F8c C7: no shared_ptr holder).  The runner decodes this message and adopts
+// the impl into the single-owner ProducerHub list (the duty side's share).  The
 // value is a process-local pointer (the message never leaves the process); SBE
 // gives it a self-describing, versioned envelope on the ring like every other
 // message, instead of a raw memcpy of pointer bytes.
@@ -99,12 +99,14 @@ struct RegisterProducer {
 //   [32..39] handle : uint64   (process-local pointer / identity; never leaves the process)
 //   [40..47] a      : int64
 //   [48..55] b      : int64
+//   [56..63] c      : int64   (F8c C4: completion-target word)
+//   [64..71] d      : int64   (F8c C5: op payload)
 // ---------------------------------------------------------------------------
 struct HubCommandMsg {
     static constexpr uint16_t    TEMPLATE_ID  = 2;
-    static constexpr uint16_t    BODY_FIXED   = 32;
+    static constexpr uint16_t    BODY_FIXED   = 48;
     static constexpr std::size_t ENCODED_SIZE =
-        pc::MessageHeader::ENCODED_SIZE + BODY_FIXED;  // 56
+        pc::MessageHeader::ENCODED_SIZE + BODY_FIXED;  // 72
 
     static std::size_t encode(const ::rune::client::detail::HubCommand& c, uint8_t* buf) noexcept {
         pc::MessageHeader hdr;
@@ -121,6 +123,8 @@ struct HubCommandMsg {
         pc::detail::putLE64(buf, B + 8,  static_cast<int64_t>(c.handle));
         pc::detail::putLE64(buf, B + 16, c.a);
         pc::detail::putLE64(buf, B + 24, c.b);
+        pc::detail::putLE64(buf, B + 32, c.c);
+        pc::detail::putLE64(buf, B + 40, c.d);
         return ENCODED_SIZE;
     }
 
@@ -137,6 +141,8 @@ struct HubCommandMsg {
         c.handle = static_cast<uint64_t>(pc::detail::getLE64(buf, B + 8));
         c.a      = pc::detail::getLE64(buf, B + 16);
         c.b      = pc::detail::getLE64(buf, B + 24);
+        c.c      = pc::detail::getLE64(buf, B + 32);
+        c.d      = pc::detail::getLE64(buf, B + 40);
         return c;
     }
 };

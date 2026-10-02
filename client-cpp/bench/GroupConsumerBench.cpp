@@ -150,7 +150,7 @@ static rcc::RecordsView makeRecordsView(int32_t topicId, int32_t partition,
 // Build a GroupConsumerImpl in Stable state with N partitions assigned.
 // sendBuf pre-allocated to 4 KiB; commitEntriesScratch pre-reserved.
 // ---------------------------------------------------------------------------
-static std::shared_ptr<rune::client::GroupConsumerImpl>
+static std::unique_ptr<rune::client::GroupConsumerImpl>
 makeStableImpl(int nPartitions,
                int32_t topicId    = 0,
                int32_t sessionTimeoutMs = 30000,
@@ -159,7 +159,7 @@ makeStableImpl(int nPartitions,
                std::chrono::steady_clock::time_point acDeadline  =
                    std::chrono::steady_clock::now() + std::chrono::hours{1})
 {
-    auto impl = std::make_shared<rune::client::GroupConsumerImpl>();
+    auto impl = std::make_unique<rune::client::GroupConsumerImpl>();
     impl->groupId       = "bench-group";
     impl->topicIds      = {topicId};
     impl->memberId      = "bench-member-1";
@@ -201,7 +201,7 @@ static void BM_GCHub_OnRecords(benchmark::State& state)
 {
     rccg::GroupConsumerHub hub;
     auto impl = makeStableImpl(1);
-    hub.add(impl);
+    hub.add(impl.get());
 
     // Pre-build the RecordsView for (topicId=0, partition=0).
     rcc::RecordsView rv = makeRecordsView(0, 0, 0, 1);
@@ -283,7 +283,7 @@ static void BM_GCHub_DoWork_HeartbeatCadence(benchmark::State& state)
         /*sessionTimeoutMs=*/30000,
         /*hbDeadline=*/std::chrono::steady_clock::now() - std::chrono::seconds{1},
         /*acDeadline=*/std::chrono::steady_clock::now() + std::chrono::hours{1});
-    hub.add(impl);
+    hub.add(impl.get());
 
     int64_t clk = 1'000'000'000LL;
 
@@ -366,7 +366,7 @@ static void BM_GCHub_DoWork_CommitCadence(benchmark::State& state)
         /*sessionTimeoutMs=*/30000,
         /*hbDeadline=*/std::chrono::steady_clock::now() + std::chrono::hours{1},
         /*acDeadline=*/std::chrono::steady_clock::now() - std::chrono::seconds{1});
-    hub.add(impl);
+    hub.add(impl.get());
 
     int64_t clk = 1'000'000'000LL;
 
@@ -445,7 +445,7 @@ static void BM_GCHub_DoWork_Stable(benchmark::State& state)
 
     rccg::GroupConsumerHub hub;
     auto impl = makeStableImpl(4);
-    hub.add(impl);
+    hub.add(impl.get());
 
     int64_t clk = 1'000'000'000LL;
     for (int i = 0; i < 50; ++i) {

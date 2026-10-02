@@ -18,17 +18,25 @@ smuggle shared state back in:
   #include of <atomic> <mutex> <shared_mutex> <condition_variable> <semaphore>
   <latch> <barrier>.
 
+F8c C9 adds the FUTURE kind: std::future / shared_future / promise /
+packaged_task / async / launch (and future_status / future_error ...,
+std::experimental:: forms, bare future< / promise< / shared_future /
+packaged_task) and #include <future>.  It is banned in src/** and include/**
+(ring files included) and ALSO in examples/** bench/** tools/** (FUTURE kind
+only there).  `--futures` checks just that kind across all five trees
+(ctest NoFuturesOrPromisesGuardRegression).
+
 ALLOWLIST (path relative to the repo root):
   * RING     — a ring implementation: atomics-family constructs allowed (any
                count); a mutex / lock / condition_variable / thread_local there
                is still a violation.
   * SLICE-B  — TEMPORARY: sites owned by F8a slice B (Client::mtx_ and the
                Client/ClientAgent/AeronTransport lifecycle atomics, the
-               TransactionalProducerImpl mutexes, nextCorrId_, ProducerImpl's
-               globalFlushPending_).  Each entry is an EXACT MULTISET of
+               TransactionalProducerImpl mutexes, nextCorrId_).  Each entry is an EXACT MULTISET of
                (kind, normalized snippet) -> count for that file: ANY difference
                fails — a new site, and also a removed one (which must then be
-               removed from the allowlist).  Slice B deletes these entries.
+               removed from the allowlist).  EMPTY since F8c C5 (the last
+               entries, TransactionalProducerImpl, were removed).
 
 The script self-tests its detector and the allowlist logic against synthetic
 fixtures before scanning (--selftest runs only that), so a regex change that
@@ -39,6 +47,13 @@ import sys
 from pathlib import Path
 
 SCAN_DIRS = ("src", "include")
+# F8c C9: the examples, benchmarks and tools were migrated to the completion-
+# token API too; only the FUTURE kind is enforced there (their harness code may
+# still time / count with other constructs — the shared-nothing law for the
+# library itself is src/ + include/).  tests/e2e/ holds client apps shipped in
+# Docker images (rune_ql_probe), so it is scanned like examples/; the rest of
+# tests/ is not.
+FUTURE_ONLY_DIRS = ("examples", "bench", "tools", "tests/e2e")  # tests/e2e: shipped probe apps (C9 fix1)
 SOURCE_EXTS = {".cpp", ".h", ".hpp", ".cc", ".cxx", ".ipp", ".inl"}
 
 # kind -> regex.  Matched on comment/string-stripped text.  Order matters only
@@ -47,7 +62,9 @@ PATTERNS = [
     ("include",   r"#\s*include\s*<\s*(?:atomic|stdatomic\.h|mutex|shared_mutex|condition_variable|semaphore|latch|barrier|stop_token)\s*>"),
     ("atomic",    r"\bstd\s*::\s*atomic\w*"),
     ("atomic",    r"(?<![\w:.])(?<!->)atomic_\w+"),
-    ("atomic",    r"(?<![\w:])atomic\s*<"),
+    # Bare / alias-qualified (s::atomic<, after `namespace s = std`); std::atomic
+    # is reported by the pattern above (same start: de-duplicated).
+    ("atomic",    r"(?<![\w.])(?<!->)atomic\s*<"),
     ("atomic",    r"\b__(?:atomic|sync|c11_atomic)_\w+"),
     ("atomic",    r"\b_Atomic\b"),
     # Aeron's atomics APIs (AtomicBuffer ordered/volatile accessors, CAS, RMW,
@@ -56,7 +73,7 @@ PATTERNS = [
     ("atomic",    r"\b(?:put|get|add)\w*(?:Ordered|Volatile)\b"),
     ("atomic",    r"\b(?:compareAndSet|getAndAdd|getAndSet|addAndGet)\w*"),
     ("mutex",     r"\bstd\s*::\s*\w*mutex\b"),
-    ("mutex",     r"(?<![\w:])(?:recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex\b"),
+    ("mutex",     r"(?<![\w.])(?<!->)(?:recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex\b"),
     ("mutex",     r"\bpthread_(?:mutex|spin|rwlock|cond)\w*"),
     ("mutex",     r"\bos_unfair_lock\w*"),
     ("lock",      r"(?<![\w])(?:std\s*::\s*)?(?:lock_guard|unique_lock|scoped_lock|shared_lock)\b"),
@@ -64,7 +81,26 @@ PATTERNS = [
     ("sync",      r"(?<![\w])(?:std\s*::\s*)?(?:counting_semaphore|binary_semaphore|latch|barrier|call_once|once_flag)\b"),
     ("sync",      r"(?<![\w])(?:std\s*::\s*)?(?:jthread|stop_source|stop_token|stop_callback)\b"),
     ("tls",       r"\bthread_local\b"),
+    # F8c C9: futures / promises / packaged tasks / std::async (and their
+    # status / error / launch companions).  Every async op completes through a
+    # Token into Completions or a CompletionHandler instead.
+    ("future",    r"#\s*include\s*<\s*(?:experimental\s*/\s*)?future\s*>"),
+    ("future",    r"\bstd\s*::\s*(?:experimental\s*::\s*)?(?:future|shared_future|promise|packaged_task|async|launch)\w*"),
+    # Bare (using-directive), alias-qualified (s::) or foreign (boost::) forms.
+    # `.`/`->` excluded: a member named future/async is not the std facility.
+    ("future",    r"(?<![\w.])(?<!->)(?:shared_future|packaged_task)\b"),
+    # `<` then a type-ish token (letter, _, ::, or `>`): `future < 3` is a compare.
+    ("future",    r"(?<![\w.])(?<!->)(?:future|promise)\s*<\s*(?=[A-Za-z_:>])"),
+    ("future",    r"(?<![\w.])(?<!->)async\s*\("),
+    ("future",    r"(?<![\w.])(?<!->)launch\s*::"),
+    # C9 fix round 1: namespace escapes that would let any bare / aliased banned
+    # construct through.  `using namespace std::chrono_literals` (a sub-
+    # namespace) and aliases of sub-namespaces (std::chrono) stay allowed.
+    ("stdns",     r"\busing\s+namespace\s+(?:::\s*)?std\s*;"),
+    ("stdns",     r"\bnamespace\s+\w+\s*=\s*(?:::\s*)?std\s*(?:::\s*experimental\s*)?;"),
 ]
+# Kinds enforced in FUTURE_ONLY_DIRS too (a namespace escape there would hide a future).
+FUTURE_SCOPE_KINDS = {"future", "stdns"}
 COMPILED = [(k, re.compile(p)) for k, p in PATTERNS]
 ATOMIC_KINDS = {"atomic", "include"}  # what a RING entry may contain
 
@@ -78,44 +114,26 @@ RING_FILES = {
 # path -> {(kind, normalized snippet): count}.  Regenerate a file's entry with
 # `--dump PATH` after a deliberate slice-B change (the reviewer sees the diff).
 SLICE_B = {
-    "include/rune/client/Client.h": {
-        ("atomic", "std::atomic"): 4,
-        ("include", "#include <atomic>"): 1,
-        ("include", "#include <mutex>"): 1,
-        ("lock", "std::lock_guard"): 1,
-        ("mutex", "std::mutex"): 2,
-    },
-    "src/Client.cpp": {
-        ("lock", "std::lock_guard"): 18,
-        ("mutex", "std::mutex"): 18,
-    },
-    "include/rune/client/producer/TransactionalProducerImpl.h": {
-        ("atomic", "std::atomic"): 5,
-        ("include", "#include <atomic>"): 1,
-        ("include", "#include <mutex>"): 1,
-        ("mutex", "std::mutex"): 2,
-    },
-    "src/producer/TransactionalProducerImpl.cpp": {
-        ("atomic", "std::atomic"): 1,
-        ("lock", "std::lock_guard"): 12,
-        ("mutex", "std::mutex"): 12,
-    },
-    "include/rune/client/producer/ProducerImpl.h": {
-        ("atomic", "std::atomic"): 3,
-        ("include", "#include <atomic>"): 1,
-    },
-    "src/producer/ProducerImpl.cpp": {
-        ("atomic", "std::atomic"): 1,
-    },
-    "include/rune/client/agent/ClientAgent.h": {
-        ("atomic", "std::atomic"): 3,
-        ("include", "#include <atomic>"): 1,
-    },
-    "include/rune/client/transport/AeronTransport.h": {
-        ("atomic", "std::atomic"): 3,
-        ("include", "#include <atomic>"): 1,
-    },
+    # F8c C2/C3 removed every Client / ClientAgent entry and F8c C5 the last
+    # two (TransactionalProducerImpl's atomics, mutexes and lock_guards: its
+    # state is duty-owned, commands arrive on the agent command ring).  The
+    # allowlist stays as a mechanism (empty: any new site fails).
 }
+
+# PERMANENT per-thread state (F8c fix round 1, controller ruling): a
+# thread_local is not shared state — each thread owns its own copy.  Allowed
+# only as an EXACT multiset of ('tls', 'thread_local') sites per file, with the
+# reason next to each declaration; any other kind here is a violation.
+PER_THREAD = {
+    # tClosing (the Client this thread is closing: a Completions released by
+    # user code that close() runs frees directly — I1) and tWaitToken (a
+    # distinct token per *AndWait call — I3/m6).
+    "src/Client.cpp": {("tls", "thread_local"): 2},
+}
+for _rel, _ms in PER_THREAD.items():
+    assert all(k[0] == "tls" for k in _ms), f"PER_THREAD entry {_rel} allows a non-tls construct"
+# n4: the two allowlists are merged per file — a shared key would silently drop one.
+assert not (set(PER_THREAD) & set(SLICE_B)), "PER_THREAD and SLICE_B must not share a file"
 
 CHAR_PREFIXES = {"L", "u", "U", "u8"}
 
@@ -242,6 +260,17 @@ def evaluate(files: dict, ring_files: set, slice_b: dict):
     return violations
 
 
+def evaluate_futures(files: dict):
+    """Only the FUTURE kind, no allowlist (FUTURE_ONLY_DIRS and --futures)."""
+    violations = []
+    for rel in sorted(files):
+        for line, kind, snip in find_matches(files[rel]):
+            if kind in FUTURE_SCOPE_KINDS:
+                violations.append(f"{rel}:{line}: banned future construct `{snip}` (F8c: issue the op "
+                                  f"with a Token into Completions / a CompletionHandler, or *AndWait)")
+    return violations
+
+
 # ---- self-test ---------------------------------------------------------------
 SELFTEST_DETECT = [
     # (name, snippet, expected number of matches)
@@ -249,7 +278,7 @@ SELFTEST_DETECT = [
     ("std_atomic_spaced", "std :: atomic<bool> b;", 1),
     ("atomic_flag", "std::atomic_flag f;", 1),
     ("fence", "std::atomic_thread_fence(std::memory_order_release);", 1),
-    ("bare_atomic_using_ns", "using namespace std; atomic<int> a;", 1),
+    ("bare_atomic_using_ns", "using namespace std; atomic<int> a;", 2),  # + the using-directive (C9 fix1)
     ("free_atomic_fn", "atomic_store(&a, 1); std::atomic_load(&a);", 2),
     ("builtin", "__atomic_load_n(&x, __ATOMIC_ACQUIRE);", 1),
     ("sync_builtin", "__sync_fetch_and_add(&x, 1);", 1),
@@ -262,7 +291,7 @@ SELFTEST_DETECT = [
     ("aeron_cas_rmw", "buf.compareAndSetInt64(i, a, b); buf.getAndAddInt64(i, 1); buf.addInt64Ordered(i, 1);", 3),
     ("mutex", "std::mutex m;", 1),
     ("shared_mutex", "mutable std::shared_mutex m;", 1),
-    ("recursive_mutex_bare", "using namespace std; recursive_mutex m;", 1),
+    ("recursive_mutex_bare", "using namespace std; recursive_mutex m;", 2),
     ("pthread_mutex", "pthread_mutex_t m; pthread_mutex_lock(&m);", 2),
     ("pthread_spin_rwlock", "pthread_spin_lock(&s); pthread_rwlock_rdlock(&r);", 2),
     ("pthread_cond", "pthread_cond_wait(&c, &m);", 1),
@@ -288,7 +317,7 @@ SELFTEST_DETECT = [
     ("member_named_atomic_ish", "x.atomicity = 1; foo_atomic_bar(); obj.atomic_view(); p->atomic_n;", 0),
     ("digit_separator", "int64_t n = 1'000'000; std::mutex m;", 1),
     ("hex_digit_separator", "auto h = 0xFF'FF; std::mutex m;", 1),
-    ("include_other", "#include <future>\n#include <thread>", 0),
+    ("include_other", "#include <thread>\n#include <functional>", 0),  # <future> is banned since F8c C9
     ("ring_word_names", "storeRelease64_(idx, v); loadAcquire32_(idx);", 0),
     ("pthread_affinity_ok", "#include <pthread.h>\npthread_setaffinity_np(pthread_self(), n, &s);", 0),
     # char-literal prefixes: the quote inside must not open a fake string that
@@ -298,6 +327,43 @@ SELFTEST_DETECT = [
     ("u16_char_quote", "char16_t q = u'\"'; std::mutex m;", 1),
     ("u32_char_quote", "char32_t q = U'\"'; std::mutex m;", 1),
     ("prefixed_char_hides_nothing", "auto q = L'x'; /* std::mutex */", 0),
+    # F8c C9: futures / promises / packaged tasks / std::async are banned (the
+    # completion-token API replaced every one of them; spec §5 C9).
+    ("include_future", "#include <future>", 1),
+    ("include_future_spaced", "#  include < future >", 1),
+    ("std_future", "std::future<int> f;", 1),
+    ("std_future_spaced", "std :: future<void> f;", 1),
+    ("std_promise", "std::promise<void> p;", 1),
+    ("std_shared_future", "std::shared_future<int> s;", 1),
+    ("std_packaged_task", "std::packaged_task<int()> t;", 1),
+    ("std_async_launch", "auto f = std::async(std::launch::async, fn);", 2),
+    ("std_async_plain", "auto f = std::async(fn);", 1),
+    ("future_status_error", "f.wait_for(0s) == std::future_status::ready; catch (std::future_error&) {}", 2),
+    ("using_decl_future", "using std::future; using std::promise;", 2),
+    ("experimental_future", "std::experimental::future<int> f;", 1),
+    ("bare_future_promise", "using namespace std; future<int> f; promise<int> p;", 3),
+    ("bare_shared_future_task", "using namespace std; shared_future<int> s; packaged_task<void()> t;", 3),
+    # false positives: prose, strings, look-alike identifiers
+    ("future_comment", "// std::future / std::promise / std::async are banned", 0),
+    ("future_string", 'const char* s = "std::promise<int> #include <future>";', 0),
+    ("future_identifiers", "int futureCount; bool promised; void asyncSend(); bool async = true; obj.future = 1;", 0),
+    ("future_compare", "if (future < 3) {} launch(x);", 0),
+    # C9 fix round 1 (review finding 1): namespace escapes and spelling variants.
+    ("using_namespace_std_banned", "using namespace std;", 1),
+    ("using_namespace_std_spaced", "using  namespace   std ;", 1),
+    ("using_namespace_global_std", "using namespace ::std;", 1),
+    ("chrono_literals_ok", "using namespace std::chrono_literals; using namespace std::literals;", 0),
+    ("alias_std_banned", "namespace s = std;", 1),
+    ("alias_std_experimental_banned", "namespace ex = std::experimental;", 1),
+    ("alias_std_chrono_ok", "namespace chr = std::chrono;", 0),
+    ("alias_std_future",
+     "namespace s = std; s::promise<int> p; s::future<int> f; s::async(fn); s::shared_future<int> x;", 5),
+    ("alias_std_atomic_mutex", "namespace s = std; s::atomic<int> a; s::mutex m;", 3),
+    ("bare_future_space_lt", "using namespace std; promise <int> p; future < int > f;", 3),
+    ("bare_async_call", "using namespace std; auto f = async(launch::async, fn);", 3),
+    ("bare_async_member_ok", "obj.async(1); p->async(2); runAsync(3); bool async = true;", 0),
+    ("experimental_include", "#include <experimental/future>", 1),
+    ("boost_future", "boost::future<int> f; boost::promise<int> p; boost::async(fn);", 3),
 ]
 
 SELFTEST_ALLOW = [
@@ -322,6 +388,21 @@ SELFTEST_ALLOW = [
      {"src/c.cpp": "std::mutex m;"}, set(),
      {"src/c.cpp": {("mutex", "std::mutex"): 1, ("atomic", "std::atomic"): 1}}, 1),
     ("stale_allowlist_fails", {}, set(), {"src/gone.cpp": {("mutex", "std::mutex"): 1}}, 1),
+    # F8c C9: a ring file may hold memory-ordering atomics, never a future.
+    ("ring_rejects_future",
+     {"include/r.h": "#include <future>\nstd::promise<int> p;"}, {"include/r.h"}, {}, 2),
+    ("unlisted_future_fails", {"src/a.cpp": "auto f = std::async(fn);"}, set(), {}, 1),
+]
+
+SELFTEST_FUTURES = [
+    # (name, files, expected violations) for evaluate_futures (FUTURE_ONLY_DIRS)
+    ("example_future_fails", {"examples/e.cpp": "#include <future>\nauto f = c.connect(); f.get();\n"
+                                                "std::future<void> g;"}, 2),
+    ("bench_other_kinds_ok", {"bench/b.cpp": "std::atomic<int> n{0}; std::mutex m;"}, 0),
+    ("bench_promise_fails", {"bench/b.cpp": "std::atomic<int> n{0}; std::promise<int> p;"}, 1),
+    ("example_using_namespace_std_fails", {"examples/e.cpp": "using namespace std;"}, 1),
+    ("example_alias_std_fails", {"tests/e2e/p.cpp": "namespace s = std; s::future<int> f;"}, 2),
+    ("prose_ok", {"tools/t.cpp": "// no std::future here\nconst char* s = \"std::async\";"}, 0),
 ]
 
 
@@ -336,12 +417,16 @@ def run_selftest():
         v = evaluate(files, ring, sliceb)
         if len(v) != want_v:
             failures.append(f"allowlist '{name}': expected {want_v} violation(s), got {len(v)}: {v}")
+    for name, files, want_v in SELFTEST_FUTURES:
+        v = evaluate_futures(files)
+        if len(v) != want_v:
+            failures.append(f"futures '{name}': expected {want_v} violation(s), got {len(v)}: {v}")
     return failures
 
 
-def collect(root: Path):
+def collect(root: Path, dirs=SCAN_DIRS):
     files = {}
-    for d in SCAN_DIRS:
+    for d in dirs:
         base = root / d
         if not base.is_dir():
             continue
@@ -361,7 +446,8 @@ def main(argv):
         return 2
     if "--selftest" in argv:
         print(f"check_no_atomics_or_mutexes: self-test OK "
-              f"({len(SELFTEST_DETECT)} detector + {len(SELFTEST_ALLOW)} allowlist fixtures)")
+              f"({len(SELFTEST_DETECT)} detector + {len(SELFTEST_ALLOW)} allowlist + "
+              f"{len(SELFTEST_FUTURES)} futures-scope fixtures)")
         return 0
     args = [a for a in argv if not a.startswith("--")]
     root = Path(args[0]) if args else Path(__file__).resolve().parent.parent
@@ -370,7 +456,21 @@ def main(argv):
         for rel in args[1:]:
             print(rel, dict(sorted(multiset(find_matches(files[rel])).items())))
         return 0
-    violations = evaluate(files, RING_FILES, SLICE_B)
+    if "--futures" in argv:
+        # NoFuturesOrPromisesGuardRegression: the FUTURE kind only, everywhere
+        # it is enforced (src/ include/ examples/ bench/ tools/), no allowlist.
+        all_files = {**files, **collect(root, FUTURE_ONLY_DIRS)}
+        violations = evaluate_futures(all_files)
+        if violations:
+            print(f"check_no_atomics_or_mutexes --futures: {len(violations)} violation(s)")
+            for v in violations:
+                print("  " + v)
+            return 1
+        print(f"check_no_atomics_or_mutexes --futures: OK ({len(all_files)} files, no future/promise/"
+              f"packaged_task/async)")
+        return 0
+    violations = evaluate(files, RING_FILES, {**SLICE_B, **PER_THREAD})
+    violations += evaluate_futures(collect(root, FUTURE_ONLY_DIRS))
     if violations:
         print(f"check_no_atomics_or_mutexes: {len(violations)} violation(s)")
         for v in violations:

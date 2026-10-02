@@ -122,11 +122,9 @@ AeronTransport::~AeronTransport() {
 // ---------------------------------------------------------------------------
 
 void AeronTransport::start() {
-    bool expected = false;
-    if (!started_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return; // already started
-    }
+    if (started_) return;  // already started (owner state)
+    started_ = true;
+    bindPumpThread();      // the starting thread owns every pump until a handoff
 
     if (auto err = validate(cfg_)) {
         throw std::invalid_argument("AeronTransport: invalid TransportConfig: " + *err);
@@ -213,11 +211,11 @@ void AeronTransport::start() {
 // ---------------------------------------------------------------------------
 
 void AeronTransport::stop() noexcept {
-    bool expected = false;
-    if (!stopped_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        return; // already stopped (or never started)
-    }
+    if (stopped_) return;  // already stopped (owner state)
+    stopped_ = true;
+    // Precondition (see the header): no other thread pumps any more — the
+    // caller takes pump ownership for the final driver drain below.
+    bindPumpThread();
 
     // Step 1: Release the FragmentAssembler (no Aeron resources held directly).
     assembler_.reset();
@@ -576,17 +574,35 @@ void AeronTransport::startEmbeddedDriver() {
     pumpDriverFromCaller_();
 
     if (cfg_.driverMode == DriverMode::Thread) {
-        driverRunning_.store(true, std::memory_order_release);
-        driverThread_ = std::thread([this]() {
-            while (driverRunning_.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+        // From here on the driver thread is the driver's ONLY pumper; the owner
+        // stops it through the control ring and joins it (stopEmbeddedDriver).
+        const std::size_t ctlBytes =
+            kDriverCtlCapacity + static_cast<std::size_t>(detail::OneToOneRingBuffer::trailerLength());
+        driverCtlStorage_ = std::make_unique<uint8_t[]>(ctlBytes);  // zeroed
+        driverCtl_ = std::make_unique<detail::OneToOneRingBuffer>(driverCtlStorage_.get(), ctlBytes);
+        driverThreadLaunched_ = true;
+        detail::OneToOneRingBuffer* ctl = driverCtl_.get();
+        aeron_driver_t*             drv = driver_;
+        driverThread_ = std::thread([ctl, drv]() {
+            while (!ctl->producerClosed()) {
+                aeron_driver_main_idle_strategy(drv, aeron_driver_main_do_work(drv));
             }
         });
     }
 }
 
 int AeronTransport::pumpDriverFromCaller_() noexcept {
-    if (driverRunning_.load(std::memory_order_acquire)) {
+#ifndef NDEBUG
+    if (std::this_thread::get_id() != pumpOwner_) [[unlikely]] {
+        std::fprintf(stderr,
+                     "rune-client: FATAL: AeronTransport driver pumped by a second thread "
+                     "(the pump owner is the thread that started it or last called "
+                     "bindPumpThread()); aborting\n");
+        std::fflush(stderr);
+        std::abort();
+    }
+#endif
+    if (driverThreadLaunched_) {
         ++callerPumpViolations_;
     }
     return aeron_driver_main_do_work(driver_);
@@ -597,11 +613,13 @@ int AeronTransport::pumpDriverFromCaller_() noexcept {
 // ---------------------------------------------------------------------------
 
 void AeronTransport::stopEmbeddedDriver() noexcept {
-    // Step A: signal the driver thread to stop and join it.
-    if (driverRunning_.exchange(false, std::memory_order_acq_rel)) {
+    // Step A: signal the driver thread to stop (control ring close) and join it.
+    if (driverThreadLaunched_) {
+        driverCtl_->producerClose();
         if (driverThread_.joinable()) {
             driverThread_.join();
         }
+        driverThreadLaunched_ = false;
     }
 
     // Step B: drain any CnC commands the conductor posted that the driver

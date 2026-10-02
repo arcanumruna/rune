@@ -33,6 +33,7 @@
 //        "CLIENT: OK record offset=<o>" per delivered record.
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
@@ -43,7 +44,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <future>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -52,6 +52,24 @@
 
 using namespace std::chrono_literals;
 using namespace rune::client;
+
+// F8c C6: one acked send waited on a Completions (examples only — the library
+// deliberately offers no per-record *AndWait sugar).  false = rejected or the
+// wait timed out (`out.status` = Timeout then; the op still completes later).
+static bool sendAndWaitAck(Completions& cq, Producer& p, const TopicHandle& th, const Key& key,
+                           std::span<const uint8_t> v, Token t, int timeoutMs, Completion& out) {
+    for (;;) {
+        const SendResult r = p.trySend(th, key, v, cq, t);
+        if (r == SendResult::Ok) break;
+        if (r == SendResult::QueueFull) { (void)cq.poll([](const Completion&, std::span<const uint8_t>) {}); continue; }
+        if (r != SendResult::BackPressured) { out.status = OpStatus::Closed; return false; }
+        std::this_thread::yield();
+    }
+    const auto w = cq.waitFor(t, std::chrono::milliseconds(timeoutMs),
+                              [&](const Completion& c, std::span<const uint8_t>) { out = c; });
+    if (w != Completions::Wait::Done) { out.status = OpStatus::Timeout; return false; }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Env helpers
@@ -112,6 +130,7 @@ static bool phaseProduceN(Client& c, const TopicHandle& th, int N,
     pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
 
     auto p = c.producer(pcfg);
+    Completions cq(c);
 
     for (int n = 1; n <= N; ++n) {
         const std::string valStr = "phase" + std::to_string(phase) +
@@ -121,23 +140,23 @@ static bool phaseProduceN(Client& c, const TopicHandle& th, int N,
         // Use record number as key (uint64 key).
         Key key(static_cast<uint64_t>(n));
 
-        auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
-
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(timeoutMs);
-        if (fut.wait_until(deadline) != std::future_status::ready) {
+        Completion done;
+        const bool waited = sendAndWaitAck(cq, p, th, key, std::span<const uint8_t>(val),
+                                           static_cast<Token>(n), timeoutMs, done);
+        if (!waited && done.status == OpStatus::Timeout) {
             std::cerr << "CLIENT: FAIL produce phase" << phase
                       << " n=" << n << " TIMEOUT\n";
             return false;
         }
-        try {
-            const int64_t offset = fut.get();
+        if (waited && done.status == OpStatus::Ok) {
+            const int64_t offset = done.value;
             std::cout << "CLIENT: OK produce phase" << phase
                       << "=" << n << " offset=" << offset << "\n";
             std::cout.flush();
-        } catch (const std::exception& ex) {
+        } else {
             std::cerr << "CLIENT: FAIL produce phase" << phase
-                      << " n=" << n << ": " << ex.what() << "\n";
+                      << " n=" << n << ": status=" << static_cast<int>(done.status)
+                      << " errorCode=" << done.errorCode << "\n";
             return false;
         }
     }
@@ -255,7 +274,7 @@ int main() {
         });
 
         std::cerr << "CLIENT: connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "CLIENT: connected\n";
 
         // Use the first topic for produce+subscribe.

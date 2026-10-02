@@ -2,14 +2,16 @@
 //
 // CB-2 — ProducerImpl: agent-side single-writer accumulator + ring handoff.
 //
-// This class is NOT part of the public API.  It is shared between Producer
-// (app thread) and ClientAgent (agent thread) via a shared_ptr.
+// This class is NOT part of the public API.  F8c C7: owned jointly by the
+// Producer handle (app thread) and the duty side (ProducerHub) — raw pointers,
+// the §3.3 release protocol (the last of the two to detach frees it).
 //
 // App threads:
 //   submitSendRecord() — lock-free ring write (the zero-alloc handoff).
 //   submitFlush()      — lock-free ring write (zero bytes, flushFlag).
-//   registerCallback() / registerFuture() — opt-in: allocate a PendingAck whose
-//     address (the "ack handle") travels to the agent inside the SEND_RECORD.
+//   F8c C6: an acked send stamps a tagged 64-bit ACK HANDLE (ackhandle::, below:
+//     a Completions target's CqRef + Token, or the onAck handler + Token) into
+//     the SEND_RECORD — no allocation, nothing to own or free.
 //
 // Agent thread (doWork / drainAndFlush):
 //   drainRing()    — reads SEND_RECORD ring entries, appends to builders.
@@ -23,8 +25,8 @@
 //   [8]      keyLen    : uint8  (≤16)
 //   [9..24]  keyBytes  : uint8[keyLen] (inline)
 //   [25]     flags     : uint8  (bit0=wantAck)
-//   [26..33] ackHandle : int64 LE PendingAck* (only meaningful when wantAck;
-//                        ownership passes to the agent on ring commit)
+//   [26..33] ackHandle : int64 LE ackhandle:: tagged token (only meaningful
+//                        when wantAck)
 //   [34..37] valueLen  : uint32 LE
 //   [38..]   valueBytes
 //
@@ -35,18 +37,20 @@
 
 #pragma once
 
+#include <rune/client/Completion.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
+#include <rune/client/detail/OpTarget.h>
 #include <rune/client/producer/Producer.h>
 
 #include <rune/protocol/RecordBatch.h>
 
 #include <concurrent/AtomicBuffer.h>
+#include <concurrent/BackOffIdleStrategy.h>
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/producer/InFlightRing.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
-#include <atomic>
 #include <thread>
 #include <chrono>
 #include <cstddef>
@@ -54,12 +58,11 @@
 #include <cstring>
 #include <deque>
 #include <functional>
-#include <future>
 #include <memory>
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace rune::client::producer {
@@ -84,6 +87,39 @@ inline constexpr int kRecValLenOff   = 34;  // uint32 LE
 inline constexpr int kRecValBytesOff = 38;  // value bytes
 inline constexpr int kRecHeaderSize  = 38;  // bytes before value
 
+// ---------------------------------------------------------------------------
+// F8c C6 — the 64-bit ack handle (SEND_RECORD ackHandle, PartitionState::
+// ackRing slot, Tier2Entry::ackHandle).  0 = no ack (void record).  Otherwise
+// a TAGGED TOKEN, never a pointer (nothing is allocated, owned or freed):
+//   bit 63 = 1            Completions target: bits 48..62 = its CqRef (15 bits:
+//                         10-bit registry index + 5-bit generation),
+//                         bits 0..47 = the Token;
+//   bit 63 = 0, bit 62 = 1  the producer's onAck handler: bits 0..47 = the Token.
+// (Spec §2.4 sketched bit 63 = "ack" + bit 62 = target + a 15-bit CqRef + a
+// 48-bit Token — 65 bits.  Here the target bit itself marks "ack": a CQ handle
+// always has bit 63 set and a handler handle bit 62, so neither is ever 0 and
+// every CqRef and every Token fit.)
+// ---------------------------------------------------------------------------
+namespace ackhandle {
+inline constexpr uint64_t kCqBit      = uint64_t{1} << 63;
+inline constexpr uint64_t kHandlerBit = uint64_t{1} << 62;
+inline constexpr int      kRefShift   = 48;
+inline constexpr uint64_t kRefMask    = 0x7FFF;
+[[nodiscard]] constexpr uint64_t forCq(CqRef ref, Token t) noexcept {
+    return kCqBit | ((static_cast<uint64_t>(ref) & kRefMask) << kRefShift) | (t & kMaxToken);
+}
+[[nodiscard]] constexpr uint64_t forHandler(Token t) noexcept { return kHandlerBit | (t & kMaxToken); }
+[[nodiscard]] constexpr bool  isCq(uint64_t h) noexcept { return (h & kCqBit) != 0; }
+[[nodiscard]] constexpr CqRef cqRef(uint64_t h) noexcept {
+    return static_cast<CqRef>((h >> kRefShift) & kRefMask);
+}
+[[nodiscard]] constexpr Token token(uint64_t h) noexcept { return h & kMaxToken; }
+}  // namespace ackhandle
+
+/// The reservation (and returned credit) of one producer completion record: a
+/// per-record / Tier-2 ack, and each credit unit of a BatchAck record.
+inline constexpr uint32_t kAckRecordBytes = 48;  // CompletionRing::completionRecordBytes(0)
+
 // kMsgTier2Batch token: 8 bytes = a heap Tier2Entry* (int64 LE).  The entry's
 // ownership travels through the ring (spec §1a.2) — no side queue, no mutex.
 inline constexpr int kT2TokenSize = 8;
@@ -104,7 +140,7 @@ inline constexpr int32_t kDefaultProducerRingCap = 32 * 1024 * 1024; // 32 MiB
 inline constexpr int32_t kDirectProducerRingCap = 1024;
 
 // Per-partition ack-ring capacity (entries; MUST be a power of two).  Holds the
-// PendingAck handles of outstanding (sent, not-yet-acked) records for one
+// ack handles (ackhandle::) of outstanding (sent, not-yet-acked) records for one
 // partition at their record index so ProduceResponse can fan out baseOffset+i.  Sized to comfortably exceed
 // the in-flight record count for a partition (maxInFlight batches × batch size);
 // if it ever fills, drainRing force-flushes + stops draining so the producer ring
@@ -122,7 +158,7 @@ inline constexpr uint32_t kAckRingCapacity = 16384; // 128 KiB/partition
 struct Tier2Entry {
     int32_t  topicId     = 0;
     int32_t  partition   = 0;
-    uint64_t ackHandle   = 0;  // PendingAck* of the batch future (0 = none)
+    uint64_t ackHandle   = 0;  // ackhandle:: tagged token of the batch (0 = none)
     int32_t  recordCount = 0;
     int64_t  enqueuedNs  = 0;  // agent clock when drained (delivery deadline if never sent)
     std::vector<uint8_t> batchBytes; // pre-built RecordBatch (baseSequence=0, patched by agent)
@@ -177,14 +213,14 @@ struct PartitionState {
     uint32_t deferBlockedPass = 0;  // apply pass in which this partition ABORTed
 
     // Per-record ack fan-out, ZERO-ALLOC ring (spec §4.3).  ackRing holds
-    // PendingAck handles at their record's OWN index within the batch (void
+    // ack handles (ackhandle::) at their record's OWN index within the batch (void
     // records hold 0; zeros are back-filled lazily, trailing void records take no
     // slot), preallocated ONCE (never per-batch).  Each flushed batch owns the
     // contiguous slice [batchAckStart, batchAckStart+batchAckCount): on
     // ProduceResponse ackRing[(start+i) & ackMask] completes at baseOffset + i.
     // ackTail = start of the oldest un-acked slice (oldest live in-flight batch,
     // else the current builder), so out-of-order acks never reclaim a live slice.
-    std::vector<uint64_t> ackRing;       // PendingAck* handles at record index (0 = void record)
+    std::vector<uint64_t> ackRing;       // ackhandle:: tokens at record index (0 = void record)
     uint32_t             ackMask       = 0; // ackRing.size() - 1 (size is pow2)
     uint64_t             ackHead       = 0; // next write index (monotonic)
     uint64_t             ackTail       = 0; // oldest unacked index (monotonic)
@@ -205,27 +241,6 @@ struct PartitionState {
     PartitionState& operator=(const PartitionState&) = delete;
     PartitionState(PartitionState&&) = default;
     PartitionState& operator=(PartitionState&&) = default;
-};
-
-// ---------------------------------------------------------------------------
-// PendingAck — heap object created on the opt-in ack paths.  Owned by the app
-// thread until the SEND_RECORD carrying its address is committed to the ring,
-// by the duty-cycle thread afterwards.  complete() fires it exactly once and
-// deletes it.
-// ---------------------------------------------------------------------------
-struct PendingAck {
-    enum class Kind : uint8_t { Callback, Future };
-    Kind                         kind = Kind::Callback;
-    std::function<void(int64_t)> callback;
-    std::promise<int64_t>        promise;
-
-    /// error empty = success (callback gets offset, future gets value);
-    /// otherwise callback(-1) / future exception(error). A throwing user
-    /// callback/promise never escapes (fix2 minor): caught, counted into
-    /// *exceptionCounter (if non-null — duty-thread-only plain counter, no
-    /// atomic, per the shared-nothing rule), and logged.
-    static void complete(uint64_t handle, int64_t offset, std::string_view error,
-                         uint64_t* exceptionCounter) noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -382,11 +397,68 @@ public:
     /// Construct a ProducerImpl with its own ring buffer.
     /// ringCap: power-of-two usable capacity in bytes (default 256 KiB).
     explicit ProducerImpl(ProducerConfig cfg,
-                          std::atomic<int64_t>& nextCorrId,
                           int32_t ringCap = kDefaultProducerRingCap);
 
-    /// Frees (without firing) every ack handle still owned by this producer.
+    /// Frees every Tier-2 entry still owned by this producer (ack handles are
+    /// plain tokens: nothing to free, nothing fired).
     ~ProducerImpl();
+
+    // ---- F8c C7: ownership (spec §3.3 — no shared_ptr) --------------------------
+    //
+    // Owned jointly by the Producer handle and the duty side (the ProducerHub,
+    // from the registration's adoption until the handle's HandleRelease was
+    // applied and the producer is quiescent — or until Client close hands it
+    // back).  Each side detaches its share ONCE on the ring's ownership word
+    // (one RMW); the side that detaches LAST frees the impl.  Nobody waits.
+
+    /// Duty side: detach the duty share.  True: the handle already detached —
+    /// the caller frees the impl.  The duty side never touches it afterwards.
+    [[nodiscard]] bool detachDuty() noexcept { return ring_.detachConsumer(); }
+    /// Handle side: detach the handle's share (its last access).  True: the
+    /// duty side already detached — the caller frees the impl.
+    [[nodiscard]] bool detachHandle() noexcept { return ring_.detachProducer(); }
+    /// Either side (acquire): the duty side detached (Client close handed the
+    /// impl back, or it was never registered) — the handle owns it alone and
+    /// must never touch the Client again.
+    [[nodiscard]] bool dutyDetached() const noexcept { return ring_.consumerDetached(); }
+    /// Either side (acquire): the handle detached (debug check of a
+    /// BatchBuilder that outlived its Producer while the duty side still holds
+    /// the impl).
+    [[nodiscard]] bool handleDetached() const noexcept { return ring_.producerDetached(); }
+    /// F8c C7 fix round 2 (F1): the handle's share handed over with its release
+    /// ORPHANED (the command ring was full).  setOrphanFence first (plain
+    /// field), then the RMW publishes it.  True: the duty side had already
+    /// detached — the caller frees the impl.
+    void setOrphanFence(int64_t fence) noexcept { orphanFence_ = fence; }
+    [[nodiscard]] bool detachHandleOrphaned() noexcept { return ring_.detachProducerOrphaned(); }
+    /// Duty side (acquire): the handle orphaned its release; and its fence.
+    [[nodiscard]] bool releaseOrphaned() const noexcept { return ring_.producerOrphaned(); }
+    [[nodiscard]] int64_t orphanFence() const noexcept { return orphanFence_; }
+    /// Duty side: the release was applied / queued (never twice).
+    bool releaseNoted = false;
+    /// Duty side: the handle's destructor semantics (closeImmediately unless a
+    /// close — begin-close, closeImmediately, Client close — already started).
+    void applyHandleRelease() {
+        if (lifeOpen()) applyCloseImmediately(OpStatus::Closed);
+    }
+    /// Duty side: nothing of this producer is pending any more — no open /
+    /// draining life, no duty work in progress (a handler of it is not
+    /// running), every accepted record completed, the ring consumed to its
+    /// closed tail.  A released producer is forgotten by its hub only then.
+    /// Duty side: inside this producer's own duty work (a handler it fired).
+    [[nodiscard]] bool inDutyWork() const noexcept { return inDuty_; }
+    [[nodiscard]] bool releasable() const noexcept {
+        return !lifeOpen() && !draining() && !inDuty_ && !pendingFail_.armed && fullyDrained_();
+    }
+    /// Registration refused (the Client was closing): no duty side will ever
+    /// hold it — the intake is closed, the Client is "closed" for the handle,
+    /// and the duty share is detached (the handle frees it alone).
+    void markBornClosed() noexcept {
+        markRingClosed();
+        if (mode_ == IngressMode::Direct) clientClosedDirect_ = true;
+        else ring_.consumerFinish();
+        (void)ring_.detachConsumer();
+    }
 
     // Non-copyable, non-movable (owns the ring buffer).
     ProducerImpl(const ProducerImpl&) = delete;
@@ -430,6 +502,18 @@ public:
     /// timeout (fix1 C2/I3).
     void sendBlocking(SendResult first, int32_t topicId, int32_t partition, const Key& key,
                       std::span<const uint8_t> value);
+
+    /// F8c C6: the pieces of sendBlocking() for the token forms (Producer.cpp):
+    /// one back-pressure wait step (pump on the duty thread / heartbeat-bounded
+    /// idle elsewhere; throws exactly as sendBlocking does), and the exception
+    /// for a non-retryable SendResult (Ok / BackPressured: no-op).
+    struct BlockingWait {
+        aeron::concurrent::BackoffIdleStrategy idle;
+        int64_t                                startNs = 0;
+    };
+    [[nodiscard]] BlockingWait beginBlockingWait() const;
+    void blockingWaitStep(BlockingWait& w);
+    static void throwForSendResult(SendResult r);
 
     using ClockFn = int64_t (*)() noexcept;
     void setClockForTesting(ClockFn fn) noexcept { clock_ = fn; }
@@ -517,7 +601,7 @@ public:
         if (mode_ == IngressMode::Direct) {
             directClosed_ = true;
         } else {
-            ring_.closed(true);
+            ring_.close();  // F8c C1(a): linearizable with every tryClaim()
         }
     }
 
@@ -532,68 +616,131 @@ public:
     /// ring (kMsgTier2Batch); ownership passes to the agent on commit.  The agent
     /// processes the token in order with Tier-1 records, stamping baseSequence.
     ///
-    /// ackHandle: PendingAck handle from registerFuture() (0 = none).  On false
-    /// the caller still owns it and must failUnsubmitted() it.
-    /// recordCount: number of records in the pre-built batch.
-    /// batchBytes: pre-built RecordBatch bytes (baseSequence field = 0; will be
-    ///             patched by the agent).
+    /// ackHandle: an ackhandle:: tagged token (0 = none).  recordCount: records
+    /// in the pre-built batch.  batchBytes: pre-built RecordBatch bytes
+    /// (baseSequence field = 0; patched by the agent) — MOVED FROM only when
+    /// accepted (F8c C6: a rejected batch stays with the caller for a retry).
     ///
-    /// fix4: returns RejectReason::None when accepted; otherwise why not (the
-    /// caller still owns the handle and fails it with a reason-specific text).
+    /// fix4: returns RejectReason::None when accepted; otherwise why not.
     RejectReason submitTier2Batch(int32_t topicId,
-                          int32_t partition,
-                          int64_t ackHandle,
-                          int32_t recordCount,
-                          std::vector<uint8_t> batchBytes);
+                                  int32_t partition,
+                                  uint64_t ackHandle,
+                                  int32_t recordCount,
+                                  std::vector<uint8_t>& batchBytes);
 
-    // ---- App-thread API (opt-in ack — may allocate) --------------------------
+    // ---- F8c C6: ack routing (setup phase; read on the duty thread) ----------
 
-    /// Allocate a callback PendingAck.  Returns the owning ack handle to stamp on
-    /// the SEND_RECORD (ownership passes on a successful submit; otherwise the
-    /// caller must failUnsubmitted() it).
-    int64_t registerCallback(std::function<void(int64_t)> cb);
+    /// The Client's seams (both runner modes; absent in bare unit rigs):
+    ///   cqDeliver — duty side: deliver one producer completion (per-record /
+    ///               Tier-2 ack, BatchAck) to registry slot `ref` (generation
+    ///               check + producer-op accounting, see Client).  Absent: CQ
+    ///               completions are dropped.
+    ///   sink      — duty side: the begin-close token (a generic target).
+    ///   issueClose — app side: begin-close (target != nullptr) or
+    ///               closeImmediately (target == nullptr): validate + reserve,
+    ///               close the intake, apply on the duty thread or submit the
+    ///               lifecycle command.  Absent (bare rig): the caller is the
+    ///               duty thread and it is applied in place.
+    ///   andWait   — the blocking close() (Client::andWait_).
+    struct Hooks {
+        void* ctx = nullptr;  ///< the Client (identity for Completions::client())
+        void (*cqDeliver)(void* ctx, CqRef ref, const Completion& c) noexcept = nullptr;
+        detail::CompletionSink sink{};
+        OpResult (*issueClose)(void* ctx, ProducerImpl& impl, const CompletionTarget* target,
+                               Token token) = nullptr;
+        detail::AndWaitSink andWait = nullptr;
+        /// F8c C7: the handle's §3.3 release (HubCommand::HandleRelease).
+        /// Absent (bare rig): no duty side — the handle frees the impl alone.
+        detail::HubCommandSink release = nullptr;
+    };
+    /// Set once by Client::producer() before the handle is returned.
+    void setHooks(const Hooks& h) noexcept { hooks_ = h; }
+    [[nodiscard]] const Hooks& hooks() const noexcept { return hooks_; }
 
-    /// Allocate a future PendingAck.  Returns (owning ack handle, future).
-    std::pair<int64_t, std::future<int64_t>> registerFuture();
-
-    /// App thread: fail an ack handle that never reached the ring (ring full).
-    /// fix3 I3: a throwing callback/promise is logged but NOT counted into
-    /// testCallbackExceptionCount() — this can run on any (possibly
-    /// concurrent, multiple) app thread, so it cannot safely share the
-    /// duty-thread-only plain counter.
-    void failUnsubmitted(int64_t ackHandle, const std::string& reason) noexcept;
-
-    /// Per-batch acknowledgements (setup-phase; see Producer::onBatchAck).
-    void onBatchAck(std::function<void(const BatchAck&)> cb) { batchAckCb_ = std::move(cb); }
-    /// Invoker mode: buffer BatchAcks for drainBatchAcks() instead of (or as well
-    /// as) calling the callback.
-    void collectBatchAcks(bool on) noexcept {
-        collectBatchAcks_ = on;
-        if (on && completedAcks_.capacity() < 4096) completedAcks_.reserve(4096);
+    /// Setup phase: the per-record ack handler (AckToken sends).  Duty thread
+    /// reads it (the first record that needs it was sent after this write:
+    /// ring order publishes it).
+    void setOnAck(AckFn fn, void* ctx) noexcept {
+        onAckFn_  = fn;
+        onAckCtx_ = ctx;
     }
-    template <class H>
-    int drainBatchAcks(H&& h) {
-        const int n = static_cast<int>(completedAcks_.size());
-        for (const BatchAck& a : completedAcks_) h(a);
-        completedAcks_.clear();  // keeps capacity
-        return n;
-    }
+    /// Setup phase: per-batch acks to a handler (exclusive with the CQ form).
+    /// Throws std::logic_error after a send / when the CQ form is set.
+    void setOnBatchAck(BatchAckFn fn, void* ctx);
+    /// Setup phase: per-batch acks into a Completions (registry ref `ref`); every
+    /// send then reserves one credit unit on `cq` (Producer.cpp).  Throws
+    /// std::logic_error after a send / on a second call / when the handler form
+    /// is set.
+    void setBatchAckCq(Completions* cq, CqRef ref);
+    /// App side: the batch-ack queue whose credit every send reserves (nullptr: none).
+    [[nodiscard]] Completions* batchAckCq() const noexcept { return batchAckCq_; }
 
-    /// fix2 minor / fix3 I3: user-callback exceptions caught at the
-    /// duty-thread PendingAck::complete call sites and onBatchAck (never let a
-    /// throwing ack callback escape and terminate the duty-cycle thread).
-    /// PLAIN counter (shared-nothing rule — no atomic): written ONLY on the
-    /// duty thread; read-safe under the same contract as
-    /// Client::testCallbackExceptionCount() (owner thread in Invoker mode;
-    /// after close() in Thread mode).
-    ///
-    /// Does NOT include failUnsubmitted()'s app-thread path (Producer::send's
-    /// callback/future overloads, BatchBuilder::send()): that runs on
-    /// whichever (possibly multiple, concurrent — this producer's ring is
-    /// MPSC) app thread calls it, so it cannot share this duty-thread-only
-    /// counter without racing both the duty thread and other app threads.
-    /// failUnsubmitted() logs a throwing callback but does not count it.
+    /// fix2 minor / fix3 I3: user-callback exceptions caught on the duty thread.
+    /// F8c C6: the ack and batch-ack handlers are noexcept function pointers
+    /// (no try/catch on the hot path), so nothing is counted any more — kept for
+    /// the existing read-safety contract and tests (always 0).
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept { return callbackExceptions_; }
+
+    // ---- F8c C6a: close (rich-state lifecycle) ----------------------------------
+    //
+    //   Open ──begin-close──> Draining{target, token, deadline}
+    //   Draining ──every accepted record completed AND ring consumed to the
+    //              closed tail──> Closed            (token Ok)
+    //   Draining ──deadline (deliveryTimeoutMs)──> Closed   (token Timeout)
+    //   Open / Draining / Closed ──closeImmediately / failClose / Client close──>
+    //              Discarding{status}               (token Closed; every record
+    //              not yet acknowledged, and every one read later from the
+    //              closed ring, completes `status` exactly once)
+    //
+    // Closed: the intake is closed and the token (if any) completed; records
+    // still in flight complete normally.
+
+    /// App side: begin-close (Producer::close(target, token)).
+    OpResult beginClose(const CompletionTarget& target, Token token);
+    /// App side: Producer::closeImmediately().
+    OpResult closeImmediately();
+
+    /// Close the INTAKE (any thread; Ring: the tail-bit CAS, linearizable with
+    /// every claim; Direct: owner-local).  True iff THIS call closed it.
+    bool closeIntake() noexcept;
+    /// Duty side: begin draining (the intake was closed by the issuer).  The
+    /// target is already pinned by the Client.
+    void applyBeginClose(const detail::OpTarget& target, Token token, int64_t nowNs);
+    /// Duty side: closeImmediately (status Closed) / the duty-thread failure
+    /// path (any status): tail-close the intake (idempotent), complete a pending
+    /// begin-close token Closed, fail every record not yet acknowledged with
+    /// `st`, and complete every record later read from the closed ring with
+    /// `st`.  Idempotent.
+    void applyCloseImmediately(OpStatus st);
+    /// Alias for the duty-thread failure path (T15: Aeron client closed).
+    void failClose(OpStatus st) { applyCloseImmediately(st); }
+    /// Duty side, once per cycle while not Open: Draining's completion /
+    /// deadline check.  Returns work done.
+    int closeDuty(int64_t nowNs);
+    /// Duty side, Client close (after the ring is closed): fail everything with
+    /// `st` and drain the closed ring up to its tail — waiting past records
+    /// claimed but not yet committed, bounded by the close-drain unblock rule
+    /// (yield cap, then Aeron's unblock(); a hang is worse than the documented
+    /// shutdown loss of a writer stalled for the whole cap).
+    void closeFinal(OpStatus st, int stalledYieldsBeforeUnblock = 1 << 20);
+    /// True once Client close completed this producer (closeFinal): Ring — the
+    /// ring's consumer-finished word (any thread); Direct — owner state.
+    [[nodiscard]] bool clientClosed() const noexcept;
+    [[nodiscard]] bool lifeOpen() const noexcept { return std::holds_alternative<LifeOpen>(life_); }
+    [[nodiscard]] bool draining() const noexcept { return std::holds_alternative<LifeDraining>(life_); }
+    [[nodiscard]] bool discarding() const noexcept { return std::holds_alternative<LifeDiscarding>(life_); }
+
+    // ---- Test seams (F8c C6a): split a SEND_RECORD claim from its commit -------
+    /// Claims + writes a SEND_RECORD WITHOUT committing it (Ring mode).  Returns
+    /// the claim index (< 0: not claimed — back-pressure / closed).
+    [[nodiscard]] aeron::util::index_t testClaimSendRecord(int32_t topicId, int32_t partition,
+                                                           const Key& key,
+                                                           std::span<const uint8_t> value,
+                                                           uint64_t ackHandle) noexcept;
+    void testCommitClaim(aeron::util::index_t idx) { ring_.commit(idx); }
+    /// Ring head / (closed) tail positions (diagnostics / tests).
+    [[nodiscard]] int64_t testRingHead() const noexcept { return ring_.headPosition(); }
+    [[nodiscard]] int64_t testRingTail() const noexcept { return ring_.tailPosition(); }
 
     // ---- Agent-thread API (single-writer) ------------------------------------
 
@@ -637,14 +784,19 @@ public:
     /// ack-ring slice (record i -> baseOffset + i) and reports its BatchAck.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset);
 
-    /// Called on close / redirect-reconnect failure (duty-cycle thread, or after
-    /// it stopped): fails AND drops every accepted record — still in the app ring,
-    /// in a builder, queued Tier-2, or in flight.
-    void failAllPending(const std::string& reason);
+    /// Called on redirect-reconnect failure (SessionLost) and by the close paths
+    /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
+    /// record — in the app ring (committed so far), the deferred arena, a
+    /// builder, queued Tier-2, or in flight — with `st`, exactly once.
+    /// noexcept (fix round 2, N1): run from ~DutyScope (the deferred fail-all
+    /// of a close applied inside a handler).  Everything it calls is non-
+    /// throwing (handlers are noexcept function pointers; no allocation).
+    void failAllPending(OpStatus st) noexcept;
 
-    /// Duty-cycle thread: fail every record of an in-flight batch (wire id).
-    /// Non-batch ids are ignored (they can come from any ErrorResponse).
-    void failBatch(int64_t batchCorrId, const std::string& reason);
+    /// Duty-cycle thread: fail every record of an in-flight batch (wire id)
+    /// with DeliveryFailed.  Non-batch ids are ignored (they can come from any
+    /// ErrorResponse).
+    void failBatch(int64_t batchCorrId);
 
     /// CB-5 B: attempt to resend the wire frame for a redirected Produce.
     /// Returns true if resent, false if corrId unknown / max redirects exceeded.
@@ -748,6 +900,28 @@ public:
 
     /// Ordinal inside the owning ProducerHub; encoded into batch correlation ids.
     void setOrdinal(uint32_t o) noexcept { ordinal_ = o; }
+    /// F8c C7 fix round 2 (F2): the ordinal plus its sequence base — past the
+    /// highest sequence any previous producer on this ordinal used (the hub
+    /// carries it forward) — so a late response for a previous incarnation
+    /// never matches one of this producer's batches.
+    void setOrdinal(uint32_t o, uint64_t seqBase) noexcept {
+        ordinal_ = o;
+        seqBase_ = seqBase;
+        for (auto& up : partitions_) up->inflight.rebase(seqBase_);  // created before adoption
+    }
+    /// Cold (ProducerHub::remove): one past the highest sequence any of this
+    /// producer's partitions ever claimed (at least its own base).
+    [[nodiscard]] uint64_t sequenceEnd() const noexcept {
+        uint64_t end = seqBase_;
+        for (const auto& up : partitions_) end = up->inflight.endSeq() > end ? up->inflight.endSeq() : end;
+        return end;
+    }
+    /// Test seam (F2): start every partition's sequences at `base` (before the
+    /// producer's first batch) — stands in for a long-lived producer.
+    void testRebaseSequences(uint64_t base) noexcept {
+        seqBase_ = base;
+        for (auto& up : partitions_) up->inflight.rebase(base);
+    }
     [[nodiscard]] uint32_t ordinal() const noexcept { return ordinal_; }
 
     /// Total Aeron frames offered to transport (agent-thread only; plain uint64_t).
@@ -795,10 +969,6 @@ public:
     /// F12: partitions examined by flushBatches so far (owner/duty thread; a
     /// plain counter — the per-cycle flush must scale with dirty partitions).
     [[nodiscard]] uint64_t debugFlushVisits() const noexcept { return flushVisits_; }
-
-    // ---- Global flush flag (written by app thread, read by agent) -------------
-    // Set by submitFlush(); cleared by flushBatches() after processing.
-    std::atomic<bool> globalFlushPending_ {false};
 
 private:
     // ---- Ring write helpers --------------------------------------------------
@@ -870,15 +1040,23 @@ private:
     }
     /// ackTail = start of the oldest un-acked slice (in-flight or current builder).
     void reclaimAckRing_(PartitionState& ps) noexcept;
-    /// Consumes every message left in the app->agent ring, handing each ack
-    /// handle it carries (SEND_RECORD wantAck / Tier-2 entry) to onHandle.
-    template <class OnHandle>
-    void drainAppRingHandles_(OnHandle&& onHandle);
+    /// Reads up to `limit` committed messages of the app->agent ring and
+    /// completes each record / Tier-2 batch with `st` (its ack handle, and a
+    /// one-unit BatchAck) — never sends it.  Frees Tier-2 entries.  Returns
+    /// messages read.
+    int discardRing_(OpStatus st, int limit);
     void pushAck_(PartitionState& ps, uint64_t handle);
+    /// F8c C6: deliver ONE ack handle's completion (0 = void: nothing) —
+    /// the onAck handler, or the Client's CQ registry.  Duty thread; never
+    /// allocates, never throws.
+    void completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
+                         uint16_t errorCode) noexcept;
     /// Completes the handles of slice [ackStart, ackStart+ackCount): record i ->
-    /// baseOffset + i, or error.  Zeroes each slot so nothing completes twice.
-    void completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount,
-                        int64_t baseOffset, std::string_view error) noexcept;
+    /// baseOffset + i (Ok), or -1 with `st` / `errorCode`.  `tier2`: the slice
+    /// is one Tier-2 batch (op Tier2Batch, aux = recordCount).  Zeroes each
+    /// slot so nothing completes twice.
+    void completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset,
+                        OpStatus st, uint16_t errorCode, bool tier2, int32_t recordCount) noexcept;
     /// acks=None: completes the just-sent builder slice with -1 ("sent, offset
     /// unknown") and reclaims it — nothing waits for a response.
     void completeSentUnacked_(PartitionState& ps) noexcept;
@@ -893,10 +1071,26 @@ private:
     /// the epoch restarts at 0 — the broker treats it as a new producer
     /// (trust-on-first-use at baseSequence 0).
     void onUnresolvedSequence_(int16_t batchEpoch) noexcept;
-    void emitBatchAck_(const PartitionState& ps, int32_t baseSequence, int32_t recordCount,
-                       int64_t baseOffset, int16_t errorCode);
+    /// One BatchAck to the batch-ack target (handler or CQ; none: nothing).
+    /// `units`: the batch-ack credit units it returns (records of a Tier-1
+    /// batch; 1 for a Tier-2 batch / a single never-sent record).
+    void emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence, int32_t recordCount,
+                       int64_t baseOffset, int16_t errorCode, OpStatus st, uint32_t units) noexcept;
+    /// Records that never reached a batch (failed in the ring / a builder /
+    /// the Tier-2 queue / the arena): a BatchAck{baseSequence -1, kClientFailure}.
+    void emitUnsentBatchAck_(int32_t topicId, int32_t partition, int32_t recordCount, OpStatus st,
+                             uint32_t units) noexcept {
+        emitBatchAck_(topicId, partition, -1, recordCount, -1, BatchAck::kClientFailure, st, units);
+    }
     /// Fails a live batch's records and releases its slot.
-    void failBatch_(PartitionState& ps, InFlightBatch& b, const std::string& reason);
+    void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st);
+    /// Fails the never-sent builder records of `ps` (handles + one BatchAck).
+    void failBuilder_(PartitionState& ps, OpStatus st);
+    /// Draining: every accepted record completed and the ring consumed to the
+    /// closed tail.
+    [[nodiscard]] bool fullyDrained_() const noexcept;
+    /// Complete the begin-close token (if Draining) with `st`; life -> next.
+    void completeCloseToken_(OpStatus st);
     /// Always-on invariant check: the id encoded into the sent frame must be the
     /// id of the slot just claimed; on mismatch logs loudly and fails the batch.
     void verifyClaimedCorrId_(PartitionState& ps, InFlightBatch& b, int64_t wireCorrId);
@@ -912,8 +1106,13 @@ private:
     bool    frameCapped_ = false;
     int32_t effCap_      = 0;
 
-    // Shared correlationId counter (also used by Client for ping).
-    std::atomic<int64_t>& nextCorrId_;
+    // F8c C0: a flush() requested ON the duty thread (inside a callback) while
+    // the ring is full cannot wait for ring room (it would wait on itself).  It
+    // is recorded here instead and consumed by the next flushBatches() pass.
+    // Duty-thread state only: written by submitFlush() on the duty thread and
+    // read/cleared by flushBatches() on the same thread.  (Replaces the
+    // cross-thread std::atomic<bool> globalFlushPending_ latch.)
+    bool dutyFlushPending_ = false;
 
     // ---- Instrumentation counters (agent-thread only — plain uint64_t) -------
     // Single-writer (agent thread): no atomics needed per shared-nothing law.
@@ -925,14 +1124,22 @@ private:
     // ProducerImpl owns its ring so SEND_RECORD messages are separate from the
     // ClientAgent command ring (agent command type IDs 1-4 are unrelated).
     static constexpr std::size_t kRingAlignment = 64; // cache-line aligned
-    std::unique_ptr<uint8_t, void(*)(void*)> ringBuf_;
+    // F8c C7 (perf): the fields EVERY app-thread send reads — the ring object
+    // (buffer pointer, capacity, index words), the ingress mode and the
+    // batch-ack queue pointer — sit on cache lines of their own, written only
+    // at setup.  Next to a field the duty thread writes per record
+    // (recordsSent_, lastNowNs_) each send paid a cross-core miss (false
+    // sharing that depended on member layout).
+    alignas(64) std::unique_ptr<uint8_t, void(*)(void*)> ringBuf_;
     rune::client::detail::M2ORingBuffer      ring_;
+    IngressMode  mode_       = IngressMode::Ring;  // set once before any send (Task 14)
+    Completions* batchAckCq_ = nullptr;            // app side: reserve one unit per send (C6)
 
     // ---- Agent-thread only (no lock needed — single-writer) ------------------
 
     // Flat partition table (spec §1a.5): FlatIndexMap key -> dense slot, slots own
     // their PartitionState (stable address; slotIndex == position).
-    detail::FlatIndexMap                          partitionIndex_;
+    alignas(64) detail::FlatIndexMap              partitionIndex_;
     std::vector<std::unique_ptr<PartitionState>>  partitions_;
     // F12: slots of the partitions with flush work (PartitionState::dirty), in
     // the order they became dirty.  capacity() >= partitions_.size() always
@@ -965,16 +1172,51 @@ private:
     // In-flight batches live in each PartitionState::inflight ring; a batch
     // correlation id encodes (ordinal_, partition slot, ring sequence).
     uint32_t ordinal_ = 0;
+    uint64_t seqBase_ = 0;  // F8c C7 F2: the ordinal's carried-forward sequence base
+    int64_t  orphanFence_ = 0;  // F8c C7 F1: written by the handle before its orphan RMW
     // Lower bound of every live batch's attemptDeadlineNs: retransmitStalled()
     // returns in O(1) until it passes (spec §1a.5; replaces the ordered map front).
     int64_t earliestAttemptDeadlineNs_ = INT64_MAX;
 
-    // ---- Per-batch acks (duty-cycle thread only) ------------------------------
-    std::function<void(const BatchAck&)> batchAckCb_;   // set before the first send
-    bool                                 collectBatchAcks_ = false;
-    std::vector<BatchAck>                completedAcks_;
+    // ---- F8c C6: ack targets (setup phase; read on the duty thread) ------------
+    Hooks        hooks_{};
+    AckFn        onAckFn_       = nullptr;
+    void*        onAckCtx_      = nullptr;
+    BatchAckFn   batchAckFn_    = nullptr;
+    void*        batchAckCtx_   = nullptr;
+    CqRef        batchAckCqRef_ = kNoCqRef;   // duty side: the BatchAck queue's registry ref
     // fix2 minor: plain counter (see testCallbackExceptionCount()).
-    uint64_t                             callbackExceptions_ = 0;
+    uint64_t     callbackExceptions_ = 0;
+
+    // ---- F8c C6a: lifecycle (duty-thread state; rich states) ---------------------
+    struct LifeOpen {};
+    struct LifeDraining {
+        detail::OpTarget target{};
+        Token            token      = 0;
+        int64_t          deadlineNs = 0;
+    };
+    struct LifeClosed {};
+    struct LifeDiscarding {
+        OpStatus status = OpStatus::Closed;
+    };
+    std::variant<LifeOpen, LifeDraining, LifeClosed, LifeDiscarding> life_{};
+    // Duty side: the intake is closed and the duty side knows it (Draining /
+    // Closed / Discarding) — every pass flushes at once (no linger: nothing
+    // more can join a batch).
+    bool flushAll_ = false;
+    // F8c fix round 1 (I1): a closeImmediately / failClose applied INSIDE this
+    // producer's own duty work (from a handler it fired) — the intake is closed
+    // and the life is Discarding at once, but the fail-all (and the aborted
+    // begin-close token) waits for the outermost DutyScope's end.
+    struct PendingFail {
+        bool         armed    = false;
+        OpStatus     status   = OpStatus::Closed;
+        bool         hadToken = false;
+        LifeDraining drain{};
+    };
+    PendingFail pendingFail_{};
+    void runPendingFail_() noexcept;
+    bool clientClosedDirect_ = false;  // Direct only: closeFinal ran (owner state)
 
     // ---- sendBlocking() support (app thread only) -----------------------------
     static int64_t steadyNowNs_() noexcept;
@@ -988,7 +1230,6 @@ private:
     std::thread::id dutyThreadId_{};
 
     // ---- Task 14: ingress mode (set once before any send; owner thread only) --
-    IngressMode mode_      = IngressMode::Ring;
     bool        directClosed_ = false;  // Direct only: see markRingClosed()
     // Duty-cycle clock of the last drainRing()/flushBatches() (Direct appends
     // stamp batchStartNs with it — the clock is sampled per pass, never per send).
@@ -1033,7 +1274,14 @@ private:
         explicit DutyScope(ProducerImpl& pi) noexcept : p(pi), prev(pi.inDuty_) { p.inDuty_ = true; }
         ~DutyScope() {
             if (!prev) {
+                // F8c fix round 1 (I1): a close applied from a handler this
+                // producer fired runs its fail-all HERE — after the walk that
+                // fired the handler finished (no live batch / ring read / slot
+                // is ever failed twice) — and before the deferred records are
+                // applied (they are failed with everything else).
+                while (p.pendingFail_.armed) p.runPendingFail_();
                 if (!p.deferred_.empty()) p.applyDeferred_();
+                while (p.pendingFail_.armed) p.runPendingFail_();  // a lost-record handler closed
                 p.inDuty_ = false;
             }
         }
@@ -1049,7 +1297,7 @@ private:
     /// is failed via its handle (void: counted + logged) and dropped.
     void applyDeferred_() noexcept;
     /// failAllPending: fail + drop every record deferred before the call.
-    void failDeferred_(const std::string& reason);
+    void failDeferred_(OpStatus st);
     /// sweepTimedOut: fail deferred records accepted >= deliveryNs ago.
     void expireDeferred_(int64_t nowNs, int64_t deliveryNs);
     /// Accept one record / Tier-2 token into the arena (inDuty_).  Validates the
@@ -1064,7 +1312,8 @@ private:
     void unaccountDeferred_(const DeferredHdr& h) noexcept;
     /// The record's ack handle (record: wantAck handle; Tier-2: takes + frees
     /// the entry and returns its handle).  0 = void.
-    uint64_t takeDeferredHandle_(std::size_t off) noexcept;
+    uint64_t takeDeferredHandle_(std::size_t off, bool* tier2 = nullptr,
+                                 int32_t* recordCount = nullptr) noexcept;
     /// Outside inDuty_: run the apply pass if `ps`'s (or unknown partitions')
     /// deferred records must go first.  Returns false if this partition still
     /// has deferred records afterwards (the new send must not overtake them).

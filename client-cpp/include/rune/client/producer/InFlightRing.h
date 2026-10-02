@@ -23,6 +23,14 @@ inline constexpr int      kOrdinalShift = 50;
 inline constexpr int      kSlotShift    = 32;
 inline constexpr uint32_t kMaxOrdinal   = (1u << 12) - 1;
 inline constexpr uint32_t kMaxSlot      = (1u << 18) - 1;
+// F8c C7 fix round 2 (F2): an ordinal reused by a new producer CARRIES ITS
+// SEQUENCES FORWARD — the new incarnation's rings start past the highest
+// sequence the previous one ever used on any partition (ProducerHub::remove
+// records it).  A late ProduceResponse of a previous incarnation carries a
+// sequence below that base and never matches a batch of the new one (exact
+// corrId compare) — the only residual is the inherent 32-bit wrap (2^32
+// batches on one slot while a response is still outstanding), the same bound
+// one producer already relies on against itself.  Zero hot-path cost.
 
 [[nodiscard]] constexpr int64_t make(uint32_t ordinal, uint32_t slot, uint32_t seq) noexcept {
     return kTag | (static_cast<int64_t>(ordinal & kMaxOrdinal) << kOrdinalShift) |
@@ -50,6 +58,7 @@ struct InFlightBatch {
     int32_t  attempts          = 0;
     int32_t  redirectCount     = 0;
     int16_t  producerEpoch     = 0;  ///< epoch the frame was stamped with (unresolved-sequence bump)
+    bool     tier2             = false;  ///< F8c C6: a Tier-2 batch (ONE ack: op Tier2Batch; 1 credit unit)
     std::vector<uint8_t> wireFrame;  ///< encoded Produce frame; capacity reused
 };
 
@@ -70,6 +79,13 @@ public:
     [[nodiscard]] bool full() const noexcept {
         return head_ - tail_ >= static_cast<uint64_t>(mask_) + 1;
     }
+    /// F8c C7 fix round 2 (F2): start the sequence at `base` (the ordinal's
+    /// carried-forward range).  Only before the first claim.
+    void rebase(uint64_t base) noexcept {
+        if (!claimed_) head_ = tail_ = base;
+    }
+    /// The sequence after the last one this ring ever claimed (cold).
+    [[nodiscard]] uint64_t endSeq() const noexcept { return head_; }
     /// Sequence the next claim() will use (encode the frame before offering it).
     [[nodiscard]] uint32_t nextSeq() const noexcept { return static_cast<uint32_t>(head_); }
 
@@ -78,6 +94,7 @@ public:
         InFlightBatch& b = slots_[head_ & mask_];
         b.corrId = batchcorr::make(ordinal, partitionSlot, static_cast<uint32_t>(head_));
         ++head_;
+        claimed_ = true;
         ++live_;
         return b;
     }
@@ -116,6 +133,7 @@ private:
     uint64_t head_ = 0;
     uint64_t tail_ = 0;
     uint32_t live_ = 0;
+    bool     claimed_ = false;  // F2: rebase only before the first claim
 };
 
 } // namespace rune::client::producer

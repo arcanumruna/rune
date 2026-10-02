@@ -95,7 +95,6 @@ struct FakeSend {
 // Uses a shared atomic corrId counter (as in production).
 // ---------------------------------------------------------------------------
 
-static std::atomic<int64_t> g_corrId{100};
 
 static std::unique_ptr<rprod::ProducerImpl> makeProducerImpl(
     rune::client::Acks acks = rune::client::Acks::None)
@@ -106,7 +105,7 @@ static std::unique_ptr<rprod::ProducerImpl> makeProducerImpl(
     cfg.batchBytes     = 1;      // flush on any byte
     cfg.maxInFlight    = 8;
     cfg.produceTimeoutMs = 30000;
-    return std::make_unique<rprod::ProducerImpl>(cfg, g_corrId);
+    return std::make_unique<rprod::ProducerImpl>(cfg);
 }
 
 // ---------------------------------------------------------------------------

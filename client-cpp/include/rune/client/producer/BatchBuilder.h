@@ -34,18 +34,18 @@
 //   auto bb = producer.batch(topic, Key(orderId));
 //   bb.add(valueSpan);
 //   bb.add(value2Span);
-//   auto f = bb.send();          // returns future<int64_t> resolving with baseOffset
-//   int64_t base = f.get();      // records land at base..base+K-1 (contiguous)
+//   bb.send(cq, token);          // F8c C6: Completion{op=Tier2Batch, value=baseOffset,
+//                                //   aux=recordCount} into cq; records at base..base+K-1
 
 #pragma once
 
+#include <rune/client/Completion.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 
 #include <rune/protocol/RecordBatch.h>
 
 #include <cstdint>
-#include <future>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -58,15 +58,22 @@ class ProducerImpl;
 
 namespace rune::client {
 
+class Completions;
+struct AckToken;
+
 // ---------------------------------------------------------------------------
 // BatchBuilder — returned by Producer::batch(topic, key).
 //
-// Not copyable; movable (ownership transfer only).
+// Not copyable; movable.  F8c C7: BORROWS its Producer's impl — it must not
+// outlive the Producer it came from (spec §3.1 rule 1).
 // ---------------------------------------------------------------------------
 class BatchBuilder {
 public:
-    // Constructed by Producer::batch() — not for direct construction.
-    explicit BatchBuilder(std::shared_ptr<producer::ProducerImpl> impl,
+    // Constructed by Producer::batch() — not for direct construction.  F8c
+    // C7: BORROWS the producer (spec §3.1 rule 1): it must not outlive the
+    // Producer it came from (a send() after that Producer was destroyed
+    // throws std::logic_error while the duty side still holds the impl).
+    explicit BatchBuilder(producer::ProducerImpl* impl,
                           int32_t topicId,
                           int32_t partition) noexcept;
 
@@ -102,26 +109,46 @@ public:
     /// Semantics:
     ///   - All records accumulated via add() are encoded into ONE RecordBatch.
     ///   - The batch is submitted as a single atomic log append (one Produce
-    ///     message, one partition, one RecordBatch).
-    ///   - The returned future resolves with the broker's baseOffset.
-    ///     The K records land at contiguous offsets base..base+K-1.
+    ///     message, one partition, one RecordBatch); the K records land at
+    ///     contiguous offsets base..base+K-1.
     ///   - Ordering with Tier-1: the batch token is enqueued into the same
     ///     ring used by Tier-1, so submission order is preserved.
     ///
-    /// Throws std::invalid_argument if the batch is empty (no add() calls).
-    /// Throws std::logic_error if send() has already been called.
+    /// F8c C6 — three forms, all returning the issue result synchronously:
+    ///   send()                 no completion (fire-and-forget);
+    ///   send(cq, token)        one Completion{op = Tier2Batch, value =
+    ///                          baseOffset (or -1), aux = recordCount} into cq
+    ///                          (credit reserved on cq first: QueueFull);
+    ///   send(AckToken{token})  the producer's onAck handler (baseOffset).
+    /// Accepted: the batch is consumed (add() throws afterwards) and exactly
+    /// one completion follows for the token forms.  Any other result leaves
+    /// the batch INTACT (retry send() later): BackPressured (ring full /
+    /// deferred arena full / its partition still has deferred records),
+    /// Closed (the producer's intake is closed), WrongThread, QueueFull,
+    /// InvalidArgument (unaddressable partition, bad token / queue).
     ///
-    /// After send() returns, add() will throw on subsequent calls.
-    std::future<int64_t> send();
+    /// Throws std::invalid_argument if the batch is empty (no add() calls).
+    /// Throws std::logic_error if send() has already been accepted.
+    OpResult send();
+    OpResult send(Completions& cq, Token token);
+    OpResult send(AckToken token);
 
 private:
-    std::shared_ptr<producer::ProducerImpl> impl_;
+    void checkProducer_() const;
+
+    producer::ProducerImpl* impl_ = nullptr;  // borrowed (owned by the Producer + duty side)
     int32_t topicId_   = -1;
     int32_t partition_ = -1;
 
     // Per-batch RecordBatchBuilder (reused; reset if needed, but a BatchBuilder
     // is single-use so the builder is built once).
     std::unique_ptr<rune::protocol::RecordBatchBuilder> builder_;
+    // The encoded batch, kept across a rejected send() so it can be retried.
+    std::vector<uint8_t> batchBytes_;
+    int32_t              recordCount_ = 0;
+
+    /// Encode (once) and submit with this ack handle (0 = none).
+    OpResult submit_(uint64_t ackHandle);
 
     // Lifecycle guard.
     bool sent_ = false;

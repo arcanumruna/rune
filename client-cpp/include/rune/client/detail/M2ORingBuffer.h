@@ -17,12 +17,19 @@
 //
 // Record framing (length/type headers, alignment, padding) is byte-identical
 // to Aeron's ManyToOneRingBuffer, so write()/read() interoperate with the same
-// RecordDescriptor framing. The TRAILER layout is NOT fully byte-identical to
-// Aeron's RingBufferDescriptor: the first five words (tail, head cache, head,
-// correlation counter, consumer heartbeat — CL*0..CL*10) match Aeron's offsets
-// exactly, but this ring extends the trailer with one more word, `closed`, at
-// CL*12 (fix1 C2/I3) — a Rune-only extension with no Aeron counterpart. See
-// the trailer layout comment above the offset constants, below.
+// RecordDescriptor framing, and the TRAILER layout (tail, head cache, head,
+// correlation counter, consumer heartbeat — CL*0..CL*12) is Aeron's
+// RingBufferDescriptor exactly.
+//
+// Rune extension (F8c C1(a), user-approved deviation from Aeron's
+// ManyToOneRingBuffer, which has no close): a LINEARIZABLE close.  The closed
+// flag is the top (sign) bit of the tail position word — the word tryClaim()
+// already CASes — so every claim is totally ordered with the close: a claim
+// whose CAS precedes the close is drained by the consumer (even if it commits
+// afterwards), a claim after it fails with kClaimClosed, and the tail never
+// moves again.  The claim hot path pays one sign test on the tail value it has
+// already loaded.  (The previous separate `closed` trailer word could not
+// order a writer that checked it before the close but claimed after.)
 //
 // Threading: many producer threads may call tryClaim()/write(); exactly ONE
 // consumer thread may call read()/controlledRead().
@@ -60,7 +67,9 @@ public:
         m_headPositionIndex         = m_capacity + HEAD_POSITION_OFFSET;
         m_correlationIdCounterIndex = m_capacity + CORRELATION_COUNTER_OFFSET;
         m_consumerHeartbeatIndex    = m_capacity + CONSUMER_HEARTBEAT_OFFSET;
-        m_closedIndex               = m_capacity + CLOSED_OFFSET;
+        m_consumerFinishedIndex     = m_capacity + CONSUMER_FINISHED_OFFSET;
+        m_detachIndex               = m_capacity + DETACH_OFFSET;
+        m_orphanHintIndex           = m_capacity + ORPHAN_HINT_OFFSET;
     }
 
     M2ORingBuffer(const M2ORingBuffer&)            = delete;
@@ -79,8 +88,9 @@ public:
     [[nodiscard]] std::int64_t headPosition() const noexcept {
         return loadAcquire64_(m_headPositionIndex);
     }
+    /// The tail POSITION (the closed bit masked off — see close()).
     [[nodiscard]] std::int64_t tailPosition() const noexcept {
-        return loadAcquire64_(m_tailPositionIndex);
+        return loadAcquire64_(m_tailPositionIndex) & TAIL_POSITION_MASK;
     }
 
     /// Raw writable base pointer — combined with a tryClaim() offset for a
@@ -107,18 +117,101 @@ public:
         return loadRelaxed64_(m_consumerHeartbeatIndex);
     }
 
-    /// fix1 C2/I3: a "this producer's Client is gone" word in the ring trailer,
-    /// symmetric with consumerHeartbeatTime — the ring's own state, no other
-    /// shared memory. Set once (release store) by Client::closeImpl_ while the
-    /// Client is still fully valid (before any pump-hook context can dangle);
-    /// trySubmit() / sendBlocking() check it (acquire load) so a Producer that
-    /// outlives its Client gets SendResult::Closed instead of ever touching the
-    /// (by then invalid) pump hook — no use-after-free, no silent accept.
-    void closed(bool v) noexcept {
-        storeRelease64_(m_closedIndex, v ? 1 : 0);
+    /// F8c fix round 1 (I2): the consumer will never read this ring again
+    /// (release).  Set after a close drain finished — even an ABANDONED one
+    /// (fix5): a producer still waiting for the outcome of a record it
+    /// committed observes this (acquire) and knows the record will never be
+    /// read.  A Rune extension in the trailer's spare cache line (the second
+    /// line of Aeron's padded heartbeat slot); the trailer length is unchanged.
+    void consumerFinish() noexcept { storeRelease64_(m_consumerFinishedIndex, 1); }
+    [[nodiscard]] bool consumerFinished() const noexcept {
+        return loadAcquire64_(m_consumerFinishedIndex) != 0;
+    }
+
+    /// F8c C7: last-one-frees ownership hand-off of the OBJECT that owns this
+    /// ring (a ProducerImpl) between its two holders — the consumer side (the
+    /// duty registry) and the producer side (the app-thread handle).  Each side
+    /// detaches exactly once with ONE RMW on one word; the call that finds the
+    /// OTHER side already detached returns true and its caller frees the
+    /// owner.  Exactly one of the two calls returns true; nobody waits.  The
+    /// same handshake as OneToOneRingBuffer::detachProducer/detachConsumer
+    /// (F8c fix round 2, I5), in the trailer's spare line after the
+    /// correlation counter (Aeron pads it; nothing else uses it).
+    bool detachConsumer() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedConsumer, __ATOMIC_ACQ_REL) &
+                kDetachedProducer) != 0;
+    }
+    bool detachProducer() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedProducer, __ATOMIC_ACQ_REL) &
+                kDetachedConsumer) != 0;
+    }
+    /// Either side (acquire): has the consumer side (the duty registry)
+    /// detached?  Once true, the consumer never touches the owner again.
+    [[nodiscard]] bool consumerDetached() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kDetachedConsumer) != 0;
+    }
+    /// Either side (acquire): has the producer side (the handle) detached?
+    [[nodiscard]] bool producerDetached() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kDetachedProducer) != 0;
+    }
+    /// F8c C7 fix round 2 (F1): the producer side (the handle) detaches AND
+    /// marks its release as ORPHANED (it could not be put on the command ring:
+    /// full) in the same RMW — the duty side discovers it (orphanHint below)
+    /// and applies the release itself.  Returns true iff the consumer side had
+    /// already detached (the caller frees the owner).
+    bool detachProducerOrphaned() noexcept {
+        return (__atomic_fetch_or(word64_(m_detachIndex), kDetachedProducer | kOrphanRelease,
+                                  __ATOMIC_ACQ_REL) & kDetachedConsumer) != 0;
+    }
+    [[nodiscard]] bool producerOrphaned() const noexcept {
+        return (loadAcquire64_(m_detachIndex) & kOrphanRelease) != 0;
+    }
+
+    /// F8c C7 fix round 2 (F1), on a COMMAND ring: "an orphaned handle release
+    /// exists — scan for it".  Any thread raises it (release) AFTER marking its
+    /// impl orphaned; the consumer takes it (one acquire load per duty cycle;
+    /// the RMW only when raised), then scans.  A raise racing the take is
+    /// either seen by this scan or leaves the hint up for the next one.
+    void raiseOrphanHint() noexcept { __atomic_store_n(word64_(m_orphanHintIndex), 1, __ATOMIC_RELEASE); }
+    [[nodiscard]] bool takeOrphanHint() noexcept {
+        if (loadAcquire64_(m_orphanHintIndex) == 0) [[likely]] return false;
+        return __atomic_exchange_n(word64_(m_orphanHintIndex), 0, __ATOMIC_ACQ_REL) != 0;
+    }
+
+    /// Test seam (fix5 / F8c fix round 1): turn a claim returned by tryClaim()
+    /// into a HEADER-LESS claim (length + type words zeroed) — the state of a
+    /// writer that won the tail CAS but never wrote its record header.  Uses
+    /// the ring's own release stores, so a concurrently polling consumer
+    /// (TSan) sees a well-defined value.
+    void testZeroClaimHeader(aeron::util::index_t claimIndex) noexcept {
+        namespace RD = aeron::concurrent::ringbuffer;
+        const aeron::util::index_t recordIndex = claimIndex - RD::RecordDescriptor::HEADER_LENGTH;
+        storeRelease32_(RD::RecordDescriptor::typeOffset(recordIndex), 0);
+        storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), 0);
+    }
+
+    /// tryClaim() result when the ring is closed (INSUFFICIENT_CAPACITY is -2).
+    static constexpr aeron::util::index_t kClaimClosed = -3;
+
+    /// F8c C1(a): close the ring to producers — LINEARIZABLE with tryClaim().
+    /// Sets the closed bit in the tail word with one RMW (fetch_or, seq_cst),
+    /// which is totally ordered with every claim's tail CAS: a claim whose CAS
+    /// came first is a normal record (the consumer drains it — a close drain
+    /// reads up to tailPosition(), waiting past claims not yet committed), and
+    /// every claim after it returns kClaimClosed.  The tail position is frozen
+    /// from here on.  Idempotent; any thread (a producer, the consumer, or a
+    /// closer).  Returns true iff THIS call closed the ring.
+    ///
+    /// (fix1 C2/I3 use: Client::closeImpl_ closes each producer ring while the
+    /// Client is still fully valid, so a Producer that outlives its Client gets
+    /// SendResult::Closed and never touches the by-then-invalid pump hook.)
+    bool close() noexcept {
+        const std::int64_t prev =
+            __atomic_fetch_or(word64_(m_tailPositionIndex), TAIL_CLOSED_BIT, __ATOMIC_SEQ_CST);
+        return (prev & TAIL_CLOSED_BIT) == 0;
     }
     [[nodiscard]] bool closed() const noexcept {
-        return loadAcquire64_(m_closedIndex) != 0;
+        return (loadAcquire64_(m_tailPositionIndex) & TAIL_CLOSED_BIT) != 0;
     }
 
     // ------------------------------------------------------------------
@@ -126,7 +219,8 @@ public:
     // ------------------------------------------------------------------
 
     /// Reserve space for a `length`-byte message; returns the encoded-message
-    /// offset to write into, or a NEGATIVE value on insufficient capacity.
+    /// offset to write into, or a NEGATIVE value: INSUFFICIENT_CAPACITY (-2,
+    /// back-pressure) or kClaimClosed (-3, the ring is closed — see close()).
     aeron::util::index_t tryClaim(std::int32_t msgTypeId, std::size_t length) {
         namespace RD = aeron::concurrent::ringbuffer;
         RD::RecordDescriptor::checkMsgTypeId(msgTypeId);
@@ -135,7 +229,7 @@ public:
         const aeron::util::index_t recordLength =
             static_cast<aeron::util::index_t>(length) + RD::RecordDescriptor::HEADER_LENGTH;
         const aeron::util::index_t recordIndex = claimCapacity(recordLength);
-        if (INSUFFICIENT_CAPACITY == recordIndex) return recordIndex;
+        if (recordIndex < 0) return recordIndex;  // INSUFFICIENT_CAPACITY / kClaimClosed
 
         storeRelease32_(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
         std::atomic_thread_fence(std::memory_order_release);
@@ -243,7 +337,7 @@ public:
     bool unblock() {
         namespace RD = aeron::concurrent::ringbuffer;
         const std::int64_t headPosition = loadAcquire64_(m_headPositionIndex);
-        const std::int64_t tailPosition = loadAcquire64_(m_tailPositionIndex);
+        const std::int64_t tailPosition = loadAcquire64_(m_tailPositionIndex) & TAIL_POSITION_MASK;
 
         if (tailPosition == headPosition) return false;
 
@@ -434,23 +528,28 @@ public:
     }
 
 private:
-    // Trailer layout. CL*0..CL*10 (tail, head cache, head, correlation counter,
-    // consumer heartbeat) are byte-identical to Aeron's RingBufferDescriptor —
-    // this is what lets write()/read() interoperate with Aeron's own
-    // RecordDescriptor record framing. CLOSED_OFFSET (CL*12) is a Rune-only
-    // extension (fix1 C2/I3): Aeron's RingBufferDescriptor has no such word,
-    // and no external Aeron-side reader ever looks past CL*10 on this ring (it
-    // is never shared outside rune::client::detail — see the class comment),
-    // so extending the trailer here is safe.
+    // Trailer layout: byte-identical to Aeron's RingBufferDescriptor (tail,
+    // head cache, head, correlation counter, consumer heartbeat; CL*12 long).
+    // The closed flag lives in the tail word's top bit (F8c C1(a)), not in a
+    // trailer word of its own.
     static constexpr aeron::util::index_t CL = aeron::util::BitUtil::CACHE_LINE_LENGTH;
     static constexpr aeron::util::index_t TAIL_POSITION_OFFSET       = CL * 2;
     static constexpr aeron::util::index_t HEAD_CACHE_POSITION_OFFSET = CL * 4;
     static constexpr aeron::util::index_t HEAD_POSITION_OFFSET       = CL * 6;
     static constexpr aeron::util::index_t CORRELATION_COUNTER_OFFSET = CL * 8;
     static constexpr aeron::util::index_t CONSUMER_HEARTBEAT_OFFSET  = CL * 10; // matches Aeron
-    static constexpr aeron::util::index_t CLOSED_OFFSET              = CL * 12; // Rune extension
-    static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 14;
+    static constexpr aeron::util::index_t CONSUMER_FINISHED_OFFSET   = CL * 11; // Rune (I2): spare line
+    static constexpr aeron::util::index_t DETACH_OFFSET              = CL * 9;  // Rune (C7): spare line
+    static constexpr aeron::util::index_t ORPHAN_HINT_OFFSET         = CL * 1;  // Rune (C7 F1): spare line
+    static constexpr std::int64_t kDetachedProducer = 1;
+    static constexpr std::int64_t kDetachedConsumer = 2;
+    static constexpr std::int64_t kOrphanRelease    = 4;
+    static constexpr aeron::util::index_t TRAILER_LENGTH             = CL * 12; // matches Aeron
     static constexpr aeron::util::index_t INSUFFICIENT_CAPACITY      = -2;
+    // The tail word: bit 63 = closed (positions never reach 2^63), bits 0..62 =
+    // the tail position.  A closed tail is negative: one sign test.
+    static constexpr std::int64_t TAIL_CLOSED_BIT    = std::int64_t{-1} << 63;  // INT64_MIN
+    static constexpr std::int64_t TAIL_POSITION_MASK = ~TAIL_CLOSED_BIT;
 
     // Minimal template-based scope guard (no std::function, no heap alloc).
     template <typename F>
@@ -497,8 +596,9 @@ private:
     void storeRelaxed64_(aeron::util::index_t off, std::int64_t v) noexcept {
         __atomic_store_n(word64_(off), v, __ATOMIC_RELAXED);
     }
-    bool compareAndSet64_(aeron::util::index_t off, std::int64_t expected,
-                          std::int64_t desired) noexcept {
+    /// CAS that reports the observed value in `expected` on failure (the witness).
+    bool compareAndSwap64_(aeron::util::index_t off, std::int64_t& expected,
+                           std::int64_t desired) noexcept {
         return __atomic_compare_exchange_n(word64_(off), &expected, desired, /*weak=*/false,
                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     }
@@ -567,18 +667,30 @@ private:
         const aeron::util::index_t mask = capacity - 1;
 
         std::int64_t head = loadAcquire64_(headCachePositionIndex);
-        std::int64_t tail, newTail;
+        std::int64_t newTail;
         aeron::util::index_t tailIndex, padding, writeIndex;
 
-        do {
-            tail = loadAcquire64_(tailPositionIndex);
+        // F8c C1(a): the closed flag is bit 63 of the tail word.  The CAS's
+        // EXPECTED value is always the masked (open) position, so a closed word
+        // can never match: a claim succeeds only on an open tail, and every
+        // claim is totally ordered with close() (one RMW on the same word).
+        // The success path is load, AND, compute, CAS — the closed test runs
+        // only on a failed CAS (already the contended path) and on the cold
+        // full-ring return.  Do NOT drop the mask: an expected value carrying
+        // the bit would let the CAS move a closed tail.
+        for (;;) {
+            const std::int64_t raw  = loadAcquire64_(tailPositionIndex);
+            const std::int64_t tail = raw & TAIL_POSITION_MASK;
             const aeron::util::index_t availableCapacity =
                 capacity - static_cast<aeron::util::index_t>(tail - head);
 
             if (requiredCapacity > availableCapacity) {
                 head = loadAcquire64_(m_headPositionIndex);
                 if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
-                    return INSUFFICIENT_CAPACITY;
+                    // Cold: report closed from the value already loaded (closed
+                    // is sticky), so a writer retrying on -2 can never livelock
+                    // on a closed, full ring.
+                    return raw < 0 ? kClaimClosed : INSUFFICIENT_CAPACITY;
                 }
                 storeRelease64_(headCachePositionIndex, head);
             }
@@ -604,7 +716,10 @@ private:
                 padding = toBufferEndLength;
                 newTail += padding;
             }
-        } while (!compareAndSet64_(tailPositionIndex, tail, newTail));
+            std::int64_t witness = tail;
+            if (compareAndSwap64_(tailPositionIndex, witness, newTail)) break;
+            if (witness < 0) [[unlikely]] return kClaimClosed;
+        }
 
         if (0 != padding) {
             storeRelease32_(RD::RecordDescriptor::lengthOffset(tailIndex), -padding);
@@ -624,7 +739,9 @@ private:
     aeron::util::index_t m_tailPositionIndex        = 0;
     aeron::util::index_t m_correlationIdCounterIndex = 0;
     aeron::util::index_t m_consumerHeartbeatIndex   = 0;
-    aeron::util::index_t m_closedIndex              = 0;
+    aeron::util::index_t m_consumerFinishedIndex = 0;
+    aeron::util::index_t m_detachIndex           = 0;
+    aeron::util::index_t m_orphanHintIndex       = 0;
 };
 
 } // namespace rune::client::detail

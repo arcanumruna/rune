@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""check_no_shared_ptr_handles.py — F8c C7 guard (rune-client-cpp).
+
+Spec F8c §3.1 / §5 C7: the client's handles (Producer, TransactionalProducer,
+Subscription, GroupConsumer, BatchBuilder, TypedTopic) are MOVE-ONLY and own
+their impls through the §3.3 release protocol — no std::shared_ptr, no
+refcount, no "last owner frees" decided by an atomic RMW race.  The hubs hold
+owning raw pointers (the duty side's share) and hand them over by ring order.
+
+This guard scans src/** and include/** (comments and string literals blanked,
+line numbers preserved — the same stripper as check_no_atomics_or_mutexes.py)
+for every shared-ownership construct:
+
+  std::shared_ptr, std::weak_ptr, std::make_shared, std::allocate_shared,
+  std::enable_shared_from_this (qualified or not).
+
+ALLOWLIST (path relative to the repo root) — an EXACT multiset of
+(normalized snippet) -> count per file: a new site fails, and so does a removed
+one (which must then be removed from the allowlist):
+
+  * TRANSPORT — the Aeron C++ client's own object model (Aeron, Publication,
+    Subscription are shared_ptrs created by the library; spec §1.3 S5): they
+    are created on the constructing thread before the runner starts and
+    released after the join — never shared across live threads by us.
+
+F8c C9: the PUBLIC HANDLE HEADERS (selected by rule: HANDLE_DIRS minus
+*Impl.h / *Hub.h, plus REQUIRED_HANDLE_HEADERS) may never hold one of
+those constructs — an allowlist entry for a handle header is itself a
+violation, and every listed header must exist.  `--handles` checks only that
+(ctest NoSharedPtrHandlesGuardRegression); the default run checks both.
+
+The script self-tests its detector and the allowlist logic against synthetic
+fixtures before scanning (--selftest runs only that).
+"""
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import check_no_atomics_or_mutexes as base  # noqa: E402  (shared stripper / collector)
+
+PATTERN = re.compile(
+    r"(?<![\w])(?:std\s*::\s*)?(?:shared_ptr|weak_ptr|make_shared|allocate_shared|enable_shared_from_this)\b")
+
+TRANSPORT = {
+    "include/rune/client/transport/AeronTransport.h": {"std::shared_ptr": 3},
+    "include/rune/client/transport/Resolution.h": {"std::shared_ptr": 3},
+    "src/transport/AeronTransport.cpp": {"std::shared_ptr": 2},
+}
+
+
+def find_matches(raw: str):
+    clean = base.strip_comments_and_strings(raw)
+    out = []
+    for m in PATTERN.finditer(clean):
+        line = clean.count("\n", 0, m.start()) + 1
+        out.append((line, base.normalize(raw[m.start():m.end()])))
+    return out
+
+
+def evaluate(files: dict, allow: dict):
+    violations = []
+    for rel in sorted(files):
+        matches = find_matches(files[rel])
+        allowed = allow.get(rel)
+        if allowed is None:
+            for line, snip in matches:
+                violations.append(f"{rel}:{line}: `{snip}` — shared ownership is banned (F8c C7: "
+                                  f"move-only handles, owning raw pointers handed over by ring order)")
+            continue
+        got = {}
+        for _line, snip in matches:
+            got[snip] = got.get(snip, 0) + 1
+        for key in sorted(set(got) | set(allowed)):
+            g, a = got.get(key, 0), allowed.get(key, 0)
+            if g > a:
+                lines = ", ".join(str(l) for l, sn in matches if sn == key)
+                violations.append(f"{rel}: NEW `{key}` x{g - a} (lines {lines}) — not allowlisted")
+            elif g < a:
+                violations.append(f"{rel}: allowlisted `{key}` x{a - g} is GONE — remove it from TRANSPORT")
+    for rel in sorted(allow):
+        if rel not in files:
+            violations.append(f"{rel}: allowlisted but not found (stale allowlist entry)")
+    return violations
+
+
+# F8c C9: the public handle headers — move-only handles over single-owner impls
+# (§3.1/§3.3); shared ownership there is banned outright, allowlist or not.
+# Selected BY RULE (C9 fix round 1): every header directly in one of
+# HANDLE_DIRS except *Impl.h / *Hub.h (duty-side internals, still covered by
+# the tree-wide C7 rule).  detail/ transport/ agent/ session/ codec/ metadata/
+# are internal plumbing, not handles.
+HANDLE_DIRS = (
+    "include/rune/client",
+    "include/rune/client/producer",
+    "include/rune/client/subscriber",
+    "include/rune/client/group",
+    "include/rune/client/shard",
+)
+HANDLE_EXCLUDE_SUFFIXES = ("Impl.h", "Hub.h")
+# Must exist AND be selected by the rule (a rename or a rule change that drops
+# one of them fails loudly).
+REQUIRED_HANDLE_HEADERS = {
+    "include/rune/client/Client.h",
+    "include/rune/client/Completions.h",
+    "include/rune/client/TypedTopic.h",
+    "include/rune/client/producer/Producer.h",
+    "include/rune/client/producer/BatchBuilder.h",
+    "include/rune/client/producer/TransactionalProducer.h",
+    "include/rune/client/subscriber/Subscription.h",
+    "include/rune/client/group/GroupConsumer.h",
+}
+
+
+def is_handle_header(rel: str) -> bool:
+    d, _, name = rel.rpartition("/")
+    return (d in HANDLE_DIRS and name.endswith((".h", ".hpp"))
+            and not name.endswith(HANDLE_EXCLUDE_SUFFIXES))
+
+
+def evaluate_handles(files: dict, allow: dict, required: set):
+    violations = []
+    for rel in sorted(required):
+        if rel in files and not is_handle_header(rel) and rel.startswith("include/rune/client/"):
+            violations.append(f"{rel}: required handle header is not selected by the HANDLE_DIRS rule")
+    handles = {rel for rel in files if is_handle_header(rel)} | set(required)
+    for rel in sorted(handles):
+        if rel in allow:
+            violations.append(f"{rel}: public handle header is in the TRANSPORT allowlist — "
+                              f"handles may never share ownership (remove the entry)")
+        if rel not in files:
+            violations.append(f"{rel}: public handle header not found (update REQUIRED_HANDLE_HEADERS)")
+            continue
+        for line, snip in find_matches(files[rel]):
+            violations.append(f"{rel}:{line}: `{snip}` in a public handle header — handles are "
+                              f"move-only over a single-owner impl (F8c §3.1)")
+    return violations
+
+
+SELFTEST_DETECT = [
+    ("member", "std::shared_ptr<Impl> impl_;", 1),
+    ("spaced", "std :: shared_ptr<Impl> p;", 1),
+    ("make_shared", "auto p = std::make_shared<Impl>();", 1),
+    ("weak", "std::weak_ptr<Impl> w;", 1),
+    ("allocate_shared", "auto p = std::allocate_shared<T>(a);", 1),
+    ("esft", "struct X : std::enable_shared_from_this<X> {};", 1),
+    ("unqualified", "using namespace std; shared_ptr<int> p; make_shared<int>();", 2),
+    ("two_in_one", "std::shared_ptr<A> a = std::make_shared<A>();", 2),
+    # false positives
+    ("comment", "// std::shared_ptr is banned", 0),
+    ("block_comment", "/* std::make_shared<T>() */ int x;", 0),
+    ("string", 'const char* s = "std::shared_ptr";', 0),
+    ("unique", "std::unique_ptr<Impl> p = std::make_unique<Impl>();", 0),
+    ("identifiers", "int shared_ptr_count; void my_make_shared(); bool weak_ptrs;", 0),
+]
+
+SELFTEST_ALLOW = [
+    ("unlisted_fails", {"src/a.cpp": "std::shared_ptr<int> p;"}, {}, 1),
+    ("exact_ok", {"src/t.cpp": "std::shared_ptr<A> a; std::shared_ptr<B> b;"},
+     {"src/t.cpp": {"std::shared_ptr": 2}}, 0),
+    ("new_site_fails", {"src/t.cpp": "std::shared_ptr<A> a; std::shared_ptr<B> b; std::shared_ptr<C> c;"},
+     {"src/t.cpp": {"std::shared_ptr": 2}}, 1),
+    ("removed_site_fails", {"src/t.cpp": "std::shared_ptr<A> a;"}, {"src/t.cpp": {"std::shared_ptr": 2}}, 1),
+    ("other_kind_fails", {"src/t.cpp": "std::shared_ptr<A> a; std::shared_ptr<B> b; auto c = std::make_shared<C>();"},
+     {"src/t.cpp": {"std::shared_ptr": 2}}, 1),
+    ("stale_fails", {}, {"src/gone.cpp": {"std::shared_ptr": 1}}, 1),
+]
+
+# F8c C9 (NoSharedPtrHandlesGuardRegression): the public handle headers may
+# NEVER hold shared ownership — not even through an allowlist entry, and each
+# listed header must exist (a rename must update REQUIRED_HANDLE_HEADERS, not silently
+# drop the check).  (name, files, transport allowlist, handle headers, expected)
+SELFTEST_HANDLES = [
+    ("clean_handles_ok", {"include/h/P.h": "class P { Impl* impl_ = nullptr; };"}, {}, {"include/h/P.h"}, 0),
+    ("handle_shared_ptr_fails", {"include/h/P.h": "class P { std::shared_ptr<Impl> impl_; };"}, {},
+     {"include/h/P.h"}, 1),
+    ("handle_weak_and_make_shared_fail",
+     {"include/h/P.h": "std::weak_ptr<I> w; auto p = std::make_shared<I>();"}, {}, {"include/h/P.h"}, 2),
+    ("handle_esft_fails", {"include/h/P.h": "struct I : std::enable_shared_from_this<I> {};"}, {},
+     {"include/h/P.h"}, 1),
+    ("handle_allowlisted_still_fails", {"include/h/P.h": "std::shared_ptr<I> p;"},
+     {"include/h/P.h": {"std::shared_ptr": 1}}, {"include/h/P.h"}, 2),
+    ("handle_missing_fails", {}, {}, {"include/h/P.h"}, 1),
+    # C9 fix round 1 (review finding 9): handle headers are selected BY RULE, so
+    # a new public handle header (Task 15: shard/ClientShard.h, ShardGroup.h) is
+    # covered without editing a list.
+    ("rule_selects_new_shard_header", {"include/rune/client/shard/ClientShard.h": "std::shared_ptr<I> p;"},
+     {}, set(), 1),
+    ("rule_selects_top_level_header", {"include/rune/client/NewHandle.h": "std::weak_ptr<I> w;"}, {}, set(), 1),
+    ("rule_allowlisted_shard_header_fails", {"include/rune/client/shard/ShardGroup.h": "std::shared_ptr<I> p;"},
+     {"include/rune/client/shard/ShardGroup.h": {"std::shared_ptr": 1}}, set(), 2),
+    ("rule_skips_internal_headers",
+     {"include/rune/client/producer/ProducerImpl.h": "std::shared_ptr<I> p;",
+      "include/rune/client/producer/ProducerHub.h": "std::shared_ptr<I> p;",
+      "include/rune/client/detail/X.h": "std::shared_ptr<I> p;",
+      "include/rune/client/transport/T.h": "std::shared_ptr<I> p;",
+      "include/rune/client/agent/A.h": "std::shared_ptr<I> p;"}, {}, set(), 0),
+    ("transport_allowlist_not_a_handle_ok",
+     {"include/t/A.h": "std::shared_ptr<aeron::Aeron> a;", "include/h/P.h": "class P {};"},
+     {"include/t/A.h": {"std::shared_ptr": 1}}, {"include/h/P.h"}, 0),
+]
+
+
+def run_selftest():
+    failures = []
+    for name, snippet, want in SELFTEST_DETECT:
+        got = len(find_matches(snippet))
+        if got != want:
+            failures.append(f"detect '{name}': expected {want}, got {got}: {find_matches(snippet)}")
+    for name, files, allow, want in SELFTEST_ALLOW:
+        v = evaluate(files, allow)
+        if len(v) != want:
+            failures.append(f"allowlist '{name}': expected {want} violation(s), got {len(v)}: {v}")
+    for name, files, allow, handles, want in SELFTEST_HANDLES:
+        v = evaluate_handles(files, allow, handles)
+        if len(v) != want:
+            failures.append(f"handles '{name}': expected {want} violation(s), got {len(v)}: {v}")
+    return failures
+
+
+def main(argv):
+    failures = run_selftest()
+    if failures:
+        print("check_no_shared_ptr_handles: SELF-TEST FAILED")
+        for f in failures:
+            print("  " + f)
+        return 2
+    if "--selftest" in argv:
+        print(f"check_no_shared_ptr_handles: self-test OK "
+              f"({len(SELFTEST_DETECT)} detector + {len(SELFTEST_ALLOW)} allowlist + "
+              f"{len(SELFTEST_HANDLES)} handle-header fixtures)")
+        return 0
+    args = [a for a in argv if not a.startswith("--")]
+    root = Path(args[0]) if args else Path(__file__).resolve().parent.parent
+    files = base.collect(root)
+    if "--handles" in argv:
+        # NoSharedPtrHandlesGuardRegression: only the public handle headers.
+        violations = evaluate_handles(files, TRANSPORT, REQUIRED_HANDLE_HEADERS)
+        if violations:
+            print(f"check_no_shared_ptr_handles --handles: {len(violations)} violation(s)")
+            for v in violations:
+                print("  " + v)
+            return 1
+        n = sum(1 for rel in files if is_handle_header(rel))
+        print(f"check_no_shared_ptr_handles --handles: OK ({n} public handle headers by rule)")
+        return 0
+    violations = evaluate(files, TRANSPORT) + evaluate_handles(files, TRANSPORT, REQUIRED_HANDLE_HEADERS)
+    if violations:
+        print(f"check_no_shared_ptr_handles: {len(violations)} violation(s)")
+        for v in violations:
+            print("  " + v)
+        return 1
+    print(f"check_no_shared_ptr_handles: OK ({len(files)} files; transport allowlist "
+          f"{sum(sum(m.values()) for m in TRANSPORT.values())} sites)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

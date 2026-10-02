@@ -56,6 +56,7 @@
 // The gateway intercepts Subscribe messages and immediately pushes one or more
 // Records{subscriptionId} back.  This keeps the test self-contained.
 
+#include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -451,10 +452,11 @@ struct SubscriberHarness {
 
     /// Connect and wait until Connected.
     bool connect() {
-        auto fut = client->connect();
+        test_support::TestCq futCq(*client);
+        auto fut = futCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
         return pumpUntil([&]() {
             return client->state() == rcs::SessionState::Connected;
-        }) && (fut.wait_for(kFutureTimeout) == std::future_status::ready);
+        }) && (fut.ready());
     }
 };
 

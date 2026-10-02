@@ -37,6 +37,32 @@
 
 namespace {
 
+#ifdef RUNE_CLI_LIVE_ENABLED
+// F8c C3: the CLI waits with the *AndWait conveniences (no futures).
+constexpr std::chrono::seconds kCliWait{10};
+
+bool isWaitTimeout(const std::exception& e) {
+    return std::string_view(e.what()).find("timed out") != std::string_view::npos;
+}
+
+/// connectAndWait with the CLI's messages; closes the client on failure.
+bool connectOrReport(rune::client::Client& client, std::ostream& err) {
+    try {
+        client.connectAndWait(kCliWait);
+        return true;
+    } catch (const std::exception& e) {
+        if (isWaitTimeout(e)) {
+            err << "rune: connect timed out\n";
+        } else {
+            err << "rune error: " << e.what() << "\n";
+        }
+        client.close();
+        return false;
+    }
+}
+#endif
+
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Return the value of --<flag> in args, or "" if not present.
@@ -181,29 +207,26 @@ int cmdSchemaApply(const std::vector<std::string>& args,
     using namespace rune::client;
     Client client(buildClientConfig(args));
     try {
-        auto connectFut = client.connect();
-        if (connectFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            err << "rune: connect timed out\n";
-            client.close();
-            return 1;
+        if (!connectOrReport(client, err)) return 1;
+
+        DefineTopicResult r;
+        try {
+            r = client.defineTopicAndWait(
+                plan.name,
+                plan.partitions,
+                plan.keyField,
+                validate,
+                std::span<const uint8_t>(plan.descriptorBlob.data(),
+                                         plan.descriptorBlob.size()),
+                kCliWait);
+        } catch (const std::exception& e) {
+            if (isWaitTimeout(e)) {
+                err << "rune: defineTopic timed out for topic: " << plan.name << "\n";
+                client.close();
+                return 1;
+            }
+            throw;
         }
-        connectFut.get();
-
-        auto defineFut = client.defineTopic(
-            plan.name,
-            plan.partitions,
-            plan.keyField,
-            validate,
-            std::span<const uint8_t>(plan.descriptorBlob.data(),
-                                     plan.descriptorBlob.size()));
-
-        if (defineFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            err << "rune: defineTopic timed out for topic: " << plan.name << "\n";
-            client.close();
-            return 1;
-        }
-
-        DefineTopicResult r = defineFut.get();
         client.close();
 
         // TopicExists (25) is not an error from the CLI perspective.
@@ -253,21 +276,19 @@ int cmdSchemaGet(const std::vector<std::string>& args,
     using namespace rune::client;
     Client client(buildClientConfig(args));
     try {
-        auto connectFut = client.connect();
-        if (connectFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            err << "rune: connect timed out\n";
-            client.close();
-            return 1;
-        }
-        connectFut.get();
+        if (!connectOrReport(client, err)) return 1;
 
-        auto schemaFut = client.getTopicSchema(topic);
-        if (schemaFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
-            client.close();
-            return 1;
+        TopicSchemaResult r;
+        try {
+            r = client.getTopicSchemaAndWait(topic, kCliWait);
+        } catch (const std::exception& e) {
+            if (isWaitTimeout(e)) {
+                err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
+                client.close();
+                return 1;
+            }
+            throw;
         }
-        TopicSchemaResult r = schemaFut.get();
         client.close();
 
         namespace rpc = rune::protocol::client;
@@ -312,19 +333,13 @@ int cmdSchemaList(const std::vector<std::string>& args,
     using namespace rune::client;
     Client client(buildClientConfig(args));
     try {
-        auto connectFut = client.connect();
-        if (connectFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            err << "rune: connect timed out\n";
-            client.close();
-            return 1;
-        }
-        connectFut.get();
+        if (!connectOrReport(client, err)) return 1;
 
         // list() uses the client-side registry of topics that were defined in
         // this session (populated from successful DefineTopicResponse frames).
         // For a full broker-side enumeration a ListTopics protocol message would
         // be needed — that is deferred to Task 10 (Docker e2e).
-        const auto topics = client.listTopics();
+        const auto topics = client.listTopics(kCliWait);
 
         if (topics.empty()) {
             out << "(no topics applied in this session)\n";
@@ -333,10 +348,9 @@ int cmdSchemaList(const std::vector<std::string>& args,
                 out << name << " id=" << topicId;
                 if (verbose) {
                     // Fetch schema for version + fingerprint.
-                    auto schemaFut = client.getTopicSchema(name);
-                    if (schemaFut.wait_for(std::chrono::seconds(10)) == std::future_status::ready) {
+                    {
                         try {
-                            TopicSchemaResult sr = schemaFut.get();
+                            TopicSchemaResult sr = client.getTopicSchemaAndWait(name, kCliWait);
                             if (sr.errorCode == 0 && !sr.descriptorBlob.empty()) {
                                 rune::codec::Descriptor d = rune::codec::deserialize(
                                     std::span<const uint8_t>(sr.descriptorBlob.data(),
@@ -408,21 +422,19 @@ int cmdSchemaGenerate(const std::vector<std::string>& args,
     using namespace rune::client;
     Client client(buildClientConfig(args));
     try {
-        auto connectFut = client.connect();
-        if (connectFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            err << "rune: connect timed out\n";
-            client.close();
-            return 1;
-        }
-        connectFut.get();
+        if (!connectOrReport(client, err)) return 1;
 
-        auto schemaFut = client.getTopicSchema(topic);
-        if (schemaFut.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
-            err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
-            client.close();
-            return 1;
+        TopicSchemaResult r;
+        try {
+            r = client.getTopicSchemaAndWait(topic, kCliWait);
+        } catch (const std::exception& e) {
+            if (isWaitTimeout(e)) {
+                err << "rune: getTopicSchema timed out for topic: " << topic << "\n";
+                client.close();
+                return 1;
+            }
+            throw;
         }
-        TopicSchemaResult r = schemaFut.get();
 
         if (r.errorCode != 0) {
             err << "rune: broker error code " << r.errorCode

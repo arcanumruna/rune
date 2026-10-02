@@ -10,8 +10,9 @@
 //   - App thread only calls: onAssigned/onRevoked/onRecords (setup-phase
 //     callback registration), commit(), commitSync(), close() and active().
 //   - commit() / commitSync() / close() hand a HubCommand to the duty thread
-//     through the agent command ring; commitSync()'s promise is owned and
-//     resolved by the duty thread.  subscribeGroup() registers the impl the
+//     through the agent command ring (or apply it directly on the duty
+//     thread); commitSync(target, token) completes exactly once (F8c C4: a
+//     completion token, no future).  subscribeGroup() registers the impl the
 //     same way (HubCommand{GroupAdd}) — the hub's consumer list is single-owner.
 //   - The duty thread signals "this consumer is finished" (close(), or the
 //     Client closed) by closing the impl's status ring; the handle checks it
@@ -23,14 +24,18 @@
 //   gc.onRevoked(fn)   — called on runner thread when partitions are revoked
 //   gc.onRecords(fn)   — called on runner thread when records arrive (assigned partitions)
 //   gc.commit()        — async: a commit command for the duty thread
-//   gc.commitSync()    — returns a future resolved when OffsetCommitResponse arrives
+//   gc.commitSync(target, token) — one completion when OffsetCommitResponse arrives
+//   gc.commitSyncAndWait(timeout) — cold-path blocking form (throws on failure)
 //   gc.close()         — deactivate (idempotent; the handle's owner thread)
 
 #pragma once
 
 #include <rune/client/subscriber/Subscription.h>  // TopicPartition, Record types
+#include <rune/client/Completion.h>
+#include <rune/client/Completions.h>  // CompletionTarget
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/detail/HubCommand.h>
+#include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
 
 #include <rune/protocol/client/OffsetMessages.h>  // OffsetCommitEntry (for commitEntriesScratch)
@@ -38,7 +43,6 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -49,14 +53,14 @@
 namespace rune::client {
 
 // ---------------------------------------------------------------------------
-// SessionLostError — F8a fix4 M6: commitSync() failed because the session to
-// the broker was lost (it went down, or a new session / connect episode
-// replaced the one the commit was sent on) or was down when commitSync() was
-// applied.  The commit's fate is UNKNOWN (it may or may not have been
-// applied).  RETRIABLE: wait for the next onAssigned (the consumer rejoins
-// after the reconnect and re-seeds its positions), then commit again.  Every
-// other commitSync failure (closed, superseded, rejoin, broker error code) is
-// a plain std::runtime_error.
+// SessionLostError — F8a fix4 M6: commitSyncAndWait() failed because the
+// session to the broker was lost (OpStatus::SessionLost: it went down, or a
+// new session / connect episode replaced the one the commit was sent on) or
+// was down when the commitSync was applied.  The commit's fate is UNKNOWN (it
+// may or may not have been applied).  RETRIABLE: wait for the next onAssigned
+// (the consumer rejoins after the reconnect and re-seeds its positions), then
+// commit again.  Every other failure (closed, superseded, rejoin, broker error
+// code, timeout) is a plain std::runtime_error.
 // ---------------------------------------------------------------------------
 class SessionLostError : public std::runtime_error {
 public:
@@ -113,6 +117,9 @@ struct GroupConfig {
     int32_t      sessionTimeoutMs     = 30000;
     OffsetReset  autoOffsetReset      = OffsetReset::Latest;
     IsolationLevel isolation          = IsolationLevel::ReadUncommitted;  // TX-5: read_committed support
+    /// F8c C4 (spec Q6): a commitSync that has not completed this long after
+    /// it was applied (duty clock) completes OpStatus::Timeout.
+    int32_t      commitSyncTimeoutMs  = 30000;
 };
 
 // ---------------------------------------------------------------------------
@@ -136,8 +143,12 @@ struct GroupConsumerStatus {
 };
 
 // ---------------------------------------------------------------------------
-// GroupConsumerImpl — internal state (heap-allocated, shared_ptr between the
-// GroupConsumer handle and the GroupConsumerHub's consumer list).
+// GroupConsumerImpl — internal state (heap-allocated).  F8c C7 ownership (spec
+// §3.3, no shared_ptr): owned jointly by the GroupConsumer handle and the duty
+// side (the GroupConsumerHub, from the GroupAdd's adoption until the handle's
+// HandleRelease is applied and the hub no longer references it — or until
+// Client close hands it back).  Each side detaches its share of `status`'s
+// ownership word once; the side that detaches last frees the impl.
 //
 // F8a ownership: config is written by the app thread BEFORE the GroupAdd
 // command is put on the agent ring (publishing it); EVERYTHING else — callbacks
@@ -178,11 +189,17 @@ struct GroupConsumerImpl {
 
     // ---- Commit requests (duty thread; set by GroupCommit/GroupCommitSync) ----
     bool commitRequested {false};
-    // The in-flight commitSync() promise (null = none).  Owned by the duty
-    // thread — no lock.  Resolved by the OffsetCommitResponse whose
-    // correlationId == commitSyncCorrId (error code checked); failed when
-    // superseded, on close, on rejoin, or on session loss once sent.
-    std::unique_ptr<std::promise<void>> commitSyncPromise;
+    // F8c C4: the pending commitSync (at most one; duty thread only — no
+    // lock, no promise).  Completed exactly once: Ok by the OffsetCommitResponse
+    // whose correlationId == commitSyncCorrId (BrokerError on an error code),
+    // Superseded / Rejoined / SessionLost / Closed / Timeout otherwise.
+    struct PendingCommitSync {
+        detail::OpTarget target{};
+        Token            token = 0;
+        int64_t          deadlineNs = 0;  // duty clock (GroupConfig::commitSyncTimeoutMs)
+    };
+    bool              hasCommitSync {false};
+    PendingCommitSync commitSync{};
     int64_t commitSyncCorrId {0};   // 0 = its OffsetCommit not sent yet
 
     // A generation snapshot the near-full status ring refused (fix1 I4).
@@ -195,6 +212,10 @@ struct GroupConsumerImpl {
     // ---- Liveness (duty thread) -----------------------------------------------
     bool active {true};
 
+    // ---- F8c C7 fix round 2 (F1): orphaned release -------------------------------
+    int64_t orphanFence  = 0;      // written by the handle BEFORE its orphan RMW (published by it)
+    bool    releaseNoted = false;  // duty thread: its release was applied / queued
+
     // ---- Duty thread -> app handle ------------------------------------------------
     detail::StatusRing<GroupConsumerStatus, 256> status;
 
@@ -202,8 +223,13 @@ struct GroupConsumerImpl {
     GroupConsumerImpl() {
         sendBuf.resize(4096);  // pre-allocate scratch (avoids per-send allocation)
     }
+    // F8c C7: freed by whichever of {the handle, the duty side} detaches its
+    // share of `status`'s ownership word last (see GroupConsumer).
+    ~GroupConsumerImpl() {
+        if (detail::testOnImplFree != nullptr) detail::testOnImplFree(detail::HandleKind::GroupConsumer, this);
+    }
 
-    // Non-copyable / non-movable (shared_ptr ownership; the ring is pinned).
+    // Non-copyable / non-movable (raw single-owner hand-off; the ring is pinned).
     GroupConsumerImpl(const GroupConsumerImpl&) = delete;
     GroupConsumerImpl& operator=(const GroupConsumerImpl&) = delete;
     GroupConsumerImpl(GroupConsumerImpl&&) = delete;
@@ -220,14 +246,20 @@ struct GroupConsumerImpl {
 //     duty-owned std::functions are never written from an app thread.
 //   - The handle is OWNED by one app thread at a time (move-only, like
 //     Subscription): its app-side methods must not be called concurrently.
-//   - Calls from INSIDE a callback (duty thread, Thread mode) are allowed:
-//     commit() / close() / active() / generation() act directly on duty-owned
-//     state.  commitSync() there throws std::logic_error (its future could
-//     never resolve while the callback blocks the duty thread) — use commit().
+//   - Calls from INSIDE a callback (duty thread) are allowed: commit() /
+//     close() / active() / generation() / commitSync(target, token) act
+//     directly on duty-owned state (F8c C4: the token form is just a command
+//     applied there).  Only commitSyncAndWait() throws std::logic_error there
+//     (it would wait for the duty thread it is blocking).
 //   - finished(): the duty side is done with this consumer — no further
 //     callback will run.  A finished handle never touches the Client again, so
 //     a handle may outlive its Client (not be used CONCURRENTLY with its
-//     destruction); commitSync() then returns an already-failed future.
+//     destruction); commitSync() then returns OpResult::Closed.
+//   - Destruction (F8c C7) = close() + the handle's share of the impl handed
+//     to the duty side (one HandleRelease: applied directly on the duty
+//     thread, through the command ring elsewhere — orphaned and applied by
+//     the duty side in FIFO order when the ring is full); the impl is freed by
+//     whichever side lets go last — never while one of its callbacks runs.
 //   - HANDLE LIFETIME (fix4 M6): the handle must NOT be destroyed, moved from
 //     or moved into while ANY thread may still be calling it — its owner app
 //     thread, or a runner callback (onAssigned / onRevoked / onRecords calling
@@ -243,11 +275,20 @@ public:
     /// Constructed by Client::subscribeGroup().  `sink`/`sinkCtx` deliver the
     /// handle's commands to the duty thread.  `dutyThread`: the Thread-mode
     /// runner (calls from it take the duty path); default id disables that.
-    GroupConsumer(std::shared_ptr<GroupConsumerImpl> impl,
-                  detail::HubCommandSink             sink,
-                  void*                              sinkCtx,
-                  std::thread::id                    dutyThread = {}) noexcept;
+    /// `opSink` issues token ops (commitSync), `waitSink` backs
+    /// commitSyncAndWait() (both nullptr: commitSync is rejected Closed).
+    GroupConsumer(GroupConsumerImpl*     impl,
+                  detail::HubCommandSink sink,
+                  void*                  sinkCtx,
+                  std::thread::id        dutyThread = {},
+                  detail::TargetedOpSink opSink     = nullptr,
+                  detail::AndWaitSink    waitSink   = nullptr) noexcept;
 
+    /// F8c C7 release (§3.3): closes the consumer (the duty side applies it)
+    /// and gives the handle's share of the impl to the duty side.  Never
+    /// throws, never waits; routed like ~Producer (duty thread: direct;
+    /// elsewhere: the command ring, orphaned when full).  After Client
+    /// close the handle frees the impl, never touching the Client.
     ~GroupConsumer();
 
     // Non-copyable, movable.
@@ -276,25 +317,32 @@ public:
     /// the bounded wait.
     void commit();
 
-    /// Commit and return a future that resolves when the broker acknowledges
-    /// THIS commit (OffsetCommitResponse matched by correlationId, error codes
-    /// checked — a failed commit throws from get()), or resolves at once when
-    /// there is nothing to commit.  It fails when superseded by a newer
-    /// commitSync(), on close(), on a group rejoin, or when the Client closes
-    /// (std::runtime_error).
-    /// SESSION LOSS (fix4 M6) throws rune::client::SessionLostError (a
-    /// std::runtime_error): the session to the broker went DOWN (the session
-    /// machine's own liveness verdict — no timeout of its own), a new session
-    /// or connect episode replaced the one its commit was sent on, or the
-    /// session was already down when commitSync() was applied.  The commit's
-    /// fate is unknown; it is RETRIABLE — retry after the next onAssigned
-    /// (the consumer rejoins after the reconnect).
-    /// An OffsetCommit the transport transiently refuses is retried every duty
-    /// cycle; one it can never carry (Fatal) fails the commitSync at once.
-    /// Waiting: Thread mode — get() from an app thread.  Invoker mode — keep
-    /// calling Client::doWork() until it is ready.  NEVER from inside a duty-
-    /// cycle callback: commitSync() throws std::logic_error there.
-    std::future<void> commitSync();
+    /// F8c C4: commit the current positions; exactly ONE completion
+    /// (op = OpKind::CommitSync) follows an Accepted return:
+    ///   Ok           — the broker acknowledged THIS commit (OffsetCommitResponse
+    ///                  matched by correlationId), or there was nothing to commit;
+    ///   BrokerError  — the response carried an error code (errorCode);
+    ///   Superseded   — a newer commitSync replaced it;
+    ///   Rejoined     — the group rebalanced (rejoin) before the answer;
+    ///   SessionLost  — the session went down / was replaced after it was
+    ///                  applied, or was down when it was applied (fate unknown,
+    ///                  RETRIABLE after the next onAssigned — fix4 M6);
+    ///   NotConnected — the transport can never carry the OffsetCommit (Fatal);
+    ///   Timeout      — GroupConfig::commitSyncTimeoutMs of duty time passed;
+    ///   Closed       — close() of this consumer, or Client close.
+    /// Synchronous rejections (no completion): Closed (finished / Client
+    /// closed), InvalidArgument (token > kMaxToken, no target, a Completions
+    /// of another Client), WrongThread (Invoker off the owner, a Completions
+    /// off its owner), QueueFull, BackPressured (command ring full).
+    /// Callable from inside a duty-cycle callback (applied directly).
+    OpResult commitSync(CompletionTarget target, Token token);
+
+    /// Cold-path blocking form (spec §2.3): issue + wait (Invoker owner pumps
+    /// doWork(); a Thread-mode app thread idle-polls).  Throws
+    /// SessionLostError on SessionLost, std::runtime_error on any other
+    /// non-Ok outcome or wait timeout, std::logic_error from a duty-cycle
+    /// callback.
+    void commitSyncAndWait(std::chrono::nanoseconds timeout = std::chrono::seconds(60));
 
     /// Deactivate this consumer: no more dispatch occurs, a pending commitSync
     /// fails.  Idempotent.  Delivery is guaranteed (a full command ring is
@@ -323,11 +371,16 @@ private:
     template <class Fn>
     void setCallback_(int which, Fn cb);
 
-    std::shared_ptr<GroupConsumerImpl> impl_;
+    static OpResult issueCommitSync_(void* self, const CompletionTarget& target, Token token);
+    /// F8c C7: the §3.3 release of the handle's share (see the destructor).
+    void release_() noexcept;
+
+    GroupConsumerImpl*                 impl_    = nullptr;  // the handle's share (§3.3)
     detail::HubCommandSink             sink_    = nullptr;
     void*                              sinkCtx_ = nullptr;
+    detail::TargetedOpSink             opSink_   = nullptr;
+    detail::AndWaitSink                waitSink_ = nullptr;
     std::thread::id                    dutyThread_{};
-    bool moved_  = false;
     bool closed_ = false;   // handle-local (app-owned): close() was called
     mutable GroupConsumerStatus cache_{};  // app-owned: last drained status snapshot
 };

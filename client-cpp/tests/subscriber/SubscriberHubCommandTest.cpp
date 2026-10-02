@@ -73,8 +73,10 @@ struct CapturingSink {
     }
 };
 
-std::shared_ptr<rc::SubscriptionImpl> makeImpl(int64_t corrId, int* delivered = nullptr) {
-    auto impl = std::make_shared<rc::SubscriptionImpl>();
+// F8c C7: the test owns the impl's memory (a bare hub holds raw pointers; a
+// handle built on it never frees it — no duty side ever detaches).
+std::unique_ptr<rc::SubscriptionImpl> makeImpl(int64_t corrId, int* delivered = nullptr) {
+    auto impl = std::make_unique<rc::SubscriptionImpl>();
     impl->correlationId = corrId;
     impl->topicId       = kTopic;
     impl->partition     = kPart;
@@ -82,9 +84,9 @@ std::shared_ptr<rc::SubscriptionImpl> makeImpl(int64_t corrId, int* delivered = 
     return impl;
 }
 
-rcd::HubCommand addCmd(std::shared_ptr<rc::SubscriptionImpl> impl) {
+rcd::HubCommand addCmd(rc::SubscriptionImpl* impl) {
     auto req = SubscriberHub::makeSubscribeRequest(
-        std::move(impl), kSession, /*partitionKnown=*/1, /*fromOffset=*/-2, /*iso=*/0, {},
+        impl, kSession, /*partitionKnown=*/1, /*fromOffset=*/-2, /*iso=*/0, {},
         std::chrono::steady_clock::now() + std::chrono::hours(1));
     rcd::HubCommand c;
     c.op     = rcd::HubCommand::Op::SubscribeAdd;
@@ -116,6 +118,8 @@ rc::codec::RecordsView records(std::vector<uint8_t>& storage, int64_t subId,
     return rv;
 }
 
+int g_subFrees = 0;  // F8c C7: impl frees counted by rcd::testOnImplFree (test thread only)
+
 } // namespace
 
 // SubscribeAdd is applied by the duty thread: it registers the pending entry
@@ -125,7 +129,7 @@ TEST(SubscriberHubCommand, SubscribeAddRegistersAndSendsOnDutyThreadRegression) 
     CaptureSend   send;
     auto impl = makeImpl(11);
     EXPECT_EQ(hub.pendingCount(), 0u);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     EXPECT_EQ(hub.pendingCount(), 1u);
     EXPECT_EQ(send.countSubscribe(), 1);
     EXPECT_TRUE(hub.hasPending());
@@ -139,9 +143,9 @@ TEST(SubscriberHubCommand, SubscriptionStatePublishedThroughStatusRingRegression
     CapturingSink sink;
     int delivered = 0;
     auto impl = makeImpl(12, &delivered);
-    rc::Subscription sub(impl, &CapturingSink::fn, &sink);
+    rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
 
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     EXPECT_EQ(sub.subscriptionId(), 0);
     EXPECT_TRUE(sub.active());
 
@@ -164,8 +168,8 @@ TEST(SubscriberHubCommand, UnsubscribeIsACommandNotASharedWriteRegression) {
     CaptureSend   send;
     CapturingSink sink;
     auto impl = makeImpl(13);
-    rc::Subscription sub(impl, &CapturingSink::fn, &sink);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(13, 88), 0, kSession, send.fn());
     ASSERT_EQ(hub.activeCount(), 1u);
 
@@ -173,7 +177,10 @@ TEST(SubscriberHubCommand, UnsubscribeIsACommandNotASharedWriteRegression) {
     EXPECT_FALSE(sub.active()) << "the handle reports inactive at once (handle-local)";
     ASSERT_EQ(sink.cmds.size(), 1u);
     EXPECT_EQ(sink.cmds[0].op, rcd::HubCommand::Op::Unsubscribe);
-    EXPECT_EQ(sink.cmds[0].a, 13);
+    // F8c C3: identified by the impl address (the correlationId is duty-
+    // assigned and never read by the app thread).
+    EXPECT_EQ(sink.cmds[0].handle, reinterpret_cast<uint64_t>(impl.get()));
+    EXPECT_EQ(sink.cmds[0].a, 0);
     EXPECT_EQ(hub.activeCount(), 1u) << "app thread touched no hub state";
     EXPECT_TRUE(impl->active)        << "app thread touched no duty-owned impl field";
 
@@ -195,7 +202,7 @@ TEST(SubscriberHubCommand, UnsubscribeBeforeResponseSendsLateUnsubscribeRegressi
     CaptureSend   send;
     int delivered = 0;
     auto impl = makeImpl(14, &delivered);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
 
     rcd::HubCommand u;
     u.op = rcd::HubCommand::Op::Unsubscribe;
@@ -221,8 +228,8 @@ TEST(SubscriberHubCommand, StatusRingNearFullNeverLosesFinalPositionRegression) 
     CaptureSend   send;
     CapturingSink sink;
     auto impl = makeImpl(15);
-    rc::Subscription sub(impl, &CapturingSink::fn, &sink);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(15, 5), 0, kSession, send.fn());
 
     std::vector<uint8_t> st;
@@ -243,8 +250,8 @@ TEST(SubscriberHubCommand, DirtyStatusRepublishedEveryDutyCycleRegression) {
     CaptureSend   send;
     CapturingSink sink;
     auto impl = makeImpl(16);
-    rc::Subscription sub(impl, &CapturingSink::fn, &sink);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(16, 6), 0, kSession, send.fn());
 
     std::vector<uint8_t> st;
@@ -265,17 +272,29 @@ TEST(SubscriberHubCommand, FinishedHandleNeverTouchesTheClientRegression) {
     SubscriberHub hub;
     CaptureSend   send;
     CapturingSink sink;
-    auto impl = makeImpl(17);
+    // F8c C7: shared by the handle and the hub — the Client close hand-back
+    // (handBackAll) detaches the duty share; the handle then frees it.
+    int freed = 0;
+    rcd::testOnImplFree = [](rcd::HandleKind, const void*) noexcept { ++g_subFrees; };
+    g_subFrees = 0;
+    rc::SubscriptionImpl* impl = makeImpl(17).release();
     {
         rc::Subscription sub(impl, &CapturingSink::fn, &sink);
         hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
         hub.onSubscribeResponse(bindRsp(17, 8), 0, kSession, send.fn());
         hub.deactivateAll();
+        hub.handBackAll([](rc::SubscriptionImpl* s) noexcept {
+            if (s->status.detachProducer()) delete s;
+        });
         EXPECT_FALSE(sub.active());
         sub.unsubscribe();
         EXPECT_EQ(sink.calls, 0);
-    }  // dtor: still no call
+        freed = g_subFrees;
+    }  // dtor: still no call; the handle frees the impl (the duty share is gone)
     EXPECT_EQ(sink.calls, 0);
+    EXPECT_EQ(freed, 0);
+    EXPECT_EQ(g_subFrees, 1);
+    rcd::testOnImplFree = nullptr;
 }
 
 // Subscribe deadline expiry finishes the subscription for the app.
@@ -284,9 +303,9 @@ TEST(SubscriberHubCommand, TimedOutSubscribeFinishesHandleRegression) {
     CaptureSend   send;
     CapturingSink sink;
     auto impl = makeImpl(18);
-    rc::Subscription sub(impl, &CapturingSink::fn, &sink);
+    rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
     auto req = SubscriberHub::makeSubscribeRequest(
-        impl, kSession, 1, -2, 0, {}, std::chrono::steady_clock::now());
+        impl.get(), kSession, 1, -2, 0, {}, std::chrono::steady_clock::now());
     hub.adoptSubscribe(std::move(req), send.fn());
     hub.sweepTimedOut(std::chrono::steady_clock::now() + std::chrono::seconds(1));
     EXPECT_EQ(hub.pendingCount(), 0u);
@@ -306,7 +325,11 @@ struct DirectSubSink {
     static rcd::HubSubmit fn(void* ctx, const rcd::HubCommand& c) {
         auto* self = static_cast<DirectSubSink*>(ctx);
         ++self->calls;
-        self->hub->applyCommand(c, 700 + self->calls, kSession, self->send->fn());
+        rcd::HubCommand cmd = c;
+        // F8c C7: a handle's release carries its destructor semantics
+        // (unsubscribe), as the Client applies it.
+        if (cmd.op == rcd::HubCommand::Op::HandleRelease) cmd.op = rcd::HubCommand::Op::Unsubscribe;
+        self->hub->applyCommand(cmd, 700 + self->calls, kSession, self->send->fn());
         return rcd::HubSubmit::Accepted;
     }
 };
@@ -319,7 +342,7 @@ TEST(SubscriberHubCommand, UnsubscribeInsideHandlerStopsTheBatchAndDefersFinishR
     auto impl = makeImpl(30);
     // dutyThread = this thread: the handle takes the duty path, like a call
     // from inside a callback on the runner.
-    rc::Subscription sub(impl, &DirectSubSink::fn, &ds, std::this_thread::get_id());
+    rc::Subscription sub(impl.get(), &DirectSubSink::fn, &ds, std::this_thread::get_id());
     int delivered = 0;
     bool finishedInsideHandler = true;
     impl->handler = [&](const rc::Record&) {
@@ -327,7 +350,7 @@ TEST(SubscriberHubCommand, UnsubscribeInsideHandlerStopsTheBatchAndDefersFinishR
         sub.unsubscribe();
         finishedInsideHandler = sub.finished();
     };
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(30, 40), 0, kSession, send.fn());
 
     std::vector<uint8_t> st;
@@ -344,33 +367,43 @@ TEST(SubscriberHubCommand, UnsubscribeInsideHandlerStopsTheBatchAndDefersFinishR
 }
 
 // Destroying the Subscription from inside its own handler must not free the
-// running std::function: the routing entry (and its impl reference) lives until
-// the dispatch ends.
+// running std::function: F8c C7 — the hub keeps referencing the impl until the
+// dispatch ends (release() refuses while it runs), and only the duty side's
+// reap afterwards lets the last share go.
 TEST(SubscriberHubCommand, DestroyHandleInsideHandlerKeepsImplAliveUntilDispatchEndsRegression) {
     SubscriberHub hub;
     CaptureSend   send;
     DirectSubSink ds{&hub, &send};
-    auto impl = makeImpl(31);
-    std::weak_ptr<rc::SubscriptionImpl> weak = impl;
+    g_subFrees = 0;
+    rcd::testOnImplFree = [](rcd::HandleKind, const void*) noexcept { ++g_subFrees; };
+    rc::SubscriptionImpl* impl = makeImpl(31).release();  // shared: handle + hub (§3.3)
     auto sub = std::make_unique<rc::Subscription>(impl, &DirectSubSink::fn, &ds,
                                                   std::this_thread::get_id());
-    bool aliveAfterReset = false;
-    int delivered = 0;
+    int  freesInHandler    = -1;
+    bool releasedInHandler = true;
+    int  delivered         = 0;
     impl->handler = [&](const rc::Record&) {
         ++delivered;
-        sub.reset();  // dtor -> unsubscribe -> applied directly on this thread
-        aliveAfterReset = !weak.expired();
+        sub.reset();  // dtor -> release (unsubscribe applied directly on this thread)
+        freesInHandler    = g_subFrees;
+        releasedInHandler = hub.release(impl);  // the duty side may not forget it yet
     };
     hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(31, 41), 0, kSession, send.fn());
-    impl.reset();  // only the hub (and the handle) hold it now
 
     std::vector<uint8_t> st;
     hub.onRecords(records(st, 41, 0, 3));
     EXPECT_EQ(delivered, 1);
-    EXPECT_TRUE(aliveAfterReset) << "the impl (and the running handler) must outlive the reset";
-    EXPECT_TRUE(weak.expired()) << "released once the dispatch ended";
+    EXPECT_EQ(freesInHandler, 0) << "the impl (and the running handler) must outlive the handle";
+    EXPECT_FALSE(releasedInHandler) << "a running handler keeps the hub's reference";
+    EXPECT_EQ(g_subFrees, 0);
+    // The Client's end-of-cycle reap: nothing references it any more.
+    ASSERT_TRUE(hub.release(impl));
     EXPECT_EQ(hub.activeCount(), 0u);
+    ASSERT_TRUE(impl->status.detachProducer()) << "the handle let go first: the duty side frees";
+    delete impl;
+    EXPECT_EQ(g_subFrees, 1);
+    rcd::testOnImplFree = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -447,8 +480,8 @@ TEST(SubscriberHubCommand, AppAndDutyThreadsShareOnlyRingsRegression) {
     });
 
     // App thread (this one): subscribe, read state during live dispatch, unsubscribe.
-    auto sub = std::make_unique<rc::Subscription>(impl, &RingChannel::fn, &ch);
-    (void)RingChannel::fn(&ch, addCmd(impl));
+    auto sub = std::make_unique<rc::Subscription>(impl.get(), &RingChannel::fn, &ch);
+    (void)RingChannel::fn(&ch, addCmd(impl.get()));
     while (sub->position() < kMinRecords) std::this_thread::yield();
     EXPECT_EQ(sub->subscriptionId(), 31);
     EXPECT_TRUE(sub->active());
@@ -506,7 +539,7 @@ TEST(SubscriberHubCommand, RefusedUnsubscribeRetriedNextDutyCycleRegression) {
     RefusingTransport tx;
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     auto impl = makeImpl(50);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(50, 60), 0, kSession, send.fn());
 
     tx.refuseNext = 2;
@@ -537,7 +570,7 @@ TEST(SubscriberHubCommand, PendingUnsubscribeDroppedWhenTheSessionChangesRegress
     RefusingTransport tx;
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     auto impl = makeImpl(51);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(51, 61), 0, kSession, send.fn());
     tx.refuseNext = 1;
     rcd::HubCommand u;
@@ -559,7 +592,7 @@ TEST(SubscriberHubCommand, LateResponseUnsubscribeRetriedWhenRefusedRegression) 
     RefusingTransport tx;
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     auto impl = makeImpl(52);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     rcd::HubCommand u;
     u.op = rcd::HubCommand::Op::Unsubscribe;
     u.a  = 52;
@@ -578,7 +611,7 @@ TEST(SubscriberHubCommand, ResponseOfAnOldSessionNeverBindsRegression) {
     SubscriberHub hub;
     CaptureSend   send;
     auto impl = makeImpl(70);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     auto old = bindRsp(70, 80);
     old.sessionId = kSession - 1;
     hub.onSubscribeResponse(old, 0, kSession, send.fn());
@@ -600,7 +633,7 @@ TEST(SubscriberHubCommand, SubscribeAdoptedWhileSessionDownIsKeptUnsentRegressio
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     hub.setSessionConnected(false);
     auto impl = makeImpl(90);
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
     EXPECT_EQ(tx.subscribes(), 0);
     EXPECT_EQ(hub.unsentSubscribes(), 1u) << "dropped without a retry";
     EXPECT_EQ(hub.retryUnsentSubscribes(), 0) << "never offered while down";
@@ -622,7 +655,7 @@ TEST(SubscriberHubCommand, FatalSubscribeOfferFailsTheSubscriptionRegression) {
     // At adoption.
     auto a = makeImpl(91);
     tx.fatalNext = 1;
-    hub.applyCommand(addCmd(a), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(a.get()), 0, kSession, send.fn());
     EXPECT_FALSE(a->active);
     EXPECT_TRUE(a->status.closed()) << "the handle learns it failed";
     EXPECT_EQ(hub.pendingCount(), 0u);
@@ -631,7 +664,7 @@ TEST(SubscriberHubCommand, FatalSubscribeOfferFailsTheSubscriptionRegression) {
     // On the per-cycle retry of a refused one.
     auto b = makeImpl(92);
     tx.refuseNext = 1;
-    hub.applyCommand(addCmd(b), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(b.get()), 0, kSession, send.fn());
     ASSERT_EQ(hub.unsentSubscribes(), 1u);
     tx.fatalNext = 1;
     EXPECT_EQ(hub.retryUnsentSubscribes(), 0);
@@ -643,8 +676,8 @@ TEST(SubscriberHubCommand, FatalSubscribeOfferFailsTheSubscriptionRegression) {
     // On a reconnect resend (c fails, d still goes out).
     auto c = makeImpl(93);
     auto d = makeImpl(94);
-    hub.applyCommand(addCmd(c), 0, kSession, send.fn());
-    hub.applyCommand(addCmd(d), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(c.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(d.get()), 0, kSession, send.fn());
     ASSERT_EQ(tx.subscribes(), 2);
     tx.fatalNext = 1;
     EXPECT_EQ(hub.resendPending(kSession + 1, send.fn()), 1);
@@ -667,7 +700,7 @@ TEST(SubscriberHubCommand, FatalUnsubscribeFinishesLocallyRegression) {
     hub.setDirectSend(&RefusingTransport::fn, &tx);
 
     auto a = makeImpl(95);
-    hub.applyCommand(addCmd(a), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(a.get()), 0, kSession, send.fn());
     hub.onSubscribeResponse(bindRsp(95, 65), 0, kSession, send.fn());
     ASSERT_EQ(hub.activeCount(), 1u);
     tx.fatalNext = 1;
@@ -680,7 +713,7 @@ TEST(SubscriberHubCommand, FatalUnsubscribeFinishesLocallyRegression) {
     EXPECT_EQ(hub.activeCount(), 0u);
 
     auto b = makeImpl(96);
-    hub.applyCommand(addCmd(b), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(b.get()), 0, kSession, send.fn());
     u.a = 96;
     hub.applyCommand(u, 906, kSession, send.fn());  // still pending: late Unsubscribe
     tx.fatalNext = 1;

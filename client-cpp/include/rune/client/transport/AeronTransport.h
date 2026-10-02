@@ -30,10 +30,10 @@ extern "C" {
 }
 
 #include <rune/client/detail/FlatIndexMap.h>
+#include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/transport/Resolution.h>
 #include <rune/client/transport/TransportConfig.h>
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -77,9 +77,22 @@ public:
     void start();
 
     /// Release pub/sub → close aeron client → stop+join driver thread →
-    /// drain CnC → close driver.  Idempotent (CAS flag).
+    /// drain CnC → close driver.  Idempotent (plain owner flag).
     /// Teardown order follows BrokerNode BR-3b to prevent use-after-free.
+    /// Lifecycle call: only when no other thread pumps this transport (the duty
+    /// thread is joined / this IS the owner); the calling thread becomes the
+    /// pump owner for the final driver drain.
     void stop() noexcept;
+
+    /// F8c C0 — single pump owner, enforced structurally (no atomics):
+    /// exactly ONE thread at a time may pump this transport's embedded driver /
+    /// client conductor (dutyCycle(), and start()/stop()'s own pumps).  start()
+    /// makes the calling thread the owner; a duty thread that takes over after a
+    /// happens-before handoff (thread creation, join) calls bindPumpThread()
+    /// first.  Debug builds abort if any other thread pumps (a second pumper);
+    /// with DriverMode::Thread the driver thread is the driver's only pumper and
+    /// a caller pump while it runs is counted in callerPumpViolations().
+    void bindPumpThread() noexcept { pumpOwner_ = std::this_thread::get_id(); }
 
     /// Invoker mode: one pass of this transport's OWN embedded driver duty cycle
     /// (conductor + sender + receiver, aeron_driver.c:712-722) followed by the Aeron
@@ -268,6 +281,9 @@ public:
     /// Regression hook (spec §3.6): number of times the CALLER thread pumped
     /// aeron_driver_main_do_work() while driverThread_ was running.  A driver
     /// must be driven by exactly one thread, so this must always be 0.
+    /// F8c C0: decided from owner-thread state (the driver thread is launched /
+    /// joined by the owner), not by sampling a flag the driver thread shares —
+    /// deterministic, no atomic.  Read on the owner thread.
     [[nodiscard]] int callerPumpViolations() const noexcept { return callerPumpViolations_; }
 
     /// Max single-frame payload of the default ingress publication
@@ -304,8 +320,19 @@ private:
     // ---- Embedded driver (C API) --------------------------------------------
     aeron_driver_context_t* driverCtx_     = nullptr;
     aeron_driver_t*         driver_        = nullptr;
-    std::atomic<bool>       driverRunning_ {false};
     std::thread             driverThread_;
+    // F8c C0: true from the owner launching driverThread_ until it joined it —
+    // owner-thread state only (the driver thread never reads it).
+    bool                    driverThreadLaunched_ = false;
+    // The driver thread's stop signal: a one-to-one ring, owner = producer,
+    // driver thread = consumer.  Stop = producerClose() (release); the driver
+    // loop runs while !producerClosed() (acquire).  The ring's own closed word is
+    // the only cross-thread memory — no std::atomic in this class.
+    static constexpr std::size_t kDriverCtlCapacity = 64;
+    std::unique_ptr<uint8_t[]>                  driverCtlStorage_;
+    std::unique_ptr<detail::OneToOneRingBuffer> driverCtl_;
+    // The one thread allowed to pump (see bindPumpThread()).  Debug-checked.
+    std::thread::id         pumpOwner_{};
 
     void startEmbeddedDriver();
     void stopEmbeddedDriver() noexcept;
@@ -331,9 +358,11 @@ private:
     std::shared_ptr<aeron::Subscription>         egressSub_;
     std::unique_ptr<aeron::FragmentAssembler>    assembler_;
 
-    // ---- Lifecycle CAS flags (idempotent stop) --------------------------------
-    std::atomic<bool> started_ {false};
-    std::atomic<bool> stopped_ {false};
+    // ---- Lifecycle flags (idempotent start/stop) ------------------------------
+    // F8c C0: plain owner-thread state — start()/stop() are lifecycle calls made
+    // only by the single owner (see stop()), never concurrently with a pumper.
+    bool started_ = false;
+    bool stopped_ = false;
 
     // ---- Poll handler thunk (set during poll(), cleared after) ---------------
     // Single-writer: only one thread calls poll() so this is never concurrent.

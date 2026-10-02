@@ -18,7 +18,7 @@ The client is built the same way as the broker: **one background runner thread**
 loops a single-writer `doWork(nowNs)` duty cycle under an `IdleStrategy`. App
 threads never touch Aeron, the session, or the transport directly — they hand
 work to the agent through a **lock-free `ManyToOneRingBuffer`** and get results
-back via futures/callbacks that fire **on the runner thread**.
+back via completion tokens / callbacks that fire **on the runner thread** (F8c: no futures).
 
 ```
   APP THREADS                         RUNNER (agent) THREAD  — single writer
@@ -29,7 +29,7 @@ back via futures/callbacks that fire **on the runner thread**.
   GroupConsumer::commit  ─┘   ring ───► 3. route egress → session / hubs
                                         4. session_.tick(nowNs) (timeouts,
                                            keepalive, redirect/retry)
-   futures/callbacks  ◄────────────────  resolved/rejected here (NOT app thread)
+   completions/cbs    ◄────────────────  completed here (NOT app thread)
 ```
 
 **Threading contract (applies everywhere):**
@@ -71,12 +71,39 @@ alloc-free handoff). The agent drains, accumulates records into per-
 **linger elapsed OR `batchBytes` reached OR `flush()` requested**.
 - `Acks`: `None` (fire-and-forget; fully alloc-free end-to-end), `Leader`
   (default; awaits `ProduceResponse`), `All` (treated as Leader for now).
-- Per-send heap is allowed **only** on the opt-in callback/future ack paths,
-  never on the void path.
+- F8c C6: no per-send heap on ANY path — acked sends carry a tagged 64-bit
+  token (a `Completions` queue's CqRef + Token, or the producer's `onAck`
+  function pointer + Token) in the record's ack slot; begin-close
+  (`close(target, token)`) / `close()` / `closeImmediately()` per F8c C6a.
 - Idempotence: each partition stamps a monotonic `baseSequence` into the batch
   header (`producerId` is a local stub pending real `InitProducerId`).
-- `ProducerHub` registers producers with the agent via an atomic COW snapshot —
-  no lock on the runner hot path; `onProduceResponse` routes acks back.
+- `ProducerHub` holds the producers the duty thread owns (registered through
+  the agent command ring — no lock, no atomic); `onProduceResponse` routes acks
+  back by the batch id's ordinal.
+- F8c C7 — handle lifetime (spec §3): `Producer`, `TransactionalProducer`,
+  `Subscription`, `GroupConsumer`, `TypedTopic` are MOVE-ONLY; `BatchBuilder`
+  borrows its producer.  No `shared_ptr` anywhere in the handles or hubs
+  (guard: `NoSharedPtrInPublicHandlesGuardRegression`): each impl is owned
+  jointly by its handle and the duty side, each side detaches its share of the
+  impl's ownership word (a ring word, one RMW) exactly once, and whichever
+  detaches last frees it — nobody waits, nobody refcounts.  A handle's
+  destructor hands its share over with one `HandleRelease` command
+  (Producer / TransactionalProducer: `closeImmediately()` unless a close already
+  started; Subscription: unsubscribe; GroupConsumer: close); the duty side
+  frees at the end of a duty cycle once nothing references the impl (never
+  under a running callback).  The duty thread (Invoker owner, runner callback)
+  applies a release directly; any other thread uses the command ring, and if
+  that is full the release is ORPHANED (orphan bit in the impl's ownership
+  word + a fence at the ring tail + the ring's orphan hint): the duty side
+  scans, applies it once the ring head passes the fence — no wait, no time
+  bound.  Client close
+  hands every still-held impl back to its handle.
+- Shutdown pairs (user decision 2): `Producer::close()` drains /
+  `closeImmediately()` discards; `TransactionalProducer::close()` aborts an open
+  broker transaction (EndTxn(abort)) before it reports closed /
+  `closeImmediately()` discards locally; `Client::close()` drains every
+  producer and closes every transactional producer, then tears down /
+  `Client::closeImmediately()` (= the destructor) tears down at once.
 
 ### 2.2 Subscriber (`subscriber/`)
 `Subscription` + `SubscribeOptions`. `From` selects the start offset —
@@ -119,7 +146,7 @@ fails pending commitSyncs with the retriable `SessionLostError`.
 `GroupConsumer` runs the full join/sync/stable/rejoin state machine, heartbeat,
 record routing, and the auto-commit duty cycle **on the runner thread**. App
 threads only register `onAssigned`/`onRevoked`/`onRecords` (setup) and call
-`commit()`, `commitSync()` (returns a future the duty thread resolves on
+`commit()`, `commitSync(target, token)` (a completion token the duty thread completes on
 `OffsetCommitResponse`), and `close()` — each a `HubCommand` on the agent ring
 (F8a: no atomics, no mutex). `subscribeGroup()` registers through the ring too
 (`GroupAdd`); the `GroupConsumerHub` list is duty-thread owned.

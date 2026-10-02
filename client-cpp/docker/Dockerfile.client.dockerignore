@@ -3,6 +3,9 @@
 
 # Build outputs (large; do NOT send to the daemon)
 build/
+build_release/
+build_tsan/
+build_asan/
 cov/
 cmake-build-debug/
 cmake-build-release/
@@ -16,7 +19,13 @@ conan-release/
 .superpowers/
 
 # Tests and benchmarks (not built in the client image)
-tests/
+# Tests (not built in this image) — EXCEPT the e2e probe source: configure
+# (BUILD_EXAMPLES=ON) declares the EXCLUDE_FROM_ALL rune_ql_probe target and
+# needs its source file to exist.
+tests/*
+!tests/e2e
+tests/e2e/*
+!tests/e2e/rune_ql_probe.cpp
 benchmark/
 bench/
 

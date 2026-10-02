@@ -39,7 +39,7 @@ namespace rune::client::subscriber {
 /// App-thread -> duty-thread hand-off for one subscribe() call (heap-allocated
 /// by the app thread, ownership passed through the agent command ring).
 struct SubscribeRequest {
-    std::shared_ptr<SubscriptionImpl>     impl;
+    SubscriptionImpl*                     impl = nullptr;  // F8c C7: not owning (see owned_)
     std::vector<uint8_t>                  subscribeFrame;  // encoded Subscribe (resend on redirect)
     std::chrono::steady_clock::time_point deadline;        // M2: subscribe-request timeout
     bool                                  unsent = false;  // fix3 I4: refused, retried per cycle
@@ -76,7 +76,7 @@ public:
     ///   partitionKnown — 1 if partition is explicit, 0 if resolved from key
     ///   deadline       — subscribe-request timeout (sweepTimedOut fails it)
     [[nodiscard]] static std::unique_ptr<SubscribeRequest>
-    makeSubscribeRequest(std::shared_ptr<SubscriptionImpl>     impl,
+    makeSubscribeRequest(SubscriptionImpl*                     impl,
                          int64_t                               sessionId,
                          uint8_t                               partitionKnown,
                          int64_t                               fromOffset,
@@ -215,6 +215,40 @@ public:
     /// fix4 M1: subscriptions failed because their Subscribe frame was Fatal.
     [[nodiscard]] uint64_t subscribesFailed() const noexcept { return subscribesFailed_; }
 
+    // -------------------------------------------------------------------------
+    // F8c C7: ownership of the impls (spec §3.3) — duty thread
+    // -------------------------------------------------------------------------
+
+    /// The handle released `impl` (its HandleRelease was applied and the
+    /// subscription unsubscribed): if no table references it any more and no
+    /// handler of it is running, forget it and return true — the caller then
+    /// detaches the duty side's share (and frees the impl if the handle
+    /// already detached).  False: still referenced; ask again later.
+    [[nodiscard]] bool release(SubscriptionImpl* impl) noexcept;
+
+    /// Client close (after deactivateAll): every impl this hub still owns is
+    /// handed back — `detach(impl)` detaches the duty side's share (and frees
+    /// it if the handle already detached).  The hub holds nothing afterwards.
+    template <class Detach>
+    void handBackAll(Detach&& detach) noexcept {
+        std::vector<SubscriptionImpl*> owned;
+        owned.swap(owned_);
+        for (SubscriptionImpl* impl : owned) detach(impl);
+    }
+
+    /// Finish `impl` locally (inactive, final snapshot, status closed) — no
+    /// frame sent (Client close: the transport is going away).
+    void finishLocal(SubscriptionImpl& impl) { finish_(impl); }
+
+    /// F8c C7 F1: visit every impl this hub owns (cold: an orphan scan).
+    template <class F>
+    void forEachOwned(F&& f) {
+        for (std::size_t i = 0; i < owned_.size(); ++i) f(*owned_[i]);
+    }
+
+    /// Impls this hub owns (adopted, not yet released and forgotten).
+    [[nodiscard]] std::size_t ownedCount() const noexcept { return owned_.size(); }
+
     /// CB-5 B: true if there is at least one pending (unbound) subscription.
     [[nodiscard]] bool hasPending() const;
 
@@ -250,7 +284,12 @@ private:
 
     // Active subscriptions: SubscribeResponse received, subscriptionId bound.
     // Key: subscriptionId.
-    std::map<int64_t, std::shared_ptr<SubscriptionImpl>> activeById_;
+    std::map<int64_t, SubscriptionImpl*> activeById_;
+
+    // F8c C7: every impl whose SubscribeAdd this hub adopted (even one already
+    // unsubscribed / finished), until release() forgets it or Client close
+    // hands it back.  The tables above only reference impls listed here.
+    std::vector<SubscriptionImpl*> owned_;
 
     // fix1 C1 / fix2 minor-5: plain counter, written only on the agent thread.
     uint64_t callbackExceptions_ = 0;
@@ -285,6 +324,9 @@ private:
     uint64_t    staleResponsesIgnored_ = 0;
     uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
     detail::SendResult sendSubscribeFrame_(const SubscribeRequest& req);
+    /// F8c C3: the Subscribe correlationId of the subscription whose impl is
+    /// `key`, found by address in this hub's own tables (0 = not held).
+    [[nodiscard]] int64_t correlationIdOf_(const SubscriptionImpl* key) const noexcept;
     /// fix4 M1: fail + erase a pending request whose Subscribe is never deliverable.
     PendingMap::iterator failRequest_(PendingMap::iterator it);
     void markUnsent_(SubscribeRequest& req) noexcept;

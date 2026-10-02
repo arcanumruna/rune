@@ -4,6 +4,7 @@
 // Bare ProducerImpl + ProducerHub, injected clock, counting / capturing sinks,
 // no Aeron.  "Visits" = ProducerImpl::debugFlushVisits(): partitions examined by
 // flushBatches.
+#include "../support/AckLedger.h"
 #include "../support/AllocCounter.h"
 
 #include <rune/client/Key.h>
@@ -65,15 +66,14 @@ rc::ProducerConfig cfgOf(rc::Acks acks, int64_t lingerUs, int32_t maxInFlight = 
 
 // N partitions, all created and flushed clean (one record each).
 struct Rig {
-    std::atomic<int64_t>          corr{1};
-    std::shared_ptr<ProducerImpl> impl;
+    std::unique_ptr<ProducerImpl> impl;  // F8c C7: the bare hub holds a raw pointer
     ProducerHub                   hub;
     int64_t                       now = 1'000'000'000;
 
     Rig(const rc::ProducerConfig& cfg, int32_t partitions, bool direct) {
-        impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024 * 1024);
+        impl = std::make_unique<ProducerImpl>(cfg, 4 * 1024 * 1024);
         if (direct) impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, now});
-        hub.add(impl);
+        hub.add(impl.get());
     }
     rc::SendResult send(int32_t partition) {
         return impl->trySubmit(kTopic, partition, rc::Key(uint64_t{7}), kVal, 0);
@@ -309,7 +309,9 @@ TEST(ProducerFlushDirty, FlushFromCallbackMidWalkLeavesNoStaleFlagRegression) {
     // Partition 0 is walked first (plain record); partition 1's acks=None
     // "sent" callback fires inside the same walk and calls flush().
     ASSERT_EQ(r.send(0), rc::SendResult::Ok);
-    const int64_t h = r.impl->registerCallback([&r](int64_t) { r.impl->submitFlush(); });
+    test_support::ScriptedAcks S;
+    S.attach(*r.impl);
+    const int64_t h = S.cb([&r](int64_t) { r.impl->submitFlush(); });
     ASSERT_EQ(r.impl->trySubmit(kTopic, 1, rc::Key(uint64_t{7}), kVal, h), rc::SendResult::Ok);
     r.impl->submitFlush();
     r.cycle(sink);

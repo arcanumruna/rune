@@ -1,22 +1,26 @@
 // src/Client.cpp
 //
-// CC-6 — Client implementation: connect()/ping() futures + background runner.
+// CC-6 — Client implementation: control ops with completion tokens + runner.
 //
-// Threading safety summary:
-//   - The runner thread (runLoop) is the ONLY caller of agent_.doWork().
-//     It also calls sweepTimeouts() and onEgressFrame() (via the egress
-//     observer that the agent invokes from within doWork()).
-//   - The app thread calls connect() and ping() which:
-//       1. Create a promise, insert into the pending map (under mtx_).
-//       2. Submit a command to the agent's thread-safe ring.
-//   - mtx_ protects pendingConnect_ and pendingPings_.  It is only held for
-//     short critical sections; never held across agent calls or I/O.
-//   - The egress observer (onEgressFrame) runs on the runner thread and
-//     resolves/rejects promises while holding mtx_ for minimal scopes.
+// Threading summary (F8c C2/C3 — no futures, no atomics, no mutex):
+//   - The duty thread (the Thread-mode runner, or the Invoker owner inside
+//     doWork()) owns the agent, the session, every hub, the control-op pending
+//     table, the correlation-id counter and the completion-queue registry.
+//   - App threads hand it commands through the agent's M2O command ring
+//     (control ops, registrations, CqAdd / CqRelease, callback setters); on the
+//     duty thread itself they are applied directly.
+//   - Results travel back as completions: into a Completions ring (duty thread
+//     = its single producer) or to a CompletionHandler called on the duty
+//     thread.  The seed session state reaches the owner through a StatusRing.
+//   - close() closes the command ring (the closed bit is in its tail word:
+//     linearizable with every submit), joins the runner, drains what was
+//     accepted, completes everything Closed and hands every registered
+//     Completions back (producer-close).
 
 #include <rune/client/Client.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
+#include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/GroupMessages.h>
@@ -26,6 +30,7 @@
 #include <concurrent/BackOffIdleStrategy.h>
 #include <concurrent/YieldingIdleStrategy.h>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdio>
@@ -36,6 +41,24 @@
 #include <unordered_map>
 
 namespace rune::client {
+
+namespace {
+// F8c fix round 1 (I1): the Client this thread is closing (set right after the
+// runner join, cleared when closeImpl_ returns).  Per-THREAD state — never
+// shared: it lets a Completions released by user code that close() itself runs
+// (a callable destroyed by the final drain, a callback during teardown)
+// recognise that its thread already owns every duty structure, and release
+// directly instead of waiting for a hand-back only this thread would perform.
+thread_local const Client* tClosing = nullptr;
+// F8c fix round 1 (m6): a distinct token per *AndWait call on THIS thread (two
+// threads may draw the same value; each call has its own fresh queue, and the
+// I3 quarantine makes cross-queue delivery impossible, so this is hygiene).
+thread_local Token tWaitToken = 0;
+// F8c C8: the runner start latch (spec §3.4) — one empty record on a
+// stack-local OneToOneRingBuffer of the smallest useful capacity.
+constexpr std::size_t   kStartLatchCapacity = 64;
+constexpr std::int32_t  kStartLatchMsgType  = 1;
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Helper: build AgentConfig from ClientConfig
@@ -103,6 +126,10 @@ Client::Client(ClientConfig cfg)
     , agent_(toAgentConfig(cfg_))
     , partitionRouter_(metadataCache_)
 {
+    // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
+    // never holds more than one entry per registry slot, so reserve it once
+    // here and the push_back there can never allocate (or throw).
+    deferredReleases_.reserve(kMaxCqs);
     // MD1 IMPORTANT-2: the seed session's currentLeaderChannel is initialised to
     // the config ingress channel (== gatewayChannel) inside ClientAgent's Session
     // constructor — Task 1.1 (was Client::currentLeaderChannel_ here).
@@ -133,26 +160,43 @@ Client::Client(ClientConfig cfg)
 
     // Shared-nothing producer registration: the duty-cycle thread drains a
     // kMsgRegisterProducer command and lands here, adopting the producer into the
-    // single-owner ProducerHub list.  `holder` is a heap shared_ptr<ProducerImpl>*
-    // created by Client::producer(); we move the shared_ptr out and free the holder.
-    agent_.setProducerRegisterFn([this](void* holder) {
-        auto* sp = static_cast<std::shared_ptr<producer::ProducerImpl>*>(holder);
-        producerHub_.add(std::move(*sp));
-        delete sp;
+    // single-owner ProducerHub list.  F8c C7: the record carries the impl itself
+    // (no shared_ptr holder) — from here the duty side holds its share (§3.3).
+    agent_.setProducerRegisterFn([this](void* impl) {
+        auto* p = static_cast<producer::ProducerImpl*>(impl);
+        producerHub_.add(p);
+        // F1: its handle orphaned the release before this adoption: a scan
+        // could not see it yet — queue it now (its fence keeps FIFO).
+        if (p->releaseOrphaned() && !p->releaseNoted) {
+            p->releaseNoted = true;
+            noteOrphan_(detail::HandleKind::Producer, p, p->orphanFence());
+        }
     });
     // Same hand-off for transactional producers (was a mutex-guarded vector that
     // the runner locked and copied every duty cycle).
-    agent_.setTxnProducerRegisterFn([this](void* holder) {
-        auto* sp = static_cast<std::shared_ptr<producer::TransactionalProducerImpl>*>(holder);
-        txnProducers_.push_back(std::move(*sp));
-        delete sp;
+    agent_.setTxnProducerRegisterFn([this](void* impl) {
+        auto* t = static_cast<producer::TransactionalProducerImpl*>(impl);
+        txnProducers_.push_back(t);
+        if (t->status.consumerOrphaned() && !t->releaseNoted) {  // F1: see producers
+            t->releaseNoted = true;
+            noteOrphan_(detail::HandleKind::TxnProducer, t, t->orphanFence);
+        }
         agent_.setForwardProduceResponses(true);  // txn producers consume raw ProduceResponses
     });
 
     // F8a: subscriber / group-consumer commands from app threads, applied on the
     // duty thread (or by close()'s final drain) by the hub that owns the state.
     agent_.setHubCommandFn([this](const detail::HubCommand& cmd) { applyHubCommand_(cmd); });
+    // F8c C3: control ops (connect / ping / DDL / listTopics) from app threads.
+    agent_.setControlOpFn([this](const uint8_t* rec, std::size_t len) { applyControlOpRecord_(rec, len); });
+    pendingCtl_.reserve(64);
+    ctlScratch_.reserve(512);
+    cqSlots_.reserve(kMaxCqs);
+    cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
+    releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
     groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
+    // F8c C4: commitSync completions go through the completion-queue registry.
+    groupConsumerHub_.setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
     subscriberHub_.setSessionConnected(false);
     // F8a fix2: Unsubscribe / OffsetCommit frames go straight to the transport
     // from the duty thread (retried every duty cycle on refusal), never via the
@@ -167,13 +211,27 @@ Client::Client(ClientConfig cfg)
     });
 
     // Built ONCE (not per duty cycle / per frame).  TX-5 / Task 1.4: txn producers
-    // keep their 3-arg SendFn (streamId, buf, len); the data path has no
-    // per-partition route, so topicId/partition = 0 → the agent's default offer path.
+    // keep their 3-arg SendFn (streamId, buf, len), stamped with the seed
+    // sessionId.  C10: the route follows the frame —
+    //   * Produce (txn data) -> ITS partition's leader route (re-stamped with
+    //     that leader session's id; no route known = the seed, as for any produce);
+    //   * every other txn frame is a COORDINATOR request (InitProducerId,
+    //     AddPartitionsToTxn, AddOffsetsToTxn, TxnOffsetCommit, EndTxn) -> the
+    //     seed session, like the group coordinator's requests.  (It used to take
+    //     topic 0 / partition 0's leader route: on a cluster whose partition
+    //     leaders are spread over the nodes that is not the coordinator.)
     txnSendFn_ = [this](int32_t streamId, const uint8_t* buf, std::size_t len) -> bool {
-        return agent_.offerToPartition(/*topicId=*/0, /*partition=*/0, streamId, buf, len);
-    };
-    txnControlSendFn_ = [this](int32_t, const uint8_t* buf, std::size_t len) -> bool {
-        return agent_.submitSend(buf, len);
+        const auto tid = codec::peekTemplate(buf, len);
+        if (tid && static_cast<codec::TemplateId>(*tid) == codec::TemplateId::Produce) {
+            const auto pv = codec::decodeProduce(buf, len);
+            const int32_t topicId   = pv ? pv->topicId : 0;
+            const int32_t partition = pv ? pv->partition : 0;
+            return agent_.offerToPartition(topicId, partition, streamId, buf, len);
+        }
+        // Retry = transiently refused: false, re-offered next cycle.  Fatal =
+        // never deliverable (counted + logged by the agent): consumed, the op
+        // deadline completes the request.
+        return agent_.offerDefault(buf, len) != transport::AeronTransport::OfferResult::Retry;
     };
 
     // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence).
@@ -183,19 +241,39 @@ Client::Client(ClientConfig cfg)
     dutyThreadId_ = ownerThread_;
     nextSweepNs_  = now() + kSweepIntervalMs * 1'000'000LL;
     if (cfg_.runnerMode == RunnerMode::Thread) {
-        // dutyThreadId_ is written BEFORE the runner runs its first duty cycle: the
-        // runner blocks on `go` until the write is done, and set_value() → wait()
-        // is a happens-before edge, so the runner's reads (submitRegistration_ /
-        // ~Client from a callback) never race the write.  App threads see it via
-        // the Client's construction (they cannot hold the Client earlier).
-        std::promise<void> go;
-        std::future<void>  goF = go.get_future();
-        runnerThread_ = std::thread([this, goF = std::move(goF)]() mutable {
-            goF.wait();
+        // F8c C8 (spec §3.4): the runner start latch — a stack-local 1-record
+        // OneToOneRingBuffer.  The runner writes dutyThreadId_ (its OWN id) as
+        // its first action, then publishes one record, then producer-closes the
+        // ring as its LAST touch of it.  This thread spins until it has read the
+        // record AND seen the producer-closed word: the acquire reads order the
+        // runner's dutyThreadId_ write before every later read of it (app
+        // threads hold the Client only after this constructor returns), and the
+        // closed word proves the runner is done with the stack buffer (write()
+        // stores the tail AFTER the record header, so returning on the record
+        // alone would let that store land in a dead frame).  No timeout: the
+        // runner's very first statements publish, so the wait ends as soon as
+        // the thread runs — liveness does not depend on any time window.
+        alignas(64) std::uint8_t startRingBuf[kStartLatchCapacity +
+                                              detail::OneToOneRingBuffer::trailerLength()] = {};
+        detail::OneToOneRingBuffer startRing(startRingBuf, sizeof(startRingBuf));
+        runnerThread_ = std::thread([this, &startRing]() {
+            dutyThreadId_ = std::this_thread::get_id();
+            if (!startRing.writeWith(kStartLatchMsgType, 0,
+                                     [](aeron::concurrent::AtomicBuffer&, aeron::util::index_t) {})) {
+                std::abort();  // unreachable: an empty ring of capacity 64 takes one empty record
+            }
+            startRing.producerClose();  // the runner never touches `startRing` again
             runLoop();
         });
-        dutyThreadId_ = runnerThread_.get_id();
-        go.set_value();
+        bool started = false;
+        aeron::concurrent::YieldingIdleStrategy idle;
+        for (;;) {
+            started = started ||
+                      startRing.read([](std::int32_t, aeron::concurrent::AtomicBuffer&,
+                                        aeron::util::index_t, aeron::util::index_t) {}, 1) == 1;
+            if (started && startRing.producerClosed()) break;
+            idle.idle();
+        }
     }
 }
 
@@ -225,42 +303,57 @@ Client::~Client() {
 // close() — idempotent shutdown
 // ---------------------------------------------------------------------------
 
-void Client::close() {
+void Client::checkCloseCaller_(const char* what) const {
     if (cfg_.runnerMode == RunnerMode::Invoker) {
         // Cold-path contract checks, enforced in release builds too.
         if (std::this_thread::get_id() != ownerThread_) [[unlikely]] {
-            throw std::logic_error("Client::close(): Invoker mode — call from the owner thread");
+            throw std::logic_error(std::string(what) + ": Invoker mode — call from the owner thread");
         }
         if (inDutyCycle_) [[unlikely]] {
-            throw std::logic_error(
-                "Client::close(): called from a duty-cycle callback (would tear the agent "
-                "down under its own poll)");
+            throw std::logic_error(std::string(what) +
+                                   ": called from a duty-cycle callback (would tear the agent "
+                                   "down under its own poll)");
+        }
+    } else if (std::this_thread::get_id() == dutyThreadId_ && !agent_.commandRingClosed()) [[unlikely]] {
+        throw std::logic_error(std::string(what) +
+                               ": called from a runner callback (it would join its own thread)");
+    }
+}
+
+void Client::close() {
+    checkCloseCaller_("Client::close()");
+    // F8c C7 (user decision 2): drain every producer (and close every
+    // transactional producer) first — one token for all of them, waited for
+    // like the *AndWait sugar — then tear down.  Each drain is bounded by its
+    // own deadline (deliveryTimeoutMs / transactionOpTimeoutMs).
+    if (!agent_.commandRingClosed()) {
+        try {
+            andWait_("Client::close()", std::chrono::hours(24 * 365 * 100), 0,
+                     [this](Completions& q, Token t) { return issueDrain_(q, t); },
+                     [](const Completion&, std::span<const uint8_t>) {});
+        } catch (const std::runtime_error&) {
+            // Another thread closed the Client meanwhile (its close completes
+            // everything): nothing left to drain.
         }
     }
     closeImpl_();
 }
 
-void Client::closeImpl_() {
-    // Registration-vs-close race (fix2 Important-3, corrected in fix3 C1; the
-    // full argument is at the compare_exchange in producerWithRingCap_): a
-    // producer() call on another thread commits its registration into the
-    // agent command ring and THEN performs a seq_cst RMW on stopped_
-    // (compare_exchange false->false). This exchange is the other RMW on
-    // stopped_; the two are totally ordered in stopped_'s modification order:
-    //   * CAS first: the CAS succeeds (reads false), and this exchange
-    //     reads-from it (or from a later RMW in its release sequence), so the
-    //     CAS synchronizes-with this exchange. The ring commit is
-    //     sequenced-before the CAS, hence happens-before this exchange and the
-    //     drainRegistrationsForClose() below — which therefore sees the
-    //     committed record (write-read coherence) and adopts it.
-    //   * Exchange first: the CAS fails (reads true) and that producer() call
-    //     marks its own ring closed instead.
-    // Either way, no registration is ever left unread with its ring open.
-    // Atomically transition to stopped; only the first caller does the work.
-    bool alreadyStopped = stopped_.exchange(true, std::memory_order_seq_cst);
-    if (alreadyStopped) return;
+void Client::closeImmediately() {
+    checkCloseCaller_("Client::closeImmediately()");
+    closeImpl_();
+}
 
-    // Join the runner thread (it checks stopped_ in its loop condition).
+void Client::closeImpl_() {
+    // F8c C2: closing the agent command ring IS the stop signal (no stopped_
+    // atomic).  The closed bit lives in the ring's tail word, so every submit
+    // is linearized against this one RMW: a command accepted before it is
+    // drained below; a command after it is refused (Closed) and never written
+    // — no ClosedAfterSubmit window, no accepted leak.  Only the first caller
+    // (the one that closed the ring) does the work.
+    if (!agent_.closeCommandRing()) return;
+
+    // Join the runner thread (it loops until it sees the closed ring).
     // CONTRACT: close() must NOT be called from within a Client callback
     // (onConnected/onDisconnected/onError run on the runner thread). Doing so
     // would self-join the runner (std::system_error) and re-enter teardown on the
@@ -269,15 +362,32 @@ void Client::closeImpl_() {
     if (runnerThread_.joinable()) {
         runnerThread_.join();
     }
+    // F8c C0: no duty thread runs any more — this thread is the single pumper
+    // for whatever the teardown below drives (it is already the owner in
+    // Invoker mode, or the destroying thread in the off-owner-destroy pattern).
+    agent_.bindDutyThread();
+    // From here this thread owns every duty-side structure (the join / the
+    // Invoker contract orders it after the last duty cycle).
+    closing_ = true;
+    struct ClosingMark {  // I1: this thread is the closer until closeImpl_ returns
+        const Client* prev;
+        explicit ClosingMark(const Client* c) : prev(tClosing) { tClosing = c; }
+        ~ClosingMark() { tClosing = prev; }
+    } closingMark(this);
 
-    // Single-threaded from here.  Adopt registrations still sitting in the command
-    // ring (producer()/transactionalProducer() whose registration no duty cycle has
-    // drained yet) so their holders are freed and the failAll below reaches them.
+    // Single-threaded from here.  Drain the command ring up to its (now frozen)
+    // tail: registrations are adopted (the hubs hold their share; the failAll below
+    // reaches them), hub commands applied, completion queues added / released,
+    // and every accepted control op completes — Closed (closing_).
     (void)agent_.drainRegistrationsForClose();
+    // I3': the drain read up to the frozen tail (or was abandoned — nothing
+    // behind the orphan is ever applied): every deferred release is safe now,
+    // and must happen before the registry hand-back (the owner gave it up).
+    (void)applyDeferredReleases_(true);
 
     // fix1 C2/I3: mark every producer's ring closed NOW — the Client (and its
     // pump-hook contexts, each `this`) is still fully valid, and this runs
-    // before the transport is torn down. A Producer whose shared_ptr the app
+    // before the transport is torn down. A Producer handle the app
     // kept past this point then gets SendResult::Closed, never touching the
     // (by-then-dangling) pump hook: no use-after-free, no silent accept.
     producerHub_.closeAllRings();
@@ -289,7 +399,35 @@ void Client::closeImpl_() {
     // MUST be called after agent_.stop() so no agent thread is in onRecords().
     subscriberHub_.deactivateAll();
 
+    // M2 FIX: Fail any still-pending (unbound) subscribes so their active flag
+    // is cleared and any polling app-code sees the subscription is dead.
+    // Must be called after deactivateAll() (which already clears pending), but
+    // failPendingSubscribes is idempotent (operates on pendingByCorrelation_
+    // which deactivateAll already cleared — this is a belt-and-suspenders call
+    // for any edge where deactivateAll was not yet called).
+    subscriberHub_.failPendingSubscribes("Client closed");
+
+    // F8c C6/C6a: every producer completes everything it accepted with Closed,
+    // exactly once — in its ring (drained to the frozen tail: a record claimed
+    // before closeAllRings() but committed after it is still read; fix5 bound),
+    // builders, the Tier-2 queue, the deferred arena, in flight — and a pending
+    // begin-close token completes Closed.  Before the registry hand-back
+    // (closeCqRegistry_, below), so no producer completion is a stale drop.
+    // After agent_.stop(): nothing else touches the producers.
+    producerHub_.closeFinalAll(OpStatus::Closed, agent_.closeDrainUnblockAfterYields());
+
+    // TX-5 / F8c C5: every pending txn op completes Closed (its completion
+    // reaches its queue before the registry hand-back below), and each
+    // producer's status channel is finished, so later operations are rejected
+    // Closed at once, never hang.  No lock: the runner was joined above
+    // (Thread mode) or this is the owner thread (Invoker mode).
+    for (producer::TransactionalProducerImpl* tp : txnProducers_) {
+        tp->failAll();
+    }
+
     // CG-5: Deactivate all group consumers (fire onRevoked, send LeaveGroup).
+    // F8c fix round 1 (M-1): spec §4 order — producers, txn producers, THEN
+    // group consumers, then the control tables.
     // MUST be called after agent_.stop() so no agent thread is in onRecords().
     // sendFn here is a best-effort last send (transport may be stopping).
     {
@@ -300,44 +438,50 @@ void Client::closeImpl_() {
         groupConsumerHub_.closeAll(snap.sessionId, gcSendFn);
     }
 
-    // M2 FIX: Fail any still-pending (unbound) subscribes so their active flag
-    // is cleared and any polling app-code sees the subscription is dead.
-    // Must be called after deactivateAll() (which already clears pending), but
-    // failPendingSubscribes is idempotent (operates on pendingByCorrelation_
-    // which deactivateAll already cleared — this is a belt-and-suspenders call
-    // for any edge where deactivateAll was not yet called).
-    subscriberHub_.failPendingSubscribes("Client closed");
-
-    // Fail any still-pending producer acks (futures/callbacks) BEFORE returning.
-    // producerHub_.failAll() calls ProducerImpl::failAllPending on every registered
-    // producer — this resolves every pending future/callback with an error so they
-    // never hang.  MUST be called after agent_.stop() so the agent thread is no
-    // longer in drainAndFlush / onProduceResponse (no concurrent access to the ack rings).
-    producerHub_.failAll("Client closed");
-
-    // TX-5: fail all pending txn producer ops.  No lock: the runner was joined
-    // above (Thread mode) or this is the owner thread (Invoker mode).
-    // fix5: failAll() also markClosed()s each one (the txn analogue of
-    // closeAllRings() above), so later operations fail at once, never hang.
-    for (auto& tp : txnProducers_) {
-        tp->failAll("Client closed");
-    }
 
     // M2 FIX: clear the seed session's redirect latch on close so it does not
-    // latch.  Safe as a plain write: the runner thread was joined above, so this
+    // stay latched.  Safe as a plain write: the runner thread was joined above, so this
     // runs single-threaded (no concurrent agent-thread access) — Task 1.1.
     redirectPending() = false;
 
-    // Fail any still-pending connect/ping futures.
-    failAllPending("Client closed");
+    // F8c (spec §4 order): after producers, txn producers and group consumers
+    // have failed their ops, the control tables complete Closed, and only then
+    // is every registered Completions handed back (producer-closed: its owner
+    // sees every Closed record, then finished()) — so no completion delivered
+    // during close is dropped.  A queue released by user code that this close
+    // runs (above) was freed directly (tClosing, I1), never waited on.
+    failAllControl_(OpStatus::Closed);
+    // F8c C7: a Client::close() drain still pending (another thread's close
+    // won, or this is the destructor) completes Closed, exactly once.
+    for (const DrainWaiter& w : drainWaiters_) {
+        Completion c;
+        c.token  = w.token;
+        c.op     = OpKind::ClientDrain;
+        c.status = OpStatus::Closed;
+        deliver_(w.target, c, {});
+    }
+    drainWaiters_.clear();
+    closeCqRegistry_();
+    // F8c C7 (§3.3 (b)): every handle impl the hubs still hold is handed back
+    // — the duty side detaches its share (the handle frees it on release, or
+    // it is freed here if its handle already let go).  After every hub
+    // finished (above), before the command ring's consumer-finished word.
+    handBackAll_();
+    // I2: nothing reads the command ring any more — even if the drain above
+    // was abandoned behind an orphaned claim.  A Completions constructor still
+    // waiting for a CqAdd stranded there sees this and is born finished.
+    agent_.finishCommandRingConsumer();
 
-    // Fire onDisconnected once.
-    bool expected = false;
-    if (disconnectedFired_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        if (cbDisconnected_) {
-            invokeUserCallback_("onDisconnected", [&] { cbDisconnected_(); });
-        }
+    // F8c C3: handler-target completions deferred during the close (Closed),
+    // now that every queue is handed back.
+    for (DeferredHandler& d : closeDeferred_) {
+        d.handler(d.c, std::span<const uint8_t>(d.payload));
+    }
+    closeDeferred_.clear();
+
+    // Fire onDisconnected once (closeImpl_'s body runs once: the first closer).
+    if (cbDisconnected_) {
+        invokeUserCallback_("onDisconnected", [&] { cbDisconnected_(); });
     }
 }
 
@@ -345,38 +489,83 @@ void Client::closeImpl_() {
 // Callback registration
 // ---------------------------------------------------------------------------
 
-// FIX F4: callback setters are setup-phase only.  Once connect() has been
-// called the runner thread may read the callback std::functions, so mutating
-// them here would be a data race.  Enforce the "set before connect()" contract:
-// assert in debug builds; no-op safely in release.
-void Client::onConnected(std::function<void(int64_t)> cb) {
-    assert(!connectCalled_.load(std::memory_order_acquire) &&
-           "onConnected() must be called BEFORE connect() (callback setters are "
-           "setup-phase only; setting after connect() is a data race)");
-    if (connectCalled_.load(std::memory_order_acquire)) return;
-    cbConnected_ = std::move(cb);
+// F8c C3: a callback setter is a command for the duty thread (no
+// connectCalled_ flag, no setup-phase race).  On the Invoker owner OUTSIDE a
+// duty cycle the callback is installed directly; anywhere else it goes through
+// the ring (never replaced while it may be running: a duty-cycle callback that
+// sets a callback queues the change for the next drain).  After close() the
+// setter is a no-op.
+template <class Fn>
+void Client::setCallback_(int which, Fn cb) {
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker && onDuty && !inDutyCycle_) {
+        if (agent_.commandRingClosed()) return;
+        auto* holder = new Fn(std::move(cb));
+        applySetCallback_(which, holder);
+        return;
+    }
+    if (agent_.commandRingClosed()) return;
+    auto holder = std::make_unique<Fn>(std::move(cb));
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::ClientSetCallback;
+    cmd.handle = reinterpret_cast<uint64_t>(holder.get());
+    cmd.a      = which;
+    try {
+        if (submitRegistration_([&] { return agent_.submitHubCommand(cmd); }, [] {})) {
+            (void)holder.release();  // the duty thread owns it now
+        }
+    } catch (const std::logic_error&) {
+        if (!agent_.commandRingClosed()) throw;  // ring full inside a callback
+    }
 }
 
-void Client::onDisconnected(std::function<void()> cb) {
-    assert(!connectCalled_.load(std::memory_order_acquire) &&
-           "onDisconnected() must be called BEFORE connect()");
-    if (connectCalled_.load(std::memory_order_acquire)) return;
-    cbDisconnected_ = std::move(cb);
+void Client::applySetCallback_(int which, void* holder) {
+    switch (which) {
+    case 0: {
+        std::unique_ptr<std::function<void(int64_t)>> h(static_cast<std::function<void(int64_t)>*>(holder));
+        cbConnected_ = std::move(*h);
+        break;
+    }
+    case 1: {
+        std::unique_ptr<std::function<void()>> h(static_cast<std::function<void()>*>(holder));
+        cbDisconnected_ = std::move(*h);
+        break;
+    }
+    default: {
+        std::unique_ptr<std::function<void(const std::string&)>> h(
+            static_cast<std::function<void(const std::string&)>*>(holder));
+        cbError_ = std::move(*h);
+        break;
+    }
+    }
 }
 
-void Client::onError(std::function<void(const std::string&)> cb) {
-    assert(!connectCalled_.load(std::memory_order_acquire) &&
-           "onError() must be called BEFORE connect()");
-    if (connectCalled_.load(std::memory_order_acquire)) return;
-    cbError_ = std::move(cb);
-}
+void Client::onConnected(std::function<void(int64_t)> cb) { setCallback_(0, std::move(cb)); }
+void Client::onDisconnected(std::function<void()> cb)     { setCallback_(1, std::move(cb)); }
+void Client::onError(std::function<void(const std::string&)> cb) { setCallback_(2, std::move(cb)); }
 
 // ---------------------------------------------------------------------------
 // State observer
 // ---------------------------------------------------------------------------
 
-session::SessionState Client::state() const noexcept {
-    return agent_.sessionState();
+session::SessionState Client::state() const {
+    const auto me = std::this_thread::get_id();
+    // The duty thread itself (Invoker owner, a Thread-mode runner callback).
+    if (me == dutyThreadId_) return agent_.sessionState();
+    if (me != ownerThread_) {
+        throw std::logic_error(
+            "Client::state(): call from the owner (constructing) thread or a duty-cycle callback");
+    }
+    // Thread mode, owner thread: the latest status the duty thread published.
+    (void)seedStatus_.drainLatest(seedStatusCache_);
+    return static_cast<session::SessionState>(seedStatusCache_.state);
+}
+
+void Client::publishSeedStatus_(session::SessionState st, int64_t sid) noexcept {
+    if (cfg_.runnerMode != RunnerMode::Thread) return;  // Invoker: the owner reads it directly
+    seedStatusLast_.state     = static_cast<uint8_t>(st);
+    seedStatusLast_.sessionId = sid;
+    seedStatusDirty_ = !seedStatus_.tryPublish(seedStatusLast_);
 }
 
 uint64_t Client::testCallbackExceptionCount() const noexcept {
@@ -386,282 +575,861 @@ uint64_t Client::testCallbackExceptionCount() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// connect() — app thread
+// F8c C2: completion-queue registry (§2.2, §3.3)
 // ---------------------------------------------------------------------------
 
-std::future<void> Client::connect() {
-    // FIX F4: mark the callback setup phase closed.  Release store so the runner
-    // thread's acquire load sees all callbacks registered before this point.
-    connectCalled_.store(true, std::memory_order_release);
-
-    std::promise<void> prom;
-    auto fut = prom.get_future();
-
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(cfg_.connectTimeoutMs);
-
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        // If there is already a pending connect, fail the old one.
-        if (pendingConnect_) {
-            try {
-                pendingConnect_->promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("connect() called while another connect is pending")));
-            } catch (...) { /* already satisfied */ }
-            pendingConnect_.reset();
-        }
-
-        pendingConnect_ = std::make_unique<PendingConnect>(
-            PendingConnect{std::move(prom), deadline});
+void Client::registerCq_(Completions& q) {
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) {
+        throw std::logic_error("Completions: Invoker mode — construct on the owner thread");
     }
-
-    // Submit the connect command to the ring (thread-safe).
-    if (!agent_.submitConnect()) {
-        // Ring full — fail the promise immediately.
-        std::lock_guard<std::mutex> lk(mtx_);
-        if (pendingConnect_) {
-            try {
-                pendingConnect_->promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("connect(): ring full, could not submit")));
-            } catch (...) {}
-            pendingConnect_.reset();
+    q.client_ = this;
+    if (agent_.commandRingClosed()) {  // born finished: no duty side will ever own it
+        (void)q.ring_->producerCloseAndDetach();  // the owner's detach then frees it
+        return;
+    }
+    // The registration record is an ordinary completion: reserve its credit.
+    const uint32_t rec = detail::CompletionRing::completionRecordBytes(0);
+    (void)q.reserve(rec);  // a fresh queue on its owner thread: always Accepted
+    if (onDuty) {
+        applyCqAdd_(q.ring_);  // the duty thread itself (Invoker owner / a runner callback)
+    } else {
+        detail::HubCommand cmd;
+        cmd.op     = detail::HubCommand::Op::CqAdd;
+        cmd.handle = reinterpret_cast<uint64_t>(q.ring_);
+        aeron::concurrent::BackoffIdleStrategy idle(
+            10, 20, std::chrono::duration<long, std::nano>(1'000),
+            std::chrono::duration<long, std::nano>(100'000));
+        for (;;) {
+            const auto r = agent_.submitHubCommand(cmd);
+            if (r == agent::ClientAgent::Submit::Accepted) break;
+            if (r == agent::ClientAgent::Submit::Closed) {  // never written: still ours
+                q.unreserve(rec);
+                (void)q.ring_->producerCloseAndDetach();
+                return;
+            }
+            idle.idle(0);  // full: the duty thread drains it (progress-based, no time bound)
         }
     }
+    // One duty round trip: the duty side answers in the queue's own ring.  The
+    // wait ends on ring words only: the registration record, the hand-back
+    // (producer-closed), or — I2 — the command ring's consumer finished with
+    // the CqAdd never read (an abandoned close drain).  Never a time bound.
+    int64_t answer = -2;
+    auto onAnswer = [&](const Completion& c, std::span<const uint8_t>) { answer = c.value; };
+    DefaultWaitIdle idle;
+    Completions::Wait w = Completions::Wait::TimedOut;
+    for (;;) {
+        w = q.waitFor(Completions::kRegistrationToken, std::chrono::nanoseconds(0), onAnswer);
+        if (w != Completions::Wait::TimedOut) break;
+        if (agent_.commandRingConsumerFinished()) {
+            // Everything close() delivered happens-before that word: one more
+            // pass sees the answer if the CqAdd was ever applied.
+            w = q.waitFor(Completions::kRegistrationToken, std::chrono::nanoseconds(0), onAnswer);
+            break;
+        }
+        idle.idle(0);
+    }
+    if (w == Completions::Wait::Done && answer >= 0) {
+        q.cqRef_ = static_cast<CqRef>(answer);
+        return;
+    }
+    if (w == Completions::Wait::Done && answer == -1) {
+        q.client_ = nullptr;  // never adopted: the destructor frees it locally
+        throw std::runtime_error("Completions: the Client's completion-queue registry is full (" +
+                                 std::to_string(kMaxCqs) + " queues)");
+    }
+    // Never registered: the Client closed and handed it back (NotPending), or
+    // its CqAdd was stranded by an abandoned close drain (TimedOut).  Born
+    // finished: the registration credit returns, no duty side owns the ring.
+    q.unreserve(rec);
+    // NotPending: the closer already handed it back (producer closed AND
+    // detached).  TimedOut + consumer-finished: nobody ever adopted it.
+    if (!q.ring_->producerClosed()) (void)q.ring_->producerCloseAndDetach();
+}
 
-    return fut;
+void Client::releaseCq_(Completions& q) noexcept {
+    detail::CompletionRing* ring = q.ring_;
+    const CqRef             ref  = q.cqRef_;
+    // I1: on the thread running this Client's close().  Usually its drain has
+    // already read up to the frozen tail (or was abandoned: nothing behind the
+    // orphan is ever applied).  A release made INSIDE drainRegistrationsForClose
+    // can still have later ops of this queue in that drain: they are dropped as
+    // stale by the generation check (misdelivery would need 32 generation wraps
+    // of this one slot within a single drain — not reachable in practice).
+    const uint64_t prodIssued = q.producerIssued_;  // C6: producer-op accounting
+    if (tClosing == this) {
+        applyCqRelease_(ref, ring, prodIssued);
+        return;
+    }
+    if (std::this_thread::get_id() == dutyThreadId_) {
+        // Thread-mode runner: every op it issues is applied directly.
+        if (cfg_.runnerMode == RunnerMode::Thread) {
+            applyCqRelease_(ref, ring, prodIssued);
+            return;
+        }
+        // I3' (fix round 3): the Invoker owner, inside or between cycles.  Its
+        // ops issued between cycles may still sit in the command ring (past a
+        // bounded drain, or behind a Retry head).  The queue records the ring
+        // tail after its LAST ring-submitted op (owner-thread state, written
+        // only by this thread): release directly once the drain has passed
+        // that fence, otherwise defer the release until it does.  Duty-side
+        // state only; nobody waits.
+        const std::int64_t fence = q.issueFence_;
+        if (agent_.commandRingHead() >= fence) {
+            applyCqRelease_(ref, ring, prodIssued);
+        } else {
+            // Never allocates: reserved to kMaxCqs in the constructor (one entry
+            // per registry slot at most).  A deferred release keeps its slot (and
+            // ring) until the drain passes the fence, so the registry can report
+            // "full" meanwhile — bounded by that drain; a late op completes into
+            // this queue's own (unpolled) ring, never into another queue.
+            deferredReleases_.push_back(DeferredRelease{ring, fence, ref, prodIssued});
+        }
+        return;
+    }
+    detail::HubCommand cmd;
+    cmd.op     = detail::HubCommand::Op::CqRelease;
+    cmd.handle = reinterpret_cast<uint64_t>(ring);
+    cmd.a      = ref;
+    cmd.b      = static_cast<int64_t>(prodIssued);
+    aeron::concurrent::BackoffIdleStrategy idle(
+        10, 20, std::chrono::duration<long, std::nano>(1'000),
+        std::chrono::duration<long, std::nano>(100'000));
+    for (;;) {
+        const auto r = agent_.submitHubCommand(cmd);
+        if (r == agent::ClientAgent::Submit::Accepted) return;  // §3.3 (a): the duty side frees it
+        if (r == agent::ClientAgent::Submit::Closed) break;
+        idle.idle(0);  // full: another thread (the duty thread) drains it — progress-based
+    }
+    // §3.3 (b) + I5: close() is in progress on another thread.  Never wait for
+    // its hand-back (the closer may be running user code blocked on THIS
+    // thread): detach the consumer side; if the closer already handed the
+    // ring back (producer detached), free it here, else the closer frees it.
+    if (ring->consumerDetach()) delete ring;
+}
+
+int Client::applyDeferredReleases_(bool all) noexcept {
+    if (deferredReleases_.empty()) return 0;
+    const std::int64_t head = agent_.commandRingHead();
+    int n = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < deferredReleases_.size(); ++i) {
+        const DeferredRelease d = deferredReleases_[i];
+        if (all || head >= d.fence) {
+            applyCqRelease_(d.ref, d.ring, d.prodIssued);  // every op it fenced has been applied (counted)
+            ++n;
+        } else {
+            deferredReleases_[keep++] = d;
+        }
+    }
+    deferredReleases_.resize(keep);
+    return n;
+}
+
+void Client::applyCqAdd_(detail::CompletionRing* ring) {
+    Completion reg;
+    reg.token         = Completions::kRegistrationToken;
+    reg.reservedBytes = detail::CompletionRing::completionRecordBytes(0);
+    // I3 (fix round 2): a released slot returns to the free ring only once no
+    // pending op targets it (CqSlot::targets == 0 — quarantine), so a stale op
+    // can never match a recycled slot: correctness does not rest on the
+    // generation width.  Fresh slots first, then the oldest freed (FIFO).
+    uint32_t idx = 0;
+    if (cqSlots_.size() < kMaxCqs) {
+        idx = static_cast<uint32_t>(cqSlots_.size());
+        cqSlots_.push_back({});
+    } else if (cqFreeCount_ != 0) {
+        idx = cqFree_[cqFreeHead_];
+        cqFreeHead_ = (cqFreeHead_ + 1) & (kMaxCqs - 1);
+        --cqFreeCount_;
+    } else {
+        reg.value = -1;  // full: not adopted — the queue keeps (and frees) its ring
+        (void)ring->deliver(reg, {});
+        return;
+    }
+    cqSlots_[idx].ring          = ring;
+    cqSlots_[idx].prodDelivered = 0;  // C6: a fresh owner's producer-op count
+    reg.value = makeCqRef(idx, cqSlots_[idx].gen);
+    (void)ring->deliver(reg, {});
+}
+
+void Client::applyCqRelease_(CqRef ref, detail::CompletionRing* ring, uint64_t prodIssued) {
+    const uint32_t idx = cqRefIndex(ref);
+    if (ref != kNoCqRef && idx < cqSlots_.size() && cqSlots_[idx].ring == ring &&
+        cqSlots_[idx].gen == cqRefGen(ref)) {
+        CqSlot& slot = cqSlots_[idx];
+        slot.ring = nullptr;
+        slot.gen  = static_cast<uint8_t>((slot.gen + 1) & kCqRefGenMask);
+        // Quarantined until no pinned op targets it (I3) AND every producer op
+        // its owner issued has been delivered or dropped here (C6) — so a
+        // stale completion can never match a recycled slot.
+        slot.quarantined = true;
+        slot.prodIssued  = prodIssued;
+        maybeRecycleCqSlot_(idx);
+    }
+    // An accepted release always transfers the ring to this side (§3.3 (a)).
+    delete ring;
+}
+
+void Client::maybeRecycleCqSlot_(uint32_t idx) noexcept {
+    CqSlot& slot = cqSlots_[idx];
+    if (!slot.quarantined || slot.targets != 0 || slot.prodDelivered < slot.prodIssued) return;
+    slot.quarantined   = false;
+    slot.prodDelivered = 0;
+    slot.prodIssued    = 0;
+    freeCqSlot_(idx);
+}
+
+void Client::producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion& c) noexcept {
+    static_cast<Client*>(ctx)->producerCqDeliver_(ref, c);
+}
+
+void Client::producerCqDeliver_(CqRef ref, const Completion& c) noexcept {
+    // Duty thread (or the closing thread).  One producer completion: a per-
+    // record / Tier-2 ack (one producer op) or a BatchAck (reserved0 credit
+    // units, each one producer op).
+    const uint32_t idx = cqRefIndex(ref);
+    if (idx >= cqSlots_.size()) {
+        ++staleCqDrops_;
+        return;
+    }
+    CqSlot& slot = cqSlots_[idx];
+    const uint64_t ops = c.op == OpKind::BatchAck ? c.reserved0 : 1u;
+    if (slot.ring != nullptr && slot.gen == cqRefGen(ref)) {
+        (void)slot.ring->deliver(c, {});
+        slot.prodDelivered += ops;
+        return;
+    }
+    // Released: dropped.  If the slot is quarantined for THIS generation (the
+    // one released just before its gen was bumped), count it so the slot can
+    // be recycled once every producer op of that owner is accounted for.
+    ++staleCqDrops_;
+    if (slot.quarantined && ((cqRefGen(ref) + 1) & kCqRefGenMask) == slot.gen) {
+        slot.prodDelivered += ops;
+        maybeRecycleCqSlot_(idx);
+    }
+}
+
+void Client::pinCqSlot_(DutyTarget& t) noexcept {
+    if (t.handler.fn != nullptr || t.cqRef == kNoCqRef) return;
+    const uint32_t idx = cqRefIndex(t.cqRef);
+    if (idx >= cqSlots_.size() || cqSlots_[idx].ring == nullptr || cqSlots_[idx].gen != cqRefGen(t.cqRef)) {
+        return;  // already released: its completion is dropped (nothing to pin)
+    }
+    ++cqSlots_[idx].targets;
+    t.counted = true;
+}
+
+void Client::freeCqSlot_(uint32_t idx) noexcept {
+    cqFree_[(cqFreeHead_ + cqFreeCount_) & (kMaxCqs - 1)] = static_cast<uint16_t>(idx);
+    ++cqFreeCount_;
+}
+
+void Client::closeCqRegistry_() {
+    for (std::size_t i = 0; i < cqSlots_.size(); ++i) {
+        CqSlot& slot = cqSlots_[i];
+        if (slot.ring == nullptr) continue;
+        detail::CompletionRing* ring = slot.ring;
+        slot.ring = nullptr;
+        slot.gen  = static_cast<uint8_t>((slot.gen + 1) & kCqRefGenMask);
+        // The LAST access, I5 handshake: if the owner already detached (its
+        // release found us closing) we free it; otherwise the owner does.
+        if (ring->producerCloseAndDetach()) delete ring;
+    }
+}
+
+std::size_t Client::testRegisteredCqs() const noexcept {
+    std::size_t n = 0;
+    for (const CqSlot& slot : cqSlots_) n += slot.ring != nullptr ? 1u : 0u;
+    return n;
+}
+
+void Client::testDeliverToCqRef(CqRef ref, Token token, uint32_t reservedBytes) {
+    DutyTarget t;
+    t.cqRef         = ref;
+    t.reservedBytes = reservedBytes;
+    Completion c;
+    c.token = token;
+    c.op    = OpKind::Ping;
+    deliver_(t, c, {});
+}
+
+void Client::deliver_(const DutyTarget& t, Completion c, std::span<const uint8_t> payload,
+                      detail::CompletionRing::Overflow ov) {
+    if (t.handler.fn != nullptr) {
+        if (closing_) {
+            // close(): after every queue is handed back (see closeImpl_).
+            closeDeferred_.push_back(DeferredHandler{t.handler, c, {payload.begin(), payload.end()}});
+            return;
+        }
+        c.payloadLen = static_cast<uint32_t>(payload.size());
+        t.handler(c, payload);  // noexcept by type
+        return;
+    }
+    c.reservedBytes = t.reservedBytes;
+    const uint32_t idx = cqRefIndex(t.cqRef);
+    if (t.cqRef != kNoCqRef && idx < cqSlots_.size() && cqSlots_[idx].ring != nullptr &&
+        cqSlots_[idx].gen == cqRefGen(t.cqRef)) {
+        (void)cqSlots_[idx].ring->deliver(c, payload, ov);
+    } else {
+        ++staleCqDrops_;  // released slot (quarantined, never reused yet): dropped
+    }
+    if (t.counted && idx < cqSlots_.size()) {  // I3: this op no longer pins its slot
+        CqSlot& slot = cqSlots_[idx];
+        --slot.targets;
+        maybeRecycleCqSlot_(idx);
+    }
+}
+
+void Client::deliverTrampoline_(void* ctx, const detail::OpTarget& t, const Completion& c,
+                                std::span<const uint8_t> payload) noexcept {
+    static_cast<Client*>(ctx)->deliver_(t, c, payload);
+}
+
+void Client::pinCommandTarget_(detail::HubCommand& cmd) noexcept {
+    detail::OpTarget t = detail::decodeTarget(cmd);
+    pinCqSlot_(t);
+    detail::encodeTarget(t, cmd);
 }
 
 // ---------------------------------------------------------------------------
-// ping() — app thread
+// F8c C4/C5: token ops issued through handles (commitSync, txn ops)
 // ---------------------------------------------------------------------------
 
-std::future<Bytes> Client::ping(Bytes payload) {
-    std::promise<Bytes> prom;
-    auto fut = prom.get_future();
+OpResult Client::targetedOpTrampoline_(void* ctx, detail::HubCommand& cmd, const CompletionTarget& target,
+                                       Token token, OpKind op) {
+    return static_cast<Client*>(ctx)->issueTargeted_(cmd, target, token, op);
+}
 
-    // Require an established session (Milestone-A: reject, do not queue).
-    // FIX F3: read (state, sessionId) as ONE coherent atomic snapshot so the
-    // sessionId we stamp on the Ping always belongs to the same session epoch
-    // as the observed Connected state (two independent loads could tear across
-    // a resume and stamp a stale sessionId).
-    const auto snap    = agent_.stateAndSessionId();
-    const auto st      = snap.state;
-    const auto sessId  = snap.sessionId;
+OpResult Client::issueTargeted_(detail::HubCommand& cmd, const CompletionTarget& target, Token token, OpKind op,
+                                bool viaRing) {
+    if (token > kMaxToken) return OpResult::InvalidArgument;
+    if (target.cq == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) return OpResult::WrongThread;
 
-    if (st != session::SessionState::Connected) {
-        prom.set_exception(std::make_exception_ptr(
-            std::runtime_error("ping(): not connected (state != Connected)")));
-        return fut;
+    detail::OpTarget t;
+    Completions* q = target.cq;
+    if (q != nullptr) {
+        if (q->client_ != this) return OpResult::InvalidArgument;
+        if (!q->onOwnerThread()) return OpResult::WrongThread;
+        const uint32_t r  = q->reservationFor(op);
+        const OpResult rr = q->reserve(r);
+        if (rr != OpResult::Accepted) return rr;
+        t.reservedBytes = r;
+        t.cqRef         = q->cqRef_;
+    } else {
+        t.handler = target.handler;
     }
+    cmd.a = static_cast<int64_t>(token);
+    detail::encodeTarget(t, cmd);
+    auto unreserve = [&] { if (q != nullptr) q->unreserve(t.reservedBytes); };
 
-    // Allocate a fresh correlationId.
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-
-    // Encode the Ping frame into a scratch buffer.
-    // Max frame size: header(24) + varLen(2) + payload <= 24+2+payload.size().
-    // Use an on-stack buffer for typical payloads; heap for large ones.
-    const std::size_t neededCap =
-        26u + payload.size() + 32u; // 32 bytes headroom
-    std::vector<uint8_t> scratch(neededCap);
-
-    // Build string_view over payload bytes (binary-safe — std::string_view
-    // does not require NUL termination; Codec's encodePing also uses
-    // string_view, so NUL bytes are preserved).
-    const std::string_view echoView(
-        reinterpret_cast<const char*>(payload.data()), payload.size());
-
-    const std::size_t frameLen = codec::encodePing(
-        scratch.data(), scratch.size(),
-        echoView,
-        sessId,
-        corrId);
-
-    if (frameLen == 0) {
-        prom.set_exception(std::make_exception_ptr(
-            std::runtime_error("ping(): failed to encode Ping frame")));
-        return fut;
+    if (agent_.commandRingClosed()) {
+        unreserve();
+        return OpResult::Closed;
     }
-
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(cfg_.pingTimeoutMs);
-
-    // Insert into pending map BEFORE submitting (prevents a race where the
-    // Pong arrives before we insert the promise).
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        pendingPings_.emplace(corrId,
-            PendingPing{std::move(prom), deadline});
+    // The duty thread itself (the Invoker owner — in or outside a cycle — or
+    // a Thread-mode runner callback): the state is ours, apply now (the
+    // command is pinned and owned before this returns; nothing is queued).
+    if (onDuty && !viaRing) {
+        applyHubCommandDirect_(cmd);
+        return OpResult::Accepted;
     }
-
-    // Submit the encoded frame to the agent ring.
-    if (!agent_.submitSend(scratch.data(), frameLen)) {
-        // Ring full — remove and fail the promise.
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = pendingPings_.find(corrId);
-        if (it != pendingPings_.end()) {
-            try {
-                it->second.promise.set_exception(
-                    submitError_("ping()", frameLen));
-            } catch (...) {}
-            pendingPings_.erase(it);
-        }
+    // fix5 test seam: close() racing this submit (the ring linearizes it).
+    if (testBeforeRegistrationSubmitHook_) [[unlikely]] testBeforeRegistrationSubmitHook_();
+    switch (agent_.submitHubCommand(cmd)) {
+    case agent::ClientAgent::Submit::Accepted:
+        // I3': the queue's ring fence — the op lies before this tail.
+        if (q != nullptr) q->issueFence_ = agent_.commandRingTail();
+        return OpResult::Accepted;
+    case agent::ClientAgent::Submit::Full:
+        unreserve();
+        return OpResult::BackPressured;
+    case agent::ClientAgent::Submit::Closed:
+        break;
     }
+    unreserve();
+    return OpResult::Closed;
+}
 
-    return fut;
+Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
+                                      detail::AndWaitIssue issue, void* issueCtx, std::string* text) {
+    auto* self = static_cast<Client*>(ctx);
+    Completion out;
+    self->andWait_(what, timeout, 0,
+                   [&](Completions& q, Token t) { return issue(issueCtx, CompletionTarget(q), t); },
+                   [&](const Completion& c, std::span<const uint8_t> p) {
+                       out = c;
+                       if (text != nullptr) text->assign(reinterpret_cast<const char*>(p.data()), p.size());
+                   });
+    return out;
 }
 
 // ---------------------------------------------------------------------------
-// defineTopic() — app thread (Task 10)
+// F8c C3: control ops — app-thread issue path
 // ---------------------------------------------------------------------------
 
-std::future<DefineTopicResult> Client::defineTopic(std::string              name,
-                                                    uint32_t                 partitions,
-                                                    std::string              keyField,
-                                                    bool                     validate,
-                                                    std::span<const uint8_t> descriptorBlob)
-{
+OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
+                               std::span<const uint8_t> frame, uint32_t payloadHint) {
+    if (token > kMaxToken) return OpResult::InvalidArgument;
+    if (target.cq == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
+    if (frame.size() > agent_.maxFrameLength()) return OpResult::InvalidArgument;
+    // Liveness: a record the command ring can never carry is not "full" (a
+    // retry would loop forever) — it is rejected here, synchronously.
+    if (sizeof(ControlOpHeader) + frame.size() > agent_.commandMsgLimit()) return OpResult::InvalidArgument;
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) return OpResult::WrongThread;
+
+    ControlOpHeader h;
+    h.token = token;
+    h.op    = op;
+    Completions* q = target.cq;
+    if (q != nullptr) {
+        if (q->client_ != this) return OpResult::InvalidArgument;
+        if (!q->onOwnerThread()) return OpResult::WrongThread;
+        const uint32_t r  = q->reservationFor(op, payloadHint);
+        const OpResult rr = q->reserve(r);
+        if (rr != OpResult::Accepted) return rr;
+        h.reservedBytes = r;
+        h.cqRef         = q->cqRef_;
+    } else {
+        h.handler = target.handler;
+    }
+    auto unreserve = [&] { if (q != nullptr) q->unreserve(h.reservedBytes); };
+
+    // Inside a duty cycle (a callback on the duty thread): the state is ours —
+    // apply now.  Everywhere else (an app thread, the Invoker owner between
+    // doWork() calls) it is a command, processed in ring order by the duty
+    // thread's next drain.
+    if (onDuty && inDutyCycle_) {
+        if (agent_.commandRingClosed()) {
+            unreserve();
+            return OpResult::Closed;
+        }
+        applyControlOp_(h, frame);
+        return OpResult::Accepted;
+    }
+    switch (agent_.submitControlOp(&h, sizeof h, frame)) {
+    case agent::ClientAgent::Submit::Accepted:
+        // I3': the queue's ring fence — every op of it lies before this tail.
+        if (q != nullptr) q->issueFence_ = agent_.commandRingTail();
+        return OpResult::Accepted;
+    case agent::ClientAgent::Submit::Full:     unreserve(); return OpResult::BackPressured;
+    case agent::ClientAgent::Submit::Closed:   break;
+    }
+    unreserve();
+    return OpResult::Closed;
+}
+
+OpResult Client::connect(CompletionTarget target, Token token) {
+    return issueControl_(OpKind::Connect, target, token, {}, 0);
+}
+
+OpResult Client::ping(std::span<const uint8_t> payload, CompletionTarget target, Token token) {
+    // Encoded here (pure); the duty thread stamps sessionId + correlationId.
+    std::array<uint8_t, 512> small{};
+    std::vector<uint8_t>     big;
+    uint8_t*                 buf = small.data();
+    const std::size_t        cap = 26u + payload.size() + 32u;
+    if (cap > small.size()) {
+        big.resize(cap);
+        buf = big.data();
+    }
+    const std::string_view echo(reinterpret_cast<const char*>(payload.data()), payload.size());
+    const std::size_t n = codec::encodePing(buf, cap, echo, /*sessionId=*/0, /*corrId=*/0);
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::Ping, target, token, std::span<const uint8_t>(buf, n),
+                         static_cast<uint32_t>(payload.size()));
+}
+
+OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
+                             bool validate, std::span<const uint8_t> descriptorBlob,
+                             CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
-
-    std::promise<DefineTopicResult> prom;
-    auto fut = prom.get_future();
-
-    // Require an established session (mirror ping() semantics).
-    const auto snap   = agent_.stateAndSessionId();
-    const auto st     = snap.state;
-    const auto sessId = snap.sessionId;
-
-    if (st != session::SessionState::Connected) {
-        prom.set_exception(std::make_exception_ptr(
-            std::runtime_error("defineTopic(): not connected (state != Connected)")));
-        return fut;
-    }
-
-    // Allocate a fresh correlationId.
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-
-    // Encode the DefineTopic request.
     rpc::DefineTopic msg;
-    msg.sessionId      = sessId;
-    msg.correlationId  = corrId;
+    msg.sessionId      = 0;
+    msg.correlationId  = 0;
     msg.topicName      = name;
     msg.partitionCount = partitions;
     msg.keyField       = keyField;
     msg.validate       = validate;
     msg.descriptorBlob = descriptorBlob.data();
     msg.descriptorLen  = static_cast<uint32_t>(descriptorBlob.size());
-
-    const std::size_t neededCap = msg.encodedSize() + 32u; // 32 bytes headroom
-    std::vector<uint8_t> scratch(neededCap);
-    const std::size_t frameLen = msg.encode(scratch.data());
-
-    if (frameLen == 0) {
-        prom.set_exception(std::make_exception_ptr(
-            std::runtime_error("defineTopic(): failed to encode DefineTopic frame")));
-        return fut;
-    }
-
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(cfg_.pingTimeoutMs);
-
-    // Insert into pending map BEFORE submitting (prevents a race where the
-    // response arrives before we insert the promise — mirrors ping()).
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        pendingDefine_.emplace(corrId,
-            PendingDefine{std::move(prom), deadline, name});
-    }
-
-    // Submit the encoded frame to the agent ring.
-    if (!agent_.submitSend(scratch.data(), frameLen)) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = pendingDefine_.find(corrId);
-        if (it != pendingDefine_.end()) {
-            try {
-                it->second.promise.set_exception(
-                    submitError_("defineTopic()", frameLen));
-            } catch (...) {}
-            pendingDefine_.erase(it);
-        }
-    }
-
-    return fut;
+    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::DefineTopic, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
-// ---------------------------------------------------------------------------
-// getTopicSchema() — app thread (Task 10)
-// ---------------------------------------------------------------------------
-
-std::future<TopicSchemaResult> Client::getTopicSchema(std::string name)
-{
+OpResult Client::getTopicSchema(std::string_view name, CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
-
-    std::promise<TopicSchemaResult> prom;
-    auto fut = prom.get_future();
-
-    // Require an established session.
-    const auto snap   = agent_.stateAndSessionId();
-    const auto st     = snap.state;
-    const auto sessId = snap.sessionId;
-
-    if (st != session::SessionState::Connected) {
-        prom.set_exception(std::make_exception_ptr(
-            std::runtime_error("getTopicSchema(): not connected (state != Connected)")));
-        return fut;
-    }
-
-    // Allocate a fresh correlationId.
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-
-    // Encode the GetTopicSchema request.
     rpc::GetTopicSchema msg;
-    msg.sessionId     = sessId;
-    msg.correlationId = corrId;
+    msg.sessionId     = 0;
+    msg.correlationId = 0;
     msg.topicName     = name;
+    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::GetTopicSchema, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
 
-    const std::size_t neededCap = msg.encodedSize() + 32u;
-    std::vector<uint8_t> scratch(neededCap);
-    const std::size_t frameLen = msg.encode(scratch.data());
+OpResult Client::listTopics(CompletionTarget target, Token token) {
+    return issueControl_(OpKind::ListTopics, target, token, {}, 0);
+}
 
-    if (frameLen == 0) {
-        prom.set_exception(std::make_exception_ptr(
-            std::runtime_error("getTopicSchema(): failed to encode GetTopicSchema frame")));
-        return fut;
+std::vector<std::pair<std::string, int32_t>> Client::decodeTopicList(std::span<const uint8_t> p) {
+    std::vector<std::pair<std::string, int32_t>> out;
+    std::size_t at = 0;
+    auto need = [&](std::size_t n) { return at + n <= p.size(); };
+    if (!need(4)) return out;
+    uint32_t count = 0;
+    std::memcpy(&count, p.data(), 4);
+    at = 4;
+    for (uint32_t i = 0; i < count && need(6); ++i) {
+        int32_t  id  = 0;
+        uint16_t len = 0;
+        std::memcpy(&id, p.data() + at, 4);
+        std::memcpy(&len, p.data() + at + 4, 2);
+        at += 6;
+        if (!need(len)) break;
+        out.emplace_back(std::string(reinterpret_cast<const char*>(p.data() + at), len), id);
+        at += len;
     }
-
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(cfg_.pingTimeoutMs);
-
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        pendingGet_.emplace(corrId,
-            PendingGet{std::move(prom), deadline});
-    }
-
-    if (!agent_.submitSend(scratch.data(), frameLen)) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        auto it = pendingGet_.find(corrId);
-        if (it != pendingGet_.end()) {
-            try {
-                it->second.promise.set_exception(
-                    submitError_("getTopicSchema()", frameLen));
-            } catch (...) {}
-            pendingGet_.erase(it);
-        }
-    }
-
-    return fut;
+    return out;
 }
 
 // ---------------------------------------------------------------------------
-// listTopics() — app thread (Task 9 CLI)
+// F8c C3: control ops — duty side (pending table, completion, timeouts)
 // ---------------------------------------------------------------------------
 
-std::vector<std::pair<std::string, int32_t>> Client::listTopics()
-{
-    std::lock_guard<std::mutex> lk(mtx_);
-    return knownTopics_;
+void Client::applyControlOpRecord_(const uint8_t* rec, std::size_t len) {
+    if (len < sizeof(ControlOpHeader)) return;
+    ControlOpHeader h;
+    std::memcpy(&h, rec, sizeof h);
+    applyControlOp_(h, std::span<const uint8_t>(rec + sizeof h, len - sizeof h));
+}
+
+void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> frame) {
+    PendingCtl p;
+    p.token                = h.token;
+    p.op                   = h.op;
+    p.target.handler       = h.handler;
+    p.target.reservedBytes = h.reservedBytes;
+    p.target.cqRef         = h.cqRef;
+    pinCqSlot_(p.target);  // I3: the slot stays out of reuse until this op completes
+    if (closing_) {  // close()'s final drain: an accepted op completes exactly once
+        completeCtl_(p, OpStatus::Closed);
+        return;
+    }
+    auto& machine = agent_.seedSession().machine;
+    const int64_t nowNs = now();
+
+    if (h.op == OpKind::Connect) {
+        if (hasPendingConnect_) {  // the older one is superseded (exactly once)
+            PendingCtl old = std::move(pendingConnect_);
+            hasPendingConnect_ = false;
+            completeCtl_(old, OpStatus::Superseded);
+        }
+        if (machine.state() == session::SessionState::Connected) {
+            completeCtl_(p, OpStatus::Ok, machine.sessionId());
+            return;
+        }
+        p.deadlineNs = nowNs + cfg_.connectTimeoutMs * 1'000'000LL;
+        pendingConnect_    = std::move(p);
+        hasPendingConnect_ = true;
+        machine.connect(nowNs);
+        return;
+    }
+    if (h.op == OpKind::ListTopics) {
+        ctlScratch_.assign(4, 0);
+        const auto count = static_cast<uint32_t>(knownTopics_.size());
+        std::memcpy(ctlScratch_.data(), &count, 4);
+        for (const auto& [name, id] : knownTopics_) {
+            const auto len = static_cast<uint16_t>(std::min<std::size_t>(name.size(), 0xFFFF));
+            uint8_t rec[6];
+            std::memcpy(rec, &id, 4);
+            std::memcpy(rec + 4, &len, 2);
+            ctlScratch_.insert(ctlScratch_.end(), rec, rec + 6);
+            ctlScratch_.insert(ctlScratch_.end(), name.begin(), name.begin() + len);
+        }
+        completeCtl_(p, OpStatus::Ok, count, 0, 0, std::span<const uint8_t>(ctlScratch_),
+                     detail::CompletionRing::Overflow::TooLarge);
+        return;
+    }
+
+    // Ping / DefineTopic / GetTopicSchema: decided HERE, on the duty thread.
+    if (machine.state() != session::SessionState::Connected) {
+        completeCtl_(p, OpStatus::NotConnected);
+        return;
+    }
+    if (frame.size() < rune::protocol::client::MessageHeader::ENCODED_SIZE) {
+        completeCtl_(p, OpStatus::NotConnected);
+        return;
+    }
+    namespace rpc = rune::protocol::client;
+    p.corrId     = nextCorrId_++;
+    p.deadlineNs = nowNs + cfg_.pingTimeoutMs * 1'000'000LL;
+    if (h.op == OpKind::DefineTopic) {
+        if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) p.topicName = std::string(d->topicName);
+    }
+    ctlScratch_.assign(frame.begin(), frame.end());
+    rpc::detail::putLE64(ctlScratch_.data(), 8, machine.sessionId());
+    rpc::detail::putLE64(ctlScratch_.data(), 16, p.corrId);
+    switch (agent_.offerDefault(ctlScratch_.data(), ctlScratch_.size())) {
+    case transport::AeronTransport::OfferResult::Accepted:
+        break;
+    case transport::AeronTransport::OfferResult::Retry:  // re-offered every duty cycle, in order
+        p.unsentFrame = ctlScratch_;
+        ++unsentCtl_;
+        break;
+    case transport::AeronTransport::OfferResult::Fatal:  // the transport can never carry it
+        completeCtl_(p, OpStatus::NotConnected);
+        return;
+    }
+    pendingCtl_.push_back(std::move(p));
+}
+
+void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux, uint16_t errorCode,
+                          std::span<const uint8_t> payload, detail::CompletionRing::Overflow ov) {
+    Completion c;
+    c.token     = p.token;
+    c.value     = value;
+    c.aux       = aux;
+    c.op        = p.op;
+    c.status    = st;
+    c.errorCode = errorCode;
+    deliver_(p.target, c, payload, ov);
+}
+
+Client::PendingCtl Client::takeCtl_(std::size_t i) {
+    // Ordered erase (m3): unsent frames keep their order; the table is small.
+    PendingCtl p = std::move(pendingCtl_[i]);
+    pendingCtl_.erase(pendingCtl_.begin() + static_cast<std::ptrdiff_t>(i));
+    if (!p.unsentFrame.empty()) --unsentCtl_;
+    return p;
+}
+
+std::size_t Client::findCtl_(int64_t corrId) const noexcept {
+    for (std::size_t i = 0; i < pendingCtl_.size(); ++i) {
+        if (pendingCtl_[i].corrId == corrId) return i;
+    }
+    return pendingCtl_.size();
+}
+
+void Client::completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text) {
+    if (!hasPendingConnect_) return;
+    PendingCtl p = std::move(pendingConnect_);
+    hasPendingConnect_ = false;
+    completeCtl_(p, st, value, 0, errorCode,
+                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
+}
+
+int Client::retryUnsentControl_() {
+    const auto& m = agent_.seedSession().machine;
+    int work = 0;
+    for (std::size_t i = 0; i < pendingCtl_.size() && unsentCtl_ != 0;) {
+        PendingCtl& p = pendingCtl_[i];
+        if (p.unsentFrame.empty()) { ++i; continue; }
+        const int64_t frameSid = rune::protocol::client::detail::getLE64(p.unsentFrame.data(), 8);
+        if (m.state() != session::SessionState::Connected || frameSid != m.sessionId()) {
+            PendingCtl dead = takeCtl_(i);  // its session is gone: no answer possible
+            completeCtl_(dead, OpStatus::SessionLost);
+            ++work;
+            continue;
+        }
+        switch (agent_.offerDefault(p.unsentFrame.data(), p.unsentFrame.size())) {
+        case transport::AeronTransport::OfferResult::Accepted:
+            p.unsentFrame.clear();
+            p.unsentFrame.shrink_to_fit();
+            --unsentCtl_;
+            ++work;
+            ++i;
+            break;
+        case transport::AeronTransport::OfferResult::Retry:
+            return work;  // still refused: keep the order, retry next cycle
+        case transport::AeronTransport::OfferResult::Fatal: {
+            PendingCtl dead = takeCtl_(i);
+            completeCtl_(dead, OpStatus::NotConnected);
+            ++work;
+            break;
+        }
+        }
+    }
+    return work;
+}
+
+void Client::sweepControl_(int64_t nowNs) {
+    if (hasPendingConnect_ && nowNs >= pendingConnect_.deadlineNs) {
+        completeConnect_(OpStatus::Timeout, 0, 0, {});
+        if (cbError_) {
+            invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
+        }
+    }
+    for (std::size_t i = 0; i < pendingCtl_.size();) {
+        if (nowNs >= pendingCtl_[i].deadlineNs) {
+            PendingCtl p = takeCtl_(i);  // removed first: the delivery may issue a new op
+            completeCtl_(p, OpStatus::Timeout);
+        } else {
+            ++i;
+        }
+    }
+}
+
+void Client::failAllControl_(OpStatus st) {
+    if (hasPendingConnect_) completeConnect_(st, 0, 0, {});
+    while (!pendingCtl_.empty()) {
+        PendingCtl p = takeCtl_(pendingCtl_.size() - 1);
+        completeCtl_(p, st);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F8c C3: *AndWait — cold-path blocking conveniences (pump-until-done)
+// ---------------------------------------------------------------------------
+
+void Client::throwForStatus_(const char* what, const Completion& c, std::span<const uint8_t> payload) const {
+    std::string msg(what);
+    switch (c.status) {
+    case OpStatus::Ok:             return;
+    case OpStatus::Timeout:        msg += ": timed out"; break;
+    case OpStatus::Closed:         msg += ": client closed"; break;
+    case OpStatus::NotConnected:   msg += ": not connected (state != Connected)"; break;
+    case OpStatus::SessionLost:    msg += ": session lost before the answer"; break;
+    case OpStatus::Superseded:     msg += ": superseded by a newer call"; break;
+    case OpStatus::ResultTooLarge: msg += ": result too large (" + std::to_string(c.value) + " bytes)"; break;
+    case OpStatus::BrokerError:
+        msg += ": broker error code " + std::to_string(c.errorCode);
+        if (!payload.empty()) msg += ": " + std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
+        break;
+    default:                       msg += ": failed (status " + std::to_string(static_cast<int>(c.status)) + ")"; break;
+    }
+    throw std::runtime_error(msg);
+}
+
+template <class Issue, class OnDone>
+void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
+                      Issue&& issue, OnDone&& onDone) {
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker) {
+        if (!onDuty) throw std::logic_error(std::string(what) + ": Invoker mode — call from the owner thread");
+        if (inDutyCycle_) {
+            throw std::logic_error(std::string(what) +
+                                   ": called from a duty-cycle callback (it could never complete) — "
+                                   "use the token form");
+        }
+    } else if (onDuty) {
+        throw std::logic_error(std::string(what) +
+                               ": called on the runner thread (a callback would wait for itself) — "
+                               "use the token form");
+    }
+    CompletionsConfig qc;
+    qc.maxResultBytes = std::max<uint32_t>(maxResultBytes, qc.maxErrorText);
+    uint32_t cap = 1u << 16;
+    while (cap / 8 < qc.maxResultBytes + 64u) cap <<= 1;
+    qc.capacityBytes = cap;
+    Completions q(*this, qc);
+
+    // A distinct token per call (m6): a completion for an earlier call can
+    // never be taken for this one's answer.
+    tWaitToken = (tWaitToken % kMaxToken) + 1;
+    const Token kToken = tWaitToken;
+    // n1: ONE budget for issue + wait.
+    const auto issueDeadline = std::chrono::steady_clock::now() + timeout;
+    aeron::concurrent::BackoffIdleStrategy backoff(
+        10, 20, std::chrono::duration<long, std::nano>(1'000),
+        std::chrono::duration<long, std::nano>(100'000));
+    for (;;) {
+        const OpResult r = issue(q, kToken);
+        if (r == OpResult::Accepted) break;
+        if (r == OpResult::BackPressured) {  // the command ring is full: let the duty thread drain
+            if (std::chrono::steady_clock::now() >= issueDeadline) {
+                throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
+            }
+            if (cfg_.runnerMode == RunnerMode::Invoker) (void)doWork(); else backoff.idle(0);
+            continue;
+        }
+        if (r == OpResult::Closed) throw std::runtime_error(std::string(what) + ": client closed");
+        throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
+                                 std::to_string(static_cast<int>(r)) + ")");
+    }
+    bool       ok = false;
+    auto done = [&](const Completion& c, std::span<const uint8_t> payload) {
+        ok = true;
+        onDone(c, payload);
+    };
+    Completions::Wait w;
+    const auto left = std::max(std::chrono::nanoseconds(0),
+                               std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   issueDeadline - std::chrono::steady_clock::now()));
+    if (cfg_.runnerMode == RunnerMode::Invoker) {
+        w = q.waitFor(kToken, left, done, [this] { return doWork(); });
+    } else {
+        w = q.waitFor(kToken, left, done);
+    }
+    if (w == Completions::Wait::TimedOut) throw std::runtime_error(std::string(what) + ": timed out waiting");
+    if (!ok) throw std::runtime_error(std::string(what) + ": client closed");
+}
+
+void Client::connectAndWait(std::chrono::nanoseconds timeout) {
+    andWait_("connect()", timeout, 0,
+             [&](Completions& q, Token t) { return connect(q, t); },
+             [&](const Completion& c, std::span<const uint8_t> payload) { throwForStatus_("connect()", c, payload); });
+}
+
+Bytes Client::pingAndWait(std::span<const uint8_t> payload, std::chrono::nanoseconds timeout) {
+    Bytes echo;
+    andWait_("ping()", timeout, static_cast<uint32_t>(payload.size()),
+             [&](Completions& q, Token t) { return ping(payload, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 throwForStatus_("ping()", c, p);
+                 echo.assign(p.begin(), p.end());
+             });
+    return echo;
+}
+
+DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t partitions,
+                                             std::string_view keyField, bool validate,
+                                             std::span<const uint8_t> descriptorBlob,
+                                             std::chrono::nanoseconds timeout) {
+    DefineTopicResult result;
+    andWait_("defineTopic()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return defineTopic(name, partitions, keyField, validate, descriptorBlob, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("defineTopic()", c, p);
+                 result.topicId   = static_cast<int32_t>(c.value);
+                 result.version   = static_cast<uint16_t>(c.aux);
+                 result.errorCode = c.errorCode;
+             });
+    return result;
+}
+
+TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, std::chrono::nanoseconds timeout) {
+    TopicSchemaResult result;
+    andWait_("getTopicSchema()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return getTopicSchema(name, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("getTopicSchema()", c, p);
+                 result.topicId   = static_cast<int32_t>(c.value);
+                 result.version   = static_cast<uint16_t>(c.aux);
+                 result.errorCode = c.errorCode;
+                 if (c.status == OpStatus::Ok) result.descriptorBlob.assign(p.begin(), p.end());
+             });
+    return result;
+}
+
+std::vector<std::pair<std::string, int32_t>> Client::listTopics(std::chrono::nanoseconds timeout) {
+    std::vector<std::pair<std::string, int32_t>> out;
+    andWait_("listTopics()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return listTopics(q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 throwForStatus_("listTopics()", c, p);
+                 out = decodeTopicList(p);
+             });
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -676,10 +1444,10 @@ int Client::doWork() {
         throw std::logic_error("Client::doWork(): call from the owner (constructing) thread");
     }
     if (inDutyCycle_) return 0;  // re-entered from a callback: never nest the duty cycle
-    // fix2 minor: a no-op after close() (mirrors ClientAgent::doWork's own
-    // stopped_ guard) — belt-and-suspenders against a stray post-close call
-    // (e.g. from an app loop that has not yet noticed close() happened).
-    if (stopped_.load(std::memory_order_seq_cst)) return 0;
+    // fix2 minor: a no-op after close() — belt-and-suspenders against a stray
+    // post-close call (e.g. from an app loop that has not yet noticed close()
+    // happened).  F8c: "closed" is the command ring's closed bit.
+    if (agent_.commandRingClosed()) return 0;
     return dutyCycle(now());
 }
 
@@ -695,6 +1463,8 @@ int Client::dutyCycle(int64_t nowNs) {
     // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
     //    ProduceResponses are decoded and buffered, not dispatched through hooks.
     int work = agent_.doWork(nowNs);
+    // I3': owner releases fenced on the command ring apply once the drain passed them.
+    if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);
 
     // 2. ProduceResponses → hub with plain calls (O(1) ordinal routing).
     work += routeBufferedAcks_();
@@ -720,6 +1490,9 @@ int Client::dutyCycle(int64_t nowNs) {
         }
     }
 
+    // 3b'. F8c C3: control frames the transport refused (Retry), in order.
+    if (unsentCtl_ != 0) [[unlikely]] work += retryUnsentControl_();
+
     // 3c. F8a fix2/fix3/fix4 (IM-2, I2, M5): session state is LEVEL-triggered
     //     for commitSync — it fails on leaving a connected (state, sessionId,
     //     episode) (syncSeedSession_, also run at the transition itself by
@@ -737,6 +1510,16 @@ int Client::dutyCycle(int64_t nowNs) {
         sweepTimeouts(nowNs);
         nextSweepNs_ = nowNs + kSweepIntervalMs * 1'000'000LL;
     }
+
+    // 5. F8c C7: Client::close()'s drain, then handle releases — at the very
+    //    end of the cycle, outside every hub walk (a released impl is freed
+    //    only once nothing references it: never under a running handler).
+    if (!drainWaiters_.empty()) [[unlikely]] work += checkDrain_();
+    // F8c C7 fix round 2 (F1): orphaned releases (one acquire load per cycle
+    // when none exists), applied in FIFO order behind the handle's own ops.
+    if (agent_.takeOrphanHint()) [[unlikely]] scanOrphans_();
+    if (!orphans_.empty()) [[unlikely]] work += applyDueOrphans_();
+    if (!releases_.empty()) [[unlikely]] work += reapReleases_();
     return work;
 }
 
@@ -748,7 +1531,16 @@ void Client::syncSeedSession_() noexcept {
     // never while Connected: it identifies the connect episode, so a resume
     // that gets the SAME sessionId back is still a transition.
     const int64_t episode = m.correlationId();
-    if (st == lastSeedState_ && sid == lastSeedSessionId_ && episode == lastSeedEpisode_) [[likely]] return;
+    if (st == lastSeedState_ && sid == lastSeedSessionId_ && episode == lastSeedEpisode_) [[likely]] {
+        // F8c C3: an app-side status the ring refused (owner not draining) is
+        // retried until it fits — the newest value always wins.
+        if (seedStatusDirty_) [[unlikely]] publishSeedStatus_(st, sid);
+        return;
+    }
+    // F8c C3: app threads (Client::state()) see the transition BEFORE any
+    // completion or callback this transition triggers (ring order on this
+    // thread: status first).
+    if (st != lastSeedState_ || sid != lastSeedSessionId_) publishSeedStatus_(st, sid);
     const bool connected = st == session::SessionState::Connected;
     groupConsumerHub_.setSessionConnected(connected, sid, episode);
     subscriberHub_.setSessionConnected(connected);
@@ -768,7 +1560,7 @@ int Client::routeBufferedAcks_() {
 int Client::producerDuty_(int64_t nowNs) {
     const int64_t sessionId = agent_.seedSession().machine.sessionId();
     int work = producerHub_.drainAndFlush(nowNs, sessionId, agent::AgentProduceSink{&agent_});
-    for (auto& tp : txnProducers_) work += tp->doWork(sessionId, txnSendFn_);
+    for (auto& tp : txnProducers_) work += tp->doWork(nowNs, sessionId, txnSendFn_);
     return work;
 }
 
@@ -777,6 +1569,7 @@ int Client::producerDuty_(int64_t nowNs) {
 // ---------------------------------------------------------------------------
 
 void Client::runLoop() {
+    agent_.bindDutyThread();  // F8c C0: the runner is now the single pumper
     if (cfg_.runnerCore >= 0 && !detail::pinCurrentThreadToCore(cfg_.runnerCore)) {
         std::fprintf(stderr, "rune-client: could not pin the runner to core %d\n", cfg_.runnerCore);
     }
@@ -786,10 +1579,10 @@ void Client::runLoop() {
         aeron::concurrent::BackoffIdleStrategy idle(
             5, 3, std::chrono::duration<long, std::nano>(1'000),
             std::chrono::duration<long, std::nano>(100'000));
-        while (!stopped_.load(std::memory_order_acquire)) idle.idle(dutyCycle(now()));
+        while (!agent_.commandRingClosed()) idle.idle(dutyCycle(now()));
     } else if (cfg_.idleMode == IdleMode::BusySpin) {
         // Never park or yield: pin this runner to a dedicated core.
-        while (!stopped_.load(std::memory_order_acquire)) {
+        while (!agent_.commandRingClosed()) {
             if (dutyCycle(now()) == 0) {
 #if defined(__x86_64__) || defined(__i386__)
                 __asm__ volatile("pause" ::: "memory");
@@ -804,7 +1597,7 @@ void Client::runLoop() {
         // Balanced: spins -> yields -> parks (max 1 ms).
         aeron::concurrent::BackoffIdleStrategy idle(
             10, 20, std::chrono::duration<long, std::nano>(1'000), std::chrono::milliseconds(1));
-        while (!stopped_.load(std::memory_order_acquire)) idle.idle(dutyCycle(now()));
+        while (!agent_.commandRingClosed()) idle.idle(dutyCycle(now()));
     }
 }
 
@@ -813,8 +1606,9 @@ void Client::runLoop() {
 // ---------------------------------------------------------------------------
 
 void Client::sweepTimeouts(int64_t nowNs) {
-    // Connect/ping/subscribe/define/get promise deadlines are created on app
-    // threads with steady_clock, so they keep their own steady_clock sample.
+    // Subscribe deadlines are created on app threads with steady_clock, so
+    // they keep their own steady_clock sample (control-op deadlines are on the
+    // duty clock: sweepControl_ below).
     const auto now = std::chrono::steady_clock::now();
 
     // --- Producer delivery timeouts (duty-cycle thread; no lock — ack rings are single-owner) ---
@@ -853,6 +1647,8 @@ void Client::sweepTimeouts(int64_t nowNs) {
             return agent_.submitSend(fb, fl);
         };
         groupConsumerHub_.doWork(wallNs, snap.sessionId, sendFn);
+        // F8c C4: commitSync deadlines on the duty clock -> Timeout.
+        (void)groupConsumerHub_.sweepCommitSyncTimeouts(nowNs);
     }
 
     // --- MD1 IMPORTANT-3: fire an armed background metadata refresh if due ------
@@ -871,7 +1667,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
         const auto snap = agent_.stateAndSessionId();
         if (snap.state == session::SessionState::Disconnected) {
             redirectPending() = false;
-            producerHub_.failAll("Redirect reconnect failed: endpoint unreachable");
+            producerHub_.failAll(OpStatus::SessionLost);  // redirect reconnect failed: no answer possible
             subscriberHub_.failPendingSubscribes(
                 "Redirect reconnect failed: endpoint unreachable");
             if (cbError_) {
@@ -882,64 +1678,8 @@ void Client::sweepTimeouts(int64_t nowNs) {
         }
     }
 
-    std::lock_guard<std::mutex> lk(mtx_);
-
-    // --- Pending connect timeout ---
-    if (pendingConnect_ && now >= pendingConnect_->deadline) {
-        try {
-            pendingConnect_->promise.set_exception(
-                std::make_exception_ptr(
-                    std::runtime_error("connect() timed out")));
-        } catch (...) {}
-        pendingConnect_.reset();
-
-        // Fire onError.
-        if (cbError_) {
-            invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
-        }
-    }
-
-    // --- Pending ping timeouts ---
-    for (auto it = pendingPings_.begin(); it != pendingPings_.end(); ) {
-        if (now >= it->second.deadline) {
-            try {
-                it->second.promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("ping() timed out (no Pong received)")));
-            } catch (...) {}
-            it = pendingPings_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    // --- Task 10: Pending defineTopic timeouts ---
-    for (auto it = pendingDefine_.begin(); it != pendingDefine_.end(); ) {
-        if (now >= it->second.deadline) {
-            try {
-                it->second.promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("defineTopic() timed out (no DefineTopicResponse received)")));
-            } catch (...) {}
-            it = pendingDefine_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    // --- Task 10: Pending getTopicSchema timeouts ---
-    for (auto it = pendingGet_.begin(); it != pendingGet_.end(); ) {
-        if (now >= it->second.deadline) {
-            try {
-                it->second.promise.set_exception(
-                    std::make_exception_ptr(
-                        std::runtime_error("getTopicSchema() timed out (no TopicSchemaResponse received)")));
-            } catch (...) {}
-            it = pendingGet_.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    // --- F8c C3: control-op deadlines on the duty clock -> Timeout ---
+    sweepControl_(nowNs);
 }
 
 // ---------------------------------------------------------------------------
@@ -966,15 +1706,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             static_cast<uint16_t>(opt->code));
 
         if (ec == rpc::ErrorCode::OK) {
-            // Resolve the pending-connect promise.
-            std::unique_ptr<PendingConnect> pc;
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                pc = std::move(pendingConnect_);
-            }
-            if (pc) {
-                try { pc->promise.set_value(); } catch (...) {}
-            }
+            // F8c C3: complete the pending connect (state() was published by
+            // syncSeedSession_ above, so a woken waiter reads Connected).
+            completeConnect_(OpStatus::Ok, opt->assignedSessionId, 0, {});
 
             // CB-5 B: if this ConnectResponse{OK} completes a redirect-triggered
             // reconnect, flush every pending redirected data op NOW, re-stamped
@@ -1039,20 +1773,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 invokeUserCallback_("onConnected", [&] { cbConnected_(opt->assignedSessionId); });
             }
         } else {
-            // Error response via ConnectResponse — fail the promise and fire onError.
-            std::unique_ptr<PendingConnect> pc;
-            {
-                std::lock_guard<std::mutex> lk(mtx_);
-                pc = std::move(pendingConnect_);
-            }
+            // Error response via ConnectResponse — fail the connect and fire onError.
             const std::string msg = "ConnectResponse error code: " +
                                     std::to_string(opt->code);
-            if (pc) {
-                try {
-                    pc->promise.set_exception(
-                        std::make_exception_ptr(std::runtime_error(msg)));
-                } catch (...) {}
-            }
+            completeConnect_(OpStatus::BrokerError, 0, static_cast<uint16_t>(opt->code), msg);
             if (cbError_) {
                 invokeUserCallback_("onError", [&] { cbError_(msg); });
             }
@@ -1251,7 +1975,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // so the subscribe side and reconnect-pending latch are clean.
                 const std::string retargetReason =
                     "Redirect retarget failed for endpoint: " + newEndpoint;
-                producerHub_.failPending(opt->correlationId, retargetReason);
+                producerHub_.failPending(opt->correlationId);  // DeliveryFailed
                 subscriberHub_.failPendingSubscribes("Redirect retarget failed");
                 redirectPending() = false;
                 if (cbError_) {
@@ -1326,53 +2050,29 @@ void Client::onEgressFrame(codec::TemplateId tid,
             msg = "ErrorResponse code: " + std::to_string(opt->code);
         }
 
-        // FIX F2: fail in-flight pings on this error IMMEDIATELY rather than
-        // letting them die by pingTimeoutMs (which loses the server error and
-        // adds full-timeout latency).  Two cases, both under a single lock so
-        // there is no double-resolve (extract-under-lock discipline):
-        //   (a) the error carries a correlationId matching a pending ping →
-        //       fail exactly that ping;
-        //   (b) the error is session-fatal (SessionExpired / UnknownSession) →
-        //       fail ALL pending pings for the (now dead) session.
+        // FIX F2 / F8c C3: complete in-flight control ops on this error
+        // IMMEDIATELY rather than letting them die by their deadline (which
+        // loses the server error and adds full-timeout latency):
+        //   (a) a pending connect always fails (BrokerError);
+        //   (b) session-fatal (SessionExpired / UnknownSession) -> SessionLost
+        //       for EVERY pending control op of the (now dead) session;
+        //   (c) otherwise the op whose correlationId matches -> BrokerError.
+        // Each entry is removed before it is delivered (exactly once).
         const bool sessionFatal =
             (ec == rpc::ErrorCode::SessionExpired ||
              ec == rpc::ErrorCode::UnknownSession);
-
-        std::unique_ptr<PendingConnect>       pc;
-        std::vector<std::promise<Bytes>>      failedPings;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-
-            // Always fail a pending connect (existing behaviour).
-            pc = std::move(pendingConnect_);
-
-            if (sessionFatal) {
-                // Fail every pending ping for this session.
-                for (auto& [corrId, pp] : pendingPings_) {
-                    failedPings.push_back(std::move(pp.promise));
-                }
-                pendingPings_.clear();
-            } else {
-                // Fail only the ping whose correlationId matches (if any).
-                auto it = pendingPings_.find(opt->correlationId);
-                if (it != pendingPings_.end()) {
-                    failedPings.push_back(std::move(it->second.promise));
-                    pendingPings_.erase(it);
-                }
+        const auto ecode = static_cast<uint16_t>(opt->code);
+        const auto text  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+        completeConnect_(OpStatus::BrokerError, 0, ecode, msg);
+        if (sessionFatal) {
+            while (!pendingCtl_.empty()) {
+                PendingCtl p = takeCtl_(pendingCtl_.size() - 1);
+                completeCtl_(p, OpStatus::SessionLost, 0, 0, ecode, text);
             }
-        }
-
-        if (pc) {
-            try {
-                pc->promise.set_exception(
-                    std::make_exception_ptr(std::runtime_error(msg)));
-            } catch (...) {}
-        }
-        for (auto& prom : failedPings) {
-            try {
-                prom.set_exception(
-                    std::make_exception_ptr(std::runtime_error(msg)));
-            } catch (...) {}
+        } else if (const std::size_t i = findCtl_(opt->correlationId); i < pendingCtl_.size()) {
+            PendingCtl p = takeCtl_(i);
+            const int64_t noTopic = (p.op == OpKind::Ping) ? 0 : -1;
+            completeCtl_(p, OpStatus::BrokerError, noTopic, 0, ecode, text);
         }
         if (cbError_) {
             invokeUserCallback_("onError", [&] { cbError_(msg); });
@@ -1385,23 +2085,14 @@ void Client::onEgressFrame(codec::TemplateId tid,
         auto opt = codec::decodePong(buf, len);
         if (!opt) break;
 
-        // Copy the echo bytes (string_view is a view into the Aeron buffer
-        // which is only valid for the duration of this callback).
-        Bytes echoBytes(opt->echo.begin(), opt->echo.end());
-
-        std::promise<Bytes> prom;
-        bool found = false;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto it = pendingPings_.find(opt->correlationId);
-            if (it != pendingPings_.end()) {
-                prom = std::move(it->second.promise);
-                pendingPings_.erase(it);
-                found = true;
-            }
-        }
-        if (found) {
-            try { prom.set_value(std::move(echoBytes)); } catch (...) {}
+        // F8c C3: the echo is written straight into the completion (the
+        // Aeron buffer view is valid for this call only; no copy here).
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::Ping) {
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, OpStatus::Ok, 0, 0, 0,
+                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(opt->echo.data()),
+                                                  opt->echo.size()));
         }
         break;
     }
@@ -1413,7 +2104,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // CB-5 A2: pass a sendFn so SubscriberHub can emit a late Unsubscribe
         // if the app called unsubscribe() before the response arrived.
         {
-            const int64_t unsubCorrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+            const int64_t unsubCorrId = nextCorrId_++;
             const auto snap = agent_.stateAndSessionId();
             subscriberHub_.onSubscribeResponse(
                 *opt,
@@ -1509,7 +2200,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
     case codec::TemplateId::ProduceResponse: {
         for (auto& tp : txnProducers_) {
-            tp->onProduceResponse(buf, len, txnControlSendFn_);
+            tp->onProduceResponse(buf, len);
         }
         break;
     }
@@ -1529,11 +2220,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
     }
 
     case codec::TemplateId::AddOffsetsToTxnResponse: {
-        if (!txnProducers_.empty()) {
-            const auto snap = agent_.stateAndSessionId();
-            for (auto& tp : txnProducers_) {
-                tp->onAddOffsetsToTxnResponse(buf, len, snap.sessionId, txnControlSendFn_);
-            }
+        for (auto& tp : txnProducers_) {
+            tp->onAddOffsetsToTxnResponse(buf, len);
         }
         break;
     }
@@ -1558,40 +2246,18 @@ void Client::onEgressFrame(codec::TemplateId tid,
         auto opt = rpc::DefineTopicResponse::decode(buf, len);
         if (!opt) break;
 
-        std::promise<DefineTopicResult> prom;
-        std::string savedName;
-        bool found = false;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto it = pendingDefine_.find(opt->correlationId);
-            if (it != pendingDefine_.end()) {
-                prom      = std::move(it->second.promise);
-                savedName = std::move(it->second.topicName);
-                pendingDefine_.erase(it);
-                found = true;
-            }
-        }
-        if (found) {
-            DefineTopicResult result;
-            result.topicId   = opt->topicId;
-            result.version   = opt->version;
-            result.errorCode = opt->errorCode;
-
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::DefineTopic) {
+            PendingCtl p = takeCtl_(i);
             // Task 9 (CLI): on success, register (name, topicId) so listTopics()
             // can enumerate topics that were applied via this client.
-            if (result.errorCode == 0 && !savedName.empty() && result.topicId >= 0) {
-                std::lock_guard<std::mutex> lk(mtx_);
-                // Avoid duplicates (idempotent re-apply would re-register).
-                bool already = false;
-                for (const auto& [n, id] : knownTopics_) {
-                    if (n == savedName) { already = true; break; }
-                }
-                if (!already) {
-                    knownTopics_.emplace_back(savedName, result.topicId);
-                }
+            if (opt->errorCode == 0 && !p.topicName.empty() && opt->topicId >= 0) {
+                const bool already = std::any_of(knownTopics_.begin(), knownTopics_.end(),
+                                                 [&](const auto& e) { return e.first == p.topicName; });
+                if (!already) knownTopics_.emplace_back(p.topicName, opt->topicId);
             }
-
-            try { prom.set_value(result); } catch (...) {}
+            completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
+                         opt->topicId, opt->version, opt->errorCode);
         }
         break;
     }
@@ -1602,30 +2268,20 @@ void Client::onEgressFrame(codec::TemplateId tid,
         auto opt = rpc::TopicSchemaResponse::decode(buf, len);
         if (!opt) break;
 
-        std::promise<TopicSchemaResult> prom;
-        bool found = false;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto it = pendingGet_.find(opt->correlationId);
-            if (it != pendingGet_.end()) {
-                prom  = std::move(it->second.promise);
-                pendingGet_.erase(it);
-                found = true;
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetTopicSchema) {
+            PendingCtl p = takeCtl_(i);
+            if (opt->errorCode == 0) {
+                // Task 11 / F8c C3: the per-topic schema cache is written HERE,
+                // on the duty thread (was an app-thread write under mtx_).
+                topicSchemaCache_.put(opt->topicId,
+                    metadata::TopicSchemaEntry{opt->version, /*validate=*/false, /*keyField=*/""});
             }
-        }
-        if (found) {
-            TopicSchemaResult result;
-            result.topicId   = opt->topicId;
-            result.version   = opt->version;
-            result.errorCode = opt->errorCode;
-            // Copy descriptorBlob out of the Aeron buffer (view is only valid
-            // for the duration of this callback — same discipline as Pong echo).
-            if (opt->descriptorBlob && opt->descriptorLen > 0) {
-                result.descriptorBlob.assign(
-                    opt->descriptorBlob,
-                    opt->descriptorBlob + opt->descriptorLen);
-            }
-            try { prom.set_value(std::move(result)); } catch (...) {}
+            const std::span<const uint8_t> blob(
+                opt->descriptorBlob, (opt->descriptorBlob != nullptr) ? opt->descriptorLen : 0u);
+            completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
+                         opt->topicId, opt->version, opt->errorCode, blob,
+                         detail::CompletionRing::Overflow::TooLarge);
         }
         break;
     }
@@ -1634,47 +2290,6 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // Unknown template — ignore (never crash).
         break;
     }
-}
-
-// ---------------------------------------------------------------------------
-// failAllPending() — fail every pending promise with the given reason
-// ---------------------------------------------------------------------------
-
-void Client::failAllPending(const std::string& reason) {
-    std::lock_guard<std::mutex> lk(mtx_);
-
-    if (pendingConnect_) {
-        try {
-            pendingConnect_->promise.set_exception(
-                std::make_exception_ptr(std::runtime_error(reason)));
-        } catch (...) {}
-        pendingConnect_.reset();
-    }
-
-    for (auto& [corrId, pp] : pendingPings_) {
-        try {
-            pp.promise.set_exception(
-                std::make_exception_ptr(std::runtime_error(reason)));
-        } catch (...) {}
-    }
-    pendingPings_.clear();
-
-    // Task 10: fail any in-flight schema ops.
-    for (auto& [corrId, pd] : pendingDefine_) {
-        try {
-            pd.promise.set_exception(
-                std::make_exception_ptr(std::runtime_error(reason)));
-        } catch (...) {}
-    }
-    pendingDefine_.clear();
-
-    for (auto& [corrId, pg] : pendingGet_) {
-        try {
-            pg.promise.set_exception(
-                std::make_exception_ptr(std::runtime_error(reason)));
-        } catch (...) {}
-    }
-    pendingGet_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,11 +2328,11 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 }
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
-    // ProducerImpl owns its own ring buffer; shares the correlationId counter.
-    auto impl = std::make_shared<producer::ProducerImpl>(
-        cfg,
-        nextCorrId_,
-        ringCap);
+    // ProducerImpl owns its own ring buffer (its batch correlation ids are
+    // self-tagged — batchcorr — so it takes no shared counter).  F8c C7: held
+    // here until the registration is accepted (then the duty side holds its
+    // share and the handle the other — spec §3.3).
+    auto impl = std::make_unique<producer::ProducerImpl>(cfg, ringCap);
 
     // fix1 C1: wire the pump hook in BOTH runner modes — a back-pressured
     // blocking send() must never wait on a ring consumer that IS the calling
@@ -1732,6 +2347,20 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
     // producer() call can run), so ProducerImpl can decide NotOwner itself
     // without ever touching `this` from a non-duty thread.
     impl->setPumpFn(&Client::pumpTrampoline_, this, dutyThreadId_);
+
+    // F8c C6/C6a: ack delivery into the completion-queue registry, the close
+    // token's generic delivery, the begin-close / closeImmediately issue path
+    // and the blocking close() — plain function pointers + `this`.
+    {
+        producer::ProducerImpl::Hooks hk;
+        hk.ctx        = this;
+        hk.cqDeliver  = &Client::producerCqDeliverTrampoline_;
+        hk.sink       = detail::CompletionSink{&Client::deliverTrampoline_, this};
+        hk.issueClose = &Client::issueProducerCloseTrampoline_;
+        hk.andWait    = &Client::andWaitTrampoline_;
+        hk.release    = &Client::hubCommandTrampoline_;  // C7: HandleRelease
+        impl->setHooks(hk);
+    }
 
     // fix1 I4: clock coherence — when an injected clock is configured, the ring's
     // heartbeat writer (the duty cycle, via dutyCycle(now())) and its reader
@@ -1757,78 +2386,491 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
     // directly (which would need an atomic snapshot + mutex), hand the ProducerImpl
     // to the runner thread via the agent command ring.  The runner drains
     // kMsgRegisterProducer and calls producerHub_.add() itself, so the list stays
-    // single-owner (no atomic, no lock).  `impl` is copied into a heap holder whose
-    // address travels the ring; the runner adopts the shared_ptr and frees the
-    // holder.  Both `impl` (returned to the caller) and the hub's entry keep the
-    // ProducerImpl alive.  Retry on a transiently full ring (off the hot path).
-    // Bounded setup-phase submit; in Invoker mode the duty cycle runs between
-    // attempts (this thread is the ring's only consumer).
-    auto* holder = new std::shared_ptr<producer::ProducerImpl>(impl);
-    submitRegistration_([&] { return agent_.submitRegisterProducer(holder); },
-                        [&] { delete holder; });
-
-    // fix3 C1 (Dekker correctness, corrected): submitRegistration_'s initial
-    // stopped_ check above can read false and then succeed in submitting the
-    // registration into the agent ring CONCURRENTLY with a close() on another
-    // thread whose own drainRegistrationsForClose() already ran and so never
-    // adopts (or closes) this producer.
-    //
-    // A plain load of stopped_ here (even seq_cst) is NOT sufficient: a load
-    // that reads `false` only tells us the exchange is not yet visible to us;
-    // it creates no happens-before edge from our ring commit (a RELEASE store
-    // to a different location) to the close side's drain.
-    //
-    // Fix (fix5 minor 3 — the precise C++ memory-model argument): a seq_cst
-    // read-modify-write, compare_exchange(false -> false). closeImpl_'s
-    // stopped_.exchange(true) is also an RMW, and all RMWs on stopped_ are
-    // totally ordered in its modification order (MO), each reading the value
-    // written by its immediate MO predecessor ([atomics.order]/10).
-    //   * CAS succeeds (reads false): the CAS precedes the exchange in MO. The
-    //     exchange therefore reads-from this CAS's write, or from a later
-    //     RMW's write — which is part of this CAS's release sequence. The CAS
-    //     is a release operation and the exchange an acquire operation, so the
-    //     CAS synchronizes-with the exchange. Our ring commit is
-    //     sequenced-before the CAS, so: commit happens-before exchange
-    //     happens-before (sequenced-before, program order in closeImpl_)
-    //     drainRegistrationsForClose(). By write-read coherence
-    //     ([intro.races]/18), the drain's acquire loads of the ring's tail
-    //     and of this record's length word cannot read values older than
-    //     those writes — the drain sees the committed registration and
-    //     adopts it.
-    //   * CAS fails (reads true): the exchange — and therefore, possibly, the
-    //     drain — already happened; this thread closes the ring itself so the
-    //     Producer returned below reports Closed instead of silently accepting
-    //     sends into a ring nobody will ever drain or mark closed.
-    bool expectedNotStopped = false;
-    if (!stopped_.compare_exchange_strong(expectedNotStopped, false, std::memory_order_seq_cst)) {
-        // fix3 M1: intentional leak, not a bug. We cannot tell from here
-        // whether drainRegistrationsForClose() already adopted (and freed)
-        // `holder` before this registration's commit became visible to it, or
-        // whether it ran too early and `holder` is still sitting unread in the
-        // ring forever. Freeing `holder` ourselves would double-free in the
-        // first case; not freeing it leaks one small heap object in the
-        // second. A leak at shutdown, racing close(), is the safe choice —
-        // UAF/double-free is not. `impl` itself is NOT leaked (the local
-        // variable is still alive and is returned below via Producer).
-        //
-        // Task 14 fix1 M5 — the related accepted edge for DIRECT producers:
-        // if close()'s drainRegistrationsForClose() stopped at an
-        // un-unblockable claim (a header-less stalled end-of-buffer wrap; see
-        // ClientAgent.cpp) while this producer's registration sat behind it
-        // AND this CAS still succeeded (close() had not started yet when we
-        // committed), the producer is never adopted, so closeAllRings() never
-        // marks it closed — and its pump hook context (`this`) dangles once the
-        // Client is destroyed. A later back-pressured blocking send() on the
-        // owner thread would then call into a destroyed Client. It needs a
-        // writer stalled for the whole close-drain cap concurrently with this
-        // call; marking every created producer closed through a Client-owned
-        // registry would remove it, but producer() runs on any thread and that
-        // registry would need a lock or atomics (forbidden), so it is accepted
-        // and documented instead, like the leak above.
-        impl->markRingClosed();
+    // single-owner (no atomic, no lock).  F8c C7: the impl's own address travels
+    // the ring (no shared_ptr holder): the hub holds the duty share, the returned
+    // handle the other; whichever lets go last frees it (§3.3).  Retry on a
+    // transiently full ring (off the hot path).  Bounded setup-phase submit; in
+    // Invoker mode the duty cycle runs between attempts (this thread is the
+    // ring's only consumer).
+    // F8c C2: the submit is linearized against close() by the command ring's
+    // closed bit (no post-submit stopped_ CAS, no indeterminate ownership):
+    //   * accepted — before the close: the duty cycle, or close()'s final
+    //     drain (which reads up to the frozen tail), adopts it; close() then
+    //     marks its ring closed with every other one and hands it back;
+    //   * refused as Closed (close() raced this call) — never written: the
+    //     producer is born closed (every send reports Closed; the handle
+    //     alone owns it).
+    // (Closed on entry still throws logic_error("client closed") from
+    // submitRegistration_, as before — the unique_ptr frees the impl.)
+    producer::ProducerImpl* raw = impl.get();
+    if (!submitRegistration_([&] { return agent_.submitRegisterProducer(raw); }, [] {})) {
+        impl->markBornClosed();
     }
+    return Producer(impl.release());
+}
 
-    return Producer(std::move(impl));
+OpResult Client::issueProducerCloseTrampoline_(void* ctx, producer::ProducerImpl& impl,
+                                              const CompletionTarget* target, Token token) {
+    return static_cast<Client*>(ctx)->issueProducerClose_(impl, target, token);
+}
+
+OpResult Client::issueProducerClose_(producer::ProducerImpl& impl, const CompletionTarget* target,
+                                     Token token) {
+    using Op = detail::HubCommand::Op;
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) return OpResult::WrongThread;
+
+    detail::HubCommand cmd;
+    cmd.handle = reinterpret_cast<uint64_t>(&impl);
+    Completions*     q = nullptr;
+    detail::OpTarget t;
+    if (target == nullptr) {
+        // closeImmediately: the intake closes now (idempotent; it may already
+        // be closed by a begin-close whose drain this aborts).
+        cmd.op = Op::ProducerCloseNow;
+        (void)impl.closeIntake();
+    } else {
+        if (token > kMaxToken) return OpResult::InvalidArgument;
+        if (target->cq == nullptr && target->handler.fn == nullptr) return OpResult::InvalidArgument;
+        q = target->cq;
+        if (q != nullptr) {
+            if (q->client_ != this) return OpResult::InvalidArgument;
+            if (!q->onOwnerThread()) return OpResult::WrongThread;
+            const uint32_t r  = q->reservationFor(OpKind::ProducerClose);
+            const OpResult rr = q->reserve(r);
+            if (rr != OpResult::Accepted) return rr;
+            t.reservedBytes = r;
+            t.cqRef         = q->cqRef_;
+        } else {
+            t.handler = target->handler;
+        }
+        // The linearization point: the intake's tail-bit CAS.  Lost = already
+        // closed (a second begin-close, closeImmediately, the failure path or
+        // Client close): no completion.
+        if (!impl.closeIntake()) {
+            if (q != nullptr) q->unreserve(t.reservedBytes);
+            return OpResult::Closed;
+        }
+        cmd.op = Op::ProducerBeginClose;
+        cmd.a  = static_cast<int64_t>(token);
+        detail::encodeTarget(t, cmd);
+    }
+    auto unreserve = [&] { if (q != nullptr) q->unreserve(t.reservedBytes); };
+    if (agent_.commandRingClosed()) {
+        // The Client is closing: its close completes every record (and the
+        // intake is closed either way).
+        unreserve();
+        return OpResult::Closed;
+    }
+    if (onDuty) {  // the Invoker owner (in or outside a cycle) / a runner callback
+        applyProducerCommand_(cmd);
+        return OpResult::Accepted;
+    }
+    // A lifecycle command: guaranteed delivery — a full ring is waited out on
+    // the runner's progress (it drains the ring), never a time bound.
+    aeron::concurrent::BackoffIdleStrategy idle(
+        10, 20, std::chrono::duration<long, std::nano>(1'000),
+        std::chrono::duration<long, std::nano>(100'000));
+    for (;;) {
+        const auto r = agent_.submitHubCommand(cmd);
+        if (r == agent::ClientAgent::Submit::Accepted) {
+            if (q != nullptr) q->issueFence_ = agent_.commandRingTail();  // I3'
+            return OpResult::Accepted;
+        }
+        if (r == agent::ClientAgent::Submit::Closed) break;
+        idle.idle(0);
+    }
+    unreserve();
+    return OpResult::Closed;
+}
+
+void Client::applyProducerCommand_(const detail::HubCommand& cmd) {
+    // The impl is alive: the issuing handle (or the hub, which adopted it
+    // through the ring ahead of this command) holds it.
+    auto* impl = reinterpret_cast<producer::ProducerImpl*>(cmd.handle);
+    if (cmd.op == detail::HubCommand::Op::ProducerBeginClose) {
+        detail::HubCommand pinned = cmd;
+        pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+        impl->applyBeginClose(detail::decodeTarget(pinned), static_cast<Token>(cmd.a), now());
+        return;
+    }
+    impl->applyCloseImmediately(OpStatus::Closed);
+}
+
+// ---------------------------------------------------------------------------
+// F8c C7: handle release (spec §3.3) — no shared_ptr, no refcount, no waits
+// ---------------------------------------------------------------------------
+//
+// Every handle impl (Producer / TransactionalProducer / Subscription /
+// GroupConsumer) is owned jointly by its handle and the duty side.  Each side
+// detaches its share of the impl's ownership word (a ring word) exactly once;
+// whichever detaches LAST frees the impl.  The duty side detaches when it
+// reaps a released impl that nothing references any more (end of a duty
+// cycle), or when Client close hands every still-held impl back.
+//
+// Known gap (review m1 — test seam only): a registration stranded behind an
+// ABANDONED close drain (an orphaned command-ring claim that unblock() cannot
+// clear — impossible in-process outside the testClaim* seams) is never adopted
+// and so never handed back: its duty share is never detached.  A handle that
+// outlives the Client then sees !dutyDetached() and its release calls the
+// release hook — i.e. it TOUCHES THE DEAD Client (use-after-free), it does not
+// merely leak.  Accepted for the crash-only shutdown path (fix5); a later fix
+// can mark such impls in their own ring word when the drain is abandoned.
+
+detail::HubSubmit Client::submitRelease_(const detail::HubCommand& cmd) {
+    // I1: this thread runs this Client's close(): it owns every duty structure
+    // (the drain, the hub teardown and the hand-back are its own work).
+    if (tClosing == this) {
+        applyRelease_(cmd, 0, /*closing=*/true);
+        return detail::HubSubmit::Accepted;
+    }
+    const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
+    if (onDuty) {
+        // The duty thread itself — the Invoker owner (in or outside a cycle) or
+        // a Thread-mode runner callback (the duty state is ours until close()
+        // joins this thread, even once it closed the ring): apply it here.
+        if (cfg_.runnerMode == RunnerMode::Invoker && agent_.commandRingClosed()) {
+            return detail::HubSubmit::Closed;  // closed: the hand-back owns it
+        }
+        // I3': ops of this handle may still sit in the command ring (issued
+        // off this thread, or past a bounded drain): its impl is not forgotten
+        // before the drain passed them (the current tail is a safe fence).
+        applyRelease_(cmd, agent_.commandRingTail(), /*closing=*/false);
+        return detail::HubSubmit::Accepted;
+    }
+    // Any other thread (spec §3.3): a lifecycle command on the command ring —
+    // FIFO behind this handle's own ops; it never touches duty state itself
+    // (the Invoker owner may be pumping right now).  Closed: close() is in
+    // progress elsewhere and hands the impl back.
+    //
+    // F8c C7 fix round 2 (F1): the ring is FULL — never wait (the head may sit
+    // behind an ABORTed send for as long as the transport refuses it, or
+    // nobody pumps at all: join-then-destroy).  The release is ORPHANED
+    // instead: no command, no time bound, nothing touched on the duty side.
+    // The duty side discovers it (the ring's orphan hint -> a scan, or at the
+    // impl's adoption) and applies it through the same {impl, fence} path as
+    // a direct release, so it still takes effect in FIFO order behind this
+    // handle's queued ops.
+    const auto r = agent_.submitHubCommand(cmd);
+    if (r == agent::ClientAgent::Submit::Accepted) return detail::HubSubmit::Accepted;
+    if (r == agent::ClientAgent::Submit::Closed) return detail::HubSubmit::Closed;
+    if (testHubCommandRingFullHook_) [[unlikely]] testHubCommandRingFullHook_();
+    orphanRelease_(cmd);
+    return detail::HubSubmit::Orphaned;
+}
+
+void Client::orphanRelease_(const detail::HubCommand& cmd) noexcept {
+    using K = detail::HandleKind;
+    void* const        impl  = reinterpret_cast<void*>(static_cast<uintptr_t>(cmd.handle));
+    const std::int64_t fence = agent_.commandRingTail();
+    // The fence (a plain field) first, then ONE RMW that orphans the release
+    // and detaches the handle's share (release-ordered: it publishes the
+    // fence).  If the duty side already let go, this side frees the impl —
+    // and raises no hint (review N3: nothing is left to scan for, and this
+    // thread then never touches the Client after the free).
+    bool freed = false;
+    switch (static_cast<K>(cmd.a)) {
+    case K::Producer: {
+        auto* p = static_cast<producer::ProducerImpl*>(impl);
+        p->setOrphanFence(fence);
+        freed = p->detachHandleOrphaned();
+        if (freed) delete p;
+        break;
+    }
+    case K::TxnProducer: {
+        auto* t = static_cast<producer::TransactionalProducerImpl*>(impl);
+        t->orphanFence = fence;
+        freed = t->status.detachConsumerOrphaned();
+        if (freed) delete t;
+        break;
+    }
+    case K::Subscription: {
+        auto* sub = static_cast<SubscriptionImpl*>(impl);
+        sub->orphanFence = fence;
+        freed = sub->status.detachConsumerOrphaned();
+        if (freed) delete sub;
+        break;
+    }
+    case K::GroupConsumer: {
+        auto* gc = static_cast<GroupConsumerImpl*>(impl);
+        gc->orphanFence = fence;
+        freed = gc->status.detachConsumerOrphaned();
+        if (freed) delete gc;
+        break;
+    }
+    }
+    // After the RMW (never before: that would reopen the lost wakeup) — a scan
+    // that takes the hint sees the mark.  This store is the handle thread's
+    // last touch of the Client: a handle destructor must not race the
+    // Client's destruction (the documented handle contract — the submit above
+    // touches the Client too).
+    if (!freed) agent_.raiseOrphanHint();
+}
+
+void Client::noteOrphan_(detail::HandleKind kind, void* impl, std::int64_t fence) {
+    try {
+        orphans_.push_back(PendingRelease{kind, impl, fence});
+    } catch (...) {
+        // Out of memory: the impl stays with the duty side until close hands it back.
+    }
+}
+
+void Client::scanOrphans_() {
+    // Cold: only when an orphan hint was taken.  Every impl the duty side holds
+    // whose release is orphaned and not yet noted is queued (FIFO: applied
+    // once the command-ring head passes its fence).
+    using K = detail::HandleKind;
+    producerHub_.forEach([&](producer::ProducerImpl& p) {
+        if (!p.releaseNoted && p.releaseOrphaned()) {
+            p.releaseNoted = true;
+            noteOrphan_(K::Producer, &p, p.orphanFence());
+        }
+    });
+    for (std::size_t i = 0; i < txnProducers_.size(); ++i) {
+        producer::TransactionalProducerImpl* t = txnProducers_[i];
+        if (!t->releaseNoted && t->status.consumerOrphaned()) {
+            t->releaseNoted = true;
+            noteOrphan_(K::TxnProducer, t, t->orphanFence);
+        }
+    }
+    subscriberHub_.forEachOwned([&](SubscriptionImpl& sub) {
+        if (!sub.releaseNoted && sub.status.consumerOrphaned()) {
+            sub.releaseNoted = true;
+            noteOrphan_(K::Subscription, &sub, sub.orphanFence);
+        }
+    });
+    groupConsumerHub_.forEachOwned([&](GroupConsumerImpl& gc) {
+        if (!gc.releaseNoted && gc.status.consumerOrphaned()) {
+            gc.releaseNoted = true;
+            noteOrphan_(K::GroupConsumer, &gc, gc.orphanFence);
+        }
+    });
+}
+
+int Client::applyDueOrphans_() {
+    // An orphaned release takes effect once the command-ring head passed its
+    // fence: everything the handle submitted before it was applied first.
+    const std::int64_t head = agent_.commandRingHead();
+    int n = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < orphans_.size(); ++i) {  // applyRelease_ may run user code
+        const PendingRelease o = orphans_[i];
+        if (head >= o.fence) {
+            detail::HubCommand cmd;
+            cmd.op     = detail::HubCommand::Op::HandleRelease;
+            cmd.handle = reinterpret_cast<uint64_t>(o.impl);
+            cmd.a      = static_cast<int64_t>(o.kind);
+            applyRelease_(cmd, 0, /*closing=*/false);
+            ++n;
+        } else {
+            orphans_[keep++] = o;
+        }
+    }
+    orphans_.resize(keep);
+    return n;
+}
+
+void Client::applyRelease_(const detail::HubCommand& cmd, std::int64_t fence, bool closing) {
+    using K = detail::HandleKind;
+    const auto kind = static_cast<K>(cmd.a);
+    void* const impl = reinterpret_cast<void*>(static_cast<uintptr_t>(cmd.handle));
+    // The handle's destructor semantics.  During close() (`closing`) the close
+    // path finishes every producer / txn producer itself (closeFinal /
+    // failAll, before or after this point); subscriptions and consumers are
+    // finished locally here so no further callback reaches a destroyed handle.
+    switch (kind) {
+    case K::Producer:
+        static_cast<producer::ProducerImpl*>(impl)->releaseNoted = true;
+        if (!closing) static_cast<producer::ProducerImpl*>(impl)->applyHandleRelease();
+        break;
+    case K::TxnProducer:
+        static_cast<producer::TransactionalProducerImpl*>(impl)->releaseNoted = true;
+        if (!closing) static_cast<producer::TransactionalProducerImpl*>(impl)->applyHandleRelease();
+        break;
+    case K::Subscription: {
+        auto* sub = static_cast<SubscriptionImpl*>(impl);
+        sub->releaseNoted = true;
+        if (closing) {
+            if (sub->active) subscriberHub_.finishLocal(*sub);
+        } else {
+            detail::HubCommand u;
+            u.op     = detail::HubCommand::Op::Unsubscribe;
+            u.handle = cmd.handle;
+            applyHubCommandDirect_(u);  // the impl is alive: the duty share is still held
+        }
+        break;
+    }
+    case K::GroupConsumer: {
+        auto* gc = static_cast<GroupConsumerImpl*>(impl);
+        gc->releaseNoted = true;
+        if (closing) {
+            if (gc->active) groupConsumerHub_.finishLocal(*gc);
+        } else {
+            detail::HubCommand g;
+            g.op     = detail::HubCommand::Op::GroupClose;
+            g.handle = cmd.handle;
+            groupConsumerHub_.applyCommandDirect(g, now());
+        }
+        break;
+    }
+    }
+    // Reserved in the constructor; a burst beyond it allocates (cold path).
+    try {
+        releases_.push_back(PendingRelease{kind, impl, fence});
+    } catch (...) {
+        // Out of memory: the impl stays with the duty side until close hands it back.
+    }
+}
+
+int Client::reapReleases_() noexcept {
+    using K = detail::HandleKind;
+    const std::int64_t head = agent_.commandRingHead();
+    int n = 0;
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < releases_.size(); ++i) {
+        const PendingRelease r = releases_[i];
+        bool done = false;
+        if (head >= r.fence) {
+            switch (r.kind) {
+            case K::Producer: {
+                auto* p = static_cast<producer::ProducerImpl*>(r.impl);
+                if (p->releasable()) {
+                    producerHub_.remove(p);
+                    if (p->detachDuty()) delete p;  // the handle let go first
+                    done = true;
+                }
+                break;
+            }
+            case K::TxnProducer: {
+                auto* t = static_cast<producer::TransactionalProducerImpl*>(r.impl);
+                if (t->closedDuty()) {
+                    std::erase(txnProducers_, t);
+                    if (t->status.detachProducer()) delete t;
+                    done = true;
+                }
+                break;
+            }
+            case K::Subscription: {
+                auto* sub = static_cast<SubscriptionImpl*>(r.impl);
+                if (subscriberHub_.release(sub)) {
+                    if (sub->status.detachProducer()) delete sub;
+                    done = true;
+                }
+                break;
+            }
+            case K::GroupConsumer: {
+                auto* gc = static_cast<GroupConsumerImpl*>(r.impl);
+                if (groupConsumerHub_.release(gc)) {
+                    if (gc->status.detachProducer()) delete gc;
+                    done = true;
+                }
+                break;
+            }
+            }
+        }
+        if (done) ++n;
+        else releases_[keep++] = r;
+    }
+    releases_.resize(keep);
+    return n;
+}
+
+void Client::handBackAll_() noexcept {
+    // Released impls are in the hubs' lists too (forgotten only by a reap);
+    // orphaned releases not yet applied are handed back with them.
+    releases_.clear();
+    orphans_.clear();
+    uint64_t n = 0;
+    producerHub_.handBackAll([&n](producer::ProducerImpl* p) noexcept {
+        ++n;
+        if (p->detachDuty()) delete p;
+    });
+    std::vector<producer::TransactionalProducerImpl*> txns;
+    txns.swap(txnProducers_);
+    for (producer::TransactionalProducerImpl* t : txns) {
+        ++n;
+        if (t->status.detachProducer()) delete t;
+    }
+    subscriberHub_.handBackAll([&n](SubscriptionImpl* sub) noexcept {
+        ++n;
+        if (sub->status.detachProducer()) delete sub;
+    });
+    groupConsumerHub_.handBackAll([&n](GroupConsumerImpl* gc) noexcept {
+        ++n;
+        if (gc->status.detachProducer()) delete gc;
+    });
+    implsHandedBack_ += n;
+    // A free above may have destroyed a user callable that owned another
+    // handle; its release (this closing thread) queued an entry for an impl
+    // the hand-back then let go: the list is dead state now.
+    releases_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// F8c C7: Client::close()'s drain (user decision 2)
+// ---------------------------------------------------------------------------
+
+OpResult Client::issueDrain_(Completions& q, Token token) {
+    detail::HubCommand cmd;
+    cmd.op = detail::HubCommand::Op::ClientDrain;
+    // Always through the ring (also on the Invoker owner): applied after every
+    // registration accepted before it, so a producer created just before
+    // close() is drained too, not only failed by the teardown.
+    return issueTargeted_(cmd, CompletionTarget(q), token, OpKind::ClientDrain, /*viaRing=*/true);
+}
+
+void Client::drainPartDone_(void*, const Completion&, std::span<const uint8_t>) noexcept {
+    // A producer's / txn producer's internal close token: its outcome is its
+    // records' own (each completed with its own status); checkDrain_ decides.
+}
+
+void Client::applyClientDrain_(const detail::HubCommand& cmd) {
+    detail::HubCommand pinned = cmd;
+    pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+    DrainWaiter w;
+    w.target = detail::decodeTarget(pinned);
+    w.token  = static_cast<Token>(cmd.a);
+    drainWaiters_.push_back(w);  // cold: one per close() call
+    (void)checkDrain_();
+}
+
+int Client::checkDrain_() {
+    // Begin-close every open producer and close every transactional producer
+    // (also ones registered after the drain began); settled once none is open
+    // or draining / closing.  Each settles within its own deadline.
+    const CompletionHandler internal{&Client::drainPartDone_, nullptr};
+    const int64_t t = now();
+    bool settled = true;
+    producerHub_.forEach([&](producer::ProducerImpl& p) {
+        // closeIntake() lost: another closer (a begin-close / closeImmediately
+        // still in the command ring) owns this producer's close — wait for it.
+        if (p.lifeOpen() && p.closeIntake()) {
+            detail::OpTarget tgt;
+            tgt.handler = internal;
+            p.applyBeginClose(tgt, 0, t);
+        }
+        if (p.lifeOpen() || p.draining()) settled = false;
+    });
+    for (std::size_t i = 0; i < txnProducers_.size(); ++i) {  // a handler may register one
+        producer::TransactionalProducerImpl* tp = txnProducers_[i];
+        if (tp->closedDuty()) continue;
+        if (!tp->closingDuty()) {
+            detail::OpTarget tgt;
+            tgt.handler = internal;
+            tp->beginClose(tgt, 0, t);
+        }
+        if (!tp->closedDuty()) settled = false;
+    }
+    if (!settled) return 0;
+    std::vector<DrainWaiter> ws;
+    ws.swap(drainWaiters_);
+    for (const DrainWaiter& w : ws) {
+        Completion c;
+        c.token = w.token;
+        c.op    = OpKind::ClientDrain;
+        deliver_(w.target, c, {});
+    }
+    return static_cast<int>(ws.size());
 }
 
 producer::PumpResult Client::pumpTrampoline_(void* ctx) {
@@ -1894,17 +2936,14 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
                                     SubscribeOptions         opts,
                                     RecordHandler            handler)
 {
-    // Allocate a fresh correlationId (app-thread, atomic).
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
-
-    // Snapshot the current session id (coherent pair — same as ping()).
-    const auto snap = agent_.stateAndSessionId();
-
     // Build the impl.  Its immutable fields are written HERE, before the
     // SubscribeAdd command is committed to the agent ring (which publishes them
     // to the duty thread); every other field is duty-thread owned from then on.
-    auto impl = std::make_shared<SubscriptionImpl>();
-    impl->correlationId = corrId;
+    // F8c C3: the correlationId (and the frame's sessionId) are assigned by the
+    // duty thread when it adopts the request — no app-thread counter / snapshot.
+    // F8c C7: held here until the SubscribeAdd is accepted; then the duty side
+    // holds its share (from adoption) and the handle the other (§3.3).
+    auto impl = std::make_unique<SubscriptionImpl>();
     impl->topicId       = topic.topicId;
     impl->partition     = partition;
     impl->handler       = std::move(handler);
@@ -1917,7 +2956,7 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     // F8a: encode on this thread (pure), then hand the request to the duty
     // thread, which registers it as pending and sends the Subscribe frame.
     auto req = subscriber::SubscriberHub::makeSubscribeRequest(
-        impl, snap.sessionId, partitionKnown, opts.from.toWire(),
+        impl.get(), /*sessionId (stamped on adoption)=*/0, partitionKnown, opts.from.toWire(),
         static_cast<uint8_t>(opts.isolation), keyBytes, subscribeDL);
     // F8a fix4 M1: a Subscribe frame no ingress publication can carry fails
     // HERE, synchronously — it never reaches the duty thread (where it could
@@ -1937,15 +2976,13 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
         (void)req.release();      // the duty thread owns it now
         break;
     case detail::HubSubmit::Closed:
-        impl->status.abandon();   // never submitted (req freed): born finished
-        break;
-    case detail::HubSubmit::ClosedAfterSubmit:
-        (void)req.release();      // indeterminate ownership: leak, never free
-        impl->status.abandon();   // consumer-side word (the drain may close the producer side)
+    case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a SubscribeAdd
+        impl->status.abandon();         // never submitted (req freed): born finished
+        (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
     }
 
-    return Subscription(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_());
+    return Subscription(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_());
 }
 
 // ---------------------------------------------------------------------------
@@ -1972,14 +3009,24 @@ void Client::applyHubCommandDirect_(const detail::HubCommand& cmd) {
         const auto snap = agent_.stateAndSessionId();
         subscriberHub_.unsubscribeDirect(
             *reinterpret_cast<SubscriptionImpl*>(cmd.handle),
-            nextCorrId_.fetch_add(1, std::memory_order_relaxed), snap.sessionId,
+            nextCorrId_++, snap.sessionId,
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                 return agent_.submitSend(fb, fl);
             });
         return;
     }
-    if (cmd.op == Op::GroupClose || cmd.op == Op::GroupCommit || cmd.op == Op::GroupCommitSync) {
-        groupConsumerHub_.applyCommandDirect(cmd);
+    if (cmd.op == Op::GroupCommitSync) {
+        detail::HubCommand pinned = cmd;
+        pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+        groupConsumerHub_.applyCommandDirect(pinned, now());
+        return;
+    }
+    if (producer::TransactionalProducerImpl::isTxnOp(cmd.op)) {
+        applyTxnCommand_(cmd, /*direct=*/true);
+        return;
+    }
+    if (cmd.op == Op::GroupClose || cmd.op == Op::GroupCommit) {
+        groupConsumerHub_.applyCommandDirect(cmd, now());
         return;
     }
     applyHubCommand_(cmd);
@@ -1998,34 +3045,89 @@ detail::SendResult Client::directSendTrampoline_(void* ctx, const uint8_t* buf, 
 void Client::applyHubCommand_(const detail::HubCommand& cmd) {
     syncSeedSession_();  // fix4 I-1: the hubs act on the session's CURRENT state
     using Op = detail::HubCommand::Op;
+    switch (cmd.op) {  // F8c C2/C3: the Client's own commands
+    case Op::CqAdd:
+        applyCqAdd_(reinterpret_cast<detail::CompletionRing*>(cmd.handle));
+        return;
+    case Op::CqRelease:
+        applyCqRelease_(static_cast<CqRef>(cmd.a), reinterpret_cast<detail::CompletionRing*>(cmd.handle),
+                        static_cast<uint64_t>(cmd.b));
+        return;
+    case Op::ProducerBeginClose:
+    case Op::ProducerCloseNow:
+        applyProducerCommand_(cmd);
+        return;
+    case Op::HandleRelease:  // F8c C7: via the ring — FIFO behind the handle's own ops
+        applyRelease_(cmd, 0, closing_);
+        return;
+    case Op::ClientDrain:    // F8c C7: Client::close()
+        applyClientDrain_(cmd);
+        return;
+    case Op::ClientSetCallback:
+        applySetCallback_(static_cast<int>(cmd.a), reinterpret_cast<void*>(cmd.handle));
+        return;
+    default:
+        break;
+    }
+    if (producer::TransactionalProducerImpl::isTxnOp(cmd.op)) {  // F8c C5
+        applyTxnCommand_(cmd, /*direct=*/false);
+        return;
+    }
+    if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
+        // F8c C3: the Subscribe correlationId comes from the duty-owned counter
+        // (header offset 16; the sessionId at offset 8 is stamped by the hub).
+        auto* req = reinterpret_cast<subscriber::SubscribeRequest*>(cmd.handle);
+        if (req->impl) {
+            req->impl->correlationId = nextCorrId_++;
+            if (req->subscribeFrame.size() >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
+                rune::protocol::client::detail::putLE64(req->subscribeFrame.data(), 16,
+                                                        req->impl->correlationId);
+            }
+        }
+    }
     if (cmd.op == Op::SubscribeAdd || cmd.op == Op::Unsubscribe) {
+        SubscriptionImpl* adopted = nullptr;  // F1: check the adopted impl for an orphaned release
+        if (cmd.op == Op::SubscribeAdd && cmd.handle != 0) {
+            adopted = reinterpret_cast<subscriber::SubscribeRequest*>(cmd.handle)->impl;
+        }
         const auto snap = agent_.stateAndSessionId();
-        const int64_t unsubCorrId = (cmd.op == Op::Unsubscribe)
-            ? nextCorrId_.fetch_add(1, std::memory_order_relaxed) : 0;
+        const int64_t unsubCorrId = (cmd.op == Op::Unsubscribe) ? nextCorrId_++ : 0;
         subscriberHub_.applyCommand(
             cmd, unsubCorrId, snap.sessionId,
             [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                 return agent_.submitSend(fb, fl);
             });
+        if (adopted != nullptr && adopted->status.consumerOrphaned() && !adopted->releaseNoted) {
+            adopted->releaseNoted = true;  // its handle orphaned the release before this adoption
+            noteOrphan_(detail::HandleKind::Subscription, adopted, adopted->orphanFence);
+        }
+    } else if (cmd.op == Op::GroupCommitSync) {
+        detail::HubCommand pinned = cmd;
+        pinCommandTarget_(pinned);  // I3: counted before anything can complete it
+        groupConsumerHub_.applyCommand(pinned, now());
     } else {
-        groupConsumerHub_.applyCommand(cmd);
+        groupConsumerHub_.applyCommand(cmd, now());
+        if (cmd.op == Op::GroupAdd && cmd.handle != 0) {  // F1: as for subscriptions
+            auto* gc = reinterpret_cast<GroupConsumerImpl*>(cmd.handle);
+            if (gc->status.consumerOrphaned() && !gc->releaseNoted) {
+                gc->releaseNoted = true;
+                noteOrphan_(detail::HandleKind::GroupConsumer, gc, gc->orphanFence);
+            }
+        }
     }
 }
 
 detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubCommand& cmd) {
     using Op = detail::HubCommand::Op;
     auto* self = static_cast<Client*>(ctx);
+    // F8c C7: a handle's §3.3 release has its own routing (closer thread,
+    // duty work, or the ring) — decided before the closed-ring check.
+    if (cmd.op == Op::HandleRelease) return self->submitRelease_(cmd);
     const bool onDuty = std::this_thread::get_id() == self->dutyThreadId_;
 
-    // fix1 I6: a commitSync() future created inside a duty-cycle callback can
-    // never resolve while that callback blocks the duty thread — fail loudly
-    // instead of deadlocking.  (inDutyCycle_ is read on the duty thread only.)
-    if (cmd.op == Op::GroupCommitSync && onDuty && self->inDutyCycle_) {
-        throw std::logic_error(
-            "GroupConsumer::commitSync() called from inside a duty-cycle callback: its "
-            "future can never resolve while the callback runs — use commit()");
-    }
-    if (self->stopped_.load(std::memory_order_seq_cst)) return detail::HubSubmit::Closed;
+    // F8c C4: GroupCommitSync is a token op (targetedOpTrampoline_), never
+    // submitted here; the token form is allowed from a duty-cycle callback.
+    if (self->agent_.commandRingClosed()) return detail::HubSubmit::Closed;
 
     // fix1 C1(a): on the duty thread the state is ours — apply directly (never
     // through the ring, so never blocked by it).  fix2: the registrations
@@ -2035,11 +3137,16 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
     // GroupSetCallback (it could replace a running callback): ring order.
     if (onDuty && (cmd.op == Op::SubscribeAdd || cmd.op == Op::GroupAdd ||
                    cmd.op == Op::Unsubscribe || cmd.op == Op::GroupClose ||
-                   cmd.op == Op::GroupCommit || cmd.op == Op::GroupCommitSync)) {
+                   cmd.op == Op::GroupCommit || cmd.op == Op::TxnBegin || cmd.op == Op::TxnSend ||
+                   cmd.op == Op::TxnCloseNow)) {
         self->applyHubCommandDirect_(cmd);
         return detail::HubSubmit::Accepted;
     }
 
+    // F8c C2: every submit below is linearized against close() by the command
+    // ring's closed bit: Accepted = before the close (applied by the duty
+    // cycle or close()'s final drain), Closed = never written.
+    using S = agent::ClientAgent::Submit;
     if (detail::isLifecycle(cmd.op)) {
         // fix1 C1(b): guaranteed delivery.  A full ring is waited out on the
         // duty thread's progress (it drains the ring), never a time bound and
@@ -2048,33 +3155,27 @@ detail::HubSubmit Client::hubCommandTrampoline_(void* ctx, const detail::HubComm
         aeron::concurrent::BackoffIdleStrategy idle(
             10, 20, std::chrono::duration<long, std::nano>(1'000),
             std::chrono::duration<long, std::nano>(100'000));
-        while (!self->agent_.submitHubCommand(cmd)) {
-            if (self->stopped_.load(std::memory_order_seq_cst)) return detail::HubSubmit::Closed;
+        for (;;) {
+            const S r = self->agent_.submitHubCommand(cmd);
+            if (r == S::Accepted) return detail::HubSubmit::Accepted;
+            if (r == S::Closed) return detail::HubSubmit::Closed;
             if (self->testHubCommandRingFullHook_) [[unlikely]] self->testHubCommandRingFullHook_();
             idle.idle(0);
         }
-    } else {
-        try {
-            // Bounded back-pressure exactly like producer registration: Invoker
-            // owner pumps the duty cycle, Thread-mode app threads park while
-            // the runner drains; from a duty-cycle callback / non-owner Invoker
-            // thread a FULL ring throws instead (never a silent drop).
-            self->submitRegistration_([&] { return self->agent_.submitHubCommand(cmd); }, [] {});
-        } catch (const std::logic_error&) {
-            // close() won the race before the submit: nothing was written.
-            if (self->stopped_.load(std::memory_order_seq_cst)) return detail::HubSubmit::Closed;
-            throw;
-        }
     }
-    // Same post-submit seq_cst RMW re-check as producerWithRingCap_ (fix3 C1):
-    // succeeds => close()'s exchange (and its final ring drain, which applies
-    // hub commands) is ordered after our commit, so the command WILL be applied.
-    bool expectedNotStopped = false;
-    if (!self->stopped_.compare_exchange_strong(expectedNotStopped, false,
-                                                std::memory_order_seq_cst)) {
-        return detail::HubSubmit::ClosedAfterSubmit;
+    try {
+        // Bounded back-pressure exactly like producer registration: Invoker
+        // owner pumps the duty cycle, Thread-mode app threads park while
+        // the runner drains; from a duty-cycle callback / non-owner Invoker
+        // thread a FULL ring throws instead (never a silent drop).
+        return self->submitRegistration_([&] { return self->agent_.submitHubCommand(cmd); }, [] {})
+                   ? detail::HubSubmit::Accepted
+                   : detail::HubSubmit::Closed;
+    } catch (const std::logic_error&) {
+        // close() won the race before the submit: nothing was written.
+        if (self->agent_.commandRingClosed()) return detail::HubSubmit::Closed;
+        throw;
     }
-    return detail::HubSubmit::Accepted;
 }
 
 // ---------------------------------------------------------------------------
@@ -2098,7 +3199,7 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
             "(Multi-group per connection is deferred to CG-6.)");
     }
 
-    auto impl = std::make_shared<GroupConsumerImpl>();
+    auto impl = std::make_unique<GroupConsumerImpl>();  // C7: see subscribeImpl
     impl->groupId = std::move(groupId);
     impl->cfg     = cfg;
 
@@ -2115,32 +3216,24 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
     impl->state = GroupConsumerState::Unjoined;
 
     // F8a: register through the agent ring — the duty thread adopts the impl
-    // into the single-owner hub list and frees the holder.
-    auto* holder = new std::shared_ptr<GroupConsumerImpl>(impl);
+    // into the single-owner hub list.  F8c C7: the impl's own address (no
+    // shared_ptr holder); a throw before the submit frees it here.
     detail::HubCommand cmd;
     cmd.op     = detail::HubCommand::Op::GroupAdd;
-    cmd.handle = reinterpret_cast<uint64_t>(holder);
-    detail::HubSubmit r = detail::HubSubmit::Closed;
-    try {
-        r = hubCommandTrampoline_(this, cmd);
-    } catch (...) {
-        delete holder;  // never submitted
-        throw;
-    }
-    switch (r) {
+    cmd.handle = reinterpret_cast<uint64_t>(impl.get());
+    switch (hubCommandTrampoline_(this, cmd)) {
     case detail::HubSubmit::Accepted:
         groupSubscribed_ = true;
         break;
     case detail::HubSubmit::Closed:
-        delete holder;            // never submitted
-        impl->status.abandon();   // born finished
-        break;
-    case detail::HubSubmit::ClosedAfterSubmit:
-        impl->status.abandon();   // indeterminate holder ownership: leak, never free
+    case detail::HubSubmit::Orphaned:  // HandleRelease only — never for a GroupAdd
+        impl->status.abandon();               // never submitted: born finished
+        (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
         break;
     }
 
-    return GroupConsumer(std::move(impl), &Client::hubCommandTrampoline_, this, handleDutyThread_());
+    return GroupConsumer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
+                         &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
 }
 
 // ---------------------------------------------------------------------------
@@ -2150,31 +3243,32 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
 TransactionalProducer Client::transactionalProducer(const std::string& transactionalId,
                                                      ProducerConfig cfg)
 {
-    auto impl = std::make_shared<producer::TransactionalProducerImpl>(
+    // nextCorrId_ is duty-owned: the txn producer only draws ids on the duty
+    // thread (doWork / response handlers), so it shares the plain counter.
+    auto impl = std::make_unique<producer::TransactionalProducerImpl>(  // C7: see producer()
         transactionalId,
         cfg,
         nextCorrId_);
+    // F8c C5: its completions go through the completion-queue registry; F14:
+    // NotCoordinator asks this Client to re-discover the coordinator.  Both
+    // are set before the impl is published to the duty thread (the ring).
+    impl->setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
+    impl->setRediscoverHook(&Client::rediscoverTrampoline_, this);
 
     // Shared-nothing registration through the agent ring (like producer()): the
     // duty-cycle thread adopts it into txnProducers_ — no mutex, no per-cycle copy.
-    auto* holder = new std::shared_ptr<producer::TransactionalProducerImpl>(impl);
-    submitRegistration_([&] { return agent_.submitRegisterTxnProducer(holder); },
-                        [&] { delete holder; });
-
-    // fix5 (symmetry with producerWithRingCap_): the same post-submit seq_cst
-    // compare_exchange re-check, for the same registration-vs-close race — see
-    // the fix3 C1 comment in producerWithRingCap_ for the full memory-model
-    // argument. "Setup phase only" is a documented contract, not an
-    // enforcement, so this path must be as race-safe as producer(). If the CAS
-    // fails, close() already ran (possibly including its drain): self-close so
-    // every later operation fails at once instead of queueing work no duty
-    // cycle will ever process. `holder` is intentionally not freed here — the
-    // same fix3 M1 reasoning (it may already have been adopted and freed).
-    bool expectedNotStopped = false;
-    if (!stopped_.compare_exchange_strong(expectedNotStopped, false, std::memory_order_seq_cst)) {
-        impl->markClosed("Client closed");
+    // F8c C2: linearized against close() by the ring (see producerWithRingCap_):
+    // Closed = never written — the producer is born closed: its status channel
+    // abandoned (every later operation is rejected Closed at once instead of
+    // queueing work no duty cycle will ever process) and the duty share
+    // detached (F8c C7: the handle alone owns and frees it).
+    producer::TransactionalProducerImpl* raw = impl.get();
+    if (!submitRegistration_([&] { return agent_.submitRegisterTxnProducer(raw); }, [] {})) {
+        impl->status.abandon();
+        (void)impl->status.detachProducer();  // C7: no duty side will ever hold it
     }
-    return TransactionalProducer(std::move(impl));
+    return TransactionalProducer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
+                                 &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
 }
 
 // ---------------------------------------------------------------------------
@@ -2182,8 +3276,8 @@ TransactionalProducer Client::transactionalProducer(const std::string& transacti
 // ---------------------------------------------------------------------------
 
 void Client::sendMetadataRequest(int64_t sessionId) noexcept {
-    // Allocate a fresh correlationId.
-    const int64_t corrId = nextCorrId_.fetch_add(1, std::memory_order_relaxed);
+    // Allocate a fresh correlationId (duty-owned counter).
+    const int64_t corrId = nextCorrId_++;
     pendingMetadataCorrId_ = corrId;
 
     // Encode a MetadataRequest (empty topicIds span = all topics).
@@ -2321,6 +3415,49 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // and disarm any pending refresh (we just refreshed).
     metadataBackoffNs_     = kMetadataBackoffInitNs;
     nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max();
+
+    // F14: a fresh cluster view — txn requests waiting for the coordinator to
+    // be re-discovered (NotCoordinator) back off and re-send.
+    for (auto& tp : txnProducers_) tp->onCoordinatorRediscovered();
+}
+
+void Client::rediscoverTrampoline_(void* ctx) noexcept {
+    // F14: NotCoordinator -> re-discover the coordinator (== the consensus
+    // leader today, F15 §5.1): ask for a fresh cluster view now.  Not
+    // connected: the MetadataRequest sent on the next ConnectResponse{OK}
+    // answers it instead.
+    auto* self = static_cast<Client*>(ctx);
+    const auto& m = self->agent_.seedSession().machine;
+    if (m.state() == session::SessionState::Connected && m.sessionId() != 0) {
+        self->sendMetadataRequest(m.sessionId());
+    }
+}
+
+producer::TransactionalProducerImpl* Client::findTxn_(uint64_t handle) const noexcept {
+    for (producer::TransactionalProducerImpl* tp : txnProducers_) {
+        if (reinterpret_cast<uint64_t>(tp) == handle) return tp;
+    }
+    return nullptr;
+}
+
+void Client::applyTxnCommand_(const detail::HubCommand& cmd, bool direct) {
+    using Op = detail::HubCommand::Op;
+    detail::HubCommand c = cmd;
+    // I3: a token op's target is pinned when it is applied (before anything
+    // can complete it).  Begin / Send carry no target.
+    if (c.op == Op::TxnInit || c.op == Op::TxnSendOffsets || c.op == Op::TxnEnd || c.op == Op::TxnClose) {
+        pinCommandTarget_(c);
+    }
+    // Ring path: resolve the identity against the duty-owned list (never
+    // dereference an unknown one).  Direct path: the caller's handle holds
+    // the impl for the whole call (it may still be awaiting adoption).
+    producer::TransactionalProducerImpl* impl =
+        direct ? reinterpret_cast<producer::TransactionalProducerImpl*>(c.handle) : findTxn_(c.handle);
+    if (impl == nullptr) {
+        producer::TransactionalProducerImpl::discardCommand(c, detail::CompletionSink{&Client::deliverTrampoline_, this});
+        return;
+    }
+    impl->applyCommand(c, now());
 }
 
 // ---------------------------------------------------------------------------

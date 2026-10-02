@@ -12,6 +12,7 @@
 //   2. OpenTopicFailsOnMismatch  — StubT_Mismatch: kFingerprint != blob fingerprint → throws
 //   3. OpenTopicSendDoesNotThrow — After a Match resolve, send() does not throw (fire-and-forget)
 
+#include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <gtest/gtest.h>
 #include <rune/client/Client.h>
@@ -31,7 +32,6 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -235,13 +235,14 @@ struct GateHarness {
     }
 
     void connectAndWait() {
-        auto fut = client->connect();
+        test_support::TestCq futCq(*client);
+        auto fut = futCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
         pumpUntil([&]() {
             return client->state() == rcs::SessionState::Connected;
         });
-        ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+        ASSERT_TRUE(fut.waitReady())
             << "connect() future did not resolve";
-        ASSERT_NO_THROW(fut.get()) << "connect() threw";
+        ASSERT_TRUE(fut.ok()) << fut.describe() << " connect() failed";
     }
 
     ~GateHarness() {
@@ -299,17 +300,22 @@ TEST(OpenTopicGate, OpenTopicResolvesOnMatch) {
     h.gw->getVersion   = 1;
     h.gw->getErrorCode = 0;
 
-    auto fut = h.client->openTopic<StubT_Match>("characters");
-
-    h.pumpUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+    // F8c C3: getTopicSchema token op + TypedTopic::fromSchema on this thread
+    // (no std::async continuation thread).
+    test_support::TestCq cq(*h.client);
+    auto fut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->getTopicSchema("characters", q, t);
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    h.pumpUntil([&]() {
+        return fut.ready();
+    });
+
+    ASSERT_TRUE(fut.waitReady())
         << "openTopic<StubT_Match> future did not resolve";
 
     ASSERT_NO_THROW({
-        auto tt = fut.get();
+        auto tt = TypedTopic<StubT_Match>::fromSchema(*h.client, fut.outcome().c, fut.outcome().payload);
         (void)tt;
     }) << "openTopic<StubT_Match> should resolve without throwing";
 }
@@ -328,17 +334,22 @@ TEST(OpenTopicGate, OpenTopicFailsOnMismatch) {
     h.gw->getVersion   = 1;
     h.gw->getErrorCode = 0;
 
-    auto fut = h.client->openTopic<StubT_Mismatch>("characters");
-
-    h.pumpUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+    // F8c C3: getTopicSchema token op + TypedTopic::fromSchema on this thread
+    // (no std::async continuation thread).
+    test_support::TestCq cq(*h.client);
+    auto fut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->getTopicSchema("characters", q, t);
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    h.pumpUntil([&]() {
+        return fut.ready();
+    });
+
+    ASSERT_TRUE(fut.waitReady())
         << "openTopic<StubT_Mismatch> future did not resolve with error";
 
     EXPECT_THROW({
-        auto tt = fut.get();
+        auto tt = TypedTopic<StubT_Mismatch>::fromSchema(*h.client, fut.outcome().c, fut.outcome().payload);
         (void)tt;
     }, std::exception) << "openTopic<StubT_Mismatch> must throw (stale type)";
 }
@@ -357,16 +368,22 @@ TEST(OpenTopicGate, OpenTopicSendDoesNotThrow) {
     h.gw->getVersion   = 1;
     h.gw->getErrorCode = 0;
 
-    auto fut = h.client->openTopic<StubT_Match>("characters");
-
-    h.pumpUntil([&]() {
-        return fut.wait_for(0ms) == std::future_status::ready;
+    // F8c C3: getTopicSchema token op + TypedTopic::fromSchema on this thread
+    // (no std::async continuation thread).
+    test_support::TestCq cq(*h.client);
+    auto fut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->getTopicSchema("characters", q, t);
     });
 
-    ASSERT_EQ(fut.wait_for(kFutureTimeout), std::future_status::ready)
+    h.pumpUntil([&]() {
+        return fut.ready();
+    });
+
+    ASSERT_TRUE(fut.waitReady())
         << "openTopic resolve timed out";
 
-    TypedTopic<StubT_Match> tt = fut.get();
+    TypedTopic<StubT_Match> tt =
+        TypedTopic<StubT_Match>::fromSchema(*h.client, fut.outcome().c, fut.outcome().payload);
 
     // send() is fire-and-forget (void, noexcept); must not crash.
     // The ring may drop it (no active broker session on the runner), but

@@ -18,7 +18,8 @@
 //   - One-time setup: embedded driver + connected Client + gateway echoer.
 //   - Gateway runs on a dedicated helper thread, tight-polling (yielding loop).
 //   - Client runs in IdleMode::LowLatency (YieldingIdleStrategy, no park).
-//   - Per iteration: c.ping(payload).get() — wall-clock RTT measured.
+//   - Per iteration: ping(payload, cq, token) + cq.waitFor (yielding idle) —
+//     wall-clock RTT measured (F8c: completion tokens, no future).
 //   - Warm-up: explicit pre-benchmark warm-up of kWarmupPings + Google
 //     Benchmark's built-in warm-up iterations (both discard early data).
 //   - Percentiles reported: p50/p99/p99.9/mean (µs) via state.counters.
@@ -29,11 +30,11 @@
 // What this measures (the TRUE client hot path):
 //   app-thread → ring → runner-thread (yield loop) → transport tryClaim →
 //   aeron:ipc (IPC ring buffer) → gateway (yield loop) → aeron:ipc →
-//   runner-thread → egress observer → promise.set_value → future.get()
+//   runner-thread → egress observer → completion ring write → app poll
 //
 // Expected: p99 well under 100µs (typically 10–40µs on a quiet macOS/Linux host).
 // The broker's raw gateway RTT is ~1.9µs; the client adds ring-hop + yield cycles
-// + observer overhead + future wake-up.  A p99 of 30–60µs is typical and correct.
+// + observer overhead + completion poll.  A p99 of 30–60µs is typical and correct.
 
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
@@ -52,7 +53,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <future>
+#include <concurrent/YieldingIdleStrategy.h>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -246,6 +247,8 @@ struct BenchFixture {
     std::string                   aeronDir;
     std::unique_ptr<Client>       client;
     std::unique_ptr<BenchGateway> gw;
+    std::unique_ptr<Completions>  cq;
+    Token                         nextToken = 0;
 
     BenchFixture() {
         agentDir = uniqueDir();
@@ -271,28 +274,44 @@ struct BenchFixture {
         gw->start(kIngressStream, kEgressStream);
 
         // Connect.
-        auto fut = client->connect();
-        const auto connDl = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(kConnectTimeoutMs);
-        if (fut.wait_until(connDl) != std::future_status::ready)
-            throw std::runtime_error("BenchFixture: connect() timed out");
-        fut.get(); // throws on error
+        client->connectAndWait(std::chrono::milliseconds(kConnectTimeoutMs));
+
+        // F8c C3: one long-lived completion queue, owned by this (the
+        // benchmark) thread — the steady-state ping path allocates nothing.
+        cq = std::make_unique<Completions>(*client);
 
         // Explicit warm-up: discard first kWarmupPings before sampling.
         // This lets the IPC channels, Aeron internal caches, and CPU
         // branch-predictor reach steady state.
         Bytes wPayload = {'w', 'a', 'r', 'm'};
         for (int i = 0; i < kWarmupPings; ++i) {
-            auto wf = client->ping(wPayload);
-            const auto wdl = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(kPingTimeoutMs);
-            if (wf.wait_until(wdl) != std::future_status::ready)
-                throw std::runtime_error("BenchFixture: warm-up ping timed out");
-            wf.get();
+            if (!pingOnce(wPayload)) throw std::runtime_error("BenchFixture: warm-up ping failed");
         }
     }
 
+    /// One ping round trip on the token API: issue, then poll the queue
+    /// under a yielding idle strategy (a latency-sensitive waiter, §2.3).
+    bool pingOnce(std::span<const uint8_t> payload, std::string* error = nullptr) {
+        const Token t = ++nextToken;
+        if (client->ping(payload, *cq, t) != OpResult::Accepted) {
+            if (error) *error = "ping() not accepted";
+            return false;
+        }
+        bool ok = false;
+        const auto w = cq->waitFor(
+            t, std::chrono::milliseconds(kPingTimeoutMs),
+            [&](const Completion& c, std::span<const uint8_t>) { ok = c.status == OpStatus::Ok; },
+            NoPump{}, aeron::concurrent::YieldingIdleStrategy{});
+        if (w != Completions::Wait::Done) {
+            if (error) *error = "ping() completion did not arrive within timeout";
+            return false;
+        }
+        if (!ok && error) *error = "ping() completed with a non-Ok status";
+        return ok;
+    }
+
     ~BenchFixture() {
+        cq.reset();
         if (client) {
             client->close();
             client.reset();
@@ -317,7 +336,7 @@ static BenchFixture* g_fixture = nullptr;
 // ---------------------------------------------------------------------------
 // BM_PingRoundTrip — main benchmark.
 //
-// Measures wall-clock of client.ping(payload).get() per iteration.
+// Measures wall-clock of one ping round trip (token API) per iteration.
 // Accumulates per-iteration samples, then reports p50/p99/p99.9/mean (µs).
 //
 // Configuration:
@@ -338,19 +357,11 @@ static void BM_PingRoundTrip(benchmark::State& state) {
         auto& c = *g_fixture->client;
         state.ResumeTiming();
 
+        (void)c;
         const auto t0 = std::chrono::steady_clock::now();
-        auto fut = c.ping(kPayload);
-
-        const auto deadline = t0 + std::chrono::milliseconds(kPingTimeoutMs);
-        if (fut.wait_until(deadline) != std::future_status::ready) {
-            state.SkipWithError("ping() future did not resolve within timeout");
-            break;
-        }
-
-        try {
-            (void)fut.get();
-        } catch (const std::exception& ex) {
-            state.SkipWithError(ex.what());
+        std::string error;
+        if (!g_fixture->pingOnce(kPayload, &error)) {
+            state.SkipWithError(error.c_str());
             break;
         }
 

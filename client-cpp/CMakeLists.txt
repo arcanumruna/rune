@@ -52,6 +52,29 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py
             ${CMAKE_CURRENT_SOURCE_DIR})
+    # F8c C7: move-only handles — no std::shared_ptr / weak_ptr / make_shared in
+    # src/ or include/ except the Aeron transport objects (exact allowlist).
+    # (Renamed in C9 fix round 1 from NoSharedPtrInPublicHandlesGuard*: it scans
+    # the whole tree; the handle-header-only check is NoSharedPtrHandlesGuard.)
+    add_test(NAME NoSharedOwnershipOutsideTransportGuardSelfTestRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --selftest)
+    add_test(NAME NoSharedOwnershipOutsideTransportGuardRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py
+            ${CMAKE_CURRENT_SOURCE_DIR})
+    # F8c C9: no std::future / promise / shared_future / packaged_task / async /
+    # launch / #include <future> in src/ include/ examples/ bench/ tools/ (the
+    # script self-tests its fixtures first), and no shared ownership in the
+    # public handle headers — allowlist or not.
+    add_test(NAME NoFuturesOrPromisesGuardRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --futures
+            ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME NoSharedPtrHandlesGuardRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --handles
+            ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
@@ -239,6 +262,7 @@ endif()
 if(aeron_FOUND)
     add_library(rune_client_api STATIC
         src/Client.cpp
+        src/Completions.cpp
         src/detail/CpuAffinity.cpp
         src/shard/ShardConfig.cpp
     )
@@ -503,6 +527,22 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
             target_link_libraries(rune_producer_accum_bench PRIVATE ${UUID_LIB})
         endif()
     endif()
+
+    # F8c C6 — acked producer path (token acks) micro-bench (in-process, no Aeron)
+    add_executable(rune_producer_acked_bench bench/ProducerAckedBench.cpp)
+    target_include_directories(rune_producer_acked_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_producer_acked_bench PRIVATE rune_client_api rune_client_producer)
+
+    # F8c C7 — the producer hot path THROUGH THE HANDLE (Producer::trySend, void + acked)
+    add_executable(rune_producer_handle_bench bench/ProducerHandleBench.cpp)
+    target_include_directories(rune_producer_handle_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_producer_handle_bench PRIVATE rune_client_api rune_client_producer)
+
+    # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
+    add_executable(rune_m2o_claim_bench
+        bench/M2OClaimBench.cpp
+    )
+    target_link_libraries(rune_m2o_claim_bench PRIVATE rune_client_producer)
 
     # F12 — per-duty-cycle producer cost vs partition count (in-process, no Aeron)
     add_executable(rune_producer_flush_scaling_bench
@@ -961,11 +1001,16 @@ if(BUILD_TESTING)
             tests/producer/ProducerSendTest.cpp
             tests/producer/DirectIngressTest.cpp
             tests/producer/ProducerFlushDirtyTest.cpp
+            tests/producer/ProducerAckTokenTest.cpp
+            tests/producer/ProducerCloseTest.cpp
             tests/detail/M2ORingBufferTest.cpp
             tests/detail/OneToOneRingBufferTest.cpp
+            tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/shard/ShardConfigTest.cpp
             tests/client/HubCommandClientTest.cpp
+            tests/client/CompletionsClientTest.cpp
+            tests/client/HandleLifetimeTest.cpp
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

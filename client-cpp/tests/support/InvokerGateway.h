@@ -14,6 +14,8 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
+#include <rune/protocol/client/SchemaMessages.h>
+#include <rune/protocol/client/TxnMessages.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -21,6 +23,7 @@
 #include <Subscription.h>
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <set>
 #include <span>
@@ -92,6 +95,34 @@ struct InvokerGateway {
     int  pings        = 0;
     std::vector<std::vector<uint8_t>> offsetCommits;  // raw OffsetCommit frames received
     bool replyOffsetCommits = true;
+    // F8c C3: control-op replies (all off by default = the historical gateway).
+    bool    replyConnects   = true;   // false: ConnectRequests are counted, never answered
+    bool    replyPongs      = false;  // Ping -> Pong{echo}
+    int16_t pingErrorCode   = 0;      // != 0: Ping -> ErrorResponse{code, the ping's corrId}
+    std::vector<int64_t> pingCorrIds; // correlationIds of the Pings received
+    bool    replySchemas    = false;  // DefineTopic / GetTopicSchema -> their responses
+    int32_t schemaTopicId   = 7;
+    uint16_t schemaVersion  = 1;
+    uint16_t schemaErrorCode = 0;
+    std::vector<uint8_t> schemaBlob;  // the GetTopicSchema descriptor blob
+    int defines = 0;
+    int schemaGets = 0;
+    std::vector<int64_t> subscribeCorrIds;  // correlationIds of the Subscribes received
+    // F8c C5 / F14: transactional requests.  Counted always; InitProducerId is
+    // answered when replyInitPid: the next code of initPidCodes (popped), or
+    // OK{initPid, epoch 0} once it is empty.  Others are never answered.
+    bool                initPidReply = false;
+    std::deque<int16_t> initPidCodes;
+    int64_t             initPid = 4242;
+    int initPids = 0, addPartitions = 0, addOffsets = 0, txnOffsetCommits = 0, endTxns = 0;
+    // C10: the sessionId stamped on every txn COORDINATOR request received
+    // (InitProducerId / AddPartitionsToTxn / EndTxn) — which client session
+    // carried it (the seed session = the coordinator's, vs a partition leader's).
+    std::vector<int64_t> coordinatorSessionIds;
+    // F8c C7: answer AddPartitionsToTxn and EndTxn OK (txn close tests); the
+    // commit flag of every EndTxn received (1 commit / 0 abort).
+    bool                 replyTxn = false;
+    std::vector<uint8_t> endTxnCommits;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -241,6 +272,7 @@ private:
             const auto c = rcc::decodeConnectRequest(buf, len);
             if (!c) return;
             ++connects;
+            if (!replyConnects) return;
             for (const Produced& pr : ackBeforeNextConnect) ack(pr);
             ackBeforeNextConnect.clear();
             uint8_t out[64];
@@ -277,6 +309,7 @@ private:
         case rcc::TemplateId::Subscribe: {
             const auto sv = rcc::decodeSubscribe(buf, len);
             if (!sv) return;
+            subscribeCorrIds.push_back(sv->correlationId);
             const Subscribed sub{nextSubscriptionId++, sv->topicId, sv->partition, sv->sessionId};
             subscribed.push_back(sub);
             uint8_t out[64];
@@ -288,6 +321,53 @@ private:
         }
         case rcc::TemplateId::Ping: {
             ++pings;
+            const auto pv = rcc::decodePing(buf, len);
+            if (!pv) return;
+            pingCorrIds.push_back(pv->correlationId);
+            if (pingErrorCode != 0) {
+                std::vector<uint8_t> out(256);
+                const std::size_t n = rcc::encodeErrorResponse(out.data(), out.size(), pingErrorCode,
+                                                               "ping refused", pv->sessionId,
+                                                               pv->correlationId);
+                send(0, out.data(), n);
+            } else if (replyPongs) {
+                std::vector<uint8_t> out(64 + pv->echo.size());
+                const std::size_t n =
+                    rcc::encodePong(out.data(), out.size(), pv->echo, pv->sessionId, pv->correlationId);
+                send(0, out.data(), n);
+            }
+            return;
+        }
+        case rcc::TemplateId::DefineTopic: {
+            ++defines;
+            const auto d = rp::DefineTopic::decode(buf, len);
+            if (!d || !replySchemas) return;
+            rp::DefineTopicResponse r;
+            r.sessionId     = d->sessionId;
+            r.correlationId = d->correlationId;
+            r.topicId       = schemaTopicId;
+            r.version       = schemaVersion;
+            r.errorCode     = schemaErrorCode;
+            std::vector<uint8_t> out(r.encodedSize());
+            const std::size_t n = r.encode(out.data());
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::GetTopicSchema: {
+            ++schemaGets;
+            const auto g = rp::GetTopicSchema::decode(buf, len);
+            if (!g || !replySchemas) return;
+            rp::TopicSchemaResponse r;
+            r.sessionId      = g->sessionId;
+            r.correlationId  = g->correlationId;
+            r.topicId        = schemaTopicId;
+            r.version        = schemaVersion;
+            r.errorCode      = schemaErrorCode;
+            r.descriptorBlob = schemaBlob.data();
+            r.descriptorLen  = static_cast<uint32_t>(schemaBlob.size());
+            std::vector<uint8_t> out(r.encodedSize());
+            const std::size_t n = r.encode(out.data());
+            send(0, out.data(), n);
             return;
         }
         case rcc::TemplateId::OffsetCommit: {
@@ -299,6 +379,55 @@ private:
             rsp.correlationId = oc->correlationId;
             std::vector<uint8_t> out(rp::OffsetCommitResponse::encodedSizeFor(0));
             const std::size_t n = rsp.encode(out.data(), {});
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::InitProducerId: {
+            ++initPids;
+            const auto ip = rp::InitProducerId::decode(buf, len);
+            if (ip) coordinatorSessionIds.push_back(ip->sessionId);
+            if (!ip || !initPidReply) return;
+            rp::InitProducerIdResponse rsp;
+            rsp.sessionId     = ip->sessionId;
+            rsp.correlationId = ip->correlationId;
+            if (!initPidCodes.empty()) {
+                rsp.errorCode = initPidCodes.front();
+                initPidCodes.pop_front();
+            }
+            rsp.producerId    = rsp.errorCode == 0 ? initPid : -1;
+            rsp.producerEpoch = 0;
+            std::vector<uint8_t> out(rp::InitProducerIdResponse::ENCODED_SIZE);
+            const std::size_t n = rsp.encode(out.data());
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::AddPartitionsToTxn: {
+            ++addPartitions;
+            const auto ap = rp::AddPartitionsToTxn::decode(buf, len);
+            if (ap) coordinatorSessionIds.push_back(ap->sessionId);
+            if (!ap || !replyTxn) return;
+            rp::AddPartitionsToTxnResponse rsp;
+            rsp.sessionId     = ap->sessionId;
+            rsp.correlationId = ap->correlationId;
+            std::vector<uint8_t> out(rp::AddPartitionsToTxnResponse::encodedSizeFor(0));
+            const std::size_t n = rsp.encode(out.data(), {});
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::AddOffsetsToTxn:    ++addOffsets; return;
+        case rcc::TemplateId::TxnOffsetCommit:    ++txnOffsetCommits; return;
+        case rcc::TemplateId::EndTxn: {
+            ++endTxns;
+            const auto et = rp::EndTxn::decode(buf, len);
+            if (!et) return;
+            coordinatorSessionIds.push_back(et->sessionId);
+            endTxnCommits.push_back(et->commit);
+            if (!replyTxn) return;
+            rp::EndTxnResponse rsp;
+            rsp.sessionId     = et->sessionId;
+            rsp.correlationId = et->correlationId;
+            std::vector<uint8_t> out(rp::EndTxnResponse::ENCODED_SIZE);
+            const std::size_t n = rsp.encode(out.data());
             send(0, out.data(), n);
             return;
         }

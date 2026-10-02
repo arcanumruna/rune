@@ -1,4 +1,5 @@
 // tests/producer/ProducerSendTest.cpp — back-pressure is propagated, never dropped.
+#include "../support/AckLedger.h"
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/CountingSink.h>
@@ -64,8 +65,7 @@ TEST(ProducerSend, VoidSendNeverDropsOnFullRingRegression) {
     // consumer, and a loaded CI/TSan run can lag it enough to trip the default
     // 1 s liveness window, turning a slow-but-fine drain into a spurious throw.
     cfg.agentLivenessTimeoutMs = 30'000;
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, /*ringCap=*/4 * 1024);
+    auto* impl = new ProducerImpl(cfg, /*ringCap=*/4 * 1024);
     Producer p(impl);
     constexpr uint64_t kRecords = 2000;
     std::thread drainer([&] {  // plays the runner thread
@@ -96,8 +96,7 @@ TEST(ProducerSend, VoidSendNeverDropsOnFullRingRegression) {
 TEST(ProducerSend, VoidSendThrowsWhenTheRunnerStopsDrainingRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.agentLivenessTimeoutMs = 5;
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    auto* impl = new ProducerImpl(cfg, 4 * 1024);
     // Injected clock: +1 ms per read, so liveness expires after a few back-offs.
     impl->setClockForTesting(+[]() noexcept -> int64_t {
         static int64_t t = 0;
@@ -109,8 +108,7 @@ TEST(ProducerSend, VoidSendThrowsWhenTheRunnerStopsDrainingRegression) {
 }
 
 TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothingRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
     Producer p(impl);
     uint64_t ok = 0;
     SendResult last = SendResult::Ok;
@@ -126,8 +124,7 @@ TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothingRegression) {
 }
 
 TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDroppedRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr);
+    auto* impl = new ProducerImpl(voidCfg());
     Producer p(impl);
     const std::vector<uint8_t> tooBig(Producer::kMaxSendValueBytes + 1, 0);
     EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), tooBig), SendResult::ValueTooLarge);
@@ -140,10 +137,9 @@ TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDroppedRegression) {
 // ring's maxMsgLength must map to ValueTooLarge (not BackPressured) — otherwise
 // sendBlocking would retry it forever (nothing ever makes room for it).
 TEST(ProducerSend, ValueLargerThanRingMaxMsgLengthIsValueTooLargeNotBackPressuredRegression) {
-    std::atomic<int64_t> corr{1};
     // Smallest usable ring: 64 B usable capacity -> maxMsgLength = 64/8 = 8 B,
     // far smaller than kMaxSendValueBytes.
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, /*ringCap=*/64);
+    auto* impl = new ProducerImpl(voidCfg(), /*ringCap=*/64);
     Producer p(impl);
     const std::vector<uint8_t> val(32, 0x11); // fits kMaxSendValueBytes, not this ring
     EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), val), SendResult::ValueTooLarge);
@@ -154,13 +150,12 @@ TEST(ProducerSend, ValueLargerThanRingMaxMsgLengthIsValueTooLargeNotBackPressure
 // not report 0 work while a real record waits right past the wrap — drainRing
 // must continue into it within the SAME call.
 TEST(ProducerSend, RingWrapPaddingDoesNotReportIdleRegression) {
-    std::atomic<int64_t> corr{1};
     // 48-byte records (38-byte header + 2-byte value, aligned to 8): a 512 B
     // ring holds exactly 10 (480 B) before the 11th hits real back-pressure
     // (not the wrap case this test targets). Draining 5 reopens total capacity
     // but leaves only 32 B contiguous to the physical buffer end, so the next
     // send pads that remainder and wraps to offset 0 — the scenario under test.
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, /*ringCap=*/512);
+    auto* impl = new ProducerImpl(voidCfg(), /*ringCap=*/512);
     Producer p(impl);
     const std::vector<uint8_t> val(2, 0x22);
     for (uint64_t i = 0; i < 10; ++i) {
@@ -206,8 +201,7 @@ TEST(ProducerSend, RingWrapPaddingDoesNotReportIdleRegression) {
 // a duty-cycle callback) is used instead of idling/waiting on the heartbeat —
 // the blocking send succeeds immediately, with no liveness-timeout wait at all.
 TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -215,7 +209,7 @@ TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
     struct PumpCtx {
         ProducerImpl* impl;
         int           calls = 0;
-    } ctx{impl.get()};
+    } ctx{impl};
     impl->setPumpFn(
         +[](void* raw) noexcept -> PumpResult {
             auto* c = static_cast<PumpCtx*>(raw);
@@ -237,8 +231,7 @@ TEST(ProducerSend, VoidSendPumpsInsteadOfWaitingOnItselfRegression) {
 // FAST with std::runtime_error, never spin and never silently wait out the
 // liveness timeout.
 TEST(ProducerSend, VoidSendThrowsInsteadOfPumpingWhenPumpDeclinesRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -267,8 +260,7 @@ TEST(ProducerSend, VoidSendThrowsInsteadOfPumpingWhenPumpDeclinesRegression) {
 TEST(ProducerSend, NonDutyThreadNeverInvokesPumpHookFallsBackToHeartbeatWaitRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.agentLivenessTimeoutMs = 5;
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    auto* impl = new ProducerImpl(cfg, 4 * 1024);
     impl->setClockForTesting(+[]() noexcept -> int64_t {
         static int64_t t = 0;
         return t += 1'000'000;
@@ -296,8 +288,7 @@ TEST(ProducerSend, NonDutyThreadNeverInvokesPumpHookFallsBackToHeartbeatWaitRegr
 // closed word before sendBlocking could ever call a (potentially dangling)
 // pumpFn_/pumpCtx_.
 TEST(ProducerSend, ClosedRingNeverInvokesThePumpHookRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -321,47 +312,38 @@ TEST(ProducerSend, ClosedRingNeverInvokesThePumpHookRegression) {
 // Task 13 fix1 I8 / minor 13
 // ---------------------------------------------------------------------------
 
-// The callback overload must never destroy an uncalled callback on an invalid
-// topic — it fires with -1 (the same "not accepted" signal failUnsubmitted
-// uses on back-pressure), consistent with every other invalid-input path.
-TEST(ProducerSend, CallbackSendOnInvalidTopicInvokesCallbackWithMinusOneRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr);
+// F8c C6 (replaces the fix1 I8 callback test): a token send on an invalid
+// topic is rejected synchronously — the exactly-once rule: nothing that was
+// not accepted ever completes (no "-1 callback" any more).
+TEST(ProducerSend, AckTokenSendOnInvalidTopicIsRejectedWithNoCompletionRegression) {
+    auto* impl = new ProducerImpl(voidCfg());
     Producer p(impl);
-    bool called = false;
-    int64_t got = 0;
-    p.send(TopicHandle{}, Key(uint64_t{1}), kVal, [&](int64_t offset) {
-        called = true;
-        got = offset;
-    });
-    EXPECT_TRUE(called) << "the callback must never be destroyed uncalled";
-    EXPECT_EQ(got, -1);
+    test_support::AckLedger L;
+    L.attach(*impl);
+    EXPECT_EQ(p.trySend(TopicHandle{}, Key(uint64_t{1}), kVal, rune::client::AckToken{1}),
+              SendResult::InvalidTopic);
+    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), kVal, rune::client::AckToken{rune::client::kMaxToken + 1}),
+              SendResult::InvalidArgument);
+    impl->failAllPending(rune::client::OpStatus::Closed);
+    EXPECT_TRUE(L.recs.empty()) << "a rejected send never completes";
 }
 
-// fix1 minor 13: failUnsubmitted's reason string distinguishes BackPressured
-// from ValueTooLarge (previously one generic "back-pressure or invalid value"
-// string covered both). The want_future_t overload surfaces the reason as the
-// rejected future's exception message, so it is observable here.
-TEST(ProducerSend, FailUnsubmittedReasonIsDistinctPerSendResultRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+// fix1 minor 13 (F8c C6 form): the rejection of a token send is the
+// SendResult itself — BackPressured and ValueTooLarge stay distinct, and
+// neither ever completes.
+TEST(ProducerSend, RejectedAckTokenSendResultIsDistinctPerCauseRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
     Producer p(impl);
+    test_support::AckLedger L;
+    L.attach(*impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
-
-    auto backPressuredFut = p.send(kTopic, Key(uint64_t{ok}), kVal, rune::client::want_future);
-    std::string backPressuredMsg;
-    try { backPressuredFut.get(); } catch (const std::exception& e) { backPressuredMsg = e.what(); }
-    ASSERT_FALSE(backPressuredMsg.empty());
-
+    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{ok}), kVal, rune::client::AckToken{1}), SendResult::BackPressured);
     const std::vector<uint8_t> tooBig(Producer::kMaxSendValueBytes + 1, 0);
-    auto tooLargeFut = p.send(kTopic, Key(uint64_t{ok}), tooBig, rune::client::want_future);
-    std::string tooLargeMsg;
-    try { tooLargeFut.get(); } catch (const std::exception& e) { tooLargeMsg = e.what(); }
-    ASSERT_FALSE(tooLargeMsg.empty());
-
-    EXPECT_NE(backPressuredMsg, tooLargeMsg)
-        << "BackPressured and ValueTooLarge must report DISTINCT reasons, not one generic string";
+    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{ok}), tooBig, rune::client::AckToken{2}), SendResult::ValueTooLarge);
+    impl->failAllPending(rune::client::OpStatus::Closed);  // completes only what was accepted (void here)
+    EXPECT_EQ(L.times(1), 0);
+    EXPECT_EQ(L.times(2), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -381,8 +363,7 @@ TEST(ProducerSend, FailUnsubmittedReasonIsDistinctPerSendResultRegression) {
 TEST(ProducerSend, CloseWhileSendBlockingIsWaitingThrowsPromptlyRegression) {
     ProducerConfig cfg = voidCfg();
     cfg.agentLivenessTimeoutMs = 60'000; // would hang ~a minute if the in-loop check regressed
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(cfg, corr, 4 * 1024);
+    auto* impl = new ProducerImpl(cfg, 4 * 1024);
     Producer p(impl);
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
@@ -426,78 +407,50 @@ TEST(ProducerSend, CloseWhileSendBlockingIsWaitingThrowsPromptlyRegression) {
 }
 
 // ---------------------------------------------------------------------------
-// fix3 I3: failUnsubmitted() runs on the APP thread (Producer::send's
-// callback/future overloads, BatchBuilder::send()) and must never write the
-// duty-thread-only callbackExceptions_ counter — this producer's ring is
-// MPSC, so even multiple app threads could race each other on it, not just
-// the duty thread.
-//
-// fix5 minor 5: made non-vacuous. The fix3 version let its "duty" thread
-// drain the ring continuously, so the app thread's sends mostly SUCCEEDED and
-// the failUnsubmitted path was hit rarely or never. Now the path is forced and
-// counted:
-//   1. kDrained callback-sends (throwing callbacks) are committed to the ring
-//      first — failAllPending() will later complete them on the DUTY thread
-//      through the COUNTED path.
-//   2. The rest of the ring is filled with void sends, so every app-thread
-//      callback-send below back-pressures and is failed RIGHT THERE by
-//      failUnsubmitted() (callback fires on the app thread with offset -1,
-//      synchronously inside send()).
-//   3. Only after the app thread is done does the duty thread run
-//      failAllPending() — gated by a RELAXED flag, which creates no
-//      happens-before edge (for TSan or the memory model), so the app
-//      thread's failUnsubmitted() and the duty thread's counted completions
-//      are genuinely unordered: if failUnsubmitted() still wrote the counter,
-//      TSan reports the race (verified RED with the old counting restored —
-//      see the fix5 report), and the count check below fails in any build.
+// F8c C6 (replaces fix3 I3 / fix5 minor 5, whose failUnsubmitted() is gone):
+// an app thread's REJECTED token sends (ring full) never complete — on any
+// thread — while the duty thread completes the ACCEPTED ones (failAllPending).
+// The ack handler runs on the duty thread only, so the ledger (plain state) is
+// written by one thread; TSan checks that no app-thread path touches it.
 // ---------------------------------------------------------------------------
-TEST(ProducerSend, AppThreadFailUnsubmittedNeverRacesDutyThreadCounterRegression) {
-    std::atomic<int64_t> corr{1};
-    auto impl = std::make_shared<ProducerImpl>(voidCfg(), corr, 4 * 1024);
+TEST(ProducerSend, RejectedTokenSendsNeverCompleteWhileDutyFailsAcceptedRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
     Producer p(impl);
+    test_support::AckLedger L;
+    L.attach(*impl);
 
-    // 1. Committed callback-sends: completed later by the duty thread (counted).
-    constexpr int kDrained = 3;
-    for (int i = 0; i < kDrained; ++i) {
-        p.send(kTopic, Key(static_cast<uint64_t>(i)), kVal, [](int64_t) {
-            throw std::runtime_error("duty-side throw");
-        });
+    // 1. Accepted token sends: completed later by the duty thread.
+    constexpr int kAccepted = 3;
+    for (int i = 0; i < kAccepted; ++i) {
+        ASSERT_EQ(p.trySend(kTopic, Key(static_cast<uint64_t>(i)), kVal,
+                            rune::client::AckToken{static_cast<rune::client::Token>(i + 1)}),
+                  SendResult::Ok);
     }
     // 2. Fill the remainder: from here every send back-pressures.
     ASSERT_GT(fillUntilBackPressured(p), 0u);
 
-    constexpr int kUnsubmitted = 50;
+    constexpr int kRejected = 50;
     std::atomic<bool> appDone{false};
-    std::atomic<int>  unsubmittedHits{0}; // callbacks run on the app thread, inside send()
-    std::atomic<int>  wrongOffset{0};
-    std::thread::id   appId;              // written before any callback can read it
-
+    std::atomic<int>  rejected{0};
     std::thread duty([&] {
-        // Event wait (not passing time): RELAXED on purpose — see above.
-        while (!appDone.load(std::memory_order_relaxed)) std::this_thread::yield();
-        impl->failAllPending("duty-thread failAllPending");
+        while (!appDone.load(std::memory_order_acquire)) std::this_thread::yield();  // event wait
+        impl->failAllPending(rune::client::OpStatus::Closed);
     });
-
     std::thread app([&] {
-        appId = std::this_thread::get_id();
-        for (int i = 0; i < kUnsubmitted; ++i) {
-            p.send(kTopic, Key(static_cast<uint64_t>(1000 + i)), kVal, [&](int64_t offset) {
-                if (std::this_thread::get_id() == appId) unsubmittedHits.fetch_add(1);
-                if (offset != -1) wrongOffset.fetch_add(1);
-                throw std::runtime_error("app-side throw");
-            });
+        for (int i = 0; i < kRejected; ++i) {
+            if (p.trySend(kTopic, Key(static_cast<uint64_t>(1000 + i)), kVal,
+                          rune::client::AckToken{static_cast<rune::client::Token>(1000 + i)}) ==
+                SendResult::BackPressured) {
+                rejected.fetch_add(1);
+            }
         }
-        appDone.store(true, std::memory_order_relaxed);
+        appDone.store(true, std::memory_order_release);
     });
-
     app.join();
     duty.join();
 
-    EXPECT_EQ(unsubmittedHits.load(), kUnsubmitted)
-        << "every app-thread send must have been failed by failUnsubmitted() on the app "
-           "thread (ring full, nothing drained) — otherwise this test exercises nothing";
-    EXPECT_EQ(wrongOffset.load(), 0) << "failUnsubmitted() reports offset -1";
-    // Both writers joined: reading the plain counter is safe here.
-    EXPECT_EQ(impl->testCallbackExceptionCount(), static_cast<uint64_t>(kDrained))
-        << "only the duty thread's completions may be counted; failUnsubmitted() logs only";
+    EXPECT_EQ(rejected.load(), kRejected) << "every app-thread send must have been rejected";
+    EXPECT_TRUE(L.exactlyOnce(1, kAccepted + 1)) << "each accepted token completes exactly once";
+    for (int i = 0; i < kRejected; ++i) EXPECT_EQ(L.times(1000 + i), 0) << "rejected token " << i;
+    EXPECT_EQ(L.recs.size(), static_cast<std::size_t>(kAccepted));
 }

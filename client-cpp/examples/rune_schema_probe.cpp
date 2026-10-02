@@ -4,10 +4,10 @@
 // (default config, NOT in-process), a typed client exercises the FULL 0b typed
 // transport path:
 //
-//   1. connect()                                       — real Aeron session
+//   1. connectAndWait()                                     — real Aeron session
 //   2. defineTopic("characters", 1, "userId",          — runtime DDL, validate ON
 //                  validate=true, <characters blob>)      broker registers schema
-//   3. openTopic<rune::gen::Characters>("characters")  — EXACT-fingerprint gate
+//   3. openTopicAndWait<rune::gen::Characters>("characters")— EXACT-fingerprint gate
 //   4. topic.send(Characters{...}) × N                 — typed produce
 //   5. subscribe(from earliest) + decode each record   — typed consume + decode
 //      via rune::gen::Characters::decode → assert fields == what was sent
@@ -42,6 +42,7 @@
 #include "characters.gen.h"   // build-time generated from characters.blob
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
@@ -53,7 +54,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
-#include <future>
+#include <optional>
+#include <string_view>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -62,6 +64,24 @@
 
 using namespace std::chrono_literals;
 using namespace rune::client;
+
+// F8c C6: one acked send waited on a Completions (examples only — the library
+// deliberately offers no per-record *AndWait sugar).  false = rejected or the
+// wait timed out (`out.status` = Timeout then; the op still completes later).
+static bool sendAndWaitAck(Completions& cq, Producer& p, const TopicHandle& th, const Key& key,
+                           std::span<const uint8_t> v, Token t, int timeoutMs, Completion& out) {
+    for (;;) {
+        const SendResult r = p.trySend(th, key, v, cq, t);
+        if (r == SendResult::Ok) break;
+        if (r == SendResult::QueueFull) { (void)cq.poll([](const Completion&, std::span<const uint8_t>) {}); continue; }
+        if (r != SendResult::BackPressured) { out.status = OpStatus::Closed; return false; }
+        std::this_thread::yield();
+    }
+    const auto w = cq.waitFor(t, std::chrono::milliseconds(timeoutMs),
+                              [&](const Completion& c, std::span<const uint8_t>) { out = c; });
+    if (w != Completions::Wait::Done) { out.status = OpStatus::Timeout; return false; }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Env helpers
@@ -143,14 +163,13 @@ int main() {
 
         // ---- 1. Connect ------------------------------------------------------
         std::cerr << "PROBE: connecting...\n";
-        c.connect().get();
+        c.connectAndWait();
         std::cerr << "PROBE: connected\n";
 
         // ---- 2. defineTopic (validate = ON) ----------------------------------
         std::cerr << "PROBE: defineTopic(\"characters\", 1, \"userId\", validate=true, blob)\n";
-        auto defFut = c.defineTopic("characters", /*partitions=*/1, /*keyField=*/"userId",
-                                    /*validate=*/true, std::span<const uint8_t>(blob));
-        DefineTopicResult def = defFut.get();
+        DefineTopicResult def = c.defineTopicAndWait("characters", /*partitions=*/1, /*keyField=*/"userId",
+                                                     /*validate=*/true, std::span<const uint8_t>(blob));
         if (def.errorCode != 0) {
             std::cerr << "PROBE: FAIL defineTopic errorCode=" << def.errorCode << "\n";
             c.close();
@@ -162,16 +181,21 @@ int main() {
 
         // ---- 3. openTopic<Characters> — EXACT-fingerprint gate ---------------
         std::cerr << "PROBE: openTopic<Characters>(\"characters\")...\n";
-        auto topicFut = c.openTopic<rune::gen::Characters>("characters");
-        {
-            const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-            if (topicFut.wait_until(dl) != std::future_status::ready) {
+        // F8c C3: openTopicAndWait — no std::async thread; throws on a stale
+        // fingerprint, a broker error or the wait timeout.
+        std::optional<TypedTopic<rune::gen::Characters>> topicOpt;
+        try {
+            topicOpt.emplace(c.openTopicAndWait<rune::gen::Characters>(
+                "characters", std::chrono::milliseconds(timeoutMs)));
+        } catch (const std::exception& e) {
+            if (std::string_view(e.what()).find("timed out") != std::string_view::npos) {
                 std::cerr << "PROBE: FAIL openTopic TIMEOUT\n";
                 c.close();
                 return 4;
             }
+            throw;
         }
-        TypedTopic<rune::gen::Characters> topic = topicFut.get();  // throws if fingerprint stale
+        TypedTopic<rune::gen::Characters>& topic = *topicOpt;
         std::cerr << "PROBE: openTopic OK (fingerprint matched broker schema)\n";
 
         // ---- 4. Produce N typed records --------------------------------------
@@ -262,12 +286,11 @@ int main() {
 
             // Garbage: 3 bytes — far shorter than a valid Characters record.
             const std::vector<uint8_t> bad{0x01, 0x02, 0x03};
-            auto badFut = p.send(th, Key(static_cast<uint64_t>(999)),
-                                 std::span<const uint8_t>(bad), want_future);
-
-            const auto dl = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(timeoutMs);
-            if (badFut.wait_until(dl) != std::future_status::ready) {
+            Completions cq(c);
+            Completion  done;
+            const bool  waited = sendAndWaitAck(cq, p, th, Key(static_cast<uint64_t>(999)),
+                                                std::span<const uint8_t>(bad), 1, static_cast<int>(timeoutMs), done);
+            if (!waited && done.status == OpStatus::Timeout) {
                 std::cerr << "PROBE: FAIL malformed-record produce TIMEOUT "
                              "(broker neither acked nor rejected)\n";
                 c.close();
@@ -275,13 +298,12 @@ int main() {
             }
             bool rejected = false;
             std::string why;
-            try {
-                int64_t off = badFut.get();
+            if (waited && done.status == OpStatus::Ok) {
                 std::cerr << "PROBE: FAIL malformed record was ACCEPTED at offset="
-                          << off << " (validation did NOT reject)\n";
-            } catch (const std::exception& ex) {
+                          << done.value << " (validation did NOT reject)\n";
+            } else {
                 rejected = true;
-                why = ex.what();
+                why = "produce rejected by broker (errorCode=" + std::to_string(done.errorCode) + ")";
             }
             if (!rejected) { c.close(); return 8; }
 

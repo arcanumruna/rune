@@ -48,17 +48,16 @@ rc::ProducerConfig benchCfg() {
 }
 
 struct Rig {
-    std::atomic<int64_t>          corr{1};
-    std::shared_ptr<ProducerImpl> impl;
+    std::unique_ptr<ProducerImpl> impl;  // F8c C7: the bare hub holds a raw pointer
     ProducerHub                   hub;
     uint64_t                      frames = 0, bytes = 0;
     CountingSink                  sink{&frames, &bytes};
     int64_t                       now = 1;
 
     Rig(int32_t partitions, bool direct) {
-        impl = std::make_shared<ProducerImpl>(benchCfg(), corr, 4 * 1024 * 1024);
+        impl = std::make_unique<ProducerImpl>(benchCfg(), 4 * 1024 * 1024);
         if (direct) impl->enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, now});
-        hub.add(impl);
+        hub.add(impl.get());
         for (int32_t p = 0; p < partitions; ++p) {
             send(p);
             if ((p & 63) == 63) cycle();

@@ -161,7 +161,7 @@ TEST(InvokerAgent, CloseAdoptsRegistrationPastRingWrapRegression) {
     // the 32 B remaining to the physical buffer end, so it pads that remainder
     // and wraps, landing the WHOLE record at offset 0.
     void* const fakeHandle = reinterpret_cast<void*>(0x1234);
-    ASSERT_TRUE(agent.submitRegisterProducer(fakeHandle));
+    ASSERT_EQ(agent.submitRegisterProducer(fakeHandle), rca::ClientAgent::Submit::Accepted);
 
     // Before the fix: the first (and, since drainRegistrationsForClose() stops
     // on n==0, ONLY) read() call sees head(480)..bufferEnd(512) as pure
@@ -211,7 +211,7 @@ TEST(InvokerAgent, CloseDrainWaitsPastUncommittedClaimRegression) {
     // A real registration, committed immediately, lands right behind the
     // still-uncommitted claim above (the ring's tail already reflects both).
     void* const fakeHandle = reinterpret_cast<void*>(0x5678);
-    ASSERT_TRUE(agent.submitRegisterProducer(fakeHandle));
+    ASSERT_EQ(agent.submitRegisterProducer(fakeHandle), rca::ClientAgent::Submit::Accepted);
 
     // Deterministic, single-threaded: the yield hook commits the stuck claim
     // from INSIDE drainRegistrationsForClose()'s own wait loop, on the same
@@ -273,7 +273,7 @@ TEST(InvokerAgent, CloseDrainUnblocksAnOrphanedClaimAndAdoptsWhatIsBehindRegress
     // The orphan: claimed and NEVER committed (no hook commits it here).
     ASSERT_GE(agent.testClaimNoopWithoutCommitting(8), 0);
     void* const fakeHandle = reinterpret_cast<void*>(0x9abc);
-    ASSERT_TRUE(agent.submitRegisterProducer(fakeHandle));
+    ASSERT_EQ(agent.submitRegisterProducer(fakeHandle), rca::ClientAgent::Submit::Accepted);
 
     constexpr int kCap = 64; // instead of the 1M production default — same code path
     agent.testSetCloseDrainUnblockAfterYields(kCap);

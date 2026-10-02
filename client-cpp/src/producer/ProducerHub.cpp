@@ -21,13 +21,50 @@ namespace rune::client::producer {
 // ordinal, encoded into every batch correlation id it emits.
 // ---------------------------------------------------------------------------
 
-void ProducerHub::add(std::shared_ptr<ProducerImpl> impl)
+void ProducerHub::add(ProducerImpl* impl)
 {
-    if (producers_.size() > batchcorr::kMaxOrdinal) {
-        throw std::length_error("ProducerHub: at most 4096 producers per client");
+    uint32_t ord = 0;
+    if (producers_.size() <= batchcorr::kMaxOrdinal) {
+        ord = static_cast<uint32_t>(producers_.size());
+        producers_.push_back(impl);
+    } else if (freeHead_ < freeOrdinals_.size()) {
+        // F8c C7: every fresh ordinal is taken — reuse the oldest released one
+        // (FIFO: the longest time for late ProduceResponses of its previous
+        // producer to have arrived and been dropped).
+        ord = freeOrdinals_[freeHead_++];
+        if (freeHead_ == freeOrdinals_.size()) {
+            freeOrdinals_.clear();
+            freeHead_ = 0;
+        }
+        producers_[ord] = impl;
+    } else {
+        throw std::length_error("ProducerHub: at most 4096 live producers per client");
     }
-    impl->setOrdinal(static_cast<uint32_t>(producers_.size()));
-    producers_.push_back(std::move(impl));
+    if (nextBase_.size() <= ord) nextBase_.resize(ord + 1, 0);
+    impl->setOrdinal(ord, nextBase_[ord]);  // F2: past every sequence a previous incarnation used
+    active_.push_back(impl);  // m2: walks visit only the live producers
+}
+
+void ProducerHub::remove(ProducerImpl* impl) noexcept
+{
+    const uint32_t ord = impl->ordinal();
+    if (ord >= producers_.size() || producers_[ord] != impl) return;
+    producers_[ord] = nullptr;
+    // F2: the next producer on this ordinal starts past every sequence this one
+    // ever used (cold: once per released producer).
+    if (nextBase_.size() > ord) nextBase_[ord] = impl->sequenceEnd() + 1;
+    for (std::size_t i = 0; i < active_.size(); ++i) {
+        if (active_[i] == impl) {
+            active_[i] = active_.back();
+            active_.pop_back();
+            break;
+        }
+    }
+    try {
+        freeOrdinals_.push_back(ord);
+    } catch (...) {
+        // Out of memory: the ordinal is simply never reused.
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -39,18 +76,27 @@ void ProducerHub::onProduceResponse(int64_t correlationId, int64_t baseOffset) {
     // never by the publisher the response arrived on.
     if (!batchcorr::isBatch(correlationId)) return;       // txn / non-producer id
     const uint32_t o = batchcorr::ordinal(correlationId);
-    if (o < producers_.size()) producers_[o]->onProduceResponse(correlationId, baseOffset);
-}
-
-void ProducerHub::failAll(const std::string& reason) {
-    for (auto& impl : producers_) {
-        impl->failAllPending(reason);
+    if (o < producers_.size() && producers_[o] != nullptr) {
+        producers_[o]->onProduceResponse(correlationId, baseOffset);
     }
 }
 
-void ProducerHub::failPending(int64_t corrId, const std::string& reason) {
-    for (auto& impl : producers_) {
-        impl->failBatch(corrId, reason);
+void ProducerHub::failAll(OpStatus st) {
+    for (std::size_t i = 0; i < active_.size(); ++i) {
+        if (active_[i] != nullptr) active_[i]->failAllPending(st);
+    }
+}
+
+void ProducerHub::closeFinalAll(OpStatus st, int stalledYieldsBeforeUnblock) {
+    for (std::size_t i = 0; i < active_.size(); ++i) {
+        if (active_[i] != nullptr) active_[i]->closeFinal(st, stalledYieldsBeforeUnblock);
+    }
+}
+
+void ProducerHub::failPending(int64_t corrId) {
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
+        impl->failBatch(corrId);
     }
 }
 
@@ -58,7 +104,8 @@ bool ProducerHub::retryRedirectedProduce(
     int64_t corrId,
     std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn)
 {
-    for (auto& impl : producers_) {
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         if (impl->retryRedirectedProduce(corrId, sendFn)) {
             return true;
         }
@@ -71,7 +118,8 @@ int ProducerHub::resendAllRedirected(
     std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     int resent = 0;
-    for (auto& impl : producers_) {
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         resent += impl->resendAllRedirected(newSessionId, sendFn);
     }
     return resent;
@@ -81,21 +129,24 @@ int ProducerHub::resendAllViaRoute(
     std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn)
 {
     int resent = 0;
-    for (auto& impl : producers_) {
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         resent += impl->resendAllViaRoute(sendFn);
     }
     return resent;
 }
 
 bool ProducerHub::hasInFlight() const noexcept {
-    for (const auto& impl : producers_) {
+    for (const ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         if (impl->hasInFlight()) return true;
     }
     return false;
 }
 
 void ProducerHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
-    for (auto& impl : producers_) {
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         impl->sweepTimedOut(now);
     }
 }
@@ -104,7 +155,8 @@ bool ProducerHub::partitionForCorrId(int64_t corrId,
                                      int32_t& topicId,
                                      int32_t& partition) noexcept
 {
-    for (auto& impl : producers_) {
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         if (impl->partitionForCorrId(corrId, topicId, partition)) {
             return true;
         }
@@ -115,7 +167,8 @@ bool ProducerHub::partitionForCorrId(int64_t corrId,
 bool ProducerHub::firstPendingPartition(int32_t& topicId,
                                         int32_t& partition) const noexcept
 {
-    for (const auto& impl : producers_) {
+    for (const ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         if (impl->firstPendingPartition(topicId, partition)) {
             return true;
         }
@@ -126,7 +179,8 @@ bool ProducerHub::firstPendingPartition(int32_t& topicId,
 void ProducerHub::updateIngressRoute(int32_t topicId, int32_t partition,
                                      int32_t ingressStreamId) noexcept
 {
-    for (auto& impl : producers_) {
+    for (ProducerImpl* impl : active_) {
+        if (impl == nullptr) continue;
         impl->updateIngressRoute(topicId, partition, ingressStreamId);
     }
 }

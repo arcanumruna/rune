@@ -40,6 +40,7 @@
 #include "support/AeronTestErrors.h"
 #include "rune/cli/Cli.h"
 
+#include "support/TestCompletions.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
 #include <rune/codec/Serialize.h>
@@ -629,14 +630,17 @@ TEST(CliLive, SchemaListLive) {
     gw.start();
 
     // Connect.
-    auto connFut = client.connect();
+    test_support::TestCq cq(client);  // F8c C3: this thread's completions
+    auto connFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return client.connect(q, t);
+    });
     const auto cDL = std::chrono::steady_clock::now() + 5s;
-    while (connFut.wait_for(10ms) != std::future_status::ready &&
+    while (!connFut.ready() &&
            std::chrono::steady_clock::now() < cDL) {
         gw.poll(16);
     }
-    ASSERT_EQ(connFut.wait_for(0ms), std::future_status::ready) << "connect failed";
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.ready()) << "connect failed";
+    ASSERT_NO_THROW(connFut.check());
 
     // Before any define: list should be empty.
     {
@@ -645,18 +649,19 @@ TEST(CliLive, SchemaListLive) {
     }
 
     // DefineTopic.
-    auto defFut = client.defineTopic(
-        plan.name, plan.partitions, plan.keyField, false,
-        std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()));
+    auto defFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return client.defineTopic(plan.name, plan.partitions, plan.keyField, false,
+        std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()), q, t);
+    });
 
     const auto dDL = std::chrono::steady_clock::now() + 5s;
-    while (defFut.wait_for(10ms) != std::future_status::ready &&
+    while (!defFut.ready() &&
            std::chrono::steady_clock::now() < dDL) {
         gw.poll(16);
     }
-    ASSERT_EQ(defFut.wait_for(0ms), std::future_status::ready) << "defineTopic future not ready";
+    ASSERT_TRUE(defFut.ready()) << "defineTopic future not ready";
     rune::client::DefineTopicResult dr;
-    ASSERT_NO_THROW(dr = defFut.get());
+    ASSERT_NO_THROW(dr = defFut.defineResult());
     EXPECT_EQ(dr.errorCode, 0u);
 
     // After define: listTopics() must return "characters".
@@ -710,28 +715,32 @@ TEST(CliLive, SchemaListVerbose) {
     gw.start();
 
     // Connect.
-    auto connFut = client.connect();
+    test_support::TestCq cq(client);  // F8c C3: this thread's completions
+    auto connFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return client.connect(q, t);
+    });
     const auto cDL = std::chrono::steady_clock::now() + 5s;
-    while (connFut.wait_for(10ms) != std::future_status::ready &&
+    while (!connFut.ready() &&
            std::chrono::steady_clock::now() < cDL) {
         gw.poll(16);
     }
-    ASSERT_EQ(connFut.wait_for(0ms), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.ready());
+    ASSERT_NO_THROW(connFut.check());
 
     // Define.
-    auto defFut = client.defineTopic(
-        plan.name, plan.partitions, plan.keyField, false,
-        std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()));
+    auto defFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return client.defineTopic(plan.name, plan.partitions, plan.keyField, false,
+        std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()), q, t);
+    });
 
     const auto dDL = std::chrono::steady_clock::now() + 5s;
-    while (defFut.wait_for(10ms) != std::future_status::ready &&
+    while (!defFut.ready() &&
            std::chrono::steady_clock::now() < dDL) {
         gw.poll(16);
     }
-    ASSERT_EQ(defFut.wait_for(0ms), std::future_status::ready);
+    ASSERT_TRUE(defFut.ready());
     rune::client::DefineTopicResult dr;
-    ASSERT_NO_THROW(dr = defFut.get());
+    ASSERT_NO_THROW(dr = defFut.defineResult());
     EXPECT_EQ(dr.errorCode, 0u);
     EXPECT_EQ(dr.topicId, 0x40000003);
 
@@ -741,15 +750,17 @@ TEST(CliLive, SchemaListVerbose) {
     EXPECT_EQ(topics[0].first, "characters");
 
     // GetTopicSchema for verbose info.
-    auto getFut = client.getTopicSchema("characters");
+    auto getFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return client.getTopicSchema("characters", q, t);
+    });
     const auto gDL = std::chrono::steady_clock::now() + 5s;
-    while (getFut.wait_for(10ms) != std::future_status::ready &&
+    while (!getFut.ready() &&
            std::chrono::steady_clock::now() < gDL) {
         gw.poll(16);
     }
-    ASSERT_EQ(getFut.wait_for(0ms), std::future_status::ready);
+    ASSERT_TRUE(getFut.ready());
     rune::client::TopicSchemaResult sr;
-    ASSERT_NO_THROW(sr = getFut.get());
+    ASSERT_NO_THROW(sr = getFut.schemaResult());
     EXPECT_EQ(sr.errorCode, 0u);
     EXPECT_EQ(sr.version, 2u);
     ASSERT_FALSE(sr.descriptorBlob.empty());
@@ -870,24 +881,28 @@ TEST(CliLiveRegression, ListLive_TopicPresent) {
     gw.start();
 
     // Connect.
-    auto connFut = client.connect();
+    test_support::TestCq cq(client);  // F8c C3: this thread's completions
+    auto connFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return client.connect(q, t);
+    });
     const auto cDL = std::chrono::steady_clock::now() + 5s;
-    while (connFut.wait_for(10ms) != std::future_status::ready &&
+    while (!connFut.ready() &&
            std::chrono::steady_clock::now() < cDL) { gw.poll(16); }
-    ASSERT_EQ(connFut.wait_for(0ms), std::future_status::ready);
-    ASSERT_NO_THROW(connFut.get());
+    ASSERT_TRUE(connFut.ready());
+    ASSERT_NO_THROW(connFut.check());
 
     // Define.
-    auto defFut = client.defineTopic(
-        plan.name, plan.partitions, plan.keyField, false,
-        std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()));
+    auto defFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return client.defineTopic(plan.name, plan.partitions, plan.keyField, false,
+        std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()), q, t);
+    });
 
     const auto dDL = std::chrono::steady_clock::now() + 5s;
-    while (defFut.wait_for(10ms) != std::future_status::ready &&
+    while (!defFut.ready() &&
            std::chrono::steady_clock::now() < dDL) { gw.poll(16); }
-    ASSERT_EQ(defFut.wait_for(0ms), std::future_status::ready);
+    ASSERT_TRUE(defFut.ready());
     rune::client::DefineTopicResult dr;
-    ASSERT_NO_THROW(dr = defFut.get());
+    ASSERT_NO_THROW(dr = defFut.defineResult());
     EXPECT_EQ(dr.errorCode, 0u) << "regression: define must succeed";
 
     // listTopics must contain "characters".

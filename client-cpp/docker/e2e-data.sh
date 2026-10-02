@@ -45,7 +45,7 @@ fi
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-DATA_IMAGE="rune-client-data:e2e-$(date +%s)"
+DATA_IMAGE="rune-client-data:$(cd "${CLIENT_REPO}" && git rev-parse --short HEAD)"  # git SHA, never dev/latest
 CLIENT_HOSTNAME="rune-data-client"
 CLIENT_EGRESS_PORT="40402"   # different port from e2e-client.sh to avoid conflict
 
@@ -165,6 +165,9 @@ log "Step 4: Building rune-client-data image (${DATA_IMAGE})..."
 docker build \
     --platform linux/amd64 \
     --build-context rune-protocol="${CLIENT_REPO}/../rune-protocol" \
+    --build-context rune-fr="${CLIENT_REPO}/../rune-fr" \
+    --build-context rune-codec="${CLIENT_REPO}/../rune-codec" \
+    --build-context rune-ql="${CLIENT_REPO}/../rune-ql" \
     -f "${CLIENT_REPO}/docker/Dockerfile.data" \
     -t "${DATA_IMAGE}" \
     "${CLIENT_REPO}" 2>&1 \

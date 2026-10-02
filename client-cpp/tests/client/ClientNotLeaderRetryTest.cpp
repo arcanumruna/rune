@@ -23,6 +23,7 @@
 //   - a separate case: a gateway that ALWAYS returns bare NotLeader exhausts the
 //     redirect/retry budget and the future then fails (cbError only after budget).
 
+#include "../support/TestCompletions.h"
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
@@ -45,7 +46,6 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -219,15 +219,17 @@ static std::unique_ptr<Client> makeConnectedClient(const std::string& agentDir,
     std::this_thread::sleep_for(150ms);
     gwOut = std::make_unique<GW>(aeronDir, inStr, egStr);
 
-    auto connFut = client->connect();
+    test_support::TestCq connFutCq(*client);
+
+    auto connFut = connFutCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
     bool connected = false;
     for (int i = 0; i < kPumpMax; ++i) {
         gwOut->poll(16);
-        if (connFut.wait_for(0s) == std::future_status::ready) { connected = true; break; }
+        if (connFut.ready()) { connected = true; break; }
         std::this_thread::sleep_for(kPumpSleep);
     }
     EXPECT_TRUE(connected) << "Failed to connect to NotLeader gateway";
-    connFut.get();
+    connFut.check();
     return client;
 }
 
@@ -249,17 +251,18 @@ TEST(ClientNotLeaderRetry, BareNotLeaderTriggersRefreshNotError) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 12'000;
     auto p  = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("inventory");
     ASSERT_TRUE(th.valid());
 
     Key key(uint64_t{7});
     const std::vector<uint8_t> val = {0x01, 0x02, 0x03};
-    auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
     bool done = false;
     for (int i = 0; i < kPumpMax; ++i) {
         gw->poll(16);
-        if (fut.wait_for(0s) == std::future_status::ready) { done = true; break; }
+        if (fut.ready()) { done = true; break; }
         std::this_thread::sleep_for(kPumpSleep);
     }
 
@@ -268,7 +271,7 @@ TEST(ClientNotLeaderRetry, BareNotLeaderTriggersRefreshNotError) {
         << gw->producesSeen.load() << " produce(s))";
 
     int64_t baseOffset = -1;
-    ASSERT_NO_THROW({ baseOffset = fut.get(); })
+    ASSERT_NO_THROW({ baseOffset = fut.offset(); })
         << "Produce future must NOT throw — bare NotLeader is retried, not errored";
     EXPECT_GE(baseOffset, NotLeaderGateway::kBaseOffset);
 
@@ -303,23 +306,24 @@ TEST(ClientNotLeaderRetry, PersistentNotLeaderFailsAfterBudgetExhausted) {
     pcfg.acks = Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
     pcfg.maxInFlight = 4; pcfg.produceTimeoutMs = 20'000;
     auto p  = client->producer(pcfg);
+    test_support::TestCq cqP(*client);
     auto th = client->topic("inventory");
     ASSERT_TRUE(th.valid());
 
     Key key(uint64_t{9});
     const std::vector<uint8_t> val = {0xAA};
-    auto fut = p.send(th, key, std::span<const uint8_t>(val), want_future);
+    auto fut = cqP.send(p, th, key, std::span<const uint8_t>(val));
 
     bool done = false;
     for (int i = 0; i < kPumpMax * 6; ++i) {
         gw->poll(16);
-        if (fut.wait_for(0s) == std::future_status::ready) { done = true; break; }
+        if (fut.ready()) { done = true; break; }
         std::this_thread::sleep_for(kPumpSleep);
     }
     ASSERT_TRUE(done) << "Produce future must resolve (fail) after retry budget exhausted";
 
     bool threw = false;
-    try { fut.get(); } catch (...) { threw = true; }
+    try { fut.offset(); } catch (...) { threw = true; }
     EXPECT_TRUE(threw)
         << "Produce future must throw once the bare-NotLeader retry budget is exhausted";
 

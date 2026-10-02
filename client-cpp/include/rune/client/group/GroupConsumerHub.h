@@ -15,7 +15,7 @@
 //   onJoinGroupResponse(...)        — state machine: Joining → Syncing
 //   onSyncGroupResponse(...)        — state machine: Syncing → Stable
 //   onHeartbeatResponse(...)        — state machine: Stable → Rejoining (on error)
-//   onOffsetCommitResponse(...)     — resolve commitSync promise
+//   onOffsetCommitResponse(...)     — complete the pending commitSync (F8c C4)
 //   onAssign(...)                   — inline assignment update (Assign frame 44)
 //   closeAll()                      — deactivate all consumers on Client::close()
 
@@ -39,7 +39,7 @@
 namespace rune::client::group {
 
 // The duty-thread-owned consumer list.
-using ImplList = std::vector<std::shared_ptr<GroupConsumerImpl>>;
+using ImplList = std::vector<GroupConsumerImpl*>;  // F8c C7: not owning (see owned_)
 
 // SendFn: (ingressStreamId, buf, len) -> bool.
 // ingressStreamId=0 means "use the default ingress stream".
@@ -61,17 +61,57 @@ public:
 
     /// Register a GroupConsumerImpl (duty thread; Client reaches it via
     /// HubCommand{GroupAdd}).  Cold path.
-    void add(std::shared_ptr<GroupConsumerImpl> impl);
+    void add(GroupConsumerImpl* impl);
+
+    /// F8c C7: the handle released `impl` (its HandleRelease was applied and
+    /// the consumer closed): once nothing references it any more (no callback
+    /// of it running, no LeaveGroup being retried, no dirty snapshot), forget
+    /// it and return true — the caller detaches the duty side's share (and
+    /// frees the impl if the handle already detached).  Call only between
+    /// duty cycles' hub walks (never from inside a hub iteration).
+    [[nodiscard]] bool release(GroupConsumerImpl* impl) noexcept;
+
+    /// Client close (after closeAll): every impl this hub still owns is
+    /// handed back through `detach(impl)`; the hub holds nothing afterwards.
+    template <class Detach>
+    void handBackAll(Detach&& detach) noexcept {
+        std::vector<GroupConsumerImpl*> owned;
+        owned.swap(owned_);
+        impls_.clear();
+        for (GroupConsumerImpl* impl : owned) detach(impl);
+    }
+
+    /// Finish `impl` locally (inactive, a pending commitSync Closed, status
+    /// closed — deferred past its running callback) with no LeaveGroup sent.
+    void finishLocal(GroupConsumerImpl& impl) { finish_(impl); }
+
+    /// F8c C7 F1: visit every impl this hub owns (cold: an orphan scan).
+    template <class F>
+    void forEachOwned(F&& f) {
+        for (std::size_t i = 0; i < owned_.size(); ++i) f(*owned_[i]);
+    }
+
+    /// Impls this hub owns (adopted, not yet released and forgotten).
+    [[nodiscard]] std::size_t ownedCount() const noexcept { return owned_.size(); }
 
     /// Apply one group HubCommand drained from the agent ring.  Non-group ops
     /// are ignored.  A command naming an impl this hub does not hold is
-    /// ignored (a commitSync promise it carries is failed, never dropped).
-    void applyCommand(const detail::HubCommand& cmd);
+    /// ignored (a commitSync it carries completes Closed, never dropped).
+    /// `nowNs`: the duty clock (a commitSync's deadline starts here).
+    void applyCommand(const detail::HubCommand& cmd, int64_t nowNs = 0);
 
     /// fix3 I3: the same command applied DIRECTLY on the duty thread by a
     /// caller whose handle holds the impl (cmd.handle is dereferenced): acts on
     /// the impl even before its GroupAdd (still in the ring) is adopted.
-    void applyCommandDirect(const detail::HubCommand& cmd);
+    void applyCommandDirect(const detail::HubCommand& cmd, int64_t nowNs = 0);
+
+    /// F8c C4: where commitSync completions go (the Client's registry).  Set
+    /// before start; without one a handler target is called directly.
+    void setCompletionSink(detail::CompletionSink sink) noexcept { completions_ = sink; }
+
+    /// F8c C4: complete every commitSync whose deadline (duty clock) passed
+    /// with OpStatus::Timeout.  Returns how many.
+    int sweepCommitSyncTimeouts(int64_t nowNs);
 
     /// fix3 M4: LeaveGroup frames the transport refused (GroupConsumer close),
     /// retried every duty cycle; dropped on a session change.
@@ -138,7 +178,7 @@ public:
     int flushRequestedCommits(int64_t sessionId);
 
     /// F8a fix2 (IM-2): the session went down (Connected -> anything else):
-    /// fail every pending commitSync now — progress-driven, no timeout.
+    /// complete every pending commitSync SessionLost now — progress-driven.
     void onSessionDown();
 
     /// F8a fix3 I2 (level-triggered session state, duty thread).  While not
@@ -174,8 +214,15 @@ public:
     }
 
 private:
-    // ---- Registered consumers (duty-thread owned; never shrinks) -------------
+    // ---- Registered consumers (duty-thread owned) ------------------------------
+    // impls_: the consumers the duty cycle drives (active at adoption).  Index
+    // loops capture the size first (a handler may adopt one); an entry is
+    // removed only by release(), which never runs inside a hub walk.
     ImplList impls_;
+    // F8c C7: every impl whose GroupAdd this hub adopted (also one closed
+    // before its adoption), until release() forgets it or Client close hands
+    // it back.
+    std::vector<GroupConsumerImpl*> owned_;
 
     // fix1 C1 / fix2 minor-5: plain counter (see testCallbackExceptionCount()).
     uint64_t callbackExceptions_ = 0;
@@ -191,7 +238,7 @@ private:
     int64_t currentSessionId_ = 0;
     int64_t sessionEpisode_   = 0;
     std::size_t pendingLeaves_ = 0;
-    void applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl);
+    void applyTo_(const detail::HubCommand& cmd, GroupConsumerImpl* impl, int64_t nowNs);
     static std::size_t encodeLeave_(GroupConsumerImpl& impl, int64_t sessionId);
     void sendLeave_(GroupConsumerImpl& impl);
     // F8a fix2.
@@ -212,8 +259,9 @@ private:
 
     enum class CommitSend : uint8_t { Nothing, Sent, SendFailed, Fatal };
 
-    static void failCommitSync_(GroupConsumerImpl& impl, const char* why);
-    static void failCommitSyncSessionLost_(GroupConsumerImpl& impl, const char* why);
+    /// F8c C4: complete impl's pending commitSync (if any) exactly once.
+    void completeCommitSync_(GroupConsumerImpl& impl, OpStatus st, uint16_t errorCode = 0);
+    detail::CompletionSink completions_{};
     int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     static void closeStatus_(GroupConsumerImpl& impl);
     void toRejoining_(GroupConsumerImpl& impl);
@@ -260,9 +308,9 @@ private:
     /// The registered impl whose address is `handle`, or nullptr.
     GroupConsumerImpl* find_(uint64_t handle) const noexcept;
 
-    /// Deactivate impl: inactive, fail a pending commitSync with `why`, close
+    /// Deactivate impl: inactive, complete a pending commitSync Closed, close
     /// its status ring (deferred to the end of its running callback, if any).
-    void finish_(GroupConsumerImpl& impl, const char* why);
+    void finish_(GroupConsumerImpl& impl);
 
     /// Apply a new assignment to impl: fire revoked+assigned callbacks. Not
     /// static (fix1 C1): catches/counts a throwing callback via callbackExceptions_.

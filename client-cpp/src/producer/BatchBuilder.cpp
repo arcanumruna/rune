@@ -4,6 +4,7 @@
 
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/Completions.h>
 
 #include <chrono>
 #include <stdexcept>
@@ -11,25 +12,14 @@
 namespace rune::client {
 
 namespace {
-const char* tier2RejectText(producer::RejectReason why) noexcept {
+OpResult tier2Result(producer::RejectReason why) noexcept {
     using producer::RejectReason;
     switch (why) {
-    case RejectReason::Closed:
-        return "Tier-2 batch rejected — client closed — batch dropped";
-    case RejectReason::WrongThread:
-        return "Tier-2 batch rejected — wrong thread (invoker-mode producer used off its owner "
-               "thread) — batch dropped";
-    case RejectReason::DeferredFull:
-        return "Tier-2 batch rejected — deferred buffer full (sent from inside the producer's own "
-               "duty-cycle callback) — batch dropped";
-    case RejectReason::PartitionDeferred:
-        return "Tier-2 batch rejected — its partition still has deferred records (sends made from a "
-               "duty-cycle callback) that cannot be sent yet; retry later — batch dropped";
-    case RejectReason::Unaddressable:
-        return "Tier-2 batch rejected — unaddressable partition (the producer's partition table is "
-               "full) — batch dropped";
-    default:
-        return "Tier-2 batch ring full — batch dropped";
+    case RejectReason::None:          return OpResult::Accepted;
+    case RejectReason::Closed:        return OpResult::Closed;
+    case RejectReason::WrongThread:   return OpResult::WrongThread;
+    case RejectReason::Unaddressable: return OpResult::InvalidArgument;
+    default:                          return OpResult::BackPressured;  // ring / arena full, partition deferred
     }
 }
 } // namespace
@@ -48,10 +38,10 @@ inline int64_t wallNs() noexcept {
 // Construction
 // ---------------------------------------------------------------------------
 
-BatchBuilder::BatchBuilder(std::shared_ptr<producer::ProducerImpl> impl,
+BatchBuilder::BatchBuilder(producer::ProducerImpl* impl,
                            int32_t topicId,
                            int32_t partition) noexcept
-    : impl_(std::move(impl))
+    : impl_(impl)
     , topicId_(topicId)
     , partition_(partition)
     , sent_(false)
@@ -68,7 +58,7 @@ void BatchBuilder::add(std::span<const uint8_t> value) {
 void BatchBuilder::add(std::span<const uint8_t> value,
                        std::string_view         record_key)
 {
-    if (sent_) {
+    if (sent_ || !batchBytes_.empty()) {
         throw std::logic_error("BatchBuilder: add after send");
     }
 
@@ -89,45 +79,126 @@ void BatchBuilder::add(std::span<const uint8_t> value,
 // send() — flush as one atomic RecordBatch
 // ---------------------------------------------------------------------------
 
-std::future<int64_t> BatchBuilder::send() {
+OpResult BatchBuilder::submit_(uint64_t ackHandle) {
     if (sent_) {
         throw std::logic_error("BatchBuilder: send called more than once");
     }
-
-    if (!builder_ || builder_->recordCount() == 0) {
-        throw std::invalid_argument("BatchBuilder: empty batch — must add() at least one record before send()");
+    if (batchBytes_.empty()) {
+        if (!builder_ || builder_->recordCount() == 0) {
+            throw std::invalid_argument(
+                "BatchBuilder: empty batch — must add() at least one record before send()");
+        }
+        // Build the RecordBatch bytes ONCE (kept across a rejected send for a
+        // retry).  baseSequence / producerId / epoch are patched by the agent.
+        recordCount_ = builder_->recordCount();
+        builder_->buildInto(batchBytes_);
+        builder_.reset();  // single-use
     }
-
-    sent_ = true;
-
-    // Register a future for the ack (Tier-2 always returns a future).
-    auto [ackHandle, fut] = impl_->registerFuture();
-
-    const int32_t recordCount = builder_->recordCount();
-
-    // Build the RecordBatch bytes into a local vector.
-    // NOTE: baseSequence is left as 0 here.  The agent thread will patch the
-    // correct baseSequence (from PartitionState.nextBaseSequence) before
-    // encoding the Produce wire frame.  Producer ID and epoch are also left 0
-    // here; the agent patches them from the shared producerId_/producerEpoch_.
-    std::vector<uint8_t> batchBytes;
-    builder_->buildInto(batchBytes);
-    builder_.reset(); // release memory; builder is single-use
-
-    // Submit to ProducerImpl: the heap Tier2Entry's address travels through the
-    // ring (kMsgTier2Batch token) so the agent processes it in submission order
-    // relative to Tier-1 records on the same partition.
-    const producer::RejectReason why = impl_->submitTier2Batch(
-        topicId_, partition_, ackHandle, recordCount, std::move(batchBytes));
-
-    if (why != producer::RejectReason::None) {
-        // CB-5 A3: not accepted — fail the specific promise immediately (the
-        // batch never reached the producer; the future would otherwise hang).
-        // Task 14 fix4: the text comes from the RETURNED reason only.
-        impl_->failUnsubmitted(ackHandle, tier2RejectText(why));
+    // Submit: the heap Tier2Entry's address travels through the ring
+    // (kMsgTier2Batch token), in submission order with Tier-1 records.  The
+    // bytes are moved only when accepted.
+    const producer::RejectReason why =
+        impl_->submitTier2Batch(topicId_, partition_, ackHandle, recordCount_, batchBytes_);
+    if (why == producer::RejectReason::None) {
+        sent_ = true;
+        batchBytes_.clear();
+        batchBytes_.shrink_to_fit();
     }
+    return tier2Result(why);
+}
 
-    return std::move(fut);
+namespace {
+// The batch-ack credit unit of a batchAcksTo() producer (one per Tier-2 batch).
+OpResult reserveUnit(Completions* bq) noexcept {
+    if (bq == nullptr) return OpResult::Accepted;
+    if (!bq->onOwnerThread()) return OpResult::WrongThread;
+    return bq->reserve(producer::kAckRecordBytes);
+}
+} // namespace
+
+// Review m3: a deliberate deviation from the spec's "debug check" — it runs in
+// every build: one acquire load of a cache line written once per lifetime,
+// per batch (cold relative to the per-record path).
+void BatchBuilder::checkProducer_() const {
+    // F8c C7 (spec §3.1 rule 1): a BatchBuilder borrows its producer and must
+    // not outlive the Producer handle.  Caught while the duty side still holds
+    // the impl (the handle's share is gone); after the impl is freed this read
+    // itself is the bug (ASan reports it).
+    if (impl_ == nullptr || impl_->handleDetached()) {
+        throw std::logic_error("BatchBuilder: used after its Producer was destroyed");
+    }
+}
+
+OpResult BatchBuilder::send() {
+    checkProducer_();
+    Completions* bq = impl_->batchAckCq();
+    const OpResult u = reserveUnit(bq);
+    if (u != OpResult::Accepted) return u;
+    OpResult r = OpResult::InvalidArgument;
+    try {
+        r = submit_(0);
+    } catch (...) {
+        if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
+        throw;
+    }
+    if (bq != nullptr) {
+        if (r == OpResult::Accepted) ++bq->producerIssued_;
+        else bq->unreserve(producer::kAckRecordBytes);
+    }
+    return r;
+}
+
+OpResult BatchBuilder::send(Completions& cq, Token token) {
+    checkProducer_();
+    if (token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx ||
+        cq.ring_ == nullptr) {
+        return OpResult::InvalidArgument;
+    }
+    if (!cq.onOwnerThread()) return OpResult::WrongThread;
+    const OpResult rr = cq.reserve(producer::kAckRecordBytes);
+    if (rr != OpResult::Accepted) return rr;
+    Completions* bq = impl_->batchAckCq();
+    const OpResult u = reserveUnit(bq);
+    if (u != OpResult::Accepted) {
+        cq.unreserve(producer::kAckRecordBytes);
+        return u;
+    }
+    OpResult r = OpResult::InvalidArgument;
+    try {
+        r = submit_(producer::ackhandle::forCq(cq.cqRef_, token));
+    } catch (...) {
+        cq.unreserve(producer::kAckRecordBytes);
+        if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
+        throw;
+    }
+    if (r == OpResult::Accepted) {
+        ++cq.producerIssued_;
+        if (bq != nullptr) ++bq->producerIssued_;
+    } else {
+        cq.unreserve(producer::kAckRecordBytes);
+        if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
+    }
+    return r;
+}
+
+OpResult BatchBuilder::send(AckToken token) {
+    checkProducer_();
+    if (token.token > kMaxToken) return OpResult::InvalidArgument;
+    Completions* bq = impl_->batchAckCq();
+    const OpResult u = reserveUnit(bq);
+    if (u != OpResult::Accepted) return u;
+    OpResult r = OpResult::InvalidArgument;
+    try {
+        r = submit_(producer::ackhandle::forHandler(token.token));
+    } catch (...) {
+        if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
+        throw;
+    }
+    if (bq != nullptr) {
+        if (r == OpResult::Accepted) ++bq->producerIssued_;
+        else bq->unreserve(producer::kAckRecordBytes);
+    }
+    return r;
 }
 
 } // namespace rune::client

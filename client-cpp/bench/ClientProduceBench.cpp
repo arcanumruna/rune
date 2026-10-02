@@ -6,12 +6,13 @@
 //   BM_ProduceRTT
 //     Produces a single 64-byte record (Tier-1 auto-batch, Acks::Leader) and
 //     waits for the ProduceResponse.  Measures wall-clock of
-//     producer.send(…,want_future).get() per iteration.
+//     producer.trySend(…, cq, token) + cq.waitFor(token) per iteration (F8c C6:
+//     a polled completion, yielding idle — no future / condvar).
 //     Gate: p99 < 100µs.
 //
 //   BM_SubscribeDeliveryLatency
 //     Produces one record, then measures the wall-clock from the final byte of
-//     the produce future resolution (gateway has sent ProduceResponse) until the
+//     the produce completion (gateway has sent ProduceResponse) until the
 //     SubscribeResponse + first delivered record hits the RecordHandler.
 //     This is the end-to-end "write-to-read" delivery latency.
 //     Gate: p99 < 100µs.
@@ -25,10 +26,11 @@
 //       Subscribe      → SubscribeResponse{subscriptionId=1, startOffset}
 //                        then pushes a RecordBatch back for each subscribe
 //   - Produce RTT: the full app→ring→agent→transport→gateway→transport→agent→
-//                  promise path.
+//                  completion-ring path.
 //   - Subscribe delivery: gap from produce-ack to first RecordHandler call.
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
@@ -51,8 +53,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
-#include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -350,12 +352,7 @@ struct BenchFixture {
         gw->start(kIngressStream, kEgressStream);
 
         // Connect.
-        auto fut = client->connect();
-        const auto dl = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(kConnTimeoutMs);
-        if (fut.wait_until(dl) != std::future_status::ready)
-            throw std::runtime_error("BenchFixture: connect() timed out");
-        fut.get();
+        client->connectAndWait(std::chrono::milliseconds(kConnTimeoutMs));
 
         th = client->topic("bench_topic");
         if (!th.valid())
@@ -373,18 +370,35 @@ struct BenchFixture {
         auto p = client->producer(pcfg);
         Key key(uint64_t{0});
         const std::vector<uint8_t> wval = {'w','a','r','m'};
+        cq = std::make_unique<Completions>(*client);
 
         for (int i = 0; i < kWarmupIter; ++i) {
-            auto wf = p.send(th, key, std::span<const uint8_t>(wval), want_future);
-            const auto wdl = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(kOpTimeoutMs);
-            if (wf.wait_until(wdl) != std::future_status::ready)
-                throw std::runtime_error("BenchFixture: warm-up produce timed out");
-            wf.get();
+            if (ackedSend(p, th, key, std::span<const uint8_t>(wval)) < 0)
+                throw std::runtime_error("BenchFixture: warm-up produce failed / timed out");
         }
     }
 
+    std::unique_ptr<Completions> cq;  // F8c C6: the bench thread's ack queue
+    Token                        nextToken = 1;
+
+    /// One acked send, waited by polling `cq` (yielding idle).  Returns the
+    /// offset, or -1 on failure / timeout.
+    int64_t ackedSend(Producer& p, const TopicHandle& t, const Key& k, std::span<const uint8_t> v) {
+        const Token tok = nextToken++;
+        SendResult r;
+        while ((r = p.trySend(t, k, v, *cq, tok)) == SendResult::BackPressured) std::this_thread::yield();
+        if (r != SendResult::Ok) return -1;
+        int64_t off = -1;
+        const auto w = cq->waitFor(tok, std::chrono::milliseconds(kOpTimeoutMs),
+                                   [&](const Completion& c, std::span<const uint8_t>) {
+                                       off = c.status == OpStatus::Ok ? c.value : -1;
+                                   },
+                                   NoPump{}, aeron::concurrent::YieldingIdleStrategy{});
+        return w == Completions::Wait::Done ? off : -1;
+    }
+
     ~BenchFixture() {
+        cq.reset();
         if (client) { client->close(); client.reset(); }
         if (gw)     { gw->stop(); gw.reset(); }
         try { std::filesystem::remove_all(agentDir); } catch (...) {}
@@ -421,19 +435,8 @@ static void BM_ProduceRTT(benchmark::State& state) {
         state.ResumeTiming();
 
         const auto t0 = std::chrono::steady_clock::now();
-        auto fut = p.send(g_fixture->th, kKey,
-                          std::span<const uint8_t>(kVal),
-                          want_future);
-
-        const auto dl = t0 + std::chrono::milliseconds(kOpTimeoutMs);
-        if (fut.wait_until(dl) != std::future_status::ready) {
-            state.SkipWithError("ProduceRTT: future timed out");
-            break;
-        }
-        try {
-            (void)fut.get();
-        } catch (const std::exception& ex) {
-            state.SkipWithError(ex.what());
+        if (g_fixture->ackedSend(p, g_fixture->th, kKey, std::span<const uint8_t>(kVal)) < 0) {
+            state.SkipWithError("ProduceRTT: produce failed or timed out");
             break;
         }
         const auto t1 = std::chrono::steady_clock::now();
@@ -476,8 +479,12 @@ static void BM_ProduceRTT(benchmark::State& state) {
         (frames > 0) ? static_cast<double>(records) / static_cast<double>(frames)
                      : 0.0;
 
+    // Always report (a gate failure skips the benchmark's counters).
+    std::fprintf(stderr, "PRODUCE_RTT mean_us=%.2f p50_us=%.2f p99_us=%.2f p999_us=%.2f samples=%zu\n",
+                 mean, pct(0.50), pct(0.99), pct(0.999), n);
     // Enforce gate: p99 < 100µs.
-    if (pct(0.99) >= 100.0) {
+    // A p99 needs samples: google-benchmark's 1-iteration probe run must not trip the gate.
+    if (n >= 100 && pct(0.99) >= 100.0) {
         state.SkipWithError("GATE FAIL: ProduceRTT p99 >= 100µs");
     }
 }
@@ -586,19 +593,9 @@ static void BM_SubscribeDeliveryLatency(benchmark::State& state) {
 
         // Produce: gateway will send ProduceResponse (stamps ackNs) then
         // push RecordBatch (triggers delivery).
-        auto fut = p.send(g_fixture->th, kKey,
-                          std::span<const uint8_t>(kVal),
-                          want_future);
-
-        // Wait for produce ack.
-        const auto dl = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(kOpTimeoutMs);
-        if (fut.wait_until(dl) != std::future_status::ready) {
-            state.SkipWithError("SubscribeDelivery: produce timed out");
+        if (g_fixture->ackedSend(p, g_fixture->th, kKey, std::span<const uint8_t>(kVal)) < 0) {
+            state.SkipWithError("SubscribeDelivery: produce failed or timed out");
             break;
-        }
-        try { (void)fut.get(); } catch (const std::exception& ex) {
-            state.SkipWithError(ex.what()); break;
         }
 
         // Wait for delivery.

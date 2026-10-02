@@ -10,7 +10,7 @@
 
 #include <atomic>
 #include <chrono>
-#include <future>
+#include "../support/TestCompletions.h"
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -41,8 +41,23 @@ rc::ClientConfig hubCfg(int32_t in, int32_t eg, rc::RunnerMode mode) {
     return c;
 }
 
-template <class F>
-bool readyNow(F& f) { return f.wait_for(0s) == std::future_status::ready; }
+/// F8c C4: a handler-target ledger (exactly-once counts per token).  The
+/// handler runs on the duty thread (or the closing thread): only read it once
+/// that thread is this one (Invoker) or joined (after close()).
+struct HandlerLedger {
+    int             times = 0;
+    rc::Completion  last{};
+    static void on(void* ctx, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+        auto* self = static_cast<HandlerLedger*>(ctx);
+        ++self->times;
+        self->last = c;
+    }
+    rc::CompletionHandler handler() { return rc::CompletionHandler{&HandlerLedger::on, this}; }
+};
+
+test_support::PendingOp commitSyncOp(test_support::TestCq& cq, rc::GroupConsumer& gc) {
+    return cq.issue([&](rc::Completions& q, rc::Token t) { return gc.commitSync(q, t); });
+}
 
 rc::Subscription subscribeT(rc::Client& c) {
     return c.subscribe(c.topic("t"), /*partition=*/0, rc::SubscribeOptions{rc::From::earliest()},
@@ -55,22 +70,28 @@ const char* modeName(rc::RunnerMode m) { return m == rc::RunnerMode::Invoker ? "
 
 // Commands still sitting in the agent ring when close() runs (Invoker: nothing
 // ever drained them) are applied by close()'s final drain and then finished —
-// a commitSync future fails, handles report inactive.  Never a hang.
+// a commitSync completes Closed (exactly once), handles report inactive.
 TEST(HubCommandClient, CommandsStillInTheRingAreFinishedByCloseRegression) {
     int port = 3960;
     for (const rc::RunnerMode mode : {rc::RunnerMode::Invoker, rc::RunnerMode::Thread}) {
         SCOPED_TRACE(modeName(mode));
         rc::Client client(hubCfg(port, port + 1, mode));
         port += 2;
+        test_support::TestCq cq(client);
         auto sub = subscribeT(client);
         auto gc  = client.subscribeGroup("g", {"t"});
-        auto f   = gc.commitSync();
+        auto f   = commitSyncOp(cq, gc);
+        ASSERT_TRUE(f.accepted()) << f.describe();
         EXPECT_TRUE(sub.active());
         EXPECT_TRUE(gc.active());
 
         client.close();
-        ASSERT_TRUE(readyNow(f)) << "commitSync must be failed by close(), not stranded";
-        EXPECT_THROW(f.get(), std::runtime_error);
+        ASSERT_TRUE(f.ready()) << "commitSync must be completed by close(), not stranded";
+        // Never connected: the hub completes it SessionLost when it applies it
+        // (level-triggered, fix3 I2) — by the runner, or by close()'s drain.
+        EXPECT_EQ(f.status(), rc::OpStatus::SessionLost);
+        EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+        EXPECT_TRUE(cq.q().finished());
         EXPECT_FALSE(sub.active());
         EXPECT_FALSE(gc.active());
     }
@@ -92,9 +113,11 @@ TEST(HubCommandClient, HandlesOutliveTheirClientRegression) {
         EXPECT_EQ(sub.position(), 0);
         EXPECT_NO_THROW(sub.unsubscribe());
         EXPECT_NO_THROW(gc.commit());
-        auto f = gc.commitSync();
-        ASSERT_TRUE(readyNow(f));
-        EXPECT_THROW(f.get(), std::runtime_error);
+        HandlerLedger led;
+        EXPECT_EQ(gc.commitSync(led.handler(), 1), rc::OpResult::Closed)
+            << "rejected synchronously: the handle never touches the dead Client";
+        EXPECT_EQ(led.times, 0);
+        EXPECT_THROW(gc.commitSyncAndWait(1s), std::runtime_error);
         EXPECT_NO_THROW(gc.close());
         // Destructors run here, after the Client is gone.
     }
@@ -109,14 +132,14 @@ TEST(HubCommandClient, SubscribeAfterCloseReturnsFinishedHandlesRegression) {
     EXPECT_FALSE(sub.active());
     auto gc = client.subscribeGroup("g", {"t"});
     EXPECT_FALSE(gc.active());
-    auto f = gc.commitSync();
-    ASSERT_TRUE(readyNow(f));
-    EXPECT_THROW(f.get(), std::runtime_error);
+    HandlerLedger led;
+    EXPECT_EQ(gc.commitSync(led.handler(), 1), rc::OpResult::Closed);
+    EXPECT_EQ(led.times, 0);
 }
 
 // A command committed to the ring AFTER close()'s final drain already ran (the
 // exact window the post-submit re-check exists for) is reported as closed:
-// the handle is finished and a commitSync future is failed — never stranded.
+// the handle is finished and a commitSync is rejected Closed — never stranded.
 TEST(HubCommandClient, CommandRacingCloseIsNeverStrandedRegression) {
     {
         // Thread mode: the app thread's registration goes through the ring (on
@@ -138,9 +161,10 @@ TEST(HubCommandClient, CommandRacingCloseIsNeverStrandedRegression) {
         rc::Client client(hubCfg(3978, 3979, rc::RunnerMode::Thread));
         auto gc = client.subscribeGroup("g", {"t"});
         client.testSetBeforeRegistrationSubmitHook([&] { client.close(); });
-        auto f = gc.commitSync();
-        ASSERT_TRUE(readyNow(f)) << "a commitSync racing close() must fail at once";
-        EXPECT_THROW(f.get(), std::runtime_error);
+        HandlerLedger led;
+        EXPECT_EQ(gc.commitSync(led.handler(), 1), rc::OpResult::Closed)
+            << "a commitSync racing close() is rejected (linearized by the ring), never stranded";
+        EXPECT_EQ(led.times, 0);
         EXPECT_FALSE(gc.active());
     }
 }
@@ -188,8 +212,9 @@ TEST(HubCommandClient, HubCommandFromCallbackWithFullRingFailsFastRegression) {
         return false;
     };
     ASSERT_TRUE(drive([&] { return gw.ready(); }));
-    auto f = client.connect();
-    ASSERT_TRUE(drive([&] { return readyNow(f); }));
+    test_support::TestCq cq(client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(drive([&] { return f.ready(); }));
     EXPECT_FALSE(commitThrew) << "commit() inside a callback is applied directly";
     EXPECT_TRUE(threw) << "a ring-only command fails fast on a full ring inside a callback";
 
@@ -237,11 +262,16 @@ struct HubRig {
     void settle(int cycles = 2'000) {
         for (int i = 0; i < cycles; ++i) { client.doWork(); gw.pump(); }
     }
+    // F8c C3: the test thread's completions (Invoker: this thread is the owner).
+    test_support::TestCq cq{client};
+    test_support::PendingOp pingOp(const rc::Bytes& payload) {
+        return cq.issue([&](rc::Completions& q, rc::Token t) { return client.ping(payload, q, t); });
+    }
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
-        auto f = client.connect();
-        ASSERT_TRUE(drive([&] { return readyNow(f); }));
-        f.get();
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
     }
 };
 
@@ -301,7 +331,9 @@ TEST(HubCommandClient, RingFullUnsubscribeStillStopsDispatchRegression) {
 }
 
 // C1(b): the destructor under a full ring blocks only until the duty thread
-// makes progress, then dispatch is stopped.
+// makes progress, then dispatch is stopped.  F8c C7 fix round 1 (I-2): an
+// Invoker-mode release off the owner thread goes through the command ring
+// (never touches duty state) — the owner keeps pumping concurrently here.
 TEST(HubCommandClient, DestructorUnderFullRingStopsDispatchRegression) {
     HubRig r(3986);
     r.connect();
@@ -329,6 +361,7 @@ TEST(HubCommandClient, DestructorUnderFullRingStopsDispatchRegression) {
     r.gw.pushRecords(r.gw.subscribed[0], 0, 2);
     r.settle();
     EXPECT_EQ(got.load(), 0) << "the destroyed subscription's handler must never run";
+    EXPECT_EQ(r.client.testSubscriptionImplsHeld(), 0u) << "the duty side let go (reaped)";
 }
 
 // C1(a): unsubscribe from inside the handler on the duty thread is applied
@@ -357,23 +390,83 @@ TEST(HubCommandClient, UnsubscribeInsideHandlerAppliesDirectlyRegression) {
     EXPECT_EQ(r.gw.unsubscribed[0], r.gw.subscribed[0].subscriptionId);
 }
 
-// I6: commitSync() from inside a duty-cycle callback throws instead of
-// creating a future that can never resolve.
-TEST(HubCommandClient, CommitSyncFromDutyCallbackThrowsRegression) {
+// F8c C4 (was I6): the TOKEN form of commitSync is allowed from inside a
+// duty-cycle callback (it is just a command applied there) and completes
+// exactly once; only the blocking commitSyncAndWait() throws there (it would
+// wait for the very duty thread it blocks).
+TEST(HubCommandClient, CommitSyncTokenFromCallbackIsAllowedRegression) {
     HubRig r(3990);
     auto gc = r.client.subscribeGroup("g", {"t"});
-    bool threw = false;
+    HandlerLedger led;
+    rc::OpResult inCbHandler = rc::OpResult::Closed;
+    rc::OpResult inCbCq      = rc::OpResult::Closed;
+    test_support::PendingOp cqOp;
+    bool waitThrew = false;
+    bool threwOther = false;
     r.client.onConnected([&](int64_t) {
         try {
-            (void)gc.commitSync();
+            inCbHandler = gc.commitSync(led.handler(), 7);
+            cqOp        = commitSyncOp(r.cq, gc);  // supersedes the handler one
+            inCbCq      = cqOp.issued();
+        } catch (...) {
+            threwOther = true;
+        }
+        try {
+            gc.commitSyncAndWait(1s);
         } catch (const std::logic_error&) {
-            threw = true;
+            waitThrew = true;
         }
     });
     r.connect();
-    EXPECT_TRUE(threw);
-    // Outside a callback, on the owner thread, it is allowed (the app pumps).
-    EXPECT_NO_THROW((void)gc.commitSync());
+    EXPECT_FALSE(threwOther) << "the token form must not throw inside a callback";
+    EXPECT_EQ(inCbHandler, rc::OpResult::Accepted);
+    EXPECT_EQ(inCbCq, rc::OpResult::Accepted);
+    EXPECT_TRUE(waitThrew) << "the blocking form must refuse inside a callback";
+    // The first was superseded by the second (both applied directly, in order).
+    ASSERT_EQ(led.times, 1);
+    EXPECT_EQ(led.last.token, 7u);
+    EXPECT_EQ(led.last.status, rc::OpStatus::Superseded);
+    EXPECT_FALSE(cqOp.ready()) << "pending: the consumer never became Stable";
+    // Outside a callback, on the owner thread, both forms are allowed.
+    auto later = commitSyncOp(r.cq, gc);
+    ASSERT_TRUE(later.accepted()) << later.describe();
+    ASSERT_TRUE(cqOp.ready());
+    EXPECT_EQ(cqOp.status(), rc::OpStatus::Superseded);
+    r.client.close();
+    ASSERT_TRUE(later.ready());
+    EXPECT_EQ(later.status(), rc::OpStatus::Closed);
+    EXPECT_EQ(led.times, 1) << "exactly once";
+    EXPECT_EQ(r.cq.timesCompleted(cqOp.token()), 1);
+    EXPECT_EQ(r.cq.timesCompleted(later.token()), 1);
+}
+
+// F8c C4 (spec Q6): a commitSync that never gets an answer completes Timeout
+// after GroupConfig::commitSyncTimeoutMs of DUTY time — a stepped injected
+// clock, no sleeps — exactly once (close() later delivers nothing more).
+namespace {
+int64_t g_csNow = 1'000'000'000;  // test thread only
+int64_t csNow() noexcept { return g_csNow; }
+} // namespace
+
+TEST(HubCommandClient, CommitSyncTimesOutRegression) {
+    HubRig r(4014, 0, &csNow);
+    r.connect();
+    rc::GroupConfig gcfg;
+    gcfg.commitSyncTimeoutMs = 500;
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    auto f  = commitSyncOp(r.cq, gc);  // never Stable (no group protocol here): no answer
+    ASSERT_TRUE(f.accepted()) << f.describe();
+    r.settle(200);
+    ASSERT_FALSE(f.ready()) << "the clock has not moved";
+    g_csNow += 400'000'000LL;  // 400 ms: still inside the deadline
+    r.settle(200);
+    ASSERT_FALSE(f.ready()) << "completed before its deadline";
+    g_csNow += 200'000'000LL;  // 600 ms total > 500 ms
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 2'000)) << "never timed out on the duty clock";
+    EXPECT_EQ(f.status(), rc::OpStatus::Timeout);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected) << "not a session loss";
+    r.client.close();
+    EXPECT_EQ(r.cq.timesCompleted(f.token()), 1) << "exactly once";
 }
 
 // ===========================================================================
@@ -388,8 +481,11 @@ TEST(HubCommandClient, RingDrainedFrameRetriedUnderTransportBackPressureRegressi
     r.connect();
     r.gw.pauseIngress = true;  // the gateway stops consuming: the publication fills
     constexpr int kPings = 120;  // ~120 KiB >> the 64 KiB term's window
-    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
-    for (int i = 0; i < kPings; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, static_cast<uint8_t>(i))));
+    std::vector<test_support::PendingOp> futs;
+    for (int i = 0; i < kPings; ++i) {
+        futs.push_back(r.pingOp(rc::Bytes(1024, static_cast<uint8_t>(i))));
+        ASSERT_TRUE(futs.back().accepted()) << futs.back().describe();
+    }
     r.settle(5'000);
     ASSERT_GT(r.client.testIngressOfferRefused(), 0u) << "the transport must have refused (back-pressure)";
     r.gw.pauseIngress = false;
@@ -408,8 +504,11 @@ TEST(HubCommandClient, UnsubscribeRetriedWhenTheTransportRefusesItRegression) {
     ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() > 0; }));
 
     r.gw.pauseIngress = true;
-    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
-    for (int i = 0; i < 120; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, 1)));
+    std::vector<test_support::PendingOp> futs;
+    for (int i = 0; i < 120; ++i) {
+        futs.push_back(r.pingOp(rc::Bytes(1024, 1)));
+        ASSERT_TRUE(futs.back().accepted()) << futs.back().describe();
+    }
     r.settle(5'000);
     ASSERT_GT(r.client.testIngressOfferRefused(), 0u) << "the publication must be back-pressured";
 
@@ -437,22 +536,22 @@ TEST(HubCommandClient, CommitSyncFailsWhenTheSessionGoesDownRegression) {
     HubRig r(3996, 0, &hubNow);
     r.connect();
     auto gc = r.client.subscribeGroup("g", {"t"});
-    auto f = gc.commitSync();  // owner thread: applied directly; pending (not Stable)
+    auto f = commitSyncOp(r.cq, gc);  // owner thread: applied directly; pending (not Stable)
     r.settle(100);
-    ASSERT_FALSE(readyNow(f));
+    ASSERT_FALSE(f.ready());
     ASSERT_EQ(r.client.state(), rc::session::SessionState::Connected);
 
     // The broker is gone: no more egress, no reconnect.  Advance the duty
     // clock past the session's response timeout and pump ONLY the client.
     g_hubNow += 11'000'000'000LL;
     bool down = false;
-    for (int i = 0; i < 1'000 && !readyNow(f); ++i) {
+    for (int i = 0; i < 1'000 && !f.ready(); ++i) {
         r.client.doWork();
         down = down || r.client.state() != rc::session::SessionState::Connected;
     }
     EXPECT_TRUE(down);
-    ASSERT_TRUE(readyNow(f)) << "commitSync must fail on the session-down transition";
-    EXPECT_THROW(f.get(), std::runtime_error);
+    ASSERT_TRUE(f.ready()) << "commitSync must complete on the session-down transition";
+    EXPECT_EQ(f.status(), rc::OpStatus::SessionLost);
 }
 
 // fix2 (found while writing the IM-2 test): on the Invoker owner a direct
@@ -462,9 +561,9 @@ TEST(HubCommandClient, DirectCommandNeverOvertakesItsOwnRegistrationRegression) 
     r.connect();
     {
         auto gc = r.client.subscribeGroup("g", {"t"});
-        auto f = gc.commitSync();  // before any doWork(): the add must already be applied
+        auto f = commitSyncOp(r.cq, gc);  // before any doWork(): the add must already be applied
         r.settle(100);
-        EXPECT_FALSE(readyNow(f)) << "commitSync failed as if the consumer did not exist";
+        EXPECT_FALSE(f.ready()) << "commitSync failed as if the consumer did not exist";
         EXPECT_TRUE(gc.active());
     }
     int got = 0;
@@ -490,10 +589,10 @@ TEST(HubCommandClient, OversizePingFailsAtSubmitAndNeverWedgesTheRingRegression)
     HubRig r(4000, /*termBytes=*/64 * 1024);  // max message = 8 KiB
     r.connect();
     ASSERT_EQ(r.client.testMaxFrameLength(), 8u * 1024);
-    auto big = r.client.ping(rc::Bytes(16 * 1024, 7));
-    ASSERT_TRUE(readyNow(big)) << "an oversize frame must fail at submit";
-    EXPECT_THROW(big.get(), std::length_error);
-    auto small = r.client.ping(rc::Bytes(64, 1));
+    auto big = r.pingOp(rc::Bytes(16 * 1024, 7));
+    EXPECT_EQ(big.issued(), rc::OpResult::InvalidArgument) << "an oversize frame must fail at submit";
+    auto small = r.pingOp(rc::Bytes(64, 1));
+    ASSERT_TRUE(small.accepted()) << small.describe();
     ASSERT_TRUE(r.drive([&] { return r.gw.pings == 1; })) << "a later command was wedged";
 }
 
@@ -505,8 +604,8 @@ TEST(HubCommandClient, FatalOfferIsDroppedAndLaterCommandsProceedRegression) {
     ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));  // ring idle
     r.settle(200);
     r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 1);
-    auto a = r.client.ping(rc::Bytes(8, 1));
-    auto b = r.client.ping(rc::Bytes(8, 2));
+    auto a = r.pingOp(rc::Bytes(8, 1));
+    auto b = r.pingOp(rc::Bytes(8, 2));
     ASSERT_TRUE(r.drive([&] { return r.gw.pings >= 1; })) << "the ring was wedged by a Fatal offer";
     r.settle(200);
     EXPECT_EQ(r.gw.pings, 1);
@@ -525,10 +624,10 @@ TEST(HubCommandClient, CommitSyncAfterTheBrokerIsGoneFailsPromptlyRegression) {
         r.client.doWork();
     }
     ASSERT_NE(r.client.state(), rc::session::SessionState::Connected);
-    auto f = gc.commitSync();  // issued AFTER the session-down transition
-    for (int i = 0; i < 100 && !readyNow(f); ++i) r.client.doWork();
-    ASSERT_TRUE(readyNow(f)) << "a commitSync issued while the session is down must fail promptly";
-    EXPECT_THROW(f.get(), std::runtime_error);
+    auto f = commitSyncOp(r.cq, gc);  // issued AFTER the session-down transition
+    for (int i = 0; i < 100 && !f.ready(); ++i) r.client.doWork();
+    ASSERT_TRUE(f.ready()) << "a commitSync issued while the session is down must fail promptly";
+    EXPECT_EQ(f.status(), rc::OpStatus::SessionLost);
 }
 
 // I3 (Invoker): handles created on a NON-owner thread (their Add still queued
@@ -573,8 +672,11 @@ TEST(HubCommandClient, SubscribeRefusedAtAdoptionIsRetriedRegression) {
     HubRig r(4010, /*termBytes=*/64 * 1024);
     r.connect();
     r.gw.pauseIngress = true;
-    std::vector<std::future<rc::Bytes>> futs;  // pre-existing API (F8c converts it)
-    for (int i = 0; i < 120; ++i) futs.push_back(r.client.ping(rc::Bytes(1024, 1)));
+    std::vector<test_support::PendingOp> futs;
+    for (int i = 0; i < 120; ++i) {
+        futs.push_back(r.pingOp(rc::Bytes(1024, 1)));
+        ASSERT_TRUE(futs.back().accepted()) << futs.back().describe();
+    }
     r.settle(5'000);
     ASSERT_GT(r.client.testIngressOfferRefused(), 0u);
     auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
@@ -603,8 +705,9 @@ TEST(HubCommandClient, RunnerCallbackUnsubscribesAnUnadoptedAppHandleRegression)
         return false;
     };
     ASSERT_TRUE(pump([&] { return gw.ready(); }));
-    auto cf = client.connect();
-    ASSERT_TRUE(pump([&] { return readyNow(cf); }));
+    test_support::TestCq cq(client);
+    auto cf = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(pump([&] { return cf.ready(); }));
 
     std::unique_ptr<rc::Subscription> b;  // written by the test thread before `ev`
     std::atomic<int> inHandler{kPending}; // runner -> test: "blocked in A's handler"
@@ -633,7 +736,7 @@ TEST(HubCommandClient, RunnerCallbackUnsubscribesAnUnadoptedAppHandleRegression)
     // (a direct Subscribe sent at B's adoption, or the ring-drained ping) goes
     // out on the same ingress publication — so once the gateway has seen the
     // ping, it has already seen any Subscribe B's adoption could have sent.
-    auto barrier = client.ping(rc::Bytes(8, 1));
+    auto barrier = cq.issue([&](rc::Completions& q, rc::Token t) { return client.ping(rc::Bytes(8, 1), q, t); });
     ASSERT_TRUE(pump([&] { return gw.pings == 1; })) << "the barrier ping never arrived";
     EXPECT_EQ(gw.subscribed.size(), 1u) << "the unsubscribed handle was revived by its late adoption";
     client.close();
@@ -724,7 +827,7 @@ TEST(HubCommandClient, FatalUnsubscribeOfferFinishesLocallyRegression) {
     sub.unsubscribe();  // owner: applied directly -> Fatal
     EXPECT_TRUE(sub.finished());
     EXPECT_EQ(r.client.testPendingUnsubscribes(), 0u) << "a Fatal Unsubscribe is never retried";
-    auto barrier = r.client.ping(rc::Bytes(8, 1));  // FIFO barrier on the same publication
+    auto barrier = r.pingOp(rc::Bytes(8, 1));  // FIFO barrier on the same publication
     ASSERT_TRUE(r.drive([&] { return r.gw.pings == 1; }));
     EXPECT_TRUE(r.gw.unsubscribed.empty());
     EXPECT_EQ(r.client.testIngressFatalDropped(), 1u);
@@ -739,9 +842,9 @@ TEST(HubCommandClient, FatalDropLogIsRateLimitedRegression) {
     r.settle(200);
     r.client.testForceIngressOffers(rc::transport::AeronTransport::OfferResult::Fatal, 3);
     testing::internal::CaptureStderr();
-    auto p1 = r.client.ping(rc::Bytes(8, 1));
-    auto p2 = r.client.ping(rc::Bytes(8, 2));
-    auto p3 = r.client.ping(rc::Bytes(8, 3));
+    auto p1 = r.pingOp(rc::Bytes(8, 1));
+    auto p2 = r.pingOp(rc::Bytes(8, 2));
+    auto p3 = r.pingOp(rc::Bytes(8, 3));
     const bool all = r.drive([&] { return r.client.testIngressFatalDropped() == 3; });
     const std::string err = testing::internal::GetCapturedStderr();
     ASSERT_TRUE(all);
@@ -762,4 +865,162 @@ TEST(HubCommandClient, OversizeSubscribeFrameFailsAtSubscribeRegression) {
     EXPECT_TRUE(r.gw.subscribed.empty());
     auto ok = subscribeT(r.client);
     ASSERT_TRUE(r.drive([&] { return ok.subscriptionId() > 0; }));
+}
+
+// ===========================================================================
+// F8c C5 — transactional producer on completion tokens (Client level)
+// ===========================================================================
+namespace {
+const std::vector<uint8_t> kTxnVal{1, 2, 3};
+}
+
+// Client close completes EVERY outstanding txn token Closed, exactly once,
+// whatever its phase (InitProducerId in flight, two-phase sendOffsets, an
+// EndTxn waiting for its records): CQ targets before the queue is handed back
+// (finished()), handler targets after.  Ops the transaction state machine
+// refuses (abort / init while committing — fix round 1) complete at once,
+// also exactly once.  Later ops are rejected synchronously.  Both runner modes.
+TEST(HubCommandClient, TxnCloseCompletesAllClosedRegression) {
+    {
+        SCOPED_TRACE("Invoker");
+        HubRig r(4016);
+        auto tp = r.client.transactionalProducer("tx-close-all");
+        r.connect();
+        r.gw.initPidReply = true;
+        auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+        ASSERT_TRUE(init.ok()) << init.describe();
+        r.gw.initPidReply = false;  // from here the coordinator never answers
+        tp.beginTransaction();
+        tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+        auto offs = r.cq.issue([&](rc::Completions& q, rc::Token t) {
+            return tp.sendOffsetsToTransaction({{{1, 0}, 5}}, "g", q, t);
+        });
+        auto commit = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+        auto abort  = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.abortTransaction(q, t); });
+        auto init2  = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        // A handler target on a refused op: delivered once, at once.
+        HandlerLedger led;
+        ASSERT_EQ(tp.initTransactions(led.handler(), 99), rc::OpResult::Accepted);
+        for (auto* op : {&offs, &commit, &abort, &init2}) ASSERT_TRUE(op->accepted()) << op->describe();
+        ASSERT_TRUE(r.drive([&] { return r.gw.addPartitions >= 1 && r.gw.addOffsets >= 1; }))
+            << "the requests never reached the coordinator";
+        r.settle(200);
+        for (auto* op : {&offs, &commit}) EXPECT_FALSE(op->ready()) << op->describe();
+        for (auto* op : {&abort, &init2}) {  // refused by state (Committing): at once
+            ASSERT_TRUE(op->ready());
+            EXPECT_EQ(op->status(), rc::OpStatus::BrokerError);
+        }
+        EXPECT_EQ(led.times, 1);
+        EXPECT_EQ(led.last.status, rc::OpStatus::BrokerError);
+
+        r.client.closeImmediately();  // C7: the discarding close (close() aborts first)
+        for (auto* op : {&offs, &commit}) {
+            ASSERT_TRUE(op->ready()) << "stranded by close()";
+            EXPECT_EQ(op->status(), rc::OpStatus::Closed);
+            EXPECT_EQ(r.cq.timesCompleted(op->token()), 1);
+        }
+        for (auto* op : {&abort, &init2}) EXPECT_EQ(r.cq.timesCompleted(op->token()), 1);
+        EXPECT_TRUE(r.cq.q().finished());
+        EXPECT_EQ(led.times, 1);
+        EXPECT_EQ(tp.commitTransaction(led.handler(), 100), rc::OpResult::Closed);
+        EXPECT_EQ(led.times, 1);
+        // A handler-target op still pending at close completes Closed (after the hand-back).
+    }
+    {
+        SCOPED_TRACE("Invoker, handler pending at close");
+        HubRig r(4022);
+        auto tp = r.client.transactionalProducer("tx-close-handler");
+        HandlerLedger led;
+        ASSERT_EQ(tp.initTransactions(led.handler(), 5), rc::OpResult::Accepted);  // never connected
+        r.settle(50);
+        EXPECT_EQ(led.times, 0);
+        r.client.closeImmediately();  // C7: the discarding close (close() aborts first)
+        EXPECT_EQ(led.times, 1);
+        EXPECT_EQ(led.last.status, rc::OpStatus::Closed);
+    }
+    {
+        SCOPED_TRACE("Thread");
+        rc::Client client(hubCfg(4018, 4019, rc::RunnerMode::Thread));
+        test_support::TestCq cq(client);
+        auto tp = client.transactionalProducer("tx-close-thread");
+        auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(init.accepted()) << init.describe();
+        EXPECT_FALSE(init.ready()) << "never connected: nothing answers it";
+        client.closeImmediately();
+        ASSERT_TRUE(init.ready());
+        EXPECT_EQ(init.status(), rc::OpStatus::Closed);
+        EXPECT_EQ(cq.timesCompleted(init.token()), 1);
+        EXPECT_TRUE(cq.q().finished());
+    }
+}
+
+// F14 end to end: InitProducerId answered NotCoordinator re-discovers the
+// coordinator through a MetadataRequest, then retries; a following
+// ConcurrentTransactions backs off and retries; then Ok.
+TEST(HubCommandClient, TxnNotCoordinatorRediscoversThroughMetadataRegression) {
+    HubRig r(4020);
+    auto tp = r.client.transactionalProducer("tx-nc");
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= 1; }));
+    r.settle(200);
+    const int mdBefore = r.gw.metadataRequests;
+    r.gw.initPidReply = true;
+    r.gw.initPidCodes = {static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator),
+                         static_cast<int16_t>(rune::protocol::client::ErrorCode::ConcurrentTransactions)};
+    auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); })) << "never retried after NotCoordinator";
+    EXPECT_EQ(init.status(), rc::OpStatus::Ok) << init.describe();
+    EXPECT_EQ(init.outcome().c.value, 4242);
+    EXPECT_EQ(r.gw.initPids, 3) << "NotCoordinator -> re-discover -> retry -> 27 -> retry";
+    EXPECT_EQ(r.gw.metadataRequests, mdBefore + 1) << "NotCoordinator must re-discover (one MetadataRequest)";
+    EXPECT_EQ(tp.producerId(), 4242);
+    EXPECT_EQ(r.cq.timesCompleted(init.token()), 1);
+}
+
+// C10 (found by the dr-e2e tx suite on a 3-node broker whose partition
+// leaders are spread over the nodes): every transactional frame went through
+// the route of topic 0 / partition 0.  Coordinator requests (InitProducerId,
+// AddPartitionsToTxn, EndTxn) then reached whichever node led partition 0 —
+// not the coordinator, which is the node of the seed session (NotCoordinator,
+// re-discovered and re-sent to the same wrong node until the op timed out) —
+// and txn data for any other partition reached partition 0's leader.
+// Coordinator requests must ride the seed session; a txn Produce must ride
+// ITS partition's leader route.
+TEST(HubCommandClient, TxnFramesRouteCoordinatorToSeedAndDataToPartitionLeaderRegression) {
+    HubRig r(4026);
+    auto tp = r.client.transactionalProducer("tx-route");
+    r.connect();
+    const int64_t seedSid = r.gw.assignedSessionId;  // the seed (coordinator) session
+    // Partition 0 of topic 0 is led by another node (its own session, sid 77).
+    r.gw.assignedSessionId = 77;
+    r.client.testSetRoute(0, 0, "aeron:ipc?alias=p0leader");
+    r.gw.initPidReply = true;
+    auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+    ASSERT_TRUE(init.ok()) << init.describe();
+    ASSERT_FALSE(r.gw.coordinatorSessionIds.empty());
+    for (const int64_t sid : r.gw.coordinatorSessionIds) {
+        EXPECT_EQ(sid, seedSid) << "InitProducerId must go to the coordinator (seed session)";
+    }
+
+    // Topic "t" (id 1) partition 0 is led by a third node (sid 88).
+    r.gw.assignedSessionId = 88;
+    r.client.testSetRoute(1, 0, "aeron:ipc?alias=t1leader");
+    r.gw.replyTxn = true;
+    tp.beginTransaction();
+    tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+    auto commit = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+    ASSERT_TRUE(r.drive([&] { return commit.ready(); })) << commit.describe();
+    EXPECT_EQ(commit.status(), rc::OpStatus::Ok) << commit.describe();
+    ASSERT_FALSE(r.gw.produced.empty());
+    for (const auto& pr : r.gw.produced) {
+        EXPECT_EQ(pr.topicId, 1);
+        EXPECT_EQ(pr.sessionId, 88) << "txn data must ride its partition leader's session";
+    }
+    ASSERT_GE(r.gw.coordinatorSessionIds.size(), 3u) << "InitProducerId + AddPartitions + EndTxn";
+    for (const int64_t sid : r.gw.coordinatorSessionIds) {
+        EXPECT_EQ(sid, seedSid) << "coordinator requests must ride the seed session";
+    }
+    EXPECT_EQ(r.cq.timesCompleted(commit.token()), 1);
 }

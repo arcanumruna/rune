@@ -37,7 +37,6 @@
 #include <rune/client/detail/HubCommand.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -216,7 +215,17 @@ public:
     void start();
 
     /// Stop the agent (idempotent).  Stops transport.  Dtor calls stop.
+    /// Single-threaded lifecycle call: only when no thread is inside doWork()
+    /// (after the runner is joined / on the Invoker owner) — never as a
+    /// cross-thread stop signal (use the runner shutdown path or submitClose()).
     void stop() noexcept;
+
+    /// F8c C0: the calling thread becomes the single thread that drives this
+    /// agent's duty cycle (and so pumps the transport's driver/conductor in
+    /// invoker mode).  Call once at the top of a duty thread that takes over
+    /// after a happens-before handoff (the Thread-mode runner; the closing
+    /// thread after the join).  See AeronTransport::bindPumpThread().
+    void bindDutyThread() noexcept { transport_.bindPumpThread(); }
 
     // -------------------------------------------------------------------------
     // doWork — single-writer duty cycle
@@ -234,6 +243,41 @@ public:
     // -------------------------------------------------------------------------
     // Thread-safe submission API (callable from ANY thread)
     // -------------------------------------------------------------------------
+
+    /// F8c C2: verdict of a command-ring submit.  Closed is LINEARIZABLE with
+    /// closeCommandRing() (the closed bit lives in the ring's tail word, C1):
+    /// a command accepted before the close is drained by the close path, a
+    /// command refused as Closed was never written.
+    enum class Submit : uint8_t { Accepted, Full, Closed };
+
+    /// F8c C2: close the command ring to producers (any thread; one RMW in
+    /// ring internals).  True only for the call that closed it.  Every command
+    /// accepted before it is still in the ring (drainRegistrationsForClose()
+    /// reads up to the frozen tail); every later submit returns Closed.
+    bool closeCommandRing() noexcept { return ring_.close(); }
+    /// Any thread: has closeCommandRing() run?  (acquire)
+    [[nodiscard]] bool commandRingClosed() const noexcept { return ring_.closed(); }
+    /// F8c fix round 1 (I2): close() marks the command ring's consumer
+    /// finished once nothing will ever read it again (after its drain, even an
+    /// abandoned one); any thread may observe it (acquire).
+    void finishCommandRingConsumer() noexcept { ring_.consumerFinish(); }
+    [[nodiscard]] bool commandRingConsumerFinished() const noexcept { return ring_.consumerFinished(); }
+    /// The command ring's consumer position (duty thread: its own progress).
+    [[nodiscard]] std::int64_t commandRingHead() const noexcept { return ring_.headPosition(); }
+    /// F8c C7 fix round 2 (F1): orphaned handle releases exist (any thread
+    /// raises; the duty thread takes, then scans).
+    void raiseOrphanHint() noexcept { ring_.raiseOrphanHint(); }
+    [[nodiscard]] bool takeOrphanHint() noexcept { return ring_.takeOrphanHint(); }
+    /// Any thread: the command ring's tail position (acquire).
+    [[nodiscard]] std::int64_t commandRingTail() const noexcept { return ring_.tailPosition(); }
+    /// The largest command record (header + payload) the ring accepts.
+    [[nodiscard]] std::size_t commandMsgLimit() const noexcept {
+        const auto m = static_cast<std::size_t>(ring_.maxMsgLength());
+        return (testCommandMsgCap_ != 0 && testCommandMsgCap_ < m) ? testCommandMsgCap_ : m;
+    }
+    /// Test seams (set before the threads they affect run).
+    void testCapCommandMsgLength(std::size_t cap) noexcept { testCommandMsgCap_ = cap; }
+    void testDisableCloseDrainUnblock() noexcept { testCloseDrainNoUnblock_ = true; }
 
     /// Submit a CONNECT command.  Returns false if the ring is full.
     bool submitConnect() noexcept;
@@ -254,28 +298,36 @@ public:
     /// reuse immediately after this call returns).
     bool submitSend(const uint8_t* frame, std::size_t len) noexcept;
 
-    /// Shared-nothing producer registration: hand a heap-allocated
-    /// std::shared_ptr<ProducerImpl>* ("holder") to the RUNNER thread via the
-    /// command ring.  The runner drains kMsgRegisterProducer, invokes the register
-    /// hook (which adopts the shared_ptr into the single-owner ProducerHub list and
-    /// deletes the holder), so the producer list is never touched cross-thread.
-    /// Returns false if the ring is momentarily full (caller retries).  The holder
-    /// pointer is only its 8-byte address — no producer bytes cross the ring.
-    bool submitRegisterProducer(void* holder) noexcept;
+    /// Shared-nothing producer registration: hand the ProducerImpl* to the
+    /// RUNNER thread via the command ring.  The runner drains
+    /// kMsgRegisterProducer and invokes the register hook, which adopts it into
+    /// the single-owner ProducerHub list (F8c C7: the duty side's share of the
+    /// impl — no shared_ptr holder), so the producer list is never touched
+    /// cross-thread.  Returns false if the ring is momentarily full (caller
+    /// retries).  Only the 8-byte address crosses the ring.
+    Submit submitRegisterProducer(void* impl) noexcept;
 
-    /// Same shared-nothing hand-off for a transactional producer: `holder` is a heap
-    /// std::shared_ptr<TransactionalProducerImpl>* adopted on the duty-cycle thread.
-    bool submitRegisterTxnProducer(void* holder) noexcept;
+    /// Same shared-nothing hand-off for a transactional producer: `impl` is the
+    /// TransactionalProducerImpl* adopted on the duty-cycle thread.
+    Submit submitRegisterTxnProducer(void* impl) noexcept;
 
-    /// F8a: hand a subscriber / group-consumer command to the duty thread
-    /// (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty thread drains it
-    /// and invokes the hub-command hook.  Returns false if the ring is full.
-    bool submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept;
+    /// F8a: hand a subscriber / group-consumer / completion-queue command to
+    /// the duty thread (kMsgHubCommand, SBE ring_msg::HubCommandMsg).  The duty
+    /// thread drains it and invokes the hub-command hook.
+    Submit submitHubCommand(const ::rune::client::detail::HubCommand& cmd) noexcept;
+
+    /// F8c C3: hand a client control op (connect / ping / defineTopic /
+    /// getTopicSchema / listTopics) to the duty thread: `hdr` (a trivially
+    /// copyable header, `hdrLen` bytes) followed by the op's wire frame, copied
+    /// into ONE ring record (kMsgControlOp).  The duty thread invokes the
+    /// control-op hook with the whole record.
+    Submit submitControlOp(const void* hdr, std::size_t hdrLen,
+                           std::span<const uint8_t> frame) noexcept;
 
     /// close() path, single-threaded (runner joined / Invoker owner): drain the
     /// WHOLE command ring once, adopting producer + txn-producer registrations
     /// and applying F8a hub commands through their hooks (so their holders are
-    /// freed and the owner can fail them — a commitSync promise or subscribe
+    /// freed and the owner can fail them — a commitSync token or subscribe
     /// still in the ring is never stranded) and dropping every other command
     /// (sends carry no completion).
     ///
@@ -395,7 +447,7 @@ public:
     /// into a HEADER-LESS claim (length + type words zeroed) — the state of a
     /// writer that won the tail CAS but never wrote its record header.
     void testZeroClaimHeader(aeron::util::index_t claimIndex) noexcept {
-        std::memset(ring_.base() + claimIndex - 8, 0, 8);
+        ring_.testZeroClaimHeader(claimIndex);
     }
     /// fix3 I1: called (if set) every time drainRegistrationsForClose() yields
     /// waiting on an uncommitted claim — lets a test commit the claim
@@ -409,6 +461,8 @@ public:
     /// can reach the unblock path without a million real yields. Set before
     /// close(); single-threaded.
     void testSetCloseDrainUnblockAfterYields(int n) noexcept { closeDrainUnblockAfterYields_ = n; }
+    /// The close-drain yield cap (also used by the producers' closed-ring drain, C6a).
+    [[nodiscard]] int closeDrainUnblockAfterYields() const noexcept { return closeDrainUnblockAfterYields_; }
     /// fix5 Important-2(c): number of times drainRegistrationsForClose() has
     /// called M2ORingBuffer::unblock() (owner / post-join reads only).
     [[nodiscard]] int testCloseDrainUnblockCalls() const noexcept { return closeDrainUnblockCalls_; }
@@ -435,10 +489,10 @@ public:
     }
 
     /// Shared-nothing producer registration hook: invoked on the RUNNER thread
-    /// when a kMsgRegisterProducer command is drained.  The argument is the holder
-    /// pointer passed to submitRegisterProducer (a std::shared_ptr<ProducerImpl>*).
-    /// The Client wires this to adopt the producer into the ProducerHub list and
-    /// delete the holder.  Set before start().
+    /// when a kMsgRegisterProducer command is drained.  The argument is the impl
+    /// pointer passed to submitRegisterProducer (F8c C7: a ProducerImpl*).  The
+    /// Client wires this to adopt the producer into the ProducerHub list.  Set
+    /// before start().
     using ProducerRegisterFn = std::function<void(void*)>;
     void setProducerRegisterFn(ProducerRegisterFn fn) noexcept {
         producerRegisterFn_ = std::move(fn);
@@ -448,7 +502,8 @@ public:
     }
 
     /// F8a fix2: control frames dropped because their session no longer exists,
-    /// and ring-drained frames the transport refused (each retried later).
+    /// and frames the transport refused — ring-drained or duty-thread direct
+    /// sends (each retried later).
     /// Duty thread only (or after the runner is joined).
     [[nodiscard]] uint64_t staleFramesDropped() const noexcept { return staleFramesDropped_; }
     [[nodiscard]] uint64_t ingressOfferRefused() const noexcept { return ingressOfferRefused_; }
@@ -482,6 +537,11 @@ public:
     void setHubCommandFn(HubCommandFn fn) noexcept {
         hubCommandFn_ = std::move(fn);
     }
+
+    /// F8c C3: hook invoked (duty thread, or close()'s drain) for every drained
+    /// kMsgControlOp with the record bytes (header + frame).  Set before start().
+    using ControlOpFn = std::function<void(const uint8_t*, std::size_t)>;
+    void setControlOpFn(ControlOpFn fn) noexcept { controlOpFn_ = std::move(fn); }
 
     // -------------------------------------------------------------------------
     // Observers
@@ -535,35 +595,22 @@ public:
     /// Set the MetadataResponse routing hook.  MUST be called before start().
     void setMetadataResponseFn(MetadataResponseFn fn) noexcept;
 
-    /// Return the session state snapshot published by the agent thread.
-    /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
-    /// state at the end of the most recent doWork() call.  Safe to call from
-    /// ANY thread — this is the cross-thread observer path used by CC-6.
+    /// The seed session's state.  F8c C3: DUTY-THREAD ONLY (the thread that
+    /// drives doWork(), or the closing thread once no duty thread runs) — a
+    /// plain read of duty-owned state.  The cross-thread atomic snapshot is
+    /// gone: an app thread learns the session state from Client::state()
+    /// (a duty-published StatusRing) and op outcomes from completions.
     [[nodiscard]] session::SessionState sessionState() const noexcept;
 
-    /// Return the session-id snapshot published by the agent thread.
-    /// Thread-safe (atomic acquire load).  Eventually-consistent: reflects the
-    /// session-id at the end of the most recent doWork() call.
+    /// The seed session's id.  Duty-thread only (see sessionState()).
     [[nodiscard]] int64_t sessionId() const noexcept;
 
-    // -------------------------------------------------------------------------
-    // Coherent (state, sessionId) snapshot — FIX F3
-    // -------------------------------------------------------------------------
-
-    /// A coherent (state, sessionId) pair read from a SINGLE atomic load.
-    /// Neither field can be torn against the other: they are published together
-    /// (packed into one uint64_t) by the agent thread, so a caller never sees
-    /// state==Connected paired with a sessionId from a different session epoch.
+    /// (state, sessionId) of the seed session.  Duty-thread only — both are
+    /// read from the one duty-owned SessionMachine, so they are coherent.
     struct StateSnapshot {
         session::SessionState state;
         int64_t               sessionId;
     };
-
-    /// Return a coherent (state, sessionId) pair in ONE atomic acquire load.
-    /// This is the accessor Client::ping() MUST use so the sessionId it stamps
-    /// on the Ping always belongs to the same session epoch as the observed
-    /// Connected state.  (Two independent atomic loads could tear across a
-    /// resume — FIX F3.)
     [[nodiscard]] StateSnapshot stateAndSessionId() const noexcept;
 
     // CB-2: Allow Client to access ring_ for ProducerImpl construction.
@@ -594,6 +641,7 @@ private:
     static constexpr int32_t kMsgRegisterProducer = 6; // shared-nothing producer registration
     static constexpr int32_t kMsgRegisterTxnProducer = 7; // shared-nothing txn producer registration
     static constexpr int32_t kMsgHubCommand = 8;          // F8a subscriber / group-consumer command
+    static constexpr int32_t kMsgControlOp  = 9;          // F8c C3 client control op (header + frame)
     static constexpr int32_t kMsgTestNoop = 99;           // testFillCommandRing filler (dropped)
 
     // Task 1.3: per-session ConnectRequest correlationId range stride.  Session i
@@ -606,6 +654,8 @@ private:
     // Helpers
     // -------------------------------------------------------------------------
     bool writeCommand(int32_t msgTypeId, const uint8_t* payload, std::size_t payloadLen) noexcept;
+    /// writeCommand() with the Full / Closed distinction (C2).
+    Submit writeCommand3_(int32_t msgTypeId, const uint8_t* payload, std::size_t payloadLen) noexcept;
     void dispatchEgressFrame(int64_t nowNs, const uint8_t* buf, std::size_t len) noexcept;
 
     /// Task 1.3: resolve the Session whose IN-FLIGHT ConnectRequest carries
@@ -613,32 +663,6 @@ private:
     /// Falls back to the seed session when no session matches (single-node, a
     /// steady-state frame, or an already-established session).  Agent-thread only.
     Session& sessionForConnectCorrId(int64_t corrId) noexcept;
-
-    /// Publish the current (state, sessionId) as ONE packed atomic store
-    /// (release).  Called on the agent thread (a) after each frame is fed to the
-    /// session and BEFORE the egress observer runs (FIX F1), and (b) at the end
-    /// of each doWork() as the catch-all for tick-driven transitions.
-    void publishSnapshot() noexcept;
-
-    // ---- Packed (state, sessionId) snapshot codec (FIX F1 + F3) -------------
-    // Layout: high 16 bits = SessionState (fits in 8 bits), low 48 bits =
-    // sessionId.  sessionId is monotonic from 1 (server-assigned) and 0 when no
-    // session — it comfortably fits in 48 bits.  Packing both into ONE uint64_t
-    // makes the pair readable in a single atomic load with no torn read.
-    static constexpr int      kStateShift    = 48;
-    static constexpr uint64_t kSessionIdMask = (uint64_t{1} << kStateShift) - 1;
-
-    static uint64_t packSnapshot(session::SessionState st, int64_t sid) noexcept {
-        const uint64_t usid = static_cast<uint64_t>(sid) & kSessionIdMask;
-        return (static_cast<uint64_t>(static_cast<uint8_t>(st)) << kStateShift) | usid;
-    }
-    static session::SessionState unpackState(uint64_t v) noexcept {
-        return static_cast<session::SessionState>(
-            static_cast<uint8_t>(v >> kStateShift));
-    }
-    static int64_t unpackSessionId(uint64_t v) noexcept {
-        return static_cast<int64_t>(v & kSessionIdMask);
-    }
 
     // -------------------------------------------------------------------------
     // Members
@@ -730,8 +754,16 @@ private:
     rune::client::detail::M2ORingBuffer      ring_;
 
     // ---- Lifecycle -----------------------------------------------------------
-    std::atomic<bool> started_ {false};
-    std::atomic<bool> stopped_ {false};
+    // F8c C0: plain owner state, no atomics.  start() runs on the constructing
+    // thread before any duty thread exists; stop() runs only once no duty
+    // thread can be inside doWork() — Client::closeImpl_ after joining the
+    // runner (Thread mode) / on the owner thread (Invoker), or the destructor.
+    // A cross-thread stop REQUEST never touches these: it goes through the
+    // runner shutdown path (Client::close(): stop the runner loop, join it, then
+    // stop()) or the command ring (submitClose()).  The thread creation / join
+    // edges order every access, so doWork()'s read below is race-free.
+    bool started_ = false;
+    bool stopped_ = false;
 
     // ---- Egress observer (agent thread only; must be set before start()) ----
     EgressObserver egressObserver_;
@@ -743,6 +775,7 @@ private:
     ProducerRegisterFn producerRegisterFn_; // shared-nothing producer registration (ring-drained)
     ProducerRegisterFn txnProducerRegisterFn_; // same, transactional producers
     HubCommandFn       hubCommandFn_;          // F8a subscriber / group-consumer commands
+    ControlOpFn        controlOpFn_;           // F8c C3 client control ops
     // F8a fix2: duty-thread counters for the kMsgSend drain rule (plain; read
     // only on the duty thread / after the runner is joined).
     uint64_t staleFramesDropped_  = 0;
@@ -752,6 +785,8 @@ private:
     int testForcedOffers_ = 0;
     transport::AeronTransport::OfferResult testForcedOffer_ = transport::AeronTransport::OfferResult::Accepted;
     std::size_t testMaxFrameCap_ = 0;  // fix4 test seam (0 = uncapped)
+    std::size_t testCommandMsgCap_ = 0;  // F8c fix1 test seam (0 = uncapped)
+    bool        testCloseDrainNoUnblock_ = false;  // F8c fix1 test seam
     transport::AeronTransport::OfferResult offerIngress_(const uint8_t* buf, std::size_t len) noexcept;
     void noteFatalDrop_(std::size_t len) noexcept;
 
@@ -766,16 +801,6 @@ private:
     // ---- MD1 Task 10: Metadata response hook (agent thread only) -------------
     MetadataResponseFn metadataResponseFn_;
 
-    // ---- Thread-safe observer snapshot (BrokerNode mirror pattern) ----------
-    // FIX F1 + F3: (state, sessionId) are packed into ONE atomic uint64_t and
-    // published together (release) so cross-thread readers get a COHERENT pair
-    // in a single acquire load — no torn read across a resume, and the snapshot
-    // is fresh at the moment the egress observer resolves the connect promise.
-    // Written on the agent thread; read by sessionState()/sessionId()/
-    // stateAndSessionId() from any thread.
-    std::atomic<uint64_t> snapshot_ {
-        packSnapshot(session::SessionState::Disconnected, 0)
-    };
 };
 
 } // namespace rune::client::agent

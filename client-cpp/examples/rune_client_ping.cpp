@@ -35,7 +35,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <future>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -129,9 +128,9 @@ int main() {
             std::cerr << "CLIENT: onError: " << msg << "\n";
         });
 
-        // connect().get() — bounded by connectTimeoutMs.
+        // connectAndWait() — the op itself is bounded by connectTimeoutMs.
         std::cerr << "CLIENT: connecting...\n";
-        c.connect().get();  // throws on error / timeout
+        c.connectAndWait();  // throws on error / timeout
         std::cerr << "CLIENT: connected\n";
 
         // -------------------------------------------------------------------------
@@ -152,8 +151,8 @@ int main() {
             Bytes payload(echoStr.begin(), echoStr.end());
 
             try {
-                auto fut  = c.ping(payload);  // throws if not connected
-                Bytes echo = fut.get();        // bounded by pingTimeoutMs
+                // Throws if not connected; the op is bounded by pingTimeoutMs.
+                Bytes echo = c.pingAndWait(payload);
 
                 // Verify echo matches.
                 const std::string echoGot(echo.begin(), echo.end());
