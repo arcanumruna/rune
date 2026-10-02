@@ -470,6 +470,8 @@ TEST(ShardWorkerAckRegression, UndeliverableSessionPublicationIsReportedToTheRun
         f.worker->drainReturn([&](WorkerReturn r) { if (isFailedSignal(r)) ++failed; });
     }
     EXPECT_EQ(failed, 1) << "reported exactly once";
+    EXPECT_EQ(f.worker->sessionRegistrationsDrainingForTest(), 0u)
+        << "an errored registration is already gone (real Aeron) — never on the drain list";
 }
 
 // I1: never skip the client poll for pending ops — continuous runtime op

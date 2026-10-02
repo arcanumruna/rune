@@ -580,6 +580,10 @@ public:
     /// Fix round 2 (finding 9): session signals (Failed / Held / Released) the
     /// return ring could not take at once — deferred to a later pass, never lost.
     [[nodiscard]] uint64_t sessionSignalsDeferredForTest() const noexcept { return sessionSignalsDeferred_; }
+    /// Fix round 3: ack-publication registrations still being released.
+    [[nodiscard]] std::size_t sessionRegistrationsDrainingForTest() const noexcept {
+        return ackSink_ ? ackSink_->drainingRegistrations() : 0;
+    }
     /// Test seam: write one return straight to ret_ (false = ring full).
     bool injectReturnForTest(const WorkerReturn& r) { return tryWriteReturn_(r); }
 

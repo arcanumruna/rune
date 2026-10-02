@@ -1180,20 +1180,30 @@ TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwa
     for (auto& n : nodes) n->stop();
 }
 
-// T13 fix round 2 (finding 1, critical): C1 on the GATEWAY-ROUTED path, end to
-// end.  A client that ignores ingressEndpoint (every Produce to the node
-// endpoint → gateway → op ring) and stops reading its acks must be paused
-// ALONE: the worker reports it Held, the gateway ABORTs its produce frames.
-// Another client keeps producing; the slow one loses nothing once it reads.
-// (Was: its acks filled the worker's ack queue — op drain and every client's
-// intake stopped.)
+// T13 fix round 2 (finding 1, critical) + fix round 3 (re-review 2, finding 3):
+// C1 on the GATEWAY-ROUTED path, end to end.  A client that ignores
+// ingressEndpoint (every Produce to the node endpoint → gateway → op ring) and
+// stops reading its acks must be paused ALONE: the worker reports it Held and
+// the gateway ABORTs its produce frames (asserted via the gateway's pause
+// counter — the defining mechanism), while the worker's op drain never runs
+// out of ack room.  Another client keeps producing; the slow one loses nothing
+// once it reads.  No elapsed-time decisions: A stops offering when an offer is
+// refused AND the gateway has paused it.
 TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
     TmpDir dir{"slowcl"}, ad{"slowa"}, bd{"slowb"};
     const auto ports = ShardPorts::discover(1, 1);
-    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true)};
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     const std::string gw = gatewayChannel(ports, 0);
+    auto gatewayPauses = [&] {
+        return node.onControlThreadForTest([&] { return node.gatewayForTest()->heldProduceAbortsForTest(); });
+    };
+    auto ackRoomOpPauses = [&] {
+        return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) {
+            return node.workerForTest(0)->ackRoomOpPausesForTest();
+        });
+    };
     {
         ShardTestClient a(ad.path), b(bd.path);
         const int64_t sidA = a.connect(gw, kClientStream);
@@ -1208,14 +1218,16 @@ TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
             m.recordBatch = std::span<const uint8_t>(batch);
             out.resize(m.encodedSize());
             m.encode(out.data());
-        }, /*maxFrames=*/40'000, /*idleIters=*/2'000);
-        ASSERT_GT(n, 100) << "client A out-ran its ack stream";
+        }, /*maxFrames=*/40'000, [&] { return gatewayPauses() > 0; });
+        ASSERT_LT(n, 40'000) << "client A was never paused (gateway ABORT never engaged)";
+        EXPECT_GT(gatewayPauses(), 0u);
 
         const int64_t sidB = b.connect(gw, kClientStream);
-        ASSERT_GT(sidB, 0) << "a new session is accepted while A is slow";
+        ASSERT_GT(sidB, 0) << "a new session is accepted while A is paused";
         for (int k = 0; k < 5; ++k)
             ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB, 0, 0, /*acks=*/1, batch, /*maxAttempts=*/3))
                 << "client B's produce " << k << " starved behind client A's unread acks";
+        EXPECT_EQ(ackRoomOpPauses(), 0u) << "the worker's op drain never ran out of ack room";
 
         for (int64_t c = c0; c < c0 + n; ++c)                 // A reads again: nothing lost
             ASSERT_TRUE(a.awaitProduceResponse(c).has_value()) << "ack " << c - c0 << " of " << n;

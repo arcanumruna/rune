@@ -25,6 +25,8 @@ struct FakePolicy {
         int64_t nextReg = 1;
         std::map<int64_t, std::pair<std::string, int32_t>> added;
         bool findReady = true, findError = false;
+        bool errorOnceThenUnknown = false;                      // Aeron: find throws once, then the id is gone
+        std::set<int64_t> erroredRegs;
         std::set<int> blocked;                                  // pub ids that back-pressure
         std::set<int> closed;                                   // pub ids that are CLOSED (fatal)
         std::vector<std::pair<int, std::vector<uint8_t>>> sent; // (pub id, frame)
@@ -37,6 +39,8 @@ struct FakePolicy {
         return r;
     }
     PubFind find(int64_t reg, PubHandle& out) noexcept {
+        if (s->errorOnceThenUnknown)
+            return s->erroredRegs.insert(reg).second ? PubFind::Error : PubFind::Pending;
         if (s->findError) return PubFind::Error;
         if (!s->findReady) return PubFind::Pending;
         out = std::make_shared<FakePub>(FakePub{static_cast<int>(reg)});
@@ -356,4 +360,22 @@ TEST(SessionAckSinkRegression, RegistrationOfASessionClosedOrReannouncedWhileRes
     std::vector<int64_t> found = st->foundRegs;
     std::sort(found.begin(), found.end());
     EXPECT_EQ(found, (std::vector<int64_t>{1, 2, 3})) << "regs 1, 2 drained; reg 3 is 9's live one";
+}
+
+// Fix round 3 (re-review 2, finding 1): a registration that resolved to Error is
+// already gone from the client conductor (Aeron erases it before throwing; every
+// later find of it answers "not yet" forever).  It must NOT go on the drain list
+// — it would stay there for good, cost a conductor lookup every pass and fill
+// the list until real drains are dropped.
+TEST(SessionAckSinkRegression, RegistrationThatResolvedToErrorIsNeverDrained) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    st->errorOnceThenUnknown = true;
+    ASSERT_TRUE(s.announce(7, "c", 1));
+    pass(s);                                                // Announced → Resolving(reg 1)
+    pass(s);                                                // find → Error (once) → Failed
+    ASSERT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
+    EXPECT_EQ(s.drainingRegistrations(), 0u) << "the driver already dropped it — nothing to release";
+    s.close(7);
+    for (int i = 0; i < 3; ++i) pass(s);
+    EXPECT_EQ(s.drainingRegistrations(), 0u);
 }

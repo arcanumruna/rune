@@ -38,6 +38,11 @@
 #include <cstdlib>
 #include <cstring>
 
+// Task 13 fix round 3 (re-review 2, finding 2): every shard worker has a bit in
+// the gateway's per-session held mask (G-A6 pause on the gateway-routed path).
+static_assert(rune::node::NodeConfig::kMaxShardWorkers <= rune::gateway::ClientGateway::kMaxHeldMaskWorkers,
+              "shard worker cap must fit the gateway's held-by-worker mask");
+
 namespace fs = std::filesystem;
 using namespace rune::consensus;
 

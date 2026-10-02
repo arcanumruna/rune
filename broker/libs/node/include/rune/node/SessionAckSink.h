@@ -264,6 +264,7 @@ public:
     /// Fix round 2 (finding 8): registrations of sessions closed / re-announced
     /// while Resolving, still being released (find → drop).
     [[nodiscard]] std::size_t drainingRegistrations() const noexcept { return drainCount_; }
+    [[nodiscard]] uint64_t    drainOverflowForTest() const noexcept { return drainOverflow_; }
     [[nodiscard]] std::size_t freeAckSlots() const noexcept { return kAckCapacity - ackCount_; }
     [[nodiscard]] std::size_t pending() const noexcept { return ackCount_; }
     /// Acks still queued after the last flush (held for their sessions).
@@ -337,8 +338,13 @@ private:
             freeChan_[freeChanCount_++] = a->chan;
         else if (const auto* f = std::get_if<PubFailed>(&st); f && !f->reported)
             --unreported_;
-        else if (const auto* r = std::get_if<PubResolving>(&st); r && drainCount_ < kMaxSessions)
-            draining_[drainCount_++] = r->regId;                     // finding 8: never leaked
+        else if (const auto* r = std::get_if<PubResolving>(&st)) {
+            // finding 8: never leaked.  At most one Resolving registration per
+            // live session is ever pending here (errored ones are not queued),
+            // so the list cannot fill; if it ever did, count it — never silent.
+            if (drainCount_ < kMaxSessions) [[likely]] draining_[drainCount_++] = r->regId;
+            else ++drainOverflow_;
+        }
     }
     /// Hold edges of this flush: sessions held now that were not reported held,
     /// and sessions held at the previous flush that no longer are → dirty.
@@ -409,7 +415,16 @@ private:
                 PubHandle pub{};
                 const PubFind f = policy_.find(r->regId, pub);
                 if (f == PubFind::Ready) { st = PubReady{std::move(pub), 0}; ++work; continue; }
-                if (f == PubFind::Error) { fail_(st); ++work; continue; }
+                if (f == PubFind::Error) {
+                    // The client conductor erased the registration before
+                    // reporting the error (later finds of it say "not yet"
+                    // forever): nothing to release — NOT via leaveState_'s
+                    // drain push (fix round 3).
+                    st = PubFailed{false};
+                    ++unreported_;
+                    ++work;
+                    continue;
+                }
                 unresolved_[keep++] = sid;                           // driver answers in a pass or two
             }
         }
@@ -439,6 +454,7 @@ private:
     std::size_t                                                      heldNowCount_ = 0, heldPrevCount_ = 0;
     std::array<int64_t, kMaxSessions>                                draining_{};      // finding 8
     std::size_t                                                      drainCount_ = 0;
+    uint64_t                                                         drainOverflow_ = 0;
     std::size_t                                                      count_ = 0;
     std::array<int64_t, kMaxSessions>                                unresolved_{};
     std::size_t                                                      unresolvedCount_ = 0;

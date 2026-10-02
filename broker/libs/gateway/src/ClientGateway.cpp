@@ -455,6 +455,13 @@ int ClientGateway::doWork(int64_t nowNs) {
         // stays on ITS image (one client publication) and the poll moves on to
         // the other images; the client's offers back-pressure until it reads
         // its acks (Released).  One branch when nothing is held.
+        // ABORT stops the WHOLE image: every later frame of that client —
+        // Keepalive, Metadata, Disconnect, … — waits behind the aborted Produce
+        // until Released, a close (SessionFailed), or the lease reap.  No
+        // deadlock (releasing a held ack never needs a gateway frame); while
+        // paused, the client's lease is refreshed only by the post-ack
+        // notifications of the acks it does read, and a client that drops its
+        // egress before Disconnect leaves through the lease reap (fix round 3).
         work += sub_->controlledPoll(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
                    aeron::Header& h) {
@@ -884,7 +891,10 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
     const auto kind = static_cast<K>(ret.lastOffset);
     if (kind == K::Held || kind == K::Released) {
         Session* s = sessions_.find(ret.sessionId);
-        if (!s || ret.partition < 0 || ret.partition >= 64) return;   // closed meanwhile
+        if (!s) return;                                               // closed meanwhile
+        // Unreachable: NodeConfig refuses > kMaxHeldMaskWorkers shard workers.
+        assert(ret.partition >= 0 && ret.partition < kMaxHeldMaskWorkers);
+        if (ret.partition < 0 || ret.partition >= kMaxHeldMaskWorkers) [[unlikely]] return;
         const uint64_t bit = uint64_t{1} << ret.partition;
         const bool was = s->heldByWorkers != 0;
         if (kind == K::Held) s->heldByWorkers |= bit; else s->heldByWorkers &= ~bit;

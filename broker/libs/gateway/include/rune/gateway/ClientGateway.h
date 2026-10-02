@@ -132,6 +132,10 @@ public:
     /// Task 13: most concurrent sessions in shard mode — one worker ack table's
     /// capacity (SessionAckSink::kMaxSessions − 1; static_assert in the .cpp).
     static constexpr std::size_t kShardMaxSessions = 4095;
+    /// Task 13 fix round 3 (re-review 2, finding 2): width of Session::
+    /// heldByWorkers — every shard worker must have a bit.  NodeConfig refuses
+    /// more shard workers (kMaxShardWorkers; static_assert in BrokerNode.cpp).
+    static constexpr int32_t kMaxHeldMaskWorkers = 64;
 
     // @param aeron                    Shared Aeron client (connected to a media driver).
     // @param clientChannel            Aeron channel the gateway listens on (clients publish here).
@@ -1529,6 +1533,9 @@ public:
     }
     [[nodiscard]] std::size_t shardSessionSlotsInUseForTest() const noexcept { return shardSessionSlotsInUse_(); }
     void evictOldestPendingConnectForTest() { evictOldestPendingConnect_(); }
+    /// Fix round 3: Produce frames ABORTed because their session was held
+    /// (control thread only — read via BrokerNode::onControlThreadForTest).
+    [[nodiscard]] uint64_t heldProduceAbortsForTest() const noexcept { return heldProduceAborts_; }
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }

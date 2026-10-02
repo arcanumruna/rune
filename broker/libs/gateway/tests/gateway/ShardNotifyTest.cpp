@@ -200,8 +200,10 @@ std::vector<uint8_t> metadataFrame(int64_t sid) {
 
 // Finding 1 (critical): the gateway pauses a session's PRODUCE frames while ANY
 // worker reports it Held (controlled ABORT on its image) and resumes once every
-// such worker reported Released.  Other sessions and the held session's
-// non-produce frames are never paused.
+// such worker reported Released.  Other sessions are never paused, and a non-
+// produce frame at the head of a held session's image is not aborted — though,
+// ABORT stopping the whole image, the frames behind an aborted Produce wait for
+// the release (or a close / lease reap).
 TEST(GatewayShardNotifyRegression, HeldSessionsProduceFramesArePausedUntilEveryWorkerReleases) {
     using K = rune::node::SessionSignalKind;
     ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
@@ -216,7 +218,8 @@ TEST(GatewayShardNotifyRegression, HeldSessionsProduceFramesArePausedUntilEveryW
     gw.drainWorkerReturnsForTest(1'000);
     EXPECT_TRUE(gw.clientFrameHeldForTest(pa.data(), pa.size())) << "a held session's produce is paused";
     EXPECT_FALSE(gw.clientFrameHeldForTest(pb.data(), pb.size())) << "other sessions are not";
-    EXPECT_FALSE(gw.clientFrameHeldForTest(ma.data(), ma.size())) << "non-produce frames are not";
+    EXPECT_FALSE(gw.clientFrameHeldForTest(ma.data(), ma.size()))
+        << "a non-produce frame at the head of the held session's image is not aborted";
     ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(a, 0, K::Released)));
     gw.drainWorkerReturnsForTest(2'000);
     EXPECT_TRUE(gw.clientFrameHeldForTest(pa.data(), pa.size())) << "still held by worker 1";
