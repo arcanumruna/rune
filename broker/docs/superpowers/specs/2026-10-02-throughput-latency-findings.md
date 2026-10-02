@@ -172,6 +172,22 @@ Longer runs (1.5M vs 300k records) explain the higher 65504 numbers vs §4.2 (mo
 Client saturation profile (same day): crc32c = 28% of client CPU from ~6.6 rebuilds per sent frame on back-pressure
 (LAT-1 h); clear_page from 64 KiB skb allocation ~7% of client CPU.
 
+### 4.4 Quick-and-dirty UDP GSO/GRO assessment (2026-10-03, k3s-node-01, interleaved, stopped after 2 rounds)
+
+Build: QD bindings (rune_gso_bindings.c from the GSO plan) env-gated RUNE_QD_GSO=1 in /root/frcap broker
+EmbeddedDriver + /root/qd client copy (max_messages_per_send=16 when on).  Same binaries for every arm; config as §4.3.
+GSO/GRO proven active: every on-arm logged "rune-gso: UDP GSO active ... seg=1408" and "UDP GRO active" on all brokers.
+
+| arm | round 1 | round 2 |
+|---|---|---|
+| MTU 1408, GSO off | 44,570 | 44,700 |
+| MTU 1408, GSO on  | **135,833** | **140,619** |
+| MTU 65504, GSO off (loopback only) | 165,406 | — |
+
+All errors=0.  GSO/GRO = 3.1x at the real-network MTU.  Remaining gap to 65504 (~15-18%) = Aeron per-fragment
+work (~47 fragments per 64 KiB batch): suspected broker FragmentAssembler reassembly copy, per-fragment publication
+header writes, 16-datagram send cap -> to be profiled (1408+GSO vs 65504) before fixing.  Proper implementation: GSO-1.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
