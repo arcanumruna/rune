@@ -1396,13 +1396,15 @@ void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
 
     // Mark log dirty for group-commit fsync.
     //
-    // E5.1.3 (d) R7 fix: when per-worker ingress is active, USER partitions
-    // (topicId >= 0) are exclusively owned by the worker — the worker's doWork
-    // calls syncOwnedLogsAsync_() which submits the owned-log fsync to its io backend.
-    // The gateway must NOT call Log::sync on worker-owned logs (that would
-    // race with the worker's own appends/sync — TSan race R7).
+    // E5.1.3 (d) R7 fix + F30 fix round 1: a worker return for a USER partition
+    // (topicId >= 0) is about a log the worker exclusively owns — in EVERY
+    // configuration (per-worker ingress or gateway fan-out).  The worker's
+    // doWork submits its fsyncs to its own io backend (follower flush, roll
+    // seals, Strict, and the time-gated syncOwnedLogsAsync_, which runs in every
+    // configuration).  The gateway must NOT call Log::sync on worker-owned logs
+    // (a cross-thread call racing the worker's appends — TSan race R7).
     // Internal partitions (topicId < 0) remain on the gateway sync path.
-    const bool workerOwnedLog = perWorkerIngressActive_ && (ret.topicId >= 0);
+    const bool workerOwnedLog = ret.topicId >= 0;
     if (!workerOwnedLog && topicRegistry_) {
         rune::storage::Log* log =
             topicRegistry_->log(ret.topicId, ret.partition);
@@ -3851,8 +3853,8 @@ void ClientGateway::flushDirtyLogs()
     // at Milestone C this path should escalate to a leader step-down.
     //
     // E5.1.3 (d) R7 fix: skip any log in workerOwnedLogs_ — those are exclusively
-    // owned by a worker thread (which drives its own sync via syncOwnedLogs_ in
-    // doWork).  Calling Log::sync from the gateway thread while the worker thread
+    // owned by a worker thread (which submits its own fsyncs to its io backend:
+    // syncOwnedLogsAsync_ + follower flush / seals, F30).  Calling Log::sync from the gateway thread while the worker thread
     // appends is a TSan-confirmed data race (R7).  Internal partitions (topicId<0)
     // are never added to workerOwnedLogs_ and always take this gateway sync path.
     std::unordered_set<rune::storage::Log*> stillDirty;

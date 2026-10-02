@@ -1234,17 +1234,10 @@ public:
             work += serveHeldPushReads_();
         }
         // F30: never block a worker on disk in ANY mode (spec §3.1; replication
-        // optimization #5 "fsync off the append thread").  Follower flushes raised
-        // by the replicas (setExternalFollowerFlush) and roll seals the logs
-        // deferred go to this worker's io backend — exactly as the shard pass does.
-        for (auto* replica : owned_) {
-            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
-                if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
-            }
-        }
-        for (auto& slot : slots_) {
-            if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);
-        }
+        // optimization #5 "fsync off the append thread") — the SAME background
+        // disk-work step as the shard pass (truncation reconcile, roll seals,
+        // follower flush requests → io backend).
+        work += submitBackgroundDiskWork_();
 
         // Task 6: per-worker replication transport poll — inline dispatch.
         //
@@ -1285,21 +1278,14 @@ public:
         }
         work += flushPendingSignals_();
 
-        // E5.1.3 (d) R7 fix: time-based Log::sync on owned user-partition logs.
-        //
-        // When per-worker ingress is active, the gateway's flushDirtyLogs() skips
-        // worker-owned logs (R7 gate).  Instead, the WORKER calls log->sync() here
-        // on ITS OWN thread — the same thread that appends — eliminating the
-        // append-vs-sync data race (R7 closed).
-        //
-        // Applies only when perWorkerIngressActive_ is true (default: false).
-        // Internal partitions (topicId < 0) are not in owned_ so they keep the
-        // gateway sync path unaffected.
-        // F30: the time-gated owned-log sync is an io_ submission (never an
-        // inline fsync on the worker) — the shard pass's syncOwnedLogsAsync_.
-        if (perWorkerIngressActive_) {
-            work += syncOwnedLogsAsync_(nowNs);
-        }
+        // E5.1.3 (d) R7 fix + F30: time-gated owned-log sync, on THIS worker's
+        // io backend (never Log::sync on the worker, never from the gateway: the
+        // gateway skips every worker-owned user log — R7).  Runs in EVERY
+        // configuration (F30 fix round 1, F4): it is what re-requests a flush
+        // the io backend refused and flushes a log adopted by an ownership move
+        // (fresh slot, lastSyncedLeo 0) — no per-pass retry table.
+        // Internal partitions (topicId < 0) are not in owned_.
+        work += syncOwnedLogsAsync_(nowNs);
 
         return work;
     }
@@ -1337,13 +1323,9 @@ private:
         }
         work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
         work += serveHeldPushReads_();
-        // 4b. follower flushes raised by the replicas (shard replicas run with
-        //     setExternalFollowerFlush) → io backend, never an inline fsync.
-        for (auto* replica : owned_) {
-            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
-                if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
-            }
-        }
+        // 4b. background disk work → io backend, never an inline fsync
+        //     (truncation reconcile, roll seals, follower flush requests).
+        work += submitBackgroundDiskWork_();
         // 5. fire due produce acks.
         work += flushOwedAcksAll_(nowNs);
         checkOwedCapEpisodeEnd_();
@@ -1355,8 +1337,6 @@ private:
             work += slot.log->drainCleanerSwaps();
             work += slot.log->drainRetentionDeletes();
             work += slot.log->drainStagingRenamesDone();
-            if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);   // async roll seals
-            reconcileTruncation_(slot);
             checkStorageFailure_(slot.log);
         }
         work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
@@ -3808,7 +3788,9 @@ private:
     // with the segment it pinned (M1: the fd outlives the flush).  A Background
     // or Seal token is retired by routing and can never reach produce-ack
     // matching.  A refused background submit is NOT retried per pass: the next
-    // owned-log sync interval re-requests it (LEO > lastSyncedLeo).
+    // owned-log sync interval (every configuration, F30) re-requests it
+    // (LEO > lastSyncedLeo); a truncation clamps lastSyncedLeo / bgLeo to the
+    // log's truncation low-water (reconcileTruncation_).
     // fsync errors are FAIL-STOP (fsyncgate): never retried.
     // Only fdatasync of the .log fd: Log::recover rebuilds the .index from the
     // .log, so the .index msync is not a durability point.
@@ -4409,8 +4391,29 @@ private:
         return t;
     }
 
-    // Async roll seals queued by the log (shard mode).  A refused submit leaves
-    // the seal queued (still pinned) for the next pass.
+    // F30 fix round 1 (F9): the ONE background disk-work step, shared by the
+    // shard and thread-placement passes so they cannot drift.  Per owned log:
+    // reconcile a truncation first (clamps lastSyncedLeo / bgLeo, so neither the
+    // timed sync nor a coalesced re-request skips re-appended bytes), then submit
+    // queued roll seals; then each replica's follower flush request.  Every
+    // disk call is an io_ submission (spec §3.1).  Allocation-free.
+    int submitBackgroundDiskWork_() {
+        int work = 0;
+        for (auto& slot : slots_) {
+            reconcileTruncation_(slot);
+            if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);
+        }
+        for (auto* replica : owned_) {
+            if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
+                if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
+            }
+        }
+        return work;
+    }
+
+    // Async roll seals queued by the log (every worker-driven log — the replica
+    // runs with setExternalFollowerFlush).  A refused submit leaves the seal
+    // queued (still pinned) for the next pass.
     int submitPendingSeals_(LogFlushSlot& slot) noexcept {
         int n = 0;
         rune::storage::Log* log = slot.log;
@@ -4440,7 +4443,8 @@ private:
         const CompletionToken t = submitActive_(log, RouteKind::Background, slot.epoch);
         if (t == kNoToken) {
             // Back-pressure (io in-flight depth): no retry table, no per-pass
-            // spin — the next owned-log sync interval re-requests it.
+            // spin — the next owned-log sync interval (syncOwnedLogsAsync_, run
+            // in every configuration) re-requests it (LEO > lastSyncedLeo).
             ++bgFlushDeferred_;
             if (bgFlushDeferred_ == 1 || (bgFlushDeferred_ & 1023u) == 0)
                 spdlog::warn("Worker {}: background flush deferred (io back-pressure, total={})",
@@ -4501,9 +4505,9 @@ private:
             }
         }
         if (entry.thenAwaitHw) {
-            // Shard Strict acks=all: durable locally — now the HW gate.  (M4: for
-            // a single-ISR Strict log, HW / consumer visibility can precede the
-            // fsync in shard mode — Kafka semantics; the PRODUCER ack never does.)
+            // Strict acks=all: durable locally — now the HW gate.  (M4: for a
+            // single-ISR Strict log, HW / consumer visibility can precede the
+            // fsync — Kafka semantics; the PRODUCER ack never does.)
             entry.ret.errorCode = 0;
             PendingAcksAll pending;
             pending.replica    = entry.thenAwaitHw;
@@ -4615,10 +4619,16 @@ private:
     // the truncate dropped an UNSUBMITTED pending seal, this worker's durable
     // entries on the log can no longer prove durability (their seal is gone) —
     // fail them RETRIABLY instead of wedging (and holding ack reservations).
+    // F30 fix round 1: clamp to the LOWEST point truncated to since the last
+    // pass (Log::takeTruncationLowWater), not the current LEO — a follower
+    // truncates and re-appends in the same op, so the LEO can already be back
+    // above the cut while the re-appended bytes are unflushed.
     void reconcileTruncation_(LogFlushSlot& slot) {
-        const int64_t leo = slot.log->logEndOffset();
-        if (slot.lastSyncedLeo > leo) slot.lastSyncedLeo = leo;
-        if (slot.bgLeo > leo) slot.bgLeo = leo;
+        const int64_t low = slot.log->takeTruncationLowWater();
+        if (low != rune::storage::Log::kNoTruncation) [[unlikely]] {
+            if (slot.lastSyncedLeo > low) slot.lastSyncedLeo = low;
+            if (slot.bgLeo > low) slot.bgLeo = low;
+        }
         const uint64_t drops = slot.log->droppedPendingSeals();
         if (drops != slot.sealDropsSeen) [[unlikely]] {
             slot.sealDropsSeen = drops;
@@ -5163,10 +5173,12 @@ private:
         // was hardcoded to 1, so RUNE_TOPICS tier=strict was silently ignored on the
         // per-worker ingress path.)
         const uint8_t durabilityTier = replica ? replica->durabilityTier() : 1;
-        // Task 10 (spec §3.1): shard mode never fsyncs inline on the loop.  Strict
-        // appends page-cache only and acks from its own io_ completion (then the
-        // HW gate for acks=all).
-        const bool asyncStrict = shardMode_ && durabilityTier == 2;
+        // Task 10 (spec §3.1) + F30 fix round 1 (F1/F2): a worker never fsyncs
+        // inline — in EVERY placement.  Strict appends page-cache only and acks
+        // from its own io_ completion, gated on the log's outstanding roll
+        // seals (onFlushCompletion_ / fireSealGated_), then the HW gate for
+        // acks=all.
+        const bool asyncStrict = durabilityTier == 2;
 
         // Op-ring produce (gateway-received, Task 13): its parked answer was not
         // covered by a poll budget — reserve it here BEFORE the append (G-A6, the

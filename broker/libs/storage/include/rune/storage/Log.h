@@ -153,6 +153,17 @@ public:
     /// removed (truncate / retention / reload).  The owning worker fails its
     /// seal-gated durable entries retriably when this changes.
     [[nodiscard]] uint64_t droppedPendingSeals() const noexcept { return droppedPendingSeals_; }
+    /// F30 fix round 1: the lowest LEO this log was truncated to since the
+    /// owner last took it (kNoTruncation = none), then reset.  The owning
+    /// worker clamps its synced-LEO bookkeeping to it, so bytes re-appended
+    /// after a truncation are never treated as already flushed.  Owner-thread
+    /// only (the thread that appends / truncates); no allocation.
+    static constexpr int64_t kNoTruncation = INT64_MAX;
+    [[nodiscard]] int64_t takeTruncationLowWater() noexcept {
+        const int64_t v = truncationLowWater_;
+        truncationLowWater_ = kNoTruncation;
+        return v;
+    }
     /// Accepted role-change sync work (not on the steady-state loop): the index
     /// msync + directory fsync of LogSegment::recover (run by truncateTo on a
     /// role / epoch change, and at startup recovery).
@@ -398,6 +409,10 @@ private:
     std::array<LogSegment*, kMaxPendingSeals> pendingSeals_{};
     std::size_t pendingSealCount_ = 0;
     uint64_t droppedPendingSeals_ = 0;
+    int64_t  truncationLowWater_ = kNoTruncation;   ///< see takeTruncationLowWater()
+    void noteTruncatedTo_(int64_t leo) noexcept {
+        if (leo < truncationLowWater_) truncationLowWater_ = leo;
+    }
     /// M1: segments removed from segments_ while an async flush was in flight on
     /// their fd.  Destroyed (fd closed) by unpinSegmentFlush.  Rare, cold.
     std::vector<std::unique_ptr<LogSegment>> retiredSegments_;

@@ -54,6 +54,19 @@ static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 // limit CALLS the transport's/ring's own function; no hand arithmetic here.
 // ---------------------------------------------------------------------------
 namespace {
+// Task 10 (spec §3.1) + F30: the ONE place a newly built replica's disk
+// durability policy is set — boot (buildReplication) and runtime-created
+// topics (createRuntimeUserReplicas) alike, in shard AND thread placement.
+// User replicas (topicId >= 0) are always driven by a worker (the pool always
+// exists, >= 1 worker), which submits the follower flush, txn-marker / leader
+// append flushes and deferred roll seals to its io backend — never an inline
+// fsync on the worker.  Internal partitions (topicId < 0) run on the control
+// thread, which services neither flush requests nor pending seals: they keep
+// the inline path.
+void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId) noexcept {
+    if (topicId >= 0) replica.setExternalFollowerFlush(true);
+}
+
 int32_t clampI32(int64_t v) noexcept {
     if (v < 0) return 0;
     if (v > INT32_MAX) return INT32_MAX;
@@ -931,11 +944,7 @@ void BrokerNode::buildReplication() {
                 : std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
-            // Task 10 (spec §3.1) + F30: user replicas are always driven by a worker
-            // (the pool always exists, >= 1 worker), which submits the follower
-            // flush and roll seals to its io backend — never an inline fsync on the
-            // worker, in shard AND thread placement.
-            if (topicId >= 0) replica->setExternalFollowerFlush(true);
+            applyWorkerDrivenDurability(*replica, topicId);   // Task 10 + F30
 
             if (replTransport_) {
                 // DR-BUG-5: register with composite (topicId, partitionId) key so
@@ -1105,8 +1114,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
             : std::make_unique<PartitionReplica>(
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
-        // Task 10 (spec §3.1): shard-worker-driven → async follower flush.
-        if (config_.shardMode() && topicId >= 0) replica->setExternalFollowerFlush(true);
+        applyWorkerDrivenDurability(*replica, topicId);   // same policy as boot (F30 fix round 1, F3)
 
         // User replicas on a per-worker plane are polled by their owning worker —
         // do NOT register them in the legacy transport's routing table (that would

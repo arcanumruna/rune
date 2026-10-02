@@ -460,9 +460,10 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     const auto& batch = makeBatch_(baseOffset, records);
     // lastOffset = baseOffset + 0 (one record per batch = lastOffsetDelta=0).
     if (externalFollowerFlush_) {
-        // Shard mode (spec §3.1): no inline fsync on the loop (txn markers come
-        // through here).  Page-cache append + a flush request the owning worker
-        // submits to its io backend in the same pass.
+        // Worker-driven replica (spec §3.1, every placement — F30): no inline
+        // fsync on the worker (txn markers come through here).  Page-cache
+        // append + a flush request the owning worker submits to its io backend
+        // in the same pass.
         onLog([&](auto& L){ L.appendNoSync(batch.data(), batch.size(), baseOffset); });
         if (!memoryBacked_) followerFlushRequested_ = true;
     } else {
@@ -529,7 +530,7 @@ Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatc
         // Zero-copy restamp (pwritev): the caller's bytes are never mutated.
         diskLog_->appendNoSyncRestamp(controlBatch.data(), controlBatch.size(), lastOffsetDelta, baseOffset);
         if (externalFollowerFlush_) {
-            followerFlushRequested_ = true;   // the owning worker submits it (shard, never inline)
+            followerFlushRequested_ = true;   // the owning worker submits it (never inline)
         } else {
             diskLog_->sync();                 // append()'s durable-by-default fsync, unchanged
         }
@@ -1662,8 +1663,9 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                 lastTruncationOffset_ = logEndOffset_();
                 ++logGeneration_;
                 if (externalFollowerFlush_) {
-                    // Shard mode: page-cache append; durability via the owning
-                    // worker's io backend (flush request), never an inline fsync.
+                    // Worker-driven (every placement): page-cache append;
+                    // durability via the owning worker's io backend (flush
+                    // request), never an inline fsync.
                     onLog([&](auto& L){ L.appendNoSync(raw.data(), raw.size(), lastOff); });
                     if (!memoryBacked_) followerFlushRequested_ = true;
                 } else {
@@ -1761,8 +1763,9 @@ int PartitionReplica::doWork(int64_t nowNs)
         followerApplyDirty_ = false;
         lastFollowerSyncNs_ = nowNs;
         if (externalFollowerFlush_) {
-            // Shard mode: the owning worker submits it to its io backend (never
-            // blocks the shard loop).  Raised at most once per interval.
+            // Worker-driven (every placement): the owning worker submits it
+            // to its io backend (never blocks the worker).  Raised at most
+            // once per interval.
             followerFlushRequested_ = true;
         } else {
             RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFlush,

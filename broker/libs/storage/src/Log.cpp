@@ -710,6 +710,11 @@ int64_t Log::totalBytes() const {
 }
 void Log::truncateTo(int64_t truncateOffset) {
     if (truncateOffset >= logEndOffset_) return; // nothing to do
+    // F30 fix round 1: the owner's flush bookkeeping must learn the LOWEST
+    // point truncated to, even when new bytes are re-appended before it looks
+    // (LEO alone hides that).  Recorded now (an exception below still lowered
+    // the content) and again with the exact resulting LEO at each exit.
+    noteTruncatedTo_(std::max<int64_t>(0, truncateOffset));
 
     // Remove segments that start at or beyond truncateOffset.
     auto it = segments_.lower_bound(truncateOffset);
@@ -735,6 +740,7 @@ void Log::truncateTo(int64_t truncateOffset) {
                                                  /*eagerReadMap*/true);
         install_(base, std::move(seg));
         logEndOffset_ = base;
+        noteTruncatedTo_(logEndOffset_);
         return;
     }
 
@@ -857,6 +863,7 @@ void Log::truncateTo(int64_t truncateOffset) {
                   ": unknown exception.  The .log file is ALREADY truncated on disk "
                   "(cutPos=" + std::to_string(cutPos) + ").  Halting.");
     }
+    noteTruncatedTo_(logEndOffset_);   // rounded down to the batch boundary
 }
 
 void Log::reloadSegments() {
