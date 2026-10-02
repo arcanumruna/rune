@@ -351,9 +351,11 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     # Network-hop throughput load client (batched/pipelined produce over Aeron).
     add_executable(rune_produce_throughput
         examples/rune_produce_throughput.cpp
+        examples/bench/InvokerBench.cpp
     )
     target_include_directories(rune_produce_throughput PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/examples/bench
     )
     target_link_libraries(rune_produce_throughput PRIVATE
         rune_client_api

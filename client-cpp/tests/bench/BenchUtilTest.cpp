@@ -1,6 +1,8 @@
 // tests/bench/BenchUtilTest.cpp — benchmark building blocks (pure, no Aeron).
+#include "InvokerBench.h"
 #include "LogLinearHistogram.h"
 #include "OpenLoopSchedule.h"
+#include "PartitionTimestamps.h"
 #include "ProcStat.h"
 #include "SeqTimestampRing.h"
 
@@ -8,6 +10,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -135,6 +139,24 @@ TEST(SeqTimestampRing, ManyLapsKeepSequenceToTimestampMapping) {
     EXPECT_EQ(r.outstanding(), 0u);
 }
 
+TEST(SeqTimestampRing, PendingIsExactlyThePushedNotYetTakenSequences) {
+    SeqTimestampRing r(4);
+    EXPECT_FALSE(r.pending(0));
+    r.push(1);
+    r.push(2);
+    EXPECT_TRUE(r.pending(0));
+    EXPECT_TRUE(r.pending(1));
+    EXPECT_FALSE(r.pending(2)) << "never pushed";
+    (void)r.take(1);
+    EXPECT_FALSE(r.pending(1)) << "taken";
+    EXPECT_TRUE(r.pending(0));
+    (void)r.take(0);
+    EXPECT_FALSE(r.pending(0));
+    for (int i = 0; i < 4; ++i) r.push(10 + i);  // seqs 2..5 reuse the slots of 0..3
+    EXPECT_FALSE(r.pending(1)) << "an old lap is not pending";
+    EXPECT_TRUE(r.pending(5));
+}
+
 TEST(ProcStat, ParsesCpuLines) {
     const auto agg = parseProcStatCpuLine("cpu  100 5 50 1000 20 1 2 3 0 0");
     ASSERT_TRUE(agg.has_value());
@@ -168,4 +190,141 @@ TEST(ProcStat, BusyFractionsBetweenSnapshots) {
     ASSERT_EQ(f.size(), 2u);
     EXPECT_DOUBLE_EQ(f[0], 0.5);
     EXPECT_DOUBLE_EQ(f[1], 0.01);
+}
+
+// ---- Task 18: invoker bench arguments + ack -> scheduled-time attribution ----
+
+namespace {
+std::optional<BenchArgs> parse(std::vector<std::string> args, std::string& err) {
+    std::vector<char*> argv{const_cast<char*>("rune_produce_throughput")};
+    for (auto& a : args) argv.push_back(a.data());
+    return parseBenchArgs(static_cast<int>(argv.size()), argv.data(), err);
+}
+} // namespace
+
+TEST(BenchArgs, DefaultsMatchThePassCriterion) {
+    std::string err;
+    const auto a = parse({"--mode", "open"}, err);
+    ASSERT_TRUE(a.has_value()) << err;
+    EXPECT_EQ(a->mode, BenchArgs::Mode::Open);
+    EXPECT_EQ(a->rate, 100'000u);
+    EXPECT_EQ(a->durationS, 60);
+    EXPECT_EQ(a->valueBytes, 1024);
+    EXPECT_EQ(a->acks, "all");
+    EXPECT_EQ(a->shards, 1u);
+    EXPECT_EQ(a->core, -1);
+}
+
+TEST(BenchArgs, ParsesEveryOption) {
+    std::string err;
+    const auto a = parse({"--mode", "saturate", "--rate", "5000", "--duration-s", "10", "--warmup-s", "1",
+                          "--value-bytes", "256", "--shards", "2", "--core", "0", "--window", "512",
+                          "--records", "1000000", "--acks", "leader", "--max-in-flight", "64",
+                          "--gate-p99-us", "100", "--gate-rps", "100000", "--idle-check-cores", "0,1,2,3",
+                          "--idle-check-only"},
+                         err);
+    ASSERT_TRUE(a.has_value()) << err;
+    EXPECT_EQ(a->mode, BenchArgs::Mode::Saturate);
+    EXPECT_EQ(a->rate, 5000u);
+    EXPECT_EQ(a->shards, 2u);
+    EXPECT_EQ(a->core, 0);
+    EXPECT_EQ(a->window, 512);
+    EXPECT_EQ(a->records, 1'000'000u);
+    EXPECT_EQ(a->acks, "leader");
+    EXPECT_EQ(a->maxInFlight, 64);
+    EXPECT_EQ(a->gateP99Us, 100);
+    EXPECT_EQ(a->gateRps, 100'000u);
+    EXPECT_EQ(a->idleCheckCores, (std::vector<int>{0, 1, 2, 3}));
+    EXPECT_TRUE(a->idleCheckOnly);
+}
+
+TEST(BenchArgs, RejectsBadInput) {
+    std::string err;
+    EXPECT_FALSE(parse({"--rate"}, err).has_value());
+    EXPECT_FALSE(parse({"--rate", "fast"}, err).has_value());
+    EXPECT_FALSE(parse({"--acks", "maybe"}, err).has_value());
+    EXPECT_FALSE(parse({"--value-bytes", "9000"}, err).has_value());
+    EXPECT_FALSE(parse({"--shards", "0"}, err).has_value());
+    EXPECT_FALSE(parse({"--bogus"}, err).has_value());
+    EXPECT_NE(err.find("--bogus"), std::string::npos);
+}
+
+TEST(BenchArgs, TransportAndBatchingKnobsAreExplicit) {
+    std::string err;
+    const auto d = parse({"--rate", "1000"}, err);
+    ASSERT_TRUE(d.has_value()) << err;
+    EXPECT_EQ(d->mtu, 8192u) << "the bench box layout (ShardConfig.h) uses mtu 8192";
+    EXPECT_EQ(d->lingerUs, 0) << "Invoker: end-of-pass batching";
+    EXPECT_EQ(d->batchBytes, 64 * 1024);
+    const auto a = parse({"--mtu", "1408", "--linger-us", "50", "--batch-bytes", "16384"}, err);
+    ASSERT_TRUE(a.has_value()) << err;
+    EXPECT_EQ(a->mtu, 1408u);
+    EXPECT_EQ(a->lingerUs, 50);
+    EXPECT_EQ(a->batchBytes, 16384);
+}
+
+TEST(BenchArgs, RejectsMoreBadInput) {
+    std::string err;
+    EXPECT_FALSE(parse({"--mode", "closed"}, err).has_value());
+    EXPECT_FALSE(parse({"--idle-check-cores", "0,,1"}, err).has_value());
+    EXPECT_FALSE(parse({"--idle-check-cores", ""}, err).has_value());
+    EXPECT_FALSE(parse({"--rate", "-5"}, err).has_value());
+    EXPECT_FALSE(parse({"--max-in-flight", "0"}, err).has_value());
+    EXPECT_FALSE(parse({"--batch-bytes", "0"}, err).has_value());
+    EXPECT_FALSE(parse({"--mtu", "100"}, err).has_value());
+    EXPECT_FALSE(parse({"--rate", "0"}, err).has_value()) << "open loop needs a rate";
+    EXPECT_TRUE(parse({"--mode", "saturate", "--rate", "0"}, err).has_value()) << err;
+    EXPECT_FALSE(parse({"--mode", "saturate", "--window", "0"}, err).has_value());
+}
+
+TEST(PartitionTimestamps, SequencedAcksInAnyOrderReturnEachRecordsScheduledTime) {
+    PartitionTimestamps p(8, /*sequenced=*/true);
+    for (int64_t t = 100; t < 106; ++t) p.push(t);
+    std::vector<int64_t> got;
+    auto rec = [&](int64_t ts) { got.push_back(ts); };
+    EXPECT_TRUE(p.onAck(3, 3, 0, rec));  // a later batch first
+    EXPECT_TRUE(p.onAck(0, 3, 0, rec));
+    EXPECT_EQ(got, (std::vector<int64_t>{103, 104, 105, 100, 101, 102}));
+    EXPECT_EQ(p.outstanding(), 0u);
+}
+
+TEST(PartitionTimestamps, UnattributableAcksAreReportedNotMisattributed) {
+    std::vector<int64_t> got;
+    auto rec = [&](int64_t ts) { got.push_back(ts); };
+    {
+        PartitionTimestamps p(8, true);
+        for (int64_t t = 0; t < 4; ++t) p.push(t);
+        EXPECT_TRUE(p.onAck(0, 2, 5, rec));
+        EXPECT_FALSE(p.onAck(0, 2, 6, rec)) << "an epoch bump restarts sequences at 0";
+    }
+    {
+        PartitionTimestamps p(8, true);
+        p.push(1);
+        EXPECT_FALSE(p.onAck(-1, 1, 0, rec)) << "sequenced producer, unsequenced ack";
+    }
+    {
+        PartitionTimestamps p(8, true);
+        p.push(1);
+        EXPECT_FALSE(p.onAck(0, 2, 0, rec)) << "acks more records than were sent";
+        EXPECT_FALSE(p.onAck(5, 1, 0, rec)) << "a sequence never sent";
+    }
+    {
+        PartitionTimestamps p(8, true);
+        p.push(1);
+        p.push(2);
+        EXPECT_TRUE(p.onAck(0, 1, 0, rec));
+        EXPECT_FALSE(p.onAck(0, 1, 0, rec)) << "already taken";
+    }
+    EXPECT_EQ(got, (std::vector<int64_t>{0, 1, 1}));
+}
+
+TEST(PartitionTimestamps, UnsequencedProducerAcksInSendOrder) {
+    PartitionTimestamps p(4, /*sequenced=*/false);  // acks=None: baseSequence -1, FIFO per partition
+    for (int64_t t = 7; t < 10; ++t) p.push(t);
+    std::vector<int64_t> got;
+    auto rec = [&](int64_t ts) { got.push_back(ts); };
+    EXPECT_TRUE(p.onAck(-1, 2, -1, rec));
+    EXPECT_TRUE(p.onAck(-1, 1, -1, rec));
+    EXPECT_FALSE(p.onAck(-1, 1, -1, rec)) << "nothing left to attribute";
+    EXPECT_EQ(got, (std::vector<int64_t>{7, 8, 9}));
 }

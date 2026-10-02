@@ -1,5 +1,8 @@
 // examples/rune_produce_throughput.cpp — network produce THROUGHPUT load client.
 //
+//   With arguments: invoker-shard open-loop bench — see examples/bench/InvokerBench.h (--rate, --mode, ...).
+//   Without arguments: the legacy env-driven agent-mode bench below (unchanged).
+//
 // Drives the REAL client → broker path over Aeron (UDP or IPC) at maximum rate,
 // using the batched/pipelined Producer, and reports records/s + MB/s + (acked
 // mode) latency.  This is the fair, network-footing counterpart to Kafka's
@@ -38,6 +41,9 @@
 #include <rune/client/TopicHandle.h>
 #include <rune/client/producer/Producer.h>
 #include <rune_fr/FlightRecorder.h>
+
+#include "BenchEnv.h"
+#include "InvokerBench.h"
 
 #include <algorithm>
 #include <atomic>
@@ -79,33 +85,14 @@ static void frReport(const std::string& tag) {
     std::cerr << "rune-fr: client report written to " << dir << " (suffix=" << sfx << ")\n";
 }
 
-static std::string envStr(const char* n, const std::string& d = {}) {
-    const char* v = std::getenv(n); return (v && *v) ? std::string(v) : d;
-}
-static int64_t envI64(const char* n, int64_t d) {
-    const char* v = std::getenv(n); return (v && *v) ? std::atoll(v) : d;
-}
+using rune::bench::envI64;
+using rune::bench::envStr;
+using rune::bench::parseTopics;
 
-static std::vector<TopicSpec> parseTopics(const std::string& s) {
-    std::vector<TopicSpec> out;
-    std::size_t pos = 0;
-    while (pos <= s.size()) {
-        const std::size_t comma = s.find(',', pos);
-        const std::string tok = s.substr(pos, (comma == std::string::npos ? s.size() : comma) - pos);
-        pos = (comma == std::string::npos ? s.size() + 1 : comma + 1);
-        if (tok.empty()) continue;
-        const auto c1 = tok.find(':'); if (c1 == std::string::npos) continue;
-        const auto c2 = tok.find(':', c1 + 1); if (c2 == std::string::npos) continue;
-        TopicSpec ts;
-        ts.name = tok.substr(0, c1);
-        ts.topicId = std::atoi(tok.c_str() + c1 + 1);
-        ts.partitionCount = std::atoi(tok.c_str() + c2 + 1);
-        out.push_back(std::move(ts));
-    }
-    return out;
-}
-
-int main() {
+int main(int argc, char** argv) {
+    // Any argument selects the invoker-shard bench (spec §5); env-only runs keep the
+    // legacy agent-mode path unchanged (VM scripts and the default-config A/B use it).
+    if (argc > 1) return rune::bench::invokerBenchMain(argc, argv);
     std::signal(SIGUSR1, frdumphandler);
     frConfigure();
     const std::string target  = envStr("RUNE_TARGET");

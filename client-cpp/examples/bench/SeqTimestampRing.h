@@ -23,6 +23,11 @@ public:
     /// Sequences in [nextSeq() - outstanding(), nextSeq()) are not yet all taken.
     [[nodiscard]] uint64_t outstanding() const noexcept { return next_ - oldest_; }
 
+    /// True when `seq` was pushed and is not taken yet (the only seqs take() accepts).
+    [[nodiscard]] bool pending(uint64_t seq) const noexcept {
+        return seq >= oldest_ && seq < next_ && !slots_[seq & mask_].taken;
+    }
+
     void push(int64_t ts) noexcept {  // caller checked !full()
         slots_[next_ & mask_] = Slot{ts, false};
         ++next_;
