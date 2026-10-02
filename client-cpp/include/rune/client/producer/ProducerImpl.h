@@ -210,6 +210,12 @@ struct PartitionState {
     // Every in-flight batch flagged routeResendPending is re-offered, oldest
     // first, on the next flushBatches visit — before anything new.
     bool     routeResend  = false;
+    /// Re-review 1 NEW-4(b): bumped whenever the partition's produce route may
+    /// have changed (a different publication / endpoint = a different lane).
+    uint32_t laneGen      = 0;
+    /// An OOS on the oldest batch is waiting for earlier-lane attempts to be
+    /// answered before it may be taken as proof (see "Sequence resolution" C2b).
+    bool     laneWait     = false;
 
     // RecordBatchBuilder (reused; reset after each flush).
     // Lazy-initialised on first append.
@@ -867,6 +873,10 @@ public:
     /// Task 16 (C1): resendPartitionViaRoute for every route-parked partition
     /// (fresh metadata arrived after a NotLeader).  Returns # batches queued.
     int resendRouteParked() noexcept;
+    /// Re-review 1 NEW-4(b): the partition's produce route changed without a
+    /// re-offer (e.g. a first node -> worker install): later offers of its live
+    /// batches go on a new lane.  Cold path.
+    void noteRouteChanged(int32_t topicId, int32_t partition) noexcept;
     /// Test/diagnostics: true while (topicId, partition) is route-parked.
     [[nodiscard]] bool routeParked(int32_t topicId, int32_t partition) const noexcept;
 
@@ -1185,6 +1195,15 @@ private:
     void resequence_(PartitionState& ps) noexcept;
     /// Re-stamp a stored frame's attempt tag (MessageHeader correlationId).
     static void stampAttempt_(InFlightBatch& b, uint8_t tag) noexcept;
+    /// NEW-4(b): an answer (any outcome) to attempt `tag` of `b` arrived — one
+    /// fewer outstanding attempt on its lane.
+    static void noteAnswer_(InFlightBatch& b, uint8_t tag) noexcept;
+    /// NEW-4(b): a live batch of b's identity has an unanswered attempt on an
+    /// earlier lane (it may still be appended).
+    [[nodiscard]] bool staleLaneInFlight_(PartitionState& ps, const InFlightBatch& b) noexcept;
+    /// NEW-4(b): a waiting OOS head is re-sent once no earlier-lane attempt of
+    /// its identity is outstanding.
+    void maybeEndLaneWait_(PartitionState& ps) noexcept;
     /// One offer of a live batch's stored frame as a NEW attempt (its earlier
     /// attempts' error answers are ignored from now on).  Reverted when the
     /// transport refuses it.

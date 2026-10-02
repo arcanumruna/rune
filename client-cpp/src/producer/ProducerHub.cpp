@@ -156,6 +156,13 @@ int ProducerHub::resendRouteParked() noexcept
     return queued;
 }
 
+void ProducerHub::noteRouteChanged(int32_t topicId, int32_t partition) noexcept
+{
+    for (ProducerImpl* impl : active_) {
+        if (impl != nullptr) impl->noteRouteChanged(topicId, partition);
+    }
+}
+
 bool ProducerHub::routeParked(int32_t topicId, int32_t partition) const noexcept
 {
     for (const ProducerImpl* impl : active_) {

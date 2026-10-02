@@ -192,3 +192,118 @@ TEST(ProducerRoutePark, OldOwnersLateAnswersToSupersededAttemptsAreIgnoredRegres
     EXPECT_EQ(impl.producerEpoch(), e0) << "epoch bumped";
     EXPECT_FALSE(impl.hasInFlight());
 }
+
+// ===========================================================================
+// Re-review 1 NEW-4(b): an OutOfOrderSequence on the oldest batch is proof that
+// nothing of the identity is stored only when no earlier attempt can still
+// land.  Attempts on the SAME lane (one publication, FIFO to the broker) were
+// processed before the answered one; an attempt on ANOTHER lane (the route
+// moved: node relay vs direct worker, old vs new owner) may land later.  So
+// while any live batch of the identity has an unanswered attempt on a previous
+// lane the OOS is not conclusive: the batch waits (no failure, no re-sequence)
+// for those answers — an OK of any attempt completes it — and is re-sent once
+// they are all in; that re-send's answer decides.
+// ===========================================================================
+namespace {
+constexpr int16_t kOos = static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence);
+struct BatchTally {
+    int okRecords = 0, failed = 0;
+    static void on(void* c, const rune::client::BatchAck& a) noexcept {
+        auto* t = static_cast<BatchTally*>(c);
+        if (a.errorCode == 0) t->okRecords += a.recordCount; else ++t->failed;
+    }
+};
+} // namespace
+
+// The old lane's attempt of the head lands after the new lane's OOS.  RED
+// (pre-fix): the head failed BrokerError(20) and the followers were re-sequenced
+// under a new epoch — while the head was in fact stored (old lane OK).
+TEST(ProducerRoutePark, OosWhileAnOldLaneAttemptIsOutstandingIsNotConclusiveRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    BatchTally t;
+    impl.setOnBatchAck(&BatchTally::on, &t);
+    sendThree(impl, w, sink);              // A, B, C on lane 0 (e.g. the node relay)
+    const int16_t e0 = impl.producerEpoch();
+    ASSERT_EQ(impl.resendPartitionViaRoute(1, 0), 3);  // the route moved: lane 1
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 6u);
+    impl.onProduceResponse(w.frames[3].corrId, -1, kOos);  // A's lane-1 attempt: OOS
+    pump(impl, sink);
+    EXPECT_EQ(t.failed, 0) << "an OOS was taken as proof while A's lane-0 attempt may still land";
+    EXPECT_EQ(impl.producerEpoch(), e0) << "re-sequenced while an old-lane attempt was outstanding";
+    EXPECT_EQ(w.frames.size(), 6u) << "nothing re-sent / re-sequenced yet";
+    impl.onProduceResponse(w.frames[0].corrId, 100, 0);  // A's lane-0 attempt was stored
+    impl.onProduceResponse(w.frames[4].corrId, 101, 0);
+    impl.onProduceResponse(w.frames[5].corrId, 102, 0);
+    EXPECT_EQ(t.okRecords, 3);
+    EXPECT_EQ(t.failed, 0);
+    EXPECT_EQ(impl.producerEpoch(), e0);
+    EXPECT_FALSE(impl.hasInFlight());
+}
+
+// Once every old-lane attempt is answered (here: the old owner's NotLeader for
+// each — errors of superseded attempts, ignored but counted), the waiting head
+// is re-sent on the current lane; an OOS on THAT attempt is conclusive (C4: the
+// head fails, the followers are re-sequenced).  RED (pre-fix): the first OOS
+// already failed the head.
+TEST(ProducerRoutePark, WaitingHeadIsResentOnceTheOldLaneIsAnsweredRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    BatchTally t;
+    impl.setOnBatchAck(&BatchTally::on, &t);
+    sendThree(impl, w, sink);
+    const int16_t e0 = impl.producerEpoch();
+    ASSERT_EQ(impl.resendPartitionViaRoute(1, 0), 3);
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 6u);
+    impl.onProduceResponse(w.frames[3].corrId, -1, kOos);
+    EXPECT_EQ(t.failed, 0);
+    for (int i = 0; i < 3; ++i) impl.onProduceResponse(w.frames[static_cast<std::size_t>(i)].corrId, -1, kNotLeader);
+    EXPECT_FALSE(impl.routeParked(1, 0)) << "a superseded attempt's NotLeader parked the partition";
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 7u) << "the waiting head is re-sent once the old lane answered";
+    EXPECT_EQ(batchcorr::base(w.frames[6].corrId), batchcorr::base(w.frames[0].corrId));
+    EXPECT_EQ(w.frames[6].epoch, e0);
+    impl.onProduceResponse(w.frames[6].corrId, -1, kOos);  // conclusive now
+    pump(impl, sink);
+    EXPECT_EQ(t.failed, 1) << "the rejected head fails";
+    ASSERT_GE(w.frames.size(), 9u);
+    EXPECT_EQ(w.frames[7].epoch, static_cast<int16_t>(e0 + 1)) << "the followers are re-sequenced";
+    EXPECT_EQ(w.frames[7].baseSequence, 0);
+    EXPECT_EQ(w.frames[8].baseSequence, 1);
+}
+
+// Re-review 1 NEW-4(a), the Kafka-faithful contract: DuplicateSequence (Kafka
+// DUPLICATE_SEQUENCE_NUMBER) means "already stored, offset unknown" — the batch
+// completes Ok with offset -1 exactly once (like the broker's OK -1 known-old
+// answer); no failure, no epoch bump, the sequence continues.  RED (pre-fix):
+// it was a generic error (D: failed, outcome unknown, the partition reset).
+TEST(ProducerRoutePark, DuplicateSequenceIsAStoredBatchWithUnknownOffsetRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    std::vector<rune::client::BatchAck> acks;
+    impl.setOnBatchAck(
+        [](void* c, const rune::client::BatchAck& a) noexcept {
+            static_cast<std::vector<rune::client::BatchAck>*>(c)->push_back(a);
+        },
+        &acks);
+    sendThree(impl, w, sink);
+    const int16_t e0 = impl.producerEpoch();
+    impl.onProduceResponse(w.frames[0].corrId, 100,
+                           static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence));
+    impl.onProduceResponse(w.frames[1].corrId, 101, 0);
+    impl.onProduceResponse(w.frames[2].corrId, 102, 0);
+    ASSERT_EQ(acks.size(), 3u);
+    EXPECT_EQ(acks[0].errorCode, 0) << "a DuplicateSequence batch is stored: never a failure";
+    EXPECT_EQ(acks[0].baseOffset, -1) << "offset unknown";
+    const std::vector<uint8_t> v(8, 4);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 4u);
+    EXPECT_EQ(w.frames[3].epoch, e0) << "no epoch bump";
+    EXPECT_EQ(w.frames[3].baseSequence, 3) << "the sequence continues";
+}

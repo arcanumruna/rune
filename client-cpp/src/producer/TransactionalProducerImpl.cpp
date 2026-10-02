@@ -1223,7 +1223,10 @@ void TransactionalProducerImpl::armParked_(TxnPartitionState& ps) {
 void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_t len) {
     auto opt = rpc::ProduceResponse::decode(buf, len);
     if (!opt) return;
-    const int16_t ec = opt->errorCode;
+    // Re-review 1 NEW-4(a): DuplicateSequence (Kafka DUPLICATE_SEQUENCE_NUMBER) =
+    // already stored, offset unknown: an OK.
+    const int16_t ec = opt->errorCode == static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence)
+                           ? kOk : opt->errorCode;
     auto it = batches_.find(opt->correlationId);
     if (it == batches_.end()) {
         // I-2: an earlier attempt's answer.  Its OK still decides the batch

@@ -90,6 +90,14 @@ struct InFlightBatch {
     /// Task 16: queued for an in-order re-offer on the partition's new route
     /// (PartitionState::routeResend); the attempt timer leaves it to that pass.
     bool     routeResendPending = false;
+    /// Re-review 1 NEW-4(b): the lane (PartitionState::laneGen) of the latest
+    /// offer, the attempt tag of the first offer on it, and the attempts not yet
+    /// answered on it / on EARLIER lanes.  Attempts on one lane reach the broker
+    /// in order; an earlier lane's attempt may still land after a later answer.
+    uint32_t laneGen       = 0;
+    uint8_t  laneFirstTag  = 0;
+    uint16_t laneOut       = 0;
+    uint16_t staleLaneOut  = 0;
     std::vector<uint8_t> wireFrame;  ///< encoded Produce frame; capacity reused
 };
 

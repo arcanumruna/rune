@@ -2180,3 +2180,19 @@ TEST(TransactionalProducerTest, NotLeaderParksUntilMetadataThenReoffersSameIdent
     EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
     EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
 }
+
+// Re-review 1 NEW-4(a): DuplicateSequence (Kafka DUPLICATE_SEQUENCE_NUMBER) is a
+// stored batch — the transaction neither retries nor aborts.  RED (pre-fix):
+// re-sent as a generic retriable error, then abortable after kMaxRetries.
+TEST(TransactionalProducerTest, DuplicateSequenceIsAStoredBatchRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    const auto first = sendData(r, 1);
+    ASSERT_EQ(first.size(), 1u);
+    answer(r, corrIdOf(first[0]), ecOf(rpc::ErrorCode::DuplicateSequence));
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u) << "a DuplicateSequence batch is stored";
+    r.sink.clear();
+    r.doWork();
+    EXPECT_TRUE(produceFrames(r.sink).empty()) << "a stored batch was re-sent";
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+}

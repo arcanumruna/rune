@@ -3512,8 +3512,11 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         } else {
             continue;
         }
-        if (agent_.setRoute(p.topicId, p.partition, session, data) && hadWorker &&
-            !agent::ClientAgent::sameEndpoint(prevData, data)) {
+        const bool changed = agent_.setRoute(p.topicId, p.partition, session, data);
+        // NEW-4(b): any route change is a new lane for the partition's later
+        // offers (even when nothing is re-offered now — a first worker install).
+        if (changed) producerHub_.noteRouteChanged(p.topicId, p.partition);
+        if (changed && hadWorker && !agent::ClientAgent::sameEndpoint(prevData, data)) {
             moved.emplace_back(p.topicId, p.partition);
         }
         ++mnRoutes;

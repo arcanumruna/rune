@@ -1625,6 +1625,10 @@ bool ProducerImpl::encodeAndSend(
         b.lastSendTick      = ++sendTick_;
         b.ingressStreamId   = ps.ingressStreamId;
         b.tier2             = false;
+        b.laneGen           = ps.laneGen;  // NEW-4(b): attempt 0 on the current lane
+        b.laneFirstTag      = 0;
+        b.laneOut           = 1;
+        b.staleLaneOut      = 0;
         keepFrame(b.wireFrame, encodeScratch_.data(), written);
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
             earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
@@ -1811,6 +1815,10 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.lastSendTick      = ++sendTick_;
         ib.ingressStreamId   = ps.ingressStreamId;
         ib.tier2             = true;
+        ib.laneGen           = ps.laneGen;  // NEW-4(b)
+        ib.laneFirstTag      = 0;
+        ib.laneOut           = 1;
+        ib.staleLaneOut      = 0;
         keepFrame(ib.wireFrame, encodeScratch_.data(), written);
         verifyClaimedCorrId_(ps, ib, wireCorrId);  // always on (not an assert)
     }
@@ -1835,6 +1843,13 @@ bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t n
     b.lastSendNs   = nowNs;
     b.lastSendTick = ++sendTick_;
     ++b.attempts;
+    if (b.laneGen != ps.laneGen) {  // NEW-4(b): the first attempt on a new lane
+        b.staleLaneOut = static_cast<uint16_t>(b.staleLaneOut + b.laneOut);
+        b.laneOut      = 0;
+        b.laneGen      = ps.laneGen;
+        b.laneFirstTag = next;
+    }
+    ++b.laneOut;
     unpark_(ps, b);  // re-sent: its next answer decides (parked again only on another OOS)
     return true;
 }
@@ -2062,7 +2077,18 @@ int ProducerImpl::flushBatches(
 //     superseded attempt is ignored (Kafka: a new correlation id per request;
 //     a stale response is never matched).  An OK of any attempt is a success.
 //  B. OK: complete (baseOffset -1 = a known-old duplicate: stored, offset
-//     unknown); lastAckedSeq advances.
+//     unknown); lastAckedSeq advances.  DuplicateSequence (Kafka
+//     DUPLICATE_SEQUENCE_NUMBER) is the same outcome: an OK with offset -1.
+//  The OutOfOrderSequence CONTRACT (Kafka's; re-review 1 NEW-4): the broker
+//  answers OOS only for a batch it did NOT append, and a batch it did append
+//  is answered OK (its original offset in the dedup window, -1 beyond it) or
+//  DuplicateSequence — never OOS.  C3/C4 below re-sequence on that proof.  A
+//  broker that cannot vouch for a sequence (a producer state not proven
+//  consistent with its log) must answer an outcome-unknown error (-> D), never
+//  OOS: an OOS for a stored batch makes C4 report it failed and re-stamp
+//  possibly stored followers under a new epoch (written twice).  (rune-broker
+//  37564ba: the no-worker-pool gateway INLINE path still answers a known-old
+//  duplicate OOS — a broker fix; the worker path keeps the contract.)
 //  C. OutOfOrderSequence on batch b (current attempt):
 //     C1. an older live batch of b's identity exists -> b is PARKED (retried
 //         once the older ones resolve; Kafka: !isNextSequence -> retry).  The
@@ -2071,6 +2097,17 @@ int ProducerImpl::flushBatches(
 //         latest OK was processed -> the answer may predate that OK (answers
 //         reorder: errors are immediate, acks=all OKs deferred, routes differ):
 //         b is re-sent (C applies again to that attempt's answer).
+//     C2b. (NEW-4(b)) b is the oldest, but a live batch of b's identity still
+//         has an UNANSWERED attempt on an EARLIER LANE (PartitionState::laneGen:
+//         the route moved / a redirect / a retarget since it was offered).
+//         Attempts on one lane reach the broker in order, so every same-lane
+//         attempt offered before b's was processed before b's OOS; an
+//         earlier lane's attempt may still be appended AFTER it.  The OOS is
+//         not proof yet: b is parked (PartitionState::laneWait) until every
+//         earlier-lane attempt is answered (any outcome; an OK of any attempt
+//         completes its batch), then re-sent on the current lane — that
+//         attempt's answer decides (C again).  Bounded by the attempt timer
+//         and the delivery timeout (D) when an old lane never answers.
 //     C3. b is the oldest and b.baseSequence != lastAckedSeq + 1 -> a failed
 //         predecessor left a gap; the OOS proves it was never written (else b
 //         would have been accepted), so b was not either: the partition is
@@ -2105,7 +2142,13 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     PartitionState& ps = *partitions_[s];
     InFlightBatch* b = ps.inflight.find(correlationId);
     if (b == nullptr) return;  // duplicate / stale (slot reused) / already expired: ignore
-    const int16_t ec = errorCode;
+    noteAnswer_(*b, batchcorr::attempt(correlationId));  // NEW-4(b): one fewer outstanding attempt
+    // NEW-4(a): DuplicateSequence (Kafka DUPLICATE_SEQUENCE_NUMBER) = stored,
+    // offset unknown — the same outcome as the broker's OK -1 known-old answer.
+    const bool dupSeq =
+        errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
+    const int16_t ec = dupSeq ? int16_t{0} : errorCode;
+    if (dupSeq) baseOffset = -1;
     const uint32_t units = b->tier2 ? 1u : static_cast<uint32_t>(b->recordCount);
     if (ec == 0) {  // B
         // EOS-OOS: baseOffset < 0 with OK = a known-old duplicate (the broker
@@ -2121,9 +2164,13 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         ps.lastAckTick = sendTick_;
         releaseResolved_(ps, *b);
         reclaimAckRing_(ps);
+        maybeEndLaneWait_(ps);
         return;
     }
-    if (batchcorr::attempt(correlationId) != b->attemptTag) return;  // A: a superseded attempt's error
+    if (batchcorr::attempt(correlationId) != b->attemptTag) {  // A: a superseded attempt's error
+        maybeEndLaneWait_(ps);  // ... is still an answer (NEW-4(b))
+        return;
+    }
     if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader)) {
         // Task 16 fix round 1 (C1): the partition moved (Kafka NOT_LEADER_OR_FOLLOWER
         // parity): retriable — no completion, no epoch bump, the SAME identity.
@@ -2153,6 +2200,15 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                 ++ps.parkedCount;
             }
             ps.resendParked = true;  // b is the oldest: nothing to wait for
+            markDirty_(ps);
+            return;
+        }
+        if (staleLaneInFlight_(ps, *b)) {  // C2b (NEW-4(b)): not conclusive yet — wait
+            if (!b->oosParked) {
+                b->oosParked = true;
+                ++ps.parkedCount;
+            }
+            ps.laneWait = true;
             markDirty_(ps);
             return;
         }
@@ -2202,6 +2258,37 @@ void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcep
     if (gap != nullptr && gap->lastSendTick <= b.lastSendTick) {
         gap->attemptDeadlineNs     = 0;
         earliestAttemptDeadlineNs_ = 0;
+    }
+}
+
+void ProducerImpl::noteAnswer_(InFlightBatch& b, uint8_t tag) noexcept {
+    // Attempts laneFirstTag..attemptTag (mod 256) went out on the current lane.
+    const auto onLane = static_cast<uint8_t>(tag - b.laneFirstTag) <=
+                        static_cast<uint8_t>(b.attemptTag - b.laneFirstTag);
+    if (onLane) {
+        if (b.laneOut > 0) --b.laneOut;
+    } else if (b.staleLaneOut > 0) {
+        --b.staleLaneOut;
+    }
+}
+
+bool ProducerImpl::staleLaneInFlight_(PartitionState& ps, const InFlightBatch& b) noexcept {
+    bool stale = false;
+    ps.inflight.forEachLive([&](InFlightBatch& o) {
+        if (o.producerId == b.producerId && o.producerEpoch == b.producerEpoch && o.staleLaneOut != 0) stale = true;
+    });
+    return stale;
+}
+
+void ProducerImpl::maybeEndLaneWait_(PartitionState& ps) noexcept {
+    if (!ps.laneWait) return;
+    bool stale = false;
+    ps.inflight.forEachLive([&](InFlightBatch& o) { stale |= o.staleLaneOut != 0; });
+    if (stale) return;
+    ps.laneWait = false;
+    if (ps.parkedCount != 0) {  // the waiting head goes out again; its answer decides
+        ps.resendParked = true;
+        markDirty_(ps);
     }
 }
 
@@ -2451,8 +2538,13 @@ void ProducerImpl::failBatch(int64_t corrId) {
     const uint32_t s = batchcorr::slot(corrId);
     if (s >= partitions_.size()) return;
     if (InFlightBatch* b = partitions_[s]->inflight.find(corrId)) {
-        if (batchcorr::attempt(corrId) != b->attemptTag) return;  // A: a superseded attempt's error
+        noteAnswer_(*b, batchcorr::attempt(corrId));  // NEW-4(b)
+        if (batchcorr::attempt(corrId) != b->attemptTag) {  // A: a superseded attempt's error
+            maybeEndLaneWait_(*partitions_[s]);
+            return;
+        }
         failBatch_(*partitions_[s], *b, OpStatus::DeliveryFailed);
+        maybeEndLaneWait_(*partitions_[s]);
     }
 }
 
@@ -2551,12 +2643,18 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
     PartitionState& ps = *partitions_[s];
     InFlightBatch* b = ps.inflight.find(corrId);
     if (b == nullptr) return false;
-    if (batchcorr::attempt(corrId) != b->attemptTag) return true;  // A: a superseded attempt's redirect
+    noteAnswer_(*b, batchcorr::attempt(corrId));  // NEW-4(b)
+    if (batchcorr::attempt(corrId) != b->attemptTag) {  // A: a superseded attempt's redirect
+        maybeEndLaneWait_(ps);
+        return true;
+    }
     if (b->redirectCount >= kMaxRedirects) {
         failBatch_(ps, *b, OpStatus::DeliveryFailed);  // redirect budget exhausted
+        maybeEndLaneWait_(ps);
         return false;
     }
     ++b->redirectCount;
+    ++ps.laneGen;  // NEW-4(b): the redirect target is another lane
     return offerAttempt_(ps, *b, lastNowNs_, sendFn);
 }
 
@@ -2566,6 +2664,7 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
     int resent = 0;
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
+        ++ps.laneGen;  // NEW-4(b): the retargeted transport is another lane
         ps.inflight.forEachLive([&](InFlightBatch& b) {
             if (b.redirectCount >= kMaxRedirects) {
                 failBatch_(ps, b, OpStatus::DeliveryFailed);  // redirect budget exhausted
@@ -2612,8 +2711,15 @@ int ProducerImpl::resendPartitionViaRoute(int32_t topicId, int32_t partition) no
     const uint32_t idx = partitionIndex_.find(partKey(topicId, partition));
     if (idx == detail::FlatIndexMap::kNone) return 0;
     PartitionState& ps = *partitions_[idx];
+    ++ps.laneGen;  // NEW-4(b): the route moved — another lane
     queueRouteResend_(ps);
     return ps.routeResend ? static_cast<int>(ps.inflight.live()) : 0;
+}
+
+void ProducerImpl::noteRouteChanged(int32_t topicId, int32_t partition) noexcept
+{
+    const uint32_t idx = partitionIndex_.find(partKey(topicId, partition));
+    if (idx != detail::FlatIndexMap::kNone) ++partitions_[idx]->laneGen;
 }
 
 int ProducerImpl::resendRouteParked() noexcept
@@ -2696,6 +2802,7 @@ void ProducerImpl::failAllPending(OpStatus st) noexcept {
         ps.batchStartNs   = 0;
         ps.flushRequested = false;
         ps.resendParked   = false;  // N-3: nothing in flight is left to re-send
+        ps.laneWait       = false;  // NEW-4(b): likewise
         reclaimAckRing_(ps);
     }
 }

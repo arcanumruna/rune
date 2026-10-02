@@ -218,6 +218,8 @@ public:
     int resendPartitionViaRoute(int32_t topicId, int32_t partition) noexcept;
     /// Task 16 (C1): the same for every NotLeader-parked partition (fresh metadata).
     int resendRouteParked() noexcept;
+    /// Re-review 1 NEW-4(b): (topicId, partition)'s route changed (no re-offer).
+    void noteRouteChanged(int32_t topicId, int32_t partition) noexcept;
     /// Test/diagnostics: any producer holds (topicId, partition) route-parked.
     [[nodiscard]] bool routeParked(int32_t topicId, int32_t partition) const noexcept;
 
