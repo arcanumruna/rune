@@ -45,3 +45,6 @@ race:aeron::concurrent::broadcast::CopyBroadcastReceiver::receive
 # Subscription::poll / imageCount / imageBySessionId.  Aeron-internal.
 race:aeron::util::addToArray
 race:aeron::util::removeFromArray
+# The same seqlock, read through Subscription::imageBySessionId (copies the
+# shared_ptr<Image> the conductor just published; rune's ImageLossWatch).
+race:aeron::Subscription::imageBySessionId
