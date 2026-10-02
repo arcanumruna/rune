@@ -40,6 +40,7 @@ extern "C" {
 #include <rune/replication/WorkerReplicationTransport.h>
 #include <rune/storage/Log.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -722,9 +723,19 @@ TEST(AeronPartitionTransportRegression, DrainDeadAndUnregisteredPeersNeverBlockL
     const int before = live.fragments;
     int sent = 0;
     const auto deadline = steady_clock::now() + seconds(20);
+    // An abort (ring read left in place) is only legitimate when the LIVE peer's
+    // own FIFO is full (it is momentarily back-pressured: a slow subscriber under
+    // CPU load).  A dead / unregistered peer must NEVER hold a frame, so it can
+    // never be the FIFO that forces an abort.  Sampled after every drain pass.
+    std::size_t deadHeldMax = 0;
+    uint64_t abortsWithoutLiveBacklog = 0;
     while ((sent < kFrames || live.fragments - before < kFrames) && steady_clock::now() < deadline) {
         while (sent < kFrames && t.sendFetchRequest(req)) ++sent;   // fill the ring
+        const uint64_t abortsBefore = t.holdStatsForTest().aborts;
         (void)t.poll(1);
+        if (t.holdStatsForTest().aborts != abortsBefore && t.heldFramesForTest(2) == 0)
+            ++abortsWithoutLiveBacklog;
+        deadHeldMax = std::max({deadHeldMax, t.heldFramesForTest(3), t.heldFramesForTest(4)});
         (void)live.poll();
     }
     EXPECT_EQ(sent, kFrames) << "the outbound ring froze: a dead peer blocked the live one";
@@ -732,7 +743,14 @@ TEST(AeronPartitionTransportRegression, DrainDeadAndUnregisteredPeersNeverBlockL
     EXPECT_GE(live.fragments - before, kFrames) << "every broadcast reaches the live peer";
     const auto& hs = t.holdStatsForTest();
     EXPECT_GT(hs.downDropped, 0u) << "dead / unregistered peers' copies are discarded, not held";
-    EXPECT_EQ(hs.aborts, 0u);
+    EXPECT_EQ(deadHeldMax, 0u) << "a dead / unregistered peer held a frame";
+    EXPECT_TRUE(t.peerDownForTest(3));
+    EXPECT_TRUE(t.peerDownForTest(4));
+    // Was EXPECT_EQ(hs.aborts, 0u): timing-dependent — a live subscriber starved
+    // of CPU (ctest -j) back-pressures its publication, fills its own FIFO and
+    // correctly aborts (gate flake, 7/36 under 12-way parallel stress).  The
+    // property is that no abort happens WITHOUT live-peer backlog.
+    EXPECT_EQ(abortsWithoutLiveBacklog, 0u) << "an abort not caused by the live peer's own backlog";
     EXPECT_EQ(hs.pushFailed, 0u);
 }
 

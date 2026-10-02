@@ -238,6 +238,9 @@ public:
     [[nodiscard]] const OutboundHoldStats& holdStatsForTest() const noexcept {
         return holdRouter_.stats();
     }
+    /// F27: frames currently held for `peer` / whether it is marked down (tests).
+    [[nodiscard]] std::size_t heldFramesForTest(NodeId peer) const noexcept { return holdRouter_.heldFrames(peer); }
+    [[nodiscard]] bool peerDownForTest(NodeId peer) const noexcept { return holdRouter_.isDown(peer); }
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
