@@ -192,7 +192,14 @@ struct WorkerOp {
 
     // deferAck: true when the gateway determined (before enqueueing) that the
     // response should be deferred (acks=All + replica + committedMetadataReady).
-    // Forwarded in WorkerReturn so the gateway knows to enqueue PendingAck.
+    //
+    // WIRE NOTE (F15 S5 fix round 2, N-4): the SBE WorkerOp field named
+    // `deferAck` (rune-internal-ring.xml) is a FLAG BYTE, not a bool:
+    //   bit 0 (kOpFlagDeferAck = 0x01)     — this deferAck (acks=all, steady state)
+    //   bit 1 (kOpFlagCrcValidated = 0x02) — crcValidated (below; Produce only)
+    // Writer: Worker::enqueueOp only.  Readers MUST mask the bit they need
+    // (executeProduceWire_ does); `deferAck() != 0` is wrong.  Rename the
+    // schema field to `flags` the next time rune-protocol's schema is touched.
     bool deferAck = false;
 
     // F15 S5 fix round 1 (review M-3): the producer of this Produce op ran

@@ -86,10 +86,11 @@ std::vector<uint8_t> batch(int64_t pid, int32_t seq) {
 // threads in turn (deterministic, no cross-thread wait).
 struct GatewayRig {
     std::string dir = tempDir("gw");
-    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, dir};
+    int32_t partitions;
+    rune::gateway::TopicRegistry topics;
     NullTransport t;
     rune::node::ReplicaRegistry reg;
-    rune::node::WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 22, 1 << 23, 64, 64};
+    rune::node::WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 22, 1 << 25, 64, 64};   // 32 MiB return ring (production default)
     int64_t answers = 0;
     int64_t errors  = 0;     ///< answers with a non-zero code (the bench must measure the OK path)
     int16_t lastErr = 0;
@@ -105,13 +106,19 @@ struct GatewayRig {
             else if (!r) { ++errors; lastErr = -1; }
             return 1;
         });
-    PartitionReplica* r = nullptr;
+    PartitionReplica* r = nullptr;    ///< partition 0
+    PartitionReplica* r1 = nullptr;   ///< partition 1 (stalled-front arm), if any
     int64_t sid = 0;
     int64_t now = 1;
-    explicit GatewayRig(std::vector<NodeId> isr) {
-        auto rep = std::make_unique<PartitionReplica>(partCfg(), Role::Leader, 1, isr, isr, topics.log(0, 0), &t);
-        r = rep.get();
-        reg.add(0, 0, std::move(rep));
+    explicit GatewayRig(std::vector<NodeId> isr, int32_t parts = 1)
+        : partitions(parts), topics({rune::node::TopicSpec{"t", parts}}, dir) {
+        for (int32_t p = 0; p < parts; ++p) {
+            PartitionConfig c = partCfg();
+            c.partitionId = p;
+            auto rep = std::make_unique<PartitionReplica>(c, Role::Leader, 1, isr, isr, topics.log(0, p), &t);
+            (p == 0 ? r : r1) = rep.get();
+            reg.add(0, p, std::move(rep));
+        }
         pool.assignFromRegistry(reg);
         pool.setRegistry(&reg);
         pool.setRunnersStartedForTest(true);
@@ -181,9 +188,11 @@ BENCHMARK(BM_GatewayPathProduce)->Arg(0)->Arg(1)->Unit(benchmark::kNanosecond)->
 // ---------------------------------------------------------------------------
 void BM_FlushOwedAcksAll(benchmark::State& state) {
     const int64_t parked = state.range(0);
+    const bool stalled = state.range(1) != 0;
     constexpr int kFire = 16;
-    GatewayRig R({1, 2});
-    R.w().setMaxOwedReturns(8192);
+    // N-1: the PRODUCTION owed cap (Worker::kMaxOwedReturns = 4096); the
+    // largest arm parks cap - kFire so a pass's kFire new waiters still fit.
+    GatewayRig R({1, 2}, stalled ? 2 : 1);
     const auto b = batch(-1, 0);
     WorkerOp op;
     op.type = WorkerOp::Type::Produce; op.topicId = 0; op.partition = 0;
@@ -203,13 +212,25 @@ void BM_FlushOwedAcksAll(benchmark::State& state) {
         rune::replication::FetchRequestMsg fr{R.r->epoch(), 0, 2, fetchOffset, 1, R.r->topicId()};
         (void)R.r->onFetchRequest(fr, R.now);
     };
+    // Stalled-front arm (re-review I-2): ONE acks=all waiter on partition 1,
+    // parked FIRST, whose follower never fetches — it never fires and pins the
+    // front of the worker's waiter queue while partition 0 keeps firing.
+    if (stalled) {
+        WorkerOp s1 = op;
+        s1.partition = 1; s1.replica = R.r1; s1.logPtr = R.r1->log();
+        s1.targetReplicaId = R.r1->registryId(); s1.incarnation = R.r1->incarnation();
+        s1.correlationId = ++corr;
+        if (!R.w().tryEnqueueOp(s1)) state.SkipWithError("op ring full");
+        R.pass();
+    }
     // Prefill: `parked` waiters, none fired (follower at 0).
     for (int64_t done = 0; done < parked; done += 256) {
         enqueue(static_cast<int>(std::min<int64_t>(256, parked - done)));
         R.pass();
     }
     follower(0);
-    if (R.w().reservedAckSlotsForTest() != parked) state.SkipWithError("prefill did not park every waiter");
+    if (R.w().reservedAckSlotsForTest() != parked + (stalled ? 1 : 0))
+        state.SkipWithError("prefill did not park every waiter");
     const int64_t answered0 = R.answers;
     for (auto _ : state) {
         enqueue(kFire);
@@ -220,9 +241,14 @@ void BM_FlushOwedAcksAll(benchmark::State& state) {
     if (R.answers - answered0 != static_cast<int64_t>(state.iterations()) * kFire)
         state.SkipWithError("fired count mismatch");
     else if (R.errors != 0)
-        state.SkipWithError("waiters answered with an error");
+        state.SkipWithError(("waiters answered with an error: first code " + std::to_string(R.firstErr) +
+                             " at answer " + std::to_string(R.firstErrAt) + ", errors " +
+                             std::to_string(R.errors)).c_str());
     state.SetItemsProcessed(state.iterations() * kFire);
 }
-BENCHMARK(BM_FlushOwedAcksAll)->Arg(64)->Arg(512)->Arg(4096)->Unit(benchmark::kNanosecond)->MinTime(0.5);
+BENCHMARK(BM_FlushOwedAcksAll)
+    ->Args({64, 0})->Args({512, 0})->Args({4096 - 64, 0})
+    ->Args({64, 1})->Args({512, 1})->Args({4096 - 64, 1})
+    ->Unit(benchmark::kNanosecond)->MinTime(0.5);
 
 } // namespace

@@ -4222,29 +4222,33 @@ TEST(TxnAddOffsetsRegression, AddOffsetsWhilePreparingIsConcurrentTransactions) 
 // F15 S5 fix round 1 (task review): M-1, M-2, M-3.
 // ============================================================================
 TEST(WorkerPsmRegression, StrictAnswersInParkOrderWhenFsyncsCompleteOutOfOrder) {
-    // M-1: two coalesced fsyncs on the same log (T1 for seq 0, T2 for seq 1)
-    // are not ordered by the io backend.  T2's completion arriving first must
-    // not answer seq 1 before seq 0: T2's fdatasync covers seq 0's write too,
-    // so both are answered, in park order.
+    // M-1 (fix round 1), closed structurally by M-6 (fix round 2): two
+    // coalesced fsyncs on one log could complete out of order and answer seq 1
+    // before seq 0.  Now seq 1's fsync is not submitted until seq 0's completed
+    // (one in flight per log): completions are in submit order and the answers
+    // leave in park order.
     LegacyAcksRig R({1}, /*tier=*/2);
     R.w().setReapPausedForTest(true);
     R.produce(1, /*acks=leader*/0, batchAt(0));
     R.runWorker();                                            // seq 0 appended, fsync T1 submitted
     R.produce(2, 0, batchAt(0));
-    R.runWorker();                                            // seq 1 appended, fsync T2 submitted
+    R.runWorker();                                            // seq 1 appended, its fsync waits behind T1
     ASSERT_EQ(R.w().durablePendingCountForTest(), 2u);
     const CompletionToken t1 = R.w().durablePendingTokenForTest(0);
-    const CompletionToken t2 = R.w().durablePendingTokenForTest(1);
     ASSERT_NE(t1, kNoToken);
-    ASSERT_NE(t2, kNoToken);
-    ASSERT_NE(t1, t2) << "precondition: two separate fsyncs";
+    ASSERT_EQ(R.w().durablePendingTokenForTest(1), kNoToken) << "a second fsync in flight on the same log";
     auto drain = [&] { R.w().drainReturn([&](WorkerReturn ret) { R.gw.handleWorkerReturnForTest(ret); }); };
-    R.w().deliverCompletionForTest(FlushCompletion{t2, 0, R.r->log()->flushBoundary()});   // T2 first
-    drain();
     R.w().deliverCompletionForTest(FlushCompletion{t1, 0, R.r->log()->flushBoundary()});
     drain();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].corr, 1);
+    R.runWorker();                                            // T2 submitted now
+    const CompletionToken t2 = R.w().durablePendingTokenForTest(0);
+    ASSERT_NE(t2, kNoToken);
+    ASSERT_NE(t2, t1);
+    R.w().deliverCompletionForTest(FlushCompletion{t2, 0, R.r->log()->flushBoundary()});
+    drain();
     ASSERT_EQ(R.answers.size(), 2u);
-    EXPECT_EQ(R.answers[0].corr, 1) << "seq 1 was answered before seq 0 (fsync completion order leaked)";
     EXPECT_EQ(R.answers[1].corr, 2);
     for (const auto& a : R.answers) EXPECT_EQ(a.code, 0);
     // The real completions (reaped later) fire nothing more.
@@ -4338,4 +4342,88 @@ TEST(OrderedWaitQueueRegression, ParkOrderKeptFrontFireIsO1AndTombstonesNeverGro
     EXPECT_EQ(seen, (std::vector<int>{1, 2, 3, 4, 6, 8, 9})) << "order lost across compactions";
     EXPECT_EQ(q.sweep([](int) { return true; }), 7u);
     EXPECT_TRUE(q.empty());
+}
+
+// ============================================================================
+// F15 S5 fix round 2 (re-review 1): M-6, I-2, N-2.
+// ============================================================================
+TEST(WorkerPsmRegression, OneDurableFsyncInFlightPerLogSoAnErrorReachesEveryWaiter) {
+    // M-6: two concurrent fdatasyncs on one log file — a writeback error is
+    // reported once per open file (errseq), so the fsync that sees it (T1) can
+    // fail while the other (T2) succeeds — and T2's success would answer OK for
+    // pages whose writeback failed.  One fsync in flight per log: seq 1 waits
+    // un-submitted behind T1, and T1's error fails BOTH, never OK.
+    LegacyAcksRig R({1}, /*tier=*/2);
+    R.w().setReapPausedForTest(true);
+    R.produce(1, /*acks=leader*/0, batchAt(0));
+    R.runWorker();
+    const CompletionToken t1 = R.w().durablePendingTokenForTest(0);
+    ASSERT_NE(t1, kNoToken);
+    R.produce(2, 0, batchAt(0));
+    R.runWorker();
+    ASSERT_EQ(R.w().durablePendingCountForTest(), 2u);
+    const CompletionToken t2 = R.w().durablePendingTokenForTest(1);
+    auto drain = [&] { R.w().drainReturn([&](WorkerReturn ret) { R.gw.handleWorkerReturnForTest(ret); }); };
+    if (t2 != kNoToken) {                                     // a concurrent fsync that did not see the EIO
+        R.w().deliverCompletionForTest(FlushCompletion{t2, 0, R.r->log()->flushBoundary()});
+        drain();
+    }
+    R.w().deliverCompletionForTest(FlushCompletion{t1, EIO, R.r->log()->flushBoundary()});
+    drain();
+    EXPECT_EQ(t2, kNoToken) << "a second durable fsync was in flight on the same log";
+    ASSERT_EQ(R.answers.size(), 2u);
+    for (const auto& a : R.answers)
+        EXPECT_NE(a.code, 0) << "corr " << a.corr << " answered OK although the log's fsync failed";
+}
+
+TEST(OrderedWaitQueueRegression, StalledFrontKeepsTheWalkedSpanBoundedByLiveEntries) {
+    // I-2: one waiter that never fires (a lagging follower) pins the head;
+    // another partition keeps parking and firing behind it.  Every pass must
+    // walk O(live) slots — the span (live + tombstones) stays <= 2·live + slack
+    // — and the ring never grows.
+    OrderedWaitQueue<int> q;
+    q.reserve(Worker::kMaxOwedReturns);
+    const std::size_t slots = q.capacitySlots();
+    q.push_back(-1);                                          // the stalled front waiter
+    int next = 0;
+    std::size_t maxSpan = 0;
+    for (int pass = 0; pass < 20'000; ++pass) {
+        for (int k = 0; k < 16; ++k) q.push_back(int{next++});
+        (void)q.sweep([](int v) { return v >= 0 && (v & 1) == 0; });   // half of each pass fires
+        (void)q.sweep([&](int v) { return v >= 0 && v < next - 64; });  // older ones fire later
+        if (q.spanForTest() > maxSpan) maxSpan = q.spanForTest();
+    }
+    const std::size_t bound = 2 * q.size() + OrderedWaitQueue<int>::kSlack + 16;
+    EXPECT_LE(maxSpan, 2 * 65 + OrderedWaitQueue<int>::kSlack + 16)
+        << "the walked span grew with the tombstones behind the stalled front (not with live entries)";
+    EXPECT_LE(q.spanForTest(), bound);
+    EXPECT_EQ(q.growths(), 0u);
+    EXPECT_EQ(q.capacitySlots(), slots);
+    EXPECT_EQ(q.at(0), -1) << "the stalled front kept its place";
+}
+
+TEST(OrderedWaitQueueRegression, CompactionWithAWrappedWindowKeepsOrder) {
+    // N-2: advance the head past the middle of the ring, wrap the window
+    // physically, tombstone the middle and compact (eager and full-ring).
+    OrderedWaitQueue<int> q;
+    q.reserve(16);                                            // a small ring: pow2(2·16 + slack) = 128 slots
+    const std::size_t slots = q.capacitySlots();
+    int next = 0;
+    std::vector<int> expect;
+    for (std::size_t i = 0; i < slots / 2 + 8; ++i) q.push_back(int{next++});
+    (void)q.sweep([&](int v) { return v < static_cast<int>(slots / 2) + 4; });   // head moves past mid-ring
+    ASSERT_GT(q.headForTest() & (slots - 1), slots / 2) << "precondition: head beyond the middle";
+    for (int v = static_cast<int>(slots / 2) + 4; v < next; ++v) expect.push_back(v);
+    while (q.spanForTest() < slots) { expect.push_back(next); q.push_back(int{next++}); }   // window wraps physically
+    ASSERT_EQ(q.spanForTest(), slots) << "precondition: the ring is full with a wrapped window";
+    // Tombstone the middle (every third entry after the head), then push into the full ring.
+    (void)q.sweep([&](int v) { return v % 3 == 0 && v > expect.front(); });
+    std::vector<int> kept;
+    for (int v : expect) if (!(v % 3 == 0 && v > expect.front())) kept.push_back(v);
+    for (int k = 0; k < 8; ++k) { kept.push_back(next); q.push_back(int{next++}); }
+    std::vector<int> seen;
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, kept) << "order lost compacting a wrapped window";
+    EXPECT_EQ(q.growths(), 0u);
+    EXPECT_GT(q.compactions(), 0u);
 }

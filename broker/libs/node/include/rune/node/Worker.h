@@ -516,6 +516,7 @@ public:
         durablePending_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         initRoutes_(ioSubmitDepth > ioComplDepth ? ioSubmitDepth : ioComplDepth);
         dirtyThisCycle_.reserve(kDirtySetReserve);
+        stillDirty_.reserve(kDirtySetReserve);
         pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         subs_.reserve(kSubsReserve);
         validators_.reserve(kValidatorsReserve);
@@ -1547,6 +1548,15 @@ private:
                 continue;
             }
             if (slot) work += submitPendingSeals_(*slot);
+            // M-6: one fsync in flight per log.  While one is, the new entries
+            // stay un-stamped (kNoToken) and the log stays dirty: the next pass
+            // after the in-flight fsync completes submits ONE fsync covering
+            // all of them (state-driven retry, no timer).
+            if (slot && (slot->durableToken != kNoToken || slot->bgToken != kNoToken)) {
+                ++durableSubmitsDeferred_;
+                stillDirty_.push_back(log);
+                continue;
+            }
             CompletionToken t = submitActive_(log, RouteKind::Durable, slot ? slot->epoch : 0,
                                               /*pin=*/slot != nullptr);
             if (t == kNoToken) {
@@ -1568,11 +1578,14 @@ private:
                 durablePending_.forEach([&](DurablePending& entry) {
                     if (entry.token == kNoToken && entry.logPtr == log) entry.token = t;
                 });
+                if (slot) { slot->durableToken = t; slot->durableLeo = log->logEndOffset(); }
                 ++io_submitCount_;
                 ++work;
             }
         }
-        dirtyThisCycle_.clear();
+        // M-6: logs whose fsync is deferred behind an in-flight one stay dirty.
+        dirtyThisCycle_.swap(stillDirty_);
+        stillDirty_.clear();
         return work;
     }
 
@@ -1631,6 +1644,19 @@ private:
             if (bgInFlight_) --bgInFlight_;
         }
         if (routed && r.kind == RouteKind::Seal && slot && slot->sealsInFlight > 0) --slot->sealsInFlight;
+        // M-6: the log's one durable fsync is no longer in flight.  A success
+        // syncs everything below its LEO (it also serves a background request
+        // deferred behind it); data appended since is re-requested.
+        if (routed && r.kind == RouteKind::Durable && slot && slot->durableToken == c.token) {
+            slot->durableToken = kNoToken;
+            if (c.errorCode == 0) {
+                if (slot->durableLeo > slot->lastSyncedLeo) slot->lastSyncedLeo = slot->durableLeo;
+                if (slot->bgAgain) {
+                    slot->bgAgain = false;
+                    if (slot->log->logEndOffset() > slot->lastSyncedLeo) (void)requestBgFlush_(*slot);
+                }
+            }
+        }
 
         // C-1: the error FIRST — before any purged-slot early return.  An fsync
         // error is fail-stop whoever owns the log now (never retried).
@@ -1659,27 +1685,12 @@ private:
         }
 
         // Durable token (or an unrouted one: synthetic / already-retired).
-        // F15 S5 (+ fix round 1, M-1): Strict answers of one log leave in PARK
-        // order whatever order the fsyncs complete in.  A successful fdatasync
-        // of token T on log L covers every write issued before T's submit — so
-        // T also fires L's entries parked BEFORE T's last entry whose own
-        // (earlier) token has not completed yet.  Writes in an older, rolled
-        // segment are covered by its seal: while a seal is outstanding the
-        // entries wait for it (awaitSeal), exactly like T's own entries.
-        const rune::storage::Log* L = routed ? r.log : nullptr;
-        std::size_t lastPos = SIZE_MAX, pos = 0;
-        durablePending_.forEach([&](const DurablePending& e) {
-            if (e.token == c.token) {
-                if (L == nullptr) L = e.logPtr;
-                lastPos = pos;
-            }
-            ++pos;
-        });
-        if (lastPos == SIZE_MAX) return 0;                       // nothing parked on T
-        pos = 0;
+        // F15 S5 fix round 2 (M-6 supersedes the round-1 M-1 cover rule): one
+        // durable fsync in flight per log, so a log's tokens complete in submit
+        // order and its Strict answers leave in park order by construction;
+        // the order-preserving sweep keeps them in that order.
         return static_cast<int>(durablePending_.sweep([&](DurablePending& entry) {
-            if (pos++ > lastPos) return false;
-            if (entry.logPtr != L || entry.token == kNoToken || entry.awaitSeal) return false;
+            if (entry.token == kNoToken || entry.token != c.token || entry.awaitSeal) return false;
             if (sealsOutstanding_(entry.logPtr)) {
                 entry.awaitSeal = true;                         // durable in its active segment;
                 return false;                                   // fires once the seals complete
@@ -3264,6 +3275,9 @@ private:
     // append this cycle.  submitCoalescedFlushes_ drains this and submits one
     // io_.submit per log.  Worker-thread only — plain vector, reserved in ctor.
     std::vector<rune::storage::Log*> dirtyThisCycle_;
+    // F15 S5 fix round 2 (M-6): dirty logs whose fsync waits behind an in-flight one.
+    std::vector<rune::storage::Log*> stillDirty_ = [] { std::vector<rune::storage::Log*> v; v.reserve(64); return v; }();
+    uint64_t durableSubmitsDeferred_ = 0;
 
     // E3 Task 5: cumulative count of successful io_.submit calls in
     // submitCoalescedFlushes_.  Used by tests (ioSubmitCountForTest()).
@@ -3529,6 +3543,13 @@ private:
         rune::replication::PartitionReplica* replica = nullptr;
         uint32_t        epoch           = 0;          ///< identity across rebuilds (M2)
         CompletionToken bgToken         = kNoToken;   ///< background flush in flight
+        /// F15 S5 fix round 2 (M-6): the ONE durable fsync in flight on this
+        /// log's active segment (kNoToken = none).  At most one fsync — durable
+        /// or background — is in flight per log, so a writeback error (errseq:
+        /// reported once per open file) can never be consumed by one fsync while
+        /// a concurrent one on the same file succeeds and acks OK.
+        CompletionToken durableToken    = kNoToken;
+        int64_t         durableLeo      = 0;          ///< LEO covered by durableToken
         int64_t         bgLeo           = 0;          ///< LEO covered by bgToken
         bool            bgAgain         = false;      ///< newer data requested meanwhile
         int64_t         lastSyncedLeo   = 0;
@@ -4142,6 +4163,12 @@ private:
         if (log->storageFailed()) return false;                   // fail-stop: never again
         if (slot.bgToken != kNoToken) {                           // coalesce
             if (log->logEndOffset() > slot.bgLeo) slot.bgAgain = true;
+            return false;
+        }
+        // M-6: never a background fsync concurrent with the log's durable one
+        // (one fsync in flight per log); re-requested when the durable completes.
+        if (slot.durableToken != kNoToken) {
+            if (log->logEndOffset() > slot.lastSyncedLeo) slot.bgAgain = true;
             return false;
         }
         const CompletionToken t = submitActive_(log, RouteKind::Background, slot.epoch);
