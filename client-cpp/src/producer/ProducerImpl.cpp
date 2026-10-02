@@ -303,6 +303,11 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     // a retransmit older than the window could otherwise not be recognised as a
     // duplicate (Kafka caps max.in.flight at 5 for the same reason).
     constexpr int32_t kWindow = rune::protocol::client::kIdempotentMaxInFlightBatches;
+    // N-2: the in-flight ring rounds its capacity up to a power of two and
+    // full() bounds the span INCLUDING holes by it — only a power-of-two window
+    // keeps every retransmit inside the broker's window.
+    static_assert(kWindow > 0 && (kWindow & (kWindow - 1)) == 0,
+                  "kIdempotentMaxInFlightBatches must be a power of two");
     if (cfg_.acks != Acks::None && cfg_.maxInFlight > kWindow) {
         std::fprintf(stderr,
                      "ProducerImpl: maxInFlight=%d clamped to %d (idempotent producer: the broker's "
@@ -1201,6 +1206,8 @@ PartitionState& ProducerImpl::getOrCreatePartition(int32_t topicId, int32_t part
     if (idx != detail::FlatIndexMap::kNone) return *partitions_[idx];
     auto ps = std::make_unique<PartitionState>(topicId, partition);
     ps->slotIndex = static_cast<uint32_t>(partitions_.size());
+    ps->producerId = producerId_;  // I-4: the identity its sequences start under
+    ps->epoch      = producerEpoch_;
     ps->ackRing.assign(kAckRingCapacity, 0);  // preallocated ONCE (zero per-batch alloc)
     ps->ackMask = kAckRingCapacity - 1;
     ps->inflight = InFlightRing(static_cast<uint32_t>(cfg_.maxInFlight > 0 ? cfg_.maxInFlight : 1));
@@ -1516,8 +1523,8 @@ bool ProducerImpl::encodeAndSend(
     // after a successful offer (below), so a back-pressured retry re-sends the
     // SAME sequence rather than opening a gap.
     if (cfg_.acks != Acks::None) {
-        ps.builder->setProducerId(producerId_);
-        ps.builder->setProducerEpoch(producerEpoch_);
+        ps.builder->setProducerId(ps.producerId);  // the PARTITION's identity (I-4)
+        ps.builder->setProducerEpoch(ps.epoch);
         ps.builder->setBaseSequence(ps.nextBaseSequence);
     }
 
@@ -1538,8 +1545,8 @@ bool ProducerImpl::encodeAndSend(
     // — carry exactly what was stamped into the header above (acks=None keeps the
     // -1 sentinels: non-idempotent).  Retransmits re-send this frame verbatim.
     if (cfg_.acks != Acks::None) {
-        msg.producerId    = producerId_;
-        msg.producerEpoch = producerEpoch_;
+        msg.producerId    = ps.producerId;
+        msg.producerEpoch = ps.epoch;
         msg.baseSequence  = ps.nextBaseSequence;
     } else {
         msg.producerEpoch = -1;  // the header's -1 (Produce defaults epoch to 0): all three match
@@ -1612,7 +1619,9 @@ bool ProducerImpl::encodeAndSend(
         b.ackCount          = ps.batchAckCount;
         b.recordCount       = batchRecords;
         b.baseSequence      = batchSeq;
-        b.producerEpoch     = producerEpoch_;
+        b.producerEpoch     = ps.epoch;
+        b.producerId        = ps.producerId;
+        b.lastSendTick      = ++sendTick_;
         b.ingressStreamId   = ps.ingressStreamId;
         b.tier2             = false;
         keepFrame(b.wireFrame, encodeScratch_.data(), written);
@@ -1683,12 +1692,12 @@ bool ProducerImpl::encodeAndSendTier2(
     const bool idempotent = (cfg_.acks != Acks::None);
     if (idempotent) {
         // Patch producerId (int64 LE at kProducerIdOffset).
-        const uint64_t pid = static_cast<uint64_t>(producerId_);
+        const uint64_t pid = static_cast<uint64_t>(ps.producerId);
         for (int i = 0; i < 8; ++i)
             b[rb::kProducerIdOffset + i] = static_cast<uint8_t>(pid >> (i * 8));
 
         // Patch producerEpoch (int16 LE at kProducerEpochOffset).
-        const uint16_t ep = static_cast<uint16_t>(producerEpoch_);
+        const uint16_t ep = static_cast<uint16_t>(ps.epoch);
         b[rb::kProducerEpochOffset]     = static_cast<uint8_t>(ep);
         b[rb::kProducerEpochOffset + 1] = static_cast<uint8_t>(ep >> 8);
 
@@ -1730,8 +1739,8 @@ bool ProducerImpl::encodeAndSendTier2(
     msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
     // EOS-DUP: the frame carries the identity patched into the header above.
     if (idempotent) {
-        msg.producerId    = producerId_;
-        msg.producerEpoch = producerEpoch_;
+        msg.producerId    = ps.producerId;
+        msg.producerEpoch = ps.epoch;
         msg.baseSequence  = ps.nextBaseSequence;
     } else {
         msg.producerEpoch = -1;  // the pre-built header's -1: all three match
@@ -1795,7 +1804,9 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.ackCount          = 1;
         ib.recordCount       = entry.recordCount;
         ib.baseSequence      = batchSeq;
-        ib.producerEpoch     = producerEpoch_;
+        ib.producerEpoch     = ps.epoch;
+        ib.producerId        = ps.producerId;
+        ib.lastSendTick      = ++sendTick_;
         ib.ingressStreamId   = ps.ingressStreamId;
         ib.tier2             = true;
         keepFrame(ib.wireFrame, encodeScratch_.data(), written);
@@ -1809,19 +1820,38 @@ bool ProducerImpl::encodeAndSendTier2(
 // EOS-OOS: re-send parked batches (their older batches all resolved)
 // ---------------------------------------------------------------------------
 
+template <class Send>
+bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t nowNs, Send&& send) {
+    const uint8_t prev = b.attemptTag;
+    const uint8_t next = static_cast<uint8_t>(prev + 1);
+    stampAttempt_(b, next);
+    if (!send(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(), b.wireFrame.size())) {
+        stampAttempt_(b, prev);  // not on the wire: the previous attempt is still the current one
+        return false;
+    }
+    b.attemptTag   = next;
+    b.lastSendNs   = nowNs;
+    b.lastSendTick = ++sendTick_;
+    ++b.attempts;
+    unpark_(ps, b);  // re-sent: its next answer decides (parked again only on another OOS)
+    return true;
+}
+
 template <class Sink>
 bool ProducerImpl::resendParked_(PartitionState& ps, int64_t nowNs, const Sink& sink) {
     const int64_t attemptNs = cfg_.produceTimeoutMs * 1'000'000LL;
-    bool all = true;
+    bool all  = true;
+    bool stop = false;  // reached a possible gap: the parked batches behind it wait for it
     ps.inflight.forEachLive([&](InFlightBatch& b) {
-        if (!all || !b.oosParked) return;
-        if (!sink(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(), b.wireFrame.size())) {
+        if (!all || stop) return;
+        if (!b.oosParked) {
+            if (!storedByAck_(ps, b)) stop = true;
+            return;
+        }
+        if (!offerAttempt_(ps, b, nowNs, sink)) {
             all = false;  // back-pressure: keep order — the rest wait for the next pass
             return;
         }
-        unpark_(ps, b);
-        ++b.attempts;
-        b.lastSendNs        = nowNs;
         b.attemptDeadlineNs = nowNs + attemptNs;
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
     });
@@ -1878,6 +1908,14 @@ int ProducerImpl::flushBatches(
         // again FIRST, oldest-first — a new batch sent ahead of them would only
         // meet the same sequence gap.  Back-pressure: nothing new this pass.
         if (ps.resendParked && !resendParked_(ps, nowNs, sink)) {
+            dirty_[keep++] = slot;
+            continue;
+        }
+        // ---- EOS follow-ups M-1 / I-4 (Kafka shouldStopDrainBatchesForPartition):
+        // no NEW batch of a partition while it has parked batches (they would
+        // only meet the same gap) or an unresolved sequence (its outcome decides
+        // the identity the next batch gets).  Kept dirty: re-examined every pass.
+        if (ps.parkedCount > 0 || ps.unresolved) {
             dirty_[keep++] = slot;
             continue;
         }
@@ -1971,6 +2009,53 @@ int ProducerImpl::flushBatches(
 // Agent-thread: ProduceResponse routing
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Sequence resolution — EOS follow-ups fix round 1 (I-2, I-4, M-1).  The
+// idempotent producer's rules, per partition, after Kafka's TransactionManager
+// (maybeResolveSequences, requestEpochBumpForPartition / startSequences-
+// AtBeginning, canRetry) and RecordAccumulator.shouldStopDrainBatchesFor-
+// Partition.  Every live batch of a partition carries the partition's
+// identity (producerId, epoch).
+//
+//  A. Attempts.  Every offer of a batch's stored frame is a new attempt (its
+//     tag rides in the frame's correlationId).  An ERROR answer of a
+//     superseded attempt is ignored (Kafka: a new correlation id per request;
+//     a stale response is never matched).  An OK of any attempt is a success.
+//  B. OK: complete (baseOffset -1 = a known-old duplicate: stored, offset
+//     unknown); lastAckedSeq advances.
+//  C. OutOfOrderSequence on batch b (current attempt):
+//     C1. an older live batch of b's identity exists -> b is PARKED (retried
+//         once the older ones resolve; Kafka: !isNextSequence -> retry).  The
+//         frame right before the gap is fast-retransmitted once.
+//     C2. b is the oldest, but its attempt was offered before the partition's
+//         latest OK was processed -> the answer may predate that OK (answers
+//         reorder: errors are immediate, acks=all OKs deferred, routes differ):
+//         b is re-sent (C applies again to that attempt's answer).
+//     C3. b is the oldest and b.baseSequence != lastAckedSeq + 1 -> a failed
+//         predecessor left a gap; the OOS proves it was never written (else b
+//         would have been accepted), so b was not either: the partition is
+//         RE-SEQUENCED (new epoch, sequences from 0; b and every batch behind it
+//         re-stamped and re-sent) — nothing fails.
+//     C4. otherwise the broker rejected the next-in-line batch: b FAILS
+//         (BrokerError 20) and the batches behind it are re-sequenced (Kafka:
+//         requestEpochBumpForPartition; startSequencesAtBeginning re-stamps the
+//         in-flight batches).
+//  D. Any other error answer, the delivery timeout, an exhausted redirect
+//     budget, a close: b FAILS with its outcome UNKNOWN (an earlier attempt
+//     may be stored) -> the partition is UNRESOLVED.
+//  E. An unresolved partition sends no new batch (re-sends of live ones go on)
+//     until nothing of it is in flight; then (Kafka maybeResolveSequences):
+//     lastAckedSeq + 1 == nextBaseSequence (later batches were acked: the gap
+//     was filled after all) -> resolved, same identity; else -> reset to a new
+//     identity at sequence 0.
+//  F. A new identity bumps the PRODUCER epoch only if the partition was on
+//     the current one (else it adopts it); other partitions keep theirs, so an
+//     already-stored retransmit elsewhere is never fenced.
+//  G. No new batch of a partition goes out while it has parked batches (C1)
+//     or is unresolved (E) — Kafka stops draining a partition with a retry
+//     outstanding.
+// ---------------------------------------------------------------------------
+
 void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode)
 {
     const DutyScope duty(*this);  // fix1 C1
@@ -1982,34 +2067,62 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     if (b == nullptr) return;  // duplicate / stale (slot reused) / already expired: ignore
     const int16_t ec = errorCode;
     const uint32_t units = b->tier2 ? 1u : static_cast<uint32_t>(b->recordCount);
-    if (ec == 0) {
+    if (ec == 0) {  // B
         // EOS-OOS: baseOffset < 0 with OK = a known-old duplicate (the broker
         // wrote it earlier; Kafka DUPLICATE_SEQUENCE parity): success, offset
         // unknown — every record completes Ok with -1, exactly once.
         const int64_t off = baseOffset < 0 ? -1 : baseOffset;
         emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, 0,
-                      OpStatus::Ok, units, b->producerEpoch);
+                      OpStatus::Ok, units, b->producerEpoch, b->producerId);
         completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::Ok, 0, b->tier2, b->recordCount);
-    } else if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence) &&
-               b->baseSequence >= 0 &&
-               ps.inflight.anyOlderLive(*b, [&](const InFlightBatch& o) {
-                   return o.producerEpoch == b->producerEpoch;
-               })) {
-        // EOS-OOS (Kafka parity): an OLDER batch of this epoch is unresolved,
-        // so an earlier frame was lost — this batch is retried once the older
-        // ones resolve, never failed (no completion, no epoch bump here).
-        parkOutOfOrder_(ps, *b);
+        if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch) {
+            ps.lastAckedSeq = std::max(ps.lastAckedSeq, b->baseSequence + b->recordCount - 1);
+        }
+        ps.lastAckTick = sendTick_;
+        releaseResolved_(ps, *b);
+        reclaimAckRing_(ps);
         return;
-    } else {
+    }
+    if (batchcorr::attempt(correlationId) != b->attemptTag) return;  // A: a superseded attempt's error
+    if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence) &&
+        b->baseSequence >= 0) {
+        const bool olderLive = ps.inflight.anyOlderLive(*b, [&](const InFlightBatch& o) {
+            return o.producerId == b->producerId && o.producerEpoch == b->producerEpoch;
+        });
+        if (olderLive) {  // C1
+            parkOutOfOrder_(ps, *b);
+            return;
+        }
+        if (b->lastSendTick <= ps.lastAckTick) {  // C2: may predate the latest OK — re-send
+            if (!b->oosParked) {
+                b->oosParked = true;
+                ++ps.parkedCount;
+            }
+            ps.resendParked = true;  // b is the oldest: nothing to wait for
+            markDirty_(ps);
+            return;
+        }
+        if (b->baseSequence != ps.lastAckedSeq + 1) {  // C3: a failed predecessor's gap
+            resequence_(ps);
+            return;
+        }
+        // C4: the next-in-line batch was rejected — it fails, the rest move on.
         emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
-                      OpStatus::BrokerError, units, b->producerEpoch);
+                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
         completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
                        static_cast<uint16_t>(ec), b->tier2, b->recordCount);
-        // Rejected (OutOfOrderSequence on the OLDEST live batch of its epoch
-        // included): its sequences were never written — Kafka's unresolved
-        // sequence rule bumps the epoch (once per gap).
-        onUnresolvedSequence_(b->producerEpoch);
+        unpark_(ps, *b);
+        ps.inflight.release(*b);
+        resequence_(ps);
+        reclaimAckRing_(ps);
+        return;
     }
+    // D: rejected, but an earlier attempt may be stored — outcome unknown.
+    emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                  OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+    completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                   static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+    markUnresolved_(ps, *b);
     releaseResolved_(ps, *b);
     reclaimAckRing_(ps);
 }
@@ -2021,17 +2134,18 @@ void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcep
     }
     // Still retried on its own attempt timer (a lost resend never strands it);
     // the delivery timeout still bounds it.
-    // Fast retransmit: the gap sits right before this batch — at the NEWEST
-    // older same-epoch batch that is not itself parked (a parked one already
-    // waits on an older gap).  If its last offer went out no later than this
-    // batch's, that frame was lost: due now (one frame, never a burst — a
-    // stale-OOS for a batch sent before the resend leaves it alone).
+    // Fast retransmit (M-1): the gap sits right before this batch — at the
+    // NEWEST older batch of its identity, unless a parked batch lies between
+    // (then the gap is upstream of that parked batch: already being handled).
+    // Re-sent only if that frame's latest offer went out before this batch's
+    // (a stale OOS of a batch sent before the resend leaves it alone).
     InFlightBatch* gap = nullptr;
     ps.inflight.anyOlderLive(b, [&](InFlightBatch& o) {
-        if (o.producerEpoch == b.producerEpoch && !o.oosParked) gap = &o;
+        if (o.producerId != b.producerId || o.producerEpoch != b.producerEpoch) return false;
+        gap = o.oosParked ? nullptr : &o;
         return false;
     });
-    if (gap != nullptr && gap->lastSendNs <= b.lastSendNs) {
+    if (gap != nullptr && gap->lastSendTick <= b.lastSendTick) {
         gap->attemptDeadlineNs     = 0;
         earliestAttemptDeadlineNs_ = 0;
     }
@@ -2040,10 +2154,116 @@ void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcep
 void ProducerImpl::releaseResolved_(PartitionState& ps, InFlightBatch& b) noexcept {
     unpark_(ps, b);
     ps.inflight.release(b);
-    if (ps.parkedCount == 0) return;
-    // Every batch older than the oldest live one has resolved: if that one is
-    // parked, the parked batches go out again (flushBatches, before new ones).
-    if (const InFlightBatch* o = ps.inflight.oldestLive(); o != nullptr && o->oosParked) {
+    // The parked batches go out again (flushBatches, before new ones) once every
+    // live batch older than the first parked one is either acked-by-implication
+    // (an OK proves every lower sequence is stored: its own answer is just
+    // pending) — i.e. the gap in front of them is closed or failed.
+    if (ps.parkedCount != 0 && !ps.resendParked) {
+        bool ready = true, seenParked = false;
+        ps.inflight.forEachLive([&](InFlightBatch& o) {
+            if (seenParked) return;
+            if (o.oosParked) seenParked = true;
+            else if (!storedByAck_(ps, o)) ready = false;
+        });
+        if (ready) {
+            ps.resendParked = true;
+            markDirty_(ps);
+        }
+    }
+    maybeResolve_(ps);
+}
+
+void ProducerImpl::markUnresolved_(PartitionState& ps, const InFlightBatch& b) noexcept {
+    if (b.baseSequence >= 0 && b.producerId == ps.producerId && b.producerEpoch == ps.epoch) {
+        ps.unresolved = true;
+    }
+}
+
+void ProducerImpl::maybeResolve_(PartitionState& ps) noexcept {  // E
+    if (!ps.unresolved || !ps.inflight.empty()) return;
+    if (ps.lastAckedSeq + 1 == ps.nextBaseSequence) {
+        ps.unresolved = false;  // every sequence sent was acked after all
+    } else {
+        resetPartition_(ps);
+    }
+    markDirty_(ps);  // held records may go now
+}
+
+void ProducerImpl::resetPartition_(PartitionState& ps) noexcept {  // F
+    if (ps.producerId == producerId_ && ps.epoch == producerEpoch_) {
+        if (producerEpoch_ == INT16_MAX) {
+            // Epoch space exhausted: rotate to a FRESH unique id (never producerId_+1 —
+            // an incremented id is just as likely to collide with another live
+            // producer's id as the original was, and gives the broker no reason to
+            // believe this is a distinct producer).  Fresh id + epoch 0 is the same
+            // trust-on-first-use the broker already grants any never-seen producerId.
+            producerId_    = generateProducerId(this);
+            producerEpoch_ = 0;
+        } else {
+            ++producerEpoch_;
+        }
+    }
+    ps.producerId       = producerId_;
+    ps.epoch            = producerEpoch_;
+    ps.nextBaseSequence = 0;
+    ps.lastAckedSeq     = -1;
+    ps.unresolved       = false;
+    std::fprintf(stderr,
+                 "ProducerImpl: topic=%d part=%d sequences restart at 0 under producerId=%lld epoch=%d\n",
+                 ps.topicId, ps.partition, static_cast<long long>(producerId_), static_cast<int>(producerEpoch_));
+}
+
+namespace {
+constexpr std::size_t kHdrCorrIdOff  = 16;  // MessageHeader.correlationId LE64
+constexpr std::size_t kHdrBytes      = 24;  // MessageHeader
+constexpr std::size_t kFramePidOff   = kHdrBytes + 10;  // Produce body: producerId LE64
+constexpr std::size_t kFrameEpochOff = kHdrBytes + 18;  //               producerEpoch LE16
+constexpr std::size_t kFrameSeqOff   = kHdrBytes + 20;  //               baseSequence LE32
+inline void putLE(uint8_t* p, uint64_t v, int bytes) noexcept {
+    for (int i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
+}
+}  // namespace
+
+void ProducerImpl::stampAttempt_(InFlightBatch& b, uint8_t tag) noexcept {
+    if (b.wireFrame.size() < kHdrCorrIdOff + 8) return;
+    putLE(b.wireFrame.data() + kHdrCorrIdOff,
+          static_cast<uint64_t>(batchcorr::withAttempt(b.corrId, tag)), 8);
+}
+
+void ProducerImpl::resequence_(PartitionState& ps) noexcept {
+    namespace rb = rune::protocol::batch;
+    resetPartition_(ps);
+    int32_t seq = 0;
+    ps.inflight.forEachLive([&](InFlightBatch& b) {
+        // Re-stamp the stored frame: Produce body + the CRC-covered batch header.
+        auto& f = b.wireFrame;
+        const auto view = rune::protocol::client::Produce::decode(f.data(), f.size());
+        if (view && view->recordBatch.size() >= static_cast<std::size_t>(rb::kRecordBatchOverhead)) {
+            uint8_t* batch = f.data() + (view->recordBatch.data() - f.data());
+            const std::size_t len = view->recordBatch.size();
+            putLE(f.data() + kFramePidOff, static_cast<uint64_t>(ps.producerId), 8);
+            putLE(f.data() + kFrameEpochOff, static_cast<uint16_t>(ps.epoch), 2);
+            putLE(f.data() + kFrameSeqOff, static_cast<uint32_t>(seq), 4);
+            putLE(batch + rb::kProducerIdOffset, static_cast<uint64_t>(ps.producerId), 8);
+            putLE(batch + rb::kProducerEpochOffset, static_cast<uint16_t>(ps.epoch), 2);
+            putLE(batch + rb::kBaseSequenceOffset, static_cast<uint32_t>(seq), 4);
+            putLE(batch + rb::kCrcOffset,
+                  rune::protocol::crc32c(batch + rb::kAttributesOffset, len - rb::kAttributesOffset), 4);
+        }
+        b.producerId    = ps.producerId;
+        b.producerEpoch = ps.epoch;
+        b.baseSequence  = seq;
+        seq += b.recordCount;
+        // Every earlier attempt is superseded (their answers are about the old identity).
+        b.attemptTag = static_cast<uint8_t>(b.attemptTag + 1);
+        stampAttempt_(b, b.attemptTag);
+        if (!b.oosParked) {
+            b.oosParked = true;
+            ++ps.parkedCount;
+        }
+    });
+    ps.nextBaseSequence = seq;
+    if (ps.parkedCount != 0) {
         ps.resendParked = true;
         markDirty_(ps);
     }
@@ -2114,10 +2334,11 @@ void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
 
 void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence,
                                  int32_t recordCount, int64_t baseOffset, int16_t errorCode,
-                                 OpStatus st, uint32_t units, int16_t producerEpoch) noexcept {
+                                 OpStatus st, uint32_t units, int16_t producerEpoch,
+                                 int64_t producerId) noexcept {
     if (batchAckFn_ != nullptr) {
         const BatchAck a{topicId, partition, errorCode == 0 ? baseOffset : -1, baseSequence,
-                         recordCount, errorCode, producerEpoch};
+                         recordCount, errorCode, producerEpoch, producerId};
         batchAckFn_(batchAckCtx_, a);  // noexcept by type
         return;
     }
@@ -2138,9 +2359,9 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
 
 void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st) {
     emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure,
-                  st, b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount), b.producerEpoch);
+                  st, b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount), b.producerEpoch, b.producerId);
     completeSlice_(ps, b.ackStart, b.ackCount, -1, st, 0, b.tier2, b.recordCount);
-    onUnresolvedSequence_(b.producerEpoch);  // outcome at the broker unknown
+    markUnresolved_(ps, b);  // D: outcome at the broker unknown
     releaseResolved_(ps, b);
     reclaimAckRing_(ps);
 }
@@ -2163,32 +2384,13 @@ void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st) {
     reclaimAckRing_(ps);
 }
 
-void ProducerImpl::onUnresolvedSequence_(int16_t batchEpoch) noexcept {
-    if (batchEpoch != producerEpoch_) return;  // gap already resolved by an earlier bump
-    if (producerEpoch_ == INT16_MAX) {
-        // Epoch space exhausted: rotate to a FRESH unique id (never producerId_+1 —
-        // an incremented id is just as likely to collide with another live
-        // producer's id as the original was, and gives the broker no reason to
-        // believe this is a distinct producer).  Fresh id + epoch 0 is the same
-        // trust-on-first-use the broker already grants any never-seen producerId.
-        producerId_ = generateProducerId(this);
-        producerEpoch_ = 0;
-    } else {
-        ++producerEpoch_;
-    }
-    for (auto& up : partitions_) up->nextBaseSequence = 0;
-    std::fprintf(stderr,
-                 "ProducerImpl: unresolved sequence -> producerId=%lld epoch=%d, sequences "
-                 "restart at 0\n",
-                 static_cast<long long>(producerId_), static_cast<int>(producerEpoch_));
-}
-
 void ProducerImpl::failBatch(int64_t corrId) {
     const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return;
     const uint32_t s = batchcorr::slot(corrId);
     if (s >= partitions_.size()) return;
     if (InFlightBatch* b = partitions_[s]->inflight.find(corrId)) {
+        if (batchcorr::attempt(corrId) != b->attemptTag) return;  // A: a superseded attempt's error
         failBatch_(*partitions_[s], *b, OpStatus::DeliveryFailed);
     }
 }
@@ -2251,13 +2453,8 @@ int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
                 failBatch_(ps, b, OpStatus::DeliveryFailed);  // no ProduceResponse in time
                 return;
             }
-            if (nowNs >= b.attemptDeadlineNs &&
-                sink(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
-                     b.wireFrame.size())) {
-                ++b.attempts;
-                b.lastSendNs        = nowNs;
-                b.attemptDeadlineNs = nowNs + attemptNs;  // same frame, same corrId: broker dedups
-                unpark_(ps, b);  // re-sent: its next answer decides (parked again only on another OOS)
+            if (nowNs >= b.attemptDeadlineNs && offerAttempt_(ps, b, nowNs, sink)) {
+                b.attemptDeadlineNs = nowNs + attemptNs;  // same frame, a new attempt: broker dedups
                 ++resent;
             }
             if (b.attemptDeadlineNs < nextEarliest) nextEarliest = b.attemptDeadlineNs;
@@ -2292,15 +2489,13 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
     PartitionState& ps = *partitions_[s];
     InFlightBatch* b = ps.inflight.find(corrId);
     if (b == nullptr) return false;
+    if (batchcorr::attempt(corrId) != b->attemptTag) return true;  // A: a superseded attempt's redirect
     if (b->redirectCount >= kMaxRedirects) {
         failBatch_(ps, *b, OpStatus::DeliveryFailed);  // redirect budget exhausted
         return false;
     }
     ++b->redirectCount;
-    b->lastSendNs = lastNowNs_;
-    unpark_(ps, *b);
-    return sendFn(ps.topicId, ps.partition, b->ingressStreamId, b->wireFrame.data(),
-                  b->wireFrame.size());
+    return offerAttempt_(ps, *b, lastNowNs_, sendFn);
 }
 
 int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
@@ -2316,12 +2511,7 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
             }
             restampSessionId(b.wireFrame, newSessionId);
             ++b.redirectCount;
-            b.lastSendNs = lastNowNs_;
-            unpark_(ps, b);
-            if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
-                       b.wireFrame.size())) {
-                ++resent;
-            }
+            if (offerAttempt_(ps, b, lastNowNs_, sendFn)) ++resent;
         });
     }
     return resent;
@@ -2334,12 +2524,7 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
-            b.lastSendNs = lastNowNs_;
-            unpark_(ps, b);
-            if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
-                       b.wireFrame.size())) {
-                ++resent;
-            }
+            if (offerAttempt_(ps, b, lastNowNs_, sendFn)) ++resent;
         });
     }
     return resent;
@@ -2430,6 +2615,7 @@ void ProducerImpl::failAllPending(OpStatus st) noexcept {
         ps.builderBytes   = 0;
         ps.batchStartNs   = 0;
         ps.flushRequested = false;
+        ps.resendParked   = false;  // N-3: nothing in flight is left to re-send
         reclaimAckRing_(ps);
     }
 }

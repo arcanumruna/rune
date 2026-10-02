@@ -179,6 +179,19 @@ struct PartitionState {
     // Idempotence sequence: monotonically increasing baseSequence.
     int32_t nextBaseSequence = 0;
 
+    // EOS follow-ups I-4 (Kafka TransactionManager, per partition): the
+    // (producerId, epoch) this partition's sequences belong to.  Every live
+    // batch of the partition carries exactly this identity (a reset happens
+    // only with nothing in flight, or re-stamps every live batch).  A bump of
+    // the PRODUCER epoch moves only the partition that needs it; the others
+    // keep theirs (the broker tracks (producerId, partition)), so no
+    // already-stored retransmit elsewhere is ever fenced.
+    int64_t  producerId   = -1;
+    int16_t  epoch        = 0;
+    int32_t  lastAckedSeq = -1;     // last sequence acked OK under (producerId, epoch)
+    uint64_t lastAckTick  = 0;      // ProducerImpl::sendTick_ when the latest OK was processed
+    bool     unresolved   = false;  // a batch failed with its broker outcome unknown
+
     // Fixed ring of in-flight (sent, un-acked) batches; capacity = maxInFlight
     // rounded up to a power of two (spec §4.3).
     InFlightRing inflight;
@@ -959,8 +972,14 @@ public:
 
     /// Test-only seam (F5 regression coverage): force the current epoch so a
     /// test can drive the INT16_MAX overflow path without sending 32767 real
-    /// batches to get there. Never called from production code.
-    void debugSetEpochForTest(int16_t epoch) noexcept { producerEpoch_ = epoch; }
+    /// batches to get there (partitions with nothing in flight adopt it).
+    /// Never called from production code.
+    void debugSetEpochForTest(int16_t epoch) noexcept {
+        producerEpoch_ = epoch;
+        for (auto& up : partitions_) {
+            if (up->inflight.empty()) up->epoch = epoch;
+        }
+    }
 
     /// Test-only seam (Task 14 fix2): lower the partition-table cap (default
     /// batchcorr::kMaxSlot + 1) so the "unaddressable partition" path can be
@@ -1059,6 +1078,12 @@ private:
     /// epoch — park it (no completion, no epoch bump) and fast-retransmit the
     /// older batches whose last offer was not after its own (the lost frame).
     void parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcept;
+    /// An OK for a later batch of the same identity proves this one is stored
+    /// (the broker appends sequences contiguously): its own answer is pending.
+    [[nodiscard]] static bool storedByAck_(const PartitionState& ps, const InFlightBatch& b) noexcept {
+        return b.baseSequence >= 0 && b.producerId == ps.producerId && b.producerEpoch == ps.epoch &&
+               b.baseSequence + b.recordCount - 1 <= ps.lastAckedSeq;
+    }
     /// A parked batch that was re-sent (or resolved) is no longer parked.
     static void unpark_(PartitionState& ps, InFlightBatch& b) noexcept {
         if (b.oosParked) {
@@ -1099,23 +1124,38 @@ private:
     /// acks=None: completes the just-sent builder slice with -1 ("sent, offset
     /// unknown") and reclaims it — nothing waits for a response.
     void completeSentUnacked_(PartitionState& ps) noexcept;
-    /// Unresolved sequence (Kafka semantics): a sequenced batch stamped with the
-    /// CURRENT epoch was failed to the user while its broker outcome is unknown or
-    /// it was rejected, so its sequences are a same-epoch gap the broker would
-    /// reject forever.  Bumps producerEpoch_ and restarts every partition at
-    /// baseSequence 0 (the broker accepts a higher epoch only at 0 and resets its
-    /// state).  Batches of an older epoch do not bump again (one bump per gap
-    /// event).  Epoch overflow: at INT16_MAX a FRESH unique producerId is drawn
-    /// (never the old id+1 — see generateProducerId() in ProducerImpl.cpp) and
-    /// the epoch restarts at 0 — the broker treats it as a new producer
-    /// (trust-on-first-use at baseSequence 0).
-    void onUnresolvedSequence_(int16_t batchEpoch) noexcept;
+    // ---- EOS follow-ups I-4: Kafka's idempotent-producer sequence rules ------
+    // (TransactionManager.maybeResolveSequences / requestEpochBumpForPartition /
+    // startSequencesAtBeginning, RecordAccumulator.shouldStopDrainBatchesFor-
+    // Partition), per partition — the exact rule set is in ProducerImpl.cpp,
+    // "Sequence resolution".
+    /// A sequenced batch of the partition's identity failed with its broker
+    /// outcome unknown: the partition holds new batches until it is resolved.
+    void markUnresolved_(PartitionState& ps, const InFlightBatch& b) noexcept;
+    /// With nothing in flight: an unresolved partition is resolved — kept (every
+    /// sequence it sent was acked after all) or reset to a new epoch at 0.
+    void maybeResolve_(PartitionState& ps) noexcept;
+    /// The partition moves to a new identity at sequence 0: a producer epoch
+    /// bump if it is on the current one (else it adopts the current one).
+    /// Epoch overflow: at INT16_MAX a FRESH unique producerId is drawn (never
+    /// the old id+1 — see generateProducerId()) and the epoch restarts at 0.
+    void resetPartition_(PartitionState& ps) noexcept;
+    /// resetPartition_ + every live batch re-stamped (frame + header + CRC) in
+    /// order from sequence 0 and queued for re-send (parked), new attempts.
+    void resequence_(PartitionState& ps) noexcept;
+    /// Re-stamp a stored frame's attempt tag (MessageHeader correlationId).
+    static void stampAttempt_(InFlightBatch& b, uint8_t tag) noexcept;
+    /// One offer of a live batch's stored frame as a NEW attempt (its earlier
+    /// attempts' error answers are ignored from now on).  Reverted when the
+    /// transport refuses it.
+    template <class Send>
+    bool offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t nowNs, Send&& send);
     /// One BatchAck to the batch-ack target (handler or CQ; none: nothing).
     /// `units`: the batch-ack credit units it returns (records of a Tier-1
     /// batch; 1 for a Tier-2 batch / a single never-sent record).
     void emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence, int32_t recordCount,
                        int64_t baseOffset, int16_t errorCode, OpStatus st, uint32_t units,
-                       int16_t producerEpoch) noexcept;
+                       int16_t producerEpoch, int64_t producerId = -1) noexcept;
     /// Records that never reached a batch (failed in the ring / a builder /
     /// the Tier-2 queue / the arena): a BatchAck{baseSequence -1, kClientFailure}.
     void emitUnsentBatchAck_(int32_t topicId, int32_t partition, int32_t recordCount, OpStatus st,
@@ -1207,6 +1247,9 @@ private:
     // accidental collision between two live instances astronomically unlikely.
     int64_t producerId_;
     int16_t producerEpoch_ = 0;
+    // EOS follow-ups: +1 per frame offer (first send or re-send) — orders sends
+    // against answers without clocks (fast retransmit; OOS-vs-ack ordering).
+    uint64_t sendTick_ = 0;
 
     // ---- In-flight batch tracking (agent-thread only; no mutex needed) -------
     // In-flight batches live in each PartitionState::inflight ring; a batch

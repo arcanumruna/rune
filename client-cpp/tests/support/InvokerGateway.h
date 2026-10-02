@@ -12,6 +12,7 @@
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -155,12 +157,28 @@ struct InvokerGateway {
     // accepted batches reach `log` (what a reader would see).  Held / paused
     // acks (replyAcks / holdPartitions) are not modelled on this path.
     bool idempotence       = false;
-    int  idempotenceWindow = 32;
+    int  idempotenceWindow = rune::protocol::client::kIdempotentMaxInFlightBatches;  // the broker's window
     // Fault injection by the 1-based ordinal of the Produce frames received:
     // dropProduce — the frame is lost on the wire (never seen);
-    // dropAnswer  — processed, but its ProduceResponse is lost.
-    std::set<int> dropProduce;
-    std::set<int> dropAnswer;
+    // dropAnswer  — processed, but its ProduceResponse is lost;
+    // errorFor    — NOT processed; answered with this error code instead;
+    // holdAnswer  — processed; its answer is held until releaseAnswer(ordinal);
+    // answerDelay — processed; its answer goes out this many pump() calls later.
+    // dropIf      — every frame it returns true for is lost (all attempts).
+    std::set<int>           dropProduce;
+    std::set<int>           dropAnswer;
+    std::map<int, int16_t>  errorFor;
+    std::set<int>           holdAnswer;
+    std::map<int, int>      answerDelay;
+    std::function<bool(int32_t partition, int16_t epoch, int32_t baseSequence)> dropIf;
+    // errorIf — every frame it returns != 0 for is NOT processed and answered
+    // with that error (all attempts: e.g. a batch the broker keeps rejecting).
+    std::function<int16_t(int32_t partition, int16_t epoch, int32_t baseSequence)> errorIf;
+    // EOS-OOS M-3 (acks=All emulation): an OK answer (incl. duplicates) to a
+    // frame with acks=All goes out okDelayPumps pump() calls later — like the
+    // broker's deferred acks=all answers — while error answers go out at once,
+    // so later errors can overtake earlier OKs.
+    int           okDelayPumps  = 0;
     int           produceFrames = 0;
     struct LogBatch {
         int32_t partition = 0;
@@ -172,6 +190,18 @@ struct InvokerGateway {
     };
     std::vector<LogBatch> log;
     int oosAnswers = 0, windowDupAnswers = 0, oldDupAnswers = 0, fencedAnswers = 0;
+    /// The answers awaiting their pump (delayed / held), by Produce ordinal.
+    [[nodiscard]] std::size_t pendingAnswers() const { return pendingAnswers_.size(); }
+    /// Sends a held answer now (no-op when not held).
+    void releaseAnswer(int ordinal) {
+        for (auto& pa : pendingAnswers_) {
+            if (pa.ordinal == ordinal && pa.held) {
+                pa.held  = false;
+                pa.dueAt = 0;
+            }
+        }
+        flushAnswers_();
+    }
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -226,6 +256,8 @@ struct InvokerGateway {
 
     /// One gateway duty cycle: conductor, registrations, outbox, polls.
     int pump() {
+        ++pumps_;
+        flushAnswers_();
         int work = aeron->conductorAgentInvoker().invoke();
         for (auto& ep : endpoints) {
             if (!ep->sub) ep->sub = aeron->findSubscription(ep->subReg);
@@ -403,16 +435,64 @@ private:
     };
     std::map<std::tuple<int32_t, int64_t, int32_t>, SeqState> seqStates;
 
+    struct PendingAnswer {
+        int      ordinal = 0;
+        int64_t  dueAt   = 0;     // pump count
+        bool     held    = false;
+        Produced pr{};
+        int16_t  ec  = 0;
+        int64_t  off = 0;
+    };
+    std::vector<PendingAnswer> pendingAnswers_;
+    int64_t                    pumps_ = 0;
+
+    void flushAnswers_() {
+        for (std::size_t i = 0; i < pendingAnswers_.size();) {
+            const PendingAnswer& pa = pendingAnswers_[i];
+            if (!pa.held && pa.dueAt <= pumps_) {
+                const PendingAnswer a = pa;
+                pendingAnswers_.erase(pendingAnswers_.begin() + static_cast<std::ptrdiff_t>(i));
+                ackAt(a.pr, a.ec, a.off);
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    // Model answer: now, delayed or held (see the fault-injection knobs).
+    void answerModel_(int ordinal, const Produced& pr, bool acksAll, int16_t ec, int64_t off) {
+        int64_t delay = 0;
+        if (ec == 0 && acksAll) delay = okDelayPumps;
+        if (const auto it = answerDelay.find(ordinal); it != answerDelay.end()) delay = it->second;
+        const bool held = holdAnswer.count(ordinal) != 0;
+        if (delay == 0 && !held) {
+            ackAt(pr, ec, off);
+            return;
+        }
+        pendingAnswers_.push_back({ordinal, pumps_ + delay, held, pr, ec, off});
+    }
+
     template <class View>
     void onIdempotentProduce(const View& pv, int endpoint) {
         namespace rp = rune::protocol::client;
         const int ordinal = ++produceFrames;
         if (dropProduce.count(ordinal) != 0) return;  // lost on the wire
+        if (dropIf && dropIf(pv.partition, pv.producerEpoch, pv.baseSequence)) return;
         rune::protocol::RecordBatchReader r(pv.recordBatch.data(), pv.recordBatch.size());
         const Produced pr{pv.topicId, pv.partition, pv.sessionId, pv.correlationId,
                           r.recordCount(), r.baseSequence(), endpoint};
         produced.push_back(pr);
         const bool answer = pv.correlationId != 0 && dropAnswer.count(ordinal) == 0;
+        const bool acksAll = pv.acks == 1;
+        auto ackAt = [&](const Produced& p, int16_t ec, int64_t off) { answerModel_(ordinal, p, acksAll, ec, off); };
+        int16_t injected = 0;
+        if (const auto it = errorFor.find(ordinal); it != errorFor.end()) injected = it->second;
+        if (injected == 0 && errorIf) injected = errorIf(pv.partition, pv.producerEpoch, pv.baseSequence);
+        if (injected != 0) {  // rejected, not processed
+            if (injected == static_cast<int16_t>(rp::ErrorCode::OutOfOrderSequence)) ++oosAnswers;
+            if (answer) ackAt(pr, injected, 0);
+            return;
+        }
         auto append = [&]() -> int64_t {
             LogBatch lb;
             lb.partition     = pv.partition;

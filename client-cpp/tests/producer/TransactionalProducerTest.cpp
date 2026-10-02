@@ -375,7 +375,7 @@ TEST(TransactionalProducerTest, InitTransactionsAcquiresPidEpoch) {
 }
 
 // Two sends to one partition carry baseSequence 0 and 1; a retriable produce
-// error re-sends the SAME frame (same baseSequence, same correlationId).
+// error re-sends the SAME batch (same baseSequence) as a new attempt.
 TEST(TransactionalProducerTest, IdempotentRetryReusesBaseSequence) {
     TxnRig r;
     r.acquire(99, 0);
@@ -411,7 +411,10 @@ TEST(TransactionalProducerTest, IdempotentRetryReusesBaseSequence) {
     const auto retry = r.sink.last(rpc::TemplateId::Produce);
     ASSERT_FALSE(retry.empty()) << "a retriable error must re-send";
     EXPECT_EQ(decodeBaseSeqFromProduce(retry), 0) << "the retry MUST reuse baseSequence 0";
-    EXPECT_EQ(corrIdOf(retry), ids[0]) << "the retry carries the ORIGINAL correlationId";
+    // EOS follow-ups I-2: same bytes and baseSequence, but a NEW attempt id
+    // (an answer to the first attempt can never decide the retry).
+    EXPECT_NE(corrIdOf(retry), ids[0]) << "the retry is a new attempt";
+    EXPECT_NE(corrIdOf(retry), ids[1]);
     EXPECT_EQ(r.tp.producerId(), 99) << "no fencing on a retriable error";
 }
 
@@ -2003,4 +2006,103 @@ TEST(TransactionalProducerTest, TxnCloseImmediatelyDiscardsLocallyRegression) {
         EXPECT_TRUE(r.impl->closedDuty());
         EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "the destructor never sends EndTxn";
     }
+}
+
+// ===========================================================================
+// EOS follow-ups fix round 1 (eos-followups-review.md I-1 / M-2 / I-2)
+// ===========================================================================
+namespace {
+std::vector<std::vector<uint8_t>> produceFrames(const CaptureSink& sink) {
+    std::vector<std::vector<uint8_t>> out;
+    for (const auto& f : sink.frames) {
+        if (peekTemplate(f) == static_cast<uint16_t>(rpc::TemplateId::Produce)) out.push_back(f);
+    }
+    return out;
+}
+void answer(TxnRig& r, int64_t corr, int16_t ec, int64_t off = 0) {
+    auto a = makeProduceResponse(corr, ec, off);
+    r.impl->onProduceResponse(a.data(), a.size());
+}
+// begin + n records on one partition, AddPartitions OK, the data sent.
+std::vector<std::vector<uint8_t>> sendData(TxnRig& r, int n, TopicHandle topic = TopicHandle{1, 1}) {
+    r.tp.beginTransaction();
+    for (int i = 0; i < n; ++i) r.tp.send(topic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.sink.clear();
+    r.doWork();
+    return produceFrames(r.sink);
+}
+constexpr int16_t kTxnOos = static_cast<int16_t>(rpc::ErrorCode::OutOfOrderSequence);
+} // namespace
+
+// I-1 (Kafka parity, ruling 3): OutOfOrderSequence on a batch BEHIND an
+// unresolved older batch means an earlier frame was lost — retried once the
+// older batch resolves, never a poisoned (abortable) transaction.  RED
+// (pre-fix): the first such OOS poisons the transaction (AbortableError).
+TEST(TransactionalProducerTest, OutOfOrderBehindAnOlderBatchIsRetriedNotPoisonedRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    const auto first = sendData(r, 3);
+    ASSERT_EQ(first.size(), 3u);
+    answer(r, corrIdOf(first[1]), kTxnOos);  // seq 0 was lost: seq 1 and 2 meet the gap
+    answer(r, corrIdOf(first[2]), kTxnOos);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction) << "an OOS behind a live older batch is retried, not poisoned";
+    r.sink.clear();
+    r.doWork();
+    // Fast retransmit of the gap frame (seq 0) only; seq 1 and 2 wait for it.
+    auto again = produceFrames(r.sink);
+    ASSERT_EQ(again.size(), 1u);
+    EXPECT_EQ(decodeBaseSeqFromProduce(again[0]), 0);
+    answer(r, corrIdOf(again[0]), 0, 100);
+    r.sink.clear();
+    r.doWork();  // the parked batches go out again, in sequence order
+    again = produceFrames(r.sink);
+    ASSERT_EQ(again.size(), 2u);
+    EXPECT_EQ(decodeBaseSeqFromProduce(again[0]), 1);
+    EXPECT_EQ(decodeBaseSeqFromProduce(again[1]), 2);
+    answer(r, corrIdOf(again[0]), 0, 101);
+    answer(r, corrIdOf(again[1]), 0, 102);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
+}
+
+// M-2 (ruling 1): the transactional producer's in-flight batches per partition
+// are clamped to kIdempotentMaxInFlightBatches (the broker's dedup window); the
+// rest wait.  RED (pre-fix): all 40 went out at once.
+TEST(TransactionalProducerTest, InFlightPerPartitionClampedToTheBrokerWindowRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    const auto first = sendData(r, 40);
+    constexpr std::size_t kWindow = static_cast<std::size_t>(rpc::kIdempotentMaxInFlightBatches);
+    ASSERT_EQ(first.size(), kWindow) << "at most the broker's window in flight per partition";
+    EXPECT_EQ(r.impl->testInFlightBatches(), kWindow);
+    answer(r, corrIdOf(first[0]), 0, 100);
+    r.sink.clear();
+    r.doWork();
+    const auto more = produceFrames(r.sink);
+    ASSERT_EQ(more.size(), 1u) << "one acked -> one more";
+    EXPECT_EQ(decodeBaseSeqFromProduce(more[0]), static_cast<int32_t>(kWindow));
+}
+
+// I-2: an error answer of a SUPERSEDED attempt never decides the batch.  The
+// batch is retried after a retriable error; the first attempt's late OOS (an
+// old route) arrives while the retry may be stored — it is ignored, and the
+// retry's OK completes the batch.  RED (pre-fix: one correlationId for every
+// attempt): the late OOS poisons the transaction.
+TEST(TransactionalProducerTest, ErrorOfASupersededAttemptIsIgnoredRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    const auto first = sendData(r, 1);
+    ASSERT_EQ(first.size(), 1u);
+    answer(r, corrIdOf(first[0]), ecOf(rpc::ErrorCode::NotLeader));  // retriable
+    r.sink.clear();
+    r.doWork();
+    const auto retry = produceFrames(r.sink);
+    ASSERT_EQ(retry.size(), 1u);
+    answer(r, corrIdOf(first[0]), kTxnOos);  // the FIRST attempt's late answer
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction) << "a superseded attempt's error is ignored";
+    answer(r, corrIdOf(retry[0]), 0, 100);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
 }

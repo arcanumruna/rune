@@ -638,8 +638,8 @@ void TransactionalProducerImpl::publishStatus_() {
 void TransactionalProducerImpl::enterFatal_(uint16_t errorCode, uint64_t exceptOpId) {
     // Terminal (Kafka ProducerFencedException): nothing is ever sent again.
     state_ = SFatalError{errorCode};
+    clearBatches_();
     partitions_.clear();
-    batches_.clear();
     reqs_.clear();
     publishStatus_();
     // Every pending op completes Fenced — after the tables are emptied (a
@@ -713,6 +713,9 @@ void TransactionalProducerImpl::produce_(TxnPartitionState& ps, TxnSendRecord& r
     // Retained even when the transport refuses it now: re-offered every cycle
     // (never silently lost) until acked or its deadline poisons the txn.
     ib.sentSessionId = sendFrame_(ib.wireFrame, sessionId, sendFn) ? sessionId : 0;
+    ib.offered       = ib.sentSessionId != 0;
+    ib.sendTick      = ++sendTick_;
+    ++ps.inFlight;
     batches_.emplace(msg.correlationId, std::move(ib));
     ++work;
 }
@@ -814,7 +817,8 @@ void TransactionalProducerImpl::sweep_(int64_t nowNs) {
     bool lost = false;
     for (auto it = batches_.begin(); it != batches_.end();) {
         if (nowNs >= it->second.deadlineNs) {
-            it = batches_.erase(it);
+            const auto dead = it++;
+            eraseBatch_(dead);
             lost = true;
         } else {
             ++it;
@@ -884,7 +888,11 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
                 ++work;
             }
             if (ps.add != TxnPartitionState::Add::Added || sessionId == 0) continue;
-            while (!ps.waiting.empty()) {
+            // M-2: at most the broker's dedup window in flight per partition;
+            // I-1: nothing new while batches are parked (they would meet the
+            // same gap — Kafka stops draining a partition with a retry outstanding).
+            constexpr uint32_t kWindow = static_cast<uint32_t>(rpc::kIdempotentMaxInFlightBatches);
+            while (!ps.waiting.empty() && ps.parked == 0 && ps.inFlight < kWindow) {
                 produce_(ps, ps.waiting.front(), nowNs, sessionId, sendFn, work);
                 ps.waiting.pop_front();
             }
@@ -901,12 +909,41 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
 
     if (sessionId == 0) return work;
 
-    // Re-offer refused / re-sent produce batches.
-    for (auto& [corr, b] : batches_) {
-        if (b.sentSessionId != 0) continue;
-        if (sendFrame_(b.wireFrame, sessionId, sendFn)) {
-            b.sentSessionId = sessionId;
-            ++work;
+    // Re-offer refused / re-sent produce batches, per partition in sequence
+    // order.  A batch that was on the wire before goes out as a NEW attempt
+    // (fresh correlationId; I-2).
+    {
+        std::vector<int64_t>& due = dueScratch_;  // reused: no per-cycle allocation
+        due.clear();
+        for (const auto& [corr, b] : batches_) {
+            if (b.sentSessionId == 0 && !b.parked) due.push_back(corr);
+        }
+        std::sort(due.begin(), due.end(), [&](int64_t x, int64_t y) {
+            const InFlightBatch& a = batches_.at(x);
+            const InFlightBatch& c = batches_.at(y);
+            if (a.topicId != c.topicId) return a.topicId < c.topicId;
+            if (a.partition != c.partition) return a.partition < c.partition;
+            return a.baseSequence < c.baseSequence;
+        });
+        for (int64_t corr : due) {
+            auto it = batches_.find(corr);
+            if (it->second.offered) {
+                const int64_t next = nextCorrId_++;
+                auto node = batches_.extract(it);
+                node.key() = next;
+                InFlightBatch& b = node.mapped();
+                rpc::detail::putLE64(b.wireFrame.data(), 16, next);  // MessageHeader.correlationId
+                b.priorCorrIds.push_back(corr);
+                for (int64_t old : b.priorCorrIds) superseded_[old] = next;
+                it = batches_.insert(std::move(node)).position;
+            }
+            InFlightBatch& b = it->second;
+            if (sendFrame_(b.wireFrame, sessionId, sendFn)) {
+                b.sentSessionId = sessionId;
+                b.offered       = true;
+                b.sendTick      = ++sendTick_;
+                ++work;
+            }
         }
     }
     // Send every Unsent request (a refused offer is re-offered next cycle).
@@ -1117,36 +1154,133 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
     }
 }
 
+void TransactionalProducerImpl::eraseBatch_(std::map<int64_t, InFlightBatch>::iterator it) {
+    const InFlightBatch b = std::move(it->second);
+    batches_.erase(it);
+    for (int64_t old : b.priorCorrIds) superseded_.erase(old);
+    auto pit = partitions_.find(rune::client::TopicPartitionKey{b.topicId, b.partition});
+    if (pit == partitions_.end()) return;
+    TxnPartitionState& ps = pit->second;
+    if (ps.inFlight > 0) --ps.inFlight;
+    if (b.parked && ps.parked > 0) --ps.parked;
+    armParked_(ps);
+}
+
+void TransactionalProducerImpl::clearBatches_() noexcept {
+    batches_.clear();
+    superseded_.clear();
+    for (auto& [k, ps] : partitions_) {
+        ps.inFlight = 0;
+        ps.parked   = 0;
+    }
+}
+
+void TransactionalProducerImpl::armParked_(TxnPartitionState& ps) {
+    if (ps.parked == 0) return;
+    // The first parked batch (lowest sequence) and whether something not yet
+    // known stored lies before it (an OK proves every lower sequence stored).
+    int32_t firstParked = INT32_MAX;
+    for (const auto& [c, b] : batches_) {
+        if (b.topicId == ps.topicId && b.partition == ps.partition && b.parked) {
+            firstParked = std::min(firstParked, b.baseSequence);
+        }
+    }
+    for (const auto& [c, b] : batches_) {
+        if (b.topicId != ps.topicId || b.partition != ps.partition || b.parked) continue;
+        if (b.baseSequence < firstParked && b.baseSequence > ps.lastAckedSeq) return;  // the gap is still open
+    }
+    for (auto& [c, b] : batches_) {
+        if (b.topicId == ps.topicId && b.partition == ps.partition && b.parked) {
+            b.parked        = false;
+            b.sentSessionId = 0;  // re-sent next cycle (a new attempt), in sequence order
+        }
+    }
+    ps.parked = 0;
+}
+
 void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_t len) {
     auto opt = rpc::ProduceResponse::decode(buf, len);
     if (!opt) return;
-    auto it = batches_.find(opt->correlationId);
-    if (it == batches_.end()) return;  // not our produce
     const int16_t ec = opt->errorCode;
+    auto it = batches_.find(opt->correlationId);
+    if (it == batches_.end()) {
+        // I-2: an earlier attempt's answer.  Its OK still decides the batch
+        // (stored is stored); its error never does.
+        const auto sup = superseded_.find(opt->correlationId);
+        if (sup == superseded_.end() || ec != kOk) return;
+        it = batches_.find(sup->second);
+        if (it == batches_.end()) return;
+    }
+    TxnPartitionState* ps = nullptr;
+    if (auto pit = partitions_.find(rune::client::TopicPartitionKey{it->second.topicId, it->second.partition});
+        pit != partitions_.end()) {
+        ps = &pit->second;
+    }
     if (ec == kOk) {
-        batches_.erase(it);
+        if (ps != nullptr) {
+            ps->lastAckedSeq = std::max(ps->lastAckedSeq, it->second.baseSequence);
+            ps->lastAckTick  = sendTick_;
+        }
+        eraseBatch_(it);
         return;
     }
     if (ec == kInvalidProducerEpoch || ec == kProducerFenced) {
-        batches_.erase(it);
+        eraseBatch_(it);
         enterFatal_(static_cast<uint16_t>(ec));
         return;
     }
-    if (ec == kOutOfOrderSequence) {
-        // M-2: a sequence error, not a fence — the transaction is abortable.
-        batches_.erase(it);
+    InFlightBatch& ib = it->second;
+    if (ec == kOutOfOrderSequence && ps != nullptr) {
+        // I-1 (Kafka parity, ruling 3): an older batch of this partition is
+        // still unresolved -> an earlier frame was lost: park, retry later.
+        const InFlightBatch* gap = nullptr;
+        bool parkedBetween = false, olderLive = false;
+        for (const auto& [c, o] : batches_) {
+            if (&o == &ib || o.topicId != ib.topicId || o.partition != ib.partition) continue;
+            if (o.baseSequence >= ib.baseSequence) continue;
+            olderLive = true;
+            if (gap == nullptr || o.baseSequence > gap->baseSequence) {
+                if (o.parked) {
+                    parkedBetween = true;
+                    gap = &o;
+                } else {
+                    parkedBetween = false;
+                    gap = &o;
+                }
+            }
+        }
+        if (olderLive) {
+            if (!ib.parked) {
+                ib.parked = true;
+                ++ps->parked;
+            }
+            // M-1: fast retransmit of the frame right before the gap (once:
+            // only if its latest offer went out before this batch's).
+            if (gap != nullptr && !parkedBetween && gap->sendTick <= ib.sendTick) {
+                for (auto& [c, o] : batches_) {
+                    if (&o == gap) o.sentSessionId = 0;
+                }
+            }
+            return;
+        }
+        if (ib.sendTick <= ps->lastAckTick) {  // may predate the latest OK (reordered answers): retry
+            ib.sentSessionId = 0;
+            return;
+        }
+        // M-2: a sequence error on the next-in-line batch, not a fence — the
+        // transaction is abortable (Kafka: transactional OOS -> abortable).
+        eraseBatch_(it);
         poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec), /*bumpEpoch=*/true);
         return;
     }
-    InFlightBatch& ib = it->second;
     if (ib.retryCount >= InFlightBatch::kMaxRetries) {
         // Exhausted: this data never became durable — the txn must abort (TX-6b).
-        batches_.erase(it);
+        eraseBatch_(it);
         poison_(OpStatus::DeliveryFailed, 0, /*bumpEpoch=*/true);  // a sequence gap
         return;
     }
     ++ib.retryCount;
-    ib.sentSessionId = 0;  // re-sent unchanged (same bytes, same baseSequence) next cycle
+    ib.sentSessionId = 0;  // re-sent next cycle: same bytes and baseSequence, a NEW attempt id
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,7 +1295,7 @@ void TransactionalProducerImpl::failAll() {
     if (auto* cl = std::get_if<LifeClosing>(&life_)) closing = *cl;
     life_ = LifeOpen{};
     reqs_.clear();
-    batches_.clear();
+    clearBatches_();
     dropWaiting_();
     // The final snapshot, then the channel is finished (handles stop calling in).
     TxnStatus s;
