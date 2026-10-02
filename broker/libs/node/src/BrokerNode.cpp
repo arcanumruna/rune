@@ -2188,6 +2188,7 @@ void BrokerNode::buildGateway() {
         // Task 10 round 4: the cleaner never reads the registry — it gets its
         // own replica view over a ring from the control thread, which frees a
         // removed replica only after the cleaner acked the generation dropping it.
+        cleanerAgent_->setProducerIdExpirationMs(config_.producerIdExpirationMs);   // PSM round 1, I1
         if (runtimeAgent_) cleanerAgent_->attachViewChannel(runtimeAgent_->enableCleanerView());
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);

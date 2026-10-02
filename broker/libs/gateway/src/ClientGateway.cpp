@@ -497,6 +497,7 @@ int ClientGateway::doWork(int64_t nowNs) {
         imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
     }
     pollPendingConnects(nowNs);
+    work += advanceInlinePsmScans_();   // I3: budgeted inline producer-state rebuilds
     // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
     if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
     pollPendingRecordEgress_(nowNs);  // hybrid egress: resolve unicast pubs + drain deferred subscribes
@@ -582,7 +583,8 @@ void ClientGateway::rebuildProducerStateFromLogs()
             // rebuilds it from logStart to LEO (proveInlinePsm_), which also
             // covers every per-partition promotion / truncation this node-level
             // edge never sees.
-            inlinePsm_.erase(inlinePsmKey_(topicId, partition));
+            if (auto it = inlinePsm_.find(inlinePsmKey_(topicId, partition)); it != inlinePsm_.end())
+                setInlinePsmState_(it->second, InlinePsmUnproven{});
 
             // TX-7: Rebuild per-partition read_committed state (LsoTracker +
             // AbortedTxnIndex) from the same committed log range [0, scanTo).
@@ -631,55 +633,99 @@ void ClientGateway::rebuildProducerStateFromLogs()
 // ---------------------------------------------------------------------------
 // proveInlinePsm_ — PSM <-> log consistency gate of the inline path (see the
 // InlinePsmState comment in ClientGateway.h).  Hot path (Proven, unchanged
-// facts): one hash lookup + a compare.  Cold: the rebuild.
+// facts): one hash lookup + a compare.  Otherwise at most ONE budgeted rebuild
+// step (kInlinePsmStepBytes) — never an O(log) scan on the duty thread (I3).
 // ---------------------------------------------------------------------------
+void ClientGateway::setInlinePsmState_(InlinePsmState& slot, InlinePsmState next) noexcept
+{
+    if (std::holds_alternative<InlinePsmScanning>(slot)) --inlinePsmScanning_;
+    if (std::holds_alternative<InlinePsmScanning>(next)) ++inlinePsmScanning_;
+    slot = std::move(next);
+}
+
 ClientGateway::InlinePsmGate
 ClientGateway::proveInlinePsm_(int32_t topicId, int32_t partition, rune::storage::Log& log,
-                               const rune::replication::PartitionReplica* replica, uint32_t incarnation)
+                               const rune::replication::PartitionReplica* replica)
 {
     const uint64_t key = inlinePsmKey_(topicId, partition);
-    InlinePsmProven facts;
-    facts.log         = &log;
-    facts.incarnation = incarnation;
+    InlinePsmFacts facts;
     if (replica != nullptr) {
         // Only a COMPLETE leader's log is stable below its LEO: a follower
         // takes replicated appends, a deficient leader may still reconcile-
         // append old-term batches (the worker path's RC gate, I2).
         if (replica->role() != rune::replication::Role::Leader || !replica->isLeaderComplete()) [[unlikely]] {
-            if (auto it = inlinePsm_.find(key); it != inlinePsm_.end()) it->second = InlinePsmUnproven{};
+            if (auto it = inlinePsm_.find(key); it != inlinePsm_.end())
+                setInlinePsmState_(it->second, InlinePsmUnproven{});
             return InlinePsmGate::NotLeader;
         }
-        facts.logGen  = replica->logGeneration();
-        facts.leadGen = replica->leadershipGeneration();
+        facts.incarnation = replica->incarnation();
+        facts.logGen      = replica->logGeneration();
+        facts.leadGen     = replica->leadershipGeneration();
+    } else {
+        facts.logGen = log.contentGeneration();
     }
     auto it = inlinePsm_.find(key);
-    if (it != inlinePsm_.end()) {
-        const auto* proven = std::get_if<InlinePsmProven>(&it->second);
-        if (proven != nullptr && *proven == facts) [[likely]] return InlinePsmGate::Proven;
+    if (it == inlinePsm_.end()) [[unlikely]] it = inlinePsm_.emplace(key, InlinePsmUnproven{}).first;   // cold
+    InlinePsmState& slot = it->second;
+    if (const auto* p = std::get_if<InlinePsmProven>(&slot); p != nullptr && p->facts == facts) [[likely]]
+        return InlinePsmGate::Proven;
+
+    int64_t backoffNs = kInlinePsmRetryMinNs;
+    if (const auto* f = std::get_if<InlinePsmFailed>(&slot)) {
+        // I2: a failed proof is LATCHED — no rescan per produce.  Retried only
+        // when the facts change (the log / leadership moved) or the backoff ends.
+        if (f->facts == facts && nowNs_ < f->retryAtNs) return InlinePsmGate::Unprovable;
+        if (f->facts == facts) backoffNs = std::min(f->backoffNs * 2, kInlinePsmRetryMaxNs);
     }
-    // Cold: rebuild from logStart to LEO — every stored batch (the kept tail
-    // above HW included; Kafka loads producer state to the log end).  A later
-    // truncation of that tail bumps logGeneration and is caught above.
-    bool complete = false;
-    const char* why = "it stopped short of the log end (an unreadable batch)";
-    try {
-        complete = producerStateManager_.rebuildFromLog(topicId, log, log.logEndOffset(), partition);
-    } catch (const std::exception& ex) {
-        why = ex.what();
+    auto* sc = std::get_if<InlinePsmScanning>(&slot);
+    if (sc == nullptr || sc->facts != facts) {
+        // (Re)start the build: from logStart to the LEO of NOW.
+        InlinePsmScanning fresh;
+        fresh.facts     = facts;
+        fresh.backoffNs = backoffNs;
+        producerStateManager_.beginRebuild(fresh.cursor, topicId, log, log.logEndOffset(), partition);
+        ++inlinePsmRebuilds_;
+        setInlinePsmState_(slot, std::move(fresh));
+        sc = std::get_if<InlinePsmScanning>(&slot);
     }
-    if (!complete) [[unlikely]] {
-        producerStateManager_.clearPartition(topicId, partition);
-        if (it != inlinePsm_.end()) it->second = InlinePsmUnproven{};
-        spdlog::error("ClientGateway: producer-state rebuild failed for topicId={} partition={}: {} — "
-                      "idempotent produces answered Internal (outcome unknown) until it succeeds",
-                      topicId, partition, why);
-        return InlinePsmGate::Unprovable;
+    using RS = rune::storage::ProducerStateManager::Rebuild::Status;
+    const RS st = producerStateManager_.rebuildStep(sc->cursor, log, kInlinePsmStepBytes);
+    if (st == RS::InProgress) return InlinePsmGate::NotLeader;
+    if (st == RS::Done) {
+        setInlinePsmState_(slot, InlinePsmProven{facts});
+        return InlinePsmGate::Proven;
     }
-    if (it != inlinePsm_.end()) it->second = facts;
-    else inlinePsm_.emplace(key, facts);
-    return InlinePsmGate::Proven;
+    const int64_t b = sc->backoffNs;
+    producerStateManager_.clearPartition(topicId, partition);
+    setInlinePsmState_(slot, InlinePsmFailed{facts, nowNs_ + b, b});
+    spdlog::error("ClientGateway: producer-state rebuild of topicId={} partition={} stopped short of the log "
+                  "end (an unreadable batch) — idempotent produces answered Internal (outcome unknown); "
+                  "retried on a log change or in {} ms", topicId, partition, b / 1'000'000);
+    return InlinePsmGate::Unprovable;
 }
 
+int ClientGateway::advanceInlinePsmScans_()
+{
+    if (inlinePsmScanning_ == 0 || topicRegistry_ == nullptr) [[likely]] return 0;
+    int work = 0;
+    for (auto& [key, state] : inlinePsm_) {
+        if (!std::holds_alternative<InlinePsmScanning>(state)) continue;
+        const auto topicId   = static_cast<int32_t>(static_cast<uint32_t>(key >> 32));
+        const auto partition = static_cast<int32_t>(static_cast<uint32_t>(key));
+        rune::storage::Log* log = topicRegistry_->log(topicId, partition);
+        if (log == nullptr) { setInlinePsmState_(state, InlinePsmUnproven{}); continue; }
+        const rune::replication::PartitionReplica* rep =
+            replicaRegistry_ ? replicaRegistry_->lookup(topicId, partition) : nullptr;
+        (void)proveInlinePsm_(topicId, partition, *log, rep);   // one budgeted step (no rehash: key exists)
+        ++work;
+    }
+    return work;
+}
+
+// M2: leadershipGeneration is deliberately NOT checked — the data under a
+// waiter changes only through a truncation or a reconcile append, both of which
+// bump logGeneration; a leadership flip with the log untouched leaves the
+// waiter's data in place (the worker path's §3.2 rule is the same).
 bool ClientGateway::inlineWaiterStillValid_(const rune::replication::PartitionReplica& rep,
                                             PendingAck& entry) noexcept
 {
@@ -2091,7 +2137,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // a complete leader, Internal (outcome unknown) if the rebuild failed.
     if (msg.producerId >= 0) {
         const InlinePsmGate gate =
-            proveInlinePsm_(msg.topicId, partition, *log, ownedReplica, replica.incarnation());
+            proveInlinePsm_(msg.topicId, partition, *log, ownedReplica);
         if (gate != InlinePsmGate::Proven) [[unlikely]] {
             sendResp(gate == InlinePsmGate::NotLeader ? pc::ErrorCode::NotLeader : pc::ErrorCode::Internal,
                      partition, 0);

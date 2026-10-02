@@ -548,6 +548,13 @@ struct NodeConfig {
     // Overridable via RUNE_ENABLE_COALESCING env var ("0" or "false" → off).
     bool enableCompactionCoalescing = true;
 
+    // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
+    // last batch METADATA of every producer active within this window (a
+    // record-less batch when its last record is compacted away) so a
+    // producer-state rebuild still knows it; older producers are expired.
+    // Default 7 days.  Overridable via RUNE_PRODUCER_ID_EXPIRATION_MS (>= 0).
+    int64_t producerIdExpirationMs = 7LL * 24 * 3600 * 1000;
+
     // Segment roll size (bytes) for the internal __consumer_offsets log.
     // Default 64 MiB matches TopicSpec::segmentRollBytes.
     // Tests may set a small value (e.g. 128) to force multiple sealed segments

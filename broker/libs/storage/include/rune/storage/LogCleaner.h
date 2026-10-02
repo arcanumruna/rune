@@ -60,6 +60,15 @@ struct RangeCleanResult {
 /// are cleaned up at the start of compact().
 class LogCleaner {
 public:
+    /// I1 (Kafka producer.id.expiration.ms): a producer whose last batch's
+    /// maxTimestamp is older than now - this is no longer retained by
+    /// compaction (ProducerTails.h).  Default 7 days; < 0 = never expire.
+    void setProducerIdExpirationMs(int64_t ms) noexcept { producerIdExpirationMs_ = ms; }
+    [[nodiscard]] int64_t producerIdExpirationMs() const noexcept { return producerIdExpirationMs_; }
+    /// M3: bytes the last offset-map build read from clean-prefix segments
+    /// (producer tails) — throttled by the bounded passes.
+    [[nodiscard]] int64_t lastPrefixBytesRead() const noexcept { return prefixBytesRead_; }
+
     LogCleaner() = default;
 
     /// Scan log batches whose base-offset falls in [fromOffset, toOffset) and
@@ -358,6 +367,8 @@ private:
                            Offset globalDirtyStart, Offset passEnd,
                            int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs,
                            Throttler* throttler, bool* changed);
+    int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
+    int64_t prefixBytesRead_        = 0;
 };
 
 } // namespace rune::storage

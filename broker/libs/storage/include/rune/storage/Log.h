@@ -92,6 +92,11 @@ public:
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
 
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
+    /// Bumped by every truncateTo() that removed data: a state derived from
+    /// this log's existing content (a producer state) is stale once it moves.
+    /// For a log with no replica (passthrough) this is its only generation —
+    /// replicated logs use PartitionReplica::logGeneration().  Owner thread.
+    [[nodiscard]] uint64_t contentGeneration() const noexcept { return truncations_; }
     /// The lowest offset still readable from this log — the base offset of the
     /// first (oldest) on-disk segment.  Advances past 0 when retention/compaction
     /// deletes the earliest segment(s).  An "Earliest" subscriber MUST start here,
@@ -392,6 +397,7 @@ private:
 
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
     uint64_t readViewCalls_ = 0;   // F18 B-2 (single-owner thread)
+    uint64_t truncations_   = 0;   // contentGeneration() (owner thread)
     LogStorageState storage_{};     ///< fail-stop state + inline-sync accounting (shared with segments)
     bool deferSealSync_ = false;
     static constexpr std::size_t kMaxPendingSeals = 16;

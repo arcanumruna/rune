@@ -33,6 +33,7 @@
 // Thread-safety: NOT thread-safe. Intended for single-thread cleaner use.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -158,6 +159,10 @@ public:
         capacity_ = cap;
         mask_     = cap - 1;
         table_.assign(cap, Entry{kEmpty, -1});
+        // I1: the producer tails share the dedupe budget — at most a quarter
+        // of it (kEntryBytes per key slot vs ProducerTails::kBytesPerProducer).
+        tails_.setCapacity(std::max<std::size_t>(
+            1024, cap * kEntryBytes / 4 / ProducerTails::kBytesPerProducer));
     }
 
     // Disable copy (large allocation, should never be copied).

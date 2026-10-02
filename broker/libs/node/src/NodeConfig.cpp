@@ -905,6 +905,13 @@ ConfigResult parseNodeConfig(
         // Absent or empty → keep the default (true, set in NodeConfig initializers).
     }
 
+    // --- RUNE_PRODUCER_ID_EXPIRATION_MS (optional, >= 0) — PSM fix round 1 (I1). ---
+    if (const char* raw = getenv_fn("RUNE_PRODUCER_ID_EXPIRATION_MS"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end != raw && v >= 0) cfg.producerIdExpirationMs = static_cast<int64_t>(v);
+    }
+
     // --- RUNE_WORKERS (optional) — Milestone E1: in-process partition worker count (floor 1). ---
     if (const char* w = getenv_fn("RUNE_WORKERS")) {
         char* end = nullptr;

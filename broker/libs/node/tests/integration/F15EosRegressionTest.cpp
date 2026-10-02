@@ -4462,11 +4462,17 @@ struct Answer {
 // replica registry, to a bare passthrough log.
 struct InlineRig {
     TmpDir d;
-    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+    int64_t rollBytes;
+    rune::gateway::TopicRegistry topics{{rollSpec(rollBytes)}, d.path.string()};
     NullTransport t;
     ReplicaRegistry reg;
     PartitionReplica* r = nullptr;
     std::vector<Answer> answers;
+    static rune::node::TopicSpec rollSpec(int64_t roll) {
+        rune::node::TopicSpec ts{"t", 1};
+        ts.segmentRollBytes = roll;
+        return ts;
+    }
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
         [this](const uint8_t* b, std::size_t n) -> int64_t {
             if (auto pr = pc::ProduceResponse::decode(b, n)) answers.push_back(Answer{pr->errorCode, pr->baseOffset});
@@ -4475,7 +4481,8 @@ struct InlineRig {
     int64_t sid  = 0;
     int64_t corr = 0;
     int64_t now  = 1;
-    InlineRig(Role role, std::vector<NodeId> isr, bool withReplica = true) {
+    InlineRig(Role role, std::vector<NodeId> isr, bool withReplica = true,
+              int64_t roll = 64LL * 1024 * 1024) : rollBytes(roll) {
         gw.setTopicRegistry(&topics);
         if (withReplica) {
             auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 0, 0), role, 1, isr, isr, topics.log(0, 0), &t);
@@ -4767,4 +4774,288 @@ TEST(PsmLogConsistencyRegression, CompactionRetainsEachProducersLastBatch) {
         log.reloadSegments();
         expectProducer7Vouched(log, coalesce ? "range+coalesce" : "range");
     }
+}
+
+// ============================================================================
+// PSM <-> log consistency — fix round 1 (review of 01d9ff9).
+// ============================================================================
+namespace {
+std::vector<uint8_t> bigSeqBatch(int64_t pid, int32_t seq, std::size_t valueBytes) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq);
+    b.append("k", std::string(valueBytes, static_cast<char>('a' + seq % 26)), 1000);
+    return b.build();
+}
+void preloadBig(Log& log, int64_t pid, int32_t n, std::size_t valueBytes) {
+    for (int32_t s = 0; s < n; ++s) (void)appendAt(log, bigSeqBatch(pid, s, valueBytes));
+}
+// Resend `seq` until it is answered with something other than NotLeader (a
+// budgeted rebuild in progress); returns the final answer and the NotLeaders.
+std::pair<Answer, int> produceUntilSettled(InlineRig& R, int64_t pid, int32_t seq, int cap) {
+    int notLeader = 0;
+    for (int i = 0; i < cap; ++i) {
+        const Answer a = R.produce(pid, 0, seq);
+        if (a.err != kNotLeader) return {a, notLeader};
+        ++notLeader;
+    }
+    return {Answer{}, notLeader};
+}
+} // namespace
+
+TEST(PsmLogConsistencyRegression, RebuildCrossesReadWindowEdgesOnDefaultRollSegments) {
+    // C1: the 64 MiB read window of the old rebuild cut a batch at its edge and
+    // that was taken for "stopped short" — every sealed segment at the default
+    // roll (>= 64 MiB) left the state unprovable (OOS on the storage level,
+    // Internal forever on the inline path).  The reviewer's repro: 1100 x 64 KiB
+    // idempotent batches at roll 64 MiB (2 segments) and 256 MiB (one 70 MB one).
+    constexpr int32_t kN = 1100;
+    constexpr std::size_t kValue = 64 * 1024;
+    for (int64_t roll : {64LL * 1024 * 1024, 256LL * 1024 * 1024}) {
+        TmpDir d;
+        Log log(d.path.string(), roll);
+        log.recover();
+        preloadBig(log, 7, kN, kValue);
+        ASSERT_GT(static_cast<int64_t>(kN) * static_cast<int64_t>(kValue), 64LL * 1024 * 1024);
+        rune::storage::ProducerStateManager psm;
+        EXPECT_TRUE(psm.rebuildFromLog(0, log, log.logEndOffset(), 0)) << "roll " << roll << ": stopped short";
+        const auto v = psm.validate(0, 7, 0, 0, kN - 1, kN - 1);
+        EXPECT_FALSE(v.isOos()) << "roll " << roll << ": OOS for a stored batch";
+        EXPECT_TRUE(v.isDuplicate()) << "roll " << roll;
+        EXPECT_EQ(v.retryBaseOffset, kN - 1) << "roll " << roll;
+    }
+    // The inline path on a default-roll partition: the resend settles OK.
+    InlineRig R(Role::Leader, {1});
+    preloadBig(R.log(), 7, kN, kValue);
+    R.r->onLeaderLogAppended();
+    const auto [a, notLeader] = produceUntilSettled(R, 7, kN - 1, 4096);
+    EXPECT_EQ(a.err, 0) << "a stored batch on a default-roll log was refused (after " << notLeader << " NotLeader)";
+    EXPECT_EQ(a.base, kN - 1);
+    EXPECT_EQ(R.log().logEndOffset(), kN);
+}
+
+TEST(PsmLogConsistencyRegression, InlineRebuildIsBudgetedAndAnswersNotLeaderWhileScanning) {
+    // I3: the rebuild was one O(log) synchronous scan on the gateway duty
+    // thread.  It is budgeted (1 MiB per step); while it runs an idempotent
+    // batch is answered NotLeader (retriable, nothing appended) and the
+    // duty loop advances it without any produce.
+    InlineRig R(Role::Leader, {1});
+    preloadBig(R.log(), 7, 128, 64 * 1024);                  // 8 MiB
+    R.r->onLeaderLogAppended();
+    const Answer first = R.produce(7, 0, 127);
+    EXPECT_EQ(first.err, kNotLeader) << "the whole 8 MiB rebuild ran inside one produce";
+    EXPECT_EQ(R.log().logEndOffset(), 128);
+    const auto [a, notLeader] = produceUntilSettled(R, 7, 127, 64);
+    EXPECT_GE(notLeader + 1, 6) << "not budgeted (" << notLeader << " NotLeader)";
+    EXPECT_EQ(a.err, 0);
+    EXPECT_EQ(a.base, 127);
+    EXPECT_EQ(R.log().logEndOffset(), 128);
+}
+
+TEST(PsmLogConsistencyRegression, InlineRebuildAdvancesFromTheDutyLoopWithoutProduces) {
+    // I3: the duty loop (doWork) steps a build in progress — progress does not
+    // depend on client retries.
+    InlineRig R(Role::Leader, {1});
+    preloadBig(R.log(), 7, 128, 64 * 1024);
+    R.r->onLeaderLogAppended();
+    ASSERT_EQ(R.produce(7, 0, 127).err, kNotLeader);
+    int passes = 0;
+    while (passes < 64 && R.gw.advanceInlinePsmScansForTest(++R.now) > 0) ++passes;
+    EXPECT_LT(passes, 64) << "the build never finished from the duty loop";
+    const Answer a = R.produce(7, 0, 127);
+    EXPECT_EQ(a.err, 0) << "the next produce found the build unfinished";
+    EXPECT_EQ(a.base, 127);
+    EXPECT_EQ(R.gw.inlinePsmRebuildsForTest(), 1u);
+}
+
+TEST(PsmLogConsistencyRegression, InlineFailedProofIsLatchedUntilBackoffOrLogChange) {
+    // I2: a failed rebuild was retried — a full log scan — on EVERY idempotent
+    // produce.  It is latched: answered Internal without rescanning until the
+    // facts change or the backoff ends.  Here retention removes the bad batch
+    // (no generation change): the state stays latched until the backoff, then
+    // the retry proves it.
+    InlineRig R(Role::Leader, {1}, /*withReplica=*/true, /*roll=*/1);
+    preload(R.log(), 7, 0, 0, 0);
+    (void)appendAt(R.log(), corrupted(seqBatch(7, 0, 1)));
+    preload(R.log(), 7, 0, 2, 3);
+    R.r->onLeaderLogAppended();
+    R.gw.drainPendingAcksForTest(1'000'000'000);             // gateway clock: t = 1 s
+    EXPECT_EQ(R.produce(7, 0, 3).err, static_cast<int16_t>(pc::ErrorCode::Internal));
+    (void)R.log().deleteOldSegments(1);                       // retention: the bad batch is gone
+    ASSERT_EQ(R.log().logStartOffset(), 3) << "precondition: only the active segment remains";
+    EXPECT_EQ(R.produce(7, 0, 3).err, static_cast<int16_t>(pc::ErrorCode::Internal))
+        << "a failed proof was rescanned on the next produce (no latch)";
+    R.gw.drainPendingAcksForTest(1'000'000'000 + 31'000'000'000LL);   // past the (capped) backoff
+    const Answer a = R.produce(7, 0, 3);
+    EXPECT_EQ(a.err, 0);
+    EXPECT_EQ(a.base, 3);
+    EXPECT_EQ(R.log().logEndOffset(), 4);
+}
+
+TEST(PsmLogConsistencyRegression, InlineFailedProofNeverRescansPerProduce) {
+    // I2 (counted): ten produces against a latched failure begin one rebuild.
+    InlineRig R(Role::Leader, {1});
+    preload(R.log(), 7, 0, 0, 0);
+    (void)appendAt(R.log(), corrupted(seqBatch(7, 0, 1)));
+    R.r->onLeaderLogAppended();
+    for (int i = 0; i < 10; ++i)
+        EXPECT_EQ(R.produce(7, 0, 2).err, static_cast<int16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(R.gw.inlinePsmRebuildsForTest(), 1u);
+}
+
+TEST(PsmLogConsistencyRegression, InlinePassthroughTruncationRebuildsTheProducerState) {
+    // M4: the passthrough proof was keyed on the Log* alone — a truncation of a
+    // replica-less log left it "proven", so a resend of a truncated-away seq 1
+    // was answered duplicate-OK and never written.  Facts are now the stable
+    // partition identity + the log's content generation.
+    InlineRig R(Role::Leader, {1}, /*withReplica=*/false);
+    for (int32_t s = 0; s <= 2; ++s) ASSERT_EQ(R.produce(7, 0, s).base, s);
+    R.log().truncateTo(1);
+    const Answer a = R.produce(7, 0, 1);
+    EXPECT_EQ(a.err, 0);
+    EXPECT_EQ(a.base, 1);
+    EXPECT_EQ(R.log().logEndOffset(), 2) << "seq 1 (truncated away) was answered OK but not written";
+}
+
+TEST(PsmLogConsistencyRegression, WorkerPassthroughRebuildIsBudgetedAndLatched) {
+    // I2 + I3 on the worker's replica-less path: NotLeader while the budgeted
+    // build runs (advanced per pass), Internal latched after a failure.
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024);
+    log.recover();
+    preloadBig(log, 7, 128, 64 * 1024);
+    Worker w(0, 1 << 22, 1 << 23, 64, 64);
+    auto produce = [&](int32_t seq, int64_t corr) {
+        WorkerOp o;
+        o.type = WorkerOp::Type::Produce; o.topicId = 1; o.partition = 0; o.replica = nullptr;
+        o.logPtr = &log; o.sessionId = 1; o.correlationId = corr; o.recordCount = 1;
+        o.producerId = 7; o.producerEpoch = 0; o.baseSequence = seq;
+        o.recordBatchBytes = bigSeqBatch(7, seq, 64 * 1024);
+        EXPECT_TRUE(w.tryEnqueueOp(std::move(o)));
+        w.doWork(corr);
+        auto rets = drainAll(w);
+        return rets.empty() ? Answer{} : Answer{rets[0].errorCode, rets[0].baseOffset};
+    };
+    EXPECT_EQ(produce(127, 1).err, kNotLeader) << "the whole build ran inside one produce";
+    for (int i = 0; i < 64; ++i) w.doWork(100 + i);           // passes advance it
+    const Answer a = produce(127, 200);
+    EXPECT_EQ(a.err, 0);
+    EXPECT_EQ(a.base, 127);
+    EXPECT_EQ(log.logEndOffset(), 128);
+    EXPECT_EQ(w.passthroughPsmRebuildsForTest(), 1u);
+}
+
+TEST(PsmLogConsistencyRegression, CompactionNeverResurrectsATombstonedKeyThroughAProducerTail) {
+    // C2: the cleaner kept a producer's superseded LAST record; once the
+    // tombstone that superseded it expired, that record was the only copy of
+    // the key — the deleted key came back forever.  Kafka keeps only the
+    // METADATA (an empty batch, RETAIN_EMPTY): the producer survives a rebuild,
+    // the key does not.
+    for (bool coalesce : {false, true}) {
+        TmpDir d;
+        Log log(d.path.string(), /*segmentBytes=*/1); log.recover();
+        constexpr int64_t kT0 = 1'000'000;                    // ms
+        auto rec = [&](int64_t pid, int32_t seq, std::string_view key, std::string_view val) {
+            rune::protocol::RecordBatchBuilder b(0, kT0);
+            if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+            b.append(key, val, kT0);
+            return appendAt(log, b.build());
+        };
+        (void)rec(7, 0, "K", "v1");                           // P1's LAST batch: K = v1
+        (void)rec(8, 0, "K", "");                             // P2: tombstone K
+        (void)rec(8, 1, "Z", "z");
+        (void)rec(8, 2, "Z", "z2");                           // seals the rest
+        rune::storage::LogCleaner cleaner;
+        rune::storage::SkimpyOffsetMap map(1024);
+        auto pass = [&](int64_t nowMs) {
+            auto bases = log.segmentBaseOffsets();
+            const int64_t active = bases.back();
+            bases.pop_back();
+            std::vector<int64_t> sizes(bases.size(), 1);
+            (void)cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0,
+                                                     /*deleteRetentionMs=*/100, map, coalesce, 1 << 20,
+                                                     nullptr, nowMs);
+            log.reloadSegments();
+        };
+        pass(kT0 + 10);                                       // stamps the tombstone's horizon
+        pass(kT0 + 1000);                                     // horizon passed: tombstone dropped
+        pass(kT0 + 2000);
+        pass(kT0 + 3000);
+        const auto raw = log.read(0, 1 << 24);
+        std::size_t pos = 0;
+        bool resurrected = false, p1Known = false;
+        while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= raw.size()) {
+            rune::protocol::RecordBatchReader r(raw.data() + pos, raw.size() - pos);
+            if (r.totalLength() <= 0) break;
+            if (r.producerId() == 7) p1Known = true;
+            r.forEachRecord([&](std::string_view k, std::string_view, int64_t, int64_t) {
+                if (k == "K") resurrected = true;
+            });
+            pos += static_cast<std::size_t>(r.totalLength());
+        }
+        EXPECT_FALSE(resurrected) << (coalesce ? "coalesce" : "range") << ": the deleted key K came back";
+        EXPECT_TRUE(p1Known) << (coalesce ? "coalesce" : "range") << ": the producer's last metadata was lost";
+        rune::storage::ProducerStateManager psm;
+        ASSERT_TRUE(psm.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        EXPECT_TRUE(psm.validate(0, 7, 0, 0, 0, 0).isDuplicate()) << "a rebuild forgot the producer";
+        EXPECT_TRUE(psm.validate(0, 7, 0, 0, 1, 1).isAccept());
+    }
+}
+
+TEST(PsmLogConsistencyRegression, CompactionExpiresProducerTailsLikeKafka) {
+    // I1: retention of a producer's last metadata never expired — every
+    // producer id ever seen kept a record per compacted topic forever.  Like
+    // Kafka's producer.id.expiration.ms (default here 7 days) an expired
+    // producer's superseded last batch is removed entirely.
+    TmpDir d;
+    Log log(d.path.string(), /*segmentBytes=*/1); log.recover();
+    constexpr int64_t kT0 = 1'000'000;
+    auto rec = [&](int64_t pid, std::string_view key) {
+        rune::protocol::RecordBatchBuilder b(0, kT0);
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(0); }
+        b.append(key, "v", kT0);
+        return appendAt(log, b.build());
+    };
+    (void)rec(7, "K");
+    (void)rec(-1, "K");
+    (void)rec(-1, "Z");
+    auto bases = log.segmentBaseOffsets();
+    const int64_t active = bases.back();
+    bases.pop_back();
+    std::vector<int64_t> sizes(bases.size(), 1);
+    rune::storage::LogCleaner cleaner;
+    EXPECT_EQ(cleaner.producerIdExpirationMs(), 7LL * 24 * 3600 * 1000) << "the default (Kafka-style) expiry";
+    rune::storage::SkimpyOffsetMap map(1024);
+    (void)cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 100, map, false, 1 << 20,
+                                             nullptr, /*nowMs=*/kT0 + 8LL * 24 * 3600 * 1000);
+    log.reloadSegments();
+    const auto raw = log.read(0, 1 << 24);
+    std::size_t pos = 0;
+    bool p7 = false;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= raw.size()) {
+        rune::protocol::RecordBatchReader r(raw.data() + pos, raw.size() - pos);
+        if (r.totalLength() <= 0) break;
+        if (r.producerId() == 7) p7 = true;
+        pos += static_cast<std::size_t>(r.totalLength());
+    }
+    EXPECT_FALSE(p7) << "an expired producer's superseded last batch was retained";
+}
+
+TEST(PsmLogConsistencyRegression, ProducerTailsAreBoundedByTheCleanerBudget) {
+    // I1 (bound): the tails map lives inside the dedupe budget; past its cap it
+    // never grows — unrecorded producers keep their metadata conservatively
+    // (never the contract), and expiry still applies.
+    rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(1 << 20));
+    EXPECT_LT(map.producerTails().capacity(), rune::storage::ProducerTails::kUnbounded);
+    rune::storage::ProducerTails t(2);
+    t.note(1, 10, 100);
+    t.note(2, 20, 100);
+    t.note(3, 30, 100);                                       // over the cap: not recorded
+    EXPECT_EQ(t.size(), 2u);
+    EXPECT_TRUE(t.overflowed());
+    EXPECT_TRUE(t.mustRetain(1, 10, 100, -1, -1));
+    EXPECT_FALSE(t.mustRetain(1, 5, 100, -1, -1)) << "not producer 1's last batch";
+    EXPECT_TRUE(t.mustRetain(3, 30, 100, -1, -1)) << "an unrecorded producer must be kept (conservative)";
+    EXPECT_FALSE(t.mustRetain(3, 30, 100, /*now=*/1000, /*exp=*/500)) << "expired";
+    t.note(1, 40, 100);                                       // existing producers still advance
+    EXPECT_TRUE(t.mustRetain(1, 40, 100, -1, -1));
 }

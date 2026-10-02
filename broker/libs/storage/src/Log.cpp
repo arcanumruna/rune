@@ -710,6 +710,7 @@ int64_t Log::totalBytes() const {
 }
 void Log::truncateTo(int64_t truncateOffset) {
     if (truncateOffset >= logEndOffset_) return; // nothing to do
+    ++truncations_;
 
     // Remove segments that start at or beyond truncateOffset.
     auto it = segments_.lower_bound(truncateOffset);

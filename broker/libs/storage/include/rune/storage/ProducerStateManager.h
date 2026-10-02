@@ -360,6 +360,33 @@ public:
     bool rebuildFromLog(int32_t topicId, LogT& log, int64_t highWatermark, int32_t partition);
 
     // -----------------------------------------------------------------------
+    // Budgeted rebuild (fix round 1, I3): the same scan as rebuildFromLog, cut
+    // into steps of at most ~budgetBytes each so an owner thread (the gateway
+    // duty loop, a worker pass) never blocks on an O(log) scan.  beginRebuild
+    // clears the partition's entries and fixes the bound; rebuildStep advances
+    // the cursor over WHOLE batches through the log's zero-copy readView (no
+    // allocation, no chunk reserve — M5): a batch never straddles a step (C1:
+    // the 64 MiB read window used to cut batches and was taken for "stopped
+    // short").  While InProgress the state must not answer produces.  Retention
+    // between steps is tolerated (the cursor is clamped to the log start).
+    //   Done   — every batch below the bound was applied (or the data ended).
+    //   Failed — a batch inside the written bytes failed its CRC / framing, or
+    //            the scan made no progress: the state lags the log; the caller
+    //            must not answer from it.
+    // -----------------------------------------------------------------------
+    struct Rebuild {
+        enum class Status : uint8_t { InProgress, Done, Failed };
+        int32_t topicId   = 0;
+        int32_t partition = 0;
+        int64_t next      = 0;   ///< next offset to apply
+        int64_t target    = 0;   ///< exclusive bound
+    };
+    template<class LogT>
+    void beginRebuild(Rebuild& r, int32_t topicId, LogT& log, int64_t bound, int32_t partition);
+    template<class LogT>
+    Rebuild::Status rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes);
+
+    // -----------------------------------------------------------------------
     // rebuildHighWatermark — the log high-watermark at which the last rebuild ran.
     //
     // Tracks rebuildHw_, which is set to the highWatermark argument on every
