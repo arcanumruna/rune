@@ -365,7 +365,8 @@ AddPartitionsResult TransactionCoordinator::addOffsetsToTxn(
     const std::string&                                                   group,
     const std::map<rune::coordination::TopicPartition,
                    rune::coordination::Offset>&                          offsets,
-    int64_t                                                              /*nowNs*/)
+    int64_t                                                              nowNs,
+    bool                                                                 beginsTxn)
 {
     TransactionMetadata* meta = findMetadata(txnId);
     if (meta == nullptr) {
@@ -377,7 +378,20 @@ AddPartitionsResult TransactionCoordinator::addOffsetsToTxn(
         return { .errorCode = e };
     }
 
-    // Only valid while the transaction is Ongoing.
+    // X-1 (Kafka AddOffsetsToTxn): the request may OPEN the transaction from
+    // the resting Empty / Complete* — exactly like addPartitions.  A
+    // TxnOffsetCommit needs an Ongoing transaction; Prepare* is refused here
+    // and answered retriable 27 by the service (concurrentIfPreparing_).
+    const bool resting = meta->state == TxnState::Empty ||
+                         meta->state == TxnState::CompleteCommit ||
+                         meta->state == TxnState::CompleteAbort;
+    if (beginsTxn && resting) {
+        meta->state        = TxnState::Ongoing;
+        meta->txnStartNs   = nowNs;
+        meta->fencingEpoch = false;
+        meta->partitions.clear();
+        meta->pendingOffsets.clear();
+    }
     if (meta->state != TxnState::Ongoing) {
         return { .errorCode = AddPartitionsResult::kInvalidTransition };
     }

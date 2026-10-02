@@ -381,7 +381,13 @@ public:
     /// On completeTransaction(ABORT) or any abort path (fence / timeout /
     ///   recovered PrepareAbort): pending offsets are DISCARDED (never written).
     ///
-    /// Valid states: Ongoing only (same guard as addPartitions).
+    /// Valid states: Ongoing; with `beginsTxn` (the AddOffsetsToTxn request,
+    /// X-1 — Kafka) also the resting Empty / Complete*, which it moves to
+    /// Ongoing exactly like addPartitions (the client sends AddOffsets as soon
+    /// as sendOffsetsToTransaction is applied — often before any
+    /// AddPartitions, and an offsets-only transaction never sends one).
+    /// TxnOffsetCommit (beginsTxn false) requires an Ongoing transaction.
+    /// Prepare* → kInvalidTransition (the service answers it as retriable 27).
     /// Epoch/PID fenced like addPartitions.
     ///
     /// \param txnId         Transactional id.
@@ -389,7 +395,8 @@ public:
     /// \param producerEpoch Must match.
     /// \param group         Consumer group id.
     /// \param offsets       Map of TopicPartition → offset to commit.
-    /// \param nowNs         Injected clock.
+    /// \param nowNs         Injected clock (the txn start when it begins one).
+    /// \param beginsTxn     true for AddOffsetsToTxn (may open the transaction).
     AddPartitionsResult addOffsetsToTxn(
         const TransactionalId&                                              txnId,
         ProducerId                                                           producerId,
@@ -397,7 +404,8 @@ public:
         const std::string&                                                   group,
         const std::map<rune::coordination::TopicPartition,
                        rune::coordination::Offset>&                          offsets,
-        int64_t                                                              nowNs);
+        int64_t                                                              nowNs,
+        bool                                                                 beginsTxn = false);
 
     // -----------------------------------------------------------------------
     // completeTransaction

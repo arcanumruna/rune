@@ -582,6 +582,12 @@ void ClientGateway::rebuildProducerStateFromLogs()
                 }
             }
 
+            // F15 S5 (§2.5, Q3): the owning worker rebuilds the producer state of
+            // every partition it owns (its RC build) — the gateway keeps state
+            // only for partitions it appends to itself (no worker pool, or an
+            // internal partition in shard mode), and never reads a worker-owned
+            // log from this thread.
+            if (routesToWorker_(topicId)) continue;
             producerStateManager_.rebuildFromLog(topicId, *log, scanTo, partition);
 
             // TX-7: Rebuild per-partition read_committed state (LsoTracker +
@@ -1454,45 +1460,6 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 // Single-writer: called only from onFragment → doWork duty-cycle thread.
 // Zero heap allocation on hot path: restampScratch_ is a reusable member array.
 // ---------------------------------------------------------------------------
-// F15 S2: the gateway-mirror facts of one successful worker append (idempotent
-// PSM update, dirty-log mark).  From a facts-only return (deferAck) or an
-// immediate final result.  TEMPORARY: S5 moves the PSM onto the owning worker
-// (and deletes this function with the facts-only return).  F15 S4 deleted the
-// LsoTracker feed: the owning worker updates its own RC state at append.
-void ClientGateway::applyProduceFacts_(const rune::node::WorkerReturn& ret)
-{
-    // Success: TX-2 idempotent PSM update.  Task 13 fix round 1 (m2): in shard
-    // mode the owning worker's psm_ is the single owner for user partitions and
-    // the mirror is never read for them (the gate is skipped) — no update.
-    if (ret.producerId >= 0 && !(shardMode_ && ret.topicId >= 0)) {
-        const int32_t lastSeqInBatch =
-            ret.baseSequence + ret.recordCount - 1;
-        producerStateManager_.update(
-            ret.topicId, ret.producerId, ret.partition,
-            ret.producerEpoch, ret.baseSequence, lastSeqInBatch,
-            ret.baseOffset);
-    }
-
-    // Mark log dirty for group-commit fsync.
-    //
-    // E5.1.3 (d) R7 fix + F30 fix round 1: a worker return for a USER partition
-    // (topicId >= 0) is about a log the worker exclusively owns — in EVERY
-    // configuration (per-worker ingress or gateway fan-out).  The worker's
-    // doWork submits its fsyncs to its own io backend (follower flush, roll
-    // seals, Strict, and the time-gated syncOwnedLogsAsync_, which runs in every
-    // configuration).  The gateway must NOT call Log::sync on worker-owned logs
-    // (a cross-thread call racing the worker's appends — TSan race R7).
-    // Internal partitions (topicId < 0) remain on the gateway sync path.
-    const bool workerOwnedLog = ret.topicId >= 0;
-    if (!workerOwnedLog && topicRegistry_) {
-        rune::storage::Log* log =
-            topicRegistry_->log(ret.topicId, ret.partition);
-        if (log) {
-            dirtyLogs_.insert(log);
-        }
-    }
-}
-
 void ClientGateway::setWorkerPool(rune::node::WorkerPool* pool) noexcept {
     workerPool_ = pool;
     if (!pool) return;
@@ -1926,41 +1893,12 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             }
         }
 
-        // TX-2: Idempotent-producer dedup gate (worker path).
-        // Task 13 (spec §3.4): in shard mode the owning worker's psm_ is the
-        // single owner for user partitions (it validates in its produce core) —
-        // the runtime mirror is not consulted (two authorities for one pid would
-        // be a check-then-act race).
-        if (msg.producerId >= 0 && !(shardMode_ && msg.topicId >= 0)) {
-            const int32_t lastSeqInBatch = msg.baseSequence + recordCount - 1;
-            const auto vr = producerStateManager_.validate(
-                msg.topicId, msg.producerId, partition,
-                msg.producerEpoch, msg.baseSequence, lastSeqInBatch);
-
-            if (vr.isDuplicate()) {
-                spdlog::debug("ClientGateway: Produce duplicate (pid={} epoch={} baseSeq={} "
-                              "partition={}) → prior baseOffset={} (no re-append)",
-                              msg.producerId, msg.producerEpoch, msg.baseSequence,
-                              partition, vr.retryBaseOffset);
-                sendResp(pc::ErrorCode::OK, partition, vr.retryBaseOffset);
-                return;
-            }
-            if (vr.isOos()) {
-                spdlog::debug("ClientGateway: Produce OutOfOrderSequence "
-                              "(pid={} epoch={} baseSeq={} partition={})",
-                              msg.producerId, msg.producerEpoch, msg.baseSequence, partition);
-                sendResp(pc::ErrorCode::OutOfOrderSequence, partition, 0);
-                return;
-            }
-            if (vr.isFenced()) {
-                spdlog::debug("ClientGateway: Produce InvalidProducerEpoch "
-                              "(pid={} fenced epoch={} tracked partition={})",
-                              msg.producerId, msg.producerEpoch, partition);
-                sendResp(pc::ErrorCode::InvalidProducerEpoch, partition, 0);
-                return;
-            }
-            // Status::Accept — fall through to worker enqueue.
-        }
+        // F15 S5 (§2.5, I6 / Q3): NO idempotent-producer gate here, in any mode.
+        // The OWNING worker's psm_ is the single producer-state authority for
+        // every partition it owns (validate → append → update in its produce
+        // core, in program order with every marker's fence) — a gateway mirror
+        // would be a second authority for one pid (a check-then-act race, and a
+        // one-pass window for seq k+1 before seq k's result drained).
 
         // GR-5 (Task 10 round 5): NO min-ISR gate here.  The replica's ISR is
         // worker-owned state; reading replica->isr() on this control thread was a
@@ -2013,6 +1951,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // vector.  The worker's appendNoSyncRestamp assigns + patches the base
         // offset (CRC-safe: base-offset field [0..7] precedes the CRC region).
         op.recordBatchView = msg.recordBatch;
+        // F15 S5 fix round 1 (M-3): these exact bytes (rbData == msg.recordBatch,
+        // unmodified since the ensureValid() above, copied once into the ring by
+        // enqueueOp below) passed the CRC32C check — the worker may skip its
+        // repeat pass.  INVARIANT: set ONLY here, only after ensureValid().
+        op.crcValidated    = true;
 
         // Enqueue to the worker.  tryEnqueueOp returns false on back-pressure
         // (ring full, or the worker's SetOwnership still undelivered).  M5 (Task
@@ -3177,12 +3120,11 @@ void ClientGateway::pushSubscriptions()
 //
 // ProduceResult handling:
 //   1. If errorCode != 0: find session, send ProduceResponse{Internal, partition, 0}.
-//   2. If success:
-//      a. Update idempotent PSM (producerStateManager_.update) if producerId >= 0.
-//      b. Feed LsoTracker for transactional data batches (TRANSACTIONAL bit in batchAttrs).
-//      c. Mark log dirty for group-commit fsync (dirtyLogs_.insert).
-//      d. If deferAck: enqueue PendingAck (same as inline path).
-//      e. Else: send ProduceResponse{OK, partition, baseOffset}.
+//   2. If success: send ProduceResponse{OK, partition, baseOffset} — every
+//      worker result is FINAL (F15 I-A).  No mirror is fed (F15 S4/S5: the
+//      owning worker holds the read_committed and producer state and syncs
+//      its own logs).  A deferAck result is a shard-mode post-ack liveness
+//      notification: the session is touched, nothing is sent.
 //
 // PushReadResult handling:
 //   1. Remove subscriptionId from pendingWorkerReads_.
@@ -3399,24 +3341,17 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // worker→gateway return-ring + duty-cycle latency (same correlationId).
             RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp,
                                  static_cast<uint32_t>(ret.correlationId));
-            // F15 S2 fix round 1 (review C1) — TEMPORARY, deleted by S4 (LSO on
-            // W) and S5 (PSM on W): a facts-only return (deferAck == true) is
-            // emitted by the owning worker AT APPEND for a produce whose answer
-            // it parks (acks=all / Strict).  Apply the PSM / LSO / dirty-log
-            // facts now — whatever the session state — and answer nothing: the
-            // final result follows when the worker's waiter fires.
-            // Only a SUCCESS can be facts-only (fix round 2, B1): an error result
-            // is always an answer — it must reach the client and must never
-            // feed the mirrors (the batch was not appended).
+            // Task 13 (spec §3.4): with worker-side acks (shard mode) a
+            // deferAck ProduceResult is the post-ack notification of an ack the
+            // worker already sent — and the only produce traffic the runtime
+            // sees for the session (F23 liveness, ack time >= request time:
+            // never early).  One lookup; nothing is sent.  F15 S5: it carries no
+            // facts — the owning worker's psm_ is the sole producer-state
+            // authority (the facts-only return and the gateway mirror are gone).
             assert(!(ret.deferAck && ret.errorCode != 0) &&
                    "worker invariant: an error ProduceResult never carries deferAck");
-            if (ret.deferAck && ret.errorCode == 0) {
-                applyProduceFacts_(ret);
-                // Task 13: in shard mode this is the post-ack notification of an
-                // ack the worker already sent — and the only produce traffic the
-                // runtime sees for the session (F23 liveness, ack time >=
-                // request time: never early).  One lookup; nothing is sent.
-                if (shardMode_) [[likely]] sessions_.touch(ret.sessionId, nowNs_);
+            if (ret.deferAck) {
+                sessions_.touch(ret.sessionId, nowNs_);
                 return;
             }
             Session* session = sessions_.find(ret.sessionId);
@@ -3445,10 +3380,6 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 return;
             }
-
-            // Success: the append facts (no-op for a final result that follows a
-            // facts-only return — the worker strips its producerId / attrs).
-            applyProduceFacts_(ret);
 
             // F15 I-A: every ProduceResult from a worker is FINAL.  The owning
             // worker answers acks=all itself — parked on W until the HW passes

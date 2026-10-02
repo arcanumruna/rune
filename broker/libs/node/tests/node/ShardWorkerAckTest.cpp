@@ -2,9 +2,9 @@
 // publication (REAL invoker driver, aeron:ipc), notifies the runtime after the ack,
 // and fails parked acks=all promptly on demotion.
 //
-// F15 reconciliation: the post-ack notification is the existing facts-only
-// ProduceResult (deferAck == true: PSM-mirror facts + session liveness, never an
-// answer) — WorkerReturn PRODUCE_NOTIFY(2) was retired by F15 §7 (RESERVED_2).
+// F15 reconciliation: the post-ack notification is a ProduceResult with
+// deferAck == true (session liveness only — F15 S5 removed its PSM facts; never
+// an answer) — WorkerReturn PRODUCE_NOTIFY(2) was retired by F15 §7 (RESERVED_2).
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -213,7 +213,7 @@ TEST(ShardWorkerAckRegression, AcksDirectlyOnTheSessionPublicationNotTheReturnRi
         if (r.deferAck) ++notifies; else ++answers;
     });
     EXPECT_EQ(answers, 0) << "shard mode: the runtime never relays produce acks";
-    EXPECT_EQ(notifies, 1) << "one post-ack notification per ack (facts + session liveness)";
+    EXPECT_EQ(notifies, 1) << "one post-ack notification per ack (session liveness)";
 }
 
 TEST(ShardWorkerAckRegression, DemotedLeaderFiresNotLeaderPromptly) {
@@ -239,7 +239,8 @@ TEST(ShardWorkerAckRegression, ProduceNotifyFollowsTheAckOnTheReturnRing) {
     });
     EXPECT_EQ(answers, 0);
     EXPECT_EQ(notifies, 1);
-    EXPECT_EQ(pid, 11) << "the notification carries the PSM facts of the acked append";
+    EXPECT_EQ(pid, -1) << "F15 S5: the notification carries no producer-state facts (the worker psm_ is the sole "
+                          "authority; the runtime has no mirror to feed)";
     EXPECT_EQ(sid, 5) << "and the session (runtime liveness)";
     EXPECT_EQ(err, 0) << "a notification is never an answer (facts-only invariant)";
 }
@@ -254,7 +255,7 @@ TEST(ShardWorkerAckRegression, ErrorAckNotifiesLivenessWithoutFacts) {
         if (r.type == WorkerReturn::Type::ProduceResult && r.deferAck) { ++notifies; pid = r.producerId; }
     });
     EXPECT_EQ(notifies, 1);
-    EXPECT_EQ(pid, -1) << "an error carries no facts — the mirror must never learn a refused batch";
+    EXPECT_EQ(pid, -1) << "a notification never carries producer-state facts";
 }
 
 TEST(ShardWorkerAckRegression, GatewayRoutedProduceIsDedupedByTheWorkerPsm) {
@@ -281,6 +282,42 @@ TEST(ShardWorkerAckRegression, GatewayRoutedProduceIsDedupedByTheWorkerPsm) {
     EXPECT_EQ(f.acks[22].errorCode, 0);
     EXPECT_EQ(f.acks[22].baseOffset, f.acks[21].baseOffset) << "duplicate answered with the original offset";
     EXPECT_EQ(f.log->logEndOffset(), 1) << "the retried batch must not be appended twice";
+}
+
+// F15 S5 (Kafka parity, re-review 1 I1 residual): a retry of an acks=all
+// batch whose original is still below the HW is answered only when the
+// original commits — on shard ingress AND on the gateway-routed op path.
+TEST(ShardWorkerAckRegression, AcksAllDuplicateAnsweredOnlyWhenTheOriginalCommits) {
+    for (bool routed : {false, true}) {
+        Fixture f({1, 2}, /*minIsr=*/1);                       // follower 2 in the ISR: the HW waits for it
+        rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+        const auto batch = b.build();
+        auto send = [&](int64_t corr) {
+            if (!routed) { f.produce(corr, /*acks=all*/1, /*pid=*/11, /*seq=*/0); return; }
+            WorkerOp op; op.type = WorkerOp::Type::Produce; op.topicId = 1; op.partition = 0;
+            op.replica = f.replica.get(); op.logPtr = f.log.get();
+            op.sessionId = 5; op.correlationId = corr; op.acks = 1; op.deferAck = true;
+            op.producerId = 11; op.producerEpoch = 0; op.baseSequence = 0;
+            op.lastOffsetDelta = 0; op.recordCount = 1; op.durabilityTier = 1;
+            op.recordBatchView = std::span<const uint8_t>(batch);
+            ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(op)));
+        };
+        send(31);
+        for (int i = 0; i < 2'000; ++i) f.step();
+        ASSERT_EQ(f.acks.count(31), 0u) << "precondition: the original is parked on the HW (routed=" << routed << ")";
+        send(32);                                              // the client's retry
+        for (int i = 0; i < 2'000; ++i) f.step();
+        EXPECT_EQ(f.log->logEndOffset(), 1) << "one copy (routed=" << routed << ")";
+        EXPECT_EQ(f.acks.count(32), 0u)
+            << "the duplicate was acked before its original reached the HW (routed=" << routed << ")";
+        rune::replication::FetchRequestMsg fr{1, 0, 2, f.log->logEndOffset(), 1 << 20, 0};
+        (void)f.replica->onFetchRequest(fr, f.now);
+        ASSERT_TRUE(f.awaitAck(31));
+        ASSERT_TRUE(f.awaitAck(32));
+        EXPECT_EQ(f.acks[31].errorCode, 0);
+        EXPECT_EQ(f.acks[32].errorCode, 0);
+        EXPECT_EQ(f.acks[32].baseOffset, f.acks[31].baseOffset);
+    }
 }
 
 TEST(ShardWorkerAckRegression, ClosedSessionGetsNoAckAndReannounceRestoresIt) {

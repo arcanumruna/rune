@@ -9,6 +9,7 @@
 // only waits are condition waits with a hard iteration cap.
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/GatewayReplicaView.h>
+#include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/TransactionCoordinationService.h>
@@ -22,6 +23,7 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/transaction/ControlMarker.h>
@@ -947,7 +949,7 @@ struct LegacyAcksRig {
     std::vector<std::pair<int64_t, int64_t>> records;   // (subscriptionId, baseOffset) pushed
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
         [this](const uint8_t* b, std::size_t n) -> int64_t {
-            if (auto r = pc::ProduceResponse::decode(b, n)) answers.push_back({false, r->errorCode, r->baseOffset});
+            if (auto r = pc::ProduceResponse::decode(b, n)) answers.push_back({false, r->errorCode, r->baseOffset, r->correlationId});
             else if (auto e = pc::ErrorResponse::decode(b, n)) answers.push_back({true, e->code, -1, e->correlationId});
             else if (auto rec = pc::Records::decode(b, n)) records.emplace_back(rec->subscriptionId, rec->baseOffset);
             return 1;
@@ -1314,11 +1316,12 @@ TEST(LegacyAcksAllRegression, HeldWhileIsrBelowMinIsrAtFire) {
 }
 
 // ============================================================================
-// F15 S2 fix round 1 (review C1, controller ruling Option 1): in the default
-// config the gateway's PSM / LSO / dirty-log mirrors still exist until S4/S5,
-// so the OWNING worker must hand them the append facts AT APPEND (a facts-only
-// return), never only with the final ack — which arrives a replication RTT
-// later, or as an error that carries no facts.
+// F15 S2 fix round 1 (review C1, controller ruling Option 1) — guards kept
+// through S4 / S5: in the default config an idempotent / transactional acks=all
+// produce must be validated and registered AT APPEND, never only with the
+// final ack (which arrives a replication RTT later, or as an error).  Since S5
+// the owning worker's psm_ does it in the append's own invocation (the S2
+// temporary facts-only return and the gateway mirrors are deleted).
 // ============================================================================
 namespace {
 std::vector<uint8_t> idemBatch(int64_t pid, int16_t epoch, int32_t seq, bool txn = false) {
@@ -1367,6 +1370,11 @@ TEST(LegacyAcksAllRegression, RetryAfterAckTimeoutIsDeduped) {
     produceIdem(R, 2, 7, 0);                                  // the client's retry
     for (int i = 0; i < 4; ++i) R.runWorker();
     EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the retry of an appended batch was appended again";
+    // F15 S5 (Kafka parity, addendum): the duplicate is answered only under its
+    // original's ack condition — once the HW passes the original.
+    EXPECT_EQ(R.answers.size(), 1u) << "the duplicate was answered before its original reached the HW";
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.size() < 2; ++i) R.runWorker();
     ASSERT_EQ(R.answers.size(), 2u);
     EXPECT_EQ(R.answers[1].code, 0) << "a duplicate is answered OK";
     EXPECT_EQ(R.answers[1].base, 0) << "with the ORIGINAL offset";
@@ -1458,11 +1466,9 @@ TEST(TxnRoleGateRegression, NoOpEpochTruncationKeepsLogGeneration) {
 }
 
 // ============================================================================
-// F15 S2 fix round 2 (re-review 1).  B1: an ERROR result must never be taken
-// for the append-time facts-only return — the client must be answered and the
-// gateway mirrors (PSM / LSO) must never record a batch that was not appended.
-// Strict ruling: Strict facts are applied at fsync completion, never at
-// append — a retry after a failed fsync must not be answered duplicate-OK.
+// F15 S2 fix round 2 (re-review 1) — guards kept through S5.  B1: an ERROR
+// result is always answered and its batch is never recorded (PSM / LSO).
+// Strict ruling: a retry after a failed fsync is never answered duplicate-OK.
 // ============================================================================
 namespace {
 // Replace the worker's owned set (as a SetOwnership op from the runtime would).
@@ -1484,7 +1490,7 @@ TEST(LegacyAcksAllRegression, NotOwnedRefusalIsAnsweredAndNeverRecorded) {
     produceIdem(R, 1, 7, 0);
     for (int i = 0; i < 4; ++i) R.runWorker();
     EXPECT_EQ(R.r->log()->logEndOffset(), 0);
-    ASSERT_EQ(R.answers.size(), 1u) << "the not-owned refusal was swallowed as a facts-only return";
+    ASSERT_EQ(R.answers.size(), 1u) << "the not-owned refusal was never answered";
     EXPECT_EQ(R.answers[0].code, kNotLeader);
     setWorkerOwns(R, {R.r});
     produceIdem(R, 2, 7, 0);                                  // the client's retry
@@ -1513,7 +1519,7 @@ TEST(LegacyAcksAllRegression, SchemaRejectIsAnsweredAndNeverRecorded) {
     produceIdem(R, 1, 7, 0, /*txn=*/true);                    // value "idem" is not a valid record
     for (int i = 0; i < 4; ++i) R.runWorker();
     EXPECT_EQ(R.r->log()->logEndOffset(), 0);
-    ASSERT_EQ(R.answers.size(), 1u) << "the schema reject was swallowed as a facts-only return";
+    ASSERT_EQ(R.answers.size(), 1u) << "the schema reject was never answered";
     EXPECT_EQ(R.answers[0].code, kSchemaFailed);
     EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "a rejected txn batch was registered as open (LSO pinned)";
     produceIdem(R, 2, 7, 0, /*txn=*/true);                    // retry
@@ -1525,8 +1531,7 @@ TEST(LegacyAcksAllRegression, SchemaRejectIsAnsweredAndNeverRecorded) {
 
 TEST(LegacyAcksAllRegression, StrictRetryAfterFsyncFailureIsNotDuplicateOk) {
     // Strict acks=all whose fsync FAILS: the batch is not durable.  A retry must
-    // never be answered duplicate-OK (Strict facts are applied at fsync
-    // completion, not at append).
+    // never be answered duplicate-OK (fsyncgate: the failed log refuses it).
     LegacyAcksRig R({1, 2}, /*tier=*/2);
     R.w().forceFlushErrorForTest(EIO);
     produceIdem(R, 1, 7, 0);
@@ -1540,9 +1545,9 @@ TEST(LegacyAcksAllRegression, StrictRetryAfterFsyncFailureIsNotDuplicateOk) {
 }
 
 TEST(LegacyAcksAllRegression, StrictAcksAllDedupsAfterFsync) {
-    // Strict acks=all success path: once the fsync completed, the facts are
-    // applied — a retry is a duplicate (one copy, original offset) and the next
-    // sequence is accepted (not OutOfOrderSequence) while the ack waits on the HW.
+    // Strict acks=all success path: a retry is a duplicate (one copy, original
+    // offset) and the next sequence is accepted (not OutOfOrderSequence) while
+    // the acks wait on the HW.
     LegacyAcksRig R({1, 2}, /*tier=*/2);
     produceIdem(R, 1, 7, 0);
     R.runWorker();
@@ -1551,15 +1556,24 @@ TEST(LegacyAcksAllRegression, StrictAcksAllDedupsAfterFsync) {
     ASSERT_EQ(R.w().reservedAckSlotsForTest(), 1) << "precondition: fsynced, parked on the HW";
     ASSERT_TRUE(R.answers.empty());
     produceIdem(R, 2, 7, 0);                                  // retry of seq 0
+    for (int i = 0; i < kCap && R.w().durablePendingCountForTest() > 0; ++i) { R.runWorker(); std::this_thread::yield(); }
     R.runWorker();
-    ASSERT_EQ(R.answers.size(), 1u);
-    EXPECT_EQ(R.answers[0].code, 0);
-    EXPECT_EQ(R.answers[0].base, 0);
     EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "one copy";
+    // F15 S5 (Kafka parity, addendum): the duplicate waits for its original's
+    // ack condition (fsync, then the HW) — it is parked, not answered OK at once.
+    EXPECT_TRUE(R.answers.empty()) << "the duplicate was answered before its original reached the HW";
     produceIdem(R, 3, 7, 1);                                  // seq 1
+    for (int i = 0; i < kCap && R.w().durablePendingCountForTest() > 0; ++i) { R.runWorker(); std::this_thread::yield(); }
     R.runWorker();
-    EXPECT_EQ(R.answers.size(), 1u) << "seq 1 answered (OutOfOrderSequence?) instead of being parked";
+    EXPECT_TRUE(R.answers.empty()) << "seq 1 answered (OutOfOrderSequence?) instead of being parked";
     EXPECT_EQ(R.r->log()->logEndOffset(), 2);
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.size() < 3; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 3u);
+    for (const auto& a : R.answers) EXPECT_EQ(a.code, 0);
+    EXPECT_EQ(R.answers[0].base, 0);
+    EXPECT_EQ(R.answers[1].base, 0) << "the duplicate is answered with the ORIGINAL offset";
+    EXPECT_EQ(R.answers[2].base, 1);
 }
 
 // ============================================================================
@@ -2041,9 +2055,12 @@ void followerCaughtUp(PartitionReplica& r, int64_t now) {
     rune::replication::FetchRequestMsg fr{r.epoch(), 0, 2, r.log()->logEndOffset(), 1 << 20, r.topicId()};
     (void)r.onFetchRequest(fr, now);
 }
-// Answers only (the S2 temporary facts-only return carries deferAck == true).
+// Every return is an answer (F15 S5: the facts-only return is deleted).
 void collectAnswers(Worker& w, std::vector<WorkerReturn>& out) {
-    w.drainReturn([&](WorkerReturn r) { if (!r.deferAck) out.push_back(std::move(r)); });
+    w.drainReturn([&](WorkerReturn r) {
+        EXPECT_FALSE(r.deferAck) << "a facts-only return (deleted by F15 S5) for " << r.correlationId;
+        out.push_back(std::move(r));
+    });
 }
 // Drain + run until `want` answers arrived (bounded passes; no sleeps).
 void drainUntil(Worker& w, std::vector<WorkerReturn>& out, std::size_t want, int64_t& now) {
@@ -2089,7 +2106,7 @@ TEST(ReturnOverflowRegression, LegacyFullRingNeverDropsProduceResult) {
     constexpr int kParked = 100;
     for (int i = 0; i < kParked; ++i) ASSERT_TRUE(w.tryEnqueueOp(acksAllOp(&rep, 10'000 + i)));
     w.doWork(++now);
-    collectAnswers(w, answers);   // facts-only returns drained; nothing answered yet
+    collectAnswers(w, answers);   // nothing answered yet
     ASSERT_TRUE(answers.empty());
     ASSERT_EQ(w.reservedAckSlotsForTest(), kParked) << "precondition: acks=all parked on the worker";
     constexpr int kFill = 600;
@@ -2312,10 +2329,12 @@ TEST(ReturnOverflowRegression, ShardIngressPollBudgetHonoursStaticBound) {
     EXPECT_EQ(w.ingressPollBudgetForTest(), 0) << "the poll budget ignores the static owed-return cap";
 }
 
-TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) {
-    // The S2 temporary facts-only return (acks=all: at append; Strict: at fsync
-    // completion) and the final answer share the ONE FIFO: through a full ring
-    // neither is dropped and, per produce, the facts arrive before the answer.
+TEST(ReturnOverflowRegression, ParkedAnswersThroughFullRingNeverDroppedAndInOrder) {
+    // F15 S5 retarget (the S2 temporary facts-only return is deleted): the
+    // parked answers (acks=all: on the HW; Strict acks=all: fsync, then the HW)
+    // and the immediate answers share the ONE FIFO — through a full ring none is
+    // dropped, none is a facts-only return, and the parked answers of the one
+    // partition leave in append order (order-preserving waiter removal).
     for (const uint8_t tier : {uint8_t{1}, uint8_t{2}}) {
         SCOPED_TRACE(tier == 2 ? "Strict acks=all" : "acks=all");
         TmpDir d;
@@ -2327,9 +2346,8 @@ TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) 
         int64_t now = 1;
         constexpr int kFill = 600, kParked = 60;
         // The parked produces are admitted first (their G-A6 reservation needs
-        // ring room); then acks=leader answers fill the ring, so the Strict
-        // facts (emitted at fsync completion) and every final answer are
-        // emitted into a FULL ring and must queue in the FIFO.
+        // ring room); then acks=leader answers fill the ring, so every parked
+        // answer is emitted into a FULL ring and must queue in the FIFO.
         w.setReapPausedForTest(true);
         for (int i = 0; i < kParked; ++i) {
             WorkerOp op = acksAllOp(&rep, 10'000 + i);
@@ -2337,30 +2355,26 @@ TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) 
             ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
         }
         w.doWork(++now);
-        ASSERT_EQ(w.reservedAckSlotsForTest(), tier == 2 ? 2 * kParked : kParked) << "precondition: all parked";
+        ASSERT_EQ(w.reservedAckSlotsForTest(), kParked) << "precondition: all parked (one owed answer each)";
         for (int i = 0; i < kFill; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 1 + i)));
-        std::vector<std::pair<int64_t, bool>> seq;   // (correlationId, facts-only?)
+        std::vector<std::pair<int64_t, bool>> seq;   // (correlationId, deferAck?)
         auto drain = [&] { w.drainReturn([&](WorkerReturn r) { seq.emplace_back(r.correlationId, r.deferAck); }); };
         w.doWork(++now);                 // ring full of acks=leader answers
         w.setReapPausedForTest(false);
         EXPECT_GT(w.retFifoSizeForTest(), 0u) << "the ring is full: returns must queue in the FIFO";
-        // Strict: run until every fsync completed (facts emitted at completion).
         for (int i = 0; i < kCap && w.durablePendingCountForTest() > 0; ++i) { w.doWork(++now); std::this_thread::yield(); }
         followerCaughtUp(rep, now);
-        for (int i = 0; i < 4096 && seq.size() < static_cast<std::size_t>(kFill + 2 * kParked); ++i) { drain(); w.doWork(++now); }
+        for (int i = 0; i < 4096 && seq.size() < static_cast<std::size_t>(kFill + kParked); ++i) { drain(); w.doWork(++now); }
         drain();
-        ASSERT_EQ(seq.size(), static_cast<std::size_t>(kFill + 2 * kParked)) << "a facts-only return or an answer was dropped";
-        for (int i = 0; i < kParked; ++i) {
-            const int64_t corr = 10'000 + i;
-            std::ptrdiff_t facts = -1, answer = -1;
-            for (std::size_t k = 0; k < seq.size(); ++k) {
-                if (seq[k].first != corr) continue;
-                (seq[k].second ? facts : answer) = static_cast<std::ptrdiff_t>(k);
-            }
-            ASSERT_GE(facts, 0) << "facts dropped for " << corr;
-            ASSERT_GE(answer, 0) << "answer dropped for " << corr;
-            EXPECT_LT(facts, answer) << "the answer overtook its facts for " << corr;
+        ASSERT_EQ(seq.size(), static_cast<std::size_t>(kFill + kParked)) << "an answer was dropped (or a facts-only return emitted)";
+        int64_t lastParked = 0;
+        for (const auto& [corr, deferAck] : seq) {
+            EXPECT_FALSE(deferAck) << "a facts-only return for " << corr;
+            if (corr < 10'000) continue;
+            EXPECT_GT(corr, lastParked) << "parked answer " << corr << " overtook an earlier one";
+            lastParked = corr;
         }
+        EXPECT_EQ(lastParked, 10'000 + kParked - 1);
     }
 }
 
@@ -3922,4 +3936,518 @@ TEST(TxnRcRegression, HeldPushReadUnansweredOnOwnershipLossRegistered) {
     EXPECT_EQ(rs[0].pushEffectiveBound(), -1);
     EXPECT_TRUE(rs[0].chunk.empty());
     EXPECT_EQ(R.w().heldPushReadsForTest(), 0u);
+}
+
+// ============================================================================
+// F15 S5 — the owning worker's psm_ is the SOLE producer-state authority in
+// EVERY mode (I6: the default Legacy config included), the marker fences the
+// partition producer epoch on receipt (C1+), the PSM rebuild applies control
+// batches as epoch raises inside the S4 build (I3), a duplicate is answered
+// only under its original batch's ack condition, pipelined Strict answers
+// keep their order, and AddOffsetsToTxn opens a transaction (X-1).
+// Design note §2.5, §8 S5 row; step addendum (S5 items, X-1).
+// ============================================================================
+namespace {
+void produceLegacy(LegacyAcksRig& R, int64_t corr, uint8_t acks, int64_t pid, int16_t epoch, int32_t seq,
+                   bool txn = false) {
+    const auto f = produceFrame(R.sid, corr, idemBatch(pid, epoch, seq, txn), acks, 0, 0, pid, epoch, seq);
+    R.gw.applyProduceForTest(f.data(), f.size());
+}
+void legacyMarker(LegacyAcksRig& R, int64_t pid, int16_t epoch, bool commit) {
+    const auto m = tx::ControlMarker::build(pid, epoch, commit ? tx::ControlType::Commit : tx::ControlType::Abort, 0);
+    ASSERT_EQ(R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), pid, commit, /*coordinatorEpoch=*/0),
+              rune::gateway::ClientGateway::kControlRecordAsync);
+    for (int i = 0; i < 64 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker();
+    ASSERT_EQ(R.gw.markersInFlightForTest(), 0u) << "the marker reply reached the gateway";
+}
+// A gateway-routed produce op exactly as the gateway enqueues it (no gateway
+// validation in front of it — the worker is the authority).
+WorkerOp routedIdemOp(PartitionReplica* r, int64_t sid, int64_t corr, const std::vector<uint8_t>& batch,
+                      int64_t pid, int32_t seq) {
+    WorkerOp op;
+    op.type = WorkerOp::Type::Produce; op.topicId = r->topicId(); op.partition = static_cast<int32_t>(r->partitionId());
+    op.replica = r; op.logPtr = r->log(); op.sessionId = sid; op.correlationId = corr; op.acks = 0;
+    op.producerId = pid; op.producerEpoch = 0; op.baseSequence = seq; op.lastOffsetDelta = 0; op.recordCount = 1;
+    op.durabilityTier = r->durabilityTier(); op.recordBatchBytes = batch;
+    return stamp(std::move(op));
+}
+bool runUntilRcReady(LegacyAcksRig& R) {
+    for (int i = 0; i < 256 && R.w().rcStatusForTest(0, 0) != Worker::kRcReady; ++i) R.runWorker();
+    return R.w().rcStatusForTest(0, 0) == Worker::kRcReady;
+}
+} // namespace
+
+TEST(TxnFenceRegression, ZombieBatchAfterAbortMarkerIsFencedGatewayPath) {
+    // C1+ in the DEFAULT config: the gateway routes every user produce to the
+    // owning worker; the marker raised the partition producer epoch there, so a
+    // zombie batch of the old epoch arriving after the ABORT is refused 17.
+    LegacyAcksRig R({1});
+    produceLegacy(R, 1, /*acks=leader*/0, /*pid=*/7, /*epoch=*/0, /*seq=*/0, /*txn=*/true);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    ASSERT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u);
+    legacyMarker(R, 7, /*markerEpoch=*/1, /*commit=*/false);   // fence-abort at the bumped epoch
+    ASSERT_EQ(R.r->log()->logEndOffset(), 2);
+    produceLegacy(R, 2, 0, 7, /*zombie epoch=*/0, /*seq=*/1, true);
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, kInvalidProducerEpoch) << "the zombie must be fenced by the marker's epoch";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 2) << "the zombie batch was appended after the abort marker";
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "the zombie opened a txn that never closes (LSO pinned)";
+}
+
+TEST(TxnFenceRegression, MarkerEpochFenceSurvivesBecomeLeader) {
+    // I3: a follower REPLICATES the txn batch and the fence-abort marker (it
+    // never saw the marker op).  Promoted, its producer state is rebuilt from
+    // the log inside the RC build — and the control batch must apply as an
+    // epoch raise, so the zombie is refused 17 on the new leader too.
+    LegacyAcksRig R({1});
+    const int32_t e0 = R.r->epoch();
+    R.r->becomeFollower(e0 + 1, /*leaderId=*/2);
+    const auto data   = rebased(idemBatch(7, /*epoch=*/0, /*seq=*/0, /*txn=*/true), 0);
+    const auto marker = rebased(tx::ControlMarker::build(7, /*epoch=*/1, tx::ControlType::Abort, 0), 1);
+    refetch(*R.r, concat({data, marker}), /*leaderHw=*/2);
+    ASSERT_EQ(R.r->log()->logEndOffset(), 2) << "precondition: both batches replicated";
+    R.r->becomeLeader(e0 + 2, {1});
+    ASSERT_TRUE(runUntilRcReady(R)) << "precondition: the new leader's RC / producer state is built";
+    produceLegacy(R, 2, 0, 7, /*zombie epoch=*/0, /*seq=*/1, true);
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, kInvalidProducerEpoch) << "the replicated marker's epoch was not applied on rebuild";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 2);
+}
+
+TEST(TxnFenceRegression, GatewayPathDuplicateDedupedByWorker) {
+    // I6: the SAME idempotent batch routed twice to the owning worker (no
+    // gateway check in front of it) is appended once; the retry is answered
+    // with the original offset.  Default (Legacy) config.
+    LegacyAcksRig R({1});
+    const auto b = idemBatch(11, 0, 0);
+    ASSERT_TRUE(R.w().tryEnqueueOp(routedIdemOp(R.r, R.sid, 21, b, 11, 0)));
+    ASSERT_TRUE(R.w().tryEnqueueOp(routedIdemOp(R.r, R.sid, 22, b, 11, 0)));
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the retried batch was appended twice";
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[0].code, 0);
+    EXPECT_EQ(R.answers[1].code, 0);
+    EXPECT_EQ(R.answers[1].base, R.answers[0].base) << "the duplicate is answered with the original offset";
+}
+
+TEST(TxnFenceRegression, LegacyModeDedupWithoutGatewayMirror) {
+    // I6 / Q3: no gateway PSM mirror for a worker-owned partition in any mode —
+    // the worker alone dedups a gateway-received retry.
+    LegacyAcksRig R({1});
+    produceLegacy(R, 1, 0, 11, 0, 0);
+    R.runWorker();
+    produceLegacy(R, 2, 0, 11, 0, 0);                         // the client's retry
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1);
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, 0);
+    EXPECT_EQ(R.answers[1].base, 0);
+    EXPECT_EQ(R.gw.producerStateManagerForTest().size(), 0u)
+        << "the gateway still mirrors producer state for a worker-owned partition (two authorities)";
+}
+
+TEST(WorkerPsmRegression, PipelinedSeqKPlus1BeforeSeqKResultDrainsIsAccepted) {
+    // Re-review 1 minor 6: seq k+1 reaches validation before seq k's result
+    // drained back to the gateway.  With the worker psm_ the validation runs
+    // on the appending thread, in op order — no window.
+    for (uint8_t acks : {uint8_t{0}, uint8_t{1}}) {
+        LegacyAcksRig R({1});
+        produceLegacy(R, 1, acks, 7, 0, 0);
+        produceLegacy(R, 2, acks, 7, 0, 1);                   // no worker pass in between
+        for (int i = 0; i < 8 && R.answers.size() < 2; ++i) R.runWorker();
+        ASSERT_EQ(R.answers.size(), 2u) << "acks=" << int(acks);
+        EXPECT_EQ(R.answers[0].code, 0) << "acks=" << int(acks);
+        EXPECT_EQ(R.answers[1].code, 0) << "seq 1 refused (20 = OutOfOrderSequence), acks=" << int(acks);
+        EXPECT_EQ(R.r->log()->logEndOffset(), 2) << "acks=" << int(acks);
+    }
+}
+
+TEST(WorkerPsmRegression, AcksAllDuplicateAnsweredOnlyWhenTheOriginalCommits) {
+    // Kafka parity (re-review 1 I1 residual): a retry of an acks=all batch
+    // whose original is still below the HW is answered only when the original
+    // commits — never OK for data that is not on the ISR yet.
+    LegacyAcksRig R({1, 2});
+    produceLegacy(R, 1, /*acks=all*/1, 7, 0, 0);
+    R.runWorker();
+    ASSERT_TRUE(R.answers.empty()) << "precondition: the original is parked on the HW";
+    produceLegacy(R, 2, 1, 7, 0, 0);                          // the client's retry
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "one copy";
+    EXPECT_TRUE(R.answers.empty()) << "the duplicate was answered OK before its original reached the HW";
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.size() < 2; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    for (const auto& a : R.answers) { EXPECT_EQ(a.code, 0); EXPECT_EQ(a.base, 0); }
+}
+
+TEST(WorkerPsmRegression, AcksAllDuplicateOfTruncatedOriginalNeverOk) {
+    // The original is parked, the leader is demoted (its waiter fails
+    // NotLeader) and the follower log truncates under it: the retry on the
+    // re-promoted leader must be APPENDED — never a duplicate-OK pointing at an
+    // offset that now holds other data.  The producer state is rebuilt from
+    // the surviving log (the RC build), not kept from the old leadership.
+    LegacyAcksRig R({1, 2});
+    produceLegacy(R, 1, 1, 7, 0, 0);
+    R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    const int32_t e0 = R.r->epoch();
+    R.r->becomeFollower(e0 + 1, 2);
+    for (int i = 0; i < 4 && R.answers.empty(); ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    ASSERT_EQ(R.answers[0].code, kNotLeader) << "precondition: the parked original failed";
+    truncateTo(*R.r, 0);
+    ASSERT_EQ(R.r->log()->logEndOffset(), 0) << "precondition: truncated";
+    refetch(*R.r, batchAt(0), /*leaderHw=*/1);                // another producer's data at offset 0
+    ASSERT_EQ(R.r->log()->logEndOffset(), 1);
+    R.r->becomeLeader(e0 + 2, {1});
+    ASSERT_TRUE(runUntilRcReady(R));
+    produceLegacy(R, 2, 1, 7, 0, 0);                          // the client's retry
+    for (int i = 0; i < 8 && R.answers.size() < 2; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].code, 0);
+    EXPECT_EQ(R.answers[1].base, 1) << "the retry was answered duplicate-OK at offset 0 (another producer's data)";
+    EXPECT_EQ(R.r->log()->logEndOffset(), 2);
+}
+
+TEST(WorkerPsmRegression, StrictRetryAfterDemotionMidFsyncIsNeverDuplicateOk) {
+    // Re-review 2: a Strict batch whose fsync completes after the leader was
+    // demoted is failed NotLeader; its retry must not be answered
+    // duplicate-OK (the new leader may truncate that data).
+    LegacyAcksRig R({1}, /*tier=*/2);
+    R.w().setReapPausedForTest(true);
+    produceLegacy(R, 1, 0, 7, 0, 0);
+    R.runWorker();
+    ASSERT_EQ(R.w().durablePendingCountForTest(), 1u) << "precondition: parked on its fsync";
+    R.r->becomeFollower(R.r->epoch() + 1, 2);
+    R.w().setReapPausedForTest(false);
+    for (int i = 0; i < kCap && R.answers.empty(); ++i) { R.runWorker(); std::this_thread::yield(); }
+    ASSERT_EQ(R.answers.size(), 1u);
+    ASSERT_EQ(R.answers[0].code, kNotLeader) << "precondition: demoted mid-fsync";
+    produceLegacy(R, 2, 0, 7, 0, 0);                          // the client's retry
+    for (int i = 0; i < kCap && R.answers.size() < 2; ++i) { R.runWorker(); std::this_thread::yield(); }
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_NE(R.answers[1].code, 0) << "a retry was answered duplicate-OK by a demoted leader";
+}
+
+TEST(WorkerPsmRegression, PipelinedStrictAnswersKeepTheirOrder) {
+    // Re-review 2 minor: answers of pipelined Strict batches of ONE partition
+    // leave in sequence order — durablePending_ removal is order-preserving.
+    LegacyAcksRig R({1}, /*tier=*/2);
+    R.w().setReapPausedForTest(true);
+    produceLegacy(R, 1, 0, 7, 0, 0);
+    R.runWorker();                                            // seq 0: fsync T1 submitted
+    produceLegacy(R, 2, 0, 7, 0, 1);
+    produceLegacy(R, 3, 0, 7, 0, 2);
+    R.runWorker();                                            // seq 1, 2: fsync T2 submitted
+    ASSERT_EQ(R.w().durablePendingCountForTest(), 3u);
+    R.w().setReapPausedForTest(false);
+    for (int i = 0; i < kCap && R.answers.size() < 3; ++i) { R.runWorker(); std::this_thread::yield(); }
+    ASSERT_EQ(R.answers.size(), 3u);
+    for (std::size_t k = 0; k < 3; ++k) {
+        EXPECT_EQ(R.answers[k].code, 0);
+        EXPECT_EQ(R.answers[k].corr, static_cast<int64_t>(k + 1)) << "answer " << k << " out of sequence order";
+    }
+}
+
+// ---- X-1: AddOffsetsToTxn opens a transaction (Kafka) ----------------------
+namespace {
+int16_t addOffsets(TxnRig& T, std::string_view group) {
+    pc::AddOffsetsToTxn q; q.sessionId = 1; q.correlationId = ++T.corr; q.producerId = T.pid;
+    q.producerEpoch = T.epoch; q.transactionalId = T.tid();
+    q.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
+    const auto n = T.tcs->handleAddOffsets(f.data(), f.size(), 1, T.out.data(), T.out.size());
+    auto r = pc::AddOffsetsToTxnResponse::decode(T.out.data(), n);
+    return r ? r->errorCode : int16_t{-1};
+}
+int16_t txnOffsetCommit(TxnRig& T, std::string_view group, int64_t offset) {
+    pc::TxnOffsetCommit q; q.sessionId = 1; q.correlationId = ++T.corr; q.producerId = T.pid;
+    q.producerEpoch = T.epoch; q.transactionalId = T.tid();
+    q.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    const pc::TxnOffsetCommitEntry e{0, 0, offset, {}};
+    const std::span<const pc::TxnOffsetCommitEntry> es(&e, 1);
+    std::vector<uint8_t> f(pc::TxnOffsetCommit::encodedSizeFor(q.transactionalId, q.groupId, es));
+    q.encode(f.data(), es);
+    const auto n = T.tcs->handleTxnOffsetCommit(f.data(), f.size(), 1, T.out.data(), T.out.size());
+    auto r = pc::TxnOffsetCommitResponse::decode(T.out.data(), n);
+    if (!r) return -1;
+    for (const auto& pr : r->results) return pr.errorCode;
+    return -1;
+}
+} // namespace
+
+TEST(TxnAddOffsetsRegression, AddOffsetsFirstTxnCommits) {
+    // The client sends AddOffsets as soon as sendOffsetsToTransaction is
+    // applied — often BEFORE the first AddPartitions.  Kafka: Empty → Ongoing.
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    EXPECT_EQ(addOffsets(T, "g"), 0) << "AddOffsets before AddPartitions refused (consume-transform-produce aborts)";
+    EXPECT_EQ(txnOffsetCommit(T, "g", 5), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    T.m.runWorker(2);
+    EXPECT_EQ(T.endTxn(/*commit=*/true), 999) << "deferred until the marker lands";
+    T.runUntilNoMarkerAwaited(10);
+    const auto err = T.endTxnFrameError(0);
+    ASSERT_TRUE(err.has_value()) << "the EndTxn response was never sent";
+    EXPECT_EQ(*err, 0);
+    EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 1u) << "the transaction never completed";
+}
+
+TEST(TxnAddOffsetsRegression, OffsetsOnlyTxnCommits) {
+    // A transaction that only commits consumer offsets (no produce): AddOffsets
+    // opens it, TxnOffsetCommit records the offsets, EndTxn commits it.
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(addOffsets(T, "g"), 0) << "an offsets-only txn can never start";
+    ASSERT_EQ(txnOffsetCommit(T, "g", 9), 0);
+    EXPECT_EQ(T.endTxn(/*commit=*/true), 0) << "no partitions: no marker to await";
+    EXPECT_EQ(T.tcs->transactionsCompletedForTest(), 1u) << "the transaction never completed";
+}
+
+TEST(TxnAddOffsetsRegression, AddOffsetsWhilePreparingIsConcurrentTransactions) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    T.m.runWorker(2);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "precondition: PrepareCommit, marker in flight";
+    EXPECT_EQ(addOffsets(T, "g"), kConcurrent) << "AddOffsets on a txn in Prepare* must be retriable 27";
+}
+
+// ============================================================================
+// F15 S5 fix round 1 (task review): M-1, M-2, M-3.
+// ============================================================================
+TEST(WorkerPsmRegression, StrictAnswersInParkOrderWhenFsyncsCompleteOutOfOrder) {
+    // M-1 (fix round 1), closed structurally by M-6 (fix round 2): two
+    // coalesced fsyncs on one log could complete out of order and answer seq 1
+    // before seq 0.  Now seq 1's fsync is not submitted until seq 0's completed
+    // (one in flight per log): completions are in submit order and the answers
+    // leave in park order.
+    LegacyAcksRig R({1}, /*tier=*/2);
+    R.w().setReapPausedForTest(true);
+    R.produce(1, /*acks=leader*/0, batchAt(0));
+    R.runWorker();                                            // seq 0 appended, fsync T1 submitted
+    R.produce(2, 0, batchAt(0));
+    R.runWorker();                                            // seq 1 appended, its fsync waits behind T1
+    ASSERT_EQ(R.w().durablePendingCountForTest(), 2u);
+    const CompletionToken t1 = R.w().durablePendingTokenForTest(0);
+    ASSERT_NE(t1, kNoToken);
+    ASSERT_EQ(R.w().durablePendingTokenForTest(1), kNoToken) << "a second fsync in flight on the same log";
+    auto drain = [&] { R.w().drainReturn([&](WorkerReturn ret) { R.gw.handleWorkerReturnForTest(ret); }); };
+    R.w().deliverCompletionForTest(FlushCompletion{t1, 0, R.r->log()->flushBoundary()});
+    drain();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].corr, 1);
+    R.runWorker();                                            // T2 submitted now
+    const CompletionToken t2 = R.w().durablePendingTokenForTest(0);
+    ASSERT_NE(t2, kNoToken);
+    ASSERT_NE(t2, t1);
+    R.w().deliverCompletionForTest(FlushCompletion{t2, 0, R.r->log()->flushBoundary()});
+    drain();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[1].corr, 2);
+    for (const auto& a : R.answers) EXPECT_EQ(a.code, 0);
+    // The real completions (reaped later) fire nothing more.
+    R.w().setReapPausedForTest(false);
+    const uint64_t reaped = R.w().ioCompletionsReapedForTest();
+    for (int i = 0; i < kCap && R.w().ioCompletionsReapedForTest() < reaped + 2; ++i) { R.runWorker(); std::this_thread::yield(); }
+    EXPECT_EQ(R.answers.size(), 2u) << "a real completion fired an answer twice";
+}
+
+TEST(WorkerPsmRegression, MemoryLogPromotionClearsStaleProducerState) {
+    // M-2: a memory-backed partition goes Unbuilt → Ready without a scan.  Its
+    // producer state from an earlier leadership must not survive that edge (a
+    // retry could be answered duplicate-OK at an offset that now holds other
+    // data); cleared, the retry is appended again (never a false OK).
+    rune::storage::InMemoryLog mlog(1 << 20, 10000);
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &mlog, &t);
+    Worker w(0, 1 << 16, 1 << 16, 16, 16);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.doWork(1);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady) << "precondition: memory log Ready at once";
+    w.psmForTest().update(1, /*pid=*/7, 0, /*epoch=*/0, /*baseSeq=*/0, /*lastSeq=*/0, /*baseOffset=*/0);
+    ASSERT_NE(w.psmForTest().entry(1, 7, 0), nullptr);
+    rep.becomeFollower(2, /*leader=*/2);                      // a follower period (log may change under it)
+    w.doWork(2);
+    rep.becomeLeader(3, {1});
+    w.doWork(3);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady) << "precondition: re-promoted, Ready again";
+    EXPECT_EQ(w.psmForTest().entry(1, 7, 0), nullptr)
+        << "the memory-log promotion kept producer state from the earlier leadership";
+}
+
+namespace {
+std::vector<uint8_t> corrupted(std::vector<uint8_t> b) {
+    b.back() ^= 0x5A;                                         // inside the CRC-covered region
+    return b;
+}
+} // namespace
+
+TEST(WorkerPsmRegression, CorruptBatchRejectedOnTheWorkerPoolGatewayPath) {
+    // M-3: default config (worker pool): a corrupt-CRC produce received by the
+    // gateway is answered Internal and never appended.
+    LegacyAcksRig R({1});
+    R.produce(1, /*acks=leader*/0, corrupted(batchAt(0)));
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, static_cast<int16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0) << "a corrupt batch was appended";
+}
+
+TEST(WorkerPsmRegression, CorruptBatchOnAnUnvalidatedOpIsRejectedByTheWorker) {
+    // M-3: the worker skips its CRC pass ONLY for an op whose producer says it
+    // validated the bytes (the gateway).  Any other op producer — a test rig, a
+    // future forward / retry queue — gets the worker's own check.
+    LegacyAcksRig R({1});
+    WorkerOp op = routedIdemOp(R.r, R.sid, 1, corrupted(batchAt(0)), /*pid=*/-1, /*seq=*/-1);
+    ASSERT_FALSE(op.crcValidated) << "precondition: not validated by its producer";
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(op)));
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, static_cast<int16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0) << "the worker appended a corrupt batch from an unvalidated op";
+}
+
+TEST(OrderedWaitQueueRegression, ParkOrderKeptFrontFireIsO1AndTombstonesNeverGrowTheRing) {
+    // I-1: the parked-waiter container keeps park order across middle removals,
+    // pops a fired front without moving survivors, and — with live entries
+    // within the reservation — never allocates (compaction reclaims tombstones).
+    OrderedWaitQueue<int> q;
+    q.reserve(64);
+    const std::size_t slots = q.capacitySlots();
+    for (int i = 0; i < 10; ++i) q.push_back(int{i});
+    EXPECT_EQ(q.sweep([](int v) { return v == 0 || v == 5 || v == 7; }), 3u);
+    std::vector<int> seen;
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, (std::vector<int>{1, 2, 3, 4, 6, 8, 9}));
+    EXPECT_EQ(q.size(), 7u);
+    EXPECT_EQ(q.at(4), 6);
+    // An old entry (1) never fires while thousands behind it do: tombstones
+    // accumulate behind it, compaction reclaims them, the ring never grows.
+    int next = 10;
+    for (int round = 0; round < 2000; ++round) {
+        for (int k = 0; k < 8; ++k) q.push_back(int{next++});
+        (void)q.sweep([](int v) { return v >= 10; });
+    }
+    EXPECT_EQ(q.growths(), 0u) << "the ring grew although live entries stayed within the reservation";
+    EXPECT_GT(q.compactions(), 0u);
+    EXPECT_EQ(q.capacitySlots(), slots);
+    seen.clear();
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, (std::vector<int>{1, 2, 3, 4, 6, 8, 9})) << "order lost across compactions";
+    EXPECT_EQ(q.sweep([](int) { return true; }), 7u);
+    EXPECT_TRUE(q.empty());
+}
+
+// ============================================================================
+// F15 S5 fix round 2 (re-review 1): M-6, I-2, N-2.
+// ============================================================================
+TEST(WorkerPsmRegression, OneDurableFsyncInFlightPerLogSoAnErrorReachesEveryWaiter) {
+    // M-6: two concurrent fdatasyncs on one log file — a writeback error is
+    // reported once per open file (errseq), so the fsync that sees it (T1) can
+    // fail while the other (T2) succeeds — and T2's success would answer OK for
+    // pages whose writeback failed.  One fsync in flight per log: seq 1 waits
+    // un-submitted behind T1, and T1's error fails BOTH, never OK.
+    LegacyAcksRig R({1}, /*tier=*/2);
+    R.w().setReapPausedForTest(true);
+    R.produce(1, /*acks=leader*/0, batchAt(0));
+    R.runWorker();
+    const CompletionToken t1 = R.w().durablePendingTokenForTest(0);
+    ASSERT_NE(t1, kNoToken);
+    R.produce(2, 0, batchAt(0));
+    R.runWorker();
+    ASSERT_EQ(R.w().durablePendingCountForTest(), 2u);
+    const CompletionToken t2 = R.w().durablePendingTokenForTest(1);
+    auto drain = [&] { R.w().drainReturn([&](WorkerReturn ret) { R.gw.handleWorkerReturnForTest(ret); }); };
+    if (t2 != kNoToken) {                                     // a concurrent fsync that did not see the EIO
+        R.w().deliverCompletionForTest(FlushCompletion{t2, 0, R.r->log()->flushBoundary()});
+        drain();
+    }
+    R.w().deliverCompletionForTest(FlushCompletion{t1, EIO, R.r->log()->flushBoundary()});
+    drain();
+    EXPECT_EQ(t2, kNoToken) << "a second durable fsync was in flight on the same log";
+    ASSERT_EQ(R.answers.size(), 2u);
+    for (const auto& a : R.answers)
+        EXPECT_NE(a.code, 0) << "corr " << a.corr << " answered OK although the log's fsync failed";
+}
+
+TEST(OrderedWaitQueueRegression, StalledFrontKeepsTheWalkedSpanBoundedByLiveEntries) {
+    // I-2: one waiter that never fires (a lagging follower) pins the head;
+    // another partition keeps parking and firing behind it.  Every pass must
+    // walk O(live) slots — the span (live + tombstones) stays <= 1.5·live + slack
+    // — and the ring never grows.
+    OrderedWaitQueue<int> q;
+    q.reserve(Worker::kMaxOwedReturns);
+    const std::size_t slots = q.capacitySlots();
+    q.push_back(-1);                                          // the stalled front waiter
+    int next = 0;
+    std::size_t maxSpan = 0;
+    for (int pass = 0; pass < 20'000; ++pass) {
+        for (int k = 0; k < 16; ++k) q.push_back(int{next++});
+        (void)q.sweep([](int v) { return v >= 0 && (v & 1) == 0; });   // half of each pass fires
+        (void)q.sweep([&](int v) { return v >= 0 && v < next - 64; });  // older ones fire later
+        if (q.spanForTest() > maxSpan) maxSpan = q.spanForTest();
+    }
+    const std::size_t bound = q.size() + q.size() / 2 + OrderedWaitQueue<int>::kSlack + 16;
+    EXPECT_LE(maxSpan, 65 + 65 / 2 + OrderedWaitQueue<int>::kSlack + 16)   // 1.5·live + slack (+ a pass's pushes)
+        << "the walked span grew with the tombstones behind the stalled front (not with live entries)";
+    EXPECT_LE(q.spanForTest(), bound);
+    EXPECT_EQ(q.growths(), 0u);
+    EXPECT_EQ(q.capacitySlots(), slots);
+    EXPECT_EQ(q.at(0), -1) << "the stalled front kept its place";
+}
+
+TEST(OrderedWaitQueueRegression, CompactionWithAWrappedWindowKeepsOrder) {
+    // N-2: advance the head past the middle of the ring, wrap the window
+    // physically, tombstone the middle and compact (eager and full-ring).
+    OrderedWaitQueue<int> q;
+    q.reserve(16);                                            // a small ring: pow2(1.5·16 + slack) = 128 slots
+    const std::size_t slots = q.capacitySlots();
+    int next = 0;
+    std::vector<int> expect;
+    for (std::size_t i = 0; i < slots / 2 + 8; ++i) q.push_back(int{next++});
+    (void)q.sweep([&](int v) { return v < static_cast<int>(slots / 2) + 4; });   // head moves past mid-ring
+    ASSERT_GT(q.headForTest() & (slots - 1), slots / 2) << "precondition: head beyond the middle";
+    for (int v = static_cast<int>(slots / 2) + 4; v < next; ++v) expect.push_back(v);
+    while (q.spanForTest() < slots) { expect.push_back(next); q.push_back(int{next++}); }   // window wraps physically
+    ASSERT_EQ(q.spanForTest(), slots) << "precondition: the ring is full with a wrapped window";
+    // Tombstone the middle (every third entry after the head), then push into the full ring.
+    (void)q.sweep([&](int v) { return v % 3 == 0 && v > expect.front(); });
+    std::vector<int> kept;
+    for (int v : expect) if (!(v % 3 == 0 && v > expect.front())) kept.push_back(v);
+    for (int k = 0; k < 8; ++k) { kept.push_back(next); q.push_back(int{next++}); }
+    std::vector<int> seen;
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, kept) << "order lost compacting a wrapped window";
+    EXPECT_EQ(q.growths(), 0u);
+    EXPECT_GT(q.compactions(), 0u);
+}
+
+TEST(OrderedWaitQueueRegression, CompactionRebasesTheWindowToSlotZero) {
+    // N-8: a compaction whose survivors fit in front of the head's physical
+    // slot (no physical wrap) moves the window back to slot 0, in order.
+    OrderedWaitQueue<int> q;
+    q.reserve(1000);                                          // pow2(1.5·1000 + 64) = 2048 slots
+    ASSERT_EQ(q.capacitySlots(), 2048u);
+    for (int v = 0; v < 1500; ++v) q.push_back(int{v});
+    (void)q.sweep([](int v) { return v < 1400; });            // head at physical 1400; 100 live, span 100
+    ASSERT_EQ(q.headForTest(), 1400u);
+    ASSERT_EQ(q.compactions(), 0u);
+    // Remove 80 from the middle: live 20, span 100 > 1.5·20 + 64 = 94 → compaction.
+    (void)q.sweep([](int v) { return v > 1400 && v < 1481; });
+    ASSERT_EQ(q.compactions(), 1u);
+    EXPECT_EQ(q.headForTest(), 0u) << "the compacted window was not rebased to slot 0";
+    EXPECT_EQ(q.spanForTest(), 20u);
+    std::vector<int> seen, expect{1400};
+    for (int v = 1481; v < 1500; ++v) expect.push_back(v);
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, expect) << "order lost across the rebase";
+    q.push_back(int{1500});                                    // keeps appending after the rebase
+    EXPECT_EQ(q.at(20), 1500);
+    EXPECT_EQ(q.growths(), 0u);
 }

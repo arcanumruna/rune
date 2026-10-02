@@ -132,6 +132,21 @@ public:
         return send(channel, stream, buf.data(), buf.size());
     }
 
+    /// An idempotent produce (F15 S5 e2e): producer id / epoch / sequence on the wire.
+    bool produceIdempotent(const std::string& channel, int32_t stream, int64_t sessionId, int64_t corr,
+                           int32_t topicId, int32_t partition, uint8_t acks, int64_t producerId,
+                           int16_t producerEpoch, int32_t baseSequence, const std::vector<uint8_t>& batch) {
+        pc::Produce msg;
+        msg.sessionId = sessionId; msg.correlationId = corr;
+        msg.topicId = topicId; msg.partition = partition; msg.partitionKnown = 1;
+        msg.acks = acks; msg.producerId = producerId; msg.producerEpoch = producerEpoch;
+        msg.baseSequence = baseSequence;
+        msg.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> buf(msg.encodedSize());
+        msg.encode(buf.data());
+        return send(channel, stream, buf.data(), buf.size());
+    }
+
     std::optional<pc::ProduceResponse> awaitProduceResponse(int64_t corr) {
         for (int i = 0; i < kMaxIters; ++i) {
             poll_();

@@ -167,25 +167,19 @@ struct WorkerHarness {
     }
 
     // Drain the return ring; update lastReturn and totalReturns.
-    // Returns number of returns drained in this call.
-    // Counts produce ANSWERS only: F15 S2 fix round 1 adds an append-time
-    // facts-only ProduceResult (deferAck == true, TEMPORARY until S4/S5) for a
-    // parked (Strict / acks=all) gateway-routed produce — gateway-mirror
-    // bookkeeping, not an ack.  Counted separately in factsReturns.
+    // Returns number of returns drained in this call.  Every ProduceResult is
+    // an answer (F15 S5 deleted the append-time facts-only return).
     int drainReturns() {
         int count = 0;
         worker->drainReturn([&](WorkerReturn ret) {
-            if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) {
-                if (ret.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
-                else { ++factsReturns; return; }
-            }
+            if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck)
+                ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
             lastReturn = ret;
             ++totalReturns;
             ++count;
         });
         return count;
     }
-    int factsReturns = 0;
 
     ~WorkerHarness() {
         // worker dtor shuts down its IoBackend (joins flusher thread).
@@ -207,8 +201,6 @@ TEST(AsyncDurability, StrictProduceAcksOnlyAfterFlushCompletion) {
     h.worker->doWork(/*nowNs=*/1);
     EXPECT_EQ(h.drainReturns(), 0)
         << "Strict produce ack must wait for fsync completion — must not fire immediately";
-    EXPECT_EQ(h.factsReturns, 0)
-        << "Strict facts wait for the fsync (never applied for non-durable data)";
 
     // Spin doWork until the completion is reaped and the ack fires.
     int acks = 0;
@@ -218,7 +210,6 @@ TEST(AsyncDurability, StrictProduceAcksOnlyAfterFlushCompletion) {
     }
 
     ASSERT_EQ(acks, 1) << "Exactly one ProduceResult must be acked after flush completes";
-    EXPECT_EQ(h.factsReturns, 1) << "the facts-only return is emitted at fsync completion";
     EXPECT_EQ(h.lastReturn.errorCode, 0) << "Successful fsync must yield errorCode == OK";
     EXPECT_EQ(h.lastReturn.lastOffset, 3)
         << "lastOffset must be base(0) + lastOffsetDelta(3) = 3 for 4 records";
@@ -472,10 +463,8 @@ TEST(AsyncDurability, SubmitRingFullHoldsProduce) {
     int returned = 0;
     bool sawNonOk = false;
     auto drainFn = [&](WorkerReturn ret) {
-        if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck) {
-            if (ret.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
-            else return;                                                          // facts-only, not an ack
-        }
+        if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck)
+            ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
         ++returned;
         if (ret.errorCode != 0) sawNonOk = true;
     };

@@ -472,10 +472,11 @@ size_t TransactionCoordinationService::handleAddOffsets(
     // We pass an empty offsets map here — the group binding is what matters.
     // AddOffsetsToTxn is a "register intent" call; offsets arrive in TxnOffsetCommit.
     // Reuse offsetsScratch_ cleared as the empty map — no per-call map alloc.
+    // X-1: AddOffsetsToTxn opens the transaction from Empty / Complete* (Kafka).
     offsetsScratch_.clear();
     const auto result = coordinator_.addOffsetsToTxn(
         txnIdScratch_, msg.producerId, msg.producerEpoch,
-        groupIdScratch_, offsetsScratch_, nowNs);
+        groupIdScratch_, offsetsScratch_, nowNs, /*beginsTxn=*/true);
 
     // Persist before responding (pass the real coordinatorEpoch, not literal 0).
     if (result.ok()) {

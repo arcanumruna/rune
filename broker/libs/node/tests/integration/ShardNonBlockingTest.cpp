@@ -110,18 +110,15 @@ std::vector<uint8_t> produceFrame(int64_t corr, const std::vector<uint8_t>& batc
     msg.encode(frame.data());
     return frame;
 }
-// Produce ANSWERS only.  F15 S2 fix round 1: a parked gateway-routed produce
-// also emits an append-time facts-only ProduceResult (deferAck == true, TEMPORARY
-// until S4/S5) — gateway-mirror bookkeeping, not an answer to the client.
+// Produce answers (F15 S5: every ProduceResult is an answer — the S2
+// append-time facts-only return is deleted; one is a failure).
 struct Acks {
     int n = 0;
-    int facts = 0;
     std::vector<WorkerReturn> rets;
     int drain(Worker& w) {
         return static_cast<int>(w.drainReturn([&](WorkerReturn r) {
             if (r.type != WorkerReturn::Type::ProduceResult) return;
-            if (r.deferAck && r.errorCode == 0) { ++facts; return; }
-            if (r.deferAck) ADD_FAILURE() << "an error result carries deferAck (would be swallowed as facts-only)";
+            if (r.deferAck) ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
             ++n; rets.push_back(r);
         }));
     }
@@ -457,9 +454,16 @@ TEST(NonShardNonBlockingRegression, TxnMarkerAppendIsAsyncInThreadPlacementRegre
     s.w.doWork(1);
     EXPECT_GT(s.log->logEndOffset(), 0) << "the marker was appended";
     EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "the marker append must not fsync inline on a worker";
-    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 1u) << "its durability is a background io token";
-    for (int i = 0; i < kCap && s.w.bgFlushInFlightForTest() > 0; ++i) { s.w.doWork(2); std::this_thread::yield(); }
+    // Its durability is an io token — since the F15 S5 merge (M-6: one fsync in
+    // flight per log) the pass's coalesced durable fsync, which also serves the
+    // deferred background request (same as the shard-mode twin below).
+    EXPECT_EQ(s.w.ioSubmitCountForTest(), 1u) << "its durability is the pass's durable io token";
+    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 0u) << "a background fsync concurrent with the durable one";
+    for (int i = 0; i < kCap && s.w.lastSyncedLeoForTest(s.log.get()) < s.log->logEndOffset(); ++i) {
+        s.w.doWork(2); std::this_thread::yield();
+    }
     EXPECT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), s.log->logEndOffset());
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u);
 }
 
 TEST(ShardNonBlockingRegression, TxnMarkerAppendIsAsyncInShardMode) {
@@ -474,9 +478,20 @@ TEST(ShardNonBlockingRegression, TxnMarkerAppendIsAsyncInShardMode) {
     s.w.doWork(1);
     EXPECT_GT(s.log->logEndOffset(), 0) << "the marker was appended";
     EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "the marker append must not fsync inline on the shard loop";
-    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 1u) << "its durability is a background io token";
-    for (int i = 0; i < kCap && s.w.bgFlushInFlightForTest() > 0; ++i) { s.w.doWork(2); std::this_thread::yield(); }
+    // Its durability is an io token: the coalesced durable fsync (F15 S5 fix
+    // round 2, M-6: one fsync in flight per log — the follower-flush background
+    // request is served by it, never concurrent with it).
+    // M-8 (re-review 2): exactly ONE fsync — the coalesced durable one; the
+    // replica's follower-flush background request (pass step 4b) is deferred
+    // behind it and served by it, never submitted concurrently.
+    EXPECT_EQ(s.w.ioSubmitCountForTest(), 1u) << "its durability is the pass's durable io token";
+    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 0u) << "a background fsync concurrent with the durable one";
+    for (int i = 0; i < kCap && s.w.lastSyncedLeoForTest(s.log.get()) < s.log->logEndOffset(); ++i) {
+        s.w.doWork(2); std::this_thread::yield();
+    }
     EXPECT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), s.log->logEndOffset());
+    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 0u) << "the deferred background request was served by the durable fsync";
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u);
 }
 
 // ============================================================================
@@ -484,49 +499,114 @@ TEST(ShardNonBlockingRegression, TxnMarkerAppendIsAsyncInShardMode) {
 // ============================================================================
 
 TEST(ShardNonBlockingRegression, BackgroundFlushCompletionNeverFiresProduceAck) {
-    TmpDir d;
+    // Token routing: a background token's completion is retired by routing and
+    // never reaches produce-ack matching — even while a STAMPED durable entry is
+    // parked (M-8, re-review 2: on a second log, since one log never has a
+    // background and a durable fsync in flight together since F15 S5 M-6).
+    TmpDir d, d2;
     Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
     NullTransport t;
     PartitionReplica leader(cfg(1, /*tier=*/2), Role::Leader, 1, {1}, {1}, &log, &t);
+    auto c2 = cfg(1, /*tier=*/2); c2.partitionId = 1;
+    PartitionReplica leader2(c2, Role::Leader, 1, {1}, {1}, &log2, &t);
     Worker w(0, 1 << 16, 1 << 16, 64, 64);
-    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setOwnedDirect(Worker::OwnedSet{&leader, &leader2});
     WorkerOp op;
-    op.type = WorkerOp::Type::Produce; op.topicId = 1; op.partition = 0;
-    op.replica = &leader; op.logPtr = &log; op.sessionId = 1; op.correlationId = 1;
+    op.type = WorkerOp::Type::Produce; op.topicId = 1; op.partition = 1;
+    op.replica = &leader2; op.logPtr = &log2; op.sessionId = 1; op.correlationId = 1;
     op.lastOffsetDelta = 0; op.recordCount = 1; op.durabilityTier = 2;
     op.recordBatchBytes = batchAt(0);
-    ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
     w.setReapPausedForTest(true);                          // only synthetic deliveries until unpaused
-    w.doWork(1);                                           // append + one coalesced submit (token T1)
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+    w.doWork(1);                                           // append on log2 + its durable submit (T1)
     const auto t1 = w.durablePendingTokenForTest(0);
-    ASSERT_NE(t1, kNoToken);
-    const auto t2 = w.submitBgFlushForTest(&log);          // a background flush on the SAME log
+    ASSERT_NE(t1, kNoToken) << "precondition: a STAMPED durable entry is parked";
+    const auto t2 = w.submitBgFlushForTest(&log);          // a background flush on log 1
     ASSERT_NE(t2, kNoToken);
     ASSERT_NE(t1, t2);
     Acks a;
     a.drain(w);
-    EXPECT_EQ(a.facts, 0) << "a gateway-routed Strict produce's facts wait for its fsync";
+    EXPECT_EQ(a.n, 0) << "a Strict produce's answer waits for its fsync";
     w.deliverCompletionForTest(FlushCompletion{t2, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 0) << "a background flush token must never fire a produce ack";
-    EXPECT_EQ(a.facts, 0) << "nor release the produce's facts";
     EXPECT_EQ(w.bgFlushInFlightForTest(), 0u) << "the background token is retired by routing";
-    w.deliverCompletionForTest(FlushCompletion{t1, 0, log.flushBoundary()});
+    EXPECT_EQ(w.durablePendingTokenForTest(0), t1) << "the stamped durable entry is untouched";
+    w.deliverCompletionForTest(FlushCompletion{t1, 0, log2.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 1);
-    EXPECT_EQ(a.facts, 1) << "the produce's own fsync completion emits its facts";
     EXPECT_EQ(w.durableAckTokenForTest(), t1);
     // The real completions for T1 and T2 arrive later through io_.reap: wait for
     // exactly those two (condition, capped) and prove neither fires anything.
     w.setReapPausedForTest(false);
     const uint64_t reapedBefore = w.ioCompletionsReapedForTest();
     for (int i = 0; i < kCap && w.ioCompletionsReapedForTest() < reapedBefore + 2; ++i) {
-        w.doWork(2 + i); a.drain(w); std::this_thread::yield();
+        w.doWork(3 + i); a.drain(w); std::this_thread::yield();
     }
     ASSERT_EQ(w.ioCompletionsReapedForTest(), reapedBefore + 2);
     a.drain(w);
     EXPECT_EQ(a.n, 1) << "late real completions for T1/T2 must be ignored";
     EXPECT_EQ(w.bgFlushErrorsForTest(), 0u);
+}
+
+// F15 S5 fix round 3 (re-review 2 I-3): a Strict waiter deferred behind an
+// in-flight background flush must not be deferred AGAIN by a background flush
+// re-armed in the meantime (sync-interval tick / follower flush): the durable
+// fsync goes next and serves the background request.  Bound: one in-flight
+// fsync + its own.
+TEST(ShardNonBlockingRegression, StrictWaiterIsNeverStarvedByRearmedBackgroundFlushes) {
+    StrictShard s;
+    s.w.setReapPausedForTest(true);
+    const auto b1 = s.w.submitBgFlushForTest(s.log.get());   // background fsync B1 in flight
+    ASSERT_NE(b1, kNoToken);
+    ASSERT_EQ(s.produce(1, batchAt(0), 0, 1), 1);           // Strict append while B1 is in flight
+    s.w.doWork(1);
+    ASSERT_EQ(s.w.durablePendingTokenForTest(0), kNoToken) << "precondition: deferred behind B1";
+    // A sync tick lands while B1 is in flight (LEO > bgLeo): background re-armed.
+    (void)s.w.submitBgFlushForTest(s.log.get());
+    Acks a;
+    for (int round = 0; round < 3; ++round) {
+        const uint64_t bgBefore = s.w.bgFlushSubmitsForTest();
+        const auto inflightBg = s.w.bgFlushInFlightForTest();
+        if (inflightBg == 0) break;
+        // retire whatever background token is in flight (B1 first)
+        s.w.deliverCompletionForTest(FlushCompletion{round == 0 ? b1 : s.w.lastBgTokenForTest(s.log.get()), 0,
+                                                     s.log->flushBoundary()});
+        s.w.doWork(2 + round);
+        a.drain(s.w);
+        if (s.w.durablePendingCountForTest() == 0 || s.w.durablePendingTokenForTest(0) != kNoToken) break;
+        EXPECT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore)
+            << "round " << round << ": a background flush was re-armed ahead of the waiting Strict fsync";
+    }
+    ASSERT_EQ(s.w.durablePendingCountForTest(), 1u);
+    EXPECT_NE(s.w.durablePendingTokenForTest(0), kNoToken)
+        << "the Strict fsync was not submitted on the pass after the in-flight background fsync completed";
+    EXPECT_EQ(s.w.bgFlushInFlightForTest(), 0u) << "a background fsync is in flight instead of the Strict one";
+}
+
+// F15 S5 fix round 3 (re-review 2 N-5): the one-in-flight gate belongs to the
+// LOG.  Purged and re-owned while its durable fsync is in flight, the log must
+// not get a second, concurrent fsync from the fresh slot.
+TEST(ShardNonBlockingRegression, ReownedLogKeepsItsInFlightFsyncGate) {
+    StrictShard s;
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0), 0, 1), 1);
+    s.w.doWork(1);
+    const auto t1 = s.w.durablePendingTokenForTest(0);
+    ASSERT_NE(t1, kNoToken) << "precondition: durable fsync T1 in flight";
+    s.w.setOwnedDirect(Worker::OwnedSet{});                  // purged (its waiter is failed)
+    s.w.setOwnedDirect(Worker::OwnedSet{s.leader.get()});   // re-owned: a fresh slot
+    Acks a;
+    s.w.doWork(2); a.drain(s.w);
+    ASSERT_EQ(s.produce(2, batchAt(0), 0, 3), 1);
+    s.w.doWork(3); a.drain(s.w);
+    ASSERT_EQ(s.w.durablePendingCountForTest(), 1u);
+    EXPECT_EQ(s.w.durablePendingTokenForTest(0), kNoToken)
+        << "a second fsync was submitted on the log while T1 (from before the re-own) is in flight";
+    s.w.deliverCompletionForTest(FlushCompletion{t1, 0, s.log->flushBoundary()});
+    s.w.doWork(4); a.drain(s.w);
+    EXPECT_NE(s.w.durablePendingTokenForTest(0), kNoToken) << "T1's completion released the gate";
 }
 
 TEST(ShardNonBlockingRegression, BackgroundFlushRequestedWhileInFlightIsResubmittedOnRetire) {
@@ -611,10 +691,16 @@ TEST(ShardNonBlockingRegression, StrictDuplicateIsParkedOnFsync) {
     s.w.doWork(2); a.drain(s.w);
     EXPECT_EQ(a.n, 0) << "a Strict duplicate must not be acked before the data is durable";
     EXPECT_EQ(s.w.durablePendingCountForTest(), 2u);
+    // F15 S5 fix round 2 (M-6): the retry's fsync waits behind T1 (one in
+    // flight per log) — it is submitted on the pass after T1 completes.
     s.w.deliverCompletionForTest(FlushCompletion{t1, 0, 0});
-    const auto t2 = s.w.durablePendingTokenForTest(0);
-    s.w.deliverCompletionForTest(FlushCompletion{t2, 0, 0});
     s.w.doWork(3); a.drain(s.w);
+    ASSERT_EQ(a.n, 1) << "the original answers on its own fsync";
+    const auto t2 = s.w.durablePendingTokenForTest(0);
+    ASSERT_NE(t2, kNoToken);
+    ASSERT_NE(t2, t1);
+    s.w.deliverCompletionForTest(FlushCompletion{t2, 0, 0});
+    s.w.doWork(4); a.drain(s.w);
     ASSERT_EQ(a.n, 2);
     for (const auto& r : a.rets) EXPECT_EQ(r.errorCode, 0);
 }
@@ -1936,10 +2022,9 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         ASSERT_EQ(w.reservedAckSlotsForTest(), 1) << "precondition: parked on the owning worker";
         std::vector<WorkerReturn> rets;
         w.drainReturn([&](WorkerReturn r) {
-            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
-            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
+            if (r.type == WorkerReturn::Type::ProduceResult) rets.push_back(std::move(r));
         });
-        ASSERT_TRUE(rets.empty()) << "only the append-time facts-only return before the move";
+        ASSERT_TRUE(rets.empty()) << "nothing answered before the move (F15 S5: no facts-only return)";
         R.reg.remove(5, 0);
         PartitionReplica* again = recreate ? R.add(5, 0) : nullptr;
         WorkerOp own;
@@ -1950,10 +2035,10 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u) << "freed";
         w.doWork(3);                                          // no read of the freed replica
         w.drainReturn([&](WorkerReturn r) {
-            // answers only (skip OwnershipAck and the append-time facts-only return)
+            // answers only (skip OwnershipAck)
             if (r.type != WorkerReturn::Type::ProduceResult) return;
-            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
-            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
+            if (r.deferAck) ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
+            rets.push_back(std::move(r));
         });
         EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
         ASSERT_EQ(rets.size(), 1u) << "recreate=" << recreate;
@@ -2867,4 +2952,54 @@ TEST(ProduceBatchLimitRegression, ReconcilePullOfSmallBatchesAboveOwnFrameComple
     EXPECT_EQ(trA.oversizedApplyRefused(), 0u)
         << "the survivor's reply exceeded the puller's own frame: reconcile can never complete";
     EXPECT_GT(deficient->logEndOffset(), 0) << "the pulled committed records must be applied";
+}
+
+// F15 S5 fix round 3 follow-up (re-review 3 M-9): S5 e69a215 submitted one
+// durable fsync PER PASS per log; pipelined Strict produces on one log filled
+// the io in-flight depth and the back-pressure branch answered healthy
+// produces Internal.  One fsync in flight per log (M-6) can never exhaust it.
+TEST(ShardNonBlockingRegression, PipelinedStrictOnOneLogNeverExhaustsIoDepth) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica leader(cfg(1, /*tier=*/2), Role::Leader, 1, {1}, {1}, &log, &t);
+    leader.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, /*ioSubmitDepth=*/2, /*ioComplDepth=*/2);
+    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setWorkerIngress(nullptr, true);
+    w.setShardMode(true);
+    w.setReapPausedForTest(true);                             // fsyncs complete, but are not reaped yet
+    Acks a;
+    for (int i = 0; i < 8; ++i) {                             // one Strict produce per pass
+        const auto f = produceFrame(i + 1, batchAt(0), 0, 1, 0);
+        ASSERT_EQ(w.handleIngressFrameForTest(f.data(), f.size(), i + 1), 1);
+        w.doWork(i + 1);
+        a.drain(w);
+    }
+    EXPECT_EQ(a.n, 0) << "a pipelined Strict produce was answered (Internal: io depth exhausted) before any fsync";
+    w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && a.n < 8; ++i) { w.doWork(100 + i); a.drain(w); std::this_thread::yield(); }
+    ASSERT_EQ(a.n, 8);
+    for (const auto& r : a.rets) EXPECT_EQ(r.errorCode, 0) << "corr " << r.correlationId;
+}
+
+// N-7 (re-review 3): a log re-owned while its fsync is in flight — that
+// fsync's completion unpins its segment (no leaked pin) and re-serves a
+// background request made meanwhile.
+TEST(ShardNonBlockingRegression, ReownedLogCompletionUnpinsAndReservesBackgroundRequest) {
+    StrictShard s;
+    s.w.setReapPausedForTest(true);
+    const auto b1 = s.w.submitBgFlushForTest(s.log.get());   // background fsync in flight (segment pinned)
+    ASSERT_NE(b1, kNoToken);
+    rune::storage::LogSegment* seg = s.log->activeSegmentForFlush();
+    ASSERT_EQ(seg->flushPins(), 1u);
+    s.w.setOwnedDirect(Worker::OwnedSet{});                  // purged ...
+    s.w.setOwnedDirect(Worker::OwnedSet{s.leader.get()});   // ... and re-owned: a fresh slot (gate seeded)
+    ASSERT_EQ(s.produce(1, batchAt(0), 0, 1), 1);           // newer data ...
+    const uint64_t bgBefore = s.w.bgFlushSubmitsForTest();
+    (void)s.w.submitBgFlushForTest(s.log.get());            // ... and a background request while B1 is in flight
+    ASSERT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore) << "precondition: coalesced behind B1 (bgAgain)";
+    s.w.deliverCompletionForTest(FlushCompletion{b1, 0, s.log->flushBoundary()});
+    EXPECT_EQ(seg->flushPins(), s.w.bgFlushInFlightForTest()) << "B1's segment pin leaked on the re-owned log";
+    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore + 1) << "the background request made meanwhile was not re-served";
 }
