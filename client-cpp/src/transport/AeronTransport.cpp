@@ -259,8 +259,12 @@ AeronTransport::OfferResult AeronTransport::offerToPub(aeron::ExclusivePublicati
     // ADMIN_ACTION(-3) are transient; PUBLICATION_CLOSED(-4) and
     // MAX_POSITION_EXCEEDED(-5) are permanent; a throw (e.g. a frame over the
     // publication's max message length) is permanent too.
-    auto verdict = [](int64_t pos) noexcept {
+    auto verdict = [this, &pub](int64_t pos) noexcept {
         if (pos > 0) return OfferResult::Accepted;
+        // FR: refused (arg = -position: 1 NOT_CONNECTED, 2 BACK_PRESSURED,
+        // 3 ADMIN_ACTION, 4 CLOSED, 5 MAX_POSITION) — throttled.
+        RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::ClientTransportRefused,
+                                  static_cast<uint32_t>(pub.streamId()), static_cast<uint16_t>(-pos));
         if (pos == aeron::PUBLICATION_CLOSED || pos == aeron::MAX_POSITION_EXCEEDED) {
             return OfferResult::Fatal;
         }

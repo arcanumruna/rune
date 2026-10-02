@@ -43,6 +43,7 @@
 #include <rune/client/detail/CpuAffinity.h>
 #include <rune/client/shard/ClientShard.h>
 
+#include "FrRun.h"
 #include "OpenLoopSchedule.h"
 
 #include <algorithm>
@@ -699,6 +700,8 @@ int runVerify(const Args& a) {
 
 int main(int argc, char** argv) {
     const Args a = parse(argc, argv);
+    // rune-fr: armed by RUNE_FR_ENABLE before any client thread; report on exit.
+    rune::bench::FrRun fr("gate-" + a.arm);
     try {
         if (a.arm == "verify") return runVerify(a);
         const int64_t cap = a.records > 0 ? a.records : 1;

@@ -158,7 +158,7 @@ if(aeron_FOUND)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     )
-    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog)
+    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr)
 
     # Linux CI portability: libuuid is needed on Linux but not macOS (no-op there).
     if(UNIX AND NOT APPLE)

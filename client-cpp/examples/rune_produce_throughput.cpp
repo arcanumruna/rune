@@ -43,6 +43,7 @@
 #include <rune_fr/FlightRecorder.h>
 
 #include "BenchEnv.h"
+#include "FrRun.h"
 #include "InvokerBench.h"
 
 #include <algorithm>
@@ -50,8 +51,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <csignal>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -60,41 +59,18 @@
 
 using namespace rune::client;
 
-// rune-fr lifecycle (mirrors the broker): configure ring + enable on RUNE_FR_ENABLE,
-// dump trace on SIGUSR1 / shutdown so the CLIENT is traced with the same recorder.
-static std::atomic<bool> g_frDump{false};
-static void frdumphandler(int) noexcept { g_frDump.store(true, std::memory_order_release); }
-static void frConfigure() {
-    std::uint64_t ringBytes = 128ull * 1024 * 1024;
-    if (const char* rb = std::getenv("RUNE_FR_RING_BYTES")) {
-        const std::uint64_t v = std::strtoull(rb, nullptr, 10);
-        if (v > 0) ringBytes = v;
-    }
-    rune_fr::Recorder::instance().configure(static_cast<size_t>(ringBytes));
-    if (std::getenv("RUNE_FR_ENABLE")) rune_fr::enable();
-}
-static void frReport(const std::string& tag) {
-    if (!rune_fr::isEnabled()) return;
-    rune_fr::Recorder::instance().drain();
-    const char* out = std::getenv("RUNE_FR_OUT");
-    const std::string dir = (out && *out) ? out : ".";
-    const std::string sfx = "-client-p" + std::to_string(static_cast<long>(::getpid())) + "-" + tag;
-    { std::ofstream f(dir + "/fr-hist" + sfx + ".txt"); if (f) rune_fr::dumpHistograms(f); }
-    rune_fr::exportChromeTrace(dir + "/fr-trace" + sfx + ".json");
-    rune_fr::writeTape(dir + "/fr-tape" + sfx + ".bin");
-    std::cerr << "rune-fr: client report written to " << dir << " (suffix=" << sfx << ")\n";
-}
-
 using rune::bench::envI64;
 using rune::bench::envStr;
 using rune::bench::parseTopics;
 
 int main(int argc, char** argv) {
+    // rune-fr: armed by RUNE_FR_ENABLE before any client thread starts; the
+    // report is written to RUNE_FR_OUT on every exit path, in EVERY mode
+    // (legacy void/acked AND the invoker open/saturate bench).
+    rune::bench::FrRun fr(argc > 1 ? "invoker" : "agent");
     // Any argument selects the invoker-shard bench (spec §5); env-only runs keep the
     // legacy agent-mode path unchanged (VM scripts and the default-config A/B use it).
     if (argc > 1) return rune::bench::invokerBenchMain(argc, argv);
-    std::signal(SIGUSR1, frdumphandler);
-    frConfigure();
     const std::string target  = envStr("RUNE_TARGET");
     const std::string egress  = envStr("RUNE_EGRESS");
     const std::string dataDir = envStr("RUNE_DATA_DIR");
@@ -320,7 +296,7 @@ int main(int argc, char** argv) {
                       << " records_per_sec=" << (uint64_t)rps
                       << " MB_per_sec=" << (rps * valueBytes / (1024.0*1024.0)) << "\n";
         }
-        frReport("shutdown");   // dump the client-side flight-recorder trace
+        fr.dump();   // the client-side flight-recorder report (also on every other exit)
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "FATAL: " << ex.what() << "\n";

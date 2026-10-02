@@ -49,6 +49,7 @@
 #include <concurrent/BackOffIdleStrategy.h>
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/producer/InFlightRing.h>
+#include <rune_fr/FlightRecorder.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
 #include <thread>
@@ -1225,7 +1226,7 @@ private:
     /// attempts' error answers are ignored from now on).  Reverted when the
     /// transport refuses it.
     template <class Send>
-    bool offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t nowNs, Send&& send);
+    bool offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t nowNs, Send&& send, uint16_t frReason = 0);
     /// One BatchAck to the batch-ack target (handler or CQ; none: nothing).
     /// `units`: the batch-ack credit units it returns (records of a Tier-1
     /// batch; 1 for a Tier-2 batch / a single never-sent record).
@@ -1273,6 +1274,10 @@ private:
     // ---- Instrumentation counters (agent-thread only — plain uint64_t) -------
     // Single-writer (agent thread): no atomics needed per shared-nothing law.
     uint64_t framesSent_  = 0; // total Aeron frames offered to transport
+    // FR (fr-hop-instrumentation): coalescers for conditions retried every duty
+    // cycle (empty when FR is compiled out).
+    [[no_unique_address]] rune_fr::Throttle frOfferRefused_{};
+    [[no_unique_address]] rune_fr::Throttle frWindowFull_{};
     uint64_t recordsSent_ = 0; // total records drained from the ring
     uint64_t flushVisits_ = 0; // F12: partitions examined by flushBatches (debugFlushVisits)
 

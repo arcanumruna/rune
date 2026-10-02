@@ -33,6 +33,7 @@ extern "C" {
 #include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/transport/Resolution.h>
 #include <rune/client/transport/TransportConfig.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -401,6 +402,8 @@ private:
     static std::size_t computeMaxMessageLength(const TransportConfig& c) noexcept;
     OfferResult offerToPub(aeron::ExclusivePublication& pub,
                     const uint8_t* buf, std::size_t len) noexcept;
+    /// FR: coalescer for refused offers (retried every duty cycle; empty when compiled out).
+    [[no_unique_address]] rune_fr::Throttle frOfferRefused_{};
 
     // ---- Resolution constants ------------------------------------------------
     static constexpr int kResolveMaxMs = 5'000; // hard cap for pub/sub resolve

@@ -1577,6 +1577,8 @@ bool ProducerImpl::encodeAndSend(
                         encodeScratch_.data(), written);
 
     if (!ok) {
+        RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::ClientOfferRefused, rune_fr::foldCorr(correlationId),
+                                  static_cast<uint16_t>(ps.partition));
         // Aeron ingress back-pressure (term buffer momentarily full / not yet
         // connected).  Leave the batch FULLY intact — builder records, stamped
         // baseSequence, and the ack-ring slice (batchAckStart/Count) are all
@@ -1595,9 +1597,15 @@ bool ProducerImpl::encodeAndSend(
     ++framesSent_;                                       // one Aeron frame offered
     // Agent-thread: batch frame offered to the broker.  corr=batch correlationId;
     // value=in-flight depth AFTER this offer (how deep the un-acked pipeline is).
+    // corr = rune_fr::foldCorr (the key the broker's hop sites use for this batch).
     RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientBatchOffer,
-                             static_cast<uint32_t>(correlationId),
+                             rune_fr::foldCorr(correlationId),
                              static_cast<double>(ps.inflight.live() + 1));
+    // The batch's age at its first offer (first record appended -> offer): the
+    // client-side linger / window / back-pressure wait.  arg = record count.
+    RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientBatchSeal, rune_fr::foldCorr(correlationId),
+                                 static_cast<uint16_t>(std::min<int32_t>(ps.builder->recordCount(), 65535)),
+                                 static_cast<double>(nowNs - ps.batchStartNs));
     const int32_t batchRecords = ps.builder->recordCount();
     // acks=None batches are non-idempotent (producerId=-1, above) and nothing
     // tracks their sequence, so nextBaseSequence is never stamped, read, or
@@ -1770,12 +1778,19 @@ bool ProducerImpl::encodeAndSendTier2(
                         encodeScratch_.data(), written);
 
     if (!ok) {
+        RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::ClientOfferRefused, rune_fr::foldCorr(wireCorrId),
+                                  static_cast<uint16_t>(ps.partition));
         // Back-pressure: leave the entry + sequence untouched so the caller can
         // retry (flushBatches must NOT pop it).  No sequence advance, no drop.
         return false;
     }
 
     ++framesSent_; // one Aeron frame offered to transport (Tier-2)
+    RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientBatchOffer, rune_fr::foldCorr(wireCorrId),
+                             static_cast<double>(ps.inflight.live() + 1));
+    RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientBatchSeal, rune_fr::foldCorr(wireCorrId),
+                                 static_cast<uint16_t>(std::min<int32_t>(entry.recordCount, 65535)),
+                                 static_cast<double>(nowNs - entry.enqueuedNs));
     // acks=None: non-idempotent (see above) — sequence stays untouched, matching
     // the Tier-1 rule in encodeAndSend.
     const int32_t batchSeq = idempotent ? ps.nextBaseSequence : -1;
@@ -1831,7 +1846,8 @@ bool ProducerImpl::encodeAndSendTier2(
 // ---------------------------------------------------------------------------
 
 template <class Send>
-bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t nowNs, Send&& send) {
+bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t nowNs, Send&& send,
+                                 [[maybe_unused]] uint16_t frReason) {
     const uint8_t prev = b.attemptTag;
     const uint8_t next = static_cast<uint8_t>(prev + 1);
     stampAttempt_(b, next);
@@ -1850,6 +1866,9 @@ bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t n
         b.laneFirstTag = next;
     }
     ++b.laneOut;
+    // A stored frame went out again (reason: 1 timer, 2 route, 3 parked, 4 redirect).
+    RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientRetransmit, rune_fr::foldCorr(b.corrId), frReason,
+                                 static_cast<double>(b.attempts));
     unpark_(ps, b);  // re-sent: its next answer decides (parked again only on another OOS)
     return true;
 }
@@ -1862,7 +1881,7 @@ bool ProducerImpl::resendRoute_(PartitionState& ps, int64_t nowNs, const Sink& s
         if (!all || !b.routeResendPending) return;
         // A NEW attempt (same frame, same identity): the old owner's late
         // answers to the earlier attempts are ignored from now on (EOS I-2).
-        if (!offerAttempt_(ps, b, nowNs, sink)) {
+        if (!offerAttempt_(ps, b, nowNs, sink, 2)) {
             all = false;  // new publication resolving / back-pressure: keep order
             return;
         }
@@ -1885,7 +1904,7 @@ bool ProducerImpl::resendParked_(PartitionState& ps, int64_t nowNs, const Sink& 
             if (!storedByAck_(ps, b)) stop = true;
             return;
         }
-        if (!offerAttempt_(ps, b, nowNs, sink)) {
+        if (!offerAttempt_(ps, b, nowNs, sink, 3)) {
             all = false;  // back-pressure: keep order — the rest wait for the next pass
             return;
         }
@@ -1999,6 +2018,11 @@ int ProducerImpl::flushBatches(
             // gate STOPS draining a partition once it is size-full (F12: regardless
             // of the in-flight window), so no oversized (unsendable) frame is built.
             const bool doFlush        = canFlight && (sizeFull || otherTrigger);
+            // FR: a batch is due but the in-flight window is full (waits on acks).
+            if (!canFlight && (sizeFull || otherTrigger))
+                RUNE_FR_THROTTLED_PRODUCE(frWindowFull_, rune_fr::Site::ClientWindowFull,
+                                          static_cast<uint32_t>(ps.partition),
+                                          static_cast<uint16_t>(std::min<std::size_t>(ps.inflight.live(), 65535)));
 
             if (doFlush) {
                 const int64_t corrId = (cfg_.acks != Acks::None)
@@ -2139,6 +2163,9 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     const uint32_t s = batchcorr::slot(correlationId);
     if (s >= partitions_.size()) return;
     PartitionState& ps = *partitions_[s];
+    // Hop chain: the ProduceResponse reached the producer (arg = its attempt).
+    RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientAckRecv, rune_fr::foldCorr(correlationId),
+                                 batchcorr::attempt(correlationId), static_cast<double>(errorCode));
     InFlightBatch* b = ps.inflight.find(correlationId);
     if (b == nullptr) return;  // duplicate / stale (slot reused) / already expired: ignore
     noteAnswer_(*b, batchcorr::attempt(correlationId));  // NEW-4(b): one fewer outstanding attempt
@@ -2180,6 +2207,8 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         // by (producerId, epoch, sequence).  Only the CURRENT attempt's NotLeader
         // gets here (A): a superseded attempt's late NotLeader is ignored.  The
         // attempt timer stays the backstop; the delivery timeout bounds it.
+        RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientNotLeader, rune_fr::foldCorr(correlationId),
+                                     static_cast<uint16_t>(ps.partition), 0.0);
         ps.routeParked = true;
         markDirty_(ps);
         return;
@@ -2191,6 +2220,8 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         });
         if (olderLive) {  // C1
             parkOutOfOrder_(ps, *b);
+            RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientOosPark, rune_fr::foldCorr(correlationId), 1,
+                                         static_cast<double>(ps.parkedCount));
             return;
         }
         if (b->lastSendTick <= ps.lastAckTick) {  // C2: may predate the latest OK — re-send
@@ -2198,6 +2229,8 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                 b->oosParked = true;
                 ++ps.parkedCount;
             }
+            RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientOosPark, rune_fr::foldCorr(correlationId), 2,
+                                         static_cast<double>(ps.parkedCount));
             ps.resendParked = true;  // b is the oldest: nothing to wait for
             markDirty_(ps);
             return;
@@ -2208,6 +2241,10 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                 ++ps.parkedCount;
             }
             ps.laneWait = true;
+            RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientOosPark, rune_fr::foldCorr(correlationId), 3,
+                                         static_cast<double>(ps.parkedCount));
+            RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientLaneWait, rune_fr::foldCorr(correlationId),
+                                         static_cast<uint16_t>(ps.partition), 0.0);
             markDirty_(ps);
             return;
         }
@@ -2234,6 +2271,8 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         // gateway's full pending-ack queue answers it AFTER: the retry is then a
         // window duplicate, OK with the original offset).  Bounded by the
         // delivery timeout.  Followers meet the gap (C1) and wait.
+        RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ClientRetriable, rune_fr::foldCorr(correlationId),
+                                     static_cast<uint16_t>(ec), 0.0);
         const int64_t backoffNs = std::min<int64_t>(kRetriableBackoffNs, cfg_.produceTimeoutMs * 1'000'000LL);
         b->attemptDeadlineNs = lastNowNs_ + backoffNs;
         if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
@@ -2631,7 +2670,7 @@ int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
                 return;
             }
             if (nowNs >= b.attemptDeadlineNs && !b.routeResendPending &&
-                offerAttempt_(ps, b, nowNs, sink)) {
+                offerAttempt_(ps, b, nowNs, sink, 1)) {
                 b.attemptDeadlineNs = nowNs + attemptNs;  // same frame, a new attempt: broker dedups
                 ++resent;
             }
@@ -2679,7 +2718,7 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
     }
     ++b->redirectCount;
     ++ps.laneGen;  // NEW-4(b): the redirect target is another lane
-    return offerAttempt_(ps, *b, lastNowNs_, sendFn);
+    return offerAttempt_(ps, *b, lastNowNs_, sendFn, 4);
 }
 
 int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
@@ -2696,7 +2735,7 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
             }
             restampSessionId(b.wireFrame, newSessionId);
             ++b.redirectCount;
-            if (offerAttempt_(ps, b, lastNowNs_, sendFn)) ++resent;
+            if (offerAttempt_(ps, b, lastNowNs_, sendFn, 4)) ++resent;
         });
     }
     return resent;
@@ -2709,7 +2748,7 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
-            if (offerAttempt_(ps, b, lastNowNs_, sendFn)) ++resent;
+            if (offerAttempt_(ps, b, lastNowNs_, sendFn, 2)) ++resent;
         });
     }
     return resent;
