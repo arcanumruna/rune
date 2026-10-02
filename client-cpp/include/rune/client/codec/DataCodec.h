@@ -44,6 +44,9 @@ struct ProduceView {
     int32_t                   partition      = 0;
     uint8_t                   partitionKnown = 0;
     uint8_t                   acks           = 0;  // GR-5: 0=Leader/None, 1=All
+    int64_t                   producerId     = -1; // frame-level idempotent identity (-1 = none)
+    int16_t                   producerEpoch  = 0;
+    int32_t                   baseSequence   = -1;
     std::span<const uint8_t>  key;          // zero-copy view into the original buffer
     std::span<const uint8_t>  recordBatch;  // zero-copy view into the original buffer
 };
@@ -87,6 +90,9 @@ inline std::optional<ProduceView> decodeProduce(const uint8_t* buf,
     v.partition      = opt->partition;
     v.partitionKnown = opt->partitionKnown;
     v.acks           = opt->acks;
+    v.producerId     = opt->producerId;
+    v.producerEpoch  = opt->producerEpoch;
+    v.baseSequence   = opt->baseSequence;
     v.key            = opt->key;
     v.recordBatch    = opt->recordBatch;
     return v;

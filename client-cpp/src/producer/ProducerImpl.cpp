@@ -1521,6 +1521,14 @@ bool ProducerImpl::encodeAndSend(
     msg.partition      = ps.partition;
     msg.partitionKnown = 1;
     msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
+    // EOS-DUP: the broker dedups on the FRAME's identity, not the batch header's
+    // — carry exactly what was stamped into the header above (acks=None keeps the
+    // -1 sentinels: non-idempotent).  Retransmits re-send this frame verbatim.
+    if (cfg_.acks != Acks::None) {
+        msg.producerId    = producerId_;
+        msg.producerEpoch = producerEpoch_;
+        msg.baseSequence  = ps.nextBaseSequence;
+    }
     msg.key            = {};
     msg.recordBatch    = {};   // appended directly below (no intermediate copy)
 
@@ -1703,6 +1711,12 @@ bool ProducerImpl::encodeAndSendTier2(
     msg.partition      = entry.partition;
     msg.partitionKnown = 1;
     msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
+    // EOS-DUP: the frame carries the identity patched into the header above.
+    if (idempotent) {
+        msg.producerId    = producerId_;
+        msg.producerEpoch = producerEpoch_;
+        msg.baseSequence  = ps.nextBaseSequence;
+    }
     msg.key            = {};
     msg.recordBatch    = std::span<const uint8_t>(b);
 

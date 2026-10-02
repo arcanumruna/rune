@@ -125,6 +125,10 @@ struct ProduceGateway {
         int32_t baseSeq    = -1; // from RecordBatch header offset 53
         int32_t recCount   = 0;
         uint8_t acks       = 0xff; // captured from wire frame (0=Leader/None, 1=All)
+        int64_t frameProducerId    = -1;  // Produce FRAME fields (what the broker dedups on)
+        int16_t frameProducerEpoch = -1;
+        int32_t frameBaseSeq       = -1;
+        int16_t producerEpoch      = -1;  // from RecordBatch header
         std::vector<std::string> values; // decoded record values
     };
 
@@ -234,14 +238,18 @@ struct ProduceGateway {
         rec.partition = opt->partition;
         rec.corrId    = opt->correlationId;
         rec.acks      = opt->acks;  // B2: capture wire acks field
+        rec.frameProducerId    = opt->producerId;
+        rec.frameProducerEpoch = opt->producerEpoch;
+        rec.frameBaseSeq       = opt->baseSequence;
 
         // Decode RecordBatch header via the reader (producerId, baseSequence,
         // recordCount — F5 adds producerId to what this test harness captures).
         const auto& rb = opt->recordBatch;
         if (rb.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
             rune::protocol::RecordBatchReader reader(rb.data(), rb.size());
-            rec.producerId = reader.producerId();
-            rec.baseSeq    = reader.baseSequence();
+            rec.producerId    = reader.producerId();
+            rec.producerEpoch = reader.producerEpoch();
+            rec.baseSeq       = reader.baseSequence();
             rec.recCount   = reader.recordCount();
 
             // Decode values.
@@ -800,6 +808,45 @@ TEST(Producer, IdempotentMonotonicSequence) {
     for (int i = 1; i < kSends; ++i) {
         EXPECT_GT(h.gw->batches[i].baseSeq, h.gw->batches[i-1].baseSeq)
             << "baseSeq must be strictly increasing between batches";
+    }
+}
+
+
+// ===========================================================================
+// EOS-DUP regression: the broker dedups on the Produce FRAME's identity
+// (producerId / producerEpoch / baseSequence), not on the RecordBatch header.
+// The plain producer stamped only the header and left the frame at -1, so the
+// broker treated every idempotent produce as non-idempotent: every retransmit
+// (ack timeout, session reconnect) was appended again — 5-36k duplicate records
+// per 100k in the k3s T15b gates.  The frame must carry exactly the header's
+// identity for acks=Leader/All, and stay -1 for acks=None.
+// ===========================================================================
+TEST(ProducerRegression, IdempotentFrameCarriesProducerIdentityRegression) {
+    for (const Acks acks : {Acks::Leader, Acks::All}) {
+        static constexpr int32_t kInStr = 2061, kEgStr = 2062;
+        AgentHarness h(kInStr, kEgStr);
+        ASSERT_TRUE(h.connect()) << "Failed to connect";
+        ProducerConfig pcfg;
+        pcfg.acks        = acks;
+        pcfg.lingerUs    = 1;
+        pcfg.batchBytes  = 1;   // one batch per send
+        pcfg.maxInFlight = 16;
+        auto p     = h.makeProducer(pcfg);
+        auto topic = makeTopic(10, 1);
+        Key  key(uint64_t{0});
+        const std::vector<uint8_t> val(5, 0xAB);
+        for (int i = 0; i < 3; ++i) {
+            p.send(topic, key, std::span<const uint8_t>(val));
+            p.flush();
+        }
+        ASSERT_TRUE(h.pumpUntilBatches(3));
+        for (std::size_t i = 0; i < 3; ++i) {
+            const auto& b = h.gw->batches[i];
+            ASSERT_GE(b.producerId, 0) << "precondition: idempotent header";
+            EXPECT_EQ(b.frameProducerId, b.producerId) << "frame producerId must equal the header's, batch " << i;
+            EXPECT_EQ(b.frameProducerEpoch, b.producerEpoch) << "frame epoch must equal the header's, batch " << i;
+            EXPECT_EQ(b.frameBaseSeq, b.baseSeq) << "frame baseSequence must equal the header's, batch " << i;
+        }
     }
 }
 

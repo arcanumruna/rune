@@ -431,11 +431,17 @@ int runVerify(const Args& a) {
     const int64_t         n     = a.expect;
     std::vector<uint8_t>  seen(static_cast<std::size_t>(n > 0 ? n : 1), 0);
     int64_t               total = 0, dups = 0, foreign = 0, distinct = 0;
+    // Where each id was first seen: a duplicate id at the SAME (partition, offset)
+    // is a re-delivery by the reader; at a DIFFERENT offset it is a second copy
+    // physically in the log.
+    std::vector<int64_t>  firstOff(static_cast<std::size_t>(n > 0 ? n : 1), -1);
+    std::vector<int32_t>  firstPart(static_cast<std::size_t>(n > 0 ? n : 1), -1);
+    int64_t               redelivered = 0, logCopies = 0;
     rc::SubscribeOptions  opts;
     opts.from = rc::From::earliest();
     std::vector<rc::Subscription> subs;
     for (int32_t p = 0; p < a.partitions; ++p) {
-        subs.push_back(client.subscribe(topic, p, opts, [&](const rc::Record& r) {
+        subs.push_back(client.subscribe(topic, p, opts, [&, p](const rc::Record& r) {
             ++total;
             if (r.value.size() < 8) {
                 ++foreign;
@@ -447,10 +453,14 @@ int runVerify(const Args& a) {
                 ++foreign;
                 return;
             }
-            if (seen[static_cast<std::size_t>(id)]++ != 0) {
+            const auto u = static_cast<std::size_t>(id);
+            if (seen[u]++ != 0) {
                 ++dups;
+                if (firstOff[u] == r.offset && firstPart[u] == p) ++redelivered; else ++logCopies;
             } else {
                 ++distinct;
+                firstOff[u]  = r.offset;
+                firstPart[u] = p;
             }
         }));
     }
@@ -467,8 +477,8 @@ int runVerify(const Args& a) {
         if (clk::now() - last > std::chrono::seconds(10)) break;                    // nothing more is coming
     }
     std::printf("VERIFY expect=%" PRId64 " total=%" PRId64 " distinct=%" PRId64 " duplicates=%" PRId64
-                " missing=%" PRId64 " foreign=%" PRId64 "\n",
-                n, total, distinct, dups, n - distinct, foreign);
+                " missing=%" PRId64 " foreign=%" PRId64 " dup_same_offset=%" PRId64 " dup_log_copies=%" PRId64 "\n",
+                n, total, distinct, dups, n - distinct, foreign, redelivered, logCopies);
     std::fflush(stdout);
     for (auto& s : subs) s.unsubscribe();
     client.close();
