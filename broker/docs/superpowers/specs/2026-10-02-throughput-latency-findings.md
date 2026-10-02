@@ -103,20 +103,32 @@ RUNE_BENCH_WINDOW=RUNE_BENCH_MAX_IN_FLIGHT=8000 RUNE_LINGER_US=1000 RUNE_BATCH_B
 RUNE_IDLE_MODE=backoff   (client still sends produce via the runtime gateway — not ingressEndpoint yet)
 ```
 
-### 4.1 Defaults = tuned — e2e proof (PENDING)
+### 4.1 Defaults = tuned — e2e proof (DONE 2026-10-02, broker b4321be, client 6c43f00)
 
-Run by the controller on the integ/perf-defaults head (auto-MTU fix included; `7ad0b2a` had the
-1472 bug) with the final client (`/root/e2e/rune-client-cpp`), RUNE_FS_LOG=0,
-RUNE_LOG_LEVEL=warn, under `/root/vm.lock`:
+Controller runs on k3s-node-01, broker `integ/perf-defaults@b4321be`, client
+`feat/sharded-invoker-client@6c43f00` (T16 direct-to-worker + EOS rounds + T18 bench), clean
+Release builds, RUNE_FS_LOG=0, RUNE_LOG_LEVEL=warn, under `/root/vm.lock`, 3-node acks=all 1 KiB,
+topic bench:8 (majority, durability=all-in-sync, minIsr 2), harness `/root/e2e/{perf,gate}.sh`.
 
-| run | broker env | client | RESULT (rec/s, p50, p99, failed) | effective-config line |
-|---|---|---|---|---|
-| 1 default | none (cluster.sh passes only what it needs to start) | §4 client block | _pending_ | _pending_ |
-| 2 tuned | §4 broker env, explicit | §4 client block | _pending_ | _pending_ |
-| shard_gate correctness (both modes) | — | 100k acks=all, `--acked-file` + verify | _pending: failed / duplicates / missing / ok_missing / failed_stored_ | — |
+| run | broker env | client | result |
+|---|---|---|---|
+| default config (NO RUNE_AERON_* / ring env) | none | `rune_produce_throughput --mode saturate --shards 1 --records 300000 --linger-us 0` | **112,854 rec/s**, errors=0. Effective: `mode=shard placement=fused workers=1 io=uring term=16 MiB sparse=false mtu=65504 socketBuffer=16 MiB rcvWindow=4 MiB` |
+| 7ad0b2a (auto-MTU bug) | none | same | 14–18k rec/s; effective `mtu=1472` (wildcard bind treated as NIC) → fixed in b4321be |
+| 7ad0b2a + explicit `RUNE_AERON_MTU=65504` | MTU only | same | 136,234 rec/s, errors=0 |
+| client MTU sweep at broker mtu 1472 | — | client mtu 1408 / 65504 / 65504+1 MiB batch | 18.3k / 14.0k / 15.2k — client MTU is NOT the lever |
+| shard_gate correctness, 3 client modes (agent / shard-invoker / client-invoker) | none | 100k acks=all, `--acked-file` + verify | all: failed=0 duplicates=0 missing=0 ok_missing=0 failed_stored=0 |
+| direct-to-worker proof (open-loop 20k, FR on) | — | 460k records acked | `GatewayHandle` (fires right after the gateway decodes ANY produce) = 0 on all 3 nodes → no produce through the gateway |
+| pre-460dd12 client | — | legacy bench | every record rejected (frame/header identity check) — by design |
 
-Also to record: /dev/shm and RSS per broker on the 7.7 GB box (16 MiB non-sparse terms on
-tmpfs = 48 MiB per publication/image log), and proof the client goes direct-to-worker.
+Caveats / found along the way:
+- One correctness run with `/dev/shm` at 852 MiB free (harness left the previous run's 3 GB work
+  dir) reported 192 failed (reported honestly: failed_stored=0, ok_missing=0) on node 0's
+  partitions. Hypothesis: non-sparse 16 MiB terms can't be allocated when shm is short —
+  non-sparse must be capacity-aware, not just "is tmpfs". Harness fixed (stop() removes the work
+  dir); hypothesis to be confirmed with FR.
+- LATENCY (open-loop, explicit MTU 65504, 7ad0b2a): 20k/s → achieved 17.1k, p50 1.36 ms,
+  p99 14.0 s; 50k/s → 42.5k, p50 3.9 ms, p99 4.9 s.  Multi-second stall + 1.4 ms base hop:
+  next = full per-hop FR instrumentation (feat/fr-hop-instrumentation) and diagnosis.
 
 ## 5. Where the time goes now (measured)
 
