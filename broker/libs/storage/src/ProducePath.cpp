@@ -15,6 +15,7 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <cstring>
+#include <limits>
 #include <spdlog/spdlog.h>
 
 namespace rune::storage {
@@ -191,7 +192,15 @@ ProduceOutcome handleProduceBatch(
     //    Mutates producerState only on the Accept path (after append).
     // -------------------------------------------------------------------------
     if (producerId >= 0) {
-        const int32_t lastSeqInBatch = baseSequence + recordCount - 1;
+        // Review I2: no signed overflow — a batch whose sequences would run past
+        // INT32_MAX is refused (the producer bumps its epoch before overflow; a
+        // wrap BETWEEN batches, seq 0 after INT32_MAX, is accepted by the PSM).
+        const int64_t lastSeq64 = static_cast<int64_t>(baseSequence) + recordCount - 1;
+        if (lastSeq64 > std::numeric_limits<int32_t>::max()) [[unlikely]] {
+            out.error = pc::ErrorCode::OutOfOrderSequence;
+            return out;
+        }
+        const auto lastSeqInBatch = static_cast<int32_t>(lastSeq64);
         const auto vr = producerState.validate(
             topicId, producerId, partition,
             producerEpoch, baseSequence, lastSeqInBatch);
@@ -279,7 +288,8 @@ ProduceOutcome handleProduceBatch(
     //    original base offset.
     // -------------------------------------------------------------------------
     if (producerId >= 0) {
-        const int32_t lastSeqInBatch = baseSequence + recordCount - 1;
+        const auto lastSeqInBatch = static_cast<int32_t>(
+            static_cast<int64_t>(baseSequence) + recordCount - 1);   // range-checked at step 5
         producerState.update(
             topicId, producerId, partition,
             producerEpoch, baseSequence, lastSeqInBatch,

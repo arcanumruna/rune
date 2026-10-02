@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -422,6 +423,9 @@ TEST_F(ProducePathTest, IdentityRegression_EpochOrSequenceMismatchRejected)
     auto os = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/3, /*seq=*/1);
     EXPECT_EQ(os.error, pc::ErrorCode::SchemaValidationFailed);
     EXPECT_TRUE(os.identityMismatch);
+    auto op = callHelper(b, log_, psm_, 1, 0, /*producerId=*/43, /*epoch=*/3, /*seq=*/0);
+    EXPECT_EQ(op.error, pc::ErrorCode::SchemaValidationFailed) << "both pids >= 0 but different";
+    EXPECT_TRUE(op.identityMismatch);
     auto ok = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/3, /*seq=*/0);
     EXPECT_TRUE(ok.isOK()) << "the matching frame is accepted";
     EXPECT_FALSE(ok.identityMismatch);
@@ -469,6 +473,21 @@ TEST_F(ProducePathTest, IdempotenceWindowRegression_KnownOldDuplicateIsOkUnknown
     auto partial = makeBatch(3, kPid, 0, 2 * kBatches - 1);
     EXPECT_EQ(callHelper(partial, log_, psm_, 1, 0, kPid, 0, 2 * kBatches - 1).error,
               pc::ErrorCode::OutOfOrderSequence);
+}
+
+// Review I2: a batch whose sequences would run past INT32_MAX (signed overflow
+// in baseSequence + recordCount - 1) is refused OutOfOrderSequence, never
+// appended.  (Rune's producer bumps the epoch before overflow; a wrap BETWEEN
+// batches — seq 0 after INT32_MAX — is accepted, see the PSM regression.)
+TEST_F(ProducePathTest, IdempotenceWindowRegression_BatchCrossingInt32MaxRefused)
+{
+    constexpr int32_t kMax = std::numeric_limits<int32_t>::max();
+    constexpr int64_t kPid = 78;
+    psm_.update(1, kPid, 0, 0, 0, kMax - 2, 0);              // lastSequence = MAX - 2
+    auto b = makeBatch(3, kPid, 0, kMax - 1);                 // MAX-1, MAX, (overflow)
+    auto o = callHelper(b, log_, psm_, 1, 0, kPid, 0, kMax - 1);
+    EXPECT_EQ(o.error, pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(log_.logEndOffset(), 0);
 }
 
 } // namespace

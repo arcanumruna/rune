@@ -45,6 +45,7 @@
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -177,6 +178,12 @@ ProducerStateManager::validate(int32_t topicId,
         if (baseSequence == e.lastSequence + 1) return ValidationResult::accept();
         return ValidationResult::oos();   // forward gap
     }
+
+    // Review I2: sequences wrap INT32_MAX -> 0 (Kafka incrementSequence).  The
+    // batch after lastSequence == INT32_MAX starts at 0 and is IN ORDER — never
+    // a known-old duplicate (that would answer OK without appending: loss).
+    if (e.lastSequence == std::numeric_limits<int32_t>::max() && baseSequence == 0)
+        return ValidationResult::accept();
 
     // baseSequence <= lastSequence: a retransmit (rare).  An exact match in the
     // window answers with the original offset.  Filled slots are [0, count)

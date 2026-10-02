@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <fcntl.h>
 #include <filesystem>
@@ -1099,5 +1100,46 @@ TEST(IdempotenceWindow, RecoversAVersion2FiveSlotSnapshot) {
     ProducerStateManager m2;
     ASSERT_EQ(m2.recover(path), 1);
     EXPECT_EQ(m2.validate(topic, pid, part, epoch, 4, 4).retryBaseOffset, 104);
+    ::unlink(path.c_str());
+}
+
+// Review I2: sequences wrap INT32_MAX -> 0 (Kafka DefaultRecordBatch
+// incrementSequence).  A batch at seq 0 right after lastSequence == INT32_MAX
+// is the NEXT in-order batch — it must be accepted (appended), never taken for
+// a known-old duplicate (OK, not appended = silent loss).
+TEST(IdempotenceWindowRegression, SequenceWrapAfterInt32MaxIsInOrderNotKnownOld) {
+    constexpr int32_t kMax = std::numeric_limits<int32_t>::max();
+    ProducerStateManager m;
+    ASSERT_TRUE(m.validate(0, 710, 0, 0, 0, kMax - 10).isAccept());
+    m.update(0, 710, 0, 0, 0, kMax - 10, 0);
+    ASSERT_TRUE(m.validate(0, 710, 0, 0, kMax - 9, kMax).isAccept());
+    m.update(0, 710, 0, 0, kMax - 9, kMax, 100);
+    const auto r = m.validate(0, 710, 0, 0, 0, 4);
+    EXPECT_TRUE(r.isAccept()) << "seq 0 after INT32_MAX is in order (wrap), status="
+                              << static_cast<int>(r.status);
+    m.update(0, 710, 0, 0, 0, 4, 200);
+    EXPECT_TRUE(m.validate(0, 710, 0, 0, 5, 5).isAccept());
+    // The newest pre-wrap batch is still answered from the window.
+    const auto d = m.validate(0, 710, 0, 0, kMax - 9, kMax);
+    EXPECT_TRUE(d.isOos() || (d.isDuplicate() && d.retryBaseOffset == 100))
+        << "a pre-wrap retransmit is never answered with an unknown offset";
+}
+
+// Snapshot v3 header guard: a recorded window of 0 slots is corrupt → nothing loaded.
+TEST(IdempotenceWindow, Version3SnapshotWithZeroSlotsIsRejected) {
+    const std::string path = tmpPath("psm_v3_zero");
+    ProducerStateManager m;
+    produce(m, 720, 0, 0, 0, 1, 10);
+    m.takeSnapshot(path);
+    {
+        const int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        const uint32_t zero = 0;
+        ASSERT_EQ(::pwrite(fd, &zero, 4, 12), 4);
+        ::close(fd);
+    }
+    ProducerStateManager m2;
+    EXPECT_EQ(m2.recover(path), 0);
+    EXPECT_EQ(m2.size(), 0u);
     ::unlink(path.c_str());
 }

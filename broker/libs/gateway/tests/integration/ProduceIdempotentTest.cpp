@@ -549,5 +549,40 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_LegacyProducerPassthrough)
     EXPECT_EQ(log->logEndOffset(), 4);  // 2 batches × 2 records
 }
 
+// Review I3: the no-worker-pool INLINE path's PSM is rebuilt only on a node-
+// level leadership change, so it refuses a KNOWN-OLD duplicate (older than the
+// window) with OutOfOrderSequence instead of answering OK with an unknown
+// offset; an in-window retransmit is still answered with its original offset.
+TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathRefusesKnownOldDuplicate)
+{
+    auto client = makeClient(kEgressBase + 5);
+    auto connResp = doConnect(*client.ingressPub, *client.egressSub,
+                              client.egressStreamId, client.egressChannel,
+                              /*correlationId=*/5, scratch_);
+    const int64_t sid = connResp.assignedSessionId;
+    const int n = rune::protocol::client::kIdempotentMaxInFlightBatches + 2;
+    std::vector<std::vector<uint8_t>> batches;
+    for (int i = 0; i < n; ++i) batches.push_back(makeBatch(1, /*pid=*/12, /*epoch=*/0, /*seq=*/i));
+    for (int i = 0; i < n; ++i) {
+        sendIdempotentProduce(*client.ingressPub, sid, 500 + i, kTopicId, kPartition0, 12, 0, i,
+                              std::span<const uint8_t>(batches[i]), "Fill");
+        auto r = recvProduceResponse(*client.egressSub, "FillResponse");
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::OK)) << i;
+    }
+    sendIdempotentProduce(*client.ingressPub, sid, 600, kTopicId, kPartition0, 12, 0, 0,
+                          std::span<const uint8_t>(batches[0]), "KnownOld");
+    auto old = recvProduceResponse(*client.egressSub, "KnownOldResponse");
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence));
+    sendIdempotentProduce(*client.ingressPub, sid, 601, kTopicId, kPartition0, 12, 0, n - 1,
+                          std::span<const uint8_t>(batches[n - 1]), "InWindow");
+    auto dup = recvProduceResponse(*client.egressSub, "InWindowResponse");
+    ASSERT_TRUE(dup.has_value());
+    EXPECT_EQ(dup->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(dup->baseOffset, n - 1);
+    EXPECT_EQ(registry_->log(kTopicId, kPartition0)->logEndOffset(), n);
+}
+
 } // namespace
 } // namespace rune::gateway
