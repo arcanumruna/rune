@@ -3586,12 +3586,17 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // MD1 IMPORTANT-3: a fresh authoritative map arrived — reset the backoff to
     // its initial interval so a future no-progress episode starts from the floor,
     // and disarm any pending refresh (we just refreshed).
-    metadataBackoffNs_     = kMetadataBackoffInitNs;
     nextMetadataRefreshAt_ = std::chrono::steady_clock::time_point::max();
-    // R2-1: an answer that leaves a redirect's guess unconfirmed (e.g. it was
-    // requested before a later redirect of the same burst) must not end the
-    // refresh cycle — re-arm so a later request confirms or corrects the guess.
-    if (metadataCache_.anyProvisional()) scheduleMetadataRefresh();
+    if (metadataCache_.anyProvisional()) {
+        // R2-1: an answer that leaves a redirect's guess unconfirmed (requested
+        // before a later redirect of the burst, or a partition the answer omits)
+        // must not end the refresh cycle — re-arm WITHOUT resetting the backoff,
+        // so a guess that is never confirmed backs off to the cap instead of
+        // polling every 100 ms forever.
+        scheduleMetadataRefresh();
+    } else {
+        metadataBackoffNs_ = kMetadataBackoffInitNs;
+    }
 
     // F14: a fresh cluster view — txn requests waiting for the coordinator to
     // be re-discovered (NotCoordinator) back off and re-send.

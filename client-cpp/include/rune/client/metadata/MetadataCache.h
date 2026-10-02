@@ -301,16 +301,19 @@ private:
             return;  // may predate the redirect — discard
         }
 
+        const int32_t prevLeader = entry.leaderNodeId;
         entry.leaderNodeId    = newLeaderId;
         entry.leaderEpoch     = newEpoch;
         entry.ingressStreamId = newIngressStreamId;
         if (authoritative) {
             entry.confirmedEpoch   = newEpoch;
             entry.provisionalSince = 0;
-        } else if (entry.provisionalSince == 0) {
-            // R2-1: keep the FIRST guess's order while a guess already stands —
-            // a later redirect in the same burst must not make the answer to the
-            // first redirect's request look "earlier" and get discarded.
+        } else if (entry.provisionalSince == 0 || newLeaderId != prevLeader) {
+            // R2-1: keep the FIRST guess's order while a guess to the SAME node
+            // stands — a repeat redirect in a burst must not make the answer to
+            // the first redirect's request look "earlier" and get discarded.  A
+            // redirect to a DIFFERENT node starts a new guess: an answer
+            // requested before it could route back to the older target.
             entry.provisionalSince = order > 0 ? order : 1;
         }
     }

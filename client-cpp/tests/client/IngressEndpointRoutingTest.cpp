@@ -649,3 +649,44 @@ TEST(IngressEndpointRoutingRegression, SpuriousRedirectBurstRestoresTheWorkerRou
     }
     EXPECT_TRUE(restored) << "worker route stranded on the node after a burst of spurious redirects";
 }
+
+// Review of 54a2082 (Q2a + Q4 gap): a redirect's guess that NO metadata answer
+// ever confirms (the answers omit the partition) must keep the refresh cycle
+// alive (>= 2 requests) but back off exponentially — never poll every 100 ms
+// forever (~30 requests in 3 s).
+TEST(IngressEndpointRoutingRegression, UnconfirmedRedirectGuessRefreshBacksOffRegression) {
+    Rig r(3963, 3964, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    const std::string node = "aeron:udp?endpoint=127.0.0.1:24843";
+    (void)r.gw.addEndpoint(node, 3963);
+    const int w = r.gw.addEndpoint("aeron:udp?endpoint=127.0.0.1:24844", 3963);
+    r.gw.brokerHost = "127.0.0.1";
+    r.gw.brokerPort = 24843;
+    r.gw.partitions = {{1, 0, 0, 1, 3963, "127.0.0.1:24844"}};
+    r.connect();
+    const std::string worker = "aeron:udp?endpoint=127.0.0.1:24844";
+    ASSERT_TRUE(r.drive([&] { return r.client.testDataChannelFor(1, 0) == worker; }));
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAndAwait(p).status, rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.produced.back().endpoint, w);
+
+    r.gw.redirectNext = 1;
+    r.gw.redirectTo   = node;
+    r.gw.partitions.clear();               // no answer will ever confirm the guess
+    const int before = r.gw.metadataRequests;
+    const rc::Token t1 = r.nextToken++;
+    ASSERT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), r.cq, t1),
+              rc::SendResult::Ok);
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) { if (c.token == t1) done = true; });
+        return done;
+    }));
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < until) {
+        r.client.doWork();
+        r.gw.pump();
+    }
+    const int requests = r.gw.metadataRequests - before;
+    EXPECT_GE(requests, 2) << "an unconfirmed guess must keep the refresh cycle alive";
+    EXPECT_LE(requests, 8) << "the refresh must back off, not poll every 100 ms (" << requests << " in 3 s)";
+}
