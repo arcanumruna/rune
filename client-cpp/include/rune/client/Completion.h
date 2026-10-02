@@ -66,6 +66,15 @@ struct Completion {
     uint32_t reserved0 = 0;
 };
 static_assert(sizeof(Completion) == 40);
+
+/// One BatchAck credit unit: the reservation of one producer completion record
+/// (CompletionRing::completionRecordBytes(0); asserted in Completions.h).  A
+/// BatchAck returns reservedBytes = units * kBatchAckUnitBytes — the units are
+/// derived from it, so reserved0 is free to carry the batch's producerEpoch.
+inline constexpr uint32_t kBatchAckUnitBytes = 48;
+[[nodiscard]] constexpr uint32_t batchAckUnits(const Completion& c) noexcept {
+    return c.reservedBytes / kBatchAckUnitBytes;
+}
 static_assert(std::is_trivially_copyable_v<Completion>);
 
 /// Callback target: a plain function pointer + context.  Called on the duty

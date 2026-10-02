@@ -94,7 +94,7 @@ int dutyPass(ProducerImpl& impl, CorrSink& cs, const ProducerImpl::SendFn& sink,
     int w = impl.drainRing(now, 256);
     w += impl.flushBatches(now, 42, sink);
     if (ack) {
-        for (const int64_t c : cs.corr) impl.onProduceResponse(c, 100);
+        for (const int64_t c : cs.corr) impl.onProduceResponse(c, 100, 0);
         w += static_cast<int>(cs.corr.size());
         cs.corr.clear();
     }
@@ -204,7 +204,7 @@ TEST(ProducerClose, BeginCloseTokenCompletesAfterLastAckRegression) {
         EXPECT_TRUE(CL.got.empty()) << "records still in flight";
         (void)dutyPass(impl, cs, sink, kNow, /*ack=*/false);
         EXPECT_TRUE(CL.got.empty());
-        impl.onProduceResponse(cs.corr[0], 500);  // the last ack
+        impl.onProduceResponse(cs.corr[0], 500, 0);  // the last ack
         cs.corr.clear();
         EXPECT_TRUE(CL.got.empty()) << "decided by the next duty pass, not inside the ack";
         (void)dutyPass(impl, cs, sink);
@@ -690,7 +690,7 @@ TEST(ProducerClose, CloseImmediatelyFromOnAckHandlerCompletesEachRecordOnceRegre
             ASSERT_TRUE(R.send(1, 3));
             R.closeOnToken = 1;
             const int16_t epoch0 = R.impl.producerEpoch();
-            R.impl.onProduceResponse(cs.corr[0], 100);
+            R.impl.onProduceResponse(cs.corr[0], 100, 0);
             EXPECT_EQ(R.closes, 1);
             EXPECT_EQ(R.impl.producerEpoch(), epoch0) << "the acked batch must not bump the epoch";
             for (int i = 0; i < 5; ++i) (void)R.impl.drainRing(kNow, 256);  // Discarding drain
@@ -720,7 +720,7 @@ TEST(ProducerClose, CloseImmediatelyFromBatchAckHandlerCompletesEachRecordOnceRe
             ASSERT_TRUE(R.send(1, 3));
             R.closeOnFirstBatch = true;
             const int16_t epoch0 = R.impl.producerEpoch();
-            R.impl.onProduceResponse(cs.corr[0], 100);
+            R.impl.onProduceResponse(cs.corr[0], 100, 0);
             EXPECT_EQ(R.closes, 1);
             EXPECT_EQ(R.impl.producerEpoch(), epoch0);
             for (int i = 0; i < 5; ++i) (void)R.impl.drainRing(kNow, 256);
@@ -818,7 +818,7 @@ TEST(ProducerClose, BeginCloseThenCloseImmediatelyFromOnAckDeliversTokenOnceAfte
                   OpResult::Accepted);
         EXPECT_TRUE(T.got.empty()) << "records outstanding: Draining";
         R.closeOnToken = 1;
-        R.impl.onProduceResponse(cs.corr[0], 100);
+        R.impl.onProduceResponse(cs.corr[0], 100, 0);
         EXPECT_EQ(R.closes, 1);
         for (int i = 0; i < 5; ++i) {
             (void)R.impl.drainRing(kNow, 256);

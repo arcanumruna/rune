@@ -13,6 +13,7 @@
 #include <rune/client/producer/CountingSink.h>
 #include <rune/client/Completions.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune_fr/FlightRecorder.h>
@@ -297,6 +298,18 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     // a user sets batchBytes larger than maxFrameBytes.
     frameCapped_ = (cfg_.maxFrameBytes > 0 && cfg_.maxFrameBytes < cfg_.batchBytes);
     effCap_      = frameCapped_ ? cfg_.maxFrameBytes : cfg_.batchBytes;
+    // EOS-OOS: an idempotent producer never has more batches of one partition
+    // outstanding than the broker's dedup window (the shared protocol constant):
+    // a retransmit older than the window could otherwise not be recognised as a
+    // duplicate (Kafka caps max.in.flight at 5 for the same reason).
+    constexpr int32_t kWindow = rune::protocol::client::kIdempotentMaxInFlightBatches;
+    if (cfg_.acks != Acks::None && cfg_.maxInFlight > kWindow) {
+        std::fprintf(stderr,
+                     "ProducerImpl: maxInFlight=%d clamped to %d (idempotent producer: the broker's "
+                     "dedup window, rune::protocol::client::kIdempotentMaxInFlightBatches)\n",
+                     static_cast<int>(cfg_.maxInFlight), static_cast<int>(kWindow));
+        cfg_.maxInFlight = kWindow;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1528,6 +1541,8 @@ bool ProducerImpl::encodeAndSend(
         msg.producerId    = producerId_;
         msg.producerEpoch = producerEpoch_;
         msg.baseSequence  = ps.nextBaseSequence;
+    } else {
+        msg.producerEpoch = -1;  // the header's -1 (Produce defaults epoch to 0): all three match
     }
     msg.key            = {};
     msg.recordBatch    = {};   // appended directly below (no intermediate copy)
@@ -1588,6 +1603,8 @@ bool ProducerImpl::encodeAndSend(
         // Only ack-expecting batches occupy the in-flight window (acks=None: corrId 0).
         InFlightBatch& b = ps.inflight.claim(ordinal_, ps.slotIndex);
         b.firstSendNs       = nowNs;
+        b.lastSendNs        = nowNs;
+        b.oosParked         = false;
         b.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
         b.attempts          = 1;
         b.redirectCount     = 0;
@@ -1608,7 +1625,7 @@ bool ProducerImpl::encodeAndSend(
         // so the batch's acks complete now, "sent, offset unknown" (-1), and its
         // ack-ring slice is reclaimed immediately — nothing is retained.
         emitBatchAck_(ps.topicId, ps.partition, batchSeq, batchRecords, -1, 0, OpStatus::Ok,
-                      static_cast<uint32_t>(batchRecords));
+                      static_cast<uint32_t>(batchRecords), -1);
         completeSentUnacked_(ps);
     }
 
@@ -1716,6 +1733,8 @@ bool ProducerImpl::encodeAndSendTier2(
         msg.producerId    = producerId_;
         msg.producerEpoch = producerEpoch_;
         msg.baseSequence  = ps.nextBaseSequence;
+    } else {
+        msg.producerEpoch = -1;  // the pre-built header's -1: all three match
     }
     msg.key            = {};
     msg.recordBatch    = std::span<const uint8_t>(b);
@@ -1749,7 +1768,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ps.nextBaseSequence += entry.recordCount;  // advance ONLY on success
     }
     if (!awaitAck) {
-        emitBatchAck_(ps.topicId, ps.partition, batchSeq, entry.recordCount, -1, 0, OpStatus::Ok, 1);
+        emitBatchAck_(ps.topicId, ps.partition, batchSeq, entry.recordCount, -1, 0, OpStatus::Ok, 1, -1);
         const uint64_t h = entry.ackHandle;
         entry.ackHandle = 0;
         completeHandle_(h, OpKind::Tier2Batch, -1, entry.recordCount, OpStatus::Ok, 0);  // "sent, offset unknown"
@@ -1764,6 +1783,8 @@ bool ProducerImpl::encodeAndSendTier2(
         // the old BatchInfo left firstSendNs = 0, so the first retransmit scan gave
         // it up immediately).
         ib.firstSendNs       = nowNs;
+        ib.lastSendNs        = nowNs;
+        ib.oosParked         = false;
         ib.attemptDeadlineNs = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
         if (ib.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
             earliestAttemptDeadlineNs_ = ib.attemptDeadlineNs;
@@ -1782,6 +1803,30 @@ bool ProducerImpl::encodeAndSendTier2(
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// EOS-OOS: re-send parked batches (their older batches all resolved)
+// ---------------------------------------------------------------------------
+
+template <class Sink>
+bool ProducerImpl::resendParked_(PartitionState& ps, int64_t nowNs, const Sink& sink) {
+    const int64_t attemptNs = cfg_.produceTimeoutMs * 1'000'000LL;
+    bool all = true;
+    ps.inflight.forEachLive([&](InFlightBatch& b) {
+        if (!all || !b.oosParked) return;
+        if (!sink(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(), b.wireFrame.size())) {
+            all = false;  // back-pressure: keep order — the rest wait for the next pass
+            return;
+        }
+        unpark_(ps, b);
+        ++b.attempts;
+        b.lastSendNs        = nowNs;
+        b.attemptDeadlineNs = nowNs + attemptNs;
+        if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
+    });
+    if (all) ps.resendParked = false;
+    return all;
 }
 
 // ---------------------------------------------------------------------------
@@ -1829,6 +1874,13 @@ int ProducerImpl::flushBatches(
         const uint32_t slot = dirty_[di];
         PartitionState& ps = *partitions_[slot];
         ++flushVisits_;
+        // ---- EOS-OOS: parked batches whose older batches all resolved go out
+        // again FIRST, oldest-first — a new batch sent ahead of them would only
+        // meet the same sequence gap.  Back-pressure: nothing new this pass.
+        if (ps.resendParked && !resendParked_(ps, nowNs, sink)) {
+            dirty_[keep++] = slot;
+            continue;
+        }
         // ---- Tier-1: flush pending auto-batch if triggered -------------------
         //
         // CB-5 A1 FIX: Tier-2 entries must NEVER be dispatched while a
@@ -1899,7 +1951,8 @@ int ProducerImpl::flushBatches(
 
         // F12: still has work -> stays dirty; otherwise leaves the list.  Re-read
         // the state (a callback fired above may have reset this partition).
-        if ((ps.builder && ps.builder->recordCount() > 0) || !ps.pendingTier2Entries.empty()) {
+        if ((ps.builder && ps.builder->recordCount() > 0) || !ps.pendingTier2Entries.empty() ||
+            ps.resendParked) {
             dirty_[keep++] = slot;
         } else {
             ps.dirty          = false;
@@ -1918,7 +1971,7 @@ int ProducerImpl::flushBatches(
 // Agent-thread: ProduceResponse routing
 // ---------------------------------------------------------------------------
 
-void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
+void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode)
 {
     const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(correlationId) || batchcorr::ordinal(correlationId) != ordinal_) return;
@@ -1927,22 +1980,73 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset)
     PartitionState& ps = *partitions_[s];
     InFlightBatch* b = ps.inflight.find(correlationId);
     if (b == nullptr) return;  // duplicate / stale (slot reused) / already expired: ignore
-    // DR-BUG-5: a negative baseOffset is the -errorCode sentinel for the whole batch.
-    const int16_t ec = baseOffset < 0 ? static_cast<int16_t>(-baseOffset) : int16_t{0};
+    const int16_t ec = errorCode;
     const uint32_t units = b->tier2 ? 1u : static_cast<uint32_t>(b->recordCount);
     if (ec == 0) {
-        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, baseOffset, 0,
-                      OpStatus::Ok, units);
-        completeSlice_(ps, b->ackStart, b->ackCount, baseOffset, OpStatus::Ok, 0, b->tier2, b->recordCount);
+        // EOS-OOS: baseOffset < 0 with OK = a known-old duplicate (the broker
+        // wrote it earlier; Kafka DUPLICATE_SEQUENCE parity): success, offset
+        // unknown — every record completes Ok with -1, exactly once.
+        const int64_t off = baseOffset < 0 ? -1 : baseOffset;
+        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, 0,
+                      OpStatus::Ok, units, b->producerEpoch);
+        completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::Ok, 0, b->tier2, b->recordCount);
+    } else if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence) &&
+               b->baseSequence >= 0 &&
+               ps.inflight.anyOlderLive(*b, [&](const InFlightBatch& o) {
+                   return o.producerEpoch == b->producerEpoch;
+               })) {
+        // EOS-OOS (Kafka parity): an OLDER batch of this epoch is unresolved,
+        // so an earlier frame was lost — this batch is retried once the older
+        // ones resolve, never failed (no completion, no epoch bump here).
+        parkOutOfOrder_(ps, *b);
+        return;
     } else {
         emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
-                      OpStatus::BrokerError, units);
+                      OpStatus::BrokerError, units, b->producerEpoch);
         completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
                        static_cast<uint16_t>(ec), b->tier2, b->recordCount);
-        onUnresolvedSequence_(b->producerEpoch);  // rejected: its sequences were never written
+        // Rejected (OutOfOrderSequence on the OLDEST live batch of its epoch
+        // included): its sequences were never written — Kafka's unresolved
+        // sequence rule bumps the epoch (once per gap).
+        onUnresolvedSequence_(b->producerEpoch);
     }
-    ps.inflight.release(*b);
+    releaseResolved_(ps, *b);
     reclaimAckRing_(ps);
+}
+
+void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcept {
+    if (!b.oosParked) {
+        b.oosParked = true;
+        ++ps.parkedCount;
+    }
+    // Still retried on its own attempt timer (a lost resend never strands it);
+    // the delivery timeout still bounds it.
+    // Fast retransmit: the gap sits right before this batch — at the NEWEST
+    // older same-epoch batch that is not itself parked (a parked one already
+    // waits on an older gap).  If its last offer went out no later than this
+    // batch's, that frame was lost: due now (one frame, never a burst — a
+    // stale-OOS for a batch sent before the resend leaves it alone).
+    InFlightBatch* gap = nullptr;
+    ps.inflight.anyOlderLive(b, [&](InFlightBatch& o) {
+        if (o.producerEpoch == b.producerEpoch && !o.oosParked) gap = &o;
+        return false;
+    });
+    if (gap != nullptr && gap->lastSendNs <= b.lastSendNs) {
+        gap->attemptDeadlineNs     = 0;
+        earliestAttemptDeadlineNs_ = 0;
+    }
+}
+
+void ProducerImpl::releaseResolved_(PartitionState& ps, InFlightBatch& b) noexcept {
+    unpark_(ps, b);
+    ps.inflight.release(b);
+    if (ps.parkedCount == 0) return;
+    // Every batch older than the oldest live one has resolved: if that one is
+    // parked, the parked batches go out again (flushBatches, before new ones).
+    if (const InFlightBatch* o = ps.inflight.oldestLive(); o != nullptr && o->oosParked) {
+        ps.resendParked = true;
+        markDirty_(ps);
+    }
 }
 
 void ProducerImpl::verifyClaimedCorrId_(PartitionState& ps, InFlightBatch& b, int64_t wireCorrId) {
@@ -1984,7 +2088,8 @@ void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t
         const uint64_t h = slot;
         slot = 0;
         if (h == 0) continue;
-        const int64_t value = ok ? baseOffset + (tier2 ? 0 : i) : -1;
+        // baseOffset < 0 on Ok: offset unknown (known-old duplicate) — -1 for every record.
+        const int64_t value = (ok && baseOffset >= 0) ? baseOffset + (tier2 ? 0 : i) : -1;
         RUNE_FR_MARK_VAL_PRODUCE(rune_fr::Site::ClientAckComplete, static_cast<uint32_t>(h),
                                  static_cast<double>(value));
         completeHandle_(h, tier2 ? OpKind::Tier2Batch : OpKind::Send, value, tier2 ? recordCount : 0,
@@ -2009,10 +2114,10 @@ void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
 
 void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence,
                                  int32_t recordCount, int64_t baseOffset, int16_t errorCode,
-                                 OpStatus st, uint32_t units) noexcept {
+                                 OpStatus st, uint32_t units, int16_t producerEpoch) noexcept {
     if (batchAckFn_ != nullptr) {
         const BatchAck a{topicId, partition, errorCode == 0 ? baseOffset : -1, baseSequence,
-                         recordCount, errorCode};
+                         recordCount, errorCode, producerEpoch};
         batchAckFn_(batchAckCtx_, a);  // noexcept by type
         return;
     }
@@ -2026,17 +2131,17 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     c.op            = OpKind::BatchAck;
     c.status        = st;
     c.errorCode     = static_cast<uint16_t>(errorCode);
-    c.reservedBytes = units * kAckRecordBytes;  // the credit of every record it covers
-    c.reserved0     = units;
+    c.reservedBytes = units * kAckRecordBytes;  // the credit of every record it covers (batchAckUnits)
+    c.reserved0     = static_cast<uint16_t>(producerEpoch);  // batchAckOf() -> BatchAck::producerEpoch
     hooks_.cqDeliver(hooks_.ctx, batchAckCqRef_, c);
 }
 
 void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st) {
     emitBatchAck_(ps.topicId, ps.partition, b.baseSequence, b.recordCount, -1, BatchAck::kClientFailure,
-                  st, b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount));
+                  st, b.tier2 ? 1u : static_cast<uint32_t>(b.recordCount), b.producerEpoch);
     completeSlice_(ps, b.ackStart, b.ackCount, -1, st, 0, b.tier2, b.recordCount);
     onUnresolvedSequence_(b.producerEpoch);  // outcome at the broker unknown
-    ps.inflight.release(b);
+    releaseResolved_(ps, b);
     reclaimAckRing_(ps);
 }
 
@@ -2150,7 +2255,9 @@ int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
                 sink(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
                      b.wireFrame.size())) {
                 ++b.attempts;
+                b.lastSendNs        = nowNs;
                 b.attemptDeadlineNs = nowNs + attemptNs;  // same frame, same corrId: broker dedups
+                unpark_(ps, b);  // re-sent: its next answer decides (parked again only on another OOS)
                 ++resent;
             }
             if (b.attemptDeadlineNs < nextEarliest) nextEarliest = b.attemptDeadlineNs;
@@ -2190,6 +2297,8 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
         return false;
     }
     ++b->redirectCount;
+    b->lastSendNs = lastNowNs_;
+    unpark_(ps, *b);
     return sendFn(ps.topicId, ps.partition, b->ingressStreamId, b->wireFrame.data(),
                   b->wireFrame.size());
 }
@@ -2207,6 +2316,8 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
             }
             restampSessionId(b.wireFrame, newSessionId);
             ++b.redirectCount;
+            b.lastSendNs = lastNowNs_;
+            unpark_(ps, b);
             if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
                        b.wireFrame.size())) {
                 ++resent;
@@ -2223,6 +2334,8 @@ int ProducerImpl::resendAllViaRoute(SendFn& sendFn)
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
+            b.lastSendNs = lastNowNs_;
+            unpark_(ps, b);
             if (sendFn(ps.topicId, ps.partition, b.ingressStreamId, b.wireFrame.data(),
                        b.wireFrame.size())) {
                 ++resent;

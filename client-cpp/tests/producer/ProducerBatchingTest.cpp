@@ -225,8 +225,8 @@ struct BatchingHarness {
                 return hub.drainAndFlush(nowNs, sessionId, std::move(sendFn));
             });
         agent->setProduceResponseFn(
-            [this](int64_t correlationId, int64_t baseOffset) {
-                hub.onProduceResponse(correlationId, baseOffset);
+            [this](int64_t correlationId, int64_t baseOffset, int16_t errorCode) {
+                hub.onProduceResponse(correlationId, baseOffset, errorCode);
             });
         agent->setEgressObserver([](rcc::TemplateId, const uint8_t*, std::size_t){});
 
@@ -601,8 +601,8 @@ struct CapHarness {
                 return hub.drainAndFlush(nowNs, sessionId, std::move(sendFn));
             });
         agent->setProduceResponseFn(
-            [this](int64_t correlationId, int64_t baseOffset) {
-                hub.onProduceResponse(correlationId, baseOffset);
+            [this](int64_t correlationId, int64_t baseOffset, int16_t errorCode) {
+                hub.onProduceResponse(correlationId, baseOffset, errorCode);
             });
         agent->setEgressObserver([](rcc::TemplateId, const uint8_t*, std::size_t){});
 

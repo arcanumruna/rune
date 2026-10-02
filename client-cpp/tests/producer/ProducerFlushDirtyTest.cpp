@@ -204,7 +204,7 @@ TEST(ProducerFlushDirty, WindowBlockedPartitionFlushesAfterAckRegression) {
     r.cycle(sink);
     r.cycle(sink);
     ASSERT_EQ(cap.frames.size(), 1u) << "window full";
-    r.hub.onProduceResponse(cap.frames[0].corrId, 0);
+    r.hub.onProduceResponse(cap.frames[0].corrId, 0, 0);
     r.cycle(sink);
     ASSERT_EQ(cap.frames.size(), 2u);
 }

@@ -76,6 +76,9 @@ struct NoPump {
 
 class Client;
 
+static_assert(kBatchAckUnitBytes == detail::CompletionRing::completionRecordBytes(0),
+              "a BatchAck credit unit is one producer completion record");
+
 class Completions {
 public:
     /// Standalone queue (no Client).
@@ -342,8 +345,9 @@ private:
     void consumeCredit_(const Completion& c) noexcept {
         reservedTotal_ -= c.reservedBytes;
         // C6: one BatchAck record returns the credit of every record of its
-        // batch (reserved0 = how many reservations it covers).
-        outstanding_ -= (c.op == OpKind::BatchAck) ? c.reserved0 : 1u;
+        // batch (reservedBytes / kBatchAckUnitBytes reservations; EOS-OOS:
+        // reserved0 carries the batch's producerEpoch).
+        outstanding_ -= (c.op == OpKind::BatchAck) ? batchAckUnits(c) : 1u;
     }
 
     // Copy a completion read from the ring into the stash (FIFO).  The stash is

@@ -71,13 +71,13 @@ void ProducerHub::remove(ProducerImpl* impl) noexcept
 // Duty-cycle methods — runner thread only; iterate the single-owner vector.
 // ---------------------------------------------------------------------------
 
-void ProducerHub::onProduceResponse(int64_t correlationId, int64_t baseOffset) {
+void ProducerHub::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode) {
     // O(1): the batch id names its producer.  Matching is by correlation id only,
     // never by the publisher the response arrived on.
     if (!batchcorr::isBatch(correlationId)) return;       // txn / non-producer id
     const uint32_t o = batchcorr::ordinal(correlationId);
     if (o < producers_.size() && producers_[o] != nullptr) {
-        producers_[o]->onProduceResponse(correlationId, baseOffset);
+        producers_[o]->onProduceResponse(correlationId, baseOffset, errorCode);
     }
 }
 

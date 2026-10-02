@@ -88,7 +88,11 @@ struct ProducerConfig {
                                           // (deep pipeline: throughput = outstanding / RTT;
                                           //  Aeron's µs RTT means a shallow window throttles
                                           //  hard — 32 batches keeps the pipe full while the
-                                          //  idempotent seq window / ackRing bound memory)
+                                          //  idempotent seq window / ackRing bound memory).
+                                          // EOS-OOS: acks=Leader/All (idempotent) clamps it to
+                                          // rune::protocol::client::kIdempotentMaxInFlightBatches
+                                          // (the broker's dedup window; Kafka caps at 5) — logged
+                                          // once at producer creation when clamped.
     int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
     // F8c fix round 1 (I-4): TransactionalProducer only — the deadline of
     // initTransactions / sendOffsetsToTransaction / commit / abort (Kafka
@@ -129,7 +133,10 @@ struct ProducerConfig {
 /// owner inside doWork(); the closing thread for the Closed completions
 /// Client::close() delivers) once per AckToken send / Tier-2 batch:
 ///   Ok             baseOffset = the record's offset (acks=None: -1, "handed to
-///                  the transport, offset unknown")
+///                  the transport, offset unknown"; also -1 when the broker
+///                  answered a retransmit as a known-old duplicate — the record
+///                  IS in the log, its offset is no longer known: Kafka
+///                  DUPLICATE_SEQUENCE parity)
 ///   BrokerError    errorCode = the broker's ErrorCode, baseOffset = -1
 ///   DeliveryFailed delivery timeout / redirect budget exhausted / a deferred
 ///                  record that could not be applied, baseOffset = -1
@@ -159,6 +166,13 @@ struct AckToken {
 // Failure of a sequenced batch (delivery timeout, redirect exhausted, close,
 // broker rejection) bumps the producer epoch and restarts every partition's
 // sequence at 0, so the failed batch never leaves a permanent sequence gap.
+// producerEpoch is the epoch the batch was stamped with (-1: not sequenced), so
+// (partition, producerEpoch, baseSequence) names a batch across epoch restarts.
+//
+// EOS-OOS: errorCode 0 with baseOffset -1 on a sequenced batch = a known-old
+// duplicate (the broker had already written it; offset unknown) — a success.
+// OutOfOrderSequence on a batch behind an older live batch is not reported: the
+// batch is re-sent once the older ones resolve (Kafka parity).
 // ---------------------------------------------------------------------------
 //
 // F8c C6: EVERY accepted record is reported in exactly one BatchAck — including
@@ -173,6 +187,7 @@ struct BatchAck {
     int32_t baseSequence = 0;
     int32_t recordCount  = 0;
     int16_t errorCode    = 0;   ///< 0 OK; >0 broker ErrorCode; kClientFailure
+    int16_t producerEpoch = -1; ///< epoch the batch was stamped with; -1 = not sequenced
 };
 
 /// Per-batch handler (Producer::onBatchAck): called on the duty thread, one
@@ -182,8 +197,10 @@ using BatchAckFn = void (*)(void* ctx, const BatchAck& ack) noexcept;
 /// A BatchAck delivered into a Completions (Producer::batchAcksTo) is a
 /// Completion with op == OpKind::BatchAck: token = topicId << 32 | partition,
 /// value = baseOffset, aux = baseSequence << 32 | recordCount, errorCode = the
-/// BatchAck errorCode (kClientFailure as 0xFFFF), status = Ok / BrokerError /
-/// DeliveryFailed / SessionLost / Closed.  This decodes it.
+/// BatchAck errorCode (kClientFailure as 0xFFFF), reserved0 = producerEpoch
+/// (int16 in the low 16 bits; the credit units are reservedBytes /
+/// kBatchAckUnitBytes), status = Ok / BrokerError / DeliveryFailed /
+/// SessionLost / Closed.  This decodes it.
 [[nodiscard]] inline BatchAck batchAckOf(const Completion& c) noexcept {
     BatchAck a;
     a.topicId      = static_cast<int32_t>(static_cast<uint32_t>(c.token >> 32));
@@ -192,6 +209,7 @@ using BatchAckFn = void (*)(void* ctx, const BatchAck& ack) noexcept;
     a.baseSequence = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(c.aux) >> 32));
     a.recordCount  = static_cast<int32_t>(static_cast<uint32_t>(c.aux));
     a.errorCode    = static_cast<int16_t>(c.errorCode);
+    a.producerEpoch = static_cast<int16_t>(static_cast<uint16_t>(c.reserved0));
     return a;
 }
 

@@ -49,6 +49,7 @@ inline constexpr uint32_t kMaxSlot      = (1u << 18) - 1;
 struct InFlightBatch {
     int64_t  corrId            = 0;  ///< 0 = free slot
     int64_t  firstSendNs       = 0;
+    int64_t  lastSendNs        = 0;  ///< duty clock of the latest offer of wireFrame (fast retransmit)
     int64_t  attemptDeadlineNs = 0;
     uint64_t ackStart          = 0;  ///< this batch's slice of the partition ack ring
     int32_t  ackCount          = 0;
@@ -59,6 +60,11 @@ struct InFlightBatch {
     int32_t  redirectCount     = 0;
     int16_t  producerEpoch     = 0;  ///< epoch the frame was stamped with (unresolved-sequence bump)
     bool     tier2             = false;  ///< F8c C6: a Tier-2 batch (ONE ack: op Tier2Batch; 1 credit unit)
+    /// EOS-OOS: the broker answered OutOfOrderSequence while an OLDER batch of
+    /// the same epoch was still live (an earlier frame was lost / is unresolved).
+    /// Not failed (Kafka parity): re-sent, unchanged, once every older batch has
+    /// resolved (PartitionState::resendParked).
+    bool     oosParked         = false;
     std::vector<uint8_t> wireFrame;  ///< encoded Produce frame; capacity reused
 };
 
@@ -111,6 +117,18 @@ public:
         b.corrId = 0;
         --live_;
         while (tail_ != head_ && slots_[tail_ & mask_].corrId == 0) ++tail_;
+    }
+
+    /// Visits the live batches OLDER than `b` (a live batch of this ring),
+    /// oldest-first; stops early when f returns true.  Returns whether it did.
+    template <class F>
+    bool anyOlderLive(const InFlightBatch& b, F&& f) {
+        for (uint64_t s = tail_; s != head_; ++s) {
+            InFlightBatch& x = slots_[s & mask_];
+            if (&x == &b) return false;
+            if (x.corrId != 0 && f(x)) return true;
+        }
+        return false;
     }
 
     [[nodiscard]] InFlightBatch* oldestLive() noexcept {

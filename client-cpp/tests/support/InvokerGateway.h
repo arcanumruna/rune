@@ -30,6 +30,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -142,6 +143,35 @@ struct InvokerGateway {
     // Record values per partition, in arrival order (keepValues).
     bool                                                   keepValues = false;
     std::map<int32_t, std::vector<std::vector<uint8_t>>> values;
+
+    // ---- EOS-OOS: broker idempotence model + fault injection (off by default) ----
+    // idempotence: Produce frames with producerId >= 0 are validated like the
+    // broker's ProducerStateManager (keyed on the FRAME identity) plus the
+    // EOS-OOS rulings: trust-on-first-use at seq 0; a lower epoch -> fenced; a
+    // higher epoch only at seq 0; an exact retry inside the last
+    // `idempotenceWindow` batches -> OK with its original offset; a batch
+    // entirely <= lastSequence but outside the window -> OK with baseOffset -1
+    // (known-old duplicate); otherwise a gap -> OutOfOrderSequence.  Only
+    // accepted batches reach `log` (what a reader would see).  Held / paused
+    // acks (replyAcks / holdPartitions) are not modelled on this path.
+    bool idempotence       = false;
+    int  idempotenceWindow = 32;
+    // Fault injection by the 1-based ordinal of the Produce frames received:
+    // dropProduce — the frame is lost on the wire (never seen);
+    // dropAnswer  — processed, but its ProduceResponse is lost.
+    std::set<int> dropProduce;
+    std::set<int> dropAnswer;
+    int           produceFrames = 0;
+    struct LogBatch {
+        int32_t partition = 0;
+        int64_t producerId = -1;
+        int16_t producerEpoch = -1;
+        int32_t baseSequence = -1;
+        int64_t baseOffset = 0;
+        std::vector<std::vector<uint8_t>> values;
+    };
+    std::vector<LogBatch> log;
+    int oosAnswers = 0, windowDupAnswers = 0, oldDupAnswers = 0, fencedAnswers = 0;
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
                    int32_t controlStream, std::string egressCh, int32_t egressStream)
@@ -274,6 +304,19 @@ struct InvokerGateway {
         sendToSession(sessionId, buf.data(), n);
     }
 
+    /// ProduceResponse with an explicit baseOffset (idempotence model).
+    void ackAt(const Produced& pr, int16_t errorCode, int64_t baseOffset) {
+        namespace rcc = rune::client::codec;
+        uint8_t buf[64];
+        const std::size_t n = rcc::encodeProduceResponse(buf, sizeof buf, errorCode, pr.partition,
+                                                         baseOffset, pr.sessionId, pr.corrId);
+        if (replyOnAnnouncedEgress) {
+            sendToSession(pr.sessionId, buf, n);
+            return;
+        }
+        send(pr.endpoint, buf, n);
+    }
+
     /// ProduceResponse from the endpoint that received the batch.
     void ack(const Produced& pr, int16_t errorCode = 0) {
         namespace rcc = rune::client::codec;
@@ -348,6 +391,98 @@ private:
         return ep->pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
     }
 
+    struct SeqDesc {
+        int32_t first = 0, last = 0;
+        int64_t offset = 0;
+    };
+    struct SeqState {
+        int16_t             epoch   = 0;
+        int32_t             lastSeq = -1;
+        std::deque<SeqDesc> window;
+    };
+    std::map<std::tuple<int32_t, int64_t, int32_t>, SeqState> seqStates;
+
+    template <class View>
+    void onIdempotentProduce(const View& pv, int endpoint) {
+        namespace rp = rune::protocol::client;
+        const int ordinal = ++produceFrames;
+        if (dropProduce.count(ordinal) != 0) return;  // lost on the wire
+        rune::protocol::RecordBatchReader r(pv.recordBatch.data(), pv.recordBatch.size());
+        const Produced pr{pv.topicId, pv.partition, pv.sessionId, pv.correlationId,
+                          r.recordCount(), r.baseSequence(), endpoint};
+        produced.push_back(pr);
+        const bool answer = pv.correlationId != 0 && dropAnswer.count(ordinal) == 0;
+        auto append = [&]() -> int64_t {
+            LogBatch lb;
+            lb.partition     = pv.partition;
+            lb.producerId    = pv.producerId;
+            lb.producerEpoch = pv.producerEpoch;
+            lb.baseSequence  = pv.baseSequence;
+            lb.baseOffset    = nextOffset;
+            r.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
+                lb.values.emplace_back(v.begin(), v.end());
+            });
+            nextOffset += pr.records;
+            log.push_back(std::move(lb));
+            return log.back().baseOffset;
+        };
+        if (pv.producerId < 0) {
+            const int64_t off = append();
+            if (answer) ackAt(pr, 0, off);
+            return;
+        }
+        const int32_t first = pv.baseSequence;
+        const int32_t last  = first + pr.records - 1;
+        const auto key = std::make_tuple(pv.topicId, pv.producerId, pv.partition);
+        auto it = seqStates.find(key);
+        auto accept = [&](SeqState& st) {
+            const int64_t off = append();
+            st.epoch   = pv.producerEpoch;
+            st.lastSeq = last;
+            st.window.push_back({first, last, off});
+            while (static_cast<int>(st.window.size()) > idempotenceWindow) st.window.pop_front();
+            if (answer) ackAt(pr, 0, off);
+        };
+        auto oos = [&] {
+            ++oosAnswers;
+            if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::OutOfOrderSequence), 0);
+        };
+        if (it == seqStates.end()) {
+            if (first != 0) return oos();
+            accept(seqStates[key]);
+            return;
+        }
+        SeqState& st = it->second;
+        if (pv.producerEpoch < st.epoch) {
+            ++fencedAnswers;
+            if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::InvalidProducerEpoch), 0);
+            return;
+        }
+        if (pv.producerEpoch > st.epoch) {
+            if (first != 0) return oos();
+            st.window.clear();
+            accept(st);
+            return;
+        }
+        for (const SeqDesc& d : st.window) {
+            if (d.first == first && d.last == last) {
+                ++windowDupAnswers;
+                if (answer) ackAt(pr, 0, d.offset);
+                return;
+            }
+        }
+        if (first == st.lastSeq + 1) {
+            accept(st);
+            return;
+        }
+        if (last <= st.lastSeq) {  // known-old duplicate (outside the window)
+            ++oldDupAnswers;
+            if (answer) ackAt(pr, 0, -1);
+            return;
+        }
+        oos();
+    }
+
     void onFrame(int endpoint, const uint8_t* buf, std::size_t len, bool replay = false) {
         namespace rcc = rune::client::codec;
         namespace rp  = rune::protocol::client;
@@ -394,6 +529,10 @@ private:
         case rcc::TemplateId::Produce: {
             const auto pv = rcc::decodeProduce(buf, len);
             if (!pv) return;
+            if (idempotence) {
+                onIdempotentProduce(*pv, endpoint);
+                return;
+            }
             rune::protocol::RecordBatchReader r(pv->recordBatch.data(), pv->recordBatch.size());
             const Produced pr{pv->topicId, pv->partition, pv->sessionId, pv->correlationId,
                               r.recordCount(), r.baseSequence(), endpoint};

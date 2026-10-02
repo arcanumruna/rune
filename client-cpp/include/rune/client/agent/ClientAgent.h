@@ -396,9 +396,13 @@ public:
 
     /// ProduceResponses decoded this duty cycle, for the owner to route with plain
     /// calls (buffered only when no produceResponseFn_ test hook is installed).
+    /// EOS-OOS: the error code travels on its own — an OK answer may carry
+    /// baseOffset -1 (a known-old duplicate: written, offset unknown), which the
+    /// old "< 0 = -ErrorCode" sentinel turned into error 1.
     struct ProduceAck {
         int64_t correlationId;
-        int64_t baseOffsetOrError;  ///< < 0 = -ErrorCode
+        int64_t baseOffset;  ///< meaningful when errorCode == 0 (-1: offset unknown)
+        int16_t errorCode;   ///< rune::protocol::client::ErrorCode (0 = OK)
     };
     [[nodiscard]] std::span<const ProduceAck> produceAcks() const noexcept {
         return {produceAcks_.data(), produceAcks_.size()};
@@ -609,8 +613,9 @@ public:
         std::function<int(int64_t /*nowNs*/, int64_t /*sessionId*/, SendFn)>;
 
     /// ProduceResponse routing callback: invoked on the agent thread when a
-    /// ProduceResponse frame arrives.  Signature: (correlationId, baseOffset).
-    using ProduceResponseFn = std::function<void(int64_t, int64_t)>;
+    /// ProduceResponse frame arrives.  Signature: (correlationId, baseOffset,
+    /// errorCode).
+    using ProduceResponseFn = std::function<void(int64_t, int64_t, int16_t)>;
 
     /// Set the producer drain+flush hook.  MUST be called before start().
     void setProducerDrainFn(ProducerDrainFn fn) noexcept;

@@ -785,16 +785,15 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     }
 
     case codec::TemplateId::ProduceResponse: {
-        // DR-BUG-5: a non-zero errorCode is passed as the negative sentinel -errorCode.
+        // EOS-OOS: errorCode and baseOffset travel separately (an OK answer to a
+        // known-old duplicate carries baseOffset -1; the old -errorCode sentinel
+        // read it as error 1).
         if (auto opt = codec::decodeProduceResponse(buf, len)) {
-            const int64_t sentinel =
-                (opt->errorCode != 0)
-                    ? -static_cast<int64_t>(static_cast<uint16_t>(opt->errorCode))
-                    : opt->baseOffset;
+            const int64_t off = opt->errorCode == 0 ? opt->baseOffset : -1;
             if (produceResponseFn_) {
-                produceResponseFn_(opt->correlationId, sentinel);  // test-harness hook
+                produceResponseFn_(opt->correlationId, off, opt->errorCode);  // test-harness hook
             } else {
-                produceAcks_.push_back(ProduceAck{opt->correlationId, sentinel});
+                produceAcks_.push_back(ProduceAck{opt->correlationId, off, opt->errorCode});
             }
         }
         if (forwardProduceResponses_ && egressObserver_) egressObserver_(tid, buf, len);

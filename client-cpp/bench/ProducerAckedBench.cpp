@@ -38,7 +38,7 @@ int main() {
             const int64_t now = clk::now().time_since_epoch().count();
             impl.drainRing(now, 256);
             impl.flushBatches(now, 1, sink);
-            for (int64_t c : corr) { impl.onProduceResponse(c, off); off += 64; }
+            for (int64_t c : corr) { impl.onProduceResponse(c, off, 0); off += 64; }
             corr.clear();
         }
         tEnd = clk::now();

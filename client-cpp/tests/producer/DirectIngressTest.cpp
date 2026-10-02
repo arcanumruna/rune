@@ -550,7 +550,7 @@ TEST(DirectIngress, FailAllPendingFailsDeferredRecordsRegression) {
     for (int i = 0; i < 10'000 && r == rc::SendResult::Ok; ++i) r = impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, 0);
     ASSERT_EQ(r, rc::SendResult::BackPressured);
     const int64_t p1Corr = const_cast<rc::producer::PartitionState*>(impl.partitionState(1, 1))->inflight.oldestLive()->corrId;
-    impl.onProduceResponse(p1Corr, 100);  // hOuter fires inside the producer's duty work
+    impl.onProduceResponse(p1Corr, 100, 0);  // hOuter fires inside the producer's duty work
     EXPECT_EQ(deferredOutcome, 0) << "accepted into the deferred buffer, still pending";
     impl.failAllPending(rc::OpStatus::SessionLost);
     EXPECT_EQ(deferredOutcome, -1) << "a deferred record is failed like every accepted record";
@@ -745,7 +745,7 @@ struct Fx {
         ASSERT_EQ(send(trigger, 't', h), rc::SendResult::Ok);
         impl.submitFlush();
         flush(now);
-        impl.onProduceResponse(inflightCorr(trigger), 100);
+        impl.onProduceResponse(inflightCorr(trigger), 100, 0);
     }
 };
 rc::ProducerConfig stallCfg() {
@@ -784,12 +784,12 @@ TEST(DirectIngress, PerPartitionOrderPreservedAcrossDeferralRegression) {
     EXPECT_EQ(fx.send(0, 'E'), rc::SendResult::BackPressured);
     // Unblock p0: ack its in-flight batch; the next pass sends the full builder
     // and then applies A, C; E follows.
-    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100, 0);
     fx.flush(3);
     EXPECT_EQ(fx.impl.deferredCount(), 0u);
     ASSERT_EQ(fx.send(0, 'E'), rc::SendResult::Ok);
-    fx.impl.onProduceResponse(fx.inflightCorr(0), 200);
-    fx.impl.onProduceResponse(fx.inflightCorr(1), 300);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 200, 0);
+    fx.impl.onProduceResponse(fx.inflightCorr(1), 300, 0);
     fx.impl.submitFlush();
     fx.flush(4);
     const std::string& p0 = fx.sent[0];
@@ -843,7 +843,7 @@ TEST(DirectIngress, DeferredRecordBatchStartIsAcceptanceTimeRegression) {
     fx.stall(0, 'f', 1'000);
     fx.inDuty(1, 1'000, [&] { (void)fx.send(0, 'd'); });
     ASSERT_EQ(fx.impl.deferredCount(), 1u);
-    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100, 0);
     fx.flush(5'000);  // sends the full builder, then applies the deferred record
     ASSERT_EQ(fx.impl.deferredCount(), 0u);
     ASSERT_EQ(builderRecords(fx.impl, 0), 1);
@@ -870,12 +870,12 @@ TEST(DirectIngress, FlushIncludesDeferredRecordsRegression) {
     fx.flush(1'000);  // size-full: sent (window 1/1)
     r = rc::SendResult::Ok;
     for (int i = 0; i < 10'000 && r == rc::SendResult::Ok; ++i) r = fx.send(0, 'g');
-    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);  // callback: R deferred (builder full)
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100, 0);  // callback: R deferred (builder full)
     ASSERT_EQ(fx.impl.deferredCount(), 1u);
     fx.impl.submitFlush();  // must cover R
     fx.flush(2'000);        // sends the 'g' builder, then applies R
     ASSERT_EQ(builderRecords(fx.impl, 0), 1);
-    fx.impl.onProduceResponse(fx.inflightCorr(0), 200);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 200, 0);
     fx.flush(3'000);  // linger 60 s: only the flush request can send R now
     ASSERT_FALSE(fx.sent[0].empty());
     EXPECT_EQ(fx.sent[0].back(), 'R');
@@ -953,7 +953,7 @@ TEST(DirectIngress, RefusedSendToStalledPartitionRunsNoPassRegression) {
     for (int i = 0; i < 100; ++i) ASSERT_EQ(fx.send(0, 'e'), rc::SendResult::BackPressured);
     EXPECT_EQ(fx.impl.debugDeferPasses(), before) << "no pass while p0's state cannot have changed";
     // Once p0 can move (its in-flight batch acked + the next pass), it applies.
-    fx.impl.onProduceResponse(fx.inflightCorr(0), 100);
+    fx.impl.onProduceResponse(fx.inflightCorr(0), 100, 0);
     fx.flush(3);
     EXPECT_EQ(fx.impl.deferredCount(), 0u);
 }
@@ -1004,7 +1004,7 @@ TEST(DirectIngress, Tier2RejectReasonIsSpecificRegression) {
     p.send(topic, k1, kVal, S.tok([&](int64_t) { (void)p.trySend(topic, k0, kVal); }));
     impl->flushBatches(2, 42, sink);
     auto* ps1 = const_cast<rc::producer::PartitionState*>(impl->partitionState(1, 1));
-    impl->onProduceResponse(ps1->inflight.oldestLive()->corrId, 100);
+    impl->onProduceResponse(ps1->inflight.oldestLive()->corrId, 100, 0);
     ASSERT_EQ(impl->deferredCount(), 1u);
 
     auto b = p.batch(topic, k0);

@@ -145,6 +145,7 @@ struct ProduceGateway {
     int64_t                  nextOffset = 100;
 
     bool replyAcks = true; // set false to simulate slow broker (maxInFlight test)
+    int  rejectNext = 0;   // the next N answered batches are rejected NotPartitionLeader (epoch bump)
     std::vector<PendingAck> pendingAcks_; // held when replyAcks=false
 
     std::shared_ptr<aeron::Aeron>                gwAeron;
@@ -279,11 +280,14 @@ struct ProduceGateway {
     /// Send a ProduceResponse for a single batch.
     void sendAck(int32_t partition, int32_t recCount,
                  int64_t sessionId, int64_t corrId) {
-        const int64_t baseOff = nextOffset;
-        nextOffset += recCount;
+        const int16_t ec = rejectNext > 0
+            ? static_cast<int16_t>(rcc::ErrorCode::NotPartitionLeader) : int16_t{0};
+        if (rejectNext > 0) --rejectNext;
+        const int64_t baseOff = ec != 0 ? -1 : nextOffset;
+        if (ec == 0) nextOffset += recCount;
         std::size_t n = rcc::encodeProduceResponse(
             replyBuf, sizeof(replyBuf),
-            /*errorCode=*/0,
+            /*errorCode=*/ec,
             partition,
             baseOff,
             sessionId,
@@ -340,8 +344,8 @@ struct AgentHarness {
                 return hub.drainAndFlush(nowNs, sessionId, std::move(sendFn));
             });
         agent->setProduceResponseFn(
-            [this](int64_t correlationId, int64_t baseOffset) {
-                hub.onProduceResponse(correlationId, baseOffset);
+            [this](int64_t correlationId, int64_t baseOffset, int16_t errorCode) {
+                hub.onProduceResponse(correlationId, baseOffset, errorCode);
             });
         // Absorb egress (ConnectResponse handled by session machine internally).
         agent->setEgressObserver([](rcc::TemplateId, const uint8_t*, std::size_t){});
@@ -831,21 +835,37 @@ TEST(ProducerRegression, IdempotentFrameCarriesProducerIdentityRegression) {
         pcfg.lingerUs    = 1;
         pcfg.batchBytes  = 1;   // one batch per send
         pcfg.maxInFlight = 16;
+        AckLedger L;  // outlives the producer
         auto p     = h.makeProducer(pcfg);
+        L.attach(p);
         auto topic = makeTopic(10, 1);
         Key  key(uint64_t{0});
         const std::vector<uint8_t> val(5, 0xAB);
+        // EOS-DUP review I3: a fresh producer's epoch 0 equals the Produce
+        // frame's default, so an epoch-0 run cannot catch a frame missing its
+        // epoch.  Drive the epoch to 1 first: the broker rejects batch 0.
+        h.gw->rejectNext = 1;
+        ASSERT_EQ(p.trySend(topic, key, std::span<const uint8_t>(val), AckToken{1}), SendResult::Ok);
+        for (int i = 0; i < kPumpMax && L.times(1) == 0; ++i) {
+            h.agent->doWork(monoNs());
+            h.gw->poll();
+            std::this_thread::sleep_for(kPumpSleep);
+        }
+        ASSERT_EQ(L.times(1), 1);
+        ASSERT_EQ(L.status(1), OpStatus::BrokerError) << "precondition: the rejection bumps the epoch";
         for (int i = 0; i < 3; ++i) {
             p.send(topic, key, std::span<const uint8_t>(val));
             p.flush();
         }
-        ASSERT_TRUE(h.pumpUntilBatches(3));
-        for (std::size_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(h.pumpUntilBatches(4));
+        for (std::size_t i = 1; i < 4; ++i) {
             const auto& b = h.gw->batches[i];
             ASSERT_GE(b.producerId, 0) << "precondition: idempotent header";
+            EXPECT_EQ(b.producerEpoch, 1) << "precondition: a NON-ZERO epoch, batch " << i;
             EXPECT_EQ(b.frameProducerId, b.producerId) << "frame producerId must equal the header's, batch " << i;
             EXPECT_EQ(b.frameProducerEpoch, b.producerEpoch) << "frame epoch must equal the header's, batch " << i;
             EXPECT_EQ(b.frameBaseSeq, b.baseSeq) << "frame baseSequence must equal the header's, batch " << i;
+            EXPECT_EQ(b.baseSeq, static_cast<int32_t>(i - 1)) << "the new epoch restarts at sequence 0";
         }
     }
 }

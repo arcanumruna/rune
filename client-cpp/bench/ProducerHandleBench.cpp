@@ -77,7 +77,7 @@ int main() {
             impl.drainRing(now, 256);
             impl.flushBatches(now, 1, sink);
             for (int64_t c : corr) {
-                impl.onProduceResponse(c, off);
+                impl.onProduceResponse(c, off, 0);
                 off += 64;
             }
             corr.clear();

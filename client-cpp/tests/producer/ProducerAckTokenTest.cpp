@@ -294,7 +294,7 @@ TEST(ProducerAckToken, DeliveryTimeoutCompletesDeliveryFailedOnceRegression) {
         EXPECT_EQ(L.status(t), OpStatus::DeliveryFailed) << t;
         EXPECT_EQ(L.value(t), -1) << t;
     }
-    impl->onProduceResponse(cs.corr[0], 100);  // late OK ack
+    impl->onProduceResponse(cs.corr[0], 100, 0);  // late OK ack
     for (rc::Token t = 1; t <= 3; ++t) EXPECT_EQ(L.times(t), 1) << t;
     EXPECT_TRUE(L.noneDuplicated());
 }
@@ -324,12 +324,12 @@ TEST(ProducerAckToken, DeferredSendAckCompletesOnceRegression) {
     ASSERT_EQ(impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, outer), SendResult::Ok);
     (void)impl.flushBatches(kNow, 42, sink);
     ASSERT_EQ(cs.corr.size(), 1u);
-    impl.onProduceResponse(cs.corr[0], 100);  // outer fires inside duty work: inner deferred
+    impl.onProduceResponse(cs.corr[0], 100, 0);  // outer fires inside duty work: inner deferred
     EXPECT_EQ(impl.deferredCount(), 0u) << "applied at the end of the duty scope";
     (void)impl.flushBatches(kNow, 42, sink);
     ASSERT_EQ(cs.corr.size(), 2u);
-    impl.onProduceResponse(cs.corr[1], 200);
-    impl.onProduceResponse(cs.corr[1], 200);  // duplicate
+    impl.onProduceResponse(cs.corr[1], 200, 0);
+    impl.onProduceResponse(cs.corr[1], 200, 0);  // duplicate
     EXPECT_EQ(innerFires, 1);
     EXPECT_EQ(inner, 200);
     EXPECT_TRUE(S.noneDuplicated());
@@ -347,7 +347,7 @@ TEST(ProducerAckToken, DeferredSendAckCompletesOnceRegression) {
     });
     ASSERT_EQ(impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, outer2), SendResult::Ok);
     (void)impl.flushBatches(kNow, 42, sink);
-    impl.onProduceResponse(cs.corr.back(), 300);
+    impl.onProduceResponse(cs.corr.back(), 300, 0);
     EXPECT_EQ(lostFires, 1);
     EXPECT_EQ(lost, -1);
     impl.failAllPending(OpStatus::Closed);
@@ -469,7 +469,7 @@ long ackedSteadyStateAllocs(ProducerImpl& impl, Send&& send) {
     auto cycle = [&](uint64_t k) {
         send(k);
         pumpBare(impl, sink);
-        impl.onProduceResponse(cs.corr.back(), static_cast<int64_t>(k));
+        impl.onProduceResponse(cs.corr.back(), static_cast<int64_t>(k), 0);
     };
     for (uint64_t k = 0; k < 64; ++k) cycle(k);  // warm-up
     alloc_counter::start();

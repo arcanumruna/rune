@@ -55,7 +55,8 @@ TEST(InvokerAgent, ProduceResponsesAreBufferedForTheOwnerWhenNoHookIsSet) {
     ASSERT_TRUE(drive([&] { return !agent.produceAcks().empty(); }));
     ASSERT_EQ(agent.produceAcks().size(), 1u);
     EXPECT_EQ(agent.produceAcks()[0].correlationId, 777);
-    EXPECT_EQ(agent.produceAcks()[0].baseOffsetOrError, 100);
+    EXPECT_EQ(agent.produceAcks()[0].baseOffset, 100);
+    EXPECT_EQ(agent.produceAcks()[0].errorCode, 0);
     agent.clearProduceAcks();
     EXPECT_TRUE(agent.produceAcks().empty());
     // Destruction order: gw (declared last) closes its Aeron client before the

@@ -57,7 +57,7 @@ TEST(ProducerAllocRegression, SteadyStateAckedFlushAllocatesNothingRegression) {
     auto cycle = [&](uint64_t k) {
         (void)impl.submitSendRecord(1, 0, Key(k), kVal, false, 0);
         pump(impl, sink);
-        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k));
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k), 0);
     };
     for (uint64_t k = 0; k < 64; ++k) cycle(k);   // warm-up: builder, ring, frame capacity
     alloc_counter::start();
@@ -85,7 +85,7 @@ TEST(ProducerAllocRegression, FrameSizeJitterDoesNotReallocateSlotRegression) {
     auto cycle = [&](uint64_t k, const std::vector<uint8_t>& v) {
         (void)impl.submitSendRecord(1, 0, Key(k), v, false, 0);
         pump(impl, sink);
-        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k));
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k), 0);
     };
     for (uint64_t k = 0; k < 64; ++k) cycle(k, small);  // warm-up at the SMALL size only
     alloc_counter::start();

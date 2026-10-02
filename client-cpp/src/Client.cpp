@@ -793,15 +793,15 @@ void Client::producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion
 
 void Client::producerCqDeliver_(CqRef ref, const Completion& c) noexcept {
     // Duty thread (or the closing thread).  One producer completion: a per-
-    // record / Tier-2 ack (one producer op) or a BatchAck (reserved0 credit
-    // units, each one producer op).
+    // record / Tier-2 ack (one producer op) or a BatchAck (batchAckUnits()
+    // credit units, each one producer op).
     const uint32_t idx = cqRefIndex(ref);
     if (idx >= cqSlots_.size()) {
         ++staleCqDrops_;
         return;
     }
     CqSlot& slot = cqSlots_[idx];
-    const uint64_t ops = c.op == OpKind::BatchAck ? c.reserved0 : 1u;
+    const uint64_t ops = c.op == OpKind::BatchAck ? batchAckUnits(c) : 1u;
     if (slot.ring != nullptr && slot.gen == cqRefGen(ref)) {
         (void)slot.ring->deliver(c, {});
         slot.prodDelivered += ops;
@@ -1649,7 +1649,7 @@ void Client::syncSeedSession_() noexcept {
 int Client::routeBufferedAcks_() {
     const auto acks = agent_.produceAcks();
     const int n = static_cast<int>(acks.size());
-    for (const auto& a : acks) producerHub_.onProduceResponse(a.correlationId, a.baseOffsetOrError);
+    for (const auto& a : acks) producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode);
     agent_.clearProduceAcks();
     return n;
 }

@@ -8,7 +8,7 @@
 //   On each doWork cycle the agent calls:
 //     hub.drainAndFlush(nowNs, sessionId, sendFn)
 //   When a ProduceResponse arrives (dispatchEgressFrame), the agent calls:
-//     hub.onProduceResponse(correlationId, baseOffset)  (O(1) by batch-id ordinal)
+//     hub.onProduceResponse(correlationId, baseOffset, errorCode)  (O(1) by batch-id ordinal)
 //
 // Threading model (shared-nothing, single-owner — NO atomics, NO locks):
 //   The producer list is owned SOLELY by the runner (agent) thread.  Every
@@ -139,7 +139,7 @@ public:
 
     /// Route a ProduceResponse to the ONE producer named by the batch id's
     /// ordinal (O(1)); non-batch ids (transactional / control) are ignored.
-    void onProduceResponse(int64_t correlationId, int64_t baseOffset);
+    void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode);
 
     /// Fail every pending ack with `st` (redirect-reconnect failure:
     /// SessionLost; the producers stay open).

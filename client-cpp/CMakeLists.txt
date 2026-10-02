@@ -1062,6 +1062,17 @@ if(BUILD_TESTING)
         endif()
         gtest_discover_tests(rune_invoker_tests)
 
+        # EOS-OOS / EOS-DUP follow-ups: idempotence end to end against the
+        # InvokerGateway's broker idempotence model + fault injection (own
+        # binary: public API + bare ProducerImpl only).
+        add_executable(rune_eos_tests tests/producer/ProducerEosTest.cpp)
+        target_include_directories(rune_eos_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_eos_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
+            target_link_libraries(rune_eos_tests PRIVATE ${UUID_LIB_INVOKER})
+        endif()
+        gtest_discover_tests(rune_eos_tests)
+
         # T15b Gate 4: SIGSTOP DR gate (fork: a client process under SIGSTOP /
         # SIGCONT; own binary so the fork happens in a single-threaded process).
         add_executable(rune_shard_dr_gate_tests tests/shard/ShardSigstopDrGateTest.cpp)

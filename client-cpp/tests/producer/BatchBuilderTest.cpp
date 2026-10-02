@@ -331,8 +331,8 @@ struct CB3AgentHarness {
                 return hub.drainAndFlush(nowNs, sessionId, std::move(sendFn));
             });
         agent->setProduceResponseFn(
-            [this](int64_t correlationId, int64_t baseOffset) {
-                hub.onProduceResponse(correlationId, baseOffset);
+            [this](int64_t correlationId, int64_t baseOffset, int16_t errorCode) {
+                hub.onProduceResponse(correlationId, baseOffset, errorCode);
             });
         agent->setEgressObserver([](rcc::TemplateId, const uint8_t*, std::size_t){});
 
@@ -993,8 +993,8 @@ TEST(BatchBuilder, CrossTierOrderingUnderMaxInFlight) {
             return hub.drainAndFlush(nowNs, sessionId, std::move(sendFn));
         });
     agent->setProduceResponseFn(
-        [&](int64_t correlationId, int64_t baseOffset) {
-            hub.onProduceResponse(correlationId, baseOffset);
+        [&](int64_t correlationId, int64_t baseOffset, int16_t errorCode) {
+            hub.onProduceResponse(correlationId, baseOffset, errorCode);
         });
     agent->setEgressObserver([](rcc::TemplateId, const uint8_t*, std::size_t){});
     agent->start();
@@ -1127,7 +1127,7 @@ TEST(BatchBuilder, RingFullTier2FailsFast) {
 
     auto agent = std::make_unique<rca::ClientAgent>(cfg);
     agent->setProducerDrainFn([](int64_t,int64_t,rca::ClientAgent::SendFn){return 0;});
-    agent->setProduceResponseFn([](int64_t,int64_t){});
+    agent->setProduceResponseFn([](int64_t,int64_t,int16_t){});
     agent->setEgressObserver([](rcc::TemplateId,const uint8_t*,std::size_t){});
     agent->start();
     std::this_thread::sleep_for(150ms);
@@ -1205,7 +1205,7 @@ TEST(BatchBuilder, RingFullTier1FutureFailsFast) {
     rprod::ProducerHub   hub;
     auto agent = std::make_unique<rca::ClientAgent>(cfg);
     agent->setProducerDrainFn([](int64_t,int64_t,rca::ClientAgent::SendFn){return 0;});
-    agent->setProduceResponseFn([](int64_t,int64_t){});
+    agent->setProduceResponseFn([](int64_t,int64_t,int16_t){});
     agent->setEgressObserver([](rcc::TemplateId,const uint8_t*,std::size_t){});
     agent->start();
     std::this_thread::sleep_for(150ms);

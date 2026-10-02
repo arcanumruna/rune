@@ -118,7 +118,7 @@ inline constexpr uint64_t kRefMask    = 0x7FFF;
 
 /// The reservation (and returned credit) of one producer completion record: a
 /// per-record / Tier-2 ack, and each credit unit of a BatchAck record.
-inline constexpr uint32_t kAckRecordBytes = 48;  // CompletionRing::completionRecordBytes(0)
+inline constexpr uint32_t kAckRecordBytes = kBatchAckUnitBytes;  // CompletionRing::completionRecordBytes(0)
 
 // kMsgTier2Batch token: 8 bytes = a heap Tier2Entry* (int64 LE).  The entry's
 // ownership travels through the ring (spec §1a.2) — no side queue, no mutex.
@@ -182,6 +182,12 @@ struct PartitionState {
     // Fixed ring of in-flight (sent, un-acked) batches; capacity = maxInFlight
     // rounded up to a power of two (spec §4.3).
     InFlightRing inflight;
+    // EOS-OOS: live batches parked on OutOfOrderSequence (InFlightBatch::oosParked)
+    // and whether their older batches have all resolved, so they must be re-sent
+    // — in sequence order, BEFORE any new batch of this partition — by the next
+    // flushBatches visit.
+    uint32_t parkedCount  = 0;
+    bool     resendParked = false;
 
     // RecordBatchBuilder (reused; reset after each flush).
     // Lazy-initialised on first append.
@@ -780,9 +786,15 @@ public:
     template <class Sink>
     int retransmitStalled(int64_t nowNs, const Sink& sink);
 
-    /// Called by the agent when a ProduceResponse arrives.  Completes the batch's
-    /// ack-ring slice (record i -> baseOffset + i) and reports its BatchAck.
-    void onProduceResponse(int64_t correlationId, int64_t baseOffset);
+    /// Called by the agent when a ProduceResponse arrives.  errorCode 0 completes
+    /// the batch's ack-ring slice (record i -> baseOffset + i) and reports its
+    /// BatchAck; baseOffset < 0 with errorCode 0 is a known-old duplicate (Kafka
+    /// DUPLICATE_SEQUENCE parity: the batch IS in the log, its offset is unknown)
+    /// — every record completes Ok with offset -1.  errorCode != 0 fails the
+    /// batch, except OutOfOrderSequence on a batch that is not the oldest live
+    /// batch of its epoch: an earlier frame was lost, so it is parked and re-sent
+    /// once the older batches resolve (Kafka parity).
+    void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode);
 
     /// Called on redirect-reconnect failure (SessionLost) and by the close paths
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
@@ -1035,6 +1047,25 @@ private:
                             int64_t sessionId,
                             const Sink& sink);
 
+    /// EOS-OOS: OutOfOrderSequence on a batch with an older live batch of its
+    /// epoch — park it (no completion, no epoch bump) and fast-retransmit the
+    /// older batches whose last offer was not after its own (the lost frame).
+    void parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcept;
+    /// A parked batch that was re-sent (or resolved) is no longer parked.
+    static void unpark_(PartitionState& ps, InFlightBatch& b) noexcept {
+        if (b.oosParked) {
+            b.oosParked = false;
+            --ps.parkedCount;
+        }
+    }
+    /// Releases a resolved batch's slot; when the oldest live batch left is a
+    /// parked one, its older batches all resolved: arm resendParked.
+    void releaseResolved_(PartitionState& ps, InFlightBatch& b) noexcept;
+    /// flushBatches: re-send every parked batch of `ps` oldest-first (stored
+    /// frames).  False on transport back-pressure (retried next pass).
+    template <class Sink>
+    bool resendParked_(PartitionState& ps, int64_t nowNs, const Sink& sink);
+
     [[nodiscard]] bool canFlight_(const PartitionState& ps) const noexcept {
         return static_cast<int32_t>(ps.inflight.live()) < cfg_.maxInFlight && !ps.inflight.full();
     }
@@ -1075,12 +1106,13 @@ private:
     /// `units`: the batch-ack credit units it returns (records of a Tier-1
     /// batch; 1 for a Tier-2 batch / a single never-sent record).
     void emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence, int32_t recordCount,
-                       int64_t baseOffset, int16_t errorCode, OpStatus st, uint32_t units) noexcept;
+                       int64_t baseOffset, int16_t errorCode, OpStatus st, uint32_t units,
+                       int16_t producerEpoch) noexcept;
     /// Records that never reached a batch (failed in the ring / a builder /
     /// the Tier-2 queue / the arena): a BatchAck{baseSequence -1, kClientFailure}.
     void emitUnsentBatchAck_(int32_t topicId, int32_t partition, int32_t recordCount, OpStatus st,
                              uint32_t units) noexcept {
-        emitBatchAck_(topicId, partition, -1, recordCount, -1, BatchAck::kClientFailure, st, units);
+        emitBatchAck_(topicId, partition, -1, recordCount, -1, BatchAck::kClientFailure, st, units, -1);
     }
     /// Fails a live batch's records and releases its slot.
     void failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st);
