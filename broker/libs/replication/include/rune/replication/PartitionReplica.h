@@ -370,8 +370,8 @@ public:
     ///     CRC-safe: [0..7] precede the CRC region), never via makeBatch_;
     ///   - then append()'s post-append sequence: leader LEO, HW, cleaner
     ///     publish, push-on-append, and the SAME flush request append() issues
-    ///     (shard: followerFlushRequested_ for the owning worker; legacy: the
-    ///     inline durable sync append() did).
+    ///     (worker-driven: followerFlushRequested_ for the owning worker;
+    ///     control-thread internal partitions: the inline durable sync).
     ///
     /// \returns the marker's base offset, or a negative kAppend* code.
     Offset appendControlBatch(std::span<const uint8_t> controlBatch, bool acksAll = true);
@@ -681,10 +681,14 @@ public:
     [[nodiscard]] uint32_t registryId()  const noexcept { return registryId_; }
     [[nodiscard]] uint32_t incarnation() const noexcept { return incarnation_; }
 
+    /// Worker-driven user replicas (every placement, F30): the follower flush,
+    /// leader append / txn-marker flushes and roll seals become requests the
+    /// owning worker submits to its io backend — never an inline fsync.
     void setExternalFollowerFlush(bool on) noexcept {
         externalFollowerFlush_ = on;
         if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setDeferSealSync(on);
     }
+    [[nodiscard]] bool externalFollowerFlush() const noexcept { return externalFollowerFlush_; }
     /// Leader-epoch checkpoint writes (the one accepted synchronous disk write
     /// on a shard loop — see checkpointEpochs_).
     [[nodiscard]] uint64_t epochCheckpointWritesForTest() const noexcept { return epochCheckpointWrites_; }
@@ -1018,7 +1022,7 @@ private:
     int64_t lastKnownNowNs_ = 0;   ///< most-recent doWork() clock, for message handlers
     bool followerApplyDirty_ = false;  ///< follower applied via appendNoSync since last flush
     int64_t lastFollowerSyncNs_ = 0;   ///< last coalesced follower fsync (time-gated)
-    bool externalFollowerFlush_ = false;   ///< shard mode: worker submits the flush (async)
+    bool externalFollowerFlush_ = false;   ///< worker-driven (every placement): worker submits the flush (async)
     uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
     uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
     uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation / reconcile append

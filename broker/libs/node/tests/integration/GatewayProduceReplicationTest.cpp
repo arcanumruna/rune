@@ -653,6 +653,19 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
     }
     EXPECT_TRUE(anyFollowerConverged) << "At least one follower must have replicated";
 
+    // F30 fix round 1 (F7): BrokerNode wiring, default (thread-placement)
+    // config — every user replica on every node is worker-driven: its follower
+    // flush / roll seals are io submissions of the owning worker, never an
+    // inline fsync.  Read on the replica's TRUE owner thread.
+    for (int i = 0; i < 3; ++i) {
+        const bool workerDriven = allNodes[i]->onOwnerThreadForTest(0, 0,
+            [](rune::replication::PartitionReplica& r) {
+                return r.externalFollowerFlush() && r.isDiskBacked() && r.log()->deferSealSync();
+            });
+        EXPECT_TRUE(workerDriven) << "node " << i << ": user replica must use the worker's external flush "
+                                     "+ deferred seals (BrokerNode wiring)";
+    }
+
     // -----------------------------------------------------------------------
     // 7. Teardown.
     // -----------------------------------------------------------------------

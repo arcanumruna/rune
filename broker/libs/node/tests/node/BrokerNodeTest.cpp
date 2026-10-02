@@ -1609,6 +1609,18 @@ TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegress
             ASSERT_TRUE(installed[w]) << "worker " << w << " never installed the validator";
     }
 
+    // F30 fix round 1 (F3): a RUNTIME-created user replica (thread placement,
+    // the default WorkerMode) gets the same worker-driven durability as a boot
+    // one — external follower flush + deferred roll seals, never inline fsync.
+    for (int32_t p = 0; p < static_cast<int32_t>(kParts); ++p) {
+        const bool workerDriven = node.onOwnerThreadForTest(topicId, p,
+            [](rune::replication::PartitionReplica& r) {
+                return r.externalFollowerFlush() && r.isDiskBacked() && r.log()->deferSealSync();
+            });
+        EXPECT_TRUE(workerDriven) << "runtime topic partition " << p
+                                  << ": must use the worker's external flush + deferred seals";
+    }
+
     // Produce: non-conforming rejected, conforming accepted.  Retry ONLY
     // NotLeader (runtime-topic leadership settling) with a short backoff; a
     // missing response or the overall deadline fails at once.

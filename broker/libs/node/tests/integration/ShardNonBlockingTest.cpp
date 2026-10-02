@@ -92,8 +92,8 @@ PartitionConfig cfg(rune::replication::NodeId self, uint8_t tier = 1, int32_t to
     c.replicaLagMaxMs = 1'000'000;
     return c;
 }
-void applyOneBatch(PartitionReplica& follower, int64_t base) {
-    const auto b = batchAt(base);
+void applyOneBatch(PartitionReplica& follower, int64_t base, std::size_t valueBytes = 0) {
+    const auto b = valueBytes ? batchAt(base, 1, valueBytes) : batchAt(base);
     rune::replication::FetchResponseMsg resp{1, 0, 0, 0, rune::replication::kErrNone, 1,
                                              std::span<const uint8_t>(b)};
     follower.applyReplicated(resp);
@@ -133,15 +133,17 @@ struct StrictShard {
     NullTransport t;
     std::unique_ptr<PartitionReplica> leader;
     Worker w{0, 1 << 16, 1 << 16, 64, 64};
+    // F30 fix round 1: `shard == false` is thread placement (the default
+    // WorkerMode) — the same worker-driven, never-inline durability rules hold.
     explicit StrictShard(int64_t rollBytes = 64LL * 1024 * 1024,
-                         std::vector<rune::replication::NodeId> isr = {1}) {
+                         std::vector<rune::replication::NodeId> isr = {1}, bool shard = true) {
         log = std::make_unique<Log>(d.path.string(), rollBytes);
         log->recover();
         leader = std::make_unique<PartitionReplica>(cfg(1, /*tier=*/2), Role::Leader, 1, isr, isr, log.get(), &t);
         leader->setExternalFollowerFlush(true);
         w.setOwnedDirect(Worker::OwnedSet{leader.get()});
         w.setWorkerIngress(nullptr, true);
-        w.setShardMode(true);
+        w.setShardMode(shard);
     }
     int produce(int64_t corr, const std::vector<uint8_t>& batch, uint8_t acks, int64_t now,
                 int64_t pid = -1, int32_t seq = -1) {
@@ -184,7 +186,9 @@ TEST(ShardNonBlockingRegression, FollowerFlushNeverSyncsOnTheWorkerThread) {
 }
 
 TEST(ShardNonBlockingRegression, LegacyFollowerFlushStillSyncsInline) {
-    // Legacy (non-shard) mode is unchanged: the replica fsyncs inline.
+    // A replica WITHOUT the external flush (internal partitions, driven on the
+    // control thread) is unchanged: it fsyncs inline.  Every worker-driven user
+    // replica uses the external flush in every placement (F30).
     TmpDir d;
     Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
     NullTransport t;
@@ -215,6 +219,247 @@ TEST(ShardNonBlockingRegression, OwnedLogSyncIsAsyncAndIdleLogIsNotResubmitted) 
     EXPECT_EQ(s.w.bgFlushSubmitsForTest(), settled) << "an unchanged log is not resubmitted (no phantom work)";
     EXPECT_EQ(work, 0) << "an idle shard reports no work (backoff can park)";
     EXPECT_EQ(s.log->syncCallsForTest(), 0u);
+}
+
+// ============================================================================
+// F30: the same never-block rules hold for a NON-shard (thread-placement) worker.
+// Before the fix the non-shard loop fsynced inline on the worker thread (follower
+// flush every 20 ms + time-gated owned-log sync every 10 ms) and never submitted
+// deferred roll seals — stalling every partition the worker owns for ms.
+// ============================================================================
+
+TEST(NonShardNonBlockingRegression, FollowerFlushIsSubmittedNotSyncedInlineRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&follower});
+    w.setWorkerIngress(nullptr, true);                     // per-worker ingress (the optimal config)
+    applyOneBatch(follower, 0);
+    ASSERT_GT(log.logEndOffset(), 0);
+    w.doWork(25 * kMs);                                    // past the 20 ms follower flush interval
+    EXPECT_EQ(log.syncCallsForTest(), 0u) << "the follower flush must not block a non-shard worker";
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), 1u) << "it is submitted to the io backend";
+    for (int i = 0; i < kCap && w.bgFlushInFlightForTest() > 0; ++i) { w.doWork(26 * kMs); std::this_thread::yield(); }
+    EXPECT_EQ(w.bgFlushInFlightForTest(), 0u);
+    EXPECT_EQ(w.bgFlushErrorsForTest(), 0u);
+    EXPECT_EQ(w.lastSyncedLeoForTest(&log), log.logEndOffset());
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+
+TEST(NonShardNonBlockingRegression, OwnedLogTimedSyncIsAsyncRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica leader(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    leader.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setWorkerIngress(nullptr, true);
+    w.doWork(1 * kMs);                                     // arms the owned-log sync interval
+    leader.append(std::span<const uint8_t>(std::vector<uint8_t>(16, 1)));
+    // F30 fix round 1 (F6): consume the append's flush request so ONLY the
+    // timed owned-log sync can submit a flush for this log.
+    ASSERT_TRUE(leader.takeFollowerFlushRequest());
+    w.doWork(5 * kMs);                                     // < 10 ms: not due yet
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), 0u) << "nothing submits before the owned-log sync interval";
+    w.doWork(12 * kMs);                                    // > 10 ms: owned-log sync due
+    EXPECT_EQ(log.syncCallsForTest(), 0u) << "the timed owned-log sync must not fsync inline on a non-shard worker";
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), 1u) << "the timed owned-log sync submitted exactly one flush";
+    for (int i = 0; i < kCap && w.bgFlushInFlightForTest() > 0; ++i) { w.doWork(13 * kMs); std::this_thread::yield(); }
+    EXPECT_EQ(w.lastSyncedLeoForTest(&log), log.logEndOffset());
+    const uint64_t settled = w.bgFlushSubmitsForTest();
+    w.doWork(30 * kMs);                                    // next interval, unchanged log
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), settled) << "an unchanged log is not resubmitted";
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+
+TEST(NonShardNonBlockingRegression, DeferredRollSealIsSubmittedRegression) {
+    TmpDir d;
+    Log log(d.path.string(), /*rollBytes=*/512); log.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);               // defers the roll seal to the worker
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&follower});
+    w.setWorkerIngress(nullptr, true);
+    applyOneBatch(follower, 0, 600);                       // fills segment A
+    applyOneBatch(follower, 1, 16);                        // rolls: A sealed (deferred)
+    ASSERT_GT(log.pendingSealCount(), 0u);
+    w.doWork(1 * kMs);
+    EXPECT_EQ(w.sealSubmitsForTest(), 1u) << "a non-shard worker must submit the deferred seal (else it is never fsynced)";
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+
+// F30 fix round 1 (F4): the DEFAULT configuration (thread placement, per-worker
+// ingress OFF).  A follower flush the io backend refuses (in-flight depth
+// reached) is consumed and never re-raised by an idle follower — the time-gated
+// owned-log sync must run in every configuration and re-request it.
+TEST(NonShardNonBlockingRegression, DefaultConfigRefusedFollowerFlushIsEventuallyFlushedRegression) {
+    TmpDir d, d2;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    Log other(d2.path.string(), 64LL * 1024 * 1024); other.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);
+    PartitionReplica holder(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &other, &t);
+    holder.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, /*ioSubmitDepth=*/1, /*ioComplDepth=*/1);
+    w.setOwnedDirect(Worker::OwnedSet{&follower, &holder});   // default config: no per-worker ingress
+    w.setReapPausedForTest(true);
+    ASSERT_NE(w.submitBgFlushForTest(&other), kNoToken);   // occupies the whole io depth
+    applyOneBatch(follower, 0);
+    ASSERT_GT(log.logEndOffset(), 0);
+    w.doWork(25 * kMs);                                    // the follower flush request is raised + refused
+    ASSERT_EQ(w.bgFlushDeferredForTest(), 1u) << "test setup: the follower flush must be refused";
+    ASSERT_EQ(w.lastSyncedLeoForTest(&log), 0);
+    w.setReapPausedForTest(false);
+    int64_t now = 25 * kMs;
+    for (int i = 0; i < kCap && w.lastSyncedLeoForTest(&log) != log.logEndOffset(); ++i) {
+        w.doWork(now += kMs);                              // no further applies: only time passes
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(w.lastSyncedLeoForTest(&log), log.logEndOffset())
+        << "a refused follower flush must be re-requested (never unflushed forever)";
+    EXPECT_EQ(w.bgFlushErrorsForTest(), 0u);
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+
+// F30 fix round 1 (F4): an ownership move drops the old owner's coalesced
+// "dirty again" re-request; the NEW owner (default config) must flush the
+// unflushed data within one owned-log sync interval.
+TEST(NonShardNonBlockingRegression, OwnershipMoveUnflushedDataIsFlushedByNewOwnerRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);
+    Worker a(0, 1 << 16, 1 << 16, 64, 64);
+    Worker b(1, 1 << 16, 1 << 16, 64, 64);
+    a.setOwnedDirect(Worker::OwnedSet{&follower});
+    a.setReapPausedForTest(true);                          // A's flush stays in flight
+    applyOneBatch(follower, 0);
+    a.doWork(25 * kMs);                                    // A submits the follower flush
+    ASSERT_EQ(a.bgFlushSubmitsForTest(), 1u);
+    applyOneBatch(follower, 1);
+    a.doWork(50 * kMs);                                    // newer data: coalesced as "dirty again" on A
+    ASSERT_EQ(a.bgFlushSubmitsForTest(), 1u);
+    a.setOwnedDirect(Worker::OwnedSet{});                  // ownership move: A purges the slot
+    b.setOwnedDirect(Worker::OwnedSet{&follower});
+    int64_t now = 50 * kMs;
+    for (int i = 0; i < kCap && b.lastSyncedLeoForTest(&log) != log.logEndOffset(); ++i) {
+        b.doWork(now += kMs);
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(b.lastSyncedLeoForTest(&log), log.logEndOffset())
+        << "the new owner flushes data the old owner never made durable";
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+    a.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && a.ioCompletionsReapedForTest() < 1; ++i) { a.doWork(now); std::this_thread::yield(); }
+}
+
+// F30 fix round 1 (F5): a follower truncation below the synced LEO is
+// reconciled in the thread-placement pass — re-appended bytes below the stale
+// mark are flushed by the timed sync (else never, once traffic stops).
+namespace {
+void followerTruncationThenReappendIsReflushed(bool shard) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&follower});
+    w.setWorkerIngress(nullptr, true);                     // timed sync active before F30 too: isolates F5
+    w.setShardMode(shard);
+    applyOneBatch(follower, 0);
+    applyOneBatch(follower, 1);
+    w.doWork(25 * kMs);                                    // follower flush submitted
+    int64_t now = 25 * kMs;
+    for (int i = 0; i < kCap && w.bgFlushInFlightForTest() > 0; ++i) { w.doWork(now += 1000); std::this_thread::yield(); }
+    ASSERT_EQ(w.lastSyncedLeoForTest(&log), 2);
+    log.truncateTo(0);                                     // follower truncation (divergence / role change)
+    const auto b = batchAt(0);
+    log.appendNoSync(b.data(), b.size(), 0);               // re-append below the stale mark (LEO 1),
+                                                           // BEFORE the worker's next pass sees the cut
+    ASSERT_EQ(log.logEndOffset(), 1);
+    const uint64_t before = w.bgFlushSubmitsForTest();
+    for (int i = 0; i < 64 && w.lastSyncedLeoForTest(&log) != log.logEndOffset(); ++i) {
+        now += 11 * kMs;                                   // one owned-log sync interval per step
+        w.doWork(now);
+        for (int j = 0; j < kCap && w.bgFlushInFlightForTest() > 0; ++j) { w.doWork(now); std::this_thread::yield(); }
+    }
+    EXPECT_GT(w.bgFlushSubmitsForTest(), before) << "re-appended data below the stale synced mark is flushed";
+    EXPECT_EQ(w.lastSyncedLeoForTest(&log), 1);
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+} // namespace
+
+TEST(NonShardNonBlockingRegression, FollowerTruncationThenReappendIsReflushedRegression) {
+    followerTruncationThenReappendIsReflushed(/*shard=*/false);
+}
+TEST(ShardNonBlockingRegression, FollowerTruncationThenReappendIsReflushedRegression) {
+    followerTruncationThenReappendIsReflushed(/*shard=*/true);
+}
+
+// F30 fix round 1 (F7): a deferred roll seal the io backend refuses stays queued
+// (pinned) and is submitted on a later pass in thread placement — never lost —
+// and completes.
+TEST(NonShardNonBlockingRegression, RefusedRollSealIsRetriedAndCompletesRegression) {
+    TmpDir d, d2;
+    Log log(d.path.string(), /*rollBytes=*/512); log.recover();
+    Log other(d2.path.string(), 64LL * 1024 * 1024); other.recover();
+    NullTransport t;
+    PartitionReplica follower(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);
+    PartitionReplica holder(cfg(1, 1, 1, 1), Role::Leader, 1, {1}, {1}, &other, &t);
+    holder.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, /*ioSubmitDepth=*/1, /*ioComplDepth=*/1);
+    w.setOwnedDirect(Worker::OwnedSet{&follower, &holder});
+    w.setReapPausedForTest(true);
+    ASSERT_NE(w.submitBgFlushForTest(&other), kNoToken);   // occupies the whole io depth
+    applyOneBatch(follower, 0, 600);                       // fills segment A
+    applyOneBatch(follower, 1, 16);                        // rolls: A sealed (deferred)
+    ASSERT_EQ(log.pendingSealCount(), 1u);
+    w.doWork(1 * kMs);
+    EXPECT_EQ(w.sealSubmitsForTest(), 0u) << "refused: io depth reached";
+    EXPECT_EQ(log.pendingSealCount(), 1u) << "a refused seal stays queued";
+    w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && (w.sealSubmitsForTest() == 0 || w.ioCompletionsReapedForTest() < 2); ++i) {
+        w.doWork(1 * kMs + i);
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(w.sealSubmitsForTest(), 1u);
+    EXPECT_EQ(log.pendingSealCount(), 0u);
+    EXPECT_GE(w.ioCompletionsReapedForTest(), 2u) << "the seal completed";
+    EXPECT_EQ(w.bgFlushErrorsForTest(), 0u);
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+}
+
+// F30 fix round 1 (F8): in thread placement a txn marker no longer fsyncs
+// inline on the worker (as in shard mode) — its durability is an io token.
+TEST(NonShardNonBlockingRegression, TxnMarkerAppendIsAsyncInThreadPlacementRegression) {
+    StrictShard s(64LL * 1024 * 1024, {1}, /*shard=*/false);
+    const auto marker = rune::transaction::ControlMarker::build(7, 0, rune::transaction::ControlType::Commit, 0);
+    WorkerOp op;
+    op.type = WorkerOp::Type::AppendControlRecord; op.topicId = 1; op.partition = 0;
+    op.replica = s.leader.get(); op.logPtr = s.log.get();
+    op.recordBatchBytes = marker;
+    ASSERT_TRUE(s.w.tryEnqueueOp(std::move(op)));
+    s.w.doWork(1);
+    EXPECT_GT(s.log->logEndOffset(), 0) << "the marker was appended";
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "the marker append must not fsync inline on a worker";
+    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 1u) << "its durability is a background io token";
+    for (int i = 0; i < kCap && s.w.bgFlushInFlightForTest() > 0; ++i) { s.w.doWork(2); std::this_thread::yield(); }
+    EXPECT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), s.log->logEndOffset());
 }
 
 TEST(ShardNonBlockingRegression, TxnMarkerAppendIsAsyncInShardMode) {
@@ -327,8 +572,13 @@ TEST(ShardNonBlockingRegression, StrictAckNotWedgedByTokenAliasingRegression) {
 // Strict tier (shard): ack only after its OWN fsync; acks=all then HW.
 // ============================================================================
 
-TEST(ShardNonBlockingRegression, StrictAcksAllWaitsForFsyncThenHw) {
-    StrictShard s(64LL * 1024 * 1024, {1, 2});            // follower 2 in ISR: HW needs its fetch
+// F30 fix round 1 (F1 + F2): the Strict tier is completion-gated (and gated on
+// outstanding roll seals) in EVERY placement — thread placement never fsyncs
+// inline on a worker either.  Param: true = shard, false = thread placement.
+class StrictPlacementRegression : public ::testing::TestWithParam<bool> {};
+
+TEST_P(StrictPlacementRegression, StrictAcksAllWaitsForFsyncThenHw) {
+    StrictShard s(64LL * 1024 * 1024, {1, 2}, GetParam()); // follower 2 in ISR: HW needs its fetch
     s.w.setReapPausedForTest(true);
     ASSERT_EQ(s.produce(7, batchAt(0, 3), /*acks=all*/1, 1), 1);
     s.w.doWork(1);
@@ -430,12 +680,12 @@ TEST(ShardNonBlockingRegression, StrictTierAcksFromItsOwnCompletionWithoutInline
 // Roll seal: async in shard mode; the sealed segment's fd outlives its flush.
 // ============================================================================
 
-TEST(ShardNonBlockingRegression, RollSealIsAsyncAndGatesStrictAcks) {
-    StrictShard s(/*rollBytes=*/512);
+TEST_P(StrictPlacementRegression, RollSealIsAsyncAndGatesStrictAcks) {
+    StrictShard s(/*rollBytes=*/512, {1}, GetParam());
     s.w.setReapPausedForTest(true);
     ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);  // segment A (>= rollBytes)
     ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // rolls: A sealed, appended to B
-    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "the seal fsync is not inline in shard mode";
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "the seal fsync is never inline on a worker (any placement)";
     s.w.doWork(1);
     EXPECT_EQ(s.w.sealSubmitsForTest(), 1u) << "the sealed segment is flushed through the io backend";
     ASSERT_EQ(s.w.durablePendingCountForTest(), 2u);
@@ -450,6 +700,11 @@ TEST(ShardNonBlockingRegression, RollSealIsAsyncAndGatesStrictAcks) {
     for (const auto& r : a.rets) EXPECT_EQ(r.errorCode, 0);
     EXPECT_EQ(s.log->syncCallsForTest(), 0u);
 }
+
+INSTANTIATE_TEST_SUITE_P(Placement, StrictPlacementRegression, ::testing::Values(true, false),
+                         [](const ::testing::TestParamInfo<bool>& i) {
+                             return std::string(i.param ? "Shard" : "ThreadPlacement");
+                         });
 
 TEST(ShardNonBlockingRegression, SegmentWithInFlightFlushDefersItsClose) {
     // M1: a segment removed (truncate / retention / reload) while a flush token is
@@ -813,22 +1068,23 @@ TEST(StorageFailStopRegression, FailedLogIsNeverSubmittedAgain) {
     EXPECT_EQ(a.rets[0].errorCode, kStorageError);
 }
 
-TEST(StorageFailStopRegression, InlineStrictSyncFailureIsStorageError) {
-    // Legacy (non-shard) WorkerIngress Strict path: the inline fsync fails.
-    TmpDir d;
-    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
-    NullTransport t;
-    PartitionReplica leader(cfg(1, /*tier=*/2), Role::Leader, 1, {1}, {1}, &log, &t);
-    Worker w(0, 1 << 16, 1 << 16, 64, 64);
-    w.setOwnedDirect(Worker::OwnedSet{&leader});
-    w.setWorkerIngress(nullptr, true);
-    log.setSyncFaultForTest(EIO);
-    const auto f = produceFrame(1, batchAt(0), 0);
-    ASSERT_EQ(w.handleIngressFrameForTest(f.data(), f.size(), 1), 1);
+TEST(StorageFailStopRegression, ThreadPlacementStrictFsyncFailureIsStorageErrorRegression) {
+    // F30 fix round 1 (F2): the thread-placement WorkerIngress Strict path no
+    // longer fsyncs inline — its OWN io completion carries the fsync error, and
+    // the ack fails StorageError (never OK).
+    StrictShard s(64LL * 1024 * 1024, {1}, /*shard=*/false);
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0), 0, 1), 1);
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on a thread-placement worker";
+    s.w.doWork(1);
+    const auto tok = s.w.durablePendingTokenForTest(0);
+    ASSERT_NE(tok, kNoToken);
+    s.w.deliverCompletionForTest(FlushCompletion{tok, EIO, 0});
     Acks a;
-    a.drain(w);
+    a.drain(s.w);
     ASSERT_EQ(a.n, 1);
     EXPECT_EQ(a.rets[0].errorCode, kStorageError);
+    EXPECT_TRUE(s.log->storageFailed());
 }
 
 TEST(StorageFailStopRegression, OwnershipMoveFailsAcksAllWaitersNoCrossThreadReadRegression) {
