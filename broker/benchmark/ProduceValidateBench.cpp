@@ -65,9 +65,9 @@ static constexpr int32_t kPartition  = 0;
 // ---------------------------------------------------------------------------
 class NullTransport : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(rune::replication::NodeId,
-                           const rune::replication::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId,
+                           const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------

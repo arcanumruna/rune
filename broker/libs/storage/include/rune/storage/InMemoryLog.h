@@ -187,6 +187,10 @@ public:
         return v;
     }
 
+    /// F27 R2: parity with Log::installGeneration() — an in-memory ring never
+    /// swaps segments; truncation/eviction change the LEO/view the memo also keys on.
+    [[nodiscard]] uint64_t installGeneration() const noexcept { return 0; }
+
     [[nodiscard]] int64_t logEndOffset() const noexcept {
         return logEndOffset_;
     }

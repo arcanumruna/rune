@@ -654,3 +654,124 @@ TEST(AeronPartitionTransportRegression, TrafficCountersArePerInstance) {
     EXPECT_EQ(b1.outDrained, b0.outDrained) << "draining A must not move B's counter";
     EXPECT_EQ(b1.polls, b0.polls) << "polling A must not move B's counter";
 }
+
+// ===========================================================================
+// F27 re-review R1 / R4: the REAL drainOutbound wiring (PubOffer + sendOnPub)
+// over a real driver.  Peer 2 is LIVE, peer 3 is DEAD (no subscriber →
+// NOT_CONNECTED forever), peer 4's registration FAILED (no publication ever).
+// Far more broadcasts than a dead peer's FIFO could hold: every one reaches the
+// live peer, the outbound ring never freezes, nothing is held for the dead /
+// unregistered peers.  Bounded real-time loops (driver I/O), no sleeps.
+// ===========================================================================
+namespace {
+struct LiveSub {
+    std::shared_ptr<aeron::Subscription> sub;
+    int fragments = 0;
+    int poll() {
+        return sub->poll([this](aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                                aeron::util::index_t, aeron::Header&) { ++fragments; }, 256);
+    }
+};
+LiveSub addLiveSub(aeron::Aeron& a, const std::string& ch, int32_t stream) {
+    const int64_t id = a.addSubscription(ch, stream);
+    LiveSub s;
+    const auto deadline = steady_clock::now() + seconds(5);
+    while (!(s.sub = a.findSubscription(id)) && steady_clock::now() < deadline) std::this_thread::yield();
+    return s;
+}
+} // namespace
+
+TEST(AeronPartitionTransportRegression, DrainDeadAndUnregisteredPeersNeverBlockLivePeerRegression) {
+    TempDir driverTd("rune_f27_drain_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    constexpr int32_t kStream = 931;
+    const uint16_t selfPort = discoverFreeUdpPort();
+    const uint16_t livePort = discoverFreeUdpPort();
+    const uint16_t deadPort = discoverFreeUdpPort();
+    LiveSub live = addLiveSub(*aeronClient, udpChannel(livePort), kStream);
+    ASSERT_TRUE(live.sub);
+
+    AeronPartitionTransport t(aeronClient, udpChannel(selfPort), kStream, /*selfId=*/1,
+                              /*outboundRingBytes=*/64 * 1024);    // FIFO per peer = 64 KiB
+    t.addPeer(2, udpChannel(livePort), kStream);
+    t.addPeer(3, udpChannel(deadPort), kStream);                   // nobody listens
+    t.addPeer(4, "aeron:udp?endpoint=", kStream);                  // registration fails
+
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1; req.partition = 0; req.followerId = 1;
+    req.fetchOffset = 0; req.maxBytes = 1024; req.topicId = 0;
+
+    // Wait (bounded) until the live publication is connected: one probe arrives.
+    {
+        const auto deadline = steady_clock::now() + seconds(10);
+        bool up = false;
+        while (!up && steady_clock::now() < deadline) {
+            (void)t.sendFetchRequest(req);
+            (void)t.poll(1);
+            (void)live.poll();
+            up = live.fragments > 0;
+        }
+        ASSERT_TRUE(up) << "live peer never connected";
+    }
+
+    constexpr int kFrames = 6000;   // 6000 × ~72 B ≈ 430 KB ≫ a 64 KiB FIFO
+    const int before = live.fragments;
+    int sent = 0;
+    const auto deadline = steady_clock::now() + seconds(20);
+    while ((sent < kFrames || live.fragments - before < kFrames) && steady_clock::now() < deadline) {
+        while (sent < kFrames && t.sendFetchRequest(req)) ++sent;   // fill the ring
+        (void)t.poll(1);
+        (void)live.poll();
+    }
+    EXPECT_EQ(sent, kFrames) << "the outbound ring froze: a dead peer blocked the live one";
+    // >= : warm-up probes still in flight may land after `before` was sampled.
+    EXPECT_GE(live.fragments - before, kFrames) << "every broadcast reaches the live peer";
+    const auto& hs = t.holdStatsForTest();
+    EXPECT_GT(hs.downDropped, 0u) << "dead / unregistered peers' copies are discarded, not held";
+    EXPECT_EQ(hs.aborts, 0u);
+    EXPECT_EQ(hs.pushFailed, 0u);
+}
+
+// R4: an oversized frame (larger than the publication's maxMessageLength) is a
+// permanent refusal from sendOnPub (kOfferOversized): counted and discarded,
+// never held (it could never be sent).
+TEST(AeronPartitionTransportRegression, DrainOversizedFrameCountedNotHeldRegression) {
+    TempDir driverTd("rune_f27_oversize_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());   // 64 KiB term → 8 KiB max message
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    constexpr int32_t kStream = 932;
+    const uint16_t selfPort = discoverFreeUdpPort();
+    const uint16_t livePort = discoverFreeUdpPort();
+    LiveSub live = addLiveSub(*aeronClient, udpChannel(livePort), kStream);
+    ASSERT_TRUE(live.sub);
+    AeronPartitionTransport t(aeronClient, udpChannel(selfPort), kStream, /*selfId=*/1,
+                              /*outboundRingBytes=*/1024 * 1024);   // ring frame up to 128 KiB
+    t.addPeer(2, udpChannel(livePort), kStream);
+    {   // resolve + connect (bounded)
+        FetchRequestMsg req{};
+        req.leaderEpoch = 1; req.followerId = 1; req.maxBytes = 1024;
+        const auto deadline = steady_clock::now() + seconds(10);
+        while (live.fragments == 0 && steady_clock::now() < deadline) {
+            (void)t.sendFetchRequest(req);
+            (void)t.poll(1);
+            (void)live.poll();
+        }
+        ASSERT_GT(live.fragments, 0);
+    }
+    const std::vector<uint8_t> records(20 * 1024, 0x5A);   // > 8 KiB publication max
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 1;
+    resp.records = std::span<const uint8_t>(records);
+    ASSERT_TRUE(t.sendFetchResponse(2, resp)) << "the ring accepts it";
+    for (int i = 0; i < 5; ++i) (void)t.poll(1);
+    EXPECT_EQ(t.holdStatsForTest().oversizeDropped, 1u);
+    EXPECT_EQ(t.holdStatsForTest().held, 0u) << "an unsendable frame is never held";
+    EXPECT_EQ(t.oversizedFrameDropped(), 1u);
+}

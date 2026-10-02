@@ -104,12 +104,22 @@ public:
         return ring_.read(std::forward<Handler>(handler), limit);
     }
 
+    /// Controlled drain: handler returns true to consume, false to ABORT (the
+    /// message stays in the ring and is re-read next drain).  Returns consumed.
+    template <class Handler>
+    int controlledDrain(Handler&& handler, int limit = 10) {
+        return ring_.controlledRead(std::forward<Handler>(handler), limit);
+    }
+
     // -----------------------------------------------------------------------
     // Introspection (tests / debugging)
     // -----------------------------------------------------------------------
 
     int64_t producerPosition() const { return ring_.producerPosition(); }
     int64_t consumerPosition() const { return ring_.consumerPosition(); }
+
+    /// Payload capacity in bytes (power of two).
+    std::size_t capacity() const { return static_cast<std::size_t>(ring_.capacity()); }
 
     /// Largest single message the ring accepts (agrona: capacity / 8).  write()/
     /// tryClaim() reject a larger message — callers that frame variable-length

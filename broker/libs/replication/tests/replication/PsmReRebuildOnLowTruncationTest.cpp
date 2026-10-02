@@ -94,12 +94,12 @@ static PartitionConfig makeFollowerConfig(NodeId selfId, NodeId leaderId)
 // Null transport: we drive the PSM and truncation directly — no fetch round-trips.
 class NullTransportPsm : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
-    void sendOffsetsForLeaderEpochRequest(
-            NodeId, const OffsetsForLeaderEpochReqMsg&) override {}
-    void sendOffsetsForLeaderEpochResponse(
-            NodeId, const OffsetsForLeaderEpochRespMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochRequest(
+            NodeId, const OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(
+            NodeId, const OffsetsForLeaderEpochRespMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------

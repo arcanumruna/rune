@@ -936,7 +936,11 @@ public:
            .targetReplicaId(op.targetReplicaId)
            .incarnation(op.incarnation)
            .minIsr(op.minIsr)
-           .ownershipGen(op.ownershipGen)
+           // F27 R1: a FetchRequest op carries the follower's connection
+           // generation in ownershipGen (SetOwnership is the field's only other user).
+           .ownershipGen(op.type == WorkerOp::Type::FetchRequest
+                             ? static_cast<std::uint64_t>(op.fetchRequestPayload.connGen)
+                             : op.ownershipGen)
            .tailKind(tailKind);
         enc.putTail(reinterpret_cast<const char*>(tailSrc),
                     static_cast<std::uint32_t>(tailLen));
@@ -3046,7 +3050,8 @@ private:
         req.topicId     = op.topicId();
 
         try {
-            replica->onFetchRequest(req, op.frNowNs());
+            replica->onFetchRequest(req, op.frNowNs(),
+                                    static_cast<uint32_t>(op.ownershipGen()));   // F27 R1
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: onFetchRequest threw: {}", workerId_, ex.what());
         } catch (...) {

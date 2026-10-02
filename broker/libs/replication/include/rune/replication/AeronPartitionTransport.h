@@ -57,6 +57,7 @@
 // (compiled under rune_replication_aeron which has RUNE_NODE_INCLUDE).
 namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 
+#include <rune/replication/OutboundHoldRouter.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
@@ -233,6 +234,10 @@ public:
     /// written only by the thread that polls it).  Control thread / tests.
     struct TxStats { int64_t polls = 0; int64_t fragsRecv = 0; int64_t outDrained = 0; };
     [[nodiscard]] TxStats txStatsForTest() const noexcept;
+    /// F27 F1: held-FIFO counters (control thread / tests).
+    [[nodiscard]] const OutboundHoldStats& holdStatsForTest() const noexcept {
+        return holdRouter_.stats();
+    }
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -240,26 +245,26 @@ public:
 
     /// (Follower → Leader) encode and offer a FetchRequest on the leader's pub.
     /// Non-blocking: drops if the pub is not yet resolved or back-pressured.
-    void sendFetchRequest(const FetchRequestMsg& req) override;
+    bool sendFetchRequest(const FetchRequestMsg& req) override;
     /// Same broadcast as sendFetchRequest (the leader NodeId is not on this wire);
     /// overridden so the call stays direct on this final class (Task 11 fix 2).
-    void sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) override { sendFetchRequest(req); }
+    bool sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) override { return sendFetchRequest(req); }
     /// Task 11 fix 2 (B2): PartitionReplica dispatches this final class directly.
     [[nodiscard]] TransportKind kind() const noexcept override { return TransportKind::Aeron; }
 
     /// (Leader → Follower) encode and offer a FetchResponse to a follower.
     /// Non-blocking: drops if the follower's pub is not yet resolved.
-    void sendFetchResponse(NodeId toFollower,
+    bool sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override;
 
     // DR-BUG-6: OffsetsForLeaderEpoch exchange + deficient-leader reconcile.
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendOffsetsForLeaderEpochRequest(
             NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override;
-    void sendOffsetsForLeaderEpochResponse(
+    bool sendOffsetsForLeaderEpochResponse(
             NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override;
-    void sendReconcileRequest(
+    bool sendReconcileRequest(
             NodeId toPeer, const FetchRequestMsg& req) override;
-    void sendReconcileResponse(
+    bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override;
 
     /// F3's int32 view of the ONE live ceiling, maxFetchRecordsBytes() (F18):
@@ -336,11 +341,36 @@ private:
     /// One non-blocking findExclusivePublication per unresolved peer.
     void resolvePendingPubs();
 
-    /// Send a raw buffer on a peer's ExclusivePublication.
-    /// Returns true if the frame was accepted (> 0 from tryClaim/offer).
-    /// Non-blocking; caller bears the drop silently.
-    bool sendOnPub(aeron::ExclusivePublication& pub,
-                   const uint8_t* buf, std::size_t len);
+    /// Send a raw buffer on a peer's ExclusivePublication.  Returns the Aeron
+    /// result (> 0 accepted; BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED ...
+    /// refused — the caller HOLDS the frame, F27) or kOfferOversized (permanent).
+    int64_t sendOnPub(aeron::ExclusivePublication& pub,
+                      const uint8_t* buf, std::size_t len);
+
+    /// F27 F1 / R1: the hold router's Offer policy — offer `buf` to peer `id`'s
+    /// pub.  No publication (registration failed, or not resolved yet) means the
+    /// peer is DOWN (kOfferPeerDown): its frames are not held; the down→up edge
+    /// bumps its connection generation (see OutboundHoldRouter.h).
+    struct PubOffer {
+        AeronPartitionTransport* t;
+        int64_t operator()(NodeId id, const uint8_t* buf, std::size_t len) {
+            PeerPub* p = t->findPeer(id);
+            if (p == nullptr || !p->registered || !p->pub) return kOfferPeerDown;
+            return t->sendOnPub(*p->pub, buf, len);
+        }
+    };
+    friend struct PubOffer;
+
+    /// R1: the connection generation stamped on a FetchRequest from `peer`
+    /// (control thread).  Observes the link first, so a peer that reconnected
+    /// while nothing was being sent to it still raises the edge before its fetch
+    /// reaches the replica.
+    uint32_t peerConnGen_(NodeId peer) noexcept {
+        PeerPub* p = findPeer(peer);
+        holdRouter_.noteLink(peer, p && p->registered && p->pub && p->pub->isConnected());
+        return holdRouter_.connGen(peer);
+    }
+    uint64_t lastPushFailed_ = 0;   ///< R3: last logged OutboundHoldStats::pushFailed
 
     /// Look up a peer's PeerPub entry (or nullptr if not found).
     PeerPub* findPeer(NodeId id);
@@ -456,6 +486,9 @@ private:
     // Size is NodeConfig-configurable (replicationOutboundRingBytes) — passed to
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
+    // F27 F1: per-peer held FIFOs (control thread only) — a frame the ring
+    // accepted is never dropped by drainOutbound (see OutboundHoldRouter.h).
+    OutboundHoldRouter<PubOffer> holdRouter_;
     uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
     uint64_t oversizedFrameDropped_ = 0;   // F18; see oversizedFrameDropped()
     int64_t  pubMaxMessageBytes_    = 0;   // F18; immutable after start

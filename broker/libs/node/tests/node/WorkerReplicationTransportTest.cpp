@@ -65,7 +65,7 @@ struct SharedState {
 //
 // Satisfies the PubRegistry concept:
 //   int64_t sendToPeer(NodeId, const uint8_t*, size_t)
-//   void    broadcastToPeers(const uint8_t*, size_t)
+//   bool    broadcastToPeers(const uint8_t*, size_t)
 //   bool    allResolved()
 // ===========================================================================
 class SharedFakePubRegistry {
@@ -107,9 +107,11 @@ public:
         return 1;
     }
 
-    void broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
+    bool broadcastToPeers(const uint8_t* buf, std::size_t len) noexcept
     {
-        for (NodeId id : state_->peers) sendToPeer(id, buf, len);
+        bool all = !state_->peers.empty();
+        for (NodeId id : state_->peers) if (sendToPeer(id, buf, len) <= 0) all = false;
+        return all;
     }
 
     // Shard plane refusal: data sends to a blocked peer are no-ops; control

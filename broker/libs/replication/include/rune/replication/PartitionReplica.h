@@ -176,6 +176,12 @@ struct PartitionConfig {
 // PartitionTransport — injected interface (no Aeron in this file)
 //
 // Leader uses sendFetchResponse(); follower uses sendFetchRequest().
+//
+// F27 — every send REPORTS whether the frame was accepted by the transport
+// (true) or refused (false: Aeron BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED,
+// no publication, oversized, outbound ring full).  The replica never assumes a
+// refused send was delivered: it retries on its next pass (time-independent);
+// it never waits for a resend timer to discover its own drop.
 // The fake pumps responses back into the leader via its onFetchRequest() and
 // pumps requests back into the follower via its applyReplicated().
 // ---------------------------------------------------------------------------
@@ -195,16 +201,16 @@ public:
     [[nodiscard]] virtual TransportKind kind() const noexcept { return TransportKind::Generic; }
 
     /// (Follower → Leader) send a FetchRequest.
-    virtual void sendFetchRequest(const FetchRequestMsg& req) = 0;
+    virtual bool sendFetchRequest(const FetchRequestMsg& req) = 0;
 
     /// (Follower → its KNOWN leader) spec §3.5.2: unicast.  Default keeps the old
     /// behaviour for transports that cannot address a peer (tests, legacy ring).
-    virtual void sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) {
-        sendFetchRequest(req);
+    virtual bool sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) {
+        return sendFetchRequest(req);
     }
 
     /// (Leader → Follower) send a FetchResponse.
-    virtual void sendFetchResponse(NodeId toFollower,
+    virtual bool sendFetchResponse(NodeId toFollower,
                                    const FetchResponseMsg& resp) = 0;
 
     // -----------------------------------------------------------------------
@@ -221,12 +227,12 @@ public:
 
     /// (New follower → New leader) ask for the leader's end offset for the last
     /// epoch they share (KIP-101), BEFORE the follower truncates on epoch change.
-    virtual void sendOffsetsForLeaderEpochRequest(
-            NodeId /*toLeader*/, const OffsetsForLeaderEpochReqMsg& /*req*/) {}
+    virtual bool sendOffsetsForLeaderEpochRequest(
+            NodeId /*toLeader*/, const OffsetsForLeaderEpochReqMsg& /*req*/) { return true; }
 
     /// (Leader → New follower) the epoch-boundary answer.
-    virtual void sendOffsetsForLeaderEpochResponse(
-            NodeId /*toFollower*/, const OffsetsForLeaderEpochRespMsg& /*resp*/) {}
+    virtual bool sendOffsetsForLeaderEpochResponse(
+            NodeId /*toFollower*/, const OffsetsForLeaderEpochRespMsg& /*resp*/) { return true; }
 
     /// F18: the largest records payload ONE FetchResponse can carry to any peer
     /// on this transport (conservative min over its frame bounds).  Unbounded by
@@ -239,13 +245,13 @@ public:
     /// (Deficient leader → ahead survivor) pull missing committed records
     /// [fromOffset, survivorLEO) — a REVERSE fetch (leader fetches from a
     /// follower).  Reuses the FetchRequest shape.
-    virtual void sendReconcileRequest(
-            NodeId /*toPeer*/, const FetchRequestMsg& /*req*/) {}
+    virtual bool sendReconcileRequest(
+            NodeId /*toPeer*/, const FetchRequestMsg& /*req*/) { return true; }
 
     /// (Ahead survivor → deficient leader) serve the requested records.
     /// Reuses the FetchResponse shape.
-    virtual void sendReconcileResponse(
-            NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) {}
+    virtual bool sendReconcileResponse(
+            NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) { return true; }
 
     // (F3 fix-round-2 item A's maxFetchResponseBytes() — the hard per-message
     //  records ceiling a FIRST batch is served alone within — is the SAME
@@ -265,13 +271,13 @@ class AeronPartitionTransport;
 class NullPartitionTransport final : public PartitionTransport {
 public:
     [[nodiscard]] TransportKind kind() const noexcept override { return TransportKind::Null; }
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchRequestTo(NodeId, const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
-    void sendOffsetsForLeaderEpochRequest(NodeId, const OffsetsForLeaderEpochReqMsg&) override {}
-    void sendOffsetsForLeaderEpochResponse(NodeId, const OffsetsForLeaderEpochRespMsg&) override {}
-    void sendReconcileRequest(NodeId, const FetchRequestMsg&) override {}
-    void sendReconcileResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchRequestTo(NodeId, const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochRequest(NodeId, const OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(NodeId, const OffsetsForLeaderEpochRespMsg&) override { return true; }
+    bool sendReconcileRequest(NodeId, const FetchRequestMsg&) override { return true; }
+    bool sendReconcileResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -416,7 +422,12 @@ public:
     ///               the actual current time so time-lag eviction is correct.
     ///
     /// \returns kErrNone on success, error code otherwise.
-    int16_t onFetchRequest(const FetchRequestMsg& req, int64_t nowNs);
+    /// \param connGen  F27 R1: the follower's connection generation at the
+    ///                 transport (0 = not tracked).  A CHANGED generation means
+    ///                 the link to that follower went down and came back — frames
+    ///                 the transport accepted meanwhile may never have arrived, so
+    ///                 its push state is rewound to this fetch (re-sent, not lost).
+    int16_t onFetchRequest(const FetchRequestMsg& req, int64_t nowNs, uint32_t connGen = 0);
 
     /// Read committed records (≤ highWatermark) starting at fetchOffset.
     ///
@@ -705,8 +716,9 @@ public:
     /// F3 fix-round-2, item A.3 test accessor: drive the private pushToFollowers()
     /// directly, so a test can control fromOffset/pushCeiling precisely without
     /// needing GR-10's real coalesced-push cadence.
-    void pushToFollowersForTest(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept {
-        pushToFollowers(fromOffset, pushCeiling);
+    /// F27: `fromOffset` is ignored — every follower is pushed from its own cursor.
+    void pushToFollowersForTest(Offset /*fromOffset*/, Offset pushCeiling = kNoPushCeiling) noexcept {
+        (void)pushToFollowers(pushCeiling);
     }
 
     /// F3 round 5, item I2 test accessors: how many times the "batch exceeds the
@@ -722,6 +734,13 @@ public:
     /// push on, a non-zero count means the follower had to be re-served
     /// (lost/dropped push → 20 ms resend window).
     [[nodiscard]] uint64_t fetchDataServesForTest() const noexcept { return fetchDataServes_; }
+    /// F27: replication sends this replica had REFUSED by its transport (pushes,
+    /// fetch answers, follower fetches/acks) — each one was retried next pass.
+    [[nodiscard]] uint64_t sendRefusalsForTest() const noexcept { return sendRefusals_; }
+    /// Test view of the push flow window (== kPushFlowWindow, asserted below).
+    static constexpr Offset kPushFlowWindowForTest = 16384;
+    /// F27 F7: times an owed Data answer's whole-batch walk was (re)built.
+    [[nodiscard]] uint64_t owedAnswerRebuildsForTest() const noexcept { return owedRebuilds_; }
 
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
@@ -811,11 +830,13 @@ private:
     /// offset = truncateOffset - 1).  Updates local LEO.
     void truncateLog(Offset truncateOffset);
 
-    /// (Leader) GR-10: push records starting at fromOffset to all ISR followers
-    /// via unsolicited FetchResponse.  Non-blocking (tryClaim/offer); a dropped
-    /// push is fine — the fetch backstop recovers it.  Builds the FetchResponse
-    /// via makeFetchResponse() (zero-copy records view).  Only called when
-    /// cfg_.pushOnAppend is true.
+    /// (Leader) GR-10: push records to all ISR followers via unsolicited
+    /// FetchResponse.  Non-blocking (tryClaim/offer).  F27: each follower is
+    /// pushed from ITS OWN cursor (FollowerSlot::pushCursor) and its cursor
+    /// advances only when the transport ACCEPTED the push to it — a refused push
+    /// is re-sent on the next pass (time-independent), followers that got it are
+    /// not re-sent.  Builds the FetchResponse via makeFetchResponse() (zero-copy
+    /// records view).  Only called when cfg_.pushOnAppend is true.
     // Flow control: the leader never pushes more than kPushFlowWindow records ahead
     // of the slowest ISR follower's acked LEO.  Outrunning the follower makes Aeron
     // back-pressure and DROP best-effort pushes → the follower stalls behind the gap
@@ -823,21 +844,43 @@ private:
     // leader to the follower's apply rate instead → stable.  Well under an Aeron term
     // buffer's record capacity so a full window never overflows the publication.
     static constexpr Offset kPushFlowWindow  = 16384;
+    static_assert(kPushFlowWindow == kPushFlowWindowForTest);
     static constexpr Offset kNoPushCeiling   = (1LL << 62);
-    /// Push [fromOffset, min(LEO, pushCeiling)) to ISR followers (whole-batch aligned,
-    /// capped at maxFetchBytes).  Advances lastPushedOffset_ to the last offset pushed.
-    void pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
+    /// Push [cursor_f, min(LEO, pushCeiling)) to each ISR follower f (whole-batch
+    /// aligned, capped at the frame).  `floor` = pushFloor_() when the caller
+    /// already has it (doWork, F9), else kFloorUnknown (computed here).  An ISR
+    /// follower without a slot cannot exist (the ISR is within the replica set the
+    /// slots are built from) and is skipped.
+    /// Returns the number of pushes the transport ACCEPTED (doWork's work count).
+    static constexpr Offset kFloorUnknown = -1;
+    int pushToFollowers(Offset pushCeiling = kNoPushCeiling, Offset floor = kFloorUnknown) noexcept;
+    /// F27: the lowest push cursor over the ISR followers (LEO when there are none)
+    /// — the derived replacement of the former shared lastPushedOffset_.
+    [[nodiscard]] Offset pushFloor_() const noexcept;
+    /// F27: re-send fetch answers the transport refused (FollowerSlot::owed).
+    /// Never refreshes ISR liveness (only a real fetch does).  Returns sends made.
+    int retryOwedFetchAnswers_() noexcept;
+    /// F27: send a fetch answer to `slot`'s follower; on refusal record it as owed
+    /// and forget it as served (never conflate against an unsent answer).
+    bool sendFetchAnswer_(FollowerSlot* slot, NodeId follower, const FetchResponseMsg& resp,
+                          Offset fetchOffset, int32_t maxBytes, bool data, Offset dataEnd);
+    /// F27 F3: DR sends that are OWED when refused and re-sent next pass.
+    void sendEpochAnswer_(NodeId to, const OffsetsForLeaderEpochRespMsg& m);
+    bool sendReconcilePull_(NodeId peer, const FetchRequestMsg& pull);
+    /// F27 F3: re-send owed DR frames (any role).  Returns sends accepted.
+    int retryOwedDrSends_() noexcept;
 
     /// F3 round 5, item I2: true while the push head is a remembered UNSENDABLE
     /// batch and nothing that could change the outcome (LEO, ISR, follower
     /// position via pushCeiling, epoch) has changed — doWork() then skips the
     /// push entirely (no readView/parse, no work count).  One compare when unarmed.
-    [[nodiscard]] bool unsendablePushSuppressed_(Offset pushCeiling) const noexcept;
+    [[nodiscard]] bool unsendablePushSuppressed_(Offset pushCeiling, Offset floor) const noexcept;
     /// Order-sensitive signature of the current ISR (cold: only computed while
     /// an unsendable-push memo is armed or being armed).
     [[nodiscard]] uint64_t isrSignature_() const noexcept;
     // Spec §3.5.2: follower FetchRequests are unicast to the known leader.
-    void sendFetchToLeader_(const FetchRequestMsg& req);
+    /// F27: true iff the transport accepted the request.
+    bool sendFetchToLeader_(const FetchRequestMsg& req);
 
     /// Build a FetchResponseMsg stamped with this partition's identity
     /// (epoch/partitionId/topicId, logStartOffset=0) plus the given HW,
@@ -1010,7 +1053,7 @@ private:
     // (fromOffset >= 0) by pushToFollowers() when the head batch exceeds the
     // transport's hard ceiling; cleared by any successful push.
     struct UnsendablePushMemo {
-        Offset   fromOffset  = -1;   ///< lastPushedOffset_ at the failed push (-1 = unarmed)
+        Offset   fromOffset  = -1;   ///< pushFloor_() at the failed push (-1 = unarmed)
         Offset   leo         = -1;
         Offset   pushCeiling = -1;
         uint64_t isrSig      = 0;
@@ -1068,9 +1111,16 @@ private:
     // Atomic: cleaner/duty threads write; test threads may poll it concurrently.
     std::atomic<Offset> lastCleanOffset_{0};
 
-    // GR-10: push tracking — last offset that was pushed to followers.
-    // Avoids re-pushing bytes already pushed in the same append cycle.
-    Offset lastPushedOffset_ = 0;
+    // GR-10 push tracking is PER FOLLOWER (F27): FollowerSlot::pushedThrough /
+    // pushCursor(); the old shared lastPushedOffset_ advanced even when a push to
+    // one follower was refused, so that follower's data waited for a timer.
+    uint64_t sendRefusals_ = 0;   // F27: transport-refused replication sends (retried)
+    uint64_t owedRebuilds_ = 0;   // F27 F7: owed Data answer rebuilds (log walk)
+    // F27 F3: owed DR sends (one each; a newer one replaces it).
+    struct OwedPull      { NodeId peer = -1; FetchRequestMsg req{}; };
+    struct OwedReconResp { NodeId peer = -1; FetchRequestMsg req{}; };
+    OwedPull      owedPull_{};        ///< refused reverse-reconcile pull (leader)
+    OwedReconResp owedReconResp_{};   ///< refused reconcile answer (survivor)
 
     // Durability: effective minIsr for the acksAll produce gate.
     // Majority mode: cfg_.minIsr.
@@ -1256,12 +1306,13 @@ public:
     // that the leader push path (called from the produce thread) and the
     // pump() path (called from the replication duty-cycle thread) are safe to
     // call concurrently.  In single-threaded tests the lock is uncontended.
-    void sendFetchRequest(const FetchRequestMsg& req) override {
+    bool sendFetchRequest(const FetchRequestMsg& req) override {
         std::lock_guard lk(mu_);
         pendingRequests_.push_back({req});
+        return true;
     }
 
-    void sendFetchResponse(NodeId toFollower,
+    bool sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override {
         PendingResponse pr;
         pr.toFollower = toFollower;
@@ -1272,25 +1323,29 @@ public:
                                                     pr.recordsBuf.size());
         std::lock_guard lk(mu_);
         pendingResponses_.push_back(std::move(pr));
+        return true;
     }
 
     // DR-BUG-6: OffsetsForLeaderEpoch + reconcile peer-routed messages.
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendOffsetsForLeaderEpochRequest(
             NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override {
         std::lock_guard lk(mu_);
         pendingEpochReqs_.push_back({toLeader, req});
+        return true;
     }
-    void sendOffsetsForLeaderEpochResponse(
+    bool sendOffsetsForLeaderEpochResponse(
             NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override {
         std::lock_guard lk(mu_);
         pendingEpochResps_.push_back({toFollower, resp});
+        return true;
     }
-    void sendReconcileRequest(
+    bool sendReconcileRequest(
             NodeId toPeer, const FetchRequestMsg& req) override {
         std::lock_guard lk(mu_);
         pendingReconcileReqs_.push_back({toPeer, req});
+        return true;
     }
-    void sendReconcileResponse(
+    bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override {
         PendingResponse pr;
         pr.toFollower = toPeer;
@@ -1300,6 +1355,7 @@ public:
                                                     pr.recordsBuf.size());
         std::lock_guard lk(mu_);
         pendingReconcileResps_.push_back(std::move(pr));
+        return true;
     }
 
     /// Deliver all pending messages: FetchRequests → leader, FetchResponses → followers.

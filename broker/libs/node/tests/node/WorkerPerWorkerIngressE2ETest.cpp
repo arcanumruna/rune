@@ -102,19 +102,19 @@ struct TempDir {
 // ---------------------------------------------------------------------------
 class NullTransport : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(rune::replication::NodeId,
-                           const rune::replication::FetchResponseMsg&) override {}
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId,
+                           const rune::replication::FetchResponseMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochRequest(
             rune::replication::NodeId,
-            const rune::replication::OffsetsForLeaderEpochReqMsg&) override {}
-    void sendOffsetsForLeaderEpochResponse(
+            const rune::replication::OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(
             rune::replication::NodeId,
-            const rune::replication::OffsetsForLeaderEpochRespMsg&) override {}
-    void sendReconcileRequest(rune::replication::NodeId,
-                              const rune::replication::FetchRequestMsg&) override {}
-    void sendReconcileResponse(rune::replication::NodeId,
-                               const rune::replication::FetchResponseMsg&) override {}
+            const rune::replication::OffsetsForLeaderEpochRespMsg&) override { return true; }
+    bool sendReconcileRequest(rune::replication::NodeId,
+                              const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendReconcileResponse(rune::replication::NodeId,
+                               const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------

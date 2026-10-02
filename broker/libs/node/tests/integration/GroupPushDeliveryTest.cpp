@@ -141,8 +141,8 @@ static PartitionConfig makePartCfg(int32_t selfId = 1) {
 
 class NullTransport : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 // Build kN individual record batches (one per record) and write them to the log.

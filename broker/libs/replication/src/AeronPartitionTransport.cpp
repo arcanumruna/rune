@@ -19,6 +19,7 @@
 #include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
 
+#include <cassert>
 #include <cstdlib>
 #include <spdlog/spdlog.h>
 
@@ -86,6 +87,11 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
         // Leave registered=false; peer will be silently dropped on send.
     }
     peers_.emplace(peerId, std::move(p));
+    // F27 F1: the peer's held FIFO, sized to one full outbound ring (>= 8 max-size
+    // frames), allocated once here (cold) and never reallocated.
+    // R3: an empty FIFO must hold any ring frame (capacity >= maxMsgLength).
+    assert(outboundRing_.capacity() >= outboundRing_.maxMsgLength() + 8);
+    holdRouter_.addPeer(peerId, outboundRing_.capacity());
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +148,7 @@ int64_t AeronPartitionTransport::maxFetchRecordsBytes() const noexcept
 // ---------------------------------------------------------------------------
 // sendFetchRequest — (Follower → Leader)  non-blocking
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
+bool AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
 {
     // Shared-nothing: encode into a per-call STACK buffer (no shared state),
     // then marshal to the control thread via the outbound ring. FetchRequest is
@@ -161,13 +167,13 @@ void AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
         req.fetchOffset,
         maxBytes,
         req.topicId);
-    enqueueOutbound(kBroadcast, wire, len);
+    return enqueueOutbound(kBroadcast, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // sendFetchResponse — (Leader → Follower)  non-blocking
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
+bool AeronPartitionTransport::sendFetchResponse(NodeId                toFollower,
                                                  const FetchResponseMsg& resp)
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplSendFetchResp, 0);
@@ -176,13 +182,13 @@ void AeronPartitionTransport::sendFetchResponse(NodeId                toFollower
     // the old encode-into-`wire` + putPayload-into-ring double copy.  Shared-nothing:
     // the worker only writes the ring; peers_/pubs stay control-owned (drainOutbound
     // offers).  Back-pressure (full ring) → false; the follower re-fetches.
-    enqueueFetchResponse(toFollower, resp, /*reconcile=*/false);
+    return enqueueFetchResponse(toFollower, resp, /*reconcile=*/false);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: OffsetsForLeaderEpoch request  (Follower → new Leader)
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
+bool AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
         NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req)
 {
     uint8_t wire[kMaxWireFrame];
@@ -190,13 +196,13 @@ void AeronPartitionTransport::sendOffsetsForLeaderEpochRequest(
         wire, 0,
         req.currentEpoch, req.partition, req.followerId,
         req.requestedEpoch, req.followerLeo, req.topicId);
-    enqueueOutbound(toLeader, wire, len);
+    return enqueueOutbound(toLeader, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: OffsetsForLeaderEpoch response  (Leader → Follower)
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
+bool AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
         NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp)
 {
     uint8_t wire[kMaxWireFrame];
@@ -204,14 +210,14 @@ void AeronPartitionTransport::sendOffsetsForLeaderEpochResponse(
         wire, 0,
         resp.leaderEpoch, resp.partition, resp.responseEpoch,
         resp.endOffset, resp.errorCode, resp.topicId);
-    enqueueOutbound(toFollower, wire, len);
+    return enqueueOutbound(toFollower, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: reconcile request  (deficient Leader → ahead survivor)
 // Reuses the FetchRequest layout, re-stamped with the reconcile templateId.
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendReconcileRequest(
+bool AeronPartitionTransport::sendReconcileRequest(
         NodeId toPeer, const FetchRequestMsg& req)
 {
     // F18 (B-3): the reverse pull lands on THIS node's worker ingress ring exactly
@@ -227,19 +233,19 @@ void AeronPartitionTransport::sendReconcileRequest(
         req.leaderEpoch, req.partition, req.followerId,
         req.fetchOffset, maxBytes, req.topicId);
     stampTemplateId(wire, 0, kReconcileFetchReqTemplateId);
-    enqueueOutbound(toPeer, wire, len);
+    return enqueueOutbound(toPeer, wire, len);
 }
 
 // ---------------------------------------------------------------------------
 // DR-BUG-6: reconcile response  (ahead survivor → deficient Leader)
 // Reuses the FetchResponse layout, re-stamped with the reconcile templateId.
 // ---------------------------------------------------------------------------
-void AeronPartitionTransport::sendReconcileResponse(
+bool AeronPartitionTransport::sendReconcileResponse(
         NodeId toPeer, const FetchResponseMsg& resp)
 {
     // #2b zero-copy: encode the FetchResponse straight into the outbound-ring slot,
     // then re-stamp the reconcile templateId in place (see enqueueFetchResponse).
-    enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
+    return enqueueFetchResponse(toPeer, resp, /*reconcile=*/true);
 }
 
 // FR trace correlation (F9a: no file-static / atomic sequence counters).
@@ -378,10 +384,17 @@ bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
 int AeronPartitionTransport::drainOutbound()
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplOutboundDrain, 0);
-    auto handler = [this](std::int32_t /*msgTypeId*/,
-                          aeron::concurrent::AtomicBuffer& buf,
-                          aeron::util::index_t offset,
-                          aeron::util::index_t length) {
+    // F27 F1: NOTHING the ring accepted is ever dropped here.  Phase A flushes
+    // each peer's held frames in order (a refusal stops that peer only); phase B
+    // routes ring frames through the hold router under a CONTROLLED read — a
+    // frame a full FIFO cannot take stays in the ring (ABORT) for the next drain.
+    PubOffer offer{this};
+    int work = holdRouter_.flushHeld(offer);
+
+    auto handler = [this, &offer](std::int32_t /*msgTypeId*/,
+                                  aeron::concurrent::AtomicBuffer& buf,
+                                  aeron::util::index_t offset,
+                                  aeron::util::index_t length) -> bool {
         // Decode the SBE OutboundFrame envelope: targetNodeId + a ZERO-COPY payload
         // view into the ring frame (no memcpy, no hand-rolled offsets).
         char* fbase = reinterpret_cast<char*>(buf.buffer()) + offset;
@@ -395,27 +408,27 @@ int AeronPartitionTransport::drainOutbound()
         const std::string_view pv = dec.getPayloadAsStringView();
         const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
         const std::size_t wlen = pv.size();
-        // Control-clock: frame drained from the outbound ring + offered to peer(s).
-        // corr = ring slot offset == the enqueue's tryClaim index → the gap
-        // ReplOutEnqueue(slot)→ReplOutDrain(slot) is the EXACT worker→control handoff.
-        RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, static_cast<uint32_t>(offset));
-        ++txOutDrained_;
-
-        if (target == kBroadcast) {
-            for (auto& [nodeId, peer] : peers_) {
-                if (peer.pub && peer.pub->isConnected())
-                    sendOnPub(*peer.pub, wire, wlen);
-            }
-        } else {
-            PeerPub* peer = findPeer(target);
-            if (peer && peer->pub && peer->pub->isConnected())
-                sendOnPub(*peer->pub, wire, wlen);
+        const bool consumed = holdRouter_.route(offer, target, wire, wlen);
+        if (consumed) {
+            // Control-clock: frame drained from the outbound ring (offered or held).
+            // corr = ring slot offset == the enqueue's tryClaim index.
+            RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplOutDrain, static_cast<uint32_t>(offset));
+            ++txOutDrained_;
         }
+        return consumed;
     };
-    // Mirror the ConsensusAgent pattern: return the count of ring messages
-    // drained so poll()/doWork() folds it into workCount and the AgentRunner's
-    // IdleStrategy idles only when there was genuinely no work.
-    return outboundRing_.drain(handler, /*limit=*/kFragmentLimit);
+    // Work = ring frames consumed + held frames flushed (a FIFO that keeps being
+    // refused is NOT work, so the IdleStrategy can back off).
+    work += outboundRing_.controlledDrain(handler, /*limit=*/kFragmentLimit);
+    // R3: a held-FIFO push can only fail if the FIFO >= ring-maxMsgLength
+    // invariant is broken — never silent: counted by the router, logged here.
+    if (const uint64_t pf = holdRouter_.stats().pushFailed; pf != lastPushFailed_) [[unlikely]] {
+        lastPushFailed_ = pf;
+        spdlog::error("AeronPartitionTransport[node={}]: held-FIFO push failed ({} total) — "
+                      "FIFO smaller than a ring frame; frame DROPPED (invariant breach)",
+                      selfId_, pf);
+    }
+    return work;
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +594,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.fetchRequestPayload.maxBytes      = req.maxBytes;
             op.fetchRequestPayload.topicId       = req.topicId;
             op.fetchRequestPayload.nowNs         = nowNs_;
+            op.fetchRequestPayload.connGen       = peerConnGen_(req.followerId);   // R1
             if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
                 // Worker ring full → back-pressure: leave the fragment unconsumed and
                 // retry next cycle (the follower's fetch is served once the worker
@@ -592,7 +606,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             // the gap is the EXACT control→worker handoff latency on this node.
             RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, inRecvSeq_++);
         } else {
-            rep->onFetchRequest(req, nowNs_);
+            rep->onFetchRequest(req, nowNs_, peerConnGen_(req.followerId));   // R1
         }
 
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {
@@ -913,7 +927,7 @@ void AeronPartitionTransport::resolvePendingPubs()
 // ---------------------------------------------------------------------------
 // sendOnPub — non-blocking zero-copy send (tryClaim → commit; fallback offer).
 // ---------------------------------------------------------------------------
-bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
+int64_t AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
                                          const uint8_t*               buf,
                                          std::size_t                  len)
 {
@@ -934,7 +948,7 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
                      "len={} maxMessageLength={} — fetch ceiling not applied correctly",
                      len, pub.maxMessageLength());
         ++oversizedFrameDropped_;   // F18: an oversize, not back-pressure
-        return false;
+        return kOfferOversized;     // permanent: never held
     }
 
     auto* mutableBuf = const_cast<uint8_t*>(buf);
@@ -950,7 +964,7 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
             claim.buffer().putBytes(claim.offset(), atomicBuf, 0,
                                     static_cast<aeron::util::index_t>(len));
             claim.commit();
-            return true;
+            return pos;
         }
         // BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED — fall through to offer.
     }
@@ -958,7 +972,7 @@ bool AeronPartitionTransport::sendOnPub(aeron::ExclusivePublication& pub,
     // Fallback: offer (copies into term buffer).
     const int64_t result = pub.offer(atomicBuf, 0,
                                       static_cast<aeron::util::index_t>(len));
-    return result > 0;
+    return result;
 }
 
 // ---------------------------------------------------------------------------

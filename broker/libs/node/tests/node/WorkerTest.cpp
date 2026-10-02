@@ -63,9 +63,9 @@ namespace {
 // TransactionCoordinationServiceTest (the ground-truth call site per the brief).
 class NullTransport : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(rune::replication::NodeId,
-                           const rune::replication::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId,
+                           const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -77,24 +77,27 @@ public:
     std::atomic<int> fetchResponseCount{0};
     rune::replication::NodeId lastToFollower = -1;
     rune::replication::Offset lastHw = -1;
+    int dataResponseCount = 0;   ///< FetchResponses carrying records (push / Data serve)
 
-    void sendFetchRequest(const FetchRequestMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
 
-    void sendFetchResponse(NodeId toFollower,
+    bool sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override {
         lastToFollower = toFollower;
         lastHw         = resp.highWatermark;
+        if (!resp.records.empty()) ++dataResponseCount;
         fetchResponseCount.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
-    void sendOffsetsForLeaderEpochRequest(
-            NodeId, const rune::replication::OffsetsForLeaderEpochReqMsg&) override {}
-    void sendOffsetsForLeaderEpochResponse(
-            NodeId, const rune::replication::OffsetsForLeaderEpochRespMsg&) override {}
-    void sendReconcileRequest(
-            NodeId, const FetchRequestMsg&) override {}
-    void sendReconcileResponse(
-            NodeId, const FetchResponseMsg&) override {}
+    bool sendOffsetsForLeaderEpochRequest(
+            NodeId, const rune::replication::OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(
+            NodeId, const rune::replication::OffsetsForLeaderEpochRespMsg&) override { return true; }
+    bool sendReconcileRequest(
+            NodeId, const FetchRequestMsg&) override { return true; }
+    bool sendReconcileResponse(
+            NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 struct ReplicaFixture {
@@ -292,6 +295,72 @@ TEST(Worker, FetchRequestRoutedToWorker) {
     EXPECT_EQ(transport.lastToFollower, 2);
 }
 
+// ---------------------------------------------------------------------------
+// F27 re-review 2 N2: the follower's connection generation must survive the
+// control → worker ring (encoded into ownershipGen, decoded into
+// onFetchRequest's connGen).  Same generation twice = the push covers the
+// fetch (no Data); a bumped generation = the link bounced, the push may be lost
+// → served Data at once.  A ring that drops the generation never rewinds.
+// ---------------------------------------------------------------------------
+TEST(WorkerRegression, FetchOpCarriesConnectionGenerationAcrossRingRegression) {
+    static constexpr std::size_t kBatchBytes = 128;
+    std::vector<uint8_t> batch(kBatchBytes, 0x00);
+    int32_t blen = static_cast<int32_t>(kBatchBytes) - 12;
+    std::memcpy(batch.data() + 8, &blen, 4);
+    batch[16] = 2;
+
+    InMemoryLog                       log(1024 * 1024, 1000);
+    RecordingTransport                transport;
+    std::unique_ptr<PartitionReplica> replica;
+    {
+        PartitionConfig cfg{};
+        cfg.topicId             = 7;
+        cfg.partitionId         = 0;
+        cfg.selfId              = 1;
+        cfg.minIsr              = 1;
+        cfg.replicaLagMaxMs     = 10'000;
+        cfg.replicaLagMaxOffset = 10'000;
+        cfg.fetchIntervalNs     = 1'000'000LL;
+        cfg.isrCheckIntervalNs  = 1'000'000LL;
+        cfg.maxFetchBytes       = 1 << 20;
+        cfg.pushOnAppend        = true;
+        replica = std::make_unique<PartitionReplica>(
+            cfg, rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    }
+    constexpr int64_t kNowNs = 1'000'000LL;   // frozen: no resend window can fire
+    log.append(batch, /*lastOffset=*/0);
+    replica->onLeaderLogAppended();
+    (void)replica->doWork(kNowNs);                       // push offset 0 to follower 2
+    ASSERT_EQ(transport.dataResponseCount, 1) << "precondition: the push was sent";
+
+    Worker w(/*workerId=*/4);
+    w.setOwnedDirect(Worker::OwnedSet{replica.get()});
+    auto fetchOp = [&](uint32_t gen) {
+        WorkerOp op;
+        op.type                            = WorkerOp::Type::FetchRequest;
+        op.topicId                         = 7;
+        op.partition                       = 0;
+        op.replica                         = replica.get();
+        op.fetchRequestPayload.leaderEpoch = 1;
+        op.fetchRequestPayload.partition   = 0;
+        op.fetchRequestPayload.followerId  = 2;
+        op.fetchRequestPayload.fetchOffset = 0;      // below pushedThrough
+        op.fetchRequestPayload.maxBytes    = 1 << 20;
+        op.fetchRequestPayload.topicId     = 7;
+        op.fetchRequestPayload.nowNs       = kNowNs;
+        op.fetchRequestPayload.connGen     = gen;
+        return op;
+    };
+    ASSERT_TRUE(w.tryEnqueueOp(fetchOp(1)));
+    (void)w.doWork(kNowNs);
+    EXPECT_EQ(transport.dataResponseCount, 1) << "same link: the in-flight push covers the fetch";
+    ASSERT_TRUE(w.tryEnqueueOp(fetchOp(2)));
+    (void)w.doWork(kNowNs);
+    EXPECT_EQ(transport.dataResponseCount, 2)
+        << "generation 2 must reach onFetchRequest through the ring and rewind (Data served)";
+}
+
 // ===========================================================================
 // Task 6: per-worker replication transport poll + inline apply tests.
 //
@@ -331,7 +400,7 @@ public:
 
     // No real sends needed for receive-path tests.
     int64_t sendToPeer(rune::replication::NodeId, const uint8_t*, std::size_t) noexcept { return 1; }
-    void    broadcastToPeers(const uint8_t*, std::size_t) noexcept {}
+    bool    broadcastToPeers(const uint8_t*, std::size_t) noexcept { return true; }
     int64_t sendGatherToPeer(rune::replication::NodeId, const uint8_t*, std::size_t,
                              std::span<const uint8_t>) noexcept { return 1; }
     void    setPeerBlocked(rune::replication::NodeId, bool) noexcept {}

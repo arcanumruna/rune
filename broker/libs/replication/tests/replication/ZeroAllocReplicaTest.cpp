@@ -36,8 +36,8 @@ struct Armed {
 };
 struct SinkTransport final : PartitionTransport {
     uint64_t bytes = 0, frames = 0;
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg& m) override { bytes += m.records.size(); ++frames; }
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg& m) override { bytes += m.records.size(); ++frames; return true; }
 };
 struct Dir {
     fs::path p = fs::temp_directory_path() / ("rune_zalloc_" + std::to_string(::getpid()));
