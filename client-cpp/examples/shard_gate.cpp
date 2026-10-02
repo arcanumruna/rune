@@ -169,12 +169,14 @@ struct Ledger {
     // Report side (after every ack runner stopped).
     std::vector<int64_t>               latencyNs;  // id -> ack - sched, -1 = none
     std::vector<uint8_t>               okIds;      // id -> 1 if acked OK
+    std::vector<uint8_t>               failedIds;  // id -> 1 if reported failed (sequenced batches)
     int64_t                            accepted = 0;
 
     void init(const Args& a, int64_t cap) {
         sched.assign(static_cast<std::size_t>(cap), 0);
         latencyNs.assign(static_cast<std::size_t>(cap), -1);
         okIds.assign(static_cast<std::size_t>(cap), 0);
+        failedIds.assign(static_cast<std::size_t>(cap), 0);
         // Keys hash evenly: 2x the fair share per partition (+ slack); a record
         // past it is counted as `unmatched` (no latency sample), never mis-attributed.
         const auto perPartition = static_cast<std::size_t>(cap / std::max(1, a.partitions) * 2 + 4096);
@@ -186,6 +188,7 @@ struct Ledger {
 // One sequenced batch ack, logged by the runner that delivered it.
 struct AckRec {
     int64_t t;
+    int64_t producerId;  // -1: unknown (the Completions form carries none)
     int32_t partition;
     int32_t baseSequence;
     int32_t recordCount;
@@ -201,6 +204,7 @@ struct AckCtx {
     int64_t             records     = 0;
     int64_t             lastAck     = 0;
     int64_t             unseqFailed = 0;  // records failed before they were sequenced
+    int64_t             logDropped  = 0;  // acks the full log could not keep
     std::vector<AckRec> log;              // sequenced acks (reserved up front: no growth in the handler)
     void reserve(int64_t cap) { log.reserve(static_cast<std::size_t>(cap) + 1024); }
     static int64_t nowNs() noexcept {
@@ -221,46 +225,78 @@ struct AckCtx {
             return;  // acks=None or never sequenced: no (epoch, sequence) to match
         }
         if (self->log.size() < self->log.capacity()) {
-            self->log.push_back({t, a.partition, a.baseSequence, a.recordCount, a.producerEpoch, a.errorCode == 0});
+            self->log.push_back(
+                {t, a.producerId, a.partition, a.baseSequence, a.recordCount, a.producerEpoch, a.errorCode == 0});
+        } else {
+            ++self->logDropped;
         }
     }
 };
 
 // Report time (every runner stopped): per partition, the sequenced acks sorted
-// by (epoch, baseSequence) are the producer's encode order -> the n-th
-// sequenced record is the n-th sent id.  Fills latencyNs / okIds.  Returns
-// whether the match is exact (no unsequenced failures, no sequence gaps).
+// by (producerId, epoch, baseSequence) are the producer's encode order -> the
+// n-th sequenced record is the n-th sent id.  Within one producerId the epoch
+// only grows; a producerId change is the INT16_MAX rotation: the group that
+// reached epoch INT16_MAX comes first (more than two groups, or an unknown id
+// next to a rotation, cannot be ordered: approx).  Fills latencyNs / okIds /
+// failedIds.  Returns whether the match is exact (no unsequenced failures, no
+// lost log entries, no sequence gaps, an unambiguous identity order).
 bool matchAcks(Ledger& L, const std::vector<AckCtx*>& ctxs, int32_t partitions) {
     std::vector<std::vector<AckRec>> byPart(static_cast<std::size_t>(partitions));
     bool exact = true;
     for (const AckCtx* c : ctxs) {
-        if (c->unseqFailed != 0) exact = false;
-        if (c->log.size() == c->log.capacity()) exact = false;  // log overflow (should not happen)
+        if (c->unseqFailed != 0 || c->logDropped != 0) exact = false;
         for (const AckRec& r : c->log) {
             if (r.partition >= 0 && r.partition < partitions) byPart[static_cast<std::size_t>(r.partition)].push_back(r);
         }
     }
     for (int32_t p = 0; p < partitions; ++p) {
         auto& v = byPart[static_cast<std::size_t>(p)];
-        std::sort(v.begin(), v.end(), [](const AckRec& x, const AckRec& y) {
+        // Identity groups, ordered: the one that reached INT16_MAX first.
+        std::vector<int64_t> pids;
+        bool rotatedFromMax = false;
+        for (const AckRec& r : v) {
+            if (std::find(pids.begin(), pids.end(), r.producerId) == pids.end()) pids.push_back(r.producerId);
+            if (r.producerEpoch == INT16_MAX) rotatedFromMax = true;
+        }
+        if (pids.size() > 2 || (pids.size() == 2 && !rotatedFromMax) ||
+            (rotatedFromMax && std::find(pids.begin(), pids.end(), int64_t{-1}) != pids.end())) {
+            exact = false;
+        }
+        auto rank = [&](int64_t pid) {
+            if (pids.size() < 2) return 0;
+            for (const AckRec& r : v) {
+                if (r.producerId == pid && r.producerEpoch == INT16_MAX) return 0;
+            }
+            return 1;
+        };
+        std::sort(v.begin(), v.end(), [&](const AckRec& x, const AckRec& y) {
+            const int rx = rank(x.producerId), ry = rank(y.producerId);
+            if (rx != ry) return rx < ry;
             return x.producerEpoch != y.producerEpoch ? x.producerEpoch < y.producerEpoch
                                                       : x.baseSequence < y.baseSequence;
         });
         const auto& ids = L.ordToId[static_cast<std::size_t>(p)];
         int64_t ord = 0;
+        int64_t pid = INT64_MIN;
         int16_t epoch = -1;
         int32_t nextSeq = 0;
         for (const AckRec& r : v) {
-            if (r.producerEpoch != epoch) {
+            if (r.producerEpoch != epoch || r.producerId != pid) {
+                pid     = r.producerId;
                 epoch   = r.producerEpoch;
                 nextSeq = 0;
             }
             if (r.baseSequence != nextSeq) exact = false;  // a sequence gap: ordinals may shift
             nextSeq = r.baseSequence + r.recordCount;
             for (int32_t i = 0; i < r.recordCount; ++i, ++ord) {
-                if (!r.ok || ord >= static_cast<int64_t>(ids.size())) continue;
+                if (ord >= static_cast<int64_t>(ids.size())) continue;
                 const int64_t id = ids[static_cast<std::size_t>(ord)];
                 if (id < 0) continue;
+                if (!r.ok) {
+                    L.failedIds[static_cast<std::size_t>(id)] = 1;
+                    continue;
+                }
                 L.okIds[static_cast<std::size_t>(id)] = 1;
                 L.latencyNs[static_cast<std::size_t>(id)] = r.t - L.sched[static_cast<std::size_t>(id)];
             }
@@ -270,42 +306,59 @@ bool matchAcks(Ledger& L, const std::vector<AckCtx*>& ctxs, int32_t partitions) 
 }
 
 // --acked-file format (little-endian): u32 magic 'SGAK' (0x4B414753), u32
-// version 1, u64 nbits, then ceil(nbits / 8) bytes — bit (id % 8) of byte
-// (id / 8) set = id acked OK.
+// version 2, u64 nbits, then two bitmaps of ceil(nbits / 8) bytes — bit
+// (id % 8) of byte (id / 8): the ids acked OK, then the ids reported FAILED (in
+// a sequenced batch).  Version 1 (the OK bitmap only) is still read.
 constexpr uint32_t kAckedMagic = 0x4B414753u;
 
-bool writeAckedFile(const std::string& path, const std::vector<uint8_t>& okIds) {
+bool writeAckedFile(const std::string& path, const std::vector<uint8_t>& okIds,
+                    const std::vector<uint8_t>& failedIds) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (f == nullptr) return false;
-    const uint32_t hdr[2] = {kAckedMagic, 1u};
+    const uint32_t hdr[2] = {kAckedMagic, 2u};
     const uint64_t nbits  = okIds.size();
-    std::vector<uint8_t> bits((okIds.size() + 7) / 8, 0);
-    for (std::size_t i = 0; i < okIds.size(); ++i) {
-        if (okIds[i] != 0) bits[i / 8] = static_cast<uint8_t>(bits[i / 8] | (1u << (i % 8)));
-    }
+    auto pack = [&](const std::vector<uint8_t>& ids) {
+        std::vector<uint8_t> bits((nbits + 7) / 8, 0);
+        for (std::size_t i = 0; i < ids.size() && i < nbits; ++i) {
+            if (ids[i] != 0) bits[i / 8] = static_cast<uint8_t>(bits[i / 8] | (1u << (i % 8)));
+        }
+        return bits;
+    };
+    const std::vector<uint8_t> okBits = pack(okIds), failedBits = pack(failedIds);
     bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 && std::fwrite(&nbits, sizeof nbits, 1, f) == 1 &&
-              (bits.empty() || std::fwrite(bits.data(), bits.size(), 1, f) == 1);
+              (okBits.empty() || (std::fwrite(okBits.data(), okBits.size(), 1, f) == 1 &&
+                                  std::fwrite(failedBits.data(), failedBits.size(), 1, f) == 1));
     ok = (std::fclose(f) == 0) && ok;
     return ok;
 }
 
-// Returns false on a missing / malformed file.
-bool readAckedFile(const std::string& path, std::vector<uint8_t>& okIds) {
+// Returns false on a missing / malformed file.  failedIds is empty for v1.
+bool readAckedFile(const std::string& path, std::vector<uint8_t>& okIds, std::vector<uint8_t>& failedIds) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) return false;
     uint32_t hdr[2] = {0, 0};
     uint64_t nbits  = 0;
     bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && std::fread(&nbits, sizeof nbits, 1, f) == 1 &&
-              hdr[0] == kAckedMagic && hdr[1] == 1u && nbits <= (uint64_t{1} << 40);
-    std::vector<uint8_t> bits;
+              hdr[0] == kAckedMagic && (hdr[1] == 1u || hdr[1] == 2u) && nbits <= (uint64_t{1} << 40);
+    std::vector<uint8_t> okBits, failedBits;
     if (ok) {
-        bits.resize(static_cast<std::size_t>((nbits + 7) / 8));
-        ok = bits.empty() || std::fread(bits.data(), bits.size(), 1, f) == 1;
+        const std::size_t n = static_cast<std::size_t>((nbits + 7) / 8);
+        okBits.resize(n);
+        ok = n == 0 || std::fread(okBits.data(), n, 1, f) == 1;
+        if (ok && hdr[1] == 2u) {
+            failedBits.resize(n);
+            ok = n == 0 || std::fread(failedBits.data(), n, 1, f) == 1;
+        }
     }
     std::fclose(f);
     if (!ok) return false;
     okIds.assign(static_cast<std::size_t>(nbits), 0);
-    for (std::size_t i = 0; i < okIds.size(); ++i) okIds[i] = (bits[i / 8] >> (i % 8)) & 1u;
+    for (std::size_t i = 0; i < okIds.size(); ++i) okIds[i] = (okBits[i / 8] >> (i % 8)) & 1u;
+    failedIds.clear();
+    if (!failedBits.empty()) {
+        failedIds.assign(static_cast<std::size_t>(nbits), 0);
+        for (std::size_t i = 0; i < failedIds.size(); ++i) failedIds[i] = (failedBits[i / 8] >> (i % 8)) & 1u;
+    }
     return true;
 }
 
@@ -387,7 +440,7 @@ void report(const Args& a, Ledger& L, const std::vector<AckCtx*>& ctxs, int64_t 
     for (uint8_t b : L.okIds) okIdCount += b;
     std::string acked = "-";
     if (!a.ackedFile.empty()) {
-        acked = writeAckedFile(a.ackedFile, L.okIds) ? a.ackedFile : std::string("WRITE_FAILED");
+        acked = writeAckedFile(a.ackedFile, L.okIds, L.failedIds) ? a.ackedFile : std::string("WRITE_FAILED");
     }
     std::vector<int64_t> lat;
     lat.reserve(static_cast<std::size_t>(L.accepted));
@@ -602,15 +655,25 @@ int runVerify(const Args& a) {
     }
     // ok_missing: acked OK by the produce run (--acked-file) but absent from the
     // log — an OK ack is a durability promise, so this must be 0.  -1 = no file.
-    int64_t okAcked = -1, okMissing = -1;
+    // failed_stored: reported FAILED (a sequenced batch) but present in the log
+    // — a false failure (an app retry would duplicate it).  -1 = not available.
+    int64_t okAcked = -1, okMissing = -1, failedReported = -1, failedStored = -1;
     if (!a.ackedFile.empty()) {
-        std::vector<uint8_t> okIds;
-        if (readAckedFile(a.ackedFile, okIds)) {
+        std::vector<uint8_t> okIds, failedIds;
+        if (readAckedFile(a.ackedFile, okIds, failedIds)) {
             okAcked = okMissing = 0;
             for (std::size_t i = 0; i < okIds.size(); ++i) {
                 if (okIds[i] == 0) continue;
                 ++okAcked;
                 if (i >= seen.size() || seen[i] == 0) ++okMissing;
+            }
+            if (!failedIds.empty()) {
+                failedReported = failedStored = 0;
+                for (std::size_t i = 0; i < failedIds.size(); ++i) {
+                    if (failedIds[i] == 0) continue;
+                    ++failedReported;
+                    if (i < seen.size() && seen[i] != 0) ++failedStored;
+                }
             }
         } else {
             std::fprintf(stderr, "shard_gate: cannot read --acked-file %s\n", a.ackedFile.c_str());
@@ -618,8 +681,10 @@ int runVerify(const Args& a) {
     }
     std::printf("VERIFY expect=%" PRId64 " total=%" PRId64 " distinct=%" PRId64 " duplicates=%" PRId64
                 " missing=%" PRId64 " foreign=%" PRId64 " dup_same_offset=%" PRId64 " dup_log_copies=%" PRId64
-                " ok_acked=%" PRId64 " ok_missing=%" PRId64 "\n",
-                n, total, distinct, dups, n - distinct, foreign, redelivered, logCopies, okAcked, okMissing);
+                " ok_acked=%" PRId64 " ok_missing=%" PRId64 " failed_reported=%" PRId64 " failed_stored=%" PRId64
+                "\n",
+                n, total, distinct, dups, n - distinct, foreign, redelivered, logCopies, okAcked, okMissing,
+                failedReported, failedStored);
     std::fflush(stdout);
     for (auto& s : subs) s.unsubscribe();
     client.close();
