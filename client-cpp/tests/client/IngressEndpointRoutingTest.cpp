@@ -386,6 +386,10 @@ TEST(IngressEndpointRouting, PartitionMoveWithAcksAllInFlightCompletesEachRecord
     }
     EXPECT_EQ(atB, 4) << "each stored frame re-offered to B exactly once";
     EXPECT_FALSE(r.client.testRouteParked(1, 0));
+    // Re-review 1 NEW-2: the re-offered frames (new attempt tag in the header
+    // correlationId) still pass the broker's CRC32C and frame/header identity checks.
+    EXPECT_EQ(r.gw.crcFailures, 0);
+    EXPECT_EQ(r.gw.identityMismatches, 0);
 }
 
 // I1: the bare ErrorResponse{NotLeader} retry goes through the partition's route

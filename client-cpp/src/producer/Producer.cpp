@@ -395,4 +395,8 @@ void Producer::testCommitClaim(long claimIndex) noexcept {
     if (impl_ && claimIndex >= 0) impl_->testCommitClaim(static_cast<aeron::util::index_t>(claimIndex));
 }
 
+void Producer::testSetNextSequence(TopicHandle topic, int32_t partition, int32_t seq) noexcept {
+    if (impl_) impl_->debugSetNextSequenceForTest(topic.topicId, partition, seq);
+}
+
 } // namespace rune::client

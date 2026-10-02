@@ -201,6 +201,25 @@ struct InvokerGateway {
     };
     std::vector<LogBatch> log;
     int oosAnswers = 0, windowDupAnswers = 0, oldDupAnswers = 0, fencedAnswers = 0;
+    // Re-review 1 (NEW-2): the broker's ProducePath step 4 (RecordBatch CRC32C ->
+    // Internal) and step 4b (the Produce FRAME's producerId / epoch / baseSequence
+    // must equal the CRC-covered batch HEADER's -> SchemaValidationFailed).  Every
+    // Produce frame of the idempotence model is checked, before anything else
+    // (fault injection, NotLeader, dedup): a failed frame is never appended.  Both
+    // counters stay 0 for a correct client — re-stamped frames included.
+    int crcFailures = 0, identityMismatches = 0;
+    /// Feeds one raw client frame to the gateway as if it arrived on `endpoint`
+    /// (tests of the broker model itself).
+    void injectFrame(int endpoint, const uint8_t* buf, std::size_t len) { onFrame(endpoint, buf, len); }
+    /// The broker already holds (producerId, epoch) on (topicId, partition) up to
+    /// `lastSeq` (an empty dedup window) — a test reaches high sequences without
+    /// producing 2^31 records.
+    void seedSequence(int32_t topicId, int64_t producerId, int32_t partition, int16_t epoch, int32_t lastSeq) {
+        SeqState& st = seqStates[std::make_tuple(topicId, producerId, partition)];
+        st.epoch   = epoch;
+        st.lastSeq = lastSeq;
+        st.window.clear();
+    }
     /// Task 16 fix round 1 (the broker's moved-replica answer): every pending
     /// (deferred acks=all / held) answer to a frame received on `endpoint` —
     /// the frame IS appended — goes out NOW as `ec` (e.g. NotLeader).
@@ -509,6 +528,22 @@ private:
         const bool answer = pv.correlationId != 0 && dropAnswer.count(ordinal) == 0;
         const bool acksAll = pv.acks == 1;
         auto ackAt = [&](const Produced& p, int16_t ec, int64_t off) { answerModel_(ordinal, p, acksAll, ec, off); };
+        // NEW-2: step 4 (CRC) then step 4b (identity: producerId always; epoch +
+        // baseSequence when producerId >= 0) — the real broker's order and codes.
+        if (!r.ensureValid()) {
+            ++crcFailures;
+            if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::Internal), 0);
+            return;
+        }
+        bool mismatch = r.producerId() != pv.producerId;
+        if (!mismatch && pv.producerId >= 0) {
+            mismatch = r.producerEpoch() != pv.producerEpoch || r.baseSequence() != pv.baseSequence;
+        }
+        if (mismatch) {
+            ++identityMismatches;
+            if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::SchemaValidationFailed), 0);
+            return;
+        }
         int16_t injected = 0;
         if (const auto it = errorFor.find(ordinal); it != errorFor.end()) injected = it->second;
         if (injected == 0 && errorIf) injected = errorIf(pv.partition, pv.producerEpoch, pv.baseSequence);

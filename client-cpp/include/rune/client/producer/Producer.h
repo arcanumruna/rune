@@ -552,6 +552,10 @@ public:
     [[nodiscard]] long testClaimRecord(TopicHandle topic, int32_t partition, const Key& key,
                                        std::span<const uint8_t> value) noexcept;
     void testCommitClaim(long claimIndex) noexcept;
+    /// Test seam (Invoker owner thread = the duty thread; re-review 1 NEW-2):
+    /// set a partition's next baseSequence (ProducerImpl::debugSetNextSequenceForTest)
+    /// so an end-to-end test reaches the INT32_MAX epoch move without 2^31 records.
+    void testSetNextSequence(TopicHandle topic, int32_t partition, int32_t seq) noexcept;
 
 private:
     /// T15b M3: the one send body; `part` computed once by the caller.

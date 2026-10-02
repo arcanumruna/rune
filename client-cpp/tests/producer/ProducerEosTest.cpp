@@ -653,6 +653,9 @@ TEST(EosOosRegression, FollowersOfARejectedHeadAreResequencedNotFailedRegression
     EXPECT_EQ(r.gw.log[0].producerEpoch, 1);
     EXPECT_EQ(r.gw.log[0].baseSequence, 0) << "re-sequenced from 0 under the new epoch";
     EXPECT_EQ(r.gw.log[1].baseSequence, 1);
+    // NEW-2: the re-stamped frames (frame + header identity, CRC) are broker-valid.
+    EXPECT_EQ(r.gw.crcFailures, 0);
+    EXPECT_EQ(r.gw.identityMismatches, 0);
 }
 
 // I-4: same for a head that FAILS by its delivery timeout (lost on every
@@ -681,4 +684,128 @@ TEST(EosOosRegression, FollowersOfATimedOutHeadAreResequencedNotFailedRegression
     EXPECT_EQ(L.status(2), rc::OpStatus::Ok) << "F1 re-sequenced, not failed";
     EXPECT_EQ(L.status(3), rc::OpStatus::Ok) << "F2 re-sequenced, not failed";
     EXPECT_EQ(loggedIds(r.gw, 0), (std::vector<uint64_t>{1, 2}));
+    EXPECT_EQ(r.gw.crcFailures, 0);  // NEW-2: the re-stamped frames are broker-valid
+    EXPECT_EQ(r.gw.identityMismatches, 0);
+}
+
+// ===========================================================================
+// Re-review 1, NEW-2: the broker model checks what the real broker checks
+// before dedup — the RecordBatch CRC32C (ProducePath step 4 -> Internal) and
+// the Produce FRAME identity against the CRC-covered batch HEADER identity
+// (step 4b -> SchemaValidationFailed) — and the frames of every resend path
+// pass both.
+// ===========================================================================
+namespace {
+// One idempotent Produce frame: the frame carries (fPid, fEpoch, fSeq), the
+// batch header (hPid, hEpoch, hSeq).
+std::vector<uint8_t> rawProduce(int64_t sessionId, int64_t corrId, int64_t fPid, int16_t fEpoch, int32_t fSeq,
+                                int64_t hPid, int16_t hEpoch, int32_t hSeq, uint64_t id) {
+    rune::protocol::RecordBatchBuilder b(0, 1'000'000);
+    b.setProducerId(hPid);
+    b.setProducerEpoch(hEpoch);
+    b.setBaseSequence(hSeq);
+    const auto v = idValue(id);
+    b.append(std::string_view("k"), std::string_view(reinterpret_cast<const char*>(v.data()), v.size()), 1'000'000);
+    const std::vector<uint8_t> batch = b.build();
+    rune::protocol::client::Produce msg;
+    msg.sessionId      = sessionId;
+    msg.correlationId  = corrId;
+    msg.topicId        = 1;
+    msg.partition      = 0;
+    msg.partitionKnown = 1;
+    msg.producerId     = fPid;
+    msg.producerEpoch  = fEpoch;
+    msg.baseSequence   = fSeq;
+    msg.recordBatch    = std::span<const uint8_t>(batch);
+    std::vector<uint8_t> out(msg.encodedSize());
+    out.resize(msg.encode(out.data()));
+    return out;
+}
+void expectBrokerValid(const test_support::InvokerGateway& gw) {
+    EXPECT_EQ(gw.crcFailures, 0) << "a frame failed the broker's CRC32C check";
+    EXPECT_EQ(gw.identityMismatches, 0) << "a frame's identity differs from its batch header's";
+}
+} // namespace
+
+// The model itself.  RED (pre-fix model): every one of the three bad frames was
+// appended (log size 4) and none was counted.
+TEST(EosFrameValidityRegression, BrokerModelRejectsCrcAndIdentityMismatchRegression) {
+    Rig r(invokerCfg(3980, 3981));
+    r.connect();
+    r.gw.idempotence = true;
+    const int64_t sid = r.gw.assignedSessionId;
+    // Frame sequence 1 vs header sequence 0.
+    auto seqMismatch = rawProduce(sid, 11, 7, 0, 1, 7, 0, 0, 1);
+    r.gw.injectFrame(0, seqMismatch.data(), seqMismatch.size());
+    // The EOS-DUP signature: frame pid -1, header pid 7.
+    auto pidMismatch = rawProduce(sid, 12, -1, 0, -1, 7, 0, 0, 2);
+    r.gw.injectFrame(0, pidMismatch.data(), pidMismatch.size());
+    // Consistent identity, one record byte flipped (CRC no longer matches).
+    auto corrupt = rawProduce(sid, 13, 7, 0, 0, 7, 0, 0, 3);
+    corrupt[corrupt.size() - 2] ^= 0x5A;
+    r.gw.injectFrame(0, corrupt.data(), corrupt.size());
+    EXPECT_EQ(r.gw.identityMismatches, 2);
+    EXPECT_EQ(r.gw.crcFailures, 1);
+    EXPECT_TRUE(r.gw.log.empty()) << "an invalid frame was appended";
+    // A valid frame is still appended.
+    auto good = rawProduce(sid, 14, 7, 0, 0, 7, 0, 0, 4);
+    r.gw.injectFrame(0, good.data(), good.size());
+    ASSERT_EQ(r.gw.log.size(), 1u);
+    EXPECT_EQ(loggedIds(r.gw, 0), (std::vector<uint64_t>{4}));
+}
+
+// Epoch move (an unresolved head: its outcome unknown -> the partition resets to
+// a new epoch at 0 once nothing is in flight): the next batch, encoded under the
+// new identity, passes both checks and is written.
+TEST(EosFrameValidityRegression, EpochMoveFramesAreBrokerValidRegression) {
+    Rig r(invokerCfg(3982, 3983));
+    r.connect();
+    r.gw.idempotence = true;
+    r.gw.errorFor    = {{1, static_cast<int16_t>(rcc::ErrorCode::NotPartitionLeader)}};  // D: outcome unknown
+    AckLedger    L;
+    rc::Producer p = r.client.producer(eosProducer(8, /*produceTimeoutMs=*/50));
+    L.attach(p);
+    const rc::TopicHandle topic = r.client.topic("t");
+    r.sendRecord(p, topic, 0, 1);
+    ASSERT_TRUE(r.drive([&] { return L.times(1) > 0; }));
+    ASSERT_EQ(L.status(1), rc::OpStatus::BrokerError);
+    r.sendRecord(p, topic, 1, 2);
+    r.sendRecord(p, topic, 2, 3);
+    ASSERT_TRUE(r.drive([&] { return L.times(2) > 0 && L.times(3) > 0; }));
+    EXPECT_EQ(L.status(2), rc::OpStatus::Ok);
+    EXPECT_EQ(L.status(3), rc::OpStatus::Ok);
+    ASSERT_EQ(r.gw.log.size(), 2u);
+    EXPECT_EQ(r.gw.log[0].producerEpoch, 1) << "precondition: the partition moved to a new epoch";
+    EXPECT_EQ(r.gw.log[0].baseSequence, 0);
+    expectBrokerValid(r.gw);
+}
+
+// Overflow epoch move (sequenceRoom_): before the int32 counter would pass
+// INT32_MAX the partition moves to a new epoch at 0; every frame on both sides
+// of the move passes both checks and every record is written once.
+TEST(EosFrameValidityRegression, OverflowEpochMoveFramesAreBrokerValidRegression) {
+    Rig r(invokerCfg(3984, 3985));
+    r.connect();
+    r.gw.idempotence = true;
+    AckLedger    L;
+    rc::Producer p = r.client.producer(eosProducer(8, /*produceTimeoutMs=*/50));
+    L.attach(p);
+    const rc::TopicHandle topic = r.client.topic("t");
+    r.sendRecord(p, topic, 0, 1);
+    ASSERT_TRUE(r.drive([&] { return L.times(1) > 0; }));
+    ASSERT_EQ(r.gw.log.size(), 1u);
+    const int64_t pid = r.gw.log[0].producerId;
+    // The broker already holds this producer up to INT32_MAX - 2.
+    r.gw.seedSequence(1, pid, 0, 0, INT32_MAX - 2);
+    p.testSetNextSequence(topic, 0, INT32_MAX - 1);
+    for (int i = 1; i <= 3; ++i) r.sendRecord(p, topic, static_cast<uint64_t>(i), static_cast<rc::Token>(i + 1));
+    ASSERT_TRUE(r.drive([&] { return L.count.size() >= 4; }));
+    EXPECT_TRUE(L.exactlyOnce(1, 5));
+    for (int t = 1; t <= 4; ++t) EXPECT_EQ(L.status(t), rc::OpStatus::Ok) << t;
+    EXPECT_EQ(loggedIds(r.gw, 0), (std::vector<uint64_t>{0, 1, 2, 3}));
+    ASSERT_EQ(r.gw.log.size(), 4u);
+    EXPECT_EQ(r.gw.log[1].baseSequence, INT32_MAX - 1);
+    EXPECT_EQ(r.gw.log[2].producerEpoch, 1) << "precondition: the epoch moved before the overflow";
+    EXPECT_EQ(r.gw.log[2].baseSequence, 0);
+    expectBrokerValid(r.gw);
 }
