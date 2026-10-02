@@ -67,6 +67,7 @@
 #include <rune_fr/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
+#include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/RcState.h>
 #include <rune/node/ReturnFifo.h>
 #include <rune/node/SessionAckSink.h>
@@ -903,7 +904,8 @@ public:
            .lastOffsetDelta(op.lastOffsetDelta)
            .recordCount(op.recordCount)
            .batchAttrs(op.batchAttrs)
-           .deferAck(op.deferAck ? 1 : 0)
+           .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
+                                               (op.crcValidated ? kOpFlagCrcValidated : 0u)))
            .durabilityTier(op.durabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
@@ -1554,7 +1556,7 @@ private:
                 spdlog::warn("Worker {}: submitCoalescedFlushes_ ring full for log@{}; "
                              "back-pressure: acking pending entries Internal",
                              workerId_, static_cast<const void*>(log));
-                work += static_cast<int>(removeInOrder_(durablePending_, [&](DurablePending& entry) {
+                work += static_cast<int>(durablePending_.sweep([&](DurablePending& entry) {
                     if (entry.token != kNoToken || entry.logPtr != log) return false;
                     entry.ret.errorCode = static_cast<int16_t>(6); // Internal
                     enqueueReturn_(entry.ret);
@@ -1563,11 +1565,9 @@ private:
             } else {
                 // Successful submit: stamp the token onto every pending entry
                 // for this log (all appends this cycle share one fsync token).
-                for (auto& entry : durablePending_) {
-                    if (entry.token == kNoToken && entry.logPtr == log) {
-                        entry.token = t;
-                    }
-                }
+                durablePending_.forEach([&](DurablePending& entry) {
+                    if (entry.token == kNoToken && entry.logPtr == log) entry.token = t;
+                });
                 ++io_submitCount_;
                 ++work;
             }
@@ -1637,8 +1637,9 @@ private:
         if (c.errorCode != 0) {
             if (routed && r.kind == RouteKind::Background) ++bgFlushErrors_;
             const rune::storage::Log* failed = routed ? r.log : nullptr;
-            for (const auto& e : durablePending_)
+            durablePending_.forEach([&](const DurablePending& e) {
                 if (!failed && e.token == c.token) failed = e.logPtr;
+            });
             if (failed) {
                 if (LogFlushSlot* owner = slotOf_(failed)) failLog_(owner->log, c.errorCode);
                 else failForeignLog_(failed, c.errorCode);
@@ -1658,10 +1659,27 @@ private:
         }
 
         // Durable token (or an unrouted one: synthetic / already-retired).
-        // F15 S5: order-preserving (pipelined Strict answers of one partition
-        // leave in append order — never reordered by the removal).
-        return static_cast<int>(removeInOrder_(durablePending_, [&](DurablePending& entry) {
-            if (entry.token == kNoToken || entry.token != c.token || entry.awaitSeal) return false;
+        // F15 S5 (+ fix round 1, M-1): Strict answers of one log leave in PARK
+        // order whatever order the fsyncs complete in.  A successful fdatasync
+        // of token T on log L covers every write issued before T's submit — so
+        // T also fires L's entries parked BEFORE T's last entry whose own
+        // (earlier) token has not completed yet.  Writes in an older, rolled
+        // segment are covered by its seal: while a seal is outstanding the
+        // entries wait for it (awaitSeal), exactly like T's own entries.
+        const rune::storage::Log* L = routed ? r.log : nullptr;
+        std::size_t lastPos = SIZE_MAX, pos = 0;
+        durablePending_.forEach([&](const DurablePending& e) {
+            if (e.token == c.token) {
+                if (L == nullptr) L = e.logPtr;
+                lastPos = pos;
+            }
+            ++pos;
+        });
+        if (lastPos == SIZE_MAX) return 0;                       // nothing parked on T
+        pos = 0;
+        return static_cast<int>(durablePending_.sweep([&](DurablePending& entry) {
+            if (pos++ > lastPos) return false;
+            if (entry.logPtr != L || entry.token == kNoToken || entry.awaitSeal) return false;
             if (sealsOutstanding_(entry.logPtr)) {
                 entry.awaitSeal = true;                         // durable in its active segment;
                 return false;                                   // fires once the seals complete
@@ -2290,7 +2308,8 @@ private:
         f.minIsr         = op.minIsr();
         f.producerEpoch  = op.producerEpoch();
         auto* rep        = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
-        f.acksAll        = op.deferAck() != 0 && rep != nullptr;
+        f.acksAll        = (op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr;
+        f.crcValidated   = (op.deferAck() & kOpFlagCrcValidated) != 0;
         f.durabilityTier = op.durabilityTier();
         f.enqueuedAtNs   = op.enqueuedAtNs();
         f.fromOp         = true;
@@ -3238,7 +3257,8 @@ private:
         uint64_t                logGen     = 0;
         int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
     };
-    std::vector<DurablePending> durablePending_;
+    // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
+    OrderedWaitQueue<DurablePending> durablePending_;
 
     // E3 Task 5: per-cycle set of logs that have had at least one Strict-tier
     // append this cycle.  submitCoalescedFlushes_ drains this and submits one
@@ -3386,7 +3406,8 @@ private:
         int32_t                              minIsr     = 1;
         WorkerReturn                         ret;               ///< ack payload when ready
     };
-    std::vector<PendingAcksAll> pendingAcksAll_;
+    // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
+    OrderedWaitQueue<PendingAcksAll> pendingAcksAll_;
 
     // F15 S3 (§6): the ONE local return FIFO in front of ret_, every mode.
     // Pre-allocated fixed-capacity ring of tagged entries (WorkerReturn |
@@ -3991,7 +4012,7 @@ private:
             return p.ret.incarnation != 0 ? ownsIncarnation_(p.ret.targetReplicaId, p.ret.incarnation)
                                           : isOwned(p.replica);
         };
-        (void)removeInOrder_(pendingAcksAll_, [&](PendingAcksAll& e) {
+        (void)pendingAcksAll_.sweep([&](PendingAcksAll& e) {
             if (stillOwned(e)) return false;
             e.ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
             enqueueReturn_(e.ret);
@@ -4194,7 +4215,7 @@ private:
     }
     void fireSealGated_(LogFlushSlot& slot) {
         if (sealsOutstanding_(slot.log)) return;
-        (void)removeInOrder_(durablePending_, [&](DurablePending& entry) {
+        (void)durablePending_.sweep([&](DurablePending& entry) {
             if (!entry.awaitSeal || entry.logPtr != slot.log) return false;
             fireDurable_(entry);
             return true;
@@ -4220,14 +4241,14 @@ private:
     // and the runtime is signalled once to halt the broker.
     // Fail THIS worker's pending acks on `log` with `code` (never touches the Log).
     void failOwnPending_(const rune::storage::Log* log, int16_t code, bool includeAcksAll) {
-        (void)removeInOrder_(durablePending_, [&](DurablePending& e) {
+        (void)durablePending_.sweep([&](DurablePending& e) {
             if (e.logPtr != log) return false;
             e.ret.errorCode = code;
             enqueueReturn_(e.ret);
             return true;
         });
         if (!includeAcksAll) return;
-        (void)removeInOrder_(pendingAcksAll_, [&](PendingAcksAll& e) {
+        (void)pendingAcksAll_.sweep([&](PendingAcksAll& e) {
             auto* r = e.replica;
             if (!(r && r->isDiskBacked() && r->log() == log)) return false;   // log() is immutable: safe to read
             e.ret.errorCode = code;
@@ -4383,7 +4404,7 @@ private:
 
         // F15 S5: order-preserving removal — the answers of pipelined acks=all
         // batches of one partition leave in append order.
-        return static_cast<int>(removeInOrder_(pendingAcksAll_, [&](PendingAcksAll& entry) {
+        return static_cast<int>(pendingAcksAll_.sweep([&](PendingAcksAll& entry) {
             // F15 §3.2: re-validate first — ownership, role (BecomeFollower OR a
             // self-demotion in onFetchRequest, no hook needed), log generation.
             auto* rep = waiterReplica_(entry.replica, entry.ret.targetReplicaId, entry.ret.incarnation,
@@ -4458,24 +4479,6 @@ private:
         return r;
     }
 
-    // F15 S5: order-preserving removal of every entry `take` claims (it fires
-    // or fails the entry and returns true); survivors keep their order, so the
-    // answers of pipelined batches of one partition leave in append order
-    // (swap-with-back reordered them).  O(n) per sweep, no allocation (the
-    // vector only shrinks), template visitor (no std::function).
-    template <typename Vec, typename Take>
-    static std::size_t removeInOrder_(Vec& v, Take&& take) {
-        std::size_t w = 0;
-        const std::size_t n = v.size();
-        for (std::size_t r = 0; r < n; ++r) {
-            if (take(v[r])) continue;
-            if (w != r) v[w] = std::move(v[r]);
-            ++w;
-        }
-        const std::size_t removed = n - w;
-        v.erase(v.begin() + static_cast<std::ptrdiff_t>(w), v.end());
-        return removed;
-    }
     // F15 S2 (R-4c): one more owed ack (fires into ret_ later) still fits the
     // G-A6 return-ring reservation — the same rule the shard-ingress poll uses.
     [[nodiscard]] bool ackReservationAvailable_() const noexcept {
@@ -4735,6 +4738,7 @@ private:
         uint8_t durabilityTier = 1;     ///< 2 = Strict (ack after fsync)
         bool    acksAll       = false;
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
+        bool    crcValidated  = false;  ///< the op producer validated this batch's CRC (M-3)
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
     };
 
@@ -4896,7 +4900,9 @@ private:
             f.producerId, f.producerEpoch, f.baseSequence,
             *log, psm_,
             acksAll, isrSize, minIsr, helperTier,
-            /*crcPreverified=*/f.fromOp);   // the gateway validated the routed batch's CRC
+            // M-3: skip the repeat CRC pass ONLY when the op's producer says it
+            // validated these exact bytes (the gateway, right after ensureValid).
+            /*crcPreverified=*/f.fromOp && f.crcValidated);
 
         ret.baseOffset  = outcome.baseOffset;
         // A duplicate carries its ORIGINAL range (handleProduceBatch reports
@@ -4917,7 +4923,7 @@ private:
         // Waterfall: leader appended [baseOffset..lastOffset].  Keyed by lastOffset.
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplLeaderAppend,
             (static_cast<uint32_t>(f.partition) << 24) |
-                (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
+                (static_cast<uint32_t>(ret.lastOffset) & 0xFFFFFFu));   // a duplicate: its original range
         // GR-4 Mode A: advance the replica's LEO/HW after successful append.
         if (replica) {
             replica->onLeaderLogAppended();
@@ -4972,7 +4978,7 @@ private:
         // Keyed by (partition<<24)|offset (see ReplPendingAckFire).
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckEnqueue,
             (static_cast<uint32_t>(ret.partition) << 24) |
-                (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
+                (static_cast<uint32_t>(lastOff) & 0xFFFFFFu));   // a duplicate: its ORIGINAL range
         PendingAcksAll pending;
         pending.replica    = replica;
         pending.lastOffset = lastOff;

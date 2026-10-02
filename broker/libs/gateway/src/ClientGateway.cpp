@@ -1951,6 +1951,11 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // vector.  The worker's appendNoSyncRestamp assigns + patches the base
         // offset (CRC-safe: base-offset field [0..7] precedes the CRC region).
         op.recordBatchView = msg.recordBatch;
+        // F15 S5 fix round 1 (M-3): these exact bytes (rbData == msg.recordBatch,
+        // unmodified since the ensureValid() above, copied once into the ring by
+        // enqueueOp below) passed the CRC32C check — the worker may skip its
+        // repeat pass.  INVARIANT: set ONLY here, only after ensureValid().
+        op.crcValidated    = true;
 
         // Enqueue to the worker.  tryEnqueueOp returns false on back-pressure
         // (ring full, or the worker's SetOwnership still undelivered).  M5 (Task

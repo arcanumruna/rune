@@ -1317,3 +1317,65 @@ TEST(WorkerPsmEndToEndRegression, ShardThreadPlacementDedupsOnTheOwningWorker) {
 TEST(WorkerPsmEndToEndRegression, ShardFusedPlacementDedupsOnTheOwningWorker) {
     runWorkerPsmDedupEndToEnd(PsmE2eMode::ShardFused);
 }
+
+// F15 S5 fix round 1 (review M-5): the DEFAULT config across a PROCESS RESTART.
+// Before S5 the gateway mirror seeded Legacy dedup state at startup; now the
+// owning worker's RC build rebuilds it from the log.  Produce seq 0 and 1,
+// stop, start a NEW broker on the same data dir, retry seq 1: answered with
+// the original offset (1), one copy; seq 2 lands at 2.
+TEST(WorkerPsmEndToEndRegression, DefaultLegacyConfigDedupsARetryAfterRestart) {
+    TmpDir dir{"psmr"}, cdir1{"psmrc1"}, cdir2{"psmrc2"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const NodeConfig cfg = makeDefaultConfig(0, dir.path, ports, 1);
+    constexpr int64_t kPid = 4343;
+    const std::string gw = gatewayChannel(ports, 0);
+    auto sendIdem = [&](ShardTestClient& c, int64_t sid, int32_t seq) -> std::optional<pc::ProduceResponse> {
+        const auto batch = idempotentBatch(kPid, 0, seq);
+        for (int a = 0; a < 200; ++a) {
+            const int64_t corr = c.nextCorrelationId();
+            if (!c.produceIdempotent(gw, kClientStream, sid, corr, 0, 0, /*acks=all*/1, kPid, 0, seq, batch)) continue;
+            auto ack = c.awaitProduceResponse(corr);
+            if (ack && ack->errorCode == static_cast<int16_t>(pc::ErrorCode::NotLeader)) continue;
+            return ack;
+        }
+        return std::nullopt;
+    };
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(10'000ms));
+        {
+            ShardTestClient c(cdir1.path);
+            const int64_t sid = c.connect(gw, kClientStream);
+            ASSERT_GT(sid, 0);
+            for (int32_t seq = 0; seq < 2; ++seq) {
+                auto a = sendIdem(c, sid, seq);
+                ASSERT_TRUE(a.has_value());
+                ASSERT_EQ(a->errorCode, 0);
+                ASSERT_EQ(a->baseOffset, seq);
+            }
+        }
+        node.stop();
+    }
+    ASSERT_EQ(logEndOffsetAfterStop(dir.path), 2);
+    {
+        BrokerNode node{cfg};                                  // a new process image, same data dir
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(10'000ms));
+        {
+            ShardTestClient c(cdir2.path);
+            const int64_t sid = c.connect(gw, kClientStream);
+            ASSERT_GT(sid, 0);
+            auto retry = sendIdem(c, sid, 1);                  // the producer's retry of seq 1
+            ASSERT_TRUE(retry.has_value());
+            EXPECT_EQ(retry->errorCode, 0);
+            EXPECT_EQ(retry->baseOffset, 1) << "the retry after restart was not deduped (original offset 1)";
+            auto next = sendIdem(c, sid, 2);
+            ASSERT_TRUE(next.has_value());
+            EXPECT_EQ(next->errorCode, 0) << "seq 2 refused after restart (20 = OutOfOrderSequence)";
+            EXPECT_EQ(next->baseOffset, 2);
+        }
+        node.stop();
+    }
+    EXPECT_EQ(logEndOffsetAfterStop(dir.path), 3) << "the retried batch was appended twice across the restart";
+}

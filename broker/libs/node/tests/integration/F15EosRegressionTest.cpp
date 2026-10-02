@@ -9,6 +9,7 @@
 // only waits are condition waits with a hard iteration cap.
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/GatewayReplicaView.h>
+#include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/TransactionCoordinationService.h>
@@ -22,6 +23,7 @@
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/transaction/ControlMarker.h>
@@ -4214,4 +4216,126 @@ TEST(TxnAddOffsetsRegression, AddOffsetsWhilePreparingIsConcurrentTransactions) 
     T.m.runWorker(2);
     ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "precondition: PrepareCommit, marker in flight";
     EXPECT_EQ(addOffsets(T, "g"), kConcurrent) << "AddOffsets on a txn in Prepare* must be retriable 27";
+}
+
+// ============================================================================
+// F15 S5 fix round 1 (task review): M-1, M-2, M-3.
+// ============================================================================
+TEST(WorkerPsmRegression, StrictAnswersInParkOrderWhenFsyncsCompleteOutOfOrder) {
+    // M-1: two coalesced fsyncs on the same log (T1 for seq 0, T2 for seq 1)
+    // are not ordered by the io backend.  T2's completion arriving first must
+    // not answer seq 1 before seq 0: T2's fdatasync covers seq 0's write too,
+    // so both are answered, in park order.
+    LegacyAcksRig R({1}, /*tier=*/2);
+    R.w().setReapPausedForTest(true);
+    R.produce(1, /*acks=leader*/0, batchAt(0));
+    R.runWorker();                                            // seq 0 appended, fsync T1 submitted
+    R.produce(2, 0, batchAt(0));
+    R.runWorker();                                            // seq 1 appended, fsync T2 submitted
+    ASSERT_EQ(R.w().durablePendingCountForTest(), 2u);
+    const CompletionToken t1 = R.w().durablePendingTokenForTest(0);
+    const CompletionToken t2 = R.w().durablePendingTokenForTest(1);
+    ASSERT_NE(t1, kNoToken);
+    ASSERT_NE(t2, kNoToken);
+    ASSERT_NE(t1, t2) << "precondition: two separate fsyncs";
+    auto drain = [&] { R.w().drainReturn([&](WorkerReturn ret) { R.gw.handleWorkerReturnForTest(ret); }); };
+    R.w().deliverCompletionForTest(FlushCompletion{t2, 0, R.r->log()->flushBoundary()});   // T2 first
+    drain();
+    R.w().deliverCompletionForTest(FlushCompletion{t1, 0, R.r->log()->flushBoundary()});
+    drain();
+    ASSERT_EQ(R.answers.size(), 2u);
+    EXPECT_EQ(R.answers[0].corr, 1) << "seq 1 was answered before seq 0 (fsync completion order leaked)";
+    EXPECT_EQ(R.answers[1].corr, 2);
+    for (const auto& a : R.answers) EXPECT_EQ(a.code, 0);
+    // The real completions (reaped later) fire nothing more.
+    R.w().setReapPausedForTest(false);
+    const uint64_t reaped = R.w().ioCompletionsReapedForTest();
+    for (int i = 0; i < kCap && R.w().ioCompletionsReapedForTest() < reaped + 2; ++i) { R.runWorker(); std::this_thread::yield(); }
+    EXPECT_EQ(R.answers.size(), 2u) << "a real completion fired an answer twice";
+}
+
+TEST(WorkerPsmRegression, MemoryLogPromotionClearsStaleProducerState) {
+    // M-2: a memory-backed partition goes Unbuilt → Ready without a scan.  Its
+    // producer state from an earlier leadership must not survive that edge (a
+    // retry could be answered duplicate-OK at an offset that now holds other
+    // data); cleared, the retry is appended again (never a false OK).
+    rune::storage::InMemoryLog mlog(1 << 20, 10000);
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &mlog, &t);
+    Worker w(0, 1 << 16, 1 << 16, 16, 16);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.doWork(1);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady) << "precondition: memory log Ready at once";
+    w.psmForTest().update(1, /*pid=*/7, 0, /*epoch=*/0, /*baseSeq=*/0, /*lastSeq=*/0, /*baseOffset=*/0);
+    ASSERT_NE(w.psmForTest().entry(1, 7, 0), nullptr);
+    rep.becomeFollower(2, /*leader=*/2);                      // a follower period (log may change under it)
+    w.doWork(2);
+    rep.becomeLeader(3, {1});
+    w.doWork(3);
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady) << "precondition: re-promoted, Ready again";
+    EXPECT_EQ(w.psmForTest().entry(1, 7, 0), nullptr)
+        << "the memory-log promotion kept producer state from the earlier leadership";
+}
+
+namespace {
+std::vector<uint8_t> corrupted(std::vector<uint8_t> b) {
+    b.back() ^= 0x5A;                                         // inside the CRC-covered region
+    return b;
+}
+} // namespace
+
+TEST(WorkerPsmRegression, CorruptBatchRejectedOnTheWorkerPoolGatewayPath) {
+    // M-3: default config (worker pool): a corrupt-CRC produce received by the
+    // gateway is answered Internal and never appended.
+    LegacyAcksRig R({1});
+    R.produce(1, /*acks=leader*/0, corrupted(batchAt(0)));
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, static_cast<int16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0) << "a corrupt batch was appended";
+}
+
+TEST(WorkerPsmRegression, CorruptBatchOnAnUnvalidatedOpIsRejectedByTheWorker) {
+    // M-3: the worker skips its CRC pass ONLY for an op whose producer says it
+    // validated the bytes (the gateway).  Any other op producer — a test rig, a
+    // future forward / retry queue — gets the worker's own check.
+    LegacyAcksRig R({1});
+    WorkerOp op = routedIdemOp(R.r, R.sid, 1, corrupted(batchAt(0)), /*pid=*/-1, /*seq=*/-1);
+    ASSERT_FALSE(op.crcValidated) << "precondition: not validated by its producer";
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(op)));
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 1u);
+    EXPECT_EQ(R.answers[0].code, static_cast<int16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(R.r->log()->logEndOffset(), 0) << "the worker appended a corrupt batch from an unvalidated op";
+}
+
+TEST(OrderedWaitQueueRegression, ParkOrderKeptFrontFireIsO1AndTombstonesNeverGrowTheRing) {
+    // I-1: the parked-waiter container keeps park order across middle removals,
+    // pops a fired front without moving survivors, and — with live entries
+    // within the reservation — never allocates (compaction reclaims tombstones).
+    OrderedWaitQueue<int> q;
+    q.reserve(64);
+    const std::size_t slots = q.capacitySlots();
+    for (int i = 0; i < 10; ++i) q.push_back(int{i});
+    EXPECT_EQ(q.sweep([](int v) { return v == 0 || v == 5 || v == 7; }), 3u);
+    std::vector<int> seen;
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, (std::vector<int>{1, 2, 3, 4, 6, 8, 9}));
+    EXPECT_EQ(q.size(), 7u);
+    EXPECT_EQ(q.at(4), 6);
+    // An old entry (1) never fires while thousands behind it do: tombstones
+    // accumulate behind it, compaction reclaims them, the ring never grows.
+    int next = 10;
+    for (int round = 0; round < 2000; ++round) {
+        for (int k = 0; k < 8; ++k) q.push_back(int{next++});
+        (void)q.sweep([](int v) { return v >= 10; });
+    }
+    EXPECT_EQ(q.growths(), 0u) << "the ring grew although live entries stayed within the reservation";
+    EXPECT_GT(q.compactions(), 0u);
+    EXPECT_EQ(q.capacitySlots(), slots);
+    seen.clear();
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, (std::vector<int>{1, 2, 3, 4, 6, 8, 9})) << "order lost across compactions";
+    EXPECT_EQ(q.sweep([](int) { return true; }), 7u);
+    EXPECT_TRUE(q.empty());
 }

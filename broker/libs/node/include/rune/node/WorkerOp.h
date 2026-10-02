@@ -195,6 +195,15 @@ struct WorkerOp {
     // Forwarded in WorkerReturn so the gateway knows to enqueue PendingAck.
     bool deferAck = false;
 
+    // F15 S5 fix round 1 (review M-3): the producer of this Produce op ran
+    // RecordBatchReader::ensureValid() (CRC32C) on EXACTLY these batch bytes
+    // before enqueueing them.  Only then may the worker skip its own CRC pass.
+    // Set by ClientGateway::handleProduce right after its ensureValid; any
+    // other op producer (test rigs, a future forward / retry queue) leaves it
+    // false and the worker validates.  Carried over the ring as bit 1 of the
+    // wire `deferAck` byte (kOpFlagCrcValidated) — no protocol change.
+    bool crcValidated = false;
+
     // durabilityTier: controls when the ProduceResult ack is emitted.
     //   0 = Leader  — ack immediately after appendNoSync (today's default).
     //   1 = Majority — ack after HW advance (gateway-side gate, same as today).
@@ -431,6 +440,10 @@ struct WorkerReturn {
 /// later); TooLarge = the op's tail can never fit one ring frame — NOT retriable
 /// (a caller that retries it would livelock); answer it as an error instead.
 enum class EnqueueResult : uint8_t { Enqueued, Full, TooLarge };
+
+/// The wire `deferAck` byte of a WorkerOp is a flag set (F15 S5 fix round 1).
+inline constexpr uint8_t kOpFlagDeferAck     = 0x01;   ///< WorkerOp::deferAck (acks=all, steady state)
+inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidated (Produce only)
 
 // ---------------------------------------------------------------------------
 // workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a

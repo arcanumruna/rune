@@ -241,6 +241,13 @@ public:
         if (std::holds_alternative<Unbuilt>(st_)) {
             if (!f.leader || !f.leaderComplete) return 0;  // I2: wait for leaderComplete_
             if (log == nullptr) {
+                // F15 S5 fix round 1 (M-2): a memory-backed partition has no
+                // scan to rebuild its producer state — clear it on this edge too,
+                // so no window from an earlier leadership / log generation can
+                // answer a retry duplicate-OK at an offset now holding other data
+                // (at worst a retry is appended again: at-least-once, never a
+                // false OK).  A real rebuild for memory logs belongs to F22.
+                if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
                 st_ = Ready{f.epoch, f.logGeneration, f.leadershipGeneration};
                 return 0;
             }
