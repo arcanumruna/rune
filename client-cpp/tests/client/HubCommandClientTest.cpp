@@ -977,3 +977,50 @@ TEST(HubCommandClient, TxnNotCoordinatorRediscoversThroughMetadataRegression) {
     EXPECT_EQ(tp.producerId(), 4242);
     EXPECT_EQ(r.cq.timesCompleted(init.token()), 1);
 }
+
+// C10 (found by the dr-e2e tx suite on a 3-node broker whose partition
+// leaders are spread over the nodes): every transactional frame went through
+// the route of topic 0 / partition 0.  Coordinator requests (InitProducerId,
+// AddPartitionsToTxn, EndTxn) then reached whichever node led partition 0 —
+// not the coordinator, which is the node of the seed session (NotCoordinator,
+// re-discovered and re-sent to the same wrong node until the op timed out) —
+// and txn data for any other partition reached partition 0's leader.
+// Coordinator requests must ride the seed session; a txn Produce must ride
+// ITS partition's leader route.
+TEST(HubCommandClient, TxnFramesRouteCoordinatorToSeedAndDataToPartitionLeaderRegression) {
+    HubRig r(4026);
+    auto tp = r.client.transactionalProducer("tx-route");
+    r.connect();
+    const int64_t seedSid = r.gw.assignedSessionId;  // the seed (coordinator) session
+    // Partition 0 of topic 0 is led by another node (its own session, sid 77).
+    r.gw.assignedSessionId = 77;
+    r.client.testSetRoute(0, 0, "aeron:ipc?alias=p0leader");
+    r.gw.initPidReply = true;
+    auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+    ASSERT_TRUE(init.ok()) << init.describe();
+    ASSERT_FALSE(r.gw.coordinatorSessionIds.empty());
+    for (const int64_t sid : r.gw.coordinatorSessionIds) {
+        EXPECT_EQ(sid, seedSid) << "InitProducerId must go to the coordinator (seed session)";
+    }
+
+    // Topic "t" (id 1) partition 0 is led by a third node (sid 88).
+    r.gw.assignedSessionId = 88;
+    r.client.testSetRoute(1, 0, "aeron:ipc?alias=t1leader");
+    r.gw.replyTxn = true;
+    tp.beginTransaction();
+    tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+    auto commit = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+    ASSERT_TRUE(r.drive([&] { return commit.ready(); })) << commit.describe();
+    EXPECT_EQ(commit.status(), rc::OpStatus::Ok) << commit.describe();
+    ASSERT_FALSE(r.gw.produced.empty());
+    for (const auto& pr : r.gw.produced) {
+        EXPECT_EQ(pr.topicId, 1);
+        EXPECT_EQ(pr.sessionId, 88) << "txn data must ride its partition leader's session";
+    }
+    ASSERT_GE(r.gw.coordinatorSessionIds.size(), 3u) << "InitProducerId + AddPartitions + EndTxn";
+    for (const int64_t sid : r.gw.coordinatorSessionIds) {
+        EXPECT_EQ(sid, seedSid) << "coordinator requests must ride the seed session";
+    }
+    EXPECT_EQ(r.cq.timesCompleted(commit.token()), 1);
+}

@@ -211,10 +211,27 @@ Client::Client(ClientConfig cfg)
     });
 
     // Built ONCE (not per duty cycle / per frame).  TX-5 / Task 1.4: txn producers
-    // keep their 3-arg SendFn (streamId, buf, len); the data path has no
-    // per-partition route, so topicId/partition = 0 → the agent's default offer path.
+    // keep their 3-arg SendFn (streamId, buf, len), stamped with the seed
+    // sessionId.  C10: the route follows the frame —
+    //   * Produce (txn data) -> ITS partition's leader route (re-stamped with
+    //     that leader session's id; no route known = the seed, as for any produce);
+    //   * every other txn frame is a COORDINATOR request (InitProducerId,
+    //     AddPartitionsToTxn, AddOffsetsToTxn, TxnOffsetCommit, EndTxn) -> the
+    //     seed session, like the group coordinator's requests.  (It used to take
+    //     topic 0 / partition 0's leader route: on a cluster whose partition
+    //     leaders are spread over the nodes that is not the coordinator.)
     txnSendFn_ = [this](int32_t streamId, const uint8_t* buf, std::size_t len) -> bool {
-        return agent_.offerToPartition(/*topicId=*/0, /*partition=*/0, streamId, buf, len);
+        const auto tid = codec::peekTemplate(buf, len);
+        if (tid && static_cast<codec::TemplateId>(*tid) == codec::TemplateId::Produce) {
+            const auto pv = codec::decodeProduce(buf, len);
+            const int32_t topicId   = pv ? pv->topicId : 0;
+            const int32_t partition = pv ? pv->partition : 0;
+            return agent_.offerToPartition(topicId, partition, streamId, buf, len);
+        }
+        // Retry = transiently refused: false, re-offered next cycle.  Fatal =
+        // never deliverable (counted + logged by the agent): consumed, the op
+        // deadline completes the request.
+        return agent_.offerDefault(buf, len) != transport::AeronTransport::OfferResult::Retry;
     };
 
     // CG-5: GroupConsumerHub is ticked from sweepTimeouts (100 ms cadence).

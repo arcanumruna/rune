@@ -115,6 +115,10 @@ struct InvokerGateway {
     std::deque<int16_t> initPidCodes;
     int64_t             initPid = 4242;
     int initPids = 0, addPartitions = 0, addOffsets = 0, txnOffsetCommits = 0, endTxns = 0;
+    // C10: the sessionId stamped on every txn COORDINATOR request received
+    // (InitProducerId / AddPartitionsToTxn / EndTxn) — which client session
+    // carried it (the seed session = the coordinator's, vs a partition leader's).
+    std::vector<int64_t> coordinatorSessionIds;
     // F8c C7: answer AddPartitionsToTxn and EndTxn OK (txn close tests); the
     // commit flag of every EndTxn received (1 commit / 0 abort).
     bool                 replyTxn = false;
@@ -381,6 +385,7 @@ private:
         case rcc::TemplateId::InitProducerId: {
             ++initPids;
             const auto ip = rp::InitProducerId::decode(buf, len);
+            if (ip) coordinatorSessionIds.push_back(ip->sessionId);
             if (!ip || !initPidReply) return;
             rp::InitProducerIdResponse rsp;
             rsp.sessionId     = ip->sessionId;
@@ -399,6 +404,7 @@ private:
         case rcc::TemplateId::AddPartitionsToTxn: {
             ++addPartitions;
             const auto ap = rp::AddPartitionsToTxn::decode(buf, len);
+            if (ap) coordinatorSessionIds.push_back(ap->sessionId);
             if (!ap || !replyTxn) return;
             rp::AddPartitionsToTxnResponse rsp;
             rsp.sessionId     = ap->sessionId;
@@ -414,6 +420,7 @@ private:
             ++endTxns;
             const auto et = rp::EndTxn::decode(buf, len);
             if (!et) return;
+            coordinatorSessionIds.push_back(et->sessionId);
             endTxnCommits.push_back(et->commit);
             if (!replyTxn) return;
             rp::EndTxnResponse rsp;
