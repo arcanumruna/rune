@@ -265,6 +265,7 @@ if(aeron_FOUND)
         src/Completions.cpp
         src/detail/CpuAffinity.cpp
         src/shard/ShardConfig.cpp
+        src/shard/ClientShard.cpp
     )
     target_include_directories(rune_client_api PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -1008,6 +1009,7 @@ if(BUILD_TESTING)
             tests/detail/CompletionsTest.cpp
             tests/client/InvokerClientTest.cpp
             tests/shard/ShardConfigTest.cpp
+            tests/shard/ClientShardTest.cpp
             tests/client/HubCommandClientTest.cpp
             tests/client/CompletionsClientTest.cpp
             tests/client/HandleLifetimeTest.cpp
