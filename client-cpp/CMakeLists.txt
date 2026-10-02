@@ -165,6 +165,14 @@ if(aeron_FOUND)
         find_library(UUID_LIB uuid)
         if(UUID_LIB)
             target_link_libraries(rune_client_transport PUBLIC ${UUID_LIB})
+            # The embedded driver archive (libaeron_driver_static.a) needs uuid_generate:
+            # append -luuid to aeron::aeron's interface so it is always linked AFTER
+            # the Aeron archives.  With --as-needed (Ubuntu) a libuuid placed before
+            # them is dropped, and CMake de-duplicates a repeated ${UUID_LIB} path
+            # (keeping the early one) — hence the -l form (T15b, k3s gcc-13).
+            if(TARGET aeron::aeron)
+                set_property(TARGET aeron::aeron APPEND PROPERTY INTERFACE_LINK_LIBRARIES "-luuid")
+            endif()
         endif()
     endif()
 endif()
@@ -383,7 +391,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     # T15b gates 2-5: real-broker driver for every client arm (see its header).
     add_executable(shard_gate examples/shard_gate.cpp)
     target_include_directories(shard_gate PRIVATE ${RUNE_PROTOCOL_INCLUDE})
-    target_link_libraries(shard_gate PRIVATE rune_client_api)
+    target_link_libraries(shard_gate PRIVATE rune_client_api rune_client_producer rune_client_subscriber rune_fr)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB_SHARD_GATE uuid)
         if(UUID_LIB_SHARD_GATE)
