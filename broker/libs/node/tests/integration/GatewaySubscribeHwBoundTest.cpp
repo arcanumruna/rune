@@ -46,6 +46,7 @@
 // NO Docker.  ALL waits bounded (hard cap + ASSERT).  No busy-spin.
 // ---------------------------------------------------------------------------
 
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 // Gateway
@@ -688,6 +689,7 @@ static rune::node::NodeConfig makeGr6Config(
     const std::vector<uint16_t>& rPorts)
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 31;
@@ -743,7 +745,7 @@ private:
         fs::create_directories(aeronDir);
         rune::node::EmbeddedDriverConfig cfg;
         cfg.dir             = aeronDir.string();
-        cfg.termBufferBytes = 64 * 1024;
+        cfg.termBufferBytes = 256 * 1024;   // receiver window = term/2 must be >= the broker MTU (derived 65504 on loopback)
         return cfg;
     }
 };

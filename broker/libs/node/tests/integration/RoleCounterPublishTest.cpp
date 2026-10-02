@@ -13,6 +13,7 @@
 // (BrokerNode) and the read path (CncFileReader) that the dr-e2e harness relies
 // on via `docker exec rune_role`.
 // ---------------------------------------------------------------------------
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RoleCounter.h>
@@ -46,6 +47,7 @@ fs::path makeTempDataDir(std::string_view tag) {
 
 NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;

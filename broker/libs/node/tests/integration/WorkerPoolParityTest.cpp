@@ -32,6 +32,7 @@
 //        Without RUNE_WORKERS the config defaults to 1 (pre-E1 path).
 // ---------------------------------------------------------------------------
 
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 
@@ -96,6 +97,7 @@ static std::filesystem::path makeTempDataDir(std::string_view tag) {
 static NodeConfig makeSingleNodeConfig4W(const std::filesystem::path& dataDir,
                                          int32_t workerCount) {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;

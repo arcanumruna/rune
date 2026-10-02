@@ -1,4 +1,5 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/node/HostDefaults.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/RoleCounter.h>
@@ -198,6 +199,19 @@ void BrokerNode::start() {
     // observer (isLeader/leaderId/... drain the ring; others are refused).
     // Bound before the control thread exists (ordered by its start).
     leaderObserver_.bindObserver();
+
+    // 2026-10-02: the findings §4 config is the DEFAULT, derived from the host —
+    // Aeron mtu / socket buffer / window, shard base ports, worker affinity.
+    // Explicit values win; resolved ONCE here (before any reader) and logged in
+    // one line.  The line is emitted at WARN so it is visible in perf runs too
+    // (RUNE_LOG_LEVEL=warn) — it proves which config a measurement ran.
+    {
+        const auto facts = probeHostNetFacts(nodeEndpointHosts(config_));
+        const auto hd    = applyHostDerivedDefaults(config_, facts, hostCpuCount());
+        spdlog::warn("BrokerNode[{}]: effective config: {}", config_.nodeId, hd.summary);
+        if (!hd.warnings.empty())
+            spdlog::warn("BrokerNode[{}]: !!! TRANSPORT CONFIG WARNING: {}", config_.nodeId, hd.warnings);
+    }
 
     // Spec §3.3: shard-mode misconfiguration is a HARD startup refusal, before any
     // side effect (no dataDir, no driver, no ports).
@@ -1253,6 +1267,15 @@ void BrokerNode::buildWorkerPool() {
                                      "refusing to start");
     }
 
+    // 2026-10-02: io_uring is the default WHEN AVAILABLE — an auto-selected
+    // uring that cannot be set up fell back to portable; logged ONCE per node.
+    for (int32_t i = 0; i < wc; ++i) {
+        if (const auto& why = workerPool_->worker(i).ioFallbackReason(); !why.empty()) {
+            spdlog::warn("BrokerNode[{}]: io_uring unavailable ({}) — io backend falls back to 'portable' "
+                         "(set RUNE_IO_BACKEND=portable to silence)", config_.nodeId, why);
+            break;
+        }
+    }
     if (config_.shardMode()) {
         // Spec §3.1 never-block: a shard has no inline-fsync fallback, so the
         // selected io backend MUST accept submissions (Task 10 fix 1 / C1).

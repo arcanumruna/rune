@@ -20,6 +20,7 @@
 // Unique temp paths: getpid() + atomic counter.
 // All waits hard-capped with ASSERT (no infinite spin).
 
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
@@ -134,6 +135,7 @@ static NodeConfig makeThreeNodeConfig(
     const std::vector<uint16_t>& clientPorts)     // 3 ports, one per node
 {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = nodeId;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;

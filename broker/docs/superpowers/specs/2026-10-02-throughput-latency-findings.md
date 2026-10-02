@@ -58,6 +58,7 @@ Throughput numbers: 3-node acks=all 1 KiB, window 8000, 300k records unless note
 | MTU | 64 KiB MTU (`RUNE_AERON_MTU=65504`) on loopback replication; window 4 MiB with 16 MiB socket buffers (16 MiB window caused 98 % UDP drops: 30M rcvbuf errors in one run). | config | 12.4k → 61.5k (shard) ; netfilter share ~20 % → ~3 % |
 | A4 | Fused runtime rides worker 0's driver (one driver per worker; the extra runtime driver cost ~15–17 µs/pass of idle polling). | `02951ef` | runtime 18–22 → 2–2.6 µs/pass; pass 40 → 20 µs; 61k → 73–79k |
 | SPARSE | `RUNE_AERON_TERM_SPARSE=false`: pre-allocated term buffers (sparse terms page-faulted ~15 % of the shard thread; also F26 SIGBUS). | `bf8527e` | 73–79k → **100–105k** |
+| DEFAULTS | The §4 config is the broker DEFAULT, auto-derived from the host (`HostDefaults.h`): shard + fused, 1 worker; 16 MiB non-sparse terms; 32 MiB rings; uring with auto-fallback to portable; MTU 65504 on loopback / NIC MTU − 28 (IPv6 − 48) aligned 32, clamped ≤ SO_SNDBUF; socket buffer min(16 MiB, rmem/wmem_max) + loud WARN naming the sysctls; window pow2(min(4 MiB, buf/4, term/2)); shard base ports + core layout derived. Explicit env/config always wins (clamped only where `aeron_driver_init` would EINVAL). One startup line logs the effective config. | integ/perf-defaults (wt26) | e2e: see the "defaults = tuned" row below |
 | ENV | Loopback fast path on k3s-node-01 (`lo` NOTRACK + ACCEPT ahead of ~1055 kube rules / 201 chains). Revert: `/root/rune-e5/iptables-lo-revert.sh`. | box config | small-send syscall p50 30 → 19.5 µs, p99 110 → 67 µs; throughput unchanged (98–103k) |
 
 Measured and **not** the cause (ruled out with data): storage `pwrite` is not I/O-bound
@@ -66,6 +67,13 @@ oversubscription); `fallocate` preallocation works (64 MB allocated per active s
 `kPushFlowWindow` (16384 records) is not the limiter; netfilter alone is not the per-packet floor.
 
 ## 4. Current best config (100–105k rec/s run)
+
+> **Since integ/perf-defaults (2026-10-02) every broker value below is the DEFAULT**,
+> derived from the host at start (`libs/node/include/rune/node/HostDefaults.h`); a broker
+> started with none of these variables logs `effective config: mode=shard placement=fused
+> workers=1 coreBase=… term=16777216 sparse=false mtu=65504 socketBuffer=16777216
+> rcvWindow=4194304 rings{…33554432…}` on this box.  `bench/kafka-compare/cluster.sh`
+> passes a knob only when the caller sets it.
 
 Broker (env, via `replbench.sh`/`cluster.sh` in shard mode):
 ```

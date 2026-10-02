@@ -26,6 +26,7 @@
 // NO Docker.  NO mocks for the replication path.  Real aeron:udp on loopback.
 // ---------------------------------------------------------------------------
 
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 #include <rune/node/BrokerNode.h>
@@ -155,7 +156,7 @@ private:
         fs::create_directories(aeronDir);
         rune::node::EmbeddedDriverConfig cfg;
         cfg.dir             = aeronDir.string();
-        cfg.termBufferBytes = 64 * 1024;
+        cfg.termBufferBytes = 256 * 1024;   // receiver window = term/2 must be >= the broker MTU (derived 65504 on loopback)
         return cfg;
     }
 };
@@ -192,6 +193,7 @@ static rune::node::NodeConfig makeGrConfig(
     const std::vector<uint16_t>& rPorts)    // replication ports
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 10;

@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/HostDefaults.h>
 #include <rune/node/Worker.h>   // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <filesystem>
@@ -44,6 +45,14 @@ static std::map<std::string, std::string> base1node() {
         {"RUNE_CLIENT_ENDPOINT",   "rune-1:50001"},
         {"RUNE_DATA_DIR",          "/data/rune"},
     };
+}
+
+/// Legacy runtime pinned: the flag-parsing tests below are about LEGACY-mode
+/// flags (shard mode — the default since 2026-10-02 — forces them on).
+static std::map<std::string, std::string> legacyEnv(std::map<std::string, std::string> m) {
+    m["RUNE_WORKER_MODE"] = "legacy";
+    m["RUNE_RUNTIME_PLACEMENT"] = "thread";
+    return m;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,13 +208,13 @@ TEST(NodeConfigTest, NonIntWorkerEgressBaseStreamIsError) {
 TEST(NodeConfigTest, PerWorkerEgressFlagDefaultsFalseAndParses) {
     // Default (unset) → false.
     {
-        auto r = parseNodeConfig(fakeEnv(base3node()));
+        auto r = parseNodeConfig(fakeEnv(legacyEnv(base3node())));
         ASSERT_TRUE(r.error.empty()) << r.error;
         EXPECT_FALSE(r.config->perWorkerEgressEnabled);
     }
     // "1"/"true"/"TRUE" → true.
     for (const char* v : {"1", "true", "TRUE"}) {
-        auto env = base3node();
+        auto env = legacyEnv(base3node());
         env["RUNE_PER_WORKER_EGRESS"] = v;
         auto r = parseNodeConfig(fakeEnv(env));
         ASSERT_TRUE(r.error.empty()) << r.error;
@@ -213,7 +222,7 @@ TEST(NodeConfigTest, PerWorkerEgressFlagDefaultsFalseAndParses) {
     }
     // Other non-empty → false.
     {
-        auto env = base3node();
+        auto env = legacyEnv(base3node());
         env["RUNE_PER_WORKER_EGRESS"] = "no";
         auto r = parseNodeConfig(fakeEnv(env));
         ASSERT_TRUE(r.error.empty()) << r.error;
@@ -1483,12 +1492,12 @@ TEST(NodeConfig, TopicSpecDurabilityTierDefaultIsMajority) {
 // E4: CPU affinity — RUNE_WORKER_CORE_BASE parse tests.
 // ---------------------------------------------------------------------------
 
-TEST(NodeConfig, WorkerCoreBaseDefaultIsDisabled) {
-    // Absent env var → workerCoreBase defaults to -1 (affinity disabled).
+TEST(NodeConfig, WorkerCoreBaseDefaultIsAuto) {
+    // Absent env var → kWorkerCoreBaseAuto (derived at start: HostDefaults.h).
     auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
     ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->workerCoreBase, -1)
-        << "default workerCoreBase must be -1 (affinity disabled)";
+    EXPECT_EQ(res.config->workerCoreBase, NodeConfig::kWorkerCoreBaseAuto)
+        << "default workerCoreBase is derived from the host";
 }
 
 TEST(NodeConfig, WorkerCoreBaseZero) {
@@ -1534,8 +1543,8 @@ TEST(NodeConfig, WorkerCoreBaseUnparsableKeepsDefault) {
     base["RUNE_WORKER_CORE_BASE"] = "notanumber";
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->workerCoreBase, -1)
-        << "unparseable RUNE_WORKER_CORE_BASE must keep default -1";
+    EXPECT_EQ(res.config->workerCoreBase, NodeConfig::kWorkerCoreBaseAuto)
+        << "unparseable RUNE_WORKER_CORE_BASE must keep the (auto) default";
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,7 +1592,7 @@ TEST(NodeConfig, ParsesAeronTermSparse) {
     {
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
-        EXPECT_TRUE(res.config->aeronTermBufferSparse) << "default unchanged";
+        EXPECT_FALSE(res.config->aeronTermBufferSparse) << "default: non-sparse (findings §4)";
     }
     {
         auto kv = base; kv["RUNE_AERON_TERM_SPARSE"] = "false";
@@ -1701,7 +1710,7 @@ TEST(NodeConfig, ParsesAeronDriverIdleOverride) {
 
 TEST(NodeConfig, ParsesPerWorkerReplicationFlagDefaultFalse) {
     // RUNE_PER_WORKER_REPLICATION absent → default false.
-    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    auto res = rune::node::parseNodeConfig(fakeEnv(legacyEnv(base1node())));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_FALSE(res.config->perWorkerReplication)
         << "default perWorkerReplication must be false";
@@ -1721,7 +1730,7 @@ TEST(NodeConfig, ParsesPerWorkerReplicationFlagTrue) {
 
 TEST(NodeConfig, ParsesPerWorkerReplicationFlagFalseForOtherValues) {
     // Non-truthy value → false.
-    auto base = base1node();
+    auto base = legacyEnv(base1node());
     base["RUNE_PER_WORKER_REPLICATION"] = "no";
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
@@ -1814,7 +1823,7 @@ TEST(NodeConfigRegression, ValidateAeronDirCatchesProgrammaticConfig) {
 
 TEST(NodeConfig, PeerWorkerCountDefaultsToZero) {
     // PeerConfig::workerCount defaults to 0 (unknown) for peers parsed from RUNE_PEERS.
-    auto res = rune::node::parseNodeConfig(fakeEnv(base3node()));
+    auto res = rune::node::parseNodeConfig(fakeEnv(legacyEnv(base3node())));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     for (const auto& p : res.config->peers) {
         EXPECT_EQ(p.workerCount, 0)
@@ -1952,14 +1961,25 @@ static std::map<std::string, std::string> shard3node(int self = 0) {
     };
 }
 
-TEST(NodeConfig, DefaultsAreLegacyThreadAndValid) {
+TEST(NodeConfig, DefaultsAreShardFusedAndValidOnceDerived) {
+    // 2026-10-02: shard + fused is the default; unset per-worker ports are
+    // derived at BrokerNode::start (applyHostDerivedDefaults), after which the
+    // config validates.
     auto r = parseNodeConfig(fakeEnv(base1node()));
     ASSERT_TRUE(r.config.has_value()) << r.error;
-    EXPECT_EQ(r.config->workerMode, NodeConfig::WorkerMode::Legacy);
-    EXPECT_EQ(r.config->runtimePlacement, NodeConfig::RuntimePlacement::Thread);
-    EXPECT_FALSE(r.config->workerIngressBasePort.has_value());
-    EXPECT_FALSE(r.config->workerReplBasePort.has_value());
-    EXPECT_FALSE(r.config->validateShardConfig().has_value());
+    EXPECT_EQ(r.config->workerMode, NodeConfig::WorkerMode::Shard);
+    EXPECT_EQ(r.config->runtimePlacement, NodeConfig::RuntimePlacement::Fused);
+    EXPECT_FALSE(r.config->workerIngressBasePort.has_value()) << "not set by the env → derived later";
+    NodeConfig c = *r.config;
+    HostNetFacts f; f.platform = HostPlatform::Linux; f.rmemMax = f.wmemMax = 16 << 20;
+    applyHostDerivedDefaults(c, f, 4);
+    EXPECT_TRUE(c.workerIngressBasePort.has_value());
+    EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
+    // Legacy stays selectable and valid.
+    auto l = parseNodeConfig(fakeEnv(legacyEnv(base1node())));
+    ASSERT_TRUE(l.config.has_value()) << l.error;
+    EXPECT_FALSE(l.config->shardMode());
+    EXPECT_FALSE(l.config->validateShardConfig().has_value());
 }
 
 TEST(NodeConfig, ParsesShardModePlacementPortsAndPeerBases) {
@@ -2099,7 +2119,7 @@ TEST(ShardConfigRegression, PortRangeOverflowRefused) {
 }
 
 TEST(ShardConfigRegression, FusedRequiresShard) {
-    auto env = base1node(); env["RUNE_RUNTIME_PLACEMENT"] = "fused";
+    auto env = legacyEnv(base1node()); env["RUNE_RUNTIME_PLACEMENT"] = "fused";
     auto e = shardErr(env);
     ASSERT_TRUE(e.has_value());
     EXPECT_NE(e->find("fused requires"), std::string::npos);
@@ -2122,7 +2142,7 @@ TEST(ShardConfigRegression, MissingEgressControlBasePortRefused) {
 }
 
 TEST(NodeConfigRegression, LegacyModeKeepsDefaultEgressControlBasePort) {
-    auto r = parseNodeConfig(fakeEnv(base1node()));
+    auto r = parseNodeConfig(fakeEnv(legacyEnv(base1node())));
     ASSERT_TRUE(r.config.has_value()) << r.error;
     EXPECT_EQ(r.config->effectiveWorkerEgressControlBasePort(), 40300);
     EXPECT_FALSE(r.config->validateShardConfig().has_value());
@@ -2241,13 +2261,14 @@ TEST(ProduceBatchLimitRegression, IntakeLimitNeverExceedsOneFrameOnAnyHop) {
     }
 }
 
-TEST(ProduceBatchLimitRegression, DefaultThreeNodeLimitIsTheOutboundRingFrame) {
-    // Default outbound ring 4 MiB → 512 KiB frames: an 8 MiB batch must NOT be
-    // accepted (it would be appended but never replicated) — and the default
+TEST(ProduceBatchLimitRegression, DefaultThreeNodeLimitIsTheTermFrame) {
+    // Defaults (2026-10-02): 32 MiB outbound ring (4 MiB frames) and a 16 MiB
+    // term (2 MiB max message) → the term frame binds at ~2 MiB: an 8 MiB batch
+    // must NOT be accepted (appended but never replicated) — and the default
     // config still starts (no refusal; the limit simply shrinks).
     const NodeConfig c = parsedOrDie(base3node());
-    EXPECT_LT(c.produceIntakeLimit(), 512 * 1024);
-    EXPECT_GT(c.produceIntakeLimit(), 511 * 1024);
+    EXPECT_LT(c.produceIntakeLimit(), 2 * 1024 * 1024);
+    EXPECT_GT(c.produceIntakeLimit(), 2 * 1024 * 1024 - 1024);
 }
 
 TEST(ProduceBatchLimitRegression, OutboundRingFrameBoundsTheLimit) {
@@ -2310,3 +2331,19 @@ TEST(ProduceBatchLimitRegression, BenchProfileAccepts2MiBBatches) {
 }
 
 } // namespace rune::node
+
+// REGRESSION (integ/perf-defaults, shard default): RUNE_CLIENT_ENDPOINT given as
+// a full Aeron channel (docker/README.md form) was wrapped again →
+// "aeron:udp?endpoint=aeron:udp?endpoint=host:port".  Legacy mode limped along;
+// shard mode built its worker ingress from that host and refused to start
+// ("unknown host").  Both forms must yield the same channel and bind host.
+TEST(NodeConfigRegression, ClientEndpointAcceptsHostPortAndFullChannelRegression) {
+    for (const char* raw : {"127.0.0.1:50001", "aeron:udp?endpoint=127.0.0.1:50001"}) {
+        auto env = rune::node::base1node();
+        env["RUNE_CLIENT_ENDPOINT"] = raw;
+        auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->clientEndpoint.channel, "aeron:udp?endpoint=127.0.0.1:50001") << raw;
+        EXPECT_EQ(r.config->clientBindHost(), "127.0.0.1") << raw;
+    }
+}

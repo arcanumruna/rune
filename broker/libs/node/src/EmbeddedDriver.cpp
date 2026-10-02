@@ -1,4 +1,5 @@
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/HostDefaults.h>
 
 #include <spdlog/spdlog.h>
 
@@ -20,8 +21,24 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.receiverIoVector   = c.aeronReceiverIoVectorCapacity;
     e.threadingMode     = c.aeronThreadingMode;
     e.idleStrategy      = c.driverIdleStrategy;
+    e.endpointHosts     = nodeEndpointHosts(c);
     return e;
 }
+
+namespace {
+/// Resolve any kAeronAuto transport field (direct EmbeddedDriverConfig users;
+/// BrokerNode already passes concrete values).  Clamps explicit values that
+/// aeron_driver_init would reject (never EINVAL at init).
+void resolveTransport(EmbeddedDriverConfig& c) {
+    const auto facts = probeHostNetFacts(c.endpointHosts);
+    AeronTransportRequest req;
+    req.mtuBytes = c.mtuBytes; req.socketBufferBytes = c.socketBufferBytes;
+    req.rcvWindowBytes = c.rcvWindowBytes; req.termBufferBytes = c.termBufferBytes;
+    const auto d = deriveAeronTransport(facts, req);
+    if (!d.warnings.empty()) spdlog::warn("EmbeddedDriver[{}]: {}", c.dir, d.warnings);
+    c.mtuBytes = d.mtuBytes; c.socketBufferBytes = d.socketBufferBytes; c.rcvWindowBytes = d.rcvWindowBytes;
+}
+} // namespace
 
 std::optional<std::string> checkAeronSpace(uint64_t freeBytes, int32_t drivers, int32_t termBufferBytes) {
     const uint64_t perDriver = 3ULL * static_cast<uint64_t>(termBufferBytes) + 64ULL * 1024;
@@ -66,6 +83,7 @@ void EmbeddedDriver::drainMisuse_() const noexcept {
 EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     : cfg_(std::move(cfg)), mode_(mode)
 {
+    resolveTransport(cfg_);
     if (aeron_driver_context_init(&ctx_) < 0)
         throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_context_init failed: ") +
                                  aeron_errmsg());

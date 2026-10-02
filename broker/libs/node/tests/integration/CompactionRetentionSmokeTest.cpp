@@ -44,6 +44,7 @@
 // All tests: single in-process BrokerNode (single-writer, no Docker).
 // ---------------------------------------------------------------------------
 
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 #include <rune/node/BrokerNode.h>
@@ -128,6 +129,8 @@ static rune::node::NodeConfig makeSmokeConfig(const fs::path& dataDir) {
     const uint16_t clientPort = static_cast<uint16_t>(50000u + base);
 
     rune::node::NodeConfig cfg;
+
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;

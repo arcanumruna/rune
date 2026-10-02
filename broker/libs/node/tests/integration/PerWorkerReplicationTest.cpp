@@ -76,6 +76,7 @@
 // NO Docker.  NO mocks.  C++23.
 // ---------------------------------------------------------------------------
 
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 // Replication
@@ -209,6 +210,7 @@ static rune::node::NodeConfig makePwConfig(
     int32_t minIsr = 0)                    // 0 → leave NodeConfig field default (1)
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 90;
@@ -1227,7 +1229,11 @@ void runUnservableBatchEvictsFollowers(bool perWorkerReplication, std::string_vi
     for (auto& c : cfgs) {
         c.perWorkerReplication = perWorkerReplication;
         c.replicaLagMaxMs      = 1'500;                    // the EXISTING lag check
-        ASSERT_LT(c.produceIntakeLimit(), 1 * 1024 * 1024) << "defaults: frame ~512 KiB";
+        // Pinned to the pre-2026-10-02 sizes (4 MiB term + outbound ring → ~512 KiB
+        // frame); the eviction property is size-free.
+        c.aeronTermBufferBytes = 4 * 1024 * 1024;
+        c.replicationOutboundRingBytes = 4 * 1024 * 1024;
+        ASSERT_LT(c.produceIntakeLimit(), 1 * 1024 * 1024) << "pinned: frame ~512 KiB";
     }
     std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
@@ -1414,10 +1420,15 @@ void runExactEffectiveMaxReplicates(bool perWorker) {
         makePwConfig(0, dir0.path, cPorts, kPorts, rPorts),
         makePwConfig(1, dir1.path, cPorts, kPorts, rPorts),
         makePwConfig(2, dir2.path, cPorts, kPorts, rPorts)};
-    for (auto& c : cfgs) c.perWorkerReplication = perWorker;
+    for (auto& c : cfgs) {
+        c.perWorkerReplication = perWorker;
+        // Pinned to the pre-2026-10-02 sizes the exact numbers below were derived for.
+        c.aeronTermBufferBytes = 4 * 1024 * 1024;
+        c.replicationOutboundRingBytes = 4 * 1024 * 1024;
+    }
 
     const std::size_t effMax = rune::node::effectiveMaxProduceBatchBytes(cfgs[0]);
-    ASSERT_EQ(effMax, 524226u) << "default multi-node derivation (see BrokerNodeRegression)";
+    ASSERT_EQ(effMax, 524226u) << "4 MiB multi-node derivation (see BrokerNodeRegression)";
 
     std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);

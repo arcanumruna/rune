@@ -1012,8 +1012,15 @@ NodeConfig makeDefaultConfig(int nodeId, const fs::path& dataDir, const ShardPor
         PeerConfig pc;
         pc.id = i; pc.host = "127.0.0.1";
         pc.consensusPort = p.cons[i]; pc.clientPort = p.client[i]; pc.replicationPort = p.repl[i];
+        // Deployment LAYOUT only (not tuning): the derived per-node-id shard
+        // ports are fixed, so concurrent test processes would collide on them.
+        pc.replBasePort = p.rb[i]; pc.ingressBasePort = p.ib[i];
         cfg.peers.push_back(pc);
     }
+    cfg.workerIngressBasePort       = p.ib[nodeId];
+    cfg.workerReplBasePort          = p.rb[nodeId];
+    cfg.workerEgressControlBasePort = p.eg[nodeId];
+    cfg.workerIngressBaseStreamId   = kIngressStream;
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client[nodeId]);
     cfg.clientEndpoint.streamId = kClientStream;
     TopicSpec t; t.name = "st"; t.partitionCount = 1; t.topicId = 0;
@@ -1044,16 +1051,18 @@ void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
     const auto ports = ShardPorts::discover(nodes, 1);
     const NodeConfig c0 = makeDefaultConfig(0, d0.path, ports, nodes);
     ASSERT_EQ(c0.aeronTermBufferBytes, NodeConfig{}.aeronTermBufferBytes) << "default term";
-    ASSERT_EQ(c0.workerMode, NodeConfig::WorkerMode::Legacy) << "default worker mode";
+    ASSERT_EQ(c0.workerMode, NodeConfig::WorkerMode::Shard) << "default worker mode (2026-10-02)";
+    ASSERT_EQ(c0.runtimePlacement, NodeConfig::RuntimePlacement::Fused) << "default placement";
+    ASSERT_EQ(c0.aeronMtuBytes, NodeConfig::kAeronAuto) << "derived transport";
     const std::size_t limit = static_cast<std::size_t>(c0.produceIntakeLimit());
     ASSERT_EQ(limit, Worker::maxAcceptableBatchBytes(
         static_cast<std::size_t>(c0.workerIngressRingBytes), static_cast<std::size_t>(c0.workerReturnRingBytes),
         static_cast<std::size_t>(c0.replicationOutboundRingBytes),
         static_cast<std::size_t>(c0.aeronTermBufferBytes), static_cast<std::size_t>(c0.aeronTermBufferBytes),
         static_cast<std::size_t>(c0.aeronTermBufferBytes)));
-    // Default 4 MiB term: the egress Records frame (term / 8 = 512 KiB) is one
-    // of the binding hops — the case the unification closes.
-    ASSERT_LE(limit + rune::node::kRecordsFixedBytes, 512u * 1024u);
+    // Default term / 8 bounds the egress Records frame — one of the binding hops
+    // (the case the unification closes): 16 MiB term → 2 MiB.
+    ASSERT_LE(limit + rune::node::kRecordsFixedBytes, static_cast<std::size_t>(c0.aeronTermBufferBytes) / 8);
 
     std::vector<std::unique_ptr<BrokerNode>> ns;
     ns.push_back(std::make_unique<BrokerNode>(c0));
@@ -1091,12 +1100,14 @@ void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
 
         // Accepted (+ replicated, 3 nodes: acks=all with minIsr 2 answers OK only
         // once a follower holds the batch).
-        auto ack = c.produceUntilOk(gw, kClientStream, sid, 0, 0, /*acks=all*/1, atLimit);
+        // Shard default: produce goes straight to the leader's worker ingress.
+        const std::string ing = workerIngressChannel(ports, leader, 0);
+        auto ack = c.produceUntilOk(ing, kClientStream, sid, 0, 0, /*acks=all*/1, atLimit);
         ASSERT_TRUE(ack.has_value()) << "a batch at exactly the limit must be accepted (acks=all)";
         EXPECT_EQ(ack->baseOffset, 0);
 
         // limit + 1: refused at intake, non-retriable, never appended.
-        ASSERT_TRUE(c.produce(gw, kClientStream, sid, 900001, 0, 0, /*acks=all*/1, over));
+        ASSERT_TRUE(c.produce(ing, kClientStream, sid, 900001, 0, 0, /*acks=all*/1, over));
         auto tooLarge = c.awaitProduceResponse(900001);
         ASSERT_TRUE(tooLarge.has_value());
         EXPECT_EQ(tooLarge->errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));

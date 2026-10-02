@@ -1125,6 +1125,8 @@ public:
     /// False when RUNE_IO_BACKEND selects a backend that cannot submit — shard
     /// mode refuses to start on such a worker (BrokerNode).
     [[nodiscard]] bool ioAcceptsSubmissions() const noexcept { return io_.acceptsSubmissions(); }
+    /// Startup-only: the auto-selected io_uring fell back to portable ("" = no).
+    [[nodiscard]] const std::string& ioFallbackReason() const noexcept { return io_.fallbackReason(); }
 
     // Task 7: test accessor — true if a Validator is installed for the given topic.
     // Worker-thread only; call only from single-threaded tests.

@@ -64,6 +64,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
+#include "../support/TestNodeConfig.h"
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -304,6 +305,7 @@ static rune::node::NodeConfig makeTx2bConfig(
     const std::vector<uint16_t>& rPorts)
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 71;
@@ -358,7 +360,7 @@ private:
         fs::create_directories(aeronDir);
         rune::node::EmbeddedDriverConfig cfg;
         cfg.dir             = aeronDir.string();
-        cfg.termBufferBytes = 64 * 1024;
+        cfg.termBufferBytes = 256 * 1024;   // receiver window = term/2 must be >= the broker MTU (derived 65504 on loopback)
         return cfg;
     }
 };

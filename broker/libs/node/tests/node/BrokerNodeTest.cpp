@@ -13,6 +13,7 @@
 // All waits are bounded with hard deadlines + ASSERT.
 // Unique temp paths use getpid() + atomic counter.
 
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/Worker.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
@@ -74,6 +75,7 @@ static fs::path makeTempDataDir(std::string_view tag = "") {
 // ---------------------------------------------------------------------------
 static NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;
@@ -642,6 +644,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
     // -------------------------------------------------------------------------
     auto makeCoalescingConfig = [](const fs::path& dataDir, bool coalesce) -> NodeConfig {
         NodeConfig cfg;
+        rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
         cfg.nodeId            = 0;
         cfg.dataDir           = dataDir.string();
         cfg.consensusStreamId = 10;
@@ -1177,7 +1180,12 @@ TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxStorableBatch) {
 TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
     const fs::path dir = makeTempDataDir("shardbad_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
-    cfg.workerMode = NodeConfig::WorkerMode::Shard;     // no per-worker ports configured
+    // Since 2026-10-02 unset per-worker ports are DERIVED (shard is the default),
+    // so "no ports" is no longer invalid; an explicit out-of-range base still is
+    // (65535 + worker 1 overflows the port space).
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.workerCount = 2;
+    cfg.workerIngressBasePort = 65535;
     BrokerNode node{cfg};
     EXPECT_THROW(node.start(), std::runtime_error);
     EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
@@ -1324,8 +1332,10 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     peer1.id = 1; peer1.host = "127.0.0.1"; peer1.consensusPort = 40116;
     cfg.peers.push_back(peer1);
     ASSERT_FALSE(cfg.isSingleNode());
-    ASSERT_EQ(cfg.aeronTermBufferBytes, 4 * 1024 * 1024);
-    ASSERT_EQ(cfg.replicationOutboundRingBytes, 4 * 1024 * 1024);
+    // Pinned (the numbers below are for a 4 MiB term + 4 MiB outbound ring — the
+    // pre-2026-10-02 defaults; the derivation-vs-transport property is size-free).
+    cfg.aeronTermBufferBytes = 4 * 1024 * 1024;
+    cfg.replicationOutboundRingBytes = 4 * 1024 * 1024;
     ASSERT_EQ(cfg.workerIngressRingBytes, 32 * 1024 * 1024);
 
     EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524226);

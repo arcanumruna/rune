@@ -34,7 +34,9 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <system_error>
 
 namespace rune::node {
 
@@ -42,6 +44,39 @@ enum class IoBackendKind : uint8_t { Uring, Portable, Invalid };
 
 /// The env var that selects the backend (named in startup refusals).
 inline constexpr const char* kIoBackendEnv = "RUNE_IO_BACKEND";
+
+/// What the deployment asked for: the kind, and whether it was the platform
+/// DEFAULT (RUNE_IO_BACKEND unset/empty) rather than an explicit choice.
+struct IoBackendRequest {
+    IoBackendKind kind;
+    bool          autoSelected;
+};
+
+[[nodiscard]] inline IoBackendKind selectIoBackendFromEnv() noexcept;
+
+[[nodiscard]] inline IoBackendRequest ioBackendRequestFromEnv() noexcept {
+    const char* v = std::getenv(kIoBackendEnv);
+    return {selectIoBackendFromEnv(), v == nullptr || *v == '\0'};
+}
+
+/// 2026-10-02 default: io_uring WHEN AVAILABLE.  `tryUring` sets the uring
+/// backend up (throws std::system_error when io_uring_setup / mmap fails: old
+/// kernel, seccomp, Docker Desktop / Rosetta).  An AUTO-selected uring then falls
+/// back to the portable backend (`reason` = the error, logged once by the
+/// owner); an EXPLICIT RUNE_IO_BACKEND=uring keeps failing loudly (rethrows).
+/// Any other kind is returned unchanged.  Pure apart from `tryUring`.
+template <class TryUring>
+[[nodiscard]] IoBackendKind resolveIoBackendKind(IoBackendRequest req, TryUring&& tryUring, std::string& reason) {
+    if (req.kind != IoBackendKind::Uring) return req.kind;
+    try {
+        tryUring();
+        return IoBackendKind::Uring;
+    } catch (const std::system_error& e) {
+        if (!req.autoSelected) throw;
+        reason = e.what();
+        return IoBackendKind::Portable;
+    }
+}
 
 [[nodiscard]] inline IoBackendKind selectIoBackendFromEnv() noexcept {
     const char* v = std::getenv(kIoBackendEnv);
@@ -63,14 +98,14 @@ inline constexpr const char* kIoBackendEnv = "RUNE_IO_BACKEND";
 class IoBackend {
 public:
     IoBackend(std::size_t submitDepth, std::size_t completionDepth)
-        : kind_(selectIoBackendFromEnv()) {
-        switch (kind_) {
-        case IoBackendKind::Portable: portable_.emplace(submitDepth, completionDepth); break;
+        : IoBackend(submitDepth, completionDepth, ioBackendRequestFromEnv()) {}
+    IoBackend(std::size_t submitDepth, std::size_t completionDepth, IoBackendRequest req) {
+        kind_ = resolveIoBackendKind(req, [&] {
 #if defined(__linux__)
-        case IoBackendKind::Uring:    uring_.emplace(submitDepth, completionDepth); break;
+            uring_.emplace(submitDepth, completionDepth);
 #endif
-        default: break;
-        }
+        }, fallbackReason_);
+        if (kind_ == IoBackendKind::Portable) portable_.emplace(submitDepth, completionDepth);
     }
     IoBackend(const IoBackend&)            = delete;
     IoBackend& operator=(const IoBackend&) = delete;
@@ -117,6 +152,9 @@ public:
     }
 
     [[nodiscard]] bool acceptsSubmissions() const noexcept { return kind_ != IoBackendKind::Invalid; }
+    /// Non-empty when the AUTO-selected io_uring could not be set up and this
+    /// backend fell back to portable (the setup error).  Cold (startup log).
+    [[nodiscard]] const std::string& fallbackReason() const noexcept { return fallbackReason_; }
     [[nodiscard]] IoBackendKind kind() const noexcept { return kind_; }
     [[nodiscard]] const char* name() const noexcept {
         switch (kind_) {
@@ -127,7 +165,8 @@ public:
     }
 
 private:
-    IoBackendKind                       kind_;
+    IoBackendKind                       kind_ = IoBackendKind::Invalid;
+    std::string                         fallbackReason_;
     std::optional<PortableFlushBackend> portable_;
 #if defined(__linux__)
     std::optional<UringFlushBackend>    uring_;

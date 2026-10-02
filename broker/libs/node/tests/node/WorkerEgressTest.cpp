@@ -57,6 +57,7 @@ protected:
         rune::node::EmbeddedDriverConfig cfg;
         cfg.dir             = aeronDir_;
         cfg.termBufferBytes = 64 * 1024;
+        cfg.mtuBytes        = 1408;   // pinned: the fragmentation test needs maxPayload*3 < term/8
         try {
             driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
         } catch (const std::exception& e) {

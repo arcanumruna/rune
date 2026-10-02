@@ -34,16 +34,24 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace rune::node {
 
 struct EmbeddedDriverConfig {
     std::string dir;
-    int32_t     termBufferBytes   = 4 * 1024 * 1024;
-    int32_t     mtuBytes          = 1408;
-    int32_t     rcvWindowBytes    = 128 * 1024;
-    int32_t     socketBufferBytes = 2 * 1024 * 1024;
-    bool        termBufferSparse  = true;    ///< false: allocate + zero-fill terms at creation
+    // Defaults = NodeConfig's (the findings §4 config).  mtu / window / socket
+    // buffer = NodeConfig::kAeronAuto: derived from the host in the constructor
+    // (HostDefaults.h deriveAeronTransport) — BrokerNode resolves them once at
+    // start and passes concrete values; direct users (tests) get the same rules.
+    int32_t     termBufferBytes   = 16 * 1024 * 1024;
+    int32_t     mtuBytes          = NodeConfig::kAeronAuto;
+    int32_t     rcvWindowBytes    = NodeConfig::kAeronAuto;
+    int32_t     socketBufferBytes = NodeConfig::kAeronAuto;   ///< 0 = OS default
+    bool        termBufferSparse  = false;   ///< false: allocate + zero-fill terms at creation
+    /// Hosts this driver's endpoints use (loopback decides the derived MTU).
+    /// Empty = loopback.
+    std::vector<std::string> endpointHosts;
     int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default
     int32_t     senderIoVector     = 0;      ///< 0 = Aeron default
     int32_t     receiverIoVector   = 0;      ///< 0 = Aeron default

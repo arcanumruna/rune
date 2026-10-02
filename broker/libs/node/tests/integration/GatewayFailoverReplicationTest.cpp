@@ -68,6 +68,7 @@
 // NO Docker.  NO mocks for replication.  C++23.
 // ---------------------------------------------------------------------------
 
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 // Replication
@@ -871,6 +872,7 @@ static rune::node::NodeConfig makeGr7Config(
     const std::vector<uint16_t>& rPorts)
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 60;

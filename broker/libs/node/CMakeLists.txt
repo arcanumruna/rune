@@ -2,6 +2,7 @@ add_library(rune_node
     src/NodeConfig.cpp
     src/BrokerNode.cpp
     src/EmbeddedDriver.cpp
+    src/HostDefaults.cpp
     src/ShardAgent.cpp
     src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
@@ -72,6 +73,7 @@ if(BUILD_TESTING)
     # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry + AdminWorker)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
+        tests/node/HostDefaultsTest.cpp
         tests/node/PortableFlushBackendTest.cpp
         tests/node/OneToOneByteRingTest.cpp
         tests/node/SchemaCodecSmokeTest.cpp

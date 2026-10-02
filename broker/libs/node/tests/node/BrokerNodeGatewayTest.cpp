@@ -19,6 +19,7 @@
 // Unique temp dirs: getpid() + atomic counter.
 // Free-port discovery: bind UDP socket to :0, read port, close.
 
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
@@ -118,6 +119,7 @@ static uint16_t discoverFreeUdpPort() {
 // ---------------------------------------------------------------------------
 static NodeConfig makeSingleNodeConfig(const fs::path& dataDir, uint16_t clientPort) {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;
@@ -833,6 +835,8 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
     TempDir tmp{"tx6a_smoke_"};
 
     NodeConfig cfg;
+
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = tmp.path.string();
     cfg.consensusStreamId = 10;

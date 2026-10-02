@@ -23,7 +23,7 @@ rune_cluster_peers() {
 rune_shard_env() {
   [ "${RUNE_SHARD:-0}" = "1" ] || return 0
   local w="${2:-1}"
-  echo "RUNE_WORKER_MODE=shard RUNE_RUNTIME_PLACEMENT=${RUNE_RUNTIME_PLACEMENT:-fused} RUNE_WORKER_INGRESS_BASE_PORT=$((40500+20*$1)) RUNE_WORKER_REPL_BASE_PORT=$((40600+20*$1)) RUNE_WORKER_CORE_BASE=$(( ${RUNE_SHARD_CORE0:-1} + $1 * w ))"
+  echo "RUNE_WORKER_MODE=shard RUNE_RUNTIME_PLACEMENT=${RUNE_RUNTIME_PLACEMENT:-fused} RUNE_WORKER_INGRESS_BASE_PORT=$((40500+20*$1)) RUNE_WORKER_REPL_BASE_PORT=$((40600+20*$1)) RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$((40400+20*$1)) RUNE_WORKER_CORE_BASE=$(( ${RUNE_SHARD_CORE0:-1} + $1 * w ))"
 }
 # rune_shard_layout_check <workers> [cores] -> non-zero (with a message) when the 3
 # nodes' pinned busy-spin workers do not fit on distinct cores: overlapping or
@@ -47,47 +47,48 @@ CLUSTER_PERSISTENCE="nvme"
 _rune_node_aeron() { echo "$WORK/rune-c$1/a"; }
 
 # rune_start_cluster <workers> <topics_spec> [io] [persistence]
+# 2026-10-02: the broker's DEFAULTS are the measured 110k config (shard + fused,
+# 16 MiB non-sparse terms, 32 MiB rings, derived MTU / socket buffer / window,
+# uring, derived shard ports + core layout).  This harness therefore passes a
+# sizing / io / worker knob ONLY when the caller set it (env or a non-empty arg):
+# an unset knob means "the broker default".  workers="" / io="" = default.
 rune_start_cluster() {
-  local workers="$1" topics="$2" io="${3:-uring}" persistence="${4:-nvme}"
+  local workers="$1" topics="$2" io="${3-}" persistence="${4:-nvme}"
   CLUSTER_PERSISTENCE="$persistence"
-  # Memory-heavy Aeron/ring sizes are env-overridable so a small (4-core) VM can
-  # run the 8MB small-VM recipe without OOM; default to the 32MB fat-VM profile.
-  local termb="${RUNE_AERON_TERM_BUFFER_BYTES:-33554432}"
-  local iring="${RUNE_WORKER_INGRESS_RING_BYTES:-33554432}"
-  local rring="${RUNE_WORKER_RETURN_RING_BYTES:-33554432}"
-  # F18: the replication outbound ring's frame (/8) bounds the produce intake
-  # limit AND each replication message.  32 MiB → ~4 MiB frames: the intake limit
-  # matches the 32 MiB term, and a full 1 MiB (maxFetchBytes) push/fetch prefix
-  # fits one frame (the 4 MiB default caps both at ~512 KiB).  NB the bench client
-  # emits batches <= min(RUNE_BATCH_BYTES, RUNE_MAX_FRAME_BYTES = 64 KiB default).
-  local oring="${RUNE_REPL_OUTBOUND_RING_BYTES:-33554432}"
   local peers; peers="$(rune_cluster_peers)"
   pkill -9 -x rune_broker 2>/dev/null; sleep 0.5
   RUNE_CLUSTER_PIDS=()
-  rune_shard_layout_check "$workers" || return 1
+  [ -n "$workers" ] && { rune_shard_layout_check "$workers" || return 1; }
+  # Explicit knobs only (KEY=VALUE words; empty when unset).
+  local k knobs=""
+  for k in RUNE_AERON_TERM_BUFFER_BYTES RUNE_WORKER_INGRESS_RING_BYTES RUNE_WORKER_RETURN_RING_BYTES \
+           RUNE_REPL_OUTBOUND_RING_BYTES RUNE_AERON_MTU RUNE_AERON_RCV_WINDOW RUNE_AERON_SOCKET_BUFFER_BYTES \
+           RUNE_AERON_TERM_SPARSE RUNE_WORKER_MODE RUNE_RUNTIME_PLACEMENT RUNE_WORKER_IDLE RUNE_RUNTIME_IDLE \
+           RUNE_AERON_DRIVER_IDLE RUNE_PER_WORKER_INGRESS RUNE_PER_WORKER_EGRESS RUNE_MIN_ISR; do
+    [ -n "${!k:-}" ] && knobs="$knobs $k=${!k}"
+  done
+  [ -n "$io" ] && knobs="$knobs RUNE_IO_BACKEND=$io"
+  [ -n "$workers" ] && knobs="$knobs RUNE_WORKERS=$workers"
+  log "rune cluster knobs (explicit; everything else = broker default):${knobs:- none}"
   local i
   for i in 0 1 2; do
-    local cport=$((40200+i)) egbase=$((40400+i*20))
+    local cport=$((40200+i))
     local logdir; logdir="$(data_root "$persistence" rune-log-$i)"
     local d="$WORK/rune-c$i"; rm -rf "$d" "$logdir"; mkdir -p "$d/a" "$logdir"
     local pinprefix; pinprefix="$(pin "$CORES_BROKER")"
     [ "${RUNE_SHARD:-0}" = "1" ] && pinprefix=""
+    # Legacy (RUNE_WORKER_MODE=legacy) keeps its fixed egress-control base;
+    # shard mode derives it per node id unless RUNE_SHARD=1 sets the layout.
+    local eg=""; [ "${RUNE_WORKER_MODE:-}" = "legacy" ] && eg="RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$((40400+i*20))"
     # shellcheck disable=SC2086
     env RUNE_NODE_ID=$i RUNE_PEERS="$peers" RUNE_CLIENT_ENDPOINT="0.0.0.0:$cport" \
-        RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_WORKERS="$workers" \
-        RUNE_PER_WORKER_INGRESS=true RUNE_PER_WORKER_EGRESS=true RUNE_TOPICS="$topics" \
-        RUNE_IO_BACKEND="$io" RUNE_AERON_TERM_BUFFER_BYTES="$termb" \
-        RUNE_WORKER_INGRESS_RING_BYTES="$iring" RUNE_WORKER_RETURN_RING_BYTES="$rring" \
-        RUNE_REPL_OUTBOUND_RING_BYTES="$oring" \
-        RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=$egbase \
-        $(rune_shard_env "$i" "$workers") \
+        RUNE_DATA_DIR="$logdir" RUNE_AERON_DIR="$d/a" RUNE_TOPICS="$topics" \
+        $knobs $eg \
+        $(rune_shard_env "$i" "${workers:-1}") \
         RUNE_ELECTION_TIMEOUT_MS="${RUNE_ELECTION_TIMEOUT_MS:-300}" \
         RUNE_ELECTION_STATUS_INTERVAL_MS="${RUNE_ELECTION_STATUS_INTERVAL_MS:-50}" \
         RUNE_STARTUP_CANVASS_TIMEOUT_MS="${RUNE_STARTUP_CANVASS_TIMEOUT_MS:-200}" \
-        RUNE_WORKER_IDLE="${RUNE_WORKER_IDLE:-backoff}" \
-        RUNE_RUNTIME_IDLE="${RUNE_RUNTIME_IDLE:-backoff}" \
-        RUNE_AERON_DRIVER_IDLE="${RUNE_AERON_DRIVER_IDLE:-sleep-ns}" \
-        RUNE_LOG_LEVEL="${RUNE_LOG_LEVEL:-info}" \
+        RUNE_LOG_LEVEL="${RUNE_LOG_LEVEL:-info}" RUNE_FS_LOG="${RUNE_FS_LOG:-0}" \
         $pinprefix "$RUNE_BROKER_BIN" >"$d/broker.log" 2>&1 &
     RUNE_CLUSTER_PIDS+=($!)
   done

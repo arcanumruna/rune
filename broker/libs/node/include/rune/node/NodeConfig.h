@@ -169,6 +169,14 @@ struct ClientEndpoint {
 };
 
 struct NodeConfig {
+    /// "Derive from the host" sentinel for the Aeron transport sizes (mtu, socket
+    /// buffer, receive window) — resolved once at BrokerNode::start() by
+    /// applyHostDerivedDefaults (HostDefaults.h).  Any other value is explicit.
+    static constexpr int32_t kAeronAuto = -1;
+    /// workerCoreBase sentinel: derive the affinity layout from the host (-1 stays
+    /// "explicitly disabled").
+    static constexpr int32_t kWorkerCoreBaseAuto = -2;
+
     int32_t             nodeId          = -1;
     std::vector<PeerConfig> peers;       // includes self; sorted by id
     ClientEndpoint      clientEndpoint;
@@ -202,11 +210,16 @@ struct NodeConfig {
     bool    perWorkerReplication = false;
     int32_t replBaseStreamId     = 2000;
 
-    // Self-contained worker shards (spec §3.1-§3.3).  Defaults = today's behaviour.
+    // Self-contained worker shards (spec §3.1-§3.3).  DEFAULT (2026-10-02, the
+    // measured 110k rec/s config, findings §4): shard mode + fused runtime
+    // placement, 1 worker per node — what the bench's RUNE_SHARD=1 set.  The legacy
+    // mode stays selectable (RUNE_WORKER_MODE=legacy / RUNE_RUNTIME_PLACEMENT=thread).
+    // Unset per-worker base ports are derived per node id (HostDefaults.h
+    // deriveShardBasePorts) at BrokerNode::start().
     enum class WorkerMode : uint8_t { Legacy = 0, Shard = 1 };          // RUNE_WORKER_MODE
     enum class RuntimePlacement : uint8_t { Thread = 0, Fused = 1 };    // RUNE_RUNTIME_PLACEMENT
-    WorkerMode       workerMode       = WorkerMode::Legacy;
-    RuntimePlacement runtimePlacement = RuntimePlacement::Thread;
+    WorkerMode       workerMode       = WorkerMode::Shard;
+    RuntimePlacement runtimePlacement = RuntimePlacement::Fused;
     std::optional<int32_t> workerIngressBasePort;   // RUNE_WORKER_INGRESS_BASE_PORT (nullopt = unset)
     std::optional<int32_t> workerReplBasePort;      // RUNE_WORKER_REPL_BASE_PORT    (nullopt = unset)
     static constexpr int32_t kMaxShardWorkers = 64;   // runtime→worker announce mask width
@@ -290,19 +303,23 @@ struct NodeConfig {
     // E4: per-worker CPU affinity base core (Linux-only; macOS is a no-op).
     //
     // When >= 0, worker i pins its own AgentRunner thread to core
-    // (workerCoreBase + i) on the first doWork call (self-pin on entry).
+    // (workerCoreBase + i) on the first doWork call (self-pin on entry).  In shard
+    // mode a pinned worker busy-spins (dedicated core); unpinned → backoff.
     //
-    // -1 (default) = affinity DISABLED — no pinning, current behaviour preserved.
-    //   All existing tests are parity-unchanged at the default.
+    // kWorkerCoreBaseAuto (-2, DEFAULT) = derived at start (HostDefaults.h
+    //   deriveWorkerCoreBase): Linux shard mode pins node i of a co-located
+    //   cluster to cores 1+i*W.. when the box has the cores (the bench layout),
+    //   one-node-per-host to 1..W; otherwise / legacy / non-Linux → -1.
+    // -1 = affinity explicitly DISABLED.
     //
     // Example: with workerCoreBase=2 and workerCount=4, workers pin to cores
     //   2, 3, 4, 5 — reserving cores 0 and 1 for the control thread, Aeron
     //   media driver, and kernel housekeeping (see AffinityConfig in the E4 spec).
     //
     // Overridable via RUNE_WORKER_CORE_BASE env var.
-    //   Absent or empty → -1 (disabled).
+    //   Absent or empty → kWorkerCoreBaseAuto (derived).
     //   Any value < -1   → -1 (clamped to disabled).
-    int32_t workerCoreBase = -1;
+    int32_t workerCoreBase = kWorkerCoreBaseAuto;
 
     // E5.1: per-worker Aeron ingress stream id base.
     //
@@ -375,7 +392,7 @@ struct NodeConfig {
     //     RUNE_IO_COMPLETION_RING_DEPTH. Default 1024 (matches Worker::kIoCompletionDepth).
     //   - memoryLogRingBytes: byte capacity of each InMemoryLog single-owner ring.
     //     RUNE_MEMORY_LOG_RING_BYTES. Default 8 MiB.
-    int32_t replicationOutboundRingBytes = 4 * 1024 * 1024;
+    int32_t replicationOutboundRingBytes = 32 * 1024 * 1024;   // findings §4 (was 4 MiB)
     int32_t workerIngressRingBytes       = 32 * 1024 * 1024;
     int32_t workerReturnRingBytes        = 32 * 1024 * 1024;
     int32_t ioSubmitRingDepth            = 1024;
@@ -383,27 +400,28 @@ struct NodeConfig {
     int32_t memoryLogRingBytes           = 8 * 1024 * 1024;
     //   - aeronTermBufferBytes: Aeron term buffer length (bytes) for the embedded
     //     media driver — sizes every publication/subscription log buffer.  Power
-    //     of two in [64 KiB, 1 GiB].  Default 4 MiB; deployments raise it (e.g.
-    //     32 MiB via RUNE_AERON_TERM_BUFFER_BYTES) for deep in-flight throughput.
-    int32_t aeronTermBufferBytes         = 4 * 1024 * 1024;
+    //     of two in [64 KiB, 1 GiB].  Default 16 MiB (findings §4; was 4 MiB).
+    //     Every publication/image maps 3 terms (48 MiB at the default, NON-sparse
+    //     → really allocated on the aeron dir's filesystem): tests set smaller.
+    int32_t aeronTermBufferBytes         = 16 * 1024 * 1024;
     //   - produce intake limit (F18): the largest produce batch the broker accepts
     //     is DERIVED, never refused at startup — produceIntakeLimit() below.  A
     //     batch above it is answered MessageTooLarge at intake (gateway + worker
     //     ingress), so an accepted batch always fits one replication frame.
     static constexpr int32_t kDefaultMaxProduceBatchBytes = 8 * 1024 * 1024;
     //   - aeronMtuBytes: Aeron UDP MTU (bytes) for the embedded media driver.
-    //     RUNE_AERON_MTU.  Not required to be a power of two.  Default 1408
-    //     (Aeron's own AERON_MTU_LENGTH_DEFAULT — the max that fits the default
-    //     socket SO_SNDBUF on all platforms).
+    //     RUNE_AERON_MTU.  Not required to be a power of two.  Default kAeronAuto:
+    //     DERIVED at start (HostDefaults.h deriveAeronTransport) — 65504 when every
+    //     endpoint is loopback, else the egress interface MTU minus IP/UDP headers
+    //     aligned to 32; always clamped <= the socket buffer the driver will get.
     //
-    //     WHY NOT jumbo (65504): aeron_driver_init() rejects with EINVAL(22) when
-    //     mtu_length > the probed socket SO_SNDBUF max (aeron_driver.c:451).  On
-    //     macOS (and any host with the default ~64 KiB SO_SNDBUF cap) a 65504-byte
-    //     MTU fails driver startup outright — every real embedded-driver test
-    //     (GR-7 / TX-2b failover) crashed at init.  Deployments that raise
-    //     SO_SNDBUF (net.inet.udp.maxdgram / net.core.wmem_max) and want jumbo
-    //     frames for deep batched produces can set RUNE_AERON_MTU=65504.
-    int32_t aeronMtuBytes                = 1408;
+    //     The EINVAL lesson: aeron_driver_init() rejects mtu_length > the probed
+    //     socket SO_SNDBUF (aeron_driver.c:451).  macOS's default UDP SO_SNDBUF is
+    //     9216 (net.inet.udp.maxdgram) and its cap ~8 MiB (kern.ipc.maxsockbuf):
+    //     a 65504 MTU with the OS-default buffer crashed every embedded-driver
+    //     test at init.  The derivation sets the socket buffer first and clamps the
+    //     MTU (even an explicit one, with a WARN) so that can never recur.
+    int32_t aeronMtuBytes                = kAeronAuto;
     //   - gatewayFragmentLimit: maximum fragments polled per ClientGateway
     //     doWork() cycle (RUNE_GATEWAY_FRAGMENT_LIMIT).  Not required to be a
     //     power of two — parsed with parseInt32.  Default 256 (raised from the
@@ -460,18 +478,20 @@ struct NodeConfig {
     //     [256, 8192]; out of range refuses to start).
     int32_t workerMaxOwedReturns         = 4096;
     //   - aeronRcvWindowBytes: Aeron receiver flow-control initial window (bytes).
-    //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default 128 KiB
-    //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to
-    //     avoid receiver window throttling on large batched produces.
-    int32_t aeronRcvWindowBytes          = 128 * 1024;
+    //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default kAeronAuto:
+    //     min(4 MiB, socketBuffer/4, term/2) rounded down to a power of two
+    //     (window <= socket buffer <= sysctl; with 64 KiB datagrams a window near
+    //     SO_RCVBUF drops packets — kernel truesize).  Was 128 KiB (F28).
+    int32_t aeronRcvWindowBytes          = kAeronAuto;
 
     //   - aeronTermBufferSparse: create term buffers as sparse files (true, Aeron's
     //     default here) or fully allocated + zero-filled at creation (false).
     //     RUNE_AERON_TERM_SPARSE=true|false.  Sparse terms page-fault on the first
     //     write to every page (measured ~15% of a loaded shard thread) and turn a
     //     full tmpfs into a mid-run SIGBUS; non-sparse moves both to publication
-    //     creation (a full tmpfs then fails the create, loudly).
-    bool    aeronTermBufferSparse        = true;
+    //     creation (a full tmpfs then fails the create, loudly).  Default false
+    //     (findings §4 SPARSE: 73–79k → 100–105k rec/s).
+    bool    aeronTermBufferSparse        = false;
 
     //   - Aeron sender/receiver batching per syscall (0 = Aeron default 2; 1..16).
     //     RUNE_AERON_MAX_MSGS_PER_SEND  -> network_publication_max_messages_per_send
@@ -485,9 +505,10 @@ struct NodeConfig {
     //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.
     //     Larger socket buffers absorb produce/ack bursts on loopback/LAN so the
     //     kernel does not drop datagrams under load (which would otherwise force
-    //     Aeron NAK/retransmit or app-level retransmit).  0 = leave Aeron's default.
-    //     Default 2 MiB.  (Task 6: transport reliability hardening.)
-    int32_t aeronSocketBufferBytes       = 2 * 1024 * 1024;
+    //     Aeron NAK/retransmit or app-level retransmit).  0 = leave the OS default.
+    //     Default kAeronAuto: min(16 MiB, net.core.rmem_max/wmem_max) (macOS: the
+    //     probed SO_*BUF cap); capped below 16 MiB → loud WARN naming the sysctls.
+    int32_t aeronSocketBufferBytes       = kAeronAuto;
 
     // E5.2: Aeron media-driver threading mode.
     //

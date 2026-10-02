@@ -560,7 +560,11 @@ ConfigResult parseNodeConfig(
     cfg.consensusStreamId   = consensusStreamId;
     cfg.replicationStreamId = replicationStreamId;
 
-    cfg.clientEndpoint.channel  = std::string("aeron:udp?endpoint=") + rawClient;
+    // host:port (canonical) or an already-formed Aeron channel (docker/README.md
+    // form) — never wrapped twice (regression: shard ingress "unknown host").
+    cfg.clientEndpoint.channel  = std::string_view(rawClient).starts_with("aeron:")
+                                      ? std::string(rawClient)
+                                      : std::string("aeron:udp?endpoint=") + rawClient;
     cfg.clientEndpoint.streamId = clientStreamId;
     cfg.replBaseStreamId        = replBaseStreamId;
     // RUNE_AERON_DIR (optional): Aeron dir override (empty → dataDir/aeron).
