@@ -167,7 +167,7 @@ public:
     // its back; nothing is ever dropped.
     //
     // Bound (review S3 m1).  Let F = |FIFO| and O = owed returns (parked
-    // acks=all + durablePending_ + owed Strict facts; S6 adds commit waiters /
+    // acks=all + durablePending_ + held PushReads; S6 adds commit waiters /
     // parked markers — every owed source MUST be counted in reservedAckSlots_()).
     //   * O <= maxOwedReturns_ always: the cap is checked BEFORE the append on
     //     the gateway path (ackReservationAvailable_) and bounds the shard poll
@@ -196,7 +196,7 @@ public:
     /// below kOverflowHighWater.
     static constexpr std::size_t kOverflowLowWater = kOverflowHighWater / 2;
     /// Default static cap on owed returns (G-A6 reservation): parked acks=all +
-    /// durablePending_ + owed Strict facts.  Configurable per worker
+    /// durablePending_ + held PushReads.  Configurable per worker
     /// (RUNE_WORKER_MAX_OWED_RETURNS → setMaxOwedReturns) within
     /// [kMinOwedReturns, kMaxOwedReturnsCeiling].  Both vectors are reserved to
     /// the configured cap, so parking never allocates.  4096 waiters/worker
@@ -1287,11 +1287,16 @@ public:
         // on ITS OWN thread — the same thread that appends — eliminating the
         // append-vs-sync data race (R7 closed).
         //
-        // Applies only when perWorkerIngressActive_ is true (default: false).
-        // Internal partitions (topicId < 0) are not in owned_ so they keep the
-        // gateway sync path unaffected.
-        if (perWorkerIngressActive_) {
+        // F15 S5 (R7, addendum): in EVERY mode — the gateway no longer learns
+        // worker appends (no facts / mirror), so it can never mark a
+        // worker-owned log dirty; the owning worker group-commits its own logs.
+        // Without per-worker ingress (the default Legacy config) the flush is
+        // an io-backend submission (never a blocking fdatasync on this loop)
+        // when the backend accepts submissions.
+        if (perWorkerIngressActive_ || !io_.acceptsSubmissions()) {
             work += syncOwnedLogs_(nowNs);
+        } else {
+            work += syncOwnedLogsAsync_(nowNs);
         }
 
         return work;
@@ -1412,14 +1417,14 @@ private:
     // purge, refusal).  1. the ack is queued on the session's own publication,
     // claimed in this pass's flush (coalesced per session, before the next
     // driver duty cycle);  2. with it (m1: queued at ack ENQUEUE, i.e. before
-    // the ack is claimed — the runtime may see it first; it carries facts the
-    // append already made true and liveness, never an answer), a fire-and-
-    // forget notification goes to the runtime on the one return FIFO (never
-    // dropped, never delaying an ack): the facts-only ProduceResult of F15 S2 (deferAck == true — PSM-
-    // mirror facts of a successful append, and the session's liveness, which
-    // shard-mode produces no longer refresh on the runtime).  An error carries
-    // no facts (producerId -1).  WorkerReturn PRODUCE_NOTIFY stays retired
-    // (F15 §7).  Reservation: the notification takes exactly the ret_ slot the
+    // the ack is claimed — the runtime may see it first; it carries liveness
+    // only, never an answer), a fire-and-forget notification goes to the
+    // runtime on the one return FIFO (never dropped, never delaying an ack): a
+    // ProduceResult with deferAck == true that carries the session's liveness
+    // (shard-mode produces no longer refresh it on the runtime) and NO facts —
+    // F15 S5: the worker psm_ is the sole producer-state authority, the
+    // runtime holds no mirror to feed (producerId -1, no attrs, errorCode 0).
+    // WorkerReturn PRODUCE_NOTIFY stays retired (F15 §7).  Reservation: the notification takes exactly the ret_ slot the
     // relayed answer took before (kMaxReturnsPerOp unchanged); the ack queue is
     // bounded by the same static bound (static_assert below) and gated by the
     // poll budget + op-drain high water.  A full queue is an invariant halt.
@@ -1430,12 +1435,10 @@ private:
                                         ret.partition, ret.errorCode})) [[unlikely]]
             haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
         WorkerReturn n = ret;
-        n.deferAck = true;            // facts only — never an answer
-        if (!ok) {
-            n.errorCode  = 0;         // the facts-only invariant: deferAck ⇒ errorCode 0 …
-            n.producerId = -1;        // … and an error carries no facts
-            n.batchAttrs = 0;
-        }
+        n.deferAck   = true;          // a liveness notification — never an answer
+        n.errorCode  = 0;             // deferAck ⇒ errorCode 0 (the runtime's invariant)
+        n.producerId = -1;            // F15 S5: no producer-state facts (no runtime mirror)
+        n.batchAttrs = 0;
         enqueueToRuntime_(n);
     }
     void enqueueTxnReturn_(const TxnReturn& r) {
@@ -1551,18 +1554,12 @@ private:
                 spdlog::warn("Worker {}: submitCoalescedFlushes_ ring full for log@{}; "
                              "back-pressure: acking pending entries Internal",
                              workerId_, static_cast<const void*>(log));
-                for (std::size_t i = 0; i < durablePending_.size(); ) {
-                    auto& entry = durablePending_[i];
-                    if (entry.token == kNoToken && entry.logPtr == log) {
-                        entry.ret.errorCode = static_cast<int16_t>(6); // Internal
-                        enqueueReturn_(entry.ret);
-                        eraseDurable_(i);   // O(1) swap-with-back
-                        ++work;
-                        // Do NOT advance i — the swapped entry must be checked.
-                    } else {
-                        ++i;
-                    }
-                }
+                work += static_cast<int>(removeInOrder_(durablePending_, [&](DurablePending& entry) {
+                    if (entry.token != kNoToken || entry.logPtr != log) return false;
+                    entry.ret.errorCode = static_cast<int16_t>(6); // Internal
+                    enqueueReturn_(entry.ret);
+                    return true;
+                }));
             } else {
                 // Successful submit: stamp the token onto every pending entry
                 // for this log (all appends this cycle share one fsync token).
@@ -1661,23 +1658,17 @@ private:
         }
 
         // Durable token (or an unrouted one: synthetic / already-retired).
-        int fired = 0;
-        for (std::size_t i = 0; i < durablePending_.size(); ) {
-            auto& entry = durablePending_[i];
-            if (entry.token != kNoToken && entry.token == c.token && !entry.awaitSeal) {
-                if (sealsOutstanding_(entry.logPtr)) {
-                    entry.awaitSeal = true;                     // durable in its active segment;
-                    ++i;                                        // fires once the seals complete
-                    continue;
-                }
-                fireDurable_(entry);
-                eraseDurable_(i);
-                ++fired;
-            } else {
-                ++i;
+        // F15 S5: order-preserving (pipelined Strict answers of one partition
+        // leave in append order — never reordered by the removal).
+        return static_cast<int>(removeInOrder_(durablePending_, [&](DurablePending& entry) {
+            if (entry.token == kNoToken || entry.token != c.token || entry.awaitSeal) return false;
+            if (sealsOutstanding_(entry.logPtr)) {
+                entry.awaitSeal = true;                         // durable in its active segment;
+                return false;                                   // fires once the seals complete
             }
-        }
-        return fired;
+            fireDurable_(entry);
+            return true;
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -2276,308 +2267,38 @@ private:
     }
 
     // -------------------------------------------------------------------
-    // executeProduceWire_ — append the batch to the owning Log and update
-    // the replica's tracked LEO/HW via onLeaderLogAppended().
-    //
-    // The tail view IS the record-batch bytes in the ring. We re-stamp the
-    // base offset in-place (CRC region is after kBaseOffsetOffset=0, so no
-    // CRC recompute) then call log->appendNoSync(tail, tailLen, lastOffset)
-    // — zero-copy READ from the ring into the log.
-    //
-    // CRITICAL: the tail pointer is a zero-copy view valid only for the
-    // duration of this callback — it is fully consumed here (appendNoSync
-    // copies the bytes into the log's owned buffer).
+    // executeProduceWire_ — a gateway-routed produce (WorkerOp::Produce):
+    // produceCore_ on the op's zero-copy tail view (valid only for the
+    // duration of this callback — the log restamps + copies it at append).
     // -------------------------------------------------------------------
     void executeProduceWire_(sbe::WorkerOp& op) {
         RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerAppend,
                              static_cast<uint32_t>(op.correlationId()));
-        // Task 13 (spec §3.4): with worker-side acks (shard mode) a gateway-
-        // received user produce joins the ONE produce path of the shard — the
-        // worker psm_ validates it (the runtime no longer does) and the answer
-        // is acked on the session's own publication like a worker-ingress one.
-        if (ackSink_) {
-            ProduceFields f;
-            f.sessionId     = op.sessionId();
-            f.correlationId = op.correlationId();
-            f.producerId    = op.producerId();
-            f.topicId       = op.topicId();
-            f.partition     = op.partition();
-            f.baseSequence  = op.baseSequence();
-            f.minIsr        = op.minIsr();
-            f.producerEpoch = op.producerEpoch();
-            auto* rep       = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
-            f.acksAll       = op.deferAck() != 0 && rep != nullptr;
-            f.fromOp        = true;
-            const std::uint32_t tl = op.tailLength();
-            const char* tp = op.tail();
-            (void)produceCore_(f, getLogFromWire_(op), rep,
-                               std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(tp), tl),
-                               passNowNs_);
-            return;
-        }
-        const int32_t topicId   = op.topicId();
-        const int32_t partition = op.partition();
-        WorkerReturn ret;
-        ret.type          = WorkerReturn::Type::ProduceResult;
-        ret.sessionId     = op.sessionId();
-        ret.correlationId = op.correlationId();
-        ret.partition     = partition;
-        // F15 S2 fix round 2 (B1): a worker result is an ANSWER (deferAck false)
-        // unless it is the append-time facts-only copy emitted below — never
-        // inherit op.deferAck (an error result marked deferAck would be taken
-        // for facts by the gateway: no answer, mirrors poisoned).
-        ret.deferAck      = false;
-        ret.replica       = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
-        ret.targetReplicaId = op.targetReplicaId();
-        ret.incarnation     = op.incarnation();
-        ret.producerId    = op.producerId();
-        ret.producerEpoch = op.producerEpoch();
-        ret.baseSequence  = op.baseSequence();
-        ret.recordCount   = op.recordCount();
-        ret.topicId       = topicId;
-        ret.batchAttrs    = op.batchAttrs();
-        ret.enqueuedAtNs  = op.enqueuedAtNs();
-
-        auto* replica = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
-        auto* log     = getLogFromWire_(op);
-
-        if (!log) {
-            spdlog::error("Worker {}: executeProduceWire_ — no Log for topicId={} partition={}; "
-                          "sending Internal error",
-                          workerId_, topicId, partition);
-            ret.errorCode = static_cast<int16_t>(6); // ErrorCode::Internal
-            enqueueReturn_(ret);
-            return;
-        }
-
-        // fsyncgate fail-stop: a failed log refuses every produce.
-        if (log->storageFailed()) [[unlikely]] {
-            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
-            enqueueReturn_(ret);
-            return;
-        }
-
-        // F15 §3.1 (I1): the OWNING worker is the role authority.  A produce
-        // routed while a BecomeFollower (or a self-demotion) was ahead of it is
-        // refused retriably — the follower log is never touched.
-        if (!produceRoleGatePasses_(replica)) [[unlikely]] {
-            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
-            ret.deferAck  = false;
-            enqueueReturn_(ret);
-            return;
-        }
-
-        // F15 §2.3 produce gate: an idempotent / transactional batch is taken
-        // only while this partition's RC (and producer) state is Ready — one
-        // inline build step first; else NotLeader (retriable, log untouched).
-        // pid -1 batches skip it (the same branch as the PSM check).
-        RcState* rc = nullptr;
-        if (op.producerId() >= 0 && replica != nullptr && topicId >= 0) [[unlikely]] {
-            rc = rcGate_(replica);
-            if (rc == nullptr) {
-                ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
-                ret.deferAck  = false;
-                enqueueReturn_(ret);
-                return;
-            }
-        }
-
-        // Task 10 round 5: the min-ISR admission gate for acks=all lives HERE, on
-        // the owning thread (the replica's ISR is worker-owned state).  The
-        // gateway used to read replica->isr() on the control thread — a data race
-        // that could segfault mid-promotion.  deferAck == acks=all on a
-        // replicated partition in steady state (exactly the old gateway gate).
-        if (op.deferAck() != 0 && replica &&
-            static_cast<int>(replica->isr().size()) <
-                (op.minIsr() > 0 ? op.minIsr() : replica->minIsr())) [[unlikely]] {
-            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation);
-            ret.deferAck  = false;
-            enqueueReturn_(ret);   // log untouched — no append, no LEO advance
-            return;
-        }
-
-        // F15 S2 (I-A, addendum R-4c): the acks=all waiter will be parked on THIS
-        // worker and fire into ret_ later — reserve its return slot BEFORE the
-        // append (the G-A6 reservation, now covering gateway-routed produces;
-        // the gateway's old pendingAcks_ cap is gone).  No slot → retriable
-        // NotLeader with the log untouched (a retry is always safe).
-        const bool acksAll = op.deferAck() != 0 && replica != nullptr;
-        // A produce whose answer is PARKED (acks=all on the HW, Strict on its
-        // fsync) also emits an append-time facts-only return (see below): it
-        // needs TWO return slots — the facts now, the final answer later.
-        const bool strict = op.durabilityTier() == 2 && log->isDiskBacked();
-        const bool parks  = acksAll || strict;
-        if (parks && !ackReservationAvailable_(/*returnsNow=*/1)) [[unlikely]] {
-            ++acksAllRefusedNoReservation_;
-            if (!owedCapAllows_(1)) noteOwedCapThrottle_("gateway-routed produce");
-            if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
-                spdlog::warn("Worker {}: parked (acks=all / Strict) produce refused NotLeader — return-ring reservation "
-                             "exhausted (owed={}, total refused={})", workerId_, reservedAckSlots_(),
-                             acksAllRefusedNoReservation_);
-            // NotLeader: the only retriable "nothing was appended, retry"
-            // code the client protocol has without a protocol change (review
-            // m11: MinIsrViolation would misreport the ISR; a dedicated
-            // back-pressure code is a protocol change).
-            ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
-            ret.deferAck  = false;
-            enqueueReturn_(ret);
-            return;
-        }
-
-        // Zero-copy restamp append: the base offset is assigned from the log's end
-        // offset and patched into the batch header via pwritev (LE64 at bytes
-        // [0..7], before the CRC region) — the ring frame is NOT mutated, so
-        // op.tail() stays a read-only view (no const_cast).  The worker is the
-        // single writer, so the assigned base is authoritative.
-        const uint32_t tailLen = op.tailLength();
-        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
-
-        // ── Task 7: per-worker schema validation hook ──────────────────────
-        // Immediately before append: if a local Validator is installed for this
-        // topic (installed off-hot-path via SchemaUpdate ring op), validate each
-        // record's value in the batch.
-        //
-        // HARD RULE 4 (zero hot-path alloc): validators_ was built by
-        // executeSchemaUpdateWire_ off-hot-path.  The validate() call operates
-        // on a zero-copy span into the ring tail (no heap).  No per-record
-        // allocation; only preallocated state inside the Validator is accessed.
-        // HARD RULE 5 (no virtual calls): Validator::validate is a concrete call.
-        // HARD RULE 1 (shared-nothing): validators_ is ONLY touched by this worker
-        // thread — never shared, never locked.
-        //
-        // I1 fast-out (ultra-low-latency default path, HARD RULE #4): when no
-        // validator has ever been installed (validators_ empty — the common case
-        // for topics without a schema), skip the hash lookup entirely.  This
-        // reduces the default produce path to one integer load + one
-        // well-predicted branch; the hash+bucket+pointer-chase is paid only when
-        // at least one schema has been pushed to this worker.
-        if (schemaRejects_(topicId, tail, tailLen)) [[unlikely]] {
-            ret.errorCode = static_cast<int16_t>(
-                rune::protocol::client::ErrorCode::SchemaValidationFailed);
-            enqueueReturn_(ret);
-            return;
-        }
-        // ── end Task 7 validation hook ─────────────────────────────────────
-
-        int64_t base = 0;
-        try {
-            const int64_t appended =
-                log->appendNoSyncRestamp(tail, static_cast<std::size_t>(tailLen),
-                                         op.lastOffsetDelta(), base);
-            // R5 finding F6 (correctness): a negative return means the append was
-            // REFUSED (e.g. InMemoryLog in BackPressure mode with a full ring).
-            // We MUST NOT ack OK for a record that was never appended — that is a
-            // phantom-durability false-OK.  Return a non-OK error so the client
-            // retries ([[rune-shared-nothing-law]]: never false-OK a commit-critical
-            // produce under back-pressure).
-            if (appended < 0) {
-                spdlog::warn("Worker {}: appendNoSync refused (back-pressure) for "
-                             "topicId={} partition={}; returning Internal",
-                             workerId_, topicId, partition);
-                ret.errorCode = static_cast<int16_t>(6); // Internal
-                enqueueReturn_(ret);
-                return;
-            }
-        } catch (const std::exception& ex) {
-            spdlog::error("Worker {}: appendNoSync threw: {}", workerId_, ex.what());
-            ret.errorCode = static_cast<int16_t>(6); // Internal
-            enqueueReturn_(ret);
-            return;
-        } catch (...) {
-            spdlog::error("Worker {}: appendNoSync threw unknown exception", workerId_);
-            ret.errorCode = static_cast<int16_t>(6); // Internal
-            enqueueReturn_(ret);
-            return;
-        }
-
-        // Base offset assigned by appendNoSyncRestamp (authoritative).
-        ret.baseOffset = base;
-        ret.lastOffset = base + static_cast<int64_t>(op.lastOffsetDelta());
-
-        // GR-4 Mode A seam: reconcile the replica's tracked LEO/HW.
-        if (replica) {
-            replica->onLeaderLogAppended();
-        }
-
-        // F15 §2.1 (C1): the RC update is in the SAME invocation as the append —
-        // independent of the ack, the ProduceResult and the session.
-        if (rc != nullptr && (txnAttrs_(tail, tailLen) & kTxnAttrBit) != 0) [[unlikely]]
-            rc->onTxnBatch(op.producerId(), base);
-
-        // F15 I-A: this worker answers the produce itself (immediately, after
-        // its fsync, or when the HW passes it) — the final result is final, the
-        // gateway never parks it.
-        ret.deferAck = false;
-        if (acksAll && !strict) [[unlikely]] {
-            // TEMPORARY (F15 S2 fix round 1, review C1; DELETED by S4 — LSO on
-            // W — and S5 — PSM on W): until then the gateway still mirrors the
-            // idempotent PSM, the LsoTracker and the dirty-log set for
-            // gateway-received produces.  They must learn the append NOW, in the
-            // same invocation as the append and before any ack decision — not
-            // with the final answer, which comes a replication RTT later or as
-            // an error that carries no facts (pre-S2 semantics for acks=all).
-            // A Strict produce's facts wait for its fsync (fireDurable_, ruling
-            // of re-review 1): a duplicate is never answered OK for data that
-            // is not durable.
-            emitFactsOnly_(ret);   // slot reserved above (ackReservationAvailable_(1))
-        }
-
-        // E3 Task 5: Strict durability tier — defer ack until fsync completion is reaped.
-        // Only applicable to disk-backed logs (memory logs have no fd to fsync).
-        //
-        // Group-commit coalescing: we do NOT submit the fsync here.  Instead we
-        // push a DurablePending entry with token=0 (un-flushed-yet) and record the
-        // log in dirtyThisCycle_ (dedup — only if not already present this cycle).
-        // After ALL this-cycle produces are appended (drainIngress_ returns),
-        // submitCoalescedFlushes_() submits ONE io_.submit per dirty log and stamps
-        // the resulting token onto every pending entry for that log.
-        if (strict) {
-            ret.errorCode = 0; // tentatively OK; updated in submitCoalescedFlushes_ or on completion
-            // token=0 means "not yet submitted" — reapDurableCompletions_ will never fire this.
-            // F15 R-4b: a Strict acks=all ack waits for its fsync, THEN the HW
-            // (thenAwaitHw) — in every mode.
-            DurablePending dp;
-            dp.token       = kNoToken;
-            dp.lastOffset  = ret.lastOffset;
-            dp.logPtr      = log;
-            dp.ret         = std::move(ret);
-            dp.thenAwaitHw = acksAll ? replica : nullptr;
-            dp.deadlineNs  = passNowNs_ + ackTimeoutNs_;
-            dp.replica     = replica;
-            dp.logGen      = replica ? replica->logGeneration() : 0;
-            dp.minIsr      = acksAll ? (op.minIsr() > 0 ? op.minIsr() : replica->minIsr()) : 1;
-            dp.factsOwed   = true;   // TEMPORARY (S5): facts emitted at fsync completion
-            ++strictFactsOwed_;      // reserved above (ackReservationAvailable_(1))
-            durablePending_.push_back(std::move(dp));
-
-            // Record this log as dirty for this cycle (dedup).
-            bool found = false;
-            for (auto* dl : dirtyThisCycle_) {
-                if (dl == log) { found = true; break; }
-            }
-            if (!found) dirtyThisCycle_.push_back(log);
-            return;
-        }
-
-        if (acksAll) {
-            // F15 I-A: park on THIS worker (was: the gateway's pendingAcks_ on
-            // the published HW snapshot).  Fires in flushOwedAcksAll_ when the
-            // HW passes it with the ISR >= minIsr (DR-BUG-3), re-validated every
-            // pass against role / ownership / log generation (§3.2).
-            PendingAcksAll pending;
-            pending.replica    = replica;
-            pending.lastOffset = ret.lastOffset;
-            pending.deadlineNs = passNowNs_ + ackTimeoutNs_;
-            pending.logGen     = replica->logGeneration();
-            pending.minIsr     = op.minIsr() > 0 ? op.minIsr() : replica->minIsr();
-            pending.ret        = std::move(ret);
-            pendingAcksAll_.push_back(std::move(pending));
-            return;
-        }
-
-        // Default (tier 0 / tier 1) or memory-backed: enqueue immediately.
-        ret.errorCode = 0;
-        enqueueReturn_(ret);
+        // F15 S5 (§2.5, I6) + Task 13 (spec §3.4): a gateway-received produce
+        // joins THE produce path of this worker in EVERY mode (Legacy default
+        // config, per-worker ingress, shard — both placements): the worker
+        // psm_ validates it (duplicate → the original offsets, fenced epoch →
+        // 17) in program order with the append and with every marker's fence.
+        // The gateway holds no producer state for a worker-owned partition.
+        ProduceFields f;
+        f.sessionId      = op.sessionId();
+        f.correlationId  = op.correlationId();
+        f.producerId     = op.producerId();
+        f.topicId        = op.topicId();
+        f.partition      = op.partition();
+        f.baseSequence   = op.baseSequence();
+        f.minIsr         = op.minIsr();
+        f.producerEpoch  = op.producerEpoch();
+        auto* rep        = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+        f.acksAll        = op.deferAck() != 0 && rep != nullptr;
+        f.durabilityTier = op.durabilityTier();
+        f.enqueuedAtNs   = op.enqueuedAtNs();
+        f.fromOp         = true;
+        const std::uint32_t tl = op.tailLength();
+        const char* tp = op.tail();
+        (void)produceCore_(f, getLogFromWire_(op), rep,
+                           std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(tp), tl),
+                           passNowNs_);
     }
 
     // -------------------------------------------------------------------
@@ -2680,7 +2401,7 @@ private:
                     // a follower / demoted partition answers at once (notReady).
                     if (mayHold && replica->role() == rune::replication::Role::Leader &&
                         rcOf_(replica) != nullptr && heldPushReads_.size() < kMaxHeldPushReads &&
-                        owedCapAllows_(0)) {
+                        owedCapAllows_()) {
                         heldPushReads_.push_back(a);   // reserved: never allocates
                         return;
                     }
@@ -2903,61 +2624,12 @@ private:
             spdlog::warn("Worker {}: becomeLeader threw unknown exception", workerId_);
         }
 
-        // E5.1.5: PSM reconstruction on ownership GAIN (worker thread).
-        //
-        // When this worker becomes leader of a partition, its ProducerStateManager
-        // must reflect the last sequence per producer so idempotent dedup holds
-        // across a leadership move.  Without this, a retried produce spanning the
-        // move could be re-appended (false Accept) — acknowledged data at a
-        // different (new) offset, i.e. data duplication.
-        //
-        // Reuse the same logic as ClientGateway::rebuildProducerStateFromLogs
-        // (ClientGateway.cpp:474) adapted for the worker-owned PSM:
-        //   - Scan only the committed log tail (HW-bound, NOT LEO) so we never
-        //     seed from uncommitted batches that may be truncated by KIP-101
-        //     divergence resolution (same TX-2b correctness argument).
-        //   - Fallback to LEO when HW is not yet known (replica not yet
-        //     initialized, or passthrough/single-node mode).
-        //   - rebuildFromLog is idempotent for this (topicId, partition) pair —
-        //     it clears and re-seeds only this partition's entries, leaving other
-        //     partitions' state intact.
-        //
-        // Shared-nothing: runs on the WORKER thread (this function is called from
-        // executeBecomeLeaderWire_ which is called from drainIngress_, which runs
-        // on the worker's duty-cycle thread).  No cross-thread access to psm_.
-        //
-        // Cold path: alloc OK (rebuildFromLog is a log scan, not on the hot path).
-        if (perWorkerIngressActive_ && replica->isDiskBacked()) {
-            rune::storage::Log* log = replica->log();
-            if (log) {
-                // TX-2b: use committed HW, not LEO, as the scan upper bound.
-                // highWatermark() is safe to call here on the worker thread — the
-                // worker owns all HW writes (E5.1.2c: FetchRequest/ApplyReplicated
-                // are on the worker thread; becomeLeader itself sets the initial HW).
-                int64_t hw = replica->highWatermark();
-                if (hw <= 0) {
-                    // HW not yet established (very first becomeLeader): fall back
-                    // to LEO.  A new leader with no replication history has no
-                    // uncommitted tail, so LEO == HW is safe.
-                    hw = log->logEndOffset();
-                }
-                try {
-                    psm_.rebuildFromLog(topicId, *log, hw, partition);
-                    spdlog::info("Worker {}: PSM rebuilt for topicId={} partition={} "
-                                 "hw={} entries={}",
-                                 workerId_, topicId, partition, hw,
-                                 psm_.size());
-                } catch (const std::exception& ex) {
-                    spdlog::error("Worker {}: PSM rebuild threw for topicId={} "
-                                  "partition={}: {}; idempotency window may be stale",
-                                  workerId_, topicId, partition, ex.what());
-                } catch (...) {
-                    spdlog::error("Worker {}: PSM rebuild threw unknown exception for "
-                                  "topicId={} partition={}",
-                                  workerId_, topicId, partition);
-                }
-            }
-        }
+        // F15 S5 (§2.5, I3): no synchronous producer-state rebuild here.  The
+        // worker psm_ for this partition is rebuilt by the incremental RC build
+        // (RcState: bounded per pass, starts at leaderComplete_, scans the
+        // whole log and applies control batches as epoch raises), in EVERY
+        // mode; idempotent / transactional produces are refused NotLeader
+        // (retriable) until it is Ready.
     }
 
     // -------------------------------------------------------------------
@@ -3210,6 +2882,17 @@ private:
         }
         const std::span<const uint8_t> markerSpan(tail, static_cast<std::size_t>(tailLen));
         using RepT = rune::replication::PartitionReplica;
+        // F15 S5 (§2.5, C1+): fence the partition producer epoch on RECEIPT —
+        // before the role gate, a MinIsr refusal or the append (raise only, no
+        // sequence).  By L4 a gateway-routed produce enqueued before this op was
+        // validated first and lands before the marker (covered by its range);
+        // one enqueued after it — or a shard-ingress frame polled after it — is
+        // validated against the raised epoch: a zombie gets 17.  The control
+        // batch itself is the durable form (the PSM rebuild applies it).
+        rune::transaction::ControlMarkerPayload mp;
+        const bool mpOk = rune::transaction::ControlMarker::extract(tail, 0, mp, tailLen);
+        if (mpOk) psm_.fenceEpoch(topicId, mp.producerId, partition,
+                                  rune::protocol::RecordBatchReader(tail, tailLen).producerEpoch());
         try {
             // F15 N2: the marker lands AS a control batch (restamped in place),
             // with the replica's own role gate (NotLeader, retriable) and min-ISR gate.
@@ -3219,8 +2902,7 @@ private:
                 // F15 §2.1 step 2: the RC update in the same invocation as the
                 // marker append (Ready: applied; Scanning: tail list).
                 if (RcState* rc = rcOf_(replica)) {
-                    rune::transaction::ControlMarkerPayload mp;
-                    if (rune::transaction::ControlMarker::extract(tail, 0, mp, tailLen))
+                    if (mpOk)
                         rc->onMarker(mp.producerId, base, mp.controlType == rune::transaction::ControlType::Commit);
                 }
                 // N2 (minor): keep append()'s flush request on the worker — a
@@ -3555,10 +3237,6 @@ private:
         rune::replication::PartitionReplica* replica = nullptr;
         uint64_t                logGen     = 0;
         int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
-        /// TEMPORARY (F15 S2 fix round 2; deleted by S5): a gateway-routed
-        /// Strict produce owes the gateway its facts-only return, emitted at
-        /// fsync completion (fireDurable_) — counted in strictFactsOwed_.
-        bool                    factsOwed  = false;
     };
     std::vector<DurablePending> durablePending_;
 
@@ -3747,9 +3425,6 @@ private:
     int64_t passNowNs_ = 0;
     // F15 S2 (R-4c): gateway-routed acks=all refused for lack of a reservation.
     uint64_t acksAllRefusedNoReservation_ = 0;
-    // TEMPORARY (F15 S2 fix round 2; deleted by S5): durablePending_ entries
-    // whose facts-only return is still owed (DurablePending::factsOwed).
-    int64_t strictFactsOwed_ = 0;
 
     // E5.1.3 (d) R7 fix: last time syncOwnedLogs_ was run (ns). 0 = never.
     // Worker-thread only — no atomic needed.
@@ -4101,6 +3776,8 @@ private:
                 slot.rc = std::make_unique<RcState>();
                 slot.rc->reserve(rcOpenTxnCapacity_);
                 slot.rc->setResidencyProbe(rcProbeFn_, rcProbeCtx_);
+                // F15 S5 (I3): the build rebuilds THIS worker's producer state.
+                slot.rc->bindProducerState(&psm_, r->topicId(), static_cast<int32_t>(r->partitionId()));
             }
             installReadAhead_(slot);
             next.push_back(std::move(slot));
@@ -4314,17 +3991,12 @@ private:
             return p.ret.incarnation != 0 ? ownsIncarnation_(p.ret.targetReplicaId, p.ret.incarnation)
                                           : isOwned(p.replica);
         };
-        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
-            if (!stillOwned(pendingAcksAll_[i])) {
-                pendingAcksAll_[i].ret.errorCode =
-                    static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
-                enqueueReturn_(pendingAcksAll_[i].ret);
-                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
-                pendingAcksAll_.pop_back();
-            } else {
-                ++i;
-            }
-        }
+        (void)removeInOrder_(pendingAcksAll_, [&](PendingAcksAll& e) {
+            if (stillOwned(e)) return false;
+            e.ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            enqueueReturn_(e.ret);
+            return true;
+        });
         // Push subscriptions: parked / re-activated by id + incarnation in
         // rebuildOwnedIndex_ above — never overwritten by a pointer compare here.
         // C-1 / M2: logs this worker no longer owns.  Their still-pending durable
@@ -4491,15 +4163,6 @@ private:
     }
     void fireDurable_(DurablePending& entry) {
         durableAckToken_ = entry.token;
-        // TEMPORARY (F15 S2 fix round 2, Strict ruling; deleted by S5): the
-        // batch is now durable — hand the gateway mirrors its facts (before the
-        // §3.2 validation: the batch was appended and is durable either way;
-        // for Strict-then-HW, before the HW wait).
-        if (entry.factsOwed) {
-            entry.factsOwed = false;
-            --strictFactsOwed_;
-            emitFactsOnly_(entry.ret);
-        }
         // F15 §3.2: a durable ack may fire OK only while this worker still owns
         // the replica, it is still Leader and the acked content is unchanged —
         // a Strict ack whose fsync completes after a demotion fails NotLeader.
@@ -4531,15 +4194,11 @@ private:
     }
     void fireSealGated_(LogFlushSlot& slot) {
         if (sealsOutstanding_(slot.log)) return;
-        for (std::size_t i = 0; i < durablePending_.size(); ) {
-            auto& entry = durablePending_[i];
-            if (entry.awaitSeal && entry.logPtr == slot.log) {
-                fireDurable_(entry);
-                eraseDurable_(i);
-            } else {
-                ++i;
-            }
-        }
+        (void)removeInOrder_(durablePending_, [&](DurablePending& entry) {
+            if (!entry.awaitSeal || entry.logPtr != slot.log) return false;
+            fireDurable_(entry);
+            return true;
+        });
     }
 
     // ---- fsyncgate fail-stop -------------------------------------------------
@@ -4561,27 +4220,20 @@ private:
     // and the runtime is signalled once to halt the broker.
     // Fail THIS worker's pending acks on `log` with `code` (never touches the Log).
     void failOwnPending_(const rune::storage::Log* log, int16_t code, bool includeAcksAll) {
-        for (std::size_t i = 0; i < durablePending_.size(); ) {
-            if (durablePending_[i].logPtr == log) {
-                durablePending_[i].ret.errorCode = code;   // an error carries no facts (deferAck false)
-                enqueueReturn_(durablePending_[i].ret);
-                eraseDurable_(i);
-            } else {
-                ++i;
-            }
-        }
+        (void)removeInOrder_(durablePending_, [&](DurablePending& e) {
+            if (e.logPtr != log) return false;
+            e.ret.errorCode = code;
+            enqueueReturn_(e.ret);
+            return true;
+        });
         if (!includeAcksAll) return;
-        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
-            auto* r = pendingAcksAll_[i].replica;
-            if (r && r->isDiskBacked() && r->log() == log) {   // log() is immutable: safe to read
-                pendingAcksAll_[i].ret.errorCode = code;
-                enqueueReturn_(pendingAcksAll_[i].ret);
-                pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
-                pendingAcksAll_.pop_back();
-            } else {
-                ++i;
-            }
-        }
+        (void)removeInOrder_(pendingAcksAll_, [&](PendingAcksAll& e) {
+            auto* r = e.replica;
+            if (!(r && r->isDiskBacked() && r->log() == log)) return false;   // log() is immutable: safe to read
+            e.ret.errorCode = code;
+            enqueueReturn_(e.ret);
+            return true;
+        });
     }
     void signalStorageFailure_(const std::string& dir, int err, int32_t topicId, int32_t partition) {
         spdlog::critical("Worker {}: fsync FAILED on {} (errno={}) — log permanently failed; "
@@ -4729,10 +4381,9 @@ private:
     int flushOwedAcksAll_(int64_t nowNs) {
         if (pendingAcksAll_.empty()) return 0;
 
-        int fired = 0;
-        for (std::size_t i = 0; i < pendingAcksAll_.size(); ) {
-            auto& entry = pendingAcksAll_[i];
-
+        // F15 S5: order-preserving removal — the answers of pipelined acks=all
+        // batches of one partition leave in append order.
+        return static_cast<int>(removeInOrder_(pendingAcksAll_, [&](PendingAcksAll& entry) {
             // F15 §3.2: re-validate first — ownership, role (BecomeFollower OR a
             // self-demotion in onFetchRequest, no hook needed), log generation.
             auto* rep = waiterReplica_(entry.replica, entry.ret.targetReplicaId, entry.ret.incarnation,
@@ -4757,8 +4408,7 @@ private:
                 // Internal (6) is the correct "unexpected server-side failure" code.
                 code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
             } else {
-                ++i;
-                continue;
+                return false;
             }
             entry.ret.errorCode = code;
             // Keyed by (partition<<24)|offset — unique across partitions;
@@ -4770,13 +4420,8 @@ private:
                 (static_cast<uint32_t>(entry.ret.partition) << 24) |
                     (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
             enqueueReturn_(entry.ret);
-            // O(1) erase by swap-with-back.
-            pendingAcksAll_[i] = std::move(pendingAcksAll_.back());
-            pendingAcksAll_.pop_back();
-            ++fired;
-            // Do NOT advance i — the swapped entry needs checking.
-        }
-        return fired;
+            return true;
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -4813,42 +4458,37 @@ private:
         return r;
     }
 
+    // F15 S5: order-preserving removal of every entry `take` claims (it fires
+    // or fails the entry and returns true); survivors keep their order, so the
+    // answers of pipelined batches of one partition leave in append order
+    // (swap-with-back reordered them).  O(n) per sweep, no allocation (the
+    // vector only shrinks), template visitor (no std::function).
+    template <typename Vec, typename Take>
+    static std::size_t removeInOrder_(Vec& v, Take&& take) {
+        std::size_t w = 0;
+        const std::size_t n = v.size();
+        for (std::size_t r = 0; r < n; ++r) {
+            if (take(v[r])) continue;
+            if (w != r) v[w] = std::move(v[r]);
+            ++w;
+        }
+        const std::size_t removed = n - w;
+        v.erase(v.begin() + static_cast<std::ptrdiff_t>(w), v.end());
+        return removed;
+    }
     // F15 S2 (R-4c): one more owed ack (fires into ret_ later) still fits the
     // G-A6 return-ring reservation — the same rule the shard-ingress poll uses.
-    // TEMPORARY (F15 S2 fix rounds 1-2; deleted by S4/S5): emit the facts-only
-    // copy of a successful append (deferAck == true, errorCode 0) and strip the
-    // facts from `ret` (producerId -1, no attrs) so the final answer never
-    // re-applies them.  The caller has reserved the slot.
-    void emitFactsOnly_(WorkerReturn& ret) {
-        WorkerReturn facts = ret;
-        facts.deferAck  = true;
-        facts.errorCode = 0;
-        enqueueReturn_(facts);
-        ret.producerId = -1;
-        ret.batchAttrs = 0;
-    }
-    // O(1) swap-with-back erase of durablePending_[i], keeping strictFactsOwed_
-    // exact (an entry dropped with facts still owed releases its reservation).
-    void eraseDurable_(std::size_t i) noexcept {
-        if (durablePending_[i].factsOwed) --strictFactsOwed_;
-        durablePending_[i] = std::move(durablePending_.back());
-        durablePending_.pop_back();
-    }
-    // `returnsNow` = extra returns the caller owes on top of the answer (the
-    // facts-only return: now for acks=all, at fsync completion for Strict).
-    [[nodiscard]] bool ackReservationAvailable_(int64_t returnsNow = 0) const noexcept {
+    [[nodiscard]] bool ackReservationAvailable_() const noexcept {
         return ret_.freeSlotsForMsgSize(ackSlotBytes_) >
-               reservedAckSlots_() + static_cast<int64_t>(retFifo_.size()) + returnsNow &&
-               owedCapAllows_(returnsNow);
+               reservedAckSlots_() + static_cast<int64_t>(retFifo_.size()) &&
+               owedCapAllows_();
     }
     // F15 S3 (addendum S3): the STATIC owed-return cap — the answer parked now
-    // (+1) plus any further owed return (returnsNow: Strict owes its facts at
-    // fsync) must stay within maxOwedReturns_, so pendingAcksAll_ /
+    // (+1) must stay within maxOwedReturns_, so pendingAcksAll_ /
     // durablePending_ never outgrow their reservation and the §6 FIFO bound
-    // holds.  (For non-Strict acks=all the facts are emitted now, not owed, so
-    // this is one conservative.)
-    [[nodiscard]] bool owedCapAllows_(int64_t returnsNow) const noexcept {
-        return reservedAckSlots_() + 1 + returnsNow <= static_cast<int64_t>(maxOwedReturns_);
+    // holds.
+    [[nodiscard]] bool owedCapAllows_() const noexcept {
+        return reservedAckSlots_() + 1 <= static_cast<int64_t>(maxOwedReturns_);
     }
     // Cold: count + rate-limited log of an owed-cap throttle (the bench / DR
     // matrix watches it: the cap, not the ring, was the limiter).
@@ -4943,8 +4583,7 @@ private:
     [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
         return static_cast<int64_t>(pendingAcksAll_.size()) +
                static_cast<int64_t>(durablePending_.size()) +
-               static_cast<int64_t>(heldPushReads_.size()) +   // F15 S4 I-2: held PushReads owe a return
-               strictFactsOwed_;   // TEMPORARY (S5): owed Strict facts-only returns
+               static_cast<int64_t>(heldPushReads_.size());    // F15 S4 I-2: held PushReads owe a return
     }
 
     // Reservation-before-poll (E5.1.3 deliverable b), G-A6: never poll more
@@ -5071,6 +4710,7 @@ private:
         f.partition     = msg.partition;
         f.baseSequence  = msg.baseSequence;
         f.producerEpoch = msg.producerEpoch;
+        f.durabilityTier = replica ? replica->durabilityTier() : uint8_t{1};
         f.acksAll       = (msg.acks != 0);
         f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
         return produceCore_(f, log, replica, msg.recordBatch, nowNs);
@@ -5092,8 +4732,10 @@ private:
         int32_t baseSequence  = 0;
         int32_t minIsr        = 0;      ///< admission policy override (0 = the replica's)
         int16_t producerEpoch = 0;
+        uint8_t durabilityTier = 1;     ///< 2 = Strict (ack after fsync)
         bool    acksAll       = false;
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
+        int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
     };
 
     int produceCore_(const ProduceFields& f, rune::storage::Log* log,
@@ -5111,6 +4753,7 @@ private:
         ret.producerId    = f.producerId;
         ret.producerEpoch = f.producerEpoch;
         ret.baseSequence  = f.baseSequence;
+        ret.enqueuedAtNs  = f.enqueuedAtNs;
         ret.replica       = replica;
         if (replica) { ret.targetReplicaId = replica->registryId(); ret.incarnation = replica->incarnation(); }
 
@@ -5216,23 +4859,31 @@ private:
         const int minIsr  = f.minIsr > 0 ? f.minIsr : (replica ? replica->minIsr() : 1);
 
         // Durability tier — honor the topic/replica's configured tier so a
-        // tier=strict (D2) topic actually acks after fdatasync (handleProduceBatch
-        // does an inline synchronous log->sync() for tier==2).  Defaults to Majority
-        // (1) when no replica is wired, preserving prior behavior.  (Previously this
-        // was hardcoded to 1, so RUNE_TOPICS tier=strict was silently ignored on the
-        // per-worker ingress path.)
-        const uint8_t durabilityTier = replica ? replica->durabilityTier() : 1;
-        // Task 10 (spec §3.1): shard mode never fsyncs inline on the loop.  Strict
-        // appends page-cache only and acks from its own io_ completion (then the
-        // HW gate for acks=all).
-        const bool asyncStrict = shardMode_ && durabilityTier == 2;
+        // tier=strict (D2) topic actually acks after fdatasync.  Worker ingress:
+        // the replica's tier (Majority when no replica is wired); op path: the
+        // tier the gateway stamped from the same replica view.
+        const uint8_t durabilityTier = f.durabilityTier;
+        // Task 10 (spec §3.1) + F15 S5: shard mode and EVERY gateway-routed
+        // produce never fsync inline on the worker loop.  Strict appends
+        // page-cache only and acks from its own io_ completion (then the HW gate
+        // for acks=all).  Only a disk-backed log has an fd to fsync; the
+        // non-shard per-worker-ingress path keeps its inline sync (unchanged).
+        const bool asyncStrict = durabilityTier == 2 && (shardMode_ || f.fromOp) && log->isDiskBacked();
+        // The tier handleProduceBatch sees: never an inline sync for an op.
+        const uint8_t helperTier = (asyncStrict || f.fromOp) ? uint8_t{1} : durabilityTier;
 
         // Op-ring produce (gateway-received, Task 13): its parked answer was not
         // covered by a poll budget — reserve it here BEFORE the append (G-A6, the
         // F15 S2 R-4c rule); no slot → retriable NotLeader, log untouched.
-        if (f.fromOp && (acksAll || asyncStrict) && !ackReservationAvailable_(0)) [[unlikely]] {
+        if (f.fromOp && (acksAll || asyncStrict) && !ackReservationAvailable_()) [[unlikely]] {
             ++acksAllRefusedNoReservation_;
-            if (!owedCapAllows_(0)) noteOwedCapThrottle_("gateway-routed produce");
+            if (!owedCapAllows_()) noteOwedCapThrottle_("gateway-routed produce");
+            if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
+                spdlog::warn("Worker {}: parked (acks=all / Strict) produce refused NotLeader — return-ring reservation "
+                             "exhausted (owed={}, total refused={})", workerId_, reservedAckSlots_(),
+                             acksAllRefusedNoReservation_);
+            // NotLeader: the only retriable "nothing was appended, retry" code
+            // the client protocol has without a protocol change (review m11).
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             enqueueReturn_(ret);
             return 1;
@@ -5244,10 +4895,15 @@ private:
             f.topicId, f.partition,
             f.producerId, f.producerEpoch, f.baseSequence,
             *log, psm_,
-            acksAll, isrSize, minIsr, asyncStrict ? uint8_t{1} : durabilityTier);
+            acksAll, isrSize, minIsr, helperTier,
+            /*crcPreverified=*/f.fromOp);   // the gateway validated the routed batch's CRC
 
         ret.baseOffset  = outcome.baseOffset;
-        ret.lastOffset  = outcome.lastOffset;
+        // A duplicate carries its ORIGINAL range (handleProduceBatch reports
+        // only the original base): its answer waits on that range (below).
+        ret.lastOffset  = outcome.isDuplicate
+            ? outcome.baseOffset + static_cast<int64_t>(outcome.recordCount) - 1
+            : outcome.lastOffset;
         ret.recordCount = outcome.recordCount;
         ret.batchAttrs  = outcome.batchAttrs;
 
@@ -5272,14 +4928,19 @@ private:
         if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]]
             rc->onTxnBatch(f.producerId, outcome.baseOffset);
 
+        // F15 S5 (Kafka parity; re-review 1 I1 residual, re-review 2): a
+        // DUPLICATE is answered only under its original batch's ack condition —
+        // Strict: after an fsync covering it; acks=all: when the HW passes it
+        // with the §3.2 re-validation — exactly like a fresh batch, never "OK at
+        // once" for data that is not durable / not on the ISR yet.  (Kafka
+        // DelayedProduce waits on the duplicate's original offsets too.)
+        const int64_t lastOff = ret.lastOffset;
+
         if (asyncStrict) {
             // Park on the coalesced fsync (submitCoalescedFlushes_ stamps the token
             // this pass).  A duplicate retry is parked too: its original may still
             // be awaiting its own fsync, and a Strict ack is never sent before the
             // data it acknowledges is durable.
-            const int64_t lastOff = outcome.isDuplicate
-                ? outcome.baseOffset + static_cast<int64_t>(outcome.recordCount) - 1
-                : outcome.lastOffset;
             ret.errorCode = 0;
             DurablePending dp;
             dp.token       = kNoToken;
@@ -5289,7 +4950,7 @@ private:
             dp.thenAwaitHw = acksAll ? replica : nullptr;
             dp.deadlineNs  = nowNs + ackTimeoutNs_;
             dp.replica     = replica;
-            dp.logGen      = replica->logGeneration();
+            dp.logGen      = replica ? replica->logGeneration() : 0;
             dp.minIsr      = minIsr;
             durablePending_.push_back(std::move(dp));
             if (std::find(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), log) == dirtyThisCycle_.end())
@@ -5297,14 +4958,15 @@ private:
             return 1;
         }
 
-        if (!acksAll || outcome.isDuplicate) {
-            // acks=leader / duplicate: ack immediately.
+        if (!acksAll) {
+            // acks=leader (its original was answered on append — a duplicate's
+            // condition holds already): ack immediately.
             ret.errorCode = 0;
             enqueueReturn_(ret);
             return 1;
         }
 
-        // acks=all (non-duplicate): register a pending ack; fire when HW passes.
+        // acks=all (fresh or duplicate): register a pending ack; fire when HW passes.
         // Timeout: nowNs + ackTimeoutNs_ (generous — accounts for fetch-handling
         // latency added by E5.1.2c, where fetch waits a worker cycle).
         // Keyed by (partition<<24)|offset (see ReplPendingAckFire).
@@ -5313,7 +4975,7 @@ private:
                 (static_cast<uint32_t>(outcome.lastOffset) & 0xFFFFFFu));
         PendingAcksAll pending;
         pending.replica    = replica;
-        pending.lastOffset = outcome.lastOffset;
+        pending.lastOffset = lastOff;
         pending.deadlineNs = nowNs + ackTimeoutNs_;
         pending.logGen     = replica->logGeneration();
         pending.minIsr     = minIsr;

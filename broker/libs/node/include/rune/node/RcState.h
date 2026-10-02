@@ -61,6 +61,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
+#include <rune/storage/ProducerStateManager.h>
 #include <rune/transaction/ReadCommittedView.h>
 
 #include <spdlog/spdlog.h>
@@ -164,6 +165,17 @@ public:
         residency_.reserve(static_cast<std::size_t>(kDefaultScanBytesPerPass) / 4096 + 2);
     }
     void setResidencyProbe(RcResidencyProbe fn, void* ctx) noexcept { probeFn_ = fn; probeCtx_ = ctx; }
+    /// F15 S5 (§2.5, I3): the owning worker's producer state for THIS partition.
+    /// The build feeds it from the same pass (RcBuilder::step): data batches as
+    /// sequences, control batches as epoch raises (no sequence).  It is cleared
+    /// for the partition on every Unbuilt → Scanning edge, so after a truncation,
+    /// a reconcile append or a follower period it holds exactly the surviving
+    /// log — and producerId >= 0 batches are refused until Ready (the produce
+    /// gate), so nothing updates it concurrently except a marker's fence, which
+    /// only ever raises an epoch.  Cold (ownership apply).
+    void bindProducerState(rune::storage::ProducerStateManager* psm, int32_t topicId, int32_t partition) noexcept {
+        psm_ = psm; psmTopic_ = topicId; psmPartition_ = partition;
+    }
     /// The read-ahead issuer (nullptr = synchronous MADV_WILLNEED).
     void setReadAhead(RcReadAhead fn, void* ctx) noexcept { readAheadFn_ = fn; readAheadCtx_ = ctx; }
     /// The async hint issued for this partition completed (its CQE was reaped).
@@ -232,6 +244,9 @@ public:
                 st_ = Ready{f.epoch, f.logGeneration, f.leadershipGeneration};
                 return 0;
             }
+            // F15 S5 (I3): the producer state is rebuilt from the log by this
+            // scan — never kept from an earlier leadership or log generation.
+            if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
             Scanning sc;
             sc.cursor = sc.segBase = log->logStartOffset();
             sc.target = log->logEndOffset();
@@ -453,12 +468,32 @@ private:
                 const auto out = builder.step(p + pos, len);
                 if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                     haltInvariant_("RcBuilder refused a whole batch inside the log's written bytes");
+                if (psm_ != nullptr) feedProducerState_(r, out.outcome);
                 s.cursor = last + 1;
             }
             pos += len;
         }
         s.bytePos += pos;
         return pos;
+    }
+    // F15 S5 (§2.5, I3): the producer-state half of one build step — the same
+    // classification RcBuilder made.  A REAL control batch is an epoch raise
+    // (no sequence); an idempotent / transactional data batch records its
+    // sequence range (an epoch older than an applied fence is ignored by the
+    // PSM).  A CONTROL-flagged batch that is not a valid marker is ignored.
+    void feedProducerState_(const rune::protocol::RecordBatchReader& r, rune::transaction::RcBuilder::Outcome o) {
+        using O = rune::transaction::RcBuilder::Outcome;
+        const int64_t pid = r.producerId();
+        if (pid < 0) return;
+        if (o == O::CommitMarker || o == O::AbortMarker) {
+            psm_->fenceEpoch(psmTopic_, pid, psmPartition_, r.producerEpoch());
+            return;
+        }
+        if ((r.attributes() & rune::protocol::batch::kAttrControl) != 0) return;
+        const int32_t baseSeq = r.baseSequence();
+        if (baseSeq < 0) return;
+        psm_->update(psmTopic_, pid, psmPartition_, r.producerEpoch(), baseSeq, baseSeq + r.lastOffsetDelta(),
+                     r.baseOffset());
     }
     void finish_(const Scanning& s) {
         // The tail lies wholly at or above target: replaying it after the scan
@@ -483,6 +518,9 @@ private:
     void*            readAheadCtx_ = nullptr;
     bool             hintInFlight_ = false;   ///< survives reset_(): the kernel still owns the hint
     StepProfile*     profile_      = nullptr;
+    rune::storage::ProducerStateManager* psm_ = nullptr;   ///< F15 S5: the worker's psm_ (not owned)
+    int32_t          psmTopic_     = 0;
+    int32_t          psmPartition_ = 0;
     uint64_t    readAheadRequests_        = 0;
     uint64_t    readAheadSkippedInFlight_ = 0;
     uint64_t    readAheadSkippedByIssuer_ = 0;

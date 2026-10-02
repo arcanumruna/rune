@@ -3211,4 +3211,48 @@ TEST(TxnCoordEosDurabilityTest, AbortDiscardsPendingOffsetsEvenAcrossRecovery)
         << "aborted txn offsets must NEVER be applied to the OffsetStore";
 }
 
+// X-1 (broker contract gap from client F8 C4+C5 re-review 2): AddOffsetsToTxn
+// opens a transaction from Empty / Complete* exactly like AddPartitionsToTxn
+// (Kafka).  The client sends it as soon as sendOffsetsToTransaction is applied —
+// often BEFORE any AddPartitions — and an offsets-only txn never sends one.
+TEST(TxnAddOffsetsRegression, AddOffsetsOpensTheTxnAndItsOffsetsApplyOnCommit) {
+    std::vector<std::pair<std::string, rune::coordination::Offset>> applied;
+    auto cb = [&](const std::string& g, const rune::coordination::TopicPartition&,
+                  rune::coordination::Offset off, int64_t) { applied.emplace_back(g, off); };
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, nullptr, /*coordinatorEpoch=*/0, cb);
+    for (int round = 0; round < 2; ++round) {                 // from Empty, then from the resting CompleteCommit
+        auto r = coord.initProducerId("off-only", 60'000, 0LL);
+        ASSERT_TRUE(r.ok());
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> none;
+        // TxnOffsetCommit (no begin) needs an Ongoing txn.
+        std::map<rune::coordination::TopicPartition, rune::coordination::Offset> offs;
+        rune::coordination::TopicPartition in; in.topic = "in"; in.partition = 0;
+        offs[in] = 40 + round;
+        EXPECT_EQ(coord.addOffsetsToTxn("off-only", r.producerId, r.producerEpoch, "g", offs, 10LL).errorCode,
+                  AddPartitionsResult::kInvalidTransition) << "round " << round;
+        // AddOffsetsToTxn opens it.
+        ASSERT_TRUE(coord.addOffsetsToTxn("off-only", r.producerId, r.producerEpoch, "g", none, 10LL,
+                                          /*beginsTxn=*/true).ok()) << "round " << round;
+        EXPECT_EQ(coord.state("off-only"), TxnState::Ongoing);
+        ASSERT_TRUE(coord.addOffsetsToTxn("off-only", r.producerId, r.producerEpoch, "g", offs, 11LL).ok());
+        ASSERT_TRUE(coord.endTransaction("off-only", r.producerId, r.producerEpoch, /*commit=*/true, 12LL).ok());
+        ASSERT_TRUE(coord.completeTransaction("off-only").ok());
+        EXPECT_EQ(coord.state("off-only"), TxnState::CompleteCommit);
+        ASSERT_EQ(applied.size(), static_cast<std::size_t>(round + 1));
+        EXPECT_EQ(applied.back().second, 40 + round) << "the offsets-only txn's offsets were not applied on commit";
+    }
+}
+
+TEST(TxnAddOffsetsRegression, AddOffsetsInPrepareIsRefusedNotReopened) {
+    TransactionCoordinator coord(ProducerIdAllocator{}, 60'000, nullptr, 0);
+    auto r = coord.initProducerId("prep", 60'000, 0LL);
+    ASSERT_TRUE(r.ok());
+    ASSERT_TRUE(coord.addPartitions("prep", r.producerId, r.producerEpoch, tps({tp("out", 0)}), 1LL).ok());
+    ASSERT_TRUE(coord.endTransaction("prep", r.producerId, r.producerEpoch, true, 2LL).ok());
+    std::map<rune::coordination::TopicPartition, rune::coordination::Offset> none;
+    EXPECT_EQ(coord.addOffsetsToTxn("prep", r.producerId, r.producerEpoch, "g", none, 3LL, true).errorCode,
+              AddPartitionsResult::kInvalidTransition);
+    EXPECT_EQ(coord.state("prep"), TxnState::PrepareCommit) << "AddOffsets must never reopen a preparing txn";
+}
+
 } // anonymous namespace

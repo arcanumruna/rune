@@ -115,6 +115,9 @@ struct ProduceOutcome {
 // @param isrSize       Current ISR size for this partition (0 if no replica wired).
 // @param minIsr        Minimum ISR required for acks=All durability.
 // @param durabilityTier 1 = Majority (appendNoSync + group-commit); 2 = Strict (sync).
+// @param crcPreverified true when the caller (the gateway, for a gateway-routed
+//                      produce the worker executes) already validated this
+//                      exact batch's CRC32C — skip the second pass over it.
 //
 // Returns a ProduceOutcome; caller handles egress, LSO tracking, dirty-log tracking,
 // onLeaderLogAppended(), and deferred-ack queue.
@@ -135,7 +138,8 @@ ProduceOutcome handleProduceBatch(
     bool                              acksAll,
     int                               isrSize,
     int                               minIsr,
-    uint8_t                           durabilityTier) noexcept;
+    uint8_t                           durabilityTier,
+    bool                              crcPreverified = false) noexcept;
 
 } // namespace rune::storage
 

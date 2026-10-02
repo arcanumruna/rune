@@ -203,6 +203,11 @@ void ProducerStateManager::update(int32_t topicId,
 {
     ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
 
+    // F15 S5: a replayed batch older than an already-applied fence (or a
+    // later epoch) never re-enters the window — it would make a new session's
+    // sequence look like a duplicate of zombie data.
+    if (producerEpoch < e.producerEpoch) return;
+
     if (producerEpoch > e.producerEpoch) {
         // New epoch: clear retry window + reset sequence state.
         e.producerEpoch = producerEpoch;
@@ -219,6 +224,32 @@ void ProducerStateManager::update(int32_t topicId,
     if (e.windowCount < kRetryWindowSize) ++e.windowCount;
 
     e.lastSequence = lastSequence;
+}
+
+// ---------------------------------------------------------------------------
+// fenceEpoch — F15 S5 (C1+, I3): raise only
+// ---------------------------------------------------------------------------
+void ProducerStateManager::fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition,
+                                      int16_t producerEpoch)
+{
+    if (producerId < 0 || producerEpoch < 0) return;
+    ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
+    if (producerEpoch <= e.producerEpoch) return;
+    e.producerEpoch = producerEpoch;
+    e.lastSequence  = -1;
+    e.windowHead    = 0;
+    e.windowCount   = 0;
+    e.window        = {};
+}
+
+// ---------------------------------------------------------------------------
+// clearPartition — F15 S5 (I3): before a rebuild of (topicId, partition)
+// ---------------------------------------------------------------------------
+void ProducerStateManager::clearPartition(int32_t topicId, int32_t partition)
+{
+    std::erase_if(map_, [&](const auto& kv) noexcept {
+        return kv.first.topicId == topicId && kv.first.partition == partition;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -431,8 +462,8 @@ int ProducerStateManager::recover(const std::string& path)
 //     the real produce sequence.
 //
 // Non-idempotent batches (producerId == -1) are silently skipped.
-// Control batches are also skipped (their producerId is set but baseSequence
-// is typically -1 — the PSM only tracks data batches).
+// Control batches are applied as epoch raises (fenceEpoch, F15 S5 / I3) —
+// never as sequences.
 //
 // TX-2b: highWatermark MUST be the committed HW (replica->highWatermark()),
 // not the log-end-offset (LEO).  Batches above HW may be truncated by KIP-101
@@ -546,10 +577,9 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
             const int32_t lastDelta = reader.lastOffsetDelta();
             const int64_t batchEnd  = batchBase + lastDelta + 1;
 
-            // Skip control batches (COMMIT/ABORT markers) — they are tagged
-            // with the CONTROL attribute bit; their baseSequence is meaningless
-            // for idempotent-producer dedup (and is typically -1 when built by
-            // ControlMarker::build which doesn't stamp a sequence).
+            // Control batches (COMMIT/ABORT markers) carry the CONTROL
+            // attribute bit; their baseSequence is meaningless for dedup — they
+            // are applied as epoch raises only (below).
             const bool isControl =
                 (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
 
@@ -570,7 +600,13 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
             //   producerId >= 0 — idempotent producer
             //   baseSequence >= 0 — valid sequence (non-idempotent default is -1)
             //   not a control batch
-            if (!isControl && pid >= 0 && baseSeq >= 0) {
+            // F15 S5 (I3): a control batch (COMMIT / ABORT marker) is applied
+            // as an epoch raise with no sequence — the durable form of the
+            // marker's fence, so an old-epoch zombie is refused on a rebuilt
+            // (e.g. newly elected) leader too.
+            if (isControl && pid >= 0) {
+                fenceEpoch(topicId, pid, partition, epoch);
+            } else if (!isControl && pid >= 0 && baseSeq >= 0) {
                 // lastSequence = baseSequence + lastOffsetDelta
                 // (for a multi-record batch, lastOffsetDelta == recordCount - 1,
                 //  matching how handleProduce computes lastSeqInBatch).

@@ -189,6 +189,9 @@ public:
     // update — called AFTER a successful append.
     //
     // Advances lastSequence and records the batch in the retry window.
+    // F15 S5: a batch of an epoch OLDER than the tracked one is ignored (it can
+    // only come from a log replay that already applied a later control-batch
+    // fence — the live path never updates with a fenced epoch).
     // -----------------------------------------------------------------------
     void update(int32_t topicId,
                 int64_t producerId,
@@ -197,6 +200,24 @@ public:
                 int32_t baseSequence,
                 int32_t lastSequence,
                 int64_t baseOffset);
+
+    // -----------------------------------------------------------------------
+    // fenceEpoch — F15 S5 (C1+, I3): a COMMIT/ABORT control batch of `producerId`
+    // at `producerEpoch` raises the partition producer epoch (raise only, no
+    // sequence: a higher epoch resets the sequence window, an equal or lower
+    // one changes nothing).  A later batch of an older epoch is then fenced
+    // (InvalidProducerEpoch).  Applied on receipt of the marker op and, as the
+    // durable form, for every control batch the producer-state rebuild sees.
+    // Cold (a marker per transaction per partition): may allocate the entry.
+    // -----------------------------------------------------------------------
+    void fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition, int16_t producerEpoch);
+
+    // -----------------------------------------------------------------------
+    // clearPartition — F15 S5 (I3): drop every entry of (topicId, partition)
+    // before its producer state is rebuilt from the log (the owning worker's
+    // RC build).  Cold: O(entries).
+    // -----------------------------------------------------------------------
+    void clearPartition(int32_t topicId, int32_t partition);
 
     // -----------------------------------------------------------------------
     // Snapshot + recover (crash-safe, fsync'd).

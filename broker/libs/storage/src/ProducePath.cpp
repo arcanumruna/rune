@@ -38,7 +38,8 @@ ProduceOutcome handleProduceBatch(
     bool                              acksAll,
     int                               isrSize,
     int                               minIsr,
-    uint8_t                           durabilityTier) noexcept
+    uint8_t                           durabilityTier,
+    bool                              crcPreverified) noexcept
 {
     ProduceOutcome out;
 
@@ -128,7 +129,9 @@ ProduceOutcome handleProduceBatch(
     //    The restamp above did NOT invalidate the CRC (base-offset precedes the
     //    CRC-covered region that starts at kAttributesOffset=21).
     // -------------------------------------------------------------------------
-    {
+    // F15 S5: a gateway-routed produce was CRC-validated by the gateway on the
+    // same bytes (copied once into the op ring) — the worker skips the repeat.
+    if (!crcPreverified) {
         rune::protocol::RecordBatchReader reader(batch, batchLen);
         if (!reader.ensureValid()) {
             spdlog::warn("ProducePath: CRC mismatch (corrupt batch) → rejected");

@@ -110,18 +110,15 @@ std::vector<uint8_t> produceFrame(int64_t corr, const std::vector<uint8_t>& batc
     msg.encode(frame.data());
     return frame;
 }
-// Produce ANSWERS only.  F15 S2 fix round 1: a parked gateway-routed produce
-// also emits an append-time facts-only ProduceResult (deferAck == true, TEMPORARY
-// until S4/S5) — gateway-mirror bookkeeping, not an answer to the client.
+// Produce answers (F15 S5: every ProduceResult is an answer — the S2
+// append-time facts-only return is deleted; one is a failure).
 struct Acks {
     int n = 0;
-    int facts = 0;
     std::vector<WorkerReturn> rets;
     int drain(Worker& w) {
         return static_cast<int>(w.drainReturn([&](WorkerReturn r) {
             if (r.type != WorkerReturn::Type::ProduceResult) return;
-            if (r.deferAck && r.errorCode == 0) { ++facts; return; }
-            if (r.deferAck) ADD_FAILURE() << "an error result carries deferAck (would be swallowed as facts-only)";
+            if (r.deferAck) ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
             ++n; rets.push_back(r);
         }));
     }
@@ -260,16 +257,14 @@ TEST(ShardNonBlockingRegression, BackgroundFlushCompletionNeverFiresProduceAck) 
     ASSERT_NE(t1, t2);
     Acks a;
     a.drain(w);
-    EXPECT_EQ(a.facts, 0) << "a gateway-routed Strict produce's facts wait for its fsync";
+    EXPECT_EQ(a.n, 0) << "a gateway-routed Strict produce's answer waits for its fsync";
     w.deliverCompletionForTest(FlushCompletion{t2, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 0) << "a background flush token must never fire a produce ack";
-    EXPECT_EQ(a.facts, 0) << "nor release the produce's facts";
     EXPECT_EQ(w.bgFlushInFlightForTest(), 0u) << "the background token is retired by routing";
     w.deliverCompletionForTest(FlushCompletion{t1, 0, log.flushBoundary()});
     a.drain(w);
     EXPECT_EQ(a.n, 1);
-    EXPECT_EQ(a.facts, 1) << "the produce's own fsync completion emits its facts";
     EXPECT_EQ(w.durableAckTokenForTest(), t1);
     // The real completions for T1 and T2 arrive later through io_.reap: wait for
     // exactly those two (condition, capped) and prove neither fires anything.
@@ -1680,10 +1675,9 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         ASSERT_EQ(w.reservedAckSlotsForTest(), 1) << "precondition: parked on the owning worker";
         std::vector<WorkerReturn> rets;
         w.drainReturn([&](WorkerReturn r) {
-            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
-            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
+            if (r.type == WorkerReturn::Type::ProduceResult) rets.push_back(std::move(r));
         });
-        ASSERT_TRUE(rets.empty()) << "only the append-time facts-only return before the move";
+        ASSERT_TRUE(rets.empty()) << "nothing answered before the move (F15 S5: no facts-only return)";
         R.reg.remove(5, 0);
         PartitionReplica* again = recreate ? R.add(5, 0) : nullptr;
         WorkerOp own;
@@ -1694,10 +1688,10 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u) << "freed";
         w.doWork(3);                                          // no read of the freed replica
         w.drainReturn([&](WorkerReturn r) {
-            // answers only (skip OwnershipAck and the append-time facts-only return)
+            // answers only (skip OwnershipAck)
             if (r.type != WorkerReturn::Type::ProduceResult) return;
-            if (r.deferAck && r.errorCode != 0) ADD_FAILURE() << "an error result carries deferAck";
-            if (!(r.deferAck && r.errorCode == 0)) rets.push_back(std::move(r));
+            if (r.deferAck) ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
+            rets.push_back(std::move(r));
         });
         EXPECT_EQ(w.reservedAckSlotsForTest(), 0);
         ASSERT_EQ(rets.size(), 1u) << "recreate=" << recreate;

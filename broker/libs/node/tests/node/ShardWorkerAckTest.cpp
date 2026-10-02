@@ -2,9 +2,9 @@
 // publication (REAL invoker driver, aeron:ipc), notifies the runtime after the ack,
 // and fails parked acks=all promptly on demotion.
 //
-// F15 reconciliation: the post-ack notification is the existing facts-only
-// ProduceResult (deferAck == true: PSM-mirror facts + session liveness, never an
-// answer) — WorkerReturn PRODUCE_NOTIFY(2) was retired by F15 §7 (RESERVED_2).
+// F15 reconciliation: the post-ack notification is a ProduceResult with
+// deferAck == true (session liveness only — F15 S5 removed its PSM facts; never
+// an answer) — WorkerReturn PRODUCE_NOTIFY(2) was retired by F15 §7 (RESERVED_2).
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -213,7 +213,7 @@ TEST(ShardWorkerAckRegression, AcksDirectlyOnTheSessionPublicationNotTheReturnRi
         if (r.deferAck) ++notifies; else ++answers;
     });
     EXPECT_EQ(answers, 0) << "shard mode: the runtime never relays produce acks";
-    EXPECT_EQ(notifies, 1) << "one post-ack notification per ack (facts + session liveness)";
+    EXPECT_EQ(notifies, 1) << "one post-ack notification per ack (session liveness)";
 }
 
 TEST(ShardWorkerAckRegression, DemotedLeaderFiresNotLeaderPromptly) {
@@ -239,7 +239,8 @@ TEST(ShardWorkerAckRegression, ProduceNotifyFollowsTheAckOnTheReturnRing) {
     });
     EXPECT_EQ(answers, 0);
     EXPECT_EQ(notifies, 1);
-    EXPECT_EQ(pid, 11) << "the notification carries the PSM facts of the acked append";
+    EXPECT_EQ(pid, -1) << "F15 S5: the notification carries no producer-state facts (the worker psm_ is the sole "
+                          "authority; the runtime has no mirror to feed)";
     EXPECT_EQ(sid, 5) << "and the session (runtime liveness)";
     EXPECT_EQ(err, 0) << "a notification is never an answer (facts-only invariant)";
 }
@@ -254,7 +255,7 @@ TEST(ShardWorkerAckRegression, ErrorAckNotifiesLivenessWithoutFacts) {
         if (r.type == WorkerReturn::Type::ProduceResult && r.deferAck) { ++notifies; pid = r.producerId; }
     });
     EXPECT_EQ(notifies, 1);
-    EXPECT_EQ(pid, -1) << "an error carries no facts — the mirror must never learn a refused batch";
+    EXPECT_EQ(pid, -1) << "a notification never carries producer-state facts";
 }
 
 TEST(ShardWorkerAckRegression, GatewayRoutedProduceIsDedupedByTheWorkerPsm) {

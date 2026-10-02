@@ -1234,3 +1234,86 @@ TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
     }
     node.stop();
 }
+
+// ===========================================================================
+// F15 S5 (§2.5, I6) — END TO END over real Aeron UDP: the owning worker's psm_
+// is the sole producer-state authority in the DEFAULT (Legacy) config and in
+// shard mode under BOTH runtime placements.  An idempotent producer's retry of
+// an appended batch is deduped whichever route it takes (gateway-routed op, or
+// the shard's own ingress): one copy, answered with the original offset; the
+// next sequence is accepted.  (Idempotent produces are refused NotLeader —
+// retriable — until the new leader's producer state is built.)
+// ===========================================================================
+namespace {
+std::vector<uint8_t> idempotentBatch(int64_t pid, int16_t epoch, int32_t seq) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+    b.append("k", "idem", 1000);
+    return b.build();
+}
+enum class PsmE2eMode { Legacy, ShardThread, ShardFused };
+void runWorkerPsmDedupEndToEnd(PsmE2eMode mode) {
+    TmpDir dir{"psm"}, cdir{"psmc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const NodeConfig cfg = mode == PsmE2eMode::Legacy
+        ? makeDefaultConfig(0, dir.path, ports, 1)
+        : makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/mode == PsmE2eMode::ShardFused);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    constexpr int64_t kPid = 4242;
+    {
+        ShardTestClient c(cdir.path);
+        const std::string gw = gatewayChannel(ports, 0);
+        const int64_t sid = c.connect(gw, kClientStream);
+        ASSERT_GT(sid, 0);
+        // One idempotent produce; NotLeader (bootstrap / producer state still
+        // building) is retried — bounded, progress-driven, no sleep.
+        auto send = [&](const std::string& ch, int32_t seq) -> std::optional<pc::ProduceResponse> {
+            const auto batch = idempotentBatch(kPid, 0, seq);
+            for (int a = 0; a < 200; ++a) {
+                const int64_t corr = c.nextCorrelationId();
+                if (!c.produceIdempotent(ch, kClientStream, sid, corr, 0, 0, /*acks=all*/1, kPid, 0, seq, batch))
+                    continue;
+                auto ack = c.awaitProduceResponse(corr);
+                if (ack && ack->errorCode == static_cast<int16_t>(pc::ErrorCode::NotLeader)) continue;
+                return ack;
+            }
+            return std::nullopt;
+        };
+        auto first = send(gw, 0);
+        ASSERT_TRUE(first.has_value());
+        ASSERT_EQ(first->errorCode, 0);
+        EXPECT_EQ(first->baseOffset, 0);
+        auto retryGw = send(gw, 0);                            // gateway-routed retry
+        ASSERT_TRUE(retryGw.has_value());
+        EXPECT_EQ(retryGw->errorCode, 0);
+        EXPECT_EQ(retryGw->baseOffset, 0) << "the gateway-routed retry was not deduped by the worker";
+        std::string next = gw;
+        if (mode != PsmE2eMode::Legacy) {
+            const std::string ing = workerIngressChannel(ports, 0, 0);
+            auto retryIng = send(ing, 0);                      // the shard's own ingress
+            ASSERT_TRUE(retryIng.has_value());
+            EXPECT_EQ(retryIng->errorCode, 0);
+            EXPECT_EQ(retryIng->baseOffset, 0) << "the shard-ingress retry was not deduped";
+            next = ing;
+        }
+        auto second = send(next, 1);
+        ASSERT_TRUE(second.has_value());
+        EXPECT_EQ(second->errorCode, 0) << "seq 1 refused (20 = OutOfOrderSequence)";
+        EXPECT_EQ(second->baseOffset, 1);
+    }
+    node.stop();
+    EXPECT_EQ(logEndOffsetAfterStop(dir.path), 2) << "a retried idempotent batch was appended twice";
+}
+} // namespace
+
+TEST(WorkerPsmEndToEndRegression, DefaultLegacyConfigDedupsOnTheOwningWorker) {
+    runWorkerPsmDedupEndToEnd(PsmE2eMode::Legacy);
+}
+TEST(WorkerPsmEndToEndRegression, ShardThreadPlacementDedupsOnTheOwningWorker) {
+    runWorkerPsmDedupEndToEnd(PsmE2eMode::ShardThread);
+}
+TEST(WorkerPsmEndToEndRegression, ShardFusedPlacementDedupsOnTheOwningWorker) {
+    runWorkerPsmDedupEndToEnd(PsmE2eMode::ShardFused);
+}

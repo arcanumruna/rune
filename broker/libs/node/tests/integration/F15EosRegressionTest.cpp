@@ -1314,11 +1314,12 @@ TEST(LegacyAcksAllRegression, HeldWhileIsrBelowMinIsrAtFire) {
 }
 
 // ============================================================================
-// F15 S2 fix round 1 (review C1, controller ruling Option 1): in the default
-// config the gateway's PSM / LSO / dirty-log mirrors still exist until S4/S5,
-// so the OWNING worker must hand them the append facts AT APPEND (a facts-only
-// return), never only with the final ack — which arrives a replication RTT
-// later, or as an error that carries no facts.
+// F15 S2 fix round 1 (review C1, controller ruling Option 1) — guards kept
+// through S4 / S5: in the default config an idempotent / transactional acks=all
+// produce must be validated and registered AT APPEND, never only with the
+// final ack (which arrives a replication RTT later, or as an error).  Since S5
+// the owning worker's psm_ does it in the append's own invocation (the S2
+// temporary facts-only return and the gateway mirrors are deleted).
 // ============================================================================
 namespace {
 std::vector<uint8_t> idemBatch(int64_t pid, int16_t epoch, int32_t seq, bool txn = false) {
@@ -1367,6 +1368,11 @@ TEST(LegacyAcksAllRegression, RetryAfterAckTimeoutIsDeduped) {
     produceIdem(R, 2, 7, 0);                                  // the client's retry
     for (int i = 0; i < 4; ++i) R.runWorker();
     EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the retry of an appended batch was appended again";
+    // F15 S5 (Kafka parity, addendum): the duplicate is answered only under its
+    // original's ack condition — once the HW passes the original.
+    EXPECT_EQ(R.answers.size(), 1u) << "the duplicate was answered before its original reached the HW";
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.size() < 2; ++i) R.runWorker();
     ASSERT_EQ(R.answers.size(), 2u);
     EXPECT_EQ(R.answers[1].code, 0) << "a duplicate is answered OK";
     EXPECT_EQ(R.answers[1].base, 0) << "with the ORIGINAL offset";
@@ -1458,11 +1464,9 @@ TEST(TxnRoleGateRegression, NoOpEpochTruncationKeepsLogGeneration) {
 }
 
 // ============================================================================
-// F15 S2 fix round 2 (re-review 1).  B1: an ERROR result must never be taken
-// for the append-time facts-only return — the client must be answered and the
-// gateway mirrors (PSM / LSO) must never record a batch that was not appended.
-// Strict ruling: Strict facts are applied at fsync completion, never at
-// append — a retry after a failed fsync must not be answered duplicate-OK.
+// F15 S2 fix round 2 (re-review 1) — guards kept through S5.  B1: an ERROR
+// result is always answered and its batch is never recorded (PSM / LSO).
+// Strict ruling: a retry after a failed fsync is never answered duplicate-OK.
 // ============================================================================
 namespace {
 // Replace the worker's owned set (as a SetOwnership op from the runtime would).
@@ -1484,7 +1488,7 @@ TEST(LegacyAcksAllRegression, NotOwnedRefusalIsAnsweredAndNeverRecorded) {
     produceIdem(R, 1, 7, 0);
     for (int i = 0; i < 4; ++i) R.runWorker();
     EXPECT_EQ(R.r->log()->logEndOffset(), 0);
-    ASSERT_EQ(R.answers.size(), 1u) << "the not-owned refusal was swallowed as a facts-only return";
+    ASSERT_EQ(R.answers.size(), 1u) << "the not-owned refusal was never answered";
     EXPECT_EQ(R.answers[0].code, kNotLeader);
     setWorkerOwns(R, {R.r});
     produceIdem(R, 2, 7, 0);                                  // the client's retry
@@ -1513,7 +1517,7 @@ TEST(LegacyAcksAllRegression, SchemaRejectIsAnsweredAndNeverRecorded) {
     produceIdem(R, 1, 7, 0, /*txn=*/true);                    // value "idem" is not a valid record
     for (int i = 0; i < 4; ++i) R.runWorker();
     EXPECT_EQ(R.r->log()->logEndOffset(), 0);
-    ASSERT_EQ(R.answers.size(), 1u) << "the schema reject was swallowed as a facts-only return";
+    ASSERT_EQ(R.answers.size(), 1u) << "the schema reject was never answered";
     EXPECT_EQ(R.answers[0].code, kSchemaFailed);
     EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "a rejected txn batch was registered as open (LSO pinned)";
     produceIdem(R, 2, 7, 0, /*txn=*/true);                    // retry
@@ -1525,8 +1529,7 @@ TEST(LegacyAcksAllRegression, SchemaRejectIsAnsweredAndNeverRecorded) {
 
 TEST(LegacyAcksAllRegression, StrictRetryAfterFsyncFailureIsNotDuplicateOk) {
     // Strict acks=all whose fsync FAILS: the batch is not durable.  A retry must
-    // never be answered duplicate-OK (Strict facts are applied at fsync
-    // completion, not at append).
+    // never be answered duplicate-OK (fsyncgate: the failed log refuses it).
     LegacyAcksRig R({1, 2}, /*tier=*/2);
     R.w().forceFlushErrorForTest(EIO);
     produceIdem(R, 1, 7, 0);
@@ -1540,9 +1543,9 @@ TEST(LegacyAcksAllRegression, StrictRetryAfterFsyncFailureIsNotDuplicateOk) {
 }
 
 TEST(LegacyAcksAllRegression, StrictAcksAllDedupsAfterFsync) {
-    // Strict acks=all success path: once the fsync completed, the facts are
-    // applied — a retry is a duplicate (one copy, original offset) and the next
-    // sequence is accepted (not OutOfOrderSequence) while the ack waits on the HW.
+    // Strict acks=all success path: a retry is a duplicate (one copy, original
+    // offset) and the next sequence is accepted (not OutOfOrderSequence) while
+    // the acks wait on the HW.
     LegacyAcksRig R({1, 2}, /*tier=*/2);
     produceIdem(R, 1, 7, 0);
     R.runWorker();
@@ -1551,15 +1554,24 @@ TEST(LegacyAcksAllRegression, StrictAcksAllDedupsAfterFsync) {
     ASSERT_EQ(R.w().reservedAckSlotsForTest(), 1) << "precondition: fsynced, parked on the HW";
     ASSERT_TRUE(R.answers.empty());
     produceIdem(R, 2, 7, 0);                                  // retry of seq 0
+    for (int i = 0; i < kCap && R.w().durablePendingCountForTest() > 0; ++i) { R.runWorker(); std::this_thread::yield(); }
     R.runWorker();
-    ASSERT_EQ(R.answers.size(), 1u);
-    EXPECT_EQ(R.answers[0].code, 0);
-    EXPECT_EQ(R.answers[0].base, 0);
     EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "one copy";
+    // F15 S5 (Kafka parity, addendum): the duplicate waits for its original's
+    // ack condition (fsync, then the HW) — it is parked, not answered OK at once.
+    EXPECT_TRUE(R.answers.empty()) << "the duplicate was answered before its original reached the HW";
     produceIdem(R, 3, 7, 1);                                  // seq 1
+    for (int i = 0; i < kCap && R.w().durablePendingCountForTest() > 0; ++i) { R.runWorker(); std::this_thread::yield(); }
     R.runWorker();
-    EXPECT_EQ(R.answers.size(), 1u) << "seq 1 answered (OutOfOrderSequence?) instead of being parked";
+    EXPECT_TRUE(R.answers.empty()) << "seq 1 answered (OutOfOrderSequence?) instead of being parked";
     EXPECT_EQ(R.r->log()->logEndOffset(), 2);
+    R.followerFetch();
+    for (int i = 0; i < 8 && R.answers.size() < 3; ++i) R.runWorker();
+    ASSERT_EQ(R.answers.size(), 3u);
+    for (const auto& a : R.answers) EXPECT_EQ(a.code, 0);
+    EXPECT_EQ(R.answers[0].base, 0);
+    EXPECT_EQ(R.answers[1].base, 0) << "the duplicate is answered with the ORIGINAL offset";
+    EXPECT_EQ(R.answers[2].base, 1);
 }
 
 // ============================================================================
@@ -2041,9 +2053,12 @@ void followerCaughtUp(PartitionReplica& r, int64_t now) {
     rune::replication::FetchRequestMsg fr{r.epoch(), 0, 2, r.log()->logEndOffset(), 1 << 20, r.topicId()};
     (void)r.onFetchRequest(fr, now);
 }
-// Answers only (the S2 temporary facts-only return carries deferAck == true).
+// Every return is an answer (F15 S5: the facts-only return is deleted).
 void collectAnswers(Worker& w, std::vector<WorkerReturn>& out) {
-    w.drainReturn([&](WorkerReturn r) { if (!r.deferAck) out.push_back(std::move(r)); });
+    w.drainReturn([&](WorkerReturn r) {
+        EXPECT_FALSE(r.deferAck) << "a facts-only return (deleted by F15 S5) for " << r.correlationId;
+        out.push_back(std::move(r));
+    });
 }
 // Drain + run until `want` answers arrived (bounded passes; no sleeps).
 void drainUntil(Worker& w, std::vector<WorkerReturn>& out, std::size_t want, int64_t& now) {
@@ -2089,7 +2104,7 @@ TEST(ReturnOverflowRegression, LegacyFullRingNeverDropsProduceResult) {
     constexpr int kParked = 100;
     for (int i = 0; i < kParked; ++i) ASSERT_TRUE(w.tryEnqueueOp(acksAllOp(&rep, 10'000 + i)));
     w.doWork(++now);
-    collectAnswers(w, answers);   // facts-only returns drained; nothing answered yet
+    collectAnswers(w, answers);   // nothing answered yet
     ASSERT_TRUE(answers.empty());
     ASSERT_EQ(w.reservedAckSlotsForTest(), kParked) << "precondition: acks=all parked on the worker";
     constexpr int kFill = 600;
@@ -2312,10 +2327,12 @@ TEST(ReturnOverflowRegression, ShardIngressPollBudgetHonoursStaticBound) {
     EXPECT_EQ(w.ingressPollBudgetForTest(), 0) << "the poll budget ignores the static owed-return cap";
 }
 
-TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) {
-    // The S2 temporary facts-only return (acks=all: at append; Strict: at fsync
-    // completion) and the final answer share the ONE FIFO: through a full ring
-    // neither is dropped and, per produce, the facts arrive before the answer.
+TEST(ReturnOverflowRegression, ParkedAnswersThroughFullRingNeverDroppedAndInOrder) {
+    // F15 S5 retarget (the S2 temporary facts-only return is deleted): the
+    // parked answers (acks=all: on the HW; Strict acks=all: fsync, then the HW)
+    // and the immediate answers share the ONE FIFO — through a full ring none is
+    // dropped, none is a facts-only return, and the parked answers of the one
+    // partition leave in append order (order-preserving waiter removal).
     for (const uint8_t tier : {uint8_t{1}, uint8_t{2}}) {
         SCOPED_TRACE(tier == 2 ? "Strict acks=all" : "acks=all");
         TmpDir d;
@@ -2327,9 +2344,8 @@ TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) 
         int64_t now = 1;
         constexpr int kFill = 600, kParked = 60;
         // The parked produces are admitted first (their G-A6 reservation needs
-        // ring room); then acks=leader answers fill the ring, so the Strict
-        // facts (emitted at fsync completion) and every final answer are
-        // emitted into a FULL ring and must queue in the FIFO.
+        // ring room); then acks=leader answers fill the ring, so every parked
+        // answer is emitted into a FULL ring and must queue in the FIFO.
         w.setReapPausedForTest(true);
         for (int i = 0; i < kParked; ++i) {
             WorkerOp op = acksAllOp(&rep, 10'000 + i);
@@ -2337,30 +2353,26 @@ TEST(ReturnOverflowRegression, FactsOnlyReturnPrecedesItsAnswerThroughFullRing) 
             ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
         }
         w.doWork(++now);
-        ASSERT_EQ(w.reservedAckSlotsForTest(), tier == 2 ? 2 * kParked : kParked) << "precondition: all parked";
+        ASSERT_EQ(w.reservedAckSlotsForTest(), kParked) << "precondition: all parked (one owed answer each)";
         for (int i = 0; i < kFill; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, 1 + i)));
-        std::vector<std::pair<int64_t, bool>> seq;   // (correlationId, facts-only?)
+        std::vector<std::pair<int64_t, bool>> seq;   // (correlationId, deferAck?)
         auto drain = [&] { w.drainReturn([&](WorkerReturn r) { seq.emplace_back(r.correlationId, r.deferAck); }); };
         w.doWork(++now);                 // ring full of acks=leader answers
         w.setReapPausedForTest(false);
         EXPECT_GT(w.retFifoSizeForTest(), 0u) << "the ring is full: returns must queue in the FIFO";
-        // Strict: run until every fsync completed (facts emitted at completion).
         for (int i = 0; i < kCap && w.durablePendingCountForTest() > 0; ++i) { w.doWork(++now); std::this_thread::yield(); }
         followerCaughtUp(rep, now);
-        for (int i = 0; i < 4096 && seq.size() < static_cast<std::size_t>(kFill + 2 * kParked); ++i) { drain(); w.doWork(++now); }
+        for (int i = 0; i < 4096 && seq.size() < static_cast<std::size_t>(kFill + kParked); ++i) { drain(); w.doWork(++now); }
         drain();
-        ASSERT_EQ(seq.size(), static_cast<std::size_t>(kFill + 2 * kParked)) << "a facts-only return or an answer was dropped";
-        for (int i = 0; i < kParked; ++i) {
-            const int64_t corr = 10'000 + i;
-            std::ptrdiff_t facts = -1, answer = -1;
-            for (std::size_t k = 0; k < seq.size(); ++k) {
-                if (seq[k].first != corr) continue;
-                (seq[k].second ? facts : answer) = static_cast<std::ptrdiff_t>(k);
-            }
-            ASSERT_GE(facts, 0) << "facts dropped for " << corr;
-            ASSERT_GE(answer, 0) << "answer dropped for " << corr;
-            EXPECT_LT(facts, answer) << "the answer overtook its facts for " << corr;
+        ASSERT_EQ(seq.size(), static_cast<std::size_t>(kFill + kParked)) << "an answer was dropped (or a facts-only return emitted)";
+        int64_t lastParked = 0;
+        for (const auto& [corr, deferAck] : seq) {
+            EXPECT_FALSE(deferAck) << "a facts-only return for " << corr;
+            if (corr < 10'000) continue;
+            EXPECT_GT(corr, lastParked) << "parked answer " << corr << " overtook an earlier one";
+            lastParked = corr;
         }
+        EXPECT_EQ(lastParked, 10'000 + kParked - 1);
     }
 }
 

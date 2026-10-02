@@ -1097,8 +1097,6 @@ private:
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
-    /// F15 S2 (TEMPORARY until S4/S5): apply a worker append's gateway-mirror facts.
-    void applyProduceFacts_(const rune::node::WorkerReturn& ret);
     // Task 13 fix round 1: shard-mode session lifecycle helpers.
     /// Worker ack-table slots in use or about to be (I2): accepted sessions +
     /// closes not yet queued on every worker + pending connects whose
@@ -1642,6 +1640,12 @@ private:
     // No per-op heap allocation: ProducerStateManager::validate() is noexcept,
     // allocation-free; update() inserts into the internal unordered_map only on
     // the first Accept for a new (producerId, partition) pair.
+    //
+    // F15 S5 (§2.5, Q3/I6): ONLY for partitions this gateway appends to itself
+    // (no worker pool — unit rigs — or an internal partition in shard mode).
+    // A worker-owned partition's producer state lives in its OWNING worker's
+    // psm_ alone, in every mode: this map is never validated, updated or
+    // rebuilt for it.
     rune::storage::ProducerStateManager producerStateManager_;
 
     // TX-2b: Tracks previous-cycle leadership to detect Follower→Leader transitions.
