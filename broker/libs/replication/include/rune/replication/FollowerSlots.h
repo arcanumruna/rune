@@ -83,10 +83,8 @@ struct FollowerSlot {
     };
     OwedEpochAnswer owedEpoch{};
     // F27 R1: the follower's connection generation last seen on its fetch (0 =
-    // none yet in this leadership).
+    // never seen).  Survives resetLeadership(): it is a property of the link.
     uint32_t connGen = 0;
-    // F7 / R2 memo key: the view and the log identity the walk was built on.
-    // (Stored in OwedAnswer; see builtView/builtLen/builtInstallGen.)
 
     /// F27 R1: the link to this follower went down and came back: anything the
     /// transport accepted while it was down may be lost — forget every claim of
@@ -114,7 +112,8 @@ struct FollowerSlot {
         servedFetchOffset = -1; servedLeo = -1; servedTimeNs = 0;
         askOffset = -1; askSinceNs = 0; pushedThrough = 0; catchUpTarget = -1;
         ackedLeo = -1; owed = OwedAnswer{}; dataServedThrough = -1; owedEpoch = OwedEpochAnswer{};
-        connGen = 0;
+        // connGen is NOT reset: it belongs to the link, not the leadership — a
+        // bounce across a re-election must still rewind (re-review 2 N1).
     }
 };
 

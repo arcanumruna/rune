@@ -651,3 +651,27 @@ TEST(F27SendNeverDroppedRegression, ConnectionGenerationBumpRewindsFollowerPushS
     (void)L.r->onFetchRequest(f, kNow, /*connGen=*/2);         // same generation again
     EXPECT_EQ(L.dataFramesTo(2), 2u) << "no further rewind without a new generation (conflated)";
 }
+
+// Re-review 2 N1: the connection generation is a property of the LINK, not of
+// the leadership.  A re-election must not forget it — otherwise the first fetch
+// of the new leadership is treated as a "first sighting", a push dropped while
+// the link bounced across the re-election is NOT rewound, and recovery waits
+// out the resend window (latency hole).
+TEST(F27SendNeverDroppedRegression, ConnectionGenerationSurvivesReelectionRegression) {
+    Cluster c;
+    Node& L = c.leader();
+    (void)c.produce(1024);
+    (void)L.r->doWork(kNow);
+    const FetchRequestMsg f1{1, 0, 2, /*off=*/1, 1 << 20, 0};
+    (void)L.r->onFetchRequest(f1, kNow, /*connGen=*/1);        // link generation 1 learned
+    L.r->becomeLeader(2, {1, 2, 3});                           // re-election (same node)
+    const Offset base = c.produce(1024);
+    (void)L.r->doWork(kNow);
+    const std::size_t before = L.dataFramesTo(2);
+    // The link bounced (gen 1 → 2) while the push above was "accepted": the
+    // follower reports it never got it.
+    const FetchRequestMsg f2{2, 0, 2, /*off=*/base, 1 << 20, 0};
+    (void)L.r->onFetchRequest(f2, kNow, /*connGen=*/2);
+    EXPECT_EQ(L.dataFramesTo(2), before + 1)
+        << "a generation bump across a re-election must rewind and serve Data at once";
+}
