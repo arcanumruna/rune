@@ -233,6 +233,22 @@ per hop × ~4 hops).
   (e) worker fsync interval as config (RUNE_WORKER_SYNC_INTERVAL_MS; final semantics owned by DUR-1);
   (f) io_uring io-wq affinity (IORING_REGISTER_IOWQ_AFF, RUNE_IOWQ_CORES) keeping io-wq off worker cores;
   (g) backoff vs busy-spin worker idle (RUNE_SHARD_BACKOFF; no measured latency difference -> backoff frees cores).
+  Client CRC/encode waste (2026-10-03 saturation profile, 3-node acks=all: crc32c_hw = 28% of client CPU; uprobes
+  counted 35,897 buildAppend calls CRC-ing 1.52 GB in 2 s vs ~116 MB/s produced = ~6.6 builds per sent frame):
+  (h) no rebuild on back-pressure: probe the publication (position < publication limit, the exact Aeron refusal
+      condition) BEFORE encoding; a refused offer must not rebuild header + record copy + CRC every agent cycle.
+      Records keep joining the held batch.  WIP in rune-client-cpp-wt4 (uncommitted): canOffer() on
+      AeronTransport/ClientAgent/AgentProduceSink/CountingSink + ProducerImpl::sinkCanOffer_ gate in encodeAndSend and
+      encodeAndSendTier2; ProducerSink.BackPressuredSinkIsNotReEncodedRegression RED (50 rebuilds/50 cycles) -> GREEN.
+      Remaining: full client suites, Opus review, commit, re-profile on the box.
+  (i) incremental CRC patch: Tier-2 send stamp and retransmit re-sequencing re-CRC the whole batch after patching
+      producerId/epoch/baseSequence.  Use CRC32C linearity (crc32c_combine-style shift of the XOR delta, O(log n))
+      instead of a full rescan; bit-exact tests vs full recompute (random patches, every field offset, len 0..64 KiB).
+  (j) faster CRC32C (only if still in the top of the profile after h+i): 3-way interleaved _mm_crc32_u64 streams
+      combined with PCLMUL (~8 B/cycle vs ~2.7 B/cycle single chain), shared in rune-protocol (broker validation too).
+  Also: drop the extra full-frame copy (encodeScratch_ -> keepFrame): encode once into the retained retransmit
+  buffer and offer from it.  MTU stays network-sized (1408 default; no 64 KiB MTU over real networks) -> offer() for
+  multi-MTU batches; real-network throughput lever = UDP GSO/GRO transport binding (separate spec).
   Each item: RED-first test where it is a behavior change, *Regression* marker where it fixes a bug (rotation stall),
   no allocation/virtual/std::function on the hot path, numbers in this doc.
 
