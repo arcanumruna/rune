@@ -2943,14 +2943,25 @@ void BrokerNode::buildShardRuntimes_() {
     if (ec) {
         spdlog::warn("BrokerNode[{}]: cannot stat free space of aeron dir {} ({}) — shard tmpfs budget "
                      "NOT checked", config_.nodeId, config_.effectiveAeronDir(), ec.message());
-    } else if (auto err = checkAeronSpace(space.available, wc + 1, config_.aeronTermBufferBytes)) {
-        // wc shard drivers + the node driver share the aeron filesystem.
+    } else if (auto err = checkAeronSpace(space.available, config_.fused() ? wc : wc + 1,
+                                          config_.aeronTermBufferBytes)) {
+        // wc shard drivers + the node driver share the aeron filesystem (fused:
+        // worker 0 rides the node driver, so wc drivers in total).
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing shard mode — " + *err);
     }
     shardDrivers_.reserve(static_cast<std::size_t>(wc));
     shardClients_.reserve(static_cast<std::size_t>(wc));
     for (int32_t w = 0; w < wc; ++w) {
+        // A4: fused placement — the runtime (control plane) already runs on worker
+        // 0's thread; worker 0 rides the node driver + runtime client instead of
+        // owning a second invoker driver (one Aeron driver per worker, no extra
+        // runtime driver duty-cycled on the same pass).
+        if (config_.fused() && w == 0) {
+            shardDrivers_.push_back(nullptr);
+            shardClients_.push_back(aeron_);
+            continue;
+        }
         const std::string dir = (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
         auto dcfg = EmbeddedDriverConfig::fromNode(config_, dir);
         dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
@@ -3006,10 +3017,17 @@ void BrokerNode::attachShardRuntimes_() {
     // own AeronPump; all are still owned by this start thread), so no shard goes
     // unpumped while another one resolves: startup liveness is independent of
     // the shard count and of how long any single resolve takes (fix round 2).
+    // A4: worker 0's driver is the node driver in fused placement — the interim
+    // startup pump runner is joined here (it never pumps again) and this thread
+    // becomes its only pumper until worker 0's first pass takes it over.
+    if (config_.fused()) {
+        stopStartupPump_();
+        nodeDriver_->bindPumpThread();
+    }
     ShardStartupPump startupPump;
     startupPump.pumps.reserve(static_cast<std::size_t>(wc));
     for (int32_t w = 0; w < wc; ++w)
-        startupPump.pumps.push_back(shardDrivers_[static_cast<std::size_t>(w)]->pumpWith(
+        startupPump.pumps.push_back(shardDriver_(static_cast<std::size_t>(w)).pumpWith(
             shardClients_[static_cast<std::size_t>(w)].get()));
     for (int32_t w = 0; w < wc; ++w) {
         const auto idx = static_cast<std::size_t>(w);
@@ -3059,7 +3077,7 @@ void BrokerNode::attachShardRuntimes_() {
         wk.setShardClient(shardClients_[idx].get());
         workerIngresses_.push_back(std::move(ing));
         workerEgresses_.push_back(std::move(eg));
-        shardAgents_.push_back(std::make_unique<ShardAgent>(wk, *shardDrivers_[idx], *shardClients_[idx], clock_));
+        shardAgents_.push_back(std::make_unique<ShardAgent>(wk, shardDriver_(idx), *shardClients_[idx], clock_));
     }
     if (gateway_) {
         gateway_->setPerWorkerIngressActive(true);

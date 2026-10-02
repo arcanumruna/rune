@@ -32,6 +32,9 @@ namespace detail {
 /// line because NodeRuntimeAgent.h includes this header (via WorkerPool.h).
 int fusedRuntimePass(NodeRuntimeAgent& runtime, EmbeddedDriver& driver, aeron::Aeron& client,
                      int64_t nowNs) noexcept;
+/// A4: the fused runtime when it rides the shard's own driver + client (the pass
+/// already ran that driver and conductor): only the runtime agent's work.
+int fusedRuntimeAgentOnly(NodeRuntimeAgent& runtime, int64_t nowNs) noexcept;
 } // namespace detail
 
 template <class Clock>
@@ -52,6 +55,7 @@ public:
     void setFusedRuntime(NodeRuntimeAgent* runtime, EmbeddedDriver* runtimeDriver,
                          aeron::Aeron* runtimeClient) noexcept {
         runtime_ = runtime; runtimeDriver_ = runtimeDriver; runtimeClient_ = runtimeClient;
+        sharedDriver_ = runtimeDriver == &driver_ && runtimeClient == &client_;
     }
 
     int doWork(int64_t nowNs) override {
@@ -61,22 +65,37 @@ public:
             if (runtimeDriver_) runtimeDriver_->bindPumpThread();
             bound_ = true;
         }
-        int work = driver_.doWork();                        // 1. own driver duty cycle
+        // 1. own driver duty cycle — A1: drained while it reports work (bounded),
+        //    so one pass moves more than ~1 datagram per stream (invoker driver:
+        //    one duty cycle sends/receives only a small batch per transport).
+        int work = 0;
+        for (int dc = 0; dc < kDriverDutyPerPass; ++dc) {
+            const int w = driver_.doWork();
+            ++driverDutyCycles_;
+            work += w;
+            if (w == 0) break;
+        }
         work += client_.conductorAgentInvoker().invoke();   // 2. own client conductor
         work += worker_.doWork(nowNs);                      // 3-6. Worker (final → direct call)
         if (runtime_)                                       // 7. fused runtime (worker 0)
-            work += detail::fusedRuntimePass(*runtime_, *runtimeDriver_, *runtimeClient_, nowNs);
+            work += sharedDriver_ ? detail::fusedRuntimeAgentOnly(*runtime_, nowNs)  // A4: rides THIS pass's driver + conductor
+                                  : detail::fusedRuntimePass(*runtime_, *runtimeDriver_, *runtimeClient_, nowNs);
         if (clock_.nowNs() - nowNs > kSlowPassNs) [[unlikely]] ++slowPasses_;
         return work;
     }
 
     [[nodiscard]] uint64_t slowPassesForTest() const noexcept { return slowPasses_; }
+    /// A1: most driver duty cycles one pass runs while the driver keeps reporting work.
+    static constexpr int kDriverDutyPerPass = 16;
+    [[nodiscard]] uint64_t driverDutyCyclesForTest() const noexcept { return driverDutyCycles_; }
 
 private:
     Worker&         worker_;
     EmbeddedDriver& driver_;
     aeron::Aeron&   client_;
     const Clock&    clock_;
+    uint64_t driverDutyCycles_ = 0;
+    bool     sharedDriver_     = false;   ///< A4: fused runtime rides this shard's driver + client
     NodeRuntimeAgent* runtime_       = nullptr;   // fused placement only (worker 0)
     EmbeddedDriver*   runtimeDriver_ = nullptr;
     aeron::Aeron*     runtimeClient_ = nullptr;

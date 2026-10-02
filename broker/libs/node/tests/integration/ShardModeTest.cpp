@@ -203,6 +203,77 @@ TEST(ShardMode, ThreeNodeAcksAllCommitsOverShardReplicationPlanes) {
     EXPECT_GE(atLeast20, 2) << "every acked record must be on a majority";
 }
 
+// A4: in fused placement the runtime (control plane) runs on worker 0's thread
+// and rides worker 0's OWN driver + client — exactly one Aeron driver per worker,
+// no extra runtime driver (the extra one cost ~15 us of polling every pass).
+TEST(ShardModeRegression, FusedWorkerZeroSharesTheRuntimeDriverRegression) {
+    TmpDir dir{"fz"}, cdir{"fzc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    EXPECT_EQ(node.shardDriverCountForTest(), 0u)
+        << "worker 0 must not own a second driver: it shares the runtime's";
+    EXPECT_FALSE(fs::exists(fs::path(cfg.effectiveAeronDir()) / "w0" / "cnc.dat"));
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid, 0);
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0,
+                                    /*acks=*/1, makeBatch(3));
+        ASSERT_TRUE(ack.has_value()) << "no OK ack from the fused worker shard";
+    }
+    node.stop();
+    EXPECT_GE(logEndOffsetAfterStop(dir.path), 3);
+}
+
+TEST(ShardModeRegression, FusedTwoWorkersOwnOneExtraDriverRegression) {
+    TmpDir dir{"f2"};
+    const auto ports = ShardPorts::discover(1, 2);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 2, /*fused=*/true);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    EXPECT_EQ(node.shardDriverCountForTest(), 1u) << "worker 1 owns its driver; worker 0 shares the runtime's";
+    node.stop();
+    EXPECT_EQ(node.shardDriverCountForTest(), 0u);
+}
+
+TEST(ShardModeRegression, FusedThreeNodeAcksAllCommitsRegression) {
+    TmpDir d0{"ft0"}, d1{"ft1"}, d2{"ft2"}, cdir{"ftc"};
+    const auto ports = ShardPorts::discover(3, 1);
+    BrokerNode n0{makeShardConfig(0, d0.path, ports, 3, 1, true)};
+    BrokerNode n1{makeShardConfig(1, d1.path, ports, 3, 1, true)};
+    BrokerNode n2{makeShardConfig(2, d2.path, ports, 3, 1, true)};
+    n0.start(); n1.start(); n2.start();
+    ASSERT_TRUE(n0.awaitLeader(15'000ms));
+    EXPECT_EQ(n0.shardDriverCountForTest() + n1.shardDriverCountForTest() + n2.shardDriverCountForTest(), 0u);
+    int32_t leader = -1;
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid0, 0);
+        for (int i = 0; i < 200 && leader < 0; ++i) {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                if (pi.topicId == 0 && pi.partition == 0) leader = pi.leaderId;
+            if (leader < 0) std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_GE(leader, 0) << "no partition leader advertised";
+        const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+        ASSERT_GT(sid, 0);
+        for (int b = 0; b < 5; ++b) {
+            auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, 0,
+                                        /*acks=all*/1, makeBatch(4));
+            ASSERT_TRUE(ack.has_value()) << "fused acks=all batch " << b << " not committed";
+        }
+    }
+    n0.stop(); n1.stop(); n2.stop();
+    int atLeast20 = 0;
+    for (const auto* d : {&d0, &d1, &d2}) atLeast20 += logEndOffsetAfterStop(d->path) >= 20 ? 1 : 0;
+    EXPECT_GE(atLeast20, 2) << "every acked record must be on a majority";
+}
+
 TEST(ShardModeRegression, LegacyDefaultBuildsNoShardRuntime) {
     TmpDir dir{"legacy"};
     const auto ports = ShardPorts::discover(1, 1);
