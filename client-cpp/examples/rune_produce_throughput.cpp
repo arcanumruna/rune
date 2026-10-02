@@ -208,7 +208,9 @@ int main() {
             p.onAck([](void* raw, Token tok, int64_t /*offset*/, OpStatus st, uint16_t) noexcept {
                 auto* a = static_cast<AckCtx*>(raw);
                 RUNE_FR_MARK_PRODUCE(rune_fr::Site::ClientDrvAckCb, static_cast<uint32_t>(tok));
-                a->acked->fetch_add(1, std::memory_order_release);
+                // `acked` is published LAST (release): main stops waiting once it
+                // reaches nRecords and then reads succeeded/failed/lat and reuses
+                // this frame's stack — every other write must happen-before it.
                 if (st == OpStatus::Ok) {
                     a->succeeded->fetch_add(1, std::memory_order_relaxed);
                     // sample ~1/256 SUCCESSFUL acks for latency
@@ -220,6 +222,7 @@ int main() {
                 } else {
                     a->failed->fetch_add(1, std::memory_order_relaxed);
                 }
+                a->acked->fetch_add(1, std::memory_order_release);
             }, &actx);
             const auto t0 = clk::now();
             // DIAG: sample sent/acked every 250ms to see whether acks arrive as a
