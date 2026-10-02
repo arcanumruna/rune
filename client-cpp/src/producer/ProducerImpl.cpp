@@ -1523,6 +1523,7 @@ bool ProducerImpl::encodeAndSend(
     // after a successful offer (below), so a back-pressured retry re-sends the
     // SAME sequence rather than opening a gap.
     if (cfg_.acks != Acks::None) {
+        if (!sequenceRoom_(ps, ps.builder->recordCount())) return false;  // int32 sequence space
         ps.builder->setProducerId(ps.producerId);  // the PARTITION's identity (I-4)
         ps.builder->setProducerEpoch(ps.epoch);
         ps.builder->setBaseSequence(ps.nextBaseSequence);
@@ -1690,6 +1691,7 @@ bool ProducerImpl::encodeAndSendTier2(
     // server side causes a compile-time break rather than silent CRC/seq
     // corruption.
     const bool idempotent = (cfg_.acks != Acks::None);
+    if (idempotent && !sequenceRoom_(ps, entry.recordCount)) return false;  // int32 sequence space
     if (idempotent) {
         // Patch producerId (int64 LE at kProducerIdOffset).
         const uint64_t pid = static_cast<uint64_t>(ps.producerId);
@@ -2263,6 +2265,13 @@ void ProducerImpl::resetPartition_(PartitionState& ps) noexcept {  // F
     std::fprintf(stderr,
                  "ProducerImpl: topic=%d part=%d sequences restart at 0 under producerId=%lld epoch=%d\n",
                  ps.topicId, ps.partition, static_cast<long long>(producerId_), static_cast<int>(producerEpoch_));
+}
+
+bool ProducerImpl::sequenceRoom_(PartitionState& ps, int32_t n) noexcept {
+    if (static_cast<int64_t>(ps.nextBaseSequence) + n <= INT32_MAX) return true;
+    if (!ps.inflight.empty()) return false;  // drain first: never fence a stored retransmit
+    resetPartition_(ps);                     // new identity at 0, before the overflow
+    return static_cast<int64_t>(n) <= INT32_MAX;
 }
 
 namespace {

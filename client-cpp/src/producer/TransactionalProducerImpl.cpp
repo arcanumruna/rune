@@ -893,6 +893,15 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
             // same gap — Kafka stops draining a partition with a retry outstanding).
             constexpr uint32_t kWindow = static_cast<uint32_t>(rpc::kIdempotentMaxInFlightBatches);
             while (!ps.waiting.empty() && ps.parked == 0 && ps.inFlight < kWindow) {
+                // int32 sequence space (one record per batch): never wrapped —
+                // the broker compares sequences signed.  The epoch belongs to the
+                // coordinator, so the transaction becomes abortable with an epoch
+                // bump (InitProducerId restarts every sequence at 0) BEFORE the
+                // counter could overflow.
+                if (ps.nextBaseSequence == INT32_MAX) [[unlikely]] {
+                    poison_(OpStatus::DeliveryFailed, 0, /*bumpEpoch=*/true);
+                    break;
+                }
                 produce_(ps, ps.waiting.front(), nowNs, sessionId, sendFn, work);
                 ps.waiting.pop_front();
             }

@@ -782,6 +782,53 @@ TEST(ProducerSequence, BatchAckProducerIdIsTheStampedIdentityAcrossRotationRegre
     EXPECT_EQ(L.batchAcks[1].producerEpoch, 0);
 }
 
+// Sequence overflow (broker-agent concern): the per-partition int32 sequence
+// counter never overflows.  The broker compares sequences signed (no Kafka wrap
+// rule), so the producer moves the partition to a new epoch at sequence 0
+// BEFORE the counter would pass INT32_MAX — and only once the partition's
+// in-flight batches drained (a bump with A in flight would fence A's stored
+// retransmit, EOS I-4).  A completes Ok, B and C go out at 0 / 1 under
+// epoch + 1, every record completes Ok exactly once, no sequence is negative.
+// RED (pre-fix): B went out at INT32_MAX and C at a wrapped negative sequence.
+TEST(ProducerSequence, SequenceCounterNeverOverflowsInt32Regression) {
+    ProducerImpl impl(ackCfg(8));
+    AckLedger L;
+    L.attachBatches(impl);
+    SeqCapture cap;
+    const auto sink = cap.fn();
+    impl.debugSetNextSequenceForTest(1, 0, INT32_MAX - 1);
+    const int16_t e0 = impl.producerEpoch();
+    sendOne(impl, sink, 0);  // A: INT32_MAX - 1 (the counter then reaches INT32_MAX)
+    sendOne(impl, sink, 0);  // B: no room — held while A is in flight
+    sendOne(impl, sink, 0);  // C
+    for (const auto& f : cap.frames) {
+        EXPECT_GE(f.baseSequence, 0) << "a wrapped sequence went out";
+    }
+    ASSERT_EQ(cap.frames.size(), 1u) << "B/C must wait for A (no bump with A in flight)";
+    EXPECT_EQ(cap.frames[0].baseSequence, INT32_MAX - 1);
+    EXPECT_EQ(cap.frames[0].epoch, e0);
+    EXPECT_EQ(impl.producerEpoch(), e0) << "no bump while A is in flight";
+
+    impl.onProduceResponse(cap.frames[0].corrId, 900, 0);  // A stored + acked
+    pump(impl, sink);
+    ASSERT_GE(cap.frames.size(), 2u);
+    EXPECT_EQ(impl.producerEpoch(), static_cast<int16_t>(e0 + 1)) << "one bump, before the overflow";
+    int32_t next = 0;
+    for (std::size_t i = 1; i < cap.frames.size(); ++i) {
+        EXPECT_EQ(cap.frames[i].epoch, static_cast<int16_t>(e0 + 1));
+        EXPECT_EQ(cap.frames[i].baseSequence, next) << "restarts at 0, contiguous";
+        next = cap.frames[i].baseSequence + 1;
+    }
+    for (std::size_t i = 1; i < cap.frames.size(); ++i) impl.onProduceResponse(cap.frames[i].corrId, 1000, 0);
+    int okRecords = 0;
+    for (const auto& a : L.batchAcks) {
+        EXPECT_EQ(a.errorCode, 0) << "a record failed across the sequence rollover";
+        okRecords += a.recordCount;
+    }
+    EXPECT_EQ(okRecords, 3) << "every record completes exactly once";
+    EXPECT_FALSE(impl.hasInFlight());
+}
+
 TEST(ProducerSequence, CloseWithInFlightBatchesBumpsEpochAndRestartsSequenceRegression) {
     ProducerImpl impl(ackCfg(8));
     SeqCapture cap;

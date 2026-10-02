@@ -232,6 +232,11 @@ public:
     [[nodiscard]] std::size_t testPendingRequests() const noexcept { return reqs_.size(); }
     [[nodiscard]] std::size_t testPendingOps() const noexcept { return ops_.size(); }
     [[nodiscard]] std::size_t testInFlightBatches() const noexcept { return batches_.size(); }
+    /// Test-only (sequence overflow regression): every known partition's next
+    /// baseSequence := seq, so a test reaches INT32_MAX without 2^31 records.
+    void testSetNextSequenceAll(int32_t seq) noexcept {
+        for (auto& [k, ps] : partitions_) ps.nextBaseSequence = seq;
+    }
     [[nodiscard]] std::size_t testWaitingRecords() const noexcept;
     /// Sends / begins refused by the state machine (dropped, never produced).
     [[nodiscard]] uint64_t testRefusedSends() const noexcept { return refusedSends_; }

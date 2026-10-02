@@ -997,6 +997,15 @@ public:
         }
     }
 
+    /// Test-only seam (sequence overflow regression): set a partition's next
+    /// baseSequence (created on demand) so a test reaches INT32_MAX without
+    /// sending 2^31 records.  Never called from production code.
+    void debugSetNextSequenceForTest(int32_t topicId, int32_t partition, int32_t seq) {
+        PartitionState& ps = getOrCreatePartition(topicId, partition);
+        ps.nextBaseSequence = seq;
+        ps.lastAckedSeq     = seq - 1;
+    }
+
     /// Test-only seam (Task 14 fix2): lower the partition-table cap (default
     /// batchcorr::kMaxSlot + 1) so the "unaddressable partition" path can be
     /// exercised without creating 262144 partitions. Never called in production.
@@ -1161,6 +1170,16 @@ private:
     /// Epoch overflow: at INT16_MAX a FRESH unique producerId is drawn (never
     /// the old id+1 — see generateProducerId()) and the epoch restarts at 0.
     void resetPartition_(PartitionState& ps) noexcept;
+    /// Sequence space (int32, never wrapped — the broker compares sequences
+    /// signed and has no Kafka wrap rule): true when a batch of `n` records
+    /// may be stamped at ps.nextBaseSequence with its last sequence AND the
+    /// following nextBaseSequence still <= INT32_MAX.  When it may not: with
+    /// nothing in flight the partition moves to a new identity at sequence 0
+    /// (resetPartition_: an epoch bump BEFORE the overflow) and it may; with
+    /// batches in flight it waits for them (a bump now would fence their
+    /// retransmits — EOS I-4) and returns false (the batch is kept, retried
+    /// next pass).
+    [[nodiscard]] bool sequenceRoom_(PartitionState& ps, int32_t n) noexcept;
     /// resetPartition_ + every live batch re-stamped (frame + header + CRC) in
     /// order from sequence 0 and queued for re-send (parked), new attempts.
     void resequence_(PartitionState& ps) noexcept;

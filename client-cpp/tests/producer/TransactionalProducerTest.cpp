@@ -2106,3 +2106,27 @@ TEST(TransactionalProducerTest, ErrorOfASupersededAttemptIsIgnoredRegression) {
     EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
     EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
 }
+
+// Sequence overflow (broker-agent concern): the per-partition int32 sequence
+// never overflows — the broker compares sequences signed and has no Kafka wrap
+// rule.  The txn producer's epoch belongs to the coordinator, so before the
+// counter would pass INT32_MAX the transaction becomes abortable with an epoch
+// bump (InitProducerId restarts every sequence at 0); no frame ever carries a
+// wrapped (negative) sequence.  RED (pre-fix): the third record went out at a
+// negative baseSequence (signed overflow) and the transaction stayed live.
+TEST(TransactionalProducerTest, SequenceCounterNeverOverflowsInt32Regression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    const auto first = sendData(r, 1);
+    ASSERT_EQ(first.size(), 1u);
+    answer(r, corrIdOf(first[0]), 0, 100);
+    r.impl->testSetNextSequenceAll(INT32_MAX - 1);
+    for (int i = 0; i < 3; ++i) r.tp.send(TopicHandle{1, 1}, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.sink.clear();
+    r.doWork();
+    const auto frames = produceFrames(r.sink);
+    for (const auto& f : frames) EXPECT_GE(decodeBaseSeqFromProduce(f), 0) << "a wrapped sequence went out";
+    ASSERT_EQ(frames.size(), 1u) << "only INT32_MAX - 1 fits (the next counter value must stay <= INT32_MAX)";
+    EXPECT_EQ(decodeBaseSeqFromProduce(frames[0]), INT32_MAX - 1);
+    EXPECT_EQ(r.tp.state(), TxnState::AbortableError) << "abortable with an epoch bump before the overflow";
+}
