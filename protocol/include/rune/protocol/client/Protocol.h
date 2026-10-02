@@ -5,6 +5,16 @@ namespace rune::protocol::client {
 inline constexpr uint16_t kSchemaId        = 120;  // client-facing schema (distinct from internal 111-114)
 inline constexpr uint16_t kProtocolVersion = 3;  // read-rework: PartitionEntry egressControlPort+egressStreamId (20→28 bytes)
 
+// Idempotent producer bound, shared by client and broker (one constant, so the
+// two can never drift apart):
+//   * client: an idempotent producer keeps at most this many un-acked batches in
+//     flight per partition (maxInFlight is clamped to it);
+//   * broker: the per-(producer, partition) dedup window (ProducerStateManager)
+//     remembers this many recent batches, so a retransmit of ANY in-flight batch
+//     is answered as a duplicate with its original offset.
+// Kafka caps max.in.flight at 5 for the same reason; Rune pipelines deeper.
+inline constexpr int kIdempotentMaxInFlightBatches = 32;
+
 enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/consume 16-31, groups/txn 32-63, view 64-95
     Connect          = 1,
     ConnectResponse  = 2,
