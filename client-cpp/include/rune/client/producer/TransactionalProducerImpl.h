@@ -118,6 +118,14 @@ struct TxnPartitionState {
     enum class Add : uint8_t { NotAdded, Adding, Added, Failed };
     Add                       add = Add::NotAdded;
     std::deque<TxnSendRecord> waiting;  // not yet produced (FIFO)
+    // EOS follow-ups (I-1 / M-2): in-flight batches of this partition (clamped
+    // to kIdempotentMaxInFlightBatches), those parked on OutOfOrderSequence
+    // behind an older one, the highest sequence acked OK, and the producer's
+    // send tick when the latest OK was processed.
+    uint32_t inFlight     = 0;
+    uint32_t parked       = 0;
+    int32_t  lastAckedSeq = -1;
+    uint64_t lastAckTick  = 0;
 
     TxnPartitionState() = default;
     TxnPartitionState(int32_t tid, int32_t p) : topicId(tid), partition(p) {}
@@ -297,6 +305,13 @@ private:
         static constexpr int kMaxRetries = 5;
         int64_t              deadlineNs = 0;     // duty clock
         int64_t              sentSessionId = 0;  // 0: not on the wire (re-sent next cycle)
+        // EOS follow-ups: every offer after the first is a NEW attempt with a
+        // fresh correlationId (I-2: an earlier attempt's error answer never
+        // decides the batch; its OK still does — stored is stored).
+        bool                 offered  = false;
+        bool                 parked   = false;  // I-1: OOS behind an older live batch
+        uint64_t             sendTick = 0;      // TransactionalProducerImpl::sendTick_ at the latest offer
+        std::vector<int64_t> priorCorrIds;      // the superseded attempts' ids
     };
 
     enum class Verdict : uint8_t { Ok, Retry, Rediscover, Fenced, Fail };
@@ -426,7 +441,17 @@ private:
     std::vector<UserOp>     ops_;   // apply order
     std::vector<TxnRequest> reqs_;  // creation order
     std::map<rune::client::TopicPartitionKey, TxnPartitionState> partitions_;
-    std::map<int64_t, InFlightBatch> batches_;  // corrId -> in-flight batch
+    std::map<int64_t, InFlightBatch> batches_;  // current attempt's corrId -> in-flight batch
+    std::map<int64_t, int64_t>       superseded_;  // an earlier attempt's corrId -> the current one
+    uint64_t                         sendTick_ = 0;
+    std::vector<int64_t>             dueScratch_;  // doWork's re-offer list (capacity kept)
+    /// Drops a batch (any outcome): its partition's counters and superseded ids.
+    void eraseBatch_(std::map<int64_t, InFlightBatch>::iterator it);
+    /// Drops every batch (fatal / close).
+    void clearBatches_() noexcept;
+    /// I-1: once nothing un-acked lies before a partition's first parked batch,
+    /// its parked batches are re-sent (next cycle, in sequence order).
+    void armParked_(TxnPartitionState& ps);
 
     TxnStatus statusLast_{};
     bool      statusDirty_ = false;
