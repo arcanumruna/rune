@@ -473,6 +473,14 @@ struct NodeConfig {
     //     creation (a full tmpfs then fails the create, loudly).
     bool    aeronTermBufferSparse        = true;
 
+    //   - Aeron sender/receiver batching per syscall (0 = Aeron default 2; 1..16).
+    //     RUNE_AERON_MAX_MSGS_PER_SEND  -> network_publication_max_messages_per_send
+    //     RUNE_AERON_SENDER_IOV         -> sender_io_vector_capacity (sendmmsg batch)
+    //     RUNE_AERON_RECEIVER_IOV       -> receiver_io_vector_capacity (recvmmsg batch)
+    int32_t aeronMaxMessagesPerSend      = 0;
+    int32_t aeronSenderIoVectorCapacity  = 0;
+    int32_t aeronReceiverIoVectorCapacity = 0;
+
     //   - aeronSocketBufferBytes: OS UDP socket SO_SNDBUF / SO_RCVBUF (bytes) for
     //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.
     //     Larger socket buffers absorb produce/ack bursts on loopback/LAN so the

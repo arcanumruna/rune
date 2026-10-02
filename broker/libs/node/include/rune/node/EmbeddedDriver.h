@@ -44,6 +44,9 @@ struct EmbeddedDriverConfig {
     int32_t     rcvWindowBytes    = 128 * 1024;
     int32_t     socketBufferBytes = 2 * 1024 * 1024;
     bool        termBufferSparse  = true;    ///< false: allocate + zero-fill terms at creation
+    int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default
+    int32_t     senderIoVector     = 0;      ///< 0 = Aeron default
+    int32_t     receiverIoVector   = 0;      ///< 0 = Aeron default
     NodeConfig::AeronThreadingMode threadingMode = NodeConfig::AeronThreadingMode::Shared;
     std::string idleStrategy      = "sleep-ns";
     bool        deleteDirOnShutdown = true;

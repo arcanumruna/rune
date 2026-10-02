@@ -1555,6 +1555,28 @@ TEST(NodeConfig, ParsesAeronMtuAndRcvWindow) {
     EXPECT_EQ(res.config->aeronRcvWindowBytes, 262144);
 }
 
+TEST(NodeConfig, ParsesAeronSendBatching) {
+    std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+    {
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_EQ(res.config->aeronMaxMessagesPerSend, 0) << "default = Aeron default";
+    }
+    {
+        auto kv = base; kv["RUNE_AERON_MAX_MSGS_PER_SEND"] = "16"; kv["RUNE_AERON_SENDER_IOV"] = "16"; kv["RUNE_AERON_RECEIVER_IOV"] = "8";
+        auto res = rune::node::parseNodeConfig(fakeEnv(kv));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_EQ(res.config->aeronMaxMessagesPerSend, 16);
+        EXPECT_EQ(res.config->aeronSenderIoVectorCapacity, 16);
+        EXPECT_EQ(res.config->aeronReceiverIoVectorCapacity, 8);
+    }
+    for (const char* bad : {"0", "17", "x"}) {
+        auto kv = base; kv["RUNE_AERON_MAX_MSGS_PER_SEND"] = bad;
+        EXPECT_FALSE(rune::node::parseNodeConfig(fakeEnv(kv)).config.has_value()) << bad;
+    }
+}
+
 TEST(NodeConfig, ParsesAeronTermSparse) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
         {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};

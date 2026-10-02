@@ -940,6 +940,16 @@ ConfigResult parseNodeConfig(
         }
     }
     parsePow2(getenv_fn("RUNE_AERON_RCV_WINDOW"), cfg.aeronRcvWindowBytes);
+    for (auto [name, field] : {std::pair{"RUNE_AERON_MAX_MSGS_PER_SEND", &cfg.aeronMaxMessagesPerSend},
+                               std::pair{"RUNE_AERON_SENDER_IOV", &cfg.aeronSenderIoVectorCapacity},
+                               std::pair{"RUNE_AERON_RECEIVER_IOV", &cfg.aeronReceiverIoVectorCapacity}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            int32_t v{};
+            if (!parseInt32(raw, v) || v < 1 || v > 16)
+                return {{}, std::string(name) + " must be an integer in [1, 16], got '" + raw + "'"};
+            *field = v;
+        }
+    }
     if (const char* raw = getenv_fn("RUNE_AERON_TERM_SPARSE"); raw && *raw) {
         const std::string_view v(raw);
         if (v == "false" || v == "0") cfg.aeronTermBufferSparse = false;
