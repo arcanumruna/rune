@@ -71,13 +71,16 @@ stop() {
 }
 sg() { "$SG" --gateway "$GW" --topic bench --topic-id 0 --partitions 8 "$@"; }
 
-# one produce + read-back verify; prints RESULT and VERIFY lines
+# one produce + read-back verify; prints RESULT and VERIFY lines.  The produce
+# run writes its OK-acked id set to $OUT/<tag>.acked; VERIFY's ok_missing = ids
+# acked OK but absent from the log (must be 0).
 produce_verify() {  # <tag> <shard_gate args...>
     local tag="$1"; shift
     local r v n
-    r="$(sg "$@" 2>"$OUT/$tag.err" | grep -E '^RESULT')"
+    r="$(sg "$@" --acked-file "$OUT/$tag.acked" 2>"$OUT/$tag.err" | grep -E '^RESULT')"
     n="$(echo "$r" | grep -oE 'accepted=[0-9]+' | cut -d= -f2)"
-    v="$(sg --arm verify --expect "${n:-0}" --egress 127.0.0.1:41900 2>>"$OUT/$tag.err" | grep -E '^VERIFY')"
+    v="$(sg --arm verify --expect "${n:-0}" --acked-file "$OUT/$tag.acked" --egress 127.0.0.1:41900 \
+        2>>"$OUT/$tag.err" | grep -E '^VERIFY')"
     echo "$tag $r"; echo "$tag $v"
 }
 
@@ -106,7 +109,7 @@ gate4() {
     local fifo="$OUT/gate4.in" log="$OUT/gate4.out"
     rm -f "$fifo" "$log"; mkfifo "$fifo"
     sg --arm shard-agent --shards 2 --records 3000000 --rate 5000 --value-bytes 1024 --acks all \
-        --egress 127.0.0.1:41000 --sigstop <"$fifo" >"$log" 2>"$OUT/gate4.err" &
+        --egress 127.0.0.1:41000 --acked-file "$OUT/gate4.acked" --sigstop <"$fifo" >"$log" 2>"$OUT/gate4.err" &
     local pid=$!
     exec 7>"$fifo"  # hold the fifo open (the client reads 'q' from it)
     local i
@@ -128,7 +131,8 @@ gate4() {
     echo "gate4 events:"; grep '^EVENT' "$log"
     local r n; r="$(grep '^RESULT' "$log")"; echo "gate4 $r"
     n="$(echo "$r" | grep -oE 'accepted=[0-9]+' | cut -d= -f2)"
-    sg --arm verify --expect "${n:-0}" --egress 127.0.0.1:41900 2>>"$OUT/gate4.err" | grep -E '^VERIFY' | sed 's/^/gate4 /'
+    sg --arm verify --expect "${n:-0}" --acked-file "$OUT/gate4.acked" --egress 127.0.0.1:41900 \
+        2>>"$OUT/gate4.err" | grep -E '^VERIFY' | sed 's/^/gate4 /'
     stop gate4
 }
 

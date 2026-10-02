@@ -7,14 +7,26 @@
 //   --arm shard-invoker   one ClientShard (Invoker; this thread drives it)
 // plus  --arm verify      read every partition back from offset 0 (Invoker
 //                         Client) and check record ids: distinct / duplicates /
-//                         missing against --expect.
+//                         missing against --expect, and (--acked-file) the ids
+//                         acked OK but missing from the log.
 //
 // Records: value = [uint64 id][padding to --value-bytes], key = id.  Open loop
 // (--rate R): record i is SCHEDULED at t0 + i/R and its latency is measured from
 // that schedule (coordinated-omission safe: a stalled client is charged for
 // the records it could not send); --rate 0 = saturation (latency from the send).
-// Every accepted record's batch ack is matched by (partition, sequence) -> id;
-// the full latency array is kept (no sampling) and percentiles are exact.
+// Every accepted record's batch ack is matched to its id by (partition,
+// producerEpoch, sequence): the sender records each partition's ids in send
+// order; the acks are logged and, at report time, sorted per partition by
+// (epoch, baseSequence) — the producer's encode order, since an epoch bump
+// restarts sequences at 0 for every batch encoded after it — so the n-th
+// sequenced record of a partition is its n-th sent id.  Records failed before
+// they were ever sequenced (baseSequence -1) do not take a sequence; if any
+// occur the match is reported `match=approx`.  The full latency array is kept
+// (no sampling) and percentiles are exact.
+//
+// --acked-file PATH: the produce run writes the set of ids acked OK there (see
+// AckedFile below); --arm verify reads it and reports ok_missing = ids acked OK
+// but absent from the log (must be 0: an OK ack is a durability promise).
 //
 // Threads: no atomics / mutexes.  The sender writes an id's schedule and its
 // (partition, sequence) slot BEFORE the producer accepts it (the producer ring's
@@ -75,6 +87,7 @@ struct Args {
     int64_t     expect      = 0;  // verify
     std::string dataDir     = "/tmp/shard_gate";
     int32_t     maxInFlight = 0;  // 0 = producer default
+    std::string ackedFile;        // produce: write the OK-acked id set; verify: read it
 };
 
 [[noreturn]] void usage(const char* why) {
@@ -112,6 +125,7 @@ Args parse(int argc, char** argv) {
         else if (k == "--expect") a.expect = std::atoll(v().c_str());
         else if (k == "--data-dir") a.dataDir = v();
         else if (k == "--max-in-flight") a.maxInFlight = std::atoi(v().c_str());
+        else if (k == "--acked-file") a.ackedFile = v();
         else usage(("unknown option " + k).c_str());
     }
     if (a.valueBytes < 8) a.valueBytes = 8;
@@ -150,30 +164,45 @@ rc::ProducerConfig producerConfig(const Args& a) {
 struct Ledger {
     // Sender side (written before the producer accepts the record).
     std::vector<int64_t>               sched;      // id -> scheduled (or send) time, ns
-    std::vector<std::vector<int64_t>>  seqToId;    // partition -> sequence -> id
-    std::vector<int32_t>               nextSeq;    // partition -> next sequence (sender)
-    // Ack side (one writer per id: the runner that acks it).
+    std::vector<std::vector<int64_t>>  ordToId;    // partition -> send ordinal -> id
+    std::vector<int32_t>               nextOrd;    // partition -> next send ordinal (sender)
+    // Report side (after every ack runner stopped).
     std::vector<int64_t>               latencyNs;  // id -> ack - sched, -1 = none
+    std::vector<uint8_t>               okIds;      // id -> 1 if acked OK
     int64_t                            accepted = 0;
 
     void init(const Args& a, int64_t cap) {
         sched.assign(static_cast<std::size_t>(cap), 0);
         latencyNs.assign(static_cast<std::size_t>(cap), -1);
+        okIds.assign(static_cast<std::size_t>(cap), 0);
         // Keys hash evenly: 2x the fair share per partition (+ slack); a record
         // past it is counted as `unmatched` (no latency sample), never mis-attributed.
         const auto perPartition = static_cast<std::size_t>(cap / std::max(1, a.partitions) * 2 + 4096);
-        seqToId.assign(static_cast<std::size_t>(a.partitions), std::vector<int64_t>(perPartition, -1));
-        nextSeq.assign(static_cast<std::size_t>(a.partitions), 0);
+        ordToId.assign(static_cast<std::size_t>(a.partitions), std::vector<int64_t>(perPartition, -1));
+        nextOrd.assign(static_cast<std::size_t>(a.partitions), 0);
     }
+};
+
+// One sequenced batch ack, logged by the runner that delivered it.
+struct AckRec {
+    int64_t t;
+    int32_t partition;
+    int32_t baseSequence;
+    int32_t recordCount;
+    int16_t producerEpoch;
+    bool    ok;
 };
 
 // One per ack-delivering thread (a shard's runner / the client's runner / this thread).
 struct AckCtx {
-    Ledger* L       = nullptr;
-    int64_t ok      = 0;
-    int64_t failed  = 0;
-    int64_t records = 0;
-    int64_t lastAck = 0;
+    Ledger*             L           = nullptr;
+    int64_t             ok          = 0;
+    int64_t             failed      = 0;
+    int64_t             records     = 0;
+    int64_t             lastAck     = 0;
+    int64_t             unseqFailed = 0;  // records failed before they were sequenced
+    std::vector<AckRec> log;              // sequenced acks (reserved up front: no growth in the handler)
+    void reserve(int64_t cap) { log.reserve(static_cast<std::size_t>(cap) + 1024); }
     static int64_t nowNs() noexcept {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now().time_since_epoch()).count();
     }
@@ -184,18 +213,101 @@ struct AckCtx {
         self->lastAck = t;
         if (a.errorCode != 0) {
             self->failed += a.recordCount;
-            return;
+        } else {
+            self->ok += a.recordCount;  // baseOffset -1 = a known-old duplicate: stored, offset unknown
         }
-        self->ok += a.recordCount;
-        const auto& map = self->L->seqToId[static_cast<std::size_t>(a.partition)];
-        for (int32_t i = 0; i < a.recordCount; ++i) {
-            const int64_t seq = static_cast<int64_t>(a.baseSequence) + i;
-            if (seq < 0 || seq >= static_cast<int64_t>(map.size())) continue;
-            const int64_t id = map[static_cast<std::size_t>(seq)];
-            if (id >= 0) self->L->latencyNs[static_cast<std::size_t>(id)] = t - self->L->sched[static_cast<std::size_t>(id)];
+        if (a.baseSequence < 0) {
+            if (a.errorCode != 0) self->unseqFailed += a.recordCount;
+            return;  // acks=None or never sequenced: no (epoch, sequence) to match
+        }
+        if (self->log.size() < self->log.capacity()) {
+            self->log.push_back({t, a.partition, a.baseSequence, a.recordCount, a.producerEpoch, a.errorCode == 0});
         }
     }
 };
+
+// Report time (every runner stopped): per partition, the sequenced acks sorted
+// by (epoch, baseSequence) are the producer's encode order -> the n-th
+// sequenced record is the n-th sent id.  Fills latencyNs / okIds.  Returns
+// whether the match is exact (no unsequenced failures, no sequence gaps).
+bool matchAcks(Ledger& L, const std::vector<AckCtx*>& ctxs, int32_t partitions) {
+    std::vector<std::vector<AckRec>> byPart(static_cast<std::size_t>(partitions));
+    bool exact = true;
+    for (const AckCtx* c : ctxs) {
+        if (c->unseqFailed != 0) exact = false;
+        if (c->log.size() == c->log.capacity()) exact = false;  // log overflow (should not happen)
+        for (const AckRec& r : c->log) {
+            if (r.partition >= 0 && r.partition < partitions) byPart[static_cast<std::size_t>(r.partition)].push_back(r);
+        }
+    }
+    for (int32_t p = 0; p < partitions; ++p) {
+        auto& v = byPart[static_cast<std::size_t>(p)];
+        std::sort(v.begin(), v.end(), [](const AckRec& x, const AckRec& y) {
+            return x.producerEpoch != y.producerEpoch ? x.producerEpoch < y.producerEpoch
+                                                      : x.baseSequence < y.baseSequence;
+        });
+        const auto& ids = L.ordToId[static_cast<std::size_t>(p)];
+        int64_t ord = 0;
+        int16_t epoch = -1;
+        int32_t nextSeq = 0;
+        for (const AckRec& r : v) {
+            if (r.producerEpoch != epoch) {
+                epoch   = r.producerEpoch;
+                nextSeq = 0;
+            }
+            if (r.baseSequence != nextSeq) exact = false;  // a sequence gap: ordinals may shift
+            nextSeq = r.baseSequence + r.recordCount;
+            for (int32_t i = 0; i < r.recordCount; ++i, ++ord) {
+                if (!r.ok || ord >= static_cast<int64_t>(ids.size())) continue;
+                const int64_t id = ids[static_cast<std::size_t>(ord)];
+                if (id < 0) continue;
+                L.okIds[static_cast<std::size_t>(id)] = 1;
+                L.latencyNs[static_cast<std::size_t>(id)] = r.t - L.sched[static_cast<std::size_t>(id)];
+            }
+        }
+    }
+    return exact;
+}
+
+// --acked-file format (little-endian): u32 magic 'SGAK' (0x4B414753), u32
+// version 1, u64 nbits, then ceil(nbits / 8) bytes — bit (id % 8) of byte
+// (id / 8) set = id acked OK.
+constexpr uint32_t kAckedMagic = 0x4B414753u;
+
+bool writeAckedFile(const std::string& path, const std::vector<uint8_t>& okIds) {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) return false;
+    const uint32_t hdr[2] = {kAckedMagic, 1u};
+    const uint64_t nbits  = okIds.size();
+    std::vector<uint8_t> bits((okIds.size() + 7) / 8, 0);
+    for (std::size_t i = 0; i < okIds.size(); ++i) {
+        if (okIds[i] != 0) bits[i / 8] = static_cast<uint8_t>(bits[i / 8] | (1u << (i % 8)));
+    }
+    bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 && std::fwrite(&nbits, sizeof nbits, 1, f) == 1 &&
+              (bits.empty() || std::fwrite(bits.data(), bits.size(), 1, f) == 1);
+    ok = (std::fclose(f) == 0) && ok;
+    return ok;
+}
+
+// Returns false on a missing / malformed file.
+bool readAckedFile(const std::string& path, std::vector<uint8_t>& okIds) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return false;
+    uint32_t hdr[2] = {0, 0};
+    uint64_t nbits  = 0;
+    bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && std::fread(&nbits, sizeof nbits, 1, f) == 1 &&
+              hdr[0] == kAckedMagic && hdr[1] == 1u && nbits <= (uint64_t{1} << 40);
+    std::vector<uint8_t> bits;
+    if (ok) {
+        bits.resize(static_cast<std::size_t>((nbits + 7) / 8));
+        ok = bits.empty() || std::fread(bits.data(), bits.size(), 1, f) == 1;
+    }
+    std::fclose(f);
+    if (!ok) return false;
+    okIds.assign(static_cast<std::size_t>(nbits), 0);
+    for (std::size_t i = 0; i < okIds.size(); ++i) okIds[i] = (bits[i / 8] >> (i % 8)) & 1u;
+    return true;
+}
 
 bool stdinReady() {
     fd_set rd;
@@ -235,11 +347,11 @@ void sendLoop(const Args& a, Ledger& L, int64_t cap, TrySend&& trySend, Pump&& p
         }
         const rc::Key   key(static_cast<uint64_t>(id));
         const int32_t   p   = key.partition(a.partitions);
-        const int32_t   seq = L.nextSeq[static_cast<std::size_t>(p)];
+        const int32_t   ord = L.nextOrd[static_cast<std::size_t>(p)];
         std::memcpy(val.data(), &id, sizeof id);
         L.sched[static_cast<std::size_t>(id)] = a.rate > 0 ? due : AckCtx::nowNs();
-        if (seq < static_cast<int32_t>(L.seqToId[static_cast<std::size_t>(p)].size())) {
-            L.seqToId[static_cast<std::size_t>(p)][static_cast<std::size_t>(seq)] = id;
+        if (ord < static_cast<int32_t>(L.ordToId[static_cast<std::size_t>(p)].size())) {
+            L.ordToId[static_cast<std::size_t>(p)][static_cast<std::size_t>(ord)] = id;
         }
         for (;;) {
             const rc::SendResult r = trySend(key, std::span<const uint8_t>(val));
@@ -255,7 +367,7 @@ void sendLoop(const Args& a, Ledger& L, int64_t cap, TrySend&& trySend, Pump&& p
                 return;
             }
         }
-        ++L.nextSeq[static_cast<std::size_t>(p)];
+        ++L.nextOrd[static_cast<std::size_t>(p)];
         ++L.accepted;
     }
     tLast = AckCtx::nowNs();
@@ -269,6 +381,13 @@ void report(const Args& a, Ledger& L, const std::vector<AckCtx*>& ctxs, int64_t 
         failed += c->failed;
         records += c->records;
         lastAck = std::max(lastAck, c->lastAck);
+    }
+    const bool exact = matchAcks(L, ctxs, a.partitions);
+    int64_t    okIdCount = 0;
+    for (uint8_t b : L.okIds) okIdCount += b;
+    std::string acked = "-";
+    if (!a.ackedFile.empty()) {
+        acked = writeAckedFile(a.ackedFile, L.okIds) ? a.ackedFile : std::string("WRITE_FAILED");
     }
     std::vector<int64_t> lat;
     lat.reserve(static_cast<std::size_t>(L.accepted));
@@ -286,10 +405,12 @@ void report(const Args& a, Ledger& L, const std::vector<AckCtx*>& ctxs, int64_t 
     const double maxUs   = lat.empty() ? -1 : static_cast<double>(*std::max_element(lat.begin(), lat.end())) / 1000.0;
     std::printf("RESULT arm=%s shards=%u rate=%" PRId64 " value=%d acks=%s accepted=%" PRId64 " completed=%" PRId64
                 " ok=%" PRId64 " failed=%" PRId64 " unmatched=%" PRId64
+                " ok_ids=%" PRId64 " match=%s acked_file=%s"
                 " send_rps=%.0f ack_rps=%.0f p50_us=%.1f p90_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f close=%s"
                 " events=%s\n",
                 a.arm.c_str(), a.shards, a.rate, a.valueBytes, a.acks.c_str(), L.accepted, records, ok, failed,
-                unmatched, sendSec > 0 ? static_cast<double>(L.accepted) / sendSec : 0.0,
+                unmatched, okIdCount, exact ? "exact" : "approx", acked.c_str(),
+                sendSec > 0 ? static_cast<double>(L.accepted) / sendSec : 0.0,
                 ackSec > 0 ? static_cast<double>(ok) / ackSec : 0.0, pct(lat, 0.50), pct(lat, 0.90), pct(lat, 0.99),
                 pct(lat, 0.999), maxUs, closeStatus, events.empty() ? "-" : events.c_str());
     std::fflush(stdout);
@@ -318,6 +439,7 @@ int runShardAgent(const Args& a, Ledger& L, int64_t cap) {
     std::vector<AckCtx*>  ptrs;
     for (uint32_t i = 0; i < grp.size(); ++i) {
         ctx[i].L = &L;
+        ctx[i].reserve(cap);
         grp.onBatchAck(i, &AckCtx::on, &ctx[i]);
         ptrs.push_back(&ctx[i]);
     }
@@ -372,6 +494,7 @@ int runShardInvoker(const Args& a, Ledger& L, int64_t cap) {
     rs::ClientShard shard(g, 0);
     AckCtx          ctx;
     ctx.L = &L;
+    ctx.reserve(cap);
     std::string events;
     auto        pump = [&] {
         shard.doWork();
@@ -401,9 +524,10 @@ int runClient(const Args& a, Ledger& L, int64_t cap, bool invoker) {
     if (!invoker) c.runnerCore = a.core;
     if (invoker && a.core >= 0) (void)rc::detail::pinCurrentThreadToCore(a.core);
     rc::Client   client(c);
-    rc::Producer prod = client.producer(producerConfig(a));
-    AckCtx       ctx;
+    AckCtx       ctx;  // outlives the producer (its close completes into it)
     ctx.L = &L;
+    ctx.reserve(cap);
+    rc::Producer prod = client.producer(producerConfig(a));
     prod.onBatchAck(&AckCtx::on, &ctx);
     client.connectAndWait(std::chrono::seconds(30));
     const rc::TopicHandle topic = client.topic(a.topic);
@@ -476,9 +600,26 @@ int runVerify(const Args& a) {
         if (distinct >= n && clk::now() - last > std::chrono::seconds(2)) break;  // settle: late duplicates
         if (clk::now() - last > std::chrono::seconds(10)) break;                    // nothing more is coming
     }
+    // ok_missing: acked OK by the produce run (--acked-file) but absent from the
+    // log — an OK ack is a durability promise, so this must be 0.  -1 = no file.
+    int64_t okAcked = -1, okMissing = -1;
+    if (!a.ackedFile.empty()) {
+        std::vector<uint8_t> okIds;
+        if (readAckedFile(a.ackedFile, okIds)) {
+            okAcked = okMissing = 0;
+            for (std::size_t i = 0; i < okIds.size(); ++i) {
+                if (okIds[i] == 0) continue;
+                ++okAcked;
+                if (i >= seen.size() || seen[i] == 0) ++okMissing;
+            }
+        } else {
+            std::fprintf(stderr, "shard_gate: cannot read --acked-file %s\n", a.ackedFile.c_str());
+        }
+    }
     std::printf("VERIFY expect=%" PRId64 " total=%" PRId64 " distinct=%" PRId64 " duplicates=%" PRId64
-                " missing=%" PRId64 " foreign=%" PRId64 " dup_same_offset=%" PRId64 " dup_log_copies=%" PRId64 "\n",
-                n, total, distinct, dups, n - distinct, foreign, redelivered, logCopies);
+                " missing=%" PRId64 " foreign=%" PRId64 " dup_same_offset=%" PRId64 " dup_log_copies=%" PRId64
+                " ok_acked=%" PRId64 " ok_missing=%" PRId64 "\n",
+                n, total, distinct, dups, n - distinct, foreign, redelivered, logCopies, okAcked, okMissing);
     std::fflush(stdout);
     for (auto& s : subs) s.unsubscribe();
     client.close();
