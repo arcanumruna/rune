@@ -1648,14 +1648,18 @@ private:
             return 1;
         }
         LogFlushSlot* slot = routed ? liveSlot_(r) : nullptr;
+        // M-6 / N-5 / N-7: the log's CURRENT slot whatever its epoch — non-null
+        // means this worker owns the log (again), so touching it is safe.
+        LogFlushSlot* gate = routed ? slotOf_(r.log) : nullptr;
         // M1: release the segment pin taken at submit (only while this worker
-        // still owns the log — a purged slot's log may belong to another worker).
-        if (routed && r.seg && slot) r.log->unpinSegmentFlush(r.seg);
+        // owns the log — a purged log may belong to another worker).  N-7: keyed
+        // on the current slot, so a log re-owned while this fsync was in flight
+        // still unpins (no leaked pin / never-closed retired fd).
+        if (routed && r.seg && gate) r.log->unpinSegmentFlush(r.seg);
 
         // M-6 / N-5: the one-in-flight gate belongs to the LOG — it is cleared on
         // the log's CURRENT slot whatever its epoch (a log purged and re-owned
         // while this fsync was in flight seeded its fresh slot from the route).
-        LogFlushSlot* gate = routed ? slotOf_(r.log) : nullptr;
         if (routed && r.kind == RouteKind::Background && gate && gate->bgToken == c.token) {
             gate->bgToken = kNoToken;
             if (bgInFlight_) --bgInFlight_;
@@ -1666,7 +1670,7 @@ private:
         // deferred behind it); data appended since is re-requested.
         if (routed && r.kind == RouteKind::Durable && gate && gate->durableToken == c.token) {
             gate->durableToken = kNoToken;
-            if (c.errorCode == 0 && gate == slot) {
+            if (c.errorCode == 0) {
                 if (gate->durableLeo > gate->lastSyncedLeo) gate->lastSyncedLeo = gate->durableLeo;
                 // I-3: re-request background only if no Strict waiter is queued
                 // (requestBgFlush_ keeps bgAgain set while strictWaiting).
@@ -1693,10 +1697,13 @@ private:
         }
 
         if (routed && r.kind != RouteKind::Durable) {
-            if (!slot) return 1;                               // purged (M2): success ignored safely
             if (r.kind == RouteKind::Background) {
-                if (slot->bgLeo > slot->lastSyncedLeo) slot->lastSyncedLeo = slot->bgLeo;
-                if (slot->bgAgain) { slot->bgAgain = false; (void)requestBgFlush_(*slot); }
+                // N-7: the current slot (a re-owned log re-serves its bgAgain).
+                if (!gate) return 1;                           // purged (M2): success ignored safely
+                if (gate == slot && gate->bgLeo > gate->lastSyncedLeo) gate->lastSyncedLeo = gate->bgLeo;
+                if (gate->bgAgain) { gate->bgAgain = false; (void)requestBgFlush_(*gate); }
+            } else if (!slot) {
+                return 1;                                      // purged (M2): success ignored safely
             } else {
                 fireSealGated_(*slot);
             }
@@ -4044,6 +4051,11 @@ private:
                 // N-5 (cold): a log re-owned while an fsync this worker issued on it
                 // is still in flight keeps its one-in-flight gate — seeded from the
                 // route table (cleared by that completion through slotOf_(log)).
+                // Cross-WORKER safety does not come from here: it rests on F7 (the
+                // router is fixed for the pool's lifetime — a runtime move halts the
+                // broker) and the two-phase migration's drain-before-grant contract
+                // (WorkerPool.h), so another worker never fsyncs a log while this
+                // worker's fsync on it is in flight.
                 for (const TokenRoute& rt : routes_) {
                     if (rt.token == kNoToken || rt.log != log) continue;
                     if (rt.kind == RouteKind::Durable)    fresh.durableToken = rt.token;

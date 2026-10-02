@@ -2690,3 +2690,53 @@ TEST(ProduceBatchLimitRegression, ReconcilePullOfSmallBatchesAboveOwnFrameComple
         << "the survivor's reply exceeded the puller's own frame: reconcile can never complete";
     EXPECT_GT(deficient->logEndOffset(), 0) << "the pulled committed records must be applied";
 }
+
+// F15 S5 fix round 3 follow-up (re-review 3 M-9): S5 e69a215 submitted one
+// durable fsync PER PASS per log; pipelined Strict produces on one log filled
+// the io in-flight depth and the back-pressure branch answered healthy
+// produces Internal.  One fsync in flight per log (M-6) can never exhaust it.
+TEST(ShardNonBlockingRegression, PipelinedStrictOnOneLogNeverExhaustsIoDepth) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica leader(cfg(1, /*tier=*/2), Role::Leader, 1, {1}, {1}, &log, &t);
+    leader.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, /*ioSubmitDepth=*/2, /*ioComplDepth=*/2);
+    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setWorkerIngress(nullptr, true);
+    w.setShardMode(true);
+    w.setReapPausedForTest(true);                             // fsyncs complete, but are not reaped yet
+    Acks a;
+    for (int i = 0; i < 8; ++i) {                             // one Strict produce per pass
+        const auto f = produceFrame(i + 1, batchAt(0), 0, 1, 0);
+        ASSERT_EQ(w.handleIngressFrameForTest(f.data(), f.size(), i + 1), 1);
+        w.doWork(i + 1);
+        a.drain(w);
+    }
+    EXPECT_EQ(a.n, 0) << "a pipelined Strict produce was answered (Internal: io depth exhausted) before any fsync";
+    w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && a.n < 8; ++i) { w.doWork(100 + i); a.drain(w); std::this_thread::yield(); }
+    ASSERT_EQ(a.n, 8);
+    for (const auto& r : a.rets) EXPECT_EQ(r.errorCode, 0) << "corr " << r.correlationId;
+}
+
+// N-7 (re-review 3): a log re-owned while its fsync is in flight — that
+// fsync's completion unpins its segment (no leaked pin) and re-serves a
+// background request made meanwhile.
+TEST(ShardNonBlockingRegression, ReownedLogCompletionUnpinsAndReservesBackgroundRequest) {
+    StrictShard s;
+    s.w.setReapPausedForTest(true);
+    const auto b1 = s.w.submitBgFlushForTest(s.log.get());   // background fsync in flight (segment pinned)
+    ASSERT_NE(b1, kNoToken);
+    rune::storage::LogSegment* seg = s.log->activeSegmentForFlush();
+    ASSERT_EQ(seg->flushPins(), 1u);
+    s.w.setOwnedDirect(Worker::OwnedSet{});                  // purged ...
+    s.w.setOwnedDirect(Worker::OwnedSet{s.leader.get()});   // ... and re-owned: a fresh slot (gate seeded)
+    ASSERT_EQ(s.produce(1, batchAt(0), 0, 1), 1);           // newer data ...
+    const uint64_t bgBefore = s.w.bgFlushSubmitsForTest();
+    (void)s.w.submitBgFlushForTest(s.log.get());            // ... and a background request while B1 is in flight
+    ASSERT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore) << "precondition: coalesced behind B1 (bgAgain)";
+    s.w.deliverCompletionForTest(FlushCompletion{b1, 0, s.log->flushBoundary()});
+    EXPECT_EQ(seg->flushPins(), s.w.bgFlushInFlightForTest()) << "B1's segment pin leaked on the re-owned log";
+    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore + 1) << "the background request made meanwhile was not re-served";
+}

@@ -4379,7 +4379,7 @@ TEST(WorkerPsmRegression, OneDurableFsyncInFlightPerLogSoAnErrorReachesEveryWait
 TEST(OrderedWaitQueueRegression, StalledFrontKeepsTheWalkedSpanBoundedByLiveEntries) {
     // I-2: one waiter that never fires (a lagging follower) pins the head;
     // another partition keeps parking and firing behind it.  Every pass must
-    // walk O(live) slots — the span (live + tombstones) stays <= 2·live + slack
+    // walk O(live) slots — the span (live + tombstones) stays <= 1.5·live + slack
     // — and the ring never grows.
     OrderedWaitQueue<int> q;
     q.reserve(Worker::kMaxOwedReturns);
@@ -4393,8 +4393,8 @@ TEST(OrderedWaitQueueRegression, StalledFrontKeepsTheWalkedSpanBoundedByLiveEntr
         (void)q.sweep([&](int v) { return v >= 0 && v < next - 64; });  // older ones fire later
         if (q.spanForTest() > maxSpan) maxSpan = q.spanForTest();
     }
-    const std::size_t bound = 2 * q.size() + OrderedWaitQueue<int>::kSlack + 16;
-    EXPECT_LE(maxSpan, 2 * 65 + OrderedWaitQueue<int>::kSlack + 16)
+    const std::size_t bound = q.size() + q.size() / 2 + OrderedWaitQueue<int>::kSlack + 16;
+    EXPECT_LE(maxSpan, 65 + 65 / 2 + OrderedWaitQueue<int>::kSlack + 16)   // 1.5·live + slack (+ a pass's pushes)
         << "the walked span grew with the tombstones behind the stalled front (not with live entries)";
     EXPECT_LE(q.spanForTest(), bound);
     EXPECT_EQ(q.growths(), 0u);
@@ -4406,7 +4406,7 @@ TEST(OrderedWaitQueueRegression, CompactionWithAWrappedWindowKeepsOrder) {
     // N-2: advance the head past the middle of the ring, wrap the window
     // physically, tombstone the middle and compact (eager and full-ring).
     OrderedWaitQueue<int> q;
-    q.reserve(16);                                            // a small ring: pow2(2·16 + slack) = 128 slots
+    q.reserve(16);                                            // a small ring: pow2(1.5·16 + slack) = 128 slots
     const std::size_t slots = q.capacitySlots();
     int next = 0;
     std::vector<int> expect;
@@ -4426,4 +4426,28 @@ TEST(OrderedWaitQueueRegression, CompactionWithAWrappedWindowKeepsOrder) {
     EXPECT_EQ(seen, kept) << "order lost compacting a wrapped window";
     EXPECT_EQ(q.growths(), 0u);
     EXPECT_GT(q.compactions(), 0u);
+}
+
+TEST(OrderedWaitQueueRegression, CompactionRebasesTheWindowToSlotZero) {
+    // N-8: a compaction whose survivors fit in front of the head's physical
+    // slot (no physical wrap) moves the window back to slot 0, in order.
+    OrderedWaitQueue<int> q;
+    q.reserve(1000);                                          // pow2(1.5·1000 + 64) = 2048 slots
+    ASSERT_EQ(q.capacitySlots(), 2048u);
+    for (int v = 0; v < 1500; ++v) q.push_back(int{v});
+    (void)q.sweep([](int v) { return v < 1400; });            // head at physical 1400; 100 live, span 100
+    ASSERT_EQ(q.headForTest(), 1400u);
+    ASSERT_EQ(q.compactions(), 0u);
+    // Remove 80 from the middle: live 20, span 100 > 1.5·20 + 64 = 94 → compaction.
+    (void)q.sweep([](int v) { return v > 1400 && v < 1481; });
+    ASSERT_EQ(q.compactions(), 1u);
+    EXPECT_EQ(q.headForTest(), 0u) << "the compacted window was not rebased to slot 0";
+    EXPECT_EQ(q.spanForTest(), 20u);
+    std::vector<int> seen, expect{1400};
+    for (int v = 1481; v < 1500; ++v) expect.push_back(v);
+    q.forEach([&](int v) { seen.push_back(v); });
+    EXPECT_EQ(seen, expect) << "order lost across the rebase";
+    q.push_back(int{1500});                                    // keeps appending after the rebase
+    EXPECT_EQ(q.at(20), 1500);
+    EXPECT_EQ(q.growths(), 0u);
 }

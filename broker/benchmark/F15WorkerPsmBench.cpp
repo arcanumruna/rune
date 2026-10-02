@@ -316,15 +316,20 @@ void BM_StrictPipelined(benchmark::State& state) {
         w.doWork(++now);
         drain();
     }
+    // N-8: the rate and latency counters cover the TIMED loop only — settle
+    // acks (the in-flight window drained after it) are excluded.
+    const int64_t ackedTimed = acked;
+    const std::size_t latTimed = latNs.size();
     for (int i = 0; i < 50'000'000 && acked + errors < corr; ++i) { w.doWork(++now); drain(); }   // settle (bounded)
+    latNs.resize(latTimed);
     if (errors != 0) state.SkipWithError("Strict produces answered with an error");
     std::sort(latNs.begin(), latNs.end());
     if (!latNs.empty()) {
         state.counters["p50us"] = static_cast<double>(latNs[latNs.size() / 2]) / 1000.0;
         state.counters["p99us"] = static_cast<double>(latNs[latNs.size() * 99 / 100]) / 1000.0;
     }
-    state.counters["acked_per_s"] = benchmark::Counter(static_cast<double>(acked), benchmark::Counter::kIsRate);
-    state.SetItemsProcessed(acked);
+    state.counters["acked_per_s"] = benchmark::Counter(static_cast<double>(ackedTimed), benchmark::Counter::kIsRate);
+    state.SetItemsProcessed(ackedTimed);
     std::error_code ec; fs::remove_all(dir, ec);
 }
 BENCHMARK(BM_StrictPipelined)->Arg(1)->Arg(16)->Unit(benchmark::kMicrosecond)->MinTime(2.0)->UseRealTime();
