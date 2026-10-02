@@ -638,7 +638,12 @@ public:
 
     /// Self-contained worker shards (spec §3.1): number of per-worker invoker
     /// drivers built (0 in legacy mode).  Startup/stop-time state (no worker access).
-    [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept { return shardDrivers_.size(); }
+    /// Shard drivers this node OWNS (fused worker 0 rides the node driver: not counted).
+    [[nodiscard]] std::size_t shardDriverCountForTest() const noexcept {
+        std::size_t n = 0;
+        for (const auto& d : shardDrivers_) n += d ? 1u : 0u;
+        return n;
+    }
     /// Worker w (owned by its own thread — touch only inside onOwnerThreadForTest).
     [[nodiscard]] Worker* workerForTest(int32_t w) const noexcept {
         return workerPool_ && w >= 0 && w < workerPool_->workerCount() ? &workerPool_->worker(w) : nullptr;
@@ -898,7 +903,10 @@ private:
     // Normally torn down explicitly in stop() (teardownShardRuntimes_) after the
     // worker runners are joined and each invoker driver is handed to the closing
     // thread (join → bindPumpThread → close), before the node driver.
-    std::vector<std::unique_ptr<EmbeddedDriver>> shardDrivers_;
+    std::vector<std::unique_ptr<EmbeddedDriver>> shardDrivers_;   ///< null = rides the node driver (fused w0)
+    EmbeddedDriver& shardDriver_(std::size_t w) noexcept {
+        return shardDrivers_[w] ? *shardDrivers_[w] : *nodeDriver_;
+    }
     std::vector<std::shared_ptr<aeron::Aeron>>   shardClients_;
     std::vector<std::unique_ptr<ShardAgent>>     shardAgents_;
     // F3 round 6, item 3: control-thread-owned SchemaUpdate fan-out (the
