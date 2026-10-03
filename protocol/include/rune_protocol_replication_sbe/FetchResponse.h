@@ -116,7 +116,7 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(46);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(34);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(2);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(112);
     static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(3);
@@ -174,7 +174,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(46);
+        return static_cast<std::uint16_t>(34);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -693,142 +693,6 @@ public:
         return *this;
     }
 
-    SBE_NODISCARD static const char *divergingEpochMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
-    {
-        switch (metaAttribute)
-        {
-            case MetaAttribute::PRESENCE: return "required";
-            default: return "";
-        }
-    }
-
-    static SBE_CONSTEXPR std::uint16_t divergingEpochId() SBE_NOEXCEPT
-    {
-        return 8;
-    }
-
-    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t divergingEpochSinceVersion() SBE_NOEXCEPT
-    {
-        return 3;
-    }
-
-    SBE_NODISCARD bool divergingEpochInActingVersion() SBE_NOEXCEPT
-    {
-        return m_actingVersion >= divergingEpochSinceVersion();
-    }
-
-    SBE_NODISCARD static SBE_CONSTEXPR std::size_t divergingEpochEncodingOffset() SBE_NOEXCEPT
-    {
-        return 34;
-    }
-
-    static SBE_CONSTEXPR std::int32_t divergingEpochNullValue() SBE_NOEXCEPT
-    {
-        return SBE_NULLVALUE_INT32;
-    }
-
-    static SBE_CONSTEXPR std::int32_t divergingEpochMinValue() SBE_NOEXCEPT
-    {
-        return INT32_C(-2147483647);
-    }
-
-    static SBE_CONSTEXPR std::int32_t divergingEpochMaxValue() SBE_NOEXCEPT
-    {
-        return INT32_C(2147483647);
-    }
-
-    static SBE_CONSTEXPR std::size_t divergingEpochEncodingLength() SBE_NOEXCEPT
-    {
-        return 4;
-    }
-
-    SBE_NODISCARD std::int32_t divergingEpoch() const SBE_NOEXCEPT
-    {
-        if (m_actingVersion < 3)
-        {
-            return INT32_MIN;
-        }
-
-        std::int32_t val;
-        std::memcpy(&val, m_buffer + m_offset + 34, sizeof(std::int32_t));
-        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
-    }
-
-    FetchResponse &divergingEpoch(const std::int32_t value) SBE_NOEXCEPT
-    {
-        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
-        std::memcpy(m_buffer + m_offset + 34, &val, sizeof(std::int32_t));
-        return *this;
-    }
-
-    SBE_NODISCARD static const char *divergingEndOffsetMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
-    {
-        switch (metaAttribute)
-        {
-            case MetaAttribute::PRESENCE: return "required";
-            default: return "";
-        }
-    }
-
-    static SBE_CONSTEXPR std::uint16_t divergingEndOffsetId() SBE_NOEXCEPT
-    {
-        return 9;
-    }
-
-    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t divergingEndOffsetSinceVersion() SBE_NOEXCEPT
-    {
-        return 3;
-    }
-
-    SBE_NODISCARD bool divergingEndOffsetInActingVersion() SBE_NOEXCEPT
-    {
-        return m_actingVersion >= divergingEndOffsetSinceVersion();
-    }
-
-    SBE_NODISCARD static SBE_CONSTEXPR std::size_t divergingEndOffsetEncodingOffset() SBE_NOEXCEPT
-    {
-        return 38;
-    }
-
-    static SBE_CONSTEXPR std::int64_t divergingEndOffsetNullValue() SBE_NOEXCEPT
-    {
-        return SBE_NULLVALUE_INT64;
-    }
-
-    static SBE_CONSTEXPR std::int64_t divergingEndOffsetMinValue() SBE_NOEXCEPT
-    {
-        return INT64_C(-9223372036854775807);
-    }
-
-    static SBE_CONSTEXPR std::int64_t divergingEndOffsetMaxValue() SBE_NOEXCEPT
-    {
-        return INT64_C(9223372036854775807);
-    }
-
-    static SBE_CONSTEXPR std::size_t divergingEndOffsetEncodingLength() SBE_NOEXCEPT
-    {
-        return 8;
-    }
-
-    SBE_NODISCARD std::int64_t divergingEndOffset() const SBE_NOEXCEPT
-    {
-        if (m_actingVersion < 3)
-        {
-            return INT64_MIN;
-        }
-
-        std::int64_t val;
-        std::memcpy(&val, m_buffer + m_offset + 38, sizeof(std::int64_t));
-        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
-    }
-
-    FetchResponse &divergingEndOffset(const std::int64_t value) SBE_NOEXCEPT
-    {
-        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
-        std::memcpy(m_buffer + m_offset + 38, &val, sizeof(std::int64_t));
-        return *this;
-    }
-
     SBE_NODISCARD static const char *recordsMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
@@ -1043,14 +907,6 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("topicId": )";
     builder << +writer.topicId();
-
-    builder << ", ";
-    builder << R"("divergingEpoch": )";
-    builder << +writer.divergingEpoch();
-
-    builder << ", ";
-    builder << R"("divergingEndOffset": )";
-    builder << +writer.divergingEndOffset();
 
     builder << ", ";
     builder << R"("records": )";
