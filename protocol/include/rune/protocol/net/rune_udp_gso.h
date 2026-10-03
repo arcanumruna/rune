@@ -50,6 +50,14 @@ static inline size_t rune_gro_segment_len(size_t len, size_t seg, size_t index)
     return (len - off < seg) ? (len - off) : seg;
 }
 
+/* Aeron network_publication_max_messages_per_send to use with these bindings: 16 (Aeron's max) only when GSO
+ * send is active AND two MTU datagrams fit one GSO send (else every group is a single datagram and a deeper
+ * batch only adds burstiness); 0 = keep Aeron's default (2). */
+static inline unsigned rune_gso_msgs_per_send(int gso_active, size_t mtu)
+{
+    return (gso_active && 0 != mtu && 2 * mtu <= RUNE_GSO_MAX_BYTES) ? 16u : 0u;
+}
+
 #ifdef __cplusplus
 }
 #endif

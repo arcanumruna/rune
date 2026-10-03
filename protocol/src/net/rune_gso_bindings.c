@@ -1,9 +1,15 @@
 /* rune_gso_bindings.c — see rune/protocol/net/rune_gso_bindings.h.
  *
- * Threading (verified in Aeron's driver): every transport init/close runs on the CONDUCTOR (endpoint create /
- * *_endpoint_delete); send/recvmmsg run on the sender/receiver agent that owns the endpoint.  Per-transport state
- * (transport->bindings_clientd) is therefore written by exactly one agent at a time, and owner->totals only by the
- * conductor.  No locks, no atomics, no allocation on the send/receive path. */
+ * Threading (verified in Aeron's C driver, 1.4x):
+ *  - init_func runs ONLY on the conductor (send endpoint / receive destination create).
+ *  - send/recvmmsg run on the sender/receiver agent that owns the transport.
+ *  - close_func runs on the conductor (endpoint delete) OR on the RECEIVER agent (multi-destination subscription
+ *    remove-destination / failed add: aeron_driver_receiver.c on_add/on_remove_destination).
+ * So: per-transport state is allocated and appended to owner->states by the conductor only (init); close never
+ * touches the owner (it only detaches the state from the transport); per-transport counters are written only by
+ * the agent driving that transport; states are freed and totals summed only after aeron_driver_close (all agents
+ * stopped).  No locks, no atomics, no allocation on the send/receive path.  Memory: one small state per transport
+ * ever created, freed at rune_gso_bindings_delete. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
@@ -48,9 +54,10 @@ struct rune_gso_bindings_stct
     aeron_udp_channel_transport_bindings_t defaults; /* Aeron's stock bindings: every fallback goes through these */
     int gso_enabled;
     int gro_enabled;
-    int inject_errno;
+    int inject_errno;            /* test seams: set before driver start, consumed by one agent */
     int inject_count;
-    rune_gso_totals_t totals;
+    int inject_trunc_count;
+    struct rune_gso_transport_state_stct *states; /* conductor-only list (init); freed at delete */
 };
 
 typedef union rune_gro_ctrl_un
@@ -63,8 +70,10 @@ rune_gro_ctrl_t;
 typedef struct rune_gso_transport_state_stct
 {
     rune_gso_bindings_t *owner;
+    struct rune_gso_transport_state_stct *next;
     int gso_on;
-    int gro_on;
+    int gro_parse;   /* this transport receives through rune_gro_recvmmsg (GRO was enabled at init) */
+    int gro_on;      /* UDP_GRO currently enabled on recv_fd (turned off after a MSG_TRUNC) */
     int gso_logged;
     int gro_logged;
     rune_gso_totals_t t;
@@ -80,6 +89,10 @@ static void rune_gso_totals_add(rune_gso_totals_t *dst, const rune_gso_totals_t 
     dst->gro_buffers += src->gro_buffers;
     dst->gro_datagrams += src->gro_datagrams;
     dst->gro_ctrunc_drops += src->gro_ctrunc_drops;
+    dst->gro_trunc_drops += src->gro_trunc_drops;
+    dst->gro_disabled += src->gro_disabled;
+    dst->transports += src->transports;
+    dst->gro_transports += src->gro_transports;
 }
 
 static int rune_gso_init(
@@ -106,16 +119,25 @@ static int rune_gso_init(
     rune_gso_transport_state_t *st = (rune_gso_transport_state_t *)calloc(1, sizeof(*st));
     if (NULL == st)
     {
-        owner->defaults.close_func(transport);
-        AERON_SET_ERR(ENOMEM, "%s", "rune-gso: failed to allocate transport state");
-        return -1;
+        /* Never fail (or double-close) a transport Aeron would have created: run it as stock Aeron. */
+        transport->bindings_clientd = NULL;
+        fprintf(stderr, "rune-gso: WARN no memory for transport state fd=%d; stock Aeron for it\n", (int)transport->fd);
+        return 0;
     }
     st->owner = owner;
     st->gso_on = owner->gso_enabled;
+    st->t.transports = 1;
+    /* GRO only on RECEIVER-affinity sockets: the sender agent polls its control sockets (status messages, NAKs)
+     * with mtu-sized buffers, so a GRO-merged burst would be truncated there.  And only where no other receive
+     * cmsg (media timestamps) competes for the control buffer. */
     int one = 1;
-    /* GRO only where no other receive cmsg (media timestamps) competes for the control buffer. */
-    st->gro_on = owner->gro_enabled && 0 == transport->timestamp_flags &&
+    st->gro_on = owner->gro_enabled && AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER == affinity &&
+        0 == transport->timestamp_flags &&
         0 == setsockopt(transport->recv_fd, SOL_UDP, UDP_GRO, &one, sizeof(one));
+    st->gro_parse = st->gro_on;
+    st->t.gro_transports = st->gro_on ? 1 : 0;
+    st->next = owner->states; /* conductor-only */
+    owner->states = st;
     transport->bindings_clientd = st;
     return 0;
 }
@@ -127,11 +149,10 @@ static int rune_gso_close(aeron_udp_channel_transport_t *transport)
     {
         return aeron_udp_channel_transport_close(transport);
     }
-    rune_gso_bindings_t *owner = st->owner;
-    rune_gso_totals_add(&owner->totals, &st->t);
+    /* May run on the receiver agent (MDS): never touch the owner here; the state stays on owner->states and
+     * is summed / freed after aeron_driver_close. */
     transport->bindings_clientd = NULL;
-    free(st);
-    return owner->defaults.close_func(transport);
+    return st->owner->defaults.close_func(transport);
 }
 
 /* One sendmsg(UDP_SEGMENT) carrying `count` datagrams of iov[0].iov_len bytes (last may be shorter).
@@ -185,7 +206,10 @@ static int rune_gso_sendmsg(
     if (sent < 0)
     {
         const int err = errno;
-        if (EAGAIN == err || EWOULDBLOCK == err || EINTR == err || ECONNREFUSED == err || ENOBUFS == err)
+        /* Same classification as Aeron's stock sendmmsg (aeron_udp_channel_transport_sendv): these four are a
+         * short send; everything else — ENOBUFS included — is a send error.  Either way the network
+         * publication does not advance snd-pos and re-sends the batch on its next duty cycle. */
+        if (EAGAIN == err || EWOULDBLOCK == err || EINTR == err || ECONNREFUSED == err)
         {
             return 0;
         }
@@ -278,7 +302,7 @@ static int rune_gro_recvmmsg(
     {
         return aeron_udp_channel_transport_recvmmsg(transport, msgvec, vlen, bytes_rcved, recv_func, clientd);
     }
-    if (!st->gro_on)
+    if (!st->gro_parse)
     {
         return st->owner->defaults.recvmmsg_func(transport, msgvec, vlen, bytes_rcved, recv_func, clientd);
     }
@@ -311,6 +335,12 @@ static int rune_gro_recvmmsg(
         return -1;
     }
 
+    if (result > 0 && st->owner->inject_trunc_count > 0) /* test seam only: production never sets it */
+    {
+        st->owner->inject_trunc_count--;
+        msgvec[0].msg_hdr.msg_flags |= MSG_TRUNC;
+    }
+
     int delivered = 0;
     for (int i = 0; i < result; i++)
     {
@@ -331,6 +361,22 @@ static int rune_gro_recvmmsg(
         if (0 != (h->msg_flags & MSG_CTRUNC))
         {
             st->t.gro_ctrunc_drops++; /* cannot know the segment size: drop = loss, Aeron NAKs recover it */
+            continue;
+        }
+        if (0 != (h->msg_flags & MSG_TRUNC))
+        {
+            /* The coalesced buffer did not fit: its tail is gone, so drop it all (= loss, NAKs recover) and stop
+             * coalescing on this socket.  Keep parsing UDP_GRO cmsgs: buffers already queued stay coalesced. */
+            st->t.gro_trunc_drops++;
+            if (st->gro_on)
+            {
+                int zero = 0;
+                (void)setsockopt(transport->recv_fd, SOL_UDP, UDP_GRO, &zero, sizeof(zero));
+                st->gro_on = 0;
+                st->t.gro_disabled = 1;
+                fprintf(stderr, "rune-gso: WARN truncated GRO buffer (len=%zu) on recv_fd=%d; GRO off for it\n",
+                    len, (int)transport->recv_fd);
+            }
             continue;
         }
 
@@ -423,6 +469,11 @@ rune_gso_bindings_t *rune_gso_bindings_create(int want_gso, int want_gro)
     return b;
 }
 
+int rune_gso_bindings_active(const rune_gso_bindings_t *b)
+{
+    return NULL == b ? 0 : ((b->gso_enabled ? 1 : 0) | (b->gro_enabled ? 2 : 0));
+}
+
 int rune_gso_bindings_install(aeron_driver_context_t *ctx, rune_gso_bindings_t *b)
 {
     if (NULL == ctx || NULL == b)
@@ -435,9 +486,9 @@ int rune_gso_bindings_install(aeron_driver_context_t *ctx, rune_gso_bindings_t *
 void rune_gso_bindings_totals(const rune_gso_bindings_t *b, rune_gso_totals_t *out)
 {
     memset(out, 0, sizeof(*out));
-    if (NULL != b)
+    for (const rune_gso_transport_state_t *st = NULL != b ? b->states : NULL; NULL != st; st = st->next)
     {
-        *out = b->totals;
+        rune_gso_totals_add(out, &st->t);
     }
 }
 
@@ -448,6 +499,30 @@ void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count)
         b->inject_errno = err;
         b->inject_count = count;
     }
+}
+
+void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count)
+{
+    if (NULL != b)
+    {
+        b->inject_trunc_count = count;
+    }
+}
+
+void rune_gso_bindings_delete(rune_gso_bindings_t *b)
+{
+    if (NULL == b)
+    {
+        return;
+    }
+    rune_gso_transport_state_t *st = b->states;
+    while (NULL != st)
+    {
+        rune_gso_transport_state_t *next = st->next;
+        free(st);
+        st = next;
+    }
+    free(b);
 }
 
 #else /* !__linux__ : stock Aeron everywhere */
@@ -462,10 +537,8 @@ rune_gso_bindings_t *rune_gso_bindings_create(int want_gso, int want_gro) { (voi
 int rune_gso_bindings_install(aeron_driver_context_t *ctx, rune_gso_bindings_t *b) { (void)ctx; (void)b; return -1; }
 void rune_gso_bindings_totals(const rune_gso_bindings_t *b, rune_gso_totals_t *out) { (void)b; memset(out, 0, sizeof(*out)); }
 void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count) { (void)b; (void)err; (void)count; }
+void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count) { (void)b; (void)count; }
+int rune_gso_bindings_active(const rune_gso_bindings_t *b) { (void)b; return 0; }
+void rune_gso_bindings_delete(rune_gso_bindings_t *b) { free(b); }
 
 #endif
-
-void rune_gso_bindings_delete(rune_gso_bindings_t *b)
-{
-    free(b);
-}

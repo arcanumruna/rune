@@ -51,3 +51,13 @@ TEST(UdpGsoPlan, GroCountAndLengths) {
     EXPECT_EQ(rune_gro_segment_len(4225, 1408, 3), 1u);
     EXPECT_EQ(rune_gro_segment_len(3500, 1408, 2), 684u);
 }
+
+// Fix round 1 (review M2): raise Aeron's msgs-per-send only when a GSO group of >= 2 MTU datagrams can exist.
+TEST(UdpGsoPlan, MsgsPerSendRaisedOnlyWhenGsoCanGroup) {
+    EXPECT_EQ(rune_gso_msgs_per_send(1, 1408), 16u);
+    EXPECT_EQ(rune_gso_msgs_per_send(1, 8192), 16u);
+    EXPECT_EQ(rune_gso_msgs_per_send(1, 32736), 16u);   // 2 x 32736 = 65472 <= 65507
+    EXPECT_EQ(rune_gso_msgs_per_send(1, 32768), 0u);    // 2 x 32768 > 65507: GSO can never group
+    EXPECT_EQ(rune_gso_msgs_per_send(1, 65504), 0u);    // loopback-derived MTU
+    EXPECT_EQ(rune_gso_msgs_per_send(0, 1408), 0u);     // no UDP_SEGMENT (GRO-only bindings, or none)
+}

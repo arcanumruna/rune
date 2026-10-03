@@ -22,6 +22,10 @@ typedef struct rune_gso_totals_stct
     uint64_t gro_buffers;      /* received buffers that held > 1 coalesced datagram */
     uint64_t gro_datagrams;    /* datagrams split out of them */
     uint64_t gro_ctrunc_drops; /* received buffers dropped: control data truncated (cannot split safely) */
+    uint64_t gro_trunc_drops;  /* received buffers dropped: payload truncated (MSG_TRUNC) */
+    uint64_t gro_disabled;     /* transports that turned GRO off after a MSG_TRUNC */
+    uint64_t transports;       /* transports created through these bindings */
+    uint64_t gro_transports;   /* of which GRO was enabled on (receiver-affinity sockets only) */
 }
 rune_gso_totals_t;
 
@@ -31,16 +35,24 @@ int rune_gso_platform_supported(void);
 /* NULL when neither (want_gso && supported) nor (want_gro && supported), or on allocation failure. */
 rune_gso_bindings_t *rune_gso_bindings_create(int want_gso, int want_gro);
 
+/* What these bindings do: 1 = GSO send, 2 = GRO receive (0 for NULL).  Runtime per-transport fallbacks are in
+ * the totals (gso_fallbacks / gro_disabled). */
+int rune_gso_bindings_active(const rune_gso_bindings_t *b);
+
 /* aeron_driver_context_set_udp_channel_transport_bindings(ctx, ...); 0 on success, -1 otherwise. */
 int rune_gso_bindings_install(aeron_driver_context_t *ctx, rune_gso_bindings_t *b);
 
-/* Sum over every transport closed so far (all are closed by aeron_driver_close). */
+/* Sum over every transport these bindings created.  Call ONLY after aeron_driver_close (every driver agent has
+ * stopped): the per-transport counters are written by the sender/receiver agents without synchronisation. */
 void rune_gso_bindings_totals(const rune_gso_bindings_t *b, rune_gso_totals_t *out);
 
 void rune_gso_bindings_delete(rune_gso_bindings_t *b);
 
 /* TEST SEAM — call before aeron_driver_start: the next `count` GSO sendmsg attempts fail with errno `err`. */
 void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count);
+
+/* TEST SEAM — call before aeron_driver_start: the next `count` received GRO buffers are flagged MSG_TRUNC. */
+void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count);
 
 #ifdef __cplusplus
 }
