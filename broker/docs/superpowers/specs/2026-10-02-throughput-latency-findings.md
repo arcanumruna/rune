@@ -353,6 +353,16 @@ per hop × ~4 hops).
   no leadership/ISR/HW eligibility for a replica restarted after an unclean shutdown until caught up (KIP-966-style),
   explicit flush-interval config (Strict tier unchanged), minIsr gating, rack-aware placement, and DR fault tests
   (kill -9 all, hard crash with unflushed data: no acknowledged record lost). Details: broker SDD ledger DUR-1.
+  DR testing for DUR-1 (and from then on for every durability/replication change):
+  - PRIMARY: very fast in-process integration tests that drive disaster scenarios deterministically (no Docker,
+    no sleeps, injected clock + fault injection at the storage/transport seams): unclean-shutdown truncation,
+    leader crash with an unflushed tail, follower restart after unclean shutdown (no ISR/HW eligibility until caught
+    up), ISR shrink/expand under faults, KIP-101 epoch truncation, partial writes / torn batches, producer-state
+    rebuild after crash (EOS: no duplicate, no OOS for stored batches), split-brain / stale leader fencing,
+    kill-all with acks=all -> no acknowledged record lost.  Seconds per suite; part of the default test run.
+  - SECONDARY: the dockerized e2e DR matrix (dr-e2e) re-run on k3s-node-01 and extended with the same edge cases
+    (kill -9 all, hard crash with unflushed data, rolling restarts under load, netem loss/delay/partition,
+    disk-full, slow follower) as the real-process confirmation.
 
 
 - **LAT-1 (after throughput/p99 analysis): productionize the env-gated latency experiments.** Today they exist only as
