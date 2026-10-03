@@ -129,6 +129,10 @@
       <!-- reserved for F15-FU1 (hanging-transaction safety net); never emitted yet. -->
       <validValue name="TXN_HANGING">2</validValue>
     </enum>
+
+    <!-- E1d: the fixed block a WriteSyncRequest writes (a recovery-point
+         checkpoint slot image).  `length` says how many of its bytes. -->
+    <type name="WriteBlock64" primitiveType="uint8" length="64"/>
   </types>
 
   <!-- ====================================================================== -->
@@ -289,6 +293,21 @@
     <field name="leaderEpoch" id="5" type="int32"/>
     <field name="token"       id="6" type="int64"/>
     <field name="errorCode"   id="7" type="int16"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- WriteSyncRequest (worker → flusher, the SAME submit ring as            -->
+  <!-- FlushRequest, discriminated by template id).  E1d: pwrite a small fixed -->
+  <!-- block (<= 64 bytes, carried inline — no pointer, no lifetime coupling) -->
+  <!-- at `fileOffset` of an already-open, pre-allocated file, then fdatasync it;  -->
+  <!-- ONE FlushCompletion (same token space) reports the combined result.    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="WriteSyncRequest" id="7" description="async pwrite of a small block + fdatasync">
+    <field name="fd"     id="1" type="int32"/>
+    <field name="length" id="2" type="uint16"/>
+    <field name="fileOffset" id="3" type="int64"/>
+    <field name="token"  id="4" type="int64"/>
+    <field name="block"  id="5" type="WriteBlock64"/>
   </sbe:message>
 
 </sbe:messageSchema>
