@@ -76,6 +76,7 @@
 // NO Docker.  NO mocks.  C++23.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
@@ -154,20 +155,7 @@ struct PwTempDir {
 };
 
 static uint16_t pwDiscoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd); throw std::runtime_error("bind() failed");
-    }
-    socklen_t addrLen = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port    = static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::vector<uint16_t> pwDiscoverFreePorts(int n) {
@@ -1438,18 +1426,22 @@ void runExactEffectiveMaxReplicates(bool perWorker) {
     for (auto& n : nodes) n->start();
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
 
-    const auto lid = nodes[0]->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-    rune::node::BrokerNode* leader = nodes[static_cast<std::size_t>(lid)].get();
+    // D8: follow the CURRENT leader — under CPU contention leadership can move between the first leaderId()
+    // read and the partition role settling; pinning the first answer waited 30 s on a node that never led.
+    rune::node::BrokerNode* leader = nullptr;
     {
         const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline &&
-               !(leader->replicationIsLeaderForTest() && hasReplica(*leader) &&
-                 roleOnOwner(*leader) == Role::Leader)) {
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto lid = nodes[0]->leaderId();
+            if (lid >= 0 && lid <= 2) {
+                leader = nodes[static_cast<std::size_t>(lid)].get();
+                if (leader->replicationIsLeaderForTest() && hasReplica(*leader) && roleOnOwner(*leader) == Role::Leader)
+                    break;
+            }
             std::this_thread::sleep_for(20ms);
         }
     }
+    ASSERT_NE(leader, nullptr);
     ASSERT_EQ(roleOnOwner(*leader), Role::Leader);
     for (auto& n : nodes) {
         ASSERT_EQ(n->gatewayForTest()->maxProduceBatchBytes(), effMax)

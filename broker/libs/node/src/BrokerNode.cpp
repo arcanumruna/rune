@@ -1658,9 +1658,13 @@ void BrokerNode::buildGateway() {
                          nodeId, config_.peers.size());
         }
     } catch (const std::exception& ex) {
-        spdlog::warn("BrokerNode[{}]: ClientGateway construction failed: {}; proceeding without gateway",
-                     nodeId, ex.what());
+        // D8 (2026-10-03): fail-fast, never a HEADLESS node.  This used to warn and continue without a
+        // gateway: the node still joined consensus (and could lead) but no client could ever reach it
+        // (and callers null-dereferenced gatewayForTest()).  Same rule as the per-worker transports.
         gateway_.reset();
+        throw std::runtime_error("BrokerNode[" + std::to_string(nodeId) +
+                                 "]: ClientGateway construction failed — refusing to start without a client gateway: " +
+                                 ex.what());
     }
 
     // -----------------------------------------------------------------------

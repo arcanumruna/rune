@@ -193,7 +193,7 @@ public:
                 }
             }
             return pending.empty();
-        }, std::chrono::milliseconds{kResolveMaxMs});
+        }, rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers (errors stop it)
         // Any still-pending entries were not resolved within the window;
         // they remain absent from pubs_ → sends to them are no-ops.
         allResolved_ = pending.empty() && failedPeers == 0 && pubCount_ > 0 &&
@@ -481,7 +481,7 @@ private:
                     failed = true;
                     return nullptr;
                 }
-            }, std::chrono::milliseconds{AeronPubRegistry::kResolveMaxMs}, &failed);
+            }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);   // D8
         } catch (const std::exception& e) {
             spdlog::error("WorkerReplicationTransport[{}]: addSubscription {} stream {} failed: {}",
                           workerId_, inboundChannel_, inboundStreamId_, e.what());

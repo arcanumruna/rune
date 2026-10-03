@@ -1182,6 +1182,8 @@ if(BUILD_TESTING)
         tests/integration/GatewayPsmFailoverTest.cpp)
     target_compile_definitions(rune_psm_hw_bound_tests PRIVATE
         TX2B_UNIT_ONLY=1)
+    target_include_directories(rune_psm_hw_bound_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/libs/aeronutil/include)   # header-only testing/FreePort.h
     target_link_libraries(rune_psm_hw_bound_tests PRIVATE
         rune_storage
         GTest::gtest_main)

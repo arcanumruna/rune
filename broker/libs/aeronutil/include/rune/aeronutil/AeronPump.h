@@ -41,17 +41,25 @@ public:
         return w;
     }
 
-    /// Probe `find` until it yields a truthy value, `budget` elapses, `*failed`
-    /// becomes true (find saw a hard registration error), or the driver refuses
-    /// to be pumped by this thread.  Returns find()'s last result.
+    /// "No deadline of our own": resolve until Aeron ANSWERS — find yields, a registration error is
+    /// reported (find throws / sets `failed`), or the driver refuses the pump.  A dead driver is
+    /// still bounded: Aeron's client throws DriverTimeoutException from find* after the driver
+    /// timeout.  Production startup resolves use this (time-independent convergence — a tuned 5 s
+    /// cap made a loaded node refuse to start, D8 2026-10-03).
+    static constexpr std::chrono::milliseconds kUntilAnswered = std::chrono::milliseconds::max();
+
+    /// Probe `find` until it yields a truthy value, `budget` elapses (never, for kUntilAnswered),
+    /// `*failed` becomes true (find saw a hard registration error), or the driver refuses to be
+    /// pumped by this thread.  Returns find()'s last result.
     template <class Find>
     auto resolve(Find&& find, std::chrono::milliseconds budget,
                  const bool* failed = nullptr) -> decltype(find()) {
         using clock = std::chrono::steady_clock;
-        const auto deadline = clock::now() + budget;
+        const bool bounded = budget != kUntilAnswered;
+        const auto deadline = bounded ? clock::now() + budget : clock::time_point::max();
         for (;;) {
             auto r = find();
-            if (r || (failed && *failed) || clock::now() >= deadline) return r;
+            if (r || (failed && *failed) || (bounded && clock::now() >= deadline)) return r;
             if (invoker()) {
                 if (pump() < 0) return r;                      // refused: fail fast
             } else {

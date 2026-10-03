@@ -3,6 +3,7 @@
 // tests: its own (threaded) embedded driver + Aeron client, raw Rune protocol
 // frames over UDP.  Every wait is a bounded poll of a real condition (hard
 // iteration cap), never a sleep-for-correctness.
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/ControlMessages.h>
@@ -43,13 +44,7 @@ inline bool udpPortFree(uint16_t port) {
 }
 
 inline uint16_t freeUdpPort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-    socklen_t len = sizeof(a);
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 /// n disjoint blocks of `width` consecutive free UDP ports (per-worker base ranges).

@@ -93,10 +93,10 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     // Bounded resolve — same pattern as AeronIngress (spec §3.6: an invoker
     // driver + conductor is pumped by this thread between probes).
     sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); },
-                        std::chrono::milliseconds{kResolveMaxMs});
+                        rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers (errors throw)
     if (!sub_) {
         throw std::runtime_error(
-            "ClientGateway: ingress subscription not resolved within timeout");
+            "ClientGateway: ingress subscription not resolved (driver refused the pump)");
     }
 }
 

@@ -60,6 +60,7 @@
 // NO Docker.  C++23.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
 #include <gtest/gtest.h>
 
 // Storage + protocol (both unit and integration; no Aeron dependency)
@@ -278,19 +279,7 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
 // ===========================================================================
 
 static uint16_t tx2bFreePort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket failed");
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    ::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-    socklen_t l = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &l);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port = static_cast<uint16_t>(
-        (netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::vector<uint16_t> tx2bFreePorts(int n) {

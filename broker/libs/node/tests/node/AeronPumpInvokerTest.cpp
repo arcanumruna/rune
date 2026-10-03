@@ -245,3 +245,28 @@ TEST(WorkerReplicationPollRegression, ProductionTransportIsPolledDirectly) {
     EXPECT_FALSE(w.replicationPollIsIndirectForTest()) << "production poll must be a direct call";
     (void)w.doWork(1);   // drives the direct poll (no frames) without crashing
 }
+
+// D8 root cause (PerWorkerReplication flakes, 2026-10-03): every startup resolve had its OWN 5 s cap; under CPU
+// contention a registration answered later and BrokerNode refused to start ("did not resolve within 5s").  Aeron
+// already bounds a dead driver (find* throws DriverTimeoutException; registration errors throw too), so the
+// production resolve waits until Aeron ANSWERS — no tuned constant (time-independent convergence).
+namespace {
+int noopPump(void*) noexcept { return 0; }
+}
+TEST(AeronPumpRegression, UntilAnsweredHasNoDeadlineOfItsOwn) {
+    int noCtx = 0;
+    rune::aeronutil::AeronPump pump(&noopPump, &noCtx, nullptr);   // invoker: pumps, never sleeps
+    int calls = 0;
+    // A zero budget gives up at once ...
+    EXPECT_FALSE(pump.resolve([&] { return ++calls >= 1000; }, std::chrono::milliseconds{0}));
+    // ... "until answered" keeps going until find answers, however long that takes.
+    calls = 0;
+    EXPECT_TRUE(pump.resolve([&] { return ++calls >= 100000; }, rune::aeronutil::AeronPump::kUntilAnswered));
+    EXPECT_EQ(calls, 100000);
+    bool failed = false;
+    calls = 0;
+    EXPECT_FALSE(pump.resolve([&] { if (++calls == 7) failed = true; return false; },
+                              rune::aeronutil::AeronPump::kUntilAnswered, &failed))
+        << "a registration error (failed) still stops it";
+    EXPECT_EQ(calls, 7);
+}

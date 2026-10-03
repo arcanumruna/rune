@@ -65,7 +65,7 @@ public:
                   std::string                   channel,
                   int32_t                       streamId,
                   rune::aeronutil::AeronPump    pump   = {},
-                  std::chrono::milliseconds     budget = std::chrono::milliseconds{kResolveMaxMs}) noexcept
+                  std::chrono::milliseconds     budget = rune::aeronutil::AeronPump::kUntilAnswered) noexcept
         : aeron_(std::move(aeron))
         , channel_(std::move(channel))
         , streamId_(streamId)

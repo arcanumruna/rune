@@ -58,7 +58,7 @@ AeronPartitionTransport::AeronPartitionTransport(
 
     int64_t regId = aeron_->addSubscription(ingressChannel, ingressStreamId);
     sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); },
-                        std::chrono::milliseconds{kResolveMaxMs});
+                        rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
     if (!sub_) {
         throw std::runtime_error(
             "AeronPartitionTransport: ingress subscription not resolved within 5 s");

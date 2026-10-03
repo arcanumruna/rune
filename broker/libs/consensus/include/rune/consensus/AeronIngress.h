@@ -51,7 +51,7 @@ public:
 
         // Up to 5 s.  Spec §3.6: an invoker driver/conductor (fused runtime) is
         // pumped by this thread between probes; the default pump sleeps 1 ms.
-        sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, std::chrono::seconds{5});
+        sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
         if (!sub_) {
             throw std::runtime_error("AeronIngress: subscription not resolved within timeout");
         }

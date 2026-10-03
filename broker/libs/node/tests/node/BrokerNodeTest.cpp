@@ -1913,3 +1913,27 @@ TEST(BrokerNodeRegression, ClusterShStyleWildcardBindDerivesLoopbackMtuRegressio
     std::error_code ec; fs::remove_all(dir, ec);
 }
 } // namespace rune::node
+
+namespace rune::node {
+// D8 root cause (PerWorkerReplication segfault, 2026-10-03): a ClientGateway that failed to construct (here: its
+// client port is already bound) was logged and SKIPPED — the node ran HEADLESS: in consensus (it could lead)
+// but unreachable by any client, and gatewayForTest() was null.  Now start() refuses, like the per-worker planes.
+TEST(BrokerNodeRegression, GatewayConstructionFailureRefusesToStartNotHeadless) {
+    const fs::path dir = makeTempDataDir("headless_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    const int squat = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(squat, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(clientPort);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(squat, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0) << "test setup: occupy the client port";
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::exception) << "a node without its client gateway must not run";
+    EXPECT_EQ(node.gatewayForTest(), nullptr);
+    node.stop();
+    ::close(squat);
+}
+} // namespace rune::node
