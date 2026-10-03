@@ -2,6 +2,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
+#include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <atomic>
@@ -1564,4 +1565,101 @@ TEST(LogCleaner, CompactionPreservesProducerIdentity) {
     EXPECT_EQ(gotSeq,   expectedBaseSeq) << "baseSequence must be preserved through compaction";
 
     std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// D3 (I4): compaction must keep a batch's transactional/control attributes.
+// The cleaner rebuilt every kept record with a fresh RecordBatchBuilder, so a
+// transactional record lost kAttrTransactional and a COMMIT/ABORT marker came
+// out as an ordinary data record (two markers with the same key were even
+// deduplicated against each other).  read_committed then saw aborted data and
+// markers as user records.  Kafka: control batches are never key-compacted.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int64_t kTxnPid = 77;
+
+std::vector<uint8_t> txnBatch(int64_t off, std::string_view key, std::string_view val, int32_t seq) {
+    RecordBatchBuilder b(off, 1000 + off);
+    b.setProducerId(kTxnPid); b.setProducerEpoch(0); b.setBaseSequence(seq);
+    b.setTransactional(true);
+    b.append(key, val, 1000 + off);
+    return b.build();
+}
+std::vector<uint8_t> markerBatch(int64_t off) {
+    RecordBatchBuilder b(off, 1000 + off);
+    b.setProducerId(kTxnPid); b.setProducerEpoch(0);
+    b.setControl(true);
+    b.append(std::string_view("\0\0\0\1", 4), std::string_view("\0\0\0\0\0\0", 6), 1000 + off);  // COMMIT
+    return b.build();
+}
+void writeTxnLog(Log& log) {
+    log.append(txnBatch(0, "k1", "v1", 0), 0);   // superseded by @1
+    log.append(txnBatch(1, "k1", "v2", 1), 1);
+    log.append(markerBatch(2), 2);
+    log.append(txnBatch(3, "k2", "w", 2), 3);
+    log.append(markerBatch(4), 4);                // same marker key as @2
+    log.append(makeBatch(5, "k2", "x", 2005), 5);   // supersedes the producer's LAST record @3
+    for (int64_t i = 6; i < 9; ++i) log.append(makeBatch(i, "pad", "p", 2000 + i), i);
+}
+int16_t attrsAt(Log& log, int64_t off) {
+    auto bytes = log.read(off, 1 << 20);
+    if (bytes.empty()) return -1;
+    RecordBatchReader r(bytes.data(), bytes.size());
+    if (r.baseOffset() != off || !r.ensureValid()) return -1;
+    return r.attributes();
+}
+void expectTxnAttrsKept(Log& log, const char* path) {
+    const int16_t data = attrsAt(log, 1);
+    ASSERT_NE(data, -1) << path << ": txn record @1 must survive with a valid batch";
+    EXPECT_NE(data & batch::kAttrTransactional, 0) << path << ": @1 lost kAttrTransactional";
+    EXPECT_EQ(data & batch::kAttrControl, 0) << path;
+    // The producer's last batch @3 was superseded: its record-less tail batch keeps the txn bit.
+    const int16_t tail = attrsAt(log, 3);
+    ASSERT_NE(tail, -1) << path << ": producer-tail batch @3 must be retained";
+    EXPECT_NE(tail & batch::kAttrTransactional, 0) << path << ": tail @3 lost kAttrTransactional";
+    for (int64_t m : {2, 4}) {
+        const int16_t a = attrsAt(log, m);
+        ASSERT_NE(a, -1) << path << ": marker @" << m << " must survive compaction";
+        EXPECT_NE(a & batch::kAttrControl, 0) << path << ": marker @" << m << " lost kAttrControl";
+        EXPECT_NE(a & batch::kAttrTransactional, 0) << path << ": marker @" << m << " lost kAttrTransactional";
+    }
+}
+} // namespace
+
+TEST(LogCleanerTxnRegression, CompactionKeepsTransactionalAndControlAttributes) {
+    {   // synchronous path (OffsetMap)
+        auto dir = makeTempDir("lc_d3_sync");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            writeTxnLog(log);
+            LogCleaner cleaner;
+            cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
+            log.reloadSegments();
+            ASSERT_TRUE(log.read(0, 1 << 20).empty() || attrsAt(log, 0) == -1)
+                << "precondition: superseded k1@0 was compacted away";
+            expectTxnAttrsKept(log, "clean");
+        }
+        std::filesystem::remove_all(dir);
+    }
+    for (bool coalesce : {false, true}) {   // the cleaner thread's path (SkimpyOffsetMap)
+        auto dir = makeTempDir("lc_d3_range");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            writeTxnLog(log);
+            auto bases = log.segmentBaseOffsets();
+            const int64_t active = bases.back();
+            bases.pop_back();
+            std::vector<int64_t> sizes(bases.size(), 1);
+            LogCleaner cleaner;
+            SkimpyOffsetMap map(1024);
+            const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1'000'000,
+                                                                map, coalesce, 1 << 20);
+            ASSERT_TRUE(res.compacted) << "precondition: something was cleaned";
+            log.reloadSegments();
+            expectTxnAttrsKept(log, coalesce ? "range+coalesce" : "range");
+        }
+        std::filesystem::remove_all(dir);
+    }
 }

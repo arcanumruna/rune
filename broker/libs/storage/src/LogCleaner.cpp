@@ -142,6 +142,15 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
 
 
 namespace {
+// D3 (I4): a COMMIT/ABORT marker batch.  Never key-compacted, never indexed in the
+// offset map (Kafka: control batches are not subject to key compaction).
+bool isControlBatch(const rune::protocol::RecordBatchReader& r) {
+    return (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0;
+}
+bool isTransactionalBatch(const rune::protocol::RecordBatchReader& r) {
+    return (static_cast<uint16_t>(r.attributes()) &
+            static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional)) != 0;
+}
 // Kafka LogCleaner parity (ProducerTails.h): note the batch if it is an
 // idempotent DATA batch starting below `toOffset`.
 void noteProducerTail(const uint8_t* batch, const rune::protocol::RecordBatchReader& r, Offset toOffset,
@@ -157,8 +166,10 @@ void noteProducerTail(const uint8_t* batch, const rune::protocol::RecordBatchRea
 // covers `lastOffset`, carries the producer id / epoch / the batch's last
 // sequence / its maxTimestamp, holds no record (no key can resurrect).
 void appendEmptyTailBatch(std::vector<uint8_t>& out, std::vector<uint8_t>& tmp, int64_t lastOffset,
-                          int64_t maxTimestampMs, int64_t producerId, int16_t producerEpoch, int32_t lastSequence) {
+                          int64_t maxTimestampMs, int64_t producerId, int16_t producerEpoch, int32_t lastSequence,
+                          bool transactional) {
     rune::protocol::RecordBatchBuilder b(lastOffset, maxTimestampMs);
+    b.setTransactional(transactional);
     b.setProducerId(producerId);
     b.setProducerEpoch(producerEpoch);
     b.setBaseSequence(lastSequence);
@@ -232,7 +243,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             noteProducerTail(buf.data() + pos, r, toOffset, map.producerTails());
 
             bool full = false;
-            r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
+            if (!isControlBatch(r)) r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
                 if (full) return;
                 if (offset < fromOffset || offset >= toOffset) return;
@@ -301,7 +312,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (!r.ensureValid()) break;
             noteProducerTail(buf.data() + pos, r, toOffset, map.producerTails());
 
-            r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
+            if (!isControlBatch(r)) r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
                 if (offset < fromOffset || offset >= toOffset) return;
                 if (key.empty()) return; // skip null-key records (not compactable)
@@ -411,6 +422,13 @@ bool LogCleaner::rewriteSegmentImpl(
             pos += static_cast<size_t>(total);
             continue;
         }
+        if (isControlBatch(r)) {   // D3: markers are copied verbatim, never key-compacted
+            outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                          buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+            pos += static_cast<size_t>(total);
+            continue;
+        }
+        const bool batchIsTxn = isTransactionalBatch(r);   // D3: rebuilt records keep the txn bit
         bool lastKept = false;   // the record at batchLastOffset was emitted
 
         // CP-8: does this batch contain any tombstone (for horizon stamping)?
@@ -438,6 +456,7 @@ bool LogCleaner::rewriteSegmentImpl(
             // @param horizonMs  If >= 0, stamp this as a delete-horizon batch.
             auto keepWithHorizon = [&](int64_t horizonMs) {
                 rune::protocol::RecordBatchBuilder b(offset, timestamp);
+                b.setTransactional(batchIsTxn);
                 if (horizonMs >= 0) {
                     // CP-8: Stamp the output batch with the delete horizon.
                     // This sets kAttrDeleteHorizon and puts horizonMs into baseTimestamp.
@@ -577,7 +596,8 @@ bool LogCleaner::rewriteSegmentImpl(
         // C2: the producer's last record was dropped — keep its METADATA only.
         if (tailNeeded && !lastKept) {
             appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId, origProducerEpoch,
-                                 origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset));
+                                 origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
+                                 batchIsTxn);
         }
 
         pos += static_cast<size_t>(total);
@@ -1159,12 +1179,20 @@ void LogCleaner::mergeGroupWithMap(
                 pos += static_cast<size_t>(total);
                 continue;
             }
+            if (isControlBatch(r)) {   // D3: markers are copied verbatim, never key-compacted
+                outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                              buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+                pos += static_cast<size_t>(total);
+                continue;
+            }
+            const bool batchIsTxn = isTransactionalBatch(r);   // D3: rebuilt records keep the txn bit
             bool lastKept = false;
 
             r.forEachRecord([&](std::string_view key, std::string_view val,
                           int64_t offset, int64_t timestamp) {
                 auto keepWithHorizon2 = [&](int64_t horizonMs2) {
                     rune::protocol::RecordBatchBuilder b2(offset, timestamp);
+                    b2.setTransactional(batchIsTxn);
                     if (horizonMs2 >= 0) b2.setDeleteHorizonMs(horizonMs2);
                     b2.append(key, val, timestamp);
                     b2.buildInto(tmpBatch);
@@ -1229,7 +1257,8 @@ void LogCleaner::mergeGroupWithMap(
             if (tailNeeded && !lastKept) {   // C2: metadata only
                 appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId,
                                      origProducerEpoch,
-                                     origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset));
+                                     origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
+                                 batchIsTxn);
             }
 
             pos += static_cast<size_t>(total);
