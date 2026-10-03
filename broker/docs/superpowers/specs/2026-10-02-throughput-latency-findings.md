@@ -259,6 +259,20 @@ channel/port, many streams) -> 1-2 recv syscalls per duty; (2) one driver duty p
 moved data (the "repeat while work" loop runs ~2.2x, second pass mostly housekeeping); (3) idle publications/images
 walked every duty (~20 PubSend/ImageClean per pass) - fewer publications per worker.
 
+### 4.7 Per-pass driver + control plane off the worker (2026-10-03, backoff workers, MTU 65504, fsync off)
+
+| arm | 20k acks=all p50 / p99 | saturation rec/s |
+|---|---|---|
+| A base (fused, whole-driver loop) | 448 us / 9.8 ms | **200,506** |
+| B thread placement + per-pass driver | 3,441 us / 40.9 ms | 91,574 |
+| C thread placement only | 3,408 us / 42.2 ms | - |
+| D per-pass driver only (conductor once, sender+receiver while moving data) | 430 us / 15.0 ms | - |
+
+0 errors, 0 election/leader log lines in every arm.  Per-pass driver: neutral (430 vs 448, one pair).
+Thread placement: 7.6x worse latency and -54% throughput -> the runtime thread (backoff park up to 200 us + its own
+sleep-ns driver) is still on the produce->ack path in thread placement; "runtime off the data path" does not hold.
+Both QD changes reverted.  New reference: saturation 200.5k rec/s with BACKOFF workers (MTU 65504, loopback).
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
