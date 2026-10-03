@@ -13,7 +13,7 @@
 // identity re-stamp patches the CRC incrementally — detail/Crc32cPatch.h).
 #pragma once
 
-#include <rune/protocol/Crc32c.h>
+#include <rune/client/detail/Crc32cFast.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <cstddef>
@@ -37,9 +37,10 @@ struct FrameCrc {
     }
 };
 
-/// The CRC of `frame`'s covered region (nothing written).
+/// The CRC of `frame`'s covered region (nothing written) — 3-way interleaved
+/// hardware CRC-32C (backlog B3: detail/Crc32cFast.h).
 [[nodiscard]] inline uint32_t frameCrcValue(const uint8_t* frame, std::size_t len, FrameCrc c) noexcept {
-    return ::rune::protocol::crc32c(frame + c.from, len - c.from);
+    return ::rune::client::detail::crc32cFast(frame + c.from, len - c.from);
 }
 
 /// Writes `crc` (LE) at `dst`.

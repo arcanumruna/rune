@@ -14,6 +14,7 @@
 //                        over this).
 //   BM_Crc32c/N          raw rune::protocol::crc32c throughput over N bytes
 //                        (backlog B3: is CRC still hot?).
+//   BM_Crc32cFast/N      the client's 3-way interleaved CRC-32C (B3).
 //
 // Counters: bytes_per_second = frame bytes accepted per second.
 
@@ -22,6 +23,10 @@
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/protocol/Crc32c.h>
+#if __has_include(<rune/client/detail/Crc32cFast.h>)
+#include <rune/client/detail/Crc32cFast.h>
+#define RUNE_BENCH_HAS_CRC_FAST 1
+#endif
 
 
 #include <benchmark/benchmark.h>
@@ -103,8 +108,25 @@ void crc32cRaw(benchmark::State& st) {
     st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) * static_cast<int64_t>(n));
 }
 
+#ifdef RUNE_BENCH_HAS_CRC_FAST
+void crc32cFastRaw(benchmark::State& st) {
+    const auto n = static_cast<std::size_t>(st.range(0));
+    std::vector<uint8_t> buf(n);
+    for (std::size_t i = 0; i < n; ++i) buf[i] = static_cast<uint8_t>(i * 131u + 7u);
+    uint32_t acc = 0;
+    for (auto _ : st) {
+        acc ^= rune::client::detail::crc32cFast(buf.data(), buf.size());
+        benchmark::DoNotOptimize(acc);
+    }
+    st.SetBytesProcessed(static_cast<int64_t>(st.iterations()) * static_cast<int64_t>(n));
+}
+#endif
+
 }  // namespace
 
+#ifdef RUNE_BENCH_HAS_CRC_FAST
+BENCHMARK(crc32cFastRaw)->Name("BM_Crc32cFast")->Arg(1024)->Arg(16 * 1024)->Arg(64 * 1024);
+#endif
 BENCHMARK(encodeFlush)->Name("BM_EncodeFlush")->ArgsProduct({{256, 1024, 4096}, {0, 6}});
 BENCHMARK(appendEncodeFlush)->Name("BM_AppendEncodeFlush")->ArgsProduct({{256, 1024, 4096}, {0}});
 BENCHMARK(crc32cRaw)->Name("BM_Crc32c")->Arg(1024)->Arg(16 * 1024)->Arg(64 * 1024);

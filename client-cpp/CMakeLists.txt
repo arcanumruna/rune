@@ -1028,6 +1028,7 @@ if(BUILD_TESTING)
         tests/producer/InFlightRingTest.cpp
         tests/shard/ShardMapTest.cpp
         tests/detail/Crc32cPatchTest.cpp
+        tests/detail/Crc32cFastTest.cpp
         tests/producer/ProduceFrameBuilderTest.cpp
     )
     target_include_directories(rune_pure_tests PRIVATE
