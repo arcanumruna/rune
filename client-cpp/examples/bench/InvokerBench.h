@@ -38,7 +38,7 @@ struct BenchArgs {
     std::vector<int> idleCheckCores;      // --idle-check-cores 0,1,2,3: each must be < 5% busy
     bool        idleCheckOnly = false;    // --idle-check-only: run the idle check and exit
     // Transport / batching (explicit, printed in RESULT):
-    std::size_t mtu         = 8192;       // --mtu: client Aeron MTU (bench box layout, ShardConfig.h)
+    std::size_t mtu         = 1408;       // --mtu: client Aeron MTU (B5: real-network default; 8192 jumbo opt-in)
     int64_t     lingerUs    = 0;          // --linger-us: Invoker linger (0 = end-of-pass batching)
     int32_t     batchBytes  = 64 * 1024;  // --batch-bytes: flush a partition's batch at this size
 };

@@ -253,12 +253,12 @@ TEST(BenchArgs, TransportAndBatchingKnobsAreExplicit) {
     std::string err;
     const auto d = parse({"--rate", "1000"}, err);
     ASSERT_TRUE(d.has_value()) << err;
-    EXPECT_EQ(d->mtu, 8192u) << "the bench box layout (ShardConfig.h) uses mtu 8192";
+    EXPECT_EQ(d->mtu, 1408u) << "backlog B5: benches default to the real-network MTU (jumbo opt-in)";
     EXPECT_EQ(d->lingerUs, 0) << "Invoker: end-of-pass batching";
     EXPECT_EQ(d->batchBytes, 64 * 1024);
-    const auto a = parse({"--mtu", "1408", "--linger-us", "50", "--batch-bytes", "16384"}, err);
+    const auto a = parse({"--mtu", "8192", "--linger-us", "50", "--batch-bytes", "16384"}, err);
     ASSERT_TRUE(a.has_value()) << err;
-    EXPECT_EQ(a->mtu, 1408u);
+    EXPECT_EQ(a->mtu, 8192u);
     EXPECT_EQ(a->lingerUs, 50);
     EXPECT_EQ(a->batchBytes, 16384);
 }

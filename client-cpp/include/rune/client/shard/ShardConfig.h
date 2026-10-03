@@ -19,7 +19,8 @@
 //     gets 16 shard threads; use reservedCores for cores the app or a co-located
 //     process needs (they are the LOWEST cores of the calling thread's mask).
 //   * Shared box: set shardCount explicitly.  The 4-core bench box with 3
-//     co-located brokers uses shardCount = 1, Invoker mode, core 0, mtu 8192.
+//     co-located brokers uses shardCount = 1, Invoker mode, core 0, mtu 1408
+//     (the default; aligned with the broker's interface-derived MTU).
 //   * Agent idle modes: the runner's park also delays its driver (D1).  Balanced
 //     parks <= 1 ms; LowLatency <= 100 us (client p99 floor ~100 us); BusySpin on
 //     a pinned core is the only Agent mode that fits p99 <= 100 us.  N BusySpin
