@@ -23,7 +23,7 @@ typedef struct rune_gso_totals_stct
     uint64_t gro_datagrams;    /* datagrams split out of them */
     uint64_t gro_ctrunc_drops; /* received buffers dropped: control data truncated (cannot split safely) */
     uint64_t gro_trunc_drops;  /* received buffers dropped: payload truncated (MSG_TRUNC) */
-    uint64_t gro_disabled;     /* transports that turned GRO off after a MSG_TRUNC */
+    uint64_t gro_disabled;     /* always 0: GRO is never turned off (a MSG_TRUNC drops only the damaged tail) */
     uint64_t transports;       /* transports created through these bindings */
     uint64_t gro_transports;   /* of which GRO was enabled on (receiver-affinity sockets only) */
 }

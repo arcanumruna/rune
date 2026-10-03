@@ -76,6 +76,7 @@ typedef struct rune_gso_transport_state_stct
     int gro_on;      /* UDP_GRO currently enabled on recv_fd (turned off after a MSG_TRUNC) */
     int gso_logged;
     int gro_logged;
+    int trunc_logged;
     rune_gso_totals_t t;
     rune_gro_ctrl_t ctrl[AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX];
 }
@@ -136,6 +137,9 @@ static int rune_gso_init(
         0 == setsockopt(transport->recv_fd, SOL_UDP, UDP_GRO, &one, sizeof(one));
     st->gro_parse = st->gro_on;
     st->t.gro_transports = st->gro_on ? 1 : 0;
+    /* Lifetime (re-review L3): per-transport state (~0.4 KB) lives until rune_gso_bindings_delete, not until the
+     * transport closes — bounded for Rune's shapes (fixed unicast endpoints + MDC egress); unbounded endpoint
+     * churn in a long-running driver would grow it. */
     st->next = owner->states; /* conductor-only */
     owner->states = st;
     transport->bindings_clientd = st;
@@ -255,7 +259,7 @@ static int rune_gso_send(
             r = st->owner->defaults.send_func(data_paths, transport, address, iov + done, 1, bytes_sent);
             if (r <= 0)
             {
-                return r < 0 ? r : (int)done;
+                return done > 0 ? (int)done : r;   /* partial batch = short send (stock sendmmsg semantics) */
             }
             done += 1;
             continue;
@@ -274,7 +278,7 @@ static int rune_gso_send(
         }
         if (r <= 0)
         {
-            return r < 0 ? r : (int)done;
+            return done > 0 ? (int)done : r;   /* partial batch = short send (stock sendmmsg semantics) */
         }
         st->t.gso_sends++;
         st->t.gso_datagrams += k;
@@ -363,28 +367,33 @@ static int rune_gro_recvmmsg(
             st->t.gro_ctrunc_drops++; /* cannot know the segment size: drop = loss, Aeron NAKs recover it */
             continue;
         }
+        size_t use = len;
         if (0 != (h->msg_flags & MSG_TRUNC))
         {
-            /* The coalesced buffer did not fit: its tail is gone, so drop it all (= loss, NAKs recover) and stop
-             * coalescing on this socket.  Keep parsing UDP_GRO cmsgs: buffers already queued stay coalesced. */
+            /* The coalesced buffer did not fit: its tail is gone.  Deliver the COMPLETE leading segments and drop
+             * only the damaged tail (= loss, Aeron NAKs recover it).  GRO is NEVER turned off here (re-review M1):
+             * once UDP_GRO is disabled the kernel stops attaching the segment-size cmsg to buffers already
+             * coalesced in the queue, so each would reach Aeron as ONE datagram — frames of other sessions written
+             * into the first one's term (silent corruption). */
             st->t.gro_trunc_drops++;
-            if (st->gro_on)
+            if (!st->trunc_logged)
             {
-                int zero = 0;
-                (void)setsockopt(transport->recv_fd, SOL_UDP, UDP_GRO, &zero, sizeof(zero));
-                st->gro_on = 0;
-                st->t.gro_disabled = 1;
-                fprintf(stderr, "rune-gso: WARN truncated GRO buffer (len=%zu) on recv_fd=%d; GRO off for it\n",
-                    len, (int)transport->recv_fd);
+                st->trunc_logged = 1;
+                fprintf(stderr, "rune-gso: WARN truncated GRO buffer (len=%zu seg=%zu) on recv_fd=%d; tail dropped\n",
+                    len, seg, (int)transport->recv_fd);
             }
-            continue;
+            if (0 == seg || len < seg)
+            {
+                continue;
+            }
+            use = (len / seg) * seg;
         }
 
-        const size_t n = rune_gro_count(len, seg);
+        const size_t n = rune_gro_count(use, seg);
         if (1 == n)
         {
             recv_func(transport->data_paths, transport, clientd, transport->dispatch_clientd,
-                transport->destination_clientd, base, len, (struct sockaddr_storage *)h->msg_name, NULL);
+                transport->destination_clientd, base, use, (struct sockaddr_storage *)h->msg_name, NULL);
             delivered++;
             continue;
         }
@@ -399,7 +408,7 @@ static int rune_gro_recvmmsg(
         for (size_t j = 0; j < n; j++)
         {
             recv_func(transport->data_paths, transport, clientd, transport->dispatch_clientd,
-                transport->destination_clientd, base + j * seg, rune_gro_segment_len(len, seg, j),
+                transport->destination_clientd, base + j * seg, rune_gro_segment_len(use, seg, j),
                 (struct sockaddr_storage *)h->msg_name, NULL);
         }
         delivered += (int)n;
