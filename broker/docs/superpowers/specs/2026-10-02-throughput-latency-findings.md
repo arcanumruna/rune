@@ -275,6 +275,8 @@ per hop × ~4 hops).
   (l) REMOVE duty1 (driver duty cap per pass = 1, item d): it starves the in-pass Aeron driver on the 3-node
       replication path.  20k acks=all, fsync off: p50 688 us without it vs 24.2 ms with it (p99 9.6 vs 45 ms).
       It only helped single-node (client acks only).  Do not productionize (d); keep the uncapped duty loop.
+  (m) REMOVE end-of-pass send (item c, RUNE_END_PASS_SEND): no benefit on 3-node acks=all (20k, fsync off:
+      p50 750 us / p99 10.6 ms with it vs 688 us / 9.6 ms without).  Do not productionize (c).
   Client CRC/encode waste (2026-10-03 saturation profile, 3-node acks=all: crc32c_hw = 28% of client CPU; uprobes
   counted 35,897 buildAppend calls CRC-ing 1.52 GB in 2 s vs ~116 MB/s produced = ~6.6 builds per sent frame):
   (h) no rebuild on back-pressure: probe the publication (position < publication limit, the exact Aeron refusal
