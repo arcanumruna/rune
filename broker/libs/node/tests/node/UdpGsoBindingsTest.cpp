@@ -326,15 +326,19 @@ TEST(UdpGsoBindings, GroNeverEnabledOnTheSenderControlSocketRegression) {
     EXPECT_GT(r.totals.gro_datagrams, 0u);
 }
 
-// Fix round 1 (review M1): a truncated GRO buffer is dropped (Aeron NAKs recover it), counted, and GRO is
-// turned off for that transport; delivery stays byte-exact.
-TEST(UdpGsoBindings, TruncatedGroBufferIsDroppedAndDisablesGroRegression) {
+// Re-review M1: a truncated GRO buffer delivers its complete leading segments and drops only the damaged tail
+// (Aeron NAKs recover it); GRO is NEVER turned off — once disabled, the kernel stops attaching the segment-size
+// cmsg to buffers already coalesced in the queue and each would reach Aeron as one datagram (corruption).
+// Delivery stays byte-exact and GRO keeps splitting after the truncation.
+TEST(UdpGsoBindings, TruncatedGroBufferDropsTailNeverDisablesGroRegression) {
     Rig r;
     ASSERT_TRUE(r.start(3, 1408, 0, 1)) << aeron_errmsg();
     roundTrip(r, r, udp(24611, 1408), mixedSizes(1408, 70));
     r.close();
     EXPECT_EQ(r.totals.gro_trunc_drops, 1u);
-    EXPECT_EQ(r.totals.gro_disabled, 1u) << "the transport that saw MSG_TRUNC turns GRO off";
+    EXPECT_EQ(r.totals.gro_disabled, 0u) << "GRO stays on after a MSG_TRUNC";
+    EXPECT_EQ(r.totals.gro_transports, 1u);
+    EXPECT_GT(r.totals.gro_datagrams, 0u) << "GRO keeps coalescing/splitting after the truncation";
 }
 
 // Fix round 1 (review L6): ENOBUFS on a GSO send is handled like stock sendmmsg (a send error; the batch is
