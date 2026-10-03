@@ -416,7 +416,8 @@ enum class RejectReason : uint8_t {
     None,               ///< accepted
     Closed,             ///< the producer's Client was closed
     WrongThread,        ///< Direct (Invoker) producer used off its owner thread
-    ValueTooLarge,
+    ValueTooLarge,      ///< can never fit this producer's ring (tiny rings)
+    MessageTooLarge,    ///< key + value > Producer::kMaxRecordBytes (backlog B6)
     BackPressured,      ///< ring full / builder full (retry)
     DeferredFull,       ///< Direct: in-duty deferral arena / partition share full (retry later)
     PartitionDeferred,  ///< Direct: this partition still has deferred records that cannot go yet

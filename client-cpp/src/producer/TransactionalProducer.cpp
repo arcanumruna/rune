@@ -6,6 +6,7 @@
 
 #include <rune/client/producer/TransactionalProducer.h>
 #include <rune/client/producer/TransactionalProducerImpl.h>
+#include <rune/client/producer/Producer.h>
 
 #include <cstdio>
 #include <exception>
@@ -262,6 +263,11 @@ void TransactionalProducer::send(TopicHandle topic, const Key& key, std::span<co
     // fix1 I8: never silently drop an invalid topic — report via throw.
     if (!topic.valid()) {
         throw std::invalid_argument("TransactionalProducer::send: invalid topic handle");
+    }
+    // Backlog B6: the per-record limit, one O(1) compare at append.
+    if (key.size() + value.size() > Producer::kMaxRecordBytes) {
+        throw std::length_error("TransactionalProducer::send: MessageTooLarge: key + value exceeds "
+                                "Producer::kMaxRecordBytes (16 KiB)");
     }
     // fix5: never silently accept a send nothing will process.
     if (finished_() || sink_ == nullptr || closeIssued_) throw std::logic_error("client closed");

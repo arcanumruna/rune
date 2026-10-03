@@ -5,6 +5,7 @@
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/Completions.h>
+#include <rune/client/producer/Producer.h>
 
 #include <chrono>
 #include <stdexcept>
@@ -60,6 +61,11 @@ void BatchBuilder::add(std::span<const uint8_t> value,
 {
     if (sent_ || !batchBytes_.empty()) {
         throw std::logic_error("BatchBuilder: add after send");
+    }
+    // Backlog B6: the per-record limit, one O(1) compare at append.
+    if (record_key.size() + value.size() > Producer::kMaxRecordBytes) {
+        throw std::length_error("BatchBuilder::add: MessageTooLarge: key + value exceeds "
+                                "Producer::kMaxRecordBytes (16 KiB)");
     }
 
     // Lazy-init builder on first add.

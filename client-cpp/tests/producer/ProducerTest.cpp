@@ -1393,7 +1393,7 @@ TEST(Producer, MultiPartitionInterleave) {
 // ===========================================================================
 // FIX 5 — Test 19: OversizedValueRejected
 //   Value > kMaxSendValueBytes must NOT crash; the send is rejected with
-//   ValueTooLarge / std::length_error.
+//   MessageTooLarge (backlog B6: key + value > 16 KiB) / std::length_error.
 //   A subsequent normal send must still succeed.
 // ===========================================================================
 TEST(Producer, OversizedValueRejected) {
@@ -1411,14 +1411,14 @@ TEST(Producer, OversizedValueRejected) {
     auto topic = makeTopic(17, 1);
     Key  key(uint64_t{0});
 
-    // Value exactly at kMaxSendValueBytes — must be accepted.
-    const std::vector<uint8_t> maxVal(rc::Producer::kMaxSendValueBytes, 0xAA);
+    // The largest record (key + value == kMaxRecordBytes) — must be accepted.
+    const std::vector<uint8_t> maxVal(rc::Producer::kMaxRecordBytes - key.size(), 0xAA);
     p.send(topic, key, std::span<const uint8_t>(maxVal));
     p.flush();
 
     // Value one byte over — reported to the caller, never silently dropped.
-    const std::vector<uint8_t> overVal(rc::Producer::kMaxSendValueBytes + 1, 0xBB);
-    EXPECT_EQ(p.trySend(topic, key, std::span<const uint8_t>(overVal)), rc::SendResult::ValueTooLarge);
+    const std::vector<uint8_t> overVal(rc::Producer::kMaxRecordBytes - key.size() + 1, 0xBB);
+    EXPECT_EQ(p.trySend(topic, key, std::span<const uint8_t>(overVal)), rc::SendResult::MessageTooLarge);  // B6
     EXPECT_THROW(p.send(topic, key, std::span<const uint8_t>(overVal)), std::length_error);
     p.flush();
 

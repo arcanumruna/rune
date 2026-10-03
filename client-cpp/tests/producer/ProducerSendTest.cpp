@@ -8,12 +8,16 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <thread>
+#include <span>
+#include <string_view>
 #include <vector>
 
 using rune::client::Acks;
@@ -126,8 +130,8 @@ TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothingRegression) {
 TEST(ProducerSend, InvalidInputIsReportedNeverSilentlyDroppedRegression) {
     auto* impl = new ProducerImpl(voidCfg());
     Producer p(impl);
-    const std::vector<uint8_t> tooBig(Producer::kMaxSendValueBytes + 1, 0);
-    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), tooBig), SendResult::ValueTooLarge);
+    const std::vector<uint8_t> tooBig(Producer::kMaxRecordBytes + 1, 0);
+    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{1}), tooBig), SendResult::MessageTooLarge);  // B6
     EXPECT_EQ(p.trySend(TopicHandle{}, Key(uint64_t{1}), kVal), SendResult::InvalidTopic);
     EXPECT_THROW(p.send(kTopic, Key(uint64_t{1}), tooBig), std::length_error);
     EXPECT_THROW(p.send(TopicHandle{}, Key(uint64_t{1}), kVal), std::invalid_argument);
@@ -339,8 +343,8 @@ TEST(ProducerSend, RejectedAckTokenSendResultIsDistinctPerCauseRegression) {
     const uint64_t ok = fillUntilBackPressured(p);
     ASSERT_GT(ok, 0u);
     EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{ok}), kVal, rune::client::AckToken{1}), SendResult::BackPressured);
-    const std::vector<uint8_t> tooBig(Producer::kMaxSendValueBytes + 1, 0);
-    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{ok}), tooBig, rune::client::AckToken{2}), SendResult::ValueTooLarge);
+    const std::vector<uint8_t> tooBig(Producer::kMaxRecordBytes + 1, 0);
+    EXPECT_EQ(p.trySend(kTopic, Key(uint64_t{ok}), tooBig, rune::client::AckToken{2}), SendResult::MessageTooLarge);  // B6
     impl->failAllPending(rune::client::OpStatus::Closed);  // completes only what was accepted (void here)
     EXPECT_EQ(L.times(1), 0);
     EXPECT_EQ(L.times(2), 0);
@@ -453,4 +457,70 @@ TEST(ProducerSend, RejectedTokenSendsNeverCompleteWhileDutyFailsAcceptedRegressi
     EXPECT_TRUE(L.exactlyOnce(1, kAccepted + 1)) << "each accepted token completes exactly once";
     for (int i = 0; i < kRejected; ++i) EXPECT_EQ(L.times(1000 + i), 0) << "rejected token " << i;
     EXPECT_EQ(L.recs.size(), static_cast<std::size_t>(kAccepted));
+}
+
+// ---------------------------------------------------------------------------
+// Backlog B6 (user decision 2026-10-03): a record (key + value bytes) larger
+// than Producer::kMaxRecordBytes = 16 KiB is rejected AT APPEND with
+// MessageTooLarge — non-retriable (never BackPressured) — on the Ring and the
+// Direct path and by a Tier-2 BatchBuilder; the largest legal record is
+// produced intact.  (The broker's hard limit stays the batch limit.)
+// ---------------------------------------------------------------------------
+#include <rune/client/producer/BatchBuilder.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
+
+TEST(ProducerSend, RecordOver16KiBIsMessageTooLargeAtAppend) {
+    static_assert(Producer::kMaxRecordBytes == 16 * 1024);
+    auto* impl = new ProducerImpl(voidCfg());
+    Producer p(impl);
+    const Key k8(uint64_t{7});
+    ASSERT_EQ(k8.size(), 8u);
+    const std::vector<uint8_t> fits(Producer::kMaxRecordBytes - k8.size(), 0x5C);
+    const std::vector<uint8_t> over(fits.size() + 1, 0x5D);
+    EXPECT_EQ(p.trySend(kTopic, k8, over), SendResult::MessageTooLarge);
+    EXPECT_THROW(p.send(kTopic, k8, over), std::length_error);
+    const std::vector<uint8_t> overNoKey(Producer::kMaxRecordBytes + 1, 0x5E);
+    EXPECT_EQ(p.trySend(kTopic, Key{}, overNoKey), SendResult::MessageTooLarge);
+    EXPECT_EQ(p.trySend(kTopic, Key{}, std::span<const uint8_t>(overNoKey).first(Producer::kMaxRecordBytes)),
+              SendResult::Ok);
+    EXPECT_GE(Producer::kMaxSendValueBytes + Key::kMaxInline, Producer::kMaxRecordBytes - 0u);
+    EXPECT_EQ(p.trySend(kTopic, k8, fits), SendResult::Ok);
+
+    std::vector<std::size_t> valueSizes;
+    const ProducerImpl::SendFn sink = [&](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        const auto f = rune::protocol::client::Produce::decode(b, n);
+        EXPECT_TRUE(f);
+        if (!f) return true;
+        rune::protocol::RecordBatchReader rd(f->recordBatch.data(), f->recordBatch.size());
+        EXPECT_TRUE(rd.ensureValid());
+        rd.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) { valueSizes.push_back(v.size()); });
+        return true;
+    };
+    for (int i = 0; i < 100 && valueSizes.size() < 2; ++i) {
+        impl->drainRing(1, 16);
+        impl->flushBatches(1, 42, sink);
+    }
+    std::sort(valueSizes.begin(), valueSizes.end(), std::greater<>());
+    EXPECT_EQ(impl->recordsSent(), 2u);
+    ASSERT_EQ(valueSizes.size(), 2u);
+    EXPECT_EQ(valueSizes[0], Producer::kMaxRecordBytes);
+    EXPECT_EQ(valueSizes[1], fits.size());
+}
+
+TEST(ProducerSend, DirectAppendRejectsARecordOver16KiB) {
+    ProducerImpl impl(voidCfg());
+    impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr});
+    const std::vector<uint8_t> over(Producer::kMaxRecordBytes, 0x01);  // + 8-byte key = 16 KiB + 8
+    EXPECT_EQ(impl.trySubmit(1, 0, Key(uint64_t{1}), over, 0), SendResult::MessageTooLarge);
+    EXPECT_EQ(impl.trySubmit(1, 0, Key{}, over, 0), SendResult::Ok);
+}
+
+TEST(ProducerSend, Tier2BatchBuilderRejectsARecordOver16KiB) {
+    auto* impl = new ProducerImpl(voidCfg());
+    Producer p(impl);
+    rune::client::BatchBuilder bb(impl, 1, 0);
+    const std::vector<uint8_t> v(Producer::kMaxRecordBytes - 2, 0x02);
+    EXPECT_THROW(bb.add(std::span<const uint8_t>(v), "abc"), std::length_error);
+    EXPECT_NO_THROW(bb.add(std::span<const uint8_t>(v), "ab"));
 }

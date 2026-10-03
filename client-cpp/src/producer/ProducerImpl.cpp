@@ -368,12 +368,11 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
     const std::size_t valueLen = value.size();
     const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + valueLen;
 
-    // Public contract: a single SEND_RECORD is capped at kMaxSendValueBytes
-    // (a fixed 8 KiB message, independent of the ring's larger maxMsgLength).
-    // Returns false (not accepted) on an oversized value; callers (trySubmit /
-    // Producer::trySend / Producer::send) map that to SendResult::ValueTooLarge
-    // — never a silent drop (fix1 minor 12).
-    if (valueLen > rune::client::Producer::kMaxSendValueBytes) {
+    // Public contract (backlog B6): a record is capped at kMaxRecordBytes
+    // (key + value).  Returns false (not accepted) on an oversized record;
+    // trySubmit checks first and reports SendResult::MessageTooLarge — never a
+    // silent drop (fix1 minor 12).
+    if (keyLen + valueLen > rune::client::Producer::kMaxRecordBytes) {
         return false;
     }
 
@@ -441,6 +440,7 @@ SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key
         *why = r == SendResult::Ok            ? RejectReason::None
              : r == SendResult::Closed        ? RejectReason::Closed
              : r == SendResult::ValueTooLarge ? RejectReason::ValueTooLarge
+             : r == SendResult::MessageTooLarge ? RejectReason::MessageTooLarge
                                               : RejectReason::BackPressured;
     }
     return r;
@@ -456,9 +456,12 @@ SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, cons
     // load on the hot path: the rejected claim is told apart from back-pressure
     // only on the (cold) failure branch below.  sendBlocking() still checks
     // closed_() before ever touching the pump hook's context.
-    if (value.size() > rune::client::Producer::kMaxSendValueBytes) return SendResult::ValueTooLarge;
+    // Backlog B6: one O(1) compare at append (key + value <= 16 KiB).
+    if (key.size() + value.size() > rune::client::Producer::kMaxRecordBytes) [[unlikely]] {
+        return SendResult::MessageTooLarge;
+    }
     // fix1 minor 11: a value that can NEVER fit this ring (maxMsgLength is a
-    // function of ringCap, which can be far smaller than kMaxSendValueBytes —
+    // function of ringCap, which can be far smaller than kMaxRecordBytes —
     // e.g. a small test ring) must not be reported as retryable back-pressure:
     // no amount of draining ever makes room for a message the ring cannot hold,
     // so BackPressured here would livelock sendBlocking's retry loop forever.
@@ -487,9 +490,9 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
         why = RejectReason::Closed;
         return SendResult::Closed;
     }
-    if (value.size() > rune::client::Producer::kMaxSendValueBytes) {
-        why = RejectReason::ValueTooLarge;
-        return SendResult::ValueTooLarge;
+    if (key.size() + value.size() > rune::client::Producer::kMaxRecordBytes) [[unlikely]] {  // B6
+        why = RejectReason::MessageTooLarge;
+        return SendResult::MessageTooLarge;
     }
     const auto kb = key.bytes();
     const uint8_t flags = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
@@ -538,7 +541,7 @@ void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
     // and one partition may hold at most its share (default min(arena/2,
     // 4 x batchBytes)) so a stalled partition cannot exhaust the arena.
     constexpr std::size_t kMaxRec = DeferredArena::recordSize(
-        static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxSendValueBytes);
+        static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxRecordBytes);
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
     deferred_.init(std::max(want, 2 * kMaxRec));
@@ -915,8 +918,10 @@ void ProducerImpl::throwForSendResult(SendResult r) {
     case SendResult::BackPressured:
         return;
     case SendResult::ValueTooLarge:
-        throw std::length_error("Producer::send: value exceeds Producer::kMaxSendValueBytes "
-                                 "or this producer's ring maxMsgLength");
+        throw std::length_error("Producer::send: record can never fit this producer's ring maxMsgLength");
+    case SendResult::MessageTooLarge:
+        throw std::length_error("Producer::send: MessageTooLarge: key + value exceeds "
+                                "Producer::kMaxRecordBytes (16 KiB)");
     case SendResult::InvalidTopic:
         throw std::invalid_argument("Producer::send: invalid topic handle");
     case SendResult::WrongThread:

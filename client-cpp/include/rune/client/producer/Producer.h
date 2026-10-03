@@ -225,8 +225,8 @@ using BatchAckFn = void (*)(void* ctx, const BatchAck& ack) noexcept;
 enum class SendResult : uint8_t {
     Ok = 0,         ///< accepted: will be batched and sent
     BackPressured,  ///< ring full right now: retry after the duty cycle drains
-    ValueTooLarge,  ///< value > kMaxSendValueBytes, OR too big to EVER fit this producer's ring
-                    ///< (> maxMsgLength) — never retryable
+    ValueTooLarge,  ///< too big to EVER fit this producer's ring (> maxMsgLength; only tiny
+                    ///< rings) — never retryable
     InvalidTopic,   ///< TopicHandle not valid
     WrongThread,    ///< ClientShard only (later tasks): producer used off its owner thread
     WrongShard,     ///< ClientShard only (later tasks): partition owned by another shard
@@ -236,6 +236,8 @@ enum class SendResult : uint8_t {
     QueueFull,      ///< F8c C6: the target Completions has no credit — poll() it, then retry
     InvalidArgument,///< F8c C6: token > kMaxToken, or the Completions is not registered
                     ///< with this producer's Client
+    MessageTooLarge,///< backlog B6: key + value > Producer::kMaxRecordBytes (16 KiB) —
+                    ///< rejected at append, never retryable (Kafka MESSAGE_TOO_LARGE)
 };
 
 // ---------------------------------------------------------------------------
@@ -288,18 +290,20 @@ public:
 
     // ---- Max value size (named constant) ------------------------------------
 
-    /// Maximum value size for a single send().
-    ///
-    /// The SEND_RECORD ring message is limited to kMaxSendValueBytes bytes of
-    /// value data.  Values larger than this are REJECTED, never silently
-    /// dropped: trySend() returns SendResult::ValueTooLarge and the void
-    /// send() throws std::length_error.
-    ///
-    /// Rationale: the ring write uses an 8 KiB stack scratch buffer
-    /// (kMaxStackBuf = 8192) and the record header is 38 bytes, leaving
-    /// 8192 - 38 = 8154 bytes for the value.  Chunking for larger payloads
-    /// is left to the caller.
-    static constexpr std::size_t kMaxSendValueBytes = 8192 - 38; // 8154 bytes
+    /// Maximum record size: key bytes + value bytes (backlog B6, user decision
+    /// 2026-10-03).  A larger record is REJECTED at append, never silently
+    /// dropped: trySend() returns SendResult::MessageTooLarge (non-retriable),
+    /// the void send() throws std::length_error, a Tier-2 BatchBuilder::add()
+    /// and TransactionalProducer::send() throw std::length_error.  One O(1)
+    /// compare at append — no per-record scan anywhere else.  The broker's
+    /// hard limit stays its batch limit (term/8).  Chunking larger payloads is
+    /// left to the caller.
+    static constexpr std::size_t kMaxRecordBytes = 16 * 1024;
+
+    /// The largest value a send() accepts with ANY key (keys are at most
+    /// Key::kMaxInline = 16 bytes): kMaxRecordBytes - 16 = 16368 bytes.  With a
+    /// shorter key the value may grow to kMaxRecordBytes - key.size().
+    static constexpr std::size_t kMaxSendValueBytes = kMaxRecordBytes - Key::kMaxInline;
 
     // ---- Hot path — void send (ZERO per-send heap allocation) ---------------
 
@@ -334,8 +338,9 @@ public:
     /// next agentLivenessTimeoutMs window for every producer on that Client.
     ///
     /// Throws:
-    ///   std::length_error    — value too large (> kMaxSendValueBytes, or too
-    ///                          big to ever fit this producer's ring).
+    ///   std::length_error    — record too large (key + value > kMaxRecordBytes:
+    ///                          MessageTooLarge), or too big to ever fit this
+    ///                          producer's ring.
     ///   std::invalid_argument — invalid topic handle.
     ///   std::logic_error      — this producer's Client has been closed (the
     ///                          Producer outlived it, or send() raced a

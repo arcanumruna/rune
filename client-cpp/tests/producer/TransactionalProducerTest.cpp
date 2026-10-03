@@ -2196,3 +2196,15 @@ TEST(TransactionalProducerTest, DuplicateSequenceIsAStoredBatchRegression) {
     EXPECT_TRUE(produceFrames(r.sink).empty()) << "a stored batch was re-sent";
     EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
 }
+
+// Backlog B6: a transactional record (key + value) over Producer::kMaxRecordBytes
+// is rejected at append (std::length_error), never sent.
+TEST(TransactionalProducerTest, RecordOver16KiBIsRejectedAtAppend) {
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    const std::vector<uint8_t> over(rune::client::Producer::kMaxRecordBytes - 7, 0x09);  // + 8-byte key
+    EXPECT_THROW(r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(over)), std::length_error);
+    for (int i = 0; i < 8; ++i) r.doWork();
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::Produce), 0);
+}
