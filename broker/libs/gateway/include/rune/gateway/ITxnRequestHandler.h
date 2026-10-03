@@ -54,9 +54,10 @@ struct ITxnRequestHandler {
                                          int64_t nowNs,
                                          uint8_t* out, size_t outCap) = 0;
 
-    // Task 10 fix 3: a COMMIT/ABORT control marker this node could not append
-    // (the partition is no longer here: NotLeader).  Never silently dropped —
-    // the coordinator is told.  Cold path; default no-op for test doubles.
+    // A COMMIT/ABORT control marker this node could not append (NotLeader,
+    // MinIsrViolation, ...).  Never silently dropped and never "landed": the
+    // coordinator retries it until it lands (or drops it if the partition is
+    // gone).  Cold path; default no-op for test doubles.
     //
     // F15 m3: coordinatorEpoch is the epoch the marker was dispatched under
     // (kAnyCoordinatorEpoch when the gateway no longer knows it); a coordinator

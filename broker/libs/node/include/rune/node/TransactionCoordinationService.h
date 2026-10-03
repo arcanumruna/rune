@@ -178,8 +178,11 @@ public:
     size_t handleEndTxn         (const uint8_t* buf, size_t len,
                                   int64_t nowNs, uint8_t* out, size_t outCap) override;
 
-    /// Task 10 fix 3: a control marker this node could not append (NotLeader /
-    /// append failure).  Recorded + logged — never silent; counts as resolved.
+    /// A control marker this node could not append.  NEVER counts as landed: a
+    /// retriable refusal (NotLeader, MinIsrViolation, Internal, ...) is re-dispatched
+    /// with a doubling backoff until it lands; a partition that no longer exists
+    /// (UnknownTopic / UnknownPartition, or gone from metadata) drops the marker
+    /// (Kafka TransactionMarkerChannelManager parity).
     void onControlMarkerRefused(int32_t topicId, int32_t partition,
                                 int64_t producerId, int16_t errorCode,
                                 int32_t coordinatorEpoch) override;
@@ -189,6 +192,7 @@ public:
     [[nodiscard]] std::size_t awaitingMarkerTxnsForTest() const noexcept { return awaiting_.size(); }
     [[nodiscard]] uint64_t transactionsCompletedForTest() const noexcept { return transactionsCompleted_; }
     [[nodiscard]] uint64_t controlMarkersRefusedForTest() const noexcept { return controlMarkersRefused_; }
+    [[nodiscard]] std::size_t queuedMarkerRetriesForTest() const noexcept { return queuedRetries_; }
 
 private:
     uint64_t controlMarkersRefused_ = 0;
@@ -202,8 +206,9 @@ private:
     struct MarkerRetry {
         int32_t topicId   = 0;
         int32_t partition = 0;
-        int64_t dueNs     = 0;   ///< 0 = due at the next doWork
+        int64_t dueNs     = 0;
         int64_t backoffNs = 0;
+        bool    inFlight  = false;   ///< re-dispatched, reply pending: keeps its backoff
     };
     struct AwaitingMarkers {
         rune::transaction::TransactionalId txnId;
@@ -219,7 +224,13 @@ private:
     static constexpr int64_t kMarkerRetryMinNs = 10'000'000;      // 10 ms
     static constexpr int64_t kMarkerRetryMaxNs = 1'000'000'000;   // 1 s
     int64_t lastNowNs_ = 0;                 ///< doWork clock, used to schedule refusal retries
+    std::size_t queuedRetries_ = 0;         ///< retries due for (re-)dispatch (not in flight)
     int retryRefusedMarkers_(int64_t nowNs);
+    /// Queue (or re-queue with a doubled backoff) the marker for (topicId, partition).
+    void queueRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition);
+    /// Drop the retry entry for (topicId, partition) if any; true when one was dropped.
+    bool dropRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition);
+    [[nodiscard]] bool partitionExists_(int32_t topicId, int32_t partition) const;
     std::unordered_map<int64_t, AwaitingMarkers> awaiting_;
     bool dispatchMarkers_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
                           int16_t producerEpoch, int32_t coordinatorEpoch, bool commit,

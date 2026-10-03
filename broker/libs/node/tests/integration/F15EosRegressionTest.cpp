@@ -613,6 +613,44 @@ TEST(MarkerRetryRegression, RefusedMarkerIsRetriedAndCompletesTheTxnOnceItLands)
     EXPECT_EQ(T.addPartition(), 0) << "the next txn may start";
 }
 
+// Review of 13c02c5 (2): a re-dispatched retry must keep its backoff (doubling 10 ms .. 1 s), not
+// restart at 10 ms on every refusal (~300 retries + log lines per second per stuck partition).
+TEST(MarkerRetryRegression, RefusedMarkerRetriesBackOffExponentially) {
+    TxnRig T(/*minIsr=*/2);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    T.runUntilNoMarkerAwaited(10);
+    for (int64_t now = 20'000'000; now < 4'000'000'000; now += 1'000'000) {     // 4 s, coordinator every 1 ms
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+    }
+    const auto refusals = T.tcs->controlMarkersRefusedForTest();
+    EXPECT_GE(refusals, 5u) << "retries keep happening";
+    EXPECT_LE(refusals, 20u) << "fixed 10 ms retries would refuse ~400 times in 4 s (got " << refusals << ")";
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u);
+}
+
+// Review of 13c02c5 (3): a marker for a partition that no longer exists is dropped (Kafka parity) —
+// the producer is not blocked forever.
+TEST(MarkerRetryRegression, MarkerForADeletedPartitionIsDroppedAndTheTxnCompletes) {
+    TxnRig T(/*minIsr=*/2);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u) << "precondition: the marker was refused and is pending";
+    T.tcs->onControlMarkerRefused(0, 0, T.pid, static_cast<int16_t>(pc::ErrorCode::UnknownPartition),
+                                  rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "the deleted partition's marker was dropped";
+    EXPECT_EQ(T.tcs->queuedMarkerRetriesForTest(), 0u) << "its retry entry is gone too";
+    EXPECT_EQ(T.addPartition(), 0) << "the producer can start its next transaction";
+}
+
 TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: acks=all marker refused
     const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);   // S4 retarget: declared scenario addition
@@ -625,6 +663,11 @@ TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     ASSERT_EQ(T.m.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
     ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "EndTxn deferred while the marker is in flight";
     T.runUntilNoMarkerAwaited(10);
+    for (int64_t now = 20'000'000; now < 3'000'000'000; now += 10'000'000) {   // 3 s of coordinator retries
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+    }
+    EXPECT_GE(T.tcs->controlMarkersRefusedForTest(), 2u) << "the refused marker was retried";
     EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "no marker in the log";
     EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u)
         << "the txn completed although its only marker was refused (controlMarkersRefused="

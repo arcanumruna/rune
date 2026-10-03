@@ -156,6 +156,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     const tx::ProducerId maxPid =
         coordinator_.reload(txnState_ ? txnState_->all() : noSnapshot_, coordinatorEpoch_, nowNs);
     awaiting_.clear();
+    queuedRetries_ = 0;
     if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_);   // older epochs' leftovers
     if (txnState_ != nullptr) {
         // I7: the next pid lies at or above every ceiling a previous coordinator
@@ -189,6 +190,7 @@ void TransactionCoordinationService::unload_()
         (void)gateway_->sendControlFrame(a.sessionId, buf.data(), n);
     }
     awaiting_.clear();
+    queuedRetries_ = 0;
     if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_ + 1);   // this (now old) epoch
     coordinator_.clear();
     pidCeilingPending_       = -1;
@@ -697,7 +699,12 @@ bool TransactionCoordinationService::dispatchMarkers_(
             } else if (off >= 0) {
                 gateway_->notifyControlMarker(*topicIdOpt, tp.partition, producerId, off, commit);
             } else {
-                spdlog::warn("TCS: appendControlRecord failed topicId={} partition={}", *topicIdOpt, tp.partition);
+                // Refused synchronously: the marker is NOT in the log — it stays outstanding and is
+                // retried (dropped only if the partition is gone; see retryRefusedMarkers_).
+                spdlog::warn("TCS: appendControlRecord refused topicId={} partition={} — retrying",
+                             *topicIdOpt, tp.partition);
+                ++a.outstanding;
+                queueRetry_(a, *topicIdOpt, tp.partition);
             }
         } else if (appendFnOverride_) {
             // TEST SEAM: the override returns an APPEND offset only — a marker
@@ -754,11 +761,12 @@ void TransactionCoordinationService::completeAwaiting_(int64_t producerId, bool 
     }
 }
 
-void TransactionCoordinationService::onControlMarkerLanded(int32_t, int32_t, int64_t producerId,
+void TransactionCoordinationService::onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
                                                            int32_t coordinatorEpoch)
 {
     // m3: a reply for a marker dispatched by an earlier load matches no task.
     if (!currentEpoch_(coordinatorEpoch)) return;
+    if (auto it = awaiting_.find(producerId); it != awaiting_.end()) (void)dropRetry_(it->second, topicId, partition);
     resolveMarker_(producerId);
 }
 
@@ -770,52 +778,92 @@ void TransactionCoordinationService::onControlMarkerRefused(int32_t topicId, int
     if (!currentEpoch_(coordinatorEpoch)) return;   // m3: an earlier load's marker
     namespace pcl = rune::protocol::client;
     const auto err = static_cast<pcl::ErrorCode>(errorCode);
+    auto it = awaiting_.find(producerId);
     if (err == pcl::ErrorCode::UnknownTopic || err == pcl::ErrorCode::UnknownPartition) {
         // Kafka parity: a partition that no longer exists takes no marker — drop it.
         spdlog::warn("TCS: control marker for a deleted partition topic={} partition={} producerId={} err={} "
                      "— dropped", topicId, partition, producerId, errorCode);
+        if (it != awaiting_.end()) (void)dropRetry_(it->second, topicId, partition);
         resolveMarker_(producerId);
         return;
     }
-    auto it = awaiting_.find(producerId);
     if (it == awaiting_.end()) return;
     // Every other refusal (NotLeader, MinIsrViolation, Internal, StorageError, ...) is retried: the
     // marker is NOT in the log, so the transaction must stay Prepare* (EndTxn deferred, the next
     // transaction refused ConcurrentTransactions) until a retry lands.
-    spdlog::warn("TCS: control marker refused topic={} partition={} producerId={} err={} — retrying",
-                 topicId, partition, producerId, errorCode);
-    for (auto& r : it->second.retries) {
+    queueRetry_(it->second, topicId, partition);
+}
+
+void TransactionCoordinationService::queueRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition)
+{
+    for (auto& r : a.retries) {
         if (r.topicId == topicId && r.partition == partition) {   // refused again: back off further
+            if (!r.inFlight) return;                                // already queued
+            r.inFlight  = false;
             r.backoffNs = std::min(r.backoffNs * 2, kMarkerRetryMaxNs);
             r.dueNs     = lastNowNs_ + r.backoffNs;
+            ++queuedRetries_;
+            if (r.backoffNs == kMarkerRetryMaxNs)
+                spdlog::warn("TCS: control marker topic={} partition={} still refused — retrying every {} ms",
+                             topicId, partition, kMarkerRetryMaxNs / 1'000'000);
             return;
         }
     }
-    it->second.retries.push_back(MarkerRetry{topicId, partition, lastNowNs_ + kMarkerRetryMinNs,
-                                             kMarkerRetryMinNs});
+    a.retries.push_back(MarkerRetry{topicId, partition, lastNowNs_ + kMarkerRetryMinNs, kMarkerRetryMinNs, false});
+    ++queuedRetries_;
+}
+
+bool TransactionCoordinationService::dropRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition)
+{
+    for (std::size_t i = 0; i < a.retries.size(); ++i) {
+        if (a.retries[i].topicId == topicId && a.retries[i].partition == partition) {
+            if (!a.retries[i].inFlight) --queuedRetries_;
+            a.retries.erase(a.retries.begin() + static_cast<std::ptrdiff_t>(i));
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TransactionCoordinationService::partitionExists_(int32_t topicId, int32_t partition) const
+{
+    if (topics_ == nullptr) return true;   // no metadata to consult: keep retrying
+    const auto* spec = topics_->topic(topicId);
+    return spec != nullptr && partition >= 0 && partition < spec->partitionCount;
 }
 
 int TransactionCoordinationService::retryRefusedMarkers_(int64_t nowNs)
 {
-    if (gateway_ == nullptr) return 0;
+    if (gateway_ == nullptr || queuedRetries_ == 0) return 0;
     int work = 0;
-    std::vector<int64_t> landed;   // cold path (refusals only): resolve after the walk
+    std::vector<int64_t> resolved;   // cold path (refusals only): resolve after the walk
     for (auto& [producerId, a] : awaiting_) {
         for (std::size_t i = 0; i < a.retries.size();) {
             MarkerRetry& r = a.retries[i];
-            if (r.dueNs > nowNs) { ++i; continue; }
+            if (r.inFlight || r.dueNs > nowNs) { ++i; continue; }
+            ++work;
+            if (!partitionExists_(r.topicId, r.partition)) {   // deleted meanwhile: Kafka drops the marker
+                spdlog::warn("TCS: control marker for a deleted partition topic={} partition={} producerId={} "
+                             "— dropped", r.topicId, r.partition, producerId);
+                --queuedRetries_;
+                a.retries.erase(a.retries.begin() + static_cast<std::ptrdiff_t>(i));
+                resolved.push_back(producerId);
+                continue;
+            }
             const tx::ControlType ct = a.commit ? tx::ControlType::Commit : tx::ControlType::Abort;
             const auto batch = tx::ControlMarker::build(producerId, a.producerEpoch, ct, a.coordinatorEpoch);
             const int64_t off = gateway_->appendControlRecord(
                 r.topicId, r.partition, std::span<const uint8_t>(batch.data(), batch.size()),
                 producerId, a.commit, a.coordinatorEpoch);
-            ++work;
             if (off == rune::gateway::ClientGateway::kControlRecordAsync) {
-                a.retries.erase(a.retries.begin() + static_cast<std::ptrdiff_t>(i));   // in flight again
+                r.inFlight = true;            // reply pending: the entry keeps its backoff
+                --queuedRetries_;
+                ++i;
             } else if (off >= 0) {
                 gateway_->notifyControlMarker(r.topicId, r.partition, producerId, off, a.commit);
+                --queuedRetries_;
                 a.retries.erase(a.retries.begin() + static_cast<std::ptrdiff_t>(i));
-                landed.push_back(producerId);
+                resolved.push_back(producerId);
             } else {
                 r.backoffNs = std::min(r.backoffNs * 2, kMarkerRetryMaxNs);
                 r.dueNs     = nowNs + r.backoffNs;
@@ -823,7 +871,7 @@ int TransactionCoordinationService::retryRefusedMarkers_(int64_t nowNs)
             }
         }
     }
-    for (const int64_t pid : landed) resolveMarker_(pid);
+    for (const int64_t pid : resolved) resolveMarker_(pid);
     return work;
 }
 
