@@ -111,6 +111,20 @@ TEST(ProducerSend, VoidSendThrowsWhenTheRunnerStopsDrainingRegression) {
     EXPECT_THROW(p.send(kTopic, Key(uint64_t{1}), kVal), std::runtime_error);
 }
 
+// D7 review (blocking): a bulk ns->ms rename also hit the producer's DEFAULT liveness clock (steadyNowNs_), not
+// only record timestamps: it returned steady MILLISECONDS while the ring heartbeat and livenessNs are steady
+// NANOSECONDS -> the dead-runner check never fired (send() on a wedged runner blocked forever).  Tests inject
+// nanoClock, so only this asserts the default clock's unit.
+TEST(ProducerSend, DefaultLivenessClockIsSteadyNanosecondsRegression) {
+    const int64_t before = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t got = ProducerImpl::defaultClockNowForTest();
+    const int64_t after = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    EXPECT_GE(got, before);
+    EXPECT_LE(got, after);
+}
+
 TEST(ProducerSend, TrySendReportsBackPressureAndLosesNothingRegression) {
     auto* impl = new ProducerImpl(voidCfg(), 4 * 1024);
     Producer p(impl);

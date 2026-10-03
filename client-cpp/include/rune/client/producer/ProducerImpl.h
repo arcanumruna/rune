@@ -556,6 +556,8 @@ public:
 
     using ClockFn = int64_t (*)() noexcept;
     void setClockForTesting(ClockFn fn) noexcept { clock_ = fn; }
+    /// The DEFAULT liveness clock (steady nanoseconds — the unit of the ring heartbeat and livenessNs).
+    [[nodiscard]] static int64_t defaultClockNowForTest() noexcept { return steadyNowNs_(); }
 
     /// Pump hook, wired by Client::producer() in BOTH runner modes (fix1 C1):
     /// called from sendBlocking() on BackPressured, checked AFTER the ring's

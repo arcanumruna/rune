@@ -422,7 +422,7 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
 }
 
 int64_t ProducerImpl::steadyNowNs_() noexcept {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
@@ -1426,7 +1426,7 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     //   first; this guarantees NO emitted RecordBatch exceeds effCap wire.
     if (frameCapped && ps.builder && ps.builder->recordCount() > 0) {
         // Compute exact wire contribution of this next record.
-        // wallMs() here and inside builder->append() may differ by ≤1µs,
+        // wallMs() here and inside builder->append() may differ by one ms tick,
         // which can shift varlongLen(tsDelta) by +1 byte at boundary values.
         // Adding 1 byte of slack makes the check conservative (splits ≤1 byte
         // early at boundary values) but guarantees NO overshoot.

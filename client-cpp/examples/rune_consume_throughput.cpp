@@ -141,7 +141,9 @@ int main() {
             recs.fetch_add(1, std::memory_order_relaxed);
             bytes.fetch_add(r.value.size(), std::memory_order_relaxed);
             if (mode == "tail" && r.timestamp > 0) {
-                const int64_t lag = wallNowNs() - r.timestamp * 1'000'000LL;   // record timestamps are epoch ms (D7)
+                const int64_t tsNs = r.timestamp > 1'000'000'000'000'000LL ? r.timestamp            // legacy ns-stamped record
+                                                                      : r.timestamp * 1'000'000LL;  // epoch ms (D7)
+                const int64_t lag = wallNowNs() - tsNs;   // ms resolution for ms-stamped records
                 if (lag > 0 && lag < 60'000'000'000LL) { // ignore absurd/negative
                     lagSumNs.fetch_add(lag, std::memory_order_relaxed);
                     lagSamples.fetch_add(1, std::memory_order_relaxed);
