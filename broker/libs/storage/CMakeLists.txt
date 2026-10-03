@@ -23,7 +23,9 @@ if(BUILD_TESTING)
     add_executable(rune_in_memory_log_ring_tests tests/storage/InMemoryLogRingTest.cpp)
     target_link_libraries(rune_in_memory_log_ring_tests PRIVATE rune_storage GTest::gtest_main)
     gtest_discover_tests(rune_in_memory_log_ring_tests)
-    target_link_libraries(rune_storage_tests PRIVATE rune_storage GTest::gtest_main)
+    # D3b r2: the cleaner tests write the PRODUCTION txn marker bytes
+    # (rune::transaction::ControlMarker::build) — a cross-library contract.
+    target_link_libraries(rune_storage_tests PRIVATE rune_storage rune_transaction GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_storage_tests)
 endif()

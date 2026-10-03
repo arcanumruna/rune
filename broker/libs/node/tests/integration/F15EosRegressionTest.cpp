@@ -5282,3 +5282,97 @@ TEST(CleanerLsoRegression, RcRebuildRacingCleanerSwapsNeverLeavesTxnOpen) {
     EXPECT_TRUE(bytes.empty() || rune::protocol::RecordBatchReader(bytes.data(), bytes.size()).baseOffset() != 1)
         << "the deferred swaps are applied once the rebuild is Ready";
 }
+
+// D3b fix round 2 (4): a read_committed SERVE that finds the RC state stale (a new
+// leadership) resets it — and must publish the cleaner LSO 0 right there, not on
+// the next per-pass driver step (a cleaner pass could start in between).
+TEST(CleanerLsoRegression, ServeTimeResetPublishesZeroLso) {
+    EosRig R;
+    for (int i = 0; i < 8 && R.r->cleanerLastStableOffset() != PartitionReplica::kNoCleanerLso; ++i)
+        R.runWorker(2 + i);
+    ASSERT_EQ(R.r->cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso) << "precondition: Ready, nothing open";
+    ASSERT_TRUE(R.w().rcServeForTest(0, 0)) << "precondition: served";
+    R.r->becomeFollower(2, /*leaderId=*/2);   // a new leadership: the RC state is stale
+    R.r->becomeLeader(3, {1});
+    EXPECT_FALSE(R.w().rcServeForTest(0, 0)) << "the stale RC state must not be served";
+    EXPECT_EQ(R.r->cleanerLastStableOffset(), 0) << "the serve-time reset did not publish the cleaner LSO 0";
+}
+
+// D3b fix round 2 (2): a rebuild that maps a SEALED segment it has not read yet
+// (here > kReadMapMinBytes: its eager 1 MiB map is too small, so the first read
+// remaps) must map the segment's OWN inode — never re-open the path, which after
+// a deferred cleaner swap is the rewritten file (marker gone → txn left open, or
+// SIGBUS past the new EOF).
+TEST(CleanerLsoRegression, RcRebuildMapsSealedSegmentThroughItsOwnInode) {
+    TmpDir d;
+    NullTransport t;
+    ReplicaRegistry reg;
+    constexpr int32_t kRoll = 1200 * 1024;   // > kReadMapMinBytes (1 MiB)
+    Log log(d.path.string(), kRoll);
+    log.recover();
+    constexpr int64_t P = 5;
+    const std::string big(64 * 1024, 'x');
+    int64_t o = 0;
+    auto pad = [&]() {
+        rune::protocol::RecordBatchBuilder b(o, 1000 + o);
+        b.append("pad" + std::to_string(o), big, 1000 + o);
+        log.append(b.build(), o); ++o;
+    };
+    {   // segment 0: the aborted txn data first, then padding past the roll
+        rune::protocol::RecordBatchBuilder b(o, 1000);
+        b.setTransactional(true); b.setProducerId(P); b.setProducerEpoch(0); b.setBaseSequence(0);
+        b.append("k", "v", 1000);
+        log.append(b.build(), o); ++o;
+    }
+    while (log.segmentBaseOffsets().size() < 2) pad();
+    const int64_t markerOff = o;   // segment 1 (> 1 MiB): the ABORT marker, then the producer's last batch
+    {
+        auto m = tx::ControlMarker::build(P, 0, tx::ControlType::Abort, 0);
+        for (int i = 0; i < 8; ++i) m[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(o) >> (8 * i));
+        log.append(m, o); ++o;
+        rune::protocol::RecordBatchBuilder b(o, 1000 + o);
+        b.setProducerId(P); b.setProducerEpoch(0); b.setBaseSequence(1);
+        b.append("k2", "v", 1000 + o);
+        log.append(b.build(), o); ++o;
+    }
+    while (log.segmentBaseOffsets().size() < 3) pad();
+    ASSERT_GT(fs::file_size(d.path / "00000000000000000000.log"), (1u << 20)) << "precondition";
+
+    auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, /*topicId=*/0, 0), Role::Leader, 1,
+                                                  std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &t);
+    PartitionReplica* r = rep.get();
+    r->onLeaderLogAppended();
+    reg.add(0, 0, std::move(rep));
+    WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
+    pool.assignFromRegistry(reg);
+    pool.setRegistry(&reg);
+    pool.setRunnersStartedForTest(true);
+    Worker& w = pool.worker(0);
+    w.setRcScanBytesPerPass(64);   // one batch per pass
+    w.setRcResidencyProbeForTest([](void*, const uint8_t*, std::size_t len) { return len; }, nullptr);
+    auto pass = [&](int64_t now) { w.doWork(now); w.drainReturn([](WorkerReturn) {}); };
+    int64_t now = 1;
+    for (int i = 0; i < 64 && w.rcScannedBytesForTest(0, 0) == 0; ++i) pass(now++);
+    ASSERT_GT(w.rcScannedBytesForTest(0, 0), 0u) << "precondition: the rebuild read the aborted data";
+    ASSERT_LT(w.rcScannedBytesForTest(0, 0), 1u << 20) << "precondition: segment 1 not reached yet";
+
+    // Cleaner passes rewrite segments 0 and 1 on disk (discard the aborted data,
+    // stamp, then drop the empty ABORT marker); their swaps are deferred.
+    for (int64_t nowMs : {1'000'000LL, 1'000'000LL, 2'000'000LL}) {
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        std::vector<int64_t> sizes(bases.size(), 1);
+        rune::storage::LogCleaner cleaner;
+        cleaner.setMarkerRemovalBound(std::numeric_limits<int64_t>::max());
+        rune::storage::SkimpyOffsetMap map(1 << 16);
+        const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0,
+                                                            /*deleteRetentionMs=*/10, map, false, 64 << 20,
+                                                            nullptr, nowMs);
+        for (int64_t b : res.rewrittenBases) ASSERT_TRUE(log.enqueueCleanedSegment(b));
+    }
+    for (int i = 0; i < 4096 && w.rcStatusForTest(0, 0) != 2; ++i) pass(now++);
+    ASSERT_EQ(w.rcStatusForTest(0, 0), 2) << "the rebuild finished";
+    EXPECT_EQ(w.rcOpenTxnsForTest(0, 0), 0u)
+        << "the aborted txn was left OPEN: the rebuild mapped the rewritten segment (marker @" << markerOff << " gone)";
+}

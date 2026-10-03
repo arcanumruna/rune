@@ -216,6 +216,10 @@ public:
     /// sealed segment recovered from disk starts false (F3: lazy mapping) and
     /// flips true after its first successful readView().
     [[nodiscard]] bool hasReadMapForTest() const noexcept { return static_cast<bool>(readMap_); }
+    /// TEST SEAM (D3b r2): make every read-map creation fail.  The read map is now
+    /// made through the segment's own fd (never by path), so a test can no longer
+    /// break it by swapping the .log path out from under the segment.
+    void setReadMapFaultForTest(bool on) noexcept { readMapFaultForTest_ = on; }
     /// Count of readView() calls that failed to (re)establish the read mapping
     /// (ensureReadMap() returned false), e.g. because the backing file is gone
     /// or the map/open syscall failed.  Monotonically increasing; never reset.
@@ -246,6 +250,7 @@ private:
     /// on failure — readMap_/readMapSize_ are left null/0 (never a dangling or
     /// stale mapping) and readMapFailures_ is bumped, with a rate-limited spdlog
     /// warn (first failure, then every 1024th).
+    std::unique_ptr<MappedFile> makeReadMap_(std::size_t bytes);   // D3b r2: through fd_, never by path
     bool ensureReadMap() noexcept;
     /// Eagerly create the read mapping at segment construction (off the hot path).
     void openReadMap() noexcept;
@@ -268,6 +273,7 @@ private:
     std::unique_ptr<MappedFile> readMap_;
     std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_ (>= logSize_ headroom)
     static constexpr std::size_t kReadMapMinBytes = 1u << 20;   // first read mapping: 1 MiB
+    bool     readMapFaultForTest_ = false;   // D3b r2 test seam (setReadMapFaultForTest)
     uint64_t readMapFailures_ = 0;  // count of failed ensureReadMap() calls — see readMapFailures()
 };
 

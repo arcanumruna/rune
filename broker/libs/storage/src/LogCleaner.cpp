@@ -1,5 +1,6 @@
 #include <rune/storage/LogCleaner.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/ControlMarkerLayout.h>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -180,30 +181,26 @@ void appendEmptyTailBatch(std::vector<uint8_t>& out, std::vector<uint8_t>& tmp, 
     rune::protocol::detail::putLE(tmp, rune::protocol::batch::kCrcOffset, crc);
     out.insert(out.end(), tmp.begin(), tmp.end());
 }
-// D3b: is the control batch an ABORT marker?  The marker key is the int16 LE
-// controlType (0 = COMMIT, 1 = ABORT — rune::transaction::ControlMarker).  An
-// unparseable key is treated as COMMIT: never discard data on a marker we cannot read.
-//
-// TWO encodings (fix round 1): the PRODUCTION marker (ControlMarker::build — the
-// one every EndTxn writes) is a fixed 75-byte batch whose single record carries
-// NO length varint (attrs, tsDelta, offDelta, keyLen=2, key, valLen=6, value,
-// headers at [61..74]); a Kafka-framed control record (length varint first, as
-// RecordBatchBuilder::setControl emits) is read with the normal record walk.
-// RecordBatchReader::forEachRecord on the production layout misreads it (the
-// attributes byte is taken as the length varint) and saw every ABORT as COMMIT.
-bool isAbortMarker(const uint8_t* batch, std::size_t len, const rune::protocol::RecordBatchReader& r) {
-    constexpr std::size_t kMarkerSize = 75, kRec = rune::protocol::batch::kRecordBatchOverhead;
-    if (len == kMarkerSize && r.recordCount() == 1 && batch[kRec] == 0 && batch[kRec + 1] == 0 &&
-        batch[kRec + 2] == 0 && batch[kRec + 3] == 0x04 /* zig-zag keyLen 2 */ && batch[kRec + 6] == 0x0C) {
-        return rune::protocol::detail::getLE16(batch + kRec + 4) == 1;   // ControlMarker layout
-    }
-    bool abort = false;
+// D3b: the control type of a marker batch — kCommit / kAbort, or kUnparseable.
+// TWO encodings: the PRODUCTION marker (ControlMarker::build — its layout is
+// defined ONCE in ControlMarkerLayout.h; its record carries NO length varint) and
+// a Kafka-framed control record (length varint first) whose key is the 2-byte LE
+// controlType.  Anything else is UNPARSEABLE: the cleaner treats its transaction
+// as UNRESOLVED (caps the pass at it) — never as COMMIT, which would index data
+// that may have been aborted (fix round 2).
+int markerControlType(const uint8_t* batch, std::size_t len, const rune::protocol::RecordBatchReader& r) {
+    namespace cml = rune::storage::control_marker;
+    const int t = cml::controlType(batch, len);
+    if (t != cml::kUnparseable) return t;
+    if (r.recordCount() != 1 || batch[cml::kBatchHeaderSize] == 0) return cml::kUnparseable;   // not Kafka-framed
+    int out = cml::kUnparseable;
     r.forEachRecord([&](std::string_view key, std::string_view, int64_t, int64_t) {
-        if (key.size() == 2)
-            abort = (static_cast<uint16_t>(static_cast<uint8_t>(key[0])) |
-                     static_cast<uint16_t>(static_cast<uint8_t>(key[1])) << 8) == 1;
+        if (key.size() != 2) return;
+        const int v = static_cast<int>(static_cast<uint16_t>(static_cast<uint8_t>(key[0])) |
+                                       static_cast<uint16_t>(static_cast<uint8_t>(key[1])) << 8);
+        if (v == cml::kCommit || v == cml::kAbort) out = v;
     });
-    return abort;
+    return out;
 }
 
 // D3b: the transaction pre-pass (Kafka: the cleaner's aborted-txn collection +
@@ -234,9 +231,14 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             const int64_t pid  = r.producerId();
             const int64_t last = base + r.lastOffsetDelta();
             if (pid >= 0) {
-                if (isControlBatch(r))
-                    txn.onMarker(pid, base, isAbortMarker(buf.data() + pos, static_cast<std::size_t>(total), r),
-                                 r.hasDeleteHorizon() ? r.deleteHorizonMs() : TxnCleanState::kNoHorizon);
+                if (isControlBatch(r)) {
+                    const int type = markerControlType(buf.data() + pos, static_cast<std::size_t>(total), r);
+                    if (type == rune::storage::control_marker::kUnparseable)
+                        txn.onUnresolvedMarker(pid, base);   // never COMMIT (fix round 2)
+                    else
+                        txn.onMarker(pid, base, type == rune::storage::control_marker::kAbort,
+                                     r.hasDeleteHorizon() ? r.deleteHorizonMs() : TxnCleanState::kNoHorizon);
+                }
                 else if (isTransactionalBatch(r))
                     txn.onTxnDataBatch(pid, base, last, r.recordCount() > 0);
                 else                              txn.onProducerBatch(pid, last);

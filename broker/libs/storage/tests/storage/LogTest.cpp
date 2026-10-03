@@ -1474,10 +1474,11 @@ TEST(LogSegmentRegression, ReadViewNoexceptOnMapFailure) {
     ASSERT_FALSE(sealedSeg->hasReadMapForTest()) << "sealed segment must still be unmapped (F3 lazy)";
     EXPECT_EQ(sealedSeg->readMapFailures(), 0u);
 
-    // Delete the sealed segment's backing .log file out from under it — the
-    // (still-open) write fd_ keeps the inode alive, but a brand-new open() by
-    // pathname (what the lazy MappedFile ctor does) now fails with ENOENT.
+    // D3b r2: the read map is made through the segment's own fd (its inode),
+    // never by re-opening the path — deleting the path no longer breaks it (the
+    // segment keeps reading its own bytes).  Inject the map failure via the seam.
     ::unlink(sealedSeg->logPath().c_str());
+    sealedSeg->setReadMapFaultForTest(true);
 
     LogReadView v1;
     EXPECT_NO_THROW(v1 = log2.readView(sealedBase, 1 << 20));

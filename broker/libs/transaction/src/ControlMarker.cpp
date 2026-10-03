@@ -203,6 +203,10 @@ std::vector<uint8_t> ControlMarker::build(ProducerId    producerId,
     rpos += write_varint_zigzag(p, rpos, 0);  // headersCount = 0
 
     assert(rpos == ENCODED_SIZE);
+    // D3b r2: the layout the log cleaner parses (ControlMarkerLayout.h) is THIS one.
+    namespace cml = rune::storage::control_marker;
+    assert(p[cml::kKeyLengthOffset] == cml::kKeyLengthByte && p[cml::kValueLengthOffset] == cml::kValueLengthByte);
+    assert(cml::controlType(p, ENCODED_SIZE) == static_cast<int>(controlType));
 
     // CRC32C over bytes [CRC_DATA_START..ENCODED_SIZE) — same range as
     // RecordBatchBuilder::build() which covers [kAttributesOffset..end].

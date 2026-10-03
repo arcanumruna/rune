@@ -28,8 +28,9 @@
 //    delete horizon on the first pass that finds it removable and dropped by a
 //    pass at/after the horizon (KIP-534).
 //
-// A marker whose record key is not a 2-byte controlType is treated as COMMIT:
-// never discard data on an unparseable marker.
+// A marker whose type cannot be read is UNRESOLVED (fix round 2): its txn caps the
+// pass like an open one — never treated as COMMIT (that would index data that may
+// have been aborted) nor as ABORT (that would discard committed data).
 //
 // Cleaner thread only (cold; the cleaner is the one sanctioned heap user).
 // clear() keeps the containers' capacity for reuse across passes.
@@ -54,6 +55,7 @@ public:
         removable_.clear();
         firstUnresolved_ = kNone;
         cleanLimit_      = kNone;
+        unresolvedFloor_ = kNone;
         abortedBatches_  = 0;
     }
     static constexpr int64_t kNoHorizon = -1;
@@ -87,11 +89,23 @@ public:
         s.openRecordBatches = 0;
         s.lastBatch         = std::max(s.lastBatch, offset);
     }
+    /// A control batch of `pid` at `offset` whose type cannot be read (fix round
+    /// 2): its transaction is UNRESOLVED — the pass is capped at the txn's first
+    /// offset (or at the marker itself if no data preceded it), never cleaned as
+    /// committed.
+    void onUnresolvedMarker(int64_t pid, int64_t offset) {
+        Scan& s = scan_[pid];
+        unresolvedFloor_ = std::min(unresolvedFloor_, s.openFirst >= 0 ? s.openFirst : offset);
+        s.openFirst         = -1;
+        s.openBatches       = 0;
+        s.openRecordBatches = 0;
+        s.lastBatch         = std::max(s.lastBatch, offset);
+    }
     /// End of the pre-pass: resolve the LSO, the clean limit and removable markers
     /// (only below `markerRemovalBound`, the minimum fetch position over every
     /// assigned replica).
     void finish(int64_t toOffset, int64_t markerRemovalBound = 0) {
-        firstUnresolved_ = kNone;
+        firstUnresolved_ = unresolvedFloor_;
         for (const auto& [pid, s] : scan_)
             if (s.openFirst >= 0 && s.openFirst < firstUnresolved_) firstUnresolved_ = s.openFirst;
         cleanLimit_ = std::min(toOffset, firstUnresolved_);
@@ -144,6 +158,7 @@ private:
     std::unordered_map<int64_t, int64_t> removable_;   ///< marker offset -> its horizon (kNoHorizon)
     int64_t firstUnresolved_ = kNone;
     int64_t cleanLimit_      = kNone;
+    int64_t unresolvedFloor_ = kNone;   ///< first offset of a txn ended by an unparseable marker
     int64_t abortedBatches_  = 0;
 };
 

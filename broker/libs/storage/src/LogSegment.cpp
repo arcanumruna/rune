@@ -136,6 +136,19 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     if (eagerReadMap) openReadMap();
 }
 
+// D3b fix round 2: the read mapping is ALWAYS made through this segment's own
+// open fd_ (its inode, held for the segment's lifetime anyway) — never by
+// re-opening logPath_.  The log cleaner renames a rewritten file over the path
+// and only then enqueues the swap; until the owner applies it (deferred while a
+// read_committed rebuild scans), this segment must keep reading ITS bytes: a
+// by-path (re)map would expose the rewritten file (a marker skipped → a txn left
+// open) or SIGBUS past its shorter EOF.  No extra fd (F3 unchanged).
+std::unique_ptr<MappedFile> LogSegment::makeReadMap_(std::size_t bytes) {
+    if (readMapFaultForTest_) [[unlikely]] throw std::runtime_error("LogSegment: injected read-map failure");
+    if (fd_ >= 0) return std::make_unique<MappedFile>(MappedFile::BorrowedFd{fd_}, logPath_, bytes);
+    return std::make_unique<MappedFile>(logPath_, bytes, /*writable*/false);   // unreachable: ctor throws on fd_ < 0
+}
+
 void LogSegment::openReadMap() noexcept {
     // Create the read-only .log mapping WITH the segment (spec §1a.5): the first
     // readView() after a roll must not allocate a MappedFile + mmap on the
@@ -143,7 +156,7 @@ void LogSegment::openReadMap() noexcept {
     // readView reads only [0, logSize_)).  Failure is non-fatal — ensureReadMap()
     // falls back to creating it lazily.
     try {
-        readMap_     = std::make_unique<MappedFile>(logPath_, kReadMapMinBytes, /*writable*/false);
+        readMap_     = makeReadMap_(kReadMapMinBytes);
         readMapSize_ = readMap_->size();
     } catch (...) {
         readMap_.reset();
@@ -400,9 +413,10 @@ bool LogSegment::ensureReadMap() noexcept {
     try {
         if (!readMap_) {
             // Read-only mapping (writable=false → no ftruncate; never mutates .log).
-            readMap_ = std::make_unique<MappedFile>(logPath_, cap, /*writable*/false);
+            readMap_ = makeReadMap_(cap);
         } else {
-            // For a read-only MappedFile, resize() munmaps + remaps WITHOUT ftruncate.
+            // For a read-only MappedFile, resize() munmaps + remaps WITHOUT ftruncate
+            // — through this segment's own fd (D3b r2), never by path.
             readMap_->resize(cap);
         }
         readMapSize_ = readMap_->size();

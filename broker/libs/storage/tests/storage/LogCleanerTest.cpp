@@ -4,6 +4,8 @@
 #include <rune/storage/OffsetMap.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/ControlMarkerLayout.h>
+#include <rune/transaction/ControlMarker.h>
 
 #include <atomic>
 #include <filesystem>
@@ -1588,12 +1590,10 @@ std::vector<uint8_t> txnBatch(int64_t off, std::string_view key, std::string_vie
     b.append(key, val, 1000 + off);
     return b.build();
 }
-std::vector<uint8_t> markerBatch(int64_t off) {
-    RecordBatchBuilder b(off, 1000 + off);
-    b.setProducerId(kTxnPid); b.setProducerEpoch(0);
-    b.setControl(true);
-    b.append(std::string_view("\0\0\0\1", 4), std::string_view("\0\0\0\0\0\0", 6), 1000 + off);  // COMMIT
-    return b.build();
+std::vector<uint8_t> markerBatch(int64_t off) {   // a real COMMIT marker (ControlMarker::build)
+    auto b = rune::transaction::ControlMarker::build(kTxnPid, 0, rune::transaction::ControlType::Commit, 0);
+    for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(off) >> (8 * i));
+    return b;
 }
 void writeTxnLog(Log& log) {
     log.append(txnBatch(0, "k1", "v1", 0), 0);   // superseded by @1
@@ -1697,27 +1697,12 @@ std::vector<uint8_t> d3bTxn(int64_t off, std::string_view key, std::string_view 
     b.append(key, val, 1000 + off);
     return b.build();
 }
-// The PRODUCTION end-txn marker bytes (rune::transaction::ControlMarker::build —
-// 75 bytes; its record has NO length varint, unlike RecordBatchBuilder records):
-// key = int16 LE controlType (0=COMMIT, 1=ABORT), value = version + coordinatorEpoch.
+// The PRODUCTION end-txn marker: rune::transaction::ControlMarker::build (the
+// bytes every EndTxn writes), with the log offset stamped in (outside the CRC).
 std::vector<uint8_t> d3bMarker(int64_t off, bool abort, int64_t pid = kD3bPid) {
-    std::vector<uint8_t> b(75, 0);
-    auto le = [&](std::size_t at, uint64_t v, int n) { for (int i = 0; i < n; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i)); };
-    le(0, static_cast<uint64_t>(off), 8);
-    le(8, 63, 4);
-    le(12, 0xFFFFFFFFu, 4);
-    b[16] = 2;
-    le(21, 0x0030, 2);                                     // CONTROL | TRANSACTIONAL
-    le(43, static_cast<uint64_t>(pid), 8);
-    le(51, 3, 2);                                          // epoch
-    le(53, 0xFFFFFFFFu, 4);                                // baseSequence -1
-    le(57, 1, 4);                                          // one record
-    b[64] = 0x04;                                          // keyLength 2 (zig-zag)
-    le(65, abort ? 1 : 0, 2);                              // controlType
-    b[67] = 0x0C;                                          // valueLength 6
-    le(68, 1, 2);                                          // version
-    const uint32_t crc = crc32c(b.data() + 21, b.size() - 21);
-    le(17, crc, 4);
+    auto b = rune::transaction::ControlMarker::build(
+        pid, 3, abort ? rune::transaction::ControlType::Abort : rune::transaction::ControlType::Commit, 0);
+    for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(off) >> (8 * i));
     return b;
 }
 // The same marker as a RecordBatchBuilder control batch (Kafka record framing).
@@ -2167,4 +2152,87 @@ TEST(LogCleanerTxnAbortRegression, BothMarkerEncodingsAreParsed) {
         }
         std::filesystem::remove_all(dir);
     }
+}
+
+// Fix round 2 (3): a marker the cleaner cannot parse is UNRESOLVED — never read as
+// COMMIT (which would index the possibly-aborted data).  The pass is capped at the
+// txn's first offset: the data stays unindexed and untouched.
+TEST(LogCleanerTxnAbortRegression, UnparseableMarkerIsUnresolvedNeverCommit) {
+    for (CleanPath path : {CleanPath::Sync, CleanPath::Range, CleanPath::RangeCoalesce}) {
+        auto dir = makeTempDir("lc_d3b_unparse");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            d3bPlain(log, 0, "k", "v1");
+            log.append(d3bTxn(1, "k", "v2", 0), 1);
+            {   // a control batch whose record is not a 2-byte controlType key
+                RecordBatchBuilder b(2, 0);
+                b.setProducerId(kD3bPid); b.setProducerEpoch(3); b.setControl(true);
+                b.append(std::string_view("\0\0\0\1", 4), std::string_view("\0\0\0\0\0\0", 6), 0);
+                log.append(b.build(), 2);
+            }
+            for (int64_t i = 3; i < 6; ++i) d3bPlain(log, i, "pad", "p");
+            const int64_t passEnd = cleanOnce(log, path, 1'000'000);
+            const auto recs = readAllRecords(log);
+            EXPECT_EQ(countKey(recs, "k"), 2) << pathName(path) << ": data before an unparseable marker was cleaned";
+            if (path != CleanPath::Sync) EXPECT_LE(passEnd, 1) << pathName(path);
+            ASSERT_FALSE(batchAt(log, 2).empty()) << pathName(path);
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 2 (3): cross-library contract — the layout the cleaner parses
+// (ControlMarkerLayout.h) is exactly what ControlMarker::build writes.
+TEST(LogCleanerTxnMarkerKeyRegression, ControlMarkerBuildMatchesTheCleanersLayout) {
+    namespace cml = rune::storage::control_marker;
+    namespace tx = rune::transaction;
+    for (auto [type, want] : {std::pair{tx::ControlType::Commit, cml::kCommit}, std::pair{tx::ControlType::Abort, cml::kAbort}}) {
+        const auto m = tx::ControlMarker::build(7, 2, type, 9);
+        EXPECT_EQ(m.size(), cml::kEncodedSize);
+        EXPECT_EQ(cml::controlType(m.data(), m.size()), want);
+    }
+    auto bad = tx::ControlMarker::build(7, 2, tx::ControlType::Abort, 9);
+    bad[cml::kKeyOffset] = 7;   // an unknown control type
+    EXPECT_EQ(cml::controlType(bad.data(), bad.size()), cml::kUnparseable);
+}
+
+// Fix round 2 (2): a SEALED segment's read mapping is always made through the
+// segment's own open file (its inode) — never by re-opening the path.  The cleaner
+// renames a rewritten file over the path and only then enqueues the swap; until
+// the owner applies it (deferred during an RC rebuild) a read that grows/creates
+// the mapping must still see the ORIGINAL bytes (by path it would see the
+// rewritten file — a skipped marker — or SIGBUS past its shorter EOF).
+TEST(LogSegmentReadMapRegression, SealedSegmentMapsItsOwnInodeNotThePath) {
+    auto dir = makeTempDir("lc_d3b_inode");
+    std::filesystem::create_directories(dir);
+    {
+        constexpr int32_t kRoll = 1200 * 1024;   // > kReadMapMinBytes: the eager 1 MiB map is too small
+        Log log(dir.string(), kRoll); log.recover();
+        const std::string big(64 * 1024, 'o');
+        int64_t o = 0;
+        while (log.segmentBaseOffsets().size() < 2) { d3bPlain(log, o, "k" + std::to_string(o), big); ++o; }
+        const int64_t last = log.segmentBaseOffsets()[1] - 1;   // the sealed segment's tail batch (past 1 MiB, never read)
+        const auto seg0 = dir / "00000000000000000000.log";
+        ASSERT_GT(std::filesystem::file_size(seg0), (1u << 20)) << "precondition";
+        // A same-size replacement with different bytes, renamed over the path (as
+        // the cleaner does before enqueueing its swap).
+        {
+            std::ifstream in(seg0, std::ios::binary);
+            std::vector<char> bytes((std::istreambuf_iterator<char>(in)), {});
+            for (std::size_t i = bytes.size() - 1024; i < bytes.size(); ++i) bytes[i] = 'Z';
+            std::ofstream out(seg0.string() + ".new", std::ios::binary);
+            out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        }
+        std::filesystem::rename(seg0.string() + ".new", seg0);
+        const auto v = log.readView(last, 1 << 20);
+        ASSERT_FALSE(v.empty()) << "the sealed segment's tail must stay readable";
+        RecordBatchReader r(v.data, v.len);
+        ASSERT_EQ(r.baseOffset(), last);
+        EXPECT_TRUE(r.ensureValid()) << "the read mapping re-opened the PATH (the rewritten file), not the segment's inode";
+        std::string val;
+        r.forEachRecord([&](std::string_view, std::string_view value, int64_t, int64_t) { val = std::string(value); });
+        EXPECT_EQ(val, big) << "read the rewritten file's bytes";
+    }
+    std::filesystem::remove_all(dir);
 }

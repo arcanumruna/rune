@@ -608,6 +608,12 @@ public:
     // replica, once leader, read the aborted data as the producer's NEXT txn.  A
     // replica that never fetched counts as 0, so a permanently dead assigned
     // replica keeps every marker (correctness over growth).  Follower role: 0.
+    // Only REAL fetch positions count (onFetchRequest), relearned every
+    // leadership; an OffsetsForLeaderEpoch probe's LEO never does (it may be a
+    // divergent pre-truncation tail).  The bound TRUSTS reported fetch positions:
+    // a follower that lost an unflushed tail in a crash keeps its old position
+    // here until it fetches again — safe unless a marker's delete horizon
+    // (deleteRetentionMs) expires within that follower's restart.
     // kNoCleanerLso when this is the only assigned replica.
     [[nodiscard]] Offset cleanerMarkerRemovalBound() const noexcept {
         return publishedMarkerBoundForCleaner_.load(std::memory_order_acquire);

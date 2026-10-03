@@ -1400,7 +1400,10 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         const Offset trackedLeo = std::min<Offset>(req.followerLeo, logEndOffset_());
         if (trackedLeo >= 0) {
             leaderState_.updateFollowerFetchOffset(req.followerId, trackedLeo);
-            noteReplicaFetchPos_(req.followerId, trackedLeo);   // D3b fix round 1
+            // D3b fix round 2: NOT noteReplicaFetchPos_ — a probe carries the
+            // follower's PRE-truncation LEO from its own (possibly divergent)
+            // lineage; only real fetch positions on our lineage feed the cleaner's
+            // marker-removal bound (cleanerMarkerRemovalBound()).
             // BUG FIX (ISR-tracking divergence): the probe must ALSO advance the
             // IsrManager's per-follower fetch offset/time, exactly like a normal
             // fetch (onFetchRequest updates BOTH).  Updating only leaderState_ left

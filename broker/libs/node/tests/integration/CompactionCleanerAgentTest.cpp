@@ -2930,3 +2930,98 @@ TEST(LogCleanerRcRebuildRegression, ReadCommittedAndProducerStateUnchangedByClea
     }
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// D3b fix round 2 (1): an OffsetsForLeaderEpoch PROBE never feeds the marker-
+// removal bound.  A probe carries the follower's PRE-truncation LEO from its own,
+// possibly divergent, lineage (an old leader with a divergent tail): counting it
+// would let the new leader stamp + drop an ABORT marker the old leader does not
+// hold on this lineage; after truncating it refetches past the marker's offset,
+// never sees it, and as leader keeps that txn open forever.
+// ===========================================================================
+TEST(PartitionReplicaCleanerSnapshotRegression, ProbeNeverFeedsMarkerRemovalBound) {
+    auto dir = cp6TempDir("d3b_probe");
+    Log log(dir.string(), 1 << 20);
+    for (int64_t o = 0; o < 100; ++o) log.append(cp6Batch(o, "k", "v"), o);
+    Cp6NullTransport transport;
+    PartitionReplica r(makeCompactConfig(695), Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+    r.becomeLeader(1, {1, 2});
+    r.onLeaderLogAppended();
+    r.onOffsetsForLeaderEpochRequest(rune::replication::OffsetsForLeaderEpochReqMsg{1, 0, 2, 1, /*followerLeo=*/90, 695});
+    r.doWork(1);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "a probe's (unverified-lineage) LEO fed the marker bound";
+    (void)r.onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 40, 1 << 20, 695}, 2);
+    r.doWork(3);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 40) << "a real fetch position does";
+    fs::remove_all(dir);
+}
+
+// Fix round 2 (4): fetch positions are relearned in every leadership — a position
+// from an earlier term may predate a truncation.
+TEST(PartitionReplicaCleanerSnapshotRegression, FetchPositionsResetOnEveryLeadership) {
+    auto dir = cp6TempDir("d3b_releader");
+    Log log(dir.string(), 1 << 20);
+    for (int64_t o = 0; o < 20; ++o) log.append(cp6Batch(o, "k", "v"), o);
+    Cp6NullTransport transport;
+    PartitionReplica r(makeCompactConfig(696), Role::Leader, 1, {1, 2}, {1}, &log, &transport);
+    r.becomeLeader(1, {1});
+    r.onLeaderLogAppended();
+    (void)r.onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 15, 1 << 20, 696}, 1);
+    r.doWork(2);
+    ASSERT_EQ(r.cleanerMarkerRemovalBound(), 15) << "precondition";
+    r.becomeFollower(2, /*leaderId=*/2);
+    r.doWork(3);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "a follower never removes markers";
+    r.becomeLeader(3, {1});
+    r.doWork(4);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "replica 2's position from the earlier leadership was reused";
+    fs::remove_all(dir);
+}
+
+// Fix round 2 (1), agent level: a divergent old leader that only PROBES (with a
+// LEO past the marker) never lets the marker go; its real fetch past it does.
+TEST(LogCleanerAgentMarkerRemovalRegression, ProbeFromDivergentReplicaNeverReleasesMarker) {
+    auto dir = cp6TempDir("d3b_probe_agent");
+    Log log(dir.string(), /*rollBytes=*/1);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(697);
+    cfg.deleteRetentionMs = 0;
+    auto owned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1, std::vector<NodeId>{1, 2}, std::vector<NodeId>{1}, &log, &transport);
+    owned->becomeLeader(1, {1});
+    PartitionReplica* replica = owned.get();
+    constexpr int64_t P = 9;
+    log.append(r1Txn(0, "k", "aborted", P, 0, 0), 0);
+    log.append(r1Marker(1, P, 0, /*commit=*/false), 1);
+    log.append(r1Txn(2, "k2", "c", P, 0, 1), 2);
+    log.append(r1Marker(3, P, 0, /*commit=*/true), 3);
+    int64_t next = 4;
+    for (; next < 8; ++next) log.append(cp6Batch(next, "pad", "p"), next);
+    replica->onLeaderLogAppended();
+    replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    rune::node::ReplicaRegistry registry;
+    registry.add(697, 0, std::move(owned));
+    Cp6MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0);
+    auto cycles = [&](int n, int64_t& t) {
+        for (int i = 0; i < n; ++i, t += 1'000'000) {
+            log.append(cp6Batch(next, "pad", "p"), next); ++next;
+            replica->onLeaderLogAppended();
+            // Replica 2 (divergent old leader) keeps probing with a LEO past the marker.
+            replica->onOffsetsForLeaderEpochRequest(
+                rune::replication::OffsetsForLeaderEpochReqMsg{1, 0, 2, 1, /*followerLeo=*/next, 697});
+            duty.doWork(t);
+            cleaner.doWork(t);
+            duty.doWork(t);
+        }
+        log.reloadSegments();
+    };
+    int64_t t = 2'000'000;
+    cycles(8, t);
+    ASSERT_FALSE(r1BatchAt(log, 1).empty()) << "ABORT marker released by a probe's divergent LEO";
+    (void)replica->onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 2, 1 << 20, 697}, t);
+    cycles(8, t);
+    EXPECT_TRUE(r1BatchAt(log, 1).empty()) << "a real fetch past the marker releases it";
+    fs::remove_all(dir);
+}

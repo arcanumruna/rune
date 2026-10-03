@@ -408,6 +408,12 @@ public:
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->aborted().ranges() : std::vector<rune::transaction::AbortedTxnRange>{};
     }
+    /// Test seam (D3b r2): the read_committed SERVE check alone (rcServe_), as a
+    /// push/fetch read runs it — true when the RC state is served.
+    bool rcServeForTest(int32_t topicId, int32_t partition) {
+        auto* r = findOwnedReplica_(topicId, partition);
+        return r != nullptr && rcServe_(r, rcOf_(r)) != nullptr;
+    }
     [[nodiscard]] int rcStatusForTest(int32_t topicId, int32_t partition) const {
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->statusCode() : kRcNone;

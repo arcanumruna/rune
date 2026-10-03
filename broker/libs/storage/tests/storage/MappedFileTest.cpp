@@ -233,13 +233,10 @@ TEST(MappedFileRegression, FailedMmapAfterOpenLeaksNoFd) {
     ASSERT_NE(sealedSeg, nullptr);
     ASSERT_FALSE(sealedSeg->hasReadMapForTest()) << "sealed segment must still be unmapped";
 
-    // Replace the sealed segment's .log with a symlink to /dev/null: a fresh
-    // open() by pathname (what the lazy MappedFile ctor does) succeeds, but
-    // mmap() on it fails with ENODEV every time — a persistent, retried
-    // "open succeeds, mmap fails" failure exactly like the review's scenario.
-    std::string logPath = sealedSeg->logPath();
-    std::filesystem::remove(logPath);
-    std::filesystem::create_symlink("/dev/null", logPath);
+    // D3b r2: the lazy read map is made through the segment's own fd (never by
+    // re-opening the path), so a path swap can no longer fail it; inject a
+    // persistent, retried map failure via the seam instead.
+    sealedSeg->setReadMapFaultForTest(true);
 
     int before2 = countOpenFdsForTest();
     for (int i = 0; i < 50; ++i) {
