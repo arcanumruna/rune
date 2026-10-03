@@ -16,8 +16,10 @@ inline constexpr int kMagicOffset = 16;                // int8
 inline constexpr int kCrcOffset = 17;                  // uint32 CRC-32C
 inline constexpr int kAttributesOffset = 21;           // int16; CRC starts here
 inline constexpr int kLastOffsetDeltaOffset = 23;      // int32
-inline constexpr int kBaseTimestampOffset = 27;        // int64
-inline constexpr int kMaxTimestampOffset = 35;         // int64
+// Timestamp contract (D7, Kafka parity): base / max / per-record timestamps are epoch MILLISECONDS.
+// (Legacy rune-client builds stamped epoch ns; the broker still normalises those on read — toEpochMs.)
+inline constexpr int kBaseTimestampOffset = 27;        // int64, epoch ms
+inline constexpr int kMaxTimestampOffset = 35;         // int64, epoch ms
 inline constexpr int kProducerIdOffset = 43;           // int64
 inline constexpr int kProducerEpochOffset = 51;        // int16
 inline constexpr int kBaseSequenceOffset = 53;         // int32
