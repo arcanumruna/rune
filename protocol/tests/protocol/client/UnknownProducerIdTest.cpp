@@ -179,3 +179,71 @@ TEST(UnknownProducerIdWireCompatRegression, DecodeHonoursBlockLengthRegression) 
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->logStartOffset, 7);
 }
+
+// ---------------------------------------------------------------------------
+// Review M4: the 46 B frame must not reach a session the version gate treats as
+// old.  A STRICT pre-D6 decoder (exact length 38, exact blockLength 14 — what a
+// non-C++ client may hard-code) must decode every answer the broker gives a
+// session below kClientVersionUnknownProducerId.  encodeFor() is the single
+// per-session encoder: v0 frame + UnknownProducerId -> OOS for old sessions;
+// the 46 B frame (28 + logStartOffset) only for version >= 2.
+// ---------------------------------------------------------------------------
+namespace {
+std::optional<OldProduceResponse> strictOldDecode(const uint8_t* buf, std::size_t len) {
+    if (len != 38) return std::nullopt;
+    if (rpc::detail::getLE16(buf, 0) != 14) return std::nullopt;   // blockLength
+    return oldDecode(buf, len);
+}
+}  // namespace
+
+TEST(UnknownProducerIdWireCompatRegression, EncodeForOldClientIsStrictV0FrameRegression) {
+    for (int32_t ver : {0, 1}) {
+        for (auto ec : {rpc::ErrorCode::OK, rpc::ErrorCode::UnknownProducerId, rpc::ErrorCode::NotLeader}) {
+            rpc::ProduceResponse msg;
+            msg.sessionId      = 21;
+            msg.correlationId  = 22;
+            msg.errorCode      = static_cast<int16_t>(ec);
+            msg.partition      = 6;
+            msg.baseOffset     = ec == rpc::ErrorCode::OK ? 4242 : 0;
+            msg.logStartOffset = ec == rpc::ErrorCode::UnknownProducerId ? 100 : -1;
+            std::array<uint8_t, 64> buf{};
+            const std::size_t n = msg.encodeFor(buf.data(), ver);
+            ASSERT_EQ(n, rpc::ProduceResponse::ENCODED_SIZE_V0) << "ver=" << ver;
+            ASSERT_EQ(n, rpc::ProduceResponse::encodedSizeFor(ver));
+            auto o = strictOldDecode(buf.data(), n);
+            ASSERT_TRUE(o.has_value()) << "ver=" << ver << " ec=" << static_cast<int>(ec);
+            EXPECT_EQ(o->sessionId, 21);
+            EXPECT_EQ(o->correlationId, 22);
+            EXPECT_EQ(o->partition, 6);
+            EXPECT_EQ(o->baseOffset, msg.baseOffset);
+            const auto want = ec == rpc::ErrorCode::UnknownProducerId ? rpc::ErrorCode::OutOfOrderSequence : ec;
+            EXPECT_EQ(o->errorCode, static_cast<int16_t>(want));
+            EXPECT_EQ(rpc::checkFrame(buf.data(), n).status, rpc::FrameStatus::Ok);
+            auto d = rpc::ProduceResponse::decode(buf.data(), n);   // the new decoder too
+            ASSERT_TRUE(d.has_value());
+            EXPECT_EQ(d->logStartOffset, -1);
+        }
+    }
+}
+
+TEST(UnknownProducerIdWireCompatRegression, EncodeForNewClientIsFullFrameRegression) {
+    rpc::ProduceResponse msg;
+    msg.sessionId      = 31;
+    msg.correlationId  = 32;
+    msg.errorCode      = static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId);
+    msg.partition      = 2;
+    msg.logStartOffset = 77;
+    std::array<uint8_t, 64> buf{};
+    const std::size_t n = msg.encodeFor(buf.data(), rpc::kClientVersionUnknownProducerId);
+    ASSERT_EQ(n, rpc::ProduceResponse::ENCODED_SIZE);
+    ASSERT_EQ(n, rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersion));
+    EXPECT_FALSE(strictOldDecode(buf.data(), n).has_value());   // a v2 frame by design
+    auto d = rpc::ProduceResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->errorCode, static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId));
+    EXPECT_EQ(d->logStartOffset, 77);
+    // The gate helper (one definition for every broker answer site, review L4).
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::UnknownProducerId, 1), rpc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::UnknownProducerId, 2), rpc::ErrorCode::UnknownProducerId);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::NotLeader, 0), rpc::ErrorCode::NotLeader);
+}

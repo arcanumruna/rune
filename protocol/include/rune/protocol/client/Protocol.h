@@ -130,4 +130,14 @@ inline constexpr int32_t kClientVersion                  = 2;   // what this pro
     return clientVersion >= kClientVersionUnknownProducerId;
 }
 
+/// The produce error code a session that connected with `clientVersion` is
+/// answered: UnknownProducerId becomes OutOfOrderSequence (the pre-D6 answer)
+/// for clients below kClientVersionUnknownProducerId; every other code passes
+/// through.  The ONE definition every broker answer site uses (review L4).
+[[nodiscard]] constexpr ErrorCode produceErrorForClient(ErrorCode ec, int32_t clientVersion) noexcept {
+    return (ec == ErrorCode::UnknownProducerId && !clientUnderstandsUnknownProducerId(clientVersion))
+               ? ErrorCode::OutOfOrderSequence
+               : ec;
+}
+
 } // namespace rune::protocol::client

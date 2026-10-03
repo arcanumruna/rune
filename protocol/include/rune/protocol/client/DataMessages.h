@@ -220,6 +220,43 @@ struct ProduceResponse {
         return ENCODED_SIZE;
     }
 
+    /// D6 review M4: the frame size a session that connected with
+    /// `clientVersion` is sent — the pre-D6 38 B frame (blockLength 14) below
+    /// kClientVersionUnknownProducerId, the 46 B frame from it on.
+    [[nodiscard]] static constexpr std::size_t encodedSizeFor(int32_t clientVersion) noexcept {
+        return clientUnderstandsUnknownProducerId(clientVersion) ? ENCODED_SIZE : ENCODED_SIZE_V0;
+    }
+
+    /// D6 review M4: encode the frame for a session that connected with
+    /// `clientVersion` — every broker answer site uses this.  Below
+    /// kClientVersionUnknownProducerId the frame is EXACTLY the pre-D6 one
+    /// (38 B, blockLength 14, no logStartOffset) and UnknownProducerId is
+    /// answered OutOfOrderSequence (produceErrorForClient), so even a strict
+    /// pre-D6 decoder (exact length / exact blockLength) reads it.  From that
+    /// version on it is the 46 B frame.  buf must hold encodedSizeFor(version).
+    /// Returns the bytes written.
+    std::size_t encodeFor(uint8_t* buf, int32_t clientVersion) const noexcept {
+        const bool full = clientUnderstandsUnknownProducerId(clientVersion);
+        MessageHeader hdr;
+        hdr.blockLength   = full ? BODY_FIXED : BODY_FIXED_V0;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE16s(buf, fixedBase + 0, static_cast<int16_t>(produceErrorForClient(
+                                                 static_cast<ErrorCode>(static_cast<uint16_t>(errorCode)),
+                                                 clientVersion)));
+        detail::putLE32 (buf, fixedBase + 2, partition);
+        detail::putLE64 (buf, fixedBase + 6, baseOffset);
+        if (!full) return ENCODED_SIZE_V0;
+        detail::putLE64 (buf, fixedBase + 14, logStartOffset);
+        return ENCODED_SIZE;
+    }
+
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation (header + declared block), a declared
     /// block shorter than the v0 block, or a header mismatch.
