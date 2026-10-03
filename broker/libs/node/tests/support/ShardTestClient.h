@@ -322,6 +322,9 @@ private:
         EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes;
         if (legacyTransport) {
             c.mtuBytes = 1408; c.socketBufferBytes = 2 * 1024 * 1024; c.termBufferSparse = true;
+            // Pre-2026-10-02 = stock Aeron UDP: no GSO/GRO bindings, Aeron's 2 msgs/send.  GSO's 16-datagram
+            // bursts deepen the pipeline exactly like the 64 KiB MTU (KNOWN ISSUE in ShardModeTest).
+            c.udpGso = false;
         }
         // Pinned (test client, orthogonal to the broker defaults): the pre-2026-10-02
         // 128 KiB receive window, so back-pressure tests (a client that stops
