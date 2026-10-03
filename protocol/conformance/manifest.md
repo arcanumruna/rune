@@ -410,7 +410,15 @@ Offset  Hex                                        Notes
 
 ---
 
-## 13. `produce_response.bin` — 38 bytes
+## 13. `produce_response.bin` — 46 bytes (D6)
+
+D6 appended `logStartOffset : int64` (here -1 = not carried) at offset 38 and
+raised blockLength to 22.  The pre-D6 38-byte form below is kept verbatim as
+`produce_response_v0.bin` (compat vector: a new decoder reads it with
+logStartOffset = -1).  `produce_response_unknown_pid.bin` is the same message
+with errorCode = 28 (UnknownProducerId), baseOffset = 0, logStartOffset = 500.
+
+### 13 (pre-D6 layout, = `produce_response_v0.bin`) — 38 bytes
 
 **Message:** `ProduceResponse` (templateId = 17)
 

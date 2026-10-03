@@ -482,7 +482,7 @@ TEST(ProduceCodec, SchemaMismatchReturnsNullopt) {
 }
 
 // ===========================================================================
-// ProduceResponse (templateId 17, BODY_FIXED = 14, total = 38 bytes)
+// ProduceResponse (templateId 17, BODY_FIXED = 22, total = 46 bytes — D6)
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -537,7 +537,7 @@ TEST(ProduceResponseCodec, ErrorCodeNonZeroRoundTrip) {
 
     std::array<uint8_t, 64> buf{};
     const std::size_t n = msg.encode(buf.data());
-    ASSERT_EQ(n, 38u);
+    ASSERT_EQ(n, 46u);
 
     auto decoded = rpc::ProduceResponse::decode(buf.data(), n);
     ASSERT_TRUE(decoded.has_value());
@@ -552,8 +552,8 @@ TEST(ProduceResponseCodec, ErrorCodeNonZeroRoundTrip) {
 //
 // Message: errorCode=0, partition=1, baseOffset=0x0102030405060708
 //
-// Expected layout (38 bytes):
-//   [0..1]   0E 00   blockLength = 14 (LE)
+// Expected layout (46 bytes, D6):
+//   [0..1]   16 00   blockLength = 22 (LE)
 //   [2..3]   11 00   templateId = 17 (LE)
 //   [4..5]   78 00   schemaId = 120 (LE)
 //   [6..7]   02 00   version = 2 (LE, E5.1 bump)
@@ -562,6 +562,7 @@ TEST(ProduceResponseCodec, ErrorCodeNonZeroRoundTrip) {
 //   [24..25] 00 00   errorCode = 0 (LE)
 //   [26..29] 01 00 00 00   partition = 1 (LE)
 //   [30..37] 08 07 06 05 04 03 02 01   baseOffset (LE)
+//   [38..45] FF FF FF FF FF FF FF FF   logStartOffset = -1 (not carried)
 // ---------------------------------------------------------------------------
 TEST(ProduceResponseCodec, ByteExactness) {
     rpc::ProduceResponse msg;
@@ -573,11 +574,11 @@ TEST(ProduceResponseCodec, ByteExactness) {
 
     std::array<uint8_t, 64> buf{};
     const std::size_t n = msg.encode(buf.data());
-    ASSERT_EQ(n, 38u);
+    ASSERT_EQ(n, 46u);
 
     // clang-format off
-    static constexpr uint8_t kExpected[38] = {
-        0x0E, 0x00,                              // blockLength = 14
+    static constexpr uint8_t kExpected[46] = {
+        0x16, 0x00,                              // blockLength = 22 (D6)
         0x11, 0x00,                              // templateId = 17
         0x78, 0x00,                              // schemaId = 120
         0x03, 0x00,                              // version = 3 (E5.1 bump)
@@ -586,6 +587,7 @@ TEST(ProduceResponseCodec, ByteExactness) {
         0x00, 0x00,                              // errorCode = 0
         0x01, 0x00, 0x00, 0x00,                  // partition = 1
         0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // baseOffset (LE)
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // logStartOffset = -1
     };
     // clang-format on
 
@@ -639,8 +641,8 @@ TEST(ProduceResponseCodec, AllErrorCodes) {
 
 // ---------------------------------------------------------------------------
 // RR-6. Truncation at every boundary.
-//   ENCODED_SIZE = 38 bytes; no var fields.
-//   avail < 38 → nullopt; avail >= 38 → ok.
+//   ENCODED_SIZE = 46 bytes (D6); no var fields.
+//   avail < 46 → nullopt; avail >= 46 → ok.
 // ---------------------------------------------------------------------------
 TEST(ProduceResponseCodec, TruncationAtEveryBoundary) {
     rpc::ProduceResponse msg;
@@ -650,14 +652,14 @@ TEST(ProduceResponseCodec, TruncationAtEveryBoundary) {
 
     std::array<uint8_t, 64> buf{};
     const std::size_t n = msg.encode(buf.data());
-    ASSERT_EQ(n, 38u);
+    ASSERT_EQ(n, 46u);
 
-    for (std::size_t a = 0; a < 38u; ++a) {
+    for (std::size_t a = 0; a < 46u; ++a) {
         EXPECT_FALSE(rpc::ProduceResponse::decode(buf.data(), a).has_value())
             << "avail=" << a << " should be nullopt";
     }
 
-    EXPECT_TRUE(rpc::ProduceResponse::decode(buf.data(), 38u).has_value());
+    EXPECT_TRUE(rpc::ProduceResponse::decode(buf.data(), 46u).has_value());
     // Extra bytes are fine
     EXPECT_TRUE(rpc::ProduceResponse::decode(buf.data(), 64u).has_value());
 }
@@ -831,7 +833,7 @@ TEST(ProduceResponseConformance, OkGolden) {
 
     std::array<uint8_t, 64> buf{};
     const std::size_t n = msg.encode(buf.data());
-    ASSERT_EQ(n, 38u);
+    ASSERT_EQ(n, 46u);
 
     auto decoded = rpc::ProduceResponse::decode(buf.data(), n);
     ASSERT_TRUE(decoded.has_value());

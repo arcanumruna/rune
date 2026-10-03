@@ -187,6 +187,27 @@ TEST(RingSbe, SessionAnnounceCarriesEgressChannelAndStream) {
     EXPECT_EQ(std::string(p, len), ch);
 }
 
+// D6: SESSION_ANNOUNCE carries the session's ConnectRequest.clientVersion so a
+// worker acking directly gates UnknownProducerId on it.
+TEST(RingSbe, SessionAnnounceCarriesClientVersionRegression) {
+    std::array<char, 1024> buf{};
+    const std::string ch = "aeron:udp?endpoint=10.0.0.9:40900";
+    sbe::WorkerOp enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.opType(sbe::OpType::Value::SESSION_ANNOUNCE)
+       .sessionId(78)
+       .egressStreamId(9)
+       .clientVersion(2)
+       .tailKind(sbe::TailKind::Value::EGRESS_CHANNEL);
+    enc.putTail(ch);
+    auto dec = decodeAt<sbe::WorkerOp>(buf.data(), buf.size());
+    EXPECT_EQ(dec.clientVersion(), 2);
+    EXPECT_EQ(dec.egressStreamId(), 9);
+    const std::uint32_t len = dec.tailLength();   // before tail(): tail() advances
+    const char* p = dec.tail();
+    EXPECT_EQ(std::string(p, len), ch);
+}
+
 TEST(RingSbe, Reserved2ReturnTypeRoundTrips) {
     // F15: PRODUCE_NOTIFY(2) is retired as RESERVED_2 (never emitted); the value
     // stays reserved so 3..6 keep their meaning and an old frame still decodes.

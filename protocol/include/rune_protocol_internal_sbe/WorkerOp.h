@@ -120,7 +120,7 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(239);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(243);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(1);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(7);
     static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(0);
@@ -178,7 +178,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(239);
+        return static_cast<std::uint16_t>(243);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -3209,6 +3209,69 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *clientVersionMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t clientVersionId() SBE_NOEXCEPT
+    {
+        return 50;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t clientVersionSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool clientVersionInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t clientVersionEncodingOffset() SBE_NOEXCEPT
+    {
+        return 238;
+    }
+
+    static SBE_CONSTEXPR std::int32_t clientVersionNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT32;
+    }
+
+    static SBE_CONSTEXPR std::int32_t clientVersionMinValue() SBE_NOEXCEPT
+    {
+        return INT32_C(-2147483647);
+    }
+
+    static SBE_CONSTEXPR std::int32_t clientVersionMaxValue() SBE_NOEXCEPT
+    {
+        return INT32_C(2147483647);
+    }
+
+    static SBE_CONSTEXPR std::size_t clientVersionEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::int32_t clientVersion() const SBE_NOEXCEPT
+    {
+        std::int32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 238, sizeof(std::int32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    WorkerOp &clientVersion(const std::int32_t value) SBE_NOEXCEPT
+    {
+        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 238, &val, sizeof(std::int32_t));
+        return *this;
+    }
+
     SBE_NODISCARD static const char *tailKindMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
@@ -3235,7 +3298,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingOffset() SBE_NOEXCEPT
     {
-        return 238;
+        return 242;
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingLength() SBE_NOEXCEPT
@@ -3246,21 +3309,21 @@ public:
     SBE_NODISCARD std::uint8_t tailKindRaw() const SBE_NOEXCEPT
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 238, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 242, sizeof(std::uint8_t));
         return (val);
     }
 
     SBE_NODISCARD TailKind::Value tailKind() const
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 238, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 242, sizeof(std::uint8_t));
         return TailKind::get((val));
     }
 
     WorkerOp &tailKind(const TailKind::Value value) SBE_NOEXCEPT
     {
         std::uint8_t val = (value);
-        std::memcpy(m_buffer + m_offset + 238, &val, sizeof(std::uint8_t));
+        std::memcpy(m_buffer + m_offset + 242, &val, sizeof(std::uint8_t));
         return *this;
     }
 
@@ -3638,6 +3701,10 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("minIsr": )";
     builder << +writer.minIsr();
+
+    builder << ", ";
+    builder << R"("clientVersion": )";
+    builder << +writer.clientVersion();
 
     builder << ", ";
     builder << R"("tailKind": )";
