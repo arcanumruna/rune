@@ -25,6 +25,7 @@
 #include <cstdint>
 extern "C" {
 #include <aeronmd/aeronmd.h>
+#include "rune/protocol/net/rune_gso_bindings.h"
 }
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/node/NodeConfig.h>
@@ -54,7 +55,8 @@ struct EmbeddedDriverConfig {
     /// Hosts this driver's endpoints use (loopback decides the derived MTU).
     /// Empty = loopback.
     std::vector<std::string> endpointHosts;
-    int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default
+    int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default (2), or 16 when udpGso is active
+    bool        udpGso             = true;   ///< install rune_gso bindings (Linux UDP GSO/GRO; else stock)
     int32_t     senderIoVector     = 0;      ///< 0 = Aeron default
     int32_t     receiverIoVector   = 0;      ///< 0 = Aeron default
     NodeConfig::AeronThreadingMode threadingMode = NodeConfig::AeronThreadingMode::Shared;
@@ -109,6 +111,12 @@ public:
     [[nodiscard]] bool               isOpen() const noexcept { return driver_ != nullptr; }
     [[nodiscard]] DriverMode         mode() const noexcept { return mode_; }
     [[nodiscard]] const std::string& dir() const noexcept { return cfg_.dir; }
+    /// The rune_gso UDP GSO/GRO bindings were installed (stays true after close()).
+    [[nodiscard]] bool udpGsoActive() const noexcept { return gsoWasActive_; }
+    /// GSO/GRO totals of every transport this driver closed; complete after close().
+    [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
+    /// network_publication_max_messages_per_send the driver was started with.
+    [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
     /// Misuse tallies (diagnostics).  OBSERVER thread only (one at a time —
     /// tests): each call drains misuseRing_ into the observer-owned tallies.
     [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { drainMisuse_(); return foreignPumps_; }
@@ -126,11 +134,17 @@ private:
     /// by the caller if the ring is full — diagnostics, never coordination).
     void reportMisuse_(Misuse m) noexcept { (void)misuseRing_.offer(m); }
     void drainMisuse_() const noexcept;
+    /// After aeron_driver_context_close: capture the GSO totals and free the bindings.
+    void releaseGso_() noexcept;
 
     EmbeddedDriverConfig    cfg_;
     DriverMode              mode_;
     aeron_driver_context_t* ctx_    = nullptr;
     aeron_driver_t*         driver_ = nullptr;
+    rune_gso_bindings_t*    gso_    = nullptr;   // owned; outlives ctx_ (Aeron points at it)
+    rune_gso_totals_t       gsoTotals_{};
+    bool                    gsoWasActive_ = false;
+    uint32_t                maxMessagesPerSend_ = 0;
     bool                    threadRunning_ = false;   // Threaded: CONTROLLER-owned
     rune::consensus::ControlRing<256> stopRing_;       // controller → driver thread
     std::thread             thread_;

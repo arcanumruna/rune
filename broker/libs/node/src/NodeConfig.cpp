@@ -1026,6 +1026,12 @@ ConfigResult parseNodeConfig(
             *field = v;
         }
     }
+    if (const char* raw = getenv_fn("RUNE_AERON_UDP_GSO"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.aeronUdpGso = true;
+        else if (v == "0" || v == "false") cfg.aeronUdpGso = false;
+        else return {{}, std::string("RUNE_AERON_UDP_GSO must be 0/1/false/true, got '") + raw + "'"};
+    }
     if (const char* raw = getenv_fn("RUNE_AERON_TERM_SPARSE"); raw && *raw) {
         const std::string_view v(raw);
         if (v == "false" || v == "0") cfg.aeronTermBufferSparse = false;   // explicit (else derived)

@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <system_error>
+#include <tuple>
 
 using namespace rune::node;
 
@@ -447,6 +448,19 @@ TEST(HostDefaults, ApplyOnTheK3sBoxGivesExactlyTheTunedConfig) {
         EXPECT_TRUE(hd.warnings.empty()) << hd.warnings;
         EXPECT_NE(hd.summary.find("mode=shard placement=fused workers=1"), std::string::npos) << hd.summary;
         EXPECT_NE(hd.summary.find("mtu=65504 socketBuffer=16777216 rcvWindow=262144"), std::string::npos) << hd.summary;
+    }
+}
+
+// The effective-config line proves which UDP path a run measured (bench rule: verify the measured path).
+TEST(HostDefaults, SummaryReportsUdpGso) {
+    for (auto [want, supported, expect] : {std::tuple{true, true, "gso=on"}, std::tuple{true, false, "gso=unsupported"},
+                                           std::tuple{false, true, "gso=off"}, std::tuple{false, false, "gso=off"}}) {
+        NodeConfig c = threeNodeDefault(0);
+        c.aeronUdpGso = want;
+        HostNetFacts f = k3sFacts();
+        f.udpGso = supported;
+        const auto hd = applyHostDerivedDefaults(c, f);
+        EXPECT_NE(hd.summary.find(std::string(" ") + expect + " "), std::string::npos) << hd.summary;
     }
 }
 

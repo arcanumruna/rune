@@ -9,6 +9,8 @@ extern "C" {
 #include "rune/protocol/net/rune_gso_bindings.h"
 }
 
+#include "rune/node/EmbeddedDriver.h"
+
 #include <sched.h>
 #include <unistd.h>
 
@@ -265,4 +267,31 @@ TEST(UdpGsoBindings, Ipv6RoundTrip) {
     roundTrip(r, r, "aeron:udp?endpoint=[::1]:24608|mtu=1408", mixedSizes(1408, 70));
     r.close();
     EXPECT_GT(r.totals.gso_datagrams, 0u);
+}
+
+// Broker wiring (plan Task 3): the embedded driver installs the bindings by default and raises Aeron's
+// msgs-per-send 2 -> 16 so a burst forms GSO groups; RUNE_AERON_UDP_GSO=0 (udpGso=false) is stock Aeron.
+TEST(UdpGsoBindings, EmbeddedDriverInstallsGsoByDefault) {
+    rune::node::EmbeddedDriverConfig on;
+    on.dir = "/dev/shm/rune-gso-ed-on-" + std::to_string(::getpid());
+    on.idleStrategy = "backoff";
+    rune::node::EmbeddedDriver a(on, rune::node::DriverMode::Threaded);
+    EXPECT_TRUE(a.udpGsoActive());
+    EXPECT_EQ(a.maxMessagesPerSend(), 16u);
+    a.close();
+    EXPECT_TRUE(a.udpGsoActive()) << "stays reportable after close";
+
+    rune::node::EmbeddedDriverConfig off = on;
+    off.dir += "-off";
+    off.udpGso = false;
+    rune::node::EmbeddedDriver b(off, rune::node::DriverMode::Threaded);
+    EXPECT_FALSE(b.udpGsoActive());
+    EXPECT_EQ(b.maxMessagesPerSend(), 2u) << "GSO off: Aeron's default batching, unchanged";
+
+    rune::node::EmbeddedDriverConfig explicitCfg = on;
+    explicitCfg.dir += "-explicit";
+    explicitCfg.maxMessagesPerSend = 4;
+    rune::node::EmbeddedDriver c(explicitCfg, rune::node::DriverMode::Threaded);
+    EXPECT_TRUE(c.udpGsoActive());
+    EXPECT_EQ(c.maxMessagesPerSend(), 4u) << "an explicit RUNE_AERON_MAX_MSGS_PER_SEND wins";
 }

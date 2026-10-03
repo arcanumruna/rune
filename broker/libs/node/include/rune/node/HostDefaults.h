@@ -94,6 +94,7 @@ struct HostNetFacts {
     int64_t      wmemMax       = 0;
     int64_t      defaultSndBuf = 0;
     int64_t      defaultRcvBuf = 0;
+    bool         udpGso        = false;   ///< kernel accepts UDP_SEGMENT and UDP_GRO (rune_gso bindings)
 };
 
 struct AeronTransportRequest {

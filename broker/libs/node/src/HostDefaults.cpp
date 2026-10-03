@@ -1,5 +1,6 @@
 // HostDefaults.cpp — see HostDefaults.h.  Startup-only (cold) code.
 #include <rune/node/HostDefaults.h>
+#include "rune/protocol/net/rune_gso_bindings.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -336,17 +337,18 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     std::string ioWq;
     for (const int32_t c : cfg.ioWorkerCpus) { if (!ioWq.empty()) ioWq += ','; ioWq += std::to_string(c); }
     if (ioWq.empty()) ioWq = "inherit";
-    char line[768];
+    char line[896];
     std::snprintf(line, sizeof line,
         "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
-        "rcvWindow=%d rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
+        "rcvWindow=%d gso=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
         cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(),
         cfg.aeronTermBufferBytes, cfg.aeronControlTermBufferBytes,
         static_cast<long long>(cfg.workerSyncIntervalMs), static_cast<long long>(cfg.followerFlushIntervalMs),
         cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,
-        cfg.aeronSocketBufferBytes, cfg.aeronRcvWindowBytes, cfg.replicationOutboundRingBytes,
+        cfg.aeronSocketBufferBytes, cfg.aeronRcvWindowBytes,
+        cfg.aeronUdpGso ? (facts.udpGso ? "on" : "unsupported") : "off", cfg.replicationOutboundRingBytes,
         cfg.workerIngressRingBytes, cfg.workerReturnRingBytes, cfg.workerIngressBasePort.value_or(0),
         cfg.workerReplBasePort.value_or(0), cfg.effectiveWorkerEgressControlBasePort(),
         facts.loopback ? "true" : "false", facts.interfaceMtu, static_cast<long long>(facts.rmemMax),
@@ -490,6 +492,7 @@ HostNetFacts probeHostNetFacts(const std::vector<std::string>& endpointHosts, co
         }
         f.interfaceMtu = minMtu;
     }
+    f.udpGso = rune_gso_platform_supported() == 3;   // 0 off Linux
     if (f.platform == HostPlatform::Linux) {
         f.rmemMax = readProcLong("/proc/sys/net/core/rmem_max");
         f.wmemMax = readProcLong("/proc/sys/net/core/wmem_max");
