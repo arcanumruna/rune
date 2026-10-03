@@ -244,8 +244,10 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     // reloaded) only when the load predicate holds, and serves only then.
     if (!ensureLoaded_(nowNs)) return 0;
 
+    lastNowNs_ = nowNs;
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     int work = coordinator_.doWork(nowNs);
+    work += retryRefusedMarkers_(nowNs);
 
     // TX-4 Task 8: Resolve pending markers (internally-initiated aborts and the
     // Prepare* re-driven after a load).  Task 10 round 5 (Kafka semantics): the
@@ -675,6 +677,9 @@ bool TransactionCoordinationService::dispatchMarkers_(
 {
     AwaitingMarkers& a = awaiting_[producerId];
     a.txnId = txnId;
+    a.producerEpoch    = producerEpoch;
+    a.coordinatorEpoch = coordinatorEpoch;
+    a.commit           = commit;
     const tx::ControlType ct = commit ? tx::ControlType::Commit : tx::ControlType::Abort;
     for (const auto& tp : parts) {
         const auto batch = tx::ControlMarker::build(producerId, producerEpoch, ct, coordinatorEpoch);
@@ -763,10 +768,63 @@ void TransactionCoordinationService::onControlMarkerRefused(int32_t topicId, int
 {
     ++controlMarkersRefused_;
     if (!currentEpoch_(coordinatorEpoch)) return;   // m3: an earlier load's marker
-    spdlog::error("TCS: control marker REFUSED/FAILED topic={} partition={} producerId={} err={} "
-                  "(counted as resolved so the transaction can complete)",
-                  topicId, partition, producerId, errorCode);
-    resolveMarker_(producerId);
+    namespace pcl = rune::protocol::client;
+    const auto err = static_cast<pcl::ErrorCode>(errorCode);
+    if (err == pcl::ErrorCode::UnknownTopic || err == pcl::ErrorCode::UnknownPartition) {
+        // Kafka parity: a partition that no longer exists takes no marker — drop it.
+        spdlog::warn("TCS: control marker for a deleted partition topic={} partition={} producerId={} err={} "
+                     "— dropped", topicId, partition, producerId, errorCode);
+        resolveMarker_(producerId);
+        return;
+    }
+    auto it = awaiting_.find(producerId);
+    if (it == awaiting_.end()) return;
+    // Every other refusal (NotLeader, MinIsrViolation, Internal, StorageError, ...) is retried: the
+    // marker is NOT in the log, so the transaction must stay Prepare* (EndTxn deferred, the next
+    // transaction refused ConcurrentTransactions) until a retry lands.
+    spdlog::warn("TCS: control marker refused topic={} partition={} producerId={} err={} — retrying",
+                 topicId, partition, producerId, errorCode);
+    for (auto& r : it->second.retries) {
+        if (r.topicId == topicId && r.partition == partition) {   // refused again: back off further
+            r.backoffNs = std::min(r.backoffNs * 2, kMarkerRetryMaxNs);
+            r.dueNs     = lastNowNs_ + r.backoffNs;
+            return;
+        }
+    }
+    it->second.retries.push_back(MarkerRetry{topicId, partition, lastNowNs_ + kMarkerRetryMinNs,
+                                             kMarkerRetryMinNs});
+}
+
+int TransactionCoordinationService::retryRefusedMarkers_(int64_t nowNs)
+{
+    if (gateway_ == nullptr) return 0;
+    int work = 0;
+    std::vector<int64_t> landed;   // cold path (refusals only): resolve after the walk
+    for (auto& [producerId, a] : awaiting_) {
+        for (std::size_t i = 0; i < a.retries.size();) {
+            MarkerRetry& r = a.retries[i];
+            if (r.dueNs > nowNs) { ++i; continue; }
+            const tx::ControlType ct = a.commit ? tx::ControlType::Commit : tx::ControlType::Abort;
+            const auto batch = tx::ControlMarker::build(producerId, a.producerEpoch, ct, a.coordinatorEpoch);
+            const int64_t off = gateway_->appendControlRecord(
+                r.topicId, r.partition, std::span<const uint8_t>(batch.data(), batch.size()),
+                producerId, a.commit, a.coordinatorEpoch);
+            ++work;
+            if (off == rune::gateway::ClientGateway::kControlRecordAsync) {
+                a.retries.erase(a.retries.begin() + static_cast<std::ptrdiff_t>(i));   // in flight again
+            } else if (off >= 0) {
+                gateway_->notifyControlMarker(r.topicId, r.partition, producerId, off, a.commit);
+                a.retries.erase(a.retries.begin() + static_cast<std::ptrdiff_t>(i));
+                landed.push_back(producerId);
+            } else {
+                r.backoffNs = std::min(r.backoffNs * 2, kMarkerRetryMaxNs);
+                r.dueNs     = nowNs + r.backoffNs;
+                ++i;
+            }
+        }
+    }
+    for (const int64_t pid : landed) resolveMarker_(pid);
+    return work;
 }
 
 } // namespace rune::node

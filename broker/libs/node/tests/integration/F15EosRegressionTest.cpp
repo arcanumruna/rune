@@ -586,6 +586,33 @@ TEST(TxnRoleGateRegression, DemotionFailsParkedStrictAckNotLeader) {
 // (no EndTxn OK, next txn refused) until the marker is really in the log.
 // ============================================================================
 
+// A RETRIABLE marker refusal is retried (Kafka TransactionMarkerChannelManager parity): once the
+// partition can take it again the marker lands, and only then the txn completes and EndTxn answers OK.
+TEST(MarkerRetryRegression, RefusedMarkerIsRetriedAndCompletesTheTxnOnceItLands) {
+    TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: the marker is refused
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999) << "EndTxn deferred while the marker is in flight";
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the first marker attempt was refused";
+    ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u);
+    T.m.r->setMinIsrForTest(1);                              // the partition can take acks=all again
+    int64_t now = 1'000'000'000;                             // past every retry backoff
+    for (int i = 0; i < 64 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) {
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+        now += 50'000'000;
+    }
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "the retried COMMIT marker landed";
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "the txn completes once its marker landed";
+    ASSERT_EQ(T.controlFrames.size(), 1u) << "exactly one deferred EndTxn response";
+    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), 0) << "EndTxn OK only after the marker is in the log";
+    EXPECT_EQ(T.addPartition(), 0) << "the next txn may start";
+}
+
 TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: acks=all marker refused
     const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);   // S4 retarget: declared scenario addition

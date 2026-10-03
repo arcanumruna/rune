@@ -620,6 +620,8 @@ public:
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
     /// E5.1.2d: min-ISR required for acks=All produce on this partition.
     [[nodiscard]] int         minIsr()         const noexcept { return cfg_.minIsr; }
+    /// TEST SEAM: change min-ISR on a live leader (e.g. an ISR-recovery scenario without a 2nd node).
+    void setMinIsrForTest(int v) noexcept { cfg_.minIsr = v; effectiveMinIsr_ = v; }
     /// CP-1: the log cleanup policy for this partition (consulted by the LogCleaner).
     [[nodiscard]] CleanupPolicy cleanupPolicy() const noexcept { return cfg_.cleanupPolicy; }
 

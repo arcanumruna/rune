@@ -196,13 +196,30 @@ private:
     // Task 10 round 5: Prepare* transactions whose markers are still in flight,
     // keyed by the markers' producerId (one transaction per producer at a time:
     // the next one is refused with ConcurrentTransactions until this completes).
+    // A marker refused with a RETRIABLE error stays outstanding and is re-dispatched from doWork
+    // with a doubling backoff until it lands (Kafka TransactionMarkerChannelManager parity); the
+    // transaction never completes over a marker that is not in the log.
+    struct MarkerRetry {
+        int32_t topicId   = 0;
+        int32_t partition = 0;
+        int64_t dueNs     = 0;   ///< 0 = due at the next doWork
+        int64_t backoffNs = 0;
+    };
     struct AwaitingMarkers {
         rune::transaction::TransactionalId txnId;
-        int     outstanding   = 0;
-        bool    respPending   = false;   // a deferred EndTxn response
-        int64_t sessionId     = 0;
-        int64_t correlationId = 0;
+        int     outstanding      = 0;
+        bool    respPending      = false;   // a deferred EndTxn response
+        int64_t sessionId        = 0;
+        int64_t correlationId    = 0;
+        int16_t producerEpoch    = 0;       // to rebuild a retried marker
+        int32_t coordinatorEpoch = -1;
+        bool    commit           = false;
+        std::vector<MarkerRetry> retries;   // refused markers awaiting re-dispatch
     };
+    static constexpr int64_t kMarkerRetryMinNs = 10'000'000;      // 10 ms
+    static constexpr int64_t kMarkerRetryMaxNs = 1'000'000'000;   // 1 s
+    int64_t lastNowNs_ = 0;                 ///< doWork clock, used to schedule refusal retries
+    int retryRefusedMarkers_(int64_t nowNs);
     std::unordered_map<int64_t, AwaitingMarkers> awaiting_;
     bool dispatchMarkers_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
                           int16_t producerEpoch, int32_t coordinatorEpoch, bool commit,
