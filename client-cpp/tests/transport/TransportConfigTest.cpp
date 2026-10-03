@@ -43,7 +43,21 @@ TEST(TransportConfig, RejectsTermLengthNotPowerOfTwoOrOutOfRange) {
     EXPECT_TRUE(validate(c).has_value());
     c.termBufferLength = 32u * 1024;
     EXPECT_TRUE(validate(c).has_value());
-    c.termBufferLength = 64u * 1024;
+    c.termBufferLength = 256u * 1024;
+    EXPECT_FALSE(validate(c).has_value());
+}
+
+// B6 review: Aeron's max message is term/8.  A term whose max message cannot carry one maximum record
+// (16 KiB + batch/frame headers) accepted the record at append and then failed every offer (a fatal
+// max-message throw that looked like back-pressure) until the delivery timeout.  Refuse it at config time.
+TEST(TransportConfigRegression, TermTooSmallForTheMaxRecordIsRejected) {
+    TransportConfig c;
+    c.termBufferLength = 64u * 1024;    // max message 8 KiB
+    ASSERT_TRUE(validate(c).has_value());
+    EXPECT_NE(validate(c)->find("16 KiB"), std::string::npos) << *validate(c);
+    c.termBufferLength = 128u * 1024;   // max message 16 KiB: no room for the headers
+    EXPECT_TRUE(validate(c).has_value());
+    c.termBufferLength = 256u * 1024;   // max message 32 KiB
     EXPECT_FALSE(validate(c).has_value());
 }
 

@@ -243,7 +243,8 @@ TEST(BenchArgs, RejectsBadInput) {
     EXPECT_FALSE(parse({"--rate"}, err).has_value());
     EXPECT_FALSE(parse({"--rate", "fast"}, err).has_value());
     EXPECT_FALSE(parse({"--acks", "maybe"}, err).has_value());
-    EXPECT_FALSE(parse({"--value-bytes", "9000"}, err).has_value());
+    EXPECT_FALSE(parse({"--value-bytes", "16369"}, err).has_value());   // > the 16 KiB record cap (B6)
+    EXPECT_TRUE(parse({"--value-bytes", "16368"}, err).has_value());
     EXPECT_FALSE(parse({"--shards", "0"}, err).has_value());
     EXPECT_FALSE(parse({"--bogus"}, err).has_value());
     EXPECT_NE(err.find("--bogus"), std::string::npos);

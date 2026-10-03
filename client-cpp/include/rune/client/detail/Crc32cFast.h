@@ -39,7 +39,7 @@ namespace crc32c_fast {
 /// Multiply-by-a-constant (x^(8*bytes) mod P) as 4 byte-indexed tables.
 struct ShiftTable {
     std::array<std::array<uint32_t, 256>, 4> t{};
-    explicit ShiftTable(uint64_t bytes) noexcept {
+    explicit constexpr ShiftTable(uint64_t bytes) noexcept {
         const uint32_t k = crc32c_patch::x8nModP(bytes);
         for (uint32_t i = 0; i < 4; ++i) {
             for (uint32_t b = 0; b < 256; ++b) t[i][b] = crc32c_patch::multModP(k, b << (8 * i));
@@ -57,9 +57,9 @@ struct Tables {
     ShiftTable big1{kBigBlock}, big2{2 * kBigBlock};
     ShiftTable small1{kSmallBlock}, small2{2 * kSmallBlock};
 };
-/// Built once during static initialisation (dynamic init of an inline variable:
-/// no guard on access), immutable afterwards.
-inline const Tables kTables{};
+/// Computed at COMPILE time (constant-initialised): never observed zeroed, even from another
+/// translation unit's static initialiser (B review).
+inline constexpr Tables kTables{};
 
 inline uint64_t load64(const uint8_t* p) noexcept {
     uint64_t v;

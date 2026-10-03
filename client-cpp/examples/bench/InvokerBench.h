@@ -127,7 +127,7 @@ inline constexpr const char* kBenchUsage =
         return std::nullopt;
     }
     if (a.shards == 0) { error = "--shards must be >= 1"; return std::nullopt; }
-    if (a.valueBytes <= 0 || a.valueBytes > 8154) { error = "--value-bytes must be in [1, 8154]"; return std::nullopt; }
+    if (a.valueBytes <= 0 || a.valueBytes > 16368) { error = "--value-bytes must be in [1, 16368]"; return std::nullopt; }
     if (a.maxInFlight <= 0) { error = "--max-in-flight must be > 0"; return std::nullopt; }
     if (a.batchBytes <= 0) { error = "--batch-bytes must be > 0"; return std::nullopt; }
     if (a.mtu < 1024 || a.mtu > 65504 || a.mtu % 32 != 0) {

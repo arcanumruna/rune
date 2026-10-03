@@ -121,6 +121,13 @@ struct TransportConfig {
         return "termBufferLength must be a power of two in [65536, 1073741824]: " +
                std::to_string(t);
     }
+    // Aeron's max message is term/8: it must carry one maximum record (16 KiB, backlog B6) plus the
+    // Produce + RecordBatch + record headers, or such a record is accepted and then never sendable.
+    constexpr std::size_t kMaxRecordFrameBytes = 16u * 1024 + 1024;
+    if (t / 8 < kMaxRecordFrameBytes) {
+        return "termBufferLength " + std::to_string(t) + " gives a max message of " + std::to_string(t / 8) +
+               " B (term/8) — too small for a 16 KiB record plus headers; use >= 262144";
+    }
     if (c.socketSndBufBytes != 0 && c.socketSndBufBytes < c.mtuLength) {
         return "socketSndBufBytes must be 0 (OS default) or >= mtuLength";
     }

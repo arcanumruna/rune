@@ -519,7 +519,7 @@ public:
     /// Non-blocking submit (ZERO allocation, lock-free): checks the ring's closed
     /// word FIRST (fix1 C2/I3 — a Producer outliving its closed Client gets
     /// Closed, never touching the pump hook's now-dangling context), then
-    /// validates the value size against both kMaxSendValueBytes AND the ring's
+    /// validates the record size (key + value <= Producer::kMaxRecordBytes, B6) AND the ring's
     /// own maxMsgLength (fix1 minor 11 — a message too big for a small ring maps
     /// to ValueTooLarge, not BackPressured, so it can never livelock a retry),
     /// then writes the SEND_RECORD. Never drops silently — see SendResult.

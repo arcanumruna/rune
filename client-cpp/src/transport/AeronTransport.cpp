@@ -305,6 +305,14 @@ AeronTransport::OfferResult AeronTransport::offerToPub(aeron::ExclusivePublicati
         }
         seal_ = PendingSeal{sealable, len, crc, true};
         const int64_t pos = pub.offer(ab, 0, ilen, sealSupplier_);
+        if (pos > 0 && seal_.armed) [[unlikely]] {
+            // Accepted but the supplier never ran: the frame left with CRC 0 and every retransmit
+            // would patch an invalid CRC.  Only an Aeron change of when the supplier runs can do
+            // this — an invariant violation, never a silent corrupt send.
+            std::fprintf(stderr, "rune-client FATAL: offer accepted without sealing the frame CRC "
+                                 "(Aeron reserved-value supplier contract changed?)\n");
+            std::abort();
+        }
         seal_.armed = false;  // refused: never sealed (the next attempt re-arms)
         return verdict(pos);
     } catch (...) {
