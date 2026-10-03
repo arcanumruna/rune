@@ -586,14 +586,31 @@ public:
     // OWNING worker publishes the first offset of the earliest open transaction of
     // its read_committed state (RcState LsoTracker) here; the LogCleanerAgent caps
     // firstUncleanable at it, exactly as it does at cleanerHighWatermark().
-    // kNoCleanerLso (the default) = no open transaction known / not tracked: no cap
-    // beyond HW (the cleaner's own log scan still never cleans an unresolved txn).
-    // 0 = read_committed state not Ready yet: clean nothing.  Slightly stale is
-    // safe in the same way as the HW snapshot (the cleaner's own scan is the
-    // backstop for the publish window).
+    // INVARIANT (fix round 1): a partition with read_committed state (topicId >= 0
+    // — exactly the partitions a Worker builds an RcState for) STARTS at 0 = clean
+    // nothing, and is 0 whenever that state is not Ready (unbuilt / scanning): the
+    // worker publishes 0 BEFORE any rebuild step and the first real value only on
+    // READY.  So no cleaner pass starts while the log's transaction state is being
+    // rebuilt (and the worker defers draining a cleaner swap until the rebuild is
+    // done — see Worker::cleanerSwapsDeferred_).  kNoCleanerLso = no open
+    // transaction, or no read_committed state at all (internal topics, topicId <
+    // 0): no cap beyond HW (the cleaner's own log scan still never cleans an
+    // unresolved txn).  Slightly stale is safe like the HW snapshot.
     static constexpr Offset kNoCleanerLso = std::numeric_limits<Offset>::max();
     void publishCleanerLso(Offset firstUnstableOffset) noexcept {
         publishedLsoForCleaner_.store(firstUnstableOffset, std::memory_order_release);
+    }
+    // D3b fix round 1: the minimum fetch position over EVERY assigned replica (not
+    // just the ISR), published by the duty/owning thread in publishCleanerState().
+    // A txn marker below it is held by every replica, so the cleaner may remove it;
+    // at/above it a lagging replica (possibly outside the ISR) that already holds
+    // the txn's data may still need the marker — removing it would make that
+    // replica, once leader, read the aborted data as the producer's NEXT txn.  A
+    // replica that never fetched counts as 0, so a permanently dead assigned
+    // replica keeps every marker (correctness over growth).  Follower role: 0.
+    // kNoCleanerLso when this is the only assigned replica.
+    [[nodiscard]] Offset cleanerMarkerRemovalBound() const noexcept {
+        return publishedMarkerBoundForCleaner_.load(std::memory_order_acquire);
     }
     [[nodiscard]] Offset cleanerLastStableOffset() const noexcept {
         return publishedLsoForCleaner_.load(std::memory_order_acquire);
@@ -1000,6 +1017,16 @@ private:
     // on acks=all for that partition (observed on multi-partition topics whose
     // election handed a leader-only ISR).
     std::vector<NodeId>  configuredReplicas_;
+    // D3b fix round 1: each assigned replica's fetch position in THIS leadership
+    // (parallel to configuredReplicas_; reset to 0 on becomeLeader — a position
+    // learned in an earlier term may predate a truncation).  Feeds
+    // cleanerMarkerRemovalBound().  Duty/owning thread only; no allocation after
+    // initReplica (linear search over <= FollowerSlots::kMaxReplicas).
+    std::vector<Offset>  replicaFetchPos_;
+    void noteReplicaFetchPos_(NodeId id, Offset pos) noexcept {
+        for (std::size_t i = 0; i < configuredReplicas_.size(); ++i)
+            if (configuredReplicas_[i] == id) { replicaFetchPos_[i] = pos; return; }
+    }
 
     // Epoch caches (both roles need one for truncation)
     rune::storage::LeaderEpochCache epochCache_;
@@ -1277,7 +1304,10 @@ private:
     std::atomic<int>    publishedRoleForCleaner_{static_cast<int>(Role::Follower)};
     std::atomic<int>    publishedIsrSizeForGateway_{0};
     // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
-    std::atomic<Offset> publishedLsoForCleaner_{kNoCleanerLso};
+    std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
+    // D3b fix round 1: min fetch position over every assigned replica — see
+    // cleanerMarkerRemovalBound().  0 until the first leader publication.
+    std::atomic<Offset> publishedMarkerBoundForCleaner_{0};
 
     // Controller position snapshot (see controllerReplicaLeo()/controllerLeaderEpoch()).
     // Per-node published LEO (stored as leo+1; 0 = unknown), indexed by nodeId.

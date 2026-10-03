@@ -5196,3 +5196,89 @@ TEST(CleanerLsoRegression, WorkerPublishesFirstUnstableOffsetToCleaner) {
     R.abortMarker(7, 0, 50);
     EXPECT_EQ(R.r->cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso);
 }
+
+// D3b fix round 1 (2): a read_committed REBUILD racing cleaner passes never leaves
+// a transaction open.  The worker's RC scan has already walked an aborted txn's
+// data when swaps from cleaner passes that discarded that data and then removed
+// its (now empty) ABORT marker land: applied mid-scan, the scan would never see
+// the marker and the txn would stay open forever (LSO pinned, the data later read
+// as part of the producer's next txn).  The worker defers cleaner swaps while
+// the RC state is scanning (one consistent log version per rebuild) and publishes
+// a cleaner LSO of 0 for the whole rebuild (no new pass starts).
+TEST(CleanerLsoRegression, RcRebuildRacingCleanerSwapsNeverLeavesTxnOpen) {
+    TmpDir d;
+    NullTransport t;
+    ReplicaRegistry reg;
+    Log log(d.path.string(), /*segmentBytes=*/1);   // one batch per segment
+    log.recover();
+    constexpr int64_t P = 5;
+    auto txnAt = [&](int64_t off, std::string_view k, int32_t seq) {
+        rune::protocol::RecordBatchBuilder b(off, 1000 + off);
+        b.setTransactional(true); b.setProducerId(P); b.setProducerEpoch(0); b.setBaseSequence(seq);
+        b.append(k, "v", 1000 + off);
+        log.append(b.build(), off);
+    };
+    auto markerAt = [&](int64_t off, bool commit) {
+        auto m = tx::ControlMarker::build(P, 0, commit ? tx::ControlType::Commit : tx::ControlType::Abort, 0);
+        for (int i = 0; i < 8; ++i) m[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(off) >> (8 * i));
+        log.append(m, off);
+    };
+    txnAt(0, "k", 0);
+    markerAt(1, /*commit=*/false);   // ABORT: @0 is discarded, then this marker is removable
+    {   // the producer's last batch: a NON-transactional idempotent batch (no later marker)
+        rune::protocol::RecordBatchBuilder b(2, 1002);
+        b.setProducerId(P); b.setProducerEpoch(0); b.setBaseSequence(1);
+        b.append("k2", "v", 1002);
+        log.append(b.build(), 2);
+    }
+    for (int64_t o = 3; o < 8; ++o) log.append(batchAt(o), o);
+    auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, /*topicId=*/0, 0), Role::Leader, 1,
+                                                  std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &t);
+    PartitionReplica* r = rep.get();
+    r->onLeaderLogAppended();
+    reg.add(0, 0, std::move(rep));
+    EXPECT_EQ(r->cleanerLastStableOffset(), 0) << "no RC state built yet: the cleaner must clean nothing";
+    WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
+    pool.assignFromRegistry(reg);
+    pool.setRegistry(&reg);
+    pool.setRunnersStartedForTest(true);
+    Worker& w = pool.worker(0);
+    w.setRcScanBytesPerPass(64);  // ~one batch per pass: the rebuild spans many passes
+    w.setRcResidencyProbeForTest([](void*, const uint8_t*, std::size_t len) { return len; }, nullptr);
+    auto pass = [&](int64_t now) { w.doWork(now); w.drainReturn([](WorkerReturn) {}); };
+
+    int64_t now = 1;
+    for (int i = 0; i < 64 && w.rcScannedBytesForTest(0, 0) == 0; ++i) pass(now++);
+    ASSERT_GT(w.rcScannedBytesForTest(0, 0), 0u) << "precondition: the rebuild walked the aborted data @0"
+        << " status=" << w.rcStatusForTest(0, 0) << " complete=" << r->isLeaderComplete()
+        << " passes=" << w.rcScanPassesForTest(0, 0);
+    ASSERT_EQ(w.rcStatusForTest(0, 0), 1) << "precondition: still scanning (the marker @1 not reached)";
+    EXPECT_EQ(r->cleanerLastStableOffset(), 0) << "the cleaner LSO must be 0 for the whole rebuild";
+
+    // Cleaner passes that started before the rebuild land now: discard @0, stamp,
+    // then drop the empty ABORT marker @1 — their swaps are enqueued mid-scan.
+    for (int64_t nowMs : {1'000'000LL, 1'000'000LL, 2'000'000LL}) {
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        std::vector<int64_t> sizes(bases.size(), 1);
+        rune::storage::LogCleaner cleaner;
+        cleaner.setMarkerRemovalBound(std::numeric_limits<int64_t>::max());
+        rune::storage::SkimpyOffsetMap map(1024);
+        const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0,
+                                                            /*deleteRetentionMs=*/10, map, false, 1 << 20,
+                                                            nullptr, nowMs);
+        for (int64_t b : res.rewrittenBases) ASSERT_TRUE(log.enqueueCleanedSegment(b));
+    }
+    ASSERT_FALSE(fs::exists(d.path / "00000000000000000001.log")) << "precondition: the marker is gone on disk";
+
+    for (int i = 0; i < 256 && w.rcStatusForTest(0, 0) != 2; ++i) pass(now++);
+    ASSERT_EQ(w.rcStatusForTest(0, 0), 2) << "the rebuild finished";
+    EXPECT_EQ(w.rcOpenTxnsForTest(0, 0), 0u) << "the aborted txn was left OPEN: its marker vanished mid-rebuild";
+    EXPECT_EQ(r->cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso) << "Ready: nothing open";
+    for (int i = 0; i < 4; ++i) pass(now++);
+    log.reloadSegments();
+    auto bytes = log.read(1, 1 << 20);
+    EXPECT_TRUE(bytes.empty() || rune::protocol::RecordBatchReader(bytes.data(), bytes.size()).baseOffset() != 1)
+        << "the deferred swaps are applied once the rebuild is Ready";
+}

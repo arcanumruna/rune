@@ -71,6 +71,18 @@ public:
 
     LogCleaner() = default;
 
+    /// D3b fix 1: a COMMIT/ABORT marker may be removed (horizon-stamped, then
+    /// dropped) only below this offset — the minimum fetch position over EVERY
+    /// assigned replica (PartitionReplica::cleanerMarkerRemovalBound): a lagging
+    /// replica that holds a txn's data but not yet its marker must still receive
+    /// the marker, or after a failover it would treat the aborted data as part of
+    /// the producer's next txn.  Default 0 = never remove a marker (a caller with
+    /// no replica knowledge keeps them all — correctness over growth).
+    void setMarkerRemovalBound(Offset bound) noexcept { markerRemovalBound_ = bound; }
+    [[nodiscard]] Offset markerRemovalBound() const noexcept { return markerRemovalBound_; }
+    /// Segment files the rewrite phase of the last pass read (test/accounting).
+    [[nodiscard]] int64_t lastRewriteSegmentsRead() const noexcept { return rewriteSegmentsRead_; }
+
     /// Scan log batches whose base-offset falls in [fromOffset, toOffset) and
     /// populate `map` with key→latest-offset entries.
     /// A tombstone record (value == "" or vlen < 0 in the wire format) is also
@@ -373,6 +385,8 @@ private:
                            Throttler* throttler, bool* changed);
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
     int64_t prefixBytesRead_        = 0;
+    Offset  markerRemovalBound_     = 0;
+    int64_t rewriteSegmentsRead_    = 0;
 };
 
 } // namespace rune::storage

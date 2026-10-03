@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -1696,8 +1697,31 @@ std::vector<uint8_t> d3bTxn(int64_t off, std::string_view key, std::string_view 
     b.append(key, val, 1000 + off);
     return b.build();
 }
-// A real end-txn marker: 2-byte LE int16 key = controlType (0=COMMIT, 1=ABORT).
+// The PRODUCTION end-txn marker bytes (rune::transaction::ControlMarker::build —
+// 75 bytes; its record has NO length varint, unlike RecordBatchBuilder records):
+// key = int16 LE controlType (0=COMMIT, 1=ABORT), value = version + coordinatorEpoch.
 std::vector<uint8_t> d3bMarker(int64_t off, bool abort, int64_t pid = kD3bPid) {
+    std::vector<uint8_t> b(75, 0);
+    auto le = [&](std::size_t at, uint64_t v, int n) { for (int i = 0; i < n; ++i) b[at + i] = static_cast<uint8_t>(v >> (8 * i)); };
+    le(0, static_cast<uint64_t>(off), 8);
+    le(8, 63, 4);
+    le(12, 0xFFFFFFFFu, 4);
+    b[16] = 2;
+    le(21, 0x0030, 2);                                     // CONTROL | TRANSACTIONAL
+    le(43, static_cast<uint64_t>(pid), 8);
+    le(51, 3, 2);                                          // epoch
+    le(53, 0xFFFFFFFFu, 4);                                // baseSequence -1
+    le(57, 1, 4);                                          // one record
+    b[64] = 0x04;                                          // keyLength 2 (zig-zag)
+    le(65, abort ? 1 : 0, 2);                              // controlType
+    b[67] = 0x0C;                                          // valueLength 6
+    le(68, 1, 2);                                          // version
+    const uint32_t crc = crc32c(b.data() + 21, b.size() - 21);
+    le(17, crc, 4);
+    return b;
+}
+// The same marker as a RecordBatchBuilder control batch (Kafka record framing).
+std::vector<uint8_t> d3bBuilderMarker(int64_t off, bool abort, int64_t pid = kD3bPid) {
     RecordBatchBuilder b(off, 0);
     b.setProducerId(pid); b.setProducerEpoch(3);
     b.setControl(true);
@@ -1712,24 +1736,33 @@ void d3bPlain(Log& log, int64_t off, std::string_view key, std::string_view val)
 
 // One cleaning pass over the whole sealed region, on `path`, at wall clock nowMs.
 // Returns the pass end (the range paths' next-pass watermark; activeBase for sync).
-int64_t cleanOnce(Log& log, CleanPath path, int64_t nowMs = -1) {
+// `markerBound` = the minimum fetch position over all replicas (fix round 1);
+// default: every replica holds everything.  `dirtyStart` = the clean watermark.
+int64_t cleanOnce(Log& log, CleanPath path, int64_t nowMs = -1,
+                  int64_t markerBound = std::numeric_limits<int64_t>::max(), int64_t dirtyStart = 0,
+                  int64_t* rewriteReads = nullptr) {
     auto bases = log.segmentBaseOffsets();
     const int64_t active = bases.back();
     LogCleaner cleaner;
+    cleaner.setMarkerRemovalBound(markerBound);
     if (path == CleanPath::Sync) {
-        cleaner.clean(log, 0, active, 0, kD3bRetentionMs, nowMs);
+        cleaner.clean(log, dirtyStart, active, 0, kD3bRetentionMs, nowMs);
         log.reloadSegments();
+        if (rewriteReads) *rewriteReads = cleaner.lastRewriteSegmentsRead();
         return active;
     }
     bases.pop_back();
     std::vector<int64_t> sizes(bases.size(), 1);
     SkimpyOffsetMap map(1024);
-    const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, kD3bRetentionMs,
-                                                        map, path == CleanPath::RangeCoalesce, 1 << 20,
-                                                        nullptr, nowMs);
+    const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, dirtyStart, 0,
+                                                        kD3bRetentionMs, map, path == CleanPath::RangeCoalesce,
+                                                        1 << 20, nullptr, nowMs);
     log.reloadSegments();
+    if (rewriteReads) *rewriteReads = cleaner.lastRewriteSegmentsRead();
     return res.passEnd;
 }
+// All keys' read_committed values (see committedValue).
+std::map<std::string, std::string> committedState(Log& log, const std::vector<std::string>& keys);
 
 // The batch whose base offset is exactly `off` (empty when absent).
 std::vector<uint8_t> batchAt(Log& log, int64_t off) {
@@ -1757,10 +1790,14 @@ std::optional<std::string> committedValue(Log& log, std::string_view key) {
             if (!r.ensureValid() || r.baseOffset() + r.lastOffsetDelta() < cur) break;
             B b{r.producerId(), (r.attributes() & batch::kAttrTransactional) != 0,
                 (r.attributes() & batch::kAttrControl) != 0, false, {}};
-            r.forEachRecord([&](std::string_view k, std::string_view v, int64_t, int64_t) {
-                if (b.ctrl) b.abort = k.size() == 2 && k[0] == 1;
-                else b.recs.emplace_back(std::string(k), std::string(v));
-            });
+            if (b.ctrl && r.totalLength() == 75 && bytes[64] == 0x04) {
+                b.abort = bytes[65] == 1;   // production ControlMarker layout (no record length varint)
+            } else {
+                r.forEachRecord([&](std::string_view k, std::string_view v, int64_t, int64_t) {
+                    if (b.ctrl) b.abort = k.size() == 2 && k[0] == 1;
+                    else b.recs.emplace_back(std::string(k), std::string(v));
+                });
+            }
             batches.push_back(std::move(b));
             cur = r.baseOffset() + r.lastOffsetDelta() + 1;
         }
@@ -1919,6 +1956,214 @@ TEST(LogCleanerTxnMarkerKeyRegression, UserRecordWithMarkerKeyBytesSurvives) {
             cleanOnce(log, path);
             EXPECT_EQ(committedValue(log, mkey), std::optional<std::string>("user"))
                 << pathName(path) << ": user record superseded by a marker with the same key bytes";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+namespace {
+std::map<std::string, std::string> committedState(Log& log, const std::vector<std::string>& keys) {
+    std::map<std::string, std::string> out;
+    for (const auto& k : keys) if (auto v = committedValue(log, k)) out[k] = *v;
+    return out;
+}
+std::vector<uint8_t> d3bNullKey(int64_t off) {
+    RecordBatchBuilder b(off, 2000 + off);
+    b.append("", "u", 2000 + off);
+    return b.build();
+}
+} // namespace
+
+// Fix round 1 (1): a marker is removed only once EVERY assigned replica fetched
+// past it.  A lagging replica holding a txn's data but not its marker would
+// otherwise never see the marker and, after a failover, read the aborted data as
+// part of the producer's next transaction.
+TEST(LogCleanerTxnMarkerRemovalRegression, MarkerKeptUntilEveryReplicaFetchedPastIt) {
+    for (CleanPath path : {CleanPath::Sync, CleanPath::Range, CleanPath::RangeCoalesce}) {
+        auto dir = makeTempDir("lc_d3b_mbound");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            log.append(d3bTxn(0, "k", "a", 0), 0);
+            log.append(d3bMarker(1, /*abort=*/true), 1);    // aborted txn
+            log.append(d3bTxn(2, "k2", "c", 1), 2);
+            log.append(d3bMarker(3, /*abort=*/false), 3);   // the producer's last batch
+            for (int64_t i = 4; i < 7; ++i) d3bPlain(log, i, "pad", "p");
+            const int64_t t0 = 1'000'000;
+            // A replica's fetch position is 1: it holds the aborted data @0, not the marker @1.
+            for (int pass = 0; pass < 4; ++pass) cleanOnce(log, path, t0 + pass * kD3bRetentionMs, /*bound=*/1);
+            const auto m = batchAt(log, 1);
+            ASSERT_FALSE(m.empty()) << pathName(path) << ": marker removed before a lagging replica fetched it";
+            EXPECT_FALSE(RecordBatchReader(m.data(), m.size()).hasDeleteHorizon())
+                << pathName(path) << ": horizon stamped before every replica fetched the marker";
+            // Every replica past it → stamped, then dropped after the horizon.
+            cleanOnce(log, path, t0, /*bound=*/2);
+            ASSERT_FALSE(batchAt(log, 1).empty()) << pathName(path);
+            cleanOnce(log, path, t0 + kD3bRetentionMs, /*bound=*/2);
+            EXPECT_TRUE(batchAt(log, 1).empty()) << pathName(path) << ": marker never removed once all replicas had it";
+            EXPECT_EQ(committedValue(log, "k2"), std::optional<std::string>("c")) << pathName(path);
+            EXPECT_EQ(committedValue(log, "k"), std::nullopt) << pathName(path);
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1 (4a): txn data in the CLEAN PREFIX (below the watermark) with its
+// ABORT marker in the dirty section — the txn scan must start at log start, or
+// the marker looks like an empty txn (removed) and the prefix data surfaces.
+TEST(LogCleanerTxnAbortRegression, AbortedDataInCleanPrefixMarkerInDirtySection) {
+    for (CleanPath path : {CleanPath::Sync, CleanPath::Range, CleanPath::RangeCoalesce}) {
+        auto dir = makeTempDir("lc_d3b_prefix");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            d3bPlain(log, 0, "k", "v1");
+            log.append(d3bTxn(1, "k", "v2", 0), 1);         // clean prefix [0, 2)
+            log.append(d3bMarker(2, /*abort=*/true), 2);    // dirty section starts at 2
+            log.append(d3bTxn(3, "k2", "c", 1), 3);
+            log.append(d3bMarker(4, /*abort=*/false), 4);
+            for (int64_t i = 5; i < 8; ++i) d3bPlain(log, i, "pad", "p");
+            const int64_t t0 = 1'000'000;
+            for (int pass = 0; pass < 4; ++pass) {
+                cleanOnce(log, path, t0 + pass * kD3bRetentionMs, std::numeric_limits<int64_t>::max(),
+                          /*dirtyStart=*/2);
+                ASSERT_EQ(committedValue(log, "k"), std::optional<std::string>("v1"))
+                    << pathName(path) << " pass " << pass << ": prefix aborted k=v2 surfaced / superseded v1";
+            }
+            EXPECT_EQ(countKey(readAllRecords(log), "k"), 1) << pathName(path) << ": prefix aborted data kept";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1 (4c): interleaved producers, one with several aborted ranges —
+// read_committed state is identical before and after every pass.
+TEST(LogCleanerTxnAbortRegression, InterleavedProducersSeveralAbortedRangesKeepCommittedState) {
+    for (CleanPath path : {CleanPath::Sync, CleanPath::Range, CleanPath::RangeCoalesce}) {
+        auto dir = makeTempDir("lc_d3b_inter");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            constexpr int64_t P = 41, Q = 42;
+            int64_t o = 0;
+            int32_t ps = 0, qs = 0;
+            d3bPlain(log, o, "a", "a0"); ++o;
+            d3bPlain(log, o, "b", "b0"); ++o;
+            log.append(d3bTxn(o, "a", "a1-P-aborted", ps++, P), o); ++o;
+            log.append(d3bTxn(o, "b", "b1-Q", qs++, Q), o); ++o;
+            log.append(d3bTxn(o, "c", "c1-P-aborted", ps++, P), o); ++o;
+            log.append(d3bMarker(o, true, P), o); ++o;            // P abort #1
+            log.append(d3bTxn(o, "a", "a2-Q", qs++, Q), o); ++o;
+            log.append(d3bTxn(o, "b", "b2-P", ps++, P), o); ++o;
+            log.append(d3bMarker(o, false, Q), o); ++o;           // Q commit
+            log.append(d3bMarker(o, false, P), o); ++o;           // P commit
+            log.append(d3bTxn(o, "b", "b3-P-aborted", ps++, P), o); ++o;
+            d3bPlain(log, o, "c", "c0"); ++o;
+            log.append(d3bTxn(o, "a", "a3-Q-aborted", qs++, Q), o); ++o;
+            log.append(d3bTxn(o, "c", "c2-P-aborted", ps++, P), o); ++o;
+            log.append(d3bMarker(o, true, P), o); ++o;            // P abort #2
+            log.append(d3bMarker(o, true, Q), o); ++o;            // Q abort
+            log.append(d3bTxn(o, "d", "d1-P-aborted", ps++, P), o); ++o;
+            log.append(d3bMarker(o, true, P), o); ++o;            // P abort #3
+            log.append(d3bTxn(o, "d", "d2-Q", qs++, Q), o); ++o;
+            log.append(d3bMarker(o, false, Q), o); ++o;
+            for (int i = 0; i < 3; ++i, ++o) d3bPlain(log, o, "pad", "p");
+            const std::vector<std::string> keys{"a", "b", "c", "d", "pad"};
+            const auto before = committedState(log, keys);
+            ASSERT_EQ(before.at("a"), "a2-Q");
+            ASSERT_EQ(before.at("b"), "b2-P");
+            ASSERT_EQ(before.at("c"), "c0");
+            ASSERT_EQ(before.at("d"), "d2-Q");
+            const int64_t t0 = 1'000'000;
+            for (int pass = 0; pass < 5; ++pass) {
+                cleanOnce(log, path, t0 + pass * kD3bRetentionMs);
+                ASSERT_EQ(committedState(log, keys), before) << pathName(path) << " pass " << pass;
+            }
+            for (const auto& r : readAllRecords(log))
+                EXPECT_EQ(r.value.find("aborted"), std::string::npos)
+                    << pathName(path) << ": aborted record @" << r.offset << " kept";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1 (3): an aborted batch whose metadata is already retained as a
+// record-less tail is not "work": a pass over a range with nothing else to do
+// must not re-read every in-pass segment.
+TEST(LogCleanerTxnAbortRegression, RetainedAbortedTailIsNotReworkedEveryPass) {
+    for (CleanPath path : {CleanPath::Range, CleanPath::RangeCoalesce}) {
+        auto dir = makeTempDir("lc_d3b_rework");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            log.append(d3bTxn(0, "k", "a", 0), 0);
+            log.append(d3bMarker(1, /*abort=*/true), 1);    // the producer's last batch: kept
+            for (int64_t i = 2; i < 5; ++i) log.append(d3bNullKey(i), i);
+            int64_t reads = -1;
+            cleanOnce(log, path, 1'000'000, std::numeric_limits<int64_t>::max(), 0, &reads);
+            const auto tail = batchAt(log, 0);
+            ASSERT_FALSE(tail.empty()) << pathName(path);
+            ASSERT_EQ(RecordBatchReader(tail.data(), tail.size()).recordCount(), 0)
+                << pathName(path) << ": first pass discards the aborted record";
+            cleanOnce(log, path, 1'000'000, std::numeric_limits<int64_t>::max(), 0, &reads);
+            EXPECT_EQ(reads, 0) << pathName(path) << ": nothing to do, yet the rewrite re-read the segments";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1 (3): the single-segment / group bounded paths do not skip aborted
+// data when the range has no keyed record (they early-returned on an empty map).
+TEST(LogCleanerTxnAbortRegression, BoundedFileAndGroupPathsDiscardAbortedWithoutKeys) {
+    for (bool group : {false, true}) {
+        auto dir = makeTempDir("lc_d3b_fgroup");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            log.append(d3bTxn(0, "k", "a", 0), 0);
+            log.append(d3bMarker(1, /*abort=*/true), 1);
+            log.append(d3bTxn(2, "k2", "c", 1), 2);         // the producer's later batch: @0 is not its tail
+            log.append(d3bMarker(3, /*abort=*/true), 3);
+            for (int64_t i = 4; i < 7; ++i) log.append(d3bNullKey(i), i);
+            auto bases = log.segmentBaseOffsets();
+            const int64_t active = bases.back();
+            bases.pop_back();
+            LogCleaner cleaner;
+            cleaner.setMarkerRemovalBound(std::numeric_limits<int64_t>::max());
+            if (group) {
+                SegmentGroup g; g.bases = bases; g.combinedBytes = 1;
+                (void)cleaner.produceCleanedGroupBounded(log.dir(), bases, g, active, 0, 0, kD3bRetentionMs,
+                                                         1 << 20, nullptr, 1'000'000);
+            } else {
+                (void)cleaner.produceCleanedFileBounded(log.dir(), bases, /*segBase=*/0, active, 0, 0,
+                                                        kD3bRetentionMs, 1 << 20, nullptr, 1'000'000);
+            }
+            log.reloadSegments();
+            EXPECT_TRUE(batchAt(log, 0).empty()) << (group ? "group" : "file")
+                                                 << ": aborted record without keys in range survived";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1: the cleaner must read the PRODUCTION marker layout (no record
+// length varint — ControlMarker::build) as well as Kafka-framed control records.
+// Misreading an ABORT as COMMIT re-opens the original bug (aborted data indexed).
+TEST(LogCleanerTxnAbortRegression, BothMarkerEncodingsAreParsed) {
+    for (bool builder : {false, true}) {
+        auto dir = makeTempDir("lc_d3b_menc");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+            d3bPlain(log, 0, "k", "v1");
+            log.append(d3bTxn(1, "k", "v2", 0), 1);
+            log.append(builder ? d3bBuilderMarker(2, true) : d3bMarker(2, true), 2);
+            for (int64_t i = 3; i < 6; ++i) d3bPlain(log, i, "pad", "p");
+            cleanOnce(log, CleanPath::Range);
+            EXPECT_EQ(countKey(readAllRecords(log), "k"), 1) << (builder ? "builder" : "production")
+                << " ABORT marker not recognised: aborted k=v2 kept/indexed";
+            const auto recs = readAllRecords(log);
+            EXPECT_EQ(latestOffsetForKey(recs, "k"), 0) << (builder ? "builder" : "production");
         }
         std::filesystem::remove_all(dir);
     }

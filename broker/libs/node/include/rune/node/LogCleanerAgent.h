@@ -499,6 +499,9 @@ public:
 
         rune::storage::LogCleaner cleaner;
         cleaner.setProducerIdExpirationMs(producerIdExpirationMs_);
+        // D3b fix round 1: a txn marker is removed only below the minimum fetch
+        // position of EVERY assigned replica (a lagging replica must still get it).
+        cleaner.setMarkerRemovalBound(best.replica->cleanerMarkerRemovalBound());
         rune::storage::RangeCleanResult passResult = cleaner.produceCleanedRangeBounded(
             best.dir,
             sealedBases,

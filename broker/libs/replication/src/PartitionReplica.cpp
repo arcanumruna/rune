@@ -164,6 +164,7 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
     // follower-first replica can rebuild a correct IsrManager on a later
     // becomeLeader() instead of collapsing replicas == isr (see header note).
     configuredReplicas_ = replicas;
+    replicaFetchPos_.assign(configuredReplicas_.size(), 0);   // D3b fix round 1
     if (!followerSlots_.init(configuredReplicas_)) {
         throw std::invalid_argument(
             "PartitionReplica: replica set size " + std::to_string(configuredReplicas_.size()) +
@@ -262,6 +263,8 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
         cfg_.minIsr);
 
     leaderState_.setLeaderId(cfg_.selfId);
+    // D3b fix round 1: fetch positions are relearned in every leadership.
+    std::fill(replicaFetchPos_.begin(), replicaFetchPos_.end(), Offset{0});
 
     // Durability quorum: set the per-topic rule FIRST, before seeding the floor
     // and ISR/LEO.  setDurabilityMode resets prevHw_ to 0 and recomputes (which
@@ -799,6 +802,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
     const Offset prevHwOnFetch = leaderState_.highWatermark();
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
+    noteReplicaFetchPos_(req.followerId, req.fetchOffset);   // D3b fix round 1: marker-removal bound
     // HW is already recomputed inside updateFollowerFetchOffset().
     // FR: acks=all COMMIT point — this follower position update just lifted the
     //     majority high-watermark. Keyed by (partition<<24)|committedOffset so it
@@ -1396,6 +1400,7 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         const Offset trackedLeo = std::min<Offset>(req.followerLeo, logEndOffset_());
         if (trackedLeo >= 0) {
             leaderState_.updateFollowerFetchOffset(req.followerId, trackedLeo);
+            noteReplicaFetchPos_(req.followerId, trackedLeo);   // D3b fix round 1
             // BUG FIX (ISR-tracking divergence): the probe must ALSO advance the
             // IsrManager's per-follower fetch offset/time, exactly like a normal
             // fetch (onFetchRequest updates BOTH).  Updating only leaderState_ left
@@ -2296,6 +2301,17 @@ void PartitionReplica::publishCleanerState() noexcept
         ? static_cast<int>(isrManager_->isr().size())
         : 0;
     publishedIsrSizeForGateway_.store(isrSize, std::memory_order_release);
+
+    // D3b fix round 1: the cleaner's marker-removal bound — the minimum fetch
+    // position over EVERY assigned replica (not just the ISR; a replica that never
+    // fetched in this leadership counts as 0).  A follower publishes 0 (it never cleans).
+    Offset markerBound = 0;
+    if (role_ == Role::Leader) {
+        markerBound = kNoCleanerLso;
+        for (std::size_t i = 0; i < configuredReplicas_.size(); ++i)
+            if (configuredReplicas_[i] != cfg_.selfId) markerBound = std::min(markerBound, replicaFetchPos_[i]);
+    }
+    publishedMarkerBoundForCleaner_.store(markerBound, std::memory_order_release);
 
     // Controller position snapshot: mirror this replica's view of replica-node LEOs
     // for the leadership-convergence path (see controllerReplicaLeo() in the header).
