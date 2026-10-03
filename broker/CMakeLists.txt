@@ -59,6 +59,23 @@ else()
     target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
 endif()
 
+# ── rune_gso — UDP GSO/GRO Aeron transport bindings ──────────────────────────
+# rune-protocol sibling C source (spec 2026-10-03-aeron-udp-gso-gro).  Linux does GSO/GRO; other platforms
+# compile a no-op (create() returns NULL -> stock Aeron).
+enable_language(C)
+add_library(rune_gso STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_gso_bindings.c)
+set_target_properties(rune_gso PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rune_gso PUBLIC ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_gso PUBLIC aeron::aeron)
+if(UNIX AND NOT APPLE)
+    # Aeron's internal driver headers include siblings relative to <root>, <root>/aeron, <root>/aeronmd
+    # (pinned by the plan's Task 2 Step 1 probe against the conan aeron package).
+    foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+        target_include_directories(rune_gso PRIVATE
+            "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+    endforeach()
+endif()
+
 # ── rune-codec (0a) — consumed as a SIBLING source static lib (like rune-fr) ──
 set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-codec"
     CACHE PATH "Path to the rune-codec sibling repo")

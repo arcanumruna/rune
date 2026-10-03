@@ -55,6 +55,8 @@ endif()
 # spdlog is PUBLIC because Worker.h (a PUBLIC header) uses spdlog calls inline.
 # E2 inc2a: Worker.h was extended with inline execute methods that log via spdlog.
 target_link_libraries(rune_node PUBLIC spdlog::spdlog)
+# UDP GSO/GRO Aeron transport bindings (EmbeddedDriver, HostDefaults probe).
+target_link_libraries(rune_node PUBLIC rune_gso)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -80,6 +82,12 @@ if(BUILD_TESTING)
     add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp)
     target_link_libraries(rune_session_announcer_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
     gtest_discover_tests(rune_session_announcer_tests)
+    if(UNIX AND NOT APPLE)
+        # Real-driver UDP GSO/GRO bindings tests (Linux kernels only: UDP_SEGMENT/UDP_GRO).
+        add_executable(rune_udp_gso_tests tests/node/UdpGsoBindingsTest.cpp)
+        target_link_libraries(rune_udp_gso_tests PRIVATE rune_gso rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_udp_gso_tests)
+    endif()
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 

@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <system_error>
+#include <tuple>
 
 using namespace rune::node;
 
@@ -447,6 +448,26 @@ TEST(HostDefaults, ApplyOnTheK3sBoxGivesExactlyTheTunedConfig) {
         EXPECT_TRUE(hd.warnings.empty()) << hd.warnings;
         EXPECT_NE(hd.summary.find("mode=shard placement=fused workers=1"), std::string::npos) << hd.summary;
         EXPECT_NE(hd.summary.find("mtu=65504 socketBuffer=16777216 rcvWindow=262144"), std::string::npos) << hd.summary;
+    }
+}
+
+// The effective-config line proves which UDP path a run measured (bench rule: verify the measured path).
+// Fix round 1 (review L5): GSO send and GRO receive are reported separately — the bindings install with
+// either one (a kernel with UDP_GRO but no UDP_SEGMENT still runs GRO).
+TEST(HostDefaults, SummaryReportsUdpGsoAndGroSeparatelyRegression) {
+    struct Case { bool want, gso, gro; const char* g; const char* r; };
+    for (const Case c : {Case{true, true, true, "gso=on", "gro=on"},
+                         Case{true, false, true, "gso=unsupported", "gro=on"},
+                         Case{true, true, false, "gso=on", "gro=unsupported"},
+                         Case{true, false, false, "gso=unsupported", "gro=unsupported"},
+                         Case{false, true, true, "gso=off", "gro=off"}}) {
+        NodeConfig cfg = threeNodeDefault(0);
+        cfg.aeronUdpGso = c.want;
+        HostNetFacts f = k3sFacts();
+        f.udpGso = c.gso;
+        f.udpGro = c.gro;
+        const auto hd = applyHostDerivedDefaults(cfg, f);
+        EXPECT_NE(hd.summary.find(std::string(" ") + c.g + " " + c.r + " "), std::string::npos) << hd.summary;
     }
 }
 

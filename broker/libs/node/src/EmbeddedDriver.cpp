@@ -1,5 +1,6 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
+#include "rune/protocol/net/rune_udp_gso.h"
 
 #include <spdlog/spdlog.h>
 
@@ -17,6 +18,7 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.socketBufferBytes = c.aeronSocketBufferBytes;
     e.termBufferSparse  = c.aeronTermBufferSparse;
     e.maxMessagesPerSend = c.aeronMaxMessagesPerSend;
+    e.udpGso             = c.aeronUdpGso;
     e.senderIoVector     = c.aeronSenderIoVectorCapacity;
     e.receiverIoVector   = c.aeronReceiverIoVectorCapacity;
     e.threadingMode     = c.aeronThreadingMode;
@@ -94,6 +96,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     if (aeron_is_driver_active(cfg_.dir.c_str(), /*timeout_ms=*/1000, +[](const char*) {})) {
         aeron_driver_context_close(ctx_);
         ctx_ = nullptr;
+        releaseGso_();
         throw std::runtime_error(
             "EmbeddedDriver: aeron dir '" + cfg_.dir + "' is already in use by an ACTIVE media "
             "driver (a prior broker instance may still be running, or was killed without clean "
@@ -121,8 +124,19 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
     aeron_driver_context_set_term_buffer_sparse_file(ctx_, cfg_.termBufferSparse.value_or(true));
+    if (cfg_.udpGso) {
+        gso_ = rune_gso_bindings_create(1, 1);   // NULL when the kernel/platform has neither -> stock Aeron
+        if (gso_ != nullptr && rune_gso_bindings_install(ctx_, gso_) < 0) {
+            rune_gso_bindings_delete(gso_);
+            gso_ = nullptr;
+        }
+        gsoActiveMask_ = rune_gso_bindings_active(gso_);
+    }
     if (cfg_.maxMessagesPerSend > 0)
         aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, static_cast<uint32_t>(cfg_.maxMessagesPerSend));
+    else if (const unsigned m = rune_gso_msgs_per_send(udpGsoActive(), static_cast<std::size_t>(cfg_.mtuBytes)); m > 0)
+        aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, m);   // GSO groups <= 16 datagrams
+    maxMessagesPerSend_ = aeron_driver_context_get_network_publication_max_messages_per_send(ctx_);
     if (cfg_.senderIoVector > 0)
         aeron_driver_context_set_sender_io_vector_capacity(ctx_, static_cast<uint32_t>(cfg_.senderIoVector));
     if (cfg_.receiverIoVector > 0)
@@ -137,6 +151,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     if (aeron_driver_init(&driver_, ctx_) < 0) {
         aeron_driver_context_close(ctx_);
         ctx_ = nullptr;
+        releaseGso_();
         throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_init failed: ") + aeron_errmsg());
     }
     if (aeron_driver_start(driver_, /*manual_main_loop=*/true) < 0) {
@@ -144,6 +159,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_close(ctx_);
         driver_ = nullptr;
         ctx_    = nullptr;
+        releaseGso_();
         throw std::runtime_error(std::string("EmbeddedDriver: aeron_driver_start failed: ") + aeron_errmsg());
     }
     if (mode_ == DriverMode::Threaded) {
@@ -176,6 +192,10 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     }
     spdlog::info("EmbeddedDriver: started (dir={}, mode={})", cfg_.dir,
                  mode_ == DriverMode::Invoker ? "invoker" : "threaded");
+    // WARN: visible in perf runs (RUNE_LOG_LEVEL=warn) — the INSTALLED UDP path of this driver.
+    spdlog::warn("EmbeddedDriver[{}]: udp mtu={} gso={} gro={} msgsPerSend={}", cfg_.dir, cfg_.mtuBytes,
+                 udpGsoActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"),
+                 udpGroActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_);
 }
 
 int EmbeddedDriver::doWork() noexcept {
@@ -237,6 +257,18 @@ void EmbeddedDriver::close() noexcept {
             spdlog::warn("EmbeddedDriver: aeron_driver_context_close error (dir={}): {}", cfg_.dir, aeron_errmsg());
         ctx_ = nullptr;
     }
+    releaseGso_();
+}
+
+void EmbeddedDriver::releaseGso_() noexcept {
+    if (gso_ == nullptr) return;
+    rune_gso_bindings_totals(gso_, &gsoTotals_);
+    if (gsoTotals_.gso_fallbacks > 0 || gsoTotals_.gro_disabled > 0)
+        spdlog::warn("EmbeddedDriver[{}]: udp runtime fallbacks: gso_fallbacks={} gro_disabled={} "
+                     "gro_trunc_drops={}", cfg_.dir, gsoTotals_.gso_fallbacks, gsoTotals_.gro_disabled,
+                     gsoTotals_.gro_trunc_drops);
+    rune_gso_bindings_delete(gso_);
+    gso_ = nullptr;
 }
 
 EmbeddedDriver::~EmbeddedDriver() {

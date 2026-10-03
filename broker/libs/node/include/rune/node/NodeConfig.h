@@ -530,9 +530,17 @@ struct NodeConfig {
     //     RUNE_AERON_MAX_MSGS_PER_SEND  -> network_publication_max_messages_per_send
     //     RUNE_AERON_SENDER_IOV         -> sender_io_vector_capacity (sendmmsg batch)
     //     RUNE_AERON_RECEIVER_IOV       -> receiver_io_vector_capacity (recvmmsg batch)
+    //     With UDP GSO active (below) and MAX_MSGS_PER_SEND unset, the driver uses 16 (Aeron's max) so a
+    //     burst of MTU-size fragments forms one GSO super-datagram.
     int32_t aeronMaxMessagesPerSend      = 0;
     int32_t aeronSenderIoVectorCapacity  = 0;
     int32_t aeronReceiverIoVectorCapacity = 0;
+
+    //   - aeronUdpGso: install the rune_gso Aeron UDP transport bindings — Linux UDP GSO (UDP_SEGMENT) on
+    //     send, UDP GRO on receive; wire format unchanged (peers see <= MTU datagrams), auto-off where the
+    //     kernel/platform lacks them (stock Aeron).  RUNE_AERON_UDP_GSO=0|false forces stock Aeron (A/B,
+    //     fault isolation).  Spec docs/superpowers/specs/2026-10-03-aeron-udp-gso-gro-design.md.
+    bool aeronUdpGso = true;
 
     //   - aeronSocketBufferBytes: OS UDP socket SO_SNDBUF / SO_RCVBUF (bytes) for
     //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.

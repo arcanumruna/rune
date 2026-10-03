@@ -1587,6 +1587,33 @@ TEST(NodeConfig, ParsesAeronSendBatching) {
     }
 }
 
+TEST(NodeConfig, AeronUdpGsoDefaultsOnAndEnvTurnsItOff) {
+    std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+    EXPECT_TRUE(rune::node::NodeConfig{}.aeronUdpGso);
+    {
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_TRUE(res.config->aeronUdpGso) << "default on (auto-off where the kernel lacks it)";
+    }
+    for (const char* off : {"0", "false"}) {
+        auto kv = base; kv["RUNE_AERON_UDP_GSO"] = off;
+        auto res = rune::node::parseNodeConfig(fakeEnv(kv));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_FALSE(res.config->aeronUdpGso) << off;
+    }
+    for (const char* on : {"1", "true"}) {
+        auto kv = base; kv["RUNE_AERON_UDP_GSO"] = on;
+        auto res = rune::node::parseNodeConfig(fakeEnv(kv));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_TRUE(res.config->aeronUdpGso) << on;
+    }
+    auto kv = base; kv["RUNE_AERON_UDP_GSO"] = "maybe";
+    auto bad = rune::node::parseNodeConfig(fakeEnv(kv));
+    EXPECT_FALSE(bad.config.has_value());
+    EXPECT_NE(bad.error.find("RUNE_AERON_UDP_GSO"), std::string::npos) << bad.error;
+}
+
 TEST(NodeConfig, ParsesAeronTermSparse) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
         {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
