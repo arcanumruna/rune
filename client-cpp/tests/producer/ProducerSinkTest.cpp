@@ -1,3 +1,4 @@
+#include <chrono>
 // tests/producer/ProducerSinkTest.cpp — concrete (non-std::function) produce sinks
 // and the flat partition table.  No Aeron: ProducerImpl is driven directly.
 #include <rune/client/Key.h>
@@ -203,4 +204,30 @@ TEST(ProducerSinkCrc, Tier2StampKeepsTheCrcValidAcrossRetries) {
     ASSERT_TRUE(p);
     EXPECT_EQ(p->producerId, impl.producerId());
     EXPECT_EQ(p->baseSequence, 0);
+}
+
+// Backlog D7: the record-timestamp wire contract is epoch MILLISECONDS (Kafka parity).  The client stamped
+// epoch nanoseconds, so every Kafka-semantics consumer of the timestamp (retention by time, time-index
+// lookups, the broker's segment max-ts) saw a date ~1e6x in the future unless it guessed the unit.
+TEST(TimestampContractRegression, ProducedRecordTimestampsAreEpochMilliseconds) {
+    ProducerImpl impl(ackedCfg());
+    uint64_t frames = 0, bytes = 0;
+    std::vector<uint8_t> last;
+    CountingSink sink{&frames, &bytes};
+    sink.lastFrame = &last;
+    const std::vector<uint8_t> v(16, 0x5a);
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t(i)), v, false, 0));
+    impl.drainRing(kNow, 100);
+    ASSERT_EQ(impl.flushBatches(kNow, 42, sink), 1);
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto p = rune::protocol::client::Produce::decode(last.data(), last.size());
+    ASSERT_TRUE(p);
+    rune::protocol::RecordBatchReader rd(p->recordBatch.data(), p->recordBatch.size());
+    ASSERT_TRUE(rd.ensureValid());
+    constexpr int64_t kSlackMs = 60'000;
+    EXPECT_NEAR(static_cast<double>(rd.baseTimestamp()), static_cast<double>(nowMs), kSlackMs)
+        << "baseTimestamp must be epoch ms";
+    EXPECT_NEAR(static_cast<double>(rd.maxTimestamp()), static_cast<double>(nowMs), kSlackMs)
+        << "maxTimestamp must be epoch ms";
 }

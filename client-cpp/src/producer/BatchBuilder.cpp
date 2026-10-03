@@ -27,9 +27,9 @@ OpResult tier2Result(producer::RejectReason why) noexcept {
 
 namespace {
 
-// Current wall-clock timestamp (ns) for batch baseTimestamp.
-inline int64_t wallNs() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+// Current wall-clock timestamp: epoch MILLISECONDS (the record-timestamp wire contract, Kafka parity — D7).
+inline int64_t wallMs() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
@@ -71,14 +71,14 @@ void BatchBuilder::add(std::span<const uint8_t> value,
     // Lazy-init builder on first add.
     if (!builder_) {
         builder_ = std::make_unique<rune::protocol::RecordBatchBuilder>(
-            0, wallNs());
+            0, wallMs());
     }
 
     // Append record: record_key + value.
     const std::string_view vv(
         reinterpret_cast<const char*>(value.data()), value.size());
 
-    builder_->append(record_key, vv, wallNs());
+    builder_->append(record_key, vv, wallMs());
 }
 
 // ---------------------------------------------------------------------------

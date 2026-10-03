@@ -107,9 +107,9 @@ inline int64_t readLE64(const uint8_t* buf, int off) noexcept {
     return static_cast<int64_t>(v);
 }
 
-// Current wall-clock timestamp (ns) for batch baseTimestamp.
-inline int64_t wallNs() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+// Current wall-clock timestamp: epoch MILLISECONDS (the record-timestamp wire contract, Kafka parity — D7).
+inline int64_t wallMs() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
@@ -422,7 +422,7 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
 }
 
 int64_t ProducerImpl::steadyNowNs_() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
@@ -1418,25 +1418,25 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     // Frame-cap path (frameCapped=true, effCap=maxFrameBytes < batchBytes):
     //   Use an exact pre-flight check: compute the wire contribution of this
     //   record (recordBodyContrib) and ABORT if appending it would push
-    //   builderBytes past effCap.  The check uses wallNs() for tsDelta, which
+    //   builderBytes past effCap.  The check uses wallMs() for tsDelta, which
     //   is the same function the builder calls inside append() — so the
     //   predicted size matches the actual encoded size.  The builder is reset
-    //   to builderBaseWallNs on each frame boundary.
+    //   to builderBaseWallMs on each frame boundary.
     //   ABORT even when inFlight has room so the current frame is flushed
     //   first; this guarantees NO emitted RecordBatch exceeds effCap wire.
     if (frameCapped && ps.builder && ps.builder->recordCount() > 0) {
         // Compute exact wire contribution of this next record.
-        // wallNs() here and inside builder->append() may differ by ≤1µs,
+        // wallMs() here and inside builder->append() may differ by ≤1µs,
         // which can shift varlongLen(tsDelta) by +1 byte at boundary values.
         // Adding 1 byte of slack makes the check conservative (splits ≤1 byte
         // early at boundary values) but guarantees NO overshoot.
-        const int64_t tsDelta = wallNs() - ps.builderBaseWallNs;
+        const int64_t tsDelta = wallMs() - ps.builderBaseWallMs;
         const int32_t contrib = recordBodyContrib(
             static_cast<int32_t>(keyLen),
             static_cast<int32_t>(valueLen),
             tsDelta,
             ps.builder->recordCount() /* offsetDelta = current record count */)
-            + 1; // +1 byte slack for wallNs() jitter between pre-flight and append
+            + 1; // +1 byte slack for wallMs() jitter between pre-flight and append
 
         if (ps.builderBytes + contrib > effCap) {
             // Record would overshoot: ABORT.  flushBatches will fire on
@@ -1470,11 +1470,11 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     // Create the builder ONCE per partition; reused (reset in place) across
     // batches so there is no per-batch heap allocation.
     if (!ps.builder) {
-        const int64_t baseWall = wallNs();
+        const int64_t baseWall = wallMs();
         ps.builder = std::make_unique<ProduceFrameBuilder>(0, baseWall);
-        ps.builderBaseWallNs = baseWall;
+        ps.builderBaseWallMs = baseWall;
     }
-    // I1 FIX (frame cap): builderBaseWallNs is never re-sampled here — it already
+    // I1 FIX (frame cap): builderBaseWallMs is never re-sampled here — it already
     // equals the builder's actual baseTimestamp (set at construction above and at
     // the reset(0, resetWall) in encodeAndSend), so the pre-flight tsDelta is
     // computed against the SAME base the builder encodes with.
@@ -1515,7 +1515,7 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
                               static_cast<std::size_t>(keyLen));
     const std::string_view vv(reinterpret_cast<const char*>(valBytes),
                               static_cast<std::size_t>(valueLen));
-    ps.builder->append(kv, vv, wallNs());
+    ps.builder->append(kv, vv, wallMs());
 
     // ---- committed: nothing below throws (ack slots reserved above) ----------
     // fix2: the batch clock is the EARLIEST record's acceptance time (a deferred
@@ -1681,10 +1681,10 @@ bool ProducerImpl::encodeAndSend(
 
     // Reset builder IN PLACE for the next batch (success path only; keep the
     // object + its records_ capacity — no per-batch heap alloc).
-    const int64_t resetWall = wallNs();
+    const int64_t resetWall = wallMs();
     ps.builder->reset(0, resetWall);
     ps.builderBytes  = 0;
-    ps.builderBaseWallNs = resetWall;  // I1: keep the pre-flight base in lockstep with
+    ps.builderBaseWallMs = resetWall;  // I1: keep the pre-flight base in lockstep with
                                        // the builder's actual baseTimestamp.
     ps.batchStartNs  = 0;
     ps.flushRequested = false;
@@ -2589,9 +2589,9 @@ void ProducerImpl::failBuilder_(PartitionState& ps, OpStatus st) {
         ps.ackHead = ps.batchAckStart;  // reclaim the unsent (newest) slice
     }
     ps.batchAckCount = 0;
-    const int64_t resetWall = wallNs();
+    const int64_t resetWall = wallMs();
     ps.builder->reset(0, resetWall);
-    ps.builderBaseWallNs = resetWall;
+    ps.builderBaseWallMs = resetWall;
     ps.builderBytes      = 0;
     ps.batchStartNs      = 0;
     ps.flushRequested    = false;

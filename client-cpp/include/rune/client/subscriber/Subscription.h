@@ -91,7 +91,7 @@ struct SubscribeOptions {
 // ---------------------------------------------------------------------------
 struct Record {
     int64_t                  offset;    // absolute offset in the partition log
-    int64_t                  timestamp; // producer timestamp (nanoseconds)
+    int64_t                  timestamp; // producer timestamp, epoch MILLISECONDS (wire contract, Kafka parity)
     std::span<const uint8_t> key;       // zero-copy — valid only in-callback
     std::span<const uint8_t> value;     // zero-copy — valid only in-callback
 };

@@ -36,8 +36,8 @@ namespace rpc = rune::protocol::client;
 
 namespace {
 
-inline int64_t wallNs() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+inline int64_t wallMs() noexcept {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
@@ -674,10 +674,10 @@ int64_t TransactionalProducerImpl::testRequestCorrId(uint8_t kind) const noexcep
 
 void TransactionalProducerImpl::produce_(TxnPartitionState& ps, TxnSendRecord& rec, int64_t nowNs,
                                          int64_t sessionId, const SendFn& sendFn, int& work) {
-    rune::protocol::RecordBatchBuilder builder(0, wallNs());
+    rune::protocol::RecordBatchBuilder builder(0, wallMs());
     const std::string_view kv(reinterpret_cast<const char*>(rec.key.bytes().data()), rec.key.size());
     const std::string_view vv(reinterpret_cast<const char*>(rec.value.data()), rec.value.size());
-    builder.append(kv, vv, wallNs());
+    builder.append(kv, vv, wallMs());
     builder.setProducerId(producerId_);
     builder.setProducerEpoch(producerEpoch_);
     // TX-6: mark the DATA batch transactional (attributes bit 0x10) — the
