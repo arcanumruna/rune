@@ -622,7 +622,9 @@ TEST(ShardModeRegression, StorageFailureHaltsBrokerWithExitCode) {
     // the failed partition refuses every later produce with StorageError.
     TmpDir dir{"halt"}, cdir{"client"};
     const auto ports = ShardPorts::discover(1, 1);
-    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    auto haltCfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    haltCfg.workerSyncIntervalMs = 10;   // the periodic owned-log fsync whose failure is injected (default: off)
+    BrokerNode node{haltCfg};
     HaltCapture halt;
     node.setHaltHandler(&HaltCapture::handler, &halt);
     node.start();

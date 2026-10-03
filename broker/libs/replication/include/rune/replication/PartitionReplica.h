@@ -143,6 +143,7 @@ struct PartitionConfig {
     int         minIsr            = 1;              ///< min ISR for acksAll produce
     int64_t     fetchIntervalNs   = 50'000'000LL;   ///< follower fetch cadence (50 ms backstop; push is steady-state)
     int64_t     isrCheckIntervalNs = 10'000'000LL;  ///< leader ISR check cadence (10 ms)
+    int64_t     followerFlushIntervalNs = 20'000'000LL;   ///< follower coalesced fsync interval; 0 = off (durability via replication)
     int32_t     maxFetchBytes     = 1 << 20;        ///< max bytes per fetch (1 MiB)
     bool        pushOnAppend      = true;            ///< GR-10: leader pushes to ISR followers immediately on append
     bool        fastAckOnApply    = true;            ///< GR-10: follower fast-acks (emit FetchRequest immediately after applyReplicated)

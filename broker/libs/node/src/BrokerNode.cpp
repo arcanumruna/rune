@@ -398,10 +398,10 @@ void BrokerNode::start() {
                 shardAgents_.at(0)->setFusedRuntime(runtimeAgent_.get(), nodeDriver_.get(), aeron_.get());
                 stopStartupPump_();
             }
-            // Busy-spin ONLY when pinned to a dedicated core (principle §1a.3);
-            // unpinned shard workers use the backoff idle.
+            // Backoff idle by default (never busy-spin unless explicitly opted in:
+            // RUNE_WORKER_IDLE=busyspin) — pinned or not.
             workerPool_->startShardRunners(shardAgents_, clock_,
-                                           /*busySpin=*/config_.workerCoreBase >= 0,
+                                           /*busySpin=*/config_.shardWorkersBusySpin(),
                                            config_.idleMaxParkUs);
         } else {
             workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
@@ -892,6 +892,7 @@ void BrokerNode::buildReplication() {
             pcfg.minIsr               = config_.gatewayMinIsr;    // M1: consistent with gateway gate
             pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
             pcfg.isrCheckIntervalNs   = 10'000'000LL;
+            pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
             pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
             // CP-2: thread TopicSpec.cleanupPolicy into PartitionConfig so that
             // runBoundedCompaction() reads the correct policy from every replica.
@@ -1098,6 +1099,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.minIsr               = config_.gatewayMinIsr;
         pcfg.fetchIntervalNs      = config_.fetchIntervalNs;
         pcfg.isrCheckIntervalNs   = 10'000'000LL;
+        pcfg.followerFlushIntervalNs = config_.followerFlushIntervalMs * 1'000'000LL;
         pcfg.maxFetchBytes        = userTopicMaxFetchBytes(config_);   // F3 r5 I1
         pcfg.cleanupPolicy = static_cast<rune::replication::CleanupPolicy>(
             static_cast<uint8_t>(spec.cleanupPolicy));
@@ -1251,6 +1253,7 @@ void BrokerNode::buildWorkerPool() {
     for (int32_t i = 0; i < wc; ++i) {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
+        workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
         workerPool_->worker(i).setReturnDrainLimit(config_.workerReturnDrainLimit);
         workerPool_->worker(i).setMaxOwedReturns(static_cast<std::size_t>(config_.workerMaxOwedReturns));
@@ -3101,7 +3104,7 @@ void BrokerNode::attachShardRuntimes_() {
         wk.setWorkerEgress(eg.get());
         // Task 13 (spec §3.4): produce acks on this worker's OWN publications to
         // each announced session, created on its own invoker client.
-        wk.setShardClient(shardClients_[idx].get());
+        wk.setShardClient(shardClients_[idx].get(), config_.aeronControlTermBufferBytes);
         workerIngresses_.push_back(std::move(ing));
         workerEgresses_.push_back(std::move(eg));
         shardAgents_.push_back(std::make_unique<ShardAgent>(wk, shardDriver_(idx), *shardClients_[idx], clock_));

@@ -3007,3 +3007,71 @@ TEST(ShardNonBlockingRegression, ReownedLogCompletionUnpinsAndReservesBackground
     EXPECT_EQ(seg->flushPins(), s.w.bgFlushInFlightForTest()) << "B1's segment pin leaked on the re-owned log";
     EXPECT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore + 1) << "the background request made meanwhile was not re-served";
 }
+
+// LAT-1 (e)+(k): the 10 ms owned-log sync and the 20 ms follower flush became config, OFF by default in the
+// broker (measured: the background fsync halved the median and cost 6x p99).  0 must mean NEVER.
+TEST(NonShardNonBlockingRegression, FollowerFlushIntervalZeroNeverFlushesRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionConfig c = cfg(2);
+    c.followerFlushIntervalNs = 0;
+    PartitionReplica follower(c, Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    follower.becomeFollower(1, 1);
+    follower.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&follower});
+    w.setWorkerIngress(nullptr, true);
+    w.setBackgroundSyncIntervalNs(0);
+    applyOneBatch(follower, 0);
+    ASSERT_GT(log.logEndOffset(), 0);
+    for (int64_t now = 25 * kMs; now < 2000 * kMs; now += 25 * kMs) w.doWork(now);
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), 0u) << "follower flush interval 0 must never flush";
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+
+    // Positive control: the same scenario with the 20 ms interval DOES flush (the test is not vacuous).
+    TmpDir d2;
+    Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
+    PartitionReplica on(cfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &log2, &t);
+    on.becomeFollower(1, 1);
+    on.setExternalFollowerFlush(true);
+    Worker w2(0, 1 << 16, 1 << 16, 64, 64);
+    w2.setOwnedDirect(Worker::OwnedSet{&on});
+    w2.setWorkerIngress(nullptr, true);
+    w2.setBackgroundSyncIntervalNs(0);
+    applyOneBatch(on, 0);
+    for (int64_t now = 25 * kMs; now < 2000 * kMs && w2.bgFlushSubmitsForTest() == 0; now += 25 * kMs) w2.doWork(now);
+    EXPECT_GE(w2.bgFlushSubmitsForTest(), 1u) << "positive control: interval 20 ms flushes";
+}
+
+TEST(NonShardNonBlockingRegression, OwnedLogSyncIntervalZeroNeverSyncsRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica leader(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    leader.setExternalFollowerFlush(true);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setWorkerIngress(nullptr, true);
+    w.setBackgroundSyncIntervalNs(0);
+    w.doWork(1 * kMs);
+    leader.append(std::span<const uint8_t>(std::vector<uint8_t>(16, 1)));
+    (void)leader.takeFollowerFlushRequest();
+    for (int64_t now = 12 * kMs; now < 2000 * kMs; now += 12 * kMs) w.doWork(now);
+    EXPECT_EQ(w.bgFlushSubmitsForTest(), 0u) << "owned-log sync interval 0 must never sync";
+    EXPECT_EQ(log.syncCallsForTest(), 0u);
+
+    // Positive control: the same scenario at the 10 ms library default DOES submit a background flush.
+    TmpDir d2;
+    Log log2(d2.path.string(), 64LL * 1024 * 1024); log2.recover();
+    PartitionReplica l2(cfg(1), Role::Leader, 1, {1}, {1}, &log2, &t);
+    l2.setExternalFollowerFlush(true);
+    Worker w2(0, 1 << 16, 1 << 16, 64, 64);
+    w2.setOwnedDirect(Worker::OwnedSet{&l2});
+    w2.setWorkerIngress(nullptr, true);
+    w2.doWork(1 * kMs);
+    l2.append(std::span<const uint8_t>(std::vector<uint8_t>(16, 1)));
+    (void)l2.takeFollowerFlushRequest();
+    for (int64_t now = 12 * kMs; now < 2000 * kMs && w2.bgFlushSubmitsForTest() == 0; now += 12 * kMs) w2.doWork(now);
+    EXPECT_GE(w2.bgFlushSubmitsForTest(), 1u) << "positive control: interval 10 ms syncs";
+}

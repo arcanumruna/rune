@@ -564,8 +564,8 @@ public:
     // through the client's conductor).  The sink is heap-allocated once (cold):
     // ~0.9 MiB of fixed tables must not live on a thread stack.
     // -----------------------------------------------------------------------
-    void setShardClient(aeron::Aeron* client) {
-        ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client}) : nullptr;
+    void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0) {
+        ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes}) : nullptr;
     }
     void releaseShardClient() noexcept { ackSink_.reset(); }
     [[nodiscard]] bool workerSideAcks() const noexcept { return ackSink_ != nullptr; }
@@ -1305,9 +1305,12 @@ public:
         // E5.1.3 (d) R7 fix + F30: time-gated owned-log sync, on THIS worker's
         // io backend (never Log::sync on the worker, never from the gateway: the
         // gateway skips every worker-owned user log — R7).  Runs in EVERY
-        // configuration (F30 fix round 1, F4): it is what re-requests a flush
-        // the io backend refused and flushes a log adopted by an ownership move
-        // (fresh slot, lastSyncedLeo 0) — no per-pass retry table.
+        // configuration while its interval is > 0 (F30 fix round 1, F4): it is what
+        // re-requests a flush the io backend refused and flushes a log adopted by an
+        // ownership move (fresh slot, lastSyncedLeo 0) — no per-pass retry table.
+        // Interval 0 (the broker default, Kafka model): no periodic fsync at all, so a
+        // deferred background flush is simply not retried — durability comes from
+        // replication; Strict acks use their own coalesced fsync (not this path).
         // F15 S5 (R7, addendum): the gateway no longer learns worker appends (no
         // facts / mirror), so it can never mark a worker-owned log dirty — the
         // owning worker group-commits its own logs, here.
@@ -4345,8 +4348,8 @@ private:
         const CompletionToken t = submitActive_(log, RouteKind::Background, slot.epoch);
         if (t == kNoToken) {
             // Back-pressure (io in-flight depth): no retry table, no per-pass
-            // spin — the next owned-log sync interval (syncOwnedLogsAsync_, run
-            // in every configuration) re-requests it (LEO > lastSyncedLeo).
+            // spin — the next owned-log sync interval (syncOwnedLogsAsync_) re-requests
+            // it (LEO > lastSyncedLeo); with the interval 0 (default) it is not retried.
             ++bgFlushDeferred_;
             if (bgFlushDeferred_ == 1 || (bgFlushDeferred_ & 1023u) == 0)
                 spdlog::warn("Worker {}: background flush deferred (io back-pressure, total={})",
@@ -4362,13 +4365,20 @@ private:
     }
 
     // Group-commit sync interval (mirrors gateway's kGroupCommitIntervalNs = 10 ms).
-    static constexpr int64_t kWorkerSyncIntervalNs = 10'000'000LL; // 10 ms
+    static constexpr int64_t kWorkerSyncIntervalNs = 10'000'000LL; // 10 ms (library default)
+    int64_t syncIntervalNs_ = kWorkerSyncIntervalNs;   ///< owned-log background sync; 0 = off
+public:
+    /// Owned-log background sync interval (ns); 0 = never (durability via replication, Kafka model).
+    /// Strict-tier acks keep their own coalesced fsync.  Before start.
+    void setBackgroundSyncIntervalNs(int64_t ns) noexcept { syncIntervalNs_ = ns; }
+private:
 
     // Time-gated owned-log sync (every mode, F30): same 10 ms gate and the same
     // "unchanged log = no work" rule, but each due log is an io_ submission.
     int syncOwnedLogsAsync_(int64_t nowNs) {
+        if (syncIntervalNs_ <= 0) return 0;   // off: durability via replication (Kafka model)
         if (lastSyncNs_ == 0) { lastSyncNs_ = nowNs; return 0; }
-        if (nowNs - lastSyncNs_ < kWorkerSyncIntervalNs) return 0;
+        if (nowNs - lastSyncNs_ < syncIntervalNs_) return 0;
         lastSyncNs_ = nowNs;
         int n = 0;
         for (auto& slot : slots_) {

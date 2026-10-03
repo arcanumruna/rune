@@ -15,7 +15,7 @@
 //
 // Aeron transport rules (all sizes bytes):
 //   socketBuffer = min(16 MiB, OS max SO_RCVBUF/SO_SNDBUF)  — capped → loud WARN
-//   rcvWindow    = pow2floor(min(4 MiB, kernelRcvBuf/4, term/2)); kernelRcvBuf =
+//   rcvWindow    = pow2floor(min(4 MiB, kernelRcvBuf/4, term/4)); kernelRcvBuf =
 //                  2 × socketBuffer on Linux (the kernel doubles SO_RCVBUF), 1× else
 //                  (64 KiB datagrams: kernel truesize makes a window near the
 //                  real SO_RCVBUF drop packets — a 16 MiB window on a 16 MiB
@@ -133,16 +133,16 @@ inline constexpr int32_t kDerivedShardPortBase   = 41000;
 inline constexpr int32_t kDerivedShardPortStride = 3 * NodeConfig::kMaxShardWorkers;
 [[nodiscard]] std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t workers) noexcept;
 
-/// Worker affinity (= busy-spin, BrokerNode): the bench layout as a host-derived
+/// Worker affinity (cache locality; idle = backoff unless opted in): the bench layout as a host-derived
 /// default.  Only where every node is VISIBLE on this host — all peers loopback
 /// (a co-located cluster, the bench): node at index i of the sorted peer list gets
 /// the allowed CPUs [1 + i*W, 1 + i*W + W) of the process affinity mask (index 0
 /// is left to the client / OS / every other thread), if those W CPUs exist and are
-/// consecutive.  Linux only (affinity is a no-op elsewhere and an unpinned
-/// busy-spin is never wanted).  Non-loopback deployments return -1: containers
-/// sharing one VM look exactly like dedicated hosts, and auto-pinning them would
-/// busy-spin several nodes on one core — pin explicitly (RUNE_WORKER_CORE_BASE).
-/// Returns -1 (unpinned → backoff idle) whenever the layout does not fit.
+/// consecutive.  Linux only (affinity is a no-op elsewhere).  Non-loopback
+/// deployments return -1: containers sharing one VM look exactly like dedicated
+/// hosts, and auto-pinning them would stack several nodes on one core — pin
+/// explicitly (RUNE_WORKER_CORE_BASE).  Returns -1 (unpinned) whenever the layout
+/// does not fit.
 [[nodiscard]] int32_t deriveWorkerCoreBase(HostPlatform platform, bool allLoopback, int32_t selfIndex,
                                            int32_t nodes, int32_t workers,
                                            const std::vector<int32_t>& allowedCpus) noexcept;

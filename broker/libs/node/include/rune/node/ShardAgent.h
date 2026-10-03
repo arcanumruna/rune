@@ -1,6 +1,6 @@
 #pragma once
 // ShardAgent.h — the self-contained worker shard duty cycle (spec §3.1).  One
-// thread (pinned, busy-spin when pinned) per worker; each pass, in order:
+// thread (pinned; backoff idle unless RUNE_WORKER_IDLE=busyspin) per worker; each pass, in order:
 //   1. own embedded driver (INVOKER: conductor + sender + receiver)
 //   2. own Aeron client conductor (useConductorAgentInvoker)
 //   3-6. Worker::doWork in shard order (intake, replication, acks, io reap)

@@ -1,5 +1,6 @@
 // HostDefaultsTest.cpp — the findings §4 config as host-derived DEFAULTS
 // (HostDefaults.h).  Pure functions: every case is a plain facts → value check.
+#include <rune/node/AeronChannel.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/IoBackend.h>
 #include <rune/node/NodeConfig.h>
@@ -158,8 +159,8 @@ TEST(HostDefaults, OsDefaultSocketBufferOnMacClampsMtuToTheDefaultSndbuf) {
 
 TEST(HostDefaults, SmallTermBoundsTheWindowAndTheMtu) {
     const auto d = deriveAeronTransport(linuxFacts(true, 0, 16 * MiB, 16 * MiB), autoReq(64 * 1024));
-    EXPECT_EQ(d.rcvWindowBytes, 32 * 1024);   // term / 2
-    EXPECT_EQ(d.mtuBytes, 8192);              // window / 4
+    EXPECT_EQ(d.rcvWindowBytes, 16 * 1024);   // term / 4
+    EXPECT_EQ(d.mtuBytes, 4096);              // window / 4
     expectDriverValid(d, 16 * MiB, 16 * MiB, "64 KiB term");
 }
 
@@ -410,7 +411,7 @@ TEST(HostDefaults, DefaultConfigIsShardFusedWithTheFindingsSizes) {
     EXPECT_TRUE(c.shardMode());
     EXPECT_TRUE(c.fused());
     EXPECT_EQ(c.workerCount, 1);
-    EXPECT_EQ(c.aeronTermBufferBytes, 16 * MiB);
+    EXPECT_EQ(c.aeronTermBufferBytes, 1 * MiB) << "measured 2026-10-03 (findings §4.2/§4.8)";
     EXPECT_FALSE(c.aeronTermBufferSparse.has_value()) << "derived (non-sparse on tmpfs)";
     EXPECT_EQ(c.replicationOutboundRingBytes, 32 * MiB);
     EXPECT_EQ(c.workerIngressRingBytes, 32 * MiB);
@@ -428,7 +429,7 @@ TEST(HostDefaults, ApplyOnTheK3sBoxGivesExactlyTheTunedConfig) {
         const auto hd = applyHostDerivedDefaults(c, k3sFacts());
         EXPECT_EQ(c.aeronMtuBytes, 65504);
         EXPECT_EQ(c.aeronSocketBufferBytes, 16 * MiB);
-        EXPECT_EQ(c.aeronRcvWindowBytes, 4 * MiB);
+        EXPECT_EQ(c.aeronRcvWindowBytes, 256 * 1024) << "term/4 of the 1 MiB term (measured config)";
         EXPECT_EQ(c.workerCoreBase, 1 + self);
         EXPECT_EQ(c.aeronTermBufferSparse, false) << "tmpfs → non-sparse (findings §4)";
         EXPECT_TRUE(c.perWorkerIngressEnabled && c.perWorkerReplication && c.perWorkerEgressEnabled);
@@ -445,8 +446,50 @@ TEST(HostDefaults, ApplyOnTheK3sBoxGivesExactlyTheTunedConfig) {
         EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
         EXPECT_TRUE(hd.warnings.empty()) << hd.warnings;
         EXPECT_NE(hd.summary.find("mode=shard placement=fused workers=1"), std::string::npos) << hd.summary;
-        EXPECT_NE(hd.summary.find("mtu=65504 socketBuffer=16777216 rcvWindow=4194304"), std::string::npos) << hd.summary;
+        EXPECT_NE(hd.summary.find("mtu=65504 socketBuffer=16777216 rcvWindow=262144"), std::string::npos) << hd.summary;
     }
+}
+
+// Never busy-spin (user rule 2026-10-03; measured: no p50/p99 gain over backoff, and it pegs cores the
+// box needs): a shard worker pinned to its own core still idles with BACKOFF by default.  Busy-spin only
+// on the explicit RUNE_WORKER_IDLE=busyspin opt-in.
+TEST(HostDefaults, PinnedShardWorkersBackOffByDefaultRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    ASSERT_GE(c.workerCoreBase, 0) << "precondition: pinned";
+    EXPECT_FALSE(c.shardWorkersBusySpin()) << "a pinned shard worker must not busy-spin by default";
+    EXPECT_NE(hd.summary.find("coreBase=1(backoff)"), std::string::npos) << hd.summary;
+
+    NodeConfig spin = threeNodeDefault(0);
+    spin.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;   // explicit opt-in only
+    const auto hs = applyHostDerivedDefaults(spin, k3sFacts());
+    EXPECT_TRUE(spin.shardWorkersBusySpin());
+    EXPECT_NE(hs.summary.find("coreBase=1(busy-spin)"), std::string::npos) << hs.summary;
+}
+
+// Low-volume control publications (per-session acks, gateway egress) get their own small term: at the
+// data term (16 MiB) an ack stream filled a term every ~10 s and the rotation's term cleaning stalled the
+// worker pass 100+ ms (p99 11-31 ms -> 311-352 us with 1 MiB, findings §4.2).
+TEST(HostDefaults, ControlPublicationsUseTheirOwnSmallTermRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    EXPECT_EQ(c.aeronControlTermBufferBytes, 1024 * 1024);
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.summary.find("ctlTerm=1048576"), std::string::npos) << hd.summary;
+    EXPECT_NE(hd.summary.find("fsyncMs{worker=0 follower=0}"), std::string::npos) << hd.summary;
+    // Floor: the ack term's window (term/2) must hold a full MTU datagram — 64 KiB at MTU 65504 is raised.
+    NodeConfig small = threeNodeDefault(0);
+    small.aeronControlTermBufferBytes = 64 * 1024;
+    const auto hs = applyHostDerivedDefaults(small, k3sFacts());
+    ASSERT_EQ(small.aeronMtuBytes, 65504);
+    EXPECT_EQ(small.aeronControlTermBufferBytes, 128 * 1024);
+    EXPECT_NE(hs.warnings.find("RUNE_AERON_CONTROL_TERM_BYTES"), std::string::npos) << hs.warnings;
+    using rune::node::withTermLength;
+    EXPECT_EQ(withTermLength("aeron:udp?endpoint=127.0.0.1:40900", 1 << 20),
+              "aeron:udp?endpoint=127.0.0.1:40900|term-length=1048576");
+    EXPECT_EQ(withTermLength("aeron:udp?endpoint=h:1|term-length=65536", 1 << 20),
+              "aeron:udp?endpoint=h:1|term-length=65536") << "an explicit per-channel term wins";
+    EXPECT_EQ(withTermLength("aeron:ipc", 1 << 20), "aeron:ipc?term-length=1048576");
+    EXPECT_EQ(withTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1") << "0 = driver default";
 }
 
 TEST(HostDefaults, ApplyKeepsEveryExplicitValueAndIsIdempotent) {
@@ -560,7 +603,7 @@ TEST(HostDefaults, MacHostAppliesTheCappedBufferAndNoPinning) {
     NodeConfig c = threeNodeDefault(0);
     const auto hd = applyHostDerivedDefaults(c, macFacts(8 * MiB));
     EXPECT_EQ(c.aeronSocketBufferBytes, 8 * MiB);
-    EXPECT_EQ(c.aeronRcvWindowBytes, 2 * MiB);
+    EXPECT_EQ(c.aeronRcvWindowBytes, 256 * 1024) << "term/4 of the 1 MiB default term";
     EXPECT_EQ(c.aeronMtuBytes, 65504);
     EXPECT_EQ(c.workerCoreBase, -1);
     EXPECT_EQ(c.aeronTermBufferSparse, true) << "no tmpfs on macOS";

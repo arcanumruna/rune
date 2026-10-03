@@ -951,6 +951,25 @@ ConfigResult parseNodeConfig(
     parsePow2(getenv_fn("RUNE_IO_COMPLETION_RING_DEPTH"), cfg.ioCompletionRingDepth);
     parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);
     parsePow2(getenv_fn("RUNE_AERON_TERM_BUFFER_BYTES"),  cfg.aeronTermBufferBytes);
+    for (auto [name, field] : {std::pair{"RUNE_WORKER_SYNC_INTERVAL_MS", &cfg.workerSyncIntervalMs},
+                               std::pair{"RUNE_FOLLOWER_FLUSH_INTERVAL_MS", &cfg.followerFlushIntervalMs}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            char* end = nullptr;
+            const long long v = std::strtoll(raw, &end, 10);
+            constexpr long long kMaxMs = 30LL * 24 * 3600 * 1000;   // 30 days: ms->ns never overflows
+            if (end == raw || *end != '\0' || v < 0 || v > kMaxMs)
+                return {{}, std::string(name) + " must be an integer in [0, 2592000000] ms (0 = never), got '" +
+                                raw + "'"};
+            *field = v;
+        }
+    }
+    if (const char* raw = getenv_fn("RUNE_AERON_CONTROL_TERM_BYTES"); raw && *raw) {
+        int32_t ct = 0;
+        parsePow2(raw, ct);
+        if (ct < 64 * 1024)   // Aeron's minimum term; not a power of two -> ct stays 0
+            return {{}, std::string("RUNE_AERON_CONTROL_TERM_BYTES must be a power of two >= 65536, got '") + raw + "'"};
+        cfg.aeronControlTermBufferBytes = ct;
+    }
     // RUNE_AERON_MTU: MTU is not required to be a power of two — use parseInt32.
     // Unset → derived (HostDefaults).  An explicit value must be a valid Aeron
     // MTU (> 32-byte data header, <= 65504); 32-byte alignment / socket-buffer fit

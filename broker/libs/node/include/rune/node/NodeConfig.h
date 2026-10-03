@@ -308,8 +308,10 @@ struct NodeConfig {
     // E4: per-worker CPU affinity base core (Linux-only; macOS is a no-op).
     //
     // When >= 0, worker i pins its own AgentRunner thread to core
-    // (workerCoreBase + i) on the first doWork call (self-pin on entry).  In shard
-    // mode a pinned worker busy-spins (dedicated core); unpinned → backoff.
+    // (workerCoreBase + i) on the first doWork call (self-pin on entry).  Pinning is
+    // for cache locality only: shard workers idle with BACKOFF unless
+    // RUNE_WORKER_IDLE=busyspin (then every shard worker busy-spins, pinned or not;
+    // "yielding"/"sleeping" are treated as backoff in shard mode).
     //
     // kWorkerCoreBaseAuto (-2, DEFAULT) = derived at start (HostDefaults.h
     //   deriveWorkerCoreBase): Linux shard mode pins node i of a co-located
@@ -325,6 +327,11 @@ struct NodeConfig {
     //   Absent or empty → kWorkerCoreBaseAuto (derived).
     //   Any value < -1   → -1 (clamped to disabled).
     int32_t workerCoreBase = kWorkerCoreBaseAuto;
+    /// Do the shard workers busy-spin?  Only on the explicit RUNE_WORKER_IDLE=busyspin opt-in — never
+    /// by default, pinned or not (measured: no p50/p99 gain over backoff; it pegs cores the box needs).
+    [[nodiscard]] bool shardWorkersBusySpin() const noexcept {
+        return workerIdleStrategy == WorkerIdleStrategy::BusySpin;
+    }
 
     // E5.1: per-worker Aeron ingress stream id base.
     //
@@ -408,7 +415,20 @@ struct NodeConfig {
     //     of two in [64 KiB, 1 GiB].  Default 16 MiB (findings §4; was 4 MiB).
     //     Every publication/image maps 3 terms (48 MiB at the default, NON-sparse
     //     → really allocated on the aeron dir's filesystem): tests set smaller.
-    int32_t aeronTermBufferBytes         = 16 * 1024 * 1024;
+    // 1 MiB (measured 2026-10-03, 3-node acks=all: >= 16 MiB throughput, no 100+ ms term-rotation stalls,
+    // 16x less /dev/shm).  Max Aeron message = term/8 = 128 KiB -> the batch limit (batchLimitFormula).
+    int32_t aeronTermBufferBytes         = 1024 * 1024;
+    /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
+    /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
+    /// consumer record pushes travel there (max message = term/8 must cover the largest batch).
+    /// Power of two, >= max(64 KiB, 2 x MTU) (enforced in HostDefaults).
+    int32_t aeronControlTermBufferBytes  = 1024 * 1024;
+    /// Periodic fsync of a worker's owned logs (leader side) and of follower-applied data, in ms.
+    /// 0 = never (default; Kafka's log.flush.interval.* default): durability via replication + OS
+    /// writeback; recovery semantics in DUR-1.  The Strict tier keeps its per-write fsync.
+    /// RUNE_WORKER_SYNC_INTERVAL_MS / RUNE_FOLLOWER_FLUSH_INTERVAL_MS.
+    int64_t workerSyncIntervalMs         = 0;
+    int64_t followerFlushIntervalMs      = 0;
     //   - produce intake limit (F18): the largest produce batch the broker accepts
     //     is DERIVED, never refused at startup — produceIntakeLimit() below.  A
     //     batch above it is answered MessageTooLarge at intake (gateway + worker

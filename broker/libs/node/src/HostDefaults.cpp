@@ -91,8 +91,9 @@ AeronTransportDerived deriveAeronTransport(const HostNetFacts& f, const AeronTra
     //    term/2)) where Linux's kernel buffer is 2 x the requested SO_RCVBUF.
     if (req.rcvWindowBytes == kAeronAuto) {
         const int64_t kernelBuf = f.platform == HostPlatform::Linux ? 2 * rcvCap : rcvCap;
+        // term/4 (measured config: 256 KiB at the 1 MiB term); Aeron's own cap is term/2.
         const int64_t w = pow2Floor(std::min({static_cast<int64_t>(kMaxDerivedRcvWindowBytes), kernelBuf / 4,
-                                              term / 2, rcvCap}));
+                                              term / 4, rcvCap}));
         d.rcvWindowBytes = static_cast<int32_t>(std::max<int64_t>(w, kMinMtuBytes));
     } else {
         d.rcvWindowBytes = req.rcvWindowBytes;
@@ -229,6 +230,14 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         cfg.aeronRcvWindowBytes    = t.rcvWindowBytes;
         out.socketBufferCapped     = t.socketBufferCapped;
         if (!t.warnings.empty()) appendWarn(out.warnings, t.warnings);
+        // The ack term's receive window is term/2: it must hold at least one full MTU datagram.
+        int32_t minCtl = 64 * 1024;
+        while (minCtl < 2 * cfg.aeronMtuBytes) minCtl *= 2;
+        if (cfg.aeronControlTermBufferBytes < minCtl) {
+            appendWarn(out.warnings, "RUNE_AERON_CONTROL_TERM_BYTES=" + std::to_string(cfg.aeronControlTermBufferBytes) +
+                       " is below 2 x MTU (" + std::to_string(cfg.aeronMtuBytes) + "): raised to " + std::to_string(minCtl));
+            cfg.aeronControlTermBufferBytes = minCtl;
+        }
     }
 
     // Term sparseness (non-sparse only on tmpfs).
@@ -297,7 +306,7 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         if (portsDerived) mark("shardPorts");
     }
 
-    // Worker affinity (shard mode only: a pinned shard worker busy-spins).
+    // Worker affinity (shard mode only: pinned for cache locality; idle = backoff unless opted in).
     bool allLoopback = !cfg.peers.empty();
     for (const auto& p : cfg.peers) allLoopback = allLoopback && isLoopbackHost(p.host);
     if (cfg.workerCoreBase == NodeConfig::kWorkerCoreBaseAuto) {
@@ -313,12 +322,14 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     const std::string io(ioBackend);
     char line[768];
     std::snprintf(line, sizeof line,
-        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s term=%d sparse=%s mtu=%d socketBuffer=%d "
+        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
         "rcvWindow=%d rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
-        cfg.shardMode() ? (cfg.workerCoreBase >= 0 ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(),
-        cfg.aeronTermBufferBytes, cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,
+        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(),
+        cfg.aeronTermBufferBytes, cfg.aeronControlTermBufferBytes,
+        static_cast<long long>(cfg.workerSyncIntervalMs), static_cast<long long>(cfg.followerFlushIntervalMs),
+        cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,
         cfg.aeronSocketBufferBytes, cfg.aeronRcvWindowBytes, cfg.replicationOutboundRingBytes,
         cfg.workerIngressRingBytes, cfg.workerReturnRingBytes, cfg.workerIngressBasePort.value_or(0),
         cfg.workerReplBasePort.value_or(0), cfg.effectiveWorkerEgressControlBasePort(),

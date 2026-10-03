@@ -2264,13 +2264,13 @@ TEST(ProduceBatchLimitRegression, IntakeLimitNeverExceedsOneFrameOnAnyHop) {
 }
 
 TEST(ProduceBatchLimitRegression, DefaultThreeNodeLimitIsTheTermFrame) {
-    // Defaults (2026-10-02): 32 MiB outbound ring (4 MiB frames) and a 16 MiB
-    // term (2 MiB max message) → the term frame binds at ~2 MiB: an 8 MiB batch
-    // must NOT be accepted (appended but never replicated) — and the default
-    // config still starts (no refusal; the limit simply shrinks).
+    // Defaults (2026-10-03): 32 MiB outbound ring (4 MiB frames) and a 1 MiB term
+    // (128 KiB max message) → the term frame binds at ~128 KiB: a larger batch must
+    // NOT be accepted (appended but never replicated / never pushed to consumers) —
+    // and the default config still starts (no refusal; the limit simply shrinks).
     const NodeConfig c = parsedOrDie(base3node());
-    EXPECT_LT(c.produceIntakeLimit(), 2 * 1024 * 1024);
-    EXPECT_GT(c.produceIntakeLimit(), 2 * 1024 * 1024 - 1024);
+    EXPECT_LT(c.produceIntakeLimit(), 128 * 1024);
+    EXPECT_GT(c.produceIntakeLimit(), 128 * 1024 - 1024);
 }
 
 TEST(ProduceBatchLimitRegression, OutboundRingFrameBoundsTheLimit) {
@@ -2364,5 +2364,34 @@ TEST(NodeConfigRegression, ClientEndpointAcceptsHostPortAndFullChannelRegression
         ASSERT_TRUE(r.config.has_value()) << r.error;
         EXPECT_EQ(r.config->clientEndpoint.channel, "aeron:udp?endpoint=127.0.0.1:50001") << raw;
         EXPECT_EQ(r.config->clientBindHost(), "127.0.0.1") << raw;
+    }
+}
+
+TEST(NodeConfig, ControlTermBytesEnvIsAPowerOfTwoAtLeast64KiB) {
+    auto env = rune::node::base1node();
+    EXPECT_EQ(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config->aeronControlTermBufferBytes, 1 << 20);
+    env["RUNE_AERON_CONTROL_TERM_BYTES"] = "262144";
+    EXPECT_EQ(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config->aeronControlTermBufferBytes, 262144);
+    for (const char* bad : {"300000", "32768", "abc"}) {   // not pow2 / below Aeron's 64 KiB minimum / garbage
+        env["RUNE_AERON_CONTROL_TERM_BYTES"] = bad;
+        EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value()) << "refused: " << bad;
+    }
+}
+
+TEST(NodeConfig, FsyncIntervalsDefaultOffAndParseRegression) {
+    auto env = rune::node::base1node();
+    auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->workerSyncIntervalMs, 0) << "no periodic leader fsync by default (Kafka model)";
+    EXPECT_EQ(r.config->followerFlushIntervalMs, 0) << "no periodic follower fsync by default";
+    env["RUNE_WORKER_SYNC_INTERVAL_MS"] = "10";
+    env["RUNE_FOLLOWER_FLUSH_INTERVAL_MS"] = "20";
+    r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->workerSyncIntervalMs, 10);
+    EXPECT_EQ(r.config->followerFlushIntervalMs, 20);
+    for (const char* bad : {"-1", "2592000001", "10ms"}) {   // negative / > 30 days (ms->ns overflow guard) / garbage
+        env["RUNE_WORKER_SYNC_INTERVAL_MS"] = bad;
+        EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value()) << "refused: " << bad;
     }
 }

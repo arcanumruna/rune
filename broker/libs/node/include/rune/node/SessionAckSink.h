@@ -45,6 +45,7 @@
 // Zero allocation per pass: fixed arrays, open addressing (backward-shift
 // delete), no node containers.  std::string only inside the policy's add()
 // (announcement, cold path).  Owner: the worker thread only.
+#include <rune/node/AeronChannel.h>
 #include <rune/protocol/client/DataMessages.h>
 
 #include <Aeron.h>
@@ -473,9 +474,10 @@ private:
 struct AeronSessionPubPolicy {
     using PubHandle = std::shared_ptr<aeron::ExclusivePublication>;
     aeron::Aeron* client = nullptr;
+    int32_t controlTermBytes = 0;   ///< per-publication term for the ack stream (0 = driver default)
 
     int64_t add(std::string_view channel, int32_t streamId) noexcept {
-        try { return client->addExclusivePublication(std::string(channel), streamId); }
+        try { return client->addExclusivePublication(rune::node::withTermLength(channel, controlTermBytes), streamId); }
         catch (...) { return -1; }
     }
     PubFind find(int64_t regId, PubHandle& out) noexcept {

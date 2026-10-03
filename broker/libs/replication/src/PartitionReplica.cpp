@@ -1862,9 +1862,10 @@ int PartitionReplica::doWork(int64_t nowNs)
     // not per record — acks=all crash-durability comes from ISR replication).
     // Disk-backed only (memory-backed sync() is a no-op).  Bounded flush lag =
     // kFollowerFlushIntervalNs.
-    static constexpr int64_t kFollowerFlushIntervalNs = 20'000'000LL; // 20 ms
-    if (followerApplyDirty_ && !memoryBacked_
-        && nowNs - lastFollowerSyncNs_ >= kFollowerFlushIntervalNs) {
+    // cfg_.followerFlushIntervalNs (default 20 ms; the broker passes its NodeConfig value, OFF by
+    // default — durability via replication, Kafka model).  0 = never.
+    if (followerApplyDirty_ && !memoryBacked_ && cfg_.followerFlushIntervalNs > 0
+        && nowNs - lastFollowerSyncNs_ >= cfg_.followerFlushIntervalNs) {
         followerApplyDirty_ = false;
         lastFollowerSyncNs_ = nowNs;
         if (externalFollowerFlush_) {

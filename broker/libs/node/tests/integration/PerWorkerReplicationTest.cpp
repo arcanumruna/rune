@@ -1332,6 +1332,9 @@ TEST(LargeBatchReplicationRegression, MultiBatchPushAboveFollowerFrameNeverWedge
     for (auto& c : cfgs) {
         c.perWorkerReplication   = false;
         c.workerIngressRingBytes = 4 * 1024 * 1024;           // the reviewer's config
+        // ~262 KiB batches exist only with a large term (the 1 MiB default caps a batch at
+        // term/8 = 128 KiB at intake): this scenario is defined on the 16 MiB term.
+        c.aeronTermBufferBytes   = 16 * 1024 * 1024;
     }
     std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);
