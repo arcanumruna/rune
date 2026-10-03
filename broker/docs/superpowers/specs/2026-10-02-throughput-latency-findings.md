@@ -268,6 +268,13 @@ per hop × ~4 hops).
   (e) worker fsync interval as config (RUNE_WORKER_SYNC_INTERVAL_MS; final semantics owned by DUR-1);
   (f) io_uring io-wq affinity (IORING_REGISTER_IOWQ_AFF, RUNE_IOWQ_CORES) keeping io-wq off worker cores;
   (g) backoff vs busy-spin worker idle (RUNE_SHARD_BACKOFF; no measured latency difference -> backoff frees cores).
+  (k) follower fsync off by default: the follower's hard-coded 20 ms coalesced flush (kFollowerFlushIntervalNs,
+      PartitionReplica.cpp) becomes configurable and OFF by default, same as the leader worker sync (e) — durability
+      via replication (Kafka model); final semantics owned by DUR-1.  QD knob on the VM build: RUNE_FOLLOWER_FLUSH_MS.
+      (20k acks=all A/B with it effectively off: p50 14.2 -> 13.3 ms — not the main cost, but drop it.)
+  (l) REMOVE duty1 (driver duty cap per pass = 1, item d): it starves the in-pass Aeron driver on the 3-node
+      replication path.  20k acks=all, fsync off: p50 688 us without it vs 24.2 ms with it (p99 9.6 vs 45 ms).
+      It only helped single-node (client acks only).  Do not productionize (d); keep the uncapped duty loop.
   Client CRC/encode waste (2026-10-03 saturation profile, 3-node acks=all: crc32c_hw = 28% of client CPU; uprobes
   counted 35,897 buildAppend calls CRC-ing 1.52 GB in 2 s vs ~116 MB/s produced = ~6.6 builds per sent frame):
   (h) no rebuild on back-pressure: probe the publication (position < publication limit, the exact Aeron refusal
