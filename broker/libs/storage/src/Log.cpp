@@ -1,3 +1,4 @@
+#include <rune/storage/Timestamps.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune_fr/FlightRecorder.h>
@@ -496,7 +497,7 @@ int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // so this batch's maxTimestamp is attributed to the segment it was written to.
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
         rune::protocol::RecordBatchReader r(data, len);
-        int64_t batchMaxTs = r.maxTimestamp();
+        int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
         if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
     }
     return logEndOffset_;
@@ -516,7 +517,7 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
     logEndOffset_ = activeSegment().appendNoSync(data, len, lastOffset);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
         rune::protocol::RecordBatchReader r(data, len);
-        int64_t batchMaxTs = r.maxTimestamp();
+        int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
         if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
     }
     return logEndOffset_;
@@ -537,7 +538,7 @@ int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
     logEndOffset_ = activeSegment().appendNoSyncRestamp(batch, len, base, lastOffset);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
         rune::protocol::RecordBatchReader r(batch, len);
-        int64_t batchMaxTs = r.maxTimestamp();
+        int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
         if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
     }
     return logEndOffset_;
@@ -608,7 +609,7 @@ int64_t Log::recover() {
                 int32_t total = r.totalLength();
                 if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
                 if (!r.ensureValid()) break;
-                int64_t batchMaxTs = r.maxTimestamp();
+                int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
                 if (batchMaxTs > segMaxTs) segMaxTs = batchMaxTs;
                 pos += static_cast<std::size_t>(total);
             }
@@ -690,6 +691,12 @@ void Log::unpinSegmentFlush(LogSegment* seg) noexcept {
 int64_t Log::nextSegmentBaseAfter(int64_t offset) const noexcept {
     const auto it = segments_.upper_bound(offset);
     return it == segments_.end() ? -1 : it->first;
+}
+int64_t Log::segmentNextOffsetAt(int64_t offset) const noexcept {
+    auto it = segments_.upper_bound(offset);
+    if (it == segments_.begin()) return -1;
+    --it;
+    return it->second->nextOffset();
 }
 Log::SegmentBytes Log::segmentBytesAt(int64_t segmentBase) {
     const auto it = segments_.find(segmentBase);

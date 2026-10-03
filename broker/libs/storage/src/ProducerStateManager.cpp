@@ -523,6 +523,9 @@ namespace {
 // is held by a batch.
 int64_t nextBaseAfter(Log& log, int64_t offset) noexcept { return log.nextSegmentBaseAfter(offset); }
 int64_t nextBaseAfter(InMemoryLog&, int64_t) noexcept { return -1; }
+// One past the last written offset of the segment holding `offset` (-1 = unknown / no segment).
+int64_t segmentEndAt(Log& log, int64_t offset) noexcept { return log.segmentNextOffsetAt(offset); }
+int64_t segmentEndAt(InMemoryLog&, int64_t) noexcept { return -1; }
 // Per-step budget of the synchronous rebuildFromLog loop.
 constexpr std::size_t kSyncStepBytes = 4u * 1024u * 1024u;
 } // namespace
@@ -569,6 +572,9 @@ ProducerStateManager::rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes
         const LogReadView v = log.readView(r.next, static_cast<int32_t>(
             std::min<std::size_t>(room, static_cast<std::size_t>(std::numeric_limits<int32_t>::max()))));
         if (v.empty()) {
+            // Re-review C1: an empty view BELOW the segment's written end means bytes exist that
+            // cannot be read (corrupt length, failed mapping) — never a gap: fail the proof.
+            if (const int64_t segEnd = segmentEndAt(log, r.next); segEnd > r.next) return S::Failed;
             // CP-4: a compaction gap (a sealed segment's superseded tail) — or
             // the end of the data.  Skip to the next segment base.
             const int64_t nb = nextBaseAfter(log, r.next);

@@ -331,6 +331,52 @@ TEST(RetentionCleanerAgent, TimeRetentionDeletesOldSegments) {
     fs::remove_all(dir);
 }
 
+// Regression (found in the F20 re-review): rune-client-cpp stamps record timestamps in epoch
+// NANOSECONDS; the time predicate compared them with epoch-ms "now", so (now - largestTs) was hugely
+// negative and time retention NEVER deleted a real client's segments.  Timestamps are normalised to
+// epoch ms (rune::storage::toEpochMs) before the age test.  No sleeps: deletion = the .log is renamed
+// to .deleted by the retention cycle itself.
+TEST(RetentionCleanerAgent, TimeRetentionWithNanosecondTimestampsRegression) {
+    auto dir = cp9TempDir("cp9_time_retention_ns");
+    Log log(dir.string(), /*rollBytes=*/128);
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    constexpr int64_t kDayMs = 24LL * 3600 * 1000;
+    const int64_t oldNs = (nowMs - 2 * kDayMs) * 1'000'000LL;   // 2 days old, epoch NANOSECONDS
+    const int64_t newNs = nowMs * 1'000'000LL;
+    int64_t off = 0;
+    for (int i = 0; i < 20; ++i) off = log.append(cp9Batch(off, "k" + std::to_string(i), "old_v", oldNs), off);
+    {
+        RecordBatchBuilder fb(off, oldNs);
+        fb.append("fill", std::string(200, 'x'), oldNs);
+        off = log.append(fb.build(), off);
+    }
+    for (int i = 0; i < 10; ++i) off = log.append(cp9Batch(off, "r" + std::to_string(i), "new_v", newNs), off);
+    const int segsTotal = countLogSegments(dir);
+    ASSERT_GE(segsTotal, 3);
+
+    Cp9NullTransport transport;
+    auto cfg = makeDeleteConfig(903, /*retentionMs=*/kDayMs, /*retentionBytes=*/-1,
+                                /*retentionCheckMs=*/1, /*fileDeleteDelayMs=*/60'000);
+    auto rep = std::make_unique<PartitionReplica>(cfg, Role::Leader, 1, std::vector<NodeId>{1},
+                                                  std::vector<NodeId>{1}, &log, &transport);
+    rep->becomeLeader(1, {1});
+    rep->onLeaderLogAppended();
+    rune::node::ReplicaRegistry reg;
+    reg.add(903, 0, std::move(rep));
+    rune::node::LogCleanerAgent cleaner(&reg);
+    Cp9MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &reg, nullptr);
+    for (int i = 0; i < 20; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        duty.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+    EXPECT_LT(countLogSegments(dir), segsTotal) << "2-day-old ns-stamped segments must be retired by 1-day retention";
+    EXPECT_GT(countDeletedFiles(dir), 0);
+    EXPECT_GE(countLogSegments(dir), 1) << "recent segments (and the active one) stay";
+    fs::remove_all(dir);
+}
+
 // ===========================================================================
 // TEST 2: SizeRetentionDeletesOldestFirst
 //

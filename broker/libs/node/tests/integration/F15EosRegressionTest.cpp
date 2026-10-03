@@ -5040,6 +5040,26 @@ TEST(PsmLogConsistencyRegression, CompactionExpiresProducerTailsLikeKafka) {
     EXPECT_FALSE(p7) << "an expired producer's superseded last batch was retained";
 }
 
+// Re-review of 700d86d (I1): rune-client stamps batch timestamps in NANOSECONDS and the broker never
+// restamps them, while the cleaner's "now" and the expiry are epoch MILLISECONDS — so a real client's
+// producer tail never expired (memory bounded only by the producer-count cap).  Expiry must hold for
+// both units.
+TEST(PsmLogConsistencyRegression, ProducerTailsExpireWithNanosecondClientTimestamps) {
+    constexpr int64_t kDayMs = 24LL * 3600 * 1000;
+    constexpr int64_t kNowMs = 1'790'000'000'000LL;                 // ~2026, epoch ms
+    constexpr int64_t kExpMs = 7 * kDayMs;
+    const int64_t oldNs   = (kNowMs - 8 * kDayMs) * 1'000'000LL;     // 8 days ago, epoch NANOSECONDS
+    const int64_t freshNs = (kNowMs - 1 * kDayMs) * 1'000'000LL;     // 1 day ago
+    rune::storage::ProducerTails t(rune::storage::ProducerTails::kUnbounded);
+    t.note(7, 10, oldNs);
+    t.note(8, 20, freshNs);
+    EXPECT_FALSE(t.mustRetain(7, 10, oldNs, kNowMs, kExpMs)) << "an 8-day-old ns tail must expire (7-day expiry)";
+    EXPECT_TRUE(t.mustRetain(8, 20, freshNs, kNowMs, kExpMs)) << "a 1-day-old ns tail is kept";
+    // Millisecond producers keep working.
+    EXPECT_FALSE(t.mustRetain(7, 10, kNowMs - 8 * kDayMs, kNowMs, kExpMs));
+    EXPECT_TRUE(t.mustRetain(8, 20, kNowMs - 1 * kDayMs, kNowMs, kExpMs));
+}
+
 TEST(PsmLogConsistencyRegression, ProducerTailsAreBoundedByTheCleanerBudget) {
     // I1 (bound): the tails map lives inside the dedupe budget; past its cap it
     // never grows — unrecorded producers keep their metadata conservatively

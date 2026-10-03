@@ -1,4 +1,5 @@
 #pragma once
+#include <rune/storage/Timestamps.h>
 // ---------------------------------------------------------------------------
 // ProducerTails — the last data batch of every idempotent producer in the
 // range a cleaner pass scanned (Kafka LogCleaner parity:
@@ -66,7 +67,7 @@ public:
     /// `maxTimestampMs`) keep its producer metadata?
     [[nodiscard]] bool mustRetain(int64_t producerId, int64_t lastOffset, int64_t maxTimestampMs,
                                   int64_t nowMs, int64_t expirationMs) const noexcept {
-        if (nowMs >= 0 && expirationMs >= 0 && maxTimestampMs < nowMs - expirationMs) return false;   // expired
+        if (nowMs >= 0 && expirationMs >= 0 && toEpochMs(maxTimestampMs) < nowMs - expirationMs) return false;   // expired (ns or ms stamps)
         const auto it = tails_.find(producerId);
         if (it != tails_.end()) return it->second.lastOffset == lastOffset;
         return overflowed_;   // unrecorded (map full): keep it, conservatively

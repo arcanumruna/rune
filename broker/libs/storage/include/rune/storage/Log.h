@@ -177,6 +177,8 @@ public:
     /// owner (append) thread only.  The read_committed build skips an empty
     /// view (a gap below its target) with it.
     [[nodiscard]] int64_t nextSegmentBaseAfter(int64_t offset) const noexcept;
+    /// One past the last written offset of the segment containing `offset` (-1 if none).
+    [[nodiscard]] int64_t segmentNextOffsetAt(int64_t offset) const noexcept;
     /// F15 S4 fix round 1: the segment whose base is exactly `segmentBase` —
     /// its written bytes as an untouched read-only mapping (see
     /// LogSegment::mappedBytes), its .log fd (async read-ahead hints), and its
