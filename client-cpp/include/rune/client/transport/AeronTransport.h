@@ -322,8 +322,11 @@ public:
     /// deterministic, no atomic.  Read on the owner thread.
     [[nodiscard]] int callerPumpViolations() const noexcept { return callerPumpViolations_; }
 
-    /// The embedded driver runs the rune_gso UDP GSO/GRO bindings (stays true after stop()).
-    [[nodiscard]] bool udpGsoActive() const noexcept { return gsoWasActive_; }
+    /// UDP GSO send / GRO receive installed in the embedded driver (stays reportable after stop()).
+    [[nodiscard]] bool udpGsoActive() const noexcept { return (gsoActiveMask_ & 1) != 0; }
+    [[nodiscard]] bool udpGroActive() const noexcept { return (gsoActiveMask_ & 2) != 0; }
+    /// network_publication_max_messages_per_send the embedded driver started with (0 before start()).
+    [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
     /// GSO/GRO totals of every transport the driver closed; complete after stop().
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
     /// TEST SEAM — call before start(): the driver's next `count` GSO sendmsg calls fail with errno `err`.
@@ -365,7 +368,8 @@ private:
     aeron_driver_t*         driver_        = nullptr;
     rune_gso_bindings_t*    gso_           = nullptr;   // owned; outlives driverCtx_ (Aeron points at it)
     rune_gso_totals_t       gsoTotals_{};
-    bool                    gsoWasActive_  = false;
+    int                     gsoActiveMask_ = 0;      // rune_gso_bindings_active(): 1 = GSO, 2 = GRO
+    uint32_t                maxMessagesPerSend_ = 0;
     int                     gsoInjectErr_   = 0;      // test seam (injectGsoSendErrorsForTest)
     int                     gsoInjectCount_ = 0;
     void releaseGso_() noexcept;   // after aeron_driver_context_close

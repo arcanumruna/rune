@@ -15,6 +15,7 @@
 //   - FragmentAssembler wraps all poll calls for multi-frame reassembly.
 
 #include <rune/client/transport/AeronTransport.h>
+#include "rune/protocol/net/rune_udp_gso.h"
 
 #include <cassert>
 #include <chrono>
@@ -564,12 +565,13 @@ void AeronTransport::startEmbeddedDriver() {
             rune_gso_bindings_delete(gso_);
             gso_ = nullptr;
         }
-        gsoWasActive_ = gso_ != nullptr;
+        gsoActiveMask_ = rune_gso_bindings_active(gso_);
     }
     if (cfg_.maxMessagesPerSend > 0)
         aeron_driver_context_set_network_publication_max_messages_per_send(driverCtx_, cfg_.maxMessagesPerSend);
-    else if (gso_ != nullptr)
-        aeron_driver_context_set_network_publication_max_messages_per_send(driverCtx_, 16U);   // GSO groups <= 16
+    else if (const unsigned m = rune_gso_msgs_per_send(udpGsoActive(), cfg_.mtuLength); m > 0)
+        aeron_driver_context_set_network_publication_max_messages_per_send(driverCtx_, m);   // GSO groups <= 16
+    maxMessagesPerSend_ = aeron_driver_context_get_network_publication_max_messages_per_send(driverCtx_);
     // Aeron requires timer_interval < client_liveness < publication_unblock
     // (aeron_driver_context.c:1322-1344).  validate() bounds liveness to
     // [kMinClientLivenessTimeoutNs, kMaxClientLivenessTimeoutNs]; derive the two

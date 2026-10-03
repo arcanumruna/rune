@@ -94,12 +94,15 @@ TEST(AeronTransportGso, UdpEchoUsesGsoSendAndGroReceiveByDefault) {
     Transport t{udpLoopbackConfig("on", 2101)};
     t.start();
     EXPECT_TRUE(t.udpGsoActive());
+    EXPECT_TRUE(t.udpGroActive());
+    EXPECT_EQ(t.maxMessagesPerSend(), 16u) << "MTU 1408: GSO groups up to 16 datagrams";
     echoMixed(t, 140);
     t.stop();
     const auto tot = t.gsoTotals();
     EXPECT_GT(tot.gso_sends, 0u) << "the GSO send path never ran";
     EXPECT_GT(tot.gso_datagrams, tot.gso_sends) << "GSO sends must carry > 1 datagram each";
     EXPECT_GT(tot.gro_datagrams, 0u) << "the GRO split never ran";
+    EXPECT_EQ(tot.gro_transports, 1u) << "GRO only on the receive socket, never the publication's control socket";
     EXPECT_EQ(tot.gso_fallbacks, 0u);
     EXPECT_EQ(tot.gro_ctrunc_drops, 0u);
     EXPECT_TRUE(t.udpGsoActive()) << "stays reportable after stop";
@@ -139,4 +142,15 @@ TEST(AeronTransportGso, UnsupportedGsoFallsBackToSendmmsgWithoutLoss) {
     echoMixed(t, 70);
     t.stop();
     EXPECT_GE(t.gsoTotals().gso_fallbacks, 1u);
+}
+
+// Fix round 1 (review M2): at a 64 KiB MTU two datagrams never fit one GSO send — keep Aeron's 2 msgs/send.
+TEST(AeronTransportGso, JumboMtuKeepsAeronDefaultMsgsPerSendRegression) {
+    auto cfg = udpLoopbackConfig("64k", 2105);
+    cfg.mtuLength = 65504;
+    Transport t{cfg};
+    t.start();
+    EXPECT_TRUE(t.udpGsoActive());
+    EXPECT_EQ(t.maxMessagesPerSend(), 2u);
+    t.stop();
 }

@@ -25,7 +25,6 @@
 #include <rune/client/shard/ClientShard.h>
 #include <rune/client/transport/TransportConfig.h>
 #include <rune/protocol/client/Protocol.h>
-#include <rune/protocol/net/rune_gso_bindings.h>
 
 #include <algorithm>
 #include <chrono>
@@ -68,6 +67,8 @@ struct ShardResult {
     double      cpuSeconds = -1.0;
     bool        ok = true;
     std::string error;
+    int         udpMask = -1;            // installed GSO(1)/GRO(2) of this shard's driver (-1 = never started)
+    uint64_t    gsoFallbacks = 0, groDisabled = 0;   // runtime fallbacks, read after the driver closed
 };
 
 // Start barrier with no atomics (F8 law: cross-thread state only through rings):
@@ -127,6 +128,7 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
         // F8c: Invoker owner — connectAndWait pumps this shard's doWork() itself
         // and throws on any non-Ok outcome or after 10 s.
         shard.connectAndWait(std::chrono::seconds(10));
+        out.udpMask = (shard.client().testTransport().udpGsoActive() ? 1 : 0) | (shard.client().testTransport().udpGroActive() ? 2 : 0);
         const rc::TopicHandle topic = shard.topic(topicName);
         if (!topic.valid()) throw std::runtime_error("unknown topic " + topicName);
 
@@ -234,6 +236,9 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
         } catch (const std::exception&) {
             // The measurement is complete; the destructor tears down whatever is left.
         }
+        const auto gt = shard.client().testTransport().gsoTotals();   // complete once the driver closed (else zeros)
+        out.gsoFallbacks = gt.gso_fallbacks;
+        out.groDisabled  = gt.gro_disabled;
     } catch (const std::exception& e) {
         out.ok    = false;
         out.error = e.what();
@@ -347,8 +352,13 @@ int invokerBenchMain(int argc, char** argv) {
     uint64_t sent = 0, acked = 0, inWindow = 0, errors = 0;
     int64_t  lastAck = origin;
     bool     ok = true;
+    int      udpMask = 3;                    // AND over shards: "on" only when every shard's driver ran it
+    uint64_t gsoFallbacks = 0, groDisabled = 0;
     for (uint32_t i = 0; i < a.shards; ++i) {
         const ShardResult& r = results[i];
+        udpMask &= r.udpMask < 0 ? 0 : r.udpMask;
+        gsoFallbacks += r.gsoFallbacks;
+        groDisabled += r.groDisabled;
         all.merge(r.hist);
         sent += r.sent;
         acked += r.acked;
@@ -382,7 +392,7 @@ int invokerBenchMain(int argc, char** argv) {
     std::printf("RESULT mode=%s shards=%u core=%d rate=%llu duration_s=%lld warmup_s=%lld window=%lld records=%llu "
                 "value=%d acks=%s max_in_flight=%d linger_us=%lld batch_bytes=%d max_frame=%d mtu=%zu "
                 "sent=%llu acked=%llu errors=%llu measured=%llu achieved_rps=%.0f "
-                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s%s\n",
+                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s gro=%s gso_fallbacks=%llu gro_disabled=%llu%s\n",
                 a.mode == BenchArgs::Mode::Open ? "open" : "saturate", a.shards, a.core,
                 static_cast<unsigned long long>(a.rate), static_cast<long long>(a.durationS),
                 static_cast<long long>(a.warmupS), static_cast<long long>(a.window),
@@ -391,7 +401,9 @@ int invokerBenchMain(int argc, char** argv) {
                 static_cast<unsigned long long>(sent), static_cast<unsigned long long>(acked),
                 static_cast<unsigned long long>(errors), static_cast<unsigned long long>(all.count()), achieved,
                 us(all.valueAtQuantile(0.50)), p99us, us(all.valueAtQuantile(0.999)), us(all.max()),
-                (tc.udpGso && rune_gso_platform_supported() == 3) ? "on" : "off", ok ? "" : " run_error=1");
+                (udpMask & 1) ? "on" : "off", (udpMask & 2) ? "on" : "off",   // INSTALLED, not config+probe
+                static_cast<unsigned long long>(gsoFallbacks), static_cast<unsigned long long>(groDisabled),
+                ok ? "" : " run_error=1");
     std::fflush(stdout);
     if (!ok || errors != 0) return 1;
     if (a.gateP99Us > 0 || a.gateRps > 0) {
