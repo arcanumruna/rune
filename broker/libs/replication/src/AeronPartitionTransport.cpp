@@ -54,14 +54,13 @@ AeronPartitionTransport::AeronPartitionTransport(
 {
     // Register ingress subscription.  One bounded synchronous wait at
     // construction — never called on the duty-cycle hot path.
-    static constexpr int kResolveMaxMs = 5000;
 
     int64_t regId = aeron_->addSubscription(ingressChannel, ingressStreamId);
     sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); },
                         rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
     if (!sub_) {
         throw std::runtime_error(
-            "AeronPartitionTransport: ingress subscription not resolved within 5 s");
+            "AeronPartitionTransport: ingress subscription not resolved (driver refused the pump)");
     }
 }
 

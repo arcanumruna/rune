@@ -57,7 +57,6 @@ namespace pc = rune::protocol::client;
 // via pendingConnects_ — the blocking resolvePublication() was deleted (Task 11:
 // a duty-cycle sleep-poll would stall worker 0's loop under fused placement).
 // ---------------------------------------------------------------------------
-static constexpr int kResolveMaxMs = 5000; // 5 s
 
 // ---------------------------------------------------------------------------
 // ClientGateway constructor
@@ -1087,7 +1086,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         //
         // DR-BUG-2 (redirect-reconnect storm) ROOT CAUSE + FIX:
         //   Previously this path called the BLOCKING resolvePublication(), which
-        //   sleeps up to kResolveMaxMs (5 s) in 1 ms slices ON THE GATEWAY
+        //   sleeps up to the then 5 s resolve cap in 1 ms slices ON THE GATEWAY
         //   DUTY-CYCLE THREAD.  When N clients hit a follower at once (the DR-3
         //   reconnect storm), each ConnectRequest was dispatched serially inside a
         //   single sub_->poll() and each blocked in resolvePublication before the

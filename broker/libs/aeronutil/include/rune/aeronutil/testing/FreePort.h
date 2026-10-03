@@ -13,6 +13,8 @@
 #include <unistd.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 namespace rune::aeronutil::testing {
 
@@ -35,7 +37,8 @@ inline uint16_t allocFreeUdpPort() {
         const auto p = static_cast<uint16_t>(kBase + (next++ % kSpan));
         if (udpPortBindable(p)) return p;
     }
-    return 0;
+    std::fprintf(stderr, "allocFreeUdpPort: no bindable port in 20000..31999\n");   // never hand Aeron port 0
+    std::abort();
 }
 
 } // namespace rune::aeronutil::testing

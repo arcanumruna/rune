@@ -19,7 +19,7 @@
 //
 // ## Design (mirrors WorkerIngress)
 //   - Resolves the publication via a bounded addExclusivePublication +
-//     findExclusivePublication resolve via AeronPump (kResolveMaxMs=5000; 1 ms
+//     findExclusivePublication resolve via AeronPump (until Aeron answers — AeronPump::kUntilAnswered, bounded by Aeron's driverTimeoutMs; 1 ms
 //     sleep with the default pump, invoker pumping otherwise),
 //     the same pattern used across the gateway/ingress.
 //   - Non-throwing construction; check resolved() after construction.
@@ -143,7 +143,6 @@ public:
     }
 
 private:
-    static constexpr int kResolveMaxMs   = 5000;
 
     std::shared_ptr<aeron::Aeron>                aeron_;
     std::string                                  controlEndpoint_;

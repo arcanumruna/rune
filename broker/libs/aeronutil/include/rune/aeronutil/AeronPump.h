@@ -42,10 +42,11 @@ public:
     }
 
     /// "No deadline of our own": resolve until Aeron ANSWERS — find yields, a registration error is
-    /// reported (find throws / sets `failed`), or the driver refuses the pump.  A dead driver is
-    /// still bounded: Aeron's client throws DriverTimeoutException from find* after the driver
-    /// timeout.  Production startup resolves use this (time-independent convergence — a tuned 5 s
-    /// cap made a loaded node refuse to start, D8 2026-10-03).
+    /// reported (find throws / sets `failed`), or the driver refuses the pump.  The bound is Aeron's:
+    /// ClientConductor::find* throws DriverTimeoutException once a registration is older than the
+    /// client's driverTimeoutMs (default 10 s, wall clock), in threaded AND invoker modes.  Production
+    /// startup resolves use this instead of Rune's own tighter 5 s cap, which made a loaded node refuse
+    /// to start (D8 2026-10-03).  Pass exactly kUntilAnswered (any other huge budget overflows).
     static constexpr std::chrono::milliseconds kUntilAnswered = std::chrono::milliseconds::max();
 
     /// Probe `find` until it yields a truthy value, `budget` elapses (never, for kUntilAnswered),

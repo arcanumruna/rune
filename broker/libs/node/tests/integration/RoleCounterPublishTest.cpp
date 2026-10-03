@@ -13,6 +13,7 @@
 // (BrokerNode) and the read path (CncFileReader) that the dr-e2e harness relies
 // on via `docker exec rune_role`.
 // ---------------------------------------------------------------------------
+#include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
@@ -54,9 +55,9 @@ NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     PeerConfig self;
     self.id            = 0;
     self.host          = "127.0.0.1";
-    self.consensusPort = 40911;  // distinct from other tests
+    self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();   // D8: never a fixed port
     cfg.peers          = {self};
-    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50901";
+    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     cfg.clientEndpoint.streamId = 1;
     cfg.workerCount = rune::node::test::workerCountFromEnv();
     return cfg;

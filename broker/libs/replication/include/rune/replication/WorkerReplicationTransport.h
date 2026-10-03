@@ -115,13 +115,12 @@ namespace rune::replication {
 // FollowerSlots::kMaxReplicas peers; a linear scan beats unordered_map::find on
 // every send (spec §3.5a.2 fix on sight).
 // Resolves publications via bounded addExclusivePublication + findExclusive-
-// Publication resolve via AeronPump (kResolveMaxMs=5000; 1 ms sleep with the
+// Publication resolve via AeronPump (until Aeron answers — AeronPump::kUntilAnswered, bounded by Aeron's driverTimeoutMs; 1 ms sleep with the
 // default pump, invoker pumping otherwise), same as
 // WorkerEgress.  Single-owner / single-thread.
 // ===========================================================================
 class AeronPubRegistry {
 public:
-    static constexpr int kResolveMaxMs   = 5000;
 
     // -----------------------------------------------------------------------
     // Construction: for each (peerId, peerChannel) pair, register an

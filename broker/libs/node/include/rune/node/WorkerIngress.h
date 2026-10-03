@@ -8,7 +8,7 @@
 // ## Design
 //   - Subscribes to (channel, streamId) via a bounded resolve loop that mirrors
 //     ClientGateway.cpp:85-99 exactly: addSubscription + findSubscription loop,
-//     kResolveMaxMs=5000 ms; via AeronPump (1 ms sleep with the default pump,
+//     until Aeron answers (AeronPump::kUntilAnswered, bounded by Aeron's driverTimeoutMs); via AeronPump (1 ms sleep with the default pump,
 //     invoker pumping of the shard's own driver + conductor otherwise, §3.6).
 //   - Reassembles multi-fragment messages (produces can exceed a single Aeron
 //     MTU) with rune::aeronutil::FragmentAssembler — same as the gateway;
@@ -179,7 +179,6 @@ public:
 
 private:
     // Mirror the exact constants from ClientGateway.cpp:49-50.
-    static constexpr int kResolveMaxMs   = 5000;  // 5 s
 
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::string                            channel_;

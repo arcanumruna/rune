@@ -785,7 +785,7 @@ void BrokerNode::buildReplication() {
                         throw std::runtime_error(
                             "BrokerNode[" + std::to_string(config_.nodeId) +
                             "]: per-worker replication transport for worker " +
-                            std::to_string(w) + " did not resolve within 5s "
+                            std::to_string(w) + " did not resolve (Aeron registration error or driver timeout) "
                             "(stream=" + std::to_string(streamId) + ") — "
                             "refusing to start with a half-wired plane");
                     }
@@ -1324,7 +1324,7 @@ void BrokerNode::buildWorkerPool() {
                 auto ing = std::make_unique<WorkerIngress>(aeron_, channel, streamId);
                 if (!ing->resolved()) {
                     spdlog::warn("BrokerNode[{}]: WorkerIngress for worker {} on stream {} "
-                                 "did not resolve within 5s — per-worker ingress disabled for this worker",
+                                 "did not resolve (Aeron registration error or driver timeout) — per-worker ingress disabled for this worker",
                                  config_.nodeId, i, streamId);
                 } else {
                     spdlog::info("BrokerNode[{}]: WorkerIngress for worker {} wired on stream {} (channel={})",
@@ -1386,7 +1386,7 @@ void BrokerNode::buildWorkerPool() {
                 auto eg = std::make_unique<WorkerEgress>(aeron_, control, egStream);
                 if (!eg->resolved()) {
                     spdlog::warn("BrokerNode[{}]: WorkerEgress for worker {} on stream {} "
-                                 "control {} did not resolve within 5s — per-worker egress "
+                                 "control {} did not resolve (Aeron registration error or driver timeout) — per-worker egress "
                                  "disabled for this worker",
                                  config_.nodeId, i, egStream, control);
                 } else {

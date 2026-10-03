@@ -49,7 +49,7 @@ public:
     {
         int64_t regId = aeron_->addSubscription(channel, streamId);
 
-        // Up to 5 s.  Spec §3.6: an invoker driver/conductor (fused runtime) is
+        // Until Aeron answers (bounded by Aeron's driverTimeoutMs, default 10 s).  Spec §3.6: an invoker driver/conductor (fused runtime) is
         // pumped by this thread between probes; the default pump sleeps 1 ms.
         sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
         if (!sub_) {

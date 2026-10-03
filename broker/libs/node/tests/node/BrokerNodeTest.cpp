@@ -13,6 +13,7 @@
 // All waits are bounded with hard deadlines + ASSERT.
 // Unique temp paths use getpid() + atomic counter.
 
+#include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/HostDefaults.h>
@@ -84,10 +85,10 @@ static NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     PeerConfig self;
     self.id            = 0;
     self.host          = "127.0.0.1";
-    self.consensusPort = 40111;
+    self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();   // D8: never a fixed port
     cfg.peers          = {self};
 
-    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50001";
+    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     cfg.clientEndpoint.streamId = 1;
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
@@ -653,10 +654,10 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         PeerConfig self;
         self.id            = 0;
         self.host          = "127.0.0.1";
-        self.consensusPort = 40111;
+        self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();   // D8: never a fixed port
         cfg.peers          = {self};
 
-        cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50001";
+        cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         cfg.clientEndpoint.streamId = 1;
 
         TopicSpec ts;
