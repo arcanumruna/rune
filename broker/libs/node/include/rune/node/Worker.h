@@ -408,6 +408,12 @@ public:
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->aborted().ranges() : std::vector<rune::transaction::AbortedTxnRange>{};
     }
+    /// Test seam (D3b r2): the read_committed SERVE check alone (rcServe_), as a
+    /// push/fetch read runs it — true when the RC state is served.
+    bool rcServeForTest(int32_t topicId, int32_t partition) {
+        auto* r = findOwnedReplica_(topicId, partition);
+        return r != nullptr && rcServe_(r, rcOf_(r)) != nullptr;
+    }
     [[nodiscard]] int rcStatusForTest(int32_t topicId, int32_t partition) const {
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->statusCode() : kRcNone;
@@ -1303,7 +1309,7 @@ public:
         // Step 6.5: drain cleaner/retention/staging queues (disk-backed only).
         for (auto* replica : owned_) {
             if (replica && replica->isDiskBacked()) {
-                work += replica->log()->drainCleanerSwaps();
+                if (!cleanerSwapsDeferred_(replica)) work += replica->log()->drainCleanerSwaps();   // D3b
                 work += replica->log()->drainRetentionDeletes();
                 work += replica->log()->drainStagingRenamesDone();
                 // fsyncgate: any inline sync failure on this log → fail-stop.
@@ -1375,7 +1381,7 @@ private:
         // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
         work += pushOwnedSubscriptions_(nowNs);
         for (auto& slot : slots_) {
-            work += slot.log->drainCleanerSwaps();
+            if (!cleanerSwapsDeferred_(slot.replica)) work += slot.log->drainCleanerSwaps();   // D3b
             work += slot.log->drainRetentionDeletes();
             work += slot.log->drainStagingRenamesDone();
             checkStorageFailure_(slot.log);
@@ -2977,6 +2983,7 @@ private:
                 if (RcState* rc = rcOf_(replica)) {
                     if (mpOk)
                         rc->onMarker(mp.producerId, base, mp.controlType == rune::transaction::ControlType::Commit);
+                    publishCleanerLso_(replica, *rc);   // D3b: a resolved txn lifts the cleaner's cap
                 }
                 // N2 (minor): keep append()'s flush request on the worker — a
                 // Strict-tier marker joins this pass's coalesced durable flush
@@ -3983,15 +3990,39 @@ private:
         return f;
     }
     // One §2.3 driver step for one partition.
+    // D3b fix round 1 (cleaner invariant): the cleaner-visible LSO is 0 (clean
+    // nothing) whenever the RC state is not Ready — it is published BEFORE any
+    // rebuild step (revalidate may reset a Ready state in this very call, and the
+    // inline produce gate rcGate_ steps here too) and the real value after.
     std::size_t rcAdvance_(rune::replication::PartitionReplica* r, RcState& rc) {
-        return r->isDiskBacked() ? rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_)
-                                 : rc.advance(rcFacts_(r), nullptr, rcScanBytesPerPass_, r->memoryLog());
+        if (!rc.revalidate(rcFacts_(r))) publishCleanerLso_(r, rc);   // 0 before scanning
+        const std::size_t n = r->isDiskBacked() ? rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_)
+                                                : rc.advance(rcFacts_(r), nullptr, rcScanBytesPerPass_, r->memoryLog());
+        publishCleanerLso_(r, rc);
+        return n;
+    }
+    // D3b fix round 1: a cleaner swap (rewritten / emptied segment) is NOT applied
+    // while this partition's RC state is SCANNING the log: the rebuild walks the
+    // in-memory segments (the pre-swap inodes stay mapped), so it sees ONE
+    // consistent version of the log — never a txn's data from before a cleaner
+    // pass and the (removed) marker state from after it, which would leave the
+    // txn open.  The swap stays queued (the cleaner retries a full ring) and is
+    // applied once the state is Ready.  Together with "LSO 0 while not Ready"
+    // (no NEW cleaner pass starts during a rebuild) a pass already in flight can
+    // never land mid-rebuild.
+    [[nodiscard]] bool cleanerSwapsDeferred_(const rune::replication::PartitionReplica* r) const noexcept {
+        const RcState* rc = rcOf_(r);
+        return rc != nullptr && rc->scanning();
     }
     // §2.4: the RC state to serve read_committed from — only if Ready AND still
     // valid for the replica's live role / generations (a demotion can land
     // between the per-pass driver and this read).  nullptr → serve nothing.
-    [[nodiscard]] const RcState* rcServe_(const rune::replication::PartitionReplica* r, RcState* rc) noexcept {
-        if (rc == nullptr || !rc->revalidate(rcFacts_(r))) return nullptr;
+    [[nodiscard]] const RcState* rcServe_(rune::replication::PartitionReplica* r, RcState* rc) noexcept {
+        if (rc == nullptr) return nullptr;
+        if (!rc->revalidate(rcFacts_(r))) {
+            publishCleanerLso_(r, *rc);   // D3b: a reset publishes 0
+            return nullptr;
+        }
         return rc;
     }
     // Per pass, every owned user partition (state-driven: no role-op hooks).
@@ -4006,11 +4037,18 @@ private:
         int work = 0;
         for (std::size_t k = 0, i = rcWalkStart_; k < n; ++k) {
             RcSlot& sl = rcSlots_[i];
-            work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;
+            work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
             if (++i == n) i = 0;
         }
         if (++rcWalkStart_ == n) rcWalkStart_ = 0;
         return work;
+    }
+    // D3b: publish the partition's first unstable offset to the cleaner (only on
+    // change).  Called on every RC transition: the per-pass driver (Ready / reset)
+    // and right after each txn data batch / marker the RC state applies.
+    static void publishCleanerLso_(rune::replication::PartitionReplica* r, RcState& rc) noexcept {
+        int64_t v = 0;
+        if (rc.takeCleanerLsoChange(v)) r->publishCleanerLso(v);
     }
     // §2.3 produce gate: the RC state for an idempotent / transactional batch,
     // after one inline build step if it is not Ready; nullptr → refuse NotLeader.
@@ -5155,8 +5193,10 @@ private:
 
         // F15 §2.1 (C1): RC update in the same invocation as the append; a
         // duplicate retry was registered with its original.
-        if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]]
+        if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]] {
             rc->onTxnBatch(f.producerId, outcome.baseOffset);
+            if (replica) publishCleanerLso_(replica, *rc);   // D3b: an open txn caps the cleaner
+        }
 
         // F15 S5 (Kafka parity; re-review 1 I1 residual, re-review 2): a
         // DUPLICATE is answered only under its original batch's ack condition —

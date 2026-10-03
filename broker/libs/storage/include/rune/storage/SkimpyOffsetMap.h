@@ -43,6 +43,7 @@
 #include <string_view>
 #include <vector>
 #include <rune/storage/ProducerTails.h>
+#include <rune/storage/TxnCleanState.h>
 
 namespace rune::storage {
 
@@ -235,12 +236,17 @@ public:
         size_          = 0;
         latestOffset_  = -1;
         tails_.clear();
+        txn_.clear();
     }
 
     /// The last data batch of every producer in the scanned range (retained by
     /// compaction — see ProducerTails.h).  Filled by buildOffsetMapFromBases.
     ProducerTails&       producerTails() noexcept { return tails_; }
     const ProducerTails& producerTails() const noexcept { return tails_; }
+    /// D3b: the pass's transaction state (aborted ranges, LSO, removable
+    /// markers — see TxnCleanState.h).  Filled by buildOffsetMapFromBases.
+    TxnCleanState&       txnState() noexcept { return txn_; }
+    const TxnCleanState& txnState() const noexcept { return txn_; }
 
     // --- Budget helper (static, no instance) --------------------------------
     /// Compute maxSlots from a byte budget and per-entry size.
@@ -275,6 +281,7 @@ private:
     Offset               latestOffset_ = -1;
     std::vector<Entry>   table_;
     ProducerTails        tails_;
+    TxnCleanState        txn_;
 };
 
 } // namespace rune::storage

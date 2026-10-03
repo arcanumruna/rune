@@ -37,6 +37,9 @@
 
 #include <rune/node/LogCleanerAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
+#include <rune/node/RcState.h>
+#include <rune/storage/ProducerStateManager.h>
+#include <rune/transaction/ControlMarker.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
@@ -57,6 +60,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -181,6 +185,7 @@ TEST(CompactionCleanerAgent, CompactionRunsOffDutyThread) {
         cfg, Role::Leader, /*epoch=*/1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     for (int v = 0; v < 200; ++v) {
@@ -267,6 +272,7 @@ TEST(CompactionCleanerAgent, ConvergesToOnePerKeyAtDefaultDirtyRatio) {
     auto replica = std::make_unique<PartitionReplica>(
         cfg, Role::Leader, /*epoch=*/1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     const int kKeys = 4, kRecords = 200;
@@ -352,6 +358,7 @@ TEST(CompactionCleanerAgent, ConvergesUnderInterleavedProduceAndClean) {
     auto replica = std::make_unique<PartitionReplica>(
         cfg, Role::Leader, /*epoch=*/1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     rune::node::ReplicaRegistry registry;
@@ -485,16 +492,19 @@ TEST(CompactionCleanerAgent, FilthiestLogSelectedFirst) {
 
     auto repA = std::make_unique<PartitionReplica>(
         cfgA, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logA, &transport);
+    repA->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     repA->becomeLeader(1, {1});
     repA->onLeaderLogAppended();
 
     auto repB = std::make_unique<PartitionReplica>(
         cfgB, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logB, &transport);
+    repB->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     repB->becomeLeader(1, {1});
     repB->onLeaderLogAppended();
 
     auto repC = std::make_unique<PartitionReplica>(
         cfgC, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logC, &transport);
+    repC->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     repC->becomeLeader(1, {1});
     repC->onLeaderLogAppended();
 
@@ -646,6 +656,7 @@ TEST(CompactionCleanerAgent, PerCycleBudgetBoundsWork) {
                 cfg, Role::Leader, 1,
                 std::vector<NodeId>{1}, std::vector<NodeId>{1},
                 &log, &transport);
+            replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
             replica->becomeLeader(1, {1});
             replica->onLeaderLogAppended();
 
@@ -741,6 +752,7 @@ TEST(CompactionCleanerAgent, AppendP99UnperturbedByCompaction) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     // Fill log with many dirty segments for the cleaner to work on.
@@ -814,6 +826,7 @@ TEST(CompactionCleanerAgent, SwapSafeUnderRoleChangeAndTruncation) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     // Write records to create multiple sealed segments.
@@ -992,6 +1005,7 @@ TEST(CompactionCleanerAgent, FollowerProducesZeroCompaction) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     // Write enough records to create multiple sealed segments.
@@ -1128,6 +1142,7 @@ TEST(CompactionCleanerAgent, SwapRingFullDoesNotLoseCompaction) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     for (int v = 0; v < 200; ++v) {
@@ -1244,6 +1259,7 @@ TEST(CompactionCleanerAgent, CheckpointResumesAcrossAgentRestart) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
 
     // DISTINCT keys (one per record): this test targets WATERMARK/CHECKPOINT
@@ -1463,6 +1479,7 @@ TEST(CompactionCleanerAgent, BoundedRangePerPassIncremental) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
 
@@ -1614,6 +1631,7 @@ TEST(CompactionCleanerAgent, DedupeMapBoundedByBudgetEndToEnd) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
 
@@ -1859,6 +1877,7 @@ TEST(CompactionCleanerAgent, CoalescingEndToEndFewSegments) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
     ASSERT_GT(replica->highWatermark(), 0);
@@ -2268,6 +2287,7 @@ TEST(CompactionCleanerAgent, MinCompactionLagHoldsRecentSegments) {
             cfg, Role::Leader, 1,
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
+        replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
 
@@ -2314,6 +2334,7 @@ TEST(CompactionCleanerAgent, MinCompactionLagHoldsRecentSegments) {
             cfg2, Role::Leader, 1,
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
+        replica2->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
         replica2->becomeLeader(1, {1});
         replica2->onLeaderLogAppended();
 
@@ -2372,6 +2393,7 @@ TEST(CompactionCleanerAgent, MaxCompactionLagForcesLowDirtyLog) {
             cfg, Role::Leader, 1,
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
+        replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
         replica->setLastCleanOffset(co);
@@ -2413,6 +2435,7 @@ TEST(CompactionCleanerAgent, MaxCompactionLagForcesLowDirtyLog) {
             cfg2, Role::Leader, 1,
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
+        replica2->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
         replica2->becomeLeader(1, {1});
         replica2->onLeaderLogAppended();
         replica2->setLastCleanOffset(co2);
@@ -2512,6 +2535,7 @@ TEST(CompactionCleanerAgent, CompactionConvergesWithSingleSegmentGroups) {
         cfg, Role::Leader, 1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
     ASSERT_GT(replica->highWatermark(), 0);
@@ -2597,5 +2621,407 @@ TEST(CompactionCleanerAgent, CompactionConvergesWithSingleSegmentGroups) {
            "(one per key + sentinel); got " << totalAfter
         << " (before=" << totalBefore << ").";
 
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// D3b REGRESSION: the cleanable range is capped at the partition's LSO.
+//
+// Kafka cleans only below min(activeSegmentBase, LSO): an OPEN transaction's data
+// may still abort, and an aborted value must never supersede a committed one.  The
+// owning worker publishes the first unstable offset (PartitionReplica::
+// publishCleanerLso); the agent must never clean at/after it — even when the log
+// itself carries no txn data (this pins the agent-level wiring, independent of
+// LogCleaner's own unresolved-txn scan).  Then lifting the LSO lets it converge.
+// ===========================================================================
+TEST(LogCleanerAgentLsoRegression, CleanableRangeCappedAtPublishedLso) {
+    auto dir = cp6TempDir("d3b_lso_cap");
+    Log log(dir.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(690);
+    auto replicaOwned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replicaOwned->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replicaOwned->becomeLeader(1, {1});
+    constexpr int kRecords = 200;
+    constexpr int64_t kLso = 50;
+    for (int v = 0; v < kRecords; ++v) log.append(cp6Batch(v, "k1", "v" + std::to_string(v)), v);
+    replicaOwned->onLeaderLogAppended();
+    ASSERT_GT(replicaOwned->cleanerHighWatermark(), kLso) << "precondition: HW above the LSO";
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u) << "precondition: several sealed segments";
+    PartitionReplica* replica = replicaOwned.get();
+    replica->publishCleanerLso(kLso);   // an open txn starts at 50 (published by its worker)
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(690, 0, std::move(replicaOwned));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent duty(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0);
+
+    auto liveAtOrAbove = [&](int64_t from) {
+        int n = 0;
+        for (int64_t o = from; o < kRecords; ++o) {
+            auto bytes = log.read(o, 1 << 20);
+            if (bytes.empty()) continue;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (r.ensureValid() && r.baseOffset() == o && r.recordCount() > 0) ++n;
+        }
+        return n;
+    };
+    constexpr int kCycles = 16;   // bounded drive: each cycle = one cleaner pass + swap drain
+    for (int i = 0; i < kCycles; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        duty.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+    EXPECT_LE(replica->lastCleanOffset(), kLso) << "clean watermark crossed the published LSO";
+    EXPECT_EQ(liveAtOrAbove(kLso), kRecords - kLso) << "records at/after the LSO must be untouched";
+    EXPECT_LT(cp6CountLiveRecords(log), kRecords) << "below the LSO the cleaner still works";
+
+    // The transaction resolves: the LSO lifts → the cleaner converges past it.
+    replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    for (int i = 0; i < kCycles; ++i) {
+        cleaner.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
+        duty.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+    EXPECT_GT(replica->lastCleanOffset(), kLso);
+    EXPECT_LT(liveAtOrAbove(kLso), kRecords - kLso) << "after the LSO lifts, the range above it is cleaned";
+    fs::remove_all(dir);
+}
+
+
+// ===========================================================================
+// D3b fix round 1 helpers: transactional batches + the PRODUCTION marker bytes.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> r1Txn(int64_t off, std::string_view key, std::string_view val, int64_t pid,
+                           int16_t epoch, int32_t seq) {
+    RecordBatchBuilder b(off, 1000 + off);
+    b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+    b.setTransactional(true);
+    b.append(key, val, 1000 + off);
+    return b.build();
+}
+std::vector<uint8_t> r1Marker(int64_t off, int64_t pid, int16_t epoch, bool commit) {
+    auto m = rune::transaction::ControlMarker::build(
+        pid, epoch, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+    for (int i = 0; i < 8; ++i) m[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(off) >> (8 * i));
+    return m;   // baseOffset is outside the CRC
+}
+// The batch at exactly `off` (empty if none).
+std::vector<uint8_t> r1BatchAt(Log& log, int64_t off) {
+    auto bytes = log.read(off, 1 << 20);
+    if (bytes.empty()) return {};
+    RecordBatchReader r(bytes.data(), bytes.size());
+    if (r.baseOffset() != off || !r.ensureValid()) return {};
+    return {bytes.begin(), bytes.begin() + r.totalLength()};
+}
+} // namespace
+
+// ===========================================================================
+// D3b fix round 1 (1): a marker is removed only once EVERY assigned replica —
+// not just the ISR — has fetched past it.  A replica outside the ISR that holds
+// a txn's aborted data but not its ABORT marker would otherwise never receive the
+// marker; on becoming leader it would read the aborted data as the producer's
+// NEXT txn (a later COMMIT exposes it).  The leader publishes the minimum fetch
+// position over the assigned replicas; the agent gates marker removal on it.
+// ===========================================================================
+TEST(LogCleanerAgentMarkerRemovalRegression, MarkerKeptWhileAnAssignedReplicaLagsBehindIt) {
+    auto dir = cp6TempDir("d3b_marker_lag");
+    Log log(dir.string(), /*rollBytes=*/1);   // one batch per segment
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(691);
+    cfg.deleteRetentionMs = 0;               // horizon == stamping pass: drop on the next pass
+    auto owned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1, std::vector<NodeId>{1, 2}, std::vector<NodeId>{1}, &log, &transport);
+    owned->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    owned->becomeLeader(1, {1});
+    PartitionReplica* replica = owned.get();
+    constexpr int64_t P = 9;
+    log.append(r1Txn(0, "k", "aborted", P, 0, 0), 0);
+    log.append(r1Marker(1, P, 0, /*commit=*/false), 1);   // ABORT @1
+    log.append(r1Txn(2, "k2", "c", P, 0, 1), 2);
+    log.append(r1Marker(3, P, 0, /*commit=*/true), 3);    // the producer's last batch
+    int64_t next = 4;
+    for (; next < 8; ++next) log.append(cp6Batch(next, "pad", "p"), next);
+    replica->onLeaderLogAppended();
+    replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);   // no worker in this rig: no open txn
+    // Replica 2 (assigned, NOT in the ISR) fetched up to 1: it has @0, not the marker @1.
+    (void)replica->onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 1, 1 << 20, 691}, 1'000'000);
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(691, 0, std::move(owned));
+    Cp6MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0);
+    auto cycles = [&](int n, int64_t& t) {
+        for (int i = 0; i < n; ++i, t += 1'000'000) {
+            log.append(cp6Batch(next, "pad", "p"), next); ++next;   // keep the log dirty: one pass per cycle
+            replica->onLeaderLogAppended();
+            duty.doWork(t);                                         // replica doWork publishes its snapshots
+            cleaner.doWork(t);
+            duty.doWork(t);                                         // drain the swaps
+        }
+        log.reloadSegments();
+    };
+    int64_t t = 2'000'000;
+    cycles(8, t);
+    EXPECT_EQ(replica->cleanerMarkerRemovalBound(), 1) << "the bound is replica 2's fetch position";
+    EXPECT_TRUE(r1BatchAt(log, 0).empty() || RecordBatchReader(r1BatchAt(log, 0).data(), r1BatchAt(log, 0).size()).recordCount() == 0)
+        << "precondition: the aborted record was discarded";
+    ASSERT_FALSE(r1BatchAt(log, 1).empty()) << "ABORT marker removed although replica 2 has not fetched it";
+
+    // Replica 2 fetches past the marker → it may now go (stamp, then drop).
+    (void)replica->onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 2, 1 << 20, 691}, t);
+    cycles(8, t);
+    EXPECT_EQ(replica->cleanerMarkerRemovalBound(), 2);
+    EXPECT_TRUE(r1BatchAt(log, 1).empty()) << "marker never removed once every replica fetched it";
+    ASSERT_FALSE(r1BatchAt(log, 3).empty()) << "the producer's last marker stays";
+    fs::remove_all(dir);
+}
+
+// The leader publishes min(fetch position) over EVERY assigned replica (a replica
+// that never fetched counts as 0); a single-replica partition has no bound.
+TEST(PartitionReplicaCleanerSnapshotRegression, MarkerRemovalBoundIsMinFetchOverAllAssignedReplicas) {
+    auto dir = cp6TempDir("d3b_bound");
+    Log log(dir.string(), 1 << 20);
+    for (int64_t o = 0; o < 10; ++o) log.append(cp6Batch(o, "k", "v"), o);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(692);
+    PartitionReplica r(cfg, Role::Leader, 1, {1, 2, 3}, {1}, &log, &transport);
+    r.becomeLeader(1, {1});
+    r.onLeaderLogAppended();
+    r.doWork(1);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "replicas 2 and 3 never fetched";
+    (void)r.onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 5, 1 << 20, 692}, 2);
+    r.doWork(3);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "replica 3 (not in the ISR) still never fetched";
+    (void)r.onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 3, 7, 1 << 20, 692}, 4);
+    r.doWork(5);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 5);
+
+    auto dir2 = cp6TempDir("d3b_bound1");
+    Log log2(dir2.string(), 1 << 20);
+    PartitionReplica solo(makeCompactConfig(693), Role::Leader, 1, {1}, {1}, &log2, &transport);
+    solo.becomeLeader(1, {1});
+    solo.doWork(1);
+    EXPECT_EQ(solo.cleanerMarkerRemovalBound(), PartitionReplica::kNoCleanerLso) << "no other replica";
+    fs::remove_all(dir);
+    fs::remove_all(dir2);
+}
+
+// Fix round 1 (2): a read_committed partition's cleaner LSO starts at 0 (clean
+// nothing) until its owning worker's first READY publish — never "no cap" while
+// nobody has built the transaction state.  A partition with no read_committed
+// state (internal topic, topicId < 0) has no LSO cap.
+TEST(PartitionReplicaCleanerSnapshotRegression, LsoStartsAtZeroUntilTheFirstReadyPublish) {
+    auto dir = cp6TempDir("d3b_lso0");
+    Log log(dir.string(), 1 << 20);
+    Cp6NullTransport transport;
+    PartitionReplica user(makeCompactConfig(694), Role::Leader, 1, {1}, {1}, &log, &transport);
+    EXPECT_EQ(user.cleanerLastStableOffset(), 0);
+    auto dir2 = cp6TempDir("d3b_lso0i");
+    Log log2(dir2.string(), 1 << 20);
+    PartitionReplica internal(makeCompactConfig(-5), Role::Leader, 1, {1}, {1}, &log2, &transport);
+    EXPECT_EQ(internal.cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso);
+    fs::remove_all(dir);
+    fs::remove_all(dir2);
+}
+
+// Fix round 1 (4d): end to end — the read_committed state AND the producer state
+// rebuilt from a CLEANED log (aborted data discarded, markers stamped and
+// dropped) equal those rebuilt from the original log: same committed value per
+// key, no open txn, same LSO, same (epoch, lastSequence) per producer.
+TEST(LogCleanerRcRebuildRegression, ReadCommittedAndProducerStateUnchangedByCleaning) {
+    auto dir = cp6TempDir("d3b_rc_e2e");
+    Log log(dir.string(), /*rollBytes=*/1);
+    constexpr int64_t P = 21, Q = 22;
+    int64_t o = 0;
+    int32_t ps = 0, qs = 0;
+    auto plain = [&](std::string_view k, std::string_view v) { log.append(cp6Batch(o, k, v), o); ++o; };
+    auto txn = [&](std::string_view k, std::string_view v, int64_t pid, int16_t e) {
+        log.append(r1Txn(o, k, v, pid, e, pid == P ? ps++ : qs++), o); ++o;
+    };
+    auto marker = [&](int64_t pid, int16_t e, bool commit) { log.append(r1Marker(o, pid, e, commit), o); ++o; };
+    plain("a", "a0");
+    plain("e", "e0");
+    txn("a", "a1-P-aborted", P, 0);
+    txn("b", "b1-Q", Q, 0);
+    txn("e", "e1-P-aborted", P, 0);     // an aborted copy must never supersede e0
+    marker(P, 0, false);
+    txn("b", "b2-P", P, 0);
+    marker(Q, 0, true);
+    marker(P, 0, true);
+    txn("c", "c1-P-aborted", P, 0);
+    plain("b", "b3");
+    marker(P, 1, false);                // fence abort: the epoch rises to 1
+    txn("a", "a2-Q", Q, 0);
+    marker(Q, 0, true);
+    for (int i = 0; i < 3; ++i) plain("pad", "p");
+
+    struct View {
+        std::map<std::string, std::string> committed;
+        std::size_t open = 0;
+        int64_t lso = 0;
+        std::map<int64_t, std::pair<int16_t, int32_t>> producers;
+        bool operator==(const View&) const = default;
+    };
+    auto rebuild = [&]() {
+        log.reloadSegments();
+        rune::storage::ProducerStateManager psm;
+        rune::node::RcState rc;
+        rc.bindProducerState(&psm, 1, 0);
+        rune::node::RcFacts f; f.leader = true; f.leaderComplete = true; f.logGeneration = 1;
+        f.leadershipGeneration = 1; f.epoch = 1;
+        for (int i = 0; i < 100'000 && !rc.ready(); ++i) (void)rc.advance(f, &log, 1 << 20);
+        EXPECT_TRUE(rc.ready());
+        View v;
+        const int64_t end = log.logEndOffset();
+        v.open = rc.tracker().openCount();
+        v.lso = rc.lso(end);
+        auto bases = log.segmentBaseOffsets();
+        for (std::size_t si = 0; si < bases.size(); ++si) {
+            const int64_t segEnd = si + 1 < bases.size() ? bases[si + 1] : end;
+            for (int64_t cur = bases[si]; cur < segEnd;) {
+                auto bytes = log.read(cur, 1 << 20);
+                if (bytes.empty()) break;
+                RecordBatchReader r(bytes.data(), bytes.size());
+                if (!r.ensureValid()) break;
+                const bool ctrl = (r.attributes() & batch::kAttrControl) != 0;
+                const bool tx = (r.attributes() & batch::kAttrTransactional) != 0;
+                if (!ctrl && !(tx && rc.isAborted(r.producerId(), r.baseOffset())) && r.baseOffset() < v.lso)
+                    r.forEachRecord([&](std::string_view k, std::string_view val, int64_t, int64_t) {
+                        v.committed[std::string(k)] = std::string(val);
+                    });
+                cur = r.baseOffset() + r.lastOffsetDelta() + 1;
+            }
+        }
+        for (int64_t pid : {P, Q})
+            if (const auto* e = psm.entry(1, pid, 0)) v.producers[pid] = {e->producerEpoch, e->lastSequence};
+        return v;
+    };
+    const View before = rebuild();
+    ASSERT_EQ(before.committed.at("a"), "a2-Q");
+    ASSERT_EQ(before.committed.at("b"), "b3");
+    ASSERT_EQ(before.committed.count("c"), 0u);
+    ASSERT_EQ(before.committed.at("e"), "e0");
+    ASSERT_EQ(before.open, 0u);
+    ASSERT_EQ(before.producers.at(P).first, 1) << "the fence marker raised P's epoch";
+
+    for (bool coalesce : {false, true}) {
+        for (int pass = 0; pass < 4; ++pass) {
+            auto bases = log.segmentBaseOffsets();
+            const int64_t active = bases.back();
+            bases.pop_back();
+            std::vector<int64_t> sizes(bases.size(), 1);
+            LogCleaner cleaner;
+            cleaner.setMarkerRemovalBound(std::numeric_limits<int64_t>::max());
+            SkimpyOffsetMap map(1024);
+            (void)cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, /*deleteRetentionMs=*/10,
+                                                     map, coalesce, 1 << 20, nullptr, 1'000'000 + pass * 10);
+            const View after = rebuild();
+            EXPECT_EQ(after.committed, before.committed) << "coalesce=" << coalesce << " pass " << pass;
+            EXPECT_EQ(after.open, 0u) << "coalesce=" << coalesce << " pass " << pass << ": a txn was left open";
+            EXPECT_EQ(after.lso, log.logEndOffset()) << "coalesce=" << coalesce << " pass " << pass;
+            EXPECT_EQ(after.producers, before.producers) << "coalesce=" << coalesce << " pass " << pass;
+        }
+    }
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// D3b fix round 2 (1): an OffsetsForLeaderEpoch PROBE never feeds the marker-
+// removal bound.  A probe carries the follower's PRE-truncation LEO from its own,
+// possibly divergent, lineage (an old leader with a divergent tail): counting it
+// would let the new leader stamp + drop an ABORT marker the old leader does not
+// hold on this lineage; after truncating it refetches past the marker's offset,
+// never sees it, and as leader keeps that txn open forever.
+// ===========================================================================
+TEST(PartitionReplicaCleanerSnapshotRegression, ProbeNeverFeedsMarkerRemovalBound) {
+    auto dir = cp6TempDir("d3b_probe");
+    Log log(dir.string(), 1 << 20);
+    for (int64_t o = 0; o < 100; ++o) log.append(cp6Batch(o, "k", "v"), o);
+    Cp6NullTransport transport;
+    PartitionReplica r(makeCompactConfig(695), Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+    r.becomeLeader(1, {1, 2});
+    r.onLeaderLogAppended();
+    r.onOffsetsForLeaderEpochRequest(rune::replication::OffsetsForLeaderEpochReqMsg{1, 0, 2, 1, /*followerLeo=*/90, 695});
+    r.doWork(1);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "a probe's (unverified-lineage) LEO fed the marker bound";
+    (void)r.onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 40, 1 << 20, 695}, 2);
+    r.doWork(3);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 40) << "a real fetch position does";
+    fs::remove_all(dir);
+}
+
+// Fix round 2 (4): fetch positions are relearned in every leadership — a position
+// from an earlier term may predate a truncation.
+TEST(PartitionReplicaCleanerSnapshotRegression, FetchPositionsResetOnEveryLeadership) {
+    auto dir = cp6TempDir("d3b_releader");
+    Log log(dir.string(), 1 << 20);
+    for (int64_t o = 0; o < 20; ++o) log.append(cp6Batch(o, "k", "v"), o);
+    Cp6NullTransport transport;
+    PartitionReplica r(makeCompactConfig(696), Role::Leader, 1, {1, 2}, {1}, &log, &transport);
+    r.becomeLeader(1, {1});
+    r.onLeaderLogAppended();
+    (void)r.onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 15, 1 << 20, 696}, 1);
+    r.doWork(2);
+    ASSERT_EQ(r.cleanerMarkerRemovalBound(), 15) << "precondition";
+    r.becomeFollower(2, /*leaderId=*/2);
+    r.doWork(3);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "a follower never removes markers";
+    r.becomeLeader(3, {1});
+    r.doWork(4);
+    EXPECT_EQ(r.cleanerMarkerRemovalBound(), 0) << "replica 2's position from the earlier leadership was reused";
+    fs::remove_all(dir);
+}
+
+// Fix round 2 (1), agent level: a divergent old leader that only PROBES (with a
+// LEO past the marker) never lets the marker go; its real fetch past it does.
+TEST(LogCleanerAgentMarkerRemovalRegression, ProbeFromDivergentReplicaNeverReleasesMarker) {
+    auto dir = cp6TempDir("d3b_probe_agent");
+    Log log(dir.string(), /*rollBytes=*/1);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(697);
+    cfg.deleteRetentionMs = 0;
+    auto owned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1, std::vector<NodeId>{1, 2}, std::vector<NodeId>{1}, &log, &transport);
+    owned->becomeLeader(1, {1});
+    PartitionReplica* replica = owned.get();
+    constexpr int64_t P = 9;
+    log.append(r1Txn(0, "k", "aborted", P, 0, 0), 0);
+    log.append(r1Marker(1, P, 0, /*commit=*/false), 1);
+    log.append(r1Txn(2, "k2", "c", P, 0, 1), 2);
+    log.append(r1Marker(3, P, 0, /*commit=*/true), 3);
+    int64_t next = 4;
+    for (; next < 8; ++next) log.append(cp6Batch(next, "pad", "p"), next);
+    replica->onLeaderLogAppended();
+    replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    rune::node::ReplicaRegistry registry;
+    registry.add(697, 0, std::move(owned));
+    Cp6MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0);
+    auto cycles = [&](int n, int64_t& t) {
+        for (int i = 0; i < n; ++i, t += 1'000'000) {
+            log.append(cp6Batch(next, "pad", "p"), next); ++next;
+            replica->onLeaderLogAppended();
+            // Replica 2 (divergent old leader) keeps probing with a LEO past the marker.
+            replica->onOffsetsForLeaderEpochRequest(
+                rune::replication::OffsetsForLeaderEpochReqMsg{1, 0, 2, 1, /*followerLeo=*/next, 697});
+            duty.doWork(t);
+            cleaner.doWork(t);
+            duty.doWork(t);
+        }
+        log.reloadSegments();
+    };
+    int64_t t = 2'000'000;
+    cycles(8, t);
+    ASSERT_FALSE(r1BatchAt(log, 1).empty()) << "ABORT marker released by a probe's divergent LEO";
+    (void)replica->onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 2, 1 << 20, 697}, t);
+    cycles(8, t);
+    EXPECT_TRUE(r1BatchAt(log, 1).empty()) << "a real fetch past the marker releases it";
     fs::remove_all(dir);
 }

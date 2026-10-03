@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include <rune/storage/ProducerTails.h>
+#include <rune/storage/TxnCleanState.h>
 
 namespace rune::storage {
 
@@ -37,16 +38,21 @@ public:
     std::size_t size() const noexcept { return map_.size(); }
 
     /// Clear all entries.
-    void clear() noexcept { map_.clear(); tails_.clear(); }
+    void clear() noexcept { map_.clear(); tails_.clear(); txn_.clear(); }
 
     /// The last data batch of every producer in the scanned range (retained by
     /// compaction — see ProducerTails.h).  Filled by buildOffsetMapFromBases.
     ProducerTails&       producerTails() noexcept { return tails_; }
     const ProducerTails& producerTails() const noexcept { return tails_; }
+    /// D3b: the pass's transaction state (aborted ranges, LSO, removable
+    /// markers — see TxnCleanState.h).  Filled by buildOffsetMapFromBases.
+    TxnCleanState&       txnState() noexcept { return txn_; }
+    const TxnCleanState& txnState() const noexcept { return txn_; }
 
 private:
     std::unordered_map<std::string, Offset> map_;
     ProducerTails tails_;
+    TxnCleanState txn_;
 };
 
 } // namespace rune::storage

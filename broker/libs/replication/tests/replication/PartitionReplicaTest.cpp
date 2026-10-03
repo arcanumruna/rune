@@ -3742,11 +3742,10 @@ TEST(PartitionReplicaRegression, FetchMapFailureDoesNotReportCaughtUp) {
     ASSERT_NE(sealedSeg, nullptr);
     ASSERT_FALSE(sealedSeg->hasReadMapForTest()) << "sealed segment must still be lazily-unmapped (F3)";
 
-    // Break this segment's lazy map: open() succeeds (resolves to /dev/null),
-    // mmap() fails with ENODEV, every retry — readView() returns {} forever.
-    std::string sealedLogPath = sealedSeg->logPath();
-    std::filesystem::remove(sealedLogPath);
-    std::filesystem::create_symlink("/dev/null", sealedLogPath);
+    // Break this segment's lazy map, every retry — readView() returns {} forever.
+    // (D3b r2: the read map is made through the segment's own fd, never by path,
+    // so a path swap no longer breaks it — inject the failure via the seam.)
+    sealedSeg->setReadMapFaultForTest(true);
 
     // Fetch at sealedBase: fetchOffset < LEO (more segments were appended after
     // it), so the ONLY correct interpretation of an empty readView() here is

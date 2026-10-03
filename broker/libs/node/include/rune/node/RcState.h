@@ -72,6 +72,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdint>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -212,6 +213,23 @@ public:
             tail_.push_back(TailEvent{producerId, offset, commit});
         }
         // Unbuilt: nothing — the build starts at LEO > offset and scans it.
+    }
+
+    // ---- D3b: the cleaner's LSO bound ---------------------------------------
+    /// The first unstable offset the LogCleanerAgent must not clean at/after
+    /// (PartitionReplica::publishCleanerLso): Ready → the first offset of the
+    /// earliest open transaction, or INT64_MAX when none is open; not Ready → 0
+    /// (the LSO is unknown while the state is (re)built: clean nothing).
+    [[nodiscard]] int64_t cleanerFirstUnstableOffset() const noexcept {
+        return ready() ? tracker_.lso(std::numeric_limits<int64_t>::max()) : 0;
+    }
+    /// True (and remembers `out`) when the value changed since the last call —
+    /// the worker publishes only changes (no per-pass store on the replica line).
+    bool takeCleanerLsoChange(int64_t& out) noexcept {
+        out = cleanerFirstUnstableOffset();
+        if (out == cleanerLsoPublished_) return false;
+        cleanerLsoPublished_ = out;
+        return true;
     }
 
     // ---- §2.3 step 1 alone: validity against the live replica facts --------
@@ -529,6 +547,7 @@ private:
     }
 
     rune::transaction::LsoTracker      tracker_;
+    int64_t cleanerLsoPublished_ = std::numeric_limits<int64_t>::min();   ///< D3b: last value published
     rune::transaction::AbortedTxnIndex aborted_;
     std::vector<TailEvent>             tail_;
 #if defined(__APPLE__)

@@ -1,6 +1,7 @@
 #include <rune/storage/MappedFile.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <stdexcept>
 #include <cerrno>
@@ -55,6 +56,16 @@ MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, boo
         fd_ = -1;
     }
 }
+MappedFile::MappedFile(BorrowedFd borrowedFd, std::string path, size_t initialBytes)
+    : path_(std::move(path)), size_(initialBytes), writable_(false), borrowedFd_(borrowedFd.fd) {
+    if (borrowedFd_ < 0) throw std::runtime_error("MappedFile: invalid borrowed fd for " + path_);
+    struct stat st{};
+    if (::fstat(borrowedFd_, &st) == 0 && st.st_size > 0 && static_cast<size_t>(st.st_size) > size_)
+        size_ = static_cast<size_t>(st.st_size);
+    fd_ = borrowedFd_;     // mapNow() maps fd_
+    try { mapNow(); } catch (...) { fd_ = -1; throw; }
+    fd_ = -1;              // never owned: the destructor must not close it
+}
 void MappedFile::mapNow() {
     int prot = writable_ ? (PROT_READ|PROT_WRITE) : PROT_READ;
     void* p = ::mmap(nullptr, size_, prot, MAP_SHARED, fd_, 0);
@@ -72,6 +83,12 @@ void MappedFile::resize(size_t newBytes) {
                 throw std::runtime_error("ftruncate failed: " + path_);
             size_ = newBytes;
             mapNow();
+        } else if (borrowedFd_ >= 0) {
+            // D3b r2: remap through the borrowed fd (the file's inode) — never by path.
+            fd_ = borrowedFd_;
+            size_ = newBytes;
+            try { mapNow(); } catch (...) { fd_ = -1; throw; }
+            fd_ = -1;
         } else {
             // F3: the fd was closed right after the initial mmap (read-only mode
             // holds no fd between calls).  Reopen briefly to remap at the new size,

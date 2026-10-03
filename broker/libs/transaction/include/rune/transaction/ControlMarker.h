@@ -88,6 +88,7 @@
 //   coordinator.completeTransaction(txnId). Returns number of markers written.
 // ---------------------------------------------------------------------------
 
+#include <rune/storage/ControlMarkerLayout.h>
 #include <rune/transaction/Types.h>
 #include <rune/transaction/TransactionMessages.h>
 #include <rune/transaction/TransactionCoordinator.h>
@@ -127,7 +128,7 @@ public:
     // exclusively (matches the authoritative Kafka KIP-98 definition).
 
     /// Total encoded size of a control batch in bytes.
-    static constexpr std::size_t ENCODED_SIZE = 75;
+    static constexpr std::size_t ENCODED_SIZE = rune::storage::control_marker::kEncodedSize;   // D3b r2: shared
 
     /// Offset of the CRC field within the batch bytes.
     static constexpr std::size_t CRC_OFFSET = 17;
@@ -136,7 +137,7 @@ public:
     static constexpr std::size_t CRC_DATA_START = 21;
 
     /// Batch header size (up to and including numRecords).
-    static constexpr std::size_t BATCH_HEADER_SIZE = 61;
+    static constexpr std::size_t BATCH_HEADER_SIZE = rune::storage::control_marker::kBatchHeaderSize;
 
     // -----------------------------------------------------------------------
     // build — encode a control batch for the given producer + controlType.

@@ -11,6 +11,14 @@ public:
     ///   writable mapping.  Used by the segment pre-provisioner so the append/
     ///   roll hot path never faults index pages.
     MappedFile(std::string path, size_t initialBytes, bool writable, bool prefault = false);
+    /// D3b fix round 2: a READ-ONLY mapping of an ALREADY-OPEN file `borrowedFd`
+    /// (NOT owned: never closed here; the caller keeps it open for this object's
+    /// lifetime).  Mapping and every resize() go through that fd — i.e. through
+    /// the file's INODE — never by re-opening `path` (kept for error messages
+    /// only): a file renamed over the path (the log cleaner's rewrite) can never
+    /// be mapped in its place.  Maps at least the file's current size.
+    struct BorrowedFd { int fd; };
+    MappedFile(BorrowedFd borrowedFd, std::string path, size_t initialBytes);
     ~MappedFile();
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
@@ -37,6 +45,7 @@ public:
     int sync(size_t bytes);
 private:
     std::string path_; uint8_t* data_ = nullptr; size_t size_ = 0; int fd_ = -1; bool writable_;
+    int borrowedFd_ = -1;   ///< D3b r2: read-only mapping through a caller-owned fd (never closed here)
     void mapNow();
 };
 } // namespace rune::storage
