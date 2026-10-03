@@ -333,7 +333,7 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
                 kept.push_back(c);
         if (kept.size() != cfg.ioWorkerCpus.size())
             appendWarn(out.warnings, std::string("RUNE_IOWQ_CORES lists CPUs outside this process's allowed set — ") +
-                       (kept.empty() ? "none usable, io-wq inherits" : "ignoring those"));
+                       (kept.empty() ? "none usable, falling back to the default io-wq placement" : "ignoring those"));
         cfg.ioWorkerCpus = std::move(kept);
     }
     // Assumes every node runs W workers (same assumption as deriveWorkerCoreBase).

@@ -1186,12 +1186,13 @@ public:
                              workerId_, coreId_);
             }
         }
-        // LAT-1 (f): io-wq is per TASK — bind THIS thread's io-wq (EBUSY = at the in-flight cap: retry
-        // next pass).
+        // LAT-1 (f): io-wq is per TASK — bind THIS thread's io-wq (EBUSY = at the in-flight cap,
+        // EAGAIN/EINTR = transient submit failure: retry next pass).
         if (ioWorkerCpusResult_ < 0 && !ioWorkerCpus_.empty()) [[unlikely]] {
             const int r = io_.setIoWorkerAffinity(ioWorkerCpus_);
-            if (r != EBUSY) ioWorkerCpusResult_ = r;
-            if (r != 0 && r != EBUSY && io_.kind() == IoBackendKind::Uring)
+            const bool retry = r == EBUSY || r == EAGAIN || r == EINTR;
+            if (!retry) ioWorkerCpusResult_ = r;
+            if (r != 0 && !retry && io_.kind() == IoBackendKind::Uring)
                 spdlog::warn("Worker {}: IORING_REGISTER_IOWQ_AFF refused (errno={}) — io-wq threads keep the "
                              "worker's affinity", workerId_, ioWorkerCpusResult_);
         }

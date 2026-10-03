@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
@@ -53,14 +54,18 @@ using rune::node::FlushCompletion;
 using rune::node::kNoToken;
 
 // ---------------------------------------------------------------------------
-// Helper: spin-reap until 'got.token != 0' or we exhaust retries.
-// Returns true if a completion was received.
+// Helper: poll-reap until 'got.token != 0' or a generous wall-clock deadline.
+// Returns true if a completion was received.  The bound is TIME, not an
+// iteration count: a real fsync on a loaded VM disk can take far longer than
+// 2M empty polls (~5 ms) — that iteration bound flaked.  Never sleeps.
 // ---------------------------------------------------------------------------
 static bool spinReap(UringFlushBackend& be, FlushCompletion& out,
-                     int maxIter = 2'000'000) {
-    for (int i = 0; i < maxIter; ++i) {
+                     std::chrono::milliseconds deadline = std::chrono::seconds(10)) {
+    const auto end = std::chrono::steady_clock::now() + deadline;
+    while (std::chrono::steady_clock::now() < end) {
         be.reap([&](const FlushCompletion& c){ out = c; });
         if (out.token != rune::node::kNoToken) return true;
+        std::this_thread::yield();
     }
     return false;
 }
@@ -232,12 +237,20 @@ int firstAllowedCpu() {
     for (int c = 0; c < CPU_SETSIZE; ++c) if (CPU_ISSET(c, &set)) return c;
     return -1;
 }
-bool affinityUnsupported(int rc) { return rc == EINVAL || rc == ENOTSUP || rc == EOPNOTSUPP; }
+int allowedCpuCount() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    return ::sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
+}
+// The KERNEL refused the register (old kernel: unknown opcode -> EINVAL; no io-wq support).  Only when the
+// internal NOP went through (inFlight == 1): an EINVAL from our own arguments / a dead ring is a failure.
+bool affinityUnsupported(int rc, const rune::node::UringFlushBackend& be) {
+    return (rc == EINVAL || rc == ENOTSUP || rc == EOPNOTSUPP) && be.inFlight() == 1;
+}
 } // namespace
 
 TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegression) {
-    const int ncpu = static_cast<int>(::sysconf(_SC_NPROCESSORS_ONLN));
-    if (ncpu < 2) GTEST_SKIP() << "needs >= 2 CPUs";
+    if (allowedCpuCount() < 2) GTEST_SKIP() << "needs >= 2 allowed CPUs (a 1-CPU mask passes trivially)";
     const int cpu = firstAllowedCpu();
     ASSERT_GE(cpu, 0);
     char path[] = "/tmp/rune_iowq_aff_XXXXXX";
@@ -247,10 +260,12 @@ TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegressio
     ASSERT_EQ(::write(fd, data.data(), data.size()), static_cast<ssize_t>(data.size()));
     std::string allowedOut;
     int rc = -1;
+    bool unsupported = false;
     bool submitted = false;
     std::thread t([&] {   // no ASSERTs in here: the test thread owns fd/path cleanup
         rune::node::UringFlushBackend be(8, 8);
         rc = be.setIoWorkerAffinity({cpu});
+        unsupported = affinityUnsupported(rc, be);
         if (rc != 0) return;
         const auto tok = be.submit(fd, 1);
         submitted = tok != rune::node::kNoToken;
@@ -275,7 +290,7 @@ TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegressio
     t.join();
     ::close(fd);
     ::unlink(path);
-    if (affinityUnsupported(rc)) GTEST_SKIP() << "IORING_REGISTER_IOWQ_AFF unsupported here (errno " << rc << ")";
+    if (unsupported) GTEST_SKIP() << "IORING_REGISTER_IOWQ_AFF unsupported here (errno " << rc << ")";
     ASSERT_EQ(rc, 0);
     ASSERT_TRUE(submitted);
     ASSERT_FALSE(allowedOut.empty()) << "no io-wq worker was spawned for the submitting thread's fsync";
@@ -289,7 +304,7 @@ TEST(UringDurabilityTest, IoWorkerAffinityNopIsDrainedSilentlyAndRespectsTheCapR
     ASSERT_GE(cpu, 0);
     rune::node::UringFlushBackend be(2, 2);
     const int rc = be.setIoWorkerAffinity({cpu});
-    if (affinityUnsupported(rc)) GTEST_SKIP() << "IORING_REGISTER_IOWQ_AFF unsupported here (errno " << rc << ")";
+    if (affinityUnsupported(rc, be)) GTEST_SKIP() << "IORING_REGISTER_IOWQ_AFF unsupported here (errno " << rc << ")";
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(be.inFlight(), 1u) << "the NOP holds one slot until reaped";
     int handled = 0;

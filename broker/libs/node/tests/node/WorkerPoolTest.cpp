@@ -1048,5 +1048,8 @@ TEST(WorkerPool, IoWorkerCpusAreAppliedOnTheWorkersOwnPassRegression) {
     pool.worker(0).setIoWorkerCpus({0});
     EXPECT_EQ(pool.worker(0).ioWorkerCpusResult(), -1) << "configuring must not apply it";
     (void)pool.worker(0).doWork(/*nowNs=*/1);
-    EXPECT_NE(pool.worker(0).ioWorkerCpusResult(), -1) << "the worker's first pass applies it";
+    const int first = pool.worker(0).ioWorkerCpusResult();
+    EXPECT_NE(first, -1) << "the worker's first pass applies it";
+    (void)pool.worker(0).doWork(/*nowNs=*/2);
+    EXPECT_EQ(pool.worker(0).ioWorkerCpusResult(), first) << "applied once, not re-registered every pass";
 }
