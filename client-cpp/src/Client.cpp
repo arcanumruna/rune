@@ -1661,7 +1661,7 @@ int Client::routeBufferedAcks_() {
     const int n = static_cast<int>(acks.size());
     bool notLeader = false;
     for (const auto& a : acks) {
-        producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode);
+        producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode, a.logStartOffset);
         notLeader |= a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
     }
     agent_.clearProduceAcks();

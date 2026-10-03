@@ -651,7 +651,9 @@ if(BUILD_TESTING)
     include(GoogleTest)
 
     # Conformance vector directory — the sibling rune-protocol repo.
-    set(RUNE_CONFORMANCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/conformance")
+    # D6: the golden vectors come from the SAME rune-protocol checkout as the
+    # headers (RUNE_PROTOCOL_INCLUDE) — a header change and its vectors move together.
+    set(RUNE_CONFORMANCE_DIR "${RUNE_PROTOCOL_INCLUDE}/../conformance")
     if(NOT EXISTS "${RUNE_CONFORMANCE_DIR}/vectors")
         message(FATAL_ERROR
             "CC-2: conformance vector directory not found: ${RUNE_CONFORMANCE_DIR}/vectors\n"
@@ -1111,6 +1113,16 @@ if(BUILD_TESTING)
             target_link_libraries(rune_eos_tests PRIVATE ${UUID_LIB_INVOKER})
         endif()
         gtest_discover_tests(rune_eos_tests)
+
+        # D6: UnknownProducerId — rule U on a bare ProducerImpl + end to end
+        # (retention + failover) against the InvokerGateway broker model.
+        add_executable(rune_unknown_pid_tests tests/producer/ProducerUnknownProducerIdTest.cpp)
+        target_include_directories(rune_unknown_pid_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_unknown_pid_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
+            target_link_libraries(rune_unknown_pid_tests PRIVATE ${UUID_LIB_INVOKER})
+        endif()
+        gtest_discover_tests(rune_unknown_pid_tests)
 
         # T15b Gate 4: SIGSTOP DR gate (fork: a client process under SIGSTOP /
         # SIGCONT; own binary so the fork happens in a single-threaded process).

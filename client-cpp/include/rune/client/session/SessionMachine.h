@@ -83,7 +83,9 @@ struct SessionIo {
 struct SessionConfig {
     std::string egressChannel  = "aeron:udp?endpoint=localhost:40200";
     int32_t     egressStreamId = 1001;
-    int32_t     clientVersion  = 1;
+    // D6: announces UnknownProducerId + ProduceResponse.logStartOffset support
+    // (a broker answers 28 only at >= kClientVersionUnknownProducerId).
+    int32_t     clientVersion  = rune::protocol::client::kClientVersion;
 
     // Timeouts / intervals (nanoseconds).
     int64_t connectTimeoutNs    = 5'000'000'000LL;   // 5 s  — give up one connect attempt

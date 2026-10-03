@@ -191,6 +191,11 @@ struct PartitionState {
     int64_t  producerId   = -1;
     int16_t  epoch        = 0;
     int32_t  lastAckedSeq = -1;     // last sequence acked OK under (producerId, epoch)
+    // D6 (Kafka TopicPartitionEntry.lastAckedOffset): the max LAST offset any OK
+    // of this partition reported (-1 = none; a known-old OK -1 never moves it).
+    // Rule U: lastAckedOffset < ProduceResponse.logStartOffset proves every
+    // record we had acked was removed by retention.
+    int64_t  lastAckedOffset = -1;
     uint64_t lastAckTick  = 0;      // ProducerImpl::sendTick_ when the latest OK was processed
     bool     unresolved   = false;  // a batch failed with its broker outcome unknown
 
@@ -828,8 +833,11 @@ public:
     /// — every record completes Ok with offset -1.  errorCode != 0 fails the
     /// batch, except OutOfOrderSequence on a batch that is not the oldest live
     /// batch of its epoch: an earlier frame was lost, so it is parked and re-sent
-    /// once the older batches resolve (Kafka parity).
-    void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode);
+    /// once the older batches resolve (Kafka parity).  D6: `logStartOffset` is
+    /// the partition's log start carried with UnknownProducerId (-1 = not
+    /// carried) — rule U decides retention (re-sequence) from loss (unknown).
+    void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
+                           int64_t logStartOffset = -1);
 
     /// Called on redirect-reconnect failure (SessionLost) and by the close paths
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted

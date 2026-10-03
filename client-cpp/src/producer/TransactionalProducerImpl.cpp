@@ -1228,8 +1228,14 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
     if (!opt) return;
     // Re-review 1 NEW-4(a): DuplicateSequence (Kafka DUPLICATE_SEQUENCE_NUMBER) =
     // already stored, offset unknown: an OK.
-    const int16_t ec = opt->errorCode == static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence)
-                           ? kOk : opt->errorCode;
+    // D6: UnknownProducerId (the broker forgot this producer: its batch was NOT
+    // appended) is handled exactly like OutOfOrderSequence here — parked behind
+    // an older unresolved batch, else the transaction is abortable (Kafka
+    // KIP-360: a transactional UNKNOWN_PRODUCER_ID is abortable + epoch bump).
+    const int16_t ec = opt->errorCode == static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence) ? kOk
+                     : opt->errorCode == static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId)
+                         ? kOutOfOrderSequence
+                         : opt->errorCode;
     auto it = batches_.find(opt->correlationId);
     if (it == batches_.end()) {
         // I-2: an earlier attempt's answer.  Its OK still decides the batch

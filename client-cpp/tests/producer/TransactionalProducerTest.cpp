@@ -2197,6 +2197,45 @@ TEST(TransactionalProducerTest, DuplicateSequenceIsAStoredBatchRegression) {
     EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
 }
 
+// D6: UnknownProducerId (the broker forgot this producer; the batch was NOT
+// appended) is handled exactly like OutOfOrderSequence by the transactional
+// producer (Kafka KIP-360: transactional UNKNOWN_PRODUCER_ID is abortable):
+// behind an unresolved older batch it is retried, never poisoned...
+TEST(TransactionalProducerTest, UnknownProducerIdBehindAnOlderBatchIsRetriedNotPoisonedRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    const auto first = sendData(r, 3);
+    ASSERT_EQ(first.size(), 3u);
+    answer(r, corrIdOf(first[1]), ecOf(rpc::ErrorCode::UnknownProducerId));
+    answer(r, corrIdOf(first[2]), ecOf(rpc::ErrorCode::UnknownProducerId));
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    r.sink.clear();
+    r.doWork();
+    auto again = produceFrames(r.sink);
+    ASSERT_EQ(again.size(), 1u);
+    EXPECT_EQ(decodeBaseSeqFromProduce(again[0]), 0) << "fast retransmit of the gap frame";
+    answer(r, corrIdOf(again[0]), 0, 100);
+    r.sink.clear();
+    r.doWork();
+    again = produceFrames(r.sink);
+    ASSERT_EQ(again.size(), 2u);
+    answer(r, corrIdOf(again[0]), 0, 101);
+    answer(r, corrIdOf(again[1]), 0, 102);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
+}
+
+// ... and on the next-in-line batch the transaction becomes abortable (as OOS),
+// never a fatal error and never silently dropped.
+TEST(TransactionalProducerTest, UnknownProducerIdOnTheHeadMakesTheTxnAbortableRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    const auto first = sendData(r, 1);
+    ASSERT_EQ(first.size(), 1u);
+    answer(r, corrIdOf(first[0]), ecOf(rpc::ErrorCode::UnknownProducerId));
+    EXPECT_EQ(r.tp.state(), TxnState::AbortableError);
+}
+
 // Backlog B6: a transactional record (key + value) over Producer::kMaxRecordBytes
 // is rejected at append (std::length_error), never sent.
 TEST(TransactionalProducerTest, RecordOver16KiBIsRejectedAtAppend) {

@@ -199,6 +199,7 @@ struct InvokerGateway {
     int           okDelayPumps  = 0;
     int           produceFrames = 0;
     struct LogBatch {
+        int32_t topicId = 0;
         int32_t partition = 0;
         int64_t producerId = -1;
         int16_t producerEpoch = -1;
@@ -207,6 +208,43 @@ struct InvokerGateway {
         std::vector<std::vector<uint8_t>> values;
     };
     std::vector<LogBatch> log;
+    // ---- D6: UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID) ----
+    // The model answers a Produce with no producer entry and baseSequence != 0
+    // UnknownProducerId + logStartOffset — to a session whose ConnectRequest
+    // announced clientVersion >= 2 (kClientVersionUnknownProducerId); older
+    // sessions get OutOfOrderSequence (the real broker's version gate).
+    int64_t logStartOffset = 0;                  // the model log's start (retention moves it)
+    std::map<int64_t, int32_t> clientVersions;   // sessionId -> ConnectRequest.clientVersion
+    int32_t lastConnectClientVersion = -1;
+    int unknownPidAnswers = 0;
+    /// Retention + failover: drop every log batch wholly below `newLogStart`,
+    /// then REBUILD the producer state from what is left (a new leader / a
+    /// restart scans [logStart, LEO)) — producers whose batches were all
+    /// removed are forgotten.
+    void retainAndRebuild(int64_t newLogStart) {
+        std::vector<LogBatch> kept;
+        for (auto& b : log) {
+            const int64_t last = b.baseOffset + static_cast<int64_t>(b.values.size()) - 1;
+            if (last >= newLogStart) kept.push_back(std::move(b));
+        }
+        log            = std::move(kept);
+        logStartOffset = std::max(logStartOffset, newLogStart);
+        seqStates.clear();
+        for (const auto& b : log) {
+            if (b.producerId < 0) continue;
+            SeqState& st = seqStates[std::make_tuple(b.topicId, b.producerId, b.partition)];
+            const int32_t lastSeq = b.baseSequence + static_cast<int32_t>(b.values.size()) - 1;
+            if (b.producerEpoch > st.epoch) { st.window.clear(); }
+            st.epoch   = std::max(st.epoch, b.producerEpoch);
+            st.lastSeq = lastSeq;
+            st.window.push_back({b.baseSequence, lastSeq, b.baseOffset});
+            while (static_cast<int>(st.window.size()) > idempotenceWindow) st.window.pop_front();
+        }
+    }
+    /// Failover WITHOUT retention that lost the producer state anyway (e.g. an
+    /// unclean leader whose log lacks the producer's acked batches).
+    void forgetProducers() { seqStates.clear(); }
+    [[nodiscard]] std::size_t knownProducers() const { return seqStates.size(); }
     int oosAnswers = 0, windowDupAnswers = 0, oldDupAnswers = 0, fencedAnswers = 0;
     // Re-review 1 (NEW-2): the broker's ProducePath step 4 (RecordBatch CRC32C ->
     // Internal) and step 4b (the Produce FRAME's producerId / epoch / baseSequence
@@ -395,11 +433,11 @@ struct InvokerGateway {
     }
 
     /// ProduceResponse with an explicit baseOffset (idempotence model).
-    void ackAt(const Produced& pr, int16_t errorCode, int64_t baseOffset) {
+    void ackAt(const Produced& pr, int16_t errorCode, int64_t baseOffset, int64_t logStart = -1) {
         namespace rcc = rune::client::codec;
         uint8_t buf[64];
         const std::size_t n = rcc::encodeProduceResponse(buf, sizeof buf, errorCode, pr.partition,
-                                                         baseOffset, pr.sessionId, pr.corrId);
+                                                         baseOffset, pr.sessionId, pr.corrId, logStart);
         if (replyOnAnnouncedEgress) {
             sendToSession(pr.sessionId, buf, n);
             return;
@@ -499,6 +537,7 @@ private:
         Produced pr{};
         int16_t  ec  = 0;
         int64_t  off = 0;
+        int64_t  lso = -1;   // D6: ProduceResponse.logStartOffset
     };
     std::vector<PendingAnswer> pendingAnswers_;
     int64_t                    pumps_ = 0;
@@ -509,7 +548,7 @@ private:
             if (!pa.held && pa.dueAt <= pumps_) {
                 const PendingAnswer a = pa;
                 pendingAnswers_.erase(pendingAnswers_.begin() + static_cast<std::ptrdiff_t>(i));
-                ackAt(a.pr, a.ec, a.off);
+                ackAt(a.pr, a.ec, a.off, a.lso);
             } else {
                 ++i;
             }
@@ -517,16 +556,16 @@ private:
     }
 
     // Model answer: now, delayed or held (see the fault-injection knobs).
-    void answerModel_(int ordinal, const Produced& pr, bool acksAll, int16_t ec, int64_t off) {
+    void answerModel_(int ordinal, const Produced& pr, bool acksAll, int16_t ec, int64_t off, int64_t lso = -1) {
         int64_t delay = 0;
         if (ec == 0 && acksAll) delay = okDelayPumps;
         if (const auto it = answerDelay.find(ordinal); it != answerDelay.end()) delay = it->second;
         const bool held = holdAnswer.count(ordinal) != 0;
         if (delay == 0 && !held) {
-            ackAt(pr, ec, off);
+            ackAt(pr, ec, off, lso);
             return;
         }
-        pendingAnswers_.push_back({ordinal, pumps_ + delay, held, pr, ec, off});
+        pendingAnswers_.push_back({ordinal, pumps_ + delay, held, pr, ec, off, lso});
     }
 
     template <class View>
@@ -541,7 +580,9 @@ private:
         produced.push_back(pr);
         const bool answer = pv.correlationId != 0 && dropAnswer.count(ordinal) == 0;
         const bool acksAll = pv.acks == 1;
-        auto ackAt = [&](const Produced& p, int16_t ec, int64_t off) { answerModel_(ordinal, p, acksAll, ec, off); };
+        auto ackAt = [&](const Produced& p, int16_t ec, int64_t off, int64_t lso = -1) {
+            answerModel_(ordinal, p, acksAll, ec, off, lso);
+        };
         // NEW-2: step 4 (CRC) then step 4b (identity: producerId always; epoch +
         // baseSequence when producerId >= 0) — the real broker's order and codes.
         if (!r.ensureValid()) {
@@ -573,6 +614,7 @@ private:
         }
         auto append = [&]() -> int64_t {
             LogBatch lb;
+            lb.topicId       = pv.topicId;
             lb.partition     = pv.partition;
             lb.producerId    = pv.producerId;
             lb.producerEpoch = pv.producerEpoch;
@@ -607,7 +649,15 @@ private:
             if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::OutOfOrderSequence), 0);
         };
         if (it == seqStates.end()) {
-            if (first != 0) return oos();
+            if (first != 0) {
+                // D6: no entry + seq != 0 -> UnknownProducerId with the log start
+                // (version-gated like the broker: OOS to an old client).
+                const auto cv = clientVersions.find(pv.sessionId);
+                if (cv == clientVersions.end() || !rp::clientUnderstandsUnknownProducerId(cv->second)) return oos();
+                ++unknownPidAnswers;
+                if (answer) ackAt(pr, static_cast<int16_t>(rp::ErrorCode::UnknownProducerId), 0, logStartOffset);
+                return;
+            }
             accept(seqStates[key]);
             return;
         }
@@ -663,6 +713,8 @@ private:
             ackBeforeNextConnect.clear();
             int64_t sid = assignedSessionId;
             if (uniqueSessionIds) sid = c->sessionId != 0 ? c->sessionId : nextUniqueSessionId++;
+            clientVersions[sid]      = c->clientVersion;   // D6: the version gate's input
+            lastConnectClientVersion = c->clientVersion;
             if (replyOnAnnouncedEgress && sessionPubs.count(sid) == 0) {
                 SessionPub sp;
                 sp.channel = std::string(c->egressChannel);

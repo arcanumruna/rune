@@ -102,29 +102,32 @@ inline std::optional<ProduceView> decodeProduce(const uint8_t* buf,
 // ProduceResponseView — decoded ProduceResponse fields
 // ---------------------------------------------------------------------------
 struct ProduceResponseView {
-    int64_t sessionId     = 0;
-    int64_t correlationId = 0;
-    int16_t errorCode     = 0;  // rpc::ErrorCode value
-    int32_t partition     = 0;
-    int64_t baseOffset    = 0;
+    int64_t sessionId      = 0;
+    int64_t correlationId  = 0;
+    int16_t errorCode      = 0;  // rpc::ErrorCode value
+    int32_t partition      = 0;
+    int64_t baseOffset     = 0;
+    int64_t logStartOffset = -1; // D6: the partition's log start (-1 = not carried / old broker)
 };
 
-/// Encode a ProduceResponse frame (38 bytes) into buf[0..cap-1].
-/// Returns 38 on success, or 0 if cap < 38.
+/// Encode a ProduceResponse frame (rpc::ProduceResponse::ENCODED_SIZE = 46
+/// bytes) into buf[0..cap-1].  Returns the size, or 0 if cap is too small.
 inline std::size_t encodeProduceResponse(uint8_t*    buf,
                                           std::size_t cap,
                                           int16_t     errorCode,
                                           int32_t     partition,
                                           int64_t     baseOffset,
                                           int64_t     sessionId,
-                                          int64_t     correlationId) noexcept {
+                                          int64_t     correlationId,
+                                          int64_t     logStartOffset = -1) noexcept {
     if (cap < rpc::ProduceResponse::ENCODED_SIZE) return 0u;
     rpc::ProduceResponse msg;
-    msg.sessionId     = sessionId;
-    msg.correlationId = correlationId;
-    msg.errorCode     = errorCode;
-    msg.partition     = partition;
-    msg.baseOffset    = baseOffset;
+    msg.sessionId      = sessionId;
+    msg.correlationId  = correlationId;
+    msg.errorCode      = errorCode;
+    msg.partition      = partition;
+    msg.baseOffset     = baseOffset;
+    msg.logStartOffset = logStartOffset;
     return msg.encode(buf);
 }
 
@@ -138,8 +141,9 @@ inline std::optional<ProduceResponseView> decodeProduceResponse(const uint8_t* b
     v.sessionId     = opt->sessionId;
     v.correlationId = opt->correlationId;
     v.errorCode     = opt->errorCode;
-    v.partition     = opt->partition;
-    v.baseOffset    = opt->baseOffset;
+    v.partition      = opt->partition;
+    v.baseOffset     = opt->baseOffset;
+    v.logStartOffset = opt->logStartOffset;
     return v;
 }
 

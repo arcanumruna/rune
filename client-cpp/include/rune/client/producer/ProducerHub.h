@@ -139,7 +139,9 @@ public:
 
     /// Route a ProduceResponse to the ONE producer named by the batch id's
     /// ordinal (O(1)); non-batch ids (transactional / control) are ignored.
-    void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode);
+    /// D6: logStartOffset = ProduceResponse.logStartOffset (-1 = not carried).
+    void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
+                           int64_t logStartOffset = -1);
 
     /// Fail every pending ack with `st` (redirect-reconnect failure:
     /// SessionLost; the producers stay open).
