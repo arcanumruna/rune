@@ -320,6 +320,29 @@ MTU 65504 (loopback, no GSO yet), 3-node acks=all 1 KiB:
 OPEN: CPU_BUSY ~99% on all 4 cores even at 20k rec/s with BACKOFF workers -> the backoff idle effectively never
 parks between passes (spin/yield phases).  "Never busy-spin" holds by name only; tune the backoff (backlog A7).
 
+### 4.11 GSO-1: proper UDP GSO/GRO transport bindings (2026-10-03, k3s-node-01, interleaved ABAB, logs off)
+
+Build: rune-protocol feat/gso-1 25cdbbb (rune_gso_bindings) + broker feat/gso-1 13c8e4d (EmbeddedDriver default on,
+RUNE_AERON_UDP_GSO) on integ/perf-defaults (A1-A4), pure defaults otherwise; harness /root/e2e/tp.sh (vm-clean per
+run, RUNE_FS_LOG=0, log level warn), 3-node acks=all, 1 KiB, saturate 1.5M records, linger 0, shards 1, term 1 MiB,
+rcvWindow 256 KiB, ctlTerm 1 MiB, broker RUNE_AERON_MTU = client --mtu.  Off arm = RUNE_AERON_UDP_GSO=0 +
+RUNE_CLIENT_AERON_UDP_GSO=0 (stock Aeron, 2 msgs/send); on arm = defaults (GSO+GRO, 16 msgs/send).  Same binaries
+per ABAB.  VM Aeron = the FR-hooked driver lib (same as §4.3/§4.4; stock-lib restore still pending, §8).
+Proof per on-run: 10-11 "rune-gso: UDP GSO active" + 8 "UDP GRO active" lines across the 3 brokers, 4 on the client,
+effective config `gso=on` (off-runs: 0 lines, `gso=off`), 0 WARN fallbacks.  All runs errors=0.
+
+| ABAB (client) | arm | rec/s per round | median | p50 / p99 (saturation queueing) | CPU busy |
+|---|---|---|---|---|---|
+| A: 6c43f00 + GSO diff, n=5 | 1408 off | 55,647 / 56,544 / 58,425 / 59,980 / 56,795 | **56,795** | ~62 ms / ~330 ms | ~98-100% all cores |
+| | 1408 on | 178,022 / 194,133 / 174,143 / 182,051 / 187,450 | **182,051** | ~20 ms / ~115 ms | cpu0 ~99%, others ~95% |
+| | 65504 on (loopback, labelled) | 207,589 / 210,719 / 218,805 / 209,534 / 204,127 | **209,534** | ~17-26 ms / ~74-142 ms | cpu0 ~99%, others ~93% |
+| B: wt8 feat/client-gso 4a7dea5, n=4 (stopped: rounds agree) | 1408 off | 56,205 / 59,446 / 59,084 / 56,337 | **57,711** | ~81 ms / ~350 ms | ~98-100% |
+| | 1408 on | 188,697 / 187,195 / 166,852 / 180,922 | **184,059** | ~22 ms / ~150 ms | cpu0 ~99%, others ~95% |
+
+GSO/GRO = **3.2x at the real-network MTU** (vs QD §4.4: 3.1x); MTU 1408 + GSO reaches ~87% of the loopback-64K number.
+Real-driver tests (broker rune_udp_gso_tests 11/11, client rune_transport_gso_tests 4/4) prove GSO sends carry >1
+datagram, GRO splits, mixed peers, injected EAGAIN/EIO, 5% loss + NAK recovery, IPv6.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
