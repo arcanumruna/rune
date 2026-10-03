@@ -46,6 +46,7 @@
 // delete), no node containers.  std::string only inside the policy's add()
 // (announcement, cold path).  Owner: the worker thread only.
 #include <rune/protocol/client/DataMessages.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -178,9 +179,17 @@ public:
                 if (r->blockedPass != pass_) {                      // per-session order kept
                     const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, dst); });
                     if (pos > 0) [[likely]] {
+                        // Hop chain: the ack left on the client's session publication.
+                        RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShAckClaimed, rune_fr::foldCorr(a.correlationId),
+                                                     static_cast<double>(a.baseOffset));
                         ++work;
                         continue;
                     }
+                    // FR: refused (arg = -position: 1 NOT_CONNECTED, 2 BACK_PRESSURED,
+                    // 3 ADMIN_ACTION, 4 fatal) — throttled, it retries every pass.
+                    RUNE_FR_THROTTLED_REPLICATION(frClaimBlocked_, rune_fr::Site::ShAckClaimBlocked,
+                                                  rune_fr::foldCorr(a.correlationId),
+                                                  static_cast<uint16_t>(pos < 0 ? -pos : 0));
                     if (pos == kClaimFatal) [[unlikely]] {           // can never deliver
                         fail_(st);
                         ++dropped_;
@@ -351,11 +360,23 @@ private:
     void noteHoldEdges_() noexcept {
         for (std::size_t k = 0; k < heldPrevCount_; ++k) {
             const std::size_t idx = find_(heldPrev_[k]);
-            if (idx != kNone && heldPass_[idx] != pass_) markDirty_(idx);   // released
+            if (idx != kNone && heldPass_[idx] != pass_) {                 // released
+                RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ShAckHold, static_cast<uint32_t>(heldPrev_[k]), 0, 0.0);
+                markDirty_(idx);
+            }
         }
         for (std::size_t k = 0; k < heldNowCount_; ++k) {
             const std::size_t idx = find_(heldNow_[k]);
-            if (idx != kNone && reportedHeld_[idx] == 0) markDirty_(idx);   // newly held
+            if (idx == kNone) continue;
+#if RUNE_FR && !defined(RUNE_FR_NO_PRODUCE)
+            if (rune_fr::enabled(rune_fr::Site::ShAckHold)) [[unlikely]] {   // FR edge: newly held
+                bool wasHeld = false;
+                for (std::size_t j = 0; j < heldPrevCount_ && !wasHeld; ++j) wasHeld = heldPrev_[j] == heldNow_[k];
+                if (!wasHeld) rune_fr::markArgVal(rune_fr::Site::ShAckHold, static_cast<uint32_t>(heldNow_[k]), 1,
+                                                  static_cast<double>(heldAfterFlush_));
+            }
+#endif
+            if (reportedHeld_[idx] == 0) markDirty_(idx);                  // newly held
         }
         for (std::size_t k = 0; k < heldNowCount_; ++k) heldPrev_[k] = heldNow_[k];   // only the live prefix
         heldPrevCount_ = heldNowCount_;
@@ -467,6 +488,7 @@ private:
     std::size_t                                                      unreported_ = 0;
     uint64_t                                                         pass_    = 0;
     uint64_t                                                         dropped_ = 0;
+    [[no_unique_address]] rune_fr::Throttle                         frClaimBlocked_{};   // FR only
 };
 
 /// Production policy: the worker's own invoker-mode Aeron client (spec §3.1).

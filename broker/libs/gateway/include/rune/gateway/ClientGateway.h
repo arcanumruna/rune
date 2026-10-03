@@ -48,6 +48,7 @@
 //   - NO busy-spin.
 
 #include <rune/aeronutil/AeronPump.h>
+#include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/SessionTable.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
@@ -1269,6 +1270,7 @@ private:
     uint64_t oversizeProduceRejects_    = 0;
     uint64_t identityMismatchRejects_   = 0;   // inline path: frame identity != batch header
     uint64_t oversizeProduceRejectLogs_ = 0;
+    [[no_unique_address]] rune_fr::Throttle frOfferRefused_{};   // FR only (gateway duty thread)
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.

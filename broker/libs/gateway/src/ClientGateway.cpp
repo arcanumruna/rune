@@ -1400,7 +1400,12 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
                               const uint8_t*               buf,
                               std::size_t                  len)
 {
-    if (!pub.isConnected()) return false;
+    if (!pub.isConnected()) {
+        // FR: refused, not connected (arg 1 = NOT_CONNECTED) — throttled.
+        RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::GatewayOfferRefused,
+                                  static_cast<uint32_t>(pub.streamId()), 1);
+        return false;
+    }
 
     // AtomicBuffer takes a non-const pointer, but Aeron only reads (copies out)
     // the data — it never writes back through the pointer.  The cast is safe.
@@ -1423,6 +1428,9 @@ bool ClientGateway::sendOnPub(aeron::ExclusivePublication& pub,
 
     const int64_t result = pub.offer(atomicBuf, 0,
                                      static_cast<aeron::util::index_t>(len));
+    if (result <= 0)   // FR: refused (arg = -position) — throttled, retried by the caller
+        RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::GatewayOfferRefused,
+                                  static_cast<uint32_t>(pub.streamId()), static_cast<uint16_t>(result < 0 ? -result : 0));
     return result > 0;
 }
 
@@ -1492,8 +1500,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return;
     }
     const pc::Produce& msg = *msgOpt;
-    RUNE_FR_SPAN_PRODUCE(rune_fr::Site::GatewayHandle,
-                         static_cast<uint32_t>(msg.correlationId));
+    RUNE_FR_SPAN_PRODUCE(rune_fr::Site::GatewayHandle, rune_fr::foldCorr(msg.correlationId));
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
@@ -3365,8 +3372,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // Mark the instant the gateway first sees the worker's produce result.
             // The gap between WorkerAppend (worker thread) and this mark is the
             // worker→gateway return-ring + duty-cycle latency (same correlationId).
-            RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp,
-                                 static_cast<uint32_t>(ret.correlationId));
+            RUNE_FR_MARK_PRODUCE(rune_fr::Site::WorkerProcessOp, rune_fr::foldCorr(ret.correlationId));
             // Task 13 (spec §3.4): with worker-side acks (shard mode) a
             // deferAck ProduceResult is the post-ack notification of an ack the
             // worker already sent — and the only produce traffic the runtime
@@ -3413,8 +3419,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // re-validation holds — so the gateway never parks a worker-owned
             // ack (its pendingAcks_ serves only the inline, control-owned path).
             {
-                RUNE_FR_SPAN_PRODUCE(rune_fr::Site::ProduceAckSend,
-                                     static_cast<uint32_t>(ret.correlationId));
+                RUNE_FR_SPAN_PRODUCE(rune_fr::Site::ProduceAckSend, rune_fr::foldCorr(ret.correlationId));
                 pc::ProduceResponse okResp;
                 okResp.sessionId     = ret.sessionId;
                 okResp.correlationId = ret.correlationId;

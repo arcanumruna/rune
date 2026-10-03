@@ -59,7 +59,10 @@ public:
     }
 
     int doWork(int64_t nowNs) override {
-        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::ShardPass, 0);
+        // FR: per-pass / per-stage spans are SLOW spans (kept only above
+        // RUNE_FR_SLOW_SPAN_NS) — a busy-spinning shard must not flood its ring.
+        [[maybe_unused]] const auto frW = static_cast<uint32_t>(worker_.workerId());
+        RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShardPass, frW);
         if (!bound_) [[unlikely]] {
             driver_.bindPumpThread();          // ownership hand-off: startup thread → this thread
             if (runtimeDriver_) runtimeDriver_->bindPumpThread();
@@ -69,17 +72,30 @@ public:
         //    so one pass moves more than ~1 datagram per stream (invoker driver:
         //    one duty cycle sends/receives only a small batch per transport).
         int work = 0;
-        for (int dc = 0; dc < kDriverDutyPerPass; ++dc) {
-            const int w = driver_.doWork();
+        int dc = 0;
+        for (; dc < kDriverDutyPerPass; ++dc) {
+            int w;
+            {
+                RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShardDriverDuty, static_cast<uint32_t>(dc));
+                w = driver_.doWork();
+            }
             ++driverDutyCycles_;
             work += w;
             if (w == 0) break;
         }
-        work += client_.conductorAgentInvoker().invoke();   // 2. own client conductor
+        // FR: the driver still had work after the per-pass cap (its backlog
+        // waits for the next pass) — throttled, value = passes it happened in.
+        if (dc == kDriverDutyPerPass) RUNE_FR_THROTTLED_REPLICATION(frDriverCap_, rune_fr::Site::ShDriverWork, frW, 0);
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageConductor, frW);
+            work += client_.conductorAgentInvoker().invoke();   // 2. own client conductor
+        }
         work += worker_.doWork(nowNs);                      // 3-6. Worker (final → direct call)
-        if (runtime_)                                       // 7. fused runtime (worker 0)
+        if (runtime_) {                                     // 7. fused runtime (worker 0)
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageRuntime, frW);
             work += sharedDriver_ ? detail::fusedRuntimeAgentOnly(*runtime_, nowNs)  // A4: rides THIS pass's driver + conductor
                                   : detail::fusedRuntimePass(*runtime_, *runtimeDriver_, *runtimeClient_, nowNs);
+        }
         if (clock_.nowNs() - nowNs > kSlowPassNs) [[unlikely]] ++slowPasses_;
         return work;
     }
@@ -101,6 +117,7 @@ private:
     aeron::Aeron*     runtimeClient_ = nullptr;
     bool            bound_      = false;
     uint64_t        slowPasses_ = 0;
+    [[no_unique_address]] rune_fr::Throttle frDriverCap_{};   // FR only (empty when compiled out)
 };
 
 /// Production shard agent: the node's monotonic clock (final class).

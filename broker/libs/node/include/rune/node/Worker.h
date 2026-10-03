@@ -1168,7 +1168,7 @@ public:
     //      NEVER drop an ack.
     int doWork(int64_t nowNs) override {
         // Per-tick span: inter-tick gap = scheduler handoff/park; duration = tick cost.
-        RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDoWork, 0);
+        RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerDoWork, static_cast<uint32_t>(workerId_));
         int work = 0;
 
         // E4: self-pin this thread to the assigned core on the FIRST doWork call.
@@ -1229,6 +1229,10 @@ public:
             if (retFifo_.empty() &&
                 ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
                 work += pollWorkerIngress_(nowNs);
+            } else {
+                // FR: client intake skipped this pass (1 = return FIFO backlog, 2 = ring room).
+                RUNE_FR_THROTTLED_RUNTIME(frIngressSkip_, rune_fr::Site::ShIngressSkip,
+                                          static_cast<uint32_t>(workerId_), retFifo_.empty() ? 2 : 1);
             }
         }
 
@@ -1236,7 +1240,7 @@ public:
         // ops that mutate owned_ (on THIS worker thread — single-owner, no lock).
         // Strict-tier produces record their log in dirtyThisCycle_ (token=0).
         {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDrainIngress, 0);
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerDrainIngress, static_cast<uint32_t>(workerId_));
             work += static_cast<int>(drainIngress_());
         }
 
@@ -1248,7 +1252,7 @@ public:
         // Shared-nothing: owned_ is a plain member touched only by this thread.
         // Step 5: per-replica ISR checks / follower fetch emission.
         {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplicaDoWorkStage, 0);
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerReplicaDoWorkStage, static_cast<uint32_t>(workerId_));
             for (auto* replica : owned_) {
                 if (!replica) continue;
                 work += replica->doWork(nowNs);
@@ -1274,7 +1278,7 @@ public:
         // Test seam only: the (ctx, fn*) trampoline for fake pub registries.
         // Neither wired → no poll (flag-off path unchanged).
         if (workerReplTransport_) {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplPollDrive, 0);
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerReplPollDrive, static_cast<uint32_t>(workerId_));
             work += pollReplTransport_(*workerReplTransport_, nowNs);
         } else if (replTransportCtx_) [[unlikely]] {
             work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);
@@ -1285,7 +1289,7 @@ public:
         // the HW bound is fresh.  No-op unless subs_ is populated (Subscribe ops)
         // AND a WorkerEgress is wired (pre-I3b: gateway still owns push → inert).
         {
-            RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerEgressPushStage, 0);
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerEgressPushStage, static_cast<uint32_t>(workerId_));
             work += pushOwnedSubscriptions_(nowNs);
         }
 
@@ -1322,57 +1326,89 @@ private:
     // component (a full return ring is a non-blocking intake skip, spec §3.6).
     int doWorkShard_(int64_t nowNs) {
         int work = 0;
+        // FR: every stage is a SLOW span (kept only above RUNE_FR_SLOW_SPAN_NS,
+        // corr = workerId) — which stage of which pass ate the time.
+        [[maybe_unused]] const auto frW = static_cast<uint32_t>(workerId_);
         // 2a. (doWork) session lifecycle ring drained in full.
         // 2b. runtime→worker ring: ownership / role changes must be applied
         //     before the intake they govern.
-        work += static_cast<int>(drainIngress_());
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerDrainIngress, frW);
+            work += static_cast<int>(drainIngress_());
+        }
         // 3. client ingress → append.  Never skipped for pending ops (fix round
         //    1, I1): a frame whose session announcement is not applied yet has
         //    its ack HELD by the sink until the lifecycle ring is consumed past
         //    the position sampled after the frame was seen (no gate, no time).
         //    G-A6: per-session pause inside the poll (controlled ABORT).
-        work += flushRetFifo_();
-        // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
-        // into ret_ later: reserve for every one of them (G-A6, never drop).
-        if (retFifo_.empty() &&
-            ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
-            work += pollWorkerIngress_(nowNs);
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageClientIngress, frW);
+            work += flushRetFifo_();
+            // Owed acks (acks=all parked on HW, Strict parked on its fsync) all fire
+            // into ret_ later: reserve for every one of them (G-A6, never drop).
+            if (retFifo_.empty() &&
+                ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
+                work += pollWorkerIngress_(nowNs);
+            } else {
+                // FR: client intake skipped this pass (1 = return FIFO backlog, 2 = ring room).
+                RUNE_FR_THROTTLED_RUNTIME(frIngressSkip_, rune_fr::Site::ShIngressSkip, frW,
+                                          retFifo_.empty() ? 2 : 1);
+            }
+            work += submitCoalescedFlushes_();
         }
-        work += submitCoalescedFlushes_();
         // 4. replication on this worker's plane: apply inbound (inline, fast-acks),
         //    then push / ISR / HW per owned replica.
-        if (workerReplTransport_) work += pollReplTransport_(*workerReplTransport_, nowNs);   // direct
-        else if (replTransportCtx_) [[unlikely]]
-            work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);   // test seam
-        for (auto* replica : owned_) {
-            if (replica) work += replica->doWork(nowNs);
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerReplPollDrive, frW);
+            if (workerReplTransport_) work += pollReplTransport_(*workerReplTransport_, nowNs);   // direct
+            else if (replTransportCtx_) [[unlikely]]
+                work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);   // test seam
         }
-        work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
-        work += serveHeldPushReads_();
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::WorkerReplicaDoWorkStage, frW);
+            for (auto* replica : owned_) {
+                if (replica) work += replica->doWork(nowNs);
+            }
+            work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
+            work += serveHeldPushReads_();
+        }
         // 4b. background disk work → io backend, never an inline fsync
         //     (truncation reconcile, roll seals, follower flush requests).
-        work += submitBackgroundDiskWork_();
-        // 5. fire due produce acks.
-        work += flushOwedAcksAll_(nowNs);
-        checkOwedCapEpisodeEnd_();
-        // 6. reap durability completions.
-        work += reapDurableCompletions_();
-        // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
-        work += pushOwnedSubscriptions_(nowNs);
-        for (auto& slot : slots_) {
-            work += slot.log->drainCleanerSwaps();
-            work += slot.log->drainRetentionDeletes();
-            work += slot.log->drainStagingRenamesDone();
-            checkStorageFailure_(slot.log);
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageDisk, frW);
+            work += submitBackgroundDiskWork_();
         }
-        work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
-        work += flushPendingSignals_();
+        // 5. fire due produce acks.
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageAckFire, frW);
+            work += flushOwedAcksAll_(nowNs);
+            checkOwedCapEpisodeEnd_();
+        }
+        // 6. reap durability completions.
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageDisk, frW);
+            work += reapDurableCompletions_();
+        }
+        // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
+        {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageColdTail, frW);
+            work += pushOwnedSubscriptions_(nowNs);
+            for (auto& slot : slots_) {
+                work += slot.log->drainCleanerSwaps();
+                work += slot.log->drainRetentionDeletes();
+                work += slot.log->drainStagingRenamesDone();
+                checkStorageFailure_(slot.log);
+            }
+            work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
+            work += flushPendingSignals_();
+        }
         // Task 13 (spec §3.4): claim EVERY ack due this pass — appends, HW fires,
         // fsync completions, failures — on its session's own publication, last,
         // so the next driver duty cycle ships each session's acks together.
         // The lifecycle ring is sampled now, after every frame of this pass was
         // observed (consumer first: consumer <= producer) — I1 hold rule.
         if (ackSink_) {
+            RUNE_FR_SLOW_SPAN_RUNTIME(rune_fr::Site::ShStageAckFlush, frW);
             const int64_t consumed = sessionRing_.consumerPosition();
             work += ackSink_->flush(sessionRing_.producerPosition(), consumed);
             work += reportSessionSignals_();
@@ -1640,6 +1676,8 @@ private:
     // fdatasync covers every write issued before the submit — the completion's
     // flushBoundary is informational and never gates an ack.
     int onFlushCompletion_(const FlushCompletion& c) {
+        RUNE_FR_MARK_VAL_STORAGE(rune_fr::Site::StorageFsyncDone, static_cast<uint32_t>(c.token),
+                                 static_cast<double>(c.errorCode));
         TokenRoute r;
         const bool routed = routeTake_(c.token, r);
         // F15 S4 fix round 2 (RR1-4): an RC read-ahead hint — never a flush:
@@ -2328,8 +2366,10 @@ private:
     // duration of this callback — the log restamps + copies it at append).
     // -------------------------------------------------------------------
     void executeProduceWire_(sbe::WorkerOp& op) {
-        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerAppend,
-                             static_cast<uint32_t>(op.correlationId()));
+        RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerAppend, rune_fr::foldCorr(op.correlationId()));
+        // Hop chain: a GATEWAY-routed produce reached its worker (vs ShIngressFrame).
+        RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ShGatewayRouted, rune_fr::foldCorr(op.correlationId()),
+                                     static_cast<uint16_t>(workerId_), 0.0);
         // F15 S5 (§2.5, I6) + Task 13 (spec §3.4): a gateway-received produce
         // joins THE produce path of this worker in EVERY mode (Legacy default
         // config, per-worker ingress, shard — both placements): the worker
@@ -3005,11 +3045,14 @@ private:
         // Shard plane handshake (spec §3.3): one predicted branch unless a peer
         // is unverified / refused (then a hello on the retry cadence).
         const int hs = t.driveHandshake(nowNs);
-        return hs + t.poll(kReplFetchLimit,
-                           [this, nowNs](int32_t topicId, int32_t partition, uint16_t templateId,
-                                         const uint8_t* frame, std::size_t len) {
-                               pollReplTransportDispatch_(topicId, partition, templateId, frame, len, nowNs);
-                           });
+        const int frags = t.poll(kReplFetchLimit,
+                                 [this, nowNs](int32_t topicId, int32_t partition, uint16_t templateId,
+                                               const uint8_t* frame, std::size_t len) {
+                                     pollReplTransportDispatch_(topicId, partition, templateId, frame, len, nowNs);
+                                 });
+        if (frags > 0) RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShPlanePollFrags, static_cast<uint32_t>(workerId_),
+                                                    static_cast<double>(frags));
+        return hs + frags;
     }
 
     // -------------------------------------------------------------------
@@ -3472,6 +3515,11 @@ private:
     uint64_t    retFifoPausePassesAtEntry_ = 0;
     int64_t     retFifoPauseStartNs_ = 0;
     bool        retFifoPaused_ = false;
+    // FR (fr-hop-instrumentation): per-call-site coalescers for marks that can
+    // repeat every pass while a stall lasts (empty when FR is compiled out).
+    [[no_unique_address]] rune_fr::Throttle frIngressSkip_{};
+    [[no_unique_address]] rune_fr::Throttle frOwedCap_{};
+    [[no_unique_address]] rune_fr::Throttle frIntakePaused_{};
     // Re-review 1 I-4: PushReads answered MessageTooLarge because a stored
     // batch is larger than this worker's return ring's max message.
     uint64_t    pushReadOversize_ = 0;
@@ -4179,6 +4227,8 @@ private:
         if (pin) seg->pinFlush();
         const CompletionToken t = io_.submit(seg->logFd(), log->flushBoundary());
         if (t == kNoToken) { if (pin) log->unpinSegmentFlush(seg); return kNoToken; }
+        RUNE_FR_MARK_ARG_VAL_STORAGE(rune_fr::Site::StorageFsyncSubmit, static_cast<uint32_t>(t),
+                                     kind == RouteKind::Durable ? 1 : 2, 0.0);
         if (!pin) seg = nullptr;
         if (!routeInsert_(TokenRoute{t, log, seg, epoch, kind})) {
             spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
@@ -4216,6 +4266,7 @@ private:
             rune::storage::LogSegment* seg = log->frontPendingSeal();
             const CompletionToken t = io_.submit(seg->logFd(), 0);
             if (t == kNoToken) break;
+            RUNE_FR_MARK_ARG_VAL_STORAGE(rune_fr::Site::StorageFsyncSubmit, static_cast<uint32_t>(t), 3, 0.0);
             log->popPendingSeal();   // the seal's pin now belongs to the route
             if (!routeInsert_(TokenRoute{t, log, seg, slot.epoch, RouteKind::Seal})) {
                 spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
@@ -4507,6 +4558,9 @@ private:
             RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplAckSendOff,
                 (static_cast<uint32_t>(entry.ret.partition) << 24) |
                     (static_cast<uint32_t>(entry.lastOffset) & 0xFFFFFFu));
+            // Hop chain: the waiter fired (C = the client batch id; value = error code).
+            RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShWaiterFire, rune_fr::foldCorr(entry.ret.correlationId),
+                                         static_cast<double>(code));
             enqueueReturn_(entry.ret);
             return true;
         }));
@@ -4564,11 +4618,14 @@ private:
     // matrix watches it: the cap, not the ring, was the limiter).
     // Re-review 1 m-b: logged once on ENTERING and once on LEAVING an episode
     // (never per pass / per event), with the episode count and the events in it.
-    [[gnu::cold]] void noteOwedCapThrottle_(const char* where) noexcept {
+    [[gnu::cold]] void noteOwedCapThrottle_(const char* where, uint16_t frWhere) noexcept {
         ++owedCapThrottles_;
+        RUNE_FR_THROTTLED_RUNTIME(frOwedCap_, rune_fr::Site::ShOwedCapThrottle, static_cast<uint32_t>(workerId_), frWhere);
         if (owedCapThrottling_) return;
         owedCapThrottling_ = true;
         ++owedCapEpisodes_;
+        RUNE_FR_MARK_ARG_VAL_RUNTIME(rune_fr::Site::ShOwedCapEpisode, static_cast<uint32_t>(workerId_), 1,
+                                     static_cast<double>(reservedAckSlots_()));
         owedCapThrottlesAtEntry_ = owedCapThrottles_ - 1;
         owedCapStartNs_ = passNowNs_;
         spdlog::warn("Worker {}: owed-return cap {} reached ({}) — intake throttled, episode {} "
@@ -4579,6 +4636,8 @@ private:
     void checkOwedCapEpisodeEnd_() noexcept {
         if (owedCapThrottling_ && reservedAckSlots_() <= static_cast<int64_t>(maxOwedReturns_ / 2)) [[unlikely]] {
             owedCapThrottling_ = false;
+            RUNE_FR_MARK_ARG_VAL_RUNTIME(rune_fr::Site::ShOwedCapEpisode, static_cast<uint32_t>(workerId_), 0,
+                                         static_cast<double>(owedCapThrottles_ - owedCapThrottlesAtEntry_));
             spdlog::info("Worker {}: owed-return cap episode {} ended — {} throttled intake events over {} ns "
                          "(total {})", workerId_, owedCapEpisodes_, owedCapThrottles_ - owedCapThrottlesAtEntry_,
                          passNowNs_ - owedCapStartNs_, owedCapThrottles_);
@@ -4586,6 +4645,8 @@ private:
     }
     [[gnu::cold]] void enterRetFifoPause_(std::size_t backlog) noexcept {
         retFifoPaused_ = true;
+        RUNE_FR_MARK_ARG_VAL_RUNTIME(rune_fr::Site::ShRetFifoPause, static_cast<uint32_t>(workerId_), 1,
+                                     static_cast<double>(backlog));
         ++retFifoPauseEpisodes_;
         retFifoPausePassesAtEntry_ = retFifoHighWaterPauses_ - 1;
         retFifoPauseStartNs_ = passNowNs_;
@@ -4594,6 +4655,8 @@ private:
     }
     [[gnu::cold]] void leaveRetFifoPause_() noexcept {
         retFifoPaused_ = false;
+        RUNE_FR_MARK_ARG_VAL_RUNTIME(rune_fr::Site::ShRetFifoPause, static_cast<uint32_t>(workerId_), 0,
+                                     static_cast<double>(retFifo_.size()));
         spdlog::info("Worker {}: return FIFO pause episode {} ended — {} paused passes over {} ns "
                      "(total retFifoHighWaterPauses={})", workerId_, retFifoPauseEpisodes_,
                      retFifoHighWaterPauses_ - retFifoPausePassesAtEntry_, passNowNs_ - retFifoPauseStartNs_,
@@ -4687,7 +4750,8 @@ private:
 
         const int32_t K = static_cast<int32_t>(ingressPollBudget_());
         if (K <= 0) [[unlikely]] {   // no room — skip poll (G-A6 preserved)
-            if (reservedAckSlots_() >= static_cast<int64_t>(maxOwedReturns_)) noteOwedCapThrottle_("shard poll");
+            RUNE_FR_THROTTLED_RUNTIME(frIngressSkip_, rune_fr::Site::ShIngressSkip, static_cast<uint32_t>(workerId_), 3);
+            if (reservedAckSlots_() >= static_cast<int64_t>(maxOwedReturns_)) noteOwedCapThrottle_("shard poll", 1);
             return 0;
         }
 
@@ -4706,12 +4770,16 @@ private:
                     if (ackSink_->heldAcks() != 0 && len >= kProduceSessionIdEnd) [[unlikely]] {
                         if (ackSink_->holding(produceSessionIdOf_(data))) {
                             ++intakePausedFrames_;
+                            RUNE_FR_THROTTLED_PRODUCE(frIntakePaused_, rune_fr::Site::ShIntakePaused,
+                                                      static_cast<uint32_t>(produceSessionIdOf_(data)), 0);
                             return aeron::ControlledPollAction::ABORT;
                         }
                     }
                     polled += handleWorkerIngressFrame_(data, len, nowNs);
                     return aeron::ControlledPollAction::CONTINUE;
                 });
+            if (polled > 0) RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShIngressFrags, static_cast<uint32_t>(workerId_),
+                                                         static_cast<double>(polled));
             return polled;
         }
         workerIngress_->poll(
@@ -4763,6 +4831,9 @@ private:
             return 0;
         }
         const pc::Produce& msg = *msgOpt;
+        // Hop chain: the client frame reached its shard directly (C = batch id).
+        RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ShIngressFrame, rune_fr::foldCorr(msg.correlationId),
+                                     static_cast<uint16_t>(workerId_), static_cast<double>(len));
 
         // Look up the owned Log + replica for this partition.
         auto [log, replica] = getLogAndReplicaForPartition_(msg.topicId, msg.partition);
@@ -4949,7 +5020,7 @@ private:
         // F15 S2 R-4c rule); no slot → retriable NotLeader, log untouched.
         if (f.fromOp && (acksAll || asyncStrict) && !ackReservationAvailable_()) [[unlikely]] {
             ++acksAllRefusedNoReservation_;
-            if (!owedCapAllows_()) noteOwedCapThrottle_("gateway-routed produce");
+            if (!owedCapAllows_()) noteOwedCapThrottle_("gateway-routed produce", 2);
             if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
                 spdlog::warn("Worker {}: parked (acks=all / Strict) produce refused NotLeader — return-ring reservation "
                              "exhausted (owed={}, total refused={})", workerId_, reservedAckSlots_(),
@@ -4997,10 +5068,20 @@ private:
         if (!outcome.isOK()) {
             ret.errorCode = static_cast<int16_t>(
                 static_cast<int>(outcome.error));
+            // Hop chain: answered without an append (value = -errorCode).
+            RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ShAppendCorr, rune_fr::foldCorr(f.correlationId),
+                                         static_cast<uint16_t>(workerId_), -static_cast<double>(ret.errorCode));
             enqueueReturn_(ret);
             return 1;
         }
 
+        // Hop chain: C -> K(lastOffset) link (the replication marks are keyed by
+        // K), and the batch's base (value = its full last offset).
+        RUNE_FR_MARK_ARG_VAL_PRODUCE(rune_fr::Site::ShAppendCorr, rune_fr::foldCorr(f.correlationId),
+                                     static_cast<uint16_t>(workerId_),
+                                     static_cast<double>(rune_fr::partKey(f.topicId, f.partition, ret.lastOffset)));
+        RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShAppendBase, rune_fr::partKey(f.topicId, f.partition, ret.baseOffset),
+                                     static_cast<double>(ret.lastOffset));
         // Waterfall: leader appended [baseOffset..lastOffset].  Keyed by lastOffset.
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplLeaderAppend,
             (static_cast<uint32_t>(f.partition) << 24) |
@@ -5060,6 +5141,8 @@ private:
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplPendingAckEnqueue,
             (static_cast<uint32_t>(ret.partition) << 24) |
                 (static_cast<uint32_t>(lastOff) & 0xFFFFFFu));   // a duplicate: its ORIGINAL range
+        RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShWaiterPark, rune_fr::foldCorr(ret.correlationId),
+                                     static_cast<double>(rune_fr::partKey(f.topicId, f.partition, lastOff)));
         PendingAcksAll pending;
         pending.replica    = replica;
         pending.lastOffset = lastOff;

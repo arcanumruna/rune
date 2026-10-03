@@ -268,7 +268,9 @@ public:
     {
         aeron::ExclusivePublication* pub = findPub_(peer);
         if (!pub) return -1;
-        return sendOnPub_(*pub, buf, len);
+        const int64_t pos = sendOnPub_(*pub, buf, len);
+        if (pos <= 0) [[unlikely]] noteRefused_(peer, pos);
+        return pos;
     }
 
     // -----------------------------------------------------------------------
@@ -289,7 +291,8 @@ public:
         for (std::size_t i = 0; i < pubCount_; ++i) {
             if (pubs_[i].pub && !pubs_[i].blocked) {
                 all = true;
-                if (sendOnPub_(*pubs_[i].pub, buf, len) <= 0) anyRefused = true;
+                const int64_t pos = sendOnPub_(*pubs_[i].pub, buf, len);
+                if (pos <= 0) { anyRefused = true; noteRefused_(pubs_[i].id, pos); }
             }
         }
         return all && !anyRefused;
@@ -326,6 +329,8 @@ public:
                 std::memcpy(dst, prefix, prefixLen);
                 if (!body.empty()) std::memcpy(dst + prefixLen, body.data(), body.size());
                 claim.commit();
+            } else {
+                noteRefused_(peer, pos);
             }
             return pos;
         }
@@ -334,10 +339,19 @@ public:
                                             static_cast<aeron::util::index_t>(prefixLen)),
             aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(body.data()),
                                             static_cast<aeron::util::index_t>(body.size()))};
-        return pub->offer(parts);
+        const int64_t pos = pub->offer(parts);
+        if (pos <= 0) [[unlikely]] noteRefused_(peer, pos);
+        return pos;
     }
 
 private:
+    // FR: a refused plane send (arg = -position: 1 NOT_CONNECTED, 2 BACK_PRESSURED,
+    // 3 ADMIN_ACTION, ...) — throttled: a refused send is retried every pass.
+    void noteRefused_([[maybe_unused]] rune::replication::NodeId peer, [[maybe_unused]] int64_t pos) noexcept {
+        RUNE_FR_THROTTLED_REPLICATION(frRefused_, rune_fr::Site::ShPlanePubRefused, static_cast<uint32_t>(peer),
+                                      static_cast<uint16_t>(pos < 0 ? -pos : 0));
+    }
+
     // Zero-copy tryClaim for ≤ maxPayloadLength; offer() for larger frames.
     // Mirrors Worker::sendEncodedToPub_ (Worker.h:1064-1085) plus the
     // defence-in-depth maxMessageLength guard from AeronPartitionTransport::sendOnPub.
@@ -392,6 +406,7 @@ private:
 
     bool                           allResolved_ = false;
     uint64_t                       oversizeDrops_ = 0;   // F3 r6: owner-worker-thread only
+    [[no_unique_address]] rune_fr::Throttle frRefused_{};   // FR only (owner worker thread)
     std::array<PeerPub, kMaxPeers> pubs_{};
     std::size_t                    pubCount_    = 0;
 };
@@ -563,7 +578,7 @@ public:
     template <class Dispatch>
     int poll(int fragmentLimit, Dispatch&& dispatch)
     {
-        RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplWorkerPoll, 0);
+        RUNE_FR_SLOW_SPAN_REPLICATION(rune_fr::Site::ReplWorkerPoll, 0);   // every pass: outliers only
         if (!resolved()) [[unlikely]] return 0;
 
         using D = std::remove_reference_t<Dispatch>;

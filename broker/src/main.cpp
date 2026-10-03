@@ -69,44 +69,35 @@ static void drainControlEvents(rune::node::ControlEventRing& events, ControlStat
 // ---------------------------------------------------------------------------
 // rune-fr — flight recorder init + report helpers.
 // ---------------------------------------------------------------------------
-// Per-thread ring size: env RUNE_FR_RING_BYTES, default 128 MiB/thread (~5.6M
-// 24-byte records) so a full bench run is captured without drop-on-full. MUST be
-// set BEFORE any broker thread registers a ring (i.e. before node.start()).
+// rune_fr::configureFromEnv: RUNE_FR_ENABLE arms recording (compiled in, OFF by
+// default); RUNE_FR_RING_BYTES (default 128 MiB/thread), RUNE_FR_CATEGORIES,
+// RUNE_FR_SLOW_SPAN_NS, RUNE_FR_THROTTLE_NS, RUNE_FR_DRAIN_MS (a background
+// drainer keeps a long run from filling the rings).  MUST run BEFORE any broker
+// thread registers a ring (i.e. before node.start()).
 static void frConfigure() {
-    std::uint64_t ringBytes = 128ull * 1024 * 1024;
-    if (const char* rb = std::getenv("RUNE_FR_RING_BYTES")) {
-        const std::uint64_t v = std::strtoull(rb, nullptr, 10);
-        if (v > 0) ringBytes = v;
-    }
-    rune_fr::Recorder::instance().configure(static_cast<size_t>(ringBytes));
-
-    if (std::getenv("RUNE_FR_ENABLE")) {
-        rune_fr::enable();
-        spdlog::info("rune-fr: flight recording ENABLED (ring {} MiB/thread)",
-                     ringBytes / (1024 * 1024));
+    if (rune_fr::configureFromEnv()) {
+        spdlog::info("rune-fr: flight recording ENABLED (slow-span {} ns, throttle {} ns)",
+                     static_cast<uint64_t>(rune_fr::cyclesToNs(rune_fr::slowSpanTsc())),
+                     static_cast<uint64_t>(rune_fr::cyclesToNs(rune_fr::throttleTsc())));
     }
 }
 
-// Drain all thread rings and write histogram + Chrome-trace + raw tape to
-// RUNE_FR_OUT (default cwd). Off the hot path (shutdown / SIGUSR1).
+// Drain all thread rings and write hist + Chrome trace + tape + meta (the
+// cross-process anchor) to RUNE_FR_OUT (default cwd).  Off the hot path
+// (shutdown / SIGUSR1).
 static void frReport(const std::string& tag) {
     if (!rune_fr::isEnabled()) return;
-    rune_fr::Recorder::instance().drain();
     const char* out = std::getenv("RUNE_FR_OUT");
     const std::string dir = (out && *out) ? out : ".";
     // Disambiguate per broker so co-located cluster nodes sharing one RUNE_FR_OUT
     // dir do not overwrite each other's reports: suffix with node id + pid.
     const char* nid = std::getenv("RUNE_NODE_ID");
-    const std::string sfx = "-n" + std::string(nid ? nid : "x") +
-                            "-p" + std::to_string(static_cast<long>(::getpid())) +
-                            "-" + tag;
-    {
-        std::ofstream f(dir + "/fr-hist" + sfx + ".txt");
-        if (f) rune_fr::dumpHistograms(f);
-    }
-    rune_fr::exportChromeTrace(dir + "/fr-trace" + sfx + ".json");
-    rune_fr::writeTape(dir + "/fr-tape" + sfx + ".bin");
-    spdlog::info("rune-fr: report written to {} (suffix={})", dir, sfx);
+    const std::string node = nid ? nid : "x";
+    const std::string sfx = "-n" + node + "-p" + std::to_string(static_cast<long>(::getpid())) + "-" + tag;
+    if (rune_fr::dumpAll(dir, sfx, "broker", node))
+        spdlog::info("rune-fr: report written to {} (suffix={}, dropped={})", dir, sfx, rune_fr::droppedRecords());
+    else
+        spdlog::error("rune-fr: report to {} (suffix={}) FAILED", dir, sfx);
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,13 @@
 
 namespace rune::replication {
 
+namespace {
+// FR hop key K(offset) for this replica (rune_fr::partKey).
+[[maybe_unused]] inline uint32_t frKey_(const PartitionConfig& c, Offset off) noexcept {
+    return rune_fr::partKey(c.topicId, static_cast<int32_t>(c.partitionId), off);
+}
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Helper: build a minimal RecordBatch wrapping raw bytes as a single record.
 // Uses the protocol builder so the batch header is valid (CRC stamped etc).
@@ -756,6 +763,11 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         ? decideFetchServe(*slot, req.fetchOffset, req.maxBytes, logEndOffset_(),
                            cfg_.pushOnAppend, nowNs, kFetchResendNs)
         : (req.maxBytes > 0 ? FetchServe::Data : FetchServe::AckOnly);
+    // Hop chain: the follower's fetch / fast-ack reached the leader (K = its LEO).
+    RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShFetchRecv, frKey_(cfg_, req.fetchOffset),
+                                 static_cast<double>((static_cast<int64_t>(req.followerId) << 1) | (req.maxBytes > 0 ? 1 : 0)));
+    RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShServeDecision, frKey_(cfg_, req.fetchOffset),
+                                 static_cast<double>((static_cast<int64_t>(req.followerId) << 2) | static_cast<int64_t>(serve)));
 
     // F18 / KIP-74 (I-1, B-2): ONE readView for a Data serve, reused for the serve
     // below.  readView always includes the first batch whole, so v.len > maxBytes
@@ -806,6 +818,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     {
         const Offset newHwOnFetch = leaderState_.highWatermark();
         if (newHwOnFetch > prevHwOnFetch) {
+            RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShHwAdvanceFetch, frKey_(cfg_, newHwOnFetch - 1),
+                                         static_cast<double>(req.followerId));
             RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
                 (static_cast<uint32_t>(cfg_.partitionId) << 24) |
                     (static_cast<uint32_t>(newHwOnFetch - 1) & 0xFFFFFFu));
@@ -889,9 +903,13 @@ bool PartitionReplica::sendFetchAnswer_(FollowerSlot* slot, NodeId follower,
 {
     const bool ok = onTransport([&](auto& t) { return t.sendFetchResponse(follower, resp); });
     if (ok) [[likely]] {
+        RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShAnswerSent, frKey_(cfg_, fetchOffset),
+                                     static_cast<double>(resp.records.size()));
         if (slot && dataEnd > slot->dataServedThrough) slot->dataServedThrough = dataEnd;   // F6
         return true;
     }
+    RUNE_FR_THROTTLED_REPLICATION(frAnswerRefused_, rune_fr::Site::ShAnswerRefused, frKey_(cfg_, fetchOffset),
+                                  static_cast<uint16_t>(follower));
     ++sendRefusals_;
     if (slot != nullptr) {
         slot->forgetServe();
@@ -946,8 +964,12 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
             s.owed = FollowerSlot::OwedAnswer{};
             if (dataEnd > s.dataServedThrough) s.dataServedThrough = dataEnd;   // F6
             if (!records.empty()) ++fetchDataServes_;
+            RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShAnswerSent, frKey_(cfg_, owed.fetchOffset),
+                                         static_cast<double>(records.size()));
             ++sent;
         } else {
+            RUNE_FR_THROTTLED_REPLICATION(frAnswerRefused_, rune_fr::Site::ShAnswerRefused, frKey_(cfg_, owed.fetchOffset),
+                                          static_cast<uint16_t>(s.id));
             ++sendRefusals_;
         }
     }
@@ -1080,6 +1102,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
     const Offset preLeo = logEndOffset_();
     const Offset preHw  = followerHw_;
+    // Hop chain: a push / fetch answer reached this follower (K = its LEO before).
+    RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShApplyEntry, frKey_(cfg_, preLeo),
+                                 static_cast<double>(resp.records.size()));
     // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
     //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
@@ -1246,6 +1271,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     //     leader's ReplLeaderAppend / ReplHwAdvance for end-to-end (cross-node)
     //     replication latency.
     if (postLeo > preLeo) {
+        RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShApplyDone, frKey_(cfg_, postLeo - 1),
+                                     static_cast<double>(preLeo));
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFollowerRecv,
             (static_cast<uint32_t>(cfg_.partitionId) << 24) |
                 (static_cast<uint32_t>(postLeo - 1) & 0xFFFFFFu));
@@ -1257,8 +1284,16 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                             // (data flows via push / the single-outstanding fetch).
         // F27: a refused ack is OWED and re-sent on the next doWork pass (the
         // acks=all commit point depends on it — never wait for a fetch timer).
-        if (sendFetchToLeader_(ack)) followerSync_.onFetchSent();
-        else { followerSync_.onAckRefused(); ++sendRefusals_; }
+        if (sendFetchToLeader_(ack)) {
+            followerSync_.onFetchSent();
+            RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShFastAckSent, frKey_(cfg_, ack.fetchOffset),
+                                         static_cast<double>(postHw));
+        } else {
+            followerSync_.onAckRefused();
+            ++sendRefusals_;
+            RUNE_FR_THROTTLED_REPLICATION(frFastAckRefused_, rune_fr::Site::ShFastAckRefused,
+                                          frKey_(cfg_, ack.fetchOffset), 0);
+        }
     }
 }
 
@@ -1967,6 +2002,11 @@ int PartitionReplica::doWork(int64_t nowNs)
                 if (fl < minFollowerLeo) minFollowerLeo = fl;
             }
             const Offset pushCeiling = minFollowerLeo + kPushFlowWindow;
+            // FR: the leader holds data it may not push yet (the slowest ISR
+            // follower is a whole flow window behind) — throttled, every pass.
+            if (pushCeiling <= pushFloor)
+                RUNE_FR_THROTTLED_REPLICATION(frPushWindow_, rune_fr::Site::ShPushWindowBlocked,
+                                              frKey_(cfg_, pushFloor), 0);
             if (pushCeiling > pushFloor &&
                 !unsendablePushSuppressed_(pushCeiling, pushFloor)) {
                 // F27: work only for ACCEPTED pushes — a follower whose pushes are
@@ -2181,8 +2221,16 @@ int PartitionReplica::doWork(int64_t nowNs)
                 // F27: a refused fetch never left — undo the emit so the NEXT pass
                 // re-sends it (no resend-timer wait for our own refusal).
                 const bool sent = sendFetchToLeader_(req);
-                if (sent) followerSync_.onFetchSent();
-                else { followerSync_.onFetchRefused(); ++sendRefusals_; }
+                if (sent) {
+                    followerSync_.onFetchSent();
+                    RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShFetchSent, frKey_(cfg_, req.fetchOffset),
+                                                 act.wantData ? 1.0 : 0.0);
+                } else {
+                    followerSync_.onFetchRefused();
+                    ++sendRefusals_;
+                    RUNE_FR_THROTTLED_REPLICATION(frFetchRefused_, rune_fr::Site::ShFetchRefused,
+                                                  frKey_(cfg_, req.fetchOffset), act.wantData ? 1 : 0);
+                }
                 // F4: real catch-up counts as work only when it LEFT — a refused
                 // fetch is retried next pass but lets the idle strategy back off.
                 if (sent && act.wantData) ++work;
@@ -2204,8 +2252,16 @@ int PartitionReplica::doWork(int64_t nowNs)
             if (!wedged && followerSync_.ackOwed()) {
                 FetchRequestMsg ack = nextFetch();
                 ack.maxBytes = 0;
-                if (sendFetchToLeader_(ack)) { followerSync_.onFetchSent(); ++work; }
-                else ++sendRefusals_;
+                if (sendFetchToLeader_(ack)) {
+                    followerSync_.onFetchSent();
+                    ++work;
+                    RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShFastAckSent, frKey_(cfg_, ack.fetchOffset),
+                                                 static_cast<double>(followerHw_));
+                } else {
+                    ++sendRefusals_;
+                    RUNE_FR_THROTTLED_REPLICATION(frFastAckRefused_, rune_fr::Site::ShFastAckRefused,
+                                                  frKey_(cfg_, ack.fetchOffset), 1);
+                }
             }
         }
     }
@@ -2438,6 +2494,7 @@ void PartitionReplica::recomputeHw()
     //     Keyed by (partition<<24)|committedOffset to pair with ReplLeaderAppend.
     const Offset newHwRecompute = leaderState_.highWatermark();
     if (newHwRecompute > prevHwRecompute) {
+        RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShHwAdvanceFetch, frKey_(cfg_, newHwRecompute - 1), -1.0);
         RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplHwAdvance,
             (static_cast<uint32_t>(cfg_.partitionId) << 24) |
                 (static_cast<uint32_t>(newHwRecompute - 1) & 0xFFFFFFu));
@@ -2648,10 +2705,15 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
 
         const bool ok = onTransport([&](auto& t) { return t.sendFetchResponse(followerId, resp); });
         if (ok) [[likely]] {
+            // Hop chain: push covering [from, endOffset) left for this follower.
+            RUNE_FR_MARK_VAL_REPLICATION(rune_fr::Site::ShPushSent, frKey_(cfg_, pre.endOffset - 1),
+                                         static_cast<double>(followerId));
             ++accepted;
             rtPushBytes_ += static_cast<int64_t>(pre.bytes);
             if (pre.endOffset > slot->pushedThrough) slot->pushedThrough = pre.endOffset;
         } else {
+            RUNE_FR_THROTTLED_REPLICATION(frPushRefused_, rune_fr::Site::ShPushRefused, frKey_(cfg_, from),
+                                          static_cast<uint16_t>(followerId));
             ++sendRefusals_;   // cursor unchanged: re-sent from it on the next pass
         }
     }

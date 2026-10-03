@@ -1,3 +1,4 @@
+#include <rune_fr/FlightRecorder.h>
 #include <rune/storage/LogSegment.h>
 #include <rune/protocol/RecordBatch.h>
 #include <algorithm>
@@ -223,7 +224,8 @@ int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, in
 
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
         rune::protocol::RecordBatchReader r(data, len);
-        index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
+        { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageIndex, 0);
+          index_->append(r.baseOffset(), logSize_); } // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
     log_.seekp(0, std::ios::end);
@@ -257,7 +259,8 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // Update the sparse index (mmap write, no syscall).
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
         rune::protocol::RecordBatchReader r(data, len);
-        index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
+        { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageIndex, 0);
+          index_->append(r.baseOffset(), logSize_); } // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
 
@@ -278,7 +281,9 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // A leader crash before sync() (flushDirtyLogs) may lose the tail.
     // TODO(Milestone C): acks=All waits for ISR HWM before acking.
     off_t writePos = static_cast<off_t>(logSize_);
-    ssize_t written = ::pwrite(fd_, data, len, writePos);
+    ssize_t written;
+    { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StoragePwrite, static_cast<uint32_t>(len));
+      written = ::pwrite(fd_, data, len, writePos); }
     if (written < 0 || static_cast<std::size_t>(written) != len) {
         throw std::runtime_error("rune: LogSegment::appendNoSync pwrite failed");
     }
@@ -303,7 +308,8 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
     // Sparse index: use the ASSIGNED baseOffset (data still carries the stale
     // client value, so we must NOT read it via RecordBatchReader::baseOffset()).
     if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
-        index_->append(baseOffset, logSize_); // C4: OffsetIndex guards 2GiB
+        { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageIndex, 0);
+          index_->append(baseOffset, logSize_); } // C4: OffsetIndex guards 2GiB
         bytesSinceIndex_ = 0;
     }
 
@@ -321,7 +327,9 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
     iov[1].iov_len  = len - 8;
 
     off_t writePos = static_cast<off_t>(logSize_);
-    ssize_t written = ::pwritev(fd_, iov, 2, writePos);
+    ssize_t written;
+    { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StoragePwrite, static_cast<uint32_t>(len));
+      written = ::pwritev(fd_, iov, 2, writePos); }
     if (written < 0 || static_cast<std::size_t>(written) != len) {
         throw std::runtime_error("rune: LogSegment::appendNoSyncRestamp pwritev failed");
     }

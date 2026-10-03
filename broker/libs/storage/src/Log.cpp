@@ -490,7 +490,7 @@ int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // This ensures the incremental counter tracks batches that land on the
     // current active segment, NOT the batch that caused the roll.
     throwIfFailed_();
-    maybeRoll();
+    { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageRoll, 0); maybeRoll(); }
     logEndOffset_ = activeSegment().append(data, len, lastOffset);
     // Update incremental largestTimestamp AFTER the write (and after any roll)
     // so this batch's maxTimestamp is attributed to the segment it was written to.
@@ -512,7 +512,7 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
     // The caller (gateway doWork) calls sync() once after the ingress batch.
     // CP-8: same post-roll update pattern as append() above.
     throwIfFailed_();
-    maybeRoll();
+    { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageRoll, 0); maybeRoll(); }
     logEndOffset_ = activeSegment().appendNoSync(data, len, lastOffset);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
         rune::protocol::RecordBatchReader r(data, len);
@@ -530,7 +530,7 @@ int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
     // the base offset is read AFTER the roll so it matches the segment the batch
     // actually lands in.
     throwIfFailed_();
-    maybeRoll();
+    { RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageRoll, 0); maybeRoll(); }
     const int64_t base       = logEndOffset_;
     const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
     outBaseOffset = base;

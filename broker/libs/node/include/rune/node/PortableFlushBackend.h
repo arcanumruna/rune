@@ -56,6 +56,7 @@
 #include <thread>
 
 #include <rune/consensus/IdleStrategy.h>
+#include <rune_fr/FlightRecorder.h>
 
 #include <cerrno>
 #include <unistd.h>
@@ -330,8 +331,15 @@ void BasicPortableFlushBackend<Sync>::flusherLoop_() {
                 const CompletionToken reqTok   = r.token;
 
                 // Perform the datasync (may block — intentional; off the worker path).
-                int rc = Sync(reqFd);
-                int saved_errno = (rc != 0) ? errno : 0;
+                int rc;
+                int saved_errno;
+                {
+                    // FR: the fdatasync itself, on the flusher thread (off the worker).
+                    // errno is captured inside the span (its commit may register a ring).
+                    RUNE_FR_SPAN_STORAGE(rune_fr::Site::StorageFsync, static_cast<uint32_t>(reqFd));
+                    rc = Sync(reqFd);
+                    saved_errno = (rc != 0) ? errno : 0;
+                }
                 const int32_t ec = (rc == 0) ? 0 : saved_errno;
 
                 // SBE wrap-in-place encode of the completion into the claimed slot.
