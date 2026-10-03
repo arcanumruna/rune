@@ -130,15 +130,18 @@ public:
     /// @param nowNs               Current monotonic time in nanoseconds.
     /// @param deleteRetentionMs   How long (ms) to retain tombstones before
     ///                            removing them entirely.
+    /// @param nowMs               Wall-clock epoch-ms (KIP-534 delete horizon for
+    ///                            tombstones AND removable txn markers).  -1 =
+    ///                            legacy nowNs tombstone path; markers are kept.
     void compact(Log& log, OffsetMap& map,
                  Offset firstDirtyOffset, Offset cleanBoundaryOffset,
-                 int64_t nowNs, int64_t deleteRetentionMs);
+                 int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs = -1);
 
     /// Convenience: build the offset map and compact in one call.
     /// The dirty range is [log.firstDirtyOffset, cleanBoundaryOffset).
     /// `firstDirtyOffset` is typically 0 for a fresh compaction.
     void clean(Log& log, Offset firstDirtyOffset, Offset cleanBoundaryOffset,
-               int64_t nowNs, int64_t deleteRetentionMs);
+               int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs = -1);
 
     /// CP-2: bounded, single-segment compaction (the duty-cycle unit of work).
     ///
@@ -335,7 +338,8 @@ private:
                             Offset fromOffset, Offset cleanBoundaryOffset,
                             int64_t nowNs, int64_t deleteRetentionMs,
                             int64_t nowMs = -1, bool* changed = nullptr,
-                            const ProducerTails* tails = nullptr);
+                            const ProducerTails* tails = nullptr,
+                            const TxnCleanState* txn = nullptr);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones

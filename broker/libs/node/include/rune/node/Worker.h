@@ -2976,6 +2976,7 @@ private:
                 if (RcState* rc = rcOf_(replica)) {
                     if (mpOk)
                         rc->onMarker(mp.producerId, base, mp.controlType == rune::transaction::ControlType::Commit);
+                    publishCleanerLso_(replica, *rc);   // D3b: a resolved txn lifts the cleaner's cap
                 }
                 // N2 (minor): keep append()'s flush request on the worker — a
                 // Strict-tier marker joins this pass's coalesced durable flush
@@ -4006,10 +4007,18 @@ private:
         for (std::size_t k = 0, i = rcWalkStart_; k < n; ++k) {
             RcSlot& sl = rcSlots_[i];
             work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;
+            publishCleanerLso_(sl.replica, *sl.rc);   // D3b: Ready / reset transitions
             if (++i == n) i = 0;
         }
         if (++rcWalkStart_ == n) rcWalkStart_ = 0;
         return work;
+    }
+    // D3b: publish the partition's first unstable offset to the cleaner (only on
+    // change).  Called on every RC transition: the per-pass driver (Ready / reset)
+    // and right after each txn data batch / marker the RC state applies.
+    static void publishCleanerLso_(rune::replication::PartitionReplica* r, RcState& rc) noexcept {
+        int64_t v = 0;
+        if (rc.takeCleanerLsoChange(v)) r->publishCleanerLso(v);
     }
     // §2.3 produce gate: the RC state for an idempotent / transactional batch,
     // after one inline build step if it is not Ready; nullptr → refuse NotLeader.
@@ -5154,8 +5163,10 @@ private:
 
         // F15 §2.1 (C1): RC update in the same invocation as the append; a
         // duplicate retry was registered with its original.
-        if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]]
+        if (rc != nullptr && !outcome.isDuplicate && (outcome.batchAttrs & kTxnAttrBit) != 0) [[unlikely]] {
             rc->onTxnBatch(f.producerId, outcome.baseOffset);
+            if (replica) publishCleanerLso_(replica, *rc);   // D3b: an open txn caps the cleaner
+        }
 
         // F15 S5 (Kafka parity; re-review 1 I1 residual, re-review 2): a
         // DUPLICATE is answered only under its original batch's ack condition —

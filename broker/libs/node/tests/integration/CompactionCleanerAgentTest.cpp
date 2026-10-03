@@ -2599,3 +2599,69 @@ TEST(CompactionCleanerAgent, CompactionConvergesWithSingleSegmentGroups) {
 
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// D3b REGRESSION: the cleanable range is capped at the partition's LSO.
+//
+// Kafka cleans only below min(activeSegmentBase, LSO): an OPEN transaction's data
+// may still abort, and an aborted value must never supersede a committed one.  The
+// owning worker publishes the first unstable offset (PartitionReplica::
+// publishCleanerLso); the agent must never clean at/after it — even when the log
+// itself carries no txn data (this pins the agent-level wiring, independent of
+// LogCleaner's own unresolved-txn scan).  Then lifting the LSO lets it converge.
+// ===========================================================================
+TEST(LogCleanerAgentLsoRegression, CleanableRangeCappedAtPublishedLso) {
+    auto dir = cp6TempDir("d3b_lso_cap");
+    Log log(dir.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(690);
+    auto replicaOwned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replicaOwned->becomeLeader(1, {1});
+    constexpr int kRecords = 200;
+    constexpr int64_t kLso = 50;
+    for (int v = 0; v < kRecords; ++v) log.append(cp6Batch(v, "k1", "v" + std::to_string(v)), v);
+    replicaOwned->onLeaderLogAppended();
+    ASSERT_GT(replicaOwned->cleanerHighWatermark(), kLso) << "precondition: HW above the LSO";
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u) << "precondition: several sealed segments";
+    PartitionReplica* replica = replicaOwned.get();
+    replica->publishCleanerLso(kLso);   // an open txn starts at 50 (published by its worker)
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(690, 0, std::move(replicaOwned));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent duty(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0);
+
+    auto liveAtOrAbove = [&](int64_t from) {
+        int n = 0;
+        for (int64_t o = from; o < kRecords; ++o) {
+            auto bytes = log.read(o, 1 << 20);
+            if (bytes.empty()) continue;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            if (r.ensureValid() && r.baseOffset() == o && r.recordCount() > 0) ++n;
+        }
+        return n;
+    };
+    constexpr int kCycles = 16;   // bounded drive: each cycle = one cleaner pass + swap drain
+    for (int i = 0; i < kCycles; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        duty.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+    EXPECT_LE(replica->lastCleanOffset(), kLso) << "clean watermark crossed the published LSO";
+    EXPECT_EQ(liveAtOrAbove(kLso), kRecords - kLso) << "records at/after the LSO must be untouched";
+    EXPECT_LT(cp6CountLiveRecords(log), kRecords) << "below the LSO the cleaner still works";
+
+    // The transaction resolves: the LSO lifts → the cleaner converges past it.
+    replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    for (int i = 0; i < kCycles; ++i) {
+        cleaner.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
+        duty.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+    EXPECT_GT(replica->lastCleanOffset(), kLso);
+    EXPECT_LT(liveAtOrAbove(kLso), kRecords - kLso) << "after the LSO lifts, the range above it is cleaned";
+    fs::remove_all(dir);
+}

@@ -580,6 +580,24 @@ public:
     [[nodiscard]] Offset gatewayHighWatermark() const noexcept {
         return publishedHwForCleaner_.load(std::memory_order_acquire);
     }
+    // D3b (Kafka LogCleaner parity): the cleaner never cleans at/after the last
+    // stable offset — an OPEN transaction's data must stay untouched (it may still
+    // abort, and an aborted value must never supersede a committed one).  The
+    // OWNING worker publishes the first offset of the earliest open transaction of
+    // its read_committed state (RcState LsoTracker) here; the LogCleanerAgent caps
+    // firstUncleanable at it, exactly as it does at cleanerHighWatermark().
+    // kNoCleanerLso (the default) = no open transaction known / not tracked: no cap
+    // beyond HW (the cleaner's own log scan still never cleans an unresolved txn).
+    // 0 = read_committed state not Ready yet: clean nothing.  Slightly stale is
+    // safe in the same way as the HW snapshot (the cleaner's own scan is the
+    // backstop for the publish window).
+    static constexpr Offset kNoCleanerLso = std::numeric_limits<Offset>::max();
+    void publishCleanerLso(Offset firstUnstableOffset) noexcept {
+        publishedLsoForCleaner_.store(firstUnstableOffset, std::memory_order_release);
+    }
+    [[nodiscard]] Offset cleanerLastStableOffset() const noexcept {
+        return publishedLsoForCleaner_.load(std::memory_order_acquire);
+    }
     // Task #13: gatewayIsrSize() — acquire-load of the published ISR size snapshot.
     // The owning worker publishes (in publishCleanerState()) the current ISR size
     // whenever the HW/ISR state is updated.  The gateway reads it in
@@ -1258,6 +1276,8 @@ private:
     std::atomic<Offset> publishedHwForCleaner_{0};
     std::atomic<int>    publishedRoleForCleaner_{static_cast<int>(Role::Follower)};
     std::atomic<int>    publishedIsrSizeForGateway_{0};
+    // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
+    std::atomic<Offset> publishedLsoForCleaner_{kNoCleanerLso};
 
     // Controller position snapshot (see controllerReplicaLeo()/controllerLeaderEpoch()).
     // Per-node published LEO (stored as leo+1; 0 = unknown), indexed by nodeId.

@@ -22,7 +22,7 @@
 // Byte dirty ratio (Kafka-exact, §3.2):
 //   cleanBytes     = Σ seg.sizeBytes() for segs with base < firstDirtyOffset
 //   cleanableBytes = Σ seg.sizeBytes() for segs with base ∈ [firstDirty, firstUncleanable)
-//   firstUncleanable = min(activeSegmentBase, highWatermark)
+//   firstUncleanable = min(activeSegmentBase, highWatermark, lastStableOffset)
 //   dirtyRatio     = cleanableBytes / (cleanBytes + cleanableBytes)
 //
 // SINGLE-WRITER INVARIANT — the cleaner thread NEVER touches Log::segments_ (§3.1):
@@ -301,6 +301,12 @@ public:
             // Clamping to hw keeps compaction strictly below the committed HW.
             const int64_t activeBase = snap->back().endOffset;
             int64_t firstUncleanable = std::min(activeBase, hw);
+            // D3b (Kafka: the cleanable range ends at the LAST STABLE OFFSET): an
+            // open transaction may still abort, so nothing at/after its first
+            // offset is cleaned.  The owning worker publishes it from its
+            // read_committed state (cleaner-visible snapshot, like the HW);
+            // LogCleaner's own unresolved-txn scan is the backstop.
+            firstUncleanable = std::min(firstUncleanable, replica->cleanerLastStableOffset());
             if (firstUncleanable < 0) firstUncleanable = 0;
 
             // CP-8: minCompactionLagMs — shrink firstUncleanable so segments

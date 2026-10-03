@@ -5173,3 +5173,26 @@ TEST(PsmLogConsistencyRegression, ProducerTailsAreBoundedByTheCleanerBudget) {
     t.note(1, 40, 100);                                       // existing producers still advance
     EXPECT_TRUE(t.mustRetain(1, 40, 100, -1, -1));
 }
+
+// D3b: the OWNING worker publishes the partition's first unstable offset (its
+// read_committed LsoTracker) to the cleaner-visible snapshot on every RC
+// transition, so the LogCleanerAgent never cleans an open transaction's data
+// (Kafka: the cleanable range ends at the LSO).  An open txn pins it at the txn's
+// first offset; its marker lifts it.
+TEST(CleanerLsoRegression, WorkerPublishesFirstUnstableOffsetToCleaner) {
+    EosRig R;
+    const int64_t sid = R.gw.injectTestSession();
+    for (int i = 0; i < 4; ++i) R.runWorker(2 + i);
+    ASSERT_EQ(R.r->cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso) << "precondition: nothing open";
+
+    ASSERT_EQ(R.ingressTxn(sid, 1, /*pid=*/5, 0, 0, /*acks=*/0, 10), 1);   // txn data at 0
+    EXPECT_EQ(R.r->cleanerLastStableOffset(), 0) << "an open txn at 0 must cap the cleaner at 0";
+    R.abortMarker(5, 0, 20);                                                 // marker at 1
+    EXPECT_EQ(R.r->cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso) << "the marker lifts the cap";
+
+    ASSERT_EQ(R.ingressTxn(sid, 2, /*pid=*/7, 0, 0, /*acks=*/0, 30), 1);   // txn data at 2
+    for (int i = 0; i < 4; ++i) R.runWorker(40 + i);
+    EXPECT_EQ(R.r->cleanerLastStableOffset(), 2) << "the open txn of pid 7 (first offset 2) must cap the cleaner";
+    R.abortMarker(7, 0, 50);
+    EXPECT_EQ(R.r->cleanerLastStableOffset(), PartitionReplica::kNoCleanerLso);
+}
