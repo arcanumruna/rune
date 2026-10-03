@@ -1032,7 +1032,9 @@ TEST(AtomicVisibility, CompleteCommit_TransitionsToEmpty_ReadyForNextTxn)
     // State must be Empty after complete.
     auto st = h.coordinator().state("reuse-txn");
     ASSERT_TRUE(st.has_value());
-    EXPECT_EQ(*st, TxnState::Empty) << "State must be Empty after complete commit";
+    // F15 §5.4 (5113a52, Kafka parity): CompleteCommit is the RESTING state after a commit; the
+    // txnId is reusable from it (the next AddPartitions starts a new txn) — asserted below.
+    EXPECT_EQ(*st, TxnState::CompleteCommit) << "CompleteCommit is the resting state after a commit";
 
     // Next txn on same txnId works.
     ASSERT_TRUE(h.addAllPartitions("reuse-txn", ir.producerId, ir.producerEpoch).ok());
@@ -1155,7 +1157,7 @@ TEST(DisasterRecovery, TxnLog_DurableAcrossReopen_StatePreserved)
     // Verify state before reopen.
     auto stBefore = h.coordinator().state("durable-txn");
     ASSERT_TRUE(stBefore.has_value());
-    EXPECT_EQ(*stBefore, TxnState::Empty);
+    EXPECT_EQ(*stBefore, TxnState::CompleteCommit);   // F15 §5.4 resting state
 
     // Reopen (no crash, orderly restart).
     h.recreateCoordinator(1);
@@ -1163,8 +1165,8 @@ TEST(DisasterRecovery, TxnLog_DurableAcrossReopen_StatePreserved)
     // State recovered.
     auto stAfter = h.coordinator().state("durable-txn");
     ASSERT_TRUE(stAfter.has_value());
-    EXPECT_EQ(*stAfter, TxnState::Empty)
-        << "Completed txn state must be Empty in the recovered coordinator";
+    EXPECT_EQ(*stAfter, TxnState::CompleteCommit)
+        << "the completed txn's resting state must survive the reopen (F15 §5.4)";
 }
 
 // ---------------------------------------------------------------------------
