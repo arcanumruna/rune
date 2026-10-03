@@ -12,10 +12,12 @@ extern "C" {
 #include "rune/node/EmbeddedDriver.h"
 
 #include <sched.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -38,7 +40,8 @@ struct Rig {
     rune_gso_totals_t       totals{};
     bool                    closed = false;
 
-    // gsoMode: 0 = stock Aeron, 1 = GSO+GRO, 2 = GSO+GRO with an injected sendmsg errno (inject before start).
+    // gsoMode: 0 = stock Aeron, 1 = GSO+GRO, 2 = GSO+GRO with an injected sendmsg errno (inject before start),
+    // 3 = GSO+GRO with `injectCount` received GRO buffers flagged MSG_TRUNC.
     bool start(int gsoMode, std::size_t mtu, int injectErr = 0, int injectCount = 0) {
         dir = "/dev/shm/rune-gso-test-" + std::to_string(::getpid()) + "-" + std::to_string(++g_rigSeq);
         if (aeron_driver_context_init(&dctx) < 0) return false;
@@ -54,6 +57,7 @@ struct Rig {
             gso = rune_gso_bindings_create(1, 1);
             if (gso == nullptr) return false;   // the VM kernel supports both: NULL here is a failure
             if (gsoMode == 2) rune_gso_bindings_test_inject(gso, injectErr, injectCount);
+            if (gsoMode == 3) rune_gso_bindings_test_inject_recv_trunc(gso, injectCount);
             if (rune_gso_bindings_install(dctx, gso) < 0) return false;
         }
         if (aeron_driver_init(&driver, dctx) < 0) return false;
@@ -118,8 +122,10 @@ void onFragment(void* clientd, const uint8_t* buf, size_t len, aeron_header_t*) 
 }
 
 // Publishes `sizes` on `pubRig`, subscribes on `subRig`, checks every message arrives once, in order, byte-exact.
-void roundTrip(Rig& pubRig, Rig& subRig, const std::string& channel, const std::vector<std::size_t>& sizes) {
-    aeron_subscription_t* sub = addSub(subRig.client, channel.c_str(), 1001);
+void roundTrip(Rig& pubRig, Rig& subRig, const std::string& channel, const std::vector<std::size_t>& sizes,
+               const std::string& subChannel = "", aeron_subscription_t* existingSub = nullptr) {
+    aeron_subscription_t* sub = existingSub != nullptr
+        ? existingSub : addSub(subRig.client, (subChannel.empty() ? channel : subChannel).c_str(), 1001);
     ASSERT_NE(sub, nullptr) << aeron_errmsg();
     aeron_exclusive_publication_t* pub = addPub(pubRig.client, channel.c_str(), 1001);
     ASSERT_NE(pub, nullptr) << aeron_errmsg();
@@ -176,6 +182,10 @@ std::string udp(int port, std::size_t mtu, const char* host = "localhost") {
 } // namespace
 
 TEST(UdpGsoBindings, PlatformSupportsBothOnTheBenchKernel) {
+    utsname u{};
+    int major = 0, minor = 0;
+    if (::uname(&u) == 0) std::sscanf(u.release, "%d.%d", &major, &minor);
+    if (major < 5) GTEST_SKIP() << "kernel " << u.release << " < 5.0: UDP_GRO unavailable (UDP_SEGMENT needs 4.18)";
     EXPECT_EQ(rune_gso_platform_supported(), 3);
 }
 
@@ -226,6 +236,13 @@ TEST(UdpGsoBindings, MixedPeersBothDirections) {
         ASSERT_TRUE(plainPub.start(0, 1408)) << aeron_errmsg();
         ASSERT_TRUE(groSub.start(1, 1408)) << aeron_errmsg();
         roundTrip(plainPub, groSub, udp(24604, 1408), mixedSizes(1408, 70));
+        groSub.close();
+        // The receiving socket ran with UDP_GRO on and delivered the stock burst byte-exact (roundTrip).  On
+        // loopback the kernel never coalesces independently sent datagrams (GRO merging happens in a NIC's
+        // NAPI path; lo only hands over GSO super-datagrams whole), so gro_datagrams stays 0 here by design.
+        EXPECT_EQ(groSub.totals.gro_transports, 1u) << "GRO must be enabled on the subscriber's receive socket";
+        EXPECT_EQ(groSub.totals.gro_trunc_drops + groSub.totals.gro_ctrunc_drops, 0u);
+        EXPECT_EQ(groSub.totals.gso_sends, 0u) << "the GRO-side rig only subscribed";
     }
 }
 
@@ -275,6 +292,7 @@ TEST(UdpGsoBindings, EmbeddedDriverInstallsGsoByDefault) {
     rune::node::EmbeddedDriverConfig on;
     on.dir = "/dev/shm/rune-gso-ed-on-" + std::to_string(::getpid());
     on.idleStrategy = "backoff";
+    on.mtuBytes = 1408;   // a network MTU: GSO groups MTU datagrams -> 16 msgs/send
     rune::node::EmbeddedDriver a(on, rune::node::DriverMode::Threaded);
     EXPECT_TRUE(a.udpGsoActive());
     EXPECT_EQ(a.maxMessagesPerSend(), 16u);
@@ -294,4 +312,88 @@ TEST(UdpGsoBindings, EmbeddedDriverInstallsGsoByDefault) {
     rune::node::EmbeddedDriver c(explicitCfg, rune::node::DriverMode::Threaded);
     EXPECT_TRUE(c.udpGsoActive());
     EXPECT_EQ(c.maxMessagesPerSend(), 4u) << "an explicit RUNE_AERON_MAX_MSGS_PER_SEND wins";
+}
+
+// Fix round 1 (review M1): GRO only on RECEIVER-affinity sockets.  The sender agent polls its control
+// sockets with mtu-sized buffers: a GRO-merged burst of status messages / NAKs would be truncated.
+TEST(UdpGsoBindings, GroNeverEnabledOnTheSenderControlSocketRegression) {
+    Rig r;
+    ASSERT_TRUE(r.start(1, 1408)) << aeron_errmsg();
+    roundTrip(r, r, udp(24610, 1408), mixedSizes(1408, 14));
+    r.close();
+    EXPECT_EQ(r.totals.transports, 2u) << "one send endpoint + one receive destination";
+    EXPECT_EQ(r.totals.gro_transports, 1u) << "GRO on the receive destination only, never the send endpoint";
+    EXPECT_GT(r.totals.gro_datagrams, 0u);
+}
+
+// Fix round 1 (review M1): a truncated GRO buffer is dropped (Aeron NAKs recover it), counted, and GRO is
+// turned off for that transport; delivery stays byte-exact.
+TEST(UdpGsoBindings, TruncatedGroBufferIsDroppedAndDisablesGroRegression) {
+    Rig r;
+    ASSERT_TRUE(r.start(3, 1408, 0, 1)) << aeron_errmsg();
+    roundTrip(r, r, udp(24611, 1408), mixedSizes(1408, 70));
+    r.close();
+    EXPECT_EQ(r.totals.gro_trunc_drops, 1u);
+    EXPECT_EQ(r.totals.gro_disabled, 1u) << "the transport that saw MSG_TRUNC turns GRO off";
+}
+
+// Fix round 1 (review L6): ENOBUFS on a GSO send is handled like stock sendmmsg (a send error; the batch is
+// re-sent from snd-pos) — never a GSO fallback, nothing lost, GSO resumes.
+TEST(UdpGsoBindings, InjectedEnobufsIsRetriedWithoutLossRegression) {
+    Rig r;
+    ASSERT_TRUE(r.start(2, 1408, ENOBUFS, 20)) << aeron_errmsg();
+    roundTrip(r, r, udp(24612, 1408), mixedSizes(1408, 70));
+    r.close();
+    EXPECT_GT(r.totals.gso_datagrams, 0u) << "GSO must resume after the injected ENOBUFS";
+    EXPECT_EQ(r.totals.gso_fallbacks, 0u) << "ENOBUFS is back-pressure, not 'unsupported'";
+}
+
+// Fix round 1 (review gap 7): multi-destination-cast with dynamic control (the broker's egress shape):
+// the publication sends to every subscriber that registered on its control endpoint.
+TEST(UdpGsoBindings, MdcDynamicControlRoundTripUsesGsoAndGro) {
+    Rig r;
+    ASSERT_TRUE(r.start(1, 1408)) << aeron_errmsg();
+    roundTrip(r, r, "aeron:udp?control=localhost:24613|control-mode=dynamic|mtu=1408", mixedSizes(1408, 70),
+              "aeron:udp?endpoint=localhost:24614|control=localhost:24613|mtu=1408");
+    r.close();
+    EXPECT_GT(r.totals.gso_datagrams, 0u);
+    EXPECT_GT(r.totals.gro_datagrams, 0u);
+    EXPECT_EQ(r.totals.gso_fallbacks, 0u);
+}
+
+// Fix round 1 (review L3): multi-destination subscription — the receive destination is added AND removed on
+// the receiver agent (aeron_driver_receiver.c on_remove_destination closes it there); the totals of a
+// transport closed off the conductor are still collected.
+TEST(UdpGsoBindings, MdsDestinationRemovedOnTheReceiverIsCounted) {
+    Rig r;
+    ASSERT_TRUE(r.start(1, 1408)) << aeron_errmsg();
+    aeron_subscription_t* sub = addSub(r.client, "aeron:udp?control-mode=manual", 1001);
+    ASSERT_NE(sub, nullptr) << aeron_errmsg();
+    const std::string dest = "aeron:udp?endpoint=localhost:24615";   // the publication carries mtu=1408
+    aeron_async_destination_t* ad = nullptr;
+    ASSERT_EQ(aeron_subscription_async_add_destination(&ad, r.client, sub, dest.c_str()), 0) << aeron_errmsg();
+    int addResult = 0;
+    ASSERT_TRUE(pollUntil([&] { return (addResult = aeron_subscription_async_destination_poll(ad)) != 0; }));
+    ASSERT_EQ(addResult, 1) << aeron_errmsg();
+    roundTrip(r, r, udp(24615, 1408), mixedSizes(1408, 70), "", sub);
+    aeron_async_destination_t* rd = nullptr;
+    ASSERT_EQ(aeron_subscription_async_remove_destination(&rd, r.client, sub, dest.c_str()), 0) << aeron_errmsg();
+    int removeResult = 0;
+    ASSERT_TRUE(pollUntil([&] { return (removeResult = aeron_subscription_async_destination_poll(rd)) != 0; }));
+    ASSERT_EQ(removeResult, 1) << aeron_errmsg();
+    r.close();
+    EXPECT_GT(r.totals.gro_datagrams, 0u) << "the receiver-closed destination's GRO counts were lost";
+    EXPECT_GE(r.totals.transports, 2u);
+}
+
+// Fix round 1 (review M2): at the loopback-derived 64 KiB MTU two datagrams never fit one GSO send, so the
+// driver keeps Aeron's 2 msgs/send (GSO/GRO bindings still installed: GRO still helps the receiver).
+TEST(UdpGsoBindings, LoopbackMtuKeepsAeronDefaultMsgsPerSendRegression) {
+    rune::node::EmbeddedDriverConfig c;
+    c.dir = "/dev/shm/rune-gso-ed-64k-" + std::to_string(::getpid());
+    c.idleStrategy = "backoff";
+    c.mtuBytes = 65504;
+    rune::node::EmbeddedDriver d(c, rune::node::DriverMode::Threaded);
+    EXPECT_TRUE(d.udpGsoActive());
+    EXPECT_EQ(d.maxMessagesPerSend(), 2u);
 }

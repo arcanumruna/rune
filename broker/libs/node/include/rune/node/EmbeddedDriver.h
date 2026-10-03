@@ -55,7 +55,7 @@ struct EmbeddedDriverConfig {
     /// Hosts this driver's endpoints use (loopback decides the derived MTU).
     /// Empty = loopback.
     std::vector<std::string> endpointHosts;
-    int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default (2), or 16 when udpGso is active
+    int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default (2), or 16 when GSO can group at this MTU
     bool        udpGso             = true;   ///< install rune_gso bindings (Linux UDP GSO/GRO; else stock)
     int32_t     senderIoVector     = 0;      ///< 0 = Aeron default
     int32_t     receiverIoVector   = 0;      ///< 0 = Aeron default
@@ -111,8 +111,9 @@ public:
     [[nodiscard]] bool               isOpen() const noexcept { return driver_ != nullptr; }
     [[nodiscard]] DriverMode         mode() const noexcept { return mode_; }
     [[nodiscard]] const std::string& dir() const noexcept { return cfg_.dir; }
-    /// The rune_gso UDP GSO/GRO bindings were installed (stays true after close()).
-    [[nodiscard]] bool udpGsoActive() const noexcept { return gsoWasActive_; }
+    /// UDP GSO send / GRO receive installed by the rune_gso bindings (stays reportable after close()).
+    [[nodiscard]] bool udpGsoActive() const noexcept { return (gsoActiveMask_ & 1) != 0; }
+    [[nodiscard]] bool udpGroActive() const noexcept { return (gsoActiveMask_ & 2) != 0; }
     /// GSO/GRO totals of every transport this driver closed; complete after close().
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
     /// network_publication_max_messages_per_send the driver was started with.
@@ -143,7 +144,7 @@ private:
     aeron_driver_t*         driver_ = nullptr;
     rune_gso_bindings_t*    gso_    = nullptr;   // owned; outlives ctx_ (Aeron points at it)
     rune_gso_totals_t       gsoTotals_{};
-    bool                    gsoWasActive_ = false;
+    int                     gsoActiveMask_ = 0;   // rune_gso_bindings_active(): 1 = GSO, 2 = GRO
     uint32_t                maxMessagesPerSend_ = 0;
     bool                    threadRunning_ = false;   // Threaded: CONTROLLER-owned
     rune::consensus::ControlRing<256> stopRing_;       // controller → driver thread

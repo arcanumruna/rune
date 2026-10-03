@@ -1,5 +1,6 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
+#include "rune/protocol/net/rune_udp_gso.h"
 
 #include <spdlog/spdlog.h>
 
@@ -129,12 +130,12 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
             rune_gso_bindings_delete(gso_);
             gso_ = nullptr;
         }
-        gsoWasActive_ = gso_ != nullptr;
+        gsoActiveMask_ = rune_gso_bindings_active(gso_);
     }
     if (cfg_.maxMessagesPerSend > 0)
         aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, static_cast<uint32_t>(cfg_.maxMessagesPerSend));
-    else if (gso_ != nullptr)
-        aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, 16U);   // GSO groups <= 16 datagrams
+    else if (const unsigned m = rune_gso_msgs_per_send(udpGsoActive(), static_cast<std::size_t>(cfg_.mtuBytes)); m > 0)
+        aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, m);   // GSO groups <= 16 datagrams
     maxMessagesPerSend_ = aeron_driver_context_get_network_publication_max_messages_per_send(ctx_);
     if (cfg_.senderIoVector > 0)
         aeron_driver_context_set_sender_io_vector_capacity(ctx_, static_cast<uint32_t>(cfg_.senderIoVector));
@@ -189,9 +190,12 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     } else {
         pumpOwner_ = std::this_thread::get_id();
     }
-    spdlog::info("EmbeddedDriver: started (dir={}, mode={}, mtu={}, gso={}, msgsPerSend={})", cfg_.dir,
-                 mode_ == DriverMode::Invoker ? "invoker" : "threaded", cfg_.mtuBytes,
-                 gso_ != nullptr ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_);
+    spdlog::info("EmbeddedDriver: started (dir={}, mode={})", cfg_.dir,
+                 mode_ == DriverMode::Invoker ? "invoker" : "threaded");
+    // WARN: visible in perf runs (RUNE_LOG_LEVEL=warn) — the INSTALLED UDP path of this driver.
+    spdlog::warn("EmbeddedDriver[{}]: udp mtu={} gso={} gro={} msgsPerSend={}", cfg_.dir, cfg_.mtuBytes,
+                 udpGsoActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"),
+                 udpGroActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_);
 }
 
 int EmbeddedDriver::doWork() noexcept {
@@ -259,6 +263,10 @@ void EmbeddedDriver::close() noexcept {
 void EmbeddedDriver::releaseGso_() noexcept {
     if (gso_ == nullptr) return;
     rune_gso_bindings_totals(gso_, &gsoTotals_);
+    if (gsoTotals_.gso_fallbacks > 0 || gsoTotals_.gro_disabled > 0)
+        spdlog::warn("EmbeddedDriver[{}]: udp runtime fallbacks: gso_fallbacks={} gro_disabled={} "
+                     "gro_trunc_drops={}", cfg_.dir, gsoTotals_.gso_fallbacks, gsoTotals_.gro_disabled,
+                     gsoTotals_.gro_trunc_drops);
     rune_gso_bindings_delete(gso_);
     gso_ = nullptr;
 }
