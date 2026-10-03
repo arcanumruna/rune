@@ -310,6 +310,16 @@ the final warmed 128 B / latency pass):
   fetchers 4 net 4 io 8: 631k.  Fewer threads win on 4 cores.
 => best tuned Kafka at 64 B ~ 674-688k rec/s vs Rune 1.43M (~2.1x).  Tuned Kafka latency not measured.
 
+### 4.10 Integ on PURE defaults reproduces the tuned config (2026-10-03, bee4476, k3s-node-01)
+
+No tuning env at all (harness sizes unset; the VM's stale cluster.sh forced 32 MiB terms until replaced by the repo
+copy).  Effective config: term 1 MiB, ctlTerm 1 MiB, fsyncMs{worker=0 follower=0}, backoff workers, rcvWindow 256 KiB,
+MTU 65504 (loopback, no GSO yet), 3-node acks=all 1 KiB:
+- 20k open loop: p50 455 us / p99 14.2 ms (tuned QD: 448 us / 9.8 ms), 0 errors.
+- saturation: 193,830 rec/s (tuned QD 200,506; early ack flush A5 not in the defaults yet), 0 errors.
+OPEN: CPU_BUSY ~99% on all 4 cores even at 20k rec/s with BACKOFF workers -> the backoff idle effectively never
+parks between passes (spin/yield phases).  "Never busy-spin" holds by name only; tune the backoff (backlog A7).
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
