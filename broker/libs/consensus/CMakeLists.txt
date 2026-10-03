@@ -38,7 +38,7 @@ if(BUILD_TESTING)
         PROPERTIES ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()
 
-option(BUILD_INTEGRATION_TESTING "Build integration tests" OFF)
+option(BUILD_INTEGRATION_TESTING "Build integration tests" ON)
 if(BUILD_INTEGRATION_TESTING)
     if(NOT BUILD_TESTING)
         find_package(GTest REQUIRED)

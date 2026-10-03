@@ -28,7 +28,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_storage_tests)
 endif()
 
-option(BUILD_INTEGRATION_TESTING "Build storage integration tests (no external deps — real filesystem only)" OFF)
+option(BUILD_INTEGRATION_TESTING "Build storage integration tests (no external deps — real filesystem only)" ON)
 if(BUILD_INTEGRATION_TESTING)
     find_package(GTest REQUIRED)
     add_executable(rune_storage_integration_tests

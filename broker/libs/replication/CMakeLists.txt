@@ -55,7 +55,7 @@ if(aeron_FOUND)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING
-    "Build replication cluster disaster/recovery integration tests (P3-6)" OFF)
+    "Build replication cluster disaster/recovery integration tests (P3-6)" ON)
 if(BUILD_REPLICATION_INTEGRATION_TESTING)
     if(NOT BUILD_TESTING)
         find_package(GTest REQUIRED)

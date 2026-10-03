@@ -34,7 +34,7 @@ endif()
 # mirror the replication integration target pattern.
 # ---------------------------------------------------------------------------
 option(BUILD_COORDINATION_INTEGRATION_TESTING
-    "Build consumer-group + compaction end-to-end integration tests (P4-5)" OFF)
+    "Build consumer-group + compaction end-to-end integration tests (P4-5)" ON)
 if(BUILD_COORDINATION_INTEGRATION_TESTING)
     if(NOT BUILD_TESTING)
         find_package(GTest REQUIRED)
