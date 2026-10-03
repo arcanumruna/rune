@@ -1084,6 +1084,9 @@ private:
     // the correct truncation.  This prevents an up-to-date survivor from
     // dropping its committed tail before the (possibly deficient) new leader can
     // pull it (the DR-8 loss).
+    // DUR-1: highest offset this replica has known as committed (monotonic,
+    // this incarnation) — the floor of an OutOfRange-armed KIP-101 probe.
+    Offset committedFloor_     = 0;
     bool   epochProbePending_ = false;
     Epoch  epochProbeEpoch_    = -1;   ///< epoch we transitioned into
     Offset epochProbeFloor_    = 0;    ///< committed HW floor at transition

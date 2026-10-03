@@ -178,6 +178,25 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
     // corrupt checkpoint.
     if (!memoryBacked_ && diskLog_ != nullptr) {
         (void)epochCache_.restoreFromFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+        // DUR-1: the checkpoint is fsynced (tmp+fsync+rename) but, with periodic
+        // fsync off, the log tail it describes may not have survived an unclean
+        // shutdown (power loss) — recovery cut the log back.  An entry starting
+        // PAST the recovered log end describes records that no longer exist and
+        // poisons the cache: every later assign() at the (lower) LEO is silently
+        // dropped as non-monotonic (A5), so a becomeLeader epoch is never
+        // recorded and KIP-101 answers / reconcile lineage checks go wrong.
+        // Kafka truncates the cache to the recovered LEO the same way.  An
+        // entry starting exactly AT the LEO (an epoch with no records yet) is
+        // kept: it still names the lineage the (possibly empty) log belongs to.
+        // Only against a RECOVERED log (the LEO is the true log end): an
+        // un-recovered Log reports its last segment's base and must never cost
+        // us epoch history.
+        const Offset leo = logEndOffset_();
+        const int32_t latest = epochCache_.latestEpoch();
+        if (diskLog_->isRecovered() && latest >= 0 && epochCache_.startOffsetFor(latest) > leo) {
+            epochCache_.truncateFromEnd(leo + 1);
+            checkpointEpochs_();
+        }
     }
 
     if (role_ == Role::Leader) {
@@ -358,6 +377,15 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 {
+    // DUR-1: remember the highest offset this replica has known as committed
+    // (its role's view, captured before the reset below) — the floor of any
+    // later KIP-101 truncation in this leadership (see applyReplicated's
+    // kErrOutOfRange arm), not only the one armed here.
+    {
+        const Offset committedNow = highWatermark();
+        if (committedNow > committedFloor_) committedFloor_ = committedNow;
+    }
+
     // DR-BUG-6 — DEFERRED, epoch-correct truncation (KIP-101).
     //
     // We do NOT truncate eagerly to the committed HW here.  Eagerly truncating a
@@ -700,14 +728,23 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // in flight, we serve nothing this round and let the follower's own epoch
     // probe (armed on becomeFollower) drive the lineage-checked decision.
     if (req.fetchOffset > logEndOffset_()) {
-        // DR-BUG-6 completeness gate: an ahead follower reached a plain fetch whose
-        // tail lineage we cannot validate here — clamp its frontier to our LEO so
-        // it never raises the target (the epoch-probe path does the lineage-checked
-        // recording that legitimately raises it).  We still (re-)evaluate so a
-        // divergent ahead follower does not block completion forever.
-        if (!leaderComplete_) {
-            survivorFrontier_[req.followerId] = logEndOffset_();
-            maybeCompleteLeadership();
+        // DUR-1 (deficient leader): an ahead follower in a plain fetch holds
+        // records we do not — possibly COMMITTED ones (Rune's HW is a majority of
+        // the ISR, so an ISR member — a lagging follower handed leadership, or a
+        // replica that lost its unflushed tail to a power loss — can be elected
+        // without them).  A plain fetch cannot prove the tail's lineage, and a
+        // follower with no uncommitted tail never ran the KIP-101 probe, so the
+        // old "clamp its frontier to our LEO and complete" let this leader
+        // complete and APPEND over committed records (divergence + acked loss).
+        // Instead: answer kErrOutOfRange — the follower runs the KIP-101 probe
+        // (floored at its committed view), whose lineage-checked answer either
+        // reverse-reconciles its tail into us (shared continuation) or truncates
+        // its divergent part — and do NOT count this fetch as a completeness
+        // report: the probe's lineage-checked report is the one that counts.
+        {
+            auto oor = makeFetchResponse(highWatermark(), kErrOutOfRange, {});
+            if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, oor); }))
+                ++sendRefusals_;   // not owed: the follower re-fetches (and re-learns it)
         }
         if (reconcileTarget_ == req.followerId) {
             FetchRequestMsg pull{};
@@ -734,6 +771,9 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // (no ISR/HW input), and it lets the single log read below happen ONLY for a
     // Data serve — a conflated or ack-only fetch reads nothing, as before.
     FollowerSlot* const slot = followerSlots_.find(req.followerId);
+    // DUR-1 / KIP-966: the follower's position in this leadership BEFORE this
+    // fetch (-1 = none yet) — see the lost-acked-data check below.
+    const Offset prevAckedLeo = slot ? slot->ackedLeo : -1;
     if (slot) {
         // F27 R1: a new connection generation = the link went down and back up;
         // frames "sent" meanwhile may be gone → rewind so they are re-sent from
@@ -813,6 +853,27 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     }
     // (FR: the onFetchRequest SPAN [ReplFetchReqHandle] measures this handler; the
     //  control→worker handoff is measured cleanly via ReplFragRecv→ReplWorkerOpRun.)
+
+    // DUR-1 / KIP-966 (data plane): a follower whose position went BACKWARDS
+    // below the HW within this leadership lost records it had acknowledged —
+    // records that counted toward that HW (an unclean shutdown: its unflushed
+    // page cache is gone; periodic fsync is off by default).  It no longer
+    // holds the committed prefix, so it must neither count toward the HW nor
+    // satisfy min-ISR: evict it now (it would otherwise stay "in sync" — it
+    // keeps fetching and its offset lag is small).  It re-enters through
+    // maybeExpandIsr once its LEO is back at the HW.  Cold path (a regression
+    // is an unclean restart, never steady state).
+    if (prevAckedLeo > req.fetchOffset && req.fetchOffset < prevHwOnFetch) [[unlikely]] {
+        if (isrManager_->removeFromIsr(req.followerId)) {
+            spdlog::warn("PartitionReplica[node={} topic={} part={}]: follower {} regressed "
+                         "{} -> {} below the HW {} (unclean restart lost acknowledged "
+                         "records) — removed from the ISR until caught up",
+                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, req.followerId,
+                         prevAckedLeo, req.fetchOffset, prevHwOnFetch);
+            syncIsrToLeaderState();
+            recomputeHw();
+        }
+    }
 
     // DR-BUG-6 completeness gate: record this survivor's frontier.  A plain fetch
     // cannot validate lineage (req carries the fetch epoch, not the tail epoch), so
@@ -1026,6 +1087,19 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             followerSync_.forceBehind();
             if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
                 wedgeAt_(logEndOffset_(), "the leader cannot fit it in one replication frame");
+        }
+        // DUR-1: our fetch offset is past the leader's log end — the leader is
+        // behind us (deficient) or our tail diverges.  Resolve it the KIP-101
+        // way: arm the epoch probe (never fetch past the leader blindly), floored
+        // at the highest offset we have known committed, so the probe can only
+        // drop an uncommitted divergent tail — never committed records.
+        if (resp.errorCode == kErrOutOfRange && role_ == Role::Follower &&
+            resp.leaderEpoch == epoch_ && !epochProbePending_ && wedgedAtOffset_ < 0) {
+            epochProbePending_  = true;
+            epochProbeEpoch_    = epoch_;
+            epochProbeFloor_    = std::max(followerHw_, committedFloor_);
+            epochProbeAttempts_ = 0;
+            lastFetchEmitNs_    = 0;     // probe on the next doWork
         }
         // Other errors — ignore (control plane handles epoch changes externally).
         return;

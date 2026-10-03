@@ -106,6 +106,19 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_replication_zero_alloc_tests)
 
     # ---------------------------------------------------------------------------
+    # E2 / DUR-1: in-process disaster-recovery integration suite (default run).
+    # Deterministic (injected clock, no sleeps), real Log + PartitionReplica +
+    # FailoverElection; storage crash seam + transport fault seams.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_dr_integration_tests
+        tests/dr/DrIntegrationTest.cpp)
+    target_include_directories(rune_dr_integration_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/dr)
+    target_link_libraries(rune_dr_integration_tests PRIVATE
+        rune_replication rune_metadata rune_consensus GTest::gtest_main)
+    gtest_discover_tests(rune_dr_integration_tests PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # FollowerSync state-machine unit tests — STANDALONE.
     # FollowerSync.h is pure logic (no Aeron / storage / I/O), so this target
     # links ONLY the header include dir + gtest and builds on ANY platform

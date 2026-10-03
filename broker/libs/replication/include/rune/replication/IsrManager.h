@@ -230,6 +230,19 @@ public:
     /// \param acksAll  true → majority-durable ("all"/"majority"); the ISR
     ///                 size must meet minIsr.
     ///                 false → leader-only ack; always allowed.
+    /// DUR-1 / KIP-966: drop `node` from the ISR immediately (it provably no
+    /// longer holds the committed prefix).  The leader never leaves its own
+    /// ISR.  Returns true if the ISR changed.  Re-admission is the normal
+    /// maybeExpandIsr() path (lastFetchOffset >= HW).
+    bool removeFromIsr(NodeId node) {
+        if (node == leaderId_) return false;
+        auto it = std::find(isr_.begin(), isr_.end(), node);
+        if (it == isr_.end()) return false;
+        isr_.erase(it);
+        isrChanged_ = true;
+        return true;
+    }
+
     [[nodiscard]] bool canProduce(int minIsr, bool acksAll) const noexcept {
         if (!acksAll) return true;
         return static_cast<int>(isr_.size()) >= minIsr;

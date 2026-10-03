@@ -2266,8 +2266,15 @@ TEST(AuditFixB1, FollowerTruncateThenRefetchLowerOffset_HWNotStale) {
     lowerReq.fetchOffset = 5; // lower than previously reported 10
     lowerReq.maxBytes    = 1 << 20;
 
+    // DUR-1: a follower regressing BELOW the HW lost acknowledged records — the
+    // leader now evicts it from the ISR at once.  With min-ISR 1 a leader-only
+    // ISR legitimately commits on its own (Kafka semantics), which would mask the
+    // B1 check below; min-ISR 2 keeps the served HW at the healthy floor instead.
+    leader.setMinIsrForTest(2);
     int16_t err = leader.onFetchRequest(lowerReq, clock);
     ASSERT_EQ(err, kErrNone) << "Lower fetchOffset fetch must be accepted";
+    EXPECT_EQ(std::count(leader.isr().begin(), leader.isr().end(), kF), 0)
+        << "DUR-1: a follower that regressed below the HW must leave the ISR";
 
     // After the leader processes the lower fetchOffset=5:
     // B1 fix: leader's tracked follower LEO is now 5.
@@ -2281,7 +2288,8 @@ TEST(AuditFixB1, FollowerTruncateThenRefetchLowerOffset_HWNotStale) {
     // We verify by appending 5 more records (leader LEO=15) and ensuring HW
     // does NOT advance to 15 just because the follower was at 10 pre-truncation.
     // Follower is removed from transport — pushes are dropped.
-    for (int i = 0; i < 5; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 10)));
+    // acks=1 appends (the leader-only ISR is below min-ISR 2, which gates acks=all).
+    for (int i = 0; i < 5; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 10)), /*acksAll=*/false);
     Offset leo15 = leader.logEndOffset();
     ASSERT_EQ(leo15, 15);
 
