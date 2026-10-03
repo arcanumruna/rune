@@ -675,7 +675,7 @@ TEST(DrIntegrationRegression, OutOfRangeProbeLoop_BoundedToFetchCadence) {
 // legitimately removes a sealed segment's last records (gap to the next base),
 // and the cleaner checkpoint can trail its renames.  Needs a durable recovery
 // point (or a cleaner that always preserves each segment's end offset).
-TEST(DrIntegrationRegression, DISABLED_PowerLoss_AsyncSealNotCompleted_NoOffsetGap) {
+TEST(DrIntegrationRegression, PowerLoss_AsyncSealNotCompleted_NoOffsetGap) {
     DrConfig cfg;
     cfg.segmentRollBytes = 2048;
     cfg.deferSealSync    = true;

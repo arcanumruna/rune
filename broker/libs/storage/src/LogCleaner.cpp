@@ -707,9 +707,14 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
     // Also never compact segments whose base is >= cleanBoundaryOffset.
     int64_t activeBase = bases.back();
 
-    for (int64_t segBase : bases) {
+    for (std::size_t i = 0; i < bases.size(); ++i) {
+        const int64_t segBase = bases[i];
         if (segBase == activeBase) continue;       // active segment — skip
         if (segBase >= cleanBoundaryOffset) break; // at/past HW — stop
+        // E1d invariant 3: never compact a segment ending above the persisted
+        // recovery point — restart recovery chain-validates it, and a
+        // compaction gap there would be taken for a lost write (truncation).
+        if (i + 1 < bases.size() && !log.compactionAllowedThrough(bases[i + 1])) break;
         rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
     }
 
@@ -1377,6 +1382,12 @@ bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
     const int64_t activeBase = bases.back();
     if (segBase == activeBase) return false;   // never compact the active segment
     (void)segEnd; // retained for API symmetry / future byte-budgeted variants
+    // E1d invariant 3: only a segment ending at or below the persisted recovery
+    // point (restart recovery trusts it as-is) may be compacted.
+    {
+        const auto it = std::upper_bound(bases.begin(), bases.end(), segBase);
+        if (it == bases.end() || !log.compactionAllowedThrough(*it)) return false;
+    }
 
     // Produce the compacted file off the map — same pure-file core the cleaner
     // thread uses.  `bases` here is the append-thread's live view (safe on this

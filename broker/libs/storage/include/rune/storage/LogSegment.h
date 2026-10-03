@@ -119,6 +119,35 @@ public:
     /// synced extent of the prefix it took over.
     void inheritSyncedBytesForTest(int64_t b) noexcept { syncedBytes_ = b; }
 
+    // ---- E1d durable recovery point ------------------------------------------
+    /// One past the highest offset of this segment KNOWN durable on disk (every
+    /// offset below it survives a power loss); == baseOffset() when nothing is
+    /// known durable.  Raised by a successful inline sync(), by Log when an
+    /// async (io backend) fdatasync of this segment's fd completes, and by Log
+    /// recovery; lowered only by a truncation.  Owner thread; no syscall.
+    [[nodiscard]] int64_t durableNext() const noexcept { return durableNext_; }
+    /// Monotonic raise, clamped to the segment's next offset.
+    void markDurableThrough(int64_t upTo) noexcept {
+        if (upTo >= nextOffset_) {
+            upTo = nextOffset_;
+            syncedBytes_ = logSize_;   // E2 crash seam: the whole segment is on disk
+        }
+        if (upTo > durableNext_) durableNext_ = upTo;
+    }
+    /// Recovery / rebuild: set the durable extent exactly (clamped to
+    /// [baseOffset, nextOffset]).
+    void setDurableNext(int64_t v) noexcept {
+        if (v > nextOffset_) v = nextOffset_;
+        if (v < baseOffset_) v = baseOffset_;
+        durableNext_ = v;
+    }
+    [[nodiscard]] bool fullyDurable() const noexcept { return durableNext_ >= nextOffset_; }
+    /// Cold (recovery / truncation — accepted role-change sync work): fdatasync
+    /// the .log fd so the CURRENT contents and size are durable, then mark the
+    /// whole segment durable.  Counted in roleChangeSyncs (never syncCalls).
+    /// An error is fail-stop (sticky failedErrno) and returns it; 0 on success.
+    int syncForRecovery() noexcept;
+
     /// Wire the owning Log's storage state (set by Log when it installs the segment).
     void setStorageState(LogStorageState* s) noexcept { storage_ = s; }
 
@@ -273,6 +302,7 @@ private:
     uint64_t installGen_ = 0;
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
     int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()
+    int64_t durableNext_ = 0;    ///< E1d: see durableNext() (== baseOffset_ when none)
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
 

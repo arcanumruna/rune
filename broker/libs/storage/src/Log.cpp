@@ -12,6 +12,9 @@
 #include <spdlog/spdlog.h>
 #include <cerrno>
 #include <system_error>
+#include <fcntl.h>
+#include <unistd.h>
+#include <climits>
 namespace rune::storage {
 
 namespace {
@@ -75,7 +78,10 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
         }
     }
     std::sort(bases.begin(), bases.end());
+    hadSegmentsAtOpen_ = !bases.empty();
     if (bases.empty()) bases.push_back(0);
+    // E1d: the value recovery reads (a non-recovered Log never writes it).
+    persistedRp_ = readRecoveryPointFile(dir_);
     // F3: eager read-map ONLY the LAST (highest-base) segment — it becomes the
     // active segment.  Earlier (sealed) segments map their .log lazily on first
     // readView(), so N retained segments no longer means N read mmaps + N fds
@@ -90,6 +96,14 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     activeSegment().preallocate(rollBytes_);
 }
 Log::~Log() {
+    // E1d: clean shutdown persists the exact recovery point (a stale, lower one
+    // would only make the next recovery validate more).  Never on a failed log.
+    if (recovered_ && !crashedForTest_ && storage_.failedErrno == 0 && recoveryPoint_ != persistedRp_) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(dir_, ec)) (void)checkpointRecoveryPoint();   // dir removed: nothing to persist
+    }
+    releaseRpFds_();
+    if (dirFd_ >= 0) { ::close(dirFd_); dirFd_ = -1; }
     // The background thread has been stopped by the owner before Log destruction,
     // so these are single-threaded.  Finalize any pending staging→base renames so
     // a clean shutdown leaves correctly-named files on disk (otherwise the next
@@ -182,6 +196,10 @@ void Log::maybeRoll() {
         // (via newlySealedMaxTs_) instead of re-scanning the file.
         newlySealedMaxTs_ = activeSegmentMaxTs_;
         activeSegmentMaxTs_ = 0;
+        // E1d: an inline seal made the sealed segment durable — R may cross into
+        // the new active segment (persisted inline on the legacy path only).
+        advanceRecoveryPoint_();
+        maybeCheckpointInline_();
         // Publish snapshot: a new sealed segment just appeared.
         publishSealedSnapshot();
         // Clear the seal-time hint after the snapshot consumed it.
@@ -247,7 +265,7 @@ void Log::publishSealedSnapshot() {
                     }
                 }
             }
-            snap->push_back({base, bytes, largestTs, endOff});
+            snap->push_back({base, bytes, largestTs, endOff, compactionAllowedThrough(endOff)});
         }
     }
     // CP-5.1: clear the recovery map after first use — it is only needed for the
@@ -493,6 +511,8 @@ int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     throwIfFailed_();
     maybeRoll();
     logEndOffset_ = activeSegment().append(data, len, lastOffset);
+    advanceRecoveryPoint_();   // E1d: the durable append synced the active segment
+    maybeCheckpointInline_();
     // Update incremental largestTimestamp AFTER the write (and after any roll)
     // so this batch's maxTimestamp is attributed to the segment it was written to.
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
@@ -572,10 +592,26 @@ std::vector<Log::SyncedExtent> Log::syncedExtentsForTest() const {
 }
 
 int64_t Log::recover() {
-    int64_t next = 0;
-    for (auto& [base, seg] : segments_) next = seg->recover();
+    // E1d: the recovery point recovery trusts up to.  Missing (upgrade / first
+    // boot): the last sealed segment's end = the active segment's base.
+    int64_t rp = readRecoveryPointFile(dir_);
+    if (rp == kRecoveryPointUnknown) {
+        rp = segments_.rbegin()->first;
+        if (hadSegmentsAtOpen_)
+            spdlog::warn("Log::recover {}: no {} — trusting every sealed segment (recovery point = "
+                         "last sealed end {}); upgrade / first boot", dir_, kRecoveryPointFile, rp);
+    }
+    validateFromRecoveryPoint_(rp);
+    const int64_t next = activeSegment().nextOffset();
     logEndOffset_ = next;
     recovered_ = true;
+    // Everything kept is durable now (trusted below rp, fsynced above it):
+    // R = LEO, persisted before anything is appended.
+    recoveryPoint_ = next;
+    rpDue_ = false;
+    // No snapshot publish here: recover() publishes once below, AFTER the real
+    // per-segment timestamps are known (CP-5.1: a 0 timestamp reads "ancient").
+    if (storage_.failedErrno == 0) (void)checkpointRecoveryPoint_(/*publish=*/false);
 
     // CP-5.1 FIX (retention-after-restart): compute the REAL largestTimestamp for
     // every SEALED segment by scanning its batches for the max maxTimestamp() value.
@@ -638,7 +674,269 @@ int64_t Log::recover() {
     publishSealedSnapshot();
     return next;
 }
-void Log::sync() { activeSegment().sync(); }   // throws + marks failed on error (LogSegment::sync)
+
+void Log::validateFromRecoveryPoint_(int64_t rp) {
+    // Trusted region: segments whose end (= the next segment's base) is at or
+    // below rp — CRC-recovered (a torn tail there is still cut), never
+    // chain-checked: compaction legitimately leaves offset gaps between them.
+    auto it = segments_.begin();
+    for (; it != segments_.end(); ++it) {
+        auto nx = std::next(it);
+        if (nx == segments_.end() || nx->first > rp) break;
+        it->second->recover();
+        it->second->setDurableNext(it->second->nextOffset());
+    }
+    // Validated region: from the segment holding rp onward, each segment must
+    // be CRC-clean AND end exactly where the next one begins.  At the first
+    // mismatch / torn tail everything after is deleted (Kafka) — an async seal
+    // that never completed must not leave the log claiming offsets it lacks.
+    for (; it != segments_.end(); ++it) {
+        const int64_t next = it->second->recover();
+        auto nx = std::next(it);
+        if (nx == segments_.end()) break;
+        if (next == nx->first) continue;
+        spdlog::warn("Log::recover {}: segment {} ends at {} but the next segment starts at {} "
+                     "(above recovery point {}) — truncating there, deleting {} later segment(s)",
+                     dir_, it->first, next, nx->first, rp,
+                     static_cast<long long>(std::distance(nx, segments_.end())));
+        while (nx != segments_.end()) {
+            const std::string lpath = nx->second->logPath();
+            std::error_code ec;
+            std::filesystem::remove(lpath, ec);
+            std::filesystem::remove(indexPathForLog(lpath), ec);
+            nx = erase_(nx);
+        }
+        break;
+    }
+    // Make the validated region durable (its torn-tail cuts and deletions too:
+    // the checkpoint's dir fsync follows) before R is persisted as the LEO.
+    auto from = segments_.upper_bound(rp);
+    if (from != segments_.begin()) --from;
+    for (; from != segments_.end(); ++from) {
+        if (from->second->fullyDurable() && std::next(from) != segments_.end()) continue;
+        (void)from->second->syncForRecovery();   // error: fail-stop (sticky)
+    }
+    // The (possibly new) active segment: preallocate as the ctor did.
+    activeSegment().preallocate(rollBytes_);
+}
+
+// ---------------------------------------------------------------------------
+// E1d: durable recovery point.
+// ---------------------------------------------------------------------------
+int64_t Log::readRecoveryPointFile(const std::string& dir) noexcept {
+    try {
+        std::ifstream f(dir + "/" + kRecoveryPointFile);
+        if (!f.is_open()) return kRecoveryPointUnknown;
+        int version = -1;
+        long long v = -1;
+        if (!(f >> version >> v) || version != 1 || v < 0) {
+            spdlog::error("Log: unreadable {} in {} — treated as missing", kRecoveryPointFile, dir);
+            return kRecoveryPointUnknown;
+        }
+        return static_cast<int64_t>(v);
+    } catch (...) {
+        return kRecoveryPointUnknown;
+    }
+}
+
+int Log::dirFd_open_() noexcept {
+    if (dirFd_ < 0) dirFd_ = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
+    return dirFd_;
+}
+
+int Log::writeRecoveryPointTmp_(int64_t value, int& fdOut) noexcept {
+    fdOut = -1;
+    const std::string tmp = dir_ + "/" + kRecoveryPointTmpFile;
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return errno != 0 ? errno : EIO;
+    char buf[48];
+    const int n = std::snprintf(buf, sizeof buf, "1\n%lld\n", static_cast<long long>(value));
+    if (storage_.writeFaultForTest != 0) { ::close(fd); return storage_.writeFaultForTest; }
+    const ssize_t w = ::pwrite(fd, buf, static_cast<std::size_t>(n), 0);
+    if (w != n) { const int e = w < 0 ? errno : ENOSPC; ::close(fd); return e != 0 ? e : EIO; }
+    fdOut = fd;
+    return 0;
+}
+
+void Log::releaseRpFds_() noexcept {
+    if (rp_.tmpFd >= 0) { ::close(rp_.tmpFd); rp_.tmpFd = -1; }
+}
+
+void Log::abandonRecoveryCheckpoint_() noexcept {
+    if (rp_.stage == RpStage::Idle) return;
+    if (rp_.inFlight) {
+        rp_.abandoned = true;            // the completion releases the fds
+    } else {
+        releaseRpFds_();
+        rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
+    }
+    if (recoveryPoint_ > persistedRp_) rpDue_ = true;   // re-checkpoint the current R later
+}
+
+int Log::checkpointRecoveryPoint() noexcept { return checkpointRecoveryPoint_(/*publish=*/true); }
+
+int Log::checkpointRecoveryPoint_(bool publish) noexcept {
+    if (!recovered_) return 0;
+    if (storage_.failedErrno != 0) return storage_.failedErrno;
+    // An in-progress async checkpoint holds the tmp file / a renamed value:
+    // this inline one supersedes it (its completion never renames).
+    if (!rp_.abandoned) abandonRecoveryCheckpoint_();
+    const int64_t v = recoveryPoint_;
+    int fd = -1;
+    int err = writeRecoveryPointTmp_(v, fd);
+    if (err == 0) {
+        ++storage_.roleChangeSyncs;
+        if (storage_.faultForTest != 0) err = storage_.faultForTest;
+        else if (::fsync(fd) != 0) err = errno != 0 ? errno : EIO;
+    }
+    if (fd >= 0) ::close(fd);
+    if (err == 0) {
+        const std::string tmp = dir_ + "/" + kRecoveryPointTmpFile;
+        const std::string fin = dir_ + "/" + kRecoveryPointFile;
+        if (::rename(tmp.c_str(), fin.c_str()) != 0) err = errno != 0 ? errno : EIO;
+    }
+    if (err == 0) {
+        const int dfd = dirFd_open_();
+        ++storage_.roleChangeSyncs;
+        if (dfd < 0) err = errno != 0 ? errno : EIO;
+        else if (::fsync(dfd) != 0) err = errno != 0 ? errno : EIO;
+    }
+    if (err != 0) {
+        if (storage_.failedErrno == 0) storage_.failedErrno = err;
+        spdlog::critical("Log {}: persisting the recovery point {} FAILED (errno={}) — log failed",
+                         dir_, v, err);
+        return err;
+    }
+    const bool moved = v != persistedRp_;
+    persistedRp_ = v;
+    rpDue_ = recoveryPoint_ > persistedRp_ && nextSegmentBaseAfter(persistedRp_) != -1 &&
+             nextSegmentBaseAfter(persistedRp_) <= recoveryPoint_;
+    ++rpPersists_;
+    if (publish && moved && !segments_.empty()) publishSealedSnapshot();   // cleaner gate
+    return 0;
+}
+
+void Log::advanceRecoveryPoint_() noexcept {
+    if (segments_.empty()) return;
+    auto it = segments_.upper_bound(recoveryPoint_);
+    if (it != segments_.begin()) --it;
+    int64_t r = recoveryPoint_;
+    while (it != segments_.end()) {
+        LogSegment& seg = *it->second;
+        if (seg.durableNext() > r) r = seg.durableNext();
+        auto nx = std::next(it);
+        if (nx == segments_.end() || !seg.fullyDurable()) break;
+        if (nx->first > r) r = nx->first;   // a sealed segment fully durable: R reaches the next base
+        it = nx;
+    }
+    if (r <= recoveryPoint_) return;
+    recoveryPoint_ = r;
+    if (!rpDue_) {
+        const int64_t b = nextSegmentBaseAfter(persistedRp_);
+        rpDue_ = b != -1 && b <= recoveryPoint_;
+    }
+}
+
+void Log::maybeCheckpointInline_() noexcept {
+    if (rpDue_ && !deferSealSync_ && recovered_ && storage_.failedErrno == 0 &&
+        rp_.stage == RpStage::Idle)
+        (void)checkpointRecoveryPoint();
+}
+
+void Log::noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept {
+    if (seg == nullptr) return;
+    seg->markDurableThrough(upTo);
+    advanceRecoveryPoint_();
+}
+
+bool Log::beginRecoveryCheckpoint() noexcept {
+    if (!recoveryCheckpointDue()) return false;
+    int fd = -1;
+    const int err = writeRecoveryPointTmp_(recoveryPoint_, fd);
+    if (err != 0) {
+        if (storage_.failedErrno == 0) storage_.failedErrno = err;
+        return false;
+    }
+    rp_.stage     = RpStage::TmpWritten;
+    rp_.inFlight  = false;
+    rp_.abandoned = false;
+    rp_.value     = recoveryPoint_;
+    rp_.tmpFd     = fd;
+    ++rp_.seq;
+    rpDue_ = false;
+    return true;
+}
+
+int Log::recoveryCheckpointFdToSync() const noexcept {
+    if (rp_.inFlight || rp_.abandoned) return -1;
+    if (rp_.stage == RpStage::TmpWritten) return rp_.tmpFd;
+    if (rp_.stage == RpStage::Renamed) return dirFd_;
+    return -1;
+}
+
+uint64_t Log::recoveryCheckpointSubmitted() noexcept {
+    if (rp_.stage == RpStage::TmpWritten) rp_.stage = RpStage::TmpSyncing;
+    else if (rp_.stage == RpStage::Renamed) rp_.stage = RpStage::DirSyncing;
+    rp_.inFlight = true;
+    return rp_.seq;
+}
+
+void Log::recoveryCheckpointSyncCompleted(uint64_t seq, int err) noexcept {
+    if (seq != rp_.seq || !rp_.inFlight) return;   // a long-gone checkpoint
+    rp_.inFlight = false;
+    if (rp_.abandoned || err != 0) {
+        if (err != 0 && storage_.failedErrno == 0) storage_.failedErrno = err;
+        releaseRpFds_();
+        rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
+        if (recoveryPoint_ > persistedRp_) {
+            const int64_t b = nextSegmentBaseAfter(persistedRp_);
+            rpDue_ = b != -1 && b <= recoveryPoint_;
+        }
+        return;
+    }
+    if (rp_.stage == RpStage::TmpSyncing) {
+        releaseRpFds_();
+        const std::string tmp = dir_ + "/" + kRecoveryPointTmpFile;
+        const std::string fin = dir_ + "/" + kRecoveryPointFile;
+        int e = 0;
+        if (::rename(tmp.c_str(), fin.c_str()) != 0) e = errno != 0 ? errno : EIO;
+        if (e == 0 && dirFd_open_() < 0) e = errno != 0 ? errno : EIO;
+        if (e != 0) {
+            if (storage_.failedErrno == 0) storage_.failedErrno = e;
+            rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
+            return;
+        }
+        rp_.stage = RpStage::Renamed;
+        return;
+    }
+    if (rp_.stage == RpStage::DirSyncing) {
+        const bool moved = rp_.value != persistedRp_;
+        persistedRp_ = rp_.value;
+        ++rpPersists_;
+        rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
+        if (recoveryPoint_ > persistedRp_) {
+            const int64_t b = nextSegmentBaseAfter(persistedRp_);
+            rpDue_ = b != -1 && b <= recoveryPoint_;
+        }
+        if (moved) publishSealedSnapshot();   // cleaner gate (cold: once per roll)
+    }
+}
+
+void Log::clampRecoveryPointAfterTruncate_(int64_t leo) noexcept {
+    if (recoveryPoint_ > leo) recoveryPoint_ = leo;
+    if (!recovered_) return;
+    // An in-progress checkpoint carrying a value above the new LEO must never
+    // land (its rename would re-raise the on-disk R over re-appended bytes).
+    const bool staleInProgress = rp_.stage != RpStage::Idle && !rp_.abandoned && rp_.value > leo;
+    if (staleInProgress || persistedRp_ > leo) (void)checkpointRecoveryPoint();   // abandons it
+    else if (recoveryPoint_ <= persistedRp_) rpDue_ = false;
+}
+
+void Log::sync() {
+    activeSegment().sync();   // throws + marks failed on error (LogSegment::sync)
+    advanceRecoveryPoint_();  // E1d
+    maybeCheckpointInline_();
+}
 
 void Log::throwIfFailed_() const {
     if (storage_.failedErrno != 0) [[unlikely]]
@@ -758,6 +1056,7 @@ void Log::truncateTo(int64_t truncateOffset) {
         install_(base, std::move(seg));
         logEndOffset_ = base;
         noteTruncatedTo_(logEndOffset_);
+        clampRecoveryPointAfterTruncate_(logEndOffset_);   // E1d
         return;
     }
 
@@ -847,6 +1146,7 @@ void Log::truncateTo(int64_t truncateOffset) {
     // the LEO assignment outside the guard, so a throw there escaped as an
     // ordinary exception with the .log already truncated and LEO stale.
     int64_t base = seg.baseOffset();
+    const int64_t oldDurable = seg.durableNext();   // E1d: the kept prefix stays as durable as it was
     try {
         // Also truncate the index — simplest: just let recover() rebuild it.
         std::string ipath = indexPathForLog(lpath);
@@ -868,6 +1168,7 @@ void Log::truncateTo(int64_t truncateOffset) {
         // truncated file) rather than hard-coding truncateOffset, so that LEO
         // and the segment's nextOffset_ can never diverge.
         activeSegment().recover();
+        activeSegment().setDurableNext(std::min(oldDurable, activeSegment().nextOffset()));
         logEndOffset_ = activeSegment().nextOffset();
     } catch (const std::exception& ex) {
         fatalHalt("Log::truncateTo: post-truncate storage failure rebuilding segment "
@@ -884,6 +1185,7 @@ void Log::truncateTo(int64_t truncateOffset) {
                   "(cutPos=" + std::to_string(cutPos) + ").  Halting.");
     }
     noteTruncatedTo_(logEndOffset_);   // rounded down to the batch boundary
+    clampRecoveryPointAfterTruncate_(logEndOffset_);   // E1d
 }
 
 void Log::reloadSegments() {
@@ -922,7 +1224,15 @@ void Log::reloadSegments() {
     // whole reconstruction, not just segment construction: a throwing
     // recover() also leaves segments_ (the old generation) untouched.
     int64_t next = 0;
-    for (auto& [base, seg] : newSegments) next = seg->recover();
+    for (auto& [base, seg] : newSegments) {
+        next = seg->recover();
+        // E1d: a rewritten (cleaner: fsynced before rename) or untouched segment
+        // is as durable as the object it replaces; a brand-new base is not.
+        auto old = segments_.find(base);
+        if (old != segments_.end() && old->second)
+            seg->setDurableNext(old->second->fullyDurable() ? seg->nextOffset()
+                                                            : std::min(old->second->durableNext(), seg->nextOffset()));
+    }
 
     // Everything succeeded — now replace the generation with NO step that can
     // throw once the old generation is touched (F3 round 7):
@@ -941,6 +1251,7 @@ void Log::reloadSegments() {
     for (auto& [b, seg] : segments_) retire_(std::move(seg));
     segments_.swap(newSegments);   // old (now all-null) entries die with newSegments
     logEndOffset_ = next;
+    if (recoveryPoint_ > logEndOffset_) recoveryPoint_ = logEndOffset_;   // E1d (never above the LEO)
 }
 
 void Log::reloadSegment(int64_t baseOffset) {
@@ -973,8 +1284,13 @@ void Log::reloadSegment(int64_t baseOffset) {
 
     // Reconstruct just this segment (closes the old fd via unique_ptr reset) and
     // recover() it so its in-memory index reflects the rewritten bytes.
+    const bool    wasDurable = it->second->fullyDurable();
+    const int64_t oldDurable = it->second->durableNext();
     install_(baseOffset, std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_));
-    segments_[baseOffset]->recover();
+    LogSegment& fresh = *segments_[baseOffset];
+    fresh.recover();
+    // E1d: the cleaner fsyncs a rewritten segment before its rename.
+    fresh.setDurableNext(wasDurable ? fresh.nextOffset() : std::min(oldDurable, fresh.nextOffset()));
 }
 
 int Log::deleteOldSegments(int64_t retainBytes) {

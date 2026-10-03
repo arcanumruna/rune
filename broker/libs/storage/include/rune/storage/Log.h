@@ -29,6 +29,12 @@ struct SegInfo {
     /// entry's endOffset) WITHOUT reading the writer-owned segments_ map — so the
     /// cleaner never advances its watermark past not-yet-sealed (active) records.
     int64_t endOffset        = 0;
+    /// E1d: the segment ends at or below the PERSISTED recovery point (or no
+    /// recovery point was ever persisted — recovery then trusts every sealed
+    /// segment), so restart recovery trusts it as-is.  The cleaner compacts
+    /// ONLY such segments: compaction never creates an offset gap in the region
+    /// recovery validates with its segment-chain check.
+    bool    belowRecoveryPoint = true;
 };
 using SealedSegmentSnapshot = std::vector<SegInfo>;
 
@@ -188,6 +194,76 @@ public:
     /// msync + directory fsync of LogSegment::recover (run by truncateTo on a
     /// role / epoch change, and at startup recovery).
     [[nodiscard]] uint64_t roleChangeSyncCallsForTest() const noexcept { return storage_.roleChangeSyncs; }
+
+    // ---- E1d: durable recovery point (Kafka recovery-point parity) -----------
+    //
+    // R = every offset below it is known durable on disk.  Advanced IN ORDER on
+    // the owner thread: a sealed segment counts only once its seal fdatasync
+    // completed (inline, or the io backend's completion -> noteFlushCompleted),
+    // the active segment up to its synced extent.  Persisted to
+    // <dir>/recovery-point-offset-checkpoint (tmp + fsync + rename + dir fsync)
+    // whenever R crossed a segment boundary since the last persist (≈ once per
+    // roll — never per append), on a truncation below it, after recovery and on
+    // a clean shutdown.  A stale (lower) persisted R is always safe.
+    //
+    // Recovery (recover()): segments ending at or below the persisted R are
+    // trusted as-is (compaction gaps there are fine); from the segment holding R
+    // onward every segment is CRC-recovered AND must end exactly at the next
+    // segment's base — at the first mismatch / torn tail the log is truncated
+    // there and every later segment deleted.  Missing file (upgrade / first
+    // boot): R = the last sealed segment's end (+ WARN when data exists).
+    static constexpr const char* kRecoveryPointFile    = "recovery-point-offset-checkpoint";
+    static constexpr const char* kRecoveryPointTmpFile = "recovery-point-offset-checkpoint.tmp";
+    static constexpr int64_t kRecoveryPointUnknown = -1;
+    /// In-memory durable recovery point (owner thread).
+    [[nodiscard]] int64_t recoveryPoint() const noexcept { return recoveryPoint_; }
+    /// The value recovery would read from disk (kRecoveryPointUnknown = no file).
+    [[nodiscard]] int64_t persistedRecoveryPoint() const noexcept { return persistedRp_; }
+    /// True iff restart recovery trusts a sealed segment ending at `segEnd`
+    /// as-is — the cleaner may compact it (E1d invariant 3).
+    [[nodiscard]] bool compactionAllowedThrough(int64_t segEnd) const noexcept {
+        return persistedRp_ == kRecoveryPointUnknown || segEnd <= persistedRp_;
+    }
+    /// An async (io backend) fdatasync of `seg`'s fd completed successfully:
+    /// every byte written to it before the submit — offsets below `upTo` (the
+    /// LEO at submit; INT64_MAX for a seal = the whole segment) — is durable.
+    /// Advances R in order.  Owner thread, O(log segments), no allocation.
+    void noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept;
+    /// Persist R now, inline (cold: recovery, truncation, legacy inline-seal
+    /// path, clean shutdown).  0 or the errno (fail-stop: sticky failedErrno).
+    int checkpointRecoveryPoint() noexcept;
+    /// Async checkpoint (the owning worker drives it through its io backend so
+    /// no fsync blocks the shard loop).  Rich state:
+    ///   Idle -> begin (write tmp) -> TmpWritten -> submitted -> TmpSyncing
+    ///   -> completed (rename) -> Renamed -> submitted -> DirSyncing
+    ///   -> completed -> Idle (persisted).
+    enum class RpStage : uint8_t { Idle, TmpWritten, TmpSyncing, Renamed, DirSyncing };
+    [[nodiscard]] RpStage recoveryCheckpointStage() const noexcept { return rp_.stage; }
+    /// R crossed a segment boundary since the last persist and no checkpoint is
+    /// in progress (O(1)).
+    [[nodiscard]] bool recoveryCheckpointDue() const noexcept {
+        return rpDue_ && rp_.stage == RpStage::Idle && recovered_ && storage_.failedErrno == 0;
+    }
+    /// Idle -> TmpWritten: write R to the tmp file (no fsync).  False when not
+    /// due, or on a write error (fail-stop: storageFailed()).
+    bool beginRecoveryCheckpoint() noexcept;
+    /// The fd the owner must fdatasync next (TmpWritten: the tmp file;
+    /// Renamed: the directory), else -1.
+    [[nodiscard]] int recoveryCheckpointFdToSync() const noexcept;
+    /// The fdatasync of recoveryCheckpointFdToSync() was submitted; returns the
+    /// checkpoint's sequence number (route it with the token).
+    uint64_t recoveryCheckpointSubmitted() noexcept;
+    /// The submitted fdatasync completed (err = its errno, 0 = ok).  A stale
+    /// sequence (abandoned by an inline checkpoint / truncation) only releases
+    /// its fds.  An error is fail-stop.
+    void recoveryCheckpointSyncCompleted(uint64_t seq, int err) noexcept;
+    [[nodiscard]] uint64_t recoveryCheckpointsForTest() const noexcept { return rpPersists_; }
+    /// Crash seam (DR / storage tests): the next destruction is a CRASH, not a
+    /// clean shutdown — no recovery-point checkpoint is written.
+    void crashForTest() noexcept { crashedForTest_ = true; }
+    /// Read <dir>/recovery-point-offset-checkpoint: the value, or
+    /// kRecoveryPointUnknown when missing / unreadable.
+    static int64_t readRecoveryPointFile(const std::string& dir) noexcept;
 
     /// Owner-defined O(1) tag (the owning worker's flush-slot index); UINT32_MAX = none.
     void     setOwnerTag(uint32_t t) noexcept { ownerTag_ = t; }
@@ -450,6 +526,40 @@ private:
     SegMap::iterator erase_(SegMap::iterator it);
     void retire_(std::unique_ptr<LogSegment> seg);
     void throwIfFailed_() const;
+    // ---- E1d recovery point state (owner thread) ----
+    bool    crashedForTest_ = false;      ///< see crashForTest()
+    bool    hadSegmentsAtOpen_ = false;   ///< segment files existed at construction (WARN gate)
+    int64_t recoveryPoint_ = 0;
+    int64_t persistedRp_   = kRecoveryPointUnknown;
+    bool    rpDue_         = false;   ///< R crossed a segment boundary since the last persist
+    uint64_t rpPersists_   = 0;
+    struct RpCheckpoint {
+        RpStage  stage    = RpStage::Idle;
+        bool     inFlight = false;     ///< an fdatasync on tmpFd / dirFd is in flight
+        bool     abandoned = false;    ///< superseded: release fds on completion, never rename
+        uint64_t seq      = 0;
+        int64_t  value    = 0;
+        int      tmpFd    = -1;
+    } rp_;
+    int dirFd_ = -1;                   ///< cached O_DIRECTORY fd (async dir fsync)
+    /// Walk segments from R: advance over fully-durable segments, then into the
+    /// first partially-durable one.  Sets rpDue_ on a boundary crossing.
+    void advanceRecoveryPoint_() noexcept;
+    /// R crossed a boundary on an inline-sync path: persist inline unless the
+    /// owner drives async checkpoints (deferSealSync_).
+    void maybeCheckpointInline_() noexcept;
+    /// Lower R to `leo` after a truncation; persists inline when the on-disk
+    /// value (or an in-progress checkpoint's) would exceed it.
+    void clampRecoveryPointAfterTruncate_(int64_t leo) noexcept;
+    /// Abandon an in-progress async checkpoint (its fds are released now, or on
+    /// its in-flight completion).
+    void abandonRecoveryCheckpoint_() noexcept;
+    void releaseRpFds_() noexcept;
+    int  checkpointRecoveryPoint_(bool publishSnapshot) noexcept;
+    int  writeRecoveryPointTmp_(int64_t value, int& fdOut) noexcept;
+    int  dirFd_open_() noexcept;
+    /// recover(): the segment-chain validation from the recovery point onward.
+    void validateFromRecoveryPoint_(int64_t rp);
     /// CP-8 incremental largestTimestamp: running max of maxTimestamp() across all
     /// batches appended to the ACTIVE segment since the last roll.  Reset to 0 at
     /// each roll (after publishSealedSnapshot captures it for the newly-sealed

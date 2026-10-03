@@ -3107,3 +3107,68 @@ TEST(NonShardNonBlockingRegression, OwnedLogSyncIntervalZeroNeverSyncsRegression
     for (int64_t now = 12 * kMs; now < 2000 * kMs && w2.bgFlushSubmitsForTest() == 0; now += 12 * kMs) w2.doWork(now);
     EXPECT_GE(w2.bgFlushSubmitsForTest(), 1u) << "positive control: interval 10 ms syncs";
 }
+
+// ============================================================================
+// E1d: the durable recovery point on a worker-driven log.  A completed async
+// seal advances the log's recovery point; the worker persists it through its
+// io backend (tmp fdatasync, rename, directory fdatasync) — never inline — and
+// only after the seal's fdatasync completed (R advances in order).
+// ============================================================================
+
+TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealCompletes) {
+    StrictShard s(/*rollBytes=*/512, {1}, GetParam());
+    const int64_t r0 = s.log->persistedRecoveryPoint();
+    ASSERT_EQ(r0, 0);
+    s.w.setReapPausedForTest(true);                        // hold every completion
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);  // segment A (>= rollBytes)
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // rolls: A sealed, appended to B
+    const int64_t bBase = s.log->segmentBaseOffsets().back();
+    ASSERT_GT(bBase, 0);
+    for (int i = 0; i < 50; ++i) s.w.doWork(2 + i);
+    EXPECT_EQ(s.w.sealSubmitsForTest(), 1u);
+    EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 0u) << "R never passes a seal whose fdatasync is in flight";
+    EXPECT_EQ(s.log->recoveryPoint(), 0);
+    EXPECT_EQ(rune::storage::Log::readRecoveryPointFile(s.d.path.string()), 0);
+    s.w.setReapPausedForTest(false);
+    Acks a;
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < bBase; ++i) {
+        s.w.doWork(100 + i); a.drain(s.w); std::this_thread::yield();
+    }
+    EXPECT_GE(s.log->persistedRecoveryPoint(), bBase) << "the completed seal's segment end is persisted";
+    EXPECT_GE(rune::storage::Log::readRecoveryPointFile(s.d.path.string()), bBase);
+    EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 2u) << "tmp-file + directory fdatasync, both via the io backend";
+    EXPECT_EQ(s.log->recoveryCheckpointStage(), rune::storage::Log::RpStage::Idle);
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on the worker loop";
+    const auto snap = s.log->sealedSegmentSnapshot();
+    ASSERT_FALSE(snap->empty());
+    EXPECT_TRUE(snap->front().belowRecoveryPoint) << "the cleaner may now compact the durable sealed segment";
+    // Steady state: no further checkpoint without a new boundary crossing.
+    const uint64_t settled = s.w.recoveryPointSubmitsForTest();
+    for (int i = 0; i < 100; ++i) { s.w.doWork(10'000 + i); a.drain(s.w); }
+    EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), settled) << "never per pass / per append";
+}
+
+TEST(ShardNonBlockingRegression, RecoveryPointCheckpointFsyncErrorIsFailStop) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed
+    Acks a;
+    // Run until the checkpoint's tmp-file fdatasync is the one in flight (the
+    // seal and both produce flushes have completed: both produces acked).
+    using RpStage = rune::storage::Log::RpStage;
+    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::TmpSyncing; ++i) {
+        s.w.doWork(1 + i); a.drain(s.w); std::this_thread::yield();
+    }
+    ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::TmpSyncing);
+    for (int i = 0; i < kCap && a.n < 2; ++i) { a.drain(s.w); std::this_thread::yield(); }
+    ASSERT_EQ(a.n, 2);
+    ASSERT_FALSE(s.log->storageFailed());
+    s.w.forceFlushErrorForTest(EIO);                       // ... and it fails
+    for (int i = 0; i < kCap && !s.log->storageFailed(); ++i) { s.w.doWork(1'000 + i); a.drain(s.w); std::this_thread::yield(); }
+    EXPECT_TRUE(s.log->storageFailed()) << "a failed recovery-point fdatasync is fail-stop (fsyncgate)";
+    EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle);
+    EXPECT_EQ(rune::storage::Log::readRecoveryPointFile(s.d.path.string()), 0) << "never renamed";
+    EXPECT_EQ(s.log->persistedRecoveryPoint(), 0);
+    EXPECT_GE(s.w.storageFailureSignalsForTest(), 1u);
+    s.w.forceFlushErrorForTest(0);
+}

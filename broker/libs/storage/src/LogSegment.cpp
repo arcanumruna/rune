@@ -88,6 +88,7 @@ void LogSegment::adoptAsActive(int64_t base) {
     // true base and renames it into place — no data loss.
     baseOffset_ = base;
     nextOffset_ = base;
+    durableNext_ = base;
     if (index_) index_->setBaseOffset(base);
     staging_ = false;
 }
@@ -97,7 +98,7 @@ void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; }
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
                        int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap)
     : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
-      indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset) {
+      indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset), durableNext_(baseOffset) {
     logPath_ = fname(dir, baseOffset, ".log");
     log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
     if (!log_.is_open()) { std::ofstream(logPath_, std::ios::binary).close();
@@ -184,6 +185,26 @@ void LogSegment::sync() {
         throw std::system_error(err, std::generic_category(), "LogSegment::sync " + logPath_);
     }
     syncedBytes_ = logSize_;
+    durableNext_ = nextOffset_;   // E1d: everything written so far is on disk
+}
+
+int LogSegment::syncForRecovery() noexcept {
+    if (storage_) {
+        ++storage_->roleChangeSyncs;
+        if (storage_->failedErrno != 0) return storage_->failedErrno;
+    }
+    int err = 0;
+    log_.flush();
+    if (!log_) err = EIO;
+    if (err == 0 && storage_ && storage_->faultForTest != 0) err = storage_->faultForTest;
+    if (err == 0 && fd_ >= 0 && ::fsync(fd_) != 0) err = errno != 0 ? errno : EIO;
+    if (err != 0) {
+        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = err;
+        return err;
+    }
+    syncedBytes_ = logSize_;
+    durableNext_ = nextOffset_;
+    return 0;
 }
 
 void LogSegment::preallocate(int64_t bytes) noexcept {
@@ -556,6 +577,10 @@ int64_t LogSegment::recover() {
     log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary);
     logSize_ = validBytes; nextOffset_ = next;
     if (syncedBytes_ > validBytes) syncedBytes_ = validBytes;   // E2 crash seam
+    // E1d: recover() itself proves nothing durable — the owning Log decides
+    // (trusted below the recovery point, fsynced in the validated region).
+    if (durableNext_ > nextOffset_) durableNext_ = nextOffset_;
+    if (durableNext_ < baseOffset_) durableNext_ = baseOffset_;
 
     // B3: msync the rebuilt index then atomically rename .index.tmp → .index,
     // then fsync the directory so the renamed entry survives power loss.
