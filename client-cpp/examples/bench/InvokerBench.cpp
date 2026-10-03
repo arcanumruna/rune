@@ -25,6 +25,7 @@
 #include <rune/client/shard/ClientShard.h>
 #include <rune/client/transport/TransportConfig.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/net/rune_gso_bindings.h>
 
 #include <algorithm>
 #include <chrono>
@@ -381,7 +382,7 @@ int invokerBenchMain(int argc, char** argv) {
     std::printf("RESULT mode=%s shards=%u core=%d rate=%llu duration_s=%lld warmup_s=%lld window=%lld records=%llu "
                 "value=%d acks=%s max_in_flight=%d linger_us=%lld batch_bytes=%d max_frame=%d mtu=%zu "
                 "sent=%llu acked=%llu errors=%llu measured=%llu achieved_rps=%.0f "
-                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f%s\n",
+                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s%s\n",
                 a.mode == BenchArgs::Mode::Open ? "open" : "saturate", a.shards, a.core,
                 static_cast<unsigned long long>(a.rate), static_cast<long long>(a.durationS),
                 static_cast<long long>(a.warmupS), static_cast<long long>(a.window),
@@ -390,7 +391,7 @@ int invokerBenchMain(int argc, char** argv) {
                 static_cast<unsigned long long>(sent), static_cast<unsigned long long>(acked),
                 static_cast<unsigned long long>(errors), static_cast<unsigned long long>(all.count()), achieved,
                 us(all.valueAtQuantile(0.50)), p99us, us(all.valueAtQuantile(0.999)), us(all.max()),
-                ok ? "" : " run_error=1");
+                (tc.udpGso && rune_gso_platform_supported() == 3) ? "on" : "off", ok ? "" : " run_error=1");
     std::fflush(stdout);
     if (!ok || errors != 0) return 1;
     if (a.gateP99Us > 0 || a.gateRps > 0) {

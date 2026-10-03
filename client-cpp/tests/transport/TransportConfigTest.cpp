@@ -206,3 +206,32 @@ TEST(TransportConfig, RejectsLivenessAboveOneHourCapRegression) {
         EXPECT_NE(validate(c)->find("clientLivenessTimeoutNs"), std::string::npos);
     }
 }
+
+// UDP GSO/GRO (rune-broker spec 2026-10-03-aeron-udp-gso-gro): default on; env forces it off / sets batching.
+TEST(TransportConfig, UdpGsoDefaultsOnEnvTurnsOffAndSetsMsgsPerSend) {
+    EXPECT_TRUE(TransportConfig{}.udpGso);
+    EXPECT_EQ(TransportConfig{}.maxMessagesPerSend, 0u);
+    ::setenv("RUNE_CLIENT_AERON_UDP_GSO", "0", 1);
+    ::setenv("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND", "8", 1);
+    TransportConfig c;
+    const auto w = applyEnvOverrides(c);
+    ::unsetenv("RUNE_CLIENT_AERON_UDP_GSO");
+    ::unsetenv("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND");
+    EXPECT_TRUE(w.empty());
+    EXPECT_FALSE(c.udpGso);
+    EXPECT_EQ(c.maxMessagesPerSend, 8u);
+
+    ::setenv("RUNE_CLIENT_AERON_UDP_GSO", "1", 1);
+    TransportConfig on; on.udpGso = false;
+    (void)applyEnvOverrides(on);
+    ::unsetenv("RUNE_CLIENT_AERON_UDP_GSO");
+    EXPECT_TRUE(on.udpGso);
+
+    ::setenv("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND", "17", 1);
+    TransportConfig d;
+    const auto w2 = applyEnvOverrides(d);
+    ::unsetenv("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND");
+    EXPECT_EQ(d.maxMessagesPerSend, 0u);
+    ASSERT_EQ(w2.size(), 1u);
+    EXPECT_NE(w2[0].find("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND"), std::string::npos);
+}

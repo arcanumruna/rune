@@ -72,6 +72,12 @@ struct TransportConfig {
     /// IP-fragmented (one lost fragment loses the datagram).
     /// Multiple of 32 in (32, 65504].  Env: RUNE_CLIENT_AERON_MTU.
     std::size_t mtuLength = kAeronDefaultMtuLength;
+    /// Linux UDP GSO (send) / GRO (receive) transport bindings in the embedded driver; auto-off where the
+    /// kernel/platform lacks them (stock Aeron).  Wire format unchanged.  Env: RUNE_CLIENT_AERON_UDP_GSO=0|1.
+    bool        udpGso             = true;
+    /// Aeron network-publication datagrams per send, 1..16; 0 = 16 with GSO active, else Aeron's 2.
+    /// Env: RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND.
+    uint32_t    maxMessagesPerSend = 0;
     /// SO_SNDBUF / SO_RCVBUF of the driver's UDP sockets (0 = OS default).
     /// Env: RUNE_AERON_SOCKET_BUFFER_BYTES (sets both, as before).
     std::size_t socketSndBufBytes = 2u * 1024 * 1024;
@@ -197,6 +203,12 @@ struct TransportConfig {
         return x;
     };
     if (const auto mtu = readSize("RUNE_CLIENT_AERON_MTU")) c.mtuLength = *mtu;
+    if (const auto g = readSize("RUNE_CLIENT_AERON_UDP_GSO")) c.udpGso = (*g != 0);
+    if (const auto m = readSize("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND")) {
+        if (*m >= 1 && *m <= 16) c.maxMessagesPerSend = static_cast<uint32_t>(*m);
+        else warnings.push_back("rune-client: ignoring RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND=" + std::to_string(*m) +
+                                ": must be in [1, 16] (keeping the configured value)");
+    }
     if (const auto sock = readSize("RUNE_AERON_SOCKET_BUFFER_BYTES")) {
         c.socketSndBufBytes = *sock;  // 0 = OS default, as before
         c.socketRcvBufBytes = *sock;

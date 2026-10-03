@@ -149,6 +149,24 @@ if(aeron_FOUND)
     target_link_libraries(rune_client INTERFACE aeron::aeron)
 endif()
 
+# ── rune_gso — UDP GSO/GRO Aeron transport bindings ──────────────────────────
+# rune-protocol sibling C source (rune-broker spec 2026-10-03-aeron-udp-gso-gro).  Linux does GSO/GRO;
+# other platforms compile a no-op (create() returns NULL -> stock Aeron).
+if(aeron_FOUND)
+    enable_language(C)
+    add_library(rune_gso STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_gso_bindings.c)
+    set_target_properties(rune_gso PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(rune_gso PUBLIC $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>)
+    target_link_libraries(rune_gso PUBLIC aeron::aeron)
+    if(UNIX AND NOT APPLE)
+        # Aeron's internal driver headers include siblings relative to <root>, <root>/aeron, <root>/aeronmd.
+        foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+            target_include_directories(rune_gso PRIVATE
+                "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+        endforeach()
+    endif()
+endif()
+
 # ── rune_client_transport — AeronTransport (compiled, links aeronmd C driver) ─
 if(aeron_FOUND)
     add_library(rune_client_transport STATIC
@@ -159,7 +177,7 @@ if(aeron_FOUND)
         $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>  # FrameCrc.h (B1): Crc32c / RecordBatch layout
         $<INSTALL_INTERFACE:include>
     )
-    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr)
+    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso)
 
     # Linux CI portability: libuuid is needed on Linux but not macOS (no-op there).
     if(UNIX AND NOT APPLE)
@@ -709,6 +727,13 @@ if(BUILD_TESTING)
         )
 
         gtest_discover_tests(rune_transport_tests)
+
+        if(UNIX AND NOT APPLE)
+            # UDP GSO/GRO bindings in the client's embedded driver (Linux kernels only).
+            add_executable(rune_transport_gso_tests tests/transport/AeronTransportGsoTest.cpp)
+            target_link_libraries(rune_transport_gso_tests PRIVATE rune_client_transport GTest::gtest_main)
+            gtest_discover_tests(rune_transport_gso_tests)
+        endif()
     endif()
 
     # ── Agent tests (CC-5) — single-writer duty-cycle + ipc gateway loop ──────

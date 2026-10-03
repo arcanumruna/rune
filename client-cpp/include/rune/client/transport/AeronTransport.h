@@ -27,6 +27,7 @@
 
 extern "C" {
 #include <aeronmd/aeronmd.h>
+#include "rune/protocol/net/rune_gso_bindings.h"
 }
 
 #include <rune/client/detail/FlatIndexMap.h>
@@ -321,6 +322,13 @@ public:
     /// deterministic, no atomic.  Read on the owner thread.
     [[nodiscard]] int callerPumpViolations() const noexcept { return callerPumpViolations_; }
 
+    /// The embedded driver runs the rune_gso UDP GSO/GRO bindings (stays true after stop()).
+    [[nodiscard]] bool udpGsoActive() const noexcept { return gsoWasActive_; }
+    /// GSO/GRO totals of every transport the driver closed; complete after stop().
+    [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
+    /// TEST SEAM — call before start(): the driver's next `count` GSO sendmsg calls fail with errno `err`.
+    void injectGsoSendErrorsForTest(int err, int count) noexcept { gsoInjectErr_ = err; gsoInjectCount_ = count; }
+
     /// Max single-frame payload of the default ingress publication
     /// (= mtuLength - 32 for UDP).  0 before start().
     [[nodiscard]] int32_t ingressMaxPayloadLength() const noexcept {
@@ -355,6 +363,12 @@ private:
     // ---- Embedded driver (C API) --------------------------------------------
     aeron_driver_context_t* driverCtx_     = nullptr;
     aeron_driver_t*         driver_        = nullptr;
+    rune_gso_bindings_t*    gso_           = nullptr;   // owned; outlives driverCtx_ (Aeron points at it)
+    rune_gso_totals_t       gsoTotals_{};
+    bool                    gsoWasActive_  = false;
+    int                     gsoInjectErr_   = 0;      // test seam (injectGsoSendErrorsForTest)
+    int                     gsoInjectCount_ = 0;
+    void releaseGso_() noexcept;   // after aeron_driver_context_close
     std::thread             driverThread_;
     // F8c C0: true from the owner launching driverThread_ until it joined it —
     // owner-thread state only (the driver thread never reads it).

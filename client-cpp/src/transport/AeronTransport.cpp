@@ -557,6 +557,19 @@ void AeronTransport::startEmbeddedDriver() {
     aeron_driver_context_set_term_buffer_length(
         driverCtx_, static_cast<uint64_t>(cfg_.termBufferLength));
     aeron_driver_context_set_mtu_length(driverCtx_, cfg_.mtuLength);
+    if (cfg_.udpGso) {
+        gso_ = rune_gso_bindings_create(1, 1);   // NULL off Linux / unsupported kernel -> stock Aeron
+        if (gso_ != nullptr && gsoInjectCount_ > 0) rune_gso_bindings_test_inject(gso_, gsoInjectErr_, gsoInjectCount_);
+        if (gso_ != nullptr && rune_gso_bindings_install(driverCtx_, gso_) < 0) {
+            rune_gso_bindings_delete(gso_);
+            gso_ = nullptr;
+        }
+        gsoWasActive_ = gso_ != nullptr;
+    }
+    if (cfg_.maxMessagesPerSend > 0)
+        aeron_driver_context_set_network_publication_max_messages_per_send(driverCtx_, cfg_.maxMessagesPerSend);
+    else if (gso_ != nullptr)
+        aeron_driver_context_set_network_publication_max_messages_per_send(driverCtx_, 16U);   // GSO groups <= 16
     // Aeron requires timer_interval < client_liveness < publication_unblock
     // (aeron_driver_context.c:1322-1344).  validate() bounds liveness to
     // [kMinClientLivenessTimeoutNs, kMaxClientLivenessTimeoutNs]; derive the two
@@ -587,6 +600,7 @@ void AeronTransport::startEmbeddedDriver() {
     if (aeron_driver_init(&driver_, driverCtx_) < 0) {
         aeron_driver_context_close(driverCtx_);
         driverCtx_ = nullptr;
+        releaseGso_();
         throw std::runtime_error(
             std::string("AeronTransport: aeron_driver_init failed: ") +
             aeron_errmsg());
@@ -597,6 +611,7 @@ void AeronTransport::startEmbeddedDriver() {
         aeron_driver_context_close(driverCtx_);
         driver_    = nullptr;
         driverCtx_ = nullptr;
+        releaseGso_();
         throw std::runtime_error(
             std::string("AeronTransport: aeron_driver_start failed: ") +
             aeron_errmsg());
@@ -612,6 +627,7 @@ void AeronTransport::startEmbeddedDriver() {
         aeron_driver_context_close(driverCtx_);
         driver_    = nullptr;
         driverCtx_ = nullptr;
+        releaseGso_();
         throw std::runtime_error(
             "AeronTransport: Aeron CnC file missing after aeron_driver_init: " + cncPath);
     }
@@ -692,11 +708,19 @@ void AeronTransport::stopEmbeddedDriver() noexcept {
         driver_ = nullptr;
     }
 
-    // Step D: close the driver context.
+    // Step D: close the driver context, then the GSO bindings it pointed at.
     if (driverCtx_) {
         aeron_driver_context_close(driverCtx_);
         driverCtx_ = nullptr;
     }
+    releaseGso_();
+}
+
+void AeronTransport::releaseGso_() noexcept {
+    if (gso_ == nullptr) return;
+    rune_gso_bindings_totals(gso_, &gsoTotals_);
+    rune_gso_bindings_delete(gso_);
+    gso_ = nullptr;
 }
 
 } // namespace rune::client::transport
