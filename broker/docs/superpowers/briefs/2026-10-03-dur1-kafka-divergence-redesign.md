@@ -11,8 +11,8 @@ spawn subagents. Configure a build-fast like the existing one in wt31.
 - Two Opus reviews found that the heuristic layer added in b7d877f/f153662 (probe credit for ISR/HW, "wedged"/
   "diverged" follower flags, leader ADOPTION of a survivor's committed prefix across epochs, reconcile pulls at
   LEO-1 with byte-identical boundary matching) keeps producing correctness/liveness holes. Reproductions:
-  /tmp/durrev2/Repro2.cpp (stock DrHarness.h) and /tmp/durrev2/Repro3.cpp (harness copy with maxFetchBytes=1),
-  plus /tmp/durrev/Repro.cpp. Every one of them must become a `*Regression*` test in the DR suite and pass.
+  docs/superpowers/briefs/repros/rev2-Repro2.cpp (stock DrHarness.h) and rev2-Repro3.cpp (harness copy with maxFetchBytes=1),
+  plus docs/superpowers/briefs/repros/Repro.cpp (all in wt26). Every one of them must become a `*Regression*` test in the DR suite and pass.
   Review findings to satisfy (all): adoption stall forever when the boundary batch differs/compacted; reconcile
   livelock when the boundary batch uses up the fetch budget; same-epoch re-assert (partitionEpoch-only ISR change)
   clears wedge/diverged/adoption state; ungated METADATA path (MetadataService append(acksAll=false) on an
