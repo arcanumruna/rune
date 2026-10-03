@@ -520,3 +520,64 @@ TEST(StaticAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
     EXPECT_EQ(svc.assignment(0, 0), nullptr)
         << "assignment must be absent when balancer threw an error";
 }
+
+// ---------------------------------------------------------------------------
+// Review: ungated METADATA path — MetadataService appended with acks=false on an
+// INCOMPLETE leader (and ignored the result), so a deficient metadata leader
+// could write over committed metadata records / lose the ones it emitted.  Now:
+// nothing is appended (static emit, dynamic records, control ticks) until the
+// metadata replica is a COMPLETE leader; the records stay queued (never dropped,
+// never an ignored append result) and are appended in order once it completes.
+// ---------------------------------------------------------------------------
+TEST(MetadataGateRegression, IncompleteMetadataLeaderQueuesNeverAppendsNeverDrops) {
+    SaeTempDir dir1("mg1"), dir2("mg2"), dir3("mg3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(
+        makeMetaCfg(kNode1), Role::Follower, 0, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(
+        makeMetaCfg(kNode2), Role::Follower, 0, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(
+        makeMetaCfg(kNode3), Role::Follower, 0, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    r1->becomeLeader(1, allNodes);               // no follower has reported: INCOMPLETE
+    ASSERT_EQ(r1->role(), Role::Leader);
+    ASSERT_FALSE(r1->isLeaderComplete());
+
+    std::vector<TopicSpec> topics = {TopicSpec{0, 3, 1, "", "t"}};
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure(topics, allNodes);
+    svc1.armControlTick(/*deadlineNs=*/0);
+    int64_t clock = 1'000'000LL;
+    for (int i = 0; i < 5; ++i) {
+        clock += 1'000'000LL;
+        (void)svc1.doWork(clock);
+        svc1.emitStaticAssignmentIfNeeded();
+        EXPECT_FALSE(svc1.pollAndAppendControlTick(clock)) << "a tick appended on an incomplete leader";
+    }
+    EXPECT_EQ(r1->logEndOffset(), 0) << "metadata appended on an incomplete leader";
+    EXPECT_TRUE(svc1.leaderPendingCompletion());
+    EXPECT_EQ(svc1.pendingControlTimers(), 1u) << "the tick was consumed although nothing was appended";
+
+    // The followers report in (validated fetches) → the leader completes; the
+    // queued / deferred records are appended, replicated and committed.
+    r2->becomeFollower(1, kNode1);
+    r3->becomeFollower(1, kNode1);
+    bool done = false;
+    for (int i = 0; i < kDriveCap && !done; ++i) {
+        clock += 1'000'000LL;
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+        (void)svc1.doWork(clock);
+        (void)svc1.pollAndAppendControlTick(clock);
+        done = r1->isLeaderComplete() && svc1.assignment(0, 0) != nullptr &&
+               svc1.assignment(0, 2) != nullptr && svc1.lastEmittedTickSeq() >= 0;
+    }
+    ASSERT_TRUE(done) << "complete=" << r1->isLeaderComplete() << " leo=" << r1->logEndOffset();
+    EXPECT_GT(r1->highWatermark(), 0);
+}

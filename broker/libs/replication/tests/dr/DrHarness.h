@@ -91,6 +91,10 @@ struct DrConfig {
     /// worker's io backend.  The harness never completes it, so a sealed segment
     /// is NOT durable until then (worst case for a power loss).
     bool    deferSealSync           = false;
+    /// Per-replica fetch budget (PartitionConfig::maxFetchBytes).  1 = every
+    /// answer carries exactly ONE (oversize-exempt) batch — the regime of any
+    /// batch >= maxFetchBytes.
+    int32_t maxFetchBytes           = 1 << 20;
 };
 
 // ---------------------------------------------------------------------------
@@ -402,6 +406,34 @@ public:
         return out;
     }
 
+    /// (baseOffset, partitionLeaderEpoch) of every batch in node `id`'s log —
+    /// two replicas holding the same records under different epochs have
+    /// DIVERGED (same ids, different lineage), which ids() alone cannot see.
+    std::vector<std::pair<Offset, int32_t>> batchEpochs(NodeId id) {
+        std::vector<std::pair<Offset, int32_t>> out;
+        DrNode& n = node(id);
+        if (!n.up) return out;
+        Offset at = n.log->logStartOffset();
+        const Offset leo = n.log->logEndOffset();
+        for (int guard = 0; at < leo && guard < 100000; ++guard) {
+            const auto bytes = n.log->read(at, 1 << 20);
+            if (bytes.empty()) break;
+            std::size_t pos = 0;
+            Offset next = at;
+            while (pos + rune::protocol::batch::kRecordBatchOverhead <= bytes.size()) {
+                rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+                const int32_t total = r.totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total) > bytes.size()) break;
+                out.emplace_back(r.baseOffset(), r.partitionLeaderEpoch());
+                next = r.baseOffset() + r.lastOffsetDelta() + 1;
+                pos += static_cast<std::size_t>(total);
+            }
+            if (next <= at) break;
+            at = next;
+        }
+        return out;
+    }
+
     /// Every acked id is present EXACTLY ONCE on node `id`.
     void expectAckedPresent(NodeId id, const char* where = "") {
         const auto v = ids(id);
@@ -427,7 +459,8 @@ public:
         EXPECT_EQ(s.size(), v.size()) << "node " << id << " holds duplicate records";
     }
 
-    /// Every live replica holds the same records in the same order as the leader.
+    /// Every live replica holds the same records in the same order, under the
+    /// same leader epochs, as the leader.
     bool converged() {
         DrNode* L = leaderNode_();
         if (!L) return false;
@@ -437,9 +470,11 @@ public:
             if (n.rep->logEndOffset() != leo) return false;
         }
         const auto ref = ids(L->id);
+        const auto refEp = batchEpochs(L->id);
         for (auto& n : nodes_) {
             if (!n.up || n.id == L->id) continue;
             if (ids(n.id) != ref) return false;
+            if (batchEpochs(n.id) != refEp) return false;   // same records, same lineage
         }
         return true;
     }
@@ -510,7 +545,7 @@ private:
         c.isrCheckIntervalNs      = cfg_.isrCheckIntervalNs;
         c.followerFlushIntervalNs = cfg_.followerFlushIntervalNs;
         c.segmentRollBytes        = cfg_.segmentRollBytes;
-        c.maxFetchBytes           = 1 << 20;
+        c.maxFetchBytes           = cfg_.maxFetchBytes;
         return c;
     }
 

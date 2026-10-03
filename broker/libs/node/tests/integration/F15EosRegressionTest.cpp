@@ -995,18 +995,30 @@ void selfDemote(PartitionReplica& r, int32_t newEpoch, int64_t now) {
     rune::replication::FetchRequestMsg up{newEpoch, 0, /*follower*/2, 0, 1 << 20, r.topicId()};
     (void)r.onFetchRequest(up, now);
 }
-// KIP-101 answer from the new leader: the shared epoch ended at `endOffset`.
+// KIP-320/595 DivergingEpoch answer from the new leader: the lineage of our
+// last epoch ends at `endOffset` on its side (KIP-279 truncation to
+// min(endOffset, our own end of that epoch) = min(endOffset, LEO)).
 void truncateTo(PartitionReplica& r, int64_t endOffset) {
-    rune::replication::OffsetsForLeaderEpochRespMsg ole{};
-    ole.leaderEpoch = r.epoch(); ole.partition = 0; ole.responseEpoch = 1;
-    ole.endOffset = endOffset; ole.errorCode = 0; ole.topicId = r.topicId();
-    r.applyOffsetsForLeaderEpochResponse(ole);
+    rune::replication::FetchResponseMsg div{};
+    div.leaderEpoch = r.epoch(); div.partition = 0; div.highWatermark = 0;
+    div.logStartOffset = 0; div.errorCode = rune::replication::kErrDivergingEpoch;
+    div.topicId = r.topicId();
+    div.divergingEpoch = r.lastFetchedEpoch(); div.divergingEndOffset = endOffset;
+    r.applyReplicated(div);
 }
 // Re-fetch from the new leader: `records` appended at the follower's LEO.
+// The batches carry the new leader's epoch (Kafka: stamped on its append).
 void refetch(PartitionReplica& r, const std::vector<uint8_t>& records, int64_t leaderHw) {
+    std::vector<uint8_t> stamped(records);
+    for (std::size_t pos = 0; pos + rune::protocol::batch::kRecordBatchOverhead <= stamped.size();) {
+        rune::protocol::RecordBatchReader rd(stamped.data() + pos, stamped.size() - pos);
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(stamped.data() + pos,
+                                                            static_cast<int32_t>(r.epoch()));
+        pos += static_cast<std::size_t>(rd.totalLength());
+    }
     rune::replication::FetchResponseMsg fr{};
     fr.leaderEpoch = r.epoch(); fr.partition = 0; fr.highWatermark = leaderHw; fr.logStartOffset = 0;
-    fr.errorCode = 0; fr.topicId = r.topicId(); fr.records = std::span<const uint8_t>(records);
+    fr.errorCode = 0; fr.topicId = r.topicId(); fr.records = std::span<const uint8_t>(stamped);
     r.applyReplicated(fr);
 }
 std::vector<uint8_t> concat(std::initializer_list<std::vector<uint8_t>> parts) {
@@ -1535,9 +1547,7 @@ TEST(TxnRoleGateRegression, NoOpEpochTruncationKeepsLogGeneration) {
     refetch(rep, concat({batchAt(0), batchAt(1)}), /*leaderHw=*/2);
     ASSERT_EQ(log.logEndOffset(), 2);
     const uint64_t gen = rep.logGeneration();
-    rune::replication::FetchResponseMsg fr{};
-    fr.leaderEpoch = 2; fr.partition = 0; fr.highWatermark = 2; fr.errorCode = 0; fr.topicId = rep.topicId();
-    rep.applyReplicated(fr);                                  // epoch upgrade: shared epoch 1 ends at LEO
+    rep.becomeFollower(2, 2);                                 // epoch upgrade: no truncation (KIP-320/595)
     ASSERT_EQ(rep.epoch(), 2);
     EXPECT_EQ(log.logEndOffset(), 2);
     EXPECT_EQ(rep.logGeneration(), gen) << "a no-op truncation bumped logGeneration";
@@ -3051,28 +3061,22 @@ void gatewayMarker(EosRig& R, int64_t pid, bool commit, int64_t now) {
 } // namespace
 
 TEST(TxnRcRegression, BuildWaitsForLeaderComplete) {
-    // I2: a deficient leader (follower 2 has not reported) must not build its
-    // RC state before leaderComplete_ — the reconcile may still append old-term
-    // batches.  Here it appends an old-term ABORT for the txn at 0: the build,
-    // started only at leaderComplete_, sees it.
+    // I2: an incomplete leader (follower 2 has not reported a validated fetch)
+    // must not build its RC state before leaderComplete_ — until then it has not
+    // proven its log holds every committed record.  (The DR-BUG-6 reverse
+    // reconcile that used to append old-term batches here is retired: a leader
+    // never takes records it did not hold when elected.)
     RcRig R({1, 2}, 64LL * 1024 * 1024, Role::Follower);
     appendAt(*R.log, txnBatch(7, 0, 0));                    // the previous term's txn data at 0
     R.rep->becomeLeader(2, {1, 2});
     R.own();
     for (int i = 0; i < 8; ++i) R.pass();
-    ASSERT_FALSE(R.rep->isLeaderComplete()) << "precondition: a deficient leader";
+    ASSERT_FALSE(R.rep->isLeaderComplete()) << "precondition: an incomplete leader";
     EXPECT_EQ(R.status(), Worker::kRcUnbuilt) << "the RC build started before leaderComplete_";
-    const auto m = rebased(marker(7, /*commit=*/false), 1);
-    rune::replication::FetchResponseMsg fr{};
-    fr.leaderEpoch = R.rep->epoch(); fr.partition = 0; fr.highWatermark = 2; fr.logStartOffset = 0;
-    fr.errorCode = 0; fr.topicId = R.topic(); fr.records = std::span<const uint8_t>(m);
-    R.rep->applyReconcileResponse(fr);
-    ASSERT_EQ(R.log->logEndOffset(), 2) << "precondition: the reconcile appended the old-term ABORT at 1";
     followerCaughtUp(*R.rep, R.now);
     ASSERT_TRUE(R.rep->isLeaderComplete()) << "precondition: the survivor reported in";
     ASSERT_TRUE(R.runUntilReady(64)) << "status " << R.status();
-    EXPECT_TRUE(R.covers(7, 0)) << "the build missed the reconciled ABORT marker (aborted data would be served)";
-    EXPECT_EQ(R.open(), 0u);
+    EXPECT_EQ(R.open(), 1u) << "the build missed the open txn at 0";
 }
 
 TEST(TxnRcRegression, BuildIsBoundedPerPass) {

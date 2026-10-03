@@ -199,10 +199,21 @@ public:
     /// \param highWatermark The partition high-watermark (committed prefix).
     /// \returns The new ISR vector (same as isr() after the call).
     std::vector<NodeId> maybeExpandIsr(int64_t nowNs, Offset highWatermark) {
+        return maybeExpandIsrIf(nowNs, highWatermark, [](NodeId) { return true; });
+    }
+
+    /// maybeExpandIsr restricted to replicas `mayJoin(node)` accepts — the
+    /// leader admits only followers whose fetch passed lineage validation in
+    /// its CURRENT leadership (ISR soundness: the per-follower fetch state here
+    /// outlives a leadership, and resetLagClock refreshes it for every replica,
+    /// so it alone is no proof that a replica holds the committed prefix).
+    template <class MayJoin>
+    std::vector<NodeId> maybeExpandIsrIf(int64_t nowNs, Offset highWatermark, MayJoin&& mayJoin) {
         std::vector<NodeId> newIsr = isr_;
 
         for (NodeId node : replicas_) {
             if (inIsr(node)) continue; // already in ISR
+            if (!mayJoin(node)) continue;
 
             const auto& s = followerState_[node];
             // A-NEW-4: require recent fetch (within the shrink lag window)

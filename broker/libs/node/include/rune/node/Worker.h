@@ -925,11 +925,14 @@ public:
            .replLogStartOffset(op.replicatedPayload.logStartOffset)
            .replErrorCode(op.replicatedPayload.errorCode)
            .replTopicId(op.replicatedPayload.topicId)
+           .replDivergingEpoch(op.replicatedPayload.divergingEpoch)
+           .replDivergingEndOffset(op.replicatedPayload.divergingEndOffset)
            .frLeaderEpoch(static_cast<std::int64_t>(op.fetchRequestPayload.leaderEpoch))
            .frFollowerId(static_cast<std::int32_t>(op.fetchRequestPayload.followerId))
            .frFetchOffset(static_cast<std::int64_t>(op.fetchRequestPayload.fetchOffset))
            .frMaxBytes(op.fetchRequestPayload.maxBytes)
            .frNowNs(op.fetchRequestPayload.nowNs)
+           .frLastFetchedEpoch(op.fetchRequestPayload.lastFetchedEpoch)
            .oleCurrentEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.currentEpoch))
            .oleFollowerId(static_cast<std::int32_t>(op.offsEpochReqPayload.followerId))
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
@@ -2641,6 +2644,8 @@ private:
         msg.logStartOffset = op.replLogStartOffset();
         msg.errorCode      = op.replErrorCode();
         msg.topicId        = op.replTopicId();
+        msg.divergingEpoch     = op.replDivergingEpoch();
+        msg.divergingEndOffset = op.replDivergingEndOffset();
         // Zero-copy span: records view into the ring frame.
         // Valid only inside this callback — applyReplicated copies before we return.
         msg.records = std::span<const uint8_t>(
@@ -2788,6 +2793,7 @@ private:
         req.fetchOffset = static_cast<rune::replication::Offset>(op.frFetchOffset());
         req.maxBytes    = op.frMaxBytes();
         req.topicId     = op.topicId();
+        req.lastFetchedEpoch = op.frLastFetchedEpoch();
 
         try {
             replica->onFetchRequest(req, op.frNowNs(),

@@ -113,6 +113,9 @@ public:
     ///          rebuild here would silently recover no committed offsets.
     bool rebuildFromLog();
 
+    /// The __consumer_offsets replica this store appends to / rebuilds from.
+    [[nodiscard]] rune::replication::PartitionReplica* replica() const noexcept { return replica_; }
+
 private:
     // -----------------------------------------------------------------------
     // Key/value encode helpers (write into caller-supplied vectors).

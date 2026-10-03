@@ -252,6 +252,8 @@ private:
     /// Load if loadable_, unload if the Loaded predicate broke; true = serving.
     bool ensureLoaded_(int64_t nowNs);
     [[nodiscard]] bool loadable_() const;
+    /// The txn-state replica's logGeneration() the loaded state was folded from.
+    uint64_t loadedLogGen_ = 0;
     [[nodiscard]] bool stillLoaded_() const;
     void load_(int64_t nowNs);
     void unload_();

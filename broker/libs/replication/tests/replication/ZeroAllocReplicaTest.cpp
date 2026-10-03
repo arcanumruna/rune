@@ -75,6 +75,10 @@ TEST(ZeroAllocReplicaRegression, PushAllocatesNothing) {
     Dir d; rune::storage::Log log(d.p.string(), 64LL * 1024 * 1024); log.recover();
     SinkTransport t;
     PartitionReplica leader(cfg(/*push=*/true), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    // KIP-320/595: follower 2 reports in first (validated pure ack on its empty
+    // log) — a leader pushes only to validated followers.
+    (void)leader.onFetchRequest(FetchRequestMsg{1, 0, 2, 0, 0, 0}, 0);
+    t.frames = 0; t.bytes = 0;
     // Production produce path: batches land in the log directly, then the leader
     // is told (onLeaderLogAppended) and doWork() COALESCES them into one push.
     // (PartitionReplica::append() pushes inline — it would leave doWork nothing.)

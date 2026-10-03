@@ -97,8 +97,12 @@ public:
     /// Kafka's leader restamp).  `data` is never mutated (may point directly at a
     /// read-only Aeron fragment / ring slot).  Same page-cache durability
     /// contract as appendNoSync().  Returns nextOffset (= lastOffset + 1).
+    /// `leaderEpoch` >= 0 additionally patches the batch's partitionLeaderEpoch
+    /// field [12..15] (CRC-excluded, Kafka's leader stamp) the same zero-copy way;
+    /// -1 writes the producer's bytes there unchanged.
     int64_t appendNoSyncRestamp(const uint8_t* data, std::size_t len,
-                                int64_t baseOffset, int64_t lastOffset);
+                                int64_t baseOffset, int64_t lastOffset,
+                                int32_t leaderEpoch = -1);
 
     /// Flush libc buffer + fdatasync ".log" + msync ".index".
     /// Called automatically by append() (durable-by-default).

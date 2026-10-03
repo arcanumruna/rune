@@ -1154,7 +1154,14 @@ void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
         EXPECT_EQ(c.records().front().bytes.size(), limit);
         auto expected = atLimit;
         for (int i = 0; i < 8; ++i) expected[i] = 0;   // baseOffset 0 restamped (bytes 0..7)
-        EXPECT_EQ(c.records().front().bytes, expected) << "pushed batch not byte-identical";
+        // Kafka parity: the leader stamps its partitionLeaderEpoch (bytes 12..15,
+        // CRC-excluded) on append — a real epoch, never the producer's -1.
+        const auto& got0 = c.records().front().bytes;
+        int32_t stampedEpoch = 0;
+        std::memcpy(&stampedEpoch, got0.data() + 12, 4);
+        EXPECT_GE(stampedEpoch, 0) << "the leader did not stamp its epoch";
+        std::memcpy(expected.data() + 12, &stampedEpoch, 4);
+        EXPECT_EQ(got0, expected) << "pushed batch not byte-identical (beyond the leader stamps)";
     }
     for (auto& n : ns) n->stop();
     int replicas = 0;

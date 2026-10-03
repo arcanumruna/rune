@@ -195,6 +195,13 @@ struct Cluster {
     Cluster() {
         n[1]->r->becomeFollower(1, 1);
         n[2]->r->becomeFollower(1, 1);
+        // KIP-320/595: a leader pushes only to followers whose fetch passed
+        // lineage validation in this leadership — both report in first (a
+        // validated fetch on their empty logs, delivered straight to the leader;
+        // the followers' own fetch state machines stay untouched) and the
+        // leader's empty answers are discarded.
+        for (NodeId f : {2, 3}) (void)leader().r->onFetchRequest(node(f).r->nextFetch(), kNow);
+        leader().wire->out.clear();
     }
     Node& leader() { return *n[0]; }
     Node& node(NodeId id) { return *n[static_cast<std::size_t>(id - 1)]; }
@@ -508,32 +515,25 @@ TEST(F27SendNeverDroppedRegression, RefusedEpochResponseIsResentNextPassRegressi
     EXPECT_EQ(L.framesTo(2, kEpochResp), 1u) << "exactly once";
 }
 
-// F3: a refused reverse-reconcile PULL (deficient leader → ahead survivor) is
-// re-sent on the next pass (no re-probe / stuck-window wait).
-TEST(F27SendNeverDroppedRegression, RefusedReconcilePullIsResentNextPassRegression) {
+// Kafka-parity redesign: the DR-BUG-6 reverse reconcile is retired — a leader
+// never pulls records it did not hold when elected, and a replica never serves
+// such a pull.  (Replaces the F3 "refused reconcile pull / answer re-sent"
+// tests: there is nothing left to owe.)
+TEST(F27SendNeverDroppedRegression, RetiredReconcileIsNeverSentRegression) {
     Cluster c;
     Node& L = c.leader();
-    L.r->becomeLeader(2, {1, 2, 3});                   // open epoch 2 at LEO 0
-    L.wire->script[2].push_back(kAeronBackPressured);  // the pull is refused
+    L.r->becomeLeader(2, {1, 2, 3});
     OffsetsForLeaderEpochReqMsg req{};
     req.currentEpoch = 2; req.partition = 0; req.followerId = 2;
-    req.requestedEpoch = 2; req.followerLeo = 5; req.topicId = 0;   // ahead, shared epoch
+    req.requestedEpoch = 2; req.followerLeo = 5; req.topicId = 0;   // claims to be ahead
     L.r->onOffsetsForLeaderEpochRequest(req);
-    ASSERT_EQ(L.framesTo(2, kReconcileFetchReqTemplateId), 0u);
-    (void)L.r->doWork(kNow);
-    EXPECT_EQ(L.framesTo(2, kReconcileFetchReqTemplateId), 1u) << "refused pull re-sent next pass";
-}
-
-// F3: a refused survivor ReconcileResponse is re-sent on the survivor's next pass.
-TEST(F27SendNeverDroppedRegression, RefusedReconcileResponseIsResentNextPassRegression) {
-    Cluster c;
+    for (int i = 0; i < 3; ++i) (void)L.r->doWork(kNow);
+    EXPECT_EQ(L.framesTo(2, kReconcileFetchReqTemplateId), 0u) << "a leader never pulls";
     Node& F = c.node(2);
-    F.log.append(batchAt(0, 64), 0);                   // the survivor holds offset 0
-    F.wire->script[1].push_back(kAeronAdminAction);
+    F.log.append(batchAt(0, 64), 0);
     F.r->onReconcileRequest(FetchRequestMsg{1, 0, /*puller=*/1, /*off=*/0, 1 << 20, 0});
-    ASSERT_EQ(F.framesTo(1, kReconcileFetchRespTemplateId), 0u);
     (void)F.r->doWork(kNow);
-    EXPECT_EQ(F.framesTo(1, kReconcileFetchRespTemplateId), 1u) << "refused reconcile answer re-sent";
+    EXPECT_EQ(F.framesTo(1, kReconcileFetchRespTemplateId), 0u) << "a pull is never served";
 }
 
 // F4: a follower whose sends are all refused (leader image not connected) does

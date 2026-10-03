@@ -825,7 +825,7 @@ public:
         rune::replication::FetchRequestMsg::encode(
             claimBuf, 0,
             req.leaderEpoch, req.partition, req.followerId,
-            req.fetchOffset, req.maxBytes, req.topicId);
+            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch);
         return pubReg_.broadcastToPeers(claimBuf, kSize);
     }
 
@@ -842,7 +842,7 @@ public:
         alignas(8) uint8_t claimBuf[kSize];
         rune::replication::FetchRequestMsg::encode(
             claimBuf, 0, req.leaderEpoch, req.partition, req.followerId,
-            req.fetchOffset, req.maxBytes, req.topicId);
+            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch);
         if (pubReg_.hasPeer(leader)) return pubReg_.sendToPeer(leader, claimBuf, kSize) > 0;
         return pubReg_.broadcastToPeers(claimBuf, kSize);
     }
@@ -903,7 +903,7 @@ public:
         rune::replication::FetchRequestMsg::encode(
             claimBuf, 0,
             req.leaderEpoch, req.partition, req.followerId,
-            req.fetchOffset, req.maxBytes, req.topicId);
+            req.fetchOffset, req.maxBytes, req.topicId, req.lastFetchedEpoch);
         rune::replication::stampTemplateId(
             claimBuf, 0, rune::replication::kReconcileFetchReqTemplateId);
         return pubReg_.sendToPeer(toPeer, claimBuf, kSize) > 0;
@@ -980,7 +980,7 @@ private:
             case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest):
             case rr::kReconcileFetchReqTemplateId:
             {
-                if (len < rr::FetchRequestMsg::TOTAL_SIZE) [[unlikely]] return;
+                if (len < rr::FetchRequestMsg::MIN_SIZE) [[unlikely]] return;
                 topicId = rr::detail::read_le<int32_t>(frame + kHdrSize + 28);
 
                 // GR-1 carry-forward: cap maxBytes to the deliverable ceiling so the
@@ -997,12 +997,14 @@ private:
                     rr::detail::read_le<int32_t>(frame + kHdrSize + 24);
                 if (ceiling > 0 && rawMaxBytes > ceiling) {
                     // Build a capped copy and dispatch it instead of the original.
+                    // v2 (32-byte block) or v3 (36) frame: copy what arrived.
+                    const std::size_t reqLen = len < rr::FetchRequestMsg::TOTAL_SIZE
+                        ? len : rr::FetchRequestMsg::TOTAL_SIZE;
                     alignas(8) uint8_t cappedBuf[rr::FetchRequestMsg::TOTAL_SIZE];
-                    std::memcpy(cappedBuf, frame, rr::FetchRequestMsg::TOTAL_SIZE);
+                    std::memcpy(cappedBuf, frame, reqLen);
                     rr::detail::write_le<int32_t>(
                         cappedBuf + kHdrSize + 24, ceiling);
-                    dispatch(topicId, partition, templateId,
-                             cappedBuf, rr::FetchRequestMsg::TOTAL_SIZE);
+                    dispatch(topicId, partition, templateId, cappedBuf, reqLen);
                     return;
                 }
                 break;
@@ -1010,7 +1012,7 @@ private:
             case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchResponse):
             case rr::kReconcileFetchRespTemplateId:
             {
-                if (len < rr::FetchResponseMsg::encodedSize(0)) [[unlikely]] return;
+                if (len < rr::FetchResponseMsg::MIN_SIZE) [[unlikely]] return;
                 // Generated SBE: topicId @ m_offset+30 (errorCode+2=@28, topicId@30;
                 // no padding; sbeBlockLength=34).
                 topicId = rr::detail::read_le<int32_t>(frame + kHdrSize + 30);
@@ -1153,7 +1155,7 @@ private:
     // log) is handed to sendGatherToPeer, which copies it ONCE into the term
     // buffer.  No scratch buffer, no allocation.
     // -----------------------------------------------------------------------
-    static constexpr std::size_t kFetchResponsePrefixMax = 64;   // encodedSize(0) == 46
+    static constexpr std::size_t kFetchResponsePrefixMax = 64;   // encodedSize(0) == 58 (v3)
 
     bool sendFetchResponseImpl_(rune::replication::NodeId peer,
                                 const rune::replication::FetchResponseMsg& resp,
@@ -1169,7 +1171,8 @@ private:
                                      resp.highWatermark, resp.logStartOffset,
                                      resp.errorCode,
                                      std::span<const uint8_t>(&kNoRecords, 0),
-                                     resp.topicId);
+                                     resp.topicId, resp.divergingEpoch,
+                                     resp.divergingEndOffset);
         rr::detail::write_le<uint32_t>(prefix + prefixLen - rr::FetchResponseMsg::VAR_HEADER_SIZE,
                                        static_cast<uint32_t>(resp.records.size()));
         if (reconcile) rr::stampTemplateId(prefix, 0, rr::kReconcileFetchRespTemplateId);

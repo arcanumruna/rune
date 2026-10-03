@@ -215,6 +215,9 @@ private:
     // group resumes committing, so re-running rebuild (clear+repopulate from the
     // log) cannot clobber a live in-memory commit.
     bool offsetsRebuilt_ = false;
+    /// (leadershipGeneration << 32) ^ logGeneration of the offsets replica the
+    /// index was rebuilt against (see doWork).
+    uint64_t offsetsGen_ = 0;
 
     // CG-4: ClientGateway — non-owning; may be null (tests without push subs).
     rune::gateway::ClientGateway*              gateway_ = nullptr;

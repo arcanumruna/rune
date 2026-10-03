@@ -267,6 +267,8 @@ struct WorkerOp {
         int64_t  logStartOffset = 0;
         int16_t  errorCode      = 0;
         int32_t  topicId        = 0;
+        int32_t  divergingEpoch     = -1;   ///< KIP-320/595 DivergingEpoch (-1 = none)
+        int64_t  divergingEndOffset = -1;
         std::vector<uint8_t> records;   ///< copy of the records span
     } replicatedPayload;
 
@@ -299,6 +301,7 @@ struct WorkerOp {
         rune::replication::Offset      fetchOffset  = 0;
         int32_t                        maxBytes     = 0;
         int32_t                        topicId      = 0;
+        int32_t                        lastFetchedEpoch = -1;   ///< KIP-320/595 (-1 = none)
         int64_t                        nowNs        = 0;
         /// F27 R1: the follower's connection generation at the transport (0 =
         /// not tracked).  On the SBE ring it rides in `ownershipGen` (a SetOwnership

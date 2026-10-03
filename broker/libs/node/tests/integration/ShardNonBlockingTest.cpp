@@ -1317,13 +1317,14 @@ struct Reg {
     NullTransport t;
     ReplicaRegistry reg;
     std::vector<std::unique_ptr<Log>> logs;
-    PartitionReplica* add(int32_t topicId, int32_t part) {
+    PartitionReplica* add(int32_t topicId, int32_t part,
+                          std::vector<rune::replication::NodeId> replicas = {1}) {
         auto dir = d.path / (std::to_string(topicId) + "_" + std::to_string(part) + "_" + std::to_string(logs.size()));
         fs::create_directories(dir);
         logs.push_back(std::make_unique<Log>(dir.string(), 64LL * 1024 * 1024));
         logs.back()->recover();
         auto r = std::make_unique<PartitionReplica>(cfg(1, 1, topicId, part), Role::Leader, 1,
-            std::vector<rune::replication::NodeId>{1}, std::vector<rune::replication::NodeId>{1},
+            replicas, std::vector<rune::replication::NodeId>{1},
             logs.back().get(), &t);
         auto* raw = r.get();
         reg.add(topicId, part, std::move(r));
@@ -2043,7 +2044,7 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
     // deferAck) parked on the worker; the ownership drop answers it.
     for (bool recreate : {false, true}) {
         Reg R;
-        auto* rep = R.add(5, 0);
+        auto* rep = R.add(5, 0, {1, 2});                      // replica set {1, 2}
         rep->becomeLeader(2, {1, 2});                         // follower 2 behind → the ack parks on the HW
         // DUR-1 B1: an incomplete leader refuses produce — follower 2 reports in
         // (at offset 0: behind), completing leadership without advancing the HW.
@@ -2917,78 +2918,11 @@ TEST(ProduceBatchLimitRegression, OversizedBatchNotAtFollowerLeoDoesNotWedge) {
     EXPECT_EQ(rig.follower->wedgedAtOffset(), -1) << "only the batch AT the follower's LEO can wedge it";
 }
 
-// ============================================================================
-// F18 fix round 3 (B-3): the DR-BUG-6 reverse pull (a deficient leader pulling
-// committed records from an ahead survivor) must be capped to the PULLING node's
-// own worker apply frame, exactly like a follower fetch (B-1).  Before: the pull
-// asked maxFetchBytes (1 MiB), the survivor answered a multi-batch prefix bounded
-// only by ITS frame, and the puller refused the whole reply (above its worker
-// frame although every batch fits) on every retry — reconcile never completed,
-// the partition stayed unwritable.  Two REAL AeronPartitionTransports over
-// aeron:ipc on one driver: A (deficient leader, 8 KiB worker frames, the
-// production apply cap) pulls ~30 KiB of SMALL batches from B (ahead survivor,
-// large frames).  Bounded progress loop; no sleeps.
-// ============================================================================
-TEST(ProduceBatchLimitRegression, ReconcilePullOfSmallBatchesAboveOwnFrameCompletes) {
-    TmpDir ad;
-    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 1 << 20;   // pub frame 128 KiB
-    EmbeddedDriver drv(dc, DriverMode::Threaded);
-    aeron::Context ctx; ctx.aeronDir(ad.path.string());
-    auto client = aeron::Aeron::connect(ctx);
-    constexpr int32_t kStreamA = 7320, kStreamB = 7321;
-    rune::replication::AeronPartitionTransport trA(client, "aeron:ipc", kStreamA, /*self*/1, 1 << 20);
-    rune::replication::AeronPartitionTransport trB(client, "aeron:ipc", kStreamB, /*self*/2, 1 << 20);
-    trA.addPeer(2, "aeron:ipc", kStreamB);
-    trB.addPeer(1, "aeron:ipc", kStreamA);
-    trA.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(dc.termBufferBytes));
-    trB.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(dc.termBufferBytes));
-    constexpr int kIngressRing = 1 << 16;                                   // 8 KiB op frames on A
-    trA.setApplyRecordsCap(kIngressRing / 8 - static_cast<int64_t>(workerOpFrameBytes(0)));   // as BrokerNode
-
-    TmpDir la, lb;
-    Log logA(la.path.string(), 64LL * 1024 * 1024); logA.recover();
-    Log logB(lb.path.string(), 64LL * 1024 * 1024); logB.recover();
-    const std::vector<rune::replication::NodeId> both{1, 2};
-    auto repA = std::make_unique<PartitionReplica>(cfg(1, 1, 5, 0), Role::Leader, 1, both,
-                                                   std::vector<rune::replication::NodeId>{1}, &logA, &trA);
-    auto repB = std::make_unique<PartitionReplica>(cfg(2, 1, 5, 0), Role::Leader, 1, both,
-                                                   std::vector<rune::replication::NodeId>{2}, &logB, &trB);
-    PartitionReplica* const deficient = repA.get();
-    for (int i = 0; i < 30; ++i)                                            // ~30 KiB of 1 KiB batches
-        ASSERT_EQ(repB->append(std::vector<uint8_t>(1024, static_cast<uint8_t>(i)), false), i);
-    ReplicaRegistry regA, regB;
-    regA.add(5, 0, std::move(repA));
-    regB.add(5, 0, std::move(repB));
-    trB.setReplicaRegistry(&regB);                                          // B serves inline
-    WorkerPool poolA(1, rune::metadata::ShardRouter(1), kIngressRing, 1 << 16, 16, 16);
-    poolA.assignFromRegistry(regA);
-    poolA.setRegistry(&regA);
-    poolA.setRunnersStartedForTest(true);
-    trA.setReplicaRegistry(&regA);
-    trA.setWorkerPool(&poolA);
-    poolA.reconcile(regA);
-    ackAll(poolA);
-
-    rune::replication::FetchRequestMsg pull{};
-    pull.leaderEpoch = 1; pull.partition = 0; pull.followerId = 1;
-    pull.fetchOffset = 0; pull.maxBytes = 1 << 20; pull.topicId = 5;        // = cfg maxFetchBytes
-    constexpr int kSpin = 400'000;                                          // hard cap (no sleeps)
-    int i = 0;
-    for (; i < kSpin && deficient->logEndOffset() == 0 && trA.oversizedApplyRefused() == 0; ++i) {
-        if (i % 4'000 == 0) {                                               // (re)issue: pubs resolve lazily
-            pull.fetchOffset = deficient->logEndOffset();
-            trA.sendReconcileRequest(2, pull);
-        }
-        trA.poll(i);
-        trB.poll(i);
-        poolA.worker(0).doWork(i);
-        std::this_thread::yield();
-    }
-    ASSERT_LT(i, kSpin) << "no reconcile reply arrived at all (transport wiring)";
-    EXPECT_EQ(trA.oversizedApplyRefused(), 0u)
-        << "the survivor's reply exceeded the puller's own frame: reconcile can never complete";
-    EXPECT_GT(deficient->logEndOffset(), 0) << "the pulled committed records must be applied";
-}
+// (ProduceBatchLimitRegression.ReconcilePullOfSmallBatchesAboveOwnFrameCompletes
+//  was retired with the DR-BUG-6 reverse reconcile: a leader never pulls records
+//  it did not hold when elected.  The same "multi-batch answer above the
+//  receiver's own frame" property on the fetch / push path is pinned by
+//  LargeBatchReplicationRegression.MultiBatchPushAboveFollowerFrameNeverWedges*.)
 
 // F15 S5 fix round 3 follow-up (re-review 3 M-9): S5 e69a215 submitted one
 // durable fsync PER PASS per log; pipelined Strict produces on one log filled

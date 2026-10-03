@@ -474,9 +474,14 @@ TEST_F(FailoverTest3, OldLeader_BecomeFollower_TruncatesUncommittedTail) {
     PartitionReplica* newLeaderReplica = (nl == kF2) ? follower2_.get() : follower3_.get();
     transport_.setLeader(newLeaderReplica);
     transport_.addFollower(kL, leader_.get());
+    // KIP-320/595: the new leader completes (and only then directs truncations)
+    // once a majority of its ISR proved a validated position — drive the other
+    // survivor too.
+    PartitionReplica* const otherSurvivor = (nl == kF2) ? follower3_.get() : follower2_.get();
+    transport_.addFollower(nl == kF2 ? kF3 : kF2, otherSurvivor);
 
     bool truncated = driveUntil(
-        {newLeaderReplica, leader_.get()}, transport_, clock_,
+        {newLeaderReplica, leader_.get(), otherSurvivor}, transport_, clock_,
         [&]{ return leader_->logEndOffset() == committed; });
 
     // Intent preserved: the uncommitted tail is truncated (now via the deferred
@@ -564,9 +569,14 @@ TEST_F(FailoverTest3, OldLeader_TailTruncation_ExactOffset) {
     PartitionReplica* newLeaderReplica = (nl == kF2) ? follower2_.get() : follower3_.get();
     transport_.setLeader(newLeaderReplica);
     transport_.addFollower(kL, leader_.get());
+    // KIP-320/595: the new leader completes (and only then directs truncations)
+    // once a majority of its ISR proved a validated position — drive the other
+    // survivor too.
+    PartitionReplica* const otherSurvivor = (nl == kF2) ? follower3_.get() : follower2_.get();
+    transport_.addFollower(nl == kF2 ? kF3 : kF2, otherSurvivor);
 
     bool truncated = driveUntil(
-        {newLeaderReplica, leader_.get()}, transport_, clock_,
+        {newLeaderReplica, leader_.get(), otherSurvivor}, transport_, clock_,
         [&]{ return leader_->logEndOffset() == committed; });
 
     Offset leoAfterTrunc = leader_->logEndOffset();
@@ -1589,9 +1599,10 @@ TEST_F(FailoverTest3, B1_T4_OldLeaderTruncatesAndRefetchesLower_HWNotStale) {
     // to the leader's epoch boundary (== committed hw).
     transport_.setLeader(follower2_.get());
     transport_.addFollower(kL, leader_.get());
+    transport_.addFollower(kF3, follower3_.get());   // KIP-320/595: completeness quorum
 
     bool truncated = driveUntil(
-        {follower2_.get(), leader_.get()}, transport_, clock_,
+        {follower2_.get(), leader_.get(), follower3_.get()}, transport_, clock_,
         [&]{ return leader_->logEndOffset() <= hw; });
     EXPECT_TRUE(truncated)
         << "Old leader must truncate uncommitted tail to <= committedHw via epoch exchange";

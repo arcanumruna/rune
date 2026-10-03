@@ -167,7 +167,8 @@ bool AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
         req.followerId,
         req.fetchOffset,
         maxBytes,
-        req.topicId);
+        req.topicId,
+        req.lastFetchedEpoch);
     return enqueueOutbound(kBroadcast, wire, len);
 }
 
@@ -232,7 +233,7 @@ bool AeronPartitionTransport::sendReconcileRequest(
     const std::size_t len = FetchRequestMsg::encode(
         wire, 0,
         req.leaderEpoch, req.partition, req.followerId,
-        req.fetchOffset, maxBytes, req.topicId);
+        req.fetchOffset, maxBytes, req.topicId, req.lastFetchedEpoch);
     stampTemplateId(wire, 0, kReconcileFetchReqTemplateId);
     return enqueueOutbound(toPeer, wire, len);
 }
@@ -308,7 +309,8 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     uint8_t* payload = reinterpret_cast<uint8_t*>(slot) + lenPos + isbe::OutboundFrame::payloadHeaderLength();
     FetchResponseMsg::encode(payload, 0,
                              resp.leaderEpoch, resp.partition, resp.highWatermark,
-                             resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
+                             resp.logStartOffset, resp.errorCode, resp.records, resp.topicId,
+                             resp.divergingEpoch, resp.divergingEndOffset);
     if (reconcile) {
         // DR reverse-catch-up: re-stamp the FetchResponse templateId in place so it
         // routes to the reconcile handlers (matches sendReconcileResponse's wire).
@@ -523,7 +525,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
 
     if (tid == FetchRequestMsg::TEMPLATE_ID) {
         // Minimum size check.
-        if (len < FetchRequestMsg::TOTAL_SIZE) {
+        if (len < FetchRequestMsg::MIN_SIZE) {
             spdlog::trace("AeronPartitionTransport: FetchRequest truncated ({} bytes)", len);
             return Action::CONTINUE;
         }
@@ -594,6 +596,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.fetchRequestPayload.fetchOffset   = req.fetchOffset;
             op.fetchRequestPayload.maxBytes      = req.maxBytes;
             op.fetchRequestPayload.topicId       = req.topicId;
+            op.fetchRequestPayload.lastFetchedEpoch = req.lastFetchedEpoch;
             op.fetchRequestPayload.nowNs         = nowNs_;
             op.fetchRequestPayload.connGen       = peerConnGen_(req.followerId);   // R1
             if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
@@ -613,7 +616,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {
         // Minimum valid frame = the zero-records framing (SBE header + block +
         // records length-prefix), from the generated codec.
-        const std::size_t kMinResponseSize = FetchResponseMsg::encodedSize(0);
+        const std::size_t kMinResponseSize = FetchResponseMsg::MIN_SIZE;
         if (len < kMinResponseSize) {
             spdlog::trace("AeronPartitionTransport: FetchResponse truncated ({} bytes)", len);
             return Action::CONTINUE;
@@ -723,6 +726,8 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.replicatedPayload.logStartOffset  = resp.logStartOffset;
             op.replicatedPayload.errorCode       = resp.errorCode;
             op.replicatedPayload.topicId         = resp.topicId;
+            op.replicatedPayload.divergingEpoch     = resp.divergingEpoch;
+            op.replicatedPayload.divergingEndOffset = resp.divergingEndOffset;
             // Copy records span bytes into an owned vector (buffer lifetime).
             if (!resp.records.empty()) {
                 op.replicatedPayload.records.assign(
@@ -803,7 +808,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // DR-BUG-6: reverse pull request (deficient leader → survivor).  Reuses
         // the FetchRequest layout.  Cap maxBytes to the requesting peer's
         // deliverable ceiling (same rationale as the normal FetchRequest path).
-        if (len < FetchRequestMsg::TOTAL_SIZE) return Action::CONTINUE;
+        if (len < FetchRequestMsg::MIN_SIZE) return Action::CONTINUE;
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
         PartitionReplica* const rep = resolveReplica_(req.topicId, req.partition);
         if (rep == nullptr) return Action::CONTINUE;
@@ -843,7 +848,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
     } else if (tid == kReconcileFetchRespTemplateId) {
         // DR-BUG-6: reverse pull response (survivor → deficient leader).  Reuses
         // the FetchResponse layout.
-        const std::size_t kMinResp = FetchResponseMsg::encodedSize(0);
+        const std::size_t kMinResp = FetchResponseMsg::MIN_SIZE;
         if (len < kMinResp) return Action::CONTINUE;
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
         PartitionReplica* const rep = resolveReplica_(resp.topicId, resp.partition);
@@ -878,6 +883,8 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.replicatedPayload.logStartOffset  = resp.logStartOffset;
             op.replicatedPayload.errorCode       = resp.errorCode;
             op.replicatedPayload.topicId         = resp.topicId;
+            op.replicatedPayload.divergingEpoch     = resp.divergingEpoch;
+            op.replicatedPayload.divergingEndOffset = resp.divergingEndOffset;
             if (!resp.records.empty()) {
                 op.replicatedPayload.records.assign(
                     resp.records.data(),

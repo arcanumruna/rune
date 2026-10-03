@@ -535,7 +535,8 @@ int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
     const int64_t base       = logEndOffset_;
     const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
     outBaseOffset = base;
-    logEndOffset_ = activeSegment().appendNoSyncRestamp(batch, len, base, lastOffset);
+    logEndOffset_ = activeSegment().appendNoSyncRestamp(batch, len, base, lastOffset,
+                                                          leaderEpochStamp_);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
         rune::protocol::RecordBatchReader r(batch, len);
         int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms

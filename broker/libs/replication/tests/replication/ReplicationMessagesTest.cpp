@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <climits>
 
@@ -38,9 +39,10 @@ TEST(ReplicationMessages, SchemaIdIs112) {
     EXPECT_EQ(kSchemaId, 112);
 }
 
-TEST(ReplicationMessages, SchemaVersionIs2) {
-    // DR-BUG-5: version bumped from 1→2 when topicId was added to FetchRequest/FetchResponse.
-    EXPECT_EQ(kSchemaVersion, 2);
+TEST(ReplicationMessages, SchemaVersionIs3) {
+    // DR-BUG-5: 1→2 (topicId); KIP-320/595: 2→3 (FetchRequest.lastFetchedEpoch,
+    // FetchResponse.divergingEpoch / divergingEndOffset).
+    EXPECT_EQ(kSchemaVersion, 3);
 }
 
 TEST(ReplicationMessages, FetchRequestTemplateId) {
@@ -52,22 +54,72 @@ TEST(ReplicationMessages, FetchResponseTemplateId) {
 }
 
 TEST(ReplicationMessages, FetchRequestBlockLength) {
-    // DR-BUG-5: 2×int64 + 4×int32 = 16 + 16 = 32 (topicId added)
-    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 32u);
+    // v3: 2×int64 + 5×int32 = 16 + 20 = 36 (lastFetchedEpoch added; v2 was 32)
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 36u);
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH_V2, 32u);
 }
 
 TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
     // SBE tight-packs the block (no alignment pad): int64+int32+int64+int64+int16+int32
     // = 8+4+8+8+2+4 = 34.  (The pre-SBE hand-rolled layout inserted a 2-byte pad after
     // errorCode → 36; SBE owns sizing now, and both nodes run the same generated codec.)
-    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 34u);
+    // v3 appends divergingEpoch (int32) + divergingEndOffset (int64): 34 + 12 = 46.
+    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 46u);
 }
 
 TEST(ReplicationMessages, FetchRequestTotalSize) {
     EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE,
               ReplicationMessageHeader::ENCODED_SIZE + FetchRequestMsg::BLOCK_LENGTH);
-    // DR-BUG-5: 8 (header) + 32 (block) = 40 (was 36 before topicId was added)
-    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 40u);
+    // v3: 8 (header) + 36 (block) = 44; a v2 frame (40) is still decodable.
+    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 44u);
+    EXPECT_EQ(FetchRequestMsg::MIN_SIZE, 40u);
+}
+
+// KIP-320/595 wire compatibility: a v3 FetchRequest carries lastFetchedEpoch;
+// a v2 frame (32-byte block) decodes as lastFetchedEpoch = -1 (no validation).
+TEST(ReplicationMessages, FetchRequestLastFetchedEpochV3RoundTripAndV2Absent) {
+    uint8_t buf[64]{};
+    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 77, 1 << 20, 9, /*lastFetchedEpoch=*/3), 44u);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    EXPECT_EQ(m.fetchOffset, 77);
+    EXPECT_EQ(m.topicId, 9);
+    EXPECT_EQ(m.lastFetchedEpoch, 3);
+    // A v2 sender: blockLength 32 in the header, no field after topicId.
+    uint8_t v2[64]{};
+    (void)FetchRequestMsg::encode(v2, 0, 4, 1, 2, 77, 1 << 20, 9, 3);
+    v2[0] = 32; v2[1] = 0;                            // header blockLength = 32
+    v2[6] = 2;  v2[7] = 0;                            // header version = 2
+    std::memset(v2 + 8 + 32, 0x5A, 4);                // garbage past the v2 block
+    m = FetchRequestMsg::decode(v2, 0);
+    EXPECT_EQ(m.fetchOffset, 77);
+    EXPECT_EQ(m.lastFetchedEpoch, -1) << "a v2 frame has no lastFetchedEpoch";
+}
+
+// KIP-320/595: a v3 FetchResponse carries DivergingEpoch; a v2 frame decodes
+// as "no divergence" (-1) and its records still decode at the v2 offsets.
+TEST(ReplicationMessages, FetchResponseDivergingEpochV3RoundTripAndV2Absent) {
+    uint8_t buf[256]{};
+    const uint8_t rec[5] = {1, 2, 3, 4, 5};
+    const std::size_t n = FetchResponseMsg::encode(buf, 0, 4, 1, 10, 0, static_cast<int16_t>(-7),
+        std::span<const uint8_t>(rec, 5), 9, /*divergingEpoch=*/2, /*divergingEndOffset=*/33);
+    FetchResponseMsg m = FetchResponseMsg::decode(buf, 0, n);
+    EXPECT_EQ(m.errorCode, static_cast<int16_t>(-7));
+    EXPECT_EQ(m.divergingEpoch, 2);
+    EXPECT_EQ(m.divergingEndOffset, 33);
+    ASSERT_EQ(m.records.size(), 5u);
+    // Hand-build a v2 frame: header(8: block 34, version 2) + 34-byte block + len + records.
+    uint8_t v2[128]{};
+    std::memcpy(v2, buf, 8 + 34);                     // header + the v2 part of the block
+    v2[0] = 34; v2[1] = 0; v2[6] = 2; v2[7] = 0;
+    const uint32_t len = 5;
+    std::memcpy(v2 + 8 + 34, &len, 4);
+    std::memcpy(v2 + 8 + 34 + 4, rec, 5);
+    m = FetchResponseMsg::decode(v2, 0, 8 + 34 + 4 + 5);
+    EXPECT_EQ(m.highWatermark, 10);
+    EXPECT_EQ(m.divergingEpoch, -1);
+    EXPECT_EQ(m.divergingEndOffset, -1);
+    ASSERT_EQ(m.records.size(), 5u) << "v2 records must decode at the v2 block end";
+    EXPECT_EQ(m.records[4], 5);
 }
 
 TEST(ReplicationMessages, HeaderEncodedSize) {
@@ -215,8 +267,8 @@ TEST(FetchResponse, RoundTripEmptyRecords) {
 
     std::size_t written = FetchResponseMsg::encode(buf, 0,
         epoch, part, hw, logSt, err, empty);
-    // SBE: header(8) + block(34) + len_prefix(4) + 0 records = 46
-    EXPECT_EQ(written, 46u);
+    // SBE: header(8) + block(46, v3) + len_prefix(4) + 0 records = 58
+    EXPECT_EQ(written, 58u);
 
     FetchResponseMsg m = FetchResponseMsg::decode(buf, 0);
     EXPECT_EQ(m.leaderEpoch,    epoch);

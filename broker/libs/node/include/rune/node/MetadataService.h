@@ -174,9 +174,8 @@ public:
         }
         if (!present) { configuredTopics_.push_back(spec); ++routingInputsEpoch_; }
 
-        // (2) Emit the initial assignment for this topic (leader-only).
-        if (!replica_) return;
-        if (replica_->role() != rune::replication::Role::Leader) return;
+        // (2) Emit the initial assignment for this topic (complete leader only).
+        if (!leaderReady_()) return;
         if (liveNodes_.empty()) return;
 
         // Per-topic idempotency: skip if the MSM already has every partition
@@ -197,14 +196,10 @@ public:
         }
         if (records.empty()) return;
 
-        // One-record-per-append (see emitStaticAssignmentIfNeeded rationale).
-        static constexpr std::size_t kEncBufSize = 16 * 1024;
-        uint8_t encBuf[kEncBufSize];
-        for (const auto& br : records) {
-            const std::size_t n = br.rec.encode(encBuf, kEncBufSize);
-            if (n == 0) continue;
-            replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false);
-        }
+        // One-record-per-append through the gated queue (never an ignored
+        // append result: a refused record stays queued).
+        for (auto& br : records) pendingDynamicRecords_.push_back(std::move(br));
+        drainDynamicQueue();
     }
 
     /// Emit static assignment records to the metadata log if needed.
@@ -224,8 +219,7 @@ public:
     /// Public for test-only direct invocation; normally called by doWork().
     /// Single-writer: must be called on the duty-cycle thread.
     void emitStaticAssignmentIfNeeded() {
-        if (!replica_) return;
-        if (replica_->role() != rune::replication::Role::Leader) return;
+        if (!leaderReady_()) return;
         if (configuredTopics_.empty() || liveNodes_.empty()) return;
 
         // Idempotency guard: if already assigned (flag latched), skip.
@@ -257,35 +251,14 @@ public:
             return;
         }
 
-        // Encode + append records to the metadata log.
-        //
-        // One-record-per-append invariant (required by the read path):
-        //   Each replica_->append() stores its payload as the VALUE of exactly
-        //   ONE log record (one RecordBatch entry on disk).  Concatenating N
-        //   metadata records' bytes into a single payload would make all N look
-        //   like ONE apply() call in doWork() — only the first record would be
-        //   decoded; the rest would be silently ignored.  Therefore we MUST call
-        //   append() exactly once per metadata record so each occupies its own
-        //   log slot and advances logEndOffset() by exactly 1.
-        //
-        // Per-record encode buffer.
-        //   Max size: prefix(3) + topicId(4) + partition(4) + leaderNode(4)
-        //   + isr(2+n*4) + leaderEpoch(4) + partitionEpoch(4) + replicas(2+n*4).
-        //   With RF≤1024 per side: ~8.2 KiB.  The 16 KiB stack buffer bounds
-        //   per-record size for Phase-1 scale.  A record that encodes larger
-        //   than kEncBufSize (very large ISR/replica array) returns n==0 and is
-        //   skipped — flagged for a future guard that adds a hard startup check.
-        static constexpr std::size_t kEncBufSize = 16 * 1024;
-        uint8_t encBuf[kEncBufSize];
-
-        for (const auto& br : records) {
-            const std::size_t n = br.rec.encode(encBuf, kEncBufSize);
-            if (n == 0) continue; // encode overflow (should not occur at Phase-1 scale)
-
-            replica_->append(
-                std::span<const uint8_t>(encBuf, n),
-                /*acksAll=*/false);
-        }
+        // One-record-per-append invariant (required by the read path): each
+        // metadata record occupies its own log slot (concatenating N records into
+        // one payload would make replay decode only the first).  The records go
+        // through the gated queue (drainDynamicQueue): appended in order while
+        // this replica is a COMPLETE leader, kept queued — never dropped, never
+        // an ignored append result — while it is not.
+        for (auto& br : records) pendingDynamicRecords_.push_back(std::move(br));
+        drainDynamicQueue();
 
         assigned_ = true;
     }
@@ -296,6 +269,13 @@ public:
     // mismatch, etc.) — no assignment was emitted when this is non-zero.
     // -----------------------------------------------------------------------
     [[nodiscard]] uint64_t balancerErrorCount() const noexcept { return balancerErrors_; }
+
+    /// The metadata replica leads but has not completed yet (B1): nothing it
+    /// decides can be appended until it does.
+    [[nodiscard]] bool leaderPendingCompletion() const noexcept {
+        return replica_ != nullptr && replica_->role() == rune::replication::Role::Leader &&
+               !replica_->isLeaderComplete();
+    }
 
     // -----------------------------------------------------------------------
     // MD1 Task 13: Dynamic assignment — bounded batched emit.
@@ -362,8 +342,7 @@ public:
     /// advances past it; the balancer decision is then driven by
     /// runDynamicRebalanceOnTick() on whichever node is the leader.
     bool pollAndAppendControlTick(int64_t clusterNowNs) {
-        if (!replica_) return false;
-        if (replica_->role() != rune::replication::Role::Leader) return false;
+        if (!leaderReady_()) return false;
 
         int32_t firedId = 0;
         if (!controlTimer_.poll(clusterNowNs, firedId)) return false;
@@ -375,7 +354,13 @@ public:
         uint8_t buf[rune::protocol::metadata::ControlTickRecord::ENCODED_SIZE];
         const std::size_t n = tick.encode(buf, sizeof(buf));
         if (n == 0) return false;
-        replica_->append(std::span<const uint8_t>(buf, n), /*acksAll=*/false);
+        if (replica_->append(std::span<const uint8_t>(buf, n), /*acksAll=*/false) < 0) {
+            // Refused (no longer a complete leader): the tick is not consumed —
+            // re-arm it and reuse its sequence number.
+            --nextTickSeq_;
+            controlTimer_.arm(clusterNowNs, firedId);
+            return false;
+        }
         lastEmittedTickSeq_ = tick.tickSeq;
         return true;
     }
@@ -398,8 +383,7 @@ public:
         int maxPreferredElectionsPerCycle = 1000,
         int maxRecordsPerCycle            = 4096)
     {
-        if (!replica_) return 0;
-        if (replica_->role() != rune::replication::Role::Leader) return 0;
+        if (!leaderReady_()) return 0;
         if (configuredTopics_.empty()) return 0;
 
         rune::metadata::DynamicBalancerInputs in;
@@ -500,8 +484,7 @@ public:
         const std::vector<rune::metadata::NodeId>& eligibleNodes,
         int maxPreferredElectionsPerCycle = 1000)
     {
-        if (!replica_) return 0;
-        if (replica_->role() != rune::replication::Role::Leader) return 0;
+        if (!leaderReady_()) return 0;
         if (eligibleNodes.empty()) return 0;
         return runDynamicRebalanceOnTick(eligibleNodes, &positions_,
                                          maxPreferredElectionsPerCycle);
@@ -536,8 +519,18 @@ public:
     int doWork(int64_t nowNs) {
         if (!replica_) return 0;
 
-        // Detect Follower→Leader transition (same pattern as TCS::doWork).
-        const bool amLeader = (replica_->role() == rune::replication::Role::Leader);
+        // The log's existing content changed (a KIP-279 truncation while
+        // following): everything applied from the old content is stale — rebuild
+        // the MSM from the committed log as it is now.
+        if (replica_->logGeneration() != lastLogGen_) {
+            lastLogGen_ = replica_->logGeneration();
+            rebuildFromLog();
+        }
+
+        // Detect the "complete leader" edge (same pattern as TCS::loadable_):
+        // a leader that has not completed (B1 gate) may lack committed records,
+        // so it neither rebuilds the controller state nor emits until it has.
+        const bool amLeader = leaderReady_();
         if (amLeader && !wasLeader_) {
             // Became leader: rebuild the MSM from the committed log so we have
             // the full assignment map before serving requests.
@@ -551,6 +544,9 @@ public:
         } else if (!amLeader && wasLeader_) {
             wasLeader_ = false;
             assigned_  = false;  // re-arm emit if we regain leadership later
+            // Records decided under this leadership but not appended: the next
+            // complete leader re-decides from the committed map.
+            pendingDynamicRecords_.clear();
             // Follower: reset lastApplied_ so we re-apply from scratch if we
             // become leader again later.
             lastApplied_ = -1;
@@ -817,9 +813,14 @@ private:
     // invariant).  Stops when the count OR byte budget for this cycle is
     // exhausted, leaving the remainder in the queue for the next cycle.
     // -----------------------------------------------------------------------
+    /// This replica may append to the metadata log: Leader AND complete (B1).
+    [[nodiscard]] bool leaderReady_() const noexcept {
+        return replica_ != nullptr && replica_->acceptsProduce();
+    }
+
     void drainDynamicQueue() {
         if (pendingDynamicRecords_.empty()) return;
-        if (!replica_) return;
+        if (!leaderReady_()) return;   // kept queued until this replica may append
 
         static constexpr std::size_t kEncBufSize = 16 * 1024;
         uint8_t encBuf[kEncBufSize];
@@ -839,7 +840,9 @@ private:
             }
             if (cycleBytes + n > kMaxBatchBytes) break;
 
-            replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false);
+            // Never ignore the result: a refusal (no longer a complete leader)
+            // keeps the record queued, in order.
+            if (replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false) < 0) break;
             cycleBytes   += n;
             cycleRecords += 1;
             pendingDynamicRecords_.pop_front();
@@ -857,6 +860,8 @@ private:
 
     // Follower→Leader transition gate (mirrors TCS / GCS patterns).
     bool wasLeader_ = false;
+    /// replica_->logGeneration() the MSM was built against (see doWork).
+    uint64_t lastLogGen_ = 0;
 
     // -----------------------------------------------------------------------
     // MD1 Task 6: static assignment emit state.

@@ -93,7 +93,8 @@ inline constexpr int16_t kErrStaleEpoch   = -1;   // request epoch < local epoch
 inline constexpr int16_t kErrNotLeader    = -2;   // this node is not the leader
 inline constexpr int16_t kErrMinIsr       = -3;   // ISR too small to produce
 inline constexpr int16_t kErrOutOfRange   = -4;   // fetchOffset out of range
-// DR-BUG-6: leader is deferring the epoch answer while it reverse-reconciles a
+// RETIRED (DR-BUG-6 reverse reconcile; kept so the code is never reused): a
+// leader deferred the epoch answer while it reverse-reconciled a
 // genuine committed continuation from this (ahead, on-lineage) follower.  This
 // is a KEEP-ALIVE, NOT a truncation directive: the follower KEEPS its tail and
 // RESETS its fallback probe counter so a slow reconcile under packet loss never
@@ -111,6 +112,20 @@ inline constexpr int16_t kErrReconcileDeferred = -5;
 // forever.  Cleared by a leadership/epoch change or a truncation that moves the
 // follower's LEO.
 inline constexpr int16_t kErrRecordTooLarge = -6;
+// KIP-320/595 DivergingEpoch: the follower's (fetchOffset, lastFetchedEpoch) is
+// not on the leader's epoch lineage.  The answer carries divergingEpoch /
+// divergingEndOffset (= the leader's endOffsetForEpoch(lastFetchedEpoch)); the
+// follower truncates to min(divergingEndOffset, its own end offset of that
+// epoch) — or, if it never held that epoch, to its own end of the largest
+// earlier epoch (another round) — and re-fetches.  Never credited (ISR / HW /
+// completeness): only a fetch that passed validation counts.
+inline constexpr int16_t kErrDivergingEpoch = -7;
+// The leader is not complete yet (a majority of its assigned ISR has not proven,
+// by a validated fetch, that its log is a prefix of ours) and this follower's
+// fetch is NOT on our lineage: it is HELD — no truncation directive, no credit —
+// because a deficient leader must never make a survivor drop records that may be
+// committed.  The follower keeps its log and retries at its fetch cadence.
+inline constexpr int16_t kErrLeaderNotComplete = -8;
 // The default replication fetch-ceiling (requested chunk size) used for
 // every PartitionConfig across the broker (see BrokerNode.cpp).  This is
 // deliberately NOT required to cover the gateway's max accepted produce
@@ -215,7 +230,9 @@ public:
                                    const FetchResponseMsg& resp) = 0;
 
     // -----------------------------------------------------------------------
-    // DR-BUG-6 — OffsetsForLeaderEpoch exchange + deficient-leader reconcile.
+    // OffsetsForLeaderEpoch exchange + the RETIRED DR-BUG-6 reverse reconcile
+    // (PartitionReplica no longer sends either; the plumbing stays for wire
+    // compatibility).
     //
     // These are peer-routed (addressed to a specific NodeId).  They have SAFE
     // DEFAULT NO-OP bodies so a transport that has not implemented them yet
@@ -333,9 +350,14 @@ public:
 
     /// Transition to Leader with the given epoch.
     /// Resets ISR from replicas, seeds ReplicaLeaderState.
+    /// A SAME-EPOCH re-assert while already Leader (a partitionEpoch-only ISR
+    /// change) only applies the ISR — removals at once, additions only through
+    /// the data-plane expansion rule (LEO >= HW after a validated fetch) — and
+    /// resets nothing else (completeness, follower slots, push state).
     void becomeLeader(Epoch newEpoch, std::vector<NodeId> isr);
 
-    /// Transition to Follower with the given leader epoch.
+    /// Transition to Follower with the given leader epoch.  A same-epoch
+    /// re-assert of the same leader while already Follower is a no-op.
     void becomeFollower(Epoch leaderEpoch, NodeId leaderId);
 
     // -----------------------------------------------------------------------
@@ -445,48 +467,46 @@ public:
     /// Apply a FetchResponse received from the leader.
     ///
     /// On epoch change (response.leaderEpoch > local):
-    ///   1. Compute truncation offset via EpochFencing.
-    ///   2. Truncate local Log to that offset.
-    ///   3. Adopt the new epoch.
+    /// KIP-320/595: a DivergingEpoch answer runs the KIP-279 truncation and
+    /// re-fetches; a frame from an older OR newer epoch than ours is dropped
+    /// (never adopted, never truncated on).  Applied batches keep the leader's
+    /// stamped partitionLeaderEpoch; the epoch cache is built from those stamps.
     ///
     /// Then append the records to the local Log (if any).
     /// Update local HW = min(local LEO, response.highWatermark).
     void applyReplicated(const FetchResponseMsg& resp);
 
-    /// Build a FetchRequest for the leader: fetchOffset = local LEO.
+    /// Build a FetchRequest for the leader: fetchOffset = local LEO,
+    /// lastFetchedEpoch = the epoch of the last batch in our log (-1 = empty).
     FetchRequestMsg nextFetch() const noexcept;
 
+    /// KIP-320/595: the epoch of the last record in our log (the epoch-cache
+    /// entry owning offset LEO-1), -1 for an empty log.
+    [[nodiscard]] int32_t lastFetchedEpoch() const noexcept;
+
     // -----------------------------------------------------------------------
-    // DR-BUG-6 — OffsetsForLeaderEpoch exchange (KIP-101) + deficient-leader
-    // reverse-catch-up reconcile.
+    // OffsetsForLeaderEpoch (KIP-101) + the retired DR-BUG-6 reverse reconcile.
+    //
+    // Divergence is resolved on the FETCH path (lastFetchedEpoch validation +
+    // DivergingEpoch, KIP-320/595); followers never send side probes and a
+    // leader never pulls records it did not hold when elected.  The handlers
+    // stay so the transports' message plumbing (and a peer on an older build)
+    // stays well-defined.
     // -----------------------------------------------------------------------
 
-    /// (Leader) Handle an OffsetsForLeaderEpochRequest from a follower that is
-    /// deciding whether/where to truncate on an epoch change.  Answers from the
-    /// LeaderEpochCache: (responseEpoch, endOffset) — see LeaderEpochCache::
-    /// endOffsetForEpoch.  Sends the response via
-    /// transport_->sendOffsetsForLeaderEpochResponse().
+    /// (Leader) Answer an OffsetsForLeaderEpoch query authoritatively from the
+    /// LeaderEpochCache: (responseEpoch, endOffset) = endOffsetForEpoch.  No
+    /// state change, no ISR / HW / completeness credit.
     void onOffsetsForLeaderEpochRequest(const OffsetsForLeaderEpochReqMsg& req);
 
-    /// (Follower) Apply the leader's OffsetsForLeaderEpoch answer: perform the
-    /// DEFERRED, correct truncation.
-    ///   • responseEpoch == our latest epoch  → SHARED (possibly open) epoch:
-    ///     no divergence.  We keep our tail (the leader reconciles anything it
-    ///     lacks).  Truncate only to min(ourLEO, endOffset) which, for a shared
-    ///     open epoch (endOffset == leaderLEO), can be BELOW our LEO — but those
-    ///     are committed records the leader is missing, so we KEEP them.
-    ///   • responseEpoch  < our latest epoch  → GENUINE divergence at the epoch
-    ///     boundary: truncate to min(ourLEO, endOffset).
-    /// Never truncates below our committed HW floor (defence in depth).
+    /// (Follower) Retired: this build never probes, so an answer is ignored.
     void applyOffsetsForLeaderEpochResponse(const OffsetsForLeaderEpochRespMsg& resp);
 
-    /// (Any role) Serve a reconcile pull: read raw log bytes [fromOffset, LEO)
-    /// and reply via transport_->sendReconcileResponse().  Used by an ahead
-    /// survivor to feed committed records to a deficient new leader.
+    /// Retired reverse-reconcile pull: ignored (a leader never takes records it
+    /// did not hold when elected).
     void onReconcileRequest(const FetchRequestMsg& req);
 
-    /// (Leader) Apply reconcile records pulled from an ahead survivor: append
-    /// the strictly-new committed tail and advance LEO/HW.
+    /// Retired reverse-reconcile answer: ignored.
     void applyReconcileResponse(const FetchResponseMsg& resp);
 
     // -----------------------------------------------------------------------
@@ -509,8 +529,8 @@ public:
 
     [[nodiscard]] Role        role()           const noexcept { return role_; }
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
-    /// F15 §2.3: DR-BUG-6 leader-completeness (the deficient-leader reconcile is
-    /// done).  Owner thread only.
+    /// F15 §2.3: leader-completeness (a majority of the assigned ISR proved a
+    /// validated prefix position — see completenessIsr_; was the reconcile    /// done).  Owner thread only.
     [[nodiscard]] bool        isLeaderComplete() const noexcept { return leaderComplete_; }
     /// DUR-1 fix round 1 (B1): THE produce gate — the only predicate every
     /// produce / control-batch append path consults (worker, gateway inline,
@@ -523,8 +543,8 @@ public:
         return role_ == Role::Leader && leaderComplete_;
     }
     /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
-    /// content — a tail truncation or a reconcile append of foreign (old-term)
-    /// batches.  A parked waiter compares it with the value it parked under.
+    /// content — a tail truncation (KIP-279; formerly also a reconcile append of
+    /// foreign old-term batches).  A parked waiter compares it with the value it parked under.
     /// Owner thread only (plain member, no atomic).
     [[nodiscard]] uint64_t    logGeneration()  const noexcept { return logGeneration_; }
     /// The offset the log was cut to by the change that last bumped
@@ -812,27 +832,6 @@ private:
     /// this seeds the leader/follower state, epoch cache, and cleaner snapshots.
     void initReplica(std::vector<NodeId> replicas, std::vector<NodeId> isr);
 
-    /// (Leader) DR-BUG-6 divergence guard — is an ahead follower's tail a genuine
-    /// continuation of THIS leader's OWN epoch lineage (KIP-101), i.e. safe to
-    /// keep+reverse-reconcile rather than direct the follower to truncate?
-    ///
-    /// Gates on the follower's tail EPOCH, NOT on ISR membership.  Because the
-    /// GR-2 bridge seeds ISR = ALL replicas, ISR membership cannot distinguish a
-    /// committed continuation from a divergent tail — both look "in ISR".  The
-    /// only sound discriminator is epoch lineage:
-    ///
-    ///   endOffsetForEpoch(requestedEpoch, leaderLEO) → (responseEpoch, endOffset)
-    ///
-    /// The follower's ahead tail is a shared continuation ONLY when the leader
-    /// shares the EXACT epoch the follower's tail is in AND that epoch is the
-    /// leader's own latest OPEN epoch (endOffset == leaderLEO, boundary >=
-    /// leaderLEO).  Then the follower's [leaderLEO, followerLEO) tail extends the
-    /// leader's still-open shared epoch → keep + reverse-reconcile.  Otherwise the
-    /// follower's tail is from a divergent / non-shared epoch → the leader answers
-    /// authoritatively and the follower TRUNCATES to the shared-epoch end offset.
-    [[nodiscard]] bool followerTailIsSharedContinuation(
-            Epoch requestedEpoch, Offset followerLeo) const;
-
     /// (Leader) Recompute HW from ReplicaLeaderState and propagate to leader ISR.
     void recomputeHw();
 
@@ -894,15 +893,6 @@ private:
                           Offset fetchOffset, int32_t maxBytes, bool data, Offset dataEnd);
     /// F27 F3: DR sends that are OWED when refused and re-sent next pass.
     void sendEpochAnswer_(NodeId to, const OffsetsForLeaderEpochRespMsg& m);
-    bool sendReconcilePull_(NodeId peer, const FetchRequestMsg& pull);
-    /// DUR-1 fix round 1: a reverse-reconcile pull from (our LEO - 1) — the
-    /// boundary batch rides along for the Log-Matching check.
-    [[nodiscard]] FetchRequestMsg makeReconcilePull_() const noexcept;
-    /// DUR-1 B2: mark a follower diverged for this leadership (out of the ISR,
-    /// never credited).  Cold.
-    void markDiverged_(FollowerSlot& slot, Offset fetchOffset);
-    /// H1 Log-Matching: `batch` equals our batch at its base offset.  Cold.
-    [[nodiscard]] bool sameBatchAsLocal_(const uint8_t* batch, std::size_t len);
     /// F27 F3: re-send owed DR frames (any role).  Returns sends accepted.
     int retryOwedDrSends_() noexcept;
 
@@ -917,6 +907,13 @@ private:
     // Spec §3.5.2: follower FetchRequests are unicast to the known leader.
     /// F27: true iff the transport accepted the request.
     bool sendFetchToLeader_(const FetchRequestMsg& req);
+
+    /// (Follower) KIP-279 truncation on a DivergingEpoch answer, then re-fetch.
+    void onDivergingEpoch_(const FetchResponseMsg& resp);
+    /// (Follower) Kafka LeaderEpochFileCache.assign on append: record the start
+    /// of every new epoch stamped on the batches in [p, p+len) (whole batches).
+    /// Returns true when the cache changed.
+    bool assignEpochsFromBatches_(const uint8_t* p, std::size_t len);
 
     /// Build a FetchResponseMsg stamped with this partition's identity
     /// (epoch/partitionId/topicId, logStartOffset=0) plus the given HW,
@@ -1043,7 +1040,7 @@ private:
     // One explicit state machine (see FollowerSync.h) replaces the former scattered
     // flags (heardFromLeader_ / lastResponseEmpty_ / lastKnownLeaderHw_ /
     // leoAtLastPeriodicFetch_ / dataFetchInFlight_ / dataFetchSentNs_).  Governs ONLY
-    // the normal follower fetch path; the DR epoch-probe / reconcile path pre-empts it
+    // the normal follower fetch path (a DivergingEpoch answer resets it)
     // (and keeps its own lastFetchEmitNs_ cadence).  Fast-acks (on apply) are pure
     // (maxBytes=0) and independent of this machine — they advance the leader's
     // follower-offset → HW for acks=majority.
@@ -1057,7 +1054,7 @@ private:
     bool externalFollowerFlush_ = false;   ///< worker-driven (every placement): worker submits the flush (async)
     uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
     uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
-    uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation / reconcile append
+    uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation
     Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
     uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
@@ -1098,54 +1095,6 @@ private:
     UnsendablePushMemo unsendablePush_{};
     Offset             unsendablePushLoggedOffset_ = -1;   ///< last offset logged critical
 
-    // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
-    //
-    // On becomeFollower(newEpoch) we do NOT truncate eagerly.  Instead we set
-    // epochProbePending_ and remember the epoch we are probing under and the
-    // committed floor captured at transition time.  The follower issues an
-    // OffsetsForLeaderEpochRequest to the new leader and defers all fetching
-    // until the answer arrives (applyOffsetsForLeaderEpochResponse), which does
-    // the correct truncation.  This prevents an up-to-date survivor from
-    // dropping its committed tail before the (possibly deficient) new leader can
-    // pull it (the DR-8 loss).
-    // DUR-1: highest offset this replica has known as committed (monotonic,
-    // this incarnation) — the floor of an OutOfRange-armed KIP-101 probe.
-    Offset committedFloor_     = 0;
-    Offset oorLeo_             = -1;    ///< M1: LEO at the last OutOfRange-armed probe
-    bool   oorLoopLogged_      = false; ///< M1: the OOR<->probe loop CRITICAL is logged once
-    bool   epochProbePending_ = false;
-    Epoch  epochProbeEpoch_    = -1;   ///< epoch we transitioned into
-    Offset epochProbeFloor_    = 0;    ///< committed HW floor at transition
-    int    epochProbeAttempts_ = 0;    ///< probes issued without an answer
-
-    // DR-BUG-6: after this many unanswered probes, fall back to the conservative
-    // committed-HW truncation and resume fetching.  Keeps the replica live even
-    // when the transport does not implement OffsetsForLeaderEpoch or the new
-    // leader is not promoted yet — it degrades EXACTLY to the pre-DR-BUG-6
-    // behaviour (never loses committed data; may re-fetch a small committed
-    // tail), never a permanent stall.
-    static constexpr int kEpochProbeMaxAttempts = 8;
-
-    // DR-BUG-6: deficient-leader reconcile state.
-    //
-    // A newly-elected leader may be BEHIND the committed frontier (a deficient
-    // node elected by the data-blind consensus).  When it sees a follower whose
-    // LEO exceeds its own, it pulls the missing committed records from that
-    // ahead survivor via sendReconcileRequest() before advertising a HW that
-    // covers them.  reconcileTarget_ tracks which peer we are pulling from (to
-    // avoid a storm of duplicate reconcile requests); -1 means idle.
-    NodeId reconcileTarget_    = -1;   ///< peer we are reverse-fetching from
-    NodeId adoptPeer_          = -1;   ///< H1: the peer whose pull is an ADOPTION (see probe handler)
-
-    // DR-BUG-6 CHURN-ROBUSTNESS: wall-clock (ns) at which the in-flight reconcile
-    // pull was issued.  If a pull goes unanswered (its request or response dropped
-    // under packet loss) reconcileTarget_ would otherwise latch forever and stall
-    // the leader-driven re-drive.  The incomplete-leader doWork clears a stuck
-    // target after kReconcileStuckNs so the pull re-arms on the next cadence — the
-    // self-healing retry that makes catch-up robust to sustained loss / churn.
-    int64_t reconcileIssuedNs_ = -1;
-    static constexpr int64_t kReconcileStuckNs = 250'000'000LL; // 250 ms
-
     // CP-2: cleaned watermark — the log offset up to which compaction has already
     // been applied.  Starts at 0 (nothing compacted).  NodeRuntimeAgent advances
     // this after each successful segment compaction so already-clean prefixes are
@@ -1158,12 +1107,6 @@ private:
     // one follower was refused, so that follower's data waited for a timer.
     uint64_t sendRefusals_ = 0;   // F27: transport-refused replication sends (retried)
     uint64_t owedRebuilds_ = 0;   // F27 F7: owed Data answer rebuilds (log walk)
-    // F27 F3: owed DR sends (one each; a newer one replaces it).
-    struct OwedPull      { NodeId peer = -1; FetchRequestMsg req{}; };
-    struct OwedReconResp { NodeId peer = -1; FetchRequestMsg req{}; };
-    OwedPull      owedPull_{};        ///< refused reverse-reconcile pull (leader)
-    OwedReconResp owedReconResp_{};   ///< refused reconcile answer (survivor)
-
     // Durability: effective minIsr for the acksAll produce gate.
     // Majority mode: cfg_.minIsr.
     // AllInSync  mode: replicas.size() (== RF), so every replica must be in ISR.
@@ -1179,64 +1122,34 @@ private:
     // production and caused the DR-8 committed-loss).
     bool leaderLagClockNeedsReset_ = false;
 
-    // DR-BUG-6 LEADER-COMPLETENESS GATE (the final DR-8 close).
+    // LEADER-COMPLETENESS GATE (the B1 write gate) — Kafka parity edition.
     //
-    // A newly-promoted partition leader may have been elected by the data-BLIND
-    // consensus while it is BEHIND the true committed frontier (the double-election
-    // churn case).  Serving its own regressed committed HW immediately is the
-    // residual DR-8 loss: a committed record held on an up-to-date survivor is
-    // never delivered / gets dropped because the deficient leader advertises a HW
-    // at its own frontier and the reverse-reconcile has not (yet, or reliably under
-    // loss) caught it up.
-    //
-    // The gate enforces leader-completeness at the REPLICATION layer (not the Raft
-    // election, which stays untouched for consensus safety): on becomeLeader we
-    // enter a NOT-YET-COMPLETE state and HOLD the served/advertised high-watermark
-    // at the pre-failover committed floor (completenessFloor_).  While incomplete
-    // the leader does NOT advance the committed offset past that floor — so neither
-    // the acks=All drain nor HW-bounded subscribers (GR-6) can observe a regressed
-    // or partial view.  We LEARN each live ISR survivor's committed frontier from
-    // the probe/fetch requests they send (their LEO + epoch — the lag-clock reset
-    // keeps them in ISR so they report in), compute the highest offset a MAJORITY
-    // of the ISR holds (the true committed frontier), reverse-reconcile UP TO it
-    // from an ahead on-lineage survivor, and only THEN mark leadership COMPLETE and
-    // advertise a HW >= that frontier.  The served HW never REGRESSES below a
-    // previously-committed frontier across the failover (completenessFloor_ is a
-    // hard floor; the post-complete HW is monotonic).
-    //
-    // NO-DIVERGENCE: the frontier is computed ONLY from ON-LINEAGE survivor reports.
-    // A divergent ahead survivor (one whose tail fails the epoch-lineage gate
-    // followerTailIsSharedContinuation) contributes only min(itsLeo, ourLeo) to the
-    // majority computation — its divergent tail can NEVER raise the frontier nor be
-    // adopted (the per-batch hasEpoch gate in applyReconcileResponse rejects it).
-    // Genuine divergent tails still truncate exactly as before.
-    //
-    // BOUNDED / CHURN-ROBUST: the gate is re-armed on EVERY becomeLeader (so it
-    // survives leadership flaps under loss); completion is decided per-doWork /
-    // per-report with no busy-spin; and it degrades safely — if a majority of the
-    // ISR never reports in (genuine quorum loss), the DR-BUG-3 min-ISR gate already
-    // pins the committed offset at the floor, so the incomplete state can never
-    // expose uncommitted data.  Completion requires only that we have HEARD from a
-    // majority AND our own LEO covers the majority frontier with no reconcile in
-    // flight — an event that the reverse-reconcile machinery drives deterministically.
-    bool   leaderComplete_    = true;   ///< false while a new leader reconciles to the frontier
+    // A leader never takes records it did not hold when elected.  It is COMPLETE
+    // (accepts writes, serves an HW above the pre-election floor, directs
+    // truncations) once a MAJORITY of the ISR it was ASSIGNED at becomeLeader
+    // (self included) has proven — by a fetch that passed lastFetchedEpoch
+    // validation in this leadership — that its log is a prefix of ours.  Every
+    // committed record is held by a majority of the ISR it was committed under,
+    // so such a quorum contains a holder of it, and that holder's log is a prefix
+    // of ours: we hold every committed record (ISR soundness, not data pulling).
+    // A deficient leader (an ISR member that lacks committed records the others
+    // hold) never gets that quorum — the holders' fetches are ahead / off our
+    // lineage — so it stays incomplete: it refuses writes, holds those fetches
+    // (kErrLeaderNotComplete, no truncation), and the controller has to hand
+    // leadership to a complete replica (E1b).  The quorum is over the ASSIGNED
+    // set, not the data-plane ISR (a held follower is never credited, so the
+    // lag check shrinks it — it must still count): only a member that is SILENT
+    // in this leadership (no fetch at all) AND was shrunk out of the data ISR —
+    // a dead / unreachable replica, which Kafka would not have in the ISR —
+    // leaves the quorum set.  Decided once per leadership (a same-epoch
+    // re-assert keeps it).
+    bool   leaderComplete_    = true;   ///< false until the validated quorum above is reached
     Offset completenessFloor_ = 0;      ///< pre-failover committed HW; served HW held here until complete
+    std::vector<NodeId> completenessIsr_;   ///< the ISR assigned at becomeLeader (cold)
 
-    /// (Leader) Re-evaluate the completeness gate: if we have heard from a majority
-    /// of the ISR and our LEO covers the on-lineage majority frontier with no
-    /// reconcile pending, mark leadership complete and release the served HW.
+    /// (Leader) Complete the leadership once a majority of completenessIsr_
+    /// (self + validated followers) is reached.
     void maybeCompleteLeadership();
-
-    /// (Leader) The highest offset a MAJORITY of the ISR holds, computed from
-    /// ON-LINEAGE survivor reports only (a divergent ahead survivor is clamped to
-    /// our own LEO).  == the true committed frontier we must reconcile up to.
-    [[nodiscard]] Offset majorityCommittedFrontier() const;
-
-    // DR-BUG-6: per-survivor last-reported LEO (frontier), recorded from probe and
-    // fetch requests.  Used to (a) decide when a MAJORITY of the ISR has reported
-    // in (completeness quorum) and (b) — clamped for divergent tails — compute the
-    // majority committed frontier.  Single-writer (leader thread); bounded by |ISR|.
-    std::unordered_map<NodeId, Offset> survivorFrontier_;
 
     // FETCH CONFLATION: per-follower record of the last (fetchOffset, LEO) served +
     // when.  The leader SKIPS re-serving an IDENTICAL response within kFetchResendNs.

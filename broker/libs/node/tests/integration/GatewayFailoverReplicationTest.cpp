@@ -294,9 +294,15 @@ TEST(GR7_Unit, LeaderKillMidProduce_CommittedNotLost) {
     // (KIP-101).  Wire L to the new leader and drive the exchange; L is NOT in
     // F2's ISR ({kF2,kF3}), so its ahead tail is treated as uncommitted and it
     // truncates to F2's epoch boundary (== committedHw).
+    // KIP-320/595: F2 completes once a majority of its assigned ISR {F2, F3}
+    // proved (validated fetch) its log is a prefix of F2's — F3 must report in
+    // before F2 directs L's DivergingEpoch truncation (an incomplete leader
+    // holds a diverging follower instead).
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
-    bool truncated = gr7Drive({&replicaF2, &replicaL}, transport, clock,
+    transport.addFollower(kF3, &replicaF3);
+    replicaF3.becomeFollower(newEpoch, kF2);
+    bool truncated = gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
                               [&]{ return replicaL.logEndOffset() <= committedHw; });
 
     // Assertions:
@@ -459,23 +465,34 @@ TEST(GR7_Unit, UncommittedTailTruncation_NoLogDivergence) {
     replicaF2.becomeLeader(newEpoch, {kF2, kF3, kL});
     replicaF3.becomeFollower(newEpoch, kF2);
 
-    // DR-BUG-6: F3 (and L) are ISR members whose ahead same-epoch tail (B3) is
-    // indistinguishable, from local information alone, from a committed
-    // continuation the new leader merely lacks — this is exactly the DR-8
-    // ambiguity.  The divergence-critical priority is: NEVER lose committed data
-    // and NEVER diverge.  So an ahead ISR member KEEPS its tail and the new
-    // leader reconciles (pulls) it, rather than truncating (which risked the
-    // DR-8 committed-loss).  The result: all replicas CONVERGE byte-identically
-    // on the reconciled log — no divergence, which is this test's stated intent.
+    // F3 and L are ISR members whose tail (B3) F2 lacks — and B3 sits on a
+    // MAJORITY (L + F3): F2 cannot tell it from a committed record.  Kafka
+    // parity: a leader never takes records it did not hold when elected, and it
+    // never directs a truncation it cannot prove safe.  F2 stays INCOMPLETE —
+    // their diverging fetches are held, nobody truncates — until the controller
+    // moves leadership to a replica that holds everything (F3 here).
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
     transport.addFollower(kF3, &replicaF3);
+    (void)gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock, [] { return false; });
+    EXPECT_FALSE(replicaF2.isLeaderComplete()) << "a deficient leader completed";
+    EXPECT_EQ(replicaF3.logEndOffset(), leo3) << "a held follower truncated";
+    EXPECT_EQ(replicaL.logEndOffset(), leo3) << "a held follower truncated";
 
-    // Drive the epoch exchange + reconcile to full convergence.
-    bool okConv = gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
+    const Epoch epoch3 = 3;
+    replicaF2.becomeFollower(epoch3, kF3);
+    replicaL.becomeFollower(epoch3, kF3);
+    replicaF3.becomeLeader(epoch3, {kF3, kF2, kL});
+    transport.setLeader(&replicaF3);
+    transport.removeFollower(kF3);
+    transport.addFollower(kF2, &replicaF2);
+    transport.addFollower(kL, &replicaL);
+
+    // Drive the validated fetch path to full convergence.
+    bool okConv = gr7Drive({&replicaF3, &replicaL, &replicaF2}, transport, clock,
                            [&]{
-                               Offset a = replicaF2.logEndOffset();
-                               return replicaF3.logEndOffset() == a &&
+                               Offset a = replicaF3.logEndOffset();
+                               return replicaF2.logEndOffset() == a &&
                                       replicaL.logEndOffset()  == a;
                            });
     ASSERT_TRUE(okConv) << "all replicas must converge to a single log (no divergence)";
@@ -810,6 +827,7 @@ TEST(GR7_Unit, HW_Monotonic_AcrossFailover) {
     const Epoch newEpoch = 2;
     replicaL.becomeFollower(newEpoch, kF2);
     replicaF2.becomeLeader(newEpoch, {kF2, kF3});
+    replicaF3.becomeFollower(newEpoch, kF2);
 
     // New leader F2 must hold all hw1 committed records (LEO >= hw1).
     EXPECT_GE(replicaF2.logEndOffset(), hw1)
@@ -818,6 +836,11 @@ TEST(GR7_Unit, HW_Monotonic_AcrossFailover) {
     // Re-wire transport to new leader.
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
+    transport.removeFollower(kF2);
+    // The new leader accepts writes once a majority of its ISR {F2, F3} proved
+    // (validated fetch) its log is a prefix of F2's.
+    ASSERT_TRUE(gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
+                         [&]{ return replicaF2.acceptsProduce(); }));
 
     // Produce 2 more records under new leader.
     Offset leo6 = appendN(replicaF2, 2, 0x02);

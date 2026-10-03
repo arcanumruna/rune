@@ -356,7 +356,13 @@ private:
                         dbgLastTerm_   = curTerm;
                     }
                 }
-                if (n > 0) {
+                // A metadata leader that is not COMPLETE yet (B1 gate) may not
+                // append: keep the eligible-set change pending (do not consume it
+                // into prevElig) until it can — else the one-shot preferred pass
+                // of that change is lost.
+                const bool metaLeaderPending =
+                    metadataService_ != nullptr && metadataService_->leaderPendingCompletion();
+                if (n > 0 && !metaLeaderPending) {
                     // Refresh the controller's ReplicaPositionTable from the worker-
                     // published, race-free controller position snapshots BEFORE the
                     // rebalance runs, so the DynamicBalancer decides leadership

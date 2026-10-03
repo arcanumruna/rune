@@ -48,7 +48,7 @@ namespace rsbe = ::rune::protocol::replication::sbe;
 // Schema constants
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kSchemaId      = 112;
-inline constexpr uint16_t kSchemaVersion = 2; // bumped: DR-BUG-5 added topicId to FetchRequest/FetchResponse
+inline constexpr uint16_t kSchemaVersion = 3; // v2: DR-BUG-5 topicId; v3: KIP-320/595 lastFetchedEpoch + DivergingEpoch
 
 // ---------------------------------------------------------------------------
 // Template IDs (assigned for the replication protocol)
@@ -155,7 +155,7 @@ inline void stampTemplateId(uint8_t* buf, std::size_t offset,
 //   (b) Report its own logEndOffset (= fetchOffset) so the leader can
 //       compute the high-watermark.
 //
-// Wire layout (fixed block, 32 bytes):  [schema version 2: DR-BUG-5 adds topicId]
+// Wire layout (fixed block, 36 bytes):  [v2: DR-BUG-5 topicId; v3: lastFetchedEpoch @ +32]
 //   leaderEpoch   : Epoch       (int64)  @ +0   leader epoch the follower expects
 //   partition     : PartitionId (int32)  @ +8
 //   followerId    : NodeId      (int32)  @ +12
@@ -171,11 +171,21 @@ struct FetchRequestMsg {
     Offset      fetchOffset;
     int32_t     maxBytes;
     int32_t     topicId;    ///< DR-BUG-5: distinguishes replicas that share a partitionId
+    /// v3 (KIP-320/595): the epoch of the last batch in the follower's log
+    /// (-1 = none, or a v2 sender: no lineage validation).  The leader checks
+    /// (fetchOffset, lastFetchedEpoch) against its own epoch lineage on EVERY
+    /// fetch and answers DivergingEpoch when it is not on it.
+    int32_t     lastFetchedEpoch = -1;
 
     static constexpr uint16_t TEMPLATE_ID  = 1;
-    static constexpr uint16_t BLOCK_LENGTH = 32; // 2×int64 + 4×int32 = 16 + 16 = 32
+    static constexpr uint16_t BLOCK_LENGTH = 36; // 2×int64 + 5×int32 (v3)
+    static_assert(BLOCK_LENGTH == rsbe::FetchRequest::sbeBlockLength());
+    static constexpr uint16_t BLOCK_LENGTH_V2 = 32;
     static constexpr std::size_t TOTAL_SIZE =
         ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+    /// Smallest decodable frame (a v2 sender): receivers bound-check against this.
+    static constexpr std::size_t MIN_SIZE =
+        ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH_V2;
 
     /// Encode FetchRequest into buf[offset]. Returns total bytes written.
     static std::size_t encode(uint8_t* buf, std::size_t offset,
@@ -184,7 +194,8 @@ struct FetchRequestMsg {
                               NodeId      followerId_,
                               Offset      fetchOffset_,
                               int32_t     maxBytes_,
-                              int32_t     topicId_ = 0) noexcept
+                              int32_t     topicId_ = 0,
+                              int32_t     lastFetchedEpoch_ = -1) noexcept
     {
         std::size_t pos = offset;
         pos += ReplicationMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
@@ -195,13 +206,16 @@ struct FetchRequestMsg {
         detail::write_le<int64_t>(p + 16, fetchOffset_);
         detail::write_le<int32_t>(p + 24, maxBytes_);
         detail::write_le<int32_t>(p + 28, topicId_);
+        detail::write_le<int32_t>(p + 32, lastFetchedEpoch_);
         return TOTAL_SIZE;
     }
 
-    /// Decode FetchRequest from buf[offset].
+    /// Decode FetchRequest from buf[offset] (at least MIN_SIZE bytes).  A v2
+    /// frame (blockLength 32) carries no lastFetchedEpoch: decoded as -1.
     static FetchRequestMsg decode(const uint8_t* buf,
                                   std::size_t offset) noexcept
     {
+        const uint16_t blockLen = detail::read_le<uint16_t>(buf + offset);
         const uint8_t* p = buf + offset + ReplicationMessageHeader::ENCODED_SIZE;
         FetchRequestMsg m{};
         m.leaderEpoch  = detail::read_le<int64_t>(p +  0);
@@ -210,6 +224,7 @@ struct FetchRequestMsg {
         m.fetchOffset  = detail::read_le<int64_t>(p + 16);
         m.maxBytes     = detail::read_le<int32_t>(p + 24);
         m.topicId      = detail::read_le<int32_t>(p + 28);
+        m.lastFetchedEpoch = blockLen >= BLOCK_LENGTH ? detail::read_le<int32_t>(p + 32) : -1;
         return m;
     }
 };
@@ -222,7 +237,8 @@ struct FetchRequestMsg {
 // consumers), the logStartOffset (earliest offset available in this epoch),
 // an error code, and a variable-length records blob.
 //
-// Fixed block (34 bytes, sbeBlockLength=34):  [schema version 2: DR-BUG-5 adds topicId]
+// Fixed block (46 bytes in v3; 34 in v2):  [v2: DR-BUG-5 topicId; v3: divergingEpoch @ +34,
+//   divergingEndOffset @ +38 — KIP-320/595]
 //   leaderEpoch    : Epoch       (int64)  @ +0
 //   partition      : PartitionId (int32)  @ +8
 //   highWatermark  : Offset      (int64)  @ +12
@@ -247,8 +263,16 @@ struct FetchResponseMsg {
     int16_t                  errorCode;
     int32_t                  topicId;   ///< DR-BUG-5: distinguishes replicas that share a partitionId
     std::span<const uint8_t> records;   ///< Zero-copy view into the decode buf.
+    /// v3 (KIP-320/595) DivergingEpoch: the follower's (fetchOffset,
+    /// lastFetchedEpoch) is not on the leader's lineage.  The follower truncates
+    /// to min(divergingEndOffset, its own end offset of divergingEpoch) and
+    /// re-fetches.  -1 = no divergence (always -1 in a v2 frame).
+    int32_t                  divergingEpoch     = -1;
+    Offset                   divergingEndOffset = -1;
 
     static constexpr uint16_t TEMPLATE_ID = 2;
+    /// Smallest decodable frame: a v2 sender's (34-byte block) empty answer.
+    static constexpr std::size_t MIN_SIZE = 8 + 34 + 4;
     // Layout constants DERIVED from the generated SBE codec (not hand-magic):
     // the fixed block length and the var-data (records) length-prefix width.
     static constexpr uint16_t    BLOCK_LENGTH_FIXED = rsbe::FetchResponse::sbeBlockLength();
@@ -273,7 +297,9 @@ struct FetchResponseMsg {
                               Offset                   logStartOffset_,
                               int16_t                  errorCode_,
                               std::span<const uint8_t> records_,
-                              int32_t                  topicId_ = 0) noexcept
+                              int32_t                  topicId_ = 0,
+                              int32_t                  divergingEpoch_ = -1,
+                              Offset                   divergingEndOffset_ = -1) noexcept
     {
         const std::size_t frame = encodedSize(records_.size());
         rsbe::FetchResponse enc;
@@ -283,7 +309,9 @@ struct FetchResponseMsg {
            .highWatermark(highWatermark_)
            .logStartOffset(logStartOffset_)
            .errorCode(errorCode_)
-           .topicId(topicId_);
+           .topicId(topicId_)
+           .divergingEpoch(divergingEpoch_)
+           .divergingEndOffset(divergingEndOffset_);
         enc.putRecords(reinterpret_cast<const char*>(records_.data()),
                        static_cast<std::uint32_t>(records_.size()));
         return frame;
@@ -312,13 +340,20 @@ struct FetchResponseMsg {
         m.logStartOffset = dec.logStartOffset();
         m.errorCode      = dec.errorCode();
         m.topicId        = dec.topicId();
+        // v3 fields: a v2 frame decodes them as absent → -1 (no divergence).
+        if (dec.divergingEpochInActingVersion()) {
+            m.divergingEpoch     = dec.divergingEpoch();
+            m.divergingEndOffset = dec.divergingEndOffset();
+        }
         // Records tail: guard against a malformed/truncated length prefix (a
         // corrupt frame claiming more bytes than the fragment holds) BEFORE reading
         // the view — decode is noexcept and must never over-read or let an SBE
         // bounds-check throw escape.  recordsLength() only reads the 4-byte length
         // field (within the block), which is always present here.
         const std::uint32_t rlen = dec.recordsLength();
-        const std::size_t framing = encodedSize(0);          // header + block + len-prefix
+        // header + the frame's OWN block (v2: 34, v3: 46) + len-prefix
+        const std::size_t framing = rsbe::MessageHeader::encodedLength() + mh.blockLength()
+                                  + VAR_HEADER_SIZE;
         const std::size_t avail   = (cap >= framing) ? static_cast<std::size_t>(cap - framing) : 0;
         if (rlen == 0 || rlen > avail) {
             m.records = {};                                   // empty or malformed → safe empty span

@@ -81,6 +81,13 @@ public:
     int64_t appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
                                 int32_t lastOffsetDelta, int64_t& outBaseOffset);
 
+    /// Kafka parity (leader stamp): the partitionLeaderEpoch every
+    /// appendNoSyncRestamp() writes into the batch header (zero-copy, CRC-
+    /// excluded field).  Set by the owning PartitionReplica on becomeLeader,
+    /// -1 (leave the producer's bytes) while not leading.  Owner thread only.
+    void setLeaderEpochStamp(int32_t epoch) noexcept { leaderEpochStamp_ = epoch; }
+    [[nodiscard]] int32_t leaderEpochStamp() const noexcept { return leaderEpochStamp_; }
+
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
 
     /// Zero-copy read: locate the segment containing startOffset and return a
@@ -427,6 +434,7 @@ private:
     uint64_t readViewCalls_ = 0;   // F18 B-2 (single-owner thread)
     uint64_t truncations_   = 0;   // contentGeneration() (owner thread)
     bool     recovered_     = false;   // see isRecovered()
+    int32_t  leaderEpochStamp_ = -1;   // see setLeaderEpochStamp()
     LogStorageState storage_{};     ///< fail-stop state + inline-sync accounting (shared with segments)
     bool deferSealSync_ = false;
     static constexpr std::size_t kMaxPendingSeals = 16;
