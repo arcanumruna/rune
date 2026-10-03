@@ -59,6 +59,7 @@
 // Owner (worker) thread only.  No locks, no atomics, no virtual calls; the hot
 // paths (onTxnBatch, lso, isAborted, ready) never allocate once reserve()d.
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
 #include <rune/storage/ProducerStateManager.h>
@@ -227,9 +228,11 @@ public:
     }
 
     // ---- §2.3: per-pass driver --------------------------------------------
-    /// `log` null = a memory-backed partition (nothing to scan: Ready at once;
-    /// see F22).  Returns the bytes this step parsed (0: no scan work).
-    std::size_t advance(const RcFacts& f, rune::storage::Log* log, int32_t budget) {
+    /// `log` null = a memory-backed partition (`memLog`, F22): no bounded scan —
+    /// Ready at once, its producer state rebuilt from the ring in one cold pass.
+    /// Returns the bytes this step parsed (0: no scan work).
+    std::size_t advance(const RcFacts& f, rune::storage::Log* log, int32_t budget,
+                        rune::storage::InMemoryLog* memLog = nullptr) {
         (void)revalidate(f);
         if (Ready* r = std::get_if<Ready>(&st_)) [[likely]] {
             r->epoch = f.epoch;                            // epoch bump, same log: still exact
@@ -241,13 +244,28 @@ public:
         if (std::holds_alternative<Unbuilt>(st_)) {
             if (!f.leader || !f.leaderComplete) return 0;  // I2: wait for leaderComplete_
             if (log == nullptr) {
-                // F15 S5 fix round 1 (M-2): a memory-backed partition has no
-                // scan to rebuild its producer state — clear it on this edge too,
-                // so no window from an earlier leadership / log generation can
-                // answer a retry duplicate-OK at an offset now holding other data
-                // (at worst a retry is appended again: at-least-once, never a
-                // false OK).  A real rebuild for memory logs belongs to F22.
-                if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
+                // PSM <-> log consistency (finding 3, F22): a memory-backed
+                // partition's producer state is REBUILT from its InMemoryLog on
+                // this edge, exactly like a disk log's scan — never kept from an
+                // earlier leadership / log generation (a retry answered
+                // duplicate-OK at an offset now holding other data), and never
+                // left empty: an empty state answers OOS ("NOT appended") for a
+                // STORED batch with seq > 0, and the client then writes it twice
+                // (clearing was NOT "at worst a retry appended again").  One
+                // synchronous pass, bounded by the ring capacity
+                // (memoryLogRingBytes); cold — once per leadership / truncation.
+                // The memory ring evicts its oldest batches (DropOldest), which
+                // forgets a producer like retention does (see the
+                // UNKNOWN_PRODUCER_ID ticket).  No ring (unreachable: every
+                // replica has a log) → cleared, and produceCore_ refuses every
+                // produce of a memory-backed partition anyway (Internal).
+                // A rebuild that stopped short (an unreadable batch) is cleared:
+                // nothing is answered from it (produceCore_ refuses every produce
+                // of a memory-backed partition, Internal).
+                if (psm_ != nullptr &&
+                    (memLog == nullptr ||
+                     !psm_->rebuildFromLog(psmTopic_, *memLog, memLog->logEndOffset(), psmPartition_)))
+                    psm_->clearPartition(psmTopic_, psmPartition_);
                 st_ = Ready{f.epoch, f.logGeneration, f.leadershipGeneration};
                 return 0;
             }

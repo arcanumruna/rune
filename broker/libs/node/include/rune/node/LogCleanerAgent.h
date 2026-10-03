@@ -153,6 +153,10 @@ public:
         channel_  = ch;
         registry_ = nullptr;
     }
+    /// I1: Kafka producer.id.expiration.ms for the producer-tail retention
+    /// (NodeConfig::producerIdExpirationMs).  Call before the runner starts.
+    void setProducerIdExpirationMs(int64_t ms) noexcept { producerIdExpirationMs_ = ms; }
+    [[nodiscard]] int64_t producerIdExpirationMsForTest() const noexcept { return producerIdExpirationMs_; }
     [[nodiscard]] uint64_t viewGenerationForTest() const noexcept { return viewGen_; }
     [[nodiscard]] std::size_t viewSizeForTest() const noexcept { return view_.size(); }
 
@@ -488,6 +492,7 @@ public:
         const int64_t groupRollBytes = (replicaRoll > 0) ? replicaRoll : coalescingRollBytes_;
 
         rune::storage::LogCleaner cleaner;
+        cleaner.setProducerIdExpirationMs(producerIdExpirationMs_);
         rune::storage::RangeCleanResult passResult = cleaner.produceCleanedRangeBounded(
             best.dir,
             sealedBases,
@@ -839,6 +844,7 @@ private:
     int64_t                 dedupeBufferBytes_;   // dedupe map byte budget (SkimpyOffsetMap, > 0 always)
     int64_t                 bytesUsed_ = 0;       // bytes consumed so far in the current budget window
     rune::storage::Throttler throttler_;          // CP-8: shared I/O throttler (cleaner-thread only)
+    int64_t producerIdExpirationMs_ = rune::storage::ProducerTails::kDefaultExpirationMs;   // I1
     // CP-8 Fix 3: segment coalescing.
     bool    useCoalescing_       = false;          // if true, group consecutive segments and merge
     int64_t coalescingRollBytes_ = 64LL * 1024 * 1024; // max combined output bytes per group

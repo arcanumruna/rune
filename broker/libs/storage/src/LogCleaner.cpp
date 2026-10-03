@@ -140,6 +140,51 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
 
 } // anonymous namespace
 
+
+namespace {
+// Kafka LogCleaner parity (ProducerTails.h): note the batch if it is an
+// idempotent DATA batch starting below `toOffset`.
+void noteProducerTail(const uint8_t* batch, const rune::protocol::RecordBatchReader& r, Offset toOffset,
+                      ProducerTails& tails) {
+    if (r.producerId() < 0 || r.baseSequence() < 0) return;
+    if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0)
+        return;
+    if (r.baseOffset() >= toOffset) return;
+    tails.note(r.producerId(), r.baseOffset() + r.lastOffsetDelta(),
+               static_cast<int64_t>(rune::protocol::detail::getLE64(batch + rune::protocol::batch::kMaxTimestampOffset)));
+}
+// C2 (Kafka BatchRetention.RETAIN_EMPTY): the RECORD-LESS producer-tail batch —
+// covers `lastOffset`, carries the producer id / epoch / the batch's last
+// sequence / its maxTimestamp, holds no record (no key can resurrect).
+void appendEmptyTailBatch(std::vector<uint8_t>& out, std::vector<uint8_t>& tmp, int64_t lastOffset,
+                          int64_t maxTimestampMs, int64_t producerId, int16_t producerEpoch, int32_t lastSequence) {
+    rune::protocol::RecordBatchBuilder b(lastOffset, maxTimestampMs);
+    b.setProducerId(producerId);
+    b.setProducerEpoch(producerEpoch);
+    b.setBaseSequence(lastSequence);
+    b.buildInto(tmp);   // recordCount 0 (the builder writes lastOffsetDelta -1)
+    rune::protocol::detail::putLE(tmp, rune::protocol::batch::kLastOffsetDeltaOffset, static_cast<uint32_t>(0));
+    const uint32_t crc = rune::protocol::crc32c(tmp.data() + rune::protocol::batch::kAttributesOffset,
+                                                tmp.size() - rune::protocol::batch::kAttributesOffset);
+    rune::protocol::detail::putLE(tmp, rune::protocol::batch::kCrcOffset, crc);
+    out.insert(out.end(), tmp.begin(), tmp.end());
+}
+// Walk the batch headers of one segment file, noting producer tails only (the
+// clean prefix below a pass's dirty range: its producers' last batches must be
+// known too, or a prefix copy superseded by the dirty section would drop one).
+void noteProducerTailsOfFile(const std::vector<uint8_t>& buf, Offset toOffset, ProducerTails& tails) {
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        if (!r.ensureValid()) break;
+        noteProducerTail(buf.data() + pos, r, toOffset, tails);
+        pos += static_cast<std::size_t>(total);
+    }
+}
+} // namespace
+
 // ---------------------------------------------------------------------------
 // buildOffsetMap  (APPEND-THREAD ONLY — derives bases from segments_)
 // ---------------------------------------------------------------------------
@@ -158,14 +203,21 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                                            const std::vector<int64_t>& bases,
                                            Offset fromOffset, Offset toOffset,
                                            SkimpyOffsetMap& map) {
+    prefixBytesRead_ = 0;
     if (fromOffset >= toOffset) return -1;
 
     for (size_t i = 0; i < bases.size(); ++i) {
         int64_t segBase = bases[i];
         int64_t segEnd  = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
 
-        if (segEnd <= fromOffset) continue;
         if (segBase >= toOffset)  break;
+        if (segEnd <= fromOffset) {
+            // Clean prefix: producer tails only (ProducerTails.h).
+            const auto prefix = readFile(segmentLogPath(dir, segBase));
+            prefixBytesRead_ += static_cast<int64_t>(prefix.size());   // M3: throttled by the caller
+            noteProducerTailsOfFile(prefix, toOffset, map.producerTails());
+            continue;
+        }
 
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
@@ -177,6 +229,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             int32_t total = r.totalLength();
             if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
+            noteProducerTail(buf.data() + pos, r, toOffset, map.producerTails());
 
             bool full = false;
             r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
@@ -205,6 +258,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                                          const std::vector<int64_t>& bases,
                                          Offset fromOffset, Offset toOffset,
                                          OffsetMap& map) {
+    prefixBytesRead_ = 0;
     if (fromOffset >= toOffset) return;
 
     // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
@@ -222,9 +276,15 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         int64_t segBase = bases[i];
         int64_t segEnd = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
 
-        // Skip segments entirely outside [fromOffset, toOffset).
-        if (segEnd <= fromOffset) continue;
+        // Skip segments entirely outside [fromOffset, toOffset) — except that a
+        // clean-prefix segment's producer tails are still noted (ProducerTails.h).
         if (segBase >= toOffset) break;
+        if (segEnd <= fromOffset) {
+            const auto prefix = readFile(segmentLogPath(dir, segBase));
+            prefixBytesRead_ += static_cast<int64_t>(prefix.size());   // M3: throttled by the caller
+            noteProducerTailsOfFile(prefix, toOffset, map.producerTails());
+            continue;
+        }
 
         // Read segment from disk.
         auto buf = readFile(segmentLogPath(dir, segBase));
@@ -239,6 +299,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (total <= 0 || pos + static_cast<size_t>(total) > buf.size()) break;
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
+            noteProducerTail(buf.data() + pos, r, toOffset, map.producerTails());
 
             r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
@@ -260,7 +321,7 @@ bool LogCleaner::rewriteSegmentImpl(
     const std::function<std::optional<Offset>(std::string_view)>& getLatest,
     Offset fromOffset, Offset cleanBoundaryOffset,
     int64_t nowNs, int64_t deleteRetentionMs,
-    int64_t nowMs, bool* changed)
+    int64_t nowMs, bool* changed, const ProducerTails* tails)
 {
     std::string logPath   = segmentLogPath(dir, segBase);
     std::string newPath   = logPath + ".new";
@@ -329,6 +390,28 @@ bool LogCleaner::rewriteSegmentImpl(
         int32_t origBaseSequence  = static_cast<int32_t>(
             rune::protocol::detail::getLE32(buf.data() + pos + rune::protocol::batch::kBaseSequenceOffset));
         int64_t batchBaseOffset   = r.baseOffset();
+        const int64_t batchLastOffset = batchBaseOffset + r.lastOffsetDelta();
+        const bool batchIsData = origProducerId >= 0 && origBaseSequence >= 0 &&
+            (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) == 0;
+        const int64_t batchMaxTs = static_cast<int64_t>(
+            rune::protocol::detail::getLE64(buf.data() + pos + rune::protocol::batch::kMaxTimestampOffset));
+        // C2 / I1: does this batch carry its producer's last metadata (Kafka
+        // isBatchLastRecordOfProducer, unexpired)?  Then it is never removed
+        // whole: kept records carry it, else a record-less batch does.
+        const bool tailNeeded = batchIsData && tails != nullptr && batchLastOffset < cleanBoundaryOffset &&
+            tails->mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs, producerIdExpirationMs_);
+        if (batchIsData && r.recordCount() == 0) {
+            // A record-less producer-tail batch of an earlier pass: kept while
+            // it is still the (unexpired) tail, dropped once superseded.
+            if (batchLastOffset >= cleanBoundaryOffset || tailNeeded)
+                outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                              buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+            else
+                modified = true;
+            pos += static_cast<size_t>(total);
+            continue;
+        }
+        bool lastKept = false;   // the record at batchLastOffset was emitted
 
         // CP-8: does this batch contain any tombstone (for horizon stamping)?
         // We track this as we iterate records and then stamp the batch if needed.
@@ -407,6 +490,7 @@ bool LogCleaner::rewriteSegmentImpl(
                 }
 
                 outBuf.insert(outBuf.end(), batch.begin(), batch.end());
+                if (offset == batchLastOffset) lastKept = true;
             };
 
             auto keep = [&]() { keepWithHorizon(-1); };
@@ -419,6 +503,7 @@ bool LogCleaner::rewriteSegmentImpl(
 
             // Null-key records: always keep (not compactable).
             if (key.empty()) { keep(); return; }
+
 
             // UNIFIED RETAIN RULE (Kafka LogCleaner.shouldRetainRecord).
             //
@@ -489,6 +574,11 @@ bool LogCleaner::rewriteSegmentImpl(
             // Keep this record (non-tombstone, or tombstone within retention).
             keep();
         });
+        // C2: the producer's last record was dropped — keep its METADATA only.
+        if (tailNeeded && !lastKept) {
+            appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId, origProducerEpoch,
+                                 origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset));
+        }
 
         pos += static_cast<size_t>(total);
     }
@@ -558,7 +648,8 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
                                 int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
+        &map.producerTails());
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +661,8 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyO
                                 int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
+        &map.producerTails());
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +809,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
         // Read bytes can be estimated from sealedBases sizes (file reads).
         // For simplicity, throttle after the full map-build pass.
         buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+        if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
         if (throttler) {
             // Approximate read bytes: size of the segment file being processed.
             // For the cleaner-thread path we throttle after the map is built.
@@ -825,6 +918,8 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     // one pass without a member's keys vanishing after it is deleted.
     map.clear();
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    // M3: the clean-prefix reads for producer tails count against the I/O throttle.
+    if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);
 
     const Offset latestMapped = map.latestOffset();
     if (latestMapped < 0) {
@@ -880,7 +975,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     for (int64_t b : inPassBases) {
         bool changed = false;
         rewriteSegmentImpl(dir, b, getLatest, globalDirtyStart, passEnd,
-                           nowNs, deleteRetentionMs, nowMs, &changed);
+                           nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails());
 
         // A segment needs a swap enqueue iff its on-disk content changed (records
         // dropped / tombstone stamped / emptied), OR its .log is now absent (emptied
@@ -1046,6 +1141,25 @@ void LogCleaner::mergeGroupWithMap(
                 rune::protocol::detail::getLE32(buf.data() + pos
                     + rune::protocol::batch::kBaseSequenceOffset));
             int64_t batchBaseOffset   = r.baseOffset();
+            const int64_t batchLastOffset = batchBaseOffset + r.lastOffsetDelta();
+            const bool batchIsData = origProducerId >= 0 && origBaseSequence >= 0 &&
+                (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) == 0;
+            const int64_t batchMaxTs = static_cast<int64_t>(
+                rune::protocol::detail::getLE64(buf.data() + pos + rune::protocol::batch::kMaxTimestampOffset));
+            // C2 / I1 (see rewriteSegmentImpl): producer-tail metadata retention.
+            const bool tailNeeded = batchIsData && batchLastOffset < passEnd &&
+                map.producerTails().mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs,
+                                               producerIdExpirationMs_);
+            if (batchIsData && r.recordCount() == 0) {
+                if (batchLastOffset >= passEnd || tailNeeded)
+                    outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                                  buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+                else
+                    modified = true;
+                pos += static_cast<size_t>(total);
+                continue;
+            }
+            bool lastKept = false;
 
             r.forEachRecord([&](std::string_view key, std::string_view val,
                           int64_t offset, int64_t timestamp) {
@@ -1083,6 +1197,7 @@ void LogCleaner::mergeGroupWithMap(
                     batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(newCrc >> 16);
                     batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(newCrc >> 24);
                     outBuf.insert(outBuf.end(), batch.begin(), batch.end());
+                    if (offset == batchLastOffset) lastKept = true;
                 };
                 auto keep2 = [&]() { keepWithHorizon2(-1); };
 
@@ -1111,6 +1226,11 @@ void LogCleaner::mergeGroupWithMap(
                 }
                 keep2();
             });
+            if (tailNeeded && !lastKept) {   // C2: metadata only
+                appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId,
+                                     origProducerEpoch,
+                                     origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset));
+            }
 
             pos += static_cast<size_t>(total);
         }
@@ -1180,6 +1300,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
     std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
     SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
 
     // Throttle the map-build read phase (approx from combined group size).
     if (throttler && group.combinedBytes > 0) {

@@ -1254,6 +1254,7 @@ public:
                 work += replica->doWork(nowNs);
             }
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
+            if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }
         // F30: never block a worker on disk in ANY mode (spec §3.1; replication
@@ -1348,6 +1349,7 @@ private:
             if (replica) work += replica->doWork(nowNs);
         }
         work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
+        if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync
         //     (truncation reconcile, roll seals, follower flush requests).
@@ -3373,11 +3375,101 @@ private:
     // Per-worker ProducerStateManager — idempotency for this worker's owned partitions.
     // Worker-thread only (single-writer per (log, PSM) pair — shared-nothing).
     //
-    // TODO(E5.1.5): At migration time, reconstruct PSM from the log tail via
-    //   reconstructPsmFromLog(partition) seam (left as an explicit hook here).
-    //   For now, a fresh PSM at construction is safe (loses idempotency window
-    //   across restarts, but that is acceptable for the E5.1.2d gate).
+    // It answers a sequence only while PROVEN consistent with the partition's
+    // log (the contract: OOS = "NOT appended"; a stored batch is answered OK /
+    // duplicate, never appended again):
+    //   * a replicated user partition — rebuilt from logStart to LEO by the RC
+    //     build (RcState; a memory-backed one from its InMemoryLog) on every
+    //     leadership / log generation, idempotent batches refused NotLeader
+    //     until Ready (rcGate_);
+    //   * a replica-less (passthrough) partition — rebuilt once per log on its
+    //     first idempotent batch (passthroughPsm_: nothing else writes it);
+    //   * an internal partition (topicId < 0) never carries a producer id —
+    //     such a batch is refused (Internal), never validated.
+    // (The former "a fresh PSM at construction is safe" note was wrong: an
+    // empty state answers OOS for a stored batch with seq > 0 and accepts a
+    // stored seq 0 again.)
     rune::storage::ProducerStateManager psm_{};
+    // Replica-less (passthrough) partitions: the proof state of psm_ for each,
+    // keyed on the stable (topicId, partition) identity + the log's content
+    // generation (M4 — no Log* key).  Same rules as the gateway's inline state
+    // (fix round 1): a budgeted rebuild (I3: kPassthroughPsmStepBytes per step,
+    // one per idempotent batch and one per pass; NotLeader while it runs), a
+    // failed one LATCHED (I2: Internal without a rescan until the log changes
+    // or the doubling backoff ends).
+    struct PassthroughUnproven {};
+    struct PassthroughScanning {
+        uint64_t logGen = 0;
+        rune::storage::Log* log = nullptr;   ///< the log being scanned (driven per pass)
+        rune::storage::ProducerStateManager::Rebuild cursor;
+        int64_t backoffNs = 0;
+    };
+    struct PassthroughProven { uint64_t logGen = 0; };
+    struct PassthroughFailed { uint64_t logGen = 0; int64_t retryAtNs = 0; int64_t backoffNs = 0; };
+    struct PassthroughPsm {
+        int32_t topicId = 0;
+        int32_t partition = 0;
+        std::variant<PassthroughUnproven, PassthroughScanning, PassthroughProven, PassthroughFailed> st;
+    };
+    std::vector<PassthroughPsm> passthroughPsm_;
+    uint64_t passthroughPsmRebuilds_ = 0;
+    static constexpr std::size_t kPassthroughPsmStepBytes = 1u << 20;
+    static constexpr int64_t     kPassthroughRetryMinNs   = 100'000'000;
+    static constexpr int64_t     kPassthroughRetryMaxNs   = 30'000'000'000;
+    enum class PsmGate : uint8_t { Proven, NotLeader, Unprovable };
+    // Cold the first time per partition; a short linear scan afterwards
+    // (replica-less partitions exist only in rigs / passthrough deployments).
+    [[nodiscard]] PsmGate provePassthroughPsm_(int32_t topicId, int32_t partition, rune::storage::Log& log) {
+        PassthroughPsm* e = nullptr;
+        for (auto& p : passthroughPsm_)
+            if (p.topicId == topicId && p.partition == partition) { e = &p; break; }
+        if (e == nullptr) {
+            passthroughPsm_.push_back(PassthroughPsm{topicId, partition, PassthroughUnproven{}});
+            e = &passthroughPsm_.back();
+        }
+        const uint64_t gen = log.contentGeneration();
+        if (const auto* p = std::get_if<PassthroughProven>(&e->st); p && p->logGen == gen) [[likely]]
+            return PsmGate::Proven;
+        int64_t backoff = kPassthroughRetryMinNs;
+        if (const auto* f = std::get_if<PassthroughFailed>(&e->st)) {
+            if (f->logGen == gen && passNowNs_ < f->retryAtNs) return PsmGate::Unprovable;
+            if (f->logGen == gen) backoff = std::min(f->backoffNs * 2, kPassthroughRetryMaxNs);
+        }
+        auto* sc = std::get_if<PassthroughScanning>(&e->st);
+        if (sc == nullptr || sc->logGen != gen || sc->log != &log) {
+            PassthroughScanning fresh;
+            fresh.logGen = gen; fresh.log = &log; fresh.backoffNs = backoff;
+            psm_.beginRebuild(fresh.cursor, topicId, log, log.logEndOffset(), partition);
+            ++passthroughPsmRebuilds_;
+            e->st = fresh;
+            sc = std::get_if<PassthroughScanning>(&e->st);
+        }
+        using RS = rune::storage::ProducerStateManager::Rebuild::Status;
+        const RS r = psm_.rebuildStep(sc->cursor, log, kPassthroughPsmStepBytes);
+        if (r == RS::InProgress) return PsmGate::NotLeader;
+        if (r == RS::Done) { e->st = PassthroughProven{gen}; return PsmGate::Proven; }
+        const int64_t b = sc->backoffNs;
+        psm_.clearPartition(topicId, partition);
+        e->st = PassthroughFailed{gen, passNowNs_ + b, b};
+        spdlog::error("Worker {}: producer-state rebuild of topicId={} partition={} stopped short of the log end "
+                      "— idempotent produces answered Internal; retried on a log change or in {} ms",
+                      workerId_, topicId, partition, b / 1'000'000);
+        return PsmGate::Unprovable;
+    }
+    // One budgeted step per pass for every passthrough build in progress.
+    int advancePassthroughPsm_() {
+        int work = 0;
+        for (auto& p : passthroughPsm_) {
+            if (auto* sc = std::get_if<PassthroughScanning>(&p.st)) {
+                (void)provePassthroughPsm_(p.topicId, p.partition, *sc->log);
+                ++work;
+            }
+        }
+        return work;
+    }
+public:
+    [[nodiscard]] uint64_t passthroughPsmRebuildsForTest() const noexcept { return passthroughPsmRebuilds_; }
+private:
 
     // E5.1.2d: gate — true when the worker should poll workerIngress_ for produce.
     // Default FALSE so the existing gateway fanout remains the live path and
@@ -3877,7 +3969,8 @@ private:
     }
     // One §2.3 driver step for one partition.
     std::size_t rcAdvance_(rune::replication::PartitionReplica* r, RcState& rc) {
-        return rc.advance(rcFacts_(r), r->isDiskBacked() ? r->log() : nullptr, rcScanBytesPerPass_);
+        return r->isDiskBacked() ? rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_)
+                                 : rc.advance(rcFacts_(r), nullptr, rcScanBytesPerPass_, r->memoryLog());
     }
     // §2.4: the RC state to serve read_committed from — only if Ready AND still
     // valid for the replica's live role / generations (a demotion can land
@@ -4867,14 +4960,35 @@ private:
             enqueueReturn_(ret);
             return 1;
         }
-        // F15 §2.3 produce gate (see executeProduceWire_).
+        // F15 §2.3 produce gate (see executeProduceWire_) + PSM <-> log
+        // consistency: an idempotent batch is validated only against a producer
+        // state proven consistent with this log (see psm_).
         RcState* rc = nullptr;
-        if (f.producerId >= 0 && replica != nullptr && f.topicId >= 0) [[unlikely]] {
-            rc = rcGate_(replica);
-            if (rc == nullptr) {
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        if (f.producerId >= 0) [[unlikely]] {
+            if (replica != nullptr && f.topicId >= 0) {
+                rc = rcGate_(replica);
+                if (rc == nullptr) {
+                    ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                    enqueueReturn_(ret);
+                    return 1;
+                }
+            } else if (replica != nullptr) {
+                // Internal partitions are written by coordinators with pid -1
+                // only; no producer state is ever built for them.
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
                 enqueueReturn_(ret);
                 return 1;
+            } else {
+                const PsmGate g = provePassthroughPsm_(f.topicId, f.partition, *log);
+                if (g != PsmGate::Proven) [[unlikely]] {
+                    // Unproven: never OOS ("NOT appended"), never an append —
+                    // retriable while the budgeted build runs, outcome unknown
+                    // when it failed.
+                    ret.errorCode = static_cast<int16_t>(g == PsmGate::NotLeader ? pc::ErrorCode::NotLeader
+                                                                                 : pc::ErrorCode::Internal);
+                    enqueueReturn_(ret);
+                    return 1;
+                }
             }
         }
 

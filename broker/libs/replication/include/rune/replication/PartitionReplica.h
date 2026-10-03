@@ -666,6 +666,11 @@ public:
     /// NodeRuntimeAgent drains, PartitionFailoverCoordinator) skip memory-backed
     /// partitions via this predicate.
     [[nodiscard]] bool isMemoryBacked() const noexcept { return memoryBacked_; }
+    /// The InMemoryLog of a memory-backed partition (nullptr when disk-backed).
+    /// Owner thread only (the producer-state rebuild of the owning worker).
+    [[nodiscard]] rune::storage::InMemoryLog* memoryLog() const noexcept {
+        return memoryBacked_ ? memLog_ : nullptr;
+    }
     [[nodiscard]] bool isDiskBacked()   const noexcept { return !memoryBacked_; }
 
     /// Shard mode (spec §3.1 never-block): this replica never fsyncs inline.
@@ -980,12 +985,12 @@ private:
     // Epoch caches (both roles need one for truncation)
     rune::storage::LeaderEpochCache epochCache_;
 
-    // Task 11: per-partition producer dedup state.
-    //
-    // Rebuilt from the log on becomeLeader (via callers such as
-    // ClientGateway::rebuildProducerStateFromLogs) and re-rebuilt atomically
-    // when a KIP-101 divergence truncation lands below the last rebuild HW
-    // (truncateLog → conditional rebuildFromLog).  Single-writer; no locks.
+    // Task 11: a replica-held producer dedup state.  NOT the broker's: no
+    // produce is validated against it (the owning worker's psm_ and the
+    // gateway's inline state are — each proven consistent with this log, see
+    // RcState / ClientGateway::proveInlinePsm_).  Only tests rebuild it; then
+    // truncateLog re-rebuilds it when a KIP-101 truncation lands below the last
+    // rebuild bound.  Single-writer; no locks.
     rune::storage::ProducerStateManager psm_;
 
     // Timing state

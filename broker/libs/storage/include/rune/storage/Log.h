@@ -96,6 +96,11 @@ public:
     /// object is (re)installed (roll, compaction swap, reload, truncation).  A
     /// cached walk over read bytes is valid only while it is unchanged.
     [[nodiscard]] uint64_t installGeneration() const noexcept { return segInstallGen_; }
+    /// Bumped by every truncateTo() that removed data: a state derived from
+    /// this log's existing content (a producer state) is stale once it moves.
+    /// For a log with no replica (passthrough) this is its only generation —
+    /// replicated logs use PartitionReplica::logGeneration().  Owner thread.
+    [[nodiscard]] uint64_t contentGeneration() const noexcept { return truncations_; }
     /// The lowest offset still readable from this log — the base offset of the
     /// first (oldest) on-disk segment.  Advances past 0 when retention/compaction
     /// deletes the earliest segment(s).  An "Earliest" subscriber MUST start here,
@@ -187,6 +192,8 @@ public:
     /// owner (append) thread only.  The read_committed build skips an empty
     /// view (a gap below its target) with it.
     [[nodiscard]] int64_t nextSegmentBaseAfter(int64_t offset) const noexcept;
+    /// One past the last written offset of the segment containing `offset` (-1 if none).
+    [[nodiscard]] int64_t segmentNextOffsetAt(int64_t offset) const noexcept;
     /// F15 S4 fix round 1: the segment whose base is exactly `segmentBase` —
     /// its written bytes as an untouched read-only mapping (see
     /// LogSegment::mappedBytes), its .log fd (async read-ahead hints), and its
@@ -407,6 +414,7 @@ private:
 
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
     uint64_t readViewCalls_ = 0;   // F18 B-2 (single-owner thread)
+    uint64_t truncations_   = 0;   // contentGeneration() (owner thread)
     LogStorageState storage_{};     ///< fail-stop state + inline-sync accounting (shared with segments)
     bool deferSealSync_ = false;
     static constexpr std::size_t kMaxPendingSeals = 16;

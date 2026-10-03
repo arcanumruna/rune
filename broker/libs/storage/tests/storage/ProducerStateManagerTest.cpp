@@ -18,6 +18,7 @@
 #include <gtest/gtest.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/InMemoryLog.h>
+#include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -1142,4 +1143,42 @@ TEST(IdempotenceWindow, Version3SnapshotWithZeroSlotsIsRejected) {
     EXPECT_EQ(m2.recover(path), 0);
     EXPECT_EQ(m2.size(), 0u);
     ::unlink(path.c_str());
+}
+
+// Re-review of 700d86d (C1): readView also comes back EMPTY when a sealed segment's bytes cannot be
+// read (a corrupt length field, a failed mapping) — not only at a compaction gap.  Treating that as a
+// gap skipped the producer's stored batches and marked the state PROVEN: a resend of a stored batch
+// then got OutOfOrderSequence or was appended again.  Data that exists but cannot be read must FAIL
+// the proof.
+TEST(PsmRebuildRegression, CorruptLengthAfterValidBatchesFailsTheProof) {
+    const std::string dir = tmpPath("psm_corrupt_len");
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir);
+        log.recover();
+        std::vector<std::size_t> sizes;
+        for (int i = 0; i < 3; ++i) {
+            rune::protocol::RecordBatchBuilder b(log.logEndOffset(), 1000);
+            b.setProducerId(910); b.setProducerEpoch(0); b.setBaseSequence(i * 2);
+            b.append("k", "v", 1000); b.append("k", "v", 1000);
+            const auto bytes = b.build();
+            sizes.push_back(bytes.size());
+            ASSERT_GE(log.append(bytes, log.logEndOffset() + 1), 0);
+        }
+        // Corrupt the 2nd batch's length field (bytes [8,12) of the batch) in place, through the file:
+        // the live segment's shared mapping sees it; its nextOffset still covers all three batches.
+        std::string seg;
+        for (const auto& e : std::filesystem::directory_iterator(dir))
+            if (e.path().extension() == ".log") seg = e.path().string();
+        ASSERT_FALSE(seg.empty());
+        const int fd = ::open(seg.c_str(), O_WRONLY);
+        ASSERT_GE(fd, 0);
+        const int32_t bogus = 0x7FFFFFF0;
+        ASSERT_EQ(::pwrite(fd, &bogus, sizeof bogus, static_cast<off_t>(sizes[0] + 8)), 4);
+        ::close(fd);
+        ProducerStateManager m;
+        EXPECT_FALSE(m.rebuildFromLog(0, log, log.logEndOffset(), 0))
+            << "unreadable stored batches were skipped and the producer state reported PROVEN";
+    }
+    std::filesystem::remove_all(dir);
 }

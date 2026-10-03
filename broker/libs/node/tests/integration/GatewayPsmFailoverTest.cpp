@@ -7,9 +7,19 @@
 //
 //   TX2b_GatewayDriven.DivergentTail_HWBoundRebuild_NoFalseDuplicate
 //
-//   Directly tests the CRITICAL TX-2b fix: rebuildFromLog() must use the
-//   committed high-watermark (HW) as its scan upper bound, NOT the log-end-
-//   offset (LEO).
+//   Pins rebuildFromLog()'s BOUND semantics: a state built to HW does not
+//   cover the tail above it; one built to LEO does.
+//
+//   NOTE (PSM <-> log consistency, review of b4594f8): the broker no longer
+//   answers produces from an HW-bounded state.  A new leader KEEPS its tail
+//   above HW, so an HW-bounded state accepted a resend of the first tail batch
+//   (a silent duplicate) and answered OOS for later stored ones.  The answering
+//   states are built to LEO and REBUILT on every log-generation change (a
+//   KIP-101 truncation of that tail included), which is what prevents the
+//   false-Duplicate this test was written for — see
+//   PsmLogConsistencyRegression.* (F15EosRegressionTest.cpp).  Scenario C below
+//   is therefore the CORRECT state for a log whose tail is kept, and the
+//   truncation case is covered by the invalidation, not by the bound.
 //
 //   Scenario:
 //     - Log has kN committed batches (pid=P, epoch=E, seq 0..kN-1) + 1 UNCOMMITTED
@@ -200,7 +210,7 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
     ASSERT_EQ(leoOffset, static_cast<int64_t>(kN + 1));
 
     // -----------------------------------------------------------------------
-    // Scenario B (POST-FIX): HW-bounded scan — the correct behavior.
+    // Scenario B: HW-bounded scan — a prefix state (no longer used to answer).
     // -----------------------------------------------------------------------
     {
         ProducerStateManager psmHw;
@@ -235,9 +245,9 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
     }
 
     // -----------------------------------------------------------------------
-    // Scenario C (PRE-FIX): LEO-bounded scan — the BUG.
-    // Asserts isDuplicate() == true to confirm this test is a valid
-    // RED/GREEN discriminator: code that uses LEO fails where HW-bound passes.
+    // Scenario C: LEO-bounded scan — the bound the answering states use (with
+    // rebuild-on-truncation; see the NOTE in the file header): the kept tail
+    // is covered (a resend of it is a duplicate).
     // -----------------------------------------------------------------------
     {
         ProducerStateManager psmLeo;
@@ -247,11 +257,10 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
         // producer retry of kUncSeq is incorrectly marked Duplicate.
         const auto vrUnc = psmLeo.validate(/*topicId=*/0, kPid, kPartition, kEpoch, kUncSeq, kUncSeq);
         EXPECT_TRUE(vrUnc.isDuplicate())
-            << "PRE-FIX REGRESSION CHECK: LEO-bound rebuildFromLog MUST produce"
-            << " false-Duplicate for uncommitted seq=" << kUncSeq << "."
-            << " This EXPECT documents the pre-fix bug (LEO-bound seeds PSM from"
-            << " uncommitted batches). Scenario B (HW-bound) corrects this to Accept."
-            << " Together B+C prove: HW-bound=Accept (FIX), LEO-bound=Duplicate (BUG).";
+            << "LEO-bound rebuildFromLog must cover the kept tail (seq=" << kUncSeq << "):"
+            << " a resend of a STORED tail batch is a duplicate, never appended again."
+            << " If the tail is later truncated, the owner's log-generation check"
+            << " rebuilds the state before answering (PsmLogConsistencyRegression.*).";
 
         // Committed seqs are still Duplicate in LEO-bound mode (correct in both cases).
         for (int seq = 0; seq < kN; ++seq) {

@@ -2332,6 +2332,23 @@ TEST(ProduceBatchLimitRegression, BenchProfileAccepts2MiBBatches) {
     EXPECT_GE(c.produceIntakeLimit(), 2 * 1024 * 1024 + 64 * 1024);
 }
 
+// PSM fix round 1 (I1): RUNE_PRODUCER_ID_EXPIRATION_MS (Kafka
+// producer.id.expiration.ms for compaction's producer-tail retention).
+TEST(NodeConfigTest, PsmLogConsistencyRegression_ProducerIdExpirationDefaultAndOverride) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_EQ(r.config->producerIdExpirationMs, 7LL * 24 * 3600 * 1000) << "default 7 days";
+    auto env = base1node();
+    env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = "3600000";
+    auto r2 = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r2.error.empty()) << r2.error;
+    EXPECT_EQ(r2.config->producerIdExpirationMs, 3'600'000);
+    env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = "-5";
+    auto r3 = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(r3.error.empty()) << r3.error;
+    EXPECT_EQ(r3.config->producerIdExpirationMs, 7LL * 24 * 3600 * 1000) << "invalid -> default";
+}
+
 } // namespace rune::node
 
 // REGRESSION (integ/perf-defaults, shard default): RUNE_CLIENT_ENDPOINT given as

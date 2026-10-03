@@ -321,30 +321,70 @@ public:
     //                       non-const in the current implementation).  NO virtual
     //                       dispatch — the concrete read()/segmentBaseOffsets() are
     //                       called directly (de-virtualized seam, Milestone D P2).
-    // @param highWatermark  Scan up to (exclusive) this log offset.
-    //                       MUST be the committed high-watermark (HW), NOT the
-    //                       log-end-offset (LEO).  Scanning beyond HW seeds the
-    //                       PSM dedup window from uncommitted batches that may be
-    //                       truncated by KIP-101 divergence resolution, causing a
-    //                       false-Duplicate for a genuinely new producer retry →
-    //                       acknowledged data loss at a truncated-away offset.
-    //                       Pass log.logEndOffset() ONLY when HW == LEO (e.g.
-    //                       single-node passthrough with no uncommitted tail).
+    // @param highWatermark  Scan up to (exclusive) this log offset.  For a
+    //                       state that ANSWERS produces it MUST be the LEO (Kafka
+    //                       loads producer state to the log end): a leader keeps
+    //                       its tail above HW, and a state built only to HW
+    //                       accepts a resend of the first tail batch (seq ==
+    //                       lastSequence + 1) — a silent duplicate — and answers
+    //                       OOS ("NOT appended") for later stored ones.  The
+    //                       tail's possible KIP-101 truncation is handled by
+    //                       INVALIDATION, not by the bound: the owner rebuilds
+    //                       whenever the log generation (truncation / reconcile
+    //                       append) or leadership changes (RcState on the worker
+    //                       path, ClientGateway::proveInlinePsm_ inline).  The
+    //                       parameter stays general for callers that need a
+    //                       prefix (e.g. a truncation offset).
     // @param partition      The partition id to use as the key (producer state
     //                       is keyed by (topicId, producerId, partition)).
     //
     // Sets rebuildHw_ = highWatermark on every call so callers can test whether
     // a subsequent truncation falls below the last rebuild bound.
     //
-    // Called from ClientGateway::rebuildProducerStateFromLogs (production) and
-    // from PartitionReplica::truncateLog when a divergence truncation lands below
-    // the rebuild HW (Task 11 atomicity fix).
+    // Called from ClientGateway::proveInlinePsm_ and the worker's passthrough
+    // proof (to the LEO), RcState's memory-log rebuild (to the LEO), and
+    // PartitionReplica::truncateLog when a divergence truncation lands below
+    // the rebuild bound (Task 11; that replica-held state answers no produce).
+    // The worker's disk-log RC build feeds update()/fenceEpoch() batch by batch
+    // instead (RcBuilder::step) — the same rules.
     //
     // Cold path — allocations are acceptable here.
     // Single-writer: call only on the duty-cycle thread.
     // -----------------------------------------------------------------------
+    // Returns true when the scan COMPLETED: it reached `highWatermark` or the
+    // end of the log's data.  false = it stopped short on a batch it could not
+    // parse / CRC-validate (or made no progress): every batch behind that point
+    // is missing from the state, so the caller must NOT answer produces from
+    // it (it cannot vouch for a sequence either way — answer outcome-unknown).
     template<class LogT>
-    void rebuildFromLog(int32_t topicId, LogT& log, int64_t highWatermark, int32_t partition);
+    bool rebuildFromLog(int32_t topicId, LogT& log, int64_t highWatermark, int32_t partition);
+
+    // -----------------------------------------------------------------------
+    // Budgeted rebuild (fix round 1, I3): the same scan as rebuildFromLog, cut
+    // into steps of at most ~budgetBytes each so an owner thread (the gateway
+    // duty loop, a worker pass) never blocks on an O(log) scan.  beginRebuild
+    // clears the partition's entries and fixes the bound; rebuildStep advances
+    // the cursor over WHOLE batches through the log's zero-copy readView (no
+    // allocation, no chunk reserve — M5): a batch never straddles a step (C1:
+    // the 64 MiB read window used to cut batches and was taken for "stopped
+    // short").  While InProgress the state must not answer produces.  Retention
+    // between steps is tolerated (the cursor is clamped to the log start).
+    //   Done   — every batch below the bound was applied (or the data ended).
+    //   Failed — a batch inside the written bytes failed its CRC / framing, or
+    //            the scan made no progress: the state lags the log; the caller
+    //            must not answer from it.
+    // -----------------------------------------------------------------------
+    struct Rebuild {
+        enum class Status : uint8_t { InProgress, Done, Failed };
+        int32_t topicId   = 0;
+        int32_t partition = 0;
+        int64_t next      = 0;   ///< next offset to apply
+        int64_t target    = 0;   ///< exclusive bound
+    };
+    template<class LogT>
+    void beginRebuild(Rebuild& r, int32_t topicId, LogT& log, int64_t bound, int32_t partition);
+    template<class LogT>
+    Rebuild::Status rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes);
 
     // -----------------------------------------------------------------------
     // rebuildHighWatermark — the log high-watermark at which the last rebuild ran.

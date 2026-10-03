@@ -549,11 +549,17 @@ TEST_F(ProduceIdempotentFixture, ProduceIdempotent_LegacyProducerPassthrough)
     EXPECT_EQ(log->logEndOffset(), 4);  // 2 batches × 2 records
 }
 
-// Review I3: the no-worker-pool INLINE path's PSM is rebuilt only on a node-
-// level leadership change, so it refuses a KNOWN-OLD duplicate (older than the
-// window) with OutOfOrderSequence instead of answering OK with an unknown
-// offset; an in-window retransmit is still answered with its original offset.
-TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathRefusesKnownOldDuplicate)
+// The no-worker-pool INLINE path validates an idempotent batch only against a
+// producer state PROVEN consistent with the partition log (rebuilt from
+// logStart to LEO per partition whenever the log / leadership it was built for
+// changes — ClientGateway::proveInlinePsm_), so like the worker path it answers
+// a KNOWN-OLD duplicate (older than the window, entirely <= lastSequence) OK
+// with an unknown offset (-1, Kafka DUPLICATE_SEQUENCE_NUMBER parity) — never
+// OutOfOrderSequence ("NOT appended": the client would re-sequence and write it
+// twice) and never appended again.  An in-window retransmit is answered with
+// its original offset.  (b4594f8 answered Internal here while the state was
+// rebuilt only on a node-level leadership change.)
+TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathKnownOldDuplicateIsOkUnknownOffset)
 {
     auto client = makeClient(kEgressBase + 5);
     auto connResp = doConnect(*client.ingressPub, *client.egressSub,
@@ -574,7 +580,11 @@ TEST_F(ProduceIdempotentFixture, IdempotenceWindowRegression_InlinePathRefusesKn
                           std::span<const uint8_t>(batches[0]), "KnownOld");
     auto old = recvProduceResponse(*client.egressSub, "KnownOldResponse");
     ASSERT_TRUE(old.has_value());
-    EXPECT_EQ(old->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence));
+    // Stored (every sequence <= lastSequence of this epoch was appended): OK,
+    // offset unknown.  Never OOS, never re-appended (LEO checked below).
+    EXPECT_NE(old->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence));
+    EXPECT_EQ(old->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(old->baseOffset, -1);
     sendIdempotentProduce(*client.ingressPub, sid, 601, kTopicId, kPartition0, 12, 0, n - 1,
                           std::span<const uint8_t>(batches[n - 1]), "InWindow");
     auto dup = recvProduceResponse(*client.egressSub, "InWindowResponse");

@@ -33,6 +33,7 @@
 // Thread-safety: NOT thread-safe. Intended for single-thread cleaner use.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -41,6 +42,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+#include <rune/storage/ProducerTails.h>
 
 namespace rune::storage {
 
@@ -157,6 +159,10 @@ public:
         capacity_ = cap;
         mask_     = cap - 1;
         table_.assign(cap, Entry{kEmpty, -1});
+        // I1: the producer tails share the dedupe budget — at most a quarter
+        // of it (kEntryBytes per key slot vs ProducerTails::kBytesPerProducer).
+        tails_.setCapacity(std::max<std::size_t>(
+            1024, cap * kEntryBytes / 4 / ProducerTails::kBytesPerProducer));
     }
 
     // Disable copy (large allocation, should never be copied).
@@ -228,7 +234,13 @@ public:
         for (auto& e : table_) { e.hash = kEmpty; e.offset = -1; }
         size_          = 0;
         latestOffset_  = -1;
+        tails_.clear();
     }
+
+    /// The last data batch of every producer in the scanned range (retained by
+    /// compaction — see ProducerTails.h).  Filled by buildOffsetMapFromBases.
+    ProducerTails&       producerTails() noexcept { return tails_; }
+    const ProducerTails& producerTails() const noexcept { return tails_; }
 
     // --- Budget helper (static, no instance) --------------------------------
     /// Compute maxSlots from a byte budget and per-entry size.
@@ -262,6 +274,7 @@ private:
     std::size_t          size_         = 0;
     Offset               latestOffset_ = -1;
     std::vector<Entry>   table_;
+    ProducerTails        tails_;
 };
 
 } // namespace rune::storage
