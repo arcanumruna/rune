@@ -292,6 +292,9 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // Durability: pwrite() to a non-O_SYNC fd writes to page cache only.
     // A leader crash before sync() (flushDirtyLogs) may lose the tail.
     // TODO(Milestone C): acks=All waits for ISR HWM before acking.
+    // NOTE: the sparse-index entry above is written BEFORE the data.  If the write below fails the
+    // entry points at bytes never written — harmless: the log is then failed (no reads/appends) and
+    // restart recovery rebuilds the index from the valid data.
     off_t writePos = static_cast<off_t>(logSize_);
     if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
         failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSync pwrite");

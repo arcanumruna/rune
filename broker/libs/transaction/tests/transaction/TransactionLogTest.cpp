@@ -931,3 +931,21 @@ TEST(TransactionLogTest, TopicLenOverrunsTotalLengthRejected) {
     EXPECT_EQ(log3.metadata(kTxnId), nullptr)
         << "The corrupt record must not be applied to the metadata map";
 }
+
+// E1 review (fsyncgate): a failed pwrite/fsync of the transaction log must be STICKY.  It threw but left the
+// log usable: a retry after a failed fsync could report success for pages the kernel had already dropped,
+// and the in-memory txn state would then claim a durable transition that is not on disk.
+TEST(TransactionLogRegression, WriteOrFsyncFailureIsStickyFailStop) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    TransactionLog log(path);
+    log.append(makeEntry("txn-1", 42, 0, TxnState::Empty));
+    log.setWriteFaultForTest(EIO);
+    EXPECT_THROW(log.append(makeEntry("txn-1", 42, 0, TxnState::Ongoing)), std::system_error);
+    EXPECT_TRUE(log.storageFailed());
+    EXPECT_EQ(log.metadata("txn-1")->state, TxnState::Empty) << "a failed append never reaches the in-memory state";
+    log.setWriteFaultForTest(0);
+    EXPECT_THROW(log.append(makeEntry("txn-1", 42, 0, TxnState::Ongoing)), std::system_error)
+        << "sticky: no later 'success' once the log failed";
+    EXPECT_EQ(log.metadata("txn-1")->state, TxnState::Empty);
+}

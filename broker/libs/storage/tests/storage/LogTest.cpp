@@ -1498,9 +1498,9 @@ TEST(LogSegmentRegression, ReadViewNoexceptOnMapFailure) {
 // installNextSegment() fallback) must NEVER leave Log without an active
 // segment.  Forced by pre-creating a DIRECTORY at the exact path the next
 // segment's .log would use (EISDIR on open(), independent of uid/perms) —
-// the OLD active segment must remain fully valid and usable, and a retry
-// after removing the obstruction must succeed.
-TEST(LogRegression, FailedRollKeepsOldActiveSegmentAndRetrySucceeds) {
+// the OLD active segment must remain fully valid and readable; the failure is
+// fail-stop (E1 review) — no retry.
+TEST(LogRegression, FailedRollKeepsOldActiveSegmentAndIsFailStop) {
     auto dir = makeTempDir("rune_f3_failed_roll");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
 
@@ -1560,13 +1560,16 @@ TEST(LogRegression, FailedRollKeepsOldActiveSegmentAndRetrySucceeds) {
         EXPECT_EQ(r.baseOffset(), 0);
     }
 
-    // Remove the obstruction and retry: the SAME append must now succeed, and
-    // the roll must actually complete (two segments now).
+    // E1 review (Kafka parity: an IOException on roll takes the log dir offline): a failed roll is
+    // FAIL-STOP.  It used to leave the log healthy and every later append retried the roll (re-pinning
+    // the sealed segment each time) — on a dead disk the partition answered every produce with an
+    // internal error and the broker never halted.  Now the log is failed (sticky) -> worker halt.
+    EXPECT_TRUE(log.storageFailed()) << "a failed roll marks the log failed";
+    EXPECT_NE(log.storageErrno(), 0);
     std::filesystem::remove_all(blockedPath.str());
-    int64_t next = log.append(triggerBatch, off);
-    EXPECT_EQ(next, off + 1);
-    EXPECT_GT(log.segmentBaseOffsets().size(), basesBefore.size())
-        << "the retried append must complete the roll (a new segment now exists)";
+    EXPECT_THROW(log.append(triggerBatch, off), std::system_error)
+        << "sticky: no retry after a storage failure, even once the obstruction is gone";
+    EXPECT_EQ(log.segmentBaseOffsets(), basesBefore);
 
     std::filesystem::remove_all(dir);
 }

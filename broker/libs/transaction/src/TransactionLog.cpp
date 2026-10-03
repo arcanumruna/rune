@@ -254,16 +254,21 @@ void TransactionLog::appendRecord(const TxnLogEntry& entry) {
     pos += kChecksumSize;
     assert(pos == totalLength);
 
+    // fsyncgate (E1 review): the first write/fsync error is STICKY — a later "successful" fsync cannot
+    // vouch for pages the kernel already dropped, so no further append may report success.
+    if (failedErrno_ != 0) {
+        throw std::system_error(failedErrno_, std::system_category(),
+                                "TransactionLog: append refused, storage failed " + path_);
+    }
+    auto fail = [&](int err, const char* what) {
+        failedErrno_ = err != 0 ? err : EIO;
+        throw std::system_error(failedErrno_, std::system_category(), std::string("TransactionLog: ") + what + " " + path_);
+    };
+    if (writeFaultForTest_ != 0) fail(writeFaultForTest_, "pwrite");
     ssize_t written = ::pwrite(fd_, buf.data(), totalLength,
                                 static_cast<off_t>(writePos_));
-    if (written != static_cast<ssize_t>(totalLength)) {
-        throw std::system_error(errno, std::system_category(),
-                                "TransactionLog: pwrite " + path_);
-    }
-    if (::fsync(fd_) != 0) {
-        throw std::system_error(errno, std::system_category(),
-                                "TransactionLog: fsync " + path_);
-    }
+    if (written != static_cast<ssize_t>(totalLength)) fail(written < 0 ? errno : ENOSPC, "pwrite");
+    if (::fsync(fd_) != 0) fail(errno, "fsync");
     writePos_ += static_cast<int64_t>(totalLength);
 }
 

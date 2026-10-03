@@ -171,7 +171,18 @@ void Log::maybeRoll() {
         // is deferred to the bg thread) when ready; otherwise falls back to a
         // synchronous create.  The seal fsync above is unchanged and fully
         // synchronous (durability preserved).
-        installNextSegment(base);
+        // E1 review (Kafka: an IOException on roll takes the log dir offline): a failed next-segment
+        // create (open / ftruncate / mmap on a dead or full disk) is FAIL-STOP — never a silent retry
+        // loop that re-pins the sealed segment and answers every produce with an internal error.
+        try {
+            installNextSegment(base);
+        } catch (const std::system_error& e) {
+            markStorageFailed(e.code().value());
+            throw;
+        } catch (...) {
+            markStorageFailed(EIO);
+            throw;
+        }
         // #5 non-blocking append: preallocate the freshly-installed active segment's
         // blocks (negligible vs the seal fsync above) so its hot-path appends don't
         // stall on block allocation.

@@ -102,6 +102,10 @@ public:
     // Also updates the in-memory txnMap.
     // -----------------------------------------------------------------------
     void append(const TxnLogEntry& entry);
+    /// fsyncgate fail-stop: true once any write/fsync of this log failed (sticky; appends then throw).
+    [[nodiscard]] bool storageFailed() const noexcept { return failedErrno_ != 0; }
+    /// Test hook: while non-zero every record write fails with this errno.
+    void setWriteFaultForTest(int err) noexcept { writeFaultForTest_ = err; }
 
     // -----------------------------------------------------------------------
     // Convenience: build and append a TxnLogEntry from TransactionMetadata.
@@ -154,6 +158,8 @@ private:
     std::string path_;
     int         fd_{-1};
     int64_t     writePos_{0};
+    int         failedErrno_{0};
+    int         writeFaultForTest_{0};
 
     /// Rebuilt map from replay; mirrors coordinator's txnMap_.
     std::unordered_map<TransactionalId, TransactionMetadata> txnMap_;
