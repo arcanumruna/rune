@@ -109,6 +109,16 @@ public:
     /// On an already-failed log it throws without touching the disk.
     void sync();
 
+    /// E2 crash-simulation seam (DR tests): the .log byte length that the LAST
+    /// successful inline sync() made durable in this incarnation (-1 = never
+    /// synced since open).  A truncation below it lowers it.  Pure bookkeeping —
+    /// one store on the (already syscall-bound) sync path; nothing reads it in
+    /// production.  Async (io-backend) flushes are not tracked.
+    [[nodiscard]] int64_t syncedBytesForTest() const noexcept { return syncedBytes_; }
+    /// A segment object REBUILT over the same file (Log::truncateTo) keeps the
+    /// synced extent of the prefix it took over.
+    void inheritSyncedBytesForTest(int64_t b) noexcept { syncedBytes_ = b; }
+
     /// Wire the owning Log's storage state (set by Log when it installs the segment).
     void setStorageState(LogStorageState* s) noexcept { storage_ = s; }
 
@@ -262,6 +272,7 @@ private:
     std::unique_ptr<OffsetIndex> index_;
     uint64_t installGen_ = 0;
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
+    int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
 

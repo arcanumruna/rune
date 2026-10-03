@@ -183,6 +183,7 @@ void LogSegment::sync() {
         if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = err;
         throw std::system_error(err, std::generic_category(), "LogSegment::sync " + logPath_);
     }
+    syncedBytes_ = logSize_;
 }
 
 void LogSegment::preallocate(int64_t bytes) noexcept {
@@ -554,6 +555,7 @@ int64_t LogSegment::recover() {
     log_.close();
     log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary);
     logSize_ = validBytes; nextOffset_ = next;
+    if (syncedBytes_ > validBytes) syncedBytes_ = validBytes;   // E2 crash seam
 
     // B3: msync the rebuilt index then atomically rename .index.tmp → .index,
     // then fsync the directory so the renamed entry survives power loss.
