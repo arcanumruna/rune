@@ -264,13 +264,14 @@ public:
                                   int32_t egressStreamId,
                                   const std::string& egressChannel,
                                   int64_t correlationId,
-                                  uint8_t* scratch)
+                                  uint8_t* scratch,
+                                  int32_t clientVersion = 1)
     {
         pc::ConnectRequest req;
         req.sessionId      = 0;
         req.correlationId  = correlationId;
         req.egressStreamId = egressStreamId;
-        req.clientVersion  = 1;
+        req.clientVersion  = clientVersion;
         req.egressChannel  = egressChannel;
         const std::size_t reqLen = req.encode(scratch);
 
@@ -1096,6 +1097,43 @@ TEST_F(GatewayProduceFixture, MC6_FsyncFailureLogStaysDirty)
 
     // Confirm the dirtyLogs_ clear-on-success semantics via a direct Log sync.
     EXPECT_NO_THROW(log->sync()) << "MC6: sync on a clean (just-fsynced) log must succeed";
+}
+
+// ===========================================================================
+// D6: UnknownProducerId is version-gated on ConnectRequest.clientVersion, over
+// a real Aeron Connect.  An idempotent producer the broker does not know sends
+// seq 5: a clientVersion-2 session is answered UnknownProducerId with the
+// partition's logStartOffset; a clientVersion-1 session OutOfOrderSequence (as
+// before D6).  Neither batch is appended.
+// ===========================================================================
+TEST_F(GatewayProduceFixture, UnknownProducerIdIsGatedOnTheConnectClientVersionRegression)
+{
+    auto produceUnknown = [&](int32_t clientVersion, int32_t egress, int64_t corr) {
+        auto client = makeClient(egress);
+        auto conn = doConnect(*client.ingressPub, *client.egressSub, client.egressStreamId,
+                              client.egressChannel, corr, scratch_, clientVersion);
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.setProducerId(77); b.setProducerEpoch(0); b.setBaseSequence(5);
+        b.append("k", "v", 1000);
+        const auto batch = b.build();
+        pc::Produce prod;
+        prod.sessionId = conn.assignedSessionId; prod.correlationId = corr + 1;
+        prod.topicId = kTopicIdB; prod.partition = 0; prod.partitionKnown = 1;
+        prod.producerId = 77; prod.producerEpoch = 0; prod.baseSequence = 5;
+        prod.recordBatch = std::span<const uint8_t>(batch);
+        const std::size_t n = prod.encode(largeScratch_);
+        offerBounded(*client.ingressPub, largeScratch_, n, "Produce(unknown pid)");
+        return recvProduceResponse(*client.egressSub, "ProduceResponse(unknown pid)");
+    };
+    const auto v2 = produceUnknown(pc::kClientVersion, kEgressBase + 41, 400);
+    ASSERT_TRUE(v2.has_value());
+    EXPECT_EQ(v2->errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId));
+    EXPECT_EQ(v2->logStartOffset, 0);
+    const auto v1 = produceUnknown(1, kEgressBase + 42, 500);
+    ASSERT_TRUE(v1.has_value());
+    EXPECT_EQ(v1->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence))
+        << "an old client must never see UnknownProducerId";
+    EXPECT_EQ(registry_->log(kTopicIdB, 0)->logEndOffset(), 0) << "nothing was appended";
 }
 
 } // namespace

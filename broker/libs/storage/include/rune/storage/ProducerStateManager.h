@@ -28,6 +28,13 @@
 //   OutOfOrderSequence— forward gap, or a batch partially overlapping
 //                       lastSequence (base <= lastSequence < end).
 //   InvalidProducerEpoch — producerEpoch < tracked epoch (zombie fenced).
+//   UnknownProducerId — D6 (Kafka UNKNOWN_PRODUCER_ID): no entry for (topic,
+//                       pid, partition) and baseSequence != 0.  The state does
+//                       not know this producer (retention / compaction /
+//                       memory-ring eviction removed all its batches before a
+//                       rebuild) — NOT appended.  Answered only from a PROVEN
+//                       state (the callers' gates); the client tells retention
+//                       from loss with the partition's logStartOffset.
 //
 // Epoch semantics (mirror Kafka):
 //   epoch == tracked   → validate sequence normally.
@@ -141,6 +148,7 @@ struct ValidationResult {
         Duplicate,
         OutOfOrderSequence,
         InvalidProducerEpoch,
+        UnknownProducerId,     ///< D6: no entry + baseSequence != 0 (NOT appended)
     };
 
     Status  status{Status::Accept};
@@ -155,11 +163,13 @@ struct ValidationResult {
     }
     static ValidationResult oos()     { return {Status::OutOfOrderSequence,  -1, -1}; }
     static ValidationResult fenced()  { return {Status::InvalidProducerEpoch, -1, -1}; }
+    static ValidationResult unknownProducer() { return {Status::UnknownProducerId, -1, -1}; }
 
     bool isAccept()   const { return status == Status::Accept; }
     bool isDuplicate() const { return status == Status::Duplicate; }
     bool isOos()      const { return status == Status::OutOfOrderSequence; }
     bool isFenced()   const { return status == Status::InvalidProducerEpoch; }
+    bool isUnknownProducerId() const { return status == Status::UnknownProducerId; }
 };
 
 // ---------------------------------------------------------------------------

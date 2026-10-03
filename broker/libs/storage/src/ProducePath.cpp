@@ -232,6 +232,17 @@ ProduceOutcome handleProduceBatch(
             out.error = pc::ErrorCode::OutOfOrderSequence;
             return out;
         }
+        if (vr.isUnknownProducerId()) {
+            // D6: the (proven) state has no entry for this producer and the
+            // batch does not start at sequence 0 — NOT appended.  The log start
+            // lets the client tell retention (re-sequence) from loss.
+            spdlog::debug("ProducePath: UnknownProducerId "
+                          "(pid={} epoch={} baseSeq={} partition={} logStart={})",
+                          producerId, producerEpoch, baseSequence, partition, log.logStartOffset());
+            out.error          = pc::ErrorCode::UnknownProducerId;
+            out.logStartOffset = log.logStartOffset();
+            return out;
+        }
         if (vr.isFenced()) {
             spdlog::debug("ProducePath: InvalidProducerEpoch "
                           "(pid={} epoch={} partition={})",

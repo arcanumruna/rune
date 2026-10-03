@@ -4550,6 +4550,7 @@ std::vector<uint8_t> seqBatch(int64_t pid, int16_t epoch, int32_t seq, int64_t b
 struct Answer {
     int16_t err  = -1;
     int64_t base = -1;
+    int64_t lso  = -1;   // D6: ProduceResponse.logStartOffset
 };
 // The no-worker-pool INLINE path: a real ClientGateway appends to the log of a
 // control-owned replica (the gateway thread is its owner) — or, without a
@@ -4569,7 +4570,8 @@ struct InlineRig {
     }
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
         [this](const uint8_t* b, std::size_t n) -> int64_t {
-            if (auto pr = pc::ProduceResponse::decode(b, n)) answers.push_back(Answer{pr->errorCode, pr->baseOffset});
+            if (auto pr = pc::ProduceResponse::decode(b, n))
+                answers.push_back(Answer{pr->errorCode, pr->baseOffset, pr->logStartOffset});
             return 1;
         });
     int64_t sid  = 0;
@@ -5375,4 +5377,135 @@ TEST(CleanerLsoRegression, RcRebuildMapsSealedSegmentThroughItsOwnInode) {
     ASSERT_EQ(w.rcStatusForTest(0, 0), 2) << "the rebuild finished";
     EXPECT_EQ(w.rcOpenTxnsForTest(0, 0), 0u)
         << "the aborted txn was left OPEN: the rebuild mapped the rewritten segment (marker @" << markerOff << " gone)";
+}
+
+// ============================================================================
+// D6 — UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID).  After retention removed
+// every batch of producer P, a REBUILT producer state (failover / restart /
+// re-promotion) has no entry for P: P's next batch (seq k > 0) is NOT appended
+// and is answered UnknownProducerId with the partition's logStartOffset — to a
+// client that announced clientVersion >= 2; an older client keeps getting
+// OutOfOrderSequence.  Only on a PROVEN state (unproven: NotLeader / Internal,
+// as before).  Known producers: gap -> OOS, epochs unchanged.
+// ============================================================================
+namespace {
+constexpr int16_t kUnknownPid = static_cast<int16_t>(pc::ErrorCode::UnknownProducerId);
+constexpr int16_t kOosD6      = static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence);
+} // namespace
+
+TEST(UnknownProducerIdRegression, InlineFailoverAfterRetentionAnswersUnknownProducerIdRegression) {
+    InlineRig R(Role::Follower, {1}, /*withReplica=*/true, /*roll=*/256);
+    preload(R.log(), /*P*/ 7, 0, 0, 5);
+    preload(R.log(), /*Q*/ 8, 2, 0, 11);
+    ASSERT_GT(R.log().deleteOldSegments(0), 0);
+    const int64_t logStart = R.log().logStartOffset();
+    ASSERT_GE(logStart, 6) << "precondition: retention removed every batch of P";
+    R.r->becomeLeader(2, {1});                               // failover: this node takes over
+    (void)R.r->doWork(++R.now);
+    ASSERT_TRUE(R.r->isLeaderComplete());
+    R.gw.onNodeLeadershipGainedForTest();
+    const int64_t leo = R.log().logEndOffset();
+
+    const Answer a = R.produce(7, 0, 6);
+    EXPECT_EQ(a.err, kUnknownPid) << "P's next batch after the rebuild";
+    EXPECT_EQ(a.lso, logStart);
+    EXPECT_EQ(R.log().logEndOffset(), leo) << "an UnknownProducerId batch was appended";
+
+    // An OLD client (clientVersion 1) gets OutOfOrderSequence, as before D6.
+    const int64_t oldSid = R.gw.injectTestSession(0, /*clientVersion=*/1);
+    const auto f = produceFrame(oldSid, ++R.corr, seqBatch(7, 0, 6), 0, 0, 0, 7, 0, 6);
+    R.gw.applyProduceForTest(f.data(), f.size());
+    ASSERT_FALSE(R.answers.empty());
+    EXPECT_EQ(R.answers.back().err, kOosD6) << "an old client must never see UnknownProducerId";
+    EXPECT_EQ(R.log().logEndOffset(), leo);
+
+    // The client's U1 re-sequence (new epoch from seq 0) is accepted.
+    const Answer u = R.produce(7, 1, 0);
+    EXPECT_EQ(u.err, 0);
+    EXPECT_EQ(u.base, leo);
+    EXPECT_EQ(u.lso, -1);
+    EXPECT_EQ(R.produce(7, 1, 1).base, leo + 1);
+    // Known producer Q: gap -> OOS, lower epoch -> fenced, in order -> OK.
+    EXPECT_EQ(R.produce(8, 2, 20).err, kOosD6);
+    EXPECT_EQ(R.produce(8, 1, 12).err, kInvalidProducerEpoch);
+    EXPECT_EQ(R.produce(8, 2, 12).err, 0);
+}
+
+TEST(UnknownProducerIdRegression, InlineUnprovenStateNeverAnswersUnknownProducerIdRegression) {
+    // An incomplete leader cannot vouch: retriable NotLeader, never 28.
+    InlineRig R(Role::Follower, {1, 2}, true, 256);
+    preload(R.log(), 7, 0, 0, 5);
+    preload(R.log(), 8, 2, 0, 11);
+    ASSERT_GT(R.log().deleteOldSegments(0), 0);
+    R.r->becomeLeader(2, {1, 2});
+    ASSERT_FALSE(R.r->isLeaderComplete()) << "precondition: follower 2 has not reported in";
+    EXPECT_EQ(R.produce(7, 0, 6).err, kNotLeader);
+}
+
+TEST(UnknownProducerIdRegression, WorkerRebuildAfterRetentionAnswersUnknownProducerIdWithLogStartRegression) {
+    // The worker path (gateway-routed op): the owning worker's RC-built state
+    // after retention answers 28 with the log start (carried in baseOffset of
+    // the ProduceResult — the carrier does not grow); the gateway relays it
+    // version-gated per session.
+    TmpDir d;
+    Log log(d.path.string(), /*segmentRollBytes=*/256);
+    log.recover();
+    preload(log, 7, 0, 0, 5);
+    preload(log, 8, 2, 0, 11);
+    ASSERT_GT(log.deleteOldSegments(0), 0);
+    const int64_t logStart = log.logStartOffset();
+    ASSERT_GE(logStart, 6);
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 16, 16);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    for (int i = 0; i < 4096 && w.rcStatusForTest(1, 0) != Worker::kRcReady; ++i) {
+        w.doWork(1 + i);
+        (void)drainAll(w);
+    }
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady);
+    const int64_t leo = log.logEndOffset();
+    auto op = [&](int64_t pid, int16_t epoch, int32_t seq, int64_t corr) {
+        WorkerOp o;
+        o.type = WorkerOp::Type::Produce; o.topicId = 1; o.partition = 0; o.replica = &rep;
+        o.logPtr = &log; o.sessionId = 1; o.correlationId = corr; o.recordCount = 1;
+        o.producerId = pid; o.producerEpoch = epoch; o.baseSequence = seq;
+        o.recordBatchBytes = seqBatch(pid, epoch, seq);
+        return stamp(std::move(o));
+    };
+    auto run = [&](int64_t pid, int16_t epoch, int32_t seq, int64_t corr) {
+        EXPECT_TRUE(w.tryEnqueueOp(op(pid, epoch, seq, corr)));
+        w.doWork(10'000 + corr);
+        auto rets = drainAll(w);
+        EXPECT_EQ(rets.size(), 1u) << "seq " << seq;
+        return rets.empty() ? WorkerReturn{} : rets[0];
+    };
+    const WorkerReturn unknown = run(7, 0, 6, 1);
+    EXPECT_EQ(unknown.errorCode, kUnknownPid);
+    EXPECT_EQ(unknown.baseOffset, logStart) << "the ProduceResult carries the log start in baseOffset";
+    EXPECT_EQ(log.logEndOffset(), leo);
+    EXPECT_EQ(run(8, 2, 20, 2).errorCode, kOosD6) << "known entry + gap";
+    EXPECT_EQ(run(8, 1, 12, 3).errorCode, kInvalidProducerEpoch);
+    const WorkerReturn ok = run(7, 1, 0, 4);
+    EXPECT_EQ(ok.errorCode, 0);
+    EXPECT_EQ(ok.baseOffset, leo);
+
+    // Gateway relay: version-gated per session, log start on the wire.
+    std::vector<Answer> answers;
+    auto gw = rune::gateway::ClientGateway::makeForTest([&](const uint8_t* b, std::size_t n) -> int64_t {
+        if (auto pr = pc::ProduceResponse::decode(b, n))
+            answers.push_back(Answer{pr->errorCode, pr->baseOffset, pr->logStartOffset});
+        return 1;
+    });
+    const int64_t newSid = gw.injectTestSession(0, pc::kClientVersion);
+    const int64_t oldSid = gw.injectTestSession(0, 1);
+    WorkerReturn r1 = unknown; r1.sessionId = newSid;
+    WorkerReturn r2 = unknown; r2.sessionId = oldSid;
+    gw.handleWorkerReturnForTest(r1);
+    gw.handleWorkerReturnForTest(r2);
+    ASSERT_EQ(answers.size(), 2u);
+    EXPECT_EQ(answers[0].err, kUnknownPid);
+    EXPECT_EQ(answers[0].lso, logStart);
+    EXPECT_EQ(answers[0].base, 0);
+    EXPECT_EQ(answers[1].err, kOosD6) << "an old client must never see UnknownProducerId";
 }

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -378,4 +379,68 @@ TEST(SessionAckSinkRegression, RegistrationThatResolvedToErrorIsNeverDrained) {
     s.close(7);
     for (int i = 0; i < 3; ++i) pass(s);
     EXPECT_EQ(s.drainingRegistrations(), 0u);
+}
+
+// ===========================================================================
+// D6 — UnknownProducerId is version-gated per session: the announcement carries
+// the session's ConnectRequest.clientVersion; a client that understands 28
+// gets it with the logStartOffset, an older one gets OutOfOrderSequence.
+// ===========================================================================
+namespace {
+AckEntry unknownPid(int64_t sid, int64_t corr, int64_t logStart) {
+    AckEntry a{sid, corr, 0, 3, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId)};
+    a.logStartOffset = logStart;
+    return a;
+}
+std::optional<pc::ProduceResponse> sentTo(const FakePolicy::State& st, int64_t sid) {
+    for (const auto& [pub, f] : st.sent)
+        if (auto r = pc::ProduceResponse::decode(f.data(), f.size()); r && r->sessionId == sid) return r;
+    return std::nullopt;
+}
+} // namespace
+
+TEST(SessionAckSinkUnknownProducerIdRegression, AnsweredOnlyToClientsThatUnderstandItRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, /*clientVersion=*/pc::kClientVersion));
+    ASSERT_TRUE(s.announce(8, "c8", 1, /*clientVersion=*/1));
+    pass(s); pass(s);
+    s.enqueue(unknownPid(7, 70, 500));
+    s.enqueue(unknownPid(8, 80, 500));
+    pass(s);
+    auto r7 = sentTo(*st, 7), r8 = sentTo(*st, 8);
+    ASSERT_TRUE(r7 && r8);
+    EXPECT_EQ(r7->errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId));
+    EXPECT_EQ(r7->logStartOffset, 500);
+    EXPECT_EQ(r8->errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence))
+        << "an old client must never see UnknownProducerId";
+    EXPECT_EQ(r7->partition, 3);
+}
+
+TEST(SessionAckSinkUnknownProducerIdRegression, OkAndOtherErrorsCarryNoLogStartRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7);
+    s.enqueue(AckEntry{7, 1, 42, 0, 0});
+    pass(s);
+    auto r = sentTo(*st, 7);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->baseOffset, 42);
+    EXPECT_EQ(r->logStartOffset, -1);
+}
+
+TEST(SessionAckSinkUnknownProducerIdRegression, ClientVersionSurvivesBackwardShiftDeletionRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    constexpr int64_t kN = 600;
+    auto version = [](int64_t sid) { return (sid % 3 == 0) ? int32_t{1} : pc::kClientVersion; };
+    for (int64_t sid = 1; sid <= kN; ++sid) ASSERT_TRUE(s.announce(sid, "c", 1, version(sid)));
+    for (int i = 0; i < 18; ++i) pass(s);
+    for (int64_t sid = 1; sid <= kN; sid += 2) s.close(sid);
+    for (int64_t sid = 2; sid <= kN; sid += 2) s.enqueue(unknownPid(sid, sid, 9));
+    pass(s);
+    for (int64_t sid = 2; sid <= kN; sid += 2) {
+        auto r = sentTo(*st, sid);
+        ASSERT_TRUE(r) << sid;
+        const auto want = version(sid) >= pc::kClientVersionUnknownProducerId ? pc::ErrorCode::UnknownProducerId
+                                                                              : pc::ErrorCode::OutOfOrderSequence;
+        EXPECT_EQ(r->errorCode, static_cast<int16_t>(want)) << sid;
+    }
 }

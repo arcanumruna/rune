@@ -576,6 +576,7 @@ public:
     void releaseShardClient() noexcept { ackSink_.reset(); }
     [[nodiscard]] bool workerSideAcks() const noexcept { return ackSink_ != nullptr; }
     [[nodiscard]] uint64_t sessionAnnouncesSeenForTest() const noexcept { return sessionAnnouncesSeen_; }
+    [[nodiscard]] int32_t  lastAnnouncedClientVersionForTest() const noexcept { return lastAnnouncedClientVersion_; }
     [[nodiscard]] uint64_t sessionClosesSeenForTest() const noexcept { return sessionClosesSeen_; }
     /// Acks dropped by the sink (closed / failed / stalled sessions).
     [[nodiscard]] uint64_t sessionAcksDroppedForTest() const noexcept { return ackSink_ ? ackSink_->droppedForTest() : 0; }
@@ -947,6 +948,7 @@ public:
            .targetReplicaId(op.targetReplicaId)
            .incarnation(op.incarnation)
            .minIsr(op.minIsr)
+           .clientVersion(op.clientVersion)   // D6: SessionAnnounce
            // F27 R1: a FetchRequest op carries the follower's connection
            // generation in ownershipGen (SetOwnership is the field's only other user).
            .ownershipGen(op.type == WorkerOp::Type::FetchRequest
@@ -1460,8 +1462,12 @@ private:
     // -----------------------------------------------------------------------
     void emitProduceAck_(const WorkerReturn& ret) {
         const bool ok = ret.errorCode == 0;
-        if (!ackSink_->enqueue(AckEntry{ret.sessionId, ret.correlationId, ok ? ret.baseOffset : 0,
-                                        ret.partition, ret.errorCode})) [[unlikely]]
+        AckEntry a{ret.sessionId, ret.correlationId, ok ? ret.baseOffset : 0, ret.partition, ret.errorCode};
+        // D6: an UnknownProducerId result carries the log start in baseOffset
+        // (the carrier does not grow); the sink gates it per session version.
+        if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
+            a.logStartOffset = ret.baseOffset;
+        if (!ackSink_->enqueue(a)) [[unlikely]]
             haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
         WorkerReturn n = ret;
         n.deferAck   = true;          // a liveness notification — never an answer
@@ -1971,6 +1977,8 @@ private:
         ++sessionAnnouncesSeen_;
         const int64_t sid       = op.sessionId();
         const int32_t stream    = op.egressStreamId();
+        const int32_t version   = op.clientVersion();   // D6: gates UnknownProducerId acks
+        lastAnnouncedClientVersion_ = version;
         const std::uint32_t len = op.tailLength();
         const char* p           = op.tail();
         if (!ackSink_) return;
@@ -1979,7 +1987,7 @@ private:
         // closes not yet queued everywhere) against kMaxSessions − 1, and
         // refuses longer channels at Connect.  A refusal would leave an
         // accepted session that is never acked: halt, never a silent drop.
-        if (!ackSink_->announce(sid, std::string_view(p, len), stream)) [[unlikely]] {
+        if (!ackSink_->announce(sid, std::string_view(p, len), stream, version)) [[unlikely]] {
             spdlog::critical("Worker {}: session {} announcement refused (sessions {}, channel {} B, max {})",
                              workerId_, sid, ackSink_->sessionCount(), len, SessionAckSink::kMaxChannelBytes);
             haltInvariant_("session announcement refused", "Task 13 I2: runtime session cap violated", 0);
@@ -3364,6 +3372,7 @@ private:
                           static_cast<std::size_t>(kMaxFragmentLimit),
                   "Task 13 G-A6: an idle ack queue must admit a full op drain and poll at the owed ceiling");
     uint64_t sessionAnnouncesSeen_ = 0;
+    int32_t  lastAnnouncedClientVersion_ = -1;   ///< D6 test probe (the last SessionAnnounce's)
     uint64_t sessionClosesSeen_    = 0;
     uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs)
     uint64_t ackRoomOpPauses_      = 0;   // fix round 1: op drains skipped, ack queue full
@@ -5178,6 +5187,10 @@ private:
         if (!outcome.isOK()) {
             ret.errorCode = static_cast<int16_t>(
                 static_cast<int>(outcome.error));
+            // D6: UnknownProducerId — the ProduceResult carries the partition's
+            // log start in baseOffset (the WorkerReturn carrier does not grow,
+            // F15 §7); every answer site maps it onto ProduceResponse.logStartOffset.
+            if (outcome.error == pc::ErrorCode::UnknownProducerId) ret.baseOffset = outcome.logStartOffset;
             enqueueReturn_(ret);
             return 1;
         }

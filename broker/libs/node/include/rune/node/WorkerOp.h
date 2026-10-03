@@ -172,6 +172,9 @@ struct WorkerOp {
     // (copied once into the ring slot as the tail, TailKind = EGRESS_CHANNEL).
     int32_t          egressStreamId = 0;
     std::string_view egressChannel;
+    // D6: SessionAnnounce — the session's ConnectRequest.clientVersion (a
+    // worker acking directly gates UnknownProducerId on it).
+    int32_t          clientVersion = 0;
 
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
     // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.

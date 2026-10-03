@@ -41,6 +41,10 @@ struct Session {
     // set = worker w holds acks for this session (SessionSignal Held/Released).
     // Non-zero → the gateway ABORTs this session's Produce frames.
     uint64_t                                       heldByWorkers = 0;
+    // D6: ConnectRequest.clientVersion — gates behaviour the client must
+    // understand (UnknownProducerId is answered OutOfOrderSequence below
+    // protocol::client::kClientVersionUnknownProducerId).  0 = unknown (oldest).
+    int32_t                                        clientVersion = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -69,13 +73,15 @@ public:
                  std::shared_ptr<aeron::ExclusivePublication> egress,
                  int64_t                                      nowNs,
                  std::string                                  egressChannel = {},
-                 int32_t                                      egressStreamId = 0) {
+                 int32_t                                      egressStreamId = 0,
+                 int32_t                                      clientVersion = 0) {
         Session s;
         s.sessionId      = sessionId;
         s.egress         = std::move(egress);
         s.lastSeenNs     = nowNs;
         s.egressChannel  = std::move(egressChannel);
         s.egressStreamId = egressStreamId;
+        s.clientVersion  = clientVersion;
         auto [it, _] = sessions_.emplace(sessionId, std::move(s));
         return it->second;
     }

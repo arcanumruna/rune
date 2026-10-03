@@ -72,6 +72,9 @@ struct AckEntry {
     /// Unknown-session hold (I1): the lifecycle-ring producer position sampled
     /// at the first flush that saw this ack with no session; -1 = not held.
     int64_t sessionPos    = -1;
+    /// D6: with errorCode == UnknownProducerId, the partition's log start
+    /// (ProduceResponse.logStartOffset); -1 = not carried.
+    int64_t logStartOffset = -1;
 };
 
 enum class PubFind : uint8_t { Pending, Ready, Error };
@@ -108,11 +111,15 @@ public:
     /// table full, channel too long) — unreachable by construction: the runtime
     /// caps sessions at kMaxSessions − 1 and refuses longer channels at Connect
     /// (the worker treats a refusal as an invariant violation).
-    bool announce(int64_t sessionId, std::string_view channel, int32_t streamId) noexcept {
+    /// D6: `clientVersion` (ConnectRequest.clientVersion) gates the
+    /// UnknownProducerId answer for this session (OOS below version 2).
+    bool announce(int64_t sessionId, std::string_view channel, int32_t streamId,
+                  int32_t clientVersion = rune::protocol::client::kClientVersion) noexcept {
         if (sessionId <= 0 || channel.size() > kMaxChannelBytes) return false;
         std::size_t idx = find_(sessionId);
         if (idx == kNone) idx = insert_(sessionId);
         if (idx == kNone) return false;                                   // table full
+        clientVersion_[idx] = clientVersion;
         PubState& st = states_[idx];
         // m3: an Announced / Resolving session is already in unresolved_.
         const bool listed = std::holds_alternative<PubAnnounced>(st) || std::holds_alternative<PubResolving>(st);
@@ -177,7 +184,8 @@ public:
             PubState& st = states_[idx];
             if (auto* r = std::get_if<PubReady>(&st)) [[likely]] {
                 if (r->blockedPass != pass_) {                      // per-session order kept
-                    const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, dst); });
+                    const int32_t ver = clientVersion_[idx];
+                    const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, ver, dst); });
                     if (pos > 0) [[likely]] {
                         ++work;
                         continue;
@@ -304,7 +312,7 @@ private:
         while (keys_[i] != 0) i = (i + 1) & kMask;
         keys_[i] = sid;
         states_[i] = PubFailed{};                                    // neutral (reported) placeholder
-        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0;
+        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0; clientVersion_[i] = 0;
         ++count_;
         return i;
     }
@@ -312,7 +320,7 @@ private:
         leaveState_(states_[i]);
         keys_[i] = 0;
         states_[i] = PubFailed{};                                    // releases a Ready publication
-        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0;
+        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0; clientVersion_[i] = 0;
         --count_;
         std::size_t j = i;
         for (;;) {
@@ -326,9 +334,10 @@ private:
             heldPass_[i] = heldPass_[j];
             reportedHeld_[i] = reportedHeld_[j];
             dirtyFlag_[i] = dirtyFlag_[j];
+            clientVersion_[i] = clientVersion_[j];
             keys_[j] = 0;
             states_[j] = PubFailed{};
-            heldPass_[j] = 0; reportedHeld_[j] = 0; dirtyFlag_[j] = 0;
+            heldPass_[j] = 0; reportedHeld_[j] = 0; dirtyFlag_[j] = 0; clientVersion_[j] = 0;
             i = j;
         }
     }
@@ -432,13 +441,20 @@ private:
         unresolvedCount_ = keep;
         return work;
     }
-    static void encode_(const AckEntry& a, uint8_t* dst) noexcept {
+    static void encode_(const AckEntry& a, int32_t clientVersion, uint8_t* dst) noexcept {
+        namespace pc = rune::protocol::client;
         rune::protocol::client::ProduceResponse r;
-        r.sessionId     = a.sessionId;
-        r.correlationId = a.correlationId;
-        r.errorCode     = a.errorCode;
-        r.partition     = a.partition;
-        r.baseOffset    = a.baseOffset;
+        r.sessionId      = a.sessionId;
+        r.correlationId  = a.correlationId;
+        // D6: UnknownProducerId only to clients that understand it (else OOS —
+        // the pre-D6 answer); every other code passes through.
+        r.errorCode      = (a.errorCode == static_cast<int16_t>(pc::ErrorCode::UnknownProducerId) &&
+                            !pc::clientUnderstandsUnknownProducerId(clientVersion))
+                               ? static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence)
+                               : a.errorCode;
+        r.partition      = a.partition;
+        r.baseOffset     = a.baseOffset;
+        r.logStartOffset = a.logStartOffset;
         r.encode(dst);
     }
 
@@ -448,6 +464,7 @@ private:
     std::array<uint64_t, kMaxSessions>                               heldPass_{};  // pass that last held acks
     std::array<uint8_t, kMaxSessions>                                reportedHeld_{};  // what the runtime knows
     std::array<uint8_t, kMaxSessions>                                dirtyFlag_{};     // in dirty_
+    std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
     std::array<int64_t, kMaxSessions>                                dirty_{};         // held state to report
     std::size_t                                                      dirtyCount_ = 0;
     std::array<int64_t, kMaxSessions>                                heldNow_{};       // held this flush
