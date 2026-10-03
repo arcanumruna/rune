@@ -273,6 +273,19 @@ Thread placement: 7.6x worse latency and -54% throughput -> the runtime thread (
 sleep-ns driver) is still on the produce->ack path in thread placement; "runtime off the data path" does not hold.
 Both QD changes reverted.  New reference: saturation 200.5k rec/s with BACKOFF workers (MTU 65504, loopback).
 
+### 4.8 REFERENCE CONFIG from here on: MTU 1408 + UDP GSO/GRO, backoff workers (2026-10-03)
+
+65504 / loopback numbers are labelled comparisons only (user rule).  QD GSO build (broker RUNE_QD_GSO=1 + /root/qd
+client), GSO/GRO proven active (19 "rune-gso: UDP G..." log lines across brokers, client install OK), fsync off,
+term 1 MiB / ctl 1 MiB, 3-node acks=all 1 KiB, one run each:
+
+| | p50 | p99 | rec/s |
+|---|---|---|---|
+| 20k open loop | **664 us** | 31.5 ms | 20,000 |
+| saturation (1.5M records) | 22 ms (queueing) | 166 ms | **186,546** |
+
+(Same build at MTU 65504: 448 us / 200,506 rec/s.)  All 0 errors.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
