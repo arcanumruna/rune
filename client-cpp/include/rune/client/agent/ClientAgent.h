@@ -526,7 +526,15 @@ public:
     bool offerToPartition(int32_t topicId, int32_t partition, int32_t ingressStreamId,
                           const uint8_t* buf, std::size_t len) noexcept {
         if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
-        return offerProduceToLeader_(topicId, partition, ingressStreamId, buf, len);
+        return offerProduceToLeader_(topicId, partition, ingressStreamId, buf, len, {});
+    }
+    /// Backlog B1: a freshly encoded frame whose RecordBatch CRC is still unset —
+    /// the transport seals it (into the term AND `buf`) only once Aeron accepted
+    /// it (AeronTransport::offer).  AGENT-THREAD ONLY.
+    bool offerToPartition(int32_t topicId, int32_t partition, int32_t ingressStreamId,
+                          uint8_t* buf, std::size_t len, transport::FrameCrc crc) noexcept {
+        if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
+        return offerProduceToLeader_(topicId, partition, ingressStreamId, buf, len, crc);
     }
 
     /// Task 1.4 (redirect convergence): hook fired on the agent thread whenever a
@@ -797,7 +805,8 @@ private:
     // Connected, else re-stamp the leader sessionId (header offset 8) and offerOn.
     // Single-writer (agent thread).  Definition mirrors the produce drain send-lambda.
     bool offerProduceToLeader_(int32_t topicId, int32_t partition, int32_t ingressStreamId,
-                               const uint8_t* buf, std::size_t len) noexcept;
+                               const uint8_t* buf, std::size_t len,
+                               transport::FrameCrc crc) noexcept;
 
     // ---- Ring buffer (MPSC: many app threads write, one agent thread reads) -
     // Buffer size = power-of-two capacity + trailer.

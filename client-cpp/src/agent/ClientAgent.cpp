@@ -342,7 +342,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
                 // (topicId, partition).  Shared with the redirect resend path — see
                 // offerProduceToLeader_.
                 return offerProduceToLeader_(topicId, partition, ingressStreamId,
-                                             buf, len);
+                                             buf, len, {});
             });
         totalWork += producerWork;
     }
@@ -1040,7 +1040,8 @@ std::string ClientAgent::dataChannelFor(int32_t topicId, int32_t partition) cons
 
 bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                                         int32_t ingressStreamId,
-                                        const uint8_t* buf, std::size_t len) noexcept {
+                                        const uint8_t* buf, std::size_t len,
+                                        transport::FrameCrc crc) noexcept {
     // Single-node / no routes: one size check, then the default offer.
     if (routeIndex_.size() != 0) {
         const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
@@ -1065,10 +1066,10 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
             if (len >= 16) {
                 ::rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, sid);
             }
-            return transport_.offerOn(r.pub, buf, len);
+            return transport_.offerOn(r.pub, buf, len, crc);
         }
     }
-    return transport_.offer(ingressStreamId, buf, len);
+    return transport_.offer(ingressStreamId, buf, len, crc);
 }
 
 } // namespace rune::client::agent

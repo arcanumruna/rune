@@ -94,6 +94,8 @@ int AeronTransport::dutyCycle() noexcept {
 AeronTransport::AeronTransport(TransportConfig cfg)
     : cfg_(std::move(cfg))
     , maxMessageLength_(computeMaxMessageLength(cfg_))
+    , sealSupplier_([this](aeron::concurrent::AtomicBuffer& term, aeron::util::index_t termOffset,
+                           aeron::util::index_t) -> std::int64_t { return sealInTerm_(term, termOffset); })
 {}
 
 std::size_t AeronTransport::computeMaxMessageLength(const TransportConfig& c) noexcept {
@@ -253,7 +255,8 @@ void AeronTransport::stop() noexcept {
 
 AeronTransport::OfferResult AeronTransport::offerToPub(aeron::ExclusivePublication& pub,
                                                        const uint8_t* buf,
-                                                       std::size_t    len) noexcept
+                                                       std::size_t    len,
+                                                       FrameCrc       crc) noexcept
 {
     // Aeron result codes: NOT_CONNECTED(-1), BACK_PRESSURED(-2),
     // ADMIN_ACTION(-3) are transient; PUBLICATION_CLOSED(-4) and
@@ -271,11 +274,15 @@ AeronTransport::OfferResult AeronTransport::offerToPub(aeron::ExclusivePublicati
         return OfferResult::Retry;
     };
     const auto ilen = static_cast<aeron::util::index_t>(len);
+    // B1: a pending CRC is sealed into the producer's own (writable) frame.
+    uint8_t* const sealable = crc.pending() ? const_cast<uint8_t*>(buf) : nullptr;
     try {
         if (len > 0 && ilen <= pub.maxPayloadLength()) {
             aeron::concurrent::logbuffer::BufferClaim claim;
             const int64_t claimPos = pub.tryClaim(ilen, claim);
             if (claimPos > 0) {
+                // Accepted: the space is ours — only now is the CRC computed.
+                if (sealable != nullptr) (void)sealFrame(sealable, len, crc);
                 std::memcpy(claim.buffer().buffer() + claim.offset(), buf, len);
                 claim.commit();
                 return OfferResult::Accepted;
@@ -286,17 +293,43 @@ AeronTransport::OfferResult AeronTransport::offerToPub(aeron::ExclusivePublicati
         aeron::concurrent::AtomicBuffer ab(
             const_cast<uint8_t*>(len > 0 ? buf : kEmptyBuf),
             ilen);
-        return verdict(pub.offer(ab, 0, ilen));
+        if (sealable == nullptr) return verdict(pub.offer(ab, 0, ilen));
+        // Multi-fragment frame: Aeron calls the supplier per fragment after its
+        // position < limit check and the fragment copy, before that fragment's
+        // commit.  The CRC field sits in the Produce + RecordBatch headers, so
+        // in the FIRST fragment for any legal MTU; the supplier computes the CRC
+        // over the whole source frame (all of it is in `buf`) and patches both.
+        if (static_cast<std::size_t>(crc.crcAt) + 4 > static_cast<std::size_t>(pub.maxPayloadLength())) [[unlikely]] {
+            (void)sealFrame(sealable, len, crc);  // unreachable for a Produce frame (header ~110 B)
+            return verdict(pub.offer(ab, 0, ilen));
+        }
+        seal_ = PendingSeal{sealable, len, crc, true};
+        const int64_t pos = pub.offer(ab, 0, ilen, sealSupplier_);
+        seal_.armed = false;  // refused: never sealed (the next attempt re-arms)
+        return verdict(pos);
     } catch (...) {
+        seal_.armed = false;
         return OfferResult::Fatal;
     }
+}
+
+std::int64_t AeronTransport::sealInTerm_(aeron::concurrent::AtomicBuffer& term,
+                                         aeron::util::index_t termOffset) noexcept {
+    if (seal_.armed) {  // the BEGIN fragment: the offer was accepted
+        seal_.armed = false;
+        const uint32_t c = sealFrame(seal_.frame, seal_.len, seal_.crc);
+        putCrc(term.buffer() + termOffset + aeron::concurrent::logbuffer::DataFrameHeader::LENGTH +
+                   seal_.crc.crcAt,
+               c);
+    }
+    return 0;  // the reserved value Aeron's DEFAULT_RESERVED_VALUE_SUPPLIER writes
 }
 
 // ---------------------------------------------------------------------------
 // offer (default stream)
 // ---------------------------------------------------------------------------
 
-bool AeronTransport::offer(const uint8_t* buf, std::size_t len) noexcept {
+bool AeronTransport::offer(const uint8_t* buf, std::size_t len, FrameCrc crc) noexcept {
     if (!ingressPub_) return false;
 
     // This method is noexcept but the Aeron publication calls below can throw
@@ -304,7 +337,7 @@ bool AeronTransport::offer(const uint8_t* buf, std::size_t len) noexcept {
     // The single-writer lifetime contract makes that unreachable in normal use,
     // but a throw escaping a noexcept fn would std::terminate — so we contain it
     // and report a failed send instead. Aeron never mutates the source buffer.
-    return offerToPub(*ingressPub_, buf, len) == OfferResult::Accepted;
+    return offerToPub(*ingressPub_, buf, len, crc) == OfferResult::Accepted;
 }
 
 AeronTransport::OfferResult AeronTransport::offerResult(const uint8_t* buf, std::size_t len) noexcept {
@@ -329,23 +362,24 @@ AeronTransport::PubHandle AeronTransport::publicationHandle(const std::string& c
     return static_cast<PubHandle>(pubSlots_.size() - 1);
 }
 
-bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len) noexcept {
+bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len, FrameCrc crc) noexcept {
     if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
     PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
-    if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len) == OfferResult::Accepted;
+    if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len, crc) == OfferResult::Accepted;
     if (!aeron_) return false;
     PubRegistry reg{*aeron_, s.channel, s.streamId};
     if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) return false;
-    return offerToPub(*s.res.ready(), buf, len) == OfferResult::Accepted;
+    return offerToPub(*s.res.ready(), buf, len, crc) == OfferResult::Accepted;
 }
 
 // ---------------------------------------------------------------------------
 // offer (per-worker stream)
 // ---------------------------------------------------------------------------
 
-bool AeronTransport::offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept {
+bool AeronTransport::offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len,
+                           FrameCrc crc) noexcept {
     // 0 means "legacy / no per-worker stream" — fall back to default.
-    if (ingressStreamId == 0 || ingressStreamId == cfg_.ingressStreamId) return offer(buf, len);
+    if (ingressStreamId == 0 || ingressStreamId == cfg_.ingressStreamId) return offer(buf, len, crc);
     uint32_t h = streamPub_.find(ingressStreamId);
     if (h == detail::FlatIndexMap::kNone) {
         try {
@@ -358,7 +392,7 @@ bool AeronTransport::offer(int32_t ingressStreamId, const uint8_t* buf, std::siz
     // Resolving or back-pressured -> false.  Never fall back to the default
     // publication: one partition's batches must stay on ONE stream, or the broker
     // may process consecutive in-flight batches out of order.
-    return offerOn(static_cast<PubHandle>(h), buf, len);
+    return offerOn(static_cast<PubHandle>(h), buf, len, crc);
 }
 
 // ---------------------------------------------------------------------------

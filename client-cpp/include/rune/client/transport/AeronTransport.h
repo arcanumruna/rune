@@ -31,6 +31,7 @@ extern "C" {
 
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/detail/OneToOneRingBuffer.h>
+#include <rune/client/transport/FrameCrc.h>
 #include <rune/client/transport/Resolution.h>
 #include <rune/client/transport/TransportConfig.h>
 #include <rune_fr/FlightRecorder.h>
@@ -140,7 +141,16 @@ public:
     /// (cfg_.ingressStreamId).  Uses tryClaim for zero-copy; falls back to
     /// offer if tryClaim is not supported.  Returns true iff accepted.
     /// No busy-spin — call site retries if needed.
-    bool offer(const uint8_t* buf, std::size_t len) noexcept;
+    ///
+    /// Backlog B1 (CRC on accept): a PENDING `crc` names the RecordBatch CRC of
+    /// a frame the producer left unsealed.  It is computed only once Aeron has
+    /// accepted the frame — inside a successful tryClaim, or (frame larger than
+    /// one MTU payload) inside the offer's reserved-value supplier, after Aeron's
+    /// position < limit check and before the first fragment commits — and is
+    /// written into the claimed term bytes AND into `buf` (the producer's
+    /// retained frame, which must then be writable).  A refused offer computes
+    /// nothing.  Default {}: the frame is sent as is.
+    bool offer(const uint8_t* buf, std::size_t len, FrameCrc crc = {}) noexcept;
 
     /// F8a fix3: the 3-way verdict of an offer.
     ///   Accepted — published.
@@ -168,7 +178,8 @@ public:
     /// broker process them out of order (ordering + idempotence break).
     /// E5.1: called from the ProducerImpl flush path with the per-partition
     /// worker stream id decoded from the metadata response.
-    bool offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len) noexcept;
+    bool offer(int32_t ingressStreamId, const uint8_t* buf, std::size_t len,
+               FrameCrc crc = {}) noexcept;
 
     /// Task 1.3 (multi-node): publish buf[0..len-1] to the ingress publication for
     /// an EXPLICIT (channel, ingressStreamId) pair — the per-leader-node routing
@@ -192,7 +203,7 @@ public:
 
     /// Hot path: one bounds check + one variant check + tryClaim.  Returns false
     /// while the publication resolves or is back-pressured (retry next cycle).
-    bool offerOn(PubHandle h, const uint8_t* buf, std::size_t len) noexcept;
+    bool offerOn(PubHandle h, const uint8_t* buf, std::size_t len, FrameCrc crc = {}) noexcept;
 
     /// Test/simulation seam: the clock that drives every Resolution deadline and
     /// retry backoff (default: steady_clock).  pumpUntil_'s own wall-time bound
@@ -401,7 +412,21 @@ private:
     std::size_t maxMessageLength_ = 0;  // immutable after construction
     static std::size_t computeMaxMessageLength(const TransportConfig& c) noexcept;
     OfferResult offerToPub(aeron::ExclusivePublication& pub,
-                    const uint8_t* buf, std::size_t len) noexcept;
+                    const uint8_t* buf, std::size_t len, FrameCrc crc = {}) noexcept;
+    /// B1: the frame whose CRC the reserved-value supplier seals (armed only for
+    /// the duration of one multi-fragment offer; single-writer).
+    struct PendingSeal {
+        uint8_t*    frame = nullptr;
+        std::size_t len   = 0;
+        FrameCrc    crc{};
+        bool        armed = false;
+    };
+    PendingSeal seal_{};
+    /// Aeron's offer() takes its supplier as a std::function (Publication.h);
+    /// built ONCE here (captures `this`; the transport is immovable) so the hot
+    /// path never constructs one.  Seals on the first (BEGIN) fragment.
+    aeron::on_reserved_value_supplier_t sealSupplier_;
+    std::int64_t sealInTerm_(aeron::concurrent::AtomicBuffer& term, aeron::util::index_t termOffset) noexcept;
     /// FR: coalescer for refused offers (retried every duty cycle; empty when compiled out).
     [[no_unique_address]] rune_fr::Throttle frOfferRefused_{};
 

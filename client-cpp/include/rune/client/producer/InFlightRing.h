@@ -137,6 +137,10 @@ public:
     /// Sequence the next claim() will use (encode the frame before offering it).
     [[nodiscard]] uint32_t nextSeq() const noexcept { return static_cast<uint32_t>(head_); }
 
+    /// The slot the next claim() returns (caller checked !full(): it is free).
+    /// Lets a frame be encoded straight into its retained buffer (backlog B4).
+    [[nodiscard]] InFlightBatch& peekNext() noexcept { return slots_[head_ & mask_]; }
+
     /// Claims the next slot (caller checked !full()) and stamps its corrId.
     InFlightBatch& claim(uint32_t ordinal, uint32_t partitionSlot) noexcept {
         InFlightBatch& b = slots_[head_ & mask_];

@@ -156,6 +156,7 @@ if(aeron_FOUND)
     )
     target_include_directories(rune_client_transport PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>  # FrameCrc.h (B1): Crc32c / RecordBatch layout
         $<INSTALL_INTERFACE:include>
     )
     target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr)
@@ -1026,6 +1027,8 @@ if(BUILD_TESTING)
         tests/detail/FlatIndexMapTest.cpp
         tests/producer/InFlightRingTest.cpp
         tests/shard/ShardMapTest.cpp
+        tests/detail/Crc32cPatchTest.cpp
+        tests/producer/ProduceFrameBuilderTest.cpp
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -421,3 +421,113 @@ TEST(InvokerTransport, PumpOwnershipHandoffViaBindRegression) {
     t.stop();
     EXPECT_EQ(t.callerPumpViolations(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Backlog B1 (LAT-1 h): CRC on accept.  A Produce frame handed over with its
+// RecordBatch CRC unset is sealed by the transport only once Aeron accepted
+// it — inside tryClaim (<= one MTU payload) or inside the offer's
+// reserved-value supplier (multi-fragment) — into the term AND the source.
+// ---------------------------------------------------------------------------
+#include <rune/client/producer/ProduceFrameBuilder.h>
+#include <rune/client/transport/FrameCrc.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
+namespace {
+
+using rune::client::producer::ProduceFrameBuilder;
+
+// An unsealed Produce frame with `records` records of `valueBytes` bytes.
+ProduceFrameBuilder unsealedFrame(int records, std::size_t valueBytes) {
+    ProduceFrameBuilder fb(0, 1'000);
+    for (int i = 0; i < records; ++i) {
+        fb.append("k" + std::to_string(i), std::string(valueBytes, static_cast<char>('a' + i % 26)), 1'000 + i);
+    }
+    fb.setProducerId(77);
+    fb.setProducerEpoch(3);
+    fb.setBaseSequence(9);
+    rune::protocol::client::Produce h;
+    h.sessionId = 5; h.correlationId = 6; h.topicId = 1; h.partitionKnown = 1;
+    h.producerId = 77; h.producerEpoch = 3; h.baseSequence = 9;
+    (void)fb.seal(h);
+    return fb;
+}
+
+uint32_t storedCrc(const uint8_t* frame) {
+    return rune::protocol::detail::getLE32(frame + ProduceFrameBuilder::frameCrc().crcAt);
+}
+
+bool batchValid(const uint8_t* frame, std::size_t len) {
+    const auto p = rune::protocol::client::Produce::decode(frame, len);
+    if (!p) return false;
+    rune::protocol::RecordBatchReader rd(p->recordBatch.data(), p->recordBatch.size());
+    return rd.ensureValid();
+}
+
+}  // namespace
+
+TEST(InvokerTransportCrc, SealsOnAcceptInTheClaimAndTheMultiFragmentPaths) {
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:24761";  // default MTU 1408
+    Transport t{invokerConfig(ch, ch, 3701)};
+    t.start();
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    for (const auto [records, value] : {std::pair{2, std::size_t{200}},       // one claim
+                                        std::pair{40, std::size_t{1024}}}) {  // ~30 fragments
+        ProduceFrameBuilder fb = unsealedFrame(records, value);
+        ASSERT_EQ(storedCrc(fb.data()), 0u);
+        ASSERT_TRUE(pumpUntil(t, [&] { return t.offer(fb.data(), fb.size(), ProduceFrameBuilder::frameCrc()); }));
+        // The source (the producer's retained frame) is sealed too.
+        EXPECT_TRUE(batchValid(fb.data(), fb.size())) << "records=" << records;
+        std::vector<uint8_t> got;
+        ASSERT_TRUE(pumpUntil(t, [&] {
+            t.poll([&](const uint8_t* b, std::size_t n) { got.assign(b, b + n); }, 64);
+            return !got.empty();
+        }));
+        EXPECT_EQ(got, std::vector<uint8_t>(fb.data(), fb.data() + fb.size())) << "records=" << records;
+        EXPECT_TRUE(batchValid(got.data(), got.size())) << "records=" << records;
+    }
+    t.stop();
+}
+
+TEST(InvokerTransportCrc, RefusedOfferNeverComputesTheCrc) {
+    // Publisher on an endpoint nobody listens on yet: every offer is refused
+    // (NOT_CONNECTED) by Aeron's position < limit check — the CRC must stay
+    // unset.  Then a receiver appears and the same frames are accepted + sealed.
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:24763";
+    Transport pub{invokerConfig(ch, "aeron:ipc", 3702)};
+    pub.start();
+    ProduceFrameBuilder small = unsealedFrame(2, 200);
+    ProduceFrameBuilder big   = unsealedFrame(40, 1024);
+    for (int i = 0; i < 200; ++i) {
+        pub.dutyCycle();
+        ASSERT_FALSE(pub.offer(small.data(), small.size(), ProduceFrameBuilder::frameCrc()));
+        ASSERT_FALSE(pub.offer(big.data(), big.size(), ProduceFrameBuilder::frameCrc()));
+    }
+    EXPECT_EQ(storedCrc(small.data()), 0u) << "a refused claim computed the CRC";
+    EXPECT_EQ(storedCrc(big.data()), 0u) << "a refused multi-fragment offer computed the CRC";
+
+    Config rc = invokerConfig("aeron:ipc", ch, 3702);
+    rc.dataDir = uniqueDir("inv_tr_rx");
+    Transport rx{rc};
+    rx.start();
+    auto both = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            pub.dutyCycle();
+            rx.dutyCycle();
+            if (pred()) return true;
+        }
+        return false;
+    };
+    ASSERT_TRUE(both([&] { return pub.offer(small.data(), small.size(), ProduceFrameBuilder::frameCrc()); }));
+    ASSERT_TRUE(both([&] { return pub.offer(big.data(), big.size(), ProduceFrameBuilder::frameCrc()); }));
+    EXPECT_TRUE(batchValid(small.data(), small.size()));
+    EXPECT_TRUE(batchValid(big.data(), big.size()));
+    int got = 0;
+    ASSERT_TRUE(both([&] {
+        rx.poll([&](const uint8_t* b, std::size_t n) { got += batchValid(b, n) ? 1 : 100; }, 64);
+        return got >= 2;
+    }));
+    EXPECT_EQ(got, 2);
+    rx.stop();
+    pub.stop();
+}

@@ -11,5 +11,11 @@ struct AgentProduceSink {
                     const uint8_t* buf, std::size_t len) const noexcept {
         return agent->offerToPartition(topicId, partition, ingressStreamId, buf, len);
     }
+    /// Backlog B1: a fresh frame with its RecordBatch CRC unset — sealed by the
+    /// transport only once Aeron accepted it.
+    bool operator()(int32_t topicId, int32_t partition, int32_t ingressStreamId,
+                    uint8_t* buf, std::size_t len, transport::FrameCrc crc) const noexcept {
+        return agent->offerToPartition(topicId, partition, ingressStreamId, buf, len, crc);
+    }
 };
 } // namespace rune::client::agent

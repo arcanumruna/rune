@@ -49,6 +49,7 @@
 #include <concurrent/BackOffIdleStrategy.h>
 #include <rune/client/detail/FlatIndexMap.h>
 #include <rune/client/producer/InFlightRing.h>
+#include <rune/client/producer/ProduceFrameBuilder.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (controlledRead/ABORT, templated read)
 
@@ -218,9 +219,11 @@ struct PartitionState {
     /// answered before it may be taken as proof (see "Sequence resolution" C2b).
     bool     laneWait     = false;
 
-    // RecordBatchBuilder (reused; reset after each flush).
+    // The Tier-1 batch, built IN PLACE as its Produce wire frame (backlog B1/B4:
+    // ProduceFrameBuilder.h) — reused; reset after each flush; its storage is
+    // swapped into the in-flight slot on an accepted acked offer.
     // Lazy-initialised on first append.
-    std::unique_ptr<rune::protocol::RecordBatchBuilder> builder;
+    std::unique_ptr<ProduceFrameBuilder> builder;
     int32_t builderBytes = 0; // approximate accumulated value bytes
 
     // Timestamp when first record was appended to the current batch (for linger).
@@ -1308,10 +1311,10 @@ private:
     std::vector<uint32_t>                         dirty_;
     DrainStop                                     lastDrainStop_ = DrainStop::Drained;
 
-    // Encode scratch buffers (reused per batch — zero per-flush heap allocation).
-    // batchScratch_: RecordBatch bytes (cleared + refilled by buildInto()).
-    // encodeScratch_: Produce wire frame (grown once; steady-state = no alloc).
-    std::vector<uint8_t> batchScratch_;
+    // encodeScratch_: the Produce wire frame of an acks=None Tier-2 batch (nothing
+    // retained; grown once, steady-state = no alloc).  Tier-1 batches are built
+    // in place (ProduceFrameBuilder) and acked Tier-2 batches are encoded into
+    // their in-flight slot's retained buffer (backlog B4).
     std::vector<uint8_t> encodeScratch_;
 
     // Per-instance producerId (F5 fix): drawn fresh at construction by

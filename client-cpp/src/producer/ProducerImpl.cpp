@@ -12,6 +12,8 @@
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/CountingSink.h>
 #include <rune/client/Completions.h>
+#include <rune/client/detail/Crc32cPatch.h>
+#include <rune/client/transport/FrameCrc.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/Crc32c.h>
@@ -31,6 +33,7 @@
 #include <cstdio>
 #include <random>
 #include <stdexcept>
+#include <type_traits>
 
 #if defined(_WIN32)
 #include <process.h> // _getpid
@@ -158,13 +161,47 @@ inline int32_t recordBodyContrib(int32_t keyLen, int32_t valueLen,
     return varintLen(bodySize) + bodySize;
 }
 
-// Copies a sent frame into an in-flight slot's reusable buffer.  Capacity grows
-// to the next power of two, so frames that differ by a few bytes (timestamp-delta
-// varint width, value length) reuse it instead of reallocating in steady state
-// (vector::assign would size it to the exact first frame).
-inline void keepFrame(std::vector<uint8_t>& dst, const uint8_t* src, std::size_t n) {
-    if (dst.capacity() < n) dst.reserve(std::bit_ceil(n));
-    dst.assign(src, src + n);
+// Backlog B1: offer a freshly encoded frame whose RecordBatch CRC is still
+// unset.  A sink that seals on accept (the Aeron transport via
+// AgentProduceSink, CountingSink) gets the FrameCrc and computes the CRC only
+// once the frame is accepted; any other sink (the std::function SendFn test /
+// cold seams) gets a sealed frame, as before.
+template <class Sink>
+inline bool offerFresh(const Sink& sink, int32_t topicId, int32_t partition, int32_t streamId,
+                       uint8_t* buf, std::size_t len, transport::FrameCrc crc) {
+    if constexpr (std::is_invocable_r_v<bool, const Sink&, int32_t, int32_t, int32_t, uint8_t*,
+                                        std::size_t, transport::FrameCrc>) {
+        return sink(topicId, partition, streamId, buf, len, crc);
+    } else {
+        (void)transport::sealFrame(buf, len, crc);
+        return sink(topicId, partition, streamId, static_cast<const uint8_t*>(buf), len);
+    }
+}
+
+// Backlog B2: re-stamps producerId / producerEpoch / baseSequence (14 contiguous
+// bytes) of a SEALED RecordBatch at `batch` (`len` bytes) and patches its CRC
+// incrementally — bit-exact with a full recompute, without rescanning the batch.
+inline void restampBatchIdentity(uint8_t* batch, std::size_t len, int64_t producerId,
+                                 int16_t producerEpoch, int32_t baseSequence) noexcept {
+    namespace rb = rune::protocol::batch;
+    constexpr std::size_t kOff = rb::kProducerIdOffset;
+    constexpr std::size_t kN   = rb::kRecordCountOffset - rb::kProducerIdOffset;
+    static_assert(rb::kProducerEpochOffset == rb::kProducerIdOffset + 8 &&
+                  rb::kBaseSequenceOffset == rb::kProducerIdOffset + 10 && kN == 14,
+                  "identity fields must stay contiguous");
+    uint8_t old[kN];
+    std::memcpy(old, batch + kOff, kN);
+    auto put = [](uint8_t* p, uint64_t v, int bytes) noexcept {
+        for (int i = 0; i < bytes; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
+    };
+    put(batch + rb::kProducerIdOffset, static_cast<uint64_t>(producerId), 8);
+    put(batch + rb::kProducerEpochOffset, static_cast<uint16_t>(producerEpoch), 2);
+    put(batch + rb::kBaseSequenceOffset, static_cast<uint32_t>(baseSequence), 4);
+    const uint32_t crc = rune::protocol::detail::getLE32(batch + rb::kCrcOffset);
+    put(batch + rb::kCrcOffset,
+        rune::client::detail::crc32cPatch(crc, len - rb::kAttributesOffset, kOff - rb::kAttributesOffset,
+                                          old, batch + kOff, kN),
+        4);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +327,6 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
 {
     // Pre-reserve partition map and encode scratch to avoid allocs on steady-state.
     partitions_.reserve(16);
-    batchScratch_.reserve(64 * 1024);  // RecordBatch bytes (reused by buildInto)
     encodeScratch_.reserve(64 * 1024); // Produce wire frame (grown once)
     // M2: frame-cap threshold computed ONCE (cfg_ is immutable).  With the default
     // config (maxFrameBytes == batchBytes) frameCapped_ is FALSE, so the per-record
@@ -1430,7 +1466,7 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     // batches so there is no per-batch heap allocation.
     if (!ps.builder) {
         const int64_t baseWall = wallNs();
-        ps.builder = std::make_unique<rune::protocol::RecordBatchBuilder>(0, baseWall);
+        ps.builder = std::make_unique<ProduceFrameBuilder>(0, baseWall);
         ps.builderBaseWallNs = baseWall;
     }
     // I1 FIX (frame cap): builderBaseWallNs is never re-sampled here — it already
@@ -1529,11 +1565,12 @@ bool ProducerImpl::encodeAndSend(
         ps.builder->setBaseSequence(ps.nextBaseSequence);
     }
 
-    // Zero-copy encode: build the Produce frame header (with an EMPTY recordBatch)
-    // then append the RecordBatch DIRECTLY after it, into the same wire buffer.
-    // This removes the old two-pass cost — buildInto(batchScratch_) followed by a
-    // full batch memcpy inside Produce::encode — which dominated the agent thread.
-    // The batch's records are now gathered into the frame exactly once.
+    // Backlog B1/B4: the batch already IS its wire frame (ProduceFrameBuilder —
+    // each record was written once, in place, at append).  Sealing writes only
+    // the Produce header and the RecordBatch header; the RecordBatch CRC is
+    // computed by the sink once the frame is accepted (tryClaim / the offer
+    // reserved-value supplier), so a back-pressured offer costs ~110 header
+    // bytes — no record copy, no CRC — and records keep joining the held batch.
     namespace rpc = rune::protocol::client;
     rpc::Produce msg;
     msg.sessionId      = sessionId;
@@ -1552,29 +1589,12 @@ bool ProducerImpl::encodeAndSend(
     } else {
         msg.producerEpoch = -1;  // the header's -1 (Produce defaults epoch to 0): all three match
     }
-    msg.key            = {};
-    msg.recordBatch    = {};   // appended directly below (no intermediate copy)
-
-    const std::size_t hdrLen = msg.encodedSize();   // header + empty key + empty rb prefix
-    if (hdrLen == 0) return false;
-    encodeScratch_.clear();
-    encodeScratch_.resize(hdrLen);
-    if (msg.encode(encodeScratch_.data()) == 0) return false;
-
-    // Append the serialized batch right after the header (single gather copy).
-    const std::size_t batchLen = ps.builder->buildAppend(encodeScratch_);
-    // Patch the recordBatch u32 length prefix (the last 4 bytes of the header).
-    rpc::detail::putLE32(encodeScratch_.data(),
-                         static_cast<int>(hdrLen) - 4,
-                         static_cast<int32_t>(batchLen));
-
-    const std::size_t written = encodeScratch_.size();
-    if (written == 0) return false;
+    const std::size_t written = ps.builder->seal(msg);
 
     // Offer to transport — Task 1.4: route by (topicId,partition); E5.1: pass
     // per-partition ingressStreamId as the transport stream.
-    const bool ok = sink(ps.topicId, ps.partition, ps.ingressStreamId,
-                        encodeScratch_.data(), written);
+    const bool ok = offerFresh(sink, ps.topicId, ps.partition, ps.ingressStreamId,
+                               ps.builder->data(), written, ProduceFrameBuilder::frameCrc());
 
     if (!ok) {
         RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::ClientOfferRefused, rune_fr::foldCorr(correlationId),
@@ -1583,8 +1603,8 @@ bool ProducerImpl::encodeAndSend(
         // connected).  Leave the batch FULLY intact — builder records, stamped
         // baseSequence, and the ack-ring slice (batchAckStart/Count) are all
         // preserved — and return false so flushBatches retries on the next agent
-        // cycle.  buildAppend() serialised into encodeScratch_ but did NOT consume
-        // the builder, so the retry re-encodes identically.
+        // cycle.  The frame stays unsealed (no CRC computed); the retry re-seals
+        // its headers only.
         //
         // This is the fix for the intermittent 5s tail: the old code reset the
         // builder + advanced nextBaseSequence UNCONDITIONALLY, so a single
@@ -1637,7 +1657,10 @@ bool ProducerImpl::encodeAndSend(
         b.laneFirstTag      = 0;
         b.laneOut           = 1;
         b.staleLaneOut      = 0;
-        keepFrame(b.wireFrame, encodeScratch_.data(), written);
+        // B4: the accepted (now sealed) frame becomes the retained retransmit
+        // frame by a buffer swap — no copy; the builder takes the slot's old
+        // storage for the next batch.
+        ps.builder->swapFrameInto(b.wireFrame);
         if (b.attemptDeadlineNs < earliestAttemptDeadlineNs_) {
             earliestAttemptDeadlineNs_ = b.attemptDeadlineNs;
         }
@@ -1705,34 +1728,11 @@ bool ProducerImpl::encodeAndSendTier2(
     const bool idempotent = (cfg_.acks != Acks::None);
     if (idempotent && !sequenceRoom_(ps, entry.recordCount)) return false;  // int32 sequence space
     if (idempotent) {
-        // Patch producerId (int64 LE at kProducerIdOffset).
-        const uint64_t pid = static_cast<uint64_t>(ps.producerId);
-        for (int i = 0; i < 8; ++i)
-            b[rb::kProducerIdOffset + i] = static_cast<uint8_t>(pid >> (i * 8));
-
-        // Patch producerEpoch (int16 LE at kProducerEpochOffset).
-        const uint16_t ep = static_cast<uint16_t>(ps.epoch);
-        b[rb::kProducerEpochOffset]     = static_cast<uint8_t>(ep);
-        b[rb::kProducerEpochOffset + 1] = static_cast<uint8_t>(ep >> 8);
-
-        // Patch baseSequence (int32 LE at kBaseSequenceOffset).  NOT advanced
-        // until the offer succeeds (below) — a back-pressured retry must
-        // re-send the SAME sequence.
-        const uint32_t seq = static_cast<uint32_t>(ps.nextBaseSequence);
-        b[rb::kBaseSequenceOffset]     = static_cast<uint8_t>(seq);
-        b[rb::kBaseSequenceOffset + 1] = static_cast<uint8_t>(seq >> 8);
-        b[rb::kBaseSequenceOffset + 2] = static_cast<uint8_t>(seq >> 16);
-        b[rb::kBaseSequenceOffset + 3] = static_cast<uint8_t>(seq >> 24);
-
-        // Recompute the CRC-32C over the CRC-covered region
-        // [kAttributesOffset .. end], stored as uint32 LE at kCrcOffset.
-        // Must be recomputed after patching producerId/epoch/baseSequence.
-        const uint32_t crc = rune::protocol::crc32c(
-            b.data() + rb::kAttributesOffset, b.size() - rb::kAttributesOffset);
-        b[rb::kCrcOffset]     = static_cast<uint8_t>(crc);
-        b[rb::kCrcOffset + 1] = static_cast<uint8_t>(crc >> 8);
-        b[rb::kCrcOffset + 2] = static_cast<uint8_t>(crc >> 16);
-        b[rb::kCrcOffset + 3] = static_cast<uint8_t>(crc >> 24);
+        // Backlog B2: stamp producerId / epoch / baseSequence and patch the CRC
+        // (computed once over the -1/-1/-1 batch by BatchBuilder) INCREMENTALLY —
+        // no rescan of the batch.  NOT advanced until the offer succeeds (below):
+        // a back-pressured retry re-stamps the SAME values (a zero delta).
+        restampBatchIdentity(b.data(), b.size(), ps.producerId, ps.epoch, ps.nextBaseSequence);
     }
 
     // Encode the Produce wire frame.
@@ -1765,17 +1765,19 @@ bool ProducerImpl::encodeAndSendTier2(
     const std::size_t needed = msg.encodedSize();
     if (needed == 0) return false;
 
-    if (encodeScratch_.size() < needed) {
-        encodeScratch_.resize(needed);
-    }
-
-    const std::size_t written = msg.encode(encodeScratch_.data());
+    // Backlog B4: an acked batch is encoded straight into the buffer of the
+    // in-flight slot it will claim (free: the caller checked canFlight_), so the
+    // retained retransmit frame is the encoded frame — no second copy.
+    // acks=None retains nothing: the scratch buffer.
+    std::vector<uint8_t>& out = awaitAck ? ps.inflight.peekNext().wireFrame : encodeScratch_;
+    out.resize(needed);
+    const std::size_t written = msg.encode(out.data());
     if (written == 0) return false;
 
     // Task 1.4: route by (topicId,partition); E5.1: pass per-partition
-    // ingressStreamId as the per-worker transport stream.
-    const bool ok = sink(ps.topicId, ps.partition, ps.ingressStreamId,
-                        encodeScratch_.data(), written);
+    // ingressStreamId as the per-worker transport stream.  The batch is already
+    // sealed (B2 patch above): nothing for the transport to compute.
+    const bool ok = sink(ps.topicId, ps.partition, ps.ingressStreamId, out.data(), written);
 
     if (!ok) {
         RUNE_FR_THROTTLED_PRODUCE(frOfferRefused_, rune_fr::Site::ClientOfferRefused, rune_fr::foldCorr(wireCorrId),
@@ -1833,8 +1835,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.laneGen           = ps.laneGen;  // NEW-4(b)
         ib.laneFirstTag      = 0;
         ib.laneOut           = 1;
-        ib.staleLaneOut      = 0;
-        keepFrame(ib.wireFrame, encodeScratch_.data(), written);
+        ib.staleLaneOut      = 0;  // wireFrame: encoded in place above (B4)
         verifyClaimedCorrId_(ps, ib, wireCorrId);  // always on (not an assert)
     }
 
@@ -2455,11 +2456,8 @@ void ProducerImpl::resequence_(PartitionState& ps) noexcept {
             putLE(f.data() + kFramePidOff, static_cast<uint64_t>(ps.producerId), 8);
             putLE(f.data() + kFrameEpochOff, static_cast<uint16_t>(ps.epoch), 2);
             putLE(f.data() + kFrameSeqOff, static_cast<uint32_t>(seq), 4);
-            putLE(batch + rb::kProducerIdOffset, static_cast<uint64_t>(ps.producerId), 8);
-            putLE(batch + rb::kProducerEpochOffset, static_cast<uint16_t>(ps.epoch), 2);
-            putLE(batch + rb::kBaseSequenceOffset, static_cast<uint32_t>(seq), 4);
-            putLE(batch + rb::kCrcOffset,
-                  rune::protocol::crc32c(batch + rb::kAttributesOffset, len - rb::kAttributesOffset), 4);
+            // B2: incremental CRC patch (bit-exact), not a rescan of the batch.
+            restampBatchIdentity(batch, len, ps.producerId, ps.epoch, seq);
         }
         b.producerId    = ps.producerId;
         b.producerEpoch = ps.epoch;

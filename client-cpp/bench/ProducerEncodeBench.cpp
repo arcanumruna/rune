@@ -8,6 +8,10 @@
 //                        acked.  Models the saturation profile (~6.6 encodes
 //                        per sent frame).  CountingSink behaves like the Aeron
 //                        transport (refuse = back-pressure).
+//   BM_AppendEncodeFlush/V/0  the same with the ring drain (records appended into
+//                        the batch) inside the timed region: the duty thread's
+//                        whole per-batch produce cost (CRC share = BM_Crc32c/64K
+//                        over this).
 //   BM_Crc32c/N          raw rune::protocol::crc32c throughput over N bytes
 //                        (backlog B3: is CRC still hot?).
 //
@@ -56,7 +60,8 @@ void submitBatch(ProducerImpl& impl, const std::vector<uint8_t>& val, int record
     }
 }
 
-void encodeFlush(benchmark::State& st) {
+template <bool kTimeAppend>
+void encodeFlushT(benchmark::State& st) {
     const auto valueBytes = static_cast<std::size_t>(st.range(0));
     const int  refusals   = static_cast<int>(st.range(1));
     auto       impl       = std::make_unique<ProducerImpl>(benchCfg(), 8 * 1024 * 1024);
@@ -70,8 +75,9 @@ void encodeFlush(benchmark::State& st) {
     for (auto _ : st) {
         st.PauseTiming();
         submitBatch(*impl, val, perBatch, key);
+        if constexpr (kTimeAppend) st.ResumeTiming();
         impl->drainRing(now, perBatch + 1);
-        st.ResumeTiming();
+        if constexpr (!kTimeAppend) st.ResumeTiming();
         for (int r = 0; r <= refusals; ++r) impl->flushBatches(++now, 1, sink);
         st.PauseTiming();
         impl->onProduceResponse(corr, offset, 0);
@@ -81,6 +87,9 @@ void encodeFlush(benchmark::State& st) {
     st.SetBytesProcessed(static_cast<int64_t>(bytes));
     st.counters["records_per_batch"] = perBatch;
 }
+
+void encodeFlush(benchmark::State& st) { encodeFlushT<false>(st); }
+void appendEncodeFlush(benchmark::State& st) { encodeFlushT<true>(st); }
 
 void crc32cRaw(benchmark::State& st) {
     const auto n = static_cast<std::size_t>(st.range(0));
@@ -97,5 +106,6 @@ void crc32cRaw(benchmark::State& st) {
 }  // namespace
 
 BENCHMARK(encodeFlush)->Name("BM_EncodeFlush")->ArgsProduct({{256, 1024, 4096}, {0, 6}});
+BENCHMARK(appendEncodeFlush)->Name("BM_AppendEncodeFlush")->ArgsProduct({{256, 1024, 4096}, {0}});
 BENCHMARK(crc32cRaw)->Name("BM_Crc32c")->Arg(1024)->Arg(16 * 1024)->Arg(64 * 1024);
 BENCHMARK_MAIN();
