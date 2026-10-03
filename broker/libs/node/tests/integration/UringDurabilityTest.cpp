@@ -40,6 +40,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <filesystem>
 #include <fstream>
@@ -223,27 +224,42 @@ TEST(UringDurabilityTest, AckOnlyAfterCompletion) {
 // LAT-1 (f), review of the first cut: io-wq is per TASK — the mask must be registered on the submitting
 // thread and must cover the io-wq worker the kernel spawns for that thread's blocking fsync.  Reads the
 // real iou-wrk-<tid> thread's Cpus_allowed_list.
+namespace {
+int firstAllowedCpu() {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (::sched_getaffinity(0, sizeof(set), &set) != 0) return -1;
+    for (int c = 0; c < CPU_SETSIZE; ++c) if (CPU_ISSET(c, &set)) return c;
+    return -1;
+}
+bool affinityUnsupported(int rc) { return rc == EINVAL || rc == ENOTSUP || rc == EOPNOTSUPP; }
+} // namespace
+
 TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegression) {
     const int ncpu = static_cast<int>(::sysconf(_SC_NPROCESSORS_ONLN));
     if (ncpu < 2) GTEST_SKIP() << "needs >= 2 CPUs";
+    const int cpu = firstAllowedCpu();
+    ASSERT_GE(cpu, 0);
+    char path[] = "/tmp/rune_iowq_aff_XXXXXX";
+    const int fd = ::mkstemp(path);
+    ASSERT_GE(fd, 0);
+    std::vector<char> data(1 << 20, 'x');
+    ASSERT_EQ(::write(fd, data.data(), data.size()), static_cast<ssize_t>(data.size()));
     std::string allowedOut;
     int rc = -1;
-    std::thread t([&] {
+    bool submitted = false;
+    std::thread t([&] {   // no ASSERTs in here: the test thread owns fd/path cleanup
         rune::node::UringFlushBackend be(8, 8);
-        rc = be.setIoWorkerAffinity({0});
-        char path[] = "/tmp/rune_iowq_aff_XXXXXX";
-        const int fd = ::mkstemp(path);
-        ASSERT_GE(fd, 0);
-        std::vector<char> data(1 << 20, 'x');
-        ASSERT_EQ(::write(fd, data.data(), data.size()), static_cast<ssize_t>(data.size()));
+        rc = be.setIoWorkerAffinity({cpu});
+        if (rc != 0) return;
         const auto tok = be.submit(fd, 1);
-        ASSERT_NE(tok, rune::node::kNoToken);
-        const pid_t tid = static_cast<pid_t>(::syscall(SYS_gettid));
-        const std::string want = "iou-wrk-" + std::to_string(tid);
+        submitted = tok != rune::node::kNoToken;
+        if (!submitted) return;
+        const std::string want = "iou-wrk-" + std::to_string(static_cast<pid_t>(::syscall(SYS_gettid)));
         bool done = false;
-        for (int i = 0; i < 200000 && !done; ++i) {   // bounded poll (no sleep)
+        for (int i = 0; i < 200000 && !(done && !allowedOut.empty()); ++i) {   // bounded poll (no sleep)
             (void)be.reap([&](const rune::node::FlushCompletion&) { done = true; });
-            if (allowedOut.empty()) {
+            if (allowedOut.empty() && (i % 64) == 0) {
                 for (const auto& e : std::filesystem::directory_iterator("/proc/self/task")) {
                     std::ifstream comm(e.path() / "comm");
                     std::string name; std::getline(comm, name);
@@ -253,16 +269,46 @@ TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegressio
                         if (line.rfind("Cpus_allowed_list:", 0) == 0) allowedOut = line.substr(line.find_last_of(" \t") + 1);
                 }
             }
-            if (done && !allowedOut.empty()) break;
             std::this_thread::yield();
         }
-        ::close(fd);
-        ::unlink(path);
     });
     t.join();
-    ASSERT_EQ(rc, 0) << "IORING_REGISTER_IOWQ_AFF refused (kernel < 5.14?)";
+    ::close(fd);
+    ::unlink(path);
+    if (affinityUnsupported(rc)) GTEST_SKIP() << "IORING_REGISTER_IOWQ_AFF unsupported here (errno " << rc << ")";
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(submitted);
     ASSERT_FALSE(allowedOut.empty()) << "no io-wq worker was spawned for the submitting thread's fsync";
-    EXPECT_EQ(allowedOut, "0") << "the submitting thread's io-wq worker must be bound to the mask";
+    EXPECT_EQ(allowedOut, std::to_string(cpu)) << "the submitting thread's io-wq worker must be bound to the mask";
+}
+
+// Review of cfb726b: the internal NOP must never reach the completion handler, must give its in-flight
+// slot back, and must not exceed the in-flight cap (EBUSY at the cap; the worker retries).
+TEST(UringDurabilityTest, IoWorkerAffinityNopIsDrainedSilentlyAndRespectsTheCapRegression) {
+    const int cpu = firstAllowedCpu();
+    ASSERT_GE(cpu, 0);
+    rune::node::UringFlushBackend be(2, 2);
+    const int rc = be.setIoWorkerAffinity({cpu});
+    if (affinityUnsupported(rc)) GTEST_SKIP() << "IORING_REGISTER_IOWQ_AFF unsupported here (errno " << rc << ")";
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(be.inFlight(), 1u) << "the NOP holds one slot until reaped";
+    int handled = 0;
+    for (int i = 0; i < 200000 && be.inFlight() > 0; ++i)   // bounded poll (no sleep)
+        handled += be.reap([&](const rune::node::FlushCompletion&) { ADD_FAILURE() << "NOP reached the handler"; });
+    EXPECT_EQ(be.inFlight(), 0u) << "the NOP's slot must be given back";
+    EXPECT_EQ(handled, 0) << "reap counts only caller completions";
+
+    char path[] = "/tmp/rune_iowq_cap_XXXXXX";
+    const int fd = ::mkstemp(path);
+    ASSERT_GE(fd, 0);
+    EXPECT_NE(be.submit(fd, 1), rune::node::kNoToken);
+    EXPECT_NE(be.submit(fd, 2), rune::node::kNoToken) << "full depth is available again after the NOP";
+    EXPECT_EQ(be.setIoWorkerAffinity({cpu}), EBUSY) << "at the in-flight cap the NOP is refused, not over-booked";
+    EXPECT_EQ(be.inFlight(), 2u);
+    for (int i = 0; i < 200000 && be.inFlight() > 0; ++i)
+        (void)be.reap([](const rune::node::FlushCompletion&) {});
+    ::close(fd);
+    ::unlink(path);
 }
 
 #endif // defined(__linux__)

@@ -76,10 +76,13 @@ public:
                                std::size_t completionDepth);
 
     /// Bind the CALLING THREAD's io-wq (io_uring keeps io-wq per task, not per ring) to `cpus`
-    /// (IORING_REGISTER_IOWQ_AFF, Linux 5.14+).  Must run on the thread that submits, before its
-    /// first blocking op: the mask applies to io-wq threads created after the call.  Submits one
-    /// internal NOP first so the thread's io-wq context exists.  Returns 0 or an errno.  Cold.
+    /// (IORING_REGISTER_IOWQ_AFF, Linux 5.14+).  Must run on the thread that submits — that is the
+    /// task whose io-wq is bound.  Submits one internal NOP first so the thread's io-wq context
+    /// exists (counts against the in-flight cap; reap drains it silently).  Returns 0, EBUSY (at
+    /// the in-flight cap / SQ full — retry later) or the kernel's errno.  Cold.
     int setIoWorkerAffinity(const std::vector<int32_t>& cpus) noexcept;
+    /// Submitted-not-yet-reaped operations (including the internal NOP).  Worker thread / tests.
+    [[nodiscard]] std::size_t inFlight() const noexcept { return inFlight_; }
     /// user_data of the internal NOP (never a real token: tokens count up from 1).
     static constexpr uint64_t kInternalNopUserData = ~uint64_t{0};
 

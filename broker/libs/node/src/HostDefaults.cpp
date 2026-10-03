@@ -324,6 +324,19 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     // node's workers sit at INDICES [1, 1 + nodes*W) of the allowed-CPU mask -> io-wq gets the other allowed
     // CPUs.  An explicit RUNE_WORKER_CORE_BASE leaves io-wq inheriting (other nodes' cores are unknown) unless
     // RUNE_IOWQ_CORES is set.
+    // An explicit RUNE_IOWQ_CORES keeps only the CPUs this process may run on: a CPU outside the mask is
+    // refused by newer kernels and silently ignored by older ones (io-wq would keep its default mask).
+    if (!cfg.ioWorkerCpus.empty() && !facts.allowedCpus.empty()) {
+        std::vector<int32_t> kept;
+        for (const int32_t c : cfg.ioWorkerCpus)
+            if (std::find(facts.allowedCpus.begin(), facts.allowedCpus.end(), c) != facts.allowedCpus.end())
+                kept.push_back(c);
+        if (kept.size() != cfg.ioWorkerCpus.size())
+            appendWarn(out.warnings, std::string("RUNE_IOWQ_CORES lists CPUs outside this process's allowed set — ") +
+                       (kept.empty() ? "none usable, io-wq inherits" : "ignoring those"));
+        cfg.ioWorkerCpus = std::move(kept);
+    }
+    // Assumes every node runs W workers (same assumption as deriveWorkerCoreBase).
     if (cfg.ioWorkerCpus.empty() && cfg.shardMode() && cfg.workerCoreBase >= 0 && coreBaseDerived) {
         const auto nodes = static_cast<int64_t>(std::max<std::size_t>(cfg.peers.size(), 1));
         const int64_t hi = 1 + nodes * W;

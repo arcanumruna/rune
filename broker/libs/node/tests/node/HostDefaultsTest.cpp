@@ -511,6 +511,12 @@ TEST(HostDefaults, IoWorkersStayOffWorkerCoresRegression) {
     expl.ioWorkerCpus = {2, 3};
     (void)applyHostDerivedDefaults(expl, k3sFacts());
     EXPECT_EQ(expl.ioWorkerCpus, (std::vector<int32_t>{2, 3})) << "an explicit RUNE_IOWQ_CORES wins";
+    // An explicit list outside the allowed CPUs is filtered (with a warning), never passed to the kernel.
+    NodeConfig outside = threeNodeDefault(0);
+    outside.ioWorkerCpus = {2, 6};
+    const auto hdo = applyHostDerivedDefaults(outside, k3sFacts());
+    EXPECT_EQ(outside.ioWorkerCpus, std::vector<int32_t>{2}) << "CPU 6 is not in the 4-CPU allowed set";
+    EXPECT_NE(hdo.warnings.find("RUNE_IOWQ_CORES"), std::string::npos) << hdo.warnings;
     // Restricted allowed mask {2..7}: workers at INDICES 1..3 = CPUs 3,4,5 -> io-wq on the rest: 2,6,7.
     auto restricted = k3sFacts();
     restricted.allowedCpus = {2, 3, 4, 5, 6, 7};

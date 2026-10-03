@@ -1137,7 +1137,6 @@ public:
     [[nodiscard]] bool ioAcceptsSubmissions() const noexcept { return io_.acceptsSubmissions(); }
     /// Startup-only: the auto-selected io_uring fell back to portable ("" = no).
     [[nodiscard]] const std::string& ioFallbackReason() const noexcept { return io_.fallbackReason(); }
-    [[nodiscard]] bool ioIsUring() const noexcept { return io_.kind() == IoBackendKind::Uring; }
 
     // Task 7: test accessor — true if a Validator is installed for the given topic.
     // Worker-thread only; call only from single-threaded tests.
@@ -1187,10 +1186,12 @@ public:
                              workerId_, coreId_);
             }
         }
-        // LAT-1 (f): io-wq is per TASK — bind THIS thread's io-wq before its first blocking io op.
+        // LAT-1 (f): io-wq is per TASK — bind THIS thread's io-wq (EBUSY = at the in-flight cap: retry
+        // next pass).
         if (ioWorkerCpusResult_ < 0 && !ioWorkerCpus_.empty()) [[unlikely]] {
-            ioWorkerCpusResult_ = io_.setIoWorkerAffinity(ioWorkerCpus_);
-            if (ioWorkerCpusResult_ != 0 && io_.kind() == IoBackendKind::Uring)
+            const int r = io_.setIoWorkerAffinity(ioWorkerCpus_);
+            if (r != EBUSY) ioWorkerCpusResult_ = r;
+            if (r != 0 && r != EBUSY && io_.kind() == IoBackendKind::Uring)
                 spdlog::warn("Worker {}: IORING_REGISTER_IOWQ_AFF refused (errno={}) — io-wq threads keep the "
                              "worker's affinity", workerId_, ioWorkerCpusResult_);
         }
@@ -4384,8 +4385,10 @@ public:
     /// LAT-1 (f): CPUs for this worker's io_uring io-wq threads.  Stored here (control thread, before the
     /// runner starts); APPLIED on the worker thread at its first pass (io-wq is per task).
     void setIoWorkerCpus(std::vector<int32_t> cpus) { ioWorkerCpus_ = std::move(cpus); }
-    /// Result of applying it on the worker thread: -1 not yet, 0 ok, else errno.
+    /// Result of applying it on the worker thread: -1 not yet, 0 ok, else errno.  TEST-ONLY: written by
+    /// the worker thread; read it only from the thread that drives doWork (tests drive it inline).
     [[nodiscard]] int ioWorkerCpusResult() const noexcept { return ioWorkerCpusResult_; }
+    [[nodiscard]] const std::vector<int32_t>& ioWorkerCpus() const noexcept { return ioWorkerCpus_; }
 private:
 
     // Time-gated owned-log sync (every mode, F30): same 10 ms gate and the same

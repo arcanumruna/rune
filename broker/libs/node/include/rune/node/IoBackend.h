@@ -1,5 +1,4 @@
 #pragma once
-#include <cerrno>
 // IoBackend.h — the worker's async-durability backend, selected ONCE at
 // construction (Task 10 fix 1 / C1).
 //
@@ -32,6 +31,7 @@
 #include <rune/node/UringFlushBackend.h>
 #endif
 
+#include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
 #include <optional>

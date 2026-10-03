@@ -1037,3 +1037,16 @@ TEST(WorkerPoolRegression, FitsIngressTailIsPoolLevelCompareRegression) {
     EXPECT_TRUE(pool.fitsIngressTail(pool.maxIngressTail()));
     EXPECT_FALSE(pool.fitsIngressTail(pool.maxIngressTail() + 1));
 }
+
+// LAT-1 (f), review of cfb726b: the io-wq CPU list is APPLIED by the worker's own pass (io-wq is per task),
+// not by the control thread that configures it.  Portable backend -> ENOTSUP; io_uring -> 0 or the kernel's
+// errno; either way the first doWork applies it exactly once.
+TEST(WorkerPool, IoWorkerCpusAreAppliedOnTheWorkersOwnPassRegression) {
+    ShardRouter router(1);
+    WorkerPool  pool(1, router);
+    pool.worker(0).setOwnedDirect(rune::node::Worker::OwnedSet{});
+    pool.worker(0).setIoWorkerCpus({0});
+    EXPECT_EQ(pool.worker(0).ioWorkerCpusResult(), -1) << "configuring must not apply it";
+    (void)pool.worker(0).doWork(/*nowNs=*/1);
+    EXPECT_NE(pool.worker(0).ioWorkerCpusResult(), -1) << "the worker's first pass applies it";
+}

@@ -198,6 +198,7 @@ bool UringFlushBackend::probeOpcode_(uint8_t opcode) noexcept {
 // ---------------------------------------------------------------------------
 int UringFlushBackend::setIoWorkerAffinity(const std::vector<int32_t>& cpus) noexcept {
     if (cpus.empty() || ringFd_ < 0) return EINVAL;
+    if (inFlight_ >= submitDepth_) return EBUSY;   // keep the in-flight bound; the worker retries next pass
     // 1. Create this thread's io_uring task context + io-wq: the kernel attaches it on the first
     //    io_uring_enter that submits.  One NOP (completes inline; reap drains its CQE silently).
     struct io_uring_sqe sqe{};
