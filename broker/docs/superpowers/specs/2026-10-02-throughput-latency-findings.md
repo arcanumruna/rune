@@ -318,6 +318,9 @@ per hop × ~4 hops).
       It only helped single-node (client acks only).  Do not productionize (d); keep the uncapped duty loop.
   (m) REMOVE end-of-pass send (item c, RUNE_END_PASS_SEND): no benefit on 3-node acks=all (20k, fsync off:
       p50 750 us / p99 10.6 ms with it vs 688 us / 9.6 ms without).  Do not productionize (c).
+  (n) NEVER busy-spin (user rule 2026-10-03): shard workers default to backoff idle (today busy-spin when a core
+      base is set; RUNE_SHARD_BACKOFF is the VM experiment knob; measured: no p50/p99 difference), no dedicated
+      busy-spin driver threads, client agents back off.  All perf numbers from here on are taken with backoff.
   Client CRC/encode waste (2026-10-03 saturation profile, 3-node acks=all: crc32c_hw = 28% of client CPU; uprobes
   counted 35,897 buildAppend calls CRC-ing 1.52 GB in 2 s vs ~116 MB/s produced = ~6.6 builds per sent frame):
   (h) no rebuild on back-pressure: probe the publication (position < publication limit, the exact Aeron refusal
