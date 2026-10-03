@@ -188,6 +188,47 @@ All errors=0.  GSO/GRO = 3.1x at the real-network MTU.  Remaining gap to 65504 (
 work (~47 fragments per 64 KiB batch): suspected broker FragmentAssembler reassembly copy, per-fragment publication
 header writes, 16-datagram send cap -> to be profiled (1408+GSO vs 65504) before fixing.  Proper implementation: GSO-1.
 
+### 4.5 3-node acks=all latency (2026-10-03, k3s-node-01, 20k rec/s open loop, 1 KiB, MTU 65504)
+
+**Cause of the ~13 ms acks=all p50:** the driver duty cap (duty1).  fsync off, everything else equal:
+no flags 688 us / p99 9.6 ms; +duty1 24.2 ms / 45 ms; +early ack 672 us; +end-pass send 750 us; +early+end-pass 668 us.
+Follower 20 ms fsync off: 14.2 -> 13.3 ms (minor).  -> LAT-1 (k) follower fsync off, (l) remove duty1, (m) remove end-pass.
+
+**Per-batch waterfall** (rune-fr on client + 3 brokers, Aeron hooks SendData/RecvInsert/Sm*/SendSyscall/NAK/Recv-
+Dispatch only, rings 64 MiB, tape 11M, dump right after the client exits; overhead check: p50 660 us vs 688 us clean;
+completeness gate: 101,754 client batch offers = broker appends = waiter fires; all 101,754 batches traced).
+offer -> ack p50 553 us.  Critical follower = the one whose ack reached the leader last.
+
+| # | hop | p50 us | p90 us |
+|---|---|---|---|
+| 01 | client offer -> client driver send | 9 | 16 |
+| 02 | client send -> leader driver recv | 46 | 140 |
+| 03 | leader driver recv -> worker IngressFrame | 32 | 93 |
+| 04 | IngressFrame -> append done | 8 | 17 |
+| 05 | append -> push sent | 26 | 90 |
+| 06 | push -> leader driver send | 27 | 61 |
+| 07 | leader send -> follower driver recv | 53 | 192 |
+| 08 | follower driver recv -> apply done (apply ~14) | 79 | 207 |
+| 09 | apply done -> fast-ack sent | 1 | 1 |
+| 10 | fast-ack -> follower driver send | 51 | 121 |
+| 11 | follower send -> leader driver recv | 35 | 125 |
+| 12 | leader recv (last ack) -> HW>=X | 44 | 122 |
+| 13 | HW -> waiter fire | 20 | 54 |
+| 14 | waiter fire -> ack claimed | 2 | 5 |
+| 15 | ack claimed -> leader driver send | 27 | 55 |
+| 16 | leader send -> client driver recv | ~0 (clock +-10) | 32 |
+| 17 | client driver recv -> ClientAckRecv | 6 | 12 |
+| -- | non-critical follower's ack arrived earlier by | 75 | 386 |
+
+Real work ~30 us; ~85% is hand-off waiting (app -> driver send -> kernel -> driver recv -> app poll, ~9 hand-offs, each
+a fraction of a ~42 us worker pass).  Levers toward 100 us: (1) send-now: run the publication's driver send right after
+an offer (hops 05/06/10/15, ~130 us); (2) receive->handle-now: poll/dispatch the image in the same pass the driver
+inserted it (03/08/12 + part of 02/07/11, ~150 us); (3) fire+claim acks inside the HW-advance step (13); all-in-sync's
+slower-follower wait (75 us) shrinks with (1)+(2).  Client side total ~31 us (batch 14, send 10, ack poll 7).
+Harness fixes needed for a valid capture: rune-fr export raced the background drainer (segfault with 64 MiB rings) ->
+stopBackgroundDrain() before dumpAll (VM build); dump must not run inside the measured window; tape sized to the
+client thread's event rate; idle per-loop Aeron hooks masked out (RUNE_FR_AERON_MASK=0x87B0F8).
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
