@@ -576,6 +576,12 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
     target_include_directories(rune_producer_handle_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_producer_handle_bench PRIVATE rune_client_api rune_client_producer)
 
+    # LAT-1 h/i/j (backlog B) — producer encode + CRC cost under back-pressure
+    add_executable(rune_producer_encode_bench bench/ProducerEncodeBench.cpp)
+    target_include_directories(rune_producer_encode_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_producer_encode_bench PRIVATE
+        rune_client_api rune_client_producer benchmark::benchmark)
+
     # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
     add_executable(rune_m2o_claim_bench
         bench/M2OClaimBench.cpp
