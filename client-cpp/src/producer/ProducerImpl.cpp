@@ -2289,7 +2289,11 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
             reclaimAckRing_(ps);
             return;
         }
-        // U1 (nothing acked and log start 0 / not carried is U2 — no proof):
+        // U1 (nothing acked and log start 0 / not carried is U2 — no proof).
+        // Accepted window (D6 review M1, same as Kafka KIP-360): U1 proves only THIS attempt was not appended.
+        // Earlier attempts on the same lane were answered first (one FIFO publication); cross-lane ones park
+        // via C2b above.  Left: an earlier attempt whose OK is lost outright AND whose data was then retained /
+        // evicted away before a producer-state rebuild — then the re-sequenced re-send duplicates it.
         if (logStartOffset > 0 && ps.lastAckedOffset < logStartOffset) {  // retention removed our state
             resequence_(ps);
             return;
