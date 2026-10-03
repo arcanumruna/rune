@@ -1,4 +1,5 @@
 #pragma once
+#include <cerrno>
 // IoBackend.h — the worker's async-durability backend, selected ONCE at
 // construction (Task 10 fix 1 / C1).
 //
@@ -109,6 +110,16 @@ public:
     }
     IoBackend(const IoBackend&)            = delete;
     IoBackend& operator=(const IoBackend&) = delete;
+
+    /// io_uring only: bind the CALLING thread's io-wq to `cpus` (see UringFlushBackend).  0 or errno;
+    /// ENOTSUP when the backend is not io_uring.  Cold.
+    int setIoWorkerAffinity(const std::vector<int32_t>& cpus) noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) return uring_->setIoWorkerAffinity(cpus);
+#endif
+        (void)cpus;
+        return ENOTSUP;
+    }
 
     /// Returns kNoToken on back-pressure (in-flight depth reached) or when the
     /// selected backend cannot submit (Invalid).

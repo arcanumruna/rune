@@ -309,7 +309,9 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     // Worker affinity (shard mode only: pinned for cache locality; idle = backoff unless opted in).
     bool allLoopback = !cfg.peers.empty();
     for (const auto& p : cfg.peers) allLoopback = allLoopback && isLoopbackHost(p.host);
+    bool coreBaseDerived = false;
     if (cfg.workerCoreBase == NodeConfig::kWorkerCoreBaseAuto) {
+        coreBaseDerived = true;
         int32_t selfIndex = 0;
         for (const auto& p : cfg.peers) if (p.id < cfg.nodeId) ++selfIndex;
         const auto nodes = static_cast<int32_t>(std::max<std::size_t>(cfg.peers.size(), 1));
@@ -318,15 +320,29 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
             : -1;
         mark("coreBase");
     }
+    // io-wq affinity (LAT-1 f): derived ONLY for the layout derived above (co-located, all loopback): every
+    // node's workers sit at INDICES [1, 1 + nodes*W) of the allowed-CPU mask -> io-wq gets the other allowed
+    // CPUs.  An explicit RUNE_WORKER_CORE_BASE leaves io-wq inheriting (other nodes' cores are unknown) unless
+    // RUNE_IOWQ_CORES is set.
+    if (cfg.ioWorkerCpus.empty() && cfg.shardMode() && cfg.workerCoreBase >= 0 && coreBaseDerived) {
+        const auto nodes = static_cast<int64_t>(std::max<std::size_t>(cfg.peers.size(), 1));
+        const int64_t hi = 1 + nodes * W;
+        for (std::size_t i = 0; i < facts.allowedCpus.size(); ++i)
+            if (static_cast<int64_t>(i) < 1 || static_cast<int64_t>(i) >= hi) cfg.ioWorkerCpus.push_back(facts.allowedCpus[i]);
+        if (!cfg.ioWorkerCpus.empty()) mark("ioWq");
+    }
 
     const std::string io(ioBackend);
+    std::string ioWq;
+    for (const int32_t c : cfg.ioWorkerCpus) { if (!ioWq.empty()) ioWq += ','; ioWq += std::to_string(c); }
+    if (ioWq.empty()) ioWq = "inherit";
     char line[768];
     std::snprintf(line, sizeof line,
-        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
+        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
         "rcvWindow=%d rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
-        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(),
+        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(),
         cfg.aeronTermBufferBytes, cfg.aeronControlTermBufferBytes,
         static_cast<long long>(cfg.workerSyncIntervalMs), static_cast<long long>(cfg.followerFlushIntervalMs),
         cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,

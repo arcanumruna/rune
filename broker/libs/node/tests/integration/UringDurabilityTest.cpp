@@ -40,6 +40,12 @@
 #include <cstring>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/syscall.h>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 using rune::node::UringFlushBackend;
 using rune::node::FlushCompletion;
@@ -212,6 +218,51 @@ TEST(UringDurabilityTest, AckOnlyAfterCompletion) {
 
     ::close(fd);
     ::unlink(path);
+}
+
+// LAT-1 (f), review of the first cut: io-wq is per TASK — the mask must be registered on the submitting
+// thread and must cover the io-wq worker the kernel spawns for that thread's blocking fsync.  Reads the
+// real iou-wrk-<tid> thread's Cpus_allowed_list.
+TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegression) {
+    const int ncpu = static_cast<int>(::sysconf(_SC_NPROCESSORS_ONLN));
+    if (ncpu < 2) GTEST_SKIP() << "needs >= 2 CPUs";
+    std::string allowedOut;
+    int rc = -1;
+    std::thread t([&] {
+        rune::node::UringFlushBackend be(8, 8);
+        rc = be.setIoWorkerAffinity({0});
+        char path[] = "/tmp/rune_iowq_aff_XXXXXX";
+        const int fd = ::mkstemp(path);
+        ASSERT_GE(fd, 0);
+        std::vector<char> data(1 << 20, 'x');
+        ASSERT_EQ(::write(fd, data.data(), data.size()), static_cast<ssize_t>(data.size()));
+        const auto tok = be.submit(fd, 1);
+        ASSERT_NE(tok, rune::node::kNoToken);
+        const pid_t tid = static_cast<pid_t>(::syscall(SYS_gettid));
+        const std::string want = "iou-wrk-" + std::to_string(tid);
+        bool done = false;
+        for (int i = 0; i < 200000 && !done; ++i) {   // bounded poll (no sleep)
+            (void)be.reap([&](const rune::node::FlushCompletion&) { done = true; });
+            if (allowedOut.empty()) {
+                for (const auto& e : std::filesystem::directory_iterator("/proc/self/task")) {
+                    std::ifstream comm(e.path() / "comm");
+                    std::string name; std::getline(comm, name);
+                    if (name != want) continue;
+                    std::ifstream st(e.path() / "status");
+                    for (std::string line; std::getline(st, line);)
+                        if (line.rfind("Cpus_allowed_list:", 0) == 0) allowedOut = line.substr(line.find_last_of(" \t") + 1);
+                }
+            }
+            if (done && !allowedOut.empty()) break;
+            std::this_thread::yield();
+        }
+        ::close(fd);
+        ::unlink(path);
+    });
+    t.join();
+    ASSERT_EQ(rc, 0) << "IORING_REGISTER_IOWQ_AFF refused (kernel < 5.14?)";
+    ASSERT_FALSE(allowedOut.empty()) << "no io-wq worker was spawned for the submitting thread's fsync";
+    EXPECT_EQ(allowedOut, "0") << "the submitting thread's io-wq worker must be bound to the mask";
 }
 
 #endif // defined(__linux__)

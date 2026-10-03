@@ -1137,6 +1137,7 @@ public:
     [[nodiscard]] bool ioAcceptsSubmissions() const noexcept { return io_.acceptsSubmissions(); }
     /// Startup-only: the auto-selected io_uring fell back to portable ("" = no).
     [[nodiscard]] const std::string& ioFallbackReason() const noexcept { return io_.fallbackReason(); }
+    [[nodiscard]] bool ioIsUring() const noexcept { return io_.kind() == IoBackendKind::Uring; }
 
     // Task 7: test accessor — true if a Validator is installed for the given topic.
     // Worker-thread only; call only from single-threaded tests.
@@ -1185,6 +1186,13 @@ public:
                              "(Linux: check RUNE_WORKER_CORE_BASE; macOS: no-op)",
                              workerId_, coreId_);
             }
+        }
+        // LAT-1 (f): io-wq is per TASK — bind THIS thread's io-wq before its first blocking io op.
+        if (ioWorkerCpusResult_ < 0 && !ioWorkerCpus_.empty()) [[unlikely]] {
+            ioWorkerCpusResult_ = io_.setIoWorkerAffinity(ioWorkerCpus_);
+            if (ioWorkerCpusResult_ != 0 && io_.kind() == IoBackendKind::Uring)
+                spdlog::warn("Worker {}: IORING_REGISTER_IOWQ_AFF refused (errno={}) — io-wq threads keep the "
+                             "worker's affinity", workerId_, ioWorkerCpusResult_);
         }
 
         passNowNs_ = nowNs;   // this pass's clock (acks=all deadlines on the op path)
@@ -3355,6 +3363,8 @@ private:
     // E4: true after the one-shot self-pin attempt fires in doWork.
     // Prevents repeated pin attempts on every doWork call.
     bool pinned_ = false;
+    std::vector<int32_t> ioWorkerCpus_;   ///< LAT-1 (f), applied once on the worker thread
+    int ioWorkerCpusResult_ = -1;
 
     // E4: pin the calling thread to the given core.
     // Linux: uses pthread_setaffinity_np.  macOS: deliberate no-op (returns false).
@@ -4371,6 +4381,11 @@ public:
     /// Owned-log background sync interval (ns); 0 = never (durability via replication, Kafka model).
     /// Strict-tier acks keep their own coalesced fsync.  Before start.
     void setBackgroundSyncIntervalNs(int64_t ns) noexcept { syncIntervalNs_ = ns; }
+    /// LAT-1 (f): CPUs for this worker's io_uring io-wq threads.  Stored here (control thread, before the
+    /// runner starts); APPLIED on the worker thread at its first pass (io-wq is per task).
+    void setIoWorkerCpus(std::vector<int32_t> cpus) { ioWorkerCpus_ = std::move(cpus); }
+    /// Result of applying it on the worker thread: -1 not yet, 0 ok, else errno.
+    [[nodiscard]] int ioWorkerCpusResult() const noexcept { return ioWorkerCpusResult_; }
 private:
 
     // Time-gated owned-log sync (every mode, F30): same 10 ms gate and the same

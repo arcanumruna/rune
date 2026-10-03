@@ -46,10 +46,10 @@ libs/node/include/rune/node/detail/O2ORingBuffer.h | head = m_buffer.getInt64Vol
 libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt64Ordered(tailPositionIndex, nextTail); | 2 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -padding); | 1 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), padding); | 1 | RING | agrona ring implementation internals
-libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 2 | RING | kernel-shared io_uring SQ/CQ ring head/tail (fsync + F15 S4 async FADVISE submit paths)
-libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 2 | RING | kernel-shared io_uring SQ/CQ ring head/tail (fsync + F15 S4 async FADVISE submit paths)
-libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE); | 2 | RING | kernel-shared io_uring SQ/CQ ring head/tail (fsync + F15 S4 async FADVISE submit paths)
-libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 2 | RING | kernel-shared io_uring SQ/CQ ring head/tail (fsync + F15 S4 async FADVISE submit paths)
+libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
+libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
 
 # ------------------------------------------------------------ CLEANER
 libs/storage/include/rune/storage/Log.h | #include <atomic> | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)

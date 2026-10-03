@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 // UringFlushBackend.h — E3 Task 8a: Linux raw io_uring async-durability backend.
 //
 // This backend is compiled and usable ONLY on Linux.  On non-Linux platforms
@@ -73,6 +74,14 @@ public:
     // sufficient for our depth.  Throws std::system_error on setup failure.
     explicit UringFlushBackend(std::size_t submitDepth,
                                std::size_t completionDepth);
+
+    /// Bind the CALLING THREAD's io-wq (io_uring keeps io-wq per task, not per ring) to `cpus`
+    /// (IORING_REGISTER_IOWQ_AFF, Linux 5.14+).  Must run on the thread that submits, before its
+    /// first blocking op: the mask applies to io-wq threads created after the call.  Submits one
+    /// internal NOP first so the thread's io-wq context exists.  Returns 0 or an errno.  Cold.
+    int setIoWorkerAffinity(const std::vector<int32_t>& cpus) noexcept;
+    /// user_data of the internal NOP (never a real token: tokens count up from 1).
+    static constexpr uint64_t kInternalNopUserData = ~uint64_t{0};
 
     // Non-copyable, non-movable.
     UringFlushBackend(const UringFlushBackend&)            = delete;
@@ -155,10 +164,11 @@ private:
     bool fadviseSupported_{false};
     bool probeOpcode_(uint8_t opcode) noexcept;
 
-    // Internal helper called by submit() after token allocation.
-    CompletionToken submitWithToken(int fd, int64_t flushBoundary,
-                                    CompletionToken tok,
-                                    uint32_t tail, uint32_t mask) noexcept;
+    // The one SQE submission path (fsync, fadvise, internal NOP): reserve the SQ
+    // slot, copy `sqe` in, publish the tail, io_uring_enter; rolls the tail back
+    // on failure.  Returns 0, EBUSY (SQ full) or the enter errno.
+    int pushSqe_(const struct io_uring_sqe& sqe) noexcept;
+    CompletionToken allocToken_() noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -181,17 +191,20 @@ int UringFlushBackend::reap(H&& handler) noexcept {
         const uint32_t idx = head & mask;
         const struct io_uring_cqe* cqe = cqes_ + idx;
 
-        // Decode: user_data == token, res == 0 (success) or -errno (failure).
-        FlushCompletion comp{};
-        comp.token     = static_cast<CompletionToken>(cqe->user_data);
-        comp.errorCode = (cqe->res < 0) ? -cqe->res : 0;
+        // setIoWorkerAffinity's internal NOP is not a caller token: drained, never handed out.
+        if (cqe->user_data != kInternalNopUserData) [[likely]] {
+            // Decode: user_data == token, res == 0 (success) or -errno (failure).
+            FlushCompletion comp{};
+            comp.token     = static_cast<CompletionToken>(cqe->user_data);
+            comp.errorCode = (cqe->res < 0) ? -cqe->res : 0;
 
-        // flushBoundary is informational and not tracked by io_uring (I2: the
-        // old token % ring-size table aliased).  Completions match by token.
-        comp.flushBoundary = 0;
+            // flushBoundary is informational and not tracked by io_uring (I2: the
+            // old token % ring-size table aliased).  Completions match by token.
+            comp.flushBoundary = 0;
 
-        handler(comp);
-        ++count;
+            handler(comp);
+            ++count;
+        }
         if (inFlight_ > 0) --inFlight_;   // one completion drained → free a slot
 
         // Advance CQ head — store-release so the kernel sees the freed slot.

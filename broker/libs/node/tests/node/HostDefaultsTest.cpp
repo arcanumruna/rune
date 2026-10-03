@@ -492,6 +492,48 @@ TEST(HostDefaults, ControlPublicationsUseTheirOwnSmallTermRegression) {
     EXPECT_EQ(withTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1") << "0 = driver default";
 }
 
+// LAT-1 (f): io_uring punts blocking ops to io-wq kernel threads that inherit the submitter's affinity —
+// i.e. they ran ON the pinned worker's own core and preempted it.  With pinned workers the derived default
+// binds io-wq to the cores no co-located node's worker uses (core 0 on the 4-core bench box).
+TEST(HostDefaults, IoWorkersStayOffWorkerCoresRegression) {
+    for (int32_t self = 0; self < 3; ++self) {
+        NodeConfig c = threeNodeDefault(self);
+        const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+        ASSERT_EQ(c.workerCoreBase, 1 + self);
+        EXPECT_EQ(c.ioWorkerCpus, std::vector<int32_t>{0}) << "node " << self;
+        EXPECT_NE(hd.summary.find("ioWq=0 "), std::string::npos) << hd.summary;
+    }
+    NodeConfig unpinned = threeNodeDefault(0);
+    unpinned.workerCoreBase = -1;
+    (void)applyHostDerivedDefaults(unpinned, k3sFacts());
+    EXPECT_TRUE(unpinned.ioWorkerCpus.empty()) << "unpinned workers: io-wq keeps the kernel default";
+    NodeConfig expl = threeNodeDefault(0);
+    expl.ioWorkerCpus = {2, 3};
+    (void)applyHostDerivedDefaults(expl, k3sFacts());
+    EXPECT_EQ(expl.ioWorkerCpus, (std::vector<int32_t>{2, 3})) << "an explicit RUNE_IOWQ_CORES wins";
+    // Restricted allowed mask {2..7}: workers at INDICES 1..3 = CPUs 3,4,5 -> io-wq on the rest: 2,6,7.
+    auto restricted = k3sFacts();
+    restricted.allowedCpus = {2, 3, 4, 5, 6, 7};
+    NodeConfig r = threeNodeDefault(0);
+    (void)applyHostDerivedDefaults(r, restricted);
+    ASSERT_EQ(r.workerCoreBase, 3);
+    EXPECT_EQ(r.ioWorkerCpus, (std::vector<int32_t>{2, 6, 7}));
+    // An explicit core base (loopback peers): the other nodes' cores are unknown -> io-wq inherits.
+    NodeConfig eb = threeNodeDefault(0);
+    eb.workerCoreBase = 6;
+    auto eight = k3sFacts();
+    eight.allowedCpus = {0, 1, 2, 3, 4, 5, 6, 7};
+    (void)applyHostDerivedDefaults(eb, eight);
+    EXPECT_TRUE(eb.ioWorkerCpus.empty()) << "explicit RUNE_WORKER_CORE_BASE: no guessed io-wq set";
+    // The layout does not fit (3 nodes on 3 CPUs) -> unpinned -> inherit.
+    auto three = k3sFacts();
+    three.allowedCpus = {0, 1, 2};
+    NodeConfig nf = threeNodeDefault(0);
+    (void)applyHostDerivedDefaults(nf, three);
+    EXPECT_EQ(nf.workerCoreBase, -1);
+    EXPECT_TRUE(nf.ioWorkerCpus.empty());
+}
+
 TEST(HostDefaults, ApplyKeepsEveryExplicitValueAndIsIdempotent) {
     NodeConfig c = threeNodeDefault(1);
     c.aeronMtuBytes = 8192;

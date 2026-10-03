@@ -428,6 +428,11 @@ struct NodeConfig {
     /// writeback; recovery semantics in DUR-1.  The Strict tier keeps its per-write fsync.
     /// RUNE_WORKER_SYNC_INTERVAL_MS / RUNE_FOLLOWER_FLUSH_INTERVAL_MS.
     int64_t workerSyncIntervalMs         = 0;
+    /// RUNE_IOWQ_CORES (cpu list "0,4-5"): CPUs for the io_uring io-wq kernel threads.  Unbound, they may
+    /// run on (and preempt) a pinned worker's core.  Applied per worker thread at its first pass (io-wq is
+    /// per task; the mask covers io-wq threads created afterwards).  Empty = derived (HostDefaults: only
+    /// for the derived co-located layout — the allowed CPUs outside every node's workers).
+    std::vector<int32_t> ioWorkerCpus;
     int64_t followerFlushIntervalMs      = 0;
     //   - produce intake limit (F18): the largest produce batch the broker accepts
     //     is DERIVED, never refused at startup — produceIntakeLimit() below.  A
@@ -687,6 +692,10 @@ struct ConfigResult {
     std::optional<NodeConfig> config;
     std::string               error;
 };
+
+/// Parse a Linux cpu list ("0", "0,4-5"); sorted + deduplicated.  nullopt on any malformed token,
+/// a reversed range, an empty list or a CPU >= 1024 (CPU_SETSIZE).
+[[nodiscard]] std::optional<std::vector<int32_t>> parseCpuList(std::string_view s);
 
 /// Parse and validate node configuration from an injected env-lookup function.
 /// Use this overload in tests (inject a fake env map) so tests never touch

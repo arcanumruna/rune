@@ -438,6 +438,36 @@ std::optional<std::string> NodeConfig::validateShardConfig() const {
 // parseNodeConfig
 // ---------------------------------------------------------------------------
 
+std::optional<std::vector<int32_t>> parseCpuList(std::string_view s) {
+    std::vector<int32_t> out;
+    if (s.empty()) return std::nullopt;
+    std::size_t pos = 0;
+    auto num = [](std::string_view t, int32_t& v) {
+        if (t.empty() || t.size() > 4) return false;
+        v = 0;
+        for (char c : t) { if (c < '0' || c > '9') return false; v = v * 10 + (c - '0'); }
+        return v < 1024;
+    };
+    while (pos <= s.size()) {
+        const std::size_t comma = std::min(s.find(',', pos), s.size());
+        const std::string_view tok = s.substr(pos, comma - pos);
+        const std::size_t dash = tok.find('-');
+        int32_t lo = 0, hi = 0;
+        if (dash == std::string_view::npos) {
+            if (!num(tok, lo)) return std::nullopt;
+            hi = lo;
+        } else if (!num(tok.substr(0, dash), lo) || !num(tok.substr(dash + 1), hi) || hi < lo) {
+            return std::nullopt;
+        }
+        for (int32_t c = lo; c <= hi; ++c) out.push_back(c);
+        if (comma == s.size()) break;
+        pos = comma + 1;
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 ConfigResult parseNodeConfig(
     const std::function<const char*(const char*)>& getenv_fn)
 {
@@ -951,6 +981,11 @@ ConfigResult parseNodeConfig(
     parsePow2(getenv_fn("RUNE_IO_COMPLETION_RING_DEPTH"), cfg.ioCompletionRingDepth);
     parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);
     parsePow2(getenv_fn("RUNE_AERON_TERM_BUFFER_BYTES"),  cfg.aeronTermBufferBytes);
+    if (const char* raw = getenv_fn("RUNE_IOWQ_CORES"); raw && *raw) {
+        auto cpus = parseCpuList(raw);
+        if (!cpus) return {{}, std::string("RUNE_IOWQ_CORES must be a cpu list like 0,4-5, got '") + raw + "'"};
+        cfg.ioWorkerCpus = std::move(*cpus);
+    }
     for (auto [name, field] : {std::pair{"RUNE_WORKER_SYNC_INTERVAL_MS", &cfg.workerSyncIntervalMs},
                                std::pair{"RUNE_FOLLOWER_FLUSH_INTERVAL_MS", &cfg.followerFlushIntervalMs}}) {
         if (const char* raw = getenv_fn(name); raw && *raw) {

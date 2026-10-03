@@ -2395,3 +2395,18 @@ TEST(NodeConfig, FsyncIntervalsDefaultOffAndParseRegression) {
         EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value()) << "refused: " << bad;
     }
 }
+
+TEST(NodeConfig, IoWorkerCoresEnvParsesACpuList) {
+    EXPECT_EQ(rune::node::parseCpuList("0"), (std::vector<int32_t>{0}));
+    EXPECT_EQ(rune::node::parseCpuList("0,4-5"), (std::vector<int32_t>{0, 4, 5}));
+    EXPECT_EQ(rune::node::parseCpuList("3,1"), (std::vector<int32_t>{1, 3})) << "sorted, deduplicated";
+    for (const char* bad : {"", "a", "5-3", "-1", "1,", "1-", "1,,2", "4096"})
+        EXPECT_FALSE(rune::node::parseCpuList(bad).has_value()) << "refused: '" << bad << "'";
+    auto env = rune::node::base1node();
+    env["RUNE_IOWQ_CORES"] = "0,2";
+    auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->ioWorkerCpus, (std::vector<int32_t>{0, 2}));
+    env["RUNE_IOWQ_CORES"] = "zero";
+    EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
+}
