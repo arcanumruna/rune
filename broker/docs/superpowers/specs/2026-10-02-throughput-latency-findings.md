@@ -286,6 +286,30 @@ term 1 MiB / ctl 1 MiB, 3-node acks=all 1 KiB, one run each:
 
 (Same build at MTU 65504: 448 us / 200,506 rec/s.)  All 0 errors.
 
+### 4.9 Rune vs Kafka, small payloads (2026-10-03, k3s-node-01, 3 nodes on one box, 8 partitions, acks=all, no fsync)
+
+Rune: MTU 1408 + QD GSO/GRO, backoff workers, 1 MiB terms, fsync off (leader + follower), early ack flush,
+client deferred CRC (QD).  Kafka 4.0.0 KRaft (OpenJDK 17), RF3 min.insync=2, idempotent, no compression, 1 GiB heap
+per broker (8 GiB box).  One run per cell, 0 errors everywhere.
+
+Baseline (Kafka untuned: linger 5 / batch 256 KiB for throughput, linger 0 for latency; its latency INCLUDES JVM
+warm-up, Rune's excludes 3 s):
+
+| | Rune 64 B | Kafka 64 B | Rune 128 B | Kafka 128 B |
+|---|---|---|---|---|
+| saturation rec/s | 1,430,056 | 429,701 | 1,011,759 | 303,804 |
+| p50 @20k | 424 us | 10 ms | 461 us | 17 ms |
+| p99 @20k | 6.3 ms | 220 ms | 10.4 ms | 796 ms |
+| p99.9 @20k | 13.7 ms | 263 ms | 23.3 ms | 921 ms |
+
+Kafka tuning sweep (64 B, warm cluster, after a warm-up pass; stopped by the user before the last broker variant and
+the final warmed 128 B / latency pass):
+- producer (broker fetchers 4, net 3 / io 4, 1 MiB socket buffers, G1 MaxGCPauseMillis=20 + AlwaysPreTouch):
+  linger 5: 541k (256 KiB) / 518k (1 MiB); linger 10: 630k / 619k; linger 20: 610k / **688k**; linger 50: 632k / 605k.
+- broker (linger 20, 1 MiB): fetchers 1 net 3 io 4: 663k; fetchers 4 net 3 io 4: 674k; fetchers 1 net 4 io 8: 555k;
+  fetchers 4 net 4 io 8: 631k.  Fewer threads win on 4 cores.
+=> best tuned Kafka at 64 B ~ 674-688k rec/s vs Rune 1.43M (~2.1x).  Tuned Kafka latency not measured.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
