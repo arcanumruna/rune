@@ -185,16 +185,15 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
         // poisons the cache: every later assign() at the (lower) LEO is silently
         // dropped as non-monotonic (A5), so a becomeLeader epoch is never
         // recorded and KIP-101 answers / reconcile lineage checks go wrong.
-        // Kafka truncates the cache to the recovered LEO the same way.  An
-        // entry starting exactly AT the LEO (an epoch with no records yet) is
-        // kept: it still names the lineage the (possibly empty) log belongs to.
-        // Only against a RECOVERED log (the LEO is the true log end): an
-        // un-recovered Log reports its last segment's base and must never cost
-        // us epoch history.
+        // Kafka truncates the cache to the recovered LEO the same way
+        // (truncateFromEnd(LEO): every entry with startOffset >= LEO goes — an
+        // epoch with no surviving records names nothing).  Only against a
+        // RECOVERED log (the LEO is the true log end): an un-recovered Log
+        // reports its last segment's base and must never cost us epoch history.
         const Offset leo = logEndOffset_();
         const int32_t latest = epochCache_.latestEpoch();
-        if (diskLog_->isRecovered() && latest >= 0 && epochCache_.startOffsetFor(latest) > leo) {
-            epochCache_.truncateFromEnd(leo + 1);
+        if (diskLog_->isRecovered() && latest >= 0 && epochCache_.startOffsetFor(latest) >= leo) {
+            epochCache_.truncateFromEnd(leo);
             checkpointEpochs_();
         }
     }
@@ -353,6 +352,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     survivorFrontier_[cfg_.selfId] = logEndOffset_();
     reconcileTarget_   = -1;   // drop any pull latched under a prior term
     reconcileIssuedNs_ = -1;
+    adoptPeer_         = -1;
 
     // DR-BUG-6: arm the follower-lag TIME-clock reset for the first leader
     // doWork(nowNs).  Until it fires, no ISR check runs (lastIsrCheckNs_==0 makes
@@ -473,6 +473,12 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     if (isControlBatch(records)) [[unlikely]] return appendControlBatch(records, acksAll);
     assert(role_ == Role::Leader && "append() called on follower");
     ++rtAppends_;
+    // B1: an incomplete leader refuses acks=all appends (callers treat < 0 as a
+    // retriable refusal).  acks=false is the MetadataService path, which ignores
+    // the result today — refusing there would silently drop metadata records
+    // (tracked as a follow-up; that leader completes on its first evaluation in
+    // the single-writer metadata topology).
+    if (acksAll && !leaderComplete_) [[unlikely]] return kAppendNotLeader;
 
     if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) {
         return -1; // gated by min-ISR
@@ -536,7 +542,7 @@ bool PartitionReplica::isControlBatch(std::span<const uint8_t> bytes) noexcept
 
 Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatch, bool acksAll)
 {
-    if (role_ != Role::Leader) return kAppendNotLeader;          // retriable; never an assert
+    if (!acceptsProduce()) return kAppendNotLeader;              // retriable (B1: also while incomplete)
     if (!isControlBatch(controlBatch)) return kAppendInvalidBatch;
     ++rtAppends_;
     if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) return kAppendMinIsr;
@@ -578,6 +584,7 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
                                       bool acksAll)
 {
     assert(role_ == Role::Leader && "appendKeyed() called on follower");
+    if (acksAll && !leaderComplete_) [[unlikely]] return kAppendNotLeader;   // B1 (see append())
 
     if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) {
         return -1; // gated by min-ISR
@@ -727,6 +734,19 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // retry).  We never START a lineage-blind pull here.  If no such reconcile is
     // in flight, we serve nothing this round and let the follower's own epoch
     // probe (armed on becomeFollower) drive the lineage-checked decision.
+    // DUR-1 B2: a diverged follower gets no liveness / HW credit and no serve;
+    // one that ignored a truncation directive (fetches above it) has diverged.
+    if (FollowerSlot* const ls = followerSlots_.find(req.followerId); ls != nullptr) [[likely]] {
+        if (ls->diverged) [[unlikely]] return kErrNone;
+        if (ls->truncDirective >= 0) [[unlikely]] {
+            if (req.fetchOffset > ls->truncDirective) {
+                markDiverged_(*ls, req.fetchOffset);
+                return kErrNone;
+            }
+            ls->truncDirective = -1;   // obeyed
+        }
+    }
+
     if (req.fetchOffset > logEndOffset_()) {
         // DUR-1 (deficient leader): an ahead follower in a plain fetch holds
         // records we do not — possibly COMMITTED ones (Rune's HW is a majority of
@@ -747,14 +767,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
                 ++sendRefusals_;   // not owed: the follower re-fetches (and re-learns it)
         }
         if (reconcileTarget_ == req.followerId) {
-            FetchRequestMsg pull{};
-            pull.leaderEpoch = epoch_;
-            pull.partition   = cfg_.partitionId;
-            pull.followerId  = cfg_.selfId;               // WE are the puller
-            pull.fetchOffset = logEndOffset_();      // from our LEO
-            pull.maxBytes    = cfg_.maxFetchBytes;
-            pull.topicId     = cfg_.topicId;
-            (void)sendReconcilePull_(req.followerId, pull);
+            (void)sendReconcilePull_(req.followerId, makeReconcilePull_());
         }
         // Serve nothing forward to an ahead follower: forward-serving under the
         // new epoch could stamp divergent bytes.  The follower keeps its tail
@@ -1099,7 +1112,22 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             epochProbeEpoch_    = epoch_;
             epochProbeFloor_    = std::max(followerHw_, committedFloor_);
             epochProbeAttempts_ = 0;
-            lastFetchEmitNs_    = 0;     // probe on the next doWork
+            // M1: probe at the normal fetch cadence (never at RTT rate): an
+            // OOR <-> probe round trip that keeps resolving to "fetch again" is
+            // bounded to one probe per fetchIntervalNs, and logged once.
+            lastFetchEmitNs_    = lastKnownNowNs_;
+            if (oorLeo_ == logEndOffset_()) {
+                if (!oorLoopLogged_) {
+                    oorLoopLogged_ = true;
+                    spdlog::critical("PartitionReplica[node={} topic={} part={}]: repeated "
+                                     "kErrOutOfRange at LEO {} from leader {} (epoch {}) — the "
+                                     "leader cannot serve or reconcile our tail; probing at the "
+                                     "fetch cadence", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
+                                     logEndOffset_(), leaderId_, static_cast<long long>(epoch_));
+                }
+            } else {
+                oorLeo_ = logEndOffset_();
+            }
         }
         // Other errors — ignore (control plane handles epoch changes externally).
         return;
@@ -1177,11 +1205,8 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             truncateLog(truncOff);
         }
         epoch_ = resp.leaderEpoch;
-        epochCache_.assign(static_cast<int32_t>(epoch_), logEndOffset_());
-        // Task 9: persist the follower's updated epoch history (disk-backed only).
-        if (!memoryBacked_ && diskLog_ != nullptr) {
-            checkpointEpochs_();
-        }
+        // DUR-1 fix round 1 (H1a): the new epoch enters the cache only where its
+        // first APPLIED batch lands (below) — never on an empty response.
     }
 
     // Append replicated records if any.
@@ -1284,7 +1309,11 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // (preLeo).  assign() is monotonic + idempotent, so a repeated same-epoch
     // call is a harmless no-op.  This keeps latestEpoch() accurate so the
     // OffsetsForLeaderEpoch request carries the correct requestedEpoch.
-    if (resp.leaderEpoch >= 0
+    // DUR-1 fix round 1 (H1a): only when this response actually APPENDED (an
+    // empty push / an all-duplicate response proves nothing about where the
+    // epoch starts — recording it at our LEO claimed the new epoch for offsets
+    // the leader never wrote in it, breaking the KIP-101 lineage check).
+    if (resp.leaderEpoch >= 0 && logEndOffset_() > preLeo
         && static_cast<int32_t>(resp.leaderEpoch) > epochCache_.latestEpoch()) {
         epochCache_.assign(static_cast<int32_t>(resp.leaderEpoch), preLeo);
         // Task 9: persist follower epoch history on new-epoch adoption (disk-backed only).
@@ -1455,33 +1484,8 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         return;
     }
 
-    // DR-BUG-6 HW-RECOVERY: an OffsetsForLeaderEpoch probe is proof of liveness and
-    // carries the follower's LEO.  A survivor DEFERS normal fetching while it
-    // probes, so without this the leader never learns the survivor's LEO and its
-    // majority-of-ISR high-watermark stays stuck at 0 after failover — the whole
-    // committed set becomes UNDELIVERABLE to HW-bounded subscribers (GR-6) even
-    // though every record is durably on disk (observed: full committed set
-    // undelivered on a post-failover subscribe).  Treat the probe like a fetch for
-    // HW/ISR bookkeeping: record the follower's LEO (clamped to our own LEO — a
-    // follower can never advance our committed HW beyond what WE hold) so the HW
-    // recomputes and the survivor stays a live ISR member.  This is pure HW/liveness
-    // bookkeeping; it does NOT change any truncation decision below.
-    {
-        const Offset trackedLeo = std::min<Offset>(req.followerLeo, logEndOffset_());
-        if (trackedLeo >= 0) {
-            leaderState_.updateFollowerFetchOffset(req.followerId, trackedLeo);
-            // BUG FIX (ISR-tracking divergence): the probe must ALSO advance the
-            // IsrManager's per-follower fetch offset/time, exactly like a normal
-            // fetch (onFetchRequest updates BOTH).  Updating only leaderState_ left
-            // IsrManager's offset stale, so maybeShrinkIsr() evicted a follower that
-            // is in fact caught up (it was reporting its LEO via probes, not normal
-            // fetches, during epoch churn) → ISR collapsed below minIsr → produce
-            // rejected with MinIsrViolation even at 1 partition.  Keeping the two
-            // trackings in lock-step is what the comment above always intended
-            // ("the survivor stays a live ISR member").
-            isrManager_->onFollowerFetch(req.followerId, trackedLeo, lastKnownNowNs_);
-        }
-    }
+    const Offset leaderLeo = logEndOffset_();
+    FollowerSlot* const slot = followerSlots_.find(req.followerId);
 
     // Deficient-leader detection — EPOCH-LINEAGE gated AND ISR gated (see the
     // block comment above).  (1) The ahead tail must be a genuine continuation of
@@ -1496,36 +1500,86 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
     const bool sharedCont =
         followerTailIsSharedContinuation(req.requestedEpoch, req.followerLeo);
 
+    // The authoritative KIP-101 answer from our cache.
+    const auto ans = epochCache_.endOffsetForEpoch(
+        static_cast<int32_t>(req.requestedEpoch), leaderLeo);
+
+    // DUR-1 fix round 1 (H1): ADOPTION candidate.  Our whole log ends exactly
+    // where the last epoch we share with the follower ends on our side
+    // (ans.second == our LEO), and the follower's tail is in an epoch we never
+    // held (responseEpoch < requestedEpoch): we are a deficient leader that
+    // missed a whole epoch (or, after a power loss, everything).  The follower's
+    // records below ITS committed HW are committed regardless of their epoch
+    // (Paxos/Zab: a committed value is adopted, never overwritten), so we
+    // reverse-reconcile them — applyReconcileResponse verifies the boundary
+    // batch is byte-identical (Log Matching) and adopts only below the
+    // survivor's committed HW, extending our epoch cache with their epochs.
+    // Not ISR-gated: the HW bound is what excludes an uncommitted tail.
+    // (Also a shared continuation from a follower OUTSIDE the ISR: the HW bound
+    // excludes an old leader's uncommitted same-epoch tail, which the ISR gate
+    // of the DR-BUG-6 path rejects wholesale.)
+    const bool adoptCandidate =
+        !(followerInIsr && sharedCont) && req.followerLeo > leaderLeo &&
+        ans.second == leaderLeo && !(slot != nullptr && (slot->diverged || slot->adoptDone));
+    // Once an adoption from this follower reached its committed bound, the rest
+    // of its tail is uncommitted as far as it knows: never pull it (it may have
+    // re-entered the ISR on its lineage-checked prefix meanwhile).
+    const bool reconcile = !(slot != nullptr && slot->adoptDone) &&
+                           ((followerInIsr && sharedCont) || adoptCandidate);
+
+    // DR-BUG-6 HW-RECOVERY: an OffsetsForLeaderEpoch probe is proof of liveness and
+    // carries the follower's LEO — record it for HW/ISR bookkeeping like a fetch
+    // (a survivor DEFERS normal fetching while it probes, so without this the HW
+    // could stay stuck at 0 after failover).  DUR-1 fix round 1 (B2): only the
+    // LINEAGE-CHECKED prefix counts — min(follower LEO, our LEO, and, when we
+    // answer authoritatively, the answer's end offset): records past the
+    // divergence point are not a copy of ours.  A diverged follower gets no
+    // credit at all.
+    if (slot == nullptr || !slot->diverged) {
+        Offset trackedLeo = std::min<Offset>(req.followerLeo, leaderLeo);
+        if (!reconcile) trackedLeo = std::min<Offset>(trackedLeo, ans.second);
+        if (trackedLeo >= 0) {
+            leaderState_.updateFollowerFetchOffset(req.followerId, trackedLeo);
+            // (ISR-tracking divergence fix: IsrManager's offset/time move in
+            // lock-step with leaderState_, exactly like a normal fetch.)
+            isrManager_->onFollowerFetch(req.followerId, trackedLeo, lastKnownNowNs_);
+        }
+    }
+
+    // DUR-1 fix round 1 (B2/H1): a COMPLETE leader that learns a survivor holds
+    // records past our LEO that we must reconcile re-enters the completeness
+    // gate (the served HW is held where it is, appends are refused — B1) until
+    // they are in.  Otherwise it would keep appending over them meanwhile.
+    if (reconcile && leaderComplete_ && (slot == nullptr || !slot->diverged)) {
+        completenessFloor_ = computeServedHw();
+        leaderComplete_    = false;
+        survivorFrontier_.clear();
+        survivorFrontier_[cfg_.selfId] = leaderLeo;
+    }
+
     // DR-BUG-6 completeness gate: the probe is the ONLY lineage-validated report.
-    // An ISR survivor whose ahead tail is a genuine on-lineage continuation
-    // contributes its FULL LEO to the frontier (we must reconcile up to it before
-    // we may advertise/serve).  Any other case (divergent tail, non-ISR, or not
-    // ahead) is clamped to our own LEO so it can never raise the frontier.
-    if (!leaderComplete_) {
+    // A survivor we reconcile from contributes its FULL LEO to the frontier (we
+    // must pull up to it — for an adoption, applyReconcileResponse lowers it to
+    // what was committed once the committed prefix is in).  Any other case is
+    // clamped to the lineage-checked prefix so it can never raise the frontier.
+    if (!leaderComplete_ && (slot == nullptr || !slot->diverged)) {
         const Offset onLineage =
-            (followerInIsr && sharedCont)
-                ? req.followerLeo
-                : std::min<Offset>(req.followerLeo, logEndOffset_());
+            reconcile ? req.followerLeo
+                      : std::min<Offset>(std::min<Offset>(req.followerLeo, leaderLeo), ans.second);
         survivorFrontier_[req.followerId] = onLineage;
         maybeCompleteLeadership();
     }
 
-    if (followerInIsr && sharedCont) {
+    if (reconcile) {
         // (Re)issue the reverse pull.  We (re)send when idle (reconcileTarget_<0)
         // OR when the pending target is this same follower — the previous pull or
         // its response may have been dropped by the transport, and the follower
         // re-probes on cadence, so re-issuing here is the natural retry (it is
         // idempotent: applyReconcileResponse only appends the strictly-new tail).
         if (reconcileTarget_ < 0 || reconcileTarget_ == req.followerId) {
-            reconcileTarget_ = req.followerId;
-            FetchRequestMsg pull{};
-            pull.leaderEpoch = epoch_;
-            pull.partition   = cfg_.partitionId;
-            pull.followerId  = cfg_.selfId;               // WE are the puller
-            pull.fetchOffset = logEndOffset_();      // from our LEO
-            pull.maxBytes    = cfg_.maxFetchBytes;
-            pull.topicId     = cfg_.topicId;
-            (void)sendReconcilePull_(req.followerId, pull);
+            reconcileTarget_   = req.followerId;
+            adoptPeer_ = adoptCandidate ? req.followerId : (adoptPeer_ == req.followerId ? -1 : adoptPeer_);
+            (void)sendReconcilePull_(req.followerId, makeReconcilePull_());
         }
         // Fallback-race hardening (the Major): send an EXPLICIT defer keep-alive
         // instead of silently dropping the answer.  Silence lets the follower's
@@ -1544,18 +1598,69 @@ void PartitionReplica::onOffsetsForLeaderEpochRequest(
         return;
     }
 
-    // Authoritative answer from our cache.
-    auto r = epochCache_.endOffsetForEpoch(
-        static_cast<int32_t>(req.requestedEpoch), logEndOffset_());
-
+    // Authoritative answer.  DUR-1 B2: remember the cut we directed — a later
+    // fetch above it means the follower kept records past it (diverged).
+    if (slot != nullptr && ans.second < req.followerLeo) slot->truncDirective = ans.second;
     OffsetsForLeaderEpochRespMsg resp{};
     resp.leaderEpoch   = epoch_;
     resp.partition     = cfg_.partitionId;
-    resp.responseEpoch = r.first;
-    resp.endOffset     = r.second;
+    resp.responseEpoch = ans.first;
+    resp.endOffset     = ans.second;
     resp.errorCode     = kErrNone;
     resp.topicId       = cfg_.topicId;
     sendEpochAnswer_(req.followerId, resp);
+}
+
+// DUR-1 fix round 1: every reverse-reconcile pull starts ONE offset below our
+// LEO so the survivor's answer carries the batch that ends our log — the
+// Log-Matching check of applyReconcileResponse (an adoption of epochs we never
+// held requires that boundary batch to be byte-identical on both sides).
+FetchRequestMsg PartitionReplica::makeReconcilePull_() const noexcept
+{
+    FetchRequestMsg pull{};
+    pull.leaderEpoch = epoch_;
+    pull.partition   = cfg_.partitionId;
+    pull.followerId  = cfg_.selfId;                         // WE are the puller
+    const Offset leo = logEndOffset_();
+    pull.fetchOffset = leo > 0 ? leo - 1 : 0;
+    pull.maxBytes    = cfg_.maxFetchBytes;
+    pull.topicId     = cfg_.topicId;
+    return pull;
+}
+
+// H1 Log-Matching check: is `batch` (a survivor's copy) the same batch our log
+// holds at its base offset?  Same base, same length, same bytes from the
+// CRC-covered attributes on (the partitionLeaderEpoch stamp is excluded).
+bool PartitionReplica::sameBatchAsLocal_(const uint8_t* batch, std::size_t len)
+{
+    rune::protocol::RecordBatchReader theirs(batch, len);
+    const auto view = onLog([&](auto& L) { return L.readView(theirs.baseOffset(), 1); });
+    if (view.empty() || view.baseOffset != theirs.baseOffset()) return false;
+    rune::protocol::RecordBatchReader ours(view.data, view.len);
+    if (ours.totalLength() != theirs.totalLength() ||
+        static_cast<std::size_t>(ours.totalLength()) != len) return false;
+    const std::size_t from = static_cast<std::size_t>(rune::protocol::batch::kCrcOffset);
+    return std::memcmp(view.data + from, batch + from, len - from) == 0;
+}
+
+// DUR-1 B2: the follower kept records past the lineage-checked prefix we
+// directed it to (its committed floor forbade the cut): never count it as a
+// copy in this leadership.
+void PartitionReplica::markDiverged_(FollowerSlot& slot, Offset fetchOffset)
+{
+    slot.diverged       = true;
+    slot.truncDirective = -1;
+    survivorFrontier_.erase(slot.id);
+    if (isrManager_ && isrManager_->removeFromIsr(slot.id)) {
+        syncIsrToLeaderState();
+        recomputeHw();
+    }
+    spdlog::critical("PartitionReplica[node={} topic={} part={} epoch={}]: follower {} DIVERGED — "
+                     "it kept records up to {} past the lineage-checked prefix (its committed "
+                     "floor is above our divergence point: this leader lacks committed records "
+                     "it holds).  Kept out of the ISR, never counted as a copy, for this "
+                     "leadership.", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
+                     static_cast<long long>(epoch_), slot.id, fetchOffset);
 }
 
 // ---------------------------------------------------------------------------
@@ -1675,8 +1780,23 @@ void PartitionReplica::applyOffsetsForLeaderEpochResponse(
 
     // C2 defence-in-depth: never truncate below the committed floor captured at
     // transition — committed data is never dropped regardless of the answer.
-    if (truncOff < committedFloor) {
-        truncOff = committedFloor;
+    // DUR-1 fix round 1 (B2): but never silently KEEP the divergent records as
+    // if they were a copy either — the leader's lineage-checked prefix ends
+    // below records we know are committed, so this leader lacks committed data
+    // we hold.  WEDGE: keep the log untouched (the committed records survive
+    // for a future leadership to adopt), send nothing (no fetch → no ISR / HW
+    // credit; the leader keeps us out), CRITICAL once.  Cleared by a new
+    // leadership (becomeFollower), which re-runs the probe.
+    if (truncOff < committedFloor && truncOff < currentLeo) {
+        epochProbePending_ = false;
+        spdlog::critical("PartitionReplica[node={} topic={} part={}]: leader {} (epoch {}) "
+                         "lineage ends at {} (epoch {}) but we hold COMMITTED records up to {} "
+                         "(LEO {}) — refusing to truncate them or to count as its copy: WEDGED "
+                         "until a new leadership", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
+                         leaderId_, static_cast<long long>(epoch_), resp.endOffset,
+                         static_cast<long long>(resp.responseEpoch), committedFloor, currentLeo);
+        wedgeAt_(currentLeo, "the leader's lineage diverges below our committed floor");
+        return;
     }
 
     if (truncOff < currentLeo) {
@@ -1743,8 +1863,13 @@ void PartitionReplica::onReconcileRequest(const FetchRequestMsg& req)
     // Reply carrying the records and our LEO as the highWatermark hint (the
     // deficient leader uses byte content, not this HW, to advance its own).
     // survivor LEO as the HW hint; our epoch (>= leader's) fences stale.
+    // DUR-1 fix round 1 (H1): the highWatermark field carries OUR committed
+    // knowledge — the bound below which the puller may adopt records whose
+    // epoch it never held (committed regardless of epoch).
+    const Offset committedKnown = role_ == Role::Leader
+        ? highWatermark() : std::max(followerHw_, committedFloor_);
     auto resp = makeFetchResponse(
-        leo, kErrNone,
+        std::min<Offset>(committedKnown, leo), kErrNone,
         std::span<const uint8_t>(logBytes.data(), logBytes.size()));
     // F27 F3: a refused answer is owed and rebuilt + re-sent next pass.
     if (onTransport([&](auto& t) { return t.sendReconcileResponse(req.followerId, resp); }))
@@ -1763,6 +1888,20 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
     // Stale-epoch fence: ignore a reconcile answer from an older epoch.
     if (resp.leaderEpoch < epoch_) { reconcileTarget_ = -1; return; }
 
+    // DUR-1 fix round 1 (H1): an ADOPTION pull (see onOffsetsForLeaderEpochRequest)
+    // may take records of epochs we never held, but only (1) after the batch
+    // that ends our log was proven byte-identical on the survivor (Log
+    // Matching), (2) strictly below the survivor's committed HW (resp.highWatermark
+    // — committed regardless of epoch), (3) with epochs strictly above every
+    // epoch we hold below our LEO, ascending, and below our own epoch.
+    const bool   adoptPull         = adoptPeer_ >= 0 && reconcileTarget_ == adoptPeer_;
+    const Offset preLeo            = logEndOffset_();
+    const Offset survivorCommitted = resp.highWatermark;
+    int32_t baseLatest = -1;          // our latest epoch that owns records (< preLeo)
+    for (const auto& [ep, start] : epochCache_.entries()) if (start < preLeo) baseLatest = ep;
+    std::vector<std::pair<int32_t, Offset>> adoptedEpochs;   // (epoch, first base) — cold path
+    bool stoppedAtCommitted = false;
+
     if (!resp.records.empty()) {
         const std::size_t kMagicOff = static_cast<std::size_t>(
             rune::protocol::batch::kMagicOffset);
@@ -1774,9 +1913,12 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
         if (looksLikeRecordBatch) {
             // Append only the strictly-new tail (baseOffset >= current LEO),
             // preserving contiguity — identical idempotent walk to applyReplicated.
-            Offset currentLeo = logEndOffset_();
+            Offset currentLeo = preLeo;
+            bool boundaryVerified = (preLeo == 0);
             std::size_t newStart = resp.records.size();
+            std::size_t newEnd   = 0;      // byte end of the accepted run
             int64_t lastOff = -1;
+            int32_t lastNewEp = baseLatest;
             std::size_t pos = 0;
             while (pos < resp.records.size()) {
                 std::size_t rem = resp.records.size() - pos;
@@ -1787,43 +1929,52 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                 if (total <= 0 || pos + static_cast<std::size_t>(total)
                                   > resp.records.size()) break;
                 int64_t batchBase = r.baseOffset();
-                if (batchBase < currentLeo) { pos += static_cast<std::size_t>(total); continue; }
+                const int64_t batchLast = batchBase + r.lastOffsetDelta();
+                if (batchBase < currentLeo) {
+                    // The batch that ends our log: Log-Matching check (bytes from
+                    // the CRC-covered attributes on + length + base must match).
+                    if (batchLast == preLeo - 1)
+                        boundaryVerified = sameBatchAsLocal_(resp.records.data() + pos,
+                                                             static_cast<std::size_t>(total));
+                    pos += static_cast<std::size_t>(total);
+                    continue;
+                }
                 if (batchBase > currentLeo) break; // gap — stop
 
-                // DR-BUG-6 divergence guard — per-batch epoch-lineage validation.
-                //
-                // A survivor stamps each served batch's partitionLeaderEpoch from
-                // its own lineage (onReconcileRequest).  Before adopting a batch we
-                // require its stamped epoch to be on OUR accepted lineage — an epoch
-                // we ourselves hold in our epochCache.  This rejects a same-offset
-                // batch pulled from an UNSHARED / divergent epoch (the two-survivor
-                // contradiction): we never append it, and we stop the walk so no
-                // later (also-suspect) batch is adopted either.  A batch with an
-                // UNSET epoch (-1, e.g. legacy / raw-injected data with no lineage
-                // metadata) is accepted for backward compatibility — the primary
-                // epoch-lineage gate on the probe path already prevents pulling from
-                // a divergent source in the first place; this is defence in depth.
+                // DR-BUG-6 divergence guard — per-batch epoch-lineage validation:
+                // a batch stamped with an epoch we never held is rejected (and the
+                // walk stops), EXCEPT an adoption below the survivor's committed HW.
                 int32_t batchEp = r.partitionLeaderEpoch();
-                if (batchEp >= 0 && !epochCache_.hasEpoch(batchEp)) {
+                if (adoptPull) {
+                    if (!boundaryVerified) break;
+                    if (batchLast >= survivorCommitted) { stoppedAtCommitted = true; break; }
+                    if (batchEp >= 0 && !epochCache_.hasEpoch(batchEp)) {
+                        if (batchEp <= lastNewEp || batchEp >= static_cast<int32_t>(epoch_)) break;
+                        adoptedEpochs.emplace_back(batchEp, batchBase);
+                        lastNewEp = batchEp;
+                    }
+                } else if (batchEp >= 0 && !epochCache_.hasEpoch(batchEp)) {
                     break; // off-lineage batch — reject and stop.
                 }
 
                 if (newStart == resp.records.size()) newStart = pos;
-                lastOff = batchBase + r.lastOffsetDelta();
+                lastOff = batchLast;
                 currentLeo = lastOff + 1;
                 pos += static_cast<std::size_t>(total);
+                newEnd = pos;
             }
-            if (newStart < resp.records.size() && lastOff >= logEndOffset_()) {
+            if (adoptPull && lastOff + 1 >= survivorCommitted) stoppedAtCommitted = true;
+            if (newStart < newEnd && lastOff >= logEndOffset_()) {
+                // Only the ACCEPTED run [newStart, newEnd) — never bytes past a
+                // rejected batch.
                 std::vector<uint8_t> raw(
                     resp.records.begin() + static_cast<std::ptrdiff_t>(newStart),
-                    resp.records.end());
+                    resp.records.begin() + static_cast<std::ptrdiff_t>(newEnd));
                 // Byte-identity: the survivor stamped partitionLeaderEpoch on the
                 // served copy for our validation above.  Restore it to the UNSET
                 // sentinel (-1) before appending so a reconciled batch is
                 // BYTE-IDENTICAL to the same batch obtained via normal replication
-                // (which carries -1).  Otherwise a replica that reconciled a batch
-                // and one that replicated it would hold cosmetically-different bytes
-                // at the same offset — a (benign but real) log divergence.  The
+                // (which carries -1).  The epoch lives in the epoch cache.  The
                 // field is CRC-excluded, so restoring it needs no re-checksum.
                 std::size_t rp = 0;
                 while (rp < raw.size()) {
@@ -1850,6 +2001,13 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
                 } else {
                     onLog([&](auto& L){ L.append(raw, lastOff); });
                 }
+                // H1: extend our lineage with the adopted epochs (the current
+                // epoch's premature boundary at preLeo is dropped here and
+                // re-stamped at the new frontier below).
+                if (!adoptedEpochs.empty()) {
+                    epochCache_.truncateFromEnd(preLeo);
+                    for (const auto& [ep, base] : adoptedEpochs) epochCache_.assign(ep, base);
+                }
             }
         }
     }
@@ -1871,7 +2029,15 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
         const Offset newLeo = logEndOffset_();
         const int32_t curEp = static_cast<int32_t>(epoch_);
         const int64_t curEpStart = epochCache_.startOffsetFor(curEp);
-        if (curEpStart >= 0 && curEpStart < newLeo) {
+        if (curEpStart < 0 && epochCache_.latestEpoch() < curEp) {
+            // H1: the adoption dropped our premature boundary — re-assign it.
+            epochCache_.assign(curEp, newLeo);
+            if (!memoryBacked_ && diskLog_ != nullptr) checkpointEpochs_();
+        } else if (curEpStart >= 0 && curEpStart == preLeo && curEpStart < newLeo) {
+            // (Fix round 1: only when this response moved our LEO off the
+            // boundary — i.e. nothing was ever appended under the current epoch.
+            // A late / duplicate reconcile answer arriving after we appended in
+            // this epoch used to move the boundary over our own epoch records.)
             // Drop the premature boundary and re-assign at the true frontier.
             epochCache_.truncateFromEnd(curEpStart);
             epochCache_.assign(curEp, newLeo);
@@ -1885,6 +2051,16 @@ void PartitionReplica::applyReconcileResponse(const FetchResponseMsg& resp)
     // Reflect the pulled records into the leader's own LEO/HW machinery.
     leaderState_.setLeaderLogEndOffset(logEndOffset_());
     recomputeHw();
+
+    // H1: an adoption round that reached the survivor's committed bound took
+    // everything we may adopt from it — its remaining (uncommitted) tail must
+    // not hold completion: lower its frontier to what we now hold.
+    if (adoptPull && stoppedAtCommitted) {
+        if (FollowerSlot* const as = followerSlots_.find(reconcileTarget_)) as->adoptDone = true;
+        auto it = survivorFrontier_.find(reconcileTarget_);
+        if (it != survivorFrontier_.end() && it->second > logEndOffset_())
+            it->second = logEndOffset_();
+    }
 
     // Reconcile round complete; clear the in-flight marker so a further gap (if
     // any) can trigger another pull.
@@ -2138,16 +2314,9 @@ int PartitionReplica::doWork(int64_t nowNs)
                     if (aheadPeer >= 0) {
                         reconcileTarget_   = aheadPeer;
                         reconcileIssuedNs_ = nowNs;
-                        FetchRequestMsg pull{};
-                        pull.leaderEpoch = epoch_;
-                        pull.partition   = cfg_.partitionId;
-                        pull.followerId  = cfg_.selfId;          // WE are the puller
-                        pull.fetchOffset = myLeo;                // from our LEO
-                        pull.maxBytes    = cfg_.maxFetchBytes;
-                        pull.topicId     = cfg_.topicId;
                         // F27 F3/F4: a refused pull is owed (re-sent next pass);
                         // work only when it actually left.
-                        if (sendReconcilePull_(aheadPeer, pull)) ++work;
+                        if (sendReconcilePull_(aheadPeer, makeReconcilePull_())) ++work;
                     }
                 }
             }
@@ -2662,6 +2831,11 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
         if (followerId == cfg_.selfId) continue;
         FollowerSlot* const slot = followerSlots_.find(followerId);
         if (slot == nullptr) [[unlikely]] continue;     // impossible: ISR ⊆ replica set
+        // DUR-1 fix round 1 (H1b): an INCOMPLETE leader pushes only to followers
+        // whose position it knows (it would otherwise push from 0 — a follower's
+        // view of our lineage must come from its own probe / fetch).  B2: never
+        // to a diverged follower.
+        if ((!leaderComplete_ && slot->ackedLeo < 0) || slot->diverged) [[unlikely]] continue;
         const Offset from = slot->pushCursor();
         if (from >= currentLeo) continue;               // this follower has (been sent) it all
 

@@ -426,7 +426,15 @@ TEST(DrIntegrationRegression, FollowerRestartAfterUncleanShutdown_OutOfIsrUntilC
 // ISR — the controller ISR only changes on a leader change).  The leader is
 // then killed (process kill: its page cache survives).  Kafka's ELR keeps the
 // partition leaderless until the old leader returns; Rune elects a survivor
-// that lacks the range.
+// that lacks the range.  (Precondition shared with B2: the elected survivor
+// was in the controller ISR but not holding the committed prefix — the data
+// plane now refuses to COUNT such a follower as a copy (B2 wedge/diverged) and
+// adopts a survivor's committed prefix when it still can (H1), but only the
+// controller can avoid electing it.  E1b also covers the review's M2: an
+// unclean follower carried across a leadership change (the new leader has no
+// prior position for it, so the regression eviction cannot fire), and RF >= 4
+// with an even ISR, where the completeness quorum and the commit quorum need
+// not overlap.)
 TEST(DrIntegration, DISABLED_Kip966_DoubleFault_UncleanFollowerPlusLeaderKill) {
     DrCluster c(3);
     c.start();
@@ -498,4 +506,190 @@ TEST(DrIntegration, PowerLoss_AcrossSegmentRolls_SealedSegmentsSurvive) {
     c.applyMetadata(2);
     EXPECT_EQ(c.produceAcked(10), 10);
     expectAllConvergedAndAcked(c, "segment rolls");
+}
+
+// ===========================================================================
+// Fix round 1 (review) — each pinned by a reproduction first.
+// ===========================================================================
+
+// B1: an INCOMPLETE leader (completeness gate still holding: it has not yet
+// proven it holds the committed frontier) must refuse EVERY append — plain
+// (pid -1) produce, idempotent produce, control batch (txn marker), acks=all
+// internal-store append — with a retriable NotLeader.  The worker gate used to
+// check role() only, so a pid -1 batch landed on the deficient leader at
+// [10,15) and the reconciled survivors' [15,30) was grafted on top (divergence
+// + acked loss).  The harness produces through the REAL gate
+// (PartitionReplica::acceptsProduce, the predicate Worker / ClientGateway use).
+TEST(DrIntegrationRegression, IncompleteDeficientLeaderRefusesEveryAppend) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.isolate(3);
+    ASSERT_EQ(c.produceAcked(20), 20);
+    c.run(20);
+    c.moveLeader(3);
+    c.healAll();
+    ASSERT_FALSE(c.rep(3).isLeaderComplete());
+    EXPECT_FALSE(c.rep(3).acceptsProduce());
+    EXPECT_EQ(c.produce(5), 0) << "pid -1 produce accepted by an incomplete leader";
+    EXPECT_EQ(c.produceIdempotent(77, 0, 0, 5000).status, IdemResult::Status::Refused);
+    rune::protocol::RecordBatchBuilder mb(0, 0);
+    mb.setControl(true);
+    mb.setTransactional(true);
+    mb.setProducerId(77);
+    mb.append(std::string_view("\0\0\0\0", 4), std::string_view("\0\0\0\0\0\0", 6), 0);
+    const auto marker = mb.build();
+    EXPECT_EQ(c.rep(3).appendControlBatch(marker), PartitionReplica::kAppendNotLeader);
+    const uint8_t k[1] = {1}, v[1] = {2};
+    EXPECT_EQ(c.rep(3).appendKeyed(k, v, /*acksAll=*/true), PartitionReplica::kAppendNotLeader);
+    EXPECT_EQ(c.rep(3).logEndOffset(), 10) << "nothing may land before completion";
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    expectAllConvergedAndAcked(c, "incomplete leader gate");
+}
+
+// H1: the committed range a lagging replica misses was written under an epoch
+// it NEVER held (one extra leader move while it lagged).  Handed leadership it
+// must still recover that range (adopting the survivors' committed prefix with
+// its epochs) and complete — before the fix it stayed incomplete forever
+// (partition unwritable): the per-batch lineage gate rejected the unknown
+// epoch, and the followers' caches claimed the new epoch from an EMPTY push.
+TEST(DrIntegrationRegression, DeficientLeaderMissingWholeEpoch_AdoptsCommittedPrefix) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.isolate(3);
+    c.moveLeader(2);                             // epoch 2 on {1,2}; 3 never sees it
+    ASSERT_EQ(c.produceAcked(20), 20);
+    c.run(20);
+    c.moveLeader(3);                             // lagging ISR replica, epoch 3
+    c.healAll();
+    ASSERT_TRUE(c.waitWritable(kCap)) << "deficient leader never completed\n" << c.dump();
+    EXPECT_GE(c.rep(3).logEndOffset(), 30);
+    EXPECT_EQ(c.rep(3).leaderEpochCacheForTest().startOffsetFor(2), 10)
+        << "adopted epoch-2 range must be recorded in the leader's epoch cache";
+    EXPECT_EQ(c.produceAcked(25), 25);
+    expectAllConvergedAndAcked(c, "missing whole epoch");
+}
+
+// B2 (review repro, min-ISR 2): node 2 holds committed [10,30) the elected
+// leader 3 lacks; it was unreachable to the controller, so it is outside the
+// new ISR and learns the assignment late.  Before the fix its probe was
+// answered "truncate to 10", its floor (30) kept the records, it rejoined the
+// ISR on the clamped tracked LEO and then counted as a COPY of the leader's new
+// [10,35): 20 divergent offsets, bogus acks=all with one real copy.  Now the
+// leader (not yet past the shared point) ADOPTS node 2's committed prefix (H1):
+// no acked loss at all.
+TEST(DrIntegrationRegression, FloorClampedFollowerNeverCountedAsCopy_LeaderAdopts) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.isolate(3);
+    ASSERT_EQ(c.produceAcked(20), 20);           // committed on {1,2}
+    c.run(20);
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    ASSERT_EQ(c.failover({2}), 3);               // 2 alive but unreachable to the controller
+    c.applyMetadata(2);                          // 2 learns the assignment late
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(25), 25);
+    expectAllConvergedAndAcked(c, "floor clamp, adopted");
+}
+
+// B2 (wedge path, min-ISR 1): the elected leader already wrote past the shared
+// point before node 2 showed up, so node 2's committed [10,30) can no longer
+// be adopted.  Node 2 must WEDGE (keep its records, send nothing, CRITICAL
+// once) and the leader must never count it in the ISR / as a copy.
+TEST(DrIntegrationRegression, FloorClampedDivergedFollowerWedges_NeverCountedAsCopy) {
+    DrConfig cfg;
+    cfg.minIsr = 1;
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.isolate(3);
+    ASSERT_EQ(c.produceAcked(20), 20);           // committed on {1,2}
+    c.run(20);
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    ASSERT_EQ(c.failover({2}), 3);
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    const std::size_t ackedBefore = c.acked().size();
+    ASSERT_EQ(c.produceAcked(5), 5);             // leader 3 moves past the shared point (10)
+    c.applyMetadata(2);
+    c.run(300);
+    EXPECT_GE(c.rep(2).wedgedAtOffset(), 0) << "diverged follower must wedge\n" << c.dump();
+    EXPECT_EQ(c.rep(2).logEndOffset(), 30) << "its committed records are kept, not truncated";
+    EXPECT_FALSE(c.leaderIsrContains(2)) << "diverged follower counted in the ISR\n" << c.dump();
+    EXPECT_EQ(c.acked().size(), ackedBefore + 5);
+    EXPECT_EQ(c.produceAcked(5), 5);             // leader-only ISR (min-ISR 1) keeps committing
+    EXPECT_FALSE(c.leaderIsrContains(2));
+    // Every record acked AFTER the failover is on the leader; none of them was
+    // ever credited to node 2 (it never received or acknowledged any).
+    const auto ids3 = c.ids(3);
+    const auto ids2 = c.ids(2);
+    for (uint64_t a : c.acked()) {
+        if (a <= 30) continue;                   // pre-failover range: lost to the mis-election (E1b)
+        EXPECT_NE(std::find(ids3.begin(), ids3.end(), a), ids3.end()) << "acked id " << a;
+        EXPECT_EQ(std::find(ids2.begin(), ids2.end(), a), ids2.end()) << "node 2 counted for " << a;
+    }
+}
+
+// M1: an OutOfRange answer re-arms the KIP-101 probe; if the probe resolves to
+// "fetch again" and the leader answers OutOfRange again, the follower used to
+// loop OOR <-> probe at round-trip rate (both sites zeroed the cadence).  The
+// probe is now bounded to the normal fetch cadence (and a CRITICAL is logged
+// once).
+TEST(DrIntegrationRegression, OutOfRangeProbeLoop_BoundedToFetchCadence) {
+    DrConfig cfg;
+    cfg.fetchIntervalNs = 10 * kStepNs;
+    cfg.replicaLagMaxMs = 1000;
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.run(30);
+    const uint64_t before = c.sentBy(2, Kind::EpochReq);
+    FetchResponseMsg oor{};
+    oor.partition = kPartId;
+    oor.topicId   = kTopicId;
+    oor.errorCode = kErrOutOfRange;
+    for (int i = 0; i < 100; ++i) {
+        oor.leaderEpoch   = c.rep(2).epoch();
+        oor.highWatermark = c.rep(1).highWatermark();
+        c.rep(2).applyReplicated(oor);           // the leader keeps answering OutOfRange
+        c.step();
+    }
+    const uint64_t probes = c.sentBy(2, Kind::EpochReq) - before;
+    EXPECT_GT(probes, 0u);
+    EXPECT_LE(probes, 12u) << "OOR <-> probe loop not bounded to the fetch cadence";
+}
+
+// L2: production seals asynchronously (Log::setDeferSealSync — the worker's io
+// backend fsyncs the sealed segment later).  A power loss before that fsync
+// completes loses the sealed segment's unflushed bytes too; recovery must
+// still yield a GAP-FREE log (never a later segment's base as the LEO over
+// missing offsets) and the replica must re-fetch and converge.
+// KNOWN BUG (E1d, not fixed in round 1): Log recovery keeps every segment
+// file, so after this power loss the replica reports LEO = the last segment's
+// base (108) while holding 0 records — it claims offsets it does not have.
+// A structural "inter-segment gap => truncate" rule is NOT safe: compaction
+// legitimately removes a sealed segment's last records (gap to the next base),
+// and the cleaner checkpoint can trail its renames.  Needs a durable recovery
+// point (or a cleaner that always preserves each segment's end offset).
+TEST(DrIntegrationRegression, DISABLED_PowerLoss_AsyncSealNotCompleted_NoOffsetGap) {
+    DrConfig cfg;
+    cfg.segmentRollBytes = 2048;
+    cfg.deferSealSync    = true;
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(120), 120);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    ASSERT_GE(c.node(2).log->segmentBaseOffsets().size(), 3u);
+    c.crash(2, CrashKind::PowerLoss);
+    c.restart(2);
+    EXPECT_EQ(c.ids(2).size(), static_cast<std::size_t>(c.rep(2).logEndOffset()))
+        << "offset gap after recovery: LEO " << c.rep(2).logEndOffset() << " but "
+        << c.ids(2).size() << " records";
+    c.applyMetadata(2);
+    EXPECT_EQ(c.produceAcked(10), 10);
+    expectAllConvergedAndAcked(c, "async seal power loss");
 }

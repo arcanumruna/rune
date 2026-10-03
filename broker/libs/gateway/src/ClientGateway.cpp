@@ -2121,6 +2121,15 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
         return;  // engine untouched — no append
     }
+    // DUR-1 fix round 1 (B1): an INCOMPLETE leader (DR-BUG-6 completeness gate
+    // holding — it has not proven it holds the committed frontier) refuses EVERY
+    // batch, idempotent or not, with a retriable NotLeader produce answer: a
+    // pid -1 batch appended here would land over records a survivor still holds.
+    // Same predicate as the worker gate (PartitionReplica::acceptsProduce).
+    if (ownedReplica && committedMetadataReady_ && !ownedReplica->acceptsProduce()) [[unlikely]] {
+        sendResp(pc::ErrorCode::NotLeader, partition, 0);
+        return;  // engine untouched — no append
+    }
     const uint8_t effectiveTier = replica.durabilityTier();
     // ISR size for min-ISR gate: only applies in steady state (committedMetadataReady_
     // true) and when a replica is wired.  Zero causes the helper to skip the gate

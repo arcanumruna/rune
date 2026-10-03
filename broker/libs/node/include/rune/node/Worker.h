@@ -4030,7 +4030,7 @@ private:
     // is a replication-less partition (passthrough): nothing to gate.
     [[nodiscard]] [[gnu::always_inline]] static bool
     produceRoleGatePasses_(const rune::replication::PartitionReplica* r) noexcept {
-        return r == nullptr || r->role() == rune::replication::Role::Leader;
+        return r == nullptr || r->acceptsProduce();   // DUR-1 B1: role AND completeness
     }
     void rebuildOwnedIndex_() {
         uint32_t maxId = 0;

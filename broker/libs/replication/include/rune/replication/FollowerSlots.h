@@ -51,6 +51,19 @@ struct FollowerSlot {
     Offset  catchUpTarget     = -1;
     // F27: the follower's last fetchOffset in THIS leadership (-1 = not heard yet).
     Offset  ackedLeo          = -1;
+    // DUR-1 B2: an authoritative KIP-101 answer told this follower to truncate to
+    // this offset (-1 = none outstanding).  Its next fetch must be at or below
+    // it; a fetch ABOVE it means it kept records past the lineage-checked prefix
+    // (its committed floor forbade the cut) → `diverged`.
+    Offset  truncDirective    = -1;
+    // DUR-1 B2: sticky for this leadership — the follower holds records that
+    // diverge from this leader's lineage.  It is kept out of the ISR and never
+    // credited for liveness / HW.  Cleared only by a new leadership.
+    bool    diverged          = false;
+    // DUR-1 fix round 1 (H1): an adoption pull from this follower reached its
+    // committed bound — what is left above it is uncommitted: answer it
+    // authoritatively from now on (this leadership).
+    bool    adoptDone         = false;
     // F27: a fetch answer the transport refused, re-sent on the leader's next pass.
     // fetchOffset < 0 = nothing owed.  Superseded by the follower's next fetch.
     struct OwedAnswer {
@@ -112,6 +125,7 @@ struct FollowerSlot {
         servedFetchOffset = -1; servedLeo = -1; servedTimeNs = 0;
         askOffset = -1; askSinceNs = 0; pushedThrough = 0; catchUpTarget = -1;
         ackedLeo = -1; owed = OwedAnswer{}; dataServedThrough = -1; owedEpoch = OwedEpochAnswer{};
+        truncDirective = -1; diverged = false; adoptDone = false;
         // connGen is NOT reset: it belongs to the link, not the leadership — a
         // bounce across a re-election must still rewind (re-review 2 N1).
     }

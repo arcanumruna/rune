@@ -50,6 +50,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
+#include <rune/storage/ProducePath.h>
 
 #include <algorithm>
 #include <atomic>
@@ -85,6 +86,11 @@ struct DrConfig {
     int64_t followerFlushIntervalNs = 0;            // A3 default: OFF
     int64_t segmentRollBytes        = 64LL * 1024 * 1024;
     int     deliveryDelaySteps      = 0;            // extra steps a frame spends on the wire
+    /// Production seal mode (worker-driven replicas: setExternalFollowerFlush →
+    /// Log::setDeferSealSync): a roll queues the seal fsync for the owning
+    /// worker's io backend.  The harness never completes it, so a sealed segment
+    /// is NOT durable until then (worst case for a power loss).
+    bool    deferSealSync           = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -310,7 +316,7 @@ public:
     int produce(int count) {
         int appended = 0;
         for (int i = 0; i < count; ++i) {
-            if (!appendOne_(nextId_, /*pid*/-1, 0, -1)) break;
+            if (!appendOne_(nextId_, /*pid*/-1, 0, -1).isOK()) break;
             ++nextId_;
             ++appended;
         }
@@ -331,7 +337,7 @@ public:
     bool waitWritable(int cap = 2000) {
         return driveUntil([&] {
             DrNode* L = leaderNode_();
-            return L != nullptr && L->rep->isLeaderComplete() &&
+            return L != nullptr && L->rep->acceptsProduce() &&
                    static_cast<int>(L->rep->isr().size()) >= L->rep->minIsr();
         }, cap);
     }
@@ -341,18 +347,16 @@ public:
     /// leadership / log-generation change, as the worker does).
     IdemResult produceIdempotent(int64_t pid, int16_t pepoch, int32_t seq, uint64_t id) {
         IdemResult r;
-        DrNode* L = leaderNode_();
-        if (L == nullptr) return r;
-        ensurePsm_(*L);
-        const auto v = psm_.validate(kTopicId, pid, kPartId, pepoch, seq, seq);
-        if (v.isDuplicate()) { r.status = IdemResult::Status::Duplicate; r.offset = v.retryBaseOffset; return r; }
-        if (v.isOos())       { r.status = IdemResult::Status::OutOfOrder; return r; }
-        if (v.isFenced())    { r.status = IdemResult::Status::Fenced; return r; }
-        Offset base = -1;
-        if (!appendOne_(id, pid, pepoch, seq, &base)) return r;
-        psm_.update(kTopicId, pid, kPartId, pepoch, seq, seq, base);
+        const auto o = appendOne_(id, pid, pepoch, seq);
+        if (o.isDuplicate) { r.status = IdemResult::Status::Duplicate; r.offset = o.baseOffset; return r; }
+        if (!o.isOK()) {
+            using EC = rune::protocol::client::ErrorCode;
+            if (o.error == EC::OutOfOrderSequence)   r.status = IdemResult::Status::OutOfOrder;
+            else if (o.error == EC::InvalidProducerEpoch) r.status = IdemResult::Status::Fenced;
+            return r;
+        }
         r.status = IdemResult::Status::Appended;
-        r.offset = base;
+        r.offset = o.baseOffset;
         return r;
     }
 
@@ -472,8 +476,14 @@ public:
     }
 
     // Endpoint entry point.
+    /// Frames of `k` handed to the transport by node `from` (accepted or lost).
+    uint64_t sentBy(NodeId from, Kind k) const noexcept {
+        return sent_[static_cast<std::size_t>(from)][static_cast<int>(k)];
+    }
+
     bool send(Frame&& f) {
         const int k = static_cast<int>(f.kind);
+        if (f.from >= 0 && f.from < 8) ++sent_[static_cast<std::size_t>(f.from)][k];
         if (dropNext_[k] > 0) { --dropNext_[k]; ++framesLost_; return true; }
         if (cut_.count({f.from, f.to}) != 0) { ++framesLost_; return true; }   // lost on the wire
         f.due = step_ + 1 + static_cast<uint64_t>(cfg_.deliveryDelaySteps);
@@ -507,6 +517,7 @@ private:
     void open_(DrNode& n) {
         n.log = std::make_unique<Log>(n.dir, cfg_.segmentRollBytes);
         n.log->recover();
+        if (cfg_.deferSealSync) n.log->setDeferSealSync(true);
         n.ep  = std::make_unique<DrEndpoint>(this, n.id);
         n.rep = std::make_unique<PartitionReplica>(cfgFor_(n.id), Role::Follower, /*epoch=*/0,
                                                    replicas_, replicas_, n.log.get(), n.ep.get());
@@ -521,11 +532,18 @@ private:
         return &L;
     }
 
-    bool appendOne_(uint64_t id, int64_t pid, int16_t pepoch, int32_t seq, Offset* outBase = nullptr) {
+    /// The production produce path: the worker's role gate
+    /// (PartitionReplica::acceptsProduce — the SAME predicate Worker /
+    /// ClientGateway call) then the shared rune::storage::handleProduceBatch core
+    /// (min-ISR gate, PSM validate/update, page-cache append) and
+    /// onLeaderLogAppended().  The producer state is the leader's, rebuilt from
+    /// its log on every leadership / log-generation change (as the worker does).
+    rune::storage::ProduceOutcome appendOne_(uint64_t id, int64_t pid, int16_t pepoch, int32_t seq) {
+        rune::storage::ProduceOutcome refused;
+        refused.error = rune::protocol::client::ErrorCode::NotLeader;
         DrNode* L = leaderNode_();
-        if (L == nullptr) return false;
-        if (!L->rep->isLeaderComplete()) return false;                         // gateway gate
-        if (static_cast<int>(L->rep->isr().size()) < L->rep->minIsr()) return false;  // acks=all gate
+        if (L == nullptr || !L->rep->acceptsProduce()) return refused;
+        ensurePsm_(*L);
         rune::protocol::RecordBatchBuilder b(0, clock_ / 1'000'000);
         if (pid >= 0) {
             b.setProducerId(pid);
@@ -536,12 +554,14 @@ private:
         std::memcpy(v, &id, sizeof id);
         b.append(std::string_view{}, std::string_view(v, sizeof v), clock_ / 1'000'000);
         const auto bytes = b.build();
-        Offset base = -1;
-        L->log->appendNoSyncRestamp(bytes.data(), bytes.size(), /*lastOffsetDelta=*/0, base);
+        const auto o = rune::storage::handleProduceBatch(
+            bytes.data(), bytes.size(), kTopicId, kPartId, pid, pepoch, seq, *L->log, psm_,
+            /*acksAll=*/true, static_cast<int>(L->rep->isr().size()), L->rep->minIsr(),
+            /*durabilityTier=*/1);
+        if (!o.isOK() || o.isDuplicate) return o;
         L->rep->onLeaderLogAppended();
-        pending_.push_back(Pending{id, base, L->id, L->rep->epoch(), L->incarnation});
-        if (outBase) *outBase = base;
-        return true;
+        pending_.push_back(Pending{id, o.baseOffset, L->id, L->rep->epoch(), L->incarnation});
+        return o;
     }
 
     void settleAcks_() {
@@ -611,6 +631,7 @@ private:
     std::set<std::pair<NodeId, NodeId>> cut_;
     int                     dropNext_[6] = {0, 0, 0, 0, 0, 0};
     uint64_t                framesLost_ = 0;
+    uint64_t                sent_[8][6] = {};
     uint64_t                step_  = 0;
     int64_t                 clock_ = 0;
     uint64_t                nextId_ = 1;

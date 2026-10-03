@@ -740,3 +740,34 @@ TEST(WorkerProduceRegression, OversizeRejectLogRateLimitedRegression) {
 
 } // namespace
 } // namespace rune::node
+
+// DUR-1 fix round 1 (B1): the worker's produce role gate must refuse an
+// INCOMPLETE leader (DR-BUG-6 completeness gate holding) — it used to check
+// role()==Leader only, so a pid -1 batch was appended by a deficient leader
+// over records its survivors still held (divergence + acked loss).  The gate
+// is PartitionReplica::acceptsProduce (shared with the gateway + DR harness).
+TEST(WorkerProduceGateRegression, IncompleteLeaderRefusedNotLeader) {
+    namespace rr = rune::replication;
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("rune_b1_gate_" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir.string());
+        log.recover();
+        rr::NullPartitionTransport t;
+        rr::PartitionConfig cfg;
+        cfg.selfId = 1;
+        rr::PartitionReplica rep(cfg, rr::Role::Follower, 0, {1, 2, 3}, {1, 2, 3}, &log, &t);
+        EXPECT_FALSE(rune::node::Worker::produceRoleGatePassesForTest(&rep)) << "follower";
+        rep.becomeLeader(2, {1, 2, 3});              // majority (2) not yet reported → incomplete
+        ASSERT_EQ(rep.role(), rr::Role::Leader);
+        ASSERT_FALSE(rep.isLeaderComplete());
+        EXPECT_FALSE(rune::node::Worker::produceRoleGatePassesForTest(&rep))
+            << "an incomplete leader must refuse every produce (retriable NotLeader)";
+        rep.becomeLeader(3, {1});                    // lone-member ISR completes at once
+        ASSERT_TRUE(rep.isLeaderComplete());
+        EXPECT_TRUE(rune::node::Worker::produceRoleGatePassesForTest(&rep));
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}

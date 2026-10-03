@@ -435,8 +435,12 @@ TEST(ShardModeRegression, PeerRestartStillMismatchedStaysRefused) {
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid, 0);
         ASSERT_TRUE(leaderBecomes(c, ports, sid, part, 0));
+        // DUR-1 B1: node 0 is an INCOMPLETE leader until node 1 (whose plane is
+        // refused, so it never reports in) leaves its ISR by the lag check
+        // (replicaLagMaxMs) — every produce, acks=leader included, is refused
+        // NotLeader (retriable) until then.  Retry past that window.
         auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, part,
-                                    /*acks=leader*/0, makeBatch(3));
+                                    /*acks=leader*/0, makeBatch(3), /*maxAttempts=*/2000);
         ASSERT_TRUE(ack.has_value());
     }
     EXPECT_GE(rune::node::test::leoOnOwner(n0, 0, part), 3);

@@ -4691,6 +4691,19 @@ TEST(PsmLogConsistencyRegression, InlineIncompleteLeaderRefusesIdempotentBatches
     EXPECT_EQ(R.log().logEndOffset(), 3);
 }
 
+TEST(PsmLogConsistencyRegression, InlineIncompleteLeaderRefusesNonIdempotentBatchesRetriably) {
+    // DUR-1 fix round 1 (B1): the inline gate checked completeness only for
+    // idempotent batches (pid >= 0) — a pid -1 batch was appended by a leader
+    // still reconciling to the frontier, over records its survivors hold.
+    InlineRig R(Role::Follower, {1, 2});
+    preload(R.log(), /*pid=*/7, 0, 0, 2);
+    R.r->becomeLeader(2, {1, 2});
+    ASSERT_FALSE(R.r->isLeaderComplete()) << "precondition: follower 2 has not reported in";
+    const Answer a = R.produce(-1, -1, -1);
+    EXPECT_EQ(a.err, kNotLeader) << "a pid -1 batch reached an incomplete leader's log";
+    EXPECT_EQ(R.log().logEndOffset(), 3);
+}
+
 TEST(PsmLogConsistencyRegression, InlineMarkerRaisesTheProducerEpochLikeTheRebuild) {
     // Markers / epoch fencing: the rebuild applies every control batch as an
     // epoch raise; the inline marker append did not, so the live producer state

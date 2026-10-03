@@ -512,6 +512,16 @@ public:
     /// F15 §2.3: DR-BUG-6 leader-completeness (the deficient-leader reconcile is
     /// done).  Owner thread only.
     [[nodiscard]] bool        isLeaderComplete() const noexcept { return leaderComplete_; }
+    /// DUR-1 fix round 1 (B1): THE produce gate — the only predicate every
+    /// produce / control-batch append path consults (worker, gateway inline,
+    /// internal stores via append*, the DR harness).  A leader that has not yet
+    /// proven it holds the committed frontier (DR-BUG-6 completeness gate) must
+    /// not append: an incomplete deficient leader would append over records its
+    /// survivors still hold (divergence + acked loss).  Refusal = retriable
+    /// NotLeader.  One load + compare each (hot replica line).
+    [[nodiscard]] [[gnu::always_inline]] bool acceptsProduce() const noexcept {
+        return role_ == Role::Leader && leaderComplete_;
+    }
     /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
     /// content — a tail truncation or a reconcile append of foreign (old-term)
     /// batches.  A parked waiter compares it with the value it parked under.
@@ -753,6 +763,12 @@ public:
     static constexpr Offset kPushFlowWindowForTest = 16384;
     /// F27 F7: times an owed Data answer's whole-batch walk was (re)built.
     [[nodiscard]] uint64_t owedAnswerRebuildsForTest() const noexcept { return owedRebuilds_; }
+    /// The leader's tracked LEO for `follower` (-1 = none) — B1 SET semantics.
+    [[nodiscard]] Offset followerLeoForTest(NodeId follower) const noexcept {
+        const auto& m = leaderState_.followerLeos();
+        const auto it = m.find(follower);
+        return it == m.end() ? -1 : it->second;
+    }
 
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
     /// failover code that needs concrete Log methods).  Safe ONLY when this
@@ -879,6 +895,14 @@ private:
     /// F27 F3: DR sends that are OWED when refused and re-sent next pass.
     void sendEpochAnswer_(NodeId to, const OffsetsForLeaderEpochRespMsg& m);
     bool sendReconcilePull_(NodeId peer, const FetchRequestMsg& pull);
+    /// DUR-1 fix round 1: a reverse-reconcile pull from (our LEO - 1) — the
+    /// boundary batch rides along for the Log-Matching check.
+    [[nodiscard]] FetchRequestMsg makeReconcilePull_() const noexcept;
+    /// DUR-1 B2: mark a follower diverged for this leadership (out of the ISR,
+    /// never credited).  Cold.
+    void markDiverged_(FollowerSlot& slot, Offset fetchOffset);
+    /// H1 Log-Matching: `batch` equals our batch at its base offset.  Cold.
+    [[nodiscard]] bool sameBatchAsLocal_(const uint8_t* batch, std::size_t len);
     /// F27 F3: re-send owed DR frames (any role).  Returns sends accepted.
     int retryOwedDrSends_() noexcept;
 
@@ -1087,6 +1111,8 @@ private:
     // DUR-1: highest offset this replica has known as committed (monotonic,
     // this incarnation) — the floor of an OutOfRange-armed KIP-101 probe.
     Offset committedFloor_     = 0;
+    Offset oorLeo_             = -1;    ///< M1: LEO at the last OutOfRange-armed probe
+    bool   oorLoopLogged_      = false; ///< M1: the OOR<->probe loop CRITICAL is logged once
     bool   epochProbePending_ = false;
     Epoch  epochProbeEpoch_    = -1;   ///< epoch we transitioned into
     Offset epochProbeFloor_    = 0;    ///< committed HW floor at transition
@@ -1109,6 +1135,7 @@ private:
     // covers them.  reconcileTarget_ tracks which peer we are pulling from (to
     // avoid a storm of duplicate reconcile requests); -1 means idle.
     NodeId reconcileTarget_    = -1;   ///< peer we are reverse-fetching from
+    NodeId adoptPeer_          = -1;   ///< H1: the peer whose pull is an ADOPTION (see probe handler)
 
     // DR-BUG-6 CHURN-ROBUSTNESS: wall-clock (ns) at which the in-flight reconcile
     // pull was issued.  If a pull goes unanswered (its request or response dropped
