@@ -227,11 +227,26 @@ int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, in
         bytesSinceIndex_ = 0;
     }
     log_.seekp(0, std::ios::end);
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]] {
+        log_.setstate(std::ios::badbit);
+        failWrite_(storage_->writeFaultForTest, "LogSegment::append write");
+    }
     log_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
+    if (!log_) [[unlikely]] failWrite_(errno != 0 ? errno : EIO, "LogSegment::append write");
     logSize_ += static_cast<int64_t>(len);
     bytesSinceIndex_ += static_cast<int64_t>(len);
     nextOffset_ = lastOffset + 1;
     return nextOffset_;
+}
+
+// E1 (DUR-1): a data-write error is fail-stop exactly like an fsync error (Kafka: an IOException on a
+// log-dir append takes the dir offline -> halt).  With periodic fsync off this is how a dead disk is seen.
+// Sticky (first error wins); the owner's loop routes storageFailed() to the broker halt.  A partial
+// O_APPEND write may have left torn bytes: restart recovery truncates them.
+void LogSegment::failWrite_(int err, const char* what) {
+    if (err == 0) err = EIO;
+    if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = err;
+    throw std::system_error(err, std::generic_category(), std::string("rune: ") + what + " failed (" + logPath_ + ")");
 }
 
 int64_t LogSegment::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
@@ -278,10 +293,11 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // A leader crash before sync() (flushDirtyLogs) may lose the tail.
     // TODO(Milestone C): acks=All waits for ISR HWM before acking.
     off_t writePos = static_cast<off_t>(logSize_);
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
+        failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSync pwrite");
     ssize_t written = ::pwrite(fd_, data, len, writePos);
-    if (written < 0 || static_cast<std::size_t>(written) != len) {
-        throw std::runtime_error("rune: LogSegment::appendNoSync pwrite failed");
-    }
+    if (written < 0 || static_cast<std::size_t>(written) != len) [[unlikely]]
+        failWrite_(written < 0 ? errno : ENOSPC, "LogSegment::appendNoSync pwrite");   // short write = out of space
 
     logSize_ += static_cast<int64_t>(len);
     bytesSinceIndex_ += static_cast<int64_t>(len);
@@ -321,10 +337,11 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
     iov[1].iov_len  = len - 8;
 
     off_t writePos = static_cast<off_t>(logSize_);
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
+        failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSyncRestamp pwritev");
     ssize_t written = ::pwritev(fd_, iov, 2, writePos);
-    if (written < 0 || static_cast<std::size_t>(written) != len) {
-        throw std::runtime_error("rune: LogSegment::appendNoSyncRestamp pwritev failed");
-    }
+    if (written < 0 || static_cast<std::size_t>(written) != len) [[unlikely]]
+        failWrite_(written < 0 ? errno : ENOSPC, "LogSegment::appendNoSyncRestamp pwritev");
 
     // maxTimestamp lives at kMaxTimestampOffset (outside the base-offset field),
     // so reading it from the read-only `data` is correct.

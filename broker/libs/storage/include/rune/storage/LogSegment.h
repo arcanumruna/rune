@@ -19,11 +19,14 @@ namespace rune::storage {
 ///                    on this log (inline or async).  Sticky — never clears; a later
 ///                    "successful" fsync cannot vouch for pages the kernel dropped.
 ///   faultForTest   — test-only: while non-zero every inline sync fails with it.
+///   writeFaultForTest — test-only: while non-zero every data write (pwrite / pwritev /
+///                    fstream) fails with it (E1: dead disk without any fsync).
 struct LogStorageState {
     uint64_t syncCalls    = 0;
     uint64_t roleChangeSyncs = 0;   ///< recover()'s index msync + dir fsync (truncate / startup)
     int      failedErrno  = 0;
     int      faultForTest = 0;
+    int      writeFaultForTest = 0;
 };
 
 /// A single on-disk log segment: a ".log" data file paired with a ".index" mmap.
@@ -235,6 +238,7 @@ private:
     /// Shared write core: update index, write bytes, advance nextOffset_.
     /// Does NOT call sync(). Called by append() and appendNoSync().
     int64_t writeAndUpdateState(const uint8_t* data, std::size_t len, int64_t lastOffset);
+    [[noreturn]] void failWrite_(int err, const char* what);   ///< E1: sticky fail-stop + throw
 
     /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so
     /// readView() can return a span into the OS page cache.  Maps with geometric

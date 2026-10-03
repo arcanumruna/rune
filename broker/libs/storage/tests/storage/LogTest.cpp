@@ -1756,3 +1756,47 @@ TEST(LogRegression, TruncateRecoverFailureFailsStopRegression) {
     std::filesystem::remove_all(dir);
 }
 
+
+// E1 (DUR-1): with periodic fsync OFF by default, a dead disk must still be detected through the WRITE
+// path.  A failed pwrite/pwritev/fstream write used to throw a plain runtime_error and leave the log
+// "healthy" (failedErrno == 0): the next append wrote again (O_APPEND after a partial write = torn data)
+// and nothing routed the broker to the Kafka-style log-dir-failure halt.  Now: sticky fail-stop + errno.
+namespace {
+std::vector<uint8_t> e1Batch(int64_t base) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    b.append("k", "v", 1000);
+    return b.build();
+}
+} // namespace
+
+TEST(LogWriteFailStopRegression, EveryAppendPathMarksTheLogFailedOnAWriteError) {
+    for (int path = 0; path < 3; ++path) {
+        auto dir = makeTempDir("rune_log_e1_write");
+        std::filesystem::create_directories(dir);
+        {
+            Log log(dir.string(), 64LL * 1024 * 1024); log.recover();
+            const auto ok = e1Batch(0);
+            int64_t base = -1;
+            ASSERT_NO_THROW(log.appendNoSync(ok.data(), ok.size(), 0));
+            log.setWriteFaultForTest(EIO);
+            const auto b = e1Batch(1);
+            try {
+                if (path == 0) log.appendNoSync(b.data(), b.size(), 1);
+                else if (path == 1) log.appendNoSyncRestamp(b.data(), b.size(), 0, base);
+                else log.append(b, 1);
+                ADD_FAILURE() << "path " << path << ": a failed write must throw";
+            } catch (const std::system_error& e) {
+                EXPECT_EQ(e.code().value(), EIO) << "path " << path;
+            } catch (const std::exception& e) {
+                ADD_FAILURE() << "path " << path << ": must be a std::system_error carrying the errno: " << e.what();
+            }
+            EXPECT_TRUE(log.storageFailed()) << "path " << path << ": a write error is fail-stop";
+            EXPECT_EQ(log.storageErrno(), EIO) << "path " << path;
+            EXPECT_EQ(log.logEndOffset(), 1) << "path " << path << ": the failed batch is not part of the log";
+            log.setWriteFaultForTest(0);
+            EXPECT_THROW(log.appendNoSync(b.data(), b.size(), 1), std::system_error)
+                << "path " << path << ": sticky — no write after a failure, even once the fault clears";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}

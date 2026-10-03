@@ -1055,6 +1055,34 @@ TEST(StorageFailStopRegression, ErrorCompletionAfterOwnershipMoveHaltsAndNeverAc
     EXPECT_FALSE(s.log->storageFailed()) << "the foreign Log object is never written by this worker";
 }
 
+// E1 (DUR-1): periodic fsync is OFF by default (A3) — a dead disk on the LEADER append path must still halt
+// the broker through the write error itself: the produce is never acked OK and the worker signals the
+// storage failure (the Kafka log-dir-failure halt), with no fsync involved.
+TEST(StorageFailStopRegression, LeaderAppendWriteErrorHaltsWithPeriodicFsyncOff) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica leader(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    w.setOwnedDirect(Worker::OwnedSet{&leader});
+    w.setWorkerIngress(nullptr, true);
+    w.setShardMode(true);
+    log.setWriteFaultForTest(EIO);
+    const auto f = produceFrame(1, batchAt(0), /*acks=*/1, 1, 0, -1, -1);
+    EXPECT_NO_THROW(w.handleIngressFrameForTest(f.data(), f.size(), 1)) << "a write error never escapes the loop";
+    EXPECT_NO_THROW(w.doWork(2));
+    EXPECT_TRUE(log.storageFailed());
+    EXPECT_EQ(log.syncCallsForTest(), 0u) << "detected without any fsync";
+    int ok = 0, answered = 0, signals = 0;
+    w.drainReturn([&](WorkerReturn r) {
+        if (r.type == WorkerReturn::Type::ProduceResult) { ++answered; ok += r.errorCode == 0; }
+        if (r.type == WorkerReturn::Type::StorageFailure) { ++signals; EXPECT_EQ(r.errorCode, EIO); }
+    });
+    EXPECT_EQ(answered, 1) << "the producer gets an answer (never a hang)";
+    EXPECT_EQ(ok, 0) << "never an OK ack for a batch the disk refused";
+    EXPECT_EQ(signals, 1) << "the write error reaches the broker halt exactly once";
+}
+
 TEST(StorageFailStopRegression, LegacyFollowerFlushFailureHaltsNotTerminates) {
     TmpDir d;
     Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();

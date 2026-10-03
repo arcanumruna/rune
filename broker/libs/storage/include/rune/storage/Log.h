@@ -123,6 +123,8 @@ public:
     [[nodiscard]] uint64_t readViewCallsForTest() const noexcept { return readViewCalls_; }
     /// Test hook: while non-zero every inline sync fails with this errno.
     void setSyncFaultForTest(int err) noexcept { storage_.faultForTest = err; }
+    /// Test hook: while non-zero every data write fails with this errno (E1).
+    void setWriteFaultForTest(int err) noexcept { storage_.writeFaultForTest = err; }
 
     // ---- fsyncgate fail-stop (sticky per-log storage failure) -----------------
     /// True once ANY fsync/msync on this log failed (inline or async).  Never
