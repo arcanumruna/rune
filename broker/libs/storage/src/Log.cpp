@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <climits>
+#include <cstring>
+#include <rune/protocol/Crc32c.h>
 namespace rune::storage {
 
 namespace {
@@ -80,8 +82,14 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     std::sort(bases.begin(), bases.end());
     hadSegmentsAtOpen_ = !bases.empty();
     if (bases.empty()) bases.push_back(0);
-    // E1d: the value recovery reads (a non-recovered Log never writes it).
-    persistedRp_ = readRecoveryPointFile(dir_);
+    // E1d: precomputed checkpoint paths (no per-roll allocation); the value
+    // recovery would read (a non-recovered Log never writes it).
+    rpPath_    = dir_ + "/" + kRecoveryPointFile;
+    rpTmpPath_ = dir_ + "/" + kRecoveryPointTmpFile;
+    {
+        const RpFileRead rf = readRecoveryPointFile(dir_);
+        if (rf.state == RpFileState::Valid) persistedRp_ = rf.r;
+    }
     // F3: eager read-map ONLY the LAST (highest-base) segment — it becomes the
     // active segment.  Earlier (sealed) segments map their .log lazily on first
     // readView(), so N retained segments no longer means N read mmaps + N fds
@@ -102,8 +110,7 @@ Log::~Log() {
         std::error_code ec;
         if (std::filesystem::is_directory(dir_, ec)) (void)checkpointRecoveryPoint();   // dir removed: nothing to persist
     }
-    releaseRpFds_();
-    if (dirFd_ >= 0) { ::close(dirFd_); dirFd_ = -1; }
+    if (rpFd_ >= 0) { ::close(rpFd_); rpFd_ = -1; }
     // The background thread has been stopped by the owner before Log destruction,
     // so these are single-threaded.  Finalize any pending staging→base renames so
     // a clean shutdown leaves correctly-named files on disk (otherwise the next
@@ -592,26 +599,52 @@ std::vector<Log::SyncedExtent> Log::syncedExtentsForTest() const {
 }
 
 int64_t Log::recover() {
-    // E1d: the recovery point recovery trusts up to.  Missing (upgrade / first
-    // boot): the last sealed segment's end = the active segment's base.
-    int64_t rp = readRecoveryPointFile(dir_);
-    if (rp == kRecoveryPointUnknown) {
+    // E1d: the recovery point recovery trusts up to.
+    std::error_code ec;
+    std::filesystem::remove(rpTmpPath_, ec);   // a crash mid-creation: never renamed
+    const RpFileRead rf = readRecoveryPointFile(dir_);
+    int64_t rp = rf.r;
+    bool corrupt = false;
+    if (rf.state == RpFileState::Corrupt) {
+        // F5 (Kafka KafkaStorageException parity): both slots unreadable —
+        // nothing can be trusted or deleted.  Fail-stop: CRC-recover only (no
+        // chain truncation, no deletion), the log is permanently failed and
+        // its owner halts the broker.
+        corrupt = true;
+        if (storage_.failedErrno == 0) storage_.failedErrno = EIO;
+        spdlog::critical("Log::recover {}: {} is corrupt (no valid slot) — log FAILED (fail-stop); "
+                         "operator action required", dir_, kRecoveryPointFile);
+    } else if (rf.state == RpFileState::Missing) {
+        // Upgrade / first boot: the last sealed segment's end.
         rp = segments_.rbegin()->first;
         if (hadSegmentsAtOpen_)
             spdlog::warn("Log::recover {}: no {} — trusting every sealed segment (recovery point = "
                          "last sealed end {}); upgrade / first boot", dir_, kRecoveryPointFile, rp);
+    } else {
+        rpSeq_ = rf.seq;
+        rpActiveSlot_ = rf.slot;
     }
-    validateFromRecoveryPoint_(rp);
+    validateFromRecoveryPoint_(corrupt ? INT64_MAX : rp, /*deleteOnGap=*/!corrupt);
     const int64_t next = activeSegment().nextOffset();
     logEndOffset_ = next;
     recovered_ = true;
+    if (rf.state == RpFileState::Valid && rp > next)
+        spdlog::error("Log::recover {}: the persisted recovery point {} is ABOVE the recovered log end "
+                      "{} — durable data vanished from disk", dir_, rp, next);
     // Everything kept is durable now (trusted below rp, fsynced above it):
-    // R = LEO, persisted before anything is appended.
+    // R = LEO, persisted before anything is appended.  No snapshot publish here:
+    // recover() publishes once below, AFTER the real per-segment timestamps are
+    // known (CP-5.1: a 0 timestamp reads "ancient").
     recoveryPoint_ = next;
     rpDue_ = false;
-    // No snapshot publish here: recover() publishes once below, AFTER the real
-    // per-segment timestamps are known (CP-5.1: a 0 timestamp reads "ancient").
-    if (storage_.failedErrno == 0) (void)checkpointRecoveryPoint_(/*publish=*/false);
+    if (!corrupt && storage_.failedErrno == 0) {
+        if (rpFd_ < 0 && rf.state == RpFileState::Valid) {
+            rpFd_ = ::open(rpPath_.c_str(), O_RDWR);
+            if (rpFd_ < 0 && storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
+        }
+        if (rf.state == RpFileState::Missing) (void)createRecoveryPointFile_(next);
+        else if (storage_.failedErrno == 0)  (void)checkpointRecoveryPoint_(/*publish=*/false);
+    }
 
     // CP-5.1 FIX (retention-after-restart): compute the REAL largestTimestamp for
     // every SEALED segment by scanning its batches for the max maxTimestamp() value.
@@ -675,7 +708,7 @@ int64_t Log::recover() {
     return next;
 }
 
-void Log::validateFromRecoveryPoint_(int64_t rp) {
+void Log::validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap) {
     // Trusted region: segments whose end (= the next segment's base) is at or
     // below rp — CRC-recovered (a torn tail there is still cut), never
     // chain-checked: compaction legitimately leaves offset gaps between them.
@@ -690,11 +723,12 @@ void Log::validateFromRecoveryPoint_(int64_t rp) {
     // be CRC-clean AND end exactly where the next one begins.  At the first
     // mismatch / torn tail everything after is deleted (Kafka) — an async seal
     // that never completed must not leave the log claiming offsets it lacks.
+    bool deleted = false;
     for (; it != segments_.end(); ++it) {
         const int64_t next = it->second->recover();
         auto nx = std::next(it);
         if (nx == segments_.end()) break;
-        if (next == nx->first) continue;
+        if (next == nx->first || !deleteOnGap) continue;
         spdlog::warn("Log::recover {}: segment {} ends at {} but the next segment starts at {} "
                      "(above recovery point {}) — truncating there, deleting {} later segment(s)",
                      dir_, it->first, next, nx->first, rp,
@@ -706,15 +740,26 @@ void Log::validateFromRecoveryPoint_(int64_t rp) {
             std::filesystem::remove(indexPathForLog(lpath), ec);
             nx = erase_(nx);
         }
+        deleted = true;
         break;
     }
-    // Make the validated region durable (its torn-tail cuts and deletions too:
-    // the checkpoint's dir fsync follows) before R is persisted as the LEO.
-    auto from = segments_.upper_bound(rp);
-    if (from != segments_.begin()) --from;
-    for (; from != segments_.end(); ++from) {
-        if (from->second->fullyDurable() && std::next(from) != segments_.end()) continue;
-        (void)from->second->syncForRecovery();   // error: fail-stop (sticky)
+    if (deleteOnGap) {
+        // Make the validated region durable (its torn-tail cuts too) before R
+        // is persisted as the LEO.
+        auto from = segments_.upper_bound(rp);
+        if (from != segments_.begin()) --from;
+        for (; from != segments_.end(); ++from) {
+            if (from->second->fullyDurable() && std::next(from) != segments_.end()) continue;
+            (void)from->second->syncForRecovery();   // error: fail-stop (sticky)
+        }
+        if (deleted) {   // the deletions themselves: a FULL directory fsync (cold)
+            const int dfd = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
+            ++storage_.roleChangeSyncs;
+            if (dfd < 0 || ::fsync(dfd) != 0) {
+                if (storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
+            }
+            if (dfd >= 0) ::close(dfd);
+        }
     }
     // The (possibly new) active segment: preallocate as the ctor did.
     activeSegment().preallocate(rollBytes_);
@@ -723,54 +768,102 @@ void Log::validateFromRecoveryPoint_(int64_t rp) {
 // ---------------------------------------------------------------------------
 // E1d: durable recovery point.
 // ---------------------------------------------------------------------------
-int64_t Log::readRecoveryPointFile(const std::string& dir) noexcept {
-    try {
-        std::ifstream f(dir + "/" + kRecoveryPointFile);
-        if (!f.is_open()) return kRecoveryPointUnknown;
-        int version = -1;
-        long long v = -1;
-        if (!(f >> version >> v) || version != 1 || v < 0) {
-            spdlog::error("Log: unreadable {} in {} — treated as missing", kRecoveryPointFile, dir);
-            return kRecoveryPointUnknown;
+namespace {
+inline int platformDataSync(int fd) noexcept {
+#if defined(__APPLE__)
+    return ::fsync(fd);
+#else
+    return ::fdatasync(fd);
+#endif
+}
+inline void putLe32(uint8_t* p, uint32_t v) noexcept { for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); }
+inline void putLe16(uint8_t* p, uint16_t v) noexcept { p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8); }
+inline void putLe64(uint8_t* p, uint64_t v) noexcept { for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); }
+inline uint32_t getLe32(const uint8_t* p) noexcept { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; }
+inline uint16_t getLe16(const uint8_t* p) noexcept { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
+inline uint64_t getLe64(const uint8_t* p) noexcept { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; }
+// Slot layout (32 bytes, LE): [0] magic u32 | [4] version u16 | [6] reserved u16
+// | [8] seq u64 | [16] R i64 | [24] crc32c u32 over [0,24) | [28] reserved u32.
+constexpr std::size_t kRpCrcOffset = 24;
+} // namespace
+
+void Log::encodeRpSlot(uint8_t (&out)[kRpSlotBytes], uint64_t seq, int64_t r) noexcept {
+    std::memset(out, 0, sizeof out);
+    putLe32(out + 0, kRpMagic);
+    putLe16(out + 4, kRpVersion);
+    putLe64(out + 8, seq);
+    putLe64(out + 16, static_cast<uint64_t>(r));
+    putLe32(out + kRpCrcOffset, rune::protocol::crc32c(out, kRpCrcOffset));
+}
+
+bool Log::decodeRpSlot(const uint8_t* in, uint64_t& seq, int64_t& r) noexcept {
+    if (getLe32(in) != kRpMagic || getLe16(in + 4) != kRpVersion) return false;
+    if (getLe32(in + kRpCrcOffset) != rune::protocol::crc32c(in, kRpCrcOffset)) return false;
+    seq = getLe64(in + 8);
+    r   = static_cast<int64_t>(getLe64(in + 16));
+    return r >= 0 && seq > 0;
+}
+
+Log::RpFileRead Log::readRecoveryPointFile(const std::string& dir) noexcept {
+    RpFileRead out;
+    const std::string path = dir + "/" + kRecoveryPointFile;
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        if (errno != ENOENT) out.state = RpFileState::Corrupt;   // present but unreadable
+        return out;
+    }
+    out.state = RpFileState::Corrupt;
+    for (int slot = 0; slot < 2; ++slot) {
+        uint8_t buf[kRpSlotBytes];
+        const ssize_t n = ::pread(fd, buf, sizeof buf, static_cast<off_t>(slot * kRpSlotStride));
+        if (n != static_cast<ssize_t>(sizeof buf)) continue;
+        uint64_t seq = 0; int64_t r = 0;
+        if (!decodeRpSlot(buf, seq, r)) continue;
+        if (out.state != RpFileState::Valid || seq > out.seq) {
+            out.state = RpFileState::Valid; out.seq = seq; out.r = r; out.slot = slot;
         }
-        return static_cast<int64_t>(v);
-    } catch (...) {
-        return kRecoveryPointUnknown;
     }
+    ::close(fd);
+    if (out.state != RpFileState::Valid) out.r = kRecoveryPointUnknown;
+    return out;
 }
 
-int Log::dirFd_open_() noexcept {
-    if (dirFd_ < 0) dirFd_ = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
-    return dirFd_;
-}
-
-int Log::writeRecoveryPointTmp_(int64_t value, int& fdOut) noexcept {
-    fdOut = -1;
-    const std::string tmp = dir_ + "/" + kRecoveryPointTmpFile;
-    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return errno != 0 ? errno : EIO;
-    char buf[48];
-    const int n = std::snprintf(buf, sizeof buf, "1\n%lld\n", static_cast<long long>(value));
-    if (storage_.writeFaultForTest != 0) { ::close(fd); return storage_.writeFaultForTest; }
-    const ssize_t w = ::pwrite(fd, buf, static_cast<std::size_t>(n), 0);
-    if (w != n) { const int e = w < 0 ? errno : ENOSPC; ::close(fd); return e != 0 ? e : EIO; }
-    fdOut = fd;
+int Log::createRecoveryPointFile_(int64_t r) noexcept {
+    // Cold, once per log lifetime: build the full pre-allocated file under a
+    // tmp name, fsync it, rename it into place and FULL-fsync the directory
+    // (F3: the directory entry must be durable — never a datasync).
+    std::vector<uint8_t> file(kRpFileBytes, 0);
+    uint8_t slot[kRpSlotBytes];
+    const uint64_t seq = ++rpSeq_;
+    encodeRpSlot(slot, seq, r);
+    std::memcpy(file.data(), slot, sizeof slot);   // slot 0 valid, slot 1 empty (invalid)
+    int err = 0;
+    const int fd = ::open(rpTmpPath_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) err = errno != 0 ? errno : EIO;
+    if (err == 0 && storage_.writeFaultForTest != 0) err = storage_.writeFaultForTest;
+    if (err == 0 && ::pwrite(fd, file.data(), file.size(), 0) != static_cast<ssize_t>(file.size()))
+        err = errno != 0 ? errno : ENOSPC;
+    ++storage_.roleChangeSyncs;
+    if (err == 0 && storage_.faultForTest != 0) err = storage_.faultForTest;
+    if (err == 0 && ::fsync(fd) != 0) err = errno != 0 ? errno : EIO;
+    if (err == 0 && ::rename(rpTmpPath_.c_str(), rpPath_.c_str()) != 0) err = errno != 0 ? errno : EIO;
+    if (err == 0) {
+        const int dfd = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
+        ++storage_.roleChangeSyncs;
+        if (dfd < 0 || ::fsync(dfd) != 0) err = errno != 0 ? errno : EIO;
+        if (dfd >= 0) ::close(dfd);
+    }
+    if (err != 0) {
+        if (fd >= 0) ::close(fd);
+        if (storage_.failedErrno == 0) storage_.failedErrno = err;
+        spdlog::critical("Log {}: creating {} FAILED (errno={}) — log failed", dir_, kRecoveryPointFile, err);
+        return err;
+    }
+    rpFd_ = fd;   // the renamed inode: kept open for every later slot write
+    rpActiveSlot_ = 0;
+    persistedRp_ = r;
+    ++rpPersists_;
     return 0;
-}
-
-void Log::releaseRpFds_() noexcept {
-    if (rp_.tmpFd >= 0) { ::close(rp_.tmpFd); rp_.tmpFd = -1; }
-}
-
-void Log::abandonRecoveryCheckpoint_() noexcept {
-    if (rp_.stage == RpStage::Idle) return;
-    if (rp_.inFlight) {
-        rp_.abandoned = true;            // the completion releases the fds
-    } else {
-        releaseRpFds_();
-        rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
-    }
-    if (recoveryPoint_ > persistedRp_) rpDue_ = true;   // re-checkpoint the current R later
 }
 
 int Log::checkpointRecoveryPoint() noexcept { return checkpointRecoveryPoint_(/*publish=*/true); }
@@ -778,29 +871,29 @@ int Log::checkpointRecoveryPoint() noexcept { return checkpointRecoveryPoint_(/*
 int Log::checkpointRecoveryPoint_(bool publish) noexcept {
     if (!recovered_) return 0;
     if (storage_.failedErrno != 0) return storage_.failedErrno;
-    // An in-progress async checkpoint holds the tmp file / a renamed value:
-    // this inline one supersedes it (its completion never renames).
-    if (!rp_.abandoned) abandonRecoveryCheckpoint_();
+    if (rpFd_ < 0) return 0;
+    // Target slot: never the one an in-flight async write may be landing in.
+    // A Prepared / InFlight checkpoint is superseded: its completion never
+    // moves persistedRp_ (this write carries a HIGHER seq).
+    int target;
+    if (rp_.stage == RpStage::InFlight) {
+        target = 1 - rp_.slot;            // the in-flight write keeps its slot
+        rp_.abandoned = true;
+    } else {
+        if (rp_.stage == RpStage::Prepared) rp_ = RpCheckpoint{RpStage::Idle, false, -1, 0, 0};
+        target = rpActiveSlot_ < 0 ? 0 : 1 - rpActiveSlot_;
+    }
     const int64_t v = recoveryPoint_;
-    int fd = -1;
-    int err = writeRecoveryPointTmp_(v, fd);
-    if (err == 0) {
-        ++storage_.roleChangeSyncs;
-        if (storage_.faultForTest != 0) err = storage_.faultForTest;
-        else if (::fsync(fd) != 0) err = errno != 0 ? errno : EIO;
-    }
-    if (fd >= 0) ::close(fd);
-    if (err == 0) {
-        const std::string tmp = dir_ + "/" + kRecoveryPointTmpFile;
-        const std::string fin = dir_ + "/" + kRecoveryPointFile;
-        if (::rename(tmp.c_str(), fin.c_str()) != 0) err = errno != 0 ? errno : EIO;
-    }
-    if (err == 0) {
-        const int dfd = dirFd_open_();
-        ++storage_.roleChangeSyncs;
-        if (dfd < 0) err = errno != 0 ? errno : EIO;
-        else if (::fsync(dfd) != 0) err = errno != 0 ? errno : EIO;
-    }
+    uint8_t img[kRpSlotBytes];
+    const uint64_t seq = ++rpSeq_;
+    encodeRpSlot(img, seq, v);
+    int err = 0;
+    if (storage_.writeFaultForTest != 0) err = storage_.writeFaultForTest;
+    else if (::pwrite(rpFd_, img, sizeof img, static_cast<off_t>(target * kRpSlotStride)) != static_cast<ssize_t>(sizeof img))
+        err = errno != 0 ? errno : ENOSPC;
+    ++storage_.roleChangeSyncs;
+    if (err == 0 && storage_.faultForTest != 0) err = storage_.faultForTest;
+    if (err == 0 && platformDataSync(rpFd_) != 0) err = errno != 0 ? errno : EIO;
     if (err != 0) {
         if (storage_.failedErrno == 0) storage_.failedErrno = err;
         spdlog::critical("Log {}: persisting the recovery point {} FAILED (errno={}) — log failed",
@@ -809,11 +902,17 @@ int Log::checkpointRecoveryPoint_(bool publish) noexcept {
     }
     const bool moved = v != persistedRp_;
     persistedRp_ = v;
-    rpDue_ = recoveryPoint_ > persistedRp_ && nextSegmentBaseAfter(persistedRp_) != -1 &&
-             nextSegmentBaseAfter(persistedRp_) <= recoveryPoint_;
+    rpActiveSlot_ = target;
     ++rpPersists_;
+    refreshRpDue_();
     if (publish && moved && !segments_.empty()) publishSealedSnapshot();   // cleaner gate
     return 0;
+}
+
+void Log::refreshRpDue_() noexcept {
+    if (recoveryPoint_ <= persistedRp_) { rpDue_ = false; return; }
+    const int64_t b = nextSegmentBaseAfter(persistedRp_);
+    rpDue_ = b != -1 && b <= recoveryPoint_;
 }
 
 void Log::advanceRecoveryPoint_() noexcept {
@@ -831,10 +930,7 @@ void Log::advanceRecoveryPoint_() noexcept {
     }
     if (r <= recoveryPoint_) return;
     recoveryPoint_ = r;
-    if (!rpDue_) {
-        const int64_t b = nextSegmentBaseAfter(persistedRp_);
-        rpDue_ = b != -1 && b <= recoveryPoint_;
-    }
+    if (!rpDue_) refreshRpDue_();
 }
 
 void Log::maybeCheckpointInline_() noexcept {
@@ -843,93 +939,94 @@ void Log::maybeCheckpointInline_() noexcept {
         (void)checkpointRecoveryPoint();
 }
 
-void Log::noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept {
-    if (seg == nullptr) return;
+bool Log::noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept {
+    if (seg == nullptr) return false;
     seg->markDurableThrough(upTo);
     advanceRecoveryPoint_();
+    return recoveryCheckpointDue();
 }
 
-bool Log::beginRecoveryCheckpoint() noexcept {
+bool Log::prepareRecoveryCheckpoint(RpWrite& out) noexcept {
     if (!recoveryCheckpointDue()) return false;
-    int fd = -1;
-    const int err = writeRecoveryPointTmp_(recoveryPoint_, fd);
-    if (err != 0) {
-        if (storage_.failedErrno == 0) storage_.failedErrno = err;
-        return false;
-    }
-    rp_.stage     = RpStage::TmpWritten;
-    rp_.inFlight  = false;
-    rp_.abandoned = false;
-    rp_.value     = recoveryPoint_;
-    rp_.tmpFd     = fd;
-    ++rp_.seq;
+    const int slot = rpActiveSlot_ < 0 ? 0 : 1 - rpActiveSlot_;
+    const uint64_t seq = ++rpSeq_;
+    encodeRpSlot(rpImage_, seq, recoveryPoint_);
+    rp_ = RpCheckpoint{RpStage::Prepared, false, slot, seq, recoveryPoint_};
     rpDue_ = false;
+    out.fd = rpFd_; out.data = rpImage_; out.len = static_cast<uint32_t>(kRpSlotBytes);
+    out.offset = static_cast<int64_t>(slot * kRpSlotStride); out.seq = seq;
     return true;
 }
 
-int Log::recoveryCheckpointFdToSync() const noexcept {
-    if (rp_.inFlight || rp_.abandoned) return -1;
-    if (rp_.stage == RpStage::TmpWritten) return rp_.tmpFd;
-    if (rp_.stage == RpStage::Renamed) return dirFd_;
-    return -1;
+void Log::recoveryCheckpointSubmitted() noexcept {
+    if (rp_.stage == RpStage::Prepared) rp_.stage = RpStage::InFlight;
 }
 
-uint64_t Log::recoveryCheckpointSubmitted() noexcept {
-    if (rp_.stage == RpStage::TmpWritten) rp_.stage = RpStage::TmpSyncing;
-    else if (rp_.stage == RpStage::Renamed) rp_.stage = RpStage::DirSyncing;
-    rp_.inFlight = true;
-    return rp_.seq;
+void Log::recoveryCheckpointNotSubmitted() noexcept {
+    if (rp_.stage != RpStage::Prepared) return;
+    rp_ = RpCheckpoint{RpStage::Idle, false, -1, 0, 0};
+    refreshRpDue_();   // still due: retried by the owner
 }
 
-void Log::recoveryCheckpointSyncCompleted(uint64_t seq, int err) noexcept {
-    if (seq != rp_.seq || !rp_.inFlight) return;   // a long-gone checkpoint
-    rp_.inFlight = false;
-    if (rp_.abandoned || err != 0) {
-        if (err != 0 && storage_.failedErrno == 0) storage_.failedErrno = err;
-        releaseRpFds_();
-        rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
-        if (recoveryPoint_ > persistedRp_) {
-            const int64_t b = nextSegmentBaseAfter(persistedRp_);
-            rpDue_ = b != -1 && b <= recoveryPoint_;
-        }
-        return;
+bool Log::recoveryCheckpointCompleted(uint64_t seq, int err) noexcept {
+    if (rp_.stage != RpStage::InFlight || seq != rp_.seq) return false;   // long gone
+    const RpCheckpoint done = rp_;
+    rp_ = RpCheckpoint{RpStage::Idle, false, -1, 0, 0};
+    if (err != 0) {
+        if (storage_.failedErrno == 0) storage_.failedErrno = err;
+        spdlog::critical("Log {}: async recovery-point checkpoint {} FAILED (errno={}) — log failed",
+                         dir_, done.value, err);
+        return false;
     }
-    if (rp_.stage == RpStage::TmpSyncing) {
-        releaseRpFds_();
-        const std::string tmp = dir_ + "/" + kRecoveryPointTmpFile;
-        const std::string fin = dir_ + "/" + kRecoveryPointFile;
-        int e = 0;
-        if (::rename(tmp.c_str(), fin.c_str()) != 0) e = errno != 0 ? errno : EIO;
-        if (e == 0 && dirFd_open_() < 0) e = errno != 0 ? errno : EIO;
-        if (e != 0) {
-            if (storage_.failedErrno == 0) storage_.failedErrno = e;
-            rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
-            return;
-        }
-        rp_.stage = RpStage::Renamed;
-        return;
-    }
-    if (rp_.stage == RpStage::DirSyncing) {
-        const bool moved = rp_.value != persistedRp_;
-        persistedRp_ = rp_.value;
+    if (!done.abandoned) {
+        // DURABLE now (write + fdatasync completed): only now may the cleaner
+        // gate and the persisted R move.
+        const bool moved = done.value != persistedRp_;
+        persistedRp_ = done.value;
+        rpActiveSlot_ = done.slot;
         ++rpPersists_;
-        rp_ = RpCheckpoint{RpStage::Idle, false, false, rp_.seq, 0, -1};
-        if (recoveryPoint_ > persistedRp_) {
-            const int64_t b = nextSegmentBaseAfter(persistedRp_);
-            rpDue_ = b != -1 && b <= recoveryPoint_;
-        }
-        if (moved) publishSealedSnapshot();   // cleaner gate (cold: once per roll)
+        if (moved && !segments_.empty()) publishSealedSnapshot();   // cold: ≈ once per roll
     }
+    refreshRpDue_();
+    return recoveryCheckpointDue();
 }
 
-void Log::clampRecoveryPointAfterTruncate_(int64_t leo) noexcept {
-    if (recoveryPoint_ > leo) recoveryPoint_ = leo;
+void Log::resetRecoveryCheckpointForNewOwner() noexcept {
+    if (rp_.stage == RpStage::Idle) return;
+    // Unknown outcome: the slot (never the active one) may or may not hold it.
+    // Treated as unwritten — the next write targets that slot again with a
+    // higher seq.  persistedRp_ (what the cleaner trusts) never moves on it.
+    rp_ = RpCheckpoint{RpStage::Idle, false, -1, 0, 0};
+    refreshRpDue_();
+}
+
+std::size_t Log::requeueUndurableSeals() noexcept {
+    std::size_t n = 0;
+    if (segments_.size() < 2) return 0;
+    const auto activeIt = std::prev(segments_.end());
+    for (auto it = segments_.begin(); it != activeIt; ++it) {
+        LogSegment* seg = it->second.get();
+        if (seg->fullyDurable()) continue;
+        bool queued = false;
+        for (std::size_t i = 0; i < pendingSealCount_; ++i) queued = queued || pendingSeals_[i] == seg;
+        if (queued) continue;
+        if (pendingSealCount_ >= kMaxPendingSeals) break;   // the rest: next requeue
+        seg->pinFlush();
+        pendingSeals_[pendingSealCount_++] = seg;
+        ++n;
+    }
+    return n;
+}
+
+void Log::persistAtMost_(int64_t bound) noexcept {
+    if (recoveryPoint_ > bound) recoveryPoint_ = bound;
     if (!recovered_) return;
-    // An in-progress checkpoint carrying a value above the new LEO must never
-    // land (its rename would re-raise the on-disk R over re-appended bytes).
-    const bool staleInProgress = rp_.stage != RpStage::Idle && !rp_.abandoned && rp_.value > leo;
-    if (staleInProgress || persistedRp_ > leo) (void)checkpointRecoveryPoint();   // abandons it
-    else if (recoveryPoint_ <= persistedRp_) rpDue_ = false;
+    // An in-progress checkpoint carrying a value above the bound must never
+    // count (its slot may still land: an inline write with a HIGHER seq to
+    // the other slot supersedes it).
+    const bool staleInProgress = rp_.stage != RpStage::Idle && !rp_.abandoned && rp_.value > bound;
+    if (staleInProgress || persistedRp_ > bound) (void)checkpointRecoveryPoint();
+    else refreshRpDue_();
 }
 
 void Log::sync() {
@@ -1024,6 +1121,12 @@ int64_t Log::totalBytes() const {
 }
 void Log::truncateTo(int64_t truncateOffset) {
     if (truncateOffset >= logEndOffset_) return; // nothing to do
+    // E1d F6: the lowered recovery point is DURABLE before any file is deleted
+    // or resized (a crash in between must never trust bytes about to go).
+    persistAtMost_(std::max<int64_t>(0, truncateOffset));
+    // Fail-stop: a failed persist leaves every file untouched (the log is
+    // permanently failed; its owner halts the broker; restart recovers).
+    if (recovered_ && storage_.failedErrno != 0) [[unlikely]] return;
     // F30 fix round 1: the owner's flush bookkeeping must learn the LOWEST
     // point truncated to, even when new bytes are re-appended before it looks
     // (LEO alone hides that).  Recorded now (an exception below still lowered
@@ -1056,7 +1159,7 @@ void Log::truncateTo(int64_t truncateOffset) {
         install_(base, std::move(seg));
         logEndOffset_ = base;
         noteTruncatedTo_(logEndOffset_);
-        clampRecoveryPointAfterTruncate_(logEndOffset_);   // E1d
+        persistAtMost_(logEndOffset_);   // E1d (batch-rounded LEO may be lower)
         return;
     }
 
@@ -1185,7 +1288,7 @@ void Log::truncateTo(int64_t truncateOffset) {
                   "(cutPos=" + std::to_string(cutPos) + ").  Halting.");
     }
     noteTruncatedTo_(logEndOffset_);   // rounded down to the batch boundary
-    clampRecoveryPointAfterTruncate_(logEndOffset_);   // E1d
+    persistAtMost_(logEndOffset_);   // E1d: a mid-batch cut rounds the LEO below truncateOffset
 }
 
 void Log::reloadSegments() {

@@ -1060,3 +1060,43 @@ TEST(CompactionDutyCycle, CrossSegmentLatestPerKeyConverges) {
 
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// E1d F4 (Regression): the legacy duty-cycle compaction advances the clean
+// watermark ONLY when the segment was actually compacted.  A segment the
+// cleaner refuses (it ends above the persisted recovery point) must stay
+// dirty — and compact once its checkpoint is durable — never be skipped
+// forever behind an advanced watermark.
+// ===========================================================================
+TEST(CompactionDutyCycleRegression, RefusedSegmentDoesNotAdvanceCleanWatermark) {
+    auto dir = makeTempDir("e1d_f4");
+    Log log(dir.string(), /*rollBytes=*/256);
+    log.recover();
+    log.setDeferSealSync(true);                          // seals pending: nothing durable
+    NullTransport transport;
+    PartitionConfig cfg;
+    cfg.topicId = 10; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL;
+    cfg.maxFetchBytes = 1 << 20; cfg.pushOnAppend = false;
+    cfg.cleanupPolicy = CleanupPolicy::Compact;
+    cfg.minCleanableDirtyRatio = 0.0;
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->becomeLeader(1, {1});
+    int64_t off = 0;
+    while (log.segmentBaseOffsets().size() < 3) {
+        auto b = makeBatch(off, "k1", "v" + std::to_string(off));
+        off = log.appendNoSync(b.data(), b.size(), off);
+    }
+    replica->onLeaderLogAppended();
+    PartitionReplica* raw = replica.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(10, 0, std::move(replica));
+    MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent agent(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    ASSERT_EQ(log.persistedRecoveryPoint(), 0);
+    for (int i = 0; i < 5; ++i) agent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
+    EXPECT_EQ(raw->lastCleanOffset(), 0) << "the watermark advanced past a segment that was never compacted";
+    fs::remove_all(dir);
+}

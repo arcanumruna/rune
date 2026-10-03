@@ -326,4 +326,48 @@ TEST(UringDurabilityTest, IoWorkerAffinityNopIsDrainedSilentlyAndRespectsTheCapR
     ::unlink(path);
 }
 
+// E1d: the linked write + fdatasync pair (recovery-point checkpoint slot).
+// Many rounds alternating two pre-allocated slots: one completion per request
+// (the internal write CQE is never handed out), the bytes are on the file, the
+// in-flight accounting returns to 0; a failing write fails the fsync's
+// completion (never OK).
+TEST(UringDurabilityTest, WriteSyncLinkedPairRoundTripRegression) {
+    UringFlushBackend be(8, 8);
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              ("uring_ws_" + std::to_string(::getpid()))).string();
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    std::vector<char> zero(8192, 0);
+    ASSERT_EQ(::pwrite(fd, zero.data(), zero.size(), 0), 8192);
+    uint8_t blk[32];
+    for (int i = 0; i < 32; ++i) blk[i] = static_cast<uint8_t>(i + 1);
+    for (int round = 0; round < 50; ++round) {
+        blk[0] = static_cast<uint8_t>(round);
+        const int64_t off = (round & 1) * 4096;
+        const auto t = be.submitWriteSync(fd, blk, sizeof blk, off);
+        ASSERT_NE(t, kNoToken);
+        int got = 0; FlushCompletion c{};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while ((got == 0 || be.inFlight() > 0) && std::chrono::steady_clock::now() < deadline)
+            be.reap([&](const FlushCompletion& x) { ++got; c = x; });
+        ASSERT_EQ(got, 1) << "exactly one completion per write+fdatasync";
+        EXPECT_EQ(c.token, t);
+        EXPECT_EQ(c.errorCode, 0);
+        EXPECT_EQ(be.inFlight(), 0u);
+        uint8_t rd[32];
+        ASSERT_EQ(::pread(fd, rd, sizeof rd, off), 32);
+        EXPECT_EQ(std::memcmp(rd, blk, sizeof blk), 0);
+    }
+    const auto bad = be.submitWriteSync(-1, blk, sizeof blk, 0);
+    ASSERT_NE(bad, kNoToken);
+    int got = 0; FlushCompletion c{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while ((got == 0 || be.inFlight() > 0) && std::chrono::steady_clock::now() < deadline)
+        be.reap([&](const FlushCompletion& x) { ++got; c = x; });
+    ASSERT_EQ(got, 1);
+    EXPECT_NE(c.errorCode, 0) << "a failed write must never complete OK";
+    ::close(fd);
+    std::filesystem::remove(path);
+}
+
 #endif // defined(__linux__)

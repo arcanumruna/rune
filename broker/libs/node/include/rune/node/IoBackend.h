@@ -131,6 +131,19 @@ public:
         return kNoToken;
     }
 
+    /// E1d: write `len` bytes of `data` at `offset` of `fd`, then fdatasync(fd)
+    /// — one token, one completion (io_uring: a linked IORING_OP_WRITE ->
+    /// IORING_OP_FSYNC(DATASYNC) pair; portable: one flusher request).  The
+    /// bytes are copied at submit.  kNoToken on back-pressure.
+    [[nodiscard]] CompletionToken submitWriteSync(int fd, const uint8_t* data, uint32_t len,
+                                                  int64_t offset) noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) [[likely]] return uring_->submitWriteSync(fd, data, len, offset);
+#endif
+        if (kind_ == IoBackendKind::Portable) return portable_->submitWriteSync(fd, data, len, offset);
+        return kNoToken;
+    }
+
     /// F15 S4 fix round 2 (RR1-4): true when read-ahead hints can be issued
     /// asynchronously (io_uring IORING_OP_FADVISE); else the caller uses a
     /// synchronous hint (counted).

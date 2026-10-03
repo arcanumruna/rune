@@ -27,6 +27,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <sys/stat.h>
 
 using namespace rune::storage;
 using namespace rune::protocol;
@@ -91,16 +92,19 @@ void flushActive(Log& log) {
     log.unpinSegmentFlush(seg);
 }
 
-// Drive one async checkpoint to completion exactly as the worker does (each
-// fdatasync is "submitted" then completed; here performed inline).
+// The io backend's work for one checkpoint request: pwrite + fdatasync.
+int performWrite(const Log::RpWrite& w) {
+    if (::pwrite(w.fd, w.data, w.len, static_cast<off_t>(w.offset)) != static_cast<ssize_t>(w.len)) return errno;
+    return ::fsync(w.fd) == 0 ? 0 : errno;
+}
+
+// Drive one async checkpoint to completion exactly as the worker does
+// (prepare -> submit -> the backend writes + syncs -> completion).
 void driveCheckpoint(Log& log) {
-    ASSERT_TRUE(log.beginRecoveryCheckpoint());
-    for (int stage = 0; stage < 2; ++stage) {
-        const int fd = log.recoveryCheckpointFdToSync();
-        ASSERT_GE(fd, 0);
-        const uint64_t seq = log.recoveryCheckpointSubmitted();
-        log.recoveryCheckpointSyncCompleted(seq, ::fsync(fd) == 0 ? 0 : errno);
-    }
+    Log::RpWrite w;
+    ASSERT_TRUE(log.prepareRecoveryCheckpoint(w));
+    log.recoveryCheckpointSubmitted();
+    log.recoveryCheckpointCompleted(w.seq, performWrite(w));
     ASSERT_EQ(log.recoveryCheckpointStage(), Log::RpStage::Idle);
 }
 
@@ -130,11 +134,21 @@ std::unique_ptr<Log> openRecovered(const fs::path& dir, int64_t roll, bool defer
     return log;
 }
 
-int64_t readPersistedR(const fs::path& dir) { return Log::readRecoveryPointFile(dir.string()); }
+int64_t readPersistedR(const fs::path& dir) { return Log::readRecoveryPointFile(dir.string()).r; }
 
+// Overwrite one slot of an existing checkpoint file in place.
+void writeSlot(const fs::path& dir, int slot, const uint8_t* bytes, std::size_t n) {
+    std::fstream f(dir / Log::kRecoveryPointFile, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(f.is_open());
+    f.seekp(static_cast<std::streamoff>(slot * Log::kRpSlotStride));
+    f.write(reinterpret_cast<const char*>(bytes), static_cast<std::streamsize>(n));
+}
+// Forge a valid slot holding r with a seq above everything written so far.
 void writeRFile(const fs::path& dir, int64_t r) {
-    std::ofstream f(dir / Log::kRecoveryPointFile, std::ios::trunc);
-    f << "1\n" << r << "\n";
+    const auto cur = Log::readRecoveryPointFile(dir.string());
+    uint8_t img[Log::kRpSlotBytes];
+    Log::encodeRpSlot(img, cur.seq + 100, r);
+    writeSlot(dir, cur.slot < 0 ? 0 : 1 - cur.slot, img, sizeof img);
 }
 
 // Rewrite a segment's .log WITHOUT its last batch (what compaction does when
@@ -328,8 +342,10 @@ TEST(RecoveryPointRegression, CrashBetweenDataFdatasyncAndRPersist_KeepsDurableD
     const int64_t leo = log->logEndOffset();
     EXPECT_EQ(log->recoveryPoint(), leo);
     EXPECT_TRUE(log->recoveryCheckpointDue());
-    // The checkpoint got as far as its tmp file, then the crash.
-    ASSERT_TRUE(log->beginRecoveryCheckpoint());
+    // The checkpoint was prepared + submitted, then the crash (never written).
+    Log::RpWrite w;
+    ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
+    log->recoveryCheckpointSubmitted();
     EXPECT_EQ(readPersistedR(dir), 0);
     crashWithPowerLoss(log);
 
@@ -373,32 +389,71 @@ TEST(RecoveryPointRegression, CleanerNeverCompactsAboveRecoveryPoint) {
 }
 
 // ---------------------------------------------------------------------------
-// A truncation below an IN-FLIGHT async checkpoint: the checkpoint is
-// abandoned (its completion never renames) and the lowered R is persisted
-// inline — the on-disk R never exceeds the LEO over re-appended bytes.
+// A truncation below an IN-FLIGHT async checkpoint: the lowered R is persisted
+// inline FIRST to the OTHER slot with a higher seq; the in-flight write still
+// lands afterwards — and never wins (its seq is lower) nor moves persistedRp_.
 // ---------------------------------------------------------------------------
-TEST(RecoveryPointRegression, TruncateBelowInFlightCheckpoint_NeverRaisesPersistedR) {
+TEST(RecoveryPointRegression, TruncateWhileCheckpointInFlight_StaleWriteNeverWins) {
     const auto dir = freshDir("rp_truncate_inflight");
     auto log = openRecovered(dir, kRoll, true);
     while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
     const auto bases = log->segmentBaseOffsets();
     completeFrontSeal(*log);
     completeFrontSeal(*log);
-    const int64_t r = log->recoveryPoint();
-    ASSERT_EQ(r, bases[2]);
-    ASSERT_TRUE(log->beginRecoveryCheckpoint());
-    const int tmpFd = log->recoveryCheckpointFdToSync();
-    const uint64_t seq = log->recoveryCheckpointSubmitted();   // tmp fsync in flight
-    const int64_t cut = bases[1] + 1;
-    log->truncateTo(cut);
-    EXPECT_EQ(log->recoveryPoint(), log->logEndOffset());
-    EXPECT_EQ(readPersistedR(dir), log->logEndOffset()) << "truncation below R must persist the lower R";
-    // The superseded checkpoint completes: it must not rename its stale value.
-    log->recoveryCheckpointSyncCompleted(seq, ::fsync(tmpFd) == 0 ? 0 : errno);
+    ASSERT_EQ(log->recoveryPoint(), bases[2]);
+    Log::RpWrite w;
+    ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
+    log->recoveryCheckpointSubmitted();                   // in flight (not yet executed)
+    log->truncateTo(bases[1] + 1);
+    const int64_t leo = log->logEndOffset();
+    EXPECT_EQ(log->recoveryPoint(), leo);
+    EXPECT_EQ(readPersistedR(dir), leo) << "truncation below R must persist the lower R first";
+    ASSERT_EQ(performWrite(w), 0);                        // the stale in-flight write lands LATE
+    log->recoveryCheckpointCompleted(w.seq, 0);
+    EXPECT_EQ(log->recoveryCheckpointStage(), Log::RpStage::Idle);
+    EXPECT_EQ(readPersistedR(dir), leo) << "the superseded (higher-R, lower-seq) slot won";
+    EXPECT_EQ(log->persistedRecoveryPoint(), leo);
+    EXPECT_FALSE(log->storageFailed());
+    fs::remove_all(dir);
+}
+
+// The same, with the checkpoint only PREPARED (not yet submitted): it is
+// dropped, and nothing stale can be submitted afterwards.
+TEST(RecoveryPointRegression, TruncateWhileCheckpointPrepared_IsDropped) {
+    const auto dir = freshDir("rp_truncate_prepared");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSeal(*log);
+    completeFrontSeal(*log);
+    Log::RpWrite w;
+    ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
+    log->truncateTo(bases[1] + 1);
+    EXPECT_EQ(log->recoveryCheckpointStage(), Log::RpStage::Idle);
+    log->recoveryCheckpointSubmitted();                   // a late submit of the dropped one: no-op
     EXPECT_EQ(log->recoveryCheckpointStage(), Log::RpStage::Idle);
     EXPECT_EQ(readPersistedR(dir), log->logEndOffset());
-    EXPECT_EQ(log->persistedRecoveryPoint(), log->logEndOffset());
-    EXPECT_FALSE(log->storageFailed());
+    EXPECT_FALSE(log->recoveryCheckpointDue());
+    fs::remove_all(dir);
+}
+
+// F6: the lowered R is persisted BEFORE truncateTo deletes / resizes files: if
+// that persist fails (fail-stop), no file is touched.
+TEST(RecoveryPointRegression, TruncatePersistsLowerRBeforeTouchingFiles) {
+    const auto dir = freshDir("rp_truncate_order");
+    auto log = openRecovered(dir, kRoll, false);
+    while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
+    appendOne(*log);
+    log->sync();
+    const auto bases = log->segmentBaseOffsets();
+    ASSERT_GT(readPersistedR(dir), bases[1]);
+    const auto sizeBefore = fs::file_size(segPath(dir, bases[1]));
+    log->setSyncFaultForTest(EIO);                        // the R persist fails
+    log->truncateTo(bases[1] + 1);
+    log->setSyncFaultForTest(0);
+    EXPECT_TRUE(log->storageFailed());
+    EXPECT_TRUE(fs::exists(segPath(dir, bases[2]))) << "a file was deleted before the lower R was durable";
+    EXPECT_EQ(fs::file_size(segPath(dir, bases[1])), sizeBefore);
     fs::remove_all(dir);
 }
 
@@ -415,14 +470,15 @@ TEST(RecoveryPointRegression, CheckpointFsyncFault_IsFailStop) {
 
 // An async checkpoint completion carrying an error is fail-stop, and the
 // on-disk R is unchanged.
-TEST(RecoveryPointRegression, AsyncCheckpointError_IsFailStop_NoRename) {
+TEST(RecoveryPointRegression, AsyncCheckpointError_IsFailStop) {
     const auto dir = freshDir("rp_async_err");
     auto log = openRecovered(dir, kRoll, true);
     while (log->segmentBaseOffsets().size() < 2) appendOne(*log);
     completeFrontSeal(*log);
-    ASSERT_TRUE(log->beginRecoveryCheckpoint());
-    const uint64_t seq = log->recoveryCheckpointSubmitted();
-    log->recoveryCheckpointSyncCompleted(seq, EIO);
+    Log::RpWrite w;
+    ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
+    log->recoveryCheckpointSubmitted();
+    log->recoveryCheckpointCompleted(w.seq, EIO);
     EXPECT_TRUE(log->storageFailed());
     EXPECT_EQ(readPersistedR(dir), 0);
     EXPECT_EQ(log->recoveryCheckpointStage(), Log::RpStage::Idle);
@@ -438,5 +494,125 @@ TEST(RecoveryPointRegression, InlineSealPath_PersistsOncePerRollNotPerAppend) {
     const uint64_t rolls = log->segmentBaseOffsets().size() - 1;
     EXPECT_EQ(log->recoveryCheckpointsForTest() - base, rolls);
     EXPECT_EQ(log->persistedRecoveryPoint(), log->segmentBaseOffsets().back());
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-order seal completions advance R strictly in order.
+// ---------------------------------------------------------------------------
+TEST(RecoveryPointRegression, OutOfOrderSealCompletions_AdvanceRInOrder) {
+    const auto dir = freshDir("rp_ooo_seals");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    ASSERT_EQ(log->pendingSealCount(), 3u);
+    LogSegment* s0 = log->frontPendingSeal(); log->popPendingSeal();
+    LogSegment* s1 = log->frontPendingSeal(); log->popPendingSeal();
+    LogSegment* s2 = log->frontPendingSeal(); log->popPendingSeal();
+    EXPECT_FALSE(log->noteFlushCompleted(s2, INT64_MAX));
+    EXPECT_EQ(log->recoveryPoint(), 0) << "seg2's completion skipped pending seg0/seg1";
+    EXPECT_FALSE(log->noteFlushCompleted(s1, INT64_MAX));
+    EXPECT_EQ(log->recoveryPoint(), 0);
+    EXPECT_TRUE(log->noteFlushCompleted(s0, INT64_MAX)) << "the checkpoint becomes due";
+    EXPECT_EQ(log->recoveryPoint(), bases[3]) << "all three in order: R reaches the active base";
+    for (LogSegment* sg : {s0, s1, s2}) log->unpinSegmentFlush(sg);
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Two-slot checkpoint file: a torn NEWEST slot falls back to the older (lower,
+// safe) R; both slots invalid = fail-stop (F5) and nothing is truncated or
+// deleted.
+// ---------------------------------------------------------------------------
+TEST(RecoveryPointRegression, TornNewestSlot_UsesOlderSlot) {
+    const auto dir = freshDir("rp_torn_slot");
+    auto log = openRecovered(dir, kRoll, false);
+    while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
+    appendOne(*log);
+    log->sync();
+    const auto bases = log->segmentBaseOffsets();
+    const int64_t leo = log->logEndOffset();
+    log.reset();                                          // clean: R = LEO in the newest slot
+    const auto cur = Log::readRecoveryPointFile(dir.string());
+    ASSERT_EQ(cur.state, Log::RpFileState::Valid);
+    ASSERT_EQ(cur.r, leo);
+    const auto older = [&] {   // what the other slot holds
+        std::ifstream f(dir / Log::kRecoveryPointFile, std::ios::binary);
+        f.seekg(static_cast<std::streamoff>((1 - cur.slot) * Log::kRpSlotStride));
+        uint8_t b[Log::kRpSlotBytes]; f.read(reinterpret_cast<char*>(b), sizeof b);
+        uint64_t sq = 0; int64_t r = -1;
+        EXPECT_TRUE(Log::decodeRpSlot(b, sq, r));
+        return r;
+    }();
+    const uint8_t torn[7] = {0xde, 0xad, 0xbe, 0xef, 0, 1, 2};
+    writeSlot(dir, cur.slot, torn, sizeof torn);
+    const auto after = Log::readRecoveryPointFile(dir.string());
+    EXPECT_EQ(after.state, Log::RpFileState::Valid);
+    EXPECT_EQ(after.r, older);
+    EXPECT_LE(after.r, leo);
+    auto rec = openRecovered(dir, kRoll, false);
+    EXPECT_FALSE(rec->storageFailed());
+    EXPECT_EQ(rec->logEndOffset(), leo);
+    EXPECT_EQ(rec->segmentBaseOffsets(), bases);
+    fs::remove_all(dir);
+}
+
+TEST(RecoveryPointRegression, BothSlotsCorrupt_FailStop_NothingDeleted) {
+    const auto dir = freshDir("rp_corrupt");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
+    appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    crashKeepPageCache(log);
+    fs::resize_file(segPath(dir, bases[1]), 0);           // a gap a validation would cut at
+    const uint8_t junk[Log::kRpSlotBytes] = {1, 2, 3};
+    writeSlot(dir, 0, junk, sizeof junk);
+    writeSlot(dir, 1, junk, sizeof junk);
+    EXPECT_EQ(Log::readRecoveryPointFile(dir.string()).state, Log::RpFileState::Corrupt);
+    auto rec = openRecovered(dir, kRoll, true);
+    EXPECT_TRUE(rec->storageFailed()) << "a corrupt checkpoint must be fail-stop, not 'trust everything'";
+    EXPECT_EQ(rec->segmentBaseOffsets(), bases) << "a fail-stopped recovery deleted segments";
+    EXPECT_TRUE(fs::exists(segPath(dir, bases[2])));
+    fs::remove_all(dir);
+}
+
+// The file is created once (pre-allocated, two slots); afterwards a
+// checkpoint never creates, renames or resizes it.
+TEST(RecoveryPointRegression, CheckpointFile_PreallocatedOnce_NeverRecreated) {
+    const auto dir = freshDir("rp_prealloc");
+    auto log = openRecovered(dir, kRoll, true);
+    const auto p = dir / Log::kRecoveryPointFile;
+    ASSERT_TRUE(fs::exists(p));
+    EXPECT_EQ(fs::file_size(p), Log::kRpFileBytes);
+    struct ::stat st0{}; ASSERT_EQ(::stat(p.c_str(), &st0), 0);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log);
+    for (int i = 0; i < 3; ++i) { completeFrontSeal(*log); driveCheckpoint(*log); }
+    struct ::stat st1{}; ASSERT_EQ(::stat(p.c_str(), &st1), 0);
+    EXPECT_EQ(st0.st_ino, st1.st_ino) << "the checkpoint file was recreated / renamed";
+    EXPECT_EQ(fs::file_size(p), Log::kRpFileBytes);
+    EXPECT_FALSE(fs::exists(dir / Log::kRecoveryPointTmpFile));
+    EXPECT_EQ(readPersistedR(dir), log->segmentBaseOffsets().back());
+    fs::remove_all(dir);
+}
+
+// F2: LogCleaner::compact (the append-thread full-log path) stops at the first
+// segment ending above the persisted recovery point.
+TEST(RecoveryPointRegression, CompactNeverRewritesAboveRecoveryPoint) {
+    const auto dir = freshDir("rp_compact_gate");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log, "same-key");
+    appendOne(*log, "same-key");
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSeal(*log);
+    driveCheckpoint(*log);                                // persisted R = bases[1]
+    completeFrontSeal(*log);                              // in memory only
+    ASSERT_EQ(log->persistedRecoveryPoint(), bases[1]);
+    const auto size0 = fs::file_size(segPath(dir, bases[0]));
+    const auto size1 = fs::file_size(segPath(dir, bases[1]));
+    LogCleaner cleaner;
+    cleaner.clean(*log, 0, log->logEndOffset(), 0, 0);
+    EXPECT_TRUE(!fs::exists(segPath(dir, bases[0])) || fs::file_size(segPath(dir, bases[0])) < size0)
+        << "below R must still compact";
+    EXPECT_EQ(fs::file_size(segPath(dir, bases[1])), size1) << "compacted a segment above the persisted R";
     fs::remove_all(dir);
 }

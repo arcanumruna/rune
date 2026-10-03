@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <cerrno>
 
 // Full io_uring kernel struct definitions are required here because reap() is an
 // inline template that dereferences io_uring_cqe::res.  This include sits inside
@@ -103,6 +104,18 @@ public:
     //
     // Returns kNoToken if the SQ ring is full (back-pressure).
     [[nodiscard]] CompletionToken submit(int fd, int64_t flushBoundary) noexcept;
+
+    // E1d: a LINKED pair — IORING_OP_WRITE of `len` (<= kWriteSyncMaxBlock)
+    // bytes at `offset` of fd (IOSQE_IO_LINK) -> IORING_OP_FSYNC(DATASYNC) —
+    // submitted in ONE io_uring_enter.  The bytes are copied into a
+    // backend-owned pre-allocated block (stable until the write's CQE).  The
+    // write's CQE is internal (never handed out); the fsync's CQE carries the
+    // token: a failed write cancels the fsync (-ECANCELED), a short write is
+    // reported as ENOSPC.  Takes two in-flight slots.  kNoToken on back-pressure.
+    [[nodiscard]] CompletionToken submitWriteSync(int fd, const uint8_t* data, uint32_t len,
+                                                  int64_t offset) noexcept;
+    /// user_data tag of an internal linked-write CQE (low bits = block index).
+    static constexpr uint64_t kLinkedWriteTag = uint64_t{1} << 62;
 
     // F15 S4 fix round 2 (RR1-4): an async IORING_OP_FADVISE(advice) on
     // [off, off + len) of fd.  kNoToken when the SQ / in-flight cap is full
@@ -171,6 +184,16 @@ private:
     // slot, copy `sqe` in, publish the tail, io_uring_enter; rolls the tail back
     // on failure.  Returns 0, EBUSY (SQ full) or the enter errno.
     int pushSqe_(const struct io_uring_sqe& sqe) noexcept;
+    /// Push `n` (1-2) SQEs with ONE io_uring_enter (a linked chain must be
+    /// submitted together).  Same rollback / errors as pushSqe_.
+    int pushSqes_(const struct io_uring_sqe* sqes, uint32_t n) noexcept;
+
+    // E1d linked-write blocks (pre-allocated in the ctor; worker-owned).
+    struct WriteBlock { uint8_t bytes[kWriteSyncMaxBlock]; uint32_t len = 0; CompletionToken token = 0; };
+    std::vector<WriteBlock> writeBlocks_;
+    std::vector<uint32_t>   freeWriteBlocks_;          ///< stack of free block indices
+    std::vector<CompletionToken> shortWriteTokens_;    ///< fsync tokens whose write was short (rare)
+
     CompletionToken allocToken_() noexcept;
 };
 
@@ -195,11 +218,32 @@ int UringFlushBackend::reap(H&& handler) noexcept {
         const struct io_uring_cqe* cqe = cqes_ + idx;
 
         // setIoWorkerAffinity's internal NOP is not a caller token: drained, never handed out.
-        if (cqe->user_data != kInternalNopUserData) [[likely]] {
+        if (cqe->user_data != kInternalNopUserData && (cqe->user_data & kLinkedWriteTag) != 0) [[unlikely]] {
+            // E1d: the internal write half of a write+fsync pair.  Release its
+            // block; a SHORT write poisons its fsync's token (a failed write
+            // already cancels the linked fsync: -ECANCELED).
+            const uint32_t bi = static_cast<uint32_t>(cqe->user_data & (kLinkedWriteTag - 1));
+            if (bi < writeBlocks_.size()) {
+                WriteBlock& wb = writeBlocks_[bi];
+                if (cqe->res >= 0 && static_cast<uint32_t>(cqe->res) != wb.len &&
+                    shortWriteTokens_.size() < shortWriteTokens_.capacity())
+                    shortWriteTokens_.push_back(wb.token);
+                freeWriteBlocks_.push_back(bi);   // capacity reserved: no allocation
+            }
+        } else if (cqe->user_data != kInternalNopUserData) [[likely]] {
             // Decode: user_data == token, res == 0 (success) or -errno (failure).
             FlushCompletion comp{};
             comp.token     = static_cast<CompletionToken>(cqe->user_data);
             comp.errorCode = (cqe->res < 0) ? -cqe->res : 0;
+            if (!shortWriteTokens_.empty()) [[unlikely]] {
+                for (std::size_t i = 0; i < shortWriteTokens_.size(); ++i) {
+                    if (shortWriteTokens_[i] != comp.token) continue;
+                    if (comp.errorCode == 0) comp.errorCode = ENOSPC;
+                    shortWriteTokens_[i] = shortWriteTokens_.back();
+                    shortWriteTokens_.pop_back();
+                    break;
+                }
+            }
 
             // flushBoundary is informational and not tracked by io_uring (I2: the
             // old token % ring-size table aliased).  Completions match by token.

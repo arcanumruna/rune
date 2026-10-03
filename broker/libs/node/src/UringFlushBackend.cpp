@@ -180,6 +180,14 @@ UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
     // hints: the worker uses the synchronous hint instead (never a hint that
     // fails forever and stalls a read_committed build).
     fadviseSupported_ = probeOpcode_(IORING_OP_FADVISE);
+
+    // E1d: pre-allocate the linked-write blocks (at most one per two in-flight
+    // slots) — submitWriteSync never allocates.
+    const std::size_t nBlocks = submitDepth_ / 2 + 1;
+    writeBlocks_.resize(nBlocks);
+    freeWriteBlocks_.reserve(nBlocks);
+    for (std::size_t i = nBlocks; i > 0; --i) freeWriteBlocks_.push_back(static_cast<uint32_t>(i - 1));
+    shortWriteTokens_.reserve(nBlocks);
 }
 
 bool UringFlushBackend::probeOpcode_(uint8_t opcode) noexcept {
@@ -236,24 +244,27 @@ UringFlushBackend::~UringFlushBackend() {
 // ---------------------------------------------------------------------------
 // pushSqe_ — the single SQE submission path
 // ---------------------------------------------------------------------------
-int UringFlushBackend::pushSqe_(const struct io_uring_sqe& sqe) noexcept {
+int UringFlushBackend::pushSqes_(const struct io_uring_sqe* sqes, uint32_t n) noexcept {
     // Load SQ head with acquire semantics — the kernel writes head after
     // consuming SQEs, so we need to observe that write here.
     const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);
     const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED);
     // SQ ring full (defensive; normally never trips given the in-flight cap).
-    if (tail - head >= sqRingSize_) return EBUSY;
+    if (tail - head + n > sqRingSize_) return EBUSY;
 
-    // The SQE slot to fill is indexed by the tail position; one-to-one SQ index array.
-    const uint32_t sqeIdx = tail & *sqRingMask_;
-    sqes_[sqeIdx] = sqe;
-    sqArray_[sqeIdx] = sqeIdx;
+    // The SQE slots to fill are indexed by the tail position; one-to-one SQ index array.
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t sqeIdx = (tail + i) & *sqRingMask_;
+        sqes_[sqeIdx] = sqes[i];
+        sqArray_[sqeIdx] = sqeIdx;
+    }
 
-    // Advance the SQ tail — store-release so the kernel sees the new SQE.
-    __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE);
+    // Advance the SQ tail — store-release so the kernel sees the new SQEs.
+    __atomic_store_n(sqTail_, tail + n, __ATOMIC_RELEASE);
 
-    // Submit: to_submit=1, min_complete=0 (async — don't wait for completion here).
-    if (rune_io_uring_enter(ringFd_, /*to_submit=*/1, /*min_complete=*/0, /*flags=*/0) < 0) {
+    // Submit ALL n with ONE enter (E1d: a linked chain must not end a
+    // submission batch); min_complete=0 (async — don't wait for completion).
+    if (rune_io_uring_enter(ringFd_, /*to_submit=*/n, /*min_complete=*/0, /*flags=*/0) < 0) {
         const int e = errno;
         // io_uring_enter failed — undo the tail advance; the caller sees back-pressure.
         __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE);
@@ -261,6 +272,8 @@ int UringFlushBackend::pushSqe_(const struct io_uring_sqe& sqe) noexcept {
     }
     return 0;
 }
+
+int UringFlushBackend::pushSqe_(const struct io_uring_sqe& sqe) noexcept { return pushSqes_(&sqe, 1); }
 
 CompletionToken UringFlushBackend::allocToken_() noexcept {
     // 0 == kNoToken is reserved; skip it on wraparound.
@@ -295,6 +308,37 @@ CompletionToken UringFlushBackend::submit(int fd,
     sqe.user_data   = static_cast<uint64_t>(tok);
     if (pushSqe_(sqe) != 0) return kNoToken;   // back-pressure: the caller retries
     ++inFlight_;   // one more submitted-not-yet-reaped
+    return tok;
+}
+
+// ---------------------------------------------------------------------------
+// E1d: linked write + fdatasync (recovery-point checkpoint slot).
+// ---------------------------------------------------------------------------
+CompletionToken UringFlushBackend::submitWriteSync(int fd, const uint8_t* data, uint32_t len,
+                                                   int64_t offset) noexcept {
+    if (inFlight_ + 2 > submitDepth_ || len > kWriteSyncMaxBlock || freeWriteBlocks_.empty())
+        return kNoToken;
+    const uint32_t bi = freeWriteBlocks_.back();
+    WriteBlock& wb = writeBlocks_[bi];
+    std::memcpy(wb.bytes, data, len);
+    wb.len = len;
+    const CompletionToken tok = allocToken_();
+    wb.token = tok;
+    struct io_uring_sqe sqe[2]{};
+    sqe[0].opcode    = IORING_OP_WRITE;
+    sqe[0].fd        = fd;
+    sqe[0].addr      = reinterpret_cast<uint64_t>(wb.bytes);
+    sqe[0].len       = len;
+    sqe[0].off       = static_cast<uint64_t>(offset);
+    sqe[0].flags     = IOSQE_IO_LINK;
+    sqe[0].user_data = kLinkedWriteTag | bi;
+    sqe[1].opcode      = IORING_OP_FSYNC;
+    sqe[1].fd          = fd;
+    sqe[1].fsync_flags = IORING_FSYNC_DATASYNC;
+    sqe[1].user_data   = static_cast<uint64_t>(tok);
+    if (pushSqes_(sqe, 2) != 0) return kNoToken;   // back-pressure: the caller retries
+    freeWriteBlocks_.pop_back();
+    inFlight_ += 2;   // two CQEs will be reaped
     return tok;
 }
 

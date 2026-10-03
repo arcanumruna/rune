@@ -1678,9 +1678,11 @@ private:
         // advances the log's recovery point in order.  BEFORE the unpin (which
         // may close a retired segment).
         if (routed && r.seg && gate && c.errorCode == 0) {
-            if (r.kind == RouteKind::Seal) r.log->noteFlushCompleted(r.seg, INT64_MAX);
+            bool due = false;
+            if (r.kind == RouteKind::Seal) due = r.log->noteFlushCompleted(r.seg, INT64_MAX);
             else if (r.kind == RouteKind::Durable || r.kind == RouteKind::Background)
-                r.log->noteFlushCompleted(r.seg, r.aux);
+                due = r.log->noteFlushCompleted(r.seg, r.aux);
+            if (due) queueRecoveryCheckpoint_(*gate);   // F8: event-driven
         }
         if (routed && r.seg && gate) r.log->unpinSegmentFlush(r.seg);
 
@@ -1711,7 +1713,11 @@ private:
         // E1d: a recovery-point checkpoint stage completed (only while owned —
         // a purged log is never touched; an error falls through to fail-stop).
         if (routed && r.kind == RouteKind::RecoveryPoint) {
-            if (gate) r.log->recoveryCheckpointSyncCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
+            // Unowned (gate == null): never touch the Log; its next owner
+            // replays the stage (F7: rebuildFlushSlots_ ->
+            // resetRecoveryCheckpointForNewOwner).
+            if (gate && r.log->recoveryCheckpointCompleted(static_cast<uint64_t>(r.aux), c.errorCode))
+                queueRecoveryCheckpoint_(*gate);
             if (c.errorCode == 0) return 1;
         }
 
@@ -3717,6 +3723,7 @@ private:
         uint32_t        sealsInFlight   = 0;
         bool            failureReported = false;
         uint64_t        sealDropsSeen   = 0;          ///< Log::droppedPendingSeals() last seen
+        bool            rpQueued        = false;      ///< E1d: in rpQueue_ (F8)
         std::string     dir;                          ///< cached at slot creation (C-1 signal)
     };
     /// Logs purged by an ownership move with tokens possibly still in flight:
@@ -3747,7 +3754,8 @@ private:
     uint64_t    bgFlushErrors_  = 0;
     uint64_t    bgFlushDeferred_ = 0;
     uint64_t    sealSubmits_    = 0;
-    uint64_t    rpSubmits_      = 0;   ///< E1d recovery-point checkpoint fdatasyncs submitted
+    uint64_t    rpSubmits_      = 0;   ///< E1d recovery-point checkpoint write+fdatasyncs submitted
+    std::vector<rune::storage::Log*> rpQueue_;   ///< E1d F8: logs whose checkpoint is due
     uint64_t    ioCompletionsReaped_ = 0;
     uint64_t    storageFailureSignals_ = 0;
     CompletionToken durableAckToken_ = kNoToken;     ///< token whose completion fired the last durable ack
@@ -4191,11 +4199,20 @@ private:
                 // broker) and the two-phase migration's drain-before-grant contract
                 // (WorkerPool.h), so another worker never fsyncs a log while this
                 // worker's fsync on it is in flight.
+                bool rpRouted = false, sealRouted = false;
                 for (const TokenRoute& rt : routes_) {
                     if (rt.token == kNoToken || rt.log != log) continue;
                     if (rt.kind == RouteKind::Durable)    fresh.durableToken = rt.token;
                     if (rt.kind == RouteKind::Background) fresh.bgToken      = rt.token;
+                    if (rt.kind == RouteKind::RecoveryPoint) rpRouted = true;
+                    if (rt.kind == RouteKind::Seal) sealRouted = true;
                 }
+                // E1d F7 (cold): a checkpoint / seal whose completion went to a
+                // PREVIOUS owner (unobserved) must not pin R forever: replay —
+                // the checkpoint stage resets (outcome unknown: rewritten with a
+                // higher seq), every not-yet-durable sealed segment is re-sealed.
+                if (!rpRouted) log->resetRecoveryCheckpointForNewOwner();
+                if (!sealRouted) (void)log->requeueUndurableSeals();
                 next.push_back(fresh);
             }
         }
@@ -4236,6 +4253,14 @@ private:
                                   dirtyThisCycle_.end());
         }
         slots_ = std::move(next);
+        // E1d F8: the due-checkpoint queue holds only owned logs; capacity for
+        // every slot (queueRecoveryCheckpoint_ never allocates).
+        rpQueue_.clear();
+        rpQueue_.reserve(slots_.size());
+        for (auto& sl : slots_) {
+            sl.rpQueued = false;
+            if (sl.log->recoveryCheckpointDue()) { sl.rpQueued = true; rpQueue_.push_back(sl.log); }
+        }
         // Prune purged entries that are owned again or have no token in flight.
         for (std::size_t i = 0; i < purgedDirs_.size(); ) {
             bool live = false;
@@ -4328,8 +4353,8 @@ private:
         for (auto& slot : slots_) {
             reconcileTruncation_(slot);
             if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);
-            work += submitRecoveryCheckpoint_(slot);
         }
+        work += submitRecoveryCheckpoints_();
         for (auto* replica : owned_) {
             if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
                 if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
@@ -4359,32 +4384,43 @@ private:
         return n;
     }
 
-    // E1d: drive the log's recovery-point checkpoint (tmp write -> fdatasync ->
-    // rename -> directory fdatasync) through the io backend — never an inline
-    // fsync on the loop.  Due only when R crossed a segment boundary since the
-    // last persist (≈ once per roll); state-driven: a refused submit is retried
-    // next pass.  O(1) when idle (two loads).  Allocation-free.
-    int submitRecoveryCheckpoint_(LogFlushSlot& slot) noexcept {
-        rune::storage::Log* log = slot.log;
-        if (log->recoveryCheckpointStage() == rune::storage::Log::RpStage::Idle) {
-            if (!log->recoveryCheckpointDue()) [[likely]] return 0;
-            if (!log->beginRecoveryCheckpoint()) {   // tmp write failed: fail-stop
-                checkStorageFailure_(log);
-                return 1;
+    // E1d: recovery-point checkpoints, EVENT-DRIVEN (F8): a completion that
+    // makes a log's checkpoint due queues that log once (rpQueued); this pass
+    // touches only queued logs.  Each checkpoint is ONE io-backend request
+    // (write the alternate pre-allocated slot + fdatasync): no syscall, no
+    // allocation on the loop.  A refused submit stays queued (next pass).
+    void queueRecoveryCheckpoint_(LogFlushSlot& slot) noexcept {
+        if (slot.rpQueued) return;
+        slot.rpQueued = true;
+        rpQueue_.push_back(slot.log);   // capacity reserved = slots_.size() (no allocation)
+    }
+    int submitRecoveryCheckpoints_() noexcept {
+        if (rpQueue_.empty()) [[likely]] return 0;
+        int work = 0;
+        std::size_t keep = 0;
+        for (std::size_t i = 0; i < rpQueue_.size(); ++i) {
+            rune::storage::Log* log = rpQueue_[i];
+            LogFlushSlot* slot = slotOf_(log);
+            if (slot == nullptr) continue;                     // purged: dropped
+            rune::storage::Log::RpWrite w;
+            if (!log->prepareRecoveryCheckpoint(w)) { slot->rpQueued = false; continue; }
+            const CompletionToken t = io_.submitWriteSync(w.fd, w.data, w.len, w.offset);
+            if (t == kNoToken) {                               // back-pressure: retry next pass
+                log->recoveryCheckpointNotSubmitted();
+                rpQueue_[keep++] = log;
+                continue;
             }
+            log->recoveryCheckpointSubmitted();
+            slot->rpQueued = false;
+            if (!routeInsert_(TokenRoute{t, log, nullptr, slot->epoch, RouteKind::RecoveryPoint,
+                                         static_cast<int64_t>(w.seq)})) {
+                spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
+            }
+            ++rpSubmits_;
+            ++work;
         }
-        if (log->storageFailed()) return 0;
-        const int fd = log->recoveryCheckpointFdToSync();
-        if (fd < 0) return 0;                        // its fdatasync is in flight
-        const CompletionToken t = io_.submit(fd, 0);
-        if (t == kNoToken) return 0;                 // back-pressure: next pass
-        const uint64_t seq = log->recoveryCheckpointSubmitted();
-        if (!routeInsert_(TokenRoute{t, log, nullptr, slot.epoch, RouteKind::RecoveryPoint,
-                                     static_cast<int64_t>(seq)})) {
-            spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
-        }
-        ++rpSubmits_;
-        return 1;
+        rpQueue_.resize(keep);
+        return work;
     }
 
     // Request a background flush of `slot`'s log.  Returns true iff submitted now.

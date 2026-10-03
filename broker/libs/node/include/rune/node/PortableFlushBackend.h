@@ -51,6 +51,7 @@
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/FlushRequest.h>
 #include <rune_protocol_internal_sbe/FlushCompletion.h>
+#include <rune_protocol_internal_sbe/WriteSyncRequest.h>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -69,6 +70,13 @@ inline constexpr std::size_t kFlushRequestWireLen =
     flushsbe::MessageHeader::encodedLength() + flushsbe::FlushRequest::sbeBlockLength();
 inline constexpr std::size_t kFlushCompletionWireLen =
     flushsbe::MessageHeader::encodedLength() + flushsbe::FlushCompletion::sbeBlockLength();
+/// E1d: a write+fdatasync request (same submit ring, template id 7).
+inline constexpr std::size_t kWriteSyncWireLen =
+    flushsbe::MessageHeader::encodedLength() + flushsbe::WriteSyncRequest::sbeBlockLength();
+/// Largest inline block a write+fdatasync request carries.
+inline constexpr std::size_t kWriteSyncMaxBlock = flushsbe::WriteSyncRequest::blockLength();
+inline constexpr std::size_t kSubmitRingMaxWireLen =
+    kWriteSyncWireLen > kFlushRequestWireLen ? kWriteSyncWireLen : kFlushRequestWireLen;
 
 // ---------------------------------------------------------------------------
 // Shared I/O backend types
@@ -179,6 +187,14 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] CompletionToken submit(int fd, int64_t flushBoundary) noexcept;
 
+    // E1d: pwrite `len` (<= kWriteSyncMaxBlock) bytes of `data` at `offset` of
+    // fd, then fdatasync(fd), on the flusher thread.  The bytes travel INLINE
+    // in the request (copied now — no lifetime coupling).  ONE completion
+    // (same token space): errorCode = the write's or the sync's errno (a short
+    // write = ENOSPC).  kNoToken on back-pressure / len too large.
+    [[nodiscard]] CompletionToken submitWriteSync(int fd, const uint8_t* data, uint32_t len,
+                                                  int64_t offset) noexcept;
+
     // -----------------------------------------------------------------------
     // reap — worker side (non-blocking).
     //
@@ -245,7 +261,7 @@ private:
 template <PortableSyncFn Sync>
 BasicPortableFlushBackend<Sync>::BasicPortableFlushBackend(std::size_t submitDepth,
                                                           std::size_t completionDepth)
-    : submitRing_(detail::flushRingByteCapacity(submitDepth, kFlushRequestWireLen))
+    : submitRing_(detail::flushRingByteCapacity(submitDepth, kSubmitRingMaxWireLen))
     , completionRing_(detail::flushRingByteCapacity(completionDepth, kFlushCompletionWireLen))
     , nextToken_(0)
     , submitDepth_(submitDepth)
@@ -295,6 +311,44 @@ CompletionToken BasicPortableFlushBackend<Sync>::submit(int fd, int64_t flushBou
 }
 
 template <PortableSyncFn Sync>
+CompletionToken BasicPortableFlushBackend<Sync>::submitWriteSync(int fd, const uint8_t* data, uint32_t len,
+                                                                 int64_t offset) noexcept {
+    if (inFlight_ >= submitDepth_ || len > kWriteSyncMaxBlock) return kNoToken;
+    const CompletionToken tok = ++nextToken_;
+    const auto idx = submitRing_.tryClaim(flushsbe::WriteSyncRequest::sbeTemplateId(), kWriteSyncWireLen);
+    if (idx < 0) { --nextToken_; return kNoToken; }
+    flushsbe::WriteSyncRequest enc;
+    enc.wrapAndApplyHeader(reinterpret_cast<char*>(submitRing_.base() + idx), 0, kWriteSyncWireLen);
+    enc.fd(fd).length(static_cast<uint16_t>(len)).fileOffset(offset).token(static_cast<int64_t>(tok));
+    std::memset(enc.block(), 0, kWriteSyncMaxBlock);
+    std::memcpy(enc.block(), data, len);
+    submitRing_.commit(idx);
+    ++inFlight_;
+    return tok;
+}
+
+namespace detail {
+// E1d: execute one WriteSyncRequest slot (flusher thread): pwrite then sync.
+template <PortableSyncFn Sync>
+inline int32_t runWriteSync(aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+                            aeron::util::index_t length, CompletionToken& tokOut, int& fdOut) noexcept {
+    char* rp = reinterpret_cast<char*>(buf.buffer() + offset);
+    const std::uint64_t rcap = static_cast<std::uint64_t>(length);
+    flushsbe::MessageHeader rhdr;
+    rhdr.wrap(rp, 0, 0, rcap);
+    flushsbe::WriteSyncRequest req;
+    req.wrapForDecode(rp, flushsbe::MessageHeader::encodedLength(), rhdr.blockLength(), rhdr.version(), rcap);
+    tokOut = static_cast<CompletionToken>(req.token());
+    fdOut  = req.fd();
+    const std::size_t n = req.length();
+    const ssize_t w = ::pwrite(fdOut, req.block(), n, static_cast<off_t>(req.fileOffset()));
+    if (w != static_cast<ssize_t>(n)) return w < 0 ? (errno != 0 ? errno : EIO) : ENOSPC;
+    if (Sync(fdOut) != 0) return errno != 0 ? errno : EIO;
+    return 0;
+}
+} // namespace detail
+
+template <PortableSyncFn Sync>
 void BasicPortableFlushBackend<Sync>::flusherLoop_() {
     // The flusher loop: drain submit ring → fdatasync → post completion.
     // Runs until the dtor posts Stop on stopRing_ (F9a).  No sentinel: submit()
@@ -319,20 +373,25 @@ void BasicPortableFlushBackend<Sync>::flusherLoop_() {
     pollStop();
     while (!stop) {
         const int drained = submitRing_.drain(
-            [this](int32_t /*msgTypeId*/,
+            [this](int32_t msgTypeId,
                    aeron::concurrent::AtomicBuffer& buf,
                    aeron::util::index_t offset,
                    aeron::util::index_t length) {
-                // read-rework SBE-C: SBE-decode the request in place (zero-copy).
-                const FlushRequest    r        = detail::decodeFlushRequest(buf, offset, length);
-                const int             reqFd    = r.fd;
-                const int64_t         reqBound = r.flushBoundary;
-                const CompletionToken reqTok   = r.token;
-
-                // Perform the datasync (may block — intentional; off the worker path).
-                int rc = Sync(reqFd);
-                int saved_errno = (rc != 0) ? errno : 0;
-                const int32_t ec = (rc == 0) ? 0 : saved_errno;
+                int64_t         reqBound = 0;
+                CompletionToken reqTok   = 0;
+                int32_t         ec       = 0;
+                if (msgTypeId == static_cast<int32_t>(flushsbe::WriteSyncRequest::sbeTemplateId())) {
+                    int fd = -1;   // E1d: pwrite + fdatasync (may block — off the worker path)
+                    ec = detail::runWriteSync<Sync>(buf, offset, length, reqTok, fd);
+                } else {
+                    // read-rework SBE-C: SBE-decode the request in place (zero-copy).
+                    const FlushRequest r = detail::decodeFlushRequest(buf, offset, length);
+                    reqBound = r.flushBoundary;
+                    reqTok   = r.token;
+                    // Perform the datasync (may block — intentional; off the worker path).
+                    const int rc = Sync(r.fd);
+                    ec = (rc == 0) ? 0 : errno;
+                }
 
                 // SBE wrap-in-place encode of the completion into the claimed slot.
                 // The flusher may block (off worker path); the completion ring drains
@@ -368,13 +427,18 @@ void BasicPortableFlushBackend<Sync>::flusherLoop_() {
     // completions — the worker has stopped reaping, so writing to the (possibly
     // full) completion ring could spin forever and hang join().
     submitRing_.drain(
-        [this](int32_t /*msgTypeId*/,
+        [this](int32_t msgTypeId,
                aeron::concurrent::AtomicBuffer& buf,
                aeron::util::index_t offset,
                aeron::util::index_t length) {
             // F9a fix: the slot is SBE-encoded — decode it exactly like the main
             // loop (it was reinterpret_cast as the POD FlushRequest, syncing the
             // SBE header bytes as an fd).
+            if (msgTypeId == static_cast<int32_t>(flushsbe::WriteSyncRequest::sbeTemplateId())) {
+                CompletionToken t = 0; int fd = -1;
+                (void)detail::runWriteSync<Sync>(buf, offset, length, t, fd);
+                return;
+            }
             (void)Sync(detail::decodeFlushRequest(buf, offset, length).fd);
         },
         /*limit=*/1 << 30);

@@ -2599,3 +2599,69 @@ TEST(CompactionCleanerAgent, CompactionConvergesWithSingleSegmentGroups) {
 
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// E1d F2 (Regression): the PRODUCTION cleaner gate.  LogCleanerAgent bounds
+// firstUncleanable by the first sealed segment ending above the PERSISTED
+// recovery point (SegInfo::belowRecoveryPoint) — restart recovery chain-
+// validates those segments, and a compaction gap there would read as a lost
+// write.  A segment whose seal is durable only in memory (checkpoint not yet
+// durable) is never compacted.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, NeverCompactsAboveRecoveryPoint) {
+    auto dir = cp6TempDir("e1d_agent_gate");
+    Log log(dir.string(), /*rollBytes=*/256);
+    log.recover();
+    log.setDeferSealSync(true);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1300, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->becomeLeader(1, {1});
+    int64_t off = 0;
+    while (log.segmentBaseOffsets().size() < 4) {
+        auto b = cp6Batch(off, "same-key", "v" + std::to_string(off));
+        off = log.appendNoSync(b.data(), b.size(), off);
+    }
+    replica->onLeaderLogAppended();
+    const auto bases = log.segmentBaseOffsets();
+    auto completeSeal = [&] {
+        rune::storage::LogSegment* s = log.frontPendingSeal();
+        log.popPendingSeal();
+        ASSERT_EQ(::fsync(s->logFd()), 0);
+        log.noteFlushCompleted(s, INT64_MAX);
+        log.unpinSegmentFlush(s);
+    };
+    completeSeal();                                      // seg0 durable
+    Log::RpWrite w;                                       // ... and its checkpoint durable
+    ASSERT_TRUE(log.prepareRecoveryCheckpoint(w));
+    log.recoveryCheckpointSubmitted();
+    ASSERT_EQ(::pwrite(w.fd, w.data, w.len, w.offset), static_cast<ssize_t>(w.len));
+    ASSERT_EQ(::fsync(w.fd), 0);
+    log.recoveryCheckpointCompleted(w.seq, 0);
+    ASSERT_EQ(log.persistedRecoveryPoint(), bases[1]);
+    completeSeal();                                      // seg1, seg2 durable in MEMORY only
+    completeSeal();
+    ASSERT_EQ(log.recoveryPoint(), bases[3]);
+    ASSERT_EQ(log.persistedRecoveryPoint(), bases[1]);
+    auto segFile = [&](int64_t base) {
+        std::string s = std::to_string(base);
+        return (dir / (std::string(20 - s.size(), '0') + s + ".log")).string();
+    };
+    const auto size1 = fs::file_size(segFile(bases[1]));
+    const auto size2 = fs::file_size(segFile(bases[2]));
+    const auto size0 = fs::file_size(segFile(bases[0]));
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(1300, 0, std::move(replica));
+    rune::node::LogCleanerAgent cleaner(&registry);
+    for (int i = 0; i < 50; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i) * 1'000'000LL);
+        log.drainCleanerSwaps();
+    }
+    EXPECT_EQ(fs::file_size(segFile(bases[1])), size1) << "compacted a segment above the persisted R";
+    EXPECT_EQ(fs::file_size(segFile(bases[2])), size2) << "compacted a segment above the persisted R";
+    EXPECT_TRUE(!fs::exists(segFile(bases[0])) || fs::file_size(segFile(bases[0])) < size0)
+        << "positive control: the segment below R compacts";
+    fs::remove_all(dir);
+}
