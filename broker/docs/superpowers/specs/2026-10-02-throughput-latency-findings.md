@@ -229,6 +229,36 @@ Harness fixes needed for a valid capture: rune-fr export raced the background dr
 stopBackgroundDrain() before dumpAll (VM build); dump must not run inside the measured window; tape sized to the
 client thread's event rate; idle per-loop Aeron hooks masked out (RUNE_FR_AERON_MASK=0x87B0F8).
 
+### 4.6 Experiments that did NOT help + worker pass composition (2026-10-03, 20k acks=all, fsync off)
+
+- Run-to-completion (driver receiver+sender called inside the pass, unconditionally): p50 worse (+100-300 us, 2 rounds).
+- Conditional send-now (driver sender after a stage that offered): p50 479/471 -> 569/569 us (2 pairs, backoff). Reverted.
+  Extra driver calls cost more than the hand-off they save (each sender call walks every publication + own sendmsg).
+- Reference baseline with backoff workers: p50 ~475 us.
+
+Pass composition (rune-fr, every span kept, backoff workers, Aeron duty hooks on; NOTE: 33-38M records dropped by ring
+overflow at this event rate, so absolute counts are low-biased; the shares are the signal).  Pass p50 38-42 us,
+8.7-12.9k passes/s per worker, workers 80-92% busy at 20k rec/s.
+
+| per pass (avg over 3 workers) | us/pass | % of pass |
+|---|---|---|
+| Aeron driver duty (runs ~2.2x per pass) | 47-59 | **64-67** |
+|   receiver duty: ~5 transports polled with recvmmsg each (~11-12 recv syscalls/pass, mostly empty, ~1.5 us each) | 24-29 | 32-34 |
+|   sender duty: ~9 publications walked per duty, ~1 real sendmsg/pass (7-8 us) | 15-19 | 21 |
+|   conductor duty | 7-9 | 10 |
+| our replication poll (apply + fast-ack) | 10-14 | 13-15 |
+| our client ingress | 4-8 | 6-9 |
+| fused runtime | 3-4 | 4-5 |
+| replica doWork (push/ISR/HW) | 2-4 | 3-4 |
+| everything else (acks, disk, cold tail, conductor invoke) | ~2 | ~3 |
+
+Aeron's transport poller iterates recvmmsg over every transport when there are <= 5
+(AERON_UDP_TRANSPORT_POLLER_ITERATION_THRESHOLD) and only uses epoll above that -> each worker pays ~5 empty recv
+syscalls per duty, ~2.2 duties per pass.  Levers (no busy-spin): (1) fewer receive transports per worker (one
+channel/port, many streams) -> 1-2 recv syscalls per duty; (2) one driver duty per pass unless the previous one
+moved data (the "repeat while work" loop runs ~2.2x, second pass mostly housekeeping); (3) idle publications/images
+walked every duty (~20 PubSend/ImageClean per pass) - fewer publications per worker.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
