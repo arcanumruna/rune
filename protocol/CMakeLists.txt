@@ -40,7 +40,8 @@ if(BUILD_TESTING)
             tests/protocol/client/MetadataMessagesTest.cpp
             tests/protocol/client/SchemaMessagesTest.cpp
             tests/protocol/client/SchemaConformanceTest.cpp
-            tests/protocol/internal/RingSbeTest.cpp)
+            tests/protocol/internal/RingSbeTest.cpp
+            tests/protocol/net/UdpGsoPlanTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_definitions(rune_protocol_tests PRIVATE
             RUNE_CONFORMANCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/conformance")
