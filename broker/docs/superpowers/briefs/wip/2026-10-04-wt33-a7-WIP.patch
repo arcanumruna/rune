@@ -1,0 +1,615 @@
+diff --git a/libs/node/CMakeLists.txt b/libs/node/CMakeLists.txt
+index a8391f7..1125a43 100644
+--- a/libs/node/CMakeLists.txt
++++ b/libs/node/CMakeLists.txt
+@@ -58,6 +58,21 @@ target_link_libraries(rune_node PUBLIC spdlog::spdlog)
+ # UDP GSO/GRO Aeron transport bindings (EmbeddedDriver, HostDefaults probe).
+ target_link_libraries(rune_node PUBLIC rune_gso)
+ 
++# A7 park-until-work: an invoker driver's readiness fds (its transport pollers' epoll instances).  A C TU:
++# Aeron's internal driver headers are C; they include siblings relative to <root>, <root>/aeron,
++# <root>/aeronmd (same probe as rune_gso).  Non-Linux compiles a stub (0 fds -> timed park).
++add_library(rune_driver_wake STATIC src/DriverWakeFds.c)
++set_target_properties(rune_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
++target_include_directories(rune_driver_wake PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
++if(UNIX AND NOT APPLE)
++    target_link_libraries(rune_driver_wake PRIVATE aeron::aeron)
++    foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
++        target_include_directories(rune_driver_wake PRIVATE
++            "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
++    endforeach()
++endif()
++target_link_libraries(rune_node PUBLIC rune_driver_wake)
++
+ if(BUILD_TESTING)
+     find_package(GTest REQUIRED)
+ 
+@@ -103,6 +118,7 @@ if(BUILD_TESTING)
+         tests/node/SignalControlTest.cpp
+         tests/node/LeaderObserverTest.cpp
+         tests/node/OwnerThreadTestTaskTest.cpp
++        tests/node/ParkUntilWorkIdleTest.cpp
+         )
+     target_link_libraries(rune_node_tests PRIVATE
+         rune_node
+diff --git a/libs/node/include/rune/node/EmbeddedDriver.h b/libs/node/include/rune/node/EmbeddedDriver.h
+index 8e94fd4..48d2484 100644
+--- a/libs/node/include/rune/node/EmbeddedDriver.h
++++ b/libs/node/include/rune/node/EmbeddedDriver.h
+@@ -116,6 +116,11 @@ public:
+     [[nodiscard]] bool udpGroActive() const noexcept { return (gsoActiveMask_ & 2) != 0; }
+     /// GSO/GRO totals of every transport this driver closed; complete after close().
+     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
++    /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
++    /// pollers' epoll instances, DriverWakeFds.h) into `out` (at most `max`); returns how many.  0 for a
++    /// threaded driver (its own thread consumes the sockets), a closed driver, or a non-Linux platform.
++    /// Owned by the driver: valid until close().  Pump thread only (like doWork).
++    [[nodiscard]] int wakeFds(int* out, int max) const noexcept;
+     /// network_publication_max_messages_per_send the driver was started with.
+     [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
+     /// Misuse tallies (diagnostics).  OBSERVER thread only (one at a time —
+diff --git a/libs/node/include/rune/node/NodeConfig.h b/libs/node/include/rune/node/NodeConfig.h
+index 35da7e6..6f71474 100644
+--- a/libs/node/include/rune/node/NodeConfig.h
++++ b/libs/node/include/rune/node/NodeConfig.h
+@@ -40,6 +40,8 @@
+ //
+ // All Aeron channels use the aeron:udp transport (container transport).
+ 
++#include <rune/node/IdleShape.h>
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <functional>
+@@ -266,6 +268,31 @@ struct NodeConfig {
+     // busyspin which triggers re-elections on shared cores).
+     int64_t idleMaxParkUs = 200;
+ 
++    // A7 park-until-work (findings §4.12): shard workers park in ppoll() on their invoker driver's
++    // socket-readiness fds (DriverWakeFds.h; Linux), woken by the next datagram and bounded by the backoff
++    // park period (1 µs doubling to idleMaxParkUs — today's bound for ring/timer work).  RUNE_IDLE_WAKE=0 →
++    // the legacy Aeron backoff (10 spins, 20 yields, timed park).  Measured: the legacy shape never parks a
++    // shard worker under load (each "spin" is a full ~35 µs syscall pass), 100% CPU per worker at 20k rec/s.
++    bool idleWake = true;
++    // Idle passes before parking (RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS, >= 0).  kIdleAuto = derived:
++    // 0 / 0 when the worker parks on readiness (the next datagram wakes it — polling buys nothing),
++    // else the Aeron 10 / 20.
++    static constexpr int32_t kIdleAuto = -1;
++    int32_t idleSpins  = kIdleAuto;
++    int32_t idleYields = kIdleAuto;
++
++    /// Shard workers park on driver readiness unless RUNE_IDLE_WAKE=0.
++    [[nodiscard]] bool shardIdleWantsWake() const noexcept { return idleWake; }
++    /// The shard-worker backoff shape, given whether the worker got readiness fds to park on.
++    [[nodiscard]] IdleShape shardIdleShape(bool wakeFdsAvailable) const noexcept {
++        IdleShape s;
++        s.maxSpins  = idleSpins  >= 0 ? idleSpins  : (wakeFdsAvailable ? 0 : 10);
++        s.maxYields = idleYields >= 0 ? idleYields : (wakeFdsAvailable ? 0 : 20);
++        s.minParkNs = 1'000;
++        s.maxParkNs = idleMaxParkUs * 1'000;
++        return s;
++    }
++
+     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
+     // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
+     // Set to 1 for single-node deployments (leader-only ISR is the whole cluster).
+diff --git a/libs/node/include/rune/node/ShardAgent.h b/libs/node/include/rune/node/ShardAgent.h
+index c7ec11b..becd5b8 100644
+--- a/libs/node/include/rune/node/ShardAgent.h
++++ b/libs/node/include/rune/node/ShardAgent.h
+@@ -84,6 +84,16 @@ public:
+         return work;
+     }
+ 
++    /// A7 park-until-work: the socket-readiness fds this shard's runner parks on — its own invoker
++    /// driver's, plus the fused runtime's driver when that is a separate one (A4: riding this shard's
++    /// driver adds nothing).  Read before the runner starts (setFusedRuntime first).  Returns how many.
++    [[nodiscard]] int wakeFds(int* out, int max) const noexcept {
++        int n = driver_.wakeFds(out, max);
++        if (runtimeDriver_ != nullptr && runtimeDriver_ != &driver_ && n < max)
++            n += runtimeDriver_->wakeFds(out + n, max - n);
++        return n;
++    }
++
+     [[nodiscard]] uint64_t slowPassesForTest() const noexcept { return slowPasses_; }
+     /// A1: most driver duty cycles one pass runs while the driver keeps reporting work.
+     static constexpr int kDriverDutyPerPass = 16;
+diff --git a/libs/node/include/rune/node/WorkerPool.h b/libs/node/include/rune/node/WorkerPool.h
+index 3da463c..f649dea 100644
+--- a/libs/node/include/rune/node/WorkerPool.h
++++ b/libs/node/include/rune/node/WorkerPool.h
+@@ -37,6 +37,7 @@
+ #include <rune/node/NodeConfig.h>
+ #include <rune/node/ReplicaRegistry.h>
+ #include <rune/node/ShardAgent.h>
++#include <rune/node/ParkUntilWorkIdle.h>
+ #include <rune/node/Worker.h>
+ #include <rune/node/WorkerOp.h>
+ #include <rune/metadata/ShardRouter.h>
+@@ -63,6 +64,34 @@ makeBackoffIdle(int64_t maxParkUs) {
+         std::chrono::microseconds{maxParkUs});
+ }
+ 
++// A7 (findings §4.12): the shard runner's idle strategy.  Busy-spin ONLY on the explicit
++// RUNE_WORKER_IDLE=busyspin opt-in.  Otherwise park-until-work on the agent's driver-readiness fds
++// (`fds`, n > 0) with the derived shape (park after the first empty pass); with RUNE_IDLE_WAKE=0 or no
++// fds (non-Linux): the legacy Aeron backoff — byte-identical to pre-A7 — unless RUNE_IDLE_SPINS /
++// RUNE_IDLE_YIELDS set an explicit shape (then a timed ParkUntilWorkIdle of that shape).
++inline std::unique_ptr<rune::consensus::IdleStrategy>
++makeShardIdle(const NodeConfig& cfg, const int* fds, int n) {
++    if (cfg.shardWorkersBusySpin()) return std::make_unique<rune::consensus::BusySpinIdleStrategy>();
++    if (cfg.shardIdleWantsWake() && n > 0)
++        return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(/*wakeFdsAvailable=*/true), fds, n);
++    if (cfg.idleSpins == NodeConfig::kIdleAuto && cfg.idleYields == NodeConfig::kIdleAuto)
++        return makeBackoffIdle(cfg.idleMaxParkUs);
++    return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(/*wakeFdsAvailable=*/false), nullptr, 0);
++}
++
++/// One line per shard worker naming the RESOLVED idle (proof of the measured path in perf logs).
++inline std::string describeShardIdle(const rune::consensus::IdleStrategy& idle) {
++    if (const auto* p = dynamic_cast<const ParkUntilWorkIdle*>(&idle)) {
++        const IdleShape& s = p->shape();
++        return std::string(p->wakeFdCount() > 0 ? "park-until-work" : "timed-park") + "{wakeFds=" +
++               std::to_string(p->wakeFdCount()) + " spins=" + std::to_string(s.maxSpins) + " yields=" +
++               std::to_string(s.maxYields) + " parkNs=" + std::to_string(s.minParkNs) + "-" +
++               std::to_string(s.maxParkNs) + "}";
++    }
++    if (dynamic_cast<const rune::consensus::BusySpinIdleStrategy*>(&idle) != nullptr) return "busy-spin";
++    return "backoff{spins=10 yields=20 (legacy Aeron)}";
++}
++
+ class WorkerPool {
+ public:
+ 
+@@ -535,16 +564,21 @@ public:
+     // refusal) when there is not exactly one agent per worker.
+     void startShardRunners(std::vector<std::unique_ptr<ShardAgent>>& agents,
+                            rune::consensus::NanoClock& clock,
+-                           bool busySpin, int64_t maxParkUs) {
++                           const NodeConfig& cfg) {
+         if (!runners_.empty()) return;
+         if (agents.size() != workers_.size())      // hard check in release too (startup refusal)
+             throw std::logic_error("WorkerPool::startShardRunners: " + std::to_string(agents.size()) +
+                                    " ShardAgent(s) for " + std::to_string(workers_.size()) + " worker(s)");
+         idles_.reserve(agents.size());
+         runners_.reserve(agents.size());
+-        for (auto& a : agents) {
+-            if (busySpin) idles_.emplace_back(std::make_unique<rune::consensus::BusySpinIdleStrategy>());
+-            else          idles_.emplace_back(makeBackoffIdle(maxParkUs));
++        for (std::size_t i = 0; i < agents.size(); ++i) {
++            auto& a = agents[i];
++            // A7: park on this shard's driver readiness (read here, before its runner owns the pump).
++            int fds[ParkUntilWorkIdle::kMaxWakeFds];
++            const int nfds = a->wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds);
++            idles_.emplace_back(makeShardIdle(cfg, fds, nfds));
++            // WARN: visible in perf runs (RUNE_LOG_LEVEL=warn) — the RESOLVED idle of this worker.
++            spdlog::warn("WorkerPool: shard worker {} idle={}", i, describeShardIdle(*idles_.back()));
+             runners_.emplace_back(std::make_unique<rune::consensus::AgentRunner>(*a, *idles_.back(), clock));
+             runners_.back()->start();
+         }
+diff --git a/libs/node/src/BrokerNode.cpp b/libs/node/src/BrokerNode.cpp
+index 41e69dd..8403a0d 100644
+--- a/libs/node/src/BrokerNode.cpp
++++ b/libs/node/src/BrokerNode.cpp
+@@ -400,9 +400,8 @@ void BrokerNode::start() {
+             }
+             // Backoff idle by default (never busy-spin unless explicitly opted in:
+             // RUNE_WORKER_IDLE=busyspin) — pinned or not.
+-            workerPool_->startShardRunners(shardAgents_, clock_,
+-                                           /*busySpin=*/config_.shardWorkersBusySpin(),
+-                                           config_.idleMaxParkUs);
++            // A7: park-until-work on each shard's driver readiness (RUNE_IDLE_WAKE, default on).
++            workerPool_->startShardRunners(shardAgents_, clock_, config_);
+         } else {
+             workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
+         }
+diff --git a/libs/node/src/EmbeddedDriver.cpp b/libs/node/src/EmbeddedDriver.cpp
+index 9e6828b..a2c500e 100644
+--- a/libs/node/src/EmbeddedDriver.cpp
++++ b/libs/node/src/EmbeddedDriver.cpp
+@@ -1,5 +1,6 @@
+ #include <rune/node/EmbeddedDriver.h>
+ #include <rune/node/HostDefaults.h>
++#include <rune/node/DriverWakeFds.h>
+ #include "rune/protocol/net/rune_udp_gso.h"
+ 
+ #include <spdlog/spdlog.h>
+@@ -198,6 +199,11 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
+                  udpGroActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_);
+ }
+ 
++int EmbeddedDriver::wakeFds(int* out, int max) const noexcept {
++    if (mode_ != DriverMode::Invoker || driver_ == nullptr) return 0;
++    return rune_driver_wake_fds(driver_, out, max);
++}
++
+ int EmbeddedDriver::doWork() noexcept {
+     if (mode_ == DriverMode::Threaded || std::this_thread::get_id() != pumpOwner_) [[unlikely]] {
+         spdlog::error("EmbeddedDriver: doWork() refused — not this driver's pump thread "
+diff --git a/libs/node/src/HostDefaults.cpp b/libs/node/src/HostDefaults.cpp
+index 6885936..2b6efc6 100644
+--- a/libs/node/src/HostDefaults.cpp
++++ b/libs/node/src/HostDefaults.cpp
+@@ -350,13 +350,24 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
+     std::string ioWq;
+     for (const int32_t c : cfg.ioWorkerCpus) { if (!ioWq.empty()) ioWq += ','; ioWq += std::to_string(c); }
+     if (ioWq.empty()) ioWq = "inherit";
+-    char line[896];
++    // A7: the shard-worker idle (ParkUntilWorkIdle; the workers' start line logs the RESOLVED shape).
++    std::string idle = "legacy";
++    if (cfg.shardMode()) {
++        if (cfg.shardWorkersBusySpin()) {
++            idle = "busy-spin";
++        } else {
++            const auto n = [](int32_t v) { return v == NodeConfig::kIdleAuto ? std::string("auto") : std::to_string(v); };
++            idle = std::string(cfg.shardIdleWantsWake() ? "wake" : "backoff") + "{spins=" + n(cfg.idleSpins) +
++                   " yields=" + n(cfg.idleYields) + " parkUs=1-" + std::to_string(cfg.idleMaxParkUs) + "}";
++        }
++    }
++    char line[1024];
+     std::snprintf(line, sizeof line,
+-        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
++        "mode=%s placement=%s workers=%d coreBase=%d(%s) idle=%s io=%s ioWq=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
+         "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
+         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
+         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
+-        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(),
++        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", idle.c_str(), io.c_str(), ioWq.c_str(),
+         cfg.aeronTermBufferBytes, cfg.aeronControlTermBufferBytes,
+         static_cast<long long>(cfg.workerSyncIntervalMs), static_cast<long long>(cfg.followerFlushIntervalMs),
+         cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,
+diff --git a/libs/node/src/NodeConfig.cpp b/libs/node/src/NodeConfig.cpp
+index d691d4a..8ff8428 100644
+--- a/libs/node/src/NodeConfig.cpp
++++ b/libs/node/src/NodeConfig.cpp
+@@ -1190,6 +1190,23 @@ ConfigResult parseNodeConfig(
+         }
+     }
+ 
++    // --- A7: RUNE_IDLE_WAKE (default on) / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS (default auto) ---
++    // Shard-worker park-until-work (NodeConfig::idleWake).  "0"/"false"/"off"/"no" → the legacy Aeron
++    // backoff; anything else keeps it on.  Spins / yields: a non-negative integer, else auto (derived by
++    // NodeConfig::shardIdleShape).
++    if (const char* iw = getenv_fn("RUNE_IDLE_WAKE")) {
++        std::string s(iw);
++        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++        if (s == "0" || s == "false" || s == "off" || s == "no") cfg.idleWake = false;
++    }
++    for (auto [name, field] : {std::pair{"RUNE_IDLE_SPINS", &cfg.idleSpins},
++                               std::pair{"RUNE_IDLE_YIELDS", &cfg.idleYields}}) {
++        if (const char* v = getenv_fn(name)) {
++            int32_t n{};
++            if (parseInt32(v, n) && n >= 0) *field = n;
++        }
++    }
++
+     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
+     // When "1" or "true", each worker gets its own Aeron subscription and the
+     // gateway produce fanout is gated off (!perWorkerIngressEnabled).
+diff --git a/libs/node/tests/node/EmbeddedDriverTest.cpp b/libs/node/tests/node/EmbeddedDriverTest.cpp
+index b879cfe..d564020 100644
+--- a/libs/node/tests/node/EmbeddedDriverTest.cpp
++++ b/libs/node/tests/node/EmbeddedDriverTest.cpp
+@@ -211,3 +211,95 @@ TEST(EmbeddedDriverRegression, NonSparseTermsAreFullyAllocatedAtCreationRegressi
+     EXPECT_LT(allocatedLogBufferBytes({}, /*sparse=*/true), full / 2)
+         << "sparse terms stay unallocated until written (the default is unchanged)";
+ }
++
++// ---------------------------------------------------------------------------
++// A7 park-until-work (findings §4.12): an invoker driver exposes its transport pollers' epoll fds; a
++// shard worker parked on them wakes on the next datagram instead of sleeping out its park period.
++// Linux only (Aeron's pollers use epoll there; other platforms expose none -> timed park).
++// ---------------------------------------------------------------------------
++#include <rune/node/ParkUntilWorkIdle.h>
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++namespace {
++uint16_t freeUdpPortForWake() {
++    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
++    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
++    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
++    socklen_t len = sizeof(a);
++    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
++    ::close(fd);
++    return ntohs(a.sin_port);
++}
++void sendJunkDatagram(uint16_t port) {
++    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
++    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
++    const char junk[8] = {1, 2, 3, 4, 5, 6, 7, 8};   // not an Aeron frame: the receiver reads and drops it
++    ASSERT_EQ(::sendto(fd, junk, sizeof junk, 0, reinterpret_cast<sockaddr*>(&a), sizeof a), static_cast<ssize_t>(sizeof junk));
++    ::close(fd);
++}
++int64_t msSinceWake(std::chrono::steady_clock::time_point t0) {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
++}
++} // namespace
++
++TEST(EmbeddedDriverWake, ThreadedDriverExposesNoWakeFds) {
++    TmpDir d;
++    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Threaded);
++    int fds[4];
++    EXPECT_EQ(drv.wakeFds(fds, 4), 0) << "only the pumping owner of an INVOKER driver may park on its sockets";
++}
++
++TEST(EmbeddedDriverWakeRegression, ParkedOwnerWakesOnDatagramNotTimeout) {
++#if !defined(__linux__)
++    GTEST_SKIP() << "driver wake fds are Linux-only (Aeron's transport pollers use epoll there)";
++#else
++    TmpDir d;
++    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);
++    auto a = connect(d.path, /*invoker=*/true);
++    ASSERT_TRUE(a);
++    int fds[4];
++    const int n = drv.wakeFds(fds, 4);
++    ASSERT_EQ(n, 2) << "receiver + sender transport pollers";
++
++    const uint16_t port = freeUdpPortForWake();
++    const int64_t reg = a->addSubscription("aeron:udp?endpoint=127.0.0.1:" + std::to_string(port), 9101);
++    std::shared_ptr<aeron::Subscription> sub;
++    for (int i = 0; i < 100'000 && !sub; ++i) {
++        drv.doWork();
++        a->conductorAgentInvoker().invoke();
++        sub = a->findSubscription(reg);
++    }
++    ASSERT_TRUE(sub) << "subscription (and its UDP socket) resolved";
++    for (int i = 0; i < 100; ++i) { drv.doWork(); a->conductorAgentInvoker().invoke(); }
++
++    // Nothing readable: a park waits out its period.
++    rune::node::ParkUntilWorkIdle quiet(rune::node::IdleShape{0, 0, 30'000'000, 30'000'000}, fds, n);
++    auto t0 = std::chrono::steady_clock::now();
++    quiet.idle(0);
++    EXPECT_GE(msSinceWake(t0), 20);
++    EXPECT_EQ(quiet.readinessWakes(), 0u);
++
++    // A datagram on the driver's socket ends a 5 s park immediately.
++    rune::node::ParkUntilWorkIdle idle(rune::node::IdleShape{0, 0, 5'000'000'000, 5'000'000'000}, fds, n);
++    std::thread sender([&] { std::this_thread::sleep_for(std::chrono::milliseconds(30)); sendJunkDatagram(port); });
++    t0 = std::chrono::steady_clock::now();
++    idle.idle(0);
++    const int64_t waited = msSinceWake(t0);
++    sender.join();
++    EXPECT_LT(waited, 2'000) << "parked until the datagram, not the 5 s timeout";
++    EXPECT_EQ(idle.readinessWakes(), 1u);
++
++    // The owner's pass drains it; the fds are quiet again (level-triggered, no sticky wake).
++    for (int i = 0; i < 10; ++i) drv.doWork();
++    rune::node::ParkUntilWorkIdle after(rune::node::IdleShape{0, 0, 30'000'000, 30'000'000}, fds, n);
++    t0 = std::chrono::steady_clock::now();
++    after.idle(0);
++    EXPECT_GE(msSinceWake(t0), 20) << "a drained socket must not keep waking the owner";
++    EXPECT_EQ(after.readinessWakes(), 0u);
++    sub.reset();
++    a.reset();
++#endif
++}
+diff --git a/libs/node/tests/node/HostDefaultsTest.cpp b/libs/node/tests/node/HostDefaultsTest.cpp
+index 14641cd..94ad674 100644
+--- a/libs/node/tests/node/HostDefaultsTest.cpp
++++ b/libs/node/tests/node/HostDefaultsTest.cpp
+@@ -488,6 +488,29 @@ TEST(HostDefaults, PinnedShardWorkersBackOffByDefaultRegression) {
+     EXPECT_NE(hs.summary.find("coreBase=1(busy-spin)"), std::string::npos) << hs.summary;
+ }
+ 
++// A7: the effective-config line names the shard idle (park-until-work + its derived shape, or the
++// legacy backoff when RUNE_IDLE_WAKE=0, or busy-spin on the explicit opt-in) — proof of the measured path.
++TEST(HostDefaults, SummaryNamesShardIdleShape) {
++    NodeConfig c = threeNodeDefault(0);
++    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
++    EXPECT_NE(hd.summary.find("idle=wake{spins=auto yields=auto parkUs=1-200}"), std::string::npos) << hd.summary;
++
++    NodeConfig off = threeNodeDefault(0);
++    off.idleWake = false;
++    const auto ho = applyHostDerivedDefaults(off, k3sFacts());
++    EXPECT_NE(ho.summary.find("idle=backoff{spins=auto yields=auto parkUs=1-200}"), std::string::npos) << ho.summary;
++
++    NodeConfig ex = threeNodeDefault(0);
++    ex.idleSpins = 1; ex.idleYields = 2; ex.idleMaxParkUs = 100;
++    const auto he = applyHostDerivedDefaults(ex, k3sFacts());
++    EXPECT_NE(he.summary.find("idle=wake{spins=1 yields=2 parkUs=1-100}"), std::string::npos) << he.summary;
++
++    NodeConfig spin = threeNodeDefault(0);
++    spin.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;
++    const auto hs = applyHostDerivedDefaults(spin, k3sFacts());
++    EXPECT_NE(hs.summary.find("idle=busy-spin"), std::string::npos) << hs.summary;
++}
++
+ // Low-volume control publications (per-session acks, gateway egress) get their own small term: at the
+ // data term (16 MiB) an ack stream filled a term every ~10 s and the rotation's term cleaning stalled the
+ // worker pass 100+ ms (p99 11-31 ms -> 311-352 us with 1 MiB, findings §4.2).
+diff --git a/libs/node/tests/node/NodeConfigTest.cpp b/libs/node/tests/node/NodeConfigTest.cpp
+index a641379..67a5825 100644
+--- a/libs/node/tests/node/NodeConfigTest.cpp
++++ b/libs/node/tests/node/NodeConfigTest.cpp
+@@ -1338,6 +1338,89 @@ TEST(NodeConfig, RuneWorkerIdleGarbageFloorsToBackoff) {
+         << "unrecognised value must floor to Backoff";
+ }
+ 
++// ---------------------------------------------------------------------------
++// A7: shard-worker idle shape — RUNE_IDLE_WAKE / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS
++// (park-until-work; findings §4.12).  Derived: with wake fds the worker parks after the FIRST
++// empty pass (0 spins, 0 yields); without (wake off / unavailable) the legacy Aeron 10/20.
++// ---------------------------------------------------------------------------
++TEST(NodeConfig, IdleWakeDefaultsOnWithAutoShape) {
++    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
++    ASSERT_TRUE(res.config.has_value()) << res.error;
++    EXPECT_TRUE(res.config->idleWake) << "park-until-work is the default";
++    EXPECT_EQ(res.config->idleSpins, rune::node::NodeConfig::kIdleAuto);
++    EXPECT_EQ(res.config->idleYields, rune::node::NodeConfig::kIdleAuto);
++}
++
++TEST(NodeConfig, IdleWakeOffValues) {
++    for (const char* v : {"0", "false", "off", "OFF", "no"}) {
++        auto base = base1node();
++        base["RUNE_IDLE_WAKE"] = v;
++        auto res = rune::node::parseNodeConfig(fakeEnv(base));
++        ASSERT_TRUE(res.config.has_value()) << res.error;
++        EXPECT_FALSE(res.config->idleWake) << v;
++    }
++    for (const char* v : {"1", "true", "on", "garbage"}) {   // anything else keeps the default (on)
++        auto base = base1node();
++        base["RUNE_IDLE_WAKE"] = v;
++        auto res = rune::node::parseNodeConfig(fakeEnv(base));
++        ASSERT_TRUE(res.config.has_value()) << res.error;
++        EXPECT_TRUE(res.config->idleWake) << v;
++    }
++}
++
++TEST(NodeConfig, IdleSpinsYieldsParse) {
++    auto base = base1node();
++    base["RUNE_IDLE_SPINS"]  = "3";
++    base["RUNE_IDLE_YIELDS"] = "0";
++    auto res = rune::node::parseNodeConfig(fakeEnv(base));
++    ASSERT_TRUE(res.config.has_value()) << res.error;
++    EXPECT_EQ(res.config->idleSpins, 3);
++    EXPECT_EQ(res.config->idleYields, 0) << "0 is explicit, not auto";
++}
++
++TEST(NodeConfig, IdleSpinsYieldsGarbageOrNegativeStaysAuto) {
++    for (const char* v : {"-5", "abc", "", "2x"}) {
++        auto base = base1node();
++        base["RUNE_IDLE_SPINS"]  = v;
++        base["RUNE_IDLE_YIELDS"] = v;
++        auto res = rune::node::parseNodeConfig(fakeEnv(base));
++        ASSERT_TRUE(res.config.has_value()) << res.error;
++        EXPECT_EQ(res.config->idleSpins, rune::node::NodeConfig::kIdleAuto) << v;
++        EXPECT_EQ(res.config->idleYields, rune::node::NodeConfig::kIdleAuto) << v;
++    }
++}
++
++TEST(NodeConfig, ShardIdleShapeDerivation) {
++    rune::node::NodeConfig c;
++    c.idleMaxParkUs = 200;
++    // Wake fds available + auto -> park after the first empty pass.
++    const auto w = c.shardIdleShape(/*wakeFdsAvailable=*/true);
++    EXPECT_EQ(w.maxSpins, 0);
++    EXPECT_EQ(w.maxYields, 0);
++    EXPECT_EQ(w.minParkNs, 1'000);
++    EXPECT_EQ(w.maxParkNs, 200'000) << "maxPark = RUNE_IDLE_MAX_PARK_US";
++    // No wake fds (non-Linux / wake off) + auto -> the legacy Aeron backoff shape.
++    const auto n = c.shardIdleShape(/*wakeFdsAvailable=*/false);
++    EXPECT_EQ(n.maxSpins, 10);
++    EXPECT_EQ(n.maxYields, 20);
++    EXPECT_EQ(n.maxParkNs, 200'000);
++    // Explicit values win in both cases.
++    c.idleSpins = 2; c.idleYields = 4; c.idleMaxParkUs = 50;
++    for (bool wake : {true, false}) {
++        const auto e = c.shardIdleShape(wake);
++        EXPECT_EQ(e.maxSpins, 2);
++        EXPECT_EQ(e.maxYields, 4);
++        EXPECT_EQ(e.maxParkNs, 50'000);
++    }
++}
++
++TEST(NodeConfig, ShardIdleUsesWakeOnlyWhenEnabled) {
++    rune::node::NodeConfig c;
++    EXPECT_TRUE(c.shardIdleWantsWake());
++    c.idleWake = false;
++    EXPECT_FALSE(c.shardIdleWantsWake()) << "RUNE_IDLE_WAKE=0 -> legacy backoff (the A/B off arm)";
++}
++
+ // ---------------------------------------------------------------------------
+ // E3 Task 7: io-ring depths + memory-log ring bytes (RUNE_IO_SUBMIT_RING_DEPTH,
+ // RUNE_IO_COMPLETION_RING_DEPTH, RUNE_MEMORY_LOG_RING_BYTES)
+diff --git a/libs/node/tests/node/ShardAgentTest.cpp b/libs/node/tests/node/ShardAgentTest.cpp
+index d6b1c21..741bf5f 100644
+--- a/libs/node/tests/node/ShardAgentTest.cpp
++++ b/libs/node/tests/node/ShardAgentTest.cpp
+@@ -3,6 +3,7 @@
+ // only (no wall time; idle parks between passes are never counted).
+ #include <rune/node/ShardAgent.h>
+ #include <rune/node/WorkerPool.h>
++#include <rune/node/ParkUntilWorkIdle.h>
+ 
+ #include <Aeron.h>
+ #include <gtest/gtest.h>
+@@ -60,7 +61,7 @@ TEST(ShardAgentRegression, StartShardRunnersRefusesAgentCountMismatch) {
+     WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
+     std::vector<std::unique_ptr<ShardAgent>> none;
+     rune::consensus::MonotonicNanoClock clk;
+-    EXPECT_THROW(pool.startShardRunners(none, clk, /*busySpin=*/false, 200), std::logic_error);
++    EXPECT_THROW(pool.startShardRunners(none, clk, NodeConfig{}), std::logic_error);
+ }
+ 
+ TEST(ShardAgent, PassDrivesOwnDriverAndConductor) {
+@@ -108,3 +109,77 @@ TEST(ShardAgentRegression, PassDrainsDriverWhileItHasWorkRegression) {
+     a.doWork(now += 1'000);
+     EXPECT_GT(a.driverDutyCyclesForTest() - busy0, 1u) << "with data queued the pass keeps driving the driver";
+ }
++
++// ---------------------------------------------------------------------------
++// A7 park-until-work (findings §4.12): the shard runner's idle strategy.
++// ---------------------------------------------------------------------------
++TEST(ShardAgentWake, AgentExposesItsInvokerDriversWakeFds) {
++#if !defined(__linux__)
++    GTEST_SKIP() << "driver wake fds are Linux-only";
++#else
++    Shard s;
++    rune::consensus::MonotonicNanoClock clk;
++    ShardAgent a(s.worker, *s.driver, *s.client, clk);
++    int fds[ParkUntilWorkIdle::kMaxWakeFds];
++    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2) << "its own driver's receiver + sender pollers";
++    // Fused placement with a SEPARATE runtime driver: the worker parks on both drivers' sockets.
++    Shard rt;
++    a.setFusedRuntime(nullptr, rt.driver.get(), rt.client.get());
++    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 4);
++    // A4: the runtime riding this shard's own driver adds nothing.
++    a.setFusedRuntime(nullptr, s.driver.get(), s.client.get());
++    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2);
++#endif
++}
++
++namespace {
++struct FakeFds {
++    int p[2]{-1, -1};
++    FakeFds() { EXPECT_EQ(::pipe(p), 0); }
++    ~FakeFds() { ::close(p[0]); ::close(p[1]); }
++};
++}
++
++TEST(ShardIdleRegression, DefaultWithWakeFdsParksUntilWorkAfterFirstEmptyPass) {
++    FakeFds f;
++    NodeConfig c;   // defaults: wake on, spins/yields auto, maxPark 200 us
++    auto idle = makeShardIdle(c, f.p, 1);
++    auto* p = dynamic_cast<ParkUntilWorkIdle*>(idle.get());
++    ASSERT_NE(p, nullptr) << "default shard idle = park-until-work";
++    EXPECT_EQ(p->wakeFdCount(), 1);
++    EXPECT_EQ(p->shape(), (IdleShape{0, 0, 1'000, 200'000}));
++}
++
++TEST(ShardIdle, WakeOffIsTheLegacyAeronBackoff) {
++    FakeFds f;
++    NodeConfig c;
++    c.idleWake = false;
++    auto idle = makeShardIdle(c, f.p, 1);
++    EXPECT_NE(dynamic_cast<rune::consensus::BackoffIdleStrategy*>(idle.get()), nullptr)
++        << "RUNE_IDLE_WAKE=0 is byte-identical to the pre-A7 shard idle (the A/B off arm)";
++}
++
++TEST(ShardIdle, NoWakeFdsFallsBackToLegacyBackoff) {
++    NodeConfig c;   // wake on, but the platform gave no fds (non-Linux)
++    auto idle = makeShardIdle(c, nullptr, 0);
++    EXPECT_NE(dynamic_cast<rune::consensus::BackoffIdleStrategy*>(idle.get()), nullptr);
++}
++
++TEST(ShardIdle, ExplicitShapeWithoutFdsIsATimedParkUntilWork) {
++    NodeConfig c;
++    c.idleWake = false;
++    c.idleSpins = 1; c.idleYields = 2; c.idleMaxParkUs = 50;
++    auto idle = makeShardIdle(c, nullptr, 0);
++    auto* p = dynamic_cast<ParkUntilWorkIdle*>(idle.get());
++    ASSERT_NE(p, nullptr);
++    EXPECT_EQ(p->wakeFdCount(), 0);
++    EXPECT_EQ(p->shape(), (IdleShape{1, 2, 1'000, 50'000}));
++}
++
++TEST(ShardIdle, BusySpinOnlyOnExplicitOptIn) {
++    FakeFds f;
++    NodeConfig c;
++    c.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;
++    auto idle = makeShardIdle(c, f.p, 1);
++    EXPECT_NE(dynamic_cast<rune::consensus::BusySpinIdleStrategy*>(idle.get()), nullptr);
++}
