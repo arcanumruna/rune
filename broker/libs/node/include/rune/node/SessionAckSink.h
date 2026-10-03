@@ -114,7 +114,7 @@ public:
     /// D6: `clientVersion` (ConnectRequest.clientVersion) gates the
     /// UnknownProducerId answer for this session (OOS below version 2).
     bool announce(int64_t sessionId, std::string_view channel, int32_t streamId,
-                  int32_t clientVersion = rune::protocol::client::kClientVersion) noexcept {
+                  int32_t clientVersion = 0) noexcept {   // D6 review: default = oldest (never 28 by omission)
         if (sessionId <= 0 || channel.size() > kMaxChannelBytes) return false;
         std::size_t idx = find_(sessionId);
         if (idx == kNone) idx = insert_(sessionId);
