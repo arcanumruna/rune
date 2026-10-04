@@ -38,6 +38,10 @@
 #include <gtest/gtest.h>
 
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/BrokerNode.h>
+#include <rune/node/NodeConfig.h>
+#include <rune/node/RoleCounter.h>
+#include <CncFileReader.h>
 #include <Aeron.h>
 #include <Context.h>
 
@@ -1119,4 +1123,119 @@ TEST(D9CrossNodeMarkerIntegrationRegression, PlaneReportsPeerUpEdgeAndNewInbound
     ASSERT_TRUE(until([&] { return has(2) && has(-1); }, [&] { (void)a.poll(++now); (void)b.poll(now); }))
         << "the plane never reported the reconnect (peer up edge / new inbound image)";
     EXPECT_FALSE(a.peerDownForTest(2));
+}
+
+// ============================================================================
+// Part 3 — review MEDIUM-4: the REAL BrokerNode wiring (default runtime config).
+// Three BrokerNodes in-process (each with its own embedded driver); a marker
+// is handed to one node's gateway (on its runtime thread — exactly where the
+// TCS calls it) for a partition another node leads.  It must reach that
+// leader over BrokerNode's own transport ↔ gateway wiring, land there as a
+// control batch, and its answer must come back (after the HW) and clear the
+// coordinator's in-flight entry.  The stuck-markers counter is in the CnC.
+// Waits are condition loops on owner-thread round trips (no sleeps).
+// ============================================================================
+namespace {
+NodeConfig d9NodeConfig(int nodeId, const fs::path& dataDir, const std::array<uint16_t, 9>& ports) {
+    NodeConfig cfg;   // the DEFAULT runtime (placement / worker mode) — not pinned
+    cfg.nodeId              = nodeId;
+    cfg.dataDir             = dataDir.string();
+    cfg.consensusStreamId   = 81;
+    cfg.replicationStreamId = 82;
+    cfg.electionTimeoutMs        = 150;
+    cfg.electionStatusIntervalMs = 20;
+    cfg.startupCanvassTimeoutMs  = 100;
+    for (int i = 0; i < 3; ++i) {
+        PeerConfig p;
+        p.id              = i;
+        p.host            = "127.0.0.1";
+        p.consensusPort   = ports[static_cast<std::size_t>(i)];
+        p.clientPort      = ports[static_cast<std::size_t>(3 + i)];
+        p.replicationPort = ports[static_cast<std::size_t>(6 + i)];
+        cfg.peers.push_back(p);
+    }
+    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports[static_cast<std::size_t>(3 + nodeId)]);
+    cfg.clientEndpoint.streamId = 83;
+    TopicSpec topic;
+    topic.name = "d9"; topic.partitionCount = 3; topic.topicId = 0;
+    cfg.topics.push_back(topic);
+    return cfg;
+}
+} // namespace
+
+TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughTheRealNodeWiring) {
+    TmpDir root;
+    std::array<uint16_t, 9> ports{};
+    for (std::size_t i = 0; i < ports.size(); ++i) {
+        for (;;) {
+            const uint16_t p = rune::aeronutil::testing::allocFreeUdpPort();
+            if (std::find(ports.begin(), ports.begin() + static_cast<std::ptrdiff_t>(i), p) ==
+                ports.begin() + static_cast<std::ptrdiff_t>(i)) { ports[i] = p; break; }
+        }
+    }
+    std::vector<std::unique_ptr<BrokerNode>> nodes;
+    for (int i = 0; i < 3; ++i)
+        nodes.push_back(std::make_unique<BrokerNode>(d9NodeConfig(i, root.path / ("n" + std::to_string(i)), ports)));
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(std::chrono::seconds{30}));
+
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + std::chrono::seconds{60};
+    // Find (coordinator c, partition p, leader L != c) from c's own routing image,
+    // with L's replica of p Leader there.
+    int coord = -1, part = -1, leader = -1;
+    while (coord < 0 && Clock::now() < deadline) {
+        for (int c = 0; c < 3 && coord < 0; ++c) {
+            const auto found = nodes[static_cast<std::size_t>(c)]->onControlThreadForTest([&, c] {
+                std::pair<int, int> r{-1, -1};
+                const auto* img = nodes[static_cast<std::size_t>(c)]->gatewayForTest()->routingImage();
+                if (img == nullptr) return r;
+                for (int p = 0; p < 3; ++p) {
+                    const auto& e = img->lookup(rune::metadata::gpidOf(0, p));
+                    if (e.leaderNodeId >= 0 && e.leaderNodeId != c) return std::pair<int, int>{p, e.leaderNodeId};
+                }
+                return r;
+            });
+            if (found.first < 0) continue;
+            const bool leads = nodes[static_cast<std::size_t>(found.second)]->onOwnerThreadForTest(0, found.first,
+                [](PartitionReplica* r) { return r != nullptr && r->role() == Role::Leader && r->highWatermark() >= 0; });
+            if (leads) { coord = c; part = found.first; leader = found.second; }
+        }
+        std::this_thread::yield();
+    }
+    ASSERT_GE(coord, 0) << "no partition led by a node other than a would-be coordinator";
+    BrokerNode& C = *nodes[static_cast<std::size_t>(coord)];
+    BrokerNode& L = *nodes[static_cast<std::size_t>(leader)];
+
+    const auto marker = tx::ControlMarker::build(/*pid=*/4242, 0, tx::ControlType::Commit, /*coordinatorEpoch=*/1);
+    const auto rc = C.onControlThreadForTest([&] {
+        return C.gatewayForTest()->appendControlRecord(0, part, std::span<const uint8_t>(marker), 4242, true, 1);
+    });
+    ASSERT_EQ(rc, rune::gateway::ClientGateway::kControlRecordAsync);
+    EXPECT_EQ(C.onControlThreadForTest([&] { return C.gatewayForTest()->remoteMarkersInFlightForTest(); }), 1u)
+        << "the marker was not forwarded to the remote leader";
+
+    bool landed = false;
+    while (!landed && Clock::now() < deadline) {
+        landed = L.onOwnerThreadForTest(0, part, [](PartitionReplica& r) { return controlBatchCount(*r.log()) == 1; });
+        std::this_thread::yield();
+    }
+    ASSERT_TRUE(landed) << "the marker never landed on the remote leader through the node wiring";
+    std::size_t inFlight = 1;
+    while (inFlight != 0 && Clock::now() < deadline) {
+        inFlight = C.onControlThreadForTest([&] { return C.gatewayForTest()->remoteMarkersInFlightForTest(); });
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(inFlight, 0u) << "the leader's answer never came back through the node wiring";
+
+    // MEDIUM-3: the stuck-markers gauge counter is registered in the CnC.
+    bool counter = false;
+    {
+        aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(C.driverForTest()->dir().c_str());
+        aeron::concurrent::CountersReader counters = reader.countersReader();
+        counters.forEach([&](std::int32_t, std::int32_t typeId, const aeron::concurrent::AtomicBuffer&,
+                             const std::string&) { counter = counter || typeId == kStuckMarkersCounterTypeId; });
+    }
+    EXPECT_TRUE(counter) << "the stuck-markers counter is not in the CnC";
+    for (auto& n : nodes) n->stop();
 }
