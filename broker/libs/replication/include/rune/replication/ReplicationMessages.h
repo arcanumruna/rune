@@ -623,7 +623,7 @@ struct InternalIsrAckMsg {
 // PlaneHello) — cold control traffic, little-endian, no allocation; the
 // marker bytes are a zero-copy view into the frame on decode.
 //
-// WriteTxnMarker (template 11), fixed block 40 bytes + marker bytes:
+// WriteTxnMarker (template 11), fixed block 44 bytes + marker bytes:
 //   coordinatorNodeId : int32 @ +0
 //   coordinatorEpoch  : int32 @ +4
 //   token             : int64 @ +8    coordinator-side marker token (echoed back)
@@ -632,11 +632,15 @@ struct InternalIsrAckMsg {
 //   producerId        : int64 @ +24
 //   commit            : uint8 @ +32   (+33..35 pad)
 //   markerLen         : uint32 @ +36  (<= kMaxMarkerBytes)
-//   marker            : markerLen bytes @ +40 (the encoded control batch)
+//   leaderEpoch       : int32 @ +40   the TARGET partition's leader epoch the
+//                                     coordinator routed it under (re-review
+//                                     MEDIUM-3: the leader refuses an older one;
+//                                     -1 = unknown, not checked)
+//   marker            : markerLen bytes @ +44 (the encoded control batch)
 // ===========================================================================
 struct WriteTxnMarkerMsg {
     static constexpr uint16_t    TEMPLATE_ID     = 11;
-    static constexpr uint16_t    BLOCK_LENGTH    = 40;
+    static constexpr uint16_t    BLOCK_LENGTH    = 44;
     static constexpr std::size_t kFixedSize      = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
     static constexpr std::size_t kMaxMarkerBytes = 128;
     static constexpr std::size_t kMaxSize        = kFixedSize + kMaxMarkerBytes;
@@ -648,6 +652,7 @@ struct WriteTxnMarkerMsg {
     int32_t partition         = 0;
     int64_t producerId        = -1;
     uint8_t commit            = 0;
+    int32_t leaderEpoch       = -1;
     std::span<const uint8_t> marker{};   ///< encode: source; decode: view into the frame
 
     /// Bytes written, or 0 (marker above kMaxMarkerBytes / cap too small).
@@ -665,6 +670,7 @@ struct WriteTxnMarkerMsg {
         detail::write_le<int64_t>(p + 24, producerId);
         p[32] = commit; p[33] = 0; p[34] = 0; p[35] = 0;
         detail::write_le<uint32_t>(p + 36, static_cast<uint32_t>(marker.size()));
+        detail::write_le<int32_t>(p + 40, leaderEpoch);
         if (!marker.empty()) std::memcpy(p + BLOCK_LENGTH, marker.data(), marker.size());
         return total;
     }
@@ -686,6 +692,7 @@ struct WriteTxnMarkerMsg {
         m.partition         = detail::read_le<int32_t>(p + 20);
         m.producerId        = detail::read_le<int64_t>(p + 24);
         m.commit            = p[32];
+        m.leaderEpoch       = detail::read_le<int32_t>(p + 40);
         m.marker            = std::span<const uint8_t>(buf + start, markerLen);
         return true;
     }

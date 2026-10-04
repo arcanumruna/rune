@@ -3550,6 +3550,9 @@ bool ClientGateway::trySendMarker_(int64_t token)
     op.producerId    = m.producerId;
     op.logPtr        = topicRegistry_ ? topicRegistry_->log(m.topicId, m.partition) : nullptr;
     op.recordBatchView = std::span<const uint8_t>(m.bytes);   // copied once into the ring slot
+    // Re-review MEDIUM-3: a remote-origin marker carries the target leader epoch
+    // it was routed under, encoded +1 in roleEpoch (0 = not checked: local markers).
+    op.roleEpoch     = m.targetLeaderEpoch >= 0 ? m.targetLeaderEpoch + 1 : 0;
     // Replica identity is stamped by WorkerPool::tryEnqueueOp from the registry.
     return workerPool_->tryEnqueueOp(m.topicId, m.partition, std::move(op));
 }
@@ -3590,6 +3593,15 @@ void ClientGateway::onControlRecordAppended_(const rune::node::WorkerReturn& ret
         // D9: appended on behalf of a remote coordinator — answer IT, never the
         // local coordinator (the owning worker already applied its RC state).
         answerRemoteOrigin_(m, ret.errorCode, ret.errorCode == 0 ? ret.baseOffset : -1);
+        return;
+    }
+    if (ret.errorCode == rune::transaction::kMarkerCoordinatorFencedError) {
+        // Re-review LOW-4: a deposed coordinator's marker — expected, not a failure.
+        spdlog::warn("ClientGateway: control marker for topic={} partition={} producerId={} FENCED "
+                     "(coordinator epoch {} deposed) — surfaced to the txn coordinator",
+                     m.topicId, m.partition, m.producerId, m.coordinatorEpoch);
+        if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode,
+                                                             m.coordinatorEpoch);
         return;
     }
     if (ret.errorCode != 0) {
@@ -3695,6 +3707,7 @@ bool ClientGateway::sendRemoteMarker_(int64_t token, MarkerInFlight& m)
     w.partition         = m.partition;
     w.producerId        = m.producerId;
     w.commit            = m.commit ? 1 : 0;
+    w.leaderEpoch       = m.remoteLeaderEpoch;   // re-review MEDIUM-3
     w.marker            = std::span<const uint8_t>(m.bytes);
     if (!txnMarkerChannel_.sendMarker(txnMarkerChannel_.ctx, m.remoteNode, w)) return false;
     m.sent = true;
@@ -3786,6 +3799,7 @@ void ClientGateway::onRemoteControlRecordResponse(const rune::replication::Write
                                                              m.coordinatorEpoch);
         return;
     }
+    ++remoteMarkersLanded_;
     if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId, m.coordinatorEpoch);
 }
 
@@ -3800,6 +3814,11 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
     m.coordinatorEpoch = w.coordinatorEpoch;
     m.originNode       = w.coordinatorNodeId;
     m.originToken      = w.token;
+    if (w.marker.size() >= 43u + 8u) {   // the control batch's producerId (LE @43) is authoritative
+        int64_t pid = 0;
+        for (int i = 0; i < 8; ++i) pid |= static_cast<int64_t>(w.marker[43u + i]) << (i * 8);
+        m.producerId = pid;
+    }
     // No such partition here, or nothing to append → NotLeader at once
     // (retriable: the coordinator re-resolves).  Never UnknownTopic /
     // UnknownPartition: those make the coordinator DROP the marker, and a
@@ -3812,14 +3831,38 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
         answerRemoteOrigin_(m, static_cast<int16_t>(pcl::ErrorCode::NotLeader), -1);
         return;
     }
-    // Review MAJOR-1: a re-sent copy of a marker still in flight here (same
-    // origin, token and coordinator epoch) — its answer is still owed: skip it.
-    for (const auto& [t, e] : markersInFlight_)
-        if (e.originNode == w.coordinatorNodeId && e.originToken == w.token && e.coordinatorEpoch == w.coordinatorEpoch)
+    // Re-review NEW MAJOR-1: idempotence for re-sent copies.  Per (topic,
+    // partition, producer) this node remembers the last remote marker it took
+    // (origin, coordinator epoch, token) and its outcome.  From the same
+    // coordinator load (same origin, epoch and token incarnation):
+    //   same token, still pending  → its answer is owed: skip the copy;
+    //   same token, answered       → RE-ANSWER the original outcome, never append
+    //                                 again (a copy trailing the answer would close
+    //                                 the producer's NEXT transaction);
+    //   older token                → a stale copy of a marker this coordinator
+    //                                 already replaced: never appended (answered
+    //                                 NotLeader; the coordinator forgot that token).
+    // Not persisted: after a leader change the marker was applied under the old
+    // leader and a stale copy is refused by its target leader epoch (MEDIUM-3).
+    const RemoteMarkerKey key{w.topicId, w.partition, m.producerId};
+    if (auto it = lastRemoteMarker_.find(key); it != lastRemoteMarker_.end()) {
+        LastRemoteMarker& e = it->second;
+        const bool sameLoad = e.origin == w.coordinatorNodeId && e.coordinatorEpoch == w.coordinatorEpoch &&
+                              (e.token >> 32) == (w.token >> 32);
+        if (sameLoad && w.token == e.token) {
+            if (e.answered) answerRemoteOrigin_(m, e.errorCode, e.offset);
             return;
-    for (const auto& [to, r] : pendingMarkerResponses_)
-        if (to == w.coordinatorNodeId && r.token == w.token && r.coordinatorEpoch == w.coordinatorEpoch)
-            return;   // answered, the answer waits for the ring
+        }
+        if (sameLoad && w.token < e.token) {
+            spdlog::info("ClientGateway: stale copy of remote marker token={} from node {} (topic={} partition={} "
+                         "producerId={}; newer token {} applied) — not appended", w.token, w.coordinatorNodeId,
+                         w.topicId, w.partition, m.producerId, e.token);
+            answerRemoteOrigin_(m, static_cast<int16_t>(pcl::ErrorCode::NotLeader), -1);
+            return;
+        }
+    }
+    lastRemoteMarker_[key] = LastRemoteMarker{w.coordinatorNodeId, w.coordinatorEpoch, w.token, false, 0, -1};
+    m.targetLeaderEpoch = w.leaderEpoch;   // MEDIUM-3: checked by the worker against the replica's epoch
     if (routesToWorker_(w.topicId)) {
         // The SAME owning-worker op-ring path as a local marker: lands after
         // every produce routed before it (L4); a full ring queues it (FIFO).
@@ -3837,6 +3880,14 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
 
 void ClientGateway::answerRemoteOrigin_(const MarkerInFlight& m, int16_t errorCode, int64_t offset)
 {
+    // NEW MAJOR-1: remember the outcome for a later copy of the same token.
+    if (auto it = lastRemoteMarker_.find(RemoteMarkerKey{m.topicId, m.partition, m.producerId});
+        it != lastRemoteMarker_.end() && it->second.origin == m.originNode && it->second.token == m.originToken &&
+        it->second.coordinatorEpoch == m.coordinatorEpoch) {
+        it->second.answered  = true;
+        it->second.errorCode = errorCode;
+        it->second.offset    = offset;
+    }
     rune::replication::WriteTxnMarkerResponseMsg r{};
     r.token            = m.originToken;
     r.topicId          = m.topicId;
@@ -3863,12 +3914,14 @@ void ClientGateway::sendMarkerResponse_(int32_t toNode, const rune::replication:
 int ClientGateway::pumpTxnMarkers_()
 {
     int work = 0;
-    if (!markerSendQueue_.empty()) work += pumpMarkerQueue_();   // worker-bound and D9 remote markers
-    if (!pendingMarkerResponses_.empty()) [[unlikely]] work += pumpMarkerResponses_();
+    // Re-review LOW-3: the leader-change check FIRST — a queued remote marker
+    // whose leader just moved is failed, never sent once to the old leader.
     if (routingChangedForMarkers_) [[unlikely]] {
         routingChangedForMarkers_ = false;
         if (!markersInFlight_.empty()) failRemoteMarkersOnLeaderChange_();
     }
+    if (!markerSendQueue_.empty()) work += pumpMarkerQueue_();   // worker-bound and D9 remote markers
+    if (!pendingMarkerResponses_.empty()) [[unlikely]] work += pumpMarkerResponses_();
     if (resendAllRemoteMarkers_ || !reconnectedPeers_.empty()) [[unlikely]] work += resendRemoteMarkers_();
     if (!markerSendQueue_.empty()) work += pumpMarkerQueue_();   // re-sends the ring refused
     return work;

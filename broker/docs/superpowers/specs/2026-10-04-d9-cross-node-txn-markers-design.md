@@ -47,6 +47,39 @@ Wire messages (replication schema, next free template ids; SBE-style like AlterI
 - `WriteTxnMarkerResponseMsg { token:i64, topicId:i32, partition:i32, producerId:i64, coordinatorEpoch:i32,
   errorCode:i16, offset:i64 }`.
 
+### §2 addendum (fix rounds 1–2, 2026-10-04)
+
+- **Target leader epoch.** `WriteTxnMarkerMsg` also carries `leaderEpoch:i32` at block offset +40: the leader
+  epoch of the TARGET partition in the routing image the coordinator routed the marker under.  The marker bytes
+  move to +44.  The leader's owning worker refuses the marker with NotLeader (retriable, so the TCS re-routes) when
+  that epoch is older than the replica's current leader epoch.  This closes the case where a copy is held across
+  two leadership changes and then delivered to a node that leads again, which the coordinator-epoch fence cannot
+  catch because the copy carries the same coordinator epoch.  Local markers are dispatched as soon as they are
+  routed and are not checked.
+- **Leader-side idempotence.**
+  - Per (topic, partition, producer), the leader remembers the last remote marker it took and its outcome:
+    (origin node, coordinator epoch, token).
+  - From the same coordinator load (same origin, epoch and token incarnation):
+    - a copy of the same token is re-answered with the original outcome and is not appended again (or is
+      skipped while its answer is still owed);
+    - a copy of an older token is never appended.
+  - This index is kept in memory only. After a leader change, a stale copy is refused by the target leader epoch
+    above.
+- **Completion is event-driven only.**
+  - A remote marker completes on its answer or on a leadership change. No timer completes it.
+  - A copy is re-sent with the same token when the plane reports that the link to its leader came back. The plane
+    reports this in three ways:
+    - the leader's publication goes not-connected → connected; this is edge-detected for every peer on every poll;
+    - the hold router's connection generation is bumped;
+    - a new inbound image appears from that peer's host.
+  - Several peers on one host are all reported; an unknown host reports every peer.
+- **Markers wait for the high watermark.** A marker counts as landed only once the partition HW passes it with the
+  ISR ≥ minIsr (Kafka WriteTxnMarkers, acks=-1). The answer waits with no deadline; a role change gives NotLeader.
+- **Rolling upgrade.** A node running a build without D9 silently drops template ids 11 and 12. A transaction that
+  needs a marker on such a leader waits until that node is upgraded and restarted. Its new image fires the
+  re-send.
+- **Template ids 11 and 12** are reserved, as a comment, in rune-protocol `schema/rune-replication.xml`.
+
 ## 3. Invariants
 
 - Idempotence: a duplicate marker is harmless — `RcState::onMarker` → `LsoTracker::onControlMarker` is a no-op when

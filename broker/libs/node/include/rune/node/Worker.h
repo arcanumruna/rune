@@ -3209,6 +3209,17 @@ private:
             enqueueReturn_(ret);
             return;
         }
+        // D9 re-review MEDIUM-3: a remote-origin marker routed under an OLDER
+        // leader epoch of this partition (a copy held across leadership changes)
+        // is refused NotLeader — retriable: the coordinator re-routes.  roleEpoch
+        // carries target+1 (0 = not checked: local markers).
+        if (op.roleEpoch() > 0 && op.roleEpoch() - 1 < static_cast<int64_t>(replica->epoch())) [[unlikely]] {
+            spdlog::info("Worker {}: control marker topicId={} partition={} routed under leader epoch {} < {} — "
+                         "refused NotLeader", workerId_, topicId, partition, op.roleEpoch() - 1, replica->epoch());
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return;
+        }
         // D9 review MAJOR-3: the answer parks on the HW (below) — reserve its
         // owed return slot BEFORE the append (G-A6, as a parked produce); no slot
         // → retriable NotLeader, log untouched.

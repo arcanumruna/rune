@@ -725,6 +725,8 @@ public:
     [[nodiscard]] int64_t lastMarkerTokenForTest() const noexcept { return nextMarkerToken_ - 1; }
     /// Test-only: doWork's marker step at `nowNs` (test gateways have no Aeron to poll).
     int pumpTxnMarkersForTest(int64_t nowNs) { nowNs_ = nowNs; return pumpTxnMarkers_(); }
+    /// Test-only: remote markers that came back LANDED (re-review LOW-1).
+    [[nodiscard]] uint64_t remoteMarkersLandedForTest() const noexcept { return remoteMarkersLanded_; }
     [[nodiscard]] std::size_t remoteMarkersInFlightForTest() const noexcept {
         std::size_t n = 0;
         for (const auto& [t, m] : markersInFlight_) n += m.remoteNode >= 0 ? 1u : 0u;
@@ -1646,6 +1648,9 @@ private:
         // D9 leader side: appended on behalf of this coordinator node (-1 = own).
         int32_t              originNode  = -1;
         int64_t              originToken = 0;
+        /// re-review MEDIUM-3: leader side, the target leader epoch the origin
+        /// routed it under (-1 = not checked).
+        int32_t              targetLeaderEpoch = -1;
         std::vector<uint8_t> bytes;
     };
     static constexpr uint32_t kMaxMarkerReroutes = 4;
@@ -1667,6 +1672,26 @@ private:
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};
     std::deque<std::pair<int32_t, rune::replication::WriteTxnMarkerResponseMsg>> pendingMarkerResponses_;
+    uint64_t remoteMarkersLanded_ = 0;           ///< D9: cold counter (tests / logs)
+    // Re-review NEW MAJOR-1: leader side, the last remote marker taken per
+    // (topic, partition, producer) and its outcome (cold; see appendRemoteControlRecord).
+    struct RemoteMarkerKey {
+        int32_t topicId = 0; int32_t partition = 0; int64_t producerId = -1;
+        bool operator==(const RemoteMarkerKey& o) const noexcept {
+            return topicId == o.topicId && partition == o.partition && producerId == o.producerId;
+        }
+    };
+    struct RemoteMarkerKeyHash {
+        std::size_t operator()(const RemoteMarkerKey& k) const noexcept {
+            return std::hash<int64_t>{}(k.producerId) ^ (static_cast<std::size_t>(static_cast<uint32_t>(k.topicId)) << 20) ^
+                   static_cast<std::size_t>(static_cast<uint32_t>(k.partition));
+        }
+    };
+    struct LastRemoteMarker {
+        int32_t origin = -1; int32_t coordinatorEpoch = -1; int64_t token = 0;
+        bool answered = false; int16_t errorCode = 0; int64_t offset = -1;
+    };
+    std::unordered_map<RemoteMarkerKey, LastRemoteMarker, RemoteMarkerKeyHash> lastRemoteMarker_;
     bool routingChangedForMarkers_ = false;      ///< D9: leader-change check due (LOW-7)
     bool resendAllRemoteMarkers_   = false;      ///< D9 MAJOR-1: re-send every remote marker
     std::vector<int32_t> reconnectedPeers_;      ///< D9 MAJOR-1: re-send markers to these peers

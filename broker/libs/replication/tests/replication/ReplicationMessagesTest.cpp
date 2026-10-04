@@ -750,7 +750,7 @@ TEST(D9TxnMarkerWireRegression, WriteTxnMarkerRoundTripAtMaxMarkerLength) {
     for (std::size_t i = 0; i < marker.size(); ++i) marker[i] = static_cast<uint8_t>(0xA0 + i);
     WriteTxnMarkerMsg m{};
     m.coordinatorNodeId = 2; m.coordinatorEpoch = 7; m.token = 0x0102030405060708LL;
-    m.topicId = 5; m.partition = 3; m.producerId = 4242; m.commit = 1;
+    m.topicId = 5; m.partition = 3; m.producerId = 4242; m.commit = 1; m.leaderEpoch = 17;
     m.marker = std::span<const uint8_t>(marker);
     std::array<uint8_t, WriteTxnMarkerMsg::kMaxSize> buf{};
     const std::size_t n = m.encode(buf.data(), buf.size());
@@ -762,6 +762,7 @@ TEST(D9TxnMarkerWireRegression, WriteTxnMarkerRoundTripAtMaxMarkerLength) {
     EXPECT_EQ(d.coordinatorNodeId, 2); EXPECT_EQ(d.coordinatorEpoch, 7);
     EXPECT_EQ(d.token, 0x0102030405060708LL); EXPECT_EQ(d.topicId, 5); EXPECT_EQ(d.partition, 3);
     EXPECT_EQ(d.producerId, 4242); EXPECT_EQ(d.commit, 1);
+    EXPECT_EQ(d.leaderEpoch, 17) << "re-review MEDIUM-3: the target leader epoch travels";
     ASSERT_EQ(d.marker.size(), marker.size());
     EXPECT_EQ(std::memcmp(d.marker.data(), marker.data(), marker.size()), 0);
     EXPECT_EQ(d.marker.data(), buf.data() + WriteTxnMarkerMsg::kFixedSize) << "zero-copy view";
@@ -784,9 +785,9 @@ TEST(D9TxnMarkerWireRegression, WriteTxnMarkerRejectsOversizeTruncatedAndForeign
     EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), WriteTxnMarkerMsg::kFixedSize - 1, d)) << "truncated block";
     EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), 4, d)) << "truncated header";
     // A forged length above the max is refused even when the bytes are there.
-    detail::write_le<uint32_t>(buf.data() + WriteTxnMarkerMsg::kFixedSize - 4, WriteTxnMarkerMsg::kMaxMarkerBytes + 1);
+    detail::write_le<uint32_t>(buf.data() + ReplicationMessageHeader::ENCODED_SIZE + 36, WriteTxnMarkerMsg::kMaxMarkerBytes + 1);
     EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), buf.size(), d)) << "forged marker length";
-    detail::write_le<uint32_t>(buf.data() + WriteTxnMarkerMsg::kFixedSize - 4, static_cast<uint32_t>(marker.size()));
+    detail::write_le<uint32_t>(buf.data() + ReplicationMessageHeader::ENCODED_SIZE + 36, static_cast<uint32_t>(marker.size()));
     ASSERT_TRUE(WriteTxnMarkerMsg::decode(buf.data(), n, d));
     stampTemplateId(buf.data(), 0, WriteTxnMarkerResponseMsg::TEMPLATE_ID);
     EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), n, d)) << "another template id";
