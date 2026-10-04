@@ -644,6 +644,28 @@ Result:
 - VM benchmark time ~28 min (3 probes, the 10-run A/B + 2 refused mw runs, 2 follow-up runs).  Raw summaries were
   copied off the box; /root/a9 deleted.
 
+#### 4.15.1 A9 review fix round: the SHIPPED default interleaved against A (2026-10-04, k3s-node-01)
+
+Binaries: A = a3b89e1 (as §4.15); B = perf/a9-doorbell 88dadb4 (review fixes: doorbells wired only when the runner parks
+on them, runtime space doorbell on the op / session rings, default shape = doorbell + Aeron 10 / 20 + 1 ms park, no
+env overrides).  Same client 7e98e33, same config and harness as §4.15; order r20k A,B,B,A then idle A,B.  Proof of
+path (B): `park-until-work{wakeFds=4 doorbell=5rings spins=10 yields=20 parkNs=1000000-1000000}`.  All errors=0.
+
+| run | arm | worker CPU % (3 nodes) | client % | sys idle | p50 / p99 / p999 us |
+|---|---|---|---|---|---|
+| 20k r1 | A | 77.7 / 75.4 / 74.8 | 57.0 | 5% | 481 / 26,608 / 100,663 |
+| | B | 85.2 / 82.5 / 78.9 | 72.8 | 3% | 444 / 9,634 / 25,428 |
+| 20k r2 | B | 89.7 / 87.7 / 84.7 | 77.2 | 2% | 418 / 9,437 / 50,594 |
+| | A | 84.6 / 81.5 / 79.7 | 68.2 | 2% | 451 / 15,335 / 60,031 |
+| idle | A | 35.0 / 34.2 / 33.0 | – | 67% | – |
+| | B | 17.2 / 16.7 / 15.7 | – | 81% | – |
+
+Result: **idle worker CPU 34.1% -> 16.5%** (parks 3.2k/s -> 0.75k/s per worker).  **20k: p50 466 -> 431 us and p99
+21.0 -> 9.5 ms (means; B below A in both rounds for both)**; worker CPU 79.0% -> 84.8% mean (B's lower round 82.2%
+equals A's higher round 81.9%; A r1 ran with its client at 57% — the rounds' own spread is ~6 pts, so no CPU claim
+either way; the doorbell shape does not cut 20k CPU, as §4.15 found).  The §4.15 B-hyb single run (p50 356 us,
+p99 9.5 ms) is confirmed in direction.  Stopped after 2 rounds per arm (they agree).  VM time ~10 min.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
