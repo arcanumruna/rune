@@ -465,7 +465,8 @@ int ClientGateway::doWork(int64_t nowNs) {
     // Task 10 round 4: retry worker-bound ops a full ring refused earlier
     // (control markers, subscription lifecycle) BEFORE new ingress, in order.
     int work = 0;
-    if (workerPool_) work += pumpMarkerQueue_() + pumpSubOps_();
+    if (workerPool_) work += pumpSubOps_();
+    work += pumpTxnMarkers_();
     if (shardMode_) {
         // D8c: ... or a Produce frame of a session with no produce credit left
         // (sessionProduceCredits_ forwarded, not yet claimed by a worker): the
@@ -3536,6 +3537,7 @@ bool ClientGateway::trySendMarker_(int64_t token)
 {
     auto it = markersInFlight_.find(token);
     if (it == markersInFlight_.end()) return true;   // already resolved
+    if (it->second.remoteNode >= 0) return sendRemoteMarker_(token, it->second);   // D9
     if (!workerPool_) return false;
     const MarkerInFlight& m = it->second;
     rune::node::WorkerOp op;
@@ -3581,6 +3583,12 @@ void ClientGateway::onControlRecordAppended_(const rune::node::WorkerReturn& ret
     }
     const MarkerInFlight m = std::move(it->second);
     markersInFlight_.erase(it);
+    if (m.originNode >= 0) {
+        // D9: appended on behalf of a remote coordinator — answer IT, never the
+        // local coordinator (the owning worker already applied its RC state).
+        answerRemoteOrigin_(m, ret.errorCode, ret.errorCode == 0 ? ret.baseOffset : -1);
+        return;
+    }
     if (ret.errorCode != 0) {
         spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} FAILED "
                       "to append (error={}) — surfaced to the txn coordinator",
@@ -3637,12 +3645,212 @@ void ClientGateway::onControlRecordRefused_(const rune::node::WorkerReturn& ret)
             markerSendQueue_.push_front(ret.correlationId);   // ahead of later markers
         return;
     }
+    if (m.originNode >= 0) {
+        // D9: a remote coordinator's marker for a partition no longer here.
+        answerRemoteOrigin_(m, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), -1);
+        markersInFlight_.erase(it);
+        return;
+    }
     spdlog::error("ClientGateway: control marker for topic={} partition={} producerId={} REFUSED "
                   "(partition not on this node) — surfaced to the txn coordinator as NotLeader",
                   m.topicId, m.partition, m.producerId);
     if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, ret.errorCode,
                                                          m.coordinatorEpoch);
     markersInFlight_.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// D9 — cross-node transaction markers (design 2026-10-04-d9).  Runtime thread,
+// cold path (allocation is fine; the produce path is untouched).
+// ---------------------------------------------------------------------------
+int32_t ClientGateway::remoteMarkerLeader_(int32_t topicId, int32_t partition, int32_t& leaderEpoch) const noexcept
+{
+    if (txnMarkerChannel_.sendMarker == nullptr || !routingImage_ || topicId < 0) return -1;
+    const auto& e = routingImage_->lookup(rune::metadata::gpidOf(topicId, partition));
+    if (e.leaderNodeId == rune::metadata::RoutingImage::NO_LEADER_NODE_ID || e.leaderNodeId == thisNodeId_)
+        return -1;   // unassigned (local path answers NotLeader → retried) or led here
+    leaderEpoch = e.leaderEpoch;
+    return e.leaderNodeId;
+}
+
+bool ClientGateway::sendRemoteMarker_(int64_t token, MarkerInFlight& m)
+{
+    rune::replication::WriteTxnMarkerMsg w{};
+    w.coordinatorNodeId = thisNodeId_;
+    w.coordinatorEpoch  = m.coordinatorEpoch;
+    w.token             = token;
+    w.topicId           = m.topicId;
+    w.partition         = m.partition;
+    w.producerId        = m.producerId;
+    w.commit            = m.commit ? 1 : 0;
+    w.marker            = std::span<const uint8_t>(m.bytes);
+    if (!txnMarkerChannel_.sendMarker(txnMarkerChannel_.ctx, m.remoteNode, w)) return false;
+    m.sentNs = nowNs_ > 0 ? nowNs_ : 1;
+    return true;
+}
+
+void ClientGateway::refuseMarker_(int64_t token, int16_t errorCode)
+{
+    auto it = markersInFlight_.find(token);
+    if (it == markersInFlight_.end()) return;
+    const MarkerInFlight m = std::move(it->second);
+    markersInFlight_.erase(it);
+    for (auto q = markerSendQueue_.begin(); q != markerSendQueue_.end(); ++q) {
+        if (*q == token) { markerSendQueue_.erase(q); break; }
+    }
+    if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, errorCode,
+                                                         m.coordinatorEpoch);
+}
+
+void ClientGateway::failRemoteMarkersOnLeaderChange_()
+{
+    std::vector<int64_t> moved;   // cold: only with markers in flight on an image change
+    for (const auto& [token, m] : markersInFlight_) {
+        if (m.remoteNode < 0) continue;
+        int32_t epoch = -1;
+        int32_t leader = -1;
+        if (routingImage_) {
+            const auto& e = routingImage_->lookup(rune::metadata::gpidOf(m.topicId, m.partition));
+            leader = e.leaderNodeId;
+            epoch  = e.leaderEpoch;
+        }
+        if (leader != m.remoteNode || epoch != m.remoteLeaderEpoch) moved.push_back(token);
+    }
+    for (const int64_t token : moved) {
+        if (auto it = markersInFlight_.find(token); it != markersInFlight_.end())
+            spdlog::info("ClientGateway: leadership of topic={} partition={} moved off node {} — in-flight "
+                         "remote marker (producerId={}) completes NotLeader (re-routed by the coordinator)",
+                         it->second.topicId, it->second.partition, it->second.remoteNode, it->second.producerId);
+        refuseMarker_(token, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader));
+    }
+}
+
+int ClientGateway::sweepUnansweredRemoteMarkers_()
+{
+    if (markersInFlight_.empty() || nowNs_ < nextRemoteMarkerSweepNs_) return 0;
+    nextRemoteMarkerSweepNs_ = nowNs_ + kRemoteMarkerUnansweredNs / 10;
+    std::vector<int64_t> lost;
+    for (const auto& [token, m] : markersInFlight_) {
+        if (m.remoteNode >= 0 && m.sentNs > 0 && nowNs_ - m.sentNs >= kRemoteMarkerUnansweredNs)
+            lost.push_back(token);
+    }
+    for (const int64_t token : lost) {
+        if (auto it = markersInFlight_.find(token); it != markersInFlight_.end())
+            spdlog::warn("ClientGateway: remote marker topic={} partition={} producerId={} unanswered by node {} "
+                         "for {} ms — completed as retriable (the coordinator re-sends it; idempotent)",
+                         it->second.topicId, it->second.partition, it->second.producerId, it->second.remoteNode,
+                         kRemoteMarkerUnansweredNs / 1'000'000);
+        refuseMarker_(token, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader));
+    }
+    return static_cast<int>(lost.size());
+}
+
+void ClientGateway::onRemoteControlRecordResponse(const rune::replication::WriteTxnMarkerResponseMsg& r)
+{
+    auto it = markersInFlight_.find(r.token);
+    if (it == markersInFlight_.end() || it->second.remoteNode < 0 || it->second.topicId != r.topicId ||
+        it->second.partition != r.partition || it->second.producerId != r.producerId) {
+        // Already completed (leader change / unanswered sweep) or not ours: the
+        // coordinator re-sent it; a duplicate landing is harmless (§3).
+        spdlog::debug("ClientGateway: WriteTxnMarkerResponse for unknown marker token={} topic={} partition={}",
+                      r.token, r.topicId, r.partition);
+        return;
+    }
+    const MarkerInFlight m = std::move(it->second);
+    markersInFlight_.erase(it);
+    if (r.errorCode != 0) {
+        spdlog::warn("ClientGateway: remote marker topic={} partition={} producerId={} refused by node {} "
+                     "(error={}) — surfaced to the txn coordinator", m.topicId, m.partition, m.producerId,
+                     m.remoteNode, r.errorCode);
+        if (txnService_) txnService_->onControlMarkerRefused(m.topicId, m.partition, m.producerId, r.errorCode,
+                                                             m.coordinatorEpoch);
+        return;
+    }
+    if (txnService_) txnService_->onControlMarkerLanded(m.topicId, m.partition, m.producerId, m.coordinatorEpoch);
+}
+
+void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnMarkerMsg& w)
+{
+    namespace pcl = rune::protocol::client;
+    MarkerInFlight m;
+    m.topicId          = w.topicId;
+    m.partition        = w.partition;
+    m.producerId       = w.producerId;
+    m.commit           = w.commit != 0;
+    m.coordinatorEpoch = w.coordinatorEpoch;
+    m.originNode       = w.coordinatorNodeId;
+    m.originToken      = w.token;
+    // Not the leader here (stale routing at the coordinator), or nothing to
+    // append → NotLeader at once (retriable: the coordinator re-resolves).
+    // Never UnknownTopic/UnknownPartition: those make the coordinator DROP the
+    // marker, and a lagging topic registry here is no proof the partition is gone.
+    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(w.topicId, w.partition) : nullptr;
+    bool leaderHere = log != nullptr && w.topicId >= 0 && !w.marker.empty();
+    if (leaderHere && routingImage_)
+        leaderHere = routingImage_->lookup(rune::metadata::gpidOf(w.topicId, w.partition)).leaderNodeId == thisNodeId_;
+    if (!leaderHere) {
+        answerRemoteOrigin_(m, static_cast<int16_t>(pcl::ErrorCode::NotLeader), -1);
+        return;
+    }
+    if (routesToWorker_(w.topicId)) {
+        // The SAME owning-worker op-ring path as a local marker: lands after
+        // every produce routed before it (L4); a full ring queues it (FIFO).
+        const int64_t token = nextMarkerToken_++;
+        m.bytes.assign(w.marker.begin(), w.marker.end());
+        markersInFlight_.emplace(token, std::move(m));
+        if (!markerSendQueue_.empty() || !trySendMarker_(token)) markerSendQueue_.push_back(token);
+        return;
+    }
+    // No worker pool (unit rigs / single-thread): the inline append.
+    const int64_t base = appendControlRecordInline_(w.topicId, w.partition, w.marker, log);
+    if (base >= 0) notifyControlMarker(w.topicId, w.partition, w.producerId, base, w.commit != 0);
+    answerRemoteOrigin_(m, base >= 0 ? int16_t{0} : static_cast<int16_t>(pcl::ErrorCode::NotLeader), base);
+}
+
+void ClientGateway::answerRemoteOrigin_(const MarkerInFlight& m, int16_t errorCode, int64_t offset)
+{
+    rune::replication::WriteTxnMarkerResponseMsg r{};
+    r.token            = m.originToken;
+    r.topicId          = m.topicId;
+    r.partition        = m.partition;
+    r.producerId       = m.producerId;
+    r.coordinatorEpoch = m.coordinatorEpoch;
+    r.errorCode        = errorCode;
+    r.offset           = offset;
+    sendMarkerResponse_(m.originNode, r);
+}
+
+void ClientGateway::sendMarkerResponse_(int32_t toNode, const rune::replication::WriteTxnMarkerResponseMsg& r)
+{
+    if (txnMarkerChannel_.sendResponse == nullptr) {
+        spdlog::warn("ClientGateway: no cluster-plane channel — WriteTxnMarkerResponse to node {} dropped "
+                     "(the coordinator re-sends)", toNode);
+        return;
+    }
+    // FIFO behind earlier back-pressured answers; never dropped.
+    if (!pendingMarkerResponses_.empty() || !txnMarkerChannel_.sendResponse(txnMarkerChannel_.ctx, toNode, r))
+        pendingMarkerResponses_.emplace_back(toNode, r);
+}
+
+int ClientGateway::pumpTxnMarkers_()
+{
+    int work = 0;
+    if (!markerSendQueue_.empty()) work += pumpMarkerQueue_();   // worker-bound and D9 remote markers
+    if (!pendingMarkerResponses_.empty()) [[unlikely]] work += pumpMarkerResponses_();
+    if (!markersInFlight_.empty()) [[unlikely]] work += sweepUnansweredRemoteMarkers_();
+    return work;
+}
+
+int ClientGateway::pumpMarkerResponses_()
+{
+    int sent = 0;
+    while (!pendingMarkerResponses_.empty()) {
+        const auto& [to, r] = pendingMarkerResponses_.front();
+        if (!txnMarkerChannel_.sendResponse(txnMarkerChannel_.ctx, to, r)) break;
+        pendingMarkerResponses_.pop_front();
+        ++sent;
+    }
+    return sent;
 }
 
 void ClientGateway::raiseStorageFailure_(const std::string& logDir, int err)
@@ -4691,7 +4899,10 @@ std::size_t ClientGateway::purgeQueuedMarkers(int32_t olderThan)
     std::size_t purged = 0;
     for (auto q = markerSendQueue_.begin(); q != markerSendQueue_.end();) {
         auto it = markersInFlight_.find(*q);
-        if (it != markersInFlight_.end() && it->second.coordinatorEpoch < olderThan) {
+        // D9: a marker appended on behalf of ANOTHER coordinator (originNode)
+        // is not this coordinator's to purge (different epoch space).
+        if (it != markersInFlight_.end() && it->second.originNode < 0 &&
+            it->second.coordinatorEpoch < olderThan) {
             markersInFlight_.erase(it);
             q = markerSendQueue_.erase(q);
             ++purged;
@@ -4721,13 +4932,37 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         return -1;
     }
 
-    int64_t base = -1;
-
-    // Find the replica (if replication is wired in).
-    rune::replication::PartitionReplica* replica = nullptr;
-    if (replicaRegistry_) {
-        replica = replicaRegistry_->lookup(topicId, partition);
+    if (producerId < 0 && marker.size() >= 43u + 8u) {   // the control batch's producerId (LE @43)
+        producerId = 0;
+        for (int i = 0; i < 8; ++i) producerId |= static_cast<int64_t>(marker[43u + i]) << (i * 8);
     }
+
+    // D9: a partition led by ANOTHER node — forward the marker to its leader
+    // over the cluster plane (Kafka WriteTxnMarkers); the answer completes it.
+    if (int32_t leaderEpoch = -1; marker.size() <= rune::replication::WriteTxnMarkerMsg::kMaxMarkerBytes) {
+        if (const int32_t leader = remoteMarkerLeader_(topicId, partition, leaderEpoch); leader >= 0) {
+            if (marker.empty()) return -1;
+            const int64_t token = nextMarkerToken_++;
+            MarkerInFlight m;
+            m.topicId           = topicId;
+            m.partition         = partition;
+            m.producerId        = producerId;
+            m.commit            = commit;
+            m.coordinatorEpoch  = coordinatorEpoch;
+            m.remoteNode        = leader;
+            m.remoteLeaderEpoch = leaderEpoch;
+            m.bytes.assign(marker.begin(), marker.end());
+            markersInFlight_.emplace(token, std::move(m));
+            if (!markerSendQueue_.empty() || !trySendMarker_(token)) {
+                markerSendQueue_.push_back(token);   // FIFO; outbound ring full → sent by a later doWork
+                spdlog::warn("ClientGateway::appendControlRecord: cluster-plane back-pressure for topicId={} "
+                             "partition={} (leader node {}) — marker queued ({} waiting)",
+                             topicId, partition, leader, markerSendQueue_.size());
+            }
+            return kControlRecordAsync;
+        }
+    }
+
 
     // Task #13 / F15 K3: the marker is appended by the OWNING worker under
     // EXACTLY the produce-routing predicate (routesToWorker_), in every mode —
@@ -4750,10 +4985,6 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
     // for gateway-owned internal partitions in shard mode (never markers).
     if (routesToWorker_(topicId)) {
         if (marker.empty()) return -1;
-        if (producerId < 0 && marker.size() >= 43u + 8u) {
-            producerId = 0;
-            for (int i = 0; i < 8; ++i) producerId |= static_cast<int64_t>(marker[43u + i]) << (i * 8);
-        }
         const int64_t token = nextMarkerToken_++;
         MarkerInFlight m;
         m.topicId    = topicId;
@@ -4771,6 +5002,15 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         }
         return kControlRecordAsync;
     }
+    return appendControlRecordInline_(topicId, partition, marker, log);
+}
+
+int64_t ClientGateway::appendControlRecordInline_(int32_t topicId, int32_t partition,
+                                                  std::span<const uint8_t> marker, rune::storage::Log* log)
+{
+    int64_t base = -1;
+    rune::replication::PartitionReplica* replica =
+        replicaRegistry_ ? replicaRegistry_->lookup(topicId, partition) : nullptr;
 
     if (replica) {
         // Durable path (F15 N2): the marker lands AS a control batch, restamped

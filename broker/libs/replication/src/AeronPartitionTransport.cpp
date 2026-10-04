@@ -371,6 +371,24 @@ bool AeronPartitionTransport::sendAlterIsrResponse(NodeId toLeader, const AlterI
     return enqueueOutbound(static_cast<int32_t>(toLeader), wire, len);
 }
 
+bool AeronPartitionTransport::sendWriteTxnMarker(NodeId to, const WriteTxnMarkerMsg& msg)
+{
+    uint8_t wire[WriteTxnMarkerMsg::kMaxSize];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0) return false;
+    if (to == static_cast<NodeId>(selfId_)) { (void)handleFrame_(wire, len); return true; }
+    return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
+bool AeronPartitionTransport::sendWriteTxnMarkerResponse(NodeId to, const WriteTxnMarkerResponseMsg& msg)
+{
+    uint8_t wire[WriteTxnMarkerResponseMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0) return false;
+    if (to == static_cast<NodeId>(selfId_)) { (void)handleFrame_(wire, len); return true; }
+    return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
                                               std::size_t    len)
@@ -572,6 +590,20 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         if (AlterIsrMsg::decode(buf, len, m) && alterIsrHandler_ != nullptr &&
             alterIsrHandler_(alterIsrCtx_, m, resp))
             (void)sendAlterIsrResponse(m.leaderId, resp);   // a refused answer: the leader re-sends
+        return Action::CONTINUE;
+    }
+    if (tid == WriteTxnMarkerMsg::TEMPLATE_ID) [[unlikely]] {
+        // D9: a txn coordinator's marker for a partition this node leads.
+        WriteTxnMarkerMsg m{};
+        if (WriteTxnMarkerMsg::decode(buf, len, m) && txnMarkerHandler_ != nullptr)
+            txnMarkerHandler_(txnMarkerCtx_, m);
+        return Action::CONTINUE;
+    }
+    if (tid == WriteTxnMarkerResponseMsg::TEMPLATE_ID) [[unlikely]] {
+        // D9: the partition leader's answer to a marker this node coordinates.
+        WriteTxnMarkerResponseMsg r{};
+        if (WriteTxnMarkerResponseMsg::decode(buf, len, r) && txnMarkerRespHandler_ != nullptr)
+            txnMarkerRespHandler_(txnMarkerCtx_, r);
         return Action::CONTINUE;
     }
     if (tid == InternalIsrMsg::TEMPLATE_ID || tid == InternalIsrAckMsg::TEMPLATE_ID) [[unlikely]] {

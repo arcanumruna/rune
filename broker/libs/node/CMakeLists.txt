@@ -846,6 +846,12 @@ if(BUILD_TESTING)
             target_link_libraries(rune_f15_eos_regression_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_f15_eos_regression_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # D9 (cross-node transaction markers): gateway unit + 3-node
+            # in-process integration over the real cluster-plane transport.
+            add_executable(rune_d9_cross_node_marker_tests tests/integration/D9CrossNodeMarkerTest.cpp)
+            target_link_libraries(rune_d9_cross_node_marker_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_d9_cross_node_marker_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # RoleCounter publish→read integration test: BrokerNode publishes the
             # Aeron node-role/term counters; CncFileReader reads them back (the
             # rune_role path).  Embeds the media driver → gated with the others.

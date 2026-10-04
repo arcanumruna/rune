@@ -292,6 +292,33 @@ public:
         alterIsrHandler_ = fn; alterIsrCtx_ = ctx;
     }
 
+    // -----------------------------------------------------------------------
+    // D9: cross-node transaction markers (cold control traffic).
+    //
+    // Sends: any thread (MPSC outbound ring); false = ring full (the caller
+    // keeps the marker / response and retries — never dropped).  A send to
+    // this node itself is delivered locally (never happens in practice: a
+    // locally led partition takes the local marker path).
+    // Handlers: called on the CONTROL thread (poll) for every decoded frame —
+    // function pointer + ctx (no virtual / std::function), set by BrokerNode to
+    // the gateway.  Unset = the frame is dropped (the coordinator re-sends).
+    // -----------------------------------------------------------------------
+    bool sendWriteTxnMarker(NodeId to, const WriteTxnMarkerMsg& msg);
+    bool sendWriteTxnMarkerResponse(NodeId to, const WriteTxnMarkerResponseMsg& msg);
+    using WriteTxnMarkerHandler         = void (*)(void* ctx, const WriteTxnMarkerMsg& msg);
+    using WriteTxnMarkerResponseHandler = void (*)(void* ctx, const WriteTxnMarkerResponseMsg& msg);
+    void setTxnMarkerHandlers(WriteTxnMarkerHandler onMarker, WriteTxnMarkerResponseHandler onResponse,
+                              void* ctx) noexcept {
+        txnMarkerHandler_ = onMarker; txnMarkerRespHandler_ = onResponse; txnMarkerCtx_ = ctx;
+    }
+    /// Thunks matching the gateway's TxnMarkerChannel send signatures (ctx = this).
+    static bool sendWriteTxnMarkerThunk(void* self, int32_t to, const WriteTxnMarkerMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendWriteTxnMarker(static_cast<NodeId>(to), msg);
+    }
+    static bool sendWriteTxnMarkerResponseThunk(void* self, int32_t to, const WriteTxnMarkerResponseMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendWriteTxnMarkerResponse(static_cast<NodeId>(to), msg);
+    }
+
     /// F3's int32 view of the ONE live ceiling, maxFetchRecordsBytes() (F18):
     /// min(outbound ring bound, publication bound) — worker-safe (both fixed
     /// before any worker runs).  poll()'s FetchRequest/reconcile clamps start
@@ -488,6 +515,9 @@ private:
     int32_t                                controllerId_    = -1;       ///< control thread
     AlterIsrHandler                        alterIsrHandler_ = nullptr;  ///< control thread
     void*                                  alterIsrCtx_     = nullptr;
+    WriteTxnMarkerHandler                  txnMarkerHandler_     = nullptr;  ///< control thread (D9)
+    WriteTxnMarkerResponseHandler          txnMarkerRespHandler_ = nullptr;
+    void*                                  txnMarkerCtx_         = nullptr;
     int64_t                                nowNs_ = 0; ///< updated at top of poll()
 
     // Per-peer egress publications (keyed by NodeId).
