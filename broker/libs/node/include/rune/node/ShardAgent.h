@@ -25,12 +25,14 @@
 #include <sys/prctl.h>
 #endif
 
+#include <rune/node/ParkUntilWorkIdle.h>
+
 namespace rune::node {
 
 /// A7 review D1: the shard runner's timer slack (ns).  Linux rounds every timed sleep / ppoll timeout UP by
 /// the thread's slack (50 µs default for SCHED_OTHER), so the backoff's 1 µs .. maxPark parks would really be
 /// 51 µs ..; 1 µs makes the park periods what the shape says (the bench thread does the same).
-inline constexpr unsigned long kShardTimerSlackNs = 1'000;
+inline constexpr unsigned long kShardTimerSlackNs = ParkUntilWorkIdle::kParkTimerSlackNs;   // set by the readiness park (re-review MEDIUM-1)
 
 class NodeRuntimeAgent;
 
@@ -71,9 +73,6 @@ public:
         if (!bound_) [[unlikely]] {
             driver_.bindPumpThread();          // ownership hand-off: startup thread → this thread
             if (runtimeDriver_) runtimeDriver_->bindPumpThread();
-#if defined(__linux__)
-            (void)::prctl(PR_SET_TIMERSLACK, kShardTimerSlackNs, 0, 0, 0);   // D1: this runner thread only
-#endif
             bound_ = true;
         }
         // 1. own driver duty cycle — A1: drained while it reports work (bounded),

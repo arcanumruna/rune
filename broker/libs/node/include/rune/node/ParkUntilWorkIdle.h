@@ -25,6 +25,9 @@
 
 #include <poll.h>
 #if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+#if defined(__linux__)
 #include <time.h>
 #endif
 
@@ -39,6 +42,8 @@ namespace rune::node {
 class ParkUntilWorkIdle final : public rune::consensus::IdleStrategy {
 public:
     static constexpr int kMaxWakeFds = 8;
+    /// Timer slack (ns) set on the runner thread at its first readiness park (Linux).
+    static constexpr unsigned long kParkTimerSlackNs = 1'000;
     enum class Phase : uint8_t { NotIdle, Spinning, Yielding, Parking };
 
     /// `fds` (may be null when n == 0): readiness fds to park on, owned by the caller and valid for this
@@ -68,6 +73,15 @@ public:
             std::this_thread::yield();
         } else {
             phase_ = Phase::Parking;
+#if defined(__linux__)
+            // A7 review D1 / re-review MEDIUM-1: 1 us timer slack so the park periods are what the shape says —
+            // only on the readiness-fd park (set lazily on this runner thread's first park); the legacy backoff
+            // fallback and fd-less timed parks keep the kernel default.
+            if (nfds_ > 0 && !slackSet_) {
+                (void)::prctl(PR_SET_TIMERSLACK, kParkTimerSlackNs, 0, 0, 0);
+                slackSet_ = true;
+            }
+#endif
             park_(parkNs_);
             parkNs_ = std::min(parkNs_ * 2, shape_.maxParkNs);
         }
@@ -123,6 +137,7 @@ private:
     int64_t                            parkNs_ = 0;
     uint64_t                           parks_  = 0;
     uint64_t                           wakes_  = 0;
+    bool slackSet_ = false;   // owner thread only
 };
 
 } // namespace rune::node

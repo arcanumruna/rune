@@ -161,7 +161,7 @@ TEST(ShardAgentWakeRegression, EpollFirstOffExposesNoWakeFdsRegression) {
 
 // Review D1: the shard runner thread sets its timer slack to 1 µs at its first pass (the default 50 µs slack
 // rounds every 1 µs .. park up to >= 51 µs).
-TEST(ShardAgent, FirstPassSetsOneMicrosecondTimerSlack) {
+TEST(ShardAgent, FirstPassLeavesTimerSlackAloneRegression) {
 #if !defined(__linux__)
     GTEST_SKIP() << "PR_SET_TIMERSLACK is Linux-only";
 #else
@@ -179,9 +179,13 @@ TEST(ShardAgent, FirstPassSetsOneMicrosecondTimerSlack) {
     });
     runner.join();
     EXPECT_EQ(before, 50'000L);
-    EXPECT_EQ(after, static_cast<long>(kShardTimerSlackNs));
+    // A7 re-review MEDIUM-1: the pass itself leaves the slack alone — only the readiness-fd park sets it, so the
+    // legacy backoff fallback (RUNE_IDLE_WAKE=0 / RUNE_AERON_EPOLL_POLL=0 / no fds) keeps the kernel default.
+    EXPECT_EQ(after, 50'000L);
 #endif
 }
+
+
 
 namespace {
 struct FakeFds {
@@ -234,3 +238,27 @@ TEST(ShardIdle, BusySpinOnlyOnExplicitOptIn) {
     auto idle = makeShardIdle(c, f.p, 1);
     EXPECT_NE(dynamic_cast<rune::consensus::BusySpinIdleStrategy*>(idle.get()), nullptr);
 }
+
+#if defined(__linux__)
+TEST(ShardAgentTimerSlack, OnlyTheReadinessParkLowersTimerSlackRegression) {
+    FakeFds f;
+    long legacy = -1, withFds = -1;
+    std::thread t1([&] {
+        (void)::prctl(PR_SET_TIMERSLACK, 50'000UL, 0, 0, 0);
+        ParkUntilWorkIdle timed(IdleShape{0, 0, 1'000, 1'000}, nullptr, 0);   // no fds = fallback shape
+        timed.idle(0);
+        legacy = ::prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    });
+    t1.join();
+    std::thread t2([&] {
+        (void)::prctl(PR_SET_TIMERSLACK, 50'000UL, 0, 0, 0);
+        const int fds[1] = {f.p[0]};
+        ParkUntilWorkIdle wake(IdleShape{0, 0, 1'000, 1'000}, fds, 1);
+        wake.idle(0);
+        withFds = ::prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    });
+    t2.join();
+    EXPECT_EQ(legacy, 50'000L);
+    EXPECT_EQ(withFds, static_cast<long>(kShardTimerSlackNs));
+}
+#endif

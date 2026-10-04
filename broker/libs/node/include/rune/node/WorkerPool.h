@@ -67,7 +67,7 @@ makeBackoffIdle(int64_t maxParkUs) {
 // A7 (findings §4.12): the shard runner's idle strategy.  Busy-spin ONLY on the explicit
 // RUNE_WORKER_IDLE=busyspin opt-in.  Otherwise park-until-work on the agent's readiness fds (`fds`, n > 0:
 // driver pollers + io_uring completions) after the Aeron spin / yield phase (review M1); with
-// RUNE_IDLE_WAKE=0 or no fds (non-Linux): the legacy Aeron backoff — byte-identical to pre-A7 — unless
+// RUNE_IDLE_WAKE=0 or no fds (non-Linux): the legacy Aeron backoff — byte-identical to pre-A7 (kernel-default timer slack) — unless
 // RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS set an explicit shape (then a timed ParkUntilWorkIdle of that shape).
 inline std::unique_ptr<rune::consensus::IdleStrategy>
 makeShardIdle(const NodeConfig& cfg, const int* fds, int n) {
