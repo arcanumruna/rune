@@ -237,26 +237,27 @@ TEST(GatewayShardNotifyRegression, HeldSessionsProduceFramesArePausedUntilEveryW
 }
 
 // D8b (found 2026-10-04, ShardModeRegression.SlowEndpointUnawareClientCannotStarveTheShard ~1/3 on Linux): a
-// HELD session's produce frames are ABORTed on its image, so nothing refreshed its lease while it was paused and
-// not yet reading its acks -> after sessionTimeout it was reaped and every queued ack dropped as orphaned (16-22k
-// lost acks).  The aborted frame proves the client's publication is connected (Aeron drops a dead publisher's
-// image after its liveness timeout), so a held frame refreshes the lease; an idle held session is still reaped.
-TEST(GatewayShardNotifyRegression, HeldSessionWithPendingFramesKeepsItsLeaseRegression) {
+// HELD session (paused by back-pressure, not yet reading its acks) was reaped on the normal 10 s lease and every
+// queued ack dropped as orphaned (16-22k lost).  A held session is now reaped only after maxHeldIdleNs without
+// progress (Kafka: connections.max.idle.ms, 10 min) — reading acks refreshes the lease; a held client that DIES is
+// failed by the worker (NOT_CONNECTED after delivering, SessionAckSink test).  Non-held sessions keep the 10 s lease.
+TEST(GatewayShardNotifyRegression, HeldSessionKeepsItsLeaseUpToMaxHeldIdleRegression) {
     using K = rune::node::SessionSignalKind;
     ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
     rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
     gw.setWorkerPool(&pool);
     gw.setShardMode(true);
     constexpr int64_t T = ClientGateway::kDefaultSessionTimeoutNs;
-    const int64_t a = gw.injectTestSession(0), idle = gw.injectTestSession(0);
-    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(a, 0, K::Held)));
-    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(idle, 0, K::Held)));
-    const auto pa = produceFrame(a);
-    gw.drainWorkerReturnsForTest(T - 1'000'000);                    // just before the lease would expire
-    ASSERT_TRUE(gw.clientFrameHeldForTest(pa.data(), pa.size()));     // a's head frame is aborted again
-    gw.reapExpiredForTest(T + 500'000'000);                          // past the ORIGINAL lease of both
-    EXPECT_GE(gw.sessionLastSeenNsForTest(a), 0) << "a held session with frames waiting must not be reaped";
-    EXPECT_EQ(gw.sessionLastSeenNsForTest(idle), -1) << "a held session with no traffic is still reaped";
+    constexpr int64_t H = ClientGateway::kDefaultMaxHeldIdleNs;
+    static_assert(H > T);
+    const int64_t held = gw.injectTestSession(0), plain = gw.injectTestSession(0);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(held, 0, K::Held)));
+    gw.drainWorkerReturnsForTest(1'000);
+    gw.reapExpiredForTest(T + 500'000'000);                  // past the normal lease
+    EXPECT_GE(gw.sessionLastSeenNsForTest(held), 0) << "a paused session must not be reaped on the normal lease";
+    EXPECT_EQ(gw.sessionLastSeenNsForTest(plain), -1) << "a non-held idle session is reaped on the normal lease";
+    gw.reapExpiredForTest(H + 500'000'000);                  // past the held-idle bound with no progress
+    EXPECT_EQ(gw.sessionLastSeenNsForTest(held), -1) << "a paused session with no progress is reaped at the bound";
 }
 
 // Finding 2: a SessionFailed close tells the client (best effort, on the

@@ -459,10 +459,12 @@ int ClientGateway::doWork(int64_t nowNs) {
         // until Released, a close (SessionFailed), or the lease reap.  No
         // deadlock (releasing a held ack never needs a gateway frame); while
         // paused, the client's lease is refreshed by the post-ack notifications
-        // of the acks it does read AND by each abort of its waiting frame (D8b:
-        // the frame proves its publication is alive — a paused client that has
-        // not read yet was reaped and lost every queued ack); a client that is
-        // gone leaves through the lease reap once Aeron drops its image.
+        // of the acks it does read, and a HELD session is reaped only after
+        // maxHeldIdleNs without progress (D8b: on the normal lease a paused
+        // client that had not read yet was reaped and lost every queued ack);
+        // a held client that dies is failed by its worker (NOT_CONNECTED after
+        // delivering) — the stuck frame never drains its image, so the image is
+        // no liveness signal.
         work += sub_->controlledPoll(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
                    aeron::Header& h) {
@@ -750,7 +752,9 @@ void ClientGateway::reapExpired(int64_t nowNs) {
     reapScratch_.clear();
 
     sessions_.forEach([&](Session& s) {
-        if (nowNs - s.lastSeenNs > sessionTimeoutNs_) {
+        // D8b: a session paused by back-pressure (held) keeps its lease up to maxHeldIdleNs_ of no progress.
+        const int64_t limit = s.heldByWorkers != 0 ? maxHeldIdleNs_ : sessionTimeoutNs_;
+        if (nowNs - s.lastSeenNs > limit) {
             reapScratch_.push_back(s.sessionId);
         }
     });
@@ -980,14 +984,8 @@ bool ClientGateway::produceFrameHeld_(const uint8_t* buf, std::size_t len)
     if (templateId != pc::Produce::TEMPLATE_ID) return false;   // only produce intake is paused
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
-    Session* s = sessions_.find(static_cast<int64_t>(sid));
-    if (!s || s->heldByWorkers == 0) return false;
-    // D8b: the aborted frame proves the client's publication is connected (Aeron drops a dead publisher's
-    // image after its liveness timeout) — refresh the lease so a paused client that has not yet read its
-    // acks is not reaped (which dropped every queued ack as orphaned).  A held session with no frames
-    // waiting is still reaped on its lease.
-    s->lastSeenNs = nowNs_;
-    return true;
+    const Session* s = sessions_.find(static_cast<int64_t>(sid));
+    return s && s->heldByWorkers != 0;
 }
 
 void ClientGateway::sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid)

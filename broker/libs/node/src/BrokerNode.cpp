@@ -1571,6 +1571,7 @@ void BrokerNode::buildGateway() {
             rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
             std::move(leaderViewFn)
         );
+        if (config_.maxHeldIdleMs > 0) gateway_->setMaxHeldIdleNs(config_.maxHeldIdleMs * 1'000'000LL);   // D8b
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());

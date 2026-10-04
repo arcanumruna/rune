@@ -88,10 +88,13 @@ public:
     /// A claim result meaning "this publication can never deliver" (Aeron CLOSED
     /// / MAX_POSITION_EXCEEDED, mapped by the policy) → the session fails now.
     static constexpr int64_t     kClaimFatal       = -4;
+    /// Aeron NOT_CONNECTED: no subscriber.  Fatal only after the publication delivered at least once (D8b
+    /// review CRITICAL-1: the client is gone — a live slow reader stays connected and back-pressures).
+    static constexpr int64_t     kClaimNotConnected = -1;
 
     struct PubAnnounced { uint16_t chan = 0; uint16_t chanLen = 0; int32_t streamId = 0; };
     struct PubResolving { int64_t regId = -1; };
-    struct PubReady     { PubHandle pub{}; uint64_t blockedPass = 0; };
+    struct PubReady     { PubHandle pub{}; uint64_t blockedPass = 0; bool delivered = false; };
     /// reported == false: the runtime has not yet been told (reportFailures).
     struct PubFailed    { bool reported = true; };
     using PubState = std::variant<PubAnnounced, PubResolving, PubReady, PubFailed>;
@@ -179,10 +182,12 @@ public:
                 if (r->blockedPass != pass_) {                      // per-session order kept
                     const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, dst); });
                     if (pos > 0) [[likely]] {
+                        r->delivered = true;
                         ++work;
                         continue;
                     }
-                    if (pos == kClaimFatal) [[unlikely]] {           // can never deliver
+                    if (pos == kClaimFatal || (pos == kClaimNotConnected && r->delivered)) [[unlikely]] {
+                        // can never deliver: CLOSED / MAX_POSITION, or the subscriber that WAS connected is gone
                         fail_(st);
                         ++dropped_;
                         ++work;

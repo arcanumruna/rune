@@ -126,6 +126,10 @@ class ClientGateway {
 public:
     // Default session timeout: 10 seconds.
     static constexpr int64_t kDefaultSessionTimeoutNs = 10LL * 1'000'000'000LL;
+    /// D8b: a HELD session (paused by back-pressure while it has not read its acks) is reaped only after this
+    /// long without progress — Kafka connections.max.idle.ms (10 min).  RUNE_MAX_HELD_IDLE_MS.
+    static constexpr int64_t kDefaultMaxHeldIdleNs = 600LL * 1'000'000'000LL;
+    void setMaxHeldIdleNs(int64_t ns) noexcept { maxHeldIdleNs_ = ns > 0 ? ns : kDefaultMaxHeldIdleNs; }
 
     // Async Connect egress-resolve timeout: 5 seconds.
     static constexpr int64_t kDefaultConnectResolveTimeoutNs = 5LL * 1'000'000'000LL;
@@ -1218,6 +1222,7 @@ private:
     int32_t                              workerEgressControlBasePort_ = 0; // read-rework I4
     int32_t                              workerEgressBaseStreamId_    = 0; // read-rework I4
     int64_t                              sessionTimeoutNs_;
+    int64_t                              maxHeldIdleNs_ = kDefaultMaxHeldIdleNs;
     int64_t                              connectResolveTimeoutNs_;
     std::function<LeaderView()>          leaderView_;
 

@@ -1168,6 +1168,15 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default ("sleep-ns").
 
+    // --- RUNE_MAX_HELD_IDLE_MS (optional, D8b) --- held-session no-progress reap bound.
+    if (const char* raw = getenv_fn("RUNE_MAX_HELD_IDLE_MS"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end == raw || *end != '\0' || v < 1)
+            return {{}, std::string("RUNE_MAX_HELD_IDLE_MS must be a positive integer (ms), got '") + raw + "'"};
+        cfg.maxHeldIdleMs = v;
+    }
+
     // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
     // Follower periodic-fetch backstop cadence.  Lower = faster acks=all
     // round-trip when GR-10 push under-delivers; measurement/tuning knob.

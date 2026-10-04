@@ -29,6 +29,7 @@ struct FakePolicy {
         std::set<int64_t> erroredRegs;
         std::set<int> blocked;                                  // pub ids that back-pressure
         std::set<int> closed;                                   // pub ids that are CLOSED (fatal)
+        std::set<int> notConnected;                             // pub ids whose subscriber is gone (NOT_CONNECTED)
         std::vector<std::pair<int, std::vector<uint8_t>>> sent; // (pub id, frame)
         std::vector<int64_t> foundRegs;                         // registrations find() resolved
     };
@@ -49,6 +50,7 @@ struct FakePolicy {
     }
     template <class E> int64_t claim(PubHandle& p, std::size_t len, E&& enc) noexcept {
         if (s->closed.count(p->id)) return kFatal;    // CLOSED / MAX_POSITION
+        if (s->notConnected.count(p->id)) return -1;            // NOT_CONNECTED
         if (s->blocked.count(p->id)) return -2;                 // BACK_PRESSURED
         std::vector<uint8_t> b(len);
         enc(b.data());
@@ -378,4 +380,40 @@ TEST(SessionAckSinkRegression, RegistrationThatResolvedToErrorIsNeverDrained) {
     s.close(7);
     for (int i = 0; i < 3; ++i) pass(s);
     EXPECT_EQ(s.drainingRegistrations(), 0u);
+}
+
+// D8b review CRITICAL-1: a paused client that DIES leaves its held acks queued forever (NOT_CONNECTED was treated
+// as back-pressure, the gateway image never drains, the lease was refreshed by the stuck frame) — they count against
+// kAckCapacity and a few dead slow clients starve the shard.  A publication that delivered at least once and then
+// reports NOT_CONNECTED has lost its subscriber: fail the session (reported -> the runtime closes it) and drop its
+// acks.  One that has never connected yet keeps waiting (connect in progress).
+TEST(SessionAckSinkRegression, NotConnectedAfterDeliveringFailsTheSessionRegression) {
+    FakePolicy pol;
+    Sink s(pol);
+    ready(s, 5);
+    ASSERT_TRUE(s.enqueue(ack(5, 1)));
+    pass(s);
+    ASSERT_EQ(pol.s->sent.size(), 1u) << "delivered once: the publication was connected";
+    const int pubId = pol.s->sent.back().first;
+    pol.s->notConnected.insert(pubId);                         // the client process died
+    ASSERT_TRUE(s.enqueue(ack(5, 2)));
+    pass(s);
+    EXPECT_EQ(s.pendingForTest(), 0u) << "the dead session's acks are released, not held forever";
+    std::vector<int64_t> failed;
+    s.reportFailures([&](int64_t sid) { failed.push_back(sid); return true; });
+    EXPECT_EQ(failed, std::vector<int64_t>{5}) << "the runtime is told so it closes the session";
+}
+
+TEST(SessionAckSinkRegression, NotConnectedBeforeFirstDeliveryKeepsWaitingRegression) {
+    FakePolicy pol;
+    Sink s(pol);
+    ready(s, 6);
+    pol.s->notConnected.insert(static_cast<int>(pol.s->foundRegs.back()));   // subscriber not connected yet
+    ASSERT_TRUE(s.enqueue(ack(6, 1)));
+    pass(s);
+    pass(s);
+    EXPECT_EQ(s.pendingForTest(), 1u) << "never connected: keep holding (connect in progress)";
+    std::vector<int64_t> failed;
+    s.reportFailures([&](int64_t sid) { failed.push_back(sid); return true; });
+    EXPECT_TRUE(failed.empty());
 }
