@@ -304,3 +304,23 @@ shrinks only).
 - rune-protocol-fe `feat/fetch-epoch`: a9787dc (AlterIsr partitionEpoch, AlterIsrResponse,
   InternalIsr/Ack, FetchRequest incarnation, WorkerOp fields). It must be published (CI) together with
   f312823/0e9b529/5260f39/40ab510 before the broker builds against the default include.
+
+## Fix round 3 (re-review round 2) — completed by the controller
+
+The round-3 agent committed every finding, then went idle (no process, last activity 06:17); the controller
+finished the round.
+
+| Finding | Commit |
+|---|---|
+| MAJOR-A permanent no-leader (candidate self-check; committed internal ISR not re-sent) | 2796c8a — voters-only candidacy rule; committed internal ISR re-sent until acked |
+| MEDIUM-A deposed-leader commit window | 3933caa — internal ISR state older than the node's consensus term never persisted or acked |
+| MEDIUM-C schemas lag-shrink outside the store + LOW-A fail-open state file | 703b087 — no lag shrink outside a quorum-decided ISR; internal-ISR knowledge fails closed (corrupt/short file -> refuse to vote; directory fsync checked) |
+| MEDIUM-B one internal ISR takes down the control plane | c319e9b — only __cluster_metadata decides consensus candidacy; offsets/txn partitions on the controller-ISR path |
+| (leftover) | rate-limited WARN for stale-term refusals |
+
+Verification (controller, Mac build-fast, protocol-fe include): DR suite 30x clean; full ctest 3257/3258 —
+LargeBatchReplicationRegression.MultiBatchPushAboveFollowerFrameNeverWedges4MiBRing failed once under -j6 and passed
+5/5 alone; in a stress loop (LargeBatch|DrIntegration|PartitionReplica, -j6) AcksAll2MiBBatchCommitsPerWorkerPlane and
+UnservableStoredBatchEvictsFollowersLegacyTransport failed once each, then the same loop passed 3x and LargeBatch alone
+passed 5x under -j6 -> load-sensitive, unreproduced on demand (watch item; capture output on next occurrence).
+check_no_atomics OK.  LOW-B (real-election-over-Aeron coverage, docker matrix RUNE_SURVIVOR_LEADER_ELECTION) = follow-up.
