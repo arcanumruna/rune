@@ -697,6 +697,7 @@ bool TransactionCoordinationService::dispatchMarkers_(
     a.producerEpoch    = producerEpoch;
     a.coordinatorEpoch = coordinatorEpoch;
     a.commit           = commit;
+    a.dispatchedNs     = lastNowNs_;   // D9 re-review MEDIUM-2 (0 = stamped by the first gauge scan)
     const tx::ControlType ct = commit ? tx::ControlType::Commit : tx::ControlType::Abort;
     for (const auto& tp : parts) {
         const auto batch = tx::ControlMarker::build(producerId, producerEpoch, ct, coordinatorEpoch);
@@ -845,11 +846,18 @@ void TransactionCoordinationService::queueRetry_(AwaitingMarkers& a, int32_t top
 void TransactionCoordinationService::updateStuckMarkers_(int64_t nowNs)
 {
     std::size_t stuck = 0;
-    for (auto& [pid, a] : awaiting_)
+    for (auto& [pid, a] : awaiting_) {
         for (auto& r : a.retries) {
             if (r.firstRefusedNs <= 0) r.firstRefusedNs = nowNs;   // refused before the clock started
             stuck += (nowNs - r.firstRefusedNs >= kStuckMarkerNs) ? 1u : 0u;
         }
+        // Re-review NEW MEDIUM-2: markers never refused but still unresolved
+        // (in flight / parked on the leader's HW) past the same window.
+        if (a.dispatchedNs <= 0) a.dispatchedNs = nowNs;
+        const auto firstAttempts = static_cast<std::size_t>(std::max(0, a.outstanding)) > a.retries.size()
+                                       ? static_cast<std::size_t>(a.outstanding) - a.retries.size() : 0u;
+        if (firstAttempts > 0 && nowNs - a.dispatchedNs >= kStuckMarkerNs) stuck += firstAttempts;
+    }
     if (stuck != 0 && stuckMarkers_ == 0)
         spdlog::warn("TCS: {} control marker(s) stuck — refused for more than {} s and still retrying "
                      "(their transactions stay Prepare*)", stuck, kStuckMarkerNs / 1'000'000'000);

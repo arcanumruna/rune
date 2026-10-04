@@ -263,8 +263,9 @@ struct TxnRig {
     std::string txnId = "tx-f15";
     int64_t pid = -1; int16_t epoch = 0; int32_t seq = 0; int64_t corr = 100; int64_t sid = 0;
     std::array<uint8_t, 4096> out{};
-    explicit TxnRig(int minIsr = 1, bool withStore = false, std::vector<NodeId> replicas = {})
-        : m({1}, 1, minIsr, std::move(replicas)) {
+    explicit TxnRig(int minIsr = 1, bool withStore = false, std::vector<NodeId> replicas = {},
+                    std::vector<NodeId> isr = {1})
+        : m(std::move(isr), 1, minIsr, std::move(replicas)) {
         if (withStore) {
             stateLog = std::make_unique<Log>(sd.path.string(), 64LL * 1024 * 1024);
             stateLog->recover();
@@ -719,6 +720,33 @@ TEST(MarkerRetryRegression, StuckMarkerGaugeIsPublishedToItsSinkOnChange) {
     for (int i = 0; i < 64 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) { now += 100'000'000; (void)T.tcs->doWork(now); T.m.runWorker(now); }
     for (int i = 0; i < 4; ++i) { now += 100'000'000; (void)T.tcs->doWork(now); }
     EXPECT_EQ(published.back(), 0) << "the cleared gauge was not published";
+}
+
+// D9 re-review NEW MEDIUM-2: a marker that was never refused but waits for the
+// HW (a follower in the ISR does not fetch) counts as stuck past the window too.
+TEST(MarkerRetryRegression, MarkerWaitingForTheHwCountsAsStuckPastTheWindow) {
+    TxnRig T(/*minIsr=*/1, /*withStore=*/false, {}, /*isr=*/{1, 2});
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    (void)T.tcs->doWork(10);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    int64_t now = 20'000'000;
+    for (int i = 0; i < 8; ++i, now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 2) << "precondition: the marker is appended";
+    ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u) << "precondition: it waits for the HW";
+    ASSERT_EQ(T.tcs->controlMarkersRefusedForTest(), 0u) << "precondition: never refused";
+    for (; now < TransactionCoordinationService::kStuckMarkerNs + 1'000'000'000; now += 50'000'000) {
+        (void)T.tcs->doWork(now); T.m.runWorker(now);
+    }
+    EXPECT_EQ(T.tcs->stuckMarkers(), 1u) << "a marker parked on the HW past the window is invisible to the gauge";
+    rune::replication::FetchRequestMsg fr{1, 0, 2, T.m.r->log()->logEndOffset(), 1 << 20, 0};
+    (void)T.m.r->onFetchRequest(fr, now);
+    for (int i = 0; i < 64 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) { now += 50'000'000; (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u);
+    (void)T.tcs->doWork(now + 1);
+    EXPECT_EQ(T.tcs->stuckMarkers(), 0u);
 }
 
 // D9 review LOW-2: a refusal seen before the coordinator's first doWork (clock

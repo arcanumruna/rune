@@ -193,8 +193,10 @@ public:
     [[nodiscard]] uint64_t controlMarkersRefusedForTest() const noexcept { return controlMarkersRefused_; }
     [[nodiscard]] std::size_t queuedMarkerRetriesForTest() const noexcept { return queuedRetries_; }
     /// D9 "stuck markers" gauge (observability only, never a correctness
-    /// input): markers of Prepare* transactions refused for longer than
-    /// kStuckMarkerNs and still awaiting a retry that lands.  Recomputed every
+    /// input): markers of Prepare* transactions unresolved for longer than
+    /// kStuckMarkerNs — refused and still retrying (since the first refusal),
+    /// or never refused but still in flight / parked on the leader's HW (since
+    /// dispatch; re-review MEDIUM-2).  Recomputed every
     /// doWork; a rise from 0 / a return to 0 is logged.  Control thread.
     static constexpr int64_t kStuckMarkerNs = 5'000'000'000;   // 5 × kMarkerRetryMaxNs
     [[nodiscard]] std::size_t stuckMarkers() const noexcept { return stuckMarkers_; }
@@ -234,6 +236,7 @@ private:
         int16_t producerEpoch    = 0;       // to rebuild a retried marker
         int32_t coordinatorEpoch = -1;
         bool    commit           = false;
+        int64_t dispatchedNs     = 0;       // D9 re-review MEDIUM-2: gauge age of never-refused markers
         std::vector<MarkerRetry> retries;   // refused markers awaiting re-dispatch
     };
     static constexpr int64_t kMarkerRetryMinNs = 10'000'000;      // 10 ms
