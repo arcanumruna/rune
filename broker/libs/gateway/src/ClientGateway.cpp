@@ -458,9 +458,11 @@ int ClientGateway::doWork(int64_t nowNs) {
         // Keepalive, Metadata, Disconnect, … — waits behind the aborted Produce
         // until Released, a close (SessionFailed), or the lease reap.  No
         // deadlock (releasing a held ack never needs a gateway frame); while
-        // paused, the client's lease is refreshed only by the post-ack
-        // notifications of the acks it does read, and a client that drops its
-        // egress before Disconnect leaves through the lease reap (fix round 3).
+        // paused, the client's lease is refreshed by the post-ack notifications
+        // of the acks it does read AND by each abort of its waiting frame (D8b:
+        // the frame proves its publication is alive — a paused client that has
+        // not read yet was reaped and lost every queued ack); a client that is
+        // gone leaves through the lease reap once Aeron drops its image.
         work += sub_->controlledPoll(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
                    aeron::Header& h) {
@@ -978,8 +980,14 @@ bool ClientGateway::produceFrameHeld_(const uint8_t* buf, std::size_t len)
     if (templateId != pc::Produce::TEMPLATE_ID) return false;   // only produce intake is paused
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
-    const Session* s = sessions_.find(static_cast<int64_t>(sid));
-    return s && s->heldByWorkers != 0;
+    Session* s = sessions_.find(static_cast<int64_t>(sid));
+    if (!s || s->heldByWorkers == 0) return false;
+    // D8b: the aborted frame proves the client's publication is connected (Aeron drops a dead publisher's
+    // image after its liveness timeout) — refresh the lease so a paused client that has not yet read its
+    // acks is not reaped (which dropped every queued ack as orphaned).  A held session with no frames
+    // waiting is still reaped on its lease.
+    s->lastSeenNs = nowNs_;
+    return true;
 }
 
 void ClientGateway::sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid)

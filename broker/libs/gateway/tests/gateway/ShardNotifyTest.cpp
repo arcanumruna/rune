@@ -236,6 +236,29 @@ TEST(GatewayShardNotifyRegression, HeldSessionsProduceFramesArePausedUntilEveryW
     EXPECT_FALSE(gw.clientFrameHeldForTest(pb.data(), pb.size())) << "the close clears its held state";
 }
 
+// D8b (found 2026-10-04, ShardModeRegression.SlowEndpointUnawareClientCannotStarveTheShard ~1/3 on Linux): a
+// HELD session's produce frames are ABORTed on its image, so nothing refreshed its lease while it was paused and
+// not yet reading its acks -> after sessionTimeout it was reaped and every queued ack dropped as orphaned (16-22k
+// lost acks).  The aborted frame proves the client's publication is connected (Aeron drops a dead publisher's
+// image after its liveness timeout), so a held frame refreshes the lease; an idle held session is still reaped.
+TEST(GatewayShardNotifyRegression, HeldSessionWithPendingFramesKeepsItsLeaseRegression) {
+    using K = rune::node::SessionSignalKind;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    constexpr int64_t T = ClientGateway::kDefaultSessionTimeoutNs;
+    const int64_t a = gw.injectTestSession(0), idle = gw.injectTestSession(0);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(a, 0, K::Held)));
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(idle, 0, K::Held)));
+    const auto pa = produceFrame(a);
+    gw.drainWorkerReturnsForTest(T - 1'000'000);                    // just before the lease would expire
+    ASSERT_TRUE(gw.clientFrameHeldForTest(pa.data(), pa.size()));     // a's head frame is aborted again
+    gw.reapExpiredForTest(T + 500'000'000);                          // past the ORIGINAL lease of both
+    EXPECT_GE(gw.sessionLastSeenNsForTest(a), 0) << "a held session with frames waiting must not be reaped";
+    EXPECT_EQ(gw.sessionLastSeenNsForTest(idle), -1) << "a held session with no traffic is still reaped";
+}
+
 // Finding 2: a SessionFailed close tells the client (best effort, on the
 // gateway's own publication) that its session expired — the rune client
 // reconnects only on SessionExpired / UnknownSession.
