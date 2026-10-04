@@ -388,6 +388,12 @@ public:
     bool setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
                   const std::string& dataChannel) noexcept;
 
+    /// True when a ConnectResponse's correlationId belongs to the SEED session's
+    /// connect range (session 0; leader session i uses [i, i+1) * stride).
+    [[nodiscard]] static constexpr bool isSeedConnectCorrId(int64_t corrId) noexcept {
+        return corrId >= 0 && corrId < kSessionCorrIdStride;
+    }
+
     /// Task 1.3: number of currently open sessions (test/observer helper).
     [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
 
@@ -400,6 +406,23 @@ public:
     [[nodiscard]] bool testPublicationOpen(const std::string& channel, int32_t streamId) const noexcept {
         return transport_.publicationOpen(channel, streamId);
     }
+
+    // ---- Consumer-group fetch routing (cold path; agent thread only) ---------
+    // A group member's Subscribe for a partition must reach that partition's
+    // LEADER node on that node's own session (the broker refuses a Subscribe for
+    // a partition it does not lead).  Sessions are append-only (sessions_ never
+    // shrinks), so an index stays valid for the agent's lifetime.
+
+    /// Index of the session leading (topicId, partition): its route's node
+    /// session, lazily opened (async connect); 0 = the seed (no route).
+    [[nodiscard]] uint32_t leaderSessionIndex(int32_t topicId, int32_t partition) noexcept;
+    /// Session `index`'s id while it is Connected; 0 otherwise (or out of range).
+    [[nodiscard]] int64_t connectedSessionId(uint32_t index) const noexcept;
+    /// Offer a control frame (already stamped with that session's id) on
+    /// session `index`'s node ingress: the seed's default publication, or the
+    /// node endpoint's.  Retry = transiently refused (the owner retries).
+    transport::AeronTransport::OfferResult offerOnSession(uint32_t index, const uint8_t* buf,
+                                                          std::size_t len) noexcept;
 
     [[nodiscard]] std::string routeEndpointFor(int32_t topicId, int32_t partition) const noexcept;
     [[nodiscard]] std::string dataChannelFor(int32_t topicId, int32_t partition) const noexcept;

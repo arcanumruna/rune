@@ -1040,6 +1040,31 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
     }
 }
 
+uint32_t ClientAgent::leaderSessionIndex(int32_t topicId, int32_t partition) noexcept {
+    if (routeIndex_.size() == 0) return 0;
+    const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+    if (idx == detail::FlatIndexMap::kNone) return 0;
+    PartitionRoute& r = routes_[idx];
+    if (r.sessionIndex == kNoSession) r.sessionIndex = sessionIndexFor_(r.sessionEndpoint);  // once per route
+    return r.sessionIndex;
+}
+
+int64_t ClientAgent::connectedSessionId(uint32_t index) const noexcept {
+    if (index >= sessions_.size()) return 0;
+    const session::SessionMachine& m = sessions_[index]->machine;
+    return m.state() == session::SessionState::Connected ? m.sessionId() : 0;
+}
+
+transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t index, const uint8_t* buf,
+                                                                  std::size_t len) noexcept {
+    using R = transport::AeronTransport::OfferResult;
+    if (index == 0) return offerDefault(buf, len);  // the seed: its (possibly retargeted) default pub
+    if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    if (transport_.offerTo(sessions_[index]->endpoint, cfg_.transport.ingressStreamId, buf, len)) return R::Accepted;
+    ++ingressOfferRefused_;
+    return R::Retry;
+}
+
 std::string ClientAgent::routeEndpointFor(int32_t topicId, int32_t partition) const noexcept {
     const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
     return idx == detail::FlatIndexMap::kNone ? std::string{} : routes_[idx].sessionEndpoint;
