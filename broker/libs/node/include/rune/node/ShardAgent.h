@@ -21,8 +21,18 @@
 #include <Aeron.h>
 
 #include <cstdint>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+
+#include <rune/node/ParkUntilWorkIdle.h>
 
 namespace rune::node {
+
+/// A7 review D1: the shard runner's timer slack (ns).  Linux rounds every timed sleep / ppoll timeout UP by
+/// the thread's slack (50 µs default for SCHED_OTHER), so the backoff's 1 µs .. maxPark parks would really be
+/// 51 µs ..; 1 µs makes the park periods what the shape says (the bench thread does the same).
+inline constexpr unsigned long kShardTimerSlackNs = ParkUntilWorkIdle::kParkTimerSlackNs;   // set by the readiness park (re-review MEDIUM-1)
 
 class NodeRuntimeAgent;
 
@@ -83,6 +93,26 @@ public:
         if (clock_.nowNs() - nowNs > kSlowPassNs) [[unlikely]] ++slowPasses_;
         return work;
     }
+
+    /// A7 park-until-work: the readiness fds this shard's runner parks on — its own invoker driver's
+    /// sockets, the fused runtime's driver when that is a separate one (A4: riding this shard's driver adds
+    /// nothing), and the worker's io_uring completion fd (review M1: an fsync completion ends the park).
+    /// Read before the runner starts (setFusedRuntime first).  Returns how many.
+    [[nodiscard]] int wakeFds(int* out, int max) const noexcept {
+        int n = driver_.wakeFds(out, max);
+        if (runtimeDriver_ != nullptr && runtimeDriver_ != &driver_ && n < max)
+            n += runtimeDriver_->wakeFds(out + n, max - n);
+        // Only with driver fds: without them (non-Linux, epoll-first off) the runner keeps the legacy backoff.
+        if (n > 0 && n < max && worker_.ioCompletionFd() >= 0) out[n++] = worker_.ioCompletionFd();
+        return n;
+    }
+
+    /// A9: the doorbell of the rings this shard's thread consumes — its worker's (op + session rings,
+    /// portable completions; in fused placement BrokerNode attaches the runtime's cross-thread rings too).
+    [[nodiscard]] detail::RingDoorbell& doorbell() noexcept { return worker_.doorbell(); }
+    /// A9 review M-1: wire the doorbell (startup only; see Worker::enableDoorbell) / whether it is wired.
+    void enableDoorbell(bool retSpaceWait) noexcept { worker_.enableDoorbell(retSpaceWait); }
+    [[nodiscard]] bool doorbellEnabled() const noexcept { return worker_.doorbellEnabled(); }
 
     [[nodiscard]] uint64_t slowPassesForTest() const noexcept { return slowPasses_; }
     /// A1: most driver duty cycles one pass runs while the driver keeps reporting work.

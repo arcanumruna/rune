@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>   // Worker::maxAcceptableBatchBytes (THE batch limit)
@@ -1340,6 +1341,148 @@ TEST(NodeConfig, RuneWorkerIdleGarbageFloorsToBackoff) {
 }
 
 // ---------------------------------------------------------------------------
+// A7: shard-worker idle shape — RUNE_IDLE_WAKE / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS
+// (park-until-work; findings §4.12).  Auto shape = the Aeron 10 spins / 20 yields before the first park,
+// with or without wake fds (review M1).  Strict parsing (review D3): garbage refuses startup.
+// ---------------------------------------------------------------------------
+TEST(NodeConfig, IdleWakeDefaultsOnWithAutoShape) {
+    auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_TRUE(res.config->idleWake) << "park-until-work is the default";
+    EXPECT_EQ(res.config->idleSpins, rune::node::NodeConfig::kIdleAuto);
+    EXPECT_EQ(res.config->idleYields, rune::node::NodeConfig::kIdleAuto);
+}
+
+TEST(NodeConfig, IdleWakeAcceptsZeroOneFalseTrue) {
+    for (const auto& [v, want] : {std::pair{"0", false}, std::pair{"false", false},
+                                  std::pair{"1", true}, std::pair{"true", true}}) {
+        auto base = base1node();
+        base["RUNE_IDLE_WAKE"] = v;
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_EQ(res.config->idleWake, want) << v;
+    }
+}
+
+// Review D3: an unrecognised value used to keep wake ON silently (a typo measured the wrong A/B arm).
+TEST(NodeConfigRegression, IdleWakeGarbageRefusesStartupRegression) {
+    for (const char* v : {"off", "no", "OFF", "garbage", "2"}) {
+        auto base = base1node();
+        base["RUNE_IDLE_WAKE"] = v;
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        EXPECT_FALSE(res.config.has_value()) << v;
+        EXPECT_NE(res.error.find("RUNE_IDLE_WAKE must be 0/1/false/true"), std::string::npos) << res.error;
+    }
+}
+
+TEST(NodeConfig, IdleSpinsYieldsParse) {
+    auto base = base1node();
+    base["RUNE_IDLE_SPINS"]  = "3";
+    base["RUNE_IDLE_YIELDS"] = "0";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->idleSpins, 3);
+    EXPECT_EQ(res.config->idleYields, 0) << "0 is explicit, not auto";
+}
+
+// Review D3: garbage / negative spins or yields used to fall back to auto silently.
+TEST(NodeConfigRegression, IdleSpinsYieldsGarbageRefusesStartupRegression) {
+    for (const char* name : {"RUNE_IDLE_SPINS", "RUNE_IDLE_YIELDS"}) {
+        for (const char* v : {"-5", "abc", "2x"}) {
+            auto base = base1node();
+            base[name] = v;
+            auto res = rune::node::parseNodeConfig(fakeEnv(base));
+            EXPECT_FALSE(res.config.has_value()) << name << "=" << v;
+            EXPECT_NE(res.error.find(std::string(name) + " must be a non-negative integer"), std::string::npos)
+                << res.error;
+        }
+    }
+    auto base = base1node();
+    base["RUNE_IDLE_SPINS"] = "";   // empty = unset (auto), like every other knob
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->idleSpins, rune::node::NodeConfig::kIdleAuto);
+}
+
+// A9: RUNE_IDLE_DOORBELL + the doorbell park knobs; garbage refuses startup (review D3 rule).
+TEST(NodeConfig, IdleDoorbellKnobsParse) {
+    auto base = base1node();
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_TRUE(res.config->idleDoorbell) << "default on";
+    EXPECT_EQ(res.config->idleDoorbellMinParkUs, 1000);
+    EXPECT_EQ(res.config->idleDoorbellParkUs, 1000);
+    base["RUNE_IDLE_DOORBELL"] = "false";
+    base["RUNE_IDLE_DOORBELL_MIN_PARK_US"] = "50";
+    base["RUNE_IDLE_DOORBELL_PARK_US"] = "2000";
+    res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_FALSE(res.config->idleDoorbell);
+    EXPECT_EQ(res.config->idleDoorbellMinParkUs, 50);
+    EXPECT_EQ(res.config->idleDoorbellParkUs, 2000);
+}
+
+TEST(NodeConfigRegression, IdleDoorbellGarbageRefusesStartupRegression) {
+    for (const char* v : {"off", "yes", "2"}) {
+        auto base = base1node();
+        base["RUNE_IDLE_DOORBELL"] = v;
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        EXPECT_FALSE(res.config.has_value()) << v;
+        EXPECT_NE(res.error.find("RUNE_IDLE_DOORBELL must be 0/1/false/true"), std::string::npos) << res.error;
+    }
+    for (const char* name : {"RUNE_IDLE_DOORBELL_MIN_PARK_US", "RUNE_IDLE_DOORBELL_PARK_US"}) {
+        for (const char* v : {"0", "-1", "abc", "2000000"}) {
+            auto base = base1node();
+            base[name] = v;
+            auto res = rune::node::parseNodeConfig(fakeEnv(base));
+            EXPECT_FALSE(res.config.has_value()) << name << "=" << v;
+            EXPECT_NE(res.error.find(std::string(name) + " must be an integer in 1..1000000"), std::string::npos)
+                << res.error;
+        }
+    }
+    auto base = base1node();
+    base["RUNE_IDLE_DOORBELL_MIN_PARK_US"] = "500";
+    base["RUNE_IDLE_DOORBELL_PARK_US"] = "100";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    EXPECT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("must not exceed RUNE_IDLE_DOORBELL_PARK_US"), std::string::npos) << res.error;
+}
+
+// A9: the doorbell shape — the Aeron spin / yield phase (measured: dropping it costs 20k p50), then the
+// doorbell park; explicit spins / yields still win.
+TEST(NodeConfig, DoorbellShardIdleShape) {
+    rune::node::NodeConfig c;
+    EXPECT_EQ(c.shardIdleShape(/*doorbell=*/true), (rune::node::IdleShape{10, 20, 1'000'000, 1'000'000}));
+    c.idleSpins = 2; c.idleYields = 3; c.idleDoorbellMinParkUs = 10; c.idleDoorbellParkUs = 500;
+    EXPECT_EQ(c.shardIdleShape(true), (rune::node::IdleShape{2, 3, 10'000, 500'000}));
+    EXPECT_EQ(c.shardIdleShape(false).maxParkNs, c.idleMaxParkUs * 1'000) << "no doorbell: A7's shape";
+}
+
+TEST(NodeConfig, ShardIdleShapeDerivation) {
+    rune::node::NodeConfig c;
+    c.idleMaxParkUs = 200;
+    // Auto: the Aeron spin / yield phase before the first park (review M1), park 1 µs doubling to maxPark.
+    const auto w = c.shardIdleShape();
+    EXPECT_EQ(w.maxSpins, 10);
+    EXPECT_EQ(w.maxYields, 20);
+    EXPECT_EQ(w.minParkNs, 1'000);
+    EXPECT_EQ(w.maxParkNs, 200'000) << "maxPark = RUNE_IDLE_MAX_PARK_US";
+    // Explicit values win.
+    c.idleSpins = 2; c.idleYields = 4; c.idleMaxParkUs = 50;
+    const auto e = c.shardIdleShape();
+    EXPECT_EQ(e.maxSpins, 2);
+    EXPECT_EQ(e.maxYields, 4);
+    EXPECT_EQ(e.maxParkNs, 50'000);
+}
+
+TEST(NodeConfig, ShardIdleUsesWakeOnlyWhenEnabled) {
+    rune::node::NodeConfig c;
+    EXPECT_TRUE(c.shardIdleWantsWake());
+    c.idleWake = false;
+    EXPECT_FALSE(c.shardIdleWantsWake()) << "RUNE_IDLE_WAKE=0 -> legacy backoff (the A/B off arm)";
+}
+
+// ---------------------------------------------------------------------------
 // E3 Task 7: io-ring depths + memory-log ring bytes (RUNE_IO_SUBMIT_RING_DEPTH,
 // RUNE_IO_COMPLETION_RING_DEPTH, RUNE_MEMORY_LOG_RING_BYTES)
 // ---------------------------------------------------------------------------
@@ -1613,6 +1756,30 @@ TEST(NodeConfig, AeronUdpGsoDefaultsOnAndEnvTurnsItOff) {
     auto bad = rune::node::parseNodeConfig(fakeEnv(kv));
     EXPECT_FALSE(bad.config.has_value());
     EXPECT_NE(bad.error.find("RUNE_AERON_UDP_GSO"), std::string::npos) << bad.error;
+}
+
+// A7: epoll-first transport polling (rune_driver_wake.h rune_driver_epoll_poll_install) — default on, A/B-able.
+TEST(NodeConfig, AeronEpollPollDefaultsOnAndEnvTurnsItOff) {
+    std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
+        {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};
+    EXPECT_TRUE(rune::node::NodeConfig{}.aeronEpollPoll);
+    {
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_TRUE(res.config->aeronEpollPoll);
+        EXPECT_TRUE(rune::node::EmbeddedDriverConfig::fromNode(*res.config, "/tmp/d").epollPoll);
+    }
+    for (const char* off : {"0", "false"}) {
+        auto kv = base; kv["RUNE_AERON_EPOLL_POLL"] = off;
+        auto res = rune::node::parseNodeConfig(fakeEnv(kv));
+        ASSERT_TRUE(res.config.has_value()) << res.error;
+        EXPECT_FALSE(res.config->aeronEpollPoll) << off;
+        EXPECT_FALSE(rune::node::EmbeddedDriverConfig::fromNode(*res.config, "/tmp/d").epollPoll) << off;
+    }
+    auto kv = base; kv["RUNE_AERON_EPOLL_POLL"] = "maybe";
+    auto bad = rune::node::parseNodeConfig(fakeEnv(kv));
+    EXPECT_FALSE(bad.config.has_value());
+    EXPECT_NE(bad.error.find("RUNE_AERON_EPOLL_POLL"), std::string::npos) << bad.error;
 }
 
 TEST(NodeConfig, ParsesAeronTermSparse) {

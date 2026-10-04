@@ -1,5 +1,6 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
+#include "rune/protocol/net/rune_driver_wake.h"
 #include "rune/protocol/net/rune_udp_gso.h"
 
 #include <spdlog/spdlog.h>
@@ -19,6 +20,7 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.termBufferSparse  = c.aeronTermBufferSparse;
     e.maxMessagesPerSend = c.aeronMaxMessagesPerSend;
     e.udpGso             = c.aeronUdpGso;
+    e.epollPoll          = c.aeronEpollPoll;
     e.senderIoVector     = c.aeronSenderIoVectorCapacity;
     e.receiverIoVector   = c.aeronReceiverIoVectorCapacity;
     e.threadingMode     = c.aeronThreadingMode;
@@ -173,6 +175,11 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         }
         gsoActiveMask_ = rune_gso_bindings_active(gso_);
     }
+    // A7: epoll-first polling — patches rune_gso's own bindings in place, or a private copy of Aeron's stock
+    // ones (never the process-wide stock struct).  After the GSO install (it replaces the context's bindings).
+    if (cfg_.epollPoll)
+        epollPollActive_ = rune_driver_epoll_poll_install(ctx_, /*ctx_bindings_owned=*/gso_ != nullptr ? 1 : 0,
+                                                          &epollBindings_) == 1;
     if (cfg_.maxMessagesPerSend > 0)
         aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, static_cast<uint32_t>(cfg_.maxMessagesPerSend));
     else if (const unsigned m = rune_gso_msgs_per_send(udpGsoActive(), static_cast<std::size_t>(cfg_.mtuBytes)); m > 0)
@@ -234,9 +241,19 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     spdlog::info("EmbeddedDriver: started (dir={}, mode={})", cfg_.dir,
                  mode_ == DriverMode::Invoker ? "invoker" : "threaded");
     // WARN: visible in perf runs (RUNE_LOG_LEVEL=warn) — the INSTALLED UDP path of this driver.
-    spdlog::warn("EmbeddedDriver[{}]: udp mtu={} gso={} gro={} msgsPerSend={}", cfg_.dir, cfg_.mtuBytes,
+    spdlog::warn("EmbeddedDriver[{}]: udp mtu={} gso={} gro={} msgsPerSend={} poll={}", cfg_.dir, cfg_.mtuBytes,
                  udpGsoActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"),
-                 udpGroActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_);
+                 udpGroActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_,
+                 epollPollActive_ ? "epoll-first" : "stock");
+}
+
+int EmbeddedDriver::wakeFds(int* out, int max) const noexcept {
+    if (mode_ != DriverMode::Invoker || driver_ == nullptr) return 0;
+    return rune_driver_wake_fds(driver_, out, max);
+}
+
+int EmbeddedDriver::epollSelectedForTest(bool reset) noexcept {
+    return driver_ == nullptr ? 0 : rune_driver_epoll_selected_for_test(driver_, reset ? 1 : 0);
 }
 
 std::string EmbeddedDriver::idleStrategyArgsForTest() const {
@@ -310,6 +327,8 @@ void EmbeddedDriver::close() noexcept {
 }
 
 void EmbeddedDriver::releaseGso_() noexcept {
+    rune_driver_epoll_poll_free(epollBindings_);   // after aeron_driver_context_close (Aeron pointed at it)
+    epollBindings_ = nullptr;
     if (gso_ == nullptr) return;
     rune_gso_bindings_totals(gso_, &gsoTotals_);
     if (gsoTotals_.gso_fallbacks > 0 || gsoTotals_.gro_disabled > 0)

@@ -40,6 +40,8 @@
 //
 // All Aeron channels use the aeron:udp transport (container transport).
 
+#include <rune/node/IdleShape.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -301,6 +303,61 @@ struct NodeConfig {
     /// The admin thread's idle.
     [[nodiscard]] BackoffShape adminIdleShape() const noexcept {
         return shardMode() ? controlIdleShape() : BackoffShape{};
+    }
+
+    // A7 park-until-work (findings §4.12): shard workers park in ppoll() on their invoker driver's
+    // socket-readiness fds and their io_uring completion fd (rune_driver_wake.h; Linux), woken by the next
+    // datagram / fsync completion and bounded by the backoff park period (1 µs doubling to idleMaxParkUs —
+    // the bound for work that has no fd: cross-thread rings, Aeron timers).  RUNE_IDLE_WAKE=0 → the legacy
+    // Aeron backoff (timed park).  The spin / yield phase BEFORE the first park stays the Aeron 10 / 20 in
+    // both modes (review M1): fd-less work (a ring message from another thread, a conductor command, a
+    // timer) usually lands within microseconds of a busy pass, and a park there costs >= the timer slack.
+    bool idleWake = true;
+    // Idle passes before parking (RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS, a non-negative integer; anything
+    // else refuses startup).  kIdleAuto = the Aeron 10 / 20.
+    static constexpr int32_t kIdleAuto = -1;
+    static constexpr int32_t kAeronIdleSpins  = 10;
+    static constexpr int32_t kAeronIdleYields = 20;
+    int32_t idleSpins  = kIdleAuto;
+    int32_t idleYields = kIdleAuto;
+
+    // A9 ring doorbells (findings §4.15): with park-until-work, the cross-thread rings a shard worker consumes
+    // (runtime → worker ops, session lifecycle, worker → fused-runtime returns, admin → fused-runtime, portable
+    // fsync completions) ring an eventfd in its park set, so ring work ends a park like a datagram does.  Every
+    // wake source a pass can wait on then has an fd — datagrams, io_uring completions, ring messages — so a park
+    // can last idleDoorbellParkUs: what is left without an fd is timers, and every timer on the worker path is
+    // >= 1 ms (Aeron: NAK 60 ms, SM 200 ms, heartbeats 100 ms+, timer interval 1 s; Rune: election status
+    // 20 ms, fetch backstop 5 ms, log sync 10 ms, ack timeout 30 s).
+    // The Aeron spin / yield phase stays in front of the first park (auto 10 / 20, as A7): measured (§4.15)
+    // on the 4-core box at 20k rec/s, dropping it (RUNE_IDLE_SPINS=0 RUNE_IDLE_YIELDS=0) cuts worker CPU ~6 pts
+    // but costs ~+100 µs p50 — every event then pays a park wake on a saturated box.  With the phase kept the
+    // 1 ms doorbell park still cuts idle-cluster worker CPU 30% -> 18% at an unchanged 20k p50.
+    // RUNE_IDLE_DOORBELL=0 → A7's shape exactly (no doorbell, Aeron 10 / 20, 1 µs .. idleMaxParkUs).
+    bool idleDoorbell = true;
+    // The doorbell shape's park: first park (RUNE_IDLE_DOORBELL_MIN_PARK_US) doubling to the timer bound
+    // (RUNE_IDLE_DOORBELL_PARK_US).  Positive integers; anything else refuses startup.
+    int64_t idleDoorbellMinParkUs = 1'000;
+    int64_t idleDoorbellParkUs    = 1'000;
+
+    /// Shard workers park on driver readiness unless RUNE_IDLE_WAKE=0.
+    [[nodiscard]] bool shardIdleWantsWake() const noexcept { return idleWake; }
+    /// The shard-worker backoff shape.  The Aeron spin / yield phase (auto 10 / 20) in both modes (review M1;
+    /// A9 measured).  `doorbell`: the runner parks on a ring doorbell too (A9) — the doorbell park
+    /// (idleDoorbellMinParkUs .. idleDoorbellParkUs); otherwise A7's 1 µs .. idleMaxParkUs.
+    [[nodiscard]] IdleShape shardIdleShape(bool doorbell = false) const noexcept {
+        IdleShape s;
+        if (doorbell) {
+            s.maxSpins  = idleSpins  >= 0 ? idleSpins  : kAeronIdleSpins;
+            s.maxYields = idleYields >= 0 ? idleYields : kAeronIdleYields;
+            s.minParkNs = idleDoorbellMinParkUs * 1'000;
+            s.maxParkNs = idleDoorbellParkUs * 1'000;
+            return s;
+        }
+        s.maxSpins  = idleSpins  >= 0 ? idleSpins  : kAeronIdleSpins;
+        s.maxYields = idleYields >= 0 ? idleYields : kAeronIdleYields;
+        s.minParkNs = 1'000;
+        s.maxParkNs = idleMaxParkUs * 1'000;
+        return s;
     }
 
     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
@@ -584,6 +641,13 @@ struct NodeConfig {
     //     kernel/platform lacks them (stock Aeron).  RUNE_AERON_UDP_GSO=0|false forces stock Aeron (A/B,
     //     fault isolation).  Spec docs/superpowers/specs/2026-10-03-aeron-udp-gso-gro-design.md.
     bool aeronUdpGso = true;
+
+    //   - aeronEpollPoll: A7 (findings §4.12) — the media driver's transport pollers take ONE epoll_wait(0)
+    //     per duty cycle and recvmmsg only the ready sockets, for every poller with > 1 transport (Aeron
+    //     does that only beyond 5 transports and otherwise recvmmsg-s every socket each cycle, mostly
+    //     empty: the top CPU cost of an invoker shard pass).  Delivery unchanged; Linux only (elsewhere
+    //     stock).  RUNE_AERON_EPOLL_POLL=0|false = Aeron's stock poller (A/B, fault isolation).
+    bool aeronEpollPoll = true;
 
     //   - aeronSocketBufferBytes: OS UDP socket SO_SNDBUF / SO_RCVBUF (bytes) for
     //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.

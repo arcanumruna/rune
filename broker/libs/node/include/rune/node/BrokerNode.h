@@ -891,6 +891,7 @@ private:
     std::unique_ptr<AdminWorkerAgent>                     adminWorkerAgent_;
     // Runtime-cycle DDL control plane (direct call; see AdminControlPlane.h).
     friend class AdminControlPlane;
+    void attachFusedRuntimeDoorbell_();   // A9: runtime's cross-thread rings → worker 0's doorbell (fused)
     int serviceAdminControl_();
     AdminControlPlane                                     adminControl_{*this};
     int64_t                                               slowTickIntervalOverrideNs_ = -1;

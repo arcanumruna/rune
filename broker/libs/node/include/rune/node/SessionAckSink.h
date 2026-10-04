@@ -491,7 +491,9 @@ struct AeronSessionPubPolicy {
     template <class Encode>
     int64_t claim(PubHandle& pub, std::size_t len, Encode&& encode) noexcept {
         aeron::concurrent::logbuffer::BufferClaim c;
-        const int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), c);
+        int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), c);
+        if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
+            pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), c);
         if (pos > 0) [[likely]] {
             encode(c.buffer().buffer() + c.offset());               // zero-copy: encode in the claim
             c.commit();

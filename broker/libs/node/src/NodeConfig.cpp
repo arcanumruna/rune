@@ -1037,6 +1037,12 @@ ConfigResult parseNodeConfig(
         else if (v == "0" || v == "false") cfg.aeronUdpGso = false;
         else return {{}, std::string("RUNE_AERON_UDP_GSO must be 0/1/false/true, got '") + raw + "'"};
     }
+    if (const char* raw = getenv_fn("RUNE_AERON_EPOLL_POLL"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.aeronEpollPoll = true;
+        else if (v == "0" || v == "false") cfg.aeronEpollPoll = false;
+        else return {{}, std::string("RUNE_AERON_EPOLL_POLL must be 0/1/false/true, got '") + raw + "'"};
+    }
     if (const char* raw = getenv_fn("RUNE_AERON_TERM_SPARSE"); raw && *raw) {
         const std::string_view v(raw);
         if (v == "false" || v == "0") cfg.aeronTermBufferSparse = false;   // explicit (else derived)
@@ -1219,6 +1225,46 @@ ConfigResult parseNodeConfig(
             if (end != imp && us > 0) cfg.idleMaxParkUs = us;
         }
     }
+
+    // --- A7: RUNE_IDLE_WAKE (default on) / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS (default auto) ---
+    // Shard-worker park-until-work (NodeConfig::idleWake): 0/1/false/true like RUNE_AERON_UDP_GSO; spins /
+    // yields: a non-negative decimal integer (auto = the Aeron 10 / 20, NodeConfig::shardIdleShape).  Anything
+    // else refuses startup (review D3: a typo must never silently measure the other arm).
+    if (const char* raw = getenv_fn("RUNE_IDLE_WAKE"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.idleWake = true;
+        else if (v == "0" || v == "false") cfg.idleWake = false;
+        else return {{}, std::string("RUNE_IDLE_WAKE must be 0/1/false/true, got '") + raw + "'"};
+    }
+    for (auto [name, field] : {std::pair{"RUNE_IDLE_SPINS", &cfg.idleSpins},
+                               std::pair{"RUNE_IDLE_YIELDS", &cfg.idleYields}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            int32_t n{};
+            if (!parseInt32(raw, n) || n < 0)
+                return {{}, std::string(name) + " must be a non-negative integer, got '" + raw + "'"};
+            *field = n;
+        }
+    }
+    // --- A9: RUNE_IDLE_DOORBELL (default on) / RUNE_IDLE_DOORBELL_MIN_PARK_US / RUNE_IDLE_DOORBELL_PARK_US ---
+    // (NodeConfig::idleDoorbell).  Garbage refuses startup, like the A7 knobs.
+    if (const char* raw = getenv_fn("RUNE_IDLE_DOORBELL"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.idleDoorbell = true;
+        else if (v == "0" || v == "false") cfg.idleDoorbell = false;
+        else return {{}, std::string("RUNE_IDLE_DOORBELL must be 0/1/false/true, got '") + raw + "'"};
+    }
+    for (auto [name, field] : {std::pair{"RUNE_IDLE_DOORBELL_MIN_PARK_US", &cfg.idleDoorbellMinParkUs},
+                               std::pair{"RUNE_IDLE_DOORBELL_PARK_US", &cfg.idleDoorbellParkUs}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            int32_t n{};
+            if (!parseInt32(raw, n) || n <= 0 || n > 1'000'000)
+                return {{}, std::string(name) + " must be an integer in 1..1000000, got '" + raw + "'"};
+            *field = n;
+        }
+    }
+    if (cfg.idleDoorbellMinParkUs > cfg.idleDoorbellParkUs)
+        return {{}, "RUNE_IDLE_DOORBELL_MIN_PARK_US (" + std::to_string(cfg.idleDoorbellMinParkUs) +
+                    ") must not exceed RUNE_IDLE_DOORBELL_PARK_US (" + std::to_string(cfg.idleDoorbellParkUs) + ")"};
 
     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
     // When "1" or "true", each worker gets its own Aeron subscription and the

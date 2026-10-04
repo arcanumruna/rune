@@ -162,6 +162,22 @@ public:
         return 0;
     }
 
+    /// A7 review M1: an fd that is readable while completions wait to be reaped (io_uring: the ring fd), so
+    /// a parked worker wakes on them; -1 when the backend has none (portable: its flusher thread hands
+    /// completions over a ring — bounded by the park cap).
+    [[nodiscard]] int completionFd() const noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) return uring_->completionFd();
+#endif
+        return -1;
+    }
+
+    /// A9: the portable backend's completions ring the worker's doorbell (its flusher thread is the producer;
+    /// called from the Worker ctor, before anything is submitted).  io_uring has its ring fd instead.
+    void attachCompletionDoorbell(detail::RingDoorbell& bell) noexcept {
+        if (kind_ == IoBackendKind::Portable) portable_->attachCompletionDoorbell(bell);
+    }
+
     [[nodiscard]] bool acceptsSubmissions() const noexcept { return kind_ != IoBackendKind::Invalid; }
     /// Non-empty when the AUTO-selected io_uring could not be set up and this
     /// backend fell back to portable (the setup error).  Cold (startup log).

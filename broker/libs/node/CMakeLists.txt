@@ -58,6 +58,21 @@ target_link_libraries(rune_node PUBLIC spdlog::spdlog)
 # UDP GSO/GRO Aeron transport bindings (EmbeddedDriver, HostDefaults probe).
 target_link_libraries(rune_node PUBLIC rune_gso)
 
+# A7 park-until-work + epoll-first polling (review L4: ONE copy, shared with rune-client-cpp): the rune-protocol
+# sibling C source, like rune_gso.  Aeron's internal driver headers are C; they include siblings relative to
+# <root>, <root>/aeron, <root>/aeronmd (same probe as rune_gso).  Non-Linux compiles a stub (0 fds -> timed park).
+add_library(rune_driver_wake STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_driver_wake.c)
+set_target_properties(rune_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rune_driver_wake PUBLIC ${RUNE_PROTOCOL_INCLUDE})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(rune_driver_wake PRIVATE aeron::aeron)
+    foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+        target_include_directories(rune_driver_wake PRIVATE
+            "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+    endforeach()
+endif()
+target_link_libraries(rune_node PUBLIC rune_driver_wake)
+
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
 
@@ -104,6 +119,8 @@ if(BUILD_TESTING)
         tests/node/LeaderObserverTest.cpp
         tests/node/OwnerThreadTestTaskTest.cpp
         tests/node/ThreadAffinityTest.cpp
+        tests/node/ParkUntilWorkIdleTest.cpp
+        tests/node/RingDoorbellTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
@@ -792,6 +809,12 @@ if(BUILD_TESTING)
             add_executable(rune_aeron_pump_tests tests/node/AeronPumpInvokerTest.cpp)
             target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # A9: worker ring doorbells (op / session / ret_ space wait), parked shard runner wake,
+            # ADMIN_ACTION retry on worker claims — REAL invoker driver.
+            add_executable(rune_worker_doorbell_tests tests/node/WorkerDoorbellTest.cpp)
+            target_link_libraries(rune_worker_doorbell_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_worker_doorbell_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             add_executable(rune_shard_agent_tests tests/node/ShardAgentTest.cpp)
             target_link_libraries(rune_shard_agent_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)

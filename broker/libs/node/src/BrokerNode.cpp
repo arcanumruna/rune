@@ -395,6 +395,11 @@ void BrokerNode::start() {
     //    FIFO order, on that worker's first pass.
     if (workerPool_) workerPool_->armRingOwnership();
 
+    // A9 (review M-1): ring doorbells only where a shard runner parks on them — wired here, before ANY
+    // producer thread of a worker ring exists (the control thread just below in thread placement).
+    if (workerPool_ && config_.shardMode())
+        (void)workerPool_->enableShardDoorbells(shardAgents_, config_, config_.fused());
+
     // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
     //    consensus + gateway on the single-writer thread).
     //    Spec §3.2: in fused placement the runtime has no thread of its own.
@@ -415,12 +420,12 @@ void BrokerNode::start() {
                 // pass — exactly one pumper at any time.
                 shardAgents_.at(0)->setFusedRuntime(runtimeAgent_.get(), nodeDriver_.get(), aeron_.get());
                 stopStartupPump_();
+                attachFusedRuntimeDoorbell_();   // A9: before the other workers / admin thread produce
             }
             // Backoff idle by default (never busy-spin unless explicitly opted in:
             // RUNE_WORKER_IDLE=busyspin) — pinned or not.
-            workerPool_->startShardRunners(shardAgents_, clock_,
-                                           /*busySpin=*/config_.shardWorkersBusySpin(),
-                                           config_.idleMaxParkUs);
+            // A7: park-until-work on each shard's driver readiness (RUNE_IDLE_WAKE, default on).
+            workerPool_->startShardRunners(shardAgents_, clock_, config_);
         } else {
             workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
         }
@@ -2953,6 +2958,38 @@ int BrokerNode::serviceAdminControl_() {
 }
 
 int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+
+// ---------------------------------------------------------------------------
+// A9 (findings §4.15): fused placement — the runtime runs in worker 0's pass, so the cross-thread rings the
+// RUNTIME consumes ring worker 0's doorbell: every other worker's return ring and the admin thread's three
+// admin → control rings (all drained unconditionally each runtime pass).  Startup only: called before the
+// other workers' runners and the admin thread start (their first commit happens-after the attach).  A ring the
+// doorbell cannot watch (full) is left unattached — bounded by the park cap, logged.
+// ---------------------------------------------------------------------------
+void BrokerNode::attachFusedRuntimeDoorbell_() {
+    // Review M-1: only when worker 0's runner parks on its doorbell.
+    if (!workerPool_ || shardAgents_.empty() || !shardAgents_.front()->doorbellEnabled()) return;
+    detail::RingDoorbell& bell = shardAgents_.front()->doorbell();
+    int attached = 0, refused = 0;
+    auto attach = [&](OneToOneByteRing& ring) { (ring.attachConsumerDoorbell(bell) ? attached : refused)++; };
+    for (int32_t w = 1; w < workerPool_->workerCount(); ++w) {
+        Worker& wk = workerPool_->worker(w);
+        attach(wk.returnRingForDoorbell());
+        // Review M-2: the runtime PRODUCES into worker w's op + session rings; a refused claim (ring full)
+        // arms the ring's space wait, and worker w's drain rings worker 0 — runtime retries ("next cycle")
+        // never wait out a park.
+        wk.opRingForDoorbell().attachProducerDoorbell(bell);
+        wk.sessionRingForDoorbell().attachProducerDoorbell(bell);
+    }
+    if (auto* admin = adminWorkerAgent_.get()) {
+        attach(admin->failureRing());
+        attach(admin->createReqRing());
+        attach(admin->egressRing());
+    }
+    if (refused != 0)
+        spdlog::warn("BrokerNode[{}]: fused runtime doorbell full — {} ring(s) attached, {} bounded by the park cap",
+                     config_.nodeId, attached, refused);
+}
 
 // ---------------------------------------------------------------------------
 // BrokerNode::runtimePathIsConcrete_ — Task 11 fix 2: every call the runtime duty

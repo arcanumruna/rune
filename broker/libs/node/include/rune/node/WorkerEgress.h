@@ -130,6 +130,8 @@ public:
         if (len <= static_cast<std::size_t>(pub_->maxPayloadLength())) {
             aeron::concurrent::logbuffer::BufferClaim claim;
             int64_t pos = pub_->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
+                pos = pub_->tryClaim(static_cast<aeron::util::index_t>(len), claim);
             if (pos > 0) {
                 claim.buffer().putBytes(claim.offset(), buf, 0,
                                         static_cast<aeron::util::index_t>(len));
@@ -139,7 +141,8 @@ public:
         }
         // Larger than one MTU fragment: offer() fragments it; the client's egress
         // FragmentAssembler reassembles.
-        return pub_->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        const int64_t r = pub_->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        return r == aeron::ADMIN_ACTION ? pub_->offer(buf, 0, static_cast<aeron::util::index_t>(len)) : r;
     }
 
 private:
