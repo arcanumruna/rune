@@ -328,10 +328,14 @@ int Election::canvass(int64_t nowNs)
     }
 
     // Election.java:720-727: check candidate readiness
-    // MAJOR-2/3 candidacy rule: a node outside the newest durable internal ISR
-    // does not nominate (it keeps canvassing and votes for eligible peers).
+    // The candidacy rule (setVoteGate) is applied by VOTERS only (re-review
+    // 2026-10-04 MAJOR-A): this node may stand whatever its own — possibly
+    // stale — internal-ISR knowledge says; a candidate outside the newest
+    // committed ISR is denied by the voters (any grant majority intersects the
+    // commit majority).  A self-gate turned stale self-knowledge into a
+    // permanently headless consensus.
     ClusterMember* thisM = memberById(thisMemberId_);
-    if (thisM != nullptr && mayVoteFor(thisMemberId_)) {
+    if (thisM != nullptr) {
         // Election.java:720: isUnanimousCandidate
         if (ClusterMember::isUnanimousCandidate(clusterMembers_, *thisM, gracefulClosedLeaderId_)) {
             // Election.java:723-725: random backoff
@@ -359,12 +363,6 @@ int Election::canvass(int64_t nowNs)
 // ---------------------------------------------------------------------------
 int Election::nominate(int64_t nowNs)
 {
-    // MAJOR-2/3: the candidacy rule may have turned against us since CANVASS
-    // (newer internal-ISR knowledge arrived): stand down.
-    if (!mayVoteFor(thisMemberId_)) {
-        state(ElectionState::Canvass, nowNs, "not in the newest internal ISR");
-        return 1;
-    }
     // Election.java:734-741: if deadline passed → become candidate
     if (nowNs >= nominationDeadlineNs_) {
         // Election.java:736-737: proposeMaxCandidateTermId(candidateTermId+1, logPosition, time)

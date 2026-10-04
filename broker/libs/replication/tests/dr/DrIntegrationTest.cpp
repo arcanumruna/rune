@@ -1463,3 +1463,86 @@ TEST(DrIntegrationRegression, Rev3Major3_StuckLiveInternalReplicaShrunk_ControlP
     c.applyMetadata(1);
     expectAllConvergedAndAcked(c, "rev3 major-3 stuck internal replica");
 }
+
+// Re-review 2026-10-04 (fix round 2) MAJOR-A: stale self-knowledge + the
+// self-candidacy gate left the consensus permanently headless.  Node 3 is
+// fenced out (v2 = {1,2}, which it receives), re-admitted while node 2 is
+// fenced (v4 = {1,3}, committed on {1,2}) — but node 3 misses v4.  Node 1 dies:
+// node 2 grants only {1,3} and node 3 (believing v2) refused to stand itself,
+// so nobody ever nominated although 2 of 3 are up and node 3 is caught up.
+// Fixed: only VOTERS apply the candidacy rule (a node always may stand; any
+// grant majority intersects the commit majority), and the internal leader
+// keeps re-sending the committed state to replicas that have not acked it.
+TEST(DrIntegrationRegression, StaleSelfKnowledge_ConsensusNotHeadless) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).internalSeedPendingForTest(); }, kCap));
+    // 3 consensus-dead (data plane fine): fenced out; it RECEIVES that state.
+    c.cut(3, kControllerAddr);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).isrProposalPendingForTest() && !c.leaderIsrContains(3);
+    }, kCap));
+    c.run(20);
+    // 3's link from the leader drops (its fetches still reach 1); 3 live again,
+    // 2 now consensus-dead: 3 re-admitted, 2 removed — 3 never hears of it.
+    c.cut(1, 3);
+    c.heal(3, kControllerAddr);
+    c.cut(2, kControllerAddr);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).isrProposalPendingForTest() && c.leaderIsrContains(3) &&
+               !c.leaderIsrContains(2);
+    }, kCap)) << c.dump();
+    c.run(50);
+    const auto* k3 = c.node(3).isrKnowledge->latest(-3, kPartId);
+    ASSERT_NE(k3, nullptr);
+    ASSERT_FALSE(k3->contains(3)) << "precondition: node 3's newest durable state excludes itself";
+    ASSERT_EQ(c.rep(3).logEndOffset(), c.rep(1).logEndOffset()) << "precondition: node 3 caught up";
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    const NodeId nl = c.consensusElect(3);
+    ASSERT_EQ(nl, 3) << "headless: nobody stands although 2 of 3 are up and node 3 is caught up\n"
+                     << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "re-review2 major-a stale self-knowledge");
+}
+
+// Re-review 2026-10-04 (fix round 2) MAJOR-A, anti-entropy: a replica that
+// missed the frame of a COMMITTED internal ISR state (one lost frame) was never
+// told again — the leader re-sent only while the change was pending.  Fixed:
+// the leader keeps re-sending the committed state to every replica that has not
+// acked it, so knowledge converges without depending on a lucky frame.
+TEST(DrIntegrationRegression, CommittedInternalIsrResentUntilAcked_KnowledgeConverges) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return !c.rep(1).internalSeedPendingForTest(); }, kCap));
+    // Fence node 3 out; the InternalIsr frames to node 3 are lost on the wire
+    // while the change commits on {1,2}.
+    c.cut(1, 3);
+    c.cut(3, kControllerAddr);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).isrProposalPendingForTest() && !c.leaderIsrContains(3);
+    }, kCap)) << c.dump();
+    const auto* k1 = c.node(1).isrKnowledge->latest(-3, kPartId);
+    ASSERT_NE(k1, nullptr);
+    const int64_t e = k1->leaderEpoch, v = k1->version;
+    const auto* k3 = c.node(3).isrKnowledge->latest(-3, kPartId);
+    ASSERT_TRUE(k3 == nullptr || !(k3->leaderEpoch == e && k3->version == v))
+        << "precondition: node 3 missed the committed state";
+    // The link heals; no further ISR change happens.
+    c.heal(1, 3);
+    EXPECT_TRUE(c.driveUntil([&] {
+        const auto* s = c.node(3).isrKnowledge->latest(-3, kPartId);
+        return s != nullptr && !c.rep(1).isrProposalPendingForTest() &&
+               s->leaderEpoch == c.node(1).isrKnowledge->latest(-3, kPartId)->leaderEpoch &&
+               s->version == c.node(1).isrKnowledge->latest(-3, kPartId)->version;
+    }, 500)) << "node 3 never learned the committed internal ISR\n" << c.dump();
+}

@@ -978,23 +978,29 @@ TEST(ElectionBallotRegression, VoteGate_DeniesCandidateOutsideInternalIsr) {
     EXPECT_TRUE(pub.placeVoteCalls[0].vote) << "an eligible candidate must still get the vote";
 }
 
-// A gated-out node does not nominate itself, even as a unanimous candidate.
-TEST(ElectionBallotRegression, VoteGate_IneligibleNodeNeverNominates) {
+// Re-review 2026-10-04 (fix round 2) MAJOR-A: the candidacy rule is applied
+// by VOTERS only.  A node whose OWN knowledge excludes itself (stale: it missed
+// the frame that re-admitted it) still stands — the voters decide (any grant
+// majority intersects the commit majority).  The old self-gate turned stale
+// self-knowledge into a permanently headless consensus.  (Replaces
+// VoteGate_IneligibleNodeNeverNominates, which pinned the self-gate.)
+TEST(ElectionBallotRegression, VoteGate_StaleSelfKnowledgeStillStands) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
     FakeConsensusPublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
-    GateCtx g{/*denied=*/0};                     // self
+    GateCtx g{/*denied=*/0};                     // self's own knowledge excludes self
     e.setVoteGate(&denyOne, &g);
     int64_t nowNs = 1'000'000LL;
     e.doWork(nowNs);                             // INIT → CANVASS
     e.onCanvassPosition(0, 0, 0, 1);
     e.onCanvassPosition(0, 0, 0, 2);
-    for (int i = 0; i < 20; ++i) { nowNs += kElectionTimeoutNs; e.doWork(nowNs); }
-    EXPECT_EQ(e.state(), ElectionState::Canvass) << "an ineligible node stood for election";
-    EXPECT_EQ(e.candidateTermId(), 0);
-    g.denied = -1;                               // newer knowledge re-admits it
-    e.doWork(nowNs += 1'000LL);
-    EXPECT_EQ(e.state(), ElectionState::Nominate);
+    for (int i = 0; i < 20 && e.state() != ElectionState::CandidateBallot; ++i) {
+        nowNs += kElectionTimeoutNs;
+        e.doWork(nowNs);
+    }
+    EXPECT_EQ(e.state(), ElectionState::CandidateBallot)
+        << "a node with stale self-knowledge refused to stand (headless consensus)";
+    EXPECT_GE(e.candidateTermId(), 1);
 }

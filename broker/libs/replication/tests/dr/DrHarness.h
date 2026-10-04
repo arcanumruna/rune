@@ -345,9 +345,9 @@ public:
     }
     /// INTERNAL partition: the CONSENSUS election (Aeron Election) that picks
     /// the internal leader.  A candidate wins with votes from a majority of the
-    /// live (up, consensus-reachable) nodes, its own included; a node votes for
-    /// a candidate (and stands itself) only if consensusVoteGate_(voter,
-    /// candidate) allows it.  `preferred` wins when electable (e.g. the node
+    /// live (up, consensus-reachable) nodes, its own included; any live node
+    /// may stand, and another node votes for it only if
+    /// consensusVoteGate_(voter, candidate) allows it.  `preferred` wins when electable (e.g. the node
     /// whose election timer fired first), else the lowest electable id.
     /// Epoch + 1, the assignment goes to every reachable node.  Returns the new
     /// leader, -1 = nobody electable (the consensus stays leaderless).
@@ -876,9 +876,12 @@ private:
         for (auto& n : nodes_)
             if (n.up && cut_.count({n.id, kControllerAddr}) == 0) live.push_back(n.id);
         if (std::find(live.begin(), live.end(), cand) == live.end()) return false;
-        std::size_t votes = 0;
-        for (NodeId v : live) if (consensusVoteGate_(v, cand)) ++votes;
-        return consensusVoteGate_(cand, cand) && votes >= nodes_.size() / 2 + 1;
+        // A candidate always may stand and votes for itself (Aeron
+        // becomeCandidate); only the OTHER voters apply the candidacy rule
+        // (re-review MAJOR-A: no self-gate).
+        std::size_t votes = 1;
+        for (NodeId v : live) if (v != cand && consensusVoteGate_(v, cand)) ++votes;
+        return votes >= nodes_.size() / 2 + 1;
     }
     rune::storage::ProducerStateManager psm_;
     uint64_t                psmGen_   = 0;

@@ -226,12 +226,13 @@ public:
                           NodeId  leaderMemberId);
 
     /// Review 2026-10-04 MAJOR-2/3 — candidacy rule.  `fn(ctx, candidate)`
-    /// decides whether this node may vote for `candidate` (and whether it may
-    /// stand itself: `fn(ctx, thisMemberId())`).  The broker wires it to
-    /// InternalIsrKnowledge::eligible: a node outside the newest durable ISR of
-    /// the internal partitions (which the consensus leader leads) never gathers
-    /// a majority — it would lead them without their committed records.  A
-    /// denied RequestVote is answered like a "my log is newer" deny.  nullptr
+    /// decides whether this node may VOTE for `candidate`.  The broker wires it
+    /// to InternalIsrKnowledge::eligible: a node outside the newest durable ISR
+    /// of __cluster_metadata (which the consensus leader leads) never gathers a
+    /// majority — it would lead it without its committed records.  A denied
+    /// RequestVote is answered like a "my log is newer" deny.  Applied by
+    /// voters only: a node always may stand (re-review MAJOR-A — its own
+    /// knowledge may be stale; the voters' majority decides).  nullptr
     /// (default) = everyone eligible (data-blind, as Aeron).  Duty-cycle thread.
     using VoteGate = bool (*)(void* ctx, NodeId candidate) noexcept;
     void setVoteGate(VoteGate fn, void* ctx) noexcept { voteGate_ = fn; voteGateCtx_ = ctx; }

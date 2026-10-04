@@ -2002,6 +2002,17 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
 bool PartitionReplica::updateIsr_(int64_t nowNs)
 {
     if (role_ != Role::Leader || isrManager_ == nullptr) return false;
+    if (internalQuorum_() && !isrProposal_.pending && internalIsrVersion_ > 0 &&
+        nowNs - isrProposal_.sentNs >= kAlterIsrResendNs) {
+        // Anti-entropy (re-review 2026-10-04 MAJOR-A): after a commit,
+        // isrProposal_ still holds the COMMITTED (version, members); keep
+        // re-sending it to every replica that has not acked it (a lost frame,
+        // a node that was down) — knowledge converges without a lucky frame.
+        // Cold: one small frame per un-acked replica per resend interval.
+        const uint32_t all = followerSlots_.size() >= 32
+            ? ~0u : ((1u << followerSlots_.size()) - 1u);
+        if ((internalIsrAcks_ & all) != all) publishInternalIsr_(nowNs);
+    }
     if ((isrChannel_ != nullptr || internalQuorum_()) && isrProposal_.pending) {
         // One proposal in flight: re-send it until the controller (internal:
         // a majority of the replicas) commits it or another committed change
@@ -2161,7 +2172,9 @@ void PartitionReplica::maybeCommitInternalIsr_()
 
 void PartitionReplica::onInternalIsrAck(const InternalIsrAckMsg& m)
 {
-    if (!internalQuorum_() || role_ != Role::Leader || !isrProposal_.pending) return;
+    // Pending: the ack counts toward the commit majority.  Committed: it stops
+    // the anti-entropy re-send to that replica (MAJOR-A).
+    if (!internalQuorum_() || role_ != Role::Leader || internalIsrVersion_ == 0) return;
     if (m.leaderEpoch != epoch_ || m.version < isrProposal_.version) return;   // an older state
     const int idx = slotIndex_(m.followerId);
     if (idx < 0) return;

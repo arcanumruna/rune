@@ -1233,7 +1233,8 @@ private:
     InternalIsrKnowledge* isrKnowledge_     = nullptr;
     bool     internalSeedPending_ = false;   ///< leadership seed (every replica) not yet replaced by a committed ISR
     int64_t  internalIsrVersion_  = 0;       ///< last version published in this leadership
-    uint32_t internalIsrAcks_     = 0;       ///< slot bits of replicas holding the pending version
+    uint32_t internalIsrAcks_     = 0;       ///< slot bits of replicas holding the latest published version
+                                             ///< (pending: commit quorum; committed: anti-entropy re-send until all ack)
     uint32_t internalFencedMask_  = 0;       ///< slot bits the cluster considers dead (shrinkIsrToLive)
     [[nodiscard]] bool internalQuorum_() const noexcept { return isrKnowledge_ != nullptr; }
     void publishInternalIsr_(int64_t nowNs);
