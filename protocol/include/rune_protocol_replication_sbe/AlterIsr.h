@@ -116,7 +116,7 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(156);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(92);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(7);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(112);
     static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(3);
@@ -174,7 +174,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(156);
+        return static_cast<std::uint16_t>(92);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -793,7 +793,7 @@ public:
         return *this;
     }
 
-    SBE_NODISCARD static const char *baseIsrCountMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    SBE_NODISCARD static const char *partitionEpochMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
         {
@@ -802,220 +802,57 @@ public:
         }
     }
 
-    static SBE_CONSTEXPR std::uint16_t baseIsrCountId() SBE_NOEXCEPT
+    static SBE_CONSTEXPR std::uint16_t partitionEpochId() SBE_NOEXCEPT
     {
         return 7;
     }
 
-    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t baseIsrCountSinceVersion() SBE_NOEXCEPT
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t partitionEpochSinceVersion() SBE_NOEXCEPT
     {
         return 0;
     }
 
-    SBE_NODISCARD bool baseIsrCountInActingVersion() SBE_NOEXCEPT
+    SBE_NODISCARD bool partitionEpochInActingVersion() SBE_NOEXCEPT
     {
         return true;
     }
 
-    SBE_NODISCARD static SBE_CONSTEXPR std::size_t baseIsrCountEncodingOffset() SBE_NOEXCEPT
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t partitionEpochEncodingOffset() SBE_NOEXCEPT
     {
         return 88;
     }
 
-    static SBE_CONSTEXPR std::int32_t baseIsrCountNullValue() SBE_NOEXCEPT
+    static SBE_CONSTEXPR std::int32_t partitionEpochNullValue() SBE_NOEXCEPT
     {
         return SBE_NULLVALUE_INT32;
     }
 
-    static SBE_CONSTEXPR std::int32_t baseIsrCountMinValue() SBE_NOEXCEPT
+    static SBE_CONSTEXPR std::int32_t partitionEpochMinValue() SBE_NOEXCEPT
     {
         return INT32_C(-2147483647);
     }
 
-    static SBE_CONSTEXPR std::int32_t baseIsrCountMaxValue() SBE_NOEXCEPT
+    static SBE_CONSTEXPR std::int32_t partitionEpochMaxValue() SBE_NOEXCEPT
     {
         return INT32_C(2147483647);
     }
 
-    static SBE_CONSTEXPR std::size_t baseIsrCountEncodingLength() SBE_NOEXCEPT
+    static SBE_CONSTEXPR std::size_t partitionEpochEncodingLength() SBE_NOEXCEPT
     {
         return 4;
     }
 
-    SBE_NODISCARD std::int32_t baseIsrCount() const SBE_NOEXCEPT
+    SBE_NODISCARD std::int32_t partitionEpoch() const SBE_NOEXCEPT
     {
         std::int32_t val;
         std::memcpy(&val, m_buffer + m_offset + 88, sizeof(std::int32_t));
         return SBE_LITTLE_ENDIAN_ENCODE_32(val);
     }
 
-    AlterIsr &baseIsrCount(const std::int32_t value) SBE_NOEXCEPT
+    AlterIsr &partitionEpoch(const std::int32_t value) SBE_NOEXCEPT
     {
         std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
         std::memcpy(m_buffer + m_offset + 88, &val, sizeof(std::int32_t));
-        return *this;
-    }
-
-    SBE_NODISCARD static const char *baseIsrMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
-    {
-        switch (metaAttribute)
-        {
-            case MetaAttribute::PRESENCE: return "required";
-            default: return "";
-        }
-    }
-
-    static SBE_CONSTEXPR std::uint16_t baseIsrId() SBE_NOEXCEPT
-    {
-        return 8;
-    }
-
-    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t baseIsrSinceVersion() SBE_NOEXCEPT
-    {
-        return 0;
-    }
-
-    SBE_NODISCARD bool baseIsrInActingVersion() SBE_NOEXCEPT
-    {
-        return true;
-    }
-
-    SBE_NODISCARD static SBE_CONSTEXPR std::size_t baseIsrEncodingOffset() SBE_NOEXCEPT
-    {
-        return 92;
-    }
-
-    static SBE_CONSTEXPR std::int32_t baseIsrNullValue() SBE_NOEXCEPT
-    {
-        return SBE_NULLVALUE_INT32;
-    }
-
-    static SBE_CONSTEXPR std::int32_t baseIsrMinValue() SBE_NOEXCEPT
-    {
-        return INT32_C(-2147483647);
-    }
-
-    static SBE_CONSTEXPR std::int32_t baseIsrMaxValue() SBE_NOEXCEPT
-    {
-        return INT32_C(2147483647);
-    }
-
-    static SBE_CONSTEXPR std::size_t baseIsrEncodingLength() SBE_NOEXCEPT
-    {
-        return 64;
-    }
-
-    static SBE_CONSTEXPR std::uint64_t baseIsrLength() SBE_NOEXCEPT
-    {
-        return 16;
-    }
-
-    SBE_NODISCARD const char *baseIsr() const SBE_NOEXCEPT
-    {
-        return m_buffer + m_offset + 92;
-    }
-
-    SBE_NODISCARD char *baseIsr() SBE_NOEXCEPT
-    {
-        return m_buffer + m_offset + 92;
-    }
-
-    SBE_NODISCARD std::int32_t baseIsr(const std::uint64_t index) const
-    {
-        if (index >= 16)
-        {
-            throw std::runtime_error("index out of range for baseIsr [E104]");
-        }
-
-        std::int32_t val;
-        std::memcpy(&val, m_buffer + m_offset + 92 + (index * 4), sizeof(std::int32_t));
-        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
-    }
-
-    AlterIsr &baseIsr(const std::uint64_t index, const std::int32_t value)
-    {
-        if (index >= 16)
-        {
-            throw std::runtime_error("index out of range for baseIsr [E105]");
-        }
-
-        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
-        std::memcpy(m_buffer + m_offset + 92 + (index * 4), &val, sizeof(std::int32_t));
-        return *this;
-    }
-
-    std::uint64_t getBaseIsr(char *const dst, const std::uint64_t length) const
-    {
-        if (length > 16)
-        {
-            throw std::runtime_error("length too large for getBaseIsr [E106]");
-        }
-
-        std::memcpy(dst, m_buffer + m_offset + 92, sizeof(std::int32_t) * static_cast<std::size_t>(length));
-        return length;
-    }
-
-    #ifdef SBE_USE_SPAN
-    SBE_NODISCARD std::span<const std::int32_t> getBaseIsrAsSpan() const SBE_NOEXCEPT
-    {
-        const char *buffer = m_buffer + m_offset + 92;
-        return std::span<const std::int32_t>(reinterpret_cast<const std::int32_t*>(buffer), 16);
-    }
-    #endif
-
-    #ifdef SBE_USE_SPAN
-    template <std::size_t N>
-    AlterIsr &putBaseIsr(std::span<const std::int32_t, N> src) SBE_NOEXCEPT
-    {
-        static_assert(N <= 16, "array too large for putBaseIsr");
-
-        if (N > 0)
-        {
-            std::memcpy(m_buffer + m_offset + 92, src.data(), sizeof(std::int32_t) * N);
-        }
-
-        for (std::size_t start = N; start < 16; ++start)
-        {
-            m_buffer[m_offset + 92 + start] = 0;
-        }
-
-        return *this;
-    }
-    #endif
-
-    #ifdef SBE_USE_SPAN
-    AlterIsr &putBaseIsr(std::span<const std::int32_t> src)
-    {
-        const std::size_t srcLength = src.size();
-        if (srcLength > 16)
-        {
-            throw std::runtime_error("array too large for putBaseIsr [E106]");
-        }
-
-        if (srcLength > 0)
-        {
-            std::memcpy(m_buffer + m_offset + 92, src.data(), sizeof(std::int32_t) * srcLength);
-        }
-
-        for (std::size_t start = srcLength; start < 16; ++start)
-        {
-            m_buffer[m_offset + 92 + start] = 0;
-        }
-
-        return *this;
-    }
-    #endif
-
-    #ifdef SBE_USE_SPAN
-    template <typename T>
-    AlterIsr &putBaseIsr(T&& src)  SBE_NOEXCEPT requires
-        (std::is_pointer_v<std::remove_reference_t<T>> &&
-         !std::is_array_v<std::remove_reference_t<T>>)
-    #else
-    AlterIsr &putBaseIsr(const char *const src) SBE_NOEXCEPT
-    #endif
-    {
-        std::memcpy(m_buffer + m_offset + 92, src, sizeof(std::int32_t) * 16);
         return *this;
     }
 
@@ -1069,21 +906,8 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ']';
 
     builder << ", ";
-    builder << R"("baseIsrCount": )";
-    builder << +writer.baseIsrCount();
-
-    builder << ", ";
-    builder << R"("baseIsr": )";
-    builder << '[';
-    for (std::size_t i = 0, length = writer.baseIsrLength(); i < length; i++)
-    {
-        if (i)
-        {
-            builder << ',';
-        }
-        builder << +writer.baseIsr(i);
-    }
-    builder << ']';
+    builder << R"("partitionEpoch": )";
+    builder << +writer.partitionEpoch();
 
     builder << '}';
 

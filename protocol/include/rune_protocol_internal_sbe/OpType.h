@@ -51,6 +51,7 @@ public:
         OFFSETS_FOR_LEADER_EPOCH_RESP = static_cast<std::uint8_t>(15),
         RECONCILE_FETCH_REQ = static_cast<std::uint8_t>(16),
         SET_ADMISSION_POLICY = static_cast<std::uint8_t>(17),
+        ALTER_ISR_RESPONSE = static_cast<std::uint8_t>(18),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -77,6 +78,7 @@ public:
             case static_cast<std::uint8_t>(15): return OFFSETS_FOR_LEADER_EPOCH_RESP;
             case static_cast<std::uint8_t>(16): return RECONCILE_FETCH_REQ;
             case static_cast<std::uint8_t>(17): return SET_ADMISSION_POLICY;
+            case static_cast<std::uint8_t>(18): return ALTER_ISR_RESPONSE;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -106,6 +108,7 @@ public:
             case OFFSETS_FOR_LEADER_EPOCH_RESP: return "OFFSETS_FOR_LEADER_EPOCH_RESP";
             case RECONCILE_FETCH_REQ: return "RECONCILE_FETCH_REQ";
             case SET_ADMISSION_POLICY: return "SET_ADMISSION_POLICY";
+            case ALTER_ISR_RESPONSE: return "ALTER_ISR_RESPONSE";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

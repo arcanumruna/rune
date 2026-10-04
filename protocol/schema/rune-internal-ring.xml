@@ -69,8 +69,12 @@
       <validValue name="RECONCILE_FETCH_REQ">16</validValue>
       <!-- F15 (m1, handled in step S9): control → every worker, the runtime's
            min-ISR admission policy (retried until delivered; latest supersedes).
-           18 stays free. -->
+           (18 = ALTER_ISR_RESPONSE.) -->
       <validValue name="SET_ADMISSION_POLICY">17</validValue>
+      <!-- AlterIsrResponse (controller answer) routed to the owning worker of a
+           USER partition leader: roleEpoch = leaderEpoch, rolePartitionEpoch,
+           replErrorCode = the controller's error code. -->
+      <validValue name="ALTER_ISR_RESPONSE">18</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -202,6 +206,11 @@
     <!-- KIP-320/595 (replication schema v3), process-local copy:
          FETCH_REQUEST: the follower's lastFetchedEpoch (-1 = none). -->
     <field name="frLastFetchedEpoch"     id="50" type="int32"/>
+    <!-- BECOME_LEADER / ALTER_ISR_RESPONSE: the committed assignment's partition
+         epoch (AlterIsr compare-and-set). -->
+    <field name="rolePartitionEpoch"     id="51" type="int32"/>
+    <!-- FETCH_REQUEST: the follower's process incarnation (KIP-903; 0 = unknown). -->
+    <field name="frIncarnation"          id="52" type="int64"/>
     <!-- which variable field the tail holds -->
     <field name="tailKind"        id="43" type="TailKind"/>
     <!-- variable tail (record batch / replicated records / isr / owned-set) -->

@@ -52,6 +52,11 @@
          sender predates v3 = no lineage validation).  The leader validates
          (fetchOffset, lastFetchedEpoch) against its own epoch lineage on EVERY fetch. -->
     <field name="lastFetchedEpoch" id="7" type="int32" sinceVersion="3"/>
+    <!-- v3 (KIP-903): the follower PROCESS incarnation (monotonic per node, bumped on
+         every start; 0 = unknown).  The leader ignores a fetch from an incarnation
+         older than one it has already seen from that follower (a frame of a dead
+         process), so it never credits a position the restarted follower may have lost. -->
+    <field name="incarnation" id="8" type="int64" sinceVersion="3"/>
   </sbe:message>
 
   <!-- ====================================================================== -->
@@ -128,20 +133,65 @@
   <!-- commits it to the metadata log (partitionEpoch + 1) and every node applies -->
   <!-- it.  The leader's HW counts the maximal ISR (committed ∪ proposed) until  -->
   <!-- then; the controller elects only from the committed ISR.                  -->
-  <!-- baseIsr = the committed ISR the proposal was derived from: the controller -->
-  <!-- commits it only if that is still the committed ISR (compare-and-set, the  -->
-  <!-- analog of Kafka's partitionEpoch check) — a stale / re-ordered proposal   -->
-  <!-- is never committed.                                                       -->
+  <!-- partitionEpoch = the partition epoch of the committed assignment the     -->
+  <!-- proposal was derived from: the controller commits it only while that is  -->
+  <!-- still the committed partitionEpoch (Kafka's compare-and-set — monotonic, -->
+  <!-- so no ABA: a stale / re-ordered proposal is never committed).            -->
   <!-- ====================================================================== -->
   <sbe:message name="AlterIsr" id="7" description="ISR change proposal" sinceVersion="3">
-    <field name="topicId"      id="1" type="int32"/>
-    <field name="partition"    id="2" type="int32"/>
-    <field name="leaderId"     id="3" type="int32"/>
-    <field name="leaderEpoch"  id="4" type="int64"/>
-    <field name="isrCount"     id="5" type="int32"/>
-    <field name="isr"          id="6" type="isrArray"/>
-    <field name="baseIsrCount" id="7" type="int32"/>
-    <field name="baseIsr"      id="8" type="isrArray"/>
+    <field name="topicId"        id="1" type="int32"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="leaderId"       id="3" type="int32"/>
+    <field name="leaderEpoch"    id="4" type="int64"/>
+    <field name="isrCount"       id="5" type="int32"/>
+    <field name="isr"            id="6" type="isrArray"/>
+    <field name="partitionEpoch" id="7" type="int32"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- AlterIsrResponse (controller → partition leader) : template 8  (v3)     -->
+  <!-- Kafka AlterPartitionResponse: errorCode 0 = committed (or already the   -->
+  <!-- committed state) at partitionEpoch; otherwise an explicit reject        -->
+  <!-- (INELIGIBLE_REPLICA, FENCED_LEADER_EPOCH, INVALID_UPDATE_VERSION, ...). -->
+  <!-- The leader clears its pending proposal only on a commit or a reject.    -->
+  <!-- ====================================================================== -->
+  <sbe:message name="AlterIsrResponse" id="8" description="ISR change answer" sinceVersion="3">
+    <field name="topicId"        id="1" type="int32"/>
+    <field name="partition"      id="2" type="int32"/>
+    <field name="leaderId"       id="3" type="int32"/>
+    <field name="leaderEpoch"    id="4" type="int64"/>
+    <field name="partitionEpoch" id="5" type="int32"/>
+    <field name="errorCode"      id="6" type="int16"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- InternalIsr (internal-partition leader → every replica) : template 9    -->
+  <!-- The ISR of an INTERNAL partition (led by the consensus leader).  Every  -->
+  <!-- replica persists the newest (leaderEpoch, version) it sees and acks it; -->
+  <!-- a change commits once a majority of the cluster persisted it, and a     -->
+  <!-- node votes / stands in a consensus election only for a candidate in the -->
+  <!-- newest internal ISRs it persisted (Raft quorum intersection).           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="InternalIsr" id="9" description="internal-partition ISR state" sinceVersion="3">
+    <field name="topicId"     id="1" type="int32"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="leaderId"    id="3" type="int32"/>
+    <field name="leaderEpoch" id="4" type="int64"/>
+    <field name="version"     id="5" type="int64"/>
+    <field name="isrCount"    id="6" type="int32"/>
+    <field name="isr"         id="7" type="isrArray"/>
+  </sbe:message>
+
+  <!-- ====================================================================== -->
+  <!-- InternalIsrAck (replica → internal-partition leader) : template 10      -->
+  <!-- "I durably hold InternalIsr (leaderEpoch, version) or newer."           -->
+  <!-- ====================================================================== -->
+  <sbe:message name="InternalIsrAck" id="10" description="internal ISR state persisted" sinceVersion="3">
+    <field name="topicId"     id="1" type="int32"/>
+    <field name="partition"   id="2" type="int32"/>
+    <field name="followerId"  id="3" type="int32"/>
+    <field name="leaderEpoch" id="4" type="int64"/>
+    <field name="version"     id="5" type="int64"/>
   </sbe:message>
 
 </sbe:messageSchema>
