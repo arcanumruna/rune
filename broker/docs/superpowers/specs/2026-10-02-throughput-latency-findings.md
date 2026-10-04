@@ -343,6 +343,52 @@ GSO/GRO = **3.2x at the real-network MTU** (vs QD §4.4: 3.1x); MTU 1408 + GSO r
 Real-driver tests (broker rune_udp_gso_tests 11/11, client rune_transport_gso_tests 4/4) prove GSO sends carry >1
 datagram, GRO splits, mixed peers, injected EAGAIN/EIO, 5% loss + NAK recovery, IPv6.
 
+### 4.12 A7: shard idle that actually idles + epoll-first transport polling (2026-10-04, k3s-node-01, interleaved)
+
+Binaries: A = broker perf/a7-idle base 770a9ba + client perf/a7-client-idle base ff60185 (= integ incl. GSO);
+B = broker 60d6bdf + client fc509e8 (park-until-work shard idle + epoll-first Aeron polling + parking invoker bench,
+all default on).  Release, gcc-13, conan toolchains of /root/rune-e5; rune-protocol f933fb9.  Config: reference §4.8
+(MTU 1408, GSO/GRO on, backoff workers, RUNE_FS_LOG=0, RUNE_LOG_LEVEL=warn, fsync off), /root/e2e/tp.sh (vm-clean per
+run), 3 nodes x 1 fused worker (cores 1/2/3), acks=all, 1 KiB, linger 0, shards 1, term 1 MiB, rcvWindow 256 KiB,
+ctlTerm 1 MiB.  CPU = utime+stime deltas from /proc/<pid>/task/*/stat over a 5-7 s window mid-run (after the
+producer exists); no perf/syscall counting inside A/B windows.  Order idle A,B; r20k A,B; sat A,B; r20k B,A; sat B,A.
+Proof of path (B): "poll=epoll-first" per driver, "idle=park-until-work{wakeFds=2 spins=0 yields=0 parkNs=1000-200000}"
+per worker.  All runs errors=0.
+
+**Measured before tuning (A arm, probes).**  20k: each worker ~75-80% CPU, client ~75-80%, system idle ~0-1%,
+sys ~47%.  Only 24-160 sched_yield/s and 6-24 clock_nanosleep/s per worker: the backoff is NOT spinning/yielding —
+an instrumented pass (A7DIAG) showed >95% of passes doing work (~8-10k passes/s, ~4 driver duty cycles each,
+driver ~70-80 us + worker ~25 us per pass).  Per worker ~175k recvmmsg/s (Aeron recvmmsg-s EVERY transport each duty
+cycle while a poller holds <= 5 transports) + ~28k epoll_wait/s; profile top = syscall entry + __recvmmsg.  So the
+brief's hypothesis (frames reset the backoff, threads live in spin/yield) is FALSE at 20k: the CPU is per-batch work
+(linger 0: every record is a batch, ~30 us CPU per batch per node vs ~6 us/record at saturation) plus empty
+polling.  Idle cluster: 39% per worker, the Aeron backoff (each "spin" = a full ~35 us syscall pass) re-armed by
+heartbeats — that one IS idle-strategy waste.
+
+| run | arm | worker CPU % (3 nodes) | client % | proc total | sys idle | p50 / p99 / p999 us | rec/s |
+|---|---|---|---|---|---|---|---|
+| idle (no producer) | A | 41.0 / 39.5 / 37.5 | – | 134% | 63% | – | – |
+| | B | 24.8 / 22.8 / 22.1 | – | 86% | 75% | – | – |
+| 20k r1 | A | 86.5 / 82.7 / 73.8 | 74.6 | 326% | 1% | 594 / 17,695 / 31,457 | 20,000 |
+| | B | 77.9 / 75.1 / 71.7 | 71.8 | 305% | 4% | 541 / 23,986 / 73,925 | 20,000 |
+| 20k r2 | B | 75.9 / 75.7 / 74.4 | 71.4 | 307% | 3% | 627 / 30,147 / 52,429 | 20,000 |
+| | A | 86.2 / 82.8 / 81.1 | 82.2 | 341% | 1% | 610 / 29,622 / 53,215 | 20,000 |
+| sat r1 (3M records) | A | 61.9 / 58.4 / 53.4 | 71.8 | 254% | 2% | 26,346 / 148,898 | 160,682 |
+| | B | 65.0 / 62.1 / 60.0 | 41.3 | 238% | 9% | 24,248 / 145,752 | 161,727 |
+| sat r2 | B | 62.1 / 61.2 / 61.2 | 40.4 | 237% | 10% | 24,379 / 148,898 | 159,902 |
+| | A | 62.9 / 60.3 / 52.7 | 66.0 | 250% | 2% | 22,938 / 156,238 | 167,305 |
+
+Result: idle cluster worker CPU **39% -> 23%** (B parks: 0 yields, ~3.9k ppoll/s = mostly the 200 us park bound kept
+for ring/timer work).  20k: worker CPU **~82% -> ~75%**, client ~78% -> ~71%, process total 334% -> 306%; p50 equal
+(602 vs 584 us); p99 r2 equal (29.6 vs 30.1 ms), r1 B worse (24.0 vs 17.7 ms) — the 20k p99/p999 is scheduler noise
+on a full box in both arms, no regression claimed or excluded beyond that.  Saturation **164.0k -> 160.8k rec/s mean
+(-2%, inside the A arm's own 4% round spread)**, bench thread 69% -> 41% CPU, system idle 2% -> 10%.  Epoll-first cut
+per-worker recvmmsg ~175k/s -> ~30k/s (epoll_wait ~28k -> ~88k/s): passes got cheaper, so they got more frequent —
+the workers still find work every pass at 20k.  Tried and dropped: a 20 us post-work batch-window sleep (interrupt
+moderation) — worker CPU 75% -> 65% but p50 510 -> 1,057 us.  **The large CPU drop at 20k is NOT available from the
+idle strategy**: it needs less per-batch work (batching at linger 0, fewer syscalls per replicated batch, cheaper
+pass composition — §4.6).
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
