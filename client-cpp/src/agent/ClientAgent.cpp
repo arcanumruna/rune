@@ -725,6 +725,10 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             opt->correlationId,
             nowNs);
         s.machine.onActivity(nowNs);
+        if (opt->code == 0 && s.machine.state() == session::SessionState::Connected) {
+            ++s.connectEpoch;                             // MEDIUM-1: a new connect episode
+            s.sourceKey = transport_.currentSourceKey();  // M3: the node's send endpoint
+        }
         // (F8c C3: the observer — Client::onEgressFrame — publishes the new
         // state to app threads (Client::state()) BEFORE it completes the
         // connect, so a thread woken by that completion reads Connected.)
@@ -1045,6 +1049,10 @@ uint32_t ClientAgent::leaderSessionIndex(int32_t topicId, int32_t partition) noe
     const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
     if (idx == detail::FlatIndexMap::kNone) return 0;
     PartitionRoute& r = routes_[idx];
+    // LOW-6: may emplace_back into sessions_ (a lazily opened node session) —
+    // also from inside an egress callback.  Safe: sessions are held by
+    // unique_ptr (stable addresses) and no range-for over sessions_ is live on
+    // any path that reaches here (doWork's tick loop never calls into the hubs).
     if (r.sessionIndex == kNoSession) r.sessionIndex = sessionIndexFor_(r.sessionEndpoint);  // once per route
     return r.sessionIndex;
 }
@@ -1060,9 +1068,46 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
     using R = transport::AeronTransport::OfferResult;
     if (index == 0) return offerDefault(buf, len);  // the seed: its (possibly retargeted) default pub
     if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    if (testForcedSessionOffers_ > 0) [[unlikely]] {
+        --testForcedSessionOffers_;
+        if (testForcedSessionOffer_ == R::Retry) ++ingressOfferRefused_;
+        return testForcedSessionOffer_;
+    }
     if (transport_.offerTo(sessions_[index]->endpoint, cfg_.transport.ingressStreamId, buf, len)) return R::Accepted;
     ++ingressOfferRefused_;
     return R::Retry;
+}
+
+uint32_t ClientAgent::recordsSource(int64_t frameSessionId) noexcept {
+    const int32_t sk = transport_.currentSourceKey();
+    uint32_t found = kUnknownSource;
+    bool anyOnSource = false;
+    if (sk >= 0) {
+        for (uint32_t i = 0; i < sessions_.size(); ++i) {
+            const Session& s = *sessions_[i];
+            if (s.sourceKey != sk) continue;
+            anyOnSource = true;
+            if (s.machine.state() != session::SessionState::Connected || s.machine.sessionId() != frameSessionId) continue;
+            if (found != kUnknownSource) return kUnknownSource;  // ambiguous on one node: never guess
+            found = i;
+        }
+        if (anyOnSource) return found;
+    }
+    for (uint32_t i = 0; i < sessions_.size(); ++i) {
+        const Session& s = *sessions_[i];
+        if (s.machine.state() != session::SessionState::Connected || s.machine.sessionId() != frameSessionId) continue;
+        if (found != kUnknownSource) return kUnknownSource;  // the id alone is ambiguous across nodes
+        found = i;
+    }
+    return found;
+}
+
+bool ClientAgent::reviveSession(uint32_t index, int64_t nowNs) noexcept {
+    if (failed_ || index == 0 || index >= sessions_.size()) return false;
+    session::SessionMachine& m = sessions_[index]->machine;
+    if (m.state() != session::SessionState::Disconnected) return false;
+    m.connect(nowNs);
+    return true;
 }
 
 std::string ClientAgent::routeEndpointFor(int32_t topicId, int32_t partition) const noexcept {

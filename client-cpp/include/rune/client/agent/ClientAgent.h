@@ -151,6 +151,14 @@ struct Session {
     /// session's partitions park in the producer builders until ConnectResponse{OK}.
     bool        connectSubmitted     = false;
 
+    /// Connect epoch: incremented on every ConnectResponse{OK} that leaves this
+    /// session Connected (a resume, a reconnect, a node restart that re-used the
+    /// broker session id — MEDIUM-1: the broker id alone cannot tell them apart).
+    uint64_t    connectEpoch         = 0;
+    /// Source key (AeronTransport::currentSourceKey) of the image the latest
+    /// ConnectResponse{OK} arrived on: the node's send endpoint.  -1 = unknown.
+    int32_t     sourceKey            = -1;
+
     Session(ClientAgent* agent, session::SessionConfig cfg,
             std::string sessionEndpoint)
         : endpoint(sessionEndpoint)
@@ -412,6 +420,36 @@ public:
     // LEADER node on that node's own session (the broker refuses a Subscribe for
     // a partition it does not lead).  Sessions are append-only (sessions_ never
     // shrinks), so an index stays valid for the agent's lifetime.
+
+    /// Unknown frame source (recordsSource).
+    static constexpr uint32_t kUnknownSource = 0xFFFFFFFFu;
+    /// The session a Records frame (being dispatched now, broker sessionId
+    /// `frameSessionId`) belongs to: among the sessions whose node sent it (the
+    /// arrival image's source key), the Connected one with that broker session id
+    /// — broker ids collide across nodes, the (node, id) pair does not.  When no
+    /// session is known on that source (or the source is unknown), the id alone
+    /// decides if exactly one Connected session carries it.  kUnknownSource
+    /// otherwise.  Hot path: no allocation (a scan of the few sessions).
+    [[nodiscard]] uint32_t recordsSource(int64_t frameSessionId) noexcept;
+    /// Session `index`'s connect epoch while it is Connected; 0 otherwise.
+    [[nodiscard]] uint64_t connectedEpoch(uint32_t index) const noexcept {
+        if (index >= sessions_.size()) return 0;
+        const Session& s = *sessions_[index];
+        return s.machine.state() == session::SessionState::Connected ? s.connectEpoch : 0;
+    }
+    /// Session `index`'s state (Disconnected when out of range).
+    [[nodiscard]] session::SessionState sessionStateAt(uint32_t index) const noexcept {
+        return index < sessions_.size() ? sessions_[index]->machine.state() : session::SessionState::Disconnected;
+    }
+    /// M1: re-drive a fresh connect on a NON-seed session that is terminally
+    /// Disconnected (its first-connect / resume budget ran out).  True if started.
+    bool reviveSession(uint32_t index, int64_t nowNs) noexcept;
+    /// Test seam (agent thread): the next `n` offerOnSession() calls on a
+    /// non-seed session return `r` without reaching the transport.
+    void testForceSessionOffers(transport::AeronTransport::OfferResult r, int n) noexcept {
+        testForcedSessionOffer_  = r;
+        testForcedSessionOffers_ = n;
+    }
 
     /// Index of the session leading (topicId, partition): its route's node
     /// session, lazily opened (async connect); 0 = the seed (no route).
@@ -886,6 +924,8 @@ private:
     int testForcedOffers_ = 0;
     transport::AeronTransport::OfferResult testForcedOffer_ = transport::AeronTransport::OfferResult::Accepted;
     std::size_t testMaxFrameCap_ = 0;  // fix4 test seam (0 = uncapped)
+    int testForcedSessionOffers_ = 0;
+    transport::AeronTransport::OfferResult testForcedSessionOffer_ = transport::AeronTransport::OfferResult::Accepted;
     std::size_t testCommandMsgCap_ = 0;  // F8c fix1 test seam (0 = uncapped)
     bool        testCloseDrainNoUnblock_ = false;  // F8c fix1 test seam
     transport::AeronTransport::OfferResult offerIngress_(const uint8_t* buf, std::size_t len) noexcept;

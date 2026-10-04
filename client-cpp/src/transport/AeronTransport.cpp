@@ -211,7 +211,8 @@ void AeronTransport::start() {
         [this](aeron::concurrent::AtomicBuffer& buf,
                aeron::util::index_t            offset,
                aeron::util::index_t            len,
-               aeron::Header&) {
+               aeron::Header&                  header) {
+            curImage_ = header.context();  // reassembled frame: its image
             if (pollThunk_) {
                 pollThunk_(pollCtx_, reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
                            static_cast<std::size_t>(len));
@@ -445,7 +446,8 @@ aeron::Subscription* AeronTransport::resolveSubSlot_(SubSlot& s) noexcept {
     try {
         s.assembler = std::make_unique<aeron::FragmentAssembler>(
             [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
-                   aeron::util::index_t len, aeron::Header&) {
+                   aeron::util::index_t len, aeron::Header& header) {
+                curImage_ = header.context();  // reassembled frame: its image
                 if (pollThunk_) {
                     pollThunk_(pollCtx_, reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
                                static_cast<std::size_t>(len));
@@ -456,6 +458,32 @@ aeron::Subscription* AeronTransport::resolveSubSlot_(SubSlot& s) noexcept {
         return nullptr;
     }
     return s.res.ready();
+}
+
+int32_t AeronTransport::currentSourceKey() noexcept {
+    if (curImage_ == nullptr) return -1;
+    const auto* img = static_cast<const aeron::Image*>(curImage_);
+    const int64_t corr = img->correlationId();
+    for (const ImageSource& is : imageSources_) {
+        if (is.imageCorrelationId == corr) return is.key;
+    }
+    // Cold: first frame of this image.
+    try {
+        const std::string id = img->sourceIdentity();
+        int32_t key = -1;
+        for (std::size_t i = 0; i < sourceIds_.size(); ++i) {
+            if (sourceIds_[i] == id) { key = static_cast<int32_t>(i); break; }
+        }
+        if (key < 0) {
+            key = static_cast<int32_t>(sourceIds_.size());
+            sourceIds_.push_back(id);
+        }
+        if (imageSources_.size() >= 4096) imageSources_.clear();  // images come and go: bound it
+        imageSources_.push_back(ImageSource{corr, key});
+        return key;
+    } catch (...) {
+        return -1;
+    }
 }
 
 // ---------------------------------------------------------------------------
