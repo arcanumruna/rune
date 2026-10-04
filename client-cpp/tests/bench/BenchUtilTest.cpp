@@ -329,3 +329,31 @@ TEST(PartitionTimestamps, UnsequencedProducerAcksInSendOrder) {
     EXPECT_FALSE(p.onAck(-1, 1, -1, rec)) << "nothing left to attribute";
     EXPECT_EQ(got, (std::vector<int64_t>{7, 8, 9}));
 }
+
+// ---------------------------------------------------------------------------
+// A7: the invoker bench parks (ppoll on its driver's wake fds) instead of spinning when a pass did
+// nothing — until the next scheduled send, a datagram, or maxPark.  RUNE_BENCH_IDLE=spin = the old loop.
+// ---------------------------------------------------------------------------
+#include "BenchIdle.h"
+
+TEST(BenchIdle, ModeParsing) {
+    EXPECT_EQ(parseBenchIdle(nullptr), BenchIdle::Park) << "default: park";
+    EXPECT_EQ(parseBenchIdle(""), BenchIdle::Park);
+    EXPECT_EQ(parseBenchIdle("park"), BenchIdle::Park);
+    EXPECT_EQ(parseBenchIdle("spin"), BenchIdle::Spin);
+    EXPECT_EQ(parseBenchIdle("SPIN"), BenchIdle::Spin);
+    EXPECT_EQ(parseBenchIdle("garbage"), BenchIdle::Park);
+}
+
+TEST(BenchIdleRegression, ParkTimeoutBoundedByNextDueSendAndMaxPark) {
+    constexpr int64_t kMax = 200'000;
+    // Nothing due before maxPark: park the full period.
+    EXPECT_EQ(benchParkTimeoutNs(/*nextDueNs=*/1'000'000, /*nowNs=*/0, kMax), kMax);
+    // The next send is due in 30 us: wake for it.
+    EXPECT_EQ(benchParkTimeoutNs(30'000, 0, kMax), 30'000);
+    // Already due (or overdue): never park.
+    EXPECT_EQ(benchParkTimeoutNs(100, 100, kMax), 0);
+    EXPECT_EQ(benchParkTimeoutNs(50, 100, kMax), 0);
+    // No further sends (all sent / closed window): bounded by maxPark only.
+    EXPECT_EQ(benchParkTimeoutNs(kNoNextSend, 0, kMax), kMax);
+}

@@ -268,6 +268,11 @@ public:
     /// returns 0 without running a nested cycle.  Thread mode: throws logic_error.
     int doWork();
 
+    /// A7 park-until-work (Invoker owner): the embedded invoker driver's socket-readiness fds — park in
+    /// ppoll() on them when doWork() returned 0 instead of spinning; a datagram (an ack, a status message)
+    /// wakes the owner.  0 fds in Thread driver mode or off Linux.  Valid until close.
+    [[nodiscard]] int wakeFds(int* out, int max) const noexcept { return agent_.testTransport().wakeFds(out, max); }
+
     /// True once the Aeron client closed itself (invoker owner stalled past
     /// aeronClientLivenessTimeoutNs, or the driver timed out).
     [[nodiscard]] bool transportClosed() const noexcept { return agent_.transportClosed(); }

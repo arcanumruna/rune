@@ -126,6 +126,9 @@ public:
     /// std::logic_error.
     int doWork();
 
+    /// A7 park-until-work (Invoker owner): the shard driver's socket-readiness fds (Client::wakeFds).
+    [[nodiscard]] int wakeFds(int* out, int max) const noexcept { return client_->wakeFds(out, max); }
+
     /// Invoker mode: h(const BatchAck&) for every batch ack completed since the
     /// last call (F8c: OpKind::BatchAck completions in the shard-owned queue).
     /// Every accepted record is reported in exactly one BatchAck (a failed /
