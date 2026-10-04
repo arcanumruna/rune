@@ -93,6 +93,16 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
     assert(outboundRing_.capacity() >= outboundRing_.maxMsgLength() + 8);
     holdRouter_.addPeer(peerId, outboundRing_.capacity());
     notifiedGen_.emplace_back(peerId, holdRouter_.connGen(peerId));   // D9: reconnect-edge baseline
+    // D9 re-review: the peer's link view (publication edge + image host).
+    PeerLink l;
+    l.peer = peerId;
+    l.pub  = &peers_.at(peerId);   // unordered_map element addresses are stable
+    if (const auto e = egressChannel.find("endpoint="); e != std::string::npos) {
+        const std::string ep = egressChannel.substr(e + 9, egressChannel.find_first_of("|?", e + 9) - (e + 9));
+        const auto colon = ep.rfind(':');
+        l.host = colon == std::string::npos ? ep : ep.substr(0, colon);
+    }
+    links_.push_back(std::move(l));
 }
 
 // ---------------------------------------------------------------------------
@@ -398,34 +408,64 @@ bool AeronPartitionTransport::sendWriteTxnMarkerResponse(NodeId to, const WriteT
 
 int AeronPartitionTransport::notePlaneReconnects_()
 {
-    const auto& st = holdRouter_.stats();
-    // A peer the router marked down is only re-observed on the next offer to it;
-    // probe its publication so the up edge does not wait for unrelated traffic.
-    if (st.downEdges > st.upEdges) [[unlikely]] {
-        for (auto& [id, p] : peers_)
-            if (holdRouter_.isDown(id)) holdRouter_.noteLink(id, p.registered && p.pub && p.pub->isConnected());
-    }
     int events = 0;
-    if (st.upEdges != lastUpEdges_) [[unlikely]] {
-        lastUpEdges_ = st.upEdges;
-        for (auto& [id, p] : peers_) {
-            const uint32_t gen = holdRouter_.connGen(id);
-            auto it = std::find_if(notifiedGen_.begin(), notifiedGen_.end(),
-                                   [id = id](const auto& e) { return e.first == id; });
-            if (it == notifiedGen_.end()) continue;   // registered in addPeer
-            if (it->second != gen) {
-                it->second = gen;
-                if (reconnectHandler_ != nullptr) reconnectHandler_(reconnectCtx_, static_cast<int32_t>(id));
-                ++events;
+    auto report = [&](int32_t peer) {
+        if (reconnectHandler_ != nullptr) reconnectHandler_(reconnectCtx_, peer);
+        ++events;
+    };
+    // Re-review NEW MEDIUM-1: edge-detect EVERY peer's link each poll (one
+    // isConnected() load per peer) — a one-way outage toward a peer this node is
+    // idle to never reaches the hold router (no offer), but its publication
+    // still drops to not-connected and back.  A down→up edge is reported; the
+    // router is told so its connection generation follows.
+    for (auto& l : links_) {
+        const PeerPub* p = l.pub;
+        const bool up = p != nullptr && p->registered && p->pub && p->pub->isConnected();
+        if (up != l.up) [[unlikely]] {
+            l.up = up;
+            if (up) {
+                if (holdRouter_.isDown(l.peer)) holdRouter_.noteLink(l.peer, true);
+                report(static_cast<int32_t>(l.peer));
             }
         }
     }
-    const int images = sub_ ? sub_->imageCount() : 0;
-    if (images > lastImageCount_) [[unlikely]] {
-        if (reconnectHandler_ != nullptr) reconnectHandler_(reconnectCtx_, -1);
-        ++events;
+    // A down→up edge the router saw on an offer (connection generation bump).
+    const auto& st = holdRouter_.stats();
+    if (st.upEdges != lastUpEdges_) [[unlikely]] {
+        lastUpEdges_ = st.upEdges;
+        for (auto& [id, gen0] : notifiedGen_) {
+            const uint32_t gen = holdRouter_.connGen(id);
+            if (gen0 != gen) { gen0 = gen; report(static_cast<int32_t>(id)); }
+        }
     }
-    lastImageCount_ = images;
+    // Re-review NEW MAJOR-1: a NEW inbound image is attributed to its peer by
+    // the image's source host (Image::sourceIdentity "host:port" vs the peer's
+    // endpoint host) — only that peer's markers are re-sent.  Several peers on
+    // one host (tests, co-located nodes) are all reported; an unknown host
+    // falls back to -1 (every peer).  Cold: only when the image count changes.
+    const int images = sub_ ? sub_->imageCount() : 0;
+    if (images != lastImageCount_) [[unlikely]] {
+        lastImageCount_ = images;
+        std::vector<int32_t> now;
+        std::vector<std::string> fresh;
+        sub_->forEachImage([&](aeron::Image& img) {
+            now.push_back(img.sessionId());
+            if (std::find(knownImageSessions_.begin(), knownImageSessions_.end(), img.sessionId()) ==
+                knownImageSessions_.end()) {
+                std::string src = img.sourceIdentity();
+                const auto colon = src.rfind(':');
+                fresh.push_back(colon == std::string::npos ? src : src.substr(0, colon));
+            }
+        });
+        knownImageSessions_.swap(now);
+        for (const auto& host : fresh) {
+            bool matched = false;
+            for (auto& l : links_) {
+                if (!l.host.empty() && l.host == host) { ++l.imagesSeen; report(static_cast<int32_t>(l.peer)); matched = true; }
+            }
+            if (!matched) report(-1);
+        }
+    }
     return events;
 }
 

@@ -241,6 +241,17 @@ public:
     /// F27: frames currently held for `peer` / whether it is marked down (tests).
     [[nodiscard]] std::size_t heldFramesForTest(NodeId peer) const noexcept { return holdRouter_.heldFrames(peer); }
     [[nodiscard]] bool peerDownForTest(NodeId peer) const noexcept { return holdRouter_.isDown(peer); }
+    /// D9 (re-review MEDIUM-1): the link state last observed for `peer` (its
+    /// publication connected).  Control thread / tests.
+    [[nodiscard]] bool peerLinkUpForTest(NodeId peer) const noexcept {
+        for (const auto& l : links_) if (l.peer == peer) return l.up;
+        return false;
+    }
+    /// D9 (re-review NEW MAJOR-1): inbound images attributed to `peer` so far.
+    [[nodiscard]] uint64_t inboundImagesFromForTest(NodeId peer) const noexcept {
+        for (const auto& l : links_) if (l.peer == peer) return l.imagesSeen;
+        return 0;
+    }
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -532,6 +543,17 @@ private:
     uint64_t                               lastUpEdges_          = 0;
     int                                    lastImageCount_       = 0;
     std::vector<std::pair<NodeId, uint32_t>> notifiedGen_;                     ///< per-peer gen last reported
+    /// D9 (re-review): per-peer link view — publication connected (edge-detected
+    /// every poll) and the host its inbound images come from (image → peer).
+    struct PeerLink {
+        NodeId      peer       = -1;
+        const PeerPub* pub     = nullptr;   ///< into peers_ (stable element address)
+        std::string host;              ///< from the peer's endpoint ("" = unknown)
+        bool        up         = false;
+        uint64_t    imagesSeen = 0;
+    };
+    std::vector<PeerLink> links_;
+    std::vector<int32_t>  knownImageSessions_;   ///< cold: image sessions already attributed
     /// D9: probe down peers' links + report down→up edges / new inbound images.
     int notePlaneReconnects_();
     int64_t                                nowNs_ = 0; ///< updated at top of poll()
