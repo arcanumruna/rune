@@ -2681,8 +2681,9 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     auto& pend = pendingRecordEgress_[{sessionId, wid}];
     if (pend.regId < 0) {
         try {
-            // A10: sparse terms (runtime add on a worker thread: see withSparseTerms).
-            pend.regId         = aeron_->addExclusivePublication(rune::node::withSparseTerms(sess->egressChannel),
+            // A10 review M1: a consumer DATA stream keeps the pre-faulted (non-sparse) default; an add error
+            // here falls back to the MDC path (degraded, never fatal).
+            pend.regId         = aeron_->addExclusivePublication(sess->egressChannel,
                                                                  sess->egressStreamId);
             pend.requestedAtNs = nowNs_;
         } catch (...) {

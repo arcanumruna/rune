@@ -76,6 +76,8 @@ AckEntry ack(int64_t sid, int64_t corr, int64_t base = 0) { return AckEntry{sid,
 
 // One pass with the lifecycle ring fully consumed (producer == consumer).
 void pass(Sink& s) { s.flush(0, 0); }
+// A10 review M2: re-adds back off 2, 4, ... 2^(kMax-1) passes — enough passes to run every attempt.
+constexpr int kPassesToExhaustRetries = 2 * (1 << Sink::kMaxPubAddAttempts) + 2 * Sink::kMaxPubAddAttempts;
 
 // Announce + resolve (two flushes: Announced→Resolving, Resolving→Ready).
 void ready(Sink& s, int64_t sid) {
@@ -215,7 +217,7 @@ TEST(SessionAckSinkRegression, AddAndFindErrorsAreReportedAndCloseForgetsAnUnrep
         FakePolicy pol; auto st = pol.s; Sink s(pol);
         st->findError = true;
         ASSERT_TRUE(s.announce(7, "c", 1));
-        for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);   // A10: bounded re-adds first
+        for (int i = 0; i < kPassesToExhaustRetries; ++i) pass(s);   // A10: bounded re-adds first
         EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
         EXPECT_EQ(s.unreportedFailures(), 1u);
         s.close(7);                                        // the runtime closed it meanwhile
@@ -386,7 +388,7 @@ TEST(SessionAckSinkRegression, RegistrationThatResolvedToErrorIsNeverDrained) {
     st->errorOnceThenUnknown = true;
     ASSERT_TRUE(s.announce(7, "c", 1));
     // Announced → Resolving(reg 1); each find errors once (A10: re-added, bounded) → Failed.
-    for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);
+    for (int i = 0; i < kPassesToExhaustRetries; ++i) pass(s);
     ASSERT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
     EXPECT_EQ(s.drainingRegistrations(), 0u) << "the driver already dropped it — nothing to release";
     s.close(7);
@@ -1072,7 +1074,7 @@ TEST(SessionAckSinkRegression, TransientPublicationAddErrorIsRetriedNotFatal) {
     st->errorsBeforeReady = 3;
     ASSERT_TRUE(s.announce(7, "aeron:udp?endpoint=c:1", 2));
     ASSERT_TRUE(s.enqueue(ack(7, 100)));
-    for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);
+    for (int i = 0; i < kPassesToExhaustRetries; ++i) pass(s);
     ASSERT_TRUE(std::holds_alternative<Sink::PubReady>(*s.stateForTest(7))) << "a transient add error is not fatal";
     EXPECT_EQ(s.unreportedFailures(), 0u);
     EXPECT_EQ(s.pubAddRetries(), 3u);
@@ -1088,8 +1090,41 @@ TEST(SessionAckSinkRegression, PersistentPublicationAddErrorFailsAfterBoundedRet
     FakePolicy pol; auto st = pol.s; Sink s(pol);
     st->findError = true;
     ASSERT_TRUE(s.announce(7, "c", 1));
-    for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);
+    for (int i = 0; i < kPassesToExhaustRetries; ++i) pass(s);
     EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
     EXPECT_EQ(st->added.size(), static_cast<std::size_t>(Sink::kMaxPubAddAttempts)) << "bounded: never retried forever";
+    EXPECT_EQ(s.freeChannelSlotsForTest(), Sink::kMaxChannelSlots) << "the Failed session's slot is returned";
     EXPECT_EQ(s.unreportedFailures(), 1u);
+}
+
+// A10 review M2: re-adds are spaced (pass-count backoff), not back to back.
+TEST(SessionAckSinkRegression, PublicationReAddsBackOffByPasses) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    st->findError = true;
+    ASSERT_TRUE(s.announce(7, "c", 1));
+    for (int i = 0; i < 4; ++i) pass(s);
+    EXPECT_LE(st->added.size(), 2u) << "no burst of re-adds while the error condition persists";
+}
+
+// A10 review M3: every channel slot comes back — Ready, Failed, closed while a re-add is pending, re-announced.
+TEST(SessionAckSinkRegression, ChannelSlotsAreAllReturned) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(1, "a", 1));                      // → Ready
+    st->errorsBeforeReady = 1;
+    ASSERT_TRUE(s.announce(2, "b", 1));                      // → one error, re-add, Ready
+    for (int i = 0; i < kPassesToExhaustRetries; ++i) pass(s);
+    ASSERT_TRUE(std::holds_alternative<Sink::PubReady>(*s.stateForTest(1)));
+    ASSERT_TRUE(std::holds_alternative<Sink::PubReady>(*s.stateForTest(2)));
+    EXPECT_EQ(s.freeChannelSlotsForTest(), Sink::kMaxChannelSlots);
+    st->findError = true;
+    ASSERT_TRUE(s.announce(3, "c", 1));
+    pass(s); pass(s);                                         // Resolving → error → a re-add pending
+    EXPECT_EQ(s.freeChannelSlotsForTest(), Sink::kMaxChannelSlots - 1) << "kept for the re-add";
+    s.close(3);
+    EXPECT_EQ(s.freeChannelSlotsForTest(), Sink::kMaxChannelSlots) << "closed while a re-add was pending";
+    ASSERT_TRUE(s.announce(1, "a2", 1));                      // re-announce a Ready session (still erroring)
+    for (int i = 0; i < kPassesToExhaustRetries; ++i) pass(s);
+    EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(1)));
+    EXPECT_EQ(s.freeChannelSlotsForTest(), Sink::kMaxChannelSlots);
+    EXPECT_EQ(s.drainingRegistrations(), 0u) << "errored registrations are never drained";
 }

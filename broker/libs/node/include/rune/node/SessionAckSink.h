@@ -186,8 +186,11 @@ public:
     /// path) so a transient driver error can re-add on the same channel — bounded by kMaxPubAddAttempts.
     static constexpr uint16_t kNoChan = 0xFFFF;
     static constexpr uint8_t  kMaxPubAddAttempts = 8;
+    /// regId < 0: a re-add is due at pass `retryPass` (A10 review M2: pass-count backoff 2, 4, ... passes —
+    /// spaced, never a timer).
     struct PubResolving {
         int64_t regId = -1; uint16_t chan = kNoChan; uint16_t chanLen = 0; int32_t streamId = 0; uint8_t attempts = 1;
+        uint64_t retryPass = 0;
     };
     struct PubReady     { PubHandle pub{}; uint64_t blockedPass = 0; };
     /// reported == false: the runtime has not yet been told (reportFailures).
@@ -556,6 +559,8 @@ public:
     [[nodiscard]] std::size_t drainingRegistrations() const noexcept { return drainCount_; }
     /// A10: ack-publication re-adds after a (transient) driver error.
     [[nodiscard]] uint64_t pubAddRetries() const noexcept { return pubAddRetries_; }
+    /// A10 review M3: channel slots currently free (all of them once no session is Announced / Resolving).
+    [[nodiscard]] std::size_t freeChannelSlotsForTest() const noexcept { return freeChanCount_; }
     [[nodiscard]] uint64_t    drainOverflowForTest() const noexcept { return drainOverflow_; }
     [[nodiscard]] std::size_t freeAckSlots() const noexcept { return kAckCapacity - ackCount_; }
     [[nodiscard]] std::size_t pending() const noexcept { return ackCount_; }
@@ -635,6 +640,7 @@ private:
             --unreported_;
         else if (const auto* r = std::get_if<PubResolving>(&st)) {
             freeChanSlot_(r->chan);                                  // A10: the slot it kept for a re-add
+            if (r->regId < 0) return;                                // a re-add was pending: nothing registered
             // finding 8: never leaked.  At most one Resolving registration per
             // live session is ever pending here (errored ones are not queued),
             // so the list cannot fill; if it ever did, count it — never silent.
@@ -818,6 +824,18 @@ private:
                 continue;
             }
             if (auto* r = std::get_if<PubResolving>(&st)) {
+                if (r->regId < 0) {                                  // A10: a backed-off re-add
+                    if (pass_ < r->retryPass) { unresolved_[keep++] = sid; continue; }
+                    const int64_t reg = policy_.add(std::string_view(chanPool_[r->chan].data(), r->chanLen),
+                                                    r->streamId);
+                    ++work;
+                    if (reg < 0) { freeChanSlot_(r->chan); st = PubFailed{false}; ++unreported_; continue; }
+                    r->regId = reg;
+                    ++r->attempts;
+                    ++pubAddRetries_;
+                    unresolved_[keep++] = sid;
+                    continue;
+                }
                 PubHandle pub{};
                 const PubFind f = policy_.find(r->regId, pub);
                 if (f == PubFind::Ready) {
@@ -836,15 +854,10 @@ private:
                     // io_uring task work on this worker thread) — re-add on the same channel, bounded; only a
                     // persistent error (bad channel) fails the session.
                     if (r->chan != kNoChan && r->attempts < kMaxPubAddAttempts) {
-                        const int64_t reg = policy_.add(std::string_view(chanPool_[r->chan].data(), r->chanLen),
-                                                        r->streamId);
-                        if (reg >= 0) {
-                            r->regId = reg;
-                            ++r->attempts;
-                            ++pubAddRetries_;
-                            unresolved_[keep++] = sid;
-                            continue;
-                        }
+                        r->regId     = -1;                           // errored regs are never drained (fix round 3)
+                        r->retryPass = pass_ + (uint64_t{1} << r->attempts);   // 2, 4, ... 128 passes
+                        unresolved_[keep++] = sid;
+                        continue;
                     }
                     freeChanSlot_(r->chan);
                     st = PubFailed{false};
