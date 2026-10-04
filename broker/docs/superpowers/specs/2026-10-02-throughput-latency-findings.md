@@ -410,7 +410,7 @@ io_uring fd), `poll=epoll-first` per driver.  All runs errors=0.  Scripts / raw:
 | | B | 70.8 / 66.3 / 64.8 | 45.0 | 259% | 8% | 21,627 / 139,461 | 168,663 |
 | 20k + fsync 5 ms (leader + follower) r1 | A | 46.4 / 44.9 / 41.9 | 41.2 | 198% | 7% | 2,802 / 14.9 s / 15.0 s | 17,251 |
 | | B | 41.8 / 35.6 / 27.3 | 12.2 | 129% | 59% | 6.5 s / 13.9 s / 14.0 s | 8,252 |
-| 20k + fsync 5 ms r2 | B | 38.5 / 33.5 / 33.0 | 30.7 | 149% | – | 9,634 / 9.9 s / 10.0 s | 17,243 |
+| 20k + fsync 5 ms r2 | B | 38.5 / 33.5 / 33.0 | 30.7 | 149% | 26% | 9,634 / 9.9 s / 10.0 s | 17,243 |
 | | A | 33.6 / 29.9 / 19.5 | 12.7 | 109% | 68% | 1.5 s / 9.9 s / 10.0 s | 20,003 |
 
 Peer-kill (idle cluster, `kill -9` of follower node 0; gateway/leader node 1), survivors' worker CPU over 5.6-5.8 s
