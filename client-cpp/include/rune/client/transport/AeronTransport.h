@@ -262,13 +262,12 @@ public:
         using HT = std::remove_reference_t<H>;
         pollCtx_   = const_cast<void*>(static_cast<const void*>(&handler));
         pollThunk_ = [](void* ctx, const uint8_t* b, std::size_t n) { (*static_cast<HT*>(ctx))(b, n); };
-        auto onFragment = [this, &handler](aeron::FragmentAssembler& assembler) {
-            return [this, &handler, &assembler](aeron::concurrent::AtomicBuffer& buf,
-                                                aeron::util::index_t offset, aeron::util::index_t length,
-                                                aeron::Header& header) {
+        auto onFragment = [&handler](aeron::FragmentAssembler& assembler) {
+            return [&handler, &assembler](aeron::concurrent::AtomicBuffer& buf,
+                                          aeron::util::index_t offset, aeron::util::index_t length,
+                                          aeron::Header& header) {
                 namespace FrameDescriptor = aeron::FrameDescriptor;
                 if ((header.flags() & FrameDescriptor::UNFRAGMENTED) == FrameDescriptor::UNFRAGMENTED) {
-                    curImage_ = header.context();  // the arrival image (currentSourceKey)
                     handler(reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
                             static_cast<std::size_t>(length));
                 } else {
@@ -298,18 +297,8 @@ public:
         }
         pollCtx_   = nullptr;
         pollThunk_ = nullptr;
-        curImage_  = nullptr;
         return frags;
     }
-
-    /// The SOURCE of the egress frame being dispatched right now (valid only
-    /// inside the poll() handler): a small dense id per distinct sending socket
-    /// (Aeron Image::sourceIdentity — "ip:port" of the broker node's send
-    /// endpoint; every publication a node's driver sends to this client's egress
-    /// channel shares it), -1 when unknown (outside a poll handler).  Cached per
-    /// image (keyed by the image correlationId): the sourceIdentity copy is made
-    /// once per image, never per frame.  Agent thread only.
-    [[nodiscard]] int32_t currentSourceKey() noexcept;
 
     /// read-rework I4: open (idempotently) a per-worker dynamic-MDC egress
     /// Subscription on controlChannel + streamId so the client receives Records
@@ -447,10 +436,6 @@ private:
     // Reassembled (multi-fragment) messages reach the current poll() handler via
     // this thunk; set only for the duration of poll().
     void* pollCtx_ = nullptr;
-    void* curImage_ = nullptr;  // aeron::Image* of the frame being dispatched (poll only)
-    struct ImageSource { int64_t imageCorrelationId; int32_t key; };
-    std::vector<ImageSource>  imageSources_;  // cold: one entry per image ever seen
-    std::vector<std::string>  sourceIds_;     // key -> sourceIdentity
     std::size_t pollStart_ = 0;  // round-robin first source for poll() (single-writer)
     void (*pollThunk_)(void*, const uint8_t*, std::size_t) = nullptr;
 
