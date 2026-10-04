@@ -250,6 +250,9 @@ UringFlushBackend::~UringFlushBackend() {
 int UringFlushBackend::pushSqes_(const struct io_uring_sqe* sqes, uint32_t n, uint32_t& submitted,
                                  uint32_t enterCount) noexcept {
     submitted = 0;
+    // A10: a single submit while a round batch is open would overwrite its first queued SQE — refuse
+    // (back-pressure) instead; the worker never interleaves them (seals are submitted before a round).
+    if (queued_ != 0) [[unlikely]] return EBUSY;
     // Load SQ head with acquire semantics — the kernel writes head after
     // consuming SQEs, so we need to observe that write here.
     const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);

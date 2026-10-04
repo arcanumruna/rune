@@ -575,4 +575,24 @@ TEST(UringDurabilityTest, QueuedRoundRespectsTheInFlightCapRegression) {
     EXPECT_EQ(be.submitQueued(), 1u);
 }
 
+// A single submit while a round batch is open must never overwrite a queued SQE: it is refused
+// (back-pressure) and the queued round is submitted intact.
+TEST(UringDurabilityTest, SingleSubmitWhileARoundIsQueuedIsRefusedRegression) {
+    char path[] = "/tmp/rune_uring_mix_XXXXXX";
+    const int fd = ::mkstemp(path);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, "x", 1), 1);
+    UringFlushBackend be(16, 16);
+    const auto q = be.queueFsync(fd);
+    ASSERT_NE(q, kNoToken);
+    EXPECT_EQ(be.submit(-99, 0), kNoToken) << "a single submit inside an open batch is refused";
+    ASSERT_EQ(be.submitQueued(), 1u);
+    FlushCompletion got{};
+    ASSERT_TRUE(spinReap(be, got));
+    EXPECT_EQ(got.token, q) << "the queued member, not the refused submit, completed";
+    EXPECT_EQ(got.errorCode, 0) << "its SQE was not overwritten (fd -99 would fail EBADF)";
+    ::close(fd);
+    ::unlink(path);
+}
+
 #endif // defined(__linux__)

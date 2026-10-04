@@ -6108,6 +6108,13 @@ private:
         int work = 0;
         roundMembers_.clear();
         bool full = false;   // the io backend refused: queue no more this pass
+        // 0. Async roll seals of the Strict logs FIRST, and before the batch opens (a seal is a single
+        //    submit — it must never run while round members are queued): a Strict entry may live in a
+        //    segment sealed this pass, and its ack waits for that seal (onFlushCompletion_).
+        for (rune::storage::Log* log : dirtyThisCycle_) {
+            if (log->storageFailed()) [[unlikely]] continue;
+            if (LogFlushSlot* slot = slotOf_(log)) work += submitPendingSeals_(*slot);
+        }
         // 1. Strict waiters → Durable members.
         for (rune::storage::Log* log : dirtyThisCycle_) {
             LogFlushSlot* slot = slotOf_(log);
@@ -6118,9 +6125,6 @@ private:
                 ++work;
                 continue;
             }
-            // Async roll seals first: a Strict entry may live in a segment sealed
-            // this pass, and its ack waits for that seal (onFlushCompletion_).
-            if (slot) work += submitPendingSeals_(*slot);
             // M-6: one fsync in flight per log (only an out-of-round flush can still be in flight here).
             // I-3: strictWaiting blocks any new background fsync on the log, so its next fsync is this
             // durable one.
