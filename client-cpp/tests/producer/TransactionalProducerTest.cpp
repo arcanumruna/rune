@@ -244,6 +244,7 @@ struct TxnRig {
     TxnOp commit() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.commitTransaction(handler(), t)}; }
     TxnOp abort() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.abortTransaction(handler(), t)}; }
     TxnOp close() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.close(handler(), t)}; }
+    TxnOp flush() { const Token t = ++nextToken; return TxnOp{&ledger, t, tp.flush(handler(), t)}; }
     TxnOp sendOffsets(const std::map<TopicPartitionKey, int64_t>& o, const std::string& g) {
         const Token t = ++nextToken;
         return TxnOp{&ledger, t, tp.sendOffsetsToTransaction(o, g, handler(), t)};
@@ -629,6 +630,60 @@ TEST(TransactionalProducerTest, EndTxnDeferredUntilAllProduceBatchesAcked) {
     ASSERT_TRUE(commit.ready());
     EXPECT_EQ(commit.status(), OpStatus::Ok);
     EXPECT_FALSE(r.tp.transactionActive());
+}
+
+// E3 (DR tx_read_committed): Kafka flush() — completes once every record sent so far is ACKED (produced and
+// durable), without ending the transaction.  Without it an abort drops unflushed records (dropWaiting_), so
+// aborted data never reaches the log and read_uncommitted consumers cannot see it.
+TEST(TransactionalProducerRegression, FlushWaitsForEveryRecordThenAbortDropsNothing) {
+    TxnRig r;
+    r.acquire(42, 0);
+    r.tp.beginTransaction();
+    const Key key(uint64_t{0});
+    r.tp.send(kTopic, key, std::span<const uint8_t>(kVal));
+    r.tp.send(kTopic, key, std::span<const uint8_t>(kVal));
+    auto flush = r.flush();
+    r.doWork();
+    EXPECT_FALSE(flush.ready()) << "AddPartitions not answered: nothing produced yet";
+    r.addPartitionsOk();
+    r.sink.clear();
+    r.doWork();
+    const auto ids = collectProduceCorrIds(r.sink);
+    ASSERT_EQ(ids.size(), 2u) << "flush produces the waiting records";
+    EXPECT_FALSE(flush.ready()) << "records in flight";
+    {
+        auto ack = makeProduceResponse(ids[0], 0, 0);
+        r.impl->onProduceResponse(ack.data(), ack.size());
+        auto ack2 = makeProduceResponse(ids[1], 0, 1);
+        r.impl->onProduceResponse(ack2.data(), ack2.size());
+    }
+    r.doWork();
+    ASSERT_TRUE(flush.ready());
+    EXPECT_EQ(flush.status(), OpStatus::Ok);
+    EXPECT_EQ(r.sink.count(rpc::TemplateId::EndTxn), 0) << "flush never ends the transaction";
+    EXPECT_TRUE(r.tp.transactionActive());
+    // The abort now only sends EndTxn(abort): the two aborted records are already in the log.
+    r.sink.clear();
+    auto abort = r.abort();
+    ASSERT_EQ(r.cycles(1, rpc::TemplateId::EndTxn), 1);
+    EXPECT_EQ(collectProduceCorrIds(r.sink).size(), 0u);
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    auto opt = rpc::EndTxn::decode(et.data(), et.size());
+    ASSERT_TRUE(opt.has_value());
+    auto resp = makeEndTxnResponse(opt->correlationId, 0);
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(abort.ready());
+    EXPECT_EQ(abort.status(), OpStatus::Ok);
+}
+
+// A flush with nothing in flight (no open transaction) completes Ok at once.
+TEST(TransactionalProducerRegression, FlushWithNothingPendingCompletesAtOnce) {
+    TxnRig r;
+    r.acquire(42, 0);
+    auto flush = r.flush();
+    r.doWork();
+    ASSERT_TRUE(flush.ready());
+    EXPECT_EQ(flush.status(), OpStatus::Ok);
 }
 
 // TX-6b + fix round 1 (C-1): a batch that times out (duty clock — no sleep)

@@ -562,6 +562,9 @@ static int doTxnProduce(Client& c, const TopicHandle& th,
         if (doCommit) {
             tp.commitTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
         } else {
+            // Kafka parity: an abort drops records not yet produced — flush first so the aborted records
+            // reach the log (read_uncommitted consumers see them; read_committed must not).
+            tp.flushAndWait(std::chrono::milliseconds(timeoutMs * 2));
             tp.abortTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
         }
     } catch (const std::exception& ex) {

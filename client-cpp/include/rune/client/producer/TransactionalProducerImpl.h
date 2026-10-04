@@ -429,6 +429,7 @@ private:
     bool sendFrame_(std::vector<uint8_t>& frame, int64_t sessionId, const SendFn& sendFn);
     void sweep_(int64_t nowNs);
     bool dataSettled_() const noexcept;
+    void gateFlushes_();
     void gateEndTxn_(int64_t nowNs);
     [[nodiscard]] int64_t opDeadline_(int64_t nowNs) const noexcept {
         return nowNs + cfg_.transactionOpTimeoutMs * 1'000'000LL;

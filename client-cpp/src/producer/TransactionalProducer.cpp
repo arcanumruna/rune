@@ -128,6 +128,12 @@ OpResult TransactionalProducer::commitTransaction(CompletionTarget target, Token
     return issue_(cmd, target, token, OpKind::CommitTransaction);
 }
 
+OpResult TransactionalProducer::flush(CompletionTarget target, Token token) {
+    detail::HubCommand cmd;
+    cmd.op = detail::HubCommand::Op::TxnFlush;
+    return issue_(cmd, target, token, OpKind::Flush);
+}
+
 OpResult TransactionalProducer::abortTransaction(CompletionTarget target, Token token) {
     detail::HubCommand cmd;
     cmd.op = detail::HubCommand::Op::TxnEnd;
@@ -190,6 +196,14 @@ void TransactionalProducer::commitTransactionAndWait(std::chrono::nanoseconds ti
     andWait_("commitTransaction()", timeout,
              [](void* s, const CompletionTarget& t, Token k) {
                  return static_cast<TransactionalProducer*>(s)->commitTransaction(t, k);
+             },
+             this);
+}
+
+void TransactionalProducer::flushAndWait(std::chrono::nanoseconds timeout) {
+    andWait_("flush()", timeout,
+             [](void* s, const CompletionTarget& t, Token k) {
+                 return static_cast<TransactionalProducer*>(s)->flush(t, k);
              },
              this);
 }

@@ -178,6 +178,10 @@ public:
     OpResult commitTransaction(CompletionTarget target, Token token);
     /// EndTxn(abort).
     OpResult abortTransaction(CompletionTarget target, Token token);
+    /// Kafka flush(): completes Ok once every record sent so far is produced and acked (the transaction stays
+    /// open); with the transaction's failure status if it failed meanwhile.  Before an abort it makes the
+    /// aborted records reach the log (an abort drops records not yet produced).
+    OpResult flush(CompletionTarget target, Token token);
 
     // ---- *AndWait: cold-path blocking forms (throw std::runtime_error on any
     //      non-Ok outcome or wait timeout; std::logic_error from a callback) ---
@@ -187,6 +191,7 @@ public:
                                          std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     void commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    void flushAndWait(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     // ---- Close (F8c C7) ---------------------------------------------------------
 

@@ -96,6 +96,8 @@ struct HubCommand {
         /// closeImmediately: discard locally (pending ops complete Closed, a
         /// pending close token completes Closed); no completion of its own.
         TxnCloseNow     = 36,
+        /// Token op: flush — completes once every record sent so far is acked (Kafka producer.flush()).
+        TxnFlush        = 37,
 
         // ---- Handle release (F8c C7, spec §3.3) ---------------------------------
         /// handle = the impl, a = HandleKind.  The handle gives its share of

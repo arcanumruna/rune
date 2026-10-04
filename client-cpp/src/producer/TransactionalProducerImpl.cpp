@@ -87,7 +87,7 @@ bool TransactionalProducerImpl::isTxnOp(detail::HubCommand::Op op) noexcept {
     using Op = detail::HubCommand::Op;
     return op == Op::TxnInit || op == Op::TxnBegin || op == Op::TxnSend ||
            op == Op::TxnSendOffsets || op == Op::TxnEnd || op == Op::TxnClose ||
-           op == Op::TxnCloseNow;
+           op == Op::TxnCloseNow || op == Op::TxnFlush;
 }
 
 void TransactionalProducerImpl::discardCommand(const detail::HubCommand& cmd,
@@ -111,6 +111,9 @@ void TransactionalProducerImpl::discardCommand(const detail::HubCommand& cmd,
         break;
     case Op::TxnClose:
         kind = OpKind::TxnClose;
+        break;
+    case Op::TxnFlush:
+        kind = OpKind::Flush;
         break;
     case Op::TxnCloseNow:
         return;
@@ -176,6 +179,9 @@ void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int6
         case Op::TxnEnd:
             refuse_(cmd, cmd.d != 0 ? OpKind::CommitTransaction : OpKind::AbortTransaction, OpStatus::Fenced,
                     f->errorCode, "producer fenced (fatal)");
+            return;
+        case Op::TxnFlush:
+            refuse_(cmd, OpKind::Flush, OpStatus::Fenced, f->errorCode, "producer fenced (fatal)");
             return;
         default:
             return;
@@ -247,6 +253,18 @@ void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int6
         ops_.push_back(std::move(op));
         const int64_t corr = addRequest_(ReqKind::AddOffsets, id, dl);
         if (UserOp* o = findOp_(id)) o->phase = UserOp::AddOffsets{corr};
+        return;
+    }
+    case Op::TxnFlush: {
+        // E3: Kafka flush() — waits (gateFlushes_) until every record sent so far is acked.
+        UserOp op;
+        op.id         = nextOpId_++;
+        op.kind       = OpKind::Flush;
+        op.target     = detail::decodeTarget(cmd);
+        op.token      = static_cast<Token>(cmd.a);
+        op.deadlineNs = opDeadline_(nowNs);
+        op.phase      = UserOp::AwaitData{};
+        ops_.push_back(std::move(op));
         return;
     }
     case Op::TxnEnd: {
@@ -739,6 +757,21 @@ bool TransactionalProducerImpl::dataSettled_() const noexcept {
     return true;
 }
 
+void TransactionalProducerImpl::gateFlushes_() {
+    // E3: a flush completes once the data settled (every record produced + acked), or with the
+    // transaction's failure once it is poisoned (its records will never all be acked).
+    const auto* ae = std::get_if<SAbortableError>(&state_);
+    if (ae == nullptr && !dataSettled_()) return;
+    for (;;) {
+        uint64_t id = 0;
+        for (const auto& op : ops_)
+            if (op.kind == OpKind::Flush && std::holds_alternative<UserOp::AwaitData>(op.phase)) { id = op.id; break; }
+        if (id == 0) return;
+        if (ae != nullptr) completeAndErase_(id, ae->status, ae->errorCode, "flush: the transaction failed");
+        else completeAndErase_(id, OpStatus::Ok);
+    }
+}
+
 void TransactionalProducerImpl::gateEndTxn_(int64_t nowNs) {
     uint64_t id = 0;
     bool started = false;
@@ -916,6 +949,7 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
 
     // TX-6: EndTxn once the data settled (may add the EndTxn request).
     gateEndTxn_(nowNs);
+    gateFlushes_();
     // F8c C7: a close whose abort just ended locally completes in this cycle.
     if (closingDuty()) [[unlikely]] {
         closeStep_(nowNs);
