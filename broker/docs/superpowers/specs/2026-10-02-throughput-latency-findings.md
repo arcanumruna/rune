@@ -668,6 +668,11 @@ p99 9.5 ms) is confirmed in direction.  Stopped after 2 rounds per arm (they agr
 
 ### 4.16 A10 root cause: periodic fsync at 5 ms saturates the disk's IOPS (2026-10-04, k3s-node-01)
 
+> **CORRECTION (2026-10-04, see §4.16.1):** the conclusion of this section is WRONG — it rests on one sample.  The
+> interleaved A/B in §4.16.1 shows the collapse does not follow disk load (collapsed runs at 23-35% disk busy).  The
+> evidence points to a ~10 s shard-loop stall (pwrite blocked behind ext4 journal commits) that trips the 10 s ISR lag
+> limit and client session lease.  Group commit (below) does not fix it.
+
 Binary: integ/perf-defaults 0960e2a (D2 + A7/A9 + D6 + D8b/c), client integ/client-2026-10-04; reference config
 (MTU 1408 + GSO, backoff workers, logs off), 3-node acks=all 1 KiB, 20k rec/s open loop, leader + follower periodic
 fsync 5 ms (RUNE_WORKER_SYNC_INTERVAL_MS=5, RUNE_FOLLOWER_FLUSH_INTERVAL_MS=5).  One run: achieved 17.4k (< 20k),
