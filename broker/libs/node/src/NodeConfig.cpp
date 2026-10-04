@@ -1168,12 +1168,15 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default ("sleep-ns").
 
-    // --- RUNE_MAX_HELD_IDLE_MS (optional, D8b) --- held-session no-progress reap bound.
+    // --- RUNE_MAX_HELD_IDLE_MS (optional, D8b) --- held-session no-progress reap bound, 1 ms .. 24 h
+    // (bounded: BrokerNode converts it to ns — no overflow; re-review LOW-B).
     if (const char* raw = getenv_fn("RUNE_MAX_HELD_IDLE_MS"); raw && *raw) {
+        constexpr long long kMaxHeldIdleMsCap = 24LL * 3600 * 1000;
         char* end = nullptr;
+        errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end == raw || *end != '\0' || v < 1)
-            return {{}, std::string("RUNE_MAX_HELD_IDLE_MS must be a positive integer (ms), got '") + raw + "'"};
+        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 || v > kMaxHeldIdleMsCap)
+            return {{}, std::string("RUNE_MAX_HELD_IDLE_MS must be an integer in [1, 86400000] (ms), got '") + raw + "'"};
         cfg.maxHeldIdleMs = v;
     }
 

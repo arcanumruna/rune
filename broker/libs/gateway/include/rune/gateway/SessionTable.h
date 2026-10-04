@@ -41,6 +41,11 @@ struct Session {
     // set = worker w holds acks for this session (SessionSignal Held/Released).
     // Non-zero → the gateway ABORTs this session's Produce frames.
     uint64_t                                       heldByWorkers = 0;
+    // D8b round 2: bit w set = worker w reports this session's ack publication
+    // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero.
+    // Non-zero → reapExpired uses the normal lease measured from lostSinceNs.
+    uint64_t                                       lostByWorkers = 0;
+    int64_t                                        lostSinceNs   = 0;
 };
 
 // ---------------------------------------------------------------------------

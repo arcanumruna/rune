@@ -15,6 +15,9 @@
 //                         | Failed(reported)                     can never deliver
 //   per ack      sessionPos — the lifecycle-ring producer position an ack of a
 //                not-yet-known session is held against (fix round 1, I1).
+//   per session  Edges — what the runtime was told (reportedHeld, reportedLost),
+//                the current Lost verdict, a pending Progress and the pass of
+//                the last Held / Progress report (D8b round 2).
 //
 // Coalescing: every ack due in a pass is claimed in one flush, before the shard's
 // next driver duty cycle, so the sender ships each session's acks together (one
@@ -22,11 +25,26 @@
 // unchanged (resolution of the §3.4 "one frame" wording).
 //
 // Never-drop, time-independent (G-A6, §1a.9 — fix round 1, C1/C2).  An ack that
-// cannot be claimed (back-pressured, or the client image not yet connected) stays
-// queued in order, for as long as it takes — there is NO timer: a slow client
-// drains at its own pace while the worker pauses ONLY that session's intake
-// (holding() → the worker ABORTs its frames in a controlled poll).  Acks are
-// dropped only on STATE events:
+// cannot be claimed (BACK_PRESSURED, NOT_CONNECTED, ADMIN_ACTION, or the
+// publication not yet resolved) stays queued in order — the sink has NO timer: a
+// slow client drains at its own pace while the worker pauses ONLY that session's
+// intake (holding() → the worker ABORTs its frames in a controlled poll).  The
+// sink only REPORTS per-session edges (reportSessionEdges); every time bound
+// lives in the runtime's session leases (ClientGateway::reapExpired):
+//   * Held / Released — the session has acks queued after a flush / no longer;
+//   * Lost / Found (D8b round 2) — a claim returned NOT_CONNECTED (Aeron: no
+//     status message from the client's driver for the publication-connection
+//     timeout, 5 s by default — a dead client, an unreachable egress endpoint,
+//     a client that stopped pumping its Aeron runtime (invoker mode), or a
+//     network blip; also a publication that never connected) / a later claim
+//     saw it connected (success, BACK_PRESSURED or ADMIN_ACTION — Aeron returns
+//     those only while connected).  Acks are NEVER dropped for Lost; the runtime
+//     reaps a session that stays Lost for its normal lease, which then drops
+//     them through the close below;
+//   * Progress — acks of a session the runtime knows as Held were claimed (the
+//     client reads); at most once per kProgressPassInterval passes per session
+//     (a pass count, never a clock), so the runtime refreshes its lease.
+// Acks are dropped only on STATE events:
 //   * the session was closed by the runtime (Disconnect / lease reap / connect
 //     timeout / SessionFailed) — the client is gone;
 //   * its publication can never deliver (add / find error, CLOSED,
@@ -46,6 +64,7 @@
 // delete), no node containers.  std::string only inside the policy's add()
 // (announcement, cold path).  Owner: the worker thread only.
 #include <rune/node/AeronChannel.h>
+#include <rune/node/SessionSignalKind.h>
 #include <rune/protocol/client/DataMessages.h>
 
 #include <Aeron.h>
@@ -88,13 +107,22 @@ public:
     /// A claim result meaning "this publication can never deliver" (Aeron CLOSED
     /// / MAX_POSITION_EXCEEDED, mapped by the policy) → the session fails now.
     static constexpr int64_t     kClaimFatal       = -4;
-    /// Aeron NOT_CONNECTED: no subscriber.  Fatal only after the publication delivered at least once (D8b
-    /// review CRITICAL-1: the client is gone — a live slow reader stays connected and back-pressures).
+    /// Aeron NOT_CONNECTED (static_assert at the Aeron policy): the session is
+    /// marked Lost — its acks stay queued in order; any other non-fatal claim
+    /// result (or a success) clears it.  A suspicion, never a verdict: the
+    /// runtime decides on its lease (D8b round 2, re-review MAJOR-A).
     static constexpr int64_t     kClaimNotConnected = -1;
+    /// Progress rate limit, in PASSES (the sink has no clock): a held session that
+    /// drains reports Progress at most once per this many flushes, counted from its
+    /// Held edge / previous Progress.  A worker under backoff idle passes at
+    /// >= ~5k/s (200 µs max park) and far faster when busy, so 1024 passes is
+    /// <= ~200 ms (~100 ms at ~10k passes/s) — orders of magnitude inside the
+    /// runtime's held bound (10 min), at <= ~10 signals/s per held session.
+    static constexpr uint64_t    kProgressPassInterval = 1024;
 
     struct PubAnnounced { uint16_t chan = 0; uint16_t chanLen = 0; int32_t streamId = 0; };
     struct PubResolving { int64_t regId = -1; };
-    struct PubReady     { PubHandle pub{}; uint64_t blockedPass = 0; bool delivered = false; };
+    struct PubReady     { PubHandle pub{}; uint64_t blockedPass = 0; };
     /// reported == false: the runtime has not yet been told (reportFailures).
     struct PubFailed    { bool reported = true; };
     using PubState = std::variant<PubAnnounced, PubResolving, PubReady, PubFailed>;
@@ -117,6 +145,7 @@ public:
         if (idx == kNone) idx = insert_(sessionId);
         if (idx == kNone) return false;                                   // table full
         PubState& st = states_[idx];
+        if (edges_[idx].lost) { edges_[idx].lost = 0; markDirty_(idx); }   // a fresh publication: not lost (yet)
         // m3: an Announced / Resolving session is already in unresolved_.
         const bool listed = std::holds_alternative<PubAnnounced>(st) || std::holds_alternative<PubResolving>(st);
         leaveState_(st);
@@ -182,18 +211,18 @@ public:
                 if (r->blockedPass != pass_) {                      // per-session order kept
                     const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, dst); });
                     if (pos > 0) [[likely]] {
-                        r->delivered = true;
+                        if (const Edges& e = edges_[idx]; (e.lost | e.reportedHeld) != 0) [[unlikely]] claimedWatched_(idx);
                         ++work;
                         continue;
                     }
-                    if (pos == kClaimFatal || (pos == kClaimNotConnected && r->delivered)) [[unlikely]] {
-                        // can never deliver: CLOSED / MAX_POSITION, or the subscriber that WAS connected is gone
+                    if (pos == kClaimFatal) [[unlikely]] {           // can never deliver: CLOSED / MAX_POSITION
                         fail_(st);
                         ++dropped_;
                         ++work;
                         continue;
                     }
-                    r->blockedPass = pass_;                         // back-pressured / not yet connected
+                    setLost_(idx, pos == kClaimNotConnected);         // D8b round 2: suspicion, acks stay queued
+                    r->blockedPass = pass_;                         // back-pressured / not connected
                 }
             } else if (std::holds_alternative<PubFailed>(st)) {
                 ++dropped_;                                          // reported → the runtime closes it
@@ -212,7 +241,7 @@ public:
     }
 
     /// G-A6 per-client pause: `sessionId` still holds acks after the last flush
-    /// (its publication back-pressured / not yet resolved).  O(1) when nothing
+    /// (its publication back-pressured / not connected / not yet resolved).  O(1) when nothing
     /// is held (the hot case) — one hash probe otherwise.
     [[nodiscard]] bool holding(int64_t sessionId) const noexcept {
         if (heldAfterFlush_ == 0) [[likely]] return false;
@@ -241,13 +270,21 @@ public:
         return n;
     }
 
-    /// Fix round 2 (finding 1): report every session whose held state changed
-    /// since the runtime last heard: `tryReport(sessionId, held)` returns false
-    /// when it cannot deliver now (return ring full) — retried next pass, never
-    /// lost.  One edge per transition (no repeats while the state is stable).
-    /// A closed session needs no report: the runtime's close clears its state.
+    /// Report every per-session edge the runtime has not heard yet, as
+    /// `tryReport(sessionId, SessionSignalKind)` — in this order per session:
+    ///   Lost / Found      the Lost verdict changed (D8b round 2);
+    ///   Held / Released   the held state changed (fix round 2, finding 1);
+    ///   Progress          acks of a reported-Held session were claimed, at most
+    ///                     once per kProgressPassInterval passes since its Held
+    ///                     edge / previous Progress (a pending one waits for the
+    ///                     interval — never lost; dropped by Released).
+    /// One signal per transition (no repeats while a state is stable).
+    /// tryReport returns false when it cannot deliver now (return ring full):
+    /// what was reported is recorded, the rest is retried next pass — never lost,
+    /// never through an unbounded queue.  A closed session needs no report: the
+    /// runtime's close clears its state.  Returns how many were reported.
     template <class TryReport>
-    int reportHoldChanges(TryReport&& tryReport) noexcept {
+    int reportSessionEdges(TryReport&& tryReport) noexcept {
         if (dirtyCount_ == 0) [[likely]] return 0;
         int n = 0;
         std::size_t keep = 0, k = 0;
@@ -255,12 +292,32 @@ public:
             const int64_t sid = dirty_[k];
             const std::size_t idx = find_(sid);
             if (idx == kNone) continue;                              // closed
-            dirtyFlag_[idx] = 0;
-            const bool held = heldPass_[idx] == pass_ && heldAfterFlush_ != 0;
-            if (held == (reportedHeld_[idx] != 0)) continue;         // flipped back: nothing to say
-            if (!tryReport(sid, held)) { dirtyFlag_[idx] = 1; break; }
-            reportedHeld_[idx] = held ? 1 : 0;
-            ++n;
+            Edges& e = edges_[idx];
+            e.dirty = 0;
+            if (e.lost != e.reportedLost) {
+                if (!tryReport(sid, e.lost ? SessionSignalKind::Lost : SessionSignalKind::Found)) { e.dirty = 1; break; }
+                e.reportedLost = e.lost;
+                ++n;
+            }
+            const uint8_t held = (heldPass_[idx] == pass_ && heldAfterFlush_ != 0) ? 1 : 0;
+            if (held != e.reportedHeld) {
+                if (!tryReport(sid, held ? SessionSignalKind::Held : SessionSignalKind::Released)) { e.dirty = 1; break; }
+                e.reportedHeld = held;
+                e.progressed   = 0;                                  // Released: moot; Held: counted from now
+                e.progressPass = pass_;
+                ++n;
+            }
+            if (e.progressed) {
+                if (pass_ - e.progressPass < kProgressPassInterval) {   // rate limit: wait, stay listed
+                    e.dirty = 1;
+                    dirty_[keep++] = sid;
+                    continue;
+                }
+                if (!tryReport(sid, SessionSignalKind::Progress)) { e.dirty = 1; break; }
+                e.progressed   = 0;
+                e.progressPass = pass_;
+                ++n;
+            }
         }
         for (; k < dirtyCount_; ++k) dirty_[keep++] = dirty_[k];      // the unreported tail
         dirtyCount_ = keep;
@@ -309,7 +366,7 @@ private:
         while (keys_[i] != 0) i = (i + 1) & kMask;
         keys_[i] = sid;
         states_[i] = PubFailed{};                                    // neutral (reported) placeholder
-        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0;
+        heldPass_[i] = 0; edges_[i] = Edges{};
         ++count_;
         return i;
     }
@@ -317,7 +374,7 @@ private:
         leaveState_(states_[i]);
         keys_[i] = 0;
         states_[i] = PubFailed{};                                    // releases a Ready publication
-        heldPass_[i] = 0; reportedHeld_[i] = 0; dirtyFlag_[i] = 0;
+        heldPass_[i] = 0; edges_[i] = Edges{};
         --count_;
         std::size_t j = i;
         for (;;) {
@@ -329,11 +386,10 @@ private:
             keys_[i] = keys_[j];
             states_[i] = std::move(states_[j]);
             heldPass_[i] = heldPass_[j];
-            reportedHeld_[i] = reportedHeld_[j];
-            dirtyFlag_[i] = dirtyFlag_[j];
+            edges_[i] = edges_[j];
             keys_[j] = 0;
             states_[j] = PubFailed{};
-            heldPass_[j] = 0; reportedHeld_[j] = 0; dirtyFlag_[j] = 0;
+            heldPass_[j] = 0; edges_[j] = Edges{};
             i = j;
         }
     }
@@ -361,21 +417,36 @@ private:
         }
         for (std::size_t k = 0; k < heldNowCount_; ++k) {
             const std::size_t idx = find_(heldNow_[k]);
-            if (idx != kNone && reportedHeld_[idx] == 0) markDirty_(idx);   // newly held
+            if (idx != kNone && edges_[idx].reportedHeld == 0) markDirty_(idx);   // newly held
         }
         for (std::size_t k = 0; k < heldNowCount_; ++k) heldPrev_[k] = heldNow_[k];   // only the live prefix
         heldPrevCount_ = heldNowCount_;
         heldNowCount_ = 0;
     }
+    /// D8b round 2: a claim on a Lost or reported-Held session succeeded — it is
+    /// connected (Found) and, if the runtime knows it Held, it progressed.
+    void claimedWatched_(std::size_t idx) noexcept {
+        Edges& e = edges_[idx];
+        if (e.lost) { e.lost = 0; markDirty_(idx); }
+        if (e.reportedHeld && !e.progressed) { e.progressed = 1; markDirty_(idx); }
+    }
+    /// D8b round 2: a failed (non-fatal) claim's verdict — NOT_CONNECTED = Lost;
+    /// BACK_PRESSURED / ADMIN_ACTION = connected (Aeron returns them only then).
+    void setLost_(std::size_t idx, bool lost) noexcept {
+        Edges& e = edges_[idx];
+        if (e.lost == static_cast<uint8_t>(lost)) [[likely]] return;
+        e.lost = lost ? 1 : 0;
+        markDirty_(idx);
+    }
     void markDirty_(std::size_t idx) noexcept {
-        if (dirtyFlag_[idx]) return;
+        if (edges_[idx].dirty) return;
         if (dirtyCount_ == kMaxSessions) [[unlikely]] {              // closed sessions' entries: compact
             std::size_t keep = 0;
             for (std::size_t k = 0; k < dirtyCount_; ++k)
-                if (const std::size_t j = find_(dirty_[k]); j != kNone && dirtyFlag_[j]) dirty_[keep++] = dirty_[k];
+                if (const std::size_t j = find_(dirty_[k]); j != kNone && edges_[j].dirty) dirty_[keep++] = dirty_[k];
             dirtyCount_ = keep;                                      // < kMaxSessions live sessions
         }
-        dirtyFlag_[idx] = 1;
+        edges_[idx].dirty = 1;
         dirty_[dirtyCount_++] = keys_[idx];                          // <= one entry per live session
     }
     /// Release registrations whose session went away while they resolved.
@@ -451,9 +522,18 @@ private:
     std::array<int64_t, kMaxSessions>                                keys_{};      // 0 = empty
     std::array<PubState, kMaxSessions>                               states_{};
     std::array<uint64_t, kMaxSessions>                               heldPass_{};  // pass that last held acks
-    std::array<uint8_t, kMaxSessions>                                reportedHeld_{};  // what the runtime knows
-    std::array<uint8_t, kMaxSessions>                                dirtyFlag_{};     // in dirty_
-    std::array<int64_t, kMaxSessions>                                dirty_{};         // held state to report
+    /// Per-session report state (D8b round 2).  Reset in insert_ / erase_, moved
+    /// with its key by erase_'s backward shift — like heldPass_.
+    struct Edges {
+        uint64_t progressPass = 0;   ///< pass of the last Held / Progress report (rate limit)
+        uint8_t  reportedHeld = 0;   ///< what the runtime was told: Held
+        uint8_t  dirty        = 0;   ///< listed in dirty_
+        uint8_t  lost         = 0;   ///< the last non-fatal claim result was NOT_CONNECTED
+        uint8_t  reportedLost = 0;   ///< what the runtime was told: Lost
+        uint8_t  progressed   = 0;   ///< acks claimed while reportedHeld, Progress not yet reported
+    };
+    std::array<Edges, kMaxSessions>                                  edges_{};
+    std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report
     std::size_t                                                      dirtyCount_ = 0;
     std::array<int64_t, kMaxSessions>                                heldNow_{};       // held this flush
     std::array<int64_t, kMaxSessions>                                heldPrev_{};      // held last flush
@@ -507,6 +587,8 @@ struct AeronSessionPubPolicy {
     }
 };
 static_assert(SessionAckSinkT<AeronSessionPubPolicy>::kClaimFatal == -4);
+static_assert(SessionAckSinkT<AeronSessionPubPolicy>::kClaimNotConnected == aeron::NOT_CONNECTED,
+              "the policy passes NOT_CONNECTED through unchanged");
 
 using SessionAckSink = SessionAckSinkT<AeronSessionPubPolicy>;
 

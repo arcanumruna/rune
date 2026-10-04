@@ -257,8 +257,9 @@ struct NodeConfig {
     // is only the lost-push backstop + ISR keepalive.  Exposed so acks=all
     // round-trip cadence can be tuned/measured on shared hardware.
     int64_t fetchIntervalNs = 5'000'000LL;
-    // D8b: a back-pressure-paused (held) client session is reaped only after this long without progress
-    // (RUNE_MAX_HELD_IDLE_MS; 0 = gateway default 10 min, Kafka connections.max.idle.ms).
+    // D8b: a back-pressure-paused (held) client session is reaped only after this long without activity
+    // or a worker Progress signal (RUNE_MAX_HELD_IDLE_MS, 1 ms .. 24 h; 0 = gateway default 10 min, Kafka
+    // connections.max.idle.ms).
     int64_t maxHeldIdleMs = 0;
 
     // Backoff idle max park (RUNE_IDLE_MAX_PARK_US, default 200µs) for the runtime

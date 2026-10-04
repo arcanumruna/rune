@@ -36,6 +36,7 @@
 // vectors.  Move-semantics for the vectors ensure no copies on the hot path.
 
 #include <rune/replication/ReplicationMessages.h>  // FetchResponseMsg
+#include <rune/node/SessionSignalKind.h>
 #include <rune/storage/Log.h>
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/WorkerOp.h>
@@ -327,8 +328,7 @@ struct WorkerOp {
 // ---------------------------------------------------------------------------
 // WorkerReturn — result sent from Worker back to the control thread.
 // ---------------------------------------------------------------------------
-/// WorkerReturn::Type::SessionSignal kinds (carried in WorkerReturn::lastOffset).
-enum class SessionSignalKind : int64_t { Failed = 0, Held = 1, Released = 2 };
+// SessionSignalKind (the WorkerReturn::Type::SessionSignal kinds): rune/node/SessionSignalKind.h.
 
 struct WorkerReturn {
     enum class Type : uint8_t {
@@ -343,7 +343,15 @@ struct WorkerReturn {
         ///              than it produces): the runtime pauses that session's
         ///              gateway intake (controlled ABORT) — G-A6 on the
         ///              gateway-routed path;
-        ///   Released — no longer held on this worker.
+        ///   Released — no longer held on this worker;
+        ///   Lost / Found (D8b) — its ack publication reports NOT_CONNECTED /
+        ///              is connected again; acks stay queued meanwhile — the
+        ///              runtime reaps a session lost on any worker on the
+        ///              normal lease measured from the Lost edge;
+        ///   Progress (D8b) — a held session's acks are being claimed (the
+        ///              client reads): the runtime refreshes its lease.
+        ///              At most once per SessionAckSink::kProgressPassInterval
+        ///              passes per session.
         /// Rides sbe ReturnType value 2 — RESERVED_2 (PRODUCE_NOTIFY, retired by
         /// F15 §7; static_assert in WorkerReturnCodec.h); in-process ring only.
         SessionSignal = 2,

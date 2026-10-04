@@ -127,7 +127,9 @@ public:
     // Default session timeout: 10 seconds.
     static constexpr int64_t kDefaultSessionTimeoutNs = 10LL * 1'000'000'000LL;
     /// D8b: a HELD session (paused by back-pressure while it has not read its acks) is reaped only after this
-    /// long without progress — Kafka connections.max.idle.ms (10 min).  RUNE_MAX_HELD_IDLE_MS.
+    /// long without activity or a worker Progress signal (the client reading its acks) — Kafka
+    /// connections.max.idle.ms (10 min).  RUNE_MAX_HELD_IDLE_MS (NodeConfig bounds it to 1 ms .. 24 h).
+    /// A session Lost on any worker is reaped on sessionTimeoutNs from its Lost edge instead (reapExpired).
     static constexpr int64_t kDefaultMaxHeldIdleNs = 600LL * 1'000'000'000LL;
     void setMaxHeldIdleNs(int64_t ns) noexcept { maxHeldIdleNs_ = ns > 0 ? ns : kDefaultMaxHeldIdleNs; }
 
@@ -1545,6 +1547,11 @@ public:
         return s ? s->lastSeenNs : -1;
     }
     void reapExpiredForTest(int64_t nowNs) { reapExpired(nowNs); }
+    /// D8b round 2: some worker reports `sid`'s ack publication Lost (NOT_CONNECTED).
+    [[nodiscard]] bool sessionLostForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s && s->lostByWorkers != 0;
+    }
     // Fix round 1 (I2) seams: a resolved-or-not pending connect with the given
     // announce state (no Aeron publication), the cap accounting, eviction.
     void injectPendingConnectForTest(int64_t sessionId, bool announceBegun) {

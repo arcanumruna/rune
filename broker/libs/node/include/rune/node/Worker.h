@@ -1781,7 +1781,11 @@ private:
     //            runtime closes the session everywhere and tells the client;
     //   Held / Released (finding 1) — G-A6 on the gateway-routed path: the
     //            runtime pauses that session's gateway produce frames while any
-    //            worker holds its acks (controlled ABORT on its image).
+    //            worker holds its acks (controlled ABORT on its image);
+    //   Lost / Found / Progress (D8b round 2) — its ack publication reports
+    //            NOT_CONNECTED / is connected again / a held session's acks are
+    //            being claimed: the runtime's lease decides (reapExpired); the
+    //            sink never drops acks for them.
     // Written straight to ret_ only when nothing is queued ahead (never through
     // the FIFO: its static bound is unchanged); otherwise the fact stays
     // recorded in the sink's per-session state and is retried next pass
@@ -1801,9 +1805,7 @@ private:
     }
     int reportSessionSignals_() {
         int n = ackSink_->reportFailures([this](int64_t sid) { return trySessionSignal_(sid, SessionSignalKind::Failed); });
-        n += ackSink_->reportHoldChanges([this](int64_t sid, bool held) {
-            return trySessionSignal_(sid, held ? SessionSignalKind::Held : SessionSignalKind::Released);
-        });
+        n += ackSink_->reportSessionEdges([this](int64_t sid, SessionSignalKind k) { return trySessionSignal_(sid, k); });
         return n;
     }
 

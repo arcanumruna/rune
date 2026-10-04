@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -1345,6 +1346,125 @@ TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
         for (int64_t c = c0; c < c0 + n; ++c)                 // A reads again: nothing lost
             ASSERT_TRUE(a.awaitProduceResponse(c).has_value()) << "ack " << c - c0 << " of " << n;
     }
+    node.stop();
+}
+
+// D8b round 2 (re-review LOW-A / CRITICAL-1 / MAJOR-A), REAL driver, default broker config.  A gateway-routed
+// client paused by back-pressure (acks held, produce intake ABORTed) ...
+namespace {
+template <class Pred>
+bool awaitBrokerState(Pred&& pred, std::chrono::seconds budget) {   // bounded poll of a real broker condition
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(1ms);                              // poll interval only (client NOT pumped)
+    }
+    return pred();
+}
+int64_t pauseClient(ShardTestClient& a, const std::string& gw, int64_t sidA, int64_t c0,
+                    const std::function<bool()>& paused) {
+    const auto batch = makeBatch(1);
+    return a.offerUntilPaused(gw, kClientStream, [&](int64_t i, std::vector<uint8_t>& out) {
+        pc::Produce m;
+        m.sessionId = sidA; m.correlationId = c0 + i; m.topicId = 0; m.partition = 0; m.partitionKnown = 1;
+        m.acks = 0; m.producerId = -1; m.producerEpoch = 0; m.baseSequence = -1;
+        m.recordBatch = std::span<const uint8_t>(batch);
+        out.resize(m.encodedSize());
+        m.encode(out.data());
+    }, /*maxFrames=*/40'000, paused);
+}
+} // namespace
+
+// ... that is KILLED (its Aeron client + driver closed — no more status messages) has its session closed and its
+// owed acks freed within ~ the publication-connection timeout (5 s) + the normal lease (10 s): the worker reports
+// it Lost, the gateway reaps it 10 s later.  (982b50e kept it forever.)  Another session is served afterwards.
+TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
+    TmpDir dir{"killcl"}, ad{"killa"}, bd{"killb"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    const std::string gw = gatewayChannel(ports, 0);
+    auto gatewayPauses = [&] {
+        return node.onControlThreadForTest([&] { return node.gatewayForTest()->heldProduceAbortsForTest(); });
+    };
+    auto sessionAlive = [&](int64_t sid) {
+        return node.onControlThreadForTest([&] { return node.gatewayForTest()->sessionLastSeenNsForTest(sid) >= 0; });
+    };
+    auto acksPending = [&] {
+        return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) {
+            return node.workerForTest(0)->sessionAcksPendingForTest();
+        });
+    };
+    int64_t sidA = 0;
+    {
+        ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/true);
+        sidA = a.connect(gw, kClientStream);
+        ASSERT_GT(sidA, 0);
+        ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, makeBatch(1)));
+        // Precondition: the worker HOLDS A's acks (A reads nothing; 40k acks >> its 128 KiB egress window).  The
+        // gateway pause itself is not required here (it can lag a burst under load — D8c).
+        (void)pauseClient(a, gw, sidA, 50'000'000, [&] { return gatewayPauses() > 0 || acksPending() > 256; });
+        ASSERT_TRUE(awaitBrokerState([&] { return acksPending() > 0; }, 10s))
+            << "the worker holds A's acks (stall offer=" << a.lastStallOffer_ << ")";
+    }                                                                  // A is killed (client + driver closed)
+    const auto killed = std::chrono::steady_clock::now();
+    EXPECT_TRUE(awaitBrokerState([&] { return !sessionAlive(sidA) && acksPending() == 0; }, 40s))
+        << "a killed paused client's session and owed acks must be freed";
+    const auto took = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - killed);
+    EXPECT_LE(took.count(), 25) << "~5 s NOT_CONNECTED + 10 s lease, not the 10-min held bound";
+    ShardTestClient b(bd.path, 1 << 20, true);
+    const int64_t sidB = b.connect(gw, kClientStream);
+    ASSERT_GT(sidB, 0);
+    for (int k = 0; k < 5; ++k)
+        ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB, 0, 0, /*acks=*/1, makeBatch(1), /*maxAttempts=*/3));
+    node.stop();
+}
+
+// ... whose client is INVOKER-driven (rune-client-cpp RunnerMode::Invoker: its driver runs only inside its calls) and
+// stops calling for longer than the publication-connection timeout: the worker's claim reports NOT_CONNECTED
+// (Lost) — a suspicion, not a verdict.  The session and every queued ack survive; once the client pumps again the
+// publication is Found and it reads every ack.  (7dc95c1 failed the session at NOT_CONNECTED and dropped its acks.)
+TEST(ShardModeRegression, PausedInvokerClientSurvivesNotConnectedRegression) {
+    TmpDir dir{"invcl"}, ad{"inva"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    const std::string gw = gatewayChannel(ports, 0);
+    auto gatewayPauses = [&] {
+        return node.onControlThreadForTest([&] { return node.gatewayForTest()->heldProduceAbortsForTest(); });
+    };
+    ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/true, DriverMode::Invoker);
+    const int64_t sidA = a.connect(gw, kClientStream);
+    ASSERT_GT(sidA, 0);
+    ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, makeBatch(1)));
+    constexpr int64_t c0 = 50'000'000;
+    auto acksPending = [&] {
+        return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) {
+            return node.workerForTest(0)->sessionAcksPendingForTest();
+        });
+    };
+    // Precondition: the worker HOLDS A's acks (the gateway pause can lag a burst under load — D8c).
+    const int64_t n = pauseClient(a, gw, sidA, c0, [&] { return gatewayPauses() > 0 || acksPending() > 256; });
+    ASSERT_GT(n, 0) << "stall offer=" << a.lastStallOffer_;
+    ASSERT_TRUE(awaitBrokerState([&] { return acksPending() > 0; }, 10s)) << "the worker holds A's acks";
+    // The client stops pumping until the broker has seen its publication go NOT_CONNECTED (or, pre-fix, closed it).
+    auto lostOrClosed = [&] {
+        return node.onControlThreadForTest([&] {
+            auto* g = node.gatewayForTest();
+            return g->sessionLostForTest(sidA) || g->sessionLastSeenNsForTest(sidA) < 0;
+        });
+    };
+    ASSERT_TRUE(awaitBrokerState(lostOrClosed, 20s)) << "no status messages for > 5 s -> NOT_CONNECTED";
+    EXPECT_TRUE(node.onControlThreadForTest([&] { return node.gatewayForTest()->sessionLastSeenNsForTest(sidA) >= 0; }))
+        << "NOT_CONNECTED alone must not close a live client's session";
+    for (int64_t c = c0; c < c0 + n; ++c)                          // pumps again: Found, every ack arrives
+        ASSERT_TRUE(a.awaitProduceResponse(c).has_value()) << "ack " << c - c0 << " of " << n;
+    EXPECT_TRUE(node.onControlThreadForTest([&] {
+        auto* g = node.gatewayForTest();
+        return !g->sessionLostForTest(sidA) && g->sessionLastSeenNsForTest(sidA) >= 0;
+    })) << "Found clears Lost; the session lives on";
     node.stop();
 }
 

@@ -457,14 +457,15 @@ int ClientGateway::doWork(int64_t nowNs) {
         // ABORT stops the WHOLE image: every later frame of that client —
         // Keepalive, Metadata, Disconnect, … — waits behind the aborted Produce
         // until Released, a close (SessionFailed), or the lease reap.  No
-        // deadlock (releasing a held ack never needs a gateway frame); while
-        // paused, the client's lease is refreshed by the post-ack notifications
-        // of the acks it does read, and a HELD session is reaped only after
-        // maxHeldIdleNs without progress (D8b: on the normal lease a paused
-        // client that had not read yet was reaped and lost every queued ack);
-        // a held client that dies is failed by its worker (NOT_CONNECTED after
-        // delivering) — the stuck frame never drains its image, so the image is
-        // no liveness signal.
+        // deadlock (releasing a held ack never needs a gateway frame).  The
+        // stuck frame never drains its image, so the image is no liveness
+        // signal; the lease of a paused session comes from the workers' signals
+        // (reapExpired, D8b): a HELD session is reaped after maxHeldIdleNs_
+        // without a Progress signal (the worker claimed acks for it, i.e. the
+        // client reads); a session LOST on any worker (its ack publication
+        // NOT_CONNECTED — dead client, unreachable egress, or a client that
+        // stopped pumping its Aeron runtime) is reaped sessionTimeoutNs_ after
+        // the Lost edge unless a Found edge clears it first.
         work += sub_->controlledPoll(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
                    aeron::Header& h) {
@@ -752,11 +753,13 @@ void ClientGateway::reapExpired(int64_t nowNs) {
     reapScratch_.clear();
 
     sessions_.forEach([&](Session& s) {
-        // D8b: a session paused by back-pressure (held) keeps its lease up to maxHeldIdleNs_ of no progress.
-        const int64_t limit = s.heldByWorkers != 0 ? maxHeldIdleNs_ : sessionTimeoutNs_;
-        if (nowNs - s.lastSeenNs > limit) {
-            reapScratch_.push_back(s.sessionId);
-        }
+        // D8b: lost on any worker (ack publication NOT_CONNECTED) → the normal lease from the Lost edge (its
+        // owed acks are freed in ~sessionTimeout); else held (paused by back-pressure) → maxHeldIdleNs_ since the
+        // last activity / Progress signal; else the normal lease since the last activity.
+        const bool expired = s.lostByWorkers != 0 ? nowNs - s.lostSinceNs > sessionTimeoutNs_
+                           : s.heldByWorkers != 0 ? nowNs - s.lastSeenNs > maxHeldIdleNs_
+                                                  : nowNs - s.lastSeenNs > sessionTimeoutNs_;
+        if (expired) reapScratch_.push_back(s.sessionId);
     });
 
     // Fix round 2 (finding 4): ONE close path (closeSession_) for reap,
@@ -1003,13 +1006,24 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
 {
     using K = rune::node::SessionSignalKind;
     const auto kind = static_cast<K>(ret.lastOffset);
-    if (kind == K::Held || kind == K::Released) {
+    if (kind != K::Failed) {
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
+        if (kind == K::Progress) { s->lastSeenNs = nowNs_; return; }  // D8b: the held client reads its acks
         // Unreachable: NodeConfig refuses > kMaxHeldMaskWorkers shard workers.
         assert(ret.partition >= 0 && ret.partition < kMaxHeldMaskWorkers);
         if (ret.partition < 0 || ret.partition >= kMaxHeldMaskWorkers) [[unlikely]] return;
         const uint64_t bit = uint64_t{1} << ret.partition;
+        if (kind == K::Lost || kind == K::Found) {                    // D8b round 2
+            if (kind == K::Lost) {
+                if (s->lostByWorkers == 0) s->lostSinceNs = nowNs_;
+                s->lostByWorkers |= bit;
+            } else {
+                s->lostByWorkers &= ~bit;
+            }
+            return;
+        }
+        if (kind != K::Held && kind != K::Released) [[unlikely]] return;   // unknown kind: never a release
         const bool was = s->heldByWorkers != 0;
         if (kind == K::Held) s->heldByWorkers |= bit; else s->heldByWorkers &= ~bit;
         const bool now = s->heldByWorkers != 0;
