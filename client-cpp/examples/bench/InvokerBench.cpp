@@ -60,6 +60,7 @@ rc::Key keyFor(int32_t partition, int32_t partitions) {
 struct ShardResult {
     LogLinearHistogram hist;
     uint64_t    sent = 0, acked = 0, ackedInWindow = 0, errors = 0;
+    uint64_t    batches = 0;         // batch acks received (= produce batches the broker answered)
     int64_t     lastAckNs = 0;
     rc::BatchAck firstError{};       // the first failed batch (reported after the run)
     bool        haveFirstError = false;
@@ -168,6 +169,7 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
         rc::BatchAck lostAck{};
         auto onAck = [&](const rc::BatchAck& ack) {
             out.acked += static_cast<uint64_t>(ack.recordCount);
+            ++out.batches;
             out.lastAckNs = ackNow;
             const bool failed = ack.errorCode != 0;
             if (failed) {
@@ -349,7 +351,7 @@ int invokerBenchMain(int argc, char** argv) {
     const auto cpuAfter = readPerCpuTimes();
 
     LogLinearHistogram all;
-    uint64_t sent = 0, acked = 0, inWindow = 0, errors = 0;
+    uint64_t sent = 0, acked = 0, inWindow = 0, errors = 0, batches = 0;
     int64_t  lastAck = origin;
     bool     ok = true;
     int      udpMask = 3;                    // AND over shards: "on" only when every shard's driver ran it
@@ -362,6 +364,7 @@ int invokerBenchMain(int argc, char** argv) {
         all.merge(r.hist);
         sent += r.sent;
         acked += r.acked;
+        batches += r.batches;
         inWindow += r.ackedInWindow;
         errors += r.errors;
         lastAck = std::max(lastAck, r.lastAckNs);
@@ -392,7 +395,8 @@ int invokerBenchMain(int argc, char** argv) {
     std::printf("RESULT mode=%s shards=%u core=%d rate=%llu duration_s=%lld warmup_s=%lld window=%lld records=%llu "
                 "value=%d acks=%s max_in_flight=%d linger_us=%lld batch_bytes=%d max_frame=%d mtu=%zu "
                 "sent=%llu acked=%llu errors=%llu measured=%llu achieved_rps=%.0f "
-                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s gro=%s gso_fallbacks=%llu gro_disabled=%llu%s\n",
+                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s gro=%s gso_fallbacks=%llu gro_disabled=%llu "
+                "batches=%llu records_per_batch=%.2f%s\n",
                 a.mode == BenchArgs::Mode::Open ? "open" : "saturate", a.shards, a.core,
                 static_cast<unsigned long long>(a.rate), static_cast<long long>(a.durationS),
                 static_cast<long long>(a.warmupS), static_cast<long long>(a.window),
@@ -403,6 +407,8 @@ int invokerBenchMain(int argc, char** argv) {
                 us(all.valueAtQuantile(0.50)), p99us, us(all.valueAtQuantile(0.999)), us(all.max()),
                 (udpMask & 1) ? "on" : "off", (udpMask & 2) ? "on" : "off",   // INSTALLED, not config+probe
                 static_cast<unsigned long long>(gsoFallbacks), static_cast<unsigned long long>(groDisabled),
+                static_cast<unsigned long long>(batches),
+                batches ? static_cast<double>(acked) / static_cast<double>(batches) : 0.0,
                 ok ? "" : " run_error=1");
     std::fflush(stdout);
     if (!ok || errors != 0) return 1;
