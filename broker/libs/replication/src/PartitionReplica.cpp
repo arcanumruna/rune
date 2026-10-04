@@ -1577,10 +1577,10 @@ int PartitionReplica::doWork(int64_t nowNs)
         else if (nowNs - rtLastNs_ >= 1'000'000'000LL) {
             const Offset hw = leaderState_.highWatermark();
             const Offset leo = logEndOffset_();
-            spdlog::info("RATE[node={} part={} role={}] appends/s={} applies/s={} pushes/s={} "
+            spdlog::info("RATE[node={} topic={} part={} role={}] appends/s={} applies/s={} pushes/s={} "
                          "fastAcksRecv/s={} hwAdv/s={} leoAdv/s={} recsPerApply={} "
                          "bytesPerPush={} hw={} leo={}",
-                         cfg_.selfId, cfg_.partitionId, role_ == Role::Leader ? "L" : "F",
+                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, role_ == Role::Leader ? "L" : "F",
                          rtAppends_, rtApplies_, rtPushes_, rtFastAcks_,
                          hw - rtLastHw_, leo - rtLastLeo_,
                          rtApplies_ ? (leo - rtLastLeo_) / rtApplies_ : 0,
