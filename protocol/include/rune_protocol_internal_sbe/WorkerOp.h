@@ -120,7 +120,7 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(243);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(259);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(1);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(7);
     static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(0);
@@ -178,7 +178,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(243);
+        return static_cast<std::uint16_t>(259);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -3272,6 +3272,195 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *frLastFetchedEpochMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t frLastFetchedEpochId() SBE_NOEXCEPT
+    {
+        return 53;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t frLastFetchedEpochSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool frLastFetchedEpochInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t frLastFetchedEpochEncodingOffset() SBE_NOEXCEPT
+    {
+        return 242;
+    }
+
+    static SBE_CONSTEXPR std::int32_t frLastFetchedEpochNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT32;
+    }
+
+    static SBE_CONSTEXPR std::int32_t frLastFetchedEpochMinValue() SBE_NOEXCEPT
+    {
+        return INT32_C(-2147483647);
+    }
+
+    static SBE_CONSTEXPR std::int32_t frLastFetchedEpochMaxValue() SBE_NOEXCEPT
+    {
+        return INT32_C(2147483647);
+    }
+
+    static SBE_CONSTEXPR std::size_t frLastFetchedEpochEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::int32_t frLastFetchedEpoch() const SBE_NOEXCEPT
+    {
+        std::int32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 242, sizeof(std::int32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    WorkerOp &frLastFetchedEpoch(const std::int32_t value) SBE_NOEXCEPT
+    {
+        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 242, &val, sizeof(std::int32_t));
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *rolePartitionEpochMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t rolePartitionEpochId() SBE_NOEXCEPT
+    {
+        return 54;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t rolePartitionEpochSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool rolePartitionEpochInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t rolePartitionEpochEncodingOffset() SBE_NOEXCEPT
+    {
+        return 246;
+    }
+
+    static SBE_CONSTEXPR std::int32_t rolePartitionEpochNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT32;
+    }
+
+    static SBE_CONSTEXPR std::int32_t rolePartitionEpochMinValue() SBE_NOEXCEPT
+    {
+        return INT32_C(-2147483647);
+    }
+
+    static SBE_CONSTEXPR std::int32_t rolePartitionEpochMaxValue() SBE_NOEXCEPT
+    {
+        return INT32_C(2147483647);
+    }
+
+    static SBE_CONSTEXPR std::size_t rolePartitionEpochEncodingLength() SBE_NOEXCEPT
+    {
+        return 4;
+    }
+
+    SBE_NODISCARD std::int32_t rolePartitionEpoch() const SBE_NOEXCEPT
+    {
+        std::int32_t val;
+        std::memcpy(&val, m_buffer + m_offset + 246, sizeof(std::int32_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_32(val);
+    }
+
+    WorkerOp &rolePartitionEpoch(const std::int32_t value) SBE_NOEXCEPT
+    {
+        std::int32_t val = SBE_LITTLE_ENDIAN_ENCODE_32(value);
+        std::memcpy(m_buffer + m_offset + 246, &val, sizeof(std::int32_t));
+        return *this;
+    }
+
+    SBE_NODISCARD static const char *frIncarnationMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t frIncarnationId() SBE_NOEXCEPT
+    {
+        return 55;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t frIncarnationSinceVersion() SBE_NOEXCEPT
+    {
+        return 0;
+    }
+
+    SBE_NODISCARD bool frIncarnationInActingVersion() SBE_NOEXCEPT
+    {
+        return true;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t frIncarnationEncodingOffset() SBE_NOEXCEPT
+    {
+        return 250;
+    }
+
+    static SBE_CONSTEXPR std::int64_t frIncarnationNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t frIncarnationMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t frIncarnationMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t frIncarnationEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::int64_t frIncarnation() const SBE_NOEXCEPT
+    {
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 250, sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    WorkerOp &frIncarnation(const std::int64_t value) SBE_NOEXCEPT
+    {
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 250, &val, sizeof(std::int64_t));
+        return *this;
+    }
+
     SBE_NODISCARD static const char *tailKindMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
@@ -3298,7 +3487,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingOffset() SBE_NOEXCEPT
     {
-        return 242;
+        return 258;
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::size_t tailKindEncodingLength() SBE_NOEXCEPT
@@ -3309,21 +3498,21 @@ public:
     SBE_NODISCARD std::uint8_t tailKindRaw() const SBE_NOEXCEPT
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 242, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 258, sizeof(std::uint8_t));
         return (val);
     }
 
     SBE_NODISCARD TailKind::Value tailKind() const
     {
         std::uint8_t val;
-        std::memcpy(&val, m_buffer + m_offset + 242, sizeof(std::uint8_t));
+        std::memcpy(&val, m_buffer + m_offset + 258, sizeof(std::uint8_t));
         return TailKind::get((val));
     }
 
     WorkerOp &tailKind(const TailKind::Value value) SBE_NOEXCEPT
     {
         std::uint8_t val = (value);
-        std::memcpy(m_buffer + m_offset + 242, &val, sizeof(std::uint8_t));
+        std::memcpy(m_buffer + m_offset + 258, &val, sizeof(std::uint8_t));
         return *this;
     }
 
@@ -3705,6 +3894,18 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("clientVersion": )";
     builder << +writer.clientVersion();
+
+    builder << ", ";
+    builder << R"("frLastFetchedEpoch": )";
+    builder << +writer.frLastFetchedEpoch();
+
+    builder << ", ";
+    builder << R"("rolePartitionEpoch": )";
+    builder << +writer.rolePartitionEpoch();
+
+    builder << ", ";
+    builder << R"("frIncarnation": )";
+    builder << +writer.frIncarnation();
 
     builder << ", ";
     builder << R"("tailKind": )";
