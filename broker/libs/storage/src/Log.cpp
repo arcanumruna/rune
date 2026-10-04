@@ -106,7 +106,8 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
 Log::~Log() {
     // E1d: clean shutdown persists the exact recovery point (a stale, lower one
     // would only make the next recovery validate more).  Never on a failed log.
-    if (recovered_ && !crashedForTest_ && storage_.failedErrno == 0 && recoveryPoint_ != persistedRp_) {
+    if (recovered_ && !crashedForTest_ && storage_.failedErrno == 0 &&
+        (recoveryPoint_ != persistedRp_ || rpUnconfirmedMax_ > recoveryPoint_)) {
         std::error_code ec;
         if (std::filesystem::is_directory(dir_, ec)) (void)checkpointRecoveryPoint();   // dir removed: nothing to persist
     }
@@ -902,6 +903,7 @@ int Log::checkpointRecoveryPoint_(bool publish) noexcept {
     }
     const bool moved = v != persistedRp_;
     persistedRp_ = v;
+    rpUnconfirmedMax_ = kRecoveryPointUnknown;   // every possibly-landed write has a LOWER seq
     rpActiveSlot_ = target;
     ++rpPersists_;
     refreshRpDue_();
@@ -959,7 +961,11 @@ bool Log::prepareRecoveryCheckpoint(RpWrite& out) noexcept {
 }
 
 void Log::recoveryCheckpointSubmitted() noexcept {
-    if (rp_.stage == RpStage::Prepared) rp_.stage = RpStage::InFlight;
+    if (rp_.stage != RpStage::Prepared) return;
+    rp_.stage = RpStage::InFlight;
+    // MAJOR-1: from now on the slot MAY hold this value (until a confirmed
+    // durable write with a higher seq dominates it).
+    if (rp_.value > rpUnconfirmedMax_) rpUnconfirmedMax_ = rp_.value;
 }
 
 void Log::recoveryCheckpointNotSubmitted() noexcept {
@@ -983,6 +989,7 @@ bool Log::recoveryCheckpointCompleted(uint64_t seq, int err) noexcept {
         // gate and the persisted R move.
         const bool moved = done.value != persistedRp_;
         persistedRp_ = done.value;
+        rpUnconfirmedMax_ = kRecoveryPointUnknown;   // the highest-seq write: confirmed
         rpActiveSlot_ = done.slot;
         ++rpPersists_;
         if (moved && !segments_.empty()) publishSealedSnapshot();   // cold: ≈ once per roll
@@ -994,13 +1001,18 @@ bool Log::recoveryCheckpointCompleted(uint64_t seq, int err) noexcept {
 void Log::resetRecoveryCheckpointForNewOwner() noexcept {
     if (rp_.stage == RpStage::Idle) return;
     // Unknown outcome: the slot (never the active one) may or may not hold it.
-    // Treated as unwritten — the next write targets that slot again with a
-    // higher seq.  persistedRp_ (what the cleaner trusts) never moves on it.
+    // The next write targets that slot again with a higher seq; persistedRp_
+    // (what the cleaner trusts) never moves on it.  MAJOR-1: the value is
+    // NOT forgotten — it stays in rpUnconfirmedMax_ (raised at submit) as an
+    // upper bound of what may be on disk, so a later truncation below it is
+    // persisted inline first.
+    if (rp_.stage == RpStage::InFlight && !rp_.abandoned && rp_.value > rpUnconfirmedMax_)
+        rpUnconfirmedMax_ = rp_.value;
     rp_ = RpCheckpoint{RpStage::Idle, false, -1, 0, 0};
     refreshRpDue_();
 }
 
-std::size_t Log::requeueUndurableSeals() noexcept {
+std::size_t Log::requeueUndurableSeals(const LogSegment* const* inFlight, std::size_t nInFlight) noexcept {
     std::size_t n = 0;
     if (segments_.size() < 2) return 0;
     const auto activeIt = std::prev(segments_.end());
@@ -1009,6 +1021,7 @@ std::size_t Log::requeueUndurableSeals() noexcept {
         if (seg->fullyDurable()) continue;
         bool queued = false;
         for (std::size_t i = 0; i < pendingSealCount_; ++i) queued = queued || pendingSeals_[i] == seg;
+        for (std::size_t i = 0; i < nInFlight; ++i) queued = queued || inFlight[i] == seg;   // routed: its completion will come
         if (queued) continue;
         if (pendingSealCount_ >= kMaxPendingSeals) break;   // the rest: next requeue
         seg->pinFlush();
@@ -1024,8 +1037,11 @@ void Log::persistAtMost_(int64_t bound) noexcept {
     // An in-progress checkpoint carrying a value above the bound must never
     // count (its slot may still land: an inline write with a HIGHER seq to
     // the other slot supersedes it).
+    // MAJOR-1: compare against the UPPER BOUND of what may be on disk (the
+    // confirmed value and every possibly-landed write), never just the
+    // confirmed one.
     const bool staleInProgress = rp_.stage != RpStage::Idle && !rp_.abandoned && rp_.value > bound;
-    if (staleInProgress || persistedRp_ > bound) (void)checkpointRecoveryPoint();
+    if (staleInProgress || onDiskRecoveryPointUpperBound() > bound) (void)checkpointRecoveryPoint();
     else refreshRpDue_();
 }
 

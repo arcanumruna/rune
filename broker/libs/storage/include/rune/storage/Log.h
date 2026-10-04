@@ -240,6 +240,11 @@ public:
     /// The value restart recovery would read (kRecoveryPointUnknown = none).
     /// Moves only once a checkpoint is DURABLE (never at write submit).
     [[nodiscard]] int64_t persistedRecoveryPoint() const noexcept { return persistedRp_; }
+    /// Upper bound of the R restart recovery may read: the confirmed value or
+    /// any possibly-landed (unconfirmed) checkpoint write above it (MAJOR-1).
+    [[nodiscard]] int64_t onDiskRecoveryPointUpperBound() const noexcept {
+        return rpUnconfirmedMax_ > persistedRp_ ? rpUnconfirmedMax_ : persistedRp_;
+    }
     /// True iff restart recovery trusts a sealed segment ending at `segEnd`
     /// as-is — the cleaner may compact it (E1d invariant 3).
     [[nodiscard]] bool compactionAllowedThrough(int64_t segEnd) const noexcept {
@@ -285,10 +290,13 @@ public:
     /// outcome is unknown — the slot is treated as unwritten (the next write
     /// targets it again with a higher seq) and R is re-checkpointed.
     void resetRecoveryCheckpointForNewOwner() noexcept;
-    /// F7: re-queue (pinned) a seal for every sealed segment not yet durable
-    /// and not already pending — a fresh owner's replay of seal completions a
-    /// previous owner never observed.  Cold.  Returns the number queued.
-    std::size_t requeueUndurableSeals() noexcept;
+    /// F7: re-queue (pinned) a seal for every sealed segment not yet durable,
+    /// not already pending and not in `inFlight[0, nInFlight)` (segments whose
+    /// seal is routed on the new owner — MEDIUM-1: the replay runs even when
+    /// another seal of this log is in flight) — a fresh owner's replay of seal
+    /// completions a previous owner never observed.  Cold.  Returns the number queued.
+    std::size_t requeueUndurableSeals(const LogSegment* const* inFlight = nullptr,
+                                      std::size_t nInFlight = 0) noexcept;
     [[nodiscard]] uint64_t recoveryCheckpointsForTest() const noexcept { return rpPersists_; }
     /// Crash seam (DR / storage tests): the next destruction is a CRASH, not a
     /// clean shutdown — no recovery-point checkpoint is written.
@@ -560,6 +568,13 @@ private:
     bool    hadSegmentsAtOpen_ = false;   ///< segment files existed at construction (WARN gate)
     int64_t recoveryPoint_ = 0;
     int64_t persistedRp_   = kRecoveryPointUnknown;
+    /// MAJOR-1 (fix round 2): the highest R carried by a checkpoint write that
+    /// MAY have landed (submitted, outcome not yet observed — or observed by a
+    /// previous owner and lost) and whose seq is above the last CONFIRMED
+    /// durable write.  max(persistedRp_, this) bounds what restart recovery
+    /// may read; a truncation below it is persisted inline first.  Reset only
+    /// by a confirmed durable write with a higher seq.
+    int64_t rpUnconfirmedMax_ = kRecoveryPointUnknown;
     bool    rpDue_         = false;   ///< R crossed a segment boundary since the last persist
     uint64_t rpPersists_   = 0;
     uint64_t rpSeq_        = 0;       ///< highest slot seq ever written (or read)

@@ -3238,3 +3238,40 @@ TEST(ShardNonBlockingRegression, SealCompletionLostToPreviousOwnerIsReplayed) {
     EXPECT_GE(s.log->persistedRecoveryPoint(), bBase);
     EXPECT_EQ(w2.sealSubmitsForTest(), 1u) << "the undurable sealed segment is re-sealed";
 }
+
+// E1d fix round 2, MEDIUM-1: the F7 seal replay must also run when ANOTHER
+// seal of the same log is still routed on this worker.  Seal A was submitted
+// by a previous owner and its completion was never observed; seal B is in
+// flight on this worker when the log is re-owned.  Every sealed-not-durable
+// segment without a route in flight is re-queued — R reaches the end of both.
+TEST(ShardNonBlockingRegression, SealLostToPreviousOwnerReplayedWhileAnotherSealIsRouted) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    Acks a;
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed (pending)
+    // A previous owner took seal A, fdatasynced it, and its completion was lost.
+    {
+        rune::storage::LogSegment* segA = s.log->frontPendingSeal();
+        ASSERT_NE(segA, nullptr);
+        s.log->popPendingSeal();
+        ASSERT_EQ(::fsync(segA->logFd()), 0);
+        s.log->unpinSegmentFlush(segA);
+    }
+    ASSERT_EQ(s.produce(3, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(4, batchAt(0, 1, 16), 0, 1), 1);   // roll: B sealed (pending)
+    const int64_t cBase = s.log->segmentBaseOffsets().back();
+    ASSERT_EQ(s.log->segmentBaseOffsets().size(), 3u);
+    s.w.doWork(5);
+    ASSERT_EQ(s.w.sealSubmitsForTest(), 1u);                // seal B in flight on this worker
+    // The log moves away and comes back to THIS worker while B is still routed.
+    s.w.setOwnedDirect(Worker::OwnedSet{});
+    s.w.setOwnedDirect(Worker::OwnedSet{s.leader.get()});
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < cBase; ++i) {
+        s.w.doWork(100 + i); a.drain(s.w); std::this_thread::yield();
+    }
+    EXPECT_GE(s.log->recoveryPoint(), cBase) << "R pinned at seal A: replay skipped because seal B was routed";
+    EXPECT_GE(s.log->persistedRecoveryPoint(), cBase);
+    EXPECT_EQ(s.w.sealSubmitsForTest(), 2u) << "seal A re-queued exactly once; B not duplicated";
+}

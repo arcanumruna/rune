@@ -4199,20 +4199,23 @@ private:
                 // broker) and the two-phase migration's drain-before-grant contract
                 // (WorkerPool.h), so another worker never fsyncs a log while this
                 // worker's fsync on it is in flight.
-                bool rpRouted = false, sealRouted = false;
+                bool rpRouted = false;
+                std::vector<const rune::storage::LogSegment*> sealsRouted;   // cold (ownership change)
                 for (const TokenRoute& rt : routes_) {
                     if (rt.token == kNoToken || rt.log != log) continue;
                     if (rt.kind == RouteKind::Durable)    fresh.durableToken = rt.token;
                     if (rt.kind == RouteKind::Background) fresh.bgToken      = rt.token;
                     if (rt.kind == RouteKind::RecoveryPoint) rpRouted = true;
-                    if (rt.kind == RouteKind::Seal) sealRouted = true;
+                    if (rt.kind == RouteKind::Seal) sealsRouted.push_back(rt.seg);
                 }
                 // E1d F7 (cold): a checkpoint / seal whose completion went to a
                 // PREVIOUS owner (unobserved) must not pin R forever: replay —
                 // the checkpoint stage resets (outcome unknown: rewritten with a
                 // higher seq), every not-yet-durable sealed segment is re-sealed.
                 if (!rpRouted) log->resetRecoveryCheckpointForNewOwner();
-                if (!sealRouted) (void)log->requeueUndurableSeals();
+                // MEDIUM-1: ALWAYS replay — skip only the segments whose seal is
+                // routed here (their completion still arrives on this worker).
+                (void)log->requeueUndurableSeals(sealsRouted.data(), sealsRouted.size());
                 next.push_back(fresh);
             }
         }

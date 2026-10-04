@@ -616,3 +616,78 @@ TEST(RecoveryPointRegression, CompactNeverRewritesAboveRecoveryPoint) {
     EXPECT_EQ(fs::file_size(segPath(dir, bases[1])), size1) << "compacted a segment above the persisted R";
     fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// E1d fix round 2, MAJOR-1 (re-review repros): a checkpoint write that LANDED
+// durably while the log was unowned (its completion went to the unowned
+// worker) is "possibly durable".  The fresh owner's reset must keep it as an
+// upper bound of what may be on disk: a later truncation below that bound
+// lowers the on-disk R first — never leaving R above the truncated LEO.
+// ---------------------------------------------------------------------------
+TEST(RecoveryPointRegression, ResetForNewOwnerThenTruncate_DiskRNeverAboveLeo) {
+    const auto dir = freshDir("rp_reset_trunc");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSeal(*log);
+    completeFrontSeal(*log);
+    ASSERT_EQ(log->recoveryPoint(), bases[2]);
+    const int64_t P = log->persistedRecoveryPoint();
+    Log::RpWrite w;
+    ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
+    log->recoveryCheckpointSubmitted();
+    ASSERT_EQ(performWrite(w), 0);                        // landed; completion unobserved
+    log->resetRecoveryCheckpointForNewOwner();            // fresh owner: outcome unknown
+    ASSERT_LE(P, bases[1] + 1);
+    log->truncateTo(bases[1] + 1);
+    const int64_t leo = log->logEndOffset();
+    crashKeepPageCache(log);
+    EXPECT_LE(readPersistedR(dir), leo) << "on-disk R " << readPersistedR(dir)
+        << " is ABOVE the truncated LEO " << leo << " (P=" << P << ")";
+    fs::remove_all(dir);
+}
+
+// MAJOR-1 end to end: reset + truncate, re-append (divergent data) past the
+// landed value with async seals that never complete, power loss -> no gap.
+TEST(RecoveryPointRegression, ResetForNewOwnerThenTruncate_PowerLoss_NoOffsetGap) {
+    const auto dir = freshDir("rp_reset_gap");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSeal(*log); completeFrontSeal(*log); completeFrontSeal(*log);
+    Log::RpWrite w;
+    ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
+    log->recoveryCheckpointSubmitted();
+    ASSERT_EQ(performWrite(w), 0);
+    log->resetRecoveryCheckpointForNewOwner();
+    log->truncateTo(bases[0] + 1);
+    flushActive(*log);
+    while (log->logEndOffset() < bases[3] + 2) appendOne(*log, "x");
+    crashWithPowerLoss(log);
+    auto rec = std::make_unique<Log>(dir.string(), kRoll);
+    rec->recover();
+    expectGapFree(*rec);
+    fs::remove_all(dir);
+}
+
+// Control for the above: the same sequence with the completion OBSERVED.
+TEST(RecoveryPointRegression, CompletionObservedThenTruncate_PowerLoss_NoOffsetGap) {
+    const auto dir = freshDir("rp_ctrl_gap");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSeal(*log); completeFrontSeal(*log); completeFrontSeal(*log);
+    Log::RpWrite w;
+    ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
+    log->recoveryCheckpointSubmitted();
+    ASSERT_EQ(performWrite(w), 0);
+    log->recoveryCheckpointCompleted(w.seq, 0);
+    log->truncateTo(bases[0] + 1);
+    flushActive(*log);
+    while (log->logEndOffset() < bases[3] + 2) appendOne(*log, "x");
+    crashWithPowerLoss(log);
+    auto rec = std::make_unique<Log>(dir.string(), kRoll);
+    rec->recover();
+    expectGapFree(*rec);
+    fs::remove_all(dir);
+}
