@@ -144,7 +144,11 @@ public:
     ///
     /// The recordBatch span MUST be valid for the duration of this call
     /// (Aeron guarantees the fragment buffer is live for the callback duration).
-    void onRecords(const codec::RecordsView& rv);
+    /// `source`: the agent session the frame arrived on (ClientAgent::
+    /// recordsSource), kUnknownSource when unknown — M3: plain subscriptions are
+    /// on the seed (0); records of another node's session are never theirs.
+    static constexpr uint32_t kUnknownSource = 0xFFFFFFFFu;
+    void onRecords(const codec::RecordsView& rv, uint32_t source = kUnknownSource);
 
     /// Fail / deactivate all subscriptions (called on close, after the duty
     /// thread is gone).  Publishes each final snapshot and closes each status
@@ -161,6 +165,9 @@ public:
     /// is treated as an already-unsubscribed response and a late Unsubscribe is
     /// emitted via the CB-5 A2 path rather than routing records to a dead impl).
     void failPendingSubscribes(const std::string& reason);
+    /// Fail the ONE pending subscription whose Subscribe carried
+    /// `correlationId` (its handle sees finished()).  False if none.
+    bool failPendingSubscribe(int64_t correlationId);
 
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.

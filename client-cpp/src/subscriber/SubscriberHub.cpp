@@ -396,6 +396,7 @@ void SubscriberHub::onSubscribeResponse(
 
     // Store the broker-assigned subscriptionId regardless of active state.
     impl->subscriptionId = rsp.subscriptionId;
+    impl->boundPartition = rsp.partition;
 
     if (!impl->active) {
         // CB-5 A2 FIX: unsubscribe() ran before SubscribeResponse arrived.  Now
@@ -419,14 +420,20 @@ void SubscriberHub::onSubscribeResponse(
 // onRecords — duty thread (hot path: map lookup + handler; one publish/frame)
 // ---------------------------------------------------------------------------
 
-void SubscriberHub::onRecords(const codec::RecordsView& rv)
+void SubscriberHub::onRecords(const codec::RecordsView& rv, uint32_t source)
 {
+    // M3: plain subscriptions live on the seed session (session 0).  Records
+    // that arrived on another node's session are never theirs: broker
+    // subscription ids are per node and collide across nodes.
+    if (source != kUnknownSource && source != 0) return;
     auto it = activeById_.find(rv.subscriptionId);
     if (it == activeById_.end()) {
         return; // unknown / already-removed subscription
     }
     SubscriptionImpl& impl = *it->second;
     if (!impl.active) return;
+    // M3: and only its own partition (one compare on a branch already taken).
+    if (rv.topicId != impl.topicId || (impl.boundPartition >= 0 && rv.partition != impl.boundPartition)) return;
 
     // ---- Decode the RecordBatch and dispatch per record ---------------------
     // The spans are views into the Aeron fragment buffer, which is valid for
@@ -559,6 +566,16 @@ bool SubscriberHub::hasPending() const
 // ---------------------------------------------------------------------------
 // M2 FIX: failPendingSubscribes — fail all unbound pending subscribes
 // ---------------------------------------------------------------------------
+
+bool SubscriberHub::failPendingSubscribe(int64_t correlationId)
+{
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end()) return false;
+    clearUnsent_(*it->second);
+    if (it->second->impl) finish_(*it->second->impl);
+    pendingByCorrelation_.erase(it);
+    return true;
+}
 
 void SubscriberHub::failPendingSubscribes(const std::string& reason)
 {

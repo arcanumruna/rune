@@ -168,6 +168,9 @@ struct ClientConfig {
 
     // Keepalive interval passthrough (nanoseconds, 0 = use agent default).
     int64_t keepaliveIntervalNs = 0;
+    // Stale-session threshold passthrough (SessionConfig::responseTimeoutNs;
+    // nanoseconds, 0 = use the agent default).
+    int64_t responseTimeoutNs = 0;
 
     // Runner-thread idle strategy.
     // Balanced (default) parks up to 1 ms between doWork() calls — CPU-friendly.
@@ -890,6 +893,15 @@ private:
     /// member's per-partition Subscribe goes to the partition leader's session.
     static uint32_t fetchLeaderTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
+    static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
+    /// M1 (duty thread, while a group consumer exists): a leader-node session a
+    /// group partition subscribes through was lost (left Connected) or became
+    /// terminally Disconnected — ask for metadata (the leader may have moved),
+    /// re-drive a Disconnected one's connect, re-route.  Event-driven: state
+    /// transitions of the agent's sessions, no clock.
+    int watchGroupSessions_(int64_t nowNs);
+    uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass
+    uint64_t groupDiscMask_ = 0;  // ... terminally Disconnected last pass
     static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
                                                     std::size_t len) noexcept;
     /// A Redirect / NotLeader answered a group fetch Subscribe (corrId tagged

@@ -132,7 +132,13 @@ public:
     /// Route a Records(20) frame: if (topicId, partition) is in any consumer's
     /// current assignment, deliver to that consumer and advance its position.
     /// Also tries the existing subscriberHub path first (via the caller).
-    void onRecords(const codec::RecordsView& rv);
+    /// C1: a routed partition accepts a batch only from its CURRENT subscription
+    /// instance (`source` = the agent session the frame arrived on, from
+    /// ClientAgent::recordsSource; kUnknownSource when unknown) and only
+    /// contiguously: a batch entirely below the position is skipped (a
+    /// duplicate), one above it (a gap) never advances it (the subscription is
+    /// re-made from the position).  The position is seeded only by OffsetFetch.
+    void onRecords(const codec::RecordsView& rv, uint32_t source = kUnknownSource);
 
     /// Called when JoinGroupResponse (tid 33) arrives.
     void onJoinGroupResponse(const uint8_t* buf, std::size_t len,
@@ -225,30 +231,44 @@ public:
         /// Session index leading (topicId, partition) now (0 = the seed); may
         /// lazily open that node's session.
         uint32_t (*leaderSession)(void* ctx, int32_t topicId, int32_t partition) = nullptr;
-        /// That session's id while Connected, else 0.
+        /// That session's broker session id while Connected, else 0 (stamping).
         int64_t (*sessionId)(void* ctx, uint32_t session) = nullptr;
+        /// That session's connect epoch while Connected, else 0 (liveness:
+        /// MEDIUM-1 — a reconnect that got the same broker id is a new epoch).
+        uint64_t (*epoch)(void* ctx, uint32_t session) = nullptr;
         /// Offer a control frame on that session's node ingress.
         detail::SendResult (*offer)(void* ctx, uint32_t session, const uint8_t* buf, std::size_t len) = nullptr;
     };
     void setFetchRouter(const FetchRouter& r) noexcept { router_ = r; }
 
-    /// Group fetch Subscribes carry correlationIds tagged with bit 61 (bit 62
-    /// clear) — disjoint from producer batch ids (bit 62), connect ids
-    /// (session * 1e12) and the Client's counter.
+    /// Records source unknown (onRecords `source`).
+    static constexpr uint32_t kUnknownSource = 0xFFFFFFFFu;
+
+    /// Group fetch Subscribes / Unsubscribes carry correlationIds tagged with
+    /// bit 61 (bit 62 clear, positive) — disjoint from producer batch ids (bit
+    /// 62), connect ids (session * 1e12), keepalive ids (negative) and the
+    /// Client's counter.
     static constexpr int64_t kFetchCorrTag = int64_t{1} << 61;
     [[nodiscard]] static constexpr bool isFetchCorrId(int64_t c) noexcept {
-        return (c & (int64_t{3} << 61)) == kFetchCorrTag;
+        return c > 0 && (c & (int64_t{3} << 61)) == kFetchCorrTag;
     }
     /// Consecutive Redirects of one partition (no bind in between) after which
-    /// it is parked until fresh metadata / the next sweep (no ping-pong storm).
+    /// it is parked until fresh metadata (no ping-pong storm).
     static constexpr uint8_t kMaxFetchRedirects = 8;
 
     /// Bring every Stable consumer's subscriptions in line with the current
-    /// leaders and sessions (cold: group / routing events + the sweep).
-    /// Returns the Subscribe frames sent.
+    /// leaders and sessions (cold: group / routing events).  Also re-offers
+    /// refused Unsubscribes.  Returns the Subscribe frames sent.
     int reconcileFetch();
-    /// Fresh metadata / the periodic sweep: refused partitions may retry.
+    /// Fresh metadata: refused / parked partitions may retry.
     void unparkFetch() noexcept;
+    /// A partition was parked (refused, gap loop): fresh metadata is wanted.
+    /// Taken (and cleared) by the caller, which arms a metadata refresh.
+    [[nodiscard]] bool takeMetadataWanted() noexcept {
+        const bool w = metadataWanted_;
+        metadataWanted_ = false;
+        return w;
+    }
     /// A SubscribeResponse whose correlationId isFetchCorrId(): binds it (an
     /// error parks the partition).  False when not a group fetch Subscribe.
     bool onFetchSubscribeResponse(int64_t corrId, int16_t errorCode, int64_t subscriptionId);
@@ -257,9 +277,23 @@ public:
     /// kMaxFetchRedirects).  True + its (topicId, partition) when it is a live
     /// one — the caller re-routes it and calls reconcileFetch().
     bool onFetchSubscribeRefused(int64_t corrId, bool park, int32_t& topicId, int32_t& partition);
-    /// Test/observer: Subscribes abandoned before their answer, awaiting it to
-    /// be unsubscribed.
+    /// M2: Unsubscribes the transport refused, re-offered by the duty cycle
+    /// (one branch when zero) until sent or moot (their session's epoch ended).
+    [[nodiscard]] std::size_t pendingFetchUnsubscribes() const noexcept { return pendingUnsubs_.size(); }
+    int retryFetchUnsubscribes();
+    /// MEDIUM-2: re-send OffsetFetch for every Stable consumer with an assigned
+    /// partition whose start offset is still unknown (refused send, errored
+    /// entry, capped answer).  Paced by a doubling backoff on the duty clock.
+    int retryOffsetFetch(int64_t nowNs, int64_t sessionId, const SendFn& sendFn);
+    /// MEDIUM-7: a consumer adopted while the session is already Connected joins
+    /// now (onConnected already ran).  No-op otherwise.
+    void joinIfConnected(int64_t sessionId, const SendFn& sendFn);
+    /// M1: does any Stable consumer's partition subscribe through `session`?
+    [[nodiscard]] bool fetchUses(uint32_t session) const noexcept;
+    /// Test/observer: Subscribes abandoned before their answer, awaiting it.
     [[nodiscard]] std::size_t lateFetchUnsubscribes() const noexcept { return late_.size(); }
+    /// Test/observer: batches dropped by the identity / contiguity rules (C1).
+    [[nodiscard]] uint64_t droppedRecordBatches() const noexcept { return droppedBatches_; }
 
     /// fix1 C1: onAssigned/onRevoked/onRecords run inside the noexcept
     /// ClientAgent::doWork chain (or, for closeAll's final onRevoked, inside
@@ -308,20 +342,37 @@ private:
     // Fetch routing (see FetchRouter).
     FetchRouter router_{};
     int64_t     nextFetchCorr_ = 1;
-    struct LateUnsub {  // a leader-node Subscribe dropped before its answer
+    bool        metadataWanted_ = false;
+    uint64_t    droppedBatches_ = 0;
+    struct LateSub {  // a Subscribe dropped before its answer
         int64_t  corrId;
         uint32_t session;
-        int64_t  sessionId;
+        uint64_t epoch;
+        bool     selfOwned;
     };
-    std::vector<LateUnsub> late_;
+    std::vector<LateSub> late_;
+    struct SubRef {   // a subscription instance (session, epoch, subscriptionId)
+        uint32_t session;
+        uint64_t epoch;
+        int64_t  subscriptionId;
+    };
+    std::vector<SubRef> retired_;       // C1: instances whose records are dropped
+    std::vector<SubRef> pendingUnsubs_; // M2: refused Unsubscribes
     [[nodiscard]] bool routed_() const noexcept { return router_.offer != nullptr; }
+    [[nodiscard]] int64_t nextFetchCorr_tagged_() noexcept {
+        return kFetchCorrTag | (nextFetchCorr_++ & (kFetchCorrTag - 1));
+    }
+    [[nodiscard]] bool isRetired_(uint32_t session, uint64_t epoch, int64_t subscriptionId) const noexcept;
+    void pruneFetch_();
     int  reconcileImpl_(GroupConsumerImpl& impl);
-    /// Forget fs's subscription: a live leader-node one is unsubscribed (an
-    /// unanswered one once its answer arrives).  Seed-session ones are the
-    /// coordinator's group subscriptions — the broker owns their lifecycle.
-    void dropFetch_(GroupConsumerImpl::FetchSub& fs);
+    /// Forget fs's subscription: its instance is retired (records dropped); one
+    /// we own is unsubscribed on its node (an unanswered one once its answer
+    /// arrives).  `force`: also unsubscribe the coordinator's group sub (gap).
+    void dropFetch_(GroupConsumerImpl::FetchSub& fs, bool force = false);
     void dropAllFetch_(GroupConsumerImpl& impl);
-    void sendFetchUnsubscribe_(uint32_t session, int64_t sessionId, int64_t subscriptionId);
+    void unsubscribe_(uint32_t session, uint64_t epoch, int64_t subscriptionId);
+    void onGap_(GroupConsumerImpl& impl, const TopicPartition& tp, GroupConsumerImpl::FetchSub& fs);
+    void sendOffsetFetchFor_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn, bool unknownOnly);
 
     /// RAII: marks impl as "callback running"; on exit, if the callback
     /// finished the consumer, closes its status ring (now that no callback runs).

@@ -179,22 +179,29 @@ struct GroupConsumerImpl {
     std::map<TopicPartition, int64_t>   assignment;   // topicPartition → nextOffset (or sentinel)
 
     // Fetch routing (distributed partition leadership; duty thread only).  One
-    // entry per assigned partition: the Subscribe that makes the partition's
-    // LEADER node push its records here.  On the seed session (the coordinator
-    // leads it) the Subscribe is the isolation carrier of the coordinator's own
-    // group subscription; on another node's session it is a plain subscription
-    // starting at the member's position.  Cold path: changed only by group /
-    // routing events, never per record.
+    // entry per assigned partition while Stable: the ONE subscription instance
+    // whose records this member accepts for it (C1).  On the seed session (the
+    // coordinator leads it) the Subscribe is the isolation carrier of the
+    // coordinator's own group subscription; on another node's session it is a
+    // plain subscription starting at the member's position.  Cold path: changed
+    // only by group / routing events, never per record.
     struct FetchSub {
         uint32_t session        = 0;      // agent session index it was sent on (0 = the seed)
-        int64_t  sessionId      = 0;      // that session's id when sent; 0 = no subscription (wanted)
+        uint64_t epoch          = 0;      // that session's connect epoch when sent; 0 = no subscription
         int64_t  corrId         = 0;      // its Subscribe correlationId while unanswered
-        int64_t  subscriptionId = 0;      // bound by the SubscribeResponse
-        bool     offsetKnown    = false;  // OffsetFetch answered for it this generation
-        bool     parked         = false;  // refused: retried on fresh metadata / the sweep
+        int64_t  subscriptionId = 0;      // bound by the SubscribeResponse (0 = unanswered)
+        bool     selfOwned      = false;  // created by our Subscribe (we unsubscribe it)
+        bool     replaceGroupSub = false; // seed: the next Subscribe replaces the coordinator's group sub
+        bool     offsetKnown    = false;  // OffsetFetch answered (OK) for it this generation
+        bool     resetPending   = false;  // no committed offset: the first batch of OUR fresh subscription resets
+        bool     parked         = false;  // refused: retried on fresh metadata
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
+        int64_t  gapAt          = -1;     // position at the last gap re-subscribe (loop guard)
     };
     std::map<TopicPartition, FetchSub> fetch;
+    // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).
+    int64_t offsetFetchDueNs     = 0;
+    int64_t offsetFetchBackoffNs = 0;
 
     // ---- Timers (duty thread) -------------------------------------------------
     std::chrono::steady_clock::time_point nextHeartbeat;

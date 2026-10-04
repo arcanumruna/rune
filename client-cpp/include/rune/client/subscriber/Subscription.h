@@ -150,6 +150,7 @@ struct SubscriptionImpl {
 
     // ---- Duty-thread owned ------------------------------------------------------
     int64_t subscriptionId = 0;  // bound by SubscribeResponse (0 = pending)
+    int32_t boundPartition = -1; // M3: the partition the SubscribeResponse resolved
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists

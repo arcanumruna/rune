@@ -85,6 +85,9 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     if (c.keepaliveIntervalNs > 0) {
         acfg.session.keepaliveIntervalNs = c.keepaliveIntervalNs;
     }
+    if (c.responseTimeoutNs > 0) {
+        acfg.session.responseTimeoutNs = c.responseTimeoutNs;
+    }
 
     // M2 FIX: propagate connectTimeoutMs → SessionMachine connectTimeoutNs.
     // Without this, the SessionMachine uses its default 5s per-retry timeout
@@ -224,6 +227,7 @@ Client::Client(ClientConfig cfg)
         fr.ctx           = this;
         fr.leaderSession = &Client::fetchLeaderTrampoline_;
         fr.sessionId     = &Client::fetchSessionIdTrampoline_;
+        fr.epoch         = &Client::fetchEpochTrampoline_;
         fr.offer         = &Client::fetchOfferTrampoline_;
         groupConsumerHub_.setFetchRouter(fr);
     }
@@ -1518,6 +1522,12 @@ int Client::dutyCycle(int64_t nowNs) {
         if (!groupConsumerHub_.empty()) {
             work += groupConsumerHub_.flushRequestedCommits(sid);
             if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(sid);
+            // M2: refused fetch Unsubscribes are re-offered every pass until sent / moot.
+            if (groupConsumerHub_.pendingFetchUnsubscribes() != 0) work += groupConsumerHub_.retryFetchUnsubscribes();
+            // A parked partition wants fresh metadata (backoff-paced refresh).
+            if (groupConsumerHub_.takeMetadataWanted()) scheduleMetadataRefresh();
+            // M1: the leader-node sessions the group's partitions depend on.
+            work += watchGroupSessions_(nowNs);
         }
     }
 
@@ -1777,11 +1787,11 @@ void Client::sweepTimeouts(int64_t nowNs) {
             return agent_.submitSend(fb, fl);
         };
         groupConsumerHub_.doWork(wallNs, snap.sessionId, sendFn);
-        // Backstop for the event-driven fetch routing: refused partitions retry,
-        // transiently refused Subscribes are re-offered, silently moved routes
-        // (a produce redirect) are followed.
-        groupConsumerHub_.unparkFetch();
+        // Pass-driven re-offer of transiently refused Subscribes and of routes a
+        // produce redirect moved (parked partitions wait for fresh metadata —
+        // LOW-2), and MEDIUM-2: OffsetFetch for start offsets still unknown.
         (void)groupConsumerHub_.reconcileFetch();
+        (void)groupConsumerHub_.retryOffsetFetch(nowNs, snap.sessionId, sendFn);
         // F8c C4: commitSync deadlines on the duty clock -> Timeout.
         (void)groupConsumerHub_.sweepCommitSyncTimeouts(nowNs);
     }
@@ -2054,8 +2064,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // route it to the correct leader (held until that session connects, then
             // flushed by the connect-triggered produceResendFn_).  This is how the
             // client converges from the stale bootstrap image to the elected leaders.
+            // MEDIUM-4: while a consumer group is active the seed session is the
+            // group coordinator's — never moved by a data-op redirect.  A produce
+            // redirect then takes this per-partition route even before metadata
+            // installed any route.
             if (havePart && rTopicId >= 0 && rPartition >= 0 &&
-                agent_.multiNodeRouting() && !newEndpoint.empty()) {
+                (agent_.multiNodeRouting() || groupActive) && !newEndpoint.empty()) {
                 const std::string leaderChannel = toChannel(newEndpoint);  // N2
                 // R2-2: a changed route is a new lane even if the redirected batch
                 // is not re-offered below (superseded / budget / unknown) — older
@@ -2073,6 +2087,20 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // budget so a genuinely unroutable partition still fails eventually.
                 producerHub_.retryRedirectedProduce(opt->correlationId, mnSendFn);
                 break; // handled per-partition; skip the single-transport retarget.
+            }
+
+            if (groupActive) {
+                // MEDIUM-4: no per-partition route for this op (a plain Subscribe,
+                // a txn request): fail THAT op retriably instead of moving the
+                // coordinator's session; fresh metadata routes the retry.
+                if (!subscriberHub_.failPendingSubscribe(opt->correlationId)) {
+                    producerHub_.retryRedirectedProduce(
+                        opt->correlationId,
+                        [this](int32_t t, int32_t p, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
+                            return agent_.offerToPartition(t, p, sid, fb, fl);
+                        });
+                }
+                break;
             }
 
             // Retarget transport to the leader's client endpoint.
@@ -2283,10 +2311,13 @@ void Client::onEgressFrame(codec::TemplateId tid,
     case codec::TemplateId::Records: {
         auto opt = codec::decodeRecords(buf, len);
         if (!opt) break;
+        // M3: the session the frame arrived on (its node + broker session id):
+        // subscription ids are per node and collide across nodes.
+        const uint32_t source = agent_.recordsSource(opt->sessionId);
         // Route to the subscriber hub first (direct subscriptions).
-        subscriberHub_.onRecords(*opt);
+        subscriberHub_.onRecords(*opt, source);
         // Also route to group consumer hub (assigned partitions).
-        groupConsumerHub_.onRecords(*opt);
+        groupConsumerHub_.onRecords(*opt, source);
         break;
     }
 
@@ -3212,6 +3243,10 @@ int64_t Client::fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept 
     return static_cast<Client*>(ctx)->agent_.connectedSessionId(session);
 }
 
+uint64_t Client::fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept {
+    return static_cast<Client*>(ctx)->agent_.connectedEpoch(session);
+}
+
 detail::SendResult Client::fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
                                                  std::size_t len) noexcept {
     using R = transport::AeronTransport::OfferResult;
@@ -3221,6 +3256,39 @@ detail::SendResult Client::fetchOfferTrampoline_(void* ctx, uint32_t session, co
     case R::Fatal:    break;
     }
     return detail::SendResult::Fatal;
+}
+
+int Client::watchGroupSessions_(int64_t nowNs) {
+    const uint32_t leaders = agent_.leaderSessionCount();
+    if (leaders == 0) return 0;
+    uint64_t up = 0, disc = 0;
+    for (uint32_t i = 1; i <= leaders && i <= 64; ++i) {
+        const session::SessionState st = agent_.sessionStateAt(i);
+        if (st == session::SessionState::Connected) up |= uint64_t{1} << (i - 1);
+        else if (st == session::SessionState::Disconnected) disc |= uint64_t{1} << (i - 1);
+    }
+    const uint64_t lost      = groupUpMask_ & ~up;
+    const uint64_t newlyDisc = disc & ~groupDiscMask_;
+    groupUpMask_   = up;
+    groupDiscMask_ = disc;
+    const uint64_t events = lost | newlyDisc;
+    if (events == 0) [[likely]] return 0;
+    bool affected = false;
+    for (uint32_t i = 1; i <= leaders && i <= 64; ++i) {
+        const uint64_t bit = uint64_t{1} << (i - 1);
+        if ((events & bit) == 0 || !groupConsumerHub_.fetchUses(i)) continue;
+        affected = true;
+        // A terminally Disconnected node session the group depends on never
+        // stays so: a fresh connect (its own connect budget paces the retries —
+        // each failure is the next event).
+        if ((newlyDisc & bit) != 0 && agent_.reviveSession(i, nowNs)) groupDiscMask_ &= ~bit;
+    }
+    if (!affected) return 0;
+    // The leader may have moved: ask now (rate-limited, falls back to the
+    // backoff refresh); the answer re-routes (onMetadataResponse -> reconcile).
+    requestMetadataNow_();
+    (void)groupConsumerHub_.reconcileFetch();
+    return 1;
 }
 
 void Client::onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_view endpoint) noexcept {
@@ -3321,6 +3389,17 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
         groupConsumerHub_.applyCommand(pinned, now());
     } else {
         groupConsumerHub_.applyCommand(cmd, now());
+        if (cmd.op == Op::GroupAdd) {
+            // MEDIUM-7: adopted after the seed connected — join now (the
+            // connect-time onConnected already ran).
+            const auto snap = agent_.stateAndSessionId();
+            if (snap.state == session::SessionState::Connected) {
+                groupConsumerHub_.joinIfConnected(
+                    snap.sessionId, [this](int32_t, const uint8_t* fb, std::size_t fl) -> bool {
+                        return agent_.submitSend(fb, fl);
+                    });
+            }
+        }
         if (cmd.op == Op::GroupAdd && cmd.handle != 0) {  // F1: as for subscriptions
             auto* gc = reinterpret_cast<GroupConsumerImpl*>(cmd.handle);
             if (gc->status.consumerOrphaned() && !gc->releaseNoted) {

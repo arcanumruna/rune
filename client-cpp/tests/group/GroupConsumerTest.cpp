@@ -492,6 +492,7 @@ TEST_F(GroupConsumerHubTest, RecordsForAssignedPartition_DeliveredAndPositionAdv
     };
 
     bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);  // C1 (fix round 1): only OffsetFetch seeds the position
 
     auto recBuf = makeRecords(kTopicId, kPartition, /*baseOffset=*/10);
     codec::RecordsView rv;
@@ -900,6 +901,7 @@ TEST_F(GroupConsumerHubTest, SyncGroupResponseError_TransitionsToRejoining) {
 TEST_F(GroupConsumerHubTest, PositionNotRegressOnNewRecords) {
     impl_->cbRecords = [](const RecordSet&) {};
     bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);  // C1 (fix round 1): only OffsetFetch seeds the position
 
     const TopicPartition tp{kTopicId, kPartition};
 
@@ -1627,6 +1629,7 @@ TEST_F(GroupConsumerHubTest, HandleCallsOnDutyThreadActDirectlyRegression) {
         finishedInside = gc.finished(); // deferred until the callback returns
     };
     bringToStable(*hub_, sink_, kTopicId, kPartition, /*genId=*/9);
+    seedPosition(*hub_, 0);
     EXPECT_EQ(seenGen, 9);
     codec::RecordsView rv;
     rv.topicId = kTopicId;
@@ -1664,6 +1667,7 @@ TEST_F(GroupConsumerHubTest, HandleDestroyedInsideOnRecordsDefersFreeRegression)
         releasedInside = hub_->release(raw);
     };
     bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 0);
     codec::RecordsView rv;
     rv.topicId   = kTopicId;
     rv.partition = kPartition;
@@ -1686,6 +1690,8 @@ TEST_F(GroupConsumerHubTest, HandleDestroyedInsideOnRecordsDefersFreeRegression)
 // Also exercises I2 (generation read on the app thread during rebalances).
 TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 0);
+    const TopicPartition tp0{kTopicId, kPartition};
     GroupRingChannel ch;
     GroupConsumer gc(impl_.get(), &GroupRingChannel::fn, &ch);
     std::atomic<bool> appDone{false};   // harness flags only
@@ -1698,6 +1704,7 @@ TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression
         int32_t gen = 1;
         while (!appDone.load(std::memory_order_acquire)) {
             ch.drainInto(*hub_);
+            rv.baseOffset = impl_->assignment.at(tp0);  // contiguous (duty thread's own state)
             hub_->onRecords(rv);
             auto asg = makeAssign(++gen, {{kTopicId, kPartition}});
             hub_->onAssign(asg.data(), asg.size(), kSessionId, sink_.fn());
@@ -1724,6 +1731,7 @@ TEST_F(GroupConsumerHubTest, CallbackSettersRaceDispatchWithoutSharingRegression
     codec::RecordsView rv;
     rv.topicId = kTopicId;
     rv.partition = kPartition;
+    rv.baseOffset = impl_->assignment.at(tp0);
     hub_->onRecords(rv);
     EXPECT_GT(dispatched.load(), 0) << "the setter was applied by the duty thread (only it drains the channel)";
 }
@@ -2068,6 +2076,8 @@ namespace {
 struct FakeFetchRouter {
     std::map<int32_t, uint32_t> leader;             // partition -> session
     std::map<uint32_t, int64_t> sids{{0u, kSessionId}};
+    std::map<uint32_t, uint64_t> epochs;  // connect epoch per session (default 1 while it has an id)
+    int refuseNext = 0;                   // the next N offers return Retry
     struct Offer { uint32_t session; std::vector<uint8_t> frame; };
     std::vector<Offer> offers;
 
@@ -2085,8 +2095,19 @@ struct FakeFetchRouter {
         const auto it = s->sids.find(i);
         return it == s->sids.end() ? 0 : it->second;
     }
+    static uint64_t epochOf(void* c, uint32_t i) {
+        auto* s = static_cast<FakeFetchRouter*>(c);
+        if (sidOf(c, i) == 0) return 0;
+        const auto it = s->epochs.find(i);
+        return it == s->epochs.end() ? 1u : it->second;
+    }
     static rune::client::detail::SendResult offer(void* c, uint32_t i, const uint8_t* b, std::size_t n) {
-        static_cast<FakeFetchRouter*>(c)->offers.push_back({i, std::vector<uint8_t>(b, b + n)});
+        auto* s = static_cast<FakeFetchRouter*>(c);
+        if (s->refuseNext > 0) {
+            --s->refuseNext;
+            return rune::client::detail::SendResult::Retry;
+        }
+        s->offers.push_back({i, std::vector<uint8_t>(b, b + n)});
         return rune::client::detail::SendResult::Accepted;
     }
     GroupConsumerHub::FetchRouter router() {
@@ -2094,6 +2115,7 @@ struct FakeFetchRouter {
         r.ctx           = this;
         r.leaderSession = &leaderOf;
         r.sessionId     = &sidOf;
+        r.epoch         = &epochOf;
         r.offer         = &offer;
         return r;
     }
@@ -2136,14 +2158,18 @@ TEST_F(GroupConsumerHubTest, LeaderNodeSubscribeWaitsForTheCommittedOffsetRegres
     hub_->setFetchRouter(fr.router());
     stableWithTwoPartitions(*hub_, sink_);
 
-    // The coordinator-led partition's Subscribe (its group subscription's
-    // isolation carrier) goes at once on the seed session; the node-1 one waits.
+    // C1 (fix round 1): no Subscribe before the start offset is known — on any session.
+    EXPECT_TRUE(fr.subscribes(0).empty());
+    EXPECT_TRUE(fr.subscribes(1).empty()) << "no leader-node Subscribe before its start offset is known";
+
+    auto ofr0 = makeOffsetFetchResponse(kTopicId, 0, 3);
+    hub_->onOffsetFetchResponse(ofr0.data(), ofr0.size());
     auto seed = fr.subscribes(0);
     ASSERT_EQ(seed.size(), 1u);
     EXPECT_EQ(seed[0].partition, 0);
     EXPECT_EQ(seed[0].sessionId, kSessionId);
+    EXPECT_EQ(seed[0].fromOffset, 3);
     EXPECT_TRUE(GroupConsumerHub::isFetchCorrId(seed[0].correlationId));
-    EXPECT_TRUE(fr.subscribes(1).empty()) << "no leader-node Subscribe before its start offset is known";
 
     auto ofr = makeOffsetFetchResponse(kTopicId, 1, 7);
     hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
@@ -2224,4 +2250,136 @@ TEST_F(GroupConsumerHubTest, NewGenerationRemakesLeaderNodeSubscriptionFromCommi
     const auto subs = fr.subscribes(1);
     ASSERT_EQ(subs.size(), 2u);
     EXPECT_EQ(subs[1].fromOffset, 12);
+}
+
+// ---- Fix round 1 (review C1 / M2 / MEDIUM-1 / LOW-1) -----------------------
+namespace {
+// Stable with p0 (seed) + p1 (node 1, session id 501), both start offsets known
+// (p0 at 0, p1 at 7), and p1's node-1 subscription bound to id 900.
+void boundOnNodeOne(GroupConsumerHub& hub, CaptureSink& sink, FakeFetchRouter& fr) {
+    fr.leader  = {{0, 0u}, {1, 1u}};
+    fr.sids[1] = 501;
+    hub.setFetchRouter(fr.router());
+    stableWithTwoPartitions(hub, sink);
+    auto o0 = makeOffsetFetchResponse(kTopicId, 0, 0);
+    hub.onOffsetFetchResponse(o0.data(), o0.size());
+    auto o1 = makeOffsetFetchResponse(kTopicId, 1, 7);
+    hub.onOffsetFetchResponse(o1.data(), o1.size());
+    ASSERT_TRUE(hub.onFetchSubscribeResponse(fr.subscribes(1).at(0).correlationId, 0, 900));
+}
+codec::RecordsView batch(int32_t partition, int64_t base, int64_t subId, int32_t count = 1) {
+    codec::RecordsView rv;
+    rv.topicId        = kTopicId;
+    rv.partition      = partition;
+    rv.baseOffset     = base;
+    rv.subscriptionId = subId;
+    rv.recordCount    = count;
+    return rv;
+}
+} // namespace
+
+// C1: only the current instance on its own session: another session's batch,
+// another id, or a retired instance's batch never reaches the application.
+TEST_F(GroupConsumerHubTest, OnlyTheCurrentSubscriptionInstanceIsAcceptedRegression) {
+    FakeFetchRouter fr;
+    int delivered = 0;
+    impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
+    boundOnNodeOne(*hub_, sink_, fr);
+    const TopicPartition tp{kTopicId, 1};
+    hub_->onRecords(batch(1, 7, 900), /*source=*/0);   // right id, wrong session (the seed)
+    hub_->onRecords(batch(1, 7, 901), /*source=*/1);   // right session, another id
+    EXPECT_EQ(delivered, 0);
+    EXPECT_EQ(impl_->assignment.at(tp), 7);
+    hub_->onRecords(batch(1, 7, 900), /*source=*/1);
+    EXPECT_EQ(delivered, 1);
+    EXPECT_EQ(impl_->assignment.at(tp), 8);
+    // The leader moves to node 2: 900 is retired — its in-flight batches drop.
+    fr.leader[1] = 2u;
+    fr.sids[2]   = 777;
+    hub_->reconcileFetch();
+    hub_->onRecords(batch(1, 8, 900), /*source=*/1);
+    EXPECT_EQ(delivered, 1) << "a retired instance's batch was delivered";
+    EXPECT_EQ(impl_->assignment.at(tp), 8);
+}
+
+// C1: a gap (batch above the position) never advances it; the subscription is
+// re-made from the position; a second gap at the same position parks the
+// partition (records gone — never skipped silently).
+TEST_F(GroupConsumerHubTest, GapResubscribesFromThePositionThenParksRegression) {
+    FakeFetchRouter fr;
+    int delivered = 0;
+    impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
+    boundOnNodeOne(*hub_, sink_, fr);
+    const TopicPartition tp{kTopicId, 1};
+    hub_->onRecords(batch(1, 12, 900), 1);  // gap: 7..11 missing
+    EXPECT_EQ(delivered, 0);
+    EXPECT_EQ(impl_->assignment.at(tp), 7);
+    const auto un = fr.unsubscribes(1);
+    ASSERT_EQ(un.size(), 1u);
+    EXPECT_EQ(un[0].subscriptionId, 900);
+    const auto subs = fr.subscribes(1);
+    ASSERT_EQ(subs.size(), 2u);
+    EXPECT_EQ(subs[1].fromOffset, 7) << "re-made from the position";
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs[1].correlationId, 0, 901));
+    hub_->onRecords(batch(1, 12, 901), 1);  // the fresh one gaps again at 7: gone
+    EXPECT_EQ(impl_->assignment.at(tp), 7);
+    EXPECT_EQ(fr.subscribes(1).size(), 2u) << "parked: no re-subscribe storm";
+    EXPECT_TRUE(hub_->takeMetadataWanted());
+}
+
+// M2: an Unsubscribe the transport refused is re-offered on a later pass; one
+// whose session episode ended is moot (dropped, never sent to a new episode).
+TEST_F(GroupConsumerHubTest, RefusedUnsubscribeIsRetriedUntilSentOrMootRegression) {
+    FakeFetchRouter fr;
+    boundOnNodeOne(*hub_, sink_, fr);
+    fr.refuseNext = 1;
+    auto asg = makeAssign(2, {{kTopicId, 0}});  // revoke p1
+    hub_->onAssign(asg.data(), asg.size(), kSessionId, sink_.fn());
+    EXPECT_TRUE(fr.unsubscribes(1).empty());
+    EXPECT_EQ(hub_->pendingFetchUnsubscribes(), 1u);
+    EXPECT_EQ(hub_->retryFetchUnsubscribes(), 1);
+    ASSERT_EQ(fr.unsubscribes(1).size(), 1u);
+    EXPECT_EQ(fr.unsubscribes(1)[0].subscriptionId, 900);
+    EXPECT_EQ(hub_->pendingFetchUnsubscribes(), 0u);
+
+    // Moot: refused, then node 1's session episode ends.
+    GroupConsumerHub hub2;
+    GroupConsumerImpl impl2;
+    impl2.groupId = "g2";
+    impl2.topicIds = {kTopicId};
+    impl2.active = true;
+    hub2.add(&impl2);
+    FakeFetchRouter fr2;
+    boundOnNodeOne(hub2, sink_, fr2);
+    fr2.refuseNext = 1;
+    auto asg2 = makeAssign(2, {{kTopicId, 0}});
+    hub2.onAssign(asg2.data(), asg2.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(hub2.pendingFetchUnsubscribes(), 1u);
+    fr2.epochs[1] = 2;  // node 1 reconnected (a new episode, maybe a restarted node)
+    (void)hub2.retryFetchUnsubscribes();
+    EXPECT_TRUE(fr2.unsubscribes(1).empty()) << "never unsubscribe an id in a new session episode";
+    EXPECT_EQ(hub2.pendingFetchUnsubscribes(), 0u);
+}
+
+// MEDIUM-1: node 1 reconnects (restart) and the new session got the SAME broker
+// session id: still a new episode — the partition is subscribed again from its
+// position.  RED: the broker id compare took the dead subscription for live.
+TEST_F(GroupConsumerHubTest, SameSessionIdNewEpisodeResubscribesRegression) {
+    FakeFetchRouter fr;
+    boundOnNodeOne(*hub_, sink_, fr);
+    ASSERT_EQ(fr.subscribes(1).size(), 1u);
+    fr.epochs[1] = 2;  // same id 501, new connect episode
+    hub_->reconcileFetch();
+    const auto subs = fr.subscribes(1);
+    ASSERT_EQ(subs.size(), 2u);
+    EXPECT_EQ(subs[1].fromOffset, 7);
+    EXPECT_EQ(subs[1].sessionId, 501);
+}
+
+// LOW-1: only positive ids with bit 61 set (and 62 clear) are group fetch ids.
+TEST(GroupFetchCorrIdRegression, NegativeIdsAreNeverFetchIdsRegression) {
+    EXPECT_TRUE(GroupConsumerHub::isFetchCorrId(GroupConsumerHub::kFetchCorrTag | 5));
+    EXPECT_FALSE(GroupConsumerHub::isFetchCorrId(-(int64_t{1} << 62) + (int64_t{1} << 61)));
+    EXPECT_FALSE(GroupConsumerHub::isFetchCorrId(-1));
+    EXPECT_FALSE(GroupConsumerHub::isFetchCorrId(42));
 }
