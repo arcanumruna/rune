@@ -548,6 +548,7 @@ public:
         durablePending_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         initRoutes_(ioSubmitDepth > ioComplDepth ? ioSubmitDepth : ioComplDepth);
         dirtyThisCycle_.reserve(kDirtySetReserve);
+        roundMembers_.reserve(pow2AtLeast_(ioSubmitDepth < 2 ? 2 : ioSubmitDepth));   // A10: members <= io depth
         pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         subs_.reserve(kSubsReserve);
         validators_.reserve(kValidatorsReserve);
@@ -1105,7 +1106,7 @@ public:
 
     // -----------------------------------------------------------------------
     // E3 Task 5: test accessor — cumulative count of successful io_.submit calls
-    // in submitCoalescedFlushes_().  Used by the GroupCommit test to assert
+    // in submitRound_().  Used by the GroupCommit test to assert
     // that 8 produces to one partition produce exactly 1 submit per cycle.
     // Worker-thread only; call only from single-threaded tests.
     // -----------------------------------------------------------------------
@@ -1148,6 +1149,10 @@ public:
     [[nodiscard]] uint64_t    bgFlushErrorsForTest() const noexcept { return bgFlushErrors_; }
     [[nodiscard]] uint64_t    bgFlushDeferredForTest() const noexcept { return bgFlushDeferred_; }
     [[nodiscard]] uint64_t    sealSubmitsForTest() const noexcept { return sealSubmits_; }
+    /// A10: durability rounds started / a round in flight / io backend submission batches (io_uring: enters).
+    [[nodiscard]] uint64_t    syncRoundsStartedForTest() const noexcept { return syncRoundsStarted_; }
+    [[nodiscard]] bool        syncRoundInFlightForTest() const noexcept { return round_.inFlight; }
+    [[nodiscard]] uint64_t    ioSubmitBatchesForTest() const noexcept { return io_.submitBatches(); }
     [[nodiscard]] uint64_t    storageFailureSignalsForTest() const noexcept { return storageFailureSignals_; }
     [[nodiscard]] std::size_t flushSlotCountForTest() const noexcept { return slots_.size(); }
     /// Completions drained from io_ by reapDurableCompletions_ (any token).
@@ -1323,10 +1328,9 @@ public:
             work += static_cast<int>(drainIngress_());
         }
 
-        // Step E3 coalesce: after all this-cycle produces are appended, submit
-        // ONE fsync per dirty log and stamp the completion token onto every pending
-        // entry for that log.  submitCoalescedFlushes_ clears dirtyThisCycle_.
-        work += submitCoalescedFlushes_();
+        // A10: Strict-tier appends recorded in dirtyThisCycle_ join this pass's durability ROUND, which
+        // is submitted at the END of the pass (submitRound_) together with every other log that needs
+        // one (periodic sync, follower flush requests) — one batch, one round in flight.
 
         // Shared-nothing: owned_ is a plain member touched only by this thread.
         // Step 5: per-replica ISR checks / follower fetch emission.
@@ -1399,6 +1403,9 @@ public:
         // owning worker group-commits its own logs, here.
         // Internal partitions (topicId < 0) are not in owned_.
         work += syncOwnedLogsAsync_(nowNs);
+        // A10 group commit: everything this pass made due (Strict appends, follower flush requests,
+        // the periodic sync) leaves in ONE round — never beside a round still in flight.
+        work += submitRound_(nowNs);
 
         return work;
     }
@@ -1425,7 +1432,7 @@ private:
             ret_.freeSlotsForMsgSize(ackSlotBytes_) > reservedAckSlots_()) {
             work += pollWorkerIngress_(nowNs);
         }
-        work += submitCoalescedFlushes_();
+        // (A10: Strict appends join the end-of-pass durability round — submitRound_.)
         // 4. replication on this worker's plane: apply inbound (inline, fast-acks),
         //    then push / ISR / HW per owned replica.
         if (workerReplTransport_) work += pollReplTransport_(*workerReplTransport_, nowNs);   // direct
@@ -1454,6 +1461,7 @@ private:
             checkStorageFailure_(slot.log);
         }
         work += syncOwnedLogsAsync_(nowNs);   // io backend, never Log::sync (spec §3.1)
+        work += submitRound_(nowNs);          // A10: one group-commit round (Strict + periodic + follower)
         work += flushPendingSignals_();
         // Task 13 (spec §3.4): claim EVERY ack due this pass — appends, HW fires,
         // fsync completions, failures — on its session's own publication, last,
@@ -1643,88 +1651,6 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // submitCoalescedFlushes_ — group-commit: submit ONE fsync per dirty log.
-    //
-    // Called from doWork AFTER drainIngress_ (so all this-cycle appends are
-    // recorded) and BEFORE the per-replica doWork loop.
-    //
-    // For each log in dirtyThisCycle_:
-    //   - Call io_.submit(log->activeSegmentFd(), log->flushBoundary()).
-    //   - If submit returns kNoToken (ring full — back-pressure): for every
-    //     durablePending_ entry with token==0 && logPtr==log, immediately
-    //     return Internal (6) and erase the entry.  Never drop; never false-OK.
-    //   - If submit succeeds: stamp the returned token onto every pending entry
-    //     with token==0 && logPtr==log (the completion covers all of them).
-    //
-    // dirtyThisCycle_ is cleared at the end.  Returns work units done.
-    // -----------------------------------------------------------------------
-    int submitCoalescedFlushes_() {
-        if (dirtyThisCycle_.empty()) return 0;
-
-        int work = 0;
-        for (rune::storage::Log* log : dirtyThisCycle_) {
-            // Async roll seals first: a Strict entry may live in a segment sealed
-            // this pass, and its ack waits for that seal (onFlushCompletion_).
-            LogFlushSlot* slot = slotOf_(log);
-            if (log->storageFailed()) [[unlikely]] {
-                // fsyncgate: never touch a failed log's disk again; its pending
-                // entries fail (StorageError), never OK.
-                failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), false);
-                ++work;
-                continue;
-            }
-            if (slot) work += submitPendingSeals_(*slot);
-            // M-6: one fsync in flight per log.  While one is, the new entries
-            // stay un-stamped (kNoToken) and the log stays dirty: the next pass
-            // after the in-flight fsync completes submits ONE fsync covering
-            // all of them (state-driven retry, no timer).
-            //
-            // Strict latency bound (fix round 3, I-3): a deferred Strict waiter
-            // marks the log strictWaiting, which blocks every NEW background
-            // fsync on it (requestBgFlush_), so the next fsync on the log is
-            // its durable one.  A Strict ack therefore waits for at most ONE
-            // in-flight fsync (durable or background) plus its own — never a
-            // chain of re-armed background flushes.
-            if (slot && (slot->durableToken != kNoToken || slot->bgToken != kNoToken)) {
-                ++durableSubmitsDeferred_;
-                slot->strictWaiting = true;
-                stillDirty_.push_back(log);
-                continue;
-            }
-            CompletionToken t = submitActive_(log, RouteKind::Durable, slot ? slot->epoch : 0,
-                                              /*pin=*/slot != nullptr);
-            if (t == kNoToken) {
-                // Submit ring full — back-pressure: ack all pending entries for
-                // this log with Internal error immediately.  Never drop; never
-                // silently hold forever.
-                spdlog::warn("Worker {}: submitCoalescedFlushes_ ring full for log@{}; "
-                             "back-pressure: acking pending entries Internal",
-                             workerId_, static_cast<const void*>(log));
-                if (slot) slot->strictWaiting = false;   // its waiters are answered below
-                work += static_cast<int>(durablePending_.sweep([&](DurablePending& entry) {
-                    if (entry.token != kNoToken || entry.logPtr != log) return false;
-                    entry.ret.errorCode = static_cast<int16_t>(6); // Internal
-                    enqueueReturn_(entry.ret);
-                    return true;
-                }));
-            } else {
-                // Successful submit: stamp the token onto every pending entry
-                // for this log (all appends this cycle share one fsync token).
-                durablePending_.forEach([&](DurablePending& entry) {
-                    if (entry.token == kNoToken && entry.logPtr == log) entry.token = t;
-                });
-                if (slot) { slot->durableToken = t; slot->durableLeo = log->logEndOffset(); slot->strictWaiting = false; }
-                ++io_submitCount_;
-                ++work;
-            }
-        }
-        // M-6: logs whose fsync is deferred behind an in-flight one stay dirty.
-        dirtyThisCycle_.swap(stillDirty_);
-        stillDirty_.clear();
-        return work;
-    }
-
-    // -----------------------------------------------------------------------
     // reapDurableCompletions_ — drain IoBackend completions and fire the
     // deferred acks for completed Strict-tier produces.
     //
@@ -1763,6 +1689,7 @@ private:
     int onFlushCompletion_(const FlushCompletion& c) {
         TokenRoute r;
         const bool routed = routeTake_(c.token, r);
+        if (routed && r.round) onRoundMemberDone_();   // A10: success or error, the member is done
         // F15 S4 fix round 2 (RR1-4): an RC read-ahead hint — never a flush:
         // success or error, it only re-arms its partition's next hint.
         if (routed && r.kind == RouteKind::Hint) [[unlikely]] {
@@ -1794,11 +1721,10 @@ private:
             gate->durableToken = kNoToken;
             if (c.errorCode == 0) {
                 if (gate->durableLeo > gate->lastSyncedLeo) gate->lastSyncedLeo = gate->durableLeo;
-                // I-3: re-request background only if no Strict waiter is queued
-                // (requestBgFlush_ keeps bgAgain set while strictWaiting).
+                // A10: newer data requested meanwhile joins the next round.
                 if (gate->bgAgain) {
                     gate->bgAgain = false;
-                    if (gate->log->logEndOffset() > gate->lastSyncedLeo) (void)requestBgFlush_(*gate);
+                    if (gate->log->logEndOffset() > gate->lastSyncedLeo) gate->roundWanted = true;
                 }
             }
         }
@@ -1823,7 +1749,7 @@ private:
                 // N-7: the current slot (a re-owned log re-serves its bgAgain).
                 if (!gate) return 1;                           // purged (M2): success ignored safely
                 if (gate == slot && gate->bgLeo > gate->lastSyncedLeo) gate->lastSyncedLeo = gate->bgLeo;
-                if (gate->bgAgain) { gate->bgAgain = false; (void)requestBgFlush_(*gate); }
+                if (gate->bgAgain) { gate->bgAgain = false; requestRound_(*gate); }   // A10: next round
             } else if (!slot) {
                 return 1;                                      // purged (M2): success ignored safely
             } else {
@@ -3099,7 +3025,7 @@ private:
                 }
                 // N2 (minor): keep append()'s flush request on the worker — a
                 // Strict-tier marker joins this pass's coalesced durable flush
-                // (submitCoalescedFlushes_), exactly like a Strict produce.
+                // (submitRound_), exactly like a Strict produce.
                 if (replica->durabilityTier() == 2 && replica->isDiskBacked()) {
                     rune::storage::Log* log = replica->log();
                     bool found = false;
@@ -3414,10 +3340,10 @@ private:
     // E3: deferred Strict-tier produce acks waiting for fsync completion.
     //
     // token: 0 (kNoToken) means "appended but not yet submitted to IoBackend" —
-    //   submitCoalescedFlushes_() assigns the real token after drainIngress_.
+    //   submitRound_() assigns the real token after drainIngress_.
     //   reapDurableCompletions_() skips token==0 entries (not yet flushed).
     // logPtr: the disk Log this entry was appended to (used by
-    //   submitCoalescedFlushes_ to match the dirty-log set and stamp tokens).
+    //   submitRound_ to match the dirty-log set and stamp tokens).
     // lastOffset: the log offset after this append.  A group-commit completion
     //   with flushBoundary B fires every pending entry with lastOffset <= B.
     //
@@ -3444,7 +3370,7 @@ private:
     OrderedWaitQueue<DurablePending> durablePending_;
 
     // E3 Task 5: per-cycle set of logs that have had at least one Strict-tier
-    // append this cycle.  submitCoalescedFlushes_ drains this and submits one
+    // append this cycle.  submitRound_ drains this and submits one
     // io_.submit per log.  Worker-thread only — plain vector, reserved in ctor.
     std::vector<rune::storage::Log*> dirtyThisCycle_;
     // F15 S5 fix round 2 (M-6): dirty logs whose fsync waits behind an in-flight one.
@@ -3452,7 +3378,7 @@ private:
     uint64_t durableSubmitsDeferred_ = 0;
 
     // E3 Task 5: cumulative count of successful io_.submit calls in
-    // submitCoalescedFlushes_.  Used by tests (ioSubmitCountForTest()).
+    // submitRound_.  Used by tests (ioSubmitCountForTest()).
     uint64_t io_submitCount_ = 0;
 
     // E4: CPU affinity — core to pin this worker's AgentRunner thread to.
@@ -3828,6 +3754,10 @@ private:
         bool            strictWaiting   = false;
         int64_t         bgLeo           = 0;          ///< LEO covered by bgToken
         bool            bgAgain         = false;      ///< newer data requested meanwhile
+        /// A10: the log joins the next durability round (follower flush request, periodic sync,
+        /// re-request after an fsync that started before newer data, a refused member).
+        bool            roundWanted     = false;
+        bool            roundQueued     = false;      ///< A10: queued in the round being assembled
         int64_t         lastSyncedLeo   = 0;
         uint32_t        sealsInFlight   = 0;
         bool            failureReported = false;
@@ -3850,6 +3780,14 @@ private:
         rune::storage::LogSegment* seg   = nullptr;     ///< pinned segment (unpin on completion)
         uint32_t                   epoch = 0;
         RouteKind                  kind  = RouteKind::Durable;
+        bool                       round = false;       ///< A10: a member of the durability round
+    };
+    struct RoundMember {
+        rune::storage::Log*        log  = nullptr;
+        LogFlushSlot*              slot = nullptr;
+        rune::storage::LogSegment* seg  = nullptr;   ///< pinned (unpinned on completion / refusal)
+        CompletionToken            token = kNoToken;
+        RouteKind                  kind = RouteKind::Background;
     };
     std::vector<TokenRoute> routes_;
     std::size_t             routeMask_ = 0;
@@ -3859,6 +3797,16 @@ private:
     uint64_t    bgFlushErrors_  = 0;
     uint64_t    bgFlushDeferred_ = 0;
     uint64_t    sealSubmits_    = 0;
+    uint64_t    syncRoundsStarted_ = 0;
+    /// A10 group commit — the worker's ONE durability round.  Rich state: Idle (inFlight == false), or
+    /// InFlight{outstanding members, startNs}.  Worker-thread only.
+    struct SyncRound {
+        bool     inFlight    = false;
+        uint32_t outstanding = 0;   ///< InFlight: members not yet completed
+        int64_t  startNs     = 0;   ///< InFlight: when it was submitted
+    };
+    SyncRound round_;
+    std::vector<RoundMember> roundMembers_;   ///< scratch for one round's assembly (reserved: io depth)
     uint64_t    ioCompletionsReaped_ = 0;
     uint64_t    storageFailureSignals_ = 0;
     CompletionToken durableAckToken_ = kNoToken;     ///< token whose completion fired the last durable ack
@@ -4436,6 +4384,193 @@ private:
         return (slot && slot->epoch == r.epoch) ? slot : nullptr;
     }
 
+    // -----------------------------------------------------------------------
+    // submitRound_ — A10 GROUP COMMIT: one durability round per worker.
+    //
+    // Called once at the END of every pass (both placements).  While a round is
+    // in flight nothing new is submitted: Strict appends (dirtyThisCycle_),
+    // follower flush requests and periodic syncs (LogFlushSlot::roundWanted)
+    // accumulate and join the NEXT round, which starts on the first pass after
+    // EVERY member of the current one completed (self-clocked by the disk; IO
+    // per round = one fdatasync per member, issued together so the filesystem
+    // batches their journal commits + cache flushes — findings §4.16.1).
+    //
+    // Members (each = one data-sync of the log's active segment, never inline):
+    //   - a log with Strict waiters: RouteKind::Durable — stamps its pending
+    //     entries; it also serves any background request on the log;
+    //   - a log with roundWanted (follower flush / periodic / re-request), and —
+    //     when the periodic sync is on and half its interval has passed — every
+    //     dirty log (aligns the leader and follower timers into one round):
+    //     RouteKind::Background.
+    // A member marks its log durable up to the LEO sampled here (durableLeo /
+    // bgLeo) on its successful completion — the per-log semantics are those of
+    // a single fsync, as before.  An error is fail-stop (onFlushCompletion_).
+    // All members are queued, then submitted with ONE io_.submitQueued()
+    // (io_uring: one io_uring_enter).  A refused Strict member answers Internal
+    // (never drop, never false-OK, as before); a refused background member stays
+    // wanted (retried by the next round).  Allocation-free (roundMembers_ is
+    // reserved to the io depth).
+    // -----------------------------------------------------------------------
+    // Queue a data-sync of `log`'s active segment into the open batch (pins the segment while a slot
+    // owns the log).  token == kNoToken on back-pressure (nothing pinned).
+    RoundMember queueMember_(rune::storage::Log* log, LogFlushSlot* slot, RouteKind kind) noexcept {
+        RoundMember m;
+        m.log = log; m.slot = slot; m.kind = kind;
+        rune::storage::LogSegment* seg = log->activeSegmentForFlush();
+        const bool pin = slot != nullptr;
+        if (pin) seg->pinFlush();
+        m.token = io_.queueFlush(seg->logFd());
+        if (m.token == kNoToken) { if (pin) log->unpinSegmentFlush(seg); return m; }
+        m.seg = pin ? seg : nullptr;
+        if (slot) slot->roundQueued = true;
+        return m;
+    }
+    // A Strict member the io backend refused: back-pressure — every un-stamped waiter on the log is
+    // answered Internal at once (never dropped, never held forever, never a false OK).
+    int refuseDurable_(rune::storage::Log* log, LogFlushSlot* slot) {
+        spdlog::warn("Worker {}: durability round refused for log@{} (io back-pressure); "
+                     "acking pending entries Internal", workerId_, static_cast<const void*>(log));
+        if (slot) slot->strictWaiting = false;   // its waiters are answered below
+        return static_cast<int>(durablePending_.sweep([&](DurablePending& entry) {
+            if (entry.token != kNoToken || entry.logPtr != log) return false;
+            entry.ret.errorCode = static_cast<int16_t>(6); // Internal
+            enqueueReturn_(entry.ret);
+            return true;
+        }));
+    }
+    // A background member is wanted if it has bytes beyond its last durable mark and nothing in flight.
+    [[nodiscard]] bool bgMemberReady_(const LogFlushSlot& slot) const noexcept {
+        return !slot.log->storageFailed() && slot.log->logEndOffset() > slot.lastSyncedLeo &&
+               slot.durableToken == kNoToken && slot.bgToken == kNoToken;
+    }
+    int submitRound_(int64_t nowNs) {
+        if (round_.inFlight) return 0;   // members wait for the round in flight (group commit)
+        int work = 0;
+        roundMembers_.clear();
+        bool full = false;   // the io backend refused: queue no more this pass
+        // 1. Strict waiters → Durable members.
+        for (rune::storage::Log* log : dirtyThisCycle_) {
+            LogFlushSlot* slot = slotOf_(log);
+            if (log->storageFailed()) [[unlikely]] {
+                // fsyncgate: never touch a failed log's disk again; its pending
+                // entries fail (StorageError), never OK.
+                failOwnPending_(log, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), false);
+                ++work;
+                continue;
+            }
+            // Async roll seals first: a Strict entry may live in a segment sealed
+            // this pass, and its ack waits for that seal (onFlushCompletion_).
+            if (slot) work += submitPendingSeals_(*slot);
+            // M-6: one fsync in flight per log (only an out-of-round flush can still be in flight here).
+            // I-3: strictWaiting blocks any new background fsync on the log, so its next fsync is this
+            // durable one.
+            if (slot && (slot->durableToken != kNoToken || slot->bgToken != kNoToken)) {
+                ++durableSubmitsDeferred_;
+                slot->strictWaiting = true;
+                stillDirty_.push_back(log);
+                continue;
+            }
+            RoundMember m = full ? RoundMember{} : queueMember_(log, slot, RouteKind::Durable);
+            if (m.token == kNoToken) { full = true; work += refuseDurable_(log, slot); continue; }
+            roundMembers_.push_back(m);
+        }
+        // 2. Background members.  The periodic sync aligns with any round that starts after half its
+        // interval: it covers every dirty log then and restarts its interval (one round per interval
+        // instead of separate leader / follower rounds).
+        bool anyWanted = !roundMembers_.empty();
+        for (const auto& slot : slots_) anyWanted = anyWanted || slot.roundWanted;
+        if (anyWanted) {
+            const bool sweepDirty = syncIntervalNs_ > 0 && lastSyncNs_ != 0 &&
+                                    nowNs - lastSyncNs_ >= syncIntervalNs_ / 2;
+            if (sweepDirty) lastSyncNs_ = nowNs;
+            for (auto& slot : slots_) {
+                if (!slot.roundWanted && !sweepDirty) continue;
+                if (slot.roundQueued) continue;   // already a (Strict) member: its durable fsync serves it
+                if (!bgMemberReady_(slot)) {
+                    // Nothing beyond its durable mark (or failed): the request is moot.  An fsync still in
+                    // flight keeps it wanted (newer data is covered by the next round).
+                    if (slot.log->storageFailed() || slot.log->logEndOffset() <= slot.lastSyncedLeo)
+                        slot.roundWanted = false;
+                    continue;
+                }
+                if (full) { slot.roundWanted = true; continue; }
+                RoundMember m = queueMember_(slot.log, &slot, RouteKind::Background);
+                if (m.token == kNoToken) {
+                    full = true;
+                    slot.roundWanted = true;   // retried by the next round
+                    noteBgDeferred_();
+                    continue;
+                }
+                roundMembers_.push_back(m);
+            }
+        }
+        dirtyThisCycle_.swap(stillDirty_);   // M-6: Strict logs deferred behind an out-of-round fsync
+        stillDirty_.clear();
+        if (roundMembers_.empty()) return work;
+        // 3. ONE submission for the whole round; the first k queued are in flight.
+        const uint32_t k = io_.submitQueued();
+        for (uint32_t i = 0; i < roundMembers_.size(); ++i) {
+            RoundMember& m = roundMembers_[i];
+            if (m.slot) m.slot->roundQueued = false;
+            if (i >= k) {   // refused by the kernel: withdrawn
+                if (m.seg) m.log->unpinSegmentFlush(m.seg);
+                if (m.kind == RouteKind::Durable) work += refuseDurable_(m.log, m.slot);
+                else { m.slot->roundWanted = true; noteBgDeferred_(); }
+                continue;
+            }
+            if (!routeInsert_(TokenRoute{m.token, m.log, m.seg, m.slot ? m.slot->epoch : 0u, m.kind, true})) {
+                spdlog::critical("Worker {}: io token route table full (token={})", workerId_, m.token);
+            }
+            if (m.kind == RouteKind::Durable) {
+                // Every un-stamped waiter on the log shares this member's token.
+                durablePending_.forEach([&](DurablePending& entry) {
+                    if (entry.token == kNoToken && entry.logPtr == m.log) entry.token = m.token;
+                });
+                if (m.slot) {
+                    m.slot->durableToken  = m.token;
+                    m.slot->durableLeo    = m.log->logEndOffset();
+                    m.slot->strictWaiting = false;
+                    m.slot->roundWanted   = false;   // the durable fsync serves the background request too
+                    m.slot->bgAgain       = false;
+                }
+                ++io_submitCount_;
+            } else {
+                m.slot->bgToken     = m.token;
+                m.slot->bgLeo       = m.log->logEndOffset();
+                m.slot->bgAgain     = false;
+                m.slot->roundWanted = false;
+                ++bgInFlight_;
+                ++bgFlushSubmits_;
+            }
+            ++round_.outstanding;
+            ++work;
+        }
+        if (round_.outstanding > 0) {
+            round_.inFlight = true;
+            round_.startNs  = nowNs;
+            ++syncRoundsStarted_;
+        }
+        return work;
+    }
+    void noteBgDeferred_() noexcept {
+        ++bgFlushDeferred_;
+        if (bgFlushDeferred_ == 1 || (bgFlushDeferred_ & 1023u) == 0)
+            spdlog::warn("Worker {}: background flush deferred (io back-pressure, total={})",
+                         workerId_, bgFlushDeferred_);
+    }
+    // A round member completed (success or error): the round completes with its last member.
+    void onRoundMemberDone_() noexcept {
+        if (round_.outstanding > 0 && --round_.outstanding == 0) round_.inFlight = false;
+    }
+    // Ask for the log to be made durable by the next round (follower flush request, re-request after a
+    // flush that started before newer data).  Never a submission by itself.
+    void requestRound_(LogFlushSlot& slot) noexcept {
+        if (slot.log->storageFailed()) return;
+        if (slot.log->logEndOffset() > slot.lastSyncedLeo || slot.bgToken != kNoToken ||
+            slot.durableToken != kNoToken)
+            slot.roundWanted = true;
+    }
+
     // Pin the active segment (only for a log this worker owns a slot for — the
     // pin is released on the completion through that slot) and submit its fd.
     // kNoToken on back-pressure.
@@ -4467,7 +4602,7 @@ private:
         }
         for (auto* replica : owned_) {
             if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
-                if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
+                if (LogFlushSlot* slot = slotOf_(replica->log())) requestRound_(*slot);   // A10: next round
             }
         }
         return work;
@@ -4558,13 +4693,13 @@ private:
         if (lastSyncNs_ == 0) { lastSyncNs_ = nowNs; return 0; }
         if (nowNs - lastSyncNs_ < syncIntervalNs_) return 0;
         lastSyncNs_ = nowNs;
-        int n = 0;
+        // A10: the due logs join the next durability round (submitRound_, end of this pass).
         for (auto& slot : slots_) {
             if (slot.log->storageFailed()) continue;
             if (slot.log->logEndOffset() <= slot.lastSyncedLeo) continue;   // unchanged: no phantom work
-            if (requestBgFlush_(slot)) ++n;
+            slot.roundWanted = true;
         }
-        return n;
+        return 0;   // the work is counted when the round submits
     }
 
     bool sealsOutstanding_(rune::storage::Log* log) noexcept {
@@ -5352,7 +5487,7 @@ private:
         const int64_t lastOff = ret.lastOffset;
 
         if (asyncStrict) {
-            // Park on the coalesced fsync (submitCoalescedFlushes_ stamps the token
+            // Park on the coalesced fsync (submitRound_ stamps the token
             // this pass).  A duplicate retry is parked too: its original may still
             // be awaiting its own fsync, and a Strict ack is never sent before the
             // data it acknowledges is durable.

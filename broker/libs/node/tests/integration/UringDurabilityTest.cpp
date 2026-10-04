@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <cstring>
 #include <unistd.h>
@@ -324,6 +325,70 @@ TEST(UringDurabilityTest, IoWorkerAffinityNopIsDrainedSilentlyAndRespectsTheCapR
         (void)be.reap([](const rune::node::FlushCompletion&) {});
     ::close(fd);
     ::unlink(path);
+}
+
+// ---------------------------------------------------------------------------
+// A10 group commit: a durability round = queued fsyncs submitted with ONE
+// io_uring_enter; every member completes with its own token; a bad member fails
+// alone (its log is fail-stopped by the worker); the in-flight cap holds.
+// ---------------------------------------------------------------------------
+TEST(UringDurabilityTest, QueuedRoundIsOneEnterAndEveryMemberCompletesRegression) {
+    constexpr int kN = 4;
+    char paths[kN][32];
+    int fds[kN];
+    for (int i = 0; i < kN; ++i) {
+        std::snprintf(paths[i], sizeof paths[i], "/tmp/rune_uring_rnd_XXXXXX");
+        fds[i] = ::mkstemp(paths[i]);
+        ASSERT_GE(fds[i], 0);
+        ASSERT_EQ(::write(fds[i], "round", 5), 5);
+    }
+    UringFlushBackend be(16, 16);
+    rune::node::CompletionToken toks[kN + 1];
+    for (int i = 0; i < kN; ++i) { toks[i] = be.queueFsync(fds[i]); ASSERT_NE(toks[i], kNoToken); }
+    toks[kN] = be.queueFsync(-99);                          // a bad member
+    ASSERT_NE(toks[kN], kNoToken);
+    EXPECT_EQ(be.inFlight(), 0u) << "queued, not yet submitted (no syscall yet)";
+    const uint64_t batches = be.submitBatches();
+    ASSERT_EQ(be.submitQueued(), static_cast<uint32_t>(kN + 1));
+    EXPECT_EQ(be.submitBatches(), batches + 1) << "the whole round in ONE io_uring_enter";
+    EXPECT_EQ(be.inFlight(), static_cast<std::size_t>(kN + 1));
+    int ok = 0, bad = 0, seen = 0;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (seen < kN + 1 && std::chrono::steady_clock::now() < end) {
+        be.reap([&](const FlushCompletion& c) {
+            ++seen;
+            if (c.token == toks[kN]) { EXPECT_NE(c.errorCode, 0); ++bad; return; }
+            bool mine = false;
+            for (int i = 0; i < kN; ++i) mine = mine || c.token == toks[i];
+            EXPECT_TRUE(mine);
+            EXPECT_EQ(c.errorCode, 0);
+            ++ok;
+        });
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(ok, kN);
+    EXPECT_EQ(bad, 1) << "only the bad member fails";
+    EXPECT_EQ(be.inFlight(), 0u);
+    for (int i = 0; i < kN; ++i) { ::close(fds[i]); ::unlink(paths[i]); }
+}
+
+TEST(UringDurabilityTest, QueuedRoundRespectsTheInFlightCapRegression) {
+    UringFlushBackend be(/*submitDepth=*/4, 4);
+    int queued = 0;
+    while (queued < 100 && be.queueFsync(1) != kNoToken) ++queued;
+    EXPECT_EQ(queued, 4) << "queue refuses beyond the in-flight cap (queued counts against it)";
+    EXPECT_EQ(be.submitQueued(), 4u);
+    EXPECT_EQ(be.queueFsync(1), kNoToken) << "in flight + queued <= cap";
+    EXPECT_EQ(be.submitQueued(), 0u) << "an empty batch submits nothing";
+    int seen = 0;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (seen < 4 && std::chrono::steady_clock::now() < end) {
+        seen += be.reap([](const FlushCompletion&) {});
+        std::this_thread::yield();
+    }
+    EXPECT_EQ(seen, 4);
+    EXPECT_NE(be.queueFsync(1), kNoToken) << "capacity is back after the reap";
+    EXPECT_EQ(be.submitQueued(), 1u);
 }
 
 #endif // defined(__linux__)

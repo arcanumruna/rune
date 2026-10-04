@@ -107,6 +107,20 @@ public:
     // Returns kNoToken if the SQ ring is full (back-pressure).
     [[nodiscard]] CompletionToken submit(int fd, int64_t flushBoundary) noexcept;
 
+    // A10 group commit — a durability ROUND as one submission batch.
+    //
+    // queueFsync(fd): writes an IORING_OP_FSYNC|DATASYNC SQE into the next free SQ slot WITHOUT
+    // publishing it to the kernel (no syscall).  kNoToken when the in-flight cap / SQ is full.
+    // submitQueued(): publishes every queued SQE and submits them with ONE io_uring_enter.  Returns the
+    // number the kernel accepted, k: the first k queued tokens (queue order) are in flight, the rest are
+    // refused (the SQ tail is rolled back past them — without SQPOLL the kernel reads the SQ only inside
+    // io_uring_enter, so the unconsumed entries are simply withdrawn).  queue/submitQueued must not be
+    // interleaved with submit()/submitFadvise() (the worker assembles a round in one call).
+    [[nodiscard]] CompletionToken queueFsync(int fd) noexcept;
+    [[nodiscard]] uint32_t submitQueued() noexcept;
+    /// io_uring_enter calls that submitted work (a round = one).  Worker thread / tests.
+    [[nodiscard]] uint64_t submitBatches() const noexcept { return submitBatches_; }
+
     // F15 S4 fix round 2 (RR1-4): an async IORING_OP_FADVISE(advice) on
     // [off, off + len) of fd.  kNoToken when the SQ / in-flight cap is full
     // (the caller skips this pass).  Same reap path; route the token.
@@ -162,6 +176,10 @@ private:
     // configured depth for deterministic back-pressure (mirrors PortableFlushBackend).
     // submit() returns kNoToken when inFlight_ >= submitDepth_; reap() decrements.
     std::size_t inFlight_{0};
+
+    // A10: SQEs written by queueFsync() but not yet published / entered (worker-owned).
+    uint32_t queued_{0};
+    uint64_t submitBatches_{0};
 
     // Depth actually allocated for the SQ ring (== sqRingSize_).
     std::size_t submitDepth_{0};

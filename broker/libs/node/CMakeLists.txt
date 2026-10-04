@@ -838,6 +838,12 @@ if(BUILD_TESTING)
             target_link_libraries(rune_shard_nonblocking_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_nonblocking_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # A10 group commit: one durability round per worker (covers every dirty log, completes as a
+            # unit, Strict acks wait for their covering round, fail-stop, never an inline sync).
+            add_executable(rune_group_commit_round_tests tests/integration/GroupCommitRoundTest.cpp)
+            target_link_libraries(rune_group_commit_round_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_group_commit_round_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # F15 (EOS marker / LSO correctness): S0 failing *Regression* tests
             # (design note 2026-10-01-f15-eos-marker-lso-design.md).
             add_executable(rune_f15_eos_regression_tests tests/integration/F15EosRegressionTest.cpp)

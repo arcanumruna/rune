@@ -179,6 +179,22 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] CompletionToken submit(int fd, int64_t flushBoundary) noexcept;
 
+    // A10 group commit: a round as one batch.  The portable backend has no submission syscall — a
+    // queued request is posted to the flusher ring at once (the flusher runs the fdatasyncs in ring
+    // order on its own thread); submitQueued() only closes the batch and reports how many were queued.
+    [[nodiscard]] CompletionToken queueFsync(int fd) noexcept {
+        const CompletionToken t = submitImpl_(fd, 0);
+        if (t != kNoToken) ++queued_;
+        return t;
+    }
+    [[nodiscard]] uint32_t submitQueued() noexcept {
+        const uint32_t n = queued_;
+        queued_ = 0;
+        if (n > 0) ++submitBatches_;
+        return n;
+    }
+    [[nodiscard]] uint64_t submitBatches() const noexcept { return submitBatches_; }
+
     // -----------------------------------------------------------------------
     // reap — worker side (non-blocking).
     //
@@ -234,6 +250,10 @@ private:
     CompletionToken nextToken_{0};
     std::size_t     submitDepth_{0};  // max in-flight submits
     std::size_t     inFlight_{0};     // current in-flight count (worker-side only)
+    uint32_t        queued_{0};       // A10: requests posted since the round's batch opened
+    uint64_t        submitBatches_{0};
+
+    CompletionToken submitImpl_(int fd, int64_t flushBoundary) noexcept;
 
     // Stop command ring — destroying thread → flusher (F9a: replaces the atomic
     // stop flag; also keeps the submit ring strictly single-producer).
@@ -275,6 +295,13 @@ BasicPortableFlushBackend<Sync>::~BasicPortableFlushBackend() {
 
 template <PortableSyncFn Sync>
 CompletionToken BasicPortableFlushBackend<Sync>::submit(int fd, int64_t flushBoundary) noexcept {
+    const CompletionToken t = submitImpl_(fd, flushBoundary);
+    if (t != kNoToken) ++submitBatches_;
+    return t;
+}
+
+template <PortableSyncFn Sync>
+CompletionToken BasicPortableFlushBackend<Sync>::submitImpl_(int fd, int64_t flushBoundary) noexcept {
     // Back-pressure: honour the depth limit (same semantic as SpscRing<T>(depth)).
     // inFlight_ is worker-owned — no synchronisation needed.
     if (inFlight_ >= submitDepth_) {

@@ -136,3 +136,45 @@ TEST(PortableFlushBackendRegression, TeardownDrainSyncsTheRequestedFd) {
             << "request " << i << " synced the wrong fd";
     }
 }
+
+// ---------------------------------------------------------------------------
+// A10 group commit: a queued round is ONE batch; every data-sync runs on the
+// flusher thread, never on the caller (the worker loop).  The recorded thread
+// ids are read after the completions are reaped (ring release/acquire).
+// ---------------------------------------------------------------------------
+namespace {
+std::array<std::thread::id, 16> g_roundSyncThreads{};
+int                             g_roundSyncs = 0;   // flusher-thread only; read after the reaps
+int roundRecordingSync(int) {
+    if (g_roundSyncs < static_cast<int>(g_roundSyncThreads.size()))
+        g_roundSyncThreads[static_cast<std::size_t>(g_roundSyncs)] = std::this_thread::get_id();
+    ++g_roundSyncs;
+    return 0;
+}
+} // namespace
+
+TEST(PortableFlushBackendRegression, QueuedRoundSyncsOnTheFlusherNeverTheCallerRegression) {
+    g_roundSyncs = 0;
+    rune::node::BasicPortableFlushBackend<&roundRecordingSync> be(16, 16);
+    rune::node::CompletionToken toks[4];
+    for (int i = 0; i < 4; ++i) { toks[i] = be.queueFsync(100 + i); ASSERT_NE(toks[i], rune::node::kNoToken); }
+    const uint64_t batches = be.submitBatches();
+    ASSERT_EQ(be.submitQueued(), 4u);
+    EXPECT_EQ(be.submitBatches(), batches + 1) << "the round is one batch";
+    EXPECT_EQ(be.submitQueued(), 0u) << "an empty batch submits nothing";
+    int seen = 0;
+    bool got[4] = {};
+    for (int i = 0; i < 50'000'000 && seen < 4; ++i) {
+        seen += be.reap([&](const rune::node::FlushCompletion& c) {
+            EXPECT_EQ(c.errorCode, 0);
+            for (int k = 0; k < 4; ++k) if (c.token == toks[k]) got[k] = true;
+        });
+        if (seen < 4) std::this_thread::yield();
+    }
+    ASSERT_EQ(seen, 4);
+    for (int k = 0; k < 4; ++k) EXPECT_TRUE(got[k]) << "member " << k;
+    ASSERT_EQ(g_roundSyncs, 4);
+    for (int k = 0; k < 4; ++k)
+        EXPECT_NE(g_roundSyncThreads[static_cast<std::size_t>(k)], std::this_thread::get_id())
+            << "a data-sync ran on the caller's (worker loop's) thread";
+}
