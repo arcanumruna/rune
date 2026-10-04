@@ -776,3 +776,24 @@ TEST(D9CrossNodeMarkerIntegrationRegression, LeaderKilledMidEndTxnMarkerLandsOnT
     EXPECT_EQ(C.node(2).deliveredCount(sub0, 0), 1) << "no duplicate visible effect";
     EXPECT_EQ(C.coord().tcs->awaitingMarkerTxnsForTest(), 0u);
 }
+
+// Leader side: the partition left this node's registry after the marker was
+// accepted (removed / reassigned) → the worker ownership guard refuses it and
+// the ORIGIN is answered NotLeader (never an invariant halt, never the local TCS).
+TEST(D9RemoteMarkerRegression, RemoteMarkerForAPartitionGoneFromTheRegistryIsAnsweredNotLeader) {
+    GwRig R(2);
+    R.gw.setRoutingImageSnapshot(imageWith(2, 5));
+    R.reg.remove(0, 0);
+    const auto bytes = tx::ControlMarker::build(77, 0, tx::ControlType::Commit, 3);
+    WriteTxnMarkerMsg m{};
+    m.coordinatorNodeId = 1; m.coordinatorEpoch = 3; m.token = 906; m.topicId = 0; m.partition = 0;
+    m.producerId = 77; m.commit = 1; m.marker = std::span<const uint8_t>(bytes);
+    R.gw.appendRemoteControlRecord(m);
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    EXPECT_EQ(R.gw.markersInFlightForTest(), 0u);
+    ASSERT_EQ(R.ch.responses.size(), 1u);
+    EXPECT_EQ(R.ch.responses[0].first, 1);
+    EXPECT_EQ(R.ch.responses[0].second.token, 906);
+    EXPECT_EQ(R.ch.responses[0].second.errorCode, kNotLeader);
+    EXPECT_TRUE(R.tcs.done.empty()) << "a remote-origin refusal must not reach the LOCAL coordinator";
+}
