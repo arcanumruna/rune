@@ -368,3 +368,71 @@ no subagents. RED logs: session scratchpad `rev4fix/red-r4-*.log`.
 - **LOW-B.** Real-election-over-Aeron coverage (`Election` + CandidacyState + term source + InternalIsr over `AeronPartitionTransport`), plus the docker matrix with `RUNE_SURVIVOR_LEADER_ELECTION`.
 - **Backlog.** LOW-R3-2 and LOW-R3-3.
 - **Wire-level rollout.** Consensus template 58 is new. Older nodes ignore it as an unknown template, so a mixed-version cluster loses only the exchange's liveness benefit.
+
+## Follow-up (LOW-B, R4-1/2/4)
+
+Review: "Re-review (fix round 4)" (approved; 4 LOW). Broker `rune-broker-wt31` `feat/dur-1` on top of 93fbab1;
+rune-protocol-fe unchanged (a9787dc). Nothing pushed, no Conan package operations, no subagents.
+RED logs are in the session scratchpad under `fu/red-*.log`.
+
+### Commits
+- 12f2984: LOW-R4-1, LOW-R4-2, LOW-R4-4 (code, plus unit and DR regressions).
+- ba84d05: LOW-B, real-Aeron multi-node tests (new binary `rune_consensus_candidacy_tests`) and BrokerNode control-thread test accessors.
+
+### LOW-B — the election wiring proven end to end over real Aeron
+The tests use in-process BrokerNodes on loopback. Each node has its own embedded driver and real consensus and
+replication transports. There is no Docker. There are no sleeps: waits are deadline polls, and each poll step is a
+control-thread round trip. All tests are `ConsensusCandidacyElectionRegression.*` and take about 9-12 s each.
+
+| Test | Scenario | RED proof (fix reverted locally) |
+|---|---|---|
+| (a) `ExcludedMemberNeverConsensusLeader_CommittedMetadataSurvives` | 3 nodes. X dies and is fenced, so {L,Y} commits, and L commits metadata records that X never received. Y then L die. X and Y restart together, which is a fair race (equal consensus logs and terms). X's own file still names X. Y must win, and Y's metadata HW/LEO must reach the pre-death HW. | Vote gate unwired: X won 7/7 races. |
+| (b) `StaleKnowledgeLearnedThroughExchange_SurvivorsElect` | 3 nodes. {L,X} commits, then {L,Y} commits while X is down. L dies and X restarts. X's own view excludes Y and Y's own view excludes X. X learns {L,Y} through template 58, and Y is elected. | `setCandidacyExchange` unwired: headless (X knew (e1,v4){0,1}, Y knew (e1,v6){0,2}). |
+| (c) `DeniedCandidacyNeverFreezesLiveLeaderMetadataIsr` | 5 configured nodes; X is never started, so {L,A,B,C} commits. X's RequestVote for T+1 is sent over Aeron with a real `SbeConsensusPublisher`. All 4 live nodes deny it, which raises their candidate term. Their ack term stays T and L stays leader. C then dies, and {L,A,B} still commits. | Pre-MAJOR-R3 ack term (max with candidateTermId): ack term raised on all 4 nodes, and the removal stayed pending. |
+
+Note: (c) injects the candidacy frame instead of running a real candidate. A lone Aeron-style candidate never
+nominates without canvass positions from a quorum. Everything on the receiving side (adapter, `Election`, gate,
+`ackTermId` term source, InternalIsr frames) is the real BrokerNode wiring.
+
+### LOW-R4-1 — the leader shares its last committed state
+- `candidacyState()` now returns the newest `__cluster_metadata` state known to be on more than this node. That is
+  a state received from another node (`offer` as a follower, or `adopt`), or the leader's own proposal once committed.
+- `PartitionReplica` self-acks through `offerOwnProposal()` and calls `noteCommitted()` in `maybeCommitInternalIsr_`.
+- The leader's vote gate still reads its newest state, including its pending proposal (the restriction is safe).
+- The own-pending marker is kept in memory only. After a restart, the loaded state is shared. This is a narrow,
+  liveness-only residual.
+- RED → GREEN:
+  - `InternalIsrRegression.LeaderExportsCommittedStateNotItsPendingProposal` (RED: exported (e1,v2), the pending state).
+  - `DrIntegrationRegression.LeaderPendingProposalNeverSharedInExchange_SurvivorsElect` (RED: "consensus leaderless").
+  - `ZombieLeaderInternalIsrAckRefusedAfterVote_NoAckedLoss` restored to `ASSERT_EQ(nl, 3)` (RED: winner 1).
+  - The DR harness gained a public `exchangeKnowledge()`.
+
+### LOW-R4-2 — adopt() plausibility checks
+- `adopt()` rejects a learned state that has any of the following:
+  - no member;
+  - a member outside the replica set (`setReplicaSet`; BrokerNode passes every configured node);
+  - a duplicated member;
+  - epoch < 0 or version < 1;
+  - an epoch more than 2^20 ahead of max(consensus term, held epoch).
+- A rejection is logged once and counted.
+- RED → GREEN: `InternalIsrRegression.AdoptRejectsImplausibleLearnedStates` (RED: 5 implausible states adopted).
+
+### LOW-R4-4 — comments
+The `Election.h` `votedTermId_` note, the `InternalIsrKnowledge` header/`offer()` comments and the BrokerNode
+MEDIUM-A comment now say "never acked; persisting is knowledge only". They also name the restart case. There is no
+code change. The test name `StateOlderThanConsensusTermNeitherPersistedNorAcked` is kept, and its assertions are
+still true for the live, non-restart case.
+
+### Suite results (Mac, build-fast Debug, protocol include = rune-protocol-fe)
+- `ctest -R Regression -j8`: 783/784 passed. The failure was `ShardModeRegression.AdvertisedIngressRoutesAreLive…`:
+  "WorkerEgress … Address already in use", an ephemeral-port bind collision with a concurrent suite. It passed 5/5
+  on rerun and passed in the full run.
+- Full ctest on ba84d05: **3272/3272 passed** (2 DISABLED, 1 uring skip), 334 s.
+- DR `rune_dr_integration_tests`: 57 + 2 DISABLED, `--gtest_repeat=30` 30/30 clean.
+- `rune_consensus_candidacy_tests` `--gtest_repeat=10`: 30/30.
+- rune-protocol-fe `rune_protocol_tests`: 475/475 (unchanged).
+- `check_no_atomics.py` OK. No sleeps in the new tests.
+
+### Still open
+- Docker DR matrix with `RUNE_SURVIVOR_LEADER_ELECTION` (the second half of the LOW-B follow-up; not run here, since the brief said no Docker).
+- LOW-R4-3 runbook item (a corrupt-file node plus a dead leader needs the operator). Backlog: LOW-R3-2 and LOW-R3-3.
