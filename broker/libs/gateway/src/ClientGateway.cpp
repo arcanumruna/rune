@@ -1027,6 +1027,13 @@ ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf
     return ProducePause::None;
 }
 
+void ClientGateway::logProducePauseStats() const
+{
+    if (heldProduceAborts_ == 0 && produceCreditUnderflows_ == 0) return;
+    spdlog::warn("ClientGateway: produce pauses — aborts={} (credit={} workerCap={}) creditUnderflows={}",
+                 heldProduceAborts_, creditProduceAborts_, workerCapProduceAborts_, produceCreditUnderflows_);
+}
+
 bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
 {
     if ((heldSessions_ | creditBlockedSessions_) == 0) [[likely]] return true;

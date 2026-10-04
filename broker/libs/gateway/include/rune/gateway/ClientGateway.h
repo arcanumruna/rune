@@ -1628,6 +1628,10 @@ public:
     /// Fix round 3: Produce frames ABORTed because their session was held
     /// (control thread only — read via BrokerNode::onControlThreadForTest).
     [[nodiscard]] uint64_t heldProduceAbortsForTest() const noexcept { return heldProduceAborts_; }
+    /// D8c: one shutdown line with the paused-produce counters (only when any
+    /// pause happened; warn so it shows at the perf log level).  Call once the
+    /// control thread is joined.
+    void logProducePauseStats() const;
     /// D8c test seams (control thread only).
     [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
     [[nodiscard]] uint64_t produceCreditUnderflowsForTest() const noexcept { return produceCreditUnderflows_; }

@@ -2696,6 +2696,7 @@ void BrokerNode::stop() {
     // P2: the control thread is joined — only now may the pool's control-thread
     // state (ring-ownership mode) change.
     if (workerPool_) workerPool_->disarmAfterControlJoined();
+    if (gateway_) gateway_->logProducePauseStats();   // D8c: control thread joined — single reader
     // F9a: the control thread is joined — skip any owner-thread test task still
     // queued for it (its test thread waits for a decision with no bound).
     if (runtimeAgent_) runtimeAgent_->skipQueuedOwnerThreadTestTasks();
