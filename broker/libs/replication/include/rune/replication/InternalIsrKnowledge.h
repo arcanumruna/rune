@@ -18,7 +18,10 @@
 //   * A node votes for a consensus candidate only if the candidate is a member
 //     of the newest __cluster_metadata ISR it persisted (eligible()).  Any node
 //     may stand (re-review MAJOR-A); a state older than the node's consensus
-//     term is never persisted or acked (MEDIUM-A).
+//     term is never ACKED (MEDIUM-A) — offer() refuses it.  Persisting such a
+//     state is knowledge only (adopt() does it on purpose; after a restart the
+//     ack term can lag a pre-crash grant and offer() may persist one), and is
+//     safe: only an ack helps a leader commit (round-4 LOW-R4-4).
 //
 // Safety: a committed change is on a majority; a winning candidate needs the
 // votes of a majority; the two majorities intersect, so some voter knows the
@@ -99,9 +102,20 @@ public:
     /// (persisted before returning).  Returns true when this node now holds
     /// `s` or a newer state for that partition (the caller may ack it), false
     /// when the write failed (never ack an unpersisted state) or when
-    /// s.leaderEpoch is older than this node's consensus term (MEDIUM-A: never
-    /// persisted, never acked).
+    /// s.leaderEpoch is older than this node's consensus term (MEDIUM-A: the
+    /// caller must not ack it; refused here, though the same state may still
+    /// be held as knowledge — learned via adopt(), or offered after a restart
+    /// that lowered the ack term — LOW-R4-4).
     bool offer(const InternalIsrState& s);
+
+    /// Round-4 LOW-R4-1: the internal LEADER's self-ack of its OWN proposal —
+    /// persisted exactly like offer() (it is the leader's vote-gate view), but
+    /// NOT shared in the election exchange (candidacyState()) until it is
+    /// known committed (noteCommitted) or received back from another node.
+    bool offerOwnProposal(const InternalIsrState& s);
+    /// Round-4 LOW-R4-1: the leader's proposal `s` committed (a majority holds
+    /// it) — from now on it is the state this node shares.
+    void noteCommitted(const InternalIsrState& s) noexcept;
 
     /// The newest state known for (topicId, partition), nullptr = none.
     [[nodiscard]] const InternalIsrState* latest(int32_t topicId, int32_t partition) const noexcept;
@@ -141,10 +155,25 @@ public:
     /// state received from the current leadership (offer) proves this node's
     /// own knowledge again.  Returns true when this node now holds it or newer.
     bool adopt(const InternalIsrState& s);
-    /// The state this node shares in the exchange: its newest
-    /// __cluster_metadata state; nullptr when none or unprovable (LOW-A).
+    /// Round-4 LOW-R4-2: the replica set of __cluster_metadata (every
+    /// configured node).  adopt() rejects a learned state naming a member
+    /// outside it.  Empty = no member check (unit rigs).  Cold (startup).
+    void setReplicaSet(std::vector<int32_t> ids) { replicaSet_ = std::move(ids); }
+    /// LOW-R4-2: a learned epoch further than this beyond the node's consensus
+    /// term is implausible (each election raises the term by >= 1).
+    static constexpr int64_t kMaxLearnedEpochLead = int64_t{1} << 20;
+    [[nodiscard]] uint64_t adoptRejectionsForTest() const noexcept { return adoptRejections_; }
+
+    /// The state this node shares in the exchange: the newest
+    /// __cluster_metadata state it holds that is known to be on more than this
+    /// node — received from another node (offer as a follower, adopt), or its
+    /// own proposal once committed (round-4 LOW-R4-1: a leader never shares
+    /// its PENDING proposal, held only by itself: survivors adopting it could
+    /// be left admitting only a dead leader).  nullptr when none or unprovable
+    /// (LOW-A).  After a restart the loaded newest state is shared (the
+    /// own-pending marker is not persisted — a narrow, liveness-only residual).
     [[nodiscard]] const InternalIsrState* candidacyState() const noexcept {
-        return (votable_ && !loadPending_) ? latest(kCandidacyTopicId, 0) : nullptr;
+        return (votable_ && !loadPending_ && hasShared_) ? &shared_ : nullptr;
     }
 
     /// False after a failed validation of an existing file, until a fresh
@@ -161,6 +190,8 @@ private:
     void failClosed_(const char* why);
     void loadTransient_(const char* what, int err);
     bool adoptNewest_(const InternalIsrState& s, bool provesOwnKnowledge);
+    bool offer_(const InternalIsrState& s, bool ownProposal);
+    void noteShared_(const InternalIsrState& s) noexcept;
     void retryLoadIfPendingNoexcept_() noexcept {
         try { retryLoadIfPending(); } catch (...) {}   // a failed retry stays pending
     }
@@ -169,6 +200,10 @@ private:
     const void*                   termCtx_ = nullptr;
     std::string                   path_;
     std::vector<InternalIsrState> entries_;
+    std::vector<int32_t>          replicaSet_;        ///< LOW-R4-2 (empty = unchecked)
+    uint64_t                      adoptRejections_ = 0;
+    InternalIsrState              shared_{};          ///< LOW-R4-1: what candidacyState() exports
+    bool                          hasShared_ = false;
     uint64_t                      persists_ = 0;
     uint64_t                      staleTermRefusals_ = 0;
     bool                          votable_ = true;

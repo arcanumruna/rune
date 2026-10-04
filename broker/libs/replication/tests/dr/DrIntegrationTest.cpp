@@ -1586,13 +1586,13 @@ TEST(DrIntegrationRegression, ZombieLeaderInternalIsrAckRefusedAfterVote_NoAcked
     EXPECT_TRUE(c.rep(1).isrProposalPendingForTest() || c.leaderIsrContains(3))
         << "the zombie leader committed an internal ISR change after its acker voted for a newer term\n"
         << c.dump();
-    // The links heal and the consensus elects at e+1.  (Round 3 CRITICAL-R3:
-    // the participants now exchange their newest metadata-ISR state — the
-    // zombie's own pending {1,2} reaches X and Y, so Y may lose to 1 or 2;
-    // either way no acked record may be lost.)
+    // The links heal and the consensus elects at e+1.  (Round 4 LOW-R4-1: the
+    // participants exchange their newest metadata-ISR state, but the zombie
+    // shares only its last COMMITTED state — its pending {1,2} never reaches X
+    // and Y — so Y, which X granted, wins again, and no acked record is lost.)
     c.healAll();
     const NodeId nl = c.consensusElect(3);
-    ASSERT_GE(nl, 0) << c.dump();
+    ASSERT_EQ(nl, 3) << c.dump();
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(3), 3);
     expectAllConvergedAndAcked(c, "re-review2 medium-a zombie ack window");
@@ -1625,6 +1625,39 @@ TEST(DrIntegrationRegression, DeniedVoteNeverFreezesLiveLeaderInternalIsr) {
     EXPECT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, 1000))
         << "HW pinned by the dead member: metadata log frozen with a live majority\n" << c.dump();
     EXPECT_EQ(c.acked().size(), 15u);
+}
+
+// Re-review round 4 LOW-R4-1: RF=3, L (1) commits {1,2} (3 stalled); then 2
+// stalls too (L proposes {1}, held only on L); L takes part in an election
+// exchange and then dies before {1} commits.  Had L shared its pending {1},
+// nodes 2 and 3 would admit only the dead L — leaderless, although L's HW
+// counted committed ∪ proposed = {1,2} so 2 holds every committed record.
+// Fixed: a leader shares its last committed state ({1,2}); the survivors elect 2.
+TEST(DrIntegrationRegression, LeaderPendingProposalNeverSharedInExchange_SurvivorsElect) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).internalSeedPendingForTest() && !c.rep(1).isrProposalPendingForTest();
+    }, kCap));
+    c.cutBoth(1, 3);                             // 3 stalls: {1,2} commits on {1,2}
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.leaderIsrContains(3) && !c.rep(1).isrProposalPendingForTest();
+    }, kCap)) << c.dump();
+    c.cutBoth(1, 2);                             // 2 stalls too: L proposes {1}, held only on L
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isrProposalPendingForTest(); }, kCap))
+        << "precondition: L proposed a shrink nobody can persist\n" << c.dump();
+    const auto* lk = c.node(1).isrKnowledge->latest(-3, kPartId);
+    ASSERT_NE(lk, nullptr);
+    ASSERT_TRUE(lk->count == 1 && lk->contains(1)) << "precondition: L's pending state is {1}";
+    c.exchangeKnowledge();                       // L canvasses: its state reaches 2 and 3
+    c.crash(1, CrashKind::ProcessKill);          // ... and dies before anything newer commits
+    const NodeId nl = c.consensusElect(2);
+    ASSERT_GE(nl, 0) << "survivors admit only the dead leader: consensus leaderless\n" << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(3), 3);
 }
 
 // Re-review 2026-10-04 (fix round 3) CRITICAL-R3: with the self-gate dropped

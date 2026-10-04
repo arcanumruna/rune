@@ -2164,7 +2164,9 @@ void PartitionReplica::publishInternalIsr_(int64_t nowNs)
         InternalIsrState st{};
         st.topicId = m.topicId; st.partition = m.partition; st.leaderEpoch = m.leaderEpoch;
         st.version = m.version; st.count = m.isrCount; st.members = m.isr;
-        if (isrKnowledge_->offer(st)) internalIsrAcks_ |= (1u << self);
+        // LOW-R4-1: our own proposal — persisted (our ack + vote-gate view),
+        // shared in the election exchange only once committed.
+        if (isrKnowledge_->offerOwnProposal(st)) internalIsrAcks_ |= (1u << self);
     }
     for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
         const NodeId to = followerSlots_.at(i).id;
@@ -2181,6 +2183,16 @@ void PartitionReplica::maybeCommitInternalIsr_()
     committedIsr_.assign(isrProposal_.isr.begin(), isrProposal_.isr.end());
     isrProposal_.pending  = false;
     internalSeedPending_  = false;
+    if (isrKnowledge_ != nullptr) {
+        // LOW-R4-1: committed — now the state this node shares in the exchange.
+        InternalIsrState st{};
+        st.topicId = cfg_.topicId; st.partition = cfg_.partitionId; st.leaderEpoch = epoch_;
+        st.version = isrProposal_.version;
+        st.count   = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), InternalIsrMsg::kMaxIsr));
+        for (int i = 0; i < st.count; ++i)
+            st.members[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
+        isrKnowledge_->noteCommitted(st);
+    }
     applyMaximalIsr_();
     publishCleanerState();
 }

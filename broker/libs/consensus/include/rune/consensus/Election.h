@@ -424,10 +424,14 @@ private:
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;
     /// Highest term this node GRANTED a vote in (MAJOR-R3) — a denial or an
-    /// own (abandoned) candidacy never raises it.  Not persisted: after a
-    /// restart the durable candidateTermId_ already makes the election ignore
-    /// a stale term's NewLeadershipTerm (a node never re-follows a deposed
-    /// leader), so the ack rule needs only this process's grants.
+    /// own (abandoned) candidacy never raises it.  Not persisted (round-4
+    /// LOW-R4-4): after a restart the ack term can be BELOW a term this node
+    /// granted in before the crash, so the knowledge store may PERSIST a
+    /// deposed leader's internal ISR state — knowledge only, exactly what
+    /// adopt() does.  It never ACKS one: the internal replica restarts as
+    /// Follower at epoch 0 with no leader, and the durable candidateTermId_
+    /// makes the election ignore the stale term's NewLeadershipTerm (a node
+    /// never re-follows a deposed leader).
     Term votedTermId_         = 0;
 
     // Election config — Election.java:80

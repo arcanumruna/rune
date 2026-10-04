@@ -4600,6 +4600,123 @@ TEST(InternalIsrRegression, StateOlderThanConsensusTermNeitherPersistedNorAcked)
     EXPECT_EQ(reloaded.latest(-3, 0)->version, 1) << "the stale state reached the disk";
 }
 
+// Re-review round 4 LOW-R4-1: the leader shares its last COMMITTED
+// __cluster_metadata ISR state in the election exchange, never its own pending
+// proposal.  L commits {L,F}; then F stalls too and L proposes {L} (held only on
+// L, as its self-ack).  Exported, {L} would be adopted by F and G while L
+// canvasses; L then dies and they admit only the dead L (leaderless, although
+// the HW counted committed ∪ proposed = everyone).  The pending state must stay
+// L's own vote-gate view only; once committed it is shared.
+TEST(InternalIsrRegression, LeaderExportsCommittedStateNotItsPendingProposal) {
+    TempDir lDir("r41_L"), fDir("r41_F"), gDir("r41_G");
+    rune::storage::Log lLog(lDir.path), fLog(fDir.path), gLog(gDir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2, kG = 3;
+    std::vector<NodeId> all = {kL, kF, kG};
+    auto cfgFor = [&](NodeId id) {
+        PartitionConfig c = makeConfig(id, /*lagMs=*/10, /*lagOff=*/1'000'000);
+        c.topicId = -3;
+        return c;
+    };
+    InternalIsrKnowledge kl, kf, kg;
+    PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
+    PartitionReplica f(cfgFor(kF), Role::Follower, 0, all, all, &fLog, &transport);
+    PartitionReplica g(cfgFor(kG), Role::Follower, 0, all, all, &gLog, &transport);
+    l.setInternalIsrKnowledge(&kl); f.setInternalIsrKnowledge(&kf); g.setInternalIsrKnowledge(&kg);
+    l.becomeLeader(1, all);
+    f.becomeFollower(1, kL);
+    g.becomeFollower(1, kL);
+    transport.setLeader(&l);
+    transport.addFollower(kF, &f);               // kG stuck: L commits {L,F}
+    ASSERT_GE(l.append(makePayload(1)), 0);
+    int64_t clock = 0;
+    for (int i = 0; i < 100 && (l.isrProposalPendingForTest() || l.internalSeedPendingForTest() ||
+                                l.isr().size() != 2); ++i) {
+        clock += 1'000'000LL;
+        l.doWork(clock); f.doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_FALSE(l.isrProposalPendingForTest());
+    ASSERT_EQ(l.isr().size(), 2u);
+    const InternalIsrState* committed = kl.candidacyState();
+    ASSERT_NE(committed, nullptr);
+    const InternalIsrState c0 = *committed;
+    ASSERT_TRUE(c0.contains(kL) && c0.contains(kF) && !c0.contains(kG));
+    // F stalls too: L proposes {L}, which nobody else can persist.
+    transport.removeFollower(kF);
+    for (int i = 0; i < 100 && !l.isrProposalPendingForTest(); ++i) {
+        clock += 1'000'000LL;
+        l.doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_TRUE(l.isrProposalPendingForTest()) << "precondition: L proposed {L}";
+    const InternalIsrState* held = kl.latest(-3, 0);
+    ASSERT_NE(held, nullptr);
+    ASSERT_TRUE(held->newerThan(c0.leaderEpoch, c0.version)) << "L holds its pending proposal (self-ack)";
+    EXPECT_FALSE(kl.eligible(kF)) << "L's own vote gate still reads its newest (pending) state";
+    const InternalIsrState* shared = kl.candidacyState();
+    ASSERT_NE(shared, nullptr);
+    EXPECT_TRUE(shared->leaderEpoch == c0.leaderEpoch && shared->version == c0.version)
+        << "the leader exported its uncommitted proposal (epoch " << shared->leaderEpoch
+        << ", version " << shared->version << ") instead of its last committed state";
+    // F returns and persists + acks {L}: committed — now it is shared.
+    transport.addFollower(kF, &f);
+    for (int i = 0; i < 200 && l.isrProposalPendingForTest(); ++i) {
+        clock += 1'000'000LL;
+        l.doWork(clock); f.doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_FALSE(l.isrProposalPendingForTest());
+    shared = kl.candidacyState();
+    ASSERT_NE(shared, nullptr);
+    held = kl.latest(-3, 0);
+    EXPECT_TRUE(shared->leaderEpoch == held->leaderEpoch && shared->version == held->version)
+        << "a committed state is not shared";
+    // A follower shares its newest persisted state (it is always on L + F).
+    ASSERT_NE(kf.candidacyState(), nullptr);
+    EXPECT_EQ(kf.candidacyState()->version, kf.latest(-3, 0)->version);
+}
+
+// Re-review round 4 LOW-R4-2: adopt() (a peer's state learned in the election
+// exchange) checks plausibility.  Newest wins, so one malformed state — no
+// member, a member outside the replica set, an absurd epoch — would poison the
+// knowledge for good (deny every candidate, "hold newer" for every real
+// proposal, re-export it).  Rejected (logged once); a sane state still adopted.
+TEST(InternalIsrRegression, AdoptRejectsImplausibleLearnedStates) {
+    TempDir d("r42");
+    InternalIsrKnowledge k(d.path + "/internal-isr.state");
+    k.setReplicaSet({1, 2, 3});
+    int64_t term = 7;
+    k.setConsensusTermSource([](const void* p) noexcept { return *static_cast<const int64_t*>(p); }, &term);
+    auto st = [](int64_t epoch, int64_t version, std::initializer_list<int32_t> m) {
+        InternalIsrState x{};
+        x.topicId = -3; x.partition = 0; x.leaderEpoch = epoch; x.version = version;
+        for (int32_t n : m) x.members[static_cast<std::size_t>(x.count++)] = n;
+        return x;
+    };
+    ASSERT_TRUE(k.adopt(st(6, 3, {1, 2})));      // sane: adopted
+    EXPECT_FALSE(k.adopt(st(7, 1, {}))) << "an empty ISR adopted";
+    EXPECT_FALSE(k.adopt(st(7, 1, {1, 9}))) << "a member outside the replica set adopted";
+    EXPECT_FALSE(k.adopt(st(7, 1, {1, 1}))) << "a duplicated member adopted";
+    EXPECT_FALSE(k.adopt(st(term + InternalIsrKnowledge::kMaxLearnedEpochLead + 1, 1, {1, 2})))
+        << "an absurd epoch adopted";
+    EXPECT_FALSE(k.adopt(st(INT64_MAX, 1, {1, 2}))) << "an absurd epoch adopted";
+    EXPECT_FALSE(k.adopt(st(-1, 9, {1, 2}))) << "a negative epoch adopted";
+    EXPECT_FALSE(k.adopt(st(7, 0, {1, 2}))) << "version 0 (never published) adopted";
+    EXPECT_EQ(k.adoptRejectionsForTest(), 7u);
+    ASSERT_NE(k.latest(-3, 0), nullptr);
+    EXPECT_EQ(k.latest(-3, 0)->leaderEpoch, 6);
+    EXPECT_EQ(k.latest(-3, 0)->version, 3);
+    EXPECT_TRUE(k.eligible(1));
+    EXPECT_FALSE(k.eligible(3));
+    ASSERT_TRUE(k.adopt(st(8, 1, {1, 3})));      // a real newer state still supersedes
+    EXPECT_TRUE(k.eligible(3));
+    EXPECT_FALSE(k.eligible(2));
+    InternalIsrKnowledge reloaded(d.path + "/internal-isr.state");
+    ASSERT_NE(reloaded.latest(-3, 0), nullptr);
+    EXPECT_EQ(reloaded.latest(-3, 0)->leaderEpoch, 8);
+}
+
 // Re-review 2026-10-04 (fix round 2) MEDIUM-C: the lag shrink restored for
 // internal partitions (MAJOR-3) is safe only where the removal commits on a
 // majority's durable knowledge that the consensus vote rule reads.  An internal

@@ -854,6 +854,15 @@ void BrokerNode::buildReplication() {
     internalIsrKnowledge_ = std::make_unique<rune::replication::InternalIsrKnowledge>(
         config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
     replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
+    {
+        // LOW-R4-2: __cluster_metadata is replicated on every configured node.
+        std::vector<int32_t> ids;
+        ids.reserve(config_.peers.size() + 1);
+        for (const auto& peer : config_.peers) ids.push_back(static_cast<int32_t>(peer.id));
+        if (std::find(ids.begin(), ids.end(), static_cast<int32_t>(config_.nodeId)) == ids.end())
+            ids.push_back(static_cast<int32_t>(config_.nodeId));
+        internalIsrKnowledge_->setReplicaSet(std::move(ids));
+    }
     if (election_) {
         // MEDIUM-B: RUNE_UNCLEAN_CONSENSUS_ELECTION (default off) leaves the
         // candidacy gate unwired — a data-blind (unclean) consensus election.
@@ -898,7 +907,7 @@ void BrokerNode::buildReplication() {
                 },
                 internalIsrKnowledge_.get());
         }
-        // Re-review MEDIUM-A: the knowledge refuses (never persists, never acks)
+        // Re-review MEDIUM-A: the knowledge refuses (so this node never acks)
         // an internal ISR state of a leadership older than the consensus term
         // this node voted in or observed — Raft's term rule applied to the ack.
         internalIsrKnowledge_->setConsensusTermSource(

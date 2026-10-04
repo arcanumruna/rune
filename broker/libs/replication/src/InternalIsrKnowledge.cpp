@@ -12,6 +12,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -58,16 +59,37 @@ bool InternalIsrKnowledge::eligible(int32_t candidate) const noexcept
     return m == nullptr || m->contains(candidate);
 }
 
-bool InternalIsrKnowledge::offer(const InternalIsrState& s)
+bool InternalIsrKnowledge::offer(const InternalIsrState& s) { return offer_(s, /*ownProposal=*/false); }
+
+bool InternalIsrKnowledge::offerOwnProposal(const InternalIsrState& s) { return offer_(s, /*ownProposal=*/true); }
+
+void InternalIsrKnowledge::noteCommitted(const InternalIsrState& s) noexcept
+{
+    const InternalIsrState* held = latest(s.topicId, s.partition);
+    if (held == nullptr || s.newerThan(held->leaderEpoch, held->version)) return;   // never share unheld
+    noteShared_(s);
+}
+
+void InternalIsrKnowledge::noteShared_(const InternalIsrState& s) noexcept
+{
+    if (s.topicId != kCandidacyTopicId || s.partition != 0) return;
+    if (hasShared_ && !s.newerThan(shared_.leaderEpoch, shared_.version)) return;
+    shared_    = s;
+    hasShared_ = true;
+}
+
+bool InternalIsrKnowledge::offer_(const InternalIsrState& s, bool ownProposal)
 {
     if (s.count < 0 || s.count > InternalIsrState::kMaxMembers) return false;
     retryLoadIfPending();
     if (loadPending_) return false;   // never overwrite a file not yet read
     // Raft's term rule applied to the ack (re-review 2026-10-04 MEDIUM-A): a
     // state from a leadership OLDER than the term this node voted in / follows
-    // (MAJOR-R3) is neither persisted nor acked — a deposed (zombie) leader can
-    // never commit an ISR change, nor plant a stale candidacy view, through a
-    // node that already moved on.
+    // (MAJOR-R3) is refused here, so it is never ACKED — a deposed (zombie)
+    // leader can never commit an ISR change through a node that already moved
+    // on.  (LOW-R4-4: "never persisted" would overstate it — the same state may
+    // be held as knowledge via adopt(), or offered after a restart lowered the
+    // ack term below a pre-crash grant; persisting without acking is safe.)
     if (const int64_t term = consensusTerm(); term >= 0 && s.leaderEpoch < term) {
         if ((staleTermRefusals_++ & 1023u) == 0)
             spdlog::warn("InternalIsrKnowledge: refused internal ISR state topic={} part={} "
@@ -76,16 +98,47 @@ bool InternalIsrKnowledge::offer(const InternalIsrState& s)
                          term, staleTermRefusals_);
         return false;
     }
-    return adoptNewest_(s, /*provesOwnKnowledge=*/true);
+    if (!adoptNewest_(s, /*provesOwnKnowledge=*/true)) return false;
+    if (!ownProposal) noteShared_(s);   // received from the leader: held by >1 node
+    return true;
 }
 
 bool InternalIsrKnowledge::adopt(const InternalIsrState& s)
 {
     if (s.topicId != kCandidacyTopicId || s.partition != 0) return false;
-    if (s.count < 0 || s.count > InternalIsrState::kMaxMembers) return false;
+    // Round-4 LOW-R4-2: plausibility.  Newest wins, so one malformed learned
+    // state (a bug, a future layout change) would poison the knowledge for
+    // good — deny every candidate, "hold newer" for every real proposal, and
+    // be re-exported.  A learned state must name >= 1 distinct member, all in
+    // the replica set, at a published version, at an epoch not absurdly ahead
+    // of anything this node has seen.  Rejected states are logged once.
+    const char* bad = nullptr;
+    if (s.count < 1 || s.count > InternalIsrState::kMaxMembers) bad = "member count";
+    else if (s.leaderEpoch < 0 || s.version < 1) bad = "epoch / version";
+    else {
+        int64_t base = std::max<int64_t>(consensusTerm(), 0);
+        if (const InternalIsrState* held = latest(kCandidacyTopicId, 0)) base = std::max(base, held->leaderEpoch);
+        if (s.leaderEpoch - base > kMaxLearnedEpochLead) bad = "epoch implausibly ahead";
+        for (int i = 0; bad == nullptr && i < s.count; ++i) {
+            const int32_t m = s.members[static_cast<std::size_t>(i)];
+            if (!replicaSet_.empty() && std::find(replicaSet_.begin(), replicaSet_.end(), m) == replicaSet_.end())
+                bad = "member outside the replica set";
+            for (int j = 0; bad == nullptr && j < i; ++j)
+                if (s.members[static_cast<std::size_t>(j)] == m) bad = "duplicated member";
+        }
+    }
+    if (bad != nullptr) {
+        if (adoptRejections_++ == 0)
+            spdlog::warn("InternalIsrKnowledge: rejected a learned __cluster_metadata ISR state "
+                         "(epoch {}, version {}, {} member(s)) — {}; further rejections are not logged",
+                         s.leaderEpoch, s.version, s.count, bad);
+        return false;
+    }
     retryLoadIfPending();
     if (loadPending_) return false;
-    return adoptNewest_(s, /*provesOwnKnowledge=*/false);
+    if (!adoptNewest_(s, /*provesOwnKnowledge=*/false)) return false;
+    noteShared_(s);                     // a peer holds it
+    return true;
 }
 
 bool InternalIsrKnowledge::adoptNewest_(const InternalIsrState& s, bool provesOwnKnowledge)
@@ -118,6 +171,7 @@ void InternalIsrKnowledge::retryLoadIfPending()
     loadPending_ = false;
     votable_     = true;
     entries_.clear();
+    hasShared_   = false;
     load_();   // may set loadPending_ again (still transient) or fail closed
 }
 
@@ -215,6 +269,9 @@ void InternalIsrKnowledge::load_()
         }
         entries_.push_back(e);
     }
+    // LOW-R4-1: whether the loaded newest state was this node's own pending
+    // proposal is not persisted — after a restart it is shared (liveness-only).
+    if (const InternalIsrState* m = latest(kCandidacyTopicId, 0)) noteShared_(*m);
 }
 
 void InternalIsrKnowledge::loadTransient_(const char* what, int err)
@@ -225,6 +282,7 @@ void InternalIsrKnowledge::loadTransient_(const char* what, int err)
     loadPending_ = true;
     votable_     = false;
     entries_.clear();
+    hasShared_   = false;
     spdlog::warn("InternalIsrKnowledge: {} of {} failed transiently (errno {}) — refusing to vote "
                  "until it is read; retried on next use", what, path_, err);
 }

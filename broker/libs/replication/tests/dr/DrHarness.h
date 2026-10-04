@@ -365,6 +365,9 @@ public:
     /// whose election timer fired first), else the lowest electable id.
     /// Epoch + 1, the assignment goes to every reachable node.  Returns the new
     /// leader, -1 = nobody electable (the consensus stays leaderless).
+    /// One round of the election knowledge exchange among the live,
+    /// consensus-reachable nodes (template 58), without electing anyone.
+    void exchangeKnowledge() { exchangeKnowledge_(); }
     NodeId consensusElect(NodeId preferred) {
         if (cfg_.topicId < 0) exchangeKnowledge_();
         NodeId winner = -1;
