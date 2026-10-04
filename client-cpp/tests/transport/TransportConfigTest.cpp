@@ -235,3 +235,19 @@ TEST(TransportConfig, UdpGsoDefaultsOnEnvTurnsOffAndSetsMsgsPerSend) {
     ASSERT_EQ(w2.size(), 1u);
     EXPECT_NE(w2[0].find("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND"), std::string::npos);
 }
+
+// A7 (rune-broker findings §4.12): epoll-first transport polling in the embedded driver — default on, env off.
+TEST(TransportConfig, EpollPollDefaultsOnAndEnvTurnsItOff) {
+    EXPECT_TRUE(TransportConfig{}.epollPoll);
+    ::setenv("RUNE_CLIENT_AERON_EPOLL_POLL", "0", 1);
+    TransportConfig c;
+    const auto w = applyEnvOverrides(c);
+    ::unsetenv("RUNE_CLIENT_AERON_EPOLL_POLL");
+    EXPECT_TRUE(w.empty());
+    EXPECT_FALSE(c.epollPoll);
+    ::setenv("RUNE_CLIENT_AERON_EPOLL_POLL", "1", 1);
+    TransportConfig on; on.epollPoll = false;
+    (void)applyEnvOverrides(on);
+    ::unsetenv("RUNE_CLIENT_AERON_EPOLL_POLL");
+    EXPECT_TRUE(on.epollPoll);
+}

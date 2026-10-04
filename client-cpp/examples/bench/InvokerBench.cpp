@@ -13,6 +13,7 @@
 // one-record OneToOneRingBuffers per shard (shard -> main "ready", main -> shard
 // "start" carrying the common schedule origin); each ShardResult is written
 // only by its shard thread and read by main after join().
+#include "BenchIdle.h"
 #include "InvokerBench.h"
 #include "BenchEnv.h"
 #include "LogLinearHistogram.h"
@@ -69,6 +70,8 @@ struct ShardResult {
     std::string error;
     int         udpMask = -1;            // installed GSO(1)/GRO(2) of this shard's driver (-1 = never started)
     uint64_t    gsoFallbacks = 0, groDisabled = 0;   // runtime fallbacks, read after the driver closed
+    uint64_t    parks = 0;               // A7: idle passes parked (RUNE_BENCH_IDLE=park)
+    int         wakeFds = 0;             // A7: driver readiness fds the parks wait on
 };
 
 // Start barrier with no atomics (F8 law: cross-thread state only through rings):
@@ -145,6 +148,13 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
         if (owned.empty()) throw std::runtime_error("shard owns no partition of " + topicName);
         const std::vector<uint8_t> value(static_cast<std::size_t>(a.valueBytes), uint8_t{0xAB});
 
+        // A7: park idle passes on the driver's readiness (BenchIdle.h) unless RUNE_BENCH_IDLE=spin.
+        const bool park = parseBenchIdle(std::getenv("RUNE_BENCH_IDLE")) == BenchIdle::Park;
+        int wfds[8];
+        const int nw = park ? shard.wakeFds(wfds, 8) : 0;
+        BenchParker parker(wfds, nw);
+        out.wakeFds = nw;
+
         signalReady(link);
         signaled = true;
         int64_t startNs = 0;
@@ -196,14 +206,16 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
             // Saturation also starts at the common origin (every shard together;
             // the warm-up window is measured from it).
             const uint64_t due = open ? std::min(total, schedule.dueCount(now)) : (now < startNs ? 0 : total);
+            const uint64_t sentBefore = out.sent;
+            bool blocked = false;   // a due send waits on credit (an ack / status message), not on the clock
             while (out.sent < due && (open || out.sent - out.acked < static_cast<uint64_t>(a.window))) {
                 const int32_t p = owned[rr % owned.size()];
                 PartitionTimestamps& ring = *sched[static_cast<std::size_t>(p)];
-                if (ring.full()) break;
+                if (ring.full()) { blocked = true; break; }
                 const rc::SendResult r = shard.trySend(topic, keyOf[static_cast<std::size_t>(p)], value);
                 // Stays due (its latency keeps accruing).  QueueFull: the batch-ack
                 // queue is out of credit until pollBatchAcks() below drains it.
-                if (r == rc::SendResult::BackPressured || r == rc::SendResult::QueueFull) break;
+                if (r == rc::SendResult::BackPressured || r == rc::SendResult::QueueFull) { blocked = true; break; }
                 if (r != rc::SendResult::Ok) {
                     throw std::runtime_error("trySend failed: SendResult=" + std::to_string(static_cast<int>(r)));
                 }
@@ -211,9 +223,17 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
                 ++out.sent;
                 ++rr;
             }
-            shard.doWork();
+            const int work = shard.doWork();
             ackNow = monoNs();
-            shard.pollBatchAcks(onAck);
+            const int acks = shard.pollBatchAcks(onAck);
+            // A7: an idle pass parks until a datagram, the next scheduled send, or maxPark (never past a
+            // due send: latency is measured from the schedule).  Credit waits (closed window, ring / queue
+            // full, back-pressure) wake on the ack datagram.
+            if (park && work == 0 && acks == 0 && out.sent == sentBefore && !(out.sent >= total && out.acked >= out.sent)) {
+                const bool clockBound = open && !blocked && out.sent < total;
+                const int64_t nextDue = clockBound ? schedule.scheduledNs(out.sent) : kNoNextSend;
+                parker.park(benchParkTimeoutNs(nextDue, monoNs(), kBenchMaxParkNs));
+            }
             if (lost) {
                 throw std::runtime_error(
                     "ack not attributable to sent records (latency attribution lost): partition=" +
@@ -231,6 +251,7 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
         }
         out.cpuSeconds = readThreadSelfCpuSeconds();
         out.core       = rc::detail::currentCore();
+        out.parks      = parker.parks();
         try {
             (void)shard.closeAndWait(std::chrono::seconds(5));  // everything acked: quick, clean teardown
         } catch (const std::exception&) {
@@ -365,7 +386,8 @@ int invokerBenchMain(int argc, char** argv) {
         inWindow += r.ackedInWindow;
         errors += r.errors;
         lastAck = std::max(lastAck, r.lastAckNs);
-        std::printf("THREAD shard=%u core=%d cpu_s=%.3f", i, r.core, r.cpuSeconds);
+        std::printf("THREAD shard=%u core=%d cpu_s=%.3f idle_parks=%llu wake_fds=%d", i, r.core, r.cpuSeconds,
+                    static_cast<unsigned long long>(r.parks), r.wakeFds);
         if (r.haveFirstError) {
             std::printf(" first_failed_batch=partition:%d,seq:%d,records:%d,epoch:%d,errorCode:%d",
                         r.firstError.partition, r.firstError.baseSequence, r.firstError.recordCount,
@@ -392,7 +414,7 @@ int invokerBenchMain(int argc, char** argv) {
     std::printf("RESULT mode=%s shards=%u core=%d rate=%llu duration_s=%lld warmup_s=%lld window=%lld records=%llu "
                 "value=%d acks=%s max_in_flight=%d linger_us=%lld batch_bytes=%d max_frame=%d mtu=%zu "
                 "sent=%llu acked=%llu errors=%llu measured=%llu achieved_rps=%.0f "
-                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s gro=%s gso_fallbacks=%llu gro_disabled=%llu%s\n",
+                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s gro=%s gso_fallbacks=%llu gro_disabled=%llu idle=%s%s\n",
                 a.mode == BenchArgs::Mode::Open ? "open" : "saturate", a.shards, a.core,
                 static_cast<unsigned long long>(a.rate), static_cast<long long>(a.durationS),
                 static_cast<long long>(a.warmupS), static_cast<long long>(a.window),
@@ -403,6 +425,7 @@ int invokerBenchMain(int argc, char** argv) {
                 us(all.valueAtQuantile(0.50)), p99us, us(all.valueAtQuantile(0.999)), us(all.max()),
                 (udpMask & 1) ? "on" : "off", (udpMask & 2) ? "on" : "off",   // INSTALLED, not config+probe
                 static_cast<unsigned long long>(gsoFallbacks), static_cast<unsigned long long>(groDisabled),
+                parseBenchIdle(std::getenv("RUNE_BENCH_IDLE")) == BenchIdle::Park ? "park" : "spin",
                 ok ? "" : " run_error=1");
     std::fflush(stdout);
     if (!ok || errors != 0) return 1;

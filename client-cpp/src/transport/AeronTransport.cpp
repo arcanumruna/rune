@@ -14,6 +14,7 @@
 //   - tryClaim / fallback to offer for zero-copy send.
 //   - FragmentAssembler wraps all poll calls for multi-frame reassembly.
 
+#include "rune/client/transport/DriverWakeFds.h"
 #include <rune/client/transport/AeronTransport.h>
 #include "rune/protocol/net/rune_udp_gso.h"
 
@@ -67,6 +68,11 @@ bool AeronTransport::pumpUntil_(Ready&& ready, int64_t timeoutNs) {
             std::this_thread::sleep_for(std::chrono::microseconds{50});
         }
     }
+}
+
+int AeronTransport::wakeFds(int* out, int max) const noexcept {
+    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) return 0;
+    return rune_client_driver_wake_fds(driver_, out, max);
 }
 
 int AeronTransport::dutyCycle() noexcept {
@@ -567,6 +573,9 @@ void AeronTransport::startEmbeddedDriver() {
         }
         gsoActiveMask_ = rune_gso_bindings_active(gso_);
     }
+    // A7: epoll-first polling (after the GSO install, which replaces the context's bindings).
+    if (cfg_.epollPoll)
+        epollPollActive_ = rune_client_driver_epoll_poll_install(driverCtx_, gso_ != nullptr ? 1 : 0, &epollBindings_) == 1;
     if (cfg_.maxMessagesPerSend > 0)
         aeron_driver_context_set_network_publication_max_messages_per_send(driverCtx_, cfg_.maxMessagesPerSend);
     else if (const unsigned m = rune_gso_msgs_per_send(udpGsoActive(), cfg_.mtuLength); m > 0)
@@ -719,6 +728,8 @@ void AeronTransport::stopEmbeddedDriver() noexcept {
 }
 
 void AeronTransport::releaseGso_() noexcept {
+    rune_client_driver_epoll_poll_free(epollBindings_);   // after aeron_driver_context_close
+    epollBindings_ = nullptr;
     if (gso_ == nullptr) return;
     rune_gso_bindings_totals(gso_, &gsoTotals_);
     rune_gso_bindings_delete(gso_);

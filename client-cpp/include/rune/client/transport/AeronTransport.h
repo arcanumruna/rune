@@ -113,6 +113,11 @@ public:
 
     /// True when a background driver thread exists (Thread mode after start()).
     [[nodiscard]] bool usesDriverThread() const noexcept { return driverThread_.joinable(); }
+    /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
+    /// pollers' epoll instances, DriverWakeFds.h) into `out` (at most `max`); returns how many.  0 in
+    /// Thread mode (the driver thread consumes the sockets), before start() / after stop(), or off Linux.
+    /// Owned by the driver: valid until stop().  The pumping owner parks in ppoll() on them between passes.
+    [[nodiscard]] int wakeFds(int* out, int max) const noexcept;
 
     /// True when the Aeron client conductor is invoker-driven (no conductor thread).
     [[nodiscard]] bool usesConductorInvoker() const noexcept {
@@ -329,6 +334,8 @@ public:
     [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
     /// GSO/GRO totals of every transport the driver closed; complete after stop().
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
+    /// A7: the embedded driver polls its transports epoll-first (DriverWakeFds.h).
+    [[nodiscard]] bool epollPollActive() const noexcept { return epollPollActive_; }
     /// TEST SEAM — call before start(): the driver's next `count` GSO sendmsg calls fail with errno `err`.
     void injectGsoSendErrorsForTest(int err, int count) noexcept { gsoInjectErr_ = err; gsoInjectCount_ = count; }
 
@@ -368,6 +375,8 @@ private:
     aeron_driver_t*         driver_        = nullptr;
     rune_gso_bindings_t*    gso_           = nullptr;   // owned; outlives driverCtx_ (Aeron points at it)
     rune_gso_totals_t       gsoTotals_{};
+    void*                   epollBindings_   = nullptr;   // owned stock-bindings copy (no GSO); outlives driverCtx_
+    bool                    epollPollActive_ = false;
     int                     gsoActiveMask_ = 0;      // rune_gso_bindings_active(): 1 = GSO, 2 = GRO
     uint32_t                maxMessagesPerSend_ = 0;
     int                     gsoInjectErr_   = 0;      // test seam (injectGsoSendErrorsForTest)

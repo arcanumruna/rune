@@ -75,6 +75,9 @@ struct TransportConfig {
     /// Linux UDP GSO (send) / GRO (receive) transport bindings in the embedded driver; auto-off where the
     /// kernel/platform lacks them (stock Aeron).  Wire format unchanged.  Env: RUNE_CLIENT_AERON_UDP_GSO=0|1.
     bool        udpGso             = true;
+    /// A7: the embedded driver's transport pollers poll epoll-first (one epoll_wait per duty cycle, recvmmsg
+    /// only ready sockets) instead of recvmmsg-ing every socket — Linux only.  Env: RUNE_CLIENT_AERON_EPOLL_POLL=0|1.
+    bool        epollPoll          = true;
     /// Aeron network-publication datagrams per send, 1..16; 0 = 16 with GSO active, else Aeron's 2.
     /// Env: RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND.
     uint32_t    maxMessagesPerSend = 0;
@@ -204,6 +207,7 @@ struct TransportConfig {
     };
     if (const auto mtu = readSize("RUNE_CLIENT_AERON_MTU")) c.mtuLength = *mtu;
     if (const auto g = readSize("RUNE_CLIENT_AERON_UDP_GSO")) c.udpGso = (*g != 0);
+    if (const auto e = readSize("RUNE_CLIENT_AERON_EPOLL_POLL")) c.epollPoll = (*e != 0);
     if (const auto m = readSize("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND")) {
         if (*m >= 1 && *m <= 16) c.maxMessagesPerSend = static_cast<uint32_t>(*m);
         else warnings.push_back("rune-client: ignoring RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND=" + std::to_string(*m) +

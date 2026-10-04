@@ -531,3 +531,82 @@ TEST(InvokerTransportCrc, RefusedOfferNeverComputesTheCrc) {
     rx.stop();
     pub.stop();
 }
+
+// ---------------------------------------------------------------------------
+// A7 park-until-work (rune-broker findings §4.12): an INVOKER transport exposes its driver's
+// transport-poller epoll fds so the owner can park in ppoll() until a datagram arrives, instead of
+// polling every socket each pass (a pegged core).  Linux only; a Thread-mode driver exposes none.
+// ---------------------------------------------------------------------------
+#include <poll.h>
+
+TEST(InvokerTransportWake, ThreadModeExposesNoWakeFds) {
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3190);
+    c.driverMode = DriverMode::Thread;
+    Transport t{c};
+    t.start();
+    int fds[4];
+    EXPECT_EQ(t.wakeFds(fds, 4), 0) << "the driver's own thread consumes the sockets";
+    t.stop();
+}
+
+TEST(InvokerTransportWakeRegression, ParkedOwnerWakesOnInboundDatagram) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "driver wake fds are Linux-only (Aeron's transport pollers use epoll there)";
+#else
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:24731";
+    Transport t{invokerConfig(ch, ch, 3191)};
+    t.start();
+    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+    for (int i = 0; i < 200; ++i) t.dutyCycle();   // settle setup / status traffic
+    int fds[4];
+    const int n = t.wakeFds(fds, 4);
+    ASSERT_EQ(n, 2) << "receiver + sender transport pollers";
+    pollfd pfds[4];
+    for (int i = 0; i < n; ++i) pfds[i] = pollfd{fds[i], POLLIN, 0};
+
+    // Quiet: nothing readable, a park waits out its timeout.
+    timespec quiet{0, 20'000'000};
+    EXPECT_EQ(::ppoll(pfds, static_cast<nfds_t>(n), &quiet, nullptr), 0);
+
+    // A datagram on the driver's socket (a plain sender: not an Aeron frame, the receiver drops it)
+    // ends a 2 s park immediately.
+    const int s = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET; a.sin_port = htons(24731); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const char junk[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    ASSERT_EQ(::sendto(s, junk, sizeof junk, 0, reinterpret_cast<sockaddr*>(&a), sizeof a), 8);
+    ::close(s);
+    const timespec ts{2, 0};
+    const auto t0 = std::chrono::steady_clock::now();
+    const int r = ::ppoll(pfds, static_cast<nfds_t>(n), &ts, nullptr);
+    const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_GT(r, 0) << "the inbound datagram must make a wake fd readable";
+    EXPECT_LT(waitedMs, 1'000);
+
+    // The owner's pass drains it: quiet again (level-triggered, no sticky wake).
+    for (int i = 0; i < 10; ++i) t.dutyCycle();
+    EXPECT_EQ(::ppoll(pfds, static_cast<nfds_t>(n), &quiet, nullptr), 0);
+    t.stop();
+    EXPECT_EQ(t.wakeFds(fds, 4), 0) << "no fds once the driver is closed";
+#endif
+}
+
+// A7 epoll-first polling: installed by default on Linux (off elsewhere / on RUNE_CLIENT_AERON_EPOLL_POLL=0),
+// and a driver whose receiver poller holds > 1 UDP transport still delivers everything.
+TEST(InvokerTransportEpollPoll, InstalledWhereSupportedAndConfigured) {
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:24741";
+    Transport t{invokerConfig(ch, ch, 3192)};
+    t.start();
+#if defined(__linux__)
+    EXPECT_TRUE(t.epollPollActive());
+#else
+    EXPECT_FALSE(t.epollPollActive());
+#endif
+    t.stop();
+    Config off = invokerConfig(ch, ch, 3193);
+    off.epollPoll = false;
+    Transport s{off};
+    s.start();
+    EXPECT_FALSE(s.epollPollActive()) << "the A/B off arm: Aeron's stock poller";
+    s.stop();
+}

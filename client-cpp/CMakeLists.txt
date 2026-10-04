@@ -167,6 +167,21 @@ if(aeron_FOUND)
     endif()
 endif()
 
+# ── rune_client_driver_wake — A7 park-until-work: an invoker driver's readiness fds ──
+# A C TU: Aeron's internal driver headers are C (same include probe as rune_gso).  Non-Linux: a stub (0 fds).
+if(aeron_FOUND)
+    add_library(rune_client_driver_wake STATIC src/transport/DriverWakeFds.c)
+    set_target_properties(rune_client_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(rune_client_driver_wake PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(rune_client_driver_wake PRIVATE aeron::aeron)
+        foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+            target_include_directories(rune_client_driver_wake PRIVATE
+                "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+        endforeach()
+    endif()
+endif()
+
 # ── rune_client_transport — AeronTransport (compiled, links aeronmd C driver) ─
 if(aeron_FOUND)
     add_library(rune_client_transport STATIC
@@ -177,7 +192,7 @@ if(aeron_FOUND)
         $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>  # FrameCrc.h (B1): Crc32c / RecordBatch layout
         $<INSTALL_INTERFACE:include>
     )
-    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso)
+    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso rune_client_driver_wake)
 
     # Linux CI portability: libuuid is needed on Linux but not macOS (no-op there).
     if(UNIX AND NOT APPLE)
