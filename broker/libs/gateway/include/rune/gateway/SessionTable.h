@@ -80,11 +80,16 @@ public:
     SessionTable& operator=(const SessionTable&) = delete;
 
     // -----------------------------------------------------------------------
-    // nextSessionId() — monotonically-increasing, starts at 1.
+    // nextSessionId() — monotonically-increasing, starts at 1, OR-ed with the
+    // cluster id prefix (setIdPrefix): ((nodeId + 1) << 40) | counter makes a
+    // session id unique across the cluster's nodes (a client holds one session
+    // per node and demultiplexes by id).  Always positive.
     // -----------------------------------------------------------------------
     [[nodiscard]] int64_t nextSessionId() noexcept {
-        return ++nextId_;
+        return idPrefix_ | ++nextId_;
     }
+    /// Cluster-unique ids: the prefix OR-ed into every id (0 = none, tests).
+    void setIdPrefix(int64_t prefix) noexcept { idPrefix_ = prefix; }
 
     // -----------------------------------------------------------------------
     // add() — insert a new session.  Returns a reference valid until remove().
@@ -151,6 +156,7 @@ public:
 
 private:
     int64_t                              nextId_   = 0;
+    int64_t                              idPrefix_ = 0;
     std::unordered_map<int64_t, Session> sessions_;
 };
 

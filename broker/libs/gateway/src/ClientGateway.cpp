@@ -96,6 +96,9 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     // pendingConnects_ is a deque — no reserve() needed; O(1) front push/pop.
     drainingRegistrations_.reserve(kMaxPendingConnects);
 
+    // Cluster-unique session / subscription ids (see setClusterIdNode).
+    setClusterIdNode(thisNodeId_);
+
     // GR-5: Pre-allocate the pending-ack queue to avoid heap allocs on the hot path.
     // The vector is used as a shrinking queue (erase-by-swap-and-pop); capacity
     // stays at kMaxPendingAcks after the initial reserve.
@@ -3020,7 +3023,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     }
 
     // 6. Allocate subscriptionId and register subscription.
-    const int64_t subId = ++nextSubscriptionId_;
+    const int64_t subId = allocSubscriptionId_();
 
     Subscription sub;
     sub.subscriptionId = subId;
@@ -3062,6 +3065,16 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
     if (!msgOpt) {
         spdlog::debug("ClientGateway: Unsubscribe decode failed — dropped");
         return;
+    }
+    // Only the owning session may remove a subscription (an Unsubscribe from
+    // another session — a stale client episode, another client — is ignored).
+    {
+        const auto own = subscriptions_.find(msgOpt->subscriptionId);
+        if (own != subscriptions_.end() && own->second.sessionId != msgOpt->sessionId) {
+            spdlog::debug("ClientGateway: Unsubscribe subId={} from sessionId={} — owned by sessionId={}, ignored",
+                          msgOpt->subscriptionId, msgOpt->sessionId, own->second.sessionId);
+            return;
+        }
     }
     // read-rework T3/T4 (I3b): tell the owning worker to drop the cursor too.
     if (perWorkerEgressActive_ && workerPool_) {
@@ -4896,7 +4909,7 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
                              : fromOffset;
 
     // Allocate subscriptionId and register the group subscription.
-    const int64_t subId = ++nextSubscriptionId_;
+    const int64_t subId = allocSubscriptionId_();
 
     Subscription sub;
     sub.subscriptionId       = subId;

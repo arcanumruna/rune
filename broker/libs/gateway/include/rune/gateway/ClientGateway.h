@@ -416,6 +416,23 @@ public:
         return committedMetadataReady_;
     }
 
+    // -----------------------------------------------------------------------
+    // Cluster-unique ids: every session id and subscription id this gateway
+    // allocates carries ((nodeId + 1) << 40) in its high bits, so ids never
+    // collide across the cluster's nodes (a client holding one session per
+    // node demultiplexes Records by subscriptionId).  Always positive.  The
+    // production constructor sets it from thisNodeId; test constructors keep
+    // the historical small ids unless a test sets it.
+    // -----------------------------------------------------------------------
+    static constexpr int kClusterIdShift = 40;
+    [[nodiscard]] static constexpr int64_t clusterIdPrefix(int32_t nodeId) noexcept {
+        return static_cast<int64_t>(nodeId + 1) << kClusterIdShift;
+    }
+    void setClusterIdNode(int32_t nodeId) noexcept {
+        idPrefix_ = nodeId >= 0 ? clusterIdPrefix(nodeId) : 0;
+        sessions_.setIdPrefix(idPrefix_);
+    }
+
     void setNodeEndpointMap(
             std::unordered_map<int32_t, std::string> nodeEndpoints) noexcept {
         nodeEndpointMap_ = std::move(nodeEndpoints);
@@ -895,6 +912,10 @@ public:
     // -----------------------------------------------------------------------
     void applySubscribeForTest(const uint8_t* buf, std::size_t len) {
         handleSubscribe(buf, len);
+    }
+    /// Test seam: feed a raw Unsubscribe frame through handleUnsubscribe().
+    void applyUnsubscribeForTest(const uint8_t* buf, std::size_t len) {
+        handleUnsubscribe(buf, len);
     }
     /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
     /// Aeron polling.
@@ -1573,6 +1594,8 @@ private:
 
     // GB-3: Monotonic subscription ID generator (starts at 1).
     int64_t nextSubscriptionId_ = 0;
+    int64_t idPrefix_           = 0;  // cluster-unique id prefix (setClusterIdNode)
+    [[nodiscard]] int64_t allocSubscriptionId_() noexcept { return idPrefix_ | ++nextSubscriptionId_; }
 
     // CG-4: Group-member push subscription tracking.
     // Maps memberSessionId → set of subscriptionIds that were created via
