@@ -163,6 +163,9 @@ struct DrNode {
     std::unique_ptr<InternalIsrKnowledge> isrKnowledge;
     bool                              up = false;
     uint32_t                          incarnation = 0;
+    /// The node's CONSENSUS term (Election max(candidateTermId,
+    /// leadershipTermId)) — durable (node-state file) like production.
+    int64_t                           consensusTerm = 0;
     std::map<std::string, int64_t>    durableFloor;   // .log path → bytes known durable
 };
 
@@ -216,6 +219,7 @@ public:
         meta_.leader = leader;
         meta_.epoch  = 1;
         meta_.isr    = replicas_;
+        for (auto& n : nodes_) n.consensusTerm = std::max<int64_t>(n.consensusTerm, 1);
         for (auto& n : nodes_) applyMetadata(n.id);
     }
 
@@ -340,6 +344,10 @@ public:
         ++meta_.partitionEpoch;
         meta_.leader = id;
         if (!inIsr) meta_.isr.insert(meta_.isr.begin(), id);
+        if (cfg_.topicId < 0)   // a consensus move: every reachable node sees the new term
+            for (auto& n : nodes_)
+                if (n.up && cut_.count({n.id, kControllerAddr}) == 0)
+                    n.consensusTerm = std::max<int64_t>(n.consensusTerm, meta_.epoch);
         for (auto& n : nodes_) applyMetadata(n.id);
         return true;
     }
@@ -358,8 +366,20 @@ public:
         if (winner < 0) return -1;
         ++meta_.epoch;
         meta_.leader = winner;
+        // Every consensus-reachable node saw the RequestVote / NewLeadershipTerm.
+        for (auto& n : nodes_)
+            if (n.up && cut_.count({n.id, kControllerAddr}) == 0)
+                n.consensusTerm = std::max<int64_t>(n.consensusTerm, meta_.epoch);
         for (auto& n : nodes_) if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
         return winner;
+    }
+
+    /// Node `voter` has voted in (or observed) consensus term `term` — e.g. it
+    /// granted a candidate's RequestVote — while its replicas may still follow
+    /// the previous leader (NewLeadershipTerm not yet applied by the bridge).
+    void consensusVote(NodeId voter, int64_t term) {
+        DrNode& n = node(voter);
+        n.consensusTerm = std::max(n.consensusTerm, term);
     }
 
     /// The controller's committed ISR contains `id`.
@@ -646,6 +666,7 @@ private:
         if (cfg_.topicId >= 0) n.rep->setIsrChannel(n.ep.get());   // as BrokerNode (multi-node)
         if (cfg_.topicId < 0) {                                       // as BrokerNode (internal)
             n.isrKnowledge = std::make_unique<InternalIsrKnowledge>(n.dir + "/internal-isr.state");
+            n.isrKnowledge->setConsensusTermSource(&DrCluster::termOf_, &n);   // as BrokerNode (Election)
             n.rep->setInternalIsrKnowledge(n.isrKnowledge.get());
         }
         n.up = true;
@@ -867,6 +888,7 @@ private:
     std::optional<rune::metadata::ReplicaPositionTable> capturedPositions_;   ///< see controllerLearnPositionsFrom
     /// Consensus vote rule (voter, candidate) — Election::mayVoteFor as the
     /// broker wires it: InternalIsrKnowledge::eligible of the voter.
+    static int64_t termOf_(const void* n) noexcept { return static_cast<const DrNode*>(n)->consensusTerm; }
     bool consensusVoteGate_(NodeId voter, NodeId candidate) {
         DrNode& v = node(voter);
         return v.isrKnowledge == nullptr || v.isrKnowledge->eligible(candidate);

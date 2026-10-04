@@ -73,7 +73,9 @@ public:
     /// Adopt `s` if it is newer than what is known for its partition, durably
     /// (persisted before returning).  Returns true when this node now holds
     /// `s` or a newer state for that partition (the caller may ack it), false
-    /// when the write failed (never ack an unpersisted state).
+    /// when the write failed (never ack an unpersisted state) or when
+    /// s.leaderEpoch is older than this node's consensus term (MEDIUM-A: never
+    /// persisted, never acked).
     bool offer(const InternalIsrState& s);
 
     /// The newest state known for (topicId, partition), nullptr = none.
@@ -88,16 +90,27 @@ public:
         return static_cast<const InternalIsrKnowledge*>(self)->eligible(candidate);
     }
 
+    /// The node's CONSENSUS term source (BrokerNode: the Election's
+    /// max(candidateTermId, leadershipTermId) — the term it voted in or
+    /// observed).  nullptr = no term rule (unit rigs).
+    using TermSource = int64_t (*)(const void* ctx) noexcept;
+    void setConsensusTermSource(TermSource fn, const void* ctx) noexcept { termFn_ = fn; termCtx_ = ctx; }
+    [[nodiscard]] int64_t consensusTerm() const noexcept { return termFn_ ? termFn_(termCtx_) : -1; }
+
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
     [[nodiscard]] uint64_t persistsForTest() const noexcept { return persists_; }
+    [[nodiscard]] uint64_t staleTermRefusals() const noexcept { return staleTermRefusals_; }
 
 private:
     bool persist_();
     void load_();
 
+    TermSource                    termFn_  = nullptr;
+    const void*                   termCtx_ = nullptr;
     std::string                   path_;
     std::vector<InternalIsrState> entries_;
     uint64_t                      persists_ = 0;
+    uint64_t                      staleTermRefusals_ = 0;
 };
 
 } // namespace rune::replication

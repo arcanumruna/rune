@@ -854,9 +854,20 @@ void BrokerNode::buildReplication() {
     internalIsrKnowledge_ = std::make_unique<rune::replication::InternalIsrKnowledge>(
         config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
     replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
-    if (election_)
+    if (election_) {
         election_->setVoteGate(&rune::replication::InternalIsrKnowledge::voteGate,
                                internalIsrKnowledge_.get());
+        // Re-review MEDIUM-A: the knowledge refuses (never persists, never acks)
+        // an internal ISR state of a leadership older than the consensus term
+        // this node voted in or observed — Raft's term rule applied to the ack.
+        internalIsrKnowledge_->setConsensusTermSource(
+            [](const void* e) noexcept -> int64_t {
+                const auto* el = static_cast<const Election*>(e);
+                return std::max<int64_t>(static_cast<int64_t>(el->candidateTermId()),
+                                         static_cast<int64_t>(el->leadershipTermId()));
+            },
+            election_.get());
+    }
     // Task 10 round 4 (Critical 1): the legacy replication transport resolves
     // every inbound frame through the registry at USE time and holds no replica
     // pointer (a removed partition can never be reached through it).  User

@@ -1546,3 +1546,51 @@ TEST(DrIntegrationRegression, CommittedInternalIsrResentUntilAcked_KnowledgeConv
                s->version == c.node(1).isrKnowledge->latest(-3, kPartId)->version;
     }, 500)) << "node 3 never learned the committed internal ISR\n" << c.dump();
 }
+
+// Re-review 2026-10-04 (fix round 2) MEDIUM-A: zombie-leader ack window.  L (1)
+// leads at term e; Y (3) loses its links to L and lags.  X (2) grants Y's
+// RequestVote for e+1 — X's internal replica still follows L at e until the
+// bridge sees NewLeadershipTerm.  In that gap L lag-shrinks Y: X persisted and
+// acked (e, {1,2}), the change committed on {1,2}, L's HW passed Y's LEO and L
+// acked client writes; Y then became leader at e+1 and X truncated them —
+// ACKED internal records lost.  Fixed (Raft's term rule applied to the ack): a
+// node refuses to persist or ack any internal ISR state whose leaderEpoch is
+// older than its current consensus term.
+TEST(DrIntegrationRegression, ZombieLeaderInternalIsrAckRefusedAfterVote_NoAckedLoss) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).internalSeedPendingForTest() && !c.rep(1).isrProposalPendingForTest();
+    }, kCap));
+    const auto* k2 = c.node(2).isrKnowledge->latest(-3, kPartId);
+    ASSERT_NE(k2, nullptr);
+    const int64_t e0 = k2->leaderEpoch, v0 = k2->version;
+    ASSERT_TRUE(k2->contains(3));
+    // Y (3) is cut from L on both planes of the replication link.
+    c.cutBoth(1, 3);
+    // X (2) grants Y's RequestVote for e+1 (3 votes for itself) — the bridges
+    // have not applied a new leadership yet: everyone's replica still at e.
+    c.consensusVote(2, c.epoch() + 1);
+    c.consensusVote(3, c.epoch() + 1);
+    ASSERT_EQ(c.produce(5), 5);                   // writes L would ack past Y's LEO
+    c.run(300);                                   // far past replicaLagMaxMs: L shrinks Y
+    const auto* k2b = c.node(2).isrKnowledge->latest(-3, kPartId);
+    ASSERT_NE(k2b, nullptr);
+    EXPECT_TRUE(k2b->leaderEpoch == e0 && k2b->version == v0)
+        << "X persisted a state of term " << k2b->leaderEpoch << " after voting in term "
+        << c.epoch() + 1;
+    EXPECT_TRUE(k2b->contains(3)) << "X's knowledge dropped Y after voting for Y";
+    EXPECT_TRUE(c.rep(1).isrProposalPendingForTest() || c.leaderIsrContains(3))
+        << "the zombie leader committed an internal ISR change after its acker voted for a newer term\n"
+        << c.dump();
+    // Y wins the election at e+1 (legitimately: X's knowledge still names it).
+    c.healAll();
+    const NodeId nl = c.consensusElect(3);
+    ASSERT_EQ(nl, 3) << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(3), 3);
+    expectAllConvergedAndAcked(c, "re-review2 medium-a zombie ack window");
+}

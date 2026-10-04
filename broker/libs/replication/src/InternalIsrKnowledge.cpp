@@ -57,6 +57,15 @@ bool InternalIsrKnowledge::eligible(int32_t candidate) const noexcept
 bool InternalIsrKnowledge::offer(const InternalIsrState& s)
 {
     if (s.count < 0 || s.count > InternalIsrState::kMaxMembers) return false;
+    // Raft's term rule applied to the ack (re-review 2026-10-04 MEDIUM-A): a
+    // state from a leadership OLDER than the term this node voted in / observed
+    // is neither persisted nor acked — a deposed (zombie) leader can never
+    // commit an ISR change, nor plant a stale candidacy view, through a node
+    // that already moved on.
+    if (const int64_t term = consensusTerm(); term >= 0 && s.leaderEpoch < term) {
+        ++staleTermRefusals_;
+        return false;
+    }
     for (auto& e : entries_) {
         if (e.topicId != s.topicId || e.partition != s.partition) continue;
         if (!s.newerThan(e.leaderEpoch, e.version)) return true;   // holds s or newer

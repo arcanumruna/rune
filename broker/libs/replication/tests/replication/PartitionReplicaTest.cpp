@@ -4549,3 +4549,49 @@ TEST(InternalIsrRegression, KnowledgeIsDurableAndMonotonic) {
     EXPECT_FALSE(k2.eligible(2)) << "must be a member of EVERY internal partition's ISR";
     EXPECT_TRUE(k2.eligible(1));
 }
+
+// Re-review 2026-10-04 (fix round 2) MEDIUM-A: a node that voted in (or
+// observed) consensus term e+1 refuses to PERSIST or ACK an internal ISR state
+// of leadership e — even while its replica still follows the term-e leader
+// (the bridge has not applied NewLeadershipTerm yet).  Raft's term rule applied
+// to the ack: a zombie leader can neither commit through it nor plant a stale
+// candidacy view in it.  A state of the current term is still adopted + acked.
+TEST(InternalIsrRegression, StateOlderThanConsensusTermNeitherPersistedNorAcked) {
+    struct AckCapture : public PartitionTransport {
+        int acks = 0;
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
+        bool sendInternalIsrAck(NodeId, const InternalIsrAckMsg&) override { ++acks; return true; }
+    };
+    TempDir fDir("iisr_term_F"), kDir("iisr_term_K");
+    rune::storage::Log fLog(fDir.path);
+    AckCapture t;
+    constexpr NodeId kL = 1, kF = 2, kY = 3;
+    std::vector<NodeId> all = {kL, kF, kY};
+    PartitionConfig cfg = makeConfig(kF, /*lagMs=*/10, /*lagOff=*/1'000'000);
+    cfg.topicId = -3;
+    InternalIsrKnowledge k(kDir.path + "/internal-isr.state");
+    int64_t term = 4;
+    k.setConsensusTermSource([](const void* p) noexcept { return *static_cast<const int64_t*>(p); }, &term);
+    PartitionReplica f(cfg, Role::Follower, 0, all, all, &fLog, &t);
+    f.setInternalIsrKnowledge(&k);
+    f.becomeFollower(4, kL);
+    auto msg = [&](int64_t epoch, int64_t version, std::initializer_list<NodeId> m) {
+        InternalIsrMsg x{};
+        x.topicId = -3; x.partition = 0; x.leaderId = kL; x.leaderEpoch = epoch; x.version = version;
+        for (NodeId n : m) x.isr[static_cast<std::size_t>(x.isrCount++)] = n;
+        return x;
+    };
+    f.onInternalIsr(msg(4, 1, {kL, kF, kY}));    // current term: adopted + acked
+    ASSERT_NE(k.latest(-3, 0), nullptr);
+    EXPECT_EQ(k.latest(-3, 0)->version, 1);
+    EXPECT_EQ(t.acks, 1);
+    term = 5;                                    // F granted Y's RequestVote for term 5
+    f.onInternalIsr(msg(4, 2, {kL, kF}));        // the zombie's shrink of Y
+    EXPECT_EQ(k.latest(-3, 0)->version, 1) << "persisted a state of term 4 after voting in term 5";
+    EXPECT_TRUE(k.latest(-3, 0)->contains(kY));
+    EXPECT_EQ(t.acks, 1) << "acked a state of term 4 after voting in term 5";
+    InternalIsrKnowledge reloaded(kDir.path + "/internal-isr.state");
+    ASSERT_NE(reloaded.latest(-3, 0), nullptr);
+    EXPECT_EQ(reloaded.latest(-3, 0)->version, 1) << "the stale state reached the disk";
+}
