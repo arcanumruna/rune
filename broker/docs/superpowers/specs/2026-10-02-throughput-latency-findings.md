@@ -389,6 +389,49 @@ moderation) — worker CPU 75% -> 65% but p50 510 -> 1,057 us.  **The large CPU 
 idle strategy**: it needs less per-batch work (batching at linger 0, fewer syscalls per replicated batch, cheaper
 pass composition — §4.6).
 
+#### 4.12.1 A7 fix round 1 (review C1/M1/M2/D1/D3) — A/B (2026-10-04, k3s-node-01)
+
+Binaries: A = A7 as reviewed (broker 60d6bdf + client fc509e8); B = fix round 1 (broker 5dcd4fd + client 7e98e33,
+rune-protocol 8636742: EPOLLERR consumed with SO_ERROR, Aeron 10 spins / 20 yields before the first park, io_uring
+ring fd in the wake set, 1 us timer slack on shard runners).  Release, gcc-13, conan toolchains of /root/rune-e5.
+Config as §4.12 (MTU 1408, GSO/GRO on, RUNE_FS_LOG=0, RUNE_LOG_LEVEL=warn, 3 nodes x 1 fused worker, acks=all, 1 KiB,
+linger 0, term 1 MiB, rcvWindow 256 KiB, ctlTerm 1 MiB), /root/e2e/tp.sh with vm-clean per run; one round per arm,
+interleaved A,B per scenario (fsync: a second round B,A).  CPU = utime+stime over a 5-13 s window mid-run.  Proof of
+path (B): `idle=park-until-work{wakeFds=3 spins=10 yields=20 parkNs=1000-200000}` per worker (2 poller fds + the
+io_uring fd), `poll=epoll-first` per driver.  All runs errors=0.  Scripts / raw: /root/a7r/{run,ab,ab2}.sh, res/.
+
+| run | arm | worker CPU % (3 nodes) | client % | proc total | sys idle | p50 / p99 / p999 us | rec/s |
+|---|---|---|---|---|---|---|---|
+| idle (no producer) | A | 23.9 / 23.4 / 22.6 | – | 86% | 76% | – | – |
+| | B | 31.8 / 31.6 / 30.8 | – | 110% | 69% | – | – |
+| 20k | A | 77.7 / 77.3 / 74.8 | 71.7 | 310% | 5% | 492 / 31,588 / 63,439 | 20,002 |
+| | B | 88.1 / 84.9 / 84.4 | 70.8 | 338% | 2% | 467 / 13,304 / 28,836 | 20,000 |
+| sat (3M records) | A | 67.8 / 64.0 / 62.1 | 43.5 | 247% | 11% | 24,904 / 136,315 | 168,024 |
+| | B | 70.8 / 66.3 / 64.8 | 45.0 | 259% | 8% | 21,627 / 139,461 | 168,663 |
+| 20k + fsync 5 ms (leader + follower) r1 | A | 46.4 / 44.9 / 41.9 | 41.2 | 198% | 7% | 2,802 / 14.9 s / 15.0 s | 17,251 |
+| | B | 41.8 / 35.6 / 27.3 | 12.2 | 129% | 59% | 6.5 s / 13.9 s / 14.0 s | 8,252 |
+| 20k + fsync 5 ms r2 | B | 38.5 / 33.5 / 33.0 | 30.7 | 149% | – | 9,634 / 9.9 s / 10.0 s | 17,243 |
+| | A | 33.6 / 29.9 / 19.5 | 12.7 | 109% | 68% | 1.5 s / 9.9 s / 10.0 s | 20,003 |
+
+Peer-kill (idle cluster, `kill -9` of follower node 0; gateway/leader node 1), survivors' worker CPU over 5.6-5.8 s
+while node 0 is down:
+
+| arm | before the kill (3 nodes) | node 0 down (2 survivors) | sys idle before -> down |
+|---|---|---|---|
+| A | 24.4 / 23.6 / 23.1 | **95.1 / 85.7** (vcsw/s 3 / 469: no parks) | 77% -> 48% |
+| B | 37.1 / 35.9 / 34.6 | **34.9 / 33.2** (vcsw/s ~3.1k: parking) | 67% -> 79% |
+
+Result: **C1 reproduced in production on A and fixed in B** — with a peer down, A's surviving workers spin at 86-95%
+(ICMP-unreachable EPOLLERR left pending, the poller epoll fd permanently ready); B's stay at their idle level.  The M1
+ruling (Aeron spin/yield phase before the first park) costs CPU, as expected: idle worker **23% -> 31%** (still below
+pre-A7's 39%), 20k worker **~77% -> ~86%** (pre-A7: ~82%; the spin/yield passes are cheaper than pre-A7's because
+epoll-first polling stays).  20k p50 492 -> 467 us, p99 31.6 -> 13.3 ms (one run each; the 20k p99 spread is 17-30 ms
+run to run in §4.12, no improvement claimed).  Saturation equal (168.0k vs 168.7k, +0.4%).  **fsync 5 ms at 20k is past
+this box in both arms**: every run has p99 >= 9.9 s, and which arm collapses harder flips between rounds (r1 A 17.3k /
+B 8.3k; r2 A 20.0k / B 17.2k with A's p50 1.5 s) — this scenario does not resolve the io_uring wake's latency effect;
+the wake itself is proven by ParkUntilWorkIdleRegression.IoUringCompletionEndsParkRegression (Linux).  Open: a
+sustainable durable-tier latency A/B (longer fsync interval or lower rate, ABAB) and §4.12 D2's n >= 15 ABAB.
+
 ### 4.13 D2: non-worker threads off the worker cores + backoff node-driver idle (2026-10-04, k3s-node-01)
 
 Binaries: before = integ/perf-defaults 1767c3d; after = fix/d2-thread-placement 68c3a62 (wt35).  Release, gcc-13,
