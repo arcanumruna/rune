@@ -127,6 +127,29 @@ struct InvokerGateway {
     // bare ErrorResponse{NotLeader} when subscribeNotLeader).  Unlisted
     // partitions are served anywhere (the historical gateway).
     std::map<int32_t, int> subscribeLeader;
+    // A real broker answers a session on that session's own node: Connect /
+    // Subscribe / Ping answers (and pushRecords) leave from the endpoint the
+    // request arrived on (default: endpoint 0, the historical gateway).
+    bool replyFromArrival = false;
+    // Subscription ids are allocated per endpoint (each node's own counter
+    // starting at nextSubscriptionId) — they collide across nodes like a real
+    // cluster's (default: one counter).
+    bool perEndpointSubIds = false;
+    std::map<int, int64_t> endpointSubIds;
+    // Endpoints that are dead: every frame arriving there is ignored.
+    std::set<int> deadEndpoints;
+    // The next N OffsetFetch answers carry an error code on every entry.
+    int offsetFetchErrorsNext = 0;
+    // OffsetFetch answers are held until releaseOffsetFetches().
+    bool holdOffsetFetch = false;
+    std::vector<std::vector<uint8_t>> heldOffsetFetches;
+    void releaseOffsetFetches() {
+        std::vector<std::vector<uint8_t>> h;
+        h.swap(heldOffsetFetches);
+        for (const auto& f : h) send(0, f.data(), f.size());
+    }
+    // ConnectRequests received per endpoint (answered or not).
+    std::map<int, int> connectsAt;
     bool                   subscribeNotLeader = false;
     int                    subscribeRefusals  = 0;
     // Consumer-group coordinator model (off by default = the historical gateway,
@@ -361,8 +384,10 @@ struct InvokerGateway {
     }
 
     InvokerGateway(const std::string& aeronDir, const std::string& controlChannel,
-                   int32_t controlStream, std::string egressCh, int32_t egressStream)
+                   int32_t controlStream, std::string egressCh, int32_t egressStream,
+                   std::string endpoint0PubChannel = {})
         : egressChannel(std::move(egressCh)), egressStreamId(egressStream) {
+        nextPubChannel = std::move(endpoint0PubChannel);
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
         ctx.useConductorAgentInvoker(true);
@@ -377,12 +402,19 @@ struct InvokerGateway {
         aeron.reset();
     }
 
+    // The publication channel of the NEXT addEndpoint's replies (empty = the
+    // egress channel): e.g. the egress channel with its own `interface=` port,
+    // so each fake node is a distinct SOURCE (Image::sourceIdentity) like real
+    // broker nodes on distinct hosts.
+    std::string nextPubChannel;
     int addEndpoint(const std::string& channel, int32_t stream) {
         auto ep = std::make_unique<Endpoint>();
         ep->channel = channel;
         ep->stream  = stream;
         ep->subReg  = aeron->addSubscription(channel, stream);
-        ep->pubReg  = aeron->addExclusivePublication(egressChannel, egressStreamId);
+        const std::string pubCh = nextPubChannel.empty() ? egressChannel : nextPubChannel;
+        nextPubChannel.clear();
+        ep->pubReg  = aeron->addExclusivePublication(pubCh, egressStreamId);
         const int index = static_cast<int>(endpoints.size());
         ep->assembler = std::make_unique<aeron::FragmentAssembler>(
             [this, index](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
@@ -552,7 +584,7 @@ struct InvokerGateway {
         const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId,
                                                  sub.topicId, sub.partition, baseOffset,
                                                  std::span<const uint8_t>(batch), sub.sessionId, 0);
-        send(0, out.data(), n);
+        send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
     }
 
     void releaseHeld() {
@@ -800,6 +832,7 @@ private:
         namespace rp  = rune::protocol::client;
         const auto tid = rcc::peekTemplate(buf, len);
         if (!tid) return;
+        if (deadEndpoints.count(endpoint) != 0) return;  // a dead node hears nothing
         if (!replay) ++framesReceived;
         switch (static_cast<rcc::TemplateId>(*tid)) {
         case rcc::TemplateId::Connect: {
@@ -811,6 +844,7 @@ private:
                 return;
             }
             ++connects;
+            ++connectsAt[endpoint];
             if (!replyConnects || silentEndpoints.count(endpoint) != 0) return;
             for (const Produced& pr : ackBeforeNextConnect) ack(pr);
             ackBeforeNextConnect.clear();
@@ -828,7 +862,11 @@ private:
             const std::size_t n = rcc::encodeConnectResponse(
                 out, sizeof out, connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK),
                 0, sid, c->sessionId, c->correlationId);
-            sendToSession(sid, out, n);
+            if (replyFromArrival && !replyOnAnnouncedEgress) {
+                send(endpoint, out, n);
+            } else {
+                sendToSession(sid, out, n);
+            }
             for (const auto& [sub, base] : recordsAfterNextConnect) pushRecords(sub, base, 1);
             recordsAfterNextConnect.clear();
             return;
@@ -901,17 +939,22 @@ private:
                     static_cast<int16_t>(subscribeNotLeader ? rp::ErrorCode::NotLeader : rp::ErrorCode::Redirect),
                     subscribeNotLeader ? std::string_view() : std::string_view(to), sv->sessionId,
                     sv->correlationId);
-                send(0, out.data(), n);
+                send(replyFromArrival ? endpoint : 0, out.data(), n);
                 return;
             }
-            const Subscribed sub{nextSubscriptionId++, sv->topicId, sv->partition, sv->sessionId,
+            int64_t subId = nextSubscriptionId++;
+            if (perEndpointSubIds) {
+                auto [it, fresh] = endpointSubIds.try_emplace(endpoint, int64_t{500});
+                subId = fresh ? it->second : ++it->second;
+            }
+            const Subscribed sub{subId, sv->topicId, sv->partition, sv->sessionId,
                                  endpoint, sv->fromOffset, sv->correlationId};
             subscribed.push_back(sub);
             uint8_t out[64];
             const std::size_t n = rcc::encodeSubscribeResponse(
                 out, sizeof out, 0, sv->partition, sub.subscriptionId, sv->sessionId,
                 sv->correlationId);
-            send(0, out, n);
+            send(replyFromArrival ? endpoint : 0, out, n);
             return;
         }
         case rcc::TemplateId::Ping: {
@@ -929,7 +972,7 @@ private:
                 std::vector<uint8_t> out(64 + pv->echo.size());
                 const std::size_t n =
                     rcc::encodePong(out.data(), out.size(), pv->echo, pv->sessionId, pv->correlationId);
-                send(0, out.data(), n);
+                send(replyFromArrival ? endpoint : 0, out.data(), n);
             }
             return;
         }
@@ -1099,11 +1142,13 @@ private:
             groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
             std::vector<rp::OffsetFetchResult> res;
+            const bool failAll = offsetFetchErrorsNext > 0;
+            if (failAll) --offsetFetchErrorsNext;
             for (const auto& e : of->entries) {
                 rp::OffsetFetchResult r;
                 r.topicId   = e.topicId;
                 r.partition = e.partition;
-                r.errorCode = 0;
+                r.errorCode = failAll ? static_cast<int16_t>(rp::ErrorCode::NotCoordinator) : int16_t{0};
                 const auto it = committedOffsets.find({e.topicId, e.partition});
                 r.offset = it == committedOffsets.end() ? -1 : it->second;
                 res.push_back(r);
@@ -1113,6 +1158,11 @@ private:
             rsp.correlationId = of->correlationId;
             std::vector<uint8_t> out(rp::OffsetFetchResponse::encodedSizeFor(res.size()));
             const std::size_t n = rsp.encode(out.data(), std::span<const rp::OffsetFetchResult>(res));
+            if (holdOffsetFetch) {
+                out.resize(n);
+                heldOffsetFetches.push_back(std::move(out));
+                return;
+            }
             send(0, out.data(), n);
             return;
         }
