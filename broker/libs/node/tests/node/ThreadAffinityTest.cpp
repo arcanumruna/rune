@@ -18,8 +18,10 @@ TEST(ThreadAffinity, EmptySetNeverPinsRegression) {
 // Pinned scope: a thread created inside inherits the set; the creator's mask is restored on exit.
 TEST(ThreadAffinity, ScopedPinIsInheritedAndRestoredRegression) {
     const std::vector<int32_t> before = currentThreadCpus();
-    ASSERT_FALSE(before.empty());
-    const std::vector<int32_t> target{before.front()};
+    // Review L4: with one allowed CPU the pin cannot change the mask (vacuous); pin to a CPU that does.
+    if (before.size() < 2) GTEST_SKIP() << "needs >= 2 allowed CPUs";
+    const std::vector<int32_t> target{before.back()};
+    ASSERT_NE(target, before);
     std::vector<int32_t> child;
     {
         ScopedThreadAffinity pin(target);

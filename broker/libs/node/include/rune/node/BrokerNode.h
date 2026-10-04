@@ -550,6 +550,11 @@ public:
         return gateway_.get();
     }
 
+    /// Test-only: the runtime thread's idle strategy (thread placement; nullptr before start / fused).
+    [[nodiscard]] const rune::consensus::IdleStrategy* runtimeIdleForTest() const noexcept { return idleStrategy_.get(); }
+    /// Test-only: the admin thread's idle strategy (nullptr when no admin worker).
+    [[nodiscard]] const rune::consensus::IdleStrategy* adminIdleForTest() const noexcept { return adminWorkerIdleStrategy_.get(); }
+
     /// Test-only: the node-level embedded driver (spec §3.6 one-pumper counters).
     EmbeddedDriver* driverForTest() const noexcept { return nodeDriver_.get(); }
 
@@ -892,7 +897,7 @@ private:
     // Task 8a: last leadership state posted to the admin role ring (control thread).
     bool                                                  adminLastLeader_ = false;
     int32_t                                               adminLastEpoch_  = -1;
-    rune::consensus::BackoffIdleStrategy                  adminWorkerIdleStrategy_;
+    std::unique_ptr<rune::consensus::BackoffIdleStrategy> adminWorkerIdleStrategy_;   // NodeConfig::adminIdleShape
     rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;
 

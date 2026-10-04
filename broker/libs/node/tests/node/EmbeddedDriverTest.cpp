@@ -211,3 +211,40 @@ TEST(EmbeddedDriverRegression, NonSparseTermsAreFullyAllocatedAtCreationRegressi
     EXPECT_LT(allocatedLogBufferBytes({}, /*sparse=*/true), full / 2)
         << "sparse terms stay unallocated until written (the default is unchanged)";
 }
+
+// D2 round 2: the node driver's idle SHAPE reaches Aeron — the init args are applied BEFORE the strategy (Aeron
+// builds the strategy's state from the args present at that call) — and a malformed shape or an unknown strategy
+// refuses construction (Aeron's setter fails and leaves a NULL idle function behind, which the driver thread would
+// call on its first idle pass).
+TEST(EmbeddedDriverRegression, IdleStrategyArgsReachAeronRegression) {
+    TmpDir d;
+    auto c = cfgAt(d.path);
+    c.idleStrategy     = "backoff";
+    c.idleStrategyArgs = "1-0-50000-1000000";
+    EmbeddedDriver drv(c, DriverMode::Threaded);
+    EXPECT_EQ(drv.idleStrategyArgsForTest(), "1-0-50000-1000000");
+    TmpDir d2;
+    auto none = cfgAt(d2.path);
+    none.idleStrategy = "backoff";   // no args: Aeron's own (env / built-in) shape, untouched
+    EmbeddedDriver plain(none, DriverMode::Threaded);
+    EXPECT_EQ(plain.idleStrategyArgsForTest(), std::string(std::getenv("AERON_SHARED_IDLE_STRATEGY_INIT_ARGS") != nullptr
+                                                               ? std::getenv("AERON_SHARED_IDLE_STRATEGY_INIT_ARGS") : ""));
+}
+
+TEST(EmbeddedDriverRegression, MalformedIdleStrategyRefusesStartRegression) {
+    TmpDir d;
+    auto bad = cfgAt(d.path);
+    bad.idleStrategy     = "backoff";
+    bad.idleStrategyArgs = "fast";
+    EXPECT_THROW(EmbeddedDriver(bad, DriverMode::Threaded), std::runtime_error);
+    TmpDir d2;
+    auto unknown = cfgAt(d2.path);
+    unknown.idleStrategy = "no-such-idle-strategy";
+    EXPECT_THROW(EmbeddedDriver(unknown, DriverMode::Threaded), std::runtime_error);
+    TmpDir d3;
+    auto dedicated = cfgAt(d3.path);
+    dedicated.threadingMode    = NodeConfig::AeronThreadingMode::Dedicated;
+    dedicated.idleStrategy     = "backoff";
+    dedicated.idleStrategyArgs = "fast";
+    EXPECT_THROW(EmbeddedDriver(dedicated, DriverMode::Threaded), std::runtime_error);
+}

@@ -362,12 +362,29 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     // co-located node's workers for the conventional layout (derived, or an explicit base equal to the derived
     // one — the bench harness passes RUNE_WORKER_CORE_BASE=1+i*W), else only this node's own (other nodes'
     // cores are unknown).  An explicit RUNE_NONWORKER_CORES keeps only CPUs this process may run on.
-    if (!cfg.nonWorkerCpus.empty() && !facts.allowedCpus.empty()) {
-        const auto outside = complementCpus(cfg.nonWorkerCpus, facts.allowedCpus);
-        if (!outside.empty()) {
-            cfg.nonWorkerCpus = complementCpus(cfg.nonWorkerCpus, outside);
-            appendWarn(out.warnings, std::string("RUNE_NONWORKER_CORES lists CPUs outside this process's allowed set — ") +
-                       (cfg.nonWorkerCpus.empty() ? "none usable, non-worker thread affinity left unchanged" : "ignoring those"));
+    // Review Md-1: the override needs PINNED workers (shard mode, workerCoreBase >= 0) — an unpinned worker
+    // never re-pins, so it would inherit the non-worker set created around it in start() for good.  With
+    // pinned workers this node's own worker cores are dropped from it (never the control plane on a worker).
+    if (!cfg.nonWorkerCpus.empty() && !(cfg.shardMode() && cfg.workerCoreBase >= 0)) {
+        cfg.nonWorkerCpus.clear();
+        appendWarn(out.warnings, "RUNE_NONWORKER_CORES ignored: the workers are not pinned (legacy mode, "
+                   "RUNE_WORKER_CORE_BASE=-1 or a multi-host layout) and would inherit that set");
+    } else if (!cfg.nonWorkerCpus.empty()) {
+        if (!facts.allowedCpus.empty()) {
+            const auto outside = complementCpus(cfg.nonWorkerCpus, facts.allowedCpus);
+            if (!outside.empty()) {
+                cfg.nonWorkerCpus = complementCpus(cfg.nonWorkerCpus, outside);
+                appendWarn(out.warnings, std::string("RUNE_NONWORKER_CORES lists CPUs outside this process's allowed set — ") +
+                           (cfg.nonWorkerCpus.empty() ? "none usable, non-worker thread affinity left unchanged" : "ignoring those"));
+            }
+        }
+        std::vector<int32_t> ownCores;
+        for (int32_t w = 0; w < W; ++w) ownCores.push_back(cfg.workerCoreBase + w);
+        const auto kept = complementCpus(cfg.nonWorkerCpus, ownCores);
+        if (kept.size() != cfg.nonWorkerCpus.size() && !cfg.nonWorkerCpus.empty()) {
+            cfg.nonWorkerCpus = kept;
+            appendWarn(out.warnings, std::string("RUNE_NONWORKER_CORES includes this node's worker core(s) — ") +
+                       (kept.empty() ? "none left, non-worker thread affinity left unchanged" : "dropping them"));
         }
     } else if (cfg.nonWorkerCpus.empty() && cfg.shardMode() && cfg.workerCoreBase >= 0 && !facts.allowedCpus.empty()) {
         int32_t selfIndex = 0;
@@ -400,14 +417,19 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     };
     const std::string ioWq = cpuList(cfg.ioWorkerCpus);
     const std::string nonWorker = cpuList(cfg.nonWorkerCpus);
-    const std::string drvIdle(cfg.effectiveDriverIdleStrategy());
-    char line[1024];
+    // D2 round 2: the node driver's idle + its Aeron args, and the control-plane (runtime / admin) park shape.
+    std::string drvIdle(cfg.effectiveDriverIdleStrategy());
+    if (const std::string a = cfg.effectiveDriverIdleArgs(); !a.empty()) drvIdle += "{" + a + "}";
+    const auto rt = cfg.runtimeIdleShape();
+    const std::string ctlIdle = std::to_string(rt.spins) + "-" + std::to_string(rt.yields) + "-" +
+                                std::to_string(rt.minParkNs / 1000) + "us-" + std::to_string(rt.maxParkNs / 1000) + "us";
+    char line[1536];
     std::snprintf(line, sizeof line,
-        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s nonWorker=%s drvIdle=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
+        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s nonWorker=%s drvIdle=%s ctlIdle=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
         "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
-        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(), nonWorker.c_str(), drvIdle.c_str(),
+        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(), nonWorker.c_str(), drvIdle.c_str(), ctlIdle.c_str(),
         cfg.aeronTermBufferBytes, cfg.aeronControlTermBufferBytes,
         static_cast<long long>(cfg.workerSyncIntervalMs), static_cast<long long>(cfg.followerFlushIntervalMs),
         cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,

@@ -193,6 +193,14 @@ BrokerNode::~BrokerNode() {
 // ---------------------------------------------------------------------------
 // BrokerNode::start
 // ---------------------------------------------------------------------------
+namespace {
+/// A backoff idle of the given shape (D2 round 2: control-plane threads).
+std::unique_ptr<rune::consensus::BackoffIdleStrategy> makeShapedBackoff(const NodeConfig::BackoffShape& s) {
+    return std::make_unique<rune::consensus::BackoffIdleStrategy>(
+        s.spins, s.yields, std::chrono::nanoseconds{s.minParkNs}, std::chrono::nanoseconds{s.maxParkNs});
+}
+} // namespace
+
 void BrokerNode::start() {
     if (started_) return; // idempotent (controller-owned flag, F9a)
     started_ = true;
@@ -2191,10 +2199,11 @@ void BrokerNode::buildGateway() {
         spdlog::info("BrokerNode[{}]: runtime idle strategy = BusySpin (low latency; core pegged)",
                      config_.nodeId);
     } else {
-        // Backoff with configurable maxPark (RUNE_IDLE_MAX_PARK_US, default 200µs):
-        // caps per-hop replication-round-trip wake latency without pegging the core
-        // (busyspin here starves consensus heartbeats → re-elections on shared cores).
-        idleStrategy_ = makeBackoffIdle(config_.idleMaxParkUs);
+        // Legacy: backoff with configurable maxPark (RUNE_IDLE_MAX_PARK_US, default 200µs) — caps per-hop
+        // replication-round-trip wake latency without pegging the core (busyspin here starves consensus
+        // heartbeats → re-elections on shared cores).  D2 round 2, shard mode: the runtime is control plane
+        // only — park without yields up to RUNE_CONTROL_IDLE_MAX_PARK_US (NodeConfig::runtimeIdleShape).
+        idleStrategy_ = makeShapedBackoff(config_.runtimeIdleShape());
     }
 
     // AgentRunner drives the NodeRuntimeAgent (consensus + gateway on ONE thread).
@@ -2617,8 +2626,10 @@ void BrokerNode::buildAdminWorker() {
             std::move(replicaSetIds), std::move(deps));
 
         // Dedicated thread (separate from gateway and produce workers).
+        // D2 round 2: shard mode parks without yields (NodeConfig::adminIdleShape); legacy: Agrona defaults.
+        adminWorkerIdleStrategy_ = makeShapedBackoff(config_.adminIdleShape());
         adminWorkerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
-            *adminWorkerAgent_, adminWorkerIdleStrategy_, adminWorkerClock_);
+            *adminWorkerAgent_, *adminWorkerIdleStrategy_, adminWorkerClock_);
 
         spdlog::info(
             "BrokerNode[{}]: __topic_schemas persistence + AdminWorker wired (dir={})",

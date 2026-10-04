@@ -40,6 +40,7 @@
 //
 // All Aeron channels use the aeron:udp transport (container transport).
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -265,6 +266,42 @@ struct NodeConfig {
     // core (backoff still sleeps → consensus heartbeats are not starved, unlike
     // busyspin which triggers re-elections on shared cores).
     int64_t idleMaxParkUs = 200;
+
+    // D2 round 2 — control-plane idle (shard mode).  The node driver thread, the runtime thread (thread
+    // placement) and the admin thread carry almost no traffic in shard mode, yet Aeron's backoff (10 spins,
+    // 20 yields, park 1 us doubling) re-armed on every heartbeat / status message: idle, the three nodes'
+    // control planes burned ~1 core on the 4-core box (node driver ~14% each: ~17k empty recvmmsg/s; runtime
+    // ~10-14% each: ~3k yields + 3.4k parks/s) and starved whatever shared their core.  Shard mode: no yields,
+    // park from kControlIdleMinParkUs doubling to controlIdleMaxParkUs (RUNE_CONTROL_IDLE_MAX_PARK_US).  The
+    // node driver spins ONCE (each Aeron spin is a whole duty cycle — a recvmmsg per socket, ~60-90 us).
+    // Measured idle on k3s-node-01 (node driver, Aeron backoff args): default 11.6% -> 1-0-50us-1ms 9.5%
+    // -> 1-0-100us-2ms 7% -> 1-0-250us-4ms 5.5% each; involuntary switches 2.9k/s -> ~1/s (no yields).
+    // A control message waits at most one park (<= 2 ms) — consensus timeouts are 100s of ms.  Legacy mode
+    // (the data path rides the runtime and the node driver) keeps its shapes.  Never busy-spin.
+    static constexpr int64_t kControlIdleMinParkUs        = 100;
+    static constexpr int64_t kControlIdleMaxParkUsDefault = 2000;
+    int64_t controlIdleMaxParkUs = kControlIdleMaxParkUsDefault;
+    /// A backoff idle shape: spin passes, yield passes, then park minParkNs doubling to maxParkNs.
+    struct BackoffShape {
+        int64_t spins     = 10;
+        int64_t yields    = 20;
+        int64_t minParkNs = 1'000;
+        int64_t maxParkNs = 1'000'000;
+        friend bool operator==(const BackoffShape&, const BackoffShape&) = default;
+    };
+    /// Shard mode: the control-plane park shape (10 spins — a runtime / admin pass touches no syscall).
+    [[nodiscard]] BackoffShape controlIdleShape() const noexcept {
+        const int64_t maxNs = controlIdleMaxParkUs * 1'000;
+        return BackoffShape{10, 0, std::min<int64_t>(kControlIdleMinParkUs * 1'000, maxNs), maxNs};
+    }
+    /// The runtime thread's idle (thread placement; RUNE_RUNTIME_IDLE=busyspin overrides).
+    [[nodiscard]] BackoffShape runtimeIdleShape() const noexcept {
+        return shardMode() ? controlIdleShape() : BackoffShape{10, 20, 1'000, idleMaxParkUs * 1'000};
+    }
+    /// The admin thread's idle.
+    [[nodiscard]] BackoffShape adminIdleShape() const noexcept {
+        return shardMode() ? controlIdleShape() : BackoffShape{};
+    }
 
     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
     // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
@@ -584,8 +621,9 @@ struct NodeConfig {
     // the active threading mode uses (RUNE_AERON_DRIVER_IDLE).
     //   Shared    mode: passed to aeron_driver_context_set_shared_idle_strategy.
     //   Dedicated mode: passed to conductor / sender / receiver idle setters.
-    // Any unrecognised value is passed through to Aeron (it will use its own
-    // default on error — safe degradation).
+    // An unrecognised value (or malformed RUNE_AERON_DRIVER_IDLE_ARGS) refuses the node
+    // driver's construction (D2 round 2: Aeron's failed setter left a NULL idle function —
+    // the driver thread aborted on its first idle pass).
     // D2: empty (DEFAULT) = derived — effectiveDriverIdleStrategy().
     std::string driverIdleStrategy;
     /// The node driver's idle strategy: RUNE_AERON_DRIVER_IDLE if set; else "backoff" in shard mode (the
@@ -596,6 +634,18 @@ struct NodeConfig {
     [[nodiscard]] std::string_view effectiveDriverIdleStrategy() const noexcept {
         if (!driverIdleStrategy.empty()) return driverIdleStrategy;
         return shardMode() ? std::string_view("backoff") : std::string_view("sleep-ns");
+    }
+    /// RUNE_AERON_DRIVER_IDLE_ARGS: Aeron idle-strategy init args for the node driver (backoff:
+    /// "spins-yields-minPark-maxPark", durations in ns or with a ns/us/ms/s suffix).  Empty = derived.
+    std::string driverIdleArgs;
+    /// The node driver's idle args: RUNE_AERON_DRIVER_IDLE_ARGS if set; else, for the DERIVED shard-mode
+    /// backoff, the control-plane shape with one spin pass ("1-0-<minParkNs>-<maxParkNs>"); else empty
+    /// (Aeron's own: AERON_*_IDLE_STRATEGY_INIT_ARGS or its built-in defaults).
+    [[nodiscard]] std::string effectiveDriverIdleArgs() const {
+        if (!driverIdleArgs.empty()) return driverIdleArgs;
+        if (!driverIdleStrategy.empty() || !shardMode()) return {};
+        const BackoffShape c = controlIdleShape();
+        return "1-0-" + std::to_string(c.minParkNs) + "-" + std::to_string(c.maxParkNs);
     }
 
     // E5.1.3: per-worker Aeron ingress flag.

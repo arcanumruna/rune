@@ -23,11 +23,31 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.receiverIoVector   = c.aeronReceiverIoVectorCapacity;
     e.threadingMode     = c.aeronThreadingMode;
     e.idleStrategy      = std::string(c.effectiveDriverIdleStrategy());
+    e.idleStrategyArgs  = c.effectiveDriverIdleArgs();
     e.endpointHosts     = nodeEndpointHosts(c);
     return e;
 }
 
+// Aeron C client internals (aeron_agent.h / aeron_alloc.h; linked into the driver library) — used only to
+// validate an idle strategy + args on a scratch state BEFORE handing them to the context.
+extern "C" {
+using rune_aeron_idle_func_t = void (*)(void*, int);
+rune_aeron_idle_func_t aeron_idle_strategy_load(const char* idle_strategy_name, void** idle_strategy_state,
+                                                const char* env_var, const char* init_args);
+void aeron_free(void* ptr);
+}
+
 namespace {
+/// D2 round 2: would Aeron accept this idle strategy + init args?  A failing context setter leaves freed
+/// pointers behind (aeron_driver_context_set_*_idle_strategy frees the old name/state before loading), so
+/// aeron_driver_context_close would double-free — validate on a scratch state first, then set.
+bool aeronIdleStrategyLoads(const char* name, const char* args) {
+    void* state = nullptr;
+    if (aeron_idle_strategy_load(name, &state, "RUNE_AERON_DRIVER_IDLE", args) == nullptr) return false;
+    aeron_free(state);
+    return true;
+}
+
 /// Resolve any kAeronAuto transport field (direct EmbeddedDriverConfig users;
 /// BrokerNode already passes concrete values).  Clamps explicit values that
 /// aeron_driver_init would reject (never EINVAL at init).
@@ -105,6 +125,19 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     }
     aeron_driver_context_set_dir(ctx_, cfg_.dir.c_str());
     const char* idle = cfg_.idleStrategy.c_str();
+    // D2 round 2: an idle strategy's state is built from the init args present when its setter runs — set
+    // the args FIRST.  Empty args = Aeron's own (AERON_*_IDLE_STRATEGY_INIT_ARGS env, else built-in).  A
+    // failed setter leaves Aeron a NULL idle function (the driver thread aborts on its first idle pass):
+    // refuse construction instead.
+    // Validated on a scratch state first: a failing context setter would leave freed pointers for
+    // aeron_driver_context_close to free again.
+    const char* idleArgs = cfg_.idleStrategyArgs.empty() ? nullptr : cfg_.idleStrategyArgs.c_str();
+    bool idleOk = mode_ == DriverMode::Invoker || aeronIdleStrategyLoads(idle, idleArgs);
+    const auto setIdle = [&](auto setArgs, auto setStrategy) {
+        if (!idleOk) return;
+        if (idleArgs != nullptr) idleOk = setArgs(ctx_, idleArgs) == 0;
+        idleOk = idleOk && setStrategy(ctx_, idle) == 0;
+    };
     if (mode_ == DriverMode::Invoker) {
         // INVOKER: SHARED runner layout, manual main loop REQUIRED, no agent thread
         // (aeron_driver.c:939-956, 1046-1082).  DEDICATED / SHARED_NETWORK would still
@@ -112,12 +145,20 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_INVOKER);
     } else if (cfg_.threadingMode == NodeConfig::AeronThreadingMode::Dedicated) {
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_DEDICATED);
-        aeron_driver_context_set_conductor_idle_strategy(ctx_, idle);
-        aeron_driver_context_set_sender_idle_strategy(ctx_, idle);
-        aeron_driver_context_set_receiver_idle_strategy(ctx_, idle);
+        setIdle(aeron_driver_context_set_conductor_idle_strategy_init_args, aeron_driver_context_set_conductor_idle_strategy);
+        setIdle(aeron_driver_context_set_sender_idle_strategy_init_args, aeron_driver_context_set_sender_idle_strategy);
+        setIdle(aeron_driver_context_set_receiver_idle_strategy_init_args, aeron_driver_context_set_receiver_idle_strategy);
     } else {
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_shared_idle_strategy(ctx_, idle);
+        setIdle(aeron_driver_context_set_shared_idle_strategy_init_args, aeron_driver_context_set_shared_idle_strategy);
+    }
+    if (!idleOk) {
+        const std::string why = aeron_errmsg();
+        aeron_driver_context_close(ctx_);
+        ctx_ = nullptr;
+        throw std::runtime_error("EmbeddedDriver: driver idle strategy '" + cfg_.idleStrategy + "' with args '" +
+                                 cfg_.idleStrategyArgs + "' refused by Aeron (RUNE_AERON_DRIVER_IDLE / "
+                                 "RUNE_AERON_DRIVER_IDLE_ARGS): " + why);
     }
     if (cfg_.clientLivenessTimeoutNs > 0)
         aeron_driver_context_set_client_liveness_timeout_ns(ctx_, static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
@@ -196,6 +237,14 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     spdlog::warn("EmbeddedDriver[{}]: udp mtu={} gso={} gro={} msgsPerSend={}", cfg_.dir, cfg_.mtuBytes,
                  udpGsoActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"),
                  udpGroActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_);
+}
+
+std::string EmbeddedDriver::idleStrategyArgsForTest() const {
+    if (ctx_ == nullptr) return {};
+    const char* a = cfg_.threadingMode == NodeConfig::AeronThreadingMode::Dedicated
+                        ? aeron_driver_context_get_conductor_idle_strategy_init_args(ctx_)
+                        : aeron_driver_context_get_shared_idle_strategy_init_args(ctx_);
+    return a != nullptr ? std::string(a) : std::string();
 }
 
 int EmbeddedDriver::doWork() noexcept {

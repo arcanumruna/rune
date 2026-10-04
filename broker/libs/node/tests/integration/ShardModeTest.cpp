@@ -5,8 +5,11 @@
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 
+#include <rune/consensus/IdleStrategy.h>
 #include <rune/node/BrokerNode.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/ThreadAffinity.h>
 #include <rune/metadata/StaticBalancer.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
@@ -19,6 +22,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <map>
 #include <memory>
 #include <set>
@@ -274,6 +279,115 @@ TEST(ShardModeRegression, FusedThreeNodeAcksAllCommitsRegression) {
     int atLeast20 = 0;
     for (const auto* d : {&d0, &d1, &d2}) atLeast20 += logEndOffsetAfterStop(d->path) >= 20 ? 1 : 0;
     EXPECT_GE(atLeast20, 2) << "every acked record must be on a majority";
+}
+
+#if defined(__linux__)
+namespace {
+/// "0-2,5" -> {0,1,2,5} (a /proc Cpus_allowed_list).
+std::vector<int32_t> parseCpuList(const std::string& s) {
+    std::vector<int32_t> out;
+    std::stringstream ss(s);
+    std::string part;
+    while (std::getline(ss, part, ',')) {
+        if (part.empty()) continue;
+        const auto dash = part.find('-');
+        const int lo = std::stoi(part.substr(0, dash));
+        const int hi = dash == std::string::npos ? lo : std::stoi(part.substr(dash + 1));
+        for (int c = lo; c <= hi; ++c) out.push_back(c);
+    }
+    return out;
+}
+struct TaskAffinity { std::string comm; std::vector<int32_t> cpus; };
+/// Every thread of this process: tid -> (comm, allowed CPUs).  Threads that exit mid-scan are skipped.
+std::map<std::string, TaskAffinity> scanTasks() {
+    std::map<std::string, TaskAffinity> out;
+    for (const auto& e : fs::directory_iterator("/proc/self/task")) {
+        std::ifstream comm(e.path() / "comm"), status(e.path() / "status");
+        TaskAffinity t;
+        if (!std::getline(comm, t.comm)) continue;
+        std::string line;
+        bool found = false;
+        while (std::getline(status, line))
+            if (line.rfind("Cpus_allowed_list:", 0) == 0) {
+                t.cpus = parseCpuList(line.substr(line.find_first_not_of(" \t", 18)));
+                found = true;
+            }
+        if (found) out[e.path().filename().string()] = std::move(t);
+    }
+    return out;
+}
+} // namespace
+
+// D2 review Md-3: the wiring, end to end on a real broker — BrokerNode::start applies the derived /
+// explicit non-worker set to EVERY thread it creates (node driver, Aeron conductor, runtime, admin,
+// cleaner, ...), each worker ends up on exactly its own core, and the caller's mask is restored.
+// Before this test only a manual /proc reading on the bench box proved it.
+TEST(ShardModeRegression, NonWorkerThreadsPinnedOffTheWorkerCoresRegression) {
+    const std::vector<int32_t> allowed = currentThreadCpus();
+    if (allowed.size() < 2) GTEST_SKIP() << "needs >= 2 allowed CPUs (one worker, one non-worker)";
+    TmpDir dir{"affin"};
+    const auto ports = ShardPorts::discover(1, 1);
+    auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    cfg.workerCoreBase = allowed.back();
+    cfg.nonWorkerCpus  = {allowed.front()};
+    std::set<std::string> preexisting;
+    for (const auto& [tid, t] : scanTasks()) preexisting.insert(tid);
+
+    BrokerNode node{cfg};
+    node.start();
+    EXPECT_EQ(currentThreadCpus(), allowed) << "start() must restore the caller's mask";
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    // Runs on worker 0 (owner of st/0) after its pass prologue re-pinned it.
+    const auto workerCpus = node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica&) {
+        return currentThreadCpus();
+    });
+    EXPECT_EQ(workerCpus, std::vector<int32_t>{allowed.back()}) << "the worker runs on exactly its own core";
+
+    std::set<std::string> named;
+    int brokerThreads = 0;
+    for (const auto& [tid, t] : scanTasks()) {
+        if (preexisting.count(tid) != 0) continue;
+        if (t.comm.rfind("iou-", 0) == 0) continue;   // io_uring kernel workers: A4's ioWq placement
+        ++brokerThreads;
+        named.insert(t.comm);
+        if (t.comm.rfind("rune-wrk-", 0) == 0)
+            EXPECT_EQ(t.cpus, std::vector<int32_t>{allowed.back()}) << "worker tid " << tid;
+        else
+            EXPECT_EQ(t.cpus, std::vector<int32_t>{allowed.front()}) << t.comm << " tid " << tid
+                << " must run on the non-worker set";
+    }
+    EXPECT_GE(brokerThreads, 4) << "driver + runtime + admin + worker at least";
+    for (const char* n : {"rune-runtime", "rune-admin", "rune-wrk-0"})
+        EXPECT_EQ(named.count(n), 1u) << n << " not found among the broker's threads";
+    node.stop();
+}
+#endif
+
+// D2 round 2: the control-plane threads of a thread-placement shard broker idle with the shard-mode park shape
+// (no yields; NodeConfig::controlIdleShape) — runtime and admin AgentRunners, and the threaded node driver's Aeron
+// backoff args.  Before: Aeron/Agrona's 10 spins + 20 yields + 1 us doubling park on all three (~1 core idle for
+// three co-located nodes on the 4-core box).
+TEST(ShardModeRegression, ControlPlaneThreadsUseTheParkShapeRegression) {
+    TmpDir dir{"ctlidle"};
+    const auto ports = ShardPorts::discover(1, 1);
+    const auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    const auto shapeOf = [](const rune::consensus::IdleStrategy* i) {
+        const auto* b = dynamic_cast<const rune::consensus::BackoffIdleStrategy*>(i);
+        EXPECT_NE(b, nullptr) << "a backoff idle (never busy-spin by default)";
+        return b == nullptr ? NodeConfig::BackoffShape{}
+                            : NodeConfig::BackoffShape{b->maxSpins(), b->maxYields(), b->minParkNs(), b->maxParkNs()};
+    };
+    const NodeConfig::BackoffShape want{10, 0, NodeConfig::kControlIdleMinParkUs * 1000,
+                                        NodeConfig::kControlIdleMaxParkUsDefault * 1000};
+    EXPECT_EQ(shapeOf(node.runtimeIdleForTest()), want) << "runtime thread";
+    EXPECT_EQ(shapeOf(node.adminIdleForTest()), want) << "admin thread";
+    ASSERT_NE(node.driverForTest(), nullptr);
+    EXPECT_EQ(node.driverForTest()->idleStrategyArgsForTest(),
+              "1-0-" + std::to_string(want.minParkNs) + "-" + std::to_string(want.maxParkNs)) << "node driver";
+    node.stop();
 }
 
 TEST(ShardModeRegression, LegacyDefaultBuildsNoShardRuntime) {

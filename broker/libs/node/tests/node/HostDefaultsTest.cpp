@@ -899,3 +899,48 @@ TEST(HostDefaults, NonWorkerEmptyComplementWarnsAndLeavesAffinityRegression) {
     ASSERT_NE(first, std::string::npos) << hd.warnings;
     EXPECT_EQ(hd.warnings.find("non-worker", first + 1), std::string::npos) << "warned once: " << hd.warnings;
 }
+
+// D2 review Md-1: RUNE_NONWORKER_CORES was honoured with UNPINNED workers (multi-host, explicit base -1,
+// legacy mode).  Workers re-pin only when they have a core, so every worker created inside start()'s scope
+// kept the non-worker set for good (all workers on core 0, no warning).  Now: ignored + warned unless the
+// workers are pinned (shard mode, workerCoreBase >= 0); with pinned workers this node's own worker cores are
+// dropped from the override (warned) — the control plane never lands on a worker core.
+TEST(HostDefaultsRegression, NonWorkerOverrideIgnoredUnlessWorkersPinnedRegression) {
+    NodeConfig unpinned = threeNodeDefault(0);
+    unpinned.workerCoreBase = -1;
+    unpinned.nonWorkerCpus  = {0};
+    const auto hu = applyHostDerivedDefaults(unpinned, k3sFacts());
+    EXPECT_TRUE(unpinned.nonWorkerCpus.empty()) << "unpinned workers would inherit the override";
+    EXPECT_NE(hu.warnings.find("RUNE_NONWORKER_CORES ignored"), std::string::npos) << hu.warnings;
+    EXPECT_NE(hu.summary.find("nonWorker=inherit "), std::string::npos) << hu.summary;
+
+    NodeConfig legacy = threeNodeDefault(0);
+    legacy.workerMode    = NodeConfig::WorkerMode::Legacy;
+    legacy.nonWorkerCpus = {0};
+    const auto hl = applyHostDerivedDefaults(legacy, k3sFacts());
+    EXPECT_TRUE(legacy.nonWorkerCpus.empty()) << "legacy workers never re-pin";
+    EXPECT_NE(hl.warnings.find("RUNE_NONWORKER_CORES ignored"), std::string::npos) << hl.warnings;
+
+    NodeConfig overlap = threeNodeDefault(0);   // pinned: derived base 1 (W=1)
+    overlap.nonWorkerCpus = {0, 1};
+    const auto ho = applyHostDerivedDefaults(overlap, k3sFacts());
+    ASSERT_EQ(overlap.workerCoreBase, 1);
+    EXPECT_EQ(overlap.nonWorkerCpus, std::vector<int32_t>{0}) << "own worker core dropped from the override";
+    EXPECT_NE(ho.warnings.find("worker core"), std::string::npos) << ho.warnings;
+
+    NodeConfig pinned = threeNodeDefault(1);    // pinned + disjoint override: honoured verbatim, no warning
+    pinned.nonWorkerCpus = {0};
+    const auto hp = applyHostDerivedDefaults(pinned, k3sFacts());
+    EXPECT_EQ(pinned.nonWorkerCpus, std::vector<int32_t>{0});
+    EXPECT_EQ(hp.warnings.find("RUNE_NONWORKER_CORES"), std::string::npos) << hp.warnings;
+}
+
+// D2 round 2: the effective-config line proves the control-plane idle a measurement ran with.
+TEST(HostDefaults, EffectiveConfigNamesTheControlPlaneIdleRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    c.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.summary.find("drvIdle=backoff{1-0-100000-2000000} ctlIdle=10-0-100us-2000us "), std::string::npos)
+        << hd.summary;
+    EXPECT_NE(hd.summary.find("derived={"), std::string::npos) << "line not truncated: " << hd.summary;
+}

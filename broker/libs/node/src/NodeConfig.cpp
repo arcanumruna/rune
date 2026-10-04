@@ -1173,6 +1173,17 @@ ConfigResult parseNodeConfig(
         }
     }
     // Absent → empty (derived).
+    // D2 round 2: the node driver's idle init args (Aeron syntax; refused at driver start if malformed).
+    if (const char* ada = getenv_fn("RUNE_AERON_DRIVER_IDLE_ARGS"); ada && *ada) cfg.driverIdleArgs = ada;
+    // D2 round 2: the shard-mode control-plane park cap (node driver, runtime thread, admin thread).
+    if (const char* raw = getenv_fn("RUNE_CONTROL_IDLE_MAX_PARK_US"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end == raw || *end != '\0' || v < 1 || v > 1'000'000)
+            return {{}, std::string("RUNE_CONTROL_IDLE_MAX_PARK_US must be an integer in [1, 1000000] us, got '") +
+                            raw + "'"};
+        cfg.controlIdleMaxParkUs = v;
+    }
 
     // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
     // Follower periodic-fetch backstop cadence.  Lower = faster acks=all

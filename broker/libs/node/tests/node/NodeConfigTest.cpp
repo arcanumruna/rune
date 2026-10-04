@@ -2471,3 +2471,52 @@ TEST(NodeConfig, NonWorkerCoresEnvParsesACpuListRegression) {
     env["RUNE_NONWORKER_CORES"] = "core0";
     EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
 }
+
+// D2 round 2 (thread placement, 4-core box): the three nodes' control planes share core 0 and burned ~1 core
+// IDLE — node driver ~14% each (Aeron backoff: every heartbeat / status message re-arms 10 spin + 20 yield duty
+// cycles, each a recvmmsg per socket: ~17k empty recvmmsg/s), runtime ~10-14% each (10 spins, 20 yields, 1 us
+// doubling park: ~3k yields + 3.4k parks/s).  Shard mode: control-plane threads park without yielding, from
+// kControlIdleMinParkUs doubling to RUNE_CONTROL_IDLE_MAX_PARK_US; the node driver spins once (one spin = one full
+// duty cycle).  Legacy mode (data path on the runtime / node driver) is unchanged.  Never busy-spin.
+TEST(NodeConfig, ControlPlaneIdleParksWithoutYieldsInShardModeRegression) {
+    using Shape = rune::node::NodeConfig::BackoffShape;
+    using NC    = rune::node::NodeConfig;
+    const auto parse = [](const std::map<std::string, std::string>& env) {
+        auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+        EXPECT_TRUE(r.config.has_value()) << r.error;
+        return r.config.value_or(NC{});
+    };
+    const int64_t minNs = NC::kControlIdleMinParkUs * 1000, maxNs = NC::kControlIdleMaxParkUsDefault * 1000;
+    const std::string args = "1-0-" + std::to_string(minNs) + "-" + std::to_string(maxNs);
+    const NC s = parse(rune::node::base1node());
+    ASSERT_TRUE(s.shardMode());
+    EXPECT_EQ(s.runtimeIdleShape(), (Shape{10, 0, minNs, maxNs}));
+    EXPECT_EQ(s.adminIdleShape(), (Shape{10, 0, minNs, maxNs}));
+    EXPECT_EQ(s.effectiveDriverIdleArgs(), args);
+    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(s, "/tmp/x").idleStrategyArgs, args);
+
+    auto cap = rune::node::base1node();
+    cap["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "4000";
+    EXPECT_EQ(parse(cap).runtimeIdleShape(), (Shape{10, 0, minNs, 4'000'000}));
+    EXPECT_EQ(parse(cap).effectiveDriverIdleArgs(), "1-0-" + std::to_string(minNs) + "-4000000");
+    cap["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "20";   // below the min park: min = max
+    EXPECT_EQ(parse(cap).runtimeIdleShape(), (Shape{10, 0, 20'000, 20'000}));
+    for (const char* bad : {"0", "-5", "fast", "10ms"}) {
+        cap["RUNE_CONTROL_IDLE_MAX_PARK_US"] = bad;
+        EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(cap)).config.has_value()) << bad;
+    }
+
+    auto strat = rune::node::base1node();
+    strat["RUNE_AERON_DRIVER_IDLE"] = "sleep-ns";
+    EXPECT_EQ(parse(strat).effectiveDriverIdleArgs(), "") << "an explicit strategy keeps Aeron's own args";
+    strat["RUNE_AERON_DRIVER_IDLE_ARGS"] = "2-1-10us-2ms";
+    EXPECT_EQ(parse(strat).effectiveDriverIdleArgs(), "2-1-10us-2ms") << "explicit args win";
+
+    auto legacy = rune::node::base1node();
+    legacy["RUNE_WORKER_MODE"] = "legacy";
+    const NC l = parse(legacy);
+    ASSERT_FALSE(l.shardMode());
+    EXPECT_EQ(l.runtimeIdleShape(), (Shape{10, 20, 1'000, l.idleMaxParkUs * 1000})) << "legacy: unchanged";
+    EXPECT_EQ(l.adminIdleShape(), (Shape{10, 20, 1'000, 1'000'000})) << "legacy: Agrona defaults, unchanged";
+    EXPECT_EQ(l.effectiveDriverIdleArgs(), "");
+}

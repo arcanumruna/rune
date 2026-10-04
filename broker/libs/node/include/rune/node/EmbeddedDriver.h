@@ -61,6 +61,9 @@ struct EmbeddedDriverConfig {
     int32_t     receiverIoVector   = 0;      ///< 0 = Aeron default
     NodeConfig::AeronThreadingMode threadingMode = NodeConfig::AeronThreadingMode::Shared;
     std::string idleStrategy      = "sleep-ns";
+    /// Aeron init args for `idleStrategy` (e.g. backoff "1-0-50000-1000000").  Empty = Aeron's own
+    /// (AERON_*_IDLE_STRATEGY_INIT_ARGS env or built-in defaults).  Threaded mode only (invoker: no idle loop).
+    std::string idleStrategyArgs;
     bool        deleteDirOnShutdown = true;
     /// 0 = Aeron default (10 s).  Also the invoker client's inter-service timeout
     /// (read from CnC).  Must exceed the driver timer interval (1 s).  Test-only
@@ -123,6 +126,8 @@ public:
     [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { drainMisuse_(); return foreignPumps_; }
     [[nodiscard]] uint64_t foreignCloseAttempts() const noexcept { drainMisuse_(); return foreignCloses_; }
     [[nodiscard]] uint64_t callerPumpsWhileThreadRunning() const noexcept { drainMisuse_(); return callerPumpsWhileRunning_; }
+    /// Test-only: the idle-strategy init args Aeron holds for this driver's idle loop (shared or conductor).
+    [[nodiscard]] std::string idleStrategyArgsForTest() const;
 
 private:
     static int pumpTrampoline_(void* self) noexcept;   // AeronPump::kRefused off the pump thread
