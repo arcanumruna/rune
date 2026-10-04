@@ -39,14 +39,22 @@ public:
         int64_t maxYields = 20,
         std::chrono::nanoseconds minPark = std::chrono::microseconds{1},
         std::chrono::nanoseconds maxPark = std::chrono::milliseconds{1})
-        : inner_{maxSpins, maxYields, minPark, maxPark}
+        : inner_{maxSpins, maxYields, minPark, maxPark},
+          maxSpins_(maxSpins), maxYields_(maxYields), minParkNs_(minPark.count()), maxParkNs_(maxPark.count())
     {}
 
     void idle(int workCount) override { inner_.idle(workCount); }
     void reset()             override { inner_.reset(); }
 
+    /// The configured shape (startup proof / tests).
+    [[nodiscard]] int64_t maxSpins()  const noexcept { return maxSpins_; }
+    [[nodiscard]] int64_t maxYields() const noexcept { return maxYields_; }
+    [[nodiscard]] int64_t minParkNs() const noexcept { return minParkNs_; }
+    [[nodiscard]] int64_t maxParkNs() const noexcept { return maxParkNs_; }
+
 private:
     aeron::concurrent::BackoffIdleStrategy inner_;
+    int64_t maxSpins_, maxYields_, minParkNs_, maxParkNs_;
 };
 
 // ---------------------------------------------------------------------------

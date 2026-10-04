@@ -986,6 +986,11 @@ ConfigResult parseNodeConfig(
         if (!cpus) return {{}, std::string("RUNE_IOWQ_CORES must be a cpu list like 0,4-5, got '") + raw + "'"};
         cfg.ioWorkerCpus = std::move(*cpus);
     }
+    if (const char* raw = getenv_fn("RUNE_NONWORKER_CORES"); raw && *raw) {
+        auto cpus = parseCpuList(raw);
+        if (!cpus) return {{}, std::string("RUNE_NONWORKER_CORES must be a cpu list like 0,4-5, got '") + raw + "'"};
+        cfg.nonWorkerCpus = std::move(*cpus);
+    }
     for (auto [name, field] : {std::pair{"RUNE_WORKER_SYNC_INTERVAL_MS", &cfg.workerSyncIntervalMs},
                                std::pair{"RUNE_FOLLOWER_FLUSH_INTERVAL_MS", &cfg.followerFlushIntervalMs}}) {
         if (const char* raw = getenv_fn(name); raw && *raw) {
@@ -1158,15 +1163,40 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (Shared).
 
-    // --- RUNE_AERON_DRIVER_IDLE (optional, default "sleep-ns") — E5.2 ---
+    // --- RUNE_AERON_DRIVER_IDLE (optional) — E5.2 ---
     // Passed to the Aeron idle-strategy setter(s) for the active threading mode.
-    // Default "sleep-ns" is byte-identical to today's hard-coded value.
+    // Unset = derived (D2): backoff in shard mode, sleep-ns in legacy —
+    // NodeConfig::effectiveDriverIdleStrategy().
     if (const char* adi = getenv_fn("RUNE_AERON_DRIVER_IDLE")) {
         if (adi && !std::string_view(adi).empty()) {
             cfg.driverIdleStrategy = std::string(adi);
         }
     }
-    // Absent → keep NodeConfig default ("sleep-ns").
+    // Absent → empty (derived).
+    // D2 round 2: the node driver's idle init args (Aeron syntax; refused at driver start if malformed).
+    if (const char* ada = getenv_fn("RUNE_AERON_DRIVER_IDLE_ARGS"); ada && *ada) cfg.driverIdleArgs = ada;
+    // D2 round 2: the shard-mode control-plane park cap (node driver, runtime thread, admin thread).
+    if (const char* raw = getenv_fn("RUNE_CONTROL_IDLE_MAX_PARK_US"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end == raw || *end != '\0' || v < 1 || v > 1'000'000)
+            return {{}, std::string("RUNE_CONTROL_IDLE_MAX_PARK_US must be an integer in [1, 1000000] us, got '") +
+                            raw + "'"};
+        cfg.controlIdleMaxParkUs = v;
+    }
+    {   // D2 round-2 review R2-Md-1: the park cap must stay well inside the election cadence, or an idle leader's
+        // heartbeats slip into endless leadership churn.  Limit = 1/4 of the election status interval: an explicit
+        // larger cap is refused; the default is clamped (so lowering only the interval never refuses a default).
+        const int64_t limitUs = std::max<int64_t>(1, cfg.electionStatusIntervalMs * 1000 / 4);
+        if (cfg.controlIdleMaxParkUs > limitUs) {
+            const char* raw = getenv_fn("RUNE_CONTROL_IDLE_MAX_PARK_US");
+            if (raw && *raw)
+                return {{}, "RUNE_CONTROL_IDLE_MAX_PARK_US=" + std::string(raw) + " us exceeds 1/4 of "
+                            "RUNE_ELECTION_STATUS_INTERVAL_MS (" + std::to_string(cfg.electionStatusIntervalMs) +
+                            " ms -> max " + std::to_string(limitUs) + " us): heartbeats would miss the election cadence"};
+            cfg.controlIdleMaxParkUs = limitUs;
+        }
+    }
 
     // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
     // Follower periodic-fetch backstop cadence.  Lower = faster acks=all

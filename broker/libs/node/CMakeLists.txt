@@ -103,6 +103,7 @@ if(BUILD_TESTING)
         tests/node/SignalControlTest.cpp
         tests/node/LeaderObserverTest.cpp
         tests/node/OwnerThreadTestTaskTest.cpp
+        tests/node/ThreadAffinityTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node

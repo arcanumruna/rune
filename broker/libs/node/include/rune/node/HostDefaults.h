@@ -149,6 +149,10 @@ inline constexpr int32_t kDerivedShardPortStride = 3 * NodeConfig::kMaxShardWork
                                            int32_t nodes, int32_t workers,
                                            const std::vector<int32_t>& allowedCpus) noexcept;
 
+/// `allowed` minus `excluded`, sorted (D2: the CPUs left for non-worker threads).  PURE.
+[[nodiscard]] std::vector<int32_t> complementCpus(const std::vector<int32_t>& allowed,
+                                                  const std::vector<int32_t>& excluded);
+
 /// Non-sparse terms only on tmpfs (see header).  `explicitSparse` wins.
 [[nodiscard]] constexpr bool deriveTermSparse(std::optional<bool> explicitSparse, bool aeronDirTmpfs) noexcept {
     return explicitSparse ? *explicitSparse : !aeronDirTmpfs;

@@ -1,5 +1,6 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/node/HostDefaults.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>   // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <filesystem>
@@ -1714,11 +1715,11 @@ TEST(NodeConfig, ParsesAeronThreadingMode_GarbageFloorsToShared) {
 }
 
 TEST(NodeConfig, ParsesAeronDriverIdleDefault) {
-    // No RUNE_AERON_DRIVER_IDLE set → must default to "sleep-ns".
+    // No RUNE_AERON_DRIVER_IDLE set → empty (= derived: backoff in shard mode, sleep-ns in legacy;
+    // D2, NodeDriverIdleDefaultsToBackoffInShardModeRegression).
     auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
     ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->driverIdleStrategy, "sleep-ns")
-        << "default driverIdleStrategy must be 'sleep-ns' (byte-identical to prior hard-code)";
+    EXPECT_TRUE(res.config->driverIdleStrategy.empty()) << "unset = derived";
 }
 
 TEST(NodeConfig, ParsesAeronDriverIdleOverride) {
@@ -2436,4 +2437,98 @@ TEST(NodeConfig, IoWorkerCoresEnvParsesACpuList) {
     EXPECT_EQ(r.config->ioWorkerCpus, (std::vector<int32_t>{0, 2}));
     env["RUNE_IOWQ_CORES"] = "zero";
     EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
+}
+
+// D2: in shard mode the node driver carries only control-plane traffic (consensus, gateway/metadata,
+// coordinators); "sleep-ns" with Aeron's tiny default sleep effectively polls (~45% CPU per node on the
+// 4-core box).  Default = Aeron's backoff (spin, yield, park up to 1 ms) — never busy-spin.  Legacy mode
+// (data path on that driver) keeps sleep-ns; RUNE_AERON_DRIVER_IDLE still overrides both.
+TEST(NodeConfig, NodeDriverIdleDefaultsToBackoffInShardModeRegression) {
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(rune::node::base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    ASSERT_TRUE(res.config->shardMode());
+    EXPECT_EQ(res.config->effectiveDriverIdleStrategy(), "backoff");
+    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(*res.config, "/tmp/x").idleStrategy, "backoff");
+    auto legacy = rune::node::base1node();
+    legacy["RUNE_WORKER_MODE"] = "legacy";
+    auto rl = rune::node::parseNodeConfig(rune::node::fakeEnv(legacy));
+    ASSERT_TRUE(rl.config.has_value()) << rl.error;
+    ASSERT_FALSE(rl.config->shardMode());
+    EXPECT_EQ(rl.config->effectiveDriverIdleStrategy(), "sleep-ns");
+    auto ov = rune::node::base1node();
+    ov["RUNE_AERON_DRIVER_IDLE"] = "sleep-ns";
+    auto ro = rune::node::parseNodeConfig(rune::node::fakeEnv(ov));
+    ASSERT_TRUE(ro.config.has_value()) << ro.error;
+    EXPECT_EQ(ro.config->effectiveDriverIdleStrategy(), "sleep-ns") << "the override wins in shard mode";
+}
+
+TEST(NodeConfig, NonWorkerCoresEnvParsesACpuListRegression) {
+    auto env = rune::node::base1node();
+    env["RUNE_NONWORKER_CORES"] = "0,4-5";
+    auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->nonWorkerCpus, (std::vector<int32_t>{0, 4, 5}));
+    env["RUNE_NONWORKER_CORES"] = "core0";
+    EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
+}
+
+// D2 round 2 (thread placement, 4-core box): the three nodes' control planes share core 0 and burned ~1 core
+// IDLE — node driver ~14% each (Aeron backoff: every heartbeat / status message re-arms 10 spin + 20 yield duty
+// cycles, each a recvmmsg per socket: ~17k empty recvmmsg/s), runtime ~10-14% each (10 spins, 20 yields, 1 us
+// doubling park: ~3k yields + 3.4k parks/s).  Shard mode: control-plane threads park without yielding, from
+// kControlIdleMinParkUs doubling to RUNE_CONTROL_IDLE_MAX_PARK_US; the node driver spins once (one spin = one full
+// duty cycle).  Legacy mode (data path on the runtime / node driver) is unchanged.  Never busy-spin.
+TEST(NodeConfig, ControlPlaneIdleParksWithoutYieldsInShardModeRegression) {
+    using Shape = rune::node::NodeConfig::BackoffShape;
+    using NC    = rune::node::NodeConfig;
+    const auto parse = [](const std::map<std::string, std::string>& env) {
+        auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+        EXPECT_TRUE(r.config.has_value()) << r.error;
+        return r.config.value_or(NC{});
+    };
+    const int64_t minNs = NC::kControlIdleMinParkUs * 1000, maxNs = NC::kControlIdleMaxParkUsDefault * 1000;
+    const std::string args = "1-0-" + std::to_string(minNs) + "-" + std::to_string(maxNs);
+    const NC s = parse(rune::node::base1node());
+    ASSERT_TRUE(s.shardMode());
+    EXPECT_EQ(s.runtimeIdleShape(), (Shape{10, 0, minNs, maxNs}));
+    EXPECT_EQ(s.adminIdleShape(), (Shape{10, 0, minNs, maxNs}));
+    EXPECT_EQ(s.effectiveDriverIdleArgs(), args);
+    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(s, "/tmp/x").idleStrategyArgs, args);
+
+    auto cap = rune::node::base1node();
+    cap["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "4000";
+    EXPECT_EQ(parse(cap).runtimeIdleShape(), (Shape{10, 0, minNs, 4'000'000}));
+    EXPECT_EQ(parse(cap).effectiveDriverIdleArgs(), "1-0-" + std::to_string(minNs) + "-4000000");
+    cap["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "20";   // below the min park: min = max
+    EXPECT_EQ(parse(cap).runtimeIdleShape(), (Shape{10, 0, 20'000, 20'000}));
+    for (const char* bad : {"0", "-5", "fast", "10ms"}) {
+        cap["RUNE_CONTROL_IDLE_MAX_PARK_US"] = bad;
+        EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(cap)).config.has_value()) << bad;
+    }
+
+    // D2 round-2 review R2-Md-1: a park cap near the election cadence would delay an idle leader's heartbeats
+    // into endless leadership churn — refuse anything above a quarter of RUNE_ELECTION_STATUS_INTERVAL_MS.
+    auto churn = rune::node::base1node();                       // default status interval 20 ms -> cap <= 5000 us
+    churn["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "5000";
+    EXPECT_TRUE(rune::node::parseNodeConfig(rune::node::fakeEnv(churn)).config.has_value());
+    churn["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "100000";
+    auto rc = rune::node::parseNodeConfig(rune::node::fakeEnv(churn));
+    EXPECT_FALSE(rc.config.has_value()) << "100 ms park vs 20 ms election status interval must be refused";
+    EXPECT_NE(rc.error.find("RUNE_ELECTION_STATUS_INTERVAL_MS"), std::string::npos) << rc.error;
+    churn["RUNE_ELECTION_STATUS_INTERVAL_MS"] = "500";           // a slower cadence admits the larger cap
+    EXPECT_TRUE(rune::node::parseNodeConfig(rune::node::fakeEnv(churn)).config.has_value());
+
+    auto strat = rune::node::base1node();
+    strat["RUNE_AERON_DRIVER_IDLE"] = "sleep-ns";
+    EXPECT_EQ(parse(strat).effectiveDriverIdleArgs(), "") << "an explicit strategy keeps Aeron's own args";
+    strat["RUNE_AERON_DRIVER_IDLE_ARGS"] = "2-1-10us-2ms";
+    EXPECT_EQ(parse(strat).effectiveDriverIdleArgs(), "2-1-10us-2ms") << "explicit args win";
+
+    auto legacy = rune::node::base1node();
+    legacy["RUNE_WORKER_MODE"] = "legacy";
+    const NC l = parse(legacy);
+    ASSERT_FALSE(l.shardMode());
+    EXPECT_EQ(l.runtimeIdleShape(), (Shape{10, 20, 1'000, l.idleMaxParkUs * 1000})) << "legacy: unchanged";
+    EXPECT_EQ(l.adminIdleShape(), (Shape{10, 20, 1'000, 1'000'000})) << "legacy: Agrona defaults, unchanged";
+    EXPECT_EQ(l.effectiveDriverIdleArgs(), "");
 }
