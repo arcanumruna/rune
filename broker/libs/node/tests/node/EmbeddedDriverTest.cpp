@@ -252,9 +252,10 @@ TEST(EmbeddedDriverRegression, MalformedIdleStrategyRefusesStartRegression) {
 }
 
 // D2 review R2-L1: with no explicit args the setter builds the strategy from the context's args — initialised from
-// AERON_*_IDLE_STRATEGY_INIT_ARGS — so validation must use THOSE (it used NULL args and passed).  Refusal is clean
-// (no double free: Aeron resets the state before init and the name is still NULL at the first set) and must name
-// the args Aeron really used.
+// AERON_*_IDLE_STRATEGY_INIT_ARGS — so validation must use THOSE (it used NULL args and passed).  The validation MUST
+// run before any context setter: a failing Aeron setter frees the strategy name (a heap copy that
+// aeron_driver_context_init sets) without resetting it, and aeron_driver_context_close frees it again — a double free
+// (ASan-proven by the review; macOS malloc misses it, so this test pins the refusal and its text, not the crash).
 TEST(EmbeddedDriverRegression, EnvIdleArgsMismatchRefusesCleanlyRegression) {
     struct EnvGuard {
         std::string name; std::string old; bool had;

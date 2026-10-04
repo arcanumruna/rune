@@ -277,8 +277,9 @@ struct NodeConfig {
     // (worker→control→net→control→worker …); 200µs cuts that 5x without pegging a
     // core (backoff still sleeps → consensus heartbeats are not starved, unlike
     // busyspin which triggers re-elections on shared cores).
-    // D2 review R2-L2: in shard mode this no longer drives the runtime / admin / node-driver threads — their park
-    // cap is RUNE_CONTROL_IDLE_MAX_PARK_US (controlIdleShape); it still caps the shard workers' backoff / wake park.
+    // D2 review R2-L2: shard mode — it caps the shard workers' backoff / wake park and the startup pump; in FUSED
+    // placement also the runtime + node driver (they ride worker 0).  In THREAD placement the runtime, admin and
+    // node-driver threads use RUNE_CONTROL_IDLE_MAX_PARK_US instead (controlIdleShape); fused: only the admin thread.
     int64_t idleMaxParkUs = 200;
     bool    idleMaxParkUsExplicit = false;   ///< RUNE_IDLE_MAX_PARK_US was set (shard mode warns: R2-L2)
 
