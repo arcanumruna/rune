@@ -345,6 +345,7 @@ public:
         const bool inIsr = std::find(meta_.isr.begin(), meta_.isr.end(), id) != meta_.isr.end();
         if (cfg_.topicId >= 0 && !inIsr) return false;
         // INTERNAL: the consensus can only move to a node it can elect.
+        if (cfg_.topicId < 0) exchangeKnowledge_();
         if (cfg_.topicId < 0 && !consensusElectable_(id)) return false;
         ++meta_.epoch;
         ++meta_.partitionEpoch;
@@ -365,6 +366,7 @@ public:
     /// Epoch + 1, the assignment goes to every reachable node.  Returns the new
     /// leader, -1 = nobody electable (the consensus stays leaderless).
     NodeId consensusElect(NodeId preferred) {
+        if (cfg_.topicId < 0) exchangeKnowledge_();
         NodeId winner = -1;
         if (preferred >= 0 && consensusElectable_(preferred)) winner = preferred;
         for (auto& n : nodes_) if (winner < 0 && consensusElectable_(n.id)) winner = n.id;
@@ -912,16 +914,33 @@ private:
         DrNode& v = node(voter);
         return v.isrKnowledge == nullptr || v.isrKnowledge->eligible(candidate);
     }
+    /// Round-3 CRITICAL-R3: the election participants (live, consensus-
+    /// reachable) exchange their newest durable metadata-ISR state while they
+    /// canvass / vote (CandidacyState): each adopts the newest one held by any
+    /// participant (InternalIsrKnowledge::adopt — durable, never acked).
+    void exchangeKnowledge_() {
+        const InternalIsrState* newest = nullptr;
+        for (auto& n : nodes_) {
+            if (!n.up || cut_.count({n.id, kControllerAddr}) != 0 || !n.isrKnowledge) continue;
+            const InternalIsrState* st = n.isrKnowledge->candidacyState();
+            if (st && (!newest || st->newerThan(newest->leaderEpoch, newest->version))) newest = st;
+        }
+        if (!newest) return;
+        const InternalIsrState copy = *newest;
+        for (auto& n : nodes_)
+            if (n.up && cut_.count({n.id, kControllerAddr}) == 0 && n.isrKnowledge)
+                (void)n.isrKnowledge->adopt(copy);
+    }
     bool consensusElectable_(NodeId cand) {
         std::vector<NodeId> live;
         for (auto& n : nodes_)
             if (n.up && cut_.count({n.id, kControllerAddr}) == 0) live.push_back(n.id);
         if (std::find(live.begin(), live.end(), cand) == live.end()) return false;
-        // A candidate always may stand and votes for itself (Aeron
-        // becomeCandidate); only the OTHER voters apply the candidacy rule
-        // (re-review MAJOR-A: no self-gate).
-        std::size_t votes = 1;
-        for (NodeId v : live) if (v != cand && consensusVoteGate_(v, cand)) ++votes;
+        // A candidate always may stand (re-review MAJOR-A), but EVERY vote —
+        // its own included — is gated by the voter's durable knowledge (round 3
+        // CRITICAL-R3: Election::gateSelfVote_).
+        std::size_t votes = 0;
+        for (NodeId v : live) if (consensusVoteGate_(v, cand)) ++votes;
         return votes >= nodes_.size() / 2 + 1;
     }
     rune::storage::ProducerStateManager psm_;

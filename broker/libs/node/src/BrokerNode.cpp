@@ -861,9 +861,43 @@ void BrokerNode::buildReplication() {
             spdlog::warn("BrokerNode[{}]: RUNE_UNCLEAN_CONSENSUS_ELECTION is ON — the consensus "
                          "candidacy gate is disabled; a node missing committed __cluster_metadata "
                          "records may be elected (those records are then lost)", config_.nodeId);
-        else
+        else {
             election_->setVoteGate(&rune::replication::InternalIsrKnowledge::voteGate,
                                    internalIsrKnowledge_.get());
+            // Round-3 CRITICAL-R3: every vote (the candidate's own included) is
+            // gated, so the election participants exchange their newest durable
+            // __cluster_metadata ISR state while canvassing / voting — a node
+            // that missed a committed state learns it from a peer (adopt:
+            // durable, never acked, not term-gated).  Control thread (cold).
+            election_->setCandidacyExchange(
+                [](void* k, rune::consensus::CandidacyState& out) noexcept -> bool {
+                    auto* kn = static_cast<rune::replication::InternalIsrKnowledge*>(k);
+                    try { kn->retryLoadIfPending(); } catch (...) {}
+                    const auto* st = kn->candidacyState();
+                    if (st == nullptr) return false;
+                    out.leaderEpoch = st->leaderEpoch;
+                    out.version     = st->version;
+                    out.count       = st->count;
+                    for (int i = 0; i < st->count && i < rune::consensus::CandidacyState::kMaxMembers; ++i)
+                        out.members[static_cast<std::size_t>(i)] = st->members[static_cast<std::size_t>(i)];
+                    return true;
+                },
+                [](void* k, const rune::consensus::CandidacyState& in) noexcept {
+                    if (in.count < 0 || in.count > rune::replication::InternalIsrState::kMaxMembers) return;
+                    rune::replication::InternalIsrState st{};
+                    st.topicId     = rune::replication::InternalIsrKnowledge::kCandidacyTopicId;
+                    st.partition   = 0;
+                    st.leaderEpoch = in.leaderEpoch;
+                    st.version     = in.version;
+                    st.count       = in.count;
+                    for (int i = 0; i < in.count; ++i)
+                        st.members[static_cast<std::size_t>(i)] = in.members[static_cast<std::size_t>(i)];
+                    try {
+                        (void)static_cast<rune::replication::InternalIsrKnowledge*>(k)->adopt(st);
+                    } catch (...) {}   // a failed adopt leaves the older (safe) knowledge
+                },
+                internalIsrKnowledge_.get());
+        }
         // Re-review MEDIUM-A: the knowledge refuses (never persists, never acks)
         // an internal ISR state of a leadership older than the consensus term
         // this node voted in or observed — Raft's term rule applied to the ack.

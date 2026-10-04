@@ -112,6 +112,11 @@ struct FakeConsensusPublisher : ConsensusPublisher {
     std::vector<NewLeadershipTermCall> newLeadershipTermCalls;
     std::vector<AppendPositionCall>    appendPositionCalls;
     std::vector<CommitPositionCall>    commitPositionCalls;
+    std::vector<std::pair<NodeId, CandidacyState>> candidacyCalls;   ///< (to, state)
+
+    void candidacyState(NodeId toMember, NodeId, const CandidacyState& st) override {
+        candidacyCalls.emplace_back(toMember, st);
+    }
 
     void canvassPosition(NodeId toMember, Term logLeadershipTermId, int64_t logPosition,
                          Term leadershipTermId, NodeId followerMemberId) override {
@@ -1030,4 +1035,95 @@ TEST(ElectionBallotRegression, DeniedRequestVoteNeverRaisesAckTerm_GrantDoes) {
     ASSERT_EQ(pub.placeVoteCalls.size(), 2u);
     ASSERT_TRUE(pub.placeVoteCalls[1].vote);
     EXPECT_EQ(e.ackTermId(), 6) << "a GRANTED vote must raise the ack term";
+}
+
+// Re-review 2026-10-04 (fix round 3) CRITICAL-R3: the candidate's OWN vote is
+// gated by its own durable knowledge.  A node that acked its own removal may
+// still stand (MAJOR-A), but its self-vote does not count: one stale peer's
+// grant is not a majority.  (Before: becomeCandidate recorded the self-vote
+// unconditionally and the excluded node won with one stale grant.)
+TEST(ElectionBallotRegression, SelfVoteGatedByOwnKnowledge_OneStaleGrantIsNotAMajority) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+    GateCtx g{/*denied=*/0};                     // self's own knowledge excludes self
+    e.setVoteGate(&denyOne, &g);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);                             // INIT → CANVASS
+    e.onCanvassPosition(0, 0, 0, 1);
+    e.onCanvassPosition(0, 0, 0, 2);
+    for (int i = 0; i < 20 && e.state() != ElectionState::CandidateBallot; ++i) {
+        nowNs += kElectionTimeoutNs;
+        e.doWork(nowNs);
+    }
+    ASSERT_EQ(e.state(), ElectionState::CandidateBallot) << "MAJOR-A: the node must still stand";
+    const Term term = e.candidateTermId();
+    e.onVote(/*logLeadershipTermId=*/0, /*logPosition=*/0, term, /*candidateId=*/0, /*voterId=*/1, /*vote=*/true);   // one stale grant
+    for (int i = 0; i < 3; ++i) { nowNs += kElectionTimeoutNs; e.doWork(nowNs); }
+    EXPECT_NE(e.state(), ElectionState::LeaderLogReplication)
+        << "won with its own ungated self-vote + one stale grant";
+    EXPECT_NE(e.state(), ElectionState::LeaderReplay);
+    EXPECT_NE(e.leaderMemberId(), 0);
+}
+
+// CRITICAL-R3 liveness: the knowledge is exchanged while canvassing / voting —
+// every CanvassPosition, RequestVote and Vote is accompanied by the sender's
+// newest durable metadata-ISR state, and a received one is handed to the
+// learn hook (which adopts it when newer, bypassing the ack term rule).
+namespace {
+struct ExchangeCtx {
+    CandidacyState mine{};
+    bool           have = true;
+    int            learned = 0;
+    CandidacyState last{};
+};
+bool exSrc(void* c, CandidacyState& out) noexcept {
+    auto* x = static_cast<ExchangeCtx*>(c);
+    if (!x->have) return false;
+    out = x->mine;
+    return true;
+}
+void exLearn(void* c, const CandidacyState& s) noexcept {
+    auto* x = static_cast<ExchangeCtx*>(c);
+    ++x->learned;
+    x->last = s;
+}
+} // namespace
+
+TEST(ElectionBallotRegression, CandidacyStateExchangedWhileCanvassingAndVoting) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+    ExchangeCtx x;
+    x.mine.leaderEpoch = 1; x.mine.version = 4; x.mine.count = 2; x.mine.members[0] = 1; x.mine.members[1] = 3;
+    e.setCandidacyExchange(&exSrc, &exLearn, &x);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);                             // INIT → CANVASS (publishes canvass)
+    nowNs += kStatusIntervalNs;
+    e.doWork(nowNs);
+    ASSERT_FALSE(pub.canvassCalls.empty());
+    bool sentTo1 = false, sentTo2 = false;
+    for (const auto& [to, st] : pub.candidacyCalls) {
+        EXPECT_EQ(st.version, 4);
+        sentTo1 = sentTo1 || to == 1;
+        sentTo2 = sentTo2 || to == 2;
+    }
+    EXPECT_TRUE(sentTo1 && sentTo2) << "the newest metadata-ISR state did not accompany the canvass";
+    // A vote is accompanied too.
+    pub.clear(); pub.candidacyCalls.clear();
+    e.onRequestVote(0, 0, /*candidateTermId=*/3, /*candidateId=*/1, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    bool withVote = false;
+    for (const auto& c : pub.candidacyCalls) withVote = withVote || c.first == 1;
+    EXPECT_TRUE(withVote) << "the newest metadata-ISR state did not accompany the vote";
+    // Received: handed to the learn hook.
+    CandidacyState peer;
+    peer.leaderEpoch = 1; peer.version = 6; peer.count = 1; peer.members[0] = 2;
+    e.onCandidacyState(2, peer);
+    EXPECT_EQ(x.learned, 1);
+    EXPECT_EQ(x.last.version, 6);
 }

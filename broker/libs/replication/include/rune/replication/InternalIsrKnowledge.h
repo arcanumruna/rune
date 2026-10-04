@@ -113,7 +113,9 @@ public:
 
     /// Election vote-gate thunk (rune::consensus::Election::setVoteGate).
     static bool voteGate(void* self, int32_t candidate) noexcept {
-        return static_cast<const InternalIsrKnowledge*>(self)->eligible(candidate);
+        auto* k = static_cast<InternalIsrKnowledge*>(self);
+        k->retryLoadIfPendingNoexcept_();
+        return k->eligible(candidate);
     }
 
     /// The node's CONSENSUS term source (BrokerNode: the Election's
@@ -122,6 +124,28 @@ public:
     using TermSource = int64_t (*)(const void* ctx) noexcept;
     void setConsensusTermSource(TermSource fn, const void* ctx) noexcept { termFn_ = fn; termCtx_ = ctx; }
     [[nodiscard]] int64_t consensusTerm() const noexcept { return termFn_ ? termFn_(termCtx_) : -1; }
+
+    /// Round-3 LOW-R3-1: a load that failed with a TRANSIENT error (EMFILE,
+    /// ENFILE, EIO, EINTR, EAGAIN, ENOMEM, ENOBUFS — not corruption) leaves the
+    /// store "load pending": it refuses to vote and to persist (persisting
+    /// would overwrite the unread file) and retries the load on its next use
+    /// (offer / adopt / the vote gate / the candidacy export) — no timer.
+    void retryLoadIfPending();
+    [[nodiscard]] bool loadPending() const noexcept { return loadPending_; }
+
+    /// Round-3 CRITICAL-R3: adopt a PEER's persisted __cluster_metadata state
+    /// learned in the election knowledge exchange — newest (leaderEpoch,
+    /// version) wins, persisted durably, but NEVER acked and NOT term-gated
+    /// (learning is not helping a leader commit: the dead leader's states are
+    /// all older than the election term).  Never restores votable(): only a
+    /// state received from the current leadership (offer) proves this node's
+    /// own knowledge again.  Returns true when this node now holds it or newer.
+    bool adopt(const InternalIsrState& s);
+    /// The state this node shares in the exchange: its newest
+    /// __cluster_metadata state; nullptr when none or unprovable (LOW-A).
+    [[nodiscard]] const InternalIsrState* candidacyState() const noexcept {
+        return (votable_ && !loadPending_) ? latest(kCandidacyTopicId, 0) : nullptr;
+    }
 
     /// False after a failed validation of an existing file, until a fresh
     /// state was persisted (LOW-A).
@@ -135,6 +159,11 @@ private:
     bool persist_();
     void load_();
     void failClosed_(const char* why);
+    void loadTransient_(const char* what, int err);
+    bool adoptNewest_(const InternalIsrState& s, bool provesOwnKnowledge);
+    void retryLoadIfPendingNoexcept_() noexcept {
+        try { retryLoadIfPending(); } catch (...) {}   // a failed retry stays pending
+    }
 
     TermSource                    termFn_  = nullptr;
     const void*                   termCtx_ = nullptr;
@@ -143,6 +172,7 @@ private:
     uint64_t                      persists_ = 0;
     uint64_t                      staleTermRefusals_ = 0;
     bool                          votable_ = true;
+    bool                          loadPending_ = false;   ///< LOW-R3-1: transient load failure
 };
 
 } // namespace rune::replication

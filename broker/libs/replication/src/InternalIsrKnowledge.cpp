@@ -50,7 +50,7 @@ const InternalIsrState* InternalIsrKnowledge::latest(int32_t topicId, int32_t pa
 
 bool InternalIsrKnowledge::eligible(int32_t candidate) const noexcept
 {
-    if (!votable_) return false;   // LOW-A: unprovable knowledge — refuse to vote
+    if (!votable_ || loadPending_) return false;   // LOW-A / LOW-R3-1: unprovable — refuse to vote
     // MEDIUM-B: only __cluster_metadata decides candidacy (the coordinator
     // partitions are on the controller-ISR path; any other entry — e.g. from an
     // older file — is ignored by the rule).
@@ -61,11 +61,13 @@ bool InternalIsrKnowledge::eligible(int32_t candidate) const noexcept
 bool InternalIsrKnowledge::offer(const InternalIsrState& s)
 {
     if (s.count < 0 || s.count > InternalIsrState::kMaxMembers) return false;
+    retryLoadIfPending();
+    if (loadPending_) return false;   // never overwrite a file not yet read
     // Raft's term rule applied to the ack (re-review 2026-10-04 MEDIUM-A): a
-    // state from a leadership OLDER than the term this node voted in / observed
-    // is neither persisted nor acked — a deposed (zombie) leader can never
-    // commit an ISR change, nor plant a stale candidacy view, through a node
-    // that already moved on.
+    // state from a leadership OLDER than the term this node voted in / follows
+    // (MAJOR-R3) is neither persisted nor acked — a deposed (zombie) leader can
+    // never commit an ISR change, nor plant a stale candidacy view, through a
+    // node that already moved on.
     if (const int64_t term = consensusTerm(); term >= 0 && s.leaderEpoch < term) {
         if ((staleTermRefusals_++ & 1023u) == 0)
             spdlog::warn("InternalIsrKnowledge: refused internal ISR state topic={} part={} "
@@ -74,19 +76,49 @@ bool InternalIsrKnowledge::offer(const InternalIsrState& s)
                          term, staleTermRefusals_);
         return false;
     }
+    return adoptNewest_(s, /*provesOwnKnowledge=*/true);
+}
+
+bool InternalIsrKnowledge::adopt(const InternalIsrState& s)
+{
+    if (s.topicId != kCandidacyTopicId || s.partition != 0) return false;
+    if (s.count < 0 || s.count > InternalIsrState::kMaxMembers) return false;
+    retryLoadIfPending();
+    if (loadPending_) return false;
+    return adoptNewest_(s, /*provesOwnKnowledge=*/false);
+}
+
+bool InternalIsrKnowledge::adoptNewest_(const InternalIsrState& s, bool provesOwnKnowledge)
+{
+    const bool proves = provesOwnKnowledge && s.topicId == kCandidacyTopicId;
     for (auto& e : entries_) {
         if (e.topicId != s.topicId || e.partition != s.partition) continue;
-        if (!s.newerThan(e.leaderEpoch, e.version)) return true;   // holds s or newer
+        if (!s.newerThan(e.leaderEpoch, e.version)) {
+            // Holds s or newer.  A state received from the current leadership
+            // (offer) re-proves our own knowledge only if what we hold IS it —
+            // a newer LEARNED state does not.
+            if (proves && e.leaderEpoch == s.leaderEpoch && e.version == s.version) votable_ = true;
+            return true;
+        }
         const InternalIsrState prev = e;
         e = s;
-        if (persist_()) { if (s.topicId == kCandidacyTopicId) votable_ = true; return true; }
+        if (persist_()) { if (proves) votable_ = true; return true; }
         e = prev;                                                    // never claim an unpersisted state
         return false;
     }
     entries_.push_back(s);
-    if (persist_()) { if (s.topicId == kCandidacyTopicId) votable_ = true; return true; }
+    if (persist_()) { if (proves) votable_ = true; return true; }
     entries_.pop_back();
     return false;
+}
+
+void InternalIsrKnowledge::retryLoadIfPending()
+{
+    if (!loadPending_) return;
+    loadPending_ = false;
+    votable_     = true;
+    entries_.clear();
+    load_();   // may set loadPending_ again (still transient) or fail closed
 }
 
 bool InternalIsrKnowledge::persist_()
@@ -139,15 +171,22 @@ void InternalIsrKnowledge::load_()
     if (path_.empty()) return;
     const int fd = ::open(path_.c_str(), O_RDONLY);
     if (fd < 0) {
-        if (errno == ENOENT) return;   // absent: the fresh state (never acked anything)
-        failClosed_("unreadable");
+        const int err = errno;
+        if (err == ENOENT) return;   // absent: the fresh state (never acked anything)
+        loadTransient_("open", err);   // transient: retried; otherwise fails closed
         return;
     }
     std::vector<uint8_t> buf;
     uint8_t chunk[4096];
     for (;;) {
         const ssize_t n = ::read(fd, chunk, sizeof chunk);
-        if (n <= 0) break;
+        if (n == 0) break;
+        if (n < 0) {
+            const int err = errno;
+            ::close(fd);
+            loadTransient_("read", err);
+            return;
+        }
         buf.insert(buf.end(), chunk, chunk + n);
     }
     ::close(fd);
@@ -176,6 +215,18 @@ void InternalIsrKnowledge::load_()
         }
         entries_.push_back(e);
     }
+}
+
+void InternalIsrKnowledge::loadTransient_(const char* what, int err)
+{
+    const bool transient = err == EMFILE || err == ENFILE || err == EIO || err == EINTR ||
+                           err == EAGAIN || err == ENOMEM || err == ENOBUFS;
+    if (!transient) { failClosed_(what); return; }
+    loadPending_ = true;
+    votable_     = false;
+    entries_.clear();
+    spdlog::warn("InternalIsrKnowledge: {} of {} failed transiently (errno {}) — refusing to vote "
+                 "until it is read; retried on next use", what, path_, err);
 }
 
 void InternalIsrKnowledge::failClosed_(const char* why)

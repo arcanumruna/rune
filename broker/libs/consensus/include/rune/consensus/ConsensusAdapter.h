@@ -77,6 +77,20 @@ public:
                 m.protocolVersion);
             break;
         }
+        case CandidacyStateMsg::TEMPLATE_ID: {
+            if (len < CandidacyStateMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
+            if constexpr (requires(Handler& h, CandidacyState& cs) { h.onCandidacyState(int64_t{}, NodeId{}, cs); }) {
+                const auto m = CandidacyStateMsg::decode(buf, 0);
+                CandidacyState cs;
+                cs.leaderEpoch = m.leaderEpoch;
+                cs.version     = m.version;
+                cs.count       = (m.count < 0 || m.count > CandidacyState::kMaxMembers) ? -1 : m.count;
+                if (cs.count < 0) { ignoredFrameCount_++; return; }
+                for (int i = 0; i < cs.count; ++i) cs.members[static_cast<std::size_t>(i)] = m.members[i];
+                handler_.onCandidacyState(nowNs, m.fromMember, cs);
+            }
+            break;
+        }
         case RequestVoteMsg::TEMPLATE_ID: {
             if (len < RequestVoteMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
             const auto m = RequestVoteMsg::decode(buf, 0);

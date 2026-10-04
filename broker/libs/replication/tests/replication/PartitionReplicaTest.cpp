@@ -4744,3 +4744,35 @@ TEST(InternalIsrRegression, NoNodeInEveryInternalIsr_ConsensusStillElects_OnlyMe
     EXPECT_TRUE(elected(kA)) << "A is in the newest __cluster_metadata ISR";
     EXPECT_FALSE(elected(kB)) << "B lacks committed metadata records: never electable";
 }
+
+// Re-review 2026-10-04 (fix round 3) LOW-R3-1: a TRANSIENT open() failure of
+// the knowledge file at startup (EMFILE / ENFILE / EIO ...) is not corruption:
+// the node refuses to vote only while the file cannot be read, then retries
+// and loads it — it must not stay fail-closed (or lose its knowledge).
+#include <sys/resource.h>
+TEST(InternalIsrRegression, TransientOpenErrorRetriedNotFailClosed) {
+    TempDir d("iisr_transient");
+    const std::string path = d.path + "/internal-isr.state";
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 4; a.version = 2; a.count = 2;
+    a.members[0] = 1; a.members[1] = 2;
+    { InternalIsrKnowledge k(path); ASSERT_TRUE(k.offer(a)); }
+    // Exhaust the descriptor table: the next open() fails with EMFILE.
+    rlimit old{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &old), 0);
+    const int probe = ::dup(0);
+    ASSERT_GE(probe, 0);
+    ::close(probe);
+    rlimit low = old;
+    low.rlim_cur = static_cast<rlim_t>(probe);   // every fd >= probe is now refused
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &low), 0);
+    auto k = std::make_unique<InternalIsrKnowledge>(path);   // open() -> EMFILE
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &old), 0);
+    EXPECT_FALSE(k->eligible(1)) << "voted while its knowledge could not be read";
+    k->retryLoadIfPending();
+    EXPECT_TRUE(k->votable()) << "a transient open() error failed the knowledge closed for good";
+    ASSERT_NE(k->latest(-3, 0), nullptr) << "the knowledge was lost";
+    EXPECT_EQ(k->latest(-3, 0)->version, 2);
+    EXPECT_FALSE(k->eligible(3));
+    EXPECT_TRUE(k->eligible(1));
+}

@@ -673,6 +673,13 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
             if (req.incarnation > s0->incarnation) {
                 incarnationChanged = s0->incarnation != 0;
                 s0->incarnation    = req.incarnation;
+                // Round-3 LOW-R3-1: a restarted replica may have lost (or failed
+                // closed on) its internal-ISR knowledge — forget its ack so the
+                // anti-entropy re-sends the latest state (cold: restarts only).
+                if (incarnationChanged && internalQuorum_()) {
+                    const int idx = slotIndex_(req.followerId);
+                    if (idx >= 0) internalIsrAcks_ &= ~(1u << idx);
+                }
             }
         }
     }

@@ -75,6 +75,9 @@ public:
     // ConsensusMessageHandler overrides — forward to election_
     // -----------------------------------------------------------------------
 
+    void onCandidacyState(int64_t nowNs, NodeId fromMember,
+                          const CandidacyState& state) override;
+
     void onCanvassPosition(
         int64_t nowNs,
         Term    logLeadershipTermId,

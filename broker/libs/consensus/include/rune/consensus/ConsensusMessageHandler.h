@@ -7,12 +7,18 @@
 // Field lists match the decoded SBE messages from ConsensusMessages.h (§3.1).
 
 #include <rune/consensus/Types.h>
+#include <rune/consensus/CandidacyState.h>
 #include <cstdint>
 
 namespace rune::consensus {
 
 struct ConsensusMessageHandler {
     virtual ~ConsensusMessageHandler() = default;
+
+    // Dispatched from templateId=58 (CandidacyState; re-review round 3
+    // CRITICAL-R3).  Default: ignored.
+    virtual void onCandidacyState(int64_t /*nowNs*/, NodeId /*fromMember*/,
+                                  const CandidacyState& /*state*/) {}
 
     // Dispatched from templateId=50 (CanvassPosition)
     virtual void onCanvassPosition(

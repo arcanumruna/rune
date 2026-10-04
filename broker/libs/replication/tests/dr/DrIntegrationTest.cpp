@@ -1586,10 +1586,13 @@ TEST(DrIntegrationRegression, ZombieLeaderInternalIsrAckRefusedAfterVote_NoAcked
     EXPECT_TRUE(c.rep(1).isrProposalPendingForTest() || c.leaderIsrContains(3))
         << "the zombie leader committed an internal ISR change after its acker voted for a newer term\n"
         << c.dump();
-    // Y wins the election at e+1 (legitimately: X's knowledge still names it).
+    // The links heal and the consensus elects at e+1.  (Round 3 CRITICAL-R3:
+    // the participants now exchange their newest metadata-ISR state — the
+    // zombie's own pending {1,2} reaches X and Y, so Y may lose to 1 or 2;
+    // either way no acked record may be lost.)
     c.healAll();
     const NodeId nl = c.consensusElect(3);
-    ASSERT_EQ(nl, 3) << c.dump();
+    ASSERT_GE(nl, 0) << c.dump();
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(3), 3);
     expectAllConvergedAndAcked(c, "re-review2 medium-a zombie ack window");
@@ -1622,4 +1625,80 @@ TEST(DrIntegrationRegression, DeniedVoteNeverFreezesLiveLeaderInternalIsr) {
     EXPECT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, 1000))
         << "HW pinned by the dead member: metadata log frozen with a live majority\n" << c.dump();
     EXPECT_EQ(c.acked().size(), 15u);
+}
+
+// Re-review 2026-10-04 (fix round 3) CRITICAL-R3: with the self-gate dropped
+// (MAJOR-A) the candidate's OWN vote was unconditional.  Node 2 acked its own
+// removal ((1,2) = {1,3}, committed on {1,2}); node 3 missed it (and the next
+// anti-entropy re-sends); 5 records committed over {1,3}.  Node 1 dies: node 2
+// stood, voted for itself and won with node 3's stale grant — leading
+// __cluster_metadata at LEO 10, node 3 truncated: acked records lost.  Fixed:
+// the candidate counts its own vote only if its own durable knowledge admits
+// it, and the survivors exchange their newest metadata-ISR state during
+// canvass / voting (node 3 learns (1,2) and denies node 2 — and still wins
+// itself, so MAJOR-A's liveness holds).
+TEST(DrIntegrationRegression, SelfVoteOfExcludedCandidateGated_NoAckedLoss) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).internalSeedPendingForTest() && !c.rep(1).isrProposalPendingForTest();
+    }, kCap));
+    c.cut(1, 3);                                 // the frame to node 3 is lost
+    c.cut(2, kControllerAddr);                   // node 2 consensus-dead: fenced out
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).isrProposalPendingForTest() && !c.leaderIsrContains(2);
+    }, kCap)) << c.dump();
+    const auto* k2 = c.node(2).isrKnowledge->latest(-3, kPartId);
+    ASSERT_TRUE(k2 && !k2->contains(2)) << "precondition: node 2 acked its own removal";
+    const auto* k3 = c.node(3).isrKnowledge->latest(-3, kPartId);
+    ASSERT_TRUE(k3 == nullptr || k3->contains(2)) << "precondition: node 3 missed it";
+    c.cutBoth(1, 2);
+    c.heal(1, 3);
+    c.dropNext(Kind::InternalIsr, 2);            // the next anti-entropy re-sends are lost too
+    ASSERT_EQ(c.produceAcked(5), 5);
+    k3 = c.node(3).isrKnowledge->latest(-3, kPartId);
+    ASSERT_TRUE(k3 == nullptr || k3->contains(2)) << "precondition: node 3 still missed it";
+    ASSERT_LT(c.rep(2).logEndOffset(), c.rep(1).logEndOffset()) << "precondition: node 2 lacks committed records";
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    const NodeId nl = c.consensusElect(/*preferred=*/2);
+    ASSERT_NE(nl, 2) << "node 2 (outside the newest committed metadata ISR) won with its own self-vote";
+    ASSERT_EQ(nl, 3) << "no consensus leader although node 3 holds every committed record\n" << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(3), 3);
+    expectAllConvergedAndAcked(c, "round-3 critical-r3 self-vote");
+}
+
+// Re-review 2026-10-04 (fix round 3) LOW-R3-1: a follower that restarts
+// cleanly (fetch >= HW: it keeps its ISR seat) kept its ack bit at the leader,
+// so the anti-entropy never re-sent it the committed metadata ISR state: with a
+// corrupt (fail-closed) knowledge file it stayed non-votable until some
+// unrelated ISR change.  Fixed: a changed process incarnation clears the
+// follower's ack bit — the leader re-sends, the node persists it and votes again.
+TEST(DrIntegrationRegression, RestartedFollowerRelearnsCommittedState_FailClosedHeals) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).internalSeedPendingForTest() && !c.rep(1).isrProposalPendingForTest() &&
+               c.node(3).isrKnowledge->latest(-3, kPartId) != nullptr;
+    }, kCap));
+    c.crash(3, CrashKind::ProcessKill);
+    {   // the knowledge file is damaged while the node is down
+        std::FILE* fp = std::fopen((c.node(3).dir + "/internal-isr.state").c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        std::fputs("garbage", fp);
+        std::fclose(fp);
+    }
+    c.restart(3);
+    c.applyMetadata(3);
+    ASSERT_FALSE(c.node(3).isrKnowledge->votable()) << "precondition: fail-closed after the restart";
+    EXPECT_TRUE(c.driveUntil([&] { return c.node(3).isrKnowledge->votable(); }, 500))
+        << "the restarted node never relearned the committed metadata ISR (no re-send)\n" << c.dump();
+    EXPECT_TRUE(c.leaderIsrContains(3));
 }
