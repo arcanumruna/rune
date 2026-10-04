@@ -194,4 +194,15 @@
     <field name="version"     id="5" type="int64"/>
   </sbe:message>
 
+  <!-- ====================================================================== -->
+  <!-- RESERVED template ids 11 / 12 — rune-broker D9 cross-node transaction  -->
+  <!-- markers, carried on THIS stream (schema 112) as hand-rolled fixed       -->
+  <!-- blocks defined in rune-broker libs/replication/include/rune/            -->
+  <!-- replication/ReplicationMessages.h (WriteTxnMarkerMsg /                  -->
+  <!-- WriteTxnMarkerResponseMsg).  The broker dispatches on the template id   -->
+  <!-- alone: do NOT assign 11 or 12 to another message here.                  -->
+  <!--   11 = WriteTxnMarker          (txn coordinator → partition leader)     -->
+  <!--   12 = WriteTxnMarkerResponse  (partition leader → txn coordinator)     -->
+  <!-- ====================================================================== -->
+
 </sbe:messageSchema>
