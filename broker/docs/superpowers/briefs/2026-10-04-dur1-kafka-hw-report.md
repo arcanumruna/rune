@@ -324,3 +324,47 @@ LargeBatchReplicationRegression.MultiBatchPushAboveFollowerFrameNeverWedges4MiBR
 UnservableStoredBatchEvictsFollowersLegacyTransport failed once each, then the same loop passed 3x and LargeBatch alone
 passed 5x under -j6 -> load-sensitive, unreproduced on demand (watch item; capture output on next occurrence).
 check_no_atomics OK.  LOW-B (real-election-over-Aeron coverage, docker matrix RUNE_SURVIVOR_LEADER_ELECTION) = follow-up.
+
+## Fix round 4 (re-review round 3)
+
+Review: "Re-review (fix round 3)" (1 CRITICAL, 1 MAJOR, 3 LOW). Broker `rune-broker-wt31` `feat/dur-1`
+on top of e359e44; rune-protocol-fe unchanged (a9787dc). Nothing pushed, no Conan package operations,
+no subagents. RED logs: session scratchpad `rev4fix/red-r4-*.log`.
+
+### RED → GREEN per finding
+
+| Finding | Fix | Regression test(s) | RED (before) | GREEN |
+|---|---|---|---|---|
+| MAJOR-R3: a denied RequestVote froze the live leader's metadata ISR | `rune/consensus/AckTerm.h`: ack term = max(votedTermId, leadershipTermId). `Election::votedTermId_` is raised only in the grant branch, and `ackTermId()` is exposed. BrokerNode's term source reads it. A denial and an abandoned own candidacy never raise it (a node that stood at T+1 already ignores T's NLT). | `ElectionBallotRegression.DeniedRequestVoteNeverRaisesAckTerm_GrantDoes`; `DrIntegrationRegression.DeniedVoteNeverFreezesLiveLeaderInternalIsr` (the reviewer's repro, with a denial modelled by `consensusDenyVote`) | The ack term was raised to 5 by a denial. DR: the leader and node 2 logged "refused internal ISR state … older than this node's consensus term", node 3 was never shrunk, and the HW stayed pinned. | The shrink commits, the HW advances, 15/15 acked |
+| CRITICAL-R3: the candidate's unconditional self-vote elected a node that acked its own removal | Every vote is gated, the candidate's own included (`Election::gateSelfVote_`: For/None, re-evaluated each ballot step). A node still stands (MAJOR-A). Liveness comes from a knowledge exchange: the new consensus template 58 `CandidacyState` (newest durable metadata-ISR state) goes with every CanvassPosition, RequestVote and Vote. A receiver adopts it (`InternalIsrKnowledge::adopt`: newest wins, durable, never acked, not term-gated, never restores votable). | `DrIntegrationRegression.SelfVoteOfExcludedCandidateGated_NoAckedLoss` (the reviewer's repro); `ElectionBallotRegression.SelfVoteGatedByOwnKnowledge_OneStaleGrantIsNotAMajority`, `CandidacyStateExchangedWhileCanvassingAndVoting`; `ConsensusMessagesRegression.CandidacyStateRoundTripsThroughCodecAndAdapter` | Node 2 won with its self-vote (5 acked records would be truncated). The ballot test: leader with self-vote + 1 grant. Exchange: nothing sent. | Node 3 learns (1,2)={1,3}, denies 2, wins itself, no loss. MAJOR-A's `StaleSelfKnowledge_ConsensusNotHeadless` stays green (node 3 learns (1,4) from node 2). |
+| LOW-R3-1: restarted follower never relearns; transient open errors fail closed | A changed process incarnation clears the follower's internal-ISR ack bit, so anti-entropy re-sends. Transient open()/read() errors (EMFILE, ENFILE, EIO, EINTR, EAGAIN, ENOMEM, ENOBUFS) put the store into "load pending": it refuses to vote and to persist, and retries on next use (offer, adopt, vote gate, export) with no timer. `votable()` is re-proven only by a current-leadership state the node then holds. | `DrIntegrationRegression.RestartedFollowerRelearnsCommittedState_FailClosedHeals`; `InternalIsrRegression.TransientOpenErrorRetriedNotFailClosed` (EMFILE via RLIMIT_NOFILE) | Never re-sent; EMFILE failed closed for good and the knowledge was lost | Relearned; the retry loads the file |
+| LOW-R3-2 / LOW-R3-3 | Backlog, as ruled: coordinator bootstrap seed over existing data (upgrade-only); per-cycle `live` copy in `decideCoordinatorPartition` while a non-controller leads | — | — | — |
+
+### Design notes
+- **Changed expectation.** `ZombieLeaderInternalIsrAckRefusedAfterVote_NoAckedLoss` now accepts any elected leader. The zombie's own pending {1,2} reaches the voters through the exchange, so Y may lose to 1 or 2. It still requires no acked loss.
+- **Why sharing a leader's pending state is safe.** Sharing a leader's own pending (uncommitted) state only restricts votes, so it is safe.
+- **Narrow liveness residual.** A leader with a pending {L} that takes part in an election and then dies leaves the learners admitting only L, until L returns or an operator sets `RUNE_UNCLEAN_CONSENSUS_ELECTION`.
+- **`votedTermId_` is not persisted.** After a restart, the durable `candidateTermId` already makes the Election ignore a stale term's NLT, so a node never re-follows a deposed leader.
+
+### LargeBatch / fused-runtime flake check (MAJOR-R3 link)
+- **Earlier failure.** `ShardModeFusedRegression.PartitionLeaderFailsOverBetweenFusedRuntimes` failed once on c319e9b. That was 1 of about 6 serial ctest runs, plus one full `-j8` run.
+- **Interleaved stress.** I compared c319e9b against a2d4092, 30×3 runs then 15×8 parallel runs each. Both versions passed 210/210, with no stale-term WARN in any run.
+- **Full ctest on 93fbab1.** The only "refused internal ISR state" WARNs come from the two MEDIUM-A tests that expect them.
+- **Conclusion.** MAJOR-R3 is fixed, and it is the plausible cause of the controller-side freezes. The LargeBatch flake is not reproduced on demand, so it remains a watch item.
+
+### Suite results (Mac, build-fast Debug, protocol include = rune-protocol-fe)
+- Full ctest on 93fbab1: **3266/3266 passed** (2 DISABLED, 1 uring skip), 428 s.
+- DR `rune_dr_integration_tests`: 56 + 2 DISABLED, `--gtest_repeat=30` 30/30 clean.
+- `rune_replication_tests` 417/417, `rune_consensus_tests` 394/394, `rune_static_assignment_emit_tests` 12/12.
+- rune-protocol-fe `rune_protocol_tests` 475/475 (unchanged).
+- `check_no_atomics.py` OK. No sleeps.
+
+### Commits (feat/dur-1)
+- dc9df66 MAJOR-R3
+- 93fbab1 CRITICAL-R3 + LOW-R3-1
+- Earlier in this round 3/4 session: 2796c8a MAJOR-A, 3933caa MEDIUM-A, 703b087 MEDIUM-C + LOW-A, c319e9b MEDIUM-B. e359e44 was committed by the controller.
+
+### Follow-ups
+- **LOW-B.** Real-election-over-Aeron coverage (`Election` + CandidacyState + term source + InternalIsr over `AeronPartitionTransport`), plus the docker matrix with `RUNE_SURVIVOR_LEADER_ELECTION`.
+- **Backlog.** LOW-R3-2 and LOW-R3-3.
+- **Wire-level rollout.** Consensus template 58 is new. Older nodes ignore it as an unknown template, so a mixed-version cluster loses only the exchange's liveness benefit.
