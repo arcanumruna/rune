@@ -257,3 +257,52 @@ TEST(GroupRoutingRegression, LeaderChangeResubscribesOnTheNewLeaderRegression) {
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 7; }));
     EXPECT_EQ(led.next[1], 17);
 }
+
+// Defect 2 (DR test_cg_rebalance_stable[2]: one member never got an assignment
+// in the final generation, the other got all partitions).  Mechanism: the
+// Redirect answering a member's partition Subscribe was taken as a SEED-level
+// redirect — the seed transport (= the group coordinator's session) moved to
+// the partition leader and reconnected there.  From then on the member's
+// Heartbeat / JoinGroup went to a node that is not the coordinator, every
+// answer was NotCoordinator, so at the next rebalance it never re-joined (its
+// coordinator member expired and the survivor took everything).  Here: the
+// member is Stable at generation 1 with partition 1 redirected to node 1; the
+// coordinator (node 0) starts generation 2 — the member must re-join on node 0
+// and be assigned again.  RED on main: every group frame after the redirect
+// arrives on node 1 (NotCoordinator), generation 2 never assigns.
+TEST(GroupRoutingRegression, MemberRejoinsTheCoordinatorAfterARedirectedSubscribeRegression) {
+    GroupRig r(4109, 4110, 24880);
+    const int n1 = r.gw.addEndpoint(udp(24881), 4109);
+    r.gw.moreBrokers         = {{1, "127.0.0.1", 24881}};
+    r.gw.partitions          = {{1, 0, 0, 1, 4109, ""}, {1, 1, /*stale*/ 0, 1, 4109, ""}};
+    r.gw.subscribeLeader     = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment     = {{1, 0}, {1, 1}};
+    r.gw.coordinatorEndpoint = 0;
+
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 600;  // a heartbeat every 200 ms
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    Consumed led;
+    wire(gc, led);
+    std::vector<int32_t> assignedGens;  // generation of every onAssigned (duty thread = this thread)
+    gc.onAssigned([&](std::vector<rc::TopicPartition>) { assignedGens.push_back(gc.generation()); });
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testMetadataResponses() > 0 && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeRefusals >= 1 && !assignedGens.empty(); }))
+        << "precondition: generation 1 assigned and partition 1's Subscribe redirected";
+
+    const int64_t seedSid = r.gw.groupSessionIds.front();
+    r.gw.holdJoins = false;  // the coordinator answers re-joins at once from now on
+    r.gw.startRebalance(/*gen=*/2, seedSid);
+    ASSERT_TRUE(r.drive([&] { return !assignedGens.empty() && assignedGens.back() == 2; }, 2'000'000))
+        << "the member never re-joined the coordinator for generation 2 (NotCoordinator answers: "
+        << r.gw.notCoordinatorAnswers << ")";
+    EXPECT_EQ(r.gw.notCoordinatorAnswers, 0) << "a group frame reached a node that is not the coordinator";
+    for (std::size_t i = 0; i < r.gw.groupEndpoints.size(); ++i) {
+        EXPECT_EQ(r.gw.groupEndpoints[i], 0) << "group frame " << i << " left the coordinator node";
+    }
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.subAt(1, n1) != nullptr; }));
+    r.gw.pushRecords(*r.subAt(1, n1), 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] >= 2; }));
+}

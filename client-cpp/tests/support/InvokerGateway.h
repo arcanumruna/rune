@@ -141,6 +141,30 @@ struct InvokerGateway {
     int32_t groupGeneration = 1;
     int     joinGroups = 0, syncGroups = 0, heartbeats = 0, offsetFetches = 0;
     std::vector<int64_t> groupSessionIds;  // sessionId of every group frame received
+    std::vector<int>     groupEndpoints;   // the endpoint every group frame arrived on
+    // The node that is the group coordinator (-1 = any node answers).  A
+    // JoinGroup / SyncGroup / Heartbeat arriving on another endpoint is answered
+    // NotCoordinator (the broker's isLocalCoordinator() fence).
+    int  coordinatorEndpoint = -1;
+    int  notCoordinatorAnswers = 0;
+    // A rebalance in progress: Heartbeats are answered RebalanceInProgress
+    // until the next JoinGroup (which completes it at groupGeneration).
+    bool rebalancing = false;
+    /// The coordinator starts generation `gen`: an empty Assign{gen} (the eager
+    /// revoke) to `sessionId`, then every Heartbeat answers RebalanceInProgress
+    /// until the member re-joins.
+    void startRebalance(int32_t gen, int64_t sessionId) {
+        namespace rp = rune::protocol::client;
+        groupGeneration = gen;
+        rebalancing     = true;
+        rp::Assign a;
+        a.sessionId     = sessionId;
+        a.correlationId = 0;
+        a.generationId  = gen;
+        std::vector<uint8_t> out(rp::Assign::encodedSizeFor(0));
+        const std::size_t n = a.encode(out.data(), std::span<const rp::TopicPartition32>{});
+        send(0, out.data(), n);
+    }
     std::vector<int64_t> pendingJoins;     // sessionIds of held JoinGroups
     /// Answer every held JoinGroup now.
     void releaseJoins() {
@@ -538,6 +562,25 @@ struct InvokerGateway {
     }
 
 private:
+    // NotCoordinator fence: true (and answered) when `endpoint` is not the coordinator.
+    template <class Resp>
+    bool notCoordinator_(int endpoint, int64_t sessionId, Resp r) {
+        if (coordinatorEndpoint < 0 || endpoint == coordinatorEndpoint) return false;
+        ++notCoordinatorAnswers;
+        r.sessionId     = sessionId;
+        r.correlationId = 0;
+        r.errorCode     = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);
+        std::vector<uint8_t> out(512);
+        std::size_t n = 0;
+        if constexpr (requires { r.encode(out.data()); }) {
+            n = r.encode(out.data());
+        } else {
+            n = r.encode(out.data(), {});
+        }
+        send(0, out.data(), n);
+        return true;
+    }
+
     void answerJoin_(int64_t sessionId) {
         namespace rp = rune::protocol::client;
         static const std::string kMember = "member-1";
@@ -996,7 +1039,10 @@ private:
             if (!j) return;
             ++joinGroups;
             groupSessionIds.push_back(j->sessionId);
+            groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
+            if (notCoordinator_(endpoint, j->sessionId, rp::JoinGroupResponse{})) return;
+            rebalancing = false;
             if (holdJoins) {
                 pendingJoins.push_back(j->sessionId);
                 return;
@@ -1009,7 +1055,9 @@ private:
             if (!sg) return;
             ++syncGroups;
             groupSessionIds.push_back(sg->sessionId);
+            groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
+            if (notCoordinator_(endpoint, sg->sessionId, rp::SyncGroupResponse{})) return;
             std::vector<rp::TopicPartition32> asgn;
             for (const auto& [t, p] : groupAssignment) {
                 rp::TopicPartition32 tp;
@@ -1031,11 +1079,13 @@ private:
             if (!hb) return;
             ++heartbeats;
             groupSessionIds.push_back(hb->sessionId);
+            groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
+            if (notCoordinator_(endpoint, hb->sessionId, rp::HeartbeatResponse{})) return;
             rp::HeartbeatResponse r;
             r.sessionId     = hb->sessionId;
             r.correlationId = 0;
-            r.errorCode     = 0;
+            r.errorCode     = rebalancing ? static_cast<int16_t>(rp::ErrorCode::RebalanceInProgress) : int16_t{0};
             std::vector<uint8_t> out(rp::HeartbeatResponse::ENCODED_SIZE);
             const std::size_t n = r.encode(out.data());
             send(0, out.data(), n);
@@ -1046,6 +1096,7 @@ private:
             if (!of) return;
             ++offsetFetches;
             groupSessionIds.push_back(of->sessionId);
+            groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
             std::vector<rp::OffsetFetchResult> res;
             for (const auto& e : of->entries) {
