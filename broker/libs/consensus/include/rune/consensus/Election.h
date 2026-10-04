@@ -39,6 +39,7 @@
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
 #include <rune/consensus/Types.h>
+#include <rune/consensus/AckTerm.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -234,6 +235,14 @@ public:
     /// voters only: a node always may stand (re-review MAJOR-A — its own
     /// knowledge may be stale; the voters' majority decides).  nullptr
     /// (default) = everyone eligible (data-blind, as Aeron).  Duty-cycle thread.
+    /// The consensus term that may refuse an internal-ISR ack (rune/consensus/
+    /// AckTerm.h): the term this node GRANTED a vote in, or followed / led a
+    /// leader in.  Duty-cycle thread.
+    [[nodiscard]] Term ackTermId() const noexcept {
+        return ackTerm(candidateTermId_, votedTermId_, leadershipTermId_);
+    }
+    [[nodiscard]] Term votedTermId() const noexcept { return votedTermId_; }
+
     using VoteGate = bool (*)(void* ctx, NodeId candidate) noexcept;
     void setVoteGate(VoteGate fn, void* ctx) noexcept { voteGate_ = fn; voteGateCtx_ = ctx; }
     [[nodiscard]] bool mayVoteFor(NodeId candidate) const noexcept {
@@ -395,6 +404,12 @@ private:
     Term leadershipTermId_    = 0;
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;
+    /// Highest term this node GRANTED a vote in (MAJOR-R3) — a denial or an
+    /// own (abandoned) candidacy never raises it.  Not persisted: after a
+    /// restart the durable candidateTermId_ already makes the election ignore
+    /// a stale term's NewLeadershipTerm (a node never re-follows a deposed
+    /// leader), so the ack rule needs only this process's grants.
+    Term votedTermId_         = 0;
 
     // Election config — Election.java:80
     bool isNodeStartup_     = false;

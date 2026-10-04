@@ -1004,3 +1004,30 @@ TEST(ElectionBallotRegression, VoteGate_StaleSelfKnowledgeStillStands) {
         << "a node with stale self-knowledge refused to stand (headless consensus)";
     EXPECT_GE(e.candidateTermId(), 1);
 }
+
+// Re-review 2026-10-04 (fix round 3) MAJOR-R3: the internal-ISR ack term is
+// the term this node GRANTED a vote in or followed a leader in.  A DENIED
+// RequestVote raises candidateTermId (Aeron) but must never raise the ack term
+// — otherwise a live leader and its followers refuse their own metadata ISR
+// states forever after one denied candidacy.
+TEST(ElectionBallotRegression, DeniedRequestVoteNeverRaisesAckTerm_GrantDoes) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+    GateCtx g{/*denied=*/1};
+    e.setVoteGate(&denyOne, &g);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);                             // INIT → CANVASS
+    const Term before = e.ackTermId();
+    e.onRequestVote(0, 0, /*candidateTermId=*/5, /*candidateId=*/1, nowNs);   // denied (gate)
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    ASSERT_FALSE(pub.placeVoteCalls[0].vote);
+    EXPECT_EQ(e.candidateTermId(), 5) << "(Aeron: a denial still raises candidateTermId)";
+    EXPECT_EQ(e.ackTermId(), before) << "a DENIED vote raised the internal-ISR ack term";
+    e.onRequestVote(0, 0, /*candidateTermId=*/6, /*candidateId=*/2, nowNs);   // granted
+    ASSERT_EQ(pub.placeVoteCalls.size(), 2u);
+    ASSERT_TRUE(pub.placeVoteCalls[1].vote);
+    EXPECT_EQ(e.ackTermId(), 6) << "a GRANTED vote must raise the ack term";
+}

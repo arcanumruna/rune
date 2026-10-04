@@ -869,9 +869,9 @@ void BrokerNode::buildReplication() {
         // this node voted in or observed — Raft's term rule applied to the ack.
         internalIsrKnowledge_->setConsensusTermSource(
             [](const void* e) noexcept -> int64_t {
-                const auto* el = static_cast<const Election*>(e);
-                return std::max<int64_t>(static_cast<int64_t>(el->candidateTermId()),
-                                         static_cast<int64_t>(el->leadershipTermId()));
+                // MAJOR-R3: the term voted in / followed — never a candidate
+                // term raised by a DENIED RequestVote.
+                return static_cast<int64_t>(static_cast<const Election*>(e)->ackTermId());
             },
             election_.get());
     }

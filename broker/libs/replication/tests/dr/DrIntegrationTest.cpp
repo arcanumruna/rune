@@ -1594,3 +1594,32 @@ TEST(DrIntegrationRegression, ZombieLeaderInternalIsrAckRefusedAfterVote_NoAcked
     EXPECT_EQ(c.produceAcked(3), 3);
     expectAllConvergedAndAcked(c, "re-review2 medium-a zombie ack window");
 }
+
+// Re-review 2026-10-04 (fix round 3) MAJOR-R3: the ack term read
+// max(candidateTermId, leadershipTermId), and a DENIED RequestVote raises
+// candidateTermId — also in Closed, on the live leader and its followers.  Node
+// 3 stands at e+1 and is denied by 1 and 2; from then on every metadata ISR
+// state of the live leader (term e) was refused, by node 2 and by node 1 itself:
+// node 3 then dies and its removal can never commit — the HW stays pinned by a
+// dead member, the metadata log frozen with a live majority.  Fixed: the ack
+// term is the term this node GRANTED a vote in or followed a leader in.
+TEST(DrIntegrationRegression, DeniedVoteNeverFreezesLiveLeaderInternalIsr) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] {
+        return !c.rep(1).internalSeedPendingForTest() && !c.rep(1).isrProposalPendingForTest();
+    }, kCap));
+    c.consensusDenyVote(1, c.epoch() + 1);       // node 3's candidacy, denied by 1 and 2
+    c.consensusDenyVote(2, c.epoch() + 1);
+    c.crash(3, CrashKind::ProcessKill);          // ... then node 3 dies for good
+    EXPECT_TRUE(c.driveUntil([&] {
+        return !c.leaderIsrContains(3) && !c.rep(1).isrProposalPendingForTest();
+    }, 1000)) << "the live leader's metadata ISR change was refused after a denied vote\n" << c.dump();
+    ASSERT_EQ(c.produce(5), 5);
+    EXPECT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, 1000))
+        << "HW pinned by the dead member: metadata log frozen with a live majority\n" << c.dump();
+    EXPECT_EQ(c.acked().size(), 15u);
+}

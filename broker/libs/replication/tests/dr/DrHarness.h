@@ -47,6 +47,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/metadata/FailoverElection.h>
+#include <rune/consensus/AckTerm.h>
 #include <rune/metadata/ReplicaPositionTable.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
@@ -163,9 +164,14 @@ struct DrNode {
     std::unique_ptr<InternalIsrKnowledge> isrKnowledge;
     bool                              up = false;
     uint32_t                          incarnation = 0;
-    /// The node's CONSENSUS term (Election max(candidateTermId,
-    /// leadershipTermId)) — durable (node-state file) like production.
-    int64_t                           consensusTerm = 0;
+    /// The node's consensus terms (as its Election holds them): the highest
+    /// candidate term seen (raised by ANY RequestVote, granted or denied), the
+    /// highest term it GRANTED a vote in, and the term of the leader it
+    /// follows / is.  The ack rule reads rune::consensus::ackTerm (BrokerNode
+    /// wires Election::ackTermId the same way).
+    int64_t                           candidateTerm  = 0;
+    int64_t                           votedTerm      = 0;
+    int64_t                           leadershipTerm = 0;
     std::map<std::string, int64_t>    durableFloor;   // .log path → bytes known durable
 };
 
@@ -219,7 +225,7 @@ public:
         meta_.leader = leader;
         meta_.epoch  = 1;
         meta_.isr    = replicas_;
-        for (auto& n : nodes_) n.consensusTerm = std::max<int64_t>(n.consensusTerm, 1);
+        for (auto& n : nodes_) observeTerm_(n, 1);
         for (auto& n : nodes_) applyMetadata(n.id);
     }
 
@@ -346,8 +352,7 @@ public:
         if (!inIsr) meta_.isr.insert(meta_.isr.begin(), id);
         if (cfg_.topicId < 0)   // a consensus move: every reachable node sees the new term
             for (auto& n : nodes_)
-                if (n.up && cut_.count({n.id, kControllerAddr}) == 0)
-                    n.consensusTerm = std::max<int64_t>(n.consensusTerm, meta_.epoch);
+                if (n.up && cut_.count({n.id, kControllerAddr}) == 0) observeTerm_(n, meta_.epoch);
         for (auto& n : nodes_) applyMetadata(n.id);
         return true;
     }
@@ -368,8 +373,7 @@ public:
         meta_.leader = winner;
         // Every consensus-reachable node saw the RequestVote / NewLeadershipTerm.
         for (auto& n : nodes_)
-            if (n.up && cut_.count({n.id, kControllerAddr}) == 0)
-                n.consensusTerm = std::max<int64_t>(n.consensusTerm, meta_.epoch);
+            if (n.up && cut_.count({n.id, kControllerAddr}) == 0) observeTerm_(n, meta_.epoch);
         for (auto& n : nodes_) if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
         return winner;
     }
@@ -379,7 +383,15 @@ public:
     /// the previous leader (NewLeadershipTerm not yet applied by the bridge).
     void consensusVote(NodeId voter, int64_t term) {
         DrNode& n = node(voter);
-        n.consensusTerm = std::max(n.consensusTerm, term);
+        n.candidateTerm = std::max(n.candidateTerm, term);
+        n.votedTerm     = std::max(n.votedTerm, term);
+    }
+    /// Node `voter` DENIED a RequestVote of term `term` (stale log / candidacy
+    /// rule) — Election's deny branch raises candidateTermId (also in Closed,
+    /// on a live leader and its followers), and nothing else.
+    void consensusDenyVote(NodeId voter, int64_t term) {
+        DrNode& n = node(voter);
+        n.candidateTerm = std::max(n.candidateTerm, term);
     }
 
     /// The controller's committed ISR contains `id`.
@@ -888,7 +900,14 @@ private:
     std::optional<rune::metadata::ReplicaPositionTable> capturedPositions_;   ///< see controllerLearnPositionsFrom
     /// Consensus vote rule (voter, candidate) — Election::mayVoteFor as the
     /// broker wires it: InternalIsrKnowledge::eligible of the voter.
-    static int64_t termOf_(const void* n) noexcept { return static_cast<const DrNode*>(n)->consensusTerm; }
+    static int64_t termOf_(const void* p) noexcept {
+        const auto* n = static_cast<const DrNode*>(p);
+        return rune::consensus::ackTerm(n->candidateTerm, n->votedTerm, n->leadershipTerm);
+    }
+    static void observeTerm_(DrNode& n, int64_t term) noexcept {   // NewLeadershipTerm seen
+        n.candidateTerm  = std::max(n.candidateTerm, term);
+        n.leadershipTerm = std::max(n.leadershipTerm, term);
+    }
     bool consensusVoteGate_(NodeId voter, NodeId candidate) {
         DrNode& v = node(voter);
         return v.isrKnowledge == nullptr || v.isrKnowledge->eligible(candidate);

@@ -732,6 +732,7 @@ void Election::onRequestVote(Term    logLeadershipTermId,
         // Election.java:376-377: proposeMaxCandidateTermId
         candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
             candidateTermId, logPosition, /*timestampMs=*/0);
+        votedTermId_ = std::max(votedTermId_, candidateTermId);   // MAJOR-R3: a GRANT
         placeVote(candidateTermId, candidateId, true);
         // Election.java:379: state(FOLLOWER_BALLOT, nowNs, "")
         // nowNs is passed in from the caller (duty-cycle clock).
