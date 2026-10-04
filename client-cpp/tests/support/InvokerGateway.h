@@ -576,6 +576,11 @@ struct InvokerGateway {
 
     /// Push one Records frame of `count` records at baseOffset to a subscription.
     void pushRecords(const Subscribed& sub, int64_t baseOffset, int32_t count) {
+        pushRecordsFrom(sub, baseOffset, count, replyFromArrival ? sub.endpoint : 0);
+    }
+    /// ... from endpoint `from`'s publication (e.g. a worker's own socket — the
+    /// broker's MDC fallback — that no session's ConnectResponse came from).
+    void pushRecordsFrom(const Subscribed& sub, int64_t baseOffset, int32_t count, int from) {
         namespace rcc = rune::client::codec;
         rune::protocol::RecordBatchBuilder b(baseOffset, 1'000'000);
         for (int32_t i = 0; i < count; ++i) b.append("k", "v", 1'000'000 + i);
@@ -584,7 +589,7 @@ struct InvokerGateway {
         const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId,
                                                  sub.topicId, sub.partition, baseOffset,
                                                  std::span<const uint8_t>(batch), sub.sessionId, 0);
-        send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
+        send(from, out.data(), n);
     }
 
     void releaseHeld() {
@@ -944,8 +949,10 @@ private:
             }
             int64_t subId = nextSubscriptionId++;
             if (perEndpointSubIds) {
-                auto [it, fresh] = endpointSubIds.try_emplace(endpoint, int64_t{500});
-                subId = fresh ? it->second : ++it->second;
+                // Like the broker: each node's own counter, cluster-unique
+                // through the node prefix ((node + 1) << 40).
+                auto [it, fresh] = endpointSubIds.try_emplace(endpoint, int64_t{1});
+                subId = (static_cast<int64_t>(endpoint + 1) << 40) | (fresh ? it->second : ++it->second);
             }
             const Subscribed sub{subId, sv->topicId, sv->partition, sv->sessionId,
                                  endpoint, sv->fromOffset, sv->correlationId};
