@@ -490,5 +490,68 @@ TEST_F(ProducePathTest, IdempotenceWindowRegression_BatchCrossingInt32MaxRefused
     EXPECT_EQ(log_.logEndOffset(), 0);
 }
 
+// ===========================================================================
+// D6 — UnknownProducerId.  A rebuilt producer state (failover / restart) that
+// lost producer P to retention answers P's next batch UnknownProducerId with
+// the partition's logStartOffset — NOT appended, never OOS.
+// ===========================================================================
+TEST(ProducePathUnknownProducerIdRegression, RebuiltAfterRetentionAnswersUnknownProducerIdWithLogStartRegression)
+{
+    TmpDir dir("d6");
+    rune::storage::Log log(dir.path.string(), /*segmentRollBytes=*/256);
+    log.recover();
+    rune::storage::ProducerStateManager live;
+    constexpr int64_t kP = 7, kQ = 8;
+    for (int32_t s = 0; s < 6; ++s) {
+        auto b = makeBatch(1, kP, 0, s);
+        ASSERT_TRUE(callHelper(b, log, live, 1, 0, kP, 0, s).isOK());
+    }
+    for (int32_t s = 0; s < 12; ++s) {
+        auto b = makeBatch(1, kQ, 2, s);
+        ASSERT_TRUE(callHelper(b, log, live, 1, 0, kQ, 2, s).isOK());
+    }
+    ASSERT_GT(log.deleteOldSegments(0), 0);
+    const int64_t logStart = log.logStartOffset();
+    ASSERT_GE(logStart, 6) << "precondition: every batch of P is below the log start";
+
+    rune::storage::ProducerStateManager rebuilt;
+    ASSERT_TRUE(rebuilt.rebuildFromLog(1, log, log.logEndOffset(), 0));
+    const int64_t leo = log.logEndOffset();
+
+    auto p6 = makeBatch(1, kP, 0, 6);
+    const auto o = callHelper(p6, log, rebuilt, 1, 0, kP, 0, 6);
+    EXPECT_EQ(o.error, pc::ErrorCode::UnknownProducerId);
+    EXPECT_EQ(o.logStartOffset, logStart);
+    EXPECT_EQ(log.logEndOffset(), leo) << "an UnknownProducerId batch was appended";
+
+    // The client's U1 answer: a new epoch from sequence 0 -> accepted.
+    auto p0 = makeBatch(1, kP, 1, 0);
+    const auto a = callHelper(p0, log, rebuilt, 1, 0, kP, 1, 0);
+    EXPECT_TRUE(a.isOK());
+    EXPECT_EQ(a.baseOffset, leo);
+    EXPECT_EQ(a.logStartOffset, -1) << "logStartOffset is carried only with UnknownProducerId";
+
+    // Known producer: gap still OOS, lower epoch still fenced.
+    auto qGap = makeBatch(1, kQ, 2, 20);
+    EXPECT_EQ(callHelper(qGap, log, rebuilt, 1, 0, kQ, 2, 20).error, pc::ErrorCode::OutOfOrderSequence);
+    auto qOld = makeBatch(1, kQ, 1, 12);
+    EXPECT_EQ(callHelper(qOld, log, rebuilt, 1, 0, kQ, 1, 12).error, pc::ErrorCode::InvalidProducerEpoch);
+    EXPECT_EQ(log.logEndOffset(), leo + 1);
+}
+
+// The version gate (ConnectRequest.clientVersion): only a client that
+// understands UnknownProducerId gets it; older clients keep OOS.
+TEST(ProducePathUnknownProducerIdRegression, AnswerIsGatedOnClientVersionRegression)
+{
+    using rune::storage::produceErrorForClient;
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::UnknownProducerId, pc::kClientVersion),
+              pc::ErrorCode::UnknownProducerId);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::UnknownProducerId, 1), pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::UnknownProducerId, 0), pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::OutOfOrderSequence, pc::kClientVersion),
+              pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::NotLeader, 1), pc::ErrorCode::NotLeader);
+}
+
 } // namespace
 } // namespace rune::storage

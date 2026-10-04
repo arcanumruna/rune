@@ -748,9 +748,12 @@ public:
     //
     // Returns the allocated sessionId.
     // Single-writer: call only on the duty-cycle thread or before doWork() starts.
-    int64_t injectTestSession(int64_t nowNs = 0) {
+    // D6: clientVersion = the session's ConnectRequest.clientVersion (default:
+    // the current client, which understands UnknownProducerId).
+    int64_t injectTestSession(int64_t nowNs = 0,
+                              int32_t clientVersion = rune::protocol::client::kClientVersion) {
         const int64_t sid = sessions_.nextSessionId();
-        sessions_.add(sid, /*egress=*/nullptr, nowNs);
+        sessions_.add(sid, /*egress=*/nullptr, nowNs, {}, 0, clientVersion);
         return sid;
     }
 
@@ -889,11 +892,11 @@ private:
     // copied into `bytes` at enqueue time (encode-once strategy); `sessionId`
     // identifies the egress session on drain.
     //
-    // kMaxBytes = 512 covers ProduceResponse (38 B) and ErrorResponse with a
+    // kMaxBytes = 512 covers ProduceResponse (46 B, D6) and ErrorResponse with a
     // typical redirect URL (< ~450 B).  Responses that exceed kMaxBytes are
     // sent best-effort and NOT enqueued (same as pre-fix behaviour for those
     // rare oversized frames).  A static_assert in sendRespReliable_ ensures the
-    // produce-ack path (ProduceResponse::ENCODED_SIZE = 38) always fits.
+    // produce-ack path (ProduceResponse::ENCODED_SIZE = 46) always fits.
     //
     // Single-writer: all accesses are on the duty-cycle thread only.
     // -----------------------------------------------------------------------
@@ -993,6 +996,7 @@ private:
         // be created lazily on the first subscribe.
         std::string egressChannel;
         int32_t     egressStreamId = 0;
+        int32_t     clientVersion  = 0;   ///< D6: ConnectRequest.clientVersion
 
         // Task 13 (spec §3.4): every worker has this session's reply destination
         // queued (announce-before-accept) — set once, so a ConnectResponse retry
@@ -1164,11 +1168,15 @@ private:
     // currentProduceSessionId_.  All internal callers (handleProduce) should
     // call sendRespReliable_() directly for clarity.
     // -----------------------------------------------------------------------
+    // D6: `ec` is mapped for the session's client version
+    // (produceErrorForClient); logStartOffset is carried on the wire (-1 =
+    // not carried — set only with UnknownProducerId).
     bool sendRespReliable_(Session& session,
                            rune::protocol::client::ErrorCode ec,
                            int32_t                           partition,
                            int64_t                           baseOffset,
-                           int64_t                           correlationId);
+                           int64_t                           correlationId,
+                           int64_t                           logStartOffset = -1);
 
     // G0.1: offerBytes_ — try to offer encoded bytes on the egress.
     // Returns > 0 on success, <= 0 on back-pressure.
@@ -1259,7 +1267,7 @@ private:
 
     // Reusable encode scratch — 68 KiB covers any Milestone-A/B frame.
     // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB;
-    //  ProduceResponse=38 B; restamp scratch = max RecordBatch = 65535 B)
+    //  ProduceResponse=46 B; restamp scratch = max RecordBatch = 65535 B)
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
 

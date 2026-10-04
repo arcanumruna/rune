@@ -23,6 +23,9 @@
 //     5. Idempotent dedup via `producerState`:
 //          Duplicate     → return prior baseOffset, NO append.
 //          OOS           → return OutOfOrderSequence, NO append.
+//          UnknownPid    → return UnknownProducerId + logStartOffset, NO append
+//                          (D6; the caller maps it per client version:
+//                          produceErrorForClient).
 //          Fenced        → return InvalidProducerEpoch, NO append.
 //          Accept        → fall through.
 //     6. Min-ISR gate for acks=All:
@@ -105,11 +108,25 @@ struct ProduceOutcome {
     /// true → rejected: the Produce frame's producer identity disagrees with the
     /// CRC-covered RecordBatch header (EOS-DUP defense); caller counts + logs.
     bool     identityMismatch = false;
+    /// D6: with error == UnknownProducerId, the partition's log start offset at
+    /// the answer (the wire ProduceResponse.logStartOffset); -1 otherwise.
+    int64_t  logStartOffset = -1;
 
     [[nodiscard]] bool isOK() const noexcept {
         return error == rune::protocol::client::ErrorCode::OK;
     }
 };
+
+// ---------------------------------------------------------------------------
+// produceErrorForClient — D6 version gate (ConnectRequest.clientVersion).
+// UnknownProducerId (28) goes only to clients that understand it; an older
+// client gets OutOfOrderSequence — the pre-D6 answer, equally "NOT appended".
+// Every other code passes through.  The single definition lives in
+// rune-protocol (review L4); every broker answer site encodes through
+// ProduceResponse::encodeFor(buf, clientVersion), which applies it together
+// with the frame-size gate (review M4).
+// ---------------------------------------------------------------------------
+using rune::protocol::client::produceErrorForClient;
 
 // ---------------------------------------------------------------------------
 // handleProduceBatch — the shared produce-batch core.

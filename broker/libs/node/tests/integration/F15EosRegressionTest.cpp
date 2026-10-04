@@ -4550,6 +4550,7 @@ std::vector<uint8_t> seqBatch(int64_t pid, int16_t epoch, int32_t seq, int64_t b
 struct Answer {
     int16_t err  = -1;
     int64_t base = -1;
+    int64_t lso  = -1;   // D6: ProduceResponse.logStartOffset
 };
 // The no-worker-pool INLINE path: a real ClientGateway appends to the log of a
 // control-owned replica (the gateway thread is its owner) — or, without a
@@ -4567,9 +4568,12 @@ struct InlineRig {
         ts.segmentRollBytes = roll;
         return ts;
     }
+    std::vector<std::vector<uint8_t>> frames;   // D6 review M4: every raw egress frame
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
         [this](const uint8_t* b, std::size_t n) -> int64_t {
-            if (auto pr = pc::ProduceResponse::decode(b, n)) answers.push_back(Answer{pr->errorCode, pr->baseOffset});
+            frames.emplace_back(b, b + n);
+            if (auto pr = pc::ProduceResponse::decode(b, n))
+                answers.push_back(Answer{pr->errorCode, pr->baseOffset, pr->logStartOffset});
             return 1;
         });
     int64_t sid  = 0;
@@ -5375,4 +5379,230 @@ TEST(CleanerLsoRegression, RcRebuildMapsSealedSegmentThroughItsOwnInode) {
     ASSERT_EQ(w.rcStatusForTest(0, 0), 2) << "the rebuild finished";
     EXPECT_EQ(w.rcOpenTxnsForTest(0, 0), 0u)
         << "the aborted txn was left OPEN: the rebuild mapped the rewritten segment (marker @" << markerOff << " gone)";
+}
+
+// ============================================================================
+// D6 — UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID).  After retention removed
+// every batch of producer P, a REBUILT producer state (failover / restart /
+// re-promotion) has no entry for P: P's next batch (seq k > 0) is NOT appended
+// and is answered UnknownProducerId with the partition's logStartOffset — to a
+// client that announced clientVersion >= 2; an older client keeps getting
+// OutOfOrderSequence.  Only on a PROVEN state (unproven: NotLeader / Internal,
+// as before).  Known producers: gap -> OOS, epochs unchanged.
+// ============================================================================
+namespace {
+constexpr int16_t kUnknownPid = static_cast<int16_t>(pc::ErrorCode::UnknownProducerId);
+constexpr int16_t kOosD6      = static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence);
+} // namespace
+
+TEST(UnknownProducerIdRegression, InlineFailoverAfterRetentionAnswersUnknownProducerIdRegression) {
+    InlineRig R(Role::Follower, {1}, /*withReplica=*/true, /*roll=*/256);
+    preload(R.log(), /*P*/ 7, 0, 0, 5);
+    preload(R.log(), /*Q*/ 8, 2, 0, 11);
+    ASSERT_GT(R.log().deleteOldSegments(0), 0);
+    const int64_t logStart = R.log().logStartOffset();
+    ASSERT_GE(logStart, 6) << "precondition: retention removed every batch of P";
+    R.r->becomeLeader(2, {1});                               // failover: this node takes over
+    (void)R.r->doWork(++R.now);
+    ASSERT_TRUE(R.r->isLeaderComplete());
+    R.gw.onNodeLeadershipGainedForTest();
+    const int64_t leo = R.log().logEndOffset();
+
+    const Answer a = R.produce(7, 0, 6);
+    EXPECT_EQ(a.err, kUnknownPid) << "P's next batch after the rebuild";
+    EXPECT_EQ(a.lso, logStart);
+    EXPECT_EQ(R.log().logEndOffset(), leo) << "an UnknownProducerId batch was appended";
+
+    // An OLD client (clientVersion 1) gets OutOfOrderSequence, as before D6.
+    const int64_t oldSid = R.gw.injectTestSession(0, /*clientVersion=*/1);
+    const auto f = produceFrame(oldSid, ++R.corr, seqBatch(7, 0, 6), 0, 0, 0, 7, 0, 6);
+    R.gw.applyProduceForTest(f.data(), f.size());
+    ASSERT_FALSE(R.answers.empty());
+    EXPECT_EQ(R.answers.back().err, kOosD6) << "an old client must never see UnknownProducerId";
+    EXPECT_EQ(R.log().logEndOffset(), leo);
+
+    // The client's U1 re-sequence (new epoch from seq 0) is accepted.
+    const Answer u = R.produce(7, 1, 0);
+    EXPECT_EQ(u.err, 0);
+    EXPECT_EQ(u.base, leo);
+    EXPECT_EQ(u.lso, -1);
+    EXPECT_EQ(R.produce(7, 1, 1).base, leo + 1);
+    // Known producer Q: gap -> OOS, lower epoch -> fenced, in order -> OK.
+    EXPECT_EQ(R.produce(8, 2, 20).err, kOosD6);
+    EXPECT_EQ(R.produce(8, 1, 12).err, kInvalidProducerEpoch);
+    EXPECT_EQ(R.produce(8, 2, 12).err, 0);
+}
+
+TEST(UnknownProducerIdRegression, InlineUnprovenStateNeverAnswersUnknownProducerIdRegression) {
+    // An incomplete leader cannot vouch: retriable NotLeader, never 28.
+    InlineRig R(Role::Follower, {1, 2}, true, 256);
+    preload(R.log(), 7, 0, 0, 5);
+    preload(R.log(), 8, 2, 0, 11);
+    ASSERT_GT(R.log().deleteOldSegments(0), 0);
+    R.r->becomeLeader(2, {1, 2});
+    ASSERT_FALSE(R.r->isLeaderComplete()) << "precondition: follower 2 has not reported in";
+    EXPECT_EQ(R.produce(7, 0, 6).err, kNotLeader);
+}
+
+TEST(UnknownProducerIdRegression, WorkerRebuildAfterRetentionAnswersUnknownProducerIdWithLogStartRegression) {
+    // The worker path (gateway-routed op): the owning worker's RC-built state
+    // after retention answers 28 with the log start (carried in baseOffset of
+    // the ProduceResult — the carrier does not grow); the gateway relays it
+    // version-gated per session.
+    TmpDir d;
+    Log log(d.path.string(), /*segmentRollBytes=*/256);
+    log.recover();
+    preload(log, 7, 0, 0, 5);
+    preload(log, 8, 2, 0, 11);
+    ASSERT_GT(log.deleteOldSegments(0), 0);
+    const int64_t logStart = log.logStartOffset();
+    ASSERT_GE(logStart, 6);
+    NullTransport t;
+    PartitionReplica rep(cfg(1), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 16, 1 << 16, 16, 16);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    for (int i = 0; i < 4096 && w.rcStatusForTest(1, 0) != Worker::kRcReady; ++i) {
+        w.doWork(1 + i);
+        (void)drainAll(w);
+    }
+    ASSERT_EQ(w.rcStatusForTest(1, 0), Worker::kRcReady);
+    const int64_t leo = log.logEndOffset();
+    auto op = [&](int64_t pid, int16_t epoch, int32_t seq, int64_t corr) {
+        WorkerOp o;
+        o.type = WorkerOp::Type::Produce; o.topicId = 1; o.partition = 0; o.replica = &rep;
+        o.logPtr = &log; o.sessionId = 1; o.correlationId = corr; o.recordCount = 1;
+        o.producerId = pid; o.producerEpoch = epoch; o.baseSequence = seq;
+        o.recordBatchBytes = seqBatch(pid, epoch, seq);
+        return stamp(std::move(o));
+    };
+    auto run = [&](int64_t pid, int16_t epoch, int32_t seq, int64_t corr) {
+        EXPECT_TRUE(w.tryEnqueueOp(op(pid, epoch, seq, corr)));
+        w.doWork(10'000 + corr);
+        auto rets = drainAll(w);
+        EXPECT_EQ(rets.size(), 1u) << "seq " << seq;
+        return rets.empty() ? WorkerReturn{} : rets[0];
+    };
+    const WorkerReturn unknown = run(7, 0, 6, 1);
+    EXPECT_EQ(unknown.errorCode, kUnknownPid);
+    EXPECT_EQ(unknown.baseOffset, logStart) << "the ProduceResult carries the log start in baseOffset";
+    EXPECT_EQ(log.logEndOffset(), leo);
+    EXPECT_EQ(run(8, 2, 20, 2).errorCode, kOosD6) << "known entry + gap";
+    EXPECT_EQ(run(8, 1, 12, 3).errorCode, kInvalidProducerEpoch);
+    const WorkerReturn ok = run(7, 1, 0, 4);
+    EXPECT_EQ(ok.errorCode, 0);
+    EXPECT_EQ(ok.baseOffset, leo);
+
+    // Gateway relay: version-gated per session, log start on the wire.
+    std::vector<Answer> answers;
+    auto gw = rune::gateway::ClientGateway::makeForTest([&](const uint8_t* b, std::size_t n) -> int64_t {
+        if (auto pr = pc::ProduceResponse::decode(b, n))
+            answers.push_back(Answer{pr->errorCode, pr->baseOffset, pr->logStartOffset});
+        return 1;
+    });
+    const int64_t newSid = gw.injectTestSession(0, pc::kClientVersion);
+    const int64_t oldSid = gw.injectTestSession(0, 1);
+    WorkerReturn r1 = unknown; r1.sessionId = newSid;
+    WorkerReturn r2 = unknown; r2.sessionId = oldSid;
+    gw.handleWorkerReturnForTest(r1);
+    gw.handleWorkerReturnForTest(r2);
+    ASSERT_EQ(answers.size(), 2u);
+    EXPECT_EQ(answers[0].err, kUnknownPid);
+    EXPECT_EQ(answers[0].lso, logStart);
+    EXPECT_EQ(answers[0].base, 0);
+    EXPECT_EQ(answers[1].err, kOosD6) << "an old client must never see UnknownProducerId";
+}
+
+// ============================================================================
+// D6 review M4 — the 46 B ProduceResponse goes ONLY to sessions that announced
+// clientVersion >= kClientVersionUnknownProducerId.  Every other session gets
+// the exact pre-D6 38 B frame (blockLength 14), at EVERY answer site, so a
+// STRICT pre-D6 decoder (exact length 38, exact blockLength 14 — what a non-C++
+// client may hard-code) reads all of them.  Sites: the inline answer
+// (sendRespReliable_: OK + UnknownProducerId->OOS), the worker-return relay
+// (error + OK), and the inline acks=all pending acks (OK on the HW, NotLeader
+// on a stale replica, Internal on the timeout).
+// ============================================================================
+namespace {
+struct StrictV0 { int64_t sid = 0; int16_t err = -1; int64_t base = -1; };
+// The pre-D6 decode, made strict: exact frame length and exact blockLength.
+std::optional<StrictV0> strictPreD6Decode(const std::vector<uint8_t>& f) {
+    if (f.size() != 38) return std::nullopt;
+    if (pc::detail::getLE16(f.data(), 0) != 14) return std::nullopt;            // blockLength
+    auto hdr = pc::MessageHeader::decode(f.data(), f.size());
+    if (!hdr || hdr->schemaId != pc::kSchemaId || hdr->templateId != 17) return std::nullopt;
+    return StrictV0{hdr->sessionId, pc::detail::getLE16s(f.data(), 24), pc::detail::getLE64(f.data(), 30)};
+}
+int64_t frameSid(const std::vector<uint8_t>& f) { return pc::MessageHeader::decode(f.data(), f.size())->sessionId; }
+} // namespace
+
+TEST(UnknownProducerIdRegression, OldSessionsGetTheStrictPreD6FrameAtEveryAnswerSiteRegression) {
+    InlineRig R(Role::Follower, {1, 2});
+    R.r->becomeLeader(2, {1, 2});
+    rune::replication::FetchRequestMsg fr0{R.r->epoch(), 0, /*follower*/2, /*fetchOffset*/0, 1 << 20, R.r->topicId()};
+    (void)R.r->onFetchRequest(fr0, ++R.now);
+    ASSERT_TRUE(R.r->isLeaderComplete());
+    R.gw.onNodeLeadershipGainedForTest();
+    const int64_t oldSid = R.gw.injectTestSession(0, /*clientVersion=*/1);
+    const int64_t newSid = R.sid;                                   // clientVersion 2
+    auto sendAs = [&](int64_t sid, int64_t pid, int32_t seq, uint8_t acks) {
+        const auto f = produceFrame(sid, ++R.corr, seqBatch(pid, 0, seq), acks, 0, 0, pid, 0, seq);
+        R.gw.applyProduceForTest(f.data(), f.size());
+    };
+    // Inline answers (acks=leader): OK, and UnknownProducerId (no entry, seq 5).
+    sendAs(oldSid, 7, 0, 0);
+    sendAs(oldSid, 9, 5, 0);
+    sendAs(newSid, 8, 0, 0);
+    sendAs(newSid, 10, 5, 0);
+    // Worker-return relay: an error and an OK result.
+    WorkerReturn er; er.type = WorkerReturn::Type::ProduceResult; er.partition = 0;
+    er.errorCode = kUnknownPid; er.baseOffset = 0; er.correlationId = 900;
+    WorkerReturn ok = er; ok.errorCode = 0; ok.baseOffset = 3; ok.correlationId = 901;
+    for (int64_t sid : {oldSid, newSid}) {
+        er.sessionId = sid; ok.sessionId = sid;
+        R.gw.handleWorkerReturnForTest(er);
+        R.gw.handleWorkerReturnForTest(ok);
+    }
+    // Pending acks (inline acks=all, parked on the HW): OK once follower 2 passes it.
+    const int64_t okOff = R.log().logEndOffset();
+    sendAs(oldSid, 7, 1, 1);
+    sendAs(newSid, 8, 1, 1);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 2u) << "precondition: parked on the HW";
+    rune::replication::FetchRequestMsg fr1{R.r->epoch(), 0, 2, okOff + 2, 1 << 20, R.r->topicId()};
+    (void)R.r->onFetchRequest(fr1, ++R.now);
+    (void)R.r->doWork(++R.now);
+    ASSERT_GT(R.r->gatewayHighWatermark(), okOff + 1) << "precondition: the HW passed both batches";
+    R.gw.drainPendingAcksForTest(++R.now);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 0u);
+    // Pending acks: Internal on the timeout.
+    sendAs(oldSid, 7, 2, 1);
+    sendAs(newSid, 8, 2, 1);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 2u);
+    R.gw.drainPendingAcksForTest(R.now + 31'000'000'000LL);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 0u);
+    // Pending acks: NotLeader on a stale (removed) replica.
+    sendAs(oldSid, 7, 3, 1);
+    sendAs(newSid, 8, 3, 1);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 2u);
+    R.reg.remove(0, 0);
+    ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u);
+    R.gw.drainPendingAcksForTest(R.now + 32'000'000'000LL);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 0u);
+
+    std::vector<int16_t> oldCodes, newCodes;
+    for (const auto& f : R.frames) {
+        ASSERT_GE(f.size(), 24u);
+        if (frameSid(f) == oldSid) {
+            const auto d = strictPreD6Decode(f);
+            ASSERT_TRUE(d.has_value()) << "a clientVersion-1 session got a " << f.size()
+                                       << " B frame: a strict pre-D6 decoder drops it";
+            oldCodes.push_back(d->err);
+        } else {
+            ASSERT_EQ(f.size(), pc::ProduceResponse::ENCODED_SIZE) << "a clientVersion-2 session gets the 46 B frame";
+            newCodes.push_back(pc::ProduceResponse::decode(f.data(), f.size())->errorCode);
+        }
+    }
+    const std::vector<int16_t> want{0, kOosD6, kOosD6, 0, 0, static_cast<int16_t>(pc::ErrorCode::Internal), kNotLeader};
+    EXPECT_EQ(oldCodes, want) << "every answer site, in order";
+    const std::vector<int16_t> wantNew{0, kUnknownPid, kUnknownPid, 0, 0, static_cast<int16_t>(pc::ErrorCode::Internal), kNotLeader};
+    EXPECT_EQ(newCodes, wantNew);
 }

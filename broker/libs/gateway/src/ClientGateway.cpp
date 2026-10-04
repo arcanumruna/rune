@@ -302,7 +302,8 @@ bool ClientGateway::sendRespReliable_(Session&          session,
                                       pc::ErrorCode     ec,
                                       int32_t           partition,
                                       int64_t           baseOffset,
-                                      int64_t           correlationId)
+                                      int64_t           correlationId,
+                                      int64_t           logStartOffset)
 {
     static_assert(pc::ProduceResponse::ENCODED_SIZE <= PendingResp::kMaxBytes,
                   "ProduceResponse::ENCODED_SIZE exceeds PendingResp::kMaxBytes");
@@ -312,10 +313,14 @@ bool ClientGateway::sendRespReliable_(Session&          session,
     pc::ProduceResponse resp;
     resp.sessionId     = session.sessionId;
     resp.correlationId = correlationId;
-    resp.errorCode     = static_cast<int16_t>(ec);
-    resp.partition     = partition;
-    resp.baseOffset    = baseOffset;
-    const std::size_t encoded = resp.encode(scratch_.data());
+    // D6: UnknownProducerId only to clients that understand it (else OOS).
+    // D6 review M4: encodeFor applies the version gate (28 -> OOS) AND the
+    // frame size (pre-D6 38 B below clientVersion 2) for this session.
+    resp.errorCode      = static_cast<int16_t>(ec);
+    resp.partition      = partition;
+    resp.baseOffset     = baseOffset;
+    resp.logStartOffset = logStartOffset;
+    const std::size_t encoded = resp.encodeFor(scratch_.data(), session.clientVersion);
     if (encoded == 0 || encoded > PendingResp::kMaxBytes) {
         spdlog::error("ClientGateway::sendRespReliable_: encode error ({} bytes)", encoded);
         return false;
@@ -1152,6 +1157,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.leaderClientEndpoint  = std::move(capturedLeaderEndpoint);
     pc_entry.egressChannel         = std::string(req.egressChannel);
     pc_entry.egressStreamId        = req.egressStreamId;
+    pc_entry.clientVersion         = req.clientVersion;   // D6
     pendingConnects_.push_back(std::move(pc_entry));
 }
 
@@ -1317,7 +1323,8 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 }
                 pending.announceBegun = true;
                 if (!sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
-                                                pending.egressChannel, pending.egressStreamId)) {
+                                                pending.egressChannel, pending.egressStreamId,
+                                                pending.clientVersion)) {
                     ++it;
                     continue;   // a worker ring is full — retry next cycle
                 }
@@ -1356,7 +1363,8 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // Carry the client's egress endpoint so a per-consumer unicast Records
             // publication can be lazily created on the first subscribe.
             sessions_.add(pending.sessionId, std::move(pub), nowNs,
-                          pending.egressChannel, pending.egressStreamId);
+                          pending.egressChannel, pending.egressStreamId,
+                          pending.clientVersion);
         }
 
         it = pendingConnects_.erase(it);
@@ -1661,8 +1669,9 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // G0.1: Helper: send ProduceResponse reliably (retry on back-pressure).
     // Delegates to sendRespReliable_ which encodes once and enqueues on
     // BACK_PRESSURED / ADMIN_ACTION instead of silently dropping the ack.
-    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t baseOffset) {
-        sendRespReliable_(*session, ec, partition, baseOffset, msg.correlationId);
+    auto sendResp = [&](pc::ErrorCode ec, int32_t partition, int64_t baseOffset,
+                        int64_t logStartOffset = -1) {
+        sendRespReliable_(*session, ec, partition, baseOffset, msg.correlationId, logStartOffset);
     };
 
     // 3. Resolve partition.
@@ -2164,7 +2173,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                              msg.producerId, msg.producerEpoch, msg.baseSequence,
                              msg.topicId, partition, identityMismatchRejects_);
         }
-        sendResp(outcome.error, partition, 0);
+        sendResp(outcome.error, partition, 0, outcome.logStartOffset);   // D6: log start with 28
         return;
     }
     // Dedup path (log untouched).  F15 S5 parity on the inline path (Kafka
@@ -3504,15 +3513,21 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
 
             // Error path: worker failed to append (e.g. Log threw).
             if (ret.errorCode != 0) {
+                // D6: an UnknownProducerId result carries the log start in
+                // baseOffset (the ProduceResult carrier does not grow); the
+                // answer is version-gated for this session.
+                const auto ec = static_cast<pc::ErrorCode>(ret.errorCode);
                 pc::ProduceResponse resp;
-                resp.sessionId     = ret.sessionId;
-                resp.correlationId = ret.correlationId;
-                resp.errorCode     = ret.errorCode;
-                resp.partition     = ret.partition;
-                resp.baseOffset    = 0;
+                resp.sessionId      = ret.sessionId;
+                resp.correlationId  = ret.correlationId;
+                resp.errorCode      = ret.errorCode;   // gated by encodeFor (28 -> OOS for old sessions)
+                resp.partition      = ret.partition;
+                resp.baseOffset     = 0;
+                resp.logStartOffset = ec == pc::ErrorCode::UnknownProducerId ? ret.baseOffset : -1;
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
-                const std::size_t encoded = resp.encode(scratch_.data());
+                // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);
                 // G0.1: reliable delivery (retry on back-pressure).
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 return;
@@ -3532,7 +3547,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 okResp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
                 okResp.partition     = ret.partition;
                 okResp.baseOffset    = ret.baseOffset;
-                const std::size_t encoded = okResp.encode(scratch_.data());
+                const std::size_t encoded = okResp.encodeFor(scratch_.data(), session->clientVersion);
                 // G0.1: reliable delivery (retry on back-pressure).
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
@@ -3847,7 +3862,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = 0;
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
             spdlog::debug("ClientGateway: acks=All pending ack for topic={} partition={} is stale "
@@ -3869,7 +3884,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = 0;
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
             if (i + 1 < pendingAcks_.size()) pendingAcks_[i] = std::move(pendingAcks_.back());
@@ -3897,7 +3912,7 @@ void ClientGateway::drainPendingAcks()
                 resp.baseOffset    = entry.baseOffset;
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 // G0.1: reliable delivery (retry on back-pressure) — this is the
                 // highest-durability acks=All OK ack; a silent drop here is the
                 // exact defect #3 the retry queue exists to prevent.
@@ -3922,7 +3937,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::Internal);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = entry.baseOffset;
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 // G0.1: reliable delivery (retry on back-pressure).
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 spdlog::warn("ClientGateway: acks=All deferred ack timed out "

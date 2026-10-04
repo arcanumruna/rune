@@ -155,7 +155,11 @@ ProducerStateManager::validate(int32_t topicId,
         // Brand-new producer on this partition — trust-on-first-use.
         // Epoch is accepted as-is for the first appearance of a (producerId, partition)
         // pair on this node. Cross-node epoch fencing requires a coordinator.
-        if (baseSequence != 0) return ValidationResult::oos();
+        // D6 (Kafka UNKNOWN_PRODUCER_ID): a non-zero first sequence means this
+        // state does not know the producer — typically retention removed all its
+        // batches before a rebuild.  NOT appended; the caller answers it with
+        // the partition's logStartOffset (OutOfOrderSequence to old clients).
+        if (baseSequence != 0) return ValidationResult::unknownProducer();
         return ValidationResult::accept();
     }
 

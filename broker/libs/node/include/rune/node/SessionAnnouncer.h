@@ -34,7 +34,10 @@ class SessionAnnouncer {
 public:
     /// Announce `sessionId` to every worker not yet reached.  True once every
     /// worker has it queued (then — and only then — the runtime may accept).
-    bool announce(WorkerPool& pool, int64_t sessionId, std::string_view channel, int32_t streamId) {
+    /// D6: `clientVersion` (ConnectRequest.clientVersion) rides along so a
+    /// worker acking directly gates UnknownProducerId per session.
+    bool announce(WorkerPool& pool, int64_t sessionId, std::string_view channel, int32_t streamId,
+                  int32_t clientVersion = 0) {
         Announcing* a = findAnnouncing_(sessionId);
         if (!a) { announcing_.push_back({sessionId, allMask_(pool)}); a = &announcing_.back(); }
         for (int32_t w = 0; w < pool.workerCount(); ++w) {
@@ -45,6 +48,7 @@ public:
             op.sessionId      = sessionId;
             op.egressStreamId = streamId;
             op.egressChannel  = channel;
+            op.clientVersion  = clientVersion;
             if (pool.worker(w).tryEnqueueOp(std::move(op))) a->remaining &= ~bit;
         }
         if (a->remaining != 0) return false;

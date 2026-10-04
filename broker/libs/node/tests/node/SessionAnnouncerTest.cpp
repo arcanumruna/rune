@@ -51,3 +51,16 @@ TEST(SessionAnnouncerRegression, CloseRetriesUntilEveryWorkerAccepted) {
     EXPECT_EQ(a.retryCloses(*p), 1);
     EXPECT_EQ(a.pendingClosesForTest(), 0u);
 }
+
+// D6: the announcement carries the session's ConnectRequest.clientVersion to
+// every worker (a shard worker acks directly and gates UnknownProducerId on it).
+TEST(SessionAnnouncerRegression, AnnouncementCarriesTheClientVersionRegression) {
+    auto p = pool(2);
+    SessionAnnouncer a;
+    EXPECT_TRUE(a.announce(*p, 5, "c", 9, /*clientVersion=*/1));
+    drainAll(*p);
+    for (int32_t w = 0; w < 2; ++w) EXPECT_EQ(p->worker(w).lastAnnouncedClientVersionForTest(), 1);
+    EXPECT_TRUE(a.announce(*p, 6, "c", 9, /*clientVersion=*/2));
+    drainAll(*p);
+    for (int32_t w = 0; w < 2; ++w) EXPECT_EQ(p->worker(w).lastAnnouncedClientVersionForTest(), 2);
+}

@@ -65,11 +65,14 @@ struct Fixture {
     std::shared_ptr<aeron::ExclusivePublication> producePub;
     std::shared_ptr<aeron::Subscription> egress;
     std::map<int64_t, pc::ProduceResponse> acks;
+    std::map<int64_t, std::size_t> ackBytes;                   // D6 review M4: the raw frame length per ack
     aeron::FragmentAssembler asmb{[this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
                                          aeron::util::index_t l, aeron::Header&) {
         if (auto r = pc::ProduceResponse::decode(reinterpret_cast<const uint8_t*>(b.buffer() + o),
-                                                 static_cast<std::size_t>(l)))
+                                                 static_cast<std::size_t>(l))) {
             acks[r->correlationId] = *r;
+            ackBytes[r->correlationId] = static_cast<std::size_t>(l);
+        }
     }};
     int64_t now = 1'000;
     int egressLimit = 64;                                      // session 5's client reads this many acks / step
@@ -82,18 +85,28 @@ struct Fixture {
     aeron::FragmentAssembler asmb2{[this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
                                           aeron::util::index_t l, aeron::Header&) {
         if (auto r = pc::ProduceResponse::decode(reinterpret_cast<const uint8_t*>(b.buffer() + o),
-                                                 static_cast<std::size_t>(l)))
+                                                 static_cast<std::size_t>(l))) {
             acks[r->correlationId] = *r;
+            ackBytes[r->correlationId] = static_cast<std::size_t>(l);
+        }
     }};
 
-    explicit Fixture(std::vector<rune::replication::NodeId> replicas, int minIsr) {
+    /// `preload` (D6 review M3): writes the log before the replica / worker see
+    /// it (data replicated or recovered before this leader's state was built);
+    /// `rollBytes`: segment roll (small = retention can delete segments);
+    /// `session5Version`: session 5's ConnectRequest.clientVersion, carried by
+    /// its WorkerOp::SessionAnnounce.
+    explicit Fixture(std::vector<rune::replication::NodeId> replicas, int minIsr,
+                     const std::function<void(rune::storage::Log&)>& preload = {},
+                     int64_t rollBytes = 64LL * 1024 * 1024, int32_t session5Version = 0) {
         static std::atomic<int> seq{0};
         const std::string tag = std::to_string(::getpid()) + "_" + std::to_string(seq++);
         dir  = fs::temp_directory_path() / ("rune_swa_log_" + tag);
         adir = fs::temp_directory_path() / ("rune_swa_aeron_" + tag);
         fs::create_directories(dir);
-        log = std::make_unique<rune::storage::Log>(dir.string(), 64LL * 1024 * 1024);
+        log = std::make_unique<rune::storage::Log>(dir.string(), rollBytes);
         log->recover();
+        if (preload) preload(*log);
         PartitionConfig c; c.topicId = 1; c.selfId = 1; c.minIsr = minIsr;
         c.fetchIntervalNs = 1'000'000'000; c.isrCheckIntervalNs = 1'000'000'000'000LL;
         c.replicaLagMaxMs = 600'000; c.pushOnAppend = false;
@@ -115,7 +128,7 @@ struct Fixture {
             if (!producePub) producePub = client->findExclusivePublication(preg);
         }
         WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = 5;
-        a.egressStreamId = kEgress; a.egressChannel = kEgressChannel;
+        a.egressStreamId = kEgress; a.egressChannel = kEgressChannel; a.clientVersion = session5Version;
         EXPECT_TRUE(worker->tryEnqueueOp(std::move(a)));
     }
     ~Fixture() {
@@ -138,9 +151,9 @@ struct Fixture {
     }
     // The second client: a separate ingress publication (a separate image) and
     // egress stream kEgress2; announced as session `sid` on the lifecycle ring.
-    void addSecondClient(int64_t sid) {
+    void addSecondClient(int64_t sid, int32_t clientVersion = 0) {
         connectSecondClient();
-        announce(sid, kEgress2);
+        announce(sid, kEgress2, clientVersion);
     }
     void connectSecondClient() {
         const int64_t sreg = client->addSubscription("aeron:ipc", kEgress2);
@@ -152,9 +165,9 @@ struct Fixture {
         }
         ASSERT_TRUE(egress2 && pub2 && pub2->isConnected());
     }
-    void announce(int64_t sid, int32_t egressStream) {
+    void announce(int64_t sid, int32_t egressStream, int32_t clientVersion = 0) {
         WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = sid;
-        a.egressStreamId = egressStream; a.egressChannel = kEgressChannel;
+        a.egressStreamId = egressStream; a.egressChannel = kEgressChannel; a.clientVersion = clientVersion;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(a)));
     }
     static std::vector<uint8_t> produceFrame(int64_t sid, int64_t corr, uint8_t acks, int32_t topicId = 1,
@@ -185,7 +198,8 @@ struct Fixture {
         aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
         return pub.offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
     }
-    void produce(int64_t corr, uint8_t acksAll, int64_t pid = -1, int32_t seq = -1, int64_t sid = 5) {
+    void produce(int64_t corr, uint8_t acksAll, int64_t pid = -1, int32_t seq = -1, int64_t sid = 5,
+                 aeron::ExclusivePublication* via = nullptr) {
         rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
         // The batch header carries the same producer identity as the frame (the
         // broker rejects a mismatch — EOS-DUP defense).
@@ -196,7 +210,8 @@ struct Fixture {
         m.recordBatch = std::span<const uint8_t>(batch);
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
         aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
-        for (int i = 0; i < kCap && producePub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) <= 0; ++i) pump();
+        aeron::ExclusivePublication& pub = via ? *via : *producePub;
+        for (int i = 0; i < kCap && pub.offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) <= 0; ++i) pump();
     }
     bool awaitAck(int64_t corr) {
         for (int i = 0; i < kCap && !acks.count(corr); ++i) step();
@@ -726,4 +741,74 @@ TEST(ShardWorkerAckRegression, DeferredSessionSignalIsCountedAndStillDeliveredOn
     for (int i = 0; i < 50; ++i) f.step();
     ASSERT_EQ(f.sessionFailures.size(), 1u);
     EXPECT_EQ(f.sessionFailures[0].sessionId, 8);
+}
+
+// ============================================================================
+// D6 review M3 — the SHARD-MODE production chain, end to end, on the real
+// invoker driver: SessionAnnounce (WorkerOp.clientVersion, through the op
+// ring's SBE encode) -> Worker::executeSessionAnnounceWire_ -> the sink's
+// per-session version; a produce of producer P (whose every batch retention
+// removed before the worker's RC rebuild) on shard ingress -> the worker psm_
+// answers UnknownProducerId -> emitProduceAck_ copies the log start
+// (ret.baseOffset -> AckEntry.logStartOffset) -> SessionAckSink encodes per
+// session -> the client's egress.  A clientVersion-2 session sees 28 + the log
+// start (46 B frame); a clientVersion-1 session sees OutOfOrderSequence on the
+// pre-D6 38 B frame (review M4).  Dropping either Worker.h line the review
+// names (the logStartOffset copy, the announce version argument) turns it red.
+// ============================================================================
+namespace {
+std::vector<uint8_t> pidBatch(int64_t pid, int16_t epoch, int32_t seq) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+    b.append("k", "v" + std::to_string(seq), 1000);
+    return b.build();
+}
+void preloadSeqs(rune::storage::Log& log, int64_t pid, int16_t epoch, int32_t from, int32_t to) {
+    for (int32_t s = from; s <= to; ++s) {
+        const auto b = pidBatch(pid, epoch, s);
+        int64_t base = 0;
+        (void)log.appendNoSyncRestamp(b.data(), b.size(),
+                                      rune::protocol::RecordBatchReader(b.data(), b.size()).lastOffsetDelta(), base);
+    }
+}
+} // namespace
+
+TEST(ShardWorkerAckUnknownProducerIdRegression, ShardChainAnswersUnknownProducerIdPerSessionVersionRegression) {
+    int64_t logStart = -1;
+    Fixture f({1}, 1,
+              [&](rune::storage::Log& log) {
+                  preloadSeqs(log, /*P*/ 7, 0, 0, 5);
+                  preloadSeqs(log, /*Q*/ 8, 2, 0, 11);
+                  ASSERT_GT(log.deleteOldSegments(0), 0);
+                  logStart = log.logStartOffset();
+              },
+              /*rollBytes=*/256, /*session5Version=*/pc::kClientVersion);
+    ASSERT_GE(logStart, 6) << "precondition: retention removed every batch of P";
+    f.addSecondClient(/*sid=*/6, /*clientVersion=*/1);
+    for (int i = 0; i < kCap && f.worker->rcStatusForTest(1, 0) != Worker::kRcReady; ++i) f.step();
+    ASSERT_EQ(f.worker->rcStatusForTest(1, 0), Worker::kRcReady) << "precondition: the worker's state is proven";
+    ASSERT_EQ(f.worker->sessionAnnouncesSeenForTest(), 2u);
+    const int64_t leo = f.log->logEndOffset();
+
+    f.produce(/*corr=*/61, /*acks=*/0, /*pid=*/7, /*seq=*/6, /*sid=*/5);
+    ASSERT_TRUE(f.awaitAck(61));
+    EXPECT_EQ(f.acks[61].errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownProducerId))
+        << "a clientVersion-2 session must see 28 in shard mode (the announce carries the version to the sink)";
+    EXPECT_EQ(f.acks[61].logStartOffset, logStart)
+        << "the shard ack must carry the log start (else the client always takes U2)";
+    EXPECT_EQ(f.ackBytes[61], pc::ProduceResponse::ENCODED_SIZE);
+
+    f.produce(/*corr=*/62, /*acks=*/0, /*pid=*/7, /*seq=*/6, /*sid=*/6, f.pub2.get());
+    ASSERT_TRUE(f.awaitAck(62));
+    EXPECT_EQ(f.acks[62].errorCode, static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence))
+        << "an old client must never see UnknownProducerId";
+    EXPECT_EQ(f.acks[62].logStartOffset, -1);
+    EXPECT_EQ(f.ackBytes[62], pc::ProduceResponse::ENCODED_SIZE_V0) << "review M4: the pre-D6 frame";
+    EXPECT_EQ(f.log->logEndOffset(), leo) << "an UnknownProducerId batch was appended";
+
+    // The client's U1 re-sequence (new epoch, seq 0) is accepted and acked OK.
+    f.produce(/*corr=*/63, /*acks=*/0, /*pid=*/7, /*seq=*/0, /*sid=*/5);
+    ASSERT_TRUE(f.awaitAck(63));
+    EXPECT_EQ(f.acks[63].errorCode, 0);
+    EXPECT_EQ(f.acks[63].baseOffset, leo);
 }

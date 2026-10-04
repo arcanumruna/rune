@@ -81,16 +81,19 @@ TEST(ProducerStateManager, BrandNewProducerBaseSequenceZeroAccepted) {
     EXPECT_TRUE(r.isAccept());
 }
 
+// D6: no entry + baseSequence != 0 -> UnknownProducerId (Kafka
+// UNKNOWN_PRODUCER_ID), not OutOfOrderSequence — still NOT appended.
 TEST(ProducerStateManager, BrandNewProducerNonZeroBaseSequenceRejected) {
     ProducerStateManager m;
     auto r = m.validate(0, 42, 0, 0, 1, 2);
-    EXPECT_TRUE(r.isOos());
+    EXPECT_TRUE(r.isUnknownProducerId());
+    EXPECT_FALSE(r.isAccept());
 }
 
 TEST(ProducerStateManager, BrandNewProducerLargeBaseSequenceRejected) {
     ProducerStateManager m;
     auto r = m.validate(0, 99, 0, 0, 100, 109);
-    EXPECT_TRUE(r.isOos());
+    EXPECT_TRUE(r.isUnknownProducerId());
 }
 
 // ===========================================================================
@@ -645,7 +648,7 @@ TEST(ProducerStateManager, BrandNewProducerEpoch2AcceptsSeq0) {
 TEST(ProducerStateManager, BrandNewProducerEpoch2RejectsSeq1) {
     ProducerStateManager m;
     auto r = m.validate(0, 1000, 0, 2, 1, 1);
-    EXPECT_TRUE(r.isOos());
+    EXPECT_TRUE(r.isUnknownProducerId());
 }
 
 // ===========================================================================
@@ -1181,4 +1184,65 @@ TEST(PsmRebuildRegression, CorruptLengthAfterValidBatchesFailsTheProof) {
             << "unreadable stored batches were skipped and the producer state reported PROVEN";
     }
     std::filesystem::remove_all(dir);
+}
+
+// ===========================================================================
+// D6 — UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID).  A producer the state no
+// longer knows (retention / compaction / memory-ring eviction removed all its
+// batches before a rebuild) is answered UnknownProducerId for baseSequence != 0
+// instead of OutOfOrderSequence.  Everything else is unchanged.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> d6Batch(int64_t pid, int16_t epoch, int32_t seq, int64_t base) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+    b.append("k", "v", 1000);
+    return b.build();
+}
+}  // namespace
+
+TEST(UnknownProducerIdRegression, RebuiltStateAfterRetentionAnswersUnknownProducerIdRegression) {
+    const std::string dir = tmpPath("psm_d6");
+    fs::create_directories(dir);
+    {
+        rune::storage::Log log(dir, /*segmentRollBytes=*/256);
+        log.recover();
+        auto app = [&](int64_t pid, int16_t e, int32_t seq) {
+            const auto b = d6Batch(pid, e, seq, log.logEndOffset());
+            ASSERT_GE(log.append(b, log.logEndOffset()), 0);
+        };
+        for (int32_t s = 0; s < 6; ++s) app(/*P*/ 7, 0, s);    // P: several segments
+        for (int32_t s = 0; s < 12; ++s) app(/*Q*/ 8, 3, s);   // Q: the rest (and the active segment)
+        ProducerStateManager live;
+        ASSERT_TRUE(live.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_NE(live.entry(0, 7, 0), nullptr);
+
+        ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/0), 0);
+        ASSERT_GE(log.logStartOffset(), 6) << "precondition: retention removed every batch of P";
+
+        // The LIVE state keeps P across retention (only a rebuild forgets it).
+        EXPECT_TRUE(live.validate(0, 7, 0, 0, 6, 6).isAccept());
+
+        ProducerStateManager rebuilt;                            // failover / restart / re-promotion
+        ASSERT_TRUE(rebuilt.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_EQ(rebuilt.entry(0, 7, 0), nullptr) << "precondition: P is gone from the rebuilt state";
+        ASSERT_NE(rebuilt.entry(0, 8, 0), nullptr);
+
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 6, 6).isUnknownProducerId()) << "P's next batch";
+        EXPECT_FALSE(rebuilt.validate(0, 7, 0, 0, 6, 6).isOos());
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isAccept()) << "P re-sequenced at seq 0 (new epoch)";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 0, 0).isAccept()) << "seq 0 on any epoch: trust-on-first-use";
+        // Q is known: a forward gap stays OOS, epochs unchanged.
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 14, 14).isOos()) << "known entry + gap";
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 2, 12, 12).isFenced()) << "lower epoch";
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 4, 5, 5).isOos()) << "higher epoch, seq != 0";
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 12, 12).isAccept()) << "in order";
+    }
+    fs::remove_all(dir);
+}
+
+TEST(UnknownProducerIdRegression, ProtocolIllegalSequencesStayOutOfOrderRegression) {
+    ProducerStateManager m;
+    EXPECT_TRUE(m.validate(0, 5, 0, 0, -1, 0).isOos());
+    EXPECT_TRUE(m.validate(0, 5, 0, 0, 4, 3).isOos());
 }
