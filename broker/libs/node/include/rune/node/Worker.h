@@ -215,6 +215,26 @@ public:
              ? kOverflowHighWater : static_cast<std::size_t>(kMaxIngressDrainLimit)) * kMaxReturnsPerOp +
         static_cast<std::size_t>(kMaxFragmentLimit) * kMaxReturnsPerOp + kMaxOwedReturnsCeiling;
     static constexpr std::size_t kRetFifoCapacity   = 16384;
+    // D8c fix round 1 (MAJOR-1): the session ack queue (SessionAckSink::
+    // kAckCapacity) is split in two STATIC shares.
+    //   kAckReserve       — what this worker's own intake may need beyond the
+    //                       gateway-routed share: owed returns at their ceiling
+    //                       + one full op drain + one full direct-ingress poll
+    //                       (each op / frame adds at most one to A + O).
+    //   kRoutedAckBudget  — the most GATEWAY-routed produces the runtime may
+    //                       have outstanding to this worker (counted from
+    //                       forward until the ack is CLAIMED: op ring + owed +
+    //                       queued) — ClientGateway's per-worker cap.
+    // So stalled gateway sessions, however many, can never take the reserve:
+    // A + O <= kRoutedAckBudget + (owed <= kMaxOwedReturnsCeiling) + held
+    // direct acks, i.e. ackRoom_() >= one drain + one poll while no DIRECT
+    // client holds acks.
+    static constexpr std::size_t kAckReserve =
+        kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
+        static_cast<std::size_t>(kMaxFragmentLimit);
+    static constexpr std::size_t kRoutedAckBudget = SessionAckSink::kAckCapacity - kAckReserve;
+    static_assert(SessionAckSink::kAckCapacity > kAckReserve && kRoutedAckBudget >= kAckReserve,
+                  "D8c: the routed share and the worker's own reserve each get half of the ack queue (or more)");
     static_assert(kRetFifoCapacity >= kRetFifoBound,
                   "F15 §6: the return FIFO must hold its static bound at the owed-cap ceiling");
     static_assert((kRetFifoCapacity & (kRetFifoCapacity - 1)) == 0, "power of two (O(1) index mask)");
@@ -4114,14 +4134,8 @@ private:
         namespace pc = rune::protocol::client;
         switch (type) {
         case WorkerOp::Type::Produce: {
-            WorkerReturn ret;
-            ret.type          = WorkerReturn::Type::ProduceResult;
-            ret.sessionId     = op.sessionId();
-            ret.correlationId = op.correlationId();
-            ret.partition     = op.partition();
-            ret.topicId       = op.topicId();
-            ret.deferAck      = false;   // an answer, never facts-only (F15 S2 fix round 2, B1)
-            ret.gatewayCredit = true;    // D8c: an op-ring produce — its runtime credit returns on claim
+            WorkerReturn ret = produceAnswer_(ProduceOrigin::GatewayOp, op.sessionId(), op.correlationId(),
+                                              op.topicId(), op.partition());
             ret.producerId    = op.producerId();
             ret.producerEpoch = op.producerEpoch();
             ret.baseSequence  = op.baseSequence();
@@ -4965,6 +4979,30 @@ private:
     // (validate → append → update in handleProduceBatch): the runtime no longer
     // consults its mirror for user partitions in shard mode.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // D8c fix round 1 (MEDIUM-1): THE constructor of every produce ANSWER shell —
+    // the only place WorkerReturn::gatewayCredit is set.  Every answer of a
+    // produce (produceCore_'s shell, which every refusal / parked waiter / HW
+    // fire / timeout / §3.2 failure / fsync completion / purge copies, and
+    // refuseNotOwned_) starts here, and the origin has no default, so a new
+    // answer site cannot forget the runtime credit an op-ring produce holds
+    // (returned when the sink CLAIMS the ack).  Direct worker-ingress produces
+    // hold none.
+    // -----------------------------------------------------------------------
+    enum class ProduceOrigin : uint8_t { GatewayOp, WorkerIngress };
+    [[nodiscard]] static WorkerReturn produceAnswer_(ProduceOrigin origin, int64_t sessionId, int64_t correlationId,
+                                                     int32_t topicId, int32_t partition) noexcept {
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::ProduceResult;
+        ret.sessionId     = sessionId;
+        ret.correlationId = correlationId;
+        ret.topicId       = topicId;
+        ret.partition     = partition;
+        ret.deferAck      = false;   // an answer, never facts-only (F15 S2 fix round 2, B1)
+        ret.gatewayCredit = origin == ProduceOrigin::GatewayOp;
+        return ret;
+    }
+
     struct ProduceFields {
         int64_t sessionId     = 0;
         int64_t correlationId = 0;
@@ -4987,17 +5025,12 @@ private:
         namespace pc = rune::protocol::client;
 
         // Build a WorkerReturn shell for this ack.
-        WorkerReturn ret;
-        ret.type          = WorkerReturn::Type::ProduceResult;
-        ret.sessionId     = f.sessionId;
-        ret.correlationId = f.correlationId;
-        ret.partition     = f.partition;
-        ret.topicId       = f.topicId;
+        WorkerReturn ret = produceAnswer_(f.fromOp ? ProduceOrigin::GatewayOp : ProduceOrigin::WorkerIngress,
+                                          f.sessionId, f.correlationId, f.topicId, f.partition);
         ret.producerId    = f.producerId;
         ret.producerEpoch = f.producerEpoch;
         ret.baseSequence  = f.baseSequence;
         ret.enqueuedAtNs  = f.enqueuedAtNs;
-        ret.gatewayCredit = f.fromOp;       // D8c: an op-ring produce holds a runtime credit until claimed
         ret.replica       = replica;
         if (replica) { ret.targetReplicaId = replica->registryId(); ret.incarnation = replica->incarnation(); }
 

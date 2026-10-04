@@ -158,9 +158,17 @@ struct Rig {
     ~Rig() {
         // The worker's session publications release through the client: drop them before it.
         if (client) w().releaseShardClient();
-        egA.reset(); egB.reset(); client.reset(); drv.reset();
+        extra.clear(); egA.reset(); egB.reset(); client.reset(); drv.reset();
     }
     Worker& w() { return pool.worker(0); }
+    std::vector<std::shared_ptr<aeron::Subscription>> extra;   // stalled clients' ack subscriptions (never polled)
+    void subscribe(int32_t stream) {
+        const int64_t reg = client->addSubscription("aeron:ipc", stream);
+        std::shared_ptr<aeron::Subscription> sub;
+        for (int i = 0; i < kCap && !sub; ++i) { pump(); sub = client->findSubscription(reg); }
+        ASSERT_TRUE(sub);
+        extra.push_back(std::move(sub));
+    }
     void pump() { if (drv) { drv->doWork(); client->conductorAgentInvoker().invoke(); } }
     // A gateway session the worker knows (announce-before-accept, as the gateway's announcer does).
     int64_t session(int32_t egressStream) {
@@ -355,4 +363,114 @@ TEST(GatewayProduceCreditRegression, CreditPausedSessionKeepsItsLeaseUntilCredit
     ASSERT_EQ(r.gw.produceInFlightForTest(h), 2);
     r.gw.reapExpiredForTest(3 * T + rune::gateway::ClientGateway::kDefaultMaxHeldIdleNs + 1);
     EXPECT_EQ(r.gw.produceInFlightForTest(h), -1) << "a credit-paused session is still bounded by maxHeldIdle";
+}
+
+// D8c fix round 1 (MAJOR-1): MANY stalled gateway sessions — 20 at the MAXIMUM per-session budget (4096), i.e.
+// 5x a worker's routed ack share — still cannot fill the worker's ack queue: the gateway's per-worker cap
+// (Worker::kRoutedAckBudget) bounds the sum, so the worker's op drain never runs out of ack room and a new
+// session is still served.  (Was: every session held its whole budget — 16 x 1024 / 4 x 4096 filled the queue
+// and stalled the whole shard until the stalled sessions were reaped.)
+TEST(GatewayProduceCreditRegression, ManyStalledSessionsAtTheMaxBudgetCannotFillTheWorkersAckQueueRegression) {
+    Rig r(/*withAcks=*/true);
+    ASSERT_TRUE(r.egB);
+    r.gw.setSessionProduceCredits(rune::gateway::ClientGateway::kMaxSessionProduceCredits);   // RUNE_GATEWAY_PRODUCE_CREDITS max
+    constexpr int kStalled = 20;
+    const std::size_t perSession = rune::gateway::ClientGateway::kMaxSessionProduceCredits + 512;
+    std::vector<int64_t> sids;
+    std::vector<std::vector<std::vector<uint8_t>>> bursts(kStalled);
+    std::vector<std::size_t> consumed(kStalled, 0);
+    for (int k = 0; k < kStalled; ++k) {
+        r.subscribe(7500 + k);                                       // a client that never reads its acks
+        sids.push_back(r.session(7500 + k));
+        for (std::size_t i = 0; i < perSession; ++i)
+            bursts[k].push_back(produceFrame(sids[k], (k + 1) * 10'000'000LL + static_cast<int64_t>(i), 0));
+    }
+    int idle = 0;
+    for (int i = 0; i < 4'000 && idle < 64; ++i) {
+        std::size_t n = 0;
+        for (int k = 0; k < kStalled; ++k) {                         // every stalled client offers its whole burst
+            const std::size_t c = r.gw.controlledPollFramesForTest(bursts[k], consumed[k]);
+            consumed[k] += c;
+            n += c;
+        }
+        r.runWorker();
+        idle = n == 0 ? idle + 1 : 0;
+        ASSERT_LE(r.gw.routedInFlightForTest(0), rune::node::Worker::kRoutedAckBudget);
+        ASSERT_LE(r.w().sessionAcksPendingForTest(), rune::node::Worker::kRoutedAckBudget);
+    }
+    EXPECT_GT(r.gw.workerCapProduceAbortsForTest(), 0u) << "the per-worker cap engaged";
+    EXPECT_EQ(r.w().ackRoomOpPausesForTest(), 0u) << "the worker's op drain never ran out of ack room";
+    EXPECT_LT(r.gw.routedInFlightForTest(0), rune::node::Worker::kRoutedAckBudget)
+        << "stalled (heavy) sessions stop in the congested band; light sessions keep the rest";
+    const int64_t b = r.session(kEgressB);
+    std::vector<std::vector<uint8_t>> fb{produceFrame(b, 7, 0)};
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fb), 1u) << "a new (light) session is admitted";
+    for (int i = 0; i < 2'000 && !r.acks.count(7); ++i) r.runWorker();
+    EXPECT_EQ(r.acks.count(7), 1u) << "and served while 20 sessions are stalled";
+    EXPECT_EQ(r.w().ackRoomOpPausesForTest(), 0u);
+    // Closing the stalled sessions hands their share of the worker's cap back at once.
+    for (int64_t sid : sids) {
+        pc::Disconnect d; d.sessionId = sid; d.correlationId = 1;
+        std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
+        d.encode(buf.data());
+        r.gw.applyDisconnectForTest(buf.data(), buf.size());
+    }
+    for (int i = 0; i < 8; ++i) r.runWorker();
+    EXPECT_EQ(r.gw.routedInFlightForTest(0), 0u) << "a close returns the session's share of every worker's cap";
+    EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
+}
+
+// D8c fix round 1 (MAJOR-1 fairness): in the per-worker cap's last quarter only LIGHT sessions (< 64 in flight to
+// that worker) are admitted — the heavy (stalled) session runs out first; the hard cap is never exceeded; a deferred
+// frame is not consumed (redelivered next poll); credits and closes give the share back.
+TEST(GatewayProduceCreditRegression, CongestedWorkerAdmitsLightSessionsAndPausesTheHeavyOneFirstRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(400);                                  // congested band: [300, 400)
+    const int64_t h = r.gw.injectTestSession(r.now), l1 = r.gw.injectTestSession(r.now),
+                  l2 = r.gw.injectTestSession(r.now);
+    auto frames = [](int64_t sid, int n) {
+        std::vector<std::vector<uint8_t>> f;
+        for (int i = 0; i < n; ++i) f.push_back(produceFrame(sid, i, 0));
+        return f;
+    };
+    const auto fh = frames(h, 600), f1 = frames(l1, 100), f2 = frames(l2, 100);
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fh), 300u) << "the heavy session stops at the congested band";
+    EXPECT_EQ(r.gw.workerCapProduceAbortsForTest(), 1u);
+    EXPECT_EQ(r.gw.creditBlockedSessionsForTest(), 0u) << "not its own budget (1024): the worker's cap";
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(f1), 64u) << "a light session is admitted up to 64 in the band";
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(f2), 36u) << "the hard cap is never exceeded";
+    EXPECT_EQ(r.gw.routedInFlightForTest(0), 400u);
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fh, 300), 0u) << "deferred, not consumed";
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 150));                 // 250 in flight: below the band
+    EXPECT_EQ(r.gw.routedInFlightForTest(0), 250u);
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fh, 300), 50u) << "the heavy session resumes up to the band";
+    pc::Disconnect d; d.sessionId = h; d.correlationId = 1;
+    std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
+    d.encode(buf.data());
+    r.gw.applyDisconnectForTest(buf.data(), buf.size());
+    EXPECT_EQ(r.gw.routedInFlightForTest(0), 100u) << "the close returned the heavy session's 200";
+}
+
+// D8c fix round 1: LOW-1 — only LEAVING a credit pause refreshes the lease (other claims are not client liveness);
+// LOW-2 — changing the budget with sessions in flight recomputes the paused-session count.
+TEST(GatewayProduceCreditRegression, OnlyLeavingThePauseRefreshesTheLeaseAndBudgetChangesRecountRegression) {
+    Rig r(/*withAcks=*/false);
+    const int64_t a = r.gw.injectTestSession(0);
+    r.gw.setNowForTest(0);
+    std::vector<std::vector<uint8_t>> fa{produceFrame(a, 1, 0), produceFrame(a, 2, 0), produceFrame(a, 3, 0)};
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fa), 3u);
+    r.gw.setNowForTest(5'000);
+    r.gw.handleWorkerReturnForTest(creditSignal(a, 1));                   // not paused: no refresh
+    EXPECT_EQ(r.gw.sessionLastSeenNsForTest(a), 0);
+    r.gw.setSessionProduceCredits(2);                                     // 2 in flight >= 2: paused
+    EXPECT_EQ(r.gw.creditBlockedSessionsForTest(), 1u);
+    EXPECT_TRUE(r.gw.clientFrameHeldForTest(fa[0].data(), fa[0].size()));
+    r.gw.setSessionProduceCredits(8);
+    EXPECT_EQ(r.gw.creditBlockedSessionsForTest(), 0u) << "raising the budget unpauses it (no stale count)";
+    r.gw.setSessionProduceCredits(2);
+    r.gw.setNowForTest(9'000);
+    r.gw.handleWorkerReturnForTest(creditSignal(a, 1));                   // leaves the pause: refresh
+    EXPECT_EQ(r.gw.creditBlockedSessionsForTest(), 0u);
+    EXPECT_EQ(r.gw.sessionLastSeenNsForTest(a), 9'000);
+    EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
 }

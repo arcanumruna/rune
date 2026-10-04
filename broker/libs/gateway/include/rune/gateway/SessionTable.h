@@ -9,6 +9,7 @@
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -50,6 +51,11 @@ struct Session {
     // claimed yet (SessionSignal Credit).  At ClientGateway::sessionProduceCredits()
     // the gateway ABORTs this session's Produce frames.  Dies with the session.
     uint32_t                                       produceInFlight = 0;
+    // D8c fix round 1: produceInFlight split by the owning worker it was
+    // forwarded to (Credit signals name their worker) — kept so a close returns
+    // the session's share of every worker's routed cap.  Cold (close / credit).
+    static constexpr int                           kMaxWorkers = 64;   // == ClientGateway::kMaxHeldMaskWorkers
+    std::array<uint32_t, kMaxWorkers>              produceInFlightOn{};
 };
 
 // ---------------------------------------------------------------------------

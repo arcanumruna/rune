@@ -132,23 +132,38 @@ public:
     /// A session Lost on any worker is reaped on sessionTimeoutNs from its Lost edge instead (reapExpired).
     static constexpr int64_t kDefaultMaxHeldIdleNs = 600LL * 1'000'000'000LL;
     void setMaxHeldIdleNs(int64_t ns) noexcept { maxHeldIdleNs_ = ns > 0 ? ns : kDefaultMaxHeldIdleNs; }
-    /// D8c (shard mode, G-A6 on the gateway-routed path): the most produce ops of
-    /// ONE session the gateway has forwarded to the workers whose acks a worker
-    /// has not CLAIMED yet (SessionSignal Credit returns them).  At the budget
-    /// the session's next Produce frame is ABORTed (controlled poll — that
-    /// client's image only), so a client that stops reading is paused BEFORE
-    /// any worker's ack queue (SessionAckSink::kAckCapacity = 16384) fills —
-    /// whatever its burst size, MTU or socket buffers.  1024 = 1/16 of the ack
-    /// queue: 16 fully-stalled gateway sessions fit beside the per-pass intake
-    /// reserve; >= 1024 batches in flight per session costs a gateway client
-    /// nothing at sub-ms RTTs (Little: 1024 / 1 ms = 1M batches/s).
+    /// D8c (shard mode, G-A6 on the gateway-routed path) — two credit bounds,
+    /// both counted from forward until the owning worker CLAIMS the ack
+    /// (SessionSignal Credit returns it):
+    ///  * per WORKER (fix round 1, MAJOR-1): at most rune::node::Worker::
+    ///    kRoutedAckBudget (16384 = the worker's 32768-entry ack queue minus its
+    ///    own 16384 reserve: owed ceiling 8192 + one drain 4096 + one poll 4096)
+    ///    forwarded, unclaimed produces to one worker, summed over ALL sessions —
+    ///    so no number of stalled gateway sessions can eat the reserve (the
+    ///    worker's op drain / direct poll never run out of ack room for them).
+    ///    Fairness inside that cap: in its last quarter (the congested band)
+    ///    only LIGHT sessions — fewer than kLightSessionInFlight in flight to
+    ///    that worker — are admitted.  A stalled session sits at its whole budget
+    ///    (>= 64) so it is paused first, while up to 4096 / 64 = 64 light
+    ///    sessions (a new client, an interactive producer) keep being served.
+    ///  * per SESSION: sessionProduceCredits_ (default 1024 = 1/16 of the routed
+    ///    share, so one session never takes more than that of a worker; >= 1024
+    ///    batches in flight per session costs a gateway client nothing at sub-ms
+    ///    RTTs — Little: 1024 / 1 ms = 1M batches/s).
+    /// At either bound the session's next Produce frame is ABORTed (controlled
+    /// poll — that client's image only): the pause engages BEFORE any worker's
+    /// ack queue can fill, whatever its burst size, MTU or socket buffers.
     /// RUNE_GATEWAY_PRODUCE_CREDITS (NodeConfig bounds it to 1 .. kMaxSessionProduceCredits).
     static constexpr uint32_t kDefaultSessionProduceCredits = 1024;
-    static constexpr uint32_t kMaxSessionProduceCredits     = 4096;   // 1/4 of the ack queue (static_assert, .cpp)
-    /// Set before any session exists (BrokerNode: at gateway construction) — the
-    /// paused-session count is kept against the budget in force.
+    static constexpr uint32_t kMaxSessionProduceCredits     = 4096;   // 1/4 of the routed share (static_assert, .cpp)
+    static constexpr uint32_t kLightSessionInFlight         = 64;
+    static constexpr uint32_t kWorkerRoutedCap              = 16384;  // == Worker::kRoutedAckBudget (static_assert, .cpp)
+    /// Normally set at construction (BrokerNode); safe at any time — the
+    /// paused-session count is recomputed against the new budget (LOW-2).
     void setSessionProduceCredits(uint32_t n) noexcept {
         sessionProduceCredits_ = (n >= 1 && n <= kMaxSessionProduceCredits) ? n : kDefaultSessionProduceCredits;
+        creditBlockedSessions_ = 0;
+        sessions_.forEach([&](const Session& s) { creditBlockedSessions_ += s.produceInFlight >= sessionProduceCredits_; });
     }
     [[nodiscard]] uint32_t sessionProduceCredits() const noexcept { return sessionProduceCredits_; }
 
@@ -814,7 +829,7 @@ public:
     // Single-writer: call only on the duty-cycle thread or before doWork().
     // -----------------------------------------------------------------------
     void applyProduceForTest(const uint8_t* buf, std::size_t len) {
-        handleProduce(buf, len);
+        (void)handleProduce(buf, len);
     }
 
     // -----------------------------------------------------------------------
@@ -1047,7 +1062,8 @@ private:
     // MD1 Task 10: Metadata request — answerable by any node (reads routingImage_ + nodeEndpointMap_).
     void handleMetadata     (const uint8_t* buf, std::size_t len);
     // GB-2: Produce handler — offset-assignment + leader-local append.
-    void handleProduce      (const uint8_t* buf, std::size_t len);
+    /// false = deferred, not consumed (D8c per-worker cap; shard mode only).
+    bool handleProduce      (const uint8_t* buf, std::size_t len);
     // read-rework T3/T4 (I3b): route subscription lifecycle to the owning worker
     // (per-worker egress).  Look up the Log/replica for (topicId, partition) and
     // enqueue a Subscribe/Unsubscribe WorkerOp via workerPool_->tryEnqueueOp.
@@ -1157,10 +1173,15 @@ private:
     /// is paused.
     [[nodiscard]] bool admitClientFrame_(const uint8_t* buf, std::size_t len);
     /// D8c: one produce of `s` was forwarded to a worker / `n` of its acks were claimed.
-    void takeProduceCredit_(Session& s) noexcept;
-    void returnProduceCredits_(Session& s, int64_t n) noexcept;
+    void takeProduceCredit_(Session& s, int32_t worker) noexcept;
+    void returnProduceCredits_(Session& s, int32_t worker, int64_t n) noexcept;
+    /// D8c fix round 1: may `s` forward one more produce to `worker` (the
+    /// per-worker routed cap + its congested-band fairness rule)?
+    [[nodiscard]] bool workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept;
     /// Validate + dispatch one reassembled client frame (onFragment's body).
-    void onClientFrame_(const uint8_t* buf, std::size_t len);
+    /// false = the frame was NOT consumed (a produce deferred by the per-worker
+    /// cap): the shard-mode controlled poll ABORTs it and redelivers it later.
+    bool onClientFrame_(const uint8_t* buf, std::size_t len);
     void onSessionSignal_(const rune::node::WorkerReturn& ret);
     void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
@@ -1275,6 +1296,10 @@ private:
     std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
     uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
     uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
+    // D8c fix round 1 (MAJOR-1): forwarded, unclaimed produces per worker (all sessions).
+    std::array<uint32_t, kMaxHeldMaskWorkers>    routedInFlight_{};
+    uint32_t                                     workerRoutedCap_ = kWorkerRoutedCap;
+    uint64_t                                     workerCapProduceAborts_ = 0;  // produces deferred by the per-worker cap
 
     SessionTable                         sessions_;
 
@@ -1607,6 +1632,9 @@ public:
     [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
     [[nodiscard]] uint64_t produceCreditUnderflowsForTest() const noexcept { return produceCreditUnderflows_; }
     [[nodiscard]] std::size_t creditBlockedSessionsForTest() const noexcept { return creditBlockedSessions_; }
+    [[nodiscard]] uint32_t routedInFlightForTest(int32_t worker) const noexcept { return routedInFlight_[worker]; }
+    [[nodiscard]] uint64_t workerCapProduceAbortsForTest() const noexcept { return workerCapProduceAborts_; }
+    void setWorkerRoutedCapForTest(uint32_t cap) noexcept { workerRoutedCap_ = cap; }
     [[nodiscard]] int64_t produceInFlightForTest(int64_t sid) noexcept {
         const Session* s = sessions_.find(sid);
         return s ? static_cast<int64_t>(s->produceInFlight) : -1;
@@ -1619,7 +1647,7 @@ public:
         std::size_t i = from;
         for (; i < frames.size(); ++i) {
             if (!admitClientFrame_(frames[i].data(), frames[i].size())) break;
-            onClientFrame_(frames[i].data(), frames[i].size());
+            if (!onClientFrame_(frames[i].data(), frames[i].size())) break;   // deferred: redelivered next poll
         }
         return i - from;
     }

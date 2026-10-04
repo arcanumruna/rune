@@ -39,9 +39,15 @@
 static_assert(rune::gateway::ClientGateway::kShardMaxSessions ==
                   rune::node::SessionAckSink::kMaxSessions - 1,
               "Task 13: the runtime's shard session cap is a worker ack table's capacity");
+static_assert(rune::gateway::ClientGateway::kWorkerRoutedCap == rune::node::Worker::kRoutedAckBudget,
+              "D8c fix round 1: the gateway's per-worker routed cap is the worker's routed ack share");
 static_assert(rune::gateway::ClientGateway::kMaxSessionProduceCredits * 4 <=
-                  rune::node::SessionAckSink::kAckCapacity,
-              "D8c: one session's produce credit budget stays a small share of a worker's ack queue");
+                  rune::gateway::ClientGateway::kWorkerRoutedCap,
+              "D8c: one session's produce credit budget stays a small share of a worker's routed ack share");
+static_assert(rune::gateway::Session::kMaxWorkers == rune::gateway::ClientGateway::kMaxHeldMaskWorkers);
+static_assert(rune::gateway::ClientGateway::kLightSessionInFlight * 64 <=
+                  rune::gateway::ClientGateway::kWorkerRoutedCap / 4,
+              "D8c: the congested band admits >= 64 light sessions");
 static_assert(rune::gateway::ClientGateway::kDefaultSessionProduceCredits >= 1 &&
                   rune::gateway::ClientGateway::kDefaultSessionProduceCredits <=
                       rune::gateway::ClientGateway::kMaxSessionProduceCredits);
@@ -459,6 +465,14 @@ int ClientGateway::doWork(int64_t nowNs) {
         // (sessionProduceCredits_ forwarded, not yet claimed by a worker): the
         // pause engages BEFORE a worker's ack queue can fill, independent of
         // how many frames one poll / one datagram carries (admitClientFrame_).
+        // Fix round 1: and a produce whose owning worker's routed share is full
+        // (per-worker cap, handleProduce returns false) is ABORTed unconsumed.
+        // LOW-4 (by design, Kafka-like in-flight-per-connection): the budget is
+        // per SESSION, so one slow partition (e.g. acks=all parked through an
+        // ISR-shrink window, bounded by the ack timeout) can use up a session's
+        // credits — its aborted Produce then holds back that session's produces
+        // to healthy partitions, its Metadata and its Keepalives too, until
+        // those acks are answered and claimed.
         // Task 13 fix round 2 (finding 1, G-A6 on the gateway-routed path): a
         // Produce frame of a session some worker holds acks for is ABORTed — it
         // stays on ITS image (one client publication) and the poll moves on to
@@ -482,10 +496,14 @@ int ClientGateway::doWork(int64_t nowNs) {
                 return controlledAssembler_.onFragment(
                     [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
                            aeron::util::index_t length, aeron::Header& header) {
-                        if (!admitClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                                               static_cast<std::size_t>(length))) [[unlikely]]
+                        const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
+                        if (!admitClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
                             return aeron::ControlledPollAction::ABORT;
-                        onFragment(buffer, offset, length, header);
+                        (void)header;
+                        // D8c fix round 1: a produce deferred by the per-worker cap is not
+                        // consumed — ABORT it (redelivered at the next poll).
+                        if (!onClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
+                            return aeron::ControlledPollAction::ABORT;
                         return aeron::ControlledPollAction::CONTINUE;
                     },
                     b, o, l, h);
@@ -787,16 +805,16 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
                                aeron::util::index_t             length,
                                aeron::Header&                   /*header*/)
 {
-    onClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset), static_cast<std::size_t>(length));
+    (void)onClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset), static_cast<std::size_t>(length));
 }
 
-void ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
+bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 {
     // Step 1: validate frame with checkFrame — reject anything non-conformant.
     const auto fc = pc::checkFrame(buf, len);
     if (fc.status != pc::FrameStatus::Ok) {
         // Drop silently — bad/unknown frame never crashes the gateway.
-        return;
+        return true;
     }
 
     // Step 2: dispatch on templateId.
@@ -850,8 +868,7 @@ void ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             handleMetadata(buf, len);
             break;
         case pc::TemplateId::Produce:
-            handleProduce(buf, len);
-            break;
+            return handleProduce(buf, len);
         case pc::TemplateId::Subscribe:
             handleSubscribe(buf, len);
             break;
@@ -890,6 +907,7 @@ void ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             // — server→client or other direction; drop.
             break;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -967,6 +985,8 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
     if (s->heldByWorkers != 0) --heldSessions_;
     if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
+    for (int w = 0; w < Session::kMaxWorkers; ++w)                                 // ... and its share of each worker's cap
+        routedInFlight_[static_cast<std::size_t>(w)] -= s->produceInFlightOn[static_cast<std::size_t>(w)];
     sessions_.remove(sid);                    // releases its egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
@@ -1019,32 +1039,52 @@ bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
 
 // D8c: credits are counted only in shard mode (worker-side acks — the only mode
 // whose workers return them); the forward site guards on shardMode_.
-void ClientGateway::takeProduceCredit_(Session& s) noexcept
+void ClientGateway::takeProduceCredit_(Session& s, int32_t worker) noexcept
 {
+    const auto w = static_cast<std::size_t>(worker);
+    ++s.produceInFlightOn[w];
+    ++routedInFlight_[w];
     if (++s.produceInFlight == sessionProduceCredits_) ++creditBlockedSessions_;
 }
 
-void ClientGateway::returnProduceCredits_(Session& s, int64_t n) noexcept
+bool ClientGateway::workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept
+{
+    const auto w = static_cast<std::size_t>(worker);
+    const uint32_t used = routedInFlight_[w];
+    if (used >= workerRoutedCap_) return false;                     // hard: the worker's routed share is full
+    // Congested band (the cap's last quarter): only light sessions — a stalled
+    // session (at its whole budget) is the one that runs out first.
+    return used < workerRoutedCap_ - workerRoutedCap_ / 4 || s.produceInFlightOn[w] < kLightSessionInFlight;
+}
+
+void ClientGateway::returnProduceCredits_(Session& s, int32_t worker, int64_t n) noexcept
 {
     if (n <= 0) [[unlikely]] return;
+    const auto w = static_cast<std::size_t>(worker);
     const bool wasBlocked = s.produceInFlight >= sessionProduceCredits_;
-    if (static_cast<uint64_t>(n) > s.produceInFlight) [[unlikely]] {
+    uint32_t take = s.produceInFlightOn[w];
+    if (static_cast<uint64_t>(n) > take) [[unlikely]] {
         // Unreachable: every Credit is a claimed ack of a produce this gateway
-        // forwarded for this session (one credit taken per forward).  Clamp —
-        // never a negative budget — and count it, loudly.
+        // forwarded for this session to this worker (one credit taken per
+        // forward).  Clamp — never a negative budget — and count it, loudly.
         ++produceCreditUnderflows_;
         if (produceCreditUnderflows_ == 1 || (produceCreditUnderflows_ & 1023u) == 0)
-            spdlog::error("ClientGateway: session {} returned {} produce credits with {} in flight (total={})",
-                          s.sessionId, n, s.produceInFlight, produceCreditUnderflows_);
-        s.produceInFlight = 0;
+            spdlog::error("ClientGateway: session {} returned {} produce credits on worker {} with {} in flight "
+                          "(total={})", s.sessionId, n, worker, take, produceCreditUnderflows_);
     } else {
-        s.produceInFlight -= static_cast<uint32_t>(n);
+        take = static_cast<uint32_t>(n);
     }
-    // The session's image was stalled at a Produce frame while it had no credit
-    // (its Keepalives queued behind it): leaving that pause is client progress
-    // — refresh the lease, as a Released edge does (D8b re-review MEDIUM-1).
-    s.lastSeenNs = nowNs_;
-    if (wasBlocked && s.produceInFlight < sessionProduceCredits_) --creditBlockedSessions_;
+    s.produceInFlightOn[w] -= take;
+    routedInFlight_[w]     -= take;
+    s.produceInFlight      -= take;
+    if (wasBlocked && s.produceInFlight < sessionProduceCredits_) {
+        --creditBlockedSessions_;
+        // The session's image was stalled at a Produce frame while it had no
+        // credit (its Keepalives queued behind it): LEAVING that pause is client
+        // progress — refresh the lease, as a Released edge does (D8b re-review
+        // MEDIUM-1).  Other claims are not client liveness (fix round 1, LOW-1).
+        s.lastSeenNs = nowNs_;
+    }
 }
 
 void ClientGateway::sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid)
@@ -1066,10 +1106,10 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
         if (kind == K::Progress) { s->lastSeenNs = nowNs_; return; }  // D8b: the held client reads its acks
-        if (kind == K::Credit) { returnProduceCredits_(*s, ret.baseOffset); return; }   // D8c: acks claimed
         // Unreachable: NodeConfig refuses > kMaxHeldMaskWorkers shard workers.
         assert(ret.partition >= 0 && ret.partition < kMaxHeldMaskWorkers);
         if (ret.partition < 0 || ret.partition >= kMaxHeldMaskWorkers) [[unlikely]] return;
+        if (kind == K::Credit) { returnProduceCredits_(*s, ret.partition, ret.baseOffset); return; }   // D8c: acks claimed
         const uint64_t bit = uint64_t{1} << ret.partition;
         if (kind == K::Lost || kind == K::Found) {                    // D8b round 2
             if (kind == K::Lost) {
@@ -1668,13 +1708,13 @@ void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int6
     }
 }
 
-void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
+bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
     auto msgOpt = pc::Produce::decode(buf, len);
     if (!msgOpt) {
         spdlog::debug("ClientGateway: Produce decode failed (truncated?) — dropped");
-        return;
+        return true;
     }
     const pc::Produce& msg = *msgOpt;
     RUNE_FR_SPAN_PRODUCE(rune_fr::Site::GatewayHandle,
@@ -1684,7 +1724,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     Session* session = sessions_.find(msg.sessionId);
     if (!session) {
         spdlog::debug("ClientGateway: Produce for unknown sessionId={} — dropped", msg.sessionId);
-        return;
+        return true;
     }
     // F23: any request is liveness (Kafka: idle == no requests).  Reuses the
     // lookup above — no extra cost on the produce hot path.
@@ -1737,7 +1777,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         const LeaderView lv = leaderView_();
         if (!lv.isLeader) {
             sendRedirect(lv.leaderClientEndpoint, msg.correlationId);
-            return;  // engine untouched
+            return true;  // engine untouched
         }
     }
 
@@ -1755,13 +1795,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (!topicRegistry_) {
             spdlog::warn("ClientGateway: Produce key-partition but no TopicRegistry — UnknownTopic");
             sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
-            return;
+            return true;
         }
         partition = topicRegistry_->partitionForKey(msg.topicId, msg.key);
         if (partition < 0) {
             spdlog::debug("ClientGateway: Produce partitionForKey → unknown topicId={}", msg.topicId);
             sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
-            return;
+            return true;
         }
     }
 
@@ -1810,7 +1850,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                 const LeaderView lv = leaderView_();
                 if (!lv.isLeader) {
                     sendRedirect(lv.leaderClientEndpoint, msg.correlationId);
-                    return;  // engine untouched
+                    return true;  // engine untouched
                 }
             }
             // leaderView_ says we ARE the leader (or is null) — serve locally (fall through).
@@ -1827,7 +1867,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                           msg.topicId, partition, entry.leaderNodeId, entry.leaderEpoch,
                           msg.sessionId, redirectEndpoint);
             sendRedirect(redirectEndpoint, msg.correlationId);
-            return;  // engine untouched
+            return true;  // engine untouched
         }
         // entry.leaderNodeId == thisNodeId_ → serve locally (fall through).
     }
@@ -1836,7 +1876,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (!topicRegistry_) {
         spdlog::warn("ClientGateway: Produce but no TopicRegistry — UnknownTopic");
         sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
-        return;
+        return true;
     }
 
     // topic() returns nullptr for unknown topicId.
@@ -1844,14 +1884,14 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (!spec) {
         spdlog::debug("ClientGateway: Produce unknown topicId={}", msg.topicId);
         sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
-        return;
+        return true;
     }
 
     rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
     if (!log) {
         spdlog::debug("ClientGateway: Produce bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
-        return;
+        return true;
     }
 
     // GR-4 / F15 §3.1 (I1): per-partition NotLeader.
@@ -1880,7 +1920,22 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                           "(topicId={} partition={}) sessionId={}",
                           msg.topicId, partition, msg.sessionId);
             sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
-            return;  // engine untouched — no append, nothing routed
+            return true;  // engine untouched — no append, nothing routed
+        }
+    }
+
+    // D8c fix round 1 (MAJOR-1): the owning worker's routed share.  Checked
+    // BEFORE any validation work or answer (nothing done yet but liveness), so a
+    // deferred frame is simply not consumed: the controlled poll ABORTs it and
+    // redelivers it next poll.  Shard mode only (worker-side acks return credits).
+    int32_t routedWorker = -1;
+    if (shardMode_ && workerPool_ && routesToWorker_(msg.topicId)) {
+        routedWorker = workerPool_->ownerWorkerId(msg.topicId, partition);   // router arithmetic
+        assert(routedWorker >= 0 && routedWorker < kMaxHeldMaskWorkers);
+        if (!workerAdmitsProduce_(routedWorker, *session)) [[unlikely]] {
+            ++heldProduceAborts_;
+            ++workerCapProduceAborts_;
+            return false;
         }
     }
 
@@ -1893,7 +1948,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // Reply InvalidBatch (no valid errorCode for InvalidBatch in client::ErrorCode;
         // use Internal as the closest sentinel for a malformed produce).
         sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
+        return true;
     }
 
     // Guard: reject an oversized batch LOUDLY (explicit MessageTooLarge), never
@@ -1915,7 +1970,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                          batchLen, maxProduceBatchBytes_, oversizeProduceRejects_);
         }
         sendResp(pc::ErrorCode::MessageTooLarge, partition, 0);
-        return;
+        return true;
     }
 
     // Guard: batch must be at least large enough to hold the fixed header fields
@@ -1927,7 +1982,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         spdlog::debug("ClientGateway: Produce batch too short ({} < {}); dropped",
                       batchLen, kMinBatchSize);
         sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
+        return true;
     }
 
     // Zero-copy: the recordBatch is validated + appended directly from the
@@ -1984,7 +2039,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             // G0.1: reliable delivery (retry on back-pressure).
             enqueueOrBestEffort_(*session, scratch_.data(), encoded);
         }
-        return;  // log untouched — no append, no LEO advance
+        return true;  // log untouched — no append, no LEO advance
     }
 
     // E2 inc2a: When a WorkerPool is wired, route the append to the owning worker
@@ -2056,7 +2111,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             spdlog::debug("ClientGateway: Produce lastOffsetDelta={} < 0; rejected (Internal)",
                           lastOffsetDelta);
             sendResp(pc::ErrorCode::Internal, partition, 0);
-            return;
+            return true;
         }
 
         // recordCount must equal lastOffsetDelta + 1.
@@ -2065,7 +2120,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                          "batch internally inconsistent → rejected (Internal)",
                          recordCount, lastOffsetDelta + 1);
             sendResp(pc::ErrorCode::Internal, partition, 0);
-            return;
+            return true;
         }
 
         // CRC validation: reject corrupt batches before they touch the log.
@@ -2074,7 +2129,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             if (!reader.ensureValid()) {
                 spdlog::warn("ClientGateway: Produce CRC mismatch (corrupt batch) → rejected (Internal)");
                 sendResp(pc::ErrorCode::Internal, partition, 0);
-                return;
+                return true;
             }
         }
 
@@ -2095,7 +2150,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // waiting for worker-ring space — no later batch may overtake it.
         if (!markerSendQueue_.empty() && markerQueuedFor_(msg.topicId, partition)) [[unlikely]] {
             sendResp(pc::ErrorCode::NotLeader, partition, 0);
-            return;
+            return true;
         }
 
         // Build the op envelope.
@@ -2166,17 +2221,17 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                              "ProduceResponse NotLeader (retriable; total={})",
                              msg.topicId, partition, produceBackPressured_);
             sendResp(pc::ErrorCode::NotLeader, partition, 0);
-        } else if (shardMode_) {
+        } else if (routedWorker >= 0) {   // shard mode (set above)
             // D8c: forwarded — one produce credit is held until the owning
             // worker CLAIMS its answer on the session's ack publication
             // (SessionSignal Credit).  Every forwarded produce is answered
             // exactly once through the worker's SessionAckSink (append, refusal,
             // HW fire / timeout, fsync, purge — acks=0 included); a dropped
             // answer means the session was closed, which drops the budget too.
-            takeProduceCredit_(*session);
+            takeProduceCredit_(*session, routedWorker);
         }
         // Response (or pending-ack) will be processed in drainWorkerReturns_().
-        return;
+        return true;
     }
 
     // ---------------------------------------------------------------------------
@@ -2209,7 +2264,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                       "(topicId={} partition={}) sessionId={}",
                       msg.topicId, partition, msg.sessionId);
         sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
-        return;  // engine untouched — no append
+        return true;  // engine untouched — no append
     }
     const uint8_t effectiveTier = replica.durabilityTier();
     // ISR size for min-ISR gate: only applies in steady state (committedMetadataReady_
@@ -2231,7 +2286,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (gate != InlinePsmGate::Proven) [[unlikely]] {
             sendResp(gate == InlinePsmGate::NotLeader ? pc::ErrorCode::NotLeader : pc::ErrorCode::Internal,
                      partition, 0);
-            return;   // log untouched
+            return true;   // log untouched
         }
     }
 
@@ -2256,7 +2311,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                              msg.topicId, partition, identityMismatchRejects_);
         }
         sendResp(outcome.error, partition, 0);
-        return;
+        return true;
     }
     // Dedup path (log untouched).  F15 S5 parity on the inline path (Kafka
     // DelayedProduce): a duplicate is answered only under its original's ack
@@ -2269,7 +2324,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // condition (acks=all parks on outcome.lastOffset below).
     if (outcome.isDuplicate && !(acksAll && ownedReplica && committedMetadataReady_)) {
         sendResp(pc::ErrorCode::OK, partition, outcome.baseOffset);
-        return;
+        return true;
     }
 
     if (!outcome.isDuplicate) {
@@ -2338,7 +2393,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                          "with MinIsrViolation sessionId={} topicId={} partition={}",
                          kMaxPendingAcks, msg.sessionId, msg.topicId, partition);
             sendResp(pc::ErrorCode::MinIsrViolation, partition, 0);
-            return;
+            return true;
         }
 
         PendingAck entry;
@@ -2358,6 +2413,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                       "sessionId={} partition={} baseOffset={} lastOffset={}",
                       msg.sessionId, partition, outcome.baseOffset, outcome.lastOffset);
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -111,7 +111,11 @@ public:
 
     static constexpr std::size_t kMaxSessions      = 4096;             // power of two (one slot stays empty)
     static constexpr std::size_t kMaxChannelSlots  = 256;              // announcements awaiting add()
-    static constexpr std::size_t kAckCapacity      = 16384;            // bound: Worker.h (static_assert there)
+    /// Bound: Worker.h (static_asserts there).  D8c fix round 1: 2 x the
+    /// worker's reserve (owed ceiling + drain + poll = 16384) — the other half is
+    /// the gateway-routed share (Worker::kRoutedAckBudget).  40 B each: 1.25 MiB,
+    /// heap (setShardClient).
+    static constexpr std::size_t kAckCapacity      = 32768;
     static constexpr std::size_t kMaxChannelBytes  = 255;
     /// A claim result meaning "this publication can never deliver" (Aeron CLOSED
     /// / MAX_POSITION_EXCEEDED, mapped by the policy) → the session fails now.
