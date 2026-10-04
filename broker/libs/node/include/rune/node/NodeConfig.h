@@ -231,9 +231,19 @@ struct NodeConfig {
     std::optional<int32_t> workerIngressBasePort;   // RUNE_WORKER_INGRESS_BASE_PORT (nullopt = unset)
     std::optional<int32_t> workerReplBasePort;      // RUNE_WORKER_REPL_BASE_PORT    (nullopt = unset)
     static constexpr int32_t kMaxShardWorkers = 64;   // runtime→worker announce mask width
-    /// Test-only: shard drivers' client liveness timeout (= the invoker clients'
-    /// inter-service timeout).  0 = Aeron default (10 s).  No env var.
-    int64_t shardClientLivenessTimeoutNs = 0;
+    /// Client liveness of EVERY embedded Aeron driver (node + shard drivers) and the matching media-driver timeout
+    /// of their in-process clients.  Driver and client live in this process, so the check can only detect this
+    /// process's own stall (SIGSTOP, VM stall, docker pause) — and Aeron's 10 s default then killed the broker on
+    /// resume (DR-10).  Default: effectively unbounded (1 h, = the rune client's in-process shards); tests set a
+    /// short value to prove no startup phase starves an invoker driver.  No env var.
+    static constexpr int64_t kInProcessLivenessNs = 3'600'000'000'000LL;
+    int64_t shardClientLivenessTimeoutNs = kInProcessLivenessNs;
+    /// The in-process clients' media-driver timeout (ms) matching shardClientLivenessTimeoutNs (never below
+    /// Aeron's 10 s default).
+    [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
+        const long ms = static_cast<long>(shardClientLivenessTimeoutNs / 1'000'000);
+        return ms > 10'000 ? ms : 10'000;
+    }
     [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
     [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
 

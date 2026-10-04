@@ -352,6 +352,7 @@ void BrokerNode::start() {
             config_.effectiveAeronDir();
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
+        ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());   // in-process driver: survive own stalls
         // Spec §3.2 fused placement: the runtime client has no conductor thread
         // either — its conductor runs in worker 0's pass (during start(): in the
         // interim pump runner below).
@@ -2967,9 +2968,8 @@ void BrokerNode::stop() {
 // ---------------------------------------------------------------------------
 void BrokerNode::startEmbeddedDriver() {
     auto dcfg = EmbeddedDriverConfig::fromNode(config_, config_.effectiveAeronDir());
-    // Fused: the runtime's driver is an invoker driver too (same test-only
-    // liveness knob as the shard drivers; 0 = Aeron default).
-    if (config_.fused()) dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
+    // Every embedded driver: in-process liveness (NodeConfig::shardClientLivenessTimeoutNs, default 1 h).
+    dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
     nodeDriver_ = std::make_unique<EmbeddedDriver>(
         std::move(dcfg), config_.fused() ? DriverMode::Invoker : DriverMode::Threaded);
 }
@@ -3205,6 +3205,7 @@ void BrokerNode::buildShardRuntimes_() {
         shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
         aeron::Context ctx;
         ctx.aeronDir(dir);
+        ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());
         ctx.useConductorAgentInvoker(true);
         auto client = aeron::Aeron::connect(ctx);
         if (!client)

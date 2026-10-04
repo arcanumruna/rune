@@ -1814,3 +1814,57 @@ TEST(ShardModeRegression, StalledDirectClientsCannotStopAnotherDirectClientsInta
     }
     node.stop();
 }
+
+// E3 / DR-10 (2026-10-04): a broker FROZEN past Aeron's default client liveness (10 s) — SIGSTOP, a VM stall,
+// docker pause — died on resume with "client timeout from driver" (exit 255): its in-process driver timed out its
+// own in-process client.  Both live in this process, so that check can only detect the process's own stall; the
+// default must survive it (the broker then rejoins as a follower and is fenced by term).  Child process: the
+// freeze is the stimulus (12 s), every other wait is progress-driven.
+#include <csignal>
+#include <sys/wait.h>
+TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastAeronLivenessDefault) {
+    TmpDir dir{"freeze"};
+    const auto ports = ShardPorts::discover(1, 1);
+    NodeConfig cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true);   // the default placement
+    int beat[2];
+    ASSERT_EQ(::pipe(beat), 0);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(beat[0]);
+        BrokerNode node{cfg};
+        node.start();
+        if (!node.awaitLeader(std::chrono::milliseconds{30'000})) ::_exit(3);
+        for (;;) {                                         // heartbeat while the node runs
+            if (::write(beat[1], "H", 1) != 1) ::_exit(4);
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        }
+    }
+    ::close(beat[1]);
+    auto waitBeat = [&](std::chrono::seconds limit) {
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        char b;
+        while (std::chrono::steady_clock::now() < deadline) {
+            fd_set fds; FD_ZERO(&fds); FD_SET(beat[0], &fds);
+            timeval tv{0, 200'000};
+            if (::select(beat[0] + 1, &fds, nullptr, nullptr, &tv) > 0) return ::read(beat[0], &b, 1) == 1;
+        }
+        return false;
+    };
+    ASSERT_TRUE(waitBeat(std::chrono::seconds{60})) << "child broker never started";
+    ASSERT_EQ(::kill(child, SIGSTOP), 0);
+    std::this_thread::sleep_for(std::chrono::seconds{12});   // the stimulus: frozen past the 10 s Aeron default
+    ASSERT_EQ(::kill(child, SIGCONT), 0);
+    // Drain beats buffered before the stop, then require the process to stay alive for 5 s of fresh beats.
+    int status = 0;
+    bool alive = true;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (std::chrono::steady_clock::now() < until) {
+        if (::waitpid(child, &status, WNOHANG) == child) { alive = false; break; }
+        (void)waitBeat(std::chrono::seconds{1});
+    }
+    EXPECT_TRUE(alive) << "the broker died after the freeze (exit status " << (WIFEXITED(status) ? WEXITSTATUS(status) : -1)
+                       << ") — its in-process Aeron driver timed out its own client";
+    if (alive) { ::kill(child, SIGKILL); ::waitpid(child, &status, 0); }
+    ::close(beat[0]);
+}

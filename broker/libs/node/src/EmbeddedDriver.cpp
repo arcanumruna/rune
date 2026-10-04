@@ -172,8 +172,17 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
                                  usedArgs + "' refused by Aeron (RUNE_AERON_DRIVER_IDLE / "
                                  "RUNE_AERON_DRIVER_IDLE_ARGS): " + why);
     }
-    if (cfg_.clientLivenessTimeoutNs > 0)
-        aeron_driver_context_set_client_liveness_timeout_ns(ctx_, static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs));
+    if (cfg_.clientLivenessTimeoutNs > 0) {
+        // Aeron requires timer_interval < client_liveness < publication_unblock (aeron_driver_context.c, validate):
+        // derive both from the liveness, as the rune client does (AeronTransport.cpp).  Every publication on an
+        // embedded driver is written by this process, so a 1.5x-liveness unblock only matters if the process dies.
+        const auto livenessNs = static_cast<uint64_t>(cfg_.clientLivenessTimeoutNs);
+        aeron_driver_context_set_client_liveness_timeout_ns(ctx_, livenessNs);
+        if (aeron_driver_context_get_timer_interval_ns(ctx_) >= livenessNs)
+            aeron_driver_context_set_timer_interval_ns(ctx_, livenessNs / 10);
+        if (aeron_driver_context_get_publication_unblock_timeout_ns(ctx_) <= livenessNs)
+            aeron_driver_context_set_publication_unblock_timeout_ns(ctx_, livenessNs + livenessNs / 2);
+    }
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
     aeron_driver_context_set_term_buffer_sparse_file(ctx_, cfg_.termBufferSparse.value_or(true));
