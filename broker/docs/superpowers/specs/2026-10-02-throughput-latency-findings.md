@@ -684,6 +684,59 @@ Software lever: GROUP COMMIT — one durability round per node per interval (syn
 one coalesced round of fdatasyncs that waits for all of them), so IO count stops scaling with the number of logs;
 Strict acks wait interval/2 + one commit.  Periodic fsync stays OFF by default (A3; durability via replication).
 
+#### 4.16.1 A10 group commit — probes + interleaved A/B (2026-10-04, k3s-node-01)
+
+Branch `perf/a10-group-commit` (wt41): 0e0c5ce (one durability round per worker: Strict waiters, follower
+flush requests and the periodic sync queued together and submitted with ONE `io_uring_enter`; next round only
+after every member completed; per-log semantics unchanged) + d049b21 (seals before the batch opens).
+
+**Option choice (disk probe, 3 "nodes" x 8 append files, 22 MB/s/node, 5 ms rounds, ext4 on the QEMU volume):**
+
+| mode | rounds/s/node | write IOPS | flushes/s | busy | write p99 |
+|---|---|---|---|---|---|
+| per-file fdatasync (today) | 187 | 5,921 | 1,419 | 100% | 695 us |
+| (b) coalesced fdatasync round | 186 | 5,552 | 1,070 | 100% | 863 us |
+| (a) syncfs per node (shared fs) | 162 | 10,918 | 720 | 100% | 1,673 us |
+| (a) syncfs, 1 node / 8 files ("dedicated" fs) | 192 | 4,584 (round: 2,287) | 770 (760) | 100% | 844 us |
+| (c) two-phase round (sync_file_range, then fdatasync) | 191 | 7,387 | 1,507 | 100% | 464 us |
+
+syncfs writes the fs's metadata buffers in place (~2x write IOs) and on a shared fs every node flushes every
+other node's files; the two-phase round adds IOs.  Picked (b).  At 50 ms every mode is ~20 rounds/s, 25-38% busy.
+**No mode takes the disk below 100% busy at 5 ms**: IO per round = one data write per dirty file + 1-2 journal
+commits, and the data writes cannot merge across files.
+
+**Interleaved A/B** (A = integ b1aa4de, B = A10 d049b21; 20k rec/s open loop, 3-node acks=all 1 KiB, MTU 1408 +
+GSO, 1 worker/node, 8 partitions, leader + follower fsync interval as listed; disk = sda over a 10 s mid-run window):
+
+| fsync | arm | round | achieved | p50 | p99 | write IOPS | flushes/s | busy |
+|---|---|---|---|---|---|---|---|---|
+| 5 ms | A | 1 | 19,999 | 1.75 s | 10.1 s | 1,851 | 430 | 27% |
+| 5 ms | B | 1 | 20,000 | 1.74 s | 10.0 s | 1,624 | 376 | 23% |
+| 5 ms | A | 2 | 20,004 | 1.9 ms | 43 ms | 6,816 | 1,591 | 99% |
+| 5 ms | B | 2 | invalid (harness: previous broker still exiting) | | | | | |
+| 50 ms | A | 1 | 7,406 | 11.6 s | 20.0 s | 519 | 219 | 33% |
+| 50 ms | B | 1 | 17,472 | 2.6 ms | 9.9 s | 549 | 212 | 35% |
+| 50 ms | B | 2 | 20,003 | 1.55 s | 10.0 s | 506 | 180 | 25% |
+| 50 ms | A | 2 | invalid (harness) | | | | | |
+| off | A | 1/2 | 20,000 | 354 / 406 us | 37.2 / 35.7 ms | 136 / 119 | 0 | 6% |
+| off | B | 1/2 | 20,000 | 416 / 383 us | 42.5 / 45.1 ms | 129 / 134 | 0 | 6-7% |
+
+Extra B diag runs (info logs + 20 ms thread-state sampling): 50 ms -> 20,002 rps p50 3.6 ms p99 120 ms; 5 ms ->
+p50 2.06 s p99 10.0 s.
+
+**Reading — the §4.16 root cause does not hold.**  The collapse (p50 seconds, p99 = 10 s) is BIMODAL per run and
+does not track disk load: collapsed runs show 23-35% busy and 400-1,850 write IOPS, while the one healthy 5 ms run
+(A r2) ran at 99% busy / 6.8k IOPS with p50 1.9 ms.  Both arms collapse in some runs and not in others, at 5 ms
+and at 50 ms.  In the collapsed 5 ms diag run node 1 dropped its (internal) partition ISR to 1 at +10 s
+(`ISRChange ... isr 1->1 ... age10003ms(out)`) and every node later closed the client session ("ack publication
+... can never deliver", SessionExpired) — a 10 s stall / session-lease path, not a disk queue.  Thread sampling:
+the shard loop is in `D` (jbd2 `do_get_write_access` / `wait_transaction_locked` — pwrite blocked on a journal
+commit) in ~3-5% of samples with periodic fsync on; io-wq workers sit in `jbd2_log_wait_commit`.
+Group commit is semantically complete and fsync-off is unchanged (within run noise), but it does not fix the
+collapse; the A/B cannot attribute a perf delta to it (n=1-2 per arm, bimodal outcome).  Next: root-cause the
+10 s stall with periodic fsync on (shard-loop journal waits during a commit -> missed lease/heartbeat? the
+ISR-out at age 10,003 ms) — instrument at the session-lease / ISR boundaries, then re-A/B.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
