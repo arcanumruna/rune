@@ -117,8 +117,9 @@ COPY --from=builder /build/build/rune_broker /usr/local/bin/rune_broker
 # rune_role: standalone Aeron role-counter reader — the dr-e2e harness runs it
 # via `docker exec` to detect leadership from counters (not log scraping).
 COPY --from=builder /build/build/rune_role /usr/local/bin/rune_role
-COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
-RUN ldconfig
+# Multi-arch: the multiarch lib dir is x86_64-linux-gnu or aarch64-linux-gnu (= uname -m).
+COPY --from=builder /build/libstdc++.so.6 /tmp/libstdc++.so.6.0.32
+RUN mv /tmp/libstdc++.so.6.0.32 /usr/lib/$(uname -m)-linux-gnu/libstdc++.so.6.0.32 && ldconfig
 
 # Entrypoint (defaults RUNE_DATA_DIR, exec's the binary as PID 1 → clean SIGTERM).
 COPY docker/entrypoint.sh /entrypoint.sh
