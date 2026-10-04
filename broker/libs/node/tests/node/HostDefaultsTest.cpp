@@ -542,6 +542,17 @@ TEST(HostDefaults, ControlPublicationsUseTheirOwnSmallTermRegression) {
     EXPECT_EQ(withTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1") << "0 = driver default";
 }
 
+// A10 regression: runtime-created control publications use sparse terms (no tmpfs fallocate → no EINTR).
+TEST(AeronChannelRegression, ControlPublicationsUseSparseTerms) {
+    using rune::node::withSparseTerms;
+    using rune::node::withTermLength;
+    EXPECT_EQ(withSparseTerms(withTermLength("aeron:udp?endpoint=127.0.0.1:40900", 1 << 20)),
+              "aeron:udp?endpoint=127.0.0.1:40900|term-length=1048576|sparse=true");
+    EXPECT_EQ(withSparseTerms("aeron:udp?endpoint=h:1|sparse=false"), "aeron:udp?endpoint=h:1|sparse=false")
+        << "an explicit per-channel value wins";
+    EXPECT_EQ(withSparseTerms("aeron:ipc"), "aeron:ipc?sparse=true");
+}
+
 // LAT-1 (f): io_uring punts blocking ops to io-wq kernel threads that inherit the submitter's affinity —
 // i.e. they ran ON the pinned worker's own core and preempted it.  With pinned workers the derived default
 // binds io-wq to the cores no co-located node's worker uses (core 0 on the 4-core bench box).
