@@ -507,6 +507,74 @@ per-batch work A8 targets.  The thread p99 (163 ms) is still far above fused (45
 Remaining idle cost: each node driver ~7% (~800 wakeups/s x ~85 us duty cycle: recvmmsg per socket); A7's epoll-first
 polling, once merged, applies to the node driver too and should cut the per-cycle cost.
 
+### 4.14 A8: work per batch at 20k rec/s — what batching can and cannot do (2026-10-04, k3s-node-01)
+
+Question: can the per-batch work at linger 0 be cut (client coalescing, per-pass push / fast-ack / ack batching, fewer
+syscalls per replicated batch) for a large CPU drop at 20k rec/s with no p50/p99/saturation loss?
+Binaries: A = integ/perf-defaults 50c8dbb (broker) + client feat/client-gso ff60185 + f1a4fa0 (bench only: `batches=` /
+`records_per_batch=` in the invoker RESULT line).  B = the same sources + rune-fr 5fe5464 (the only product change, see
+below).  Release, gcc-13, conan toolchains of /root/rune-e5.  Config: §4.8 reference (MTU 1408 + GSO/GRO, backoff workers,
+RUNE_FS_LOG=0, RUNE_LOG_LEVEL=warn, fsync off), 3 nodes x 1 fused worker, acks=all, 1 KiB, linger 0, shards 1, term 1 MiB,
+rcvWindow 256 KiB, ctl term 1 MiB, tp.sh with vm-clean per run (scripts and raw results: /root/a8/).
+
+**Measured first (A, 20k, one worker, 4 s `perf trace -s` + 4 s `perf record`):**
+- Records per batch at 20k = **1.03** (460,000 records / ~446k batch acks, all 4 runs; sat ~50-52).  Arrivals are
+  50 us apart and round-robin over 8 partitions; the invoker client already sends everything appended in one pass as
+  one frame per partition (spec §4.2, ClientShard "end-of-pass batching"), and a pass almost never holds 2 records of
+  one partition.  Idea (1) is already implemented; there is nothing more for it to coalesce at 20k.
+- Per worker per second: recvmmsg 66.5k (78.6% empty), epoll_wait 11.5k, pwrite64 + pwritev 12.2k, sends
+  (sendmsg + sendto + sendmmsg) 8.1k, sched_yield 143, clock_nanosleep 5.  A node sends ~29.5k replication + ack
+  messages/s (6.7k batches led: 2 pushes + 1 ack each; 13.3k applies: 1 fast-ack each) in 8.1k send syscalls =
+  **~3.6 messages per send syscall**: pushes, fast-acks and acks to the same peer already share one datagram per pass
+  (one ExclusivePublication per peer per worker; Aeron packs every message offered before the sender duty).  Idea (2)
+  is what the transport already does; per-pass the worker has ~1 batch per partition to push, so there is no second
+  batch to fold into one push.
+- Profile (worker): kernel 56%, rune_broker 25%, libc 18%; syscall_enter_from_user_mode 10.0% + __recvmmsg 9.7% (the
+  empty polls, idea (3) — A7's epoll-first, not on this base, removes most of them), copies 3%, netfilter ~2%, pwrite +
+  ext4 ~2.5%, **rune_fr_c_now 2.6% + rune_fr_c_span 0.5%**.  Client: recvmmsg 13.5% + syscall entry 10.3%,
+  **rune_fr_c_now 4.5% + rune_fr_c_span 1.2%**.
+- The workers never park at 20k: ~1 wake event (non-empty receive) every ~70 us per worker, and Aeron backoff needs
+  10 consecutive empty passes before its first yield and 30 before the first park.  So worker CPU at 20k is set by the
+  idle shape + the event rate, not by the per-batch work: cutting work per event makes passes shorter, not fewer
+  (same CPU%).  The box is saturated in every arm (system idle 0-2%).
+
+**Found waste, fixed:** the patched Aeron C hooks call `rune_fr_c_now()` at every duty-cycle span start, and it read the
+TSC (rdtscp, slow in this VM) even with the recorder disabled.  rune-fr 5fe5464: returns 0 while disabled (a span
+started at 0 already records nothing).  RED-first test `HopPrimitivesRegression.CApiNowIsZeroWhileDisabledRegression`.
+Proof of path: B's `rune_fr_c_now` disassembly checks `rune_fr::g_enabled` before any rdtscp (A: rdtscp first), in both
+rune_broker and rune_produce_throughput.
+
+**Tried and dropped:** repeat the shard pass's driver duty (A1 loop) only while a backlog may be left, instead of
+after any work.  A byte threshold (one full send batch) left receive backlogs of small datagrams (2 per transport
+per duty): the 20k run collapsed to p50 26 ms / ~2 records per batch.  A receive-full counter in the GSO bindings fixed
+the receive side on paper, but the Linux tests showed window-limited sends (31,680 B < 32,768 B threshold) also escape
+any byte signal.  A correct signal needs send- and receive-side "full" counts through the bindings, and it is capped
+at 20k by the idle shape above.  Kept for reference: rune-broker branch perf/a8-duty-gating-wip (86017d8).
+
+A/B (interleaved A,B per scenario, 2 rounds; per-thread CPU over a ~8 s window mid-run, /proc/<pid>/task/*/stat):
+
+| | A r1 / r2 | B r1 / r2 |
+|---|---|---|
+| 20k worker CPU (mean of 3) | 77.3 / 74.2% (mean 75.8%) | 75.0 / 75.7% (mean 75.3%) |
+| 20k client CPU | 78.3 / 80.8% | 76.5 / 76.6% (-3 pts) |
+| 20k records per batch | 1.03 / 1.03 | 1.03 / 1.03 |
+| 20k p50 | 561 / 619 us | 643 / 553 us |
+| 20k p99 | 15.5 / 26.3 ms | 29.2 / 37.2 ms |
+| sat rec/s (3M records) | 153,592 / 156,827 (mean 155.2k) | 173,191 / 161,865 (mean **167.5k, +8%**) |
+| sat worker CPU (mean of 3) | 57.7 / 60.0% | 58.3 / 59.1% |
+
+All runs errors=0, gso=on, 20,000 rec/s achieved.  Result: **the 20k CPU goal is not met**: worker CPU is unchanged and
+the client is -3 points.  The rdtscp removal shows up where passes are work-bound: saturation is +8%, and B beats A in
+both rounds (B's lower round, 161.9k, is above A's higher, 156.8k).  p50 is neutral (two rounds each, which overlap).
+The 20k p99 is higher in both B rounds (29-37 vs 16-26 ms), but stays inside the 13-51 ms run-to-run spread already
+recorded for this config (§4.12, §4.13); n=2 does not prove it neutral.
+
+What would move 20k CPU: (a) an idle that parks after an empty pass without the 30-pass spin/yield phase, which
+needs the eventfd doorbell on cross-thread rings (A9), because ring and timer work has no fd; (b) A7's epoll-first, for
+the ~20% of each worker spent in empty recvmmsg; (c) fewer events per record at the same latency.  Every message is
+already coalesced per pass, so (c) means coalescing across passes, i.e. a linger, i.e. latency.  The D2 "58% at a
+starved client" number is exactly that trade: bursts produce idle gaps long enough to park.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
