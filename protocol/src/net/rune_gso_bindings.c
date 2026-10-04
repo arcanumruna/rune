@@ -58,8 +58,6 @@ struct rune_gso_bindings_stct
     int inject_count;
     int inject_trunc_count;
     struct rune_gso_transport_state_stct *states; /* conductor-only list (init); freed at delete */
-    int count_rx_full;           /* A8: set at install when ONE agent thread runs every transport (INVOKER/SHARED) */
-    uint64_t rx_full;            /* A8: recvmmsg calls that filled every slot (that agent thread only) */
 };
 
 typedef union rune_gro_ctrl_un
@@ -310,12 +308,7 @@ static int rune_gro_recvmmsg(
     }
     if (!st->gro_parse)
     {
-        const int r = st->owner->defaults.recvmmsg_func(transport, msgvec, vlen, bytes_rcved, recv_func, clientd);
-        if (r > 0 && (size_t)r >= vlen && st->owner->count_rx_full)
-        {
-            st->owner->rx_full++;
-        }
-        return r;
+        return st->owner->defaults.recvmmsg_func(transport, msgvec, vlen, bytes_rcved, recv_func, clientd);
     }
     if (vlen > AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX)
     {
@@ -344,11 +337,6 @@ static int rune_gro_recvmmsg(
         }
         AERON_SET_ERR(err, "rune-gso: recvmmsg failed, fd=%d, recv_fd=%d", (int)transport->fd, (int)transport->recv_fd);
         return -1;
-    }
-
-    if (result > 0 && (size_t)result >= vlen && st->owner->count_rx_full)
-    {
-        st->owner->rx_full++; /* every slot filled: more may be queued */
     }
 
     if (result > 0 && st->owner->inject_trunc_count > 0) /* test seam only: production never sets it */
@@ -501,14 +489,7 @@ int rune_gso_bindings_install(aeron_driver_context_t *ctx, rune_gso_bindings_t *
     {
         return -1;
     }
-    const aeron_threading_mode_t mode = aeron_driver_context_get_threading_mode(ctx);
-    b->count_rx_full = AERON_THREADING_MODE_INVOKER == mode || AERON_THREADING_MODE_SHARED == mode;
     return aeron_driver_context_set_udp_channel_transport_bindings(ctx, &b->bindings) < 0 ? -1 : 0;
-}
-
-int64_t rune_gso_bindings_rx_full(const rune_gso_bindings_t *b)
-{
-    return NULL != b && b->count_rx_full ? (int64_t)b->rx_full : -1;
 }
 
 void rune_gso_bindings_totals(const rune_gso_bindings_t *b, rune_gso_totals_t *out)
@@ -567,7 +548,6 @@ void rune_gso_bindings_totals(const rune_gso_bindings_t *b, rune_gso_totals_t *o
 void rune_gso_bindings_test_inject(rune_gso_bindings_t *b, int err, int count) { (void)b; (void)err; (void)count; }
 void rune_gso_bindings_test_inject_recv_trunc(rune_gso_bindings_t *b, int count) { (void)b; (void)count; }
 int rune_gso_bindings_active(const rune_gso_bindings_t *b) { (void)b; return 0; }
-int64_t rune_gso_bindings_rx_full(const rune_gso_bindings_t *b) { (void)b; return -1; }
 void rune_gso_bindings_delete(rune_gso_bindings_t *b) { free(b); }
 
 #endif
