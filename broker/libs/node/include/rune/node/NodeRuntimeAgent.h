@@ -266,6 +266,8 @@ private:
             const rune::replication::Epoch epoch =
                 static_cast<rune::replication::Epoch>(election_->leadershipTermId());
             work += bridge_->doWork(lid, epoch);
+            // AlterIsr proposals route to the CURRENT controller (consensus leader).
+            if (transport_) transport_->setControllerId(static_cast<int32_t>(lid));
             // M1: an invariant violation caught at the bridge's noexcept
             // boundary joins the uniform halt path below (exit 70).
             if (std::string what; bridge_->takeFatal(what)) throw std::logic_error(what);
@@ -331,6 +333,19 @@ private:
                 const std::size_t n = election_->eligibleNodeIds(
                     nowNs, failoverTimeoutNs, eligBuf_.data(), eligBuf_.size());
 
+                // Kafka broker fencing for INTERNAL partitions (led here, leader-
+                // local ISR): a member the cluster considers dead leaves the ISR
+                // at once — with HW = min over the ISR it would otherwise hold the
+                // HW (metadata commits!) for replicaLagMaxMs.
+                if (n > 0 && registry_) {
+                    for (auto* replica : registry_->allReplicas()) {
+                        if (replica && replica->topicId() < 0 &&
+                            replica->role() == rune::replication::Role::Leader)
+                            replica->shrinkIsrToLive(
+                                std::span<const int32_t>(eligBuf_.data(), n), nowNs);
+                    }
+                }
+
                 // Track eligible-set changes (kept for diagnostics / future gating).
                 const bool changed =
                     !prevEligInit_ || n != prevEligLen_ ||
@@ -356,13 +371,7 @@ private:
                         dbgLastTerm_   = curTerm;
                     }
                 }
-                // A metadata leader that is not COMPLETE yet (B1 gate) may not
-                // append: keep the eligible-set change pending (do not consume it
-                // into prevElig) until it can — else the one-shot preferred pass
-                // of that change is lost.
-                const bool metaLeaderPending =
-                    metadataService_ != nullptr && metadataService_->leaderPendingCompletion();
-                if (n > 0 && !metaLeaderPending) {
+                if (n > 0) {
                     // Refresh the controller's ReplicaPositionTable from the worker-
                     // published, race-free controller position snapshots BEFORE the
                     // rebalance runs, so the DynamicBalancer decides leadership

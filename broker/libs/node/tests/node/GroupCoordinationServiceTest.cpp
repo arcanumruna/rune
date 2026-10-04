@@ -981,7 +981,7 @@ TEST_F(CG3ServiceTest, OffsetIndexRebuiltWhenTheLogContentChangesRegression) {
     replica_->becomeFollower(2, 9);
     FetchResponseMsg div{};
     div.leaderEpoch = 2; div.partition = 0; div.errorCode = rune::replication::kErrDivergingEpoch;
-    div.divergingEpoch = replica_->lastFetchedEpoch(); div.divergingEndOffset = 0;
+    { static rune::replication::ErrorPayloadBuf epb_; div.records = epb_.set(replica_->lastFetchedEpoch(), 0); }
     replica_->applyReplicated(div);
     ASSERT_EQ(replica_->logEndOffset(), 0) << "precondition: the commit record is gone";
     replica_->becomeLeader(3, {kLeader});

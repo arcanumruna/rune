@@ -1340,13 +1340,24 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
     EXPECT_EQ(hwOnOwner(*leaderNode), static_cast<Offset>(0))
         << "leader HW must stay 0 with no follower replication";
 
+    // Kafka model (DUR-1): the controller fences the dead followers out of the
+    // committed ISR (and the leader's lag check proposes the same) — once the
+    // committed ISR is below min-ISR an acks=all produce is REFUSED up front
+    // (NotEnoughReplicas), never deferred.  Either outcome satisfies GR-9 (never
+    // an OK); the deferred-entry check below applies only when the produce was
+    // accepted before the fencing landed.
+    const bool refusedUpFront =
+        anyResp.has_value() && anyResp->errorCode != static_cast<int16_t>(pc::ErrorCode::OK);
+
     // The record was appended to the leader log (LEO advanced) but the ack is
     // still deferred: the pending-ack entry must remain enqueued.
     // F15 I-A: a worker-owned partition's acks=all waiter is parked on the
     // OWNING worker (the gateway's pendingAcks_ holds only inline-path acks), so
     // read the worker's owed-ack count on that worker's thread.
     const int32_t ownerWorker = leaderNode->workerForPartitionForTest(prod.topicId, prod.partition);
-    if (ownerWorker >= 0) {
+    if (refusedUpFront) {
+        // refused (min-ISR): nothing to defer
+    } else if (ownerWorker >= 0) {
         rune::node::Worker* w = leaderNode->workerForTest(ownerWorker);
         ASSERT_NE(w, nullptr);
         EXPECT_GE(leaderNode->onOwnerThreadForTest(prod.topicId, prod.partition,

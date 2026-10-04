@@ -967,6 +967,10 @@ void BrokerNode::buildReplication() {
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
             applyWorkerDrivenDurability(*replica, topicId);   // Task 10 + F30
+            // Kafka AlterPartition: user-partition ISR changes go through the
+            // controller (multi-node); internal partitions keep a leader-local ISR.
+            if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
+                replica->setIsrChannel(replTransport_.get());
 
             if (replTransport_) {
                 // DR-BUG-5: register with composite (topicId, partitionId) key so
@@ -1138,6 +1142,8 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
         applyWorkerDrivenDurability(*replica, topicId);   // same policy as boot (F30 fix round 1, F3)
+        if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
+            replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
 
         // User replicas on a per-worker plane are polled by their owning worker —
         // do NOT register them in the legacy transport's routing table (that would
@@ -1877,7 +1883,7 @@ void BrokerNode::buildGateway() {
                 txnReplicaRaw);
             // F15 §5.1: no startup fold — the TransactionCoordinationService
             // folds the store at its coordinator LOAD (txn replica Leader,
-            // leadership complete, HW == LEO); nothing reads the store before.
+            // HW == LEO); nothing reads the store before.
 
             txnCoordService_ = std::make_unique<TransactionCoordinationService>(
                 txnState_.get(),
@@ -2006,6 +2012,11 @@ void BrokerNode::buildGateway() {
                 metaReplicaRaw, nodeId);
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
+            // Kafka AlterPartition: this node's transport hands every AlterIsr it
+            // receives (as the controller) to the MetadataService (control thread).
+            if (replTransport_)
+                replTransport_->setAlterIsrHandler(&MetadataService::onAlterIsrThunk,
+                                                   metadataService_.get());
 
             // MD1 Task 7: wire the MSM into the bridge so USER partitions are
             // driven per-partition from the committed assignment map.

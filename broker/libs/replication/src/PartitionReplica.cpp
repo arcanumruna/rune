@@ -177,7 +177,15 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
     // epoch cache from scratch, which is the correct fallback for a fresh log or a
     // corrupt checkpoint.
     if (!memoryBacked_ && diskLog_ != nullptr) {
-        (void)epochCache_.restoreFromFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+        const bool restored =
+            epochCache_.restoreFromFile(diskLog_->dir() + "/leader-epoch-checkpoint");
+        // Fix round 1 (MEDIUM-5): a missing / corrupt checkpoint over a non-empty
+        // recovered log is REBUILT from the batches' stamped epochs (never left
+        // silently empty — an empty cache answers every validation as divergent).
+        if (!restored && diskLog_->isRecovered() && logEndOffset_() > diskLog_->logStartOffset()) {
+            rebuildEpochCacheFromLog_();
+            if (epochCache_.latestEpoch() >= 0) checkpointEpochs_();
+        }
         // DUR-1: the checkpoint is fsynced (tmp+fsync+rename) but, with periodic
         // fsync off, the log tail it describes may not have survived an unclean
         // shutdown (power loss) — recovery cut the log back.  An entry starting
@@ -198,6 +206,9 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
         }
     }
 
+    if (memoryBacked_ && epochCache_.latestEpoch() < 0 && logEndOffset_() > 0)
+        rebuildEpochCacheFromLog_();   // a pre-populated in-memory log (no checkpoint)
+
     if (role_ == Role::Leader) {
         isrManagerOwned_ = std::make_unique<IsrManager>(replicas, cfg_.selfId, cfg_.replicaLagMaxMs);
         isrManagerOwned_->setIsr(isr);
@@ -205,9 +216,8 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
 
         // Durability: set the quorum rule and effective minIsr before seeding ISR/LEO.
         leaderState_.setDurabilityMode(cfg_.durability);
-        effectiveMinIsr_ = (cfg_.durability == DurabilityMode::AllInSync)
-            ? static_cast<int>(replicas.size())
-            : cfg_.minIsr;
+        effectiveMinIsr_ = computeEffectiveMinIsr_(static_cast<int>(replicas.size()));
+        committedIsr_    = isr;
 
         leaderState_.setLeaderId(cfg_.selfId);
         leaderState_.setIsr(isr);
@@ -224,7 +234,6 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
             if (!memoryBacked_ && diskLog_ != nullptr)
                 diskLog_->setLeaderEpochStamp(static_cast<int32_t>(epoch_));
         }
-        completenessIsr_ = isr;
     }
     // (Follower: the epoch cache holds only what the log's batches carry —
     //  Kafka builds it from the stamped batches on append, never from the
@@ -241,24 +250,13 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
 void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 {
     // Same-epoch re-assert (a partitionEpoch-only ISR change re-applies the
-    // assignment with the SAME leaderEpoch): only the ISR changes.  Nothing
-    // else of this leadership — completeness, follower slots / push state,
-    // HW floors, the epoch cache — is reset (review: a re-assert used to re-arm
-    // the completeness gate and clear per-follower state).  ISR soundness: a
-    // removal applies at once; an addition never bypasses the data-plane rule
-    // (a member re-enters only through maybeExpandIsr, i.e. after validated
-    // fetches brought it to the HW) — a controller ISR is not proof of sync.
+    // assignment with the SAME leaderEpoch): the controller COMMITTED a new ISR
+    // (our AlterIsr proposal, or its own change).  Only the ISR changes; nothing
+    // else of this leadership — follower slots / push state, HW floors, the
+    // epoch cache — is reset.
     if (role_ == Role::Leader && newEpoch == epoch_ && isrManager_ != nullptr) {
-        std::vector<NodeId> applied;
-        applied.reserve(isr.size() + 1);
-        for (NodeId id : isrManager_->isr())
-            if (id == cfg_.selfId || std::find(isr.begin(), isr.end(), id) != isr.end())
-                applied.push_back(id);
-        if (applied != isrManager_->isr()) {
-            isrManager_->setIsr(applied);
-            syncIsrToLeaderState();
-            recomputeHw();
-        }
+        if (std::find(isr.begin(), isr.end(), cfg_.selfId) == isr.end()) isr.push_back(cfg_.selfId);
+        applyCommittedIsr_(std::move(isr));
         publishCleanerState();
         return;
     }
@@ -272,9 +270,6 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     // uncommitted tail (localLeo > committedHw) would mark that tail as committed,
     // causing uncommitted/divergent records to be readable after failover.
     Offset committedHw = highWatermark();
-    // A COMPLETE leader re-elected at a higher epoch stays complete: nobody else
-    // led (or committed) in between, so it still holds every committed record.
-    const bool stayComplete = role_ == Role::Leader && leaderComplete_;
 
     epoch_ = newEpoch;
     if (role_ != Role::Leader) ++leadershipGeneration_;   // F15 S4: a new leadership (not an epoch bump)
@@ -318,9 +313,9 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     leaderState_.setIsr(isr);
     leaderState_.setLeaderLogEndOffset(logEndOffset_());
 
-    effectiveMinIsr_ = (cfg_.durability == DurabilityMode::AllInSync)
-        ? static_cast<int>(replicas.size())
-        : cfg_.minIsr;
+    effectiveMinIsr_ = computeEffectiveMinIsr_(static_cast<int>(replicas.size()));
+    committedIsr_    = isr;
+    isrProposal_     = IsrProposal{};
 
     // Kafka makeLeader: the new epoch starts at our LEO; every batch we append
     // from now on carries it (Log restamp for the produce path; the replica's
@@ -333,22 +328,18 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
 
     lastIsrCheckNs_ = 0;
 
-    // Completeness gate — armed once per leadership (see the field comment).
-    // The served HW is held at the pre-failover floor until a majority of the
-    // ASSIGNED ISR has proven (validated fetch) its log is a prefix of ours.
-    completenessFloor_ = committedHw;
-    leaderComplete_    = false;
-    completenessIsr_   = isr;
+    // Kafka model (HW = min LEO over the ISR): every ISR member holds every
+    // committed record and a leader is always elected from the ISR — this
+    // leader holds every committed record and is writable at once.  (No
+    // completeness gate, no adoption: a leader never takes records it did not
+    // hold when elected.)
+    electionLeo_ = logEndOffset_();
     followerSlots_.resetLeadership();   // conflation, push coverage, validation: per leadership
 
     // DR-BUG-6: reset the follower-lag TIME clock on the first leader doWork
     // (becomeLeader has no clock) so followers are not evicted at once with a
     // stale lastFetchTimeNs of 0.
     leaderLagClockNeedsReset_ = true;
-
-    // A lone-member assigned ISR (majority == self) completes here.
-    if (stayComplete) leaderComplete_ = true;
-    maybeCompleteLeadership();
 
     publishCleanerState();
 }
@@ -373,6 +364,15 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     followerSync_.reset();    // new leadership epoch → bootstrap fetch state afresh
     wedgedAtOffset_ = -1;     // F18: a new leadership may serve it (re-evaluated)
     if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setLeaderEpochStamp(-1);
+    // Drop a phantom epoch entry (assigned at becomeLeader at our LEO, never
+    // appended in): our lastFetchedEpoch must name the epoch of our last record.
+    {
+        const int32_t latest = epochCache_.latestEpoch();
+        if (latest >= 0 && epochCache_.startOffsetFor(latest) >= logEndOffset_()) {
+            epochCache_.truncateFromEnd(logEndOffset_());
+            if (!memoryBacked_ && diskLog_ != nullptr) checkpointEpochs_();
+        }
+    }
     if (fsLogEnabled()) {
         spdlog::info("FollowerSync[node={} part={}] reset (becomeFollower epoch={} leader={})",
                      cfg_.selfId, cfg_.partitionId, leaderEpoch, leaderId);
@@ -401,7 +401,7 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
     // retries on a negative result, never ignores it).
     if (!acceptsProduce()) [[unlikely]] return kAppendNotLeader;
 
-    if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) {
+    if (!committedIsrMeetsMinIsr_(acksAll)) {
         return -1; // gated by min-ISR
     }
 
@@ -470,7 +470,7 @@ Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatc
     if (!acceptsProduce()) return kAppendNotLeader;              // retriable (B1: also while incomplete)
     if (!isControlBatch(controlBatch)) return kAppendInvalidBatch;
     ++rtAppends_;
-    if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) return kAppendMinIsr;
+    if (!committedIsrMeetsMinIsr_(acksAll)) return kAppendMinIsr;
 
     const int32_t lastOffsetDelta = rune::protocol::RecordBatchReader(
         controlBatch.data(), controlBatch.size()).lastOffsetDelta();
@@ -512,7 +512,7 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
 {
     if (!acceptsProduce()) [[unlikely]] return kAppendNotLeader;   // B1 (see append())
 
-    if (!isrManager_->canProduce(effectiveMinIsr_, acksAll)) {
+    if (!committedIsrMeetsMinIsr_(acksAll)) {
         return -1; // gated by min-ISR
     }
 
@@ -640,40 +640,51 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         return kErrNotLeader;
     }
 
-    if (FollowerSlot* const hs = followerSlots_.find(req.followerId)) [[likely]] hs->heard = true;
+    // Mixed v2/v3 replication is UNSUPPORTED (fail closed): a v2 follower has
+    // no lineage to validate — only an empty log (nothing to diverge) is served.
+    FetchRequestMsg vreq = req;
+    if (req.lastFetchedEpoch == kLastFetchedEpochV2Frame) [[unlikely]] {
+        if (req.fetchOffset > 0) {
+            if (v2RefusalsLogged_++ == 0)
+                spdlog::critical("PartitionReplica[node={} topic={} part={}]: refusing a v2 (pre-"
+                                 "KIP-320) FetchRequest from follower {} at offset {} — mixed v2/v3 "
+                                 "replication is unsupported (no lineage to validate)",
+                                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, req.followerId,
+                                 req.fetchOffset);
+            auto ref = makeFetchResponse(highWatermark(), kErrUnsupportedWireVersion, {});
+            if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, ref); }))
+                ++sendRefusals_;
+            return kErrUnsupportedWireVersion;
+        }
+        vreq.lastFetchedEpoch = -1;
+    }
 
     // KIP-320/595 — validate EVERY fetch against our epoch lineage.  The
     // follower's log ends at (fetchOffset, lastFetchedEpoch); it is on our
     // lineage iff we hold that epoch and it does not end before fetchOffset on
     // our side.  Otherwise answer DivergingEpoch = our endOffsetForEpoch(
-    // lastFetchedEpoch) and credit NOTHING (ISR liveness, HW, completeness,
-    // push position): only a fetch that passed validation counts.
-    if (req.lastFetchedEpoch >= 0) {
+    // lastFetchedEpoch) and credit NOTHING (ISR liveness, HW, push position): only a fetch that passed validation counts.
+    if (vreq.lastFetchedEpoch >= 0) {
         const Offset leo = logEndOffset_();
-        const auto ans = epochCache_.endOffsetForEpoch(req.lastFetchedEpoch, leo);
-        if (ans.first < req.lastFetchedEpoch || ans.second < req.fetchOffset) [[unlikely]] {
-            if (!leaderComplete_) {
-                // A leader that has not proven it holds every committed record
-                // must never make a survivor drop records (they may be the
-                // committed ones it lacks): HOLD the follower — it keeps its log
-                // and re-fetches; the answer becomes a truncation directive only
-                // once we are complete (or another leader takes over).
-                auto hold = makeFetchResponse(highWatermark(), kErrLeaderNotComplete, {});
-                if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, hold); }))
-                    ++sendRefusals_;   // not owed: the follower re-fetches
-                return kErrLeaderNotComplete;
-            }
-            auto div = makeFetchResponse(highWatermark(), kErrDivergingEpoch, {});
-            div.divergingEpoch     = ans.first;
-            div.divergingEndOffset = ans.second;
+        const auto ans = epochCache_.endOffsetForEpoch(vreq.lastFetchedEpoch, leo);
+        if (ans.first < vreq.lastFetchedEpoch || ans.second < req.fetchOffset) [[unlikely]] {
+            // We hold every committed record (we were elected from the ISR):
+            // whatever the follower holds past our lineage is uncommitted —
+            // KIP-279 truncation directive.
+            ErrorPayload{ans.first, ans.second}.encode(errPayload_.data());
+            auto div = makeFetchResponse(highWatermark(), kErrDivergingEpoch,
+                                         std::span<const uint8_t>(errPayload_.data(), ErrorPayload::SIZE));
             if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, div); }))
                 ++sendRefusals_;       // not owed: the follower re-fetches (and re-learns it)
             return kErrDivergingEpoch;
         }
     } else if (req.fetchOffset > logEndOffset_()) [[unlikely]] {
-        // No epoch to validate (an empty-log / pre-v3 follower) yet ahead of us:
-        // Kafka's OFFSET_OUT_OF_RANGE.  Never credited, never served.
-        auto oor = makeFetchResponse(highWatermark(), kErrOutOfRange, {});
+        // No epoch to validate (an empty-log / unstamped-log follower) yet ahead
+        // of us: Kafka's OFFSET_OUT_OF_RANGE, carrying our log end offset (the
+        // follower truncates to it).  Never credited, never served.
+        ErrorPayload{-1, logEndOffset_()}.encode(errPayload_.data());
+        auto oor = makeFetchResponse(highWatermark(), kErrOutOfRange,
+                                     std::span<const uint8_t>(errPayload_.data(), ErrorPayload::SIZE));
         if (!onTransport([&](auto& t) { return t.sendFetchResponse(req.followerId, oor); }))
             ++sendRefusals_;
         return kErrOutOfRange;
@@ -753,7 +764,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // Record follower fetch: update ISR manager + leader state.
     // Pass the REAL nowNs so time-lag eviction uses the actual fetch time,
     // not the stale last-ISR-check timestamp.
-    isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs);
+    isrManager_->onFollowerFetch(req.followerId, req.fetchOffset, nowNs, logEndOffset_());
     const Offset prevHwOnFetch = leaderState_.highWatermark();
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
@@ -781,20 +792,16 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // maybeExpandIsr once its LEO is back at the HW.  Cold path (a regression
     // is an unclean restart, never steady state).
     if (prevAckedLeo > req.fetchOffset && req.fetchOffset < prevHwOnFetch) [[unlikely]] {
-        if (isrManager_->removeFromIsr(req.followerId)) {
-            spdlog::warn("PartitionReplica[node={} topic={} part={}]: follower {} regressed "
-                         "{} -> {} below the HW {} (unclean restart lost acknowledged "
-                         "records) — removed from the ISR until caught up",
-                         cfg_.selfId, cfg_.topicId, cfg_.partitionId, req.followerId,
-                         prevAckedLeo, req.fetchOffset, prevHwOnFetch);
-            syncIsrToLeaderState();
-            recomputeHw();
-        }
+        if (slot != nullptr) slot->unclean = true;   // kept out of the ISR until caught up
+        spdlog::warn("PartitionReplica[node={} topic={} part={}]: follower {} regressed "
+                     "{} -> {} below the HW {} (unclean restart lost acknowledged "
+                     "records) — removed from the ISR until caught up",
+                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, req.followerId,
+                     prevAckedLeo, req.fetchOffset, prevHwOnFetch);
+        updateIsr_(nowNs);
+    } else if (slot != nullptr && slot->unclean && req.fetchOffset >= prevHwOnFetch) {
+        slot->unclean = false;   // caught up again (validated): may re-enter via expansion
     }
-
-    // Completeness gate: this validated fetch proves the follower's log is a
-    // prefix of ours.
-    if (!leaderComplete_) maybeCompleteLeadership();
 
     // Conflated (decided above): an identical response is still in flight — ISR
     // liveness + HW were updated above, so skipping the RESPONSE is safe.  F27:
@@ -1001,14 +1008,25 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         }
         // KIP-320/595: our (fetchOffset, lastFetchedEpoch) is off the leader's
         // lineage — KIP-279 truncation, then re-fetch.
+        ErrorPayload ep{};
         if (resp.errorCode == kErrDivergingEpoch && role_ == Role::Follower &&
-            resp.leaderEpoch == epoch_ && resp.divergingEpoch >= -1 && resp.divergingEndOffset >= 0) {
-            onDivergingEpoch_(resp);
+            resp.leaderEpoch == epoch_ && ErrorPayload::decode(resp.records, ep) &&
+            ep.epoch >= -1 && ep.endOffset >= 0) {
+            onDivergingEpoch_(ep.epoch, ep.endOffset);
         }
-        // kErrLeaderNotComplete: the leader holds us (it may lack records we
-        // have) — keep the log, re-fetch at cadence.  kErrOutOfRange (we sent
-        // no epoch) and the rest: ignored (control plane drives role changes).
-        // Other errors — ignore (control plane handles epoch changes externally).
+        // OffsetOutOfRange (we fetched without an epoch — empty or unstamped log —
+        // and are ahead of the leader): Kafka truncates to the leader's log end.
+        if (resp.errorCode == kErrOutOfRange && role_ == Role::Follower &&
+            resp.leaderEpoch == epoch_ && ErrorPayload::decode(resp.records, ep) &&
+            ep.endOffset >= 0 && ep.endOffset < logEndOffset_()) {
+            onDivergingEpoch_(/*epoch=*/-1, ep.endOffset);
+        }
+        if (resp.errorCode == kErrUnsupportedWireVersion && v2RefusalsLogged_++ == 0) {
+            spdlog::critical("PartitionReplica[node={} topic={} part={}]: dropped a v2 (pre-KIP-320) "
+                             "replication frame from leader {} — mixed v2/v3 replication is "
+                             "unsupported", cfg_.selfId, cfg_.topicId, cfg_.partitionId, leaderId_);
+        }
+        // Other errors: ignored (the control plane drives role changes).
         return;
     }
     // fsyncgate fail-stop: a log whose fsync failed accepts no further data
@@ -1276,6 +1294,32 @@ int32_t PartitionReplica::lastFetchedEpoch() const noexcept
     return epochCache_.epochForOffset(leo - 1);
 }
 
+// Cold: rebuild the epoch cache from the stamped batches of the whole log.
+void PartitionReplica::rebuildEpochCacheFromLog_()
+{
+    Offset at = onLog([](auto& L) { return L.logStartOffset(); });
+    const Offset leo = logEndOffset_();
+    for (int guard = 0; at < leo && guard < (1 << 20); ++guard) {
+        // Copying read (cold): never leaves sealed segments mapped (lazy maps).
+        const std::vector<uint8_t> buf = onLog([&](auto& L) { return L.read(at, 1 << 20); });
+        if (buf.empty()) break;
+        struct { const uint8_t* data; std::size_t len; } v{buf.data(), buf.size()};
+        (void)assignEpochsFromBatches_(v.data, v.len);
+        // Advance past the last whole batch in the view.
+        Offset next = at;
+        std::size_t pos = 0;
+        while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= v.len) {
+            rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
+            const int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > v.len) break;
+            next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            pos += static_cast<std::size_t>(total);
+        }
+        if (next <= at) break;
+        at = next;
+    }
+}
+
 // Kafka LeaderEpochFileCache.assign on append: each batch whose stamped epoch
 // is newer than the latest cached one starts that epoch at its base offset.
 bool PartitionReplica::assignEpochsFromBatches_(const uint8_t* p, std::size_t len)
@@ -1305,16 +1349,16 @@ bool PartitionReplica::assignEpochsFromBatches_(const uint8_t* p, std::size_t le
 //     (we may diverge earlier still): the next fetch, carrying the older epoch,
 //     runs another round.
 // Then re-fetch at once (the loop converges in at most one round per epoch).
-void PartitionReplica::onDivergingEpoch_(const FetchResponseMsg& resp)
+void PartitionReplica::onDivergingEpoch_(int32_t divergingEpoch, Offset divergingEndOffset)
 {
     const Offset leo = logEndOffset_();
-    const auto mine = epochCache_.endOffsetForEpoch(resp.divergingEpoch, leo);
+    const auto mine = epochCache_.endOffsetForEpoch(divergingEpoch, leo);
     // A log with no epoch history at all (unstamped legacy batches): Kafka's
     // "no local epoch info" case — truncate to the leader's end offset.
-    Offset truncTo = epochCache_.latestEpoch() < 0
-        ? resp.divergingEndOffset
-        : (mine.first == resp.divergingEpoch)
-            ? std::min<Offset>(resp.divergingEndOffset, mine.second)
+    Offset truncTo = (divergingEpoch < 0 || epochCache_.latestEpoch() < 0)
+        ? divergingEndOffset
+        : (mine.first == divergingEpoch)
+            ? std::min<Offset>(divergingEndOffset, mine.second)
             : mine.second;
     if (truncTo > leo) truncTo = leo;
     if (truncTo < 0) truncTo = 0;
@@ -1326,8 +1370,8 @@ void PartitionReplica::onDivergingEpoch_(const FetchResponseMsg& resp)
                          "ends at {} (epoch {}) below our known committed offset {} (LEO {}) — "
                          "truncating (an unclean / deficient election happened upstream)",
                          cfg_.selfId, cfg_.topicId, cfg_.partitionId, leaderId_,
-                         static_cast<long long>(epoch_), resp.divergingEndOffset,
-                         resp.divergingEpoch, followerHw_, leo);
+                         static_cast<long long>(epoch_), divergingEndOffset,
+                         divergingEpoch, followerHw_, leo);
     }
     if (truncTo < leo) truncateLog(truncTo);   // prunes the epoch cache in step (A10)
     followerSync_.reset();
@@ -1558,50 +1602,18 @@ int PartitionReplica::doWork(int64_t nowNs)
             // idle/no-follower leader).  Only count work when the check ACTUALLY
             // changes ISR state or emits a reconcile (below).
 
-            isrManager_->maybeShrinkIsr(nowNs,
-                                         logEndOffset_(),
-                                         cfg_.replicaLagMaxMs,
-                                         cfg_.replicaLagMaxOffset);
-            if (isrManager_->isrChanged()) {
-                syncIsrToLeaderState();
-                recomputeHw();
-                ++work;
-            }
+            if (updateIsr_(nowNs)) ++work;
 
-            // Change-gated diagnostic (cheap): only log when the ISR size shrinks
-            // below the full replica set OR recovers — logging every check starves
-            // the worker under load (observed: leo frozen at 0).
+            // Change-gated diagnostic (cheap): only log when the ISR size changes.
             if (fsLogEnabled()) {
-                const int isrSz = static_cast<int>(isrManager_->isr().size());
-                const int repl  = static_cast<int>(isrManager_->replicas().size());
+                const int isrSz = static_cast<int>(committedIsr_.size());
                 if (isrSz != lastLoggedIsrSize_) {
                     lastLoggedIsrSize_ = isrSz;
-                    std::string dump;
-                    for (NodeId n : isrManager_->replicas()) {
-                        dump += " n" + std::to_string(n) + "=off"
-                              + std::to_string(isrManager_->debugLastFetchOffset(n))
-                              + "/age" + std::to_string(
-                                    isrManager_->debugFetchAgeNs(n, nowNs) / 1'000'000)
-                              + "ms" + (isrManager_->inIsr(n) ? "(isr)" : "(out)");
-                    }
-                    spdlog::info("ISRChange[node={} part={}] isr {}->{} of {} hw={} leo={}{}",
-                                 cfg_.selfId, cfg_.partitionId, isrSz, isrSz, repl,
-                                 leaderState_.highWatermark(), logEndOffset_(), dump);
+                    spdlog::info("ISRChange[node={} part={}] committed isr {} (maximal {}) hw={} leo={}",
+                                 cfg_.selfId, cfg_.partitionId, isrSz, isrManager_->isr().size(),
+                                 leaderState_.highWatermark(), logEndOffset_());
                 }
             }
-            isrManager_->maybeExpandIsrIf(nowNs, leaderState_.highWatermark(), [this](NodeId n) {
-                const FollowerSlot* sl = followerSlots_.find(n);
-                return sl != nullptr && sl->validated;   // validated in THIS leadership
-            });
-            if (isrManager_->isrChanged()) {
-                syncIsrToLeaderState();
-                ++work;
-            }
-
-            // Completeness gate: re-evaluated each ISR check (cold; a no-op once
-            // complete).  Its quorum is over the ASSIGNED ISR — an ISR shrink
-            // never completes a leader.
-            maybeCompleteLeadership();
 
         }
     } else {
@@ -1666,8 +1678,8 @@ int PartitionReplica::doWork(int64_t nowNs)
 
     // Publish the current served HW + role for the cleaner (release-store).
     // This is the steady-state publication site: it covers every HW/ISR/
-    // completeness/role change made on this duty tick (ISR shrink/expand,
-    // completeness gate, fetch-driven HW advances) so the cleaner's acquire-load
+    // role change made on this duty tick (ISR shrink/expand, fetch-driven HW
+    // advances) so the cleaner's acquire-load
     // converges to the current committed HW without ever reading the live state.
     publishCleanerState();
 
@@ -1691,18 +1703,12 @@ Offset PartitionReplica::computeServedHw() const noexcept
     // Raw majority-of-ISR HW from the leader state (spec §4).
     const Offset rawHw = leaderState_.highWatermark();
 
-    // DR-BUG-6 LEADER-COMPLETENESS GATE.  While incomplete, hold the served HW
-    // at the pre-failover floor (see the field comment / becomeLeader).
-    if (!leaderComplete_) {
-        return completenessFloor_;
-    }
-
     // DR-BUG-3: min-ISR COMMIT gate on the exposed HW.  While the ISR is BELOW
     // effectiveMinIsr_ the effective committed HW must not advance past the last offset
     // committed while the ISR was healthy (lastHealthyHw_).
     // effectiveMinIsr_ == cfg_.minIsr (Majority) or RF (AllInSync).
     const int minIsr  = (effectiveMinIsr_ >= 1) ? effectiveMinIsr_ : 1;
-    const int isrSize = isrManager_ ? static_cast<int>(isrManager_->isr().size()) : 0;
+    const int isrSize = static_cast<int>(committedIsr_.size());
 
     if (isrSize >= minIsr) {
         // Healthy ISR: rawHw is a legitimate majority-committed offset.
@@ -1722,12 +1728,22 @@ Offset PartitionReplica::highWatermark() const noexcept
     // ONLY write to lastHealthyHw_; it is a duty-thread-only side effect.  The
     // cleaner NEVER calls highWatermark() (it uses cleanerHighWatermark()), so
     // this write never races with the cleaner thread.
-    if (role_ == Role::Leader && leaderComplete_) {
+    if (role_ == Role::Leader) {
         const int minIsr  = (effectiveMinIsr_ >= 1) ? effectiveMinIsr_ : 1;
-        const int isrSize = isrManager_ ? static_cast<int>(isrManager_->isr().size()) : 0;
+        const int isrSize = static_cast<int>(committedIsr_.size());
+        const Offset rawHw = leaderState_.highWatermark();
         if (isrSize >= minIsr) {
-            const Offset rawHw = leaderState_.highWatermark();
             if (rawHw > lastHealthyHw_) lastHealthyHw_ = rawHw;
+        } else {
+            // DR-BUG-3 × failover (was the completion-time recovery): a new
+            // leader seeds the healthy floor from its own possibly-stale follower
+            // view.  Records it held AT ELECTION that every current ISR member
+            // now holds (raw HW = min over the ISR) were written by the previous
+            // leader to its whole ISR — re-expose them even while the ISR sits
+            // below min-ISR (AllInSync after a node death), never anything
+            // appended since (that waits for a healthy ISR).
+            const Offset recovered = std::min(rawHw, electionLeo_);
+            if (recovered > lastHealthyHw_) lastHealthyHw_ = recovered;
         }
     }
 
@@ -1746,7 +1762,7 @@ void PartitionReplica::publishCleanerState() noexcept
     // ISR-health check — closes the live isr().size() read race (Task #13 acks race).
     // Leader: publish actual ISR size; Follower: publish 0 (not applicable).
     const int isrSize = (role_ == Role::Leader && isrManager_)
-        ? static_cast<int>(isrManager_->isr().size())
+        ? static_cast<int>(committedIsr_.size())
         : 0;
     publishedIsrSizeForGateway_.store(isrSize, std::memory_order_release);
 
@@ -1769,11 +1785,17 @@ void PartitionReplica::publishCleanerState() noexcept
     }
 }
 
+const std::vector<NodeId>& PartitionReplica::maximalIsrForTest() const noexcept
+{
+    static const std::vector<NodeId> kEmpty{};
+    return (role_ == Role::Leader && isrManager_) ? isrManager_->isr() : kEmpty;
+}
+
 const std::vector<NodeId>& PartitionReplica::isr() const noexcept
 {
     static const std::vector<NodeId> kEmpty{};
     if (role_ == Role::Leader && isrManager_) {
-        return isrManager_->isr();
+        return committedIsr_;   // the controller-committed ISR (min-ISR, elections)
     }
     return kEmpty;
 }
@@ -1783,45 +1805,165 @@ const std::vector<NodeId>& PartitionReplica::isr() const noexcept
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// DR-BUG-6 LEADER-COMPLETENESS GATE
+// ISR management — Kafka model (HW = min LEO over the maximal ISR).
+//
+// The COMMITTED ISR (committedIsr_) is the controller's: the controller elects
+// only from it, and min-ISR (acks=all) is checked against it.  A leader with an
+// ISR channel (isrChannel_, production / the DR harness) never changes it on its
+// own: it PROPOSES a change (AlterIsr, Kafka AlterPartition) and keeps computing
+// the HW over the MAXIMAL ISR = committed ∪ proposed (KIP-497/841): a member
+// being shrunk still holds the HW back until the controller has committed its
+// removal (so it can no longer be elected while records past its LEO are
+// committed), a member being added counts at once (it was validated at >= HW).
+// Without a channel (single node, unit rigs) the leader is its own controller:
+// a change commits immediately.
 // ---------------------------------------------------------------------------
-
-// (Leader) Complete the leadership once a MAJORITY of the ISR assigned at
-// becomeLeader (completenessIsr_; self always counts) has proven — by a fetch
-// that passed lastFetchedEpoch validation in this leadership — that its log is
-// a prefix of ours (see the field comment for why that quorum proves we hold
-// every committed record).  Cold: called on validated fetches / ISR checks
-// until complete, never after.
-void PartitionReplica::maybeCompleteLeadership()
+int PartitionReplica::computeEffectiveMinIsr_(int rf) const noexcept
 {
-    if (leaderComplete_) return;
-    if (role_ != Role::Leader || !isrManager_) return;
+    if (cfg_.durability == DurabilityMode::AllInSync) return rf;
+    const int m = cfg_.minIsr;
+    return m < 1 ? 1 : m;
+}
 
-    // Quorum set = the ISR assigned at becomeLeader, minus members that are
-    // SILENT in this leadership (never sent any fetch) AND have been shrunk out
-    // of the data ISR by the lag check — a dead / unreachable replica (Kafka:
-    // not in the ISR).  A member that talks but is held (its log is ahead of /
-    // off our lineage: it may hold committed records we lack) always stays.
-    int members = 1;   // self
-    int proven  = 1;
-    for (NodeId id : completenessIsr_) {
-        if (id == cfg_.selfId) continue;
-        const FollowerSlot* sl = followerSlots_.find(id);
-        if (sl != nullptr && sl->validated) { ++members; ++proven; continue; }
-        if ((sl != nullptr && sl->heard) || isrManager_->inIsr(id)) ++members;
+bool PartitionReplica::committedIsrMeetsMinIsr_(bool acksAll) const noexcept
+{
+    if (!acksAll) return true;
+    return static_cast<int>(committedIsr_.size()) >= effectiveMinIsr_;
+}
+
+namespace {
+bool sameMembers_(const std::vector<NodeId>& a, const std::vector<NodeId>& b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (NodeId id : a)
+        if (std::find(b.begin(), b.end(), id) == b.end()) return false;
+    return true;
+}
+} // namespace
+
+void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr)
+{
+    // A committed CHANGE resolves the pending proposal: it was committed, or its
+    // base no longer matches and the controller will refuse every copy — the
+    // maximal ISR collapses to the new committed one and the next check
+    // re-derives.  A re-assert of the SAME members (a partitionEpoch-only bump
+    // for another reason) leaves the proposal committable: keep it pending.
+    const bool changed = !sameMembers_(isr, committedIsr_);
+    committedIsr_ = std::move(isr);
+    if (changed || (isrProposal_.pending && sameMembers_(isrProposal_.isr, committedIsr_)))
+        isrProposal_.pending = false;
+    applyMaximalIsr_();
+}
+
+void PartitionReplica::applyMaximalIsr_()
+{
+    isrManager_->setIsr(committedIsr_);
+    if (isrProposal_.pending)
+        for (NodeId id : isrProposal_.isr) (void)isrManager_->addToIsr(id);
+    syncIsrToLeaderState();
+    recomputeHw();
+}
+
+void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t nowNs)
+{
+    if (role_ != Role::Leader || isrManager_ == nullptr || live.empty()) return;
+    bool anyDead = false;
+    for (NodeId id : committedIsr_)
+        if (id != cfg_.selfId && std::find(live.begin(), live.end(), id) == live.end()) anyDead = true;
+    if (!anyDead) return;
+    for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
+        FollowerSlot& sl = followerSlots_.at(i);
+        if (sl.id != cfg_.selfId && std::find(live.begin(), live.end(), sl.id) == live.end())
+            sl.validated = false;   // must prove a validated position again to re-enter
     }
-    if (proven < members / 2 + 1) return;
+    std::vector<NodeId> desired;   // cold: only when a member died
+    desired.reserve(committedIsr_.size());
+    for (NodeId id : committedIsr_)
+        if (id == cfg_.selfId || std::find(live.begin(), live.end(), id) != live.end()) desired.push_back(id);
+    (void)changeIsr_(desired, nowNs);
+}
 
-    leaderComplete_ = true;
+bool PartitionReplica::updateIsr_(int64_t nowNs)
+{
+    if (role_ != Role::Leader || isrManager_ == nullptr) return false;
+    if (isrChannel_ != nullptr && isrProposal_.pending) {
+        // One proposal in flight: re-send it until the controller commits it or
+        // another committed change resolves it (the request or the committed
+        // record may have been lost).
+        if (nowNs - isrProposal_.sentNs >= kAlterIsrResendNs) sendIsrProposal_(nowNs);
+        return false;
+    }
+    // Desired ISR: the committed one, shrunk by the Kafka lag rule (no caught-
+    // up fetch within replicaLagMaxMs), minus unclean (regressed) members,
+    // expanded by followers validated in this leadership at >= HW.  Steady
+    // state allocates nothing (IsrManager works in place on reserved capacity).
+    //
+    // INTERNAL partitions (led by the CONSENSUS leader, which is elected
+    // data-blind — see the bridge): no lag shrink.  Their ISR drops only members
+    // the cluster considers dead (shrinkIsrToLive, Kafka broker fencing) and
+    // unclean (regressed) members, so every live node the consensus can elect
+    // holds every committed record (HW = min over the ISR) — the Kafka "leader
+    // is an ISR member" rule without a controller-side ISR.  Cost: a live but
+    // slow member slows internal commits (acks=all waits for it).
+    isrManager_->setIsr(committedIsr_);
+    if (!internalPartition_())
+        (void)isrManager_->maybeShrinkIsr(nowNs, logEndOffset_(), cfg_.replicaLagMaxMs,
+                                          cfg_.replicaLagMaxOffset);
+    for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
+        const FollowerSlot& sl = followerSlots_.at(i);
+        if (sl.unclean && sl.id != cfg_.selfId) (void)isrManager_->removeFromIsr(sl.id);
+    }
+    // Expansion considers only replicas OUTSIDE the committed ISR: a member the
+    // shrink just removed sits at the HW it pins (HW = min over the ISR), so
+    // "fetch offset >= HW" would re-admit it in the same pass and the HW would
+    // never move (Kafka evaluates expansion against the HW of the shrunk ISR).
+    (void)isrManager_->maybeExpandIsrIf(nowNs, leaderState_.highWatermark(), [this](NodeId n) {
+        if (std::find(committedIsr_.begin(), committedIsr_.end(), n) != committedIsr_.end())
+            return false;
+        const FollowerSlot* sl = followerSlots_.find(n);
+        return sl != nullptr && sl->validated && !sl->unclean;   // validated in THIS leadership
+    });
+    // `desired` aliases isrManager_'s vector: changeIsr_ copies it out before it
+    // re-seeds isrManager_ with the maximal ISR.
+    const bool changed = changeIsr_(isrManager_->isr(), nowNs);
+    if (!changed) applyMaximalIsr_();   // restore the maximal ISR the HW counts
+    return changed;
+}
 
-    // DR-BUG-3 × completeness: recover the healthy-committed floor.  A new
-    // leader seeds lastHealthyHw_ from its own (possibly lagging) follower-view
-    // HW; under AllInSync the post-failover ISR may sit below minIsr and keep the
-    // served HW clamped to that stale seed forever.  Raise it to the raw
-    // majority-of-ISR HW — what a majority of the ISR provably holds (never an
-    // uncommitted tail held by this leader alone).
-    const Offset recoveredHw = leaderState_.highWatermark();
-    if (recoveredHw > lastHealthyHw_) lastHealthyHw_ = recoveredHw;
+bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t nowNs)
+{
+    if (sameMembers_(desired, committedIsr_)) return false;
+    if (isrChannel_ == nullptr) {
+        // Self-managed: the leader is its own controller.
+        committedIsr_.assign(desired.begin(), desired.end());
+        applyMaximalIsr_();
+        publishCleanerState();
+        return true;
+    }
+    if (isrProposal_.pending) return false;   // one change at a time (re-sent by updateIsr_)
+    // Controller-managed: propose; HW over committed ∪ proposed meanwhile — a
+    // member being shrunk keeps holding the HW back until the controller
+    // committed its removal (it is electable until then).
+    isrProposal_.pending = true;
+    isrProposal_.isr.assign(desired.begin(), desired.end());
+    applyMaximalIsr_();
+    sendIsrProposal_(nowNs);
+    publishCleanerState();
+    return true;
+}
+
+void PartitionReplica::sendIsrProposal_(int64_t nowNs)
+{
+    isrProposal_.sentNs = nowNs;
+    AlterIsrMsg m{};
+    m.topicId     = cfg_.topicId;
+    m.partition   = cfg_.partitionId;
+    m.leaderId    = cfg_.selfId;
+    m.leaderEpoch = epoch_;
+    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), AlterIsrMsg::kMaxIsr));
+    for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
+    m.baseIsrCount = static_cast<int32_t>(std::min<std::size_t>(committedIsr_.size(), AlterIsrMsg::kMaxIsr));
+    for (int i = 0; i < m.baseIsrCount; ++i) m.baseIsr[static_cast<std::size_t>(i)] = committedIsr_[static_cast<std::size_t>(i)];
+    if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;   // re-sent on the next resend tick
 }
 
 void PartitionReplica::recomputeHw()

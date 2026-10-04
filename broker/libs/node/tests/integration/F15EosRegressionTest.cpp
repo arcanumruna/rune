@@ -1003,7 +1003,7 @@ void truncateTo(PartitionReplica& r, int64_t endOffset) {
     div.leaderEpoch = r.epoch(); div.partition = 0; div.highWatermark = 0;
     div.logStartOffset = 0; div.errorCode = rune::replication::kErrDivergingEpoch;
     div.topicId = r.topicId();
-    div.divergingEpoch = r.lastFetchedEpoch(); div.divergingEndOffset = endOffset;
+    { static rune::replication::ErrorPayloadBuf epb_; div.records = epb_.set(r.lastFetchedEpoch(), endOffset); }
     r.applyReplicated(div);
 }
 // Re-fetch from the new leader: `records` appended at the follower's LEO.
@@ -1692,7 +1692,9 @@ struct CoordRig {
     CoordRig(Role role, rune::replication::Epoch epoch, std::vector<NodeId> replicas, std::vector<NodeId> isr) {
         log = std::make_unique<Log>(d.path.string(), 64LL * 1024 * 1024);
         log->recover();
-        rep = std::make_unique<PartitionReplica>(cfg(1, 1, 99, 0), role, epoch, std::move(replicas),
+        // The txn-state partition is INTERNAL (__transaction_state, topicId -2):
+        // led by the consensus leader, so its leader runs the completeness gate.
+        rep = std::make_unique<PartitionReplica>(cfg(1, 1, -2, 0), role, epoch, std::move(replicas),
                                                  std::move(isr), log.get(), &t);
         newCoordinator();
     }
@@ -1732,10 +1734,12 @@ struct CoordRig {
         return (r && r->results.size() == 1) ? r->results[0].errorCode : int16_t{-1};
     }
     // Follower 2 reports its log end (a FetchRequest at `offset`).
-    void fetchFrom2(int64_t offset, int64_t now) {
+    void fetchFrom2(int64_t offset, int64_t now) { fetchFrom(2, offset, now); }
+    void fetchFrom(NodeId node, int64_t offset, int64_t now) {
         rune::replication::FetchRequestMsg q{};
-        q.leaderEpoch = rep->epoch(); q.partition = 0; q.followerId = 2; q.fetchOffset = offset;
-        q.maxBytes = 1 << 20; q.topicId = 99;
+        q.leaderEpoch = rep->epoch(); q.partition = 0; q.followerId = node; q.fetchOffset = offset;
+        q.maxBytes = 1 << 20; q.topicId = -2;
+        q.lastFetchedEpoch = rep->lastFetchedEpochAtForTest(offset);
         (void)rep->onFetchRequest(q, now);
     }
     // One txn-state record written straight to the replica (a previous coordinator's put).
@@ -1749,19 +1753,17 @@ struct CoordRig {
 };
 } // namespace
 
-TEST(TxnCoordinatorLoadRegression, NotCoordinatorUntilLeaderComplete) {
-    // K4: a new txn-state leader whose leadership is not yet complete serves an
-    // HW held at the old floor — the coordinator must not load (nor answer, nor
-    // write) until leaderComplete_ holds.
-    CoordRig R(Role::Follower, 1, {1, 2}, {1, 2});
-    R.rep->becomeLeader(2, {1, 2});
-    ASSERT_FALSE(R.rep->isLeaderComplete()) << "precondition: follower 2 has not reported in";
-    EXPECT_EQ(R.initPid("t").err, kNotCoordinator) << "loaded before leaderComplete_";
-    EXPECT_EQ(R.log->logEndOffset(), 0) << "an unloaded coordinator wrote to the txn-state log";
-    R.fetchFrom2(0, 2);
-    ASSERT_TRUE(R.rep->isLeaderComplete());
-    EXPECT_NE(R.initPid("t").err, kNotCoordinator) << "loaded once leaderComplete_ and HW == LEO hold";
+TEST(TxnCoordinatorLoadRegression, NewTxnStateLeaderLoadsAtOnceWhenHwEqualsLeo) {
+    // Kafka model (CRITICAL-2 of the 0ff9322 review): a new txn-state leader is
+    // an ISR member holding every committed record — no completeness gate.  With
+    // nothing above its HW (HW == LEO) the coordinator loads at once, before any
+    // follower reported in (the completeness gate froze it here).
+    CoordRig R(Role::Follower, 1, {1, 2, 3}, {1, 2, 3});
+    R.rep->becomeLeader(2, {1, 2, 3});
+    ASSERT_EQ(R.rep->highWatermark(), R.rep->logEndOffset());
+    EXPECT_NE(R.initPid("t").err, kNotCoordinator) << "a new txn-state leader did not load";
     R.fetchFrom2(R.log->logEndOffset(), 3);                 // the pid-block ceiling commits
+    R.fetchFrom(3, R.log->logEndOffset(), 3);
     EXPECT_EQ(R.initPid("t").err, 0);
 }
 
@@ -1823,21 +1825,21 @@ TEST(TxnCoordinatorLoadRegression, CommittedPrepareAboveStaleFloorIsNeverMissed)
         m.state = tx::TxnState::PrepareCommit; ASSERT_TRUE(s.put(m, 1));
     }
     const auto bytes = oldLog.read(0, 1 << 20);
-    CoordRig R(Role::Follower, 1, {1, 2}, {1, 2});
+    CoordRig R(Role::Follower, 1, {1, 2, 3}, {1, 2, 3});
     rune::replication::FetchResponseMsg resp{};
     resp.leaderEpoch = 1; resp.partition = 0; resp.highWatermark = 0; resp.logStartOffset = 0;
-    resp.errorCode = 0; resp.topicId = 99; resp.records = std::span<const uint8_t>(bytes);
+    resp.errorCode = 0; resp.topicId = -2; resp.records = std::span<const uint8_t>(bytes);
     R.rep->applyReplicated(resp);
     ASSERT_EQ(R.log->logEndOffset(), 2) << "precondition: both records replicated";
-    R.rep->becomeLeader(2, {1, 2});
-    ASSERT_FALSE(R.rep->isLeaderComplete());
-    ASSERT_EQ(R.rep->highWatermark(), 0) << "precondition: served HW held at the stale floor";
+    R.rep->becomeLeader(2, {1, 2, 3});
+    ASSERT_EQ(R.rep->highWatermark(), 0) << "precondition: served HW at the stale floor (HW < LEO)";
     for (int i = 0; i < 4; ++i) (void)R.tcs->doWork(10'000'000'000LL + i);
-    EXPECT_TRUE(R.markers.empty()) << "decided before leadership completed";
+    EXPECT_TRUE(R.markers.empty()) << "decided while records sat above the HW";
     EXPECT_EQ(R.initPid("x").err, kNotCoordinator);
     // The old leader (node 2) rejoins as a follower at the same log end.
     R.fetchFrom2(2, 3);
-    ASSERT_TRUE(R.rep->isLeaderComplete());
+    EXPECT_EQ(R.rep->highWatermark(), 0) << "HW = min over the ISR: node 3 has not fetched";
+    R.fetchFrom(3, 2, 3);                                   // node 3 holds it too (HW = min over the ISR)
     for (int i = 0; i < 4; ++i) (void)R.tcs->doWork(20'000'000'000LL + i);
     const auto* meta = R.store->get("t-fo");
     ASSERT_NE(meta, nullptr) << "the load must see the committed records";
@@ -3060,21 +3062,16 @@ void gatewayMarker(EosRig& R, int64_t pid, bool commit, int64_t now) {
 }
 } // namespace
 
-TEST(TxnRcRegression, BuildWaitsForLeaderComplete) {
-    // I2: an incomplete leader (follower 2 has not reported a validated fetch)
-    // must not build its RC state before leaderComplete_ — until then it has not
-    // proven its log holds every committed record.  (The DR-BUG-6 reverse
-    // reconcile that used to append old-term batches here is retired: a leader
-    // never takes records it did not hold when elected.)
+TEST(TxnRcRegression, BuildStartsWithLeadership) {
+    // I2 under the Kafka model: a leader holds every committed record at
+    // becomeLeader (HW = min over the ISR; elected from the ISR), so the RC build
+    // starts with the leadership and sees the previous term's open txn.
     RcRig R({1, 2}, 64LL * 1024 * 1024, Role::Follower);
     appendAt(*R.log, txnBatch(7, 0, 0));                    // the previous term's txn data at 0
     R.rep->becomeLeader(2, {1, 2});
+    ASSERT_TRUE(R.rep->acceptsProduce()) << "a leader is writable at becomeLeader";
     R.own();
-    for (int i = 0; i < 8; ++i) R.pass();
-    ASSERT_FALSE(R.rep->isLeaderComplete()) << "precondition: an incomplete leader";
-    EXPECT_EQ(R.status(), Worker::kRcUnbuilt) << "the RC build started before leaderComplete_";
     followerCaughtUp(*R.rep, R.now);
-    ASSERT_TRUE(R.rep->isLeaderComplete()) << "precondition: the survivor reported in";
     ASSERT_TRUE(R.runUntilReady(64)) << "status " << R.status();
     EXPECT_EQ(R.open(), 1u) << "the build missed the open txn at 0";
 }
@@ -4580,10 +4577,10 @@ struct InlineRig {
     int64_t corr = 0;
     int64_t now  = 1;
     InlineRig(Role role, std::vector<NodeId> isr, bool withReplica = true,
-              int64_t roll = 64LL * 1024 * 1024) : rollBytes(roll) {
+              int64_t roll = 64LL * 1024 * 1024, int32_t replicaTopicId = 0) : rollBytes(roll) {
         gw.setTopicRegistry(&topics);
         if (withReplica) {
-            auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, 0, 0), role, 1, isr, isr, topics.log(0, 0), &t);
+            auto rep = std::make_unique<PartitionReplica>(cfg(1, 1, replicaTopicId, 0), role, 1, isr, isr, topics.log(0, 0), &t);
             r = rep.get();
             reg.add(0, 0, std::move(rep));
             gw.setReplicaRegistry(&reg);
@@ -4621,7 +4618,7 @@ TEST(PsmLogConsistencyRegression, InlineNewLeaderKeepsItsTailAboveHwAndNeverReap
     R.r->becomeLeader(2, {1, 2});
     rune::replication::FetchRequestMsg fr{R.r->epoch(), 0, /*follower*/2, /*fetchOffset*/1, 1 << 20, R.r->topicId()};
     (void)R.r->onFetchRequest(fr, ++R.now);                  // follower 2 holds [0, 1)
-    ASSERT_TRUE(R.r->isLeaderComplete()) << "precondition: a complete leader";
+    ASSERT_TRUE(R.r->acceptsProduce()) << "precondition: a writable leader";
     ASSERT_EQ(R.r->highWatermark(), 1) << "precondition: HW 1";
     ASSERT_EQ(R.log().logEndOffset(), 3) << "precondition: the tail [1, 3) is kept above HW";
     R.gw.onNodeLeadershipGainedForTest();                    // the node-level Follower→Leader rebuild
@@ -4648,8 +4645,8 @@ TEST(PsmLogConsistencyRegression, InlinePerPartitionTruncationAndRepromotionRebu
     truncateTo(*R.r, 1);                                     // seq 1, 2 never committed: cut
     refetch(*R.r, otherBatchAt(1), /*leaderHw=*/2);          // the new leader's data at 1
     R.r->becomeLeader(3, {1});
-    (void)R.r->doWork(++R.now);                              // leader completeness (lone ISR)
-    ASSERT_TRUE(R.r->isLeaderComplete());
+    (void)R.r->doWork(++R.now);
+    ASSERT_TRUE(R.r->acceptsProduce());
     ASSERT_EQ(R.log().logEndOffset(), 2);
     const Answer a = R.produce(7, 0, 1);
     EXPECT_EQ(a.err, 0);
@@ -4679,34 +4676,12 @@ TEST(PsmLogConsistencyRegression, InlineUnrebuiltProducerStateNeverAnswersOosFor
     }
 }
 
-TEST(PsmLogConsistencyRegression, InlineIncompleteLeaderRefusesIdempotentBatchesRetriably) {
-    // Finding 2: a producer state that cannot be proven (a leader still
-    // reconciling to the frontier may append old-term batches) answers a
-    // retriable refusal — never OOS, never an append.
-    InlineRig R(Role::Follower, {1, 2});
-    preload(R.log(), /*pid=*/7, 0, 0, 2);
-    R.r->becomeLeader(2, {1, 2});
-    ASSERT_FALSE(R.r->isLeaderComplete()) << "precondition: follower 2 has not reported in";
-    const Answer a = R.produce(7, 0, 2);
-    EXPECT_EQ(a.err, kNotLeader);
-    EXPECT_EQ(R.log().logEndOffset(), 3);
-    const Answer b = R.produce(7, 0, 0);
-    EXPECT_EQ(b.err, kNotLeader) << "an unproven producer state vouched for seq 0";
-    EXPECT_EQ(R.log().logEndOffset(), 3);
-}
-
-TEST(PsmLogConsistencyRegression, InlineIncompleteLeaderRefusesNonIdempotentBatchesRetriably) {
-    // DUR-1 fix round 1 (B1): the inline gate checked completeness only for
-    // idempotent batches (pid >= 0) — a pid -1 batch was appended by a leader
-    // still reconciling to the frontier, over records its survivors hold.
-    InlineRig R(Role::Follower, {1, 2});
-    preload(R.log(), /*pid=*/7, 0, 0, 2);
-    R.r->becomeLeader(2, {1, 2});
-    ASSERT_FALSE(R.r->isLeaderComplete()) << "precondition: follower 2 has not reported in";
-    const Answer a = R.produce(-1, -1, -1);
-    EXPECT_EQ(a.err, kNotLeader) << "a pid -1 batch reached an incomplete leader's log";
-    EXPECT_EQ(R.log().logEndOffset(), 3);
-}
+// (PsmLogConsistencyRegression.InlineIncompleteLeaderRefuses{Idempotent,
+//  NonIdempotent}BatchesRetriably retired with the leader-completeness gate:
+//  under the Kafka model every leader holds every committed record at
+//  becomeLeader, so the inline path's only gate is leadership itself —
+//  PartitionReplica::acceptsProduce, pinned by
+//  WorkerProduceGateRegression.FollowerRefusedLeaderWritableAtOnce.)
 
 TEST(PsmLogConsistencyRegression, InlineMarkerRaisesTheProducerEpochLikeTheRebuild) {
     // Markers / epoch fencing: the rebuild applies every control batch as an

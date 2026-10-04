@@ -176,7 +176,8 @@ TEST(StaticAssignmentEmitTest, SingleLeader_EmitsBalancedAssignmentOnLeaderClaim
         r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
         transport.pump(clock);
         // Majority = leader + at least one follower with HW >= LEO.
-        if (r2->highWatermark() >= r1->logEndOffset() ||
+        // Kafka model: committed once on every ISR member; both followers learn it.
+        if (r2->highWatermark() >= r1->logEndOffset() &&
             r3->highWatermark() >= r1->logEndOffset()) {
             replicated = true;
         }
@@ -522,14 +523,17 @@ TEST(StaticAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
 }
 
 // ---------------------------------------------------------------------------
-// Review: ungated METADATA path — MetadataService appended with acks=false on an
-// INCOMPLETE leader (and ignored the result), so a deficient metadata leader
-// could write over committed metadata records / lose the ones it emitted.  Now:
-// nothing is appended (static emit, dynamic records, control ticks) until the
-// metadata replica is a COMPLETE leader; the records stay queued (never dropped,
-// never an ignored append result) and are appended in order once it completes.
+// CRITICAL-2 (review of 0ff9322) — the metadata partition is led by the
+// consensus leader.  Under the majority-of-ISR HW + leader-completeness gate a
+// new metadata leader appended nothing until a validated majority reported in,
+// and could never complete when a survivor held an uncommitted tail: the
+// control plane froze.  Kafka model: HW = min over the ISR, the internal ISR
+// never lag-shrinks a live member — the new metadata leader holds every
+// committed record and is writable AT ONCE: static emit, control ticks and
+// dynamic records are appended immediately (never an ignored append result) and
+// commit as soon as the ISR acknowledges them.
 // ---------------------------------------------------------------------------
-TEST(MetadataGateRegression, IncompleteMetadataLeaderQueuesNeverAppendsNeverDrops) {
+TEST(MetadataGateRegression, NewMetadataLeaderWritableAtOnce_NoCompletenessFreeze) {
     SaeTempDir dir1("mg1"), dir2("mg2"), dir3("mg3");
     rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
     log1.recover(); log2.recover(); log3.recover();
@@ -545,27 +549,25 @@ TEST(MetadataGateRegression, IncompleteMetadataLeaderQueuesNeverAppendsNeverDrop
     transport.setLeader(r1.get());
     transport.addFollower(kNode2, r2.get());
     transport.addFollower(kNode3, r3.get());
-    r1->becomeLeader(1, allNodes);               // no follower has reported: INCOMPLETE
-    ASSERT_EQ(r1->role(), Role::Leader);
-    ASSERT_FALSE(r1->isLeaderComplete());
+    r1->becomeLeader(1, allNodes);               // no follower has reported yet
+    ASSERT_TRUE(r1->acceptsProduce()) << "a new metadata leader must be writable at once";
 
     std::vector<TopicSpec> topics = {TopicSpec{0, 3, 1, "", "t"}};
     MetadataService svc1(r1.get(), kNode1);
     svc1.configure(topics, allNodes);
     svc1.armControlTick(/*deadlineNs=*/0);
     int64_t clock = 1'000'000LL;
+    bool ticked = false;
     for (int i = 0; i < 5; ++i) {
         clock += 1'000'000LL;
         (void)svc1.doWork(clock);
         svc1.emitStaticAssignmentIfNeeded();
-        EXPECT_FALSE(svc1.pollAndAppendControlTick(clock)) << "a tick appended on an incomplete leader";
+        ticked = svc1.pollAndAppendControlTick(clock) || ticked;
     }
-    EXPECT_EQ(r1->logEndOffset(), 0) << "metadata appended on an incomplete leader";
-    EXPECT_TRUE(svc1.leaderPendingCompletion());
-    EXPECT_EQ(svc1.pendingControlTimers(), 1u) << "the tick was consumed although nothing was appended";
+    EXPECT_GT(r1->logEndOffset(), 0) << "the metadata leader appended nothing (frozen)";
+    EXPECT_TRUE(ticked) << "the control tick was never appended";
 
-    // The followers report in (validated fetches) → the leader completes; the
-    // queued / deferred records are appended, replicated and committed.
+    // The followers fetch → the records commit (HW = min over the ISR).
     r2->becomeFollower(1, kNode1);
     r3->becomeFollower(1, kNode1);
     bool done = false;
@@ -575,9 +577,133 @@ TEST(MetadataGateRegression, IncompleteMetadataLeaderQueuesNeverAppendsNeverDrop
         transport.pump(clock);
         (void)svc1.doWork(clock);
         (void)svc1.pollAndAppendControlTick(clock);
-        done = r1->isLeaderComplete() && svc1.assignment(0, 0) != nullptr &&
-               svc1.assignment(0, 2) != nullptr && svc1.lastEmittedTickSeq() >= 0;
+        done = svc1.assignment(0, 0) != nullptr && svc1.assignment(0, 2) != nullptr &&
+               svc1.lastEmittedTickSeq() >= 0;
     }
-    ASSERT_TRUE(done) << "complete=" << r1->isLeaderComplete() << " leo=" << r1->logEndOffset();
+    ASSERT_TRUE(done) << "leo=" << r1->logEndOffset() << " hw=" << r1->highWatermark();
     EXPECT_GT(r1->highWatermark(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1 (Kafka AlterPartition, controller side): MetadataService accepts
+// an ISR proposal only from the CURRENT leader at the CURRENT leaderEpoch, with
+// the leader in the ISR and every member a replica, and only when no other
+// change for that partition is in flight; the committed record keeps the
+// leader / leaderEpoch and bumps partitionEpoch.
+// ---------------------------------------------------------------------------
+TEST(AlterIsrControllerRegression, ControllerCommitsOnlyValidProposalsFromTheCurrentLeader) {
+    SaeTempDir dir1("ai1"), dir2("ai2"), dir3("ai3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(50);
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    const int32_t leader = pa->leaderNode, le = pa->leaderEpoch, pe = pa->partitionEpoch;
+    ASSERT_EQ(pa->isr.size(), 3u);
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = leader; m.leaderEpoch = le;
+    m.isrCount = 2;
+    m.isr[0] = leader; m.isr[1] = (leader == 1) ? 2 : 1;
+    m.baseIsrCount = 3;                          // derived from the committed {1,2,3}
+    for (int i = 0; i < 3; ++i) m.baseIsr[static_cast<std::size_t>(i)] = pa->isr[static_cast<std::size_t>(i)];
+    // Stale epoch / not the leader / leader missing from the ISR / non-replica: rejected.
+    auto stale = m; stale.leaderEpoch = le - 1;
+    EXPECT_FALSE(svc1.onAlterIsr(stale));
+    auto notLeader = m; notLeader.leaderId = (leader == 3) ? 2 : 3;
+    EXPECT_FALSE(svc1.onAlterIsr(notLeader));
+    auto noLeader = m; noLeader.isr[0] = (leader == 3) ? 2 : 3; noLeader.isr[1] = (leader == 1) ? 2 : 1;
+    if (noLeader.isr[0] == noLeader.isr[1]) noLeader.isr[1] = 99;
+    EXPECT_FALSE(svc1.onAlterIsr(noLeader));
+    auto alien = m; alien.isr[1] = 42;
+    EXPECT_FALSE(svc1.onAlterIsr(alien));
+    // Valid: accepted once; a duplicate while in flight is not re-appended.
+    EXPECT_TRUE(svc1.onAlterIsr(m));
+    EXPECT_FALSE(svc1.onAlterIsr(m));
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->isr.size(), 2u);
+    EXPECT_EQ(pa->leaderNode, leader);
+    EXPECT_EQ(pa->leaderEpoch, le) << "an ISR change never bumps the leader epoch";
+    EXPECT_EQ(pa->partitionEpoch, pe + 1);
+    EXPECT_FALSE(svc1.onAlterIsr(m)) << "already committed";
+
+    // Compare-and-set (Kafka's partitionEpoch check): a proposal derived from an
+    // OLDER committed ISR (a stale / re-ordered AlterIsr — here one re-adding the
+    // member the committed shrink removed) is never committed; the same proposal
+    // derived from the current committed ISR is.
+    const int32_t out = (m.isr[0] != 1 && m.isr[1] != 1) ? 1 : (m.isr[0] != 2 && m.isr[1] != 2) ? 2 : 3;
+    auto readd = m; readd.isrCount = 3; readd.isr[2] = out;
+    auto staleBase = readd;                      // base = the old {1,2,3}
+    EXPECT_FALSE(svc1.onAlterIsr(staleBase)) << "committed a proposal derived from a stale ISR";
+    readd.baseIsrCount = 2; readd.baseIsr[0] = m.isr[0]; readd.baseIsr[1] = m.isr[1];
+    EXPECT_TRUE(svc1.onAlterIsr(readd));
+}
+
+// Kafka broker fencing (controller side): a node the cluster considers dead
+// leaves the COMMITTED ISR of every partition whose leader is alive — with HW =
+// min over the ISR it would otherwise pin the HW (acks=all) until the leader's
+// own lag check — and the leader / leaderEpoch stay unchanged (partitionEpoch
+// + 1).  The fenced node re-enters only through its leader's AlterIsr.
+TEST(AlterIsrControllerRegression, ControllerFencesDeadMembersOutOfTheCommittedIsr) {
+    SaeTempDir dir1("fe1"), dir2("fe2"), dir3("fe3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(50);
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    ASSERT_EQ(pa->isr.size(), 3u);
+    const int32_t leader = pa->leaderNode, le = pa->leaderEpoch, pe = pa->partitionEpoch;
+    const int32_t dead = (leader == 3) ? 2 : 3;
+    std::vector<rune::metadata::NodeId> live;
+    for (int32_t n : allNodes) if (n != dead) live.push_back(n);
+    EXPECT_GE(svc1.runDynamicRebalanceOnTick(live, nullptr), 1u);
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(std::find(pa->isr.begin(), pa->isr.end(), dead), pa->isr.end()) << "a dead member stayed in the committed ISR";
+    EXPECT_EQ(pa->leaderNode, leader);
+    EXPECT_EQ(pa->leaderEpoch, le);
+    EXPECT_EQ(pa->partitionEpoch, pe + 1);
+    EXPECT_EQ(svc1.runDynamicRebalanceOnTick(live, nullptr), 0u) << "steady state must emit nothing";
 }

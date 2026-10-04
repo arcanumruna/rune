@@ -1317,17 +1317,15 @@ TEST(BrokerNodeRegression, DefaultMaxBatchConfigNeverRefusedRegression) {
 // F3 round 5, items C1 + M4: the derivation is the SAME function the
 // transports enforce.  Pins the exact default numbers and checks them against
 // REAL transport instances (one EmbeddedDriver, default 4 MiB term):
-//   (replication schema v3: the FetchResponse framing is 58 B — 46 before
-//    KIP-320/595 added divergingEpoch + divergingEndOffset)
 //   legacy (AeronPartitionTransport, 4 MiB outbound ring):
-//     min(524288 − 16 envelope − 58 framing, 524288 − 58) = 524214
-//   per-worker (WorkerReplicationTransport, gather send): 524288 − 58 = 524230
+//     min(524288 − 16 envelope − 46 framing, 524288 − 46) = 524226
+//   per-worker (WorkerReplicationTransport, gather send): 524288 − 46 = 524242
 //   worker ingress ring (32 MiB): 4194304 − WorkerOp framing from the codec
 //     (8 SBE header + sbeBlockLength + 4 tail prefix: 4194073 with rune-protocol
 //     66bf9e6, 4194057 with fb82500's targetReplicaId/incarnation fields)
 //   aeron ingress (4 MiB term):   524288 − Produce framing
-// → effective (multi-node) = 524214 = the ENFORCED legacy ceiling (round 4
-//   derived 524230, 16 bytes above what the legacy ring path can carry).
+// → effective (multi-node) = 524226 = the ENFORCED legacy ceiling (round 4
+//   derived 524242, 16 bytes above what the legacy ring path can carry).
 // ---------------------------------------------------------------------------
 TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     const fs::path dir = makeTempDataDir("derivedreal_");
@@ -1342,13 +1340,13 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     cfg.replicationOutboundRingBytes = 4 * 1024 * 1024;
     ASSERT_EQ(cfg.workerIngressRingBytes, 32 * 1024 * 1024);
 
-    EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524214);
+    EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524226);
     EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 4194304u - kWorkerOpFramingFromCodec);
-    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524214u);
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524226u);
     // F3 round 6, item 1: the multi-node fetch/push chunk is bounded by the
-    // replication hard max too (a 1 MiB coalesced push over the 524214 B
+    // replication hard max too (a 1 MiB coalesced push over the 524226 B
     // ceiling was dropped → 20 ms re-serve stall).  Single-node keeps 1 MiB.
-    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 524214);
+    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 524226);
     {
         NodeConfig single = makeSingleNodeConfig(dir);
         EXPECT_EQ(userTopicMaxFetchBytes(single), 1 << 20);
@@ -1372,8 +1370,8 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     ASSERT_TRUE(perWorker.resolved());
 
     const std::size_t eff = effectiveMaxProduceBatchBytes(cfg);
-    EXPECT_EQ(legacy.maxFetchResponseBytes(), 524214) << "derived == enforced (legacy ring path)";
-    EXPECT_EQ(perWorker.maxFetchResponseBytes(), 524230) << "derived == enforced (gather path)";
+    EXPECT_EQ(legacy.maxFetchResponseBytes(), 524226) << "derived == enforced (legacy ring path)";
+    EXPECT_EQ(perWorker.maxFetchResponseBytes(), 524242) << "derived == enforced (gather path)";
     EXPECT_GE(static_cast<std::size_t>(legacy.maxFetchResponseBytes()), eff);
     EXPECT_GE(static_cast<std::size_t>(perWorker.maxFetchResponseBytes()), eff);
     EXPECT_EQ(perWorker.maxFetchResponseBytes(),

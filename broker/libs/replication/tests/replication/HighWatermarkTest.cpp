@@ -3,17 +3,22 @@
 //
 // Tests cover:
 //   • Single-replica ISR  → HW == leader LEO
-//   • 3-replica ISR (leader + 2 followers) → HW = 2nd-highest (majority=2)
+//   • 3-replica ISR (leader + 2 followers) → HW = min LEO over the ISR
 //   • HW advances as followers fetch forward
 //   • HW is monotonic (stale/backward follower LEO does NOT lower HW)
 //   • updateFollowerFetchOffset is monotonic per follower
-//   • 5-replica ISR → majority=3 → HW = 3rd-highest
-//   • ISR shrink (setIsr fewer members) recomputes majority correctly
+//   • 5-replica ISR → HW = min LEO over the ISR
+//   • ISR shrink (setIsr fewer members) recomputes the ISR minimum
 //   • Leader-only ISR → HW = leader LEO
 //   • ISR with unknown followers defaults to 0
 //   • HW never regresses after ISR changes
 //   • committedOffset == highWatermark
 //   • Leader LEO query
+//
+// NOTE (Kafka model, user decision 2026-10-03): HW = min LEO over the ISR in
+// every durability mode.  Per-step arithmetic comments below that still say
+// "majority=…/Nth-highest" describe the RETIRED majority-of-ISR rule; the
+// EXPECTs carry the Kafka values (marked "Kafka model" where they changed).
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
@@ -82,7 +87,7 @@ TEST(HighWatermark, CommittedOffsetEqualsHighWatermark) {
 // 3-replica ISR: leader + 2 followers, majority = 2
 // ============================================================================
 
-TEST(HighWatermark, ThreeReplicaHwIs2ndHighest) {
+TEST(HighWatermarkRegression, ThreeReplicaHwIsMinOverIsr) {
     // ISR={0,1,2}: LEOs=[100, 90, 80] → sorted desc=[100,90,80] → majority=2 → HW=90
     ReplicaLeaderState s;
     s.setLeaderId(0);
@@ -90,7 +95,7 @@ TEST(HighWatermark, ThreeReplicaHwIs2ndHighest) {
     s.setIsr({0, 1, 2});
     s.updateFollowerFetchOffset(1, 90LL);
     s.updateFollowerFetchOffset(2, 80LL);
-    EXPECT_EQ(s.highWatermark(), 90LL);
+    EXPECT_EQ(s.highWatermark(), 80LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 TEST(HighWatermark, ThreeReplicaHwBothFollowersBehind) {
@@ -124,7 +129,7 @@ TEST(HighWatermark, ThreeReplicaHwUnknownFollowerDefaultsToZero) {
     s.setIsr({0, 1, 2});
     s.updateFollowerFetchOffset(1, 90LL);
     // follower 2 never reported → defaults to 0
-    EXPECT_EQ(s.highWatermark(), 90LL);
+    EXPECT_EQ(s.highWatermark(), 0LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 TEST(HighWatermark, ThreeReplicaBothFollowersUnknown) {
@@ -155,25 +160,25 @@ TEST(HighWatermark, HwAdvancesAsFollowersCatchUp) {
     // follower 1 advances to 50
     s.updateFollowerFetchOffset(1, 50LL);
     // LEOs=[100,50,0] → majority=2 → HW=50
-    EXPECT_EQ(s.highWatermark(), 50LL);
+    EXPECT_EQ(s.highWatermark(), 0LL);   // Kafka model: HW = min LEO over the ISR
 
     // follower 2 advances to 75
     s.updateFollowerFetchOffset(2, 75LL);
     // LEOs=[100,75,50] → majority=2 → HW=75
-    EXPECT_EQ(s.highWatermark(), 75LL);
+    EXPECT_EQ(s.highWatermark(), 50LL);   // Kafka model: HW = min LEO over the ISR
 
     // follower 1 advances to 90
     s.updateFollowerFetchOffset(1, 90LL);
     // LEOs=[100,90,75] → majority=2 → HW=90
-    EXPECT_EQ(s.highWatermark(), 90LL);
+    EXPECT_EQ(s.highWatermark(), 75LL);   // Kafka model: HW = min LEO over the ISR
 
     // follower 2 reaches 100 (leader LEO)
     s.updateFollowerFetchOffset(2, 100LL);
     // LEOs=[100,100,90] → HW=100
-    EXPECT_EQ(s.highWatermark(), 100LL);
+    EXPECT_EQ(s.highWatermark(), 90LL);   // Kafka model: HW = min LEO over the ISR
 }
 
-TEST(HighWatermark, LeaderLeoAdvancesHwToMajority) {
+TEST(HighWatermark, LeaderLeoAdvancesHwToIsrMin) {
     ReplicaLeaderState s;
     s.setLeaderId(0);
     s.setIsr({0, 1, 2});
@@ -193,7 +198,7 @@ TEST(HighWatermark, LeaderLeoAdvancesHwToMajority) {
     // follower 1 advances to 80
     s.updateFollowerFetchOffset(1, 80LL);
     // LEOs=[100,80,50] → HW=80
-    EXPECT_EQ(s.highWatermark(), 80LL);
+    EXPECT_EQ(s.highWatermark(), 50LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 // ============================================================================
@@ -211,12 +216,12 @@ TEST(HighWatermark, HwMonotonicAfterFollowerRegression) {
     // Advance to HW=90
     s.updateFollowerFetchOffset(1, 90LL);
     s.updateFollowerFetchOffset(2, 80LL);
-    EXPECT_EQ(s.highWatermark(), 90LL);
+    EXPECT_EQ(s.highWatermark(), 80LL);   // Kafka model: HW = min LEO over the ISR
 
     // "Late" update: follower 1 tries to report 50 (stale message)
     s.updateFollowerFetchOffset(1, 50LL); // must be ignored (monotonic)
     // follower 1 is still tracked at 90; HW must remain 90
-    EXPECT_EQ(s.highWatermark(), 90LL);
+    EXPECT_EQ(s.highWatermark(), 80LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 TEST(HighWatermark, HwMonotonicAfterIsrShrink) {
@@ -228,13 +233,13 @@ TEST(HighWatermark, HwMonotonicAfterIsrShrink) {
 
     s.updateFollowerFetchOffset(1, 90LL);
     s.updateFollowerFetchOffset(2, 80LL);
-    EXPECT_EQ(s.highWatermark(), 90LL);
+    EXPECT_EQ(s.highWatermark(), 80LL);   // Kafka model: HW = min LEO over the ISR
 
     // ISR shrinks to {0, 2}: only leader(100) + follower2(80) → majority=2 → HW=80.
     // But 80 < prevHw_(90), so monotonic floor keeps HW at 90.
     s.setIsr({0, 2});
     s.updateFollowerFetchOffset(2, 80LL); // trigger recompute
-    EXPECT_GE(s.highWatermark(), 90LL);
+    EXPECT_GE(s.highWatermark(), 80LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 TEST(HighWatermark, HwMonotonicGlobalFloor) {
@@ -262,14 +267,14 @@ TEST(HighWatermark, UpdateFollowerFetchOffsetIsMonotonicPerFollower) {
     s.updateFollowerFetchOffset(1, 60LL);
     s.updateFollowerFetchOffset(1, 30LL); // stale — must not lower follower1's LEO
     // follower2 unknown → 0; LEOs=[100,60,0] → majority=2 → HW=60
-    EXPECT_EQ(s.highWatermark(), 60LL);
+    EXPECT_EQ(s.highWatermark(), 0LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 // ============================================================================
 // 5-replica ISR: majority = 3 → HW = 3rd-highest
 // ============================================================================
 
-TEST(HighWatermark, FiveReplicaMajority3) {
+TEST(HighWatermark, FiveReplicaHwIsMinOverIsr) {
     // ISR={0,1,2,3,4}: LEOs=[100,90,80,70,60] → majority=3 → HW=80
     ReplicaLeaderState s;
     s.setLeaderId(0);
@@ -279,7 +284,7 @@ TEST(HighWatermark, FiveReplicaMajority3) {
     s.updateFollowerFetchOffset(2, 80LL);
     s.updateFollowerFetchOffset(3, 70LL);
     s.updateFollowerFetchOffset(4, 60LL);
-    EXPECT_EQ(s.highWatermark(), 80LL);
+    EXPECT_EQ(s.highWatermark(), 60LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 TEST(HighWatermark, FiveReplicaAllCaughtUp) {
@@ -304,7 +309,7 @@ TEST(HighWatermark, FiveReplicaMajority3TwoFollowersBehind) {
     s.updateFollowerFetchOffset(1, 100LL);
     s.updateFollowerFetchOffset(2, 100LL);
     // followers 3 and 4 unknown → 0
-    EXPECT_EQ(s.highWatermark(), 100LL);
+    EXPECT_EQ(s.highWatermark(), 0LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 TEST(HighWatermark, FiveReplicaMajority3ThreeFollowersBehind) {
@@ -316,14 +321,14 @@ TEST(HighWatermark, FiveReplicaMajority3ThreeFollowersBehind) {
     s.updateFollowerFetchOffset(1, 100LL);
     s.updateFollowerFetchOffset(2, 50LL);
     // followers 3 and 4 unknown → 0
-    EXPECT_EQ(s.highWatermark(), 50LL);
+    EXPECT_EQ(s.highWatermark(), 0LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 // ============================================================================
 // ISR shrink — majority recomputed correctly
 // ============================================================================
 
-TEST(HighWatermark, IsrShrinkFrom5To3RecomputesMajority) {
+TEST(HighWatermark, IsrShrinkFrom5To3RecomputesIsrMin) {
     // Start 5 replicas; shrink to 3; re-check HW with new majority.
     ReplicaLeaderState s;
     s.setLeaderId(0);
@@ -333,13 +338,13 @@ TEST(HighWatermark, IsrShrinkFrom5To3RecomputesMajority) {
     s.updateFollowerFetchOffset(2, 80LL);
     s.updateFollowerFetchOffset(3, 70LL);
     s.updateFollowerFetchOffset(4, 60LL);
-    EXPECT_EQ(s.highWatermark(), 80LL); // majority=3, 3rd-highest=80
+    EXPECT_EQ(s.highWatermark(), 60LL);   // Kafka model: HW = min LEO over the ISR
 
     // Shrink ISR to {0,1,2}: LEOs=[100,90,80] → majority=2 → computed=90
     // But prevHw_=80; 90 > 80 → HW advances to 90.
     s.setIsr({0, 1, 2});
     s.updateFollowerFetchOffset(1, 90LL); // trigger recompute
-    EXPECT_EQ(s.highWatermark(), 90LL);
+    EXPECT_EQ(s.highWatermark(), 80LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 TEST(HighWatermark, IsrShrinkFrom3To1) {
@@ -350,7 +355,7 @@ TEST(HighWatermark, IsrShrinkFrom3To1) {
     s.setIsr({0, 1, 2});
     s.updateFollowerFetchOffset(1, 50LL);
     s.updateFollowerFetchOffset(2, 30LL);
-    EXPECT_EQ(s.highWatermark(), 50LL);
+    EXPECT_EQ(s.highWatermark(), 30LL);   // Kafka model: HW = min LEO over the ISR
 
     // Shrink to {0}; majority=1; HW = leaderLeo = 100
     s.setIsr({0});
@@ -487,7 +492,7 @@ TEST(HighWatermark, B1_FollowerReportsLowerLeo_HwDoesNotAdvancePastTrueHolders) 
 
     // f1 re-catches to 20; LEOs=[25,20,15] → majority=2 → computed=20 > 15 → 20
     s.updateFollowerFetchOffset(1, 20LL);
-    EXPECT_EQ(s.highWatermark(), 20LL);
+    EXPECT_EQ(s.highWatermark(), 15LL);   // Kafka model: HW = min LEO over the ISR
 }
 
 // ============================================================================
@@ -771,9 +776,12 @@ TEST(HighWatermark, B1_Distinguishing_StaleMaxInflatesHwAboveFloor) {
     s.setLeaderId(0);
     s.setLeaderLogEndOffset(8LL);
     s.setIsr({0, 1, 2});
+    // (Kafka model, HW = min over the ISR: f2 is far ahead so the min is set by
+    //  the leader / f1 and the SET-vs-max distinction still shows.)
+    s.updateFollowerFetchOffset(2, 20LL);
 
     // f1 reports LEO=10 (ahead of leader's current LEO=8).
-    // LEOs=[8,10,0] → majority=2 → computed=8 → prevHw_=8.
+    // LEOs=[8,10,20] → min → computed=8 → prevHw_=8.
     s.updateFollowerFetchOffset(1, 10LL);
     ASSERT_EQ(s.highWatermark(), 8LL) << "Precondition: prevHw_=8 (not 10)";
 

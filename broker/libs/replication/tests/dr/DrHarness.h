@@ -95,12 +95,22 @@ struct DrConfig {
     /// answer carries exactly ONE (oversize-exempt) batch — the regime of any
     /// batch >= maxFetchBytes.
     int32_t maxFetchBytes           = 1 << 20;
+    /// Partition topic id.  >= 0: a USER partition — its leader proposes ISR
+    /// changes to the harness controller (Kafka AlterPartition, as BrokerNode
+    /// wires it) and the controller elects only from its committed ISR.  < 0:
+    /// an INTERNAL partition — led by the consensus leader (moveLeader may pick
+    /// any replica), leader-local ISR seeded with every replica, no lag shrink,
+    /// consensus-dead members fenced out (see fenceDeadForInternal_).
+    int32_t topicId                 = kTopicId;
 };
 
 // ---------------------------------------------------------------------------
 // Network frames
 // ---------------------------------------------------------------------------
-enum class Kind : uint8_t { FetchReq, FetchResp, EpochReq, EpochResp, ReconReq, ReconResp };
+enum class Kind : uint8_t { FetchReq, FetchResp, EpochReq, EpochResp, ReconReq, ReconResp, AlterIsr };
+inline constexpr int kKinds = 7;
+/// The harness controller's address on the modelled network (AlterIsr target).
+inline constexpr NodeId kControllerAddr = 0;
 
 struct Frame {
     Kind     kind{};
@@ -112,6 +122,7 @@ struct Frame {
     std::vector<uint8_t>         recs;     // owns fresp.records
     OffsetsForLeaderEpochReqMsg  ereq{};
     OffsetsForLeaderEpochRespMsg eresp{};
+    AlterIsrMsg                  alter{};
 };
 
 class DrCluster;
@@ -128,6 +139,7 @@ public:
     bool sendOffsetsForLeaderEpochResponse(NodeId to, const OffsetsForLeaderEpochRespMsg& m) override;
     bool sendReconcileRequest(NodeId to, const FetchRequestMsg& m) override;
     bool sendReconcileResponse(NodeId to, const FetchResponseMsg& m) override;
+    bool sendAlterIsr(const AlterIsrMsg& m) override;
 private:
     DrCluster* c_;
     NodeId     self_;
@@ -246,7 +258,10 @@ public:
     /// assignment to every live node.  Returns the new leader (-1 = none).
     /// `unreachable`: live nodes the controller cannot see (lost heartbeat) —
     /// neither candidates nor told about the new assignment.
-    NodeId failover(std::initializer_list<NodeId> unreachable = {}) {
+    /// `positionsFrom` >= 0: the controller knows only THAT node's own position
+    /// report (production: a controller sees the positions of its local
+    /// replicas) — the election then prefers it.  -1 = omniscient.
+    NodeId failover(std::initializer_list<NodeId> unreachable = {}, NodeId positionsFrom = -1) {
         auto reachable = [&](NodeId id) {
             return std::find(unreachable.begin(), unreachable.end(), id) == unreachable.end();
         };
@@ -255,8 +270,9 @@ public:
         for (auto& n : nodes_) {
             if (!n.up || !reachable(n.id)) continue;
             live.push_back(n.id);
+            if (positionsFrom >= 0 && n.id != positionsFrom) continue;
             auto r = n.rep->positionReport();
-            r.topicId = kTopicId; r.partition = kPartId;
+            r.topicId = cfg_.topicId; r.partition = kPartId;
             pos.report(r);
         }
         rune::metadata::ElectionInputs in;
@@ -267,7 +283,7 @@ public:
         in.cur.partitionEpoch = 0;
         in.liveNodes          = live;
         in.positions          = &pos;
-        const auto out = rune::metadata::FailoverElection::elect(kTopicId, kPartId, in);
+        const auto out = rune::metadata::FailoverElection::elect(cfg_.topicId, kPartId, in);
         ++meta_.epoch;
         if (out.change.newLeader == rune::metadata::NO_LEADER ||
             out.change.newLeader == rune::metadata::NO_LEADER_CHANGE) {
@@ -282,18 +298,31 @@ public:
 
     /// Controller: hand leadership to `id` explicitly (preferred-leader move /
     /// operator action), epoch+1, ISR unchanged.
-    void moveLeader(NodeId id) {
+    /// USER partition: Kafka preferred / controlled leader move — refused (false)
+    /// unless `id` is in the controller's COMMITTED ISR.  INTERNAL partition:
+    /// the consensus leader moves to `id` whatever the data ISR (bridge).
+    bool moveLeader(NodeId id) {
+        const bool inIsr = std::find(meta_.isr.begin(), meta_.isr.end(), id) != meta_.isr.end();
+        if (cfg_.topicId >= 0 && !inIsr) return false;
         ++meta_.epoch;
         meta_.leader = id;
-        if (std::find(meta_.isr.begin(), meta_.isr.end(), id) == meta_.isr.end())
-            meta_.isr.insert(meta_.isr.begin(), id);
+        if (!inIsr) meta_.isr.insert(meta_.isr.begin(), id);
         for (auto& n : nodes_) applyMetadata(n.id);
+        return true;
     }
+    /// The controller's committed ISR contains `id`.
+    bool controllerIsrContains(NodeId id) const {
+        return std::find(meta_.isr.begin(), meta_.isr.end(), id) != meta_.isr.end();
+    }
+    uint64_t alterIsrCommitted() const noexcept { return alterIsrCommitted_; }
+    uint64_t alterIsrStale() const noexcept { return alterIsrStale_; }
+
 
     // ---------------------------------------------------------------- driving
     void step() {
         ++step_;
         clock_ += kStepNs;
+        fenceDeadForInternal_();
         for (auto& n : nodes_) if (n.up) n.rep->doWork(clock_);
         deliver_();
         settleAcks_();
@@ -308,7 +337,10 @@ public:
     void cut(NodeId a, NodeId b)     { cut_.insert({a, b}); }
     void cutBoth(NodeId a, NodeId b) { cut(a, b); cut(b, a); }
     void heal(NodeId a, NodeId b)    { cut_.erase({a, b}); cut_.erase({b, a}); }
-    void isolate(NodeId a)  { for (NodeId r : replicas_) if (r != a) cutBoth(a, r); }
+    void isolate(NodeId a)  {
+        for (NodeId r : replicas_) if (r != a) cutBoth(a, r);
+        cutBoth(a, kControllerAddr);   // its AlterIsr / metadata are lost too
+    }
     void healAll()          { cut_.clear(); }
     void dropNext(Kind k, int count) { dropNext_[static_cast<int>(k)] += count; }
     uint64_t framesLost() const noexcept { return framesLost_; }
@@ -492,7 +524,6 @@ public:
                  " ep=" + std::to_string(n.rep->epoch()) +
                  " leo=" + std::to_string(n.rep->logEndOffset()) +
                  " hw=" + std::to_string(n.rep->highWatermark()) +
-                 " complete=" + std::to_string(n.rep->isLeaderComplete()) +
                  " cacheLatest=" + std::to_string(n.rep->leaderEpochCacheForTest().latestEpoch());
             if (n.rep->role() == Role::Leader) {
                 s += " isr=";
@@ -535,7 +566,7 @@ private:
 
     PartitionConfig cfgFor_(NodeId id) const {
         PartitionConfig c;
-        c.topicId                 = kTopicId;
+        c.topicId                 = cfg_.topicId;
         c.partitionId             = kPartId;
         c.selfId                  = id;
         c.replicaLagMaxMs         = cfg_.replicaLagMaxMs;
@@ -556,8 +587,44 @@ private:
         n.ep  = std::make_unique<DrEndpoint>(this, n.id);
         n.rep = std::make_unique<PartitionReplica>(cfgFor_(n.id), Role::Follower, /*epoch=*/0,
                                                    replicas_, replicas_, n.log.get(), n.ep.get());
+        if (cfg_.topicId >= 0) n.rep->setIsrChannel(n.ep.get());   // as BrokerNode (multi-node)
         n.up = true;
         ++n.incarnation;
+    }
+
+    /// INTERNAL partition: NodeRuntimeAgent's Kafka broker fencing — the leader
+    /// drops members the cluster considers dead from the ISR
+    /// (PartitionReplica::shrinkIsrToLive with the consensus-eligible set).  A
+    /// node is consensus-live here when it is up and can reach the controller
+    /// address (isolate() cuts it; a data-plane-only cut does not).
+    void fenceDeadForInternal_() {
+        if (cfg_.topicId >= 0 || meta_.leader < 0) return;
+        DrNode& L = node(meta_.leader);
+        if (!L.up || L.rep->role() != Role::Leader) return;
+        std::vector<int32_t> live;
+        for (auto& n : nodes_)
+            if (n.up && cut_.count({n.id, kControllerAddr}) == 0) live.push_back(n.id);
+        if (std::find(live.begin(), live.end(), L.id) == live.end()) live.push_back(L.id);
+        L.rep->shrinkIsrToLive(std::span<const int32_t>(live.data(), live.size()), clock_);
+    }
+
+    /// The harness controller (MetadataService::onAlterIsr semantics): accept a
+    /// proposal from the current leader at the current epoch, commit the new
+    /// ISR (partitionEpoch + 1) and push the assignment to every node it can
+    /// reach (the leader sees a same-epoch becomeLeader).
+    void controllerAlterIsr_(const AlterIsrMsg& m) {
+        if (m.leaderId != meta_.leader || m.leaderEpoch != meta_.epoch) return;
+        // Compare-and-set on the base ISR (Kafka's partitionEpoch check).
+        if (m.baseIsrCount != static_cast<int32_t>(meta_.isr.size())) { ++alterIsrStale_; return; }
+        for (int i = 0; i < m.baseIsrCount; ++i)
+            if (std::find(meta_.isr.begin(), meta_.isr.end(), m.baseIsr[static_cast<std::size_t>(i)]) ==
+                meta_.isr.end()) { ++alterIsrStale_; return; }
+        std::vector<NodeId> isr(m.isr.begin(), m.isr.begin() + m.isrCount);
+        if (std::find(isr.begin(), isr.end(), m.leaderId) == isr.end() || isr == meta_.isr) return;
+        meta_.isr = std::move(isr);
+        ++alterIsrCommitted_;
+        for (auto& n : nodes_)
+            if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
     }
 
     DrNode* leaderNode_() {
@@ -590,7 +657,7 @@ private:
         b.append(std::string_view{}, std::string_view(v, sizeof v), clock_ / 1'000'000);
         const auto bytes = b.build();
         const auto o = rune::storage::handleProduceBatch(
-            bytes.data(), bytes.size(), kTopicId, kPartId, pid, pepoch, seq, *L->log, psm_,
+            bytes.data(), bytes.size(), cfg_.topicId, kPartId, pid, pepoch, seq, *L->log, psm_,
             /*acksAll=*/true, static_cast<int>(L->rep->isr().size()), L->rep->minIsr(),
             /*durabilityTier=*/1);
         if (!o.isOK() || o.isDuplicate) return o;
@@ -619,8 +686,8 @@ private:
                              (L.rep->leadershipGeneration() << 32) ^ L.rep->logGeneration() ^
                              (static_cast<uint64_t>(L.id) << 56);
         if (psmValid_ && psmGen_ == gen) return;
-        psm_.clearPartition(kTopicId, kPartId);
-        (void)psm_.rebuildFromLog(kTopicId, *L.log, L.log->logEndOffset(), kPartId);
+        psm_.clearPartition(cfg_.topicId, kPartId);
+        (void)psm_.rebuildFromLog(cfg_.topicId, *L.log, L.log->logEndOffset(), kPartId);
         psmGen_   = gen;
         psmValid_ = true;
     }
@@ -639,6 +706,7 @@ private:
             else ++it;
         }
         for (auto& f : now) {
+            if (f.kind == Kind::AlterIsr) { controllerAlterIsr_(f.alter); continue; }
             DrNode& n = node(f.to);
             if (!n.up) continue;
             PartitionReplica& r = *n.rep;
@@ -653,6 +721,7 @@ private:
                 case Kind::ReconResp:
                     f.fresp.records = std::span<const uint8_t>(f.recs.data(), f.recs.size());
                     r.applyReconcileResponse(f.fresp); break;
+                case Kind::AlterIsr: break;   // handled above
             }
         }
     }
@@ -664,9 +733,11 @@ private:
     Meta                    meta_;
     std::deque<Frame>       wire_;
     std::set<std::pair<NodeId, NodeId>> cut_;
-    int                     dropNext_[6] = {0, 0, 0, 0, 0, 0};
+    int                     dropNext_[kKinds] = {};
     uint64_t                framesLost_ = 0;
-    uint64_t                sent_[8][6] = {};
+    uint64_t                sent_[8][kKinds] = {};
+    uint64_t                alterIsrCommitted_ = 0;
+    uint64_t                alterIsrStale_     = 0;
     uint64_t                step_  = 0;
     int64_t                 clock_ = 0;
     uint64_t                nextId_ = 1;
@@ -702,6 +773,10 @@ inline bool DrEndpoint::sendOffsetsForLeaderEpochResponse(NodeId to, const Offse
 }
 inline bool DrEndpoint::sendReconcileRequest(NodeId to, const FetchRequestMsg& m) {
     Frame f; f.kind = Kind::ReconReq; f.from = self_; f.to = to; f.freq = m;
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendAlterIsr(const AlterIsrMsg& m) {
+    Frame f; f.kind = Kind::AlterIsr; f.from = self_; f.to = kControllerAddr; f.alter = m;
     return c_->send(std::move(f));
 }
 inline bool DrEndpoint::sendReconcileResponse(NodeId to, const FetchResponseMsg& m) {

@@ -145,8 +145,7 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     // committed offsets that were replicated to this node while it was a follower
     // are visible before serving any JoinGroup / SyncGroup requests.
     // The offset index is valid only for the leadership AND log content it was
-    // rebuilt from, and only once the __consumer_offsets replica is a COMPLETE
-    // leader (B1: an incomplete one may lack committed commits).  A new
+    // rebuilt from, and only while the __consumer_offsets replica leads.  A new
     // leadership or a log-content change (truncation) re-arms the rebuild.
     const rune::replication::PartitionReplica* const offRep =
         offsets_ ? offsets_->replica() : nullptr;

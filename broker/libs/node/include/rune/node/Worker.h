@@ -925,8 +925,6 @@ public:
            .replLogStartOffset(op.replicatedPayload.logStartOffset)
            .replErrorCode(op.replicatedPayload.errorCode)
            .replTopicId(op.replicatedPayload.topicId)
-           .replDivergingEpoch(op.replicatedPayload.divergingEpoch)
-           .replDivergingEndOffset(op.replicatedPayload.divergingEndOffset)
            .frLeaderEpoch(static_cast<std::int64_t>(op.fetchRequestPayload.leaderEpoch))
            .frFollowerId(static_cast<std::int32_t>(op.fetchRequestPayload.followerId))
            .frFetchOffset(static_cast<std::int64_t>(op.fetchRequestPayload.fetchOffset))
@@ -2644,8 +2642,6 @@ private:
         msg.logStartOffset = op.replLogStartOffset();
         msg.errorCode      = op.replErrorCode();
         msg.topicId        = op.replTopicId();
-        msg.divergingEpoch     = op.replDivergingEpoch();
-        msg.divergingEndOffset = op.replDivergingEndOffset();
         // Zero-copy span: records view into the ring frame.
         // Valid only inside this callback — applyReplicated copies before we return.
         msg.records = std::span<const uint8_t>(
@@ -2703,7 +2699,7 @@ private:
 
         // F15 S5 (§2.5, I3): no synchronous producer-state rebuild here.  The
         // worker psm_ for this partition is rebuilt by the incremental RC build
-        // (RcState: bounded per pass, starts at leaderComplete_, scans the
+        // (RcState: bounded per pass, starts at leadership, scans the
         // whole log and applies control batches as epoch raises), in EVERY
         // mode; idempotent / transactional produces are refused NotLeader
         // (retriable) until it is Ready.
@@ -3982,7 +3978,6 @@ private:
     [[nodiscard]] static RcFacts rcFacts_(const rune::replication::PartitionReplica* r) noexcept {
         RcFacts f;
         f.leader               = r->role() == rune::replication::Role::Leader;
-        f.leaderComplete       = r->isLeaderComplete();
         f.logGeneration        = r->logGeneration();
         f.leadershipGeneration = r->leadershipGeneration();
         f.epoch                = static_cast<int32_t>(r->epoch());

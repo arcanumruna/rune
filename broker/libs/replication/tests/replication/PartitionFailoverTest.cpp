@@ -163,8 +163,12 @@ protected:
         Offset leo = leader_->logEndOffset();
         bool ok = driveUntil({leader_.get(), follower2_.get(), follower3_.get()},
                               transport_, clock_,
-                              [&]{ return leader_->highWatermark() >= leo; });
-        EXPECT_TRUE(ok) << "HW did not advance to " << leo;
+                              [&]{ return leader_->highWatermark() >= leo &&
+                                          follower2_->highWatermark() >= leo &&
+                                          follower3_->highWatermark() >= leo; });
+        // (Kafka model: the HW advances on the LAST ISR follower's ack; the
+        //  others learn it from their next answer — a keepalive at most.)
+        EXPECT_TRUE(ok) << "HW did not advance / propagate to " << leo;
         return leo;
     }
 

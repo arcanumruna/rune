@@ -63,8 +63,8 @@ TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
     // SBE tight-packs the block (no alignment pad): int64+int32+int64+int64+int16+int32
     // = 8+4+8+8+2+4 = 34.  (The pre-SBE hand-rolled layout inserted a 2-byte pad after
     // errorCode → 36; SBE owns sizing now, and both nodes run the same generated codec.)
-    // v3 appends divergingEpoch (int32) + divergingEndOffset (int64): 34 + 12 = 46.
-    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 46u);
+    // Unchanged in v3 (the DivergingEpoch answer rides in an error frame's payload).
+    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 34u);
 }
 
 TEST(ReplicationMessages, FetchRequestTotalSize) {
@@ -92,34 +92,47 @@ TEST(ReplicationMessages, FetchRequestLastFetchedEpochV3RoundTripAndV2Absent) {
     std::memset(v2 + 8 + 32, 0x5A, 4);                // garbage past the v2 block
     m = FetchRequestMsg::decode(v2, 0);
     EXPECT_EQ(m.fetchOffset, 77);
-    EXPECT_EQ(m.lastFetchedEpoch, -1) << "a v2 frame has no lastFetchedEpoch";
+    EXPECT_EQ(m.lastFetchedEpoch, kLastFetchedEpochV2Frame) << "a v2 frame is marked (fail closed)";
 }
 
-// KIP-320/595: a v3 FetchResponse carries DivergingEpoch; a v2 frame decodes
-// as "no divergence" (-1) and its records still decode at the v2 offsets.
-TEST(ReplicationMessages, FetchResponseDivergingEpochV3RoundTripAndV2Absent) {
+// KIP-320/595 (fix round 1): data frames keep their 46-byte framing; the
+// DivergingEpoch / OffsetOutOfRange answer is a 12-byte payload of a record-less
+// error frame.  A v2 frame is refused (fail closed): decoded as
+// kErrUnsupportedWireVersion with no records.
+TEST(ReplicationMessages, FetchResponseErrorPayloadV3AndV2FailClosed) {
+    EXPECT_EQ(FetchResponseMsg::encodedSize(0), 46u) << "data-frame framing must stay 46 B";
     uint8_t buf[256]{};
-    const uint8_t rec[5] = {1, 2, 3, 4, 5};
+    ErrorPayloadBuf epb;
     const std::size_t n = FetchResponseMsg::encode(buf, 0, 4, 1, 10, 0, static_cast<int16_t>(-7),
-        std::span<const uint8_t>(rec, 5), 9, /*divergingEpoch=*/2, /*divergingEndOffset=*/33);
+                                                   epb.set(2, 33), 9);
     FetchResponseMsg m = FetchResponseMsg::decode(buf, 0, n);
-    EXPECT_EQ(m.errorCode, static_cast<int16_t>(-7));
-    EXPECT_EQ(m.divergingEpoch, 2);
-    EXPECT_EQ(m.divergingEndOffset, 33);
-    ASSERT_EQ(m.records.size(), 5u);
-    // Hand-build a v2 frame: header(8: block 34, version 2) + 34-byte block + len + records.
-    uint8_t v2[128]{};
-    std::memcpy(v2, buf, 8 + 34);                     // header + the v2 part of the block
-    v2[0] = 34; v2[1] = 0; v2[6] = 2; v2[7] = 0;
-    const uint32_t len = 5;
-    std::memcpy(v2 + 8 + 34, &len, 4);
-    std::memcpy(v2 + 8 + 34 + 4, rec, 5);
-    m = FetchResponseMsg::decode(v2, 0, 8 + 34 + 4 + 5);
-    EXPECT_EQ(m.highWatermark, 10);
-    EXPECT_EQ(m.divergingEpoch, -1);
-    EXPECT_EQ(m.divergingEndOffset, -1);
-    ASSERT_EQ(m.records.size(), 5u) << "v2 records must decode at the v2 block end";
-    EXPECT_EQ(m.records[4], 5);
+    EXPECT_EQ(m.errorCode, -7);
+    ErrorPayload ep{};
+    ASSERT_TRUE(ErrorPayload::decode(m.records, ep));
+    EXPECT_EQ(ep.epoch, 2);
+    EXPECT_EQ(ep.endOffset, 33);
+    // The same frame stamped as a v2 sender's: refused.
+    buf[6] = 2; buf[7] = 0;
+    m = FetchResponseMsg::decode(buf, 0, n);
+    EXPECT_EQ(m.errorCode, kErrUnsupportedWireVersion);
+    EXPECT_TRUE(m.records.empty());
+}
+
+// AlterIsr (template 7) round-trip.
+TEST(ReplicationMessages, AlterIsrRoundTrip) {
+    AlterIsrMsg a{};
+    a.topicId = 3; a.partition = 2; a.leaderId = 1; a.leaderEpoch = 9; a.isrCount = 2;
+    a.isr[0] = 1; a.isr[1] = 3;
+    a.baseIsrCount = 3; a.baseIsr[0] = 1; a.baseIsr[1] = 2; a.baseIsr[2] = 3;
+    EXPECT_EQ(AlterIsrMsg::TOTAL_SIZE, 8u + 156u);
+    uint8_t buf[AlterIsrMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(a.encode(buf, sizeof buf), AlterIsrMsg::TOTAL_SIZE);
+    EXPECT_EQ(peekTemplateId(buf), AlterIsrMsg::TEMPLATE_ID);
+    AlterIsrMsg b{};
+    ASSERT_TRUE(AlterIsrMsg::decode(buf, sizeof buf, b));
+    EXPECT_EQ(b.topicId, 3); EXPECT_EQ(b.partition, 2); EXPECT_EQ(b.leaderId, 1);
+    EXPECT_EQ(b.leaderEpoch, 9); EXPECT_EQ(b.isrCount, 2); EXPECT_EQ(b.isr[1], 3);
+    EXPECT_EQ(b.baseIsrCount, 3); EXPECT_EQ(b.baseIsr[1], 2); EXPECT_EQ(b.baseIsr[2], 3);
 }
 
 TEST(ReplicationMessages, HeaderEncodedSize) {
@@ -267,8 +280,8 @@ TEST(FetchResponse, RoundTripEmptyRecords) {
 
     std::size_t written = FetchResponseMsg::encode(buf, 0,
         epoch, part, hw, logSt, err, empty);
-    // SBE: header(8) + block(46, v3) + len_prefix(4) + 0 records = 58
-    EXPECT_EQ(written, 58u);
+    // SBE: header(8) + block(34) + len_prefix(4) + 0 records = 46
+    EXPECT_EQ(written, 46u);
 
     FetchResponseMsg m = FetchResponseMsg::decode(buf, 0);
     EXPECT_EQ(m.leaderEpoch,    epoch);

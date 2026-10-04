@@ -309,8 +309,7 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     uint8_t* payload = reinterpret_cast<uint8_t*>(slot) + lenPos + isbe::OutboundFrame::payloadHeaderLength();
     FetchResponseMsg::encode(payload, 0,
                              resp.leaderEpoch, resp.partition, resp.highWatermark,
-                             resp.logStartOffset, resp.errorCode, resp.records, resp.topicId,
-                             resp.divergingEpoch, resp.divergingEndOffset);
+                             resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
     if (reconcile) {
         // DR reverse-catch-up: re-stamp the FetchResponse templateId in place so it
         // routes to the reconcile handlers (matches sendReconcileResponse's wire).
@@ -338,6 +337,13 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
 // init; the counters are per-transport control-thread members (F9a: they were
 // file statics shared by every in-process node).
 static const bool g_txRateLog = diagFlagFromEnv(std::getenv("RUNE_FS_LOG"));
+
+bool AeronPartitionTransport::sendAlterIsr(const AlterIsrMsg& msg)
+{
+    uint8_t wire[AlterIsrMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    return len != 0 && enqueueOutbound(kController, wire, len);
+}
 
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
@@ -407,10 +413,21 @@ int AeronPartitionTransport::drainOutbound()
         dec.wrapForDecode(fbase, isbe::MessageHeader::encodedLength(),
                           mh.blockLength(), mh.version(),
                           static_cast<std::uint64_t>(length));
-        const int32_t target = dec.targetNodeId();
+        int32_t target = dec.targetNodeId();
         const std::string_view pv = dec.getPayloadAsStringView();
         const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
         const std::size_t wlen = pv.size();
+        if (target == kController) [[unlikely]] {
+            // AlterIsr: to the current controller.  Unknown controller → dropped
+            // (the leader re-sends on its cadence); self → delivered locally.
+            if (controllerId_ < 0) { ++txOutDrained_; return true; }
+            if (controllerId_ == static_cast<int32_t>(selfId_)) {
+                (void)handleFrame_(wire, wlen);
+                ++txOutDrained_;
+                return true;
+            }
+            target = controllerId_;
+        }
         const bool consumed = holdRouter_.route(offer, target, wire, wlen);
         if (consumed) {
             // Control-clock: frame drained from the outbound ring (offered or held).
@@ -522,6 +539,13 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
     }
 
     const uint16_t tid = hdr.templateId;
+
+    if (tid == AlterIsrMsg::TEMPLATE_ID) [[unlikely]] {
+        AlterIsrMsg m{};
+        if (AlterIsrMsg::decode(buf, len, m) && alterIsrHandler_ != nullptr)
+            alterIsrHandler_(alterIsrCtx_, m);
+        return Action::CONTINUE;
+    }
 
     if (tid == FetchRequestMsg::TEMPLATE_ID) {
         // Minimum size check.
@@ -726,8 +750,6 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.replicatedPayload.logStartOffset  = resp.logStartOffset;
             op.replicatedPayload.errorCode       = resp.errorCode;
             op.replicatedPayload.topicId         = resp.topicId;
-            op.replicatedPayload.divergingEpoch     = resp.divergingEpoch;
-            op.replicatedPayload.divergingEndOffset = resp.divergingEndOffset;
             // Copy records span bytes into an owned vector (buffer lifetime).
             if (!resp.records.empty()) {
                 op.replicatedPayload.records.assign(
@@ -883,8 +905,6 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.replicatedPayload.logStartOffset  = resp.logStartOffset;
             op.replicatedPayload.errorCode       = resp.errorCode;
             op.replicatedPayload.topicId         = resp.topicId;
-            op.replicatedPayload.divergingEpoch     = resp.divergingEpoch;
-            op.replicatedPayload.divergingEndOffset = resp.divergingEndOffset;
             if (!resp.records.empty()) {
                 op.replicatedPayload.records.assign(
                     resp.records.data(),

@@ -1663,3 +1663,36 @@ TEST(LogCleanerTxnRegression, CompactionKeepsTransactionalAndControlAttributes) 
         std::filesystem::remove_all(dir);
     }
 }
+
+// Fix round 1 (MEDIUM-5): a batch rebuilt by compaction keeps the
+// partitionLeaderEpoch of the batch it came from — the epoch lineage (KIP-320
+// fetch validation, epoch-cache rebuild from stamps) survives compaction.
+TEST(LogCleanerRegression, CompactionPreservesPartitionLeaderEpoch) {
+    auto dir = makeTempDir("lc_epoch");
+    std::filesystem::create_directories(dir);
+    Log log(dir.string(), 512);
+    auto stamped = [](int64_t base, std::string_view k, std::string_view v, int32_t ep) {
+        auto b = makeBatch(base, k, v, 1000 + base);
+        RecordBatchReader::stampLeaderEpoch(b.data(), ep);
+        return b;
+    };
+    log.append(stamped(0, "k1", "v1", 4), 0);
+    log.append(stamped(1, "k1", "v2", 4), 1);
+    log.append(stamped(2, "k2", "v3", 5), 2);
+    log.append(stamped(3, "k1", "v4", 5), 3);
+    for (int i = 4; i < 20; ++i) log.append(stamped(i, "pad", "x" + std::to_string(i), 6), i);
+    LogCleaner cleaner;
+    cleaner.clean(log, 0, 4, /*nowNs=*/0, /*deleteRetentionMs=*/1'000'000);
+    int seen = 0;
+    for (int64_t off : {int64_t{2}, int64_t{3}}) {
+        auto bytes = log.read(off, 1 << 20);
+        ASSERT_FALSE(bytes.empty());
+        RecordBatchReader r(bytes.data(), bytes.size());
+        ASSERT_TRUE(r.ensureValid());
+        EXPECT_EQ(r.baseOffset(), off);
+        EXPECT_EQ(r.partitionLeaderEpoch(), 5) << "rebuilt batch at " << off << " lost its epoch";
+        ++seen;
+    }
+    EXPECT_EQ(seen, 2);
+    std::filesystem::remove_all(dir);
+}

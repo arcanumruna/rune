@@ -2046,10 +2046,9 @@ TEST(ReplicaLifetimeRegression, PendingAckForARemovedPartitionFailsNotLeaderWith
         Reg R;
         auto* rep = R.add(5, 0, {1, 2});                      // replica set {1, 2}
         rep->becomeLeader(2, {1, 2});                         // follower 2 behind → the ack parks on the HW
-        // DUR-1 B1: an incomplete leader refuses produce — follower 2 reports in
-        // (at offset 0: behind), completing leadership without advancing the HW.
+        // Follower 2 reports in at offset 0 (behind): the HW stays put.
         (void)rep->onFetchRequest(rune::replication::FetchRequestMsg{2, 0, 2, 0, 0, 0}, 1);
-        ASSERT_TRUE(rep->isLeaderComplete());
+        ASSERT_TRUE(rep->acceptsProduce());
         Worker w(0, 1 << 16, 1 << 16, 64, 64);
         w.setOwnedDirect(Worker::OwnedSet{rep});
         WorkerOp op = produceOp(rep, 77);

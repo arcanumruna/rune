@@ -650,10 +650,9 @@ ClientGateway::proveInlinePsm_(int32_t topicId, int32_t partition, rune::storage
     const uint64_t key = inlinePsmKey_(topicId, partition);
     InlinePsmFacts facts;
     if (replica != nullptr) {
-        // Only a COMPLETE leader's log is stable below its LEO: a follower
-        // takes replicated appends, a deficient leader may still reconcile-
-        // append old-term batches (the worker path's RC gate, I2).
-        if (replica->role() != rune::replication::Role::Leader || !replica->isLeaderComplete()) [[unlikely]] {
+        // Only a leader's log is stable below its LEO: a follower takes
+        // replicated appends / truncations (the worker path's RC gate, I2).
+        if (replica->role() != rune::replication::Role::Leader) [[unlikely]] {
             if (auto it = inlinePsm_.find(key); it != inlinePsm_.end())
                 setInlinePsmState_(it->second, InlinePsmUnproven{});
             return InlinePsmGate::NotLeader;

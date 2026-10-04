@@ -267,8 +267,6 @@ struct WorkerOp {
         int64_t  logStartOffset = 0;
         int16_t  errorCode      = 0;
         int32_t  topicId        = 0;
-        int32_t  divergingEpoch     = -1;   ///< KIP-320/595 DivergingEpoch (-1 = none)
-        int64_t  divergingEndOffset = -1;
         std::vector<uint8_t> records;   ///< copy of the records span
     } replicatedPayload;
 

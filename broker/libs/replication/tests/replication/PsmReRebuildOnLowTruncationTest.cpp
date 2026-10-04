@@ -194,8 +194,8 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildsWhenTruncationBelowRebuildHw)
     resp.partition          = kPartition;
     resp.errorCode          = rune::replication::kErrDivergingEpoch;
     resp.topicId            = kTopicId;
-    resp.divergingEpoch     = 1;      // shared epoch = 1
-    resp.divergingEndOffset = kTruncTo;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
     follower.applyReplicated(resp);
 
@@ -288,8 +288,8 @@ TEST(PsmReRebuildOnLowTruncation, NoReRebuildWhenTruncationAboveRebuildHw)
     resp.partition          = kPartition;
     resp.errorCode          = rune::replication::kErrDivergingEpoch;
     resp.topicId            = kTopicId;
-    resp.divergingEpoch     = 1;      // shared epoch = 1
-    resp.divergingEndOffset = kTruncTo;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
     follower.applyReplicated(resp);
 
@@ -362,8 +362,8 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildAtomicWithTruncation)
     resp.partition          = kPartition;
     resp.errorCode          = rune::replication::kErrDivergingEpoch;
     resp.topicId            = kTopicId;
-    resp.divergingEpoch     = 1;      // shared epoch = 1
-    resp.divergingEndOffset = kTruncTo;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
     follower.applyReplicated(resp);
 

@@ -48,6 +48,10 @@ namespace rune::replication {
 struct FollowerState {
     Offset  lastFetchOffset  = 0;   ///< Last fetchOffset seen from this follower.
     int64_t lastFetchTimeNs  = 0;   ///< Wall-clock time of last fetch (nanoseconds).
+    /// Kafka lastCaughtUpTimeMs: the last time this follower was caught up to
+    /// the leader's log end (at the time of a fetch).  The ISR lag check uses it.
+    int64_t lastCaughtUpTimeNs = 0;
+    Offset  lastFetchLeaderLeo = -1;   ///< leader LEO at this follower's previous fetch
 };
 
 /// Pure ISR management — tracks replica set membership and per-follower lag,
@@ -85,6 +89,7 @@ public:
         for (NodeId n : replicas_) {
             followerState_.try_emplace(n, FollowerState{});
         }
+        isr_.reserve(replicas_.size() + 1);   // shrink / expand never reallocate
     }
 
     // -----------------------------------------------------------------------
@@ -92,9 +97,16 @@ public:
     // -----------------------------------------------------------------------
 
     /// Overwrite the ISR (e.g. restored from control-plane metadata).
-    void setIsr(std::vector<NodeId> isr) {
-        isr_        = std::move(isr);
+    /// The const& overload copies into the existing capacity (no allocation
+    /// once sized) — the periodic ISR check re-seeds from the committed ISR.
+    void setIsr(const std::vector<NodeId>& isr) {
+        isr_.assign(isr.begin(), isr.end());
         isrChanged_ = false; // treat this as a baseline reset
+    }
+    void setIsr(std::vector<NodeId>&& isr) {
+        isr_        = std::move(isr);
+        isr_.reserve(replicas_.size() + 1);
+        isrChanged_ = false;
     }
 
     // -----------------------------------------------------------------------
@@ -108,10 +120,21 @@ public:
     ///                     current LEO — it holds everything up to fetchOffset-1).
     /// \param nowNs        Current wall-clock time in nanoseconds (injected for
     ///                     deterministic testing).
-    void onFollowerFetch(NodeId node, Offset fetchOffset, int64_t nowNs) {
+    /// \param leaderLeo    The leader's log end offset NOW (Kafka
+    ///                     Replica.updateFetchState): caught up if the fetch
+    ///                     reaches it; if it reaches the leader's LEO of the
+    ///                     PREVIOUS fetch, it was caught up as of that fetch.
+    ///                     -1 (legacy callers) = treat every fetch as caught up.
+    void onFollowerFetch(NodeId node, Offset fetchOffset, int64_t nowNs, Offset leaderLeo = -1) {
         auto& s = followerState_[node];
-        s.lastFetchOffset = fetchOffset;
-        s.lastFetchTimeNs = nowNs;
+        if (leaderLeo < 0 || fetchOffset >= leaderLeo) {
+            if (nowNs > s.lastCaughtUpTimeNs) s.lastCaughtUpTimeNs = nowNs;
+        } else if (s.lastFetchLeaderLeo >= 0 && fetchOffset >= s.lastFetchLeaderLeo) {
+            if (s.lastFetchTimeNs > s.lastCaughtUpTimeNs) s.lastCaughtUpTimeNs = s.lastFetchTimeNs;
+        }
+        s.lastFetchLeaderLeo = leaderLeo;
+        s.lastFetchOffset    = fetchOffset;
+        s.lastFetchTimeNs    = nowNs;
     }
 
     /// DR-BUG-6 — reset the replica-lag TIME clock for every follower to `nowNs`.
@@ -136,7 +159,9 @@ public:
     /// ISR and the reverse-reconcile engages.  Bounded, single-writer, no alloc.
     void resetLagClock(int64_t nowNs) {
         for (auto& [node, s] : followerState_) {
-            s.lastFetchTimeNs = nowNs;
+            s.lastFetchTimeNs    = nowNs;
+            s.lastCaughtUpTimeNs = nowNs;
+            s.lastFetchLeaderLeo = -1;
         }
     }
 
@@ -158,31 +183,27 @@ public:
     /// \param replicaLagMaxMs     Max lag in milliseconds before time-expiry.
     /// \param replicaLagMaxOffset Max offset gap before offset-lag expiry.
     /// \returns The new ISR vector (same as isr() after the call).
-    std::vector<NodeId> maybeShrinkIsr(int64_t nowNs,
-                                       Offset  leaderLeo,
-                                       int64_t replicaLagMaxMs,
-                                       Offset  replicaLagMaxOffset)
+    const std::vector<NodeId>& maybeShrinkIsr(int64_t nowNs,
+                                              Offset  leaderLeo,
+                                              int64_t replicaLagMaxMs,
+                                              Offset  replicaLagMaxOffset)
     {
+        // In place (no allocation): the periodic ISR check runs in steady state.
         const int64_t maxLagNs = replicaLagMaxMs * 1'000'000LL;
-        std::vector<NodeId> newIsr;
-        newIsr.reserve(isr_.size());
-
-        for (NodeId node : isr_) {
-            if (node == leaderId_) {
-                newIsr.push_back(node); // leader always stays
-                continue;
-            }
-            const auto& s = followerState_[node];
-            bool timeLag   = (nowNs - s.lastFetchTimeNs) > maxLagNs;
-            bool offsetLag = (leaderLeo - s.lastFetchOffset) > replicaLagMaxOffset;
-            if (!timeLag && !offsetLag) {
-                newIsr.push_back(node);
-            }
-            // lagging: omit from newIsr (shrunk out)
-        }
-
-        isrChanged_ = (newIsr != isr_);
-        isr_        = std::move(newIsr);
+        const std::size_t before = isr_.size();
+        std::erase_if(isr_, [&](NodeId node) {
+            if (node == leaderId_) return false;   // leader always stays
+            const FollowerState* s = followerState(node);
+            const FollowerState  none{};
+            if (s == nullptr) s = &none;
+            // Kafka: out of sync when not caught up to the leader's log end
+            // within replicaLagMaxMs (a slow-but-fetching follower included —
+            // with HW = min over the ISR it would otherwise pin the HW).
+            const bool timeLag   = (nowNs - s->lastCaughtUpTimeNs) > maxLagNs;
+            const bool offsetLag = (leaderLeo - s->lastFetchOffset) > replicaLagMaxOffset;
+            return timeLag || offsetLag;
+        });
+        isrChanged_ = isr_.size() != before;
         return isr_;
     }
 
@@ -198,7 +219,7 @@ public:
     /// \param nowNs         Current wall-clock time in nanoseconds.
     /// \param highWatermark The partition high-watermark (committed prefix).
     /// \returns The new ISR vector (same as isr() after the call).
-    std::vector<NodeId> maybeExpandIsr(int64_t nowNs, Offset highWatermark) {
+    const std::vector<NodeId>& maybeExpandIsr(int64_t nowNs, Offset highWatermark) {
         return maybeExpandIsrIf(nowNs, highWatermark, [](NodeId) { return true; });
     }
 
@@ -208,26 +229,21 @@ public:
     /// outlives a leadership, and resetLagClock refreshes it for every replica,
     /// so it alone is no proof that a replica holds the committed prefix).
     template <class MayJoin>
-    std::vector<NodeId> maybeExpandIsrIf(int64_t nowNs, Offset highWatermark, MayJoin&& mayJoin) {
-        std::vector<NodeId> newIsr = isr_;
-
+    const std::vector<NodeId>& maybeExpandIsrIf(int64_t nowNs, Offset highWatermark, MayJoin&& mayJoin) {
+        // In place: isr_ holds capacity for every replica (no allocation).
+        const std::size_t before = isr_.size();
         for (NodeId node : replicas_) {
             if (inIsr(node)) continue; // already in ISR
             if (!mayJoin(node)) continue;
-
-            const auto& s = followerState_[node];
+            const FollowerState* s = followerState(node);
+            if (s == nullptr) continue;   // never fetched
             // A-NEW-4: require recent fetch (within the shrink lag window)
             // in addition to offset catch-up, matching Kafka's expand gate.
-            // replicaLagMaxMs_ is stored so we can check the time gate here.
-            bool offsetOk = (s.lastFetchOffset >= highWatermark);
-            bool timeOk   = (nowNs - s.lastFetchTimeNs) <= replicaLagMaxNs_;
-            if (offsetOk && timeOk) {
-                newIsr.push_back(node);
-            }
+            const bool offsetOk = (s->lastFetchOffset >= highWatermark);
+            const bool timeOk   = (nowNs - s->lastFetchTimeNs) <= replicaLagMaxNs_;
+            if (offsetOk && timeOk) isr_.push_back(node);
         }
-
-        isrChanged_ = (newIsr != isr_);
-        isr_        = std::move(newIsr);
+        isrChanged_ = isr_.size() != before;
         return isr_;
     }
 
@@ -250,6 +266,14 @@ public:
         auto it = std::find(isr_.begin(), isr_.end(), node);
         if (it == isr_.end()) return false;
         isr_.erase(it);
+        isrChanged_ = true;
+        return true;
+    }
+
+    /// Add `node` (a replica) to the ISR.  Returns true if the ISR changed.
+    bool addToIsr(NodeId node) {
+        if (inIsr(node)) return false;
+        isr_.push_back(node);
         isrChanged_ = true;
         return true;
     }

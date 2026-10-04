@@ -21,7 +21,7 @@
 //          (leadershipGeneration); the `!Unbuilt` guard keeps followers from
 //          paying the clear per pass.  A leader-epoch bump with unchanged gens
 //          keeps the state (exact).
-//       2. Unbuilt, Leader and leaderComplete_ (I2) → Scanning{logStart, LEO}.
+//       2. Unbuilt and Leader (I2) → Scanning{logStart, LEO}.
 //       3. Scanning (NEVER blocks on disk — fix round 1, controller cold-cache
 //          bench): the scan walks each segment's untouched read-only mapping
 //          sequentially by byte position (no index lookup, no header read
@@ -109,7 +109,6 @@ using RcReadAhead = RcHint (*)(void* ctx, const RcReadAheadReq& req);
 /// The replica facts one advance() step reads (owner thread, plain loads).
 struct RcFacts {
     bool     leader               = false;
-    bool     leaderComplete       = false;
     uint64_t logGeneration        = 0;
     uint64_t leadershipGeneration = 0;
     int32_t  epoch                = 0;
@@ -242,7 +241,7 @@ public:
             return 0;
         }
         if (std::holds_alternative<Unbuilt>(st_)) {
-            if (!f.leader || !f.leaderComplete) return 0;  // I2: wait for leaderComplete_
+            if (!f.leader) return 0;  // I2: a leader's log only
             if (log == nullptr) {
                 // PSM <-> log consistency (finding 3, F22): a memory-backed
                 // partition's producer state is REBUILT from its InMemoryLog on

@@ -117,15 +117,11 @@ inline constexpr int16_t kErrRecordTooLarge = -6;
 // divergingEndOffset (= the leader's endOffsetForEpoch(lastFetchedEpoch)); the
 // follower truncates to min(divergingEndOffset, its own end offset of that
 // epoch) — or, if it never held that epoch, to its own end of the largest
-// earlier epoch (another round) — and re-fetches.  Never credited (ISR / HW /
-// completeness): only a fetch that passed validation counts.
+// earlier epoch (another round) — and re-fetches.  Never credited (ISR / HW):
+// only a fetch that passed validation counts.
 inline constexpr int16_t kErrDivergingEpoch = -7;
-// The leader is not complete yet (a majority of its assigned ISR has not proven,
-// by a validated fetch, that its log is a prefix of ours) and this follower's
-// fetch is NOT on our lineage: it is HELD — no truncation directive, no credit —
-// because a deficient leader must never make a survivor drop records that may be
-// committed.  The follower keeps its log and retries at its fetch cadence.
-inline constexpr int16_t kErrLeaderNotComplete = -8;
+// -8 was kErrLeaderNotComplete (the retired leader-completeness HOLD answer).
+// Reserved: never reused on the wire.
 // The default replication fetch-ceiling (requested chunk size) used for
 // every PartitionConfig across the broker (see BrokerNode.cpp).  This is
 // deliberately NOT required to cover the gateway's max accepted produce
@@ -271,6 +267,12 @@ public:
     virtual bool sendReconcileResponse(
             NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) { return true; }
 
+    /// (Partition leader → controller) Kafka AlterPartition: propose an ISR
+    /// change.  Cold path (ISR changes only).  Default: no controller channel
+    /// (false = not sent; a replica with this transport as its ISR channel
+    /// re-sends on its resend cadence).
+    virtual bool sendAlterIsr(const AlterIsrMsg& /*msg*/) { return false; }
+
     // (F3 fix-round-2 item A's maxFetchResponseBytes() — the hard per-message
     //  records ceiling a FIRST batch is served alone within — is the SAME
     //  quantity as F18's maxFetchRecordsBytes() above: one virtual.)
@@ -351,14 +353,31 @@ public:
     /// Transition to Leader with the given epoch.
     /// Resets ISR from replicas, seeds ReplicaLeaderState.
     /// A SAME-EPOCH re-assert while already Leader (a partitionEpoch-only ISR
-    /// change) only applies the ISR — removals at once, additions only through
-    /// the data-plane expansion rule (LEO >= HW after a validated fetch) — and
-    /// resets nothing else (completeness, follower slots, push state).
+    /// change: the controller committed a new ISR, e.g. our AlterIsr) only
+    /// applies that committed ISR and resets nothing else (follower slots, push
+    /// state, HW floors, the epoch cache).
     void becomeLeader(Epoch newEpoch, std::vector<NodeId> isr);
 
     /// Transition to Follower with the given leader epoch.  A same-epoch
     /// re-assert of the same leader while already Follower is a no-op.
     void becomeFollower(Epoch leaderEpoch, NodeId leaderId);
+
+    /// Kafka AlterPartition wiring: ISR changes of this (leader) replica are
+    /// PROPOSED to the controller through `channel` and applied only once the
+    /// controller committed them (they come back as a same-epoch becomeLeader).
+    /// nullptr (default) = self-managed ISR (single node / unit rigs).  Set
+    /// before the replica is driven.
+    void setIsrChannel(PartitionTransport* channel) noexcept { isrChannel_ = channel; }
+    /// Kafka broker fencing (leader only): members the cluster considers DEAD
+    /// (not in `live`) leave the ISR at once instead of after replicaLagMaxMs —
+    /// self-managed ISR: immediately; controller-managed: proposed (AlterIsr).
+    /// Cold; called on the control thread for INTERNAL partitions (whose ISR is
+    /// leader-local); user partitions are fenced by the controller.
+    void shrinkIsrToLive(std::span<const int32_t> live, int64_t nowNs);
+    /// Test view: an AlterIsr proposal is in flight.
+    [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending; }
+    /// Test view: the maximal ISR the HW is computed over (committed ∪ proposed).
+    [[nodiscard]] const std::vector<NodeId>& maximalIsrForTest() const noexcept;
 
     // -----------------------------------------------------------------------
     // Leader API
@@ -483,6 +502,11 @@ public:
     /// KIP-320/595: the epoch of the last record in our log (the epoch-cache
     /// entry owning offset LEO-1), -1 for an empty log.
     [[nodiscard]] int32_t lastFetchedEpoch() const noexcept;
+    /// Test view: the epoch of OUR record at offset-1 (what a follower whose log
+    /// is a prefix of ours ending at `offset` sends as lastFetchedEpoch).
+    [[nodiscard]] int32_t lastFetchedEpochAtForTest(Offset offset) const {
+        return offset <= 0 ? -1 : epochCache_.epochForOffset(offset - 1);
+    }
 
     // -----------------------------------------------------------------------
     // OffsetsForLeaderEpoch (KIP-101) + the retired DR-BUG-6 reverse reconcile.
@@ -496,7 +520,7 @@ public:
 
     /// (Leader) Answer an OffsetsForLeaderEpoch query authoritatively from the
     /// LeaderEpochCache: (responseEpoch, endOffset) = endOffsetForEpoch.  No
-    /// state change, no ISR / HW / completeness credit.
+    /// state change, no ISR / HW credit.
     void onOffsetsForLeaderEpochRequest(const OffsetsForLeaderEpochReqMsg& req);
 
     /// (Follower) Retired: this build never probes, so an answer is ignored.
@@ -529,18 +553,13 @@ public:
 
     [[nodiscard]] Role        role()           const noexcept { return role_; }
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
-    /// F15 §2.3: leader-completeness (a majority of the assigned ISR proved a
-    /// validated prefix position — see completenessIsr_; was the reconcile    /// done).  Owner thread only.
-    [[nodiscard]] bool        isLeaderComplete() const noexcept { return leaderComplete_; }
-    /// DUR-1 fix round 1 (B1): THE produce gate — the only predicate every
-    /// produce / control-batch append path consults (worker, gateway inline,
-    /// internal stores via append*, the DR harness).  A leader that has not yet
-    /// proven it holds the committed frontier (DR-BUG-6 completeness gate) must
-    /// not append: an incomplete deficient leader would append over records its
-    /// survivors still hold (divergence + acked loss).  Refusal = retriable
-    /// NotLeader.  One load + compare each (hot replica line).
+    /// THE produce gate — the only predicate every produce / control-batch
+    /// append path consults (worker, gateway inline, internal stores via
+    /// append*, the DR harness).  Kafka model (HW = min LEO over the ISR, the
+    /// leader is always an ISR member): every leader holds every committed
+    /// record, so leadership alone is the gate.  Refusal = retriable NotLeader.
     [[nodiscard]] [[gnu::always_inline]] bool acceptsProduce() const noexcept {
-        return role_ == Role::Leader && leaderComplete_;
+        return role_ == Role::Leader;
     }
     /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
     /// content — a tail truncation (KIP-279; formerly also a reconcile append of
@@ -574,7 +593,7 @@ public:
     // The LogCleanerAgent runs on its OWN thread (cleanerRunner_) concurrently
     // with the duty/append thread (NodeRuntimeAgent on agentRunner_).  It MUST
     // NOT read the live leader/ISR state (leaderState_, isrManager_->isr(),
-    // leaderComplete_, lastHealthyHw_, role_) — those are mutated by the duty
+    // lastHealthyHw_, role_) — those are mutated by the duty
     // thread without synchronisation (torn std::vector reads, non-atomic scalar
     // writes → UB, TSan-proven).
     //
@@ -845,7 +864,7 @@ private:
 
     /// Publish the current served HW + role into the cleaner-visible atomics
     /// (release-store).  MUST be called on the DUTY/append thread only, at every
-    /// site that can change the served HW, the ISR, the completeness gate, or the
+    /// site that can change the served HW, the ISR, or the
     /// role.  The LogCleanerAgent reads these via cleanerHighWatermark() /
     /// cleanerRole() (acquire-load) so it never touches the live racy state.
     void publishCleanerState() noexcept;
@@ -909,11 +928,13 @@ private:
     bool sendFetchToLeader_(const FetchRequestMsg& req);
 
     /// (Follower) KIP-279 truncation on a DivergingEpoch answer, then re-fetch.
-    void onDivergingEpoch_(const FetchResponseMsg& resp);
+    void onDivergingEpoch_(int32_t divergingEpoch, Offset divergingEndOffset);
     /// (Follower) Kafka LeaderEpochFileCache.assign on append: record the start
     /// of every new epoch stamped on the batches in [p, p+len) (whole batches).
     /// Returns true when the cache changed.
     bool assignEpochsFromBatches_(const uint8_t* p, std::size_t len);
+    /// Cold: rebuild the epoch cache from every stamped batch in the log.
+    void rebuildEpochCacheFromLog_();
 
     /// Build a FetchResponseMsg stamped with this partition's identity
     /// (epoch/partitionId/topicId, logStartOffset=0) plus the given HW,
@@ -1122,34 +1143,48 @@ private:
     // production and caused the DR-8 committed-loss).
     bool leaderLagClockNeedsReset_ = false;
 
-    // LEADER-COMPLETENESS GATE (the B1 write gate) — Kafka parity edition.
-    //
-    // A leader never takes records it did not hold when elected.  It is COMPLETE
-    // (accepts writes, serves an HW above the pre-election floor, directs
-    // truncations) once a MAJORITY of the ISR it was ASSIGNED at becomeLeader
-    // (self included) has proven — by a fetch that passed lastFetchedEpoch
-    // validation in this leadership — that its log is a prefix of ours.  Every
-    // committed record is held by a majority of the ISR it was committed under,
-    // so such a quorum contains a holder of it, and that holder's log is a prefix
-    // of ours: we hold every committed record (ISR soundness, not data pulling).
-    // A deficient leader (an ISR member that lacks committed records the others
-    // hold) never gets that quorum — the holders' fetches are ahead / off our
-    // lineage — so it stays incomplete: it refuses writes, holds those fetches
-    // (kErrLeaderNotComplete, no truncation), and the controller has to hand
-    // leadership to a complete replica (E1b).  The quorum is over the ASSIGNED
-    // set, not the data-plane ISR (a held follower is never credited, so the
-    // lag check shrinks it — it must still count): only a member that is SILENT
-    // in this leadership (no fetch at all) AND was shrunk out of the data ISR —
-    // a dead / unreachable replica, which Kafka would not have in the ISR —
-    // leaves the quorum set.  Decided once per leadership (a same-epoch
-    // re-assert keeps it).
-    bool   leaderComplete_    = true;   ///< false until the validated quorum above is reached
-    Offset completenessFloor_ = 0;      ///< pre-failover committed HW; served HW held here until complete
-    std::vector<NodeId> completenessIsr_;   ///< the ISR assigned at becomeLeader (cold)
+    // Kafka model (user decision 2026-10-03): HW = min LEO over the (maximal)
+    // ISR — every ISR member holds every committed record, and a leader is
+    // always elected from the ISR (user partitions: the controller elects from
+    // its committed ISR; internal partitions: see updateIsr_ — their ISR only
+    // drops members the cluster considers dead, so every live node the
+    // consensus can elect is in it).  No leader-completeness gate exists.
+    Offset electionLeo_       = 0;      ///< our LEO at becomeLeader (healthy-floor recovery bound)
+    /// The controller-COMMITTED ISR (elections, min-ISR).  The HW counts the
+    /// maximal ISR (isrManager_ = committed ∪ proposed) — see updateIsr_.
+    std::vector<NodeId> committedIsr_;
+    // AlterIsr proposal state (controller-managed ISR).  ONE proposal in flight
+    // (Kafka): re-sent on cadence until the controller commits it or another
+    // committed change supersedes it.  Each proposal carries its base
+    // (= committedIsr_ when sent); the controller commits it only while that is
+    // still the committed ISR (compare-and-set, Kafka's partitionEpoch check), so
+    // a stale / re-ordered copy can never commit after a later change.  The
+    // controller never refuses a well-formed proposal from the current leader
+    // for good (only transiently: another change for the partition in flight),
+    // so a pending proposal always resolves.  The HW counts committed ∪ pending
+    // (KIP-497/841 maximal ISR).
+    struct IsrProposal {
+        bool                pending = false;
+        std::vector<NodeId> isr;          ///< proposed ISR (AlterIsr)
+        int64_t             sentNs  = 0;
+    };
+    IsrProposal isrProposal_{};
+    PartitionTransport* isrChannel_ = nullptr;   ///< AlterIsr sink (null = self-managed ISR)
+    static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
+    std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload
+    uint64_t v2RefusalsLogged_ = 0;                             ///< mixed v2/v3: CRITICAL once
+    [[nodiscard]] bool internalPartition_() const noexcept { return cfg_.topicId < 0; }
+    [[nodiscard]] int  computeEffectiveMinIsr_(int rf) const noexcept;
+    [[nodiscard]] bool committedIsrMeetsMinIsr_(bool acksAll) const noexcept;
+    void applyCommittedIsr_(std::vector<NodeId> isr);
+    bool updateIsr_(int64_t nowNs);
+    /// Commit (self-managed) or propose (controller-managed) `desired` (an ISR
+    /// derived from committedIsr_).  Returns true when something changed / was sent.
+    bool changeIsr_(const std::vector<NodeId>& desired, int64_t nowNs);
+    /// The maximal ISR = committed ∪ the pending proposal → isrManager_.
+    void applyMaximalIsr_();
+    void sendIsrProposal_(int64_t nowNs);
 
-    /// (Leader) Complete the leadership once a majority of completenessIsr_
-    /// (self + validated followers) is reached.
-    void maybeCompleteLeadership();
 
     // FETCH CONFLATION: per-follower record of the last (fetchOffset, LEO) served +
     // when.  The leader SKIPS re-serving an IDENTICAL response within kFetchResendNs.

@@ -23,6 +23,7 @@
 //   version     : uint16   (= 1)
 // ---------------------------------------------------------------------------
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -39,6 +40,7 @@
 #include <rune_protocol_replication_sbe/MessageHeader.h>
 #include <rune_protocol_replication_sbe/FetchRequest.h>
 #include <rune_protocol_replication_sbe/FetchResponse.h>
+#include <rune_protocol_replication_sbe/AlterIsr.h>
 
 namespace rune::replication {
 
@@ -48,7 +50,13 @@ namespace rsbe = ::rune::protocol::replication::sbe;
 // Schema constants
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kSchemaId      = 112;
-inline constexpr uint16_t kSchemaVersion = 3; // v2: DR-BUG-5 topicId; v3: KIP-320/595 lastFetchedEpoch + DivergingEpoch
+inline constexpr uint16_t kSchemaVersion = 3; // v2: DR-BUG-5 topicId; v3: KIP-320/595 lastFetchedEpoch, AlterIsr
+/// Mixed v2/v3 replication is UNSUPPORTED (fail closed): a decoded v2
+/// FetchRequest carries this lastFetchedEpoch sentinel (the leader refuses it
+/// unless the follower's log is empty) and a decoded v2 FetchResponse carries
+/// errorCode kErrUnsupportedWireVersion (the follower drops it).
+inline constexpr int32_t kLastFetchedEpochV2Frame = -2;
+inline constexpr int16_t kErrUnsupportedWireVersion = -9;
 
 // ---------------------------------------------------------------------------
 // Template IDs (assigned for the replication protocol)
@@ -211,7 +219,8 @@ struct FetchRequestMsg {
     }
 
     /// Decode FetchRequest from buf[offset] (at least MIN_SIZE bytes).  A v2
-    /// frame (blockLength 32) carries no lastFetchedEpoch: decoded as -1.
+    /// frame (blockLength 32) carries no lastFetchedEpoch: decoded as
+    /// kLastFetchedEpochV2Frame (the leader fails closed on it).
     static FetchRequestMsg decode(const uint8_t* buf,
                                   std::size_t offset) noexcept
     {
@@ -224,7 +233,8 @@ struct FetchRequestMsg {
         m.fetchOffset  = detail::read_le<int64_t>(p + 16);
         m.maxBytes     = detail::read_le<int32_t>(p + 24);
         m.topicId      = detail::read_le<int32_t>(p + 28);
-        m.lastFetchedEpoch = blockLen >= BLOCK_LENGTH ? detail::read_le<int32_t>(p + 32) : -1;
+        m.lastFetchedEpoch = blockLen >= BLOCK_LENGTH ? detail::read_le<int32_t>(p + 32)
+                                                      : kLastFetchedEpochV2Frame;
         return m;
     }
 };
@@ -237,8 +247,10 @@ struct FetchRequestMsg {
 // consumers), the logStartOffset (earliest offset available in this epoch),
 // an error code, and a variable-length records blob.
 //
-// Fixed block (46 bytes in v3; 34 in v2):  [v2: DR-BUG-5 topicId; v3: divergingEpoch @ +34,
-//   divergingEndOffset @ +38 — KIP-320/595]
+// Fixed block (34 bytes, sbeBlockLength=34; unchanged in v3 — data frames keep
+// their 46-byte framing):  [schema version 2: DR-BUG-5 adds topicId]
+// v3: a record-less ERROR answer may carry a 12-byte payload in `records` — see
+// ErrorPayload (DivergingEpoch / OffsetOutOfRange).
 //   leaderEpoch    : Epoch       (int64)  @ +0
 //   partition      : PartitionId (int32)  @ +8
 //   highWatermark  : Offset      (int64)  @ +12
@@ -263,13 +275,6 @@ struct FetchResponseMsg {
     int16_t                  errorCode;
     int32_t                  topicId;   ///< DR-BUG-5: distinguishes replicas that share a partitionId
     std::span<const uint8_t> records;   ///< Zero-copy view into the decode buf.
-    /// v3 (KIP-320/595) DivergingEpoch: the follower's (fetchOffset,
-    /// lastFetchedEpoch) is not on the leader's lineage.  The follower truncates
-    /// to min(divergingEndOffset, its own end offset of divergingEpoch) and
-    /// re-fetches.  -1 = no divergence (always -1 in a v2 frame).
-    int32_t                  divergingEpoch     = -1;
-    Offset                   divergingEndOffset = -1;
-
     static constexpr uint16_t TEMPLATE_ID = 2;
     /// Smallest decodable frame: a v2 sender's (34-byte block) empty answer.
     static constexpr std::size_t MIN_SIZE = 8 + 34 + 4;
@@ -297,9 +302,7 @@ struct FetchResponseMsg {
                               Offset                   logStartOffset_,
                               int16_t                  errorCode_,
                               std::span<const uint8_t> records_,
-                              int32_t                  topicId_ = 0,
-                              int32_t                  divergingEpoch_ = -1,
-                              Offset                   divergingEndOffset_ = -1) noexcept
+                              int32_t                  topicId_ = 0) noexcept
     {
         const std::size_t frame = encodedSize(records_.size());
         rsbe::FetchResponse enc;
@@ -309,9 +312,7 @@ struct FetchResponseMsg {
            .highWatermark(highWatermark_)
            .logStartOffset(logStartOffset_)
            .errorCode(errorCode_)
-           .topicId(topicId_)
-           .divergingEpoch(divergingEpoch_)
-           .divergingEndOffset(divergingEndOffset_);
+           .topicId(topicId_);
         enc.putRecords(reinterpret_cast<const char*>(records_.data()),
                        static_cast<std::uint32_t>(records_.size()));
         return frame;
@@ -340,11 +341,6 @@ struct FetchResponseMsg {
         m.logStartOffset = dec.logStartOffset();
         m.errorCode      = dec.errorCode();
         m.topicId        = dec.topicId();
-        // v3 fields: a v2 frame decodes them as absent → -1 (no divergence).
-        if (dec.divergingEpochInActingVersion()) {
-            m.divergingEpoch     = dec.divergingEpoch();
-            m.divergingEndOffset = dec.divergingEndOffset();
-        }
         // Records tail: guard against a malformed/truncated length prefix (a
         // corrupt frame claiming more bytes than the fragment holds) BEFORE reading
         // the view — decode is noexcept and must never over-read or let an SBE
@@ -362,7 +358,103 @@ struct FetchResponseMsg {
             m.records = std::span<const uint8_t>{
                 reinterpret_cast<const uint8_t*>(sv.data()), sv.size()};
         }
+        // Mixed v2/v3 is unsupported: a v2 leader's frame is never applied.
+        if (mh.version() < kSchemaVersion) {
+            m.errorCode = kErrUnsupportedWireVersion;
+            m.records   = {};
+        }
         return m;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// v3 error payload — a record-less FetchResponse ERROR answer may carry
+//   int32 epoch | int64 endOffset   (12 bytes, LE) in its `records` field:
+//   DivergingEpoch (-7): the leader's endOffsetForEpoch(lastFetchedEpoch);
+//   OffsetOutOfRange (-4): epoch -1, endOffset = the leader's log end offset.
+// Data frames are untouched (their framing stays 46 bytes).
+// ---------------------------------------------------------------------------
+struct ErrorPayload {
+    int32_t epoch     = -1;
+    Offset  endOffset = -1;
+    static constexpr std::size_t SIZE = 12;
+    void encode(uint8_t* out) const noexcept {
+        detail::write_le<int32_t>(out, epoch);
+        detail::write_le<int64_t>(out + 4, endOffset);
+    }
+    [[nodiscard]] static bool decode(std::span<const uint8_t> in, ErrorPayload& out) noexcept {
+        if (in.size() != SIZE) return false;
+        out.epoch     = detail::read_le<int32_t>(in.data());
+        out.endOffset = detail::read_le<int64_t>(in.data() + 4);
+        return true;
+    }
+};
+
+/// Owns an ErrorPayload's bytes for a FetchResponseMsg::records view (tests,
+/// harnesses).
+struct ErrorPayloadBuf {
+    std::array<uint8_t, ErrorPayload::SIZE> bytes{};
+    std::span<const uint8_t> set(int32_t epoch, Offset endOffset) noexcept {
+        ErrorPayload{epoch, endOffset}.encode(bytes.data());
+        return {bytes.data(), bytes.size()};
+    }
+};
+
+// ---------------------------------------------------------------------------
+// AlterIsr (template 7, v3) — Kafka AlterPartition: the partition leader
+// proposes an ISR change to the controller, which commits it to the metadata
+// log only while `baseIsr` (the committed ISR the proposal was derived from)
+// is still the committed ISR — compare-and-set, the analog of Kafka's
+// partitionEpoch check.  Fixed 156-byte block (generated SBE codec).
+// ---------------------------------------------------------------------------
+struct AlterIsrMsg {
+    static constexpr uint16_t TEMPLATE_ID = 7;
+    static constexpr int kMaxIsr = 16;
+    int32_t topicId     = 0;
+    int32_t partition   = 0;
+    NodeId  leaderId    = -1;
+    Epoch   leaderEpoch = -1;
+    int32_t isrCount    = 0;
+    std::array<int32_t, kMaxIsr> isr{};
+    int32_t baseIsrCount = 0;
+    std::array<int32_t, kMaxIsr> baseIsr{};
+
+    static constexpr std::size_t TOTAL_SIZE =
+        rsbe::MessageHeader::encodedLength() + rsbe::AlterIsr::sbeBlockLength();
+
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        rsbe::AlterIsr enc;
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), 0, cap);
+        enc.topicId(topicId).partition(partition).leaderId(leaderId)
+           .leaderEpoch(leaderEpoch).isrCount(isrCount).baseIsrCount(baseIsrCount);
+        for (int i = 0; i < kMaxIsr; ++i) {
+            enc.isr(static_cast<std::uint64_t>(i), isr[static_cast<std::size_t>(i)]);
+            enc.baseIsr(static_cast<std::uint64_t>(i), baseIsr[static_cast<std::size_t>(i)]);
+        }
+        return TOTAL_SIZE;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, AlterIsrMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        char* b = reinterpret_cast<char*>(const_cast<uint8_t*>(buf));
+        rsbe::MessageHeader mh;
+        mh.wrap(b, 0, 0, len);
+        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < rsbe::AlterIsr::sbeBlockLength()) return false;
+        rsbe::AlterIsr dec;
+        dec.wrapForDecode(b, rsbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), len);
+        m.topicId     = dec.topicId();
+        m.partition   = dec.partition();
+        m.leaderId    = dec.leaderId();
+        m.leaderEpoch = dec.leaderEpoch();
+        m.isrCount    = dec.isrCount();
+        m.baseIsrCount = dec.baseIsrCount();
+        if (m.isrCount < 0 || m.isrCount > kMaxIsr) return false;
+        if (m.baseIsrCount < 0 || m.baseIsrCount > kMaxIsr) return false;
+        for (int i = 0; i < kMaxIsr; ++i) {
+            m.isr[static_cast<std::size_t>(i)]     = dec.isr(static_cast<std::uint64_t>(i));
+            m.baseIsr[static_cast<std::size_t>(i)] = dec.baseIsr(static_cast<std::uint64_t>(i));
+        }
+        return true;
     }
 };
 

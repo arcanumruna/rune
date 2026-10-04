@@ -36,7 +36,7 @@ void expectAllConvergedAndAcked(DrCluster& c, const char* where) {
 TEST(DrIntegration, HappyPath_ProduceAckConverge) {
     DrCluster c(3);
     c.start();
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isLeaderComplete(); }));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).acceptsProduce(); }));
     EXPECT_EQ(c.produceAcked(25), 25);
     expectAllConvergedAndAcked(c, "happy");
     EXPECT_EQ(c.ids(1).size(), 25u);
@@ -88,7 +88,7 @@ TEST(DrIntegration, LeaderCrash_UnflushedTail_PowerLoss_NoAckedLoss) {
     c.crash(1, CrashKind::PowerLoss);
     const NodeId nl = c.failover();
     ASSERT_GT(nl, 1);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).acceptsProduce(); }, kCap));
     EXPECT_EQ(c.produceAcked(15), 15);
     c.restart(1);
     c.applyMetadata(1);
@@ -108,7 +108,7 @@ TEST(DrIntegration, LeaderCrash_UnackedTail_TruncatedOnRejoin) {
     EXPECT_EQ(c.acked().size(), 20u);
     const NodeId nl = c.failover();
     ASSERT_GT(nl, 1);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).acceptsProduce(); }, kCap));
     EXPECT_EQ(c.produceAcked(10), 10);
     c.restart(1);
     c.healAll();
@@ -152,7 +152,7 @@ TEST(DrIntegration, Kip101_DivergentTailsAcrossTwoFailovers) {
     c.run(2);
     c.crash(1, CrashKind::ProcessKill);
     ASSERT_EQ(c.failover(), 2);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).acceptsProduce(); }, kCap));
     c.restart(1);
     c.healAll();
     c.applyMetadata(1);
@@ -164,7 +164,7 @@ TEST(DrIntegration, Kip101_DivergentTailsAcrossTwoFailovers) {
     c.crash(2, CrashKind::ProcessKill);
     const NodeId nl = c.failover();
     ASSERT_TRUE(nl == 1 || nl == 3);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).acceptsProduce(); }, kCap));
     EXPECT_EQ(c.produceAcked(5), 5);
     c.restart(2);
     c.healAll();
@@ -180,7 +180,7 @@ TEST(DrIntegration, Kip101_DivergentTailsAcrossTwoFailovers) {
 TEST(DrIntegration, ProducerStateRebuildAfterCrash_NoDupNoOos) {
     DrCluster c(3);
     c.start();
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isLeaderComplete(); }));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).acceptsProduce(); }));
     constexpr int64_t kPid = 4242;
     uint64_t id = 1'000'000;
     for (int32_t s = 0; s < 20; ++s)
@@ -195,7 +195,7 @@ TEST(DrIntegration, ProducerStateRebuildAfterCrash_NoDupNoOos) {
     c.crash(1, CrashKind::ProcessKill);
     const NodeId nl = c.failover();
     ASSERT_GT(nl, 1);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).acceptsProduce(); }, kCap));
 
     // The client retries its whole in-flight window (seq 16..23) in order.
     for (int32_t s = 16; s < 20; ++s) {
@@ -215,8 +215,11 @@ TEST(DrIntegration, ProducerStateRebuildAfterCrash_NoDupNoOos) {
     c.healAll();
     c.applyMetadata(1);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
-    c.moveLeader(1);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isLeaderComplete(); }, kCap)) << c.dump();
+    // Kafka: a controlled move only goes to a member of the committed ISR — wait
+    // for the leader's AlterIsr re-admitting node 1 to be committed.
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(1); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.moveLeader(1));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).acceptsProduce(); }, kCap)) << c.dump();
     for (int32_t s = 18; s < 24; ++s) {
         const auto r = c.produceIdempotent(kPid, 0, s, 9);
         EXPECT_EQ(r.status, IdemResult::Status::Duplicate) << "after leader move, seq " << s;
@@ -238,7 +241,7 @@ TEST(DrIntegration, StaleLeaderFencing_SplitBrain_NoStaleAck) {
     // and its metadata never reaches node 1, which still leads epoch 1.
     ASSERT_EQ(c.failover({1}), 2);
     ASSERT_EQ(c.rep(1).role(), Role::Leader);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).acceptsProduce(); }, kCap));
     EXPECT_EQ(c.produceAcked(10), 10);
 
     // Writes into the stale leader (a client that has not refreshed metadata).
@@ -274,7 +277,7 @@ TEST(DrIntegration, KillAll_ProcessKill_AcksAll_NoAckedLoss) {
     for (NodeId id = 1; id <= 3; ++id) c.restart(id);
     const NodeId nl = c.failover();
     ASSERT_GT(nl, 0);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).acceptsProduce(); }, kCap));
     EXPECT_EQ(c.produceAcked(10), 10);
     expectAllConvergedAndAcked(c, "kill-all");
 }
@@ -291,7 +294,7 @@ TEST(DrIntegration, KillAll_MinorityPowerLoss_NoAckedLoss) {
     for (NodeId id = 1; id <= 3; ++id) c.restart(id);
     const NodeId nl = c.failover();
     ASSERT_GT(nl, 0);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).acceptsProduce(); }, kCap));
     EXPECT_EQ(c.produceAcked(10), 10);
     expectAllConvergedAndAcked(c, "kill-all minority power loss");
 }
@@ -308,68 +311,82 @@ TEST(DrIntegration, TotalPowerLoss_OutOfGuarantee_StillConsistent) {
     for (NodeId id = 1; id <= 3; ++id) c.restart(id);
     const NodeId nl = c.failover();
     ASSERT_GT(nl, 0);
-    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).isLeaderComplete(); }, kCap));
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(nl).acceptsProduce(); }, kCap));
     ASSERT_EQ(c.produce(10), 10);
     ASSERT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0 && c.converged(); }, kCap));
     for (NodeId id = 1; id <= 3; ++id) c.expectNoDuplicates(id);
 }
 
 // ---------------------------------------------------------------------------
-// Leadership handed to a replica that is BEHIND the committed frontier while
-// still in the controller ISR (the controller's ISR only changes on a leader
-// change, so a follower that lagged stays in it).  Kafka parity: a leader never
-// takes records it did not hold when elected.  The deficient leader must never
-// complete (no write, no truncation directive: the survivors keep the committed
-// records); once the controller moves leadership to a complete replica the
-// cluster converges with no acked loss.  (Before the redesign it reverse-
-// reconciled the survivors' records — the heuristic layer this replaces.)
+// Kafka model (fix round 1): HW = min LEO over the ISR, ISR changes go through
+// the controller (AlterIsr).  A follower that lags past replicaLagMaxMs is
+// shrunk out of the controller's COMMITTED ISR before the HW passes its LEO —
+// so a lagging replica is never electable: a preferred / controlled move to it
+// is refused, and the committed records stay on every electable replica.
+// (Replaces the deficient-leader scenarios of the heuristic and completeness
+// eras: a deficient user-partition leader cannot be elected any more.)
 // ---------------------------------------------------------------------------
-TEST(DrIntegrationRegression, LeaderMovedToLaggingIsrReplica_StaysIncompleteUntilReelected) {
+TEST(DrIntegrationRegression, LaggingReplicaShrunkFromControllerIsr_NeverElectable) {
     DrCluster c(3);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
-    c.isolate(3);                                // 3 lags; controller ISR still {1,2,3}
-    ASSERT_EQ(c.produceAcked(20), 20);
+    c.isolate(3);                                // 3 lags
+    ASSERT_EQ(c.produceAcked(20), 20) << "commits once 3 is shrunk out (AlterIsr committed)";
+    EXPECT_FALSE(c.controllerIsrContains(3)) << "the controller still elects from an ISR holding 3";
+    EXPECT_GE(c.alterIsrCommitted(), 1u);
     c.run(20);
-    ASSERT_EQ(c.rep(2).highWatermark(), 30);
-    c.moveLeader(3);                             // preferred-leader move (3 is in the ISR)
+    EXPECT_FALSE(c.moveLeader(3)) << "a controlled move to a replica outside the committed ISR";
     c.healAll();
-    c.run(300);
-    EXPECT_FALSE(c.rep(3).acceptsProduce()) << "a deficient leader completed\n" << c.dump();
-    EXPECT_EQ(c.produce(5), 0);
-    EXPECT_EQ(c.rep(3).logEndOffset(), 10);
-    EXPECT_EQ(c.rep(1).logEndOffset(), 30) << "a survivor truncated committed records";
-    EXPECT_EQ(c.rep(2).logEndOffset(), 30) << "a survivor truncated committed records";
-    c.moveLeader(1);
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap))
+        << "the caught-up replica was never re-admitted\n" << c.dump();
+    EXPECT_GE(c.rep(3).logEndOffset(), 30) << "re-admitted before it held the committed prefix";
+    ASSERT_TRUE(c.moveLeader(3)) << "re-admitted: a move to it is allowed again";
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
-    expectAllConvergedAndAcked(c, "lagging leader");
+    expectAllConvergedAndAcked(c, "lagging replica");
 }
 
-// KIP-966: a replica restarted after an UNCLEAN shutdown (power loss: its
-// unflushed tail — acked records included — is gone) stays in the controller
-// ISR.  Leadership handed to it must not lose the acked records the others
-// still hold: it never completes (their fetches are ahead of its lineage), and
-// the controller's next move to a complete replica loses nothing.
+// KIP-966 (data plane): a replica restarted after an UNCLEAN shutdown (power
+// loss: acked records gone) is shrunk out of the controller ISR as soon as its
+// regressed fetch reaches the leader (AlterIsr) — a controlled move to it is
+// refused until it caught up again (validated, at the HW) and was re-admitted.
+// (The window between the restart and its first fetch is the controller-side
+// KIP-966 gap: see DISABLED_E1b_UncleanRestartMovedBeforeFirstFetch.)
 TEST(DrIntegrationRegression, UncleanRestartedReplicaMadeLeader_NoAckedLoss) {
     DrCluster c(3);
     c.start();
     ASSERT_EQ(c.produceAcked(30), 30);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
-    c.run(20);
-    ASSERT_EQ(c.rep(2).highWatermark(), 30);
     c.crash(3, CrashKind::PowerLoss);
     c.restart(3);
+    c.cut(1, 3);                                 // its fetches reach the leader, nothing comes back
     c.applyMetadata(3);
-    c.moveLeader(3);
-    c.run(300);
-    EXPECT_FALSE(c.rep(3).acceptsProduce()) << c.dump();
-    EXPECT_EQ(c.rep(1).logEndOffset(), 30);
-    EXPECT_EQ(c.rep(2).logEndOffset(), 30);
-    c.moveLeader(2);
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    EXPECT_FALSE(c.moveLeader(3)) << "an unclean-restarted replica is not electable";
+    c.healAll();
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
+    EXPECT_GE(c.rep(3).logEndOffset(), 30);
+    ASSERT_TRUE(c.moveLeader(3));
     ASSERT_TRUE(c.waitWritable(kCap)) << "leader never became writable";
     EXPECT_EQ(c.produceAcked(5), 5);
     expectAllConvergedAndAcked(c, "unclean restarted leader");
+}
+
+// E1b (controller side, KIP-966 clean-shutdown signal): moved BEFORE its first
+// fetch, the unclean replica is still in the committed ISR and gets elected
+// with a log missing acked records.
+TEST(DrIntegration, DISABLED_E1b_UncleanRestartMovedBeforeFirstFetch) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(30), 30);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.crash(3, CrashKind::PowerLoss);
+    c.restart(3);
+    c.applyMetadata(3);
+    (void)c.moveLeader(3);
+    (void)c.waitWritable(kCap);
+    (void)c.produceAcked(5);
+    expectAllConvergedAndAcked(c, "unclean moved before first fetch");
 }
 
 // Power loss of the LEADER after an epoch change: its leader-epoch checkpoint
@@ -381,7 +398,7 @@ TEST(DrIntegrationRegression, PowerLoss_EpochCacheBeyondRecoveredLeo_TruncatedOn
     DrCluster c(3);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
-    c.moveLeader(2);                              // epoch 2 starts at 10 on node 2
+    ASSERT_TRUE(c.moveLeader(2)) << c.dump();                              // epoch 2 starts at 10 on node 2
     ASSERT_EQ(c.produceAcked(10), 10);
     c.crash(2, CrashKind::PowerLoss);            // checkpoint {1:0, 2:10} survives, log does not
     c.restart(2);
@@ -396,7 +413,7 @@ TEST(DrIntegrationRegression, PowerLoss_EpochCacheBeyondRecoveredLeo_TruncatedOn
     ASSERT_TRUE(c.waitWritable(kCap));
     EXPECT_EQ(c.produceAcked(5), 5);
     expectAllConvergedAndAcked(c, "epoch cache past leo");
-    c.moveLeader(2);
+    ASSERT_TRUE(c.moveLeader(2)) << c.dump();
     ASSERT_TRUE(c.waitWritable(kCap));
     EXPECT_EQ(c.rep(2).leaderEpochCacheForTest().latestEpoch(), static_cast<int32_t>(c.epoch()))
         << "becomeLeader's epoch must be recorded";
@@ -434,68 +451,58 @@ TEST(DrIntegrationRegression, FollowerRestartAfterUncleanShutdown_OutOfIsrUntilC
     expectAllConvergedAndAcked(c, "unclean follower isr");
 }
 
-// KIP-966 ELR double fault (controller side): the only replicas holding a
-// committed range are the leader and a follower that then loses power; the
-// third replica lagged (out of the data-plane ISR, still in the controller
-// ISR — the controller ISR only changes on a leader change).  The leader is
-// then killed (process kill: its page cache survives).  Kafka's ELR keeps the
-// partition leaderless until the old leader returns; Rune elects a survivor
-// that lacks the range.  (The elected survivor was in the controller ISR but
-// does not hold the committed prefix; the data plane never counts a replica it
-// has not validated, and a deficient leader never completes while a validated
-// quorum is missing — but only the controller can avoid electing it.  E1b also
-// covers the review's M2: an
-// unclean follower carried across a leadership change (the new leader has no
-// prior position for it, so the regression eviction cannot fire), and RF >= 4
-// with an even ISR, where the completeness quorum and the commit quorum need
-// not overlap.)
-TEST(DrIntegration, DISABLED_Kip966_DoubleFault_UncleanFollowerPlusLeaderKill) {
+// KIP-966 double fault, now closed by the Kafka model: the committed range
+// lives on {1,2}; node 3 lagged (shrunk out of the committed ISR), node 2
+// loses power (its regressed fetch shrinks it out too: committed ISR {1}),
+// then leader 1 is process-killed.  No clean candidate → LEADERLESS (never an
+// unclean election of 2 or 3); when node 1 returns it is elected and every
+// acked record survives.
+TEST(DrIntegrationRegression, Kip966_DoubleFault_UncleanFollowerPlusLeaderKill_LeaderlessThenNoLoss) {
     DrCluster c(3);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
     c.isolate(3);
-    ASSERT_EQ(c.produceAcked(20), 20);           // on {1,2} only
+    ASSERT_EQ(c.produceAcked(20), 20);           // on {1,2} only; 3 shrunk out
     c.run(20);
     c.crash(2, CrashKind::PowerLoss);
     c.restart(2);
     c.cut(1, 2);
     c.applyMetadata(2);
-    c.run(10);
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(2); }, kCap)) << c.dump();
     c.crash(1, CrashKind::ProcessKill);
     c.healAll();
-    (void)c.failover();
-    (void)c.waitWritable(kCap);
-    (void)c.produce(5);
+    EXPECT_EQ(c.failover(), -1) << "an unclean / lagging replica was elected";
+    EXPECT_EQ(c.produce(5), 0);
     c.run(50);
     c.restart(1);
-    c.applyMetadata(1);
+    ASSERT_EQ(c.failover(), 1) << "the last clean ISR member must be re-elected";
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
     expectAllConvergedAndAcked(c, "kip-966 double fault");
 }
 
-// The deficient-leader case under a lossy, delayed network: the deficient
-// leader stays incomplete; after the controller moves leadership, dropped
-// fetch answers / fetches and DivergingEpoch rounds are re-driven by the fetch
-// cadence and the owed-answer path — no acked loss, no divergence.
+// The lagging-replica case under a lossy, delayed network: dropped fetches /
+// answers / AlterIsr frames are re-driven (fetch cadence, owed answers, the
+// AlterIsr resend) — the lagging replica leaves and re-enters the controller
+// ISR, no acked loss, no divergence.
 TEST(DrIntegration, LeaderMovedToLaggingIsrReplica_LossyDelayedLinks) {
     DrConfig cfg;
     cfg.deliveryDelaySteps = 2;
-    cfg.replicaLagMaxMs    = 500;
+    cfg.replicaLagMaxMs    = 100;
     DrCluster c(3, cfg);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
     c.isolate(3);
+    c.dropNext(Kind::AlterIsr, 1);
     ASSERT_EQ(c.produceAcked(25), 25);
-    c.run(30);
-    c.moveLeader(3);
+    EXPECT_FALSE(c.controllerIsrContains(3));
+    EXPECT_FALSE(c.moveLeader(3));
     c.healAll();
     c.dropNext(Kind::FetchResp, 4);
     c.dropNext(Kind::FetchReq, 3);
-    c.run(300);
-    EXPECT_FALSE(c.rep(3).acceptsProduce());
-    EXPECT_EQ(c.rep(1).logEndOffset(), 35);
-    c.moveLeader(2);
-    c.dropNext(Kind::FetchResp, 4);
-    c.dropNext(Kind::FetchReq, 2);
+    c.dropNext(Kind::AlterIsr, 1);
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.moveLeader(3));
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
     expectAllConvergedAndAcked(c, "lossy lagging leader");
@@ -529,46 +536,27 @@ TEST(DrIntegration, PowerLoss_AcrossSegmentRolls_SealedSegmentsSurvive) {
 // Fix round 1 (review) — each pinned by a reproduction first.
 // ===========================================================================
 
-// B1: an INCOMPLETE leader (completeness gate still holding: it has not yet
-// proven it holds the committed frontier) must refuse EVERY append — plain
-// (pid -1) produce, idempotent produce, control batch (txn marker), acks=all
-// internal-store append — with a retriable NotLeader.  The worker gate used to
-// check role() only, so a pid -1 batch landed on the deficient leader at
-// [10,15) and the reconciled survivors' [15,30) was grafted on top (divergence
-// + acked loss).  Under the Kafka-parity redesign the deficient leader never
-// completes at all; the controller moves leadership on.  The harness produces through the REAL gate
-// (PartitionReplica::acceptsProduce, the predicate Worker / ClientGateway use).
-TEST(DrIntegrationRegression, IncompleteDeficientLeaderRefusesEveryAppend) {
-    DrCluster c(3);
+// E1b (consensus side): an INTERNAL partition's leader is the CONSENSUS leader,
+// elected data-blind.  Node 3 was dead (fenced out of the internal ISR, commits
+// went on on {1,2}); it rejoins and — a second fault — becomes the consensus
+// leader before it caught up.  It does not hold [10,30) and its KIP-279
+// directives truncate them on the others.  Kafka's controller would never elect
+// it (not in the ISR); closing this needs the consensus election to respect the
+// internal ISR (a candidacy rule / vote on internal positions) — E1b.
+TEST(DrIntegration, DISABLED_E1b_InternalFencedMemberElectedBeforeCatchUp_NoAckedLoss) {
+    DrConfig cfg;
+    cfg.topicId = -1;                            // __consumer_offsets-like internal partition
+    DrCluster c(3, cfg);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
-    c.isolate(3);
+    c.isolate(3);                                // consensus-dead: fenced
     ASSERT_EQ(c.produceAcked(20), 20);
-    c.run(20);
-    c.moveLeader(3);
     c.healAll();
-    ASSERT_FALSE(c.rep(3).isLeaderComplete());
-    EXPECT_FALSE(c.rep(3).acceptsProduce());
-    EXPECT_EQ(c.produce(5), 0) << "pid -1 produce accepted by an incomplete leader";
-    EXPECT_EQ(c.produceIdempotent(77, 0, 0, 5000).status, IdemResult::Status::Refused);
-    rune::protocol::RecordBatchBuilder mb(0, 0);
-    mb.setControl(true);
-    mb.setTransactional(true);
-    mb.setProducerId(77);
-    mb.append(std::string_view("\0\0\0\0", 4), std::string_view("\0\0\0\0\0\0", 6), 0);
-    const auto marker = mb.build();
-    EXPECT_EQ(c.rep(3).appendControlBatch(marker), PartitionReplica::kAppendNotLeader);
-    const uint8_t k[1] = {1}, v[1] = {2};
-    EXPECT_EQ(c.rep(3).appendKeyed(k, v, /*acksAll=*/true), PartitionReplica::kAppendNotLeader);
-    EXPECT_EQ(c.rep(3).logEndOffset(), 10) << "nothing may land before completion";
-    c.run(300);                                  // it never completes (deficient)
-    EXPECT_FALSE(c.rep(3).acceptsProduce());
-    c.moveLeader(1);
-    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    ASSERT_TRUE(c.moveLeader(3));                // elected before its first fetch
+    ASSERT_TRUE(c.waitWritable(kCap));
     EXPECT_EQ(c.produceAcked(5), 5);
-    expectAllConvergedAndAcked(c, "incomplete leader gate");
+    expectAllConvergedAndAcked(c, "e1b internal fenced member elected");
 }
-
 
 
 
@@ -583,13 +571,13 @@ TEST(DrIntegrationRegression, NoSideProbes_DivergenceResolvedOnFetchPath) {
     c.isolate(1);
     ASSERT_EQ(c.produce(2), 2);
     c.run(2);
-    c.moveLeader(2);
+    ASSERT_TRUE(c.moveLeader(2)) << c.dump();
     c.heal(2, 3);
     ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).acceptsProduce(); }, 200)) << c.dump();
     c.isolate(2);
     ASSERT_EQ(c.produce(4), 4);
     c.run(2);
-    c.moveLeader(1);
+    ASSERT_TRUE(c.moveLeader(1)) << c.dump();
     c.healAll();
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
@@ -656,35 +644,112 @@ std::size_t positionsDiffering(const std::vector<uint64_t>& a, const std::vector
 
 } // namespace
 
-// Repro.cpp #1: the committed range the moved-to replica lacks was written
-// under an epoch it never held.  It must stay incomplete (no write, no
-// truncation directive — the survivors keep every committed record) instead
-// of adopting the survivors' prefix; once the controller moves leadership to a
-// complete replica everything converges with no acked loss.
-TEST(DrIntegrationRegression, DeficientLeaderMissingWholeEpoch_StaysIncompleteNoTruncation) {
+// Repro.cpp #1 under the Kafka model: the replica that missed a whole epoch
+// is outside the committed ISR — never electable; failovers pick a holder.
+// The internal-partition variant (consensus-led) stays INCOMPLETE instead.
+TEST(DrIntegrationRegression, DeficientLeaderMissingWholeEpoch_NotElectable) {
     DrCluster c(3);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
     c.isolate(3);
-    c.moveLeader(2);                             // epoch 2 on {1,2}; 3 never sees it
+    ASSERT_TRUE(c.moveLeader(2));                // epoch 2 on {1,2}; 3 never sees it
     ASSERT_EQ(c.produceAcked(20), 20);
     c.run(20);
-    c.moveLeader(3);                             // lagging ISR replica, epoch 3
+    EXPECT_FALSE(c.controllerIsrContains(3));
+    EXPECT_FALSE(c.moveLeader(3));
     c.healAll();
-    c.run(300);
-    EXPECT_FALSE(c.rep(3).acceptsProduce()) << "a deficient leader must never complete\n" << c.dump();
-    EXPECT_EQ(c.produce(5), 0) << "an incomplete leader accepted a write";
-    EXPECT_EQ(c.rep(3).logEndOffset(), 10) << "the leader took records it did not hold when elected";
-    EXPECT_EQ(c.rep(1).logEndOffset(), 30) << "a survivor truncated committed records";
-    EXPECT_EQ(c.rep(2).logEndOffset(), 30) << "a survivor truncated committed records";
-    c.moveLeader(1);                             // controller: a complete replica leads
+    c.crash(2, CrashKind::ProcessKill);
+    const NodeId nl = c.failover();
+    EXPECT_EQ(nl, 1) << "only an ISR member may be elected";
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(25), 25);
+    c.restart(2);
+    c.applyMetadata(2);
     expectAllConvergedAndAcked(c, "missing whole epoch");
 }
 
-// Repro.cpp #2: followers ahead of the deficient leader by different amounts
-// (one holds an extra uncommitted tail).  Same contract.
+// INTERNAL partition (__cluster_metadata-like), Repro.cpp #1 shape: node 3 is
+// dead while leadership moves to 2 (epoch 2) and [10,30) commits on {1,2} —
+// node 3 is FENCED out of the internal ISR (consensus-dead), so the commits
+// never wait for it and never freeze.  It rejoins, catches up (validated, at
+// the HW), is re-admitted, and only then does the consensus move to it: it is
+// writable at once and nothing is lost.
+TEST(DrIntegrationRegression, InternalDeadMemberFencedThenReadmitted_NoFreezeNoLoss) {
+    DrConfig cfg;
+    cfg.topicId = -3;                            // __cluster_metadata-like
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.isolate(3);
+    ASSERT_TRUE(c.moveLeader(2));
+    ASSERT_EQ(c.produceAcked(20), 20) << "internal commits froze on a dead member";
+    const auto& isr2 = c.rep(2).isr();
+    EXPECT_EQ(std::find(isr2.begin(), isr2.end(), 3), isr2.end()) << "a dead member stayed in the ISR";
+    c.healAll();
+    ASSERT_TRUE(c.driveUntil([&] {
+        const auto& i = c.rep(2).isr();
+        return std::find(i.begin(), i.end(), 3) != i.end();
+    }, kCap)) << "the caught-up member was never re-admitted\n" << c.dump();
+    EXPECT_GE(c.rep(3).logEndOffset(), 30);
+    ASSERT_TRUE(c.moveLeader(3));
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(25), 25);
+    expectAllConvergedAndAcked(c, "internal fenced then readmitted");
+}
+
+// CRITICAL-2 (review of 0ff9322): an INTERNAL partition whose consensus leader
+// fails while the surviving follower holds an UNCOMMITTED tail.  The consensus
+// picks the other (live, in-ISR) member: with HW = min over the ISR it holds
+// every committed record — it is writable at once (under the majority HW +
+// completeness gate it could never prove completeness: control plane frozen),
+// truncates the uncommitted tail on the follower (KIP-279) and loses nothing.
+TEST(DrIntegrationRegression, Critical2_InternalLeaderFailover_UncommittedTailOnSurvivor_WritableNoLoss) {
+    DrConfig cfg;
+    cfg.topicId = -1;
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cut(1, 3);                                 // data plane only: 3 stays consensus-live
+    ASSERT_EQ(c.produce(5), 5);
+    c.run(300);                                  // far past replicaLagMaxMs: no lag shrink
+    EXPECT_EQ(c.acked().size(), 10u) << "committed past a live internal ISR member";
+    EXPECT_EQ(c.rep(2).logEndOffset(), 15);
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    ASSERT_TRUE(c.moveLeader(3));                // the consensus picks node 3
+    ASSERT_TRUE(c.waitWritable(kCap)) << "the new internal leader froze\n" << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "critical-2 internal failover");
+}
+
+// CRITICAL-2 + whole-cluster kill -9: an INTERNAL partition, node 3 lagging on
+// the data plane (consensus-live) when every node is process-killed.  After the
+// restart the consensus elects node 3: it holds every committed record (the HW
+// waited for it), is writable at once and nothing acked is lost.
+TEST(DrIntegrationRegression, Critical2_InternalPartition_WholeClusterKill9_LaggingConsensusLeader_NoLoss) {
+    DrConfig cfg;
+    cfg.topicId = -1;
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.cut(1, 3);
+    ASSERT_EQ(c.produce(20), 20);                // on {1,2} only: uncommitted
+    c.run(5);
+    for (NodeId id = 1; id <= 3; ++id) c.crash(id, CrashKind::ProcessKill);
+    for (NodeId id = 1; id <= 3; ++id) c.restart(id);
+    c.healAll();
+    ASSERT_TRUE(c.moveLeader(3));                // consensus picks the lagging node
+    ASSERT_TRUE(c.waitWritable(kCap)) << "a restarted internal leader froze\n" << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    expectAllConvergedAndAcked(c, "internal kill -9");
+}
+// Repro.cpp #2: followers ahead by different amounts (one with an extra
+// uncommitted tail).  The lagging replica is not electable; when the leader
+// dies, the controller elects from the committed ISR; the uncommitted tail is
+// truncated by the validated fetch path; no acked loss.
 TEST(DrIntegrationRegression, DeficientLeaderTwoFollowersAheadDifferentAmounts_NoLossNoDivergence) {
     DrCluster c(3);
     c.start();
@@ -695,76 +760,48 @@ TEST(DrIntegrationRegression, DeficientLeaderTwoFollowersAheadDifferentAmounts_N
     c.cut(1, 2);
     (void)c.produce(5);                          // uncommitted tail on node 1 only
     c.run(5);
-    c.moveLeader(3);
+    EXPECT_FALSE(c.moveLeader(3));
+    c.crash(1, CrashKind::ProcessKill);
     c.healAll();
-    c.run(300);
-    EXPECT_FALSE(c.rep(3).acceptsProduce()) << c.dump();
-    EXPECT_EQ(c.rep(1).logEndOffset(), 35);
-    EXPECT_EQ(c.rep(2).logEndOffset(), 30);
-    c.moveLeader(1);
+    ASSERT_EQ(c.failover(), 2);
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.applyMetadata(1);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap)) << c.dump();
     for (NodeId id = 1; id <= 3; ++id) { c.expectAckedPresent(id, "two ahead"); c.expectNoDuplicates(id); }
 }
 
-// Repro.cpp #3 / the pid -1 produce of #4: the controller elects node 3 while
-// node 2 (holding the committed [10,30)) is unreachable; node 2 learns the
-// assignment late.  Losing [10,30) here is the controller-side E1b gap (a
-// replica lacking committed records was elected while a clean one existed —
-// see DISABLED_E1b_MisElectionWithCleanHolderUnreachable_NoAckedLoss).  What
-// the DATA PLANE must guarantee: node 2 is never counted as a copy of records
-// it does not hold (it truncates to the leader's lineage via the validated
-// fetch path and re-fetches), no silent divergence, every record acked AFTER
-// the election survives, and the cluster converges.
-TEST(DrIntegrationRegression, LateFollowerAheadOfElectedLeader_ValidatedTruncationNoDivergence) {
+// Repro.cpp #3 (and the former E1b mis-election): the committed range lives on
+// {1,2}; node 3 lagged and was shrunk out of the committed ISR; leader 1 dies
+// while node 2 is unreachable to the controller.  Kafka: no clean candidate →
+// the partition stays LEADERLESS (never an unclean election of 3); once node 2
+// is reachable it is elected and nothing is lost.
+TEST(DrIntegrationRegression, MisElectionPrevented_LeaderlessUntilCleanHolderReachable) {
     DrCluster c(3);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
     c.isolate(3);
     ASSERT_EQ(c.produceAcked(20), 20);
     c.run(20);
+    ASSERT_FALSE(c.controllerIsrContains(3));
     c.crash(1, CrashKind::ProcessKill);
     c.healAll();
-    ASSERT_EQ(c.failover({2}), 3);
-    c.applyMetadata(2);
-    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
-    const std::size_t before = c.acked().size();
-    ASSERT_EQ(c.produceAcked(25), 25);
-    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap)) << c.dump();
-    EXPECT_EQ(positionsDiffering(c.ids(2), c.ids(3)), 0u) << "silent divergence";
-    c.expectNoDuplicates(2);
-    c.expectNoDuplicates(3);
-    std::size_t idx = 0;
-    const auto ids2 = c.ids(2);
-    for (uint64_t a : c.acked()) {
-        if (idx++ < before) continue;            // acked after the election only
-        EXPECT_NE(std::find(ids2.begin(), ids2.end(), a), ids2.end()) << "acked id " << a;
-    }
-}
-
-// E1b acceptance (controller side): the same scenario must not lose the
-// committed [10,30) — the controller must not elect a replica lacking committed
-// records while a clean ISR member exists (KIP-966 ELR / clean-member gate).
-TEST(DrIntegration, DISABLED_E1b_MisElectionWithCleanHolderUnreachable_NoAckedLoss) {
-    DrCluster c(3);
-    c.start();
-    ASSERT_EQ(c.produceAcked(10), 10);
-    c.isolate(3);
-    ASSERT_EQ(c.produceAcked(20), 20);
-    c.run(20);
-    c.crash(1, CrashKind::ProcessKill);
-    c.healAll();
-    (void)c.failover({2});
-    c.applyMetadata(2);
+    EXPECT_EQ(c.failover({2}), -1) << "elected a replica outside the committed ISR";
+    c.run(50);
+    ASSERT_EQ(c.failover(), 2) << "the clean holder must be elected once reachable";
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(25), 25);
-    expectAllConvergedAndAcked(c, "e1b mis-election");
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "mis-election prevented");
 }
 
-// Repro.cpp #4: a non-idempotent (pid -1) produce reaching the incomplete
-// deficient leader through the production gate is refused; nothing lands;
-// leadership moves to a complete replica and nothing is lost.
+
+// Repro.cpp #4: a non-idempotent (pid -1) produce on a deficient leader.  User
+// partition: the deficient replica is not electable (move refused) — the
+// produce goes to the real leader.  (Internal-partition variant:
+// IncompleteDeficientLeaderRefusesEveryAppend.)
 TEST(DrIntegrationRegression, NonIdempotentProduceOnIncompleteDeficientLeader_Refused) {
     DrCluster c(3);
     c.start();
@@ -772,14 +809,11 @@ TEST(DrIntegrationRegression, NonIdempotentProduceOnIncompleteDeficientLeader_Re
     c.isolate(3);
     ASSERT_EQ(c.produceAcked(20), 20);
     c.run(20);
-    c.moveLeader(3);
+    EXPECT_FALSE(c.moveLeader(3));
+    EXPECT_EQ(c.rep(3).role(), Role::Follower);
     c.healAll();
-    for (int i = 0; i < 50; ++i) { EXPECT_EQ(c.produce(1), 0); c.step(); }
-    EXPECT_EQ(c.rep(3).logEndOffset(), 10);
-    c.moveLeader(2);
-    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
-    expectAllConvergedAndAcked(c, "pid -1 on incomplete leader");
+    expectAllConvergedAndAcked(c, "pid -1 never on a deficient leader");
 }
 
 // rev2-Repro2 #1 (clean elections, every replica in the controller ISR):
@@ -794,13 +828,13 @@ TEST(DrIntegrationRegression, Kip279_DivergentEpochTail_LeaderCompletesAndFollow
     c.isolate(1);
     ASSERT_EQ(c.produce(2), 2);
     c.run(2);
-    c.moveLeader(2);
+    ASSERT_TRUE(c.moveLeader(2)) << c.dump();
     c.heal(2, 3);
     ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).acceptsProduce(); }, 200)) << c.dump();
     c.isolate(2);
     ASSERT_EQ(c.produce(4), 4);
     c.run(2);
-    c.moveLeader(1);
+    ASSERT_TRUE(c.moveLeader(1)) << c.dump();
     c.healAll();
     ASSERT_TRUE(c.waitWritable(kCap)) << "leader never completed\n" << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
@@ -820,13 +854,13 @@ TEST(DrIntegrationRegression, Kip279_SameLengthDivergentTail_TruncatedToOwnEpoch
     c.isolate(1);
     ASSERT_EQ(c.produce(2), 2);
     c.run(2);
-    c.moveLeader(2);
+    ASSERT_TRUE(c.moveLeader(2)) << c.dump();
     c.heal(2, 3);
     ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).acceptsProduce(); }, 200)) << c.dump();
     c.isolate(2);
     ASSERT_EQ(c.produce(2), 2);
     c.run(2);
-    c.moveLeader(1);
+    ASSERT_TRUE(c.moveLeader(1)) << c.dump();
     c.healAll();
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
@@ -835,12 +869,10 @@ TEST(DrIntegrationRegression, Kip279_SameLengthDivergentTail_TruncatedToOwnEpoch
     expectAllConvergedAndAcked(c, "kip-279 same length");
 }
 
-// rev2-Repro2 #3: a same-epoch re-assert (a partitionEpoch-only ISR change
-// re-applies becomeLeader / becomeFollower with the SAME leaderEpoch) must only
-// apply the ISR — never reset the leader's completeness / follower slots nor
-// the follower's state.  Before: it re-armed the completeness gate and cleared
-// the diverged/wedge state, re-admitting a divergent follower (silent
-// divergence).
+// rev2-Repro2 #3: a same-epoch re-assert (partitionEpoch-only ISR change, e.g.
+// a committed AlterIsr) must only apply the ISR — never reset the leader's
+// follower slots / completeness nor the follower's state — and never cause a
+// silent divergence.
 TEST(DrIntegrationRegression, SameEpochReassert_OnlyAppliesIsr_NoDivergence) {
     DrConfig cfg;
     cfg.minIsr = 1;
@@ -848,44 +880,28 @@ TEST(DrIntegrationRegression, SameEpochReassert_OnlyAppliesIsr_NoDivergence) {
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
     c.isolate(3);
-    ASSERT_EQ(c.produceAcked(20), 20);
-    c.run(20);
-    c.crash(1, CrashKind::ProcessKill);
+    ASSERT_EQ(c.produceAcked(20), 20);           // 3 shrunk out (committed ISR {1,2})
     c.healAll();
-    ASSERT_EQ(c.failover({2}), 3);
-    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
-    const std::size_t before = c.acked().size();
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
     ASSERT_EQ(c.produceAcked(5), 5);
+    ASSERT_TRUE(c.rep(1).acceptsProduce());
+    const Offset tracked2 = c.rep(1).followerLeoForTest(2);
+    // partitionEpoch-only re-assert: the same leaderEpoch re-applied everywhere.
+    c.applyMetadata(1);
     c.applyMetadata(2);
-    c.run(300);
-    ASSERT_EQ(c.produceAcked(20), 20);
-    ASSERT_TRUE(c.rep(3).isLeaderComplete());
-    const Offset tracked2 = c.rep(3).followerLeoForTest(2);
-    // partitionEpoch-only bump: the same leaderEpoch re-applied everywhere.
     c.applyMetadata(3);
-    c.applyMetadata(2);
-    EXPECT_TRUE(c.rep(3).isLeaderComplete()) << "same-epoch re-assert re-armed the completeness gate";
-    EXPECT_TRUE(c.rep(3).acceptsProduce());
-    EXPECT_EQ(c.rep(3).followerLeoForTest(2), tracked2) << "same-epoch re-assert reset follower state";
-    c.run(300);
-    ASSERT_TRUE(c.waitWritable(kCap));
+    EXPECT_TRUE(c.rep(1).acceptsProduce());
+    EXPECT_TRUE(c.rep(1).acceptsProduce());
+    EXPECT_EQ(c.rep(1).followerLeoForTest(2), tracked2) << "same-epoch re-assert reset follower state";
     ASSERT_EQ(c.produceAcked(5), 5);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap)) << c.dump();
-    EXPECT_EQ(positionsDiffering(c.ids(3), c.ids(2)), 0u) << "silent divergence";
-    std::size_t idx = 0;
-    const auto ids2 = c.ids(2);
-    for (uint64_t a : c.acked()) {
-        if (idx++ < before) continue;
-        EXPECT_NE(std::find(ids2.begin(), ids2.end(), a), ids2.end()) << "acked id " << a;
-    }
+    EXPECT_EQ(positionsDiffering(c.ids(1), c.ids(2)), 0u) << "silent divergence";
+    EXPECT_EQ(positionsDiffering(c.ids(1), c.ids(3)), 0u) << "silent divergence";
 }
 
 // rev2-Repro3: every fetch answer carries exactly ONE batch (maxFetchBytes = 1
-// — the regime of any batch >= maxFetchBytes).  Before: the LEO-1 reconcile
-// pull spent the whole budget on the boundary batch → livelock.  Now there is
-// no reverse pull at all: the deficient leader stays incomplete without a
-// frame storm, the controller moves leadership, and catch-up + the KIP-279
-// truncation loop make progress one batch per answer.
+// — the regime of any batch >= maxFetchBytes).  No reverse pull exists; the
+// lagging replica catches up batch by batch, is re-admitted and can lead.
 TEST(DrIntegrationRegression, OneBatchPerAnswer_NoLivelock_ConvergesBatchByBatch) {
     DrConfig cfg;
     cfg.maxFetchBytes = 1;
@@ -895,12 +911,10 @@ TEST(DrIntegrationRegression, OneBatchPerAnswer_NoLivelock_ConvergesBatchByBatch
     c.isolate(3);
     ASSERT_EQ(c.produceAcked(20), 20);
     c.run(20);
-    c.moveLeader(3);
+    EXPECT_FALSE(c.moveLeader(3));
     c.healAll();
-    c.run(300);
-    EXPECT_FALSE(c.rep(3).acceptsProduce());
-    EXPECT_EQ(c.rep(1).logEndOffset(), 30);
-    c.moveLeader(1);
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.moveLeader(3));
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(10), 10);
     expectAllConvergedAndAcked(c, "one batch per answer");
@@ -918,13 +932,13 @@ TEST(DrIntegrationRegression, Kip279_DivergentTail_OneBatchPerAnswer_Converges) 
     c.isolate(1);
     ASSERT_EQ(c.produce(2), 2);
     c.run(2);
-    c.moveLeader(2);
+    ASSERT_TRUE(c.moveLeader(2)) << c.dump();
     c.heal(2, 3);
     ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).acceptsProduce(); }, 300)) << c.dump();
     c.isolate(2);
     ASSERT_EQ(c.produce(4), 4);
     c.run(2);
-    c.moveLeader(1);
+    ASSERT_TRUE(c.moveLeader(1)) << c.dump();
     c.healAll();
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
     EXPECT_EQ(c.produceAcked(5), 5);
@@ -939,11 +953,11 @@ TEST(DrIntegrationRegression, BatchesCarryRealLeaderEpoch_FollowerCacheBuiltFrom
     c.start();
     ASSERT_EQ(c.produceAcked(5), 5);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
-    c.moveLeader(2);
+    ASSERT_TRUE(c.moveLeader(2)) << c.dump();
     ASSERT_TRUE(c.waitWritable(kCap));
     ASSERT_EQ(c.produceAcked(5), 5);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
-    c.moveLeader(3);
+    ASSERT_TRUE(c.moveLeader(3)) << c.dump();
     ASSERT_TRUE(c.waitWritable(kCap));
     ASSERT_EQ(c.produceAcked(5), 5);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
@@ -1013,7 +1027,7 @@ TEST(DrIntegrationRegression, CompleteLeaderNeverReentersGateNorChangesItsLog) {
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
-    ASSERT_TRUE(c.rep(1).isLeaderComplete());
+    ASSERT_TRUE(c.rep(1).acceptsProduce());
     const uint64_t gen = c.rep(1).logGeneration();
     const uint64_t lead = c.rep(1).leadershipGeneration();
     OffsetsForLeaderEpochReqMsg probe{};
@@ -1024,16 +1038,182 @@ TEST(DrIntegrationRegression, CompleteLeaderNeverReentersGateNorChangesItsLog) {
     probe.requestedEpoch = 1;                    // the shared, still-open epoch
     probe.followerLeo    = 25;                   // "ahead" of the leader
     c.rep(1).onOffsetsForLeaderEpochRequest(probe);
-    EXPECT_TRUE(c.rep(1).acceptsProduce()) << "a probe made a complete leader re-enter the gate";
+    EXPECT_TRUE(c.rep(1).acceptsProduce()) << "a probe changed the leader's write state";
     FetchRequestMsg ahead = c.rep(2).nextFetch();
     ahead.fetchOffset = 25;                      // a diverging fetch past the LEO
     (void)c.rep(1).onFetchRequest(ahead, c.clock());
     c.run(50);
-    EXPECT_TRUE(c.rep(1).isLeaderComplete()) << "a complete leader re-entered the gate";
-    EXPECT_TRUE(c.rep(1).acceptsProduce());
+    EXPECT_TRUE(c.rep(1).acceptsProduce()) << "a diverging fetch changed the leader's write state";
     EXPECT_EQ(c.rep(1).logGeneration(), gen) << "the leader's log content changed";
     EXPECT_EQ(c.rep(1).leadershipGeneration(), lead);
     EXPECT_EQ(c.rep(1).logEndOffset(), 10);
     EXPECT_EQ(c.produceAcked(5), 5);
     expectAllConvergedAndAcked(c, "gate never re-entered");
+}
+
+// ===========================================================================
+// Fix round 1 (Opus review of 0ff9322): Kafka model for acks=all — HW = min LEO
+// over the (maximal) ISR, ISR changes committed by the controller (AlterIsr),
+// elections only from the committed ISR.  CRITICAL-1/2, MAJOR-3 scenarios.
+// ===========================================================================
+
+// CRITICAL-1: RF=3, the controller sits on node 3 (it knows only its own
+// position), node 3 is one fetch round behind, leader 1 dies.  Whoever the
+// controller picks from the ISR (here node 3) is a COMPLETE, writable leader —
+// with HW = min over the ISR nothing past node 3's LEO was ever committed — and
+// no acked record is lost.  (Under the majority HW node 3 was a deficient
+// leader that never completed.)
+TEST(DrIntegrationRegression, Critical1_ControllerPicksLaggingIsrMember_WritableNoCommittedLoss) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cut(1, 3);                                 // node 3 misses the next round
+    ASSERT_EQ(c.produce(5), 5);
+    c.run(3);
+    EXPECT_EQ(c.acked().size(), 10u) << "committed past an ISR member's LEO";
+    EXPECT_TRUE(c.controllerIsrContains(3));
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    ASSERT_EQ(c.failover({}, /*positionsFrom=*/3), 3) << "the controller on node 3 elects itself";
+    ASSERT_TRUE(c.waitWritable(kCap)) << "the elected ISR member must be writable\n" << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "critical-1");
+}
+
+// KIP-497/841 maximal ISR: while the controller has not committed a shrink,
+// the member still holds the HW back (it is still electable) — the leader may
+// not commit past its LEO.  Once the AlterIsr is committed, the HW advances.
+TEST(DrIntegrationRegression, PendingShrink_HwWaitsForTheMemberUntilCommitted) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cutBoth(1, 3);                             // 3 lags
+    c.cutBoth(1, kControllerAddr);               // the leader's AlterIsr is lost
+    ASSERT_EQ(c.produce(5), 5);
+    c.run(300);                                  // far past replicaLagMaxMs
+    EXPECT_TRUE(c.rep(1).isrProposalPendingForTest()) << "the shrink was never proposed";
+    EXPECT_TRUE(c.controllerIsrContains(3));
+    EXPECT_LE(c.rep(1).highWatermark(), 10) << "HW passed a member the controller could still elect";
+    EXPECT_EQ(c.acked().size(), 10u);
+    c.heal(1, kControllerAddr);                  // the AlterIsr re-send gets through
+    ASSERT_TRUE(c.driveUntil([&] { return !c.controllerIsrContains(3); }, kCap)) << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, kCap));
+    EXPECT_EQ(c.acked().size(), 15u) << "committed once the shrink was committed";
+    c.healAll();
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
+    expectAllConvergedAndAcked(c, "pending shrink");
+}
+
+// Kafka shrink vs expand: a follower whose fetches still ARRIVE but whose
+// answers are lost (or applied too slowly) sits exactly at the HW it pins.  It
+// must be shrunk (not caught up to the log end within replicaLagMaxMs) and must
+// NOT be re-admitted in the same ISR check just because its fetch offset equals
+// the old HW — before the fix it was shrunk and re-expanded on every check, the
+// HW stayed pinned at its LEO and acks=all stalled forever.
+TEST(DrIntegrationRegression, FetchingButLaggingFollowerShrunk_HwAdvances) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cut(1, 3);                                 // 3's fetches reach the leader; nothing comes back
+    ASSERT_EQ(c.produceAcked(5), 5) << "acks=all stalled on a lagging-but-fetching follower\n" << c.dump();
+    EXPECT_FALSE(c.controllerIsrContains(3));
+    c.healAll();
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap)) << c.dump();
+    EXPECT_GE(c.rep(3).logEndOffset(), 15);
+    expectAllConvergedAndAcked(c, "fetching but lagging");
+}
+
+// A pending expansion always resolves: the leader proposed re-admitting node 3
+// (caught up, validated) but the AlterIsr cannot reach the controller; node 3
+// then dies.  Node 3 is in the maximal ISR meanwhile (the HW waits for it — it
+// may be committed into the ISR at any moment).  Once the controller is
+// reachable the pending proposal commits (node 3 held every record up to the
+// HW), the lag check shrinks the dead node 3 out, and the HW moves again — no
+// permanent pin, no acked loss.
+TEST(DrIntegrationRegression, PendingExpansionOfAMemberThatDies_ResolvesHwNotPinned) {
+    DrConfig cfg;
+    cfg.minIsr = 1;
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.isolate(3);
+    ASSERT_EQ(c.produceAcked(5), 5);             // 3 shrunk out
+    ASSERT_FALSE(c.controllerIsrContains(3));
+    c.healAll();
+    c.cutBoth(1, kControllerAddr);               // the re-admission proposal is stuck
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).isrProposalPendingForTest(); }, kCap)) << c.dump();
+    const auto& max = c.rep(1).maximalIsrForTest();
+    ASSERT_NE(std::find(max.begin(), max.end(), 3), max.end()) << "the proposed member must count for the HW";
+    c.crash(3, CrashKind::ProcessKill);
+    ASSERT_EQ(c.produce(3), 3);
+    c.run(100);
+    EXPECT_EQ(c.acked().size(), 15u) << "committed past a member the controller may still admit";
+    c.heal(1, kControllerAddr);
+    ASSERT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, kCap))
+        << "the HW stayed pinned by a dead member of a pending proposal\n" << c.dump();
+    EXPECT_FALSE(c.controllerIsrContains(3));
+    c.restart(3);
+    c.applyMetadata(3);
+    expectAllConvergedAndAcked(c, "pending expansion resolves");
+}
+
+// A re-admitted member is caught up to the HW (validated fetch) before it counts:
+// it never enters the committed ISR — nor the HW computation — below the HW.
+TEST(DrIntegrationRegression, ReadmittedMemberCaughtUpBeforeItCounts) {
+    DrConfig cfg;
+    cfg.maxFetchBytes = 1;                       // slow catch-up: one batch per answer
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_EQ(c.produceAcked(5), 5);
+    c.isolate(3);
+    ASSERT_EQ(c.produceAcked(40), 40);
+    ASSERT_FALSE(c.controllerIsrContains(3));
+    c.healAll();
+    bool admitted = false;
+    for (int i = 0; i < kCap && !admitted; ++i) {
+        c.step();
+        const auto& max = c.rep(1).maximalIsrForTest();
+        const bool counted = std::find(max.begin(), max.end(), 3) != max.end();
+        if (counted) {
+            ASSERT_GE(c.rep(3).logEndOffset(), c.rep(1).highWatermark())
+                << "counted in the HW before it held the committed prefix (step " << i << ")";
+        }
+        admitted = c.controllerIsrContains(3);
+    }
+    ASSERT_TRUE(admitted) << c.dump();
+    EXPECT_GE(c.rep(3).logEndOffset(), 45);
+    expectAllConvergedAndAcked(c, "re-admission");
+}
+
+// CRITICAL-2: consensus failovers of an INTERNAL partition while offset commits
+// (acks=all appends) keep coming: the consensus leadership moves to a lagging
+// (live) node and back; acked commits are never lost, uncommitted ones are
+// truncated (never acked), and every replica converges.
+TEST(DrIntegrationRegression, Critical2_InternalPartition_ConsensusFailoverUnderCommitLoad_NoLoss) {
+    DrConfig cfg;
+    cfg.topicId = -1;
+    DrCluster c(3, cfg);
+    c.start();
+    ASSERT_TRUE(c.waitWritable(kCap));
+    auto load = [&](int steps) {
+        for (int i = 0; i < steps; ++i) { (void)c.produce(1); c.step(); }
+    };
+    load(40);
+    c.cut(1, 3);                                 // node 3 falls behind under load
+    load(40);
+    ASSERT_TRUE(c.moveLeader(3));                // consensus failover to the lagging node
+    c.heal(1, 3);
+    load(60);
+    ASSERT_TRUE(c.moveLeader(1));                // and back
+    load(60);
+    ASSERT_TRUE(c.moveLeader(2));
+    load(60);
+    ASSERT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, kCap));
+    EXPECT_GT(c.acked().size(), 100u);
+    expectAllConvergedAndAcked(c, "internal commit load");
 }

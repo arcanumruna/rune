@@ -55,11 +55,10 @@ struct FollowerSlot {
     // validation in THIS leadership — its log is a prefix of ours.  Only such a
     // follower is pushed to, credited, or counted for leader completeness.
     bool    validated         = false;
-    // This follower sent ANY fetch in this leadership (validated, diverging or
-    // held): it is alive.  A live member of the assigned ISR always stays in the
-    // completeness quorum, even after the lag check shrank it out of the data
-    // ISR (a held follower is never credited, so it does shrink).
-    bool    heard             = false;
+    // KIP-966 (data plane): this follower's position regressed below the HW in
+    // this leadership (an unclean restart lost acknowledged records).  Kept out
+    // of the ISR (shrink proposal) until a validated fetch is back at the HW.
+    bool    unclean           = false;
     // F27: a fetch answer the transport refused, re-sent on the leader's next pass.
     // fetchOffset < 0 = nothing owed.  Superseded by the follower's next fetch.
     struct OwedAnswer {
@@ -121,7 +120,7 @@ struct FollowerSlot {
         servedFetchOffset = -1; servedLeo = -1; servedTimeNs = 0;
         askOffset = -1; askSinceNs = 0; pushedThrough = 0; catchUpTarget = -1;
         ackedLeo = -1; owed = OwedAnswer{}; dataServedThrough = -1; owedEpoch = OwedEpochAnswer{};
-        validated = false; heard = false;
+        validated = false; unclean = false;
         // connGen is NOT reset: it belongs to the link, not the leadership — a
         // bounce across a re-election must still rewind (re-review 2 N1).
     }

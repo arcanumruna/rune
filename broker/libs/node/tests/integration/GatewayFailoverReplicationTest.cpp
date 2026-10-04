@@ -417,7 +417,8 @@ TEST(GR7_Unit, UncommittedTailTruncation_NoLogDivergence) {
     Offset leo1 = appendN(replicaL, 2, 0x11);
     bool ok1 = gr7Drive({&replicaL, &replicaF2, &replicaF3}, transport, clock,
                         [&]{ return replicaF2.logEndOffset() >= leo1 &&
-                                     replicaF3.logEndOffset() >= leo1; });
+                                     replicaF3.logEndOffset() >= leo1 &&
+                                     replicaL.highWatermark() >= leo1; });   // Kafka: all ISR acked
     ASSERT_TRUE(ok1) << "B1 must replicate to all followers";
     const Offset hwB1 = replicaL.highWatermark();
     ASSERT_GE(hwB1, 0);
@@ -465,34 +466,18 @@ TEST(GR7_Unit, UncommittedTailTruncation_NoLogDivergence) {
     replicaF2.becomeLeader(newEpoch, {kF2, kF3, kL});
     replicaF3.becomeFollower(newEpoch, kF2);
 
-    // F3 and L are ISR members whose tail (B3) F2 lacks — and B3 sits on a
-    // MAJORITY (L + F3): F2 cannot tell it from a committed record.  Kafka
-    // parity: a leader never takes records it did not hold when elected, and it
-    // never directs a truncation it cannot prove safe.  F2 stays INCOMPLETE —
-    // their diverging fetches are held, nobody truncates — until the controller
-    // moves leadership to a replica that holds everything (F3 here).
+    // Kafka model: HW = min LEO over the ISR — B3 (on L and F3 only) was never
+    // committed while F2 was in the ISR, so F2 is a COMPLETE leader: L's and F3's
+    // B3 tails are off its lineage (DivergingEpoch → KIP-279 truncation) and
+    // every replica converges on F2's log; the committed prefix is intact.
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
     transport.addFollower(kF3, &replicaF3);
-    (void)gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock, [] { return false; });
-    EXPECT_FALSE(replicaF2.isLeaderComplete()) << "a deficient leader completed";
-    EXPECT_EQ(replicaF3.logEndOffset(), leo3) << "a held follower truncated";
-    EXPECT_EQ(replicaL.logEndOffset(), leo3) << "a held follower truncated";
-
-    const Epoch epoch3 = 3;
-    replicaF2.becomeFollower(epoch3, kF3);
-    replicaL.becomeFollower(epoch3, kF3);
-    replicaF3.becomeLeader(epoch3, {kF3, kF2, kL});
-    transport.setLeader(&replicaF3);
-    transport.removeFollower(kF3);
-    transport.addFollower(kF2, &replicaF2);
-    transport.addFollower(kL, &replicaL);
-
-    // Drive the validated fetch path to full convergence.
-    bool okConv = gr7Drive({&replicaF3, &replicaL, &replicaF2}, transport, clock,
+    EXPECT_TRUE(replicaF2.acceptsProduce());
+    bool okConv = gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
                            [&]{
-                               Offset a = replicaF3.logEndOffset();
-                               return replicaF2.logEndOffset() == a &&
+                               Offset a = replicaF2.logEndOffset();
+                               return replicaF3.logEndOffset() == a &&
                                       replicaL.logEndOffset()  == a;
                            });
     ASSERT_TRUE(okConv) << "all replicas must converge to a single log (no divergence)";
