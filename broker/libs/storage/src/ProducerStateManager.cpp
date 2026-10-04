@@ -35,6 +35,7 @@
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/InMemoryLog.h>
+#include <rune/storage/ControlMarkerLayout.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <fcntl.h>
@@ -254,15 +255,23 @@ void ProducerStateManager::update(int32_t topicId,
 // fenceEpoch — F15 S5 (C1+, I3): raise only
 // ---------------------------------------------------------------------------
 void ProducerStateManager::fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition,
-                                      int16_t producerEpoch, bool fromRebuild)
+                                      int16_t producerEpoch, bool fromRebuild, int32_t coordinatorEpoch)
 {
     if (producerId < 0 || producerEpoch < 0) return;
     ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
+    if (coordinatorEpoch > e.coordinatorEpoch) e.coordinatorEpoch = coordinatorEpoch;   // D9 MAJOR-2
     if (producerEpoch <= e.producerEpoch) return;
     e.producerEpoch = producerEpoch;
     e.lastSequence  = -1;
     e.markerOnly    = fromRebuild;   // D6 L1: no sequence of this epoch survives in the log
     e.resetWindow();
+}
+
+bool ProducerStateManager::markerCoordinatorFenced(int32_t topicId, int64_t producerId, int32_t partition,
+                                                   int32_t coordinatorEpoch) const
+{
+    const ProducerStateEntry* e = entry(topicId, producerId, partition);
+    return e != nullptr && coordinatorEpoch < e->coordinatorEpoch;
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +620,8 @@ ProducerStateManager::rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes
                     (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
                 // F15 S5 (I3): a control batch is an epoch raise, never a sequence.
                 if (isControl && pid >= 0) {
-                    fenceEpoch(r.topicId, pid, r.partition, reader.producerEpoch(), /*fromRebuild=*/true);
+                    fenceEpoch(r.topicId, pid, r.partition, reader.producerEpoch(), /*fromRebuild=*/true,
+                               control_marker::coordinatorEpoch(v.data + pos, static_cast<std::size_t>(tl)));
                 } else if (!isControl && pid >= 0 && reader.baseSequence() >= 0) {
                     const int32_t baseSeq = reader.baseSequence();
                     update(r.topicId, pid, r.partition, reader.producerEpoch(), baseSeq, baseSeq + lastDelta,

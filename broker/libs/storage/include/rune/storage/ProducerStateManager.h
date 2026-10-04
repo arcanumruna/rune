@@ -116,6 +116,11 @@ struct ProducerStateEntry {
     // sequence is known in this epoch, so a first batch at seq != 0 is an UNKNOWN producer, not a gap.
     // Cleared by the first data update().
     bool    markerOnly{false};
+    /// D9 review MAJOR-2 (Kafka ProducerStateEntry.coordinatorEpoch): the
+    /// coordinator epoch of the last COMMIT/ABORT marker applied for this
+    /// producer on this partition (-1 = none).  Raise-only; rebuilt from the
+    /// log's markers.  Not part of the (unused-in-production) snapshot format.
+    int32_t coordinatorEpoch{-1};
 
     std::array<SeqRange, kRetryWindowSize> seqs{};
     std::array<int64_t,  kRetryWindowSize> baseOffsets{};
@@ -280,8 +285,15 @@ public:
     // durable form, for every control batch the producer-state rebuild sees.
     // Cold (a marker per transaction per partition): may allocate the entry.
     // -----------------------------------------------------------------------
+    /// D9 review MAJOR-2: `coordinatorEpoch` (>= 0) also raises the entry's
+    /// marker coordinator epoch (see markerCoordinatorFenced).
     void fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition, int16_t producerEpoch,
-                    bool fromRebuild = false);
+                    bool fromRebuild = false, int32_t coordinatorEpoch = -1);
+    /// D9 review MAJOR-2: true when a marker of `coordinatorEpoch` for this
+    /// producer on this partition comes from a deposed coordinator (lower than
+    /// the last applied marker's).  Cold.
+    [[nodiscard]] bool markerCoordinatorFenced(int32_t topicId, int64_t producerId, int32_t partition,
+                                               int32_t coordinatorEpoch) const;
 
     // -----------------------------------------------------------------------
     // clearPartition — F15 S5 (I3): drop every entry of (topicId, partition)

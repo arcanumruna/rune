@@ -795,6 +795,16 @@ void TransactionCoordinationService::onControlMarkerRefused(int32_t topicId, int
         return;
     }
     if (it == awaiting_.end()) return;
+    if (errorCode == rune::transaction::kMarkerCoordinatorFencedError) {
+        // D9 review MAJOR-2 (Kafka TRANSACTION_COORDINATOR_FENCED): a NEWER
+        // coordinator already wrote a marker for this producer there — this load
+        // is deposed.  Never retried, never counted as landed: the transaction
+        // stays with the newer coordinator (this one unloads on its own edge).
+        spdlog::error("TCS: control marker topic={} partition={} producerId={} FENCED by a newer coordinator "
+                      "(this epoch {}) — not retried", topicId, partition, producerId, coordinatorEpoch);
+        (void)dropRetry_(it->second, topicId, partition);
+        return;
+    }
     // Every other refusal (NotLeader, MinIsrViolation, Internal, StorageError, ...) is retried: the
     // marker is NOT in the log, so the transaction must stay Prepare* (EndTxn deferred, the next
     // transaction refused ConcurrentTransactions) until a retry lands.

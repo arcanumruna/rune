@@ -44,4 +44,15 @@ inline constexpr int kUnparseable  = -1;
     return (t == kCommit || t == kAbort) ? t : kUnparseable;
 }
 
+/// coordinatorEpoch of a marker in the layout above (value bytes [70..73]), or
+/// -1 when `batch` is not that layout (D9 review MAJOR-2: the coordinator fence
+/// is rebuilt from the log's markers).
+inline constexpr std::size_t kCoordinatorEpochOffset = kValueLengthOffset + 3;   // after valueLength + int16 version
+[[nodiscard]] inline int32_t coordinatorEpoch(const uint8_t* batch, std::size_t len) noexcept {
+    if (controlType(batch, len) == kUnparseable) return -1;
+    const uint8_t* p = batch + kCoordinatorEpochOffset;
+    return static_cast<int32_t>(static_cast<uint32_t>(p[0]) | static_cast<uint32_t>(p[1]) << 8 |
+                                static_cast<uint32_t>(p[2]) << 16 | static_cast<uint32_t>(p[3]) << 24);
+}
+
 } // namespace rune::storage::control_marker

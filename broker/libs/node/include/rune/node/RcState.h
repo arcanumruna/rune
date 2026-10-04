@@ -59,6 +59,7 @@
 // Owner (worker) thread only.  No locks, no atomics, no virtual calls; the hot
 // paths (onTxnBatch, lso, isAborted, ready) never allocate once reserve()d.
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/ControlMarkerLayout.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
@@ -510,7 +511,7 @@ private:
                 const auto out = builder.step(p + pos, len);
                 if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                     haltInvariant_("RcBuilder refused a whole batch inside the log's written bytes");
-                if (psm_ != nullptr) feedProducerState_(r, out.outcome);
+                if (psm_ != nullptr) feedProducerState_(r, out.outcome, p + pos, len);
                 s.cursor = last + 1;
             }
             pos += len;
@@ -523,12 +524,15 @@ private:
     // (no sequence); an idempotent / transactional data batch records its
     // sequence range (an epoch older than an applied fence is ignored by the
     // PSM).  A CONTROL-flagged batch that is not a valid marker is ignored.
-    void feedProducerState_(const rune::protocol::RecordBatchReader& r, rune::transaction::RcBuilder::Outcome o) {
+    void feedProducerState_(const rune::protocol::RecordBatchReader& r, rune::transaction::RcBuilder::Outcome o,
+                            const uint8_t* bytes, std::size_t len) {
         using O = rune::transaction::RcBuilder::Outcome;
         const int64_t pid = r.producerId();
         if (pid < 0) return;
         if (o == O::CommitMarker || o == O::AbortMarker) {
-            psm_->fenceEpoch(psmTopic_, pid, psmPartition_, r.producerEpoch());
+            // D9 MAJOR-2: the marker's coordinatorEpoch restores the coordinator fence.
+            psm_->fenceEpoch(psmTopic_, pid, psmPartition_, r.producerEpoch(), /*fromRebuild=*/false,
+                             rune::storage::control_marker::coordinatorEpoch(bytes, len));
             return;
         }
         if ((r.attributes() & rune::protocol::batch::kAttrControl) != 0) return;

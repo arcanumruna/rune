@@ -100,6 +100,15 @@
 
 namespace rune::transaction {
 
+/// D9 review MAJOR-2 (Kafka TRANSACTION_COORDINATOR_FENCED): a COMMIT/ABORT
+/// marker whose coordinatorEpoch is LOWER than the last marker applied for that
+/// producer on that partition comes from a deposed coordinator — refused,
+/// nothing appended.  Non-retriable for the coordinator.  Carried on the
+/// marker-reply paths only (worker → runtime → cluster plane → TCS), never to a
+/// client; the value is the client protocol's NotCoordinator (14) so it needs
+/// no protocol change (static_assert'ed in Worker.h).
+inline constexpr int16_t kMarkerCoordinatorFencedError = 14;
+
 // ---------------------------------------------------------------------------
 // ControlMarkerPayload — the decoded contents of an end-txn-marker record.
 // ---------------------------------------------------------------------------
