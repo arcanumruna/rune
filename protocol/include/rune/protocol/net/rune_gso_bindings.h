@@ -46,6 +46,11 @@ int rune_gso_bindings_install(aeron_driver_context_t *ctx, rune_gso_bindings_t *
  * stopped): the per-transport counters are written by the sender/receiver agents without synchronisation. */
 void rune_gso_bindings_totals(const rune_gso_bindings_t *b, rune_gso_totals_t *out);
 
+/* A8: recvmmsg calls (any transport of these bindings) that filled every slot — i.e. more datagrams may be queued.
+ * Counted only when ONE agent thread drives every transport (threading mode INVOKER or SHARED at install); read it
+ * on that thread.  -1 = not counted (NULL bindings, other threading modes, non-Linux). */
+int64_t rune_gso_bindings_rx_full(const rune_gso_bindings_t *b);
+
 void rune_gso_bindings_delete(rune_gso_bindings_t *b);
 
 /* TEST SEAM — call before aeron_driver_start: the next `count` GSO sendmsg attempts fail with errno `err`. */
