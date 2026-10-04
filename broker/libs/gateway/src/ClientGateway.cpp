@@ -3853,6 +3853,17 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
             if (e.answered) answerRemoteOrigin_(m, e.errorCode, e.offset);
             return;
         }
+        if (w.coordinatorEpoch < e.coordinatorEpoch) {
+            // Re-review 2 MEDIUM-1: a NEWER coordinator load's marker was already
+            // taken here (even if refused transiently and never applied, so the
+            // PSM fence did not rise) — this copy comes from a deposed load.
+            // Coordinator epochs per producer are monotone: fenced, never appended.
+            spdlog::warn("ClientGateway: remote marker from node {} at coordinator epoch {} for topic={} "
+                         "partition={} producerId={} FENCED (epoch {} already taken here)", w.coordinatorNodeId,
+                         w.coordinatorEpoch, w.topicId, w.partition, m.producerId, e.coordinatorEpoch);
+            answerRemoteOrigin_(m, rune::transaction::kMarkerCoordinatorFencedError, -1);
+            return;
+        }
         if (sameLoad && w.token < e.token) {
             spdlog::info("ClientGateway: stale copy of remote marker token={} from node {} (topic={} partition={} "
                          "producerId={}; newer token {} applied) — not appended", w.token, w.coordinatorNodeId,
@@ -3876,6 +3887,23 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
     const int64_t base = appendControlRecordInline_(w.topicId, w.partition, w.marker, log);
     if (base >= 0) notifyControlMarker(w.topicId, w.partition, w.producerId, base, w.commit != 0);
     answerRemoteOrigin_(m, base >= 0 ? int16_t{0} : static_cast<int16_t>(pcl::ErrorCode::NotLeader), base);
+}
+
+void ClientGateway::onProducerExpired(int64_t producerId)
+{
+    std::erase_if(lastRemoteMarker_, [producerId](const auto& kv) { return kv.first.producerId == producerId; });
+}
+
+void ClientGateway::pruneRemoteMarkerIndex_()
+{
+    // Re-review 2 MEDIUM-2: a partition demoted (the bridge routed BecomeFollower,
+    // queued on the worker op ring AHEAD of any later copy, so that copy meets the
+    // follower role gate) or removed on this node needs no idempotence entries —
+    // a copy arriving after a re-promotion carries an older target leader epoch.
+    std::erase_if(lastRemoteMarker_, [this](const auto& kv) {
+        const auto h = replicaRegistry_->lookupHandle(kv.first.topicId, kv.first.partition);
+        return !h || h.intendedRole == rune::node::ReplicaRegistry::IntendedRole::Follower;
+    });
 }
 
 void ClientGateway::answerRemoteOrigin_(const MarkerInFlight& m, int16_t errorCode, int64_t offset)
@@ -3922,6 +3950,11 @@ int ClientGateway::pumpTxnMarkers_()
     }
     if (!markerSendQueue_.empty()) work += pumpMarkerQueue_();   // worker-bound and D9 remote markers
     if (!pendingMarkerResponses_.empty()) [[unlikely]] work += pumpMarkerResponses_();
+    if (replicaRegistry_ != nullptr && !lastRemoteMarker_.empty() &&
+        replicaRegistry_->roleChanges() != seenRegistryRoleChanges_) [[unlikely]] {
+        seenRegistryRoleChanges_ = replicaRegistry_->roleChanges();
+        pruneRemoteMarkerIndex_();
+    }
     if (resendAllRemoteMarkers_ || !reconnectedPeers_.empty()) [[unlikely]] work += resendRemoteMarkers_();
     if (!markerSendQueue_.empty()) work += pumpMarkerQueue_();   // re-sends the ring refused
     return work;

@@ -105,8 +105,14 @@ public:
     void setIntendedRole(int32_t topicId, int32_t partition, uint32_t incarnation,
                          IntendedRole role) noexcept {
         auto it = map_.find(Key{topicId, partition});
-        if (it != map_.end() && it->second.inc == incarnation) it->second.intended = role;
+        if (it != map_.end() && it->second.inc == incarnation && it->second.intended != role) {
+            it->second.intended = role;
+            ++roleChanges_;
+        }
     }
+    /// D9 re-review 2 MEDIUM-2: bumped on every routed role change and every
+    /// removal — the gateway prunes per-partition state on a change (no timer).
+    [[nodiscard]] uint64_t roleChanges() const noexcept { return roleChanges_; }
     /// The live replica for (topicId, partition) iff it is still `incarnation`.
     [[nodiscard]] rune::replication::PartitionReplica*
     resolve(int32_t topicId, int32_t partition, uint32_t incarnation) const noexcept {
@@ -195,6 +201,7 @@ public:
         // applies the SetOwnership for this generation.  Retired here, freed by
         // collectRetired() once every worker acked an ownership gen >= this one.
         ++generation_;
+        ++roleChanges_;
         retired_.push_back(Retired{generation_, std::move(it->second.replica), it->second.id,
                                    it->second.inc});
         map_.erase(it);
@@ -293,6 +300,7 @@ private:
     bool                  wrapped_         = false;
     IncarnationInUseFn    inUseFn_         = nullptr;
     const void*           inUseCtx_        = nullptr;
+    uint64_t roleChanges_ = 0;   ///< D9: role-change / removal counter (control thread)
 };
 
 } // namespace rune::node

@@ -725,6 +725,11 @@ public:
     [[nodiscard]] int64_t lastMarkerTokenForTest() const noexcept { return nextMarkerToken_ - 1; }
     /// Test-only: doWork's marker step at `nowNs` (test gateways have no Aeron to poll).
     int pumpTxnMarkersForTest(int64_t nowNs) { nowNs_ = nowNs; return pumpTxnMarkers_(); }
+    [[nodiscard]] std::size_t remoteMarkerIndexSizeForTest() const noexcept { return lastRemoteMarker_.size(); }
+    /// Re-review 2 MEDIUM-2: a producer expired on this node — forget its
+    /// remote-marker idempotence entries (it can have no open transaction left
+    /// for a stale copy to close).  Control thread.  Cold.
+    void onProducerExpired(int64_t producerId);
     /// Test-only: remote markers that came back LANDED (re-review LOW-1).
     [[nodiscard]] uint64_t remoteMarkersLandedForTest() const noexcept { return remoteMarkersLanded_; }
     [[nodiscard]] std::size_t remoteMarkersInFlightForTest() const noexcept {
@@ -1692,6 +1697,8 @@ private:
         bool answered = false; int16_t errorCode = 0; int64_t offset = -1;
     };
     std::unordered_map<RemoteMarkerKey, LastRemoteMarker, RemoteMarkerKeyHash> lastRemoteMarker_;
+    uint64_t seenRegistryRoleChanges_ = 0;
+    void pruneRemoteMarkerIndex_();
     bool routingChangedForMarkers_ = false;      ///< D9: leader-change check due (LOW-7)
     bool resendAllRemoteMarkers_   = false;      ///< D9 MAJOR-1: re-send every remote marker
     std::vector<int32_t> reconnectedPeers_;      ///< D9 MAJOR-1: re-send markers to these peers
