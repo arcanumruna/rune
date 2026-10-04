@@ -437,6 +437,34 @@ TEST(DynamicBalancerRegression, NeverElectsOutsideCommittedIsrEvenWithCaughtUpPo
     EXPECT_EQ(recs2[0].rec.leaderNode, 0);
 }
 
+// A preferred-leader election only moves leadership: the committed ISR must be
+// carried over unchanged.  Before: the record carried an EMPTY ISR (mergeChange
+// applies newIsr literally) — the new leader started with an empty committed
+// ISR, every AlterIsr it sent lacked itself (refused) and acks=all never
+// committed (ShardModeRegression.AdvertisedIngressRoutesAreLive… hang).
+TEST(DynamicBalancerRegression, PreferredElectionKeepsTheCommittedIsr) {
+    AssignmentMap m;
+    for (int p = 0; p < 2; ++p) {
+        PartitionAssignment a;
+        a.leaderNode     = 1;               // node 1 leads both; node 0 is preferred for p0
+        a.isr            = {1, 0, 2};
+        a.replicas       = {p == 0 ? 0 : 1, p == 0 ? 1 : 2, p == 0 ? 2 : 0};
+        a.leaderEpoch    = 3;
+        a.partitionEpoch = 4;
+        m.put(7, p, a);
+    }
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {0, 1, 2};
+    in.topics = { TopicSpec{7, 2, 3, "", ""} };
+    auto recs = bal.rebalance(in);
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].rec.leaderNode, 0);
+    ASSERT_EQ(recs[0].isr.size(), 3u) << "a preferred election emptied / changed the committed ISR";
+    for (int32_t n : {0, 1, 2})
+        EXPECT_NE(std::find(recs[0].isr.begin(), recs[0].isr.end(), n), recs[0].isr.end());
+}
+
 // Position-proven survivor election (no committed-ISR member live): the
 // pigeonhole gate must count only live replicas that REPORTED a position — an
 // unreported live replica may be the only holder of the committed records, and

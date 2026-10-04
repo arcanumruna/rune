@@ -492,8 +492,15 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     chg.newReplicas = {};  // replica set unchanged
                 } else {
                     // Preferred-leader: the elected leader is in every member's
-                    // committed ISR (checked above) → ISR unchanged.
-                    chg.newIsr = {};
+                    // committed ISR (checked above) → the ISR is carried over
+                    // unchanged (leader first).  NB mergeChange applies newIsr
+                    // literally — an empty one would EMPTY the committed ISR.
+                    std::vector<int32_t> newIsr;
+                    newIsr.reserve(cur->isr.size());
+                    newIsr.push_back(computedLeader);
+                    for (int32_t node : cur->isr)
+                        if (node != computedLeader) newIsr.push_back(node);
+                    chg.newIsr = std::move(newIsr);
                     chg.newReplicas = {};
                 }
 

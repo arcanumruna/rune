@@ -254,8 +254,10 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     // (our AlterIsr proposal, or its own change).  Only the ISR changes; nothing
     // else of this leadership — follower slots / push state, HW floors, the
     // epoch cache — is reset.
+    // A leader is always a member of its own ISR (defensive: a controller
+    // record must never hand a leader an ISR without itself).
+    if (std::find(isr.begin(), isr.end(), cfg_.selfId) == isr.end()) isr.push_back(cfg_.selfId);
     if (role_ == Role::Leader && newEpoch == epoch_ && isrManager_ != nullptr) {
-        if (std::find(isr.begin(), isr.end(), cfg_.selfId) == isr.end()) isr.push_back(cfg_.selfId);
         applyCommittedIsr_(std::move(isr));
         publishCleanerState();
         return;
