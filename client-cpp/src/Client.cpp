@@ -219,6 +219,14 @@ Client::Client(ClientConfig cfg)
     // command ring.
     subscriberHub_.setDirectSend(&Client::directSendTrampoline_, this);
     groupConsumerHub_.setDirectSend(&Client::directSendTrampoline_, this);
+    {
+        group::GroupConsumerHub::FetchRouter fr;
+        fr.ctx           = this;
+        fr.leaderSession = &Client::fetchLeaderTrampoline_;
+        fr.sessionId     = &Client::fetchSessionIdTrampoline_;
+        fr.offer         = &Client::fetchOfferTrampoline_;
+        groupConsumerHub_.setFetchRouter(fr);
+    }
 
     // MD1 Task 10: Wire the MetadataResponse hook so the cache is populated
     // on the duty-cycle thread without any extra lock.
@@ -1769,6 +1777,11 @@ void Client::sweepTimeouts(int64_t nowNs) {
             return agent_.submitSend(fb, fl);
         };
         groupConsumerHub_.doWork(wallNs, snap.sessionId, sendFn);
+        // Backstop for the event-driven fetch routing: refused partitions retry,
+        // transiently refused Subscribes are re-offered, silently moved routes
+        // (a produce redirect) are followed.
+        groupConsumerHub_.unparkFetch();
+        (void)groupConsumerHub_.reconcileFetch();
         // F8c C4: commitSync deadlines on the duty clock -> Timeout.
         (void)groupConsumerHub_.sweepCommitSyncTimeouts(nowNs);
     }
@@ -1873,13 +1886,23 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     });
             }
 
-            // CG-5: Trigger group consumers to send JoinGroup on connect.
+            // CG-5: Trigger group consumers to send JoinGroup on connect — only
+            // when the SEED (the coordinator's session) connected: a leader
+            // node's session (opened for produce / group fetch routing) must
+            // not send a JoinGroup stamped with its own id (the ring drops it
+            // as stale and the member would sit in Joining until the deadline).
             if (!groupConsumerHub_.empty()) {
                 const group::SendFn gcSendFn =
                     [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
                     };
-                groupConsumerHub_.onConnected(opt->assignedSessionId, gcSendFn);
+                if (agent::ClientAgent::isSeedConnectCorrId(opt->correlationId)) {
+                    groupConsumerHub_.onConnected(opt->assignedSessionId, gcSendFn);
+                }
+                // A (leader or seed) session (re)connected: partitions waiting
+                // for it — or whose subscription died with its old session —
+                // subscribe now.
+                (void)groupConsumerHub_.reconcileFetch();
             }
 
             // MD1 Task 10: on each successful connect, request a full metadata
@@ -1915,6 +1938,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
         namespace rpc = rune::protocol::client;
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->code));
+
+        // A group member's per-partition Subscribe refused by a non-leader:
+        // re-route THAT partition (never a seed-level redirect — the seed
+        // session is the group coordinator's).
+        if ((ec == rpc::ErrorCode::Redirect || ec == rpc::ErrorCode::NotLeader) &&
+            group::GroupConsumerHub::isFetchCorrId(opt->correlationId)) {
+            onGroupFetchRefused_(opt->correlationId, ec == rpc::ErrorCode::Redirect, opt->message);
+            break;
+        }
 
         // CB-5 B: Redirect handling for pending data ops (Produce/Subscribe).
         // When a follower returns ErrorResponse{Redirect, leaderClientEndpoint}
@@ -2226,6 +2258,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
     case codec::TemplateId::SubscribeResponse: {
         auto opt = codec::decodeSubscribeResponse(buf, len);
         if (!opt) break;
+        // A group member's per-partition Subscribe (tagged correlationId).
+        if (groupConsumerHub_.onFetchSubscribeResponse(opt->correlationId, opt->errorCode,
+                                                       opt->subscriptionId)) {
+            break;
+        }
         // CB-5 A2: pass a sendFn so SubscriberHub can emit a late Unsubscribe
         // if the app called unsubscribe() before the response arrived.
         {
@@ -3167,6 +3204,58 @@ detail::SendResult Client::directSendTrampoline_(void* ctx, const uint8_t* buf, 
     return detail::SendResult::Fatal;
 }
 
+uint32_t Client::fetchLeaderTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {
+    return static_cast<Client*>(ctx)->agent_.leaderSessionIndex(topicId, partition);
+}
+
+int64_t Client::fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept {
+    return static_cast<Client*>(ctx)->agent_.connectedSessionId(session);
+}
+
+detail::SendResult Client::fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
+                                                 std::size_t len) noexcept {
+    using R = transport::AeronTransport::OfferResult;
+    switch (static_cast<Client*>(ctx)->agent_.offerOnSession(session, buf, len)) {
+    case R::Accepted: return detail::SendResult::Accepted;
+    case R::Retry:    return detail::SendResult::Retry;
+    case R::Fatal:    break;
+    }
+    return detail::SendResult::Fatal;
+}
+
+void Client::onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_view endpoint) noexcept {
+    int32_t topicId = -1, partition = -1;
+    // A bare NotLeader parks the partition until fresh metadata names the
+    // leader (asked for below); a Redirect follows its endpoint at once.
+    if (!groupConsumerHub_.onFetchSubscribeRefused(corrId, /*park=*/!redirect || endpoint.empty(),
+                                                   topicId, partition)) {
+        return;  // stale (re-routed / revoked since): nothing to follow
+    }
+    if (redirect && !endpoint.empty()) {
+        try {
+            const std::string newEndpoint(endpoint);
+            // As a produce Redirect (CB-5 B / MD1 IMPORTANT-1): the cache learns
+            // the leader provisionally (a lagging answer cannot undo it) and the
+            // partition's route follows it — only this partition, never the seed
+            // (= the group coordinator) session.
+            std::string cacheEp = newEndpoint;
+            if (const auto at = cacheEp.find("endpoint="); at != std::string::npos) cacheEp = cacheEp.substr(at + 9u);
+            const int32_t node = metadataCache_.nodeIdForEndpoint(cacheEp);
+            if (node != metadata::MetadataCache::kNoLeader) {
+                const int32_t cur = metadataCache_.epochFor(topicId, partition);
+                metadataCache_.updatePartitionLeaderProvisional(topicId, partition, node, cur >= 0 ? cur + 1 : 0,
+                                                                nextCorrId_);
+            }
+            const std::string ch = toChannel(newEndpoint);
+            if (agent_.setRoute(topicId, partition, ch, ch)) producerHub_.noteRouteChanged(topicId, partition);
+        } catch (...) {
+            // Allocation failure on this cold path: the metadata refresh below re-routes.
+        }
+    }
+    requestMetadataNow_();
+    (void)groupConsumerHub_.reconcileFetch();
+}
+
 void Client::applyHubCommand_(const detail::HubCommand& cmd) {
     syncSeedSession_();  // fix4 I-1: the hubs act on the session's CURRENT state
     using Op = detail::HubCommand::Op;
@@ -3596,6 +3685,13 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         scheduleMetadataRefresh();
     } else {
         metadataBackoffNs_ = kMetadataBackoffInitNs;
+    }
+
+    // A fresh cluster view: group members follow their partitions' leaders
+    // (a leader change re-subscribes on the new leader from the position).
+    if (!groupConsumerHub_.empty()) {
+        groupConsumerHub_.unparkFetch();
+        (void)groupConsumerHub_.reconcileFetch();
     }
 
     // F14: a fresh cluster view — txn requests waiting for the coordinator to

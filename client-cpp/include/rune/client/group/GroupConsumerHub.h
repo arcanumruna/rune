@@ -201,6 +201,66 @@ public:
     /// True if there are no registered consumers (duty thread).
     [[nodiscard]] bool empty() const noexcept { return impls_.empty(); }
 
+    // ---- Fetch routing (distributed partition leadership) --------------------
+    //
+    // A broker answers a Subscribe for a partition it does not lead with
+    // ErrorResponse{Redirect | NotLeader} and registers nothing.  So each
+    // assigned partition's Subscribe goes to the partition's LEADER session
+    // (stamped with that session's id), and converges on Redirect / NotLeader /
+    // a leader change / a session change: reconcileFetch() compares every
+    // assigned partition's subscription with where its leader is now and moves
+    // it (Unsubscribe on the old node, Subscribe on the new one from the
+    // member's position).  The group protocol itself (Join / Sync / Heartbeat /
+    // OffsetCommit / OffsetFetch / LeaveGroup) stays on the seed session = the
+    // coordinator's.  Records arrive on the shared egress and are matched by
+    // (topicId, partition) in onRecords(), whichever node pushed them.
+    //
+    // Without a router (hub-level tests) the historical single-session path is
+    // used: every Subscribe goes through the SendFn with correlationId 0.
+
+    /// How a Subscribe reaches a partition's leader (plain function pointers +
+    /// context, wired once before start by the Client to its ClientAgent).
+    struct FetchRouter {
+        void* ctx = nullptr;
+        /// Session index leading (topicId, partition) now (0 = the seed); may
+        /// lazily open that node's session.
+        uint32_t (*leaderSession)(void* ctx, int32_t topicId, int32_t partition) = nullptr;
+        /// That session's id while Connected, else 0.
+        int64_t (*sessionId)(void* ctx, uint32_t session) = nullptr;
+        /// Offer a control frame on that session's node ingress.
+        detail::SendResult (*offer)(void* ctx, uint32_t session, const uint8_t* buf, std::size_t len) = nullptr;
+    };
+    void setFetchRouter(const FetchRouter& r) noexcept { router_ = r; }
+
+    /// Group fetch Subscribes carry correlationIds tagged with bit 61 (bit 62
+    /// clear) — disjoint from producer batch ids (bit 62), connect ids
+    /// (session * 1e12) and the Client's counter.
+    static constexpr int64_t kFetchCorrTag = int64_t{1} << 61;
+    [[nodiscard]] static constexpr bool isFetchCorrId(int64_t c) noexcept {
+        return (c & (int64_t{3} << 61)) == kFetchCorrTag;
+    }
+    /// Consecutive Redirects of one partition (no bind in between) after which
+    /// it is parked until fresh metadata / the next sweep (no ping-pong storm).
+    static constexpr uint8_t kMaxFetchRedirects = 8;
+
+    /// Bring every Stable consumer's subscriptions in line with the current
+    /// leaders and sessions (cold: group / routing events + the sweep).
+    /// Returns the Subscribe frames sent.
+    int reconcileFetch();
+    /// Fresh metadata / the periodic sweep: refused partitions may retry.
+    void unparkFetch() noexcept;
+    /// A SubscribeResponse whose correlationId isFetchCorrId(): binds it (an
+    /// error parks the partition).  False when not a group fetch Subscribe.
+    bool onFetchSubscribeResponse(int64_t corrId, int16_t errorCode, int64_t subscriptionId);
+    /// An ErrorResponse{Redirect | NotLeader} to a group fetch Subscribe: the
+    /// partition is unsubscribed locally (parked when `park` or after
+    /// kMaxFetchRedirects).  True + its (topicId, partition) when it is a live
+    /// one — the caller re-routes it and calls reconcileFetch().
+    bool onFetchSubscribeRefused(int64_t corrId, bool park, int32_t& topicId, int32_t& partition);
+    /// Test/observer: Subscribes abandoned before their answer, awaiting it to
+    /// be unsubscribed.
+    [[nodiscard]] std::size_t lateFetchUnsubscribes() const noexcept { return late_.size(); }
+
     /// fix1 C1: onAssigned/onRevoked/onRecords run inside the noexcept
     /// ClientAgent::doWork chain (or, for closeAll's final onRevoked, inside
     /// Client::closeImpl_); a throwing callback is caught, counted here, and
@@ -244,6 +304,24 @@ private:
     // F8a fix2.
     DirectSendFn directSend_    = nullptr;
     void*        directSendCtx_ = nullptr;
+
+    // Fetch routing (see FetchRouter).
+    FetchRouter router_{};
+    int64_t     nextFetchCorr_ = 1;
+    struct LateUnsub {  // a leader-node Subscribe dropped before its answer
+        int64_t  corrId;
+        uint32_t session;
+        int64_t  sessionId;
+    };
+    std::vector<LateUnsub> late_;
+    [[nodiscard]] bool routed_() const noexcept { return router_.offer != nullptr; }
+    int  reconcileImpl_(GroupConsumerImpl& impl);
+    /// Forget fs's subscription: a live leader-node one is unsubscribed (an
+    /// unanswered one once its answer arrives).  Seed-session ones are the
+    /// coordinator's group subscriptions — the broker owns their lifecycle.
+    void dropFetch_(GroupConsumerImpl::FetchSub& fs);
+    void dropAllFetch_(GroupConsumerImpl& impl);
+    void sendFetchUnsubscribe_(uint32_t session, int64_t sessionId, int64_t subscriptionId);
 
     /// RAII: marks impl as "callback running"; on exit, if the callback
     /// finished the consumer, closes its status ring (now that no callback runs).

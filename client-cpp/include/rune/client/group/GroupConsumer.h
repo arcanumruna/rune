@@ -178,6 +178,24 @@ struct GroupConsumerImpl {
     static constexpr int64_t kUnseededSentinel = -1;
     std::map<TopicPartition, int64_t>   assignment;   // topicPartition → nextOffset (or sentinel)
 
+    // Fetch routing (distributed partition leadership; duty thread only).  One
+    // entry per assigned partition: the Subscribe that makes the partition's
+    // LEADER node push its records here.  On the seed session (the coordinator
+    // leads it) the Subscribe is the isolation carrier of the coordinator's own
+    // group subscription; on another node's session it is a plain subscription
+    // starting at the member's position.  Cold path: changed only by group /
+    // routing events, never per record.
+    struct FetchSub {
+        uint32_t session        = 0;      // agent session index it was sent on (0 = the seed)
+        int64_t  sessionId      = 0;      // that session's id when sent; 0 = no subscription (wanted)
+        int64_t  corrId         = 0;      // its Subscribe correlationId while unanswered
+        int64_t  subscriptionId = 0;      // bound by the SubscribeResponse
+        bool     offsetKnown    = false;  // OffsetFetch answered for it this generation
+        bool     parked         = false;  // refused: retried on fresh metadata / the sweep
+        uint8_t  redirects      = 0;      // consecutive Redirects without a bind
+    };
+    std::map<TopicPartition, FetchSub> fetch;
+
     // ---- Timers (duty thread) -------------------------------------------------
     std::chrono::steady_clock::time_point nextHeartbeat;
     std::chrono::steady_clock::time_point nextAutoCommit;

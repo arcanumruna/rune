@@ -886,6 +886,15 @@ private:
     [[nodiscard]] std::exception_ptr submitError_(const char* what, std::size_t frameLen) const;
     /// F8a fix2: duty-thread direct send on the default ingress publication.
     static detail::SendResult directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
+    /// Group fetch routing (GroupConsumerHub::FetchRouter, ctx = this): a
+    /// member's per-partition Subscribe goes to the partition leader's session.
+    static uint32_t fetchLeaderTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
+    static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
+                                                    std::size_t len) noexcept;
+    /// A Redirect / NotLeader answered a group fetch Subscribe (corrId tagged
+    /// GroupConsumerHub::isFetchCorrId): re-route that partition, re-subscribe.
+    void onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_view endpoint) noexcept;
     /// T15b: the failure path (duty thread).  Latched once, when the Aeron
     /// client closed (or the seed session was Rejected, a terminal answer):
     /// every producer's intake is tail-closed and every accepted record
