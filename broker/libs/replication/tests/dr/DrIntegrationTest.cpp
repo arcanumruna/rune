@@ -1217,3 +1217,49 @@ TEST(DrIntegrationRegression, Critical2_InternalPartition_ConsensusFailoverUnder
     EXPECT_GT(c.acked().size(), 100u);
     expectAllConvergedAndAcked(c, "internal commit load");
 }
+
+// ---- Ports of the 0ff9322 review findings that run on the 0ff9322 harness ---
+// (RED there: CRITICAL-1 lost 5 acked records on every node; CRITICAL-2 froze —
+// the elected ISR member never completed.)
+// CRITICAL-1: majority-of-ISR HW + position-blind ISR election.  Node 3 misses
+// a round; the leader dies; the controller (which cannot reach node 2) elects
+// node 3 from the ISR.
+TEST(DrIntegrationRegression, Review0ff9322Port_Critical1_LaggingIsrMemberElected_NoAckedLossAndWritable) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cut(1, 3);
+    (void)c.produce(5);
+    c.run(3);
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    const NodeId nl = c.failover({2});
+    ASSERT_EQ(nl, 3);
+    c.applyMetadata(2);
+    ASSERT_TRUE(c.waitWritable(kCap)) << "the elected ISR member never became writable\n" << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "critical-1 (red port)");
+}
+
+// CRITICAL-2 shape: the leader dies while the surviving follower holds a tail
+// the new leader lacks; the new leader (in the ISR) must become writable.
+TEST(DrIntegrationRegression, Review0ff9322Port_Critical2_NewLeaderWithUncommittedTailOnSurvivor_Writable) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cut(1, 3);
+    (void)c.produce(5);
+    c.run(3);
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    ASSERT_TRUE(c.moveLeader(3));
+    ASSERT_TRUE(c.waitWritable(kCap)) << "the new leader froze\n" << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "critical-2 (red port)");
+}
