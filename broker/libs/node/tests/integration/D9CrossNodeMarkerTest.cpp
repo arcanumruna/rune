@@ -761,6 +761,80 @@ TEST(D9RemoteMarkerRegression, CopyOfAnOlderTokenOfTheSameCoordinatorIsNotAppend
     EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "a stale older-token copy closed T2";
 }
 
+// Re-review 2 MEDIUM-1: the NEW coordinator load's marker was TAKEN here but
+// transiently refused (min-ISR), so the PSM fence never rose; a late copy from
+// the DEPOSED load (lower coordinator epoch) must still be refused as fenced —
+// not appended after T2's data, where it would close T2.
+TEST(D9RemoteMarkerRegression, DeposedCoordinatorCopyIsFencedAfterTheNewLoadsMarkerWasRefused) {
+    GwRig R(/*self=*/2);
+    R.image(2, 5);
+    std::vector<uint8_t> k1, k2;
+    const auto a1 = R.remote(/*origin=*/1, (7LL << 32) | 40, 77, true, /*epoch=*/5, k1);
+    R.gw.appendRemoteControlRecord(a1);                       // T1 COMMIT from load epoch 5
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.ch.responses.size(), 1u);
+    ASSERT_EQ(R.ch.responses[0].second.errorCode, 0);
+    R.produceTxnData(77, 0, 52, 20);                          // T2 begins
+    const int64_t leo = R.r->log()->logEndOffset();
+    R.r->setMinIsrForTest(2);                                 // transient: the new load's marker is refused
+    R.gw.appendRemoteControlRecord(R.remote(/*origin=*/3, (9LL << 32) | 1, 77, false, /*epoch=*/6, k2));
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(30 + i);
+    ASSERT_EQ(R.ch.responses.size(), 2u);
+    ASSERT_NE(R.ch.responses[1].second.errorCode, 0) << "precondition: the epoch-6 marker was refused";
+    R.r->setMinIsrForTest(1);                                 // the condition clears
+    R.gw.appendRemoteControlRecord(a1);                       // the deposed load's late copy (epoch 5)
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(40 + i);
+    EXPECT_EQ(R.r->log()->logEndOffset(), leo) << "the deposed coordinator's copy was appended";
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "the deposed coordinator's copy closed T2";
+    ASSERT_EQ(R.ch.responses.size(), 3u);
+    EXPECT_EQ(R.ch.responses[2].first, 1);
+    EXPECT_EQ(R.ch.responses[2].second.errorCode, tx::kMarkerCoordinatorFencedError);
+}
+
+// Re-review 2 MEDIUM-2: the idempotence index is pruned without a timer —
+// (a) when the partition is demoted on this node (the bridge routes BecomeFollower),
+TEST(D9RemoteMarkerRegression, RemoteMarkerIndexIsPrunedWhenThePartitionIsDemoted) {
+    GwRig R(/*self=*/2);
+    R.image(2, 5);
+    std::vector<uint8_t> k;
+    R.gw.appendRemoteControlRecord(R.remote(1, (7LL << 32) | 50, 77, true, 5, k));
+    R.gw.appendRemoteControlRecord(R.remote(1, (7LL << 32) | 51, 78, true, 5, k));
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.gw.remoteMarkerIndexSizeForTest(), 2u);
+    (void)R.gw.pumpTxnMarkersForTest(20);
+    EXPECT_EQ(R.gw.remoteMarkerIndexSizeForTest(), 2u) << "pruned while still leading";
+    const auto h = R.reg.lookupHandle(0, 0);
+    R.reg.setIntendedRole(0, 0, h.incarnation, ReplicaRegistry::IntendedRole::Follower);   // demotion routed
+    (void)R.gw.pumpTxnMarkersForTest(30);
+    EXPECT_EQ(R.gw.remoteMarkerIndexSizeForTest(), 0u) << "the demoted partition's entries were kept";
+}
+
+// (b) when the partition is removed from this node,
+TEST(D9RemoteMarkerRegression, RemoteMarkerIndexIsPrunedWhenThePartitionIsRemoved) {
+    GwRig R(/*self=*/2);
+    R.image(2, 5);
+    std::vector<uint8_t> k;
+    R.gw.appendRemoteControlRecord(R.remote(1, (7LL << 32) | 52, 77, true, 5, k));
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.gw.remoteMarkerIndexSizeForTest(), 1u);
+    R.reg.remove(0, 0);
+    (void)R.gw.pumpTxnMarkersForTest(20);
+    EXPECT_EQ(R.gw.remoteMarkerIndexSizeForTest(), 0u) << "the removed partition's entries were kept";
+}
+
+// (c) when the producer expires (the producer-expiry hook).
+TEST(D9RemoteMarkerRegression, RemoteMarkerIndexIsPrunedWhenTheProducerExpires) {
+    GwRig R(/*self=*/2);
+    R.image(2, 5);
+    std::vector<uint8_t> k;
+    R.gw.appendRemoteControlRecord(R.remote(1, (7LL << 32) | 53, 77, true, 5, k));
+    R.gw.appendRemoteControlRecord(R.remote(1, (7LL << 32) | 54, 78, true, 5, k));
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.gw.remoteMarkerIndexSizeForTest(), 2u);
+    R.gw.onProducerExpired(77);
+    EXPECT_EQ(R.gw.remoteMarkerIndexSizeForTest(), 1u) << "the expired producer's entry was kept";
+}
+
 // Re-review NEW MEDIUM-3: the coordinator stamps the target leader epoch it
 // routed the marker under.
 TEST(D9RemoteMarkerRegression, RemoteMarkerCarriesTheTargetLeaderEpoch) {
@@ -1242,7 +1316,13 @@ TEST(D9CrossNodeMarkerIntegrationRegression, PlaneReportsPeerUpEdgeAndNewInbound
 // Waits are condition loops on owner-thread round trips (no sleeps).
 // ============================================================================
 namespace {
-NodeConfig d9NodeConfig(int nodeId, const fs::path& dataDir, const std::array<uint16_t, 9>& ports) {
+// Ports: [0..2] consensus, [3..5] client, [6..8] replication, and the per-worker
+// shard bases — [9..11] worker ingress, [12..14] worker replication, [15..17]
+// worker egress control (one worker).  All discovered: the DEFAULT runtime is
+// shard mode, whose DERIVED base ports are fixed (41000 / 41064 / 41128) and
+// collide across concurrently running test processes ("replication plane did
+// not resolve — Address already in use": the round-3 flake's root cause).
+NodeConfig d9NodeConfig(int nodeId, const fs::path& dataDir, const std::array<uint16_t, 18>& ports) {
     NodeConfig cfg;   // the DEFAULT runtime (placement / worker mode) — not pinned
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
@@ -1258,10 +1338,19 @@ NodeConfig d9NodeConfig(int nodeId, const fs::path& dataDir, const std::array<ui
         p.consensusPort   = ports[static_cast<std::size_t>(i)];
         p.clientPort      = ports[static_cast<std::size_t>(3 + i)];
         p.replicationPort = ports[static_cast<std::size_t>(6 + i)];
+        p.ingressBasePort       = ports[static_cast<std::size_t>(9 + i)];
+        p.replBasePort          = ports[static_cast<std::size_t>(12 + i)];
+        p.egressControlBasePort = ports[static_cast<std::size_t>(15 + i)];
+        p.workerCount           = 1;
         cfg.peers.push_back(p);
     }
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ports[static_cast<std::size_t>(3 + nodeId)]);
     cfg.clientEndpoint.streamId = 83;
+    cfg.workerCount                 = 1;
+    cfg.workerIngressBasePort       = ports[static_cast<std::size_t>(9 + nodeId)];
+    cfg.workerReplBasePort          = ports[static_cast<std::size_t>(12 + nodeId)];
+    cfg.workerEgressControlHost     = "127.0.0.1";
+    cfg.workerEgressControlBasePort = ports[static_cast<std::size_t>(15 + nodeId)];
     TopicSpec topic;
     topic.name = "d9"; topic.partitionCount = 3; topic.topicId = 0;
     cfg.topics.push_back(topic);
@@ -1271,7 +1360,7 @@ NodeConfig d9NodeConfig(int nodeId, const fs::path& dataDir, const std::array<ui
 
 TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughTheRealNodeWiring) {
     TmpDir root;
-    std::array<uint16_t, 9> ports{};
+    std::array<uint16_t, 18> ports{};
     for (std::size_t i = 0; i < ports.size(); ++i) {
         for (;;) {
             const uint16_t p = rune::aeronutil::testing::allocFreeUdpPort();
@@ -1283,14 +1372,14 @@ TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughThe
     for (int i = 0; i < 3; ++i)
         nodes.push_back(std::make_unique<BrokerNode>(d9NodeConfig(i, root.path / ("n" + std::to_string(i)), ports)));
     for (auto& n : nodes) n->start();
-    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(std::chrono::seconds{30}));
+    // Progress-driven waits (round-3 ruling): no test-side wall-clock bound —
+    // each wait loops on observed progress; the ctest timeout is the bound.
+    for (auto& n : nodes) while (!n->awaitLeader(std::chrono::seconds{5})) {}
 
-    using Clock = std::chrono::steady_clock;
-    const auto deadline = Clock::now() + std::chrono::seconds{60};
     // Find (coordinator c, partition p, leader L != c) from c's own routing image,
     // with L's replica of p Leader there.
     int coord = -1, part = -1, leader = -1;
-    while (coord < 0 && Clock::now() < deadline) {
+    while (coord < 0) {
         for (int c = 0; c < 3 && coord < 0; ++c) {
             const auto found = nodes[static_cast<std::size_t>(c)]->onControlThreadForTest([&, c] {
                 std::pair<int, int> r{-1, -1};
@@ -1322,13 +1411,13 @@ TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughThe
         << "the marker was not forwarded to the remote leader";
 
     bool landed = false;
-    while (!landed && Clock::now() < deadline) {
+    while (!landed) {
         landed = L.onOwnerThreadForTest(0, part, [](PartitionReplica& r) { return controlBatchCount(*r.log()) == 1; });
         std::this_thread::yield();
     }
     ASSERT_TRUE(landed) << "the marker never landed on the remote leader through the node wiring";
     std::size_t inFlight = 1;
-    while (inFlight != 0 && Clock::now() < deadline) {
+    while (inFlight != 0) {
         inFlight = C.onControlThreadForTest([&] { return C.gatewayForTest()->remoteMarkersInFlightForTest(); });
         std::this_thread::yield();
     }
@@ -1379,7 +1468,9 @@ TEST(D9CrossNodeMarkerIntegrationRegression, IdleOneWayOutageIsReportedWhenTheLi
     b.reset();                                                // node 2's receiving side is gone (node 1 idle)
     ASSERT_TRUE(until([&] { return !a.peerLinkUpForTest(2); }, [&] { (void)a.poll(++now); }))
         << "precondition: node 1 observes the link down without sending anything";
-    EXPECT_FALSE(a.peerDownForTest(2)) << "precondition: the hold router never saw it (no offer)";
+    // No offer was made; the per-peer link edge alone tells the hold router
+    // (re-review 2 LOW-2: frames held for a gone peer are dropped at once).
+    EXPECT_TRUE(a.peerDownForTest(2)) << "the link-down edge did not reach the hold router";
     ev.peers.clear();
     b = std::make_unique<rune::replication::AeronPartitionTransport>(client, chan(p2), kStream, 2, kRingBytes);
     ASSERT_TRUE(until([&] { return std::find(ev.peers.begin(), ev.peers.end(), 2) != ev.peers.end(); },
