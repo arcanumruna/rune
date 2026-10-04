@@ -12,6 +12,7 @@
 
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/BatchPrefix.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/replication/DiagFlags.h>
 
 #include <limits>
@@ -25,6 +26,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -326,6 +328,14 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     isrProposal_     = IsrProposal{};
     committedPartitionEpoch_ = partitionEpoch;
     expandBackoffUntilNs_    = 0;
+    // MAJOR-2/3 (internal quorum mode): the ISR handed in (every replica) is
+    // only the HW-counting SEED of this leadership — it is never published as
+    // eligible; the first published ISR names only members validated at
+    // >= max(HW, electionLeo_) (see updateIsr_).
+    internalSeedPending_ = internalQuorum_();
+    internalIsrVersion_  = 0;
+    internalIsrAcks_     = 0;
+    internalFencedMask_  = 0;
 
     // Kafka makeLeader: the new epoch starts at our LEO; every batch we append
     // from now on carries it (Log restamp for the produce path; the replica's
@@ -829,13 +839,15 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         if (slot != nullptr && !slot->unclean &&
             (prevAckedLeo > req.fetchOffset || incarnationChanged || committedMember)) {
             slot->unclean = true;   // kept out of the ISR until caught up
-            spdlog::warn("PartitionReplica[node={} topic={} part={}]: follower {} fetched at {} "
-                         "below the HW {} (previous position {}, restarted={}, ISR member={}) — "
-                         "it lost committed records (unclean restart): removed from the ISR "
-                         "until caught up", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
-                         req.followerId, req.fetchOffset, prevHwOnFetch, prevAckedLeo,
-                         incarnationChanged, committedMember);
-            updateIsr_(nowNs);
+            if (isrManager_->inIsr(req.followerId)) {   // it was counted: it lost committed records
+                spdlog::warn("PartitionReplica[node={} topic={} part={}]: ISR member {} fetched at "
+                             "{} below the HW {} (previous position {}, restarted={}) — it lost "
+                             "committed records (unclean restart): removed from the ISR until "
+                             "caught up", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
+                             req.followerId, req.fetchOffset, prevHwOnFetch, prevAckedLeo,
+                             incarnationChanged);
+                updateIsr_(nowNs);
+            }
         }
     } else if (slot != nullptr && slot->unclean) {
         slot->unclean = false;   // caught up again (validated): may re-enter via expansion
@@ -1954,6 +1966,23 @@ void PartitionReplica::applyMaximalIsr_()
 void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t nowNs)
 {
     if (role_ != Role::Leader || isrManager_ == nullptr || live.empty()) return;
+    if (internalQuorum_()) {
+        // Internal quorum mode: the dead are FENCED (decided out of the next
+        // proposal, never published as members) until the cluster sees them
+        // live again; they re-enter through the normal validated expansion.
+        uint32_t mask = 0;
+        for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
+            FollowerSlot& sl = followerSlots_.at(i);
+            if (sl.id == cfg_.selfId || std::find(live.begin(), live.end(), sl.id) != live.end()) continue;
+            mask |= (1u << i);
+            sl.validated = false;   // must prove a validated position again to re-enter
+        }
+        if (mask != internalFencedMask_) {
+            internalFencedMask_ = mask;
+            (void)updateIsr_(nowNs);
+        }
+        return;
+    }
     bool anyDead = false;
     for (NodeId id : committedIsr_)
         if (id != cfg_.selfId && std::find(live.begin(), live.end(), id) == live.end()) anyDead = true;
@@ -1973,11 +2002,14 @@ void PartitionReplica::shrinkIsrToLive(std::span<const int32_t> live, int64_t no
 bool PartitionReplica::updateIsr_(int64_t nowNs)
 {
     if (role_ != Role::Leader || isrManager_ == nullptr) return false;
-    if (isrChannel_ != nullptr && isrProposal_.pending) {
-        // One proposal in flight: re-send it until the controller commits it or
-        // another committed change resolves it (the request or the committed
-        // record may have been lost).
-        if (nowNs - isrProposal_.sentNs >= kAlterIsrResendNs) sendIsrProposal_(nowNs);
+    if ((isrChannel_ != nullptr || internalQuorum_()) && isrProposal_.pending) {
+        // One proposal in flight: re-send it until the controller (internal:
+        // a majority of the replicas) commits it or another committed change
+        // resolves it (the request, the answer or the record may have been lost).
+        if (nowNs - isrProposal_.sentNs >= kAlterIsrResendNs) {
+            if (internalQuorum_()) publishInternalIsr_(nowNs);
+            else                   sendIsrProposal_(nowNs);
+        }
         return false;
     }
     // Desired ISR: the committed one, shrunk by the Kafka lag rule (no caught-
@@ -1985,20 +2017,18 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
     // expanded by followers validated in this leadership at >= HW.  Steady
     // state allocates nothing (IsrManager works in place on reserved capacity).
     //
-    // INTERNAL partitions (led by the CONSENSUS leader, which is elected
-    // data-blind — see the bridge): no lag shrink.  Their ISR drops only members
-    // the cluster considers dead (shrinkIsrToLive, Kafka broker fencing) and
-    // unclean (regressed) members, so every live node the consensus can elect
-    // holds every committed record (HW = min over the ISR) — the Kafka "leader
-    // is an ISR member" rule without a controller-side ISR.  Cost: a live but
-    // slow member slows internal commits (acks=all waits for it).
+    // Every partition — internal ones included (review 2026-10-04 MAJOR-3) —
+    // lag-shrinks: a live but stuck member must not freeze the HW.  For an
+    // INTERNAL partition (led by the consensus leader) that is safe because the
+    // change commits only on a majority's durable knowledge and the consensus
+    // never votes for a node outside the newest durable ISR (InternalIsrKnowledge).
     isrManager_->setIsr(committedIsr_);
-    if (!internalPartition_())
-        (void)isrManager_->maybeShrinkIsr(nowNs, logEndOffset_(), cfg_.replicaLagMaxMs,
-                                          cfg_.replicaLagMaxOffset);
+    (void)isrManager_->maybeShrinkIsr(nowNs, logEndOffset_(), cfg_.replicaLagMaxMs,
+                                      cfg_.replicaLagMaxOffset);
     for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
         const FollowerSlot& sl = followerSlots_.at(i);
-        if (sl.unclean && sl.id != cfg_.selfId) (void)isrManager_->removeFromIsr(sl.id);
+        if (sl.id == cfg_.selfId) continue;
+        if (sl.unclean || (internalFencedMask_ & (1u << i)) != 0) (void)isrManager_->removeFromIsr(sl.id);
     }
     // Expansion considers only replicas OUTSIDE the committed ISR: a member the
     // shrink just removed sits at the HW it pins (HW = min over the ISR), so
@@ -2017,9 +2047,29 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
         if (!mayExpand) return false;
         if (std::find(committedIsr_.begin(), committedIsr_.end(), n) != committedIsr_.end())
             return false;
+        const int idx = slotIndex_(n);
+        if (idx >= 0 && (internalFencedMask_ & (1u << idx)) != 0) return false;
         const FollowerSlot* sl = followerSlots_.find(n);
         return sl != nullptr && sl->validated && !sl->unclean;   // validated in THIS leadership
     });
+    if (internalSeedPending_) {
+        // MAJOR-2: the first ISR of a new internal leadership is published only
+        // once every member it keeps has fetched (validated) at >= joinFloor —
+        // a member that has not (yet) is undecided: it stays counted (seed) until
+        // it confirms or the lag rule above shrinks it.  A published ISR is the
+        // consensus candidacy set: it must never name a deficient member.
+        for (NodeId n : isrManager_->isr()) {
+            if (n == cfg_.selfId) continue;
+            const FollowerSlot* sl = followerSlots_.find(n);
+            const FollowerState* fs = isrManager_->followerState(n);
+            if (sl == nullptr || !sl->validated || sl->unclean || fs == nullptr ||
+                fs->lastFetchOffset < joinFloor) {
+                applyMaximalIsr_();   // restore the maximal (seed) ISR the HW counts
+                return false;
+            }
+        }
+        return changeIsr_(isrManager_->isr(), nowNs, /*force=*/true);
+    }
     // `desired` aliases isrManager_'s vector: changeIsr_ copies it out before it
     // re-seeds isrManager_ with the maximal ISR.
     const bool changed = changeIsr_(isrManager_->isr(), nowNs);
@@ -2027,9 +2077,23 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
     return changed;
 }
 
-bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t nowNs)
+bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t nowNs, bool force)
 {
-    if (sameMembers_(desired, committedIsr_)) return false;
+    if (!force && sameMembers_(desired, committedIsr_)) return false;
+    if (internalQuorum_()) {
+        // MAJOR-2/3: publish a new version; it commits once a majority of the
+        // replicas durably holds it.  HW over committed ∪ proposed meanwhile.
+        if (isrProposal_.pending) return false;   // one change at a time
+        isrProposal_.pending = true;
+        isrProposal_.isr.assign(desired.begin(), desired.end());
+        isrProposal_.version = ++internalIsrVersion_;
+        internalIsrAcks_     = 0;
+        applyMaximalIsr_();
+        publishInternalIsr_(nowNs);
+        maybeCommitInternalIsr_();
+        publishCleanerState();
+        return true;
+    }
     if (isrChannel_ == nullptr) {
         // Self-managed: the leader is its own controller.
         committedIsr_.assign(desired.begin(), desired.end());
@@ -2048,6 +2112,77 @@ bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t no
     sendIsrProposal_(nowNs);
     publishCleanerState();
     return true;
+}
+
+int PartitionReplica::slotIndex_(NodeId id) const noexcept
+{
+    for (std::size_t i = 0; i < followerSlots_.size(); ++i)
+        if (followerSlots_.at(i).id == id) return static_cast<int>(i);
+    return -1;
+}
+
+void PartitionReplica::publishInternalIsr_(int64_t nowNs)
+{
+    isrProposal_.sentNs = nowNs;
+    InternalIsrMsg m{};
+    m.topicId     = cfg_.topicId;
+    m.partition   = cfg_.partitionId;
+    m.leaderId    = cfg_.selfId;
+    m.leaderEpoch = epoch_;
+    m.version     = isrProposal_.version;
+    m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), InternalIsrMsg::kMaxIsr));
+    for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
+    // Our own durable copy first: it is our ack (and our vote gate's view).
+    const int self = slotIndex_(cfg_.selfId);
+    if (self >= 0 && (internalIsrAcks_ & (1u << self)) == 0) {
+        InternalIsrState st{};
+        st.topicId = m.topicId; st.partition = m.partition; st.leaderEpoch = m.leaderEpoch;
+        st.version = m.version; st.count = m.isrCount; st.members = m.isr;
+        if (isrKnowledge_->offer(st)) internalIsrAcks_ |= (1u << self);
+    }
+    for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
+        const NodeId to = followerSlots_.at(i).id;
+        if (to == cfg_.selfId || (internalIsrAcks_ & (1u << i)) != 0) continue;
+        if (!onTransport([&](auto& t) { return t.sendInternalIsr(to, m); })) ++sendRefusals_;
+    }
+}
+
+void PartitionReplica::maybeCommitInternalIsr_()
+{
+    if (!isrProposal_.pending) return;
+    const int majority = static_cast<int>(configuredReplicas_.size()) / 2 + 1;
+    if (std::popcount(internalIsrAcks_) < majority) return;
+    committedIsr_.assign(isrProposal_.isr.begin(), isrProposal_.isr.end());
+    isrProposal_.pending  = false;
+    internalSeedPending_  = false;
+    applyMaximalIsr_();
+    publishCleanerState();
+}
+
+void PartitionReplica::onInternalIsrAck(const InternalIsrAckMsg& m)
+{
+    if (!internalQuorum_() || role_ != Role::Leader || !isrProposal_.pending) return;
+    if (m.leaderEpoch != epoch_ || m.version < isrProposal_.version) return;   // an older state
+    const int idx = slotIndex_(m.followerId);
+    if (idx < 0) return;
+    internalIsrAcks_ |= (1u << idx);
+    maybeCommitInternalIsr_();
+}
+
+void PartitionReplica::onInternalIsr(const InternalIsrMsg& m)
+{
+    if (!internalQuorum_() || m.isrCount < 0 || m.isrCount > InternalIsrMsg::kMaxIsr) return;
+    InternalIsrState st{};
+    st.topicId = m.topicId; st.partition = m.partition; st.leaderEpoch = m.leaderEpoch;
+    st.version = m.version; st.count = m.isrCount; st.members = m.isr;
+    if (!isrKnowledge_->offer(st)) return;   // not persisted: never ack
+    // Ack only the leader this replica follows, at its epoch: a deposed leader
+    // (a newer epoch exists for us) is never helped to commit.
+    if (role_ != Role::Follower || m.leaderEpoch != epoch_ || m.leaderId != leaderId_) return;
+    InternalIsrAckMsg a{};
+    a.topicId = m.topicId; a.partition = m.partition; a.followerId = cfg_.selfId;
+    a.leaderEpoch = m.leaderEpoch; a.version = m.version;
+    if (!onTransport([&](auto& t) { return t.sendInternalIsrAck(m.leaderId, a); })) ++sendRefusals_;
 }
 
 void PartitionReplica::sendIsrProposal_(int64_t nowNs)

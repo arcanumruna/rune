@@ -540,14 +540,14 @@ TEST(DrIntegration, PowerLoss_AcrossSegmentRolls_SealedSegmentsSurvive) {
 // Fix round 1 (review) — each pinned by a reproduction first.
 // ===========================================================================
 
-// E1b (consensus side): an INTERNAL partition's leader is the CONSENSUS leader,
-// elected data-blind.  Node 3 was dead (fenced out of the internal ISR, commits
-// went on on {1,2}); it rejoins and — a second fault — becomes the consensus
-// leader before it caught up.  It does not hold [10,30) and its KIP-279
-// directives truncate them on the others.  Kafka's controller would never elect
-// it (not in the ISR); closing this needs the consensus election to respect the
-// internal ISR (a candidacy rule / vote on internal positions) — E1b.
-TEST(DrIntegration, DISABLED_E1b_InternalFencedMemberElectedBeforeCatchUp_NoAckedLoss) {
+// E1b, consensus side (was DISABLED: the gap the review's MAJOR-2 closed).  An
+// INTERNAL partition is led by the consensus leader.  Node 3 was dead (fenced
+// out of the internal ISR — committed on {1,2}'s durable knowledge) while
+// [10,30) committed; it rejoins and, before its first fetch, the consensus is
+// asked to move to it.  It is outside the newest durable internal ISR: node 2
+// never votes for it, so it cannot win — the consensus stays on an ISR member,
+// nothing is truncated, and node 3 is re-admitted once caught up.
+TEST(DrIntegrationRegression, E1b_InternalFencedMemberNotElectableBeforeCatchUp_NoAckedLoss) {
     DrConfig cfg;
     cfg.topicId = -1;                            // __consumer_offsets-like internal partition
     DrCluster c(3, cfg);
@@ -556,10 +556,15 @@ TEST(DrIntegration, DISABLED_E1b_InternalFencedMemberElectedBeforeCatchUp_NoAcke
     c.isolate(3);                                // consensus-dead: fenced
     ASSERT_EQ(c.produceAcked(20), 20);
     c.healAll();
-    ASSERT_TRUE(c.moveLeader(3));                // elected before its first fetch
+    EXPECT_FALSE(c.moveLeader(3)) << "the consensus elected a member missing committed records";
     ASSERT_TRUE(c.waitWritable(kCap));
     EXPECT_EQ(c.produceAcked(5), 5);
-    expectAllConvergedAndAcked(c, "e1b internal fenced member elected");
+    ASSERT_TRUE(c.driveUntil([&] { return c.leaderIsrContains(3); }, kCap))
+        << "the caught-up member was never re-admitted\n" << c.dump();
+    ASSERT_TRUE(c.driveUntil([&] { return c.moveLeader(3); }, kCap)) << "re-admitted: electable again";
+    ASSERT_TRUE(c.waitWritable(kCap));
+    EXPECT_EQ(c.produceAcked(5), 5);
+    expectAllConvergedAndAcked(c, "e1b internal fenced member");
 }
 
 
@@ -716,7 +721,7 @@ TEST(DrIntegrationRegression, Critical2_InternalLeaderFailover_UncommittedTailOn
     ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
     c.cut(1, 3);                                 // data plane only: 3 stays consensus-live
     ASSERT_EQ(c.produce(5), 5);
-    c.run(300);                                  // far past replicaLagMaxMs: no lag shrink
+    c.run(5);                                    // inside replicaLagMaxMs: 3 still in the ISR
     EXPECT_EQ(c.acked().size(), 10u) << "committed past a live internal ISR member";
     EXPECT_EQ(c.rep(2).logEndOffset(), 15);
     c.crash(1, CrashKind::ProcessKill);
@@ -1195,9 +1200,9 @@ TEST(DrIntegrationRegression, ReadmittedMemberCaughtUpBeforeItCounts) {
 }
 
 // CRITICAL-2: consensus failovers of an INTERNAL partition while offset commits
-// (acks=all appends) keep coming: the consensus leadership moves to a lagging
-// (live) node and back; acked commits are never lost, uncommitted ones are
-// truncated (never acked), and every replica converges.
+// (acks=all appends) keep coming: the consensus leadership moves (to a lagging
+// node while it is still electable) and back; acked commits are never lost,
+// uncommitted ones are truncated (never acked), and every replica converges.
 TEST(DrIntegrationRegression, Critical2_InternalPartition_ConsensusFailoverUnderCommitLoad_NoLoss) {
     DrConfig cfg;
     cfg.topicId = -1;
@@ -1210,12 +1215,15 @@ TEST(DrIntegrationRegression, Critical2_InternalPartition_ConsensusFailoverUnder
     load(40);
     c.cut(1, 3);                                 // node 3 falls behind under load
     load(40);
-    ASSERT_TRUE(c.moveLeader(3));                // consensus failover to the lagging node
+    // Consensus failovers under load (MAJOR-2/3 rule: the election picks node 3
+    // only while it is in the newest durable internal ISR — a lagging node the
+    // leader shrank out is passed over).
+    ASSERT_GE(c.consensusElect(/*preferred=*/3), 0) << c.dump();
     c.heal(1, 3);
     load(60);
-    ASSERT_TRUE(c.moveLeader(1));                // and back
+    ASSERT_GE(c.consensusElect(/*preferred=*/1), 0) << c.dump();   // and back
     load(60);
-    ASSERT_TRUE(c.moveLeader(2));
+    ASSERT_GE(c.consensusElect(/*preferred=*/2), 0) << c.dump();
     load(60);
     ASSERT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, kCap));
     EXPECT_GT(c.acked().size(), 100u);
@@ -1393,4 +1401,65 @@ TEST(DrIntegrationRegression, Rev3Medium4_UncleanRestartLeaderChanged_LosesIsrSe
     c.restart(2);
     c.applyMetadata(2);
     expectAllConvergedAndAcked(c, "rev3 medium-4 leader changed");
+}
+
+// Review 2026-10-04 MAJOR-2: an ordinary ROLLING RESTART truncated committed
+// internal records.  Node 3 restarts and is fenced out of the internal ISR;
+// [10,30) commits on {1,2}.  Node 3 rejoins but is still catching up when the
+// operator restarts node 1 (the consensus leader).  The data-blind consensus
+// election could pick node 3: it led every internal partition with a short log
+// and node 2 truncated the committed records (offsets, txn state, metadata).
+// Fixed: internal ISR changes commit on a majority's durable knowledge and a
+// node outside the newest internal ISR it knows is never voted for.
+TEST(DrIntegrationRegression, Rev3Major2_InternalRollingRestart_LaggingNodeNotElected_NoCommittedLoss) {
+    DrConfig cfg;
+    cfg.topicId = -3;                            // __cluster_metadata-like
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.crash(3, CrashKind::ProcessKill);          // rolling restart: node 3 first
+    ASSERT_EQ(c.produceAcked(20), 20) << "internal commits froze on a restarting node";
+    c.restart(3);
+    c.applyMetadata(3);
+    c.cut(1, 3);                                 // node 3 still catching up (slow)
+    c.run(5);
+    c.crash(1, CrashKind::ProcessKill);          // ... then the consensus leader
+    c.healAll();
+    const NodeId nl = c.consensusElect(/*preferred=*/3);
+    ASSERT_GE(nl, 0) << "no electable consensus leader\n" << c.dump();
+    EXPECT_NE(nl, 3) << "the lagging node 3 won the consensus election";
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_EQ(c.produceAcked(5), 5);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "rev3 major-2 rolling restart");
+}
+
+// Review 2026-10-04 MAJOR-3: one consensus-live but data-plane-stuck node froze
+// every internal commit (no lag shrink for internal partitions, HW = min over
+// an ISR that contains it) — and with it every controller decision.  Fixed:
+// the normal lag shrink, committed on a majority's durable knowledge (the
+// stuck node can then no longer be elected).
+TEST(DrIntegrationRegression, Rev3Major3_StuckLiveInternalReplicaShrunk_ControlPlaneNotFrozen) {
+    DrConfig cfg;
+    cfg.topicId = -3;
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.cutBoth(1, 3);                             // replication plane only: 3 stays consensus-live
+    c.cutBoth(2, 3);
+    ASSERT_EQ(c.produce(5), 5);
+    EXPECT_TRUE(c.driveUntil([&] { return c.pendingCount() == 0; }, 1000))
+        << "internal commits froze behind a stuck live replica\n" << c.dump();
+    EXPECT_EQ(c.acked().size(), 15u);
+    EXPECT_FALSE(c.leaderIsrContains(3)) << "the stuck replica stayed in the internal ISR";
+    c.crash(1, CrashKind::ProcessKill);
+    const NodeId nl = c.consensusElect(/*preferred=*/3);
+    EXPECT_NE(nl, 3) << "the stuck replica (missing committed records) won the consensus election";
+    c.healAll();
+    ASSERT_GE(nl, 0) << c.dump();
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "rev3 major-3 stuck internal replica");
 }

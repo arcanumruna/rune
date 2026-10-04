@@ -1,5 +1,6 @@
 add_library(rune_replication
     src/PartitionReplica.cpp
+    src/InternalIsrKnowledge.cpp
     src/FileRecordingStore.cpp
     src/PartitionRecorder.cpp
     src/PartitionReplay.cpp)

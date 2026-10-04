@@ -17,6 +17,7 @@
 #include <rune/replication/PartitionFailoverCoordinator.h>
 #include <rune/replication/FileRecordingStore.h>
 #include <rune/replication/IsrManager.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 
@@ -815,15 +816,14 @@ TEST(EpochChangeTruncationTest, TwoContradictoryAheadTailsConvergeNoDivergence) 
 //  DrIntegration.DISABLED_E1b_InternalFencedMemberElectedBeforeCatchUp_NoAckedLoss.)
 
 // ===========================================================================
-// Kafka model, INTERNAL partitions (led by the data-blind consensus leader):
-// the ISR never lag-shrinks a LIVE member (every live node the consensus can
-// elect must hold every committed record); only members the cluster considers
-// dead are fenced out (shrinkIsrToLive).  A user partition lag-shrinks (Kafka
-// replicaLagMaxMs).  Before (fix-round WIP): the internal ISR lag-shrank a slow
-// live member, the HW passed its LEO, and the consensus could then elect it —
-// a leader lacking committed records.
+// Review 2026-10-04 MAJOR-3 (replaces InternalPartitionNeverLagShrinksALive
+// Member): an INTERNAL partition lag-shrinks like any other (a live but stuck
+// member must not freeze the control plane), but the change COMMITS only once a
+// majority of the replicas durably holds it (InternalIsrKnowledge); until then
+// the HW counts the member.  After the commit the stuck member is outside the
+// newest durable ISR of the majority — never voted for by the consensus.
 // ===========================================================================
-TEST(InternalIsrRegression, InternalPartitionNeverLagShrinksALiveMember_FencesTheDead) {
+TEST(InternalIsrRegression, InternalLagShrinkCommitsOnMajorityKnowledge_StuckMemberIneligible) {
     for (const bool internal : {true, false}) {
         SCOPED_TRACE(internal ? "internal" : "user");
         TempDir lDir("iisr_L"), fDir("iisr_F"), gDir("iisr_G");
@@ -836,33 +836,42 @@ TEST(InternalIsrRegression, InternalPartitionNeverLagShrinksALiveMember_FencesTh
             if (internal) c.topicId = -1;
             return c;
         };
-        PartitionReplica l(cfgFor(kL), Role::Leader, 1, all, all, &lLog, &transport);
-        PartitionReplica f(cfgFor(kF), Role::Follower, 1, all, all, &fLog, &transport);
-        PartitionReplica g(cfgFor(kG), Role::Follower, 1, all, all, &gLog, &transport);
-        transport.setLeader(&l);
-        transport.addFollower(kF, &f);          // kG never fetches (slow / stuck, but live)
+        InternalIsrKnowledge kl, kf, kg;
+        PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
+        PartitionReplica f(cfgFor(kF), Role::Follower, 0, all, all, &fLog, &transport);
+        PartitionReplica g(cfgFor(kG), Role::Follower, 0, all, all, &gLog, &transport);
+        if (internal) {
+            l.setInternalIsrKnowledge(&kl); f.setInternalIsrKnowledge(&kf); g.setInternalIsrKnowledge(&kg);
+        }
+        l.becomeLeader(1, all);
         f.becomeFollower(1, kL);
         g.becomeFollower(1, kL);
+        transport.setLeader(&l);
+        transport.addFollower(kF, &f);           // kG never fetches (stuck, but live)
         ASSERT_GE(l.append(makePayload(1)), 0);
         int64_t clock = 0;
+        bool sawPendingWithoutCommit = false;
         for (int i = 0; i < 100; ++i) {          // 100 ms >> replicaLagMaxMs = 10 ms
             clock += 1'000'000LL;
-            l.doWork(clock); f.doWork(clock); transport.pump(clock);
+            l.doWork(clock); f.doWork(clock);
+            if (internal && l.isrProposalPendingForTest()) {
+                // Proposed (kG out) but not yet held by a majority: the HW still
+                // counts kG (maximal ISR) — nothing committed past its LEO.
+                sawPendingWithoutCommit = true;
+                EXPECT_EQ(l.highWatermark(), 0) << "committed past a member whose removal is not durable";
+            }
+            transport.pump(clock);
         }
         const auto& isr = l.isr();
-        const bool gIn = std::find(isr.begin(), isr.end(), kG) != isr.end();
+        EXPECT_EQ(std::find(isr.begin(), isr.end(), kG), isr.end()) << "a stuck live member pinned the ISR";
+        EXPECT_EQ(l.highWatermark(), 1) << "the HW froze behind a stuck member";
         if (internal) {
-            EXPECT_TRUE(gIn) << "an internal ISR lag-shrank a live member";
-            EXPECT_EQ(l.highWatermark(), 0) << "committed past a live internal ISR member's LEO";
-            // The cluster declares kG dead: fenced at once; the HW advances.
-            const int32_t live[] = {kL, kF};
-            l.shrinkIsrToLive(std::span<const int32_t>(live, 2), clock);
-            const auto& isr2 = l.isr();
-            EXPECT_EQ(std::find(isr2.begin(), isr2.end(), kG), isr2.end()) << "a dead member stayed";
-            EXPECT_EQ(l.highWatermark(), 1);
-        } else {
-            EXPECT_FALSE(gIn) << "a user partition never lag-shrank";
-            EXPECT_EQ(l.highWatermark(), 1);
+            EXPECT_TRUE(sawPendingWithoutCommit);
+            EXPECT_FALSE(l.internalSeedPendingForTest());
+            EXPECT_FALSE(kl.eligible(kG)) << "the leader would vote for the stuck member";
+            EXPECT_FALSE(kf.eligible(kG)) << "the majority's durable knowledge still names the stuck member";
+            EXPECT_TRUE(kf.eligible(kF));
+            EXPECT_TRUE(kg.eligible(kG)) << "(the stuck node itself never heard of its removal)";
         }
     }
 }
@@ -4508,4 +4517,35 @@ TEST(PartitionReplicaRegression, StaleIncarnationFetchNeverCredited) {
     (void)l.onFetchRequest(stale, clock += 1'000'000);
     EXPECT_EQ(l.followerLeoForTest(kF), 10) << "credited a fetch of a dead follower process";
     EXPECT_LE(l.highWatermark(), 10);
+}
+
+// MAJOR-2/3: the internal-ISR knowledge is DURABLE (the candidacy rule must
+// survive a whole-cluster restart) and only newer states replace older ones.
+TEST(InternalIsrRegression, KnowledgeIsDurableAndMonotonic) {
+    TempDir d("iisrk");
+    const std::string path = d.path + "/internal-isr.state";
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 4; a.version = 2; a.count = 2;
+    a.members[0] = 1; a.members[1] = 2;
+    {
+        InternalIsrKnowledge k(path);
+        EXPECT_TRUE(k.eligible(3)) << "no knowledge: everyone eligible (fresh cluster)";
+        ASSERT_TRUE(k.offer(a));
+        EXPECT_FALSE(k.eligible(3));
+        InternalIsrState older = a;
+        older.version = 1; older.count = 3; older.members[2] = 3;
+        EXPECT_TRUE(k.offer(older)) << "holds a newer state: the older one may be acked";
+        EXPECT_FALSE(k.eligible(3)) << "an older state replaced a newer one";
+    }
+    InternalIsrKnowledge k2(path);                // restart
+    ASSERT_NE(k2.latest(-3, 0), nullptr);
+    EXPECT_EQ(k2.latest(-3, 0)->version, 2);
+    EXPECT_FALSE(k2.eligible(3)) << "the candidacy rule did not survive a restart";
+    EXPECT_TRUE(k2.eligible(1));
+    InternalIsrState other{};
+    other.topicId = -1; other.partition = 0; other.leaderEpoch = 4; other.version = 1;
+    other.count = 2; other.members[0] = 1; other.members[1] = 3;
+    ASSERT_TRUE(k2.offer(other));
+    EXPECT_FALSE(k2.eligible(2)) << "must be a member of EVERY internal partition's ISR";
+    EXPECT_TRUE(k2.eligible(1));
 }

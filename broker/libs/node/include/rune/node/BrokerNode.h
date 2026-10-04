@@ -49,6 +49,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/storage/Log.h>
@@ -748,6 +749,10 @@ private:
     // -----------------------------------------------------------------------
 
     // Durable persistence (paths under config_.dataDir)
+    // Review 2026-10-04 MAJOR-2/3: this node's durable internal-ISR knowledge —
+    // the consensus vote gate and the internal replicas' quorum store.  Declared
+    // BEFORE election_ / replicaRegistry_ so it outlives both.
+    std::unique_ptr<rune::replication::InternalIsrKnowledge> internalIsrKnowledge_;
     std::unique_ptr<rune::consensus::NodeStateFile> nodeStateFile_;
     std::unique_ptr<rune::consensus::TermLog>       termLog_;
 

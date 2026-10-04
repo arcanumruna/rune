@@ -848,6 +848,15 @@ void BrokerNode::buildReplication() {
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
     // KIP-903: every replica of this process stamps the process incarnation.
     replicaRegistry_->setProcessIncarnation(bumpProcessIncarnation(config_.dataDir));
+    // Review 2026-10-04 MAJOR-2/3: durable internal-ISR knowledge — internal
+    // replicas commit their ISR changes on a majority of it, and the consensus
+    // election votes only for members of its newest internal ISRs.
+    internalIsrKnowledge_ = std::make_unique<rune::replication::InternalIsrKnowledge>(
+        config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
+    replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
+    if (election_)
+        election_->setVoteGate(&rune::replication::InternalIsrKnowledge::voteGate,
+                               internalIsrKnowledge_.get());
     // Task 10 round 4 (Critical 1): the legacy replication transport resolves
     // every inbound frame through the registry at USE time and holds no replica
     // pointer (a removed partition can never be reached through it).  User

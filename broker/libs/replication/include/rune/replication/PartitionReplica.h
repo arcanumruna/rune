@@ -68,6 +68,8 @@ namespace rune::protocol { class RecordBatchBuilder; }
 
 namespace rune::replication {
 
+class InternalIsrKnowledge;
+
 // ---------------------------------------------------------------------------
 // ReplicaPositionReport — soft per-replica position snapshot consumed by the
 // controller's failover-election path.  Off-log (rebuilt on controller restart).
@@ -277,6 +279,12 @@ public:
     /// re-sends on its resend cadence).
     virtual bool sendAlterIsr(const AlterIsrMsg& /*msg*/) { return false; }
 
+    /// (Internal-partition leader → replica) the versioned internal ISR state
+    /// (MAJOR-2/3).  Cold path (ISR changes only); re-sent until acked.
+    virtual bool sendInternalIsr(NodeId /*to*/, const InternalIsrMsg& /*msg*/) { return false; }
+    /// (Replica → internal-partition leader) "I durably hold that state".
+    virtual bool sendInternalIsrAck(NodeId /*to*/, const InternalIsrAckMsg& /*msg*/) { return false; }
+
     // (F3 fix-round-2 item A's maxFetchResponseBytes() — the hard per-message
     //  records ceiling a FIRST batch is served alone within — is the SAME
     //  quantity as F18's maxFetchRecordsBytes() above: one virtual.)
@@ -302,6 +310,8 @@ public:
     bool sendOffsetsForLeaderEpochResponse(NodeId, const OffsetsForLeaderEpochRespMsg&) override { return true; }
     bool sendReconcileRequest(NodeId, const FetchRequestMsg&) override { return true; }
     bool sendReconcileResponse(NodeId, const FetchResponseMsg&) override { return true; }
+    bool sendInternalIsr(NodeId, const InternalIsrMsg&) override { return true; }
+    bool sendInternalIsrAck(NodeId, const InternalIsrAckMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -396,6 +406,24 @@ public:
     [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
     /// Test view: the committed partitionEpoch this leader derives proposals from.
     [[nodiscard]] int32_t committedPartitionEpochForTest() const noexcept { return committedPartitionEpoch_; }
+    /// INTERNAL partitions (MAJOR-2/3): ISR changes commit on a MAJORITY's
+    /// durable knowledge instead of at once — the leader publishes each change
+    /// (InternalIsr) to every replica, each persists it in `k` and acks, and it
+    /// commits once a majority holds it; the HW counts committed ∪ proposed
+    /// until then.  A new leadership starts from every replica (HW-counting
+    /// seed) and publishes its first ISR only once every member it keeps
+    /// fetched (validated) at >= max(HW, electionLeo_) — so a published ISR
+    /// never names a member lacking committed records.  The consensus election
+    /// then votes only for members of the newest durable ISRs
+    /// (InternalIsrKnowledge::eligible).  nullptr = self-managed.  Set before
+    /// the replica is driven (control thread).
+    void setInternalIsrKnowledge(InternalIsrKnowledge* k) noexcept { isrKnowledge_ = k; }
+    /// (Follower side) persist an internal ISR state, ack it to its leader.
+    void onInternalIsr(const InternalIsrMsg& m);
+    /// (Leader side) a replica holds our published state (or newer).
+    void onInternalIsrAck(const InternalIsrAckMsg& m);
+    /// Test view: a new internal leadership has not yet committed its first ISR.
+    [[nodiscard]] bool internalSeedPendingForTest() const noexcept { return internalSeedPending_; }
     /// Test view: an AlterIsr proposal is in flight.
     [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending; }
     /// Test view: the maximal ISR the HW is computed over (committed ∪ proposed).
@@ -1194,12 +1222,23 @@ private:
         std::vector<NodeId> isr;          ///< proposed ISR (AlterIsr)
         int64_t             sentNs  = 0;
         int32_t             basePartitionEpoch = -1;   ///< MEDIUM-1: the CAS version it was derived from
+        int64_t             version = 0;               ///< internal quorum mode: the published version
     };
     IsrProposal isrProposal_{};
     /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
     /// not controller-managed).  Set by every becomeLeader.
     int32_t committedPartitionEpoch_ = -1;
     int64_t processIncarnation_      = 0;    ///< KIP-903 (see setProcessIncarnation)
+    // Internal quorum mode (MAJOR-2/3, see setInternalIsrKnowledge).
+    InternalIsrKnowledge* isrKnowledge_     = nullptr;
+    bool     internalSeedPending_ = false;   ///< leadership seed (every replica) not yet replaced by a committed ISR
+    int64_t  internalIsrVersion_  = 0;       ///< last version published in this leadership
+    uint32_t internalIsrAcks_     = 0;       ///< slot bits of replicas holding the pending version
+    uint32_t internalFencedMask_  = 0;       ///< slot bits the cluster considers dead (shrinkIsrToLive)
+    [[nodiscard]] bool internalQuorum_() const noexcept { return isrKnowledge_ != nullptr; }
+    void publishInternalIsr_(int64_t nowNs);
+    void maybeCommitInternalIsr_();
+    [[nodiscard]] int slotIndex_(NodeId id) const noexcept;
     /// MEDIUM-2: after an INELIGIBLE reject, no ISR addition is proposed before
     /// this time (a fenced replica is not re-proposed every ISR check).
     int64_t expandBackoffUntilNs_ = 0;
@@ -1214,7 +1253,7 @@ private:
     bool updateIsr_(int64_t nowNs);
     /// Commit (self-managed) or propose (controller-managed) `desired` (an ISR
     /// derived from committedIsr_).  Returns true when something changed / was sent.
-    bool changeIsr_(const std::vector<NodeId>& desired, int64_t nowNs);
+    bool changeIsr_(const std::vector<NodeId>& desired, int64_t nowNs, bool force = false);
     /// The maximal ISR = committed ∪ the pending proposal → isrManager_.
     void applyMaximalIsr_();
     void sendIsrProposal_(int64_t nowNs);
@@ -1331,8 +1370,7 @@ public:
     // pump() path (called from the replication duty-cycle thread) are safe to
     // call concurrently.  In single-threaded tests the lock is uncontended.
     bool sendFetchRequest(const FetchRequestMsg& req) override {
-        std::lock_guard lk(mu_);
-        pendingRequests_.push_back({req});
+        enqueue_(pendingRequests_, {req});
         return true;
     }
 
@@ -1345,28 +1383,33 @@ public:
         pr.resp = resp;
         pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
                                                     pr.recordsBuf.size());
-        std::lock_guard lk(mu_);
-        pendingResponses_.push_back(std::move(pr));
+        enqueue_(pendingResponses_, std::move(pr));
         return true;
     }
 
     // DR-BUG-6: OffsetsForLeaderEpoch + reconcile peer-routed messages.
     bool sendOffsetsForLeaderEpochRequest(
             NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override {
-        std::lock_guard lk(mu_);
-        pendingEpochReqs_.push_back({toLeader, req});
+        enqueue_(pendingEpochReqs_, {toLeader, req});
         return true;
     }
     bool sendOffsetsForLeaderEpochResponse(
             NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override {
-        std::lock_guard lk(mu_);
-        pendingEpochResps_.push_back({toFollower, resp});
+        enqueue_(pendingEpochResps_, {toFollower, resp});
         return true;
     }
     bool sendReconcileRequest(
             NodeId toPeer, const FetchRequestMsg& req) override {
-        std::lock_guard lk(mu_);
-        pendingReconcileReqs_.push_back({toPeer, req});
+        enqueue_(pendingReconcileReqs_, {toPeer, req});
+        return true;
+    }
+    // MAJOR-2/3: internal-ISR state / acks, peer-routed (delivered by pump()).
+    bool sendInternalIsr(NodeId to, const InternalIsrMsg& m) override {
+        enqueue_(pendingInternalIsr_, {to, m});
+        return true;
+    }
+    bool sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& m) override {
+        enqueue_(pendingInternalIsrAck_, {to, m});
         return true;
     }
     bool sendReconcileResponse(
@@ -1377,8 +1420,7 @@ public:
         pr.resp = resp;
         pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
                                                     pr.recordsBuf.size());
-        std::lock_guard lk(mu_);
-        pendingReconcileResps_.push_back(std::move(pr));
+        enqueue_(pendingReconcileResps_, std::move(pr));
         return true;
     }
 
@@ -1395,10 +1437,7 @@ public:
 
         // Deliver fetch requests to the leader.
         std::vector<PendingRequest> reqs;
-        {
-            std::lock_guard lk(mu_);
-            reqs.swap(pendingRequests_);
-        }
+        take_(pendingRequests_, reqs);
         for (auto& pr : reqs) {
             if (leader_) {
                 leader_->onFetchRequest(pr.req, nowNs);
@@ -1408,10 +1447,7 @@ public:
 
         // Deliver fetch responses to followers.
         std::vector<PendingResponse> resps;
-        {
-            std::lock_guard lk(mu_);
-            resps.swap(pendingResponses_);
-        }
+        take_(pendingResponses_, resps);
         for (auto& pr : resps) {
             auto it = followers_.find(pr.toFollower);
             if (it != followers_.end()) {
@@ -1422,10 +1458,7 @@ public:
 
         // DR-BUG-6: OffsetsForLeaderEpoch requests → target (the new leader).
         std::vector<PendingEpochReq> ereqs;
-        {
-            std::lock_guard lk(mu_);
-            ereqs.swap(pendingEpochReqs_);
-        }
+        take_(pendingEpochReqs_, ereqs);
         for (auto& e : ereqs) {
             auto it = byId_.find(e.to);
             if (it != byId_.end()) {
@@ -1436,10 +1469,7 @@ public:
 
         // DR-BUG-6: OffsetsForLeaderEpoch responses → target (the follower).
         std::vector<PendingEpochResp> eresps;
-        {
-            std::lock_guard lk(mu_);
-            eresps.swap(pendingEpochResps_);
-        }
+        take_(pendingEpochResps_, eresps);
         for (auto& e : eresps) {
             auto it = byId_.find(e.to);
             if (it != byId_.end()) {
@@ -1450,10 +1480,7 @@ public:
 
         // DR-BUG-6: reconcile requests → target (the ahead survivor).
         std::vector<PendingReconcileReq> rreqs;
-        {
-            std::lock_guard lk(mu_);
-            rreqs.swap(pendingReconcileReqs_);
-        }
+        take_(pendingReconcileReqs_, rreqs);
         for (auto& r : rreqs) {
             auto it = byId_.find(r.to);
             if (it != byId_.end()) {
@@ -1464,16 +1491,27 @@ public:
 
         // DR-BUG-6: reconcile responses → target (the deficient leader).
         std::vector<PendingResponse> rresps;
-        {
-            std::lock_guard lk(mu_);
-            rresps.swap(pendingReconcileResps_);
-        }
+        take_(pendingReconcileResps_, rresps);
         for (auto& pr : rresps) {
             auto it = byId_.find(pr.toFollower);
             if (it != byId_.end()) {
                 it->second->applyReconcileResponse(pr.resp);
                 ++count;
             }
+        }
+
+        // MAJOR-2/3: internal-ISR states / acks → target.
+        std::vector<std::pair<NodeId, InternalIsrMsg>> iisr;
+        std::vector<std::pair<NodeId, InternalIsrAckMsg>> iack;
+        take_(pendingInternalIsr_, iisr);
+        take_(pendingInternalIsrAck_, iack);
+        for (auto& [to, m] : iisr) {
+            auto it = byId_.find(to);
+            if (it != byId_.end()) { it->second->onInternalIsr(m); ++count; }
+        }
+        for (auto& [to, m] : iack) {
+            auto it = byId_.find(to);
+            if (it != byId_.end()) { it->second->onInternalIsrAck(m); ++count; }
         }
 
         return count;
@@ -1488,6 +1526,16 @@ public:
     }
 
 private:
+    // Every pending queue is touched only under mu_ — through these two helpers
+    // (test fake: the leader push path and pump() may run on different threads).
+    template <class V> void enqueue_(V& v, typename V::value_type x) {
+        std::lock_guard lk(mu_);
+        v.push_back(std::move(x));
+    }
+    template <class V> void take_(V& from, V& into) {
+        std::lock_guard lk(mu_);
+        into.swap(from);
+    }
     struct PendingEpochReq  { NodeId to; OffsetsForLeaderEpochReqMsg  req; };
     struct PendingEpochResp { NodeId to; OffsetsForLeaderEpochRespMsg resp; };
     struct PendingReconcileReq { NodeId to; FetchRequestMsg req; };
@@ -1503,6 +1551,8 @@ private:
     std::vector<PendingEpochResp> pendingEpochResps_;  ///< DR-BUG-6
     std::vector<PendingReconcileReq> pendingReconcileReqs_;  ///< DR-BUG-6
     std::vector<PendingResponse>  pendingReconcileResps_;    ///< DR-BUG-6
+    std::vector<std::pair<NodeId, InternalIsrMsg>>    pendingInternalIsr_;     ///< MAJOR-2/3
+    std::vector<std::pair<NodeId, InternalIsrAckMsg>> pendingInternalIsrAck_;  ///< MAJOR-2/3
 };
 
 } // namespace rune::replication

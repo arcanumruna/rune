@@ -163,6 +163,7 @@ public:
     }
     [[nodiscard]] std::size_t size() const noexcept { return n_; }
     [[nodiscard]] FollowerSlot& at(std::size_t i) noexcept { return slots_[i]; }
+    [[nodiscard]] const FollowerSlot& at(std::size_t i) const noexcept { return slots_[i]; }
 
 private:
     std::array<FollowerSlot, kMaxReplicas> slots_{};

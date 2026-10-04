@@ -274,6 +274,9 @@ public:
     /// control thread to the CURRENT controller (setControllerId); delivered
     /// locally when this node is the controller.
     bool sendAlterIsr(const AlterIsrMsg& msg) override;
+    /// MAJOR-2/3: internal-ISR state / ack (control thread; cold).
+    bool sendInternalIsr(NodeId to, const InternalIsrMsg& msg) override;
+    bool sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& msg) override;
     /// CONTROL thread (controller side): answer an AlterIsr (to `toLeader`;
     /// self = delivered locally).  Cold.
     bool sendAlterIsrResponse(NodeId toLeader, const AlterIsrResponseMsg& msg);

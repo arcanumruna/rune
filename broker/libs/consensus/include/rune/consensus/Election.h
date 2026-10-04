@@ -225,6 +225,20 @@ public:
                           int64_t logPosition,
                           NodeId  leaderMemberId);
 
+    /// Review 2026-10-04 MAJOR-2/3 — candidacy rule.  `fn(ctx, candidate)`
+    /// decides whether this node may vote for `candidate` (and whether it may
+    /// stand itself: `fn(ctx, thisMemberId())`).  The broker wires it to
+    /// InternalIsrKnowledge::eligible: a node outside the newest durable ISR of
+    /// the internal partitions (which the consensus leader leads) never gathers
+    /// a majority — it would lead them without their committed records.  A
+    /// denied RequestVote is answered like a "my log is newer" deny.  nullptr
+    /// (default) = everyone eligible (data-blind, as Aeron).  Duty-cycle thread.
+    using VoteGate = bool (*)(void* ctx, NodeId candidate) noexcept;
+    void setVoteGate(VoteGate fn, void* ctx) noexcept { voteGate_ = fn; voteGateCtx_ = ctx; }
+    [[nodiscard]] bool mayVoteFor(NodeId candidate) const noexcept {
+        return voteGate_ == nullptr || voteGate_(voteGateCtx_, candidate);
+    }
+
     /// Task 11 fix 2 (B2): true when every outbound consensus message is a direct
     /// call (production SbeConsensusPublisher over a final sink); false only for
     /// test doubles.  BrokerNode debug-asserts it.
@@ -419,6 +433,10 @@ private:
 
     // Seeded RNG for nominate backoff — Election.java:723
     std::mt19937_64 rng_;
+
+    // Candidacy rule (setVoteGate).
+    VoteGate voteGate_    = nullptr;
+    void*    voteGateCtx_ = nullptr;
 };
 
 } // namespace rune::consensus

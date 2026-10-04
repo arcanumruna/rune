@@ -346,6 +346,20 @@ bool AeronPartitionTransport::sendAlterIsr(const AlterIsrMsg& msg)
     return len != 0 && enqueueOutbound(kController, wire, len);
 }
 
+bool AeronPartitionTransport::sendInternalIsr(NodeId to, const InternalIsrMsg& msg)
+{
+    uint8_t wire[InternalIsrMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    return len != 0 && enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
+bool AeronPartitionTransport::sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& msg)
+{
+    uint8_t wire[InternalIsrAckMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    return len != 0 && enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
 bool AeronPartitionTransport::sendAlterIsrResponse(NodeId toLeader, const AlterIsrResponseMsg& msg)
 {
     uint8_t wire[AlterIsrResponseMsg::TOTAL_SIZE];
@@ -559,6 +573,20 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         if (AlterIsrMsg::decode(buf, len, m) && alterIsrHandler_ != nullptr &&
             alterIsrHandler_(alterIsrCtx_, m, resp))
             (void)sendAlterIsrResponse(m.leaderId, resp);   // a refused answer: the leader re-sends
+        return Action::CONTINUE;
+    }
+    if (tid == InternalIsrMsg::TEMPLATE_ID || tid == InternalIsrAckMsg::TEMPLATE_ID) [[unlikely]] {
+        // MAJOR-2/3: internal partitions only — their replicas are driven on
+        // this (control) thread.
+        if (tid == InternalIsrMsg::TEMPLATE_ID) {
+            InternalIsrMsg m{};
+            if (InternalIsrMsg::decode(buf, len, m) && m.topicId < 0)
+                if (PartitionReplica* rep = resolveReplica_(m.topicId, m.partition)) rep->onInternalIsr(m);
+        } else {
+            InternalIsrAckMsg m{};
+            if (InternalIsrAckMsg::decode(buf, len, m) && m.topicId < 0)
+                if (PartitionReplica* rep = resolveReplica_(m.topicId, m.partition)) rep->onInternalIsrAck(m);
+        }
         return Action::CONTINUE;
     }
     if (tid == AlterIsrResponseMsg::TEMPLATE_ID) [[unlikely]] {

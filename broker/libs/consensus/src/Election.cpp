@@ -328,8 +328,10 @@ int Election::canvass(int64_t nowNs)
     }
 
     // Election.java:720-727: check candidate readiness
+    // MAJOR-2/3 candidacy rule: a node outside the newest durable internal ISR
+    // does not nominate (it keeps canvassing and votes for eligible peers).
     ClusterMember* thisM = memberById(thisMemberId_);
-    if (thisM != nullptr) {
+    if (thisM != nullptr && mayVoteFor(thisMemberId_)) {
         // Election.java:720: isUnanimousCandidate
         if (ClusterMember::isUnanimousCandidate(clusterMembers_, *thisM, gracefulClosedLeaderId_)) {
             // Election.java:723-725: random backoff
@@ -357,6 +359,12 @@ int Election::canvass(int64_t nowNs)
 // ---------------------------------------------------------------------------
 int Election::nominate(int64_t nowNs)
 {
+    // MAJOR-2/3: the candidacy rule may have turned against us since CANVASS
+    // (newer internal-ISR knowledge arrived): stand down.
+    if (!mayVoteFor(thisMemberId_)) {
+        state(ElectionState::Canvass, nowNs, "not in the newest internal ISR");
+        return 1;
+    }
     // Election.java:734-741: if deadline passed → become candidate
     if (nowNs >= nominationDeadlineNs_) {
         // Election.java:736-737: proposeMaxCandidateTermId(candidateTermId+1, logPosition, time)
@@ -709,7 +717,10 @@ void Election::onRequestVote(Term    logLeadershipTermId,
         // Election.java:351-353: stale candidate → deny
         placeVote(candidateTermId, candidateId, false);
     } else if (ClusterMember::compareLog(logLeadershipTermId_, appendPosition_,
-                                         logLeadershipTermId, logPosition) > 0) {
+                                         logLeadershipTermId, logPosition) > 0 ||
+               !mayVoteFor(candidateId)) {
+        // MAJOR-2/3: a candidate outside the newest durable internal ISR is
+        // denied exactly like one with a stale log.
         // Election.java:355-371: our log is more recent → deny but update our candidateTermId
         // Election.java:357-358: proposeMaxCandidateTermId to update our persisted term
         candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(

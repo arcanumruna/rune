@@ -45,6 +45,7 @@
 #include <gtest/gtest.h>
 
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/metadata/FailoverElection.h>
 #include <rune/metadata/ReplicaPositionTable.h>
 #include <rune/protocol/RecordBatch.h>
@@ -108,8 +109,8 @@ struct DrConfig {
 // Network frames
 // ---------------------------------------------------------------------------
 enum class Kind : uint8_t { FetchReq, FetchResp, EpochReq, EpochResp, ReconReq, ReconResp, AlterIsr,
-                           AlterIsrResp };
-inline constexpr int kKinds = 8;
+                           AlterIsrResp, InternalIsr, InternalIsrAck };
+inline constexpr int kKinds = 10;
 /// The harness controller's address on the modelled network (AlterIsr target).
 inline constexpr NodeId kControllerAddr = 0;
 
@@ -125,6 +126,8 @@ struct Frame {
     OffsetsForLeaderEpochRespMsg eresp{};
     AlterIsrMsg                  alter{};
     AlterIsrResponseMsg          alterResp{};
+    InternalIsrMsg               iisr{};
+    InternalIsrAckMsg            iack{};
 };
 
 class DrCluster;
@@ -142,6 +145,8 @@ public:
     bool sendReconcileRequest(NodeId to, const FetchRequestMsg& m) override;
     bool sendReconcileResponse(NodeId to, const FetchResponseMsg& m) override;
     bool sendAlterIsr(const AlterIsrMsg& m) override;
+    bool sendInternalIsr(NodeId to, const InternalIsrMsg& m) override;
+    bool sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& m) override;
 private:
     DrCluster* c_;
     NodeId     self_;
@@ -153,6 +158,9 @@ struct DrNode {
     std::unique_ptr<Log>              log;
     std::unique_ptr<DrEndpoint>       ep;
     std::unique_ptr<PartitionReplica> rep;
+    /// INTERNAL partition: the node's durable internal-ISR knowledge (a file in
+    /// its dir — survives crashes, as in production).
+    std::unique_ptr<InternalIsrKnowledge> isrKnowledge;
     bool                              up = false;
     uint32_t                          incarnation = 0;
     std::map<std::string, int64_t>    durableFloor;   // .log path → bytes known durable
@@ -215,7 +223,7 @@ public:
         DrNode& n = node(id);
         ASSERT_TRUE(n.up) << "crash of a node that is down";
         const auto ext = n.log->syncedExtentsForTest();
-        n.rep.reset(); n.ep.reset(); n.log.reset();
+        n.rep.reset(); n.ep.reset(); n.log.reset(); n.isrKnowledge.reset();
         n.up = false;
         purge_(id);
         for (const auto& e : ext)
@@ -326,6 +334,8 @@ public:
     bool moveLeader(NodeId id) {
         const bool inIsr = std::find(meta_.isr.begin(), meta_.isr.end(), id) != meta_.isr.end();
         if (cfg_.topicId >= 0 && !inIsr) return false;
+        // INTERNAL: the consensus can only move to a node it can elect.
+        if (cfg_.topicId < 0 && !consensusElectable_(id)) return false;
         ++meta_.epoch;
         ++meta_.partitionEpoch;
         meta_.leader = id;
@@ -333,6 +343,25 @@ public:
         for (auto& n : nodes_) applyMetadata(n.id);
         return true;
     }
+    /// INTERNAL partition: the CONSENSUS election (Aeron Election) that picks
+    /// the internal leader.  A candidate wins with votes from a majority of the
+    /// live (up, consensus-reachable) nodes, its own included; a node votes for
+    /// a candidate (and stands itself) only if consensusVoteGate_(voter,
+    /// candidate) allows it.  `preferred` wins when electable (e.g. the node
+    /// whose election timer fired first), else the lowest electable id.
+    /// Epoch + 1, the assignment goes to every reachable node.  Returns the new
+    /// leader, -1 = nobody electable (the consensus stays leaderless).
+    NodeId consensusElect(NodeId preferred) {
+        NodeId winner = -1;
+        if (preferred >= 0 && consensusElectable_(preferred)) winner = preferred;
+        for (auto& n : nodes_) if (winner < 0 && consensusElectable_(n.id)) winner = n.id;
+        if (winner < 0) return -1;
+        ++meta_.epoch;
+        meta_.leader = winner;
+        for (auto& n : nodes_) if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
+        return winner;
+    }
+
     /// The controller's committed ISR contains `id`.
     bool controllerIsrContains(NodeId id) const {
         return std::find(meta_.isr.begin(), meta_.isr.end(), id) != meta_.isr.end();
@@ -615,6 +644,10 @@ private:
         n.rep = std::make_unique<PartitionReplica>(cfgFor_(n.id), Role::Follower, /*epoch=*/0,
                                                    replicas_, replicas_, n.log.get(), n.ep.get());
         if (cfg_.topicId >= 0) n.rep->setIsrChannel(n.ep.get());   // as BrokerNode (multi-node)
+        if (cfg_.topicId < 0) {                                       // as BrokerNode (internal)
+            n.isrKnowledge = std::make_unique<InternalIsrKnowledge>(n.dir + "/internal-isr.state");
+            n.rep->setInternalIsrKnowledge(n.isrKnowledge.get());
+        }
         n.up = true;
         ++n.incarnation;
         n.rep->setProcessIncarnation(n.incarnation);   // KIP-903 (as ReplicaRegistry::add)
@@ -804,6 +837,8 @@ private:
                     r.applyReconcileResponse(f.fresp); break;
                 case Kind::AlterIsr: break;   // handled above
                 case Kind::AlterIsrResp: r.onAlterIsrResponse(f.alterResp); break;
+                case Kind::InternalIsr:    r.onInternalIsr(f.iisr); break;
+                case Kind::InternalIsrAck: r.onInternalIsrAck(f.iack); break;
             }
         }
     }
@@ -830,6 +865,21 @@ private:
     std::size_t             failed_ = 0;
     bool                    lostOnPowerLoss_ = false;
     std::optional<rune::metadata::ReplicaPositionTable> capturedPositions_;   ///< see controllerLearnPositionsFrom
+    /// Consensus vote rule (voter, candidate) — Election::mayVoteFor as the
+    /// broker wires it: InternalIsrKnowledge::eligible of the voter.
+    bool consensusVoteGate_(NodeId voter, NodeId candidate) {
+        DrNode& v = node(voter);
+        return v.isrKnowledge == nullptr || v.isrKnowledge->eligible(candidate);
+    }
+    bool consensusElectable_(NodeId cand) {
+        std::vector<NodeId> live;
+        for (auto& n : nodes_)
+            if (n.up && cut_.count({n.id, kControllerAddr}) == 0) live.push_back(n.id);
+        if (std::find(live.begin(), live.end(), cand) == live.end()) return false;
+        std::size_t votes = 0;
+        for (NodeId v : live) if (consensusVoteGate_(v, cand)) ++votes;
+        return consensusVoteGate_(cand, cand) && votes >= nodes_.size() / 2 + 1;
+    }
     rune::storage::ProducerStateManager psm_;
     uint64_t                psmGen_   = 0;
     bool                    psmValid_ = false;
@@ -862,6 +912,14 @@ inline bool DrEndpoint::sendReconcileRequest(NodeId to, const FetchRequestMsg& m
 }
 inline bool DrEndpoint::sendAlterIsr(const AlterIsrMsg& m) {
     Frame f; f.kind = Kind::AlterIsr; f.from = self_; f.to = kControllerAddr; f.alter = m;
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendInternalIsr(NodeId to, const InternalIsrMsg& m) {
+    Frame f; f.kind = Kind::InternalIsr; f.from = self_; f.to = to; f.iisr = m;
+    return c_->send(std::move(f));
+}
+inline bool DrEndpoint::sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& m) {
+    Frame f; f.kind = Kind::InternalIsrAck; f.from = self_; f.to = to; f.iack = m;
     return c_->send(std::move(f));
 }
 inline bool DrEndpoint::sendReconcileResponse(NodeId to, const FetchResponseMsg& m) {

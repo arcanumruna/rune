@@ -944,3 +944,57 @@ TEST(ElectionBallot, OnRequestVote_SameTerm_EqualPosition_Grants) {
     EXPECT_TRUE(pub.placeVoteCalls[0].vote)
         << "Candidate with same term and equal log position must be granted";
 }
+
+// ============================================================================
+// Review 2026-10-04 MAJOR-2/3 — candidacy rule (setVoteGate): a node outside
+// the newest durable internal ISR never gathers a majority.
+// ============================================================================
+namespace {
+struct GateCtx { NodeId denied = -1; };
+bool denyOne(void* ctx, NodeId candidate) noexcept {
+    return candidate != static_cast<GateCtx*>(ctx)->denied;
+}
+} // namespace
+
+// A gated-out candidate's RequestVote is denied (like a stale log).
+TEST(ElectionBallotRegression, VoteGate_DeniesCandidateOutsideInternalIsr) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+    GateCtx g{/*denied=*/1};
+    e.setVoteGate(&denyOne, &g);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);                             // INIT → CANVASS
+    pub.clear();
+    e.onRequestVote(0, 0, /*candidateTermId=*/1, /*candidateId=*/1, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_FALSE(pub.placeVoteCalls[0].vote) << "voted for a candidate outside the internal ISR";
+    EXPECT_EQ(e.state(), ElectionState::Canvass);
+    pub.clear();
+    e.onRequestVote(0, 0, /*candidateTermId=*/2, /*candidateId=*/2, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_TRUE(pub.placeVoteCalls[0].vote) << "an eligible candidate must still get the vote";
+}
+
+// A gated-out node does not nominate itself, even as a unanimous candidate.
+TEST(ElectionBallotRegression, VoteGate_IneligibleNodeNeverNominates) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
+    GateCtx g{/*denied=*/0};                     // self
+    e.setVoteGate(&denyOne, &g);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);                             // INIT → CANVASS
+    e.onCanvassPosition(0, 0, 0, 1);
+    e.onCanvassPosition(0, 0, 0, 2);
+    for (int i = 0; i < 20; ++i) { nowNs += kElectionTimeoutNs; e.doWork(nowNs); }
+    EXPECT_EQ(e.state(), ElectionState::Canvass) << "an ineligible node stood for election";
+    EXPECT_EQ(e.candidateTermId(), 0);
+    g.denied = -1;                               // newer knowledge re-admits it
+    e.doWork(nowNs += 1'000LL);
+    EXPECT_EQ(e.state(), ElectionState::Nominate);
+}
