@@ -1052,6 +1052,11 @@ public:
     /// Task 14 fix2: accepted deferred records that could not be applied (and
     /// were failed through their handle / counted + logged if void). Owner thread.
     [[nodiscard]] uint64_t deferredApplyFailures() const noexcept { return deferredApplyFailures_; }
+    /// D6 review M1 (diagnostic): UnknownProducerId answers where this producer
+    /// had an acked record at/above the answer's logStartOffset — the broker
+    /// LOST producer state it should have kept (not retention).  The batch was
+    /// still provably not appended and is re-sequenced (rule U); never a failure.
+    [[nodiscard]] uint64_t unknownProducerIdStateLoss() const noexcept { return unknownPidStateLoss_; }
 
     // ---- Task 14 fix3 test seams (owner thread; never used in production) ----
     /// Parses the whole deferred arena and cross-checks it against the live
@@ -1399,6 +1404,7 @@ private:
     // ---- sendBlocking() support (app thread only) -----------------------------
     static int64_t steadyNowNs_() noexcept;
     ClockFn clock_   = &steadyNowNs_;   // overridable by setClockForTesting()
+    uint64_t unknownPidStateLoss_ = 0;  // D6 review M1: rule U2 occurrences (diagnostic)
     PumpFn  pumpFn_  = nullptr;         // wired by Client::producer(), both modes (fix1 C1)
     void*   pumpCtx_ = nullptr;
     // fix2 Important-2: the Client's duty-cycle thread id, copied in by

@@ -128,6 +128,11 @@ struct TxnPartitionState {
     uint32_t awaitingRoute = 0;
     int32_t  lastAckedSeq = -1;
     uint64_t lastAckTick  = 0;
+    /// D6 review M2 (Kafka TxnPartitionEntry.lastAckedOffset): the max LAST
+    /// offset any OK of this partition reported (-1 = none; a DuplicateSequence
+    /// OK -1 never moves it).  UnknownProducerId with lastAckedOffset <
+    /// logStartOffset = retention removed every record of ours (KIP-360).
+    int64_t  lastAckedOffset = -1;
 
     TxnPartitionState() = default;
     TxnPartitionState(int32_t tid, int32_t p) : topicId(tid), partition(p) {}
@@ -310,6 +315,7 @@ private:
         int32_t              topicId = 0;
         int32_t              partition = 0;
         int32_t              baseSequence = 0;
+        int32_t              recordCount  = 1;   // D6 review M2: lastAckedOffset = base + count - 1
         std::vector<uint8_t> wireFrame;          // sessionId re-stamped on (re)send
         int32_t              retryCount = 0;
         static constexpr int kMaxRetries = 5;
@@ -466,6 +472,14 @@ private:
     /// I-1: once nothing un-acked lies before a partition's first parked batch,
     /// its parked batches are re-sent (next cycle, in sequence order).
     void armParked_(TxnPartitionState& ps);
+    /// D6 review M2 (KIP-360, Kafka txnPartitionMap.startSequencesAtBeginning):
+    /// UnknownProducerId after retention — the broker has no entry for us on
+    /// this partition, so its sequences restart at 0 under the SAME epoch:
+    /// every in-flight batch of it is re-stamped (frame + CRC-covered batch
+    /// header) in sequence order and re-sent as a new attempt; the transaction
+    /// goes on.  Cold (error path).
+    void restartSequences_(TxnPartitionState& ps);
+    std::vector<int64_t> restartScratch_;  // restartSequences_'s batch list (capacity kept)
 
     TxnStatus statusLast_{};
     bool      statusDirty_ = false;

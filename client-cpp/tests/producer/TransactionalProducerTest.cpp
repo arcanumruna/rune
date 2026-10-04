@@ -2234,6 +2234,121 @@ TEST(TransactionalProducerTest, UnknownProducerIdOnTheHeadMakesTheTxnAbortableRe
     ASSERT_EQ(first.size(), 1u);
     answer(r, corrIdOf(first[0]), ecOf(rpc::ErrorCode::UnknownProducerId));
     EXPECT_EQ(r.tp.state(), TxnState::AbortableError);
+    auto op = r.commit();
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.c().errorCode, static_cast<uint16_t>(rpc::ErrorCode::UnknownProducerId))
+        << "D6 review M2: the app-visible code is 28, not 20";
+}
+
+// ---------------------------------------------------------------------------
+// D6 review M2 — KIP-360 for the transactional producer (Kafka
+// TransactionManager.canRetry): UnknownProducerId with lastAckedOffset <
+// logStartOffset = retention removed every record of ours -> the partition's
+// sequences restart at 0 (txnPartitionMap.startSequencesAtBeginning) and the
+// in-flight batches are re-stamped and re-sent — the transaction is KEPT (no
+// forced abort).  Otherwise the transaction is abortable with the
+// app-visible code 28 (never 20).
+// ---------------------------------------------------------------------------
+namespace {
+void answerUpid(TxnRig& r, int64_t corr, int64_t logStartOffset) {
+    rpc::ProduceResponse m;
+    m.sessionId      = kSessionId;
+    m.correlationId  = corr;
+    m.errorCode      = static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId);
+    m.logStartOffset = logStartOffset;
+    std::vector<uint8_t> b(rpc::ProduceResponse::ENCODED_SIZE);
+    m.encode(b.data());
+    r.impl->onProduceResponse(b.data(), b.size());
+}
+bool batchCrcValid(const std::vector<uint8_t>& frame) {
+    auto p = rune::client::codec::decodeProduce(frame.data(), frame.size());
+    if (!p) return false;
+    rune::protocol::RecordBatchReader rd(p->recordBatch.data(), p->recordBatch.size());
+    return rd.ensureValid();
+}
+int32_t frameSeq(const std::vector<uint8_t>& frame) {
+    auto p = rune::client::codec::decodeProduce(frame.data(), frame.size());
+    return p ? p->baseSequence : -999;
+}
+// One committed transaction whose single record (seq 0) was acked at `off`.
+void committedTxnAckedAt(TxnRig& r, int64_t off) {
+    const auto f = sendData(r, 1);
+    ASSERT_EQ(f.size(), 1u);
+    ASSERT_EQ(decodeBaseSeqFromProduce(f[0]), 0);
+    answer(r, corrIdOf(f[0]), 0, off);
+    auto op = r.commit();
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty());
+    auto resp = makeEndTxnResponse(corrIdOf(et), 0);
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(op.ready());
+    ASSERT_EQ(op.status(), OpStatus::Ok);
+    r.sink.clear();
+}
+} // namespace
+
+TEST(TransactionalProducerTest, UnknownProducerIdAfterRetentionRestartsSequencesAndKeepsTheTxnRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    committedTxnAckedAt(r, /*off=*/10);                      // lastAckedOffset 10; sequences go on at 1
+    const auto f = sendData(r, 2);                            // the next transaction: seq 1, 2
+    ASSERT_EQ(f.size(), 2u);
+    ASSERT_EQ(decodeBaseSeqFromProduce(f[0]), 1);
+    ASSERT_EQ(decodeBaseSeqFromProduce(f[1]), 2);
+    // Retention + failover: the broker forgot us; its log starts at 50 > 10.
+    answerUpid(r, corrIdOf(f[0]), /*logStartOffset=*/50);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction) << "KIP-360: retention must not force an abort";
+    answerUpid(r, corrIdOf(f[1]), 50);                        // the other batch's (superseded) answer
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    r.sink.clear();
+    r.doWork();
+    const auto again = produceFrames(r.sink);
+    ASSERT_EQ(again.size(), 2u) << "both in-flight batches re-sent";
+    EXPECT_EQ(decodeBaseSeqFromProduce(again[0]), 0) << "sequences restart at 0";
+    EXPECT_EQ(frameSeq(again[0]), 0) << "the frame's identity too";
+    EXPECT_EQ(decodeBaseSeqFromProduce(again[1]), 1);
+    EXPECT_EQ(frameSeq(again[1]), 1);
+    EXPECT_TRUE(batchCrcValid(again[0])) << "re-stamped batch CRC";
+    EXPECT_TRUE(batchCrcValid(again[1]));
+    EXPECT_NE(corrIdOf(again[0]), corrIdOf(f[0])) << "a new attempt";
+    // A late 28 of a superseded attempt never decides.
+    answerUpid(r, corrIdOf(f[1]), 50);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    answer(r, corrIdOf(again[0]), 0, 60);
+    answer(r, corrIdOf(again[1]), 0, 61);
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
+    // The next record continues the restarted sequence space.
+    r.tp.send(TopicHandle{1, 1}, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.sink.clear();
+    r.doWork();
+    const auto next = produceFrames(r.sink);
+    ASSERT_EQ(next.size(), 1u);
+    EXPECT_EQ(decodeBaseSeqFromProduce(next[0]), 2);
+    answer(r, corrIdOf(next[0]), 0, 62);
+    auto op = r.commit();
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty()) << "the transaction commits";
+    auto resp = makeEndTxnResponse(corrIdOf(et), 0);
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::Ok);
+}
+
+TEST(TransactionalProducerTest, UnknownProducerIdWithAckedDataAboveTheLogStartIsAbortableWithCode28Regression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    committedTxnAckedAt(r, /*off=*/10);
+    const auto f = sendData(r, 1);
+    ASSERT_EQ(f.size(), 1u);
+    answerUpid(r, corrIdOf(f[0]), /*logStartOffset=*/5);      // acked offset 10 >= 5: not retention
+    EXPECT_EQ(r.tp.state(), TxnState::AbortableError);
+    auto op = r.commit();
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::BrokerError);
+    EXPECT_EQ(op.c().errorCode, static_cast<uint16_t>(rpc::ErrorCode::UnknownProducerId))
+        << "the app sees 28, not 20";
 }
 
 // Backlog B6: a transactional record (key + value) over Producer::kMaxRecordBytes

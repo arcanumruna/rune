@@ -8,8 +8,12 @@
 // attempt of batch b:
 //   U1  lastAckedOffset(partition) < logStartOffset -> re-sequence exactly as C3
 //       (new identity per rule F, b and everything behind it re-stamped and
-//       re-sent) — nothing fails;
-//   U2  otherwise -> outcome UNKNOWN (rule D).
+//       re-sent) — nothing fails (the accepted KIP-360 duplicate window applies);
+//   U2  otherwise (D6 review M1, Kafka canRetry's idempotent branch: always
+//       retry with an epoch bump) -> ALSO re-sequenced: b's attempts would sit
+//       above lastAckedOffset >= logStart, inside the rebuilt range, so a 28
+//       proves none of them is stored — the re-send is duplicate-free.  Counted
+//       as broker state loss (diagnostic), never an app-visible failure.
 //
 // Part 1: bare ProducerImpl (no Aeron, frames captured from the sink, answers
 // injected).  Part 2: end to end — a real Invoker Client against the
@@ -197,37 +201,53 @@ TEST(UnknownProducerIdRegression, U1NothingAckedLogStartPastZeroResequencesRegre
     EXPECT_EQ(b.cap.frames[1].seq, 0);
 }
 
-// U2: the broker should still know us (a record we had acked is at or above
-// the log start) -> outcome UNKNOWN (rule D): b fails, the partition is
-// unresolved (rule E resolves it).
-TEST(UnknownProducerIdRegression, U2AckedAboveTheLogStartIsOutcomeUnknownRegression) {
+// U2 (D6 review M1): the broker should still know us (a record we had acked
+// is at or above the log start) — it lost producer state.  b was provably NOT
+// appended (any attempt of b would sit above lastAckedOffset >= logStart, in
+// the rebuilt range, and would have created an entry): b and every batch
+// behind it are re-sequenced (new epoch, from 0) and re-sent, exactly as U1 —
+// nothing fails, the partition is not unresolved.  Counted as state loss.
+TEST(UnknownProducerIdRegression, U2AckedAboveTheLogStartResequencesWithoutFailingRegression) {
     Bare b(3);
+    const int16_t e = b.cap.frames[0].epoch;
     b.impl.onProduceResponse(b.cap.frames[0].corr, 100, 0);
     b.impl.onProduceResponse(b.cap.frames[1].corr, 0, kUnknownPid, /*logStartOffset=*/50);
     pump(b.impl, b.sink);                                        // C2: re-sent once (predates the OK)
     ASSERT_EQ(b.cap.frames.size(), 4u);
     b.impl.onProduceResponse(b.cap.frames[3].corr, 0, kUnknownPid, /*logStartOffset=*/50);
     pump(b.impl, b.sink);
-    ASSERT_EQ(b.A.acks.size(), 2u);
-    EXPECT_EQ(b.A.acks[1].errorCode, kUnknownPid) << "b fails: outcome unknown";
-    EXPECT_EQ(b.A.acks[1].baseSequence, 1);
-    EXPECT_TRUE(b.ps().unresolved) << "rule D: the partition is unresolved";
-    EXPECT_EQ(b.cap.frames.size(), 4u) << "no re-sequence on U2";
-    EXPECT_EQ(b.ps().epoch, b.cap.frames[0].epoch);
+    EXPECT_EQ(b.A.failures(), 0) << "a batch the broker provably did not append must not fail (Kafka KIP-360)";
+    EXPECT_FALSE(b.ps().unresolved) << "nothing is in doubt";
+    ASSERT_EQ(b.cap.frames.size(), 6u) << "seq 1 and seq 2 re-sent";
+    EXPECT_EQ(b.cap.frames[4].epoch, e + 1) << "rule F: a new epoch";
+    EXPECT_EQ(b.cap.frames[4].seq, 0);
+    EXPECT_EQ(b.cap.frames[5].epoch, e + 1);
+    EXPECT_EQ(b.cap.frames[5].seq, 1);
+    EXPECT_EQ(b.impl.unknownProducerIdStateLoss(), 1u) << "acked data at/above the log start was lost (diagnostic)";
+    b.impl.onProduceResponse(b.cap.frames[4].corr, 700, 0);
+    b.impl.onProduceResponse(b.cap.frames[5].corr, 701, 0);
+    pump(b.impl, b.sink);
+    ASSERT_EQ(b.A.acks.size(), 3u);
+    for (const auto& a : b.A.acks) EXPECT_EQ(a.errorCode, 0);
+    EXPECT_FALSE(b.impl.hasInFlight());
 }
 
-TEST(UnknownProducerIdRegression, U2NothingAckedLogStartZeroIsOutcomeUnknownRegression) {
+TEST(UnknownProducerIdRegression, U2NothingAckedLogStartZeroResequencesRegression) {
+    // Nothing acked and log start 0: any attempt of b would be at >= 0 = the
+    // log start, inside the rebuilt range — a 28 proves it is not stored.
     Bare b(1);
+    const int16_t e = b.cap.frames[0].epoch;
     b.impl.onProduceResponse(b.cap.frames[0].corr, 0, kUnknownPid, /*logStartOffset=*/0);
     pump(b.impl, b.sink);
+    EXPECT_EQ(b.A.failures(), 0);
+    ASSERT_EQ(b.cap.frames.size(), 2u);
+    EXPECT_EQ(b.cap.frames[1].epoch, e + 1);
+    EXPECT_EQ(b.cap.frames[1].seq, 0);
+    EXPECT_EQ(b.impl.unknownProducerIdStateLoss(), 0u) << "nothing acked: no acked data was lost";
+    b.impl.onProduceResponse(b.cap.frames[1].corr, 0, 0);
+    pump(b.impl, b.sink);
     ASSERT_EQ(b.A.acks.size(), 1u);
-    EXPECT_EQ(b.A.acks[0].errorCode, kUnknownPid);
-    // An old broker's frame carries no log start (-1): never U1.
-    Bare c(1);
-    c.impl.onProduceResponse(c.cap.frames[0].corr, 0, kUnknownPid, /*logStartOffset=*/-1);
-    pump(c.impl, c.sink);
-    ASSERT_EQ(c.A.acks.size(), 1u);
-    EXPECT_EQ(c.A.acks[0].errorCode, kUnknownPid);
+    EXPECT_EQ(b.A.acks[0].errorCode, 0);
 }
 
 // Like C1: an older live batch of b's identity exists -> b is parked (its
@@ -466,9 +486,10 @@ TEST(UnknownProducerIdE2ERegression, OldClientVersionKeepsTheOutOfOrderAnswerReg
 }
 
 // Loss, not retention: the state forgot this producer although its acked
-// records are still at/above the log start (an unclean leader) -> U2: the
-// batch fails with its outcome unknown — never silently re-sequenced.
-TEST(UnknownProducerIdE2ERegression, LostProducerStateAboveTheLogStartIsOutcomeUnknownRegression) {
+// records are still at/above the log start (an unclean leader) -> U2 (D6
+// review M1, Kafka parity): the batch was provably not appended, so it is
+// re-sequenced and re-sent — every record Ok exactly once, no spurious failure.
+TEST(UnknownProducerIdE2ERegression, LostProducerStateAboveTheLogStartResequencesExactlyOnceRegression) {
     Rig r(invokerCfg(4064, 4065));
     r.connect();
     r.gw.idempotence = true;
@@ -482,9 +503,13 @@ TEST(UnknownProducerIdE2ERegression, LostProducerStateAboveTheLogStartIsOutcomeU
     r.send(p, topic, 3, 4);
     ASSERT_TRUE(r.drive([&] { return L.count.size() >= 4; }));
     EXPECT_GT(r.gw.unknownPidAnswers, 0);
-    EXPECT_EQ(L.status(4), rc::OpStatus::BrokerError) << "U2: outcome unknown";
-    // Rule E: the partition resolves to a new identity; the producer goes on.
+    EXPECT_EQ(L.status(4), rc::OpStatus::Ok) << "U2: provably not appended -> re-sequenced, not failed";
     r.send(p, topic, 4, 5);
     ASSERT_TRUE(r.drive([&] { return L.count.size() >= 5; }));
+    for (int i = 0; i < 20; ++i) r.step();
     EXPECT_EQ(L.status(5), rc::OpStatus::Ok);
+    EXPECT_TRUE(L.exactlyOnce(1, 6));
+    EXPECT_EQ(loggedIds(r.gw), (std::vector<uint64_t>{0, 1, 2, 3, 4})) << "every record once, in order";
+    EXPECT_EQ(r.gw.crcFailures, 0);
+    EXPECT_EQ(r.gw.identityMismatches, 0);
 }

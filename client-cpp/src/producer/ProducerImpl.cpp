@@ -2171,8 +2171,15 @@ int ProducerImpl::flushBatches(
 //         producer state legitimately) -> the partition is RE-SEQUENCED as in
 //         C3 (new identity per F; b and every batch behind it re-stamped and
 //         re-sent) — nothing fails.
-//     U2. otherwise (the broker should still know us, or nothing was acked and
-//         logStartOffset is 0 / -1 not carried) -> D: b fails, outcome unknown.
+//     U2. otherwise (the broker should still know us: an acked record of ours
+//         is at/above the log start, or nothing was acked and the log start is
+//         0) -> ALSO re-sequenced (D6 review M1, Kafka canRetry's idempotent
+//         branch: UNKNOWN_PRODUCER_ID always retries with an epoch bump).  Any
+//         attempt of b would sit above lastAckedOffset >= logStart, inside the
+//         rebuilt range, and would have created an entry — so the re-send is
+//         provably duplicate-free (no window at all, unlike U1).  The acked-
+//         data case is counted (unknownProducerIdStateLoss: the broker lost
+//         state it should have kept); it is never an app-visible failure.
 //     lastAckedOffset (per partition) = the max last offset of every OK (B).
 // ---------------------------------------------------------------------------
 
@@ -2289,16 +2296,22 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
             reclaimAckRing_(ps);
             return;
         }
-        // U1 (nothing acked and log start 0 / not carried is U2 — no proof).
-        // Accepted window (D6 review M1, same as Kafka KIP-360): U1 proves only THIS attempt was not appended.
+        // U1 (lastAckedOffset < logStartOffset: retention removed our state).
+        // Accepted window (D6 review, same as Kafka KIP-360): U1 proves only THIS attempt was not appended.
         // Earlier attempts on the same lane were answered first (one FIFO publication); cross-lane ones park
         // via C2b above.  Left: an earlier attempt whose OK is lost outright AND whose data was then retained /
         // evicted away before a producer-state rebuild — then the re-sequenced re-send duplicates it.
-        if (logStartOffset > 0 && ps.lastAckedOffset < logStartOffset) {  // retention removed our state
-            resequence_(ps);
-            return;
+        // U2 (D6 review M1): otherwise — b provably not stored (see U2 above): re-sequenced too, no window.
+        if (ps.lastAckedOffset >= 0 && logStartOffset >= 0 && ps.lastAckedOffset >= logStartOffset) [[unlikely]] {
+            ++unknownPidStateLoss_;
+            std::fprintf(stderr,
+                         "ProducerImpl: topic=%d part=%d UnknownProducerId with acked offset %lld >= log start %lld: "
+                         "the broker lost producer state (batch not appended; re-sequenced)\n",
+                         ps.topicId, ps.partition, static_cast<long long>(ps.lastAckedOffset),
+                         static_cast<long long>(logStartOffset));
         }
-        // U2: the broker should still know us — outcome unknown (D, below).
+        resequence_(ps);
+        return;
     }
     if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation)) {
         // N-e (Kafka NOT_ENOUGH_REPLICAS / _AFTER_APPEND: both retriable): the

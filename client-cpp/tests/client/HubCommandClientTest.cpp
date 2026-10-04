@@ -1071,3 +1071,58 @@ TEST(HubCommandClient, TxnNotLeaderReoffersOnTheNewRouteAndCommitsRegression) {
     EXPECT_EQ(r.gw.crcFailures + r.gw.identityMismatches, 0);
     EXPECT_EQ(r.cq.timesCompleted(commit.token()), 1);
 }
+
+// D6 review M2 end to end (real Invoker Client + Aeron IPC, InvokerGateway
+// broker model): a transactional producer whose every record retention removed
+// before a failover (the rebuilt producer state forgot it) meets
+// UnknownProducerId on its next transaction's first batch (seq 1) with
+// logStartOffset past everything it had acked -> KIP-360: the partition's
+// sequences restart at 0 under the same epoch and the transaction COMMITS (no
+// forced abort); each record is written once.  Loss instead (acked data at/above
+// the log start forgotten) -> the commit fails with the app-visible code 28.
+TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionRestartsSequencesAndCommitsRegression) {
+    for (bool retention : {true, false}) {
+        HubRig r(retention ? 4090 : 4092);
+        auto tp = r.client.transactionalProducer(retention ? "tx-upid-ret" : "tx-upid-loss");
+        r.connect();
+        r.gw.initPidReply = true;
+        r.gw.replyTxn     = true;
+        r.gw.idempotence  = true;
+        auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+        ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+        ASSERT_TRUE(init.ok()) << init.describe();
+        tp.beginTransaction();
+        tp.send(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+        auto c1 = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+        ASSERT_TRUE(r.drive([&] { return c1.ready(); })) << c1.describe();
+        ASSERT_EQ(c1.status(), rc::OpStatus::Ok) << c1.describe();
+        ASSERT_EQ(r.gw.log.size(), 1u);
+
+        if (retention) r.gw.retainAndRebuild(r.gw.nextOffset);   // retention + failover
+        else           r.gw.forgetProducers();                   // loss: the acked record is still >= log start
+        ASSERT_EQ(r.gw.knownProducers(), 0u) << "precondition: the broker forgot this producer";
+
+        tp.beginTransaction();
+        tp.send(r.client.topic("t"), rc::Key(uint64_t{2}), std::span<const uint8_t>(kTxnVal));
+        tp.send(r.client.topic("t"), rc::Key(uint64_t{3}), std::span<const uint8_t>(kTxnVal));
+        auto c2 = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+        ASSERT_TRUE(r.drive([&] { return c2.ready(); })) << c2.describe();
+        EXPECT_GT(r.gw.unknownPidAnswers, 0) << "precondition: the broker answered UnknownProducerId";
+        EXPECT_EQ(r.gw.crcFailures + r.gw.identityMismatches, 0) << "re-stamped frames are valid";
+        if (retention) {
+            EXPECT_EQ(c2.status(), rc::OpStatus::Ok) << "KIP-360: retention must not abort the transaction "
+                                                     << c2.describe();
+            ASSERT_EQ(r.gw.log.size(), 2u) << "both records written exactly once";
+            EXPECT_EQ(r.gw.log[0].baseSequence, 0) << "sequences restarted at 0";
+            EXPECT_EQ(r.gw.log[1].baseSequence, 1);
+            EXPECT_EQ(r.gw.log[0].producerEpoch, 0) << "the same epoch (no bump)";
+            EXPECT_EQ(r.gw.endTxnCommits.back(), uint8_t{1});
+        } else {
+            EXPECT_EQ(c2.status(), rc::OpStatus::BrokerError) << c2.describe();
+            EXPECT_EQ(c2.outcome().c.errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
+                << "the app sees 28, not 20";
+            EXPECT_EQ(r.gw.log.size(), 1u) << "only the first (committed) transaction's record: nothing of the failed one";
+        }
+        EXPECT_EQ(r.cq.timesCompleted(c2.token()), 1);
+    }
+}
