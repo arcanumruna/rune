@@ -517,6 +517,14 @@ public:
             -1, -1, std::forward<F>(f), timeout);
     }
 
+    /// Test-only, CONTROL thread only (call inside onControlThreadForTest):
+    /// the durable __cluster_metadata ISR knowledge (round-4 LOW-B tests).
+    [[nodiscard]] const rune::replication::InternalIsrKnowledge* internalIsrKnowledgeForTest() const noexcept {
+        return internalIsrKnowledge_.get();
+    }
+    /// Test-only, CONTROL thread only: the consensus Election (nullptr when none).
+    [[nodiscard]] const rune::consensus::Election* electionForTest() const noexcept { return election_.get(); }
+
     /// Observer-thread-safe: true if the replication metadata bridge has
     /// propagated this node's leadership to all its PartitionReplicas.
     /// Uses the atomic mirror in ReplicationMetadataBridge.
