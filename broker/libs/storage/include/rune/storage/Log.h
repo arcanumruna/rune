@@ -297,6 +297,34 @@ public:
     /// completions a previous owner never observed.  Cold.  Returns the number queued.
     std::size_t requeueUndurableSeals(const LogSegment* const* inFlight = nullptr,
                                       std::size_t nInFlight = 0) noexcept;
+    // ---- E1d MEDIUM-2: directory durability (Kafka flushParentDir parity) ----
+    // R never passes the base of a segment whose directory entry (create /
+    // adopt-rename, or a truncation's deletions) is not yet durable: recovery
+    // trusts segments below R WITHOUT a chain check, so a lost entry there
+    // would read as a compaction gap (a silent offset hole).  Every directory
+    // mutation bumps a generation; a segment records the generation of its
+    // entry; a directory fsync submitted at generation G makes every entry
+    // <= G durable.  Worker-driven logs batch ONE directory fsync through the
+    // io backend (never on the loop) when R is blocked by such an entry; the
+    // legacy inline-seal path fsyncs the directory inline at the roll.
+    //   Idle --prepare--> InFlight(gen) --completed--> Idle
+    struct DirSync { int fd = -1; uint64_t gen = 0; };
+    /// R is blocked by a not-yet-durable directory entry and no directory
+    /// fsync is in flight (O(1)).
+    [[nodiscard]] bool directorySyncDue() const noexcept;
+    /// Idle -> InFlight: the directory fd + the generation it will cover.
+    /// False when not due.  Pure memory.
+    bool prepareDirectorySync(DirSync& out) noexcept;
+    /// InFlight -> Idle (submit refused: back-pressure; still due).
+    void directorySyncNotSubmitted() noexcept;
+    /// The directory fsync covering `gen` completed (err = errno, 0 = ok).
+    /// Success: entries <= gen are durable, R advances.  Error: fail-stop.
+    /// Returns true iff a checkpoint or another directory fsync is now due.
+    bool directorySyncCompleted(uint64_t gen, int err) noexcept;
+    /// F7 parity: a fresh owner holds no route for an in-flight directory
+    /// fsync (its completion went to a previous owner): treated as not done.
+    void resetDirectorySyncForNewOwner() noexcept;
+    [[nodiscard]] uint64_t directorySyncsCompletedForTest() const noexcept { return dirSyncsDone_; }
     [[nodiscard]] uint64_t recoveryCheckpointsForTest() const noexcept { return rpPersists_; }
     /// Crash seam (DR / storage tests): the next destruction is a CRASH, not a
     /// clean shutdown — no recovery-point checkpoint is written.
@@ -590,6 +618,16 @@ private:
         int64_t  value     = 0;
     } rp_;
     uint8_t rpImage_[kRpSlotBytes] = {};   ///< the Prepared slot image (stable until next prepare)
+    // ---- E1d MEDIUM-2 directory durability (owner thread) ----
+    int      dirFd_          = -1;      ///< the log directory, opened once at recovery
+    uint64_t dirMutGen_      = 0;       ///< bumped by every directory mutation
+    uint64_t dirSyncedGen_   = 0;       ///< highest generation a completed dir fsync covers
+    bool     dirSyncInFlight_ = false;
+    uint64_t dirSyncInFlightGen_ = 0;
+    bool     rpDirBlocked_   = false;   ///< R wants to pass a not-yet-durable entry
+    uint64_t dirSyncsDone_   = 0;
+    /// Inline directory fsync (legacy / cold paths).  0 or the errno (fail-stop).
+    int  syncDirectoryInline_() noexcept;
     /// Walk segments from R: advance over fully-durable segments, then into the
     /// first partially-durable one.  Sets rpDue_ on a boundary crossing.
     void advanceRecoveryPoint_() noexcept;

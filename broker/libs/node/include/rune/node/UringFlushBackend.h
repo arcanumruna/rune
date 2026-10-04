@@ -114,6 +114,9 @@ public:
     // reported as ENOSPC.  Takes two in-flight slots.  kNoToken on back-pressure.
     [[nodiscard]] CompletionToken submitWriteSync(int fd, const uint8_t* data, uint32_t len,
                                                   int64_t offset) noexcept;
+    /// E1d MEDIUM-2: IORING_OP_FSYNC with NO DATASYNC flag (a full fsync —
+    /// a directory fd).  kNoToken on back-pressure.
+    [[nodiscard]] CompletionToken submitFsync(int fd) noexcept;
     /// user_data tag of an internal linked-write CQE (low bits = block index).
     static constexpr uint64_t kLinkedWriteTag = uint64_t{1} << 62;
 
@@ -124,6 +127,14 @@ public:
     /// RR2-1: IORING_OP_FADVISE is supported by this kernel / ring (probed at
     /// construction with IORING_REGISTER_PROBE; a failing probe = unsupported).
     [[nodiscard]] bool fadviseSupported() const noexcept { return fadviseSupported_; }
+    /// E1d LOW-4a: IORING_OP_WRITE (kernel 5.6+) is supported (probed at
+    /// construction).  Without it the linked checkpoint write cannot run:
+    /// IoBackend falls back to the portable backend up front (never a
+    /// checkpoint that fails with ECANCELED forever and halts the broker).
+    [[nodiscard]] bool writeSupported() const noexcept { return writeSupported_; }
+    /// Test seam (LOW-4b): the next submitWriteSync's io_uring_enter submits
+    /// only its FIRST SQE — a real partial enter that breaks the link.
+    void forcePartialSubmitForTest(bool on) noexcept { partialSubmitForTest_ = on; }
 
     // reap — worker side (non-blocking).
     //
@@ -178,6 +189,8 @@ private:
 
 
     bool fadviseSupported_{false};
+    bool writeSupported_{false};
+    bool partialSubmitForTest_{false};
     bool probeOpcode_(uint8_t opcode) noexcept;
 
     // The one SQE submission path (fsync, fadvise, internal NOP): reserve the SQ
@@ -186,13 +199,23 @@ private:
     int pushSqe_(const struct io_uring_sqe& sqe) noexcept;
     /// Push `n` (1-2) SQEs with ONE io_uring_enter (a linked chain must be
     /// submitted together).  Same rollback / errors as pushSqe_.
-    int pushSqes_(const struct io_uring_sqe* sqes, uint32_t n) noexcept;
+    /// LOW-4b: a PARTIAL enter (the kernel consumed `submitted` < n) is an
+    /// error: the unconsumed SQEs are rolled back (never submitted later,
+    /// unlinked) and `submitted` tells the caller what is in flight.
+    int pushSqes_(const struct io_uring_sqe* sqes, uint32_t n, uint32_t& submitted,
+                  uint32_t enterCount) noexcept;
 
     // E1d linked-write blocks (pre-allocated in the ctor; worker-owned).
     struct WriteBlock { uint8_t bytes[kWriteSyncMaxBlock]; uint32_t len = 0; CompletionToken token = 0; };
     std::vector<WriteBlock> writeBlocks_;
     std::vector<uint32_t>   freeWriteBlocks_;          ///< stack of free block indices
-    std::vector<CompletionToken> shortWriteTokens_;    ///< fsync tokens whose write was short (rare)
+    /// LOW-4c: fsync tokens whose linked write failed / was short, with the
+    /// WRITE's real errno (short = ENOSPC) — reported instead of ECANCELED.
+    struct WriteFailure { CompletionToken token; int32_t err; };
+    std::vector<WriteFailure> writeFailures_;
+    /// LOW-4b: tokens whose fsync SQE never reached the kernel (a partial
+    /// enter broke the link): delivered by reap() as an error completion.
+    std::vector<WriteFailure> syntheticFailures_;
 
     CompletionToken allocToken_() noexcept;
 };
@@ -205,6 +228,18 @@ int UringFlushBackend::reap(H&& handler) noexcept {
     // CQ tail is written by the kernel; acquire fence to observe kernel writes.
     const uint32_t mask = *cqRingMask_;
     int count = 0;
+    // LOW-4b: a write+fsync whose fsync never reached the kernel completes
+    // with an error (never OK).  Not a CQE: inFlight_ is untouched.
+    if (!syntheticFailures_.empty()) [[unlikely]] {
+        for (const WriteFailure& f : syntheticFailures_) {
+            FlushCompletion comp{};
+            comp.token = f.token;
+            comp.errorCode = f.err;
+            handler(comp);
+            ++count;
+        }
+        syntheticFailures_.clear();
+    }
 
     while (true) {
         // Load-acquire the CQ tail (kernel-written).
@@ -225,9 +260,10 @@ int UringFlushBackend::reap(H&& handler) noexcept {
             const uint32_t bi = static_cast<uint32_t>(cqe->user_data & (kLinkedWriteTag - 1));
             if (bi < writeBlocks_.size()) {
                 WriteBlock& wb = writeBlocks_[bi];
-                if (cqe->res >= 0 && static_cast<uint32_t>(cqe->res) != wb.len &&
-                    shortWriteTokens_.size() < shortWriteTokens_.capacity())
-                    shortWriteTokens_.push_back(wb.token);
+                const int32_t werr = cqe->res < 0 ? -cqe->res
+                                   : (static_cast<uint32_t>(cqe->res) != wb.len ? ENOSPC : 0);
+                if (werr != 0 && wb.token != kNoToken && writeFailures_.size() < writeFailures_.capacity())
+                    writeFailures_.push_back({wb.token, werr});
                 freeWriteBlocks_.push_back(bi);   // capacity reserved: no allocation
             }
         } else if (cqe->user_data != kInternalNopUserData) [[likely]] {
@@ -235,12 +271,13 @@ int UringFlushBackend::reap(H&& handler) noexcept {
             FlushCompletion comp{};
             comp.token     = static_cast<CompletionToken>(cqe->user_data);
             comp.errorCode = (cqe->res < 0) ? -cqe->res : 0;
-            if (!shortWriteTokens_.empty()) [[unlikely]] {
-                for (std::size_t i = 0; i < shortWriteTokens_.size(); ++i) {
-                    if (shortWriteTokens_[i] != comp.token) continue;
-                    if (comp.errorCode == 0) comp.errorCode = ENOSPC;
-                    shortWriteTokens_[i] = shortWriteTokens_.back();
-                    shortWriteTokens_.pop_back();
+            if (!writeFailures_.empty()) [[unlikely]] {
+                for (std::size_t i = 0; i < writeFailures_.size(); ++i) {
+                    if (writeFailures_[i].token != comp.token) continue;
+                    // The write's REAL errno (the linked fsync only says ECANCELED).
+                    if (comp.errorCode == 0 || comp.errorCode == ECANCELED) comp.errorCode = writeFailures_[i].err;
+                    writeFailures_[i] = writeFailures_.back();
+                    writeFailures_.pop_back();
                     break;
                 }
             }

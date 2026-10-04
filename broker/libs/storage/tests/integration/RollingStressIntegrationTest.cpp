@@ -21,9 +21,23 @@
 
 #include <algorithm>
 #include <random>
+#include <sys/resource.h>
 
 using namespace rune::storage;
 namespace fs = std::filesystem;
+
+// Fd-heavy: thousands of live segments (each holds fds) / hundreds of logs
+// exceed the default Linux soft RLIMIT_NOFILE (1024; macOS shells allow far
+// more, so this only ever failed on Linux).  Raise soft to hard once for this
+// binary (unprivileged), like the compaction / retention stress tests.
+static const bool g_fd_limit_raised = [] {
+    struct ::rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        ::setrlimit(RLIMIT_NOFILE, &rl);
+    }
+    return true;
+}();
 
 // ---------------------------------------------------------------------------
 // Helper: build value of variable size based on seed for diversity.

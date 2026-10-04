@@ -1077,6 +1077,7 @@ public:
     [[nodiscard]] uint64_t    sealSubmitsForTest() const noexcept { return sealSubmits_; }
     /// E1d: recovery-point checkpoint fdatasyncs (tmp file + directory) submitted to the io backend.
     [[nodiscard]] uint64_t    recoveryPointSubmitsForTest() const noexcept { return rpSubmits_; }
+    [[nodiscard]] uint64_t    dirSyncSubmitsForTest() const noexcept { return dirSyncSubmits_; }
     [[nodiscard]] uint64_t    storageFailureSignalsForTest() const noexcept { return storageFailureSignals_; }
     [[nodiscard]] std::size_t flushSlotCountForTest() const noexcept { return slots_.size(); }
     /// Completions drained from io_ by reapDurableCompletions_ (any token).
@@ -1710,6 +1711,13 @@ private:
             }
         }
 
+        // E1d MEDIUM-2: a batched directory fsync completed (only while owned;
+        // unowned: the next owner re-issues it — resetDirectorySyncForNewOwner).
+        if (routed && r.kind == RouteKind::DirSync) {
+            if (gate && r.log->directorySyncCompleted(static_cast<uint64_t>(r.aux), c.errorCode))
+                queueRecoveryCheckpoint_(*gate);
+            if (c.errorCode == 0) return 1;
+        }
         // E1d: a recovery-point checkpoint stage completed (only while owned —
         // a purged log is never touched; an error falls through to fail-stop).
         if (routed && r.kind == RouteKind::RecoveryPoint) {
@@ -3735,7 +3743,7 @@ private:
     std::vector<std::pair<rune::storage::Log*, uint32_t>> slotIndex_;
     std::size_t               slotIndexMask_ = 0;
 
-    enum class RouteKind : uint8_t { Durable, Background, Seal, Hint, RecoveryPoint };
+    enum class RouteKind : uint8_t { Durable, Background, Seal, Hint, RecoveryPoint, DirSync };
     struct TokenRoute {
         CompletionToken            token = kNoToken;   ///< kNoToken = empty bucket
         rune::storage::Log*        log   = nullptr;
@@ -3754,6 +3762,7 @@ private:
     uint64_t    bgFlushErrors_  = 0;
     uint64_t    bgFlushDeferred_ = 0;
     uint64_t    sealSubmits_    = 0;
+    uint64_t    dirSyncSubmits_ = 0;   ///< E1d MEDIUM-2: batched directory fsyncs submitted
     uint64_t    rpSubmits_      = 0;   ///< E1d recovery-point checkpoint write+fdatasyncs submitted
     std::vector<rune::storage::Log*> rpQueue_;   ///< E1d F8: logs whose checkpoint is due
     uint64_t    ioCompletionsReaped_ = 0;
@@ -4199,13 +4208,14 @@ private:
                 // broker) and the two-phase migration's drain-before-grant contract
                 // (WorkerPool.h), so another worker never fsyncs a log while this
                 // worker's fsync on it is in flight.
-                bool rpRouted = false;
+                bool rpRouted = false, dirRouted = false;
                 std::vector<const rune::storage::LogSegment*> sealsRouted;   // cold (ownership change)
                 for (const TokenRoute& rt : routes_) {
                     if (rt.token == kNoToken || rt.log != log) continue;
                     if (rt.kind == RouteKind::Durable)    fresh.durableToken = rt.token;
                     if (rt.kind == RouteKind::Background) fresh.bgToken      = rt.token;
                     if (rt.kind == RouteKind::RecoveryPoint) rpRouted = true;
+                    if (rt.kind == RouteKind::DirSync) dirRouted = true;
                     if (rt.kind == RouteKind::Seal) sealsRouted.push_back(rt.seg);
                 }
                 // E1d F7 (cold): a checkpoint / seal whose completion went to a
@@ -4213,6 +4223,7 @@ private:
                 // the checkpoint stage resets (outcome unknown: rewritten with a
                 // higher seq), every not-yet-durable sealed segment is re-sealed.
                 if (!rpRouted) log->resetRecoveryCheckpointForNewOwner();
+                if (!dirRouted) log->resetDirectorySyncForNewOwner();   // MEDIUM-2 (F7 parity)
                 // MEDIUM-1: ALWAYS replay — skip only the segments whose seal is
                 // routed here (their completion still arrives on this worker).
                 (void)log->requeueUndurableSeals(sealsRouted.data(), sealsRouted.size());
@@ -4262,7 +4273,7 @@ private:
         rpQueue_.reserve(slots_.size());
         for (auto& sl : slots_) {
             sl.rpQueued = false;
-            if (sl.log->recoveryCheckpointDue()) { sl.rpQueued = true; rpQueue_.push_back(sl.log); }
+            if (sl.log->recoveryCheckpointDue() || sl.log->directorySyncDue()) { sl.rpQueued = true; rpQueue_.push_back(sl.log); }
         }
         // Prune purged entries that are owned again or have no token in flight.
         for (std::size_t i = 0; i < purgedDirs_.size(); ) {
@@ -4405,8 +4416,30 @@ private:
             rune::storage::Log* log = rpQueue_[i];
             LogFlushSlot* slot = slotOf_(log);
             if (slot == nullptr) continue;                     // purged: dropped
+            // MEDIUM-2: a blocked R first needs ONE batched directory fsync
+            // (io backend, full fsync of the dir fd opened at recovery).
+            bool dirRefused = false;
+            rune::storage::Log::DirSync ds;
+            if (log->prepareDirectorySync(ds)) {
+                const CompletionToken dt = io_.submitFsync(ds.fd);
+                if (dt == kNoToken) {
+                    log->directorySyncNotSubmitted();
+                    dirRefused = true;
+                } else {
+                    if (!routeInsert_(TokenRoute{dt, log, nullptr, slot->epoch, RouteKind::DirSync,
+                                                 static_cast<int64_t>(ds.gen)})) {
+                        spdlog::critical("Worker {}: io token route table full (token={})", workerId_, dt);
+                    }
+                    ++dirSyncSubmits_;
+                    ++work;
+                }
+            }
             rune::storage::Log::RpWrite w;
-            if (!log->prepareRecoveryCheckpoint(w)) { slot->rpQueued = false; continue; }
+            if (!log->prepareRecoveryCheckpoint(w)) {
+                if (dirRefused) { rpQueue_[keep++] = log; continue; }   // back-pressure: retry next pass
+                slot->rpQueued = false;
+                continue;
+            }
             const CompletionToken t = io_.submitWriteSync(w.fd, w.data, w.len, w.offset);
             if (t == kNoToken) {                               // back-pressure: retry next pass
                 log->recoveryCheckpointNotSubmitted();

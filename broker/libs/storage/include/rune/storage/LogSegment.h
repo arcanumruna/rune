@@ -198,6 +198,12 @@ public:
     /// Log::install_) — the segment's identity, never reused (no pointer ABA).
     uint64_t installGen() const noexcept { return installGen_; }
     void setInstallGen(uint64_t g) noexcept { installGen_ = g; }
+    /// E1d MEDIUM-2: the owning Log's directory-mutation generation at which
+    /// this segment's directory entry was last created / renamed (0 = present
+    /// at open: made durable by recovery's directory fsync).  The entry is
+    /// durable once a directory fsync covering this generation completed.
+    uint64_t dirEntryGen() const noexcept { return dirEntryGen_; }
+    void setDirEntryGen(uint64_t g) noexcept { dirEntryGen_ = g; }
 
     /// #5 non-blocking append: preallocate `bytes` of disk blocks for the .log
     /// WITHOUT changing the file size, so subsequent O_APPEND pwrite()s never stall
@@ -300,6 +306,7 @@ private:
     int fd_ = -1;   // POSIX fd for fdatasync — mirrors log_ (write path uses fstream)
     std::unique_ptr<OffsetIndex> index_;
     uint64_t installGen_ = 0;
+    uint64_t dirEntryGen_ = 0;   ///< E1d MEDIUM-2: see dirEntryGen()
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
     int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()
     int64_t durableNext_ = 0;    ///< E1d: see durableNext() (== baseOffset_ when none)

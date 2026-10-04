@@ -33,6 +33,7 @@
 #if defined(__linux__)
 
 #include <rune/node/UringFlushBackend.h>
+#include <rune/node/IoBackend.h>
 
 #include <gtest/gtest.h>
 
@@ -52,6 +53,9 @@
 using rune::node::UringFlushBackend;
 using rune::node::FlushCompletion;
 using rune::node::kNoToken;
+using rune::node::IoBackend;
+using rune::node::IoBackendKind;
+using rune::node::IoBackendRequest;
 
 // ---------------------------------------------------------------------------
 // Helper: poll-reap until 'got.token != 0' or a generous wall-clock deadline.
@@ -366,6 +370,116 @@ TEST(UringDurabilityTest, WriteSyncLinkedPairRoundTripRegression) {
         be.reap([&](const FlushCompletion& x) { ++got; c = x; });
     ASSERT_EQ(got, 1);
     EXPECT_NE(c.errorCode, 0) << "a failed write must never complete OK";
+    ::close(fd);
+    std::filesystem::remove(path);
+}
+
+namespace {
+// Reap until `want` completions arrived and nothing is in flight (bounded).
+template <class Be>
+std::vector<FlushCompletion> reapAll(Be& be, int want) {
+    std::vector<FlushCompletion> out;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while ((static_cast<int>(out.size()) < want || be.inFlight() > 0) && std::chrono::steady_clock::now() < deadline)
+        be.reap([&](const FlushCompletion& x) { out.push_back(x); });
+    return out;
+}
+std::string tmpFile(const char* stem) {
+    return (std::filesystem::temp_directory_path() / (std::string(stem) + std::to_string(::getpid()))).string();
+}
+} // namespace
+
+// E1d fix round 2, LOW-4c: a failed linked write reports ITS errno (here
+// EBADF: the fd is read-only), not the fsync's generic ECANCELED.
+TEST(UringDurabilityTest, WriteSyncFailedWriteReportsItsRealErrnoRegression) {
+    UringFlushBackend be(8, 8);
+    ASSERT_TRUE(be.writeSupported());
+    const std::string path = tmpFile("uring_ws_ro_");
+    { std::ofstream f(path); f << std::string(8192, '\0'); }
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    uint8_t blk[32] = {1, 2, 3};
+    const auto t = be.submitWriteSync(fd, blk, sizeof blk, 0);
+    ASSERT_NE(t, kNoToken);
+    const auto c = reapAll(be, 1);
+    ASSERT_EQ(c.size(), 1u);
+    EXPECT_EQ(c[0].token, t);
+    EXPECT_EQ(c[0].errorCode, EBADF) << "the write's real errno was lost (got " << c[0].errorCode << ")";
+    EXPECT_EQ(be.inFlight(), 0u);
+    ::close(fd);
+    std::filesystem::remove(path);
+}
+
+// LOW-4b: a PARTIAL io_uring_enter that submits the write but not its linked
+// fsync must never count as success: the token completes with an error, the
+// cut fsync never runs later unlinked, and the backend stays usable.
+TEST(UringDurabilityTest, WriteSyncPartialEnterNeverCountsAsSuccessRegression) {
+    UringFlushBackend be(8, 8);
+    const std::string path = tmpFile("uring_ws_partial_");
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    std::vector<char> zero(8192, 0);
+    ASSERT_EQ(::pwrite(fd, zero.data(), zero.size(), 0), 8192);
+    uint8_t blk[32] = {7, 7, 7};
+    be.forcePartialSubmitForTest(true);
+    const auto t = be.submitWriteSync(fd, blk, sizeof blk, 0);
+    ASSERT_NE(t, kNoToken) << "the write reached the kernel: its token must be handed out";
+    const auto c = reapAll(be, 1);
+    ASSERT_EQ(c.size(), 1u) << "exactly one completion for the token (the cut fsync never runs)";
+    EXPECT_EQ(c[0].token, t);
+    EXPECT_NE(c[0].errorCode, 0) << "a broken WRITE->FSYNC link counted as success";
+    EXPECT_EQ(be.inFlight(), 0u);
+    // Still usable, nothing leaked (blocks / SQ): a normal pair round-trips OK.
+    for (int i = 0; i < 10; ++i) {
+        const auto t2 = be.submitWriteSync(fd, blk, sizeof blk, 4096);
+        ASSERT_NE(t2, kNoToken);
+        const auto c2 = reapAll(be, 1);
+        ASSERT_EQ(c2.size(), 1u);
+        EXPECT_EQ(c2[0].token, t2);
+        EXPECT_EQ(c2[0].errorCode, 0);
+    }
+    ::close(fd);
+    std::filesystem::remove(path);
+}
+
+// MEDIUM-2: the full (directory) fsync op round-trips on a directory fd.
+TEST(UringDurabilityTest, FullFsyncOfDirectoryCompletesRegression) {
+    UringFlushBackend be(8, 8);
+    const int dfd = ::open(std::filesystem::temp_directory_path().c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(dfd, 0);
+    const auto t = be.submitFsync(dfd);
+    ASSERT_NE(t, kNoToken);
+    const auto c = reapAll(be, 1);
+    ASSERT_EQ(c.size(), 1u);
+    EXPECT_EQ(c[0].token, t);
+    EXPECT_EQ(c[0].errorCode, 0);
+    ::close(dfd);
+}
+
+// LOW-4a: a kernel without IORING_OP_WRITE never selects io_uring for the
+// worker — it falls back to the portable backend up front (explicit request
+// too: never a halt), and the checkpoint path works there.
+TEST(UringDurabilityTest, MissingOpWriteFallsBackToPortableRegression) {
+    IoBackend be(8, 8, IoBackendRequest{IoBackendKind::Uring, /*autoSelected=*/false,
+                                        /*forceNoUringWriteForTest=*/true});
+    EXPECT_EQ(be.kind(), IoBackendKind::Portable);
+    EXPECT_FALSE(be.fallbackReason().empty());
+    const std::string path = tmpFile("uring_ws_fallback_");
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ASSERT_GE(fd, 0);
+    uint8_t blk[32] = {9};
+    const auto t = be.submitWriteSync(fd, blk, sizeof blk, 0);
+    ASSERT_NE(t, kNoToken);
+    int got = 0; FlushCompletion c{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (got == 0 && std::chrono::steady_clock::now() < deadline)
+        be.reap([&](const FlushCompletion& x) { ++got; c = x; });
+    ASSERT_EQ(got, 1);
+    EXPECT_EQ(c.token, t);
+    EXPECT_EQ(c.errorCode, 0);
+    // The real probe on this kernel: a supported kernel keeps io_uring.
+    IoBackend real(8, 8, IoBackendRequest{IoBackendKind::Uring, false});
+    EXPECT_EQ(real.kind(), IoBackendKind::Uring);
     ::close(fd);
     std::filesystem::remove(path);
 }

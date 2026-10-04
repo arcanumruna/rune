@@ -10,6 +10,7 @@
 // straight into the worker's ingress handler (handleIngressFrameForTest) and
 // control completion delivery (setReapPausedForTest / deliverCompletionForTest)
 // so durability ordering is asserted deterministically.
+#include <sys/resource.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/LogCleanerAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
@@ -52,6 +53,19 @@ using rune::replication::PartitionReplica;
 using rune::replication::Role;
 using rune::storage::Log;
 namespace fs = std::filesystem;
+
+// Fd-heavy: thousands of live segments (each holds fds) / hundreds of logs
+// exceed the default Linux soft RLIMIT_NOFILE (1024; macOS shells allow far
+// more, so this only ever failed on Linux).  Raise soft to hard once for this
+// binary (unprivileged), like the compaction / retention stress tests.
+static const bool g_fd_limit_raised = [] {
+    struct ::rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        ::setrlimit(RLIMIT_NOFILE, &rl);
+    }
+    return true;
+}();
 namespace pc = rune::protocol::client;
 
 namespace {
@@ -3161,6 +3175,35 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), settled) << "never per pass / per append";
 }
 
+// E1d fix round 2, MEDIUM-2: R never passes a rolled segment before its
+// directory entry is durable.  The worker batches ONE directory fsync through
+// its io backend (never inline on the loop) when R is blocked, and only then
+// checkpoints past it.  Invariant checked on every pass.
+TEST_P(StrictPlacementRegression, RecoveryPointWaitsForDirectoryFsyncThroughIoBackend) {
+    StrictShard s(/*rollBytes=*/512, {1}, GetParam());
+    Acks a;
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);  // A
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 600), 0, 1), 1);  // roll: B (new directory entry)
+    ASSERT_EQ(s.produce(3, batchAt(0, 1, 16), 0, 1), 1);   // roll: C
+    const auto bases = s.log->segmentBaseOffsets();
+    ASSERT_EQ(bases.size(), 3u);
+    const int64_t bBase = bases[1], cBase = bases[2];
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < cBase; ++i) {
+        s.w.setReapPausedForTest(false); s.w.doWork(10 + i); s.w.setReapPausedForTest(true);
+        a.drain(s.w); std::this_thread::yield();
+        ASSERT_TRUE(s.log->recoveryPoint() <= bBase || s.log->directorySyncsCompletedForTest() >= 1)
+            << "R passed segment " << bBase << " before a directory fsync made its entry durable";
+    }
+    EXPECT_GE(s.log->persistedRecoveryPoint(), cBase);
+    EXPECT_GE(s.w.dirSyncSubmitsForTest(), 1u) << "the directory fsync must go through the io backend";
+    EXPECT_LE(s.w.dirSyncSubmitsForTest(), 2u) << "batched: one per blocked R, not per pass";
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on the worker loop";
+    const uint64_t settled = s.w.dirSyncSubmitsForTest();
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < 100; ++i) { s.w.doWork(10'000 + i); a.drain(s.w); }
+    EXPECT_EQ(s.w.dirSyncSubmitsForTest(), settled) << "never per pass";
+}
+
 TEST(ShardNonBlockingRegression, RecoveryPointCheckpointFsyncErrorIsFailStop) {
     StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
     ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
@@ -3177,7 +3220,12 @@ TEST(ShardNonBlockingRegression, RecoveryPointCheckpointFsyncErrorIsFailStop) {
     ASSERT_FALSE(s.log->storageFailed());
     s.w.forceFlushErrorForTest(EIO);                       // ... and it fails
     s.w.setReapPausedForTest(false);
-    for (int i = 0; i < kCap && !s.log->storageFailed(); ++i) { s.w.doWork(1'000 + i); a.drain(s.w); std::this_thread::yield(); }
+    // Fix round 2: a batched directory fsync (MEDIUM-2) may be in flight next
+    // to the checkpoint; its forced-error completion can fail the log first —
+    // wait for the CHECKPOINT's completion too.
+    for (int i = 0; i < kCap && (!s.log->storageFailed() || s.log->recoveryCheckpointStage() != RpStage::Idle); ++i) {
+        s.w.doWork(1'000 + i); a.drain(s.w); std::this_thread::yield();
+    }
     EXPECT_TRUE(s.log->storageFailed()) << "a failed recovery-point write/fdatasync is fail-stop (fsyncgate)";
     EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle);
     EXPECT_EQ(s.log->persistedRecoveryPoint(), 0) << "an unacknowledged slot never counts";

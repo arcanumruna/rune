@@ -2631,6 +2631,8 @@ TEST(CompactionCleanerAgentRegression, NeverCompactsAboveRecoveryPoint) {
         ASSERT_EQ(::fsync(s->logFd()), 0);
         log.noteFlushCompleted(s, INT64_MAX);
         log.unpinSegmentFlush(s);
+        Log::DirSync d;                                  // E1d MEDIUM-2: + the worker's directory fsync
+        if (log.prepareDirectorySync(d)) log.directorySyncCompleted(d.gen, ::fsync(d.fd) == 0 ? 0 : errno);
     };
     completeSeal();                                      // seg0 durable
     Log::RpWrite w;                                       // ... and its checkpoint durable

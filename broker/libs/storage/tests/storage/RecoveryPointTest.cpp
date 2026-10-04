@@ -71,9 +71,18 @@ void expectGapFree(Log& log) {
     EXPECT_EQ(expect, log.logEndOffset());
 }
 
-// Complete the oldest pending async seal exactly as the worker does: fdatasync
-// its fd (here inline), then report the completion.
-void completeFrontSeal(Log& log) {
+// The io backend's directory fsync, as the worker drives it (MEDIUM-2):
+// prepare -> fsync(dir fd) -> completion.  Returns false when none was due.
+bool driveDirSync(Log& log) {
+    Log::DirSync d;
+    if (!log.prepareDirectorySync(d)) return false;
+    log.directorySyncCompleted(d.gen, ::fsync(d.fd) == 0 ? 0 : errno);
+    return true;
+}
+
+// Complete the oldest pending async seal: fdatasync its fd (here inline), then
+// report the completion — WITHOUT the directory fsync the worker would issue.
+void completeFrontSealNoDirSync(Log& log) {
     LogSegment* seg = log.frontPendingSeal();
     ASSERT_NE(seg, nullptr);
     log.popPendingSeal();
@@ -82,7 +91,14 @@ void completeFrontSeal(Log& log) {
     log.unpinSegmentFlush(seg);
 }
 
-// Async active-segment flush as the worker does it (pin, fdatasync, complete).
+// ... exactly as the worker does: plus the directory fsync once it is due.
+void completeFrontSeal(Log& log) {
+    completeFrontSealNoDirSync(log);
+    (void)driveDirSync(log);
+}
+
+// Async active-segment flush as the worker does it (pin, fdatasync, complete
+// — and the directory fsync once due).
 void flushActive(Log& log) {
     LogSegment* seg = log.activeSegmentForFlush();
     seg->pinFlush();
@@ -90,6 +106,7 @@ void flushActive(Log& log) {
     ASSERT_EQ(::fsync(seg->logFd()), 0);
     log.noteFlushCompleted(seg, boundary);
     log.unpinSegmentFlush(seg);
+    (void)driveDirSync(log);
 }
 
 // The io backend's work for one checkpoint request: pwrite + fdatasync.
@@ -513,7 +530,8 @@ TEST(RecoveryPointRegression, OutOfOrderSealCompletions_AdvanceRInOrder) {
     EXPECT_EQ(log->recoveryPoint(), 0) << "seg2's completion skipped pending seg0/seg1";
     EXPECT_FALSE(log->noteFlushCompleted(s1, INT64_MAX));
     EXPECT_EQ(log->recoveryPoint(), 0);
-    EXPECT_TRUE(log->noteFlushCompleted(s0, INT64_MAX)) << "the checkpoint becomes due";
+    EXPECT_TRUE(log->noteFlushCompleted(s0, INT64_MAX)) << "the checkpoint (or its directory fsync) becomes due";
+    (void)driveDirSync(*log);                             // MEDIUM-2: the rolled entries become durable
     EXPECT_EQ(log->recoveryPoint(), bases[3]) << "all three in order: R reaches the active base";
     for (LogSegment* sg : {s0, s1, s2}) log->unpinSegmentFlush(sg);
     fs::remove_all(dir);
@@ -689,5 +707,89 @@ TEST(RecoveryPointRegression, CompletionObservedThenTruncate_PowerLoss_NoOffsetG
     auto rec = std::make_unique<Log>(dir.string(), kRoll);
     rec->recover();
     expectGapFree(*rec);
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// E1d fix round 2, MEDIUM-2: R never passes the base of a segment whose
+// directory entry is not yet durable.  The seals of A and B completed, but
+// B's entry (created at the roll) is not covered by a directory fsync: R
+// stops at B's base.  Once the directory fsync completes, R reaches C.
+// ---------------------------------------------------------------------------
+TEST(RecoveryPointRegression, RNeverPassesSegmentWhoseDirectoryEntryIsNotDurable) {
+    const auto dir = freshDir("rp_dir_gate");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSealNoDirSync(*log);
+    completeFrontSealNoDirSync(*log);
+    EXPECT_LE(log->recoveryPoint(), bases[1])
+        << "R passed segment " << bases[1] << " before its directory entry was durable";
+    EXPECT_TRUE(log->directorySyncDue()) << "the blocked R must request ONE directory fsync";
+    EXPECT_FALSE(log->recoveryCheckpointDue() && log->recoveryPoint() > bases[1]);
+    Log::DirSync d;
+    ASSERT_TRUE(log->prepareDirectorySync(d));
+    EXPECT_FALSE(log->directorySyncDue()) << "one directory fsync in flight at a time";
+    EXPECT_TRUE(log->directorySyncCompleted(d.gen, ::fsync(d.fd) == 0 ? 0 : errno))
+        << "the completion makes the checkpoint due";
+    EXPECT_EQ(log->recoveryPoint(), bases[2]);
+    EXPECT_FALSE(log->directorySyncDue());
+    EXPECT_EQ(log->syncCallsForTest(), 0u) << "no inline fsync on the worker-driven path";
+    fs::remove_all(dir);
+}
+
+// MEDIUM-2 end to end: the checkpoint is written as soon as it is due, then a
+// power loss loses B's (never fsynced) directory entry.  B must not be in the
+// trusted region: recovery validates the chain from R and never reports a hole.
+TEST(RecoveryPointRegression, LostDirectoryEntryNeverBecomesAnOffsetHole) {
+    const auto dir = freshDir("rp_dir_lost");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSealNoDirSync(*log);
+    completeFrontSealNoDirSync(*log);
+    completeFrontSealNoDirSync(*log);
+    if (log->recoveryCheckpointDue()) driveCheckpoint(*log);
+    crashKeepPageCache(log);
+    fs::remove(segPath(dir, bases[1]));                   // B's entry never became durable
+    auto rec = std::make_unique<Log>(dir.string(), kRoll);
+    rec->recover();
+    expectGapFree(*rec);
+    fs::remove_all(dir);
+}
+
+// A truncation's deletions are directory mutations too: R does not move past
+// the truncation point again until a directory fsync covered them.
+TEST(RecoveryPointRegression, TruncationDeletionsGateRUntilDirectorySync) {
+    const auto dir = freshDir("rp_dir_trunc");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 3) appendOne(*log);
+    const auto bases = log->segmentBaseOffsets();
+    completeFrontSeal(*log);
+    completeFrontSeal(*log);
+    log->truncateTo(bases[1] + 1);                        // deletes C
+    const int64_t r0 = log->recoveryPoint();
+    appendOne(*log, "x"); appendOne(*log, "x");
+    LogSegment* seg = log->activeSegmentForFlush();
+    seg->pinFlush();
+    const int64_t boundary = log->flushBoundary();
+    ASSERT_EQ(::fsync(seg->logFd()), 0);
+    log->noteFlushCompleted(seg, boundary);
+    log->unpinSegmentFlush(seg);
+    EXPECT_EQ(log->recoveryPoint(), r0) << "R moved past the truncation before its deletions were durable";
+    EXPECT_TRUE(log->directorySyncDue());
+    ASSERT_TRUE(driveDirSync(*log));
+    EXPECT_EQ(log->recoveryPoint(), boundary);
+    fs::remove_all(dir);
+}
+
+// The legacy inline-seal path fsyncs the directory inline at the roll, so its
+// R (and the once-per-roll checkpoint) still reach the active base.
+TEST(RecoveryPointRegression, LegacyRollFsyncsDirectoryInline) {
+    const auto dir = freshDir("rp_dir_legacy");
+    auto log = openRecovered(dir, kRoll, false);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log);
+    EXPECT_GE(log->directorySyncsCompletedForTest(), 2u) << "no directory fsync for the rolled segments";
+    EXPECT_EQ(log->persistedRecoveryPoint(), log->segmentBaseOffsets().back());
     fs::remove_all(dir);
 }

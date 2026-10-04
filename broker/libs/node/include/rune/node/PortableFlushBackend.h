@@ -75,6 +75,11 @@ inline constexpr std::size_t kWriteSyncWireLen =
     flushsbe::MessageHeader::encodedLength() + flushsbe::WriteSyncRequest::sbeBlockLength();
 /// Largest inline block a write+fdatasync request carries.
 inline constexpr std::size_t kWriteSyncMaxBlock = flushsbe::WriteSyncRequest::blockLength();
+/// E1d MEDIUM-2: a FULL fsync request (a directory) — the FlushRequest body
+/// under its own ring record type (the record type is the ring's, not the SBE
+/// template id), so no schema change: the flusher calls ::fsync, never the
+/// data-sync primitive.
+inline constexpr std::int32_t kFullFsyncRecordType = 1001;
 inline constexpr std::size_t kSubmitRingMaxWireLen =
     kWriteSyncWireLen > kFlushRequestWireLen ? kWriteSyncWireLen : kFlushRequestWireLen;
 
@@ -194,6 +199,10 @@ public:
     // write = ENOSPC).  kNoToken on back-pressure / len too large.
     [[nodiscard]] CompletionToken submitWriteSync(int fd, const uint8_t* data, uint32_t len,
                                                   int64_t offset) noexcept;
+
+    // E1d MEDIUM-2: a FULL ::fsync(fd) on the flusher thread (a directory fd:
+    // makes its entries durable).  Same token space; kNoToken on back-pressure.
+    [[nodiscard]] CompletionToken submitFsync(int fd) noexcept;
 
     // -----------------------------------------------------------------------
     // reap — worker side (non-blocking).
@@ -327,6 +336,20 @@ CompletionToken BasicPortableFlushBackend<Sync>::submitWriteSync(int fd, const u
     return tok;
 }
 
+template <PortableSyncFn Sync>
+CompletionToken BasicPortableFlushBackend<Sync>::submitFsync(int fd) noexcept {
+    if (inFlight_ >= submitDepth_) return kNoToken;
+    const CompletionToken tok = ++nextToken_;
+    const auto idx = submitRing_.tryClaim(kFullFsyncRecordType, kFlushRequestWireLen);
+    if (idx < 0) { --nextToken_; return kNoToken; }
+    flushsbe::FlushRequest enc;
+    enc.wrapAndApplyHeader(reinterpret_cast<char*>(submitRing_.base() + idx), 0, kFlushRequestWireLen);
+    enc.fd(fd).flushBoundary(0).token(static_cast<int64_t>(tok));
+    submitRing_.commit(idx);
+    ++inFlight_;
+    return tok;
+}
+
 namespace detail {
 // E1d: execute one WriteSyncRequest slot (flusher thread): pwrite then sync.
 template <PortableSyncFn Sync>
@@ -383,6 +406,11 @@ void BasicPortableFlushBackend<Sync>::flusherLoop_() {
                 if (msgTypeId == static_cast<int32_t>(flushsbe::WriteSyncRequest::sbeTemplateId())) {
                     int fd = -1;   // E1d: pwrite + fdatasync (may block — off the worker path)
                     ec = detail::runWriteSync<Sync>(buf, offset, length, reqTok, fd);
+                } else if (msgTypeId == kFullFsyncRecordType) {
+                    // E1d MEDIUM-2: a directory — full fsync (entries are metadata).
+                    const FlushRequest r = detail::decodeFlushRequest(buf, offset, length);
+                    reqTok = r.token;
+                    ec = ::fsync(r.fd) == 0 ? 0 : (errno != 0 ? errno : EIO);
                 } else {
                     // read-rework SBE-C: SBE-decode the request in place (zero-copy).
                     const FlushRequest r = detail::decodeFlushRequest(buf, offset, length);
@@ -437,6 +465,10 @@ void BasicPortableFlushBackend<Sync>::flusherLoop_() {
             if (msgTypeId == static_cast<int32_t>(flushsbe::WriteSyncRequest::sbeTemplateId())) {
                 CompletionToken t = 0; int fd = -1;
                 (void)detail::runWriteSync<Sync>(buf, offset, length, t, fd);
+                return;
+            }
+            if (msgTypeId == kFullFsyncRecordType) {
+                (void)::fsync(detail::decodeFlushRequest(buf, offset, length).fd);
                 return;
             }
             (void)Sync(detail::decodeFlushRequest(buf, offset, length).fd);

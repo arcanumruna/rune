@@ -51,6 +51,7 @@ inline constexpr const char* kIoBackendEnv = "RUNE_IO_BACKEND";
 struct IoBackendRequest {
     IoBackendKind kind;
     bool          autoSelected;
+    bool          forceNoUringWriteForTest = false;   ///< LOW-4a test seam (probe says "unsupported")
 };
 
 [[nodiscard]] inline IoBackendKind selectIoBackendFromEnv() noexcept;
@@ -106,6 +107,16 @@ public:
             uring_.emplace(submitDepth, completionDepth);
 #endif
         }, fallbackReason_);
+#if defined(__linux__)
+        // E1d LOW-4a: without IORING_OP_WRITE every recovery-point checkpoint
+        // would fail (ECANCELED -> fail-stop -> halt).  Fall back to the
+        // portable backend up front instead — explicit or auto, never a halt.
+        if (kind_ == IoBackendKind::Uring && (!uring_->writeSupported() || req.forceNoUringWriteForTest)) {
+            uring_.reset();
+            kind_ = IoBackendKind::Portable;
+            fallbackReason_ = "io_uring lacks IORING_OP_WRITE (kernel < 5.6) — portable backend";
+        }
+#endif
         if (kind_ == IoBackendKind::Portable) portable_.emplace(submitDepth, completionDepth);
     }
     IoBackend(const IoBackend&)            = delete;
@@ -141,6 +152,17 @@ public:
         if (kind_ == IoBackendKind::Uring) [[likely]] return uring_->submitWriteSync(fd, data, len, offset);
 #endif
         if (kind_ == IoBackendKind::Portable) return portable_->submitWriteSync(fd, data, len, offset);
+        return kNoToken;
+    }
+
+    /// E1d MEDIUM-2: a FULL fsync(fd) — a directory fd, making its entries
+    /// (segment create / rename / delete) durable.  io_uring: IORING_OP_FSYNC
+    /// without DATASYNC; portable: ::fsync on the flusher.  kNoToken on back-pressure.
+    [[nodiscard]] CompletionToken submitFsync(int fd) noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) [[likely]] return uring_->submitFsync(fd);
+#endif
+        if (kind_ == IoBackendKind::Portable) return portable_->submitFsync(fd);
         return kNoToken;
     }
 

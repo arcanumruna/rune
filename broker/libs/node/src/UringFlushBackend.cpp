@@ -180,6 +180,8 @@ UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
     // hints: the worker uses the synchronous hint instead (never a hint that
     // fails forever and stalls a read_committed build).
     fadviseSupported_ = probeOpcode_(IORING_OP_FADVISE);
+    // E1d LOW-4a: the checkpoint's linked write needs IORING_OP_WRITE (5.6+).
+    writeSupported_ = probeOpcode_(IORING_OP_WRITE);
 
     // E1d: pre-allocate the linked-write blocks (at most one per two in-flight
     // slots) — submitWriteSync never allocates.
@@ -187,7 +189,8 @@ UringFlushBackend::UringFlushBackend(std::size_t submitDepth,
     writeBlocks_.resize(nBlocks);
     freeWriteBlocks_.reserve(nBlocks);
     for (std::size_t i = nBlocks; i > 0; --i) freeWriteBlocks_.push_back(static_cast<uint32_t>(i - 1));
-    shortWriteTokens_.reserve(nBlocks);
+    writeFailures_.reserve(nBlocks);
+    syntheticFailures_.reserve(nBlocks);
 }
 
 bool UringFlushBackend::probeOpcode_(uint8_t opcode) noexcept {
@@ -244,7 +247,9 @@ UringFlushBackend::~UringFlushBackend() {
 // ---------------------------------------------------------------------------
 // pushSqe_ — the single SQE submission path
 // ---------------------------------------------------------------------------
-int UringFlushBackend::pushSqes_(const struct io_uring_sqe* sqes, uint32_t n) noexcept {
+int UringFlushBackend::pushSqes_(const struct io_uring_sqe* sqes, uint32_t n, uint32_t& submitted,
+                                 uint32_t enterCount) noexcept {
+    submitted = 0;
     // Load SQ head with acquire semantics — the kernel writes head after
     // consuming SQEs, so we need to observe that write here.
     const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);
@@ -264,16 +269,28 @@ int UringFlushBackend::pushSqes_(const struct io_uring_sqe* sqes, uint32_t n) no
 
     // Submit ALL n with ONE enter (E1d: a linked chain must not end a
     // submission batch); min_complete=0 (async — don't wait for completion).
-    if (rune_io_uring_enter(ringFd_, /*to_submit=*/n, /*min_complete=*/0, /*flags=*/0) < 0) {
+    const int ret = rune_io_uring_enter(ringFd_, /*to_submit=*/enterCount, /*min_complete=*/0, /*flags=*/0);
+    if (ret < 0) {
         const int e = errno;
         // io_uring_enter failed — undo the tail advance; the caller sees back-pressure.
         __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE);
-        return e;
+        return e != 0 ? e : EIO;
+    }
+    submitted = static_cast<uint32_t>(ret) < n ? static_cast<uint32_t>(ret) : n;
+    if (submitted < n) {
+        // LOW-4b: a PARTIAL enter.  Roll the unconsumed SQEs back (the kernel
+        // never read them) so they are never submitted later — a linked
+        // chain cut here must not have its tail run unlinked.
+        __atomic_store_n(sqTail_, tail + submitted, __ATOMIC_RELEASE);
+        return EAGAIN;
     }
     return 0;
 }
 
-int UringFlushBackend::pushSqe_(const struct io_uring_sqe& sqe) noexcept { return pushSqes_(&sqe, 1); }
+int UringFlushBackend::pushSqe_(const struct io_uring_sqe& sqe) noexcept {
+    uint32_t submitted = 0;
+    return pushSqes_(&sqe, 1, submitted, 1);   // n == 1: partial == none submitted (rolled back)
+}
 
 CompletionToken UringFlushBackend::allocToken_() noexcept {
     // 0 == kNoToken is reserved; skip it on wraparound.
@@ -311,6 +328,19 @@ CompletionToken UringFlushBackend::submit(int fd,
     return tok;
 }
 
+CompletionToken UringFlushBackend::submitFsync(int fd) noexcept {
+    if (inFlight_ >= submitDepth_) return kNoToken;
+    const CompletionToken tok = allocToken_();
+    struct io_uring_sqe sqe{};
+    sqe.opcode      = IORING_OP_FSYNC;
+    sqe.fd          = fd;
+    sqe.fsync_flags = 0;   // full fsync (directory metadata)
+    sqe.user_data   = static_cast<uint64_t>(tok);
+    if (pushSqe_(sqe) != 0) return kNoToken;
+    ++inFlight_;
+    return tok;
+}
+
 // ---------------------------------------------------------------------------
 // E1d: linked write + fdatasync (recovery-point checkpoint slot).
 // ---------------------------------------------------------------------------
@@ -336,9 +366,22 @@ CompletionToken UringFlushBackend::submitWriteSync(int fd, const uint8_t* data, 
     sqe[1].fd          = fd;
     sqe[1].fsync_flags = IORING_FSYNC_DATASYNC;
     sqe[1].user_data   = static_cast<uint64_t>(tok);
-    if (pushSqes_(sqe, 2) != 0) return kNoToken;   // back-pressure: the caller retries
-    freeWriteBlocks_.pop_back();
-    inFlight_ += 2;   // two CQEs will be reaped
+    uint32_t submitted = 0;
+    const uint32_t enterCount = partialSubmitForTest_ ? 1u : 2u;
+    partialSubmitForTest_ = false;
+    const int e = pushSqes_(sqe, 2, submitted, enterCount);
+    if (submitted == 0) return e == 0 ? tok : kNoToken;   // nothing reached the kernel: back-pressure
+    freeWriteBlocks_.pop_back();                          // the write owns its block until its CQE
+    if (submitted == 2) {
+        inFlight_ += 2;   // two CQEs will be reaped
+        return tok;
+    }
+    // LOW-4b: only the WRITE reached the kernel (a partial enter cut the
+    // link; its fsync was rolled back).  The write may still land — so the
+    // token is handed out and completes with an ERROR (fail-stop), never OK
+    // and never silently forgotten.
+    inFlight_ += 1;
+    if (syntheticFailures_.size() < syntheticFailures_.capacity()) syntheticFailures_.push_back({tok, EIO});
     return tok;
 }
 

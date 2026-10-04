@@ -112,6 +112,7 @@ Log::~Log() {
         if (std::filesystem::is_directory(dir_, ec)) (void)checkpointRecoveryPoint();   // dir removed: nothing to persist
     }
     if (rpFd_ >= 0) { ::close(rpFd_); rpFd_ = -1; }
+    if (dirFd_ >= 0) { ::close(dirFd_); dirFd_ = -1; }
     // The background thread has been stopped by the owner before Log destruction,
     // so these are single-threaded.  Finalize any pending staging→base renames so
     // a clean shutdown leaves correctly-named files on disk (otherwise the next
@@ -375,6 +376,12 @@ void Log::installNextSegment(int64_t base) {
             /*prefaultIndex*/false, /*eagerReadMap*/true);
         install_(base, std::move(seg));
     }
+    // MEDIUM-2: a new directory entry (the bg thread created the adopted
+    // staging file before publishing it; the fallback created it just now).
+    // A crash before its rename leaves the staging name, which construction
+    // reconciles — so the entry is durable once a directory fsync issued
+    // after this point completes.
+    segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);
 }
 
 // --- Staging path helpers (background-pre-provisioning naming convention) ---
@@ -638,6 +645,17 @@ int64_t Log::recover() {
     // known (CP-5.1: a 0 timestamp reads "ancient").
     recoveryPoint_ = next;
     rpDue_ = false;
+    // MEDIUM-2: every entry present now (recoverStagingFiles' renames, segment
+    // files of earlier incarnations) becomes durable before R = LEO trusts it:
+    // the directory fd is opened ONCE (kept for the io backend's batched
+    // directory fsyncs) and fsynced here, cold.
+    if (dirFd_ < 0) {
+        dirFd_ = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dirFd_ < 0 && storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
+    }
+    if (!corrupt && storage_.failedErrno == 0) (void)syncDirectoryInline_();
+    dirSyncedGen_ = storage_.failedErrno == 0 ? dirMutGen_ : dirSyncedGen_;
+    rpDirBlocked_ = false;
     if (!corrupt && storage_.failedErrno == 0) {
         if (rpFd_ < 0 && rf.state == RpFileState::Valid) {
             rpFd_ = ::open(rpPath_.c_str(), O_RDWR);
@@ -922,20 +940,35 @@ void Log::advanceRecoveryPoint_() noexcept {
     auto it = segments_.upper_bound(recoveryPoint_);
     if (it != segments_.begin()) --it;
     int64_t r = recoveryPoint_;
+    bool dirBlocked = false;
     while (it != segments_.end()) {
         LogSegment& seg = *it->second;
-        if (seg.durableNext() > r) r = seg.durableNext();
         auto nx = std::next(it);
+        if (seg.dirEntryGen() > dirSyncedGen_) [[unlikely]] {
+            // MEDIUM-2: never past the base of a segment whose directory entry
+            // is not durable yet.  Blocked = R would otherwise progress here.
+            dirBlocked = seg.durableNext() > r ||
+                         (nx != segments_.end() && seg.fullyDurable() && nx->first > r);
+            break;
+        }
+        if (seg.durableNext() > r) r = seg.durableNext();
         if (nx == segments_.end() || !seg.fullyDurable()) break;
         if (nx->first > r) r = nx->first;   // a sealed segment fully durable: R reaches the next base
         it = nx;
     }
+    rpDirBlocked_ = dirBlocked;
     if (r <= recoveryPoint_) return;
     recoveryPoint_ = r;
     if (!rpDue_) refreshRpDue_();
 }
 
 void Log::maybeCheckpointInline_() noexcept {
+    // MEDIUM-2, legacy (inline-seal) logs only: the roll already fsyncs
+    // inline; the directory fsync that unblocks R is inline too.
+    if (rpDirBlocked_ && !deferSealSync_ && recovered_ && dirFd_ >= 0 && storage_.failedErrno == 0) [[unlikely]] {
+        if (syncDirectoryInline_() != 0) return;   // fail-stop (sticky)
+        advanceRecoveryPoint_();
+    }
     if (rpDue_ && !deferSealSync_ && recovered_ && storage_.failedErrno == 0 &&
         rp_.stage == RpStage::Idle)
         (void)checkpointRecoveryPoint();
@@ -945,7 +978,7 @@ bool Log::noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept {
     if (seg == nullptr) return false;
     seg->markDurableThrough(upTo);
     advanceRecoveryPoint_();
-    return recoveryCheckpointDue();
+    return recoveryCheckpointDue() || directorySyncDue();
 }
 
 bool Log::prepareRecoveryCheckpoint(RpWrite& out) noexcept {
@@ -995,7 +1028,7 @@ bool Log::recoveryCheckpointCompleted(uint64_t seq, int err) noexcept {
         if (moved && !segments_.empty()) publishSealedSnapshot();   // cold: ≈ once per roll
     }
     refreshRpDue_();
-    return recoveryCheckpointDue();
+    return recoveryCheckpointDue() || directorySyncDue();
 }
 
 void Log::resetRecoveryCheckpointForNewOwner() noexcept {
@@ -1045,6 +1078,53 @@ void Log::persistAtMost_(int64_t bound) noexcept {
     else refreshRpDue_();
 }
 
+bool Log::directorySyncDue() const noexcept {
+    return rpDirBlocked_ && !dirSyncInFlight_ && recovered_ && dirFd_ >= 0 &&
+           storage_.failedErrno == 0 && dirMutGen_ > dirSyncedGen_;
+}
+
+bool Log::prepareDirectorySync(DirSync& out) noexcept {
+    if (!directorySyncDue()) return false;
+    dirSyncInFlight_ = true;
+    dirSyncInFlightGen_ = dirMutGen_;   // every mutation so far has returned: the fsync covers it
+    out.fd = dirFd_; out.gen = dirMutGen_;
+    return true;
+}
+
+void Log::directorySyncNotSubmitted() noexcept { dirSyncInFlight_ = false; }
+
+bool Log::directorySyncCompleted(uint64_t gen, int err) noexcept {
+    if (!dirSyncInFlight_ || gen != dirSyncInFlightGen_) return false;   // long gone
+    dirSyncInFlight_ = false;
+    if (err != 0) {
+        if (storage_.failedErrno == 0) storage_.failedErrno = err;
+        spdlog::critical("Log {}: async directory fsync FAILED (errno={}) — log failed", dir_, err);
+        return false;
+    }
+    if (gen > dirSyncedGen_) dirSyncedGen_ = gen;
+    ++dirSyncsDone_;
+    advanceRecoveryPoint_();
+    return recoveryCheckpointDue() || directorySyncDue();
+}
+
+void Log::resetDirectorySyncForNewOwner() noexcept { dirSyncInFlight_ = false; }
+
+int Log::syncDirectoryInline_() noexcept {
+    if (dirFd_ < 0) return 0;
+    const uint64_t gen = dirMutGen_;
+    ++storage_.roleChangeSyncs;
+    int err = storage_.faultForTest;
+    if (err == 0 && ::fsync(dirFd_) != 0) err = errno != 0 ? errno : EIO;
+    if (err != 0) {
+        if (storage_.failedErrno == 0) storage_.failedErrno = err;
+        spdlog::critical("Log {}: directory fsync FAILED (errno={}) — log failed", dir_, err);
+        return err;
+    }
+    if (gen > dirSyncedGen_) dirSyncedGen_ = gen;
+    ++dirSyncsDone_;
+    return 0;
+}
+
 void Log::sync() {
     activeSegment().sync();   // throws + marks failed on error (LogSegment::sync)
     advanceRecoveryPoint_();  // E1d
@@ -1062,6 +1142,10 @@ void Log::install_(int64_t base, std::unique_ptr<LogSegment> seg) {
     seg->setInstallGen(++segInstallGen_);   // F15 S4 N1: identity, never reused
     auto it = segments_.find(base);
     if (it != segments_.end()) {
+        // MEDIUM-2: a rebuilt / reloaded object over the SAME file name keeps
+        // its entry's generation (callers that also mutated the directory
+        // raise it afterwards).
+        if (seg->dirEntryGen() == 0 && it->second) seg->setDirEntryGen(it->second->dirEntryGen());
         retire_(std::move(it->second));
         it->second = std::move(seg);
     } else {
@@ -1152,6 +1236,7 @@ void Log::truncateTo(int64_t truncateOffset) {
 
     // Remove segments that start at or beyond truncateOffset.
     auto it = segments_.lower_bound(truncateOffset);
+    const bool deletesFiles = it != segments_.end();   // MEDIUM-2: a directory mutation
     while (it != segments_.end()) {
         std::string lpath = it->second->logPath();
         std::string ipath = indexPathForLog(lpath);
@@ -1173,6 +1258,7 @@ void Log::truncateTo(int64_t truncateOffset) {
                                                  indexMaxBytes_, /*prefaultIndex*/false,
                                                  /*eagerReadMap*/true);
         install_(base, std::move(seg));
+        segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);   // MEDIUM-2: deletions + re-create
         logEndOffset_ = base;
         noteTruncatedTo_(logEndOffset_);
         persistAtMost_(logEndOffset_);   // E1d (batch-rounded LEO may be lower)
@@ -1288,6 +1374,9 @@ void Log::truncateTo(int64_t truncateOffset) {
         // and the segment's nextOffset_ can never diverge.
         activeSegment().recover();
         activeSegment().setDurableNext(std::min(oldDurable, activeSegment().nextOffset()));
+        // MEDIUM-2: R stays below the deleted files' range until a directory
+        // fsync covered the deletions (else they could reappear trusted).
+        if (deletesFiles) activeSegment().setDirEntryGen(++dirMutGen_);
         logEndOffset_ = activeSegment().nextOffset();
     } catch (const std::exception& ex) {
         fatalHalt("Log::truncateTo: post-truncate storage failure rebuilding segment "
@@ -1348,6 +1437,7 @@ void Log::reloadSegments() {
         // E1d: a rewritten (cleaner: fsynced before rename) or untouched segment
         // is as durable as the object it replaces; a brand-new base is not.
         auto old = segments_.find(base);
+        seg->setDirEntryGen(old != segments_.end() && old->second ? old->second->dirEntryGen() : ++dirMutGen_);
         if (old != segments_.end() && old->second)
             seg->setDurableNext(old->second->fullyDurable() ? seg->nextOffset()
                                                             : std::min(old->second->durableNext(), seg->nextOffset()));
