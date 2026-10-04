@@ -308,6 +308,16 @@ public:
             // LogCleaner's own unresolved-txn scan is the backstop.
             firstUncleanable = std::min(firstUncleanable, replica->cleanerLastStableOffset());
             if (firstUncleanable < 0) firstUncleanable = 0;
+            // E1d invariant 3: never compact a segment ending above the
+            // PERSISTED recovery point — restart recovery chain-validates those
+            // segments and would take a compaction gap for a lost write.  The
+            // first such segment's base bounds the pass (records at/after it
+            // are preserved verbatim).
+            for (const auto& si : *snap) {
+                if (si.belowRecoveryPoint) continue;
+                if (si.baseOffset < firstUncleanable) firstUncleanable = si.baseOffset;
+                break;
+            }
 
             // CP-8: minCompactionLagMs — shrink firstUncleanable so segments
             // whose largestTimestamp is within the lag window are excluded from

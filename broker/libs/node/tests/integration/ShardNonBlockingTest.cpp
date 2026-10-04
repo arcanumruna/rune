@@ -10,6 +10,7 @@
 // straight into the worker's ingress handler (handleIngressFrameForTest) and
 // control completion delivery (setReapPausedForTest / deliverCompletionForTest)
 // so durability ordering is asserted deterministically.
+#include <sys/resource.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/LogCleanerAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
@@ -52,6 +53,19 @@ using rune::replication::PartitionReplica;
 using rune::replication::Role;
 using rune::storage::Log;
 namespace fs = std::filesystem;
+
+// Fd-heavy: thousands of live segments (each holds fds) / hundreds of logs
+// exceed the default Linux soft RLIMIT_NOFILE (1024; macOS shells allow far
+// more, so this only ever failed on Linux).  Raise soft to hard once for this
+// binary (unprivileged), like the compaction / retention stress tests.
+static const bool g_fd_limit_raised = [] {
+    struct ::rlimit rl{};
+    if (::getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        ::setrlimit(RLIMIT_NOFILE, &rl);
+    }
+    return true;
+}();
 namespace pc = rune::protocol::client;
 
 namespace {
@@ -3039,4 +3053,238 @@ TEST(NonShardNonBlockingRegression, OwnedLogSyncIntervalZeroNeverSyncsRegression
     (void)l2.takeFollowerFlushRequest();
     for (int64_t now = 12 * kMs; now < 2000 * kMs && w2.bgFlushSubmitsForTest() == 0; now += 12 * kMs) w2.doWork(now);
     EXPECT_GE(w2.bgFlushSubmitsForTest(), 1u) << "positive control: interval 10 ms syncs";
+}
+
+// ============================================================================
+// E1d: the durable recovery point on a worker-driven log.  A completed async
+// seal advances the log's recovery point; the worker persists it through its
+// io backend — ONE write+fdatasync request on the pre-allocated alternate slot
+// (no open / pwrite / rename / directory sync on the loop) — only after the
+// seal's fdatasync completed (R advances in order), and the persisted R (and
+// the cleaner gate) move only once that request completed (never at submit).
+// ============================================================================
+
+TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealCompletes) {
+    StrictShard s(/*rollBytes=*/512, {1}, GetParam());
+    using RpStage = rune::storage::Log::RpStage;
+    ASSERT_EQ(s.log->persistedRecoveryPoint(), 0);
+    s.w.setReapPausedForTest(true);                        // hold every completion
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);  // segment A (>= rollBytes)
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // rolls: A sealed, appended to B
+    const int64_t bBase = s.log->segmentBaseOffsets().back();
+    ASSERT_GT(bBase, 0);
+    for (int i = 0; i < 50; ++i) s.w.doWork(2 + i);
+    EXPECT_EQ(s.w.sealSubmitsForTest(), 1u);
+    EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 0u) << "R never passes a seal whose fdatasync is in flight";
+    EXPECT_EQ(s.log->recoveryPoint(), 0);
+    EXPECT_EQ(rune::storage::Log::readRecoveryPointFile(s.d.path.string()).r, 0);
+    // Release completions ONE pass at a time until the checkpoint is submitted:
+    // it is then in flight, and nothing moved yet (F2: never at submit).
+    Acks a;
+    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::InFlight; ++i) {
+        s.w.setReapPausedForTest(false); s.w.doWork(100 + i); s.w.setReapPausedForTest(true);
+        a.drain(s.w); std::this_thread::yield();
+    }
+    ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight);
+    EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u) << "ONE write+fdatasync request";
+    EXPECT_EQ(s.log->persistedRecoveryPoint(), 0) << "the persisted R moved at submit";
+    ASSERT_FALSE(s.log->sealedSegmentSnapshot()->empty());
+    EXPECT_FALSE(s.log->sealedSegmentSnapshot()->front().belowRecoveryPoint)
+        << "the cleaner gate opened before the checkpoint was durable";
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < bBase; ++i) {
+        s.w.doWork(1'000 + i); a.drain(s.w); std::this_thread::yield();
+    }
+    EXPECT_GE(s.log->persistedRecoveryPoint(), bBase) << "the completed seal's segment end is persisted";
+    EXPECT_GE(rune::storage::Log::readRecoveryPointFile(s.d.path.string()).r, bBase);
+    EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u);
+    EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle);
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on the worker loop";
+    EXPECT_TRUE(s.log->sealedSegmentSnapshot()->front().belowRecoveryPoint)
+        << "the cleaner may now compact the durable sealed segment";
+    // Steady state: no further checkpoint without a new boundary crossing.
+    const uint64_t settled = s.w.recoveryPointSubmitsForTest();
+    for (int i = 0; i < 100; ++i) { s.w.doWork(10'000 + i); a.drain(s.w); }
+    EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), settled) << "never per pass / per append";
+}
+
+// E1d fix round 2, MEDIUM-2: R never passes a rolled segment before its
+// directory entry is durable.  The worker batches ONE directory fsync through
+// its io backend (never inline on the loop) when R is blocked, and only then
+// checkpoints past it.  Invariant checked on every pass.
+TEST_P(StrictPlacementRegression, RecoveryPointWaitsForDirectoryFsyncThroughIoBackend) {
+    StrictShard s(/*rollBytes=*/512, {1}, GetParam());
+    Acks a;
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);  // A
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 600), 0, 1), 1);  // roll: B (new directory entry)
+    ASSERT_EQ(s.produce(3, batchAt(0, 1, 16), 0, 1), 1);   // roll: C
+    const auto bases = s.log->segmentBaseOffsets();
+    ASSERT_EQ(bases.size(), 3u);
+    const int64_t bBase = bases[1], cBase = bases[2];
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < cBase; ++i) {
+        s.w.setReapPausedForTest(false); s.w.doWork(10 + i); s.w.setReapPausedForTest(true);
+        a.drain(s.w); std::this_thread::yield();
+        ASSERT_TRUE(s.log->recoveryPoint() <= bBase || s.log->directorySyncsCompletedForTest() >= 1)
+            << "R passed segment " << bBase << " before a directory fsync made its entry durable";
+    }
+    EXPECT_GE(s.log->persistedRecoveryPoint(), cBase);
+    EXPECT_GE(s.w.dirSyncSubmitsForTest(), 1u) << "the directory fsync must go through the io backend";
+    EXPECT_LE(s.w.dirSyncSubmitsForTest(), 2u) << "batched: one per blocked R, not per pass";
+    EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on the worker loop";
+    const uint64_t settled = s.w.dirSyncSubmitsForTest();
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < 100; ++i) { s.w.doWork(10'000 + i); a.drain(s.w); }
+    EXPECT_EQ(s.w.dirSyncSubmitsForTest(), settled) << "never per pass";
+}
+
+TEST(ShardNonBlockingRegression, RecoveryPointCheckpointFsyncErrorIsFailStop) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed
+    Acks a;
+    using RpStage = rune::storage::Log::RpStage;
+    // Run until the checkpoint's write+fdatasync is in flight (completions held
+    // after each pass so it cannot complete unobserved).
+    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::InFlight; ++i) {
+        s.w.setReapPausedForTest(false); s.w.doWork(1 + i); s.w.setReapPausedForTest(true);
+        a.drain(s.w); std::this_thread::yield();
+    }
+    ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight);
+    ASSERT_FALSE(s.log->storageFailed());
+    s.w.forceFlushErrorForTest(EIO);                       // ... and it fails
+    s.w.setReapPausedForTest(false);
+    // Fix round 2: a batched directory fsync (MEDIUM-2) may be in flight next
+    // to the checkpoint; its forced-error completion can fail the log first —
+    // wait for the CHECKPOINT's completion too.
+    for (int i = 0; i < kCap && (!s.log->storageFailed() || s.log->recoveryCheckpointStage() != RpStage::Idle); ++i) {
+        s.w.doWork(1'000 + i); a.drain(s.w); std::this_thread::yield();
+    }
+    EXPECT_TRUE(s.log->storageFailed()) << "a failed recovery-point write/fdatasync is fail-stop (fsyncgate)";
+    EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle);
+    EXPECT_EQ(s.log->persistedRecoveryPoint(), 0) << "an unacknowledged slot never counts";
+    EXPECT_GE(s.w.storageFailureSignalsForTest(), 1u);
+    s.w.forceFlushErrorForTest(0);
+}
+
+// E1d F7: a checkpoint (or seal) whose completion went to a PREVIOUS owner —
+// never observed — must not pin the recovery point forever: the next owner
+// replays it.
+TEST(ShardNonBlockingRegression, RecoveryPointCheckpointLostToPreviousOwnerIsReplayed) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    using RpStage = rune::storage::Log::RpStage;
+    Acks a;
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed
+    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::InFlight; ++i) {
+        s.w.setReapPausedForTest(false); s.w.doWork(1 + i); s.w.setReapPausedForTest(true);
+        a.drain(s.w); std::this_thread::yield();
+    }
+    ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight);
+    const int64_t want = s.log->recoveryPoint();
+    // Ownership moves away while the checkpoint is in flight; its completion
+    // is reaped by the old owner (log unowned: ignored, Log untouched).
+    s.w.setOwnedDirect(Worker::OwnedSet{});
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < 200; ++i) { s.w.doWork(2'000 + i); std::this_thread::yield(); }
+    EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight) << "an unowned log is never touched";
+    // A FRESH owner (another worker) takes the log: the stage is replayed.
+    Worker w2{1, 1 << 16, 1 << 16, 64, 64};
+    w2.setOwnedDirect(Worker::OwnedSet{s.leader.get()});
+    w2.setShardMode(true);
+    EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle) << "stuck in flight forever (F7)";
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < want; ++i) { w2.doWork(3'000 + i); std::this_thread::yield(); }
+    EXPECT_GE(s.log->persistedRecoveryPoint(), want) << "the replayed checkpoint never landed";
+    EXPECT_EQ(w2.recoveryPointSubmitsForTest(), 1u);
+}
+
+TEST(ShardNonBlockingRegression, SealCompletionLostToPreviousOwnerIsReplayed) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    Acks a;
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed
+    const int64_t bBase = s.log->segmentBaseOffsets().back();
+    s.w.doWork(1);
+    ASSERT_EQ(s.w.sealSubmitsForTest(), 1u);                // the seal is in flight
+    // Ownership moves away; the seal's completion reaches the old owner only.
+    s.w.setOwnedDirect(Worker::OwnedSet{});
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < 200; ++i) { s.w.doWork(2 + i); a.drain(s.w); std::this_thread::yield(); }
+    EXPECT_LT(s.log->recoveryPoint(), bBase) << "an unowned log is never touched";
+    Worker w2{1, 1 << 16, 1 << 16, 64, 64};
+    w2.setOwnedDirect(Worker::OwnedSet{s.leader.get()});
+    w2.setShardMode(true);
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < bBase; ++i) { w2.doWork(3'000 + i); std::this_thread::yield(); }
+    EXPECT_GE(s.log->recoveryPoint(), bBase) << "R pinned forever by a seal completion nobody observed (F7)";
+    EXPECT_GE(s.log->persistedRecoveryPoint(), bBase);
+    EXPECT_EQ(w2.sealSubmitsForTest(), 1u) << "the undurable sealed segment is re-sealed";
+}
+
+// E1d fix round 2, MEDIUM-1: the F7 seal replay must also run when ANOTHER
+// seal of the same log is still routed on this worker.  Seal A was submitted
+// by a previous owner and its completion was never observed; seal B is in
+// flight on this worker when the log is re-owned.  Every sealed-not-durable
+// segment without a route in flight is re-queued — R reaches the end of both.
+TEST(ShardNonBlockingRegression, SealLostToPreviousOwnerReplayedWhileAnotherSealIsRouted) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    Acks a;
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed (pending)
+    // A previous owner took seal A, fdatasynced it, and its completion was lost.
+    {
+        rune::storage::LogSegment* segA = s.log->frontPendingSeal();
+        ASSERT_NE(segA, nullptr);
+        s.log->popPendingSeal();
+        ASSERT_EQ(::fsync(segA->logFd()), 0);
+        s.log->unpinSegmentFlush(segA);
+    }
+    ASSERT_EQ(s.produce(3, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(4, batchAt(0, 1, 16), 0, 1), 1);   // roll: B sealed (pending)
+    const int64_t cBase = s.log->segmentBaseOffsets().back();
+    ASSERT_EQ(s.log->segmentBaseOffsets().size(), 3u);
+    s.w.doWork(5);
+    ASSERT_EQ(s.w.sealSubmitsForTest(), 1u);                // seal B in flight on this worker
+    // The log moves away and comes back to THIS worker while B is still routed.
+    s.w.setOwnedDirect(Worker::OwnedSet{});
+    s.w.setOwnedDirect(Worker::OwnedSet{s.leader.get()});
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < cBase; ++i) {
+        s.w.doWork(100 + i); a.drain(s.w); std::this_thread::yield();
+    }
+    EXPECT_GE(s.log->recoveryPoint(), cBase) << "R pinned at seal A: replay skipped because seal B was routed";
+    EXPECT_GE(s.log->persistedRecoveryPoint(), cBase);
+    EXPECT_EQ(s.w.sealSubmitsForTest(), 2u) << "seal A re-queued exactly once; B not duplicated";
+}
+
+// E1d fix round 3, LOW-B (ruled must-fix): a log dropped and re-owned on the
+// SAME worker while its seal B is still routed keeps the Strict-ack seal gate
+// CLOSED until B's completion — a fresh slot is seeded from the routed seals
+// and B's completion decrements through the CURRENT slot.  Before the fix the
+// gate read "no seals outstanding" (an X in the next segment could be acked
+// before B was durable; a power loss then cuts the chain at B and recovery
+// deletes the acked X).  Afterwards the count drains to 0 (no leak) and the
+// Strict ack still fires.
+TEST(ShardNonBlockingRegression, ReownedLogKeepsStrictSealGateUntilRoutedSealCompletes) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    Acks a;
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: seal B pending
+    s.w.doWork(3);
+    ASSERT_EQ(s.w.sealSubmitsForTest(), 1u);                // seal B in flight
+    ASSERT_EQ(s.log->pendingSealCount(), 0u);
+    ASSERT_TRUE(s.w.sealsOutstandingForTest(s.log.get()));
+    s.w.setOwnedDirect(Worker::OwnedSet{});                 // dropped ...
+    s.w.setOwnedDirect(Worker::OwnedSet{s.leader.get()});   // ... re-owned, B still routed
+    EXPECT_TRUE(s.w.sealsOutstandingForTest(s.log.get()))
+        << "the Strict-ack seal gate opened while seal B was still in flight";
+    // A Strict produce into the active segment, then let everything complete.
+    ASSERT_EQ(s.produce(3, batchAt(0, 1, 16), 0, 4), 1);
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && a.n < 3; ++i) { s.w.doWork(10 + i); a.drain(s.w); std::this_thread::yield(); }
+    EXPECT_FALSE(s.w.sealsOutstandingForTest(s.log.get())) << "the seeded seal count leaked";
+    bool acked3 = false;
+    for (const auto& r : a.rets) acked3 = acked3 || r.correlationId == 3;
+    EXPECT_TRUE(acked3) << "the Strict ack after the re-own never fired";
 }

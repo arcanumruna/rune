@@ -63,10 +63,11 @@ libs/node/include/rune/node/detail/RingDoorbell.h | parking_.exchange(0, std::me
 libs/node/include/rune/node/detail/RingDoorbell.h | parking_.store(0, std::memory_order_relaxed); | 2 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/node/include/rune/node/detail/RingDoorbell.h | parking_.store(1, std::memory_order_relaxed); | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/node/include/rune/node/detail/RingDoorbell.h | std::atomic_thread_fence(std::memory_order_seq_cst); | 2 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
-libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
-libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
-libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + 1, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
-libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqe_ submit path: fsync, FADVISE, io-wq NOP)
+libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + n, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + submitted, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ tail: LOW-4b partial-enter rollback of the unconsumed SQEs (single pushSqes_ submit path)
 
 # ------------------------------------------------------------ CLEANER
 libs/storage/include/rune/storage/Log.h | #include <atomic> | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)

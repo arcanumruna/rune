@@ -233,6 +233,7 @@ public:
         DrNode& n = node(id);
         ASSERT_TRUE(n.up) << "crash of a node that is down";
         const auto ext = n.log->syncedExtentsForTest();
+        n.log->crashForTest();   // a crash: no clean-shutdown recovery-point checkpoint
         n.rep.reset(); n.ep.reset(); n.log.reset(); n.isrKnowledge.reset();
         n.up = false;
         purge_(id);

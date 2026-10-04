@@ -29,6 +29,12 @@ struct SegInfo {
     /// entry's endOffset) WITHOUT reading the writer-owned segments_ map — so the
     /// cleaner never advances its watermark past not-yet-sealed (active) records.
     int64_t endOffset        = 0;
+    /// E1d: the segment ends at or below the PERSISTED recovery point (or no
+    /// recovery point was ever persisted — recovery then trusts every sealed
+    /// segment), so restart recovery trusts it as-is.  The cleaner compacts
+    /// ONLY such segments: compaction never creates an offset gap in the region
+    /// recovery validates with its segment-chain check.
+    bool    belowRecoveryPoint = true;
 };
 using SealedSegmentSnapshot = std::vector<SegInfo>;
 
@@ -195,6 +201,141 @@ public:
     /// msync + directory fsync of LogSegment::recover (run by truncateTo on a
     /// role / epoch change, and at startup recovery).
     [[nodiscard]] uint64_t roleChangeSyncCallsForTest() const noexcept { return storage_.roleChangeSyncs; }
+
+    // ---- E1d: durable recovery point (Kafka recovery-point parity) -----------
+    //
+    // R = every offset below it is known durable on disk.  Advanced IN ORDER on
+    // the owner thread: a sealed segment counts only once its seal fdatasync
+    // completed (inline, or the io backend's completion -> noteFlushCompleted),
+    // the active segment up to its synced extent.
+    //
+    // Persisted in <dir>/recovery-point-offset-checkpoint: a PRE-ALLOCATED file
+    // of two independent slots (one per 4 KiB block), each
+    // {magic, version, seq, R, crc32c}.  The file is created (tmp + fsync +
+    // rename + FULL directory fsync) ONCE, at the first recovery; afterwards a
+    // checkpoint only overwrites the ALTERNATE slot in place + fdatasync — no
+    // create, no rename, no directory sync.  Recovery takes the valid slot
+    // with the highest seq (a torn slot = the older, lower, safe R); a file
+    // whose two slots are both invalid is fail-stop (KafkaStorageException).
+    //
+    // A checkpoint is due when R crossed a segment boundary since the last
+    // persist (≈ once per roll — never per append).  Worker-driven logs
+    // (deferSealSync) checkpoint through the io backend (one write+fdatasync
+    // request: no syscall on the loop); every other path (legacy inline seal,
+    // truncation, recovery, clean shutdown) writes inline.  A stale (lower)
+    // persisted R is always safe.
+    static constexpr const char* kRecoveryPointFile    = "recovery-point-offset-checkpoint";
+    static constexpr const char* kRecoveryPointTmpFile = "recovery-point-offset-checkpoint.tmp";
+    static constexpr int64_t  kRecoveryPointUnknown = -1;
+    static constexpr uint32_t kRpMagic        = 0x31505252u;   // "RRP1" (LE)
+    static constexpr uint16_t kRpVersion      = 1;
+    static constexpr std::size_t kRpSlotBytes  = 32;           ///< one slot image
+    static constexpr std::size_t kRpSlotStride = 4096;         ///< one slot per block
+    static constexpr std::size_t kRpFileBytes  = 2 * kRpSlotStride;
+    /// Encode / decode one slot image (pure; tests use them to tear / forge slots).
+    static void encodeRpSlot(uint8_t (&out)[kRpSlotBytes], uint64_t seq, int64_t r) noexcept;
+    /// true + seq/r for a valid slot (magic, version, crc32c, r >= 0).
+    static bool decodeRpSlot(const uint8_t* in, uint64_t& seq, int64_t& r) noexcept;
+    enum class RpFileState : uint8_t { Missing, Valid, Corrupt };
+    struct RpFileRead { RpFileState state = RpFileState::Missing; int64_t r = kRecoveryPointUnknown;
+                        uint64_t seq = 0; int slot = -1; };
+    /// Read <dir>/recovery-point-offset-checkpoint (cold).
+    static RpFileRead readRecoveryPointFile(const std::string& dir) noexcept;
+
+    /// In-memory durable recovery point (owner thread).
+    [[nodiscard]] int64_t recoveryPoint() const noexcept { return recoveryPoint_; }
+    /// The value restart recovery would read (kRecoveryPointUnknown = none).
+    /// Moves only once a checkpoint is DURABLE (never at write submit).
+    [[nodiscard]] int64_t persistedRecoveryPoint() const noexcept { return persistedRp_; }
+    /// Upper bound of the R restart recovery may read: the confirmed value or
+    /// any possibly-landed (unconfirmed) checkpoint write above it (MAJOR-1).
+    [[nodiscard]] int64_t onDiskRecoveryPointUpperBound() const noexcept {
+        return rpUnconfirmedMax_ > persistedRp_ ? rpUnconfirmedMax_ : persistedRp_;
+    }
+    /// True iff restart recovery trusts a sealed segment ending at `segEnd`
+    /// as-is — the cleaner may compact it (E1d invariant 3).
+    [[nodiscard]] bool compactionAllowedThrough(int64_t segEnd) const noexcept {
+        return persistedRp_ == kRecoveryPointUnknown || segEnd <= persistedRp_;
+    }
+    /// An async (io backend) fdatasync of `seg`'s fd completed successfully:
+    /// every byte written to it before the submit — offsets below `upTo` (the
+    /// LEO at submit; INT64_MAX for a seal = the whole segment) — is durable.
+    /// Advances R in order.  Returns true iff a checkpoint is now due (the
+    /// owner queues the log — event-driven, F8).  O(log segments), no allocation.
+    bool noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept;
+    /// Persist R now, inline (cold paths).  0 or the errno (fail-stop).
+    int checkpointRecoveryPoint() noexcept;
+
+    // Async checkpoint (owning worker, through its io backend):
+    //   Idle --prepare--> Prepared --submitted--> InFlight --completed--> Idle
+    //   (Prepared --notSubmitted--> Idle on back-pressure; due stays set.)
+    enum class RpStage : uint8_t { Idle, Prepared, InFlight };
+    [[nodiscard]] RpStage recoveryCheckpointStage() const noexcept { return rp_.stage; }
+    /// R crossed a segment boundary since the last persist and no checkpoint is
+    /// in progress (O(1)).
+    [[nodiscard]] bool recoveryCheckpointDue() const noexcept {
+        return rpDue_ && rp_.stage == RpStage::Idle && recovered_ && rpFd_ >= 0 &&
+               storage_.failedErrno == 0;
+    }
+    /// The write the owner submits: `len` bytes of `data` at `offset` of `fd`,
+    /// then fdatasync(fd).  `data` stays valid until the next prepare.
+    struct RpWrite { int fd = -1; const uint8_t* data = nullptr; uint32_t len = 0; int64_t offset = 0; uint64_t seq = 0; };
+    /// Idle -> Prepared: encode the alternate slot.  False when not due.
+    /// Pure memory (no syscall).
+    bool prepareRecoveryCheckpoint(RpWrite& out) noexcept;
+    /// Prepared -> InFlight (the write+fdatasync was submitted).
+    void recoveryCheckpointSubmitted() noexcept;
+    /// Prepared -> Idle (submit refused: back-pressure; still due).
+    void recoveryCheckpointNotSubmitted() noexcept;
+    /// InFlight completed (err = its errno, 0 = ok).  Success: the slot is
+    /// durable -> persistedRecoveryPoint() moves (and the cleaner gate).  A
+    /// superseded (abandoned) checkpoint never moves it.  An error is
+    /// fail-stop.  Returns true iff another checkpoint is due.
+    bool recoveryCheckpointCompleted(uint64_t seq, int err) noexcept;
+    /// F7: a fresh owner took this log and holds no route for an in-flight
+    /// checkpoint (its completion went to a previous owner, unobserved): the
+    /// outcome is unknown — the slot is treated as unwritten (the next write
+    /// targets it again with a higher seq) and R is re-checkpointed.
+    void resetRecoveryCheckpointForNewOwner() noexcept;
+    /// F7: re-queue (pinned) a seal for every sealed segment not yet durable,
+    /// not already pending and not in `inFlight[0, nInFlight)` (segments whose
+    /// seal is routed on the new owner — MEDIUM-1: the replay runs even when
+    /// another seal of this log is in flight) — a fresh owner's replay of seal
+    /// completions a previous owner never observed.  Cold.  Returns the number queued.
+    std::size_t requeueUndurableSeals(const LogSegment* const* inFlight = nullptr,
+                                      std::size_t nInFlight = 0) noexcept;
+    // ---- E1d MEDIUM-2: directory durability (Kafka flushParentDir parity) ----
+    // R never passes the base of a segment whose directory entry (create /
+    // adopt-rename, or a truncation's deletions) is not yet durable: recovery
+    // trusts segments below R WITHOUT a chain check, so a lost entry there
+    // would read as a compaction gap (a silent offset hole).  Every directory
+    // mutation bumps a generation; a segment records the generation of its
+    // entry; a directory fsync submitted at generation G makes every entry
+    // <= G durable.  Worker-driven logs batch ONE directory fsync through the
+    // io backend (never on the loop) when R is blocked by such an entry; the
+    // legacy inline-seal path fsyncs the directory inline at the roll.
+    //   Idle --prepare--> InFlight(gen) --completed--> Idle
+    struct DirSync { int fd = -1; uint64_t gen = 0; };
+    /// R is blocked by a not-yet-durable directory entry and no directory
+    /// fsync is in flight (O(1)).
+    [[nodiscard]] bool directorySyncDue() const noexcept;
+    /// Idle -> InFlight: the directory fd + the generation it will cover.
+    /// False when not due.  Pure memory.
+    bool prepareDirectorySync(DirSync& out) noexcept;
+    /// InFlight -> Idle (submit refused: back-pressure; still due).
+    void directorySyncNotSubmitted() noexcept;
+    /// The directory fsync covering `gen` completed (err = errno, 0 = ok).
+    /// Success: entries <= gen are durable, R advances.  Error: fail-stop.
+    /// Returns true iff a checkpoint or another directory fsync is now due.
+    bool directorySyncCompleted(uint64_t gen, int err) noexcept;
+    /// F7 parity: a fresh owner holds no route for an in-flight directory
+    /// fsync (its completion went to a previous owner): treated as not done.
+    void resetDirectorySyncForNewOwner() noexcept;
+    [[nodiscard]] uint64_t directorySyncsCompletedForTest() const noexcept { return dirSyncsDone_; }
+    [[nodiscard]] uint64_t recoveryCheckpointsForTest() const noexcept { return rpPersists_; }
+    /// Crash seam (DR / storage tests): the next destruction is a CRASH, not a
+    /// clean shutdown — no recovery-point checkpoint is written.
+    void crashForTest() noexcept { crashedForTest_ = true; }
 
     /// Owner-defined O(1) tag (the owning worker's flush-slot index); UINT32_MAX = none.
     void     setOwnerTag(uint32_t t) noexcept { ownerTag_ = t; }
@@ -458,6 +599,60 @@ private:
     SegMap::iterator erase_(SegMap::iterator it);
     void retire_(std::unique_ptr<LogSegment> seg);
     void throwIfFailed_() const;
+    // ---- E1d recovery point state (owner thread) ----
+    bool    crashedForTest_ = false;      ///< see crashForTest()
+    bool    hadSegmentsAtOpen_ = false;   ///< segment files existed at construction (WARN gate)
+    int64_t recoveryPoint_ = 0;
+    int64_t persistedRp_   = kRecoveryPointUnknown;
+    /// MAJOR-1 (fix round 2): the highest R carried by a checkpoint write that
+    /// MAY have landed (submitted, outcome not yet observed — or observed by a
+    /// previous owner and lost) and whose seq is above the last CONFIRMED
+    /// durable write.  max(persistedRp_, this) bounds what restart recovery
+    /// may read; a truncation below it is persisted inline first.  Reset only
+    /// by a confirmed durable write with a higher seq.
+    int64_t rpUnconfirmedMax_ = kRecoveryPointUnknown;
+    bool    rpDue_         = false;   ///< R crossed a segment boundary since the last persist
+    uint64_t rpPersists_   = 0;
+    uint64_t rpSeq_        = 0;       ///< highest slot seq ever written (or read)
+    int      rpActiveSlot_ = -1;      ///< the slot holding persistedRp_ (-1 = none)
+    int      rpFd_         = -1;      ///< the open, pre-allocated checkpoint file
+    std::string rpPath_;              ///< precomputed (ctor) — no per-roll allocation
+    std::string rpTmpPath_;
+    struct RpCheckpoint {
+        RpStage  stage     = RpStage::Idle;
+        bool     abandoned = false;   ///< superseded: completion never moves persistedRp_
+        int      slot      = -1;
+        uint64_t seq       = 0;
+        int64_t  value     = 0;
+    } rp_;
+    uint8_t rpImage_[kRpSlotBytes] = {};   ///< the Prepared slot image (stable until next prepare)
+    // ---- E1d MEDIUM-2 directory durability (owner thread) ----
+    int      dirFd_          = -1;      ///< the log directory, opened once at recovery
+    uint64_t dirMutGen_      = 0;       ///< bumped by every directory mutation
+    uint64_t dirSyncedGen_   = 0;       ///< highest generation a completed dir fsync covers
+    bool     dirSyncInFlight_ = false;
+    uint64_t dirSyncInFlightGen_ = 0;
+    bool     rpDirBlocked_   = false;   ///< R wants to pass a not-yet-durable entry
+    uint64_t dirSyncsDone_   = 0;
+    /// Inline directory fsync (legacy / cold paths).  0 or the errno (fail-stop).
+    int  syncDirectoryInline_() noexcept;
+    /// Walk segments from R: advance over fully-durable segments, then into the
+    /// first partially-durable one.  Sets rpDue_ on a boundary crossing.
+    void advanceRecoveryPoint_() noexcept;
+    void refreshRpDue_() noexcept;
+    /// R crossed a boundary on an inline-sync path: persist inline unless the
+    /// owner drives async checkpoints (deferSealSync_).
+    void maybeCheckpointInline_() noexcept;
+    /// Persist min(R, bound) inline when the on-disk value (or an in-progress
+    /// checkpoint's) exceeds `bound` (F6: before a truncation deletes data).
+    void persistAtMost_(int64_t bound) noexcept;
+    int  checkpointRecoveryPoint_(bool publishSnapshot) noexcept;
+    /// Create the pre-allocated two-slot file holding `r` (tmp + fsync + rename
+    /// + full dir fsync), open rpFd_.  Cold (first recovery).
+    int  createRecoveryPointFile_(int64_t r) noexcept;
+    /// recover(): the segment-chain validation from the recovery point onward.
+    /// `deleteOnGap` false = a corrupt checkpoint (fail-stop): never delete.
+    void validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap);
     /// CP-8 incremental largestTimestamp: running max of maxTimestamp() across all
     /// batches appended to the ACTIVE segment since the last roll.  Reset to 0 at
     /// each roll (after publishSealedSnapshot captures it for the newly-sealed

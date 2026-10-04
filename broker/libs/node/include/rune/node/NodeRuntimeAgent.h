@@ -778,18 +778,26 @@ public:
                 } else {
                     // 7. Compact exactly this ONE sealed segment via bounded cleaner.
                     rune::storage::LogCleaner cleaner;
-                    cleaner.cleanSegment(*log,
+                    const bool cleaned = cleaner.cleanSegment(*log,
                                          /*segBase=*/segToCompact,
                                          /*segEnd=*/segEnd,
                                          /*globalDirtyStart=*/firstDirty,
                                          nowNs,
                                          replica->deleteRetentionMs());
 
-                    // 8. Advance the cleaned watermark.
-                    replica->setLastCleanOffset(segEnd);
-
-                    ++work;
-                    compactionRan = true;
+                    // 8. Advance the cleaned watermark ONLY over a segment that
+                    //    was actually compacted (E1d F4): a segment refused by
+                    //    the recovery-point gate (it ends above the persisted R)
+                    //    stays dirty and is retried once its checkpoint is
+                    //    durable.  An EMPTY sealed segment (nothing to rewrite:
+                    //    cleanSegment false, gate open) is passed over — never a
+                    //    watermark wedged on it forever.
+                    if (cleaned || (log->compactionAllowedThrough(segEnd) &&
+                                    log->segmentNextOffsetAt(segToCompact) == segToCompact)) {
+                        replica->setLastCleanOffset(segEnd);
+                        ++work;
+                        compactionRan = true;
+                    }
                 }
             }
 

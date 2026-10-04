@@ -602,14 +602,14 @@ TEST(DrIntegrationRegression, NoSideProbes_DivergenceResolvedOnFetchPath) {
 // completes loses the sealed segment's unflushed bytes too; recovery must
 // still yield a GAP-FREE log (never a later segment's base as the LEO over
 // missing offsets) and the replica must re-fetch and converge.
-// KNOWN BUG (E1d, not fixed in round 1): Log recovery keeps every segment
-// file, so after this power loss the replica reports LEO = the last segment's
-// base (108) while holding 0 records — it claims offsets it does not have.
-// A structural "inter-segment gap => truncate" rule is NOT safe: compaction
-// legitimately removes a sealed segment's last records (gap to the next base),
-// and the cleaner checkpoint can trail its renames.  Needs a durable recovery
-// point (or a cleaner that always preserves each segment's end offset).
-TEST(DrIntegrationRegression, DISABLED_PowerLoss_AsyncSealNotCompleted_NoOffsetGap) {
+// E1d (fixed): recovery used to keep every segment file, so after this power
+// loss the replica reported LEO = the last segment's base (108) while holding
+// 0 records.  Now a durable recovery point R (Log) bounds what recovery trusts:
+// segments above R must chain (each ends at the next one's base) or the log is
+// truncated at the first gap and later segments deleted.  A plain "gap =>
+// truncate" rule would be wrong — compaction leaves legitimate gaps, which is
+// why the cleaner only compacts segments ending at or below the persisted R.
+TEST(DrIntegrationRegression, PowerLoss_AsyncSealNotCompleted_NoOffsetGap) {
     DrConfig cfg;
     cfg.segmentRollBytes = 2048;
     cfg.deferSealSync    = true;

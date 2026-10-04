@@ -142,6 +142,29 @@ Tear down (including volumes): `docker compose -f docker/docker-compose.yml down
 - Clients connect to **any** node's client endpoint; killing the leader triggers automatic
   re-election among the survivors.
 
+### Open-file limit (`RLIMIT_NOFILE`)
+
+Every partition log keeps files open for its whole life: up to 4 per open segment (the
+`.log` stream and fd, the `.index` and read mappings) plus 2 for the durable recovery
+point (its checkpoint file and the log directory).  At startup the broker **raises its
+soft limit to the hard limit** and logs both, then **refuses to start** when the hard
+limit is below the estimated need — so a too-low limit fails at boot instead of halting
+the broker mid-run on `EMFILE` (and again at every restart).  It warns when the hard limit
+is within 25% of the need.
+
+Estimate: `1024 + 64 × 18 (internal topics) + Σ topics partitionCount × (openSegments × 4 + 2)`,
+where `openSegments = ceil(retentionBytes / segmentRollBytes) + 1` for size-bounded
+retention and `4` otherwise.  Every partition is assumed hosted locally.
+
+Set the hard limit high:
+
+- **systemd:** `LimitNOFILE=1048576` in the unit's `[Service]` section.
+- **Docker:** `docker run --ulimit nofile=1048576:1048576 …`, or in compose
+  `ulimits: { nofile: { soft: 1048576, hard: 1048576 } }` (most engines already default to ~1M).
+- **Kubernetes:** inherits the container runtime's limit (containerd/CRI-O default ~1M).
+- **Shell:** `ulimit -Hn` shows the hard limit; Linux's default soft limit (1024) is
+  exhausted by ~300 partitions.
+
 ### Verify the cluster (optional)
 
 The repo ships an end-to-end script that builds + starts the cluster, confirms a single
