@@ -297,6 +297,12 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
         cfg_.minIsr);
 
     leaderState_.setLeaderId(cfg_.selfId);
+    // Kafka resetReplicaState (review 2026-10-04 CRITICAL-1): a new leadership
+    // forgets every follower position learned in an earlier one — a member that
+    // has not fetched in THIS leadership must never be counted (HW) or published
+    // (controller positions) at a stale position.
+    leaderState_.resetFollowers();
+    clearPublishedFollowerPositions_();
 
     // Durability quorum: set the per-topic rule FIRST, before seeding the floor
     // and ISR/LEO (setDurabilityMode resets the floors).
@@ -381,6 +387,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     }
     lastFetchEmitNs_ = 0;
     followerSlots_.resetLeadership();
+    clearPublishedFollowerPositions_();   // a follower publishes only its own position
 
     // Publish the demotion so the cleaner stops treating this node as Leader
     // (cleanerRole() flips to Follower) — no live-state read on the cleaner.
@@ -619,6 +626,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         followerSync_.reset();    // self-demotion → bootstrap fetch state afresh
         wedgedAtOffset_ = -1;     // F18
         followerSlots_.resetLeadership();
+        clearPublishedFollowerPositions_();
         if (fsLogEnabled()) {
             spdlog::info("FollowerSync[node={} part={}] reset (self-demote to follower "
                          "epoch={} newLeaderGuess={})",
@@ -1778,12 +1786,23 @@ void PartitionReplica::publishCleanerState() noexcept
             logEndOffset_() + 1, std::memory_order_release);
     }
     if (role_ == Role::Leader) {
+        // Only followers whose fetch passed validation in THIS leadership
+        // (CRITICAL-1): an unvalidated follower's position is unknown here.
         for (const auto& [fid, leo] : leaderState_.followerLeos()) {
-            if (fid >= 0 && fid < kMaxControllerNodes) {
-                publishedReplicaLeo_[static_cast<std::size_t>(fid)].store(
-                    leo + 1, std::memory_order_release);
-            }
+            if (fid < 0 || fid >= kMaxControllerNodes) continue;
+            const FollowerSlot* sl = followerSlots_.find(fid);
+            if (sl == nullptr || !sl->validated) continue;
+            publishedReplicaLeo_[static_cast<std::size_t>(fid)].store(
+                leo + 1, std::memory_order_release);
         }
+    }
+}
+
+void PartitionReplica::clearPublishedFollowerPositions_() noexcept
+{
+    for (int n = 0; n < kMaxControllerNodes; ++n) {
+        if (n == cfg_.selfId) continue;
+        publishedReplicaLeo_[static_cast<std::size_t>(n)].store(0, std::memory_order_release);
     }
 }
 
@@ -1918,7 +1937,14 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
     // shrink just removed sits at the HW it pins (HW = min over the ISR), so
     // "fetch offset >= HW" would re-admit it in the same pass and the HW would
     // never move (Kafka evaluates expansion against the HW of the shrunk ISR).
-    (void)isrManager_->maybeExpandIsrIf(nowNs, leaderState_.highWatermark(), [this](NodeId n) {
+    // Kafka isFollowerInSync (review 2026-10-04 MAJOR-1): the follower must also
+    // hold everything this leader held when elected (its leader-epoch start
+    // offset = electionLeo_) — right after an election our HW is the floor
+    // seeded from our follower view, which can lag the true committed offset;
+    // a replica admitted below it would be electable while missing committed
+    // records.
+    const Offset joinFloor = std::max(leaderState_.highWatermark(), electionLeo_);
+    (void)isrManager_->maybeExpandIsrIf(nowNs, joinFloor, [this](NodeId n) {
         if (std::find(committedIsr_.begin(), committedIsr_.end(), n) != committedIsr_.end())
             return false;
         const FollowerSlot* sl = followerSlots_.find(n);

@@ -270,11 +270,12 @@ public:
         for (auto& n : nodes_) {
             if (!n.up || !reachable(n.id)) continue;
             live.push_back(n.id);
-            if (positionsFrom >= 0 && n.id != positionsFrom) continue;
+            if (capturedPositions_ || (positionsFrom >= 0 && n.id != positionsFrom)) continue;
             auto r = n.rep->positionReport();
             r.topicId = cfg_.topicId; r.partition = kPartId;
             pos.report(r);
         }
+        if (capturedPositions_) pos = *capturedPositions_;
         rune::metadata::ElectionInputs in;
         in.cur.leaderNode     = rune::metadata::NO_LEADER;
         in.cur.isr            = meta_.isr;
@@ -294,6 +295,24 @@ public:
         meta_.isr.assign(out.change.newIsr.begin(), out.change.newIsr.end());
         for (auto& n : nodes_) if (reachable(n.id)) applyMetadata(n.id);
         return meta_.leader;
+    }
+
+    /// The controller's position table as production feeds it: node `from`'s
+    /// PUBLISHED controller snapshot (PartitionReplica::controllerReplicaLeo —
+    /// a leader publishes its view of every follower) is reported into a table
+    /// the controller keeps (latest wins), and every later failover() elects
+    /// over that table instead of the omniscient one.  Call again to refresh.
+    void controllerLearnPositionsFrom(NodeId from) {
+        if (!capturedPositions_) capturedPositions_.emplace();
+        DrNode& n = node(from);
+        if (!n.up) return;
+        const int32_t ep = n.rep->controllerLeaderEpoch();
+        if (ep < 0) return;
+        for (NodeId id : replicas_) {
+            const Offset leo = n.rep->controllerReplicaLeo(id);
+            if (leo < 0) continue;
+            capturedPositions_->report(ReplicaPositionReport{cfg_.topicId, kPartId, id, ep, leo});
+        }
     }
 
     /// Controller: hand leadership to `id` explicitly (preferred-leader move /
@@ -745,6 +764,7 @@ private:
     std::set<uint64_t>      acked_;
     std::size_t             failed_ = 0;
     bool                    lostOnPowerLoss_ = false;
+    std::optional<rune::metadata::ReplicaPositionTable> capturedPositions_;   ///< see controllerLearnPositionsFrom
     rune::storage::ProducerStateManager psm_;
     uint64_t                psmGen_   = 0;
     bool                    psmValid_ = false;

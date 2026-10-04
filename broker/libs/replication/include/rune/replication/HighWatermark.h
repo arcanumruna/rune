@@ -146,6 +146,16 @@ public:
         recomputeHw();
     }
 
+    /// Kafka Partition.makeLeader → resetReplicaState: a NEW leadership forgets
+    /// every follower position learned in an earlier one (unknown = 0 — a
+    /// member counts only once it fetched in this leadership; until then the HW
+    /// sits at the floor seeded by setHighWatermarkFloor).  In place: the map
+    /// keeps its nodes (no reallocation on the next fetch).
+    void resetFollowers() noexcept {
+        for (auto& kv : followerLeo_) kv.second = 0;
+        recomputeHw();
+    }
+
     /// Expose a public recompute trigger for callers that need to force an
     /// HW recalculation (e.g., after setLeaderLogEndOffset when the ISR is
     /// leader-only and no follower fetch triggers recomputation).

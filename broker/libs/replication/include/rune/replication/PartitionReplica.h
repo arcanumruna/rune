@@ -868,6 +868,10 @@ private:
     /// role.  The LogCleanerAgent reads these via cleanerHighWatermark() /
     /// cleanerRole() (acquire-load) so it never touches the live racy state.
     void publishCleanerState() noexcept;
+    /// CRITICAL-1: forget every published follower position (new leadership /
+    /// demotion) — the controller snapshot then carries self only until a
+    /// follower fetches (validated) in this leadership.
+    void clearPublishedFollowerPositions_() noexcept;
 
     /// (Leader) Propagate current ISR into ReplicaLeaderState.
     void syncIsrToLeaderState();

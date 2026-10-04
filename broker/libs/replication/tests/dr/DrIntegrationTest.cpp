@@ -1263,3 +1263,50 @@ TEST(DrIntegrationRegression, Review0ff9322Port_Critical2_NewLeaderWithUncommitt
     c.applyMetadata(1);
     expectAllConvergedAndAcked(c, "critical-2 (red port)");
 }
+
+// Review 2026-10-04 (rev3) CRITICAL-1, end to end (ReviewRepro R1b + step 5):
+// the leader's per-follower LEO map survived across leaderships.  Epoch 1
+// (leader 1): node 2 fetches to 20, node 3 stalls at 5.  Epoch 2 (leader 3):
+// nodes 1 and 2 truncate to 5, [5,8) commits, node 2 goes slow (inside
+// replicaLagMaxMs, still in the ISR) while [8,12) reaches node 1.  Epoch 3: a
+// preferred move back to node 1 — it counted node 2 at its epoch-1 position 20
+// and acked [12,15) that node 2 lacks, and published (epoch 3, 20) for node 2 to
+// the controller.  Node 1 dies; the controller elects node 2 off those
+// positions; node 3 truncates to 8: acked records lost.  Fixed: a new
+// leadership forgets every follower position (Kafka resetReplicaState) and
+// publishes only followers validated in it.
+TEST(DrIntegrationRegression, Rev3Critical1_StaleFollowerLeoAcrossLeaderships_NoAckedLoss) {
+    DrConfig cfg;
+    cfg.replicaLagMaxMs = 200;                   // node 2 stays "in sync" through the scenario
+    DrCluster c(3, cfg);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(5), 5);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cutBoth(1, 3);                             // node 3 stalls at 5 (data plane)
+    ASSERT_EQ(c.produce(15), 15);
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).followerLeoForTest(2) == 20; }, kCap)) << c.dump();
+    ASSERT_EQ(c.rep(1).highWatermark(), 5);
+    // Epoch 2: node 3 (ISR member, holds the committed prefix) leads.
+    c.healAll();
+    ASSERT_TRUE(c.moveLeader(3));
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    ASSERT_EQ(c.produceAcked(3), 3);             // [5,8) on every node
+    c.cutBoth(3, 2);                             // node 2 slow from here
+    c.cutBoth(1, 2);
+    ASSERT_EQ(c.produce(4), 4);                  // [8,12): node 1 gets it, HW waits for node 2
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).logEndOffset() == 12; }, kCap)) << c.dump();
+    // Epoch 3: preferred move back to node 1 (committed-ISR member).
+    ASSERT_TRUE(c.moveLeader(1));
+    ASSERT_EQ(c.produce(3), 3);                  // [12,15)
+    c.run(20);
+    c.controllerLearnPositionsFrom(1);           // the controller ingests the leader's snapshot
+    // Node 1 dies; the controller fails over off the positions it learned.
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    const NodeId nl = c.failover();
+    ASSERT_GE(nl, 0) << c.dump();
+    (void)c.waitWritable(kCap);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "rev3 critical-1");
+}

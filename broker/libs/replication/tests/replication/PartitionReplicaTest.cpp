@@ -4348,3 +4348,137 @@ TEST(PartitionReplicaRegression, DemotionDropsPhantomEpochEntry) {
     EXPECT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 1) << "phantom epoch 2 kept";
     EXPECT_EQ(r.lastFetchedEpoch(), 1);
 }
+
+// ===========================================================================
+// Review 2026-10-04 (rev3) — CRITICAL-1 / MAJOR-1 repros (RED on e5d41b4).
+// ===========================================================================
+namespace {
+FetchRequestMsg rev3Fetch(Epoch ep, NodeId f, Offset off, int32_t lfe) {
+    FetchRequestMsg r{};
+    r.leaderEpoch = ep; r.partition = 0; r.followerId = f;
+    r.fetchOffset = off; r.maxBytes = 0; r.topicId = 0; r.lastFetchedEpoch = lfe;
+    return r;
+}
+bool rev3InIsr(const PartitionReplica& r, NodeId n) {
+    const auto& isr = r.isr();
+    return std::find(isr.begin(), isr.end(), n) != isr.end();
+}
+} // namespace
+
+// CRITICAL-1 (unit, R1): the leader's per-follower LEO survived across
+// leaderships — a member that has NOT fetched in the new leadership was counted
+// at its previous-leadership position (Kafka Partition.makeLeader resets every
+// replica's state on a new leader epoch).
+TEST(PartitionReplicaRegression, NewLeadershipForgetsFollowerPositions_HwNeverFromPreviousLeadership) {
+    TempDir d("rev3r1"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kB = 1, kA = 2, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    PartitionReplica b(makeConfig(kB, 10'000, 1'000'000, 2), Role::Leader, 1, all, all, &log, &t);
+    for (int i = 0; i < 20; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    int64_t clock = 1'000'000;
+    b.doWork(clock);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(1, kA, 20, 1), clock), kErrNone);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(1, kC, 5, 1), clock), kErrNone);
+    EXPECT_EQ(b.highWatermark(), 5);
+    b.becomeFollower(2, kC);
+    b.becomeLeader(3, {kB, kA, kC});             // A has not fetched in epoch 3
+    for (int i = 0; i < 3; ++i) ASSERT_GE(b.append(makePayload(3)), 0);
+    clock += 1'000'000; b.doWork(clock);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(3, kC, b.logEndOffset(), 3), clock), kErrNone);
+    EXPECT_LE(b.highWatermark(), 5) << "HW counted A at its previous-leadership position";
+    EXPECT_LE(b.followerLeoForTest(kA), 0) << "A's epoch-1 position survived the leadership change";
+}
+
+// CRITICAL-1 (controller snapshot): a leader publishes a follower's position
+// for the controller's election only once that follower fetched (validated) in
+// THIS leadership — never a stale position stamped with the current epoch.
+TEST(PartitionReplicaRegression, PositionSnapshotCarriesOnlyFollowersValidatedThisLeadership) {
+    TempDir d("rev3snap"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kB = 1, kA = 2, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    PartitionReplica b(makeConfig(kB, 10'000, 1'000'000, 2), Role::Leader, 1, all, all, &log, &t);
+    for (int i = 0; i < 20; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    int64_t clock = 1'000'000;
+    b.doWork(clock);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(1, kA, 20, 1), clock), kErrNone);
+    b.doWork(clock += 1'000'000);
+    ASSERT_EQ(b.controllerReplicaLeo(kA), 20);   // validated in epoch 1: published
+    b.becomeFollower(2, kC);
+    EXPECT_EQ(b.controllerReplicaLeo(kA), -1) << "a follower publishes another replica's position";
+    b.becomeLeader(3, {kB, kA, kC});
+    b.doWork(clock += 1'000'000);
+    EXPECT_EQ(b.controllerReplicaLeo(kA), -1)
+        << "the epoch-1 position of A was published under epoch " << b.controllerLeaderEpoch();
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(3, kA, 20, 1), clock), kErrNone);
+    b.doWork(clock += 1'000'000);
+    EXPECT_EQ(b.controllerReplicaLeo(kA), 20);   // validated in epoch 3: published again
+}
+
+// CRITICAL-1 (end to end, R1b): three real replicas.  A truncates under C's
+// leadership, goes slow, and leadership moves back to B: B must not ack records
+// ISR member A lacks.
+TEST(PartitionReplicaRegression, NewLeadershipForgetsFollowerPositions_EndToEnd) {
+    TempDir db("rev3r1b"), da("rev3r1a"), dc("rev3r1c");
+    rune::storage::Log lb(db.path), la(da.path), lc(dc.path);
+    InMemoryTransport t;
+    constexpr NodeId kB = 1, kA = 2, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    auto cfg = [](NodeId id) { return makeConfig(id, 10'000, 1'000'000, 2); };
+    PartitionReplica b(cfg(kB), Role::Leader, 1, all, all, &lb, &t);
+    PartitionReplica a(cfg(kA), Role::Follower, 1, all, all, &la, &t);
+    PartitionReplica c(cfg(kC), Role::Follower, 1, all, all, &lc, &t);
+    a.becomeFollower(1, kB); c.becomeFollower(1, kB);
+    t.setLeader(&b); t.addFollower(kA, &a); t.addFollower(kC, &c);
+    int64_t clock = 0;
+    for (int i = 0; i < 5; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] {
+        return a.logEndOffset() == 5 && c.logEndOffset() == 5 && b.highWatermark() == 5; }, b, a, c));
+    t.removeFollower(kC);                        // C stalls at 5
+    for (int i = 0; i < 15; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] {
+        return a.logEndOffset() == 20 && b.followerLeoForTest(kA) == 20; }, b, a));
+    ASSERT_EQ(b.highWatermark(), 5);
+    // Epoch 2: C leads (an ISR member holding the committed prefix); A, B truncate to 5.
+    t.removeFollower(kA);
+    c.becomeLeader(2, {kC, kA, kB}); a.becomeFollower(2, kC); b.becomeFollower(2, kC);
+    t.setLeader(&c); t.addFollower(kA, &a); t.addFollower(kB, &b);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(c.append(makePayload(2)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] {
+        return a.logEndOffset() == 8 && b.logEndOffset() == 8 && c.highWatermark() == 8; }, c, a, b));
+    t.removeFollower(kA);                        // A slow from here (inside replicaLagMaxMs)
+    for (int i = 0; i < 4; ++i) ASSERT_GE(c.append(makePayload(2)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] { return b.logEndOffset() == 12; }, c, b));
+    // Epoch 3: preferred election back to B (ISR carried over); A not fetching yet.
+    t.removeFollower(kB);
+    b.becomeLeader(3, {kB, kA, kC}); c.becomeFollower(3, kB);
+    t.setLeader(&b); t.addFollower(kC, &c);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(b.append(makePayload(3)), 0);   // offsets 12..14
+    (void)driveReplicas(t, clock, 20, [&] { return c.logEndOffset() == 15 && b.highWatermark() >= 15; }, b, c);
+    EXPECT_TRUE(rev3InIsr(b, kA));
+    EXPECT_LE(b.highWatermark(), a.logEndOffset())
+        << "committed past ISR member A's actual LEO (A holds " << a.logEndOffset() << ")";
+}
+
+// MAJOR-1 (R2): ISR expansion requires the follower to hold everything the new
+// leader held when elected (Kafka isFollowerInSync: followerEnd >=
+// leaderEpochStartOffset) — the leader's HW view right after an election can
+// lag the true committed offset.
+TEST(PartitionReplicaRegression, IsrExpansionRequiresLeaderEpochStartOffset) {
+    TempDir d("rev3r2"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kA = 2, kB = 1, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    PartitionReplica a(makeConfig(kA, 10'000, 1'000'000, 2), Role::Follower, 1, all, all, &log, &t);
+    seedStamped(a, 0, 10, 1, /*hw=*/5);          // holds 10 committed (ISR {B,A}), stale HW view 5
+    a.becomeLeader(2, {kA, kB});                 // C outside the ISR
+    int64_t clock = 1'000'000;
+    a.doWork(clock);
+    ASSERT_EQ(a.onFetchRequest(rev3Fetch(2, kC, 7, 1), clock), kErrNone);   // C holds [0,7)
+    for (int i = 0; i < 5; ++i) { clock += 1'000'000; a.doWork(clock); }
+    EXPECT_FALSE(rev3InIsr(a, kC)) << "C admitted while missing records the leader held at election";
+    ASSERT_EQ(a.onFetchRequest(rev3Fetch(2, kC, 10, 1), clock), kErrNone);  // caught up to 10
+    for (int i = 0; i < 5; ++i) { clock += 1'000'000; a.doWork(clock); }
+    EXPECT_TRUE(rev3InIsr(a, kC)) << "C never admitted once it held the leader-epoch start offset";
+}
