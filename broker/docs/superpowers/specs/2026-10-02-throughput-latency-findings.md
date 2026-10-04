@@ -461,6 +461,52 @@ plane's own CPU (why a control-plane-only node driver still burns ~20% at backof
 waterfall on the after binary.  Fused: p50 598 -> 549 us, p99 40 -> 51 ms (one run each; the 20k fused p99 spread is
 17-30 ms run-to-run in §4.12 and 43 ms in the D2 diagnosis — no regression claimed or excluded beyond that).
 
+#### 4.13.1 D2 round 2: the control plane actually idles (2026-10-04, k3s-node-01)
+
+Follow-up to the waterfall on 68c3a62 (thread placement, gate 60,643 = 60,643): every app-side hop was fast; the 13.4 ms
+p50 sat in RECEIVE delays (bench client receiving acks p50 ~5 ms; worker receives p90 5-7.5 ms).  Core 0 carried the
+three nodes' control planes (~1 core), so the unpinned client time-sliced with a worker; pinned to core 0 it was starved
+by the control planes instead (13.4 -> 8.7 ms).
+
+Diagnosis (68c3a62, thread placement, `perf trace -s` on one broker over 5 s, IDLE cluster): node driver thread 88,034
+recvmmsg (87,381 empty), 5,062 sched_yield, 2,250 nanosleep - Aeron backoff (10 spins, 20 yields, park 1 us doubling to
+1 ms) re-arms on every heartbeat / status message, and every spin or yield pass is a whole duty cycle (a recvmmsg per
+socket, ~60-90 us).  Runtime thread: 14,912 sched_yield + 17,296 nanosleep (10 spins, 20 yields, 1 us -> 200 us).
+Idle, the control plane (3 drivers + 3 runtimes + admin + cleaner) used ~76% of core 0 with ~2.8k involuntary switches /s
+per driver.  Driver idle shape sweep (same binary, AERON_SHARED_IDLE_STRATEGY_INIT_ARGS, idle, per driver): default 11.6%
+-> 1-0-50us-1ms 9.5% -> 1-0-100us-2ms 7% -> 1-0-250us-4ms 5.5%; involuntary switches 2.9k/s -> ~1/s once yields are 0.
+
+Fix (rune-broker fix/d2-thread-placement **2013c2e**, wt35): shard mode, control-plane threads park without yielding -
+`NodeConfig::controlIdleShape` = 10 spins, 0 yields, park 100 us doubling to `RUNE_CONTROL_IDLE_MAX_PARK_US` (default
+2000) for the runtime thread (thread placement) and the admin thread; the threaded node driver gets the same shape as
+Aeron backoff init args with ONE spin pass (`1-0-100000-2000000`; `RUNE_AERON_DRIVER_IDLE_ARGS` overrides).  Legacy mode
+unchanged; never busy-spin.  Logged `drvIdle=backoff{1-0-100000-2000000} ctlIdle=10-0-100us-2000us`.  Worker idle and
+worker invoker drivers untouched (A7).
+
+A/B: before = 68c3a62, after = 2013c2e (the box built the same tree), same config as §4.13 (tp.sh, 16 MiB
+terms, MTU 1408 GSO/GRO, logs off, 3 nodes x 1 worker on cores 1/2/3, non-worker set {0}), 20k rec/s open loop, 1 KiB,
+acks=all, linger 0, 20 s.  Thread arms: bench client pinned to core 0 (`--core 0`) in both.  Fused-after: client
+unpinned, the conditions of the 68c3a62 fused row above.  One run per arm, interleaved, all errors=0, ~20,000 rec/s.
+Per-thread CPU over a 5 s window mid-run (/root/d2c/tsamp.py; raw: /root/d2c/res/ab/ on the box).
+
+| arm | p50 / p99 / p999 us | node drivers (3) | runtimes (3) | admin+cleaner (6) | client | workers (each) |
+|---|---|---|---|---|---|---|
+| thread, before (68c3a62) | 15,073 / 371,196 / 482,345 | 44.8% (invol 2.3-2.4k/s each) | 25.7% | 6.2% | 23.5% (starved, invol 3.7k/s) | 58-59% |
+| thread, after (2013c2e) | **545 / 162,529 / 234,881** | **19.1%** (invol ~80/s) | **7.8%** (invol 0) | 5.6% | 67.9% | 92-93% |
+| fused, after (client unpinned) | 447 / 45,351 / 73,925 | - (invoker) | - (on worker) | 6.0% | 94.3% | 95-97% |
+
+Idle cluster (thread placement, 5 s, no client): control plane before 75.6% of core 0 (drivers 34.8, runtimes 31.6, admin
+5.2, cleaner 4.0) -> after **43.4%** (drivers 21.7, runtimes 12.7, admin 3.4, cleaner 5.6); workers 97% -> 84% (sum of 3).
+
+Result: **thread placement p50 15.1 ms -> 0.55 ms** (client pinned to core 0 in both arms) and p99 371 -> 163 ms; the
+control plane's CPU at 20k drops **~77% -> ~33% of core 0**, and the client on core 0 gets the CPU it needs (23% -> 68%).
+Thread p50 is now in the fused range.  Fused after (447 / 45,351 us) vs 68c3a62 fused (549 / 50,594) and integ (598 /
+40,370): no regression (single runs; fused p99 spread 17-51 ms).  Workers do more CPU at the same 20k after (58 -> 92%):
+the client is no longer starved, so it no longer sends coalesced bursts - at linger 0 that is one record per batch, the
+per-batch work A8 targets.  The thread p99 (163 ms) is still far above fused (45 ms): next, an FR waterfall on 2013c2e.
+Remaining idle cost: each node driver ~7% (~800 wakeups/s x ~85 us duty cycle: recvmmsg per socket); A7's epoll-first
+polling, once merged, applies to the node driver too and should cut the per-cycle cost.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
