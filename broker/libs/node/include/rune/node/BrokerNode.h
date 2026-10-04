@@ -1023,6 +1023,11 @@ private:
     std::int64_t                     termCounterRegId_ = -1;
     std::shared_ptr<aeron::Counter>  roleCounter_;
     std::shared_ptr<aeron::Counter>  termCounter_;
+    // D9 review MEDIUM-3: the TCS stuck-markers gauge counter.  Resolved and
+    // set on the CONTROL (runtime) thread only, from the TCS sink below.
+    std::int64_t                     stuckMarkersCounterRegId_ = -1;
+    std::shared_ptr<aeron::Counter>  stuckMarkersCounter_;
+    static bool publishStuckMarkers_(void* self, std::int64_t value);
 
     // -----------------------------------------------------------------------
     // State flags — CONTROLLER-owned (F9a: no atomics).  Written only by the

@@ -695,6 +695,48 @@ TEST(MarkerRetryRegression, StuckMarkerGaugeCountsLongRefusedMarkersAndClearsOnL
 
 // D9 review MAJOR-2: a FENCED refusal (a newer coordinator wrote a marker for
 // this producer there) is never retried and never counts as landed.
+// D9 review MEDIUM-3: the gauge is published through a sink (BrokerNode: an
+// Aeron counter in CnC) on every change.
+TEST(MarkerRetryRegression, StuckMarkerGaugeIsPublishedToItsSinkOnChange) {
+    TxnRig T(/*minIsr=*/2);
+    std::vector<int64_t> published;
+    T.tcs->setStuckMarkersSink([](void* ctx, int64_t v) { static_cast<std::vector<int64_t>*>(ctx)->push_back(v); return true; },
+                               &published);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    (void)T.tcs->doWork(10);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    T.runUntilNoMarkerAwaited(10);
+    int64_t now = 20'000'000;
+    for (; now < TransactionCoordinationService::kStuckMarkerNs + 2'000'000'000; now += 10'000'000) {
+        (void)T.tcs->doWork(now); T.m.runWorker(now);
+    }
+    ASSERT_FALSE(published.empty()) << "the gauge never reached its sink";
+    EXPECT_EQ(published.back(), 1);
+    T.m.r->setMinIsrForTest(1);
+    for (int i = 0; i < 64 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) { now += 100'000'000; (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    for (int i = 0; i < 4; ++i) { now += 100'000'000; (void)T.tcs->doWork(now); }
+    EXPECT_EQ(published.back(), 0) << "the cleared gauge was not published";
+}
+
+// D9 review LOW-2: a refusal seen before the coordinator's first doWork (clock
+// 0) must not count as stuck the moment the clock starts.
+TEST(MarkerRetryRegression, RefusalBeforeTheFirstPassIsNotInstantlyStuck) {
+    TxnRig T(/*minIsr=*/2);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);               // dispatched before any doWork
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u);
+    const int64_t start = 100'000'000'000;                   // the clock starts far from 0
+    (void)T.tcs->doWork(start);
+    EXPECT_EQ(T.tcs->stuckMarkers(), 0u) << "a refusal at clock 0 was counted as stuck at once";
+}
+
 TEST(MarkerRetryRegression, FencedMarkerIsNotRetriedAndDoesNotCompleteTheTxn) {
     TxnRig T(/*minIsr=*/2);                                  // the first attempt is refused (retriable)
     ASSERT_EQ(T.initPid(), 0);

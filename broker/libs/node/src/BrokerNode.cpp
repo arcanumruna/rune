@@ -389,6 +389,9 @@ void BrokerNode::start() {
         termCounterRegId_ = aeron_->addCounter(
             kTermCounterTypeId, roleKey, kRoleKeyLength,
             termCounterLabel(config_.nodeId));
+        stuckMarkersCounterRegId_ = aeron_->addCounter(
+            kStuckMarkersCounterTypeId, roleKey, kRoleKeyLength,
+            stuckMarkersLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -2033,6 +2036,8 @@ void BrokerNode::buildGateway() {
                 [this]() -> NodeId { return leaderObserver_.computeOnControl().leaderId; });
 
             txnCoordService_->setGateway(gateway_.get());
+            // D9 review MEDIUM-3: the stuck-markers gauge → its Aeron counter.
+            txnCoordService_->setStuckMarkersSink(&BrokerNode::publishStuckMarkers_, this);
 
             gateway_->setTxnService(txnCoordService_.get());
 
@@ -2487,6 +2492,22 @@ Term BrokerNode::leadershipTermId() const noexcept {
 // Observer thread: one ring-drained snapshot (role + term together, F9a).
 // Called from main's 100 ms poll loop.
 // ---------------------------------------------------------------------------
+// D9 review MEDIUM-3: TCS stuck-markers sink — CONTROL (runtime) thread only.
+// Resolves the counter registration lazily (the driver acks asynchronously);
+// false = not resolved yet, the TCS retries on its next gauge scan.
+bool BrokerNode::publishStuckMarkers_(void* self, std::int64_t value)
+{
+    auto* n = static_cast<BrokerNode*>(self);
+    if (!n->aeron_) return false;
+    if (!n->stuckMarkersCounter_ && n->stuckMarkersCounterRegId_ >= 0) {
+        try { n->stuckMarkersCounter_ = n->aeron_->findCounter(n->stuckMarkersCounterRegId_); }
+        catch (...) { n->stuckMarkersCounter_.reset(); }
+    }
+    if (!n->stuckMarkersCounter_) return false;
+    n->stuckMarkersCounter_->set(value);
+    return true;
+}
+
 void BrokerNode::publishRole() noexcept {
     if (!aeron_) return;
 
@@ -2967,6 +2988,7 @@ void BrokerNode::stop() {
     //     teardown.  Reset these here (not in ~BrokerNode) to fix that ordering.
     roleCounter_.reset();
     termCounter_.reset();
+    stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"

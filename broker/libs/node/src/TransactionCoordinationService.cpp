@@ -162,6 +162,8 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     awaiting_.clear();
     queuedRetries_ = 0;
     stuckMarkers_  = 0;
+    nextStuckScanNs_ = 0;
+    publishStuckMarkers_();
     if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_);   // older epochs' leftovers
     if (txnState_ != nullptr) {
         // I7: the next pid lies at or above every ceiling a previous coordinator
@@ -197,6 +199,8 @@ void TransactionCoordinationService::unload_()
     awaiting_.clear();
     queuedRetries_ = 0;
     stuckMarkers_  = 0;
+    nextStuckScanNs_ = 0;
+    publishStuckMarkers_();
     if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_ + 1);   // this (now old) epoch
     coordinator_.clear();
     pidCeilingPending_       = -1;
@@ -256,7 +260,11 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     int work = coordinator_.doWork(nowNs);
     work += retryRefusedMarkers_(nowNs);
-    if (!awaiting_.empty() || stuckMarkers_ != 0) [[unlikely]] updateStuckMarkers_(nowNs);
+    // Observability only, rate-limited (review LOW-1): never a per-pass walk.
+    if ((!awaiting_.empty() && nowNs >= nextStuckScanNs_) || (awaiting_.empty() && stuckMarkers_ != 0)) [[unlikely]] {
+        nextStuckScanNs_ = nowNs + kStuckScanIntervalNs;
+        updateStuckMarkers_(nowNs);
+    }
 
     // TX-4 Task 8: Resolve pending markers (internally-initiated aborts and the
     // Prepare* re-driven after a load).  Task 10 round 5 (Kafka semantics): the
@@ -827,6 +835,8 @@ void TransactionCoordinationService::queueRetry_(AwaitingMarkers& a, int32_t top
             return;
         }
     }
+    // firstRefusedNs: 0 = "not stamped yet" (refused before the first doWork);
+    // the gauge scan stamps it with the then-current clock (review LOW-2).
     a.retries.push_back(MarkerRetry{topicId, partition, lastNowNs_ + kMarkerRetryMinNs, kMarkerRetryMinNs, false,
                                     lastNowNs_});
     ++queuedRetries_;
@@ -835,14 +845,24 @@ void TransactionCoordinationService::queueRetry_(AwaitingMarkers& a, int32_t top
 void TransactionCoordinationService::updateStuckMarkers_(int64_t nowNs)
 {
     std::size_t stuck = 0;
-    for (const auto& [pid, a] : awaiting_)
-        for (const auto& r : a.retries) stuck += (nowNs - r.firstRefusedNs >= kStuckMarkerNs) ? 1u : 0u;
+    for (auto& [pid, a] : awaiting_)
+        for (auto& r : a.retries) {
+            if (r.firstRefusedNs <= 0) r.firstRefusedNs = nowNs;   // refused before the clock started
+            stuck += (nowNs - r.firstRefusedNs >= kStuckMarkerNs) ? 1u : 0u;
+        }
     if (stuck != 0 && stuckMarkers_ == 0)
         spdlog::warn("TCS: {} control marker(s) stuck — refused for more than {} s and still retrying "
                      "(their transactions stay Prepare*)", stuck, kStuckMarkerNs / 1'000'000'000);
     else if (stuck == 0 && stuckMarkers_ != 0)
         spdlog::info("TCS: no stuck control markers any more");
     stuckMarkers_ = stuck;
+    publishStuckMarkers_();
+}
+
+void TransactionCoordinationService::publishStuckMarkers_()
+{
+    const auto v = static_cast<int64_t>(stuckMarkers_);
+    if (stuckSink_ != nullptr && v != stuckPublished_ && stuckSink_(stuckSinkCtx_, v)) stuckPublished_ = v;
 }
 
 bool TransactionCoordinationService::dropRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition)

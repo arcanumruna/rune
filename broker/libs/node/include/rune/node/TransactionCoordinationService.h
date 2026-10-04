@@ -198,6 +198,15 @@ public:
     /// doWork; a rise from 0 / a return to 0 is logged.  Control thread.
     static constexpr int64_t kStuckMarkerNs = 5'000'000'000;   // 5 × kMarkerRetryMaxNs
     [[nodiscard]] std::size_t stuckMarkers() const noexcept { return stuckMarkers_; }
+    /// D9 review MEDIUM-3: where the gauge is published (BrokerNode: an Aeron
+    /// counter in the driver's CnC, next to the node-role counters).  Called on
+    /// the control thread when the value changes; `false` = not published yet
+    /// (counter not resolved) → retried on the next scan.  Function pointer +
+    /// ctx (no std::function).
+    using StuckMarkersSink = bool (*)(void* ctx, int64_t value);
+    void setStuckMarkersSink(StuckMarkersSink fn, void* ctx) noexcept {
+        stuckSink_ = fn; stuckSinkCtx_ = ctx; stuckPublished_ = -1;
+    }
 
 private:
     uint64_t controlMarkersRefused_ = 0;
@@ -232,7 +241,13 @@ private:
     int64_t lastNowNs_ = 0;                 ///< doWork clock, used to schedule refusal retries
     std::size_t queuedRetries_ = 0;         ///< retries due for (re-)dispatch (not in flight)
     std::size_t stuckMarkers_  = 0;         ///< D9 gauge (see stuckMarkers())
+    static constexpr int64_t kStuckScanIntervalNs = 100'000'000;   ///< gauge scan rate (observability only)
+    int64_t     nextStuckScanNs_ = 0;
+    StuckMarkersSink stuckSink_    = nullptr;
+    void*            stuckSinkCtx_ = nullptr;
+    int64_t          stuckPublished_ = -1;  ///< last value the sink took (-1 = none)
     void updateStuckMarkers_(int64_t nowNs);
+    void publishStuckMarkers_();
     int retryRefusedMarkers_(int64_t nowNs);
     /// Queue (or re-queue with a doubled backoff) the marker for (topicId, partition).
     void queueRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition);
