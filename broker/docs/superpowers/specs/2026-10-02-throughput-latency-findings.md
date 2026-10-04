@@ -666,6 +666,24 @@ equals A's higher round 81.9%; A r1 ran with its client at 57% — the rounds' o
 either way; the doorbell shape does not cut 20k CPU, as §4.15 found).  The §4.15 B-hyb single run (p50 356 us,
 p99 9.5 ms) is confirmed in direction.  Stopped after 2 rounds per arm (they agree).  VM time ~10 min.
 
+### 4.16 A10 root cause: periodic fsync at 5 ms saturates the disk's IOPS (2026-10-04, k3s-node-01)
+
+Binary: integ/perf-defaults 0960e2a (D2 + A7/A9 + D6 + D8b/c), client integ/client-2026-10-04; reference config
+(MTU 1408 + GSO, backoff workers, logs off), 3-node acks=all 1 KiB, 20k rec/s open loop, leader + follower periodic
+fsync 5 ms (RUNE_WORKER_SYNC_INTERVAL_MS=5, RUNE_FOLLOWER_FLUSH_INTERVAL_MS=5).  One run: achieved 17.4k (< 20k),
+p50 2.4 ms, p99 10 s (collapse reproduced, errors 0).  Mid-run 5 s sample: **disk 98% busy, ~6,660 write IOs/s**;
+io-wq threads 16 per broker (fsyncs DO run concurrently — not a serialization bug).
+
+Disk capability (fsync probe on the broker data disk, ext4 on a QEMU volume): sequential fdatasync ~920/s (~1 ms each,
+same for 1/8/24 files); concurrent fdatasync 4 / 8 / 24 threads = 2.8k / 5.0k / 10.5k per s (jbd2 batches);
+syncfs over 24 dirty files = 220 rounds/s (each round makes all 24 durable).
+
+Cause: per-log fdatasync every 5 ms (~8 logs/node x 200/s x 3 nodes) writes each log's few-KB dirty tail + a
+journal commit as separate small IOs -> the disk's write-IOPS budget is exceeded, queues grow without bound.
+Software lever: GROUP COMMIT — one durability round per node per interval (syncfs on a dedicated data volume, or
+one coalesced round of fdatasyncs that waits for all of them), so IO count stops scaling with the number of logs;
+Strict acks wait interval/2 + one commit.  Periodic fsync stays OFF by default (A3; durability via replication).
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
