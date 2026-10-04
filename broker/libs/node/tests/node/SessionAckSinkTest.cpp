@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <map>
 #include <memory>
 #include <optional>
@@ -30,6 +31,8 @@ struct FakePolicy {
         std::set<int64_t> erroredRegs;
         std::set<int> blocked;                                  // pub ids that back-pressure
         std::set<int> closed;                                   // pub ids that are CLOSED (fatal)
+        std::set<int> notConnected;                             // pub ids whose subscriber is gone (NOT_CONNECTED)
+        std::map<int, int> budget;                              // pub id -> claims that succeed, then back-pressure
         std::vector<std::pair<int, std::vector<uint8_t>>> sent; // (pub id, frame)
         std::vector<int64_t> foundRegs;                         // registrations find() resolved
     };
@@ -50,7 +53,12 @@ struct FakePolicy {
     }
     template <class E> int64_t claim(PubHandle& p, std::size_t len, E&& enc) noexcept {
         if (s->closed.count(p->id)) return kFatal;    // CLOSED / MAX_POSITION
+        if (s->notConnected.count(p->id)) return -1;            // NOT_CONNECTED
         if (s->blocked.count(p->id)) return -2;                 // BACK_PRESSURED
+        if (auto b = s->budget.find(p->id); b != s->budget.end()) {
+            if (b->second == 0) return -2;                      // the client's window is full
+            --b->second;
+        }
         std::vector<uint8_t> b(len);
         enc(b.data());
         s->sent.push_back({p->id, std::move(b)});
@@ -59,6 +67,9 @@ struct FakePolicy {
 };
 using Sink = SessionAckSinkT<FakePolicy>;
 static_assert(Sink::kClaimFatal == kFatal);
+static_assert(Sink::kClaimNotConnected == -1);
+using K = SessionSignalKind;
+using Edge = std::pair<int64_t, K>;
 AckEntry ack(int64_t sid, int64_t corr, int64_t base = 0) { return AckEntry{sid, corr, base, 0, 0}; }
 
 // One pass with the lifecycle ring fully consumed (producer == consumer).
@@ -320,26 +331,26 @@ TEST(SessionAckSinkRegression, ManySessionsSurviveBackwardShiftDeletion) {
 TEST(SessionAckSinkRegression, HoldEdgesAreReportedOncePerTransition) {
     FakePolicy pol; auto st = pol.s; Sink s(pol);
     ready(s, 7); ready(s, 8);
-    std::vector<std::pair<int64_t, bool>> got;
-    auto take = [&](int64_t sid, bool held) { got.push_back({sid, held}); return true; };
+    std::vector<Edge> got;
+    auto take = [&](int64_t sid, K k) { got.push_back({sid, k}); return true; };
     st->blocked.insert(1);                                  // session 7's publication
     s.enqueue(ack(7, 1)); s.enqueue(ack(8, 2));
     pass(s);
-    EXPECT_EQ(s.reportHoldChanges(take), 1);
+    EXPECT_EQ(s.reportSessionEdges(take), 1);
     ASSERT_EQ(got.size(), 1u);
-    EXPECT_EQ(got[0], (std::pair<int64_t, bool>{7, true}));
+    EXPECT_EQ(got[0], (Edge{7, K::Held}));
     s.enqueue(ack(7, 3)); pass(s); pass(s);
-    EXPECT_EQ(s.reportHoldChanges(take), 0) << "still held: no repeat";
+    EXPECT_EQ(s.reportSessionEdges(take), 0) << "still held: no repeat";
     st->blocked.clear();
     pass(s);
-    EXPECT_EQ(s.reportHoldChanges([](int64_t, bool) { return false; }), 0) << "return ring full";
-    EXPECT_EQ(s.reportHoldChanges(take), 1) << "retried, not lost";
-    EXPECT_EQ(got.back(), (std::pair<int64_t, bool>{7, false}));
+    EXPECT_EQ(s.reportSessionEdges([](int64_t, K) { return false; }), 0) << "return ring full";
+    EXPECT_EQ(s.reportSessionEdges(take), 1) << "retried, not lost";
+    EXPECT_EQ(got.back(), (Edge{7, K::Released}));
     st->blocked.insert(2);                                  // session 8 held, then closed
     s.enqueue(ack(8, 4)); pass(s);
     s.close(8);
     pass(s);
-    EXPECT_EQ(s.reportHoldChanges(take), 0) << "a closed session's state dies with the runtime's close";
+    EXPECT_EQ(s.reportSessionEdges(take), 0) << "a closed session's state dies with the runtime's close";
 }
 
 // Fix round 2 (finding 8): a registration still resolving when its session is
@@ -480,4 +491,276 @@ TEST(SessionAckSinkUnknownProducerIdRegression, OldSessionsGetTheStrictPreD6Fram
         ++seen;
     }
     EXPECT_EQ(seen, 2u * (kN - (kN + 2) / 3));
+}
+
+// D8b round 2 (re-review MAJOR-A / MEDIUM-C): NOT_CONNECTED is a SUSPICION, never a verdict.  It means "no status
+// message for the driver's publication-connection timeout (5 s)" — also a live invoker-mode client that paused its
+// duty cycle, or a network blip.  The sink stays timer-free: the session is marked LOST (reported once, as an edge),
+// its acks stay queued in order and are never dropped for it; the runtime reaps a session that stays Lost on the
+// normal lease (gateway test).  A later claim that sees the publication connected reports Found and delivers in order.
+TEST(SessionAckSinkRegression, NotConnectedMarksTheSessionLostAndKeepsItsAcksQueuedRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 5);
+    ASSERT_TRUE(s.enqueue(ack(5, 1)));
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 1u);
+    const int pubId = st->sent.back().first;
+    std::vector<Edge> got;
+    auto take = [&](int64_t sid, K k) { got.push_back({sid, k}); return true; };
+    st->notConnected.insert(pubId);                         // the client's SMs stopped (dead, paused or blip)
+    ASSERT_TRUE(s.enqueue(ack(5, 2)));
+    ASSERT_TRUE(s.enqueue(ack(5, 3)));
+    pass(s);
+    EXPECT_EQ(s.pendingForTest(), 2u) << "acks stay queued — never dropped for NOT_CONNECTED";
+    EXPECT_EQ(s.droppedForTest(), 0u);
+    EXPECT_TRUE(std::holds_alternative<Sink::PubReady>(*s.stateForTest(5))) << "not failed";
+    EXPECT_EQ(s.reportSessionEdges([](int64_t, K) { return false; }), 0) << "return ring full";
+    EXPECT_EQ(s.reportSessionEdges(take), 2) << "retried next pass, not lost";
+    EXPECT_EQ(got, (std::vector<Edge>{{5, K::Lost}, {5, K::Held}}));
+    std::vector<int64_t> failed;
+    s.reportFailures([&](int64_t sid) { failed.push_back(sid); return true; });
+    EXPECT_TRUE(failed.empty()) << "Lost is not Failed";
+    got.clear();
+    for (int i = 0; i < 3; ++i) pass(s);
+    EXPECT_EQ(s.reportSessionEdges(take), 0) << "Lost is reported once per edge";
+    st->notConnected.clear();                               // its SMs resumed
+    pass(s);
+    EXPECT_EQ(s.reportSessionEdges(take), 2);
+    EXPECT_EQ(got, (std::vector<Edge>{{5, K::Found}, {5, K::Released}}));
+    ASSERT_EQ(st->sent.size(), 3u);
+    EXPECT_EQ(corrOf(st->sent[1].second), 2);
+    EXPECT_EQ(corrOf(st->sent[2].second), 3) << "delivered in order";
+}
+
+// MEDIUM-C: a publication that never connected (unreachable egress endpoint, or the client died before its first
+// ack) is Lost too — the runtime frees it on the normal lease, not after the 10-min held bound.
+TEST(SessionAckSinkRegression, NeverConnectedPublicationIsLostRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 6);
+    st->notConnected.insert(static_cast<int>(st->foundRegs.back()));
+    ASSERT_TRUE(s.enqueue(ack(6, 1)));
+    pass(s);
+    pass(s);
+    EXPECT_EQ(s.pendingForTest(), 1u) << "held, not dropped";
+    std::vector<Edge> got;
+    s.reportSessionEdges([&](int64_t sid, K k) { got.push_back({sid, k}); return true; });
+    EXPECT_EQ(got, (std::vector<Edge>{{6, K::Lost}, {6, K::Held}}));
+}
+
+// BACK_PRESSURED is Aeron's "connected, window closed" verdict (it is only returned while the publication is
+// connected): a Lost session whose client is back but still not reading is Found — it stays Held (10-min bound).
+TEST(SessionAckSinkRegression, BackPressureAfterLostIsFoundAndStaysHeldRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 5);
+    st->notConnected.insert(1);
+    ASSERT_TRUE(s.enqueue(ack(5, 1)));
+    pass(s);
+    std::vector<Edge> got;
+    auto take = [&](int64_t sid, K k) { got.push_back({sid, k}); return true; };
+    s.reportSessionEdges(take);
+    ASSERT_EQ(got, (std::vector<Edge>{{5, K::Lost}, {5, K::Held}}));
+    got.clear();
+    st->notConnected.clear();
+    st->blocked.insert(1);
+    pass(s);
+    s.reportSessionEdges(take);
+    EXPECT_EQ(got, (std::vector<Edge>{{5, K::Found}}));
+    EXPECT_EQ(s.pendingForTest(), 1u);
+}
+
+// MEDIUM-A: a held session whose client reads (acks claimed while held) reports Progress so the runtime refreshes
+// its lease — rate-limited by PASS COUNT (no clock): at most once per kProgressPassInterval passes, counted from the
+// Held edge / the previous Progress.  The last progress is never lost: it is reported once the interval elapses even
+// if the client stalls again meanwhile.  No progress → no Progress.
+TEST(SessionAckSinkRegression, HeldSessionDrainingReportsProgressRateLimitedByPassesRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8);
+    constexpr uint64_t N = Sink::kProgressPassInterval;
+    st->budget[1] = 0;                                      // 7: window full
+    st->blocked.insert(2);                                  // 8: never reads
+    for (int64_t c = 0; c < static_cast<int64_t>(3 * N); ++c) ASSERT_TRUE(s.enqueue(ack(7, c)));
+    ASSERT_TRUE(s.enqueue(ack(8, 1)));
+    std::vector<Edge> got;
+    auto take = [&](int64_t sid, K k) { got.push_back({sid, k}); return true; };
+    pass(s);
+    s.reportSessionEdges(take);
+    ASSERT_EQ(got, (std::vector<Edge>{{7, K::Held}, {8, K::Held}}));
+    got.clear();
+    std::vector<uint64_t> progressAt;                       // passes (since the Held edge) that reported Progress
+    for (uint64_t p = 1; p <= 2 * N + 1; ++p) {
+        st->budget[1] = 1;                                  // the client reads one ack per pass
+        pass(s);
+        s.reportSessionEdges(take);
+        for (auto& e : got) {
+            ASSERT_EQ(e, (Edge{7, K::Progress})) << "only 7 progresses; no other edge";
+            progressAt.push_back(p);
+        }
+        got.clear();
+    }
+    EXPECT_EQ(progressAt, (std::vector<uint64_t>{N, 2 * N})) << "once per kProgressPassInterval passes";
+    // One ack read, then the client stalls: the progress is still reported when the interval elapses.
+    st->budget[1] = 1;
+    pass(s);
+    st->budget[1] = 0;
+    uint64_t reported = 0, at = 0;
+    for (uint64_t p = 1; p <= N; ++p) {
+        pass(s);
+        s.reportSessionEdges(take);
+        if (!got.empty()) { ++reported; at = p; EXPECT_EQ(got.back(), (Edge{7, K::Progress})); got.clear(); }
+    }
+    EXPECT_EQ(reported, 1u) << "the last progress is never lost";
+    EXPECT_EQ(at, N - 2) << "reported exactly kProgressPassInterval passes after the previous Progress";
+    for (uint64_t p = 0; p < 2 * N; ++p) { pass(s); s.reportSessionEdges(take); }
+    EXPECT_TRUE(got.empty()) << "no progress -> no Progress";
+}
+
+// A Progress that the return ring refuses is retried next pass (the session stays dirty) — never lost.
+TEST(SessionAckSinkRegression, RefusedProgressIsRetriedRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7);
+    constexpr uint64_t N = Sink::kProgressPassInterval;
+    st->budget[1] = 0;
+    for (int64_t c = 0; c < 8; ++c) ASSERT_TRUE(s.enqueue(ack(7, c)));
+    pass(s);
+    std::vector<Edge> got;
+    auto take = [&](int64_t sid, K k) { got.push_back({sid, k}); return true; };
+    s.reportSessionEdges(take);
+    got.clear();
+    st->budget[1] = 1;
+    pass(s);
+    st->budget[1] = 0;
+    for (uint64_t p = 2; p <= N; ++p) { pass(s); s.reportSessionEdges([](int64_t, K) { return false; }); }
+    EXPECT_EQ(s.reportSessionEdges(take), 1) << "refused at the interval, retried";
+    EXPECT_EQ(got, (std::vector<Edge>{{7, K::Progress}}));
+}
+
+// Backward-shift deletion must move the new per-session edge flags (lost / reported lost / progress) WITH their
+// session and reset the vacated slot: B (lost, reported) and C (held, reported) shift left when A is closed; B's
+// Found and C's Released are still reported; a new session D in the freed slot inherits nothing.
+TEST(SessionAckSinkRegression, BackwardShiftDeletionKeepsEdgeFlagsWithTheirSessionRegression) {
+    constexpr int kBits = std::countr_zero(Sink::kMaxSessions);
+    auto home = [](int64_t sid) { return (static_cast<uint64_t>(sid) * 0x9E3779B97F4A7C15ULL) >> (64 - kBits); };
+    std::vector<int64_t> same;                              // four keys with the same home slot
+    for (int64_t sid = 2; same.size() < 3; ++sid) if (home(sid) == home(1)) same.push_back(sid);
+    const int64_t A = 1, B = same[0], C = same[1], D = same[2];
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, A); ready(s, B); ready(s, C);                  // pubs 1, 2, 3; slots h, h+1, h+2
+    st->notConnected.insert(2);
+    st->blocked.insert(3);
+    ASSERT_TRUE(s.enqueue(ack(B, 1)));
+    ASSERT_TRUE(s.enqueue(ack(C, 2)));
+    pass(s);
+    std::vector<Edge> got;
+    auto take = [&](int64_t sid, K k) { got.push_back({sid, k}); return true; };
+    s.reportSessionEdges(take);
+    ASSERT_EQ(got, (std::vector<Edge>{{B, K::Lost}, {B, K::Held}, {C, K::Held}}));
+    got.clear();
+    s.close(A);                                             // B, C shift left
+    pass(s);
+    EXPECT_EQ(s.reportSessionEdges(take), 0) << "no spurious edge after the shift";
+    st->notConnected.clear();
+    st->blocked.clear();
+    pass(s);
+    s.reportSessionEdges(take);
+    std::sort(got.begin(), got.end());
+    std::vector<Edge> want{{B, K::Released}, {B, K::Found}, {C, K::Released}};
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(got, want) << "the reported flags moved with their sessions";
+    got.clear();
+    st->notConnected.insert(3);                             // C lost + held again, then closed with those flags set
+    ASSERT_TRUE(s.enqueue(ack(C, 4)));
+    pass(s);
+    s.reportSessionEdges(take);
+    ASSERT_EQ(got, (std::vector<Edge>{{C, K::Lost}, {C, K::Held}}));
+    got.clear();
+    s.close(C);                                             // C's slot freed (the tail of the run)
+    ready(s, D);
+    ASSERT_TRUE(s.enqueue(ack(D, 3)));
+    pass(s);
+    EXPECT_EQ(s.reportSessionEdges(take), 0) << "a new session in a vacated slot inherits no flags";
+    EXPECT_EQ(s.pendingForTest(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// D8c — produce credits of the gateway-routed path (reportCredits).
+// ---------------------------------------------------------------------------
+namespace {
+AckEntry routedAck(int64_t sid, int64_t corr) {
+    AckEntry a = ack(sid, corr);
+    a.credit = 1;
+    return a;
+}
+using Credit = std::pair<int64_t, uint32_t>;
+} // namespace
+
+// A gateway-routed ack returns its credit when it is CLAIMED — never at enqueue, never while it is held — and
+// direct (worker-ingress) acks return none.  Counts coalesce: one report per session per pass.
+TEST(SessionAckSinkRegression, CreditIsReturnedOnlyWhenARoutedAckIsClaimedRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8);
+    std::vector<Credit> got;
+    auto take = [&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; };
+    st->budget[1] = 2;                                      // 7: two acks fit its window, then back-pressure
+    for (int64_t c = 0; c < 5; ++c) ASSERT_TRUE(s.enqueue(routedAck(7, c)));
+    ASSERT_TRUE(s.enqueue(ack(7, 100)));                    // a direct (ingress) ack of the same session
+    ASSERT_TRUE(s.enqueue(routedAck(8, 1)));
+    ASSERT_TRUE(s.enqueue(ack(8, 2)));
+    EXPECT_EQ(s.reportCredits(take), 0) << "nothing is claimed before the flush";
+    pass(s);
+    EXPECT_EQ(s.reportCredits(take), 2);
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 2u}, {8, 1u}})) << "claimed routed acks only, coalesced per session";
+    got.clear();
+    pass(s);
+    EXPECT_EQ(s.reportCredits(take), 0) << "held acks return nothing";
+    EXPECT_EQ(s.heldAcks(), 4u);
+    st->budget[1] = 1000;                                   // the client reads again
+    pass(s);
+    EXPECT_EQ(s.reportCredits(take), 1);
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 3u}})) << "the direct ack (corr 100) carries no credit";
+    EXPECT_EQ(s.reportCredits(take), 0) << "a reported count is zeroed";
+    EXPECT_EQ(got.size(), 1u);
+}
+
+// A credit report the return ring refuses stays counted and is retried (later claims add to it) — never lost, never
+// reported twice.
+TEST(SessionAckSinkRegression, RefusedCreditReportIsRetriedNeverLostOrDoubledRegression) {
+    FakePolicy pol; Sink s(pol);
+    ready(s, 7); ready(s, 8);
+    ASSERT_TRUE(s.enqueue(routedAck(7, 1)));
+    ASSERT_TRUE(s.enqueue(routedAck(8, 1)));
+    pass(s);
+    int calls = 0;
+    EXPECT_EQ(s.reportCredits([&](int64_t, uint32_t) { ++calls; return false; }), 0);
+    EXPECT_EQ(calls, 1) << "stops at the first refusal";
+    ASSERT_TRUE(s.enqueue(routedAck(7, 2)));
+    ASSERT_TRUE(s.enqueue(routedAck(7, 3)));
+    pass(s);
+    std::vector<Credit> got;
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 2);
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 3u}, {8, 1u}})) << "refused counts kept and merged with later claims";
+    got.clear();
+    pass(s);
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 0);
+    EXPECT_TRUE(got.empty()) << "never reported twice";
+}
+
+// A closed session's unreported credits die with it (the runtime's close discards its whole budget); a session
+// re-using the slot inherits none.
+TEST(SessionAckSinkRegression, ClosedSessionsUnreportedCreditsAreDroppedRegression) {
+    FakePolicy pol; Sink s(pol);
+    ready(s, 7);
+    ASSERT_TRUE(s.enqueue(routedAck(7, 1)));
+    pass(s);
+    ASSERT_EQ(s.unreportedCreditsForTest(7), 1u);
+    s.close(7);
+    std::vector<Credit> got;
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 0);
+    ready(s, 7);                                            // re-announced (fresh publication)
+    EXPECT_EQ(s.unreportedCreditsForTest(7), 0u);
+    ASSERT_TRUE(s.enqueue(routedAck(7, 2)));
+    pass(s);
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 1);
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 1u}}));
 }

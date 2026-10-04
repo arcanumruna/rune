@@ -9,6 +9,7 @@
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -45,6 +46,25 @@ struct Session {
     // understand (UnknownProducerId is answered OutOfOrderSequence below
     // protocol::client::kClientVersionUnknownProducerId).  0 = unknown (oldest).
     int32_t                                        clientVersion = 0;
+    // D8b round 2: bit w set = worker w reports this session's ack publication
+    // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero.
+    // Non-zero → reapExpired uses the normal lease measured from lostSinceNs.
+    uint64_t                                       lostByWorkers = 0;
+    int64_t                                        lostSinceNs   = 0;
+    // D8c: produce ops forwarded to the workers whose acks no worker has
+    // claimed yet (SessionSignal Credit).  At ClientGateway::sessionProduceCredits()
+    // the gateway ABORTs this session's Produce frames.  Dies with the session.
+    uint32_t                                       produceInFlight = 0;
+    // D8c fix round 1: produceInFlight split by the owning worker it was
+    // forwarded to (Credit signals name their worker) — kept so a close returns
+    // the session's share of every worker's routed cap.  Cold (close / credit).
+    static constexpr int                           kMaxWorkers = 64;   // == ClientGateway::kMaxHeldMaskWorkers
+    std::array<uint16_t, kMaxWorkers>              produceInFlightOn{};   // <= the per-session budget (4096)
+    // D8c fix round 2: tag of the worker's cap-full episode during which this
+    // session last returned a Credit from that worker (a reader — never evicted
+    // in that episode).  uint16 tags wrap after 65536 episodes (harmless: at
+    // worst one reading session is considered for eviction once more).
+    std::array<uint16_t, kMaxWorkers>              creditTagOn{};
 };
 
 // ---------------------------------------------------------------------------

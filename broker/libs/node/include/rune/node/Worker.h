@@ -216,6 +216,30 @@ public:
              ? kOverflowHighWater : static_cast<std::size_t>(kMaxIngressDrainLimit)) * kMaxReturnsPerOp +
         static_cast<std::size_t>(kMaxFragmentLimit) * kMaxReturnsPerOp + kMaxOwedReturnsCeiling;
     static constexpr std::size_t kRetFifoCapacity   = 16384;
+    // D8c fix round 1 (MAJOR-1): the session ack queue (SessionAckSink::
+    // kAckCapacity) is split in two STATIC shares.
+    //   kAckReserve       — what this worker's own intake may need beyond the
+    //                       gateway-routed share: owed returns at their ceiling
+    //                       + one full op drain + one full direct-ingress poll
+    //                       (each op / frame adds at most one to A + O).
+    //   kRoutedAckBudget  — the most GATEWAY-routed produces the runtime may
+    //                       have outstanding to this worker (counted from
+    //                       forward until the ack is CLAIMED: op ring + owed +
+    //                       queued) — ClientGateway's per-worker cap.
+    // So stalled gateway sessions, however many, can never take the reserve:
+    // once the worker has applied every SessionClose the runtime sent (a close
+    // frees the session's cap share at once, its queued acks drop at this
+    // worker's next flush — re-review LOW-R1), A + O <= kRoutedAckBudget +
+    // (owed <= kMaxOwedReturnsCeiling) + held direct acks, i.e. ackRoom_() >=
+    // one drain + one poll while no DIRECT client holds acks.  In the window
+    // before that, ackRoom_ (the one physical throttle) still bounds every
+    // drain — at worst one op-drain pass finds no room.
+    static constexpr std::size_t kAckReserve =
+        kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
+        static_cast<std::size_t>(kMaxFragmentLimit);
+    static constexpr std::size_t kRoutedAckBudget = SessionAckSink::kAckCapacity - kAckReserve;
+    static_assert(SessionAckSink::kAckCapacity > kAckReserve && kRoutedAckBudget >= kAckReserve,
+                  "D8c: the routed share and the worker's own reserve each get half of the ack queue (or more)");
     static_assert(kRetFifoCapacity >= kRetFifoBound,
                   "F15 §6: the return FIFO must hold its static bound at the owed-cap ceiling");
     static_assert((kRetFifoCapacity & (kRetFifoCapacity - 1)) == 0, "power of two (O(1) index mask)");
@@ -1531,7 +1555,8 @@ private:
     // -----------------------------------------------------------------------
     void emitProduceAck_(const WorkerReturn& ret) {
         const bool ok = ret.errorCode == 0;
-        AckEntry a{ret.sessionId, ret.correlationId, ok ? ret.baseOffset : 0, ret.partition, ret.errorCode};
+        AckEntry a{ret.sessionId, ret.correlationId, ok ? ret.baseOffset : 0, ret.partition, ret.errorCode,
+                   static_cast<uint8_t>(ret.gatewayCredit ? 1 : 0)};
         // D6: an UnknownProducerId result carries the log start in baseOffset
         // (the carrier does not grow); the sink gates it per session version.
         if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
@@ -1856,19 +1881,24 @@ private:
     //            runtime closes the session everywhere and tells the client;
     //   Held / Released (finding 1) — G-A6 on the gateway-routed path: the
     //            runtime pauses that session's gateway produce frames while any
-    //            worker holds its acks (controlled ABORT on its image).
+    //            worker holds its acks (controlled ABORT on its image);
+    //   Lost / Found / Progress (D8b round 2) — its ack publication reports
+    //            NOT_CONNECTED / is connected again / a held session's acks are
+    //            being claimed: the runtime's lease decides (reapExpired); the
+    //            sink never drops acks for them.
     // Written straight to ret_ only when nothing is queued ahead (never through
     // the FIFO: its static bound is unchanged); otherwise the fact stays
     // recorded in the sink's per-session state and is retried next pass
     // (counted: sessionSignalsDeferred_).  Never dropped, never a timer.
     // -----------------------------------------------------------------------
-    bool trySessionSignal_(int64_t sid, SessionSignalKind kind) {
+    bool trySessionSignal_(int64_t sid, SessionSignalKind kind, int64_t value = 0) {
         if (retFifo_.empty()) {
             WorkerReturn r;
             r.type       = WorkerReturn::Type::SessionSignal;
             r.sessionId  = sid;
             r.partition  = workerId_;
             r.lastOffset = static_cast<int64_t>(kind);
+            r.baseOffset = value;                 // D8c Credit: the count
             if (tryWriteReturn_(r)) return true;
         }
         ++sessionSignalsDeferred_;
@@ -1876,8 +1906,10 @@ private:
     }
     int reportSessionSignals_() {
         int n = ackSink_->reportFailures([this](int64_t sid) { return trySessionSignal_(sid, SessionSignalKind::Failed); });
-        n += ackSink_->reportHoldChanges([this](int64_t sid, bool held) {
-            return trySessionSignal_(sid, held ? SessionSignalKind::Held : SessionSignalKind::Released);
+        n += ackSink_->reportSessionEdges([this](int64_t sid, SessionSignalKind k) { return trySessionSignal_(sid, k); });
+        // D8c: claimed gateway-routed acks return their produce credits.
+        n += ackSink_->reportCredits([this](int64_t sid, uint32_t c) {
+            return trySessionSignal_(sid, SessionSignalKind::Credit, static_cast<int64_t>(c));
         });
         return n;
     }
@@ -3444,11 +3476,14 @@ private:
     // holds regardless; this is the FAIRNESS argument: a client whose acks are
     // held is paused on BOTH intake paths — its direct frames at the next frame
     // (controlled ABORT here), its gateway-routed frames once the runtime has
-    // the Held signal (fix round 2: controlled ABORT on its gateway image).  Its
-    // share is therefore what it sent before each pause took effect: one pass's
-    // direct frames, its owed acks, and the routed frames already in the op
-    // ring / in flight to the runtime when Held landed (one ret_ hop) — not the
-    // rest of the queue.  The room throttle (ackRoom_) only backs that up.
+    // the Held signal (fix round 2: controlled ABORT on its gateway image) or,
+    // D8c, once it has forwarded the session's produce credit budget of
+    // routed produces whose acks this worker has not CLAIMED (credits return
+    // via SessionSignal Credit from reportCredits).  Its share is therefore
+    // what it sent before each pause took effect: one pass's direct frames,
+    // its owed acks, and at most its credit budget of routed produces (op
+    // ring + owed + queued) — independent of burst size / MTU / socket
+    // buffers.  The room throttle (ackRoom_) only backs that up.
     static_assert(SessionAckSink::kAckCapacity >=
                       kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
                           static_cast<std::size_t>(kMaxFragmentLimit),
@@ -4194,13 +4229,8 @@ private:
         namespace pc = rune::protocol::client;
         switch (type) {
         case WorkerOp::Type::Produce: {
-            WorkerReturn ret;
-            ret.type          = WorkerReturn::Type::ProduceResult;
-            ret.sessionId     = op.sessionId();
-            ret.correlationId = op.correlationId();
-            ret.partition     = op.partition();
-            ret.topicId       = op.topicId();
-            ret.deferAck      = false;   // an answer, never facts-only (F15 S2 fix round 2, B1)
+            WorkerReturn ret = produceAnswer_(ProduceOrigin::GatewayOp, op.sessionId(), op.correlationId(),
+                                              op.topicId(), op.partition());
             ret.producerId    = op.producerId();
             ret.producerEpoch = op.producerEpoch();
             ret.baseSequence  = op.baseSequence();
@@ -5044,6 +5074,30 @@ private:
     // (validate → append → update in handleProduceBatch): the runtime no longer
     // consults its mirror for user partitions in shard mode.
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // D8c fix round 1 (MEDIUM-1): THE constructor of every produce ANSWER shell —
+    // the only place WorkerReturn::gatewayCredit is set.  Every answer of a
+    // produce (produceCore_'s shell, which every refusal / parked waiter / HW
+    // fire / timeout / §3.2 failure / fsync completion / purge copies, and
+    // refuseNotOwned_) starts here, and the origin has no default, so a new
+    // answer site cannot forget the runtime credit an op-ring produce holds
+    // (returned when the sink CLAIMS the ack).  Direct worker-ingress produces
+    // hold none.
+    // -----------------------------------------------------------------------
+    enum class ProduceOrigin : uint8_t { GatewayOp, WorkerIngress };
+    [[nodiscard]] static WorkerReturn produceAnswer_(ProduceOrigin origin, int64_t sessionId, int64_t correlationId,
+                                                     int32_t topicId, int32_t partition) noexcept {
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::ProduceResult;
+        ret.sessionId     = sessionId;
+        ret.correlationId = correlationId;
+        ret.topicId       = topicId;
+        ret.partition     = partition;
+        ret.deferAck      = false;   // an answer, never facts-only (F15 S2 fix round 2, B1)
+        ret.gatewayCredit = origin == ProduceOrigin::GatewayOp;
+        return ret;
+    }
+
     struct ProduceFields {
         int64_t sessionId     = 0;
         int64_t correlationId = 0;
@@ -5066,12 +5120,8 @@ private:
         namespace pc = rune::protocol::client;
 
         // Build a WorkerReturn shell for this ack.
-        WorkerReturn ret;
-        ret.type          = WorkerReturn::Type::ProduceResult;
-        ret.sessionId     = f.sessionId;
-        ret.correlationId = f.correlationId;
-        ret.partition     = f.partition;
-        ret.topicId       = f.topicId;
+        WorkerReturn ret = produceAnswer_(f.fromOp ? ProduceOrigin::GatewayOp : ProduceOrigin::WorkerIngress,
+                                          f.sessionId, f.correlationId, f.topicId, f.partition);
         ret.producerId    = f.producerId;
         ret.producerEpoch = f.producerEpoch;
         ret.baseSequence  = f.baseSequence;

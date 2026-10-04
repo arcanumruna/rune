@@ -260,6 +260,16 @@ struct NodeConfig {
     // is only the lost-push backstop + ISR keepalive.  Exposed so acks=all
     // round-trip cadence can be tuned/measured on shared hardware.
     int64_t fetchIntervalNs = 5'000'000LL;
+    // D8b: a back-pressure-paused (held) client session is reaped only after this long without activity
+    // or a worker Progress signal (RUNE_MAX_HELD_IDLE_MS, 1 ms .. 24 h; 0 = gateway default 10 min, Kafka
+    // connections.max.idle.ms).
+    int64_t maxHeldIdleMs = 0;
+    // D8c: shard-mode per-session produce credit budget of the gateway-routed path — the most forwarded
+    // produces of one session whose acks no worker has claimed yet (RUNE_GATEWAY_PRODUCE_CREDITS,
+    // 1 .. kMaxGatewayProduceCredits; 0 = gateway default 1024).  At the budget the gateway pauses that
+    // client (controlled ABORT) before any worker's ack queue can fill.
+    static constexpr uint32_t kMaxGatewayProduceCredits = 4096;   // == ClientGateway::kMaxSessionProduceCredits
+    uint32_t gatewayProduceCredits = 0;
 
     // Backoff idle max park (RUNE_IDLE_MAX_PARK_US, default 200µs) for the runtime
     // + worker AgentRunners.  The default Agrona 1ms max park adds up to ~1ms wake

@@ -1594,6 +1594,9 @@ void BrokerNode::buildGateway() {
             rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
             std::move(leaderViewFn)
         );
+        if (config_.maxHeldIdleMs > 0) gateway_->setMaxHeldIdleNs(config_.maxHeldIdleMs * 1'000'000LL);   // D8b
+        static_assert(NodeConfig::kMaxGatewayProduceCredits == rune::gateway::ClientGateway::kMaxSessionProduceCredits);
+        if (config_.gatewayProduceCredits > 0) gateway_->setSessionProduceCredits(config_.gatewayProduceCredits);   // D8c
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());
@@ -2719,6 +2722,7 @@ void BrokerNode::stop() {
     // P2: the control thread is joined — only now may the pool's control-thread
     // state (ring-ownership mode) change.
     if (workerPool_) workerPool_->disarmAfterControlJoined();
+    if (gateway_) gateway_->logProducePauseStats();   // D8c: control thread joined — single reader
     // F9a: the control thread is joined — skip any owner-thread test task still
     // queued for it (its test thread waits for a decision with no bound).
     if (runtimeAgent_) runtimeAgent_->skipQueuedOwnerThreadTestTasks();

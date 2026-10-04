@@ -812,3 +812,121 @@ TEST(ShardWorkerAckUnknownProducerIdRegression, ShardChainAnswersUnknownProducer
     EXPECT_EQ(f.acks[63].errorCode, 0);
     EXPECT_EQ(f.acks[63].baseOffset, leo);
 }
+
+// D8c: the worker returns one produce credit per CLAIMED ack of a gateway-routed (op-ring) produce — acks=0 and
+// acks=all alike — and none for its direct-ingress produces; a held (unclaimed) ack returns nothing until the client
+// reads it.  Credits + held routed acks == routed produces at every step (no credit leaked or invented).
+TEST(ShardWorkerAckRegression, RoutedProduceCreditsReturnOnClaimOnlyRegression) {
+    Fixture f({1}, 1);
+    f.runtimeDrainsReturns = true;
+    for (int i = 0; i < 4; ++i) f.step();
+    int64_t credits = 0;
+    f.onReturn = [&](const WorkerReturn& r) {
+        if (r.type == WorkerReturn::Type::SessionSignal && r.sessionId == 5 &&
+            r.lastOffset == static_cast<int64_t>(SessionSignalKind::Credit)) {
+            EXPECT_GT(r.baseOffset, 0) << "a Credit report carries a positive count";
+            credits += r.baseOffset;
+        }
+    };
+    ASSERT_TRUE(f.routedProduce(5, 10, /*acks=*/0));
+    ASSERT_TRUE(f.routedProduce(5, 11, /*acks=*/1));        // acks=all (op deferAck unset: answered at append)
+    f.produce(12, 0);                                       // direct ingress: no credit
+    f.produce(13, 1);
+    for (int64_t c : {10, 11, 12, 13}) ASSERT_TRUE(f.awaitAck(c)) << c;
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(credits, 2) << "one credit per claimed routed ack, none for direct ones";
+
+    f.egressLimit = 0;                                      // the client stops reading
+    credits = 0;
+    const int64_t c0 = 100;
+    int64_t sent = 0;
+    for (int i = 0; i < 400 && sent < 3'000; ++i) {
+        for (int k = 0; k < 16 && f.routedProduce(5, c0 + sent); ++k) ++sent;
+        f.step();
+    }
+    for (int i = 0; i < 64; ++i) f.step();
+    const auto held = static_cast<int64_t>(f.worker->sessionAcksPendingForTest());
+    ASSERT_GT(held, 0) << "precondition: the client's ack window filled";
+    EXPECT_EQ(credits + held, sent) << "credits returned for exactly the claimed routed acks";
+    f.egressLimit = 64;
+    for (int i = 0; i < 50'000 && !allAcked(f, c0, c0 + sent); ++i) f.step();
+    ASSERT_TRUE(allAcked(f, c0, c0 + sent));
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(credits, sent) << "every routed ack returned its credit once claimed";
+}
+
+// D8c fix round 1 (MEDIUM-1): every ANSWER of a gateway-routed produce returns its credit once claimed — the
+// leak paths: the ownership-guard refusal (refuseNotOwned_, a stale incarnation), the role-gate NotLeader, a parked
+// acks=all failed by demotion (the purge of its waiters) and a parked acks=all failed by the ack timeout.
+namespace {
+struct CreditCount {
+    int64_t n = 0;
+    void attach(Fixture& f) {
+        f.runtimeDrainsReturns = true;
+        f.onReturn = [this](const WorkerReturn& r) {
+            if (r.type == WorkerReturn::Type::SessionSignal && r.sessionId == 5 &&
+                r.lastOffset == static_cast<int64_t>(SessionSignalKind::Credit))
+                n += r.baseOffset;
+        };
+    }
+};
+bool routedOp(Fixture& f, int64_t corr, bool acksAll, uint32_t staleIncarnation = 0) {
+    rune::protocol::RecordBatchBuilder b(0, 1000); b.append("k", "v", 1000);
+    const auto batch = b.build();
+    WorkerOp op; op.type = WorkerOp::Type::Produce; op.topicId = 1; op.partition = 0;
+    op.replica = f.replica.get(); op.logPtr = f.log.get();
+    op.sessionId = 5; op.correlationId = corr; op.acks = acksAll ? 1 : 0; op.deferAck = acksAll;
+    op.producerId = -1; op.producerEpoch = 0; op.baseSequence = -1;
+    op.lastOffsetDelta = 0; op.recordCount = 1;
+    if (staleIncarnation != 0) { op.targetReplicaId = 1; op.incarnation = staleIncarnation; }
+    op.recordBatchView = std::span<const uint8_t>(batch);
+    return f.worker->tryEnqueueOp(std::move(op));
+}
+} // namespace
+
+TEST(ShardWorkerAckRegression, RefusedRoutedProduceReturnsItsCreditRegression) {
+    Fixture f({1}, 1);
+    CreditCount c; c.attach(f);
+    for (int i = 0; i < 4; ++i) f.step();
+    ASSERT_TRUE(routedOp(f, 31, false, /*staleIncarnation=*/99));      // ownership guard: refuseNotOwned_
+    ASSERT_TRUE(f.awaitAck(31));
+    EXPECT_EQ(f.acks[31].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(c.n, 1) << "the ownership-guard refusal returns the credit";
+    f.replica->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);         // role gate: produceCore_ NotLeader
+    ASSERT_TRUE(routedOp(f, 32, false));
+    ASSERT_TRUE(f.awaitAck(32));
+    EXPECT_EQ(f.acks[32].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(c.n, 2) << "the role-gate refusal returns the credit";
+}
+
+TEST(ShardWorkerAckRegression, ParkedRoutedAcksAllFailedByDemotionReturnsItsCreditRegression) {
+    Fixture f({1, 2}, /*minIsr=*/2);                                  // HW cannot advance without node 2
+    CreditCount c; c.attach(f);
+    for (int i = 0; i < 4; ++i) f.step();
+    ASSERT_TRUE(routedOp(f, 41, /*acksAll=*/true));
+    for (int i = 0; i < 200; ++i) f.step();
+    ASSERT_EQ(f.acks.count(41), 0u) << "parked on the HW";
+    EXPECT_EQ(c.n, 0) << "a parked produce holds its credit";
+    f.replica->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);         // its waiters are failed (purged)
+    ASSERT_TRUE(f.awaitAck(41));
+    EXPECT_EQ(f.acks[41].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(c.n, 1);
+}
+
+TEST(ShardWorkerAckRegression, ParkedRoutedAcksAllTimedOutReturnsItsCreditRegression) {
+    Fixture f({1, 2}, /*minIsr=*/2);
+    f.worker->setAckTimeoutNs(1'000'000);                              // 1 ms of worker clock (10 µs per step)
+    CreditCount c; c.attach(f);
+    for (int i = 0; i < 4; ++i) f.step();
+    ASSERT_TRUE(routedOp(f, 51, /*acksAll=*/true));
+    f.step();
+    ASSERT_EQ(f.acks.count(51), 0u);
+    EXPECT_EQ(c.n, 0);
+    ASSERT_TRUE(f.awaitAck(51));                                       // the ack timeout fires
+    EXPECT_NE(f.acks[51].errorCode, 0) << "answered with an error by the timeout";
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(c.n, 1) << "the timed-out answer returns the credit";
+}

@@ -39,6 +39,18 @@
 static_assert(rune::gateway::ClientGateway::kShardMaxSessions ==
                   rune::node::SessionAckSink::kMaxSessions - 1,
               "Task 13: the runtime's shard session cap is a worker ack table's capacity");
+static_assert(rune::gateway::ClientGateway::kWorkerRoutedCap == rune::node::Worker::kRoutedAckBudget,
+              "D8c fix round 1: the gateway's per-worker routed cap is the worker's routed ack share");
+static_assert(rune::gateway::ClientGateway::kMaxSessionProduceCredits * 4 <=
+                  rune::gateway::ClientGateway::kWorkerRoutedCap,
+              "D8c: one session's produce credit budget stays a small share of a worker's routed ack share");
+static_assert(rune::gateway::Session::kMaxWorkers == rune::gateway::ClientGateway::kMaxHeldMaskWorkers);
+static_assert(rune::gateway::ClientGateway::kLightSessionInFlight * 64 <=
+                  rune::gateway::ClientGateway::kWorkerRoutedCap / 4,
+              "D8c: the congested band admits >= 64 light sessions");
+static_assert(rune::gateway::ClientGateway::kDefaultSessionProduceCredits >= 1 &&
+                  rune::gateway::ClientGateway::kDefaultSessionProduceCredits <=
+                      rune::gateway::ClientGateway::kMaxSessionProduceCredits);
 
 #include <cstring>
 
@@ -454,6 +466,22 @@ int ClientGateway::doWork(int64_t nowNs) {
     int work = 0;
     if (workerPool_) work += pumpMarkerQueue_() + pumpSubOps_();
     if (shardMode_) {
+        // D8c: ... or a Produce frame of a session with no produce credit left
+        // (sessionProduceCredits_ forwarded, not yet claimed by a worker): the
+        // pause engages BEFORE a worker's ack queue can fill, independent of
+        // how many frames one poll / one datagram carries (admitClientFrame_).
+        // Fix round 1: and a produce whose owning worker's routed share is full
+        // (per-worker cap, handleProduce returns false) is ABORTed unconsumed.
+        // LOW-4 (by design, Kafka-like in-flight-per-connection): the budget is
+        // per SESSION, so one slow partition (e.g. acks=all parked through an
+        // ISR-shrink window, bounded by the ack timeout) can use up a session's
+        // credits — its aborted Produce then holds back that session's produces
+        // to healthy partitions, its Metadata and its Keepalives too, until
+        // those acks are answered and claimed.
+        // The same head-of-line holds for a frame deferred by a full worker's
+        // routed share (re-review LOW-R4): it holds back the session's frames
+        // to other workers too; each redelivery refreshes its lease (only a
+        // live sender's image redelivers).
         // Task 13 fix round 2 (finding 1, G-A6 on the gateway-routed path): a
         // Produce frame of a session some worker holds acks for is ABORTed — it
         // stays on ITS image (one client publication) and the poll moves on to
@@ -462,23 +490,29 @@ int ClientGateway::doWork(int64_t nowNs) {
         // ABORT stops the WHOLE image: every later frame of that client —
         // Keepalive, Metadata, Disconnect, … — waits behind the aborted Produce
         // until Released, a close (SessionFailed), or the lease reap.  No
-        // deadlock (releasing a held ack never needs a gateway frame); while
-        // paused, the client's lease is refreshed only by the post-ack
-        // notifications of the acks it does read, and a client that drops its
-        // egress before Disconnect leaves through the lease reap (fix round 3).
+        // deadlock (releasing a held ack never needs a gateway frame).  The
+        // stuck frame never drains its image, so the image is no liveness
+        // signal; the lease of a paused session comes from the workers' signals
+        // (reapExpired, D8b): a HELD session is reaped after maxHeldIdleNs_
+        // without a Progress signal (the worker claimed acks for it, i.e. the
+        // client reads); a session LOST on any worker (its ack publication
+        // NOT_CONNECTED — dead client, unreachable egress, or a client that
+        // stopped pumping its Aeron runtime) is reaped sessionTimeoutNs_ after
+        // the Lost edge unless a Found edge clears it first.
         work += sub_->controlledPoll(
             [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
                    aeron::Header& h) {
                 return controlledAssembler_.onFragment(
                     [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
                            aeron::util::index_t length, aeron::Header& header) {
-                        if (heldSessions_ != 0 &&
-                            produceFrameHeld_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                                              static_cast<std::size_t>(length))) [[unlikely]] {
-                            ++heldProduceAborts_;
+                        const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
+                        if (!admitClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
                             return aeron::ControlledPollAction::ABORT;
-                        }
-                        onFragment(buffer, offset, length, header);
+                        (void)header;
+                        // D8c fix round 1: a produce deferred by the per-worker cap is not
+                        // consumed — ABORT it (redelivered at the next poll).
+                        if (!onClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
+                            return aeron::ControlledPollAction::ABORT;
                         return aeron::ControlledPollAction::CONTINUE;
                     },
                     b, o, l, h);
@@ -753,9 +787,16 @@ void ClientGateway::reapExpired(int64_t nowNs) {
     reapScratch_.clear();
 
     sessions_.forEach([&](Session& s) {
-        if (nowNs - s.lastSeenNs > sessionTimeoutNs_) {
-            reapScratch_.push_back(s.sessionId);
-        }
+        // D8b: lost on any worker (ack publication NOT_CONNECTED) → the normal lease from the Lost edge (its
+        // owed acks are freed in ~sessionTimeout); else held (paused by back-pressure) → maxHeldIdleNs_ since the
+        // last activity / Progress signal; else the normal lease since the last activity.
+        // D8c: a session paused for want of produce credit is paused like a held one (its image waits at a
+        // Produce frame, Keepalives behind it, while its forwarded produces are answered / claimed).
+        const bool paused  = s.heldByWorkers != 0 || s.produceInFlight >= sessionProduceCredits_;
+        const bool expired = s.lostByWorkers != 0 ? nowNs - s.lostSinceNs > sessionTimeoutNs_
+                           : paused               ? nowNs - s.lastSeenNs > maxHeldIdleNs_
+                                                  : nowNs - s.lastSeenNs > sessionTimeoutNs_;
+        if (expired) reapScratch_.push_back(s.sessionId);
     });
 
     // Fix round 2 (finding 4): ONE close path (closeSession_) for reap,
@@ -773,14 +814,16 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
                                aeron::util::index_t             length,
                                aeron::Header&                   /*header*/)
 {
-    const auto* buf = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
-    const auto  len = static_cast<std::size_t>(length);
+    (void)onClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset), static_cast<std::size_t>(length));
+}
 
+bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
+{
     // Step 1: validate frame with checkFrame — reject anything non-conformant.
     const auto fc = pc::checkFrame(buf, len);
     if (fc.status != pc::FrameStatus::Ok) {
         // Drop silently — bad/unknown frame never crashes the gateway.
-        return;
+        return true;
     }
 
     // Step 2: dispatch on templateId.
@@ -834,8 +877,7 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
             handleMetadata(buf, len);
             break;
         case pc::TemplateId::Produce:
-            handleProduce(buf, len);
-            break;
+            return handleProduce(buf, len);
         case pc::TemplateId::Subscribe:
             handleSubscribe(buf, len);
             break;
@@ -874,6 +916,7 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
             // — server→client or other direction; drop.
             break;
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -950,6 +993,12 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // the rune client reconnects only on SessionExpired / UnknownSession.
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
     if (s->heldByWorkers != 0) --heldSessions_;
+    if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
+    for (int w = 0; w < Session::kMaxWorkers; ++w) {                               // ... and its share of each worker's cap
+        if (s->produceInFlightOn[static_cast<std::size_t>(w)] == 0) continue;
+        routedInFlight_[static_cast<std::size_t>(w)] -= s->produceInFlightOn[static_cast<std::size_t>(w)];
+        noteWorkerShareFreed_(w);
+    }
     sessions_.remove(sid);                    // releases its egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
@@ -976,15 +1025,142 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     return true;
 }
 
-bool ClientGateway::produceFrameHeld_(const uint8_t* buf, std::size_t len)
+ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf, std::size_t len)
 {
-    if (len < pc::MessageHeader::ENCODED_SIZE) return false;
+    if (len < pc::MessageHeader::ENCODED_SIZE) return ProducePause::None;
     const uint16_t templateId = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
-    if (templateId != pc::Produce::TEMPLATE_ID) return false;   // only produce intake is paused
+    if (templateId != pc::Produce::TEMPLATE_ID) return ProducePause::None;   // only produce intake is paused
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
     const Session* s = sessions_.find(static_cast<int64_t>(sid));
-    return s && s->heldByWorkers != 0;
+    if (!s) return ProducePause::None;
+    if (s->heldByWorkers != 0) return ProducePause::Held;
+    if (s->produceInFlight >= sessionProduceCredits_) return ProducePause::NoCredit;
+    return ProducePause::None;
+}
+
+void ClientGateway::logProducePauseStats() const
+{
+    if (heldProduceAborts_ == 0 && produceCreditUnderflows_ == 0) return;
+    spdlog::warn("ClientGateway: produce pauses — aborts={} (credit={} workerCap={}) creditUnderflows={}",
+                 heldProduceAborts_, creditProduceAborts_, workerCapProduceAborts_, produceCreditUnderflows_);
+}
+
+bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
+{
+    if ((heldSessions_ | creditBlockedSessions_) == 0) [[likely]] return true;
+    const ProducePause p = produceFramePause_(buf, len);
+    if (p == ProducePause::None) return true;
+    ++heldProduceAborts_;
+    if (p == ProducePause::NoCredit) ++creditProduceAborts_;
+    return false;
+}
+
+// D8c: credits are counted only in shard mode (worker-side acks — the only mode
+// whose workers return them); the forward site guards on shardMode_.
+void ClientGateway::takeProduceCredit_(Session& s, int32_t worker) noexcept
+{
+    const auto w = static_cast<std::size_t>(worker);
+    ++s.produceInFlightOn[w];
+    ++routedInFlight_[w];
+    if (++s.produceInFlight == sessionProduceCredits_) ++creditBlockedSessions_;
+}
+
+ClientGateway::WorkerAdmit ClientGateway::workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept
+{
+    const auto w = static_cast<std::size_t>(worker);
+    const uint32_t used = routedInFlight_[w];
+    if (used >= workerRoutedCap_) return WorkerAdmit::Full;          // hard: the worker's routed share is full
+    // Congested band (the cap's last quarter): only light sessions — a stalled
+    // session (at its whole budget) is the one that runs out first.
+    if (used < workerRoutedCap_ - workerRoutedCap_ / 4 || s.produceInFlightOn[w] < kLightSessionInFlight)
+        return WorkerAdmit::Admit;
+    return WorkerAdmit::Band;
+}
+
+// D8c fix round 2 (re-review MEDIUM-R1).  Stalled sessions can still fill one
+// worker's routed share (about 12 at the full budget + 64 "light" ones that
+// stall at 63): every gateway-routed produce to it would then wait for their
+// reap (maxHeldIdleNs_, 10 min).  So when the hard cap defers a frame, the
+// gateway EXPIRES the session that is HELD by that worker (its acks are queued
+// and its publication refuses them — it is not reading) with the largest
+// share on that worker: closeSession_ + SessionExpired (the client
+// reconnects; its unacked produces are resent — idempotent producers dedupe),
+// which frees that share at once.
+//   * Never a session that is not Held by that worker: a busy reader whose
+//     acks drain is never evicted.
+//   * Never a session that returned a Credit from that worker during this
+//     episode (it is reading, just slowly), and only after
+//     kCapEvictAfterDeferredPolls deferred polls in the episode, so such a
+//     reader has had its chance to show it.
+//   * No cascade / thrash: at most ONE expiry per episode.  An episode starts
+//     when the share is full and a frame is deferred; it ends with its expiry,
+//     or when the share drops below the congested band (noteWorkerShareFreed_
+//     — credits inside the band keep it, so reader marks made in it persist).
+//     So every further expiry needs the share refilled to the cap by new
+//     forwards and 64 more deferred polls of a NEW episode: expiries are paced
+//     by fresh demand, each frees a whole stalled share, and K stalled
+//     sessions need at most K.
+//   * Event-driven (deferred polls, credits, closes), no timer.
+// The scan over sessions is cold: at most once per kCapEvictAfterDeferredPolls
+// deferred polls of a full worker.
+void ClientGateway::onWorkerCapFull_(int32_t worker)
+{
+    CapEpisode& ep = capEpisode_[static_cast<std::size_t>(worker)];
+    if (ep.tag == 0) {                                            // a new episode
+        if (++capEpisodeTags_ == 0) ++capEpisodeTags_;            // tags are never 0
+        ep = CapEpisode{capEpisodeTags_, 0};
+    }
+    if (++ep.deferredPolls % kCapEvictAfterDeferredPolls != 0) return;
+    const auto w = static_cast<std::size_t>(worker);
+    const uint64_t bit = uint64_t{1} << worker;
+    int64_t victim = 0;
+    uint16_t share = 0;
+    sessions_.forEach([&](const Session& s) {
+        if ((s.heldByWorkers & bit) == 0) return;                 // not held by this worker: a reader
+        if (s.creditTagOn[w] == ep.tag) return;                   // credited in this episode: a (slow) reader
+        if (s.produceInFlightOn[w] > share) { share = s.produceInFlightOn[w]; victim = s.sessionId; }
+    });
+    if (victim == 0) return;                                      // no held session to blame: keep deferring
+    ep = CapEpisode{};                                            // the episode ends with its one expiry
+    ++workerCapEvictions_;
+    lastCapEvictedSid_ = victim;
+    spdlog::warn("ClientGateway: worker {}'s gateway-routed share is full ({}); expiring held session {} "
+                 "(largest share, {} unclaimed acks) — the client reconnects (evictions={})",
+                 worker, routedInFlight_[w], victim, share, workerCapEvictions_);
+    (void)closeSession_(victim, /*notifyExpired=*/true);         // frees its share (noteWorkerShareFreed_)
+}
+
+void ClientGateway::returnProduceCredits_(Session& s, int32_t worker, int64_t n) noexcept
+{
+    if (n <= 0) [[unlikely]] return;
+    const auto w = static_cast<std::size_t>(worker);
+    const bool wasBlocked = s.produceInFlight >= sessionProduceCredits_;
+    uint32_t take = s.produceInFlightOn[w];
+    if (static_cast<uint64_t>(n) > take) [[unlikely]] {
+        // Unreachable: every Credit is a claimed ack of a produce this gateway
+        // forwarded for this session to this worker (one credit taken per
+        // forward).  Clamp — never a negative budget — and count it, loudly.
+        ++produceCreditUnderflows_;
+        if (produceCreditUnderflows_ == 1 || (produceCreditUnderflows_ & 1023u) == 0)
+            spdlog::error("ClientGateway: session {} returned {} produce credits on worker {} with {} in flight "
+                          "(total={})", s.sessionId, n, worker, take, produceCreditUnderflows_);
+    } else {
+        take = static_cast<uint32_t>(n);
+    }
+    s.produceInFlightOn[w] = static_cast<uint16_t>(s.produceInFlightOn[w] - take);
+    routedInFlight_[w]     -= take;
+    s.produceInFlight      -= take;
+    if (const uint16_t tag = capEpisode_[w].tag; tag != 0) s.creditTagOn[w] = tag;   // a reader in this episode
+    noteWorkerShareFreed_(worker);
+    if (wasBlocked && s.produceInFlight < sessionProduceCredits_) {
+        --creditBlockedSessions_;
+        // The session's image was stalled at a Produce frame while it had no
+        // credit (its Keepalives queued behind it): LEAVING that pause is client
+        // progress — refresh the lease, as a Released edge does (D8b re-review
+        // MEDIUM-1).  Other claims are not client liveness (fix round 1, LOW-1).
+        s.lastSeenNs = nowNs_;
+    }
 }
 
 void ClientGateway::sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid)
@@ -1002,18 +1178,36 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
 {
     using K = rune::node::SessionSignalKind;
     const auto kind = static_cast<K>(ret.lastOffset);
-    if (kind == K::Held || kind == K::Released) {
+    if (kind != K::Failed) {
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
+        if (kind == K::Progress) { s->lastSeenNs = nowNs_; return; }  // D8b: the held client reads its acks
         // Unreachable: NodeConfig refuses > kMaxHeldMaskWorkers shard workers.
         assert(ret.partition >= 0 && ret.partition < kMaxHeldMaskWorkers);
         if (ret.partition < 0 || ret.partition >= kMaxHeldMaskWorkers) [[unlikely]] return;
+        if (kind == K::Credit) { returnProduceCredits_(*s, ret.partition, ret.baseOffset); return; }   // D8c: acks claimed
         const uint64_t bit = uint64_t{1} << ret.partition;
+        if (kind == K::Lost || kind == K::Found) {                    // D8b round 2
+            if (kind == K::Lost) {
+                if (s->lostByWorkers == 0) s->lostSinceNs = nowNs_;
+                s->lostByWorkers |= bit;
+            } else {
+                s->lostByWorkers &= ~bit;
+            }
+            return;
+        }
+        if (kind != K::Held && kind != K::Released) [[unlikely]] return;   // unknown kind: never a release
         const bool was = s->heldByWorkers != 0;
         if (kind == K::Held) s->heldByWorkers |= bit; else s->heldByWorkers &= ~bit;
         const bool now = s->heldByWorkers != 0;
         if (now && !was) ++heldSessions_;
-        if (was && !now) --heldSessions_;
+        if (was && !now) {
+            --heldSessions_;
+            // D8b re-review MEDIUM-1: the hold ends only when the queue emptied through successful claims (or a
+            // close/fail, which removes the session anyway) — that is progress; a backlog drained in one pass
+            // supersedes its Progress signal, so refresh the lease here or the session is reaped as it recovers.
+            s->lastSeenNs = nowNs_;
+        }
         return;
     }
     // Failed (C2): close the session everywhere and tell the client, so it
@@ -1593,13 +1787,13 @@ void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int6
     }
 }
 
-void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
+bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
     auto msgOpt = pc::Produce::decode(buf, len);
     if (!msgOpt) {
         spdlog::debug("ClientGateway: Produce decode failed (truncated?) — dropped");
-        return;
+        return true;
     }
     const pc::Produce& msg = *msgOpt;
     RUNE_FR_SPAN_PRODUCE(rune_fr::Site::GatewayHandle,
@@ -1609,7 +1803,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     Session* session = sessions_.find(msg.sessionId);
     if (!session) {
         spdlog::debug("ClientGateway: Produce for unknown sessionId={} — dropped", msg.sessionId);
-        return;
+        return true;
     }
     // F23: any request is liveness (Kafka: idle == no requests).  Reuses the
     // lookup above — no extra cost on the produce hot path.
@@ -1662,7 +1856,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         const LeaderView lv = leaderView_();
         if (!lv.isLeader) {
             sendRedirect(lv.leaderClientEndpoint, msg.correlationId);
-            return;  // engine untouched
+            return true;  // engine untouched
         }
     }
 
@@ -1681,13 +1875,13 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (!topicRegistry_) {
             spdlog::warn("ClientGateway: Produce key-partition but no TopicRegistry — UnknownTopic");
             sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
-            return;
+            return true;
         }
         partition = topicRegistry_->partitionForKey(msg.topicId, msg.key);
         if (partition < 0) {
             spdlog::debug("ClientGateway: Produce partitionForKey → unknown topicId={}", msg.topicId);
             sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
-            return;
+            return true;
         }
     }
 
@@ -1736,7 +1930,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                 const LeaderView lv = leaderView_();
                 if (!lv.isLeader) {
                     sendRedirect(lv.leaderClientEndpoint, msg.correlationId);
-                    return;  // engine untouched
+                    return true;  // engine untouched
                 }
             }
             // leaderView_ says we ARE the leader (or is null) — serve locally (fall through).
@@ -1753,7 +1947,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                           msg.topicId, partition, entry.leaderNodeId, entry.leaderEpoch,
                           msg.sessionId, redirectEndpoint);
             sendRedirect(redirectEndpoint, msg.correlationId);
-            return;  // engine untouched
+            return true;  // engine untouched
         }
         // entry.leaderNodeId == thisNodeId_ → serve locally (fall through).
     }
@@ -1762,7 +1956,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (!topicRegistry_) {
         spdlog::warn("ClientGateway: Produce but no TopicRegistry — UnknownTopic");
         sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
-        return;
+        return true;
     }
 
     // topic() returns nullptr for unknown topicId.
@@ -1770,14 +1964,14 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (!spec) {
         spdlog::debug("ClientGateway: Produce unknown topicId={}", msg.topicId);
         sendResp(pc::ErrorCode::UnknownTopic, partition, 0);
-        return;
+        return true;
     }
 
     rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
     if (!log) {
         spdlog::debug("ClientGateway: Produce bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
-        return;
+        return true;
     }
 
     // GR-4 / F15 §3.1 (I1): per-partition NotLeader.
@@ -1806,7 +2000,24 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                           "(topicId={} partition={}) sessionId={}",
                           msg.topicId, partition, msg.sessionId);
             sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
-            return;  // engine untouched — no append, nothing routed
+            return true;  // engine untouched — no append, nothing routed
+        }
+    }
+
+    // D8c fix round 1 (MAJOR-1): the owning worker's routed share.  Checked
+    // BEFORE any validation work or answer (nothing done yet but liveness), so a
+    // deferred frame is simply not consumed: the controlled poll ABORTs it and
+    // redelivers it next poll.  Shard mode only (worker-side acks return credits).
+    int32_t routedWorker = -1;
+    if (shardMode_ && workerPool_ && routesToWorker_(msg.topicId)) {
+        routedWorker = workerPool_->ownerWorkerId(msg.topicId, partition);   // router arithmetic
+        assert(routedWorker >= 0 && routedWorker < kMaxHeldMaskWorkers);
+        if (const WorkerAdmit a = workerAdmitsProduce_(routedWorker, *session); a != WorkerAdmit::Admit) [[unlikely]] {
+            ++heldProduceAborts_;
+            ++workerCapProduceAborts_;
+            // May expire a held session — possibly this one: `session` is not used after this.
+            if (a == WorkerAdmit::Full) onWorkerCapFull_(routedWorker);
+            return false;
         }
     }
 
@@ -1819,7 +2030,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // Reply InvalidBatch (no valid errorCode for InvalidBatch in client::ErrorCode;
         // use Internal as the closest sentinel for a malformed produce).
         sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
+        return true;
     }
 
     // Guard: reject an oversized batch LOUDLY (explicit MessageTooLarge), never
@@ -1841,7 +2052,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                          batchLen, maxProduceBatchBytes_, oversizeProduceRejects_);
         }
         sendResp(pc::ErrorCode::MessageTooLarge, partition, 0);
-        return;
+        return true;
     }
 
     // Guard: batch must be at least large enough to hold the fixed header fields
@@ -1853,7 +2064,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         spdlog::debug("ClientGateway: Produce batch too short ({} < {}); dropped",
                       batchLen, kMinBatchSize);
         sendResp(pc::ErrorCode::Internal, partition, 0);
-        return;
+        return true;
     }
 
     // Zero-copy: the recordBatch is validated + appended directly from the
@@ -1910,7 +2121,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             // G0.1: reliable delivery (retry on back-pressure).
             enqueueOrBestEffort_(*session, scratch_.data(), encoded);
         }
-        return;  // log untouched — no append, no LEO advance
+        return true;  // log untouched — no append, no LEO advance
     }
 
     // E2 inc2a: When a WorkerPool is wired, route the append to the owning worker
@@ -1982,7 +2193,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             spdlog::debug("ClientGateway: Produce lastOffsetDelta={} < 0; rejected (Internal)",
                           lastOffsetDelta);
             sendResp(pc::ErrorCode::Internal, partition, 0);
-            return;
+            return true;
         }
 
         // recordCount must equal lastOffsetDelta + 1.
@@ -1991,7 +2202,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                          "batch internally inconsistent → rejected (Internal)",
                          recordCount, lastOffsetDelta + 1);
             sendResp(pc::ErrorCode::Internal, partition, 0);
-            return;
+            return true;
         }
 
         // CRC validation: reject corrupt batches before they touch the log.
@@ -2000,7 +2211,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             if (!reader.ensureValid()) {
                 spdlog::warn("ClientGateway: Produce CRC mismatch (corrupt batch) → rejected (Internal)");
                 sendResp(pc::ErrorCode::Internal, partition, 0);
-                return;
+                return true;
             }
         }
 
@@ -2021,7 +2232,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         // waiting for worker-ring space — no later batch may overtake it.
         if (!markerSendQueue_.empty() && markerQueuedFor_(msg.topicId, partition)) [[unlikely]] {
             sendResp(pc::ErrorCode::NotLeader, partition, 0);
-            return;
+            return true;
         }
 
         // Build the op envelope.
@@ -2092,9 +2303,17 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                              "ProduceResponse NotLeader (retriable; total={})",
                              msg.topicId, partition, produceBackPressured_);
             sendResp(pc::ErrorCode::NotLeader, partition, 0);
+        } else if (routedWorker >= 0) {   // shard mode (set above)
+            // D8c: forwarded — one produce credit is held until the owning
+            // worker CLAIMS its answer on the session's ack publication
+            // (SessionSignal Credit).  Every forwarded produce is answered
+            // exactly once through the worker's SessionAckSink (append, refusal,
+            // HW fire / timeout, fsync, purge — acks=0 included); a dropped
+            // answer means the session was closed, which drops the budget too.
+            takeProduceCredit_(*session, routedWorker);
         }
         // Response (or pending-ack) will be processed in drainWorkerReturns_().
-        return;
+        return true;
     }
 
     // ---------------------------------------------------------------------------
@@ -2127,7 +2346,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                       "(topicId={} partition={}) sessionId={}",
                       msg.topicId, partition, msg.sessionId);
         sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
-        return;  // engine untouched — no append
+        return true;  // engine untouched — no append
     }
     const uint8_t effectiveTier = replica.durabilityTier();
     // ISR size for min-ISR gate: only applies in steady state (committedMetadataReady_
@@ -2149,7 +2368,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (gate != InlinePsmGate::Proven) [[unlikely]] {
             sendResp(gate == InlinePsmGate::NotLeader ? pc::ErrorCode::NotLeader : pc::ErrorCode::Internal,
                      partition, 0);
-            return;   // log untouched
+            return true;   // log untouched
         }
     }
 
@@ -2174,7 +2393,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                              msg.topicId, partition, identityMismatchRejects_);
         }
         sendResp(outcome.error, partition, 0, outcome.logStartOffset);   // D6: log start with 28
-        return;
+        return true;
     }
     // Dedup path (log untouched).  F15 S5 parity on the inline path (Kafka
     // DelayedProduce): a duplicate is answered only under its original's ack
@@ -2187,7 +2406,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // condition (acks=all parks on outcome.lastOffset below).
     if (outcome.isDuplicate && !(acksAll && ownedReplica && committedMetadataReady_)) {
         sendResp(pc::ErrorCode::OK, partition, outcome.baseOffset);
-        return;
+        return true;
     }
 
     if (!outcome.isDuplicate) {
@@ -2256,7 +2475,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                          "with MinIsrViolation sessionId={} topicId={} partition={}",
                          kMaxPendingAcks, msg.sessionId, msg.topicId, partition);
             sendResp(pc::ErrorCode::MinIsrViolation, partition, 0);
-            return;
+            return true;
         }
 
         PendingAck entry;
@@ -2276,6 +2495,7 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                       "sessionId={} partition={} baseOffset={} lastOffset={}",
                       msg.sessionId, partition, outcome.baseOffset, outcome.lastOffset);
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

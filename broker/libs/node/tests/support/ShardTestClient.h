@@ -82,12 +82,18 @@ public:
     /// publications (a Produce frame must fit term / 8).
     /// `legacyTransport`: the pre-2026-10-02 client transport (1408 MTU, 2 MiB
     /// socket buffers, sparse terms) instead of the host-derived one.
+    /// `mode`: Invoker = the rune-client-cpp RunnerMode::Invoker shape — the
+    /// client's driver AND conductor run only inside this client's calls (every
+    /// wait pumps them); a test that stops calling the client stops its driver
+    /// (no status messages to the broker).  Construct, use and destroy it on ONE
+    /// thread (the driver's pump owner).
     explicit ShardTestClient(const std::filesystem::path& aeronDir, int32_t termBufferBytes = 1 << 20,
-                             bool legacyTransport = false)
-        : driver_(cfgFor(aeronDir, termBufferBytes, legacyTransport), DriverMode::Threaded)
+                             bool legacyTransport = false, DriverMode mode = DriverMode::Threaded)
+        : driver_(cfgFor(aeronDir, termBufferBytes, legacyTransport), mode), invoker_(mode == DriverMode::Invoker)
     {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
+        ctx.useConductorAgentInvoker(invoker_);
         aeron_ = aeron::Aeron::connect(ctx);
         egressChannel_ = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
         const int64_t reg = aeron_->addSubscription(egressChannel_, kEgressStream);
@@ -287,11 +293,20 @@ public:
         }
         std::vector<uint8_t> f;
         int64_t accepted = 0;
+        // Hard cap: refused for this long without paused() → stall; returns maxFrames (the caller's "never
+        // paused" assertion fails) instead of hanging the test.
+        const auto stallBudget = std::chrono::seconds{30};
+        auto refusedSince = std::chrono::steady_clock::time_point{};
         while (accepted < maxFrames) {
             make(accepted, f);
             aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
-            if (pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0) { ++accepted; continue; }
+            const int64_t r = pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size()));
+            if (r > 0) { ++accepted; refusedSince = {}; continue; }
             if (paused()) break;
+            const auto now = std::chrono::steady_clock::now();
+            if (refusedSince == std::chrono::steady_clock::time_point{}) refusedSince = now;
+            else if (now - refusedSince > stallBudget) { lastStallOffer_ = r; lastStallAccepted_ = accepted; return maxFrames; }
+            pump_();
         }
         return accepted;
     }
@@ -327,7 +342,16 @@ private:
         c.rcvWindowBytes = 128 * 1024;
         return c;
     }
-    static void pause_() { std::this_thread::sleep_for(std::chrono::microseconds{100}); }
+    /// Invoker mode: run the client's driver + conductor duty cycle (no-op when threaded).
+    void pump_() {
+        if (!invoker_) return;
+        driver_.doWork();
+        if (aeron_) aeron_->conductorAgentInvoker().invoke();
+    }
+    void pause_() {
+        pump_();
+        std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
 
     void poll_() {
         if (!egress_) return;
@@ -371,7 +395,11 @@ private:
         }
     }
 
+public:
+    int64_t lastStallOffer_ = 0, lastStallAccepted_ = 0;   ///< offerUntilPaused stall diagnostics
+private:
     EmbeddedDriver                                   driver_;
+    bool                                             invoker_ = false;
     std::shared_ptr<aeron::Aeron>                    aeron_;
     std::string                                      egressChannel_;
     std::shared_ptr<aeron::Subscription>             egress_;
