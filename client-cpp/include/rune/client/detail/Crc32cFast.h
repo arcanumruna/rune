@@ -68,9 +68,17 @@ inline uint64_t load64(const uint8_t* p) noexcept {
 }
 
 #if defined(__aarch64__)
-inline uint32_t step64(uint32_t c, uint64_t v) noexcept { return __crc32cd(c, v); }
-inline uint32_t step8(uint32_t c, uint8_t v) noexcept { return __crc32cb(c, v); }
-#  define RUNE_CRC_TARGET
+// Linux arm64 (GCC/clang without -march=...+crc): enable the CRC extension per function — the ACLE
+// intrinsics are always_inline and refuse to inline into a function compiled without it.
+#  if defined(__ARM_FEATURE_CRC32)
+#    define RUNE_CRC_TARGET
+#  elif defined(__clang__)
+#    define RUNE_CRC_TARGET __attribute__((target("crc")))
+#  else
+#    define RUNE_CRC_TARGET __attribute__((target("+crc")))
+#  endif
+RUNE_CRC_TARGET inline uint32_t step64(uint32_t c, uint64_t v) noexcept { return __crc32cd(c, v); }
+RUNE_CRC_TARGET inline uint32_t step8(uint32_t c, uint8_t v) noexcept { return __crc32cb(c, v); }
 #elif defined(__x86_64__) || defined(_M_X64)
 #  define RUNE_CRC_TARGET __attribute__((target("sse4.2")))
 RUNE_CRC_TARGET inline uint32_t step64(uint32_t c, uint64_t v) noexcept {
