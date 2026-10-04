@@ -632,6 +632,12 @@ int64_t Log::recover() {
         rpSeq_ = rf.seq;
         rpActiveSlot_ = rf.slot;
     }
+    // MEDIUM-2: the directory fd, opened ONCE (recovery's directory fsync and
+    // the io backend's batched ones use it).
+    if (dirFd_ < 0) {
+        dirFd_ = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dirFd_ < 0 && storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
+    }
     validateFromRecoveryPoint_(corrupt ? INT64_MAX : rp, /*deleteOnGap=*/!corrupt);
     const int64_t next = activeSegment().nextOffset();
     logEndOffset_ = next;
@@ -649,10 +655,6 @@ int64_t Log::recover() {
     // files of earlier incarnations) becomes durable before R = LEO trusts it:
     // the directory fd is opened ONCE (kept for the io backend's batched
     // directory fsyncs) and fsynced here, cold.
-    if (dirFd_ < 0) {
-        dirFd_ = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
-        if (dirFd_ < 0 && storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
-    }
     if (!corrupt && storage_.failedErrno == 0) (void)syncDirectoryInline_();
     dirSyncedGen_ = storage_.failedErrno == 0 ? dirMutGen_ : dirSyncedGen_;
     rpDirBlocked_ = false;
@@ -771,14 +773,9 @@ void Log::validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap) {
             if (from->second->fullyDurable() && std::next(from) != segments_.end()) continue;
             (void)from->second->syncForRecovery();   // error: fail-stop (sticky)
         }
-        if (deleted) {   // the deletions themselves: a FULL directory fsync (cold)
-            const int dfd = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
-            ++storage_.roleChangeSyncs;
-            if (dfd < 0 || ::fsync(dfd) != 0) {
-                if (storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
-            }
-            if (dfd >= 0) ::close(dfd);
-        }
+        // The deletions themselves: made durable by recover()'s ONE directory
+        // fsync, which follows before R is persisted (LOW-C: never twice).
+        (void)deleted;
     }
     // The (possibly new) active segment: preallocate as the ctor did.
     activeSegment().preallocate(rollBytes_);
@@ -1111,8 +1108,7 @@ void Log::resetDirectorySyncForNewOwner() noexcept { dirSyncInFlight_ = false; }
 
 int Log::syncDirectoryInline_() noexcept {
     if (dirFd_ < 0) return 0;
-    const uint64_t gen = dirMutGen_;
-    ++storage_.roleChangeSyncs;
+    const uint64_t gen = dirMutGen_;   // counted in dirSyncsDone_ only (LOW-C: not a role-change sync)
     int err = storage_.faultForTest;
     if (err == 0 && ::fsync(dirFd_) != 0) err = errno != 0 ? errno : EIO;
     if (err != 0) {

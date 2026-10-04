@@ -381,6 +381,9 @@ CompletionToken UringFlushBackend::submitWriteSync(int fd, const uint8_t* data, 
     // token is handed out and completes with an ERROR (fail-stop), never OK
     // and never silently forgotten.
     inFlight_ += 1;
+    // LOW-A (fix round 3): no fsync CQE will ever consume a write failure for
+    // this token — never record one (it would leak a reserved entry).
+    wb.token = kNoToken;
     if (syntheticFailures_.size() < syntheticFailures_.capacity()) syntheticFailures_.push_back({tok, EIO});
     return tok;
 }

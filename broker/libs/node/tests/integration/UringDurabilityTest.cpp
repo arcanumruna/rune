@@ -484,4 +484,27 @@ TEST(UringDurabilityTest, MissingOpWriteFallsBackToPortableRegression) {
     std::filesystem::remove(path);
 }
 
+// E1d fix round 3, LOW-A: a partial enter whose WRITE itself fails (read-only
+// fd) must not leave a write-failure entry behind: no fsync CQE will ever
+// consume it.  Repeated, the reserved entries would run out.
+TEST(UringDurabilityTest, PartialEnterFailedWriteLeaksNoWriteFailureRegression) {
+    UringFlushBackend be(8, 8);
+    const std::string path = tmpFile("uring_ws_partial_ro_");
+    { std::ofstream f(path); f << std::string(8192, '\0'); }
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    uint8_t blk[32] = {5};
+    for (int i = 0; i < 3; ++i) {
+        be.forcePartialSubmitForTest(true);
+        const auto t = be.submitWriteSync(fd, blk, sizeof blk, 0);
+        ASSERT_NE(t, kNoToken);
+        const auto c = reapAll(be, 1);
+        ASSERT_EQ(c.size(), 1u);
+        EXPECT_NE(c[0].errorCode, 0);
+        EXPECT_EQ(be.pendingWriteFailuresForTest(), 0u) << "a write-failure entry leaked (round " << i << ")";
+    }
+    ::close(fd);
+    std::filesystem::remove(path);
+}
+
 #endif // defined(__linux__)

@@ -135,6 +135,8 @@ public:
     /// Test seam (LOW-4b): the next submitWriteSync's io_uring_enter submits
     /// only its FIRST SQE — a real partial enter that breaks the link.
     void forcePartialSubmitForTest(bool on) noexcept { partialSubmitForTest_ = on; }
+    /// Write failures recorded and still waiting for their fsync CQE (LOW-A: 0 at rest).
+    [[nodiscard]] std::size_t pendingWriteFailuresForTest() const noexcept { return writeFailures_.size(); }
 
     // reap — worker side (non-blocking).
     //

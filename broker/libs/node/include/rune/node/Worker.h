@@ -1078,6 +1078,9 @@ public:
     /// E1d: recovery-point checkpoint fdatasyncs (tmp file + directory) submitted to the io backend.
     [[nodiscard]] uint64_t    recoveryPointSubmitsForTest() const noexcept { return rpSubmits_; }
     [[nodiscard]] uint64_t    dirSyncSubmitsForTest() const noexcept { return dirSyncSubmits_; }
+    /// The Strict-ack seal gate for `log` (true = an older seal is still in
+    /// flight or pending: no Strict ack may fire).  Test-only.
+    [[nodiscard]] bool sealsOutstandingForTest(rune::storage::Log* log) noexcept { return sealsOutstanding_(log); }
     [[nodiscard]] uint64_t    storageFailureSignalsForTest() const noexcept { return storageFailureSignals_; }
     [[nodiscard]] std::size_t flushSlotCountForTest() const noexcept { return slots_.size(); }
     /// Completions drained from io_ by reapDurableCompletions_ (any token).
@@ -1694,7 +1697,11 @@ private:
             gate->bgToken = kNoToken;
             if (bgInFlight_) --bgInFlight_;
         }
-        if (routed && r.kind == RouteKind::Seal && slot && slot->sealsInFlight > 0) --slot->sealsInFlight;
+        // LOW-B (fix round 3): through the log's CURRENT slot whatever its
+        // epoch — a log dropped and re-owned on this worker seeded its fresh
+        // slot's count from the routed seals (rebuildFlushSlots_), so the
+        // Strict-ack seal gate stays closed until each of them completed.
+        if (routed && r.kind == RouteKind::Seal && gate && gate->sealsInFlight > 0) --gate->sealsInFlight;
         // M-6: the log's one durable fsync is no longer in flight.  A success
         // syncs everything below its LEO (it also serves a background request
         // deferred behind it); data appended since is re-requested.
@@ -4227,6 +4234,8 @@ private:
                 // MEDIUM-1: ALWAYS replay — skip only the segments whose seal is
                 // routed here (their completion still arrives on this worker).
                 (void)log->requeueUndurableSeals(sealsRouted.data(), sealsRouted.size());
+                // LOW-B: the routed seals still gate Strict acks on this log.
+                fresh.sealsInFlight = static_cast<uint32_t>(sealsRouted.size());
                 next.push_back(fresh);
             }
         }

@@ -793,3 +793,20 @@ TEST(RecoveryPointRegression, LegacyRollFsyncsDirectoryInline) {
     EXPECT_EQ(log->persistedRecoveryPoint(), log->segmentBaseOffsets().back());
     fs::remove_all(dir);
 }
+
+// E1d fix round 3, LOW-C: a recovery that deletes segments at a chain gap
+// fsyncs the directory exactly ONCE (the deletions and every entry present
+// are covered by the same fsync), and directory fsyncs are not counted as
+// role-change syncs.
+TEST(RecoveryPointRegression, RecoveryWithGapDeletion_FsyncsDirectoryOnce) {
+    const auto dir = freshDir("rp_dir_once");
+    auto log = openRecovered(dir, kRoll, true);
+    while (log->segmentBaseOffsets().size() < 4) appendOne(*log);
+    flushActive(*log);
+    crashWithPowerLoss(log);                              // seals never completed: a gap above R
+    auto rec = std::make_unique<Log>(dir.string(), kRoll);
+    rec->recover();
+    ASSERT_LT(rec->segmentBaseOffsets().size(), 4u) << "precondition: recovery deleted segments";
+    EXPECT_EQ(rec->directorySyncsCompletedForTest(), 1u) << "recovery fsynced the directory more than once";
+    fs::remove_all(dir);
+}

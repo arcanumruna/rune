@@ -3323,3 +3323,35 @@ TEST(ShardNonBlockingRegression, SealLostToPreviousOwnerReplayedWhileAnotherSeal
     EXPECT_GE(s.log->persistedRecoveryPoint(), cBase);
     EXPECT_EQ(s.w.sealSubmitsForTest(), 2u) << "seal A re-queued exactly once; B not duplicated";
 }
+
+// E1d fix round 3, LOW-B (ruled must-fix): a log dropped and re-owned on the
+// SAME worker while its seal B is still routed keeps the Strict-ack seal gate
+// CLOSED until B's completion — a fresh slot is seeded from the routed seals
+// and B's completion decrements through the CURRENT slot.  Before the fix the
+// gate read "no seals outstanding" (an X in the next segment could be acked
+// before B was durable; a power loss then cuts the chain at B and recovery
+// deletes the acked X).  Afterwards the count drains to 0 (no leak) and the
+// Strict ack still fires.
+TEST(ShardNonBlockingRegression, ReownedLogKeepsStrictSealGateUntilRoutedSealCompletes) {
+    StrictShard s(/*rollBytes=*/512, {1}, /*shard=*/true);
+    Acks a;
+    s.w.setReapPausedForTest(true);
+    ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
+    ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: seal B pending
+    s.w.doWork(3);
+    ASSERT_EQ(s.w.sealSubmitsForTest(), 1u);                // seal B in flight
+    ASSERT_EQ(s.log->pendingSealCount(), 0u);
+    ASSERT_TRUE(s.w.sealsOutstandingForTest(s.log.get()));
+    s.w.setOwnedDirect(Worker::OwnedSet{});                 // dropped ...
+    s.w.setOwnedDirect(Worker::OwnedSet{s.leader.get()});   // ... re-owned, B still routed
+    EXPECT_TRUE(s.w.sealsOutstandingForTest(s.log.get()))
+        << "the Strict-ack seal gate opened while seal B was still in flight";
+    // A Strict produce into the active segment, then let everything complete.
+    ASSERT_EQ(s.produce(3, batchAt(0, 1, 16), 0, 4), 1);
+    s.w.setReapPausedForTest(false);
+    for (int i = 0; i < kCap && a.n < 3; ++i) { s.w.doWork(10 + i); a.drain(s.w); std::this_thread::yield(); }
+    EXPECT_FALSE(s.w.sealsOutstandingForTest(s.log.get())) << "the seeded seal count leaked";
+    bool acked3 = false;
+    for (const auto& r : a.rets) acked3 = acked3 || r.correlationId == 3;
+    EXPECT_TRUE(acked3) << "the Strict ack after the re-own never fired";
+}
