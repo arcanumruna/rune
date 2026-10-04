@@ -3195,6 +3195,29 @@ private:
         // batch itself is the durable form (the PSM rebuild applies it).
         rune::transaction::ControlMarkerPayload mp;
         const bool mpOk = rune::transaction::ControlMarker::extract(tail, 0, mp, tailLen);
+        static_assert(rune::transaction::kMarkerCoordinatorFencedError ==
+                      static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+        // D9 review MAJOR-2 (Kafka TRANSACTION_COORDINATOR_FENCED): a marker from
+        // a deposed coordinator — lower coordinatorEpoch than the last marker
+        // applied for this producer here — would close the producer's NEXT
+        // transaction.  Refused, nothing appended, no state touched.
+        if (mpOk && psm_.markerCoordinatorFenced(topicId, mp.producerId, partition, mp.coordinatorEpoch)) {
+            spdlog::warn("Worker {}: control marker topicId={} partition={} producerId={} from coordinator epoch {} "
+                         "FENCED (a newer coordinator's marker was applied) — refused", workerId_, topicId,
+                         partition, mp.producerId, mp.coordinatorEpoch);
+            ret.errorCode = rune::transaction::kMarkerCoordinatorFencedError;
+            enqueueReturn_(ret);
+            return;
+        }
+        // D9 review MAJOR-3: the answer parks on the HW (below) — reserve its
+        // owed return slot BEFORE the append (G-A6, as a parked produce); no slot
+        // → retriable NotLeader, log untouched.
+        if (!ackReservationAvailable_()) [[unlikely]] {
+            if (!owedCapAllows_()) noteOwedCapThrottle_("control marker");
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return;
+        }
         if (mpOk) psm_.fenceEpoch(topicId, mp.producerId, partition,
                                   rune::protocol::RecordBatchReader(tail, tailLen).producerEpoch());
         try {
@@ -3203,6 +3226,9 @@ private:
             const rune::replication::Offset base = replica->appendControlBatch(markerSpan, /*acksAll=*/true);
             if (base >= 0) {
                 ret.baseOffset = base;
+                if (mpOk) psm_.fenceEpoch(topicId, mp.producerId, partition,   // D9 MAJOR-2: the fence (raise-only)
+                                          rune::protocol::RecordBatchReader(tail, tailLen).producerEpoch(),
+                                          mp.coordinatorEpoch);
                 // F15 §2.1 step 2: the RC update in the same invocation as the
                 // marker append (Ready: applied; Scanning: tail list).
                 if (RcState* rc = rcOf_(replica)) {
@@ -3238,6 +3264,25 @@ private:
         } catch (...) {
             spdlog::warn("Worker {}: executeAppendControlRecordWire_ threw unknown", workerId_);
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+        }
+        if (ret.errorCode == 0 && ret.baseOffset >= 0 &&
+            !(replica->highWatermark() > ret.baseOffset &&
+              static_cast<int>(replica->isr().size()) >= replica->minIsr())) {   // not committed yet: park
+            // D9 review MAJOR-3 (Kafka WriteTxnMarkers, acks=-1): the marker
+            // counts as landed only once the partition HW passes it with the
+            // ISR >= minIsr — the acks=all waiter (re-validated every pass:
+            // ownership, role, log generation → NotLeader, retried by the
+            // coordinator).  No deadline: completion is decided by the HW or by
+            // a role change, never by a timer.
+            PendingAcksAll pending;
+            pending.replica    = replica;
+            pending.lastOffset = ret.baseOffset;
+            pending.deadlineNs = std::numeric_limits<int64_t>::max();
+            pending.logGen     = replica->logGeneration();
+            pending.minIsr     = replica->minIsr();
+            pending.ret        = std::move(ret);
+            pendingAcksAll_.push_back(std::move(pending));
+            return;
         }
         enqueueReturn_(ret);   // same FIFO as ProduceResults, never dropped
     }

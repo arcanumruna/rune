@@ -2044,6 +2044,8 @@ void BrokerNode::buildGateway() {
                 replTransport_->setTxnMarkerHandlers(
                     &rune::gateway::ClientGateway::onWriteTxnMarkerThunk,
                     &rune::gateway::ClientGateway::onWriteTxnMarkerResponseThunk, gateway_.get());
+                replTransport_->setPlaneReconnectHandler(&rune::gateway::ClientGateway::onPlaneReconnectThunk,
+                                                         gateway_.get());
                 gateway_->setTxnMarkerChannel(rune::gateway::ClientGateway::TxnMarkerChannel{
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerThunk,
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerResponseThunk,
@@ -2899,7 +2901,10 @@ void BrokerNode::stop() {
     // CG-6: destroy group coordination service before gateway (it holds a gateway* ref).
     groupCoordService_.reset(); // GroupCoordinationService (no Aeron resources, holds gateway* + offsets*)
     // D9: the transport outlives the gateway — drop its marker handlers (ctx = gateway).
-    if (replTransport_) replTransport_->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
+    if (replTransport_) {
+        replTransport_->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
+        replTransport_->setPlaneReconnectHandler(nullptr, nullptr);
+    }
     gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
     // MD1 Task 4: destroy metadata service before replicaRegistry_.
     metadataService_.reset(); // MetadataService (holds raw ptr to metadata replica in registry)

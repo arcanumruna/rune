@@ -2204,7 +2204,7 @@ TEST(ReplicaLifetimeRegression, MarkerRefusedWhileRegisteredIsReRoutedAndLandsOn
     const auto marker = txnBatch(11);
     ASSERT_EQ(m.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 11, true, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
-    // Drop the worker's copy and simulate the guard refusing it (token = 1).
+    // Drop the worker's copy and simulate the guard refusing it.
     m.pool.worker(0).doWork(1);
     std::vector<WorkerReturn> rets;
     m.pool.worker(0).drainReturn([&](WorkerReturn r) { rets.push_back(r); });
@@ -2216,7 +2216,7 @@ TEST(ReplicaLifetimeRegression, MarkerRefusedWhileRegisteredIsReRoutedAndLandsOn
               rune::gateway::ClientGateway::kControlRecordAsync);
     WorkerReturn refused;
     refused.type = WorkerReturn::Type::ControlRecordRefused;
-    refused.topicId = 0; refused.partition = 0; refused.correlationId = 2;
+    refused.topicId = 0; refused.partition = 0; refused.correlationId = m.gw.lastMarkerTokenForTest();   // #2
     refused.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
     std::string what;
     m.gw.setInvariantViolationHandler([&](const std::string& w) { what = w; });

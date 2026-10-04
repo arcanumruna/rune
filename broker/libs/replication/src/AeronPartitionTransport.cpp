@@ -92,6 +92,7 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
     // R3: an empty FIFO must hold any ring frame (capacity >= maxMsgLength).
     assert(outboundRing_.capacity() >= outboundRing_.maxMsgLength() + 8);
     holdRouter_.addPeer(peerId, outboundRing_.capacity());
+    notifiedGen_.emplace_back(peerId, holdRouter_.connGen(peerId));   // D9: reconnect-edge baseline
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +377,10 @@ bool AeronPartitionTransport::sendWriteTxnMarker(NodeId to, const WriteTxnMarker
     uint8_t wire[WriteTxnMarkerMsg::kMaxSize];
     const std::size_t len = msg.encode(wire, sizeof wire);
     if (len == 0) return false;
-    if (to == static_cast<NodeId>(selfId_)) { (void)handleFrame_(wire, len); return true; }
+    if (to == static_cast<NodeId>(selfId_)) [[unlikely]] {   // review LOW-5: never re-entrant
+        spdlog::error("AeronPartitionTransport: WriteTxnMarker addressed to this node — refused (bug)");
+        return false;
+    }
     return enqueueOutbound(static_cast<int32_t>(to), wire, len);
 }
 
@@ -385,8 +389,44 @@ bool AeronPartitionTransport::sendWriteTxnMarkerResponse(NodeId to, const WriteT
     uint8_t wire[WriteTxnMarkerResponseMsg::TOTAL_SIZE];
     const std::size_t len = msg.encode(wire, sizeof wire);
     if (len == 0) return false;
-    if (to == static_cast<NodeId>(selfId_)) { (void)handleFrame_(wire, len); return true; }
+    if (to == static_cast<NodeId>(selfId_)) [[unlikely]] {   // review LOW-5: never re-entrant
+        spdlog::error("AeronPartitionTransport: WriteTxnMarkerResponse addressed to this node — refused (bug)");
+        return false;
+    }
     return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
+int AeronPartitionTransport::notePlaneReconnects_()
+{
+    const auto& st = holdRouter_.stats();
+    // A peer the router marked down is only re-observed on the next offer to it;
+    // probe its publication so the up edge does not wait for unrelated traffic.
+    if (st.downEdges > st.upEdges) [[unlikely]] {
+        for (auto& [id, p] : peers_)
+            if (holdRouter_.isDown(id)) holdRouter_.noteLink(id, p.registered && p.pub && p.pub->isConnected());
+    }
+    int events = 0;
+    if (st.upEdges != lastUpEdges_) [[unlikely]] {
+        lastUpEdges_ = st.upEdges;
+        for (auto& [id, p] : peers_) {
+            const uint32_t gen = holdRouter_.connGen(id);
+            auto it = std::find_if(notifiedGen_.begin(), notifiedGen_.end(),
+                                   [id = id](const auto& e) { return e.first == id; });
+            if (it == notifiedGen_.end()) continue;   // registered in addPeer
+            if (it->second != gen) {
+                it->second = gen;
+                if (reconnectHandler_ != nullptr) reconnectHandler_(reconnectCtx_, static_cast<int32_t>(id));
+                ++events;
+            }
+        }
+    }
+    const int images = sub_ ? sub_->imageCount() : 0;
+    if (images > lastImageCount_) [[unlikely]] {
+        if (reconnectHandler_ != nullptr) reconnectHandler_(reconnectCtx_, -1);
+        ++events;
+    }
+    lastImageCount_ = images;
+    return events;
 }
 
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
@@ -511,6 +551,7 @@ int AeronPartitionTransport::poll(int64_t nowNs)
     // peers_/pubs). ([[rune-shared-nothing-law]]) Count folds into work so the
     // AgentRunner's IdleStrategy sees outbound activity as work (no idle).
     int work = drainOutbound();
+    work += notePlaneReconnects_();   // D9 MAJOR-1: link edges → marker re-send (cheap compares)
 
     // Drain ingress subscription with a CONTROLLED poll so onFragment can apply
     // back-pressure: a fragment whose target worker ring is full returns ABORT and

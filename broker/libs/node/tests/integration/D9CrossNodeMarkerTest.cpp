@@ -32,6 +32,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/ProducerStateManager.h>
 #include <rune/transaction/ControlMarker.h>
 #include <rune/aeronutil/testing/FreePort.h>
 #include <gtest/gtest.h>
@@ -169,9 +170,14 @@ struct GwRig {
     PartitionReplica* r = nullptr;
     FakeChannel ch;
     FakeTcs tcs;
-    explicit GwRig(int32_t selfId) {
-        auto rep = std::make_unique<PartitionReplica>(cfg(selfId, 0, 0), Role::Leader, 1, std::vector<NodeId>{selfId},
-                                                      std::vector<NodeId>{selfId}, topics.log(0, 0), &t);
+    explicit GwRig(int32_t selfId, std::vector<NodeId> isr = {}, const std::vector<uint8_t>* seedMarker = nullptr) {
+        if (isr.empty()) isr = {selfId};
+        if (seedMarker != nullptr) {   // a marker already in the log (a restarted leader)
+            int64_t base = -1;
+            topics.log(0, 0)->appendNoSyncRestamp(seedMarker->data(), seedMarker->size(), 0, base);
+        }
+        auto rep = std::make_unique<PartitionReplica>(cfg(selfId, 0, 0), Role::Leader, 1, isr, isr,
+                                                      topics.log(0, 0), &t);
         r = rep.get();
         reg.add(0, 0, std::move(rep));
         pool.assignFromRegistry(reg);
@@ -189,6 +195,30 @@ struct GwRig {
     void runWorker(int64_t now) {
         w().doWork(now);
         w().drainReturn([&](WorkerReturn ret) { gw.handleWorkerReturnForTest(ret); });
+    }
+    // A follower's fetch at `offset` (its LEO) reaching the leader's worker —
+    // the only way the HW of a multi-replica ISR moves.
+    void followerFetched(NodeId follower, int64_t offset, int64_t now) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::FetchRequest; op.topicId = 0; op.partition = 0; op.replica = r;
+        op.fetchRequestPayload.leaderEpoch = 1; op.fetchRequestPayload.partition = 0;
+        op.fetchRequestPayload.followerId = follower; op.fetchRequestPayload.fetchOffset = offset;
+        op.fetchRequestPayload.maxBytes = 1 << 16; op.fetchRequestPayload.topicId = 0;
+        op.fetchRequestPayload.lastFetchedEpoch = offset > 0 ? 1 : -1; op.fetchRequestPayload.nowNs = now;
+        ASSERT_TRUE(pool.tryEnqueueOp(0, 0, std::move(op)));
+        runWorker(now);
+    }
+    WriteTxnMarkerMsg remote(int32_t origin, int64_t token, int64_t pid, bool commit, int32_t epoch,
+                             std::vector<uint8_t>& keep) {
+        keep = tx::ControlMarker::build(pid, 0, commit ? tx::ControlType::Commit : tx::ControlType::Abort, epoch);
+        WriteTxnMarkerMsg m{};
+        m.coordinatorNodeId = origin; m.coordinatorEpoch = epoch; m.token = token; m.topicId = 0; m.partition = 0;
+        m.producerId = pid; m.commit = commit ? 1 : 0; m.marker = std::span<const uint8_t>(keep);
+        return m;
+    }
+    void image(int32_t leader, int32_t epoch) {
+        gw.setRoutingImageSnapshot(imageWith(leader, epoch));
+        (void)gw.pumpTxnMarkersForTest(1);   // the leader-change step runs in the marker pump
     }
     int64_t marker(int64_t pid, bool commit, int32_t epoch = 3) {
         const auto m = tx::ControlMarker::build(pid, 0, commit ? tx::ControlType::Commit : tx::ControlType::Abort, epoch);
@@ -252,9 +282,9 @@ TEST(D9RemoteMarkerRegression, LeaderChangeCompletesInFlightRemoteMarkersNotLead
     GwRig R(1);
     R.gw.setRoutingImageSnapshot(imageWith(2, 5));
     ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
-    R.gw.setRoutingImageSnapshot(imageWith(2, 5));   // republished, unchanged
+    R.image(2, 5);   // republished, unchanged
     EXPECT_TRUE(R.tcs.done.empty()) << "an unchanged leader must not fail the marker";
-    R.gw.setRoutingImageSnapshot(imageWith(3, 6));   // leadership moved to node 3
+    R.image(3, 6);   // leadership moved to node 3
     ASSERT_EQ(R.tcs.done.size(), 1u) << "the in-flight remote marker completes on the leader change";
     EXPECT_FALSE(R.tcs.done[0].landed);
     EXPECT_EQ(R.tcs.done[0].err, kNotLeader);
@@ -272,7 +302,7 @@ TEST(D9RemoteMarkerRegression, LeaderEpochBumpCompletesInFlightRemoteMarkersNotL
     GwRig R(1);
     R.gw.setRoutingImageSnapshot(imageWith(2, 5));
     ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
-    R.gw.setRoutingImageSnapshot(imageWith(2, 6));
+    R.image(2, 6);
     ASSERT_EQ(R.tcs.done.size(), 1u);
     EXPECT_EQ(R.tcs.done[0].err, kNotLeader);
 }
@@ -283,7 +313,7 @@ TEST(D9RemoteMarkerRegression, LeaderMovingToTheCoordinatorReroutesLocally) {
     GwRig R(1);
     R.gw.setRoutingImageSnapshot(imageWith(2, 5));
     ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
-    R.gw.setRoutingImageSnapshot(imageWith(1, 6));
+    R.image(1, 6);
     ASSERT_EQ(R.tcs.done.size(), 1u);
     EXPECT_EQ(R.tcs.done[0].err, kNotLeader);
     ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
@@ -332,19 +362,30 @@ TEST(D9RemoteMarkerRegression, RemoteOriginMarkerIsAppendedAndAnsweredToTheOrigi
 
 // Leader side, stale routing at the coordinator: this node does not lead the
 // partition → NotLeader at once, nothing appended.
-TEST(D9RemoteMarkerRegression, RemoteMarkerOnANonLeaderIsAnsweredNotLeaderAtOnce) {
+// Review MEDIUM-5: the leader's own routing image may lag its replica role
+// (the coordinator saw the election first).  The worker's role gate is the
+// authority — a Leader replica takes the marker whatever the local image says.
+TEST(D9RemoteMarkerRegression, RemoteMarkerOnALeaderWithAStaleRoutingImageIsAppended) {
     GwRig R(/*self=*/2);
-    R.gw.setRoutingImageSnapshot(imageWith(/*leader=*/3, 6));
-    const auto bytes = tx::ControlMarker::build(77, 0, tx::ControlType::Commit, 3);
-    WriteTxnMarkerMsg m{};
-    m.coordinatorNodeId = 1; m.coordinatorEpoch = 3; m.token = 902; m.topicId = 0; m.partition = 0;
-    m.producerId = 77; m.commit = 1; m.marker = std::span<const uint8_t>(bytes);
-    R.gw.appendRemoteControlRecord(m);
-    for (int i = 0; i < 8; ++i) R.runWorker(10 + i);
-    EXPECT_EQ(R.r->log()->logEndOffset(), 0);
+    R.image(/*leader=*/3, 6);                                // stale here: the replica IS Leader
+    std::vector<uint8_t> keep;
+    R.gw.appendRemoteControlRecord(R.remote(1, 902, 77, true, 3, keep));
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    EXPECT_EQ(controlBatchOffset(*R.r->log()), 0) << "the Leader replica took the marker";
     ASSERT_EQ(R.ch.responses.size(), 1u);
-    EXPECT_EQ(R.ch.responses[0].first, 1);
     EXPECT_EQ(R.ch.responses[0].second.token, 902);
+    EXPECT_EQ(R.ch.responses[0].second.errorCode, 0);
+}
+
+// A node without the partition at all (no log) answers NotLeader at once.
+TEST(D9RemoteMarkerRegression, RemoteMarkerForAnUnknownPartitionIsAnsweredNotLeaderAtOnce) {
+    GwRig R(/*self=*/2);
+    std::vector<uint8_t> keep;
+    auto m = R.remote(1, 907, 77, true, 3, keep);
+    m.partition = 5;                                         // topic 0 has one partition here
+    R.gw.appendRemoteControlRecord(m);
+    ASSERT_EQ(R.ch.responses.size(), 1u);
+    EXPECT_EQ(R.ch.responses[0].second.token, 907);
     EXPECT_EQ(R.ch.responses[0].second.errorCode, kNotLeader);
     EXPECT_EQ(R.gw.markersInFlightForTest(), 0u);
 }
@@ -418,22 +459,254 @@ TEST(D9RemoteMarkerRegression, CoordinatorPurgeKeepsRemoteOriginMarkers) {
     EXPECT_EQ(R.gw.markersQueuedForTest(), 1u);
 }
 
-// Liveness safety net: a request (or its answer) lost with NO leadership change
-// (e.g. a frame dropped for a peer the plane saw down) completes as a retriable
-// refusal after the coordinator's max retry backoff, so the TCS re-sends it
-// (idempotent).  Correctness never depends on it (§3 idempotence).
-TEST(D9RemoteMarkerRegression, UnansweredRemoteMarkerIsRetriedAfterTheMaxBackoff) {
+// Review MAJOR-1: no timer ever completes a remote marker — an unanswered one
+// keeps its token for as long as it takes, and a late answer completes it.
+TEST(D9RemoteMarkerRegression, UnansweredRemoteMarkerIsNeverCompletedByTimeAndALateAnswerLands) {
     GwRig R(1);
-    R.gw.setRoutingImageSnapshot(imageWith(2, 5));
-    (void)R.gw.pumpTxnMarkersForTest(1'000);
+    R.image(2, 5);
     ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
-    (void)R.gw.pumpTxnMarkersForTest(500'000'000);
-    EXPECT_TRUE(R.tcs.done.empty()) << "not before the max backoff";
-    (void)R.gw.pumpTxnMarkersForTest(2'500'000'000);
+    for (int64_t now = 1'000'000'000; now <= 600'000'000'000; now += 1'000'000'000) (void)R.gw.pumpTxnMarkersForTest(now);
+    EXPECT_TRUE(R.tcs.done.empty()) << "a remote marker was completed by a timer";
+    ASSERT_EQ(R.gw.remoteMarkersInFlightForTest(), 1u);
+    ASSERT_EQ(R.ch.markers.size(), 1u) << "no timer re-send either";
+    WriteTxnMarkerResponseMsg ok{};
+    ok.token = R.ch.markers[0].m.token; ok.topicId = 0; ok.partition = 0; ok.producerId = 77;
+    ok.coordinatorEpoch = 3; ok.errorCode = 0; ok.offset = 9;
+    R.gw.onRemoteControlRecordResponse(ok);
     ASSERT_EQ(R.tcs.done.size(), 1u);
-    EXPECT_FALSE(R.tcs.done[0].landed);
-    EXPECT_EQ(R.tcs.done[0].err, kNotLeader);
-    EXPECT_EQ(R.gw.markersInFlightForTest(), 0u);
+    EXPECT_TRUE(R.tcs.done[0].landed) << "the late answer completes the marker";
+}
+
+// Review MAJOR-1: the cluster plane's link to a peer comes back (down→up edge)
+// → every remote marker in flight to it is re-sent with the SAME token; an
+// answer to either copy completes it once.  Markers to other peers are not.
+TEST(D9RemoteMarkerRegression, PlaneReconnectResendsInFlightRemoteMarkersWithTheSameToken) {
+    GwRig R(1);
+    std::vector<rune::metadata::RoutingImage::BuildEntry> e{{rune::metadata::gpidOf(0, 0), 2, 5}};
+    R.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(e));
+    ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
+    ASSERT_EQ(R.ch.markers.size(), 1u);
+    R.gw.onPlaneReconnect(/*peer=*/3);                       // another peer: nothing to re-send
+    (void)R.gw.pumpTxnMarkersForTest(10);
+    EXPECT_EQ(R.ch.markers.size(), 1u);
+    R.gw.onPlaneReconnect(/*peer=*/2);
+    (void)R.gw.pumpTxnMarkersForTest(20);
+    ASSERT_EQ(R.ch.markers.size(), 2u) << "the in-flight marker was re-sent on the up edge";
+    EXPECT_EQ(R.ch.markers[1].to, 2);
+    EXPECT_EQ(R.ch.markers[1].m.token, R.ch.markers[0].m.token) << "same token";
+    EXPECT_EQ(R.ch.markers[1].marker, R.ch.markers[0].marker);
+    R.gw.onPlaneReconnect(/*peer=*/-1);                      // a new inbound image (peer unknown): re-send all
+    (void)R.gw.pumpTxnMarkersForTest(30);
+    EXPECT_EQ(R.ch.markers.size(), 3u);
+    WriteTxnMarkerResponseMsg ok{};
+    ok.token = R.ch.markers[0].m.token; ok.topicId = 0; ok.partition = 0; ok.producerId = 77;
+    ok.coordinatorEpoch = 3; ok.errorCode = 0; ok.offset = 0;
+    R.gw.onRemoteControlRecordResponse(ok);
+    R.gw.onRemoteControlRecordResponse(ok);                  // the copy's answer
+    ASSERT_EQ(R.tcs.done.size(), 1u) << "completed exactly once";
+    EXPECT_TRUE(R.tcs.done[0].landed);
+    R.gw.onPlaneReconnect(2);
+    (void)R.gw.pumpTxnMarkersForTest(40);
+    EXPECT_EQ(R.ch.markers.size(), 3u) << "a completed marker is never re-sent";
+}
+
+// A re-send whose outbound ring is full waits in the FIFO queue (never lost).
+TEST(D9RemoteMarkerRegression, BackPressuredResendIsQueuedAndSentLater) {
+    GwRig R(1);
+    R.image(2, 5);
+    ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
+    R.ch.acceptMarkers = false;
+    R.gw.onPlaneReconnect(2);
+    (void)R.gw.pumpTxnMarkersForTest(10);
+    EXPECT_EQ(R.gw.markersQueuedForTest(), 1u);
+    R.ch.acceptMarkers = true;
+    (void)R.gw.pumpTxnMarkersForTest(20);
+    EXPECT_EQ(R.gw.markersQueuedForTest(), 0u);
+    ASSERT_EQ(R.ch.markers.size(), 2u);
+    EXPECT_EQ(R.ch.markers[1].m.token, R.ch.markers[0].m.token);
+}
+
+// Leader side, MAJOR-1: a re-sent copy of a marker still in flight here (same
+// origin, token, epoch) is not appended twice — its answer is still owed.
+TEST(D9RemoteMarkerRegression, DuplicateRemoteMarkerWhileInFlightIsAppendedOnce) {
+    GwRig R(/*self=*/2, /*isr=*/{2, 9});                     // the HW waits for follower 9
+    R.image(2, 5);
+    std::vector<uint8_t> keep;
+    const auto m = R.remote(1, 908, 77, true, 3, keep);
+    R.gw.appendRemoteControlRecord(m);
+    for (int i = 0; i < 8; ++i) R.runWorker(10 + i);
+    R.gw.appendRemoteControlRecord(m);                       // the re-sent copy
+    for (int i = 0; i < 8; ++i) R.runWorker(20 + i);
+    EXPECT_EQ(controlBatchCount(*R.r->log()), 1) << "the in-flight duplicate was appended again";
+    R.followerFetched(9, R.r->log()->logEndOffset(), 30);
+    for (int i = 0; i < 8; ++i) R.runWorker(40 + i);
+    ASSERT_EQ(R.ch.responses.size(), 1u) << "one answer for the marker";
+    EXPECT_EQ(R.ch.responses[0].second.token, 908);
+    EXPECT_EQ(R.ch.responses[0].second.errorCode, 0);
+}
+
+// Review MEDIUM-1: an answer carrying the right token but another coordinator
+// epoch (a previous coordinator load / incarnation) never completes the marker.
+TEST(D9RemoteMarkerRegression, AnswerWithAnotherCoordinatorEpochIsIgnored) {
+    GwRig R(1);
+    R.image(2, 5);
+    ASSERT_EQ(R.marker(77, true, /*epoch=*/3), rune::gateway::ClientGateway::kControlRecordAsync);
+    WriteTxnMarkerResponseMsg stale{};
+    stale.token = R.ch.markers[0].m.token; stale.topicId = 0; stale.partition = 0; stale.producerId = 77;
+    stale.coordinatorEpoch = 2; stale.errorCode = 0; stale.offset = 0;
+    R.gw.onRemoteControlRecordResponse(stale);
+    EXPECT_TRUE(R.tcs.done.empty()) << "a stale-epoch answer completed the current marker";
+    EXPECT_EQ(R.gw.remoteMarkersInFlightForTest(), 1u);
+}
+
+// Review MEDIUM-1: tokens carry a per-boot incarnation in the high bits, so a
+// pre-restart answer can never match a post-restart marker.
+TEST(D9RemoteMarkerRegression, MarkerTokensCarryABootIncarnation) {
+    GwRig A(1);
+    GwRig B(1);
+    A.image(2, 5);
+    B.image(2, 5);
+    ASSERT_EQ(A.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
+    ASSERT_EQ(B.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
+    const int64_t ta = A.ch.markers[0].m.token;
+    const int64_t tb = B.ch.markers[0].m.token;
+    EXPECT_GT(ta, 0); EXPECT_GT(tb, 0);
+    EXPECT_NE(ta >> 32, 0) << "no incarnation in the high bits";
+    EXPECT_NE(ta, tb) << "two gateway incarnations issued the same first token";
+}
+
+// Review MAJOR-3: a remote marker is answered only once the partition HW passes
+// it (Kafka: WriteTxnMarkers with acks=-1), never at the leader append.
+TEST(D9RemoteMarkerRegression, RemoteMarkerIsAnsweredOnlyAfterTheHwPassesIt) {
+    GwRig R(/*self=*/2, /*isr=*/{2, 9});
+    R.image(2, 5);
+    std::vector<uint8_t> keep;
+    R.gw.appendRemoteControlRecord(R.remote(1, 909, 77, true, 3, keep));
+    for (int i = 0; i < 16; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(controlBatchOffset(*R.r->log()), 0) << "precondition: appended";
+    EXPECT_TRUE(R.ch.responses.empty()) << "answered before the ISR has the marker";
+    R.followerFetched(9, 1, 30);
+    for (int i = 0; i < 8 && R.ch.responses.empty(); ++i) R.runWorker(40 + i);
+    ASSERT_EQ(R.ch.responses.size(), 1u);
+    EXPECT_EQ(R.ch.responses[0].second.errorCode, 0);
+    EXPECT_EQ(R.ch.responses[0].second.offset, 0);
+}
+
+// Review MAJOR-3, local path: the coordinator counts the marker as landed only
+// once the HW passes it.
+TEST(D9RemoteMarkerRegression, LocalMarkerLandsOnlyAfterTheHwPassesIt) {
+    GwRig R(/*self=*/1, /*isr=*/{1, 9});
+    ASSERT_EQ(R.marker(77, true), rune::gateway::ClientGateway::kControlRecordAsync);
+    for (int i = 0; i < 16; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(controlBatchOffset(*R.r->log()), 0);
+    EXPECT_TRUE(R.tcs.done.empty()) << "landed before the ISR has the marker";
+    R.followerFetched(9, 1, 30);
+    for (int i = 0; i < 8 && R.tcs.done.empty(); ++i) R.runWorker(40 + i);
+    ASSERT_EQ(R.tcs.done.size(), 1u);
+    EXPECT_TRUE(R.tcs.done[0].landed);
+}
+
+// Review MAJOR-3: the leader is demoted while the marker waits for the HW
+// (it may be truncated) → NotLeader to the origin, the coordinator re-drives it.
+TEST(D9RemoteMarkerRegression, DemotionWhileTheMarkerWaitsForTheHwAnswersNotLeader) {
+    GwRig R(/*self=*/2, /*isr=*/{2, 9});
+    R.image(2, 5);
+    std::vector<uint8_t> keep;
+    R.gw.appendRemoteControlRecord(R.remote(1, 910, 77, true, 3, keep));
+    for (int i = 0; i < 8; ++i) R.runWorker(10 + i);
+    ASSERT_TRUE(R.ch.responses.empty());
+    WorkerOp op;
+    op.type = WorkerOp::Type::BecomeFollower; op.topicId = 0; op.partition = 0; op.replica = R.r;
+    op.logPtr = R.r->log(); op.roleEpoch = 6; op.roleLeaderId = 9;
+    op.targetReplicaId = R.r->registryId(); op.incarnation = R.r->incarnation();
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(op)));
+    for (int i = 0; i < 8 && R.ch.responses.empty(); ++i) R.runWorker(20 + i);
+    ASSERT_EQ(R.ch.responses.size(), 1u);
+    EXPECT_EQ(R.ch.responses[0].second.token, 910);
+    EXPECT_EQ(R.ch.responses[0].second.errorCode, kNotLeader);
+}
+
+// Review MAJOR-2 (Kafka TRANSACTION_COORDINATOR_FENCED): a marker from a deposed
+// coordinator (lower coordinator epoch than the last marker applied for that
+// producer here) is refused, NOT appended — it would otherwise close the
+// producer's NEXT transaction.  Two coordinator nodes (1 = new, 3 = deposed).
+TEST(D9RemoteMarkerRegression, StaleCoordinatorEpochMarkerAfterTheNextTxnDataIsFenced) {
+    GwRig R(/*self=*/2);
+    R.image(2, 5);
+    std::vector<uint8_t> k1, k2;
+    R.gw.appendRemoteControlRecord(R.remote(/*origin=*/1, 911, 77, true, /*epoch=*/5, k1));   // T1 COMMIT, new coordinator
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.ch.responses.size(), 1u);
+    ASSERT_EQ(R.ch.responses[0].second.errorCode, 0);
+    // T2's data (same producer) lands on the partition.
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.setTransactional(true); b.setProducerId(77); b.setProducerEpoch(0); b.setBaseSequence(0);
+    b.append("k", "t2", 1000);
+    WorkerOp op;
+    op.type = WorkerOp::Type::Produce; op.topicId = 0; op.partition = 0; op.replica = R.r; op.logPtr = R.r->log();
+    op.sessionId = 1; op.correlationId = 50; op.recordCount = 1; op.durabilityTier = 1; op.recordBatchBytes = b.build();
+    op.producerId = 77; op.producerEpoch = 0; op.baseSequence = 0;
+    op.targetReplicaId = R.r->registryId(); op.incarnation = R.r->incarnation();
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(op)));
+    R.runWorker(20);
+    const int64_t leo = R.r->log()->logEndOffset();
+    ASSERT_EQ(leo, 2) << "precondition: T2's batch appended after T1's marker";
+    ASSERT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "precondition: T2 is open";
+    // The deposed coordinator's stale COMMIT(T1) arrives late.
+    R.gw.appendRemoteControlRecord(R.remote(/*origin=*/3, 912, 77, true, /*epoch=*/4, k2));
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(30 + i);
+    EXPECT_EQ(R.r->log()->logEndOffset(), leo) << "the stale marker was appended";
+    EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "the stale marker closed T2";
+    ASSERT_EQ(R.ch.responses.size(), 2u);
+    EXPECT_EQ(R.ch.responses[1].first, 3);
+    EXPECT_EQ(R.ch.responses[1].second.errorCode, tx::kMarkerCoordinatorFencedError);
+}
+
+// MAJOR-2: the fence is durable — rebuilt from the log's marker batches.
+// (a) ProducerStateManager::rebuildFromLog (gateway / inline rebuild).
+TEST(D9RemoteMarkerRegression, CoordinatorFenceIsRebuiltFromTheLogByThePsmRebuild) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024);
+    log.recover();
+    const auto m = tx::ControlMarker::build(77, 0, tx::ControlType::Commit, /*coordinatorEpoch=*/5);
+    int64_t base = -1;
+    log.appendNoSyncRestamp(m.data(), m.size(), 0, base);
+    rune::storage::ProducerStateManager psm;
+    ASSERT_TRUE(psm.rebuildFromLog(0, log, log.logEndOffset(), 0));
+    EXPECT_TRUE(psm.markerCoordinatorFenced(0, 77, 0, 4)) << "the rebuilt state lost the coordinator fence";
+    EXPECT_FALSE(psm.markerCoordinatorFenced(0, 77, 0, 5));
+    EXPECT_FALSE(psm.markerCoordinatorFenced(0, 78, 0, 0)) << "another producer is not fenced";
+}
+
+// (b) the owning worker's RC build (a restarted / newly assigned leader).
+TEST(D9RemoteMarkerRegression, CoordinatorFenceIsRebuiltFromTheLogByTheWorkerRcBuild) {
+    const auto seed = tx::ControlMarker::build(77, 0, tx::ControlType::Commit, /*coordinatorEpoch=*/5);
+    GwRig R(/*self=*/2, {}, &seed);
+    for (int i = 0; i < 16; ++i) R.runWorker(2 + i);   // the RC / producer-state build
+    std::vector<uint8_t> keep;
+    R.gw.appendRemoteControlRecord(R.remote(/*origin=*/3, 913, 77, true, /*epoch=*/4, keep));
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(30 + i);
+    EXPECT_EQ(R.r->log()->logEndOffset(), 1) << "the stale marker was appended after a rebuild";
+    ASSERT_EQ(R.ch.responses.size(), 1u);
+    EXPECT_EQ(R.ch.responses[0].second.errorCode, tx::kMarkerCoordinatorFencedError);
+}
+
+// MAJOR-2 on the LOCAL path: the same fence in the worker's marker append.
+TEST(D9RemoteMarkerRegression, LocalStaleCoordinatorEpochMarkerIsFenced) {
+    GwRig R(1);
+    ASSERT_EQ(R.marker(77, true, /*epoch=*/5), rune::gateway::ClientGateway::kControlRecordAsync);
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(10 + i);
+    ASSERT_EQ(R.tcs.done.size(), 1u);
+    ASSERT_TRUE(R.tcs.done[0].landed);
+    ASSERT_EQ(R.marker(77, false, /*epoch=*/4), rune::gateway::ClientGateway::kControlRecordAsync);
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(20 + i);
+    EXPECT_EQ(controlBatchCount(*R.r->log()), 1) << "the stale-epoch marker was appended";
+    ASSERT_EQ(R.tcs.done.size(), 2u);
+    EXPECT_FALSE(R.tcs.done[1].landed);
+    EXPECT_EQ(R.tcs.done[1].err, tx::kMarkerCoordinatorFencedError);
+    ASSERT_EQ(R.marker(77, true, /*epoch=*/5), rune::gateway::ClientGateway::kControlRecordAsync);   // equal epoch: OK
+    for (int i = 0; i < 16 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker(30 + i);
+    EXPECT_EQ(controlBatchCount(*R.r->log()), 2);
 }
 
 // ============================================================================
@@ -491,7 +764,9 @@ struct Node {
                                static_cast<int64_t>(rune::node::workerOpFrameBytes(0)));
         for (int p = 0; p < 2; ++p) {
             PartitionConfig c = cfg(self, 0, p);
-            c.fetchIntervalNs = kPassNs; c.isrCheckIntervalNs = 10 * kPassNs; c.replicaLagMaxMs = 1'000'000;
+            // A dead follower leaves the ISR after 100 passes of node time (the
+            // HW-gated markers need the ISR to shrink to the live replicas).
+            c.fetchIntervalNs = kPassNs; c.isrCheckIntervalNs = 10 * kPassNs; c.replicaLagMaxMs = 100;
             const bool lead = leaders[static_cast<std::size_t>(p)] == self;
             auto rep = std::make_unique<PartitionReplica>(c, lead ? Role::Leader : Role::Follower, 1,
                                                           std::vector<NodeId>{1, 2, 3}, std::vector<NodeId>{1, 2, 3},
@@ -506,6 +781,7 @@ struct Node {
         tr->setWorkerPool(&pool);
         tr->setTxnMarkerHandlers(&rune::gateway::ClientGateway::onWriteTxnMarkerThunk,
                                  &rune::gateway::ClientGateway::onWriteTxnMarkerResponseThunk, &gw);
+        tr->setPlaneReconnectHandler(&rune::gateway::ClientGateway::onPlaneReconnectThunk, &gw);
         gw.setNodeIdForTest(self);
         gw.setTopicRegistry(&topics);
         gw.setReplicaRegistry(&reg);
@@ -597,7 +873,10 @@ struct Cluster {
         c.gw.setTxnService(c.tcs.get());
     }
     ~Cluster() {
-        for (auto& n : nodes) n->tr->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
+        for (auto& n : nodes) {
+            n->tr->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
+            n->tr->setPlaneReconnectHandler(nullptr, nullptr);
+        }
     }
     Node& node(int32_t id) { return *nodes[static_cast<std::size_t>(id - 1)]; }
     Node& coord() { return node(3); }
@@ -607,7 +886,7 @@ struct Cluster {
             e.push_back({rune::metadata::gpidOf(0, p), leaders[static_cast<std::size_t>(p)],
                          epochs[static_cast<std::size_t>(p)]});
         auto img = rune::metadata::RoutingImage::build(e);
-        for (auto& n : nodes) if (n->alive) n->gw.setRoutingImageSnapshot(img);
+        for (auto& n : nodes) if (n->alive) { n->gw.setRoutingImageSnapshot(img); (void)n->gw.pumpTxnMarkersForTest(now); }
     }
     void pass() {
         for (auto& n : nodes) if (n->alive) n->pass(now);
@@ -796,4 +1075,48 @@ TEST(D9RemoteMarkerRegression, RemoteMarkerForAPartitionGoneFromTheRegistryIsAns
     EXPECT_EQ(R.ch.responses[0].second.token, 906);
     EXPECT_EQ(R.ch.responses[0].second.errorCode, kNotLeader);
     EXPECT_TRUE(R.tcs.done.empty()) << "a remote-origin refusal must not reach the LOCAL coordinator";
+}
+
+// Review MAJOR-1, transport half: the plane reports the event the re-send hangs
+// on.  Node 1's link to node 2 is DOWN (nobody listens; a marker frame to it is
+// dropped) → node 2 comes up → the hold router's down→up edge is reported for
+// peer 2; node 2's publication to node 1 creates a new inbound image → -1.
+// Real AeronPartitionTransports on one embedded driver; condition waits only.
+TEST(D9CrossNodeMarkerIntegrationRegression, PlaneReportsPeerUpEdgeAndNewInboundImage) {
+    TmpDir dd;
+    rune::node::EmbeddedDriver driver{driverConfig(dd), rune::node::DriverMode::Threaded};
+    aeron::Context ctx;
+    ctx.aeronDir(driver.dir());
+    auto client = aeron::Aeron::connect(ctx);
+    const uint16_t p1 = rune::aeronutil::testing::allocFreeUdpPort();
+    uint16_t p2 = rune::aeronutil::testing::allocFreeUdpPort();
+    while (p2 == p1) p2 = rune::aeronutil::testing::allocFreeUdpPort();
+    auto chan = [](uint16_t p) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p); };
+    struct Events { std::vector<int32_t> peers; };
+    Events ev;
+    auto onReconnect = [](void* ctx, int32_t peer) { static_cast<Events*>(ctx)->peers.push_back(peer); };
+
+    rune::replication::AeronPartitionTransport a(client, chan(p1), kStream, /*self=*/1, kRingBytes);
+    a.setPlaneReconnectHandler(onReconnect, &ev);
+    a.addPeer(2, chan(p2), kStream);
+    std::vector<uint8_t> keep = tx::ControlMarker::build(77, 0, tx::ControlType::Commit, 3);
+    WriteTxnMarkerMsg m{};
+    m.coordinatorNodeId = 1; m.coordinatorEpoch = 3; m.token = 1; m.producerId = 77; m.commit = 1;
+    m.marker = std::span<const uint8_t>(keep);
+    int64_t now = 1;
+    auto until = [&](auto pred, auto&& step) {
+        for (int i = 0; i < 2'000'000; ++i) { if (pred()) return true; step(); std::this_thread::yield(); }
+        return pred();
+    };
+    ASSERT_TRUE(a.sendWriteTxnMarker(2, m));
+    ASSERT_TRUE(until([&] { return a.peerDownForTest(2); }, [&] { (void)a.poll(++now); }))
+        << "precondition: the link to the absent peer is down (its frame dropped)";
+    ev.peers.clear();
+
+    rune::replication::AeronPartitionTransport b(client, chan(p2), kStream, /*self=*/2, kRingBytes);
+    b.addPeer(1, chan(p1), kStream);
+    auto has = [&](int32_t peer) { return std::find(ev.peers.begin(), ev.peers.end(), peer) != ev.peers.end(); };
+    ASSERT_TRUE(until([&] { return has(2) && has(-1); }, [&] { (void)a.poll(++now); (void)b.poll(now); }))
+        << "the plane never reported the reconnect (peer up edge / new inbound image)";
+    EXPECT_FALSE(a.peerDownForTest(2));
 }

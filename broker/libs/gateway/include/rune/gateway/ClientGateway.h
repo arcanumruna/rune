@@ -76,6 +76,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -357,11 +358,13 @@ public:
     // May be empty (no-op for routing — falls back to NotLeader error).
     // -----------------------------------------------------------------------
     void setRoutingImageSnapshot(
-            std::shared_ptr<const rune::metadata::RoutingImage> img) {
+            std::shared_ptr<const rune::metadata::RoutingImage> img) noexcept {
         routingImage_ = std::move(img);
         // D9: a partition whose leadership moved fails its in-flight remote
-        // markers NotLeader at once (event-driven; the TCS retry re-routes).
-        if (!markersInFlight_.empty()) [[unlikely]] failRemoteMarkersOnLeaderChange_();
+        // markers NotLeader (event-driven; the TCS retry re-routes) — done by
+        // the next marker pump of this same thread (review LOW-7: never calls
+        // into the coordinator from inside the routing publish).
+        routingChangedForMarkers_ = true;
     }
 
     [[nodiscard]]
@@ -703,13 +706,23 @@ public:
     static void onWriteTxnMarkerResponseThunk(void* self, const rune::replication::WriteTxnMarkerResponseMsg& r) {
         static_cast<ClientGateway*>(self)->onRemoteControlRecordResponse(r);
     }
-    /// Liveness safety net only (never correctness — markers are idempotent):
-    /// a remote marker unanswered this long (no leadership change seen) is
-    /// completed as a retriable refusal so the coordinator re-sends it.
-    /// = TransactionCoordinationService::kMarkerRetryMaxNs.
-    static constexpr int64_t kRemoteMarkerUnansweredNs = 1'000'000'000;
+    /// Review MAJOR-1: the cluster plane's link to `peer` came back (down→up
+    /// edge; -1 = a new inbound image whose peer is unknown) — every remote
+    /// marker in flight to it (to everyone for -1) is RE-SENT with the SAME
+    /// token by the next marker pump.  A remote marker completes only on a real
+    /// answer or a leadership change — never on a timer.
+    void onPlaneReconnect(int32_t peer) {
+        if (peer < 0) resendAllRemoteMarkers_ = true;
+        else if (std::find(reconnectedPeers_.begin(), reconnectedPeers_.end(), peer) == reconnectedPeers_.end())
+            reconnectedPeers_.push_back(peer);
+    }
+    static void onPlaneReconnectThunk(void* self, int32_t peer) {
+        static_cast<ClientGateway*>(self)->onPlaneReconnect(peer);
+    }
     /// Test-only: this node's id (the test factories use 0).
     void setNodeIdForTest(int32_t id) noexcept { thisNodeId_ = id; }
+    /// Test-only: the token of the last marker issued (tokens carry a boot incarnation).
+    [[nodiscard]] int64_t lastMarkerTokenForTest() const noexcept { return nextMarkerToken_ - 1; }
     /// Test-only: doWork's marker step at `nowNs` (test gateways have no Aeron to poll).
     int pumpTxnMarkersForTest(int64_t nowNs) { nowNs_ = nowNs; return pumpTxnMarkers_(); }
     [[nodiscard]] std::size_t remoteMarkersInFlightForTest() const noexcept {
@@ -1625,10 +1638,11 @@ private:
         uint32_t             reroutes   = 0;
         int32_t              coordinatorEpoch = 0;   ///< F15 m3
         // D9 coordinator side: forwarded to this leader node (-1 = local marker)
-        // under this routing-image leader epoch; sentNs = last send (0 = queued).
+        // under this routing-image leader epoch; sent = handed to the plane
+        // (false = waiting in markerSendQueue_).
         int32_t              remoteNode        = -1;
         int32_t              remoteLeaderEpoch = -1;
-        int64_t              sentNs            = 0;
+        bool                 sent              = false;
         // D9 leader side: appended on behalf of this coordinator node (-1 = own).
         int32_t              originNode  = -1;
         int64_t              originToken = 0;
@@ -1637,7 +1651,10 @@ private:
     static constexpr uint32_t kMaxMarkerReroutes = 4;
     std::unordered_map<int64_t, MarkerInFlight> markersInFlight_;
     std::deque<int64_t>                         markerSendQueue_;
-    int64_t                                     nextMarkerToken_ = 1;
+    /// Review MEDIUM-1: per-boot incarnation in the high bits (bits 32..62) so
+    /// a pre-restart answer never matches a post-restart token.
+    int64_t                                     nextMarkerToken_ = initialMarkerToken_();
+    static int64_t initialMarkerToken_();
     bool trySendMarker_(int64_t token);
     /// F15 K3: THE routing predicate for worker-owned appends — used by the
     /// produce path AND marker routing (appendControlRecord), in every mode,
@@ -1650,7 +1667,10 @@ private:
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};
     std::deque<std::pair<int32_t, rune::replication::WriteTxnMarkerResponseMsg>> pendingMarkerResponses_;
-    int64_t nextRemoteMarkerSweepNs_ = 0;
+    bool routingChangedForMarkers_ = false;      ///< D9: leader-change check due (LOW-7)
+    bool resendAllRemoteMarkers_   = false;      ///< D9 MAJOR-1: re-send every remote marker
+    std::vector<int32_t> reconnectedPeers_;      ///< D9 MAJOR-1: re-send markers to these peers
+    int  resendRemoteMarkers_();
     /// The remote leader of (topicId, partition) from the routing image, or -1
     /// when the marker is local (no channel / image, unassigned, or led here).
     [[nodiscard]] int32_t remoteMarkerLeader_(int32_t topicId, int32_t partition, int32_t& leaderEpoch) const noexcept;
@@ -1662,7 +1682,6 @@ private:
     /// answers, the unanswered-remote-marker sweep.
     int  pumpTxnMarkers_();
     void failRemoteMarkersOnLeaderChange_();
-    int  sweepUnansweredRemoteMarkers_();
     /// Complete a coordinator-side marker as refused (TCS retry) and forget it.
     void refuseMarker_(int64_t token, int16_t errorCode);
     /// The inline (no worker pool) append of appendControlRecord.

@@ -233,12 +233,14 @@ struct EosRig {
         return w().handleIngressFrameForTest(f.data(), f.size(), now);
     }
     // The coordinator's marker dispatch (gateway → owning worker).
-    void abortMarker(int64_t pid, int16_t epoch, int64_t now) {
+    // D9 MAJOR-3: with a follower in the ISR the marker's reply waits for the
+    // HW (awaitReply=false: only the append is driven here).
+    void abortMarker(int64_t pid, int16_t epoch, int64_t now, bool awaitReply = true) {
         const auto m = tx::ControlMarker::build(pid, epoch, tx::ControlType::Abort, 0);
         ASSERT_EQ(gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), pid, /*commit=*/false, /*coordinatorEpoch=*/0),
                   rune::gateway::ClientGateway::kControlRecordAsync);
-        for (int i = 0; i < 64 && gw.markersInFlightForTest() > 0; ++i) runWorker(now + i);
-        ASSERT_EQ(gw.markersInFlightForTest(), 0u) << "the marker reply reached the gateway";
+        for (int i = 0; i < 64 && (awaitReply ? gw.markersInFlightForTest() > 0 : i < 4); ++i) runWorker(now + i);
+        if (awaitReply) ASSERT_EQ(gw.markersInFlightForTest(), 0u) << "the marker reply reached the gateway";
     }
     // F15 S4 retarget: the aborted ranges live on the OWNING worker (Option B).
     bool abortCovers(int64_t off) {
@@ -394,16 +396,18 @@ TEST(TxnFactOrderRegression, AcksAllParkedBatchBeforeAbortIsCovered) {
     ASSERT_EQ(R.w().rcOpenTxnsForTest(0, 0), 1u) << "S4 retarget precondition: the open txn is registered at append";
     R.runWorker(3);
     ASSERT_TRUE(R.cap.produceErrors.empty()) << "precondition: the ack is parked on the HW";
-    R.abortMarker(7, 0, 10);                                // marker lands at 1; its reply overtakes the parked ack
+    // Marker lands at 1 (D9 MAJOR-3: its reply now also waits for the HW).
+    R.abortMarker(7, 0, 10, /*awaitReply=*/false);
     ASSERT_EQ(R.r->log()->logEndOffset(), 2);
     EXPECT_TRUE(R.abortCovers(0)) << "the aborted batch at offset 0 is not in any aborted range: "
                                      "read_committed would deliver it";
     // The follower catches up → the parked ack fires → the (late) ProduceResult.
     rune::replication::FetchRequestMsg fr{1, 0, 2, R.r->log()->logEndOffset(), 1 << 20, 0};
     (void)R.r->onFetchRequest(fr, 100);
-    for (int i = 0; i < 64 && R.cap.produceErrors.empty(); ++i) R.runWorker(200 + i);
+    for (int i = 0; i < 64 && (R.cap.produceErrors.empty() || R.gw.markersInFlightForTest() > 0); ++i) R.runWorker(200 + i);
     ASSERT_EQ(R.cap.produceErrors.size(), 1u);
     EXPECT_EQ(R.cap.produceErrors[0], 0);
+    EXPECT_EQ(R.gw.markersInFlightForTest(), 0u) << "the marker reply arrives once the HW passes it";
     EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "the late result re-opened a resolved txn: the LSO is pinned forever";
     const uint64_t reads = R.w().pushReadsForTest();
     R.push(16, 300);
@@ -687,6 +691,30 @@ TEST(MarkerRetryRegression, StuckMarkerGaugeCountsLongRefusedMarkersAndClearsOnL
     ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "the retried marker landed";
     (void)T.tcs->doWork(now + 1);
     EXPECT_EQ(T.tcs->stuckMarkers(), 0u) << "the gauge clears once the marker landed";
+}
+
+// D9 review MAJOR-2: a FENCED refusal (a newer coordinator wrote a marker for
+// this producer there) is never retried and never counts as landed.
+TEST(MarkerRetryRegression, FencedMarkerIsNotRetriedAndDoesNotCompleteTheTxn) {
+    TxnRig T(/*minIsr=*/2);                                  // the first attempt is refused (retriable)
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    (void)T.tcs->doWork(10);
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_EQ(T.tcs->queuedMarkerRetriesForTest(), 1u) << "precondition: a retry is queued";
+    T.tcs->onControlMarkerRefused(0, 0, T.pid, rune::transaction::kMarkerCoordinatorFencedError,
+                                  T.tcs->coordinatorEpoch());
+    EXPECT_EQ(T.tcs->queuedMarkerRetriesForTest(), 0u) << "a fenced marker was queued for retry";
+    const auto refusals = T.tcs->controlMarkersRefusedForTest();
+    T.m.r->setMinIsrForTest(1);                              // the partition could take it now
+    for (int64_t now = 20'000'000; now < 3'000'000'000; now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "a fenced marker was re-sent and appended";
+    EXPECT_EQ(T.tcs->controlMarkersRefusedForTest(), refusals);
+    EXPECT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 1u) << "a fenced marker completed the transaction";
+    EXPECT_TRUE(T.controlFrames.empty());
 }
 
 TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
@@ -1519,9 +1547,13 @@ TEST(LegacyAcksAllRegression, TxnBatchRegisteredAtAppendAndCoveredAfterFailedAck
     const auto m = tx::ControlMarker::build(7, 0, tx::ControlType::Abort, 0);
     ASSERT_EQ(R.gw.appendControlRecord(0, 0, std::span<const uint8_t>(m), 7, /*commit=*/false, /*coordinatorEpoch=*/0),
               rune::gateway::ClientGateway::kControlRecordAsync);
+    for (int i = 0; i < 4; ++i) R.runWorker();
+    ASSERT_EQ(R.r->log()->logEndOffset(), 2) << "the ABORT marker landed at 1";
+    // D9 MAJOR-3: the marker's reply waits for the HW — the follower catches up.
+    rune::replication::FetchRequestMsg fr{1, 0, 2, R.r->log()->logEndOffset(), 1 << 20, 0};
+    (void)R.r->onFetchRequest(fr, R.now);
     for (int i = 0; i < 64 && R.gw.markersInFlightForTest() > 0; ++i) R.runWorker();
     ASSERT_EQ(R.gw.markersInFlightForTest(), 0u);
-    ASSERT_EQ(R.r->log()->logEndOffset(), 2) << "the ABORT marker landed at 1";
     bool covered = false;
     for (const auto& rg : R.w().rcAbortedRangesForTest(0, 0)) covered = covered || rg.contains(0);
     EXPECT_TRUE(covered) << "the appended txn batch whose ack failed is not covered by the abort";

@@ -311,6 +311,15 @@ public:
                               void* ctx) noexcept {
         txnMarkerHandler_ = onMarker; txnMarkerRespHandler_ = onResponse; txnMarkerCtx_ = ctx;
     }
+    /// D9 review MAJOR-1: the plane-reconnect event, CONTROL thread (poll):
+    /// `peer` >= 0 = this node's link to that peer went down→up (its hold-router
+    /// connection generation was bumped — frames to it may have been dropped
+    /// while it was down); -1 = a new inbound image appeared (some peer's link
+    /// to this node came back; frames from it may have been dropped).
+    using PlaneReconnectHandler = void (*)(void* ctx, int32_t peer);
+    void setPlaneReconnectHandler(PlaneReconnectHandler fn, void* ctx) noexcept {
+        reconnectHandler_ = fn; reconnectCtx_ = ctx;
+    }
     /// Thunks matching the gateway's TxnMarkerChannel send signatures (ctx = this).
     static bool sendWriteTxnMarkerThunk(void* self, int32_t to, const WriteTxnMarkerMsg& msg) {
         return static_cast<AeronPartitionTransport*>(self)->sendWriteTxnMarker(static_cast<NodeId>(to), msg);
@@ -518,6 +527,13 @@ private:
     WriteTxnMarkerHandler                  txnMarkerHandler_     = nullptr;  ///< control thread (D9)
     WriteTxnMarkerResponseHandler          txnMarkerRespHandler_ = nullptr;
     void*                                  txnMarkerCtx_         = nullptr;
+    PlaneReconnectHandler                  reconnectHandler_     = nullptr;  ///< control thread (D9)
+    void*                                  reconnectCtx_         = nullptr;
+    uint64_t                               lastUpEdges_          = 0;
+    int                                    lastImageCount_       = 0;
+    std::vector<std::pair<NodeId, uint32_t>> notifiedGen_;                     ///< per-peer gen last reported
+    /// D9: probe down peers' links + report down→up edges / new inbound images.
+    int notePlaneReconnects_();
     int64_t                                nowNs_ = 0; ///< updated at top of poll()
 
     // Per-peer egress publications (keyed by NodeId).
