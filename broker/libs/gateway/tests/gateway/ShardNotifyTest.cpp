@@ -411,3 +411,20 @@ TEST(GatewayShardNotifyRegression, DirectShareExpireClosesTheSessionAndTellsTheC
     EXPECT_EQ(frames.size(), 1u);
     EXPECT_EQ(gw.sessionCount(), 1u);
 }
+
+// D8d review LOW-4: an Expire for a session still pending its connect drops the pending connect, is counted as a
+// direct-share expiry and tells its workers to forget it.
+TEST(GatewayShardNotifyRegression, DirectShareExpireOfAPendingConnectIsCountedAndClosedRegression) {
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    gw.injectPendingConnectForTest(77, /*announceBegun=*/true);
+    ASSERT_EQ(gw.shardSessionSlotsInUseForTest(), 1u);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(77, 0, rune::node::SessionSignalKind::Expire)));
+    gw.drainWorkerReturnsForTest(1'000);
+    EXPECT_EQ(gw.directShareExpiriesForTest(), 1u);
+    EXPECT_EQ(gw.shardSessionSlotsInUseForTest(), 0u) << "the pending connect is dropped";
+    pool.worker(0).doWork(1);
+    EXPECT_EQ(pool.worker(0).sessionClosesSeenForTest(), 1u) << "its workers forget it";
+}

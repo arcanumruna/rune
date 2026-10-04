@@ -1232,8 +1232,15 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
     // connect — never accept a session no worker can ack.
     for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
         if (it->sessionId != ret.sessionId) continue;
-        spdlog::warn("ClientGateway: pending session {} dropped — its ack publication on worker {} can "
-                     "never deliver", ret.sessionId, ret.partition);
+        if (kind == K::Expire) {                                      // D8d review LOW-4: the right reason, counted
+            ++directShareExpiries_;
+            spdlog::warn("ClientGateway: pending session {} dropped — worker {}'s direct ack share is full and it "
+                         "holds the largest share ({} acks) without reading (expiries={})", ret.sessionId,
+                         ret.partition, ret.baseOffset, directShareExpiries_);
+        } else {
+            spdlog::warn("ClientGateway: pending session {} dropped — its ack publication on worker {} can "
+                         "never deliver", ret.sessionId, ret.partition);
+        }
         if (it->resolvedPub) sendSessionExpired_(it->resolvedPub.get(), nullptr, ret.sessionId);
         closeDroppedPendingConnect_(*it);
         pendingConnects_.erase(it);   // resolvedPub released with the entry

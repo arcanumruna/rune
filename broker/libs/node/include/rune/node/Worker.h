@@ -660,6 +660,8 @@ public:
     }
     [[nodiscard]] uint64_t directExpiriesForTest() const noexcept { return ackSink_ ? ackSink_->directExpiries() : 0; }
     [[nodiscard]] uint64_t directUnderflowsForTest() const noexcept { return ackSink_ ? ackSink_->directUnderflowsForTest() : 0; }
+    [[nodiscard]] uint64_t directDroppedClosedForTest() const noexcept { return ackSink_ ? ackSink_->directDroppedClosed() : 0; }
+    [[nodiscard]] uint64_t directExpiryCancelsForTest() const noexcept { return ackSink_ ? ackSink_->directExpiryCancelsForTest() : 0; }
     void releaseShardClient() noexcept { ackSink_.reset(); }
     [[nodiscard]] bool workerSideAcks() const noexcept { return ackSink_ != nullptr; }
     [[nodiscard]] uint64_t sessionAnnouncesSeenForTest() const noexcept { return sessionAnnouncesSeen_; }
@@ -5049,6 +5051,10 @@ private:
                             ++intakePausedFrames_;
                             return aeron::ControlledPollAction::ABORT;
                         }
+                        // Review MEDIUM-2: a CLOSED session's buffered frame is consumed,
+                        // never appended (the gateway's UnknownSession drop).
+                        if (direct == SessionAckSink::kDirectDropClosed) [[unlikely]]
+                            return aeron::ControlledPollAction::CONTINUE;
                     }
                     polled += handleWorkerIngressFrame_(data, len, nowNs, direct);
                     return aeron::ControlledPollAction::CONTINUE;

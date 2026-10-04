@@ -161,6 +161,15 @@ public:
     static constexpr uint8_t     kDirectRefused   = 0;   ///< ABORT the frame (held / no budget / band / full)
     static constexpr uint8_t     kDirectTotalOnly = 1;   ///< admitted; session not announced yet: worker total only
     static constexpr uint8_t     kDirectCounted   = 2;   ///< admitted; worker total + the session's share
+    /// Review MEDIUM-2: the session was CLOSED here (expired / reaped / failed /
+    /// disconnected): CONSUME the frame without appending or answering — the
+    /// gateway path's UnknownSession drop — so a client that resends after
+    /// SessionExpired cannot duplicate its buffered backlog.
+    static constexpr uint8_t     kDirectDropClosed = 3;
+    /// Review MEDIUM-2: recently closed session ids remembered (FIFO ring) —
+    /// sized for every close burst between a close and the drain of the closed
+    /// client's image (a client's term window drains in a few passes).
+    static constexpr std::size_t kClosedTombstones = 1024;
     /// D8d: default per-session direct budget — the owed-return cap default
     /// (Worker::kMaxOwedReturns): one session may keep a full pipeline of
     /// parked acks=all on a worker; a stalled one holds at most this.
@@ -225,6 +234,7 @@ public:
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return;
         erase_(idx);
+        closed_[closedNext_++ & (kClosedTombstones - 1)] = sessionId;   // MEDIUM-2 tombstone (overwrites the oldest)
     }
 
     /// Queue one ack for this pass's flush.  False only when the queue is full
@@ -242,7 +252,7 @@ public:
     /// truly orphaned (I1).  Returns work done.
     int flush(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
         const int work = flushAcks_(ringProducerPos, ringConsumerPos);
-        if ((directFullThisPass_ | directEp_.tag) != 0) [[unlikely]] directEpisode_();
+        if ((directDeferredThisPass_ | directEp_.tag) != 0) [[unlikely]] directEpisode_();
         return work;
     }
 
@@ -290,7 +300,9 @@ private:
                     const int64_t pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver),
                                                       [&](uint8_t* dst) { encode_(a, ver, dst); });
                     if (pos > 0) [[likely]] {
-                        if (const Edges& e = edges_[idx]; (e.lost | e.reportedHeld) != 0) [[unlikely]] claimedWatched_(idx);
+                        if (const Edges& e = edges_[idx];
+                            ((e.lost | e.reportedHeld) != 0) | ((e.dflags & (kDfDelivered | kDfExpiring)) != kDfDelivered))
+                            [[unlikely]] claimedWatched_(idx);
                         if (a.credit) noteCredit_(idx);              // D8c: gateway-routed — return its credit
                         else if (a.direct) directDone_(a.direct, idx, true);   // D8d: its direct share
                         ++work;
@@ -458,13 +470,24 @@ public:
             mine = edges_[idx].direct;
             if (mine >= directSessionBudget_) [[unlikely]] { ++directRefusedBudget_; return kDirectRefused; }
         }
+        else if (closedRecently_(sessionId)) [[unlikely]] {         // MEDIUM-2: never append a closed session's backlog
+            ++directDroppedClosed_;
+            return kDirectDropClosed;
+        }
         if (directInFlight_ >= directBandStart_) [[unlikely]] {
             if (directInFlight_ >= directCap_) {
                 ++directRefusedFull_;
-                directFullThisPass_ = 1;                              // a deferred pass (expiry pacing)
+                directDeferredThisPass_ = 1;                          // a deferred pass (expiry pacing)
                 return kDirectRefused;
             }
-            if (mine >= kDirectLightInFlight) { ++directRefusedBand_; return kDirectRefused; }
+            if (mine >= kDirectLightInFlight) {
+                ++directRefusedBand_;
+                // Review MEDIUM-1: a (non-held) session deferred by the band is a
+                // deferred pass too — held sessions parking the band without
+                // filling it are expired like a full share's.
+                directDeferredThisPass_ = 1;
+                return kDirectRefused;
+            }
         }
         ++directInFlight_;
         if (idx == kNone) [[unlikely]] return kDirectTotalOnly;     // announcement not applied yet (I1)
@@ -485,7 +508,17 @@ public:
         const int64_t sid = expireUnreported_;
         const std::size_t idx = find_(sid);
         if (idx == kNone) { expireUnreported_ = 0; return 0; }    // closed meanwhile (erase_ clears it too)
-        if (!tryReport(sid, edges_[idx].direct)) return 0;
+        Edges& e = edges_[idx];
+        // Review LOW-1: re-checked when the signal is actually sent — a victim that
+        // is no longer held, or claimed an ack since it was chosen, is reading.
+        if ((e.dflags & kDfReadSinceChosen) != 0 || !expiryEligible_(idx)) {
+            e.dflags = static_cast<uint8_t>(e.dflags & ~(kDfExpiring | kDfReadSinceChosen));
+            --expiringCount_;
+            expireUnreported_ = 0;
+            ++directExpiryCancels_;
+            return 0;
+        }
+        if (!tryReport(sid, e.direct)) return 0;
         expireUnreported_ = 0;
         return 1;
     }
@@ -503,6 +536,8 @@ public:
     [[nodiscard]] uint64_t directRefusedBandForTest() const noexcept { return directRefusedBand_; }
     [[nodiscard]] uint64_t directRefusedFullForTest() const noexcept { return directRefusedFull_; }
     [[nodiscard]] uint64_t directUnderflowsForTest() const noexcept { return directUnderflows_; }
+    [[nodiscard]] uint64_t directDroppedClosed() const noexcept { return directDroppedClosed_; }
+    [[nodiscard]] uint64_t directExpiryCancelsForTest() const noexcept { return directExpiryCancels_; }
 
     /// Claimed credits of `sessionId` not yet reported (test seam).
     [[nodiscard]] uint32_t unreportedCreditsForTest(int64_t sessionId) const noexcept {
@@ -557,7 +592,7 @@ private:
     }
     void erase_(std::size_t i) noexcept {                            // backward-shift deletion
         leaveState_(states_[i]);
-        if (edges_[i].expiring) {                                    // D8d: the runtime's close arrived
+        if (edges_[i].dflags & kDfExpiring) {                        // D8d: the runtime's close arrived
             --expiringCount_;
             if (expireUnreported_ == keys_[i]) expireUnreported_ = 0;
         }
@@ -617,6 +652,9 @@ private:
     /// connected (Found) and, if the runtime knows it Held, it progressed.
     void claimedWatched_(std::size_t idx) noexcept {
         Edges& e = edges_[idx];
+        // D8d review LOW-1 / LOW-2: it delivered (once is enough), and a chosen
+        // expiry victim that claims is reading — cancelled at report time.
+        e.dflags = static_cast<uint8_t>(e.dflags | kDfDelivered | ((e.dflags & kDfExpiring) ? kDfReadSinceChosen : 0));
         if (e.lost) { e.lost = 0; markDirty_(idx); }
         if (e.reportedHeld && !e.progressed) { e.progressed = 1; markDirty_(idx); }
     }
@@ -655,15 +693,18 @@ private:
         if (tag == kDirectCounted && e.direct != 0) --e.direct;
         if (claimed && directEp_.tag != 0) [[unlikely]] e.directTag = directEp_.tag;
     }
-    /// D8d: once per pass while the cap was hit this pass or an episode is open.
-    /// Episode: starts when the full cap defers a frame; ends with its single
-    /// expiry, or when the total drops below the congested band (claims inside
-    /// the band keep it, so reader marks persist).  While an expiry awaits the
+    /// D8d: once per pass while a frame was deferred this pass (full share, or —
+    /// fix round MEDIUM-1 — the band deferring a non-held session) or an episode
+    /// is open.  Episode: starts with such a deferral; ends with its single
+    /// expiry, or when the total drops below the congested band.  A session is a
+    /// reader (never blamed) if one of its direct acks was claimed in the current
+    /// scan window (kDirectExpireAfterDeferredPasses deferred passes; a fresh tag
+    /// per window).  While an expiry awaits the
     /// runtime's close nothing is counted (one in flight).  Cold: the scan runs
     /// at most once per kDirectExpireAfterDeferredPasses deferred passes.
     [[gnu::cold]] void directEpisode_() noexcept {
-        const bool full = directFullThisPass_ != 0;
-        directFullThisPass_ = 0;
+        const bool full = directDeferredThisPass_ != 0;
+        directDeferredThisPass_ = 0;
         if (!full) {
             if (directInFlight_ < directBandStart_) directEp_ = DirectEpisode{};
             return;
@@ -677,18 +718,42 @@ private:
         std::size_t victim = kNone;
         uint16_t share = 0;
         for (std::size_t i = 0; i < kMaxSessions; ++i) {
-            if (keys_[i] == 0 || heldPass_[i] != pass_ || heldAfterFlush_ == 0) continue;   // not held: a reader
+            if (keys_[i] == 0 || !expiryEligible_(i)) continue;      // not held / never delivered: not to blame
             const Edges& e = edges_[i];
-            if (e.expiring || e.directTag == directEp_.tag) continue;   // claimed in this episode: a (slow) reader
+            if ((e.dflags & kDfExpiring) || e.directTag == directEp_.tag) continue;   // claimed in this episode: a (slow) reader
             if (e.direct > share) { share = e.direct; victim = i; }
         }
-        if (victim == kNone) return;                                 // no held session to blame: keep deferring
+        if (victim == kNone) {                                       // no held session to blame: keep deferring
+            // Fix round (MEDIUM-1): reader marks count claims of the LAST scan
+            // window only — a fresh tag per window.  A session that read while it
+            // was being admitted (or before it stalled) in a long band episode is
+            // judged by what it does now, not marked a reader forever.
+            if (++directEpTags_ == 0) ++directEpTags_;
+            directEp_.tag = directEpTags_;
+            return;
+        }
         directEp_ = DirectEpisode{};                                 // the episode ends with its one expiry
-        edges_[victim].expiring = 1;
+        edges_[victim].dflags = static_cast<uint8_t>((edges_[victim].dflags | kDfExpiring) & ~kDfReadSinceChosen);
         ++expiringCount_;
         expireUnreported_ = keys_[victim];
         lastDirectExpired_ = keys_[victim];
         ++directExpiries_;
+    }
+    /// D8d: may this session be expired?  HELD after this flush (acks queued its
+    /// publication refuses) AND its publication is Ready and has DELIVERED before
+    /// (review LOW-2: a session whose publication is still being added /
+    /// resolved / connecting — a brand-new client — is never blamed; one that
+    /// never connects is D8b Lost and reaped on its lease).
+    [[nodiscard]] bool expiryEligible_(std::size_t i) const noexcept {
+        return heldAfterFlush_ != 0 && heldPass_[i] == pass_ && (edges_[i].dflags & kDfDelivered) != 0 &&
+               std::holds_alternative<PubReady>(states_[i]);
+    }
+    /// MEDIUM-2: was `sid` closed here recently?  Cold: consulted only for a
+    /// frame whose session is not in the table.
+    [[nodiscard]] bool closedRecently_(int64_t sid) const noexcept {
+        const std::size_t n = closedNext_ < kClosedTombstones ? closedNext_ : kClosedTombstones;
+        for (std::size_t k = 0; k < n; ++k) if (closed_[k] == sid) return true;
+        return false;
     }
     void markDirty_(std::size_t idx) noexcept {
         if (edges_[idx].dirty) return;
@@ -790,8 +855,12 @@ private:
         uint32_t credits      = 0;   ///< D8c: claimed gateway-routed acks not yet reported (<= kAckCapacity per pass)
         uint16_t direct       = 0;   ///< D8d: counted direct produces (admitted, ack not yet out) — <= kAckCapacity / 2
         uint16_t directTag    = 0;   ///< D8d: congestion episode in which one of its direct acks was claimed
-        uint8_t  expiring     = 0;   ///< D8d: chosen for expiry; the runtime's close is awaited
+        uint8_t  dflags       = 0;   ///< D8d: kDf* — delivered / chosen for expiry / read since chosen
     };
+    static constexpr uint8_t kDfDelivered       = 1;   ///< a claim on its publication succeeded once (LOW-2)
+    static constexpr uint8_t kDfExpiring        = 2;   ///< chosen for expiry; the runtime's close is awaited
+    static constexpr uint8_t kDfReadSinceChosen = 4;   ///< claimed an ack after it was chosen (LOW-1: cancel)
+    static_assert(std::has_single_bit(kClosedTombstones));
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
     std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report
@@ -824,13 +893,17 @@ private:
     uint32_t directSessionBudget_ = kDefaultDirectSessionBudget;
     DirectEpisode                                                    directEp_{};
     uint16_t                                                         directEpTags_ = 0;
-    uint8_t                                                          directFullThisPass_ = 0;
+    uint8_t                                                          directDeferredThisPass_ = 0;
     std::size_t                                                      expiringCount_ = 0;
     int64_t                                                          expireUnreported_ = 0;
     int64_t                                                          lastDirectExpired_ = 0;
     uint64_t                                                         directExpiries_ = 0;
     uint64_t directRefusedHeld_ = 0, directRefusedBudget_ = 0, directRefusedBand_ = 0, directRefusedFull_ = 0;
     uint64_t                                                         directUnderflows_ = 0;
+    uint64_t                                                         directDroppedClosed_ = 0;
+    uint64_t                                                         directExpiryCancels_ = 0;
+    std::array<int64_t, kClosedTombstones>                           closed_{};        // MEDIUM-2 tombstones
+    std::size_t                                                      closedNext_ = 0;
 };
 
 /// Production policy: the worker's own invoker-mode Aeron client (spec §3.1).

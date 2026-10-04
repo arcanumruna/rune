@@ -775,6 +775,12 @@ AckEntry directAck(int64_t sid, int64_t corr, uint8_t tag = Sink::kDirectCounted
     a.direct = tag;
     return a;
 }
+/// Review LOW-2: the session's publication delivers one (non-direct) ack — only
+/// a session that has delivered can be expired.
+void deliverOne(Sink& s, int64_t sid) {
+    ASSERT_TRUE(s.enqueue(ack(sid, -1)));
+    pass(s);
+}
 /// Admit `n` direct frames of `sid`; returns how many were admitted (stops at the first refusal).
 int admitN(Sink& s, int64_t sid, int n) {
     int k = 0;
@@ -891,6 +897,7 @@ TEST(SessionAckSinkRegression, DirectFullCapExpiresOnlyTheHeldLargestShareSessio
     FakePolicy pol; auto st = pol.s; Sink s(pol);
     s.setDirectBudgets(300, 400);                           // band = [300, 400)
     ready(s, 7); ready(s, 8); ready(s, 9); ready(s, 10); ready(s, 11);   // pubs 1..5
+    for (int64_t sid : {7, 8, 9, 10, 11}) deliverOne(s, sid);
     Expiries ex;
     ASSERT_EQ(admitN(s, 9, 300), 300);                      // 9: a full pipeline of parked acks=all — not held
     ASSERT_EQ(admitN(s, 7, 100), 64);
@@ -944,6 +951,7 @@ TEST(SessionAckSinkRegression, DirectEpisodeEndsBelowTheBandAndAClosedVictimIsNe
     FakePolicy pol; auto st = pol.s; Sink s(pol);
     s.setDirectBudgets(400, 400);                           // band = [300, 400)
     ready(s, 7); ready(s, 8); ready(s, 30);                 // pubs 1, 2, 3
+    for (int64_t sid : {7, 8, 30}) deliverOne(s, sid);
     st->blocked.insert(1);
     ASSERT_EQ(admitN(s, 7, 400), 300);                      // the heavy session stops at the band
     for (int64_t c = 0; c < 300; ++c) ASSERT_TRUE(s.enqueue(directAck(7, c)));
@@ -970,5 +978,83 @@ TEST(SessionAckSinkRegression, DirectEpisodeEndsBelowTheBandAndAClosedVictimIsNe
     pass(s);
     EXPECT_EQ(s.directInFlight(), 300u) << "its 100 queued acks dropped";
     EXPECT_EQ(s.admitDirect(8), Sink::kDirectCounted) << "the share has room again";
+    EXPECT_EQ(s.directUnderflowsForTest(), 0u);
+}
+
+// ---- D8d fix round (review MEDIUM-1 / MEDIUM-2 / LOW-1 / LOW-2) -------------
+
+// MEDIUM-1: held sessions parking the share in its band (not full) while the band DEFERS a non-held session are
+// expired like a full share's — after kDirectExpireAfterDeferredPasses deferred passes, held + largest only.
+TEST(SessionAckSinkRegression, BandDeferralOfAHealthySessionExpiresTheHeldBandParkerRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    s.setDirectBudgets(200, 400);                           // band = [300, 400)
+    ready(s, 7); ready(s, 8); ready(s, 9);                  // pubs 1..3
+    for (int64_t sid : {7, 8, 9}) deliverOne(s, sid);
+    st->blocked.insert(1); st->blocked.insert(2);           // 7 and 8 stalled
+    ASSERT_EQ(admitN(s, 7, 200), 200);
+    ASSERT_EQ(admitN(s, 8, 200), 100);                      // to the band start
+    for (int64_t c = 0; c < 200; ++c) ASSERT_TRUE(s.enqueue(directAck(7, c)));
+    for (int64_t c = 0; c < 100; ++c) ASSERT_TRUE(s.enqueue(directAck(8, c)));
+    ASSERT_EQ(admitN(s, 9, 1000), 64);                      // 9: healthy, a parked pipeline — capped by the band
+    pass(s);
+    ASSERT_LT(s.directInFlight(), 400u) << "precondition: in the band, not full";
+    const auto bandPass = [&] { ASSERT_EQ(s.admitDirect(9), Sink::kDirectRefused); pass(s); };
+    for (int i = 0; i < 62; ++i) bandPass();
+    EXPECT_EQ(s.directExpiries(), 0u);
+    bandPass();
+    ASSERT_EQ(s.directExpiries(), 1u) << "band deferrals of a healthy session are deferred passes";
+    EXPECT_EQ(s.lastDirectExpiredForTest(), 7) << "the held session with the largest share";
+    EXPECT_EQ(s.directRefusedFullForTest(), 0u) << "the share was never full";
+}
+
+// MEDIUM-2: a session closed here — its still-buffered frames are dropped (consumed, never appended or counted);
+// a session never known is still admitted (I1: its announcement may not be applied yet); a re-announced one is
+// admitted again.
+TEST(SessionAckSinkRegression, ClosedSessionsFramesAreDroppedNotAdmittedRegression) {
+    FakePolicy pol; Sink s(pol);
+    ready(s, 7);
+    ASSERT_EQ(s.admitDirect(7), Sink::kDirectCounted);
+    ASSERT_TRUE(s.enqueue(directAck(7, 1)));
+    pass(s);
+    s.close(7);
+    EXPECT_EQ(s.admitDirect(7), Sink::kDirectDropClosed);
+    EXPECT_EQ(s.admitDirect(7), Sink::kDirectDropClosed);
+    EXPECT_EQ(s.directDroppedClosed(), 2u);
+    EXPECT_EQ(s.directInFlight(), 0u) << "dropped frames are never counted";
+    EXPECT_EQ(s.admitDirect(8), Sink::kDirectTotalOnly) << "a session never seen here is admitted (I1)";
+    ready(s, 7);                                            // re-announced
+    EXPECT_EQ(s.admitDirect(7), Sink::kDirectCounted);
+}
+
+// LOW-1: the chosen victim is re-checked when the Expire is reported — one that claimed an ack since it was chosen
+// (or is no longer held) is not expired; the cancellation frees the one-in-flight slot for a later expiry.
+// LOW-2: a session whose publication never delivered (still connecting / never connected) is never chosen.
+TEST(SessionAckSinkRegression, ExpiryIsCancelledForAReaderAndNeverHitsANeverDeliveredSessionRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    s.setDirectBudgets(400, 400);
+    ready(s, 7); ready(s, 8); ready(s, 9);                  // pubs 1..3
+    deliverOne(s, 8);                                       // 7 never delivered; 8 did
+    st->notConnected.insert(1); st->blocked.insert(2);
+    ASSERT_EQ(admitN(s, 7, 300), 300);                      // the larger share — but never delivered
+    ASSERT_EQ(admitN(s, 8, 100), 64);
+    ASSERT_EQ(admitN(s, 9, 100), 36);
+    for (int64_t c = 0; c < 300; ++c) ASSERT_TRUE(s.enqueue(directAck(7, c)));
+    for (int64_t c = 0; c < 64; ++c) ASSERT_TRUE(s.enqueue(directAck(8, c)));
+    const auto deferredPass = [&] { ASSERT_EQ(s.admitDirect(10), Sink::kDirectRefused); pass(s); };
+    for (int i = 0; i < 64; ++i) deferredPass();
+    ASSERT_EQ(s.directExpiries(), 1u);
+    EXPECT_EQ(s.lastDirectExpiredForTest(), 8) << "LOW-2: the never-delivered 7 (300) is not to blame";
+    st->blocked.erase(2); st->budget[2] = 1;                // 8 reads one ack before the report goes out
+    pass(s);
+    Expiries ex;
+    EXPECT_EQ(ex.report(s), 0) << "LOW-1: a victim that read since it was chosen is not expired";
+    EXPECT_TRUE(ex.got.empty());
+    EXPECT_EQ(s.directExpiryCancelsForTest(), 1u);
+    ASSERT_EQ(admitN(s, 11, 1), 1);                         // full again (8 freed one)
+    const auto deferredPass2 = [&] { ASSERT_EQ(s.admitDirect(12), Sink::kDirectRefused); pass(s); };
+    for (int i = 0; i < 64; ++i) deferredPass2();           // 8 stalls again: a later expiry is possible
+    ASSERT_EQ(s.directExpiries(), 2u);
+    EXPECT_EQ(s.lastDirectExpiredForTest(), 8);
+    EXPECT_EQ(ex.report(s), 1);
     EXPECT_EQ(s.directUnderflowsForTest(), 0u);
 }
