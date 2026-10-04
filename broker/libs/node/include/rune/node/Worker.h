@@ -3228,7 +3228,7 @@ private:
                 ret.baseOffset = base;
                 if (mpOk) psm_.fenceEpoch(topicId, mp.producerId, partition,   // D9 MAJOR-2: the fence (raise-only)
                                           rune::protocol::RecordBatchReader(tail, tailLen).producerEpoch(),
-                                          mp.coordinatorEpoch);
+                                          /*fromRebuild=*/false, mp.coordinatorEpoch);
                 // F15 §2.1 step 2: the RC update in the same invocation as the
                 // marker append (Ready: applied; Scanning: tail list).
                 if (RcState* rc = rcOf_(replica)) {
