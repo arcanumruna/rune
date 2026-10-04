@@ -79,8 +79,10 @@ ClientAgent::ClientAgent(AgentConfig cfg)
     // channel, so its control frames fast-path back to the default offer (the
     // byte-identical single-node path).  Task 1.3 lazily appends one Session per
     // additional leader endpoint via sessionForEndpoint().
+    session::SessionConfig seedCfg = cfg_.session;
+    seedCfg.keepaliveCorrelationId = -1;   // A10: sessions_[0]'s keepalive Pong routing
     sessions_.emplace_back(std::make_unique<Session>(
-        this, cfg_.session, cfg_.transport.ingressChannel));
+        this, seedCfg, cfg_.transport.ingressChannel));
 }
 
 // ---------------------------------------------------------------------------
@@ -762,12 +764,15 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     }
 
     case codec::TemplateId::Pong: {
-        // A10: credited to the session it answers (the keepalive is a Ping per
-        // session); the seed only when the id is unknown (pre-fix behaviour).
+        // A10: a keepalive Pong carries its session's own negative correlationId
+        // (-(index + 1)) — credited to exactly that session (broker session ids
+        // collide across nodes, so the sessionId cannot route it).  Anything else
+        // (an application ping) refreshes the seed, as before.
         {
             const auto pongOpt = codec::decodePong(buf, len);
-            Session* s = pongOpt ? sessionById_(pongOpt->sessionId) : nullptr;
-            (s != nullptr ? *s : seedSession()).machine.onActivity(nowNs);
+            const int64_t corr = pongOpt ? pongOpt->correlationId : 0;
+            const auto idx = static_cast<std::size_t>(-(corr + 1));
+            (corr < 0 && idx < sessions_.size() ? *sessions_[idx] : seedSession()).machine.onActivity(nowNs);
         }
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
@@ -795,9 +800,6 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // known-old duplicate carries baseOffset -1; the old -errorCode sentinel
         // read it as error 1).
         if (auto opt = codec::decodeProduceResponse(buf, len)) {
-            // A10: an ack is proof of a live session — refresh ITS liveness clock
-            // (else every producing session went stale after responseTimeoutNs).
-            if (Session* s = sessionById_(opt->sessionId)) [[likely]] s->machine.onActivity(nowNs);
             const int64_t off = opt->errorCode == 0 ? opt->baseOffset : -1;
             if (produceResponseFn_) {
                 produceResponseFn_(opt->correlationId, off, opt->errorCode);  // test-harness hook
@@ -916,6 +918,7 @@ Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
     session::SessionConfig scfg = cfg_.session;
     scfg.correlationIdBase =
         static_cast<int64_t>(sessions_.size()) * kSessionCorrIdStride;
+    scfg.keepaliveCorrelationId = -(static_cast<int64_t>(sessions_.size()) + 1);   // A10: Pong routing
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
     Session& s = *sessions_.back();
     s.machine.connect(std::chrono::duration_cast<std::chrono::nanoseconds>(

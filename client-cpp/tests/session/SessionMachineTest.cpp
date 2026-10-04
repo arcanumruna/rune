@@ -2302,11 +2302,12 @@ TEST(SessionMachineRegression, BackoffAlternatesBootstrapAndLastKnownLeader) {
 }
 
 // A10 (2026-10-04) regression: the keepalive is a Ping the broker ANSWERS (Pong),
-// so an otherwise idle session still proves liveness; correlationId 0 never
-// matches an application ping (those start at 1).
+// so an otherwise idle session still proves liveness; its correlationId is the
+// configured per-session tag (<= 0: never an application ping's id, those start at 1).
 TEST(SessionLivenessRegression, KeepaliveIsAnAnsweredPing) {
     FakeIo io;
     auto cfg = testConfig();
+    cfg.keepaliveCorrelationId = -3;   // the agent's per-session Pong routing tag
     sm::SessionMachine m(io, cfg);
     m.connect(T0);
     m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 42LL, m.correlationId(), T0);
@@ -2319,7 +2320,7 @@ TEST(SessionLivenessRegression, KeepaliveIsAnAnsweredPing) {
     const auto ping = cc::decodePing(f.data.data(), f.data.size());
     ASSERT_TRUE(ping.has_value());
     EXPECT_EQ(ping->sessionId, 42LL);
-    EXPECT_EQ(ping->correlationId, 0LL);
+    EXPECT_EQ(ping->correlationId, -3LL);
 }
 
 // A10: a stall of the client ITSELF (no tick for longer than responseTimeoutNs —

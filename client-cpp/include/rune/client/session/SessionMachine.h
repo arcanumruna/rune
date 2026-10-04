@@ -91,6 +91,10 @@ struct SessionConfig {
     int64_t connectTimeoutNs    = 5'000'000'000LL;   // 5 s  — give up one connect attempt
     int64_t keepaliveIntervalNs = 1'000'000'000LL;   // 1 s  — send keepalive this often
     int64_t responseTimeoutNs   = 10'000'000'000LL;  // 10 s — stale session threshold
+    /// A10: correlationId of this session's keepalive Ping.  The agent gives each session its own negative
+    /// value so the Pong is credited to exactly the session it answers (broker session ids are per node and
+    /// collide across nodes; application pings use ids >= 1).
+    int64_t keepaliveCorrelationId = 0;
 
     // DR-BUG-2 FIX: fast-retry cadence for ConnectRequest when the ingress
     // publication was not-connected or back-pressured at send time.  The
@@ -171,6 +175,7 @@ public:
     // ------------------------------------------------------------------------
     [[nodiscard]] SessionState state()         const noexcept { return state_; }
     [[nodiscard]] int64_t      sessionId()     const noexcept { return sessionId_; }
+    [[nodiscard]] int64_t      keepaliveCorrelationId() const noexcept { return cfg_.keepaliveCorrelationId; }
     [[nodiscard]] int64_t      correlationId() const noexcept { return correlationId_; }
     [[nodiscard]] int           redirectCount() const noexcept { return redirectCount_; }
     /// T15a R1: latched on the first ConnectResponse{OK}.
@@ -700,12 +705,12 @@ private:
 
             // A10: the keepalive is a Ping — the broker touches the session AND
             // answers with a Pong, so even an idle session proves liveness inside
-            // responseTimeoutNs.  correlationId 0: never an application ping's id
-            // (those start at 1).
+            // responseTimeoutNs.  Its correlationId (<= 0, per session) is never an
+            // application ping's id (those start at 1) and routes the Pong back.
             const std::size_t n = rune::client::codec::encodePing(
                 scratch_.data(), kScratchCap, std::string_view{},
                 sessionId_,
-                /*correlationId=*/0);
+                cfg_.keepaliveCorrelationId);
             if (n > 0) {
                 io_.sendFrame(scratch_.data(), n);
             }

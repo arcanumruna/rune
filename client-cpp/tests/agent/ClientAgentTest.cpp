@@ -281,9 +281,9 @@ struct Gateway {
         case rcc::TemplateId::Ping: {
             auto opt = rcc::decodePing(buf, len);
             if (!opt) return;
-            // A10: the session keepalive is a Ping with correlationId 0; an
+            // A10: the session keepalive is a Ping with its correlationId <= 0; an
             // application ping carries its own (>= 1) correlationId.
-            if (opt->correlationId == 0) keepalivesSeen.fetch_add(1, std::memory_order_relaxed);
+            if (opt->correlationId <= 0) keepalivesSeen.fetch_add(1, std::memory_order_relaxed);
             else pingSeen.fetch_add(1, std::memory_order_relaxed);
             // Reply with Pong{echo}.
             std::size_t n = rcc::encodePong(

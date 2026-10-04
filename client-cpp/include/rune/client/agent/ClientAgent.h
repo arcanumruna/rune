@@ -762,14 +762,6 @@ private:
     /// the previous single-session member for both agent-internal doWork and the
     /// Client-level redirect/dispatch paths.  Agent-thread only.
     Session&       seedSession()       noexcept { return *sessions_.front(); }
-    /// The session whose broker-assigned id is `sid` (0 = none yet), or null.  Short
-    /// linear scan (N <= cluster size), agent thread only.
-    Session* sessionById_(int64_t sid) noexcept {
-        if (sid == 0) return nullptr;
-        for (auto& s : sessions_)
-            if (s->machine.sessionId() == sid) return s.get();
-        return nullptr;
-    }
     const Session& seedSession() const noexcept { return *sessions_.front(); }
 
     // ---- Task 1.4: partition routing table (agent-owned plain data) ----------
