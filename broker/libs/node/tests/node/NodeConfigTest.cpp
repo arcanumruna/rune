@@ -2506,6 +2506,18 @@ TEST(NodeConfig, ControlPlaneIdleParksWithoutYieldsInShardModeRegression) {
         EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(cap)).config.has_value()) << bad;
     }
 
+    // D2 round-2 review R2-Md-1: a park cap near the election cadence would delay an idle leader's heartbeats
+    // into endless leadership churn — refuse anything above a quarter of RUNE_ELECTION_STATUS_INTERVAL_MS.
+    auto churn = rune::node::base1node();                       // default status interval 20 ms -> cap <= 5000 us
+    churn["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "5000";
+    EXPECT_TRUE(rune::node::parseNodeConfig(rune::node::fakeEnv(churn)).config.has_value());
+    churn["RUNE_CONTROL_IDLE_MAX_PARK_US"] = "100000";
+    auto rc = rune::node::parseNodeConfig(rune::node::fakeEnv(churn));
+    EXPECT_FALSE(rc.config.has_value()) << "100 ms park vs 20 ms election status interval must be refused";
+    EXPECT_NE(rc.error.find("RUNE_ELECTION_STATUS_INTERVAL_MS"), std::string::npos) << rc.error;
+    churn["RUNE_ELECTION_STATUS_INTERVAL_MS"] = "500";           // a slower cadence admits the larger cap
+    EXPECT_TRUE(rune::node::parseNodeConfig(rune::node::fakeEnv(churn)).config.has_value());
+
     auto strat = rune::node::base1node();
     strat["RUNE_AERON_DRIVER_IDLE"] = "sleep-ns";
     EXPECT_EQ(parse(strat).effectiveDriverIdleArgs(), "") << "an explicit strategy keeps Aeron's own args";

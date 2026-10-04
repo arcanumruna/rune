@@ -1184,6 +1184,19 @@ ConfigResult parseNodeConfig(
                             raw + "'"};
         cfg.controlIdleMaxParkUs = v;
     }
+    {   // D2 round-2 review R2-Md-1: the park cap must stay well inside the election cadence, or an idle leader's
+        // heartbeats slip into endless leadership churn.  Limit = 1/4 of the election status interval: an explicit
+        // larger cap is refused; the default is clamped (so lowering only the interval never refuses a default).
+        const int64_t limitUs = std::max<int64_t>(1, cfg.electionStatusIntervalMs * 1000 / 4);
+        if (cfg.controlIdleMaxParkUs > limitUs) {
+            const char* raw = getenv_fn("RUNE_CONTROL_IDLE_MAX_PARK_US");
+            if (raw && *raw)
+                return {{}, "RUNE_CONTROL_IDLE_MAX_PARK_US=" + std::string(raw) + " us exceeds 1/4 of "
+                            "RUNE_ELECTION_STATUS_INTERVAL_MS (" + std::to_string(cfg.electionStatusIntervalMs) +
+                            " ms -> max " + std::to_string(limitUs) + " us): heartbeats would miss the election cadence"};
+            cfg.controlIdleMaxParkUs = limitUs;
+        }
+    }
 
     // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
     // Follower periodic-fetch backstop cadence.  Lower = faster acks=all
