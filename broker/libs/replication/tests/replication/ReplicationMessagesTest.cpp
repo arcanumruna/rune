@@ -738,3 +738,74 @@ TEST(OffsetsForLeaderEpoch, RequestEncodeAtNonZeroOffset) {
     EXPECT_EQ(m.followerLeo,    99LL);
     EXPECT_EQ(m.topicId,        5);
 }
+
+// ============================================================================
+// D9 — cross-node transaction markers (templates 11 / 12).
+// ============================================================================
+
+// WriteTxnMarker round-trip at the maximum marker length; the marker bytes are a
+// zero-copy view into the frame.
+TEST(D9TxnMarkerWireRegression, WriteTxnMarkerRoundTripAtMaxMarkerLength) {
+    std::array<uint8_t, WriteTxnMarkerMsg::kMaxMarkerBytes> marker{};
+    for (std::size_t i = 0; i < marker.size(); ++i) marker[i] = static_cast<uint8_t>(0xA0 + i);
+    WriteTxnMarkerMsg m{};
+    m.coordinatorNodeId = 2; m.coordinatorEpoch = 7; m.token = 0x0102030405060708LL;
+    m.topicId = 5; m.partition = 3; m.producerId = 4242; m.commit = 1;
+    m.marker = std::span<const uint8_t>(marker);
+    std::array<uint8_t, WriteTxnMarkerMsg::kMaxSize> buf{};
+    const std::size_t n = m.encode(buf.data(), buf.size());
+    ASSERT_EQ(n, WriteTxnMarkerMsg::kFixedSize + marker.size());
+    EXPECT_EQ(n, WriteTxnMarkerMsg::kMaxSize);
+    EXPECT_EQ(peekTemplateId(buf.data()), WriteTxnMarkerMsg::TEMPLATE_ID);
+    WriteTxnMarkerMsg d{};
+    ASSERT_TRUE(WriteTxnMarkerMsg::decode(buf.data(), n, d));
+    EXPECT_EQ(d.coordinatorNodeId, 2); EXPECT_EQ(d.coordinatorEpoch, 7);
+    EXPECT_EQ(d.token, 0x0102030405060708LL); EXPECT_EQ(d.topicId, 5); EXPECT_EQ(d.partition, 3);
+    EXPECT_EQ(d.producerId, 4242); EXPECT_EQ(d.commit, 1);
+    ASSERT_EQ(d.marker.size(), marker.size());
+    EXPECT_EQ(std::memcmp(d.marker.data(), marker.data(), marker.size()), 0);
+    EXPECT_EQ(d.marker.data(), buf.data() + WriteTxnMarkerMsg::kFixedSize) << "zero-copy view";
+}
+
+TEST(D9TxnMarkerWireRegression, WriteTxnMarkerRejectsOversizeTruncatedAndForeignFrames) {
+    std::array<uint8_t, WriteTxnMarkerMsg::kMaxMarkerBytes + 1> big{};
+    WriteTxnMarkerMsg m{};
+    m.marker = std::span<const uint8_t>(big);
+    std::array<uint8_t, WriteTxnMarkerMsg::kMaxSize + 16> buf{};
+    EXPECT_EQ(m.encode(buf.data(), buf.size()), 0u) << "a marker above the max length is not encoded";
+
+    const std::array<uint8_t, 61> marker{};
+    m.marker = std::span<const uint8_t>(marker);
+    EXPECT_EQ(m.encode(buf.data(), WriteTxnMarkerMsg::kFixedSize + marker.size() - 1), 0u) << "cap too small";
+    const std::size_t n = m.encode(buf.data(), buf.size());
+    ASSERT_EQ(n, WriteTxnMarkerMsg::kFixedSize + marker.size());
+    WriteTxnMarkerMsg d{};
+    EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), n - 1, d)) << "truncated marker bytes";
+    EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), WriteTxnMarkerMsg::kFixedSize - 1, d)) << "truncated block";
+    EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), 4, d)) << "truncated header";
+    // A forged length above the max is refused even when the bytes are there.
+    detail::write_le<uint32_t>(buf.data() + WriteTxnMarkerMsg::kFixedSize - 4, WriteTxnMarkerMsg::kMaxMarkerBytes + 1);
+    EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), buf.size(), d)) << "forged marker length";
+    detail::write_le<uint32_t>(buf.data() + WriteTxnMarkerMsg::kFixedSize - 4, static_cast<uint32_t>(marker.size()));
+    ASSERT_TRUE(WriteTxnMarkerMsg::decode(buf.data(), n, d));
+    stampTemplateId(buf.data(), 0, WriteTxnMarkerResponseMsg::TEMPLATE_ID);
+    EXPECT_FALSE(WriteTxnMarkerMsg::decode(buf.data(), n, d)) << "another template id";
+}
+
+TEST(D9TxnMarkerWireRegression, WriteTxnMarkerResponseRoundTripAndTruncation) {
+    WriteTxnMarkerResponseMsg r{};
+    r.token = -77; r.topicId = 9; r.partition = 1; r.producerId = 31337; r.coordinatorEpoch = 4;
+    r.errorCode = 6; r.offset = 123456789012LL;
+    std::array<uint8_t, WriteTxnMarkerResponseMsg::TOTAL_SIZE> buf{};
+    ASSERT_EQ(r.encode(buf.data(), buf.size()), WriteTxnMarkerResponseMsg::TOTAL_SIZE);
+    EXPECT_EQ(r.encode(buf.data(), buf.size() - 1), 0u);
+    EXPECT_EQ(peekTemplateId(buf.data()), WriteTxnMarkerResponseMsg::TEMPLATE_ID);
+    WriteTxnMarkerResponseMsg d{};
+    ASSERT_TRUE(WriteTxnMarkerResponseMsg::decode(buf.data(), buf.size(), d));
+    EXPECT_EQ(d.token, -77); EXPECT_EQ(d.topicId, 9); EXPECT_EQ(d.partition, 1);
+    EXPECT_EQ(d.producerId, 31337); EXPECT_EQ(d.coordinatorEpoch, 4); EXPECT_EQ(d.errorCode, 6);
+    EXPECT_EQ(d.offset, 123456789012LL);
+    EXPECT_FALSE(WriteTxnMarkerResponseMsg::decode(buf.data(), buf.size() - 1, d)) << "truncated";
+    stampTemplateId(buf.data(), 0, WriteTxnMarkerMsg::TEMPLATE_ID);
+    EXPECT_FALSE(WriteTxnMarkerResponseMsg::decode(buf.data(), buf.size(), d)) << "another template id";
+}

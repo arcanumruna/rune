@@ -75,6 +75,8 @@ enum class ReplicationTemplateId : uint16_t {
     AlterIsrResponse         = 8,   // controller → partition leader
     InternalIsr              = 9,   // internal-partition leader → replicas
     InternalIsrAck           = 10,  // replica → internal-partition leader
+    WriteTxnMarker           = 11,  // D9: txn coordinator → partition leader (hand-rolled)
+    WriteTxnMarkerResponse   = 12,  // D9: partition leader → txn coordinator (hand-rolled)
 };
 
 // DR-BUG-6: reconcile-pull template ids.  The reconcile request/response reuse
@@ -606,6 +608,138 @@ struct InternalIsrAckMsg {
         m.followerId  = dec.followerId();
         m.leaderEpoch = dec.leaderEpoch();
         m.version     = dec.version();
+        return true;
+    }
+};
+
+// ===========================================================================
+// D9 — cross-node transaction markers (templates 11 / 12).
+//
+// The transaction coordinator writes a COMMIT/ABORT control marker to a
+// partition led by ANOTHER node by sending it WriteTxnMarker over this cluster
+// plane; the partition leader appends it on the owning worker (same op-ring
+// path as a local marker) and answers WriteTxnMarkerResponse (Kafka
+// WriteTxnMarkers, one partition per request).  Hand-rolled fixed blocks (like
+// PlaneHello) — cold control traffic, little-endian, no allocation; the
+// marker bytes are a zero-copy view into the frame on decode.
+//
+// WriteTxnMarker (template 11), fixed block 40 bytes + marker bytes:
+//   coordinatorNodeId : int32 @ +0
+//   coordinatorEpoch  : int32 @ +4
+//   token             : int64 @ +8    coordinator-side marker token (echoed back)
+//   topicId           : int32 @ +16
+//   partition         : int32 @ +20
+//   producerId        : int64 @ +24
+//   commit            : uint8 @ +32   (+33..35 pad)
+//   markerLen         : uint32 @ +36  (<= kMaxMarkerBytes)
+//   marker            : markerLen bytes @ +40 (the encoded control batch)
+// ===========================================================================
+struct WriteTxnMarkerMsg {
+    static constexpr uint16_t    TEMPLATE_ID     = 11;
+    static constexpr uint16_t    BLOCK_LENGTH    = 40;
+    static constexpr std::size_t kFixedSize      = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+    static constexpr std::size_t kMaxMarkerBytes = 128;
+    static constexpr std::size_t kMaxSize        = kFixedSize + kMaxMarkerBytes;
+
+    int32_t coordinatorNodeId = -1;
+    int32_t coordinatorEpoch  = -1;
+    int64_t token             = 0;
+    int32_t topicId           = 0;
+    int32_t partition         = 0;
+    int64_t producerId        = -1;
+    uint8_t commit            = 0;
+    std::span<const uint8_t> marker{};   ///< encode: source; decode: view into the frame
+
+    /// Bytes written, or 0 (marker above kMaxMarkerBytes / cap too small).
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (marker.size() > kMaxMarkerBytes) return 0;
+        const std::size_t total = kFixedSize + marker.size();
+        if (cap < total) return 0;
+        ReplicationMessageHeader::encode(buf, 0, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        detail::write_le<int32_t>(p + 0,  coordinatorNodeId);
+        detail::write_le<int32_t>(p + 4,  coordinatorEpoch);
+        detail::write_le<int64_t>(p + 8,  token);
+        detail::write_le<int32_t>(p + 16, topicId);
+        detail::write_le<int32_t>(p + 20, partition);
+        detail::write_le<int64_t>(p + 24, producerId);
+        p[32] = commit; p[33] = 0; p[34] = 0; p[35] = 0;
+        detail::write_le<uint32_t>(p + 36, static_cast<uint32_t>(marker.size()));
+        if (!marker.empty()) std::memcpy(p + BLOCK_LENGTH, marker.data(), marker.size());
+        return total;
+    }
+    /// False on a truncated frame, a foreign template id or a marker length
+    /// above kMaxMarkerBytes / beyond the frame.
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, WriteTxnMarkerMsg& m) noexcept {
+        if (len < kFixedSize) return false;
+        const auto h = ReplicationMessageHeader::decode(buf, 0);
+        if (h.templateId != TEMPLATE_ID || h.blockLength < BLOCK_LENGTH) return false;
+        const uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        const uint32_t markerLen = detail::read_le<uint32_t>(p + 36);
+        if (markerLen > kMaxMarkerBytes) return false;
+        const std::size_t start = ReplicationMessageHeader::ENCODED_SIZE + h.blockLength;
+        if (len < start || len - start < markerLen) return false;
+        m.coordinatorNodeId = detail::read_le<int32_t>(p + 0);
+        m.coordinatorEpoch  = detail::read_le<int32_t>(p + 4);
+        m.token             = detail::read_le<int64_t>(p + 8);
+        m.topicId           = detail::read_le<int32_t>(p + 16);
+        m.partition         = detail::read_le<int32_t>(p + 20);
+        m.producerId        = detail::read_le<int64_t>(p + 24);
+        m.commit            = p[32];
+        m.marker            = std::span<const uint8_t>(buf + start, markerLen);
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// WriteTxnMarkerResponse (template 12), fixed block 40 bytes:
+//   token            : int64 @ +0    the coordinator's token (from the request)
+//   topicId          : int32 @ +8
+//   partition        : int32 @ +12
+//   producerId       : int64 @ +16
+//   coordinatorEpoch : int32 @ +24
+//   errorCode        : int16 @ +28   client ErrorCode (0 = landed)  (+30..31 pad)
+//   offset           : int64 @ +32   where the marker landed (-1 when refused)
+// ---------------------------------------------------------------------------
+struct WriteTxnMarkerResponseMsg {
+    static constexpr uint16_t    TEMPLATE_ID  = 12;
+    static constexpr uint16_t    BLOCK_LENGTH = 40;
+    static constexpr std::size_t TOTAL_SIZE   = ReplicationMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    int64_t token            = 0;
+    int32_t topicId          = 0;
+    int32_t partition        = 0;
+    int64_t producerId       = -1;
+    int32_t coordinatorEpoch = -1;
+    int16_t errorCode        = 0;
+    int64_t offset           = -1;
+
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        ReplicationMessageHeader::encode(buf, 0, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        detail::write_le<int64_t>(p + 0,  token);
+        detail::write_le<int32_t>(p + 8,  topicId);
+        detail::write_le<int32_t>(p + 12, partition);
+        detail::write_le<int64_t>(p + 16, producerId);
+        detail::write_le<int32_t>(p + 24, coordinatorEpoch);
+        detail::write_le<int16_t>(p + 28, errorCode);
+        detail::write_le<int16_t>(p + 30, 0);
+        detail::write_le<int64_t>(p + 32, offset);
+        return TOTAL_SIZE;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, WriteTxnMarkerResponseMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        const auto h = ReplicationMessageHeader::decode(buf, 0);
+        if (h.templateId != TEMPLATE_ID || h.blockLength < BLOCK_LENGTH) return false;
+        const uint8_t* p = buf + ReplicationMessageHeader::ENCODED_SIZE;
+        m.token            = detail::read_le<int64_t>(p + 0);
+        m.topicId          = detail::read_le<int32_t>(p + 8);
+        m.partition        = detail::read_le<int32_t>(p + 12);
+        m.producerId       = detail::read_le<int64_t>(p + 16);
+        m.coordinatorEpoch = detail::read_le<int32_t>(p + 24);
+        m.errorCode        = detail::read_le<int16_t>(p + 28);
+        m.offset           = detail::read_le<int64_t>(p + 32);
         return true;
     }
 };
