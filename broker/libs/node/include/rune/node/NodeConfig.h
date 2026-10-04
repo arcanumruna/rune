@@ -277,7 +277,10 @@ struct NodeConfig {
     // (worker→control→net→control→worker …); 200µs cuts that 5x without pegging a
     // core (backoff still sleeps → consensus heartbeats are not starved, unlike
     // busyspin which triggers re-elections on shared cores).
+    // D2 review R2-L2: in shard mode this no longer drives the runtime / admin / node-driver threads — their park
+    // cap is RUNE_CONTROL_IDLE_MAX_PARK_US (controlIdleShape); it still caps the shard workers' backoff / wake park.
     int64_t idleMaxParkUs = 200;
+    bool    idleMaxParkUsExplicit = false;   ///< RUNE_IDLE_MAX_PARK_US was set (shard mode warns: R2-L2)
 
     // D2 round 2 — control-plane idle (shard mode).  The node driver thread, the runtime thread (thread
     // placement) and the admin thread carry almost no traffic in shard mode, yet Aeron's backoff (10 spins,
@@ -729,6 +732,11 @@ struct NodeConfig {
     /// RUNE_AERON_DRIVER_IDLE_ARGS: Aeron idle-strategy init args for the node driver (backoff:
     /// "spins-yields-minPark-maxPark", durations in ns or with a ns/us/ms/s suffix).  Empty = derived.
     std::string driverIdleArgs;
+    /// D2 review R2-L3: Aeron builds yield / spin / noop without init args (only backoff and sleep-ns /
+    /// sleeping take them).
+    [[nodiscard]] static bool driverIdleTakesArgs(std::string_view strategy) noexcept {
+        return strategy == "backoff" || strategy == "sleep-ns" || strategy == "sleeping";
+    }
     /// The node driver's idle args: RUNE_AERON_DRIVER_IDLE_ARGS if set; else, for the DERIVED shard-mode
     /// backoff, the control-plane shape with one spin pass ("1-0-<minParkNs>-<maxParkNs>"); else empty
     /// (Aeron's own: AERON_*_IDLE_STRATEGY_INIT_ARGS or its built-in defaults).

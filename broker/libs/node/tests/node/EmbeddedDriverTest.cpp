@@ -251,6 +251,36 @@ TEST(EmbeddedDriverRegression, MalformedIdleStrategyRefusesStartRegression) {
     EXPECT_THROW(EmbeddedDriver(dedicated, DriverMode::Threaded), std::runtime_error);
 }
 
+// D2 review R2-L1: with no explicit args the setter builds the strategy from the context's args — initialised from
+// AERON_*_IDLE_STRATEGY_INIT_ARGS — so validation must use THOSE (it used NULL args and passed).  Refusal is clean
+// (no double free: Aeron resets the state before init and the name is still NULL at the first set) and must name
+// the args Aeron really used.
+TEST(EmbeddedDriverRegression, EnvIdleArgsMismatchRefusesCleanlyRegression) {
+    struct EnvGuard {
+        std::string name; std::string old; bool had;
+        EnvGuard(const char* n, const char* v) : name(n), had(std::getenv(n) != nullptr) {
+            if (had) old = std::getenv(n);
+            ::setenv(n, v, 1);
+        }
+        ~EnvGuard() { if (had) ::setenv(name.c_str(), old.c_str(), 1); else ::unsetenv(name.c_str()); }
+    };
+    for (const char* var : {"AERON_SHARED_IDLE_STRATEGY_INIT_ARGS", "AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS"}) {
+        EnvGuard env(var, "1-0-100us-2ms");   // valid for backoff, not for sleep-ns
+        TmpDir d;
+        auto c = cfgAt(d.path);
+        c.idleStrategy = "sleep-ns";
+        if (std::string(var).find("CONDUCTOR") != std::string::npos)
+            c.threadingMode = NodeConfig::AeronThreadingMode::Dedicated;
+        try {
+            EmbeddedDriver drv(c, DriverMode::Threaded);
+            ADD_FAILURE() << var << ": a strategy Aeron cannot build was accepted";
+        } catch (const std::runtime_error& e) {
+            // The refusal names the args Aeron actually used (the env's), not "".
+            EXPECT_NE(std::string(e.what()).find("1-0-100us-2ms"), std::string::npos) << e.what();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A7 park-until-work (findings §4.12): an invoker driver exposes its transport pollers' epoll fds; a
 // shard worker parked on them wakes on the next datagram instead of sleeping out its park period.

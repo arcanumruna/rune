@@ -984,3 +984,54 @@ TEST(HostDefaults, EffectiveConfigNamesTheControlPlaneIdleRegression) {
         << hd.summary;
     EXPECT_NE(hd.summary.find("derived={"), std::string::npos) << "line not truncated: " << hd.summary;
 }
+
+// D2 review R2-L3 / R2-L4: Aeron's yield / spin / noop idle strategies take no init args — RUNE_AERON_DRIVER_IDLE_ARGS
+// with one of them is ignored by Aeron: say so, and do not print args that do not apply on the effective-config line.
+TEST(HostDefaults, DriverIdleArgsWithArglessStrategyWarnRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    c.driverIdleStrategy = "yield";
+    c.driverIdleArgs     = "1-0-1us-1ms";
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.warnings.find("RUNE_AERON_DRIVER_IDLE_ARGS"), std::string::npos) << hd.warnings;
+    EXPECT_NE(hd.summary.find("drvIdle=yield "), std::string::npos) << hd.summary;
+    NodeConfig b = threeNodeDefault(0);
+    b.driverIdleStrategy = "backoff";
+    b.driverIdleArgs     = "1-0-1us-1ms";
+    const auto hb = applyHostDerivedDefaults(b, k3sFacts());
+    EXPECT_EQ(hb.warnings.find("RUNE_AERON_DRIVER_IDLE_ARGS"), std::string::npos) << hb.warnings;
+    EXPECT_NE(hb.summary.find("drvIdle=backoff{1-0-1us-1ms} "), std::string::npos) << hb.summary;
+}
+
+// D2 review R2-L2: in shard mode RUNE_IDLE_MAX_PARK_US no longer drives the runtime / admin / node-driver threads
+// (RUNE_CONTROL_IDLE_MAX_PARK_US does) — an operator who set it explicitly is told.
+TEST(HostDefaults, IdleMaxParkUsInShardModeWarnsRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    ASSERT_TRUE(c.shardMode());
+    c.idleMaxParkUs         = 50;
+    c.idleMaxParkUsExplicit = true;
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.warnings.find("RUNE_CONTROL_IDLE_MAX_PARK_US"), std::string::npos) << hd.warnings;
+    NodeConfig d = threeNodeDefault(0);   // not set explicitly: silent
+    const auto hn = applyHostDerivedDefaults(d, k3sFacts());
+    EXPECT_EQ(hn.warnings.find("RUNE_IDLE_MAX_PARK_US"), std::string::npos) << hn.warnings;
+}
+
+TEST(NodeConfigEnv, IdleMaxParkUsMarksExplicitRegression) {
+    const auto parse = [](const char* park) {
+        std::map<std::string, std::string> env = {
+            {"RUNE_NODE_ID", "0"}, {"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220"},
+            {"RUNE_CLIENT_ENDPOINT", "127.0.0.1:40200"}, {"RUNE_DATA_DIR", "/tmp/hd"}};
+        if (park != nullptr) env["RUNE_IDLE_MAX_PARK_US"] = park;
+        return parseNodeConfig([env](const char* k) -> const char* {
+            auto it = env.find(k);
+            return it == env.end() ? nullptr : it->second.c_str();
+        });
+    };
+    const auto r = parse("75");
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->idleMaxParkUs, 75);
+    EXPECT_TRUE(r.config->idleMaxParkUsExplicit);
+    const auto d = parse(nullptr);
+    ASSERT_TRUE(d.config.has_value()) << d.error;
+    EXPECT_FALSE(d.config->idleMaxParkUsExplicit);
+}

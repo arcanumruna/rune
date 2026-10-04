@@ -1268,7 +1268,7 @@ ConfigResult parseNodeConfig(
         if (imp && !std::string_view(imp).empty()) {
             char* end = nullptr;
             long long us = std::strtoll(imp, &end, 10);
-            if (end != imp && us > 0) cfg.idleMaxParkUs = us;
+            if (end != imp && us > 0) { cfg.idleMaxParkUs = us; cfg.idleMaxParkUsExplicit = true; }
         }
     }
 
