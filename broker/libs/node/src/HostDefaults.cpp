@@ -259,6 +259,16 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
                                  "hot path; findings §4 measured 73-79k vs 100-105k rec/s): set "
                                  "RUNE_AERON_DIR to a /dev/shm path");
 
+    // D2 review R2-L3: args Aeron ignores; R2-L2: a park cap that does not reach the control plane in shard mode.
+    if (!cfg.driverIdleArgs.empty() && !NodeConfig::driverIdleTakesArgs(cfg.effectiveDriverIdleStrategy()))
+        appendWarn(out.warnings, "RUNE_AERON_DRIVER_IDLE_ARGS=" + cfg.driverIdleArgs + " is ignored: Aeron's '" +
+                                 std::string(cfg.effectiveDriverIdleStrategy()) + "' idle strategy takes no args");
+    // Fused placement: the runtime and the node driver ride worker 0's pass, so the knob still caps them (review Md-2).
+    if (cfg.shardMode() && !cfg.fused() && cfg.idleMaxParkUsExplicit)
+        appendWarn(out.warnings, "RUNE_IDLE_MAX_PARK_US=" + std::to_string(cfg.idleMaxParkUs) +
+                                 " caps only the shard workers' park in thread placement — the runtime, admin and "
+                                 "node-driver threads use RUNE_CONTROL_IDLE_MAX_PARK_US");
+
     const int32_t W = cfg.workerCount >= 1 ? cfg.workerCount : 1;
 
     // Shard mode: the per-worker planes it implies + derived base ports.
@@ -433,10 +443,19 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         }
     }
     // D2 round 2: the node driver's idle + its Aeron args, and the control-plane (runtime / admin) park shape.
-    std::string drvIdle(cfg.effectiveDriverIdleStrategy());
-    if (const std::string a = cfg.effectiveDriverIdleArgs(); !a.empty()) drvIdle += "{" + a + "}";
+    // Review Md-3: fused placement pumps the node driver as an invoker inside worker 0's pass (no idle loop) and runs
+    // no runtime thread; a busy-spin runtime thread spins.
+    const bool fusedShard = cfg.shardMode() && cfg.fused();
+    std::string drvIdle(fusedShard ? std::string_view("invoker") : cfg.effectiveDriverIdleStrategy());
+    // R2-L4: args only where the strategy takes them.
+    if (const std::string a = cfg.effectiveDriverIdleArgs();
+        !fusedShard && !a.empty() && NodeConfig::driverIdleTakesArgs(cfg.effectiveDriverIdleStrategy()))
+        drvIdle += "{" + a + "}";
     const auto rt = cfg.runtimeIdleShape();
-    const std::string ctlIdle = std::to_string(rt.spins) + "-" + std::to_string(rt.yields) + "-" +
+    const std::string ctlIdle =
+        fusedShard ? std::string("worker0")
+        : cfg.runtimeIdleStrategy == NodeConfig::WorkerIdleStrategy::BusySpin ? std::string("busyspin")
+        : std::to_string(rt.spins) + "-" + std::to_string(rt.yields) + "-" +
                                 std::to_string(rt.minParkNs / 1000) + "us-" + std::to_string(rt.maxParkNs / 1000) + "us";
     char line[1536];
     std::snprintf(line, sizeof line,

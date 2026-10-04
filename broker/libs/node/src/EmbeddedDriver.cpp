@@ -134,10 +134,16 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     // Validated on a scratch state first: a failing context setter would leave freed pointers for
     // aeron_driver_context_close to free again.
     const char* idleArgs = cfg_.idleStrategyArgs.empty() ? nullptr : cfg_.idleStrategyArgs.c_str();
-    bool idleOk = mode_ == DriverMode::Invoker || aeronIdleStrategyLoads(idle, idleArgs);
-    const auto setIdle = [&](auto setArgs, auto setStrategy) {
+    bool idleOk = true;
+    std::string usedArgs = cfg_.idleStrategyArgs;   // the args Aeron builds the strategy from (for the refusal text)
+    // D2 R2-L1: validate each role with the args ITS setter will use — explicit args, else the context's own
+    // (initialised from AERON_<ROLE>_IDLE_STRATEGY_INIT_ARGS).
+    const auto setIdle = [&](auto setArgs, auto getArgs, auto setStrategy) {
         if (!idleOk) return;
-        if (idleArgs != nullptr) idleOk = setArgs(ctx_, idleArgs) == 0;
+        const char* effective = idleArgs != nullptr ? idleArgs : getArgs(ctx_);
+        if (idleArgs == nullptr && effective != nullptr) usedArgs = effective;
+        idleOk = aeronIdleStrategyLoads(idle, effective);
+        if (idleOk && idleArgs != nullptr) idleOk = setArgs(ctx_, idleArgs) == 0;
         idleOk = idleOk && setStrategy(ctx_, idle) == 0;
     };
     if (mode_ == DriverMode::Invoker) {
@@ -147,19 +153,23 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_INVOKER);
     } else if (cfg_.threadingMode == NodeConfig::AeronThreadingMode::Dedicated) {
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_DEDICATED);
-        setIdle(aeron_driver_context_set_conductor_idle_strategy_init_args, aeron_driver_context_set_conductor_idle_strategy);
-        setIdle(aeron_driver_context_set_sender_idle_strategy_init_args, aeron_driver_context_set_sender_idle_strategy);
-        setIdle(aeron_driver_context_set_receiver_idle_strategy_init_args, aeron_driver_context_set_receiver_idle_strategy);
+        setIdle(aeron_driver_context_set_conductor_idle_strategy_init_args,
+                aeron_driver_context_get_conductor_idle_strategy_init_args, aeron_driver_context_set_conductor_idle_strategy);
+        setIdle(aeron_driver_context_set_sender_idle_strategy_init_args,
+                aeron_driver_context_get_sender_idle_strategy_init_args, aeron_driver_context_set_sender_idle_strategy);
+        setIdle(aeron_driver_context_set_receiver_idle_strategy_init_args,
+                aeron_driver_context_get_receiver_idle_strategy_init_args, aeron_driver_context_set_receiver_idle_strategy);
     } else {
         aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_SHARED);
-        setIdle(aeron_driver_context_set_shared_idle_strategy_init_args, aeron_driver_context_set_shared_idle_strategy);
+        setIdle(aeron_driver_context_set_shared_idle_strategy_init_args,
+                aeron_driver_context_get_shared_idle_strategy_init_args, aeron_driver_context_set_shared_idle_strategy);
     }
     if (!idleOk) {
         const std::string why = aeron_errmsg();
         aeron_driver_context_close(ctx_);
         ctx_ = nullptr;
         throw std::runtime_error("EmbeddedDriver: driver idle strategy '" + cfg_.idleStrategy + "' with args '" +
-                                 cfg_.idleStrategyArgs + "' refused by Aeron (RUNE_AERON_DRIVER_IDLE / "
+                                 usedArgs + "' refused by Aeron (RUNE_AERON_DRIVER_IDLE / "
                                  "RUNE_AERON_DRIVER_IDLE_ARGS): " + why);
     }
     if (cfg_.clientLivenessTimeoutNs > 0)
