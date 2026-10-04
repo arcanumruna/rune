@@ -95,6 +95,9 @@ struct WorkerOp {
         // to the owning worker (they touch the replica's log/state).
         OffsetsForLeaderEpochResp = 15, ///< transport → worker: follower applies a KIP-101 answer
         ReconcileFetchReq         = 16, ///< transport → worker: survivor serves a reconcile pull
+        // MEDIUM-2: the controller's AlterIsr answer for a USER partition leader
+        // (roleEpoch = leaderEpoch, rolePartitionEpoch, replicatedPayload.errorCode).
+        AlterIsrResponse          = 18, ///< transport → worker: PartitionReplica::onAlterIsrResponse
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -254,6 +257,10 @@ struct WorkerOp {
     // Leader node for BecomeFollower (-1 = no leader / NO_LEADER).
     rune::replication::NodeId roleLeaderId = -1;
 
+    // BecomeLeader / AlterIsrResponse: the committed assignment's partitionEpoch
+    // (AlterIsr compare-and-set, MEDIUM-1); -1 = not controller-managed.
+    int32_t rolePartitionEpoch = -1;
+
     // -----------------------------------------------------------------------
     // ApplyReplicated-specific fields
     // -----------------------------------------------------------------------
@@ -300,6 +307,7 @@ struct WorkerOp {
         int32_t                        maxBytes     = 0;
         int32_t                        topicId      = 0;
         int32_t                        lastFetchedEpoch = -1;   ///< KIP-320/595 (-1 = none)
+        int64_t                        incarnation  = 0;        ///< KIP-903 follower process incarnation
         int64_t                        nowNs        = 0;
         /// F27 R1: the follower's connection generation at the transport (0 =
         /// not tracked).  On the SBE ring it rides in `ownershipGen` (a SetOwnership

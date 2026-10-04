@@ -931,6 +931,8 @@ public:
            .frMaxBytes(op.fetchRequestPayload.maxBytes)
            .frNowNs(op.fetchRequestPayload.nowNs)
            .frLastFetchedEpoch(op.fetchRequestPayload.lastFetchedEpoch)
+           .frIncarnation(op.fetchRequestPayload.incarnation)
+           .rolePartitionEpoch(op.rolePartitionEpoch)
            .oleCurrentEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.currentEpoch))
            .oleFollowerId(static_cast<std::int32_t>(op.offsEpochReqPayload.followerId))
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
@@ -1927,6 +1929,18 @@ private:
         case WorkerOp::Type::ReconcileFetchReq:
             executeReconcileFetchReqWire_(op);
             break;
+        // MEDIUM-2: the controller's AlterIsr answer (cold).
+        case WorkerOp::Type::AlterIsrResponse:
+            if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica())) {
+                rune::replication::AlterIsrResponseMsg r{};
+                r.topicId        = op.topicId();
+                r.partition      = op.partition();
+                r.leaderEpoch    = static_cast<rune::replication::Epoch>(op.roleEpoch());
+                r.partitionEpoch = op.rolePartitionEpoch();
+                r.errorCode      = op.replErrorCode();
+                rep->onAlterIsrResponse(r);
+            }
+            break;
         // Task #13: AppendControlRecord — worker appends txn control marker
         case WorkerOp::Type::AppendControlRecord:
             executeAppendControlRecordWire_(op);
@@ -2689,7 +2703,7 @@ private:
             static_cast<rune::replication::Epoch>(op.roleEpoch());
 
         try {
-            replica->becomeLeader(epoch, std::move(isr));
+            replica->becomeLeader(epoch, std::move(isr), op.rolePartitionEpoch());
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeLeader threw for topicId={} partition={}: {}",
                          workerId_, topicId, partition, ex.what());
@@ -2790,6 +2804,7 @@ private:
         req.maxBytes    = op.frMaxBytes();
         req.topicId     = op.topicId();
         req.lastFetchedEpoch = op.frLastFetchedEpoch();
+        req.incarnation      = op.frIncarnation();
 
         try {
             replica->onFetchRequest(req, op.frNowNs(),
@@ -3763,6 +3778,7 @@ private:
         case WorkerOp::Type::ReconcileFetchResp:
         case WorkerOp::Type::OffsetsForLeaderEpochResp:
         case WorkerOp::Type::ReconcileFetchReq:
+        case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::Subscribe:
             return true;

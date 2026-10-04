@@ -54,8 +54,8 @@ TEST(ReplicationMessages, FetchResponseTemplateId) {
 }
 
 TEST(ReplicationMessages, FetchRequestBlockLength) {
-    // v3: 2×int64 + 5×int32 = 16 + 20 = 36 (lastFetchedEpoch added; v2 was 32)
-    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 36u);
+    // v3: 3×int64 + 5×int32 = 24 + 20 = 44 (lastFetchedEpoch + KIP-903 incarnation; v2 was 32)
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 44u);
     EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH_V2, 32u);
 }
 
@@ -70,8 +70,8 @@ TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
 TEST(ReplicationMessages, FetchRequestTotalSize) {
     EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE,
               ReplicationMessageHeader::ENCODED_SIZE + FetchRequestMsg::BLOCK_LENGTH);
-    // v3: 8 (header) + 36 (block) = 44; a v2 frame (40) is still decodable.
-    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 44u);
+    // v3: 8 (header) + 44 (block) = 52; a v2 frame (40) is still decodable.
+    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 52u);
     EXPECT_EQ(FetchRequestMsg::MIN_SIZE, 40u);
 }
 
@@ -79,7 +79,7 @@ TEST(ReplicationMessages, FetchRequestTotalSize) {
 // a v2 frame (32-byte block) decodes as lastFetchedEpoch = -1 (no validation).
 TEST(ReplicationMessages, FetchRequestLastFetchedEpochV3RoundTripAndV2Absent) {
     uint8_t buf[64]{};
-    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 77, 1 << 20, 9, /*lastFetchedEpoch=*/3), 44u);
+    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 77, 1 << 20, 9, /*lastFetchedEpoch=*/3), 52u);
     FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
     EXPECT_EQ(m.fetchOffset, 77);
     EXPECT_EQ(m.topicId, 9);
@@ -123,8 +123,8 @@ TEST(ReplicationMessages, AlterIsrRoundTrip) {
     AlterIsrMsg a{};
     a.topicId = 3; a.partition = 2; a.leaderId = 1; a.leaderEpoch = 9; a.isrCount = 2;
     a.isr[0] = 1; a.isr[1] = 3;
-    a.baseIsrCount = 3; a.baseIsr[0] = 1; a.baseIsr[1] = 2; a.baseIsr[2] = 3;
-    EXPECT_EQ(AlterIsrMsg::TOTAL_SIZE, 8u + 156u);
+    a.partitionEpoch = 17;
+    EXPECT_EQ(AlterIsrMsg::TOTAL_SIZE, 8u + 92u);
     uint8_t buf[AlterIsrMsg::TOTAL_SIZE]{};
     ASSERT_EQ(a.encode(buf, sizeof buf), AlterIsrMsg::TOTAL_SIZE);
     EXPECT_EQ(peekTemplateId(buf), AlterIsrMsg::TEMPLATE_ID);
@@ -132,7 +132,48 @@ TEST(ReplicationMessages, AlterIsrRoundTrip) {
     ASSERT_TRUE(AlterIsrMsg::decode(buf, sizeof buf, b));
     EXPECT_EQ(b.topicId, 3); EXPECT_EQ(b.partition, 2); EXPECT_EQ(b.leaderId, 1);
     EXPECT_EQ(b.leaderEpoch, 9); EXPECT_EQ(b.isrCount, 2); EXPECT_EQ(b.isr[1], 3);
-    EXPECT_EQ(b.baseIsrCount, 3); EXPECT_EQ(b.baseIsr[1], 2); EXPECT_EQ(b.baseIsr[2], 3);
+    EXPECT_EQ(b.partitionEpoch, 17);
+}
+
+// AlterIsrResponse / InternalIsr / InternalIsrAck (templates 8-10) round-trips.
+TEST(ReplicationMessages, AlterIsrResponseAndInternalIsrRoundTrip) {
+    AlterIsrResponseMsg r{};
+    r.topicId = 3; r.partition = 2; r.leaderId = 1; r.leaderEpoch = 9; r.partitionEpoch = 12;
+    r.errorCode = kAlterIsrIneligibleReplica;
+    uint8_t rb[AlterIsrResponseMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(r.encode(rb, sizeof rb), AlterIsrResponseMsg::TOTAL_SIZE);
+    EXPECT_EQ(peekTemplateId(rb), AlterIsrResponseMsg::TEMPLATE_ID);
+    AlterIsrResponseMsg r2{};
+    ASSERT_TRUE(AlterIsrResponseMsg::decode(rb, sizeof rb, r2));
+    EXPECT_EQ(r2.leaderEpoch, 9); EXPECT_EQ(r2.partitionEpoch, 12);
+    EXPECT_EQ(r2.errorCode, kAlterIsrIneligibleReplica);
+
+    InternalIsrMsg i{};
+    i.topicId = -3; i.partition = 0; i.leaderId = 2; i.leaderEpoch = 7; i.version = 41;
+    i.isrCount = 2; i.isr[0] = 2; i.isr[1] = 3;
+    uint8_t ib[InternalIsrMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(i.encode(ib, sizeof ib), InternalIsrMsg::TOTAL_SIZE);
+    InternalIsrMsg i2{};
+    ASSERT_TRUE(InternalIsrMsg::decode(ib, sizeof ib, i2));
+    EXPECT_EQ(i2.topicId, -3); EXPECT_EQ(i2.version, 41); EXPECT_EQ(i2.isrCount, 2); EXPECT_EQ(i2.isr[1], 3);
+
+    InternalIsrAckMsg k{};
+    k.topicId = -3; k.partition = 0; k.followerId = 3; k.leaderEpoch = 7; k.version = 41;
+    uint8_t kb[InternalIsrAckMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(k.encode(kb, sizeof kb), InternalIsrAckMsg::TOTAL_SIZE);
+    InternalIsrAckMsg k2{};
+    ASSERT_TRUE(InternalIsrAckMsg::decode(kb, sizeof kb, k2));
+    EXPECT_EQ(k2.followerId, 3); EXPECT_EQ(k2.version, 41); EXPECT_EQ(k2.leaderEpoch, 7);
+}
+
+// KIP-903: the FetchRequest carries the follower's process incarnation.
+TEST(ReplicationMessages, FetchRequestCarriesIncarnation) {
+    uint8_t buf[FetchRequestMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 99, 1024, 7, 3, 0x1234567890LL),
+              FetchRequestMsg::TOTAL_SIZE);
+    const auto m = FetchRequestMsg::decode(buf, 0);
+    EXPECT_EQ(m.lastFetchedEpoch, 3);
+    EXPECT_EQ(m.incarnation, 0x1234567890LL);
 }
 
 TEST(ReplicationMessages, HeaderEncodedSize) {

@@ -41,6 +41,9 @@
 #include <rune_protocol_replication_sbe/FetchRequest.h>
 #include <rune_protocol_replication_sbe/FetchResponse.h>
 #include <rune_protocol_replication_sbe/AlterIsr.h>
+#include <rune_protocol_replication_sbe/AlterIsrResponse.h>
+#include <rune_protocol_replication_sbe/InternalIsr.h>
+#include <rune_protocol_replication_sbe/InternalIsrAck.h>
 
 namespace rune::replication {
 
@@ -68,6 +71,10 @@ enum class ReplicationTemplateId : uint16_t {
     OffsetsForLeaderEpochResp= 4,   // DR-BUG-6: KIP-101 epoch-boundary answer
     ReconcileFetchReq        = 5,   // DR-BUG-6: deficient-leader reverse pull (req)
     ReconcileFetchResp       = 6,   // DR-BUG-6: deficient-leader reverse pull (resp)
+    AlterIsr                 = 7,   // partition leader → controller (Kafka AlterPartition)
+    AlterIsrResponse         = 8,   // controller → partition leader
+    InternalIsr              = 9,   // internal-partition leader → replicas
+    InternalIsrAck           = 10,  // replica → internal-partition leader
 };
 
 // DR-BUG-6: reconcile-pull template ids.  The reconcile request/response reuse
@@ -163,7 +170,8 @@ inline void stampTemplateId(uint8_t* buf, std::size_t offset,
 //   (b) Report its own logEndOffset (= fetchOffset) so the leader can
 //       compute the high-watermark.
 //
-// Wire layout (fixed block, 36 bytes):  [v2: DR-BUG-5 topicId; v3: lastFetchedEpoch @ +32]
+// Wire layout (fixed block, 44 bytes):  [v2: DR-BUG-5 topicId; v3: lastFetchedEpoch @ +32,
+//                                        incarnation @ +36 (KIP-903)]
 //   leaderEpoch   : Epoch       (int64)  @ +0   leader epoch the follower expects
 //   partition     : PartitionId (int32)  @ +8
 //   followerId    : NodeId      (int32)  @ +12
@@ -184,9 +192,14 @@ struct FetchRequestMsg {
     /// (fetchOffset, lastFetchedEpoch) against its own epoch lineage on EVERY
     /// fetch and answers DivergingEpoch when it is not on it.
     int32_t     lastFetchedEpoch = -1;
+    /// v3 (KIP-903): the follower's PROCESS incarnation (monotonic per node,
+    /// bumped on every start; 0 = unknown / not tracked).  A leader ignores a
+    /// fetch from an incarnation older than one it already saw from that
+    /// follower (a frame of a dead process).
+    int64_t     incarnation = 0;
 
     static constexpr uint16_t TEMPLATE_ID  = 1;
-    static constexpr uint16_t BLOCK_LENGTH = 36; // 2×int64 + 5×int32 (v3)
+    static constexpr uint16_t BLOCK_LENGTH = 44; // 3×int64 + 5×int32 (v3)
     static_assert(BLOCK_LENGTH == rsbe::FetchRequest::sbeBlockLength());
     static constexpr uint16_t BLOCK_LENGTH_V2 = 32;
     static constexpr std::size_t TOTAL_SIZE =
@@ -203,7 +216,8 @@ struct FetchRequestMsg {
                               Offset      fetchOffset_,
                               int32_t     maxBytes_,
                               int32_t     topicId_ = 0,
-                              int32_t     lastFetchedEpoch_ = -1) noexcept
+                              int32_t     lastFetchedEpoch_ = -1,
+                              int64_t     incarnation_ = 0) noexcept
     {
         std::size_t pos = offset;
         pos += ReplicationMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
@@ -215,6 +229,7 @@ struct FetchRequestMsg {
         detail::write_le<int32_t>(p + 24, maxBytes_);
         detail::write_le<int32_t>(p + 28, topicId_);
         detail::write_le<int32_t>(p + 32, lastFetchedEpoch_);
+        detail::write_le<int64_t>(p + 36, incarnation_);
         return TOTAL_SIZE;
     }
 
@@ -233,8 +248,9 @@ struct FetchRequestMsg {
         m.fetchOffset  = detail::read_le<int64_t>(p + 16);
         m.maxBytes     = detail::read_le<int32_t>(p + 24);
         m.topicId      = detail::read_le<int32_t>(p + 28);
-        m.lastFetchedEpoch = blockLen >= BLOCK_LENGTH ? detail::read_le<int32_t>(p + 32)
-                                                      : kLastFetchedEpochV2Frame;
+        m.lastFetchedEpoch = blockLen >= 36 ? detail::read_le<int32_t>(p + 32)
+                                            : kLastFetchedEpochV2Frame;
+        m.incarnation = blockLen >= BLOCK_LENGTH ? detail::read_le<int64_t>(p + 36) : 0;
         return m;
     }
 };
@@ -403,21 +419,20 @@ struct ErrorPayloadBuf {
 // ---------------------------------------------------------------------------
 // AlterIsr (template 7, v3) — Kafka AlterPartition: the partition leader
 // proposes an ISR change to the controller, which commits it to the metadata
-// log only while `baseIsr` (the committed ISR the proposal was derived from)
-// is still the committed ISR — compare-and-set, the analog of Kafka's
-// partitionEpoch check.  Fixed 156-byte block (generated SBE codec).
+// log only while `partitionEpoch` (the epoch of the committed assignment the
+// proposal was derived from) is still the committed partitionEpoch —
+// compare-and-set on a monotonic version (no ABA).  Generated SBE codec.
 // ---------------------------------------------------------------------------
 struct AlterIsrMsg {
     static constexpr uint16_t TEMPLATE_ID = 7;
     static constexpr int kMaxIsr = 16;
-    int32_t topicId     = 0;
-    int32_t partition   = 0;
-    NodeId  leaderId    = -1;
-    Epoch   leaderEpoch = -1;
-    int32_t isrCount    = 0;
+    int32_t topicId        = 0;
+    int32_t partition      = 0;
+    NodeId  leaderId       = -1;
+    Epoch   leaderEpoch    = -1;
+    int32_t isrCount       = 0;
     std::array<int32_t, kMaxIsr> isr{};
-    int32_t baseIsrCount = 0;
-    std::array<int32_t, kMaxIsr> baseIsr{};
+    int32_t partitionEpoch = -1;
 
     static constexpr std::size_t TOTAL_SIZE =
         rsbe::MessageHeader::encodedLength() + rsbe::AlterIsr::sbeBlockLength();
@@ -427,11 +442,9 @@ struct AlterIsrMsg {
         rsbe::AlterIsr enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), 0, cap);
         enc.topicId(topicId).partition(partition).leaderId(leaderId)
-           .leaderEpoch(leaderEpoch).isrCount(isrCount).baseIsrCount(baseIsrCount);
-        for (int i = 0; i < kMaxIsr; ++i) {
+           .leaderEpoch(leaderEpoch).isrCount(isrCount).partitionEpoch(partitionEpoch);
+        for (int i = 0; i < kMaxIsr; ++i)
             enc.isr(static_cast<std::uint64_t>(i), isr[static_cast<std::size_t>(i)]);
-            enc.baseIsr(static_cast<std::uint64_t>(i), baseIsr[static_cast<std::size_t>(i)]);
-        }
         return TOTAL_SIZE;
     }
     [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, AlterIsrMsg& m) noexcept {
@@ -442,18 +455,157 @@ struct AlterIsrMsg {
         if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < rsbe::AlterIsr::sbeBlockLength()) return false;
         rsbe::AlterIsr dec;
         dec.wrapForDecode(b, rsbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), len);
+        m.topicId        = dec.topicId();
+        m.partition      = dec.partition();
+        m.leaderId       = dec.leaderId();
+        m.leaderEpoch    = dec.leaderEpoch();
+        m.isrCount       = dec.isrCount();
+        m.partitionEpoch = dec.partitionEpoch();
+        if (m.isrCount < 0 || m.isrCount > kMaxIsr) return false;
+        for (int i = 0; i < kMaxIsr; ++i)
+            m.isr[static_cast<std::size_t>(i)] = dec.isr(static_cast<std::uint64_t>(i));
+        return true;
+    }
+};
+
+// AlterIsrResponse error codes (Kafka AlterPartition errors).
+inline constexpr int16_t kAlterIsrOk                   = 0;  ///< committed / already committed at partitionEpoch
+inline constexpr int16_t kAlterIsrIneligibleReplica    = 1;  ///< every added replica is fenced (KIP-841): nothing to commit
+inline constexpr int16_t kAlterIsrFencedLeaderEpoch    = 2;  ///< not the current leader / leader epoch
+inline constexpr int16_t kAlterIsrInvalidUpdateVersion = 3;  ///< partitionEpoch is not the committed one
+inline constexpr int16_t kAlterIsrInvalidRequest       = 4;  ///< malformed (leader missing, non-replica)
+
+// ---------------------------------------------------------------------------
+// AlterIsrResponse (template 8, v3) — Kafka AlterPartitionResponse.  The leader
+// clears its pending proposal only on a commit (the applied assignment) or on
+// an explicit reject here; a transient refusal (another change in flight)
+// gets no answer and the proposal is re-sent.
+// ---------------------------------------------------------------------------
+struct AlterIsrResponseMsg {
+    static constexpr uint16_t TEMPLATE_ID = 8;
+    int32_t topicId        = 0;
+    int32_t partition      = 0;
+    NodeId  leaderId       = -1;
+    Epoch   leaderEpoch    = -1;
+    int32_t partitionEpoch = -1;   ///< the controller's committed partitionEpoch
+    int16_t errorCode      = kAlterIsrOk;
+
+    static constexpr std::size_t TOTAL_SIZE =
+        rsbe::MessageHeader::encodedLength() + rsbe::AlterIsrResponse::sbeBlockLength();
+
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        rsbe::AlterIsrResponse enc;
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), 0, cap);
+        enc.topicId(topicId).partition(partition).leaderId(leaderId)
+           .leaderEpoch(leaderEpoch).partitionEpoch(partitionEpoch).errorCode(errorCode);
+        return TOTAL_SIZE;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, AlterIsrResponseMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        char* b = reinterpret_cast<char*>(const_cast<uint8_t*>(buf));
+        rsbe::MessageHeader mh;
+        mh.wrap(b, 0, 0, len);
+        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < rsbe::AlterIsrResponse::sbeBlockLength()) return false;
+        rsbe::AlterIsrResponse dec;
+        dec.wrapForDecode(b, rsbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), len);
+        m.topicId        = dec.topicId();
+        m.partition      = dec.partition();
+        m.leaderId       = dec.leaderId();
+        m.leaderEpoch    = dec.leaderEpoch();
+        m.partitionEpoch = dec.partitionEpoch();
+        m.errorCode      = dec.errorCode();
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// InternalIsr (template 9, v3) — the ISR of an INTERNAL partition (led by the
+// consensus leader), published by its leader to every replica.  Each replica
+// persists the newest (leaderEpoch, version) it sees (InternalIsrKnowledge)
+// and acks it; the change commits once a majority of the cluster persisted it.
+// ---------------------------------------------------------------------------
+struct InternalIsrMsg {
+    static constexpr uint16_t TEMPLATE_ID = 9;
+    static constexpr int kMaxIsr = 16;
+    int32_t topicId     = 0;
+    int32_t partition   = 0;
+    NodeId  leaderId    = -1;
+    Epoch   leaderEpoch = -1;
+    int64_t version     = 0;
+    int32_t isrCount    = 0;
+    std::array<int32_t, kMaxIsr> isr{};
+
+    static constexpr std::size_t TOTAL_SIZE =
+        rsbe::MessageHeader::encodedLength() + rsbe::InternalIsr::sbeBlockLength();
+
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        rsbe::InternalIsr enc;
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), 0, cap);
+        enc.topicId(topicId).partition(partition).leaderId(leaderId)
+           .leaderEpoch(leaderEpoch).version(version).isrCount(isrCount);
+        for (int i = 0; i < kMaxIsr; ++i)
+            enc.isr(static_cast<std::uint64_t>(i), isr[static_cast<std::size_t>(i)]);
+        return TOTAL_SIZE;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, InternalIsrMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        char* b = reinterpret_cast<char*>(const_cast<uint8_t*>(buf));
+        rsbe::MessageHeader mh;
+        mh.wrap(b, 0, 0, len);
+        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < rsbe::InternalIsr::sbeBlockLength()) return false;
+        rsbe::InternalIsr dec;
+        dec.wrapForDecode(b, rsbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), len);
         m.topicId     = dec.topicId();
         m.partition   = dec.partition();
         m.leaderId    = dec.leaderId();
         m.leaderEpoch = dec.leaderEpoch();
+        m.version     = dec.version();
         m.isrCount    = dec.isrCount();
-        m.baseIsrCount = dec.baseIsrCount();
         if (m.isrCount < 0 || m.isrCount > kMaxIsr) return false;
-        if (m.baseIsrCount < 0 || m.baseIsrCount > kMaxIsr) return false;
-        for (int i = 0; i < kMaxIsr; ++i) {
-            m.isr[static_cast<std::size_t>(i)]     = dec.isr(static_cast<std::uint64_t>(i));
-            m.baseIsr[static_cast<std::size_t>(i)] = dec.baseIsr(static_cast<std::uint64_t>(i));
-        }
+        for (int i = 0; i < kMaxIsr; ++i)
+            m.isr[static_cast<std::size_t>(i)] = dec.isr(static_cast<std::uint64_t>(i));
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// InternalIsrAck (template 10, v3) — "I durably hold InternalIsr (leaderEpoch,
+// version) or newer."
+// ---------------------------------------------------------------------------
+struct InternalIsrAckMsg {
+    static constexpr uint16_t TEMPLATE_ID = 10;
+    int32_t topicId     = 0;
+    int32_t partition   = 0;
+    NodeId  followerId  = -1;
+    Epoch   leaderEpoch = -1;
+    int64_t version     = 0;
+
+    static constexpr std::size_t TOTAL_SIZE =
+        rsbe::MessageHeader::encodedLength() + rsbe::InternalIsrAck::sbeBlockLength();
+
+    std::size_t encode(uint8_t* buf, std::size_t cap) const noexcept {
+        if (cap < TOTAL_SIZE) return 0;
+        rsbe::InternalIsrAck enc;
+        enc.wrapAndApplyHeader(reinterpret_cast<char*>(buf), 0, cap);
+        enc.topicId(topicId).partition(partition).followerId(followerId)
+           .leaderEpoch(leaderEpoch).version(version);
+        return TOTAL_SIZE;
+    }
+    [[nodiscard]] static bool decode(const uint8_t* buf, std::size_t len, InternalIsrAckMsg& m) noexcept {
+        if (len < TOTAL_SIZE) return false;
+        char* b = reinterpret_cast<char*>(const_cast<uint8_t*>(buf));
+        rsbe::MessageHeader mh;
+        mh.wrap(b, 0, 0, len);
+        if (mh.templateId() != TEMPLATE_ID || mh.blockLength() < rsbe::InternalIsrAck::sbeBlockLength()) return false;
+        rsbe::InternalIsrAck dec;
+        dec.wrapForDecode(b, rsbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(), len);
+        m.topicId     = dec.topicId();
+        m.partition   = dec.partition();
+        m.followerId  = dec.followerId();
+        m.leaderEpoch = dec.leaderEpoch();
+        m.version     = dec.version();
         return true;
     }
 };

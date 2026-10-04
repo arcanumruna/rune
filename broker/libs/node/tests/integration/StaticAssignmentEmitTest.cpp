@@ -624,8 +624,7 @@ TEST(AlterIsrControllerRegression, ControllerCommitsOnlyValidProposalsFromTheCur
     m.topicId = 0; m.partition = 0; m.leaderId = leader; m.leaderEpoch = le;
     m.isrCount = 2;
     m.isr[0] = leader; m.isr[1] = (leader == 1) ? 2 : 1;
-    m.baseIsrCount = 3;                          // derived from the committed {1,2,3}
-    for (int i = 0; i < 3; ++i) m.baseIsr[static_cast<std::size_t>(i)] = pa->isr[static_cast<std::size_t>(i)];
+    m.partitionEpoch = pe;                       // derived from the committed {1,2,3}
     // Stale epoch / not the leader / leader missing from the ISR / non-replica: rejected.
     auto stale = m; stale.leaderEpoch = le - 1;
     EXPECT_FALSE(svc1.onAlterIsr(stale));
@@ -649,14 +648,20 @@ TEST(AlterIsrControllerRegression, ControllerCommitsOnlyValidProposalsFromTheCur
     EXPECT_FALSE(svc1.onAlterIsr(m)) << "already committed";
 
     // Compare-and-set (Kafka's partitionEpoch check): a proposal derived from an
-    // OLDER committed ISR (a stale / re-ordered AlterIsr — here one re-adding the
-    // member the committed shrink removed) is never committed; the same proposal
-    // derived from the current committed ISR is.
+    // OLDER committed assignment (a stale / re-ordered AlterIsr — here one
+    // re-adding the member the committed shrink removed) is never committed and
+    // is answered INVALID_UPDATE_VERSION; the same proposal derived from the
+    // current committed assignment is committed.
     const int32_t out = (m.isr[0] != 1 && m.isr[1] != 1) ? 1 : (m.isr[0] != 2 && m.isr[1] != 2) ? 2 : 3;
     auto readd = m; readd.isrCount = 3; readd.isr[2] = out;
-    auto staleBase = readd;                      // base = the old {1,2,3}
-    EXPECT_FALSE(svc1.onAlterIsr(staleBase)) << "committed a proposal derived from a stale ISR";
-    readd.baseIsrCount = 2; readd.baseIsr[0] = m.isr[0]; readd.baseIsr[1] = m.isr[1];
+    auto staleBase = readd;                      // partitionEpoch of the old {1,2,3}
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    EXPECT_FALSE(svc1.onAlterIsr(staleBase, &resp, &answered)) << "committed a proposal derived from a stale ISR";
+    EXPECT_TRUE(answered);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrInvalidUpdateVersion);
+    EXPECT_EQ(resp.partitionEpoch, pe + 1);
+    readd.partitionEpoch = pe + 1;
     EXPECT_TRUE(svc1.onAlterIsr(readd));
 }
 
@@ -706,4 +711,125 @@ TEST(AlterIsrControllerRegression, ControllerFencesDeadMembersOutOfTheCommittedI
     EXPECT_EQ(pa->leaderEpoch, le);
     EXPECT_EQ(pa->partitionEpoch, pe + 1);
     EXPECT_EQ(svc1.runDynamicRebalanceOnTick(live, nullptr), 0u) << "steady state must emit nothing";
+}
+
+// Review 2026-10-04 MEDIUM-1 (ABA): the AlterIsr compare-and-set compared ISR
+// SETS.  Committed {L,Y,X} → shrink to {L,Y}; the leader proposes P1 = add X
+// (base {L,Y}); Y is fenced ({L}) and re-admitted ({L,Y}); a LATE copy of P1
+// then matches the committed set again and committed X — which the HW had
+// stopped counting.  Kafka compares the monotonic partitionEpoch: never.
+TEST(AlterIsrControllerRegression, PartitionEpochCas_LateProposalNeverCommitsAfterAba) {
+    SaeTempDir dir1("aba1"), dir2("aba2"), dir3("aba3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(50);
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    ASSERT_EQ(pa->isr.size(), 3u);
+    const int32_t L = pa->leaderNode, le = pa->leaderEpoch;
+    const int32_t Y = (L == 1) ? 2 : 1;
+    const int32_t X = 6 - L - Y;
+    auto propose = [&](std::vector<int32_t> isr, const rune::metadata::PartitionAssignment& base) {
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = le;
+        m.isrCount = static_cast<int32_t>(isr.size());
+        for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+        m.partitionEpoch = base.partitionEpoch;
+        return m;
+    };
+    ASSERT_TRUE(svc1.onAlterIsr(propose({L, Y}, *pa)));          // shrink X
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_EQ(pa->isr.size(), 2u);
+    const auto p1 = propose({L, Y, X}, *pa);                       // P1: add X (base {L,Y})
+    ASSERT_TRUE(svc1.onAlterIsr(propose({L}, *pa)));              // Y fenced
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_EQ(pa->isr.size(), 1u);
+    ASSERT_TRUE(svc1.onAlterIsr(propose({L, Y}, *pa)));           // Y re-admitted
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_EQ(pa->isr.size(), 2u);
+    EXPECT_FALSE(svc1.onAlterIsr(p1)) << "a late proposal committed after an ISR ABA";
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    EXPECT_EQ(std::find(pa->isr.begin(), pa->isr.end(), X), pa->isr.end())
+        << "X entered the committed ISR off a stale proposal";
+}
+
+// Review 2026-10-04 MEDIUM-2 (KIP-841): the controller never ADDS a node it
+// considers dead (fenced) to a committed ISR — otherwise fencing and the
+// leader's re-admission alternate forever under an asymmetric partition (two
+// metadata records per partition per cycle).
+TEST(AlterIsrControllerRegression, ControllerNeverAddsAFencedReplica) {
+    SaeTempDir dir1("ine1"), dir2("ine2"), dir3("ine3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(50);
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    const int32_t L = pa->leaderNode, le = pa->leaderEpoch;
+    const int32_t dead = (L == 3) ? 2 : 3;
+    std::vector<rune::metadata::NodeId> live;
+    for (int32_t n : allNodes) if (n != dead) live.push_back(n);
+    ASSERT_GE(svc1.runDynamicRebalanceOnTick(live, nullptr), 1u);   // fences `dead`
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_EQ(std::find(pa->isr.begin(), pa->isr.end(), dead), pa->isr.end());
+    // The leader (which still sees `dead` fetching) proposes to re-add it.
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = le;
+    m.isrCount = static_cast<int32_t>(pa->isr.size()) + 1;
+    for (std::size_t i = 0; i < pa->isr.size(); ++i) m.isr[i] = pa->isr[i];
+    m.isr[pa->isr.size()] = dead;
+    m.partitionEpoch = pa->partitionEpoch;
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    EXPECT_FALSE(svc1.onAlterIsr(m, &resp, &answered)) << "the controller committed a fenced replica into the ISR";
+    EXPECT_TRUE(answered) << "an ineligible-only proposal must be answered (else it pins the leader)";
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrIneligibleReplica);
+    EXPECT_EQ(resp.partitionEpoch, pa->partitionEpoch);
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    EXPECT_EQ(std::find(pa->isr.begin(), pa->isr.end(), dead), pa->isr.end());
 }

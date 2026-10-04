@@ -337,7 +337,8 @@ private:
     void routeBecomeLeader_(
         rune::replication::PartitionReplica*          replica,
         rune::replication::Epoch                      epoch,
-        std::vector<rune::replication::NodeId>        isr) noexcept;
+        std::vector<rune::replication::NodeId>        isr,
+        int32_t                                       partitionEpoch = -1) noexcept;
     /// F15 §3.1: record the role just routed as the gateway's intended-role hint.
     void recordIntendedRole_(rune::replication::PartitionReplica* replica,
                              ReplicaRegistry::IntendedRole role) noexcept;
@@ -443,7 +444,7 @@ private:
             isr.push_back(static_cast<rune::replication::NodeId>(n));
         }
 
-        routeBecomeLeader_(replica, perPartEpoch, std::move(isr));
+        routeBecomeLeader_(replica, perPartEpoch, std::move(isr), pa->partitionEpoch);
     }
 
     void applyBecomeFollowerForKey(

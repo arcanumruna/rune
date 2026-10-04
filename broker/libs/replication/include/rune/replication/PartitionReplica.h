@@ -356,7 +356,10 @@ public:
     /// change: the controller committed a new ISR, e.g. our AlterIsr) only
     /// applies that committed ISR and resets nothing else (follower slots, push
     /// state, HW floors, the epoch cache).
-    void becomeLeader(Epoch newEpoch, std::vector<NodeId> isr);
+    /// `partitionEpoch` = the committed assignment's partition epoch (the
+    /// AlterIsr compare-and-set version, MEDIUM-1); -1 = not controller-managed
+    /// (internal partitions, unit rigs).
+    void becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch = -1);
 
     /// Transition to Follower with the given leader epoch.  A same-epoch
     /// re-assert of the same leader while already Follower is a no-op.
@@ -374,6 +377,16 @@ public:
     /// Cold; called on the control thread for INTERNAL partitions (whose ISR is
     /// leader-local); user partitions are fenced by the controller.
     void shrinkIsrToLive(std::span<const int32_t> live, int64_t nowNs);
+    /// Kafka AlterPartitionResponse (MEDIUM-2): the controller's explicit answer
+    /// to our AlterIsr.  A reject (INELIGIBLE_REPLICA / FENCED_LEADER_EPOCH /
+    /// INVALID_UPDATE_VERSION / invalid) clears the pending proposal (the HW
+    /// then counts the committed ISR only); a commit resolves it through the
+    /// applied assignment (becomeLeader re-assert with a newer partitionEpoch).
+    /// After an INELIGIBLE reject, additions are not re-proposed for
+    /// kAlterIsrResendNs (shrinks are never held back).  Owner thread.
+    void onAlterIsrResponse(const AlterIsrResponseMsg& r);
+    /// Test view: the committed partitionEpoch this leader derives proposals from.
+    [[nodiscard]] int32_t committedPartitionEpochForTest() const noexcept { return committedPartitionEpoch_; }
     /// Test view: an AlterIsr proposal is in flight.
     [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending; }
     /// Test view: the maximal ISR the HW is computed over (committed ∪ proposed).
@@ -1171,8 +1184,15 @@ private:
         bool                pending = false;
         std::vector<NodeId> isr;          ///< proposed ISR (AlterIsr)
         int64_t             sentNs  = 0;
+        int32_t             basePartitionEpoch = -1;   ///< MEDIUM-1: the CAS version it was derived from
     };
     IsrProposal isrProposal_{};
+    /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
+    /// not controller-managed).  Set by every becomeLeader.
+    int32_t committedPartitionEpoch_ = -1;
+    /// MEDIUM-2: after an INELIGIBLE reject, no ISR addition is proposed before
+    /// this time (a fenced replica is not re-proposed every ISR check).
+    int64_t expandBackoffUntilNs_ = 0;
     PartitionTransport* isrChannel_ = nullptr;   ///< AlterIsr sink (null = self-managed ISR)
     static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
     std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload
@@ -1180,7 +1200,7 @@ private:
     [[nodiscard]] bool internalPartition_() const noexcept { return cfg_.topicId < 0; }
     [[nodiscard]] int  computeEffectiveMinIsr_(int rf) const noexcept;
     [[nodiscard]] bool committedIsrMeetsMinIsr_(bool acksAll) const noexcept;
-    void applyCommittedIsr_(std::vector<NodeId> isr);
+    void applyCommittedIsr_(std::vector<NodeId> isr, int32_t partitionEpoch);
     bool updateIsr_(int64_t nowNs);
     /// Commit (self-managed) or propose (controller-managed) `desired` (an ISR
     /// derived from committedIsr_).  Returns true when something changed / was sent.

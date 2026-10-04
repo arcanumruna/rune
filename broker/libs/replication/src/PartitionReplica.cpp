@@ -247,7 +247,7 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
 // Role transitions
 // ---------------------------------------------------------------------------
 
-void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
+void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch)
 {
     // Same-epoch re-assert (a partitionEpoch-only ISR change re-applies the
     // assignment with the SAME leaderEpoch): the controller COMMITTED a new ISR
@@ -258,7 +258,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     // record must never hand a leader an ISR without itself).
     if (std::find(isr.begin(), isr.end(), cfg_.selfId) == isr.end()) isr.push_back(cfg_.selfId);
     if (role_ == Role::Leader && newEpoch == epoch_ && isrManager_ != nullptr) {
-        applyCommittedIsr_(std::move(isr));
+        applyCommittedIsr_(std::move(isr), partitionEpoch);
         publishCleanerState();
         return;
     }
@@ -324,6 +324,8 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr)
     effectiveMinIsr_ = computeEffectiveMinIsr_(static_cast<int>(replicas.size()));
     committedIsr_    = isr;
     isrProposal_     = IsrProposal{};
+    committedPartitionEpoch_ = partitionEpoch;
+    expandBackoffUntilNs_    = 0;
 
     // Kafka makeLeader: the new epoch starts at our LEO; every batch we append
     // from now on carries it (Log restamp for the produce path; the replica's
@@ -1861,18 +1863,56 @@ bool sameMembers_(const std::vector<NodeId>& a, const std::vector<NodeId>& b) no
 }
 } // namespace
 
-void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr)
+void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr, int32_t partitionEpoch)
 {
-    // A committed CHANGE resolves the pending proposal: it was committed, or its
-    // base no longer matches and the controller will refuse every copy — the
-    // maximal ISR collapses to the new committed one and the next check
-    // re-derives.  A re-assert of the SAME members (a partitionEpoch-only bump
-    // for another reason) leaves the proposal committable: keep it pending.
+    // MEDIUM-1: the controller commits a proposal only while its base
+    // partitionEpoch is the committed one — so ANY committed assignment with a
+    // different partitionEpoch resolves the pending proposal (it was committed,
+    // or it can never commit any more): the maximal ISR collapses to the new
+    // committed one and the next check re-derives from it.
+    // Without a partitionEpoch (not controller-managed): a committed CHANGE of
+    // members resolves it; a same-members re-assert keeps it pending.
     const bool changed = !sameMembers_(isr, committedIsr_);
     committedIsr_ = std::move(isr);
-    if (changed || (isrProposal_.pending && sameMembers_(isrProposal_.isr, committedIsr_)))
+    if (partitionEpoch >= 0) {
+        if (isrProposal_.pending && partitionEpoch != isrProposal_.basePartitionEpoch)
+            isrProposal_.pending = false;
+        committedPartitionEpoch_ = partitionEpoch;
+    } else if (changed || (isrProposal_.pending && sameMembers_(isrProposal_.isr, committedIsr_))) {
         isrProposal_.pending = false;
+    }
     applyMaximalIsr_();
+}
+
+void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
+{
+    if (role_ != Role::Leader || isrManager_ == nullptr || !isrProposal_.pending) return;
+    if (r.leaderEpoch != epoch_) return;                         // an answer for another leadership
+    bool clear = false;
+    switch (r.errorCode) {
+        case kAlterIsrIneligibleReplica:
+            // Nothing committed: the controller dropped the fenced additions and
+            // the rest equals the committed ISR (answered for OUR base only).
+            clear = (r.partitionEpoch == isrProposal_.basePartitionEpoch);
+            if (clear) expandBackoffUntilNs_ = lastKnownNowNs_ + kAlterIsrResendNs;
+            break;
+        case kAlterIsrInvalidUpdateVersion:
+            // Our base is not the committed partitionEpoch: the proposal can never
+            // commit; the newer assignment (already applied, or on its way) is
+            // what the next proposal derives from.
+            clear = (r.partitionEpoch != isrProposal_.basePartitionEpoch);
+            break;
+        case kAlterIsrFencedLeaderEpoch:
+        case kAlterIsrInvalidRequest:
+            clear = true;
+            break;
+        default:   // kAlterIsrOk: resolved by the applied assignment
+            break;
+    }
+    if (!clear) return;
+    isrProposal_.pending = false;
+    applyMaximalIsr_();
+    publishCleanerState();
 }
 
 void PartitionReplica::applyMaximalIsr_()
@@ -1944,7 +1984,10 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
     // a replica admitted below it would be electable while missing committed
     // records.
     const Offset joinFloor = std::max(leaderState_.highWatermark(), electionLeo_);
-    (void)isrManager_->maybeExpandIsrIf(nowNs, joinFloor, [this](NodeId n) {
+    // MEDIUM-2: no addition right after the controller answered INELIGIBLE.
+    const bool mayExpand = nowNs >= expandBackoffUntilNs_;
+    (void)isrManager_->maybeExpandIsrIf(nowNs, joinFloor, [this, mayExpand](NodeId n) {
+        if (!mayExpand) return false;
         if (std::find(committedIsr_.begin(), committedIsr_.end(), n) != committedIsr_.end())
             return false;
         const FollowerSlot* sl = followerSlots_.find(n);
@@ -1973,6 +2016,7 @@ bool PartitionReplica::changeIsr_(const std::vector<NodeId>& desired, int64_t no
     // committed its removal (it is electable until then).
     isrProposal_.pending = true;
     isrProposal_.isr.assign(desired.begin(), desired.end());
+    isrProposal_.basePartitionEpoch = committedPartitionEpoch_;
     applyMaximalIsr_();
     sendIsrProposal_(nowNs);
     publishCleanerState();
@@ -1989,8 +2033,7 @@ void PartitionReplica::sendIsrProposal_(int64_t nowNs)
     m.leaderEpoch = epoch_;
     m.isrCount    = static_cast<int32_t>(std::min<std::size_t>(isrProposal_.isr.size(), AlterIsrMsg::kMaxIsr));
     for (int i = 0; i < m.isrCount; ++i) m.isr[static_cast<std::size_t>(i)] = isrProposal_.isr[static_cast<std::size_t>(i)];
-    m.baseIsrCount = static_cast<int32_t>(std::min<std::size_t>(committedIsr_.size(), AlterIsrMsg::kMaxIsr));
-    for (int i = 0; i < m.baseIsrCount; ++i) m.baseIsr[static_cast<std::size_t>(i)] = committedIsr_[static_cast<std::size_t>(i)];
+    m.partitionEpoch = isrProposal_.basePartitionEpoch;   // MEDIUM-1: compare-and-set version
     if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;   // re-sent on the next resend tick
 }
 

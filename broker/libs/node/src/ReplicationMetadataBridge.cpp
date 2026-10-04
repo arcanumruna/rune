@@ -33,7 +33,8 @@ namespace rune::node {
 void ReplicationMetadataBridge::routeBecomeLeader_(
     rune::replication::PartitionReplica*    replica,
     rune::replication::Epoch                epoch,
-    std::vector<rune::replication::NodeId>  isr) noexcept
+    std::vector<rune::replication::NodeId>  isr,
+    int32_t                                 partitionEpoch) noexcept
 {
     recordIntendedRole_(replica, ReplicaRegistry::IntendedRole::Leader);
     if (workerPool_ && replica->topicId() >= 0) {
@@ -44,13 +45,14 @@ void ReplicationMetadataBridge::routeBecomeLeader_(
         op.replica   = replica;
         op.roleEpoch = epoch;
         op.isr       = std::move(isr);
+        op.rolePartitionEpoch = partitionEpoch;   // MEDIUM-1: AlterIsr CAS version
         // Never dropped: retried every cycle until the owning ring accepts it.
         enqueueRoleOp_(std::move(op), /*fence=*/false);
     } else {
         // Internal partition (topicId < 0) or no worker pool: direct call.
         // Both the internal replica's doWork AND MetadataService/GCS/TCS run
         // on the control thread, so this is single-threaded — no race.
-        replica->becomeLeader(epoch, std::move(isr));
+        replica->becomeLeader(epoch, std::move(isr), partitionEpoch);
     }
 }
 

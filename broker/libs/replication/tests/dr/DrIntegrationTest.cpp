@@ -333,7 +333,7 @@ TEST(DrIntegrationRegression, LaggingReplicaShrunkFromControllerIsr_NeverElectab
     c.isolate(3);                                // 3 lags
     ASSERT_EQ(c.produceAcked(20), 20) << "commits once 3 is shrunk out (AlterIsr committed)";
     EXPECT_FALSE(c.controllerIsrContains(3)) << "the controller still elects from an ISR holding 3";
-    EXPECT_GE(c.alterIsrCommitted(), 1u);
+    EXPECT_GE(c.alterIsrCommitted() + c.fenceCommitted(), 1u);   // leader shrink or controller fencing
     c.run(20);
     EXPECT_FALSE(c.moveLeader(3)) << "a controlled move to a replica outside the committed ISR";
     c.healAll();
@@ -1309,4 +1309,29 @@ TEST(DrIntegrationRegression, Rev3Critical1_StaleFollowerLeoAcrossLeaderships_No
     c.restart(1);
     c.applyMetadata(1);
     expectAllConvergedAndAcked(c, "rev3 critical-1");
+}
+
+// Review 2026-10-04 MEDIUM-2 (KIP-841): an ASYMMETRIC partition — the
+// controller misses node 3's heartbeats (it fences node 3 out of the committed
+// ISR) while the leader keeps receiving node 3's fetches (it re-proposes node 3,
+// validated at the HW).  Without "never add a fenced replica" + an explicit
+// AlterIsr reject, fencing and re-admission alternate every cycle (two metadata
+// records per partition per cycle, unbounded metadata-log growth).
+TEST(DrIntegrationRegression, AsymmetricPartition_FencedReplicaNotReaddedNoFlapping) {
+    DrCluster c(3);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(10), 10);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.cut(3, kControllerAddr);                   // controller-side only: 3 still fetches
+    c.cut(kControllerAddr, 3);
+    c.run(300);
+    const uint64_t records = c.alterIsrCommitted() + c.fenceCommitted();
+    EXPECT_LE(records, 2u) << "fencing / re-admission flapped: " << c.alterIsrCommitted()
+                           << " AlterIsr commits + " << c.fenceCommitted() << " fences in 300 steps";
+    EXPECT_FALSE(c.controllerIsrContains(3)) << "a fenced replica sits in the committed ISR";
+    EXPECT_EQ(c.produceAcked(5), 5) << "acks=all stalled behind a pinned proposal";
+    c.healAll();
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap))
+        << "node 3 never re-admitted once the controller saw it again\n" << c.dump();
+    expectAllConvergedAndAcked(c, "asymmetric partition");
 }

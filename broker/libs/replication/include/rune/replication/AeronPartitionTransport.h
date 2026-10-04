@@ -274,12 +274,17 @@ public:
     /// control thread to the CURRENT controller (setControllerId); delivered
     /// locally when this node is the controller.
     bool sendAlterIsr(const AlterIsrMsg& msg) override;
+    /// CONTROL thread (controller side): answer an AlterIsr (to `toLeader`;
+    /// self = delivered locally).  Cold.
+    bool sendAlterIsrResponse(NodeId toLeader, const AlterIsrResponseMsg& msg);
 
     /// CONTROL thread: the current controller (consensus leader) node, -1 unknown.
     void setControllerId(int32_t id) noexcept { controllerId_ = id; }
     /// CONTROL thread: the controller-side AlterIsr handler (MetadataService),
     /// called on the control thread for every AlterIsr this node receives.
-    using AlterIsrHandler = void (*)(void* ctx, const AlterIsrMsg& msg);
+    /// Returns true when `resp` must be sent back to the proposing leader
+    /// (Kafka AlterPartitionResponse — MEDIUM-2).
+    using AlterIsrHandler = bool (*)(void* ctx, const AlterIsrMsg& msg, AlterIsrResponseMsg& resp);
     void setAlterIsrHandler(AlterIsrHandler fn, void* ctx) noexcept {
         alterIsrHandler_ = fn; alterIsrCtx_ = ctx;
     }

@@ -283,44 +283,81 @@ public:
     // Control thread (AeronPartitionTransport handler).  Returns true when a
     // record was enqueued.
     // -----------------------------------------------------------------------
-    bool onAlterIsr(const rune::replication::AlterIsrMsg& m) {
+    /// `resp` (optional) is filled when the controller ANSWERS (Kafka
+    /// AlterPartitionResponse, MEDIUM-2): an explicit reject, or "already the
+    /// committed state".  Returns true when a record was enqueued; `*answer`
+    /// tells the caller whether to send `resp` (a transient refusal — another
+    /// change for the partition in flight, not the controller — is not
+    /// answered: the leader re-sends).
+    bool onAlterIsr(const rune::replication::AlterIsrMsg& m,
+                    rune::replication::AlterIsrResponseMsg* resp = nullptr,
+                    bool* answer = nullptr) {
+        namespace rr = rune::replication;
+        if (answer) *answer = false;
+        auto reply = [&](int16_t code, int32_t partitionEpoch) {
+            if (resp == nullptr) return;
+            resp->topicId = m.topicId; resp->partition = m.partition;
+            resp->leaderId = m.leaderId; resp->leaderEpoch = m.leaderEpoch;
+            resp->partitionEpoch = partitionEpoch; resp->errorCode = code;
+            if (answer) *answer = true;
+        };
         if (!leaderReady_()) return false;
         if (m.topicId < 0 || m.isrCount <= 0) return false;
         const rune::metadata::PartitionAssignment* pa = msm_.assignment(m.topicId, m.partition);
         if (pa == nullptr) return false;
         if (pa->leaderNode != m.leaderId || pa->leaderEpoch != static_cast<int32_t>(m.leaderEpoch)) {
             ++alterIsrRejected_;
+            reply(rr::kAlterIsrFencedLeaderEpoch, pa->partitionEpoch);
             return false;   // stale leader / epoch: it will learn the new assignment
         }
-        // Compare-and-set (Kafka's partitionEpoch check): the proposal must have
-        // been derived from the CURRENT committed ISR — a stale / re-ordered
-        // proposal (e.g. re-adding a member a later change removed while the HW
-        // moved past it) is never committed.
-        {
-            bool sameBase = m.baseIsrCount == static_cast<int32_t>(pa->isr.size());
-            for (int i = 0; sameBase && i < m.baseIsrCount; ++i)
-                sameBase = std::find(pa->isr.begin(), pa->isr.end(),
-                                     m.baseIsr[static_cast<std::size_t>(i)]) != pa->isr.end();
-            if (!sameBase) { ++alterIsrRejected_; return false; }
+        // Compare-and-set on the monotonic partitionEpoch (Kafka; MEDIUM-1): the
+        // proposal must have been derived from the CURRENT committed assignment
+        // — a stale / re-ordered proposal is never committed, even when the
+        // committed ISR went A → B → A meanwhile (no ABA).
+        if (m.partitionEpoch != pa->partitionEpoch) {
+            ++alterIsrRejected_;
+            reply(rr::kAlterIsrInvalidUpdateVersion, pa->partitionEpoch);
+            return false;
         }
         std::vector<int32_t> isr;
         isr.reserve(static_cast<std::size_t>(m.isrCount));
-        bool hasLeader = false;
+        bool hasLeader = false, droppedIneligible = false;
         for (int i = 0; i < m.isrCount; ++i) {
             const int32_t n = m.isr[static_cast<std::size_t>(i)];
             if (std::find(pa->replicas.begin(), pa->replicas.end(), n) == pa->replicas.end()) {
                 ++alterIsrRejected_;
+                reply(rr::kAlterIsrInvalidRequest, pa->partitionEpoch);
                 return false;   // not a replica
             }
             if (n == m.leaderId) hasLeader = true;
+            // KIP-841 (MEDIUM-2): never ADD a replica this controller considers
+            // dead (fenced) — the fencing pass would remove it again next tick
+            // (flapping).  Members already committed are kept (a shrink of them
+            // is the leader's call).
+            const bool added = std::find(pa->isr.begin(), pa->isr.end(), n) == pa->isr.end();
+            if (added && n != m.leaderId && eligibleKnown_ &&
+                std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) {
+                droppedIneligible = true;
+                continue;
+            }
             isr.push_back(n);
         }
-        if (!hasLeader) { ++alterIsrRejected_; return false; }
-        {   // already committed (a re-send) — compared as a SET
+        if (!hasLeader) {
+            ++alterIsrRejected_;
+            reply(rr::kAlterIsrInvalidRequest, pa->partitionEpoch);
+            return false;
+        }
+        {   // nothing to commit: already the committed state (a re-send), or the
+            // only change was adding fenced replicas — compared as a SET
             bool same = isr.size() == pa->isr.size();
             for (int32_t n : isr)
                 same = same && std::find(pa->isr.begin(), pa->isr.end(), n) != pa->isr.end();
-            if (same) return false;
+            if (same) {
+                if (droppedIneligible) ++alterIsrRejected_;
+                reply(droppedIneligible ? rr::kAlterIsrIneligibleReplica : rr::kAlterIsrOk,
+                      pa->partitionEpoch);
+                return false;
+            }
         }
         const int64_t key = partitionKey_(m.topicId, m.partition);
         if (inflight_.count(key) != 0) return false;   // decide on the committed state only
@@ -341,8 +378,12 @@ public:
         drainDynamicQueue();
         return true;
     }
-    static void onAlterIsrThunk(void* self, const rune::replication::AlterIsrMsg& m) {
-        (void)static_cast<MetadataService*>(self)->onAlterIsr(m);
+    /// AeronPartitionTransport handler: true = send `resp` to the proposer.
+    static bool onAlterIsrThunk(void* self, const rune::replication::AlterIsrMsg& m,
+                                rune::replication::AlterIsrResponseMsg& resp) {
+        bool answer = false;
+        (void)static_cast<MetadataService*>(self)->onAlterIsr(m, &resp, &answer);
+        return answer;
     }
     [[nodiscard]] uint64_t alterIsrAcceptedForTest() const noexcept { return alterIsrAccepted_; }
     [[nodiscard]] uint64_t alterIsrRejectedForTest() const noexcept { return alterIsrRejected_; }
@@ -455,6 +496,10 @@ public:
     {
         if (!leaderReady_()) return 0;
         if (configuredTopics_.empty()) return 0;
+
+        // MEDIUM-2: the eligible set onAlterIsr filters additions against.
+        eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
+        eligibleKnown_ = true;
 
         rune::metadata::DynamicBalancerInputs in;
         in.cur       = &msm_.committedMap();
@@ -984,6 +1029,10 @@ private:
     /// committed) assignment record.
     std::unordered_map<int64_t, rune::replication::Offset> inflight_;
     uint64_t alterIsrAccepted_ = 0, alterIsrRejected_ = 0;
+    /// MEDIUM-2: the eligible (unfenced, live) set of the last rebalance tick —
+    /// onAlterIsr never adds a node outside it.  Unknown before the first tick.
+    std::vector<int32_t> eligible_;
+    bool                 eligibleKnown_ = false;
     static int64_t partitionKey_(int32_t topicId, int32_t partition) noexcept {
         return (static_cast<int64_t>(topicId) << 32) | static_cast<uint32_t>(partition);
     }

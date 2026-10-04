@@ -107,8 +107,9 @@ struct DrConfig {
 // ---------------------------------------------------------------------------
 // Network frames
 // ---------------------------------------------------------------------------
-enum class Kind : uint8_t { FetchReq, FetchResp, EpochReq, EpochResp, ReconReq, ReconResp, AlterIsr };
-inline constexpr int kKinds = 7;
+enum class Kind : uint8_t { FetchReq, FetchResp, EpochReq, EpochResp, ReconReq, ReconResp, AlterIsr,
+                           AlterIsrResp };
+inline constexpr int kKinds = 8;
 /// The harness controller's address on the modelled network (AlterIsr target).
 inline constexpr NodeId kControllerAddr = 0;
 
@@ -123,6 +124,7 @@ struct Frame {
     OffsetsForLeaderEpochReqMsg  ereq{};
     OffsetsForLeaderEpochRespMsg eresp{};
     AlterIsrMsg                  alter{};
+    AlterIsrResponseMsg          alterResp{};
 };
 
 class DrCluster;
@@ -247,7 +249,7 @@ public:
         DrNode& n = node(id);
         if (!n.up) return;
         if (meta_.leader == id) {
-            n.rep->becomeLeader(meta_.epoch, meta_.isr);
+            n.rep->becomeLeader(meta_.epoch, meta_.isr, cfg_.topicId >= 0 ? meta_.partitionEpoch : -1);
         } else if (meta_.leader >= 0) {
             n.rep->becomeFollower(meta_.epoch, meta_.leader);
         }
@@ -286,6 +288,7 @@ public:
         in.positions          = &pos;
         const auto out = rune::metadata::FailoverElection::elect(cfg_.topicId, kPartId, in);
         ++meta_.epoch;
+        ++meta_.partitionEpoch;
         if (out.change.newLeader == rune::metadata::NO_LEADER ||
             out.change.newLeader == rune::metadata::NO_LEADER_CHANGE) {
             meta_.leader = -1;
@@ -324,6 +327,7 @@ public:
         const bool inIsr = std::find(meta_.isr.begin(), meta_.isr.end(), id) != meta_.isr.end();
         if (cfg_.topicId >= 0 && !inIsr) return false;
         ++meta_.epoch;
+        ++meta_.partitionEpoch;
         meta_.leader = id;
         if (!inIsr) meta_.isr.insert(meta_.isr.begin(), id);
         for (auto& n : nodes_) applyMetadata(n.id);
@@ -335,6 +339,8 @@ public:
     }
     uint64_t alterIsrCommitted() const noexcept { return alterIsrCommitted_; }
     uint64_t alterIsrStale() const noexcept { return alterIsrStale_; }
+    uint64_t fenceCommitted() const noexcept { return fenceCommitted_; }
+    uint64_t alterIsrIneligible() const noexcept { return alterIsrIneligible_; }
 
 
     // ---------------------------------------------------------------- driving
@@ -342,6 +348,7 @@ public:
         ++step_;
         clock_ += kStepNs;
         fenceDeadForInternal_();
+        fenceDeadForUser_();
         for (auto& n : nodes_) if (n.up) n.rep->doWork(clock_);
         deliver_();
         settleAcks_();
@@ -581,6 +588,7 @@ private:
         NodeId              leader = -1;
         Epoch               epoch  = 0;
         std::vector<NodeId> isr;
+        int32_t             partitionEpoch = 0;   ///< AlterIsr compare-and-set version (MEDIUM-1)
     };
 
     PartitionConfig cfgFor_(NodeId id) const {
@@ -627,20 +635,73 @@ private:
         L.rep->shrinkIsrToLive(std::span<const int32_t>(live.data(), live.size()), clock_);
     }
 
+    /// USER partition: the controller's broker fencing (MetadataService
+    /// rebalance tick) — a node the controller considers dead (down, or cut
+    /// from the controller address) leaves the committed ISR while the leader
+    /// is alive.  Counted in fenceCommitted().
+    void fenceDeadForUser_() {
+        if (cfg_.topicId < 0 || meta_.leader < 0) return;
+        auto liveToController = [&](NodeId id) {
+            return node(id).up && cut_.count({id, kControllerAddr}) == 0;
+        };
+        if (!liveToController(meta_.leader)) return;
+        std::vector<NodeId> isr;
+        for (NodeId n : meta_.isr) if (n == meta_.leader || liveToController(n)) isr.push_back(n);
+        if (isr.size() == meta_.isr.size()) return;
+        meta_.isr = std::move(isr);
+        ++meta_.partitionEpoch;
+        ++fenceCommitted_;
+        for (auto& n : nodes_)
+            if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
+    }
+
     /// The harness controller (MetadataService::onAlterIsr semantics): accept a
     /// proposal from the current leader at the current epoch, commit the new
     /// ISR (partitionEpoch + 1) and push the assignment to every node it can
     /// reach (the leader sees a same-epoch becomeLeader).
     void controllerAlterIsr_(const AlterIsrMsg& m) {
-        if (m.leaderId != meta_.leader || m.leaderEpoch != meta_.epoch) return;
-        // Compare-and-set on the base ISR (Kafka's partitionEpoch check).
-        if (m.baseIsrCount != static_cast<int32_t>(meta_.isr.size())) { ++alterIsrStale_; return; }
-        for (int i = 0; i < m.baseIsrCount; ++i)
-            if (std::find(meta_.isr.begin(), meta_.isr.end(), m.baseIsr[static_cast<std::size_t>(i)]) ==
-                meta_.isr.end()) { ++alterIsrStale_; return; }
-        std::vector<NodeId> isr(m.isr.begin(), m.isr.begin() + m.isrCount);
-        if (std::find(isr.begin(), isr.end(), m.leaderId) == isr.end() || isr == meta_.isr) return;
+        auto reply = [&](int16_t code) {
+            Frame f; f.kind = Kind::AlterIsrResp; f.from = kControllerAddr; f.to = m.leaderId;
+            f.alterResp.topicId = m.topicId; f.alterResp.partition = m.partition;
+            f.alterResp.leaderId = m.leaderId; f.alterResp.leaderEpoch = m.leaderEpoch;
+            f.alterResp.partitionEpoch = meta_.partitionEpoch; f.alterResp.errorCode = code;
+            (void)send(std::move(f));
+        };
+        if (m.leaderId != meta_.leader || m.leaderEpoch != meta_.epoch) {
+            reply(kAlterIsrFencedLeaderEpoch);
+            return;
+        }
+        // Compare-and-set on the monotonic partitionEpoch (Kafka; MEDIUM-1).
+        if (m.partitionEpoch != meta_.partitionEpoch) {
+            ++alterIsrStale_;
+            reply(kAlterIsrInvalidUpdateVersion);
+            return;
+        }
+        // KIP-841 (MEDIUM-2): never ADD a replica the controller considers dead.
+        auto liveToController = [&](NodeId id) {
+            return node(id).up && cut_.count({id, kControllerAddr}) == 0;
+        };
+        std::vector<NodeId> isr;
+        bool dropped = false;
+        for (int i = 0; i < m.isrCount; ++i) {
+            const NodeId n = m.isr[static_cast<std::size_t>(i)];
+            const bool added = std::find(meta_.isr.begin(), meta_.isr.end(), n) == meta_.isr.end();
+            if (added && n != m.leaderId && !liveToController(n)) { dropped = true; continue; }
+            isr.push_back(n);
+        }
+        if (std::find(isr.begin(), isr.end(), m.leaderId) == isr.end()) {
+            reply(kAlterIsrInvalidRequest);
+            return;
+        }
+        std::vector<NodeId> a = isr, b = meta_.isr;
+        std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+        if (a == b) {
+            if (dropped) ++alterIsrIneligible_;
+            reply(dropped ? kAlterIsrIneligibleReplica : kAlterIsrOk);
+            return;
+        }
         meta_.isr = std::move(isr);
+        ++meta_.partitionEpoch;
         ++alterIsrCommitted_;
         for (auto& n : nodes_)
             if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
@@ -741,6 +802,7 @@ private:
                     f.fresp.records = std::span<const uint8_t>(f.recs.data(), f.recs.size());
                     r.applyReconcileResponse(f.fresp); break;
                 case Kind::AlterIsr: break;   // handled above
+                case Kind::AlterIsrResp: r.onAlterIsrResponse(f.alterResp); break;
             }
         }
     }
@@ -757,6 +819,8 @@ private:
     uint64_t                sent_[8][kKinds] = {};
     uint64_t                alterIsrCommitted_ = 0;
     uint64_t                alterIsrStale_     = 0;
+    uint64_t                fenceCommitted_    = 0;
+    uint64_t                alterIsrIneligible_ = 0;
     uint64_t                step_  = 0;
     int64_t                 clock_ = 0;
     uint64_t                nextId_ = 1;
