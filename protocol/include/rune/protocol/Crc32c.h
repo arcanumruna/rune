@@ -55,6 +55,28 @@ inline bool crc32c_hw_available() noexcept {
 }
 #endif
 
+#if defined(__aarch64__)
+// Linux arm64 (GCC/clang without -march=...+crc): the ACLE CRC intrinsics are always_inline and refuse to inline
+// into a function compiled without the CRC extension — enable it for this function only.
+#  if defined(__ARM_FEATURE_CRC32)
+#    define RUNE_PROTOCOL_CRC_TARGET
+#  elif defined(__clang__)
+#    define RUNE_PROTOCOL_CRC_TARGET __attribute__((target("crc")))
+#  else
+#    define RUNE_PROTOCOL_CRC_TARGET __attribute__((target("+crc")))
+#  endif
+RUNE_PROTOCOL_CRC_TARGET inline uint32_t crc32c_arm(uint32_t crc, const uint8_t* data, size_t len) noexcept {
+    while (len >= 8) {
+        uint64_t v; std::memcpy(&v, data, 8);
+        crc = __crc32cd(crc, v);
+        data += 8; len -= 8;
+    }
+    while (len--) crc = __crc32cb(crc, *data++);
+    return crc;
+}
+#  undef RUNE_PROTOCOL_CRC_TARGET
+#endif
+
 } // namespace detail
 
 // Incremental CRC32C: continue from a previous value.  Uses ARMv8 / SSE4.2
@@ -63,12 +85,7 @@ inline uint32_t crc32c(uint32_t seed, const uint8_t* data, size_t len) noexcept 
     uint32_t crc = ~seed;
 #if defined(__aarch64__)
     // ARMv8 CRC (present on Apple Silicon + all server ARM we target).
-    while (len >= 8) {
-        uint64_t v; std::memcpy(&v, data, 8);
-        crc = __crc32cd(crc, v);
-        data += 8; len -= 8;
-    }
-    while (len--) crc = __crc32cb(crc, *data++);
+    crc = detail::crc32c_arm(crc, data, len);
 #elif defined(__x86_64__) || defined(_M_X64)
     if (detail::crc32c_hw_available())
         crc = detail::crc32c_hw(crc, data, len);
