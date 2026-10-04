@@ -143,6 +143,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_set_receiver_io_vector_capacity(ctx_, static_cast<uint32_t>(cfg_.receiverIoVector));
     aeron_driver_context_set_term_buffer_length(ctx_, static_cast<uint64_t>(cfg_.termBufferBytes));
     aeron_driver_context_set_mtu_length(ctx_, static_cast<size_t>(cfg_.mtuBytes));
+    mtuLength_ = static_cast<uint32_t>(aeron_driver_context_get_mtu_length(ctx_));
     aeron_driver_context_set_rcv_initial_window_length(ctx_, static_cast<size_t>(cfg_.rcvWindowBytes));
     if (cfg_.socketBufferBytes > 0) {
         aeron_driver_context_set_socket_so_sndbuf(ctx_, static_cast<size_t>(cfg_.socketBufferBytes));

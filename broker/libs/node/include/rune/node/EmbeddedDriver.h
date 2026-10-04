@@ -118,6 +118,11 @@ public:
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
     /// network_publication_max_messages_per_send the driver was started with.
     [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
+    /// The MTU (bytes) the driver was started with.
+    [[nodiscard]] uint32_t mtuLength() const noexcept { return mtuLength_; }
+    /// A8: receive calls that filled every recvmmsg slot so far (more may be queued);
+    /// -1 when not counted (no rune_gso bindings, or not one agent thread).  Pump thread only.
+    [[nodiscard]] int64_t rxFullCount() const noexcept { return rune_gso_bindings_rx_full(gso_); }
     /// Misuse tallies (diagnostics).  OBSERVER thread only (one at a time —
     /// tests): each call drains misuseRing_ into the observer-owned tallies.
     [[nodiscard]] uint64_t foreignPumpAttempts() const noexcept { drainMisuse_(); return foreignPumps_; }
@@ -146,6 +151,7 @@ private:
     rune_gso_totals_t       gsoTotals_{};
     int                     gsoActiveMask_ = 0;   // rune_gso_bindings_active(): 1 = GSO, 2 = GRO
     uint32_t                maxMessagesPerSend_ = 0;
+    uint32_t                mtuLength_ = 0;
     bool                    threadRunning_ = false;   // Threaded: CONTROLLER-owned
     rune::consensus::ControlRing<256> stopRing_;       // controller → driver thread
     std::thread             thread_;
