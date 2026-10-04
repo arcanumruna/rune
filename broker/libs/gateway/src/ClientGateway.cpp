@@ -5,6 +5,7 @@
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/gateway/GatewayReplicaView.h>
+#include <rune/node/AeronChannel.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
@@ -1350,8 +1351,10 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // Kick off the egress publication registration (returns immediately).
     int64_t regId = -1;
     try {
+        // A10: sparse terms — the gateway runs on a worker thread in fused placement, where a non-sparse
+        // term's tmpfs fallocate fails with EINTR while io_uring completions are pending (withSparseTerms).
         regId = aeron_->addExclusivePublication(
-            std::string(req.egressChannel), req.egressStreamId);
+            rune::node::withSparseTerms(req.egressChannel), req.egressStreamId);
     } catch (...) {
         // Bad channel — drop (never crash).
         spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel '{}'; dropping Connect",
@@ -2678,7 +2681,8 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     auto& pend = pendingRecordEgress_[{sessionId, wid}];
     if (pend.regId < 0) {
         try {
-            pend.regId         = aeron_->addExclusivePublication(sess->egressChannel,
+            // A10: sparse terms (runtime add on a worker thread: see withSparseTerms).
+            pend.regId         = aeron_->addExclusivePublication(rune::node::withSparseTerms(sess->egressChannel),
                                                                  sess->egressStreamId);
             pend.requestedAtNs = nowNs_;
         } catch (...) {

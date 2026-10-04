@@ -28,6 +28,7 @@ struct FakePolicy {
         std::map<int64_t, std::pair<std::string, int32_t>> added;
         bool findReady = true, findError = false;
         bool errorOnceThenUnknown = false;                      // Aeron: find throws once, then the id is gone
+        int  errorsBeforeReady = 0;                             // A10: the first N finds error (transient), then Ready
         std::set<int64_t> erroredRegs;
         std::set<int> blocked;                                  // pub ids that back-pressure
         std::set<int> closed;                                   // pub ids that are CLOSED (fatal)
@@ -46,6 +47,7 @@ struct FakePolicy {
         if (s->errorOnceThenUnknown)
             return s->erroredRegs.insert(reg).second ? PubFind::Error : PubFind::Pending;
         if (s->findError) return PubFind::Error;
+        if (s->errorsBeforeReady > 0) { --s->errorsBeforeReady; return PubFind::Error; }
         if (!s->findReady) return PubFind::Pending;
         out = std::make_shared<FakePub>(FakePub{static_cast<int>(reg)});
         s->foundRegs.push_back(reg);
@@ -213,7 +215,7 @@ TEST(SessionAckSinkRegression, AddAndFindErrorsAreReportedAndCloseForgetsAnUnrep
         FakePolicy pol; auto st = pol.s; Sink s(pol);
         st->findError = true;
         ASSERT_TRUE(s.announce(7, "c", 1));
-        pass(s); pass(s);
+        for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);   // A10: bounded re-adds first
         EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
         EXPECT_EQ(s.unreportedFailures(), 1u);
         s.close(7);                                        // the runtime closed it meanwhile
@@ -383,8 +385,8 @@ TEST(SessionAckSinkRegression, RegistrationThatResolvedToErrorIsNeverDrained) {
     FakePolicy pol; auto st = pol.s; Sink s(pol);
     st->errorOnceThenUnknown = true;
     ASSERT_TRUE(s.announce(7, "c", 1));
-    pass(s);                                                // Announced → Resolving(reg 1)
-    pass(s);                                                // find → Error (once) → Failed
+    // Announced → Resolving(reg 1); each find errors once (A10: re-added, bounded) → Failed.
+    for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);
     ASSERT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
     EXPECT_EQ(s.drainingRegistrations(), 0u) << "the driver already dropped it — nothing to release";
     s.close(7);
@@ -1057,4 +1059,37 @@ TEST(SessionAckSinkRegression, ExpiryIsCancelledForAReaderAndNeverHitsANeverDeli
     EXPECT_EQ(s.lastDirectExpiredForTest(), 8);
     EXPECT_EQ(ex.report(s), 1);
     EXPECT_EQ(s.directUnderflowsForTest(), 0u);
+}
+
+// ===========================================================================
+// A10 (2026-10-04): a TRANSIENT driver error on the ack publication's add (EINTR
+// from tmpfs fallocate on a worker thread with io_uring completions pending) must
+// not kill the session: the add is retried on the same channel a bounded number of
+// times; only a persistent error (bad channel) reports the session Failed.
+// ===========================================================================
+TEST(SessionAckSinkRegression, TransientPublicationAddErrorIsRetriedNotFatal) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    st->errorsBeforeReady = 3;
+    ASSERT_TRUE(s.announce(7, "aeron:udp?endpoint=c:1", 2));
+    ASSERT_TRUE(s.enqueue(ack(7, 100)));
+    for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);
+    ASSERT_TRUE(std::holds_alternative<Sink::PubReady>(*s.stateForTest(7))) << "a transient add error is not fatal";
+    EXPECT_EQ(s.unreportedFailures(), 0u);
+    EXPECT_EQ(s.pubAddRetries(), 3u);
+    ASSERT_EQ(st->added.size(), 4u) << "1 add + 3 re-adds";
+    for (const auto& [reg, chs] : st->added) {
+        EXPECT_EQ(chs.first, "aeron:udp?endpoint=c:1") << "re-added on the announced channel";
+        EXPECT_EQ(chs.second, 2);
+    }
+    ASSERT_TRUE(sentTo(*st, 7).has_value()) << "the queued ack is delivered on the recovered publication";
+}
+
+TEST(SessionAckSinkRegression, PersistentPublicationAddErrorFailsAfterBoundedRetries) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    st->findError = true;
+    ASSERT_TRUE(s.announce(7, "c", 1));
+    for (int i = 0; i < 2 * (Sink::kMaxPubAddAttempts + 1); ++i) pass(s);
+    EXPECT_TRUE(std::holds_alternative<Sink::PubFailed>(*s.stateForTest(7)));
+    EXPECT_EQ(st->added.size(), static_cast<std::size_t>(Sink::kMaxPubAddAttempts)) << "bounded: never retried forever";
+    EXPECT_EQ(s.unreportedFailures(), 1u);
 }
