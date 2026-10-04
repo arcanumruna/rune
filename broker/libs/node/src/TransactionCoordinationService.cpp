@@ -161,6 +161,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
         coordinator_.reload(txnState_ ? txnState_->all() : noSnapshot_, coordinatorEpoch_, nowNs);
     awaiting_.clear();
     queuedRetries_ = 0;
+    stuckMarkers_  = 0;
     if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_);   // older epochs' leftovers
     if (txnState_ != nullptr) {
         // I7: the next pid lies at or above every ceiling a previous coordinator
@@ -195,6 +196,7 @@ void TransactionCoordinationService::unload_()
     }
     awaiting_.clear();
     queuedRetries_ = 0;
+    stuckMarkers_  = 0;
     if (gateway_) (void)gateway_->purgeQueuedMarkers(coordinatorEpoch_ + 1);   // this (now old) epoch
     coordinator_.clear();
     pidCeilingPending_       = -1;
@@ -254,6 +256,7 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
     // Drive coordinator timeout aborts (sets markersPending on timed-out txns).
     int work = coordinator_.doWork(nowNs);
     work += retryRefusedMarkers_(nowNs);
+    if (!awaiting_.empty() || stuckMarkers_ != 0) [[unlikely]] updateStuckMarkers_(nowNs);
 
     // TX-4 Task 8: Resolve pending markers (internally-initiated aborts and the
     // Prepare* re-driven after a load).  Task 10 round 5 (Kafka semantics): the
@@ -804,17 +807,32 @@ void TransactionCoordinationService::queueRetry_(AwaitingMarkers& a, int32_t top
         if (r.topicId == topicId && r.partition == partition) {   // refused again: back off further
             if (!r.inFlight) return;                                // already queued
             r.inFlight  = false;
+            const bool wasAtMax = r.backoffNs == kMarkerRetryMaxNs;
             r.backoffNs = std::min(r.backoffNs * 2, kMarkerRetryMaxNs);
             r.dueNs     = lastNowNs_ + r.backoffNs;
             ++queuedRetries_;
-            if (r.backoffNs == kMarkerRetryMaxNs)
+            if (r.backoffNs == kMarkerRetryMaxNs && !wasAtMax)   // once per marker, at the max backoff
                 spdlog::warn("TCS: control marker topic={} partition={} still refused — retrying every {} ms",
                              topicId, partition, kMarkerRetryMaxNs / 1'000'000);
             return;
         }
     }
-    a.retries.push_back(MarkerRetry{topicId, partition, lastNowNs_ + kMarkerRetryMinNs, kMarkerRetryMinNs, false});
+    a.retries.push_back(MarkerRetry{topicId, partition, lastNowNs_ + kMarkerRetryMinNs, kMarkerRetryMinNs, false,
+                                    lastNowNs_});
     ++queuedRetries_;
+}
+
+void TransactionCoordinationService::updateStuckMarkers_(int64_t nowNs)
+{
+    std::size_t stuck = 0;
+    for (const auto& [pid, a] : awaiting_)
+        for (const auto& r : a.retries) stuck += (nowNs - r.firstRefusedNs >= kStuckMarkerNs) ? 1u : 0u;
+    if (stuck != 0 && stuckMarkers_ == 0)
+        spdlog::warn("TCS: {} control marker(s) stuck — refused for more than {} s and still retrying "
+                     "(their transactions stay Prepare*)", stuck, kStuckMarkerNs / 1'000'000'000);
+    else if (stuck == 0 && stuckMarkers_ != 0)
+        spdlog::info("TCS: no stuck control markers any more");
+    stuckMarkers_ = stuck;
 }
 
 bool TransactionCoordinationService::dropRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition)

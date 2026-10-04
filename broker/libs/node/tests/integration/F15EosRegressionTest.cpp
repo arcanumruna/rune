@@ -661,6 +661,34 @@ TEST(MarkerRetryRegression, MarkerForADeletedPartitionIsDroppedAndTheTxnComplete
     EXPECT_EQ(T.addPartition(), 0) << "the producer can start its next transaction";
 }
 
+// D9 "stuck markers" gauge: a marker still refused after kStuckMarkerNs counts
+// as stuck (exposed + logged), and clears once it lands.
+TEST(MarkerRetryRegression, StuckMarkerGaugeCountsLongRefusedMarkersAndClearsOnLanding) {
+    TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: the marker is refused
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.endTxn(/*commit=*/true), 999);
+    (void)T.tcs->doWork(10);
+    T.runUntilNoMarkerAwaited(10);
+    ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker was refused";
+    EXPECT_EQ(T.tcs->stuckMarkers(), 0u);
+    const int64_t stuckAt = TransactionCoordinationService::kStuckMarkerNs;
+    int64_t now = 20'000'000;
+    for (; now < stuckAt - 500'000'000; now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    EXPECT_EQ(T.tcs->stuckMarkers(), 0u) << "not stuck before the threshold";
+    for (; now < stuckAt + 1'500'000'000; now += 10'000'000) { (void)T.tcs->doWork(now); T.m.runWorker(now); }
+    EXPECT_EQ(T.tcs->stuckMarkers(), 1u) << "a marker refused for longer than the threshold is stuck";
+    T.m.r->setMinIsrForTest(1);                              // the partition can take the marker again
+    for (int i = 0; i < 64 && T.tcs->awaitingMarkerTxnsForTest() > 0; ++i) {
+        now += 100'000'000; (void)T.tcs->doWork(now); T.m.runWorker(now);
+    }
+    ASSERT_EQ(T.tcs->awaitingMarkerTxnsForTest(), 0u) << "the retried marker landed";
+    (void)T.tcs->doWork(now + 1);
+    EXPECT_EQ(T.tcs->stuckMarkers(), 0u) << "the gauge clears once the marker landed";
+}
+
 TEST(MarkerRetryRegression, MinIsrRefusedMarkerNeverCompletesTheTxn) {
     TxnRig T(/*minIsr=*/2);                                  // ISR {1} < minIsr 2: acks=all marker refused
     const int64_t rcSub = T.m.subscribe(T.sid, /*read_committed*/1);   // S4 retarget: declared scenario addition

@@ -192,6 +192,12 @@ public:
     [[nodiscard]] uint64_t transactionsCompletedForTest() const noexcept { return transactionsCompleted_; }
     [[nodiscard]] uint64_t controlMarkersRefusedForTest() const noexcept { return controlMarkersRefused_; }
     [[nodiscard]] std::size_t queuedMarkerRetriesForTest() const noexcept { return queuedRetries_; }
+    /// D9 "stuck markers" gauge (observability only, never a correctness
+    /// input): markers of Prepare* transactions refused for longer than
+    /// kStuckMarkerNs and still awaiting a retry that lands.  Recomputed every
+    /// doWork; a rise from 0 / a return to 0 is logged.  Control thread.
+    static constexpr int64_t kStuckMarkerNs = 5'000'000'000;   // 5 × kMarkerRetryMaxNs
+    [[nodiscard]] std::size_t stuckMarkers() const noexcept { return stuckMarkers_; }
 
 private:
     uint64_t controlMarkersRefused_ = 0;
@@ -208,6 +214,7 @@ private:
         int64_t dueNs     = 0;
         int64_t backoffNs = 0;
         bool    inFlight  = false;   ///< re-dispatched, reply pending: keeps its backoff
+        int64_t firstRefusedNs = 0;  ///< D9 gauge: when this marker was first refused
     };
     struct AwaitingMarkers {
         rune::transaction::TransactionalId txnId;
@@ -224,6 +231,8 @@ private:
     static constexpr int64_t kMarkerRetryMaxNs = 1'000'000'000;   // 1 s
     int64_t lastNowNs_ = 0;                 ///< doWork clock, used to schedule refusal retries
     std::size_t queuedRetries_ = 0;         ///< retries due for (re-)dispatch (not in flight)
+    std::size_t stuckMarkers_  = 0;         ///< D9 gauge (see stuckMarkers())
+    void updateStuckMarkers_(int64_t nowNs);
     int retryRefusedMarkers_(int64_t nowNs);
     /// Queue (or re-queue with a doubled backoff) the marker for (topicId, partition).
     void queueRetry_(AwaitingMarkers& a, int32_t topicId, int32_t partition);
