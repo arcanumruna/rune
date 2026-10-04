@@ -4568,8 +4568,10 @@ struct InlineRig {
         ts.segmentRollBytes = roll;
         return ts;
     }
+    std::vector<std::vector<uint8_t>> frames;   // D6 review M4: every raw egress frame
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
         [this](const uint8_t* b, std::size_t n) -> int64_t {
+            frames.emplace_back(b, b + n);
             if (auto pr = pc::ProduceResponse::decode(b, n))
                 answers.push_back(Answer{pr->errorCode, pr->baseOffset, pr->logStartOffset});
             return 1;
@@ -5508,4 +5510,99 @@ TEST(UnknownProducerIdRegression, WorkerRebuildAfterRetentionAnswersUnknownProdu
     EXPECT_EQ(answers[0].lso, logStart);
     EXPECT_EQ(answers[0].base, 0);
     EXPECT_EQ(answers[1].err, kOosD6) << "an old client must never see UnknownProducerId";
+}
+
+// ============================================================================
+// D6 review M4 — the 46 B ProduceResponse goes ONLY to sessions that announced
+// clientVersion >= kClientVersionUnknownProducerId.  Every other session gets
+// the exact pre-D6 38 B frame (blockLength 14), at EVERY answer site, so a
+// STRICT pre-D6 decoder (exact length 38, exact blockLength 14 — what a non-C++
+// client may hard-code) reads all of them.  Sites: the inline answer
+// (sendRespReliable_: OK + UnknownProducerId->OOS), the worker-return relay
+// (error + OK), and the inline acks=all pending acks (OK on the HW, NotLeader
+// on a stale replica, Internal on the timeout).
+// ============================================================================
+namespace {
+struct StrictV0 { int64_t sid = 0; int16_t err = -1; int64_t base = -1; };
+// The pre-D6 decode, made strict: exact frame length and exact blockLength.
+std::optional<StrictV0> strictPreD6Decode(const std::vector<uint8_t>& f) {
+    if (f.size() != 38) return std::nullopt;
+    if (pc::detail::getLE16(f.data(), 0) != 14) return std::nullopt;            // blockLength
+    auto hdr = pc::MessageHeader::decode(f.data(), f.size());
+    if (!hdr || hdr->schemaId != pc::kSchemaId || hdr->templateId != 17) return std::nullopt;
+    return StrictV0{hdr->sessionId, pc::detail::getLE16s(f.data(), 24), pc::detail::getLE64(f.data(), 30)};
+}
+int64_t frameSid(const std::vector<uint8_t>& f) { return pc::MessageHeader::decode(f.data(), f.size())->sessionId; }
+} // namespace
+
+TEST(UnknownProducerIdRegression, OldSessionsGetTheStrictPreD6FrameAtEveryAnswerSiteRegression) {
+    InlineRig R(Role::Follower, {1, 2});
+    R.r->becomeLeader(2, {1, 2});
+    rune::replication::FetchRequestMsg fr0{R.r->epoch(), 0, /*follower*/2, /*fetchOffset*/0, 1 << 20, R.r->topicId()};
+    (void)R.r->onFetchRequest(fr0, ++R.now);
+    ASSERT_TRUE(R.r->isLeaderComplete());
+    R.gw.onNodeLeadershipGainedForTest();
+    const int64_t oldSid = R.gw.injectTestSession(0, /*clientVersion=*/1);
+    const int64_t newSid = R.sid;                                   // clientVersion 2
+    auto sendAs = [&](int64_t sid, int64_t pid, int32_t seq, uint8_t acks) {
+        const auto f = produceFrame(sid, ++R.corr, seqBatch(pid, 0, seq), acks, 0, 0, pid, 0, seq);
+        R.gw.applyProduceForTest(f.data(), f.size());
+    };
+    // Inline answers (acks=leader): OK, and UnknownProducerId (no entry, seq 5).
+    sendAs(oldSid, 7, 0, 0);
+    sendAs(oldSid, 9, 5, 0);
+    sendAs(newSid, 8, 0, 0);
+    sendAs(newSid, 10, 5, 0);
+    // Worker-return relay: an error and an OK result.
+    WorkerReturn er; er.type = WorkerReturn::Type::ProduceResult; er.partition = 0;
+    er.errorCode = kUnknownPid; er.baseOffset = 0; er.correlationId = 900;
+    WorkerReturn ok = er; ok.errorCode = 0; ok.baseOffset = 3; ok.correlationId = 901;
+    for (int64_t sid : {oldSid, newSid}) {
+        er.sessionId = sid; ok.sessionId = sid;
+        R.gw.handleWorkerReturnForTest(er);
+        R.gw.handleWorkerReturnForTest(ok);
+    }
+    // Pending acks (inline acks=all, parked on the HW): OK once follower 2 passes it.
+    const int64_t okOff = R.log().logEndOffset();
+    sendAs(oldSid, 7, 1, 1);
+    sendAs(newSid, 8, 1, 1);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 2u) << "precondition: parked on the HW";
+    rune::replication::FetchRequestMsg fr1{R.r->epoch(), 0, 2, okOff + 2, 1 << 20, R.r->topicId()};
+    (void)R.r->onFetchRequest(fr1, ++R.now);
+    (void)R.r->doWork(++R.now);
+    ASSERT_GT(R.r->gatewayHighWatermark(), okOff + 1) << "precondition: the HW passed both batches";
+    R.gw.drainPendingAcksForTest(++R.now);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 0u);
+    // Pending acks: Internal on the timeout.
+    sendAs(oldSid, 7, 2, 1);
+    sendAs(newSid, 8, 2, 1);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 2u);
+    R.gw.drainPendingAcksForTest(R.now + 31'000'000'000LL);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 0u);
+    // Pending acks: NotLeader on a stale (removed) replica.
+    sendAs(oldSid, 7, 3, 1);
+    sendAs(newSid, 8, 3, 1);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 2u);
+    R.reg.remove(0, 0);
+    ASSERT_EQ(R.reg.collectRetired(R.reg.generation()), 1u);
+    R.gw.drainPendingAcksForTest(R.now + 32'000'000'000LL);
+    ASSERT_EQ(R.gw.pendingAcksForTest(), 0u);
+
+    std::vector<int16_t> oldCodes, newCodes;
+    for (const auto& f : R.frames) {
+        ASSERT_GE(f.size(), 24u);
+        if (frameSid(f) == oldSid) {
+            const auto d = strictPreD6Decode(f);
+            ASSERT_TRUE(d.has_value()) << "a clientVersion-1 session got a " << f.size()
+                                       << " B frame: a strict pre-D6 decoder drops it";
+            oldCodes.push_back(d->err);
+        } else {
+            ASSERT_EQ(f.size(), pc::ProduceResponse::ENCODED_SIZE) << "a clientVersion-2 session gets the 46 B frame";
+            newCodes.push_back(pc::ProduceResponse::decode(f.data(), f.size())->errorCode);
+        }
+    }
+    const std::vector<int16_t> want{0, kOosD6, kOosD6, 0, 0, static_cast<int16_t>(pc::ErrorCode::Internal), kNotLeader};
+    EXPECT_EQ(oldCodes, want) << "every answer site, in order";
+    const std::vector<int16_t> wantNew{0, kUnknownPid, kUnknownPid, 0, 0, static_cast<int16_t>(pc::ErrorCode::Internal), kNotLeader};
+    EXPECT_EQ(newCodes, wantNew);
 }

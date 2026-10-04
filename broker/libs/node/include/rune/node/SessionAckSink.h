@@ -185,7 +185,9 @@ public:
             if (auto* r = std::get_if<PubReady>(&st)) [[likely]] {
                 if (r->blockedPass != pass_) {                      // per-session order kept
                     const int32_t ver = clientVersion_[idx];
-                    const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, ver, dst); });
+                    // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
+                    const int64_t pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver),
+                                                      [&](uint8_t* dst) { encode_(a, ver, dst); });
                     if (pos > 0) [[likely]] {
                         ++work;
                         continue;
@@ -291,7 +293,6 @@ private:
     static constexpr std::size_t kNone     = static_cast<std::size_t>(-1);
     static constexpr std::size_t kMask     = kMaxSessions - 1;
     static constexpr int         kBits     = std::countr_zero(kMaxSessions);
-    static constexpr std::size_t kAckBytes = rune::protocol::client::ProduceResponse::ENCODED_SIZE;
     static_assert(std::has_single_bit(kMaxSessions), "kMaxSessions must be a power of two");
     static_assert(kMaxChannelSlots <= 65536, "channel slot index is uint16");
 
@@ -442,20 +443,16 @@ private:
         return work;
     }
     static void encode_(const AckEntry& a, int32_t clientVersion, uint8_t* dst) noexcept {
-        namespace pc = rune::protocol::client;
         rune::protocol::client::ProduceResponse r;
         r.sessionId      = a.sessionId;
         r.correlationId  = a.correlationId;
-        // D6: UnknownProducerId only to clients that understand it (else OOS —
-        // the pre-D6 answer); every other code passes through.
-        r.errorCode      = (a.errorCode == static_cast<int16_t>(pc::ErrorCode::UnknownProducerId) &&
-                            !pc::clientUnderstandsUnknownProducerId(clientVersion))
-                               ? static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence)
-                               : a.errorCode;
+        r.errorCode      = a.errorCode;
         r.partition      = a.partition;
         r.baseOffset     = a.baseOffset;
         r.logStartOffset = a.logStartOffset;
-        r.encode(dst);
+        // D6: UnknownProducerId only to clients that understand it (else OOS —
+        // the pre-D6 answer), and (review M4) the pre-D6 38 B frame to them.
+        r.encodeFor(dst, clientVersion);
     }
 
     PubPolicy                                                        policy_;

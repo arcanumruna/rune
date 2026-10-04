@@ -314,11 +314,13 @@ bool ClientGateway::sendRespReliable_(Session&          session,
     resp.sessionId     = session.sessionId;
     resp.correlationId = correlationId;
     // D6: UnknownProducerId only to clients that understand it (else OOS).
-    resp.errorCode      = static_cast<int16_t>(rune::storage::produceErrorForClient(ec, session.clientVersion));
+    // D6 review M4: encodeFor applies the version gate (28 -> OOS) AND the
+    // frame size (pre-D6 38 B below clientVersion 2) for this session.
+    resp.errorCode      = static_cast<int16_t>(ec);
     resp.partition      = partition;
     resp.baseOffset     = baseOffset;
     resp.logStartOffset = logStartOffset;
-    const std::size_t encoded = resp.encode(scratch_.data());
+    const std::size_t encoded = resp.encodeFor(scratch_.data(), session.clientVersion);
     if (encoded == 0 || encoded > PendingResp::kMaxBytes) {
         spdlog::error("ClientGateway::sendRespReliable_: encode error ({} bytes)", encoded);
         return false;
@@ -3518,14 +3520,14 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 pc::ProduceResponse resp;
                 resp.sessionId      = ret.sessionId;
                 resp.correlationId  = ret.correlationId;
-                resp.errorCode      = static_cast<int16_t>(
-                    rune::storage::produceErrorForClient(ec, session->clientVersion));
+                resp.errorCode      = ret.errorCode;   // gated by encodeFor (28 -> OOS for old sessions)
                 resp.partition      = ret.partition;
                 resp.baseOffset     = 0;
                 resp.logStartOffset = ec == pc::ErrorCode::UnknownProducerId ? ret.baseOffset : -1;
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
-                const std::size_t encoded = resp.encode(scratch_.data());
+                // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);
                 // G0.1: reliable delivery (retry on back-pressure).
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 return;
@@ -3545,7 +3547,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 okResp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
                 okResp.partition     = ret.partition;
                 okResp.baseOffset    = ret.baseOffset;
-                const std::size_t encoded = okResp.encode(scratch_.data());
+                const std::size_t encoded = okResp.encodeFor(scratch_.data(), session->clientVersion);
                 // G0.1: reliable delivery (retry on back-pressure).
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
@@ -3860,7 +3862,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = 0;
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
             spdlog::debug("ClientGateway: acks=All pending ack for topic={} partition={} is stale "
@@ -3882,7 +3884,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotLeader);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = 0;
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
             }
             if (i + 1 < pendingAcks_.size()) pendingAcks_[i] = std::move(pendingAcks_.back());
@@ -3910,7 +3912,7 @@ void ClientGateway::drainPendingAcks()
                 resp.baseOffset    = entry.baseOffset;
                 static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                               "scratch too small for ProduceResponse");
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 // G0.1: reliable delivery (retry on back-pressure) — this is the
                 // highest-durability acks=All OK ack; a silent drop here is the
                 // exact defect #3 the retry queue exists to prevent.
@@ -3935,7 +3937,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::Internal);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = entry.baseOffset;
-                const std::size_t encoded = resp.encode(scratch_.data());
+                const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 // G0.1: reliable delivery (retry on back-pressure).
                 enqueueOrBestEffort_(*session, scratch_.data(), encoded);
                 spdlog::warn("ClientGateway: acks=All deferred ack timed out "

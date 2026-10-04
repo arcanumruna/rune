@@ -444,3 +444,40 @@ TEST(SessionAckSinkUnknownProducerIdRegression, ClientVersionSurvivesBackwardShi
         EXPECT_EQ(r->errorCode, static_cast<int16_t>(want)) << sid;
     }
 }
+
+// D6 review M4: the shard-mode sink claims the pre-D6 38 B frame (blockLength
+// 14) for a session below kClientVersionUnknownProducerId — a STRICT pre-D6
+// decoder (exact length, exact blockLength) reads every ack it gets — and the
+// 46 B frame only for version >= 2.  Survives backward-shift deletion.
+TEST(SessionAckSinkUnknownProducerIdRegression, OldSessionsGetTheStrictPreD6FrameRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    constexpr int64_t kN = 300;
+    auto version = [](int64_t sid) { return (sid % 2 == 0) ? int32_t{1} : pc::kClientVersion; };
+    for (int64_t sid = 1; sid <= kN; ++sid) ASSERT_TRUE(s.announce(sid, "c", 1, version(sid)));
+    for (int i = 0; i < 18; ++i) pass(s);
+    for (int64_t sid = 1; sid <= kN; sid += 3) s.close(sid);
+    for (int64_t sid = 1; sid <= kN; ++sid) {
+        if (sid % 3 == 1) continue;
+        s.enqueue(AckEntry{sid, sid, 40 + sid, 0, 0});
+        s.enqueue(unknownPid(sid, 1000 + sid, 9));
+    }
+    pass(s);
+    std::size_t seen = 0;
+    for (const auto& [pub, f] : st->sent) {
+        auto hdr = pc::MessageHeader::decode(f.data(), f.size());
+        ASSERT_TRUE(hdr.has_value());
+        const int64_t sid = hdr->sessionId;
+        if (version(sid) < pc::kClientVersionUnknownProducerId) {
+            ASSERT_EQ(f.size(), 38u) << "sid " << sid << ": a strict pre-D6 decoder drops this frame";
+            ASSERT_EQ(pc::detail::getLE16(f.data(), 0), 14u) << "sid " << sid << ": blockLength";
+            const int16_t ec = pc::detail::getLE16s(f.data(), 24);
+            const int64_t corr = hdr->correlationId;
+            EXPECT_EQ(ec, corr == sid ? 0 : static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence)) << sid;
+            if (corr == sid) EXPECT_EQ(pc::detail::getLE64(f.data(), 30), 40 + sid);
+        } else {
+            ASSERT_EQ(f.size(), pc::ProduceResponse::ENCODED_SIZE) << sid;
+        }
+        ++seen;
+    }
+    EXPECT_EQ(seen, 2u * (kN - (kN + 2) / 3));
+}

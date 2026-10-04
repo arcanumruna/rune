@@ -121,16 +121,12 @@ struct ProduceOutcome {
 // produceErrorForClient — D6 version gate (ConnectRequest.clientVersion).
 // UnknownProducerId (28) goes only to clients that understand it; an older
 // client gets OutOfOrderSequence — the pre-D6 answer, equally "NOT appended".
-// Every other code passes through.  Applied wherever a ProduceResponse is
-// encoded for a session (gateway inline / worker relay, shard ack sink).
+// Every other code passes through.  The single definition lives in
+// rune-protocol (review L4); every broker answer site encodes through
+// ProduceResponse::encodeFor(buf, clientVersion), which applies it together
+// with the frame-size gate (review M4).
 // ---------------------------------------------------------------------------
-[[nodiscard]] constexpr rune::protocol::client::ErrorCode
-produceErrorForClient(rune::protocol::client::ErrorCode ec, int32_t clientVersion) noexcept {
-    namespace pc = rune::protocol::client;
-    return (ec == pc::ErrorCode::UnknownProducerId && !pc::clientUnderstandsUnknownProducerId(clientVersion))
-               ? pc::ErrorCode::OutOfOrderSequence
-               : ec;
-}
+using rune::protocol::client::produceErrorForClient;
 
 // ---------------------------------------------------------------------------
 // handleProduceBatch — the shared produce-batch core.
