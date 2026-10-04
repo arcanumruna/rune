@@ -237,6 +237,9 @@ UringFlushBackend::~UringFlushBackend() {
 // pushSqe_ — the single SQE submission path
 // ---------------------------------------------------------------------------
 int UringFlushBackend::pushSqe_(const struct io_uring_sqe& sqe) noexcept {
+    // A10: a single submit while a round batch is open would overwrite its first queued SQE — refuse
+    // (back-pressure) instead; the worker never interleaves them (seals are submitted before a round).
+    if (queued_ != 0) [[unlikely]] return EBUSY;
     // Load SQ head with acquire semantics — the kernel writes head after
     // consuming SQEs, so we need to observe that write here.
     const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);
