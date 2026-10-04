@@ -167,3 +167,140 @@ demotion drops a phantom (empty) epoch entry; same-epoch re-assert only applies 
 - rune-protocol-fe `feat/fetch-epoch`: f312823 (interrupted round, already committed: ErrorPayload on
   error frames, AlterIsr template 7), 0e9b529 (AlterIsr baseIsr — compare-and-set).
 - Nothing pushed; no conan command run.
+
+---
+
+## Fix round 2 (review 2026-10-04)
+
+Review: `2026-10-04-dur1-kafka-hw-review.md` (1 CRITICAL, 3 MAJOR, 4 MEDIUM, 2 LOW). Broker
+`rune-broker-wt31` `feat/dur-1` on top of e5d41b4; protocol `rune-protocol-fe` `feat/fetch-epoch` on
+top of 0e9b529. Nothing pushed, no Conan package operations, no subagents. RED logs: session
+scratchpad `rev3fix/red-*.log`.
+
+### RED → GREEN per finding
+
+| Finding | Fix | Regression test(s) | RED (before the fix) | GREEN |
+|---|---|---|---|---|
+| CRITICAL-1: stale follower LEO across leaderships | `ReplicaLeaderState::resetFollowers()` (in place) on every new-epoch `becomeLeader` (Kafka `resetReplicaState`). The controller snapshot publishes a follower only after its fetch was validated in THIS leadership. Published follower slots are cleared on becomeLeader, becomeFollower and self-demotion. | `PartitionReplicaRegression.NewLeadershipForgetsFollowerPositions_HwNeverFromPreviousLeadership` (R1), `…_EndToEnd` (R1b), `PositionSnapshotCarriesOnlyFollowersValidatedThisLeadership`; `DrIntegrationRegression.Rev3Critical1_StaleFollowerLeoAcrossLeaderships_NoAckedLoss` (R1b + step 5: the controller elects off the leader's published positions) | R1: HW=20, followerLeo(A)=20. R1b: HW 15 vs A.LEO 8. The snapshot published A=20 under epoch 3. DR: **every node lost 3 acked records** (A elected off (3,20)). | HW stays at the floor until A fetches in the new leadership; nothing is published for A; no acked loss |
+| MAJOR-1: ISR join below the leader-epoch start offset | Expansion requires `fetchOffset >= max(HW, electionLeo_)` (Kafka `isFollowerInSync`), for user and internal partitions | `PartitionReplicaRegression.IsrExpansionRequiresLeaderEpochStartOffset` (R2) | C (LEO 7) admitted to the ISR of a leader elected at LEO 10 | refused at 7, admitted at 10 |
+| MAJOR-2: internal rolling restart truncates committed records | Internal ISR changes commit on a majority's durable knowledge, and the consensus votes and stands only for members of the newest durable internal ISRs (design notes below) | `DrIntegrationRegression.Rev3Major2_InternalRollingRestart_LaggingNodeNotElected_NoCommittedLoss`; `E1b_InternalFencedMemberNotElectableBeforeCatchUp_NoAckedLoss` (replaces the DISABLED internal E1b test — fixed); `ElectionBallotRegression.VoteGate_DeniesCandidateOutsideInternalIsr`, `VoteGate_IneligibleNodeNeverNominates`; `InternalIsrRegression.KnowledgeIsDurableAndMonotonic` | Rolling restart: the lagging node 3 won the consensus election; **every node lost 20 committed internal records**. The DISABLED E1b test failed the same way. | Node 3 is never voted for (node 2's durable knowledge excludes it); node 2 leads; nothing is lost; node 3 is re-admitted (and electable again) once caught up |
+| MAJOR-3: a stuck live internal replica freezes the control plane | Lag shrink restored for internal partitions. The shrink commits on the majority's durable knowledge; the HW counts the member until then. | `DrIntegrationRegression.Rev3Major3_StuckLiveInternalReplicaShrunk_ControlPlaneNotFrozen`; `InternalIsrRegression.InternalLagShrinkCommitsOnMajorityKnowledge_StuckMemberIneligible` (replaces `InternalPartitionNeverLagShrinksALiveMember_FencesTheDead`) | Acks never settled (HW frozen); the stuck node stayed in the ISR and won the consensus election | Shrunk after replicaLagMaxMs; removal durable on {1,2}; HW advances; the stuck node is not electable |
+| MEDIUM-1: AlterIsr CAS on ISR sets (ABA) | Protocol: `AlterIsr.partitionEpoch` replaces `baseIsr`, and the controller commits only on equality. The leader learns the committed partitionEpoch from every applied assignment (`becomeLeader(…, partitionEpoch)`, bridge + `WorkerOp.rolePartitionEpoch`). An applied assignment with another partitionEpoch resolves the pending proposal. | `AlterIsrControllerRegression.PartitionEpochCas_LateProposalNeverCommitsAfterAba`; `ControllerCommitsOnlyValidProposalsFromTheCurrentLeader` (now asserts INVALID_UPDATE_VERSION) | The late P1 committed X after {L,Y}→{L}→{L,Y} | refused (INVALID_UPDATE_VERSION) |
+| MEDIUM-2: no AlterIsr response; a fenced replica gets re-added | The controller drops additions outside its eligible set (KIP-841). New `AlterIsrResponse` frame (OK / INELIGIBLE_REPLICA / FENCED_LEADER_EPOCH / INVALID_UPDATE_VERSION / INVALID_REQUEST), routed to the leader replica's owning thread (`WorkerOp ALTER_ISR_RESPONSE`). The leader clears its proposal only on a commit or an explicit reject. After INELIGIBLE it proposes no addition for 50 ms; shrinks are never held back. | `AlterIsrControllerRegression.ControllerNeverAddsAFencedReplica`; `DrIntegrationRegression.AsymmetricPartition_FencedReplicaNotReaddedNoFlapping` | The controller committed the fenced replica. DR: **150 AlterIsr commits + 150 fences in 300 steps**. | 1 fence and 0 re-adds while partitioned; acks=all keeps settling; re-admitted after heal |
+| MEDIUM-3: survivor election on by default | `DynamicBalancerInputs::allowSurvivorElection` (MetadataService / `NodeConfig::survivorLeaderElection` / `RUNE_SURVIVOR_LEADER_ELECTION=1`). Default OFF: NO_LEADER, ISR lineage kept. | `DynamicBalancerRegression.SurvivorElectionIsOptInDefaultOff` (`SurvivorElectionCountsOnlyReportedReplicas` now opts in) | Elected node 1 without the opt-in | NO_LEADER by default; with the opt-in, the most complete reporter |
+| MEDIUM-4: an unclean restart keeps its ISR seat (KIP-903) | Protocol `FetchRequest.incarnation`: a durable per-node counter (`<dataDir>/process-incarnation`) bumped on every start and stamped by every replica (`ReplicaRegistry::add`). The leader's slot keeps the newest incarnation across leaderships: an OLDER one is dropped (never credited or answered); a changed one means a restart. A validated fetch below the HW marks the follower unclean (out of the ISR until ≥ max(HW, electionLeo)) when it regressed, restarted, **or is a committed-ISR member**. Every member holds everything below the HW, so this needs no history of the follower. | `DrIntegrationRegression.Rev3Medium4_UncleanRestartSlotReset_LosesIsrSeat_NoAckedLoss`, `…_LeaderChanged_…`; `PartitionReplicaRegression.StaleIncarnationFetchNeverCredited` | Both DR tests (fix stashed): the unclean follower kept its seat and was elected; **every node lost 30 acked records**. Unit test: a dead process's fetch at 20 was credited. | Evicted at its first fetch; the other member is elected; no loss; the stale fetch is ignored |
+| LOW-1: majority wording | IsrManager / PartitionReplica / HighWatermarkTest comments now describe min over the ISR | — | — | — |
+| LOW-2: first-contact allocations, virtual `sendAlterIsr` | Left as ruled (cold paths). The new `sendInternalIsr`/`sendInternalIsrAck` virtuals are cold too (ISR changes only). | — | — | — |
+
+### Design notes — MAJOR-2 / MAJOR-3 (internal partitions)
+
+**Option chosen, and why not a consensus-log record.** The consensus layer here is the Aeron election
+only. There is no replicated consensus log: every member's log position is 0, and
+`__cluster_metadata` is itself an ISR-replicated partition led by the consensus leader. The reviewer's
+mechanism relies on two properties of a committed consensus record:
+
+- it is durable on a majority;
+- every winning vote quorum intersects that majority.
+
+This round provides both properties directly, which is far smaller than adding a replicated log to the
+consensus. It is also sounder than the fallback ("the elected node does not lead internal partitions
+until caught up"), which would need a second leader-selection mechanism plus the same durable ISR
+knowledge anyway.
+
+1. **Versioned, majority-durable internal ISR.**
+   - The internal leader publishes each change as `InternalIsr{topic, partition, leaderEpoch,
+     version, members}` (template 9) to every replica.
+   - A replica persists the newest `(leaderEpoch, version)` in `InternalIsrKnowledge`
+     (`<dataDir>/internal-isr.state`, tmp + fsync + rename + dir fsync, checksummed). Only after that
+     does it ack (`InternalIsrAck`, template 10).
+   - A replica acks only the leader it follows, at that epoch, so a deposed leader is never helped.
+   - The change commits once a majority of the cluster holds it. Internal partitions are replicated on
+     every node, so that majority is the set of consensus voters.
+   - Until then the HW counts committed ∪ proposed (the existing KIP-497/841 maximal-ISR machinery:
+     one proposal in flight, re-sent every 50 ms).
+2. **Candidacy rule.** `Election::setVoteGate`: a node votes for a candidate only if the candidate is
+   a member of the newest durable ISR of EVERY internal partition it knows.
+   - The same rule decides whether the node stands itself (CANVASS → NOMINATE, re-checked in
+     NOMINATE).
+   - A denied RequestVote is answered like a "my log is newer" deny.
+   - BrokerNode wires the gate to `InternalIsrKnowledge::eligible`.
+3. **New-leadership seed.** A new internal leader keeps every replica as the HW-counting seed, as
+   before, but never publishes that seed.
+   - Its first published ISR names only members that fetched (validated) in this leadership at
+     ≥ max(HW, electionLeo_).
+   - Undecided members stay counted until they confirm or the lag rule shrinks them.
+   - Nodes the cluster considers dead (`shrinkIsrToLive`) are fenced out of every proposal until the
+     cluster sees them again.
+
+**Safety.**
+- A committed change is durable on a majority M1, and a consensus winner needs yes-votes from a
+  majority M2. M1 ∩ M2 is non-empty, and a voter in it knows the committed version or a newer one.
+  That voter refuses any non-member.
+- Every published member was validated at ≥ the HW / leader-epoch start, and every member of the
+  newest ISR holds every committed internal record (HW = min over the maximal ISR).
+- So the consensus winner, which becomes the next internal leader, never lacks committed records, and
+  its KIP-279 directives cut only uncommitted tails.
+- An uncommitted removal is still counted in the HW, so any member the voters may still elect holds
+  everything committed.
+- The knowledge is durable, so the rule survives a whole-cluster restart.
+
+With this in place lag shrink is restored for internal partitions (MAJOR-3): a stuck member's removal
+commits on the majority, and the stuck node cannot be elected until it is re-admitted. Cost: one small
+frame per replica plus one fsync'd file write per node per internal ISR change (deaths, rejoins, lag
+shrinks only).
+
+**Residuals (documented, not fixed this round).**
+- Liveness: if no node belongs to every internal ISR (e.g. ISR_metadata = {L, A} and ISR_offsets =
+  {L, B}, then L dies), the consensus stays leaderless until L returns. This is the per-partition
+  offline state Kafka also has without unclean election.
+- A deposed internal leader can gather acks from followers that have not yet applied the new
+  consensus term. The window is one bridge cycle, because acks require following that leader at that
+  epoch.
+- MEDIUM-4, controller side (KIP-966 broker registration + clean-shutdown marker) is not covered:
+  - A restarted member elected BEFORE its first fetch is not caught on the data plane
+    (`DISABLED_E1b_UncleanRestartMovedBeforeFirstFetch`, comment updated).
+  - Neither is a restarted member whose position sits above a new leader's stale HW view.
+  - Internal partitions have the same gap: a restarted node that wins a consensus election before its
+    first internal fetch.
+- Docker DR e2e that relied on the survivor election being on by default must now set
+  `RUNE_SURVIVOR_LEADER_ELECTION=1` (MEDIUM-3). The Docker matrix was not run this round.
+
+### Other changes
+- `InMemoryTransport` (test fake) routes every pending queue through two locked helpers
+  (`enqueue_` / `take_`). The allowlisted `lock_guard` count drops from 13 to 3.
+- The CRITICAL-1 clear of published follower slots is allowlisted alongside the slice-B snapshot
+  atomics. `check_no_atomics.py`: OK.
+- Existing tests whose old expectations pinned the bugs:
+  - `NB1_BecomeLeaderUncommittedTail.HwFloorIsCommittedNotLeo`: the below-HW member now loses its
+    seat.
+  - `Critical2_InternalLeaderFailover_UncommittedTailOnSurvivor_WritableNoLoss`: runs 5 steps inside
+    the lag window. The 300-step variant became MAJOR-3's test.
+  - `Critical2_InternalPartition_ConsensusFailoverUnderCommitLoad_NoLoss`: moves via the consensus
+    election model.
+  - `LaggingReplicaShrunkFromControllerIsr_NeverElectable`: accepts controller fencing as the
+    remover.
+- DR harness additions:
+  - the controller's broker fencing for user partitions;
+  - AlterIsr responses and the partitionEpoch CAS;
+  - per-node durable internal-ISR knowledge;
+  - the consensus election with the vote rule (`consensusElect`). On internal partitions,
+    `moveLeader` refuses an unelectable node.
+
+### Suite results (Mac, build-fast Debug, protocol include = rune-protocol-fe)
+- Full ctest on a2d4092: **3245/3245 passed** (2 DISABLED, 1 uring skip on macOS), 370 s.
+- DR `rune_dr_integration_tests`: 50 passed + 2 DISABLED, ~0.4 s. `--gtest_repeat=30`: 30/30 clean.
+- `rune_replication_tests` 411/411, `rune_consensus_tests` 390/390, `rune_dynamic_balancer_tests`
+  23/23, `rune_static_assignment_emit_tests` 10/10.
+- rune-protocol-fe `rune_protocol_tests` 475/475.
+- `scripts/check_no_atomics.py`: OK.
+
+### Commits
+- rune-broker-wt31 `feat/dur-1`:
+  - 4949530 CRITICAL-1 + MAJOR-1
+  - 902cd03 MEDIUM-3 + LOW-1
+  - cf08da0 MEDIUM-1 + MEDIUM-2
+  - 667cd5c MEDIUM-4
+  - a2d4092 MAJOR-2 + MAJOR-3
+- rune-protocol-fe `feat/fetch-epoch`: a9787dc (AlterIsr partitionEpoch, AlterIsrResponse,
+  InternalIsr/Ack, FetchRequest incarnation, WorkerOp fields). It must be published (CI) together with
+  f312823/0e9b529/5260f39/40ab510 before the broker builds against the default include.
