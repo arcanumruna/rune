@@ -389,6 +389,35 @@ moderation) — worker CPU 75% -> 65% but p50 510 -> 1,057 us.  **The large CPU 
 idle strategy**: it needs less per-batch work (batching at linger 0, fewer syscalls per replicated batch, cheaper
 pass composition — §4.6).
 
+### 4.13 D2: non-worker threads off the worker cores + backoff node-driver idle (2026-10-04, k3s-node-01)
+
+Binaries: before = integ/perf-defaults 1767c3d; after = fix/d2-thread-placement 68c3a62 (wt35).  Release, gcc-13,
+conan toolchains of /root/rune-e5, rune_broker + rune_role only; client = /root/d2/rune-client-cpp rune_produce_throughput
+(same in every arm).  Config: reference §4.8 (MTU 1408, GSO/GRO on, backoff workers, RUNE_FS_LOG=0, RUNE_LOG_LEVEL=warn,
+fsync off), /root/e2e/tp.sh (vm-clean per run), 3 nodes x 1 worker (explicit RUNE_WORKER_CORE_BASE 1/2/3), acks=all,
+1 KiB, open loop 20k rec/s, 20 s, linger 0, shards 1.  One run per arm.  Per-thread CPU / last CPU / allowed list /
+involuntary switches from /proc/<pid>/task/*/{stat,status} over a ~5 s window mid-run (scripts: /root/d2b/results/ab*.sh).
+Proof of path (after): effective config `nonWorker=0 drvIdle=backoff` on every node; every non-worker thread
+`Cpus_allowed_list=0`, workers 1/2/3.  All runs errors=0, ~20,000 rec/s.
+
+| arm | p50 / p99 / p999 us | worker involuntary switches /5 s (3 nodes) | worker CPU % | node driver (threaded) CPU % | runtime thread CPU % |
+|---|---|---|---|---|---|
+| thread, before | 8,651 / 187,695 / 250,610 | 65.5k / 71.7k / 40.0k (sum 177k) | 83-85 | 47-48 (allowed 0-3) | 13-21 (allowed 0-3) |
+| thread, after | 13,173 / 184,549 / 263,193 | 396 / 437 / 369 (sum 1.2k) | 99-105 | 20 each (allowed 0) | 13-18 (allowed 0) |
+| fused, before | 598 / 40,370 / 65,536 | 9.4k / 4.8k / 6.6k (sum 20.8k) | 117-120 | – (invoker) | – (on worker) |
+| fused, after | 549 / 50,594 / 81,265 | 557 / 355 / 414 (sum 1.3k) | 120-127 | – (invoker) | – (on worker) |
+
+Result: the diagnosed mechanism is gone — worker preemption **177k -> 1.2k involuntary switches /5 s (thread, ~150x)**
+and **20.8k -> 1.3k (fused, ~16x)**; the backoff idle cut each threaded node driver **~47% -> ~20% CPU**.  **Thread
+placement latency did NOT recover**: p50 8.7 -> 13.2 ms, p99 188 -> 185 ms (single runs; p50/p99 at this level are
+scheduler-noise-sized, so neither better nor worse is claimed).  The contention moved: core 0 now carries 3 node drivers
+(~60%) + 3 runtime threads (~45%) + admin/cleaner + a share of the unpinned client — more than one core — and those
+threads now take 21-23k (drivers) and 8-18k (runtimes) involuntary switches /5 s each (before: 0.6-3k and 2.6-6.7k).  So
+thread placement on this box is bound by three co-located control planes sharing one core; the next lever is the control
+plane's own CPU (why a control-plane-only node driver still burns ~20% at backoff, the runtime ~15%), localized with an FR
+waterfall on the after binary.  Fused: p50 598 -> 549 us, p99 40 -> 51 ms (one run each; the 20k fused p99 spread is
+17-30 ms run-to-run in §4.12 and 43 ms in the D2 diagnosis — no regression claimed or excluded beyond that).
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
