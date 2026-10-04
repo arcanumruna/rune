@@ -205,7 +205,7 @@ TEST(ShardIdle, DefaultWithWakeFdsIsParkUntilWorkAfterTheAeronSpinYieldPhase) {
     EXPECT_EQ(p->shape(), (IdleShape{10, 20, 1'000, 200'000})) << "review M1: Aeron spin/yield before the first park";
 }
 
-// A9: with a doorbell the runner parks on it too, with the doorbell shape (no auto spin / yield, long park);
+// A9: with a doorbell the runner parks on it too, with the doorbell shape (Aeron spin / yield, 1 ms park);
 // RUNE_IDLE_DOORBELL=0 keeps A7's shape exactly (the A/B off arm).
 TEST(ShardIdle, DoorbellGivesTheDoorbellShapeAndOffKeepsA7) {
     FakeFds f;
@@ -216,7 +216,7 @@ TEST(ShardIdle, DoorbellGivesTheDoorbellShapeAndOffKeepsA7) {
     ASSERT_NE(p, nullptr);
     EXPECT_EQ(p->doorbell(), &bell);
     EXPECT_EQ(p->wakeFdCount(), 2) << "driver fd + the doorbell fd";
-    EXPECT_EQ(p->shape(), (IdleShape{0, 0, 1'000'000, 1'000'000}));
+    EXPECT_EQ(p->shape(), (IdleShape{10, 20, 1'000'000, 1'000'000}));
     EXPECT_NE(describeShardIdle(*idle).find("doorbell="), std::string::npos) << describeShardIdle(*idle);
 
     c.idleDoorbell = false;

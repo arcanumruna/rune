@@ -357,7 +357,7 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
             idle = "busy-spin";
         } else {
             const auto n = [](int32_t v) { return v == NodeConfig::kIdleAuto ? std::string("auto") : std::to_string(v); };
-            // A9: wake + doorbell = the doorbell shape (no auto spin / yield phase, the doorbell park).
+            // A9: wake + doorbell = the doorbell shape (Aeron spin / yield phase, then the doorbell park).
             const bool bell = cfg.shardIdleWantsWake() && cfg.idleDoorbell;
             idle = std::string(!cfg.shardIdleWantsWake() ? "backoff" : bell ? "wake+doorbell" : "wake") +
                    "{spins=" + n(cfg.idleSpins) + " yields=" + n(cfg.idleYields) + " parkUs=" +

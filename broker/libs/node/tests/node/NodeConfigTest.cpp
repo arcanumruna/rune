@@ -1447,10 +1447,11 @@ TEST(NodeConfigRegression, IdleDoorbellGarbageRefusesStartupRegression) {
     EXPECT_NE(res.error.find("must not exceed RUNE_IDLE_DOORBELL_PARK_US"), std::string::npos) << res.error;
 }
 
-// A9: the doorbell shape — no auto spin / yield phase, the doorbell park; explicit spins / yields still win.
+// A9: the doorbell shape — the Aeron spin / yield phase (measured: dropping it costs 20k p50), then the
+// doorbell park; explicit spins / yields still win.
 TEST(NodeConfig, DoorbellShardIdleShape) {
     rune::node::NodeConfig c;
-    EXPECT_EQ(c.shardIdleShape(/*doorbell=*/true), (rune::node::IdleShape{0, 0, 1'000'000, 1'000'000}));
+    EXPECT_EQ(c.shardIdleShape(/*doorbell=*/true), (rune::node::IdleShape{10, 20, 1'000'000, 1'000'000}));
     c.idleSpins = 2; c.idleYields = 3; c.idleDoorbellMinParkUs = 10; c.idleDoorbellParkUs = 500;
     EXPECT_EQ(c.shardIdleShape(true), (rune::node::IdleShape{2, 3, 10'000, 500'000}));
     EXPECT_EQ(c.shardIdleShape(false).maxParkNs, c.idleMaxParkUs * 1'000) << "no doorbell: A7's shape";

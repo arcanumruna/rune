@@ -24,7 +24,7 @@
 // A9 doorbell (detail/RingDoorbell.h): with a doorbell, the cross-thread rings this thread consumes ring an fd
 // that joins the park set, and every park first arms the doorbell and re-checks those rings (a ring holding a
 // committed record → no park: the pass runs at once).  Ring work then ends a park like a datagram does, so
-// the shape can drop the spin/yield phase and park for long (NodeConfig::shardIdleShape(doorbell=true)).
+// parks can be long (NodeConfig::shardIdleShape(doorbell=true): 1 ms, bounded by the >= 1 ms timers).
 #include <rune/consensus/IdleStrategy.h>
 #include <rune/node/IdleShape.h>
 #include <rune/node/detail/RingDoorbell.h>

@@ -72,7 +72,7 @@ makeBackoffIdle(int64_t maxParkUs) {
 //
 // A9: `bell` (may be null) — the doorbell of the rings this runner's thread consumes.  With wake fds and
 // RUNE_IDLE_DOORBELL on (default) the runner parks on it too, with the doorbell shape
-// (NodeConfig::shardIdleShape(true): no auto spin / yield phase, long parks).
+// (NodeConfig::shardIdleShape(true): the Aeron spin / yield phase, then 1 ms parks).
 inline std::unique_ptr<rune::consensus::IdleStrategy>
 makeShardIdle(const NodeConfig& cfg, const int* fds, int n, detail::RingDoorbell* bell = nullptr) {
     if (cfg.shardWorkersBusySpin()) return std::make_unique<rune::consensus::BusySpinIdleStrategy>();
