@@ -43,6 +43,8 @@ RUN conan install . --output-folder=conan-release --build=missing -s build_type=
 
 # rune-protocol sibling headers.
 COPY --from=rune-protocol include /rune-protocol/include
+# GSO-1 / A7: rune_gso + rune_client_driver_wake compile rune-protocol C sources (src/net).
+COPY --from=rune-protocol src     /rune-protocol/src
 
 # rune-fr flight recorder sibling (compiled: src + include).  The client's
 # CMakeLists wires add_library(rune_fr ...) from ${SRC}/../rune-fr → /rune-fr from
