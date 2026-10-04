@@ -707,6 +707,7 @@ void TransactionalProducerImpl::produce_(TxnPartitionState& ps, TxnSendRecord& r
     ib.topicId      = rec.topicId;
     ib.partition    = rec.partition;
     ib.baseSequence = baseSeq;
+    ib.recordCount  = builder.recordCount();
     ib.deadlineNs   = nowNs + cfg_.produceTimeoutMs * 1'000'000LL;
     ib.wireFrame.resize(msg.encodedSize());
     ib.wireFrame.resize(msg.encode(ib.wireFrame.data()));
@@ -1223,13 +1224,74 @@ void TransactionalProducerImpl::armParked_(TxnPartitionState& ps) {
     ps.parked = 0;
 }
 
+void TransactionalProducerImpl::restartSequences_(TxnPartitionState& ps) {
+    std::vector<int64_t>& mine = restartScratch_;
+    mine.clear();
+    for (const auto& [c, b] : batches_) {
+        if (b.topicId == ps.topicId && b.partition == ps.partition) mine.push_back(c);
+    }
+    std::sort(mine.begin(), mine.end(),
+              [&](int64_t x, int64_t y) { return batches_.at(x).baseSequence < batches_.at(y).baseSequence; });
+    int32_t seq = 0;
+    for (int64_t c : mine) {
+        InFlightBatch& b = batches_.at(c);
+        auto& f = b.wireFrame;
+        const auto view = rpc::Produce::decode(f.data(), f.size());
+        namespace rb = rune::protocol::batch;
+        if (!view || view->recordBatch.size() < static_cast<std::size_t>(rb::kRecordBatchOverhead)) [[unlikely]] {
+            // Unreachable (this producer encoded the frame): never re-send a
+            // frame whose identity could not be re-stamped — abortable instead.
+            poison_(OpStatus::DeliveryFailed, 0, /*bumpEpoch=*/true);
+            return;
+        }
+        {
+            constexpr std::size_t kFrameSeqOff = rpc::MessageHeader::ENCODED_SIZE + 20;  // Produce.baseSequence
+            uint8_t* batch = f.data() + (view->recordBatch.data() - f.data());
+            const std::size_t len = view->recordBatch.size();
+            rpc::detail::putLE32(f.data(), static_cast<int>(kFrameSeqOff), seq);
+            rpc::detail::putLE32(batch, rb::kBaseSequenceOffset, seq);
+            rpc::detail::putLE32(batch, rb::kCrcOffset,
+                                 static_cast<int32_t>(rune::protocol::crc32c(
+                                     batch + rb::kAttributesOffset, len - static_cast<std::size_t>(rb::kAttributesOffset))));
+        }
+        b.baseSequence  = seq;
+        seq += b.recordCount;
+        b.parked        = false;
+        b.sentSessionId = 0;  // re-sent next cycle
+        if (b.offered) {
+            // A NEW attempt id NOW (I-2): a late answer of an attempt under the
+            // old sequence (typically 28 for the batches behind the head)
+            // arrives as a superseded attempt — it never decides or parks.
+            const int64_t next = nextCorrId_++;
+            auto node = batches_.extract(c);
+            node.key() = next;
+            InFlightBatch& nb = node.mapped();
+            rpc::detail::putLE64(nb.wireFrame.data(), 16, next);  // MessageHeader.correlationId
+            nb.priorCorrIds.push_back(c);
+            for (int64_t old : nb.priorCorrIds) superseded_[old] = next;
+            nb.offered = false;  // goes out under `next` as is (no second re-key)
+            batches_.insert(std::move(node));
+        }
+    }
+    ps.parked           = 0;
+    ps.lastAckedSeq     = -1;
+    ps.nextBaseSequence = seq;
+}
+
 void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_t len) {
     auto opt = rpc::ProduceResponse::decode(buf, len);
     if (!opt) return;
     // Re-review 1 NEW-4(a): DuplicateSequence (Kafka DUPLICATE_SEQUENCE_NUMBER) =
     // already stored, offset unknown: an OK.
-    const int16_t ec = opt->errorCode == static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence)
-                           ? kOk : opt->errorCode;
+    // D6: UnknownProducerId (the broker forgot this producer: its batch was NOT
+    // appended) shares OutOfOrderSequence's parking (behind an older unresolved
+    // batch / an answer that may predate an OK).  On the next-in-line batch,
+    // KIP-360 (D6 review M2, Kafka TransactionManager.canRetry): retention
+    // (lastAckedOffset < logStartOffset) restarts the partition's sequences and
+    // KEEPS the transaction; otherwise it is abortable with code 28.
+    const int16_t ec = opt->errorCode == static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence) ? kOk
+                                                                                                 : opt->errorCode;
+    const bool unknownPid = ec == static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId);
     auto it = batches_.find(opt->correlationId);
     if (it == batches_.end()) {
         // I-2: an earlier attempt's answer.  Its OK still decides the batch
@@ -1248,6 +1310,9 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
         if (ps != nullptr) {
             ps->lastAckedSeq = std::max(ps->lastAckedSeq, it->second.baseSequence);
             ps->lastAckTick  = sendTick_;
+            // D6 review M2: the max acked LAST offset (a DuplicateSequence OK -1 carries none).
+            if (opt->baseOffset >= 0)
+                ps->lastAckedOffset = std::max(ps->lastAckedOffset, opt->baseOffset + it->second.recordCount - 1);
         }
         eraseBatch_(it);
         return;
@@ -1277,7 +1342,7 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
         ib.sentSessionId = 0;
         return;
     }
-    if (ec == kOutOfOrderSequence && ps != nullptr) {
+    if ((ec == kOutOfOrderSequence || unknownPid) && ps != nullptr) {
         // I-1 (Kafka parity, ruling 3): an older batch of this partition is
         // still unresolved -> an earlier frame was lost: park, retry later.
         const InFlightBatch* gap = nullptr;
@@ -1314,8 +1379,20 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
             ib.sentSessionId = 0;
             return;
         }
+        if (unknownPid && opt->logStartOffset >= 0 && ps->lastAckedOffset < opt->logStartOffset) {
+            // D6 review M2 (KIP-360): retention removed every record of ours —
+            // the broker accepts this producer again from sequence 0; nothing
+            // of ours on this partition is stored at or above the log start,
+            // so the restarted batches are not duplicates (the accepted
+            // KIP-360 window: an earlier attempt below the log start whose OK
+            // was lost outright).  The transaction is kept.
+            restartSequences_(*ps);
+            return;
+        }
         // M-2: a sequence error on the next-in-line batch, not a fence — the
-        // transaction is abortable (Kafka: transactional OOS -> abortable).
+        // transaction is abortable (Kafka: transactional OOS -> abortable;
+        // UNKNOWN_PRODUCER_ID that is not retention -> abortable, the code the
+        // app sees stays 28 — D6 review M2).
         eraseBatch_(it);
         poison_(OpStatus::BrokerError, static_cast<uint16_t>(ec), /*bumpEpoch=*/true);
         return;

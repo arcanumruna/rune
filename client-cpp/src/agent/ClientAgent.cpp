@@ -793,7 +793,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             if (produceResponseFn_) {
                 produceResponseFn_(opt->correlationId, off, opt->errorCode);  // test-harness hook
             } else {
-                produceAcks_.push_back(ProduceAck{opt->correlationId, off, opt->errorCode});
+                produceAcks_.push_back(ProduceAck{opt->correlationId, off, opt->errorCode, opt->logStartOffset});
             }
         }
         if (forwardProduceResponses_ && egressObserver_) egressObserver_(tid, buf, len);

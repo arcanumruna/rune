@@ -2160,9 +2160,31 @@ int ProducerImpl::flushBatches(
 //  G. No new batch of a partition goes out while it has parked batches (C1)
 //     or is unresolved (E) — Kafka stops draining a partition with a retry
 //     outstanding.
+//  U. D6 — UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID, KIP-360 canRetry) on
+//     batch b (current attempt): the broker's PROVEN producer state has no
+//     entry for this producer and b does not start at sequence 0 — b was NOT
+//     appended.  C1 / C2 / C2b / C3 apply first, exactly as for an OOS (the
+//     answer may be a gap in front of b, predate an OK, or be explained by a
+//     failed predecessor's gap).  Then, in place of C4 (b is next in line):
+//     U1. lastAckedOffset < the answer's logStartOffset (every record this
+//         partition had acked is below the log start: retention removed the
+//         producer state legitimately) -> the partition is RE-SEQUENCED as in
+//         C3 (new identity per F; b and every batch behind it re-stamped and
+//         re-sent) — nothing fails.
+//     U2. otherwise (the broker should still know us: an acked record of ours
+//         is at/above the log start, or nothing was acked and the log start is
+//         0) -> ALSO re-sequenced (D6 review M1, Kafka canRetry's idempotent
+//         branch: UNKNOWN_PRODUCER_ID always retries with an epoch bump).  Any
+//         attempt of b would sit above lastAckedOffset >= logStart, inside the
+//         rebuilt range, and would have created an entry — so the re-send is
+//         provably duplicate-free (no window at all, unlike U1).  The acked-
+//         data case is counted (unknownProducerIdStateLoss: the broker lost
+//         state it should have kept); it is never an app-visible failure.
+//     lastAckedOffset (per partition) = the max last offset of every OK (B).
 // ---------------------------------------------------------------------------
 
-void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode)
+void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
+                                     int64_t logStartOffset)
 {
     const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(correlationId) || batchcorr::ordinal(correlationId) != ordinal_) return;
@@ -2193,6 +2215,8 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch) {
             ps.lastAckedSeq = std::max(ps.lastAckedSeq, b->baseSequence + b->recordCount - 1);
         }
+        // D6: the max acked LAST offset (a known-old OK -1 carries none).
+        if (off >= 0) ps.lastAckedOffset = std::max(ps.lastAckedOffset, off + b->recordCount - 1);
         ps.lastAckTick = sendTick_;
         releaseResolved_(ps, *b);
         reclaimAckRing_(ps);
@@ -2219,7 +2243,9 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         markDirty_(ps);
         return;
     }
-    if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence) &&
+    // D6: UnknownProducerId shares C1 / C2 / C2b with OOS, then rule U.
+    const bool unknownPid = ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId);
+    if ((ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence) || unknownPid) &&
         b->baseSequence >= 0) {
         const bool olderLive = ps.inflight.anyOlderLive(*b, [&](const InFlightBatch& o) {
             return o.producerId == b->producerId && o.producerEpoch == b->producerEpoch;
@@ -2255,18 +2281,36 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
             return;
         }
         if (b->baseSequence != ps.lastAckedSeq + 1) {  // C3: a failed predecessor's gap
-            resequence_(ps);
+            resequence_(ps);                             // (an UnknownProducerId too: the gap explains it)
             return;
         }
-        // C4: the next-in-line batch was rejected — it fails, the rest move on.
-        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
-                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
-        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
-                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
-        unpark_(ps, *b);
-        ps.inflight.release(*b);
+        if (!unknownPid) {
+            // C4: the next-in-line batch was rejected — it fails, the rest move on.
+            emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                          OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+            completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                           static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+            unpark_(ps, *b);
+            ps.inflight.release(*b);
+            resequence_(ps);
+            reclaimAckRing_(ps);
+            return;
+        }
+        // U1 (lastAckedOffset < logStartOffset: retention removed our state).
+        // Accepted window (D6 review, same as Kafka KIP-360): U1 proves only THIS attempt was not appended.
+        // Earlier attempts on the same lane were answered first (one FIFO publication); cross-lane ones park
+        // via C2b above.  Left: an earlier attempt whose OK is lost outright AND whose data was then retained /
+        // evicted away before a producer-state rebuild — then the re-sequenced re-send duplicates it.
+        // U2 (D6 review M1): otherwise — b provably not stored (see U2 above): re-sequenced too, no window.
+        if (ps.lastAckedOffset >= 0 && logStartOffset >= 0 && ps.lastAckedOffset >= logStartOffset) [[unlikely]] {
+            ++unknownPidStateLoss_;
+            std::fprintf(stderr,
+                         "ProducerImpl: topic=%d part=%d UnknownProducerId with acked offset %lld >= log start %lld: "
+                         "the broker lost producer state (batch not appended; re-sequenced)\n",
+                         ps.topicId, ps.partition, static_cast<long long>(ps.lastAckedOffset),
+                         static_cast<long long>(logStartOffset));
+        }
         resequence_(ps);
-        reclaimAckRing_(ps);
         return;
     }
     if (ec == static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation)) {

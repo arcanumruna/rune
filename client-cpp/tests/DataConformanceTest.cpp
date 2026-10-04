@@ -155,12 +155,12 @@ TEST(DataCodecConformance, ProduceKeyOnly) {
 }
 
 // ===========================================================================
-// 3. produce_response.bin  (38 bytes)
+// 3. produce_response.bin  (46 bytes — D6: + logStartOffset, -1 here)
 //    ProduceResponse{ errorCode=0(OK), partition=7, baseOffset=123456 }
 // ===========================================================================
 TEST(DataCodecConformance, ProduceResponse) {
     const auto golden = readVector("produce_response.bin");
-    ASSERT_EQ(golden.size(), 38u);
+    ASSERT_EQ(golden.size(), 46u);
 
     // --- Decode-golden ---
     auto view = cc::decodeProduceResponse(golden.data(), golden.size());
@@ -170,6 +170,7 @@ TEST(DataCodecConformance, ProduceResponse) {
     EXPECT_EQ(view->errorCode,     static_cast<int16_t>(0));   // OK
     EXPECT_EQ(view->partition,     7);
     EXPECT_EQ(view->baseOffset,    123456LL);
+    EXPECT_EQ(view->logStartOffset, -1);
 
     // --- Encode-golden ---
     std::array<uint8_t, 64> enc{};
@@ -177,9 +178,30 @@ TEST(DataCodecConformance, ProduceResponse) {
         enc.data(), enc.size(),
         static_cast<int16_t>(0), 7, 123456LL,
         kSessionId, kCorrelationId);
-    ASSERT_EQ(n, 38u);
+    ASSERT_EQ(n, 46u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_response.bin";
+}
+
+// D6 compat: the pre-D6 38-byte frame an old broker sends still decodes, with
+// logStartOffset -1 (not carried); the UnknownProducerId vector carries it.
+TEST(DataCodecConformance, ProduceResponseV0AndUnknownProducerIdRegression) {
+    const auto v0 = readVector("produce_response_v0.bin");
+    ASSERT_EQ(v0.size(), 38u);
+    auto a = cc::decodeProduceResponse(v0.data(), v0.size());
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->baseOffset, 123456LL);
+    EXPECT_EQ(a->logStartOffset, -1);
+    const auto up = readVector("produce_response_unknown_pid.bin");
+    auto b = cc::decodeProduceResponse(up.data(), up.size());
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(b->errorCode, static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId));
+    EXPECT_EQ(b->logStartOffset, 500);
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = cc::encodeProduceResponse(
+        enc.data(), enc.size(), b->errorCode, 7, 0, kSessionId, kCorrelationId, 500);
+    ASSERT_EQ(n, up.size());
+    EXPECT_EQ(std::memcmp(enc.data(), up.data(), n), 0);
 }
 
 // ===========================================================================

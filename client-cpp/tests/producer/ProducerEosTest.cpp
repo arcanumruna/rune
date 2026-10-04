@@ -639,7 +639,9 @@ TEST(EosOosRegression, FollowersOfARejectedHeadAreResequencedNotFailedRegression
     r.sendRecord(p, topic, 0, 1);  // H
     r.sendRecord(p, topic, 1, 2);  // F1
     r.sendRecord(p, topic, 2, 3);  // F2
-    ASSERT_TRUE(r.drive([&] { return r.gw.oosAnswers >= 3; }));  // F1, F2 met the gap
+    // F1, F2 met the gap (D6: a never-written head leaves no producer entry, so
+    // a current client gets UnknownProducerId there — the same "not appended").
+    ASSERT_TRUE(r.drive([&] { return r.gw.oosAnswers + r.gw.unknownPidAnswers >= 3; }));
     for (int i = 0; i < 20; ++i) r.step();
     r.gw.releaseAnswer(1);
     ASSERT_TRUE(r.drive([&] { return L.count.size() >= 3; })) << "completed " << L.count.size();

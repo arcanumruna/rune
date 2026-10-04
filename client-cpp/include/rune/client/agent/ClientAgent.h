@@ -414,6 +414,7 @@ public:
         int64_t correlationId;
         int64_t baseOffset;  ///< meaningful when errorCode == 0 (-1: offset unknown)
         int16_t errorCode;   ///< rune::protocol::client::ErrorCode (0 = OK)
+        int64_t logStartOffset = -1;  ///< D6: the partition's log start (with UnknownProducerId)
     };
     [[nodiscard]] std::span<const ProduceAck> produceAcks() const noexcept {
         return {produceAcks_.data(), produceAcks_.size()};
