@@ -67,7 +67,11 @@ bool InternalIsrKnowledge::offer(const InternalIsrState& s)
     // commit an ISR change, nor plant a stale candidacy view, through a node
     // that already moved on.
     if (const int64_t term = consensusTerm(); term >= 0 && s.leaderEpoch < term) {
-        ++staleTermRefusals_;
+        if ((staleTermRefusals_++ & 1023u) == 0)
+            spdlog::warn("InternalIsrKnowledge: refused internal ISR state topic={} part={} "
+                         "(epoch {}, version {}) — older than this node's consensus term {} "
+                         "(refusals so far: {})", s.topicId, s.partition, s.leaderEpoch, s.version,
+                         term, staleTermRefusals_);
         return false;
     }
     for (auto& e : entries_) {
