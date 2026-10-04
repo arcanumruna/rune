@@ -145,6 +145,8 @@ public:
     /// RUNE_GATEWAY_PRODUCE_CREDITS (NodeConfig bounds it to 1 .. kMaxSessionProduceCredits).
     static constexpr uint32_t kDefaultSessionProduceCredits = 1024;
     static constexpr uint32_t kMaxSessionProduceCredits     = 4096;   // 1/4 of the ack queue (static_assert, .cpp)
+    /// Set before any session exists (BrokerNode: at gateway construction) — the
+    /// paused-session count is kept against the budget in force.
     void setSessionProduceCredits(uint32_t n) noexcept {
         sessionProduceCredits_ = (n >= 1 && n <= kMaxSessionProduceCredits) ? n : kDefaultSessionProduceCredits;
     }
