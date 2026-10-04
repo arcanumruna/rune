@@ -1241,6 +1241,39 @@ TEST(UnknownProducerIdRegression, RebuiltStateAfterRetentionAnswersUnknownProduc
     fs::remove_all(dir);
 }
 
+// D6 review L1: retention removed P's data batches but P's COMMIT marker survives — the rebuilt entry carries P's
+// epoch only (no sequence).  P's next batch at seq k > 0 must answer UnknownProducerId (Kafka evicts such a producer
+// from its state), not "known entry + gap" OutOfOrderSequence; epoch fencing of P stays.
+TEST(UnknownProducerIdRegression, MarkerOnlyRebuiltEntryAnswersUnknownProducerIdRegression) {
+    const std::string dir = tmpPath("psm_d6_l1");
+    fs::create_directories(dir);
+    {
+        rune::storage::Log log(dir, /*segmentRollBytes=*/256);
+        log.recover();
+        auto put = [&](const std::vector<uint8_t>& b) { ASSERT_GE(log.append(b, log.logEndOffset()), 0); };
+        for (int32_t s = 0; s < 6; ++s) put(d6Batch(/*P*/ 7, 2, s, log.logEndOffset()));
+        for (int32_t s = 0; s < 12; ++s) put(d6Batch(/*Q*/ 8, 0, s, log.logEndOffset()));   // rolls P's segments
+        {   // P's marker: the last batch, in the active segment (survives retention)
+            rune::protocol::RecordBatchBuilder m(log.logEndOffset(), 1000);
+            m.setProducerId(7); m.setProducerEpoch(2); m.setControl(true);
+            m.append("", "", 1000);
+            put(m.build());
+        }
+        ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/0), 0);
+        ASSERT_GE(log.logStartOffset(), 6) << "precondition: retention removed every DATA batch of P";
+
+        ProducerStateManager rebuilt;
+        ASSERT_TRUE(rebuilt.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_NE(rebuilt.entry(0, 7, 0), nullptr) << "precondition: the surviving marker made an epoch-only entry";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 2, 6, 6).isUnknownProducerId()) << "marker-only entry, seq != 0";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 2, 0, 0).isAccept()) << "seq 0 at the marker's epoch";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isFenced()) << "the marker's epoch still fences";
+        rebuilt.update(0, 7, 0, 2, 0, 0, log.logEndOffset());   // P appends again at its epoch
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 2, 5, 5).isOos()) << "a real gap after data is OOS again";
+    }
+    fs::remove_all(dir);
+}
+
 TEST(UnknownProducerIdRegression, ProtocolIllegalSequencesStayOutOfOrderRegression) {
     ProducerStateManager m;
     EXPECT_TRUE(m.validate(0, 5, 0, 0, -1, 0).isOos());

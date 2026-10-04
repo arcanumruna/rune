@@ -3064,6 +3064,23 @@ TEST(NonShardNonBlockingRegression, OwnedLogSyncIntervalZeroNeverSyncsRegression
 // the cleaner gate) move only once that request completed (never at submit).
 // ============================================================================
 
+// Drive passes until the recovery-point checkpoint is observably InFlight.  The checkpoint is QUEUED while
+// completions are reaped (end of a pass) and SUBMITTED at the next pass's background-disk step, before that pass
+// reaps — so the pass after it is queued runs with reaping paused and leaves it InFlight (letting that pass reap
+// let a fast flusher complete it unobserved: flaky under parallel load).  A checkpoint blocked on a batched
+// directory fsync needs one reaping pass in between (alternate).  Leaves reaping paused.
+template <class Shard, class AcksT>
+void driveUntilCheckpointInFlight(Shard& s, AcksT& a, int64_t t0) {
+    using RpStage = rune::storage::Log::RpStage;
+    bool pausedLast = false;
+    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::InFlight; ++i) {
+        const bool pause = s.w.recoveryPointQueuedForTest() && !pausedLast;
+        s.w.setReapPausedForTest(pause); s.w.doWork(t0 + i); s.w.setReapPausedForTest(true);
+        pausedLast = pause;
+        a.drain(s.w); std::this_thread::yield();
+    }
+}
+
 TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealCompletes) {
     StrictShard s(/*rollBytes=*/512, {1}, GetParam());
     using RpStage = rune::storage::Log::RpStage;
@@ -3081,10 +3098,7 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     // Release completions ONE pass at a time until the checkpoint is submitted:
     // it is then in flight, and nothing moved yet (F2: never at submit).
     Acks a;
-    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::InFlight; ++i) {
-        s.w.setReapPausedForTest(false); s.w.doWork(100 + i); s.w.setReapPausedForTest(true);
-        a.drain(s.w); std::this_thread::yield();
-    }
+    driveUntilCheckpointInFlight(s, a, 100);
     ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight);
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u) << "ONE write+fdatasync request";
     EXPECT_EQ(s.log->persistedRecoveryPoint(), 0) << "the persisted R moved at submit";
@@ -3143,12 +3157,8 @@ TEST(ShardNonBlockingRegression, RecoveryPointCheckpointFsyncErrorIsFailStop) {
     ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed
     Acks a;
     using RpStage = rune::storage::Log::RpStage;
-    // Run until the checkpoint's write+fdatasync is in flight (completions held
-    // after each pass so it cannot complete unobserved).
-    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::InFlight; ++i) {
-        s.w.setReapPausedForTest(false); s.w.doWork(1 + i); s.w.setReapPausedForTest(true);
-        a.drain(s.w); std::this_thread::yield();
-    }
+    // Run until the checkpoint's write+fdatasync is in flight (completions held).
+    driveUntilCheckpointInFlight(s, a, 1);
     ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight);
     ASSERT_FALSE(s.log->storageFailed());
     s.w.forceFlushErrorForTest(EIO);                       // ... and it fails
@@ -3175,10 +3185,7 @@ TEST(ShardNonBlockingRegression, RecoveryPointCheckpointLostToPreviousOwnerIsRep
     Acks a;
     ASSERT_EQ(s.produce(1, batchAt(0, 1, 600), 0, 1), 1);
     ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 1), 1);   // roll: A sealed
-    for (int i = 0; i < kCap && s.log->recoveryCheckpointStage() != RpStage::InFlight; ++i) {
-        s.w.setReapPausedForTest(false); s.w.doWork(1 + i); s.w.setReapPausedForTest(true);
-        a.drain(s.w); std::this_thread::yield();
-    }
+    driveUntilCheckpointInFlight(s, a, 1);
     ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight);
     const int64_t want = s.log->recoveryPoint();
     // Ownership moves away while the checkpoint is in flight; its completion

@@ -1226,6 +1226,8 @@ public:
     }
     /// Hold io completions in the backend (no reap) so tests deliver them.
     void setReapPausedForTest(bool on) noexcept { reapPausedForTest_ = on; }
+    /// A recovery-point checkpoint is queued (prepared at the next pass's background-disk step).
+    [[nodiscard]] bool recoveryPointQueuedForTest() const noexcept { return !rpQueue_.empty(); }
     /// Every reaped completion is rewritten to carry `err` (0 = off).
     void forceFlushErrorForTest(int err) noexcept { forcedFlushErrorForTest_ = err; }
     /// Requests a background flush of an OWNED log; returns its token, or
