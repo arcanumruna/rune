@@ -57,6 +57,8 @@ RUN conan install . --output-folder=conan-release --build=missing -s build_type=
 # in this image. Supplied via a BuildKit named build context:
 #   docker build --build-context rune-protocol=../rune-protocol ...
 COPY --from=rune-protocol include /rune-protocol/include
+# GSO-1 / A7: rune_gso + rune_driver_wake compile rune-protocol C sources (src/net).
+COPY --from=rune-protocol src     /rune-protocol/src
 
 # ── rune-fr flight recorder sibling (compiled: src + include) ─────────────────
 # The root CMakeLists wires add_library(rune_fr ...) from ${SRC}/../rune-fr, which
@@ -85,6 +87,7 @@ RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_INTEGRATION_TESTING=OFF \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
     && cmake --build build --target rune_broker rune_role
