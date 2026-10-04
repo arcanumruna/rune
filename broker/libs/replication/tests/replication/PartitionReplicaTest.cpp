@@ -4595,3 +4595,116 @@ TEST(InternalIsrRegression, StateOlderThanConsensusTermNeitherPersistedNorAcked)
     ASSERT_NE(reloaded.latest(-3, 0), nullptr);
     EXPECT_EQ(reloaded.latest(-3, 0)->version, 1) << "the stale state reached the disk";
 }
+
+// Re-review 2026-10-04 (fix round 2) MEDIUM-C: the lag shrink restored for
+// internal partitions (MAJOR-3) is safe only where the removal commits on a
+// majority's durable knowledge that the consensus vote rule reads.  An internal
+// partition OUTSIDE that store (__topic_schemas, -4: self-managed, not in the
+// replica registry) must not lag-shrink — once replicated it would shrink at
+// once while the shrunk node stays electable (MAJOR-2 reopened for schemas).
+// User partitions and partitions on the internal-ISR store still shrink.
+TEST(InternalIsrRegression, InternalPartitionOutsideKnowledgeStoreNeverLagShrinks) {
+    TempDir lDir("iisr_c_L"), fDir("iisr_c_F"), gDir("iisr_c_G");
+    rune::storage::Log lLog(lDir.path), fLog(fDir.path), gLog(gDir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2, kG = 3;
+    std::vector<NodeId> all = {kL, kF, kG};
+    auto cfgFor = [&](NodeId id) {
+        PartitionConfig c = makeConfig(id, /*lagMs=*/10, /*lagOff=*/1'000'000);
+        c.topicId = -4;                          // __topic_schemas: no knowledge store wired
+        return c;
+    };
+    PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
+    PartitionReplica f(cfgFor(kF), Role::Follower, 0, all, all, &fLog, &transport);
+    PartitionReplica g(cfgFor(kG), Role::Follower, 0, all, all, &gLog, &transport);
+    l.becomeLeader(1, all);
+    f.becomeFollower(1, kL);
+    g.becomeFollower(1, kL);
+    transport.setLeader(&l);
+    transport.addFollower(kF, &f);               // kG never fetches
+    ASSERT_GE(l.append(makePayload(1)), 0);
+    int64_t clock = 0;
+    for (int i = 0; i < 100; ++i) {              // 100 ms >> replicaLagMaxMs = 10 ms
+        clock += 1'000'000LL;
+        l.doWork(clock); f.doWork(clock);
+        transport.pump(clock);
+    }
+    const auto& isr = l.isr();
+    EXPECT_NE(std::find(isr.begin(), isr.end(), kG), isr.end())
+        << "an internal partition outside the internal-ISR store lag-shrank a member";
+}
+
+// Re-review 2026-10-04 (fix round 2) LOW-A: the knowledge file fails CLOSED.
+// A file that exists but does not validate (corrupt, short, unknown version)
+// means this node can no longer prove what it acked: it refuses to VOTE for
+// anyone (a voter in the commit/vote intersection with lost knowledge would
+// break the safety argument) until it durably holds a fresh state again.  Only
+// an ABSENT file is "fresh".  (Refuse-to-vote rather than refuse-to-start: the
+// node keeps serving its user partitions and self-heals from the leader.)
+TEST(InternalIsrRegression, CorruptKnowledgeFileFailsClosed_RefusesToVote) {
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 4; a.version = 2; a.count = 3;
+    a.members[0] = 1; a.members[1] = 2; a.members[2] = 3;
+    auto write = [](const std::string& p, const std::vector<uint8_t>& b) {
+        std::FILE* fp = std::fopen(p.c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        std::fwrite(b.data(), 1, b.size(), fp);
+        std::fclose(fp);
+    };
+    auto read = [](const std::string& p) {
+        std::vector<uint8_t> b;
+        std::FILE* fp = std::fopen(p.c_str(), "rb");
+        if (!fp) return b;
+        int ch;
+        while ((ch = std::fgetc(fp)) != EOF) b.push_back(static_cast<uint8_t>(ch));
+        std::fclose(fp);
+        return b;
+    };
+    TempDir d("iisr_lowa");
+    const std::string path = d.path + "/internal-isr.state";
+    {
+        InternalIsrKnowledge fresh(path);
+        EXPECT_TRUE(fresh.eligible(1)) << "an absent file is the fresh state";
+        ASSERT_TRUE(fresh.offer(a));
+    }
+    const std::vector<uint8_t> good = read(path);
+    ASSERT_GT(good.size(), 24u);
+    struct Case { const char* name; std::vector<uint8_t> bytes; };
+    std::vector<Case> cases;
+    { auto b = good; b[b.size() / 2] ^= 0x5A; cases.push_back({"corrupt (checksum)", b}); }
+    { auto b = good; b.resize(b.size() - 9); cases.push_back({"short", b}); }
+    { auto b = good; b[4] = 99; cases.push_back({"unknown version", b}); }
+    cases.push_back({"tiny", std::vector<uint8_t>{1, 2, 3}});
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        write(path, c.bytes);
+        InternalIsrKnowledge k(path);
+        EXPECT_FALSE(k.eligible(1)) << "voted with unprovable knowledge (file failed validation)";
+        EXPECT_FALSE(k.eligible(2));
+        // A fresh, durably persisted state of the gate partition restores the vote.
+        InternalIsrState b = a;
+        b.leaderEpoch = 5; b.version = 1;
+        ASSERT_TRUE(k.offer(b));
+        EXPECT_TRUE(k.eligible(1));
+        InternalIsrKnowledge reloaded(path);
+        EXPECT_TRUE(reloaded.eligible(1)) << "the rewritten file must validate";
+    }
+}
+
+// LOW-A: a failed DIRECTORY fsync (the rename may not be durable) must not be
+// reported as persisted — the caller would ack a state that can vanish.
+TEST(InternalIsrRegression, DirectoryFsyncFailureIsNotAcked) {
+    TempDir d("iisr_lowa_dir");
+    const std::string dir = d.path + "/k";
+    std::filesystem::create_directories(dir);
+    InternalIsrKnowledge k(dir + "/internal-isr.state");
+    // write+search but no read: files can be created/renamed in it, but the
+    // directory cannot be opened for the fsync.
+    std::filesystem::permissions(dir, std::filesystem::perms::owner_write | std::filesystem::perms::owner_exec);
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 1; a.version = 1; a.count = 1; a.members[0] = 1;
+    const bool ok = k.offer(a);
+    std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+    EXPECT_FALSE(ok) << "acked a state whose directory entry was never fsynced";
+    EXPECT_EQ(k.latest(-3, 0), nullptr);
+}

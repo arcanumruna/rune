@@ -2033,9 +2033,17 @@ bool PartitionReplica::updateIsr_(int64_t nowNs)
     // INTERNAL partition (led by the consensus leader) that is safe because the
     // change commits only on a majority's durable knowledge and the consensus
     // never votes for a node outside the newest durable ISR (InternalIsrKnowledge).
+    //
+    // Re-review MEDIUM-C: only where the removal is decided by a quorum the
+    // election respects — user partitions, partitions whose ISR the controller
+    // commits (isrChannel_: the coordinator partitions, MEDIUM-B), and
+    // partitions on the internal-ISR store.  Any other internal partition
+    // (__topic_schemas, -4: self-managed, outside the store) never lag-shrinks:
+    // a shrunk node would stay electable while missing acked records.
     isrManager_->setIsr(committedIsr_);
-    (void)isrManager_->maybeShrinkIsr(nowNs, logEndOffset_(), cfg_.replicaLagMaxMs,
-                                      cfg_.replicaLagMaxOffset);
+    if (!internalPartition_() || internalQuorum_() || isrChannel_ != nullptr)
+        (void)isrManager_->maybeShrinkIsr(nowNs, logEndOffset_(), cfg_.replicaLagMaxMs,
+                                          cfg_.replicaLagMaxOffset);
     for (std::size_t i = 0; i < followerSlots_.size(); ++i) {
         const FollowerSlot& sl = followerSlots_.at(i);
         if (sl.id == cfg_.selfId) continue;

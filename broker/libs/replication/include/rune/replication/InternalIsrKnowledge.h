@@ -29,6 +29,16 @@
 //
 // Single-writer: the CONTROL thread (internal replicas, the transport handlers
 // and the Election all run there).  Cold: written only on ISR changes.
+//
+// fsync placement (re-review LOW-A): each persisted change costs two fsyncs
+// (the file, then its directory) on the control/consensus duty-cycle thread.
+// They stay there deliberately: the ack must follow the durable write
+// (persist-then-ack), the store has one writer, and handing it to another
+// thread would need a ring round-trip per change for no gain.  It is cold —
+// only ISR changes of __cluster_metadata (deaths, rejoins, lag shrinks; the
+// coordinator partitions moved to the controller path, MEDIUM-B), a few
+// milliseconds each, orders of magnitude below the consensus heartbeat /
+// election timeouts (hundreds of ms+) — and never on a produce/fetch path.
 // ---------------------------------------------------------------------------
 
 #include <rune/replication/Types.h>
@@ -63,8 +73,17 @@ class InternalIsrKnowledge {
 public:
     /// Memory only (unit rigs).
     InternalIsrKnowledge() = default;
-    /// Durable: loads `path` if present (a missing / corrupt file = no
-    /// knowledge yet, i.e. every node eligible — the fresh-cluster state).
+    /// Durable: loads `path` if present.  An ABSENT file = no knowledge yet
+    /// (every node eligible — the fresh-cluster state).  A file that exists
+    /// but does not validate (corrupt, short, unknown version, unreadable)
+    /// FAILS CLOSED (re-review LOW-A): votable() is false and eligible()
+    /// denies every candidate — this node can no longer prove what it acked,
+    /// so it refuses to vote — until it durably persists a fresh state (any
+    /// successful offer(), i.e. a state from the current leadership: MEDIUM-A
+    /// refuses older ones).  Chosen over refusing to start: equally safe (a
+    /// non-voter can never help elect a non-member), while the node keeps
+    /// serving its user partitions and self-heals from the leader with no
+    /// operator action.
     explicit InternalIsrKnowledge(std::string path);
 
     InternalIsrKnowledge(const InternalIsrKnowledge&)            = delete;
@@ -97,6 +116,10 @@ public:
     void setConsensusTermSource(TermSource fn, const void* ctx) noexcept { termFn_ = fn; termCtx_ = ctx; }
     [[nodiscard]] int64_t consensusTerm() const noexcept { return termFn_ ? termFn_(termCtx_) : -1; }
 
+    /// False after a failed validation of an existing file, until a fresh
+    /// state was persisted (LOW-A).
+    [[nodiscard]] bool votable() const noexcept { return votable_; }
+
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
     [[nodiscard]] uint64_t persistsForTest() const noexcept { return persists_; }
     [[nodiscard]] uint64_t staleTermRefusals() const noexcept { return staleTermRefusals_; }
@@ -104,6 +127,7 @@ public:
 private:
     bool persist_();
     void load_();
+    void failClosed_(const char* why);
 
     TermSource                    termFn_  = nullptr;
     const void*                   termCtx_ = nullptr;
@@ -111,6 +135,7 @@ private:
     std::vector<InternalIsrState> entries_;
     uint64_t                      persists_ = 0;
     uint64_t                      staleTermRefusals_ = 0;
+    bool                          votable_ = true;
 };
 
 } // namespace rune::replication

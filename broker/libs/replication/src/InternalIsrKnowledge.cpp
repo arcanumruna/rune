@@ -12,6 +12,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
@@ -49,6 +50,7 @@ const InternalIsrState* InternalIsrKnowledge::latest(int32_t topicId, int32_t pa
 
 bool InternalIsrKnowledge::eligible(int32_t candidate) const noexcept
 {
+    if (!votable_) return false;   // LOW-A: unprovable knowledge — refuse to vote
     for (const auto& e : entries_)
         if (!e.contains(candidate)) return false;
     return true;
@@ -71,12 +73,12 @@ bool InternalIsrKnowledge::offer(const InternalIsrState& s)
         if (!s.newerThan(e.leaderEpoch, e.version)) return true;   // holds s or newer
         const InternalIsrState prev = e;
         e = s;
-        if (persist_()) return true;
+        if (persist_()) { votable_ = true; return true; }
         e = prev;                                                    // never claim an unpersisted state
         return false;
     }
     entries_.push_back(s);
-    if (persist_()) return true;
+    if (persist_()) { votable_ = true; return true; }
     entries_.pop_back();
     return false;
 }
@@ -112,9 +114,17 @@ bool InternalIsrKnowledge::persist_()
         spdlog::error("InternalIsrKnowledge: could not persist {} — the ISR change is NOT acked", path_);
         return false;
     }
+    // The rename is durable only once the directory entry is (LOW-A): a failed
+    // directory fsync is a failed persist — the caller never acks it.
     const std::string dir = std::filesystem::path(path_).parent_path().string();
     const int dfd = ::open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+    const bool dirOk = dfd >= 0 && ::fsync(dfd) == 0;
+    if (dfd >= 0) ::close(dfd);
+    if (!dirOk) {
+        spdlog::error("InternalIsrKnowledge: directory fsync for {} failed — the ISR change is NOT acked",
+                      path_);
+        return false;
+    }
     return true;
 }
 
@@ -122,7 +132,11 @@ void InternalIsrKnowledge::load_()
 {
     if (path_.empty()) return;
     const int fd = ::open(path_.c_str(), O_RDONLY);
-    if (fd < 0) return;
+    if (fd < 0) {
+        if (errno == ENOENT) return;   // absent: the fresh state (never acked anything)
+        failClosed_("unreadable");
+        return;
+    }
     std::vector<uint8_t> buf;
     uint8_t chunk[4096];
     for (;;) {
@@ -131,18 +145,16 @@ void InternalIsrKnowledge::load_()
         buf.insert(buf.end(), chunk, chunk + n);
     }
     ::close(fd);
-    if (buf.size() < kHdr + 8) return;
+    if (buf.size() < kHdr + 8) { failClosed_("short"); return; }
     const uint8_t* p = buf.data();
-    if (get<uint32_t>(p) != kMagic || get<uint32_t>(p) != kVersion) return;
+    if (get<uint32_t>(p) != kMagic) { failClosed_("bad magic"); return; }
+    if (get<uint32_t>(p) != kVersion) { failClosed_("unknown version"); return; }
     const uint32_t count = get<uint32_t>(p);
     (void)get<uint32_t>(p);
-    if (buf.size() != kHdr + count * kEnt + 8) return;
+    if (buf.size() != kHdr + static_cast<std::size_t>(count) * kEnt + 8) { failClosed_("short"); return; }
     const uint64_t sum = fnv1a(buf.data(), buf.size() - 8);
     const uint8_t* q = buf.data() + buf.size() - 8;
-    if (get<uint64_t>(q) != sum) {
-        spdlog::error("InternalIsrKnowledge: {} is corrupt — ignored", path_);
-        return;
-    }
+    if (get<uint64_t>(q) != sum) { failClosed_("checksum mismatch"); return; }
     for (uint32_t i = 0; i < count; ++i) {
         InternalIsrState e;
         e.topicId     = get<int32_t>(p);
@@ -151,9 +163,21 @@ void InternalIsrKnowledge::load_()
         e.version     = get<int64_t>(p);
         e.count       = get<int32_t>(p);
         for (auto& m : e.members) m = get<int32_t>(p);
-        if (e.count < 0 || e.count > InternalIsrState::kMaxMembers) { entries_.clear(); return; }
+        if (e.count < 0 || e.count > InternalIsrState::kMaxMembers) {
+            entries_.clear();
+            failClosed_("bad member count");
+            return;
+        }
         entries_.push_back(e);
     }
+}
+
+void InternalIsrKnowledge::failClosed_(const char* why)
+{
+    votable_ = false;
+    spdlog::error("InternalIsrKnowledge: {} exists but does not validate ({}) — this node REFUSES "
+                  "TO VOTE in consensus elections until it durably holds a fresh internal ISR "
+                  "state from the leader (fail closed)", path_, why);
 }
 
 } // namespace rune::replication
