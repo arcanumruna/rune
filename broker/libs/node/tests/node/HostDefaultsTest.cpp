@@ -493,7 +493,13 @@ TEST(HostDefaults, PinnedShardWorkersBackOffByDefaultRegression) {
 TEST(HostDefaults, SummaryNamesShardIdleShape) {
     NodeConfig c = threeNodeDefault(0);
     const auto hd = applyHostDerivedDefaults(c, k3sFacts());
-    EXPECT_NE(hd.summary.find("idle=wake{spins=auto yields=auto parkUs=1-200}"), std::string::npos) << hd.summary;
+    EXPECT_NE(hd.summary.find("idle=wake+doorbell{spins=auto yields=auto parkUs=1000-1000}"), std::string::npos)
+        << hd.summary;
+
+    NodeConfig nobell = threeNodeDefault(0);   // A9 off: A7's shape
+    nobell.idleDoorbell = false;
+    const auto hn = applyHostDerivedDefaults(nobell, k3sFacts());
+    EXPECT_NE(hn.summary.find("idle=wake{spins=auto yields=auto parkUs=1-200}"), std::string::npos) << hn.summary;
 
     NodeConfig off = threeNodeDefault(0);
     off.idleWake = false;
@@ -501,9 +507,9 @@ TEST(HostDefaults, SummaryNamesShardIdleShape) {
     EXPECT_NE(ho.summary.find("idle=backoff{spins=auto yields=auto parkUs=1-200}"), std::string::npos) << ho.summary;
 
     NodeConfig ex = threeNodeDefault(0);
-    ex.idleSpins = 1; ex.idleYields = 2; ex.idleMaxParkUs = 100;
+    ex.idleSpins = 1; ex.idleYields = 2; ex.idleDoorbellMinParkUs = 50; ex.idleDoorbellParkUs = 2000;
     const auto he = applyHostDerivedDefaults(ex, k3sFacts());
-    EXPECT_NE(he.summary.find("idle=wake{spins=1 yields=2 parkUs=1-100}"), std::string::npos) << he.summary;
+    EXPECT_NE(he.summary.find("idle=wake+doorbell{spins=1 yields=2 parkUs=50-2000}"), std::string::npos) << he.summary;
 
     NodeConfig spin = threeNodeDefault(0);
     spin.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;

@@ -107,6 +107,10 @@ public:
         return n;
     }
 
+    /// A9: the doorbell of the rings this shard's thread consumes — its worker's (op + session rings,
+    /// portable completions; in fused placement BrokerNode attaches the runtime's cross-thread rings too).
+    [[nodiscard]] detail::RingDoorbell& doorbell() noexcept { return worker_.doorbell(); }
+
     [[nodiscard]] uint64_t slowPassesForTest() const noexcept { return slowPasses_; }
     /// A1: most driver duty cycles one pass runs while the driver keeps reporting work.
     static constexpr int kDriverDutyPerPass = 16;

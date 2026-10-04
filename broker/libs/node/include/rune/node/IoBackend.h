@@ -172,6 +172,12 @@ public:
         return -1;
     }
 
+    /// A9: the portable backend's completions ring the worker's doorbell (its flusher thread is the producer;
+    /// called from the Worker ctor, before anything is submitted).  io_uring has its ring fd instead.
+    void attachCompletionDoorbell(detail::RingDoorbell& bell) noexcept {
+        if (kind_ == IoBackendKind::Portable) portable_->attachCompletionDoorbell(bell);
+    }
+
     [[nodiscard]] bool acceptsSubmissions() const noexcept { return kind_ != IoBackendKind::Invalid; }
     /// Non-empty when the AUTO-selected io_uring could not be set up and this
     /// backend fell back to portable (the setup error).  Cold (startup log).

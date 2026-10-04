@@ -1403,6 +1403,59 @@ TEST(NodeConfigRegression, IdleSpinsYieldsGarbageRefusesStartupRegression) {
     EXPECT_EQ(res.config->idleSpins, rune::node::NodeConfig::kIdleAuto);
 }
 
+// A9: RUNE_IDLE_DOORBELL + the doorbell park knobs; garbage refuses startup (review D3 rule).
+TEST(NodeConfig, IdleDoorbellKnobsParse) {
+    auto base = base1node();
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_TRUE(res.config->idleDoorbell) << "default on";
+    EXPECT_EQ(res.config->idleDoorbellMinParkUs, 1000);
+    EXPECT_EQ(res.config->idleDoorbellParkUs, 1000);
+    base["RUNE_IDLE_DOORBELL"] = "false";
+    base["RUNE_IDLE_DOORBELL_MIN_PARK_US"] = "50";
+    base["RUNE_IDLE_DOORBELL_PARK_US"] = "2000";
+    res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_FALSE(res.config->idleDoorbell);
+    EXPECT_EQ(res.config->idleDoorbellMinParkUs, 50);
+    EXPECT_EQ(res.config->idleDoorbellParkUs, 2000);
+}
+
+TEST(NodeConfigRegression, IdleDoorbellGarbageRefusesStartupRegression) {
+    for (const char* v : {"off", "yes", "2"}) {
+        auto base = base1node();
+        base["RUNE_IDLE_DOORBELL"] = v;
+        auto res = rune::node::parseNodeConfig(fakeEnv(base));
+        EXPECT_FALSE(res.config.has_value()) << v;
+        EXPECT_NE(res.error.find("RUNE_IDLE_DOORBELL must be 0/1/false/true"), std::string::npos) << res.error;
+    }
+    for (const char* name : {"RUNE_IDLE_DOORBELL_MIN_PARK_US", "RUNE_IDLE_DOORBELL_PARK_US"}) {
+        for (const char* v : {"0", "-1", "abc", "2000000"}) {
+            auto base = base1node();
+            base[name] = v;
+            auto res = rune::node::parseNodeConfig(fakeEnv(base));
+            EXPECT_FALSE(res.config.has_value()) << name << "=" << v;
+            EXPECT_NE(res.error.find(std::string(name) + " must be an integer in 1..1000000"), std::string::npos)
+                << res.error;
+        }
+    }
+    auto base = base1node();
+    base["RUNE_IDLE_DOORBELL_MIN_PARK_US"] = "500";
+    base["RUNE_IDLE_DOORBELL_PARK_US"] = "100";
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    EXPECT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("must not exceed RUNE_IDLE_DOORBELL_PARK_US"), std::string::npos) << res.error;
+}
+
+// A9: the doorbell shape — no auto spin / yield phase, the doorbell park; explicit spins / yields still win.
+TEST(NodeConfig, DoorbellShardIdleShape) {
+    rune::node::NodeConfig c;
+    EXPECT_EQ(c.shardIdleShape(/*doorbell=*/true), (rune::node::IdleShape{0, 0, 1'000'000, 1'000'000}));
+    c.idleSpins = 2; c.idleYields = 3; c.idleDoorbellMinParkUs = 10; c.idleDoorbellParkUs = 500;
+    EXPECT_EQ(c.shardIdleShape(true), (rune::node::IdleShape{2, 3, 10'000, 500'000}));
+    EXPECT_EQ(c.shardIdleShape(false).maxParkNs, c.idleMaxParkUs * 1'000) << "no doorbell: A7's shape";
+}
+
 TEST(NodeConfig, ShardIdleShapeDerivation) {
     rune::node::NodeConfig c;
     c.idleMaxParkUs = 200;

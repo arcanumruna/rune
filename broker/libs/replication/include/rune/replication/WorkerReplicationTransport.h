@@ -319,7 +319,9 @@ public:
         }
         if (len <= static_cast<std::size_t>(pub->maxPayloadLength())) {
             aeron::concurrent::logbuffer::BufferClaim claim;
-            const int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
+                pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
             if (pos > 0) {
                 uint8_t* dst = claim.buffer().buffer() + claim.offset();
                 std::memcpy(dst, prefix, prefixLen);
@@ -333,7 +335,8 @@ public:
                                             static_cast<aeron::util::index_t>(prefixLen)),
             aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(body.data()),
                                             static_cast<aeron::util::index_t>(body.size()))};
-        return pub->offer(parts);
+        const int64_t r = pub->offer(parts);
+        return r == aeron::ADMIN_ACTION ? pub->offer(parts) : r;   // A9: term rotated — retry now
     }
 
 private:
@@ -362,8 +365,9 @@ private:
 
         if (len <= static_cast<std::size_t>(pub.maxPayloadLength())) {
             aeron::concurrent::logbuffer::BufferClaim claim;
-            const int64_t pos =
-                pub.tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            int64_t pos = pub.tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
+                pos = pub.tryClaim(static_cast<aeron::util::index_t>(len), claim);
             if (pos > 0) {
                 claim.buffer().putBytes(
                     claim.offset(), atomicBuf, 0,
@@ -372,7 +376,8 @@ private:
             }
             return pos;
         }
-        return pub.offer(atomicBuf, 0, static_cast<aeron::util::index_t>(len));
+        const int64_t r = pub.offer(atomicBuf, 0, static_cast<aeron::util::index_t>(len));
+        return r == aeron::ADMIN_ACTION ? pub.offer(atomicBuf, 0, static_cast<aeron::util::index_t>(len)) : r;
     }
 
     struct PeerPub {

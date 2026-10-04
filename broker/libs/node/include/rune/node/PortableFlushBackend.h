@@ -216,6 +216,13 @@ public:
         return count;
     }
 
+    /// A9: the worker's doorbell on the completion ring (worker = consumer, flusher = producer).  Startup
+    /// only: before the first submit (the flusher commits completions only after a submission, which the
+    /// worker publishes on the submit ring after this call — the ring's release/acquire orders the write).
+    void attachCompletionDoorbell(detail::RingDoorbell& bell) noexcept {
+        (void)completionRing_.attachConsumerDoorbell(bell);
+    }
+
 private:
     // flusherLoop_ — runs on the dedicated flusher thread.
     void flusherLoop_();

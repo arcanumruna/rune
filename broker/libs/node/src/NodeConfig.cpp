@@ -1215,6 +1215,26 @@ ConfigResult parseNodeConfig(
             *field = n;
         }
     }
+    // --- A9: RUNE_IDLE_DOORBELL (default on) / RUNE_IDLE_DOORBELL_MIN_PARK_US / RUNE_IDLE_DOORBELL_PARK_US ---
+    // (NodeConfig::idleDoorbell).  Garbage refuses startup, like the A7 knobs.
+    if (const char* raw = getenv_fn("RUNE_IDLE_DOORBELL"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.idleDoorbell = true;
+        else if (v == "0" || v == "false") cfg.idleDoorbell = false;
+        else return {{}, std::string("RUNE_IDLE_DOORBELL must be 0/1/false/true, got '") + raw + "'"};
+    }
+    for (auto [name, field] : {std::pair{"RUNE_IDLE_DOORBELL_MIN_PARK_US", &cfg.idleDoorbellMinParkUs},
+                               std::pair{"RUNE_IDLE_DOORBELL_PARK_US", &cfg.idleDoorbellParkUs}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            int32_t n{};
+            if (!parseInt32(raw, n) || n <= 0 || n > 1'000'000)
+                return {{}, std::string(name) + " must be an integer in 1..1000000, got '" + raw + "'"};
+            *field = n;
+        }
+    }
+    if (cfg.idleDoorbellMinParkUs > cfg.idleDoorbellParkUs)
+        return {{}, "RUNE_IDLE_DOORBELL_MIN_PARK_US (" + std::to_string(cfg.idleDoorbellMinParkUs) +
+                    ") must not exceed RUNE_IDLE_DOORBELL_PARK_US (" + std::to_string(cfg.idleDoorbellParkUs) + ")"};
 
     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
     // When "1" or "true", each worker gets its own Aeron subscription and the

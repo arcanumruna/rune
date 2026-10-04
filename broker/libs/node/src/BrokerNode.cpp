@@ -397,6 +397,7 @@ void BrokerNode::start() {
                 // pass — exactly one pumper at any time.
                 shardAgents_.at(0)->setFusedRuntime(runtimeAgent_.get(), nodeDriver_.get(), aeron_.get());
                 stopStartupPump_();
+                attachFusedRuntimeDoorbell_();   // A9: before the other workers / admin thread produce
             }
             // Backoff idle by default (never busy-spin unless explicitly opted in:
             // RUNE_WORKER_IDLE=busyspin) — pinned or not.
@@ -2931,6 +2932,29 @@ int BrokerNode::serviceAdminControl_() {
 }
 
 int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+
+// ---------------------------------------------------------------------------
+// A9 (findings §4.15): fused placement — the runtime runs in worker 0's pass, so the cross-thread rings the
+// RUNTIME consumes ring worker 0's doorbell: every other worker's return ring and the admin thread's three
+// admin → control rings (all drained unconditionally each runtime pass).  Startup only: called before the
+// other workers' runners and the admin thread start (their first commit happens-after the attach).  A ring the
+// doorbell cannot watch (full) is left unattached — bounded by the park cap, logged.
+// ---------------------------------------------------------------------------
+void BrokerNode::attachFusedRuntimeDoorbell_() {
+    if (!config_.idleDoorbell || !workerPool_ || shardAgents_.empty()) return;
+    detail::RingDoorbell& bell = shardAgents_.front()->doorbell();
+    int attached = 0, refused = 0;
+    auto attach = [&](OneToOneByteRing& ring) { (ring.attachConsumerDoorbell(bell) ? attached : refused)++; };
+    for (int32_t w = 1; w < workerPool_->workerCount(); ++w) attach(workerPool_->worker(w).returnRingForDoorbell());
+    if (auto* admin = adminWorkerAgent_.get()) {
+        attach(admin->failureRing());
+        attach(admin->createReqRing());
+        attach(admin->egressRing());
+    }
+    if (refused != 0)
+        spdlog::warn("BrokerNode[{}]: fused runtime doorbell full — {} ring(s) attached, {} bounded by the park cap",
+                     config_.nodeId, attached, refused);
+}
 
 // ---------------------------------------------------------------------------
 // BrokerNode::runtimePathIsConcrete_ — Task 11 fix 2: every call the runtime duty

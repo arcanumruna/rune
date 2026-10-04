@@ -66,6 +66,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/node/OneToOneByteRing.h>
+#include <rune/node/detail/RingDoorbell.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/RcState.h>
@@ -514,6 +515,7 @@ public:
                     std::size_t ioSubmitDepth    = kIoSubmitDepth,
                     std::size_t ioComplDepth     = kIoCompletionDepth) noexcept
         : workerId_(workerId)
+        , doorbell_()
         , ingress_(static_cast<int>(ingressRingBytes))
         , sessionRing_(kSessionRingBytes)
         , ret_(static_cast<int>(returnRingBytes))
@@ -528,6 +530,13 @@ public:
         egressScratch_.resize(kEgressScratchSize);
         maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
+        // A9 (findings §4.15): this worker's doorbell — the cross-thread rings it consumes ring it while its
+        // runner parks (the op ring gated off while the worker itself holds it back), and the runtime rings
+        // it when it frees ret_ space this worker waits for.  Set here, before any other thread exists.
+        (void)ingress_.attachConsumerDoorbell(doorbell_, &ingressWatchable_);
+        (void)sessionRing_.attachConsumerDoorbell(doorbell_);
+        ret_.attachProducerDoorbell(doorbell_);
+        io_.attachCompletionDoorbell(doorbell_);   // portable backend: the flusher's completion ring
     }
 
     // Thread name for `ps -M`/`top -H`/profilers: "rune-wrk-<id>" (see
@@ -1069,6 +1078,15 @@ public:
     /// parks on it so an fsync completion ends the park.  Valid for the worker's lifetime.
     [[nodiscard]] int ioCompletionFd() const noexcept { return io_.completionFd(); }
 
+    /// A9: the doorbell of the cross-thread rings this worker's thread consumes (its op + session rings, the
+    /// portable backend's completions; in fused placement the runtime's rings attach to worker 0's too).
+    /// Attach only at startup, before the producer threads run.  Valid for the worker's lifetime.
+    [[nodiscard]] detail::RingDoorbell& doorbell() noexcept { return doorbell_; }
+    /// A9: the worker's return ring, for attaching its consumer's doorbell at startup (fused placement).
+    [[nodiscard]] OneToOneByteRing& returnRingForDoorbell() noexcept { return ret_; }
+    /// A9 (tests): the op ring's doorbell watch is on (false while the worker holds its op ring back).
+    [[nodiscard]] bool ingressWatchableForTest() const noexcept { return ingressWatchable_; }
+
     [[nodiscard]] uint64_t ioSubmitCountForTest() const noexcept {
         return io_submitCount_;
     }
@@ -1402,7 +1420,34 @@ private:
             work += ackSink_->flush(sessionRing_.producerPosition(), consumed);
             work += reportSessionSignals_();
         }
+        if (work == 0) work += prepareIdle_();   // A9: only a pass that may park pays for it
         return work;
+    }
+
+    // -----------------------------------------------------------------------
+    // A9 (findings §4.15): before the runner may park — the op ring's doorbell watch follows the op-drain
+    // gates, and a worker held back by ret_ (a queued return, or too few free slots to poll intake) arms the
+    // ring's space wait so the runtime's next drain rings this worker's doorbell.  Dekker: re-check after
+    // arming; space that appeared meanwhile = run again now (returns 1).  Worker thread only.
+    // -----------------------------------------------------------------------
+    int prepareIdle_() {
+        ingressWatchable_ = retFifo_.size() < kOverflowHighWater && (!ackSink_ || ackRoom_() > 0);
+        auto retBlocked = [this] {
+            return !retFifo_.empty() || ret_.freeSlotsForMsgSize(ackSlotBytes_) <= reservedAckSlots_();
+        };
+        if (!retBlocked()) [[likely]] {
+            if (spaceWaitArmed_) { ret_.disarmSpaceWait(); spaceWaitArmed_ = false; }
+            return 0;
+        }
+        ret_.armSpaceWait();
+        spaceWaitArmed_ = true;
+        // The re-check: queued returns re-try their claims (a claim reads the runtime's head after the fence);
+        // the intake gate re-reads the ring's fill.
+        const int flushed = flushRetFifo_();
+        if (flushed == 0 && retBlocked()) return 0;   // park: the runtime's next drain rings the doorbell
+        ret_.disarmSpaceWait();
+        spaceWaitArmed_ = false;
+        return flushed > 0 ? flushed : 1;             // space appeared between the pass and the arm: run again
     }
 
     // -----------------------------------------------------------------------
@@ -2140,7 +2185,9 @@ private:
         aeron::concurrent::AtomicBuffer buf(mutableBuf, static_cast<aeron::util::index_t>(len));
         if (len <= static_cast<std::size_t>(pub->maxPayloadLength())) {
             aeron::concurrent::logbuffer::BufferClaim claim;
-            const int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
+                pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), claim);
             if (pos > 0) {
                 claim.buffer().putBytes(claim.offset(), buf, 0,
                                         static_cast<aeron::util::index_t>(len));
@@ -2148,7 +2195,8 @@ private:
             }
             return pos;
         }
-        return pub->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        const int64_t r = pub->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        return r == aeron::ADMIN_ACTION ? pub->offer(buf, 0, static_cast<aeron::util::index_t>(len)) : r;
     }
 
     // F19: send the owed ErrorResponse{MessageTooLarge} for a subscription
@@ -3259,6 +3307,15 @@ private:
 
     int32_t workerId_;
     std::string threadName_; // "rune-wrk-<id>" — stable storage for name()
+
+    // A9: this worker thread's ring doorbell (declared before the rings that point at it).
+    detail::RingDoorbell doorbell_;
+    // A9: the op ring's doorbell watch — false while drainIngress_ holds the op ring back (return FIFO at high
+    // water, no session-ack room): those gates wake the worker through their own sources (ret_ space wait,
+    // session-publication status messages), and a watch on a ring the worker will not drain would keep its
+    // runner from ever parking.  Worker-thread state (read by its own idle).
+    bool ingressWatchable_ = true;
+    bool spaceWaitArmed_   = false;   // A9: ret_ space wait armed by prepareIdle_ (worker thread)
 
     // R2: ingress ring — OneToOneByteRing (SPSC, flat byte messages).
     // Producer (control thread): tryEnqueueOp tryClaim()s + encodes the WorkerOp

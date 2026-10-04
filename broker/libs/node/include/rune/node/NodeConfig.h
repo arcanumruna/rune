@@ -284,11 +284,34 @@ struct NodeConfig {
     int32_t idleSpins  = kIdleAuto;
     int32_t idleYields = kIdleAuto;
 
+    // A9 ring doorbells (findings §4.15): with park-until-work, the cross-thread rings a shard worker consumes
+    // (runtime → worker ops, session lifecycle, worker → fused-runtime returns, admin → fused-runtime, portable
+    // fsync completions) ring an eventfd in its park set, so ring work ends a park like a datagram does.  Every
+    // wake source a pass can wait on then has an fd — datagrams, io_uring completions, ring messages — and the
+    // shape drops the Aeron spin / yield phase (auto 0 / 0; RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS still override)
+    // and parks for idleDoorbellParkUs from the first empty pass: what is left without an fd is timers, and every
+    // timer on the worker path is >= 1 ms (Aeron: NAK 60 ms, SM 200 ms, heartbeats 100 ms+, timer interval 1 s;
+    // Rune: election status 20 ms, fetch backstop 5 ms, log sync 10 ms, ack timeout 30 s).
+    // RUNE_IDLE_DOORBELL=0 → A7's shape exactly (no doorbell, Aeron 10 / 20, 1 µs .. idleMaxParkUs).
+    bool idleDoorbell = true;
+    // The doorbell shape's park: first park (RUNE_IDLE_DOORBELL_MIN_PARK_US) doubling to the timer bound
+    // (RUNE_IDLE_DOORBELL_PARK_US).  Positive integers; anything else refuses startup.
+    int64_t idleDoorbellMinParkUs = 1'000;
+    int64_t idleDoorbellParkUs    = 1'000;
+
     /// Shard workers park on driver readiness unless RUNE_IDLE_WAKE=0.
     [[nodiscard]] bool shardIdleWantsWake() const noexcept { return idleWake; }
-    /// The shard-worker backoff shape (the same with or without wake fds; review M1).
-    [[nodiscard]] IdleShape shardIdleShape() const noexcept {
+    /// The shard-worker backoff shape.  `doorbell`: the runner parks on a ring doorbell too (A9) — no
+    /// spin / yield phase (auto), the doorbell park; otherwise A7's (the same with or without wake fds; review M1).
+    [[nodiscard]] IdleShape shardIdleShape(bool doorbell = false) const noexcept {
         IdleShape s;
+        if (doorbell) {
+            s.maxSpins  = idleSpins  >= 0 ? idleSpins  : 0;
+            s.maxYields = idleYields >= 0 ? idleYields : 0;
+            s.minParkNs = idleDoorbellMinParkUs * 1'000;
+            s.maxParkNs = idleDoorbellParkUs * 1'000;
+            return s;
+        }
         s.maxSpins  = idleSpins  >= 0 ? idleSpins  : kAeronIdleSpins;
         s.maxYields = idleYields >= 0 ? idleYields : kAeronIdleYields;
         s.minParkNs = 1'000;

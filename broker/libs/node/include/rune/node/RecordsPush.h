@@ -67,7 +67,9 @@ inline RecordsSendResult sendRecordsFrame(aeron::ExclusivePublication&          
         [[likely]] {
         const std::size_t encoded = rec.encode(scratch);
         aeron::concurrent::logbuffer::BufferClaim claim;
-        const int64_t pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
+        int64_t pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
+        if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
+            pos = pub.tryClaim(static_cast<aeron::util::index_t>(encoded), claim);
         if (pos > 0) {
             aeron::concurrent::AtomicBuffer src(scratch, static_cast<aeron::util::index_t>(encoded));
             claim.buffer().putBytes(claim.offset(), src, 0,
@@ -92,7 +94,8 @@ inline RecordsSendResult sendRecordsFrame(aeron::ExclusivePublication&          
         aeron::concurrent::AtomicBuffer(scratch, static_cast<aeron::util::index_t>(fixedLen)),
         aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(rec.recordBatch.data()),
                                         static_cast<aeron::util::index_t>(rec.recordBatch.size()))};
-    const int64_t pos = pub.offer(parts);
+    int64_t pos = pub.offer(parts);
+    if (pos == aeron::ADMIN_ACTION) [[unlikely]] pos = pub.offer(parts);   // A9: term rotated — retry now
     return {pos > 0 ? RecordsSendKind::Sent : RecordsSendKind::Retry, pos};
 }
 

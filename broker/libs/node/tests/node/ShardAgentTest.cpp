@@ -205,6 +205,37 @@ TEST(ShardIdle, DefaultWithWakeFdsIsParkUntilWorkAfterTheAeronSpinYieldPhase) {
     EXPECT_EQ(p->shape(), (IdleShape{10, 20, 1'000, 200'000})) << "review M1: Aeron spin/yield before the first park";
 }
 
+// A9: with a doorbell the runner parks on it too, with the doorbell shape (no auto spin / yield, long park);
+// RUNE_IDLE_DOORBELL=0 keeps A7's shape exactly (the A/B off arm).
+TEST(ShardIdle, DoorbellGivesTheDoorbellShapeAndOffKeepsA7) {
+    FakeFds f;
+    rune::node::detail::RingDoorbell bell;
+    NodeConfig c;
+    auto idle = makeShardIdle(c, f.p, 1, &bell);
+    auto* p = dynamic_cast<ParkUntilWorkIdle*>(idle.get());
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(p->doorbell(), &bell);
+    EXPECT_EQ(p->wakeFdCount(), 2) << "driver fd + the doorbell fd";
+    EXPECT_EQ(p->shape(), (IdleShape{0, 0, 1'000'000, 1'000'000}));
+    EXPECT_NE(describeShardIdle(*idle).find("doorbell="), std::string::npos) << describeShardIdle(*idle);
+
+    c.idleDoorbell = false;
+    auto off = makeShardIdle(c, f.p, 1, &bell);
+    auto* q = dynamic_cast<ParkUntilWorkIdle*>(off.get());
+    ASSERT_NE(q, nullptr);
+    EXPECT_EQ(q->doorbell(), nullptr);
+    EXPECT_EQ(q->shape(), (IdleShape{10, 20, 1'000, 200'000}));
+}
+
+TEST(ShardAgent, AgentExposesItsWorkersDoorbell) {
+    Shard s;
+    rune::consensus::MonotonicNanoClock clk;
+    ShardAgent a(s.worker, *s.driver, *s.client, clk);
+    EXPECT_EQ(&a.doorbell(), &s.worker.doorbell());
+    EXPECT_TRUE(a.doorbell().valid());
+    EXPECT_GE(a.doorbell().watchCount(), 2) << "the worker's op + session rings";
+}
+
 TEST(ShardIdle, WakeOffIsTheLegacyAeronBackoff) {
     FakeFds f;
     NodeConfig c;

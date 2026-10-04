@@ -106,6 +106,34 @@ public:
     [[nodiscard]] int64_t producerPosition() const { return ring_.producerPosition(); }
     [[nodiscard]] int64_t consumerPosition() const { return ring_.consumerPosition(); }
 
+    // -----------------------------------------------------------------------
+    // A9 doorbells (detail/RingDoorbell.h) — STARTUP ONLY, before the producer
+    // and consumer threads run.
+    // -----------------------------------------------------------------------
+
+    /// The consumer thread's doorbell: commits ring it while that thread parks.  The doorbell watches this
+    /// ring (`watchEnabled`: optional consumer-owned gate, see RingDoorbell).  false (nothing attached) when
+    /// the doorbell is invalid or full — the consumer then stays bounded by its park cap.
+    bool attachConsumerDoorbell(detail::RingDoorbell& bell, const bool* watchEnabled = nullptr) noexcept {
+        if (!bell.addWatch(ring_.watch(), watchEnabled)) return false;
+        ring_.setConsumerDoorbell(&bell);
+        return true;
+    }
+    /// The producer thread's doorbell: rung when the consumer frees space after armSpaceWait().
+    void attachProducerDoorbell(detail::RingDoorbell& bell) noexcept {
+        if (bell.valid()) ring_.setProducerDoorbell(&bell);
+    }
+    [[nodiscard]] bool hasConsumerDoorbell() const noexcept { return ring_.hasConsumerDoorbell(); }
+
+    /// Producer refused for space: announce it, then RE-CHECK the space condition (see O2ORingBuffer).
+    void armSpaceWait() noexcept { ring_.armSpaceWait(); }
+    void disarmSpaceWait() noexcept { ring_.disarmSpaceWait(); }
+    [[nodiscard]] bool spaceWaitArmedForTest() const noexcept { return ring_.spaceWaitArmedForTest(); }
+
+    /// Test seams: commit()'s publish and notify steps separately (deterministic interleavings).
+    void commitWithoutNotifyForTest(index_t claimIndex) { ring_.commitWithoutNotifyForTest(claimIndex); }
+    void notifyConsumerForTest() noexcept { ring_.notifyConsumerForTest(); }
+
     /// Maximum single-message payload the ring can hold (capacity / 8).
     index_t maxMsgLength() const { return ring_.maxMsgLength(); }
 
