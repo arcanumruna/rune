@@ -666,6 +666,19 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // --- RUNE_SURVIVOR_LEADER_ELECTION (optional, default OFF) — review
+    // 2026-10-04 MEDIUM-3: opt in to the position-proven survivor election (a
+    // partition whose committed ISR has no live member elects its most complete
+    // reporting live replica).  Kafka keeps such a partition offline unless
+    // unclean.leader.election.enable — so does Rune by default.
+    {
+        const char* raw = getenv_fn("RUNE_SURVIVOR_LEADER_ELECTION");
+        if (raw) {
+            const std::string_view sv(raw);
+            cfg.survivorLeaderElection = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+
     // --- RUNE_TOPICS (optional) ---
     // Format: comma-separated entries, each of the form:
     //   name:partitionCount[:policy[:segmentRollBytes[:deleteRetentionMs

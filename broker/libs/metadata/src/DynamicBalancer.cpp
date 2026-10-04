@@ -330,7 +330,10 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     // NO_LEADER.  Time-independent: decided off positions, not timing.
                     computedLeader = NO_LEADER;
                     positionProven = false;
+                    // MEDIUM-3: opt-in only (Kafka: offline unless unclean
+                    // election is enabled) — default stays NO_LEADER below.
                     for (const TopicSpec* ts : members) {
+                        if (!in.allowSurvivorElection) break;
                         const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
                         if (!mc || mc->replicas.empty() || !in.positions) {
                             computedLeader = NO_LEADER; positionProven = false; break;

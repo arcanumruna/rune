@@ -273,6 +273,11 @@ struct NodeConfig {
     // Also forwarded to PartitionConfig::minIsr in buildReplication().
     int32_t gatewayMinIsr = 1;
 
+    // Review 2026-10-04 MEDIUM-3 (RUNE_SURVIVOR_LEADER_ELECTION, default false):
+    // opt-in position-proven survivor election for a partition whose committed
+    // ISR has no live member (Kafka unclean.leader.election.enable analog).
+    bool survivorLeaderElection = false;
+
     // Milestone E1: number of in-process partition workers. Each owned shard is
     // assigned to worker = hash(shardId) % workerCount (ShardRouter). Default 1
     // (single-owner, identical to the pre-E1 single-agent behaviour). Overridable

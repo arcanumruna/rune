@@ -1068,7 +1068,7 @@ private:
     // the normal follower fetch path (a DivergingEpoch answer resets it)
     // (and keeps its own lastFetchEmitNs_ cadence).  Fast-acks (on apply) are pure
     // (maxBytes=0) and independent of this machine — they advance the leader's
-    // follower-offset → HW for acks=majority.
+    // follower-offset → HW for acks=all.
     FollowerSync followerSync_;
     // (Caught-up keepalive cadence is computed in doWork from replicaLagMaxMs so it
     //  always keeps the follower in the ISR — see the follower fetch-emit path.)
@@ -1203,10 +1203,10 @@ private:
     FollowerSlots followerSlots_;
 
     // DR-BUG-3: min-ISR-gated committed offset (Kafka min.insync.replicas
-    // COMMIT semantics).  ReplicaLeaderState::computeHw() uses majority-of-ISR:
-    // when the ISR shrinks to a single member (the leader stranded in a
-    // minority), majority-of-1 == the leader's own LEO, so the raw HW jumps to
-    // uncommitted-by-a-real-majority offsets.  That polluted HW must NOT be
+    // COMMIT semantics).  ReplicaLeaderState::computeHw() is the min LEO over
+    // the ISR: when the ISR shrinks to a single member (the leader stranded in
+    // a minority), the min over {leader} == the leader's own LEO, so the raw HW
+    // jumps to offsets held by fewer than minIsr replicas.  That HW must NOT be
     // exposed as "committed" — neither to the acks=All drain nor to HW-bounded
     // subscribers (GR-6) — or a minority leader's records would be acked/
     // delivered and then truncated on failover (data-loss / phantom reads).
@@ -1214,7 +1214,7 @@ private:
     // lastHealthyHw_ is the last HW observed while the ISR was healthy
     // (|ISR| >= minIsr).  While |ISR| < minIsr, highWatermark() clamps to this
     // frozen floor so the effective committed offset cannot advance past the
-    // last majority-committed offset.  It is monotonic (only advances) and is
+    // last offset committed under a healthy ISR.  It is monotonic (only advances) and is
     // refreshed on every leader HW read/recompute while the ISR is healthy.
     mutable Offset lastHealthyHw_ = 0;
 

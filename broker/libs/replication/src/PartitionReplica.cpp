@@ -438,7 +438,7 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
 
     // Leader LEO is now baseOffset + 1.
     leaderState_.setLeaderLogEndOffset(logEndOffset_());
-    // Leader self-advances HW (leader always in ISR, so majority includes leader).
+    // Recompute the HW (min LEO over the ISR; the leader is always a member).
     recomputeHw();
 
     // Mirror the advanced HW into the cleaner-visible atomic (release-store).
@@ -779,7 +779,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     leaderState_.updateFollowerFetchOffset(req.followerId, req.fetchOffset);
     // HW is already recomputed inside updateFollowerFetchOffset().
     // FR: acks=all COMMIT point — this follower position update just lifted the
-    //     majority high-watermark. Keyed by (partition<<24)|committedOffset so it
+    //     high-watermark (min LEO over the ISR). Keyed by (partition<<24)|committedOffset so it
     //     pairs 1:1 with the leader's ReplLeaderAppend (round-trip commit latency).
     {
         const Offset newHwOnFetch = leaderState_.highWatermark();
@@ -853,8 +853,8 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // committed.  Note this does NOT bound catch-up: the log read above is
     // intentionally NOT HW-bounded, so the follower still fetches (and applies)
     // the uncommitted tail and advances its own LEO — which is exactly what
-    // lets the leader's real (majority) HW advance and the ISR re-expand.  Only
-    // the follower's *committed view* (followerHw_) is held at the majority floor
+    // lets the leader's real HW (min over the ISR) advance and the ISR re-expand.  Only
+    // the follower's *committed view* (followerHw_) is held at the min-ISR-gated floor
     // until the ISR heals.
     const Offset advertiseHw = highWatermark();
     auto resp = makeFetchResponse(advertiseHw, kErrNone, records);
@@ -1710,7 +1710,7 @@ Offset PartitionReplica::computeServedHw() const noexcept
         return followerHw_;
     }
 
-    // Raw majority-of-ISR HW from the leader state (spec §4).
+    // Raw HW from the leader state: min LEO over the (maximal) ISR.
     const Offset rawHw = leaderState_.highWatermark();
 
     // DR-BUG-3: min-ISR COMMIT gate on the exposed HW.  While the ISR is BELOW
@@ -1721,7 +1721,7 @@ Offset PartitionReplica::computeServedHw() const noexcept
     const int isrSize = static_cast<int>(committedIsr_.size());
 
     if (isrSize >= minIsr) {
-        // Healthy ISR: rawHw is a legitimate majority-committed offset.
+        // Healthy ISR: rawHw is committed on every ISR member (>= minIsr of them).
         // (The floor advance to lastHealthyHw_ happens in highWatermark().)
         return (rawHw > lastHealthyHw_) ? rawHw : lastHealthyHw_;
     }

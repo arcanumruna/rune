@@ -2060,6 +2060,7 @@ void BrokerNode::buildGateway() {
                 // leadership with ISR<minIsr and every produce is rejected (startup
                 // collapse).  See DynamicBalancerInputs::minIsr.
                 metadataService_->setMinIsr(config_.gatewayMinIsr);
+                metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
                 spdlog::info(
                     "BrokerNode[{}]: MetadataService configured for assignment emit "
                     "({} user topics, {} nodes, minIsr={})",

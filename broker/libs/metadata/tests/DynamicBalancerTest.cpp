@@ -484,6 +484,7 @@ TEST(DynamicBalancerRegression, SurvivorElectionCountsOnlyReportedReplicas) {
     DynamicBalancerInputs in;
     in.cur = &m; in.liveNodes = {1, 2}; in.positions = &pos; in.minIsr = 2;
     in.topics = { TopicSpec{7, 1, 3, "", ""} };
+    in.allowSurvivorElection = true;            // MEDIUM-3: opt-in
     auto recs = bal.rebalance(in);
     for (auto& r : recs)
         EXPECT_NE(r.rec.leaderNode, 2) << "elected on a pigeonhole that counted an unreported replica";
@@ -491,6 +492,34 @@ TEST(DynamicBalancerRegression, SurvivorElectionCountsOnlyReportedReplicas) {
     auto recs2 = bal.rebalance(in);
     ASSERT_EQ(recs2.size(), 1u);
     EXPECT_EQ(recs2[0].rec.leaderNode, 1);
+}
+
+// Review 2026-10-04 MEDIUM-3: the position-proven survivor election (no
+// committed-ISR member live) is an availability escape Kafka does not have —
+// it stays offline unless unclean.leader.election.enable.  Default OFF: the
+// partition goes leaderless (keeps its ISR lineage) until an ISR member returns.
+TEST(DynamicBalancerRegression, SurvivorElectionIsOptInDefaultOff) {
+    AssignmentMap m;
+    PartitionAssignment a;
+    a.leaderNode     = 0;                   // dead
+    a.isr            = {0};                 // committed ISR: only the dead leader
+    a.replicas       = {0, 1, 2};
+    a.leaderEpoch    = 5;
+    a.partitionEpoch = 9;
+    m.put(7, 0, a);
+    ReplicaPositionTable pos;
+    pos.report({7, 0, 1, 5, 400});
+    pos.report({7, 0, 2, 3, 100});
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {1, 2}; in.positions = &pos; in.minIsr = 2;
+    in.topics = { TopicSpec{7, 1, 3, "", ""} };
+    for (auto& r : bal.rebalance(in))
+        EXPECT_EQ(r.rec.leaderNode, NO_LEADER) << "survivor election ran without the opt-in";
+    in.allowSurvivorElection = true;            // opted in: the most complete reporter
+    auto recs = bal.rebalance(in);
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].rec.leaderNode, 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

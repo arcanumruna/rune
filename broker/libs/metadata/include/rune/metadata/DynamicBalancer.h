@@ -105,6 +105,15 @@ struct DynamicBalancerInputs {
     /// cycle → drops out of this set → real failover proceeds).  Empty default
     /// preserves prior behaviour for callers (tests) that don't populate it.
     std::vector<int32_t>    dataPlaneAliveLeaders;
+    /// Review 2026-10-04 MEDIUM-3 (Kafka unclean.leader.election.enable): the
+    /// position-proven SURVIVOR election — no committed-ISR member is live, so
+    /// elect the most complete reporting live replica when > RF − minIsr of them
+    /// reported — is an availability escape Kafka does not have.  Its pigeonhole
+    /// proof rests on soft positions and on no replica having lost acked data
+    /// (KIP-966).  OFF by default: such a partition goes leaderless (ISR lineage
+    /// kept) until an ISR member returns.  Opt in per cluster
+    /// (NodeConfig::survivorLeaderElection / RUNE_SURVIVOR_LEADER_ELECTION).
+    bool                    allowSurvivorElection = false;
     int                     maxPreferredElectionsPerCycle = 1000; ///< Budget cap.
     /// Maximum BalancerRecords returned per rebalance() call.  Excess changes are
     /// deferred to the next cycle so one mass failover cannot stall the metadata log.

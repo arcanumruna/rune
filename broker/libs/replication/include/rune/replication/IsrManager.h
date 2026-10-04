@@ -9,8 +9,9 @@
 // ## Model (spec §4 — in-sync replica set)
 //
 // The ISR tracks which follower replicas are "in sync" with the leader, i.e.
-// not lagging too far behind.  Only ISR members count toward the high-watermark
-// majority.  The leader itself is ALWAYS a member of the ISR and is NEVER
+// not lagging too far behind.  The high-watermark is the MINIMUM log end
+// offset over the ISR members (Kafka model — every ISR member holds every
+// committed record).  The leader itself is ALWAYS a member of the ISR and is NEVER
 // removed.
 //
 // ## Lag definition (Kafka replica-lag model, spec §4)
@@ -31,7 +32,7 @@
 // ## Produce gate (min-ISR)
 //
 // `canProduce(minIsr, acksAll)`:
-//   - acks=all ("majority" durability): |ISR| >= minIsr must hold.
+//   - acks=all: |ISR| >= minIsr must hold.
 //   - acks=leader: always true (leader-only ack, no ISR check).
 // ---------------------------------------------------------------------------
 
@@ -254,7 +255,7 @@ public:
     /// Return true iff the partition may accept a produce request.
     ///
     /// \param minIsr   Minimum ISR size required for durable acks.
-    /// \param acksAll  true → majority-durable ("all"/"majority"); the ISR
+    /// \param acksAll  true → acks=all (committed on every ISR member); the ISR
     ///                 size must meet minIsr.
     ///                 false → leader-only ack; always allowed.
     /// DUR-1 / KIP-966: drop `node` from the ISR immediately (it provably no

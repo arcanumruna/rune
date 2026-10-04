@@ -132,6 +132,8 @@ public:
     /// collapse under transient heartbeat isolation).  BrokerNode passes
     /// gatewayMinIsr (cluster majority).
     void setMinIsr(int minIsr) noexcept { minIsr_ = minIsr > 0 ? minIsr : 1; }
+    /// MEDIUM-3: opt in to the position-proven survivor election (default OFF).
+    void setAllowSurvivorElection(bool on) noexcept { allowSurvivorElection_ = on; }
 
     // -----------------------------------------------------------------------
     // Task 8b (RULING-4, SINGLE-NODE): register a RUNTIME-defined topic and
@@ -462,6 +464,7 @@ public:
         in.maxPreferredElectionsPerCycle = maxPreferredElectionsPerCycle;
         in.maxRecordsPerCycle            = maxRecordsPerCycle;
         in.minIsr                        = minIsr_;   // commit-quorum failover floor
+        in.allowSurvivorElection         = allowSurvivorElection_;
 
         // DATA-PLANE LIVENESS: mark every leader whose partition frontier ADVANCED
         // since the last cycle as alive.  The frontier = max reported LEO across the
@@ -998,6 +1001,7 @@ private:
     /// Commit-quorum failover floor handed to the DynamicBalancer (see
     /// DynamicBalancerInputs::minIsr).  Set by BrokerNode from gatewayMinIsr.
     int                                     minIsr_ = 1;
+    bool                                    allowSurvivorElection_ = false;   ///< MEDIUM-3 opt-in
     /// Data-plane liveness state (duty-thread only): last-observed replication
     /// frontier per (topicId<<32|partition), used to detect whether a leader's
     /// partition is still advancing → the leader is alive despite heartbeat lapse.
