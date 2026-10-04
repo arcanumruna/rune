@@ -13,6 +13,7 @@
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -107,9 +108,53 @@ struct InvokerGateway {
     int connects = 0;
     int metadataRequests = 0;
     // F8a: direct subscriptions (Subscribe -> SubscribeResponse; Records pushes).
-    struct Subscribed { int64_t subscriptionId; int32_t topicId; int32_t partition; int64_t sessionId; };
+    struct Subscribed {
+        int64_t subscriptionId;
+        int32_t topicId;
+        int32_t partition;
+        int64_t sessionId;
+        int     endpoint   = 0;   // index of the endpoint that received the Subscribe
+        int64_t fromOffset = 0;   // the Subscribe's wire fromOffset
+        int64_t corrId     = 0;
+    };
     std::vector<Subscribed> subscribed;
     std::vector<int64_t>    unsubscribed;  // subscriptionIds
+    std::vector<int>        unsubscribedAt;  // the endpoint each Unsubscribe arrived on
+    // Partition leadership for Subscribe (the broker's per-partition routing
+    // image): partition -> the endpoint index that leads it.  A Subscribe for a
+    // listed partition arriving on any OTHER endpoint registers nothing and is
+    // answered ErrorResponse{Redirect, "host:port" of the leader endpoint} (or a
+    // bare ErrorResponse{NotLeader} when subscribeNotLeader).  Unlisted
+    // partitions are served anywhere (the historical gateway).
+    std::map<int32_t, int> subscribeLeader;
+    bool                   subscribeNotLeader = false;
+    int                    subscribeRefusals  = 0;
+    // Consumer-group coordinator model (off by default = the historical gateway,
+    // which never answers group frames).  JoinGroup -> JoinGroupResponse{OK,
+    // "member-1", groupGeneration} (held in pendingJoins while holdJoins);
+    // SyncGroup -> SyncGroupResponse{OK, groupAssignment}; Heartbeat -> OK;
+    // OffsetFetch -> OffsetFetchResponse with committedOffsets (-1 = none).
+    bool groupProtocol = false;
+    bool holdJoins     = false;
+    std::vector<std::pair<int32_t, int32_t>>          groupAssignment;   // (topicId, partition)
+    std::map<std::pair<int32_t, int32_t>, int64_t>    committedOffsets;  // (topicId, partition) -> offset
+    int32_t groupGeneration = 1;
+    int     joinGroups = 0, syncGroups = 0, heartbeats = 0, offsetFetches = 0;
+    std::vector<int64_t> groupSessionIds;  // sessionId of every group frame received
+    std::vector<int64_t> pendingJoins;     // sessionIds of held JoinGroups
+    /// Answer every held JoinGroup now.
+    void releaseJoins() {
+        std::vector<int64_t> p;
+        p.swap(pendingJoins);
+        for (const int64_t sid : p) answerJoin_(sid);
+    }
+    /// The latest subscription for (topicId, partition), or nullptr.
+    [[nodiscard]] const Subscribed* latestSubscription(int32_t topicId, int32_t partition) const {
+        for (auto it = subscribed.rbegin(); it != subscribed.rend(); ++it) {
+            if (it->topicId == topicId && it->partition == partition) return &*it;
+        }
+        return nullptr;
+    }
     std::vector<std::pair<Subscribed, int64_t>> recordsAfterNextConnect;
     int64_t nextSubscriptionId = 500;
     // F8a fix2: stop consuming client ingress (the client's publication then
@@ -493,6 +538,21 @@ struct InvokerGateway {
     }
 
 private:
+    void answerJoin_(int64_t sessionId) {
+        namespace rp = rune::protocol::client;
+        static const std::string kMember = "member-1";
+        rp::JoinGroupResponse r;
+        r.sessionId     = sessionId;
+        r.correlationId = 0;
+        r.generationId  = groupGeneration;
+        r.isLeader      = 0;
+        r.errorCode     = 0;
+        r.memberId      = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kMember.data()), kMember.size());
+        std::vector<uint8_t> out(r.encodedSize());
+        const std::size_t n = r.encode(out.data());
+        send(0, out.data(), n);
+    }
+
     struct SessionPub {
         std::string                                  channel;
         int64_t                                      reg = -1;
@@ -786,7 +846,23 @@ private:
             const auto sv = rcc::decodeSubscribe(buf, len);
             if (!sv) return;
             subscribeCorrIds.push_back(sv->correlationId);
-            const Subscribed sub{nextSubscriptionId++, sv->topicId, sv->partition, sv->sessionId};
+            if (const auto lead = subscribeLeader.find(sv->partition);
+                lead != subscribeLeader.end() && lead->second != endpoint) {
+                ++subscribeRefusals;
+                std::string to = endpoints[static_cast<std::size_t>(lead->second)]->channel;
+                if (const auto at = to.find("endpoint="); at != std::string::npos) to = to.substr(at + 9);
+                if (const auto bar = to.find('|'); bar != std::string::npos) to = to.substr(0, bar);
+                std::vector<uint8_t> out(256 + to.size());
+                const std::size_t n = rcc::encodeErrorResponse(
+                    out.data(), out.size(),
+                    static_cast<int16_t>(subscribeNotLeader ? rp::ErrorCode::NotLeader : rp::ErrorCode::Redirect),
+                    subscribeNotLeader ? std::string_view() : std::string_view(to), sv->sessionId,
+                    sv->correlationId);
+                send(0, out.data(), n);
+                return;
+            }
+            const Subscribed sub{nextSubscriptionId++, sv->topicId, sv->partition, sv->sessionId,
+                                 endpoint, sv->fromOffset, sv->correlationId};
             subscribed.push_back(sub);
             uint8_t out[64];
             const std::size_t n = rcc::encodeSubscribeResponse(
@@ -909,7 +985,84 @@ private:
         }
         case rcc::TemplateId::Unsubscribe: {
             const auto uv = rcc::decodeUnsubscribe(buf, len);
-            if (uv) unsubscribed.push_back(uv->subscriptionId);
+            if (uv) {
+                unsubscribed.push_back(uv->subscriptionId);
+                unsubscribedAt.push_back(endpoint);
+            }
+            return;
+        }
+        case rcc::TemplateId::JoinGroup: {
+            const auto j = rp::JoinGroup::decode(buf, len);
+            if (!j) return;
+            ++joinGroups;
+            groupSessionIds.push_back(j->sessionId);
+            if (!groupProtocol) return;
+            if (holdJoins) {
+                pendingJoins.push_back(j->sessionId);
+                return;
+            }
+            answerJoin_(j->sessionId);
+            return;
+        }
+        case rcc::TemplateId::SyncGroup: {
+            const auto sg = rp::SyncGroup::decode(buf, len);
+            if (!sg) return;
+            ++syncGroups;
+            groupSessionIds.push_back(sg->sessionId);
+            if (!groupProtocol) return;
+            std::vector<rp::TopicPartition32> asgn;
+            for (const auto& [t, p] : groupAssignment) {
+                rp::TopicPartition32 tp;
+                tp.topicId   = t;
+                tp.partition = p;
+                asgn.push_back(tp);
+            }
+            rp::SyncGroupResponse r;
+            r.sessionId     = sg->sessionId;
+            r.correlationId = 0;
+            r.errorCode     = 0;
+            std::vector<uint8_t> out(rp::SyncGroupResponse::encodedSizeFor(asgn.size()));
+            const std::size_t n = r.encode(out.data(), asgn);
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::Heartbeat: {
+            const auto hb = rp::Heartbeat::decode(buf, len);
+            if (!hb) return;
+            ++heartbeats;
+            groupSessionIds.push_back(hb->sessionId);
+            if (!groupProtocol) return;
+            rp::HeartbeatResponse r;
+            r.sessionId     = hb->sessionId;
+            r.correlationId = 0;
+            r.errorCode     = 0;
+            std::vector<uint8_t> out(rp::HeartbeatResponse::ENCODED_SIZE);
+            const std::size_t n = r.encode(out.data());
+            send(0, out.data(), n);
+            return;
+        }
+        case rcc::TemplateId::OffsetFetch: {
+            const auto of = rp::OffsetFetch::decode(buf, len);
+            if (!of) return;
+            ++offsetFetches;
+            groupSessionIds.push_back(of->sessionId);
+            if (!groupProtocol) return;
+            std::vector<rp::OffsetFetchResult> res;
+            for (const auto& e : of->entries) {
+                rp::OffsetFetchResult r;
+                r.topicId   = e.topicId;
+                r.partition = e.partition;
+                r.errorCode = 0;
+                const auto it = committedOffsets.find({e.topicId, e.partition});
+                r.offset = it == committedOffsets.end() ? -1 : it->second;
+                res.push_back(r);
+            }
+            rp::OffsetFetchResponse rsp;
+            rsp.sessionId     = of->sessionId;
+            rsp.correlationId = of->correlationId;
+            std::vector<uint8_t> out(rp::OffsetFetchResponse::encodedSizeFor(res.size()));
+            const std::size_t n = rsp.encode(out.data(), std::span<const rp::OffsetFetchResult>(res));
+            send(0, out.data(), n);
             return;
         }
         default:
