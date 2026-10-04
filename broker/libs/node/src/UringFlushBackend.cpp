@@ -284,12 +284,51 @@ int UringFlushBackend::pushSqes_(const struct io_uring_sqe* sqes, uint32_t n, ui
         __atomic_store_n(sqTail_, tail + submitted, __ATOMIC_RELEASE);
         return EAGAIN;
     }
+    ++submitBatches_;
     return 0;
 }
 
 int UringFlushBackend::pushSqe_(const struct io_uring_sqe& sqe) noexcept {
     uint32_t submitted = 0;
     return pushSqes_(&sqe, 1, submitted, 1);   // n == 1: partial == none submitted (rolled back)
+}
+
+// ---------------------------------------------------------------------------
+// A10 group commit: queueFsync / submitQueued — one io_uring_enter per round
+// ---------------------------------------------------------------------------
+CompletionToken UringFlushBackend::queueFsync(int fd, int64_t flushBoundary) noexcept {
+    (void)flushBoundary;   // not tracked by io_uring (completions match by token)
+    if (inFlight_ + queued_ >= submitDepth_) return kNoToken;
+    const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE);
+    const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED);
+    if (tail + queued_ - head >= sqRingSize_) return kNoToken;
+    const CompletionToken tok = allocToken_();
+    const uint32_t sqeIdx = (tail + queued_) & *sqRingMask_;
+    struct io_uring_sqe sqe{};
+    sqe.opcode      = IORING_OP_FSYNC;
+    sqe.fd          = fd;
+    sqe.fsync_flags = IORING_FSYNC_DATASYNC;
+    sqe.user_data   = static_cast<uint64_t>(tok);
+    sqes_[sqeIdx]    = sqe;
+    sqArray_[sqeIdx] = sqeIdx;
+    ++queued_;
+    return tok;
+}
+
+uint32_t UringFlushBackend::submitQueued() noexcept {
+    if (queued_ == 0) return 0;
+    const uint32_t n = queued_;
+    queued_ = 0;
+    const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED);
+    // Publish all n SQEs at once (store-release: the kernel sees every SQE written above).
+    __atomic_store_n(sqTail_, tail + n, __ATOMIC_RELEASE);
+    const int r = rune_io_uring_enter(ringFd_, /*to_submit=*/n, /*min_complete=*/0, /*flags=*/0);
+    const uint32_t k = r < 0 ? 0u : (static_cast<uint32_t>(r) < n ? static_cast<uint32_t>(r) : n);
+    // The kernel consumed exactly k (the SQ head advanced by k): withdraw the rest.
+    if (k < n) __atomic_store_n(sqTail_, tail + k, __ATOMIC_RELEASE);
+    inFlight_ += k;
+    if (k > 0) ++submitBatches_;
+    return k;
 }
 
 CompletionToken UringFlushBackend::allocToken_() noexcept {

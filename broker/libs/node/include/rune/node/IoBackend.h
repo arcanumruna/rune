@@ -166,6 +166,32 @@ public:
         return kNoToken;
     }
 
+    /// A10 group commit: queue one data-sync of `fd` into the open round batch (no syscall); kNoToken on
+    /// back-pressure.  submitQueued() submits the whole batch at once (io_uring: ONE io_uring_enter) and
+    /// returns how many were accepted — the first k queued tokens, in queue order.
+    [[nodiscard]] CompletionToken queueFlush(int fd, int64_t flushBoundary) noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) [[likely]] return uring_->queueFsync(fd, flushBoundary);
+#endif
+        if (kind_ == IoBackendKind::Portable) return portable_->queueFsync(fd, flushBoundary);
+        return kNoToken;
+    }
+    [[nodiscard]] uint32_t submitQueued() noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) [[likely]] return uring_->submitQueued();
+#endif
+        if (kind_ == IoBackendKind::Portable) return portable_->submitQueued();
+        return 0;
+    }
+    /// Submission batches so far (io_uring: io_uring_enter calls that submitted work).  Tests.
+    [[nodiscard]] uint64_t submitBatches() const noexcept {
+#if defined(__linux__)
+        if (kind_ == IoBackendKind::Uring) return uring_->submitBatches();
+#endif
+        if (kind_ == IoBackendKind::Portable) return portable_->submitBatches();
+        return 0;
+    }
+
     /// F15 S4 fix round 2 (RR1-4): true when read-ahead hints can be issued
     /// asynchronously (io_uring IORING_OP_FADVISE); else the caller uses a
     /// synchronous hint (counted).

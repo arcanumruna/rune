@@ -63,9 +63,9 @@ libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.store(0, 
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.store(1, std::memory_order_relaxed); | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | std::atomic_thread_fence(std::memory_order_seq_cst); | 2 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | if (ring_atomic::getInt32Acquire(w.buf, idx) > 0) return true; | 1 | RING | A9 ring doorbell watch: committed-record length at the head (ring_atomic acquire load)
-libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
-libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
-libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + n, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 2 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 3 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
+libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + n, __ATOMIC_RELEASE); | 2 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
 libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
 libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + submitted, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ tail: LOW-4b partial-enter rollback of the unconsumed SQEs (single pushSqes_ submit path)
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | #include <atomic> | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
@@ -84,6 +84,7 @@ libs/consensus/include/rune/consensus/detail/RingAtomics.h | static_assert(std::
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | std::memory_order_seq_cst); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int32_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int64_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/node/src/UringFlushBackend.cpp | if (k < n) __atomic_store_n(sqTail_, tail + k, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ tail: A10 submitQueued withdraws SQEs the kernel did not consume
 
 # ------------------------------------------------------------ CLEANER
 libs/node/include/rune/node/LogCleanerAgent.h | #include <atomic> | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)

@@ -649,6 +649,7 @@ TEST(ShardNonBlockingRegression, BackgroundFlushRequestedWhileInFlightIsResubmit
     EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 1u);
     EXPECT_EQ(s.w.bgFlushInFlightForTest(), 1u);
     s.w.deliverCompletionForTest(FlushCompletion{t1, 0, 0});
+    s.w.doWork(1);                                          // A10: served by the next durability round
     EXPECT_EQ(s.w.bgFlushSubmitsForTest(), 2u) << "re-requested flush (newer data) resubmitted on retire";
     EXPECT_EQ(s.w.bgFlushInFlightForTest(), 1u);
     s.w.setReapPausedForTest(false);
@@ -844,8 +845,10 @@ TEST(ShardNonBlockingRegression, SegmentWithInFlightFlushDefersItsClose) {
 
 TEST(ShardNonBlockingRegression, ManyLogsSaturationIsBoundedAndQuiet) {
     // More dirty logs than the io backend's in-flight depth (16): refused submits
-    // are NOT retried every pass (no retry table, no warn storm) — the next sync
-    // interval re-requests; every log is eventually synced.
+    // are NOT retried every pass (no retry table, no warn storm) — A10: a refused
+    // member stays wanted and joins the NEXT durability round (self-clocked by
+    // the completions, at most one deferral per round); every log is eventually
+    // synced.
     constexpr int kLogs = 300;
     TmpDir d;
     NullTransport t;
@@ -872,8 +875,11 @@ TEST(ShardNonBlockingRegression, ManyLogsSaturationIsBoundedAndQuiet) {
     w.doWork(now);                                         // replica requests: ≤ 16 accepted, rest deferred
     EXPECT_LE(w.bgFlushInFlightForTest(), 16u);
     const uint64_t deferredAfterFirst = w.bgFlushDeferredForTest();
+    const uint64_t roundsAfterFirst = w.syncRoundsStartedForTest();
+    EXPECT_EQ(roundsAfterFirst, 1u);
     for (int i = 0; i < 100; ++i) w.doWork(now);           // same interval: no per-pass retry
-    EXPECT_EQ(w.bgFlushDeferredForTest(), deferredAfterFirst) << "no per-pass retry spin";
+    EXPECT_LE(w.bgFlushDeferredForTest() - deferredAfterFirst, w.syncRoundsStartedForTest() - roundsAfterFirst)
+        << "no per-pass retry spin: at most one deferral per durability round";
     int intervals = 0;
     auto allSynced = [&] {
         for (int i = 0; i < kLogs; ++i)
@@ -3069,7 +3075,12 @@ TEST(ShardNonBlockingRegression, ReownedLogCompletionUnpinsAndReservesBackground
     ASSERT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore) << "precondition: coalesced behind B1 (bgAgain)";
     s.w.deliverCompletionForTest(FlushCompletion{b1, 0, s.log->flushBoundary()});
     EXPECT_EQ(seg->flushPins(), s.w.bgFlushInFlightForTest()) << "B1's segment pin leaked on the re-owned log";
-    EXPECT_EQ(s.w.bgFlushSubmitsForTest(), bgBefore + 1) << "the background request made meanwhile was not re-served";
+    // A10: the request made meanwhile joins the next durability round — served by its durable member
+    // (the Strict produce above is on the same log; the durable fsync covers the background request).
+    const uint64_t durableBefore = s.w.ioSubmitCountForTest();
+    s.w.doWork(2);
+    EXPECT_EQ(s.w.bgFlushSubmitsForTest() + s.w.ioSubmitCountForTest(), bgBefore + durableBefore + 1)
+        << "the background request made meanwhile was not re-served";
 }
 
 // LAT-1 (e)+(k): the 10 ms owned-log sync and the 20 ms follower flush became config, OFF by default in the
