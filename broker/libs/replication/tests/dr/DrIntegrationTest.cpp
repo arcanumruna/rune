@@ -374,7 +374,11 @@ TEST(DrIntegrationRegression, UncleanRestartedReplicaMadeLeader_NoAckedLoss) {
 
 // E1b (controller side, KIP-966 clean-shutdown signal): moved BEFORE its first
 // fetch, the unclean replica is still in the committed ISR and gets elected
-// with a log missing acked records.
+// with a log missing acked records.  The data-plane half (review 2026-10-04
+// MEDIUM-4: KIP-903 fetch incarnation + "an ISR member fetching below the HW
+// lost committed records") evicts it at its FIRST fetch; electing it before
+// that needs the controller to learn of the unclean restart (broker
+// registration carrying the incarnation + a clean-shutdown marker) — open.
 TEST(DrIntegration, DISABLED_E1b_UncleanRestartMovedBeforeFirstFetch) {
     DrCluster c(3);
     c.start();
@@ -1334,4 +1338,59 @@ TEST(DrIntegrationRegression, AsymmetricPartition_FencedReplicaNotReaddedNoFlapp
     ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsrContains(3); }, kCap))
         << "node 3 never re-admitted once the controller saw it again\n" << c.dump();
     expectAllConvergedAndAcked(c, "asymmetric partition");
+}
+
+// Review 2026-10-04 MEDIUM-4 (KIP-903 / KIP-966, data plane): a follower that
+// lost acked records in an UNCLEAN restart (power loss, fsync off) and came
+// back faster than failure detection (never fenced) kept its committed-ISR
+// seat when its leader's follower slot had been reset meanwhile (here: a
+// same-leader epoch bump) — the per-leadership regression check saw no
+// previous position.  It stayed electable while lacking acked records: the
+// controller (which sees only the restarted node's position) then elected it.
+TEST(DrIntegrationRegression, Rev3Medium4_UncleanRestartSlotReset_LosesIsrSeat_NoAckedLoss) {
+    DrCluster c(3);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(30), 30);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    c.crash(3, CrashKind::PowerLoss);            // fsync off: node 3's log is gone
+    c.restart(3);                                // back before any failure detection
+    ASSERT_TRUE(c.moveLeader(1));                // same leader, new epoch: follower slots reset
+    c.cut(1, 3);                                 // node 3's fetches arrive; answers are lost
+    c.run(10);                                   // well inside replicaLagMaxMs
+    EXPECT_FALSE(c.controllerIsrContains(3)) << "an unclean follower kept its committed-ISR seat\n" << c.dump();
+    c.crash(1, CrashKind::ProcessKill);
+    c.healAll();
+    (void)c.failover({}, /*positionsFrom=*/3);   // the controller sees node 3's position only
+    (void)c.waitWritable(kCap);
+    c.restart(1);
+    c.applyMetadata(1);
+    expectAllConvergedAndAcked(c, "rev3 medium-4 slot reset");
+}
+
+// MEDIUM-4, leader changed meanwhile: the unclean follower's first fetch goes
+// to a NEW leader (no history of it).  A committed-ISR member's validated fetch
+// below the leader's HW proves it lost committed records (every ISR member
+// holds everything below the HW) — it loses its seat.  (Residual, controller
+// side — KIP-966 registration: a new leader whose HW view is still below the
+// restarted member's position cannot tell; see the report.)
+TEST(DrIntegrationRegression, Rev3Medium4_UncleanRestartLeaderChanged_LosesIsrSeat_NoAckedLoss) {
+    DrCluster c(3);
+    c.start(1);
+    ASSERT_EQ(c.produceAcked(30), 30);
+    ASSERT_TRUE(c.driveUntil([&] { return c.converged(); }, kCap));
+    // The followers learn the committed offset (HW) from their next answers.
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(2).highWatermark() == 30; }, kCap)) << c.dump();
+    c.crash(3, CrashKind::PowerLoss);
+    c.restart(3);
+    ASSERT_TRUE(c.moveLeader(2));                // preferred move while node 3 restarts
+    c.cut(2, 3);
+    c.run(10);
+    EXPECT_FALSE(c.controllerIsrContains(3)) << "an unclean follower kept its committed-ISR seat\n" << c.dump();
+    c.crash(2, CrashKind::ProcessKill);
+    c.healAll();
+    (void)c.failover({}, /*positionsFrom=*/3);
+    (void)c.waitWritable(kCap);
+    c.restart(2);
+    c.applyMetadata(2);
+    expectAllConvergedAndAcked(c, "rev3 medium-4 leader changed");
 }

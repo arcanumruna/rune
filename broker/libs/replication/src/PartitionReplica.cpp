@@ -652,6 +652,21 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         return kErrNotLeader;
     }
 
+    // KIP-903: a fetch from an OLDER process incarnation of this follower than
+    // one already seen is a frame of a dead process (still in flight across the
+    // restart): never credited, never answered.  A NEWER one is adopted; when it
+    // replaces a known one, the follower restarted (checked below the HW).
+    bool incarnationChanged = false;
+    if (req.incarnation != 0) {
+        if (FollowerSlot* const s0 = followerSlots_.find(req.followerId)) {
+            if (req.incarnation < s0->incarnation) [[unlikely]] return kErrStaleIncarnation;
+            if (req.incarnation > s0->incarnation) {
+                incarnationChanged = s0->incarnation != 0;
+                s0->incarnation    = req.incarnation;
+            }
+        }
+    }
+
     // Mixed v2/v3 replication is UNSUPPORTED (fail closed): a v2 follower has
     // no lineage to validate — only an empty log (nothing to diverge) is served.
     FetchRequestMsg vreq = req;
@@ -794,24 +809,35 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // (FR: the onFetchRequest SPAN [ReplFetchReqHandle] measures this handler; the
     //  control→worker handoff is measured cleanly via ReplFragRecv→ReplWorkerOpRun.)
 
-    // DUR-1 / KIP-966 (data plane): a follower whose position went BACKWARDS
-    // below the HW within this leadership lost records it had acknowledged —
-    // records that counted toward that HW (an unclean shutdown: its unflushed
-    // page cache is gone; periodic fsync is off by default).  It no longer
-    // holds the committed prefix, so it must neither count toward the HW nor
-    // satisfy min-ISR: evict it now (it would otherwise stay "in sync" — it
-    // keeps fetching and its offset lag is small).  It re-enters through
-    // maybeExpandIsr once its LEO is back at the HW.  Cold path (a regression
-    // is an unclean restart, never steady state).
-    if (prevAckedLeo > req.fetchOffset && req.fetchOffset < prevHwOnFetch) [[unlikely]] {
-        if (slot != nullptr) slot->unclean = true;   // kept out of the ISR until caught up
-        spdlog::warn("PartitionReplica[node={} topic={} part={}]: follower {} regressed "
-                     "{} -> {} below the HW {} (unclean restart lost acknowledged "
-                     "records) — removed from the ISR until caught up",
-                     cfg_.selfId, cfg_.topicId, cfg_.partitionId, req.followerId,
-                     prevAckedLeo, req.fetchOffset, prevHwOnFetch);
-        updateIsr_(nowNs);
-    } else if (slot != nullptr && slot->unclean && req.fetchOffset >= prevHwOnFetch) {
+    // DUR-1 / KIP-966 / KIP-903 (data plane): a follower whose validated fetch
+    // lies BELOW the HW lost committed records (an unclean shutdown: its
+    // unflushed page cache is gone; periodic fsync is off by default).  Proof:
+    //   - its position went backwards within this leadership, or
+    //   - its process incarnation changed (it restarted), or
+    //   - it is a committed-ISR member (review 2026-10-04 MEDIUM-4): every
+    //     member holds everything below the HW (HW = min over the ISR; a new
+    //     leader's HW floor never exceeds the committed offset) — so this holds
+    //     even when this leader has no history of it (slot reset, or the leader
+    //     changed while it restarted).
+    // It must neither count toward the HW nor satisfy min-ISR, nor stay
+    // electable: evict it now (it would otherwise stay "in sync" — it keeps
+    // fetching and its offset lag is small).  It re-enters through expansion
+    // once its LEO is back at max(HW, electionLeo_).  Cold path.
+    if (req.fetchOffset < prevHwOnFetch) [[unlikely]] {
+        const bool committedMember =
+            std::find(committedIsr_.begin(), committedIsr_.end(), req.followerId) != committedIsr_.end();
+        if (slot != nullptr && !slot->unclean &&
+            (prevAckedLeo > req.fetchOffset || incarnationChanged || committedMember)) {
+            slot->unclean = true;   // kept out of the ISR until caught up
+            spdlog::warn("PartitionReplica[node={} topic={} part={}]: follower {} fetched at {} "
+                         "below the HW {} (previous position {}, restarted={}, ISR member={}) — "
+                         "it lost committed records (unclean restart): removed from the ISR "
+                         "until caught up", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
+                         req.followerId, req.fetchOffset, prevHwOnFetch, prevAckedLeo,
+                         incarnationChanged, committedMember);
+            updateIsr_(nowNs);
+        }
+    } else if (slot != nullptr && slot->unclean) {
         slot->unclean = false;   // caught up again (validated): may re-enter via expansion
     }
 
@@ -1290,6 +1316,7 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
     req.maxBytes    = cfg_.maxFetchBytes;
     req.topicId     = cfg_.topicId;   // DR-BUG-5: stamp topicId for transport routing
     req.lastFetchedEpoch = lastFetchedEpoch();   // KIP-320/595
+    req.incarnation      = processIncarnation_;  // KIP-903
     return req;
 }
 

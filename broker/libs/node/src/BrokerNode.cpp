@@ -37,6 +37,9 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <concurrent/logbuffer/FrameDescriptor.h>
 #include <cstdlib>
+#include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 
 // Task 13 fix round 3 (re-review 2, finding 2): every shard worker has a bit in
@@ -60,6 +63,35 @@ static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 // limit CALLS the transport's/ring's own function; no hand arithmetic here.
 // ---------------------------------------------------------------------------
 namespace {
+
+// KIP-903 (review 2026-10-04 MEDIUM-4): this node's PROCESS incarnation —
+// a counter in the data dir bumped durably (tmp + fsync + rename) on every
+// start, stamped on every FetchRequest.  Cold (once per process).  Falls back
+// to the realtime clock (ns) when the data dir cannot be written.
+int64_t bumpProcessIncarnation(const std::string& dataDir) {
+    const auto fallback = [] {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+    if (dataDir.empty()) return fallback();
+    const std::string path = dataDir + "/process-incarnation";
+    int64_t prev = 0;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        long long v = 0;
+        if (std::fscanf(f, "%lld", &v) == 1 && v > 0) prev = static_cast<int64_t>(v);
+        std::fclose(f);
+    }
+    const int64_t next = prev + 1;
+    const std::string tmp = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return fallback();
+    char buf[32];
+    const int n = std::snprintf(buf, sizeof buf, "%lld\n", static_cast<long long>(next));
+    const bool ok = n > 0 && ::write(fd, buf, static_cast<std::size_t>(n)) == n && ::fsync(fd) == 0;
+    ::close(fd);
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
+    return next;
+}
 // Task 10 (spec §3.1) + F30: the ONE place a newly built replica's disk
 // durability policy is set — boot (buildReplication) and runtime-created
 // topics (createRuntimeUserReplicas) alike, in shard AND thread placement.
@@ -814,6 +846,8 @@ void BrokerNode::buildReplication() {
     // is available.  This avoids the PartitionReplica assert(transport != nullptr).
     // -----------------------------------------------------------------------
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
+    // KIP-903: every replica of this process stamps the process incarnation.
+    replicaRegistry_->setProcessIncarnation(bumpProcessIncarnation(config_.dataDir));
     // Task 10 round 4 (Critical 1): the legacy replication transport resolves
     // every inbound frame through the registry at USE time and holds no replica
     // pointer (a removed partition can never be reached through it).  User

@@ -122,6 +122,10 @@ inline constexpr int16_t kErrRecordTooLarge = -6;
 inline constexpr int16_t kErrDivergingEpoch = -7;
 // -8 was kErrLeaderNotComplete (the retired leader-completeness HOLD answer).
 // Reserved: never reused on the wire.
+// KIP-903 (local return code, never on the wire): the fetch came from an OLDER
+// process incarnation of the follower than one already seen — dropped (no
+// answer, no credit).
+inline constexpr int16_t kErrStaleIncarnation = -10;
 // The default replication fetch-ceiling (requested chunk size) used for
 // every PartitionConfig across the broker (see BrokerNode.cpp).  This is
 // deliberately NOT required to cover the gateway's max accepted produce
@@ -385,6 +389,11 @@ public:
     /// After an INELIGIBLE reject, additions are not re-proposed for
     /// kAlterIsrResendNs (shrinks are never held back).  Owner thread.
     void onAlterIsrResponse(const AlterIsrResponseMsg& r);
+    /// KIP-903: this node's PROCESS incarnation (monotonic per node, bumped on
+    /// every start; 0 = untracked).  Stamped on every FetchRequest this replica
+    /// sends; set once before the replica is driven (ReplicaRegistry::add).
+    void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
     /// Test view: the committed partitionEpoch this leader derives proposals from.
     [[nodiscard]] int32_t committedPartitionEpochForTest() const noexcept { return committedPartitionEpoch_; }
     /// Test view: an AlterIsr proposal is in flight.
@@ -1190,6 +1199,7 @@ private:
     /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
     /// not controller-managed).  Set by every becomeLeader.
     int32_t committedPartitionEpoch_ = -1;
+    int64_t processIncarnation_      = 0;    ///< KIP-903 (see setProcessIncarnation)
     /// MEDIUM-2: after an INELIGIBLE reject, no ISR addition is proposed before
     /// this time (a fenced replica is not re-proposed every ISR check).
     int64_t expandBackoffUntilNs_ = 0;

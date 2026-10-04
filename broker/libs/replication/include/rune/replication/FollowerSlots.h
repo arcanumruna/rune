@@ -93,6 +93,12 @@ struct FollowerSlot {
     // F27 R1: the follower's connection generation last seen on its fetch (0 =
     // never seen).  Survives resetLeadership(): it is a property of the link.
     uint32_t connGen = 0;
+    // KIP-903: the newest process incarnation this follower fetched with (0 =
+    // never seen).  Survives resetLeadership(): it is a property of the follower
+    // process, not of the leadership — a fetch from an OLDER incarnation (a
+    // frame of a dead process) is never credited, and a CHANGED one below the
+    // HW marks the follower unclean (it lost committed records in a restart).
+    int64_t incarnation = 0;
 
     /// F27 R1: the link to this follower went down and came back: anything the
     /// transport accepted while it was down may be lost — forget every claim of
@@ -123,6 +129,7 @@ struct FollowerSlot {
         validated = false; unclean = false;
         // connGen is NOT reset: it belongs to the link, not the leadership — a
         // bounce across a re-election must still rewind (re-review 2 N1).
+        // incarnation is NOT reset either (MEDIUM-4: see the field).
     }
 };
 

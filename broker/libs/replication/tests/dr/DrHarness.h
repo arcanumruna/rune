@@ -617,6 +617,7 @@ private:
         if (cfg_.topicId >= 0) n.rep->setIsrChannel(n.ep.get());   // as BrokerNode (multi-node)
         n.up = true;
         ++n.incarnation;
+        n.rep->setProcessIncarnation(n.incarnation);   // KIP-903 (as ReplicaRegistry::add)
     }
 
     /// INTERNAL partition: NodeRuntimeAgent's Kafka broker fencing — the leader

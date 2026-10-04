@@ -1844,8 +1844,11 @@ TEST(NB1_BecomeLeaderUncommittedTail, HwFloorIsCommittedNotLeo) {
             << "NB1: read() must return exactly 5 batches (offsets 0-4), got " << batchCount;
     }
 
-    // Sanity: once kF2 re-acks (sends fetch at LEO=X >= 5), HW should advance.
-    // Simulate kF2 re-acking at its current LEO=0 — HW stays at floor=5 since 0<5.
+    // kF2 is a committed-ISR member whose validated fetch lies BELOW the HW
+    // (LEO 0 < 5): it provably lacks committed records (review 2026-10-04
+    // MEDIUM-4 — every ISR member holds everything below the HW).  It is removed
+    // from the ISR (self-managed: at once) and can no longer pin the HW; the HW
+    // then is the min over the remaining ISR {kF} (minIsr 1).
     FetchRequestMsg req{};
     req.leaderEpoch = 2;
     req.partition   = 0;
@@ -1855,9 +1858,10 @@ TEST(NB1_BecomeLeaderUncommittedTail, HwFloorIsCommittedNotLeo) {
     InMemoryTransport newLeaderTransport;
     newLeaderTransport.setLeader(&f1);
     f1.onFetchRequest(req, 1'000'000LL);
-    // majority(2) of {LEO_f1=10, LEO_kF2=0}: sorted=[10,0] → 0 < floor=5 → HW=5.
-    EXPECT_EQ(f1.highWatermark(), 5)
-        << "NB1: HW must remain 5 when kF2 has LEO=0 (majority not satisfied above 5)";
+    const auto& isrAfter = f1.isr();
+    EXPECT_EQ(std::find(isrAfter.begin(), isrAfter.end(), kF2), isrAfter.end())
+        << "an ISR member below the HW (it lost committed records) kept its seat";
+    EXPECT_GE(f1.highWatermark(), 5) << "the committed floor never regresses";
 }
 
 // ===========================================================================
@@ -4481,4 +4485,27 @@ TEST(PartitionReplicaRegression, IsrExpansionRequiresLeaderEpochStartOffset) {
     ASSERT_EQ(a.onFetchRequest(rev3Fetch(2, kC, 10, 1), clock), kErrNone);  // caught up to 10
     for (int i = 0; i < 5; ++i) { clock += 1'000'000; a.doWork(clock); }
     EXPECT_TRUE(rev3InIsr(a, kC)) << "C never admitted once it held the leader-epoch start offset";
+}
+
+// MEDIUM-4 (KIP-903): a fetch from an OLDER process incarnation of a follower
+// than one the leader already saw (a frame of a dead process still in flight)
+// is never credited — the restarted follower may no longer hold that position.
+TEST(PartitionReplicaRegression, StaleIncarnationFetchNeverCredited) {
+    TempDir d("rev3inc"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> all = {kL, kF};
+    PartitionReplica l(makeConfig(kL, 10'000, 1'000'000, 1), Role::Leader, 1, all, all, &log, &t);
+    for (int i = 0; i < 20; ++i) ASSERT_GE(l.append(makePayload(1)), 0);
+    int64_t clock = 1'000'000;
+    l.doWork(clock);
+    auto f = rev3Fetch(1, kF, 10, 1);
+    f.incarnation = 5;                           // the restarted follower: holds [0,10)
+    ASSERT_EQ(l.onFetchRequest(f, clock), kErrNone);
+    ASSERT_EQ(l.followerLeoForTest(kF), 10);
+    auto stale = rev3Fetch(1, kF, 20, 1);
+    stale.incarnation = 4;                       // its previous process, at 20
+    (void)l.onFetchRequest(stale, clock += 1'000'000);
+    EXPECT_EQ(l.followerLeoForTest(kF), 10) << "credited a fetch of a dead follower process";
+    EXPECT_LE(l.highWatermark(), 10);
 }
