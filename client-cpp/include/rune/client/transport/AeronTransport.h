@@ -114,10 +114,15 @@ public:
     /// True when a background driver thread exists (Thread mode after start()).
     [[nodiscard]] bool usesDriverThread() const noexcept { return driverThread_.joinable(); }
     /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
-    /// pollers' epoll instances, DriverWakeFds.h) into `out` (at most `max`); returns how many.  0 in
+    /// pollers' epoll instances, rune_driver_wake.h) into `out` (at most `max`); returns how many.  0 in
     /// Thread mode (the driver thread consumes the sockets), before start() / after stop(), or off Linux.
     /// Owned by the driver: valid until stop().  The pumping owner parks in ppoll() on them between passes.
+    /// 0 as well when epoll-first polling is off (review C1: Aeron's stock poller can leave an EPOLLERR socket
+    /// ready, so only epoll-first pollers, which consume every readiness, may be parked on).
     [[nodiscard]] int wakeFds(int* out, int max) const noexcept;
+    /// TEST SEAM (pump thread only): poller slots an epoll_wait selected since the last reset
+    /// (rune_driver_epoll_selected_for_test; 0 = the stock recvmmsg-every-socket path ran).
+    [[nodiscard]] int epollSelectedForTest(bool reset) noexcept;
 
     /// True when the Aeron client conductor is invoker-driven (no conductor thread).
     [[nodiscard]] bool usesConductorInvoker() const noexcept {
@@ -334,7 +339,7 @@ public:
     [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
     /// GSO/GRO totals of every transport the driver closed; complete after stop().
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
-    /// A7: the embedded driver polls its transports epoll-first (DriverWakeFds.h).
+    /// A7: the embedded driver polls its transports epoll-first (rune_driver_wake.h).
     [[nodiscard]] bool epollPollActive() const noexcept { return epollPollActive_; }
     /// TEST SEAM — call before start(): the driver's next `count` GSO sendmsg calls fail with errno `err`.
     void injectGsoSendErrorsForTest(int err, int count) noexcept { gsoInjectErr_ = err; gsoInjectCount_ = count; }

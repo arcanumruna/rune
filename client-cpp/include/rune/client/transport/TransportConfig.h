@@ -14,6 +14,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -205,9 +206,21 @@ struct TransportConfig {
         }
         return x;
     };
+    // On/off knobs: 0/1/false/true, the broker's spelling (RUNE_AERON_UDP_GSO / RUNE_AERON_EPOLL_POLL; review
+    // D3 — "false" used to be read as a number, rejected, and the knob silently stayed ON).
+    auto readBool = [&warnings](const char* name) -> std::optional<bool> {
+        const char* v = std::getenv(name);
+        if (v == nullptr || *v == '\0') return std::nullopt;
+        const std::string_view s(v);
+        if (s == "1" || s == "true") return true;
+        if (s == "0" || s == "false") return false;
+        warnings.push_back(std::string("rune-client: ignoring ") + name + "=\"" + v +
+                           "\": must be 0/1/false/true (keeping the configured value)");
+        return std::nullopt;
+    };
     if (const auto mtu = readSize("RUNE_CLIENT_AERON_MTU")) c.mtuLength = *mtu;
-    if (const auto g = readSize("RUNE_CLIENT_AERON_UDP_GSO")) c.udpGso = (*g != 0);
-    if (const auto e = readSize("RUNE_CLIENT_AERON_EPOLL_POLL")) c.epollPoll = (*e != 0);
+    if (const auto g = readBool("RUNE_CLIENT_AERON_UDP_GSO")) c.udpGso = *g;
+    if (const auto e = readBool("RUNE_CLIENT_AERON_EPOLL_POLL")) c.epollPoll = *e;
     if (const auto m = readSize("RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND")) {
         if (*m >= 1 && *m <= 16) c.maxMessagesPerSend = static_cast<uint32_t>(*m);
         else warnings.push_back("rune-client: ignoring RUNE_CLIENT_AERON_MAX_MSGS_PER_SEND=" + std::to_string(*m) +

@@ -610,3 +610,102 @@ TEST(InvokerTransportEpollPoll, InstalledWhereSupportedAndConfigured) {
     EXPECT_FALSE(s.epollPollActive()) << "the A/B off arm: Aeron's stock poller";
     s.stop();
 }
+
+// A7 review C1: publications to a peer that is down (closed port, host up) get ICMP port-unreachable on their
+// CONNECTED send sockets; the kernel parks the error (EPOLLERR without EPOLLIN).  Epoll-first polling must consume
+// it in the pass, or the owner parked on wakeFds() wakes at once forever (100% CPU while a broker node is down).
+// Linux only.
+namespace {
+uint16_t closedUdpPort() {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
+    socklen_t len = sizeof a;
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+    ::close(fd);
+    return ntohs(a.sin_port);
+}
+template <class Pred>
+bool pumpFor(Transport& t, std::chrono::milliseconds limit, Pred&& pred) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (std::chrono::steady_clock::now() < deadline) {
+        t.dutyCycle();
+        if (pred()) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(InvokerTransportWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePassRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "driver wake fds are Linux-only (Aeron's transport pollers use epoll there)";
+#else
+    const std::string down1 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(closedUdpPort());
+    const std::string down2 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(closedUdpPort());
+    Transport t{invokerConfig(down1, "aeron:ipc", 3194)};
+    t.start();
+    const Transport::PubHandle h = t.publicationHandle(down2, 3195);   // a 2nd send socket: the epoll-first branch
+    const uint8_t one[1] = {1};
+    ASSERT_TRUE(pumpUntil(t, [&] { (void)t.offerOn(h, one, 1); return t.publicationReady(h); }));   // resolves lazily
+    int fds[4];
+    const int n = t.wakeFds(fds, 4);
+    ASSERT_EQ(n, 2);
+    auto wakeReady = [&] {
+        pollfd pf[4];
+        for (int i = 0; i < n; ++i) pf[i] = pollfd{fds[i], POLLIN, 0};
+        const timespec zero{0, 0};
+        return ::ppoll(pf, static_cast<nfds_t>(n), &zero, nullptr) > 0;
+    };
+    for (int round = 0; round < 3; ++round) {
+        (void)pumpFor(t, std::chrono::milliseconds(350), wakeReady);   // an ICMP error pending, or >= 3 setups
+        ASSERT_TRUE(pumpFor(t, std::chrono::seconds(5), [&] { return t.dutyCycle() == 0; }));
+        pollfd pf[4];
+        for (int i = 0; i < n; ++i) pf[i] = pollfd{fds[i], POLLIN, 0};
+        const timespec park{0, 30'000'000};
+        EXPECT_EQ(::ppoll(pf, static_cast<nfds_t>(n), &park, nullptr), 0)
+            << "round " << round << ": wake fd left ready by an unconsumed EPOLLERR";
+    }
+    t.stop();
+#endif
+}
+
+// Review M2: a client driver whose receiver poller holds > 1 UDP transport (the egress subscription plus two
+// more) delivers everything AND the epoll-first branch demonstrably ran (an epoll_wait selected a socket); the
+// stock arm delivers the same without it.
+TEST(InvokerTransportEpollPollRegression, MultiTransportReceiverDeliversThroughEpollFirstRegression) {
+    for (bool epoll : {true, false}) {
+        const uint16_t p0 = closedUdpPort(), p1 = closedUdpPort(), p2 = closedUdpPort();
+        const std::string c0 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p0);
+        const std::string c1 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p1);
+        const std::string c2 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p2);
+        Config cfg = invokerConfig(c0, c0, 3196);
+        cfg.epollPoll = epoll;
+        Transport t{cfg};
+        t.start();
+        t.addEgressSubscription(c1, 3196);
+        t.addEgressSubscription(c2, 3196);
+        ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
+        const Transport::PubHandle h1 = t.publicationHandle(c1, 3196);
+        const Transport::PubHandle h2 = t.publicationHandle(c2, 3196);
+        // Publications resolve lazily in offerOn, the extra egress subscriptions inside poll(): offer and poll
+        // together (an offer to a lane that is not connected yet back-pressures and is retried).
+        for (int i = 0; i < 200; ++i) t.dutyCycle();   // setup / status traffic settles
+        (void)t.epollSelectedForTest(/*reset=*/true);
+        constexpr int kPer = 30;
+        const uint8_t b[16] = {7};
+        int sent = 0, got = 0;
+        EXPECT_TRUE(pumpUntil(t, [&] {
+            if (sent < kPer) { if (t.offer(b, sizeof b)) ++sent; }
+            else if (sent < 2 * kPer) { if (t.offerOn(h1, b, sizeof b)) ++sent; }
+            else if (sent < 3 * kPer) { if (t.offerOn(h2, b, sizeof b)) ++sent; }
+            got += t.poll([](const uint8_t*, std::size_t) {}, 64);
+            return sent == 3 * kPer && got >= 3 * kPer;
+        })) << "epoll=" << epoll << " sent " << sent << " got " << got;
+        EXPECT_EQ(got, 3 * kPer) << "epoll=" << epoll;
+#if defined(__linux__)
+        if (epoll) EXPECT_GT(t.epollSelectedForTest(false), 0) << "the epoll-first branch ran";
+        else       EXPECT_EQ(t.epollSelectedForTest(false), 0) << "stock <= 5 path only";
+#endif
+        t.stop();
+    }
+}

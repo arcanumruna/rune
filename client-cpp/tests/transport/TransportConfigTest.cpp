@@ -251,3 +251,31 @@ TEST(TransportConfig, EpollPollDefaultsOnAndEnvTurnsItOff) {
     ::unsetenv("RUNE_CLIENT_AERON_EPOLL_POLL");
     EXPECT_TRUE(on.epollPoll);
 }
+
+// Review D3: the on/off knobs take the broker's 0/1/false/true.  "false" used to be parsed as a number, rejected
+// with a warning, and the knob silently stayed ON (an A/B off arm that measured the on arm).
+TEST(TransportConfigRegression, OnOffKnobsAcceptFalseTrueAndWarnOnGarbageRegression) {
+    for (const char* name : {"RUNE_CLIENT_AERON_EPOLL_POLL", "RUNE_CLIENT_AERON_UDP_GSO"}) {
+        for (const auto& [v, want] : {std::pair{"false", false}, std::pair{"0", false},
+                                      std::pair{"true", true}, std::pair{"1", true}}) {
+            ::setenv(name, v, 1);
+            TransportConfig c;
+            c.epollPoll = !want;
+            c.udpGso = !want;
+            const auto w = applyEnvOverrides(c);
+            ::unsetenv(name);
+            EXPECT_TRUE(w.empty()) << name << "=" << v;
+            EXPECT_EQ(std::string(name) == "RUNE_CLIENT_AERON_EPOLL_POLL" ? c.epollPoll : c.udpGso, want)
+                << name << "=" << v;
+        }
+        for (const char* bad : {"off", "2", "yes"}) {
+            ::setenv(name, bad, 1);
+            TransportConfig c;
+            const auto w = applyEnvOverrides(c);
+            ::unsetenv(name);
+            ASSERT_EQ(w.size(), 1u) << name << "=" << bad;
+            EXPECT_NE(w[0].find("must be 0/1/false/true"), std::string::npos) << w[0];
+            EXPECT_TRUE(c.epollPoll && c.udpGso) << "garbage keeps the configured value";
+        }
+    }
+}

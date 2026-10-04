@@ -167,12 +167,13 @@ if(aeron_FOUND)
     endif()
 endif()
 
-# ── rune_client_driver_wake — A7 park-until-work: an invoker driver's readiness fds ──
-# A C TU: Aeron's internal driver headers are C (same include probe as rune_gso).  Non-Linux: a stub (0 fds).
+# ── rune_client_driver_wake — A7 park-until-work + epoll-first polling ──
+# ONE copy shared with rune-broker (review L4): the rune-protocol sibling C source, like rune_gso.  Aeron's internal
+# driver headers are C (same include probe as rune_gso).  Non-Linux: a stub (0 fds, stock polling).
 if(aeron_FOUND)
-    add_library(rune_client_driver_wake STATIC src/transport/DriverWakeFds.c)
+    add_library(rune_client_driver_wake STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_driver_wake.c)
     set_target_properties(rune_client_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(rune_client_driver_wake PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+    target_include_directories(rune_client_driver_wake PUBLIC $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>)
     if(UNIX AND NOT APPLE)
         target_link_libraries(rune_client_driver_wake PRIVATE aeron::aeron)
         foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
