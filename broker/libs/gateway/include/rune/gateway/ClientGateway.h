@@ -1330,6 +1330,7 @@ private:
     std::array<CapEpisode, kMaxHeldMaskWorkers>  capEpisode_{};
     uint16_t                                     capEpisodeTags_ = 0;          // global, never 0 when issued
     uint64_t                                     workerCapEvictions_ = 0;
+    uint64_t                                     directShareExpiries_ = 0;   // D8d: worker Expire signals acted on
     int64_t                                      lastCapEvictedSid_ = 0;
     /// Deferred polls of one cap-full episode before an expiry is considered:
     /// a READING session's claims return a Credit within a worker pass + one
@@ -1676,6 +1677,7 @@ public:
     [[nodiscard]] uint64_t workerCapProduceAbortsForTest() const noexcept { return workerCapProduceAborts_; }
     void setWorkerRoutedCapForTest(uint32_t cap) noexcept { workerRoutedCap_ = cap; }
     [[nodiscard]] uint64_t workerCapEvictionsForTest() const noexcept { return workerCapEvictions_; }
+    [[nodiscard]] uint64_t directShareExpiriesForTest() const noexcept { return directShareExpiries_; }
     [[nodiscard]] int64_t lastCapEvictedSessionForTest() const noexcept { return lastCapEvictedSid_; }
     [[nodiscard]] int64_t produceInFlightForTest(int64_t sid) noexcept {
         const Session* s = sessions_.find(sid);

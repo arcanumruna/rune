@@ -61,7 +61,7 @@ struct Fixture {
     std::shared_ptr<aeron::Aeron> client;
     std::unique_ptr<WorkerIngress> ing;
     // unique_ptr: the worker (its session publications) must die BEFORE the Aeron client.
-    std::unique_ptr<Worker> worker = std::make_unique<Worker>(0, 1 << 16, 1 << 16, 64, 64);
+    std::unique_ptr<Worker> worker;
     std::shared_ptr<aeron::ExclusivePublication> producePub;
     std::shared_ptr<aeron::Subscription> egress;
     std::map<int64_t, pc::ProduceResponse> acks;
@@ -98,7 +98,10 @@ struct Fixture {
     /// its WorkerOp::SessionAnnounce.
     explicit Fixture(std::vector<rune::replication::NodeId> replicas, int minIsr,
                      const std::function<void(rune::storage::Log&)>& preload = {},
-                     int64_t rollBytes = 64LL * 1024 * 1024, int32_t session5Version = 0) {
+                     int64_t rollBytes = 64LL * 1024 * 1024, int32_t session5Version = 0,
+                     std::size_t ringBytes = 1 << 16) {
+        // `ringBytes` (D8d): the op / return ring sizes (production: 32 MiB each).
+        worker = std::make_unique<Worker>(0, ringBytes, ringBytes, 64, 64);
         static std::atomic<int> seq{0};
         const std::string tag = std::to_string(::getpid()) + "_" + std::to_string(seq++);
         dir  = fs::temp_directory_path() / ("rune_swa_log_" + tag);
@@ -929,4 +932,174 @@ TEST(ShardWorkerAckRegression, ParkedRoutedAcksAllTimedOutReturnsItsCreditRegres
     EXPECT_NE(f.acks[51].errorCode, 0) << "answered with an error by the timeout";
     for (int i = 0; i < 4; ++i) f.step();
     EXPECT_EQ(c.n, 1) << "the timed-out answer returns the credit";
+}
+
+// ============================================================================
+// D8d (D8c review LOW-R2): stalled DIRECT (worker-ingress) clients.  Each
+// stalled client below has its own ingress publication (its own image, a 2 MiB
+// term so one burst out-runs any poll budget) and an ack publication nobody
+// reads (no subscriber: NOT_CONNECTED, held from its first ack).
+// ============================================================================
+namespace {
+struct StalledDirectClients {
+    std::vector<std::shared_ptr<aeron::ExclusivePublication>> pubs;
+    std::vector<int64_t> sids;
+    /// `n` sessions sid0.. announced with an unread ack stream, each with its own
+    /// ingress publication.
+    void add(Fixture& f, int n, int64_t sid0) {
+        std::vector<int64_t> regs;
+        for (int i = 0; i < n; ++i)
+            regs.push_back(f.client->addExclusivePublication("aeron:ipc?term-length=2m", kIngress));
+        pubs.resize(regs.size());
+        auto allConnected = [&] {
+            for (auto& p : pubs) if (!p || !p->isConnected()) return false;
+            return true;
+        };
+        for (int k = 0; k < kCap && !allConnected(); ++k) {
+            f.pump();
+            for (std::size_t i = 0; i < regs.size(); ++i)
+                if (!pubs[i]) pubs[i] = f.client->findExclusivePublication(regs[i]);
+        }
+        ASSERT_TRUE(allConnected());
+        for (int i = 0; i < n; ++i) {
+            sids.push_back(sid0 + i);
+            f.announce(sid0 + i, 9'000 + i);                     // nobody subscribes: never connected
+        }
+    }
+    /// Each client offers up to `frames` acks=Leader produces at once (never loops on refusal).
+    int64_t burst(int frames, int64_t corrBase) {
+        int64_t sent = 0;
+        for (std::size_t i = 0; i < pubs.size(); ++i)
+            for (int k = 0; k < frames; ++k) {
+                auto fr = Fixture::produceFrame(sids[i], corrBase + static_cast<int64_t>(i) * 1'000'000 + k, 0);
+                if (!Fixture::offerOnce(*pubs[i], fr)) break;
+                ++sent;
+            }
+        return sent;
+    }
+};
+} // namespace
+
+// D8d RED: many stalled direct sessions must not stop another direct session's
+// intake on the same worker, nor the op drain.  (Was: each stalled client's
+// first poll admitted a whole poll budget of produces — up to 4096 acks per
+// session at the fragment-limit ceiling —
+// until the worker's own-intake half was gone: ackRoom_ hit 0, the op drain
+// paused every pass and the poll budget was 0, so session 6's produce was never
+// even polled.)
+TEST(ShardWorkerAckRegression, ManyStalledDirectSessionsCannotStopAnotherDirectSessionsIntakeRegression) {
+    // Production-sized rings (32 MiB): the return ring never limits a poll.
+    Fixture f({1}, 1, {}, 64LL * 1024 * 1024, 0, Worker::kReturnByteCapacity);
+    f.runtimeDrainsReturns = true;
+    // The configurable per-poll ceiling (RUNE_GATEWAY_FRAGMENT_LIMIT <= kMaxFragmentLimit)
+    // the worker's reserve is sized for: one poll may admit 4096 frames of one image.
+    f.worker->setDesiredFragmentLimit(Worker::kMaxFragmentLimit);
+    for (int i = 0; i < 4; ++i) f.step();
+    StalledDirectClients st;
+    st.add(f, 10, 100);
+    f.addSecondClient(6);
+    for (int i = 0; i < 8; ++i) f.step();
+    const int64_t sent = st.burst(6'000, 10'000'000);
+    ASSERT_GT(sent, 40'000) << "precondition: the stalled clients out-ran any poll budget";
+    for (int i = 0; i < 200; ++i) f.step();
+    ASSERT_GT(f.worker->sessionAcksPendingForTest(), 0u) << "precondition: the worker holds the stalled acks";
+
+    auto fr6 = Fixture::produceFrame(6, 6'000'001, 0);
+    ASSERT_TRUE(Fixture::offerOnce(*f.pub2, fr6));
+    for (int i = 0; i < 2'000 && !f.acks.count(6'000'001); ++i) f.step();
+    EXPECT_EQ(f.acks.count(6'000'001), 1u)
+        << "another direct session's produce must be polled and acked while stalled sessions hold acks";
+    EXPECT_EQ(f.worker->ackRoomOpPausesForTest(), 0u) << "the op drain never ran out of ack room";
+    EXPECT_LE(f.worker->directAcksInFlightForTest(), Worker::kDirectAckBudget)
+        << "stalled direct sessions hold at most the worker's direct share";
+}
+
+// D8d: when stalled direct sessions fill the worker's whole direct share, the
+// worker EXPIRES the session held there with the largest share (SessionSignal
+// Expire → the runtime closes it: SessionClose back on the lifecycle ring), its
+// queued acks drop and free the share, and a reading session is served.  Never a
+// session that is not held (session 6 reads its acks); never more than one in
+// flight.  (A small cap — 400, budget 200 — keeps the burst short; the policy is
+// the same at the default kDirectAckBudget.)
+TEST(ShardWorkerAckRegression, FullDirectShareExpiresTheHeldLargestShareSessionAndServesAnotherRegression) {
+    Fixture f({1}, 1, {}, 64LL * 1024 * 1024, 0, Worker::kReturnByteCapacity);
+    f.runtimeDrainsReturns = true;
+    f.worker->setDirectAckBudgetsForTest(200, 400);
+    std::vector<std::pair<int64_t, int64_t>> expired;       // (sid, share at expiry)
+    int closesInFlight = 0, maxClosesInFlight = 0;
+    bool largest = true;
+    StalledDirectClients st;
+    f.onReturn = [&](const WorkerReturn& r) {
+        if (r.type != WorkerReturn::Type::SessionSignal ||
+            r.lastOffset != static_cast<int64_t>(SessionSignalKind::Expire)) return;
+        expired.push_back({r.sessionId, r.baseOffset});
+        for (int64_t sid : st.sids)                         // nobody held a larger share at that moment
+            if (sid != r.sessionId && f.worker->directAcksInFlightOfForTest(sid) > r.baseOffset) largest = false;
+        maxClosesInFlight = std::max(maxClosesInFlight, ++closesInFlight);
+        WorkerOp c; c.type = WorkerOp::Type::SessionClose; c.sessionId = r.sessionId;   // the runtime's close
+        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(c)));
+    };
+    for (int i = 0; i < 4; ++i) f.step();
+    st.add(f, 8, 100);
+    f.addSecondClient(6);
+    for (int i = 0; i < 8; ++i) f.step();
+    ASSERT_GT(st.burst(1'000, 10'000'000), 6'000);
+    for (int i = 0; i < 16; ++i) f.step();
+    ASSERT_EQ(f.worker->directAcksInFlightForTest(), 400u) << "precondition: the stalled sessions filled the share";
+    ASSERT_TRUE(expired.empty()) << "no expiry before kDirectExpireAfterDeferredPasses deferred passes";
+
+    auto fr6 = Fixture::produceFrame(6, 6'000'001, 0);
+    ASSERT_TRUE(Fixture::offerOnce(*f.pub2, fr6));
+    uint64_t closesSeen = f.worker->sessionClosesSeenForTest();
+    for (int i = 0; i < 5'000 && !f.acks.count(6'000'001); ++i) {
+        f.step();
+        if (f.worker->sessionClosesSeenForTest() != closesSeen) { closesSeen = f.worker->sessionClosesSeenForTest(); --closesInFlight; }
+        ASSERT_LE(f.worker->directAcksInFlightForTest(), 400u) << "the cap is never exceeded";
+    }
+    ASSERT_EQ(f.acks.count(6'000'001), 1u) << "a reading direct session is served once a stalled one expires";
+    ASSERT_FALSE(expired.empty());
+    EXPECT_LE(expired.size(), st.sids.size()) << "each expiry frees one stalled session's share";
+    for (auto [sid, share] : expired) {
+        EXPECT_NE(sid, 6) << "a session that reads its acks is never expired";
+        EXPECT_GE(sid, 100) << "only the stalled (held) sessions";
+        EXPECT_GT(share, 0);
+    }
+    EXPECT_EQ(expired.front().second, 200) << "the first expiry hits a session at its whole budget";
+    EXPECT_TRUE(largest) << "every expiry hit the largest held share";
+    EXPECT_EQ(maxClosesInFlight, 1) << "one expiry in flight until the runtime's close arrives";
+    EXPECT_EQ(f.worker->directExpiriesForTest(), expired.size());
+    EXPECT_EQ(f.worker->ackRoomOpPausesForTest(), 0u);
+    EXPECT_EQ(f.worker->directUnderflowsForTest(), 0u);
+}
+
+// D8d: the direct budget is returned on every exit — claim, refusal answer, the
+// runtime's close — on the real driver: after stalled and reading direct
+// sessions (acks=Leader and acks=all) drain or close, the worker's direct count
+// is back to zero.
+TEST(ShardWorkerAckRegression, DirectBudgetReturnsToZeroAfterClaimsRefusalsAndCloseRegression) {
+    Fixture f({1}, 1);
+    f.runtimeDrainsReturns = true;
+    for (int i = 0; i < 4; ++i) f.step();
+    StalledDirectClients st;
+    st.add(f, 2, 100);
+    for (int i = 0; i < 8; ++i) f.step();
+    for (int64_t c = 0; c < 50; ++c) { f.produce(1'000 + c, 0); f.produce(2'000 + c, 1); }   // acks=Leader + acks=all
+    auto bad = Fixture::produceFrame(5, 3'000, 0, /*topicId=*/77);                          // unowned → NotLeader
+    ASSERT_TRUE(Fixture::offerOnce(*f.producePub, bad));
+    ASSERT_GT(st.burst(300, 20'000'000), 300);
+    for (int i = 0; i < 2'000 && !(allAcked(f, 1'000, 1'050) && allAcked(f, 2'000, 2'050) && f.acks.count(3'000)); ++i)
+        f.step();
+    ASSERT_TRUE(allAcked(f, 1'000, 1'050) && allAcked(f, 2'000, 2'050));
+    ASSERT_EQ(f.acks.count(3'000), 1u);
+    EXPECT_EQ(f.acks[3'000].errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(f.worker->directAcksInFlightOfForTest(5), 0u) << "claimed answers (OK and refusal) returned";
+    EXPECT_GT(f.worker->directAcksInFlightForTest(), 0u) << "precondition: the stalled sessions hold some";
+    for (int64_t sid : st.sids) {
+        WorkerOp c; c.type = WorkerOp::Type::SessionClose; c.sessionId = sid;
+        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(c)));
+    }
+    for (int i = 0; i < 8; ++i) f.step();
+    EXPECT_EQ(f.worker->directAcksInFlightForTest(), 0u) << "closed sessions' shares returned";
+    EXPECT_EQ(f.worker->directUnderflowsForTest(), 0u);
 }

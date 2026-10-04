@@ -407,6 +407,12 @@ struct WorkerReturn {
     // the struct the answer travels in (parked waiters, the return FIFO).
     bool    gatewayCredit = false;
 
+    // D8d: a ProduceResult ANSWER of a DIRECT (worker-ingress) produce counted
+    // against the worker's direct budget (SessionAckSink::admitDirect's result,
+    // copied to AckEntry::direct; returned when the ack leaves the sink).
+    // Worker-local only: NOT encoded, like gatewayCredit.
+    uint8_t directAck     = 0;
+
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
     // dereferences it — it refers to the replica by (targetReplicaId,
     // incarnation), echoed from the op, and resolves through the registry.

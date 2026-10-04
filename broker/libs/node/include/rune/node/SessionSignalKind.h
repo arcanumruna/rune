@@ -19,6 +19,12 @@ enum class SessionSignalKind : int64_t {
     /// runtime returns that many produce credits (coalesced: <= one per session
     /// per worker pass).
     Credit   = 6,
+    /// D8d: the worker's direct (worker-ingress) budget is full and this
+    /// session — held here with the largest direct share — is to be EXPIRED: the
+    /// runtime closes it everywhere and tells the client SessionExpired (it
+    /// reconnects and resends; idempotent producers dedupe).  WorkerReturn::
+    /// baseOffset = its direct share (diagnostic).
+    Expire   = 7,
 };
 
 } // namespace rune::node

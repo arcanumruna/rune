@@ -3631,6 +3631,35 @@ TEST(TxnRcRegression, HoldCapacityExhaustedAnswersNotReady) {
     EXPECT_EQ(R.w->heldPushReadsForTest(), Worker::kMaxHeldPushReads);
 }
 
+// D8d (D8c review LOW-R2): held read_committed PushReads owe a return each and
+// so shrink ackRoom_ (reservedAckSlots_) — the room a stalled client cannot
+// take.  They are BOUNDED, by a static cap independent of what any client does
+// (held only while the partition's RC state builds; beyond the cap notReady at
+// once), and the worker's own-intake reserve sets exactly that cap aside next to
+// the direct (worker-ingress) share and one full op drain.  Flooding PushReads
+// past the cap: the hold set and the owed reservation stop at the cap.
+TEST(TxnRcRegression, HeldPushReadsStayWithinTheirFixedTermOfTheAckReserveRegression) {
+    static_assert(Worker::kDirectAckBudget + Worker::kMaxHeldPushReads +
+                      static_cast<std::size_t>(Worker::kMaxIngressDrainLimit) <= Worker::kAckReserve,
+                  "the reserve holds the direct share + the held-PushRead cap + one op drain");
+    RcRig R;
+    for (int i = 0; i < 64; ++i) R.append(bigBatch(1000));
+    R.own(1024);
+    R.pass();
+    ASSERT_EQ(R.status(), Worker::kRcScanning);
+    const int64_t hw = R.log->logEndOffset();
+    for (int round = 0; round < 3; ++round) {               // 3 x (cap + 64) reads while the build runs
+        for (std::size_t i = 0; i < Worker::kMaxHeldPushReads + 64; ++i)
+            ASSERT_TRUE(R.w->tryEnqueueOp(pushReadIso(R.rep.get(), static_cast<int64_t>(round * 10'000 + i), 0, hw, 1)));
+        R.pass(); R.pass(); R.pass();
+        ASSERT_EQ(R.status(), Worker::kRcScanning) << "precondition: still building";
+        EXPECT_EQ(R.w->heldPushReadsForTest(), Worker::kMaxHeldPushReads) << "round " << round;
+        EXPECT_LE(R.w->reservedAckSlotsForTest(), static_cast<int64_t>(Worker::kMaxHeldPushReads))
+            << "the owed reservation held PushReads take never exceeds their fixed term";
+        (void)R.pushResults();
+    }
+}
+
 // ---- F15 S4 fix round 2 (re-review 1: RR1-1 .. RR1-4) -------------------------
 namespace {
 // A page-cache model: residency is granted only for ranges a read-ahead call

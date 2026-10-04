@@ -62,6 +62,23 @@
 //     session is truly unknown (closed).  Until then the ack is held (a frame
 //     can be visible before its announcement is drained: aeron:ipc commits
 //     straight into the log buffer).
+// Direct budget (D8d — D8c review LOW-R2): every DIRECT (worker-ingress)
+// produce is admitted by admitDirect and counted from that moment (owed —
+// parked acks=all / Strict — or queued) until its ack LEAVES this queue
+// (claimed, or dropped for a closed / failed session).  Per session at most
+// directSessionBudget_; per worker at most directCap_ (Worker::kDirectAckBudget:
+// the own-intake half minus the held-PushRead cap and one full op drain), so no
+// number of stalled direct sessions can take the room the op drain (role /
+// replication / gateway-routed ops) needs.  In the cap's last quarter only LIGHT
+// sessions (< kDirectLightInFlight) are admitted: a stalled session — at its
+// whole share — runs out first.  A frame refused here is ABORTed by the worker's
+// controlled poll (it stays on ITS image; the client's offers back-pressure).
+// When the cap is full, the session HELD here with the largest direct share is
+// EXPIRED (reportDirectExpiry → the runtime closes it with SessionExpired) —
+// the policy and thrash guards of D8c's gateway expiry: only a held session,
+// never one whose acks were claimed during the episode, only after
+// kDirectExpireAfterDeferredPasses deferred passes, at most one per episode and
+// one in flight until the runtime's close arrives.
 // Bound: the worker gates every intake step (op drain, client poll) on free
 // slots minus owed acks, so the queue never overflows (Worker.h, kAckCapacity).
 //
@@ -76,6 +93,7 @@
 #include <ExclusivePublication.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -97,6 +115,10 @@ struct AckEntry {
     /// the runtime holds one produce credit for it until it is CLAIMED here
     /// (reportCredits).  0 = a direct (worker-ingress) produce — no credit.
     uint8_t credit        = 0;
+    /// D8d: a DIRECT (worker-ingress) produce's answer, counted against the
+    /// direct budget since admitDirect: kDirectTotalOnly (the worker total) or
+    /// kDirectCounted (also its session's share); 0 = not a direct answer.
+    uint8_t direct        = 0;
     /// Unknown-session hold (I1): the lifecycle-ring producer position sampled
     /// at the first flush that saw this ack with no session; -1 = not held.
     int64_t sessionPos    = -1;
@@ -135,6 +157,20 @@ public:
     /// <= ~200 ms (~100 ms at ~10k passes/s) — orders of magnitude inside the
     /// runtime's held bound (10 min), at <= ~10 signals/s per held session.
     static constexpr uint64_t    kProgressPassInterval = 1024;
+    /// D8d: admitDirect results (AckEntry::direct).
+    static constexpr uint8_t     kDirectRefused   = 0;   ///< ABORT the frame (held / no budget / band / full)
+    static constexpr uint8_t     kDirectTotalOnly = 1;   ///< admitted; session not announced yet: worker total only
+    static constexpr uint8_t     kDirectCounted   = 2;   ///< admitted; worker total + the session's share
+    /// D8d: default per-session direct budget — the owed-return cap default
+    /// (Worker::kMaxOwedReturns): one session may keep a full pipeline of
+    /// parked acks=all on a worker; a stalled one holds at most this.
+    static constexpr uint32_t    kDefaultDirectSessionBudget = 4096;
+    /// D8d: in the cap's last quarter only sessions holding fewer than this
+    /// many direct acks are admitted (ClientGateway::kLightSessionInFlight).
+    static constexpr uint32_t    kDirectLightInFlight = 64;
+    /// D8d: deferred passes of a full direct cap before an expiry is considered
+    /// (and between scans) — ClientGateway::kCapEvictAfterDeferredPolls.
+    static constexpr uint32_t    kDirectExpireAfterDeferredPasses = 64;
 
     struct PubAnnounced { uint16_t chan = 0; uint16_t chanLen = 0; int32_t streamId = 0; };
     struct PubResolving { int64_t regId = -1; };
@@ -205,6 +241,22 @@ public:
     /// this pass was observed) — they decide when an unknown session's ack is
     /// truly orphaned (I1).  Returns work done.
     int flush(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
+        const int work = flushAcks_(ringProducerPos, ringConsumerPos);
+        if ((directFullThisPass_ | directEp_.tag) != 0) [[unlikely]] directEpisode_();
+        return work;
+    }
+
+    /// G-A6 per-client pause: `sessionId` still holds acks after the last flush
+    /// (its publication back-pressured / not connected / not yet resolved).  O(1) when nothing
+    /// is held (the hot case) — one hash probe otherwise.
+    [[nodiscard]] bool holding(int64_t sessionId) const noexcept {
+        if (heldAfterFlush_ == 0) [[likely]] return false;
+        const std::size_t idx = find_(sessionId);
+        return idx != kNone && heldPass_[idx] == pass_;
+    }
+
+private:
+    int flushAcks_(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
         ++pass_;
         int work = unresolvedCount_ ? resolvePending_() : 0;
         if (drainCount_) [[unlikely]] work += drainRegistrations_();
@@ -222,7 +274,11 @@ public:
                 // Unknown: hold until every announcement enqueued before its
                 // frame existed is applied, then it is orphaned (closed session).
                 if (a.sessionPos < 0) a.sessionPos = ringProducerPos;
-                if (ringConsumerPos >= a.sessionPos) { ++dropped_; continue; }
+                if (ringConsumerPos >= a.sessionPos) {
+                    if (a.direct) directDone_(a.direct, kNone, false);
+                    ++dropped_;
+                    continue;
+                }
                 acks_[keep++] = a;
                 continue;
             }
@@ -236,11 +292,13 @@ public:
                     if (pos > 0) [[likely]] {
                         if (const Edges& e = edges_[idx]; (e.lost | e.reportedHeld) != 0) [[unlikely]] claimedWatched_(idx);
                         if (a.credit) noteCredit_(idx);              // D8c: gateway-routed — return its credit
+                        else if (a.direct) directDone_(a.direct, idx, true);   // D8d: its direct share
                         ++work;
                         continue;
                     }
                     if (pos == kClaimFatal) [[unlikely]] {           // can never deliver: CLOSED / MAX_POSITION
                         fail_(st);
+                        if (a.direct) directDone_(a.direct, idx, false);
                         ++dropped_;
                         ++work;
                         continue;
@@ -249,6 +307,7 @@ public:
                     r->blockedPass = pass_;                         // back-pressured / not connected
                 }
             } else if (std::holds_alternative<PubFailed>(st)) {
+                if (a.direct) directDone_(a.direct, idx, false);
                 ++dropped_;                                          // reported → the runtime closes it
                 continue;
             }
@@ -264,14 +323,7 @@ public:
         return work;
     }
 
-    /// G-A6 per-client pause: `sessionId` still holds acks after the last flush
-    /// (its publication back-pressured / not connected / not yet resolved).  O(1) when nothing
-    /// is held (the hot case) — one hash probe otherwise.
-    [[nodiscard]] bool holding(int64_t sessionId) const noexcept {
-        if (heldAfterFlush_ == 0) [[likely]] return false;
-        const std::size_t idx = find_(sessionId);
-        return idx != kNone && heldPass_[idx] == pass_;
-    }
+public:
 
     /// Report every failed session not yet reported: `tryReport(sessionId)`
     /// returns false when it cannot deliver now (return ring full) — the
@@ -379,6 +431,79 @@ public:
         creditDirtyCount_ = keep;
         return n;
     }
+    // -----------------------------------------------------------------------
+    // D8d — DIRECT (worker-ingress) produce budget.  See the header comment.
+    // -----------------------------------------------------------------------
+    /// Per-session budget and worker cap (cold: setup / tests).  The cap is
+    /// clamped to [4 x kDirectLightInFlight, kAckCapacity], the budget to
+    /// [1, cap]; the congested band is the cap's last quarter.
+    void setDirectBudgets(uint32_t perSession, uint32_t workerCap) noexcept {
+        workerCap  = std::clamp<uint32_t>(workerCap, 4 * kDirectLightInFlight, static_cast<uint32_t>(kAckCapacity));
+        perSession = std::clamp<uint32_t>(perSession, 1u, workerCap);
+        directCap_           = workerCap;
+        directBandStart_     = workerCap - workerCap / 4;
+        directSessionBudget_ = perSession;
+    }
+    /// Admit one direct produce frame of `sessionId` (the worker's controlled
+    /// poll, per frame — one hash probe): kDirectRefused = ABORT it; otherwise it
+    /// is counted (AckEntry::direct = the result) until its ack leaves the queue.
+    [[nodiscard]] uint8_t admitDirect(int64_t sessionId) noexcept {
+        const std::size_t idx = find_(sessionId);
+        uint32_t mine = 0;
+        if (idx != kNone) [[likely]] {
+            if (heldAfterFlush_ != 0 && heldPass_[idx] == pass_) [[unlikely]] {   // G-A6: it holds acks
+                ++directRefusedHeld_;
+                return kDirectRefused;
+            }
+            mine = edges_[idx].direct;
+            if (mine >= directSessionBudget_) [[unlikely]] { ++directRefusedBudget_; return kDirectRefused; }
+        }
+        if (directInFlight_ >= directBandStart_) [[unlikely]] {
+            if (directInFlight_ >= directCap_) {
+                ++directRefusedFull_;
+                directFullThisPass_ = 1;                              // a deferred pass (expiry pacing)
+                return kDirectRefused;
+            }
+            if (mine >= kDirectLightInFlight) { ++directRefusedBand_; return kDirectRefused; }
+        }
+        ++directInFlight_;
+        if (idx == kNone) [[unlikely]] return kDirectTotalOnly;     // announcement not applied yet (I1)
+        ++edges_[idx].direct;
+        return kDirectCounted;
+    }
+    /// Give back an admitted direct frame that produced no answer (undecodable).
+    void releaseDirect(int64_t sessionId, uint8_t tag) noexcept {
+        if (tag == kDirectRefused) return;
+        directDone_(tag, find_(sessionId), false);
+    }
+    /// Report the pending direct expiry as `tryReport(sessionId)` (false = the
+    /// return ring is full: kept and retried next pass, never lost).  The session
+    /// stays marked until the runtime's close erases it.  Returns 1 if reported.
+    template <class TryReport>
+    int reportDirectExpiry(TryReport&& tryReport) noexcept {
+        if (expireUnreported_ == 0) [[likely]] return 0;
+        const int64_t sid = expireUnreported_;
+        const std::size_t idx = find_(sid);
+        if (idx == kNone) { expireUnreported_ = 0; return 0; }    // closed meanwhile (erase_ clears it too)
+        if (!tryReport(sid, edges_[idx].direct)) return 0;
+        expireUnreported_ = 0;
+        return 1;
+    }
+    [[nodiscard]] std::size_t directInFlight() const noexcept { return directInFlight_; }
+    [[nodiscard]] uint32_t directInFlightOf(int64_t sessionId) const noexcept {
+        const std::size_t idx = find_(sessionId);
+        return idx == kNone ? 0u : edges_[idx].direct;
+    }
+    [[nodiscard]] uint32_t directCap() const noexcept { return directCap_; }
+    [[nodiscard]] uint32_t directSessionBudget() const noexcept { return directSessionBudget_; }
+    [[nodiscard]] uint64_t directExpiries() const noexcept { return directExpiries_; }
+    [[nodiscard]] int64_t  lastDirectExpiredForTest() const noexcept { return lastDirectExpired_; }
+    [[nodiscard]] uint64_t directRefusedHeldForTest() const noexcept { return directRefusedHeld_; }
+    [[nodiscard]] uint64_t directRefusedBudgetForTest() const noexcept { return directRefusedBudget_; }
+    [[nodiscard]] uint64_t directRefusedBandForTest() const noexcept { return directRefusedBand_; }
+    [[nodiscard]] uint64_t directRefusedFullForTest() const noexcept { return directRefusedFull_; }
+    [[nodiscard]] uint64_t directUnderflowsForTest() const noexcept { return directUnderflows_; }
+
     /// Claimed credits of `sessionId` not yet reported (test seam).
     [[nodiscard]] uint32_t unreportedCreditsForTest(int64_t sessionId) const noexcept {
         const std::size_t idx = find_(sessionId);
@@ -432,6 +557,10 @@ private:
     }
     void erase_(std::size_t i) noexcept {                            // backward-shift deletion
         leaveState_(states_[i]);
+        if (edges_[i].expiring) {                                    // D8d: the runtime's close arrived
+            --expiringCount_;
+            if (expireUnreported_ == keys_[i]) expireUnreported_ = 0;
+        }
         keys_[i] = 0;
         states_[i] = PubFailed{};                                    // releases a Ready publication
         heldPass_[i] = 0; edges_[i] = Edges{}; clientVersion_[i] = 0;
@@ -513,6 +642,53 @@ private:
         }
         e.creditListed = 1;
         creditDirty_[creditDirtyCount_++] = keys_[idx];              // <= one entry per live session
+    }
+    /// D8d: one counted direct answer left the queue (claimed: the session is
+    /// reading — marked for the current congestion episode) or was dropped, or an
+    /// admitted frame produced no answer.  `idx` kNone = the session is gone: its
+    /// share died with it (erase_), only the worker total is returned.
+    void directDone_(uint8_t tag, std::size_t idx, bool claimed) noexcept {
+        if (directInFlight_ == 0) [[unlikely]] { ++directUnderflows_; return; }   // unreachable: counted once each
+        --directInFlight_;
+        if (idx == kNone) return;
+        Edges& e = edges_[idx];
+        if (tag == kDirectCounted && e.direct != 0) --e.direct;
+        if (claimed && directEp_.tag != 0) [[unlikely]] e.directTag = directEp_.tag;
+    }
+    /// D8d: once per pass while the cap was hit this pass or an episode is open.
+    /// Episode: starts when the full cap defers a frame; ends with its single
+    /// expiry, or when the total drops below the congested band (claims inside
+    /// the band keep it, so reader marks persist).  While an expiry awaits the
+    /// runtime's close nothing is counted (one in flight).  Cold: the scan runs
+    /// at most once per kDirectExpireAfterDeferredPasses deferred passes.
+    [[gnu::cold]] void directEpisode_() noexcept {
+        const bool full = directFullThisPass_ != 0;
+        directFullThisPass_ = 0;
+        if (!full) {
+            if (directInFlight_ < directBandStart_) directEp_ = DirectEpisode{};
+            return;
+        }
+        if (expiringCount_ != 0) return;                             // one expiry in flight
+        if (directEp_.tag == 0) {                                    // a new episode
+            if (++directEpTags_ == 0) ++directEpTags_;               // tags are never 0
+            directEp_ = DirectEpisode{directEpTags_, 0};
+        }
+        if (++directEp_.deferredPasses % kDirectExpireAfterDeferredPasses != 0) return;
+        std::size_t victim = kNone;
+        uint16_t share = 0;
+        for (std::size_t i = 0; i < kMaxSessions; ++i) {
+            if (keys_[i] == 0 || heldPass_[i] != pass_ || heldAfterFlush_ == 0) continue;   // not held: a reader
+            const Edges& e = edges_[i];
+            if (e.expiring || e.directTag == directEp_.tag) continue;   // claimed in this episode: a (slow) reader
+            if (e.direct > share) { share = e.direct; victim = i; }
+        }
+        if (victim == kNone) return;                                 // no held session to blame: keep deferring
+        directEp_ = DirectEpisode{};                                 // the episode ends with its one expiry
+        edges_[victim].expiring = 1;
+        ++expiringCount_;
+        expireUnreported_ = keys_[victim];
+        lastDirectExpired_ = keys_[victim];
+        ++directExpiries_;
     }
     void markDirty_(std::size_t idx) noexcept {
         if (edges_[idx].dirty) return;
@@ -612,6 +788,9 @@ private:
         uint8_t  progressed   = 0;   ///< acks claimed while reportedHeld, Progress not yet reported
         uint8_t  creditListed = 0;   ///< D8c: listed in creditDirty_
         uint32_t credits      = 0;   ///< D8c: claimed gateway-routed acks not yet reported (<= kAckCapacity per pass)
+        uint16_t direct       = 0;   ///< D8d: counted direct produces (admitted, ack not yet out) — <= kAckCapacity / 2
+        uint16_t directTag    = 0;   ///< D8d: congestion episode in which one of its direct acks was claimed
+        uint8_t  expiring     = 0;   ///< D8d: chosen for expiry; the runtime's close is awaited
     };
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
@@ -637,6 +816,21 @@ private:
     std::size_t                                                      unreported_ = 0;
     uint64_t                                                         pass_    = 0;
     uint64_t                                                         dropped_ = 0;
+    // D8d — direct budget (rich state: the congestion episode holds its tag + pacing count).
+    struct DirectEpisode { uint16_t tag = 0; uint32_t deferredPasses = 0; };   ///< tag 0 = no episode
+    std::size_t                                                      directInFlight_ = 0;
+    uint32_t directCap_           = static_cast<uint32_t>(kAckCapacity);        // Worker sets kDirectAckBudget
+    uint32_t directBandStart_     = static_cast<uint32_t>(kAckCapacity - kAckCapacity / 4);
+    uint32_t directSessionBudget_ = kDefaultDirectSessionBudget;
+    DirectEpisode                                                    directEp_{};
+    uint16_t                                                         directEpTags_ = 0;
+    uint8_t                                                          directFullThisPass_ = 0;
+    std::size_t                                                      expiringCount_ = 0;
+    int64_t                                                          expireUnreported_ = 0;
+    int64_t                                                          lastDirectExpired_ = 0;
+    uint64_t                                                         directExpiries_ = 0;
+    uint64_t directRefusedHeld_ = 0, directRefusedBudget_ = 0, directRefusedBand_ = 0, directRefusedFull_ = 0;
+    uint64_t                                                         directUnderflows_ = 0;
 };
 
 /// Production policy: the worker's own invoker-mode Aeron client (spec §3.1).

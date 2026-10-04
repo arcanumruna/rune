@@ -376,3 +376,38 @@ TEST(GatewayShardNotifyRegression, EveryCloseOfASessionPurgesItsPendingRecordEgr
     gw.drainWorkerReturnsForTest(1'000);
     EXPECT_EQ(gw.pendingRecordEgressCountForTest(), 1u) << "SessionFailed purges it";
 }
+
+// D8d: a worker's Expire signal (its direct ack share is full and this session
+// holds the largest share without reading) closes the session on every worker
+// and tells the client SessionExpired — exactly like a SessionFailed close; an
+// Expire for a session already gone is ignored (no second close, no frame).
+TEST(GatewayShardNotifyRegression, DirectShareExpireClosesTheSessionAndTellsTheClientRegression) {
+    std::vector<std::vector<uint8_t>> frames;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* p, std::size_t n) { frames.emplace_back(p, p + n); });
+    rune::node::WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    const int64_t sid = gw.injectTestSession(0), other = gw.injectTestSession(0);
+    rune::node::WorkerReturn x = signal(sid, 1, rune::node::SessionSignalKind::Expire);
+    x.baseOffset = 4096;                                    // its direct share (diagnostic)
+    ASSERT_TRUE(pool.worker(1).injectReturnForTest(x));
+    gw.drainWorkerReturnsForTest(1'000);
+    EXPECT_EQ(gw.sessionCount(), 1u);
+    EXPECT_EQ(gw.directShareExpiriesForTest(), 1u);
+    EXPECT_GE(gw.sessionLastSeenNsForTest(other), 0) << "only the expired session is closed";
+    ASSERT_EQ(frames.size(), 1u) << "exactly one frame: the expiry notice";
+    auto e = rune::protocol::client::ErrorResponse::decode(frames[0].data(), frames[0].size());
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->sessionId, sid);
+    EXPECT_EQ(e->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired));
+    for (int32_t w = 0; w < 2; ++w) {
+        pool.worker(w).doWork(1);
+        EXPECT_EQ(pool.worker(w).sessionClosesSeenForTest(), 1u) << "closed on worker " << w;
+    }
+    ASSERT_TRUE(pool.worker(1).injectReturnForTest(x));     // a late / duplicate Expire
+    gw.drainWorkerReturnsForTest(2'000);
+    EXPECT_EQ(gw.directShareExpiriesForTest(), 1u);
+    EXPECT_EQ(frames.size(), 1u);
+    EXPECT_EQ(gw.sessionCount(), 1u);
+}

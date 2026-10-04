@@ -1741,3 +1741,65 @@ TEST(WorkerPsmEndToEndRegression, DefaultLegacyConfigDedupsARetryAfterRestart) {
     }
     EXPECT_EQ(logEndOffsetAfterStop(dir.path), 3) << "the retried batch was appended twice across the restart";
 }
+
+// D8d (D8c review LOW-R2), REAL driver + real broker: DIRECT (worker-ingress)
+// clients that stop reading their acks — each its own client, driver and image,
+// at the fragment-limit ceiling the worker's reserve is sized for (one poll may
+// take 4096 frames of one image) — must not stop another direct client's intake
+// on the same worker, nor the worker's op drain.  (Was: 48 stalled sessions held
+// 30-32k of the 32768-slot ack queue — the gateway-routed half included; at
+// 32768 ackRoom_ is 0: no op drain, no poll.)
+TEST(ShardModeRegression, StalledDirectClientsCannotStopAnotherDirectClientsIntakeRegression) {
+    constexpr int kStalled = 48;
+    TmpDir dir{"d8dn"}, ad{"d8da"}, bd{"d8db"};
+    const auto ports = ShardPorts::discover(1, 1);
+    auto cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    cfg.gatewayFragmentLimit = rune::node::Worker::kMaxFragmentLimit;
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    const std::string gw = gatewayChannel(ports, 0), direct = workerIngressChannel(ports, 0, 0);
+    auto onWorker = [&](auto&& f) {
+        return node.onOwnerThreadForTest(0, 0, [&](rune::replication::PartitionReplica&) { return f(*node.workerForTest(0)); });
+    };
+    {
+        // One stalled client process with kStalled sessions, each producing on its own exclusive publication (its
+        // own image at the worker) and never reading its acks again.
+        ShardTestClient a(ad.path, 1 << 22);
+        const auto batch = makeBatch(1);
+        for (int k = 0; k < kStalled; ++k) {
+            const int64_t sid = a.connect(gw, kClientStream);
+            ASSERT_GT(sid, 0);
+            // Offer until refused AND the worker has paused (ABORTed) intake.
+            const uint64_t abortsBefore = onWorker([](rune::node::Worker& w) { return w.intakePausedFramesForTest(); });
+            const int64_t n = a.offerUntilPausedExclusive(k, direct, kClientStream, [&](int64_t i, std::vector<uint8_t>& out) {
+                pc::Produce m;
+                m.sessionId = sid; m.correlationId = 70'000'000 + i; m.topicId = 0; m.partition = 0;
+                m.partitionKnown = 1; m.acks = 0; m.producerId = -1; m.producerEpoch = 0; m.baseSequence = -1;
+                m.recordBatch = std::span<const uint8_t>(batch);
+                out.resize(m.encodedSize());
+                m.encode(out.data());
+            }, /*maxFrames=*/200'000, [&] {
+                return onWorker([](rune::node::Worker& w) { return w.intakePausedFramesForTest(); }) > abortsBefore;
+            });
+            ASSERT_LT(n, 200'000) << "stalled session " << k << " was never paused";
+        }
+        // Pre-fix: 30-32k of the 32768-slot queue held — the gateway-routed half eaten too, one more burst from a
+        // full queue (ackRoom_ 0: no op drain, no poll).
+        EXPECT_LE(onWorker([](rune::node::Worker& w) { return w.sessionAcksPendingForTest(); }),
+                  rune::node::Worker::kDirectAckBudget) << "stalled direct sessions hold at most the direct share";
+        EXPECT_LE(onWorker([](rune::node::Worker& w) { return w.directAcksInFlightForTest(); }),
+                  rune::node::Worker::kDirectAckBudget);
+
+        ShardTestClient b(bd.path, 1 << 22);
+        const int64_t sidB = b.connect(gw, kClientStream);
+        ASSERT_GT(sidB, 0) << "a new session is accepted while the stalled ones hold acks";
+        for (int k = 0; k < 5; ++k)
+            ASSERT_TRUE(b.produceUntilOk(direct, kClientStream, sidB, 0, 0, /*acks=*/1, batch, /*maxAttempts=*/3))
+                << "client B's direct produce " << k << " starved behind the stalled sessions' unread acks";
+        EXPECT_EQ(onWorker([](rune::node::Worker& w) { return w.ackRoomOpPausesForTest(); }), 0u)
+            << "the worker's op drain never ran out of ack room";
+        EXPECT_EQ(onWorker([](rune::node::Worker& w) { return w.directUnderflowsForTest(); }), 0u);
+    }
+    node.stop();
+}

@@ -1178,7 +1178,7 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
 {
     using K = rune::node::SessionSignalKind;
     const auto kind = static_cast<K>(ret.lastOffset);
-    if (kind != K::Failed) {
+    if (kind != K::Failed && kind != K::Expire) {
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
         if (kind == K::Progress) { s->lastSeenNs = nowNs_; return; }  // D8b: the held client reads its acks
@@ -1212,9 +1212,20 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
     }
     // Failed (C2): close the session everywhere and tell the client, so it
     // reconnects; its later notifications find no session.  State-driven.
+    // Expire (D8d): the worker's direct (worker-ingress) ack share is full and
+    // this session — held there with the largest direct share — is expired the
+    // same way (D8c's gateway-cap expiry, for the direct path): the client
+    // reconnects and resends its unacked produces (idempotent producers dedupe).
     if (closeSession_(ret.sessionId, /*notifyExpired=*/true)) {
-        spdlog::warn("ClientGateway: session {} closed — its ack publication on worker {} can never "
-                     "deliver (the client was told SessionExpired)", ret.sessionId, ret.partition);
+        if (kind == K::Expire) {
+            ++directShareExpiries_;
+            spdlog::warn("ClientGateway: session {} expired — worker {}'s direct ack share is full and it holds "
+                         "the largest share ({} acks) without reading (the client was told SessionExpired, "
+                         "expiries={})", ret.sessionId, ret.partition, ret.baseOffset, directShareExpiries_);
+        } else {
+            spdlog::warn("ClientGateway: session {} closed — its ack publication on worker {} can never "
+                         "deliver (the client was told SessionExpired)", ret.sessionId, ret.partition);
+        }
         return;
     }
     // Not accepted yet (ConnectResponse still retrying): drop the pending
