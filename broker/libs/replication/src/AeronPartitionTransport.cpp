@@ -97,7 +97,11 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
     PeerLink l;
     l.peer = peerId;
     l.pub  = &peers_.at(peerId);   // unordered_map element addresses are stable
-    if (const auto e = egressChannel.find("endpoint="); e != std::string::npos) {
+    // The `endpoint=` key itself (re-review 2 LOW-1: never `control-endpoint=`).
+    auto e = egressChannel.find("?endpoint=");
+    if (e == std::string::npos) e = egressChannel.find("|endpoint=");
+    if (e != std::string::npos) {
+        e += 1;
         const std::string ep = egressChannel.substr(e + 9, egressChannel.find_first_of("|?", e + 9) - (e + 9));
         const auto colon = ep.rfind(':');
         l.host = colon == std::string::npos ? ep : ep.substr(0, colon);
@@ -426,6 +430,12 @@ int AeronPartitionTransport::notePlaneReconnects_()
             if (up) {
                 if (holdRouter_.isDown(l.peer)) holdRouter_.noteLink(l.peer, true);
                 report(static_cast<int32_t>(l.peer));
+            } else {
+                // Re-review 2 LOW-2: the link went down — drop the frames held
+                // for that peer now (router R1 semantics: never replayed into a
+                // restarted peer; markers are re-sent from the gateway on the
+                // up edge, replication rewinds by connection generation).
+                holdRouter_.noteLink(l.peer, false);
             }
         }
     }
