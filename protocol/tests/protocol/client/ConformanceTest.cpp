@@ -506,12 +506,12 @@ TEST(ConformanceGolden, ProduceKeyOnly) {
 }
 
 // ===========================================================================
-// 13. produce_response.bin — 38 bytes
+// 13. produce_response.bin — 46 bytes (D6: + logStartOffset = -1)
 //     ProduceResponse{ errorCode=0(OK), partition=7, baseOffset=123456 }
 // ===========================================================================
 TEST(ConformanceGolden, ProduceResponse) {
     const auto golden = readVector("produce_response.bin");
-    ASSERT_EQ(golden.size(), 38u);
+    ASSERT_EQ(golden.size(), 46u);
 
     assertHeader(golden, rpc::ProduceResponse::TEMPLATE_ID, rpc::ProduceResponse::BODY_FIXED);
 
@@ -522,6 +522,7 @@ TEST(ConformanceGolden, ProduceResponse) {
     EXPECT_EQ(msgOpt->errorCode,     static_cast<int16_t>(rpc::ErrorCode::OK));
     EXPECT_EQ(msgOpt->partition,     7);
     EXPECT_EQ(msgOpt->baseOffset,    123456LL);
+    EXPECT_EQ(msgOpt->logStartOffset, -1);
 
     rpc::ProduceResponse msg;
     msg.sessionId     = kSessionId;
@@ -532,9 +533,63 @@ TEST(ConformanceGolden, ProduceResponse) {
 
     std::array<uint8_t, 64> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, 38u);
+    ASSERT_EQ(n, 46u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden produce_response.bin";
+}
+
+// ===========================================================================
+// 13a. produce_response_v0.bin — 38 bytes, the PRE-D6 frame (blockLength 14)
+//      an old broker sends.  D6 compat: still decodes; logStartOffset = -1.
+// ===========================================================================
+TEST(ConformanceGoldenCompatRegression, ProduceResponseV0DecodesRegression) {
+    const auto golden = readVector("produce_response_v0.bin");
+    ASSERT_EQ(golden.size(), 38u);
+    assertHeader(golden, rpc::ProduceResponse::TEMPLATE_ID, rpc::ProduceResponse::BODY_FIXED_V0);
+
+    auto msgOpt = rpc::ProduceResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,      kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,  kCorrelationId);
+    EXPECT_EQ(msgOpt->errorCode,      static_cast<int16_t>(rpc::ErrorCode::OK));
+    EXPECT_EQ(msgOpt->partition,      7);
+    EXPECT_EQ(msgOpt->baseOffset,     123456LL);
+    EXPECT_EQ(msgOpt->logStartOffset, -1);
+
+    // The new frame is the old one with blockLength 22 and 8 trailing bytes:
+    // every pre-D6 field sits at the same offset.
+    const auto now = readVector("produce_response.bin");
+    ASSERT_EQ(now.size(), 46u);
+    EXPECT_EQ(std::memcmp(now.data() + 2, golden.data() + 2, 36), 0);
+}
+
+// ===========================================================================
+// 13b. produce_response_unknown_pid.bin — 46 bytes (D6)
+//      ProduceResponse{ errorCode=28(UnknownProducerId), partition=7,
+//                       baseOffset=0, logStartOffset=500 }
+// ===========================================================================
+TEST(ConformanceGolden, ProduceResponseUnknownProducerId) {
+    const auto golden = readVector("produce_response_unknown_pid.bin");
+    ASSERT_EQ(golden.size(), 46u);
+    assertHeader(golden, rpc::ProduceResponse::TEMPLATE_ID, rpc::ProduceResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::ProduceResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->errorCode,      static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId));
+    EXPECT_EQ(msgOpt->partition,      7);
+    EXPECT_EQ(msgOpt->logStartOffset, 500);
+
+    rpc::ProduceResponse msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.errorCode      = static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId);
+    msg.partition      = 7;
+    msg.baseOffset     = 0;
+    msg.logStartOffset = 500;
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 46u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0);
 }
 
 // ===========================================================================

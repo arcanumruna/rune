@@ -101,6 +101,43 @@ enum class ErrorCode : uint16_t {
     // txn: the previous transaction's markers have not all landed yet (Kafka
     // CONCURRENT_TRANSACTIONS) — RETRIABLE: the producer retries the request.
     ConcurrentTransactions = 27,
+    // D6 (Kafka UNKNOWN_PRODUCER_ID, 59): the broker's PROVEN producer state has
+    // no entry for (topic, producerId, partition) and the batch's baseSequence
+    // is not 0 — retention / compaction / memory-ring eviction removed every
+    // batch of this producer before a rebuild (failover, restart, re-promotion).
+    // The batch was NOT appended.  ProduceResponse.logStartOffset carries the
+    // partition's log start so the client can tell retention (every record it
+    // had acked is below it -> re-sequence, nothing fails) from loss (outcome
+    // unknown).  Sent ONLY to clients whose ConnectRequest.clientVersion is
+    // >= kClientVersionUnknownProducerId; older clients get OutOfOrderSequence.
+    UnknownProducerId      = 28,
 };
+
+// ---------------------------------------------------------------------------
+// Client versions (ConnectRequest.clientVersion) — behaviour gates.  The wire
+// header version (kProtocolVersion) is NOT bumped for additive changes: an old
+// checkFrame rejects any newer header version.
+//   1 — the original client.
+//   2 — D6: understands ErrorCode::UnknownProducerId (28) and
+//       ProduceResponse.logStartOffset.
+// ---------------------------------------------------------------------------
+inline constexpr int32_t kClientVersionUnknownProducerId = 2;
+inline constexpr int32_t kClientVersion                  = 2;   // what this protocol's client announces
+
+/// True when a session that connected with `clientVersion` may be answered
+/// UnknownProducerId (else the broker answers OutOfOrderSequence, as before).
+[[nodiscard]] constexpr bool clientUnderstandsUnknownProducerId(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionUnknownProducerId;
+}
+
+/// The produce error code a session that connected with `clientVersion` is
+/// answered: UnknownProducerId becomes OutOfOrderSequence (the pre-D6 answer)
+/// for clients below kClientVersionUnknownProducerId; every other code passes
+/// through.  The ONE definition every broker answer site uses (review L4).
+[[nodiscard]] constexpr ErrorCode produceErrorForClient(ErrorCode ec, int32_t clientVersion) noexcept {
+    return (ec == ErrorCode::UnknownProducerId && !clientUnderstandsUnknownProducerId(clientVersion))
+               ? ErrorCode::OutOfOrderSequence
+               : ec;
+}
 
 } // namespace rune::protocol::client

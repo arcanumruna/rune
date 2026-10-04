@@ -231,8 +231,11 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------------
     // 13. produce_response.bin
     //
-    // ProduceResponse{ errorCode=0(OK), partition=7, baseOffset=123456 }
-    // Total = 24 + 14 = 38 bytes
+    // ProduceResponse{ errorCode=0(OK), partition=7, baseOffset=123456,
+    //                  logStartOffset=-1 (not carried) }
+    // Total = 24 + 22 = 46 bytes (D6: logStartOffset appended; the pre-D6
+    // 38-byte form is kept as produce_response_v0.bin — a compat vector, not
+    // regenerated here).
     // -----------------------------------------------------------------------
     {
         rpc::ProduceResponse msg;
@@ -243,6 +246,25 @@ int main(int argc, char** argv) {
         msg.baseOffset    = 123456LL;
         n = msg.encode(buf);
         write_vec(dir, "produce_response.bin", buf, n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13b. produce_response_unknown_pid.bin (D6)
+    //
+    // ProduceResponse{ errorCode=28(UnknownProducerId), partition=7,
+    //                  baseOffset=0, logStartOffset=500 }
+    // Total = 46 bytes
+    // -----------------------------------------------------------------------
+    {
+        rpc::ProduceResponse msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.errorCode      = static_cast<int16_t>(rpc::ErrorCode::UnknownProducerId);
+        msg.partition      = 7;
+        msg.baseOffset     = 0;
+        msg.logStartOffset = 500;
+        n = msg.encode(buf);
+        write_vec(dir, "produce_response_unknown_pid.bin", buf, n);
     }
 
     // -----------------------------------------------------------------------

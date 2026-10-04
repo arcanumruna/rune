@@ -32,6 +32,7 @@ if(BUILD_TESTING)
             tests/protocol/client/ControlMessagesKeepaliveDisconnectErrorTest.cpp
             tests/protocol/client/PingMessagesTest.cpp
             tests/protocol/client/DataMessagesTest.cpp
+            tests/protocol/client/UnknownProducerIdTest.cpp
             tests/protocol/client/GroupMessagesTest.cpp
             tests/protocol/client/OffsetMessagesTest.cpp
             tests/protocol/client/ConformanceTest.cpp

@@ -166,28 +166,41 @@ struct Produce {
 //
 // Frame layout (all little-endian):
 //   [0..23]   MessageHeader (24 bytes)
-//     blockLength = BODY_FIXED (14)
+//     blockLength = BODY_FIXED (22)
 //     templateId  = 17
-//   [24..25]  errorCode  : int16   (ErrorCode value; 0 = OK)
-//   [26..29]  partition  : int32   (assigned/confirmed partition)
-//   [30..37]  baseOffset : int64   (base offset of the batch; ignore when errorCode != 0)
-//   BODY_FIXED = 14 (2 + 4 + 8)
+//   [24..25]  errorCode      : int16   (ErrorCode value; 0 = OK)
+//   [26..29]  partition      : int32   (assigned/confirmed partition)
+//   [30..37]  baseOffset     : int64   (base offset of the batch; ignore when errorCode != 0)
+//   [38..45]  logStartOffset : int64   (D6, Kafka PartitionProduceResponse.logStartOffset:
+//                                       the partition's log start; -1 = not carried.
+//                                       Set with ErrorCode::UnknownProducerId)
+//   BODY_FIXED = 22 (2 + 4 + 8 + 8)
 //
-// Total = 24 + 14 = 38 bytes (no var fields)
+// Backward compatibility (blockLength-versioned, additive — the header version
+// is NOT bumped):
+//   BODY_FIXED_V0 = 14 (pre-D6, no logStartOffset): decoded with
+//   logStartOffset = -1.  A pre-D6 decoder reads fixed offsets 24..37 and
+//   ignores the trailing 8 bytes, so a new frame decodes unchanged there.
+//   A longer future block is skipped via blockLength (forward-compat).
+//
+// Total = 24 + 22 = 46 bytes (no var fields)
 // ---------------------------------------------------------------------------
 struct ProduceResponse {
-    int64_t sessionId     = 0;
-    int64_t correlationId = 0;
-    int16_t errorCode     = 0;   // rune::protocol::client::ErrorCode value
-    int32_t partition     = 0;
-    int64_t baseOffset    = 0;   // meaningful only when errorCode == 0
+    int64_t sessionId      = 0;
+    int64_t correlationId  = 0;
+    int16_t errorCode      = 0;   // rune::protocol::client::ErrorCode value
+    int32_t partition      = 0;
+    int64_t baseOffset     = 0;   // meaningful only when errorCode == 0
+    int64_t logStartOffset = -1;  // D6: -1 = not carried (old broker / not set)
 
-    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ProduceResponse); // 17
-    static constexpr uint16_t BODY_FIXED  = 14;  // errorCode(2) + partition(4) + baseOffset(8)
+    static constexpr uint16_t TEMPLATE_ID   = static_cast<uint16_t>(TemplateId::ProduceResponse); // 17
+    static constexpr uint16_t BODY_FIXED    = 22;  // errorCode(2) + partition(4) + baseOffset(8) + logStartOffset(8)
+    static constexpr uint16_t BODY_FIXED_V0 = 14;  // pre-D6: errorCode(2) + partition(4) + baseOffset(8)
 
-    static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE + BODY_FIXED; // 38
+    static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;    // 46
+    static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0; // 38
 
-    /// Encode the full frame (38 bytes) into buf.  Returns 38.
+    /// Encode the full frame (46 bytes) into buf.  Returns 46.
     std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
@@ -199,23 +212,64 @@ struct ProduceResponse {
         hdr.encode(buf);
 
         constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
-        detail::putLE16s(buf, fixedBase + 0, errorCode);
-        detail::putLE32 (buf, fixedBase + 2, partition);
-        detail::putLE64 (buf, fixedBase + 6, baseOffset);
+        detail::putLE16s(buf, fixedBase + 0,  errorCode);
+        detail::putLE32 (buf, fixedBase + 2,  partition);
+        detail::putLE64 (buf, fixedBase + 6,  baseOffset);
+        detail::putLE64 (buf, fixedBase + 14, logStartOffset);
 
         return ENCODED_SIZE;
     }
 
+    /// D6 review M4: the frame size a session that connected with
+    /// `clientVersion` is sent — the pre-D6 38 B frame (blockLength 14) below
+    /// kClientVersionUnknownProducerId, the 46 B frame from it on.
+    [[nodiscard]] static constexpr std::size_t encodedSizeFor(int32_t clientVersion) noexcept {
+        return clientUnderstandsUnknownProducerId(clientVersion) ? ENCODED_SIZE : ENCODED_SIZE_V0;
+    }
+
+    /// D6 review M4: encode the frame for a session that connected with
+    /// `clientVersion` — every broker answer site uses this.  Below
+    /// kClientVersionUnknownProducerId the frame is EXACTLY the pre-D6 one
+    /// (38 B, blockLength 14, no logStartOffset) and UnknownProducerId is
+    /// answered OutOfOrderSequence (produceErrorForClient), so even a strict
+    /// pre-D6 decoder (exact length / exact blockLength) reads it.  From that
+    /// version on it is the 46 B frame.  buf must hold encodedSizeFor(version).
+    /// Returns the bytes written.
+    std::size_t encodeFor(uint8_t* buf, int32_t clientVersion) const noexcept {
+        const bool full = clientUnderstandsUnknownProducerId(clientVersion);
+        MessageHeader hdr;
+        hdr.blockLength   = full ? BODY_FIXED : BODY_FIXED_V0;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE16s(buf, fixedBase + 0, static_cast<int16_t>(produceErrorForClient(
+                                                 static_cast<ErrorCode>(static_cast<uint16_t>(errorCode)),
+                                                 clientVersion)));
+        detail::putLE32 (buf, fixedBase + 2, partition);
+        detail::putLE64 (buf, fixedBase + 6, baseOffset);
+        if (!full) return ENCODED_SIZE_V0;
+        detail::putLE64 (buf, fixedBase + 14, logStartOffset);
+        return ENCODED_SIZE;
+    }
+
     /// Decode a full frame from buf[0..avail-1].
-    /// Returns nullopt on any truncation or header mismatch.
+    /// Returns nullopt on any truncation (header + declared block), a declared
+    /// block shorter than the v0 block, or a header mismatch.
     static std::optional<ProduceResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
-        if (avail < ENCODED_SIZE) return std::nullopt;
+        if (avail < ENCODED_SIZE_V0) return std::nullopt;
 
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
         const MessageHeader& hdr = *hdrOpt;
         if (hdr.schemaId   != kSchemaId)   return std::nullopt;
         if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+        if (hdr.blockLength < BODY_FIXED_V0) return std::nullopt;
+        if (avail < MessageHeader::ENCODED_SIZE + hdr.blockLength) return std::nullopt;
 
         ProduceResponse msg;
         msg.sessionId     = hdr.sessionId;
@@ -225,6 +279,8 @@ struct ProduceResponse {
         msg.errorCode  = detail::getLE16s(buf, fixedBase + 0);
         msg.partition  = detail::getLE32 (buf, fixedBase + 2);
         msg.baseOffset = detail::getLE64 (buf, fixedBase + 6);
+        if (hdr.blockLength >= BODY_FIXED)
+            msg.logStartOffset = detail::getLE64(buf, fixedBase + 14);
 
         return msg;
     }
