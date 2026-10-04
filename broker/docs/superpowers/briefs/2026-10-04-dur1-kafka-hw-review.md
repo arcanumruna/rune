@@ -319,3 +319,211 @@ EXPECT_FALSE(inIsr(a, kC));                  // FAILS: admitted
 4. **Survivor election:** MEDIUM. It should be a default-off opt-in, as Kafka's unclean election is. Its
    proof currently rests on positions that CRITICAL-1 corrupts.
 5. **Hard rules:** OK. CRITICAL-1 and MAJOR-1 need RED-first regression tests.
+
+---
+
+# Re-review (fix round 2)
+
+Scope: rune-broker-wt31 `feat/dur-1` e5d41b4..a2d4092 (4949530, 902cd03, cf08da0, 667cd5c, a2d4092) and
+rune-protocol-fe `feat/fetch-epoch` a9787dc. Read-only. To confirm findings I compiled one scratch gtest TU
+against the a2d4092 DR harness and linked it against the existing `build-fast` libraries; the output is in the
+session scratchpad (`rr2/Repro.cpp`). Nothing in the worktrees was edited. The existing
+`rune_dr_integration_tests` binary passes 50/50 on a2d4092.
+
+## Verdict: CHANGES REQUIRED
+
+1 MAJOR, 3 MEDIUM, 2 LOW (all new). Every finding from the previous review is fixed, and the regression tests
+are genuine.
+
+The internal-ISR mechanism is sound for safety under single faults and rolling restarts. A committed version
+is durable on a majority. Every published member was validated at ≥ max(HW, electionLeo). The HW counts
+committed ∪ proposed. The seed counts every replica, fenced ones included, until the first commit, so nothing
+commits in a new leadership before its first ISR is majority-durable. The voter-side gate intersects the commit
+majority. I found no committed-record loss under a single crash, a rolling restart, a whole-cluster restart, or
+a crash between persist and ack. I also found no split-brain between two versions: (leaderEpoch, version) is
+totally ordered, and an older-epoch state never overrides a newer one.
+
+The new problems are liveness and one narrow zombie window. The self-candidacy check turns ordinary
+knowledge staleness into a permanently headless cluster, and I reproduced that.
+
+### Status of the previous findings
+
+| Finding | Status | Notes |
+|---|---|---|
+| CRITICAL-1 | **Fixed** | `resetFollowers()` runs on every new-epoch `becomeLeader` (PartitionReplica.cpp:306). The same-epoch re-assert path correctly keeps positions. The snapshot publishes only followers `validated` in this leadership. Slots are cleared on becomeLeader, becomeFollower and self-demotion. R1, R1b and the DR test are RED without the fix, per the report and my reading. |
+| MAJOR-1 | **Fixed** | `joinFloor = max(HW, electionLeo_)` (PartitionReplica.cpp:~2040). It also gates the internal first publish. |
+| MAJOR-2 | **Fixed for the reported scenario** | The rolling-restart and E1b tests cannot pass without the gate: the harness elects through the real `InternalIsrKnowledge`. Residuals: MAJOR-A, MEDIUM-A, MEDIUM-B, MEDIUM-C. |
+| MAJOR-3 | **Fixed** | Lag shrink is restored. The removal commits on a majority, and the HW counts the member until then. |
+| MEDIUM-1 | **Fixed** | `partitionEpoch` CAS. An applied assignment with any other partitionEpoch resolves the proposal. AdminWorker's `-1` is fine there, because the schema replica is not controller-managed. |
+| MEDIUM-2 | **Fixed** | KIP-841 drop plus the response frame. A mixed shrink+fenced-add commits the shrink part. Shrinks are never held back. |
+| MEDIUM-3 | **Fixed** | Default OFF, plus env and NodeConfig switches. The dr-e2e tree never sets `RUNE_SURVIVOR_LEADER_ELECTION` (see LOW-B). |
+| MEDIUM-4 | **Fixed** (data plane) | The incarnation is sticky across leaderships, and an older one is dropped. The "committed member below HW ⇒ unclean" proof holds: a new leader's floor ≤ committed ≤ every member's LEO. The controller-side gap is documented. |
+| LOW-1 | Fixed | |
+| LOW-2 | As ruled | The new `sendInternalIsr`/`sendInternalIsrAck` virtuals are cold. |
+
+### Changed test expectations: all legitimate
+
+- **`NB1_…HwFloorIsCommittedNotLeo`.** kF2 sits at LEO 0 below the floor 5 while it is a committed member, so
+  it provably lacks committed records. Evicting it is the Kafka invariant. The HW then rising over {self} with
+  minIsr 1 is Kafka-correct: the new leader's tail commits once its ISR holds it.
+- **`Critical2_InternalLeaderFailover_…` cut to 5 steps.** The 300-step variant asserted the no-lag-shrink
+  behaviour that MAJOR-3 removed, and it lives on as the MAJOR-3 test.
+- **`…ConsensusFailoverUnderCommitLoad` via `consensusElect`.** This now models the real election, so the
+  lagging node can no longer be forced in.
+- **`LaggingReplicaShrunkFromControllerIsr_NeverElectable` (fence counted as remover).** It accepts the
+  controller's fencing as an equivalent remover, which is valid.
+
+---
+
+## MAJOR-A — Stale self-knowledge plus the self-candidacy gate leaves the consensus permanently leaderless with a majority up and an eligible, caught-up node (reproduced)
+
+**Where**
+- `Election.cpp:334` (CANVASS: no NOMINATE unless `mayVoteFor(self)`) and `Election.cpp:364`.
+- `PartitionReplica.cpp:2010`: InternalIsr is re-sent only while `isrProposal_.pending`.
+- `PartitionReplica.cpp:2156`: on commit (`maybeCommitInternalIsr_`) the pending flag clears, so a replica
+  that missed the frame is never told again.
+- `InternalIsrKnowledge.cpp:50` (`eligible`).
+
+**Event sequence** (RF=3, internal partition, leader 1). Reproduced as `ReReview2.StaleSelfKnowledgeDeadlocksConsensus`:
+1. v1 = {1,2,3} is held by all nodes.
+2. Node 3 is fenced (consensus-dead for a moment, data plane up), so v2 = {1,2} commits and node 3 receives it.
+   Node 3's newest state excludes node 3.
+3. Node 3 returns while node 2 turns consensus-dead or lag-shrunk. Node 3 is re-admitted and node 2 removed,
+   ending at v4 = {1,3}. That commits on {1,2}: node 2 persists and acks a state that excludes itself. Node 3
+   misses the frame (one lost `enqueueOutbound`/link blip). The leader never re-sends a committed state.
+   - Knowledge: `n1=(1,4)={1 3}  n2=(1,4)={1 3}  n3=(1,2)={1 2}`. Node 3's LEO equals the leader's.
+4. Node 1 dies.
+   - Node 2 grants only {1,3} and will not stand itself.
+   - Node 3 grants only {1,2} and will not stand itself.
+   - Nobody ever nominates: `consensusElect → -1`.
+
+**Impact**
+- The cluster has no controller: no metadata commits, no user-partition failover, and no AlterIsr. Acks=all
+  partitions with a dead member stall.
+- This lasts until node 1 returns. If node 1 is lost for good, it is permanent, and there is no operator
+  escape hatch.
+- It violates the time-independent-liveness rule, and needs only one lost frame plus an ordinary ISR swap.
+- Safety does not need the self-check. Voters gate, and any grant majority intersects the commit majority. The
+  self-check is a liveness optimisation that turns stale knowledge into a deadlock.
+
+**Fix**
+- Drop the self-gate in CANVASS/NOMINATE: let a node stand and let the voters decide. With that, node 3 stands
+  here, node 2 grants (3 ∈ v4), and node 3 wins. Node 3 holds everything committed, because it was validated
+  at ≥ joinFloor when v4 was published.
+- Also add anti-entropy, so knowledge converges without depending on a lucky frame. Either:
+  - keep re-sending the latest committed state to replicas that have not acked it, or
+  - piggyback (epoch, version) on FetchResponse and let a stale follower ask for the state.
+- Land the scratch repro as `DrIntegrationRegression.StaleSelfKnowledge_ConsensusNotHeadless`.
+
+## MEDIUM-A — Zombie-leader ack window: an ISR change can commit after its acker has already voted for a newer term (acked internal records lost); a deposed leader's state is persisted unconditionally
+
+**Where**
+- `PartitionReplica.cpp:2181`: the ack is gated on the internal replica's `epoch_`/`leaderId_`.
+- `ReplicationMetadataBridge.h:186-199`: those change only when the bridge sees a new leader id ≥ 0, which is
+  after NewLeadershipTerm, not when the node votes.
+- `PartitionReplica.cpp:2178`: `offer()` runs before any role or epoch check.
+
+**Event sequence** (RF=3: L leads at term e; ISR {L,X,Y} committed):
+1. The L↔Y link drops on both planes, and L↔X consensus heartbeats are degraded (asymmetric, L→X replication
+   still up).
+2. Y stops fetching and lags. After `replicaLagMaxMs` (10 s), L publishes (e, v') = {L,X}. Y's election timer
+   fires on the same clock (10 s), so the two race.
+3. X grants Y's RequestVote for term e+1, because X's newest state still includes Y. X's internal replica still
+   follows L at e until NewLeadershipTerm arrives.
+4. In that gap, X persists and acks (e, v'), so it commits on {L,X}.
+   - L's HW now advances on {L,X} past Y's LEO, and L acks client writes (metadata, offsets, txn).
+5. Y becomes leader at e+1 (it was legitimately elected). X fetches with lastFetchedEpoch e, gets
+   DivergingEpoch, and truncates the records L acked in step 4. **Acked internal records are lost.**
+
+Kafka cannot reach this. The controller linearises AlterPartition against the leader-epoch bump. Raft cannot
+either: a vote for term e+1 rejects term-e appends. The report's claim that "a deposed leader is never helped"
+does not hold in this window. The window is narrow (vote → NewLeadershipTerm, during a coincident 10 s lag
+shrink), so it is MEDIUM.
+
+**Liveness side of the same gap:** `offer()` also persists states from a deposed leader. A zombie's
+(e, v'') = {L}, received before the new leader's first commit, makes every receiver grant only L. If the new
+leader then crashes before its first commit, the consensus waits for the zombie.
+
+**Fix**
+- Expose the Election's `candidateTermId`/`leadershipTermId` to the internal replicas, as the consensus term.
+- Refuse to ack (and to persist) an InternalIsr whose `leaderEpoch` < the node's consensus term (voted or
+  observed). Raft's term rule, applied to the ack.
+- Optionally also refuse data fetch credit to a leader whose epoch is below that term.
+
+## MEDIUM-B — The liveness residual "no node in every internal ISR ⇒ leaderless until L returns" is not Kafka-equivalent: it has a larger blast radius and no escape hatch
+
+**Where:** `InternalIsrKnowledge::eligible` (`InternalIsrKnowledge.cpp:50`) ANDs the ISRs of `__consumer_offsets`,
+`__transaction_state` and `__cluster_metadata`, because the consensus leader leads all three.
+
+**Event sequence** (RF=3):
+1. A is lag-shrunk from offsets (hot partition, GC pause), giving ISR_offsets = {L,B}.
+2. B is lag-shrunk from metadata, giving ISR_metadata = {L,A}.
+3. L dies. No node is eligible, so there is no controller, no user-partition failover and no AlterIsr. The
+   whole cluster's control plane is down.
+
+Kafka in the same state: only one `__consumer_offsets` partition and the metadata partition lose their ISR.
+The KRaft quorum still elects a controller (Raft on its own log), user-partition failover continues, and
+unclean election is available.
+
+Compared with today (e5d41b4): today always elects, but unsafely. So this is a deliberate safety-for-liveness
+trade, and the trade is acceptable. What is not acceptable is that one partition's ISR takes out the whole
+control plane, with no override. Reaching it needs two degraded nodes plus the leader's death, which is why it
+is MEDIUM. MAJOR-A makes it reachable with one lost frame instead, so fix MAJOR-A first.
+
+**Fix**
+- Interim, as in the previous review: move offsets and txn onto the user-partition path (controller AlterIsr,
+  election from the ISR), so they go offline per partition as in Kafka. The candidacy gate then covers only
+  `__cluster_metadata`.
+- Add a default-OFF operator override for metadata (an unclean consensus election), mirroring MEDIUM-3.
+
+## MEDIUM-C — Lag shrink is restored for every internal partition, including `__topic_schemas` (-4), which is outside the quorum and vote-gate mechanism (latent regression)
+
+**Where**
+- `PartitionReplica.cpp:2026`: the `if (!internalPartition_())` guard is gone.
+- The schema replica (`BrokerNode.cpp:2484-2493`) is not in `replicaRegistry_`, so `setInternalIsrKnowledge`
+  is never wired (`internalQuorum_()` is false). Its lag shrink therefore commits at once, self-managed, and
+  its ISR is never part of `InternalIsrKnowledge`.
+
+**Effect**
+- Today: the replica runs on a `NullPartitionTransport` (Task 8b, not replicated multi-node). After 10 s it
+  shrinks to {L}, and DDL fails with NotEnoughReplicas instead of hanging. Both are broken, so this is
+  immaterial now.
+- Once Task 8b wires real replication, this reopens MAJOR-2 for schemas:
+  1. A lagging node is shrunk at once.
+  2. It is still electable as consensus leader, and so as schemas leader.
+  3. Followers are truncated by DivergingEpoch, so acked schema registrations are lost after one leader crash.
+
+**Fix:** shrink only when `!internalPartition_() || internalQuorum_()`. Better, wire the schema replica's ISR
+into the same knowledge store when Task 8b lands. Add a guard test.
+
+## LOW-A — The knowledge file fails open
+
+**Where:** `InternalIsrKnowledge.cpp:112-150` and `:108`.
+
+- **Corrupt, short or unknown-version file.** It is logged and treated as no knowledge, so the node votes for
+  anyone. A voter in the commit/vote intersection with a corrupt file breaks the safety argument. KRaft refuses
+  to start on a corrupt quorum-state file.
+  - Fix: fail closed. Refuse to vote, or refuse to start, when the file exists but does not validate. Only an
+    absent file on a node that has never acked is "fresh".
+- **Directory fsync.** Its result is ignored, so a failed dir fsync still acks.
+- **Control-thread fsyncs.** Each internal ISR change costs two fsyncs (file plus directory) on every node, on
+  the control/consensus duty-cycle thread. It is cold (≤3 partitions), but worth a note next to the heartbeat
+  timeouts.
+
+## LOW-B — The gated election and InternalIsr wiring are proven only in the DR model
+
+- `DrCluster::consensusElect` re-implements the vote rule; it does not drive `Election`.
+- Nothing in the round exercises a real-Aeron BrokerNode failover through `Election::setVoteGate` plus
+  InternalIsr frames over `AeronPartitionTransport`.
+- The Docker DR matrix was not run, and nothing under `dr-e2e/` sets `RUNE_SURVIVOR_LEADER_ELECTION`.
+- Per the real-e2e rule, add one multi-node in-process BrokerNode test that kills the consensus leader while a
+  node is out of the internal ISR, and run the matrix before calling DUR-1 done.
+
+## Hard-rule check
+
+| Rule | Result |
+|---|---|
+| Atomics and mutexes | OK. `check_no_atomics.py` is clean. The new `publishedReplicaLeo_` clear is allowlisted (SLICE-B). The test fake's locks are now consolidated (13 → 3). |
+| Virtual calls, std::function, allocation on hot paths | OK. The fetch-path additions (incarnation check, `committedMember` find in the below-HW cold branch) do not allocate. `InternalIsrKnowledge` and InternalIsr handling are cold (ISR changes only). The new virtuals are cold. |
+| Tests never sleep | OK. No `sleep_for` or `usleep` in the diff. |
+| RED-first `*Regression*` | OK for every listed fix. MAJOR-A and MEDIUM-A need new regression tests (the MAJOR-A scratch repro is ready). |
