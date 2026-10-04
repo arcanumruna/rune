@@ -575,6 +575,75 @@ the ~20% of each worker spent in empty recvmmsg; (c) fewer events per record at 
 already coalesced per pass, so (c) means coalescing across passes, i.e. a linger, i.e. latency.  The D2 "58% at a
 starved client" number is exactly that trade: bursts produce idle gaps long enough to park.
 
+### 4.15 A9: ring doorbells — cross-thread ring work wakes a parked shard worker (2026-10-04, k3s-node-01)
+
+Question: with an eventfd doorbell on the cross-thread rings (so ring work ends a park like a datagram does), can the
+shard worker drop A7's Aeron spin/yield phase (review M1) and park longer, for a large 20k worker-CPU cut with no
+p50/p99/saturation loss?
+Binaries: A = broker perf/a7-idle a3b89e1 (A7 fix round 1 + re-review: doorbell-less park-until-work, 10 spins /
+20 yields, 1 µs .. 200 µs parks).  B = perf/a9-doorbell 2b81b03 (doorbell on the worker's op / session rings, portable
+completions, ret_ space wait, fused-runtime rings on worker 0; doorbell shape 0 spins / 0 yields, park 1 ms .. 1 ms;
+worker-path claims retry ADMIN_ACTION once).  Same client in both arms (rune-client-cpp perf/a7-client-idle 7e98e33),
+same rune-protocol 8bd5d23 / rune-fr 5fe5464.  Release, gcc-13, conan toolchains of /root/rune-e5.  Config: §4.12
+(MTU 1408, GSO/GRO on, RUNE_FS_LOG=0, RUNE_LOG_LEVEL=warn, fsync off, 3 nodes x 1 fused worker on cores 1/2/3,
+acks=all, 1 KiB, linger 0, term 1 MiB, rcvWindow 256 KiB, ctlTerm 1 MiB), /root/e2e/tp.sh with vm-clean per run.
+CPU = utime+stime over a 5-8 s window mid-run (/proc/<pid>/task/*/stat).  Order: idle A,B; r20k A,B; sat A,B; r20k
+B,A; sat B,A; then (follow-up arm "B-hyb" = the B binary with RUNE_IDLE_SPINS=10 RUNE_IDLE_YIELDS=20, i.e. doorbell +
+Aeron spin/yield + 1 ms park) idle, r20k.  Proof of path: B `idle=park-until-work{wakeFds=4 doorbell=5rings spins=0
+yields=0 parkNs=1000000-1000000}` per worker (2 poller fds + io_uring fd + the doorbell; 5 rings = op + session + the
+3 admin → control rings of the fused runtime); A `wakeFds=3 spins=10 yields=20 parkNs=1000-200000`.  All runs
+errors=0, gso=on.
+
+| run | arm | worker CPU % (3 nodes) | client % | proc total | sys idle | p50 / p99 / p999 us | rec/s |
+|---|---|---|---|---|---|---|---|
+| idle (no producer) | A | 31.8 / 29.8 / 28.5 | – | 106% | 71% | – | – |
+| | B | 10.5 / 9.8 / 9.8 | – | 46% | 87% | – | – |
+| | B-hyb | 19.1 / 18.1 / 17.6 | – | 72% | 78% | – | – |
+| 20k r1 | A | 85.5 / 84.4 / 82.4 | 73.1 | 334% | 4% | 377 / 22,020 / 49,021 | 20,000 |
+| | B | 76.6 / 75.0 / 71.4 | 67.3 | 299% | 5% | 518 / 27,918 / 78,119 | 20,000 |
+| 20k r2 | B | 77.8 / 76.9 / 75.2 | 68.2 | 308% | 6% | 471 / 11,600 / 45,351 | 20,000 |
+| | A | 84.6 / 79.2 / 74.4 | 73.7 | 321% | 2% | 395 / 19,792 / 40,108 | 20,004 |
+| 20k (follow-up) | B-hyb | 86.6 / 86.3 / 85.3 | 74.0 | 341% | 4% | 356 / 9,503 / 36,438 | 19,999 |
+| sat r1 (3M records) | A | 68.0 / 65.1 / 64.2 | 43.9 | 254% | 8% | 22,938 / 147,849 | 161,429 |
+| | B | 68.8 / 68.3 / 59.9 | 43.9 | 252% | 9% | 22,676 / 131,596 | 169,671 |
+| sat r2 | B | 66.0 / 66.0 / 62.8 | 49.2 | 254% | 8% | 23,462 / 128,451 | 169,578 |
+| | A | 72.2 / 65.3 / 62.4 | 43.6 | 253% | 8% | 21,627 / 106,955 | 173,820 |
+
+Probe before the A/B (B binary, single runs, not interleaved): 20k with the default 1 ms .. 1 ms park: workers
+76.6% mean, p50 453 us, p99 13.4 ms, ~1.0k parks/s per worker; with RUNE_IDLE_DOORBELL_MIN_PARK_US=1 (doubling from
+1 µs): 77.7%, p50 467 us, p99 23.3 ms — the doubling buys nothing once ring work has an fd.
+
+Result:
+- **Idle cluster: worker CPU 30.0% -> 10.0% (B) / 18.3% (B-hyb)**, process 106% -> 46% / 72%, system idle 71% ->
+  87% / 78%.  Parks are ~860/s per worker (the 1 ms timer bound) instead of ~3.2k/s (200 µs).  This is free: every
+  wake source with work has an fd, so longer parks lose nothing.
+- **20k, B (spin/yield off): worker CPU 81.8% -> 75.5% mean (-6.3 pts), client 73.4% -> 67.8%, process 328% ->
+  304%; but p50 386 -> 495 us (+109 us; both B rounds, 518 / 471, above both A rounds, 377 / 395).**  p99 is inside the
+  usual 10-30 ms spread (B 27.9 / 11.6 ms vs A 22.0 / 19.8 ms).  Mechanism: at 20k an event lands every ~70 us
+  (§4.14); A's 30-pass spin/yield phase (~300 us of polling) spans that gap, so A never parks (A: 36-134
+  voluntary switches/s per worker) and reacts at once; B parks after the first empty pass (464-1,313 vcsw/s) and each
+  event then pays a park wake — on this saturated box (system idle 2-6%) the worker's pinned core is often running
+  the unpinned client or softirq when its fd fires.  The 6 points of CPU A spends at 20k ARE the polling that buys
+  the p50.
+- **B-hyb (doorbell + Aeron spin/yield + 1 ms park): 20k unchanged — workers 86.1% (A r1 84.1%), p50 356 us (A 377 /
+  395), p99 9.5 ms — and idle 30.0% -> 18.3%.**  That is the shipped default (perf/a9-doorbell 0367963: auto
+  spin/yield = Aeron 10 / 20 with or without the doorbell; measured here through env on the 2b81b03 binary); spins/yields 0 stay an explicit opt-in
+  (RUNE_IDLE_SPINS=0 RUNE_IDLE_YIELDS=0) for CPU-bound boxes that can pay ~0.1 ms p50.
+- **Saturation 167.6k -> 169.6k rec/s mean (+1.2%, inside A's 161-174k round spread)**; passes are work-bound there,
+  the idle shape does not matter.
+- So the brief's 20k goal (win back M1's +8-9 points with no p50 loss) is **not available from the idle strategy on
+  this box**: the doorbell removes the correctness reason for the spin/yield phase (fd-less ring work no longer waits
+  for the park cap — review MEDIUM-2 closed), but the latency reason remains while the box is saturated.  What would
+  move it: fewer events per record (cross-pass coalescing = latency), a cheaper pass (§4.6), or headroom (the client
+  off the worker cores).
+- Multi-worker arm (2 workers per node): not run — the harness refuses the layout on this box ("3 nodes x 2 workers
+  from core 1 needs cores 1..6 but the box has 4"; pinned busy-spin-safe layout).  The cross-thread doorbell path
+  (runtime → worker 1 ops, worker 1 → fused runtime returns) is covered by rune_shard_mode_tests on Linux (3 nodes x
+  2 fused workers, real UDP) and rune_worker_doorbell_tests (parked shard runner, real invoker driver, 2 s park:
+  a cross-thread op is taken in well under 500 ms).
+- VM benchmark time ~28 min (3 probes, the 10-run A/B + 2 refused mw runs, 2 follow-up runs).  Raw summaries were
+  copied off the box; /root/a9 deleted.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
