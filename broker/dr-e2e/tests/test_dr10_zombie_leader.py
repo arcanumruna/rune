@@ -174,14 +174,25 @@ def assert_zombie_cannot_serve_write(
         start_stagger_ms=0,
     )
     serving = probe.ok and len(probe.all_produced) > 0
-    assert not serving, (
-        f"SPLIT-BRAIN [BLOCKER — DR-10]: {reason}. "
-        f"Zombie service {zombie_svc!r} successfully acked an acks=All produce "
-        f"after a higher-term leader was elected. This is a write-accepting "
-        f"split-brain. produced={len(probe.all_produced)} "
-        f"rc={probe.clients[0].rc if probe.clients else '?'} "
-        f"exit={probe.clients[0].exit_code if probe.clients else '?'}"
-    )
+    if not serving:
+        return
+    # Milestone D (per-partition leadership): the probe only BOOTSTRAPS through the zombie — the client routes
+    # each record to its partition's current leader, so an ack is not a zombie write by itself (proven with
+    # topic-aware broker logs, briefs/2026-10-04-dr10-diagnosis.md).  The split-brain property is that nothing
+    # acked through the zombie's endpoint lives only on a deposed leader: every probe record must be delivered
+    # by the real cluster (subscribe-from-earliest via a non-zombie leader).
+    others = [svc for svc in SERVICES if svc != zombie_svc]
+    leader_id = cluster.wait_for_leader(timeout_s=90, exclude=[zombie_svc])
+    true_svc = node_id_to_service(leader_id)
+    assert true_svc in others, f"no non-zombie leader to verify the probe against (leader={true_svc})"
+    sub = _subscribe_all(cluster, true_svc, _next_cid_base(), keys=18, window_ms=60_000)
+    try:
+        assert_no_committed_loss(Results(clients=probe.clients + sub.clients))
+    except AssertionError as exc:
+        raise AssertionError(
+            f"SPLIT-BRAIN [BLOCKER — DR-10]: {reason}. Zombie service {zombie_svc!r} acked an acks=All "
+            f"produce whose records the real cluster (leader {true_svc!r}) does not have: {exc}"
+        ) from exc
 
 
 def assert_no_concurrent_leaders(cluster, majority_services: list[str],
