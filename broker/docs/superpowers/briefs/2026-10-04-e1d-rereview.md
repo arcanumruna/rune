@@ -197,3 +197,146 @@ The MAJOR finding is a hole in the F7 replay. It brings back the exact offset ga
   - Design item 5 (a follower's acked LEO can exceed its synced LEO / R) interacts directly with DUR-1's Kafka HW = min LEO over ISR. After E1d, a power-lost follower comes back lower than it reported, so DUR-1's incarnation / unclean-restart handling must treat that as a legitimate regression. The E1b / KIP-966 follow-up is still open.
   - MAJOR-1 is most reachable exactly on DUR-1's divergence-truncation paths, because a role change is what triggers re-ownership plus truncation.
 - **rune-protocol `6d14dc8`** (`WriteSyncRequest`, template 7) is on `feat/self-contained-worker-shards`. It is an ancestor of that branch's HEAD and also present on `feat/unknown-producer-id`. It must be on whatever protocol revision DUR-1 builds against.
+
+---
+
+# Re-review (fix round 2)
+
+- **Reviewed:** `rune-broker-wt32`, branch `fix/e1d-recovery-point`, `git diff 85953b1..d5d84ee` (commits `3c60c5d` and `d5d84ee`). Read-only: wt32 was not edited.
+- **Build:** a separate scratch build (Debug, Ninja + ccache, same toolchain as `build-fast`) at `scratchpad/e1d-r2-build`.
+- **Mac results (portable backend):**
+
+| Binary | Result |
+|---|---|
+| `rune_storage_tests` | 313/313 |
+| `rune_storage_integration_tests` | 41/41 |
+| `rune_shard_nonblocking_tests` | 105/105 |
+| `rune_compaction_cleaner_agent_tests` `*Regression*` | 1/1 |
+
+- The io_uring tests are Linux-only. For those, this review relies on the k3s evidence in the report, plus `MissingOpWriteFallsBackToPortableRegression`, which asserts that the real probe on that kernel keeps `kind() == Uring`. That assertion means the k3s run cannot have silently fallen back to portable.
+
+## Verdict: APPROVED. No CRITICAL or MAJOR. No further review round needed (one-review-ship-fast)
+
+| Severity | Count |
+|---|---|
+| CRITICAL | 0 |
+| MAJOR | 0 |
+| MEDIUM | 1 (production fd budget: an ops follow-up, not an E1d correctness defect) |
+| LOW | 3 |
+
+## Previous findings
+
+| # | Status | Evidence |
+|---|---|---|
+| MAJOR-1 | **Fixed** | See the detail below. Both reviewer repros are in-tree (`RecoveryPointRegression.ResetForNewOwnerThenTruncate_{DiskRNeverAboveLeo,PowerLoss_NoOffsetGap}`) along with the control, and they pass. |
+| MEDIUM-1 | **Fixed** | `rebuildFlushSlots_` always calls `requeueUndurableSeals(sealsRouted)` (Worker.h:4212–4229) and excludes only the segments that have a Seal route on this worker. Duplicate completions are harmless: `markDurableThrough` is a monotonic, clamped max (LogSegment.h:130), and each requeue pins and its completion unpins exactly once. The repro `SealLostToPreviousOwnerReplayedWhileAnotherSealIsRouted` passes, with exactly 2 seal submits (no double queue of B). |
+| MEDIUM-2 | **Fixed** | See the detail below. |
+| MEDIUM-3 | **Fixed (on the report's evidence)** | io_uring Release run on k3s 5.15: `rune_uring_durability_tests` 12/12, shard 105/105, storage, DR ×10, and replication DR, all with explicit `RUNE_IO_BACKEND=uring`. Not re-run independently. The Mac cannot run these. |
+| LOW-4 a/b/c | **Fixed** | See the io_uring section. One new LOW-A edge case. |
+| LOW-1, 2, 3, 5 | Backlogged as agreed | The LOW-1 wording in the report is now correct (a stale higher R, not fail-stop). |
+
+### MAJOR-1 detail
+- **Grows only on submit; never forgotten.** `rpUnconfirmedMax_` is raised at submit (Log.cpp:1001). The reset keeps it (Log.cpp:1042), so the value of a write that landed while the log was unowned is never forgotten.
+- **Cleared only by a confirmed highest-seq durable write:**
+  - an inline `checkpointRecoveryPoint_` (Log.cpp:924);
+  - or an observed, non-abandoned completion (Log.cpp:1025).
+- **The clears are sound.** Only one async write is ever in flight, and every inline write takes `++rpSeq_`, so a confirmed write always carries the highest seq. Its target slot is one of two:
+  - **After a reset (Idle):** the target is `1 - rpActiveSlot_`, which is exactly the possibly-landed slot X. The write overwrites it.
+  - **While InFlight:** the target is the active slot, with a seq above both the in-flight write and the landed one, so it dominates both. The only exception is a torn write, which is LOW-1 (backlog).
+- **Truncation ordering is correct.** `persistAtMost_` runs at the top of `truncateTo` (Log.cpp:1225) against `max(persistedRp_, rpUnconfirmedMax_)`. A failed persist returns before any `remove` or `resize`.
+- **Clean shutdown** also re-persists when `rpUnconfirmedMax_ > R` (Log.cpp:110).
+- **Cross-worker races are excluded.** Drain-before-grant and the F7 runtime-move halt mean that no previous owner's write can still be in the kernel when the reset happens.
+
+### MEDIUM-2 detail
+- **The gate sits before each segment is used** (Log.cpp:947). Two consequences:
+  - R can reach the base of a segment whose entry is unsynced, but never trusts that segment. That is safe: a lost entry then sits at or above R and is chain-validated, and the new repro `LostDirectoryEntryNeverBecomesAnOffsetHole` passes.
+  - Truncation deletions mark the straddled active segment, so R makes no progress inside it until the deletions are durable.
+- **Every directory mutation bumps the generation:**
+  - adopt / fallback create (Log.cpp:384);
+  - truncate recreate (Log.cpp:1261);
+  - truncate deletions (Log.cpp:1379);
+  - a cleaner reload with a new base (Log.cpp:1440). The cleaner already fsyncs the directory itself (LogCleaner.cpp:87), so this costs at most one extra fsync.
+- **Staging rename:** the directory fsync is issued after adoption, so it covers the staging name. Either name is reconciled at construction, and `rename` is atomic.
+- **No wedge was found.** The fsync is requested only when R would otherwise move. A completion re-advances R, and a newer generation re-arms the request. A refused submit stays in `rpQueue_`. A fresh owner clears `dirSyncInFlight_` before the queue is refilled, which happens later in the same `rebuildFlushSlots_` call. An unowned DirSync completion is ignored on success; on an error it reaches C-1 `failForeignLog_`.
+- **No syscall on the worker loop.** The worker path is memory plus one `io_.submitFsync`. The inline `syncDirectoryInline_` runs only in `recover()` (cold) and in `maybeCheckpointInline_`, which is guarded by `!deferSealSync_`. Every worker user replica sets `deferSealSync_` (PartitionReplica.h:707).
+
+### io_uring detail
+- **LOW-4a.** The probe uses `IORING_REGISTER_PROBE`. When `IORING_OP_WRITE` is missing, `IoBackend` falls back to portable before any use, and `uring_` is reset first.
+- **LOW-4b.** The new allowlisted store `__atomic_store_n(sqTail_, tail + submitted, RELEASE)` sits inside `pushSqes_`, which is ring internals, so it is correctly classified as RING.
+  - It is correct because there is no SQPOLL (UringFlushBackend.cpp:89): the kernel reads the tail only inside `io_uring_enter` on this same thread, and its head is already `tail + submitted`.
+  - `ret == 0` with a single SQE is now rolled back and reported as back-pressure. Previously the SQE was left in the ring to run on a later enter, so this is an improvement.
+  - A partial pair accounts `inFlight_ += 1` (the write's CQE only) and keeps the block until that CQE arrives. The synthetic EIO is delivered on the next `reap`, which is fail-stop.
+- **LOW-4c.** The real errno replaces ECANCELED or 0 for the token. Covered by the EBADF test.
+
+## New findings
+
+### MEDIUM-1 (round 2): production fd budget, 2 extra fds per recovered Log, and the broker never raises `RLIMIT_NOFILE`
+**Where:**
+- `Log::recover` keeps `dirFd_` (Log.cpp:652) and `rpFd_` open for the Log's lifetime.
+- No `setrlimit` exists anywhere outside tests. A grep of `apps/`, `libs/`, `src/`, `docker/` and `scripts/` finds no NOFILE or `LimitNOFILE` setting.
+
+**Failure sequence:**
+1. The broker runs under systemd defaults (soft 1024 / hard 524288).
+2. With about 300 partitions, each holding 1–2 segments (each segment ≥ 1 fd), plus 2 E1d fds, plus Aeron and socket fds, the process exceeds the soft limit.
+3. The next roll's `open` or the next recovery's `open(dir)` fails with EMFILE.
+4. That sets `failedErrno`: the log is fail-stopped, the broker halts, and on restart recovery fails on the same limit.
+
+**Severity:** this is a crash loop, not data loss. Segment fds dominate (pre-existing), but E1d roughly doubles the per-partition floor for few-segment partitions. MEDIUM.
+
+**Recommendation** (small; do it before production, does not block the E1d merge):
+1. **At broker startup** (`main` / NodeRuntime init), raise soft `RLIMIT_NOFILE` to hard, as Kafka's start scripts and most servers do, and log both values.
+2. **Warn, or refuse to start,** when hard < `partitions × (2 + est. segments) + reserve`. That keeps it fail-fast instead of halting mid-run.
+3. **Document `LimitNOFILE=1048576`** (systemd) and `nofile` (k8s / Docker; the Docker default is already about 1M).
+4. **Optional:** a test that asserts fds per idle recovered Log ≤ N, so the budget stays visible. The binary-wide raise of soft to hard in `ShardNonBlockingTest.cpp:57` / `RollingStressIntegrationTest.cpp:29` is acceptable for tests, but on its own it masks the budget.
+
+Removing the fds is not worth it. `dirFd_` cannot be shared, because each log has its own directory, and opening it per sync would put a syscall on the path or need a linked `OPENAT`.
+
+### LOW-A: partial enter where the WRITE itself failed leaks a `writeFailures_` entry
+**Where:** UringFlushBackend.h:263–266 and UringFlushBackend.cpp:380–384.
+
+**Sequence:**
+1. `io_uring_enter` consumes only the write SQE because its init failed (for example EBADF / EINVAL at prep; that failure is what makes the kernel stop the submission).
+2. The fsync SQE is rolled back, and a synthetic EIO is queued for the token.
+3. The write's error CQE is reaped and pushes `{tok, err}` into `writeFailures_`. No fsync CQE ever arrives to consume that entry.
+
+**Effect:** each such event permanently uses one of the `nBlocks` reserved entries. Once the entries are exhausted, later real write failures report ECANCELED instead of their errno. That is still an error and still fail-stop, and the event itself already halts the broker, so the impact is cosmetic.
+
+**Fix:** skip the push for tokens that are already in (or delivered from) `syntheticFailures_`. Or push only when `inFlight` accounting says an fsync CQE is pending: for example, set `wb.token = kNoToken` on the partial path before returning.
+
+### LOW-B (pre-existing, adjacent to the MEDIUM-1 code; found by inspection, not repro'd): a fresh slot never seeds `sealsInFlight` from routed seals, so the Strict-ack seal gate is open while an older seal is still routed
+**Where:**
+- Worker.h:4200–4229: the fresh slot seeds `durableToken` / `bgToken` from routes, but not `sealsInFlight`. The new `sealsRouted` vector holds exactly that count.
+- Worker.h:1697: the decrement goes through the epoch-matched `slot`, so an old route never decrements.
+- Worker.h:4538: `sealsOutstanding_`.
+
+**Sequence:**
+1. The log is unowned and re-owned on the same worker while seal B is routed.
+2. `sealsOutstanding_` reads 0 seals in flight and 0 pending.
+3. A Strict ack for X in the active segment fires after X's own fdatasync, even though B is not yet durable.
+4. Power loss loses B's tail.
+5. Recovery hits a chain break above R and deletes the following segments, so the acked X is lost.
+
+**Reachability:** only same-worker unown→re-own inside one seal latency, with a new Strict produce in that window. Runtime cross-worker moves halt the broker. Not introduced by round 2.
+
+**Fix:**
+- Seed `fresh.sealsInFlight = sealsRouted.size()`.
+- Decrement Seal routes through `gate` (the current slot), not `slot`.
+- Add a regression test.
+
+### LOW-C: duplicate cold directory fsync at recovery
+**Where:** Log.cpp:774–780 (`deleteOnGap` opens its own dir fd and fsyncs) and Log.cpp:657 (`syncDirectoryInline_`, unconditional).
+
+**Effect:** when gap deletions happened, recovery fsyncs the directory twice. This is cold and only costs startup time.
+
+**Also:**
+- `syncDirectoryInline_` counts into `storage_.roleChangeSyncs`, so a test that reads that counter as "role-change syncs" now also sees recovery and legacy directory syncs.
+- **Fix:** reuse `dirFd_` and the single sync. Optionally add a separate counter.
+
+## Hard rules
+- **No syscall or allocation on the loop for checkpoints or directory fsyncs:** OK.
+  - `prepareDirectorySync`, `directorySyncCompleted` and `advanceRecoveryPoint_` touch only memory. The one syscall is the io-backend submit.
+  - The only new allocation is `sealsRouted` in the cold `rebuildFlushSlots_`.
+  - `writeFailures_` / `syntheticFailures_` are reserved in the ctor.
+- **Atomics:** one new allowlisted site, inside the uring ring internals and correct (see the io_uring detail). `check_no_atomics.py` is OK according to the report.
+- **No virtual calls or `std::function`:** none added. The portable full fsync is a record-type branch, not dispatch.
+- **No sleeps in tests:** none. The new tests use bounded `doWork` / `yield` loops and wall-clock-bounded reap loops.
