@@ -742,6 +742,58 @@ collapse; the A/B cannot attribute a perf delta to it (n=1-2 per arm, bimodal ou
 10 s stall with periodic fsync on (shard-loop journal waits during a commit -> missed lease/heartbeat? the
 ISR-out at age 10,003 ms) — instrument at the session-lease / ISR boundaries, then re-A/B.
 
+#### 4.16.2 A10 ROOT CAUSE (2026-10-04, k3s-node-01): session churn + EINTR on runtime publication adds
+
+**Not a disk or shard-loop stall.**  Instrumented captures (diag branches `diag/a10-stall`: per-segment slow-pass
+logs, per-second pending-ack state per worker, client sent/acked/blocked line, session-machine transitions,
+20 ms thread sampler, 0.5 s Aeron CnC counter snapshots) showed during every 5-10 s gap:
+- no shard pass > 20 ms; every partition fully committed (HW == LEO); **zero** pending acks on all brokers
+  (acks=all waiters, durable waiters, return FIFO, held acks);
+- clean transport (no NAKs / loss / retransmits; publications not back-pressured);
+- the client had 189-330 records in flight and `trySend` returned BackPressured: it was waiting for acks for
+  batches that no broker owed.
+
+Chain:
+1. **Client**: the session liveness clock was refreshed only by ConnectResponse / ErrorResponse / Pong (credited to
+   the seed) and the keepalive was one-way, so EVERY producing session went "stale" after 10 s and resumed with a
+   new Connect (healthy runs too: 6 stale resumes per run).
+2. **Broker**: each resume adds a per-session ack publication (worker) and egress publication (gateway, fused on
+   worker 0) at runtime.  With the driver's non-sparse terms Aeron `fallocate()`s the term file on tmpfs, which
+   fails with EINTR when the thread has pending notification work - io_uring fsync completions with periodic fsync
+   on.  Aeron does not retry; the add errored (`(4) Interrupted system call`), the ack sink declared the session
+   undeliverable -> SessionExpired -> the client reconnected -> again: a reconnect storm with the in-flight batches
+   orphaned until a timeout (p99 = 5 s / 10 s, bimodal per run).
+
+Fixes (RED-first `*Regression*` tests, Mac broker 3680/3680, client 940/940):
+- client `fix/a10-session-liveness` 0f2a0e8 + 27276ce: keepalive = Ping answered by a Pong, routed by a per-session
+  negative correlationId (broker session ids collide across nodes - review C1); own-stall resume (gap between ticks
+  > responseTimeout).
+- broker `fix/a10-transient-pub-add` 275a4dc + cbeda55: control publications (ack sink, gateway Connect egress) use
+  `sparse=true` (ftruncate, no EINTR); a driver error on the ack publication add is re-added with a pass-count
+  backoff, bounded (8); record-egress (data) keeps pre-faulted terms.  Review: briefs/2026-10-04-a10-fix-review.md.
+
+Verification (20k rec/s open loop, 3-node acks=all 1 KiB, MTU 1408 + GSO, logs off, worker + follower fsync 5 ms):
+
+| build | runs | collapsed (p99 >= 4.8 s) | p50 | p99 |
+|---|---|---|---|---|
+| before (integ + diag, 4 capture rounds) | 13 | 9 | 2.1 ms - 1.9 s (healthy runs p99 15.8 - 26.5 ms) | 4.9 - 9.9 s |
+| fix (275a4dc + 0f2a0e8) | 6 | 0 | 2.4 - 3.0 ms | 17.7 - 29.5 ms |
+
+| final fix (cbeda55 + 27276ce) | 1 | 0 | 2.57 ms | 22.9 ms |
+
+No regression with fsync OFF - interleaved A/B, 8 pairs (ABBA order), A = main (broker 4909e74, client 7dea068),
+B = final fix; every run 20k achieved, errors 0:
+
+| arm | p50 median (range) | p99 median (range) |
+|---|---|---|
+| A main | ~513 us (453 - 905) | ~18.0 ms (11.1 - 21.5) |
+| B fix | ~472 us (410 - 872) | ~16.9 ms (14.4 - 22.0) |
+
+B's p50 was lower in 6 of 8 pairs (1 tie).  The 565 us seen in the first two fix runs was the box's spread (main
+alone ranges 453 - 905 us); p50 comparisons need interleaved pairs, not single runs.
+Open (backlog): runtime-created IMAGES (client ingress) inherit the subscription's non-sparse terms and can hit
+the same fallocate EINTR (review M4) - recovers via Aeron's image re-setup; not observed in these runs.
+
 ## 5. Where the time goes now (measured)
 
 > **VALIDITY CORRECTION (2026-10-02 ~11:40) — read before using ANY number in this section.**
