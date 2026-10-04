@@ -21,23 +21,19 @@ the zombie made NO user-topic leader appends after resume and stepped down from 
 routes per partition (Milestone D).  Harness fix: the probe must address the zombie's OLD partitions directly (no
 routing / redirect following) and require NotLeader, or assert on broker-side leader appends.
 
-## Finding 3 — a deposed controller COMMITS to __cluster_metadata (minIsr=1) — REAL, open
+## Finding 3 — a deposed controller appends to __cluster_metadata — NOT a safety bug (corrected)
 
-Topic-aware RATE logs after resume (node 1 = zombie, node 2 = new consensus leader):
+Topic-aware RATE logs after resume (node 1 = zombie, node 2 = new consensus leader): the zombie was still role=L on
+`__cluster_metadata` (-3, minIsr=1) and APPENDED 10 records at 20:58:55 while node 2 led it — but its HW stayed 10
+(`L(hw10,leo10)` -> appends -> `F(hw10,leo35)` after demotion): the appends were NEVER committed and were truncated
+when it became a follower (normal Raft/Kafka behaviour for a deposed leader).
 
-- `__cluster_metadata` (topic -3, minIsr=1): node 1 still role=L and APPENDED 10 records at 20:58:55 (hw 10)
-  while node 2 led it (hw 35); node 1 demoted later (F hw10 leo35).
-- topic -4: node 1 still role=L at 20:59:05 (>10 s after resume) alongside node 2.
-- `__consumer_offsets` (-1, minIsr=1) and `__transaction_state` (-2): node 1 L alongside node 2 in the resume second.
+Why a frozen-then-resumed zombie cannot lag-shrink its ISR to itself and commit alone (minIsr=1 notwithstanding):
+PartitionReplica resets the working ISR to the COMMITTED ISR every pass (`isrManager_->setIsr(committedIsr_)`); an
+internal partition's lag-shrink only takes effect once a majority holds it durably (DUR-1 internal-ISR store,
+InternalIsrKnowledge), and the consensus never votes for a node outside the newest durable ISR.  -4
+(`__topic_schemas`, self-managed) never lag-shrinks.  The earlier draft's "commits locally" claim was wrong (read
+from role=L alone, not the HW).
 
-Mechanism: the resumed zombie still believes it is the consensus leader until it hears the higher term; its metadata
-service keeps emitting into `__cluster_metadata` as leader, and with minIsr=1 (BrokerNode.cpp:2102-2105, "leader-local
-in Phase 1") those records COMMIT locally without any majority → a divergent committed metadata view (assignments
-served to clients / applied to its own roles) until truncation.  Same exposure for `__consumer_offsets` (minIsr=1,
-BrokerNode.cpp:1853-1858).  KRaft commits metadata only by Raft majority.
-
-Fix direction: control logs commit only with a majority (minIsr >= majority of the replica set) so a deposed leader
-can never commit; check what the "ISR-establishment delay" concern behind minIsr=1 needs instead (the new leader's
-ISR = live set from the consensus election, not ISR re-growth).  RED test: in-process 3-node, isolate / stall the
-consensus leader, let it emit metadata, assert nothing it appended becomes committed (HW does not move) and its
-metadata view never applies an uncommitted assignment; after heal it truncates to the new leader's log.
+Remaining (LOW, backlog): the zombie keeps role=L on internal partitions until it hears the new consensus term
+(-4 seen ~10 s after resume) — harmless while it cannot commit; observability only.
