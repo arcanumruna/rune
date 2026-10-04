@@ -99,7 +99,7 @@ public:
         const int64_t reg = aeron_->addSubscription(egressChannel_, kEgressStream);
         for (int i = 0; i < kMaxIters && !egress_; ++i) { egress_ = aeron_->findSubscription(reg); pause_(); }
     }
-    ~ShardTestClient() { pubs_.clear(); egress_.reset(); aeron_.reset(); }
+    ~ShardTestClient() { pubs_.clear(); exclusivePubs_.clear(); egress_.reset(); aeron_.reset(); }
 
     const std::string& egressChannel() const noexcept { return egressChannel_; }
 
@@ -291,6 +291,28 @@ public:
             for (int i = 0; i < kMaxIters && !pub; ++i) { pub = aeron_->findPublication(reg); pause_(); }
             if (!pub) return 0;
         }
+        return offerLoop_(*pub, std::forward<Make>(make), maxFrames, std::forward<Paused>(paused));
+    }
+    /// D8d: as offerUntilPaused, on this client's own EXCLUSIVE publication #`slot`
+    /// to (channel, stream) — a separate image at the broker per slot (several
+    /// stalled "clients" from one process).
+    template <class Make, class Paused>
+    int64_t offerUntilPausedExclusive(int slot, const std::string& channel, int32_t stream, Make&& make,
+                                      int64_t maxFrames, Paused&& paused) {
+        auto& pub = exclusivePubs_[slot];
+        if (!pub) {
+            const int64_t reg = aeron_->addExclusivePublication(channel, stream);
+            for (int i = 0; i < kMaxIters && !(pub && pub->isConnected()); ++i) {
+                if (!pub) pub = aeron_->findExclusivePublication(reg);
+                pause_();
+            }
+            if (!pub) return 0;
+        }
+        return offerLoop_(*pub, std::forward<Make>(make), maxFrames, std::forward<Paused>(paused));
+    }
+    template <class Pub, class Make, class Paused>
+    int64_t offerLoop_(Pub& p, Make&& make, int64_t maxFrames, Paused&& paused) {
+        auto* pub = &p;
         std::vector<uint8_t> f;
         int64_t accepted = 0;
         // Hard cap: refused for this long without paused() → stall; returns maxFrames (the caller's "never
@@ -404,6 +426,7 @@ private:
     std::string                                      egressChannel_;
     std::shared_ptr<aeron::Subscription>             egress_;
     std::map<std::pair<std::string, int32_t>, std::shared_ptr<aeron::Publication>> pubs_;
+    std::map<int, std::shared_ptr<aeron::ExclusivePublication>> exclusivePubs_;   // D8d: offerUntilPausedExclusive
     aeron::FragmentAssembler assembler_{[this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
                                                aeron::util::index_t len, aeron::Header& h) {
         onFrame_(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len), h.sessionId());

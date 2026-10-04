@@ -234,6 +234,10 @@ public:
     // one drain + one poll while no DIRECT client holds acks.  In the window
     // before that, ackRoom_ (the one physical throttle) still bounds every
     // drain — at worst one op-drain pass finds no room.
+    // D8d: DIRECT (worker-ingress) produces get their own budget INSIDE the
+    // reserve (kDirectAckBudget, below): counted from admission (owed or queued)
+    // until the ack leaves the sink, so direct + held PushReads + one op drain
+    // fit the reserve whatever direct clients do — see kDirectAckBudget.
     static constexpr std::size_t kAckReserve =
         kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
         static_cast<std::size_t>(kMaxFragmentLimit);
@@ -416,6 +420,28 @@ public:
     /// Review I-2: read_committed PushReads held while their partition's RC
     /// state builds (each owes one return; beyond this → notReady fallback).
     static constexpr std::size_t kMaxHeldPushReads = 1024;
+    /// D8d (D8c review LOW-R2): the most DIRECT (worker-ingress) produces this
+    /// worker keeps outstanding — admitted (SessionAckSink::admitDirect, in the
+    /// controlled poll) until the ack LEAVES the sink (claimed / dropped): owed
+    /// (parked acks=all / Strict) and queued alike.  The own-intake reserve minus
+    ///   * kMaxHeldPushReads — held read_committed PushReads each owe a return
+    ///     (counted in reservedAckSlots_, so they shrink ackRoom_); bounded by
+    ///     that static cap (beyond it: notReady at once) and the owed cap,
+    ///     whatever any client does — a fixed term, not a client-driven one;
+    ///   * one full op drain (kMaxIngressDrainLimit) — the room role / ownership
+    ///     / replication / announce ops need to keep draining (gateway-routed
+    ///     produces are inside kRoutedAckBudget).
+    /// So A + O <= kRoutedAckBudget + kDirectAckBudget + kMaxHeldPushReads, i.e.
+    /// ackRoom_() >= one full op drain, however many direct sessions stall
+    /// (after every SessionClose the runtime sent is applied — LOW-R1 window).
+    static constexpr std::size_t kDirectAckBudget =
+        kAckReserve - kMaxHeldPushReads - static_cast<std::size_t>(kMaxIngressDrainLimit);
+    static_assert(kRoutedAckBudget + kDirectAckBudget + kMaxHeldPushReads +
+                      static_cast<std::size_t>(kMaxIngressDrainLimit) <= SessionAckSink::kAckCapacity,
+                  "D8d: routed + direct shares + held PushReads must leave one full op drain of ack room");
+    static_assert(kDirectAckBudget >= 4 * SessionAckSink::kDirectLightInFlight &&
+                      kDirectAckBudget >= SessionAckSink::kDefaultDirectSessionBudget,
+                  "D8d: the direct share holds a full session budget and a congested band of light sessions");
     /// Review m1: async RC read-ahead hints in flight per worker (the rest are
     /// skipped this pass), so hints never crowd fsyncs out of the io cap.
     static constexpr std::size_t kMaxRcHintsInFlight = 8;
@@ -614,7 +640,28 @@ public:
     // -----------------------------------------------------------------------
     void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0) {
         ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes}) : nullptr;
+        if (ackSink_) ackSink_->setDirectBudgets(directSessionAckBudget_, static_cast<uint32_t>(kDirectAckBudget));
     }
+    /// D8d: per-session direct (worker-ingress) outstanding-ack budget (cold;
+    /// clamped to [1, kDirectAckBudget]).  Default SessionAckSink::
+    /// kDefaultDirectSessionBudget.
+    void setDirectSessionAckBudget(uint32_t n) noexcept {
+        directSessionAckBudget_ = n;
+        if (ackSink_) ackSink_->setDirectBudgets(n, static_cast<uint32_t>(kDirectAckBudget));
+    }
+    /// D8d test seam: a smaller worker direct cap (after setShardClient).
+    void setDirectAckBudgetsForTest(uint32_t perSession, uint32_t workerCap) noexcept {
+        directSessionAckBudget_ = perSession;
+        if (ackSink_) ackSink_->setDirectBudgets(perSession, workerCap);
+    }
+    [[nodiscard]] std::size_t directAcksInFlightForTest() const noexcept { return ackSink_ ? ackSink_->directInFlight() : 0; }
+    [[nodiscard]] uint32_t directAcksInFlightOfForTest(int64_t sid) const noexcept {
+        return ackSink_ ? ackSink_->directInFlightOf(sid) : 0;
+    }
+    [[nodiscard]] uint64_t directExpiriesForTest() const noexcept { return ackSink_ ? ackSink_->directExpiries() : 0; }
+    [[nodiscard]] uint64_t directUnderflowsForTest() const noexcept { return ackSink_ ? ackSink_->directUnderflowsForTest() : 0; }
+    [[nodiscard]] uint64_t directDroppedClosedForTest() const noexcept { return ackSink_ ? ackSink_->directDroppedClosed() : 0; }
+    [[nodiscard]] uint64_t directExpiryCancelsForTest() const noexcept { return ackSink_ ? ackSink_->directExpiryCancelsForTest() : 0; }
     void releaseShardClient() noexcept { ackSink_.reset(); }
     [[nodiscard]] bool workerSideAcks() const noexcept { return ackSink_ != nullptr; }
     [[nodiscard]] uint64_t sessionAnnouncesSeenForTest() const noexcept { return sessionAnnouncesSeen_; }
@@ -1556,7 +1603,7 @@ private:
     void emitProduceAck_(const WorkerReturn& ret) {
         const bool ok = ret.errorCode == 0;
         AckEntry a{ret.sessionId, ret.correlationId, ok ? ret.baseOffset : 0, ret.partition, ret.errorCode,
-                   static_cast<uint8_t>(ret.gatewayCredit ? 1 : 0)};
+                   static_cast<uint8_t>(ret.gatewayCredit ? 1 : 0), ret.directAck};
         // D6: an UnknownProducerId result carries the log start in baseOffset
         // (the carrier does not grow); the sink gates it per session version.
         if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
@@ -1910,6 +1957,14 @@ private:
         // D8c: claimed gateway-routed acks return their produce credits.
         n += ackSink_->reportCredits([this](int64_t sid, uint32_t c) {
             return trySessionSignal_(sid, SessionSignalKind::Credit, static_cast<int64_t>(c));
+        });
+        // D8d: the direct share is full — the held session with the largest share expires.
+        n += ackSink_->reportDirectExpiry([this](int64_t sid, uint32_t share) {
+            if (!trySessionSignal_(sid, SessionSignalKind::Expire, static_cast<int64_t>(share))) return false;
+            spdlog::warn("Worker {}: direct (worker-ingress) ack share full ({} / {}); expiring held session {} "
+                         "(largest share, {} acks) — the client reconnects (expiries={})", workerId_,
+                         ackSink_->directInFlight(), ackSink_->directCap(), sid, share, ackSink_->directExpiries());
+            return true;
         });
         return n;
     }
@@ -3491,7 +3546,8 @@ private:
     uint64_t sessionAnnouncesSeen_ = 0;
     int32_t  lastAnnouncedClientVersion_ = -1;   ///< D6 test probe (the last SessionAnnounce's)
     uint64_t sessionClosesSeen_    = 0;
-    uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs)
+    uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs); D8d: + direct budget
+    uint32_t directSessionAckBudget_ = SessionAckSink::kDefaultDirectSessionBudget;   // D8d
     uint64_t ackRoomOpPauses_      = 0;   // fix round 1: op drains skipped, ack queue full
     uint64_t sessionSignalsDeferred_ = 0; // fix round 2 (finding 9)
 
@@ -4979,18 +5035,28 @@ private:
             // image (one client publication) stops at that frame and the poll
             // moves on to the other images — Aeron's own per-publisher back-
             // pressure (§1a.3); the client's offers back-pressure until it reads
-            // its acks.  One branch when nothing is held (the hot case).
+            // its acks.
+            // D8d: the same ABORT when the session is at its direct budget, or the
+            // worker's direct share is full / congested (stalled sessions first);
+            // an admitted frame is counted until its ack leaves the sink.  One
+            // hash probe per frame (admitDirect).
             workerIngress_->controlledPoll(
                 K,
                 [this, nowNs, &polled]
                 (const uint8_t* data, std::size_t len, aeron::Header& /*hdr*/) {
-                    if (ackSink_->heldAcks() != 0 && len >= kProduceSessionIdEnd) [[unlikely]] {
-                        if (ackSink_->holding(produceSessionIdOf_(data))) {
+                    uint8_t direct = SessionAckSink::kDirectRefused;   // < 16 B: undecodable, never answered
+                    if (len >= kProduceSessionIdEnd) [[likely]] {
+                        direct = ackSink_->admitDirect(produceSessionIdOf_(data));
+                        if (direct == SessionAckSink::kDirectRefused) [[unlikely]] {
                             ++intakePausedFrames_;
                             return aeron::ControlledPollAction::ABORT;
                         }
+                        // Review MEDIUM-2: a CLOSED session's buffered frame is consumed,
+                        // never appended (the gateway's UnknownSession drop).
+                        if (direct == SessionAckSink::kDirectDropClosed) [[unlikely]]
+                            return aeron::ControlledPollAction::CONTINUE;
                     }
-                    polled += handleWorkerIngressFrame_(data, len, nowNs);
+                    polled += handleWorkerIngressFrame_(data, len, nowNs, direct);
                     return aeron::ControlledPollAction::CONTINUE;
                 });
             return polled;
@@ -5031,14 +5097,18 @@ private:
     //       the Produce wire field carries 0=NoAck, 1=Leader, -1=All; treating any
     //       non-zero value as "acks requested" prevents silent false-durability.
     // -----------------------------------------------------------------------
+    // `directAck` (D8d): the admission (SessionAckSink::admitDirect) of this
+    // frame — carried by its answer (exactly one: produceCore_ answers every
+    // path once, now or parked) and given back here if it is undecodable.
     int handleWorkerIngressFrame_(const uint8_t* data, std::size_t len,
-                                  int64_t nowNs) {
+                                  int64_t nowNs, uint8_t directAck = 0) {
         RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
         namespace pc = rune::protocol::client;
 
         // Decode the produce frame.
         auto msgOpt = pc::Produce::decode(data, len);
         if (!msgOpt) {
+            if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
             spdlog::warn("Worker {}: WorkerIngress: failed to decode Produce frame "
                          "len={}; dropping", workerId_, len);
             return 0;
@@ -5064,6 +5134,7 @@ private:
         f.durabilityTier = replica ? replica->durabilityTier() : uint8_t{1};
         f.acksAll       = (msg.acks != 0);
         f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
+        f.directAck     = directAck;
         return produceCore_(f, log, replica, msg.recordBatch, nowNs);
     }
 
@@ -5111,6 +5182,7 @@ private:
         bool    acksAll       = false;
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
         bool    crcValidated  = false;  ///< the op producer validated this batch's CRC (M-3)
+        uint8_t directAck     = 0;      ///< D8d: direct-budget admission (worker ingress only)
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
     };
 
@@ -5122,6 +5194,10 @@ private:
         // Build a WorkerReturn shell for this ack.
         WorkerReturn ret = produceAnswer_(f.fromOp ? ProduceOrigin::GatewayOp : ProduceOrigin::WorkerIngress,
                                           f.sessionId, f.correlationId, f.topicId, f.partition);
+        // D8d: every answer of a direct produce (refusal, append, parked waiter,
+        // HW fire, timeout, §3.2 failure, fsync completion, purge) copies this
+        // shell, so its direct-budget unit returns when THE answer leaves the sink.
+        ret.directAck     = f.directAck;
         ret.producerId    = f.producerId;
         ret.producerEpoch = f.producerEpoch;
         ret.baseSequence  = f.baseSequence;
