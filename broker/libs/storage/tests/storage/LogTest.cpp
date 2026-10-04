@@ -1804,3 +1804,38 @@ TEST(LogWriteFailStopRegression, EveryAppendPathMarksTheLogFailedOnAWriteError) 
         std::filesystem::remove_all(dir);
     }
 }
+
+// Kafka parity (replica-divergence redesign): the leader stamps its REAL
+// partitionLeaderEpoch on every produce-path append — zero-copy (pwritev; the
+// caller's bytes are never mutated), CRC-safe (the field is excluded from the
+// CRC).  -1 (not leading) leaves the producer's bytes untouched.
+TEST(LogRegression, RestampAppendStampsTheLeaderEpochZeroCopy) {
+    auto dir = makeTempDir("rune_log_epoch_stamp");
+    std::filesystem::create_directories(dir);
+    {
+        Log log(dir.string(), 64LL * 1024 * 1024);
+        log.recover();
+        RecordBatchBuilder b(999, 1000);
+        b.append("k", "v", 1000);
+        const auto bytes = b.build();
+        const auto copy  = bytes;
+        int64_t base = -1;
+        log.setLeaderEpochStamp(7);
+        log.appendNoSyncRestamp(bytes.data(), bytes.size(), 0, base);
+        EXPECT_EQ(bytes, copy) << "the caller's batch was mutated";
+        log.setLeaderEpochStamp(-1);
+        log.appendNoSyncRestamp(bytes.data(), bytes.size(), 0, base);
+        const auto out = log.read(0, 1 << 20);
+        RecordBatchReader r0(out.data(), out.size());
+        ASSERT_TRUE(r0.ensureValid());
+        EXPECT_EQ(r0.baseOffset(), 0);
+        EXPECT_EQ(r0.partitionLeaderEpoch(), 7);
+        const std::size_t n0 = static_cast<std::size_t>(r0.totalLength());
+        RecordBatchReader r1(out.data() + n0, out.size() - n0);
+        ASSERT_TRUE(r1.ensureValid());
+        EXPECT_EQ(r1.baseOffset(), 1);
+        EXPECT_EQ(r1.partitionLeaderEpoch(), RecordBatchReader(copy.data(), copy.size()).partitionLeaderEpoch())
+            << "stamp -1 must leave the producer's epoch bytes";
+    }
+    std::filesystem::remove_all(dir);
+}

@@ -270,6 +270,28 @@ public:
     bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override;
 
+    /// Kafka AlterPartition (any thread: MPSC outbound ring).  Routed on the
+    /// control thread to the CURRENT controller (setControllerId); delivered
+    /// locally when this node is the controller.
+    bool sendAlterIsr(const AlterIsrMsg& msg) override;
+    /// MAJOR-2/3: internal-ISR state / ack (control thread; cold).
+    bool sendInternalIsr(NodeId to, const InternalIsrMsg& msg) override;
+    bool sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& msg) override;
+    /// CONTROL thread (controller side): answer an AlterIsr (to `toLeader`;
+    /// self = delivered locally).  Cold.
+    bool sendAlterIsrResponse(NodeId toLeader, const AlterIsrResponseMsg& msg);
+
+    /// CONTROL thread: the current controller (consensus leader) node, -1 unknown.
+    void setControllerId(int32_t id) noexcept { controllerId_ = id; }
+    /// CONTROL thread: the controller-side AlterIsr handler (MetadataService),
+    /// called on the control thread for every AlterIsr this node receives.
+    /// Returns true when `resp` must be sent back to the proposing leader
+    /// (Kafka AlterPartitionResponse — MEDIUM-2).
+    using AlterIsrHandler = bool (*)(void* ctx, const AlterIsrMsg& msg, AlterIsrResponseMsg& resp);
+    void setAlterIsrHandler(AlterIsrHandler fn, void* ctx) noexcept {
+        alterIsrHandler_ = fn; alterIsrCtx_ = ctx;
+    }
+
     /// F3's int32 view of the ONE live ceiling, maxFetchRecordsBytes() (F18):
     /// min(outbound ring bound, publication bound) — worker-safe (both fixed
     /// before any worker runs).  poll()'s FetchRequest/reconcile clamps start
@@ -395,6 +417,7 @@ private:
     // next cycle), so skip-and-retry is the correct policy here.
     // -----------------------------------------------------------------------
     static constexpr int32_t kBroadcast = -1;
+    static constexpr int32_t kController = -2;   ///< resolved to controllerId_ at drain
 
     /// Stack fast-path size for a single encoded wire frame.  A frame that fits is
     /// encoded/framed on the stack (no heap); a LARGER frame (e.g. a big replicated
@@ -462,6 +485,9 @@ private:
     rune::aeronutil::ImageLossWatch              imageWatch_;  // review m-c
 
     NodeId                                 selfId_;
+    int32_t                                controllerId_    = -1;       ///< control thread
+    AlterIsrHandler                        alterIsrHandler_ = nullptr;  ///< control thread
+    void*                                  alterIsrCtx_     = nullptr;
     int64_t                                nowNs_ = 0; ///< updated at top of poll()
 
     // Per-peer egress publications (keyed by NodeId).

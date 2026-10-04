@@ -38,6 +38,9 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <concurrent/logbuffer/FrameDescriptor.h>
 #include <cstdlib>
+#include <cstdio>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cstring>
 
 // Task 13 fix round 3 (re-review 2, finding 2): every shard worker has a bit in
@@ -61,6 +64,35 @@ static constexpr int kIngressCapacity = 64 * 1024; //  64 KiB
 // limit CALLS the transport's/ring's own function; no hand arithmetic here.
 // ---------------------------------------------------------------------------
 namespace {
+
+// KIP-903 (review 2026-10-04 MEDIUM-4): this node's PROCESS incarnation —
+// a counter in the data dir bumped durably (tmp + fsync + rename) on every
+// start, stamped on every FetchRequest.  Cold (once per process).  Falls back
+// to the realtime clock (ns) when the data dir cannot be written.
+int64_t bumpProcessIncarnation(const std::string& dataDir) {
+    const auto fallback = [] {
+        return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+    if (dataDir.empty()) return fallback();
+    const std::string path = dataDir + "/process-incarnation";
+    int64_t prev = 0;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        long long v = 0;
+        if (std::fscanf(f, "%lld", &v) == 1 && v > 0) prev = static_cast<int64_t>(v);
+        std::fclose(f);
+    }
+    const int64_t next = prev + 1;
+    const std::string tmp = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return fallback();
+    char buf[32];
+    const int n = std::snprintf(buf, sizeof buf, "%lld\n", static_cast<long long>(next));
+    const bool ok = n > 0 && ::write(fd, buf, static_cast<std::size_t>(n)) == n && ::fsync(fd) == 0;
+    ::close(fd);
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
+    return next;
+}
 // Task 10 (spec §3.1) + F30: the ONE place a newly built replica's disk
 // durability policy is set — boot (buildReplication) and runtime-created
 // topics (createRuntimeUserReplicas) alike, in shard AND thread placement.
@@ -837,6 +869,78 @@ void BrokerNode::buildReplication() {
     // is available.  This avoids the PartitionReplica assert(transport != nullptr).
     // -----------------------------------------------------------------------
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
+    // KIP-903: every replica of this process stamps the process incarnation.
+    replicaRegistry_->setProcessIncarnation(bumpProcessIncarnation(config_.dataDir));
+    // Review 2026-10-04 MAJOR-2/3: durable internal-ISR knowledge — internal
+    // replicas commit their ISR changes on a majority of it, and the consensus
+    // election votes only for members of its newest internal ISRs.
+    internalIsrKnowledge_ = std::make_unique<rune::replication::InternalIsrKnowledge>(
+        config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
+    replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
+    {
+        // LOW-R4-2: __cluster_metadata is replicated on every configured node.
+        std::vector<int32_t> ids;
+        ids.reserve(config_.peers.size() + 1);
+        for (const auto& peer : config_.peers) ids.push_back(static_cast<int32_t>(peer.id));
+        if (std::find(ids.begin(), ids.end(), static_cast<int32_t>(config_.nodeId)) == ids.end())
+            ids.push_back(static_cast<int32_t>(config_.nodeId));
+        internalIsrKnowledge_->setReplicaSet(std::move(ids));
+    }
+    if (election_) {
+        // MEDIUM-B: RUNE_UNCLEAN_CONSENSUS_ELECTION (default off) leaves the
+        // candidacy gate unwired — a data-blind (unclean) consensus election.
+        if (config_.uncleanConsensusElection)
+            spdlog::warn("BrokerNode[{}]: RUNE_UNCLEAN_CONSENSUS_ELECTION is ON — the consensus "
+                         "candidacy gate is disabled; a node missing committed __cluster_metadata "
+                         "records may be elected (those records are then lost)", config_.nodeId);
+        else {
+            election_->setVoteGate(&rune::replication::InternalIsrKnowledge::voteGate,
+                                   internalIsrKnowledge_.get());
+            // Round-3 CRITICAL-R3: every vote (the candidate's own included) is
+            // gated, so the election participants exchange their newest durable
+            // __cluster_metadata ISR state while canvassing / voting — a node
+            // that missed a committed state learns it from a peer (adopt:
+            // durable, never acked, not term-gated).  Control thread (cold).
+            election_->setCandidacyExchange(
+                [](void* k, rune::consensus::CandidacyState& out) noexcept -> bool {
+                    auto* kn = static_cast<rune::replication::InternalIsrKnowledge*>(k);
+                    try { kn->retryLoadIfPending(); } catch (...) {}
+                    const auto* st = kn->candidacyState();
+                    if (st == nullptr) return false;
+                    out.leaderEpoch = st->leaderEpoch;
+                    out.version     = st->version;
+                    out.count       = st->count;
+                    for (int i = 0; i < st->count && i < rune::consensus::CandidacyState::kMaxMembers; ++i)
+                        out.members[static_cast<std::size_t>(i)] = st->members[static_cast<std::size_t>(i)];
+                    return true;
+                },
+                [](void* k, const rune::consensus::CandidacyState& in) noexcept {
+                    if (in.count < 0 || in.count > rune::replication::InternalIsrState::kMaxMembers) return;
+                    rune::replication::InternalIsrState st{};
+                    st.topicId     = rune::replication::InternalIsrKnowledge::kCandidacyTopicId;
+                    st.partition   = 0;
+                    st.leaderEpoch = in.leaderEpoch;
+                    st.version     = in.version;
+                    st.count       = in.count;
+                    for (int i = 0; i < in.count; ++i)
+                        st.members[static_cast<std::size_t>(i)] = in.members[static_cast<std::size_t>(i)];
+                    try {
+                        (void)static_cast<rune::replication::InternalIsrKnowledge*>(k)->adopt(st);
+                    } catch (...) {}   // a failed adopt leaves the older (safe) knowledge
+                },
+                internalIsrKnowledge_.get());
+        }
+        // Re-review MEDIUM-A: the knowledge refuses (so this node never acks)
+        // an internal ISR state of a leadership older than the consensus term
+        // this node voted in or observed — Raft's term rule applied to the ack.
+        internalIsrKnowledge_->setConsensusTermSource(
+            [](const void* e) noexcept -> int64_t {
+                // MAJOR-R3: the term voted in / followed — never a candidate
+                // term raised by a DENIED RequestVote.
+                return static_cast<int64_t>(static_cast<const Election*>(e)->ackTermId());
+            },
+            election_.get());
+    }
     // Task 10 round 4 (Critical 1): the legacy replication transport resolves
     // every inbound frame through the registry at USE time and holds no replica
     // pointer (a removed partition can never be reached through it).  User
@@ -990,6 +1094,10 @@ void BrokerNode::buildReplication() {
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
             applyWorkerDrivenDurability(*replica, topicId);   // Task 10 + F30
+            // Kafka AlterPartition: user-partition ISR changes go through the
+            // controller (multi-node); internal partitions keep a leader-local ISR.
+            if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
+                replica->setIsrChannel(replTransport_.get());
 
             if (replTransport_) {
                 // DR-BUG-5: register with composite (topicId, partitionId) key so
@@ -1161,6 +1269,8 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
         applyWorkerDrivenDurability(*replica, topicId);   // same policy as boot (F30 fix round 1, F3)
+        if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
+            replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
 
         // User replicas on a per-worker plane are polled by their owning worker —
         // do NOT register them in the legacy transport's routing table (that would
@@ -1779,6 +1889,9 @@ void BrokerNode::buildGateway() {
             // FetchRequest / FetchResponse frames for the offset log are routed here.
             if (replTransport_) {
                 replTransport_->registerReplica(-1, 0, offsetReplica_.get());
+                // Re-review MEDIUM-B: controller-ISR path (Kafka AlterPartition),
+                // multi-node — as a user partition.
+                if (!config_.isSingleNode()) offsetReplica_->setIsrChannel(replTransport_.get());
             }
 
             // Add to replicaRegistry_ so the metadata bridge drives role transitions
@@ -1890,6 +2003,8 @@ void BrokerNode::buildGateway() {
 
             if (replTransport_) {
                 replTransport_->registerReplica(-2, 0, txnReplica_.get());
+                // Re-review MEDIUM-B: controller-ISR path, multi-node.
+                if (!config_.isSingleNode()) txnReplica_->setIsrChannel(replTransport_.get());
             }
 
             if (replicaRegistry_) {
@@ -1907,7 +2022,7 @@ void BrokerNode::buildGateway() {
                 txnReplicaRaw);
             // F15 §5.1: no startup fold — the TransactionCoordinationService
             // folds the store at its coordinator LOAD (txn replica Leader,
-            // leadership complete, HW == LEO); nothing reads the store before.
+            // HW == LEO); nothing reads the store before.
 
             txnCoordService_ = std::make_unique<TransactionCoordinationService>(
                 txnState_.get(),
@@ -2036,6 +2151,11 @@ void BrokerNode::buildGateway() {
                 metaReplicaRaw, nodeId);
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
+            // Kafka AlterPartition: this node's transport hands every AlterIsr it
+            // receives (as the controller) to the MetadataService (control thread).
+            if (replTransport_)
+                replTransport_->setAlterIsrHandler(&MetadataService::onAlterIsrThunk,
+                                                   metadataService_.get());
 
             // MD1 Task 7: wire the MSM into the bridge so USER partitions are
             // driven per-partition from the committed assignment map.
@@ -2079,6 +2199,23 @@ void BrokerNode::buildGateway() {
                 // leadership with ISR<minIsr and every produce is rejected (startup
                 // collapse).  See DynamicBalancerInputs::minIsr.
                 metadataService_->setMinIsr(config_.gatewayMinIsr);
+                metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
+                // Re-review 2026-10-04 MEDIUM-B: the coordinator partitions
+                // (__consumer_offsets, __transaction_state) are on the controller-
+                // ISR path multi-node: this controller assigns them (ISR commits,
+                // election from the ISR, offline without a live member) and the
+                // bridge drives them from the committed map.  Their ISRs no longer
+                // gate the consensus — only __cluster_metadata's does.
+                if (replTransport_ && !config_.isSingleNode()) {
+                    std::vector<rune::metadata::PartitionKey> coord;
+                    for (int32_t t : {-1, -2})
+                        if (replicaRegistry_ && replicaRegistry_->lookup(t, 0) != nullptr)
+                            coord.push_back(rune::metadata::PartitionKey{t, 0});
+                    if (!coord.empty()) {
+                        metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);
+                        if (replBridge_) replBridge_->setCoordinatorPartitionsOnController(true);
+                    }
+                }
                 spdlog::info(
                     "BrokerNode[{}]: MetadataService configured for assignment emit "
                     "({} user topics, {} nodes, minIsr={})",

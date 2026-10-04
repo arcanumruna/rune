@@ -479,6 +479,7 @@ public:
         case WorkerOp::Type::ReconcileFetchResp:
         case WorkerOp::Type::OffsetsForLeaderEpochResp:
         case WorkerOp::Type::ReconcileFetchReq:
+        case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::Subscribe:
             return true;

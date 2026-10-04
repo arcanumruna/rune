@@ -166,7 +166,9 @@ bool AeronPartitionTransport::sendFetchRequest(const FetchRequestMsg& req)
         req.followerId,
         req.fetchOffset,
         maxBytes,
-        req.topicId);
+        req.topicId,
+        req.lastFetchedEpoch,
+        req.incarnation);
     return enqueueOutbound(kBroadcast, wire, len);
 }
 
@@ -231,7 +233,7 @@ bool AeronPartitionTransport::sendReconcileRequest(
     const std::size_t len = FetchRequestMsg::encode(
         wire, 0,
         req.leaderEpoch, req.partition, req.followerId,
-        req.fetchOffset, maxBytes, req.topicId);
+        req.fetchOffset, maxBytes, req.topicId, req.lastFetchedEpoch, req.incarnation);
     stampTemplateId(wire, 0, kReconcileFetchReqTemplateId);
     return enqueueOutbound(toPeer, wire, len);
 }
@@ -336,6 +338,39 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
 // file statics shared by every in-process node).
 static const bool g_txRateLog = diagFlagFromEnv(std::getenv("RUNE_FS_LOG"));
 
+bool AeronPartitionTransport::sendAlterIsr(const AlterIsrMsg& msg)
+{
+    uint8_t wire[AlterIsrMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    return len != 0 && enqueueOutbound(kController, wire, len);
+}
+
+bool AeronPartitionTransport::sendInternalIsr(NodeId to, const InternalIsrMsg& msg)
+{
+    uint8_t wire[InternalIsrMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    return len != 0 && enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
+bool AeronPartitionTransport::sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& msg)
+{
+    uint8_t wire[InternalIsrAckMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    return len != 0 && enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
+bool AeronPartitionTransport::sendAlterIsrResponse(NodeId toLeader, const AlterIsrResponseMsg& msg)
+{
+    uint8_t wire[AlterIsrResponseMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0) return false;
+    if (toLeader == static_cast<NodeId>(selfId_)) {   // controller == leader: local
+        (void)handleFrame_(wire, len);
+        return true;
+    }
+    return enqueueOutbound(static_cast<int32_t>(toLeader), wire, len);
+}
+
 bool AeronPartitionTransport::enqueueOutbound(int32_t        targetNodeId,
                                               const uint8_t* wire,
                                               std::size_t    len)
@@ -404,10 +439,21 @@ int AeronPartitionTransport::drainOutbound()
         dec.wrapForDecode(fbase, isbe::MessageHeader::encodedLength(),
                           mh.blockLength(), mh.version(),
                           static_cast<std::uint64_t>(length));
-        const int32_t target = dec.targetNodeId();
+        int32_t target = dec.targetNodeId();
         const std::string_view pv = dec.getPayloadAsStringView();
         const uint8_t* wire = reinterpret_cast<const uint8_t*>(pv.data());
         const std::size_t wlen = pv.size();
+        if (target == kController) [[unlikely]] {
+            // AlterIsr: to the current controller.  Unknown controller → dropped
+            // (the leader re-sends on its cadence); self → delivered locally.
+            if (controllerId_ < 0) { ++txOutDrained_; return true; }
+            if (controllerId_ == static_cast<int32_t>(selfId_)) {
+                (void)handleFrame_(wire, wlen);
+                ++txOutDrained_;
+                return true;
+            }
+            target = controllerId_;
+        }
         const bool consumed = holdRouter_.route(offer, target, wire, wlen);
         if (consumed) {
             // Control-clock: frame drained from the outbound ring (offered or held).
@@ -520,9 +566,60 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
 
     const uint16_t tid = hdr.templateId;
 
+    if (tid == AlterIsrMsg::TEMPLATE_ID) [[unlikely]] {
+        AlterIsrMsg m{};
+        AlterIsrResponseMsg resp{};
+        if (AlterIsrMsg::decode(buf, len, m) && alterIsrHandler_ != nullptr &&
+            alterIsrHandler_(alterIsrCtx_, m, resp))
+            (void)sendAlterIsrResponse(m.leaderId, resp);   // a refused answer: the leader re-sends
+        return Action::CONTINUE;
+    }
+    if (tid == InternalIsrMsg::TEMPLATE_ID || tid == InternalIsrAckMsg::TEMPLATE_ID) [[unlikely]] {
+        // MAJOR-2/3: internal partitions only — their replicas are driven on
+        // this (control) thread.
+        if (tid == InternalIsrMsg::TEMPLATE_ID) {
+            InternalIsrMsg m{};
+            if (InternalIsrMsg::decode(buf, len, m) && m.topicId < 0)
+                if (PartitionReplica* rep = resolveReplica_(m.topicId, m.partition)) rep->onInternalIsr(m);
+        } else {
+            InternalIsrAckMsg m{};
+            if (InternalIsrAckMsg::decode(buf, len, m) && m.topicId < 0)
+                if (PartitionReplica* rep = resolveReplica_(m.topicId, m.partition)) rep->onInternalIsrAck(m);
+        }
+        return Action::CONTINUE;
+    }
+    if (tid == AlterIsrResponseMsg::TEMPLATE_ID) [[unlikely]] {
+        // MEDIUM-2: the controller's answer → the partition leader replica, on
+        // its owning thread (a USER replica's worker; inline otherwise).
+        AlterIsrResponseMsg r{};
+        if (!AlterIsrResponseMsg::decode(buf, len, r)) return Action::CONTINUE;
+        if (r.topicId < 0) {
+            // A coordinator partition (controller-ISR path, re-review MEDIUM-B):
+            // internal replicas are driven on this (control) thread.
+            if (PartitionReplica* rep = resolveReplica_(r.topicId, r.partition)) rep->onAlterIsrResponse(r);
+            return Action::CONTINUE;
+        }
+        if (workerPool_) {
+            rune::node::WorkerOp op;
+            op.type               = rune::node::WorkerOp::Type::AlterIsrResponse;
+            op.topicId            = r.topicId;
+            op.partition          = r.partition;
+            op.roleEpoch          = r.leaderEpoch;
+            op.rolePartitionEpoch = r.partitionEpoch;
+            op.replicatedPayload.errorCode = r.errorCode;
+            if (!workerPool_->tryEnqueueOp(r.topicId, r.partition, std::move(op)))
+                return Action::ABORT;   // worker ring full → re-delivered next cycle
+            return Action::CONTINUE;
+        }
+        PartitionReplica* rep = registry_ ? registry_->lookup(r.topicId, r.partition)
+                                          : resolveReplica_(r.topicId, r.partition);
+        if (rep != nullptr) rep->onAlterIsrResponse(r);
+        return Action::CONTINUE;
+    }
+
     if (tid == FetchRequestMsg::TEMPLATE_ID) {
         // Minimum size check.
-        if (len < FetchRequestMsg::TOTAL_SIZE) {
+        if (len < FetchRequestMsg::MIN_SIZE) {
             spdlog::trace("AeronPartitionTransport: FetchRequest truncated ({} bytes)", len);
             return Action::CONTINUE;
         }
@@ -593,6 +690,8 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.fetchRequestPayload.fetchOffset   = req.fetchOffset;
             op.fetchRequestPayload.maxBytes      = req.maxBytes;
             op.fetchRequestPayload.topicId       = req.topicId;
+            op.fetchRequestPayload.lastFetchedEpoch = req.lastFetchedEpoch;
+            op.fetchRequestPayload.incarnation      = req.incarnation;   // KIP-903
             op.fetchRequestPayload.nowNs         = nowNs_;
             op.fetchRequestPayload.connGen       = peerConnGen_(req.followerId);   // R1
             if (!workerPool_->tryEnqueueOp(req.topicId, req.partition, std::move(op))) {
@@ -612,7 +711,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
     } else if (tid == FetchResponseMsg::TEMPLATE_ID) {
         // Minimum valid frame = the zero-records framing (SBE header + block +
         // records length-prefix), from the generated codec.
-        const std::size_t kMinResponseSize = FetchResponseMsg::encodedSize(0);
+        const std::size_t kMinResponseSize = FetchResponseMsg::MIN_SIZE;
         if (len < kMinResponseSize) {
             spdlog::trace("AeronPartitionTransport: FetchResponse truncated ({} bytes)", len);
             return Action::CONTINUE;
@@ -802,7 +901,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // DR-BUG-6: reverse pull request (deficient leader → survivor).  Reuses
         // the FetchRequest layout.  Cap maxBytes to the requesting peer's
         // deliverable ceiling (same rationale as the normal FetchRequest path).
-        if (len < FetchRequestMsg::TOTAL_SIZE) return Action::CONTINUE;
+        if (len < FetchRequestMsg::MIN_SIZE) return Action::CONTINUE;
         FetchRequestMsg req = FetchRequestMsg::decode(buf, 0);
         PartitionReplica* const rep = resolveReplica_(req.topicId, req.partition);
         if (rep == nullptr) return Action::CONTINUE;
@@ -842,7 +941,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
     } else if (tid == kReconcileFetchRespTemplateId) {
         // DR-BUG-6: reverse pull response (survivor → deficient leader).  Reuses
         // the FetchResponse layout.
-        const std::size_t kMinResp = FetchResponseMsg::encodedSize(0);
+        const std::size_t kMinResp = FetchResponseMsg::MIN_SIZE;
         if (len < kMinResp) return Action::CONTINUE;
         const FetchResponseMsg resp = FetchResponseMsg::decode(buf, 0, len);
         PartitionReplica* const rep = resolveReplica_(resp.topicId, resp.partition);

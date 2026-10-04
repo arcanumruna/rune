@@ -39,6 +39,9 @@ public:
     // ConsensusPublisher interface
     // -------------------------------------------------------------------------
 
+    void candidacyState(NodeId toMember, NodeId fromMember,
+                        const CandidacyState& state) override;
+
     void canvassPosition(
         NodeId  toMember,
         Term    logLeadershipTermId,

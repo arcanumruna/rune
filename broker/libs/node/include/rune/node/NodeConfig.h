@@ -377,6 +377,23 @@ struct NodeConfig {
     // Also forwarded to PartitionConfig::minIsr in buildReplication().
     int32_t gatewayMinIsr = 1;
 
+    // Review 2026-10-04 MEDIUM-3 (RUNE_SURVIVOR_LEADER_ELECTION, default false):
+    // opt-in position-proven survivor election for a partition whose committed
+    // ISR has no live member (Kafka unclean.leader.election.enable analog).
+    bool survivorLeaderElection = false;
+
+    // Re-review 2026-10-04 MEDIUM-B (RUNE_UNCLEAN_CONSENSUS_ELECTION, default
+    // false): operator escape hatch for the consensus candidacy gate.  Normally
+    // a node votes only for a candidate in the newest durable __cluster_metadata
+    // ISR it knows (InternalIsrKnowledge) — if no live node is in it, the
+    // consensus stays leaderless until a member returns (Kafka: an offline
+    // partition).  ON = the gate is not wired: the election is data-blind and a
+    // node missing committed metadata records may win (they are then LOST —
+    // the analog of unclean.leader.election.enable for the metadata log).  Set
+    // it only to recover a cluster whose metadata ISR members are gone for
+    // good, then turn it off again.
+    bool uncleanConsensusElection = false;
+
     // Milestone E1: number of in-process partition workers. Each owned shard is
     // assigned to worker = hash(shardId) % workerCount (ShardRouter). Default 1
     // (single-owner, identical to the pre-E1 single-agent behaviour). Overridable

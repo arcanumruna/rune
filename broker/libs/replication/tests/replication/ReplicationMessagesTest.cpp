@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <climits>
 
@@ -38,9 +39,10 @@ TEST(ReplicationMessages, SchemaIdIs112) {
     EXPECT_EQ(kSchemaId, 112);
 }
 
-TEST(ReplicationMessages, SchemaVersionIs2) {
-    // DR-BUG-5: version bumped from 1→2 when topicId was added to FetchRequest/FetchResponse.
-    EXPECT_EQ(kSchemaVersion, 2);
+TEST(ReplicationMessages, SchemaVersionIs3) {
+    // DR-BUG-5: 1→2 (topicId); KIP-320/595: 2→3 (FetchRequest.lastFetchedEpoch,
+    // FetchResponse.divergingEpoch / divergingEndOffset).
+    EXPECT_EQ(kSchemaVersion, 3);
 }
 
 TEST(ReplicationMessages, FetchRequestTemplateId) {
@@ -52,22 +54,126 @@ TEST(ReplicationMessages, FetchResponseTemplateId) {
 }
 
 TEST(ReplicationMessages, FetchRequestBlockLength) {
-    // DR-BUG-5: 2×int64 + 4×int32 = 16 + 16 = 32 (topicId added)
-    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 32u);
+    // v3: 3×int64 + 5×int32 = 24 + 20 = 44 (lastFetchedEpoch + KIP-903 incarnation; v2 was 32)
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH, 44u);
+    EXPECT_EQ(FetchRequestMsg::BLOCK_LENGTH_V2, 32u);
 }
 
 TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
     // SBE tight-packs the block (no alignment pad): int64+int32+int64+int64+int16+int32
     // = 8+4+8+8+2+4 = 34.  (The pre-SBE hand-rolled layout inserted a 2-byte pad after
     // errorCode → 36; SBE owns sizing now, and both nodes run the same generated codec.)
+    // Unchanged in v3 (the DivergingEpoch answer rides in an error frame's payload).
     EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 34u);
 }
 
 TEST(ReplicationMessages, FetchRequestTotalSize) {
     EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE,
               ReplicationMessageHeader::ENCODED_SIZE + FetchRequestMsg::BLOCK_LENGTH);
-    // DR-BUG-5: 8 (header) + 32 (block) = 40 (was 36 before topicId was added)
-    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 40u);
+    // v3: 8 (header) + 44 (block) = 52; a v2 frame (40) is still decodable.
+    EXPECT_EQ(FetchRequestMsg::TOTAL_SIZE, 52u);
+    EXPECT_EQ(FetchRequestMsg::MIN_SIZE, 40u);
+}
+
+// KIP-320/595 wire compatibility: a v3 FetchRequest carries lastFetchedEpoch;
+// a v2 frame (32-byte block) decodes as lastFetchedEpoch = -1 (no validation).
+TEST(ReplicationMessages, FetchRequestLastFetchedEpochV3RoundTripAndV2Absent) {
+    uint8_t buf[64]{};
+    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 77, 1 << 20, 9, /*lastFetchedEpoch=*/3), 52u);
+    FetchRequestMsg m = FetchRequestMsg::decode(buf, 0);
+    EXPECT_EQ(m.fetchOffset, 77);
+    EXPECT_EQ(m.topicId, 9);
+    EXPECT_EQ(m.lastFetchedEpoch, 3);
+    // A v2 sender: blockLength 32 in the header, no field after topicId.
+    uint8_t v2[64]{};
+    (void)FetchRequestMsg::encode(v2, 0, 4, 1, 2, 77, 1 << 20, 9, 3);
+    v2[0] = 32; v2[1] = 0;                            // header blockLength = 32
+    v2[6] = 2;  v2[7] = 0;                            // header version = 2
+    std::memset(v2 + 8 + 32, 0x5A, 4);                // garbage past the v2 block
+    m = FetchRequestMsg::decode(v2, 0);
+    EXPECT_EQ(m.fetchOffset, 77);
+    EXPECT_EQ(m.lastFetchedEpoch, kLastFetchedEpochV2Frame) << "a v2 frame is marked (fail closed)";
+}
+
+// KIP-320/595 (fix round 1): data frames keep their 46-byte framing; the
+// DivergingEpoch / OffsetOutOfRange answer is a 12-byte payload of a record-less
+// error frame.  A v2 frame is refused (fail closed): decoded as
+// kErrUnsupportedWireVersion with no records.
+TEST(ReplicationMessages, FetchResponseErrorPayloadV3AndV2FailClosed) {
+    EXPECT_EQ(FetchResponseMsg::encodedSize(0), 46u) << "data-frame framing must stay 46 B";
+    uint8_t buf[256]{};
+    ErrorPayloadBuf epb;
+    const std::size_t n = FetchResponseMsg::encode(buf, 0, 4, 1, 10, 0, static_cast<int16_t>(-7),
+                                                   epb.set(2, 33), 9);
+    FetchResponseMsg m = FetchResponseMsg::decode(buf, 0, n);
+    EXPECT_EQ(m.errorCode, -7);
+    ErrorPayload ep{};
+    ASSERT_TRUE(ErrorPayload::decode(m.records, ep));
+    EXPECT_EQ(ep.epoch, 2);
+    EXPECT_EQ(ep.endOffset, 33);
+    // The same frame stamped as a v2 sender's: refused.
+    buf[6] = 2; buf[7] = 0;
+    m = FetchResponseMsg::decode(buf, 0, n);
+    EXPECT_EQ(m.errorCode, kErrUnsupportedWireVersion);
+    EXPECT_TRUE(m.records.empty());
+}
+
+// AlterIsr (template 7) round-trip.
+TEST(ReplicationMessages, AlterIsrRoundTrip) {
+    AlterIsrMsg a{};
+    a.topicId = 3; a.partition = 2; a.leaderId = 1; a.leaderEpoch = 9; a.isrCount = 2;
+    a.isr[0] = 1; a.isr[1] = 3;
+    a.partitionEpoch = 17;
+    EXPECT_EQ(AlterIsrMsg::TOTAL_SIZE, 8u + 92u);
+    uint8_t buf[AlterIsrMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(a.encode(buf, sizeof buf), AlterIsrMsg::TOTAL_SIZE);
+    EXPECT_EQ(peekTemplateId(buf), AlterIsrMsg::TEMPLATE_ID);
+    AlterIsrMsg b{};
+    ASSERT_TRUE(AlterIsrMsg::decode(buf, sizeof buf, b));
+    EXPECT_EQ(b.topicId, 3); EXPECT_EQ(b.partition, 2); EXPECT_EQ(b.leaderId, 1);
+    EXPECT_EQ(b.leaderEpoch, 9); EXPECT_EQ(b.isrCount, 2); EXPECT_EQ(b.isr[1], 3);
+    EXPECT_EQ(b.partitionEpoch, 17);
+}
+
+// AlterIsrResponse / InternalIsr / InternalIsrAck (templates 8-10) round-trips.
+TEST(ReplicationMessages, AlterIsrResponseAndInternalIsrRoundTrip) {
+    AlterIsrResponseMsg r{};
+    r.topicId = 3; r.partition = 2; r.leaderId = 1; r.leaderEpoch = 9; r.partitionEpoch = 12;
+    r.errorCode = kAlterIsrIneligibleReplica;
+    uint8_t rb[AlterIsrResponseMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(r.encode(rb, sizeof rb), AlterIsrResponseMsg::TOTAL_SIZE);
+    EXPECT_EQ(peekTemplateId(rb), AlterIsrResponseMsg::TEMPLATE_ID);
+    AlterIsrResponseMsg r2{};
+    ASSERT_TRUE(AlterIsrResponseMsg::decode(rb, sizeof rb, r2));
+    EXPECT_EQ(r2.leaderEpoch, 9); EXPECT_EQ(r2.partitionEpoch, 12);
+    EXPECT_EQ(r2.errorCode, kAlterIsrIneligibleReplica);
+
+    InternalIsrMsg i{};
+    i.topicId = -3; i.partition = 0; i.leaderId = 2; i.leaderEpoch = 7; i.version = 41;
+    i.isrCount = 2; i.isr[0] = 2; i.isr[1] = 3;
+    uint8_t ib[InternalIsrMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(i.encode(ib, sizeof ib), InternalIsrMsg::TOTAL_SIZE);
+    InternalIsrMsg i2{};
+    ASSERT_TRUE(InternalIsrMsg::decode(ib, sizeof ib, i2));
+    EXPECT_EQ(i2.topicId, -3); EXPECT_EQ(i2.version, 41); EXPECT_EQ(i2.isrCount, 2); EXPECT_EQ(i2.isr[1], 3);
+
+    InternalIsrAckMsg k{};
+    k.topicId = -3; k.partition = 0; k.followerId = 3; k.leaderEpoch = 7; k.version = 41;
+    uint8_t kb[InternalIsrAckMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(k.encode(kb, sizeof kb), InternalIsrAckMsg::TOTAL_SIZE);
+    InternalIsrAckMsg k2{};
+    ASSERT_TRUE(InternalIsrAckMsg::decode(kb, sizeof kb, k2));
+    EXPECT_EQ(k2.followerId, 3); EXPECT_EQ(k2.version, 41); EXPECT_EQ(k2.leaderEpoch, 7);
+}
+
+// KIP-903: the FetchRequest carries the follower's process incarnation.
+TEST(ReplicationMessages, FetchRequestCarriesIncarnation) {
+    uint8_t buf[FetchRequestMsg::TOTAL_SIZE]{};
+    ASSERT_EQ(FetchRequestMsg::encode(buf, 0, 4, 1, 2, 99, 1024, 7, 3, 0x1234567890LL),
+              FetchRequestMsg::TOTAL_SIZE);
+    const auto m = FetchRequestMsg::decode(buf, 0);
+    EXPECT_EQ(m.lastFetchedEpoch, 3);
+    EXPECT_EQ(m.incarnation, 0x1234567890LL);
 }
 
 TEST(ReplicationMessages, HeaderEncodedSize) {

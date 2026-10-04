@@ -9,6 +9,7 @@
 // Constructed in BrokerNode::start() after TopicRegistry (so Log* are valid).
 
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/replication/Types.h>
 
 #include <algorithm>
@@ -31,6 +32,16 @@ public:
     // -----------------------------------------------------------------------
     // add — register a pre-constructed PartitionReplica.
     // -----------------------------------------------------------------------
+    /// KIP-903 (review 2026-10-04 MEDIUM-4): this node's PROCESS incarnation
+    /// (monotonic per node, bumped on every start — BrokerNode), stamped on
+    /// every replica added from now on.  Set before the first add().
+    void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    /// MAJOR-2/3: the node's durable internal-ISR knowledge, wired into the
+    /// __cluster_metadata replica (MEDIUM-B: only it) added from now on.
+    /// Non-owning.
+    void setInternalIsrKnowledge(rune::replication::InternalIsrKnowledge* k) noexcept { internalIsrKnowledge_ = k; }
+    [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
+
     void add(int32_t topicId, int32_t partition,
              std::unique_ptr<rune::replication::PartitionReplica> replica)
     {
@@ -44,6 +55,16 @@ public:
         else id = nextId_++;
         const uint32_t inc = allocIncarnation_();
         replica->setRegistryHandle(id, inc);
+        // KIP-903: every replica of this process stamps the node's process
+        // incarnation on its FetchRequests (0 = untracked: unit rigs).
+        if (processIncarnation_ != 0) replica->setProcessIncarnation(processIncarnation_);
+        // MAJOR-2/3: internal replicas commit ISR changes on a majority's
+        // durable knowledge (this node's store).
+        // MEDIUM-B: only __cluster_metadata (the coordinator partitions are on
+        // the controller-ISR path; __topic_schemas is not in this registry).
+        if (topicId == rune::replication::InternalIsrKnowledge::kCandidacyTopicId &&
+            internalIsrKnowledge_ != nullptr)
+            replica->setInternalIsrKnowledge(internalIsrKnowledge_);
         auto* raw = replica.get();
         map_[key] = Entry{std::move(replica), id, inc};
         ordered_.push_back(raw);
@@ -265,6 +286,8 @@ private:
     };
     std::vector<Retired>  retired_;
     std::vector<uint32_t> freeIds_;
+    int64_t processIncarnation_ = 0;   ///< KIP-903 (see setProcessIncarnation)
+    rune::replication::InternalIsrKnowledge* internalIsrKnowledge_ = nullptr;   ///< MAJOR-2/3
     uint32_t              nextId_          = 1;   // 0 = unregistered (not gated)
     uint32_t              nextIncarnation_ = 1;
     bool                  wrapped_         = false;

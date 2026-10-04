@@ -546,7 +546,8 @@ int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
     const int64_t base       = logEndOffset_;
     const int64_t lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
     outBaseOffset = base;
-    logEndOffset_ = activeSegment().appendNoSyncRestamp(batch, len, base, lastOffset);
+    logEndOffset_ = activeSegment().appendNoSyncRestamp(batch, len, base, lastOffset,
+                                                          leaderEpochStamp_);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
         rune::protocol::RecordBatchReader r(batch, len);
         int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
@@ -574,10 +575,19 @@ int64_t Log::logStartOffset() const noexcept {
     if (segments_.empty()) return 0;
     return segments_.begin()->first;
 }
+std::vector<Log::SyncedExtent> Log::syncedExtentsForTest() const {
+    std::vector<SyncedExtent> out;
+    out.reserve(segments_.size());
+    for (const auto& [base, seg] : segments_)
+        out.push_back(SyncedExtent{seg->logPath(), seg->syncedBytesForTest()});
+    return out;
+}
+
 int64_t Log::recover() {
     int64_t next = 0;
     for (auto& [base, seg] : segments_) next = seg->recover();
     logEndOffset_ = next;
+    recovered_ = true;
 
     // CP-5.1 FIX (retention-after-restart): compute the REAL largestTimestamp for
     // every SEALED segment by scanning its batches for the max maxTimestamp() value.
@@ -859,6 +869,9 @@ void Log::truncateTo(int64_t truncateOffset) {
         auto newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
                                                     indexMaxBytes_, /*prefaultIndex*/false,
                                                     /*eagerReadMap*/true);
+        // E2 crash seam: the surviving prefix keeps what was already synced.
+        newSeg->inheritSyncedBytesForTest(
+            std::min<int64_t>(seg.syncedBytesForTest(), static_cast<int64_t>(cutPos)));
         // T10: install_ retires the old segment (kept open while a flush is
         // in flight on it — M1) instead of closing its fd under the flush.
         install_(base, std::move(newSeg));

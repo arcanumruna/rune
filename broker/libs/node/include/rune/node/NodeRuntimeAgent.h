@@ -266,6 +266,8 @@ private:
             const rune::replication::Epoch epoch =
                 static_cast<rune::replication::Epoch>(election_->leadershipTermId());
             work += bridge_->doWork(lid, epoch);
+            // AlterIsr proposals route to the CURRENT controller (consensus leader).
+            if (transport_) transport_->setControllerId(static_cast<int32_t>(lid));
             // M1: an invariant violation caught at the bridge's noexcept
             // boundary joins the uniform halt path below (exit 70).
             if (std::string what; bridge_->takeFatal(what)) throw std::logic_error(what);
@@ -330,6 +332,19 @@ private:
                     3 * election_->leaderHeartbeatTimeoutNs();
                 const std::size_t n = election_->eligibleNodeIds(
                     nowNs, failoverTimeoutNs, eligBuf_.data(), eligBuf_.size());
+
+                // Kafka broker fencing for INTERNAL partitions (led here, leader-
+                // local ISR): a member the cluster considers dead leaves the ISR
+                // at once — with HW = min over the ISR it would otherwise hold the
+                // HW (metadata commits!) for replicaLagMaxMs.
+                if (n > 0 && registry_) {
+                    for (auto* replica : registry_->allReplicas()) {
+                        if (replica && replica->topicId() < 0 &&
+                            replica->role() == rune::replication::Role::Leader)
+                            replica->shrinkIsrToLive(
+                                std::span<const int32_t>(eligBuf_.data(), n), nowNs);
+                    }
+                }
 
                 // Track eligible-set changes (kept for diagnostics / future gating).
                 const bool changed =
@@ -461,7 +476,14 @@ private:
             if (gateway_ && routingVersion != routingVersionBuilt_) {
                 routingVersionBuilt_ = routingVersion;
                 const auto& cmap = metadataService_->committedMap();
-                if (!cmap.empty()) {
+                // Coordinator partitions (re-review MEDIUM-B) are in the map
+                // too: "committed metadata ready" means a USER assignment.
+                // Cold (routing-version change only).
+                bool anyUser = false;
+                cmap.forEach([&](int32_t tid, int32_t, const rune::metadata::PartitionAssignment&) {
+                    anyUser = anyUser || tid >= 0;
+                });
+                if (anyUser) {
                     // Steady state: use the committed assignment map.
                     auto img = rune::metadata::RoutingImage::buildFromMap(
                         cmap, rune::metadata::gpidOf);

@@ -148,6 +148,12 @@ protected:
                                                           Role::Follower, 1, replicas, replicas,
                                                           &followerLog, &transport);
             transport.addFollower(kFollowerId, follower.get());
+            // KIP-320/595: the follower reports in (a validated pure ack on its
+            // empty log) — a leader pushes only to validated followers.
+            (void)leader->onFetchRequest(fetchReq(0, 0), 0);
+            transport.pump(0);
+            transport.fetchResponses.clear();
+            transport.fetchErrors.clear();
         }
     }
     // big (offset 0), small (1), small (2)
@@ -246,22 +252,8 @@ TEST_F(LargeBatchReplicationRegression, PushServesWholeOversizedBatch) {
     EXPECT_EQ(leader->highWatermark(), 1);
 }
 
-// Reconcile / catch-up serve path: an ahead survivor serves the oversized first
-// batch whole even when the pull's maxBytes is smaller.
-TEST_F(LargeBatchReplicationRegression, ReconcileServesWholeOversizedFirstBatch) {
-    build(false, false);
-    appendBigThenSmalls();
-    leader->onReconcileRequest(fetchReq(0, kMaxBytes));
-    ASSERT_EQ(transport.reconcileResponses.size(), 1u);
-    const auto served = batchesOf(transport.reconcileResponses.back());
-    ASSERT_EQ(served.size(), 1u);
-    EXPECT_EQ(served[0].base, 0);
-    EXPECT_GT(served[0].bytes, static_cast<std::size_t>(kMaxBytes));
-
-    leader->onReconcileRequest(fetchReq(1, kMaxBytes));
-    ASSERT_EQ(transport.reconcileResponses.size(), 2u);
-    EXPECT_EQ(batchesOf(transport.reconcileResponses.back()).size(), 2u);
-}
+// (ReconcileServesWholeOversizedFirstBatch retired with the DR-BUG-6 reverse
+//  reconcile: a leader never pulls records it did not hold when elected.)
 
 // ===========================================================================
 // F18 fix round 1 (I-1): an UNSERVABLE batch must never stall silently.

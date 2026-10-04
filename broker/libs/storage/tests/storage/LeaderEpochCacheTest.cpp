@@ -129,14 +129,17 @@ TEST(LeaderEpochCache, EndOffsetForEpoch_RequestedHigherThanLatest_ReturnsLeo) {
 // DR-BUG-6e: leader has NO epoch <= requested (requested predates the cache)
 // → responseEpoch = -1, endOffset = start of the earliest cached epoch
 // (everything the follower has for requested epoch is divergent).
-TEST(LeaderEpochCache, EndOffsetForEpoch_NoSharedEpoch_ReturnsEarliestStart) {
+// Fix round 1 (MEDIUM-5, Kafka parity): an epoch older than the earliest cached
+// one answers (requestedEpoch, earliest start) — a "-1" answer drove a follower
+// to truncate its whole log.
+TEST(LeaderEpochCacheRegression, EndOffsetForEpoch_OlderThanEarliest_ReturnsRequestedEpochAndEarliestStart) {
     LeaderEpochCache c;
-    c.assign(5, 0);
+    c.assign(5, 40);
     c.assign(6, 100);
-    // Follower asks about epoch 2; leader's earliest epoch is 5.
+    // Follower asks about epoch 2; leader's earliest epoch is 5 (starting at 40).
     auto r = c.endOffsetForEpoch(/*requestedEpoch=*/2, /*logEndOffset=*/200);
-    EXPECT_EQ(r.first,  -1) << "leader has no epoch <= 2";
-    EXPECT_EQ(r.second, 0)  << "shared history ends at the leader's earliest start (0)";
+    EXPECT_EQ(r.first,  2)  << "Kafka: the requested epoch itself";
+    EXPECT_EQ(r.second, 40) << "ends where the earliest cached epoch starts";
 }
 
 // DR-BUG-6f: empty cache → responseEpoch = -1, endOffset = 0.

@@ -582,6 +582,10 @@ bool LogCleaner::rewriteSegmentImpl(
                 // CP-10 ULL: use buildInto(tmpBatch) — reuses capacity, avoids per-record alloc.
                 b.buildInto(tmpBatch);
                 auto& batch = tmpBatch;
+                // Kafka parity: a rebuilt batch keeps the partitionLeaderEpoch of
+                // the batch it came from (CRC-excluded field) — the epoch lineage
+                // (KIP-320 fetch validation, epoch-cache rebuilds) survives compaction.
+                rune::protocol::RecordBatchReader::stampLeaderEpoch(batch.data(), r.partitionLeaderEpoch());
 
                 // A2: Patch producerId, producerEpoch, baseSequence into the
                 // rebuilt batch.  The record's sequence number within the
@@ -1349,6 +1353,8 @@ void LogCleaner::mergeGroupWithMap(
                     b2.append(key, val, timestamp);
                     b2.buildInto(tmpBatch);
                     auto& batch = tmpBatch;
+                    // Kafka parity: keep the source batch's partitionLeaderEpoch.
+                    rune::protocol::RecordBatchReader::stampLeaderEpoch(batch.data(), r.partitionLeaderEpoch());
                     // A2: Patch producer identity.
                     {
                         uint64_t u = static_cast<uint64_t>(origProducerId);

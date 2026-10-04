@@ -17,6 +17,7 @@
 #include <rune/replication/PartitionFailoverCoordinator.h>
 #include <rune/replication/FileRecordingStore.h>
 #include <rune/replication/IsrManager.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 
@@ -436,6 +437,17 @@ TEST_F(TwoReplicaTest, VeryStaleEpochRejected) {
 
 // Tests epoch-change truncation: a follower that has divergent tail records
 // from an old epoch must truncate before applying the new leader's data.
+
+// KIP-320/595: a leader pushes to (and counts) a follower only after a fetch of
+// that follower passed lineage validation in the current leadership — let the
+// followers report in (one validated fetch each) before the scenario.
+[[maybe_unused]] static void reportIn(rune::replication::PartitionReplica& leader,
+                                      std::initializer_list<rune::replication::PartitionReplica*> followers,
+                                      rune::replication::InMemoryTransport& t, int64_t nowNs = 0) {
+    for (auto* f : followers) (void)leader.onFetchRequest(f->nextFetch(), nowNs);
+    t.pump(nowNs);
+}
+
 TEST(EpochChangeTruncationTest, FollowerTruncatesDivergentTailOnEpochChange) {
     // Setup: leader epoch=2 (new). Follower previously had epoch=1 data.
     TempDir leaderDir("ep_leader");
@@ -606,6 +618,40 @@ TEST(EpochChangeTruncationTest, NoCommittedRecordLostOnEpochChange) {
     EXPECT_FALSE(bytes.empty()) << "Committed record lost after epoch change";
 }
 
+// Seed a replica's log as if replicated from the epoch-`ep` leader: `count`
+// single-record batches at [base, base+count), STAMPED with `ep` (Kafka: the
+// leader's partitionLeaderEpoch rides on every batch), advertised HW `hw`.  A
+// replica behind `ep` first follows that epoch (as the control plane would).
+static void seedStamped(PartitionReplica& r, int64_t base, int count, Epoch ep,
+                        Offset hw, uint8_t fill = 'r') {
+    std::vector<uint8_t> all;
+    for (int i = 0; i < count; ++i) {
+        rune::protocol::RecordBatchBuilder bld(base + i, 0);
+        const char v[3] = {static_cast<char>(fill), static_cast<char>(fill), static_cast<char>(fill)};
+        bld.append(std::string_view{}, std::string_view(v, 3), 0);
+        auto one = bld.build();
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(one.data(), static_cast<int32_t>(ep));
+        all.insert(all.end(), one.begin(), one.end());
+    }
+    if (r.epoch() < ep) r.becomeFollower(ep, /*leaderId=*/-1);
+    FetchResponseMsg resp{};
+    resp.errorCode = kErrNone; resp.leaderEpoch = ep; resp.partition = 0;
+    resp.highWatermark = hw; resp.logStartOffset = 0;
+    resp.records = std::span<const uint8_t>(all.data(), all.size());
+    r.applyReplicated(resp);
+}
+
+template <class... R>
+static bool driveReplicas(InMemoryTransport& t, int64_t& clock, int cap,
+                          const std::function<bool()>& done, R&... rs) {
+    for (int i = 0; i < cap && !done(); ++i) {
+        clock += 1'000'000LL;
+        (rs.doWork(clock), ...);
+        t.pump(clock);
+    }
+    return done();
+}
+
 // ===========================================================================
 // DR-BUG-6 — Unit A: the DR-8 mechanism.
 //
@@ -630,109 +676,30 @@ TEST(EpochChangeTruncationTest, NoCommittedRecordLostOnEpochChange) {
 // committed records [B.LEO, A.LEO) from A.  Both end holding all K records.
 // ===========================================================================
 TEST(EpochChangeTruncationTest, DR8_DeficientLeaderNoCommittedLoss) {
-    TempDir aDir("dr8_A");
-    TempDir bDir("dr8_B");
-    rune::storage::Log aLog(aDir.path);
-    rune::storage::Log bLog(bDir.path);
-
+    // DR-8 under the Kafka model (HW = min LEO over the ISR): A holds [0,5)
+    // with a stale HW view (2), B holds [0,2), both in the ISR.  With B in the
+    // ISR nothing past 2 was ever committed, so B is a COMPLETE leader: it
+    // accepts writes at once, A's uncommitted [2,5) is truncated (KIP-279) and
+    // the committed prefix [0,2) is never lost.
+    TempDir aDir("dr8_A"), bDir("dr8_B");
+    rune::storage::Log aLog(aDir.path), bLog(bDir.path);
     InMemoryTransport transport;
-
     constexpr NodeId kL = 1, kA = 2, kB = 3;
     std::vector<NodeId> replicas = {kL, kA, kB};
-    std::vector<NodeId> isr      = {kL, kA, kB};
-
-    // A and B start as followers at epoch 1 (L, the leader, has died — we model
-    // only the survivors A and B here; L is gone from the cluster).
-    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &aLog, &transport);
-    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &bLog, &transport);
-
-    // --- Seed committed epoch-1 data ---
-    // A received all K=5 records under epoch 1 but with a STALE advertised HW
-    // (L died before advancing A's HW to 5).  We model L's last response to A
-    // as carrying all 5 records but highWatermark = 2 (stale view).
-    constexpr Offset kK = 5;
-    {
-        // Build 5 single-record epoch-1 batches contiguously.
-        std::vector<uint8_t> allBatches;
-        for (int i = 0; i < kK; ++i) {
-            rune::protocol::RecordBatchBuilder builder(/*baseOffset=*/i, 0);
-            std::string_view key{};
-            std::string_view val("rec", 3);
-            builder.append(key, val, 0);
-            auto b1 = builder.build();
-            allBatches.insert(allBatches.end(), b1.begin(), b1.end());
-        }
-        FetchResponseMsg resp{};
-        resp.errorCode      = kErrNone;
-        resp.leaderEpoch    = 1;
-        resp.partition      = 0;
-        resp.highWatermark  = 2;  // STALE HW VIEW — A never learned true HW=5.
-        resp.logStartOffset = 0;
-        resp.records        = std::span<const uint8_t>(allBatches.data(), allBatches.size());
-        a.applyReplicated(resp);
-    }
-    ASSERT_EQ(a.logEndOffset(), kK)  << "A must hold all K records in its LOG";
-    ASSERT_LT(a.highWatermark(), kK) << "A's committed-HW VIEW must be STALE (< K)";
-
-    // B is lagging: it received only the first 2 records under epoch 1.
-    {
-        std::vector<uint8_t> twoBatches;
-        for (int i = 0; i < 2; ++i) {
-            rune::protocol::RecordBatchBuilder builder(/*baseOffset=*/i, 0);
-            std::string_view key{};
-            std::string_view val("rec", 3);
-            builder.append(key, val, 0);
-            auto b1 = builder.build();
-            twoBatches.insert(twoBatches.end(), b1.begin(), b1.end());
-        }
-        FetchResponseMsg resp{};
-        resp.errorCode      = kErrNone;
-        resp.leaderEpoch    = 1;
-        resp.partition      = 0;
-        resp.highWatermark  = 2;
-        resp.logStartOffset = 0;
-        resp.records        = std::span<const uint8_t>(twoBatches.data(), twoBatches.size());
-        b.applyReplicated(resp);
-    }
-    ASSERT_LT(b.logEndOffset(), kK) << "B must be LAGGING (LEO < K) — deficient";
-
-    // --- Consensus elects the DEFICIENT node B as the new epoch-2 leader ---
-    // (Directly forcing the role transitions, mimicking the GR-2 bridge which is
-    // blind to partition data.)
+    PartitionReplica a(makeConfig(kA), Role::Follower, 1, replicas, replicas, &aLog, &transport);
+    PartitionReplica b(makeConfig(kB), Role::Follower, 1, replicas, replicas, &bLog, &transport);
+    seedStamped(a, 0, 5, 1, /*hw=*/2);
+    seedStamped(b, 0, 2, 1, /*hw=*/2);
     transport.setLeader(&b);
     transport.addFollower(kA, &a);
-
-    b.becomeLeader(/*epoch=*/2, {kA, kB});   // B leads, deficient (LEO < K)
-    a.becomeFollower(/*epoch=*/2, kB);       // A must NOT truncate its committed tail
-
-    // --- Drive convergence ---
+    b.becomeLeader(2, {kA, kB});
+    a.becomeFollower(2, kB);
+    EXPECT_TRUE(b.acceptsProduce()) << "an ISR member is a complete leader (Kafka model)";
     int64_t clock = 0;
-    bool done = false;
-    for (int i = 0; i < kDriverCap && !done; ++i) {
-        clock += 1'000'000LL;
-        b.doWork(clock);
-        a.doWork(clock);
-        transport.pump(clock);
-        // Converged when both hold all K records AND B has committed all K.
-        done = (a.logEndOffset() >= kK && b.logEndOffset() >= kK
-                && b.highWatermark() >= kK);
-    }
-
-    // --- Assertions: NO committed record lost ---
-    EXPECT_GE(a.logEndOffset(), kK)
-        << "DR-8: A (up-to-date survivor) must NOT truncate its committed tail — "
-           "it must still hold all " << kK << " committed records";
-    EXPECT_GE(b.logEndOffset(), kK)
-        << "DR-8: B (deficient new leader) must reverse-catch-up the missing "
-           "committed records from A";
-    EXPECT_GE(b.highWatermark(), kK)
-        << "DR-8: B must commit all " << kK << " records after reconcile";
-    ASSERT_TRUE(done)
-        << "DR-8: cluster must converge with all " << kK
-        << " committed records preserved (A.LEO=" << a.logEndOffset()
-        << " B.LEO=" << b.logEndOffset() << " B.HW=" << b.highWatermark() << ")";
+    ASSERT_TRUE(driveReplicas(transport, clock, kDriverCap,
+                              [&] { return a.logEndOffset() == 2; }, b, a))
+        << "A.LEO=" << a.logEndOffset();
+    EXPECT_GE(b.highWatermark(), 2) << "the committed prefix stays committed";
 }
 
 // ===========================================================================
@@ -752,77 +719,36 @@ TEST(EpochChangeTruncationTest, DR8_DeficientLeaderNoCommittedLoss) {
 // the shared epoch-1 boundary.  No divergent data is ever committed.
 // ===========================================================================
 TEST(EpochChangeTruncationTest, DivergentAheadTailFromNonSharedEpochIsTruncated) {
-    TempDir nDir("divg_a_N");
-    TempDir sDir("divg_a_S");
-    rune::storage::Log nLog(nDir.path);
-    rune::storage::Log sLog(sDir.path);
+    // A survivor's ahead tail from an epoch the new leader never held is off the
+    // leader's lineage: once the leader is complete (a majority of its ISR —
+    // itself + M — proved a validated prefix position), the survivor gets
+    // DivergingEpoch and truncates to the shared epoch-1 boundary (KIP-279).
+    TempDir nDir("divg_a_N"), sDir("divg_a_S"), mDir("divg_a_M");
+    rune::storage::Log nLog(nDir.path), sLog(sDir.path), mLog(mDir.path);
     InMemoryTransport transport;
+    constexpr NodeId kN = 1, kS = 2, kM = 3;
+    std::vector<NodeId> all = {kN, kS, kM};
+    PartitionReplica n(makeConfig(kN), Role::Follower, 1, all, all, &nLog, &transport);
+    PartitionReplica s(makeConfig(kS), Role::Follower, 1, all, all, &sLog, &transport);
+    PartitionReplica m(makeConfig(kM), Role::Follower, 1, all, all, &mLog, &transport);
+    seedStamped(n, 0, 3, 1, 3);
+    seedStamped(m, 0, 3, 1, 3);
+    seedStamped(s, 0, 3, 1, 3);
+    seedStamped(s, 3, 2, 2, 3);                 // divergent epoch-2 tail N never saw
+    ASSERT_EQ(s.logEndOffset(), 5);
 
-    constexpr NodeId kN = 1, kS = 2;
-    std::vector<NodeId> replicas = {kN, kS};
-    std::vector<NodeId> isr      = {kN, kS};   // bridge-style ISR = ALL replicas
-
-    // N (soon-to-be new leader) and S (survivor with a divergent tail) both start
-    // as epoch-1 followers.
-    PartitionReplica n(makeConfig(kN), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &nLog, &transport);
-    PartitionReplica s(makeConfig(kS), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &sLog, &transport);
-
-    auto seedEpoch = [](PartitionReplica& r, int epoch, int64_t baseOffset,
-                        int count) {
-        std::vector<uint8_t> batches;
-        for (int i = 0; i < count; ++i) {
-            rune::protocol::RecordBatchBuilder b(baseOffset + i, 0);
-            std::string_view key{}; std::string_view val("rec", 3);
-            b.append(key, val, 0);
-            auto one = b.build();
-            batches.insert(batches.end(), one.begin(), one.end());
-        }
-        FetchResponseMsg resp{};
-        resp.errorCode = kErrNone; resp.leaderEpoch = epoch; resp.partition = 0;
-        resp.highWatermark = baseOffset; // committed up to baseOffset only
-        resp.logStartOffset = 0;
-        resp.records = std::span<const uint8_t>(batches.data(), batches.size());
-        r.applyReplicated(resp);
-    };
-
-    // Both hold committed epoch-1 [0,3).
-    seedEpoch(n, 1, 0, 3);
-    seedEpoch(s, 1, 0, 3);
-    // S additionally holds a DIVERGENT epoch-2 tail [3,5) from a dead short-lived
-    // leader that N NEVER saw.  N stays at LEO=3 (committed prefix only).
-    seedEpoch(s, 2, 3, 2);
-    ASSERT_EQ(n.logEndOffset(), 3);
-    ASSERT_EQ(s.logEndOffset(), 5) << "S must hold the divergent epoch-2 tail";
-
-    // Consensus (blind) elects N at epoch 3.  ISR = ALL replicas (bridge).
     transport.setLeader(&n);
     transport.addFollower(kS, &s);
-    n.becomeLeader(/*epoch=*/3, {kN, kS});
-    s.becomeFollower(/*epoch=*/3, kN);
-
-    // Drive to convergence.
+    transport.addFollower(kM, &m);
+    n.becomeLeader(3, {kN, kS, kM});
+    s.becomeFollower(3, kN);
+    m.becomeFollower(3, kN);
     int64_t clock = 0;
-    bool done = false;
-    for (int i = 0; i < kDriverCap && !done; ++i) {
-        clock += 1'000'000LL;
-        n.doWork(clock);
-        s.doWork(clock);
-        transport.pump(clock);
-        done = (s.logEndOffset() == n.logEndOffset());
-    }
-    ASSERT_TRUE(done) << "S did not converge with N (S.LEO=" << s.logEndOffset()
-                      << " N.LEO=" << n.logEndOffset() << ")";
-
-    // CORE ASSERTION: the divergent epoch-2 tail must be GONE — S truncated it to
-    // the shared epoch-1 boundary (offset 3).  Pre-correction, N would have
-    // ADOPTED S's divergent tail (kept+reconciled) → S.LEO stays 5 → divergence.
-    EXPECT_EQ(s.logEndOffset(), 3)
-        << "Divergent epoch-2 tail must be TRUNCATED to the shared epoch-1 "
-           "boundary (3); the ISR-only gate would have wrongly kept it (5).";
-    EXPECT_EQ(n.logEndOffset(), 3)
-        << "New leader must NOT adopt the divergent tail.";
+    ASSERT_TRUE(driveReplicas(transport, clock, kDriverCap,
+                              [&] { return s.logEndOffset() == 3 && n.acceptsProduce(); }, n, s, m))
+        << "S.LEO=" << s.logEndOffset();
+    EXPECT_EQ(n.logEndOffset(), 3) << "the new leader must not adopt the divergent tail";
+    EXPECT_EQ(s.lastFetchedEpoch(), 1);
 }
 
 // ===========================================================================
@@ -841,498 +767,113 @@ TEST(EpochChangeTruncationTest, DivergentAheadTailFromNonSharedEpochIsTruncated)
 // epoch) → both truncate to the shared committed prefix → identical logs.
 // ===========================================================================
 TEST(EpochChangeTruncationTest, TwoContradictoryAheadTailsConvergeNoDivergence) {
-    TempDir nDir("divg_b_N");
-    TempDir xDir("divg_b_X");
-    TempDir yDir("divg_b_Y");
-    rune::storage::Log nLog(nDir.path);
-    rune::storage::Log xLog(xDir.path);
-    rune::storage::Log yLog(yDir.path);
+    // X holds an epoch-2 tail [3,5), Y a contradictory epoch-3 tail [3,4) at the
+    // same offsets.  Y (latest epoch) is elected at 4; N (prefix [0,3)) proves a
+    // validated position → Y completes; X is off Y's lineage (Y never held epoch
+    // 2: its lineage for epoch 2 is "epoch 1, ending at 3") → DivergingEpoch →
+    // X truncates to 3 and re-fetches Y's [3,4).  Survivors converge BYTE-
+    // IDENTICALLY on the leader's lineage — never contradictory.
+    TempDir nDir("divg_b_N"), xDir("divg_b_X"), yDir("divg_b_Y");
+    rune::storage::Log nLog(nDir.path), xLog(xDir.path), yLog(yDir.path);
     InMemoryTransport transport;
-
     constexpr NodeId kN = 1, kX = 2, kY = 3;
-    std::vector<NodeId> replicas = {kN, kX, kY};
-    std::vector<NodeId> isr      = {kN, kX, kY};   // bridge-style ISR = ALL
-
-    PartitionReplica n(makeConfig(kN), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &nLog, &transport);
-    PartitionReplica x(makeConfig(kX), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &xLog, &transport);
-    PartitionReplica y(makeConfig(kY), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &yLog, &transport);
-
-    auto seedEpoch = [](PartitionReplica& r, int epoch, int64_t baseOffset,
-                        int count, uint8_t fill) {
-        std::vector<uint8_t> batches;
-        for (int i = 0; i < count; ++i) {
-            rune::protocol::RecordBatchBuilder b(baseOffset + i, 0);
-            std::string_view key{};
-            char v[3] = { (char)fill, (char)fill, (char)fill };
-            std::string_view val(v, 3);
-            b.append(key, val, 0);
-            auto one = b.build();
-            batches.insert(batches.end(), one.begin(), one.end());
-        }
-        FetchResponseMsg resp{};
-        resp.errorCode = kErrNone; resp.leaderEpoch = epoch; resp.partition = 0;
-        resp.highWatermark = baseOffset; resp.logStartOffset = 0;
-        resp.records = std::span<const uint8_t>(batches.data(), batches.size());
-        r.applyReplicated(resp);
-    };
-
-    // All three hold committed epoch-1 [0,3).
-    seedEpoch(n, 1, 0, 3, 0x11);
-    seedEpoch(x, 1, 0, 3, 0x11);
-    seedEpoch(y, 1, 0, 3, 0x11);
-
-    // X has a CONTRADICTORY epoch-2 tail at offset 3 (from short-lived leader LX).
-    // Y has a CONTRADICTORY epoch-3 tail at offset 3 (from short-lived leader LY).
-    // Both at the SAME offset (3) but different epochs / content → divergent.
-    seedEpoch(x, 2, 3, 2, 0x22);   // X: [3,5) epoch 2
-    seedEpoch(y, 3, 3, 1, 0x33);   // Y: [3,4) epoch 3
+    std::vector<NodeId> all = {kN, kX, kY};
+    PartitionReplica n(makeConfig(kN), Role::Follower, 1, all, all, &nLog, &transport);
+    PartitionReplica x(makeConfig(kX), Role::Follower, 1, all, all, &xLog, &transport);
+    PartitionReplica y(makeConfig(kY), Role::Follower, 1, all, all, &yLog, &transport);
+    seedStamped(n, 0, 3, 1, 3, 0x11);
+    seedStamped(x, 0, 3, 1, 3, 0x11);
+    seedStamped(y, 0, 3, 1, 3, 0x11);
+    seedStamped(x, 3, 2, 2, 3, 0x22);
+    seedStamped(y, 3, 1, 3, 3, 0x33);
     ASSERT_EQ(x.logEndOffset(), 5);
     ASSERT_EQ(y.logEndOffset(), 4);
 
-    // Consensus (blind) elects N at epoch 4 (higher than both divergent epochs);
-    // N holds only the committed prefix [0,3).  ISR = ALL.
-    transport.setLeader(&n);
+    transport.setLeader(&y);
     transport.addFollower(kX, &x);
-    transport.addFollower(kY, &y);
-    n.becomeLeader(/*epoch=*/4, {kN, kX, kY});
-    x.becomeFollower(/*epoch=*/4, kN);
-    y.becomeFollower(/*epoch=*/4, kN);
-
+    transport.addFollower(kN, &n);
+    y.becomeLeader(4, {kY, kX, kN});
+    x.becomeFollower(4, kY);
+    n.becomeFollower(4, kY);
     int64_t clock = 0;
-    bool done = false;
-    for (int i = 0; i < kDriverCap && !done; ++i) {
-        clock += 1'000'000LL;
-        n.doWork(clock);
-        x.doWork(clock);
-        y.doWork(clock);
-        transport.pump(clock);
-        done = (x.logEndOffset() == n.logEndOffset()
-                && y.logEndOffset() == n.logEndOffset());
-    }
-    ASSERT_TRUE(done) << "survivors did not converge (N=" << n.logEndOffset()
-                      << " X=" << x.logEndOffset() << " Y=" << y.logEndOffset() << ")";
-
-    // CORE ASSERTION: the two survivors converge to IDENTICAL logs — no divergence.
-    EXPECT_EQ(x.logEndOffset(), y.logEndOffset())
-        << "Survivors must converge to identical LEOs (no divergence).";
-
-    // And the identical log is the shared committed prefix; the divergent tails
-    // (X's epoch-2, Y's epoch-3) are both truncated.
-    EXPECT_EQ(x.logEndOffset(), 3)
-        << "X's divergent epoch-2 tail must be truncated to the shared prefix.";
-    EXPECT_EQ(y.logEndOffset(), 3)
-        << "Y's divergent epoch-3 tail must be truncated to the shared prefix.";
-
-    // Byte-identical over the whole log (the strongest no-divergence check).
-    auto xBytes = xLog.read(0, 1 << 20);
-    auto yBytes = yLog.read(0, 1 << 20);
-    EXPECT_EQ(xBytes, yBytes)
-        << "Survivor logs must be BYTE-IDENTICAL — never contradictory.";
+    ASSERT_TRUE(driveReplicas(transport, clock, kDriverCap, [&] {
+        return x.logEndOffset() == y.logEndOffset() && n.logEndOffset() == y.logEndOffset() &&
+               xLog.read(0, 1 << 20) == yLog.read(0, 1 << 20);
+    }, y, x, n)) << "X=" << x.logEndOffset() << " Y=" << y.logEndOffset() << " N=" << n.logEndOffset();
+    EXPECT_EQ(x.logEndOffset(), 4);
+    EXPECT_EQ(xLog.read(0, 1 << 20), yLog.read(0, 1 << 20)) << "contradictory survivor logs";
+    EXPECT_EQ(nLog.read(0, 1 << 20), yLog.read(0, 1 << 20));
 }
 
+// (EpochChangeTruncationTest.FallbackRaceDeferKeepAlivePreventsCommittedLoss
+//  retired with the KIP-101 side probe and its fallback: divergence is resolved
+//  on the fetch path; a deficient leader holds — never truncates — a survivor.)
+
+// (LeaderCompletenessGateTest.* retired with the completeness gate — Kafka
+//  model, user decision 2026-10-03: HW = min LEO over the ISR and a leader is
+//  always elected from the ISR, so a "deficient" ISR leader cannot exist; the
+//  E1b consensus-side gap for internal partitions is pinned by
+//  DrIntegration.DISABLED_E1b_InternalFencedMemberElectedBeforeCatchUp_NoAckedLoss.)
+
 // ===========================================================================
-// DR-BUG-6 FALLBACK RACE (the Major): a survivor must NOT fire the destructive
-// 8-probe fallback-to-committedHw truncation while a reconcile-pull addressed to
-// it is in flight / the leader is actively deferring.  The deficient leader sends
-// an explicit defer keep-alive (kErrReconcileDeferred) that RESETS the survivor's
-// probe-attempt counter, so a slow reconcile under sustained packet loss never
-// destroys committed data (which reintroduced the DR-8 loss).
-//
-// Here the reconcile is delayed well past kEpochProbeMaxAttempts (8) probe
-// intervals, but the defer keep-alive keeps flowing → the survivor keeps its
-// committed tail rather than truncating to its stale HW.
+// Review 2026-10-04 MAJOR-3 (replaces InternalPartitionNeverLagShrinksALive
+// Member): an INTERNAL partition lag-shrinks like any other (a live but stuck
+// member must not freeze the control plane), but the change COMMITS only once a
+// majority of the replicas durably holds it (InternalIsrKnowledge); until then
+// the HW counts the member.  After the commit the stuck member is outside the
+// newest durable ISR of the majority — never voted for by the consensus.
 // ===========================================================================
-// Transport that DROPS the first `dropCount` reconcile responses (simulating
-// sustained packet loss on the reverse-reconcile pull), so the deficient leader
-// cannot catch up for many rounds.  Epoch-probe / defer keep-alive messages still
-// flow.  Pre-correction (silent defer, no keep-alive), the survivor's probe
-// counter climbs to kEpochProbeMaxAttempts and fires the destructive fallback
-// truncation.  Post-correction, the defer keep-alive resets the counter → no loss.
-class DroppingReconcileTransport : public InMemoryTransport {
-public:
-    int dropCount = 0;
-    int dropped   = 0;
-    bool sendReconcileResponse(NodeId toPeer,
-                               const FetchResponseMsg& resp) override {
-        // Accepted by the transport, then LOST in flight (image loss) — not a
-        // refusal (F27: a refusal would be retried by the sender next pass).
-        if (dropped < dropCount) { ++dropped; return true; }
-        InMemoryTransport::sendReconcileResponse(toPeer, resp);
-        return true;
-    }
-};
-
-TEST(EpochChangeTruncationTest, FallbackRaceDeferKeepAlivePreventsCommittedLoss) {
-    TempDir aDir("frace_A");
-    TempDir bDir("frace_B");
-    rune::storage::Log aLog(aDir.path);
-    rune::storage::Log bLog(bDir.path);
-    DroppingReconcileTransport transport;
-    transport.dropCount = 20;   // drop reconcile answers for well past 8 attempts
-
-    constexpr NodeId kA = 2, kB = 3;
-    std::vector<NodeId> replicas = {kA, kB};
-    std::vector<NodeId> isr      = {kA, kB};
-
-    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &aLog, &transport);
-    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &bLog, &transport);
-
-    constexpr Offset kK = 6;
-    // A holds all K committed epoch-1 records but with a STALE HW view (2).
-    {
-        std::vector<uint8_t> all;
-        for (int i = 0; i < kK; ++i) {
-            rune::protocol::RecordBatchBuilder bld(i, 0);
-            std::string_view key{}; std::string_view val("rec", 3);
-            bld.append(key, val, 0);
-            auto one = bld.build();
-            all.insert(all.end(), one.begin(), one.end());
+TEST(InternalIsrRegression, InternalLagShrinkCommitsOnMajorityKnowledge_StuckMemberIneligible) {
+    for (const bool internal : {true, false}) {
+        SCOPED_TRACE(internal ? "internal" : "user");
+        TempDir lDir("iisr_L"), fDir("iisr_F"), gDir("iisr_G");
+        rune::storage::Log lLog(lDir.path), fLog(fDir.path), gLog(gDir.path);
+        InMemoryTransport transport;
+        constexpr NodeId kL = 1, kF = 2, kG = 3;
+        std::vector<NodeId> all = {kL, kF, kG};
+        auto cfgFor = [&](NodeId id) {
+            PartitionConfig c = makeConfig(id, /*lagMs=*/10, /*lagOff=*/1'000'000);
+            if (internal) c.topicId = -3;            // __cluster_metadata (the knowledge store's partition)
+            return c;
+        };
+        InternalIsrKnowledge kl, kf, kg;
+        PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
+        PartitionReplica f(cfgFor(kF), Role::Follower, 0, all, all, &fLog, &transport);
+        PartitionReplica g(cfgFor(kG), Role::Follower, 0, all, all, &gLog, &transport);
+        if (internal) {
+            l.setInternalIsrKnowledge(&kl); f.setInternalIsrKnowledge(&kf); g.setInternalIsrKnowledge(&kg);
         }
-        FetchResponseMsg resp{};
-        resp.errorCode = kErrNone; resp.leaderEpoch = 1; resp.partition = 0;
-        resp.highWatermark = 2; resp.logStartOffset = 0;
-        resp.records = std::span<const uint8_t>(all.data(), all.size());
-        a.applyReplicated(resp);
-    }
-    ASSERT_EQ(a.logEndOffset(), kK);
-    ASSERT_LT(a.highWatermark(), kK) << "A's HW view must be stale";
-
-    // B is deficient (LEO=2).
-    {
-        std::vector<uint8_t> two;
-        for (int i = 0; i < 2; ++i) {
-            rune::protocol::RecordBatchBuilder bld(i, 0);
-            std::string_view key{}; std::string_view val("rec", 3);
-            bld.append(key, val, 0);
-            auto one = bld.build();
-            two.insert(two.end(), one.begin(), one.end());
-        }
-        FetchResponseMsg resp{};
-        resp.errorCode = kErrNone; resp.leaderEpoch = 1; resp.partition = 0;
-        resp.highWatermark = 2; resp.logStartOffset = 0;
-        resp.records = std::span<const uint8_t>(two.data(), two.size());
-        b.applyReplicated(resp);
-    }
-    ASSERT_LT(b.logEndOffset(), kK);
-
-    transport.setLeader(&b);
-    transport.addFollower(kA, &a);
-    b.becomeLeader(/*epoch=*/2, {kA, kB});
-    a.becomeFollower(/*epoch=*/2, kB);
-
-    // Reconcile answers are DROPPED for the first 20 rounds (dropCount) — far past
-    // the kEpochProbeMaxAttempts=8 fallback threshold — while the epoch-probe /
-    // defer keep-alive keeps flowing.  A must NEVER destroy its committed tail
-    // during this window (the keep-alive resets its fallback counter each round).
-    // After the drops stop, the cluster must converge with no committed loss.
-    int64_t clock = 0;
-    bool converged = false;
-    for (int i = 0; i < kDriverCap && !converged; ++i) {
-        clock += 1'000'000LL;
-        b.doWork(clock);
-        a.doWork(clock);
-        transport.pump(clock);
-        // INVARIANT (the Major): A must never truncate its committed tail while a
-        // reconcile is in flight / the leader is deferring.  Pre-correction A
-        // would fall back to its stale-HW truncation after 8 unanswered probes.
-        ASSERT_GE(a.logEndOffset(), kK)
-            << "A truncated its committed tail at round " << i
-            << " (fallback race not hardened): A.LEO=" << a.logEndOffset();
-        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
-    }
-
-    // Cluster converges once the reconcile answers get through — no committed loss.
-    ASSERT_TRUE(converged) << "cluster did not converge after the drop window";
-    EXPECT_GE(a.logEndOffset(), kK);
-    EXPECT_GE(b.logEndOffset(), kK);
-    EXPECT_GE(b.highWatermark(), kK);
-}
-
-// ===========================================================================
-// DR-BUG-6 LEADER-COMPLETENESS GATE — the final DR-8 close.
-//
-// Helper: build N contiguous single-record epoch-`ep` batches starting at offset
-// `base` and feed them to a follower via applyReplicated with a (possibly stale)
-// advertised HW.  Mirrors the seed pattern used by the DR-8 tests above.
-// ===========================================================================
-static void seedCommitted(PartitionReplica& r, int from, int count,
-                          Epoch ep, Offset advertisedHw) {
-    std::vector<uint8_t> all;
-    for (int i = from; i < from + count; ++i) {
-        rune::protocol::RecordBatchBuilder bld(i, 0);
-        std::string_view key{}; std::string_view val("rec", 3);
-        bld.append(key, val, 0);
-        auto one = bld.build();
-        all.insert(all.end(), one.begin(), one.end());
-    }
-    FetchResponseMsg resp{};
-    resp.errorCode = kErrNone; resp.leaderEpoch = ep; resp.partition = 0;
-    resp.highWatermark = advertisedHw; resp.logStartOffset = 0;
-    resp.records = std::span<const uint8_t>(all.data(), all.size());
-    r.applyReplicated(resp);
-}
-
-// ===========================================================================
-// GATE INVARIANT: a newly-promoted DEFICIENT leader must NOT advertise a serving
-// high-watermark ABOVE the pre-failover committed floor until it has reconciled up
-// to the majority committed frontier.  Serving its own regressed frontier is the
-// residual DR-8 loss.  Here B is elected deficient (LEO=2) while survivor A holds
-// all K=5 committed records; before A's probe/reconcile lands, B.highWatermark()
-// must stay clamped at the floor (2) — never jumping to a value that omits A's
-// committed tail — and must only advance to >= K AFTER the reverse-reconcile.
-// ===========================================================================
-TEST(LeaderCompletenessGateTest, DeficientNewLeaderHoldsHwUntilReconciled) {
-    TempDir aDir("gate_A");
-    TempDir bDir("gate_B");
-    rune::storage::Log aLog(aDir.path);
-    rune::storage::Log bLog(bDir.path);
-    InMemoryTransport transport;
-
-    constexpr NodeId kA = 2, kB = 3;
-    std::vector<NodeId> replicas = {kA, kB};
-    std::vector<NodeId> isr      = {kA, kB};
-
-    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &aLog, &transport);
-    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1,
-                       replicas, isr, &bLog, &transport);
-
-    constexpr Offset kK = 5;
-    seedCommitted(a, 0, kK, /*ep=*/1, /*advertisedHw=*/2);   // A holds all K, stale HW
-    seedCommitted(b, 0, 2,  /*ep=*/1, /*advertisedHw=*/2);   // B deficient (LEO=2)
-    ASSERT_EQ(a.logEndOffset(), kK);
-    ASSERT_LT(b.logEndOffset(), kK);
-
-    transport.setLeader(&b);
-    transport.addFollower(kA, &a);
-    b.becomeLeader(/*epoch=*/2, {kA, kB});
-    a.becomeFollower(/*epoch=*/2, kB);
-
-    // IMMEDIATELY after election, before any reconcile, the deficient leader must
-    // hold its served HW at the pre-failover floor (2) — NOT its own LEO, and never
-    // a value that skips A's committed tail.
-    EXPECT_LE(b.highWatermark(), b.logEndOffset())
-        << "gate: served HW must never exceed what the leader actually holds";
-
-    int64_t clock = 0;
-    bool converged = false;
-    for (int i = 0; i < kDriverCap && !converged; ++i) {
-        clock += 1'000'000LL;
-        b.doWork(clock);
-        a.doWork(clock);
-        transport.pump(clock);
-
-        // GATE INVARIANT (checked EVERY round): the served HW may never exceed the
-        // leader's own LEO — i.e. it can never advertise committed records it does
-        // not hold.  While incomplete this pins it at/below the floor; once complete
-        // it equals the (now-recovered) majority HW.
-        ASSERT_LE(b.highWatermark(), b.logEndOffset())
-            << "gate violated at round " << i
-            << ": HW=" << b.highWatermark() << " LEO=" << b.logEndOffset();
-        // A must never lose its committed tail.
-        ASSERT_GE(a.logEndOffset(), kK) << "A truncated committed data at round " << i;
-
-        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
-    }
-    ASSERT_TRUE(converged)
-        << "cluster did not converge: B.LEO=" << b.logEndOffset()
-        << " B.HW=" << b.highWatermark();
-    EXPECT_GE(b.highWatermark(), kK) << "committed frontier must be served after reconcile";
-}
-
-// ===========================================================================
-// GATE HOLDS SERVED HW AT THE FLOOR WHILE RECONCILE IS INCOMPLETE.
-//
-// This is the behavioural core of the gate (the residual DR-8 delivery loss).  A
-// transport drops ALL reverse-reconcile responses, so the deficient leader B can
-// never catch up to survivor A's committed tail.  The ISR stays {A,B} (size 2), so
-// the min-ISR gate alone does NOT pin the HW.  WITHOUT the completeness gate, B
-// would advertise a served HW at its own (regressed) frontier and the acks=All
-// drain / HW-bounded subscribers would treat A's un-reconciled committed tail as
-// lost.  WITH the gate, B holds the served HW at the pre-failover floor for the
-// ENTIRE drop window and never marks itself complete — no committed record is ever
-// exposed as delivered-then-lost.  When the drops stop, it reconciles and serves
-// the full frontier.
-// ===========================================================================
-TEST(LeaderCompletenessGateTest, ServedHwHeldAtFloorWhileReconcileDropped) {
-    TempDir aDir("hold_A");
-    TempDir bDir("hold_B");
-    rune::storage::Log aLog(aDir.path);
-    rune::storage::Log bLog(bDir.path);
-    DroppingReconcileTransport transport;
-    transport.dropCount = 40;   // drop ALL reconcile answers for the whole window
-
-    constexpr NodeId kA = 2, kB = 3;
-    std::vector<NodeId> replicas = {kA, kB};
-    std::vector<NodeId> isr      = {kA, kB};
-
-    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1, replicas, isr, &aLog, &transport);
-    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1, replicas, isr, &bLog, &transport);
-
-    constexpr Offset kK = 7;
-    constexpr Offset kFloor = 3;
-    seedCommitted(a, 0, kK, /*ep=*/1, /*advertisedHw=*/kFloor);  // A: all K, stale HW
-    seedCommitted(b, 0, kFloor, /*ep=*/1, /*advertisedHw=*/kFloor); // B: deficient (LEO=floor)
-    ASSERT_EQ(a.logEndOffset(), kK);
-    ASSERT_EQ(b.logEndOffset(), kFloor);
-
-    transport.setLeader(&b);
-    transport.addFollower(kA, &a);
-    b.becomeLeader(/*epoch=*/2, {kA, kB});
-    a.becomeFollower(/*epoch=*/2, kB);
-
-    const Offset floor = b.highWatermark();   // captured floor
-    ASSERT_LE(floor, kFloor);
-
-    // While reconcile responses are dropped, the served HW MUST NOT advance past
-    // the floor — B has an on-lineage survivor (A) still holding committed records
-    // it has not pulled, so it must stay incomplete.
-    int64_t clock = 0;
-    for (int i = 0; i < 30; ++i) {   // well within the drop window
-        clock += 1'000'000LL;
-        b.doWork(clock);
-        a.doWork(clock);
-        transport.pump(clock);
-        ASSERT_LE(b.highWatermark(), floor)
-            << "GATE VIOLATED at round " << i << ": served HW advanced to "
-            << b.highWatermark() << " while an on-lineage survivor still held "
-               "un-reconciled committed records (floor=" << floor << ")";
-        ASSERT_GE(a.logEndOffset(), kK) << "A lost committed data at round " << i;
-    }
-
-    // Stop dropping; the reconcile now lands and the cluster converges to the full
-    // committed frontier.
-    transport.dropCount = 0;
-    bool converged = false;
-    for (int i = 0; i < kDriverCap && !converged; ++i) {
-        clock += 1'000'000LL;
-        b.doWork(clock);
-        a.doWork(clock);
-        transport.pump(clock);
-        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
-    }
-    ASSERT_TRUE(converged)
-        << "cluster did not converge after drops cleared: B.LEO="
-        << b.logEndOffset() << " B.HW=" << b.highWatermark();
-    EXPECT_GE(b.highWatermark(), kK);
-}
-
-// ===========================================================================
-// GATE + DOUBLE-ELECTION CHURN: under loss the cluster can flap leadership several
-// times before it settles.  The completeness gate must RE-ARM on every becomeLeader
-// so that NO leader — at any point in the churn — advertises a HW covering records
-// it does not hold, and the up-to-date survivor never drops its committed tail.
-// After the churn settles the eventual leader must have reconciled ALL committed
-// records and serve them.  This is the exact residual DR-8 case, reproduced
-// deterministically.
-// ===========================================================================
-TEST(LeaderCompletenessGateTest, DoubleElectionChurnNoCommittedLossNoRegression) {
-    TempDir aDir("churn_A");
-    TempDir bDir("churn_B");
-    TempDir cDir("churn_C");
-    rune::storage::Log aLog(aDir.path);
-    rune::storage::Log bLog(bDir.path);
-    rune::storage::Log cLog(cDir.path);
-    InMemoryTransport transport;
-
-    constexpr NodeId kA = 1, kB = 2, kC = 3;
-    std::vector<NodeId> replicas = {kA, kB, kC};
-    std::vector<NodeId> isr      = {kA, kB, kC};
-
-    PartitionReplica a(makeConfig(kA), Role::Follower, /*epoch=*/1, replicas, isr, &aLog, &transport);
-    PartitionReplica b(makeConfig(kB), Role::Follower, /*epoch=*/1, replicas, isr, &bLog, &transport);
-    PartitionReplica c(makeConfig(kC), Role::Follower, /*epoch=*/1, replicas, isr, &cLog, &transport);
-
-    constexpr Offset kK = 8;
-    seedCommitted(a, 0, kK, /*ep=*/1, /*advertisedHw=*/3);   // A: all K committed, stale HW
-    seedCommitted(b, 0, 3,  /*ep=*/1, /*advertisedHw=*/3);   // B: deficient (LEO=3)
-    seedCommitted(c, 0, 3,  /*ep=*/1, /*advertisedHw=*/3);   // C: deficient (LEO=3)
-    ASSERT_EQ(a.logEndOffset(), kK);
-    ASSERT_LT(b.logEndOffset(), kK);
-    ASSERT_LT(c.logEndOffset(), kK);
-
-    auto wireLeader = [&](PartitionReplica& leader, NodeId lid,
-                          PartitionReplica& f1, NodeId f1id,
-                          PartitionReplica& f2, NodeId f2id) {
-        transport.setLeader(&leader);
-        transport.addFollower(f1id, &f1);
-        transport.addFollower(f2id, &f2);
-        (void)lid;
-    };
-
-    // Every replica that is currently a leader must satisfy the gate invariant.
-    auto checkGate = [&](PartitionReplica& r, const char* who, int round) {
-        if (r.role() == Role::Leader) {
-            ASSERT_LE(r.highWatermark(), r.logEndOffset())
-                << who << " advertised HW > its LEO at round " << round
-                << " (gate violated): HW=" << r.highWatermark()
-                << " LEO=" << r.logEndOffset();
-        }
-        ASSERT_GE(a.logEndOffset(), kK)
-            << "A lost its committed tail at round " << round << " (" << who << ")";
-    };
-
-    int64_t clock = 0;
-    auto drive = [&](int rounds, PartitionReplica& l, PartitionReplica& f1,
-                     PartitionReplica& f2, const char* leaderName) {
-        for (int i = 0; i < rounds; ++i) {
+        l.becomeLeader(1, all);
+        f.becomeFollower(1, kL);
+        g.becomeFollower(1, kL);
+        transport.setLeader(&l);
+        transport.addFollower(kF, &f);           // kG never fetches (stuck, but live)
+        ASSERT_GE(l.append(makePayload(1)), 0);
+        int64_t clock = 0;
+        bool sawPendingWithoutCommit = false;
+        for (int i = 0; i < 100; ++i) {          // 100 ms >> replicaLagMaxMs = 10 ms
             clock += 1'000'000LL;
-            l.doWork(clock);
-            f1.doWork(clock);
-            f2.doWork(clock);
+            l.doWork(clock); f.doWork(clock);
+            if (internal && l.isrProposalPendingForTest()) {
+                // Proposed (kG out) but not yet held by a majority: the HW still
+                // counts kG (maximal ISR) — nothing committed past its LEO.
+                sawPendingWithoutCommit = true;
+                EXPECT_EQ(l.highWatermark(), 0) << "committed past a member whose removal is not durable";
+            }
             transport.pump(clock);
-            checkGate(l, leaderName, i);
         }
-    };
-
-    // ── Election 1: deficient B leads at epoch 2 (churn cut short before it fully
-    //    reconciles) ────────────────────────────────────────────────────────────
-    wireLeader(b, kB, a, kA, c, kC);
-    b.becomeLeader(/*epoch=*/2, {kA, kB, kC});
-    a.becomeFollower(/*epoch=*/2, kB);
-    c.becomeFollower(/*epoch=*/2, kB);
-    drive(/*rounds=*/3, b, a, c, "B@e2");   // only a few rounds — do NOT let it settle
-
-    // ── Election 2: leadership flaps to the OTHER deficient node C at epoch 3 ────
-    wireLeader(c, kC, a, kA, b, kB);
-    c.becomeLeader(/*epoch=*/3, {kA, kB, kC});
-    a.becomeFollower(/*epoch=*/3, kC);
-    b.becomeFollower(/*epoch=*/3, kC);
-    drive(/*rounds=*/3, c, a, b, "C@e3");   // again cut short mid-reconcile
-
-    // ── Election 3: flaps BACK to B at epoch 4 — gate must re-arm again ─────────
-    wireLeader(b, kB, a, kA, c, kC);
-    b.becomeLeader(/*epoch=*/4, {kA, kB, kC});
-    a.becomeFollower(/*epoch=*/4, kB);
-    c.becomeFollower(/*epoch=*/4, kB);
-
-    // Now let it settle.
-    bool converged = false;
-    for (int i = 0; i < kDriverCap && !converged; ++i) {
-        clock += 1'000'000LL;
-        b.doWork(clock);
-        a.doWork(clock);
-        c.doWork(clock);
-        transport.pump(clock);
-        checkGate(b, "B@e4", i);
-        converged = (b.logEndOffset() >= kK && b.highWatermark() >= kK);
+        const auto& isr = l.isr();
+        EXPECT_EQ(std::find(isr.begin(), isr.end(), kG), isr.end()) << "a stuck live member pinned the ISR";
+        EXPECT_EQ(l.highWatermark(), 1) << "the HW froze behind a stuck member";
+        if (internal) {
+            EXPECT_TRUE(sawPendingWithoutCommit);
+            EXPECT_FALSE(l.internalSeedPendingForTest());
+            EXPECT_FALSE(kl.eligible(kG)) << "the leader would vote for the stuck member";
+            EXPECT_FALSE(kf.eligible(kG)) << "the majority's durable knowledge still names the stuck member";
+            EXPECT_TRUE(kf.eligible(kF));
+            EXPECT_TRUE(kg.eligible(kG)) << "(the stuck node itself never heard of its removal)";
+        }
     }
-
-    ASSERT_TRUE(converged)
-        << "cluster did not converge after double-election churn: "
-        << "B.LEO=" << b.logEndOffset() << " B.HW=" << b.highWatermark()
-        << " A.LEO=" << a.logEndOffset();
-
-    // No committed loss: the survivor kept all K, and the final leader recovered +
-    // serves all K committed records.
-    EXPECT_GE(a.logEndOffset(), kK);
-    EXPECT_GE(b.logEndOffset(), kK);
-    EXPECT_GE(b.highWatermark(), kK);
 }
 
 // ===========================================================================
@@ -1821,28 +1362,9 @@ TEST(FetchTimestampTest, TrulySilentFollowerIsEvictedAfterLagMaxMs) {
 // ===========================================================================
 
 TEST(EpochChangeTruncationTest, FollowerTruncatesToExactEpochBoundaryOffset) {
-    // FIX 4: Assert the follower's post-truncation LEO equals the EXACT
-    // LeaderEpochCache boundary offset (a concrete numeric value) BEFORE
-    // re-convergence.  A truncate-to-0 bug must fail this test.
-    //
-    // How truncation fires in PartitionReplica::applyReplicated:
-    //   truncationOffsetForEpochChange(cache, newEpoch) calls
-    //   cache.truncateOffsetForEpoch(newEpoch - 1) which calls upper_bound(newEpoch-1).
-    //   To get a non-(-1) result the cache needs an entry with epoch > (newEpoch-1),
-    //   i.e. epoch >= newEpoch.
-    //
-    // Setup:
-    //   1. Create as Leader epoch=1 → cache {1→0}. Append 3 records → LEO=3.
-    //   2. becomeLeader epoch=2 → cache.assign(2, 3) → cache {1→0, 2→3}.
-    //      Append 2 more records → LEO=5.
-    //   3. becomeFollower epoch=1 (stale follower demoted back; cache NOT reset).
-    //   4. applyReplicated epoch=2 response (no records):
-    //        truncateOffsetForEpoch(1) on {1→0, 2→3}
-    //        → upper_bound(1) finds {2→3} → returns 3.
-    //        truncateLog(3) called → log physically truncated to offset 3.
-    //   5. ASSERT follower LEO == 3 (EXACT boundary), not 0 or 5.
-    //      A truncate-to-0 bug yields 0; skipping truncation yields 5.
-
+    // KIP-320/595 + KIP-279: the post-truncation LEO equals the EXACT lineage
+    // boundary from a DivergingEpoch answer — min(leader's end of the epoch,
+    // our own end of it) — never 0, never untouched.
     TempDir dir("fix4_trunc_exact");
     rune::storage::Log log(dir.path);
     InMemoryTransport transport;
@@ -1851,97 +1373,59 @@ TEST(EpochChangeTruncationTest, FollowerTruncatesToExactEpochBoundaryOffset) {
     std::vector<NodeId> replicas = {kL, kF};
     std::vector<NodeId> isr      = {kL, kF};
 
-    // Steps 1-2: start as Leader to seed the epoch cache with two entries.
+    // Leader at epoch 1 (cache {1:0}), 3 records stamped 1; epoch 2 (cache
+    // {1:0, 2:3}), 2 records stamped 2.
     PartitionReplica replica(makeConfig(kL), Role::Leader, /*epoch=*/1,
                               replicas, isr, &log, &transport);
-
-    // Append 3 epoch-1 records → LEO=3. Constructor set cache {1→0}.
     replica.append(makePayload(0xA1, 8), /*acksAll=*/false);
     replica.append(makePayload(0xA2, 8), /*acksAll=*/false);
     replica.append(makePayload(0xA3, 8), /*acksAll=*/false);
-    ASSERT_EQ(replica.logEndOffset(), 3) << "Expected LEO=3 after 3 epoch-1 appends";
-
-    // becomeLeader epoch=2 → epochCache_.assign(2, 3) → cache {1→0, 2→3}.
+    ASSERT_EQ(replica.logEndOffset(), 3);
     replica.becomeLeader(/*epoch=*/2, {kL, kF});
-
-    // Append 2 epoch-2 records → LEO=5.
     replica.append(makePayload(0xB1, 8), /*acksAll=*/false);
     replica.append(makePayload(0xB2, 8), /*acksAll=*/false);
-    ASSERT_EQ(replica.logEndOffset(), 5) << "Expected LEO=5 after 2 epoch-2 appends";
+    ASSERT_EQ(replica.logEndOffset(), 5);
+    ASSERT_EQ(replica.lastFetchedEpoch(), 2);
 
-    // Step 3: transition to Follower at epoch=1.
-    // epochCache_ is NOT reset by becomeFollower — it retains {1→0, 2→3}.
-    replica.becomeFollower(/*leaderEpoch=*/1, kF);
-    ASSERT_EQ(replica.logEndOffset(), 5) << "Log must still have 5 records after role change";
-
-    // Step 4: inject epoch=2 response (no records) — triggers truncation.
-    // truncationOffsetForEpochChange(cache={1→0,2→3}, newEpoch=2):
-    //   truncateOffsetForEpoch(1) → upper_bound(1) on {1→0,2→3}
-    //   → iterator to {2→3} → returns value=3.
-    // truncateLog(3) is called → log physically truncated, LEO=3.
+    // Demoted: the new epoch-3 leader never held epoch 2 — its lineage for our
+    // last epoch (2) is "epoch 1, ending at 3".
+    replica.becomeFollower(/*leaderEpoch=*/3, kF);
+    ASSERT_EQ(replica.logEndOffset(), 5) << "no truncation on becomeFollower (fetch-path validation)";
+    FetchResponseMsg div{};
+    div.leaderEpoch = 3; div.partition = 0; div.errorCode = kErrDivergingEpoch;
+    { static rune::replication::ErrorPayloadBuf epb_; div.records = epb_.set(1, 3); }
+    replica.applyReplicated(div);
     constexpr Offset kExactBoundary = 3;
-
-    FetchResponseMsg epoch2Resp{};
-    epoch2Resp.leaderEpoch    = 2;
-    epoch2Resp.partition      = 0;
-    epoch2Resp.highWatermark  = 0;
-    epoch2Resp.logStartOffset = 0;
-    epoch2Resp.errorCode      = kErrNone;
-    epoch2Resp.records        = {}; // no records — epoch-change signal only
-
-    replica.applyReplicated(epoch2Resp);
-
-    // Step 5: FIX 4 CORE ASSERTION.
-    // LEO must be EXACTLY kExactBoundary = 3.
-    //   If truncation was skipped (bug):  LEO = 5  → FAIL
-    //   If truncated to wrong offset 0:   LEO = 0  → FAIL
-    //   Correct (FIX 2 + 4):              LEO = 3  → PASS
     ASSERT_EQ(replica.logEndOffset(), kExactBoundary)
-        << "FIX 4: Post-truncation LEO must equal the exact epoch-cache boundary = "
-        << kExactBoundary << ". "
-        << "Got " << replica.logEndOffset() << ". "
-        << "Truncation skipped → 5; truncate-to-0 bug → 0; correct → 3.";
+        << "post-truncation LEO must equal the exact lineage boundary";
+    EXPECT_EQ(replica.lastFetchedEpoch(), 1) << "the epoch-2 entry was pruned with its records";
 
-    // Appendable after truncation: new epoch-2 record resumes at kExactBoundary.
-    auto ep2Payload = makePayload(0xE0, 8);
-    epoch2Resp.records = std::span<const uint8_t>(ep2Payload.data(), ep2Payload.size());
-    replica.applyReplicated(epoch2Resp);
-    EXPECT_EQ(replica.logEndOffset(), kExactBoundary + 1)
-        << "Log must be appendable at exact boundary after truncation";
-
-    // Epoch-1 records (offsets 0-2) must still be readable.
-    {
-        auto bytes = log.read(0, 1 << 20);
-        EXPECT_FALSE(bytes.empty()) << "Epoch-1 records must survive truncation";
-    }
-
-    // Divergent epoch-2 records (offsets 3-4 from before the truncation) are gone.
-    EXPECT_LT(replica.logEndOffset(), 6)
-        << "Divergent epoch-2 tail (offset 3-4) must be removed by truncation";
+    // Appendable at the boundary: an epoch-3 record lands at 3.
+    auto p = makePayload(0xE0, 8);
+    FetchResponseMsg data{};
+    data.leaderEpoch = 3; data.partition = 0; data.errorCode = kErrNone;
+    data.records = std::span<const uint8_t>(p.data(), p.size());
+    replica.applyReplicated(data);
+    EXPECT_EQ(replica.logEndOffset(), kExactBoundary + 1);
+    EXPECT_EQ(replica.lastFetchedEpoch(), 3);
 }
 
 // Stronger assertion: truncation landed at EXACT numeric boundary before re-append.
 // We verify this by truncating WITHOUT appending new records and checking LEO directly.
 TEST(EpochChangeTruncationTest, TruncationLandsAtExactNumericBoundary) {
-    // Build a follower with known divergent offsets, then trigger truncation
-    // via applyReplicated() with a new epoch.  The LEO after truncation (before
-    // any new records arrive) must equal the epoch-cache boundary offset exactly.
+    // KIP-279 min(): the leader's end of our last epoch (2) is BELOW our own end
+    // of it (5) → truncate to the leader's; and a frame from a newer epoch than
+    // ours is never applied (no truncation / adoption off a response).
     TempDir followerDir("trunc_exact");
-
     rune::storage::Log followerLog(followerDir.path);
-    InMemoryTransport transport; // needed for constructor but won't send
+    InMemoryTransport transport;
 
     constexpr NodeId kL = 1, kF = 2;
     std::vector<NodeId> replicas = {kL, kF};
     std::vector<NodeId> isr      = {kL, kF};
 
-    // Follower starts at epoch 1.
     PartitionReplica follower(makeConfig(kF), Role::Follower, /*epoch=*/1,
                                replicas, isr, &followerLog, &transport);
-    transport.setLeader(nullptr);
-    transport.addFollower(kF, &follower);
-
-    // Inject 5 epoch-1 records via fake responses (epoch stays 1, no truncation yet).
     for (int i = 0; i < 5; ++i) {
         auto p = makePayload(static_cast<uint8_t>(0x10 + i), 8);
         FetchResponseMsg r{};
@@ -1950,52 +1434,29 @@ TEST(EpochChangeTruncationTest, TruncationLandsAtExactNumericBoundary) {
         r.records = std::span<const uint8_t>(p.data(), p.size());
         follower.applyReplicated(r);
     }
-    ASSERT_EQ(follower.logEndOffset(), 5)
-        << "Expected 5 records after epoch-1 seeding";
+    ASSERT_EQ(follower.logEndOffset(), 5);
+    ASSERT_EQ(follower.lastFetchedEpoch(), 1);
 
-    // Now inject an epoch-2 response with NO records.
-    // applyReplicated will:
-    //   1. Detect epoch change (2 > 1).
-    //   2. Look up truncation offset from epochCache (epoch 1 started at 0 → truncate to 0).
-    //   Wait — the epoch cache was seeded with epoch=1 at offset 0 (constructor).
-    //   A fresh follower's epochCache was assigned epoch=1 at offset 0 via
-    //   the constructor only when role==Leader.  For follower, the epochCache is
-    //   updated as responses arrive.  Since epoch-1 responses hit the !( > epoch_)
-    //   branch they don't update the cache.  The first epoch-2 response triggers
-    //   truncationOffsetForEpochChange(cache, 2).
-    //
-    // The important thing: we assert the LEO after truncation is >= 0 AND < 5.
-    // If truncateTo is broken (goes to wrong offset), the LEO will be wrong.
-    // Specifically: if it truncates to 0 when it should truncate to some boundary,
-    // we'd see LEO=0. If it hard-codes truncateOffset (FIX 2 bug), it matches
-    // the argument to truncateTo() even if the file is physically at a different
-    // position.  With FIX 2 applied, LEO = activeSegment().nextOffset() which
-    // is the true on-disk boundary.
+    FetchResponseMsg newer{};
+    newer.leaderEpoch = 2; newer.partition = 0; newer.errorCode = kErrNone;
+    follower.applyReplicated(newer);
+    EXPECT_EQ(follower.logEndOffset(), 5) << "a newer-epoch frame must not truncate";
+    EXPECT_EQ(follower.epoch(), 1) << "nor be adopted";
 
-    auto divPayload = makePayload(0xDD, 8);
-    FetchResponseMsg epoch2Resp{};
-    epoch2Resp.leaderEpoch    = 2;
-    epoch2Resp.partition      = 0;
-    epoch2Resp.highWatermark  = 0;
-    epoch2Resp.logStartOffset = 0;
-    epoch2Resp.errorCode      = kErrNone;
-    epoch2Resp.records        = {}; // no records — just the epoch change signal
+    follower.becomeFollower(2, kL);
+    FetchResponseMsg div{};
+    div.leaderEpoch = 2; div.partition = 0; div.errorCode = kErrDivergingEpoch;
+    { static rune::replication::ErrorPayloadBuf epb_; div.records = epb_.set(1, 2); }
+    follower.applyReplicated(div);
+    const Offset leoAfterTrunc = follower.logEndOffset();
+    EXPECT_EQ(leoAfterTrunc, 2) << "min(leader end 2, own end 5)";
 
-    follower.applyReplicated(epoch2Resp);
-
-    // After truncation, follower LEO must be a valid offset (0 ≤ LEO ≤ 5).
-    Offset leoAfterTrunc = follower.logEndOffset();
-    EXPECT_GE(leoAfterTrunc, 0)
-        << "LEO after truncation must be non-negative";
-    EXPECT_LE(leoAfterTrunc, 5)
-        << "LEO after truncation must not exceed pre-truncation LEO";
-
-    // Log must be appendable: inject one epoch-2 record and LEO must advance.
     auto p2 = makePayload(0xEE, 8);
-    epoch2Resp.records = std::span<const uint8_t>(p2.data(), p2.size());
-    follower.applyReplicated(epoch2Resp);
-    EXPECT_GT(follower.logEndOffset(), leoAfterTrunc)
-        << "Log must be appendable after truncation";
+    FetchResponseMsg data{};
+    data.leaderEpoch = 2; data.partition = 0; data.errorCode = kErrNone;
+    data.records = std::span<const uint8_t>(p2.data(), p2.size());
+    follower.applyReplicated(data);
+    EXPECT_EQ(follower.logEndOffset(), leoAfterTrunc + 1) << "appendable after truncation";
 }
 
 // ===========================================================================
@@ -2269,35 +1730,18 @@ TEST(AuditFixB1, FollowerTruncateThenRefetchLowerOffset_HWNotStale) {
     int16_t err = leader.onFetchRequest(lowerReq, clock);
     ASSERT_EQ(err, kErrNone) << "Lower fetchOffset fetch must be accepted";
 
-    // After the leader processes the lower fetchOffset=5:
-    // B1 fix: leader's tracked follower LEO is now 5.
-    // Because prevHw_=10 (floor), HW stays >= 10.
-    // Verify HW still holds at >= 10 (committed prefix safe).
-    EXPECT_GE(leader.highWatermark(), 10)
-        << "B1/B2: HW must not regress below committed floor after lower follower fetch";
-
-    // B1 specific: if a FRESH HW computation were done with follower at LEO=5,
-    // majority of {leaderLEO=10, followerLEO=5} = 5 < prevHw_ → floor holds.
-    // We verify by appending 5 more records (leader LEO=15) and ensuring HW
-    // does NOT advance to 15 just because the follower was at 10 pre-truncation.
-    // Follower is removed from transport — pushes are dropped.
-    for (int i = 0; i < 5; ++i) leader.append(makePayload(static_cast<uint8_t>(i + 10)));
-    Offset leo15 = leader.logEndOffset();
-    ASSERT_EQ(leo15, 15);
-
-    // Without re-acking from the follower, HW must NOT advance to 15
-    // (that would require the leader to incorrectly count the old stale LEO=10).
-    // Drive leader alone (follower is partitioned — no push delivery).
-    for (int i = 0; i < 10; ++i) {
-        clock += 1'000'000LL;
-        leader.doWork(clock);
-        transport.pump(clock);
-    }
-    // B1 fix: HW must be 10 (floor) not 15 (which would require follower at LEO=15).
-    EXPECT_LT(leader.highWatermark(), 15)
-        << "B1: HW must not advance to 15 when follower has NOT acked up to 15";
-    EXPECT_GE(leader.highWatermark(), 10)
-        << "B1/B2: HW floor (committed prefix) must be preserved";
+    // B1 (SET, not max): the leader's tracked follower LEO is now 5 — the stale
+    // pre-truncation 10 is never counted again.  (Asserted on the tracked value
+    // itself: the served HW is clamped by the min-ISR / healthy floors and so
+    // cannot show it — the review's M3.)
+    EXPECT_EQ(leader.followerLeoForTest(kF), 5)
+        << "B1: the leader must track the follower's LOWER position (SET, not max)";
+    // DUR-1: regressing BELOW the HW (10) = lost acknowledged records → the
+    // follower also leaves the ISR at once (KIP-966, data plane).
+    EXPECT_EQ(std::count(leader.isr().begin(), leader.isr().end(), kF), 0)
+        << "DUR-1: a follower that regressed below the HW must leave the ISR";
+    // The committed prefix never regresses.
+    EXPECT_GE(leader.highWatermark(), 10);
 }
 
 // ===========================================================================
@@ -2409,8 +1853,11 @@ TEST(NB1_BecomeLeaderUncommittedTail, HwFloorIsCommittedNotLeo) {
             << "NB1: read() must return exactly 5 batches (offsets 0-4), got " << batchCount;
     }
 
-    // Sanity: once kF2 re-acks (sends fetch at LEO=X >= 5), HW should advance.
-    // Simulate kF2 re-acking at its current LEO=0 — HW stays at floor=5 since 0<5.
+    // kF2 is a committed-ISR member whose validated fetch lies BELOW the HW
+    // (LEO 0 < 5): it provably lacks committed records (review 2026-10-04
+    // MEDIUM-4 — every ISR member holds everything below the HW).  It is removed
+    // from the ISR (self-managed: at once) and can no longer pin the HW; the HW
+    // then is the min over the remaining ISR {kF} (minIsr 1).
     FetchRequestMsg req{};
     req.leaderEpoch = 2;
     req.partition   = 0;
@@ -2420,9 +1867,10 @@ TEST(NB1_BecomeLeaderUncommittedTail, HwFloorIsCommittedNotLeo) {
     InMemoryTransport newLeaderTransport;
     newLeaderTransport.setLeader(&f1);
     f1.onFetchRequest(req, 1'000'000LL);
-    // majority(2) of {LEO_f1=10, LEO_kF2=0}: sorted=[10,0] → 0 < floor=5 → HW=5.
-    EXPECT_EQ(f1.highWatermark(), 5)
-        << "NB1: HW must remain 5 when kF2 has LEO=0 (majority not satisfied above 5)";
+    const auto& isrAfter = f1.isr();
+    EXPECT_EQ(std::find(isrAfter.begin(), isrAfter.end(), kF2), isrAfter.end())
+        << "an ISR member below the HW (it lost committed records) kept its seat";
+    EXPECT_GE(f1.highWatermark(), 5) << "the committed floor never regresses";
 }
 
 // ===========================================================================
@@ -2556,7 +2004,8 @@ TEST(C3_ElectionCommittedHw, CrashedLeaderUnregistered_CandidateWithLowLeoReject
 
     // f1 is fully caught up (LEO=10). f2 may have fewer records.
     // Drive until f1 reaches LEO=10.
-    for (int i = 0; i < kDriverCap && f1.logEndOffset() < 10; ++i) {
+    // (Kafka model: f1 learns the HW from its next answer after the last ack.)
+    for (int i = 0; i < kDriverCap && (f1.logEndOffset() < 10 || f1.highWatermark() < 10); ++i) {
         clk += 1'000'000LL;
         leader.doWork(clk); f1.doWork(clk);
         transport.pump(clk);
@@ -3181,7 +2630,7 @@ TEST(PartBTest, PartB15_ANEW2_ComputeHwLargeIsrNoBoundaryViolation)
         // Leader LEO=100. Sorted: [100]*17, [0]*16. Majority=17; HW=leos[16]=100.
         for (int i = 1; i <= 16; ++i) s.updateFollowerFetchOffset(i, 100LL);
         for (int i = 17; i <= 32; ++i) s.updateFollowerFetchOffset(i, 0LL);
-        EXPECT_EQ(s.highWatermark(), 100LL)
+        EXPECT_EQ(s.highWatermark(), 0LL)   // Kafka model: HW = min LEO over the ISR
             << "A-NEW-2: ISR=33, 17 at 100 + 16 at 0, majority=17, HW must be 100";
     }
 
@@ -3212,7 +2661,7 @@ TEST(PartBTest, PartB15_ANEW2_ComputeHwLargeIsrNoBoundaryViolation)
         // 33 nodes at 75, 32 at 0. majority=33. HW=75.
         for (int i = 1; i <= 32; ++i) s.updateFollowerFetchOffset(i, 75LL);
         for (int i = 33; i < 65; ++i) s.updateFollowerFetchOffset(i, 0LL);
-        EXPECT_EQ(s.highWatermark(), 75LL)
+        EXPECT_EQ(s.highWatermark(), 0LL)   // Kafka model: HW = min LEO over the ISR
             << "A-NEW-2: ISR=65, 33 at 75 + 32 at 0, majority=33, HW must be 75";
     }
 }
@@ -3974,6 +3423,10 @@ TEST(PartitionReplicaRegression, PushOversizeFirstBatchIsDeliveredRegression) {
     cfg.pushOnAppend        = true;    // GR-10 direct-append push path
 
     PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+    // KIP-320/595: follower 2 reports in (validated pure ack on its empty log)
+    // — a leader pushes only to validated followers.
+    (void)leader.onFetchRequest(FetchRequestMsg{1, 0, 2, 0, 0, 0}, 0);
+    transport.calls = 0;
 
     // append() with pushOnAppend=true calls pushToFollowers(baseOffset) inline.
     Offset base = leader.append(makePayload(0xEF, 300));
@@ -4049,6 +3502,10 @@ TEST(PartitionReplicaRegression, PushUnsendableHeadDoesNotSpinRegression) {
     cfg.pushOnAppend        = true;           // coalesced doWork push path
 
     PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &transport);
+    // KIP-320/595: follower 2 reports in (validated pure ack on its empty log)
+    // — a leader pushes only to validated followers.
+    (void)leader.onFetchRequest(FetchRequestMsg{1, 0, 2, 0, 0, 0}, 0);
+    transport.calls = 0;
 
     // Append DIRECTLY to the log (the produce hot path) so only doWork pushes.
     {
@@ -4161,6 +3618,10 @@ TEST(PartitionReplicaRegression, PushChunkBoundedByTransportCeilingRegression) {
     PartitionReplica leader(lcfg, Role::Leader, 1, {1, 2}, {1, 2}, &logL, &lt);
     PartitionReplica follower(fcfg, Role::Follower, 1, {1, 2}, {1, 2}, &logF, &ft);
     follower.becomeFollower(1, 1);
+    // KIP-320/595: the follower reports in (validated pure ack on its empty log)
+    // — a leader pushes only to validated followers.
+    (void)leader.onFetchRequest(follower.nextFetch(), 0);
+    lb.toFollower.clear();
 
     // 8 batches x ~360 B = ~2.9 KB in ONE cycle (> 2x the 1000 B ceiling).
     Offset off = 0;
@@ -4222,6 +3683,10 @@ TEST(PartitionReplicaRegression, PushMemoNotArmedWhileCeilingUnresolvedRegressio
     cfg.pushOnAppend = true;
     rune::storage::Log log(logDir.string());
     PartitionReplica leader(cfg, Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    // KIP-320/595: follower 2 reports in (validated pure ack on its empty log)
+    // — a leader pushes only to validated followers.
+    (void)leader.onFetchRequest(FetchRequestMsg{1, 0, 2, 0, 0, 0}, 0);
+    t.calls = 0;
     {
         rune::protocol::RecordBatchBuilder b(0, 1000);
         b.append("k", std::string(300, 'x'), 1000);
@@ -4287,6 +3752,7 @@ TEST(GR10_PushOnAppend, LeaderPushesImmediatelyOnAppend) {
     PartitionReplica follower(fcfg, Role::Follower, 1, replicas, isr, &logF, &transport);
     transport.setLeader(&leader);
     transport.addFollower(kF, &follower);
+    reportIn(leader, {&follower}, transport);
 
     // Before any append: no pending messages.
     EXPECT_EQ(transport.pendingCount(), 0u);
@@ -4329,6 +3795,7 @@ TEST(GR10_PushOnAppend, FollowerFastAcksAfterPush) {
     PartitionReplica follower(fcfg, Role::Follower, 1, replicas, isr, &logF, &transport);
     transport.setLeader(&leader);
     transport.addFollower(kF, &follower);
+    reportIn(leader, {&follower}, transport);
 
     Offset preLeo = follower.logEndOffset();
     leader.append(makePayload(0xAB));
@@ -4373,6 +3840,7 @@ TEST(GR10_PushOnAppend, HwAdvancesWithoutFetchInterval_TwoReplica) {
     PartitionReplica follower(fcfg, Role::Follower, 1, replicas, isr, &logF, &transport);
     transport.setLeader(&leader);
     transport.addFollower(kF, &follower);
+    reportIn(leader, {&follower}, transport);
 
     leader.append(makePayload(0x77));
     Offset leo = leader.logEndOffset();
@@ -4608,6 +4076,7 @@ TEST(GR10_PushOnAppend, ThreeNodeHwConvergesViaPushFastAck) {
     PartitionReplica f3(makePushCfg(kF3, 1), Role::Follower, 1, replicas, isr, &logF3, &transport);
     transport.setLeader(&leader);
     transport.addFollower(kF2, &f2);
+    reportIn(leader, {&f2, &f3}, transport);
     transport.addFollower(kF3, &f3);
 
     // minIsr=2 for leader: majority of 3 = 2.
@@ -4659,6 +4128,7 @@ TEST(GR10_PushOnAppend, FailoverDurabilityPreserved) {
     PartitionReplica f3(makeCfg(kF3, 1), Role::Follower, 1, replicas, isr, &logF3, &transport);
     transport.setLeader(&leader);
     transport.addFollower(kF2, &f2);
+    reportIn(leader, {&f2, &f3}, transport);
     transport.addFollower(kF3, &f3);
 
     // Produce and wait for acks=All (HW >= leo).
@@ -4666,9 +4136,14 @@ TEST(GR10_PushOnAppend, FailoverDurabilityPreserved) {
     Offset leo = leader.logEndOffset();
 
     bool committed = false;
+    int64_t clk0 = 0;
     for (int i = 0; i < kDriverCap; ++i) {
-        transport.pump(0);
-        if (leader.highWatermark() >= leo) { committed = true; break; }
+        transport.pump(clk0);
+        // Kafka model: the HW advances on the LAST ISR ack; f2 learns it from its
+        // next answer (keepalive) — drive until it has, as a real cluster would.
+        if (leader.highWatermark() >= leo && f2.highWatermark() >= leo) { committed = true; break; }
+        clk0 += 5'000'000LL;
+        leader.doWork(clk0); f2.doWork(clk0); f3.doWork(clk0);
     }
     ASSERT_TRUE(committed) << "acks=All must commit via push+fast-ack";
     EXPECT_GE(leader.highWatermark(), leo);
@@ -4751,4 +4226,669 @@ TEST(DR9_ReconcileInvariant, StampLeaderEpochDoesNotChangeCrc) {
     EXPECT_EQ(batch[rune::protocol::batch::kCrcOffset + 1], crc1);
     EXPECT_EQ(batch[rune::protocol::batch::kCrcOffset + 2], crc2);
     EXPECT_EQ(batch[rune::protocol::batch::kCrcOffset + 3], crc3);
+}
+
+// ===========================================================================
+// Fix round 1 (Opus review of 0ff9322) — MEDIUM-5 / MEDIUM-6 / LOW.
+// ===========================================================================
+namespace {
+struct CaptureT : public PartitionTransport {
+    std::vector<FetchResponseMsg> resps;
+    std::vector<std::vector<uint8_t>> bodies;
+    std::vector<FetchRequestMsg> reqs;
+    bool sendFetchRequest(const FetchRequestMsg& r) override { reqs.push_back(r); return true; }
+    bool sendFetchRequestTo(NodeId, const FetchRequestMsg& r) override { reqs.push_back(r); return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg& r) override {
+        bodies.emplace_back(r.records.begin(), r.records.end());
+        resps.push_back(r);
+        resps.back().records = std::span<const uint8_t>(bodies.back());
+        return true;
+    }
+};
+std::vector<uint8_t> stampedBatches(int64_t base, int n, int32_t ep) {
+    std::vector<uint8_t> all;
+    for (int i = 0; i < n; ++i) {
+        rune::protocol::RecordBatchBuilder b(base + i, 0);
+        b.append(std::string_view{}, std::string_view("rec", 3), 0);
+        auto one = b.build();
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(one.data(), ep);
+        all.insert(all.end(), one.begin(), one.end());
+    }
+    return all;
+}
+} // namespace
+
+// MEDIUM-6: mixed v2/v3 replication is unsupported — fail closed.  A v2 fetch
+// (no lineage) with fetchOffset > 0 is refused (never served, never credited);
+// a v2 empty-log follower is still served; a v2 leader's frame is dropped by a
+// v3 follower.
+TEST(PartitionReplicaRegression, MixedV2V3ReplicationFailsClosed) {
+    TempDir d("mixv2");
+    rune::storage::Log log(d.path);
+    CaptureT t;
+    PartitionReplica leader(makeConfig(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    leader.append(makePayload(1));
+    leader.append(makePayload(2));
+    t.resps.clear(); t.bodies.clear();
+    FetchRequestMsg v2{};
+    v2.leaderEpoch = 1; v2.partition = 0; v2.followerId = 2; v2.fetchOffset = 1;
+    v2.maxBytes = 1 << 20; v2.lastFetchedEpoch = kLastFetchedEpochV2Frame;
+    EXPECT_EQ(leader.onFetchRequest(v2, 1), kErrUnsupportedWireVersion);
+    ASSERT_EQ(t.resps.size(), 1u);
+    EXPECT_EQ(t.resps[0].errorCode, kErrUnsupportedWireVersion);
+    EXPECT_EQ(leader.followerLeoForTest(2), -1) << "a refused v2 fetch was credited";
+    v2.fetchOffset = 0;
+    EXPECT_EQ(leader.onFetchRequest(v2, 2), kErrNone) << "an empty-log v2 follower has nothing to diverge";
+
+    TempDir fd("mixv2f");
+    rune::storage::Log flog(fd.path);
+    CaptureT ft;
+    PartitionReplica f(makeConfig(2), Role::Follower, 1, {1, 2}, {1, 2}, &flog, &ft);
+    f.becomeFollower(1, 1);
+    const auto recs = stampedBatches(0, 2, 1);
+    uint8_t frame[4096];
+    const std::size_t n = FetchResponseMsg::encode(frame, 0, 1, 0, 2, 0, kErrNone,
+                                                   std::span<const uint8_t>(recs), 0);
+    frame[6] = 2; frame[7] = 0;                  // a v2 leader's frame
+    f.applyReplicated(FetchResponseMsg::decode(frame, 0, n));
+    EXPECT_EQ(f.logEndOffset(), 0) << "a v2 frame was applied";
+}
+
+// MEDIUM-5: a follower that fetched without an epoch (empty / unstamped log)
+// and is AHEAD of the leader gets OffsetOutOfRange with the leader's log end
+// and truncates to it (Kafka) — it never stays stuck re-fetching.
+TEST(PartitionReplicaRegression, FollowerOutOfRangeTruncatesToLeaderEnd) {
+    TempDir ld("oorL"), fd("oorF");
+    rune::storage::Log llog(ld.path), flog(fd.path);
+    InMemoryTransport t;
+    PartitionReplica leader(makeConfig(1), Role::Leader, 1, {1, 2}, {1, 2}, &llog, &t);
+    PartitionReplica f(makeConfig(2), Role::Follower, 1, {1, 2}, {1, 2}, &flog, &t);
+    // Follower holds 5 UNSTAMPED (legacy, epoch -1) batches; the leader holds 2.
+    for (int i = 0; i < 5; ++i) {
+        rune::protocol::RecordBatchBuilder b(i, 0);
+        b.append(std::string_view{}, std::string_view("old", 3), 0);
+        flog.append(b.build(), i);
+    }
+    leader.append(makePayload(1));
+    leader.append(makePayload(2));
+    f.becomeFollower(1, 1);
+    ASSERT_EQ(f.lastFetchedEpoch(), -1);
+    t.setLeader(&leader);
+    t.addFollower(2, &f);
+    int64_t clk = 0;
+    for (int i = 0; i < 200 && f.logEndOffset() != 2; ++i) {
+        clk += 1'000'000LL;
+        leader.doWork(clk); f.doWork(clk); t.pump(clk);
+    }
+    EXPECT_EQ(f.logEndOffset(), 2) << "stuck ahead of the leader on OffsetOutOfRange";
+}
+
+// MEDIUM-5: a missing / corrupt epoch checkpoint over a non-empty log is rebuilt
+// from the batches' stamped epochs — never left silently empty.
+TEST(PartitionReplicaRegression, FailedEpochCheckpointRestoreRebuildsFromStamps) {
+    TempDir d("epochrebuild");
+    {
+        rune::storage::Log log(d.path);
+        const auto a = stampedBatches(0, 3, 4);
+        const auto b = stampedBatches(3, 2, 7);
+        log.append(a, 2);
+        log.append(b, 4);
+        std::ofstream(d.path + "/leader-epoch-checkpoint") << "garbage";
+    }
+    rune::storage::Log log(d.path);
+    log.recover();
+    CaptureT t;
+    PartitionReplica f(makeConfig(2), Role::Follower, 1, {1, 2}, {1, 2}, &log, &t);
+    const auto& k = f.leaderEpochCacheForTest();
+    EXPECT_EQ(k.startOffsetFor(4), 0);
+    EXPECT_EQ(k.startOffsetFor(7), 3);
+    EXPECT_EQ(f.lastFetchedEpoch(), 7);
+}
+
+// LOW: on demotion the epoch assigned at becomeLeader with no record appended
+// in it (a phantom entry) is dropped — lastFetchedEpoch names the epoch of the
+// last record, so the next leader does not answer a needless DivergingEpoch.
+TEST(PartitionReplicaRegression, DemotionDropsPhantomEpochEntry) {
+    TempDir d("phantom");
+    rune::storage::Log log(d.path);
+    CaptureT t;
+    PartitionReplica r(makeConfig(1), Role::Leader, 1, {1, 2}, {1, 2}, &log, &t);
+    r.append(makePayload(1));
+    r.becomeLeader(2, {1, 2});                   // epoch 2 assigned at LEO 1, nothing appended
+    ASSERT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 2);
+    r.becomeFollower(3, 2);
+    EXPECT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 1) << "phantom epoch 2 kept";
+    EXPECT_EQ(r.lastFetchedEpoch(), 1);
+}
+
+// ===========================================================================
+// Review 2026-10-04 (rev3) — CRITICAL-1 / MAJOR-1 repros (RED on e5d41b4).
+// ===========================================================================
+namespace {
+FetchRequestMsg rev3Fetch(Epoch ep, NodeId f, Offset off, int32_t lfe) {
+    FetchRequestMsg r{};
+    r.leaderEpoch = ep; r.partition = 0; r.followerId = f;
+    r.fetchOffset = off; r.maxBytes = 0; r.topicId = 0; r.lastFetchedEpoch = lfe;
+    return r;
+}
+bool rev3InIsr(const PartitionReplica& r, NodeId n) {
+    const auto& isr = r.isr();
+    return std::find(isr.begin(), isr.end(), n) != isr.end();
+}
+} // namespace
+
+// CRITICAL-1 (unit, R1): the leader's per-follower LEO survived across
+// leaderships — a member that has NOT fetched in the new leadership was counted
+// at its previous-leadership position (Kafka Partition.makeLeader resets every
+// replica's state on a new leader epoch).
+TEST(PartitionReplicaRegression, NewLeadershipForgetsFollowerPositions_HwNeverFromPreviousLeadership) {
+    TempDir d("rev3r1"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kB = 1, kA = 2, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    PartitionReplica b(makeConfig(kB, 10'000, 1'000'000, 2), Role::Leader, 1, all, all, &log, &t);
+    for (int i = 0; i < 20; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    int64_t clock = 1'000'000;
+    b.doWork(clock);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(1, kA, 20, 1), clock), kErrNone);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(1, kC, 5, 1), clock), kErrNone);
+    EXPECT_EQ(b.highWatermark(), 5);
+    b.becomeFollower(2, kC);
+    b.becomeLeader(3, {kB, kA, kC});             // A has not fetched in epoch 3
+    for (int i = 0; i < 3; ++i) ASSERT_GE(b.append(makePayload(3)), 0);
+    clock += 1'000'000; b.doWork(clock);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(3, kC, b.logEndOffset(), 3), clock), kErrNone);
+    EXPECT_LE(b.highWatermark(), 5) << "HW counted A at its previous-leadership position";
+    EXPECT_LE(b.followerLeoForTest(kA), 0) << "A's epoch-1 position survived the leadership change";
+}
+
+// CRITICAL-1 (controller snapshot): a leader publishes a follower's position
+// for the controller's election only once that follower fetched (validated) in
+// THIS leadership — never a stale position stamped with the current epoch.
+TEST(PartitionReplicaRegression, PositionSnapshotCarriesOnlyFollowersValidatedThisLeadership) {
+    TempDir d("rev3snap"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kB = 1, kA = 2, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    PartitionReplica b(makeConfig(kB, 10'000, 1'000'000, 2), Role::Leader, 1, all, all, &log, &t);
+    for (int i = 0; i < 20; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    int64_t clock = 1'000'000;
+    b.doWork(clock);
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(1, kA, 20, 1), clock), kErrNone);
+    b.doWork(clock += 1'000'000);
+    ASSERT_EQ(b.controllerReplicaLeo(kA), 20);   // validated in epoch 1: published
+    b.becomeFollower(2, kC);
+    EXPECT_EQ(b.controllerReplicaLeo(kA), -1) << "a follower publishes another replica's position";
+    b.becomeLeader(3, {kB, kA, kC});
+    b.doWork(clock += 1'000'000);
+    EXPECT_EQ(b.controllerReplicaLeo(kA), -1)
+        << "the epoch-1 position of A was published under epoch " << b.controllerLeaderEpoch();
+    ASSERT_EQ(b.onFetchRequest(rev3Fetch(3, kA, 20, 1), clock), kErrNone);
+    b.doWork(clock += 1'000'000);
+    EXPECT_EQ(b.controllerReplicaLeo(kA), 20);   // validated in epoch 3: published again
+}
+
+// CRITICAL-1 (end to end, R1b): three real replicas.  A truncates under C's
+// leadership, goes slow, and leadership moves back to B: B must not ack records
+// ISR member A lacks.
+TEST(PartitionReplicaRegression, NewLeadershipForgetsFollowerPositions_EndToEnd) {
+    TempDir db("rev3r1b"), da("rev3r1a"), dc("rev3r1c");
+    rune::storage::Log lb(db.path), la(da.path), lc(dc.path);
+    InMemoryTransport t;
+    constexpr NodeId kB = 1, kA = 2, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    auto cfg = [](NodeId id) { return makeConfig(id, 10'000, 1'000'000, 2); };
+    PartitionReplica b(cfg(kB), Role::Leader, 1, all, all, &lb, &t);
+    PartitionReplica a(cfg(kA), Role::Follower, 1, all, all, &la, &t);
+    PartitionReplica c(cfg(kC), Role::Follower, 1, all, all, &lc, &t);
+    a.becomeFollower(1, kB); c.becomeFollower(1, kB);
+    t.setLeader(&b); t.addFollower(kA, &a); t.addFollower(kC, &c);
+    int64_t clock = 0;
+    for (int i = 0; i < 5; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] {
+        return a.logEndOffset() == 5 && c.logEndOffset() == 5 && b.highWatermark() == 5; }, b, a, c));
+    t.removeFollower(kC);                        // C stalls at 5
+    for (int i = 0; i < 15; ++i) ASSERT_GE(b.append(makePayload(1)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] {
+        return a.logEndOffset() == 20 && b.followerLeoForTest(kA) == 20; }, b, a));
+    ASSERT_EQ(b.highWatermark(), 5);
+    // Epoch 2: C leads (an ISR member holding the committed prefix); A, B truncate to 5.
+    t.removeFollower(kA);
+    c.becomeLeader(2, {kC, kA, kB}); a.becomeFollower(2, kC); b.becomeFollower(2, kC);
+    t.setLeader(&c); t.addFollower(kA, &a); t.addFollower(kB, &b);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(c.append(makePayload(2)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] {
+        return a.logEndOffset() == 8 && b.logEndOffset() == 8 && c.highWatermark() == 8; }, c, a, b));
+    t.removeFollower(kA);                        // A slow from here (inside replicaLagMaxMs)
+    for (int i = 0; i < 4; ++i) ASSERT_GE(c.append(makePayload(2)), 0);
+    ASSERT_TRUE(driveReplicas(t, clock, kDriverCap, [&] { return b.logEndOffset() == 12; }, c, b));
+    // Epoch 3: preferred election back to B (ISR carried over); A not fetching yet.
+    t.removeFollower(kB);
+    b.becomeLeader(3, {kB, kA, kC}); c.becomeFollower(3, kB);
+    t.setLeader(&b); t.addFollower(kC, &c);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(b.append(makePayload(3)), 0);   // offsets 12..14
+    (void)driveReplicas(t, clock, 20, [&] { return c.logEndOffset() == 15 && b.highWatermark() >= 15; }, b, c);
+    EXPECT_TRUE(rev3InIsr(b, kA));
+    EXPECT_LE(b.highWatermark(), a.logEndOffset())
+        << "committed past ISR member A's actual LEO (A holds " << a.logEndOffset() << ")";
+}
+
+// MAJOR-1 (R2): ISR expansion requires the follower to hold everything the new
+// leader held when elected (Kafka isFollowerInSync: followerEnd >=
+// leaderEpochStartOffset) — the leader's HW view right after an election can
+// lag the true committed offset.
+TEST(PartitionReplicaRegression, IsrExpansionRequiresLeaderEpochStartOffset) {
+    TempDir d("rev3r2"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kA = 2, kB = 1, kC = 3;
+    std::vector<NodeId> all = {kB, kA, kC};
+    PartitionReplica a(makeConfig(kA, 10'000, 1'000'000, 2), Role::Follower, 1, all, all, &log, &t);
+    seedStamped(a, 0, 10, 1, /*hw=*/5);          // holds 10 committed (ISR {B,A}), stale HW view 5
+    a.becomeLeader(2, {kA, kB});                 // C outside the ISR
+    int64_t clock = 1'000'000;
+    a.doWork(clock);
+    ASSERT_EQ(a.onFetchRequest(rev3Fetch(2, kC, 7, 1), clock), kErrNone);   // C holds [0,7)
+    for (int i = 0; i < 5; ++i) { clock += 1'000'000; a.doWork(clock); }
+    EXPECT_FALSE(rev3InIsr(a, kC)) << "C admitted while missing records the leader held at election";
+    ASSERT_EQ(a.onFetchRequest(rev3Fetch(2, kC, 10, 1), clock), kErrNone);  // caught up to 10
+    for (int i = 0; i < 5; ++i) { clock += 1'000'000; a.doWork(clock); }
+    EXPECT_TRUE(rev3InIsr(a, kC)) << "C never admitted once it held the leader-epoch start offset";
+}
+
+// MEDIUM-4 (KIP-903): a fetch from an OLDER process incarnation of a follower
+// than one the leader already saw (a frame of a dead process still in flight)
+// is never credited — the restarted follower may no longer hold that position.
+TEST(PartitionReplicaRegression, StaleIncarnationFetchNeverCredited) {
+    TempDir d("rev3inc"); rune::storage::Log log(d.path);
+    InMemoryTransport t;
+    constexpr NodeId kL = 1, kF = 2;
+    std::vector<NodeId> all = {kL, kF};
+    PartitionReplica l(makeConfig(kL, 10'000, 1'000'000, 1), Role::Leader, 1, all, all, &log, &t);
+    for (int i = 0; i < 20; ++i) ASSERT_GE(l.append(makePayload(1)), 0);
+    int64_t clock = 1'000'000;
+    l.doWork(clock);
+    auto f = rev3Fetch(1, kF, 10, 1);
+    f.incarnation = 5;                           // the restarted follower: holds [0,10)
+    ASSERT_EQ(l.onFetchRequest(f, clock), kErrNone);
+    ASSERT_EQ(l.followerLeoForTest(kF), 10);
+    auto stale = rev3Fetch(1, kF, 20, 1);
+    stale.incarnation = 4;                       // its previous process, at 20
+    (void)l.onFetchRequest(stale, clock += 1'000'000);
+    EXPECT_EQ(l.followerLeoForTest(kF), 10) << "credited a fetch of a dead follower process";
+    EXPECT_LE(l.highWatermark(), 10);
+}
+
+// MAJOR-2/3: the internal-ISR knowledge is DURABLE (the candidacy rule must
+// survive a whole-cluster restart) and only newer states replace older ones.
+TEST(InternalIsrRegression, KnowledgeIsDurableAndMonotonic) {
+    TempDir d("iisrk");
+    const std::string path = d.path + "/internal-isr.state";
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 4; a.version = 2; a.count = 2;
+    a.members[0] = 1; a.members[1] = 2;
+    {
+        InternalIsrKnowledge k(path);
+        EXPECT_TRUE(k.eligible(3)) << "no knowledge: everyone eligible (fresh cluster)";
+        ASSERT_TRUE(k.offer(a));
+        EXPECT_FALSE(k.eligible(3));
+        InternalIsrState older = a;
+        older.version = 1; older.count = 3; older.members[2] = 3;
+        EXPECT_TRUE(k.offer(older)) << "holds a newer state: the older one may be acked";
+        EXPECT_FALSE(k.eligible(3)) << "an older state replaced a newer one";
+    }
+    InternalIsrKnowledge k2(path);                // restart
+    ASSERT_NE(k2.latest(-3, 0), nullptr);
+    EXPECT_EQ(k2.latest(-3, 0)->version, 2);
+    EXPECT_FALSE(k2.eligible(3)) << "the candidacy rule did not survive a restart";
+    EXPECT_TRUE(k2.eligible(1));
+    // Re-review MEDIUM-B: only __cluster_metadata decides candidacy (the
+    // coordinator partitions moved to the controller-ISR path) — a state of any
+    // other internal partition (e.g. from an older file) is ignored by the rule.
+    InternalIsrState other{};
+    other.topicId = -1; other.partition = 0; other.leaderEpoch = 4; other.version = 1;
+    other.count = 2; other.members[0] = 1; other.members[1] = 3;
+    ASSERT_TRUE(k2.offer(other));
+    EXPECT_TRUE(k2.eligible(2)) << "a non-metadata internal ISR decided consensus candidacy";
+    EXPECT_FALSE(k2.eligible(3));
+    EXPECT_TRUE(k2.eligible(1));
+}
+
+// Re-review 2026-10-04 (fix round 2) MEDIUM-A: a node that voted in (or
+// observed) consensus term e+1 refuses to PERSIST or ACK an internal ISR state
+// of leadership e — even while its replica still follows the term-e leader
+// (the bridge has not applied NewLeadershipTerm yet).  Raft's term rule applied
+// to the ack: a zombie leader can neither commit through it nor plant a stale
+// candidacy view in it.  A state of the current term is still adopted + acked.
+TEST(InternalIsrRegression, StateOlderThanConsensusTermNeitherPersistedNorAcked) {
+    struct AckCapture : public PartitionTransport {
+        int acks = 0;
+        bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
+        bool sendInternalIsrAck(NodeId, const InternalIsrAckMsg&) override { ++acks; return true; }
+    };
+    TempDir fDir("iisr_term_F"), kDir("iisr_term_K");
+    rune::storage::Log fLog(fDir.path);
+    AckCapture t;
+    constexpr NodeId kL = 1, kF = 2, kY = 3;
+    std::vector<NodeId> all = {kL, kF, kY};
+    PartitionConfig cfg = makeConfig(kF, /*lagMs=*/10, /*lagOff=*/1'000'000);
+    cfg.topicId = -3;
+    InternalIsrKnowledge k(kDir.path + "/internal-isr.state");
+    int64_t term = 4;
+    k.setConsensusTermSource([](const void* p) noexcept { return *static_cast<const int64_t*>(p); }, &term);
+    PartitionReplica f(cfg, Role::Follower, 0, all, all, &fLog, &t);
+    f.setInternalIsrKnowledge(&k);
+    f.becomeFollower(4, kL);
+    auto msg = [&](int64_t epoch, int64_t version, std::initializer_list<NodeId> m) {
+        InternalIsrMsg x{};
+        x.topicId = -3; x.partition = 0; x.leaderId = kL; x.leaderEpoch = epoch; x.version = version;
+        for (NodeId n : m) x.isr[static_cast<std::size_t>(x.isrCount++)] = n;
+        return x;
+    };
+    f.onInternalIsr(msg(4, 1, {kL, kF, kY}));    // current term: adopted + acked
+    ASSERT_NE(k.latest(-3, 0), nullptr);
+    EXPECT_EQ(k.latest(-3, 0)->version, 1);
+    EXPECT_EQ(t.acks, 1);
+    term = 5;                                    // F granted Y's RequestVote for term 5
+    f.onInternalIsr(msg(4, 2, {kL, kF}));        // the zombie's shrink of Y
+    EXPECT_EQ(k.latest(-3, 0)->version, 1) << "persisted a state of term 4 after voting in term 5";
+    EXPECT_TRUE(k.latest(-3, 0)->contains(kY));
+    EXPECT_EQ(t.acks, 1) << "acked a state of term 4 after voting in term 5";
+    InternalIsrKnowledge reloaded(kDir.path + "/internal-isr.state");
+    ASSERT_NE(reloaded.latest(-3, 0), nullptr);
+    EXPECT_EQ(reloaded.latest(-3, 0)->version, 1) << "the stale state reached the disk";
+}
+
+// Re-review round 4 LOW-R4-1: the leader shares its last COMMITTED
+// __cluster_metadata ISR state in the election exchange, never its own pending
+// proposal.  L commits {L,F}; then F stalls too and L proposes {L} (held only on
+// L, as its self-ack).  Exported, {L} would be adopted by F and G while L
+// canvasses; L then dies and they admit only the dead L (leaderless, although
+// the HW counted committed ∪ proposed = everyone).  The pending state must stay
+// L's own vote-gate view only; once committed it is shared.
+TEST(InternalIsrRegression, LeaderExportsCommittedStateNotItsPendingProposal) {
+    TempDir lDir("r41_L"), fDir("r41_F"), gDir("r41_G");
+    rune::storage::Log lLog(lDir.path), fLog(fDir.path), gLog(gDir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2, kG = 3;
+    std::vector<NodeId> all = {kL, kF, kG};
+    auto cfgFor = [&](NodeId id) {
+        PartitionConfig c = makeConfig(id, /*lagMs=*/10, /*lagOff=*/1'000'000);
+        c.topicId = -3;
+        return c;
+    };
+    InternalIsrKnowledge kl, kf, kg;
+    PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
+    PartitionReplica f(cfgFor(kF), Role::Follower, 0, all, all, &fLog, &transport);
+    PartitionReplica g(cfgFor(kG), Role::Follower, 0, all, all, &gLog, &transport);
+    l.setInternalIsrKnowledge(&kl); f.setInternalIsrKnowledge(&kf); g.setInternalIsrKnowledge(&kg);
+    l.becomeLeader(1, all);
+    f.becomeFollower(1, kL);
+    g.becomeFollower(1, kL);
+    transport.setLeader(&l);
+    transport.addFollower(kF, &f);               // kG stuck: L commits {L,F}
+    ASSERT_GE(l.append(makePayload(1)), 0);
+    int64_t clock = 0;
+    for (int i = 0; i < 100 && (l.isrProposalPendingForTest() || l.internalSeedPendingForTest() ||
+                                l.isr().size() != 2); ++i) {
+        clock += 1'000'000LL;
+        l.doWork(clock); f.doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_FALSE(l.isrProposalPendingForTest());
+    ASSERT_EQ(l.isr().size(), 2u);
+    const InternalIsrState* committed = kl.candidacyState();
+    ASSERT_NE(committed, nullptr);
+    const InternalIsrState c0 = *committed;
+    ASSERT_TRUE(c0.contains(kL) && c0.contains(kF) && !c0.contains(kG));
+    // F stalls too: L proposes {L}, which nobody else can persist.
+    transport.removeFollower(kF);
+    for (int i = 0; i < 100 && !l.isrProposalPendingForTest(); ++i) {
+        clock += 1'000'000LL;
+        l.doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_TRUE(l.isrProposalPendingForTest()) << "precondition: L proposed {L}";
+    const InternalIsrState* held = kl.latest(-3, 0);
+    ASSERT_NE(held, nullptr);
+    ASSERT_TRUE(held->newerThan(c0.leaderEpoch, c0.version)) << "L holds its pending proposal (self-ack)";
+    EXPECT_FALSE(kl.eligible(kF)) << "L's own vote gate still reads its newest (pending) state";
+    const InternalIsrState* shared = kl.candidacyState();
+    ASSERT_NE(shared, nullptr);
+    EXPECT_TRUE(shared->leaderEpoch == c0.leaderEpoch && shared->version == c0.version)
+        << "the leader exported its uncommitted proposal (epoch " << shared->leaderEpoch
+        << ", version " << shared->version << ") instead of its last committed state";
+    // F returns and persists + acks {L}: committed — now it is shared.
+    transport.addFollower(kF, &f);
+    for (int i = 0; i < 200 && l.isrProposalPendingForTest(); ++i) {
+        clock += 1'000'000LL;
+        l.doWork(clock); f.doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_FALSE(l.isrProposalPendingForTest());
+    shared = kl.candidacyState();
+    ASSERT_NE(shared, nullptr);
+    held = kl.latest(-3, 0);
+    EXPECT_TRUE(shared->leaderEpoch == held->leaderEpoch && shared->version == held->version)
+        << "a committed state is not shared";
+    // A follower shares its newest persisted state (it is always on L + F).
+    ASSERT_NE(kf.candidacyState(), nullptr);
+    EXPECT_EQ(kf.candidacyState()->version, kf.latest(-3, 0)->version);
+}
+
+// Re-review round 4 LOW-R4-2: adopt() (a peer's state learned in the election
+// exchange) checks plausibility.  Newest wins, so one malformed state — no
+// member, a member outside the replica set, an absurd epoch — would poison the
+// knowledge for good (deny every candidate, "hold newer" for every real
+// proposal, re-export it).  Rejected (logged once); a sane state still adopted.
+TEST(InternalIsrRegression, AdoptRejectsImplausibleLearnedStates) {
+    TempDir d("r42");
+    InternalIsrKnowledge k(d.path + "/internal-isr.state");
+    k.setReplicaSet({1, 2, 3});
+    int64_t term = 7;
+    k.setConsensusTermSource([](const void* p) noexcept { return *static_cast<const int64_t*>(p); }, &term);
+    auto st = [](int64_t epoch, int64_t version, std::initializer_list<int32_t> m) {
+        InternalIsrState x{};
+        x.topicId = -3; x.partition = 0; x.leaderEpoch = epoch; x.version = version;
+        for (int32_t n : m) x.members[static_cast<std::size_t>(x.count++)] = n;
+        return x;
+    };
+    ASSERT_TRUE(k.adopt(st(6, 3, {1, 2})));      // sane: adopted
+    EXPECT_FALSE(k.adopt(st(7, 1, {}))) << "an empty ISR adopted";
+    EXPECT_FALSE(k.adopt(st(7, 1, {1, 9}))) << "a member outside the replica set adopted";
+    EXPECT_FALSE(k.adopt(st(7, 1, {1, 1}))) << "a duplicated member adopted";
+    EXPECT_FALSE(k.adopt(st(term + InternalIsrKnowledge::kMaxLearnedEpochLead + 1, 1, {1, 2})))
+        << "an absurd epoch adopted";
+    EXPECT_FALSE(k.adopt(st(INT64_MAX, 1, {1, 2}))) << "an absurd epoch adopted";
+    EXPECT_FALSE(k.adopt(st(-1, 9, {1, 2}))) << "a negative epoch adopted";
+    EXPECT_FALSE(k.adopt(st(7, 0, {1, 2}))) << "version 0 (never published) adopted";
+    EXPECT_EQ(k.adoptRejectionsForTest(), 7u);
+    ASSERT_NE(k.latest(-3, 0), nullptr);
+    EXPECT_EQ(k.latest(-3, 0)->leaderEpoch, 6);
+    EXPECT_EQ(k.latest(-3, 0)->version, 3);
+    EXPECT_TRUE(k.eligible(1));
+    EXPECT_FALSE(k.eligible(3));
+    ASSERT_TRUE(k.adopt(st(8, 1, {1, 3})));      // a real newer state still supersedes
+    EXPECT_TRUE(k.eligible(3));
+    EXPECT_FALSE(k.eligible(2));
+    InternalIsrKnowledge reloaded(d.path + "/internal-isr.state");
+    ASSERT_NE(reloaded.latest(-3, 0), nullptr);
+    EXPECT_EQ(reloaded.latest(-3, 0)->leaderEpoch, 8);
+}
+
+// Re-review 2026-10-04 (fix round 2) MEDIUM-C: the lag shrink restored for
+// internal partitions (MAJOR-3) is safe only where the removal commits on a
+// majority's durable knowledge that the consensus vote rule reads.  An internal
+// partition OUTSIDE that store (__topic_schemas, -4: self-managed, not in the
+// replica registry) must not lag-shrink — once replicated it would shrink at
+// once while the shrunk node stays electable (MAJOR-2 reopened for schemas).
+// User partitions and partitions on the internal-ISR store still shrink.
+TEST(InternalIsrRegression, InternalPartitionOutsideKnowledgeStoreNeverLagShrinks) {
+    TempDir lDir("iisr_c_L"), fDir("iisr_c_F"), gDir("iisr_c_G");
+    rune::storage::Log lLog(lDir.path), fLog(fDir.path), gLog(gDir.path);
+    InMemoryTransport transport;
+    constexpr NodeId kL = 1, kF = 2, kG = 3;
+    std::vector<NodeId> all = {kL, kF, kG};
+    auto cfgFor = [&](NodeId id) {
+        PartitionConfig c = makeConfig(id, /*lagMs=*/10, /*lagOff=*/1'000'000);
+        c.topicId = -4;                          // __topic_schemas: no knowledge store wired
+        return c;
+    };
+    PartitionReplica l(cfgFor(kL), Role::Follower, 0, all, all, &lLog, &transport);
+    PartitionReplica f(cfgFor(kF), Role::Follower, 0, all, all, &fLog, &transport);
+    PartitionReplica g(cfgFor(kG), Role::Follower, 0, all, all, &gLog, &transport);
+    l.becomeLeader(1, all);
+    f.becomeFollower(1, kL);
+    g.becomeFollower(1, kL);
+    transport.setLeader(&l);
+    transport.addFollower(kF, &f);               // kG never fetches
+    ASSERT_GE(l.append(makePayload(1)), 0);
+    int64_t clock = 0;
+    for (int i = 0; i < 100; ++i) {              // 100 ms >> replicaLagMaxMs = 10 ms
+        clock += 1'000'000LL;
+        l.doWork(clock); f.doWork(clock);
+        transport.pump(clock);
+    }
+    const auto& isr = l.isr();
+    EXPECT_NE(std::find(isr.begin(), isr.end(), kG), isr.end())
+        << "an internal partition outside the internal-ISR store lag-shrank a member";
+}
+
+// Re-review 2026-10-04 (fix round 2) LOW-A: the knowledge file fails CLOSED.
+// A file that exists but does not validate (corrupt, short, unknown version)
+// means this node can no longer prove what it acked: it refuses to VOTE for
+// anyone (a voter in the commit/vote intersection with lost knowledge would
+// break the safety argument) until it durably holds a fresh state again.  Only
+// an ABSENT file is "fresh".  (Refuse-to-vote rather than refuse-to-start: the
+// node keeps serving its user partitions and self-heals from the leader.)
+TEST(InternalIsrRegression, CorruptKnowledgeFileFailsClosed_RefusesToVote) {
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 4; a.version = 2; a.count = 3;
+    a.members[0] = 1; a.members[1] = 2; a.members[2] = 3;
+    auto write = [](const std::string& p, const std::vector<uint8_t>& b) {
+        std::FILE* fp = std::fopen(p.c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        std::fwrite(b.data(), 1, b.size(), fp);
+        std::fclose(fp);
+    };
+    auto read = [](const std::string& p) {
+        std::vector<uint8_t> b;
+        std::FILE* fp = std::fopen(p.c_str(), "rb");
+        if (!fp) return b;
+        int ch;
+        while ((ch = std::fgetc(fp)) != EOF) b.push_back(static_cast<uint8_t>(ch));
+        std::fclose(fp);
+        return b;
+    };
+    TempDir d("iisr_lowa");
+    const std::string path = d.path + "/internal-isr.state";
+    {
+        InternalIsrKnowledge fresh(path);
+        EXPECT_TRUE(fresh.eligible(1)) << "an absent file is the fresh state";
+        ASSERT_TRUE(fresh.offer(a));
+    }
+    const std::vector<uint8_t> good = read(path);
+    ASSERT_GT(good.size(), 24u);
+    struct Case { const char* name; std::vector<uint8_t> bytes; };
+    std::vector<Case> cases;
+    { auto b = good; b[b.size() / 2] ^= 0x5A; cases.push_back({"corrupt (checksum)", b}); }
+    { auto b = good; b.resize(b.size() - 9); cases.push_back({"short", b}); }
+    { auto b = good; b[4] = 99; cases.push_back({"unknown version", b}); }
+    cases.push_back({"tiny", std::vector<uint8_t>{1, 2, 3}});
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        write(path, c.bytes);
+        InternalIsrKnowledge k(path);
+        EXPECT_FALSE(k.eligible(1)) << "voted with unprovable knowledge (file failed validation)";
+        EXPECT_FALSE(k.eligible(2));
+        // A fresh, durably persisted state of the gate partition restores the vote.
+        InternalIsrState b = a;
+        b.leaderEpoch = 5; b.version = 1;
+        ASSERT_TRUE(k.offer(b));
+        EXPECT_TRUE(k.eligible(1));
+        InternalIsrKnowledge reloaded(path);
+        EXPECT_TRUE(reloaded.eligible(1)) << "the rewritten file must validate";
+    }
+}
+
+// LOW-A: a failed DIRECTORY fsync (the rename may not be durable) must not be
+// reported as persisted — the caller would ack a state that can vanish.
+TEST(InternalIsrRegression, DirectoryFsyncFailureIsNotAcked) {
+    TempDir d("iisr_lowa_dir");
+    const std::string dir = d.path + "/k";
+    std::filesystem::create_directories(dir);
+    InternalIsrKnowledge k(dir + "/internal-isr.state");
+    // write+search but no read: files can be created/renamed in it, but the
+    // directory cannot be opened for the fsync.
+    std::filesystem::permissions(dir, std::filesystem::perms::owner_write | std::filesystem::perms::owner_exec);
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 1; a.version = 1; a.count = 1; a.members[0] = 1;
+    const bool ok = k.offer(a);
+    std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+    EXPECT_FALSE(ok) << "acked a state whose directory entry was never fsynced";
+    EXPECT_EQ(k.latest(-3, 0), nullptr);
+}
+
+// Re-review 2026-10-04 (fix round 2) MEDIUM-B: "no node in every internal ISR".
+// RF=3; A (2) was lag-shrunk from __consumer_offsets (ISR {L,B}) and B (3) from
+// __cluster_metadata (ISR {L,A}); then L (1) dies.  Before: candidacy ANDed every
+// internal ISR, so nobody was electable — no controller, no user-partition
+// failover, no AlterIsr: one offsets partition took the whole control plane
+// down.  After: only __cluster_metadata decides (A is elected); the offsets
+// partition follows the user-partition rules on the controller path
+// (CoordinatorPartitionRegression.* in rune_static_assignment_emit_tests).
+TEST(InternalIsrRegression, NoNodeInEveryInternalIsr_ConsensusStillElects_OnlyMetadataDecides) {
+    constexpr NodeId kL = 1, kA = 2, kB = 3;
+    auto state = [](int32_t topic, std::initializer_list<int32_t> m) {
+        InternalIsrState s{};
+        s.topicId = topic; s.partition = 0; s.leaderEpoch = 7; s.version = 3;
+        for (int32_t n : m) s.members[static_cast<std::size_t>(s.count++)] = n;
+        return s;
+    };
+    InternalIsrKnowledge ka, kb;                  // the two survivors (voters)
+    for (InternalIsrKnowledge* k : {&ka, &kb}) {
+        ASSERT_TRUE(k->offer(state(-3, {kL, kA})));   // metadata: B shrunk
+        ASSERT_TRUE(k->offer(state(-1, {kL, kB})));   // offsets:  A shrunk
+    }
+    // Aeron vote: a candidate votes for itself; it needs one more grant of 2 live.
+    auto elected = [&](NodeId cand) {
+        const InternalIsrKnowledge& otherVoter = (cand == kA) ? kb : ka;
+        return 1 + (otherVoter.eligible(cand) ? 1 : 0) >= 2;
+    };
+    EXPECT_TRUE(elected(kA) || elected(kB))
+        << "no consensus leader although 2 of 3 are up (one offsets ISR took the control plane down)";
+    EXPECT_TRUE(elected(kA)) << "A is in the newest __cluster_metadata ISR";
+    EXPECT_FALSE(elected(kB)) << "B lacks committed metadata records: never electable";
+}
+
+// Re-review 2026-10-04 (fix round 3) LOW-R3-1: a TRANSIENT open() failure of
+// the knowledge file at startup (EMFILE / ENFILE / EIO ...) is not corruption:
+// the node refuses to vote only while the file cannot be read, then retries
+// and loads it — it must not stay fail-closed (or lose its knowledge).
+#include <sys/resource.h>
+TEST(InternalIsrRegression, TransientOpenErrorRetriedNotFailClosed) {
+    TempDir d("iisr_transient");
+    const std::string path = d.path + "/internal-isr.state";
+    InternalIsrState a{};
+    a.topicId = -3; a.partition = 0; a.leaderEpoch = 4; a.version = 2; a.count = 2;
+    a.members[0] = 1; a.members[1] = 2;
+    { InternalIsrKnowledge k(path); ASSERT_TRUE(k.offer(a)); }
+    // Exhaust the descriptor table: the next open() fails with EMFILE.
+    rlimit old{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &old), 0);
+    const int probe = ::dup(0);
+    ASSERT_GE(probe, 0);
+    ::close(probe);
+    rlimit low = old;
+    low.rlim_cur = static_cast<rlim_t>(probe);   // every fd >= probe is now refused
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &low), 0);
+    auto k = std::make_unique<InternalIsrKnowledge>(path);   // open() -> EMFILE
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &old), 0);
+    EXPECT_FALSE(k->eligible(1)) << "voted while its knowledge could not be read";
+    k->retryLoadIfPending();
+    EXPECT_TRUE(k->votable()) << "a transient open() error failed the knowledge closed for good";
+    ASSERT_NE(k->latest(-3, 0), nullptr) << "the knowledge was lost";
+    EXPECT_EQ(k->latest(-3, 0)->version, 2);
+    EXPECT_FALSE(k->eligible(3));
+    EXPECT_TRUE(k->eligible(1));
 }

@@ -329,6 +329,9 @@ TEST(WorkerRegression, FetchOpCarriesConnectionGenerationAcrossRingRegression) {
             std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
     }
     constexpr int64_t kNowNs = 1'000'000LL;   // frozen: no resend window can fire
+    // KIP-320/595: follower 2 reports in (a validated pure ack on its empty log)
+    // — a leader pushes only to followers validated in this leadership.
+    (void)replica->onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 0, 0, 7}, kNowNs);
     log.append(batch, /*lastOffset=*/0);
     replica->onLeaderLogAppended();
     (void)replica->doWork(kNowNs);                       // push offset 0 to follower 2

@@ -70,6 +70,12 @@ int ConsensusAgent::doWork(int64_t nowNs) {
 // (All called synchronously from doWork → drain → adapter_.onFragment)
 // ---------------------------------------------------------------------------
 
+void ConsensusAgent::onCandidacyState(int64_t /*nowNs*/, NodeId fromMember,
+                                      const CandidacyState& state)
+{
+    election_.onCandidacyState(fromMember, state);
+}
+
 void ConsensusAgent::onCanvassPosition(
     int64_t nowNs,
     Term    logLeadershipTermId,

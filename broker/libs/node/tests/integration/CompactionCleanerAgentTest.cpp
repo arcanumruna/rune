@@ -2873,7 +2873,7 @@ TEST(LogCleanerRcRebuildRegression, ReadCommittedAndProducerStateUnchangedByClea
         rune::storage::ProducerStateManager psm;
         rune::node::RcState rc;
         rc.bindProducerState(&psm, 1, 0);
-        rune::node::RcFacts f; f.leader = true; f.leaderComplete = true; f.logGeneration = 1;
+        rune::node::RcFacts f; f.leader = true; f.logGeneration = 1;
         f.leadershipGeneration = 1; f.epoch = 1;
         for (int i = 0; i < 100'000 && !rc.ready(); ++i) (void)rc.advance(f, &log, 1 << 20);
         EXPECT_TRUE(rc.ready());

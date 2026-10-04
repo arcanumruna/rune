@@ -135,7 +135,7 @@ libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int> 
 libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int> publishedIsrSizeForGateway_{0}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
 libs/replication/include/rune/replication/PartitionReplica.h | std::atomic<int32_t> publishedControllerEpoch_{-1}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
 libs/replication/include/rune/replication/PartitionReplica.h | std::array<std::atomic<Offset>, kMaxControllerNodes> publishedReplicaLeo_{}; | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
-libs/replication/include/rune/replication/PartitionReplica.h | std::lock_guard lk(mu_); | 13 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling)
+libs/replication/include/rune/replication/PartitionReplica.h | std::lock_guard lk(mu_); | 3 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling; InMemoryTransport test fake — enqueue_/take_/pendingCount)
 libs/replication/include/rune/replication/PartitionReplica.h | mutable std::mutex mu_; | 1 | SLICE-B | PartitionReplica mu_ pending-queue lock (slice B, explicit ruling)
 libs/replication/src/PartitionReplica.cpp | publishedHwForCleaner_.store(computeServedHw(), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
 libs/replication/src/PartitionReplica.cpp | publishedRoleForCleaner_.store(static_cast<int>(role_), std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
@@ -145,6 +145,7 @@ libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std
 libs/replication/src/PartitionReplica.cpp | logEndOffset_() + 1, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
 libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std::size_t>(fid)].store( | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
 libs/replication/src/PartitionReplica.cpp | leo + 1, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B)
+libs/replication/src/PartitionReplica.cpp | publishedReplicaLeo_[static_cast<std::size_t>(n)].store(0, std::memory_order_release); | 1 | SLICE-B | PartitionReplica published* / cleaner-facing state (slice B; rev3 CRITICAL-1 clears follower slots)
 
 # ------------------------------------------------------------ UNSCOPED
 libs/coordination/include/rune/coordination/GroupCoordinator.h | #include <atomic> | 1 | UNSCOPED | unused <atomic> include: delete

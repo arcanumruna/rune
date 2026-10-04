@@ -16,8 +16,7 @@
 //     responding, then encode the response into the caller-supplied buffer.
 //   - F15 §5.1 coordinator LOAD state machine (Unloaded | Loaded{epoch}).
 //     Loaded only while: this node is the consensus leader (FindCoordinator
-//     routes here) AND the __transaction_state replica is Leader AND its
-//     leadership is complete (leaderComplete_) AND HW == LEO — then the store
+//     routes here) AND the __transaction_state replica is Leader AND HW == LEO — then the store
 //     is folded to the (committed) HW and the coordinator reloaded under
 //     coordinatorEpoch = that replica's leader epoch.  Evaluated at the top of
 //     doWork and of every handler (progress-driven, no timer).  Unloaded: every
@@ -252,6 +251,8 @@ private:
     /// Load if loadable_, unload if the Loaded predicate broke; true = serving.
     bool ensureLoaded_(int64_t nowNs);
     [[nodiscard]] bool loadable_() const;
+    /// The txn-state replica's logGeneration() the loaded state was folded from.
+    uint64_t loadedLogGen_ = 0;
     [[nodiscard]] bool stillLoaded_() const;
     void load_(int64_t nowNs);
     void unload_();

@@ -49,6 +49,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/storage/Log.h>
@@ -520,6 +521,14 @@ public:
             -1, -1, std::forward<F>(f), timeout);
     }
 
+    /// Test-only, CONTROL thread only (call inside onControlThreadForTest):
+    /// the durable __cluster_metadata ISR knowledge (round-4 LOW-B tests).
+    [[nodiscard]] const rune::replication::InternalIsrKnowledge* internalIsrKnowledgeForTest() const noexcept {
+        return internalIsrKnowledge_.get();
+    }
+    /// Test-only, CONTROL thread only: the consensus Election (nullptr when none).
+    [[nodiscard]] const rune::consensus::Election* electionForTest() const noexcept { return election_.get(); }
+
     /// Observer-thread-safe: true if the replication metadata bridge has
     /// propagated this node's leadership to all its PartitionReplicas.
     /// Uses the atomic mirror in ReplicationMetadataBridge.
@@ -757,6 +766,10 @@ private:
     // -----------------------------------------------------------------------
 
     // Durable persistence (paths under config_.dataDir)
+    // Review 2026-10-04 MAJOR-2/3: this node's durable internal-ISR knowledge —
+    // the consensus vote gate and the internal replicas' quorum store.  Declared
+    // BEFORE election_ / replicaRegistry_ so it outlives both.
+    std::unique_ptr<rune::replication::InternalIsrKnowledge> internalIsrKnowledge_;
     std::unique_ptr<rune::consensus::NodeStateFile> nodeStateFile_;
     std::unique_ptr<rune::consensus::TermLog>       termLog_;
 

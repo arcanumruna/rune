@@ -114,7 +114,6 @@ bool TransactionCoordinationService::loadable_() const
     // All plain reads: the txn-state replica is control-owned (BrokerNode
     // drives topicId < 0 replicas on the control thread).
     return r->role() == rune::replication::Role::Leader
-        && r->isLeaderComplete()                        // served HW released from the stale floor
         && r->highWatermark() == r->logEndOffset();     // nothing uncommitted above HW (Q2)
 }
 
@@ -123,7 +122,11 @@ bool TransactionCoordinationService::stillLoaded_() const
     if (!isLocalCoordinator()) return false;
     if (txnState_ == nullptr) return true;
     const auto* r = txnState_->replica();
+    // Loaded state is valid only for the leadership AND the log content it was
+    // folded from: unload when leadership is lost or the log's existing
+    // content changed (a truncation bumps logGeneration) — a reload re-folds.
     return r->role() == rune::replication::Role::Leader &&
+           r->logGeneration() == loadedLogGen_ &&
            static_cast<int32_t>(r->epoch()) == coordinatorEpoch_;
 }
 
@@ -150,6 +153,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     if (txnState_ != nullptr) {
         txnState_->rebuildFromLog();
         coordinatorEpoch_ = static_cast<int32_t>(txnState_->replica()->epoch());
+        loadedLogGen_     = txnState_->replica()->logGeneration();
     } else {
         coordinatorEpoch_ = ++localLoads_;
     }

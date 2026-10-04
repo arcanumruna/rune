@@ -688,10 +688,9 @@ ClientGateway::proveInlinePsm_(int32_t topicId, int32_t partition, rune::storage
     const uint64_t key = inlinePsmKey_(topicId, partition);
     InlinePsmFacts facts;
     if (replica != nullptr) {
-        // Only a COMPLETE leader's log is stable below its LEO: a follower
-        // takes replicated appends, a deficient leader may still reconcile-
-        // append old-term batches (the worker path's RC gate, I2).
-        if (replica->role() != rune::replication::Role::Leader || !replica->isLeaderComplete()) [[unlikely]] {
+        // Only a leader's log is stable below its LEO: a follower takes
+        // replicated appends / truncations (the worker path's RC gate, I2).
+        if (replica->role() != rune::replication::Role::Leader) [[unlikely]] {
             if (auto it = inlinePsm_.find(key); it != inlinePsm_.end())
                 setInlinePsmState_(it->second, InlinePsmUnproven{});
             return InlinePsmGate::NotLeader;
@@ -2364,6 +2363,15 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                       "(topicId={} partition={}) sessionId={}",
                       msg.topicId, partition, msg.sessionId);
         sendErrorResponse_(*session, msg.sessionId, msg.correlationId, pc::ErrorCode::NotLeader);
+        return true;  // engine untouched — no append
+    }
+    // DUR-1 fix round 1 (B1): an INCOMPLETE leader (DR-BUG-6 completeness gate
+    // holding — it has not proven it holds the committed frontier) refuses EVERY
+    // batch, idempotent or not, with a retriable NotLeader produce answer: a
+    // pid -1 batch appended here would land over records a survivor still holds.
+    // Same predicate as the worker gate (PartitionReplica::acceptsProduce).
+    if (ownedReplica && committedMetadataReady_ && !ownedReplica->acceptsProduce()) [[unlikely]] {
+        sendResp(pc::ErrorCode::NotLeader, partition, 0);
         return true;  // engine untouched — no append
     }
     const uint8_t effectiveTier = replica.durabilityTier();

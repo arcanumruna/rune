@@ -772,7 +772,7 @@ static PartitionConfig makeChurningCompactConfig(int32_t topicId) {
 //     replica's HW + role CONCURRENTLY.
 //
 // Before the atomic-publication fix the cleaner read highWatermark()/role()
-// which touch isr_/leaderState_/leaderComplete_/lastHealthyHw_ → TSan reports
+// which touch isr_/leaderState_/lastHealthyHw_ → TSan reports
 // a data race here.  After the fix the cleaner reads only cleanerHighWatermark()
 // / cleanerRole() (atomic acquire) → 0 races.
 // ---------------------------------------------------------------------------

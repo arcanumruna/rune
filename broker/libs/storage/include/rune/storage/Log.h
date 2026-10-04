@@ -81,6 +81,13 @@ public:
     int64_t appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
                                 int32_t lastOffsetDelta, int64_t& outBaseOffset);
 
+    /// Kafka parity (leader stamp): the partitionLeaderEpoch every
+    /// appendNoSyncRestamp() writes into the batch header (zero-copy, CRC-
+    /// excluded field).  Set by the owning PartitionReplica on becomeLeader,
+    /// -1 (leave the producer's bytes) while not leading.  Owner thread only.
+    void setLeaderEpochStamp(int32_t epoch) noexcept { leaderEpochStamp_ = epoch; }
+    [[nodiscard]] int32_t leaderEpochStamp() const noexcept { return leaderEpochStamp_; }
+
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
 
     /// Zero-copy read: locate the segment containing startOffset and return a
@@ -109,6 +116,9 @@ public:
     /// starves the subscriber (0 delivered).  Returns 0 for an empty log.
     int64_t logStartOffset() const noexcept;
     int64_t recover();
+    /// True once recover() has run on this Log object (the LEO is then the
+    /// true log end, not just the last segment's base).
+    [[nodiscard]] bool isRecovered() const noexcept { return recovered_; }
     /// Flush + fdatasync the active segment's .log and msync its .index.
     /// append() already calls this (durable-by-default). External group-commit
     /// callers may batch appends and call sync() once — but MUST NOT advance
@@ -121,6 +131,12 @@ public:
     /// readView() calls on this log (single-owner counter; F18 B-2 proves a
     /// fetch costs exactly one lookup and a conflated duplicate none).
     [[nodiscard]] uint64_t readViewCallsForTest() const noexcept { return readViewCalls_; }
+    /// E2 crash-simulation seam: {segment .log path, bytes made durable by the
+    /// last inline sync in this incarnation (-1 = none)} for every installed
+    /// segment.  A DR harness truncates each file to its durable extent to
+    /// simulate a power loss (page cache discarded).  Cold, test-only.
+    struct SyncedExtent { std::string logPath; int64_t syncedBytes = -1; };
+    [[nodiscard]] std::vector<SyncedExtent> syncedExtentsForTest() const;
     /// Test hook: while non-zero every inline sync fails with this errno.
     void setSyncFaultForTest(int err) noexcept { storage_.faultForTest = err; }
     /// Test hook: while non-zero every data write fails with this errno (E1).
@@ -417,6 +433,8 @@ private:
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
     uint64_t readViewCalls_ = 0;   // F18 B-2 (single-owner thread)
     uint64_t truncations_   = 0;   // contentGeneration() (owner thread)
+    bool     recovered_     = false;   // see isRecovered()
+    int32_t  leaderEpochStamp_ = -1;   // see setLeaderEpochStamp()
     LogStorageState storage_{};     ///< fail-stop state + inline-sync accounting (shared with segments)
     bool deferSealSync_ = false;
     static constexpr std::size_t kMaxPendingSeals = 16;

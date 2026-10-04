@@ -959,3 +959,38 @@ TEST(GroupCoordinationServiceRegression, PushedLeadershipNeverCallsTheLeaderFunc
     EXPECT_FALSE(svc.isLocalCoordinator());
     EXPECT_EQ(calls, 0) << "isLeaderFn_ called on the duty cycle after a leadership push";
 }
+
+// ---------------------------------------------------------------------------
+// Review: TCS/GCS kept stale in-memory state when the coordinator partition's
+// log content changed under them (the old reconcile appended foreign batches;
+// any truncation does the same).  The offset index is valid only for the
+// leadership AND the log content it was rebuilt from: a log-generation /
+// leadership change re-arms the rebuild, so a truncated-away commit is never
+// served.
+// ---------------------------------------------------------------------------
+TEST_F(CG3ServiceTest, OffsetIndexRebuiltWhenTheLogContentChangesRegression) {
+    ASSERT_TRUE(driveUntil([&] { return true; }, 1));
+    service_->doWork(clock_ += kStep);
+    ASSERT_TRUE(store_->commit("g-stale", tp("t", 0), 7, "", 1));
+    ASSERT_TRUE(pumpHW(replica_->logEndOffset()));
+    service_->doWork(clock_ += kStep);
+    ASSERT_TRUE(store_->fetch("g-stale", tp("t", 0)).has_value());
+
+    // Between two duty passes: demotion, a KIP-279 truncation that removes the
+    // commit record, re-promotion (a lone leader completes at once).
+    replica_->becomeFollower(2, 9);
+    FetchResponseMsg div{};
+    div.leaderEpoch = 2; div.partition = 0; div.errorCode = rune::replication::kErrDivergingEpoch;
+    { static rune::replication::ErrorPayloadBuf epb_; div.records = epb_.set(replica_->lastFetchedEpoch(), 0); }
+    replica_->applyReplicated(div);
+    ASSERT_EQ(replica_->logEndOffset(), 0) << "precondition: the commit record is gone";
+    replica_->becomeLeader(3, {kLeader});
+    ASSERT_TRUE(replica_->acceptsProduce());
+    ASSERT_TRUE(store_->commit("g-new", tp("t", 1), 3, "", 2));
+    ASSERT_TRUE(pumpHW(replica_->logEndOffset()));
+
+    service_->doWork(clock_ += kStep);
+    EXPECT_FALSE(store_->fetch("g-stale", tp("t", 0)).has_value())
+        << "a commit truncated out of the log is still served from the stale index";
+    EXPECT_TRUE(store_->fetch("g-new", tp("t", 1)).has_value());
+}

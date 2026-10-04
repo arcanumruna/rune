@@ -39,6 +39,8 @@
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
 #include <rune/consensus/Types.h>
+#include <rune/consensus/AckTerm.h>
+#include <rune/consensus/CandidacyState.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -225,6 +227,46 @@ public:
                           int64_t logPosition,
                           NodeId  leaderMemberId);
 
+    /// Review 2026-10-04 MAJOR-2/3 — candidacy rule.  `fn(ctx, candidate)`
+    /// decides whether this node may VOTE for `candidate`.  The broker wires it
+    /// to InternalIsrKnowledge::eligible: a node outside the newest durable ISR
+    /// of __cluster_metadata (which the consensus leader leads) never gathers a
+    /// majority — it would lead it without its committed records.  A denied
+    /// RequestVote is answered like a "my log is newer" deny.  Applied by
+    /// voters only: a node always may stand (re-review MAJOR-A — its own
+    /// knowledge may be stale; the voters' majority decides).  nullptr
+    /// (default) = everyone eligible (data-blind, as Aeron).  Duty-cycle thread.
+    /// The consensus term that may refuse an internal-ISR ack (rune/consensus/
+    /// AckTerm.h): the term this node GRANTED a vote in, or followed / led a
+    /// leader in.  Duty-cycle thread.
+    [[nodiscard]] Term ackTermId() const noexcept {
+        return ackTerm(candidateTermId_, votedTermId_, leadershipTermId_);
+    }
+    [[nodiscard]] Term votedTermId() const noexcept { return votedTermId_; }
+
+    /// Re-review round 3 CRITICAL-R3 — knowledge exchange.  `src(ctx, out)`
+    /// fills this node's newest durable metadata-ISR state (false = none /
+    /// unprovable: nothing sent); `learn(ctx, s)` adopts a peer's state when
+    /// newer (durably; never acked — LEARNING bypasses the ack term rule).  The
+    /// state is sent to each peer with every CanvassPosition, RequestVote and
+    /// Vote.  nullptr = no exchange.  Duty-cycle thread.
+    using CandidacySource = bool (*)(void* ctx, CandidacyState& out) noexcept;
+    using CandidacyLearn  = void (*)(void* ctx, const CandidacyState& s) noexcept;
+    void setCandidacyExchange(CandidacySource src, CandidacyLearn learn, void* ctx) noexcept {
+        candidacySrc_ = src; candidacyLearn_ = learn; candidacyCtx_ = ctx;
+    }
+    /// A peer's CandidacyState (ConsensusAgent dispatch).
+    void onCandidacyState(NodeId fromMember, const CandidacyState& s) noexcept {
+        (void)fromMember;
+        if (candidacyLearn_ != nullptr) candidacyLearn_(candidacyCtx_, s);
+    }
+
+    using VoteGate = bool (*)(void* ctx, NodeId candidate) noexcept;
+    void setVoteGate(VoteGate fn, void* ctx) noexcept { voteGate_ = fn; voteGateCtx_ = ctx; }
+    [[nodiscard]] bool mayVoteFor(NodeId candidate) const noexcept {
+        return voteGate_ == nullptr || voteGate_(voteGateCtx_, candidate);
+    }
+
     /// Task 11 fix 2 (B2): true when every outbound consensus message is a direct
     /// call (production SbeConsensusPublisher over a final sink); false only for
     /// test doubles.  BrokerNode debug-asserts it.
@@ -316,6 +358,7 @@ private:
             if (sbe) [[likely]] sbe->m(std::forward<A>(a)...);                         \
             else generic->m(std::forward<A>(a)...);                                    \
         }
+        RUNE_ELECTION_PUB_FWD(candidacyState)
         RUNE_ELECTION_PUB_FWD(canvassPosition)
         RUNE_ELECTION_PUB_FWD(requestVote)
         RUNE_ELECTION_PUB_FWD(placeVote)
@@ -380,6 +423,16 @@ private:
     Term leadershipTermId_    = 0;
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;
+    /// Highest term this node GRANTED a vote in (MAJOR-R3) — a denial or an
+    /// own (abandoned) candidacy never raises it.  Not persisted (round-4
+    /// LOW-R4-4): after a restart the ack term can be BELOW a term this node
+    /// granted in before the crash, so the knowledge store may PERSIST a
+    /// deposed leader's internal ISR state — knowledge only, exactly what
+    /// adopt() does.  It never ACKS one: the internal replica restarts as
+    /// Follower at epoch 0 with no leader, and the durable candidateTermId_
+    /// makes the election ignore the stale term's NewLeadershipTerm (a node
+    /// never re-follows a deposed leader).
+    Term votedTermId_         = 0;
 
     // Election config — Election.java:80
     bool isNodeStartup_     = false;
@@ -419,6 +472,18 @@ private:
 
     // Seeded RNG for nominate backoff — Election.java:723
     std::mt19937_64 rng_;
+
+    // Candidacy rule (setVoteGate).
+    VoteGate voteGate_    = nullptr;
+    void*    voteGateCtx_ = nullptr;
+    // Knowledge exchange (setCandidacyExchange).
+    CandidacySource candidacySrc_   = nullptr;
+    CandidacyLearn  candidacyLearn_ = nullptr;
+    void*           candidacyCtx_   = nullptr;
+    void publishCandidacyState_(NodeId toMember);
+    /// CRITICAL-R3: the candidate's own vote counts only if its own durable
+    /// knowledge admits it (re-evaluated every ballot step).
+    void gateSelfVote_() noexcept;
 };
 
 } // namespace rune::consensus

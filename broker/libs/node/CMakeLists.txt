@@ -1172,6 +1172,24 @@ if(BUILD_TESTING)
     endif()
 
     # ---------------------------------------------------------------------------
+    # DUR-1 round-4 follow-up LOW-B: the consensus candidacy gate + template-58
+    # knowledge exchange + internal-ISR term source driven end to end over real
+    # Aeron (in-process BrokerNodes on loopback, no Docker).  *Regression*.
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_consensus_candidacy_tests
+            tests/integration/ConsensusCandidacyElectionTest.cpp)
+        target_include_directories(rune_consensus_candidacy_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_consensus_candidacy_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_consensus_candidacy_tests
+            PROPERTIES TIMEOUT 180 RESOURCE_LOCK rune_udp_ports)
+    endif()
+
+    # ---------------------------------------------------------------------------
     # E5 Task 7: PerWorkerReplicationTest — in-process per-worker replication
     # integration + failover suite (perWorkerReplication flag ON).
     #

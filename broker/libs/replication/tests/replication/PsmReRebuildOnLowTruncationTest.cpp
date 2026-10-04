@@ -187,15 +187,17 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildsWhenTruncationBelowRebuildHw)
     // Force a truncation to kTruncTo via OffsetsForLeaderEpochResponse.
     follower.becomeFollower(/*leaderEpoch=*/2, leaderId);
 
-    OffsetsForLeaderEpochRespMsg resp{};
-    resp.leaderEpoch   = 2;
-    resp.partition     = kPartition;
-    resp.responseEpoch = 1;    // shared epoch = 1
-    resp.endOffset     = kTruncTo;
-    resp.errorCode     = 0;    // kErrNone
-    resp.topicId       = kTopicId;
+    // KIP-320/595: the new leader's DivergingEpoch answer — our lineage ends
+    // at kTruncTo on its side (KIP-279 truncation on the fetch path).
+    FetchResponseMsg resp{};
+    resp.leaderEpoch        = 2;
+    resp.partition          = kPartition;
+    resp.errorCode          = rune::replication::kErrDivergingEpoch;
+    resp.topicId            = kTopicId;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
-    follower.applyOffsetsForLeaderEpochResponse(resp);
+    follower.applyReplicated(resp);
 
     // --- Key assertions ---
 
@@ -279,15 +281,17 @@ TEST(PsmReRebuildOnLowTruncation, NoReRebuildWhenTruncationAboveRebuildHw)
     // Force a truncation to kTruncTo=8 (> kRebuildHw=5) — PSM does NOT re-rebuild.
     follower.becomeFollower(/*leaderEpoch=*/2, leaderId);
 
-    OffsetsForLeaderEpochRespMsg resp{};
-    resp.leaderEpoch   = 2;
-    resp.partition     = kPartition;
-    resp.responseEpoch = 1;
-    resp.endOffset     = kTruncTo;
-    resp.errorCode     = 0;
-    resp.topicId       = kTopicId;
+    // KIP-320/595: the new leader's DivergingEpoch answer — our lineage ends
+    // at kTruncTo on its side (KIP-279 truncation on the fetch path).
+    FetchResponseMsg resp{};
+    resp.leaderEpoch        = 2;
+    resp.partition          = kPartition;
+    resp.errorCode          = rune::replication::kErrDivergingEpoch;
+    resp.topicId            = kTopicId;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
-    follower.applyOffsetsForLeaderEpochResponse(resp);
+    follower.applyReplicated(resp);
 
     // rebuildHighWatermark stays at kRebuildHw — no re-rebuild was triggered.
     EXPECT_EQ(psm.rebuildHighWatermark(), kRebuildHw)
@@ -351,15 +355,17 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildAtomicWithTruncation)
     // Trigger a truncation to kTruncTo (< kRebuildHw) via epoch response.
     follower.becomeFollower(/*leaderEpoch=*/2, leaderId);
 
-    OffsetsForLeaderEpochRespMsg resp{};
-    resp.leaderEpoch   = 2;
-    resp.partition     = kPartition;
-    resp.responseEpoch = 1;
-    resp.endOffset     = kTruncTo;
-    resp.errorCode     = 0;
-    resp.topicId       = kTopicId;
+    // KIP-320/595: the new leader's DivergingEpoch answer — our lineage ends
+    // at kTruncTo on its side (KIP-279 truncation on the fetch path).
+    FetchResponseMsg resp{};
+    resp.leaderEpoch        = 2;
+    resp.partition          = kPartition;
+    resp.errorCode          = rune::replication::kErrDivergingEpoch;
+    resp.topicId            = kTopicId;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
-    follower.applyOffsetsForLeaderEpochResponse(resp);
+    follower.applyReplicated(resp);
 
     // Atomicity assertion: both log state and PSM state reflect kTruncTo in one
     // step — no intermediate window where log is truncated but PSM is not.

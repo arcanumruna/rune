@@ -144,7 +144,17 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     // after becoming coordinator (Follower → Leader transition).  This ensures
     // committed offsets that were replicated to this node while it was a follower
     // are visible before serving any JoinGroup / SyncGroup requests.
-    const bool amLeader = isLocalCoordinator();
+    // The offset index is valid only for the leadership AND log content it was
+    // rebuilt from, and only while the __consumer_offsets replica leads.  A new
+    // leadership or a log-content change (truncation) re-arms the rebuild.
+    const rune::replication::PartitionReplica* const offRep =
+        offsets_ ? offsets_->replica() : nullptr;
+    const bool offsetsReady = offRep == nullptr || offRep->acceptsProduce();
+    const bool amLeader = isLocalCoordinator() && offsetsReady;
+    if (offRep != nullptr) {
+        const uint64_t gen = (offRep->leadershipGeneration() << 32) ^ offRep->logGeneration();
+        if (gen != offsetsGen_) { offsetsGen_ = gen; offsetsRebuilt_ = false; }
+    }
     if (amLeader) {
         if (!wasLeader_) {
             // First duty cycle after becoming coordinator — attempt the rebuild.

@@ -328,6 +328,12 @@ int Election::canvass(int64_t nowNs)
     }
 
     // Election.java:720-727: check candidate readiness
+    // The candidacy rule (setVoteGate) is applied by VOTERS only (re-review
+    // 2026-10-04 MAJOR-A): this node may stand whatever its own — possibly
+    // stale — internal-ISR knowledge says; a candidate outside the newest
+    // committed ISR is denied by the voters (any grant majority intersects the
+    // commit majority).  A self-gate turned stale self-knowledge into a
+    // permanently headless consensus.
     ClusterMember* thisM = memberById(thisMemberId_);
     if (thisM != nullptr) {
         // Election.java:720: isUnanimousCandidate
@@ -365,6 +371,7 @@ int Election::nominate(int64_t nowNs)
 
         // Election.java:738: ClusterMember.becomeCandidate(clusterMembers, candidateTermId, thisMember.id())
         ClusterMember::becomeCandidate(clusterMembers_, candidateTermId_, thisMemberId_);
+        gateSelfVote_();   // CRITICAL-R3: the self-vote counts only if our knowledge admits us
 
         // Election.java:739: state(CANDIDATE_BALLOT, nowNs, "")
         state(ElectionState::CandidateBallot, nowNs, "nomination deadline reached");
@@ -387,6 +394,9 @@ int Election::nominate(int64_t nowNs)
 int Election::candidateBallot(int64_t nowNs)
 {
     int workCount = 0;
+    // CRITICAL-R3: re-evaluate our own vote — knowledge learned from a peer
+    // during the ballot may admit (or exclude) us.
+    gateSelfVote_();
 
     // Election.java:758-763: unanimous check (no timeout needed)
     if (ClusterMember::isUnanimousLeader(clusterMembers_, candidateTermId_, gracefulClosedLeaderId_)) {
@@ -417,6 +427,7 @@ int Election::candidateBallot(int64_t nowNs)
     for (auto& member : clusterMembers_) {
         if (member.id == thisMemberId_) continue; // skip self (already voted for self)
         if (!member.isBallotSent) {
+            publishCandidacyState_(member.id);   // CRITICAL-R3: our knowledge first
             // Election.java:787-789: requestVote
             publisher_.requestVote(
                 member.id,
@@ -709,7 +720,10 @@ void Election::onRequestVote(Term    logLeadershipTermId,
         // Election.java:351-353: stale candidate → deny
         placeVote(candidateTermId, candidateId, false);
     } else if (ClusterMember::compareLog(logLeadershipTermId_, appendPosition_,
-                                         logLeadershipTermId, logPosition) > 0) {
+                                         logLeadershipTermId, logPosition) > 0 ||
+               !mayVoteFor(candidateId)) {
+        // MAJOR-2/3: a candidate outside the newest durable internal ISR is
+        // denied exactly like one with a stale log.
         // Election.java:355-371: our log is more recent → deny but update our candidateTermId
         // Election.java:357-358: proposeMaxCandidateTermId to update our persisted term
         candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
@@ -723,6 +737,7 @@ void Election::onRequestVote(Term    logLeadershipTermId,
         // Election.java:376-377: proposeMaxCandidateTermId
         candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
             candidateTermId, logPosition, /*timestampMs=*/0);
+        votedTermId_ = std::max(votedTermId_, candidateTermId);   // MAJOR-R3: a GRANT
         placeVote(candidateTermId, candidateId, true);
         // Election.java:379: state(FOLLOWER_BALLOT, nowNs, "")
         // nowNs is passed in from the caller (duty-cycle clock).
@@ -1238,6 +1253,7 @@ void Election::publishCanvassPosition()
 {
     for (const auto& member : clusterMembers_) {
         if (member.id == thisMemberId_) continue;
+        publishCandidacyState_(member.id);   // CRITICAL-R3: our knowledge with the canvass
         // Election.java:1247-1248: canvassPosition(member.publication(), ...)
         publisher_.canvassPosition(
             member.id,
@@ -1249,6 +1265,28 @@ void Election::publishCanvassPosition()
 }
 
 // ---------------------------------------------------------------------------
+// CRITICAL-R3 — knowledge exchange + gated self-vote (see Election.h).
+// ---------------------------------------------------------------------------
+void Election::publishCandidacyState_(NodeId toMember)
+{
+    if (candidacySrc_ == nullptr) return;
+    CandidacyState st;
+    if (!candidacySrc_(candidacyCtx_, st)) return;   // none / unprovable: nothing to share
+    publisher_.candidacyState(toMember, thisMemberId_, st);
+}
+
+void Election::gateSelfVote_() noexcept
+{
+    ClusterMember* me = memberById(thisMemberId_);
+    if (me == nullptr || me->candidateTermId != candidateTermId_) return;
+    // The candidate's own vote is a vote like any other: it counts only if the
+    // candidacy rule admits it under this node's own durable knowledge (a node
+    // that acked its own removal is in the commit majority — its vote is the
+    // intersection).  None, not Against: the peers' votes still count.
+    me->vote = mayVoteFor(thisMemberId_) ? Vote::For : Vote::None;
+}
+
+// ---------------------------------------------------------------------------
 // Private: placeVote — Election.java:1182-1196
 // ---------------------------------------------------------------------------
 void Election::placeVote(Term candidateTermId, NodeId candidateId, bool vote)
@@ -1256,6 +1294,7 @@ void Election::placeVote(Term candidateTermId, NodeId candidateId, bool vote)
     // Election.java:1184: clusterMemberByIdMap.get(candidateId)
     ClusterMember* candidate = memberById(candidateId);
     if (candidate != nullptr) {
+        publishCandidacyState_(candidateId);   // CRITICAL-R3: our knowledge with the vote
         // Election.java:1187-1194: consensusPublisher.placeVote(...)
         publisher_.placeVote(
             candidateId,

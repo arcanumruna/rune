@@ -295,9 +295,15 @@ TEST(GR7_Unit, LeaderKillMidProduce_CommittedNotLost) {
     // (KIP-101).  Wire L to the new leader and drive the exchange; L is NOT in
     // F2's ISR ({kF2,kF3}), so its ahead tail is treated as uncommitted and it
     // truncates to F2's epoch boundary (== committedHw).
+    // KIP-320/595: F2 completes once a majority of its assigned ISR {F2, F3}
+    // proved (validated fetch) its log is a prefix of F2's — F3 must report in
+    // before F2 directs L's DivergingEpoch truncation (an incomplete leader
+    // holds a diverging follower instead).
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
-    bool truncated = gr7Drive({&replicaF2, &replicaL}, transport, clock,
+    transport.addFollower(kF3, &replicaF3);
+    replicaF3.becomeFollower(newEpoch, kF2);
+    bool truncated = gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
                               [&]{ return replicaL.logEndOffset() <= committedHw; });
 
     // Assertions:
@@ -412,7 +418,8 @@ TEST(GR7_Unit, UncommittedTailTruncation_NoLogDivergence) {
     Offset leo1 = appendN(replicaL, 2, 0x11);
     bool ok1 = gr7Drive({&replicaL, &replicaF2, &replicaF3}, transport, clock,
                         [&]{ return replicaF2.logEndOffset() >= leo1 &&
-                                     replicaF3.logEndOffset() >= leo1; });
+                                     replicaF3.logEndOffset() >= leo1 &&
+                                     replicaL.highWatermark() >= leo1; });   // Kafka: all ISR acked
     ASSERT_TRUE(ok1) << "B1 must replicate to all followers";
     const Offset hwB1 = replicaL.highWatermark();
     ASSERT_GE(hwB1, 0);
@@ -460,19 +467,14 @@ TEST(GR7_Unit, UncommittedTailTruncation_NoLogDivergence) {
     replicaF2.becomeLeader(newEpoch, {kF2, kF3, kL});
     replicaF3.becomeFollower(newEpoch, kF2);
 
-    // DR-BUG-6: F3 (and L) are ISR members whose ahead same-epoch tail (B3) is
-    // indistinguishable, from local information alone, from a committed
-    // continuation the new leader merely lacks — this is exactly the DR-8
-    // ambiguity.  The divergence-critical priority is: NEVER lose committed data
-    // and NEVER diverge.  So an ahead ISR member KEEPS its tail and the new
-    // leader reconciles (pulls) it, rather than truncating (which risked the
-    // DR-8 committed-loss).  The result: all replicas CONVERGE byte-identically
-    // on the reconciled log — no divergence, which is this test's stated intent.
+    // Kafka model: HW = min LEO over the ISR — B3 (on L and F3 only) was never
+    // committed while F2 was in the ISR, so F2 is a COMPLETE leader: L's and F3's
+    // B3 tails are off its lineage (DivergingEpoch → KIP-279 truncation) and
+    // every replica converges on F2's log; the committed prefix is intact.
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
     transport.addFollower(kF3, &replicaF3);
-
-    // Drive the epoch exchange + reconcile to full convergence.
+    EXPECT_TRUE(replicaF2.acceptsProduce());
     bool okConv = gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
                            [&]{
                                Offset a = replicaF2.logEndOffset();
@@ -811,6 +813,7 @@ TEST(GR7_Unit, HW_Monotonic_AcrossFailover) {
     const Epoch newEpoch = 2;
     replicaL.becomeFollower(newEpoch, kF2);
     replicaF2.becomeLeader(newEpoch, {kF2, kF3});
+    replicaF3.becomeFollower(newEpoch, kF2);
 
     // New leader F2 must hold all hw1 committed records (LEO >= hw1).
     EXPECT_GE(replicaF2.logEndOffset(), hw1)
@@ -819,6 +822,11 @@ TEST(GR7_Unit, HW_Monotonic_AcrossFailover) {
     // Re-wire transport to new leader.
     transport.setLeader(&replicaF2);
     transport.addFollower(kL, &replicaL);
+    transport.removeFollower(kF2);
+    // The new leader accepts writes once a majority of its ISR {F2, F3} proved
+    // (validated fetch) its log is a prefix of F2's.
+    ASSERT_TRUE(gr7Drive({&replicaF2, &replicaL, &replicaF3}, transport, clock,
+                         [&]{ return replicaF2.acceptsProduce(); }));
 
     // Produce 2 more records under new leader.
     Offset leo6 = appendN(replicaF2, 2, 0x02);

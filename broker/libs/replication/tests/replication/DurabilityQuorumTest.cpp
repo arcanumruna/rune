@@ -2,7 +2,7 @@
 // DurabilityQuorumTest.cpp — Tests for per-topic durability-quorum knob.
 //
 // Covers:
-//   1. ReplicaLeaderState: Majority mode uses majority-th highest LEO.
+//   1. ReplicaLeaderState: Majority mode uses the min LEO over the ISR (Kafka model).
 //   2. ReplicaLeaderState: AllInSync mode uses full-ISR minimum LEO.
 //   3. AllInSync with a lagging follower holds HW at laggard's LEO.
 //   4. PartitionReplica: AllInSync topic with one lagger holds HW at min follower LEO.
@@ -22,11 +22,13 @@ static ReplicaLeaderState make() {
     return s;
 }
 
-TEST(DurabilityQuorum, MajorityIsMajorityThHighest) {
+// Kafka model (user decision 2026-10-03): Majority mode no longer commits on a
+// majority — HW = min LEO over the ISR in every mode (was the 2nd highest, 90).
+TEST(DurabilityQuorumRegression, MajorityModeHwIsMinOverIsr) {
     auto s = make();
     s.setDurabilityMode(DurabilityMode::Majority);
     s.recompute();
-    EXPECT_EQ(s.highWatermark(), 90) << "majority-of-3 = 2nd highest = 90";
+    EXPECT_EQ(s.highWatermark(), 80) << "HW = min LEO over the ISR";
 }
 
 TEST(DurabilityQuorum, AllInSyncWaitsForEveryIsrMember) {

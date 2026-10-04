@@ -16,6 +16,10 @@
 //     Rationale: __cluster_metadata's own leadership cannot come from the map it
 //     holds (bootstrap chicken-and-egg); MD1-4/MD1-6 rely on this path to emit
 //     assignments.
+//     Re-review 2026-10-04 MEDIUM-B: with setCoordinatorPartitionsOnController
+//     (multi-node), -1 / -2 instead follow the committed map like USER
+//     partitions (the controller assigns them — see
+//     MetadataService::decideCoordinatorPartition); only -3 stays here.
 //
 //   USER partitions (topicId >= 0):
 //     Follow the COMMITTED assignment map (apply-committed-only — never pending):
@@ -140,6 +144,14 @@ public:
         workerPool_ = pool;
     }
 
+    /// Re-review 2026-10-04 MEDIUM-B: the coordinator partitions
+    /// (__consumer_offsets -1, __transaction_state -2) are on the controller-
+    /// ISR path (MetadataService::decideCoordinatorPartition): when on, they are
+    /// driven from the COMMITTED assignment map exactly like user partitions
+    /// (Step B; never deleted), not from consensus leadership (Step A).
+    /// BrokerNode turns it on multi-node.  Duty-cycle thread.
+    void setCoordinatorPartitionsOnController(bool on) noexcept { coordinatorOnController_ = on; }
+
     // -----------------------------------------------------------------------
     // doWork — single duty-cycle step.
     //
@@ -194,6 +206,9 @@ public:
             for (auto* replica : registry_.allReplicas()) {
                 if (!replica) continue;
                 if (replica->topicId() >= 0) continue;  // skip user partitions
+                // MEDIUM-B: coordinator partitions follow the committed map
+                // (Step B), not consensus leadership.
+                if (coordinatorOnController_ && isCoordinatorTopic_(replica->topicId())) continue;
 
                 if (selfIsClusterLeader) {
                     routeBecomeLeader_(replica, currentEpoch, allReplicaIds_);
@@ -290,18 +305,20 @@ private:
 
         // Apply role transitions for user partitions only.
         // electedLeaders + leaderUpdates → becomeLeader
+        // MEDIUM-B: plus the coordinator partitions when they are on the
+        // controller path (mapDriven_).
         for (const auto& key : delta.electedLeaders) {
-            if (key.topicId < 0) continue;  // only user partitions (guard)
+            if (!mapDriven_(key.topicId)) continue;  // user (+ coordinator) partitions only
             applyBecomeLeaderForKey(key, currentMap);
         }
         for (const auto& key : delta.leaderUpdates) {
-            if (key.topicId < 0) continue;
+            if (!mapDriven_(key.topicId)) continue;
             applyBecomeLeaderForKey(key, currentMap);
         }
 
         // followers → becomeFollower
         for (const auto& key : delta.followers) {
-            if (key.topicId < 0) continue;
+            if (!mapDriven_(key.topicId)) continue;
             applyBecomeFollowerForKey(key, currentMap);
         }
 
@@ -337,7 +354,8 @@ private:
     void routeBecomeLeader_(
         rune::replication::PartitionReplica*          replica,
         rune::replication::Epoch                      epoch,
-        std::vector<rune::replication::NodeId>        isr) noexcept;
+        std::vector<rune::replication::NodeId>        isr,
+        int32_t                                       partitionEpoch = -1) noexcept;
     /// F15 §3.1: record the role just routed as the gateway's intended-role hint.
     void recordIntendedRole_(rune::replication::PartitionReplica* replica,
                              ReplicaRegistry::IntendedRole role) noexcept;
@@ -443,7 +461,7 @@ private:
             isr.push_back(static_cast<rune::replication::NodeId>(n));
         }
 
-        routeBecomeLeader_(replica, perPartEpoch, std::move(isr));
+        routeBecomeLeader_(replica, perPartEpoch, std::move(isr), pa->partitionEpoch);
     }
 
     void applyBecomeFollowerForKey(
@@ -513,7 +531,12 @@ private:
     // Fields
     // -----------------------------------------------------------------------
 
+    [[nodiscard]] static constexpr bool isCoordinatorTopic_(int32_t t) noexcept { return t == -1 || t == -2; }
+    [[nodiscard]] bool mapDriven_(int32_t t) const noexcept {
+        return t >= 0 || (coordinatorOnController_ && isCoordinatorTopic_(t));
+    }
     rune::consensus::NodeId                        selfId_;
+    bool                                           coordinatorOnController_ = false;   ///< MEDIUM-B
     std::vector<rune::replication::NodeId>         allReplicaIds_;
     ReplicaRegistry&                               registry_;
 

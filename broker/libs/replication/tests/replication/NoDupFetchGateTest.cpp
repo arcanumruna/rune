@@ -86,6 +86,13 @@ struct LeaderFixture {
         leader = std::make_unique<PartitionReplica>(
             cfgFor(kLeader), Role::Leader, /*epoch=*/1,
             std::vector<NodeId>{kLeader, kF2, kF3}, std::move(isr), &log, &t);
+        // KIP-320/595: the ISR followers report in first (a validated pure ack on
+        // their empty logs) — a leader pushes only to validated followers.
+        for (NodeId id : leader->isr()) {
+            if (id == kLeader) continue;
+            (void)leader->onFetchRequest(fetch(id, 0, /*maxBytes=*/0), 0);
+            (void)t.takeFor(id);
+        }
         // Produce hot path: append straight to the Log, then onLeaderLogAppended().
         // (The direct append() API pushes inline per call; the hot path's push is
         // COALESCED in doWork — exactly one push covering [0,10).)

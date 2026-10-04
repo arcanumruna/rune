@@ -97,8 +97,12 @@ public:
     /// Kafka's leader restamp).  `data` is never mutated (may point directly at a
     /// read-only Aeron fragment / ring slot).  Same page-cache durability
     /// contract as appendNoSync().  Returns nextOffset (= lastOffset + 1).
+    /// `leaderEpoch` >= 0 additionally patches the batch's partitionLeaderEpoch
+    /// field [12..15] (CRC-excluded, Kafka's leader stamp) the same zero-copy way;
+    /// -1 writes the producer's bytes there unchanged.
     int64_t appendNoSyncRestamp(const uint8_t* data, std::size_t len,
-                                int64_t baseOffset, int64_t lastOffset);
+                                int64_t baseOffset, int64_t lastOffset,
+                                int32_t leaderEpoch = -1);
 
     /// Flush libc buffer + fdatasync ".log" + msync ".index".
     /// Called automatically by append() (durable-by-default).
@@ -108,6 +112,16 @@ public:
     /// and marks the owning Log permanently failed (LogStorageState::failedErrno).
     /// On an already-failed log it throws without touching the disk.
     void sync();
+
+    /// E2 crash-simulation seam (DR tests): the .log byte length that the LAST
+    /// successful inline sync() made durable in this incarnation (-1 = never
+    /// synced since open).  A truncation below it lowers it.  Pure bookkeeping —
+    /// one store on the (already syscall-bound) sync path; nothing reads it in
+    /// production.  Async (io-backend) flushes are not tracked.
+    [[nodiscard]] int64_t syncedBytesForTest() const noexcept { return syncedBytes_; }
+    /// A segment object REBUILT over the same file (Log::truncateTo) keeps the
+    /// synced extent of the prefix it took over.
+    void inheritSyncedBytesForTest(int64_t b) noexcept { syncedBytes_ = b; }
 
     /// Wire the owning Log's storage state (set by Log when it installs the segment).
     void setStorageState(LogStorageState* s) noexcept { storage_ = s; }
@@ -267,6 +281,7 @@ private:
     std::unique_ptr<OffsetIndex> index_;
     uint64_t installGen_ = 0;
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
+    int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
 

@@ -6,6 +6,7 @@
 // Methods added in P2P-5b: newLeadershipTerm, appendPosition, commitPosition.
 
 #include <rune/consensus/Types.h>
+#include <rune/consensus/CandidacyState.h>
 #include <cstdint>
 
 namespace rune::consensus {
@@ -21,6 +22,12 @@ struct ConsensusPublisher {
 
     // ConsensusPublisher.java:53-89  canvassPosition(Publication, ...)
     // Emitted by: CANVASS and NOMINATE states (periodic broadcast to peers).
+    /// Re-review round 3 CRITICAL-R3: the sender's newest durable metadata-ISR
+    /// state (template 58), sent while canvassing / voting.  Default: not sent
+    /// (test doubles that do not model the exchange).
+    virtual void candidacyState(NodeId /*toMember*/, NodeId /*fromMember*/,
+                                const CandidacyState& /*state*/) {}
+
     virtual void canvassPosition(
         NodeId  toMember,
         Term    logLeadershipTermId,

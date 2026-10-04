@@ -756,3 +756,44 @@ TEST(ConsensusTemplateId, EnumValues)
     EXPECT_EQ(static_cast<uint16_t>(ConsensusTemplateId::TerminationPosition),uint16_t{75});
     EXPECT_EQ(static_cast<uint16_t>(ConsensusTemplateId::TerminationAck),     uint16_t{76});
 }
+
+// Re-review 2026-10-04 (fix round 3) CRITICAL-R3: CandidacyState (template 58)
+// carries the sender's newest metadata-ISR state; it round-trips through the
+// codec and the adapter hands it to a handler that models the exchange.
+#include <rune/consensus/ConsensusAdapter.h>
+#include <rune/consensus/SbeConsensusPublisher.h>
+namespace {
+struct CandidacyHandler {
+    int got = 0; NodeId from = -1; rune::consensus::CandidacyState st{};
+    void onCanvassPosition(int64_t, Term, int64_t, Term, NodeId, int32_t) {}
+    void onRequestVote(int64_t, Term, int64_t, Term, NodeId, int32_t) {}
+    void onVote(int64_t, Term, Term, int64_t, NodeId, NodeId, bool) {}
+    void onNewLeadershipTerm(int64_t, Term, Term, int64_t, int64_t, Term, int64_t, int64_t, int64_t,
+                             int64_t, NodeId, int32_t, int32_t, bool, int64_t) {}
+    void onAppendPosition(int64_t, Term, int64_t, NodeId, uint8_t) {}
+    void onCommitPosition(int64_t, Term, int64_t, NodeId) {}
+    void onCandidacyState(int64_t, NodeId f, const rune::consensus::CandidacyState& s) { ++got; from = f; st = s; }
+};
+} // namespace
+
+TEST(ConsensusMessagesRegression, CandidacyStateRoundTripsThroughCodecAndAdapter) {
+    std::array<uint8_t, rune::consensus::kEncodeBufCapacity> buf{};
+    const int32_t members[3] = {1, 3, 5};
+    const std::size_t len = CandidacyStateMsg::encode(buf.data(), 0, /*leaderEpoch=*/7, /*version=*/4,
+                                                      /*fromMember=*/2, /*count=*/3, members);
+    ASSERT_EQ(len, CandidacyStateMsg::TOTAL_SIZE);
+    ASSERT_LE(len, rune::consensus::kEncodeBufCapacity);
+    CandidacyHandler h;
+    BasicConsensusAdapter<CandidacyHandler> adapter{h};
+    adapter.onFragment(0, buf.data(), len);
+    ASSERT_EQ(h.got, 1);
+    EXPECT_EQ(h.from, 2);
+    EXPECT_EQ(h.st.leaderEpoch, 7);
+    EXPECT_EQ(h.st.version, 4);
+    ASSERT_EQ(h.st.count, 3);
+    EXPECT_EQ(h.st.members[0], 1);
+    EXPECT_EQ(h.st.members[2], 5);
+    adapter.onFragment(0, buf.data(), len - 1);   // truncated: ignored
+    EXPECT_EQ(h.got, 1);
+    EXPECT_EQ(adapter.ignoredFrameCount(), 1);
+}

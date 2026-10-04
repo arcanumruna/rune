@@ -743,3 +743,84 @@ TEST(GatewayReplicationWiring, Unit_RoleFlip_RepeatedLeaderChanges) {
     EXPECT_GT(bridge.lastEpoch(), Epoch{0});
     EXPECT_EQ(bridge.lastEpoch(), Epoch{4});
 }
+
+// ---------------------------------------------------------------------------
+// Re-review 2026-10-04 (fix round 2) MEDIUM-B, real path (3 BrokerNodes over
+// aeron:udp): the coordinator partitions (__consumer_offsets -1,
+// __transaction_state -2) are on the controller-ISR path — the controller
+// assigns them in the committed metadata map and the bridge drives them from
+// it.  The consensus leader leads both (it is in their committed ISR); after it
+// is killed, the new consensus leader takes them over through a committed
+// assignment (leader epoch bumped), not through the consensus term.
+// Polling is paced by blocking control-thread round-trips (no sleeps).
+// ---------------------------------------------------------------------------
+TEST(GatewayReplicationWiring, ThreeNode_CoordinatorPartitionsOnControllerPath_FailOverViaMap) {
+    GrTempDir dir0{"gr_cp0_"}, dir1{"gr_cp1_"}, dir2{"gr_cp2_"};
+    const auto cPorts = grDiscoverFreePorts(3);
+    const auto kPorts = grDiscoverFreePorts(3);
+    const auto rPorts = grDiscoverFreePorts(3);
+    auto node0 = std::make_unique<rune::node::BrokerNode>(makeGrConfig(0, dir0.path, cPorts, kPorts, rPorts));
+    auto node1 = std::make_unique<rune::node::BrokerNode>(makeGrConfig(1, dir1.path, cPorts, kPorts, rPorts));
+    auto node2 = std::make_unique<rune::node::BrokerNode>(makeGrConfig(2, dir2.path, cPorts, kPorts, rPorts));
+    node0->start(); node1->start(); node2->start();
+    ASSERT_TRUE(node0->awaitLeader(8s));
+    ASSERT_TRUE(node1->awaitLeader(8s));
+    ASSERT_TRUE(node2->awaitLeader(8s));
+    std::array<std::unique_ptr<rune::node::BrokerNode>*, 3> owners{&node0, &node1, &node2};
+
+    struct View { int32_t mapLeader = -9; int32_t mapEpoch = -1; bool replicaLeads = false; };
+    // Read, on node `n`'s control thread, its committed assignment of (t,0) and
+    // whether its replica of (t,0) is a Leader at that epoch.
+    auto view = [&](rune::node::BrokerNode& n, int32_t t) {
+        return n.onControlThreadForTest([&n, t] {
+            View v;
+            if (auto* svc = n.metadataServiceForTest()) {
+                if (const auto* pa = svc->assignment(t, 0)) { v.mapLeader = pa->leaderNode; v.mapEpoch = pa->leaderEpoch; }
+            }
+            return v;
+        });
+    };
+    auto leads = [&](rune::node::BrokerNode& n, int32_t t, int32_t epoch) {
+        return n.onOwnerThreadForTest(t, 0, [epoch](rune::replication::PartitionReplica* r) {
+            return r != nullptr && r->role() == rune::replication::Role::Leader && r->epoch() == epoch;
+        });
+    };
+    auto awaitCoordinatorLeader = [&](rune::node::BrokerNode& n, int32_t self, int32_t t, View& out) {
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            out = view(n, t);
+            if (out.mapLeader == self && leads(n, t, out.mapEpoch)) return true;
+        }
+        return false;
+    };
+
+    const rune::consensus::NodeId l0 = node0->leaderId();
+    ASSERT_GE(l0, 0);
+    View off0, txn0;
+    ASSERT_TRUE(awaitCoordinatorLeader(**owners[l0], l0, -1, off0))
+        << "__consumer_offsets: map leader " << off0.mapLeader << " (consensus leader " << l0 << ")";
+    ASSERT_TRUE(awaitCoordinatorLeader(**owners[l0], l0, -2, txn0))
+        << "__transaction_state: map leader " << txn0.mapLeader;
+
+    owners[l0]->reset();                         // kill the consensus leader
+    std::vector<int> surv;
+    for (int i = 0; i < 3; ++i) if (i != l0) surv.push_back(i);
+    rune::consensus::NodeId l1 = -1;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto a = (*owners[surv[0]])->leaderId(), b = (*owners[surv[1]])->leaderId();
+            if (a >= 0 && a != l0 && a == b) { l1 = a; break; }
+            (void)(*owners[surv[0]])->onControlThreadForTest([] { return 0; });   // pace
+        }
+    }
+    ASSERT_GE(l1, 0) << "no consensus re-election";
+    View off1, txn1;
+    EXPECT_TRUE(awaitCoordinatorLeader(**owners[l1], l1, -1, off1))
+        << "__consumer_offsets did not fail over to the new controller via the map (map leader "
+        << off1.mapLeader << ")";
+    EXPECT_GT(off1.mapEpoch, off0.mapEpoch) << "no committed leader change";
+    EXPECT_TRUE(awaitCoordinatorLeader(**owners[l1], l1, -2, txn1))
+        << "__transaction_state did not fail over (map leader " << txn1.mapLeader << ")";
+    for (auto* o : owners) if (*o) (*o)->stop();
+}

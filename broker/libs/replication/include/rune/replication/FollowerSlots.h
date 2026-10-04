@@ -51,6 +51,14 @@ struct FollowerSlot {
     Offset  catchUpTarget     = -1;
     // F27: the follower's last fetchOffset in THIS leadership (-1 = not heard yet).
     Offset  ackedLeo          = -1;
+    // KIP-320/595: this follower sent a fetch that passed lastFetchedEpoch
+    // validation in THIS leadership — its log is a prefix of ours.  Only such a
+    // follower is pushed to, credited, or counted for leader completeness.
+    bool    validated         = false;
+    // KIP-966 (data plane): this follower's position regressed below the HW in
+    // this leadership (an unclean restart lost acknowledged records).  Kept out
+    // of the ISR (shrink proposal) until a validated fetch is back at the HW.
+    bool    unclean           = false;
     // F27: a fetch answer the transport refused, re-sent on the leader's next pass.
     // fetchOffset < 0 = nothing owed.  Superseded by the follower's next fetch.
     struct OwedAnswer {
@@ -85,6 +93,12 @@ struct FollowerSlot {
     // F27 R1: the follower's connection generation last seen on its fetch (0 =
     // never seen).  Survives resetLeadership(): it is a property of the link.
     uint32_t connGen = 0;
+    // KIP-903: the newest process incarnation this follower fetched with (0 =
+    // never seen).  Survives resetLeadership(): it is a property of the follower
+    // process, not of the leadership — a fetch from an OLDER incarnation (a
+    // frame of a dead process) is never credited, and a CHANGED one below the
+    // HW marks the follower unclean (it lost committed records in a restart).
+    int64_t incarnation = 0;
 
     /// F27 R1: the link to this follower went down and came back: anything the
     /// transport accepted while it was down may be lost — forget every claim of
@@ -112,8 +126,10 @@ struct FollowerSlot {
         servedFetchOffset = -1; servedLeo = -1; servedTimeNs = 0;
         askOffset = -1; askSinceNs = 0; pushedThrough = 0; catchUpTarget = -1;
         ackedLeo = -1; owed = OwedAnswer{}; dataServedThrough = -1; owedEpoch = OwedEpochAnswer{};
+        validated = false; unclean = false;
         // connGen is NOT reset: it belongs to the link, not the leadership — a
         // bounce across a re-election must still rewind (re-review 2 N1).
+        // incarnation is NOT reset either (MEDIUM-4: see the field).
     }
 };
 
@@ -147,6 +163,7 @@ public:
     }
     [[nodiscard]] std::size_t size() const noexcept { return n_; }
     [[nodiscard]] FollowerSlot& at(std::size_t i) noexcept { return slots_[i]; }
+    [[nodiscard]] const FollowerSlot& at(std::size_t i) const noexcept { return slots_[i]; }
 
 private:
     std::array<FollowerSlot, kMaxReplicas> slots_{};

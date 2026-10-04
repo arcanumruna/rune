@@ -550,8 +550,12 @@ TEST(ShardModeRegression, PeerRestartStillMismatchedStaysRefused) {
         const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid, 0);
         ASSERT_TRUE(leaderBecomes(c, ports, sid, part, 0));
+        // DUR-1 B1: node 0 is an INCOMPLETE leader until node 1 (whose plane is
+        // refused, so it never reports in) leaves its ISR by the lag check
+        // (replicaLagMaxMs) — every produce, acks=leader included, is refused
+        // NotLeader (retriable) until then.  Retry past that window.
         auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, part,
-                                    /*acks=leader*/0, makeBatch(3));
+                                    /*acks=leader*/0, makeBatch(3), /*maxAttempts=*/2000);
         ASSERT_TRUE(ack.has_value());
     }
     EXPECT_GE(rune::node::test::leoOnOwner(n0, 0, part), 3);
@@ -1265,7 +1269,14 @@ void runBatchAtExactLimitAcceptedReplicatedAndPushed(int nodes) {
         EXPECT_EQ(c.records().front().bytes.size(), limit);
         auto expected = atLimit;
         for (int i = 0; i < 8; ++i) expected[i] = 0;   // baseOffset 0 restamped (bytes 0..7)
-        EXPECT_EQ(c.records().front().bytes, expected) << "pushed batch not byte-identical";
+        // Kafka parity: the leader stamps its partitionLeaderEpoch (bytes 12..15,
+        // CRC-excluded) on append — a real epoch, never the producer's -1.
+        const auto& got0 = c.records().front().bytes;
+        int32_t stampedEpoch = 0;
+        std::memcpy(&stampedEpoch, got0.data() + 12, 4);
+        EXPECT_GE(stampedEpoch, 0) << "the leader did not stamp its epoch";
+        std::memcpy(expected.data() + 12, &stampedEpoch, 4);
+        EXPECT_EQ(got0, expected) << "pushed batch not byte-identical (beyond the leader stamps)";
     }
     for (auto& n : ns) n->stop();
     int replicas = 0;

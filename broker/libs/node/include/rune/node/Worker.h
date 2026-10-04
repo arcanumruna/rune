@@ -1026,6 +1026,9 @@ public:
            .frFetchOffset(static_cast<std::int64_t>(op.fetchRequestPayload.fetchOffset))
            .frMaxBytes(op.fetchRequestPayload.maxBytes)
            .frNowNs(op.fetchRequestPayload.nowNs)
+           .frLastFetchedEpoch(op.fetchRequestPayload.lastFetchedEpoch)
+           .frIncarnation(op.fetchRequestPayload.incarnation)
+           .rolePartitionEpoch(op.rolePartitionEpoch)
            .oleCurrentEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.currentEpoch))
            .oleFollowerId(static_cast<std::int32_t>(op.offsEpochReqPayload.followerId))
            .oleRequestedEpoch(static_cast<std::int64_t>(op.offsEpochReqPayload.requestedEpoch))
@@ -2094,6 +2097,18 @@ private:
         case WorkerOp::Type::ReconcileFetchReq:
             executeReconcileFetchReqWire_(op);
             break;
+        // MEDIUM-2: the controller's AlterIsr answer (cold).
+        case WorkerOp::Type::AlterIsrResponse:
+            if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica())) {
+                rune::replication::AlterIsrResponseMsg r{};
+                r.topicId        = op.topicId();
+                r.partition      = op.partition();
+                r.leaderEpoch    = static_cast<rune::replication::Epoch>(op.roleEpoch());
+                r.partitionEpoch = op.rolePartitionEpoch();
+                r.errorCode      = op.replErrorCode();
+                rep->onAlterIsrResponse(r);
+            }
+            break;
         // Task #13: AppendControlRecord — worker appends txn control marker
         case WorkerOp::Type::AppendControlRecord:
             executeAppendControlRecordWire_(op);
@@ -2861,7 +2876,7 @@ private:
             static_cast<rune::replication::Epoch>(op.roleEpoch());
 
         try {
-            replica->becomeLeader(epoch, std::move(isr));
+            replica->becomeLeader(epoch, std::move(isr), op.rolePartitionEpoch());
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeLeader threw for topicId={} partition={}: {}",
                          workerId_, topicId, partition, ex.what());
@@ -2871,7 +2886,7 @@ private:
 
         // F15 S5 (§2.5, I3): no synchronous producer-state rebuild here.  The
         // worker psm_ for this partition is rebuilt by the incremental RC build
-        // (RcState: bounded per pass, starts at leaderComplete_, scans the
+        // (RcState: bounded per pass, starts at leadership, scans the
         // whole log and applies control batches as epoch raises), in EVERY
         // mode; idempotent / transactional produces are refused NotLeader
         // (retriable) until it is Ready.
@@ -2961,6 +2976,8 @@ private:
         req.fetchOffset = static_cast<rune::replication::Offset>(op.frFetchOffset());
         req.maxBytes    = op.frMaxBytes();
         req.topicId     = op.topicId();
+        req.lastFetchedEpoch = op.frLastFetchedEpoch();
+        req.incarnation      = op.frIncarnation();
 
         try {
             replica->onFetchRequest(req, op.frNowNs(),
@@ -3950,6 +3967,7 @@ private:
         case WorkerOp::Type::ReconcileFetchResp:
         case WorkerOp::Type::OffsetsForLeaderEpochResp:
         case WorkerOp::Type::ReconcileFetchReq:
+        case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::Subscribe:
             return true;
@@ -4165,7 +4183,6 @@ private:
     [[nodiscard]] static RcFacts rcFacts_(const rune::replication::PartitionReplica* r) noexcept {
         RcFacts f;
         f.leader               = r->role() == rune::replication::Role::Leader;
-        f.leaderComplete       = r->isLeaderComplete();
         f.logGeneration        = r->logGeneration();
         f.leadershipGeneration = r->leadershipGeneration();
         f.epoch                = static_cast<int32_t>(r->epoch());
@@ -4250,7 +4267,7 @@ private:
     // is a replication-less partition (passthrough): nothing to gate.
     [[nodiscard]] [[gnu::always_inline]] static bool
     produceRoleGatePasses_(const rune::replication::PartitionReplica* r) noexcept {
-        return r == nullptr || r->role() == rune::replication::Role::Leader;
+        return r == nullptr || r->acceptsProduce();   // DUR-1 B1: role AND completeness
     }
     void rebuildOwnedIndex_() {
         uint32_t maxId = 0;
