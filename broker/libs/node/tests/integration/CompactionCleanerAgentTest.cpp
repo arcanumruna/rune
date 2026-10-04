@@ -3043,6 +3043,7 @@ TEST(CompactionCleanerAgentRegression, NeverCompactsAboveRecoveryPoint) {
     auto cfg = makeCompactConfig(1300, 0.0);
     auto replica = std::make_unique<PartitionReplica>(
         cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // F22: no Worker RcState in this rig (D3b LSO cap)
     replica->becomeLeader(1, {1});
     int64_t off = 0;
     while (log.segmentBaseOffsets().size() < 4) {

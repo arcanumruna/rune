@@ -74,6 +74,13 @@ using namespace rune::replication::test;
 
 // Hard cap used in all bounded loops not using the harness driveUntil.
 static constexpr int kCap = 500;
+// F22 (DUR-1 Kafka model): HW = min LEO over the ISR, so a partitioned ISR
+// member holds the HW back until it is lag-shrunk (replicaLagMaxMs = 1000 ms in
+// the harness).  Tests that commit "on the majority side" while a member is cut
+// off must drive past that window (1 ms steps) — and the HW must NOT move
+// before it (no majority commit).
+static constexpr int kLagShrinkCap = 3000;
+static constexpr int kInsideLagWindow = 500;
 
 // ===========================================================================
 // Group 1: Happy path
@@ -146,8 +153,10 @@ TEST(HappyPath, FiveNode_SingleLaggingReplicaDoesNotBlockHW) {
     h.partitionOff(4);
 
     // Drive the remaining 4 nodes.
-    bool ok = h.driveUntil([&]{ return ldr->highWatermark() >= leo; });
-    ASSERT_TRUE(ok) << "5-node: HW must advance even when one replica is lagging";
+    EXPECT_FALSE(h.driveUntil([&]{ return ldr->highWatermark() >= leo; }, kInsideLagWindow))
+        << "Kafka model: the lagging ISR member holds the HW until it is shrunk";
+    bool ok = h.driveUntil([&]{ return ldr->highWatermark() >= leo; }, kLagShrinkCap);
+    ASSERT_TRUE(ok) << "5-node: HW must advance once the lagging replica is lag-shrunk";
     EXPECT_GE(ldr->highWatermark(), leo);
 
     h.healPartition();
@@ -536,13 +545,15 @@ TEST(PartitionSafety, PartitionHeal_MajoritySideWins) {
 
     // Drive majority side until HW advances.
     bool ok = false;
-    for (int i = 0; i < kCap && !ok; ++i) {
+    int steps = 0;
+    for (int i = 0; i < kLagShrinkCap && !ok; ++i, ++steps) {
         h.advanceClock(ReplicationClusterHarness::kStep1ms);
         ldr->doWork(h.clock());
         h.replicaAt(1)->doWork(h.clock());
         h.transport().pump(h.clock());
         ok = (ldr->highWatermark() >= leoMajority);
     }
+    EXPECT_GE(steps, kInsideLagWindow) << "Kafka model: the cut-off ISR member held the HW until lag-shrunk";
     ASSERT_TRUE(ok) << "Majority side must commit the new record";
     Offset hwMajority = ldr->highWatermark();
 
@@ -789,13 +800,15 @@ TEST(SelfHealing, UnderReplicationRepair_ISRSizeRestored) {
     Offset leoNew = ldr->logEndOffset();
 
     bool ok = false;
-    for (int i = 0; i < kCap && !ok; ++i) {
+    int steps = 0;
+    for (int i = 0; i < kLagShrinkCap && !ok; ++i, ++steps) {
         h.advanceClock(ReplicationClusterHarness::kStep1ms);
         ldr->doWork(h.clock());
         h.replicaAt(1)->doWork(h.clock());
         h.transport().pump(h.clock());
         ok = (ldr->highWatermark() >= leoNew);
     }
+    EXPECT_GE(steps, kInsideLagWindow) << "Kafka model: the cut-off ISR member held the HW until lag-shrunk";
     ASSERT_TRUE(ok) << "Majority (2/3) must still be able to commit";
 
     h.healPartition();
@@ -1128,13 +1141,15 @@ TEST(Extra, ThreeNode_KillThenRevive_RejoinConverges) {
 
     // Commit on the majority side (leader + follower[2]).
     bool ok = false;
-    for (int i = 0; i < kCap && !ok; ++i) {
+    int steps = 0;
+    for (int i = 0; i < kLagShrinkCap && !ok; ++i, ++steps) {
         h.advanceClock(ReplicationClusterHarness::kStep1ms);
         ldr->doWork(h.clock());
         h.replicaAt(2)->doWork(h.clock());
         h.transport().pump(h.clock());
         ok = (ldr->highWatermark() >= newLeo);
     }
+    EXPECT_GE(steps, kInsideLagWindow) << "Kafka model: the cut-off ISR member held the HW until lag-shrunk";
     ASSERT_TRUE(ok);
     Offset hwAfter = ldr->highWatermark();
 
