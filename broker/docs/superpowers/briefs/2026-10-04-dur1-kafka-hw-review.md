@@ -527,3 +527,176 @@ into the same knowledge store when Task 8b lands. Add a guard test.
 | Virtual calls, std::function, allocation on hot paths | OK. The fetch-path additions (incarnation check, `committedMember` find in the below-HW cold branch) do not allocate. `InternalIsrKnowledge` and InternalIsr handling are cold (ISR changes only). The new virtuals are cold. |
 | Tests never sleep | OK. No `sleep_for` or `usleep` in the diff. |
 | RED-first `*Regression*` | OK for every listed fix. MAJOR-A and MEDIUM-A need new regression tests (the MAJOR-A scratch repro is ready). |
+
+---
+
+# Re-review (fix round 3)
+
+Scope: rune-broker-wt31 `feat/dur-1` a2d4092..e359e44 (2796c8a, 3933caa, 703b087, c319e9b, e359e44).
+rune-protocol-fe `feat/fetch-epoch` has no commits after a9787dc. Read-only. To confirm findings I compiled one
+scratch gtest TU against the e359e44 DR harness and linked it against the existing (up-to-date) `build-fast`
+libraries: `repros/rev5-dur1-round3-Repro.cpp`. Both tests in it are RED on e359e44. `check_no_atomics.py` is
+OK.
+
+## Verdict: CHANGES REQUIRED
+
+1 CRITICAL, 1 MAJOR, 0 MEDIUM, 3 LOW (all new; the CRITICAL and the MAJOR are regressions that round 3 introduced).
+Every round-2 finding has a commit and a test that fails without its fix. But two of the fixes create new
+problems:
+- **MAJOR-A fix.** Dropping the candidate self-gate removed the safety check on the candidate's own
+  (unconditional) vote.
+- **MEDIUM-A fix.** The term rule reads a term that a denied vote bumps.
+
+### Status of the round-2 findings
+
+| Finding | Status | Notes |
+|---|---|---|
+| MAJOR-A | **Liveness fixed; the fix is unsafe (CRITICAL-R3)** | The `ElectionBallotRegression.VoteGate_StaleSelfKnowledgeStillStands` and `DrIntegrationRegression.StaleSelfKnowledge_ConsensusNotHeadless` tests are landed, and the scratch repro is used as-is. Anti-entropy works: `CommittedInternalIsrResentUntilAcked_KnowledgeConverges` fails without the re-send. The DR test passes because of the harness change (`consensusElectable_`, `votes = 1`), and the Election change is proven by the ballot test. |
+| MEDIUM-A | **Zombie window closed; the term source is wrong (MAJOR-R3)** | `ZombieLeaderInternalIsrAckRefusedAfterVote_NoAckedLoss` and `InternalIsrRegression.StateOlderThanConsensusTermNeitherPersistedNorAcked` are genuine RED→GREEN tests. The BrokerNode term-source wiring is proven only by reading the code (see LOW-B). |
+| MEDIUM-B | **Fixed** | Only `-3` gates candidacy (`InternalIsrKnowledge.cpp:57`, `ReplicaRegistry.h:65`). `-1`/`-2` run on the controller path: AlterIsr is accepted for coordinator keys, the bridge drives them from the map, inline on the control thread (`ReplicationMetadataBridge.cpp` direct call for topicId<0), and the AlterIsrResponse for topicId<0 is handled inline. The override is OFF by default (`NodeConfig.h:291`), is env-parsed and tested, logs a WARN when ON, and is documented in NodeConfig.h, at the same level as `RUNE_SURVIVOR_LEADER_ELECTION`. Durability holds for single faults, rolling restarts and whole-cluster restarts: the controller moves leadership to itself only when it is in the committed ISR, the election runs over ISR ∩ live and is never unclean, an offline partition keeps its ISR lineage, and the map is persisted in `__cluster_metadata`. The map-wide fencing pass also covers the coordinator partitions. Residual: LOW-R3-2 (bootstrap seed). |
+| MEDIUM-C | **Fixed** | The guard is `!internalPartition_() \|\| internalQuorum_() \|\| isrChannel_`. The guard test is genuine. |
+| LOW-A | **Fixed** | The file fails closed, the directory fsync is checked, and the fsync placement is documented. Residual: LOW-R3-1. |
+| LOW-B | **Open** (follow-up, as ruled) | Nothing yet drives the real `Election` + `setConsensusTermSource` + InternalIsr frames over Aeron. Both new findings live exactly in that gap. |
+
+---
+
+## CRITICAL-R3 — A node that acked its own removal stands, votes for itself unconditionally, and wins with one stale voter: it leads `__cluster_metadata` without committed records (reproduced, acked loss)
+
+**Where**
+- `Election.cpp:337`: the CANVASS self-gate is removed. The NOMINATE stand-down is removed as well.
+- `Election.cpp:373`: `becomeCandidate` records the candidate's own vote as *For*, with no gate.
+- `DrHarness.h` `consensusElectable_` encodes the same rule (`votes = 1`).
+
+**Why the round-2 argument does not hold.** "Any grant majority intersects the commit majority" holds only if every vote in
+the grant majority is gated, the candidate's own vote included. A commit majority can contain the candidate
+itself: a replica persists and acks a state that removes it. That is exactly what MAJOR-A's node 2 did. The
+intersection is then only the candidate, and it now ignores its own knowledge.
+
+**Event sequence** (RF=3, `__cluster_metadata`, leader 1, ISR {1,2,3}). This is `ReReview3.SelfVoteOfExcludedNodeElectsReplicaMissingCommittedRecords`:
+1. Node 2 turns consensus-dead (GC pause or partition), so the leader fences it: proposal (1,2) = {1,3}.
+   - Node 2 receives the proposal, persists it and acks it. It commits on {1,2}.
+   - The frame to node 3 is lost (a 1→3 blip). Knowledge: `n1=(1,2)={1 3}  n2=(1,2)={1 3}  n3=(1,1)={1 2 3}`.
+2. Node 2 stops fetching. Node 3's link heals, but the next two anti-entropy re-sends are lost too (one blip of
+   about 100 ms). Five records commit and are acked over ISR {1,3}: LEO1=15, LEO3=15, LEO2=10.
+3. Node 1 crashes. Node 2 comes back.
+4. Node 2 stands. It votes for itself (unconditional), and node 3 grants, because its stale state still lists 2.
+   `consensusElect → 2`.
+5. Node 2 leads at LEO 10. Node 3 truncates by DivergingEpoch. **Five acked metadata records are lost on both
+   survivors** (`expectAckedPresent`: "lost 5 ACKED records (first id 11)").
+
+**Reach**
+- The anti-entropy only narrows the window to `kAlterIsrResendNs` (50 ms) × lost frames. A slow fsync on node 3
+  opens the same window with no loss at all: node 3 has not persisted yet when the commit lands on {1,2}.
+- The LOW-A fail-closed node is not actually "refusing to vote". It still votes for itself, so a node with a
+  corrupt file can elect itself the same way.
+
+**Fix.** Keep standing ungated, as MAJOR-A required, but gate the self-vote: a candidate counts its own vote only if
+`eligible(self)` holds under its own durable knowledge. Liveness for MAJOR-A then comes from knowledge
+convergence among the survivors, not from ignoring the candidate's knowledge:
+- Carry the newest `-3` state (epoch, version, members) on CanvassPosition, RequestVote and Vote.
+- Adopt a newer state into the knowledge store as knowledge.
+
+That adoption must bypass the MEDIUM-A term rule. That rule gates **acks** to a leader; it does not gate learning
+a peer's persisted state, because the dead leader's states are all older than the election term. Split `offer()`
+into "adopt" (newest wins) and "adopt and ack" (term-gated). In MAJOR-A, node 3 then learns (1,4) = {1,3} from
+node 2 during canvass, counts itself, and wins. Here, node 2 learns nothing that re-admits it, so it cannot count
+itself.
+
+Land the scratch test as `DrIntegrationRegression.SelfVoteOfExcludedCandidateGated_NoAckedLoss`. Change
+`consensusElectable_` to count the candidate only when `consensusVoteGate_(cand, cand)` holds, after the knowledge
+exchange is modelled. Also add an `ElectionBallotRegression` test for the self-vote.
+
+## MAJOR-R3 — The term rule reads `max(candidateTermId, leadershipTermId)`, and a denied RequestVote bumps `candidateTermId` on a live leader and its followers: the live leader can never again commit a metadata ISR change (reproduced: a dead member pins the HW)
+
+**Where**
+- `BrokerNode.cpp:870-876` (the term source).
+- `InternalIsrKnowledge.cpp:69` (refusal when `leaderEpoch < term`).
+- `Election.cpp:713-722`: `onRequestVote`'s deny branch, taken for a stale log or for `!mayVoteFor`, calls
+  `proposeMaxCandidateTermId(candidateTermId)`. Only `Init` is excluded, so this also runs in **Closed**, on the
+  steady-state leader and its followers.
+  - The bump is persisted in the node-state file, so restarting does not clear it.
+  - Nothing makes the Closed leader step down. Aeron's ConsensusModuleAgent enters an election on an unexpected
+    higher-term vote request; this port never does.
+  - The leader's internal replica keeps `epoch_ = leadershipTermId = T`.
+
+**Event sequence** (RF=3, leader 1 at term T). This is `ReReview3.DeniedVoteBumpFreezesInternalIsrOfLiveLeader`, with the denial bump modelled by `consensusVote`:
+1. Node 3 loses consensus heartbeats from node 1 (asymmetric partition, or load) and stands at T+1. Round 3 makes
+   this more likely: a node outside the metadata ISR now stands as well.
+2. Nodes 1 and 2 are in Closed. They deny the vote (3 is not in the ISR, or 3's log is older), and both persist
+   `candidateTermId = T+1`.
+3. From then on, every `-3` InternalIsr state at epoch T is refused:
+   - by node 2 (no ack);
+   - by node 1 itself (`publishInternalIsr_` → `offer` false, so the self bit is never set).
+4. Node 3 then dies. Fencing proposes {1,2}, and it can never commit. The HW counts committed ∪ proposed, so it
+   stays pinned at node 3's LEO.
+   - Dump: `n1 L ep=1 leo=15 hw=10 isr=1,2,3`, `n3 DOWN`.
+   - The metadata log is frozen with a live majority {1,2} and a live leader: no assignment commits, no AlterIsr,
+     no user-partition failover.
+5. This lasts until the leader changes, which nothing triggers. It violates the time-independent-liveness rule.
+   Even without step 4, re-admissions never commit (a returning node stays out of the metadata ISR) while
+   node 1 leads.
+
+**Fix.** The term that may refuse an ack must be one in which this node **granted a vote or followed a leader**: track
+`max(votedTermId, leadershipTermId)` separately. A denial, and an own candidacy the node abandons, must not raise
+it. An own candidacy cannot let a deposed leader commit anyway: a node that stood at T+1 ignores T's NLT,
+`Election.cpp:875-877`.
+- Alternatively, mirror Aeron: a higher-term RequestVote outside an election makes the leader enter an election,
+  so the terms resync. The minimal fix is the voted-term source.
+- Add an `ElectionBallotRegression` test showing that a Closed follower denying a higher-term candidate does not
+  raise the ack term.
+- Land the DR repro: deny-bump, then crash a member, then expect the shrink to commit and the HW to advance.
+
+**Possible link to the `LargeBatchReplicationRegression` flakes.** Round 3 changed no user-partition data path:
+- Every round-3 `PartitionReplica` change is guarded by `internalQuorum_()` or `internalPartition_()`.
+- The transport change applies only to `topicId < 0`.
+
+So the ISR lag-shrink and eviction code those tests exercise is unchanged. But they run real 3-BrokerNode
+clusters whose controller commits through `__cluster_metadata`. Under `-j6`, consensus heartbeats lapse, so a node
+stands and is denied, which reaches this MAJOR. A lagging metadata follower then pins the metadata HW, and the
+tests' committed-ISR or assignment waits time out. The 45 s deadlines, and
+`UnservableStoredBatchEvictsFollowersLegacyTransport` waiting for a committed ISR of 1, fit that pattern. This is
+plausible but not proven. Check the next failing run's stderr for e359e44's WARN, `refused internal ISR state ...
+older than this node's consensus term`. If it is there, this finding is the cause.
+
+## LOW-R3-1 — A fail-closed (or fresh) node relearns its knowledge only on the next ISR change; transient open() errors fail closed
+
+- `internalIsrAcks_` is cleared only on becomeLeader and on a new version (`PartitionReplica.cpp:337/2109`).
+  - A follower that restarts cleanly (fetch ≥ HW, so no MEDIUM-4 eviction) keeps its ack bit, so anti-entropy
+    never re-sends to it.
+  - If its file was corrupt, it stays non-votable until some unrelated `-3` ISR change.
+  - An absent file on a node that has acked before (deleted file, or one upgraded from before DUR-1) is "fresh":
+    the node votes for anyone and is never corrected.
+- `load_()` treats any `open()` failure other than ENOENT as corrupt (`InternalIsrKnowledge.cpp:141-144`),
+  including EMFILE, ENFILE and EIO at startup.
+- If every node fails closed (a format-version downgrade, or a permission change during a rollout), the cluster is
+  headless. The only escape is the unclean override.
+- Today the unconditional self-vote (CRITICAL-R3) masks this. Once the self-vote is gated, one non-votable node
+  plus a dead leader in RF=3 is headless, so this becomes MEDIUM.
+- **Fix:** clear the follower's ack bit on `incarnationChanged` (fetch handler, `PartitionReplica.cpp:673`), and
+  retry transient open errors instead of failing closed.
+
+## LOW-R3-2 — A coordinator partition's first assignment seeds the ISR with every replica, even over existing data
+
+`MetadataService.h:197-207` (`cur == nullptr`): leader = controller, ISR = all replicas. That is right for a fresh
+cluster, because every log is empty. On a cluster upgraded with existing `__consumer_offsets` or
+`__transaction_state` data, there is no assignment record yet. A controller that was lag-shrunk under the old
+internal-ISR model becomes leader at the consensus term, and the followers truncate to it, losing committed
+offsets or transaction state. This is upgrade-only. Fix: seed ISR = {self} plus the replicas whose reported
+position is ≥ the max reported, and lead only if self holds that max; otherwise let the max holder lead.
+
+## LOW-R3-3 — Per-cycle allocation in coordinator reconcile while the controller is not the coordinator leader
+
+`reconcileCoordinatorPartitions` runs on every control duty cycle. While a live non-controller leads (the
+controller catching up), `decideCoordinatorPartition` copies `live = eligible` (`MetadataService.h:209`) and builds
+`ElectionInputs` vectors on every cycle. This is cold relative to produce and fetch, but it breaks the
+allocation-free per-cycle liveness poll convention (`Election::eligibleNodeIds`). Return early before the copy when
+`cur->leaderNode` is live and in the ISR.
+
+## Hard-rule check
+
+| Rule | Result |
+|---|---|
+| Atomics and mutexes | OK. `check_no_atomics.py` is clean and the diff adds none. |
+| Virtual calls, std::function, allocation on hot paths | OK on produce and fetch. The term source is a plain function pointer with a captureless lambda (cold). Anti-entropy is internal-only and cold. Control-cycle allocation: LOW-R3-3. |
+| Tests never sleep | OK. No `sleep_for` or `usleep`. The new BrokerNode test paces itself on blocking control-thread round-trips. |
+| RED-first `*Regression*` | OK for every round-2 fix. CRITICAL-R3 and MAJOR-R3 need regression tests; both repros are ready in `repros/rev5-dur1-round3-Repro.cpp`. |
