@@ -3,6 +3,7 @@
 // only (no wall time; idle parks between passes are never counted).
 #include <rune/node/ShardAgent.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/ParkUntilWorkIdle.h>
 
 #include <Aeron.h>
 #include <gtest/gtest.h>
@@ -60,7 +61,7 @@ TEST(ShardAgentRegression, StartShardRunnersRefusesAgentCountMismatch) {
     WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
     std::vector<std::unique_ptr<ShardAgent>> none;
     rune::consensus::MonotonicNanoClock clk;
-    EXPECT_THROW(pool.startShardRunners(none, clk, /*busySpin=*/false, 200), std::logic_error);
+    EXPECT_THROW(pool.startShardRunners(none, clk, NodeConfig{}), std::logic_error);
 }
 
 TEST(ShardAgent, PassDrivesOwnDriverAndConductor) {
@@ -107,4 +108,78 @@ TEST(ShardAgentRegression, PassDrainsDriverWhileItHasWorkRegression) {
     const uint64_t busy0 = a.driverDutyCyclesForTest();
     a.doWork(now += 1'000);
     EXPECT_GT(a.driverDutyCyclesForTest() - busy0, 1u) << "with data queued the pass keeps driving the driver";
+}
+
+// ---------------------------------------------------------------------------
+// A7 park-until-work (findings §4.12): the shard runner's idle strategy.
+// ---------------------------------------------------------------------------
+TEST(ShardAgentWake, AgentExposesItsInvokerDriversWakeFds) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "driver wake fds are Linux-only";
+#else
+    Shard s;
+    rune::consensus::MonotonicNanoClock clk;
+    ShardAgent a(s.worker, *s.driver, *s.client, clk);
+    int fds[ParkUntilWorkIdle::kMaxWakeFds];
+    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2) << "its own driver's receiver + sender pollers";
+    // Fused placement with a SEPARATE runtime driver: the worker parks on both drivers' sockets.
+    Shard rt;
+    a.setFusedRuntime(nullptr, rt.driver.get(), rt.client.get());
+    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 4);
+    // A4: the runtime riding this shard's own driver adds nothing.
+    a.setFusedRuntime(nullptr, s.driver.get(), s.client.get());
+    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2);
+#endif
+}
+
+namespace {
+struct FakeFds {
+    int p[2]{-1, -1};
+    FakeFds() { EXPECT_EQ(::pipe(p), 0); }
+    ~FakeFds() { ::close(p[0]); ::close(p[1]); }
+};
+}
+
+TEST(ShardIdleRegression, DefaultWithWakeFdsParksUntilWorkAfterFirstEmptyPass) {
+    FakeFds f;
+    NodeConfig c;   // defaults: wake on, spins/yields auto, maxPark 200 us
+    auto idle = makeShardIdle(c, f.p, 1);
+    auto* p = dynamic_cast<ParkUntilWorkIdle*>(idle.get());
+    ASSERT_NE(p, nullptr) << "default shard idle = park-until-work";
+    EXPECT_EQ(p->wakeFdCount(), 1);
+    EXPECT_EQ(p->shape(), (IdleShape{0, 0, 1'000, 200'000}));
+}
+
+TEST(ShardIdle, WakeOffIsTheLegacyAeronBackoff) {
+    FakeFds f;
+    NodeConfig c;
+    c.idleWake = false;
+    auto idle = makeShardIdle(c, f.p, 1);
+    EXPECT_NE(dynamic_cast<rune::consensus::BackoffIdleStrategy*>(idle.get()), nullptr)
+        << "RUNE_IDLE_WAKE=0 is byte-identical to the pre-A7 shard idle (the A/B off arm)";
+}
+
+TEST(ShardIdle, NoWakeFdsFallsBackToLegacyBackoff) {
+    NodeConfig c;   // wake on, but the platform gave no fds (non-Linux)
+    auto idle = makeShardIdle(c, nullptr, 0);
+    EXPECT_NE(dynamic_cast<rune::consensus::BackoffIdleStrategy*>(idle.get()), nullptr);
+}
+
+TEST(ShardIdle, ExplicitShapeWithoutFdsIsATimedParkUntilWork) {
+    NodeConfig c;
+    c.idleWake = false;
+    c.idleSpins = 1; c.idleYields = 2; c.idleMaxParkUs = 50;
+    auto idle = makeShardIdle(c, nullptr, 0);
+    auto* p = dynamic_cast<ParkUntilWorkIdle*>(idle.get());
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(p->wakeFdCount(), 0);
+    EXPECT_EQ(p->shape(), (IdleShape{1, 2, 1'000, 50'000}));
+}
+
+TEST(ShardIdle, BusySpinOnlyOnExplicitOptIn) {
+    FakeFds f;
+    NodeConfig c;
+    c.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;
+    auto idle = makeShardIdle(c, f.p, 1);
+    EXPECT_NE(dynamic_cast<rune::consensus::BusySpinIdleStrategy*>(idle.get()), nullptr);
 }

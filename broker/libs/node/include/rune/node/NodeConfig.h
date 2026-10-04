@@ -40,6 +40,8 @@
 //
 // All Aeron channels use the aeron:udp transport (container transport).
 
+#include <rune/node/IdleShape.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -265,6 +267,32 @@ struct NodeConfig {
     // core (backoff still sleeps → consensus heartbeats are not starved, unlike
     // busyspin which triggers re-elections on shared cores).
     int64_t idleMaxParkUs = 200;
+
+    // A7 park-until-work (findings §4.12): shard workers park in ppoll() on their invoker driver's
+    // socket-readiness fds (DriverWakeFds.h; Linux), woken by the next datagram and bounded by the backoff
+    // park period (1 µs doubling to idleMaxParkUs — today's bound for ring/timer work).  RUNE_IDLE_WAKE=0 →
+    // the legacy Aeron backoff (10 spins, 20 yields, timed park).  Measured (A/B, findings §4.12): idle
+    // cluster 39% -> 23% CPU per worker; at 20k rec/s the workers are busy with real per-batch work (>95%
+    // of passes do work), so the idle shape only trims ~7 points there.
+    bool idleWake = true;
+    // Idle passes before parking (RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS, >= 0).  kIdleAuto = derived:
+    // 0 / 0 when the worker parks on readiness (the next datagram wakes it — polling buys nothing),
+    // else the Aeron 10 / 20.
+    static constexpr int32_t kIdleAuto = -1;
+    int32_t idleSpins  = kIdleAuto;
+    int32_t idleYields = kIdleAuto;
+
+    /// Shard workers park on driver readiness unless RUNE_IDLE_WAKE=0.
+    [[nodiscard]] bool shardIdleWantsWake() const noexcept { return idleWake; }
+    /// The shard-worker backoff shape, given whether the worker got readiness fds to park on.
+    [[nodiscard]] IdleShape shardIdleShape(bool wakeFdsAvailable) const noexcept {
+        IdleShape s;
+        s.maxSpins  = idleSpins  >= 0 ? idleSpins  : (wakeFdsAvailable ? 0 : 10);
+        s.maxYields = idleYields >= 0 ? idleYields : (wakeFdsAvailable ? 0 : 20);
+        s.minParkNs = 1'000;
+        s.maxParkNs = idleMaxParkUs * 1'000;
+        return s;
+    }
 
     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
     // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
@@ -541,6 +569,13 @@ struct NodeConfig {
     //     kernel/platform lacks them (stock Aeron).  RUNE_AERON_UDP_GSO=0|false forces stock Aeron (A/B,
     //     fault isolation).  Spec docs/superpowers/specs/2026-10-03-aeron-udp-gso-gro-design.md.
     bool aeronUdpGso = true;
+
+    //   - aeronEpollPoll: A7 (findings §4.12) — the media driver's transport pollers take ONE epoll_wait(0)
+    //     per duty cycle and recvmmsg only the ready sockets, for every poller with > 1 transport (Aeron
+    //     does that only beyond 5 transports and otherwise recvmmsg-s every socket each cycle, mostly
+    //     empty: the top CPU cost of an invoker shard pass).  Delivery unchanged; Linux only (elsewhere
+    //     stock).  RUNE_AERON_EPOLL_POLL=0|false = Aeron's stock poller (A/B, fault isolation).
+    bool aeronEpollPoll = true;
 
     //   - aeronSocketBufferBytes: OS UDP socket SO_SNDBUF / SO_RCVBUF (bytes) for
     //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.

@@ -1032,6 +1032,12 @@ ConfigResult parseNodeConfig(
         else if (v == "0" || v == "false") cfg.aeronUdpGso = false;
         else return {{}, std::string("RUNE_AERON_UDP_GSO must be 0/1/false/true, got '") + raw + "'"};
     }
+    if (const char* raw = getenv_fn("RUNE_AERON_EPOLL_POLL"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.aeronEpollPoll = true;
+        else if (v == "0" || v == "false") cfg.aeronEpollPoll = false;
+        else return {{}, std::string("RUNE_AERON_EPOLL_POLL must be 0/1/false/true, got '") + raw + "'"};
+    }
     if (const char* raw = getenv_fn("RUNE_AERON_TERM_SPARSE"); raw && *raw) {
         const std::string_view v(raw);
         if (v == "false" || v == "0") cfg.aeronTermBufferSparse = false;   // explicit (else derived)
@@ -1187,6 +1193,23 @@ ConfigResult parseNodeConfig(
             char* end = nullptr;
             long long us = std::strtoll(imp, &end, 10);
             if (end != imp && us > 0) cfg.idleMaxParkUs = us;
+        }
+    }
+
+    // --- A7: RUNE_IDLE_WAKE (default on) / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS (default auto) ---
+    // Shard-worker park-until-work (NodeConfig::idleWake).  "0"/"false"/"off"/"no" → the legacy Aeron
+    // backoff; anything else keeps it on.  Spins / yields: a non-negative integer, else auto (derived by
+    // NodeConfig::shardIdleShape).
+    if (const char* iw = getenv_fn("RUNE_IDLE_WAKE")) {
+        std::string s(iw);
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (s == "0" || s == "false" || s == "off" || s == "no") cfg.idleWake = false;
+    }
+    for (auto [name, field] : {std::pair{"RUNE_IDLE_SPINS", &cfg.idleSpins},
+                               std::pair{"RUNE_IDLE_YIELDS", &cfg.idleYields}}) {
+        if (const char* v = getenv_fn(name)) {
+            int32_t n{};
+            if (parseInt32(v, n) && n >= 0) *field = n;
         }
     }
 

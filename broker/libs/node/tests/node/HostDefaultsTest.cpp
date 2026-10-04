@@ -488,6 +488,29 @@ TEST(HostDefaults, PinnedShardWorkersBackOffByDefaultRegression) {
     EXPECT_NE(hs.summary.find("coreBase=1(busy-spin)"), std::string::npos) << hs.summary;
 }
 
+// A7: the effective-config line names the shard idle (park-until-work + its derived shape, or the
+// legacy backoff when RUNE_IDLE_WAKE=0, or busy-spin on the explicit opt-in) — proof of the measured path.
+TEST(HostDefaults, SummaryNamesShardIdleShape) {
+    NodeConfig c = threeNodeDefault(0);
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.summary.find("idle=wake{spins=auto yields=auto parkUs=1-200}"), std::string::npos) << hd.summary;
+
+    NodeConfig off = threeNodeDefault(0);
+    off.idleWake = false;
+    const auto ho = applyHostDerivedDefaults(off, k3sFacts());
+    EXPECT_NE(ho.summary.find("idle=backoff{spins=auto yields=auto parkUs=1-200}"), std::string::npos) << ho.summary;
+
+    NodeConfig ex = threeNodeDefault(0);
+    ex.idleSpins = 1; ex.idleYields = 2; ex.idleMaxParkUs = 100;
+    const auto he = applyHostDerivedDefaults(ex, k3sFacts());
+    EXPECT_NE(he.summary.find("idle=wake{spins=1 yields=2 parkUs=1-100}"), std::string::npos) << he.summary;
+
+    NodeConfig spin = threeNodeDefault(0);
+    spin.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;
+    const auto hs = applyHostDerivedDefaults(spin, k3sFacts());
+    EXPECT_NE(hs.summary.find("idle=busy-spin"), std::string::npos) << hs.summary;
+}
+
 // Low-volume control publications (per-session acks, gateway egress) get their own small term: at the
 // data term (16 MiB) an ack stream filled a term every ~10 s and the rotation's term cleaning stalled the
 // worker pass 100+ ms (p99 11-31 ms -> 311-352 us with 1 MiB, findings §4.2).

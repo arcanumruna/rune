@@ -58,6 +58,21 @@ target_link_libraries(rune_node PUBLIC spdlog::spdlog)
 # UDP GSO/GRO Aeron transport bindings (EmbeddedDriver, HostDefaults probe).
 target_link_libraries(rune_node PUBLIC rune_gso)
 
+# A7 park-until-work: an invoker driver's readiness fds (its transport pollers' epoll instances).  A C TU:
+# Aeron's internal driver headers are C; they include siblings relative to <root>, <root>/aeron,
+# <root>/aeronmd (same probe as rune_gso).  Non-Linux compiles a stub (0 fds -> timed park).
+add_library(rune_driver_wake STATIC src/DriverWakeFds.c)
+set_target_properties(rune_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rune_driver_wake PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(rune_driver_wake PRIVATE aeron::aeron)
+    foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+        target_include_directories(rune_driver_wake PRIVATE
+            "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+    endforeach()
+endif()
+target_link_libraries(rune_node PUBLIC rune_driver_wake)
+
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
 
@@ -103,6 +118,7 @@ if(BUILD_TESTING)
         tests/node/SignalControlTest.cpp
         tests/node/LeaderObserverTest.cpp
         tests/node/OwnerThreadTestTaskTest.cpp
+        tests/node/ParkUntilWorkIdleTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node

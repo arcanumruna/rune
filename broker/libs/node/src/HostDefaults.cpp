@@ -350,13 +350,24 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     std::string ioWq;
     for (const int32_t c : cfg.ioWorkerCpus) { if (!ioWq.empty()) ioWq += ','; ioWq += std::to_string(c); }
     if (ioWq.empty()) ioWq = "inherit";
-    char line[896];
+    // A7: the shard-worker idle (ParkUntilWorkIdle; the workers' start line logs the RESOLVED shape).
+    std::string idle = "legacy";
+    if (cfg.shardMode()) {
+        if (cfg.shardWorkersBusySpin()) {
+            idle = "busy-spin";
+        } else {
+            const auto n = [](int32_t v) { return v == NodeConfig::kIdleAuto ? std::string("auto") : std::to_string(v); };
+            idle = std::string(cfg.shardIdleWantsWake() ? "wake" : "backoff") + "{spins=" + n(cfg.idleSpins) +
+                   " yields=" + n(cfg.idleYields) + " parkUs=1-" + std::to_string(cfg.idleMaxParkUs) + "}";
+        }
+    }
+    char line[1024];
     std::snprintf(line, sizeof line,
-        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
+        "mode=%s placement=%s workers=%d coreBase=%d(%s) idle=%s io=%s ioWq=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
         "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
-        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(),
+        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", idle.c_str(), io.c_str(), ioWq.c_str(),
         cfg.aeronTermBufferBytes, cfg.aeronControlTermBufferBytes,
         static_cast<long long>(cfg.workerSyncIntervalMs), static_cast<long long>(cfg.followerFlushIntervalMs),
         cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,

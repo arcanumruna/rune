@@ -84,6 +84,16 @@ public:
         return work;
     }
 
+    /// A7 park-until-work: the socket-readiness fds this shard's runner parks on — its own invoker
+    /// driver's, plus the fused runtime's driver when that is a separate one (A4: riding this shard's
+    /// driver adds nothing).  Read before the runner starts (setFusedRuntime first).  Returns how many.
+    [[nodiscard]] int wakeFds(int* out, int max) const noexcept {
+        int n = driver_.wakeFds(out, max);
+        if (runtimeDriver_ != nullptr && runtimeDriver_ != &driver_ && n < max)
+            n += runtimeDriver_->wakeFds(out + n, max - n);
+        return n;
+    }
+
     [[nodiscard]] uint64_t slowPassesForTest() const noexcept { return slowPasses_; }
     /// A1: most driver duty cycles one pass runs while the driver keeps reporting work.
     static constexpr int kDriverDutyPerPass = 16;

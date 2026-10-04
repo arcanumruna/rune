@@ -37,6 +37,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ShardAgent.h>
+#include <rune/node/ParkUntilWorkIdle.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/metadata/ShardRouter.h>
@@ -61,6 +62,34 @@ makeBackoffIdle(int64_t maxParkUs) {
     return std::make_unique<rune::consensus::BackoffIdleStrategy>(
         10, 20, std::chrono::microseconds{1},
         std::chrono::microseconds{maxParkUs});
+}
+
+// A7 (findings §4.12): the shard runner's idle strategy.  Busy-spin ONLY on the explicit
+// RUNE_WORKER_IDLE=busyspin opt-in.  Otherwise park-until-work on the agent's driver-readiness fds
+// (`fds`, n > 0) with the derived shape (park after the first empty pass); with RUNE_IDLE_WAKE=0 or no
+// fds (non-Linux): the legacy Aeron backoff — byte-identical to pre-A7 — unless RUNE_IDLE_SPINS /
+// RUNE_IDLE_YIELDS set an explicit shape (then a timed ParkUntilWorkIdle of that shape).
+inline std::unique_ptr<rune::consensus::IdleStrategy>
+makeShardIdle(const NodeConfig& cfg, const int* fds, int n) {
+    if (cfg.shardWorkersBusySpin()) return std::make_unique<rune::consensus::BusySpinIdleStrategy>();
+    if (cfg.shardIdleWantsWake() && n > 0)
+        return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(/*wakeFdsAvailable=*/true), fds, n);
+    if (cfg.idleSpins == NodeConfig::kIdleAuto && cfg.idleYields == NodeConfig::kIdleAuto)
+        return makeBackoffIdle(cfg.idleMaxParkUs);
+    return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(/*wakeFdsAvailable=*/false), nullptr, 0);
+}
+
+/// One line per shard worker naming the RESOLVED idle (proof of the measured path in perf logs).
+inline std::string describeShardIdle(const rune::consensus::IdleStrategy& idle) {
+    if (const auto* p = dynamic_cast<const ParkUntilWorkIdle*>(&idle)) {
+        const IdleShape& s = p->shape();
+        return std::string(p->wakeFdCount() > 0 ? "park-until-work" : "timed-park") + "{wakeFds=" +
+               std::to_string(p->wakeFdCount()) + " spins=" + std::to_string(s.maxSpins) + " yields=" +
+               std::to_string(s.maxYields) + " parkNs=" + std::to_string(s.minParkNs) + "-" +
+               std::to_string(s.maxParkNs) + "}";
+    }
+    if (dynamic_cast<const rune::consensus::BusySpinIdleStrategy*>(&idle) != nullptr) return "busy-spin";
+    return "backoff{spins=10 yields=20 (legacy Aeron)}";
 }
 
 class WorkerPool {
@@ -535,16 +564,21 @@ public:
     // refusal) when there is not exactly one agent per worker.
     void startShardRunners(std::vector<std::unique_ptr<ShardAgent>>& agents,
                            rune::consensus::NanoClock& clock,
-                           bool busySpin, int64_t maxParkUs) {
+                           const NodeConfig& cfg) {
         if (!runners_.empty()) return;
         if (agents.size() != workers_.size())      // hard check in release too (startup refusal)
             throw std::logic_error("WorkerPool::startShardRunners: " + std::to_string(agents.size()) +
                                    " ShardAgent(s) for " + std::to_string(workers_.size()) + " worker(s)");
         idles_.reserve(agents.size());
         runners_.reserve(agents.size());
-        for (auto& a : agents) {
-            if (busySpin) idles_.emplace_back(std::make_unique<rune::consensus::BusySpinIdleStrategy>());
-            else          idles_.emplace_back(makeBackoffIdle(maxParkUs));
+        for (std::size_t i = 0; i < agents.size(); ++i) {
+            auto& a = agents[i];
+            // A7: park on this shard's driver readiness (read here, before its runner owns the pump).
+            int fds[ParkUntilWorkIdle::kMaxWakeFds];
+            const int nfds = a->wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds);
+            idles_.emplace_back(makeShardIdle(cfg, fds, nfds));
+            // WARN: visible in perf runs (RUNE_LOG_LEVEL=warn) — the RESOLVED idle of this worker.
+            spdlog::warn("WorkerPool: shard worker {} idle={}", i, describeShardIdle(*idles_.back()));
             runners_.emplace_back(std::make_unique<rune::consensus::AgentRunner>(*a, *idles_.back(), clock));
             runners_.back()->start();
         }

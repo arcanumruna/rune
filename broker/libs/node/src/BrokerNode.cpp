@@ -400,9 +400,8 @@ void BrokerNode::start() {
             }
             // Backoff idle by default (never busy-spin unless explicitly opted in:
             // RUNE_WORKER_IDLE=busyspin) — pinned or not.
-            workerPool_->startShardRunners(shardAgents_, clock_,
-                                           /*busySpin=*/config_.shardWorkersBusySpin(),
-                                           config_.idleMaxParkUs);
+            // A7: park-until-work on each shard's driver readiness (RUNE_IDLE_WAKE, default on).
+            workerPool_->startShardRunners(shardAgents_, clock_, config_);
         } else {
             workerPool_->startRunners(config_.workerIdleStrategy, clock_, config_.idleMaxParkUs);
         }

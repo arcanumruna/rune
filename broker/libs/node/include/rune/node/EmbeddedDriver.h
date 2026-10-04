@@ -57,6 +57,7 @@ struct EmbeddedDriverConfig {
     std::vector<std::string> endpointHosts;
     int32_t     maxMessagesPerSend = 0;      ///< 0 = Aeron default (2), or 16 when GSO can group at this MTU
     bool        udpGso             = true;   ///< install rune_gso bindings (Linux UDP GSO/GRO; else stock)
+    bool        epollPoll          = true;   ///< A7: epoll-first transport polling (Linux; else stock)
     int32_t     senderIoVector     = 0;      ///< 0 = Aeron default
     int32_t     receiverIoVector   = 0;      ///< 0 = Aeron default
     NodeConfig::AeronThreadingMode threadingMode = NodeConfig::AeronThreadingMode::Shared;
@@ -116,6 +117,13 @@ public:
     [[nodiscard]] bool udpGroActive() const noexcept { return (gsoActiveMask_ & 2) != 0; }
     /// GSO/GRO totals of every transport this driver closed; complete after close().
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
+    /// A7: the transport pollers poll epoll-first (DriverWakeFds.h rune_driver_epoll_poll_install).
+    [[nodiscard]] bool epollPollActive() const noexcept { return epollPollActive_; }
+    /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
+    /// pollers' epoll instances, DriverWakeFds.h) into `out` (at most `max`); returns how many.  0 for a
+    /// threaded driver (its own thread consumes the sockets), a closed driver, or a non-Linux platform.
+    /// Owned by the driver: valid until close().  Pump thread only (like doWork).
+    [[nodiscard]] int wakeFds(int* out, int max) const noexcept;
     /// network_publication_max_messages_per_send the driver was started with.
     [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
     /// Misuse tallies (diagnostics).  OBSERVER thread only (one at a time —
@@ -144,6 +152,8 @@ private:
     aeron_driver_t*         driver_ = nullptr;
     rune_gso_bindings_t*    gso_    = nullptr;   // owned; outlives ctx_ (Aeron points at it)
     rune_gso_totals_t       gsoTotals_{};
+    void*                   epollBindings_ = nullptr;   // owned copy of the stock bindings (no GSO); outlives ctx_
+    bool                    epollPollActive_ = false;
     int                     gsoActiveMask_ = 0;   // rune_gso_bindings_active(): 1 = GSO, 2 = GRO
     uint32_t                maxMessagesPerSend_ = 0;
     bool                    threadRunning_ = false;   // Threaded: CONTROLLER-owned
