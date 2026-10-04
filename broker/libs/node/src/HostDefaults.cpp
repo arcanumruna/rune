@@ -207,6 +207,16 @@ int32_t deriveWorkerCoreBase(HostPlatform platform, bool allLoopback, int32_t se
     return base;
 }
 
+std::vector<int32_t> complementCpus(const std::vector<int32_t>& allowed, const std::vector<int32_t>& excluded) {
+    std::vector<int32_t> out;
+    out.reserve(allowed.size());
+    for (const int32_t c : allowed)
+        if (std::find(excluded.begin(), excluded.end(), c) == excluded.end()) out.push_back(c);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // applyHostDerivedDefaults (PURE given facts + cores)
 // ---------------------------------------------------------------------------
@@ -346,17 +356,58 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         if (!cfg.ioWorkerCpus.empty()) mark("ioWq");
     }
 
+    // Non-worker thread affinity (D2): with pinned workers, every other broker thread (node driver, runtime,
+    // admin, cleaner, ...) goes to the allowed CPUs outside the worker cores — unbound, the scheduler ran them
+    // ON the workers' cores (~10x the workers' involuntary switches, every hop 3-8x slower).  Excluded: every
+    // co-located node's workers for the conventional layout (derived, or an explicit base equal to the derived
+    // one — the bench harness passes RUNE_WORKER_CORE_BASE=1+i*W), else only this node's own (other nodes'
+    // cores are unknown).  An explicit RUNE_NONWORKER_CORES keeps only CPUs this process may run on.
+    if (!cfg.nonWorkerCpus.empty() && !facts.allowedCpus.empty()) {
+        const auto outside = complementCpus(cfg.nonWorkerCpus, facts.allowedCpus);
+        if (!outside.empty()) {
+            cfg.nonWorkerCpus = complementCpus(cfg.nonWorkerCpus, outside);
+            appendWarn(out.warnings, std::string("RUNE_NONWORKER_CORES lists CPUs outside this process's allowed set — ") +
+                       (cfg.nonWorkerCpus.empty() ? "none usable, non-worker thread affinity left unchanged" : "ignoring those"));
+        }
+    } else if (cfg.nonWorkerCpus.empty() && cfg.shardMode() && cfg.workerCoreBase >= 0 && !facts.allowedCpus.empty()) {
+        int32_t selfIndex = 0;
+        for (const auto& p : cfg.peers) if (p.id < cfg.nodeId) ++selfIndex;
+        const auto nodes = static_cast<int32_t>(std::max<std::size_t>(cfg.peers.size(), 1));
+        const bool conventional = coreBaseDerived ||
+            (allLoopback && cfg.workerCoreBase ==
+                                deriveWorkerCoreBase(facts.platform, allLoopback, selfIndex, nodes, W, facts.allowedCpus));
+        std::vector<int32_t> workerCpus;
+        if (conventional) {
+            const int64_t hi = std::min<int64_t>(1 + static_cast<int64_t>(nodes) * W,
+                                                 static_cast<int64_t>(facts.allowedCpus.size()));
+            for (int64_t i = 1; i < hi; ++i) workerCpus.push_back(facts.allowedCpus[static_cast<std::size_t>(i)]);
+        } else {
+            for (int32_t w = 0; w < W; ++w) workerCpus.push_back(cfg.workerCoreBase + w);
+        }
+        cfg.nonWorkerCpus = complementCpus(facts.allowedCpus, workerCpus);
+        if (cfg.nonWorkerCpus.empty())
+            appendWarn(out.warnings, "no allowed CPU outside the worker cores for the non-worker threads (node driver, "
+                       "runtime, admin, cleaner) — their affinity is left unchanged and they may preempt the workers");
+        else
+            mark("nonWorker");
+    }
+
     const std::string io(ioBackend);
-    std::string ioWq;
-    for (const int32_t c : cfg.ioWorkerCpus) { if (!ioWq.empty()) ioWq += ','; ioWq += std::to_string(c); }
-    if (ioWq.empty()) ioWq = "inherit";
-    char line[896];
+    auto cpuList = [](const std::vector<int32_t>& v) {
+        std::string s;
+        for (const int32_t c : v) { if (!s.empty()) s += ','; s += std::to_string(c); }
+        return s.empty() ? std::string("inherit") : s;
+    };
+    const std::string ioWq = cpuList(cfg.ioWorkerCpus);
+    const std::string nonWorker = cpuList(cfg.nonWorkerCpus);
+    const std::string drvIdle(cfg.effectiveDriverIdleStrategy());
+    char line[1024];
     std::snprintf(line, sizeof line,
-        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
+        "mode=%s placement=%s workers=%d coreBase=%d(%s) io=%s ioWq=%s nonWorker=%s drvIdle=%s term=%d ctlTerm=%d fsyncMs{worker=%lld follower=%lld} sparse=%s mtu=%d socketBuffer=%d "
         "rcvWindow=%d gso=%s gro=%s rings{replOut=%d ingress=%d return=%d} ports{ingress=%d repl=%d egressCtl=%d} "
         "host{loopback=%s ifMtu=%d rmemMax=%lld wmemMax=%lld cpus=%d aeronTmpfs=%s} derived={%s}",
         cfg.shardMode() ? "shard" : "legacy", cfg.fused() ? "fused" : "thread", W, cfg.workerCoreBase,
-        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(),
+        cfg.shardMode() ? (cfg.shardWorkersBusySpin() ? "busy-spin" : "backoff") : "idle-cfg", io.c_str(), ioWq.c_str(), nonWorker.c_str(), drvIdle.c_str(),
         cfg.aeronTermBufferBytes, cfg.aeronControlTermBufferBytes,
         static_cast<long long>(cfg.workerSyncIntervalMs), static_cast<long long>(cfg.followerFlushIntervalMs),
         cfg.aeronTermBufferSparse.value_or(false) ? "true" : "false", cfg.aeronMtuBytes,

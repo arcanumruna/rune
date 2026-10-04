@@ -22,7 +22,7 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.senderIoVector     = c.aeronSenderIoVectorCapacity;
     e.receiverIoVector   = c.aeronReceiverIoVectorCapacity;
     e.threadingMode     = c.aeronThreadingMode;
-    e.idleStrategy      = c.driverIdleStrategy;
+    e.idleStrategy      = std::string(c.effectiveDriverIdleStrategy());
     e.endpointHosts     = nodeEndpointHosts(c);
     return e;
 }

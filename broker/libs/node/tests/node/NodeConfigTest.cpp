@@ -1,5 +1,6 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/node/HostDefaults.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>   // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <filesystem>
@@ -1714,11 +1715,11 @@ TEST(NodeConfig, ParsesAeronThreadingMode_GarbageFloorsToShared) {
 }
 
 TEST(NodeConfig, ParsesAeronDriverIdleDefault) {
-    // No RUNE_AERON_DRIVER_IDLE set → must default to "sleep-ns".
+    // No RUNE_AERON_DRIVER_IDLE set → empty (= derived: backoff in shard mode, sleep-ns in legacy;
+    // D2, NodeDriverIdleDefaultsToBackoffInShardModeRegression).
     auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
     ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->driverIdleStrategy, "sleep-ns")
-        << "default driverIdleStrategy must be 'sleep-ns' (byte-identical to prior hard-code)";
+    EXPECT_TRUE(res.config->driverIdleStrategy.empty()) << "unset = derived";
 }
 
 TEST(NodeConfig, ParsesAeronDriverIdleOverride) {
@@ -2435,5 +2436,38 @@ TEST(NodeConfig, IoWorkerCoresEnvParsesACpuList) {
     ASSERT_TRUE(r.config.has_value()) << r.error;
     EXPECT_EQ(r.config->ioWorkerCpus, (std::vector<int32_t>{0, 2}));
     env["RUNE_IOWQ_CORES"] = "zero";
+    EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
+}
+
+// D2: in shard mode the node driver carries only control-plane traffic (consensus, gateway/metadata,
+// coordinators); "sleep-ns" with Aeron's tiny default sleep effectively polls (~45% CPU per node on the
+// 4-core box).  Default = Aeron's backoff (spin, yield, park up to 1 ms) — never busy-spin.  Legacy mode
+// (data path on that driver) keeps sleep-ns; RUNE_AERON_DRIVER_IDLE still overrides both.
+TEST(NodeConfig, NodeDriverIdleDefaultsToBackoffInShardModeRegression) {
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(rune::node::base1node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    ASSERT_TRUE(res.config->shardMode());
+    EXPECT_EQ(res.config->effectiveDriverIdleStrategy(), "backoff");
+    EXPECT_EQ(rune::node::EmbeddedDriverConfig::fromNode(*res.config, "/tmp/x").idleStrategy, "backoff");
+    auto legacy = rune::node::base1node();
+    legacy["RUNE_WORKER_MODE"] = "legacy";
+    auto rl = rune::node::parseNodeConfig(rune::node::fakeEnv(legacy));
+    ASSERT_TRUE(rl.config.has_value()) << rl.error;
+    ASSERT_FALSE(rl.config->shardMode());
+    EXPECT_EQ(rl.config->effectiveDriverIdleStrategy(), "sleep-ns");
+    auto ov = rune::node::base1node();
+    ov["RUNE_AERON_DRIVER_IDLE"] = "sleep-ns";
+    auto ro = rune::node::parseNodeConfig(rune::node::fakeEnv(ov));
+    ASSERT_TRUE(ro.config.has_value()) << ro.error;
+    EXPECT_EQ(ro.config->effectiveDriverIdleStrategy(), "sleep-ns") << "the override wins in shard mode";
+}
+
+TEST(NodeConfig, NonWorkerCoresEnvParsesACpuListRegression) {
+    auto env = rune::node::base1node();
+    env["RUNE_NONWORKER_CORES"] = "0,4-5";
+    auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->nonWorkerCpus, (std::vector<int32_t>{0, 4, 5}));
+    env["RUNE_NONWORKER_CORES"] = "core0";
     EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
 }

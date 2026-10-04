@@ -986,6 +986,11 @@ ConfigResult parseNodeConfig(
         if (!cpus) return {{}, std::string("RUNE_IOWQ_CORES must be a cpu list like 0,4-5, got '") + raw + "'"};
         cfg.ioWorkerCpus = std::move(*cpus);
     }
+    if (const char* raw = getenv_fn("RUNE_NONWORKER_CORES"); raw && *raw) {
+        auto cpus = parseCpuList(raw);
+        if (!cpus) return {{}, std::string("RUNE_NONWORKER_CORES must be a cpu list like 0,4-5, got '") + raw + "'"};
+        cfg.nonWorkerCpus = std::move(*cpus);
+    }
     for (auto [name, field] : {std::pair{"RUNE_WORKER_SYNC_INTERVAL_MS", &cfg.workerSyncIntervalMs},
                                std::pair{"RUNE_FOLLOWER_FLUSH_INTERVAL_MS", &cfg.followerFlushIntervalMs}}) {
         if (const char* raw = getenv_fn(name); raw && *raw) {
@@ -1158,15 +1163,16 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (Shared).
 
-    // --- RUNE_AERON_DRIVER_IDLE (optional, default "sleep-ns") — E5.2 ---
+    // --- RUNE_AERON_DRIVER_IDLE (optional) — E5.2 ---
     // Passed to the Aeron idle-strategy setter(s) for the active threading mode.
-    // Default "sleep-ns" is byte-identical to today's hard-coded value.
+    // Unset = derived (D2): backoff in shard mode, sleep-ns in legacy —
+    // NodeConfig::effectiveDriverIdleStrategy().
     if (const char* adi = getenv_fn("RUNE_AERON_DRIVER_IDLE")) {
         if (adi && !std::string_view(adi).empty()) {
             cfg.driverIdleStrategy = std::string(adi);
         }
     }
-    // Absent → keep NodeConfig default ("sleep-ns").
+    // Absent → empty (derived).
 
     // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
     // Follower periodic-fetch backstop cadence.  Lower = faster acks=all

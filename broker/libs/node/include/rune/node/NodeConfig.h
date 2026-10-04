@@ -35,8 +35,8 @@
 // E5.2: Aeron media-driver threading mode (optional):
 //   RUNE_AERON_THREADING_MODE — "shared" (default) or "dedicated" (case-insensitive).
 //                               Any unrecognised value floors to "shared".
-//   RUNE_AERON_DRIVER_IDLE    — idle strategy string for the driver thread(s);
-//                               default "sleep-ns" (identical to today's hard-coded value).
+//   RUNE_AERON_DRIVER_IDLE    — idle strategy string for the node driver thread(s);
+//                               unset = "backoff" in shard mode, "sleep-ns" in legacy (D2).
 //
 // All Aeron channels use the aeron:udp transport (container transport).
 
@@ -433,6 +433,12 @@ struct NodeConfig {
     /// per task; the mask covers io-wq threads created afterwards).  Empty = derived (HostDefaults: only
     /// for the derived co-located layout — the allowed CPUs outside every node's workers).
     std::vector<int32_t> ioWorkerCpus;
+    /// RUNE_NONWORKER_CORES (cpu list): CPUs for every NON-worker thread the broker creates (threaded node
+    /// driver, Aeron client conductor, runtime, admin, cleaner, flushers, signal + main threads).  Unbound,
+    /// they run on (and preempt) the pinned workers' cores (D2).  Empty = derived (HostDefaults: with pinned
+    /// workers, the allowed CPUs outside the worker cores — every co-located node's for the conventional
+    /// layout, else this node's own); still empty = affinity unchanged.
+    std::vector<int32_t> nonWorkerCpus;
     int64_t followerFlushIntervalMs      = 0;
     //   - produce intake limit (F18): the largest produce batch the broker accepts
     //     is DERIVED, never refused at startup — produceIntakeLimit() below.  A
@@ -575,13 +581,22 @@ struct NodeConfig {
     AeronThreadingMode aeronThreadingMode = AeronThreadingMode::Shared;
 
     // E5.2: driver-idle strategy string applied to whichever idle setter(s)
-    // the active threading mode uses (RUNE_AERON_DRIVER_IDLE, default "sleep-ns").
+    // the active threading mode uses (RUNE_AERON_DRIVER_IDLE).
     //   Shared    mode: passed to aeron_driver_context_set_shared_idle_strategy.
     //   Dedicated mode: passed to conductor / sender / receiver idle setters.
     // Any unrecognised value is passed through to Aeron (it will use its own
-    // default on error — safe degradation).  Default "sleep-ns" is identical
-    // to today's hard-coded value so unset env → byte-identical behaviour.
-    std::string driverIdleStrategy = "sleep-ns";
+    // default on error — safe degradation).
+    // D2: empty (DEFAULT) = derived — effectiveDriverIdleStrategy().
+    std::string driverIdleStrategy;
+    /// The node driver's idle strategy: RUNE_AERON_DRIVER_IDLE if set; else "backoff" in shard mode (the
+    /// node driver carries only control-plane traffic there — Aeron's backoff spins, yields, then parks up
+    /// to 1 ms; "sleep-ns" with Aeron's tiny default sleep effectively polls, ~45% CPU per node) and
+    /// "sleep-ns" in legacy mode (the data path rides that driver).  The per-worker invoker drivers have
+    /// no idle loop (pumped by their worker).
+    [[nodiscard]] std::string_view effectiveDriverIdleStrategy() const noexcept {
+        if (!driverIdleStrategy.empty()) return driverIdleStrategy;
+        return shardMode() ? std::string_view("backoff") : std::string_view("sleep-ns");
+    }
 
     // E5.1.3: per-worker Aeron ingress flag.
     //

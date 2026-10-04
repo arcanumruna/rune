@@ -382,6 +382,10 @@ public:
     /// launch the AgentRunner thread.
     void start();
 
+    /// D2: the CPUs the broker's non-worker threads run on (resolved by start(); empty = unchanged).
+    /// main() pins its own thread + the signal thread to them after start().
+    [[nodiscard]] const std::vector<int32_t>& nonWorkerCpus() const noexcept { return config_.nonWorkerCpus; }
+
     /// Bounded wait for this node to reach LEADER_READY or CLOSED.
     /// Returns true if leadership reached within timeout, false otherwise.
     bool awaitLeader(std::chrono::milliseconds timeout);

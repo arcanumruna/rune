@@ -1,5 +1,6 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/HostDefaults.h>
+#include <rune/node/ThreadAffinity.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/RoleCounter.h>
@@ -262,6 +263,15 @@ void BrokerNode::start() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
+
+    // D2: every thread start() creates inherits THIS thread's mask — pin it to the non-worker CPUs for the
+    // rest of start() (node driver thread, Aeron conductor, runtime / admin / cleaner runners, flushers);
+    // workers re-pin to their own core on their first pass.  The caller's mask is restored on return.
+    // Empty set (unpinned workers, or no CPU outside them — warned in the effective-config line) = unchanged.
+    ScopedThreadAffinity nonWorkerAffinity(config_.nonWorkerCpus);
+    if (nonWorkerAffinity.result() > 0 && nonWorkerAffinity.result() != ENOTSUP)
+        spdlog::warn("BrokerNode[{}]: pinning the non-worker threads refused (errno={}) — they keep the "
+                     "inherited affinity and may preempt the workers", config_.nodeId, nonWorkerAffinity.result());
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -2999,6 +3009,9 @@ void BrokerNode::buildShardRuntimes_() {
         }
         const std::string dir = (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
         auto dcfg = EmbeddedDriverConfig::fromNode(config_, dir);
+        // D2: the backoff default is for the NODE driver's idle loop; a worker's invoker driver is pumped by
+        // its worker (no idle loop) — keep its configured string exactly as before.
+        dcfg.idleStrategy = config_.driverIdleStrategy.empty() ? std::string("sleep-ns") : config_.driverIdleStrategy;
         dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
         shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
         aeron::Context ctx;

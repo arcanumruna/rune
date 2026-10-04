@@ -7,6 +7,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/SignalControl.h>
+#include <rune/node/ThreadAffinity.h>
 
 #include <rune_fr/FlightRecorder.h>
 
@@ -165,6 +166,12 @@ int main() {
         // through the halt path's code (74, EX_IOERR).
         drainControlEvents(events, ctl);
         return ctl.exitCode != 0 ? ctl.exitCode : 1;
+    }
+
+    // D2: the main + signal threads predate start()'s non-worker pin — move them off the worker cores too.
+    if (const auto& cpus = node.nonWorkerCpus(); !cpus.empty()) {
+        (void)rune::node::pinCurrentThreadToCpus(cpus);
+        (void)rune::node::pinThreadToCpus(signalThread.nativeHandle(), cpus);
     }
 
     // For a 1-node cluster, await self-election.
