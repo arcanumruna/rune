@@ -83,6 +83,7 @@ std::size_t drainReturns(Worker& w, int* ownershipAcks = nullptr) {
 TEST(WorkerDoorbell, OpAndSessionRingsRingTheParkedWorker) {
     Worker w(0, 1 << 16, 1 << 16, 16, 16);
     w.setShardMode(true);
+    w.enableDoorbell(/*retSpaceWait=*/true);
     auto& bell = w.doorbell();
     ASSERT_TRUE(bell.valid());
     EXPECT_GE(bell.watchCount(), 2) << "op ring + session ring (+ the portable backend's completion ring)";
@@ -114,6 +115,7 @@ TEST(WorkerDoorbellRegression, HeldBackOpRingDoesNotKeepTheWorkerAwakeRegression
     Worker w(0, 1 << 23, 1 << 16, 64, 64);
     w.setShardMode(true);
     w.setOwnedDirect(Worker::OwnedSet{&rep});
+    w.enableDoorbell(/*retSpaceWait=*/true);
     auto& bell = w.doorbell();
     int64_t now = 1;
     constexpr int kN = 2000;
@@ -141,6 +143,57 @@ TEST(WorkerDoorbellRegression, HeldBackOpRingDoesNotKeepTheWorkerAwakeRegression
     (void)w.doWork(++now);
     EXPECT_TRUE(w.ingressWatchableForTest());
     EXPECT_EQ(log.logEndOffset(), kN + 1);
+}
+
+// Review M-1: a worker whose runner does not park on its doorbell (RUNE_IDLE_DOORBELL=0, no wake fds,
+// busy-spin) has no doorbell wired: commits pay no doorbell fence, a held-back worker arms no space wait and
+// the runtime's drain writes no fd — exactly A7.
+TEST(WorkerDoorbellRegression, DoorbellOffWiresNothingAndWritesNoFdRegression) {
+    TmpDir d;
+    Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport t;
+    PartitionReplica rep(cfg1(), Role::Leader, 1, {1}, {1}, &log, &t);
+    Worker w(0, 1 << 23, 1 << 16, 64, 64);   // never enableDoorbell()
+    w.setShardMode(true);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    EXPECT_FALSE(w.doorbellEnabled());
+    EXPECT_FALSE(w.opRingConsumerDoorbellForTest());
+    EXPECT_EQ(w.doorbell().watchCount(), 0);
+    int64_t now = 1;
+    for (int i = 0; i < 2000; ++i) ASSERT_TRUE(w.tryEnqueueOp(produceOp(&rep, i + 1)));
+    for (int p = 0; p < 8 && w.retFifoSizeForTest() < Worker::kOverflowHighWater; ++p) (void)w.doWork(++now);
+    ASSERT_GE(w.retFifoSizeForTest(), Worker::kOverflowHighWater);
+    for (int p = 0; p < 4; ++p) (void)w.doWork(++now);
+    EXPECT_FALSE(w.retSpaceWaitArmedForTest()) << "no doorbell: no space wait";
+    EXPECT_GT(drainReturns(w), 0u);
+    EXPECT_FALSE(w.doorbell().firedForTest()) << "no doorbell: the drain wrote no fd";
+}
+
+TEST(WorkerDoorbellRegression, EnableShardDoorbellsFollowsTheKillSwitchRegression) {
+    for (const bool on : {false, true}) {
+        SCOPED_TRACE(on ? "RUNE_IDLE_DOORBELL=1" : "RUNE_IDLE_DOORBELL=0");
+        TmpDir dir;
+        EmbeddedDriverConfig c; c.dir = (dir.path / "aeron").string(); c.termBufferBytes = 64 * 1024;
+        EmbeddedDriver drv(c, DriverMode::Invoker);
+        aeron::Context ctx; ctx.aeronDir(c.dir); ctx.useConductorAgentInvoker(true);
+        auto client = aeron::Aeron::connect(ctx);
+        rune::metadata::ShardRouter router(2);
+        WorkerPool pool(2, router, 1 << 16, 1 << 16, 16, 16);
+        rune::consensus::MonotonicNanoClock clk;
+        std::vector<std::unique_ptr<ShardAgent>> agents;
+        for (int i = 0; i < 2; ++i) agents.push_back(std::make_unique<ShardAgent>(pool.worker(i), drv, *client, clk));
+        NodeConfig cfg;
+        cfg.idleDoorbell = on;
+        int fds[ParkUntilWorkIdle::kMaxWakeFds];
+        const bool haveFds = agents[0]->wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds) > 0;   // Linux epoll-first
+        const int n = pool.enableShardDoorbells(agents, cfg, /*fused=*/true);
+        EXPECT_EQ(n, on && haveFds ? 2 : 0);
+        for (int i = 0; i < 2; ++i) {
+            EXPECT_EQ(pool.worker(i).doorbellEnabled(), on && haveFds);
+            EXPECT_EQ(pool.worker(i).opRingConsumerDoorbellForTest(), on && haveFds);
+        }
+        client.reset();
+    }
 }
 
 namespace {
@@ -184,7 +237,8 @@ int64_t parkedShardRunnerOpLatencyNs(bool doorbell) {
     cfg.idleDoorbell = doorbell;
     cfg.idleDoorbellMinParkUs = cfg.idleDoorbellParkUs = 2'000'000;   // 2 s: the park cap must not be what wakes it
     cfg.idleSpins = 0; cfg.idleYields = 0; cfg.idleMaxParkUs = 2'000'000;
-    auto idle = makeShardIdle(cfg, fds, n, &agent.doorbell());
+    if (doorbell) agent.enableDoorbell(true);
+    auto idle = makeShardIdle(cfg, fds, n, agent.doorbellEnabled() ? &agent.doorbell() : nullptr);
     auto* p = dynamic_cast<ParkUntilWorkIdle*>(idle.get());
     EXPECT_NE(p, nullptr);
     rune::consensus::AgentRunner runner(agent, *idle, clk);

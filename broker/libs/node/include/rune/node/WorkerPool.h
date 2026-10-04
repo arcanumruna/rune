@@ -73,11 +73,16 @@ makeBackoffIdle(int64_t maxParkUs) {
 // A9: `bell` (may be null) — the doorbell of the rings this runner's thread consumes.  With wake fds and
 // RUNE_IDLE_DOORBELL on (default) the runner parks on it too, with the doorbell shape
 // (NodeConfig::shardIdleShape(true): the Aeron spin / yield phase, then 1 ms parks).
+/// A9 review M-1: the runner parks on a ring doorbell — the only case in which any ring gets one.
+[[nodiscard]] inline bool shardRunnerUsesDoorbell(const NodeConfig& cfg, int nWakeFds) noexcept {
+    return !cfg.shardWorkersBusySpin() && cfg.shardIdleWantsWake() && cfg.idleDoorbell && nWakeFds > 0;
+}
+
 inline std::unique_ptr<rune::consensus::IdleStrategy>
 makeShardIdle(const NodeConfig& cfg, const int* fds, int n, detail::RingDoorbell* bell = nullptr) {
     if (cfg.shardWorkersBusySpin()) return std::make_unique<rune::consensus::BusySpinIdleStrategy>();
     if (cfg.shardIdleWantsWake() && n > 0) {
-        if (cfg.idleDoorbell && bell != nullptr && bell->valid())
+        if (shardRunnerUsesDoorbell(cfg, n) && bell != nullptr && bell->valid())
             return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(/*doorbell=*/true), fds, n, bell);
         return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(), fds, n);
     }
@@ -585,13 +590,28 @@ public:
             // A7: park on this shard's driver readiness (read here, before its runner owns the pump).
             int fds[ParkUntilWorkIdle::kMaxWakeFds];
             const int nfds = a->wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds - 1);   // one slot for the doorbell
-            idles_.emplace_back(makeShardIdle(cfg, fds, nfds, &a->doorbell()));
+            idles_.emplace_back(makeShardIdle(cfg, fds, nfds, a->doorbellEnabled() ? &a->doorbell() : nullptr));
             // WARN: visible in perf runs (RUNE_LOG_LEVEL=warn) — the RESOLVED idle of this worker.
             spdlog::warn("WorkerPool: shard worker {} idle={}", i, describeShardIdle(*idles_.back()));
             runners_.emplace_back(std::make_unique<rune::consensus::AgentRunner>(*a, *idles_.back(), clock));
             runners_.back()->start();
         }
         if (!runnersStarted_) runnersStarted_ = true;   // see startRunners (P2)
+    }
+
+    // A9 (review M-1): wire each shard worker's ring doorbell iff its runner will park on it (wake fds +
+    // RUNE_IDLE_DOORBELL, never busy-spin).  STARTUP ONLY: before the control thread (thread placement), the
+    // runners, the admin / cleaner threads and the fused-runtime attach (BrokerNode::start).  `fused`: worker
+    // 0's ret_ is consumed on its own thread — no space doorbell there (review L-1).  Returns how many.
+    int enableShardDoorbells(std::vector<std::unique_ptr<ShardAgent>>& agents, const NodeConfig& cfg, bool fused) {
+        int enabled = 0;
+        for (std::size_t i = 0; i < agents.size(); ++i) {
+            int fds[ParkUntilWorkIdle::kMaxWakeFds];
+            if (!shardRunnerUsesDoorbell(cfg, agents[i]->wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds - 1))) continue;
+            agents[i]->enableDoorbell(/*retSpaceWait=*/!(fused && i == 0));
+            enabled += agents[i]->doorbellEnabled() ? 1 : 0;
+        }
+        return enabled;
     }
 
     // -----------------------------------------------------------------------

@@ -142,10 +142,15 @@ public:
     }
     /// Unconditional wake (space wait: the consumer of a ring saw its producer's want-space word).
     void ring() noexcept {
-        const std::uint64_t one = 1;
+#if defined(__linux__)
+        const std::uint64_t one = 1;   // eventfd: an 8-byte counter add
+#else
+        const std::uint8_t one = 1;    // pipe: one byte (review M-1: never a partial / oversized write)
+#endif
         ssize_t r;
         do { r = ::write(writeFd_, &one, sizeof(one)); } while (r < 0 && errno == EINTR);
-        // EAGAIN: the eventfd counter / pipe is already full — the consumer is woken either way.
+        // EAGAIN: the eventfd counter / pipe is already full, i.e. already readable — the consumer is woken
+        // either way, and it drains everything when it wakes (drain_ reads until EAGAIN).
     }
 
     // -- diagnostics / tests ---------------------------------------------------------------------------------

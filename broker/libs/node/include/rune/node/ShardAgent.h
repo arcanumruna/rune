@@ -110,6 +110,9 @@ public:
     /// A9: the doorbell of the rings this shard's thread consumes — its worker's (op + session rings,
     /// portable completions; in fused placement BrokerNode attaches the runtime's cross-thread rings too).
     [[nodiscard]] detail::RingDoorbell& doorbell() noexcept { return worker_.doorbell(); }
+    /// A9 review M-1: wire the doorbell (startup only; see Worker::enableDoorbell) / whether it is wired.
+    void enableDoorbell(bool retSpaceWait) noexcept { worker_.enableDoorbell(retSpaceWait); }
+    [[nodiscard]] bool doorbellEnabled() const noexcept { return worker_.doorbellEnabled(); }
 
     [[nodiscard]] uint64_t slowPassesForTest() const noexcept { return slowPasses_; }
     /// A1: most driver duty cycles one pass runs while the driver keeps reporting work.

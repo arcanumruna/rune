@@ -233,6 +233,9 @@ TEST(ShardAgent, AgentExposesItsWorkersDoorbell) {
     ShardAgent a(s.worker, *s.driver, *s.client, clk);
     EXPECT_EQ(&a.doorbell(), &s.worker.doorbell());
     EXPECT_TRUE(a.doorbell().valid());
+    EXPECT_EQ(a.doorbell().watchCount(), 0) << "review M-1: nothing wired until enabled";
+    a.enableDoorbell(true);
+    EXPECT_TRUE(a.doorbellEnabled());
     EXPECT_GE(a.doorbell().watchCount(), 2) << "the worker's op + session rings";
 }
 

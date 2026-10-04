@@ -1248,6 +1248,21 @@ TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwa
     }
     for (auto& n : nodes) n->start();
     ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+    // A9 review M-2 / L-1 (wiring, fused, 2 workers): where worker 0 parks on its doorbell (Linux wake fds),
+    // the runtime on worker 0 is woken by worker 1 freeing op / session ring space and by worker 1's returns;
+    // worker 0's own ret_ (same thread) gets no space doorbell.  Elsewhere nothing is wired (review M-1).
+    for (auto& n : nodes) {
+        const bool on = n->workerForTest(0)->doorbellEnabled();
+        EXPECT_EQ(n->workerForTest(1)->doorbellEnabled(), on);
+        EXPECT_EQ(n->workerForTest(1)->opRingProducerDoorbellForTest(), on);
+        EXPECT_EQ(n->workerForTest(1)->sessionRingProducerDoorbellForTest(), on);
+        EXPECT_EQ(n->workerForTest(1)->retConsumerDoorbellForTest(), on);
+        EXPECT_EQ(n->workerForTest(1)->retProducerDoorbellForTest(), on);
+        EXPECT_FALSE(n->workerForTest(0)->retProducerDoorbellForTest());
+#if defined(__linux__)
+        EXPECT_TRUE(on) << "Linux default: epoll-first wake fds + RUNE_IDLE_DOORBELL on";
+#endif
+    }
     {
         ShardTestClient c(cdir.path);
         const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);

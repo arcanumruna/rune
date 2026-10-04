@@ -124,6 +124,7 @@ public:
         if (bell.valid()) ring_.setProducerDoorbell(&bell);
     }
     [[nodiscard]] bool hasConsumerDoorbell() const noexcept { return ring_.hasConsumerDoorbell(); }
+    [[nodiscard]] bool hasProducerDoorbell() const noexcept { return ring_.hasProducerDoorbell(); }
 
     /// Producer refused for space: announce it, then RE-CHECK the space condition (see O2ORingBuffer).
     void armSpaceWait() noexcept { ring_.armSpaceWait(); }

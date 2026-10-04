@@ -530,14 +530,23 @@ public:
         egressScratch_.resize(kEgressScratchSize);
         maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
-        // A9 (findings §4.15): this worker's doorbell — the cross-thread rings it consumes ring it while its
-        // runner parks (the op ring gated off while the worker itself holds it back), and the runtime rings
-        // it when it frees ret_ space this worker waits for.  Set here, before any other thread exists.
+    }
+
+    /// A9 (findings §4.15): wire this worker's doorbell — ONLY when its runner will park on it (review M-1:
+    /// otherwise no ring pays the doorbell's fences and nothing is written to an fd nobody polls).  The
+    /// cross-thread rings it consumes ring it while its runner parks (the op ring gated off while the worker
+    /// itself holds it back); the consumer of ret_ rings it when it frees space this worker waits for
+    /// (`retSpaceWait` false when ret_'s consumer is this same thread: fused worker 0, review L-1).
+    /// Startup only: before the runner and every producer thread start, and before the first io submission.
+    void enableDoorbell(bool retSpaceWait) noexcept {
+        if (doorbellEnabled_ || !doorbell_.valid()) return;
         (void)ingress_.attachConsumerDoorbell(doorbell_, &ingressWatchable_);
         (void)sessionRing_.attachConsumerDoorbell(doorbell_);
-        ret_.attachProducerDoorbell(doorbell_);
+        if (retSpaceWait) ret_.attachProducerDoorbell(doorbell_);
         io_.attachCompletionDoorbell(doorbell_);   // portable backend: the flusher's completion ring
+        doorbellEnabled_ = true;
     }
+    [[nodiscard]] bool doorbellEnabled() const noexcept { return doorbellEnabled_; }
 
     // Thread name for `ps -M`/`top -H`/profilers: "rune-wrk-<id>" (see
     // AgentRunner::setCurrentThreadName). Cached so name() can hand back a
@@ -1082,8 +1091,18 @@ public:
     /// portable backend's completions; in fused placement the runtime's rings attach to worker 0's too).
     /// Attach only at startup, before the producer threads run.  Valid for the worker's lifetime.
     [[nodiscard]] detail::RingDoorbell& doorbell() noexcept { return doorbell_; }
-    /// A9: the worker's return ring, for attaching its consumer's doorbell at startup (fused placement).
+    /// A9: the worker's rings, for attaching the fused runtime's doorbell at startup (fused placement): ret_
+    /// (runtime = consumer), the op + session rings (runtime = producer: space wait, review M-2).
     [[nodiscard]] OneToOneByteRing& returnRingForDoorbell() noexcept { return ret_; }
+    [[nodiscard]] OneToOneByteRing& opRingForDoorbell() noexcept { return ingress_; }
+    [[nodiscard]] OneToOneByteRing& sessionRingForDoorbell() noexcept { return sessionRing_; }
+    /// A9 (tests): ret_ / op ring state.
+    [[nodiscard]] bool retConsumerDoorbellForTest() const noexcept { return ret_.hasConsumerDoorbell(); }
+    [[nodiscard]] bool opRingConsumerDoorbellForTest() const noexcept { return ingress_.hasConsumerDoorbell(); }
+    [[nodiscard]] bool retSpaceWaitArmedForTest() const noexcept { return ret_.spaceWaitArmedForTest(); }
+    [[nodiscard]] bool opRingProducerDoorbellForTest() const noexcept { return ingress_.hasProducerDoorbell(); }
+    [[nodiscard]] bool sessionRingProducerDoorbellForTest() const noexcept { return sessionRing_.hasProducerDoorbell(); }
+    [[nodiscard]] bool retProducerDoorbellForTest() const noexcept { return ret_.hasProducerDoorbell(); }
     /// A9 (tests): the op ring's doorbell watch is on (false while the worker holds its op ring back).
     [[nodiscard]] bool ingressWatchableForTest() const noexcept { return ingressWatchable_; }
 
@@ -1431,6 +1450,7 @@ private:
     // arming; space that appeared meanwhile = run again now (returns 1).  Worker thread only.
     // -----------------------------------------------------------------------
     int prepareIdle_() {
+        if (!doorbellEnabled_) [[unlikely]] return 0;   // review M-1: no doorbell, no wait to arm
         ingressWatchable_ = retFifo_.size() < kOverflowHighWater && (!ackSink_ || ackRoom_() > 0);
         auto retBlocked = [this] {
             return !retFifo_.empty() || ret_.freeSlotsForMsgSize(ackSlotBytes_) <= reservedAckSlots_();
@@ -3316,6 +3336,7 @@ private:
     // runner from ever parking.  Worker-thread state (read by its own idle).
     bool ingressWatchable_ = true;
     bool spaceWaitArmed_   = false;   // A9: ret_ space wait armed by prepareIdle_ (worker thread)
+    bool doorbellEnabled_  = false;   // A9: enableDoorbell() ran (startup; then read-only)
 
     // R2: ingress ring — OneToOneByteRing (SPSC, flat byte messages).
     // Producer (control thread): tryEnqueueOp tryClaim()s + encodes the WorkerOp

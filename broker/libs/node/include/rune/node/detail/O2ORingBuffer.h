@@ -26,8 +26,9 @@
 //
 // A9 doorbells (RingDoorbell.h): optional, set at startup before either thread runs.
 //   consumer doorbell — commit() rings the consumer's doorbell iff it is parking (fence + load otherwise);
-//   producer doorbell — a producer refused for space arms the want-space word (armSpaceWait); the consumer
-//                       rings the producer's doorbell after it frees space iff the word was set.
+//   producer doorbell — a producer refused for space arms the want-space word (tryClaim does it itself, and
+//                       re-claims once; armSpaceWait for other space gates); the consumer rings the producer's
+//                       doorbell after it frees space iff the word was set.
 
 #include <climits>
 #include <cstdint>
@@ -93,8 +94,18 @@ public:
 
         const aeron::util::index_t recordLength =
             static_cast<aeron::util::index_t>(length) + RD::RecordDescriptor::HEADER_LENGTH;
-        const aeron::util::index_t recordIndex = claimCapacity(recordLength);
-        if (INSUFFICIENT_CAPACITY == recordIndex) return recordIndex;
+        aeron::util::index_t recordIndex = claimCapacity(recordLength);
+        if (INSUFFICIENT_CAPACITY == recordIndex) [[unlikely]] {
+            // A9 review M-2: a refused producer with a doorbell arms the space wait, then re-checks by
+            // claiming again (Dekker: the consumer advances its head, fences, then reads the word).  A refusal
+            // returned from here therefore always leaves the word set: the consumer's next read rings the
+            // producer's doorbell — every producer retry loop ("retry next cycle") wakes on freed space.
+            if (m_producerBell == nullptr) return recordIndex;
+            armSpaceWait();
+            recordIndex = claimCapacity(recordLength);
+            if (INSUFFICIENT_CAPACITY == recordIndex) return recordIndex;
+            disarmSpaceWait();
+        }
 
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
         std::atomic_thread_fence(std::memory_order_release);
@@ -129,6 +140,7 @@ public:
     void setConsumerDoorbell(RingDoorbell* bell) noexcept { m_consumerBell = bell; }
     void setProducerDoorbell(RingDoorbell* bell) noexcept { m_producerBell = bell; }
     [[nodiscard]] bool hasConsumerDoorbell() const noexcept { return m_consumerBell != nullptr; }
+    [[nodiscard]] bool hasProducerDoorbell() const noexcept { return m_producerBell != nullptr; }
 
     /// What the consumer's doorbell watches (committed record at the head).
     [[nodiscard]] RingWatch watch() noexcept {
@@ -445,8 +457,8 @@ private:
     aeron::concurrent::AtomicBuffer m_buffer;
     RingDoorbell* m_consumerBell = nullptr;   ///< A9: rung by commit() (startup-set)
     RingDoorbell* m_producerBell = nullptr;   ///< A9: rung by the consumer on freed space (startup-set)
-    alignas(64) std::atomic<std::uint32_t> m_spaceWanted{0};   ///< A9: producer waits for space
-    aeron::util::index_t m_capacity               = 0;
+    alignas(64) std::atomic<std::uint32_t> m_spaceWanted{0};   ///< A9: producer waits for space (own line)
+    alignas(64) aeron::util::index_t m_capacity   = 0;           // review L-2: not on the space-wait line
     aeron::util::index_t m_maxMsgLength           = 0;
     aeron::util::index_t m_headPositionIndex      = 0;
     aeron::util::index_t m_headCachePositionIndex = 0;

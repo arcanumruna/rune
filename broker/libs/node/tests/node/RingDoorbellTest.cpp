@@ -5,6 +5,10 @@
 // markParking / anyWatchReady); in every order the consumer either sees the record (does not park) or finds
 // its doorbell rung.  The same for the producer-side space wait.  Stress tests race real threads and never
 // sleep: a consumer that parks on the doorbell with a long poll timeout would time out on a lost wakeup.
+//
+// Review L-5: the sequential interleaving tests cannot see a weakened fence.  The ping-pong stress catches a
+// fence weakened to release/acquire on x86-64 (TSO: store->load reordering) — that is the platform that must run
+// it (the Linux VM suite); on arm64 macOS clang lowers a release fence to dmb ish and only a REMOVED fence fails.
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/ParkUntilWorkIdle.h>
 #include <rune/node/detail/RingDoorbell.h>
@@ -190,6 +194,8 @@ TEST(RingDoorbellRegression, SpaceWaitNeverLosesTheFreedSpaceRegression) {
         std::vector<uint8_t> rec(100);
         while (ring.write(rec.data(), rec.size(), 1)) {}
         ASSERT_FALSE(ring.hasSpaceForMsg(static_cast<int64_t>(rec.size())));
+        ASSERT_TRUE(ring.spaceWaitArmedForTest()) << "a refused claim with a producer doorbell arms the wait (M-2)";
+        ring.disarmSpaceWait();   // this producer stops waiting: start each order from a clean word
         if (consumerFirst) {
             EXPECT_GT(drainCount(ring), 0);
             EXPECT_FALSE(producerBell.firedForTest()) << "nobody waited: no ring";
@@ -377,4 +383,28 @@ int64_t parkedRunnerTakesRingMessageNs(bool withDoorbell) {
 TEST(RingDoorbellRegression, ParkedRunnerTakesRingMessageAtOnceRegression) {
     const int64_t ns = parkedRunnerTakesRingMessageNs(/*withDoorbell=*/true);
     EXPECT_LT(ns, 500'000'000) << "the parked runner slept out its 2 s park: the doorbell did not end it";
+}
+
+// Review M-2: a producer whose claim is refused arms the space wait inside tryClaim (and re-claims once), so a
+// producer retry loop with no explicit arm still wakes on the consumer's freed space.  Without a producer
+// doorbell a refusal arms nothing.
+TEST(RingDoorbellRegression, RefusedClaimArmsTheSpaceWaitItselfRegression) {
+    RingDoorbell producerBell;
+    OneToOneByteRing ring(1024);
+    ring.attachProducerDoorbell(producerBell);
+    std::vector<uint8_t> rec(100);
+    int n = 0;
+    while (ring.write(rec.data(), rec.size(), 1)) ++n;
+    ASSERT_GT(n, 0);
+    EXPECT_TRUE(ring.spaceWaitArmedForTest());
+    EXPECT_FALSE(producerBell.firedForTest());
+    EXPECT_GT(drainCount(ring), 0);
+    EXPECT_TRUE(producerBell.firedForTest()) << "the consumer's freed space must wake the refused producer";
+    producerBell.disarm(true);
+    EXPECT_TRUE(ring.write(rec.data(), rec.size(), 1));
+    EXPECT_FALSE(ring.spaceWaitArmedForTest()) << "a successful claim leaves no wait armed";
+
+    OneToOneByteRing plain(1024);
+    while (plain.write(rec.data(), rec.size(), 1)) {}
+    EXPECT_FALSE(plain.spaceWaitArmedForTest()) << "no producer doorbell: nothing armed, no fence";
 }

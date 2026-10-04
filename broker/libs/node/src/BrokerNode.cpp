@@ -377,6 +377,11 @@ void BrokerNode::start() {
     //    FIFO order, on that worker's first pass.
     if (workerPool_) workerPool_->armRingOwnership();
 
+    // A9 (review M-1): ring doorbells only where a shard runner parks on them — wired here, before ANY
+    // producer thread of a worker ring exists (the control thread just below in thread placement).
+    if (workerPool_ && config_.shardMode())
+        (void)workerPool_->enableShardDoorbells(shardAgents_, config_, config_.fused());
+
     // 7. Start the agent runner thread (drives NodeRuntimeAgent, which drives
     //    consensus + gateway on the single-writer thread).
     //    Spec §3.2: in fused placement the runtime has no thread of its own.
@@ -2941,11 +2946,20 @@ int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminCont
 // doorbell cannot watch (full) is left unattached — bounded by the park cap, logged.
 // ---------------------------------------------------------------------------
 void BrokerNode::attachFusedRuntimeDoorbell_() {
-    if (!config_.idleDoorbell || !workerPool_ || shardAgents_.empty()) return;
+    // Review M-1: only when worker 0's runner parks on its doorbell.
+    if (!workerPool_ || shardAgents_.empty() || !shardAgents_.front()->doorbellEnabled()) return;
     detail::RingDoorbell& bell = shardAgents_.front()->doorbell();
     int attached = 0, refused = 0;
     auto attach = [&](OneToOneByteRing& ring) { (ring.attachConsumerDoorbell(bell) ? attached : refused)++; };
-    for (int32_t w = 1; w < workerPool_->workerCount(); ++w) attach(workerPool_->worker(w).returnRingForDoorbell());
+    for (int32_t w = 1; w < workerPool_->workerCount(); ++w) {
+        Worker& wk = workerPool_->worker(w);
+        attach(wk.returnRingForDoorbell());
+        // Review M-2: the runtime PRODUCES into worker w's op + session rings; a refused claim (ring full)
+        // arms the ring's space wait, and worker w's drain rings worker 0 — runtime retries ("next cycle")
+        // never wait out a park.
+        wk.opRingForDoorbell().attachProducerDoorbell(bell);
+        wk.sessionRingForDoorbell().attachProducerDoorbell(bell);
+    }
     if (auto* admin = adminWorkerAgent_.get()) {
         attach(admin->failureRing());
         attach(admin->createReqRing());
