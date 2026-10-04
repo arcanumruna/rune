@@ -700,3 +700,161 @@ allocation-free per-cycle liveness poll convention (`Election::eligibleNodeIds`)
 | Virtual calls, std::function, allocation on hot paths | OK on produce and fetch. The term source is a plain function pointer with a captureless lambda (cold). Anti-entropy is internal-only and cold. Control-cycle allocation: LOW-R3-3. |
 | Tests never sleep | OK. No `sleep_for` or `usleep`. The new BrokerNode test paces itself on blocking control-thread round-trips. |
 | RED-first `*Regression*` | OK for every round-2 fix. CRITICAL-R3 and MAJOR-R3 need regression tests; both repros are ready in `repros/rev5-dur1-round3-Repro.cpp`. |
+
+---
+
+# Re-review (fix round 4)
+
+Scope: rune-broker-wt31 `feat/dur-1` e359e44..93fbab1 (dc9df66, 93fbab1). rune-protocol-fe unchanged at a9787dc.
+Read-only. `build-fast` was up to date ("no work to do"). I ran every round-4 regression, plus the round-2 and round-3
+ones they touch, from the existing binaries:
+- consensus: 5/5 (`CandidacyStateRoundTrips…`, `VoteGate_StaleSelfKnowledgeStillStands`,
+  `DeniedRequestVoteNeverRaisesAckTerm_GrantDoes`, `SelfVoteGatedByOwnKnowledge…`, `CandidacyStateExchanged…`);
+- replication: 2/2 (`StateOlderThanConsensusTerm…`, `TransientOpenErrorRetriedNotFailClosed`);
+- DR: 5/5 (`StaleSelfKnowledge_ConsensusNotHeadless`, `ZombieLeader…NoAckedLoss`,
+  `DeniedVoteNeverFreezesLiveLeaderInternalIsr`, `SelfVoteOfExcludedCandidateGated_NoAckedLoss`,
+  `RestartedFollowerRelearnsCommittedState_FailClosedHeals`).
+
+`check_no_atomics.py` is OK. The diff adds no `sleep_for`, `usleep`, `std::atomic`, `std::mutex` or `std::function`.
+
+## Verdict: APPROVED (no blocking findings)
+
+0 CRITICAL, 0 MAJOR, 0 MEDIUM, 4 LOW.
+
+### Status of the round-3 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| CRITICAL-R3 | **Fixed** | `Election.cpp:1278` `gateSelfVote_` sets the self-vote to For/None from `mayVoteFor(self)`. It runs after `becomeCandidate` (`:374`) and at the top of every `candidateBallot` step (`:399`), before `isUnanimousLeader`/`isQuorumLeader`. `None` makes both counters skip self, and `isUnanimousLeader` fails. The only leader path that skips the ballot is the single-node cluster (`:300`), which has no peers to lose records against. The reviewer's repro is landed as `SelfVoteOfExcludedCandidateGated_NoAckedLoss` and is green. |
+| MAJOR-R3 | **Fixed** | `votedTermId_` is raised only in the grant branch (`Election.cpp:740`). `ackTerm` = max(voted, leadership) (`AckTerm.h`), and `BrokerNode.cpp:908` reads `ackTermId()`. The deny branch and an abandoned own candidacy leave it unchanged. The DR repro and the ballot test are both green. |
+| LOW-R3-1 | **Fixed** | A changed incarnation clears the follower's ack bit, guarded by `internalQuorum_()` (`PartitionReplica.cpp:679-681`). Clearing it while a proposal is pending is conservative: a replica that may have lost its file must re-ack. Transient errno values put the store in "load pending", which refuses votes and persists and retries on use. Other errors still fail closed. |
+| LOW-R3-2/3 | Backlog (as ruled) | — |
+| LOW-B | **Open** (follow-up) | Nothing yet drives template 58 + `Election` + the BrokerNode exchange lambdas (`BrokerNode.cpp:872`) over real Aeron. CRITICAL-R3's liveness (MAJOR-A) now depends on that wiring, which only the DR model (all-to-all, instantaneous `exchangeKnowledge_`) and the unit tests prove. Keep it as the first follow-up. |
+
+### Safety analysis of the template-58 exchange (focus 2)
+
+- **Stale states.** Adoption is newest-wins on (leaderEpoch, version), compared lexicographically by `newerThan`.
+  A stale state can never displace a newer one.
+- **A higher version at an older term.** A zombie's high-version pending state at epoch E loses to any state at E+1.
+- **Learning cannot admit an unsafe candidate.** Let C be the latest committed metadata-ISR state.
+  - Every grant majority contains a voter that persisted something ≥ C, and that voter gates by its own newest state.
+  - A state newer than C is one of two things:
+    - a pending proposal of C's leader. An expansion is validated at ≥ max(HW, electionLeo), and HW counts committed ∪ proposed;
+    - a state of a later leadership. Its HW counts the all-replica seed until its first state commits on a majority, and from then on that newer state supersedes every older one on that majority.
+  - So a learned state never admits a replica missing committed records. A zombie's adopted pending *expansion* at E
+    can sit only on nodes that hold no E+1 state. Any grant majority still intersects the E+1 commit majority, and
+    that intersection voter ignores it.
+- **Storing without acking.** `onInternalIsr` acks only as `Follower` of `m.leaderId` at `m.leaderEpoch`. A node
+  that adopted a newer state does ack an older proposal without holding it, because `adoptNewest_` returns "holds
+  s or newer" (`InternalIsrKnowledge.cpp:97`). That stays safe:
+  - The newer state it holds is itself safe.
+  - A zombie commit still needs a node of the new grant majority to ack. Every granter refuses through the term rule.
+  - The winner refuses too, because its `leadershipTermId_` becomes E+1 the moment it wins, inside the same serialized
+    control-thread step as the self-gate.
+- **A candidate's own acks.** A candidate's ack term stays E, so it can ack a zombie's E proposal while standing at
+  E+1. If that proposal removes the candidate, the candidate's own gate then drops its self-vote. The two steps are
+  serialized on one thread, so it cannot both count itself and help commit its own removal.
+- **The rounds 2-3 arguments still hold.**
+- **The changed `ZombieLeader…` expectation.** "Any leader, no acked loss" is correct. The zombie's pending
+  shrink only restricts the votes.
+
+### Term source across restart (focus 3)
+
+`votedTermId_` is not persisted. After a restart, ackTerm = max(0, restored leadershipTermId) can be lower than a
+term the node granted in before the crash. This cannot let a zombie commit:
+- The internal replica restarts as Follower, epoch 0, leader -1 (`BrokerNode.cpp:650-653`).
+- The durable `candidateTermId` makes the Election ignore the stale term's NewLeadershipTerm.
+- So no ack goes to the zombie.
+
+It cannot freeze ISR changes either: denials no longer count. See LOW-R4-4 for the overstated comment.
+
+### Fused-runtime flake (focus 4)
+
+`ShardModeFusedRegression.PartitionLeaderFailsOverBetweenFusedRuntimes` needs the controller to commit the
+reassignment through `__cluster_metadata`. MAJOR-R3 can freeze exactly that commit on c319e9b: a denied vote under
+load followed by a stalled metadata HW. It was introduced in 3933caa and fixed by dc9df66. Round 4 adds no
+user-partition data-path change: the incarnation clear is `internalQuorum_()`-only, and the exchange is
+consensus-only. MAJOR-R3 is the plausible cause, now fixed. That remains unproven, because neither the report's ABAB
+run nor this review reproduced the flake. Keep it a watch item and capture stderr for the stale-term WARN.
+
+---
+
+## LOW-R4-1 — A leader exports its own *pending* proposal; a pending {L} can leave survivors admitting only a dead L
+
+**Where:** `InternalIsrKnowledge.h:146`. `candidacyState()` returns `latest()`. On the leader that includes its own
+pending proposal, which it persisted as its self-ack (`PartitionReplica.cpp:2167`).
+
+**Event sequence.** RF=3, L leads at epoch E, committed {L,A,B}@v.
+1. A and B stall. L fences or lag-shrinks them, giving pending {L}@(E,v+1), held only on L.
+2. A and B resume and move to a newer term without L: A stands at E+1 and B grants.
+   - B refuses L's data-plane re-send under the term rule.
+   - A's InternalIsr frames from L are lost, or A is not fetching.
+   - So {L} never commits.
+3. L, now out of Closed, canvasses and sends {L} through template 58. A and B adopt it durably.
+4. L dies before any newer state commits.
+5. A and B now admit only L, so the cluster is leaderless until L returns. Yet the HW counted committed ∪ proposed
+   = {L,A,B}, so A and B hold every committed record.
+
+**Severity.**
+- **Narrow.** It needs both followers to refuse or miss L's data-plane frames while receiving its canvass.
+  Usually A, as a candidate whose ack term is still E, persists and acks {L} through the data plane, and then {L}
+  is committed.
+- **Kafka-equivalent or better.** Kafka's controller commits a shrink to {L} without follower acks, and an
+  ISR-{L} partition goes offline when L dies (unclean disabled).
+- **Safe automatic fix.** The exchange is liveness-only, so exporting less is always safe.
+  - Have the leader export its last *committed* (epoch, version, members), not `isrProposal_` while pending.
+    Followers keep exporting their newest persisted state.
+  - In RF=3 this closes the gap entirely: a follower-persisted pending state is L+F, a majority, so it is committed.
+  - At RF≥5 only the "follower acked its own removal" corner remains.
+  - It also restores the zombie test's original expectation.
+
+## LOW-R4-2 — `adopt()` does no plausibility check; one malformed state poisons the knowledge permanently
+
+**Where:**
+- `InternalIsrKnowledge.cpp:82` checks only the topic, partition and `0 ≤ count ≤ 16`.
+- `BrokerNode.cpp:872` (learn lambda) passes the state through.
+- `ConsensusAdapter.h` (template 58) decodes it.
+
+A state with `count == 0`, members outside the configured cluster, or an implausibly high `leaderEpoch` is adopted
+as newest. Newest wins, so no real state ever supersedes it:
+- The node then refuses every candidate.
+- Its `offer()` returns "holds newer", so it acks real proposals without holding them.
+- It also re-exports the bad state to every participant.
+
+The consensus channel is trusted and unauthenticated, as all of Aeron's is, so this needs a bug or a future
+template-58 layout change. It is not an attack path. **Fix (cheap):** in `adopt`, require `count ≥ 1` and every member in
+the configured replica set. A further check that the epoch is ≤ the highest consensus term seen is optional.
+
+## LOW-R4-3 — Residual: with the self-vote gated, one fail-closed (corrupt-file) node plus a dead leader is headless in RF=3; a deleted file votes for anyone
+
+This was predicted in LOW-R3-1. Transient errors now retry, but a genuinely corrupt file still fails closed:
+- The node neither votes nor exports.
+- Its `votable()` can be re-proven only by a current-leadership `offer`, so it needs a leader.
+- With the leader dead, the RF=3 survivor S has only its self-vote. The cluster stays headless until the old leader
+  returns or an operator sets `RUNE_UNCLEAN_CONSENSUS_ELECTION`.
+
+This is acceptable: Kafka also needs an operator for on-disk corruption, and the node cannot be made votable from
+one peer's view without losing safety. Document it as an operator runbook item.
+
+An *absent* file on a node that has acked before (deleted by an operator) is still treated as fresh, so it votes
+for anyone. This is now mitigated: the candidate's CandidacyState precedes each RequestVote on the same
+publication, so the node usually learns the candidate's view before it votes. Operator-error only.
+
+## LOW-R4-4 — Comments overstate "never persisted" after a restart
+
+- **Where:** `Election.h:431` (the `votedTermId_` note), `InternalIsrKnowledge.cpp` `offer`, and the MEDIUM-A wording.
+- **The overstatement.** These comments say a deposed leader's state is "neither persisted nor acked".
+- **What actually happens after a restart.** The ack term can be below a pre-crash grant, so the node may
+  *persist* a zombie's state. It still never acks it, because the replica starts as Follower at epoch 0, leader -1.
+- **Why this is safe.** Persisting without acking is exactly what `adopt` does, which is shown safe above.
+- **Fix.** Reword the comments to "never acked; persisting is knowledge only". No code change is needed.
+
+## Hard-rule check
+
+| Rule | Result |
+|---|---|
+| Atomics and mutexes | OK. `check_no_atomics.py` is clean. |
+| Virtual calls, std::function, allocation on hot paths | OK. The exchange uses plain function pointers and captureless lambdas on the control thread (cold). `publishCandidacyState_` encodes into the publisher's fixed buffer. `adopt` writes files only when a state is newer (cold). The new `ConsensusMessageHandler::onCandidacyState` virtual follows the existing consensus-handler pattern, and the adapter dispatches through `if constexpr requires`. None of it is on the produce or fetch path. |
+| Tests never sleep | OK. |
+| Mixed version | OK. An old adapter's `default:` ignores template 58 (`ConsensusAdapter.h:161`). A new adapter decodes fixed offsets after a `len ≥ TOTAL_SIZE` check, so appended fields stay forward-compatible. An old node voting ungated preserves liveness during a rolling upgrade. The send result is ignored, which costs liveness only. |
+| RED-first `*Regression*` | OK. Every round-3 finding has a marked regression, and all are green. |
