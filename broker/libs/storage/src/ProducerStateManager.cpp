@@ -180,6 +180,8 @@ ProducerStateManager::validate(int32_t topicId,
     if (baseSequence > e.lastSequence) {
         // lastSequence == -1 means no batch appended yet in this epoch → expect 0.
         if (baseSequence == e.lastSequence + 1) return ValidationResult::accept();
+        // D6 L1: a rebuilt marker-only entry knows the epoch, not the producer's sequence.
+        if (e.markerOnly) return ValidationResult::unknownProducer();
         return ValidationResult::oos();   // forward gap
     }
 
@@ -245,19 +247,21 @@ void ProducerStateManager::update(int32_t topicId,
     // Record the batch in the retry window (circular, evicts oldest when full).
     e.push(baseSequence, lastSequence, baseOffset);
     e.lastSequence = lastSequence;
+    e.markerOnly   = false;   // D6 L1: a sequence of this epoch is known now
 }
 
 // ---------------------------------------------------------------------------
 // fenceEpoch — F15 S5 (C1+, I3): raise only
 // ---------------------------------------------------------------------------
 void ProducerStateManager::fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition,
-                                      int16_t producerEpoch)
+                                      int16_t producerEpoch, bool fromRebuild)
 {
     if (producerId < 0 || producerEpoch < 0) return;
     ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
     if (producerEpoch <= e.producerEpoch) return;
     e.producerEpoch = producerEpoch;
     e.lastSequence  = -1;
+    e.markerOnly    = fromRebuild;   // D6 L1: no sequence of this epoch survives in the log
     e.resetWindow();
 }
 
@@ -607,7 +611,7 @@ ProducerStateManager::rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes
                     (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
                 // F15 S5 (I3): a control batch is an epoch raise, never a sequence.
                 if (isControl && pid >= 0) {
-                    fenceEpoch(r.topicId, pid, r.partition, reader.producerEpoch());
+                    fenceEpoch(r.topicId, pid, r.partition, reader.producerEpoch(), /*fromRebuild=*/true);
                 } else if (!isControl && pid >= 0 && reader.baseSequence() >= 0) {
                     const int32_t baseSeq = reader.baseSequence();
                     update(r.topicId, pid, r.partition, reader.producerEpoch(), baseSeq, baseSeq + lastDelta,

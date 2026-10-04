@@ -112,6 +112,10 @@ struct ProducerStateEntry {
     uint8_t windowHead{0};       // next slot to write (oldest when full)
     uint8_t windowCount{0};      // slots filled so far (capped at kRetryWindowSize)
     int32_t lastSequence{-1};    // last seq appended (-1 = no batch yet)
+    // D6 review L1: the entry was made by a rebuild from a control MARKER only (its data batches gone) — no
+    // sequence is known in this epoch, so a first batch at seq != 0 is an UNKNOWN producer, not a gap.
+    // Cleared by the first data update().
+    bool    markerOnly{false};
 
     std::array<SeqRange, kRetryWindowSize> seqs{};
     std::array<int64_t,  kRetryWindowSize> baseOffsets{};
@@ -276,7 +280,8 @@ public:
     // durable form, for every control batch the producer-state rebuild sees.
     // Cold (a marker per transaction per partition): may allocate the entry.
     // -----------------------------------------------------------------------
-    void fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition, int16_t producerEpoch);
+    void fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition, int16_t producerEpoch,
+                    bool fromRebuild = false);
 
     // -----------------------------------------------------------------------
     // clearPartition — F15 S5 (I3): drop every entry of (topicId, partition)
