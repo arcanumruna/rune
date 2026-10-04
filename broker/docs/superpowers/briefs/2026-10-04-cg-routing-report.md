@@ -277,3 +277,118 @@ partitions it leads; the client drops those records until its OffsetFetch answer
 race there leaves the partition dead.  Clean fix: broker coordinator stops auto-subscribing at SyncGroup (clients
 subscribe to leaders explicitly now); or client handles that path idempotently.  Next round: reproduce in-process
 first (fake gateway with coordinator auto-push), then fix.
+
+---
+
+# Fix round 2 (redesign)
+
+This round follows the re-review `2026-10-04-cg-routing-rereview.md` (REJECT) and the controller's redesign ruling. Nothing was pushed. I ran no Docker. No conan.
+
+## Commits
+
+**Broker** (`rune-broker-wt51`, branch `fix/cg-unique-ids`, based on `d6f4a7c`; main has since moved to `ea807f2`, not rebased):
+
+| SHA | Commit |
+|---|---|
+| `b7db334` | feat(gateway): cluster-unique session and subscription ids; Unsubscribe only by the owning session |
+| `f820c9f` | fix(coordination): the group coordinator no longer auto-creates member subscriptions at SyncGroup (+ tests) |
+
+**Client** (`rune-client-cpp-wt14`, branch `fix/group-subscribe-routing`):
+
+| SHA | Commit |
+|---|---|
+| `5c3cd7b` | revert(transport): drop the frame arrival-source key |
+| `2701b7b` | test(support): InvokerGateway — node-prefixed subscription ids, pushes from any endpoint (MDC fallback) |
+| `a8e6812` | fix(group): fix round 2 redesign — explicit leader subscriptions, id demux, legitimate gaps (+ tests) |
+
+## Broker changes
+
+### 1. Cluster-unique ids
+
+- `SessionTable::nextSessionId()` and the gateway's subscription ids (both allocation sites: `handleSubscribe` and `addGroupSubscription`) now return `((nodeId + 1) << 40) | counter`, which is always positive.
+- The production `ClientGateway` constructor sets the prefix from `thisNodeId` (`setClusterIdNode`). The test constructors keep the historical small ids.
+
+**Audit of id widths:**
+- The only 32-bit narrowing of either id is the FR marker in `Worker.h:2631`, which is harmless.
+- The SBE protocol fields are int64.
+- The `int32` session ids in the replication transport and FragmentAssembler are Aeron session ids, a different id space.
+- No session/subscription id is used as an index or in arithmetic. The client's A10 keepalive routes Pongs by negative correlationId and is independent of id size. Its stale-frame check compares 64-bit ids.
+
+### 2. No auto-subscription at SyncGroup
+
+- `handleSyncGroup` no longer calls `revokeGroupSubscriptions`/`addGroupSubscription`, which also removes the "Fix #4" skip-recreate logic.
+- `onEnterPreparingRebalance` still sends the eager empty `Assign{gen}`. Its `revokeGroupSubscriptions` is now a no-op.
+- `addGroupSubscription` stays as an API, used by `ReadCommittedPushTest`.
+- The CG4 delivery tests now follow the explicit flow: SyncGroup, then a Subscribe per assigned partition from the committed offset, then Unsubscribe on revoke.
+
+### 3. Unsubscribe session check
+
+`handleUnsubscribe` ignores an Unsubscribe from a session that does not own the subscription (the re-review's broker ticket).
+
+## Client changes
+
+- **Arrival-source machinery removed.** Transport source keys, per-image tracking, `recordsSource` and the per-session source binding are gone. `SubscriberHub` and the group hub demultiplex Records by subscriptionId. SubscriberHub also checks topic/partition.
+- **C1.** A partition accepts only its current subscription instance of the current generation:
+  - once bound, its exact (cluster-unique) id;
+  - before the SubscribeResponse binds it, the Records' `sessionId` must be the session the Subscribe went to, and the id must not be retired.
+  - Never two unanswered instances of one partition on one session (the reconcile waits for the old one's answer).
+  - Positions are seeded only by OffsetFetch, or by the reset policy (log start) when nothing is committed.
+  - Rejoining retires and unsubscribes every subscription at once.
+  - Every subscription is the member's own (explicit, after OffsetFetch), so revoke, rejoin and close always unsubscribe it.
+- **CRITICAL-1 (legitimate gaps).** The gap rule is gone. A batch entirely below the position is skipped as a duplicate. Otherwise the batch is delivered and the position moves to `base + recordCount`, whether or not offsets in between were skipped (transaction markers, aborted batches, compaction holes).
+- **MAJOR-1 (MDC fallback).** Resolved by subscriptionId demux: Records from any publication or socket are matched by id.
+- **MAJOR-2 (stale ConnectResponse).** The agent records whether the dispatched ConnectResponse was awaited (Connecting with that correlationId) and accepted (now Connected).
+  - Only an accepted one bumps the connect epoch and triggers the produce resend.
+  - The Client ignores a ConnectResponse nobody awaited.
+  - A leader session's connect only reconciles group fetch; it never runs the seed logic (connect completion, metadata request, JoinGroup, `onConnected`).
+- **MEDIUM-1.**
+  - (a) A metadata answer that still names an unreachable leader for an assigned partition keeps a backoff-paced refresh armed (`fetchWaitsForSession`).
+  - (b) `reconcileImpl_` revives a terminally Disconnected target session (`FetchRouter::revive`), however it became Disconnected.
+- **MEDIUM-2.** Covered: pre-bind batches from the right session are accepted, so a gap at the log start is no longer special.
+- **MEDIUM-3 (documented, not routed).**
+  - A plain Subscribe redirected while a group is active is finished with `SubscriptionFailReason::LeaderElsewhereWhileGroupActive` (new `Subscription::failReason()`). This is documented on `Client::subscribe`, and the comment now correctly says transactional Produce redirects complete at their own deadline.
+  - **Why plain subscriptions are not routed per partition:** plain subscriptions have no position or leader-change model. On today's seed they don't follow a leader change either, and key-based ones (`partitionKnown=0`) can't be routed before the broker resolves the partition. Routing them is a separate feature (ticket).
+- **MEDIUM-4.** Moot: there are no coordinator-owned subscriptions to replace.
+- **MEDIUM-5.** `retired_` entries for a partition are forgotten when its current instance binds (exact match from then on), or when their session episode ends. It stays bounded (test: 50 moves leave at most 1).
+- **LOWs fixed:** LOW-2 (double-buffered Unsubscribe retry), LOW-3 (Fatal Unsubscribe logged), LOW-5 (a batch one group consumer does not own is offered to the next).
+- **LOWs not fixed:** LOW-1, LOW-6 (moot: the source machinery is gone), LOW-4 (more than 64 sessions in the watcher).
+
+## Tests
+
+All `*Regression*`, condition-driven, bounded pumps, no sleeps, free ports.
+
+**Broker.** In `GroupPushDeliveryTest`, with the branch-base gateway/coordinator sources plus only the `applyUnsubscribeForTest` seam, 4 tests FAIL:
+- `SyncGroupCreatesNoSubscriptionRegression` (records pushed before the member subscribed);
+- `SessionAndSubscriptionIdsCarryTheNodeIdRegression` (session/subscription id 1 lacks the node prefix);
+- `UnsubscribeFromAnotherSessionIsIgnoredRegression` (another session removed the subscription);
+- the updated `EachPartitionToExactlyOneMember` (two auto-created subscriptions).
+
+With the fix: 9/9. Full broker suite: **3690/3690**. `check_no_atomics` and `check_single_driver_pumper` OK.
+
+**Client.** RED tree = round-1 head `14caf1c` plus only the test infrastructure: InvokerGateway, test file, and a `testSessionStateAt` hook. The new tests that FAIL there:
+
+| Test | Symptom on the round-1 code |
+|---|---|
+| `TransactionMarkerGapIsConsumedPastRegression` (CRITICAL-1) | Stalled at the marker |
+| `RecordsFromANonSessionSourceAreConsumedRegression` (MAJOR-1) | Records dropped |
+| `StaleConnectResponseChangesNothingRegression` (MAJOR-2) | Subscriptions re-made: 3 instead of 2 |
+| `StaleMetadataAfterALeaderLossIsAskedAgainRegression` (MEDIUM-1a) | Never moved |
+| `AlreadyDisconnectedLeaderSessionIsRevivedRegression` (MEDIUM-1b) | Never revived |
+| `CollidingSessionIdsNeverCrossDeliverRegression` (redesigned M3) | Fails |
+
+Compile-RED only (new API):
+- `PlainSubscribeRedirectedWhileGroupActiveReportsWhyRegression` (MEDIUM-3)
+- hub-level `GapAdvancesThePositionRegression`, `RetiredInstancesAreBoundedRegression`, `OnlyTheCurrentSubscriptionInstanceIsAcceptedRegression` (pre-bind by session id, retired by id)
+
+The C1 test `StaleRecordsAfterRejoinNeverMoveThePositionRegression` is kept and green. All 19 client-level group-routing tests pass. Full client suite: **969/969**. Both check scripts OK.
+
+## Concerns
+
+1. **The client and broker must ship together.**
+   - A new client against an old broker: the coordinator still auto-subscribes at SyncGroup, and the member's explicit Subscribe on the seed is merged into that group subscription as a carrier, whose cursor ran ahead. That is the old stall on coordinator-led partitions.
+   - An old client against a new broker gets nothing on any partition, because nothing auto-subscribes any more.
+2. **Plain Subscribes for a non-seed-led partition still cannot succeed while a group is active.** Documented, with a reason; per-partition routing of plain subscriptions is a ticket.
+3. **The C1 pre-bind window trusts the Records' broker `sessionId` plus a non-retired id.** This is safe because ids are cluster-unique and only one unanswered instance per partition and session is allowed. A user plain subscription to the same partition on the same seed session, still pending at the same moment, is the one theoretical overlap (its id becomes known on bind).
+4. **Txn Produce redirects while a group is active** complete at their own deadline (not retried, comment corrected). A follow-up could forward them to the transactional producers.
+5. **The broker branch is not rebased onto the current main (`ea807f2`).**
+6. **Docker DR:** the CG files (and `test_tx_read_committed` / `test_tx_eos`, per the re-review) need your run with both images: broker at `f820c9f`, client at `a8e6812`.
