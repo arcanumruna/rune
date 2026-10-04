@@ -612,63 +612,84 @@ void GroupConsumerHub::sendSubscribeForPartitions(GroupConsumerImpl& impl,
 // Fetch routing — duty thread, cold path (group / routing events)
 // ---------------------------------------------------------------------------
 
-bool GroupConsumerHub::isRetired_(uint32_t session, uint64_t epoch, int64_t subscriptionId) const noexcept
+bool GroupConsumerHub::isRetired_(const TopicPartition& tp, int64_t subscriptionId) const noexcept
 {
+    // Subscription ids are cluster-unique: the id alone names the instance.
     for (const SubRef& r : retired_) {
-        if (r.subscriptionId == subscriptionId && r.session == session && r.epoch == epoch) return true;
+        if (r.subscriptionId == subscriptionId && r.tp == tp) return true;
     }
     return false;
 }
 
-void GroupConsumerHub::unsubscribe_(uint32_t session, uint64_t epoch, int64_t subscriptionId)
+void GroupConsumerHub::forgetRetired_(const TopicPartition& tp) noexcept
 {
-    // Only while the subscription's session episode is the current one: after a
-    // reconnect the broker may be a restarted node whose subscription ids are
-    // re-used (its Unsubscribe is not session-checked) — never unsubscribe there.
+    for (std::size_t i = 0; i < retired_.size();) {
+        if (retired_[i].tp == tp) { retired_[i] = retired_.back(); retired_.pop_back(); }
+        else ++i;
+    }
+}
+
+void GroupConsumerHub::unsubscribe_(uint32_t session, uint64_t epoch, int64_t subscriptionId, const TopicPartition& tp)
+{
+    // Only while the subscription's session episode is the current one: a new
+    // episode is a new broker session (the old one's subscriptions died with it).
     if (epoch == 0 || router_.epoch(router_.ctx, session) != epoch) return;
     uint8_t buf[64];
     const std::size_t len = codec::encodeUnsubscribe(buf, sizeof buf, subscriptionId,
                                                      router_.sessionId(router_.ctx, session),
                                                      nextFetchCorr_tagged_());
     if (len == 0) return;
-    if (router_.offer(router_.ctx, session, buf, len) == detail::SendResult::Retry) {
-        pendingUnsubs_.push_back(SubRef{session, epoch, subscriptionId});  // M2: re-offered per pass
+    switch (router_.offer(router_.ctx, session, buf, len)) {
+    case detail::SendResult::Accepted:
+        break;
+    case detail::SendResult::Retry:
+        pendingUnsubs_.push_back(SubRef{session, epoch, subscriptionId, tp});  // M2: re-offered per pass
+        break;
+    case detail::SendResult::Fatal:
+        // LOW-3: never deliverable; the instance stays retired (its records are
+        // dropped) until its session episode ends.
+        std::fprintf(stderr,
+            "rune-client: group fetch Unsubscribe (subscription %lld, topic %d partition %d) can never be "
+            "sent — dropped; the subscription ends with its session\n",
+            static_cast<long long>(subscriptionId), tp.topicId, tp.partition);
+        break;
     }
 }
 
 int GroupConsumerHub::retryFetchUnsubscribes()
 {
     if (!routed_() || pendingUnsubs_.empty()) return 0;
-    std::vector<SubRef> due;
-    due.swap(pendingUnsubs_);
+    unsubScratch_.clear();
+    unsubScratch_.swap(pendingUnsubs_);  // LOW-2: both keep their capacity
     int sent = 0;
-    for (const SubRef& u : due) {
+    for (const SubRef& u : unsubScratch_) {
         const std::size_t before = pendingUnsubs_.size();
-        unsubscribe_(u.session, u.epoch, u.subscriptionId);  // moot (epoch over) => dropped
+        unsubscribe_(u.session, u.epoch, u.subscriptionId, u.tp);  // moot (episode over) => dropped
         if (pendingUnsubs_.size() == before && router_.epoch(router_.ctx, u.session) == u.epoch) ++sent;
     }
+    unsubScratch_.clear();
     return sent;
 }
 
-void GroupConsumerHub::dropFetch_(GroupConsumerImpl::FetchSub& fs, bool force)
+void GroupConsumerHub::dropFetch_(const TopicPartition& tp, GroupConsumerImpl::FetchSub& fs)
 {
     if (fs.epoch != 0) {
         if (fs.subscriptionId != 0) {
-            retired_.push_back(SubRef{fs.session, fs.epoch, fs.subscriptionId});
-            if (fs.selfOwned || force) unsubscribe_(fs.session, fs.epoch, fs.subscriptionId);
+            retired_.push_back(SubRef{fs.session, fs.epoch, fs.subscriptionId, tp});
+            unsubscribe_(fs.session, fs.epoch, fs.subscriptionId, tp);
         } else if (fs.corrId != 0) {
-            late_.push_back(LateSub{fs.corrId, fs.session, fs.epoch, fs.selfOwned || force});
+            late_.push_back(LateSub{fs.corrId, fs.session, fs.epoch, tp});
         }
     }
     fs.epoch          = 0;
+    fs.brokerSid      = 0;
     fs.corrId         = 0;
     fs.subscriptionId = 0;
-    fs.selfOwned      = false;
 }
 
 void GroupConsumerHub::dropAllFetch_(GroupConsumerImpl& impl)
 {
-    for (auto& [tp, fs] : impl.fetch) dropFetch_(fs);
+    for (auto& [tp, fs] : impl.fetch) dropFetch_(tp, fs);
     impl.fetch.clear();
 }
 
@@ -693,7 +714,7 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
     // Partitions no longer assigned: their subscriptions go.
     for (auto it = impl.fetch.begin(); it != impl.fetch.end();) {
         if (impl.assignment.find(it->first) == impl.assignment.end()) {
-            dropFetch_(it->second);
+            dropFetch_(it->first, it->second);
             it = impl.fetch.erase(it);
         } else {
             ++it;
@@ -707,15 +728,29 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
         if (fs.epoch != 0) {
             // Live where the leader is, in the same session episode: nothing to do.
             if (fs.session == target && router_.epoch(router_.ctx, fs.session) == fs.epoch) continue;
-            dropFetch_(fs);  // the leader moved, or that session's episode ended
+            dropFetch_(tp, fs);  // the leader moved, or that session's episode ended
         }
         if (fs.parked) continue;
-        // C1: a subscription is made only once the start position is known
-        // (OffsetFetch, or the reset policy) — its first record is never a seed.
+        // C1: subscribed only once the start position is known (OffsetFetch /
+        // the reset policy) — no record can arrive before that.
         if (!fs.offsetKnown || pos == GroupConsumerImpl::kUnseededSentinel) continue;
         const uint64_t ep  = router_.epoch(router_.ctx, target);
         const int64_t  sid = router_.sessionId(router_.ctx, target);
-        if (ep == 0 || sid == 0) continue;  // connecting: its ConnectResponse re-drives
+        if (ep == 0 || sid == 0) {
+            // Not Connected: its ConnectResponse re-drives.  A terminally
+            // Disconnected one (however it got there) is re-driven now.
+            if (router_.revive != nullptr) router_.revive(router_.ctx, target);
+            continue;
+        }
+        // C1: never two unanswered instances of one partition on one session
+        // episode — pre-bind records are attributed by session, so the old
+        // unanswered one must be answered (retired, unsubscribed) first; its
+        // answer re-drives this reconcile.
+        bool olderUnanswered = false;
+        for (const LateSub& l : late_) {
+            if (l.tp == tp && l.session == target && l.epoch == ep) { olderUnanswered = true; break; }
+        }
+        if (olderUnanswered) continue;
         const int64_t corr = nextFetchCorr_tagged_();
         constexpr std::size_t kSubscribeFrameSize = 44u;
         ensureBuf(impl, kSubscribeFrameSize);
@@ -727,17 +762,13 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
         case detail::SendResult::Accepted:
             fs.session        = target;
             fs.epoch          = ep;
+            fs.brokerSid      = sid;
             fs.corrId         = corr;
             fs.subscriptionId = 0;
-            // On the seed the Subscribe carries the isolation to the
-            // coordinator's own group subscription — unless that one was
-            // replaced (a gap): then it is a plain one of ours.
-            fs.selfOwned       = target != 0 || fs.replaceGroupSub;
-            fs.replaceGroupSub = false;
             ++sent;
             break;
         case detail::SendResult::Retry:
-            break;  // transiently refused: the next routing event re-offers it
+            break;  // transiently refused: the next routing event / pass re-offers it
         case detail::SendResult::Fatal:
             fs.parked       = true;  // never deliverable as is: retried after fresh metadata
             metadataWanted_ = true;
@@ -785,6 +816,20 @@ bool GroupConsumerHub::fetchUses(uint32_t session) const noexcept
     return false;
 }
 
+bool GroupConsumerHub::fetchWaitsForSession() const noexcept
+{
+    if (!routed_()) return false;
+    for (const GroupConsumerImpl* impl : impls_) {
+        if (!impl->active || impl->state != GroupConsumerState::Stable) continue;
+        for (const auto& [tp, fs] : impl->fetch) {
+            if (fs.epoch != 0 || !fs.offsetKnown) continue;
+            const uint32_t target = router_.leaderSession(router_.ctx, tp.topicId, tp.partition);
+            if (router_.epoch(router_.ctx, target) == 0) return true;
+        }
+    }
+    return false;
+}
+
 bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCode, int64_t subscriptionId)
 {
     if (!isFetchCorrId(corrId)) return false;
@@ -795,9 +840,10 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
             if (errorCode == 0) {
                 fs.subscriptionId = subscriptionId;
                 fs.redirects      = 0;
+                forgetRetired_(tp);  // MEDIUM-5: exact id match from now on
             } else {
                 fs.epoch        = 0;     // nothing registered (UnknownTopic / UnknownPartition / ...)
-                fs.selfOwned    = false;
+                fs.brokerSid    = 0;
                 fs.parked       = true;  // retried after fresh metadata
                 metadataWanted_ = true;
             }
@@ -810,9 +856,10 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
         late_[i] = late_.back();
         late_.pop_back();
         if (errorCode == 0) {
-            retired_.push_back(SubRef{l.session, l.epoch, subscriptionId});  // its records: dropped
-            if (l.selfOwned) unsubscribe_(l.session, l.epoch, subscriptionId);
+            retired_.push_back(SubRef{l.session, l.epoch, subscriptionId, l.tp});  // its records: dropped
+            unsubscribe_(l.session, l.epoch, subscriptionId, l.tp);
         }
+        (void)reconcileFetch();  // a Subscribe that waited for this answer may go now
         break;
     }
     return true;  // a group fetch answer (maybe stale): never the SubscriberHub's
@@ -826,8 +873,8 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
             if (fs.corrId != corrId) continue;
             fs.corrId         = 0;
             fs.epoch          = 0;  // registered nothing
+            fs.brokerSid      = 0;
             fs.subscriptionId = 0;
-            fs.selfOwned      = false;
             if (park || ++fs.redirects > kMaxFetchRedirects) {
                 fs.parked       = true;
                 metadataWanted_ = true;
@@ -845,35 +892,6 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
         }
     }
     return false;
-}
-
-void GroupConsumerHub::onGap_(GroupConsumerImpl& impl, const TopicPartition& tp, GroupConsumerImpl::FetchSub& fs)
-{
-    const int64_t pos = impl.assignment[tp];
-    if (fs.gapAt == pos) {
-        // The subscription re-made from this very position gapped again: the
-        // records at the position are gone from the log (retention below the
-        // committed offset).  Never skip them silently: park (fresh metadata
-        // retries) and say so.
-        if (!fs.parked) {
-            std::fprintf(stderr,
-                "rune-client: group '%s' topic %d partition %d: records at the committed position %lld "
-                "are not readable (gap) — partition parked, not skipped\n",
-                impl.groupId.c_str(), tp.topicId, tp.partition, static_cast<long long>(pos));
-        }
-        dropFetch_(fs, /*force=*/true);
-        fs.parked       = true;
-        metadataWanted_ = true;
-        return;
-    }
-    fs.gapAt = pos;
-    // Re-make the subscription from the position.  On the seed the
-    // coordinator's group subscription cannot be rewound by a carrier: it is
-    // unsubscribed and replaced by a plain one of ours.
-    const bool seedGroupSub = fs.session == 0 && !fs.selfOwned;
-    dropFetch_(fs, /*force=*/true);
-    fs.replaceGroupSub = seedGroupSub;
-    (void)reconcileImpl_(impl);
 }
 
 int GroupConsumerHub::retryOffsetFetch(int64_t nowNs, int64_t sessionId, const SendFn& sendFn)
@@ -1122,67 +1140,45 @@ void GroupConsumerHub::onSessionDown()
 // onRecords — runner thread (hot path)
 // ---------------------------------------------------------------------------
 
-void GroupConsumerHub::onRecords(const codec::RecordsView& rv, uint32_t source)
+void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
 {
+    const TP key{rv.topicId, rv.partition};
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
 
         // Check if this (topicId, partition) is in the assignment.
-        const TP key{rv.topicId, rv.partition};
         auto it = impl->assignment.find(key);
         if (it == impl->assignment.end()) continue;
 
-        // Partitions are exclusively assigned within a group: this is the only
-        // consumer that can take the batch — every return below is a drop.
         if (routed_()) {
-            // C1: only the partition's CURRENT subscription instance — on its
-            // session (the frame's arrival session), in its connect episode,
-            // with its subscriptionId (or, still unanswered, any id of that
-            // session episode not retired: the same node log, and the
-            // contiguity rule below decides).
+            // C1: only this consumer's CURRENT subscription instance: its bound
+            // id (cluster-unique), or — before the SubscribeResponse binds it —
+            // a non-retired id pushed for the session it was sent on.  Another
+            // consumer (another group) may own the batch: keep looking (LOW-5).
             const auto f = impl->fetch.find(key);
-            if (f == impl->fetch.end()) { ++droppedBatches_; return; }
+            if (f == impl->fetch.end()) continue;
             const GroupConsumerImpl::FetchSub& fs = f->second;
-            const bool sameSession = source != kUnknownSource ? source == fs.session : fs.session == 0;
-            if (fs.epoch == 0 || !sameSession || router_.epoch(router_.ctx, fs.session) != fs.epoch ||
-                (fs.subscriptionId != 0 ? rv.subscriptionId != fs.subscriptionId
-                                        : isRetired_(fs.session, fs.epoch, rv.subscriptionId))) {
-                ++droppedBatches_;
-                return;
+            if (fs.epoch == 0 || router_.epoch(router_.ctx, fs.session) != fs.epoch) continue;
+            if (fs.subscriptionId != 0 ? rv.subscriptionId != fs.subscriptionId
+                                       : (rv.sessionId != fs.brokerSid ||
+                                          isRetired_(key, rv.subscriptionId))) {
+                continue;
             }
         }
 
-        // Contiguity: the position is seeded only by OffsetFetch / the reset
-        // policy (C1) — a batch never seeds it, and never skips over records.
-        int64_t pos = it->second;
+        // The position is seeded only by OffsetFetch / the reset policy (C1).
+        const int64_t pos = it->second;
         if (pos == GroupConsumerImpl::kUnseededSentinel) { ++droppedBatches_; return; }
         const int64_t end = rv.baseOffset + static_cast<int64_t>(rv.recordCount);
-        if (end <= pos) { ++droppedBatches_; return; }  // MEDIUM-3: entirely below — a duplicate
-        if (rv.baseOffset > pos) {
-            // A gap.  The one legal case: no committed offset (reset policy) and
-            // the first batch of OUR fresh subscription — the broker resolved the
-            // log start for it.
-            GroupConsumerImpl::FetchSub* fs = nullptr;
-            if (routed_()) fs = &impl->fetch.find(key)->second;
-            if (fs != nullptr && fs->resetPending && fs->selfOwned && fs->subscriptionId != 0 &&
-                rv.subscriptionId == fs->subscriptionId) {
-                fs->resetPending = false;
-                pos = it->second = rv.baseOffset;
-            } else {
-                ++droppedBatches_;
-                // From the bound current subscription: re-make it from the
-                // position (an unanswered one: wait for its bind).
-                if (fs != nullptr && fs->subscriptionId != 0) onGap_(*impl, key, *fs);
-                return;
-            }
-        }
-        if (routed_()) impl->fetch.find(key)->second.resetPending = false;
+        if (end <= pos) { ++droppedBatches_; return; }  // entirely below: a duplicate (MEDIUM-3)
+        // Otherwise delivered and the position moves to the batch's end — a
+        // batch above the position is legitimate (transaction markers, aborted
+        // batches, compaction holes are never pushed); one straddling it is
+        // delivered whole (at-least-once duplicates below the position).
 
         // Deliver to consumer. fix1 C1: noexcept doWork chain — catch/count/log.
-        // (A batch straddling the position is delivered whole: its records
-        // below the position are at-least-once duplicates.)
         if (impl->cbRecords) {
             DispatchScope scope(*this, *impl);
             try {
@@ -1200,15 +1196,14 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv, uint32_t source)
             }
         }
 
-        // (#2) Advance position by the actual batch record count:
-        //   newPos = baseOffset + recordCount  (== baseOffset + lastOffsetDelta + 1).
-        // rv.recordCount falls back to 1 for empty/stub batches (test helpers).
-        // The callback may have rebalanced this consumer (assignment changed):
-        // look the partition up again.
+        // (#2) newPos = baseOffset + recordCount (== lastOffset + 1); recordCount
+        // falls back to 1 for empty/stub batches (test helpers).  The callback
+        // may have rebalanced this consumer: look the partition up again.
         const auto again = impl->assignment.find(key);
         if (again != impl->assignment.end() && again->second == pos) again->second = end;
         return;
     }
+    ++droppedBatches_;
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,11 +1417,10 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 it->second = r.offset;
             }
             if (it->second == GroupConsumerImpl::kUnseededSentinel) {
-                // No committed offset: the reset policy (the log start, as the
-                // coordinator does) — the first batch of our fresh subscription
-                // may start above 0 (retention) and resets it.
+                // No committed offset: the reset policy — the log start (the
+                // broker clamps 0 up to it; the first batch then simply starts
+                // above 0, a legitimate gap).
                 it->second = 0;
-                if (routed_()) impl->fetch[tp].resetPending = true;
             }
             if (routed_()) impl->fetch[tp].offsetKnown = true;
         }
@@ -1466,14 +1460,9 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
         // (TX-5 CRITICAL 2) Re-send Subscribe frames for newly assigned partitions
         // so the broker applies the correct isolation level when delivering Records.
         if (routed_()) {
-            // Kept leader-node subscriptions stay (Stable throughout: nothing was
-            // dropped); revoked ones are unsubscribed, added ones subscribed
-            // (reconcileImpl_); every coordinator group subscription gets its
-            // carrier again, as before.
-                for (auto& [tp, fs] : impl->fetch) {
-                if (fs.session == 0 && !fs.selfOwned) dropFetch_(fs);  // the coordinator re-made its group subs
-            }
-            (void)reconcileImpl_(*impl);
+            // Kept subscriptions stay (Stable throughout); revoked ones are
+            // unsubscribed, added ones subscribed once their offset is known.
+                (void)reconcileImpl_(*impl);
         } else {
             sendSubscribeForPartitions(*impl, sessionId, sendFn);
         }

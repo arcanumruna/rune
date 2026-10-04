@@ -228,6 +228,7 @@ Client::Client(ClientConfig cfg)
         fr.leaderSession = &Client::fetchLeaderTrampoline_;
         fr.sessionId     = &Client::fetchSessionIdTrampoline_;
         fr.epoch         = &Client::fetchEpochTrampoline_;
+        fr.revive        = &Client::fetchReviveTrampoline_;
         fr.offer         = &Client::fetchOfferTrampoline_;
         groupConsumerHub_.setFetchRouter(fr);
     }
@@ -1850,6 +1851,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->code));
 
+        // MAJOR-2: a ConnectResponse no session machine was waiting for (stale
+        // correlationId, a duplicate, a late answer to a superseded attempt)
+        // changes nothing at all.
+        if (!agent_.lastConnectAwaited()) break;
+        // A leader-node session's own connect: its partitions' group
+        // subscriptions (and held produce, re-driven by the agent) follow it —
+        // none of the seed-session logic below (connect completion, metadata,
+        // JoinGroup, onConnected) concerns it.
+        if (agent_.lastConnectSession() != 0) {
+            if (ec == rpc::ErrorCode::OK && agent_.lastConnectAccepted() && !groupConsumerHub_.empty()) {
+                (void)groupConsumerHub_.reconcileFetch();
+            }
+            break;
+        }
+
         if (ec == rpc::ErrorCode::OK) {
             // F8c C3: complete the pending connect (state() was published by
             // syncSeedSession_ above, so a woken waiter reads Connected).
@@ -1906,9 +1922,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
                     };
-                if (agent::ClientAgent::isSeedConnectCorrId(opt->correlationId)) {
-                    groupConsumerHub_.onConnected(opt->assignedSessionId, gcSendFn);
-                }
+                groupConsumerHub_.onConnected(opt->assignedSessionId, gcSendFn);
                 // A (leader or seed) session (re)connected: partitions waiting
                 // for it — or whose subscription died with its old session —
                 // subscribe now.
@@ -2090,10 +2104,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
             }
 
             if (groupActive) {
-                // MEDIUM-4: no per-partition route for this op (a plain Subscribe,
-                // a txn request): fail THAT op retriably instead of moving the
-                // coordinator's session; fresh metadata routes the retry.
-                if (!subscriberHub_.failPendingSubscribe(opt->correlationId)) {
+                // MEDIUM-4: while a group is active the seed session (the group
+                // coordinator's) never follows a data-op redirect.
+                //  * A plain Subscribe: plain subscriptions are sent on the seed
+                //    only (no per-partition routing for them — they have no
+                //    position / leader-change model; ticketed), so one for a
+                //    partition another node leads can never succeed here: it is
+                //    finished with SubscriptionFailReason::
+                //    LeaderElsewhereWhileGroupActive (documented on subscribe()).
+                //  * A produce whose partition this handler could not map
+                //    (havePart false) is retried through its partition route.
+                //  * Anything else (a transactional producer's Produce, whose
+                //    correlationId the ProducerHub does not know) is not retried
+                //    here: it completes at its own op deadline.
+                if (!subscriberHub_.failPendingSubscribe(
+                        opt->correlationId, SubscriptionFailReason::LeaderElsewhereWhileGroupActive)) {
                     producerHub_.retryRedirectedProduce(
                         opt->correlationId,
                         [this](int32_t t, int32_t p, int32_t sid, const uint8_t* fb, std::size_t fl) -> bool {
@@ -2311,13 +2336,12 @@ void Client::onEgressFrame(codec::TemplateId tid,
     case codec::TemplateId::Records: {
         auto opt = codec::decodeRecords(buf, len);
         if (!opt) break;
-        // M3: the session the frame arrived on (its node + broker session id):
-        // subscription ids are per node and collide across nodes.
-        const uint32_t source = agent_.recordsSource(opt->sessionId);
+        // Demultiplexed by subscriptionId — cluster-unique (the broker puts
+        // the node id in its high bits), whichever node / publication pushed it.
         // Route to the subscriber hub first (direct subscriptions).
-        subscriberHub_.onRecords(*opt, source);
+        subscriberHub_.onRecords(*opt);
         // Also route to group consumer hub (assigned partitions).
-        groupConsumerHub_.onRecords(*opt, source);
+        groupConsumerHub_.onRecords(*opt);
         break;
     }
 
@@ -3247,6 +3271,11 @@ uint64_t Client::fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept {
     return static_cast<Client*>(ctx)->agent_.connectedEpoch(session);
 }
 
+void Client::fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept {
+    auto* self = static_cast<Client*>(ctx);
+    (void)self->agent_.reviveSession(session, self->now());
+}
+
 detail::SendResult Client::fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
                                                  std::size_t len) noexcept {
     using R = transport::AeronTransport::OfferResult;
@@ -3771,6 +3800,10 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     if (!groupConsumerHub_.empty()) {
         groupConsumerHub_.unparkFetch();
         (void)groupConsumerHub_.reconcileFetch();
+        // MEDIUM-1: the answer still names a leader whose session is down (the
+        // client noticed before the cluster re-elected): keep asking
+        // (backoff-paced) until a leader the client can reach is named.
+        if (groupConsumerHub_.fetchWaitsForSession()) scheduleMetadataRefresh();
     }
 
     // F14: a fresh cluster view — txn requests waiting for the coordinator to

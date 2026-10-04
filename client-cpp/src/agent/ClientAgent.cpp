@@ -718,6 +718,11 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                 (long long)opt->correlationId, (int)opt->code, (long long)opt->assignedSessionId,
                 s.endpoint.c_str(), (int)(&s == &seedSession()));
         }
+        // MAJOR-2: only a ConnectResponse the machine ACCEPTS (it was
+        // Connecting with this very correlationId and is Connected after) is a
+        // new connect episode; a stale / duplicate / ignored one changes nothing.
+        const bool awaited = s.machine.state() == session::SessionState::Connecting &&
+                             s.machine.correlationId() == opt->correlationId;
         s.machine.onConnectResponse(
             opt->code,
             opt->leaderMemberId,
@@ -725,10 +730,13 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             opt->correlationId,
             nowNs);
         s.machine.onActivity(nowNs);
-        if (opt->code == 0 && s.machine.state() == session::SessionState::Connected) {
-            ++s.connectEpoch;                             // MEDIUM-1: a new connect episode
-            s.sourceKey = transport_.currentSourceKey();  // M3: the node's send endpoint
+        lastConnectAccepted_ = awaited && opt->code == 0 && s.machine.state() == session::SessionState::Connected;
+        lastConnectSession_  = 0;
+        for (uint32_t i = 0; i < sessions_.size(); ++i) {
+            if (sessions_[i].get() == &s) { lastConnectSession_ = i; break; }
         }
+        lastConnectAwaited_ = awaited;
+        if (lastConnectAccepted_) ++s.connectEpoch;  // MEDIUM-1: a new connect episode
         // (F8c C3: the observer — Client::onEgressFrame — publishes the new
         // state to app threads (Client::state()) BEFORE it completes the
         // connect, so a thread woken by that completion reads Connected.)
@@ -737,8 +745,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // partition routes — held batches whose leader is THIS newly-connected
         // session now send.  Fires only when a session actually reached Connected
         // and per-partition routing is active (no cost single-node).
-        if (opt->code == 0 && routeIndex_.size() != 0 && produceResendFn_ &&
-            s.machine.state() == session::SessionState::Connected) {
+        if (lastConnectAccepted_ && routeIndex_.size() != 0 && produceResendFn_) {
             produceResendFn_();
         }
         if (egressObserver_) {
@@ -1068,38 +1075,9 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
     using R = transport::AeronTransport::OfferResult;
     if (index == 0) return offerDefault(buf, len);  // the seed: its (possibly retargeted) default pub
     if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
-    if (testForcedSessionOffers_ > 0) [[unlikely]] {
-        --testForcedSessionOffers_;
-        if (testForcedSessionOffer_ == R::Retry) ++ingressOfferRefused_;
-        return testForcedSessionOffer_;
-    }
     if (transport_.offerTo(sessions_[index]->endpoint, cfg_.transport.ingressStreamId, buf, len)) return R::Accepted;
     ++ingressOfferRefused_;
     return R::Retry;
-}
-
-uint32_t ClientAgent::recordsSource(int64_t frameSessionId) noexcept {
-    const int32_t sk = transport_.currentSourceKey();
-    uint32_t found = kUnknownSource;
-    bool anyOnSource = false;
-    if (sk >= 0) {
-        for (uint32_t i = 0; i < sessions_.size(); ++i) {
-            const Session& s = *sessions_[i];
-            if (s.sourceKey != sk) continue;
-            anyOnSource = true;
-            if (s.machine.state() != session::SessionState::Connected || s.machine.sessionId() != frameSessionId) continue;
-            if (found != kUnknownSource) return kUnknownSource;  // ambiguous on one node: never guess
-            found = i;
-        }
-        if (anyOnSource) return found;
-    }
-    for (uint32_t i = 0; i < sessions_.size(); ++i) {
-        const Session& s = *sessions_[i];
-        if (s.machine.state() != session::SessionState::Connected || s.machine.sessionId() != frameSessionId) continue;
-        if (found != kUnknownSource) return kUnknownSource;  // the id alone is ambiguous across nodes
-        found = i;
-    }
-    return found;
 }
 
 bool ClientAgent::reviveSession(uint32_t index, int64_t nowNs) noexcept {

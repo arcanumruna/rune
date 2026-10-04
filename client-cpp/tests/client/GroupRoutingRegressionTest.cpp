@@ -23,6 +23,8 @@
 
 #include <arpa/inet.h>
 #include <map>
+#include <memory>
+#include <tuple>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <string>
@@ -58,6 +60,7 @@ struct RigOptions {
     int64_t keepaliveNs       = 0;  // 0 = agent defaults
     int64_t responseTimeoutNs = 0;
     int64_t connectTimeoutMs  = 0;  // 0 = the client default
+    bool    reconnectForever  = false;
 };
 
 struct GroupRig {
@@ -108,6 +111,7 @@ struct GroupRig {
         c.keepaliveIntervalNs = o.keepaliveNs;
         c.responseTimeoutNs   = o.responseTimeoutNs;
         if (o.connectTimeoutMs > 0) c.connectTimeoutMs = o.connectTimeoutMs;
+        c.reconnectForeverAfterLive = o.reconnectForever;
         rc::TopicSpec ts;
         ts.name           = "t";
         ts.topicId        = 1;
@@ -568,18 +572,17 @@ TEST(GroupRoutingRegression, ErroredOffsetFetchIsRetriedRegression) {
     EXPECT_GE(r.gw.offsetFetches, 2);
 }
 
-// M3: broker session ids AND subscription ids collide across nodes.  A plain
-// subscription on topic b (seed, subscription id 500) and the group member's
-// p1 subscription on node 1 (also id 500, session id 42 on both nodes): each
-// node's records reach only its own subscription.  RED: node 1's group records
-// were also handed to the topic-b handler (and moved its offset).
-TEST(GroupRoutingRegression, CollidingIdsAcrossNodesNeverCrossDeliverRegression) {
-    RigOptions o;
-    o.udpSources = true;  // two nodes = two sources, as on real hosts
-    GroupRig r(4125, 4126, o);
+// M3 / redesign: broker session ids collide across nodes (both nodes assign
+// 42) but subscription ids are cluster-unique (node prefix, like the broker
+// now allocates them): a plain subscription on topic b (seed) and the group
+// member's p1 subscription on node 1 each get only their own records.  RED
+// (main / fix round 0): node 1's group records also reached the topic-b handler
+// when the per-node subscription ids collided.
+TEST(GroupRoutingRegression, CollidingSessionIdsNeverCrossDeliverRegression) {
+    GroupRig r(4125, 4126);
     const auto [n1, p1port] = r.addNode(4125);
     r.gw.uniqueSessionIds  = false;  // every node assigns session id 42
-    r.gw.perEndpointSubIds = true;   // every node numbers its subscriptions from 500
+    r.gw.perEndpointSubIds = true;   // per-node counters, node-prefixed (cluster-unique)
     r.gw.moreBrokers       = {{1, "127.0.0.1", p1port}};
     r.gw.partitions        = {{1, 0, 0, 1, 4125, ""}, {1, 1, 1, 1, 4125, ""}, {2, 0, 0, 1, 4125, ""}};
     r.gw.subscribeLeader   = {{1, n1}};
@@ -599,8 +602,8 @@ TEST(GroupRoutingRegression, CollidingIdsAcrossNodesNeverCrossDeliverRegression)
     }));
     const auto sb = *r.gw.latestSubscription(2, 0);
     const auto s1 = *r.subAt(1, n1);
-    ASSERT_EQ(sb.subscriptionId, s1.subscriptionId) << "precondition: colliding subscription ids";
     ASSERT_EQ(sb.sessionId, s1.sessionId) << "precondition: colliding session ids";
+    ASSERT_NE(sb.subscriptionId, s1.subscriptionId);
     r.gw.pushRecords(s1, 0, 3);
     r.gw.pushRecords(sb, 0, 2);
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 3 && plain >= 2; }));
@@ -657,4 +660,198 @@ TEST(GroupRoutingRegression, GroupConsumerCreatedAfterConnectJoinsRegression) {
     gc.onAssigned([&](std::vector<rc::TopicPartition>) { ++assigned; });
     ASSERT_TRUE(r.drive([&] { return assigned == 1; }, 2'000'000))
         << "a consumer created after connect() never joined (" << r.gw.joinGroups << " JoinGroups)";
+}
+
+// ===========================================================================
+// Fix round 2 (redesign: cluster-unique ids, explicit leader subscriptions,
+// legitimate gaps)
+// ===========================================================================
+
+namespace {
+// A rig with p0 led by node 0 (seed) and p1 by node 1, both assigned, both
+// subscribed (start offsets known: nothing committed = 0).
+struct TwoLeaders {
+    GroupRig r;
+    int      n1 = 0, p1port = 0;
+    Consumed led;
+    std::unique_ptr<rc::GroupConsumer> gc;
+    explicit TwoLeaders(int32_t in, int32_t eg, RigOptions o = {}, rc::GroupConfig gcfg = {})
+        : r(in, eg, o) {
+        std::tie(n1, p1port) = r.addNode(in);
+        r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+        r.gw.partitions      = {{1, 0, 0, 1, in, ""}, {1, 1, 1, 1, in, ""}};
+        r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+        r.gw.groupAssignment = {{1, 0}, {1, 1}};
+        gc = std::make_unique<rc::GroupConsumer>(r.client.subscribeGroup("g", {"t"}, gcfg));
+        wire(*gc, led);
+    }
+    void start() {
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+        r.gw.releaseJoins();
+        ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.subAt(1, n1) != nullptr; }));
+    }
+};
+} // namespace
+
+// CRITICAL-1 (re-review): offsets the broker never pushes (a transaction's
+// COMMIT/ABORT marker, aborted batches, compaction holes) are legitimate gaps:
+// consumption continues past them on a leader-node partition AND on the seed's.
+// RED (fix round 1): the gap re-subscribed, then parked — never advanced.
+TEST(GroupRoutingRegression, TransactionMarkerGapIsConsumedPastRegression) {
+    TwoLeaders t(4131, 4132);
+    t.start();
+    for (int p = 0; p < 2; ++p) {
+        const auto s = p == 0 ? *t.r.subAt(0, 0) : *t.r.subAt(1, t.n1);
+        t.r.gw.pushRecords(s, 0, 5);   // 0..4 (committed txn)
+        t.r.gw.pushRecords(s, 6, 3);   // 5 = its COMMIT marker (never pushed); 6..8
+        t.r.gw.pushRecords(s, 12, 2);  // 9..11 aborted + marker (read_committed skips); 12..13
+    }
+    ASSERT_TRUE(t.r.drive([&] { return t.led.records[0] == 10 && t.led.records[1] == 10; }))
+        << "p0=" << t.led.records[0] << " p1=" << t.led.records[1];
+    EXPECT_EQ(t.led.next[0], 14);
+    EXPECT_EQ(t.led.next[1], 14);
+}
+
+// MAJOR-1 (re-review): Records that come from a socket no session's
+// ConnectResponse came from (the broker's MDC fallback: a worker's own
+// publication), with broker session ids colliding across nodes, are still
+// consumed — demultiplexed by the (cluster-unique) subscriptionId.  RED (fix
+// round 1): the unknown source + colliding ids dropped every batch.
+TEST(GroupRoutingRegression, RecordsFromANonSessionSourceAreConsumedRegression) {
+    GroupRig r(4133, 4134);
+    const auto [n1, p1port] = r.addNode(4133);
+    const auto [w1, w1port] = r.addNode(4133);  // node 1's worker publication (no session)
+    (void)w1port;
+    r.gw.uniqueSessionIds  = false;  // both nodes assign session id 42
+    r.gw.perEndpointSubIds = true;
+    r.gw.moreBrokers       = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions        = {{1, 0, 0, 1, 4133, ""}, {1, 1, 1, 1, 4133, ""}};
+    r.gw.subscribeLeader   = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment   = {{1, 1}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }));
+    r.gw.pushRecordsFrom(*r.subAt(1, n1), 0, 4, w1);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 4; })) << "MDC-fallback records were dropped";
+}
+
+// MAJOR-2 (re-review): a ConnectResponse no session was waiting for (a stale /
+// duplicate answer) changes nothing: no new connect episode, no re-subscribe,
+// the live subscriptions keep delivering.  RED (fix round 1): it bumped the
+// seed's episode — every seed subscription was re-made and its records dropped.
+TEST(GroupRoutingRegression, StaleConnectResponseChangesNothingRegression) {
+    TwoLeaders t(4135, 4136);
+    t.start();
+    const auto s0 = *t.r.subAt(0, 0);
+    const std::size_t subsBefore = t.r.gw.subscribed.size();
+    // A duplicate OK for the seed's (long answered) first connect correlationId.
+    uint8_t out[64];
+    const std::size_t n = rune::client::codec::encodeConnectResponse(
+        out, sizeof out, 0, 0, s0.sessionId, 0, /*correlationId=*/1);
+    t.r.gw.send(0, out, n);
+    t.r.gw.pushRecords(s0, 0, 3);  // after the stale frame, on the same publication
+    ASSERT_TRUE(t.r.drive([&] { return t.led.records[0] == 3; }))
+        << "the live seed subscription stopped delivering after a stale ConnectResponse";
+    (void)t.r.drive([] { return false; }, 20'000);  // bounded settle: any re-subscribe reaches the gateway
+    EXPECT_EQ(t.r.gw.subscribed.size(), subsBefore) << "a stale ConnectResponse re-made subscriptions";
+}
+
+// MEDIUM-1a (re-review): the first metadata answer after node 1 dies still
+// names node 1 (the client noticed before the cluster re-elected); with
+// reconnect-forever sessions node 1's session never becomes Disconnected.  The
+// client keeps asking (backoff-paced) and moves p1 once node 2 is named.  RED
+// (fix round 1): one metadata request per loss — p1 stalled.
+TEST(GroupRoutingRegression, StaleMetadataAfterALeaderLossIsAskedAgainRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 400'000'000;
+    o.reconnectForever  = true;
+    GroupRig r(4137, 4138, o);
+    const auto [n1, p1port] = r.addNode(4137);
+    const auto [n2, p2port] = r.addNode(4137);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4137, ""}, {1, 1, 1, 1, 4137, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }));
+    const int mdBefore = r.gw.metadataRequests;
+    r.gw.deadEndpoints.insert(n1);  // metadata still names node 1 (stale)
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > mdBefore; }, 20'000'000))
+        << "losing node 1 never asked for metadata";
+    // That answer was stale; the cluster now elects node 2.
+    r.gw.partitions      = {{1, 0, 0, 1, 4137, ""}, {1, 1, 2, 2, 4137, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n2}};
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr; }, 40'000'000))
+        << "p1 never moved: the client stopped asking after one stale answer (" << r.gw.metadataRequests
+        << " requests)";
+}
+
+// MEDIUM-1b (re-review): node 1's session became terminally Disconnected BEFORE
+// the group used it (a producer opened it while node 1 was unreachable).  Once
+// p1 is assigned there (node 1 reachable again), the session is re-driven.  RED
+// (fix round 1): only a NEWLY Disconnected session was revived — p1 stalled.
+TEST(GroupRoutingRegression, AlreadyDisconnectedLeaderSessionIsRevivedRegression) {
+    RigOptions o;
+    o.connectTimeoutMs = 300;
+    GroupRig r(4139, 4140, o);
+    const auto [n1, p1port] = r.addNode(4139);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4139, ""}, {1, 1, 1, 1, 4139, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};
+    r.gw.silentEndpoints.insert(n1);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    // A producer opens node 1's session (p1's route) — node 1 never answers.
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0;
+    auto p = r.client.producer(pc);
+    const std::vector<uint8_t> val{1};
+    ASSERT_EQ(p.trySendTo(r.client.topic("t"), 1, rc::Key(uint64_t{1}), std::span<const uint8_t>(val)),
+              rc::SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] {
+        return r.client.testSessionCount() > 1 &&
+               r.client.testSessionStateAt(1) == rc::session::SessionState::Disconnected;
+    }, 40'000'000)) << "precondition: node 1's session terminally Disconnected";
+    // Node 1 is reachable again; the group now assigns p1 there.
+    r.gw.silentEndpoints.clear();
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 20'000'000))
+        << "the already-Disconnected node-1 session was never re-driven for the group";
+    r.gw.pushRecords(*r.subAt(1, n1), 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 2; }));
+}
+
+// MEDIUM-3 (re-review): while a group is active, a plain subscription to a
+// partition another node leads finishes with a distinct, documented reason
+// (never a seed redirect).
+TEST(GroupRoutingRegression, PlainSubscribeRedirectedWhileGroupActiveReportsWhyRegression) {
+    GroupRig r(4141, 4142);
+    const auto [n1, p1port] = r.addNode(4141);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4141, ""}, {2, 0, 1, 1, 4141, ""}};
+    r.gw.subscribeLeader = {{0, n1}};  // topic b / partition 0: node 1 (the fake keys by partition)
+    r.gw.groupAssignment = {{1, 0}};
+    r.gw.holdJoins       = false;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("b"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::LeaderElsewhereWhileGroupActive);
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), r.c.gatewayChannel) << "the seed moved";
 }

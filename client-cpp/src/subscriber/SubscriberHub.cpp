@@ -77,7 +77,7 @@ void SubscriberHub::closeStatus_(SubscriptionImpl& impl)
     if (impl.status.producerClosed()) return;
     // Final snapshot (uses the ring's reserve — always fits), THEN close: an
     // app thread that observes finished() and drains afterwards sees it.
-    (void)impl.status.publishFinal(SubscriptionStatus{impl.subscriptionId, impl.nextOffset});
+    (void)impl.status.publishFinal(SubscriptionStatus{impl.subscriptionId, impl.nextOffset, impl.failReason});
     impl.status.close();
 }
 
@@ -412,7 +412,7 @@ void SubscriberHub::onSubscribeResponse(
     }
 
     // Bind: lifecycle snapshot (uses the reserve — always fits).
-    (void)impl->status.publishFinal(SubscriptionStatus{impl->subscriptionId, impl->nextOffset});
+    (void)impl->status.publishFinal(SubscriptionStatus{impl->subscriptionId, impl->nextOffset, impl->failReason});
     activeById_.emplace(rsp.subscriptionId, impl);
 }
 
@@ -420,19 +420,16 @@ void SubscriberHub::onSubscribeResponse(
 // onRecords — duty thread (hot path: map lookup + handler; one publish/frame)
 // ---------------------------------------------------------------------------
 
-void SubscriberHub::onRecords(const codec::RecordsView& rv, uint32_t source)
+void SubscriberHub::onRecords(const codec::RecordsView& rv)
 {
-    // M3: plain subscriptions live on the seed session (session 0).  Records
-    // that arrived on another node's session are never theirs: broker
-    // subscription ids are per node and collide across nodes.
-    if (source != kUnknownSource && source != 0) return;
     auto it = activeById_.find(rv.subscriptionId);
     if (it == activeById_.end()) {
         return; // unknown / already-removed subscription
     }
     SubscriptionImpl& impl = *it->second;
     if (!impl.active) return;
-    // M3: and only its own partition (one compare on a branch already taken).
+    // Only its own topic / partition (a belt-and-braces compare on a branch
+    // already taken: subscription ids are cluster-unique).
     if (rv.topicId != impl.topicId || (impl.boundPartition >= 0 && rv.partition != impl.boundPartition)) return;
 
     // ---- Decode the RecordBatch and dispatch per record ---------------------
@@ -567,12 +564,15 @@ bool SubscriberHub::hasPending() const
 // M2 FIX: failPendingSubscribes — fail all unbound pending subscribes
 // ---------------------------------------------------------------------------
 
-bool SubscriberHub::failPendingSubscribe(int64_t correlationId)
+bool SubscriberHub::failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason)
 {
     const auto it = pendingByCorrelation_.find(correlationId);
     if (it == pendingByCorrelation_.end()) return false;
     clearUnsent_(*it->second);
-    if (it->second->impl) finish_(*it->second->impl);
+    if (it->second->impl) {
+        it->second->impl->failReason = reason;
+        finish_(*it->second->impl);
+    }
     pendingByCorrelation_.erase(it);
     return true;
 }

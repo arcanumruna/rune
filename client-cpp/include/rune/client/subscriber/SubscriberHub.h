@@ -144,11 +144,9 @@ public:
     ///
     /// The recordBatch span MUST be valid for the duration of this call
     /// (Aeron guarantees the fragment buffer is live for the callback duration).
-    /// `source`: the agent session the frame arrived on (ClientAgent::
-    /// recordsSource), kUnknownSource when unknown — M3: plain subscriptions are
-    /// on the seed (0); records of another node's session are never theirs.
-    static constexpr uint32_t kUnknownSource = 0xFFFFFFFFu;
-    void onRecords(const codec::RecordsView& rv, uint32_t source = kUnknownSource);
+    /// Matched by subscriptionId (cluster-unique: the broker puts its node id in
+    /// the high bits) and the subscription's own topic / resolved partition.
+    void onRecords(const codec::RecordsView& rv);
 
     /// Fail / deactivate all subscriptions (called on close, after the duty
     /// thread is gone).  Publishes each final snapshot and closes each status
@@ -167,7 +165,7 @@ public:
     void failPendingSubscribes(const std::string& reason);
     /// Fail the ONE pending subscription whose Subscribe carried
     /// `correlationId` (its handle sees finished()).  False if none.
-    bool failPendingSubscribe(int64_t correlationId);
+    bool failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason);
 
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.

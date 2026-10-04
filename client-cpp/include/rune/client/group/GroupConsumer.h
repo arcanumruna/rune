@@ -180,23 +180,19 @@ struct GroupConsumerImpl {
 
     // Fetch routing (distributed partition leadership; duty thread only).  One
     // entry per assigned partition while Stable: the ONE subscription instance
-    // whose records this member accepts for it (C1).  On the seed session (the
-    // coordinator leads it) the Subscribe is the isolation carrier of the
-    // coordinator's own group subscription; on another node's session it is a
-    // plain subscription starting at the member's position.  Cold path: changed
-    // only by group / routing events, never per record.
+    // whose records this member accepts for it (C1).  The member subscribes
+    // explicitly to the partition's LEADER (the coordinator creates none),
+    // after its OffsetFetch answer, from the committed offset (or the reset
+    // policy).  Cold path: changed only by group / routing events.
     struct FetchSub {
         uint32_t session        = 0;      // agent session index it was sent on (0 = the seed)
         uint64_t epoch          = 0;      // that session's connect epoch when sent; 0 = no subscription
+        int64_t  brokerSid      = 0;      // that session's broker id when sent (Records' sessionId)
         int64_t  corrId         = 0;      // its Subscribe correlationId while unanswered
         int64_t  subscriptionId = 0;      // bound by the SubscribeResponse (0 = unanswered)
-        bool     selfOwned      = false;  // created by our Subscribe (we unsubscribe it)
-        bool     replaceGroupSub = false; // seed: the next Subscribe replaces the coordinator's group sub
         bool     offsetKnown    = false;  // OffsetFetch answered (OK) for it this generation
-        bool     resetPending   = false;  // no committed offset: the first batch of OUR fresh subscription resets
         bool     parked         = false;  // refused: retried on fresh metadata
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
-        int64_t  gapAt          = -1;     // position at the last gap re-subscribe (loop guard)
     };
     std::map<TopicPartition, FetchSub> fetch;
     // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).

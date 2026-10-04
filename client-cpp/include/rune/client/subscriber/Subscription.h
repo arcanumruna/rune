@@ -112,9 +112,21 @@ using RecordHandler = std::function<void(const Record&)>;
 // SubscriptionStatus — one snapshot of the duty-thread-owned subscription state,
 // published to the app-side handle through the subscription's StatusRing.
 // ---------------------------------------------------------------------------
+/// Why a subscription finished without being unsubscribed (Subscription::failReason()).
+enum class SubscriptionFailReason : int32_t {
+    None = 0,
+    /// MEDIUM-3: the partition is led by another node while a consumer group is
+    /// active on this Client.  Plain subscriptions are sent on the seed session,
+    /// which is the group coordinator's and is never moved to follow a
+    /// redirect then; subscribe on a Client without a group consumer (or wait
+    /// for per-partition routing of plain subscriptions).
+    LeaderElsewhereWhileGroupActive = 1,
+};
+
 struct SubscriptionStatus {
     int64_t subscriptionId = 0;  // broker-assigned id (0 = SubscribeResponse not yet seen)
     int64_t nextOffset     = 0;  // resume position (lastDelivered + 1; 0 = nothing delivered)
+    SubscriptionFailReason failReason = SubscriptionFailReason::None;  // final snapshot only
 };
 
 // ---------------------------------------------------------------------------
@@ -150,7 +162,8 @@ struct SubscriptionImpl {
 
     // ---- Duty-thread owned ------------------------------------------------------
     int64_t subscriptionId = 0;  // bound by SubscribeResponse (0 = pending)
-    int32_t boundPartition = -1; // M3: the partition the SubscribeResponse resolved
+    int32_t boundPartition = -1; // the partition the SubscribeResponse resolved
+    SubscriptionFailReason failReason = SubscriptionFailReason::None;  // set before a failing finish
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
@@ -278,6 +291,10 @@ public:
     /// The subscriptionId assigned by the broker (0 until the SubscribeResponse
     /// has been processed — records cannot arrive before then).
     [[nodiscard]] int64_t subscriptionId() const;
+
+    /// Why the duty side finished this subscription on its own (None when it
+    /// was unsubscribed, timed out or closed — see SubscriptionFailReason).
+    [[nodiscard]] SubscriptionFailReason failReason() const;
 
 private:
     [[nodiscard]] bool onDutyThread_() const noexcept {

@@ -407,6 +407,8 @@ public:
         return agent_.testPublicationOpen(channel, streamId);
     }
     [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
+    /// Test hook (duty-cycle thread only): agent session `i`'s state.
+    [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
     /// Test hook (duty-cycle thread only): the cached advertised ingress stream (0 = none).
     [[nodiscard]] int32_t testIngressStreamIdFor(int32_t topicId, int32_t partition) const {
         return metadataCache_.ingressStreamIdFor(topicId, partition);
@@ -559,6 +561,14 @@ public:
     // ---- CB-4: Subscribe API -------------------------------------------------
 
     /// Subscribe to a topic partition using a Key (partition resolved via FNV-1a).
+    ///
+    /// Plain subscriptions are sent on the seed session.  While a consumer group
+    /// (subscribeGroup) is active on this Client, that session is the group
+    /// coordinator's and never follows a redirect: a plain subscription to a
+    /// partition another node leads is then finished with
+    /// Subscription::failReason() == SubscriptionFailReason::
+    /// LeaderElsewhereWhileGroupActive (re-subscribing cannot succeed; use a
+    /// separate Client for it).
     ///
     /// Returns a Subscription handle immediately.  Records begin flowing once
     /// the broker acknowledges (SubscribeResponse) — the Subscription does NOT
@@ -894,6 +904,7 @@ private:
     static uint32_t fetchLeaderTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
+    static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
     /// M1 (duty thread, while a group consumer exists): a leader-node session a
     /// group partition subscribes through was lost (left Connected) or became
     /// terminally Disconnected — ask for metadata (the leader may have moved),

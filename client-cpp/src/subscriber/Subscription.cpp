@@ -155,4 +155,10 @@ int64_t Subscription::subscriptionId() const {
     return cache_.subscriptionId;
 }
 
+SubscriptionFailReason Subscription::failReason() const {
+    if (impl_ && onDutyThread_()) return impl_->failReason;
+    drainStatus_();
+    return cache_.failReason;
+}
+
 } // namespace rune::client

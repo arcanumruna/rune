@@ -2267,64 +2267,79 @@ void boundOnNodeOne(GroupConsumerHub& hub, CaptureSink& sink, FakeFetchRouter& f
     hub.onOffsetFetchResponse(o1.data(), o1.size());
     ASSERT_TRUE(hub.onFetchSubscribeResponse(fr.subscribes(1).at(0).correlationId, 0, 900));
 }
-codec::RecordsView batch(int32_t partition, int64_t base, int64_t subId, int32_t count = 1) {
+codec::RecordsView batch(int32_t partition, int64_t base, int64_t subId, int32_t count = 1, int64_t sid = 501) {
     codec::RecordsView rv;
     rv.topicId        = kTopicId;
     rv.partition      = partition;
     rv.baseOffset     = base;
     rv.subscriptionId = subId;
     rv.recordCount    = count;
+    rv.sessionId      = sid;
     return rv;
 }
 } // namespace
 
-// C1: only the current instance on its own session: another session's batch,
-// another id, or a retired instance's batch never reaches the application.
+// C1: once bound, only the current instance's (cluster-unique) id is accepted;
+// a retired instance's in-flight batches are dropped.
 TEST_F(GroupConsumerHubTest, OnlyTheCurrentSubscriptionInstanceIsAcceptedRegression) {
     FakeFetchRouter fr;
     int delivered = 0;
     impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
     boundOnNodeOne(*hub_, sink_, fr);
     const TopicPartition tp{kTopicId, 1};
-    hub_->onRecords(batch(1, 7, 900), /*source=*/0);   // right id, wrong session (the seed)
-    hub_->onRecords(batch(1, 7, 901), /*source=*/1);   // right session, another id
+    hub_->onRecords(batch(1, 7, 901));  // another id
     EXPECT_EQ(delivered, 0);
     EXPECT_EQ(impl_->assignment.at(tp), 7);
-    hub_->onRecords(batch(1, 7, 900), /*source=*/1);
+    hub_->onRecords(batch(1, 7, 900));
     EXPECT_EQ(delivered, 1);
     EXPECT_EQ(impl_->assignment.at(tp), 8);
     // The leader moves to node 2: 900 is retired — its in-flight batches drop.
     fr.leader[1] = 2u;
     fr.sids[2]   = 777;
     hub_->reconcileFetch();
-    hub_->onRecords(batch(1, 8, 900), /*source=*/1);
+    hub_->onRecords(batch(1, 8, 900));
     EXPECT_EQ(delivered, 1) << "a retired instance's batch was delivered";
     EXPECT_EQ(impl_->assignment.at(tp), 8);
+    // Before node 2's answer binds the new instance: its session's batches with
+    // a non-retired id are accepted; node 1's session's / the retired id are not.
+    hub_->onRecords(batch(1, 8, 950, 1, /*sid=*/501));
+    hub_->onRecords(batch(1, 8, 900, 1, /*sid=*/777));
+    EXPECT_EQ(delivered, 1);
+    hub_->onRecords(batch(1, 8, 951, 2, /*sid=*/777));
+    EXPECT_EQ(delivered, 2);
+    EXPECT_EQ(impl_->assignment.at(tp), 10);
 }
 
-// C1: a gap (batch above the position) never advances it; the subscription is
-// re-made from the position; a second gap at the same position parks the
-// partition (records gone — never skipped silently).
-TEST_F(GroupConsumerHubTest, GapResubscribesFromThePositionThenParksRegression) {
+// CRITICAL-1 (re-review): a batch above the position is legitimate — a
+// transaction marker, an aborted batch or a compaction hole is never pushed —
+// and the position advances to its end.  RED (fix round 1): the partition was
+// re-subscribed, then parked, and never advanced.
+TEST_F(GroupConsumerHubTest, GapAdvancesThePositionRegression) {
     FakeFetchRouter fr;
     int delivered = 0;
     impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
     boundOnNodeOne(*hub_, sink_, fr);
     const TopicPartition tp{kTopicId, 1};
-    hub_->onRecords(batch(1, 12, 900), 1);  // gap: 7..11 missing
-    EXPECT_EQ(delivered, 0);
-    EXPECT_EQ(impl_->assignment.at(tp), 7);
-    const auto un = fr.unsubscribes(1);
-    ASSERT_EQ(un.size(), 1u);
-    EXPECT_EQ(un[0].subscriptionId, 900);
-    const auto subs = fr.subscribes(1);
-    ASSERT_EQ(subs.size(), 2u);
-    EXPECT_EQ(subs[1].fromOffset, 7) << "re-made from the position";
-    ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs[1].correlationId, 0, 901));
-    hub_->onRecords(batch(1, 12, 901), 1);  // the fresh one gaps again at 7: gone
-    EXPECT_EQ(impl_->assignment.at(tp), 7);
-    EXPECT_EQ(fr.subscribes(1).size(), 2u) << "parked: no re-subscribe storm";
-    EXPECT_TRUE(hub_->takeMetadataWanted());
+    hub_->onRecords(batch(1, 7, 900, 3));   // 7..9
+    hub_->onRecords(batch(1, 11, 900, 2));  // 10 was a marker: 11..12
+    EXPECT_EQ(delivered, 2);
+    EXPECT_EQ(impl_->assignment.at(tp), 13);
+    EXPECT_TRUE(fr.unsubscribes(1).empty()) << "no re-subscribe on a legitimate gap";
+    EXPECT_EQ(fr.subscribes(1).size(), 1u);
+}
+
+// MEDIUM-5 (re-review): retired instances are forgotten once the partition's
+// current instance binds — the list stays bounded however often it moves.
+TEST_F(GroupConsumerHubTest, RetiredInstancesAreBoundedRegression) {
+    FakeFetchRouter fr;
+    boundOnNodeOne(*hub_, sink_, fr);
+    for (int i = 0; i < 50; ++i) {
+        fr.epochs[1] = static_cast<uint64_t>(2 + i);  // a new episode every round: re-subscribe
+        hub_->reconcileFetch();
+        const auto subs = fr.subscribes(1);
+        ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, 0, 1000 + i));
+    }
+    EXPECT_LE(hub_->retiredCount(), 1u);
 }
 
 // M2: an Unsubscribe the transport refused is re-offered on a later pass; one
