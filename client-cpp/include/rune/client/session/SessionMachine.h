@@ -391,6 +391,17 @@ public:
     /// Drive keepalive cadence, connect timeout, and response timeout.
     /// Uses ONLY the injected nowNs — no wall-clock.
     void tick(int64_t nowNs) noexcept {
+        // A10: a gap between this machine's own ticks longer than the response
+        // timeout is a stall of the CLIENT (SIGSTOP, a long pause): the broker may
+        // have expired the session meanwhile, and frames buffered during the stall
+        // (read just before this tick) prove nothing — treat the session as stale.
+        const bool ownStall = lastTickNs_ != 0 && nowNs - lastTickNs_ > cfg_.responseTimeoutNs;
+        lastTickNs_ = nowNs;
+        if (ownStall && state_ == SessionState::Connected) [[unlikely]] {
+            transitionTo(SessionState::Resuming);
+            resumeEntryNs_ = nowNs;
+            return;
+        }
         switch (state_) {
         case SessionState::Connecting:
             tickConnecting(nowNs);
@@ -687,10 +698,14 @@ private:
         if (nowNs - lastKeepaliveSentNs_ >= cfg_.keepaliveIntervalNs) {
             lastKeepaliveSentNs_ = nowNs;
 
-            const std::size_t n = rune::client::codec::encodeKeepalive(
-                scratch_.data(), kScratchCap,
+            // A10: the keepalive is a Ping — the broker touches the session AND
+            // answers with a Pong, so even an idle session proves liveness inside
+            // responseTimeoutNs.  correlationId 0: never an application ping's id
+            // (those start at 1).
+            const std::size_t n = rune::client::codec::encodePing(
+                scratch_.data(), kScratchCap, std::string_view{},
                 sessionId_,
-                correlationId_);
+                /*correlationId=*/0);
             if (n > 0) {
                 io_.sendFrame(scratch_.data(), n);
             }
@@ -724,6 +739,7 @@ private:
     int64_t connectStartNs_      = 0;
     int64_t lastKeepaliveSentNs_ = 0;
     int64_t lastActivityNs_      = 0;
+    int64_t lastTickNs_          = 0;   ///< A10: own-stall detection (gap between ticks)
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
     // DR-BUG-2: fast-retry state for the connect path.
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered

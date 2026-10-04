@@ -762,7 +762,13 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     }
 
     case codec::TemplateId::Pong: {
-        seedSession().machine.onActivity(nowNs);
+        // A10: credited to the session it answers (the keepalive is a Ping per
+        // session); the seed only when the id is unknown (pre-fix behaviour).
+        {
+            const auto pongOpt = codec::decodePong(buf, len);
+            Session* s = pongOpt ? sessionById_(pongOpt->sessionId) : nullptr;
+            (s != nullptr ? *s : seedSession()).machine.onActivity(nowNs);
+        }
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
         }
@@ -789,6 +795,9 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // known-old duplicate carries baseOffset -1; the old -errorCode sentinel
         // read it as error 1).
         if (auto opt = codec::decodeProduceResponse(buf, len)) {
+            // A10: an ack is proof of a live session — refresh ITS liveness clock
+            // (else every producing session went stale after responseTimeoutNs).
+            if (Session* s = sessionById_(opt->sessionId)) [[likely]] s->machine.onActivity(nowNs);
             const int64_t off = opt->errorCode == 0 ? opt->baseOffset : -1;
             if (produceResponseFn_) {
                 produceResponseFn_(opt->correlationId, off, opt->errorCode);  // test-harness hook

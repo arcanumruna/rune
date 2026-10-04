@@ -758,6 +758,7 @@ if(BUILD_TESTING)
     if(aeron_FOUND)
         add_executable(rune_agent_tests
             tests/agent/ClientAgentTest.cpp
+            tests/agent/SessionLivenessRegressionTest.cpp
         )
         target_include_directories(rune_agent_tests PRIVATE
             ${RUNE_PROTOCOL_INCLUDE}

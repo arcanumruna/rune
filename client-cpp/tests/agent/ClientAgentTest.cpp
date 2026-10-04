@@ -278,13 +278,13 @@ struct Gateway {
             if (n > 0) reply(replyBuf, n);
             break;
         }
-        case rcc::TemplateId::Keepalive:
-            keepalivesSeen.fetch_add(1, std::memory_order_relaxed);
-            break;
         case rcc::TemplateId::Ping: {
             auto opt = rcc::decodePing(buf, len);
             if (!opt) return;
-            pingSeen.fetch_add(1, std::memory_order_relaxed);
+            // A10: the session keepalive is a Ping with correlationId 0; an
+            // application ping carries its own (>= 1) correlationId.
+            if (opt->correlationId == 0) keepalivesSeen.fetch_add(1, std::memory_order_relaxed);
+            else pingSeen.fetch_add(1, std::memory_order_relaxed);
             // Reply with Pong{echo}.
             std::size_t n = rcc::encodePong(
                 replyBuf, sizeof(replyBuf),
@@ -766,7 +766,7 @@ TEST(ClientAgent, KeepaliveViaAgent) {
                 }
                 break;
             }
-            case rcc::TemplateId::Keepalive:
+            case rcc::TemplateId::Ping:   // A10: the keepalive is a Ping
                 keepalivesSeen.fetch_add(1, std::memory_order_relaxed);
                 break;
             default:

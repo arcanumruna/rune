@@ -96,10 +96,11 @@ struct FakeIo final : sm::SessionIo {
         return cc::decodeConnectRequest(f.data.data(), f.data.size());
     }
 
-    std::optional<cc::KeepaliveView> lastKeepalive() const {
+    // A10: the keepalive is a Ping (answered by a Pong).
+    std::optional<cc::PingView> lastKeepalive() const {
         if (sends.empty()) return std::nullopt;
         const auto& f = sends.back();
-        return cc::decodeKeepalive(f.data.data(), f.data.size());
+        return cc::decodePing(f.data.data(), f.data.size());
     }
 
     std::optional<cc::DisconnectView> lastDisconnect() const {
@@ -314,7 +315,7 @@ TEST(SessionMachine, KeepaliveJustBeforeBoundary) {
 
     auto tid = io.lastTemplateId();
     ASSERT_TRUE(tid.has_value());
-    EXPECT_EQ(*tid, static_cast<uint16_t>(cc::TemplateId::Keepalive));
+    EXPECT_EQ(*tid, static_cast<uint16_t>(cc::TemplateId::Ping));
 }
 
 TEST(SessionMachine, KeepaliveSentOnlyOncePerInterval) {
@@ -360,11 +361,11 @@ TEST(SessionMachine, KeepaliveMultipleTicks) {
     }
     EXPECT_EQ(io.sendCount(), 3u);
 
-    // All three must decode as Keepalive with the correct sessionId.
+    // All three must decode as the keepalive Ping (A10) with the correct sessionId.
     for (std::size_t i = 0; i < 3; ++i) {
-        auto kav_opt = cc::decodeKeepalive(io.sends[i].data.data(),
-                                           io.sends[i].data.size());
-        ASSERT_TRUE(kav_opt.has_value()) << "send[" << i << "] is not a Keepalive";
+        auto kav_opt = cc::decodePing(io.sends[i].data.data(),
+                                      io.sends[i].data.size());
+        ASSERT_TRUE(kav_opt.has_value()) << "send[" << i << "] is not a keepalive Ping";
         EXPECT_EQ(kav_opt->sessionId, 99LL);
     }
 }
@@ -2297,5 +2298,58 @@ TEST(SessionMachineRegression, BackoffAlternatesBootstrapAndLastKnownLeader) {
         m2.tick(now);
         ASSERT_EQ(io2.sentTo.size(), 1u);
         EXPECT_EQ(io2.sentTo[0], "bootstrap") << "attempt " << attempt;
+    }
+}
+
+// A10 (2026-10-04) regression: the keepalive is a Ping the broker ANSWERS (Pong),
+// so an otherwise idle session still proves liveness; correlationId 0 never
+// matches an application ping (those start at 1).
+TEST(SessionLivenessRegression, KeepaliveIsAnAnsweredPing) {
+    FakeIo io;
+    auto cfg = testConfig();
+    sm::SessionMachine m(io, cfg);
+    m.connect(T0);
+    m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 42LL, m.correlationId(), T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+    io.reset();
+    m.tick(T0 + cfg.keepaliveIntervalNs);
+    ASSERT_EQ(io.sendCount(), 1u);
+    ASSERT_EQ(io.lastTemplateId(), static_cast<uint16_t>(cc::TemplateId::Ping));
+    const auto& f = io.sends.back();
+    const auto ping = cc::decodePing(f.data.data(), f.data.size());
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_EQ(ping->sessionId, 42LL);
+    EXPECT_EQ(ping->correlationId, 0LL);
+}
+
+// A10: a stall of the client ITSELF (no tick for longer than responseTimeoutNs —
+// SIGSTOP, a long GC-like pause) means the broker may have expired the session
+// meanwhile; frames buffered during the stall and read on resume must not mask
+// that: the session resumes proactively.
+TEST(SessionLivenessRegression, OwnStallPastTimeoutResumesEvenWithBufferedActivity) {
+    FakeIo io;
+    auto cfg = testConfig();
+    sm::SessionMachine m(io, cfg);
+    m.connect(T0);
+    m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 42LL, m.correlationId(), T0);
+    m.tick(T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connected);
+    const int64_t resumedAt = T0 + cfg.responseTimeoutNs + 1;
+    m.onActivity(resumedAt);   // a buffered ack read right after the stall
+    m.tick(resumedAt);
+    EXPECT_NE(m.state(), sm::SessionState::Connected);
+}
+
+// ...while a session ticked regularly and kept busy by acks never goes stale.
+TEST(SessionLivenessRegression, RegularTicksWithActivityStayConnected) {
+    FakeIo io;
+    auto cfg = testConfig();
+    sm::SessionMachine m(io, cfg);
+    m.connect(T0);
+    m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 42LL, m.correlationId(), T0);
+    for (int64_t t = T0; t <= T0 + 10 * cfg.responseTimeoutNs; t += cfg.keepaliveIntervalNs) {
+        m.onActivity(t);
+        m.tick(t);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
     }
 }

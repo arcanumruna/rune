@@ -683,6 +683,19 @@ public:
         return ring_;
     }
 
+    // TEST SEAMS (duty thread only; A10 session-liveness regression): inject one
+    // reassembled egress frame / tick every session machine with an explicit clock.
+    void dispatchEgressFrameForTest(int64_t nowNs, const uint8_t* buf, std::size_t len) noexcept {
+        dispatchEgressFrame(nowNs, buf, len);
+    }
+    void tickSessionsForTest(int64_t nowNs) noexcept {
+        for (auto& s : sessions_) s->machine.tick(nowNs);
+    }
+    session::SessionMachine& sessionMachineForTest(std::size_t i) noexcept { return sessions_[i]->machine; }
+    session::SessionMachine& sessionForEndpointForTest(const std::string& endpoint) noexcept {
+        return sessionForEndpoint(endpoint).machine;
+    }
+
 private:
     // -------------------------------------------------------------------------
     // SessionIo implementation (called only on the agent thread)
@@ -749,6 +762,14 @@ private:
     /// the previous single-session member for both agent-internal doWork and the
     /// Client-level redirect/dispatch paths.  Agent-thread only.
     Session&       seedSession()       noexcept { return *sessions_.front(); }
+    /// The session whose broker-assigned id is `sid` (0 = none yet), or null.  Short
+    /// linear scan (N <= cluster size), agent thread only.
+    Session* sessionById_(int64_t sid) noexcept {
+        if (sid == 0) return nullptr;
+        for (auto& s : sessions_)
+            if (s->machine.sessionId() == sid) return s.get();
+        return nullptr;
+    }
     const Session& seedSession() const noexcept { return *sessions_.front(); }
 
     // ---- Task 1.4: partition routing table (agent-owned plain data) ----------
