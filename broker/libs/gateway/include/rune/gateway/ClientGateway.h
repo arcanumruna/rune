@@ -1177,7 +1177,19 @@ private:
     void returnProduceCredits_(Session& s, int32_t worker, int64_t n) noexcept;
     /// D8c fix round 1: may `s` forward one more produce to `worker` (the
     /// per-worker routed cap + its congested-band fairness rule)?
-    [[nodiscard]] bool workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept;
+    enum class WorkerAdmit : uint8_t { Admit, Band, Full };
+    [[nodiscard]] WorkerAdmit workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept;
+    /// D8c fix round 2 (re-review MEDIUM-R1): the worker's routed share is FULL
+    /// and a frame was deferred — advance its cap-full episode; may expire the
+    /// held session with the largest share on that worker (see the .cpp).
+    void onWorkerCapFull_(int32_t worker);
+    /// Leaving a cap-full episode: the worker's routed share dropped below the
+    /// congested band (congestion resolved).  Credits inside the band keep the
+    /// episode (and the reader marks made in it).
+    void noteWorkerShareFreed_(int32_t worker) noexcept {
+        if (routedInFlight_[static_cast<std::size_t>(worker)] < workerRoutedCap_ - workerRoutedCap_ / 4)
+            capEpisode_[static_cast<std::size_t>(worker)] = CapEpisode{};
+    }
     /// Validate + dispatch one reassembled client frame (onFragment's body).
     /// false = the frame was NOT consumed (a produce deferred by the per-worker
     /// cap): the shard-mode controlled poll ABORTs it and redelivers it later.
@@ -1300,6 +1312,22 @@ private:
     std::array<uint32_t, kMaxHeldMaskWorkers>    routedInFlight_{};
     uint32_t                                     workerRoutedCap_ = kWorkerRoutedCap;
     uint64_t                                     workerCapProduceAborts_ = 0;  // produces deferred by the per-worker cap
+    // D8c fix round 2: per-worker cap-full episode (rich state: Idle = tag 0;
+    // Congested{tag, deferredPolls}).  An episode ends below the congested band
+    // or with its (single) expiry.
+    struct CapEpisode {
+        uint16_t tag = 0;            ///< 0 = Idle
+        uint32_t deferredPolls = 0;  ///< frames deferred by the FULL share in this episode
+    };
+    std::array<CapEpisode, kMaxHeldMaskWorkers>  capEpisode_{};
+    uint16_t                                     capEpisodeTags_ = 0;          // global, never 0 when issued
+    uint64_t                                     workerCapEvictions_ = 0;
+    int64_t                                      lastCapEvictedSid_ = 0;
+    /// Deferred polls of one cap-full episode before an expiry is considered:
+    /// a READING session's claims return a Credit within a worker pass + one
+    /// ret_ hop, i.e. many times over in 64 gateway duty cycles; a reader that
+    /// credits in the episode is never expired.
+    static constexpr uint32_t kCapEvictAfterDeferredPolls = 64;
 
     SessionTable                         sessions_;
 
@@ -1639,6 +1667,8 @@ public:
     [[nodiscard]] uint32_t routedInFlightForTest(int32_t worker) const noexcept { return routedInFlight_[worker]; }
     [[nodiscard]] uint64_t workerCapProduceAbortsForTest() const noexcept { return workerCapProduceAborts_; }
     void setWorkerRoutedCapForTest(uint32_t cap) noexcept { workerRoutedCap_ = cap; }
+    [[nodiscard]] uint64_t workerCapEvictionsForTest() const noexcept { return workerCapEvictions_; }
+    [[nodiscard]] int64_t lastCapEvictedSessionForTest() const noexcept { return lastCapEvictedSid_; }
     [[nodiscard]] int64_t produceInFlightForTest(int64_t sid) noexcept {
         const Session* s = sessions_.find(sid);
         return s ? static_cast<int64_t>(s->produceInFlight) : -1;

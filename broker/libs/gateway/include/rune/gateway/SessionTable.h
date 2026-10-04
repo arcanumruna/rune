@@ -55,7 +55,12 @@ struct Session {
     // forwarded to (Credit signals name their worker) — kept so a close returns
     // the session's share of every worker's routed cap.  Cold (close / credit).
     static constexpr int                           kMaxWorkers = 64;   // == ClientGateway::kMaxHeldMaskWorkers
-    std::array<uint32_t, kMaxWorkers>              produceInFlightOn{};
+    std::array<uint16_t, kMaxWorkers>              produceInFlightOn{};   // <= the per-session budget (4096)
+    // D8c fix round 2: tag of the worker's cap-full episode during which this
+    // session last returned a Credit from that worker (a reader — never evicted
+    // in that episode).  uint16 tags wrap after 65536 episodes (harmless: at
+    // worst one reading session is considered for eviction once more).
+    std::array<uint16_t, kMaxWorkers>              creditTagOn{};
 };
 
 // ---------------------------------------------------------------------------

@@ -30,8 +30,12 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <algorithm>
 #include <set>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 using namespace rune::node;
 using rune::replication::NodeId;
@@ -85,6 +89,16 @@ std::vector<uint8_t> produceFrame(int64_t sid, int64_t corr, uint8_t acks) {
     std::vector<uint8_t> f(m.encodedSize());
     m.encode(f.data());
     return f;
+}
+// A free loopback UDP port (bind to 0, read it back, release it).
+int freeUdpPort() {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
+    socklen_t n = sizeof a;
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &n);
+    ::close(fd);
+    return ntohs(a.sin_port);
 }
 rune::node::WorkerReturn creditSignal(int64_t sid, int64_t n) {
     rune::node::WorkerReturn r;
@@ -162,8 +176,8 @@ struct Rig {
     }
     Worker& w() { return pool.worker(0); }
     std::vector<std::shared_ptr<aeron::Subscription>> extra;   // stalled clients' ack subscriptions (never polled)
-    void subscribe(int32_t stream) {
-        const int64_t reg = client->addSubscription("aeron:ipc", stream);
+    void subscribe(int32_t stream, const std::string& channel = "aeron:ipc") {
+        const int64_t reg = client->addSubscription(channel, stream);
         std::shared_ptr<aeron::Subscription> sub;
         for (int i = 0; i < kCap && !sub; ++i) { pump(); sub = client->findSubscription(reg); }
         ASSERT_TRUE(sub);
@@ -171,10 +185,10 @@ struct Rig {
     }
     void pump() { if (drv) { drv->doWork(); client->conductorAgentInvoker().invoke(); } }
     // A gateway session the worker knows (announce-before-accept, as the gateway's announcer does).
-    int64_t session(int32_t egressStream) {
+    int64_t session(int32_t egressStream, const std::string& ackChannel = kAckChannel) {
         const int64_t sid = gw.injectTestSession(now);
         WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.sessionId = sid;
-        a.egressStreamId = egressStream; a.egressChannel = kAckChannel;
+        a.egressStreamId = egressStream; a.egressChannel = ackChannel;
         EXPECT_TRUE(w().tryEnqueueOp(std::move(a)));
         for (int i = 0; i < 8; ++i) runWorker();
         return sid;
@@ -472,5 +486,133 @@ TEST(GatewayProduceCreditRegression, OnlyLeavingThePauseRefreshesTheLeaseAndBudg
     r.gw.handleWorkerReturnForTest(creditSignal(a, 1));                   // leaves the pause: refresh
     EXPECT_EQ(r.gw.creditBlockedSessionsForTest(), 0u);
     EXPECT_EQ(r.gw.sessionLastSeenNsForTest(a), 9'000);
+    EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
+}
+
+// D8c fix round 2 (re-review MEDIUM-R1): enough stalled sessions to fill a worker's WHOLE routed share — 12 at the
+// full budget below the congested band + 64 "light" ones that stall with 64 unclaimed inside it (80 in all; one
+// process can open them).  The share must
+// not stay full: once it blocks a frame, the gateway expires the HELD session with the largest share on that worker
+// (SessionExpired, the client reconnects), and a new session is served.  (Was: every gateway-routed produce to the
+// worker waited for the stalled sessions' 10-minute reap.)
+TEST(GatewayProduceCreditRegression, FullWorkerShareExpiresTheHeldLargestShareSessionAndServesANewOneRegression) {
+    Rig r(/*withAcks=*/true);
+    ASSERT_TRUE(r.egB);
+    constexpr int kStalled = 80;                                     // 12 heavy (1024 held) + 64 light (64 held) + spare
+    const std::size_t perSession = rune::gateway::ClientGateway::kDefaultSessionProduceCredits + 256;
+    std::vector<int64_t> sids;
+    std::vector<std::vector<std::vector<uint8_t>>> bursts(kStalled);
+    std::vector<std::size_t> consumed(kStalled, 0);
+    // The stalled clients' ack publications never connect (nobody listens at their egress endpoint — a dead or
+    // unreachable client): no ack is ever claimed, so a "light" one holds all of its 64 inside the congested band.
+    // (A client that merely stops reading still lets its publication window — >= term/2 = 32 KiB, ~340 acks —
+    // take its band share, so it cannot stall there; an unreachable one can.)
+    const std::string ackCh = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort()) + "|term-length=65536";
+    for (int k = 0; k < kStalled; ++k) {
+        sids.push_back(r.session(7600 + k, ackCh));
+        for (std::size_t i = 0; i < perSession; ++i)
+            bursts[k].push_back(produceFrame(sids[k], (k + 1) * 10'000'000LL + static_cast<int64_t>(i), 0));
+    }
+    int idle = 0;
+    for (int i = 0; i < 8'000 && idle < 64; ++i) {
+        std::size_t n = 0;
+        for (int k = 0; k < kStalled; ++k) {
+            if (r.gw.produceInFlightForTest(sids[k]) < 0) continue;  // expired
+            const std::size_t c = r.gw.controlledPollFramesForTest(bursts[k], consumed[k]);
+            consumed[k] += c;
+            n += c;
+        }
+        r.runWorker();
+        idle = n == 0 ? idle + 1 : 0;
+    }
+    ASSERT_GT(r.gw.workerCapProduceAbortsForTest(), 0u);
+    // Precondition (what the review found): the stalled sessions alone fill the worker's routed share.
+    const uint64_t evictionsWhileFilling = r.gw.workerCapEvictionsForTest();
+    ASSERT_TRUE(r.gw.routedInFlightForTest(0) == rune::node::Worker::kRoutedAckBudget || evictionsWhileFilling > 0)
+        << "the stalled sessions fill the share (" << r.gw.routedInFlightForTest(0) << ")";
+
+    if (evictionsWhileFilling == 1) {                                // the full share already expired one
+        const int64_t first = r.gw.lastCapEvictedSessionForTest();
+        EXPECT_NE(std::find(sids.begin(), sids.begin() + 12, first), sids.begin() + 12)
+            << "the first expiry hits a held session with the largest share (a full-budget one)";
+    }
+    // The largest-share held session before B arrives.
+    int64_t heaviest = 0, heaviestShare = -1;
+    for (int64_t sid : sids) {
+        const int64_t f = r.gw.produceInFlightForTest(sid);
+        if (f > heaviestShare) { heaviestShare = f; heaviest = sid; }
+    }
+    const int64_t b = r.session(kEgressB);
+    std::vector<std::vector<uint8_t>> fb{produceFrame(b, 7, 0)};
+    std::size_t sent = 0;
+    for (int i = 0; i < 4'000 && !r.acks.count(7); ++i) {
+        if (sent == 0) sent = r.gw.controlledPollFramesForTest(fb);
+        for (int k = 0; k < kStalled; ++k)                           // the stalled clients keep offering
+            if (r.gw.produceInFlightForTest(sids[k]) >= 0)
+                consumed[k] += r.gw.controlledPollFramesForTest(bursts[k], consumed[k]);
+        r.runWorker();
+    }
+    EXPECT_EQ(r.acks.count(7), 1u) << "a new session's gateway-routed produce is served (not deferred for 10 min)";
+    EXPECT_GT(r.gw.workerCapEvictionsForTest(), 0u) << "a held session was expired";
+    if (evictionsWhileFilling == 0)
+        EXPECT_EQ(r.gw.lastCapEvictedSessionForTest(), heaviest) << "the held session with the largest share";
+    EXPECT_EQ(r.gw.produceInFlightForTest(r.gw.lastCapEvictedSessionForTest()), -1) << "it was closed";
+    EXPECT_GE(r.gw.produceInFlightForTest(b), 0) << "the reader B is never expired";
+    EXPECT_EQ(r.w().ackRoomOpPausesForTest(), 0u);
+    EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
+}
+
+// D8c fix round 2: the expiry never hits a session that is not Held by that worker (a busy reader), takes at most one
+// session per cap-full episode, and waits kCapEvictAfterDeferredPolls deferred polls; a session that returned a Credit
+// during the episode is skipped.
+TEST(GatewayProduceCreditRegression, CapExpiryOnlyHitsAHeldSessionOncePerEpisodeRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(400);                                  // band [300, 400)
+    const int64_t h = r.gw.injectTestSession(r.now), l1 = r.gw.injectTestSession(r.now),
+                  l2 = r.gw.injectTestSession(r.now), n = r.gw.injectTestSession(r.now);
+    auto frames = [](int64_t sid, int k) {
+        std::vector<std::vector<uint8_t>> f;
+        for (int i = 0; i < k; ++i) f.push_back(produceFrame(sid, i, 0));
+        return f;
+    };
+    const auto fh = frames(h, 300), f1 = frames(l1, 64), f2 = frames(l2, 36), fn = frames(n, 4);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 300u);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(f1), 64u);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(f2), 36u);
+    ASSERT_EQ(r.gw.routedInFlightForTest(0), 400u);
+    constexpr uint32_t N = 64;                                            // kCapEvictAfterDeferredPolls
+    for (uint32_t i = 0; i < 3 * N; ++i) EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);
+    EXPECT_EQ(r.gw.workerCapEvictionsForTest(), 0u) << "nobody is Held: a full share of readers is never evicted";
+    auto held = [&](int64_t sid) {
+        rune::node::WorkerReturn s;
+        s.type = rune::node::WorkerReturn::Type::SessionSignal; s.sessionId = sid; s.partition = 0;
+        s.lastOffset = static_cast<int64_t>(SessionSignalKind::Held);
+        r.gw.handleWorkerReturnForTest(s);
+    };
+    held(l1); held(l2);                                                   // h (the largest share) is not held
+    for (uint32_t i = 0; i + 1 < N; ++i) ASSERT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);
+    EXPECT_EQ(r.gw.workerCapEvictionsForTest(), 0u) << "waits kCapEvictAfterDeferredPolls deferred polls";
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);
+    EXPECT_EQ(r.gw.workerCapEvictionsForTest(), 1u);
+    EXPECT_EQ(r.gw.lastCapEvictedSessionForTest(), l1) << "the HELD session with the largest share (64 > 36), not h";
+    EXPECT_EQ(r.gw.routedInFlightForTest(0), 336u) << "its share is freed";
+    EXPECT_EQ(r.gw.produceInFlightForTest(h), 300) << "the unheld heavy session is untouched";
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 4u) << "the new session is served";
+    // A new episode (refill to the cap).  n becomes Held and its share is the largest, but it returns a Credit
+    // during the episode (inside the band: the episode goes on) — a slow reader — so the held l2 is expired instead.
+    const int64_t m = r.gw.injectTestSession(r.now);
+    const auto f3 = frames(n, 64);
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(f3), 60u) << "n: 4 -> 64 in flight, share 400";
+    ASSERT_EQ(r.gw.routedInFlightForTest(0), 400u);                       // its 61st frame was deferred: episode 2
+    held(n);
+    r.gw.handleWorkerReturnForTest(creditSignal(n, 1));                   // 399, still in the band
+    const auto fm = frames(m, 1);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fm), 1u);                  // back to 400
+    const auto one = frames(h, 1);
+    for (uint32_t i = 0; i < N && r.gw.workerCapEvictionsForTest() < 2; ++i)
+        EXPECT_EQ(r.gw.controlledPollFramesForTest(one), 0u);
+    EXPECT_EQ(r.gw.workerCapEvictionsForTest(), 2u) << "one more expiry in the new episode";
+    EXPECT_EQ(r.gw.lastCapEvictedSessionForTest(), l2) << "n credited in this episode: skipped although larger";
+    EXPECT_GE(r.gw.produceInFlightForTest(n), 0);
     EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
 }

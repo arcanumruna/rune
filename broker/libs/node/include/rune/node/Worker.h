@@ -226,9 +226,13 @@ public:
     //                       forward until the ack is CLAIMED: op ring + owed +
     //                       queued) — ClientGateway's per-worker cap.
     // So stalled gateway sessions, however many, can never take the reserve:
-    // A + O <= kRoutedAckBudget + (owed <= kMaxOwedReturnsCeiling) + held
-    // direct acks, i.e. ackRoom_() >= one drain + one poll while no DIRECT
-    // client holds acks.
+    // once the worker has applied every SessionClose the runtime sent (a close
+    // frees the session's cap share at once, its queued acks drop at this
+    // worker's next flush — re-review LOW-R1), A + O <= kRoutedAckBudget +
+    // (owed <= kMaxOwedReturnsCeiling) + held direct acks, i.e. ackRoom_() >=
+    // one drain + one poll while no DIRECT client holds acks.  In the window
+    // before that, ackRoom_ (the one physical throttle) still bounds every
+    // drain — at worst one op-drain pass finds no room.
     static constexpr std::size_t kAckReserve =
         kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
         static_cast<std::size_t>(kMaxFragmentLimit);

@@ -473,6 +473,10 @@ int ClientGateway::doWork(int64_t nowNs) {
         // credits — its aborted Produce then holds back that session's produces
         // to healthy partitions, its Metadata and its Keepalives too, until
         // those acks are answered and claimed.
+        // The same head-of-line holds for a frame deferred by a full worker's
+        // routed share (re-review LOW-R4): it holds back the session's frames
+        // to other workers too; each redelivery refreshes its lease (only a
+        // live sender's image redelivers).
         // Task 13 fix round 2 (finding 1, G-A6 on the gateway-routed path): a
         // Produce frame of a session some worker holds acks for is ABORTed — it
         // stays on ITS image (one client publication) and the poll moves on to
@@ -985,8 +989,11 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
     if (s->heldByWorkers != 0) --heldSessions_;
     if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
-    for (int w = 0; w < Session::kMaxWorkers; ++w)                                 // ... and its share of each worker's cap
+    for (int w = 0; w < Session::kMaxWorkers; ++w) {                               // ... and its share of each worker's cap
+        if (s->produceInFlightOn[static_cast<std::size_t>(w)] == 0) continue;
         routedInFlight_[static_cast<std::size_t>(w)] -= s->produceInFlightOn[static_cast<std::size_t>(w)];
+        noteWorkerShareFreed_(w);
+    }
     sessions_.remove(sid);                    // releases its egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
@@ -1054,14 +1061,69 @@ void ClientGateway::takeProduceCredit_(Session& s, int32_t worker) noexcept
     if (++s.produceInFlight == sessionProduceCredits_) ++creditBlockedSessions_;
 }
 
-bool ClientGateway::workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept
+ClientGateway::WorkerAdmit ClientGateway::workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept
 {
     const auto w = static_cast<std::size_t>(worker);
     const uint32_t used = routedInFlight_[w];
-    if (used >= workerRoutedCap_) return false;                     // hard: the worker's routed share is full
+    if (used >= workerRoutedCap_) return WorkerAdmit::Full;          // hard: the worker's routed share is full
     // Congested band (the cap's last quarter): only light sessions — a stalled
     // session (at its whole budget) is the one that runs out first.
-    return used < workerRoutedCap_ - workerRoutedCap_ / 4 || s.produceInFlightOn[w] < kLightSessionInFlight;
+    if (used < workerRoutedCap_ - workerRoutedCap_ / 4 || s.produceInFlightOn[w] < kLightSessionInFlight)
+        return WorkerAdmit::Admit;
+    return WorkerAdmit::Band;
+}
+
+// D8c fix round 2 (re-review MEDIUM-R1).  Stalled sessions can still fill one
+// worker's routed share (about 12 at the full budget + 64 "light" ones that
+// stall at 63): every gateway-routed produce to it would then wait for their
+// reap (maxHeldIdleNs_, 10 min).  So when the hard cap defers a frame, the
+// gateway EXPIRES the session that is HELD by that worker (its acks are queued
+// and its publication refuses them — it is not reading) with the largest
+// share on that worker: closeSession_ + SessionExpired (the client
+// reconnects; its unacked produces are resent — idempotent producers dedupe),
+// which frees that share at once.
+//   * Never a session that is not Held by that worker: a busy reader whose
+//     acks drain is never evicted.
+//   * Never a session that returned a Credit from that worker during this
+//     episode (it is reading, just slowly), and only after
+//     kCapEvictAfterDeferredPolls deferred polls in the episode, so such a
+//     reader has had its chance to show it.
+//   * No cascade / thrash: at most ONE expiry per episode.  An episode starts
+//     when the share is full and a frame is deferred; it ends with its expiry,
+//     or when the share drops below the congested band (noteWorkerShareFreed_
+//     — credits inside the band keep it, so reader marks made in it persist).
+//     So every further expiry needs the share refilled to the cap by new
+//     forwards and 64 more deferred polls of a NEW episode: expiries are paced
+//     by fresh demand, each frees a whole stalled share, and K stalled
+//     sessions need at most K.
+//   * Event-driven (deferred polls, credits, closes), no timer.
+// The scan over sessions is cold: at most once per kCapEvictAfterDeferredPolls
+// deferred polls of a full worker.
+void ClientGateway::onWorkerCapFull_(int32_t worker)
+{
+    CapEpisode& ep = capEpisode_[static_cast<std::size_t>(worker)];
+    if (ep.tag == 0) {                                            // a new episode
+        if (++capEpisodeTags_ == 0) ++capEpisodeTags_;            // tags are never 0
+        ep = CapEpisode{capEpisodeTags_, 0};
+    }
+    if (++ep.deferredPolls % kCapEvictAfterDeferredPolls != 0) return;
+    const auto w = static_cast<std::size_t>(worker);
+    const uint64_t bit = uint64_t{1} << worker;
+    int64_t victim = 0;
+    uint16_t share = 0;
+    sessions_.forEach([&](const Session& s) {
+        if ((s.heldByWorkers & bit) == 0) return;                 // not held by this worker: a reader
+        if (s.creditTagOn[w] == ep.tag) return;                   // credited in this episode: a (slow) reader
+        if (s.produceInFlightOn[w] > share) { share = s.produceInFlightOn[w]; victim = s.sessionId; }
+    });
+    if (victim == 0) return;                                      // no held session to blame: keep deferring
+    ep = CapEpisode{};                                            // the episode ends with its one expiry
+    ++workerCapEvictions_;
+    lastCapEvictedSid_ = victim;
+    spdlog::warn("ClientGateway: worker {}'s gateway-routed share is full ({}); expiring held session {} "
+                 "(largest share, {} unclaimed acks) — the client reconnects (evictions={})",
+                 worker, routedInFlight_[w], victim, share, workerCapEvictions_);
+    (void)closeSession_(victim, /*notifyExpired=*/true);         // frees its share (noteWorkerShareFreed_)
 }
 
 void ClientGateway::returnProduceCredits_(Session& s, int32_t worker, int64_t n) noexcept
@@ -1081,9 +1143,11 @@ void ClientGateway::returnProduceCredits_(Session& s, int32_t worker, int64_t n)
     } else {
         take = static_cast<uint32_t>(n);
     }
-    s.produceInFlightOn[w] -= take;
+    s.produceInFlightOn[w] = static_cast<uint16_t>(s.produceInFlightOn[w] - take);
     routedInFlight_[w]     -= take;
     s.produceInFlight      -= take;
+    if (const uint16_t tag = capEpisode_[w].tag; tag != 0) s.creditTagOn[w] = tag;   // a reader in this episode
+    noteWorkerShareFreed_(worker);
     if (wasBlocked && s.produceInFlight < sessionProduceCredits_) {
         --creditBlockedSessions_;
         // The session's image was stalled at a Produce frame while it had no
@@ -1939,9 +2003,11 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     if (shardMode_ && workerPool_ && routesToWorker_(msg.topicId)) {
         routedWorker = workerPool_->ownerWorkerId(msg.topicId, partition);   // router arithmetic
         assert(routedWorker >= 0 && routedWorker < kMaxHeldMaskWorkers);
-        if (!workerAdmitsProduce_(routedWorker, *session)) [[unlikely]] {
+        if (const WorkerAdmit a = workerAdmitsProduce_(routedWorker, *session); a != WorkerAdmit::Admit) [[unlikely]] {
             ++heldProduceAborts_;
             ++workerCapProduceAborts_;
+            // May expire a held session — possibly this one: `session` is not used after this.
+            if (a == WorkerAdmit::Full) onWorkerCapFull_(routedWorker);
             return false;
         }
     }
