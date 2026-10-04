@@ -2410,3 +2410,23 @@ TEST(NodeConfig, IoWorkerCoresEnvParsesACpuList) {
     env["RUNE_IOWQ_CORES"] = "zero";
     EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
 }
+
+namespace rune::node {
+// Re-review 2026-10-04 MEDIUM-B: the operator override for the consensus
+// candidacy (metadata-ISR) gate is default OFF and parsed from
+// RUNE_UNCLEAN_CONSENSUS_ELECTION.
+TEST(NodeConfigRegression, UncleanConsensusElection_DefaultOffEnvOptIn) {
+    auto r = parseNodeConfig(fakeEnv(base3node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_FALSE(r.config->uncleanConsensusElection) << "the unclean consensus election must be opt-in";
+    auto env = base3node();
+    env["RUNE_UNCLEAN_CONSENSUS_ELECTION"] = "1";
+    auto on = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(on.error.empty()) << on.error;
+    EXPECT_TRUE(on.config->uncleanConsensusElection);
+    env["RUNE_UNCLEAN_CONSENSUS_ELECTION"] = "0";
+    auto off = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(off.error.empty()) << off.error;
+    EXPECT_FALSE(off.config->uncleanConsensusElection);
+}
+} // namespace rune::node

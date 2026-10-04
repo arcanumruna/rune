@@ -833,7 +833,7 @@ TEST(InternalIsrRegression, InternalLagShrinkCommitsOnMajorityKnowledge_StuckMem
         std::vector<NodeId> all = {kL, kF, kG};
         auto cfgFor = [&](NodeId id) {
             PartitionConfig c = makeConfig(id, /*lagMs=*/10, /*lagOff=*/1'000'000);
-            if (internal) c.topicId = -1;
+            if (internal) c.topicId = -3;            // __cluster_metadata (the knowledge store's partition)
             return c;
         };
         InternalIsrKnowledge kl, kf, kg;
@@ -4542,11 +4542,15 @@ TEST(InternalIsrRegression, KnowledgeIsDurableAndMonotonic) {
     EXPECT_EQ(k2.latest(-3, 0)->version, 2);
     EXPECT_FALSE(k2.eligible(3)) << "the candidacy rule did not survive a restart";
     EXPECT_TRUE(k2.eligible(1));
+    // Re-review MEDIUM-B: only __cluster_metadata decides candidacy (the
+    // coordinator partitions moved to the controller-ISR path) — a state of any
+    // other internal partition (e.g. from an older file) is ignored by the rule.
     InternalIsrState other{};
     other.topicId = -1; other.partition = 0; other.leaderEpoch = 4; other.version = 1;
     other.count = 2; other.members[0] = 1; other.members[1] = 3;
     ASSERT_TRUE(k2.offer(other));
-    EXPECT_FALSE(k2.eligible(2)) << "must be a member of EVERY internal partition's ISR";
+    EXPECT_TRUE(k2.eligible(2)) << "a non-metadata internal ISR decided consensus candidacy";
+    EXPECT_FALSE(k2.eligible(3));
     EXPECT_TRUE(k2.eligible(1));
 }
 
@@ -4707,4 +4711,36 @@ TEST(InternalIsrRegression, DirectoryFsyncFailureIsNotAcked) {
     std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
     EXPECT_FALSE(ok) << "acked a state whose directory entry was never fsynced";
     EXPECT_EQ(k.latest(-3, 0), nullptr);
+}
+
+// Re-review 2026-10-04 (fix round 2) MEDIUM-B: "no node in every internal ISR".
+// RF=3; A (2) was lag-shrunk from __consumer_offsets (ISR {L,B}) and B (3) from
+// __cluster_metadata (ISR {L,A}); then L (1) dies.  Before: candidacy ANDed every
+// internal ISR, so nobody was electable — no controller, no user-partition
+// failover, no AlterIsr: one offsets partition took the whole control plane
+// down.  After: only __cluster_metadata decides (A is elected); the offsets
+// partition follows the user-partition rules on the controller path
+// (CoordinatorPartitionRegression.* in rune_static_assignment_emit_tests).
+TEST(InternalIsrRegression, NoNodeInEveryInternalIsr_ConsensusStillElects_OnlyMetadataDecides) {
+    constexpr NodeId kL = 1, kA = 2, kB = 3;
+    auto state = [](int32_t topic, std::initializer_list<int32_t> m) {
+        InternalIsrState s{};
+        s.topicId = topic; s.partition = 0; s.leaderEpoch = 7; s.version = 3;
+        for (int32_t n : m) s.members[static_cast<std::size_t>(s.count++)] = n;
+        return s;
+    };
+    InternalIsrKnowledge ka, kb;                  // the two survivors (voters)
+    for (InternalIsrKnowledge* k : {&ka, &kb}) {
+        ASSERT_TRUE(k->offer(state(-3, {kL, kA})));   // metadata: B shrunk
+        ASSERT_TRUE(k->offer(state(-1, {kL, kB})));   // offsets:  A shrunk
+    }
+    // Aeron vote: a candidate votes for itself; it needs one more grant of 2 live.
+    auto elected = [&](NodeId cand) {
+        const InternalIsrKnowledge& otherVoter = (cand == kA) ? kb : ka;
+        return 1 + (otherVoter.eligible(cand) ? 1 : 0) >= 2;
+    };
+    EXPECT_TRUE(elected(kA) || elected(kB))
+        << "no consensus leader although 2 of 3 are up (one offsets ISR took the control plane down)";
+    EXPECT_TRUE(elected(kA)) << "A is in the newest __cluster_metadata ISR";
+    EXPECT_FALSE(elected(kB)) << "B lacks committed metadata records: never electable";
 }

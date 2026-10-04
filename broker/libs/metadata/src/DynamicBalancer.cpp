@@ -85,6 +85,10 @@ void ReverseIndex::rebuild(const AssignmentMap& m)
                      const PartitionAssignment& pa)
     {
         if (pa.leaderNode == NO_LEADER) return;
+        // Internal (coordinator) partitions are assigned by the controller too
+        // (re-review MEDIUM-B) but have no gpid (gpidOf requires topicId >= 0)
+        // and never count toward user-partition leader balance.
+        if (topicId < 0) return;
         setBit(pa.leaderNode, gpidOf(topicId, partition));
     });
 }

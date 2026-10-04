@@ -476,7 +476,14 @@ private:
             if (gateway_ && routingVersion != routingVersionBuilt_) {
                 routingVersionBuilt_ = routingVersion;
                 const auto& cmap = metadataService_->committedMap();
-                if (!cmap.empty()) {
+                // Coordinator partitions (re-review MEDIUM-B) are in the map
+                // too: "committed metadata ready" means a USER assignment.
+                // Cold (routing-version change only).
+                bool anyUser = false;
+                cmap.forEach([&](int32_t tid, int32_t, const rune::metadata::PartitionAssignment&) {
+                    anyUser = anyUser || tid >= 0;
+                });
+                if (anyUser) {
                     // Steady state: use the committed assignment map.
                     auto img = rune::metadata::RoutingImage::buildFromMap(
                         cmap, rune::metadata::gpidOf);

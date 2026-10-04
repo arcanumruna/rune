@@ -51,9 +51,11 @@ const InternalIsrState* InternalIsrKnowledge::latest(int32_t topicId, int32_t pa
 bool InternalIsrKnowledge::eligible(int32_t candidate) const noexcept
 {
     if (!votable_) return false;   // LOW-A: unprovable knowledge — refuse to vote
-    for (const auto& e : entries_)
-        if (!e.contains(candidate)) return false;
-    return true;
+    // MEDIUM-B: only __cluster_metadata decides candidacy (the coordinator
+    // partitions are on the controller-ISR path; any other entry — e.g. from an
+    // older file — is ignored by the rule).
+    const InternalIsrState* m = latest(kCandidacyTopicId, 0);
+    return m == nullptr || m->contains(candidate);
 }
 
 bool InternalIsrKnowledge::offer(const InternalIsrState& s)
@@ -73,12 +75,12 @@ bool InternalIsrKnowledge::offer(const InternalIsrState& s)
         if (!s.newerThan(e.leaderEpoch, e.version)) return true;   // holds s or newer
         const InternalIsrState prev = e;
         e = s;
-        if (persist_()) { votable_ = true; return true; }
+        if (persist_()) { if (s.topicId == kCandidacyTopicId) votable_ = true; return true; }
         e = prev;                                                    // never claim an unpersisted state
         return false;
     }
     entries_.push_back(s);
-    if (persist_()) { votable_ = true; return true; }
+    if (persist_()) { if (s.topicId == kCandidacyTopicId) votable_ = true; return true; }
     entries_.pop_back();
     return false;
 }

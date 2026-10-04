@@ -549,7 +549,7 @@ TEST(DrIntegration, PowerLoss_AcrossSegmentRolls_SealedSegmentsSurvive) {
 // nothing is truncated, and node 3 is re-admitted once caught up.
 TEST(DrIntegrationRegression, E1b_InternalFencedMemberNotElectableBeforeCatchUp_NoAckedLoss) {
     DrConfig cfg;
-    cfg.topicId = -1;                            // __consumer_offsets-like internal partition
+    cfg.topicId = -3;                            // internal partition on the internal-ISR store (__cluster_metadata-like; MEDIUM-B)
     DrCluster c(3, cfg);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
@@ -714,7 +714,7 @@ TEST(DrIntegrationRegression, InternalDeadMemberFencedThenReadmitted_NoFreezeNoL
 // truncates the uncommitted tail on the follower (KIP-279) and loses nothing.
 TEST(DrIntegrationRegression, Critical2_InternalLeaderFailover_UncommittedTailOnSurvivor_WritableNoLoss) {
     DrConfig cfg;
-    cfg.topicId = -1;
+    cfg.topicId = -3;   // the internal-ISR store partition (MEDIUM-B: offsets moved to the controller path)
     DrCluster c(3, cfg);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
@@ -740,7 +740,7 @@ TEST(DrIntegrationRegression, Critical2_InternalLeaderFailover_UncommittedTailOn
 // waited for it), is writable at once and nothing acked is lost.
 TEST(DrIntegrationRegression, Critical2_InternalPartition_WholeClusterKill9_LaggingConsensusLeader_NoLoss) {
     DrConfig cfg;
-    cfg.topicId = -1;
+    cfg.topicId = -3;   // the internal-ISR store partition (MEDIUM-B: offsets moved to the controller path)
     DrCluster c(3, cfg);
     c.start();
     ASSERT_EQ(c.produceAcked(10), 10);
@@ -1205,7 +1205,7 @@ TEST(DrIntegrationRegression, ReadmittedMemberCaughtUpBeforeItCounts) {
 // uncommitted ones are truncated (never acked), and every replica converges.
 TEST(DrIntegrationRegression, Critical2_InternalPartition_ConsensusFailoverUnderCommitLoad_NoLoss) {
     DrConfig cfg;
-    cfg.topicId = -1;
+    cfg.topicId = -3;   // the internal-ISR store partition (MEDIUM-B: offsets moved to the controller path)
     DrCluster c(3, cfg);
     c.start();
     ASSERT_TRUE(c.waitWritable(kCap));

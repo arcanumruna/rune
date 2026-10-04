@@ -833,3 +833,153 @@ TEST(AlterIsrControllerRegression, ControllerNeverAddsAFencedReplica) {
     pa = svc1.assignment(0, 0);
     EXPECT_EQ(std::find(pa->isr.begin(), pa->isr.end(), dead), pa->isr.end());
 }
+
+
+// ===========================================================================
+// Re-review 2026-10-04 (fix round 2) MEDIUM-B: the coordinator partitions
+// (__consumer_offsets -1, __transaction_state -2) moved from the internal-ISR /
+// consensus-candidacy path to the controller-ISR (user-partition) path: the
+// controller commits their ISR (AlterIsr) and elects their leader from it, so
+// one of their ISRs can no longer take the whole control plane down.  The
+// coordinator lives on the consensus leader, so the controller prefers itself
+// — but only when it is in the committed ISR (clean); otherwise a live ISR
+// member leads (the controller catches up from it, is admitted by its AlterIsr,
+// then leadership moves to the controller) or the partition is offline.
+// ===========================================================================
+namespace {
+rune::metadata::PartitionAssignment coordPa(int32_t leader, std::vector<int32_t> isr,
+                                            int32_t le = 5, int32_t pe = 9) {
+    rune::metadata::PartitionAssignment pa;
+    pa.leaderNode = leader; pa.isr = std::move(isr); pa.replicas = {1, 2, 3};
+    pa.leaderEpoch = le; pa.partitionEpoch = pe;
+    return pa;
+}
+} // namespace
+
+TEST(CoordinatorPartitionRegression, DecisionFollowsUserPartitionRules) {
+    using rune::metadata::NO_LEADER;
+    const std::vector<int32_t> replicas = {1, 2, 3};
+    auto decide = [&](int32_t self, const rune::metadata::PartitionAssignment* cur,
+                      std::vector<int32_t> eligible) {
+        return MetadataService::decideCoordinatorPartition(-1, 0, self, cur, eligible, nullptr,
+                                                           /*bootstrapEpoch=*/4, replicas);
+    };
+    {   // No assignment yet (fresh cluster): the controller leads, every replica seeds the ISR.
+        const auto d = decide(2, nullptr, {1, 2, 3});
+        ASSERT_TRUE(d.has_value());
+        EXPECT_EQ(d->leaderNode, 2);
+        EXPECT_EQ(d->isr.size(), 3u);
+        EXPECT_EQ(d->leaderEpoch, 4);
+    }
+    {   // Already the controller's: nothing to do.
+        const auto pa = coordPa(2, {2, 3});
+        EXPECT_FALSE(decide(2, &pa, {1, 2, 3}).has_value());
+    }
+    {   // MEDIUM-B scenario: L (1) dead, ISR {1,3}, controller A (2) NOT in it:
+        // elect the live ISR member B (3) — never the controller (it lacks
+        // committed offsets records).
+        const auto pa = coordPa(1, {1, 3});
+        const auto d = decide(2, &pa, {2, 3});
+        ASSERT_TRUE(d.has_value()) << "the partition was left on a dead leader";
+        EXPECT_EQ(d->leaderNode, 3) << "elected a node outside the committed ISR";
+        EXPECT_EQ(d->isr, (std::vector<int32_t>{3}));
+        EXPECT_EQ(d->leaderEpoch, 6);
+        EXPECT_EQ(d->partitionEpoch, 10);
+    }
+    {   // ... and B dead too: offline (NO_LEADER), the ISR lineage kept.
+        const auto pa = coordPa(1, {1, 3});
+        const auto d = decide(2, &pa, {2});
+        ASSERT_TRUE(d.has_value());
+        EXPECT_EQ(d->leaderNode, NO_LEADER) << "unclean election of the controller";
+        EXPECT_EQ(d->isr, (std::vector<int32_t>{1, 3}));
+        const auto again = coordPa(NO_LEADER, {1, 3}, 6, 10);
+        EXPECT_FALSE(decide(2, &again, {2}).has_value()) << "steady offline state must emit nothing";
+    }
+    {   // B leads, the controller A caught up and was admitted: move to A.
+        const auto pa = coordPa(3, {3, 2});
+        const auto d = decide(2, &pa, {2, 3});
+        ASSERT_TRUE(d.has_value());
+        EXPECT_EQ(d->leaderNode, 2);
+        EXPECT_EQ(d->leaderEpoch, 6);
+        EXPECT_EQ(d->isr.front(), 2);
+        EXPECT_EQ(d->isr.size(), 2u);
+    }
+    {   // B leads, A not yet admitted: leave it (A catches up from B first).
+        const auto pa = coordPa(3, {3});
+        EXPECT_FALSE(decide(2, &pa, {2, 3}).has_value());
+    }
+    {   // The controller is in the ISR and the old leader died: straight to the controller.
+        const auto pa = coordPa(1, {1, 2, 3});
+        const auto d = decide(2, &pa, {2, 3});
+        ASSERT_TRUE(d.has_value());
+        EXPECT_EQ(d->leaderNode, 2);
+    }
+}
+
+// The controller bootstraps the coordinator partitions' assignments, commits
+// their ISR changes (AlterIsr — internal topic ids no longer refused) and the
+// bridge drives their replicas from the committed map, NOT from consensus
+// leadership.
+TEST(CoordinatorPartitionRegression, ControllerCommitsCoordinatorIsrAndBridgeFollowsTheMap) {
+    SaeTempDir dir1("cp1"), dir2("cp2"), dir3("cp3"), dirO("cpo");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path), logO(dirO.path);
+    log1.recover(); log2.recover(); log3.recover(); logO.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    svc1.setCoordinatorPartitions({{-1, 0}, {-2, 0}}, {1, 2, 3});
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(50);
+    (void)svc1.runDynamicRebalanceOnTick({1, 2, 3}, nullptr);
+    drive(50);
+    const auto* pa = svc1.assignment(-1, 0);
+    ASSERT_NE(pa, nullptr) << "the controller never assigned __consumer_offsets";
+    ASSERT_NE(svc1.assignment(-2, 0), nullptr) << "the controller never assigned __transaction_state";
+    EXPECT_EQ(pa->leaderNode, kNode1);
+    EXPECT_EQ(pa->isr.size(), 3u);
+    // AlterIsr for the coordinator partition: committed by the controller.
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = -1; m.partition = 0; m.leaderId = kNode1; m.leaderEpoch = pa->leaderEpoch;
+    m.partitionEpoch = pa->partitionEpoch;
+    m.isrCount = 2; m.isr[0] = 1; m.isr[1] = 3;
+    EXPECT_TRUE(svc1.onAlterIsr(m)) << "the controller refused a coordinator-partition AlterIsr";
+    drive(50);
+    pa = svc1.assignment(-1, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->isr, (std::vector<int32_t>{1, 3}));
+    EXPECT_EQ(svc1.runDynamicRebalanceOnTick({1, 2, 3}, nullptr), 0u) << "steady state must emit nothing";
+    // Node 2's offsets replica, driven by node 2's bridge over the committed map.
+    ReplicaRegistry reg;
+    PartitionConfig ocfg = makeMetaCfg(kNode2);
+    ocfg.topicId = -1;
+    reg.add(-1, 0, std::make_unique<PartitionReplica>(ocfg, Role::Follower, 0, allNodes, allNodes, &logO, &transport));
+    ReplicationMetadataBridge bridge(kNode2, allNodes, reg, &svc1.msmForTest());
+    bridge.setCoordinatorPartitionsOnController(true);
+    (void)bridge.doWork(/*consensusLeader=*/kNode1, /*term=*/7);
+    PartitionReplica* off = reg.lookup(-1, 0);
+    ASSERT_NE(off, nullptr);
+    EXPECT_EQ(off->role(), Role::Follower);
+    EXPECT_EQ(off->epoch(), pa->leaderEpoch) << "the coordinator replica took the consensus term, not the map's epoch";
+    // Node 2 becomes the CONSENSUS leader while it is outside the committed
+    // offsets ISR {1,3}: it must NOT lead the offsets partition (it lacks
+    // committed records) — the map decides.
+    (void)bridge.doWork(/*consensusLeader=*/kNode2, /*term=*/8);
+    EXPECT_EQ(off->role(), Role::Follower)
+        << "the consensus leader led a coordinator partition outside its committed ISR";
+}

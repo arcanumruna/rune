@@ -1,8 +1,9 @@
 #pragma once
 // ---------------------------------------------------------------------------
 // InternalIsrKnowledge.h — a node's DURABLE knowledge of the ISRs of the
-// INTERNAL partitions (__cluster_metadata, __consumer_offsets,
-// __transaction_state, ...), and the consensus candidacy rule built on it.
+// INTERNAL partition __cluster_metadata, and the consensus candidacy rule
+// built on it.  (Re-review MEDIUM-B: __consumer_offsets / __transaction_state
+// moved to the controller-ISR path — their ISRs no longer gate the consensus.)
 //
 // Review 2026-10-04 MAJOR-2 / MAJOR-3.  Internal partitions are led by the
 // consensus leader, which the (Aeron) election picks without looking at the
@@ -14,9 +15,10 @@
 //     PERSISTS the newest state it sees (this class — tmp + fsync + rename)
 //     and then acks it.  The change COMMITS once a majority of the cluster
 //     persisted it; until then the leader's HW counts committed ∪ proposed.
-//   * A node votes for a consensus candidate — and stands itself — only if the
-//     candidate is a member of the newest ISR it persisted for EVERY internal
-//     partition (eligible()).
+//   * A node votes for a consensus candidate only if the candidate is a member
+//     of the newest __cluster_metadata ISR it persisted (eligible()).  Any node
+//     may stand (re-review MAJOR-A); a state older than the node's consensus
+//     term is never persisted or acked (MEDIUM-A).
 //
 // Safety: a committed change is on a majority; a winning candidate needs the
 // votes of a majority; the two majorities intersect, so some voter knows the
@@ -71,6 +73,10 @@ struct InternalIsrState {
 
 class InternalIsrKnowledge {
 public:
+    /// The ONE internal partition whose ISR decides consensus candidacy
+    /// (re-review MEDIUM-B): __cluster_metadata, partition 0.
+    static constexpr int32_t kCandidacyTopicId = -3;
+
     /// Memory only (unit rigs).
     InternalIsrKnowledge() = default;
     /// Durable: loads `path` if present.  An ABSENT file = no knowledge yet
@@ -101,7 +107,8 @@ public:
     [[nodiscard]] const InternalIsrState* latest(int32_t topicId, int32_t partition) const noexcept;
 
     /// The consensus candidacy rule: `candidate` is a member of the newest
-    /// known ISR of every internal partition (true when nothing is known).
+    /// known ISR of __cluster_metadata (true when nothing is known; false for
+    /// everyone while the knowledge is unprovable — LOW-A).
     [[nodiscard]] bool eligible(int32_t candidate) const noexcept;
 
     /// Election vote-gate thunk (rune::consensus::Election::setVoteGate).

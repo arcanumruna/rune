@@ -9,6 +9,7 @@
 // Constructed in BrokerNode::start() after TopicRegistry (so Log* are valid).
 
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/replication/Types.h>
 
 #include <algorithm>
@@ -35,8 +36,9 @@ public:
     /// (monotonic per node, bumped on every start — BrokerNode), stamped on
     /// every replica added from now on.  Set before the first add().
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
-    /// MAJOR-2/3: the node's durable internal-ISR knowledge, wired into every
-    /// INTERNAL replica (topicId < 0) added from now on.  Non-owning.
+    /// MAJOR-2/3: the node's durable internal-ISR knowledge, wired into the
+    /// __cluster_metadata replica (MEDIUM-B: only it) added from now on.
+    /// Non-owning.
     void setInternalIsrKnowledge(rune::replication::InternalIsrKnowledge* k) noexcept { internalIsrKnowledge_ = k; }
     [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
 
@@ -58,7 +60,10 @@ public:
         if (processIncarnation_ != 0) replica->setProcessIncarnation(processIncarnation_);
         // MAJOR-2/3: internal replicas commit ISR changes on a majority's
         // durable knowledge (this node's store).
-        if (topicId < 0 && internalIsrKnowledge_ != nullptr)
+        // MEDIUM-B: only __cluster_metadata (the coordinator partitions are on
+        // the controller-ISR path; __topic_schemas is not in this registry).
+        if (topicId == rune::replication::InternalIsrKnowledge::kCandidacyTopicId &&
+            internalIsrKnowledge_ != nullptr)
             replica->setInternalIsrKnowledge(internalIsrKnowledge_);
         auto* raw = replica.get();
         map_[key] = Entry{std::move(replica), id, inc};

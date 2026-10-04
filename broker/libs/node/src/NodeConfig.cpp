@@ -678,6 +678,15 @@ ConfigResult parseNodeConfig(
             cfg.survivorLeaderElection = (sv == "1" || sv == "true" || sv == "TRUE");
         }
     }
+    // Re-review 2026-10-04 MEDIUM-B: unclean consensus election (default OFF) —
+    // see NodeConfig::uncleanConsensusElection.
+    {
+        const char* raw = getenv_fn("RUNE_UNCLEAN_CONSENSUS_ELECTION");
+        if (raw) {
+            const std::string_view sv(raw);
+            cfg.uncleanConsensusElection = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
 
     // --- RUNE_TOPICS (optional) ---
     // Format: comma-separated entries, each of the form:

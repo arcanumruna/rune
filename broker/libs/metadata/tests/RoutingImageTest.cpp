@@ -9,6 +9,7 @@
 //   4. lookup() performs no heap allocation in the hot loop (structural test).
 
 #include "rune/metadata/RoutingImage.h"
+#include "rune/metadata/Gpid.h"
 
 #include <gtest/gtest.h>
 
@@ -293,4 +294,24 @@ TEST(RoutingImage, SentinelIsNegativeOne)
     // Verify the sentinel constants.
     EXPECT_EQ(RoutingImage::NO_LEADER_NODE_ID, -1);
     EXPECT_EQ(RoutingImage::NO_LEADER_EPOCH,   -1);
+}
+
+// Re-review 2026-10-04 MEDIUM-B: the committed map now also holds the
+// coordinator partitions (__consumer_offsets -1, __transaction_state -2),
+// which have no gpid and are not client-routed — the builder skips them
+// (gpidOf would be negative: a debug assert / skipped entry before).
+TEST(RoutingImageRegression, InternalCoordinatorEntriesSkipped)
+{
+    AssignmentMap amap;
+    amap.put(0, 0,  PartitionAssignment{1, {1}, {1}, 5, 5});
+    amap.put(-1, 0, PartitionAssignment{2, {2}, {2}, 3, 3});
+    amap.put(-2, 0, PartitionAssignment{3, {3}, {3}, 3, 3});
+    int calls = 0;
+    auto img = RoutingImage::buildFromMap(amap, [&](int32_t topicId, int32_t partition) -> int32_t {
+        ++calls;
+        return gpidOf(topicId, partition);
+    });
+    ASSERT_NE(img, nullptr);
+    EXPECT_EQ(calls, 1) << "an internal entry reached gpidOf";
+    EXPECT_EQ(img->lookup(0).leaderNodeId, 1);
 }

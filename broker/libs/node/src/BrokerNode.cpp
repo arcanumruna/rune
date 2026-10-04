@@ -855,8 +855,15 @@ void BrokerNode::buildReplication() {
         config_.dataDir.empty() ? std::string{} : config_.dataDir + "/internal-isr.state");
     replicaRegistry_->setInternalIsrKnowledge(internalIsrKnowledge_.get());
     if (election_) {
-        election_->setVoteGate(&rune::replication::InternalIsrKnowledge::voteGate,
-                               internalIsrKnowledge_.get());
+        // MEDIUM-B: RUNE_UNCLEAN_CONSENSUS_ELECTION (default off) leaves the
+        // candidacy gate unwired — a data-blind (unclean) consensus election.
+        if (config_.uncleanConsensusElection)
+            spdlog::warn("BrokerNode[{}]: RUNE_UNCLEAN_CONSENSUS_ELECTION is ON — the consensus "
+                         "candidacy gate is disabled; a node missing committed __cluster_metadata "
+                         "records may be elected (those records are then lost)", config_.nodeId);
+        else
+            election_->setVoteGate(&rune::replication::InternalIsrKnowledge::voteGate,
+                                   internalIsrKnowledge_.get());
         // Re-review MEDIUM-A: the knowledge refuses (never persists, never acks)
         // an internal ISR state of a leadership older than the consensus term
         // this node voted in or observed — Raft's term rule applied to the ack.
@@ -1809,6 +1816,9 @@ void BrokerNode::buildGateway() {
             // FetchRequest / FetchResponse frames for the offset log are routed here.
             if (replTransport_) {
                 replTransport_->registerReplica(-1, 0, offsetReplica_.get());
+                // Re-review MEDIUM-B: controller-ISR path (Kafka AlterPartition),
+                // multi-node — as a user partition.
+                if (!config_.isSingleNode()) offsetReplica_->setIsrChannel(replTransport_.get());
             }
 
             // Add to replicaRegistry_ so the metadata bridge drives role transitions
@@ -1920,6 +1930,8 @@ void BrokerNode::buildGateway() {
 
             if (replTransport_) {
                 replTransport_->registerReplica(-2, 0, txnReplica_.get());
+                // Re-review MEDIUM-B: controller-ISR path, multi-node.
+                if (!config_.isSingleNode()) txnReplica_->setIsrChannel(replTransport_.get());
             }
 
             if (replicaRegistry_) {
@@ -2115,6 +2127,22 @@ void BrokerNode::buildGateway() {
                 // collapse).  See DynamicBalancerInputs::minIsr.
                 metadataService_->setMinIsr(config_.gatewayMinIsr);
                 metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
+                // Re-review 2026-10-04 MEDIUM-B: the coordinator partitions
+                // (__consumer_offsets, __transaction_state) are on the controller-
+                // ISR path multi-node: this controller assigns them (ISR commits,
+                // election from the ISR, offline without a live member) and the
+                // bridge drives them from the committed map.  Their ISRs no longer
+                // gate the consensus — only __cluster_metadata's does.
+                if (replTransport_ && !config_.isSingleNode()) {
+                    std::vector<rune::metadata::PartitionKey> coord;
+                    for (int32_t t : {-1, -2})
+                        if (replicaRegistry_ && replicaRegistry_->lookup(t, 0) != nullptr)
+                            coord.push_back(rune::metadata::PartitionKey{t, 0});
+                    if (!coord.empty()) {
+                        metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);
+                        if (replBridge_) replBridge_->setCoordinatorPartitionsOnController(true);
+                    }
+                }
                 spdlog::info(
                     "BrokerNode[{}]: MetadataService configured for assignment emit "
                     "({} user topics, {} nodes, minIsr={})",

@@ -593,7 +593,13 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // MEDIUM-2: the controller's answer → the partition leader replica, on
         // its owning thread (a USER replica's worker; inline otherwise).
         AlterIsrResponseMsg r{};
-        if (!AlterIsrResponseMsg::decode(buf, len, r) || r.topicId < 0) return Action::CONTINUE;
+        if (!AlterIsrResponseMsg::decode(buf, len, r)) return Action::CONTINUE;
+        if (r.topicId < 0) {
+            // A coordinator partition (controller-ISR path, re-review MEDIUM-B):
+            // internal replicas are driven on this (control) thread.
+            if (PartitionReplica* rep = resolveReplica_(r.topicId, r.partition)) rep->onAlterIsrResponse(r);
+            return Action::CONTINUE;
+        }
         if (workerPool_) {
             rune::node::WorkerOp op;
             op.type               = rune::node::WorkerOp::Type::AlterIsrResponse;

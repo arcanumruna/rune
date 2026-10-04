@@ -48,9 +48,11 @@
 //     caught (misconfigured group, RF > nodes, etc.).  Non-zero = silent failure;
 //     use this to detect bad config in tests or monitoring.
 //
-// Only USER topics (topicId >= 0) are assigned.
-// Internal partitions (__cluster_metadata=-3, __consumer_offsets=-1,
-//   __transaction_state=-2) follow cluster leadership and are NOT assigned.
+// USER topics (topicId >= 0) are assigned by the balancers.  Multi-node, the
+// COORDINATOR partitions (__consumer_offsets=-1, __transaction_state=-2) are
+// assigned by this controller too (re-review MEDIUM-B, see
+// decideCoordinatorPartition).  __cluster_metadata (-3) follows cluster
+// leadership and is NOT assigned.
 //
 // Namespace: rune::node
 // C++23. Single-writer. No locks.
@@ -62,14 +64,17 @@
 #include <rune/metadata/Gpid.h>
 #include <rune/metadata/StaticBalancer.h>
 #include <rune/metadata/DynamicBalancer.h>       // Task 14: rebalance-on-tick
+#include <rune/metadata/FailoverElection.h>      // MEDIUM-B: coordinator partitions
 #include <rune/metadata/ControlPlaneTimer.h>     // Task 14: deterministic logged tick
 #include <rune/metadata/ReplicaPositionTable.h>  // Task 14: election position input
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader
 #include <rune/protocol/MetadataRecords.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <optional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -134,6 +139,142 @@ public:
     void setMinIsr(int minIsr) noexcept { minIsr_ = minIsr > 0 ? minIsr : 1; }
     /// MEDIUM-3: opt in to the position-proven survivor election (default OFF).
     void setAllowSurvivorElection(bool on) noexcept { allowSurvivorElection_ = on; }
+
+    // -----------------------------------------------------------------------
+    // Re-review 2026-10-04 MEDIUM-B — the COORDINATOR partitions
+    // (__consumer_offsets -1, __transaction_state -2) on the controller-ISR
+    // (user-partition) path.  Only __cluster_metadata decides consensus
+    // candidacy (InternalIsrKnowledge); these partitions are assigned by this
+    // controller like user partitions: their ISR is committed here (AlterIsr,
+    // partitionEpoch CAS, KIP-841 fencing), their leader is elected from it,
+    // and with no live ISR member they are OFFLINE (NO_LEADER, lineage kept) —
+    // one of their ISRs can no longer take the whole control plane down.
+    //
+    // Coordinator colocation: the group / transaction coordinators run on the
+    // consensus leader (this controller) and load only while its replica of
+    // the partition leads.  So the controller PREFERS ITSELF — but only when it
+    // is in the committed ISR (a clean move).  Otherwise a live ISR member
+    // leads; this node fetches from it, that leader's AlterIsr admits it once
+    // caught up, and the next tick moves leadership here.  Multi-node only
+    // (BrokerNode); single-node keeps the consensus-driven path.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] static constexpr bool isCoordinatorTopic(int32_t topicId) noexcept {
+        return topicId == -1 || topicId == -2;
+    }
+    /// Enable the controller path for `keys` (replicated on `replicas`).
+    void setCoordinatorPartitions(std::vector<rune::metadata::PartitionKey> keys,
+                                  std::vector<int32_t> replicas) {
+        coordinatorKeys_     = std::move(keys);
+        coordinatorReplicas_ = std::move(replicas);
+    }
+    [[nodiscard]] bool coordinatorKey_(int32_t topicId, int32_t partition) const noexcept {
+        for (const auto& k : coordinatorKeys_)
+            if (k.topicId == topicId && k.partition == partition) return true;
+        return false;
+    }
+
+    /// The controller's decision for one coordinator partition (pure; cold).
+    /// Returns the next assignment to commit, nullopt = nothing to change.
+    ///   - none yet (fresh cluster): self leads at `bootstrapEpoch`, every
+    ///     replica seeds the ISR (as a new user partition);
+    ///   - self leads: nothing (fencing / AlterIsr maintain the ISR);
+    ///   - self in the committed ISR: move here (clean, leaderEpoch + 1);
+    ///   - a live leader in its ISR: keep it (self catches up first);
+    ///   - else FailoverElection over ISR ∩ live (never unclean): a live ISR
+    ///     member, or NO_LEADER keeping the ISR lineage.
+    static std::optional<rune::metadata::PartitionAssignment> decideCoordinatorPartition(
+        int32_t topicId, int32_t partition, int32_t selfId,
+        const rune::metadata::PartitionAssignment* cur,
+        const std::vector<int32_t>& eligible,
+        rune::metadata::ReplicaPositionTable* positions,
+        int32_t bootstrapEpoch,
+        const std::vector<int32_t>& replicas)
+    {
+        namespace rm = rune::metadata;
+        auto in = [](int32_t n, const std::vector<int32_t>& v) {
+            return std::find(v.begin(), v.end(), n) != v.end();
+        };
+        if (cur == nullptr) {
+            rm::PartitionAssignment pa;
+            pa.leaderNode     = selfId;
+            pa.isr            = replicas;
+            pa.replicas       = replicas;
+            pa.leaderEpoch    = bootstrapEpoch;
+            pa.partitionEpoch = 0;
+            auto it = std::find(pa.isr.begin(), pa.isr.end(), selfId);
+            if (it != pa.isr.end()) std::rotate(pa.isr.begin(), it, it + 1);   // leader first
+            return pa;
+        }
+        if (cur->leaderNode == selfId) return std::nullopt;
+        std::vector<int32_t> live = eligible;
+        if (!in(selfId, live)) live.push_back(selfId);   // the controller is live
+        rm::AssignmentChange chg;
+        if (in(selfId, cur->isr)) {
+            chg.newLeader = selfId;
+            chg.newIsr.push_back(selfId);
+            for (int32_t n : cur->isr) if (n != selfId) chg.newIsr.push_back(n);
+        } else if (cur->leaderNode != rm::NO_LEADER && in(cur->leaderNode, live) &&
+                   in(cur->leaderNode, cur->isr)) {
+            return std::nullopt;
+        } else {
+            rm::ElectionInputs ei;
+            ei.cur            = *cur;
+            ei.cur.leaderNode = rm::NO_LEADER;   // dead (or none): always elect
+            ei.liveNodes      = live;
+            ei.positions      = positions;
+            ei.allowUnclean   = false;
+            const rm::ElectionOutcome out = rm::FailoverElection::elect(topicId, partition, ei);
+            if (out.change.newLeader == rm::NO_LEADER_CHANGE) return std::nullopt;
+            chg.newLeader = out.change.newLeader;
+            if (chg.newLeader != rm::NO_LEADER) {
+                chg.newIsr.push_back(chg.newLeader);
+                for (int32_t n : cur->isr)
+                    if (n != chg.newLeader && in(n, live)) chg.newIsr.push_back(n);
+            } else {
+                chg.newIsr = cur->isr;   // offline: keep the lineage (Kafka)
+            }
+        }
+        rm::PartitionAssignment next = rm::mergeChange(*cur, chg);
+        if (next.partitionEpoch == cur->partitionEpoch && next.leaderNode == cur->leaderNode &&
+            next.isr == cur->isr)
+            return std::nullopt;   // no-op
+        return next;
+    }
+
+    /// Leader-only: apply decideCoordinatorPartition to every coordinator
+    /// partition with no decision in flight; enqueues the records.  Called from
+    /// runDynamicRebalanceOnTick (cold).  Returns the records enqueued.
+    std::size_t reconcileCoordinatorPartitions(const std::vector<int32_t>& eligibleNodes) {
+        if (!leaderReady_() || coordinatorKeys_.empty()) return 0;
+        std::size_t n = 0;
+        const int32_t bootstrapEpoch =
+            std::max<int32_t>(1, static_cast<int32_t>(replica_->epoch()));   // the consensus term
+        for (const auto& k : coordinatorKeys_) {
+            if (inflight_.count(partitionKey_(k.topicId, k.partition)) != 0) continue;
+            bool queued = false;
+            for (const auto& q : pendingDynamicRecords_)
+                queued = queued || (q.rec.topicId == k.topicId && q.rec.partition == k.partition);
+            if (queued) continue;
+            const auto next = decideCoordinatorPartition(
+                k.topicId, k.partition, selfId_, msm_.assignment(k.topicId, k.partition),
+                eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_);
+            if (!next) continue;
+            rune::metadata::BalancerRecord br;
+            br.isr      = next->isr;
+            br.replicas = next->replicas;
+            br.rec.topicId        = k.topicId;
+            br.rec.partition      = k.partition;
+            br.rec.leaderNode     = next->leaderNode;
+            br.rec.leaderEpoch    = next->leaderEpoch;
+            br.rec.partitionEpoch = next->partitionEpoch;
+            br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+            br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+            pendingDynamicRecords_.push_back(std::move(br));
+            ++n;
+        }
+        if (n > 0) drainDynamicQueue();
+        return n;
+    }
 
     // -----------------------------------------------------------------------
     // Task 8b (RULING-4, SINGLE-NODE): register a RUNTIME-defined topic and
@@ -302,7 +443,9 @@ public:
             if (answer) *answer = true;
         };
         if (!leaderReady_()) return false;
-        if (m.topicId < 0 || m.isrCount <= 0) return false;
+        // Internal topics: only the coordinator partitions on the controller
+        // path (MEDIUM-B); __cluster_metadata uses the internal-ISR store.
+        if ((m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) || m.isrCount <= 0) return false;
         const rune::metadata::PartitionAssignment* pa = msm_.assignment(m.topicId, m.partition);
         if (pa == nullptr) return false;
         if (pa->leaderNode != m.leaderId || pa->leaderEpoch != static_cast<int32_t>(m.leaderEpoch)) {
@@ -495,11 +638,14 @@ public:
         int maxRecordsPerCycle            = 4096)
     {
         if (!leaderReady_()) return 0;
-        if (configuredTopics_.empty()) return 0;
 
         // MEDIUM-2: the eligible set onAlterIsr filters additions against.
         eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
         eligibleKnown_ = true;
+
+        // MEDIUM-B: coordinator partitions (controller-ISR path).
+        const std::size_t coord = reconcileCoordinatorPartitions(eligibleNodes);
+        if (configuredTopics_.empty()) return coord;
 
         rune::metadata::DynamicBalancerInputs in;
         in.cur       = &msm_.committedMap();
@@ -592,7 +738,7 @@ public:
         });
         const std::size_t count = recs.size();
         if (count > 0) emitDynamicAssignment(recs);
-        return count;
+        return count + coord;
     }
 
     // -----------------------------------------------------------------------
@@ -1036,6 +1182,8 @@ private:
     static int64_t partitionKey_(int32_t topicId, int32_t partition) noexcept {
         return (static_cast<int64_t>(topicId) << 32) | static_cast<uint32_t>(partition);
     }
+    std::vector<rune::metadata::PartitionKey> coordinatorKeys_;      ///< MEDIUM-B
+    std::vector<int32_t>                      coordinatorReplicas_;  ///< MEDIUM-B
     /// replica_->logGeneration() the MSM was built against (see doWork).
     uint64_t lastLogGen_ = 0;
 
