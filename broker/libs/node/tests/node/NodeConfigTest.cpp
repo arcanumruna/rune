@@ -2438,6 +2438,24 @@ TEST(NodeConfig, IoWorkerCoresEnvParsesACpuList) {
     EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
 }
 
+// D8c: RUNE_GATEWAY_PRODUCE_CREDITS is bounded 1 .. 4096 (a small share of a worker's ack queue).
+TEST(NodeConfig, GatewayProduceCreditsIsBoundedRegression) {
+    auto env = rune::node::base1node();
+    auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(r.config.has_value()) << r.error;
+    EXPECT_EQ(r.config->gatewayProduceCredits, 0u) << "absent -> the gateway default (1024)";
+    for (const char* ok : {"1", "1024", "4096"}) {
+        env["RUNE_GATEWAY_PRODUCE_CREDITS"] = ok;
+        r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+        ASSERT_TRUE(r.config.has_value()) << ok << ": " << r.error;
+        EXPECT_EQ(r.config->gatewayProduceCredits, static_cast<uint32_t>(std::stoul(ok)));
+    }
+    for (const char* bad : {"0", "-1", "4097", "99999999999999999999", "1k", " "}) {
+        env["RUNE_GATEWAY_PRODUCE_CREDITS"] = bad;
+        EXPECT_FALSE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value()) << "refused: " << bad;
+    }
+}
+
 // D8b re-review LOW-B: RUNE_MAX_HELD_IDLE_MS is bounded 1 ms .. 24 h (no ms->ns overflow); anything else is refused.
 TEST(NodeConfig, MaxHeldIdleMsIsBoundedRegression) {
     auto env = rune::node::base1node();

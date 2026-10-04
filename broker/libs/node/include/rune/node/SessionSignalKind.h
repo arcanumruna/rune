@@ -14,6 +14,11 @@ enum class SessionSignalKind : int64_t {
     Lost     = 3,   ///< D8b: its ack publication reports NOT_CONNECTED (acks stay queued)
     Found    = 4,   ///< D8b: a later claim saw the publication connected again
     Progress = 5,   ///< D8b: a held session's acks are being claimed (rate-limited by passes)
+    /// D8c: WorkerReturn::baseOffset gateway-routed produce acks of the session
+    /// were CLAIMED on its ack publication since the last Credit report — the
+    /// runtime returns that many produce credits (coalesced: <= one per session
+    /// per worker pass).
+    Credit   = 6,
 };
 
 } // namespace rune::node

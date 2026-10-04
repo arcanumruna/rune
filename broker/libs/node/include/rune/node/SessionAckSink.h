@@ -44,6 +44,11 @@
 //   * Progress — acks of a session the runtime knows as Held were claimed (the
 //     client reads); at most once per kProgressPassInterval passes per session
 //     (a pass count, never a clock), so the runtime refreshes its lease.
+// Credits (D8c, reportCredits): every CLAIMED ack of a gateway-routed produce
+// (AckEntry::credit) returns one produce credit to the runtime, coalesced per
+// session per pass.  The runtime forwards at most its per-session budget of
+// unclaimed gateway-routed produces, so the gateway pauses a slow client BEFORE
+// this queue can fill — independent of burst size / MTU / socket buffers.
 // Acks are dropped only on STATE events:
 //   * the session was closed by the runtime (Disconnect / lease reap / connect
 //     timeout / SessionFailed) — the client is gone;
@@ -88,6 +93,10 @@ struct AckEntry {
     int64_t baseOffset    = 0;
     int32_t partition     = 0;
     int16_t errorCode     = 0;
+    /// D8c: 1 = the answer of a GATEWAY-routed produce (an op-ring produce):
+    /// the runtime holds one produce credit for it until it is CLAIMED here
+    /// (reportCredits).  0 = a direct (worker-ingress) produce — no credit.
+    uint8_t credit        = 0;
     /// Unknown-session hold (I1): the lifecycle-ring producer position sampled
     /// at the first flush that saw this ack with no session; -1 = not held.
     int64_t sessionPos    = -1;
@@ -212,6 +221,7 @@ public:
                     const int64_t pos = policy_.claim(r->pub, kAckBytes, [&](uint8_t* dst) { encode_(a, dst); });
                     if (pos > 0) [[likely]] {
                         if (const Edges& e = edges_[idx]; (e.lost | e.reportedHeld) != 0) [[unlikely]] claimedWatched_(idx);
+                        if (a.credit) noteCredit_(idx);              // D8c: gateway-routed — return its credit
                         ++work;
                         continue;
                     }
@@ -322,6 +332,43 @@ public:
         for (; k < dirtyCount_; ++k) dirty_[keep++] = dirty_[k];      // the unreported tail
         dirtyCount_ = keep;
         return n;
+    }
+
+    /// D8c — produce credits of the GATEWAY-routed path.  Every claimed ack with
+    /// AckEntry::credit set adds one to its session's count; this reports each
+    /// non-zero count as `tryReport(sessionId, n)` (n > 0, one call per session
+    /// per pass at most — coalesced) and zeroes it.  An ack is counted when it
+    /// is CLAIMED, never at enqueue: the runtime's per-session credit budget
+    /// therefore bounds the gateway-routed acks this sink can hold for one
+    /// session, whatever the client's read rate (G-A6, pipeline-depth
+    /// independent).  Dropped acks (closed / failed session) return nothing —
+    /// the runtime's close discards the session's whole budget.  tryReport
+    /// false (return ring full) = the count stays and is retried next pass:
+    /// never lost, never double-counted, never through an unbounded queue.
+    /// Returns how many were reported.
+    template <class TryReport>
+    int reportCredits(TryReport&& tryReport) noexcept {
+        if (creditDirtyCount_ == 0) [[likely]] return 0;
+        int n = 0;
+        std::size_t keep = 0, k = 0;
+        for (; k < creditDirtyCount_; ++k) {
+            const int64_t sid = creditDirty_[k];
+            const std::size_t idx = find_(sid);
+            if (idx == kNone) continue;                              // closed: its budget died with it
+            Edges& e = edges_[idx];
+            if (!tryReport(sid, e.credits)) break;                   // the rest stays listed
+            e.credits = 0;
+            e.creditListed = 0;
+            ++n;
+        }
+        for (; k < creditDirtyCount_; ++k) creditDirty_[keep++] = creditDirty_[k];   // the unreported tail
+        creditDirtyCount_ = keep;
+        return n;
+    }
+    /// Claimed credits of `sessionId` not yet reported (test seam).
+    [[nodiscard]] uint32_t unreportedCreditsForTest(int64_t sessionId) const noexcept {
+        const std::size_t idx = find_(sessionId);
+        return idx == kNone ? 0u : edges_[idx].credits;
     }
 
     /// Fix round 2 (finding 8): registrations of sessions closed / re-announced
@@ -438,6 +485,21 @@ private:
         e.lost = lost ? 1 : 0;
         markDirty_(idx);
     }
+    /// D8c: one gateway-routed ack of this session was claimed.
+    void noteCredit_(std::size_t idx) noexcept {
+        Edges& e = edges_[idx];
+        ++e.credits;
+        if (e.creditListed) [[likely]] return;
+        if (creditDirtyCount_ == kMaxSessions) [[unlikely]] {        // closed sessions' entries: compact
+            std::size_t keep = 0;
+            for (std::size_t k = 0; k < creditDirtyCount_; ++k)
+                if (const std::size_t j = find_(creditDirty_[k]); j != kNone && edges_[j].creditListed)
+                    creditDirty_[keep++] = creditDirty_[k];
+            creditDirtyCount_ = keep;                                // < kMaxSessions live sessions
+        }
+        e.creditListed = 1;
+        creditDirty_[creditDirtyCount_++] = keys_[idx];              // <= one entry per live session
+    }
     void markDirty_(std::size_t idx) noexcept {
         if (edges_[idx].dirty) return;
         if (dirtyCount_ == kMaxSessions) [[unlikely]] {              // closed sessions' entries: compact
@@ -531,10 +593,14 @@ private:
         uint8_t  lost         = 0;   ///< the last non-fatal claim result was NOT_CONNECTED
         uint8_t  reportedLost = 0;   ///< what the runtime was told: Lost
         uint8_t  progressed   = 0;   ///< acks claimed while reportedHeld, Progress not yet reported
+        uint8_t  creditListed = 0;   ///< D8c: listed in creditDirty_
+        uint32_t credits      = 0;   ///< D8c: claimed gateway-routed acks not yet reported (<= kAckCapacity per pass)
     };
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report
     std::size_t                                                      dirtyCount_ = 0;
+    std::array<int64_t, kMaxSessions>                                creditDirty_{};   // D8c: credits to report
+    std::size_t                                                      creditDirtyCount_ = 0;
     std::array<int64_t, kMaxSessions>                                heldNow_{};       // held this flush
     std::array<int64_t, kMaxSessions>                                heldPrev_{};      // held last flush
     std::size_t                                                      heldNowCount_ = 0, heldPrevCount_ = 0;

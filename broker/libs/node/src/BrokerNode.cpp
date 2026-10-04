@@ -1572,6 +1572,8 @@ void BrokerNode::buildGateway() {
             std::move(leaderViewFn)
         );
         if (config_.maxHeldIdleMs > 0) gateway_->setMaxHeldIdleNs(config_.maxHeldIdleMs * 1'000'000LL);   // D8b
+        static_assert(NodeConfig::kMaxGatewayProduceCredits == rune::gateway::ClientGateway::kMaxSessionProduceCredits);
+        if (config_.gatewayProduceCredits > 0) gateway_->setSessionProduceCredits(config_.gatewayProduceCredits);   // D8c
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());

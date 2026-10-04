@@ -1293,7 +1293,10 @@ TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwa
 // counter — the defining mechanism), while the worker's op drain never runs
 // out of ack room.  Another client keeps producing; the slow one loses nothing
 // once it reads.  No elapsed-time decisions: A stops offering when an offer is
-// refused AND the gateway has paused it.
+// refused AND the gateway has paused it.  D8c: the pause is credit based (at most
+// ClientGateway::sessionProduceCredits() forwarded, unclaimed produces per
+// session), so it is independent of pipeline depth — runs on the host-derived
+// transport.
 TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
     TmpDir dir{"slowcl"}, ad{"slowa"}, bd{"slowb"};
     const auto ports = ShardPorts::discover(1, 1);
@@ -1310,16 +1313,13 @@ TEST(ShardModeRegression, SlowEndpointUnawareClientCannotStarveTheShard) {
         });
     };
     {
-        // KNOWN ISSUE (found 2026-10-02 integ/perf-defaults, Linux k3s-node-01):
-        // with the host-derived client transport (64 KiB loopback MTU, 16 MiB
-        // socket buffers) one datagram carries hundreds of A's produce frames, so
-        // the gateway forwards a burst before the worker's Held -> gateway-pause
-        // signal lands: the pause still engages (measured at n = 24k..80k) and B
-        // is still served, but the worker's op drain hits ack-room pauses (~27k,
-        // asserted 0 below).  Reported to the T13 owner; until the pause is
-        // pipeline-depth independent this test runs the client on the
-        // pre-2026-10-02 transport (3/3 on Linux; 0/3 derived).
-        ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/true), b(bd.path, 1 << 20, true);
+        // D8c: the HOST-DERIVED client transport (64 KiB loopback MTU, 16 MiB
+        // socket buffers — one datagram carries hundreds of A's frames).  Was
+        // pinned to the pre-2026-10-02 transport because the pause raced the
+        // burst (Linux: engaged at 27-32k frames or never, ~28k worker ack-room
+        // pauses); the gateway's per-session produce credits now pause A after
+        // at most its budget of unclaimed forwards, whatever one poll carries.
+        ShardTestClient a(ad.path, 1 << 20), b(bd.path, 1 << 20);
         const int64_t sidA = a.connect(gw, kClientStream);
         ASSERT_GT(sidA, 0);
         const auto batch = makeBatch(1);

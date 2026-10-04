@@ -352,6 +352,9 @@ struct WorkerReturn {
         ///              client reads): the runtime refreshes its lease.
         ///              At most once per SessionAckSink::kProgressPassInterval
         ///              passes per session.
+        ///   Credit (D8c) — baseOffset gateway-routed acks of the session were
+        ///              claimed: the runtime returns that many produce credits
+        ///              (<= one per session per worker pass).
         /// Rides sbe ReturnType value 2 — RESERVED_2 (PRODUCE_NOTIFY, retired by
         /// F15 §7; static_assert in WorkerReturnCodec.h); in-process ring only.
         SessionSignal = 2,
@@ -393,6 +396,13 @@ struct WorkerReturn {
     // never carries it.  TEMPORARY: deleted with the mirrors by S4 (LSO) and S5
     // (PSM).  (On the op side, WorkerOp::deferAck still means "acks=all".)
     bool    deferAck      = false;
+
+    // D8c: a ProduceResult ANSWER of a GATEWAY-routed (op-ring) produce — the
+    // runtime holds a produce credit for it until the worker's SessionAckSink
+    // CLAIMS the ack (SessionSignal Credit).  Worker-local only: NOT encoded
+    // (the SBE WorkerReturn layout is pinned); emitProduceAck_ reads it from
+    // the struct the answer travels in (parked waiters, the return FIFO).
+    bool    gatewayCredit = false;
 
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
     // dereferences it — it refers to the replica by (targetReplicaId,

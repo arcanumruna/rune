@@ -802,6 +802,12 @@ if(BUILD_TESTING)
             target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # D8c: credit-based gateway pause of a slow gateway-routed client — a
+            # real gateway in front of a real worker with worker-side acks.
+            add_executable(rune_gateway_produce_credit_tests tests/integration/GatewayProduceCreditTest.cpp)
+            target_link_libraries(rune_gateway_produce_credit_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_produce_credit_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # Spec §3.1 never-block: follower flush / owned-log sync / Strict tier
             # go through the worker's io backend; background-token routing.
             add_executable(rune_shard_nonblocking_tests tests/integration/ShardNonBlockingTest.cpp)

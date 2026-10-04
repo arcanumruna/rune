@@ -46,6 +46,10 @@ struct Session {
     // Non-zero → reapExpired uses the normal lease measured from lostSinceNs.
     uint64_t                                       lostByWorkers = 0;
     int64_t                                        lostSinceNs   = 0;
+    // D8c: produce ops forwarded to the workers whose acks no worker has
+    // claimed yet (SessionSignal Credit).  At ClientGateway::sessionProduceCredits()
+    // the gateway ABORTs this session's Produce frames.  Dies with the session.
+    uint32_t                                       produceInFlight = 0;
 };
 
 // ---------------------------------------------------------------------------

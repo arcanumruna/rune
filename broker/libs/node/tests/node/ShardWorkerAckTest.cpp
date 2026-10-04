@@ -727,3 +727,45 @@ TEST(ShardWorkerAckRegression, DeferredSessionSignalIsCountedAndStillDeliveredOn
     ASSERT_EQ(f.sessionFailures.size(), 1u);
     EXPECT_EQ(f.sessionFailures[0].sessionId, 8);
 }
+
+// D8c: the worker returns one produce credit per CLAIMED ack of a gateway-routed (op-ring) produce — acks=0 and
+// acks=all alike — and none for its direct-ingress produces; a held (unclaimed) ack returns nothing until the client
+// reads it.  Credits + held routed acks == routed produces at every step (no credit leaked or invented).
+TEST(ShardWorkerAckRegression, RoutedProduceCreditsReturnOnClaimOnlyRegression) {
+    Fixture f({1}, 1);
+    f.runtimeDrainsReturns = true;
+    for (int i = 0; i < 4; ++i) f.step();
+    int64_t credits = 0;
+    f.onReturn = [&](const WorkerReturn& r) {
+        if (r.type == WorkerReturn::Type::SessionSignal && r.sessionId == 5 &&
+            r.lastOffset == static_cast<int64_t>(SessionSignalKind::Credit)) {
+            EXPECT_GT(r.baseOffset, 0) << "a Credit report carries a positive count";
+            credits += r.baseOffset;
+        }
+    };
+    ASSERT_TRUE(f.routedProduce(5, 10, /*acks=*/0));
+    ASSERT_TRUE(f.routedProduce(5, 11, /*acks=*/1));        // acks=all (op deferAck unset: answered at append)
+    f.produce(12, 0);                                       // direct ingress: no credit
+    f.produce(13, 1);
+    for (int64_t c : {10, 11, 12, 13}) ASSERT_TRUE(f.awaitAck(c)) << c;
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(credits, 2) << "one credit per claimed routed ack, none for direct ones";
+
+    f.egressLimit = 0;                                      // the client stops reading
+    credits = 0;
+    const int64_t c0 = 100;
+    int64_t sent = 0;
+    for (int i = 0; i < 400 && sent < 3'000; ++i) {
+        for (int k = 0; k < 16 && f.routedProduce(5, c0 + sent); ++k) ++sent;
+        f.step();
+    }
+    for (int i = 0; i < 64; ++i) f.step();
+    const auto held = static_cast<int64_t>(f.worker->sessionAcksPendingForTest());
+    ASSERT_GT(held, 0) << "precondition: the client's ack window filled";
+    EXPECT_EQ(credits + held, sent) << "credits returned for exactly the claimed routed acks";
+    f.egressLimit = 64;
+    for (int i = 0; i < 50'000 && !allAcked(f, c0, c0 + sent); ++i) f.step();
+    ASSERT_TRUE(allAcked(f, c0, c0 + sent));
+    for (int i = 0; i < 4; ++i) f.step();
+    EXPECT_EQ(credits, sent) << "every routed ack returned its credit once claimed";
+}

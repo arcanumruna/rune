@@ -578,3 +578,87 @@ TEST(SessionAckSinkRegression, BackwardShiftDeletionKeepsEdgeFlagsWithTheirSessi
     EXPECT_EQ(s.reportSessionEdges(take), 0) << "a new session in a vacated slot inherits no flags";
     EXPECT_EQ(s.pendingForTest(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// D8c — produce credits of the gateway-routed path (reportCredits).
+// ---------------------------------------------------------------------------
+namespace {
+AckEntry routedAck(int64_t sid, int64_t corr) {
+    AckEntry a = ack(sid, corr);
+    a.credit = 1;
+    return a;
+}
+using Credit = std::pair<int64_t, uint32_t>;
+} // namespace
+
+// A gateway-routed ack returns its credit when it is CLAIMED — never at enqueue, never while it is held — and
+// direct (worker-ingress) acks return none.  Counts coalesce: one report per session per pass.
+TEST(SessionAckSinkRegression, CreditIsReturnedOnlyWhenARoutedAckIsClaimedRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8);
+    std::vector<Credit> got;
+    auto take = [&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; };
+    st->budget[1] = 2;                                      // 7: two acks fit its window, then back-pressure
+    for (int64_t c = 0; c < 5; ++c) ASSERT_TRUE(s.enqueue(routedAck(7, c)));
+    ASSERT_TRUE(s.enqueue(ack(7, 100)));                    // a direct (ingress) ack of the same session
+    ASSERT_TRUE(s.enqueue(routedAck(8, 1)));
+    ASSERT_TRUE(s.enqueue(ack(8, 2)));
+    EXPECT_EQ(s.reportCredits(take), 0) << "nothing is claimed before the flush";
+    pass(s);
+    EXPECT_EQ(s.reportCredits(take), 2);
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 2u}, {8, 1u}})) << "claimed routed acks only, coalesced per session";
+    got.clear();
+    pass(s);
+    EXPECT_EQ(s.reportCredits(take), 0) << "held acks return nothing";
+    EXPECT_EQ(s.heldAcks(), 4u);
+    st->budget[1] = 1000;                                   // the client reads again
+    pass(s);
+    EXPECT_EQ(s.reportCredits(take), 1);
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 3u}})) << "the direct ack (corr 100) carries no credit";
+    EXPECT_EQ(s.reportCredits(take), 0) << "a reported count is zeroed";
+    EXPECT_EQ(got.size(), 1u);
+}
+
+// A credit report the return ring refuses stays counted and is retried (later claims add to it) — never lost, never
+// reported twice.
+TEST(SessionAckSinkRegression, RefusedCreditReportIsRetriedNeverLostOrDoubledRegression) {
+    FakePolicy pol; Sink s(pol);
+    ready(s, 7); ready(s, 8);
+    ASSERT_TRUE(s.enqueue(routedAck(7, 1)));
+    ASSERT_TRUE(s.enqueue(routedAck(8, 1)));
+    pass(s);
+    int calls = 0;
+    EXPECT_EQ(s.reportCredits([&](int64_t, uint32_t) { ++calls; return false; }), 0);
+    EXPECT_EQ(calls, 1) << "stops at the first refusal";
+    ASSERT_TRUE(s.enqueue(routedAck(7, 2)));
+    ASSERT_TRUE(s.enqueue(routedAck(7, 3)));
+    pass(s);
+    std::vector<Credit> got;
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 2);
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 3u}, {8, 1u}})) << "refused counts kept and merged with later claims";
+    got.clear();
+    pass(s);
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 0);
+    EXPECT_TRUE(got.empty()) << "never reported twice";
+}
+
+// A closed session's unreported credits die with it (the runtime's close discards its whole budget); a session
+// re-using the slot inherits none.
+TEST(SessionAckSinkRegression, ClosedSessionsUnreportedCreditsAreDroppedRegression) {
+    FakePolicy pol; Sink s(pol);
+    ready(s, 7);
+    ASSERT_TRUE(s.enqueue(routedAck(7, 1)));
+    pass(s);
+    ASSERT_EQ(s.unreportedCreditsForTest(7), 1u);
+    s.close(7);
+    std::vector<Credit> got;
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 0);
+    ready(s, 7);                                            // re-announced (fresh publication)
+    EXPECT_EQ(s.unreportedCreditsForTest(7), 0u);
+    ASSERT_TRUE(s.enqueue(routedAck(7, 2)));
+    pass(s);
+    EXPECT_EQ(s.reportCredits([&](int64_t sid, uint32_t n) { got.push_back({sid, n}); return true; }), 1);
+    EXPECT_EQ(got, (std::vector<Credit>{{7, 1u}}));
+}

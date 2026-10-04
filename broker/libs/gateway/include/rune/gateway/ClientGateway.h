@@ -132,6 +132,23 @@ public:
     /// A session Lost on any worker is reaped on sessionTimeoutNs from its Lost edge instead (reapExpired).
     static constexpr int64_t kDefaultMaxHeldIdleNs = 600LL * 1'000'000'000LL;
     void setMaxHeldIdleNs(int64_t ns) noexcept { maxHeldIdleNs_ = ns > 0 ? ns : kDefaultMaxHeldIdleNs; }
+    /// D8c (shard mode, G-A6 on the gateway-routed path): the most produce ops of
+    /// ONE session the gateway has forwarded to the workers whose acks a worker
+    /// has not CLAIMED yet (SessionSignal Credit returns them).  At the budget
+    /// the session's next Produce frame is ABORTed (controlled poll — that
+    /// client's image only), so a client that stops reading is paused BEFORE
+    /// any worker's ack queue (SessionAckSink::kAckCapacity = 16384) fills —
+    /// whatever its burst size, MTU or socket buffers.  1024 = 1/16 of the ack
+    /// queue: 16 fully-stalled gateway sessions fit beside the per-pass intake
+    /// reserve; >= 1024 batches in flight per session costs a gateway client
+    /// nothing at sub-ms RTTs (Little: 1024 / 1 ms = 1M batches/s).
+    /// RUNE_GATEWAY_PRODUCE_CREDITS (NodeConfig bounds it to 1 .. kMaxSessionProduceCredits).
+    static constexpr uint32_t kDefaultSessionProduceCredits = 1024;
+    static constexpr uint32_t kMaxSessionProduceCredits     = 4096;   // 1/4 of the ack queue (static_assert, .cpp)
+    void setSessionProduceCredits(uint32_t n) noexcept {
+        sessionProduceCredits_ = (n >= 1 && n <= kMaxSessionProduceCredits) ? n : kDefaultSessionProduceCredits;
+    }
+    [[nodiscard]] uint32_t sessionProduceCredits() const noexcept { return sessionProduceCredits_; }
 
     // Async Connect egress-resolve timeout: 5 seconds.
     static constexpr int64_t kDefaultConnectResolveTimeoutNs = 5LL * 1'000'000'000LL;
@@ -1125,9 +1142,23 @@ private:
     /// Close an accepted session (Disconnect / SessionFailed): table, workers,
     /// subscriptions, group-member tracking.  False = unknown session (no-op).
     bool closeSession_(int64_t sid, bool notifyExpired = false);
-    /// Fix round 2 (finding 1): a Produce frame of a session some worker holds
-    /// acks for — the shard-mode poll ABORTs it (that client's image only).
-    [[nodiscard]] bool produceFrameHeld_(const uint8_t* buf, std::size_t len);
+    /// Fix round 2 (finding 1) + D8c: a Produce frame of a session some worker
+    /// holds acks for (Held) or that has no produce credit left — the
+    /// shard-mode poll ABORTs it (that client's image only).
+    enum class ProducePause : uint8_t { None, Held, NoCredit };
+    [[nodiscard]] ProducePause produceFramePause_(const uint8_t* buf, std::size_t len);
+    [[nodiscard]] bool produceFrameHeld_(const uint8_t* buf, std::size_t len) {
+        return produceFramePause_(buf, len) != ProducePause::None;
+    }
+    /// Shard-mode controlled-poll decision for one reassembled client frame:
+    /// false = ABORT (counted), true = dispatch it.  One branch when no session
+    /// is paused.
+    [[nodiscard]] bool admitClientFrame_(const uint8_t* buf, std::size_t len);
+    /// D8c: one produce of `s` was forwarded to a worker / `n` of its acks were claimed.
+    void takeProduceCredit_(Session& s) noexcept;
+    void returnProduceCredits_(Session& s, int64_t n) noexcept;
+    /// Validate + dispatch one reassembled client frame (onFragment's body).
+    void onClientFrame_(const uint8_t* buf, std::size_t len);
     void onSessionSignal_(const rune::node::WorkerReturn& ret);
     void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
@@ -1236,7 +1267,12 @@ private:
     rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;
     rune::aeronutil::ImageLossWatch              controlledImageWatch_;
     std::size_t                                  heldSessions_ = 0;   // sessions with heldByWorkers != 0
-    uint64_t                                     heldProduceAborts_ = 0;
+    uint64_t                                     heldProduceAborts_ = 0;   // every paused-produce ABORT (Held or no credit)
+    // D8c: per-session produce credits (shard mode).
+    uint32_t                                     sessionProduceCredits_ = kDefaultSessionProduceCredits;
+    std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
+    uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
+    uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
 
     SessionTable                         sessions_;
 
@@ -1565,6 +1601,26 @@ public:
     /// Fix round 3: Produce frames ABORTed because their session was held
     /// (control thread only — read via BrokerNode::onControlThreadForTest).
     [[nodiscard]] uint64_t heldProduceAbortsForTest() const noexcept { return heldProduceAborts_; }
+    /// D8c test seams (control thread only).
+    [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
+    [[nodiscard]] uint64_t produceCreditUnderflowsForTest() const noexcept { return produceCreditUnderflows_; }
+    [[nodiscard]] std::size_t creditBlockedSessionsForTest() const noexcept { return creditBlockedSessions_; }
+    [[nodiscard]] int64_t produceInFlightForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s ? static_cast<int64_t>(s->produceInFlight) : -1;
+    }
+    /// D8c: ONE shard-mode controlled poll over `frames` (each a whole client
+    /// frame on one image, in order) through the REAL per-frame decision
+    /// (admitClientFrame_) and dispatch: stops at the first ABORT, exactly as
+    /// Aeron's controlledPoll does.  Returns the frames consumed.
+    std::size_t controlledPollFramesForTest(const std::vector<std::vector<uint8_t>>& frames, std::size_t from = 0) {
+        std::size_t i = from;
+        for (; i < frames.size(); ++i) {
+            if (!admitClientFrame_(frames[i].data(), frames[i].size())) break;
+            onClientFrame_(frames[i].data(), frames[i].size());
+        }
+        return i - from;
+    }
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }

@@ -1461,7 +1461,8 @@ private:
     void emitProduceAck_(const WorkerReturn& ret) {
         const bool ok = ret.errorCode == 0;
         if (!ackSink_->enqueue(AckEntry{ret.sessionId, ret.correlationId, ok ? ret.baseOffset : 0,
-                                        ret.partition, ret.errorCode})) [[unlikely]]
+                                        ret.partition, ret.errorCode,
+                                        static_cast<uint8_t>(ret.gatewayCredit ? 1 : 0)})) [[unlikely]]
             haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
         WorkerReturn n = ret;
         n.deferAck   = true;          // a liveness notification — never an answer
@@ -1791,13 +1792,14 @@ private:
     // recorded in the sink's per-session state and is retried next pass
     // (counted: sessionSignalsDeferred_).  Never dropped, never a timer.
     // -----------------------------------------------------------------------
-    bool trySessionSignal_(int64_t sid, SessionSignalKind kind) {
+    bool trySessionSignal_(int64_t sid, SessionSignalKind kind, int64_t value = 0) {
         if (retFifo_.empty()) {
             WorkerReturn r;
             r.type       = WorkerReturn::Type::SessionSignal;
             r.sessionId  = sid;
             r.partition  = workerId_;
             r.lastOffset = static_cast<int64_t>(kind);
+            r.baseOffset = value;                 // D8c Credit: the count
             if (tryWriteReturn_(r)) return true;
         }
         ++sessionSignalsDeferred_;
@@ -1806,6 +1808,10 @@ private:
     int reportSessionSignals_() {
         int n = ackSink_->reportFailures([this](int64_t sid) { return trySessionSignal_(sid, SessionSignalKind::Failed); });
         n += ackSink_->reportSessionEdges([this](int64_t sid, SessionSignalKind k) { return trySessionSignal_(sid, k); });
+        // D8c: claimed gateway-routed acks return their produce credits.
+        n += ackSink_->reportCredits([this](int64_t sid, uint32_t c) {
+            return trySessionSignal_(sid, SessionSignalKind::Credit, static_cast<int64_t>(c));
+        });
         return n;
     }
 
@@ -3356,11 +3362,14 @@ private:
     // holds regardless; this is the FAIRNESS argument: a client whose acks are
     // held is paused on BOTH intake paths — its direct frames at the next frame
     // (controlled ABORT here), its gateway-routed frames once the runtime has
-    // the Held signal (fix round 2: controlled ABORT on its gateway image).  Its
-    // share is therefore what it sent before each pause took effect: one pass's
-    // direct frames, its owed acks, and the routed frames already in the op
-    // ring / in flight to the runtime when Held landed (one ret_ hop) — not the
-    // rest of the queue.  The room throttle (ackRoom_) only backs that up.
+    // the Held signal (fix round 2: controlled ABORT on its gateway image) or,
+    // D8c, once it has forwarded the session's produce credit budget of
+    // routed produces whose acks this worker has not CLAIMED (credits return
+    // via SessionSignal Credit from reportCredits).  Its share is therefore
+    // what it sent before each pause took effect: one pass's direct frames,
+    // its owed acks, and at most its credit budget of routed produces (op
+    // ring + owed + queued) — independent of burst size / MTU / socket
+    // buffers.  The room throttle (ackRoom_) only backs that up.
     static_assert(SessionAckSink::kAckCapacity >=
                       kMaxOwedReturnsCeiling + static_cast<std::size_t>(kMaxIngressDrainLimit) +
                           static_cast<std::size_t>(kMaxFragmentLimit),
@@ -4112,6 +4121,7 @@ private:
             ret.partition     = op.partition();
             ret.topicId       = op.topicId();
             ret.deferAck      = false;   // an answer, never facts-only (F15 S2 fix round 2, B1)
+            ret.gatewayCredit = true;    // D8c: an op-ring produce — its runtime credit returns on claim
             ret.producerId    = op.producerId();
             ret.producerEpoch = op.producerEpoch();
             ret.baseSequence  = op.baseSequence();
@@ -4987,6 +4997,7 @@ private:
         ret.producerEpoch = f.producerEpoch;
         ret.baseSequence  = f.baseSequence;
         ret.enqueuedAtNs  = f.enqueuedAtNs;
+        ret.gatewayCredit = f.fromOp;       // D8c: an op-ring produce holds a runtime credit until claimed
         ret.replica       = replica;
         if (replica) { ret.targetReplicaId = replica->registryId(); ret.incarnation = replica->incarnation(); }
 

@@ -39,6 +39,12 @@
 static_assert(rune::gateway::ClientGateway::kShardMaxSessions ==
                   rune::node::SessionAckSink::kMaxSessions - 1,
               "Task 13: the runtime's shard session cap is a worker ack table's capacity");
+static_assert(rune::gateway::ClientGateway::kMaxSessionProduceCredits * 4 <=
+                  rune::node::SessionAckSink::kAckCapacity,
+              "D8c: one session's produce credit budget stays a small share of a worker's ack queue");
+static_assert(rune::gateway::ClientGateway::kDefaultSessionProduceCredits >= 1 &&
+                  rune::gateway::ClientGateway::kDefaultSessionProduceCredits <=
+                      rune::gateway::ClientGateway::kMaxSessionProduceCredits);
 
 #include <cstring>
 
@@ -449,6 +455,10 @@ int ClientGateway::doWork(int64_t nowNs) {
     int work = 0;
     if (workerPool_) work += pumpMarkerQueue_() + pumpSubOps_();
     if (shardMode_) {
+        // D8c: ... or a Produce frame of a session with no produce credit left
+        // (sessionProduceCredits_ forwarded, not yet claimed by a worker): the
+        // pause engages BEFORE a worker's ack queue can fill, independent of
+        // how many frames one poll / one datagram carries (admitClientFrame_).
         // Task 13 fix round 2 (finding 1, G-A6 on the gateway-routed path): a
         // Produce frame of a session some worker holds acks for is ABORTed — it
         // stays on ITS image (one client publication) and the poll moves on to
@@ -472,12 +482,9 @@ int ClientGateway::doWork(int64_t nowNs) {
                 return controlledAssembler_.onFragment(
                     [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
                            aeron::util::index_t length, aeron::Header& header) {
-                        if (heldSessions_ != 0 &&
-                            produceFrameHeld_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                                              static_cast<std::size_t>(length))) [[unlikely]] {
-                            ++heldProduceAborts_;
+                        if (!admitClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                               static_cast<std::size_t>(length))) [[unlikely]]
                             return aeron::ControlledPollAction::ABORT;
-                        }
                         onFragment(buffer, offset, length, header);
                         return aeron::ControlledPollAction::CONTINUE;
                     },
@@ -756,8 +763,11 @@ void ClientGateway::reapExpired(int64_t nowNs) {
         // D8b: lost on any worker (ack publication NOT_CONNECTED) → the normal lease from the Lost edge (its
         // owed acks are freed in ~sessionTimeout); else held (paused by back-pressure) → maxHeldIdleNs_ since the
         // last activity / Progress signal; else the normal lease since the last activity.
+        // D8c: a session paused for want of produce credit is paused like a held one (its image waits at a
+        // Produce frame, Keepalives behind it, while its forwarded produces are answered / claimed).
+        const bool paused  = s.heldByWorkers != 0 || s.produceInFlight >= sessionProduceCredits_;
         const bool expired = s.lostByWorkers != 0 ? nowNs - s.lostSinceNs > sessionTimeoutNs_
-                           : s.heldByWorkers != 0 ? nowNs - s.lastSeenNs > maxHeldIdleNs_
+                           : paused               ? nowNs - s.lastSeenNs > maxHeldIdleNs_
                                                   : nowNs - s.lastSeenNs > sessionTimeoutNs_;
         if (expired) reapScratch_.push_back(s.sessionId);
     });
@@ -777,9 +787,11 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
                                aeron::util::index_t             length,
                                aeron::Header&                   /*header*/)
 {
-    const auto* buf = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
-    const auto  len = static_cast<std::size_t>(length);
+    onClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset), static_cast<std::size_t>(length));
+}
 
+void ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
+{
     // Step 1: validate frame with checkFrame — reject anything non-conformant.
     const auto fc = pc::checkFrame(buf, len);
     if (fc.status != pc::FrameStatus::Ok) {
@@ -954,6 +966,7 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // the rune client reconnects only on SessionExpired / UnknownSession.
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
     if (s->heldByWorkers != 0) --heldSessions_;
+    if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
     sessions_.remove(sid);                    // releases its egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
@@ -980,15 +993,58 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     return true;
 }
 
-bool ClientGateway::produceFrameHeld_(const uint8_t* buf, std::size_t len)
+ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf, std::size_t len)
 {
-    if (len < pc::MessageHeader::ENCODED_SIZE) return false;
+    if (len < pc::MessageHeader::ENCODED_SIZE) return ProducePause::None;
     const uint16_t templateId = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
-    if (templateId != pc::Produce::TEMPLATE_ID) return false;   // only produce intake is paused
+    if (templateId != pc::Produce::TEMPLATE_ID) return ProducePause::None;   // only produce intake is paused
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
     const Session* s = sessions_.find(static_cast<int64_t>(sid));
-    return s && s->heldByWorkers != 0;
+    if (!s) return ProducePause::None;
+    if (s->heldByWorkers != 0) return ProducePause::Held;
+    if (s->produceInFlight >= sessionProduceCredits_) return ProducePause::NoCredit;
+    return ProducePause::None;
+}
+
+bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
+{
+    if ((heldSessions_ | creditBlockedSessions_) == 0) [[likely]] return true;
+    const ProducePause p = produceFramePause_(buf, len);
+    if (p == ProducePause::None) return true;
+    ++heldProduceAborts_;
+    if (p == ProducePause::NoCredit) ++creditProduceAborts_;
+    return false;
+}
+
+// D8c: credits are counted only in shard mode (worker-side acks — the only mode
+// whose workers return them); the forward site guards on shardMode_.
+void ClientGateway::takeProduceCredit_(Session& s) noexcept
+{
+    if (++s.produceInFlight == sessionProduceCredits_) ++creditBlockedSessions_;
+}
+
+void ClientGateway::returnProduceCredits_(Session& s, int64_t n) noexcept
+{
+    if (n <= 0) [[unlikely]] return;
+    const bool wasBlocked = s.produceInFlight >= sessionProduceCredits_;
+    if (static_cast<uint64_t>(n) > s.produceInFlight) [[unlikely]] {
+        // Unreachable: every Credit is a claimed ack of a produce this gateway
+        // forwarded for this session (one credit taken per forward).  Clamp —
+        // never a negative budget — and count it, loudly.
+        ++produceCreditUnderflows_;
+        if (produceCreditUnderflows_ == 1 || (produceCreditUnderflows_ & 1023u) == 0)
+            spdlog::error("ClientGateway: session {} returned {} produce credits with {} in flight (total={})",
+                          s.sessionId, n, s.produceInFlight, produceCreditUnderflows_);
+        s.produceInFlight = 0;
+    } else {
+        s.produceInFlight -= static_cast<uint32_t>(n);
+    }
+    // The session's image was stalled at a Produce frame while it had no credit
+    // (its Keepalives queued behind it): leaving that pause is client progress
+    // — refresh the lease, as a Released edge does (D8b re-review MEDIUM-1).
+    s.lastSeenNs = nowNs_;
+    if (wasBlocked && s.produceInFlight < sessionProduceCredits_) --creditBlockedSessions_;
 }
 
 void ClientGateway::sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid)
@@ -1010,6 +1066,7 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
         if (kind == K::Progress) { s->lastSeenNs = nowNs_; return; }  // D8b: the held client reads its acks
+        if (kind == K::Credit) { returnProduceCredits_(*s, ret.baseOffset); return; }   // D8c: acks claimed
         // Unreachable: NodeConfig refuses > kMaxHeldMaskWorkers shard workers.
         assert(ret.partition >= 0 && ret.partition < kMaxHeldMaskWorkers);
         if (ret.partition < 0 || ret.partition >= kMaxHeldMaskWorkers) [[unlikely]] return;
@@ -2109,6 +2166,14 @@ void ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
                              "ProduceResponse NotLeader (retriable; total={})",
                              msg.topicId, partition, produceBackPressured_);
             sendResp(pc::ErrorCode::NotLeader, partition, 0);
+        } else if (shardMode_) {
+            // D8c: forwarded — one produce credit is held until the owning
+            // worker CLAIMS its answer on the session's ack publication
+            // (SessionSignal Credit).  Every forwarded produce is answered
+            // exactly once through the worker's SessionAckSink (append, refusal,
+            // HW fire / timeout, fsync, purge — acks=0 included); a dropped
+            // answer means the session was closed, which drops the budget too.
+            takeProduceCredit_(*session);
         }
         // Response (or pending-ack) will be processed in drainWorkerReturns_().
         return;
