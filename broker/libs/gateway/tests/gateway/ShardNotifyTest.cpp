@@ -316,6 +316,25 @@ TEST(GatewayShardNotifyRegression, LostSessionIsReapedOnTheNormalLeaseFromTheLos
     EXPECT_EQ(gw.sessionLastSeenNsForTest(found), -1) << "a found, still-held session keeps the held bound";
 }
 
+// D8b re-review (round 2) MEDIUM-1: a held session that sent nothing for > sessionTimeout and then drains its whole
+// backlog in ONE worker pass reports Released (the pending Progress is superseded) — it must not be reaped in the
+// same cycle it recovered.  The hold ending means its queue emptied through successful claims: that is progress.
+TEST(GatewayShardNotifyRegression, ReleaseOfAHeldSessionRefreshesItsLeaseRegression) {
+    using K = rune::node::SessionSignalKind;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    rune::node::WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    constexpr int64_t T = ClientGateway::kDefaultSessionTimeoutNs;
+    const int64_t a = gw.injectTestSession(0);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(a, 0, K::Held)));
+    gw.drainWorkerReturnsForTest(1'000);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(a, 0, K::Released)));   // drained in one pass
+    gw.drainWorkerReturnsForTest(3 * T);                                            // long after its last frame
+    gw.reapExpiredForTest(3 * T + 1'000);
+    EXPECT_GE(gw.sessionLastSeenNsForTest(a), 0) << "a session that just drained its backlog must not be reaped";
+}
+
 // Finding 2: a SessionFailed close tells the client (best effort, on the
 // gateway's own publication) that its session expired — the rune client
 // reconnects only on SessionExpired / UnknownSession.

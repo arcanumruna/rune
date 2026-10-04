@@ -1028,7 +1028,13 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         if (kind == K::Held) s->heldByWorkers |= bit; else s->heldByWorkers &= ~bit;
         const bool now = s->heldByWorkers != 0;
         if (now && !was) ++heldSessions_;
-        if (was && !now) --heldSessions_;
+        if (was && !now) {
+            --heldSessions_;
+            // D8b re-review MEDIUM-1: the hold ends only when the queue emptied through successful claims (or a
+            // close/fail, which removes the session anyway) — that is progress; a backlog drained in one pass
+            // supersedes its Progress signal, so refresh the lease here or the session is reaped as it recovers.
+            s->lastSeenNs = nowNs_;
+        }
         return;
     }
     // Failed (C2): close the session everywhere and tell the client, so it
