@@ -2055,3 +2055,173 @@ TEST(GroupConsumerHubCommand, CommitSyncHandlerSubscribesGroupRegression) {
     }
     EXPECT_FALSE(hub.hasPendingCommitSync());
 }
+
+// ===========================================================================
+// Fetch routing (distributed partition leadership): a member's per-partition
+// Subscribe goes to the partition leader's session; revoked / abandoned
+// leader-node subscriptions are unsubscribed on THEIR node.
+// ===========================================================================
+namespace {
+
+// A fake ClientAgent: partition -> session index; session index -> session id
+// (0 = not connected); every offer recorded.
+struct FakeFetchRouter {
+    std::map<int32_t, uint32_t> leader;             // partition -> session
+    std::map<uint32_t, int64_t> sids{{0u, kSessionId}};
+    struct Offer { uint32_t session; std::vector<uint8_t> frame; };
+    std::vector<Offer> offers;
+
+    // MessageHeader: blockLength(2) + templateId(2).
+    static uint16_t tidOf(const std::vector<uint8_t>& d) {
+        return d.size() < 4 ? 0 : static_cast<uint16_t>(d[2] | (d[3] << 8));
+    }
+    static uint32_t leaderOf(void* c, int32_t, int32_t p) {
+        auto* s = static_cast<FakeFetchRouter*>(c);
+        const auto it = s->leader.find(p);
+        return it == s->leader.end() ? 0u : it->second;
+    }
+    static int64_t sidOf(void* c, uint32_t i) {
+        auto* s = static_cast<FakeFetchRouter*>(c);
+        const auto it = s->sids.find(i);
+        return it == s->sids.end() ? 0 : it->second;
+    }
+    static rune::client::detail::SendResult offer(void* c, uint32_t i, const uint8_t* b, std::size_t n) {
+        static_cast<FakeFetchRouter*>(c)->offers.push_back({i, std::vector<uint8_t>(b, b + n)});
+        return rune::client::detail::SendResult::Accepted;
+    }
+    GroupConsumerHub::FetchRouter router() {
+        GroupConsumerHub::FetchRouter r;
+        r.ctx           = this;
+        r.leaderSession = &leaderOf;
+        r.sessionId     = &sidOf;
+        r.offer         = &offer;
+        return r;
+    }
+    // Subscribes / Unsubscribes offered on `session`.
+    std::vector<rune::client::codec::SubscribeView> subscribes(uint32_t session) const {
+        std::vector<rune::client::codec::SubscribeView> v;
+        for (const auto& o : offers) {
+            if (o.session != session) continue;
+            if (tidOf(o.frame) != static_cast<uint16_t>(rpc::TemplateId::Subscribe)) continue;
+            if (auto s = rune::client::codec::decodeSubscribe(o.frame.data(), o.frame.size())) v.push_back(*s);
+        }
+        return v;
+    }
+    std::vector<rune::client::codec::UnsubscribeView> unsubscribes(uint32_t session) const {
+        std::vector<rune::client::codec::UnsubscribeView> v;
+        for (const auto& o : offers) {
+            if (o.session != session) continue;
+            if (tidOf(o.frame) != static_cast<uint16_t>(rpc::TemplateId::Unsubscribe)) continue;
+            if (auto u = rune::client::codec::decodeUnsubscribe(o.frame.data(), o.frame.size())) v.push_back(*u);
+        }
+        return v;
+    }
+};
+
+// Join + sync a consumer to Stable with partitions {0, 1} of kTopicId.
+void stableWithTwoPartitions(GroupConsumerHub& hub, CaptureSink& sink, int32_t gen = 1) {
+    hub.onConnected(kSessionId, sink.fn());
+    auto jgr = makeJoinGroupResponseOK(gen, "m1");
+    hub.onJoinGroupResponse(jgr.data(), jgr.size(), kSessionId, sink.fn());
+    auto sgr = makeSyncGroupResponseOK({{kTopicId, 0}, {kTopicId, 1}});
+    hub.onSyncGroupResponse(sgr.data(), sgr.size(), kSessionId, sink.fn());
+}
+
+} // namespace
+
+TEST_F(GroupConsumerHubTest, LeaderNodeSubscribeWaitsForTheCommittedOffsetRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 1u}};
+    fr.sids[1] = 501;
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+
+    // The coordinator-led partition's Subscribe (its group subscription's
+    // isolation carrier) goes at once on the seed session; the node-1 one waits.
+    auto seed = fr.subscribes(0);
+    ASSERT_EQ(seed.size(), 1u);
+    EXPECT_EQ(seed[0].partition, 0);
+    EXPECT_EQ(seed[0].sessionId, kSessionId);
+    EXPECT_TRUE(GroupConsumerHub::isFetchCorrId(seed[0].correlationId));
+    EXPECT_TRUE(fr.subscribes(1).empty()) << "no leader-node Subscribe before its start offset is known";
+
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 7);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    auto n1 = fr.subscribes(1);
+    ASSERT_EQ(n1.size(), 1u);
+    EXPECT_EQ(n1[0].partition, 1);
+    EXPECT_EQ(n1[0].sessionId, 501) << "stamped with node 1's own session id";
+    EXPECT_EQ(n1[0].fromOffset, 7) << "starts at the committed offset";
+}
+
+TEST_F(GroupConsumerHubTest, RevokedLeaderNodePartitionIsUnsubscribedOnItsNodeRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 1u}};
+    fr.sids[1] = 501;
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 7);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    const auto sub1 = fr.subscribes(1).at(0);
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub1.correlationId, 0, /*subscriptionId=*/900));
+
+    // Rebalance keeps partition 0 only.
+    auto asg = makeAssign(2, {{kTopicId, 0}});
+    hub_->onAssign(asg.data(), asg.size(), kSessionId, sink_.fn());
+    const auto un = fr.unsubscribes(1);
+    ASSERT_EQ(un.size(), 1u) << "the revoked partition's node-1 subscription must be unsubscribed there";
+    EXPECT_EQ(un[0].subscriptionId, 900);
+    EXPECT_EQ(un[0].sessionId, 501);
+    EXPECT_TRUE(fr.unsubscribes(0).empty()) << "the coordinator owns its group subscriptions' lifecycle";
+}
+
+TEST_F(GroupConsumerHubTest, AbandonedLeaderNodeSubscribeIsUnsubscribedWhenAnsweredRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 1u}};
+    fr.sids[1] = 501;
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 7);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    const auto sub1 = fr.subscribes(1).at(0);
+
+    // Revoked before its SubscribeResponse: the late answer is unsubscribed.
+    auto asg = makeAssign(2, {{kTopicId, 0}});
+    hub_->onAssign(asg.data(), asg.size(), kSessionId, sink_.fn());
+    EXPECT_EQ(hub_->lateFetchUnsubscribes(), 1u);
+    EXPECT_TRUE(fr.unsubscribes(1).empty());
+    EXPECT_TRUE(hub_->onFetchSubscribeResponse(sub1.correlationId, 0, /*subscriptionId=*/901));
+    const auto un = fr.unsubscribes(1);
+    ASSERT_EQ(un.size(), 1u);
+    EXPECT_EQ(un[0].subscriptionId, 901);
+    EXPECT_EQ(hub_->lateFetchUnsubscribes(), 0u);
+}
+
+TEST_F(GroupConsumerHubTest, NewGenerationRemakesLeaderNodeSubscriptionFromCommittedRegression) {
+    FakeFetchRouter fr;
+    fr.leader = {{0, 0u}, {1, 1u}};
+    fr.sids[1] = 501;
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto ofr = makeOffsetFetchResponse(kTopicId, 1, 7);
+    hub_->onOffsetFetchResponse(ofr.data(), ofr.size());
+    const auto sub1 = fr.subscribes(1).at(0);
+    ASSERT_TRUE(hub_->onFetchSubscribeResponse(sub1.correlationId, 0, 900));
+
+    // Re-join (generation 2) with the same assignment: records the old
+    // subscription pushed while the member was not Stable were dropped, so it
+    // is unsubscribed and re-made from the (re-fetched) committed offset.
+    impl_->state = GroupConsumerState::Rejoining;
+    hub_->onConnected(kSessionId, sink_.fn());
+    auto jgr = makeJoinGroupResponseOK(2, "m1");
+    hub_->onJoinGroupResponse(jgr.data(), jgr.size(), kSessionId, sink_.fn());
+    auto sgr = makeSyncGroupResponseOK({{kTopicId, 0}, {kTopicId, 1}});
+    hub_->onSyncGroupResponse(sgr.data(), sgr.size(), kSessionId, sink_.fn());
+    ASSERT_EQ(fr.unsubscribes(1).size(), 1u);
+    EXPECT_EQ(fr.subscribes(1).size(), 1u) << "waits for the committed offset";
+    auto ofr2 = makeOffsetFetchResponse(kTopicId, 1, 12);
+    hub_->onOffsetFetchResponse(ofr2.data(), ofr2.size());
+    const auto subs = fr.subscribes(1);
+    ASSERT_EQ(subs.size(), 2u);
+    EXPECT_EQ(subs[1].fromOffset, 12);
+}
