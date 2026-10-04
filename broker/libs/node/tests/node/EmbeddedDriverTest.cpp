@@ -220,6 +220,8 @@ TEST(EmbeddedDriverRegression, NonSparseTermsAreFullyAllocatedAtCreationRegressi
 // Linux only (Aeron's pollers use epoll there; other platforms expose none -> timed park).
 // ---------------------------------------------------------------------------
 #include <rune/node/ParkUntilWorkIdle.h>
+#include <rune/node/WorkerPool.h>
+#include <rune/consensus/AgentRunner.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -317,38 +319,64 @@ TEST(EmbeddedDriverWakeRegression, ParkedOwnerWakesOnDatagramNotTimeout) {
 namespace {
 void pumpBoth(EmbeddedDriver& drv, aeron::Aeron& a) { drv.doWork(); a.conductorAgentInvoker().invoke(); }
 
-int deliveredOverUdp(EmbeddedDriver& drv, aeron::Aeron& a, int channels) {
-    std::vector<std::shared_ptr<aeron::Subscription>> subs;
-    std::vector<std::shared_ptr<aeron::ExclusivePublication>> pubs;
-    for (int i = 0; i < channels; ++i) {
-        const std::string ch = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPortForWake());
-        const int64_t s = a.addSubscription(ch, 9200 + i);
-        const int64_t p = a.addExclusivePublication(ch, 9200 + i);
-        std::shared_ptr<aeron::Subscription> sub;
-        std::shared_ptr<aeron::ExclusivePublication> pub;
-        for (int k = 0; k < 200'000 && !(sub && pub && sub->isConnected() && pub->isConnected()); ++k) {
-            pumpBoth(drv, a);
-            if (!sub) sub = a.findSubscription(s);
-            if (!pub) pub = a.findExclusivePublication(p);
-        }
-        if (!(sub && pub && sub->isConnected() && pub->isConnected())) return -1;
-        subs.push_back(sub);
-        pubs.push_back(pub);
-    }
-    constexpr int kMsgs = 50;
-    int got = 0;
-    std::array<uint8_t, 64> buf{};
-    aeron::concurrent::AtomicBuffer ab(buf.data(), buf.size());
-    for (int m = 0; m < kMsgs; ++m)
-        for (auto& pub : pubs)
-            for (int k = 0; k < 100'000 && pub->offer(ab, 0, 32) < 0; ++k) pumpBoth(drv, a);
-    for (int k = 0; k < 400'000 && got < kMsgs * channels; ++k) {
+/// One UDP channel on the driver under test: a subscription (a receive socket in the receiver poller) and a
+/// publication to it (a send socket in the sender poller).
+struct UdpLane {
+    std::shared_ptr<aeron::Subscription>         sub;
+    std::shared_ptr<aeron::ExclusivePublication> pub;
+    int                                          got = 0;
+};
+
+/// Opens a lane and pumps until both ends are connected (10 s failure deadline).
+bool openLane(EmbeddedDriver& drv, aeron::Aeron& a, int32_t stream, UdpLane& lane) {
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPortForWake());
+    const int64_t s = a.addSubscription(ch, stream);
+    const int64_t p = a.addExclusivePublication(ch, stream);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
         pumpBoth(drv, a);
-        for (auto& sub : subs)
-            got += sub->poll([](const aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t,
-                                const aeron::concurrent::logbuffer::Header&) {}, 16);
+        if (!lane.sub) lane.sub = a.findSubscription(s);
+        if (!lane.pub) lane.pub = a.findExclusivePublication(p);
+        if (lane.sub && lane.pub && lane.sub->isConnected() && lane.pub->isConnected()) return true;
     }
-    return got;
+    return false;
+}
+
+/// Offers `msgs` messages of `bytes` on the lane (pumping through back-pressure, 10 s deadline).
+bool offerOn(EmbeddedDriver& drv, aeron::Aeron& a, UdpLane& lane, int msgs, int bytes) {
+    std::vector<uint8_t> buf(static_cast<std::size_t>(bytes), 0x5A);
+    aeron::concurrent::AtomicBuffer ab(buf.data(), buf.size());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (int m = 0; m < msgs; ++m)
+        while (lane.pub->offer(ab, 0, bytes) < 0) {
+            if (std::chrono::steady_clock::now() > deadline) return false;
+            pumpBoth(drv, a);
+        }
+    return true;
+}
+
+int pollLane(UdpLane& lane) {
+    const int n = lane.sub->poll([](const aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t,
+                                    const aeron::concurrent::logbuffer::Header&) {}, 64);
+    lane.got += n;
+    return n;
+}
+
+/// Pumps and polls every lane until each received `want` more (10 s deadline).  True when all arrived.
+bool deliverAll(EmbeddedDriver& drv, aeron::Aeron& a, std::vector<UdpLane*> lanes, int want) {
+    std::vector<int> base;
+    for (auto* l : lanes) base.push_back(l->got);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        pumpBoth(drv, a);
+        bool all = true;
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+            pollLane(*lanes[i]);
+            all = all && lanes[i]->got - base[i] >= want;
+        }
+        if (all) return true;
+    }
+    return false;
 }
 } // namespace
 
@@ -375,15 +403,306 @@ TEST(EmbeddedDriverEpollPoll, InstalledOnlyWhereSupportedAndConfigured) {
     EXPECT_FALSE(stock.epollPollActive()) << "patching one driver's bindings never leaks into another's";
 }
 
+// Review M2: delivery is unchanged AND the epoll-first branch demonstrably ran (an epoll_wait selected a
+// socket, EmbeddedDriver::epollSelectedForTest) — with rune_gso's bindings and with the stock-bindings copy.
+// The stock arm (epoll-first off) delivers the same and never takes the epoll path below 6 transports.
 TEST(EmbeddedDriverEpollPollRegression, MultiTransportPollerDeliversEverything) {
     for (bool gso : {true, false}) {
-        TmpDir d;
-        auto c = cfgAt(d.path);
-        c.udpGso = gso;
-        EmbeddedDriver drv(c, DriverMode::Invoker);
-        auto a = connect(d.path, /*invoker=*/true);
-        ASSERT_TRUE(a);
-        EXPECT_EQ(deliveredOverUdp(drv, *a, 3), 3 * 50) << "gso=" << gso << " epoll=" << drv.epollPollActive();
-        a.reset();
+        for (bool epoll : {true, false}) {
+            TmpDir d;
+            auto c = cfgAt(d.path);
+            c.udpGso = gso;
+            c.epollPoll = epoll;
+            EmbeddedDriver drv(c, DriverMode::Invoker);
+            auto a = connect(d.path, /*invoker=*/true);
+            ASSERT_TRUE(a);
+            UdpLane lanes[3];
+            for (int i = 0; i < 3; ++i) ASSERT_TRUE(openLane(drv, *a, 9200 + i, lanes[i])) << i;
+            (void)drv.epollSelectedForTest(/*reset=*/true);
+            for (auto& l : lanes) ASSERT_TRUE(offerOn(drv, *a, l, 50, 32));
+            EXPECT_TRUE(deliverAll(drv, *a, {&lanes[0], &lanes[1], &lanes[2]}, 50))
+                << "gso=" << gso << " epoll=" << epoll << " got " << lanes[0].got << "/" << lanes[1].got << "/"
+                << lanes[2].got;
+#if defined(__linux__)
+            if (epoll) EXPECT_GT(drv.epollSelectedForTest(false), 0) << "gso=" << gso << ": the epoll-first branch ran";
+            else       EXPECT_EQ(drv.epollSelectedForTest(false), 0) << "gso=" << gso << ": stock <= 5 path only";
+#endif
+            for (auto& l : lanes) { l.pub.reset(); l.sub.reset(); }
+            a.reset();
+        }
     }
+}
+
+// Review M2: transports added and removed while the driver runs cross the 1 <-> 2 threshold of the epoll-first
+// branch (one transport: Aeron's recvmmsg path; more: epoll_wait).  Delivery holds after every step.
+TEST(EmbeddedDriverEpollPoll, TransportsAddedAndRemovedAtRuntimeKeepDelivering) {
+    TmpDir d;
+    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);
+    auto a = connect(d.path, /*invoker=*/true);
+    ASSERT_TRUE(a);
+    UdpLane first;
+    ASSERT_TRUE(openLane(drv, *a, 9500, first));
+    // One transport per poller: the stock recvmmsg path (no epoll_wait selected anything).
+    (void)drv.epollSelectedForTest(true);
+    ASSERT_TRUE(offerOn(drv, *a, first, 20, 32));
+    ASSERT_TRUE(deliverAll(drv, *a, {&first}, 20)) << "1 lane";
+#if defined(__linux__)
+    EXPECT_EQ(drv.epollSelectedForTest(false), 0) << "a single transport keeps Aeron's one-recvmmsg path";
+#endif
+    // 1 -> 2: the epoll branch takes over.
+    UdpLane second;
+    ASSERT_TRUE(openLane(drv, *a, 9501, second));
+    (void)drv.epollSelectedForTest(true);
+    ASSERT_TRUE(offerOn(drv, *a, first, 20, 32));
+    ASSERT_TRUE(offerOn(drv, *a, second, 20, 32));
+    ASSERT_TRUE(deliverAll(drv, *a, {&first, &second}, 20)) << "2 lanes";
+#if defined(__linux__)
+    EXPECT_GT(drv.epollSelectedForTest(false), 0);
+#endif
+    // 2 -> 1: close the second lane's subscription and publication; the first keeps delivering.
+    second.sub.reset();
+    second.pub.reset();
+    for (int i = 0; i < 2'000; ++i) pumpBoth(drv, *a);   // the conductor removes the endpoints
+    ASSERT_TRUE(offerOn(drv, *a, first, 20, 32));
+    ASSERT_TRUE(deliverAll(drv, *a, {&first}, 20)) << "after removing a lane";
+    // Add again (a new port): both deliver.
+    UdpLane third;
+    ASSERT_TRUE(openLane(drv, *a, 9502, third));
+    ASSERT_TRUE(offerOn(drv, *a, first, 20, 32));
+    ASSERT_TRUE(offerOn(drv, *a, third, 20, 32));
+    ASSERT_TRUE(deliverAll(drv, *a, {&first, &third}, 20)) << "after re-adding a lane";
+    first.pub.reset(); first.sub.reset(); third.pub.reset(); third.sub.reset();
+    a.reset();
+}
+
+// Review M2: a backlog larger than one recvmmsg batch on one socket stays readable (level-triggered) until it is
+// drained, and a quiet socket next to it is not starved: its message arrives while the hot backlog is pending.
+// Receiver io vector 1 (one datagram per recvmmsg) against 16 datagrams per send.
+TEST(EmbeddedDriverEpollPoll, BacklogBeyondOneBatchDrainsAndQuietSocketIsNotStarved) {
+    TmpDir d;
+    auto c = cfgAt(d.path);
+    c.termBufferBytes    = 4 * 1024 * 1024;
+    c.udpGso             = false;   // one datagram per recvmmsg slot (no GRO coalescing)
+    c.receiverIoVector   = 1;
+    c.maxMessagesPerSend = 16;
+    EmbeddedDriver drv(c, DriverMode::Invoker);
+    auto a = connect(d.path, /*invoker=*/true);
+    ASSERT_TRUE(a);
+    UdpLane hot, quiet;
+    ASSERT_TRUE(openLane(drv, *a, 9600, hot));
+    ASSERT_TRUE(openLane(drv, *a, 9601, quiet));
+    constexpr int kHot = 400;
+    // The whole hot burst sits in the term before anything is polled; then one quiet message.
+    std::vector<uint8_t> big(1'000, 0x11);
+    aeron::concurrent::AtomicBuffer bab(big.data(), big.size());
+    // (A back-pressured offer pumps and retries: the publication limit follows the receiver's status messages.)
+    auto offerRetry = [&](aeron::ExclusivePublication& pub, aeron::concurrent::AtomicBuffer& ab, int len) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (pub.offer(ab, 0, len) < 0) {
+            if (std::chrono::steady_clock::now() > until) return false;
+            pumpBoth(drv, *a);
+        }
+        return true;
+    };
+    for (int m = 0; m < kHot; ++m) ASSERT_TRUE(offerRetry(*hot.pub, bab, 1'000)) << m;
+    std::array<uint8_t, 16> small{};
+    aeron::concurrent::AtomicBuffer sab(small.data(), small.size());
+    ASSERT_TRUE(offerRetry(*quiet.pub, sab, 16));
+    int hotWhenQuietArrived = -1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline && (hot.got < kHot || quiet.got < 1)) {
+        pumpBoth(drv, *a);
+        pollLane(hot);
+        if (pollLane(quiet) > 0 && hotWhenQuietArrived < 0) hotWhenQuietArrived = hot.got;
+    }
+    EXPECT_EQ(hot.got, kHot) << "the backlog beyond one recvmmsg batch is fully drained";
+    ASSERT_EQ(quiet.got, 1);
+    EXPECT_LT(hotWhenQuietArrived, kHot) << "the quiet socket waited for the whole hot backlog (starved)";
+    hot.pub.reset(); hot.sub.reset(); quiet.pub.reset(); quiet.sub.reset();
+    a.reset();
+}
+
+// Review M2: wake through the RUNNER, end to end.  An AgentRunner whose agent pumps an invoker driver parks on
+// that driver's wake fds (2 s park period): a datagram from another driver must be processed promptly, not at
+// the end of the park.  Linux only.
+namespace {
+struct PumpAgent final : rune::consensus::Agent {
+    EmbeddedDriver&                      drv;
+    aeron::Aeron&                        a;
+    std::shared_ptr<aeron::Subscription> sub;
+    std::atomic<int64_t>                 deliveredAtNs{0};   // test-only cross-thread observation
+    std::atomic<int64_t>                 mailboxPostedNs{0}; // stands in for a cross-thread ring (no fd)
+    std::atomic<int64_t>                 mailboxTakenNs{0};
+    std::atomic<int64_t>                 passes{0};
+    bool                                 bound = false;
+    PumpAgent(EmbeddedDriver& d, aeron::Aeron& c) : drv(d), a(c) {}
+    static int64_t steadyNs() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    int doWork(int64_t) override {
+        if (!bound) { drv.bindPumpThread(); bound = true; }
+        passes.fetch_add(1);
+        int w = drv.doWork() + a.conductorAgentInvoker().invoke();
+        if (sub) w += sub->poll([this](const aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t,
+                                       const aeron::concurrent::logbuffer::Header&) {
+            if (deliveredAtNs.load() == 0) deliveredAtNs.store(steadyNs());
+        }, 16);
+        if (mailboxPostedNs.load() != 0 && mailboxTakenNs.load() == 0) { mailboxTakenNs.store(steadyNs()); ++w; }
+        return w;
+    }
+};
+template <class Pred>
+bool waitFor(std::chrono::milliseconds limit, Pred&& pred) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::yield();
+    }
+    return pred();
+}
+} // namespace
+
+TEST(EmbeddedDriverWakeRegression, ParkedRunnerProcessesDatagramPromptlyRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "driver wake fds are Linux-only";
+#else
+    TmpDir rd, td;
+    EmbeddedDriver rdrv(cfgAt(rd.path), DriverMode::Invoker);
+    auto ra = connect(rd.path, /*invoker=*/true);
+    EmbeddedDriver tdrv(cfgAt(td.path), DriverMode::Threaded);
+    auto ta = connect(td.path, /*invoker=*/false);
+    ASSERT_TRUE(ra && ta);
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPortForWake());
+    PumpAgent agent(rdrv, *ra);
+    const int64_t sreg = ra->addSubscription(ch, 9700);
+    const int64_t preg = ta->addPublication(ch, 9700);
+    std::shared_ptr<aeron::Publication> pub;
+    for (auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+         std::chrono::steady_clock::now() < deadline && !(agent.sub && pub && pub->isConnected());) {
+        pumpBoth(rdrv, *ra);
+        if (!agent.sub) agent.sub = ra->findSubscription(sreg);
+        if (!pub) pub = ta->findPublication(preg);
+    }
+    ASSERT_TRUE(agent.sub && pub && pub->isConnected());
+    int fds[ParkUntilWorkIdle::kMaxWakeFds];
+    const int n = rdrv.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds);
+    ASSERT_EQ(n, 2);
+    // Every idle pass parks up to 2 s: only readiness can make delivery prompt.
+    ParkUntilWorkIdle idle(IdleShape{0, 0, 2'000'000'000, 2'000'000'000}, fds, n);
+    rune::consensus::MonotonicNanoClock clk;
+    {
+        rune::consensus::AgentRunner runner(agent, idle, clk);   // the agent binds the pump on its first pass
+        runner.start();
+        std::array<uint8_t, 32> msg{};
+        aeron::concurrent::AtomicBuffer ab(msg.data(), msg.size());
+        int64_t sentNs = 0;
+        ASSERT_TRUE(waitFor(std::chrono::seconds(5), [&] {
+            if (pub->offer(ab, 0, 32) > 0) { sentNs = PumpAgent::steadyNs(); return true; }
+            return false;
+        }));
+        ASSERT_TRUE(waitFor(std::chrono::seconds(5), [&] { return agent.deliveredAtNs.load() != 0; }));
+        EXPECT_LT(agent.deliveredAtNs.load() - sentNs, 500'000'000) << "the parked runner slept out its 2 s park";
+        runner.stopAndJoin();
+    }
+    rdrv.bindPumpThread();   // hand-off back after the join (close on this thread)
+    pub.reset();
+    agent.sub.reset();
+    ta.reset();
+    ra.reset();
+#endif
+}
+
+// Review M1/M2: work with NO fd (a cross-thread ring message) reaches a parked runner within the park cap.
+TEST(EmbeddedDriverWakeRegression, ParkedRunnerTakesFdLessWorkWithinTheParkCapRegression) {
+    TmpDir rd;
+    EmbeddedDriver rdrv(cfgAt(rd.path), DriverMode::Invoker);
+    auto ra = connect(rd.path, /*invoker=*/true);
+    ASSERT_TRUE(ra);
+    for (int i = 0; i < 100; ++i) pumpBoth(rdrv, *ra);
+    PumpAgent agent(rdrv, *ra);
+    int fds[ParkUntilWorkIdle::kMaxWakeFds];
+    const int n = rdrv.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds);
+    NodeConfig cfg;
+    cfg.idleMaxParkUs = 20'000;   // 20 ms cap: the bound for fd-less work
+    auto idle = makeShardIdle(cfg, fds, n);
+    rune::consensus::MonotonicNanoClock clk;
+    rune::consensus::AgentRunner runner(agent, *idle, clk);
+    runner.start();
+    // Let the runner reach its longest park (no traffic: every pass is idle) — observed, not slept: 10 spins +
+    // 20 yields + 15 doublings (1 µs .. 16 ms) reach the 20 ms cap; 80 passes are past it.
+    ASSERT_TRUE(waitFor(std::chrono::seconds(5), [&] { return agent.passes.load() >= 80; }));
+    const int64_t postedNs = PumpAgent::steadyNs();
+    agent.mailboxPostedNs.store(postedNs);
+    ASSERT_TRUE(waitFor(std::chrono::seconds(5), [&] { return agent.mailboxTakenNs.load() != 0; }));
+    EXPECT_LT(agent.mailboxTakenNs.load() - postedNs, 20'000'000 + 100'000'000)
+        << "fd-less work must be bounded by the park cap (20 ms + scheduling margin)";
+    runner.stopAndJoin();
+    rdrv.bindPumpThread();
+    ra.reset();
+}
+
+// ---------------------------------------------------------------------------
+// A7 review C1: a peer that is down (its host up, its port closed) answers every send on a CONNECTED Aeron send
+// socket with ICMP port-unreachable; the kernel parks the error on the socket (sk_err) and epoll reports it as
+// EPOLLERR without EPOLLIN.  Epoll-first polling skipped such events, so the error stayed pending, the poller's
+// epoll fd stayed readable, and a worker parked on it woke at once forever: 100% CPU per worker while a peer is
+// down.  Every pass must consume what epoll reports: after a pass with no work the wake fds are quiet.
+// Linux only (Aeron's pollers use epoll there).
+// ---------------------------------------------------------------------------
+namespace {
+template <class Pred>
+bool pumpUntilFor(EmbeddedDriver& drv, aeron::Aeron& a, std::chrono::milliseconds limit, Pred&& pred) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (std::chrono::steady_clock::now() < deadline) {
+        drv.doWork();
+        a.conductorAgentInvoker().invoke();
+        if (pred()) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(EmbeddedDriverWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePassRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "driver wake fds are Linux-only (Aeron's transport pollers use epoll there)";
+#else
+    TmpDir d;
+    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);
+    auto a = connect(d.path, /*invoker=*/true);
+    ASSERT_TRUE(a);
+    int fds[4];
+    const int n = drv.wakeFds(fds, 4);
+    ASSERT_EQ(n, 2);
+    // Two publications to two CLOSED loopback ports: two connected send sockets in the sender poller (> 1
+    // transport: the epoll-first branch).  Every setup frame they send comes back as ICMP port-unreachable.
+    const int64_t r1 = a->addExclusivePublication("aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPortForWake()), 9301);
+    const int64_t r2 = a->addExclusivePublication("aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPortForWake()), 9302);
+    std::shared_ptr<aeron::ExclusivePublication> p1, p2;
+    ASSERT_TRUE(pumpUntilFor(drv, *a, std::chrono::seconds(10), [&] {
+        if (!p1) p1 = a->findExclusivePublication(r1);
+        if (!p2) p2 = a->findExclusivePublication(r2);
+        return p1 && p2;
+    }));
+    auto wakeReady = [&] {
+        pollfd pf[4];
+        for (int i = 0; i < n; ++i) pf[i] = pollfd{fds[i], POLLIN, 0};
+        const timespec zero{0, 0};
+        return ::ppoll(pf, static_cast<nfds_t>(n), &zero, nullptr) > 0;
+    };
+    for (int round = 0; round < 3; ++round) {
+        // Setup frames go out every ~100 ms: pump until an ICMP error is pending (a wake fd readable after a
+        // pass) or 350 ms (>= 3 setup frames per publication) have passed.
+        (void)pumpUntilFor(drv, *a, std::chrono::milliseconds(350), wakeReady);
+        // The next pass that finds no work (no send after its poll) must leave nothing readable behind.
+        ASSERT_TRUE(pumpUntilFor(drv, *a, std::chrono::seconds(5), [&] { return drv.doWork() == 0; }));
+        rune::node::ParkUntilWorkIdle idle(rune::node::IdleShape{0, 0, 30'000'000, 30'000'000}, fds, n);
+        const auto t0 = std::chrono::steady_clock::now();
+        idle.idle(0);
+        EXPECT_GE(msSinceWake(t0), 20) << "round " << round << ": a peer-down error must not end the park";
+        EXPECT_EQ(idle.readinessWakes(), 0u) << "round " << round << ": wake fd left ready by an unconsumed EPOLLERR";
+    }
+    p1.reset();
+    p2.reset();
+    a.reset();
+#endif
 }

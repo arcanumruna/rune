@@ -10,7 +10,11 @@
 
 #include <atomic>
 #include <filesystem>
+#include <thread>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 using namespace rune::node;
 namespace fs = std::filesystem;
@@ -120,15 +124,62 @@ TEST(ShardAgentWake, AgentExposesItsInvokerDriversWakeFds) {
     Shard s;
     rune::consensus::MonotonicNanoClock clk;
     ShardAgent a(s.worker, *s.driver, *s.client, clk);
+    // Review M1: the worker's io_uring completion fd joins the driver's two poller fds (when io_uring is the
+    // io backend; the portable backend has no fd).
+    const int uring = s.worker.ioCompletionFd() >= 0 ? 1 : 0;
     int fds[ParkUntilWorkIdle::kMaxWakeFds];
-    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2) << "its own driver's receiver + sender pollers";
+    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2 + uring) << "receiver + sender pollers (+ io_uring)";
+    if (uring) EXPECT_EQ(fds[2], s.worker.ioCompletionFd());
     // Fused placement with a SEPARATE runtime driver: the worker parks on both drivers' sockets.
     Shard rt;
     a.setFusedRuntime(nullptr, rt.driver.get(), rt.client.get());
-    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 4);
+    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 4 + uring);
     // A4: the runtime riding this shard's own driver adds nothing.
     a.setFusedRuntime(nullptr, s.driver.get(), s.client.get());
-    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2);
+    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 2 + uring);
+#endif
+}
+
+// Review C1: Aeron's stock poller (epoll-first off) can leave an EPOLLERR socket ready, so a driver that does
+// not poll epoll-first hands out no wake fds — the runner keeps the legacy timed backoff.
+TEST(ShardAgentWakeRegression, EpollFirstOffExposesNoWakeFdsRegression) {
+    fs::path dir = fs::temp_directory_path() / ("rune_shagent_off_" + std::to_string(::getpid()));
+    EmbeddedDriverConfig c; c.dir = dir.string(); c.termBufferBytes = 64 * 1024; c.epollPoll = false;
+    auto drv = std::make_unique<EmbeddedDriver>(c, DriverMode::Invoker);
+    aeron::Context ctx; ctx.aeronDir(dir.string()); ctx.useConductorAgentInvoker(true);
+    auto client = aeron::Aeron::connect(ctx);
+    Worker w{0, 1 << 16, 1 << 16, 16, 16};
+    w.setShardMode(true);
+    rune::consensus::MonotonicNanoClock clk;
+    ShardAgent a(w, *drv, *client, clk);
+    int fds[ParkUntilWorkIdle::kMaxWakeFds];
+    EXPECT_EQ(a.wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds), 0)
+        << "no driver fds -> no wake fds at all (not even io_uring): the legacy backoff runs";
+    client.reset(); drv.reset();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Review D1: the shard runner thread sets its timer slack to 1 µs at its first pass (the default 50 µs slack
+// rounds every 1 µs .. park up to >= 51 µs).
+TEST(ShardAgent, FirstPassSetsOneMicrosecondTimerSlack) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "PR_SET_TIMERSLACK is Linux-only";
+#else
+    Shard s;
+    rune::consensus::MonotonicNanoClock clk;
+    ShardAgent a(s.worker, *s.driver, *s.client, clk);
+    long before = -1, after = -1;
+    std::thread runner([&] {
+        // Threads inherit the creator's slack (an earlier test's pass on the main thread set it): start from
+        // the kernel default (50 µs) explicitly.
+        (void)::prctl(PR_SET_TIMERSLACK, 50'000UL, 0, 0, 0);
+        before = ::prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+        a.doWork(clk.nowNs());
+        after = ::prctl(PR_GET_TIMERSLACK, 0, 0, 0, 0);
+    });
+    runner.join();
+    EXPECT_EQ(before, 50'000L);
+    EXPECT_EQ(after, static_cast<long>(kShardTimerSlackNs));
 #endif
 }
 
@@ -140,14 +191,14 @@ struct FakeFds {
 };
 }
 
-TEST(ShardIdleRegression, DefaultWithWakeFdsParksUntilWorkAfterFirstEmptyPass) {
+TEST(ShardIdle, DefaultWithWakeFdsIsParkUntilWorkAfterTheAeronSpinYieldPhase) {
     FakeFds f;
     NodeConfig c;   // defaults: wake on, spins/yields auto, maxPark 200 us
     auto idle = makeShardIdle(c, f.p, 1);
     auto* p = dynamic_cast<ParkUntilWorkIdle*>(idle.get());
     ASSERT_NE(p, nullptr) << "default shard idle = park-until-work";
     EXPECT_EQ(p->wakeFdCount(), 1);
-    EXPECT_EQ(p->shape(), (IdleShape{0, 0, 1'000, 200'000}));
+    EXPECT_EQ(p->shape(), (IdleShape{10, 20, 1'000, 200'000})) << "review M1: Aeron spin/yield before the first park";
 }
 
 TEST(ShardIdle, WakeOffIsTheLegacyAeronBackoff) {

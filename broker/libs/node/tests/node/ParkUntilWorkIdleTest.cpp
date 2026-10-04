@@ -1,6 +1,6 @@
 // ParkUntilWorkIdleTest.cpp — A7: the shard-worker idle strategy's shape (spin -> yield -> park, one action
 // per idle pass, reset on work) and its park-until-work semantics on readiness fds (a pipe stands in for the
-// driver's epoll fds here; the real-driver wake is EmbeddedDriverTest's DriverWakeFds tests, Linux).
+// driver's epoll fds here; the real-driver wake is EmbeddedDriverTest's driver-wake tests, Linux).
 #include <rune/node/ParkUntilWorkIdle.h>
 
 #include <gtest/gtest.h>
@@ -62,9 +62,8 @@ TEST(ParkUntilWorkIdle, WorkResetsToStart) {
     idle.idle(0); EXPECT_EQ(idle.phase(), Phase::Spinning) << "a reset restarts the spin phase";
 }
 
-// The derived wake shape (0 spins, 0 yields): the FIRST empty pass parks — the regression this fixes is a
-// worker that polled ~30 syscall-heavy passes (~1 ms) before every park and so never parked under load.
-TEST(ParkUntilWorkIdleRegression, WakeShapeParksOnFirstEmptyPass) {
+// A zero spin / yield shape (RUNE_IDLE_SPINS=0 RUNE_IDLE_YIELDS=0): the FIRST empty pass parks.
+TEST(ParkUntilWorkIdle, ZeroShapeParksOnFirstEmptyPass) {
     Pipe p;
     const int fd = p.readEnd();
     ParkUntilWorkIdle idle(IdleShape{0, 0, 1'000, 200'000}, &fd, 1);
@@ -136,4 +135,49 @@ TEST(ParkUntilWorkIdle, SanitizesShape) {
     EXPECT_EQ(idle.shape().maxYields, 0);
     EXPECT_EQ(idle.shape().minParkNs, 1);
     EXPECT_EQ(idle.shape().maxParkNs, 1);
+}
+
+// Review M1: an fsync completion on the worker's io_uring ends a park (the ring fd is in the wake set), and a
+// reaped CQ leaves the fd quiet again.  Linux with io_uring only.
+#include <rune/node/IoBackend.h>
+
+#include <fcntl.h>
+#include <filesystem>
+
+TEST(ParkUntilWorkIdleRegression, IoUringCompletionEndsParkRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "io_uring is Linux-only";
+#else
+    rune::node::IoBackend io(8, 8, rune::node::IoBackendRequest{rune::node::IoBackendKind::Uring, /*autoSelected=*/true});
+    if (io.completionFd() < 0) GTEST_SKIP() << "io_uring unavailable here: " << io.fallbackReason();
+    const auto path = std::filesystem::temp_directory_path() / ("rune_puw_uring_" + std::to_string(::getpid()));
+    const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::write(fd, "abcd", 4), 4);
+    const int cfd = io.completionFd();
+    // Quiet ring: a park waits out its period.
+    ParkUntilWorkIdle quiet(IdleShape{0, 0, 20'000'000, 20'000'000}, &cfd, 1);
+    auto t0 = std::chrono::steady_clock::now();
+    quiet.idle(0);
+    EXPECT_GE(msSince(t0), 15);
+    EXPECT_EQ(quiet.readinessWakes(), 0u);
+    // An fsync in flight: the park (5 s) ends on its completion (before or during the park: level-triggered).
+    ASSERT_NE(io.submit(fd, 0), rune::node::kNoToken);
+    ParkUntilWorkIdle idle(IdleShape{0, 0, 5'000'000'000, 5'000'000'000}, &cfd, 1);
+    t0 = std::chrono::steady_clock::now();
+    idle.idle(0);
+    EXPECT_LT(msSince(t0), 2'000) << "parked through the fsync completion";
+    EXPECT_EQ(idle.readinessWakes(), 1u);
+    int reaped = 0;
+    io.reap([&](const rune::node::FlushCompletion& c) { EXPECT_EQ(c.errorCode, 0); ++reaped; });
+    EXPECT_EQ(reaped, 1);
+    // Reaped: quiet again (no sticky wake).
+    ParkUntilWorkIdle after(IdleShape{0, 0, 20'000'000, 20'000'000}, &cfd, 1);
+    t0 = std::chrono::steady_clock::now();
+    after.idle(0);
+    EXPECT_GE(msSince(t0), 15);
+    EXPECT_EQ(after.readinessWakes(), 0u);
+    ::close(fd);
+    std::filesystem::remove(path);
+#endif
 }

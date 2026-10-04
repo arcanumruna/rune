@@ -1065,6 +1065,10 @@ public:
     // that 8 produces to one partition produce exactly 1 submit per cycle.
     // Worker-thread only; call only from single-threaded tests.
     // -----------------------------------------------------------------------
+    /// A7 review M1: the io backend's completion fd (io_uring ring fd; -1 for portable) — the shard runner
+    /// parks on it so an fsync completion ends the park.  Valid for the worker's lifetime.
+    [[nodiscard]] int ioCompletionFd() const noexcept { return io_.completionFd(); }
+
     [[nodiscard]] uint64_t ioSubmitCountForTest() const noexcept {
         return io_submitCount_;
     }

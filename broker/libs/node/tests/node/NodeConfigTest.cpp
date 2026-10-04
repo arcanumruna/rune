@@ -1341,8 +1341,8 @@ TEST(NodeConfig, RuneWorkerIdleGarbageFloorsToBackoff) {
 
 // ---------------------------------------------------------------------------
 // A7: shard-worker idle shape — RUNE_IDLE_WAKE / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS
-// (park-until-work; findings §4.12).  Derived: with wake fds the worker parks after the FIRST
-// empty pass (0 spins, 0 yields); without (wake off / unavailable) the legacy Aeron 10/20.
+// (park-until-work; findings §4.12).  Auto shape = the Aeron 10 spins / 20 yields before the first park,
+// with or without wake fds (review M1).  Strict parsing (review D3): garbage refuses startup.
 // ---------------------------------------------------------------------------
 TEST(NodeConfig, IdleWakeDefaultsOnWithAutoShape) {
     auto res = rune::node::parseNodeConfig(fakeEnv(base1node()));
@@ -1352,20 +1352,25 @@ TEST(NodeConfig, IdleWakeDefaultsOnWithAutoShape) {
     EXPECT_EQ(res.config->idleYields, rune::node::NodeConfig::kIdleAuto);
 }
 
-TEST(NodeConfig, IdleWakeOffValues) {
-    for (const char* v : {"0", "false", "off", "OFF", "no"}) {
+TEST(NodeConfig, IdleWakeAcceptsZeroOneFalseTrue) {
+    for (const auto& [v, want] : {std::pair{"0", false}, std::pair{"false", false},
+                                  std::pair{"1", true}, std::pair{"true", true}}) {
         auto base = base1node();
         base["RUNE_IDLE_WAKE"] = v;
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
         ASSERT_TRUE(res.config.has_value()) << res.error;
-        EXPECT_FALSE(res.config->idleWake) << v;
+        EXPECT_EQ(res.config->idleWake, want) << v;
     }
-    for (const char* v : {"1", "true", "on", "garbage"}) {   // anything else keeps the default (on)
+}
+
+// Review D3: an unrecognised value used to keep wake ON silently (a typo measured the wrong A/B arm).
+TEST(NodeConfigRegression, IdleWakeGarbageRefusesStartupRegression) {
+    for (const char* v : {"off", "no", "OFF", "garbage", "2"}) {
         auto base = base1node();
         base["RUNE_IDLE_WAKE"] = v;
         auto res = rune::node::parseNodeConfig(fakeEnv(base));
-        ASSERT_TRUE(res.config.has_value()) << res.error;
-        EXPECT_TRUE(res.config->idleWake) << v;
+        EXPECT_FALSE(res.config.has_value()) << v;
+        EXPECT_NE(res.error.find("RUNE_IDLE_WAKE must be 0/1/false/true"), std::string::npos) << res.error;
     }
 }
 
@@ -1379,40 +1384,40 @@ TEST(NodeConfig, IdleSpinsYieldsParse) {
     EXPECT_EQ(res.config->idleYields, 0) << "0 is explicit, not auto";
 }
 
-TEST(NodeConfig, IdleSpinsYieldsGarbageOrNegativeStaysAuto) {
-    for (const char* v : {"-5", "abc", "", "2x"}) {
-        auto base = base1node();
-        base["RUNE_IDLE_SPINS"]  = v;
-        base["RUNE_IDLE_YIELDS"] = v;
-        auto res = rune::node::parseNodeConfig(fakeEnv(base));
-        ASSERT_TRUE(res.config.has_value()) << res.error;
-        EXPECT_EQ(res.config->idleSpins, rune::node::NodeConfig::kIdleAuto) << v;
-        EXPECT_EQ(res.config->idleYields, rune::node::NodeConfig::kIdleAuto) << v;
+// Review D3: garbage / negative spins or yields used to fall back to auto silently.
+TEST(NodeConfigRegression, IdleSpinsYieldsGarbageRefusesStartupRegression) {
+    for (const char* name : {"RUNE_IDLE_SPINS", "RUNE_IDLE_YIELDS"}) {
+        for (const char* v : {"-5", "abc", "2x"}) {
+            auto base = base1node();
+            base[name] = v;
+            auto res = rune::node::parseNodeConfig(fakeEnv(base));
+            EXPECT_FALSE(res.config.has_value()) << name << "=" << v;
+            EXPECT_NE(res.error.find(std::string(name) + " must be a non-negative integer"), std::string::npos)
+                << res.error;
+        }
     }
+    auto base = base1node();
+    base["RUNE_IDLE_SPINS"] = "";   // empty = unset (auto), like every other knob
+    auto res = rune::node::parseNodeConfig(fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->idleSpins, rune::node::NodeConfig::kIdleAuto);
 }
 
 TEST(NodeConfig, ShardIdleShapeDerivation) {
     rune::node::NodeConfig c;
     c.idleMaxParkUs = 200;
-    // Wake fds available + auto -> park after the first empty pass.
-    const auto w = c.shardIdleShape(/*wakeFdsAvailable=*/true);
-    EXPECT_EQ(w.maxSpins, 0);
-    EXPECT_EQ(w.maxYields, 0);
+    // Auto: the Aeron spin / yield phase before the first park (review M1), park 1 µs doubling to maxPark.
+    const auto w = c.shardIdleShape();
+    EXPECT_EQ(w.maxSpins, 10);
+    EXPECT_EQ(w.maxYields, 20);
     EXPECT_EQ(w.minParkNs, 1'000);
     EXPECT_EQ(w.maxParkNs, 200'000) << "maxPark = RUNE_IDLE_MAX_PARK_US";
-    // No wake fds (non-Linux / wake off) + auto -> the legacy Aeron backoff shape.
-    const auto n = c.shardIdleShape(/*wakeFdsAvailable=*/false);
-    EXPECT_EQ(n.maxSpins, 10);
-    EXPECT_EQ(n.maxYields, 20);
-    EXPECT_EQ(n.maxParkNs, 200'000);
-    // Explicit values win in both cases.
+    // Explicit values win.
     c.idleSpins = 2; c.idleYields = 4; c.idleMaxParkUs = 50;
-    for (bool wake : {true, false}) {
-        const auto e = c.shardIdleShape(wake);
-        EXPECT_EQ(e.maxSpins, 2);
-        EXPECT_EQ(e.maxYields, 4);
-        EXPECT_EQ(e.maxParkNs, 50'000);
-    }
+    const auto e = c.shardIdleShape();
+    EXPECT_EQ(e.maxSpins, 2);
+    EXPECT_EQ(e.maxYields, 4);
+    EXPECT_EQ(e.maxParkNs, 50'000);
 }
 
 TEST(NodeConfig, ShardIdleUsesWakeOnlyWhenEnabled) {
@@ -1698,7 +1703,7 @@ TEST(NodeConfig, AeronUdpGsoDefaultsOnAndEnvTurnsItOff) {
     EXPECT_NE(bad.error.find("RUNE_AERON_UDP_GSO"), std::string::npos) << bad.error;
 }
 
-// A7: epoll-first transport polling (DriverWakeFds.h rune_driver_epoll_poll_install) — default on, A/B-able.
+// A7: epoll-first transport polling (rune_driver_wake.h rune_driver_epoll_poll_install) — default on, A/B-able.
 TEST(NodeConfig, AeronEpollPollDefaultsOnAndEnvTurnsItOff) {
     std::map<std::string, std::string> base{{"RUNE_NODE_ID","0"},{"RUNE_PEERS","0@h:1"},
         {"RUNE_CLIENT_ENDPOINT","h:2"},{"RUNE_DATA_DIR","/tmp/x"}};

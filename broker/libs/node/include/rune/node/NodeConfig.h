@@ -269,26 +269,28 @@ struct NodeConfig {
     int64_t idleMaxParkUs = 200;
 
     // A7 park-until-work (findings §4.12): shard workers park in ppoll() on their invoker driver's
-    // socket-readiness fds (DriverWakeFds.h; Linux), woken by the next datagram and bounded by the backoff
-    // park period (1 µs doubling to idleMaxParkUs — today's bound for ring/timer work).  RUNE_IDLE_WAKE=0 →
-    // the legacy Aeron backoff (10 spins, 20 yields, timed park).  Measured (A/B, findings §4.12): idle
-    // cluster 39% -> 23% CPU per worker; at 20k rec/s the workers are busy with real per-batch work (>95%
-    // of passes do work), so the idle shape only trims ~7 points there.
+    // socket-readiness fds and their io_uring completion fd (rune_driver_wake.h; Linux), woken by the next
+    // datagram / fsync completion and bounded by the backoff park period (1 µs doubling to idleMaxParkUs —
+    // the bound for work that has no fd: cross-thread rings, Aeron timers).  RUNE_IDLE_WAKE=0 → the legacy
+    // Aeron backoff (timed park).  The spin / yield phase BEFORE the first park stays the Aeron 10 / 20 in
+    // both modes (review M1): fd-less work (a ring message from another thread, a conductor command, a
+    // timer) usually lands within microseconds of a busy pass, and a park there costs >= the timer slack.
     bool idleWake = true;
-    // Idle passes before parking (RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS, >= 0).  kIdleAuto = derived:
-    // 0 / 0 when the worker parks on readiness (the next datagram wakes it — polling buys nothing),
-    // else the Aeron 10 / 20.
+    // Idle passes before parking (RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS, a non-negative integer; anything
+    // else refuses startup).  kIdleAuto = the Aeron 10 / 20.
     static constexpr int32_t kIdleAuto = -1;
+    static constexpr int32_t kAeronIdleSpins  = 10;
+    static constexpr int32_t kAeronIdleYields = 20;
     int32_t idleSpins  = kIdleAuto;
     int32_t idleYields = kIdleAuto;
 
     /// Shard workers park on driver readiness unless RUNE_IDLE_WAKE=0.
     [[nodiscard]] bool shardIdleWantsWake() const noexcept { return idleWake; }
-    /// The shard-worker backoff shape, given whether the worker got readiness fds to park on.
-    [[nodiscard]] IdleShape shardIdleShape(bool wakeFdsAvailable) const noexcept {
+    /// The shard-worker backoff shape (the same with or without wake fds; review M1).
+    [[nodiscard]] IdleShape shardIdleShape() const noexcept {
         IdleShape s;
-        s.maxSpins  = idleSpins  >= 0 ? idleSpins  : (wakeFdsAvailable ? 0 : 10);
-        s.maxYields = idleYields >= 0 ? idleYields : (wakeFdsAvailable ? 0 : 20);
+        s.maxSpins  = idleSpins  >= 0 ? idleSpins  : kAeronIdleSpins;
+        s.maxYields = idleYields >= 0 ? idleYields : kAeronIdleYields;
         s.minParkNs = 1'000;
         s.maxParkNs = idleMaxParkUs * 1'000;
         return s;

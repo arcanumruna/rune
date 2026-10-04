@@ -117,13 +117,18 @@ public:
     [[nodiscard]] bool udpGroActive() const noexcept { return (gsoActiveMask_ & 2) != 0; }
     /// GSO/GRO totals of every transport this driver closed; complete after close().
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
-    /// A7: the transport pollers poll epoll-first (DriverWakeFds.h rune_driver_epoll_poll_install).
+    /// A7: the transport pollers poll epoll-first (rune_driver_wake.h rune_driver_epoll_poll_install).
     [[nodiscard]] bool epollPollActive() const noexcept { return epollPollActive_; }
     /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
-    /// pollers' epoll instances, DriverWakeFds.h) into `out` (at most `max`); returns how many.  0 for a
-    /// threaded driver (its own thread consumes the sockets), a closed driver, or a non-Linux platform.
+    /// pollers' epoll instances, rune_driver_wake.h) into `out` (at most `max`); returns how many.  0 for a
+    /// threaded driver (its own thread consumes the sockets), a closed driver, a non-Linux platform, or
+    /// when epoll-first polling is off (review C1: Aeron's stock poller can leave an EPOLLERR socket ready,
+    /// so only epoll-first pollers, which consume every readiness, may be parked on).
     /// Owned by the driver: valid until close().  Pump thread only (like doWork).
     [[nodiscard]] int wakeFds(int* out, int max) const noexcept;
+    /// TEST SEAM (pump thread only): poller slots an epoll_wait selected since the last reset
+    /// (rune_driver_epoll_selected_for_test; 0 = the stock recvmmsg-every-socket path ran).
+    [[nodiscard]] int epollSelectedForTest(bool reset) noexcept;
     /// network_publication_max_messages_per_send the driver was started with.
     [[nodiscard]] uint32_t maxMessagesPerSend() const noexcept { return maxMessagesPerSend_; }
     /// Misuse tallies (diagnostics).  OBSERVER thread only (one at a time —

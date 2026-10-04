@@ -65,18 +65,18 @@ makeBackoffIdle(int64_t maxParkUs) {
 }
 
 // A7 (findings §4.12): the shard runner's idle strategy.  Busy-spin ONLY on the explicit
-// RUNE_WORKER_IDLE=busyspin opt-in.  Otherwise park-until-work on the agent's driver-readiness fds
-// (`fds`, n > 0) with the derived shape (park after the first empty pass); with RUNE_IDLE_WAKE=0 or no
-// fds (non-Linux): the legacy Aeron backoff — byte-identical to pre-A7 — unless RUNE_IDLE_SPINS /
-// RUNE_IDLE_YIELDS set an explicit shape (then a timed ParkUntilWorkIdle of that shape).
+// RUNE_WORKER_IDLE=busyspin opt-in.  Otherwise park-until-work on the agent's readiness fds (`fds`, n > 0:
+// driver pollers + io_uring completions) after the Aeron spin / yield phase (review M1); with
+// RUNE_IDLE_WAKE=0 or no fds (non-Linux): the legacy Aeron backoff — byte-identical to pre-A7 — unless
+// RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS set an explicit shape (then a timed ParkUntilWorkIdle of that shape).
 inline std::unique_ptr<rune::consensus::IdleStrategy>
 makeShardIdle(const NodeConfig& cfg, const int* fds, int n) {
     if (cfg.shardWorkersBusySpin()) return std::make_unique<rune::consensus::BusySpinIdleStrategy>();
     if (cfg.shardIdleWantsWake() && n > 0)
-        return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(/*wakeFdsAvailable=*/true), fds, n);
+        return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(), fds, n);
     if (cfg.idleSpins == NodeConfig::kIdleAuto && cfg.idleYields == NodeConfig::kIdleAuto)
         return makeBackoffIdle(cfg.idleMaxParkUs);
-    return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(/*wakeFdsAvailable=*/false), nullptr, 0);
+    return std::make_unique<ParkUntilWorkIdle>(cfg.shardIdleShape(), nullptr, 0);
 }
 
 /// One line per shard worker naming the RESOLVED idle (proof of the measured path in perf logs).

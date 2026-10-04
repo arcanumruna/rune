@@ -21,8 +21,16 @@
 #include <Aeron.h>
 
 #include <cstdint>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 namespace rune::node {
+
+/// A7 review D1: the shard runner's timer slack (ns).  Linux rounds every timed sleep / ppoll timeout UP by
+/// the thread's slack (50 µs default for SCHED_OTHER), so the backoff's 1 µs .. maxPark parks would really be
+/// 51 µs ..; 1 µs makes the park periods what the shape says (the bench thread does the same).
+inline constexpr unsigned long kShardTimerSlackNs = 1'000;
 
 class NodeRuntimeAgent;
 
@@ -63,6 +71,9 @@ public:
         if (!bound_) [[unlikely]] {
             driver_.bindPumpThread();          // ownership hand-off: startup thread → this thread
             if (runtimeDriver_) runtimeDriver_->bindPumpThread();
+#if defined(__linux__)
+            (void)::prctl(PR_SET_TIMERSLACK, kShardTimerSlackNs, 0, 0, 0);   // D1: this runner thread only
+#endif
             bound_ = true;
         }
         // 1. own driver duty cycle — A1: drained while it reports work (bounded),
@@ -84,13 +95,16 @@ public:
         return work;
     }
 
-    /// A7 park-until-work: the socket-readiness fds this shard's runner parks on — its own invoker
-    /// driver's, plus the fused runtime's driver when that is a separate one (A4: riding this shard's
-    /// driver adds nothing).  Read before the runner starts (setFusedRuntime first).  Returns how many.
+    /// A7 park-until-work: the readiness fds this shard's runner parks on — its own invoker driver's
+    /// sockets, the fused runtime's driver when that is a separate one (A4: riding this shard's driver adds
+    /// nothing), and the worker's io_uring completion fd (review M1: an fsync completion ends the park).
+    /// Read before the runner starts (setFusedRuntime first).  Returns how many.
     [[nodiscard]] int wakeFds(int* out, int max) const noexcept {
         int n = driver_.wakeFds(out, max);
         if (runtimeDriver_ != nullptr && runtimeDriver_ != &driver_ && n < max)
             n += runtimeDriver_->wakeFds(out + n, max - n);
+        // Only with driver fds: without them (non-Linux, epoll-first off) the runner keeps the legacy backoff.
+        if (n > 0 && n < max && worker_.ioCompletionFd() >= 0) out[n++] = worker_.ioCompletionFd();
         return n;
     }
 

@@ -1,6 +1,6 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
-#include <rune/node/DriverWakeFds.h>
+#include "rune/protocol/net/rune_driver_wake.h"
 #include "rune/protocol/net/rune_udp_gso.h"
 
 #include <spdlog/spdlog.h>
@@ -209,6 +209,10 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
 int EmbeddedDriver::wakeFds(int* out, int max) const noexcept {
     if (mode_ != DriverMode::Invoker || driver_ == nullptr) return 0;
     return rune_driver_wake_fds(driver_, out, max);
+}
+
+int EmbeddedDriver::epollSelectedForTest(bool reset) noexcept {
+    return driver_ == nullptr ? 0 : rune_driver_epoll_selected_for_test(driver_, reset ? 1 : 0);
 }
 
 int EmbeddedDriver::doWork() noexcept {

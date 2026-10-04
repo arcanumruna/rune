@@ -9,15 +9,17 @@
 // resets the backoff — at 20k rec/s one always does, so the worker never parks.  Idle cluster: 39% CPU per
 // worker for the same reason (heartbeats/status messages every few ms reset it).
 //
-// Park-until-work: park in ppoll() on the invoker driver's transport-poller epoll fds (DriverWakeFds.h) —
-// woken by the next datagram, bounded by the park period (the doubling 1 µs .. maxPark of the backoff, which
-// keeps today's bound for work that does not arrive on a socket: rings from other threads, timers).  With
-// readiness to wake on, the spin / yield passes buy nothing, so the derived shape parks after the FIRST empty
-// pass (NodeConfig::shardIdleShape).  Without fds (non-Linux, threaded driver) it parks with a plain sleep.
+// Park-until-work: park in ppoll() on readiness fds — the invoker driver's transport-poller epoll fds
+// (rune_driver_wake.h) and the worker's io_uring completion fd — woken by the next datagram or completion,
+// bounded by the park period (the doubling 1 µs .. maxPark of the backoff, which keeps the bound for work that
+// does not arrive on an fd: rings from other threads, Aeron timers).  The Aeron spin / yield phase stays in
+// front of the first park (review M1, NodeConfig::shardIdleShape): fd-less work usually lands within
+// microseconds of a busy pass.  The parks are what changes: they wake on readiness instead of sleeping out
+// their period.  Without fds (non-Linux, threaded driver) it parks with a plain sleep.
 //
 // One idle() call = exactly one action, in order: `maxSpins` immediate re-runs (no-op), `maxYields`
-// sched_yields, then parks (period doubling minPark -> maxPark).  idle(work > 0) / reset() return to the start.  Never busy-spins:
-// the spin/yield phases are bounded and every later empty pass parks.
+// sched_yields, then parks (period doubling minPark -> maxPark).  idle(work > 0) / reset() return to the start.
+// Never busy-spins: the spin/yield phases are bounded and every later empty pass parks.
 #include <rune/consensus/IdleStrategy.h>
 #include <rune/node/IdleShape.h>
 
@@ -109,7 +111,7 @@ private:
         // No ppoll: millisecond timeout, rounded up (production never gets here — wake fds are Linux-only).
         const int r = ::poll(pfds_.data(), static_cast<nfds_t>(nfds_), static_cast<int>((ns + 999'999) / 1'000'000));
 #endif
-        if (r > 0) ++wakes_;
+        if (r > 0) ++wakes_;   // (r < 0: EINTR — the next pass re-polls either way)
     }
 
     IdleShape                          shape_;

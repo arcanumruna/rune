@@ -81,6 +81,9 @@ public:
     /// exists (counts against the in-flight cap; reap drains it silently).  Returns 0, EBUSY (at
     /// the in-flight cap / SQ full — retry later) or the kernel's errno.  Cold.
     int setIoWorkerAffinity(const std::vector<int32_t>& cpus) noexcept;
+    /// A7 review M1: the ring fd.  poll(2) reports it readable (POLLIN) while the CQ holds unreaped
+    /// completions, so a worker parked in ppoll() on it wakes on the next fsync completion.  Owned here.
+    [[nodiscard]] int completionFd() const noexcept { return ringFd_; }
     /// Submitted-not-yet-reaped operations (including the internal NOP).  Worker thread / tests.
     [[nodiscard]] std::size_t inFlight() const noexcept { return inFlight_; }
     /// user_data of the internal NOP (never a real token: tokens count up from 1).

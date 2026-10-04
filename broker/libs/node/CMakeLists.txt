@@ -58,12 +58,12 @@ target_link_libraries(rune_node PUBLIC spdlog::spdlog)
 # UDP GSO/GRO Aeron transport bindings (EmbeddedDriver, HostDefaults probe).
 target_link_libraries(rune_node PUBLIC rune_gso)
 
-# A7 park-until-work: an invoker driver's readiness fds (its transport pollers' epoll instances).  A C TU:
-# Aeron's internal driver headers are C; they include siblings relative to <root>, <root>/aeron,
-# <root>/aeronmd (same probe as rune_gso).  Non-Linux compiles a stub (0 fds -> timed park).
-add_library(rune_driver_wake STATIC src/DriverWakeFds.c)
+# A7 park-until-work + epoll-first polling (review L4: ONE copy, shared with rune-client-cpp): the rune-protocol
+# sibling C source, like rune_gso.  Aeron's internal driver headers are C; they include siblings relative to
+# <root>, <root>/aeron, <root>/aeronmd (same probe as rune_gso).  Non-Linux compiles a stub (0 fds -> timed park).
+add_library(rune_driver_wake STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_driver_wake.c)
 set_target_properties(rune_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
-target_include_directories(rune_driver_wake PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_include_directories(rune_driver_wake PUBLIC ${RUNE_PROTOCOL_INCLUDE})
 if(UNIX AND NOT APPLE)
     target_link_libraries(rune_driver_wake PRIVATE aeron::aeron)
     foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
