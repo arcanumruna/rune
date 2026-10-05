@@ -3126,7 +3126,7 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u) << "ONE write+fdatasync request";
     EXPECT_EQ(s.log->persistedRecoveryPoint(), 0) << "the persisted R moved at submit";
     ASSERT_FALSE(s.log->sealedSegmentSnapshot()->empty());
-    EXPECT_FALSE(s.log->sealedSegmentSnapshot()->front().belowRecoveryPoint)
+    EXPECT_FALSE(s.log->cleanerCompactionAllowedThrough(s.log->sealedSegmentSnapshot()->front().endOffset))
         << "the cleaner gate opened before the checkpoint was durable";
     s.w.setReapPausedForTest(false);
     for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < bBase; ++i) {
@@ -3137,7 +3137,7 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u);
     EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle);
     EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on the worker loop";
-    EXPECT_TRUE(s.log->sealedSegmentSnapshot()->front().belowRecoveryPoint)
+    EXPECT_TRUE(s.log->cleanerCompactionAllowedThrough(s.log->sealedSegmentSnapshot()->front().endOffset))
         << "the cleaner may now compact the durable sealed segment";
     // Steady state: no further checkpoint without a new boundary crossing.
     const uint64_t settled = s.w.recoveryPointSubmitsForTest();

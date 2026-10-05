@@ -70,8 +70,10 @@
 #include <rune/consensus/NanoClock.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/LogCleanerAgent.h>
+#include <rune/node/NodeConfig.h>
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/SegmentProvisionerAgent.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
@@ -449,13 +451,19 @@ public:
           rt_(noop_, nullptr, nullptr, nullptr, &reg_, nullptr, nullptr, nullptr, nullptr, &pool_),
           // BrokerNode's production cleaner wiring (cycle budget 128 MiB, dedupe =
           // budget, coalescing on (NodeConfig default), 64 MiB fallback roll).
-          cleaner_(&reg_, 128 * kMiB, -1, cleanerThrottleBytesPerSec, /*useCoalescing=*/true, 64 * kMiB) {
+          cleaner_(&reg_, 128 * kMiB, -1, cleanerThrottleBytesPerSec, /*useCoalescing=*/true, 64 * kMiB),
+          // hotpath-A F2: BrokerNode's segment provisioner (NodeConfig defaults).
+          provisioner_(static_cast<std::size_t>(rune::node::NodeConfig{}.segmentProvisionDepth)),
+          provisionerIdle_(10, 20, std::chrono::microseconds{1},
+                           std::chrono::microseconds{rune::node::NodeConfig{}.segmentProvisionerMaxParkUs}) {
         static int seq = 0;
         dir_ = fs::temp_directory_path() /
                ("rune_latgate_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
         fs::remove_all(dir_);
         fs::create_directories(dir_);
         cleaner_.attachViewChannel(rt_.enableCleanerView());
+        cleaner_.setExternalProvisioner(true);                       // BrokerNode (hotpath-A)
+        provisioner_.attachViewChannel(rt_.enableProvisionerView());
         pool_.setRegistry(&reg_);                   // BrokerNode: routed ops are stamped from the registry
         Worker& w = pool_.worker(0);
         w.setWorkerIngress(nullptr, /*active=*/true);
@@ -488,6 +496,7 @@ public:
         auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
                                                     std::vector<int32_t>{1}, p->log.get(), &transport_);
         r->setExternalFollowerFlush(true);          // BrokerNode::applyWorkerDrivenDurability
+        p->log->setProvisioning(provisioner_.hook());   // ... + hotpath-A F2
         if (s.controllerManaged) {
             r->setLeaderEpochFenceFile((d / "leader-epoch-fence").string());
             r->setIsrChannel(&transport_);
@@ -508,9 +517,24 @@ public:
         observe(0);
         runner_ = std::make_unique<rune::consensus::AgentRunner>(cleaner_, cleanerIdle_, cleanerClock_);
         runner_->start();
+        provRunner_ = std::make_unique<rune::consensus::AgentRunner>(provisioner_, provisionerIdle_, provClock_);
+        provRunner_->start();
+        // Startup: let the provisioner fill every log's pool (BrokerNode starts it
+        // before any client can connect) — bounded passes, no sleep.
+        for (int i = 0; i < 2'000'000 && !poolsFull(); ++i) {
+            (void)pool_.worker(0).doWork(clock_.nowNs());
+            (void)rt_.doWork(clock_.nowNs());
+            std::this_thread::yield();
+        }
     }
     void stop() {
+        if (provRunner_) { provRunner_->stopAndJoin(); provRunner_.reset(); }
         if (runner_) { runner_->stopAndJoin(); runner_.reset(); }
+    }
+    bool poolsFull() const {
+        for (const auto& p : parts_)
+            if (p->log->readyCountForTest() < provisioner_.depth()) return false;
+        return true;
     }
 
     /// ONE measured duty pass.  `frames` are fed through the worker's ingress
@@ -518,18 +542,44 @@ public:
     int64_t pass(const std::vector<uint8_t>* const* frames, int nFrames) {
         Worker& w = pool_.worker(0);
         const int64_t t0 = clock_.nowNs();
-        for (int i = 0; i < nFrames; ++i)
-            (void)w.handleIngressFrameForTest(frames[i]->data(), frames[i]->size(), t0);
+        // hotpath-A: a HELD frame (its partition's roll is deferred — the
+        // production controlled poll ABORTs it) is re-delivered first on the
+        // next pass, ahead of the new ones (image order); a held frame stops
+        // its image, so later frames of the same partition queue behind it.
+        heldPtrs_.clear();
+        // (The image key is decoded only while something is held — rare.)
+        auto feed = [&](const std::vector<uint8_t>* f, int64_t key) {
+            if (!heldPtrs_.empty()) {
+                if (key == 0) key = imageKey(*f);
+                for (const auto& hk : heldPtrs_) if (hk.second == key) { heldPtrs_.emplace_back(f, key); return; }
+            }
+            if (w.handleIngressFrameForTest(f->data(), f->size(), t0) < 0) {
+                heldPtrs_.emplace_back(f, key != 0 ? key : imageKey(*f));
+                ++holds;
+            }
+        };
+        for (std::size_t i = 0; i < carried_.size(); ++i) feed(&carried_[i], carriedKeys_[i]);
+        for (int i = 0; i < nFrames; ++i) feed(frames[i], 0);
         const int64_t tIntake = clock_.nowNs();
         (void)w.doWork(t0);
         const int64_t tWorker = clock_.nowNs();
         (void)rt_.doWork(t0);
         const int64_t t1 = clock_.nowNs();
         lastSplit = {tIntake - t0, tWorker - tIntake, t1 - tWorker};
+        // Outside the timed window: own copies of the frames still held.
+        if (!heldPtrs_.empty() || !carried_.empty()) {
+            std::vector<std::vector<uint8_t>> next;
+            std::vector<int64_t> keys;
+            for (const auto& [hp, hk] : heldPtrs_) { next.push_back(*hp); keys.push_back(hk); }
+            carried_.swap(next);
+            carriedKeys_.swap(keys);
+        }
         drainReturns();
         return t1 - t0;
     }
     Split lastSplit{};
+    uint64_t holds = 0;   ///< frames held (re-delivered later) — back-pressure, not loss
+    std::size_t heldFrames() const noexcept { return carried_.size(); }
 
     /// Flags describing what the last pass did (compared with the previous one).
     uint32_t observe(uint32_t extra) {
@@ -642,7 +692,19 @@ private:
     rune::consensus::MonotonicNanoClock    cleanerClock_;
     rune::consensus::MonotonicNanoClock    clock_;
     std::unique_ptr<rune::consensus::AgentRunner> runner_;
+    rune::node::SegmentProvisionerAgent    provisioner_;
+    rune::consensus::BackoffIdleStrategy   provisionerIdle_;
+    rune::consensus::MonotonicNanoClock    provClock_;
+    std::unique_ptr<rune::consensus::AgentRunner> provRunner_;
     std::vector<std::unique_ptr<Part>>     parts_;
+    std::vector<std::pair<const std::vector<uint8_t>*, int64_t>> heldPtrs_;   // this pass's holds
+    std::vector<std::vector<uint8_t>> carried_;                                // owned, re-fed next pass
+    std::vector<int64_t>              carriedKeys_;
+    /// The image of a frame in this rig = its partition (one client).
+    static int64_t imageKey(const std::vector<uint8_t>& f) {
+        const auto m = pc::Produce::decode(f.data(), f.size());
+        return m ? ((static_cast<int64_t>(m->topicId) << 32) | static_cast<uint32_t>(m->partition)) + 1 : -1;
+    }
 };
 
 /// One measured pass + its attribution (sequenced: pass, then observe).

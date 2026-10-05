@@ -115,8 +115,15 @@ void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::stri
 // fsync on the worker.  Internal partitions (topicId < 0) run on the control
 // thread, which services neither flush requests nor pending seals: they keep
 // the inline path.
-void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId) noexcept {
-    if (topicId >= 0) replica.setExternalFollowerFlush(true);
+// hotpath-A F2: a worker-driven disk log is also PROVISIONED — the
+// SegmentProvisionerAgent keeps its ready segments; a roll never creates one
+// on the worker (it is deferred and the intake back-pressures instead).
+void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId,
+                                 rune::storage::Log::ProvisionHook provision) noexcept {
+    if (topicId < 0) return;
+    replica.setExternalFollowerFlush(true);
+    if (provision.fn != nullptr && replica.isDiskBacked() && replica.log() != nullptr)
+        replica.log()->setProvisioning(provision);
 }
 
 int32_t clampI32(int64_t v) noexcept {
@@ -428,6 +435,11 @@ void BrokerNode::start() {
     buildConsensusObjects();
     const auto t3 = sclock::now();
 
+    // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
+    //     built — every worker-driven disk log is wired to its demand hook.
+    provisionerAgent_ = std::make_unique<SegmentProvisionerAgent>(
+        static_cast<std::size_t>(config_.segmentProvisionDepth));
+
     // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
     //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
     buildReplication();
@@ -513,6 +525,11 @@ void BrokerNode::start() {
     //    enqueued but never drained if agentRunner_ hasn't started yet).
     if (cleanerRunner_) {
         cleanerRunner_->start();
+    }
+    // 8b. hotpath-A F2: the segment provisioner (its own thread: never stalled
+    //     by a compaction pass).
+    if (provisionerRunner_) {
+        provisionerRunner_->start();
     }
 
     // 9. DR-15 fix round 1: the cold peer-hostname resolver thread — every
@@ -1152,7 +1169,7 @@ void BrokerNode::buildReplication() {
                 : std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
-            applyWorkerDrivenDurability(*replica, topicId);   // Task 10 + F30
+            applyWorkerDrivenDurability(*replica, topicId, provisionHook_());   // Task 10 + F30 + hotpath-A
             if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
             // Kafka AlterPartition: user-partition ISR changes go through the
             // controller (multi-node); internal partitions keep a leader-local ISR.
@@ -1328,7 +1345,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
             : std::make_unique<PartitionReplica>(
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
-        applyWorkerDrivenDurability(*replica, topicId);   // same policy as boot (F30 fix round 1, F3)
+        applyWorkerDrivenDurability(*replica, topicId, provisionHook_());   // same policy as boot (F30 fix round 1, F3)
         if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
         if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
             replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
@@ -2481,6 +2498,18 @@ void BrokerNode::buildGateway() {
         if (runtimeAgent_) cleanerAgent_->attachViewChannel(runtimeAgent_->enableCleanerView());
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
+        // hotpath-A F2: pre-provisioning + staging renames belong to the
+        // SegmentProvisionerAgent (its own view, its own thread).
+        if (provisionerAgent_ && runtimeAgent_) {
+            cleanerAgent_->setExternalProvisioner(true);
+            provisionerAgent_->attachViewChannel(runtimeAgent_->enableProvisionerView());
+            provisionerIdleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>(
+                10, 20, std::chrono::microseconds{1}, std::chrono::microseconds{config_.segmentProvisionerMaxParkUs});
+            provisionerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+                *provisionerAgent_, *provisionerIdleStrategy_, provisionerClock_);
+            spdlog::info("BrokerNode[{}]: SegmentProvisionerAgent wired (depth={}, maxPark={}us)", nodeId,
+                         provisionerAgent_->depth(), config_.segmentProvisionerMaxParkUs);
+        }
         spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas, coalescing={}, ioThrottle={})",
                      nodeId, replicaRegistry_->replicaCount(),
                      config_.enableCompactionCoalescing ? "on" : "off",
@@ -2952,6 +2981,12 @@ void BrokerNode::stop() {
         cleanerRunner_->stopAndJoin();
     }
     cleanerAgent_.reset();
+    // hotpath-A F2: the provisioner too (workers are joined: no demand is
+    // posted any more; the logs it serves outlive it — the registry is torn
+    // down later, and ~Log frees the ready segments it left).
+    if (provisionerRunner_) {
+        provisionerRunner_->stopAndJoin();
+    }
 
     // 1c. Stop the main agent runner (signal + join the duty-cycle thread).
     if (agentRunner_) {

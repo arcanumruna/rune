@@ -28,6 +28,7 @@
 #include <rune/node/NodeConsensusAgent.h>
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/LogCleanerAgent.h>
+#include <rune/node/SegmentProvisionerAgent.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/GroupCoordinationService.h>
@@ -1008,6 +1009,16 @@ private:
     rune::consensus::BackoffIdleStrategy          cleanerIdleStrategy_;
     rune::consensus::MonotonicNanoClock           cleanerClock_;
     std::unique_ptr<rune::consensus::AgentRunner> cleanerRunner_;
+    // hotpath-A F2: the segment provisioner (see SegmentProvisionerAgent.h).
+    // Destroyed after the replica registry (declared before it is NOT required:
+    // the logs never call into it after the workers stopped).
+    std::unique_ptr<SegmentProvisionerAgent>              provisionerAgent_;
+    std::unique_ptr<rune::consensus::BackoffIdleStrategy> provisionerIdleStrategy_;
+    rune::consensus::MonotonicNanoClock                   provisionerClock_;
+    std::unique_ptr<rune::consensus::AgentRunner>         provisionerRunner_;
+    [[nodiscard]] rune::storage::Log::ProvisionHook provisionHook_() noexcept {
+        return provisionerAgent_ ? provisionerAgent_->hook() : rune::storage::Log::ProvisionHook{};
+    }
 
     // -----------------------------------------------------------------------
     // Runtime (AgentRunner + clock + idle)
