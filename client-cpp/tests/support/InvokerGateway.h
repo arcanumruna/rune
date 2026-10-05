@@ -97,6 +97,10 @@ struct InvokerGateway {
     int               errorNotLeaderNext = 0;
     int               redirectNext = 0;
     std::string       redirectTo;
+    // The next N Subscribes answer ErrorResponse{Redirect, subscribeRedirectTo}
+    // (any endpoint — e.g. a stopped node's — the client must survive it).
+    int               subscribeRedirectNext = 0;
+    std::string       subscribeRedirectTo;
     std::vector<Produced> produced;
     std::vector<Produced> held;
     // Acks sent immediately BEFORE the next ConnectResponse, from the same
@@ -966,6 +970,16 @@ private:
             const auto sv = rcc::decodeSubscribe(buf, len);
             if (!sv) return;
             subscribeCorrIds.push_back(sv->correlationId);
+            if (subscribeRedirectNext > 0) {
+                --subscribeRedirectNext;
+                ++subscribeRefusals;
+                std::vector<uint8_t> out(256 + subscribeRedirectTo.size());
+                const std::size_t n = rcc::encodeErrorResponse(
+                    out.data(), out.size(), static_cast<int16_t>(rp::ErrorCode::Redirect),
+                    std::string_view(subscribeRedirectTo), sv->sessionId, sv->correlationId);
+                send(replyFromArrival ? endpoint : 0, out.data(), n);
+                return;
+            }
             if (const auto lead = subscribeLeader.find(sv->partition);
                 lead != subscribeLeader.end() && lead->second != endpoint) {
                 ++subscribeRefusals;

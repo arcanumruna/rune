@@ -690,3 +690,24 @@ TEST(IngressEndpointRoutingRegression, UnconfirmedRedirectGuessRefreshBacksOffRe
     EXPECT_GE(requests, 2) << "an unconfirmed guess must keep the refresh cycle alive";
     EXPECT_LE(requests, 8) << "the refresh must back off, not poll every 100 ms (" << requests << " in 3 s)";
 }
+
+// DR-15 SIGTERM parity (Docker, 2026-10-05): right after a node stopped, a
+// subscriber's Subscribe was redirected to THAT node; the client could not
+// retarget to it (host gone) and finished the subscription with
+// "Redirect retarget failed" — 150 acked records never consumed.  A redirect to
+// an unreachable node is never terminal: the client keeps its session, asks for
+// metadata and re-sends the Subscribe on the answer (the cluster has moved on).
+TEST(IngressEndpointRouting, SubscribeRedirectedToAnUnreachableNodeIsRetriedRegression) {
+    Rig r(3930, 3931, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    r.connect();
+    r.gw.subscribeRedirectNext = 1;
+    r.gw.subscribeRedirectTo   = "rune-unresolvable.invalid:40200";
+    const int md = r.gw.metadataRequests;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.gw.latestSubscription(1, 0) != nullptr || sub.finished(); }))
+        << "the redirected Subscribe was never re-sent";
+    EXPECT_FALSE(sub.finished()) << "a redirect to an unreachable node finished the subscription";
+    EXPECT_NE(r.gw.latestSubscription(1, 0), nullptr);
+    EXPECT_GT(r.gw.metadataRequests, md) << "no metadata asked after the failed retarget";
+}

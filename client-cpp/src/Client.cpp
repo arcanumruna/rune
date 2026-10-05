@@ -2181,25 +2181,18 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     agent_.submitReconnect();
                 }
             } else {
-                // Retarget failed — fail ONLY the produce that triggered this
-                // redirect (identified by opt->correlationId).  This is Fix 7b:
-                // a failed retarget to a dead partition-leader must not cascade
-                // into failAll() and kill produces for other (alive) partitions.
-                // The transport stays on the current node; the next produce
-                // attempt for an alive partition will succeed on the same session.
-                //
-                // We still call failPendingSubscribes() and reset redirectPending_
-                // so the subscribe side and reconnect-pending latch are clean.
-                const std::string retargetReason =
-                    "Redirect retarget failed for endpoint: " + newEndpoint;
-                std::fprintf(stderr, "rune-client: produce corr=%lld failed: redirect retarget to %s failed\n",
-                             static_cast<long long>(opt->correlationId), newEndpoint.c_str());
-                producerHub_.failPending(opt->correlationId);  // DeliveryFailed
-                subscriberHub_.failPendingSubscribes("Redirect retarget failed");
+                // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
+                // that is unreachable right now (it just stopped — its host is gone).
+                // Never terminal: stay on the current node, ask for metadata, and
+                // re-send the pending Subscribes on the answer (the cluster moves on;
+                // the next answer redirects to the live leader or serves it).  The
+                // redirected Produce stays in flight — its attempt timer re-offers it
+                // (no redirect budget spent: nothing was re-sent).
+                std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata\n",
+                             newEndpoint.c_str());
                 redirectPending() = false;
-                if (cbError_) {
-                    invokeUserCallback_("onError", [&] { cbError_(retargetReason); });
-                }
+                if (subscriberHub_.hasPending()) resubscribeOnMetadata_ = true;
+                requestMetadataNow_();
             }
             break; // Redirect is handled; don't fall through to the error path.
         }
@@ -3799,6 +3792,20 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     for (const auto& [t, pp] : moved) producerHub_.resendPartitionViaRoute(t, pp);
     producerHub_.resendRouteParked();  // (b): fresh metadata after a NotLeader
     ++metadataResponses_;
+    // DR-15: Subscribes redirected to an unreachable node go out again now.
+    if (resubscribeOnMetadata_) [[unlikely]] {
+        resubscribeOnMetadata_ = false;
+        const auto snap = agent_.stateAndSessionId();
+        if (snap.state == session::SessionState::Connected && snap.sessionId != 0) {
+            subscriberHub_.resendPending(
+                snap.sessionId,
+                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                    return agent_.submitSend(fb, fl);
+                });
+        } else {
+            resubscribeOnMetadata_ = true;  // the reconnect's resendPending covers it too
+        }
+    }
 
     // read-rework I4: open a per-worker dynamic-MDC egress subscription for each
     // partition whose owner advertises one (per-worker egress active on the broker).
