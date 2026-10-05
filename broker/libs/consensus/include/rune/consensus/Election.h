@@ -299,6 +299,9 @@ private:
     // broadcasting NLT on the heartbeat interval so late-joining nodes can
     // discover the existing leader and converge.  No-op for followers.
     int closedLeaderHeartbeat(int64_t nowNs);
+    // ClosedLeaderStepDownRegression (DR-10 flap): CLOSED → election exits.
+    [[nodiscard]] bool hasActiveFollowerQuorum_(int64_t nowNs) const noexcept;
+    void leaveClosedForElection_(Term term, int64_t nowNs, const char* reason);
 
     // -----------------------------------------------------------------------
     // Transition helper — Election.java:1385-1438

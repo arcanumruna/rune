@@ -716,6 +716,26 @@ void Election::onRequestVote(Term    logLeadershipTermId,
     // Election.java:346-349: ignore vote requests from self
     if (candidateId == thisMemberId_) return;
 
+    // ClosedLeaderStepDownRegression: Aeron ConsensusModuleAgent.onRequestVote —
+    // outside an election a candidate with a higher term than ours means the
+    // cluster moved on → enterElection().  We then evaluate THIS request like any
+    // Canvass node would (grant iff its log is at least as fresh), instead of
+    // dropping it: a CLOSED node that never answers withholds the vote the
+    // survivors need for a majority (DR-10 flap: headless 4+ min).
+    // Only a candidate we would GRANT pulls us out (log at least as fresh as ours
+    // and allowed by the candidacy gate): a denied candidacy — stale log or a
+    // member excluded from the internal ISR — must never unseat a live leader
+    // (MAJOR-R3); the deny below still raises our candidate term as before.
+    if (state_ == ElectionState::Closed && clusterMembers_.size() > 1 &&
+        candidateTermId > leadershipTermId_ && candidateTermId > candidateTermId_ &&
+        memberById(candidateId) != nullptr &&
+        ClusterMember::compareLog(logLeadershipTermId_, appendPosition_,
+                                  logLeadershipTermId, logPosition) <= 0 &&
+        mayVoteFor(candidateId)) {
+        leaveClosedForElection_(leadershipTermId_, nowNs,
+                                "higher-term RequestVote in CLOSED → re-election");
+    }
+
     if (candidateTermId <= candidateTermId_) {
         // Election.java:351-353: stale candidate → deny
         placeVote(candidateTermId, candidateId, false);
@@ -804,6 +824,18 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
     // become unreadable after a leader partition (dr5_leader_isolation committed-loss).
     // Refresh liveness on the heartbeat, then still ignore it for election purposes.
     if (state_ == ElectionState::Closed) {
+        // ClosedLeaderStepDownRegression: a strictly-higher term from another
+        // member means an election concluded without us (we were paused or
+        // partitioned).  Aeron ConsensusModuleAgent.onNewLeadershipTerm: a
+        // higher leadershipTermId outside an election → enterElection().  Holding
+        // CLOSED here kept a resumed ex-leader a zombie of the old term forever.
+        if (leadershipTermIdArg > leadershipTermId_ &&
+            leaderMemberIdArg != thisMemberId_ &&
+            memberById(leaderMemberIdArg) != nullptr) {
+            leaveClosedForElection_(leadershipTermIdArg, nowNs,
+                                    "higher-term NLT in CLOSED → re-election");
+            return;
+        }
         if (leaderMember_ != nullptr &&
             leaderMemberIdArg == leaderMember_->id &&
             leaderMemberIdArg != thisMemberId_ &&
@@ -973,6 +1005,13 @@ void Election::onCommitPosition(int64_t nowNs,
     // Step down and re-enter CANVASS to participate, per Aeron Election.java:517-533
     // and ref docs/specs/…-reference.md line 146.
     if (leadershipTermIdArg > leadershipTermId_) {
+        // ClosedLeaderStepDownRegression: Aeron ConsensusModuleAgent.onCommitPosition
+        // enters an election on a higher term outside an election as well.
+        if (state_ == ElectionState::Closed && clusterMembers_.size() > 1) {
+            leaveClosedForElection_(leadershipTermIdArg, nowNs,
+                                    "higher-term CommitPosition in CLOSED → re-election");
+            return;
+        }
         const bool inLeaderState =
             (state_ == ElectionState::LeaderLogReplication ||
              state_ == ElectionState::LeaderReplay         ||
@@ -1075,9 +1114,50 @@ int Election::closedLeaderHeartbeat(int64_t nowNs)
         return 0;
     }
 
+    // ClosedLeaderStepDownRegression: Aeron ConsensusModuleAgent (leader slow
+    // tick): !ClusterMember.hasActiveQuorum(...) → "inactive follower quorum" →
+    // enterElection().  The leader counts itself (Aeron: member.isLeader()).  A
+    // leader paused/partitioned past the heartbeat timeout resumes here, sees no
+    // follower reported in the window, and rejoins the cluster's election instead
+    // of lingering as a zombie leader of the old term.
+    if (!hasActiveFollowerQuorum_(nowNs)) {
+        leaveClosedForElection_(leadershipTermId_, nowNs,
+                                "inactive follower quorum → re-election");
+        return 1;
+    }
+
     timeOfLastUpdateNs_ = nowNs;
     publishNewLeadershipTermToAll(nowNs);
     return 1;
+}
+
+// ClosedLeaderStepDownRegression: the leader itself is always active
+// (Aeron ClusterMember.hasActiveQuorum: member.isLeader() || isActive).
+bool Election::hasActiveFollowerQuorum_(int64_t nowNs) const noexcept
+{
+    int threshold = ClusterMember::quorumThreshold(static_cast<int>(clusterMembers_.size()));
+    for (const ClusterMember& m : clusterMembers_) {
+        if (m.id == thisMemberId_ || m.isActive(nowNs, leaderHeartbeatTimeoutNs_)) {
+            if (--threshold <= 0) return true;
+        }
+    }
+    return false;
+}
+
+// ClosedLeaderStepDownRegression: leave the CLOSED steady state for a fresh
+// election (Aeron enterElection()).  Adopts `term` durably when it is newer,
+// forgets the leader (leaderMemberId() → -1 while re-electing) and disarms the
+// follower liveness clock until a new leader is accepted.
+void Election::leaveClosedForElection_(Term term, int64_t nowNs, const char* reason)
+{
+    if (term > leadershipTermId_) {
+        candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
+            term, logPosition_, /*timestampMs=*/0);
+        leadershipTermId_ = term;
+    }
+    leaderMember_ = nullptr;
+    followerLiveness_.reset();
+    state(ElectionState::Canvass, nowNs, reason);
 }
 
 // ---------------------------------------------------------------------------
