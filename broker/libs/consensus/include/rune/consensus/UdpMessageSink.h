@@ -37,6 +37,13 @@
 //       thread), so resolution is retried continuously with no spin, no block,
 //       and no fatal path.
 //
+// DR-15 fix round 1 (2026-10-05): with a PeerResolutionSource wired (every
+// BrokerNode), a peer whose registration errored is re-added ONLY on its host's
+// resolution event from the cold PeerResolverHub (the driver answers peer hosts
+// from that off-thread cache — no getaddrinfo on this duty thread, no re-add
+// per send).  Without one (unmanaged / numeric host), the DR-BUG-4 re-register
+// below is unchanged.
+//
 // Thread-safety: ExclusivePublication is NOT thread-safe. Only the single
 // duty-cycle thread (NodeConsensusAgent) must call send().  addXxx/findXxx on
 // the Aeron ClientConductor ARE thread-safe, but resolvePending() is only ever
@@ -46,6 +53,7 @@
 #include <rune/consensus/Types.h>
 
 #include <rune/aeronutil/AeronPump.h>
+#include <rune/consensus/PeerResolution.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -74,9 +82,12 @@ public:
     UdpMessageSink(std::shared_ptr<aeron::Aeron>                            aeron,
                    const std::unordered_map<rune::consensus::NodeId,
                                              PeerEndpoint>&                 peerEndpoints,
-                   rune::aeronutil::AeronPump                               pump = {})
+                   rune::aeronutil::AeronPump                               pump = {},
+                   rune::consensus::PeerResolutionSource                    resolution = {})
         : aeron_(std::move(aeron))
     {
+        // DR-15 fix round 1: off-thread resolution events (PeerResolverHub).
+        inbox_.attach(resolution);
         // Register all peer slots.  addExclusivePublication is async — it never
         // throws for an unresolvable host here; the error (if any) surfaces later
         // in findExclusivePublication().
@@ -84,7 +95,8 @@ public:
             PeerSlot slot;
             slot.channel  = ep.channel;
             slot.streamId = ep.streamId;
-            registerPeer(slot);
+            slot.hostIdx  = inbox_.hostIndexOfChannel(ep.channel);
+            registerPeer(slot, /*retry=*/false);
             peers_.emplace(nodeId, std::move(slot));
         }
 
@@ -94,7 +106,10 @@ public:
         // fix: a temporarily-unresolvable peer must not abort node startup.
         // Default pump: 1 ms sleep between probes (legacy); invoker pump: drive
         // this shard's own driver + conductor between probes (spec §3.6).
-        (void)pump.resolve([&] { return resolvePending() == 0; }, std::chrono::seconds{5});
+        // 2026-10-05 (DR-15 audit): stop as soon as Aeron has ANSWERED every
+        // registration (resolved or errored) — an unresolvable peer no longer
+        // holds node startup for the whole 5 s budget.
+        (void)pump.resolve([&] { (void)resolvePending(); return everyPeerAnswered_(); }, std::chrono::seconds{5});
         // Partial (or zero) resolution is OK — resolvePending() runs on every
         // send() until the remaining peers come up.
     }
@@ -103,6 +118,8 @@ public:
 
     /// Test-only: number of peer publications still unresolved (runs one resolve probe).
     [[nodiscard]] int unresolvedForTest() noexcept { return resolvePending(); }
+    /// Test-only: registrations issued after the first one per peer.
+    [[nodiscard]] uint64_t reAddsForTest() const noexcept { return reAdds_; }
 
     UdpMessageSink(const UdpMessageSink&)            = delete;
     UdpMessageSink& operator=(const UdpMessageSink&) = delete;
@@ -155,37 +172,59 @@ private:
         int32_t     streamId       = 0;
         int64_t     registrationId = -1;
         bool        registered     = false;    // addExclusivePublication issued
+        int         hostIdx        = -1;       // managed peer host (-1: unmanaged / no resolver)
+        uint32_t    addGen         = 0;        // host resolution generation at the last add
+        uint32_t    failures       = 0;        // errored registrations so far
         std::shared_ptr<aeron::ExclusivePublication> pub; // null until resolved
     };
 
     // Issue addExclusivePublication for a peer slot (async; does not resolve).
-    void registerPeer(PeerSlot& slot) noexcept {
+    void registerPeer(PeerSlot& slot, bool retry = true) noexcept {
+        if (retry) ++reAdds_;
+        slot.addGen = inbox_.generation(slot.hostIdx);
         try {
             slot.registrationId = aeron_->addExclusivePublication(slot.channel, slot.streamId);
             slot.registered     = true;
         } catch (const std::exception&) {
             // addExclusivePublication is normally async and does not throw for a
-            // bad host, but guard anyway so construction can never abort.  The
-            // slot stays unregistered and is retried by resolvePending().
-            slot.registered = false;
+            // bad host, but guard anyway so construction can never abort.
+            onFailed_(slot);
         }
     }
 
-    // Non-blocking: one findExclusivePublication probe per unresolved peer.
-    // On a driver error (e.g. unresolvable host while a peer is (re)starting) the
-    // errored registration is dropped and RE-ISSUED so the driver retries DNS on
-    // a later probe — this is what allows a peer that comes up later to reconnect.
-    // NEVER throws.  Returns the number of peers still unresolved.
+    // A registration errored (DR-15: the peer's host is not resolvable yet).
+    // Managed host: re-add at once if it resolved since that add, else on its
+    // next resolution event (fix round 1, MAJOR-1: event-driven — never a
+    // send/pass count, and the driver answers peer hosts from its off-thread
+    // cache, so a re-add never blocks this thread on DNS).  Unmanaged host (no
+    // resolver wired — tests / numeric): re-added on the next probe (DR-BUG-4).
+    void onFailed_(PeerSlot& slot) noexcept {
+        ++slot.failures;
+        slot.pub.reset();
+        slot.registered     = false;
+        slot.registrationId = -1;
+        if (slot.hostIdx >= 0 && inbox_.generation(slot.hostIdx) != slot.addGen) registerPeer(slot);
+    }
+
+    void onHostResolved_(int idx) noexcept {
+        for (auto& [nodeId, slot] : peers_)
+            if (!slot.pub && !slot.registered && slot.hostIdx == idx) registerPeer(slot);
+    }
+
+    // Non-blocking: resolution events (a few loads when empty), then one
+    // findExclusivePublication probe per in-flight registration.  NEVER throws.
+    // Returns the number of peers still unresolved.
     int resolvePending() noexcept {
+        (void)inbox_.poll([this](int idx) { onHostResolved_(idx); });
+        if (unresolved_ == 0) [[likely]] return 0;
         int unresolved = 0;
         for (auto& [nodeId, slot] : peers_) {
             if (slot.pub) continue;            // already resolved
             ++unresolved;
 
             if (!slot.registered) {
-                // Registration previously failed/errored — try to re-register so
-                // a peer that has since come up can be resolved.
-                registerPeer(slot);
+                // Unmanaged host: DR-BUG-4 re-register.  Managed: wait for the event.
+                if (slot.hostIdx < 0) registerPeer(slot);
                 continue;                      // give the driver a tick to work
             }
 
@@ -198,17 +237,25 @@ private:
                 // else: still pending; keep probing on the next call.
             } catch (const std::exception&) {
                 // Driver returned an error for this registration (commonly an
-                // unresolved host for a peer that is still (re)starting).  Drop
-                // the dead registration and re-issue a fresh one so DNS is
-                // retried — do NOT propagate (would abort startup / send).
-                slot.pub.reset();
-                slot.registered     = false;
-                slot.registrationId = -1;
-                registerPeer(slot);
+                // unresolved host for a peer that is still (re)starting) — do
+                // NOT propagate (would abort startup / send).
+                onFailed_(slot);
             }
         }
+        unresolved_ = unresolved;
         return unresolved;
     }
+
+    /// Aeron answered every peer's registration at least once (ready or error).
+    [[nodiscard]] bool everyPeerAnswered_() const noexcept {
+        for (const auto& [nodeId, slot] : peers_)
+            if (!slot.pub && slot.failures == 0) return false;
+        return true;
+    }
+
+    int      unresolved_ = 1;   // > 0 until a resolvePending pass finds every peer resolved
+    uint64_t reAdds_     = 0;
+    rune::consensus::PeerResolutionInbox inbox_;   // consensus duty thread: resolution events
 
     std::shared_ptr<aeron::Aeron> aeron_;
     std::unordered_map<rune::consensus::NodeId, PeerSlot> peers_;

@@ -77,15 +77,11 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
     }
 
     PeerPub p;
-    p.peerId = peerId;
-    try {
-        p.registrationId = aeron_->addExclusivePublication(egressChannel, egressStreamId);
-        p.registered     = true;
-    } catch (const std::exception& ex) {
-        spdlog::warn("AeronPartitionTransport: addExclusivePublication failed for "
-                     "peerId={}: {}", peerId, ex.what());
-        // Leave registered=false; peer will be silently dropped on send.
-    }
+    p.peerId   = peerId;
+    p.channel  = egressChannel;
+    p.streamId = egressStreamId;
+    p.hostIdx  = inbox_.hostIndexOfChannel(egressChannel);
+    registerPub_(p);   // an error waits for the host's resolution event (DR-15), never a permanent drop
     peers_.emplace(peerId, std::move(p));
     // F27 F1: the peer's held FIFO, sized to one full outbound ring (>= 8 max-size
     // frames), allocated once here (cold) and never reallocated.
@@ -595,12 +591,16 @@ int AeronPartitionTransport::poll(int64_t nowNs)
 
     // Non-blocking probe: try to resolve pending publications.
     resolvePendingPubs();
+    // DR-15 fix round 1 (MEDIUM-2): legacy per-worker planes' peer re-adds on
+    // the node client, made HERE (its admin thread) — idle: one empty-ring poll each.
+    int brokerWork = 0;
+    for (auto* b : brokers_) brokerWork += b->doWork(*aeron_);
 
     // Shared-nothing: drain worker-marshalled outbound sends and do the real
     // peer offers here on the control thread (the only thread that touches
     // peers_/pubs). ([[rune-shared-nothing-law]]) Count folds into work so the
     // AgentRunner's IdleStrategy sees outbound activity as work (no idle).
-    int work = drainOutbound();
+    int work = drainOutbound() + brokerWork;
     work += notePlaneReconnects_();   // D9 MAJOR-1: link edges → marker re-send (cheap compares)
 
     // Drain ingress subscription with a CONTROLLED poll so onFragment can apply
@@ -1124,24 +1124,57 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
 // ---------------------------------------------------------------------------
 // resolvePendingPubs — non-blocking: one findExclusivePublication per unresolved peer.
 // ---------------------------------------------------------------------------
+void AeronPartitionTransport::registerPub_(PeerPub& p) noexcept
+{
+    if (p.attempts > 0) ++pubReAdds_;
+    p.addGen = inbox_.generation(p.hostIdx);
+    try {
+        p.registrationId = aeron_->addExclusivePublication(p.channel, p.streamId);
+        p.registered     = true;
+    } catch (const std::exception& ex) {
+        onPubFailed_(p, ex.what());
+    }
+}
+
+void AeronPartitionTransport::onPubFailed_(PeerPub& p, const char* why) noexcept
+{
+    p.registered     = false;   // the client conductor erased the errored registration: re-add, never re-find
+    p.registrationId = -1;
+    ++p.attempts;
+    if ((pubFailures_++ % 1024) == 0)
+        spdlog::warn("AeronPartitionTransport: peerId={} publication {} unresolved: {} — re-added when its "
+                     "host resolves ({} failure(s) so far)", p.peerId, p.channel, why, pubFailures_);
+    // Resolved (again) while that add was in flight: re-add now.  Unmanaged
+    // host (numeric / no resolver): a persistent channel error — dropped, as before.
+    if (p.hostIdx >= 0 && inbox_.generation(p.hostIdx) != p.addGen) registerPub_(p);
+}
+
+void AeronPartitionTransport::onHostResolved_(int idx) noexcept
+{
+    for (auto& [nodeId, peer] : peers_)
+        if (!peer.pub && !peer.registered && peer.hostIdx == idx) registerPub_(peer);
+}
+
 void AeronPartitionTransport::resolvePendingPubs()
 {
+    // DR-15 fix round 1: resolution events (a few loads when empty) — a peer
+    // that errored is re-added on its host's event, never on a pass count.
+    (void)inbox_.poll([this](int idx) { onHostResolved_(idx); });
     for (auto& [nodeId, peer] : peers_) {
-        if (peer.pub) continue;          // already resolved
-        if (!peer.registered) continue;  // registration failed at addPeer time
+        if (peer.pub || !peer.registered) continue;   // resolved / waiting for an event
 
         try {
             auto pub = aeron_->findExclusivePublication(peer.registrationId);
             if (pub) {
                 peer.pub = std::move(pub);
-                spdlog::debug("AeronPartitionTransport: pub resolved for peerId={}", peer.peerId);
+                if (peer.attempts > 0)
+                    spdlog::info("AeronPartitionTransport: peerId={} publication {} resolved after {} failed "
+                                 "attempt(s)", peer.peerId, peer.channel, peer.attempts);
+                else
+                    spdlog::debug("AeronPartitionTransport: pub resolved for peerId={}", peer.peerId);
             }
         } catch (const std::exception& ex) {
-            // Conductor signalled an error (bad channel, closed, etc.).
-            // Mark as unregistered so we don't keep probing a dead registration.
-            spdlog::warn("AeronPartitionTransport: findExclusivePublication threw for "
-                         "peerId={}: {}; dropping peer", peer.peerId, ex.what());
-            peer.registered = false;
+            onPubFailed_(peer, ex.what());
         }
     }
 }

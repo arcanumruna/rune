@@ -2,6 +2,7 @@ add_library(rune_node
     src/NodeConfig.cpp
     src/BrokerNode.cpp
     src/EmbeddedDriver.cpp
+    src/PeerResolverHub.cpp
     src/HostDefaults.cpp
     src/FdBudget.cpp
     src/ShardAgent.cpp
@@ -73,6 +74,19 @@ if(UNIX AND NOT APPLE)
     endforeach()
 endif()
 target_link_libraries(rune_node PUBLIC rune_driver_wake)
+
+# DR-15 fix round 1: the embedded drivers' cache-only peer name resolver (C glue over Aeron's internal
+# name-resolver vtable; the cache is C++ PeerResolutionInbox).  Every platform (it is not a Linux feature).
+add_library(rune_peer_name_resolver STATIC src/c/rune_peer_name_resolver.c)
+set_target_properties(rune_peer_name_resolver PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
+                      POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rune_peer_name_resolver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rune_peer_name_resolver PRIVATE aeron::aeron)
+foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+    target_include_directories(rune_peer_name_resolver PRIVATE
+        "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+endforeach()
+target_link_libraries(rune_node PUBLIC rune_peer_name_resolver)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -808,7 +822,8 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_embedded_driver_tests
                 PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
-            add_executable(rune_aeron_pump_tests tests/node/AeronPumpInvokerTest.cpp)
+            add_executable(rune_aeron_pump_tests tests/node/AeronPumpInvokerTest.cpp
+                tests/node/UnresolvedPeerRegressionTest.cpp)
             target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 

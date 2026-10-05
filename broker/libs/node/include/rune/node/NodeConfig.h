@@ -866,7 +866,17 @@ struct NodeConfig {
     /// Host part of clientEndpoint.channel (the client-facing bind host).
     std::string clientBindHost() const;
     std::string shardIngressBindChannel(int32_t w) const;  // aeron:udp?endpoint=<clientBindHost>:<ingressBase+w>
-    std::string shardReplBindChannel(int32_t w) const;     // aeron:udp?endpoint=<self.host>:<replBase+w>
+    std::string shardReplBindChannel(int32_t w) const;     // aeron:udp?endpoint=<peerBindHost>:<replBase+w>
+    /// DR-15 fix round 1 (MEDIUM-1): the host this node BINDS its peer-facing
+    /// inbound subscriptions on (consensus, replication, shard planes).  Never
+    /// depends on this node's own DNS record (a k8s headless-service record
+    /// appears only once the pod is Ready — after it bound): RUNE_PEER_BIND_HOST
+    /// when set, else self().host when numeric, else the wildcard 0.0.0.0.
+    /// self().host stays the ADVERTISED name peers dial.
+    std::string peerBindHost() const;
+    std::string selfConsensusBindChannel() const;     // aeron:udp?endpoint=<peerBindHost>:<consensusPort>
+    std::string selfReplicationBindChannel() const;   // "" when replicationPort == 0
+    std::string peerBindHostOverride;                 // RUNE_PEER_BIND_HOST (empty = derived)
     static std::string shardPeerReplChannel(const PeerConfig& p, int32_t w);  // <p.host>:<p.replBasePort+w>
     static std::string shardIngressEndpoint(const PeerConfig& p, int32_t w);  // "<p.host>:<p.ingressBasePort+w>"
 };

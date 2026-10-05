@@ -1,4 +1,5 @@
 #pragma once
+#include <rune/consensus/PeerResolution.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -1156,6 +1157,10 @@ private:
         // worker.
         bool        announced     = false;
         bool        announceBegun = false;
+        // Fix round 2 (LOW-4): the client's reply host is a NAME — resolved off
+        // the duty thread (PeerResolverHub); no publication registered yet
+        // (registrationId unused) until the numeric endpoint is known.
+        bool        awaitingResolve = false;
     };
 
     // -----------------------------------------------------------------------
@@ -1498,6 +1503,11 @@ private:
     // std::deque gives O(1) pop_front (evict-oldest) while still supporting
     // erase(it) for mid-sequence resolve/timeout removals.
     std::deque<PendingConnect>           pendingConnects_;
+    rune::consensus::HostResolvePort     hostResolver_{};   // fix round 2 (LOW-4)
+    /// Apply the hub's answers to pending connects awaiting their reply host.
+    int pollHostResolutions_();
+    /// Register the egress pub of `pending` (its channel final); false = dropped.
+    bool registerConnectEgress_(PendingConnect& pending);
 
     // Draining-release table (BR-7a fix): registrationIds that were logically
     // dropped (timeout / eviction / error) before their ExclusivePublication
@@ -1881,6 +1891,13 @@ public:
     // answers), worker psm_ authority for user partitions, SessionClose on every
     // worker at Disconnect / reap / connect timeout.  Set before the runtime runs.
     void setShardMode(bool on) noexcept { shardMode_ = on; }
+
+    /// DR-15 fix round 2 (LOW-4): a client's reply-channel HOSTNAME is resolved
+    /// by the cold resolver thread through `port` and the egress publication is
+    /// added on the numeric endpoint — no driver conductor (worker 0's thread
+    /// under fused placement) ever resolves a client-supplied name.  Unset: the
+    /// channel is added as given (Aeron resolves it).  Before the gateway runs.
+    void setHostResolver(rune::consensus::HostResolvePort port) noexcept { hostResolver_ = port; }
     [[nodiscard]] bool shardMode() const noexcept { return shardMode_; }
     [[nodiscard]] std::size_t pendingSessionClosesForTest() const noexcept { return sessionAnnouncer_.pendingCloses(); }
     void drainWorkerReturnsForTest(int64_t nowNs) { nowNs_ = nowNs; drainWorkerReturns_(); }

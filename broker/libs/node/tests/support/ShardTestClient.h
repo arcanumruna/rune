@@ -102,6 +102,12 @@ public:
     ~ShardTestClient() { pubs_.clear(); exclusivePubs_.clear(); egress_.reset(); aeron_.reset(); }
 
     const std::string& egressChannel() const noexcept { return egressChannel_; }
+    /// Advertise the reply channel under `host` (the subscription stays bound on
+    /// 127.0.0.1) — a client that sends a HOSTNAME in its ConnectRequest.
+    void advertiseEgressHost(const std::string& host) {
+        const auto colon = egressChannel_.rfind(':');
+        egressChannel_ = "aeron:udp?endpoint=" + host + egressChannel_.substr(colon);
+    }
 
     /// Aeron image session id of the last ConnectResponse / of the ack for `corr` (0 = none).
     int32_t connectImageSessionId() const noexcept { return connectImage_; }

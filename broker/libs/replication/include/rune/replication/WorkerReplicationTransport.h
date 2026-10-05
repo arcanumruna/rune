@@ -83,6 +83,8 @@
 #include <rune/aeronutil/AeronPump.h>          // spec §3.6 invoker-aware resolve
 #include <rune/replication/FollowerSlots.h>      // kMaxReplicas (flat peer array bound)
 #include <rune/replication/PartitionReplica.h>   // PartitionTransport base
+#include <rune/replication/PubAddBroker.h>       // legacy-plane control-thread re-adds
+#include <rune/consensus/PeerResolution.h>       // off-thread resolution events
 #include <rune/replication/ReplicationFrameLimits.h> // F18 frame limits (one source)
 #include <rune/replication/ReplicationMessages.h> // SBE codecs + stampTemplateId
 #include <rune_fr/FlightRecorder.h>                // #4 deep instrumentation
@@ -138,66 +140,110 @@ public:
     /// until attach() — lets a shard plane exist before its client does.
     AeronPubRegistry() noexcept = default;
 
-    /// Register + resolve every peer pub (the former ctor body).  Once only.
+    /// DR-15 fix round 1: the resolution events of this registry's owner thread
+    /// (the off-thread PeerResolverHub).  Cold; before attach().
+    void attachResolution(rune::consensus::PeerResolutionSource src) { inbox_.attach(src); }
+
+    /// LEGACY planes (they ride the node client): every re-add after startup is
+    /// made by the CONTROL thread through `broker` (review MEDIUM-2).  Before
+    /// the owner thread runs.
+    void setAddBroker(PubAddBroker* broker) noexcept { broker_ = broker; }
+
+    /// Register every peer pub and resolve what Aeron answers at startup (the
+    /// former ctor body).  Once only, on the startup thread.
+    ///
+    /// DR-15 (2026-10-05): a peer whose registration ERRORS — its hostname does
+    /// not resolve yet (the peer pod/container is itself restarting, DNS lag) —
+    /// is NOT fatal and NOT dropped: it stays Resolving (pub == nullptr: every
+    /// data send to it is refused exactly like a not-connected peer).  Fix round
+    /// 1: it is re-added ONLY on its host's resolution event (inbox_, fed by the
+    /// cold resolver thread) — never on a pass count, and no duty thread ever
+    /// resolves a name (the driver answers peer hosts from its off-thread cache).
+    /// From then on it is a peer that connected late (plane hello, ISR / catch-up).
     void attach(std::shared_ptr<aeron::Aeron>                                       aeron,
                 const std::vector<std::pair<rune::replication::NodeId, std::string>>& peerChannels,
                 int32_t peerStreamId,
                 rune::aeronutil::AeronPump pump = {}) noexcept
     {
         if (!aeron) return;  // no driver → all unresolved
-
-        struct Pending {
-            rune::replication::NodeId peerId;
-            int64_t                   regId;
-        };
-        std::vector<Pending> pending;
-        pending.reserve(peerChannels.size());
-
-        // Peers whose registration failed (add or find threw): absent from pubs_
-        // (sends to them are no-ops) and they keep allResolved() false.
-        std::size_t failedPeers = 0;
+        aeron_      = aeron;
+        streamId_   = peerStreamId;
+        // Local configuration validity (fatal at the caller): >= 1 peer and no
+        // more than the flat array holds.  Peer RESOLUTION never decides it.
+        configured_ = !peerChannels.empty() && peerChannels.size() <= kMaxPeers;
+        try {
+            resolving_.reserve(peerChannels.size());
+        } catch (...) {}
+        PubAddBroker* const broker = broker_;
+        broker_ = nullptr;   // startup adds: direct, on this (startup) thread
         for (const auto& [peerId, channel] : peerChannels) {
+            if (pubCount_ == kMaxPeers) break;
+            pubs_[pubCount_] = PeerPub{peerId, nullptr, false};
             try {
-                int64_t regId = aeron->addExclusivePublication(channel, peerStreamId);
-                pending.push_back({peerId, regId});
-            } catch (const std::exception& e) {
-                spdlog::error("AeronPubRegistry: peer {} addExclusivePublication {} failed: {}",
-                              peerId, channel, e.what());
-                ++failedPeers;
+                resolving_.push_back(Resolving{pubCount_, channel, inbox_.hostIndexOfChannel(channel)});
+            } catch (...) {
+                configured_ = false;   // allocation failure at startup: refuse (caller throws)
+                break;
             }
+            ++pubCount_;
+            addNow_(resolving_.back(), /*retry=*/false);
         }
 
-        // Bounded resolve (spec §3.6): default pump sleeps 1 ms between probes
-        // (legacy WorkerEgress behaviour); an invoker pump drives this shard's
-        // own driver + conductor instead.
-        // A peer whose registration ERRORED (find throws: bad channel, ...) is
-        // dropped from `pending` and counted in `failedPeers` — the others keep
-        // resolving; the ctor is noexcept so nothing may escape.
+        // Startup resolve (spec §3.6): until Aeron ANSWERS every registration
+        // (ready or error) — default pump sleeps 1 ms between probes, an invoker
+        // pump drives this shard's own driver + conductor instead.  An errored
+        // peer waits for its host's resolution event (never fatal).
         (void)pump.resolve([&] {
-            for (auto it = pending.begin(); it != pending.end(); ) {
-                std::shared_ptr<aeron::ExclusivePublication> pub;
-                try {
-                    pub = aeron->findExclusivePublication(it->regId);
-                } catch (const std::exception& e) {
-                    spdlog::error("AeronPubRegistry: peer {} publication failed: {}", it->peerId, e.what());
-                    ++failedPeers;
-                    it = pending.erase(it);
-                    continue;
+            (void)inbox_.poll([this](int idx) { onHostResolved_(idx); });
+            bool anyPending = false;
+            for (std::size_t i = 0; i < resolving_.size(); ) {
+                Resolving& r = resolving_[i];
+                if (r.regId >= 0) {
+                    const int st = probe_(r);
+                    if (st > 0) { eraseResolving_(i); continue; }
+                    if (st == 0 || r.regId >= 0) anyPending = true;
                 }
-                if (pub) {
-                    if (pubCount_ < kMaxPeers) pubs_[pubCount_++] = PeerPub{it->peerId, std::move(pub)};
-                    it = pending.erase(it);
-                } else {
-                    ++it;
-                }
+                ++i;
             }
-            return pending.empty();
+            return !anyPending;
         }, rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers (errors stop it)
-        // Any still-pending entries were not resolved within the window;
-        // they remain absent from pubs_ → sends to them are no-ops.
-        allResolved_ = pending.empty() && failedPeers == 0 && pubCount_ > 0 &&
-                       peerChannels.size() <= kMaxPeers;
+        broker_      = broker;
+        allResolved_ = resolving_.empty() && configured_;
     }
+
+    /// One call per owner-thread duty pass: drains the resolution events (an
+    /// empty ring is a few loads) and — only while a peer is Resolving — re-adds
+    /// a peer whose host just resolved and probes in-flight registrations.
+    /// Never resolves a name, never on a pass count.  Returns work done.
+    int drivePeerResolve() noexcept
+    {
+        int work = inbox_.poll([this](int idx) { onHostResolved_(idx); });
+        if (resolving_.empty()) [[likely]] return work;
+        if (broker_ != nullptr)
+            work += broker_->pollResults([this](rune::replication::NodeId peer, PubAddBroker::PubPtr pub) {
+                onBrokerResult_(peer, std::move(pub));
+            });
+        for (std::size_t i = 0; i < resolving_.size(); ) {
+            Resolving& r = resolving_[i];
+            if (r.regId < 0) { ++i; continue; }   // waiting for an event / at the broker
+            const int st = probe_(r);
+            if (st > 0) { ++work; eraseResolving_(i); continue; }
+            if (st < 0) ++work;
+            ++i;
+        }
+        allResolved_ = resolving_.empty() && configured_;
+        return work;
+    }
+
+    /// Local configuration valid (>= 1 peer, <= kMaxPeers) — independent of
+    /// whether every peer has resolved yet.
+    [[nodiscard]] bool configured() const noexcept { return configured_; }
+
+    /// Peers still Resolving (pub not yet created).
+    [[nodiscard]] std::size_t resolvingPeerCount() const noexcept { return resolving_.size(); }
+
+    /// Total publication re-adds issued after a registration error.
+    [[nodiscard]] uint64_t peerReAdds() const noexcept { return reAdds_; }
 
     // Non-copyable, non-movable.
     AeronPubRegistry(const AeronPubRegistry&)            = delete;
@@ -386,6 +432,10 @@ private:
         bool                                         blocked = false;   // shard plane refusal
     };
     static constexpr std::size_t kMaxPeers = FollowerSlots::kMaxReplicas;
+    // LOW-7: one outstanding broker request per peer always fits the request
+    // ring (ControlRing<1024>: 1024 / 24-byte records = 42), so requestAdd never
+    // fails for capacity.
+    static_assert(kMaxPeers <= 1024 / 24, "PubAddBroker request ring must hold one request per peer");
 
     [[nodiscard]] aeron::ExclusivePublication* findPub_(rune::replication::NodeId id) const noexcept
     {
@@ -394,10 +444,113 @@ private:
         return nullptr;
     }
 
+    // -----------------------------------------------------------------------
+    // Resolving peer (cold; owner thread only).  regId >= 0: a registration is
+    // in flight; kWaiting: waiting for its host's resolution event; kBrokered:
+    // an add request is at the control thread (legacy planes).
+    // -----------------------------------------------------------------------
+    static constexpr int64_t  kWaiting  = -1;
+    static constexpr int64_t  kBrokered = -2;
+    static constexpr uint64_t kLogEvery = 1024;   // first + every 1024th failure
+    struct Resolving {
+        std::size_t slot    = 0;      // index into pubs_
+        std::string channel;
+        int         hostIdx = -1;     // managed peer host (-1: unmanaged → no re-add)
+        int64_t     regId   = kWaiting;
+        uint32_t    addGen  = 0;      // host resolution generation at the last add
+        uint32_t    failures = 0;
+    };
+
+    void addNow_(Resolving& r, bool retry) noexcept
+    {
+        if (retry) ++reAdds_;
+        r.addGen = inbox_.generation(r.hostIdx);
+        if (broker_ != nullptr) {
+            r.regId = broker_->requestAdd(pubs_[r.slot].id) ? kBrokered : kWaiting;
+            return;
+        }
+        const auto aeron = aeron_.lock();
+        if (!aeron) { r.regId = kWaiting; return; }   // client closed (teardown)
+        try {
+            r.regId = aeron->addExclusivePublication(r.channel, streamId_);
+        } catch (const std::exception& e) {
+            onFailed_(r, e.what());
+        }
+    }
+
+    /// The registration failed: re-add at once if the host resolved (again)
+    /// since that add was issued, else wait for the next resolution event.
+    void onFailed_(Resolving& r, const char* why) noexcept
+    {
+        ++r.failures;
+        if ((failures_++ % kLogEvery) == 0)
+            spdlog::warn("AeronPubRegistry: peer {} publication {} unresolved: {} — peer stays Resolving "
+                         "until its host resolves ({} failure(s) so far)",
+                         pubs_[r.slot].id, r.channel, why, failures_);
+        r.regId = kWaiting;
+        if (r.hostIdx >= 0 && inbox_.generation(r.hostIdx) != r.addGen) addNow_(r, /*retry=*/true);
+    }
+
+    void onHostResolved_(int idx) noexcept
+    {
+        for (auto& r : resolving_)
+            if (r.hostIdx == idx && r.regId == kWaiting) addNow_(r, /*retry=*/true);
+    }
+
+    void onBrokerResult_(rune::replication::NodeId peer, PubAddBroker::PubPtr pub) noexcept
+    {
+        for (std::size_t i = 0; i < resolving_.size(); ++i) {
+            Resolving& r = resolving_[i];
+            if (pubs_[r.slot].id != peer || r.regId != kBrokered) continue;
+            if (pub) {
+                pubs_[r.slot].pub = std::move(pub);
+                eraseResolving_(i);
+            } else {
+                onFailed_(r, "registration error (via control thread)");
+            }
+            return;
+        }
+    }
+
+    /// 1 = resolved (pub installed), 0 = not answered yet, -1 = errored.
+    int probe_(Resolving& r) noexcept
+    {
+        std::shared_ptr<aeron::ExclusivePublication> pub;
+        const auto aeron = aeron_.lock();
+        if (!aeron) return 0;
+        try {
+            pub = aeron->findExclusivePublication(r.regId);
+        } catch (const std::exception& e) {
+            onFailed_(r, e.what());
+            return -1;
+        }
+        if (!pub) return 0;
+        if (r.failures > 0)
+            spdlog::info("AeronPubRegistry: peer {} publication {} resolved after {} failed attempt(s)",
+                         pubs_[r.slot].id, r.channel, r.failures);
+        pubs_[r.slot].pub = std::move(pub);
+        return 1;
+    }
+
+    void eraseResolving_(std::size_t i) noexcept
+    {
+        if (i + 1 != resolving_.size()) resolving_[i] = std::move(resolving_.back());
+        resolving_.pop_back();
+    }
+
     bool                           allResolved_ = false;
+    bool                           configured_  = false;
     uint64_t                       oversizeDrops_ = 0;   // F3 r6: owner-worker-thread only
     std::array<PeerPub, kMaxPeers> pubs_{};
     std::size_t                    pubCount_    = 0;
+    // Non-owning (never extends the client's life past its owner's teardown).
+    std::weak_ptr<aeron::Aeron>    aeron_;               // for re-adds (owner thread)
+    int32_t                        streamId_    = 0;
+    std::vector<Resolving>         resolving_;           // cold: peers without a pub yet
+    rune::consensus::PeerResolutionInbox inbox_;         // owner thread: resolution events
+    PubAddBroker*                  broker_      = nullptr;   // legacy planes: control-thread adds
+    uint64_t                       failures_    = 0;
+    uint64_t                       reAdds_      = 0;
 };
 
 // ===========================================================================
@@ -453,7 +606,8 @@ public:
     {}
 
     /// Register + resolve the inbound sub and every peer pub on `aeron`.  Once
-    /// only (startup thread, before the worker runner).  Returns resolved().
+    /// only (startup thread, before the worker runner).  Returns resolved() —
+    /// false only for a LOCAL failure; unresolved peers stay Resolving.
     bool attach(std::shared_ptr<aeron::Aeron> aeron,
                 const std::vector<std::pair<rune::replication::NodeId, std::string>>& peerChannels,
                 int32_t peerStreamId, rune::aeronutil::AeronPump pump = {}) noexcept
@@ -517,13 +671,43 @@ public:
     ~WorkerReplicationTransportImpl() override = default;
 
     // -----------------------------------------------------------------------
-    // resolved — true iff inbound sub AND every peer pub are live.
+    // resolved — the plane is USABLE: its inbound sub is live and its peer set
+    // is validly configured.  2026-10-05 (DR-15): peer publications that have
+    // not resolved yet (peer hostname unresolvable while it restarts) do NOT
+    // make the plane unusable — they stay Resolving and are re-added by
+    // drivePeerResolve(); allPeersResolved() reports them.  Only genuinely
+    // local failures (own bind / bad config) leave resolved() false.
     // -----------------------------------------------------------------------
     [[nodiscard]] bool resolved() const noexcept
     {
         if (testMode_) return pubReg_.allResolved();
-        return sub_ != nullptr && pubReg_.allResolved();
+        if constexpr (std::is_same_v<PubRegistry, AeronPubRegistry>)
+            return sub_ != nullptr && pubReg_.configured();
+        else
+            return sub_ != nullptr && pubReg_.allResolved();
     }
+
+    /// Every peer publication resolved (no peer still Resolving).
+    [[nodiscard]] bool allPeersResolved() const noexcept { return pubReg_.allResolved(); }
+
+    /// One call per worker pass: drain resolution events (a few loads when
+    /// empty); re-add a Resolving peer on its host's event and probe in-flight
+    /// registrations.  Never resolves a name.  Owner thread only.
+    int drivePeerResolve() noexcept
+    {
+        if constexpr (requires(PubRegistry& r) { r.drivePeerResolve(); })
+            return pubReg_.drivePeerResolve();
+        else
+            return 0;
+    }
+
+    /// DR-15 fix round 1 (production registry): resolution events of the
+    /// owner thread, and — legacy planes — the control-thread add broker.
+    /// Both before attach().
+    void attachResolution(rune::consensus::PeerResolutionSource src) { pubReg_.attachResolution(src); }
+    void setAddBroker(PubAddBroker* broker) noexcept { pubReg_.setAddBroker(broker); }
+    [[nodiscard]] std::size_t resolvingPeerCount() const noexcept { return pubReg_.resolvingPeerCount(); }
+    [[nodiscard]] uint64_t peerReAddsForTest() const noexcept { return pubReg_.peerReAdds(); }
 
     // Construction-time classification (spec §3.5a.1): the production registry is
     // the replica's concrete, de-virtualised arm; any test registry stays Generic.
@@ -724,6 +908,11 @@ public:
     //   Unverified{lastHelloSentNs}         -- matching hello -->  Verified{sessionId}
     //   Unverified / Verified / Refused     -- mismatched hello -> Refused{sessionId, peerWorkerCount, peerPlane, lastHelloSentNs}
     //   Refused / Verified                  -- matching hello -->  Verified{sessionId}   (heals; new session recorded)
+    // An UNRESOLVED peer (DR-15: its publication is still Resolving) is treated
+    // like an unreachable one, with one asymmetry (Kafka's one-way partition):
+    // its hellos still reach this node, so this side can go Verified (and record
+    // its fetches) while the peer stays Unverified until our publication to it
+    // resolves; it stays in the ISR only while caught up, then lag-shrinks.
     // Every hello is (re)evaluated, including from a refused peer: a restarted
     // peer presents a NEW image session, so a peer that was fixed and restarted
     // heals both ways without restarting this node (review M3).

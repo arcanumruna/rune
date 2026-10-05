@@ -1868,3 +1868,193 @@ TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastAeronLivenessDefault) 
     if (alive) { ::kill(child, SIGKILL); ::waitpid(child, &status, 0); }
     ::close(beat[0]);
 }
+
+// ===========================================================================
+// DR-15 (2026-10-05): two brokers restarted at once both EXITED — each node's
+// shard replication plane registers a publication to every peer at startup; the
+// co-restarting peer had no DNS record yet ("Unresolved - endpoint=rune-2:41256"),
+// the plane attach failed and BrokerNode threw "shard 0 replication plane did not
+// resolve — refusing to start".  A node MUST start and serve with any peer
+// unresolvable (RFC 6761 ".invalid" never resolves).  RED on bc153c3: start() threw.
+// ===========================================================================
+TEST(UnresolvedPeerStartupRegression, NodesStartAndServeWhileAPeerHostnameIsUnresolvableRegression) {
+    TmpDir d0{"unres0"}, d1{"unres1"}, cdir{"unresc"};
+    const auto ports = ShardPorts::discover(3, 1);
+    auto cfgFor = [&](int32_t id, const fs::path& dir) {
+        auto c = asymConfig(id, dir, ports, 3, /*workers=*/1);
+        c.replicaLagMaxMs = 500;                              // the absent peer leaves the ISR fast
+        for (auto& p : c.peers)
+            if (p.id == 2) p.host = "rune-unresolvable.invalid";   // node 2's pod is restarting: no DNS yet
+        return c;
+    };
+    BrokerNode n0{cfgFor(0, d0.path)}, n1{cfgFor(1, d1.path)};
+    ASSERT_NO_THROW(n0.start()) << "a node must start while a peer hostname is unresolvable";
+    ASSERT_NO_THROW(n1.start()) << "a node must start while a peer hostname is unresolvable";
+    ASSERT_TRUE(n0.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms)) << "no consensus with the resolvable peer";
+    // The shard planes of the two live nodes verify each other; node 2 stays
+    // unverified (its publication is still Resolving, re-added on each node's passes).
+    ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 1) == PS::Verified; }));
+    ASSERT_TRUE(eventually([&] { return peerState(n1, 0, 0) == PS::Verified; }));
+    EXPECT_EQ(peerState(n0, 0, 2), PS::Unverified);
+    EXPECT_FALSE(onPlane(n0, 0, [](WorkerReplicationTransport& t) { return t.allPeersResolved(); }));
+    // ... and the cluster serves: an acks=all produce commits on the two live nodes.
+    int32_t part = -1;
+    for (int32_t p = 0; p < kAsymPartitions && part < 0; ++p)
+        if (staticLeader(p, 3) != 2) part = p;
+    ASSERT_GE(part, 0);
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid0, 0);
+        int32_t leader = -1;
+        ASSERT_TRUE(eventually([&] {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                if (pi.topicId == 0 && pi.partition == part && (pi.leaderId == 0 || pi.leaderId == 1))
+                    leader = pi.leaderId;
+            return leader >= 0;
+        }, 400)) << "no live partition leader advertised";
+        const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+        ASSERT_GT(sid, 0);
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, part,
+                                    /*acks=all*/1, makeBatch(4), /*maxAttempts=*/2000);
+        ASSERT_TRUE(ack.has_value()) << "acks=all never committed with an unresolvable third peer";
+    }
+    n1.stop(); n0.stop();
+}
+
+// ===========================================================================
+// DR-15 fix round 1 (MEDIUM-3): node 2 starts LATE and its hostname only
+// becomes resolvable then (the SAME name — no channel swap): nodes 0 and 1
+// learn it from their cold resolver thread, re-add every peer publication to
+// it (consensus sink, internal plane, shard plane) on that event, and node 2
+// catches up and rejoins the ISR.  Node 2's OWN name never resolves for itself
+// (k8s headless record before Ready — MEDIUM-1): it binds its peer-facing
+// inbound on the wildcard and still starts.
+// ===========================================================================
+TEST(UnresolvedPeerStartupRegression, LatePeerJoinsAfterItsHostnameResolvesRegression) {
+    TmpDir d0{"late0"}, d1{"late1"}, d2{"late2"}, cdir{"latec"};
+    const auto ports = ShardPorts::discover(3, 1);
+    const std::string kLate = "rune-late.test";
+    std::atomic<bool> lateResolvable{false};
+    auto cfgFor = [&](int32_t id, const fs::path& dir) {
+        auto c = asymConfig(id, dir, ports, 3, /*workers=*/1);
+        c.replicaLagMaxMs = 500;                              // the absent peer leaves the ISR fast
+        for (auto& p : c.peers)
+            if (p.id == 2) p.host = kLate;
+        return c;
+    };
+    auto peerView = [&](const std::string& host, std::uint32_t& ip) {
+        if (host != kLate || !lateResolvable.load()) return false;
+        ip = htonl(INADDR_LOOPBACK);
+        return true;
+    };
+    BrokerNode n0{cfgFor(0, d0.path)}, n1{cfgFor(1, d1.path)};
+    n0.setPeerResolveFnForTest(peerView);
+    n1.setPeerResolveFnForTest(peerView);
+    ASSERT_NO_THROW(n0.start());
+    ASSERT_NO_THROW(n1.start());
+    ASSERT_TRUE(n0.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms));
+
+    int32_t part = -1;
+    for (int32_t p = 0; p < kAsymPartitions && part < 0; ++p)
+        if (staticLeader(p, 3) == 0) part = p;
+    ASSERT_GE(part, 0);
+    ShardTestClient c(cdir.path);
+    const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid0, 0);
+    auto produceAll = [&](int records) {
+        int32_t leader = -1;
+        if (!eventually([&] {
+                for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                    if (pi.topicId == 0 && pi.partition == part && (pi.leaderId == 0 || pi.leaderId == 1))
+                        leader = pi.leaderId;
+                return leader >= 0;
+            }, 400))
+            return false;
+        const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+        if (sid <= 0) return false;
+        return c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, part,
+                                /*acks=all*/1, makeBatch(records), /*maxAttempts=*/2000)
+            .has_value();
+    };
+    ASSERT_TRUE(produceAll(4)) << "acks=all never committed on the two live nodes";
+
+    // Node 2's pod is up now: its name resolves for the others; it never resolves for itself.
+    lateResolvable = true;
+    BrokerNode n2{cfgFor(2, d2.path)};
+    n2.setPeerResolveFnForTest([](const std::string&, std::uint32_t&) { return false; });
+    ASSERT_NO_THROW(n2.start()) << "a node must start while its OWN hostname does not resolve";
+
+    ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 2) == PS::Verified; }, 4000))
+        << "node 0's shard plane never attached the late-resolving node 2";
+    ASSERT_TRUE(eventually([&] { return peerState(n2, 0, 0) == PS::Verified; }, 4000));
+    ASSERT_TRUE(eventually([&] { return rune::node::test::leoOrMinusOne(n2, 0, part) >= 4; }, 4000))
+        << "node 2 never caught up after joining late";
+    ASSERT_TRUE(produceAll(4));
+    ASSERT_TRUE(eventually([&] { return rune::node::test::leoOrMinusOne(n2, 0, part) >= 8; }, 4000))
+        << "node 2 does not receive new records (not back in the replication set)";
+    n2.stop(); n1.stop(); n0.stop();
+}
+
+// ===========================================================================
+// DR-15 fix round 2 (LOW-4): a client's reply-channel HOSTNAME (dr-e2e clients
+// send `endpoint=<container>:<port>`) is resolved by the cold resolver thread
+// and the egress publication is added on the numeric endpoint — never resolved
+// by a driver conductor (worker 0's thread under fused placement).  The name
+// below exists only in the node's resolver (Aeron's own getaddrinfo cannot
+// resolve it): RED before — the Connect never completed.
+// ===========================================================================
+TEST(UnresolvedPeerStartupRegression, ClientReplyHostnameResolvesOffThreadRegression) {
+    TmpDir dir{"crh"}, cdir{"crhc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true)};
+    node.setPeerResolveFnForTest([](const std::string& host, std::uint32_t& ip) {
+        if (host != "rune-client.test") return false;
+        ip = htonl(INADDR_LOOPBACK);
+        return true;
+    });
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    {
+        ShardTestClient c(cdir.path);
+        c.advertiseEgressHost("rune-client.test");
+        const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid, 0) << "a Connect with a reply HOSTNAME never completed";
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0,
+                                    /*acks=*/1, makeBatch(3));
+        ASSERT_TRUE(ack.has_value()) << "no worker ack on the resolved reply channel";
+    }
+    {
+        ShardTestClient bad(cdir.path);
+        bad.advertiseEgressHost("rune-client-unknown.invalid");
+        EXPECT_LT(bad.connect(gatewayChannel(ports, 0), kClientStream), 0)
+            << "an unresolvable reply host must be dropped (the client retries)";
+    }
+    node.stop();
+}
+
+// DR-15 fix round 2 (MEDIUM-B): a LEGACY node's control-thread add brokers (one
+// may hold an undelivered publication — a peer resolved during shutdown) are
+// released in stop(), while the node client is still alive.
+TEST(UnresolvedPeerStartupRegression, LegacyAddBrokersAreReleasedInStopRegression) {
+    TmpDir d0{"lgb0"};
+    const auto ports = ShardPorts::discover(2, 1);
+    auto cfg = makeShardConfig(0, d0.path, ports, 2, 1, /*fused=*/false);
+    cfg.workerMode       = NodeConfig::WorkerMode::Legacy;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    for (auto& p : cfg.peers)
+        if (p.id == 1) p.host = "rune-late.test";
+    std::atomic<bool> resolvable{false};
+    BrokerNode n0{cfg};
+    n0.setPeerResolveFnForTest([&](const std::string& host, std::uint32_t& ip) {
+        if (host != "rune-late.test" || !resolvable.load()) return false;
+        ip = htonl(INADDR_LOOPBACK);
+        return true;
+    });
+    ASSERT_NO_THROW(n0.start());
+    ASSERT_GE(n0.legacyPlaneBrokerCountForTest(), 1u) << "legacy planes must re-add through the control thread";
+    resolvable = true;   // the peer resolves while the node shuts down: a re-add may be in flight
+    n0.stop();
+    EXPECT_EQ(n0.legacyPlaneBrokerCountForTest(), 0u)
+        << "add brokers (and any undelivered publication) must be released before the client closes";
+}

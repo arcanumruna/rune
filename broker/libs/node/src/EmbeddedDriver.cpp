@@ -215,6 +215,17 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         aeron_driver_context_set_socket_so_sndbuf(ctx_, static_cast<size_t>(cfg_.socketBufferBytes));
         aeron_driver_context_set_socket_so_rcvbuf(ctx_, static_cast<size_t>(cfg_.socketBufferBytes));
     }
+    if (cfg_.peerResolution.valid()) {
+        nameInbox_.attach(cfg_.peerResolution);
+        nameLookup_ = rune_peer_name_lookup_t{&EmbeddedDriver::peerLookup_, &nameInbox_};
+        if (rune_peer_name_resolver_install(ctx_, &nameLookup_) < 0) {
+            const std::string err = aeron_errmsg();
+            aeron_driver_context_close(ctx_);
+            ctx_ = nullptr;
+            releaseGso_();
+            throw std::runtime_error("EmbeddedDriver: peer name resolver install failed: " + err);
+        }
+    }
     if (aeron_driver_init(&driver_, ctx_) < 0) {
         aeron_driver_context_close(ctx_);
         ctx_ = nullptr;
@@ -264,6 +275,15 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
                  udpGsoActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"),
                  udpGroActive() ? "on" : (cfg_.udpGso ? "unsupported" : "off"), maxMessagesPerSend_,
                  epollPollActive_ ? "epoll-first" : "stock");
+}
+
+int EmbeddedDriver::peerLookup_(void* state, const char* host, uint32_t* ipv4) noexcept {
+    auto* inbox = static_cast<rune::consensus::PeerResolutionInbox*>(state);
+    (void)inbox->poll();
+    if (host == nullptr) return 0;
+    const int idx = inbox->table()->indexOf(host);
+    if (idx < 0) return -1;
+    return inbox->addressOf(idx, *ipv4) ? 1 : 0;
 }
 
 int EmbeddedDriver::wakeFds(int* out, int max) const noexcept {

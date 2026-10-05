@@ -355,6 +355,22 @@ void BrokerNode::start() {
     topicRegistry_ = std::make_unique<rune::gateway::TopicRegistry>(
         config_.topics, config_.dataDir);
 
+    // 2b. DR-15 fix round 1: the cold peer-hostname resolver.  No duty thread
+    //     (worker / runtime / driver conductor) ever calls getaddrinfo for a
+    //     peer: every embedded driver answers the managed peer hosts from a
+    //     cache this hub feeds over rings, and every owner of a peer
+    //     publication re-adds an unresolved peer on its host's resolution
+    //     event.  One blocking pass here (startup thread, before any driver),
+    //     the hub thread starts at the end of start().
+    //     Single-node too (fix round 2): clients' reply hostnames resolve here.
+    {
+        std::vector<std::string> hosts;
+        if (!config_.isSingleNode())
+            for (const auto& peer : config_.peers) hosts.push_back(peer.host);
+        resolverHub_ = std::make_unique<PeerResolverHub>(hosts, resolveFnForTest_);
+        resolverHub_->resolveAllNow();
+    }
+
     // 3. Start embedded Aeron media driver.
     startEmbeddedDriver();
     const auto t1 = sclock::now();
@@ -499,6 +515,10 @@ void BrokerNode::start() {
         cleanerRunner_->start();
     }
 
+    // 9. DR-15 fix round 1: the cold peer-hostname resolver thread — every
+    //    consumer ring is subscribed by now (subscribe*() is startup-only).
+    if (resolverHub_) resolverHub_->start();
+
     const auto t_start = sclock::now();
     spdlog::info(
         "BrokerNode: node {} started (dataDir={}) "
@@ -597,9 +617,11 @@ void BrokerNode::buildMultiNodeConsensus() {
     // -----------------------------------------------------------------------
     const auto& selfPeer = config_.self();
     const auto t_ingress_start = sclock::now();
+    // DR-15 fix round 1 (MEDIUM-1): bind on peerBindHost() — never on this
+    // node's own DNS record (a k8s headless record appears only once Ready).
     aeronIngress_ = std::make_unique<AeronIngress>(
         aeron_,
-        selfPeer.consensusChannel(),
+        config_.selfConsensusBindChannel(),
         config_.consensusStreamId,
         *ingressRing_);
     const auto t_ingress_end = sclock::now();
@@ -622,7 +644,9 @@ void BrokerNode::buildMultiNodeConsensus() {
             };
     }
     const auto t_sink_start = sclock::now();
-    udpSink_ = std::make_unique<UdpMessageSink>(aeron_, peerEndpoints);
+    udpSink_ = std::make_unique<UdpMessageSink>(
+        aeron_, peerEndpoints, rune::aeronutil::AeronPump{},
+        resolverHub_ ? resolverHub_->subscribeOwner() : rune::consensus::PeerResolutionSource{});
     const auto t_sink_end = sclock::now();
     spdlog::debug(
         "BrokerNode[{}]: UdpMessageSink publications resolved in {:.1f}ms",
@@ -750,7 +774,7 @@ void BrokerNode::buildReplication() {
     const bool hasReplPort = (selfPeer.replicationPort != 0);
 
     if (hasReplPort && aeron_) {
-        const std::string ingressChannel = selfPeer.replicationChannel();
+        const std::string ingressChannel = config_.selfReplicationBindChannel();   // MEDIUM-1: bind host
         const int32_t     ingressStream  = config_.replicationStreamId;
 
         try {
@@ -765,6 +789,9 @@ void BrokerNode::buildReplication() {
             replTransport_->setApplyRecordsCap(
                 static_cast<int64_t>(config_.workerIngressRingBytes) / 8 -
                 static_cast<int64_t>(rune::node::workerOpFrameBytes(0)));
+
+            // DR-15 fix round 1: resolution events before any peer is added.
+            if (resolverHub_) replTransport_->attachResolution(resolverHub_->subscribeOwner());
 
             // Add each peer (excluding self) as an egress destination.
             for (const auto& peer : config_.peers) {
@@ -820,10 +847,13 @@ void BrokerNode::buildReplication() {
         if (hasPeers) {
             const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
             perWorkerReplTransports_.reserve(static_cast<std::size_t>(wc));
-            for (int32_t w = 0; w < wc; ++w)
+            for (int32_t w = 0; w < wc; ++w) {
                 perWorkerReplTransports_.push_back(std::make_unique<WorkerReplicationTransport>(
                     w, config_.shardReplBindChannel(w), config_.replBaseStreamId + w,
                     WorkerReplicationTransport::DeferredAttach{}));
+                // DR-15 fix round 1: worker w's resolution events (its OWN ring).
+                if (resolverHub_) perWorkerReplTransports_.back()->attachResolution(resolverHub_->subscribeOwner());
+            }
         }
     } else if (config_.perWorkerReplication && aeron_) {
         // Collect (peerId, peerChannel) pairs for all peers with a replication port.
@@ -840,7 +870,7 @@ void BrokerNode::buildReplication() {
 
         if (!replPeers.empty()) {
             const int32_t wc = config_.workerCount >= 1 ? config_.workerCount : 1;
-            const std::string& inboundChannel = selfPeer.replicationChannel();
+            const std::string inboundChannel = config_.selfReplicationBindChannel();   // MEDIUM-1: bind host
             if (inboundChannel.empty()) {
                 spdlog::warn("BrokerNode[{}]: perWorkerReplication=true but self has no "
                              "replicationPort — per-worker transports skipped",
@@ -850,14 +880,26 @@ void BrokerNode::buildReplication() {
                 for (int32_t w = 0; w < wc; ++w) {
                     const int32_t streamId = config_.replBaseStreamId + w;
                     auto t = std::make_unique<WorkerReplicationTransport>(
-                        aeron_, w, inboundChannel, streamId, replPeers, streamId);
+                        w, inboundChannel, streamId, WorkerReplicationTransport::DeferredAttach{});
+                    // DR-15 fix round 1: a legacy plane rides the NODE client — its
+                    // post-startup re-adds go through the control thread (MEDIUM-2),
+                    // triggered by its own resolution events.
+                    if (resolverHub_) t->attachResolution(resolverHub_->subscribeOwner());
+                    if (replTransport_) {
+                        legacyPlaneBrokers_.push_back(
+                            std::make_unique<rune::replication::PubAddBroker>(replPeers, streamId));
+                        replTransport_->addPubAddBroker(legacyPlaneBrokers_.back().get());
+                        t->setAddBroker(legacyPlaneBrokers_.back().get());
+                    }
+                    (void)t->attach(aeron_, replPeers, streamId);
                     if (!t->resolved()) {
-                        // Hard-refuse: partial plane = silent message loss for the
-                        // partitions assigned to worker w.
+                        // Hard-refuse a LOCAL failure only (inbound bind / peer
+                        // config).  DR-15: unresolved PEER pubs stay Resolving and
+                        // are re-added on the worker's passes (never fatal).
                         throw std::runtime_error(
                             "BrokerNode[" + std::to_string(config_.nodeId) +
                             "]: per-worker replication transport for worker " +
-                            std::to_string(w) + " did not resolve (Aeron registration error or driver timeout) "
+                            std::to_string(w) + " inbound did not resolve (local registration error or driver timeout) "
                             "(stream=" + std::to_string(streamId) + ") — "
                             "refusing to start with a half-wired plane");
                     }
@@ -1729,6 +1771,8 @@ void BrokerNode::buildGateway() {
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());
+        // DR-15 fix round 2 (LOW-4): clients' reply hostnames resolve off-thread.
+        if (resolverHub_) gateway_->setHostResolver(resolverHub_->subscribeHostResolver());
         // fsyncgate fail-stop: worker StorageFailure signals (and the gateway's
         // own flushDirtyLogs) land here on the runtime thread → halt.
         gateway_->setStorageFailureHandler([this](const std::string& dir, int err) {
@@ -2852,6 +2896,10 @@ void BrokerNode::stop() {
     if (stopped_) return; // idempotent (controller-owned flag, F9a)
     stopped_ = true;
 
+    // 0. DR-15 fix round 1: the cold resolver thread only posts into rings it
+    //    owns — stop it first (nothing below consumes it any more).
+    if (resolverHub_) resolverHub_->stop();
+
     // 1a. E2 inc2b: stop per-worker AgentRunner threads FIRST.
     //     Workers hold non-owning replica pointers; they must be quiesced before
     //     replicaRegistry_ is torn down.  Stop them before the cleaner and main
@@ -2971,6 +3019,10 @@ void BrokerNode::stop() {
     // still alive.  Without this clear(), those dtors run in ~BrokerNode which fires
     // after stop() has already torn down the Aeron client → use-after-close on restart.
     perWorkerReplTransports_.clear(); // WorkerReplicationTransports: deregisters per-worker Subscription + ExclusivePubs
+    // DR-15 fix round 2 (MEDIUM-B): a legacy plane's add broker may still hold an
+    // undelivered publication (resolved by the control thread after the worker
+    // stopped) — release it while the node client is alive (before aeron_.reset()).
+    legacyPlaneBrokers_.clear();
     // Per-worker ingress/egress deregister from their client while it is alive
     // (legacy: the node client; shard: the worker's own client).
     workerIngresses_.clear();
@@ -3026,6 +3078,7 @@ void BrokerNode::stop() {
 // ---------------------------------------------------------------------------
 void BrokerNode::startEmbeddedDriver() {
     auto dcfg = EmbeddedDriverConfig::fromNode(config_, config_.effectiveAeronDir());
+    if (resolverHub_) dcfg.peerResolution = resolverHub_->subscribeDriver();   // DR-15 fix round 1
     // Every embedded driver: in-process liveness (NodeConfig::shardClientLivenessTimeoutNs, default 1 h).
     dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
     nodeDriver_ = std::make_unique<EmbeddedDriver>(
@@ -3256,6 +3309,7 @@ void BrokerNode::buildShardRuntimes_() {
         }
         const std::string dir = (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
         auto dcfg = EmbeddedDriverConfig::fromNode(config_, dir);
+        if (resolverHub_) dcfg.peerResolution = resolverHub_->subscribeDriver();   // DR-15 fix round 1
         // D2: the backoff default is for the NODE driver's idle loop; a worker's invoker driver is pumped by
         // its worker (no idle loop) — keep its configured string exactly as before.
         dcfg.idleStrategy = config_.driverIdleStrategy.empty() ? std::string("sleep-ns") : config_.driverIdleStrategy;
@@ -3343,9 +3397,20 @@ void BrokerNode::attachShardRuntimes_() {
                 peerIds.push_back(static_cast<rune::replication::NodeId>(peer.id));
             }
             auto& plane = *perWorkerReplTransports_[idx];
+            // DR-15 (2026-10-05): only a LOCAL failure (own inbound bind, bad peer
+            // config) refuses to start.  A peer whose publication does not
+            // resolve (its hostname is unresolvable while it restarts — k8s pod,
+            // DNS lag) stays Resolving and the worker re-adds it on its duty
+            // passes until it resolves; it then joins like a late peer.
             if (!plane.attach(shardClients_[idx], peersW, config_.replBaseStreamId + w, pump))
                 throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
-                                         std::to_string(w) + " replication plane did not resolve — refusing to start");
+                                         std::to_string(w) + " replication plane inbound " +
+                                         config_.shardReplBindChannel(w) +
+                                         " did not resolve (local bind / peer config) — refusing to start");
+            if (!plane.allPeersResolved())
+                spdlog::warn("BrokerNode[{}]: shard {} replication plane: {} peer publication(s) unresolved at "
+                             "startup — serving without them; re-added until they resolve",
+                             config_.nodeId, w, plane.resolvingPeerCount());
             // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
             // are unknown at parse time, so each plane verifies them in-band.
             // F3 round 6, item 6: the max-batch constraint is cluster-wide —

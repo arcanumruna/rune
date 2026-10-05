@@ -971,7 +971,8 @@ void ClientGateway::evictOldestPendingConnect_()
     // returns nullptr we would push a stale regId to drainingRegistrations_
     // that never drains.  Only push to drain when resolvedPub==nullptr (pub
     // not yet resolved — the conductor still holds it in AWAITING state).
-    const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr);
+    const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr) ||
+                                        pendingConnects_.front().awaitingResolve;   // nothing registered
     // Fix round 1 (I2): an evicted entry whose announcement began holds
     // worker ack-table slots — close it on every worker (never leaked).
     closeDroppedPendingConnect_(pendingConnects_.front());
@@ -1388,22 +1389,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // Pre-allocate sessionId now so it is stable across cycles.
     const int64_t sessionId = sessions_.nextSessionId();
 
-    // Kick off the egress publication registration (returns immediately).
-    int64_t regId = -1;
-    try {
-        // A10: sparse terms — the gateway runs on a worker thread in fused placement, where a non-sparse
-        // term's tmpfs fallocate fails with EINTR while io_uring completions are pending (withSparseTerms).
-        regId = aeron_->addExclusivePublication(
-            rune::node::withSparseTerms(req.egressChannel), req.egressStreamId);
-    } catch (...) {
-        // Bad channel — drop (never crash).
-        spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel '{}'; dropping Connect",
-                     std::string(req.egressChannel));
-        return;
-    }
-
     PendingConnect pc_entry;
-    pc_entry.registrationId        = regId;
     pc_entry.sessionId             = sessionId;
     pc_entry.correlationId         = req.correlationId;
     pc_entry.requestedAtNs         = nowNs;
@@ -1412,6 +1398,27 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.egressChannel         = std::string(req.egressChannel);
     pc_entry.egressStreamId        = req.egressStreamId;
     pc_entry.clientVersion         = req.clientVersion;   // D6
+
+    // DR-15 fix round 2 (LOW-4): a reply HOSTNAME is resolved off-thread by the
+    // cold resolver (never by a driver conductor on a duty thread); the session
+    // stays pending — bounded by the connect timeout — until the hub answers.
+    const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pc_entry.egressChannel);
+    if (hostResolver_.valid() && !replyHost.empty() &&
+        !rune::consensus::PeerHostTable::isNumericHost(replyHost)) [[unlikely]] {
+        auto* host = new std::string(replyHost);
+        if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, sessionId,
+                                      static_cast<int64_t>(reinterpret_cast<std::intptr_t>(host)))) {
+            delete host;
+            spdlog::warn("ClientGateway: host-resolve ring full; dropping Connect (the client retries)");
+            return;
+        }
+        pc_entry.awaitingResolve = true;
+        pendingConnects_.push_back(std::move(pc_entry));
+        return;
+    }
+
+    // Kick off the egress publication registration (returns immediately).
+    if (!registerConnectEgress_(pc_entry)) return;
     pendingConnects_.push_back(std::move(pc_entry));
 }
 
@@ -1425,10 +1432,59 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
 //   - Otherwise → leave in pending for next cycle.
 // Never blocks.
 // ---------------------------------------------------------------------------
+bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
+{
+    try {
+        // A10: sparse terms — the gateway runs on a worker thread in fused placement, where a non-sparse
+        // term's tmpfs fallocate fails with EINTR while io_uring completions are pending (withSparseTerms).
+        pending.registrationId = aeron_->addExclusivePublication(
+            rune::node::withSparseTerms(pending.egressChannel), pending.egressStreamId);
+    } catch (...) {
+        // Bad channel — drop (never crash).
+        spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel '{}'; dropping Connect",
+                     pending.egressChannel);
+        return false;
+    }
+    return true;
+}
+
+int ClientGateway::pollHostResolutions_()
+{
+    if (!hostResolver_.valid()) [[likely]] return 0;
+    return hostResolver_.resp->poll([this](std::int32_t type, std::int64_t id, std::int64_t ip) {
+        for (auto it = pendingConnects_.begin(); it != pendingConnects_.end(); ++it) {
+            if (it->sessionId != id || !it->awaitingResolve) continue;
+            if (type != rune::consensus::kHostResolved) {
+                spdlog::warn("ClientGateway: reply host of channel '{}' does not resolve; session={} dropped "
+                             "(the client retries)", it->egressChannel, it->sessionId);
+                closeDroppedPendingConnect_(*it);
+                pendingConnects_.erase(it);
+                return;
+            }
+            in_addr a{};
+            a.s_addr = static_cast<uint32_t>(ip);
+            char buf[INET_ADDRSTRLEN] = {};
+            ::inet_ntop(AF_INET, &a, buf, sizeof buf);
+            it->egressChannel   = rune::consensus::PeerHostTable::withEndpointHost(it->egressChannel, buf);
+            it->awaitingResolve = false;
+            if ((shardMode_ && it->egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) ||
+                !registerConnectEgress_(*it)) {
+                spdlog::warn("ClientGateway: resolved egress channel '{}' unusable; session={} dropped",
+                             it->egressChannel, it->sessionId);
+                closeDroppedPendingConnect_(*it);
+                pendingConnects_.erase(it);
+            }
+            return;
+        }
+        // Not pending any more (timed out / evicted): nothing registered — nothing to release.
+    });
+}
+
 void ClientGateway::pollPendingConnects(int64_t nowNs)
 {
     // Drive the draining-release table first (bounded, non-blocking).
     drainPendingReleases();
+    (void)pollHostResolutions_();   // fix round 2 (LOW-4): an empty ring is a few loads
 
     if (pendingConnects_.empty()) return;
 
@@ -1460,7 +1516,8 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             // in that case the conductor still holds the registration in AWAITING
             // state and we must poll it until it resolves so we can drop it.
             const int64_t timedOutRegId = pending.registrationId;
-            const bool alreadyResolved  = (pending.resolvedPub != nullptr);
+            // Awaiting its reply host: no publication was ever registered.
+            const bool alreadyResolved  = (pending.resolvedPub != nullptr) || pending.awaitingResolve;
             // Task 13: a session announced (fully or partly) but never accepted
             // is closed on every worker — the client never learned its id.
             closeDroppedPendingConnect_(pending);
@@ -1482,6 +1539,8 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             }
             continue;
         }
+
+        if (pending.awaitingResolve) { ++it; continue; }   // reply host not resolved yet (LOW-4)
 
         // Try to find the publication (non-blocking).
         std::shared_ptr<aeron::ExclusivePublication> pub;
