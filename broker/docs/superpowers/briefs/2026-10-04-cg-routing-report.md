@@ -392,3 +392,198 @@ The C1 test `StaleRecordsAfterRejoinNeverMoveThePositionRegression` is kept and 
 4. **Txn Produce redirects while a group is active** complete at their own deadline (not retried, comment corrected). A follow-up could forward them to the transactional producers.
 5. **The broker branch is not rebased onto the current main (`ea807f2`).**
 6. **Docker DR:** the CG files (and `test_tx_read_committed` / `test_tx_eos`, per the re-review) need your run with both images: broker at `f820c9f`, client at `a8e6812`.
+
+---
+
+# Fix round 3
+
+This round answers review `2026-10-04-cg-redesign-review.md` (CHANGES REQUIRED: 0 CRITICAL, 2 MAJOR, 2 MEDIUM) and the controller's rulings. Nothing was pushed. No Docker. No conan.
+
+## Commits (final SHAs for the images)
+
+| Repo | Branch | SHA | Commit |
+|---|---|---|---|
+| rune-protocol | `feat/self-contained-worker-shards` | `8f6b38f` | client version 3 + `ConnectResponse.brokerVersion` |
+| broker `rune-broker-wt51` | `fix/cg-unique-ids` (on 806c259) | `ac34a9b` | Records carry the Subscribe correlationId, version gate, reliable Subscribe answers |
+| client `rune-client-cpp-wt14` | `fix/group-subscribe-routing` | `c9092f7` | exact instance identity by Subscribe correlationId, version gate, unanswered Subscribes re-sent on events |
+
+Both images are built from sources that include the sibling rune-protocol, so they need rune-protocol `8f6b38f`.
+
+## MAJOR-1: exact subscription-instance identity
+
+**Broker.** Every Records push now carries the correlationId of the client Subscribe that created the subscription. That covers:
+- the gateway inline push path;
+- the gateway PushRead path;
+- the worker push path.
+
+The correlationId is kept in `Subscription`, `BufferedSubscribe`, `WorkerOp.correlationId` (an existing SBE field) and `WorkerSubscription`.
+
+**Client, group hub.** A partition accepts a push only if all of these hold:
+- `rv.correlationId` equals the instance's own Subscribe correlationId;
+- `rv.sessionId` equals the broker session the instance was sent on;
+- the session's connect epoch is still current;
+- once bound, the subscriptionId matches as well.
+
+The first push binds the subscriptionId if the SubscribeResponse has not arrived yet. Pre-bind acceptance of "any unretired id" is **removed**. Another group consumer's subscription, a plain subscription and every retired instance carry other correlationIds, so they can never match.
+
+**Client, SubscriberHub.** A pending plain subscription is bound by its first push, matched on correlationId, the seed session id and the topic. Bound subscriptions also check the correlationId; a push with correlationId 0 is accepted, for fixtures only.
+
+**Uniqueness of correlationIds within one client:**
+- **Group fetch Subscribes** use bit 61 plus the hub's counter, so they are positive and disjoint from everything else.
+- **Plain Subscribes** use the Client's duty counter, `nextCorrId_` (small, below 2^61).
+- **Different sessions:** each Subscribe takes a fresh value whichever session it goes to, so a correlationId never repeats within one client.
+
+**Two GroupConsumers in one Client (the review's scenario A)** cannot be created through the public API: `subscribeGroup` throws on a second group (`HubCommandClient.SecondSubscribeGroupThrowsRegression`). The hub-level test covers the logic anyway.
+
+## MAJOR-2: version gate
+
+- **rune-protocol.**
+  - `kClientVersion = 3` (`kClientVersionExplicitGroupSubscriptions`).
+  - `ConnectResponse` gains an **additive trailing `brokerVersion` int32**. The body grows from 14 to 18 bytes, a 42-byte frame, with `kBrokerVersion = 3`.
+  - No existing field carried a broker version, so this minimal additive field was added.
+  - `decode` still accepts the 38-byte frame of an older broker and reads its version as 0.
+  - The golden vectors stay the 38-byte v0 form, which every decoder must keep accepting. The generator now writes that form explicitly; I regenerated all 17 vectors and they are byte-identical. The manifest notes the change.
+- **Broker.**
+  - The coordinator refuses `JoinGroup` from a session whose `clientVersion` < 3, with `ErrorCode::ProtocolVersion`. This is non-retriable and logs a warning. The session's version is read via `ClientGateway::sessionClientVersion`.
+  - `ConnectResponse` advertises version 3.
+- **Client.**
+  - On a seed connect, the hub learns `brokerVersion`. Below 3, every GroupConsumer is finished with `GroupFailReason::BrokerTooOld` (new `GroupConsumer::failReason()`), without sending a JoinGroup. That includes consumers created after connect.
+  - A JoinGroup answered `ProtocolVersion` finishes the consumer with `GroupFailReason::RefusedByBroker`, with no rejoin storm.
+- **Documentation.** The compatibility rule is documented in the client header (`GroupFailReason`), in rune-protocol `Protocol.h`, and in the broker design spec §7.
+
+## MEDIUM-1
+
+There is no longer a retired list. Instance identity is exact (correlationId), so nothing can be forgotten at a bind.
+
+- An abandoned instance can never match.
+- An abandoned, still-unanswered instance is unsubscribed as soon as its id is revealed, by its SubscribeResponse or by its first push.
+- The Fatal log text is corrected.
+
+## MEDIUM-2: no timer
+
+- **Lost answers no longer block.** The "never two unanswered instances" guard is gone, so a lost SubscribeResponse no longer blocks later Subscribes; that was the stall.
+- **Re-send on events.** `GroupConsumerHub::resendUnanswered()` re-sends every Subscribe that has neither its answer nor a push. It runs:
+  - on a leader session's accepted (re)connect;
+  - on the M1 session events (lost or Disconnected).
+
+  Each new generation re-subscribes anyway.
+- **Broker.** SubscribeResponses and Subscribe Redirect/NotLeader answers are now queued and retried under back-pressure (`enqueueOrBestEffort_`, the produce answers' ring) on a real egress publication. Test sessions with null egress keep the direct send.
+
+## LOWs
+
+- **Fixed:**
+  - LOW-1: the position is last offset + 1, via `RecordsView::lastOffsetDelta` (compaction holes inside a batch).
+  - LOW-2: the id counters abort before carrying into the node prefix.
+  - LOW-8: the stale-ConnectResponse test now asserts behind a Ping marker.
+- **Not fixed (backlog):**
+  - LOW-3: the FR marker truncates the session id.
+  - LOW-4: ids are unique per process lifetime only.
+  - LOW-5: the indirect epoch call on the hot path.
+  - LOW-6: the coordinator-subscription machinery is dead code; remove it.
+  - LOW-7: log a retention clamp.
+  - LOW-9: the watcher ignores sessions above 64.
+
+## Tests
+
+All `*Regression*`, condition-driven, no sleeps.
+
+**Broker.** On HEAD `806c259` sources, 3 new tests FAIL:
+- `WorkerPushFixture.RecordsCarryTheSubscribeCorrelationIdRegression` (got 0);
+- `CG4DeliveryFixture.GatewayRecordsCarryTheSubscribeCorrelationIdRegression` (got 0);
+- `CG4DeliveryFixture.JoinGroupFromAnOldClientIsRefusedRegression` (the old client joined).
+
+With the fix all pass. Full broker suite: **3741/3741**. `check_no_atomics` and `check_single_driver_pumper` OK.
+
+**Client.** RED tree = round-2 head `a8e6812` plus only the test infrastructure (fake gateway, test file, codec `brokerVersion` parameter):
+- `PlainSubscriptionNeverFeedsAPendingGroupSubscriptionRegression` FAILS: the member consumed the plain subscription's batch, and its position became 903.
+- `LostSubscribeResponseNeverBlocksAReassignRegression` FAILS: p1 was never subscribed again.
+
+Compile-RED only (new API):
+- client-level `GroupConsumerRefusesABrokerTooOldRegression` and `JoinGroupRefusedForVersionFinishesTheConsumerRegression`;
+- hub-level `AnotherConsumersSubscriptionNeverFeedsThisMemberRegression`, `PlainSubscriptionNeverFeedsAPendingGroupSubscriptionRegression`, `OldInstanceNeverFeedsAfterLaterBindsRegression`, plus the reworked `OnlyTheCurrentSubscriptionInstance` and `GapAdvancesThePosition` tests;
+- conformance `ConnectResponseCarriesTheBrokerVersionRegression`.
+
+All 23 client-level group-routing tests pass. Full client suite: **976/976**. Both check scripts OK.
+
+## Concerns
+
+1. **All three repos must ship together:** rune-protocol `8f6b38f`, broker `ac34a9b`, client `c9092f7`. Mixed versions are now refused loudly in both directions instead of losing data. An old client still consumes plain (non-group) subscriptions fine against the new broker.
+2. **ConnectResponse frame size.** A broker now sends a 42-byte ConnectResponse. An old client decodes it, because its decoder checks `avail >= 38` and ignores the trailing bytes. Any third-party decoder that insists on exactly 38 bytes would break. There is none in the repos I checked (rune-ql, rune-live, rune-codec and rune-fr do not decode it).
+3. **Plain Subscribes on a non-seed-led partition while a group is active** still fail, with a reason, as documented in round 2.
+4. **The seed-side direct send for test sessions** stays best-effort, by design. Real sessions are queued.
+5. **The pre-existing coordinator-subscription machinery** (`addGroupSubscription`, the carrier merge, the worker `preCarrier` cut) is dead in production; ticket to remove it (LOW-6).
+6. **Docker DR** is yours: the CG files plus `test_tx_read_committed` / `test_tx_eos`, with images from the SHAs above.
+
+---
+
+# Fix round 4
+
+This round answers section A of review `2026-10-05-cg-round3-flush-review.md` (2 MAJOR, 3 MEDIUM, 5 LOW). Section B is not mine and is untouched. Nothing was pushed. No Docker.
+
+## Commits (final SHAs)
+
+| Repo | SHA | Commit |
+|---|---|---|
+| rune-protocol (`feat/self-contained-worker-shards`) | `1ec8b4d` | ConnectResponse tests at the 42-byte form + `connect_response_v3.bin` golden (on top of `8f6b38f`) |
+| broker `rune-broker-wt51` (`fix/cg-unique-ids`) | `6a67487` | queued Subscribe retry keeps correlationId + replica; LOW-3; tests |
+| client `rune-client-cpp-wt14` (`fix/group-subscribe-routing`) | `141a29d` | MEDIUM-1/2/3, LOW-1/2, v3 conformance |
+
+## A-MAJOR-1: the queued retry dropped the correlationId
+
+- **Fix.** `trySubOp_` rebuilt the worker Subscribe op without `op.correlationId` and without `op.replica` (LOW-4). Both paths now use one builder, `ClientGateway::buildSubscribeOp_`: the direct `enqueueSubscribeOp_` and the queued `trySubOp_`.
+- **Audit of every subscribe-op and Records path:**
+  - egress-resolve waiters (they copy `BufferedSubscribe`, which carries the correlationId);
+  - a parked worker subscription later activated (same op data);
+  - a re-subscribe of the same id (updates `subscribeCorrId`);
+  - PushRead (`sub.subscribeCorrId`);
+  - inline push;
+  - worker push.
+
+  All of them carry the correlationId. `addGroupSubscription` (dead in production) passes 0.
+- **Tests.**
+  - **RED through the gateway's full-ring queue:** `ReplicaLifetimeRegression.QueuedSubscribeKeepsItsCorrelationIdAndReplicaRegression` (ShardNonBlockingTest). It fills worker 0's ring, sends `forwardSubscribeForTest(…, corr)` (the hook gained the parameter), checks the Subscribe was queued, then pumps and drains. It asserts the worker subscription's `subscribeCorrId` and `replica`. RED on `ac34a9b` sources: `subscribeCorrId` 0.
+  - **PushRead stamp (LOW-5):** `CgPushReadStampRegression.PushReadRecordsCarryTheSubscribeCorrelationIdRegression` (EosRig, gateway PushRead path end to end).
+
+## A-MAJOR-2: rune-protocol suite
+
+- **Tests updated.** The 3 `ConnectResponseCodec` tests now assert the 42-byte form (`brokerVersion` at offset 38). New: `OlderBrokerFrameDecodesAsVersionZeroRegression`.
+- **v0 goldens kept.** `connect_response.bin` and `connect_response_redirect.bin` remain the v0 decode vectors: blockLength `BODY_FIXED_V0`, `brokerVersion == 0`, and they re-encode through the v0 truncation.
+- **New golden.** `connect_response_v3.bin` (42 bytes, `brokerVersion = 3`) is in `gen_vectors.cpp`, the manifest and the README. The other 17 regenerated vectors are byte-identical.
+- **Checked in both repos.** rune-protocol `ConformanceGolden.ConnectResponseV3`, and client `ClientCodecConformance.ConnectResponseV3Regression`.
+- **Broker.** It has no golden-vector tests. Instead, `GatewayLoopbackFixture.Connect_RoundTrip` now asserts the gateway's real ConnectResponse carries `brokerVersion == kBrokerVersion` and a node-prefixed session id.
+- **Suite.** rune-protocol: **501/501** (`cmake --build build && ctest --test-dir build`; was 494/499).
+
+## MEDIUMs
+
+- **A-MEDIUM-1.** SubscriberHub binds a pending plain subscription by a push only when the seed session id is non-zero and equals the push's. Mid-connect, only the SubscribeResponse binds.
+  - Test: `SubscriberHubCommand.PushNeverBindsAPendingSubscriptionWithoutASessionRegression`. RED on `c9092f7`: the foreign push bound the subscription.
+- **A-MEDIUM-2.** `resendUnanswered(session)` re-sends only that session's unanswered Subscribes. It is called with the reconnected leader session's index and with each watcher event's session.
+  - Test: hub-level `SessionEventResendsOnlyThatSessionsUnansweredRegression`. Compile-RED (new signature); round 3 re-sent every session's.
+- **A-MEDIUM-3.** The agent records each leader session's `brokerVersion` at its accepted connect (`FetchRouter::brokerVersion`). A partition whose leader node runs a version below 3 is **parked and logged** ("partition parked until the node is upgraded") rather than subscribed, so it never stalls silently. Fresh metadata, such as the upgraded node reconnecting, retries it.
+  - Documented on `GroupFailReason`: the whole cluster must be at version 3 or later for every partition to be consumed.
+  - Test: `PartitionLedByAnOldNodeIsParkedNotSilentlyStalledRegression`. RED on `c9092f7`: it subscribed p1 on the old node.
+
+## LOWs
+
+- **Fixed:**
+  - LOW-1: group-tagged pushes skip SubscriberHub's pending-subscription lookup.
+  - LOW-2: `late_` learns an abandoned instance's id only from its own session's push (`LateSub.brokerSid`).
+  - LOW-3: the old-client JoinGroup refusal log is rate-limited to the first refusal per session and every power of two after it (bounded map).
+  - LOW-4: `replica` on retry, via the shared builder.
+  - LOW-5: a PushRead stamp test.
+- **Open (backlog):** the round-3 backlog LOWs (FR marker truncation, per-process-lifetime ids, indirect epoch call, dead coordinator-subscription machinery, retention-clamp log, watcher > 64 sessions).
+
+## Results
+
+| Suite | Result |
+|---|---|
+| rune-protocol | 501/501 |
+| broker | **3743/3743**; `check_no_atomics` and `check_single_driver_pumper` OK |
+| client | **980/980**; both check scripts OK |
+
+## Concerns
+
+1. **Ship together:** rune-protocol `1ec8b4d` (protocol headers unchanged since `8f6b38f`; only tests and vectors were added), broker `6a67487`, client `141a29d`.
+2. **During a rolling upgrade**, partitions led by not-yet-upgraded nodes are parked, not consumed, until those nodes are upgraded. That is visible in the log, but `GroupConsumer::failReason()` stays `None`, because the consumer keeps running.
+3. **The test-session (null egress) Subscribe answers** stay on the direct send by design. Real sessions are queued.
+4. **B (`wt15`) needs A's `tests/ConformanceTest.cpp`** (now plus the v3 golden test) to be green against the new rune-protocol, as the review noted.
