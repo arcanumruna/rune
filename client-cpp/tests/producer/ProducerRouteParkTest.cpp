@@ -393,3 +393,41 @@ TEST(ProducerRoutePark, MinIsrViolationIsRetriedNotFailedRegression) {
     EXPECT_EQ(t.okRecords, 1);
     EXPECT_EQ(t.failed, 0);
 }
+
+// DR-2 (2026-10-05): a Redirect re-offer refused because the leader's data
+// publication is not connected yet (session already Connected, so no connect
+// event follows) must stay queued and go out on a later pass — never wait for
+// the delivery timeout.  Before the fix the refused batch was re-sent by
+// nothing (only the attempt timer) and failed DeliveryFailed after 30 s.
+TEST(ProducerRoutePark, RefusedRedirectReofferGoesOutOnALaterPassRegression) {
+    ProducerConfig cfg = ackedCfg();
+    cfg.produceTimeoutMs  = 30'000;   // the attempt timer never fires within this test
+    cfg.deliveryTimeoutMs = 30'000;
+    ProducerImpl impl(cfg);
+    Wire w;
+    const auto sink = w.fn();
+    const std::vector<uint8_t> v(8, 1);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 1u);
+    const Frame first = w.frames[0];
+
+    // The seed answered Redirect: the re-offer to the leader route is refused
+    // (its publication is still connecting).
+    Wire refusing;
+    refusing.refuse = {0};
+    auto refuseFn = refusing.fn();
+    (void)impl.retryRedirectedProduce(first.corrId, refuseFn);
+    EXPECT_TRUE(refusing.frames.empty());
+    EXPECT_TRUE(impl.hasInFlight()) << "a refused re-offer must not fail the batch";
+
+    // The publication connects: the next duty passes re-offer the same batch.
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 2u) << "the refused redirect re-offer was never re-driven";
+    EXPECT_EQ(batchcorr::base(w.frames[1].corrId), batchcorr::base(first.corrId));
+    EXPECT_EQ(w.frames[1].baseSequence, first.baseSequence);
+    EXPECT_EQ(w.frames[1].epoch, first.epoch);
+
+    impl.onProduceResponse(w.frames[1].corrId, 100, 0);
+    EXPECT_FALSE(impl.hasInFlight());
+}

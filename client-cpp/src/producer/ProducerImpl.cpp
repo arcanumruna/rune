@@ -2765,7 +2765,12 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
     }
     ++b->redirectCount;
     ++ps.laneGen;  // NEW-4(b): the redirect target is another lane
-    return offerAttempt_(ps, *b, lastNowNs_, sendFn, 4);
+    if (offerAttempt_(ps, *b, lastNowNs_, sendFn, 4)) return true;
+    // DR-2 (2026-10-05): refused (the leader's publication is still connecting —
+    // its session may already be Connected, so no connect event follows): the
+    // per-pass route re-offer drives it as soon as the publication accepts.
+    queueRouteResend_(ps);
+    return false;
 }
 
 int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
@@ -2782,7 +2787,13 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
             }
             restampSessionId(b.wireFrame, newSessionId);
             ++b.redirectCount;
-            if (offerAttempt_(ps, b, lastNowNs_, sendFn, 4)) ++resent;
+            if (offerAttempt_(ps, b, lastNowNs_, sendFn, 4)) {
+                ++resent;
+            } else {  // DR-2: refused — the per-pass route re-offer drives it (order kept)
+                b.routeResendPending = true;
+                ps.routeResend = true;
+                markDirty_(ps);
+            }
         });
     }
     return resent;
