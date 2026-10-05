@@ -2681,7 +2681,10 @@ TEST(LogCleanerAgentLsoRegression, CleanableRangeCappedAtPublishedLso) {
 
     // The transaction resolves: the LSO lifts → the cleaner converges past it.
     replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
-    for (int i = 0; i < kCycles; ++i) {
+    // Fix round 3: the owner installs ONE compaction output per duty pass (O(1)
+    // each), so a pass with many single-segment outputs takes many duty passes
+    // — drive until the range above the LSO is cleaned (bounded, no sleeps).
+    for (int i = 0; i < 4000 && (i % 16 != 0 || liveAtOrAbove(kLso) == kRecords - kLso); ++i) {
         cleaner.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
         duty.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
     }
@@ -3169,5 +3172,34 @@ TEST(CompactionCleanerAgentRegression, StaleSwapAfterTruncateBelowHwLeavesOrigin
         EXPECT_EQ(v, "v1");
         EXPECT_EQ(log.logEndOffset(), 2);
     }
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 3 (N-MEDIUM-1): the owner's watermark rewind (rejected outputs) was
+// a plain store into lastCleanOffset_, overwritten by a concurrent cleaner
+// pass's passEnd store.  Now the cleaner stays the single writer; the owner
+// publishes a rewind the cleaner folds in after its own store.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, OwnerRewindSurvivesConcurrentCleanerPassRegression) {
+    auto dir = cp6TempDir("fr3_rewind");
+    Log log(dir.string(), 1 << 20);
+    Cp6NullTransport transport;
+    PartitionReplica r(makeCompactConfig(781), Role::Leader, 1, {1}, {1}, &log, &transport);
+    r.setLastCleanOffset(10);          // pass N stored passEnd_N
+    r.requestCleanerRewind(4);         // owner rejects pass N's group at base 4
+    r.setLastCleanOffset(20);          // pass N+1 (read 10 before the rewind) stores passEnd_{N+1}
+    r.applyCleanerRewind();            // ...and folds the published rewind in
+    EXPECT_EQ(r.lastCleanOffset(), 4) << "the rewind was overwritten";
+    // Two rejections before the cleaner looks: the lower one wins.
+    r.setLastCleanOffset(30);
+    r.requestCleanerRewind(12);
+    r.requestCleanerRewind(7);
+    r.applyCleanerRewind();
+    EXPECT_EQ(r.lastCleanOffset(), 7);
+    // Acknowledged: a later pass is not rewound again.
+    r.setLastCleanOffset(40);
+    r.applyCleanerRewind();
+    EXPECT_EQ(r.lastCleanOffset(), 40);
     fs::remove_all(dir);
 }

@@ -2193,12 +2193,13 @@ TEST(LogRegression, RetentionDeleteNeverErasesActiveSegmentRegression) {
     log.truncateTo(3);                                  // segment 2 is active again
     const int64_t activeBase = log.segmentBaseOffsets().back();
     ASSERT_EQ(activeBase, 2);
-    // The cleaner renamed the (formerly sealed) file away and enqueued it.
-    std::filesystem::rename(segFile(dir, activeBase, ".log"), segFile(dir, activeBase, ".log.deleted"));
+    // The cleaner proposed the (formerly sealed) segment from a stale snapshot
+    // (fix round 3: proposals only — the owner renames after validation).
     ASSERT_TRUE(log.enqueueDeletedSegment(activeBase));
     EXPECT_EQ(log.drainRetentionDeletes(), 0);
     EXPECT_EQ(log.segmentBaseOffsets().back(), activeBase);
-    EXPECT_TRUE(std::filesystem::exists(segFile(dir, activeBase, ".log"))) << "the active file must be restored";
+    EXPECT_TRUE(std::filesystem::exists(segFile(dir, activeBase, ".log"))) << "the active file must stay";
+    EXPECT_FALSE(std::filesystem::exists(segFile(dir, activeBase, ".log.deleted")));
     appendTs(log, 3, 5003);
     EXPECT_EQ(log.logEndOffset(), 4);
     EXPECT_FALSE(log.read(3, 1 << 20).empty());
@@ -2257,8 +2258,7 @@ TEST(LogRegression, StaleLineageCleanerWorkIsDroppedRegression) {
     const SegInfo* now = findSeg(*log.sealedSegmentSnapshot(), 2);
     ASSERT_NE(now, nullptr);
     ASSERT_NE(now->lineage, staleLineage);
-    // Stale retention delete: renamed by the cleaner, then dropped + undone.
-    std::filesystem::rename(segFile(dir, 2, ".log"), segFile(dir, 2, ".log.deleted"));
+    // Stale retention proposal: dropped, nothing on disk touched.
     ASSERT_TRUE(log.enqueueDeletedSegment(2, staleLineage));
     EXPECT_EQ(log.drainRetentionDeletes(), 0);
     EXPECT_TRUE(std::filesystem::exists(segFile(dir, 2, ".log")));
@@ -2279,6 +2279,10 @@ TEST(LogRegression, StaleLineageCleanerWorkIsDroppedRegression) {
     ASSERT_TRUE(log.enqueueDeletedSegment(2, cur));
     EXPECT_EQ(log.drainRetentionDeletes(), 1);
     EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), 2), nullptr);
+    // The owner renamed both files away (physical removal is the cleaner's).
+    EXPECT_FALSE(std::filesystem::exists(segFile(dir, 2, ".log")));
+    EXPECT_TRUE(std::filesystem::exists(segFile(dir, 2, ".log.deleted")));
+    EXPECT_TRUE(std::filesystem::exists(segFile(dir, 2, ".index.deleted")));
     std::filesystem::remove_all(dir);
 }
 
@@ -2329,15 +2333,18 @@ TEST(LogRegression, DeferredCleanedGroupIsInstalledByOwnerRegression) {
     appendTs(log, 4, 9'000'004);
     const auto snap = log.sealedSegmentSnapshot();
     writeBytes(Log::cleanedLogPath(dir.string(), 0, 7), concatSegs(dir, {0, 2}));
+    writeBytes(Log::cleanedIndexPath(dir.string(), 0, 7), std::vector<uint8_t>(8, 0));   // entry (0, 0)
     // Nothing on disk changed yet: the originals are intact.
     ASSERT_TRUE(std::filesystem::exists(segFile(dir, 2, ".log")));
     const Log::CleanedMember members[] = {{0, (*snap)[0].lineage}, {2, (*snap)[1].lineage}};
-    ASSERT_TRUE(log.enqueueCleanedGroup(members, 2, 7, /*hasOutput=*/true));
+    ASSERT_TRUE(log.enqueueCleanedGroup(members, 2, 7, /*hasOutput=*/true, /*nextOffset=*/4));
     log.drainCleanerSwaps();
     EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 4}));
     EXPECT_FALSE(std::filesystem::exists(segFile(dir, 2, ".log")));
     EXPECT_FALSE(std::filesystem::exists(Log::cleanedLogPath(dir.string(), 0, 7)));
+    EXPECT_FALSE(std::filesystem::exists(Log::cleanedIndexPath(dir.string(), 0, 7)));
     EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
+    EXPECT_EQ(log.segmentForTest(0)->nextOffset(), 4);
     for (int64_t o = 0; o < 4; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
     const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), 0);
     ASSERT_NE(si, nullptr);
@@ -2412,6 +2419,119 @@ TEST(LogRegression, CrashRecoveryDeletesCleanedAndCompletesSwapRegression) {
         const std::string name = e.path().filename().string();
         EXPECT_EQ(name.find(".cleaned"), std::string::npos) << name;
         EXPECT_EQ(name.find(".swap"), std::string::npos) << name;
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 3 (N-MAJOR-1): the owner-thread install is O(1) — renames + a
+// trusted open (no re-read, no CRC, no index rebuild, no fsync), independent of
+// the segment size; and the drain installs at most ONE group per call.
+// ===========================================================================
+namespace {
+void copyFile(const std::string& from, const std::string& to) {
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing);
+}
+struct InstallCost { double trustedUs; double legacyUs; };
+InstallCost measureInstall(int64_t segMiB) {
+    auto dir = makeTempDir("rune_log_install_cost");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    const int64_t roll = segMiB << 20;
+    InstallCost c{};
+    {
+        Log log(dir.string(), roll);
+        const std::string big(1 << 20, 'x');
+        for (int64_t o = 0; o < segMiB; ++o) {
+            RecordBatchBuilder b(o, 1000 + o); b.append("k" + std::to_string(o), big, 1000 + o);
+            log.append(b.build(), o);
+        }
+        appendTs(log, segMiB, 5000);                       // rolls: segment 0 sealed
+        EXPECT_EQ(log.segmentBaseOffsets().size(), 2u);
+        const auto snap = log.sealedSegmentSnapshot();
+        // (1) trusted install of a cleaner-built output (same bytes + index).
+        copyFile(segFile(dir, 0, ".log"), Log::cleanedLogPath(dir.string(), 0, 1));
+        copyFile(segFile(dir, 0, ".index"), Log::cleanedIndexPath(dir.string(), 0, 1));
+        const Log::CleanedMember m[] = {{0, (*snap)[0].lineage}};
+        EXPECT_TRUE(log.enqueueCleanedGroup(m, 1, 1, true, segMiB));
+        const uint64_t syncsBefore = log.roleChangeSyncCallsForTest();
+        auto t0 = std::chrono::steady_clock::now();
+        log.drainCleanerSwaps();
+        c.trustedUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
+        EXPECT_EQ(log.roleChangeSyncCallsForTest(), syncsBefore) << "no fsync / msync on the owner";
+        EXPECT_EQ(log.segmentForTest(0)->nextOffset(), segMiB);
+        EXPECT_FALSE(log.read(segMiB - 1, 1 << 21).empty());
+        // (2) the round-2 path for comparison: reload + recover() (re-read + CRC +
+        // index rebuild + msync + directory fsync) of the same segment.
+        copyFile(segFile(dir, 0, ".log"), segFile(dir, 0, ".log.tmp"));
+        std::filesystem::rename(segFile(dir, 0, ".log.tmp"), segFile(dir, 0, ".log"));
+        EXPECT_TRUE(log.enqueueCleanedSegment(0));
+        t0 = std::chrono::steady_clock::now();
+        log.drainCleanerSwaps();
+        c.legacyUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    }
+    std::filesystem::remove_all(dir);
+    return c;
+}
+} // namespace
+
+TEST(LogRegression, OwnerInstallIsConstantTimeRegression) {
+    const InstallCost small = measureInstall(1);
+    const InstallCost large = measureInstall(64);
+    std::printf("[install-cost] 1 MiB: trusted=%.0f us legacy=%.0f us | 64 MiB: trusted=%.0f us legacy=%.0f us\n",
+                small.trustedUs, small.legacyUs, large.trustedUs, large.legacyUs);
+    RecordProperty("trusted_1MiB_us", static_cast<int>(small.trustedUs));
+    RecordProperty("trusted_64MiB_us", static_cast<int>(large.trustedUs));
+    RecordProperty("legacy_64MiB_us", static_cast<int>(large.legacyUs));
+    EXPECT_LT(large.trustedUs, 20'000.0) << "owner install must not scale with the segment (was ~620 ms)";
+    EXPECT_LT(large.trustedUs * 10, large.legacyUs) << "trusted install must be far cheaper than reload+recover";
+}
+
+TEST(LogRegression, DrainInstallsAtMostOneGroupPerCallRegression) {
+    auto dir = makeTempDir("rune_log_one_group");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);   // 0,2,4 sealed; 6 active
+    const auto snap = log.sealedSegmentSnapshot();
+    for (int k = 0; k < 2; ++k) {
+        const int64_t b = (*snap)[k].baseOffset;
+        copyFile(segFile(dir, b, ".log"), Log::cleanedLogPath(dir.string(), b, 10 + k));
+        copyFile(segFile(dir, b, ".index"), Log::cleanedIndexPath(dir.string(), b, 10 + k));
+        const Log::CleanedMember m[] = {{b, (*snap)[k].lineage}};
+        ASSERT_TRUE(log.enqueueCleanedGroup(m, 1, 10 + k, true, b + 2));
+    }
+    EXPECT_EQ(log.drainCleanerSwaps(), 1);
+    EXPECT_TRUE(log.cleanerSwapsPending());
+    EXPECT_TRUE(std::filesystem::exists(Log::cleanedLogPath(dir.string(), 2, 11))) << "second group not yet installed";
+    EXPECT_EQ(log.drainCleanerSwaps(), 1);
+    EXPECT_FALSE(log.cleanerSwapsPending());
+    EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
+    for (int64_t o = 0; o < 7; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
+    std::filesystem::remove_all(dir);
+}
+
+// N-MEDIUM-2: a retention proposal changes nothing on disk until the owner
+// validates it — a crash before the drain loses no segment; after the owner's
+// rename, the segment is gone at construction (its *.deleted files are only
+// scheduled for physical removal).
+TEST(LogRegression, RetentionProposalIsCrashSafeRegression) {
+    auto dir = makeTempDir("rune_log_ret_crash");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+        const auto snap = log.sealedSegmentSnapshot();
+        ASSERT_TRUE(log.enqueueDeletedSegment(0, (*snap)[0].lineage));   // proposed, never drained
+        ASSERT_TRUE(log.enqueueDeletedSegment(2, (*snap)[1].lineage));
+        EXPECT_EQ(log.drainRetentionDeletes(/*maxEndBound=*/3), 1) << "segment [2,4) ends above HW 3";
+        // "crash": the Log goes away with segment 2's proposal dropped by the bound.
+    }
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{2, 4, 6}));
+        for (int64_t o = 2; o < 7; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
     }
     std::filesystem::remove_all(dir);
 }

@@ -1438,7 +1438,7 @@ public:
         for (auto* replica : owned_) {
             if (replica && replica->isDiskBacked()) {
                 if (!cleanerSwapsDeferred_(replica)) work += replica->drainCleanerSwapsOnOwner();   // D3b
-                work += replica->log()->drainRetentionDeletes();
+                work += replica->drainRetentionDeletesOnOwner();
                 work += replica->log()->drainStagingRenamesDone();
                 // fsyncgate: any inline sync failure on this log → fail-stop.
                 checkStorageFailure_(replica->log());
@@ -1510,7 +1510,7 @@ private:
         work += pushOwnedSubscriptions_(nowNs);
         for (auto& slot : slots_) {
             if (!cleanerSwapsDeferred_(slot.replica)) work += slot.replica->drainCleanerSwapsOnOwner();   // D3b
-            work += slot.log->drainRetentionDeletes();
+            work += slot.replica->drainRetentionDeletesOnOwner();
             work += slot.log->drainStagingRenamesDone();
             checkStorageFailure_(slot.log);
         }

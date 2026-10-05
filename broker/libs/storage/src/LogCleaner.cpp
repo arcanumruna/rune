@@ -1,4 +1,5 @@
 #include <rune/storage/LogCleaner.h>
+#include <cstring>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/ControlMarkerLayout.h>
 
@@ -1063,6 +1064,43 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     Throttler* throttler,
     int64_t nowMs)
 {
+    deferredWritten_.clear();
+    if (deferredSeq_ != nullptr) {
+        // Fix round 3: the owner thread installs earlier outputs with renames
+        // only (no fsync on the worker).  Make those directory entries durable
+        // HERE, off the hot path, once per pass.  Not needed for crash safety
+        // (any un-fsynced prefix of the rename protocol recovers via .cleaned /
+        // .swap at construction) — it only bounds how much finished compaction
+        // a power loss can undo.
+        fsyncDir(dir);
+    }
+    try {
+        return produceCleanedRangeBoundedImpl_(dir, sealedBases, sealedSizes, activeBase,
+                                               globalDirtyStart, nowNs, deleteRetentionMs, map,
+                                               useCoalescing, groupRollBytes, throttler, nowMs);
+    } catch (...) {
+        // N-LOW-1: an exception mid-pass loses result.groups — remove this pass's
+        // outputs now (never enqueued; the originals are untouched).
+        std::error_code ec;
+        for (const auto& p : deferredWritten_) std::filesystem::remove(p, ec);
+        deferredWritten_.clear();
+        throw;
+    }
+}
+
+RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
+    const std::string& dir,
+    const std::vector<int64_t>& sealedBases,
+    const std::vector<int64_t>& sealedSizes,
+    Offset activeBase,
+    Offset globalDirtyStart,
+    int64_t nowNs, int64_t deleteRetentionMs,
+    SkimpyOffsetMap& map,
+    bool useCoalescing,
+    int64_t groupRollBytes,
+    Throttler* throttler,
+    int64_t nowMs)
+{
     RangeCleanResult result;
     rewriteSegmentsRead_ = 0;
     result.passEnd = activeBase;   // default: nothing dirty → advance to activeBase
@@ -1209,7 +1247,46 @@ void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t
     g.bases = bases;
     g.seq = static_cast<uint32_t>(++*deferredSeq_);
     g.hasOutput = !out.empty();
-    if (g.hasOutput) writeFileDurable(Log::cleanedLogPath(dir, bases.front(), g.seq), out);
+    if (g.hasOutput) {
+        // Fix round 3: the cleaner builds the COMPLETE segment so the owner's
+        // install is O(1) — CRC-verify every output batch, derive nextOffset and
+        // build the sparse index (the same rule as LogSegment::append/recover),
+        // then write both files fsynced.  The owner never re-reads them.
+        const int64_t outBase = bases.front();
+        std::vector<uint8_t> idx;
+        std::size_t pos = 0;
+        int64_t bytesSince = 0;
+        int64_t next = outBase;
+        while (pos < out.size()) {
+            rune::protocol::RecordBatchReader r(out.data() + pos, out.size() - pos);
+            const int32_t total = (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= out.size())
+                                      ? r.totalLength() : 0;
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > out.size() || !r.ensureValid())
+                throw std::runtime_error("LogCleaner: compacted output failed verification (segment " +
+                                         std::to_string(outBase) + ")");
+            if (bytesSince == 0 || bytesSince >= 4096) {
+                if (pos > static_cast<std::size_t>(INT32_MAX))
+                    throw std::runtime_error("LogCleaner: index position exceeds 2GiB limit");
+                const int32_t rel  = static_cast<int32_t>(r.baseOffset() - outBase);
+                const int32_t phys = static_cast<int32_t>(pos);
+                const std::size_t at = idx.size();
+                idx.resize(at + 8);
+                std::memcpy(idx.data() + at, &rel, 4);
+                std::memcpy(idx.data() + at + 4, &phys, 4);
+                bytesSince = 0;
+            }
+            bytesSince += total;
+            next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            pos += static_cast<std::size_t>(total);
+        }
+        g.nextOffset = next;
+        const std::string logOut = Log::cleanedLogPath(dir, outBase, g.seq);
+        const std::string idxOut = Log::cleanedIndexPath(dir, outBase, g.seq);
+        deferredWritten_.push_back(logOut);
+        writeFileDurable(logOut, out);
+        deferredWritten_.push_back(idxOut);
+        writeFileDurable(idxOut, idx);
+    }
     deferredOut_->push_back(std::move(g));
 }
 

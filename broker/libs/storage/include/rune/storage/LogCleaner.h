@@ -40,6 +40,9 @@ struct CleanedGroup {
     std::vector<int64_t> bases;
     uint64_t             seq       = 0;
     bool                 hasOutput = false;
+    /// hasOutput: one past the output's last offset (the installed segment's
+    /// nextOffset — the owner opens it trusted, without re-reading it).
+    int64_t              nextOffset = 0;
 };
 
 struct RangeCleanResult {
@@ -415,10 +418,19 @@ private:
     int64_t rewriteSegmentsRead_    = 0;
     uint64_t* deferredSeq_          = nullptr;   ///< non-null = deferred-install mode
     std::vector<CleanedGroup>* deferredOut_ = nullptr;   ///< set for one pass
+    std::vector<std::string>   deferredWritten_;         ///< this pass's output files (exception cleanup)
     /// Deferred mode: write `out` durably to a fresh cleaned path for `bases`
     /// (or record an all-removed group) — never touches the originals.
     void deferInstall_(const std::string& dir, const std::vector<int64_t>& bases,
                        const std::vector<uint8_t>& out);
+    RangeCleanResult produceCleanedRangeBoundedImpl_(const std::string& dir,
+                                                     const std::vector<int64_t>& sealedBases,
+                                                     const std::vector<int64_t>& sealedSizes,
+                                                     Offset activeBase, Offset globalDirtyStart,
+                                                     int64_t nowNs, int64_t deleteRetentionMs,
+                                                     SkimpyOffsetMap& map, bool useCoalescing,
+                                                     int64_t groupRollBytes, Throttler* throttler,
+                                                     int64_t nowMs);
 };
 
 } // namespace rune::storage

@@ -188,6 +188,12 @@ public:
     LogReadView mappedBytes() noexcept;
 
     int64_t recover();
+    /// Fix round 3 (O(1) owner-thread install): adopt a SEALED segment whose
+    /// .log and .index were built, CRC-verified and fsynced by the cleaner
+    /// thread — no re-read, no CRC, no index rebuild, no fsync.  `nextOffset`
+    /// comes from the cleaner; the size is one fstat.  The segment is fully
+    /// durable (the cleaner fsynced it).  Returns 0 or the errno of the fstat.
+    int openTrusted(int64_t nextOffset) noexcept;
 
     int64_t baseOffset() const noexcept { return baseOffset_; }
     int64_t sizeBytes() const noexcept { return logSize_; }

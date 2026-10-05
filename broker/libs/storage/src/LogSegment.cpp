@@ -2,6 +2,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <algorithm>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <cstdint>
@@ -139,9 +140,9 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
 
 // D3b fix round 2: the read mapping is ALWAYS made through this segment's own
 // open fd_ (its inode, held for the segment's lifetime anyway) — never by
-// re-opening logPath_.  The log cleaner renames a rewritten file over the path
-// and only then enqueues the swap; until the owner applies it (deferred while a
-// read_committed rebuild scans), this segment must keep reading ITS bytes: a
+// re-opening logPath_.  A compaction install renames a rewritten file over the
+// path (owner thread, fix round 2/3) and the legacy synchronous path replaces it
+// before the reload; until the reload, this segment must keep reading ITS bytes: a
 // by-path (re)map would expose the rewritten file (a marker skipped → a txn left
 // open) or SIGBUS past its shorter EOF.  No extra fd (F3 unchanged).
 std::unique_ptr<MappedFile> LogSegment::makeReadMap_(std::size_t bytes) {
@@ -571,6 +572,17 @@ LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) noexcept
     v.baseOffset = firstBase;
     v.nextOffset = nextOff;
     return v;
+}
+
+int LogSegment::openTrusted(int64_t nextOffset) noexcept {
+    struct stat st{};
+    if (::fstat(fd_, &st) != 0) return errno != 0 ? errno : EIO;
+    logSize_     = static_cast<int64_t>(st.st_size);
+    nextOffset_  = nextOffset;
+    durableNext_ = nextOffset;
+    syncedBytes_ = logSize_;
+    index_->rebuildEntries();   // counts the cleaner-built entries (O(index entries), no I/O)
+    return 0;
 }
 
 int64_t LogSegment::recover() {

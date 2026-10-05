@@ -1126,3 +1126,42 @@ TEST(RetentionCleanerAgent, TimeRetentionNeverDeletesSegmentStraddlingHwRegressi
     EXPECT_TRUE(exists(8));
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// Fix round 3 (N-MEDIUM-2): the cleaner thread renamed retention victims to
+// .deleted ITSELF, before the owner validated them — a crash before the owner's
+// drain lost the segment (construction removes every *.deleted file), even if
+// it had just been merged with in-window records.  Now the cleaner only
+// proposes; nothing on disk changes until the owner validates.
+// ===========================================================================
+TEST(RetentionCleanerAgent, UndrainedRetentionProposalLosesNothingAcrossCrashRegression) {
+    auto dir = cp9TempDir("cp9_ret_crash");
+    std::vector<int64_t> basesBefore;
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        for (int64_t o = 0; o < 10; ++o) log.append(cp9Batch(o, "k", "v", /*ts=*/1000), o);
+        basesBefore = log.segmentBaseOffsets();
+        Cp9NullTransport transport;
+        auto owned = std::make_unique<PartitionReplica>(
+            makeDeleteConfig(912, /*retentionMs=*/1, /*retentionBytes=*/-1), Role::Leader, 1,
+            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+        owned->becomeLeader(1, {1});
+        owned->onLeaderLogAppended();
+        rune::node::ReplicaRegistry reg;
+        reg.add(912, 0, std::move(owned));
+        rune::node::LogCleanerAgent cleaner(&reg);
+        Cp9MinimalConsensusAgent dummy;
+        rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &reg, nullptr);
+        duty.doWork(1'000'000);                 // publish the cleaner-visible HW
+        for (int i = 0; i < 5; ++i) cleaner.doWork(2'000'000LL + i);   // retention runs; NO owner drain
+        // "crash" here: the owner never validated / applied the proposals.
+    }
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        EXPECT_EQ(log.segmentBaseOffsets(), basesBefore) << "an unvalidated proposal must not delete anything";
+        EXPECT_EQ(log.logStartOffset(), 0);
+    }
+    fs::remove_all(dir);
+}

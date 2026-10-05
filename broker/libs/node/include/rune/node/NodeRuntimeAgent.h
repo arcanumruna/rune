@@ -599,15 +599,15 @@ private:
         }
 
         // 6.5. CP-6: Drain pending cleaner swaps from LogCleanerAgent.
-        //      LogCleanerAgent runs on its own thread and enqueues compacted
-        //      segment bases via Log::enqueueCleanedSegment().  The actual
-        //      in-memory segment-map reload must happen on this single-writer
-        //      thread (not on the cleaner thread), so we drain them here.
+        //      LogCleanerAgent runs on its own thread and enqueues compaction
+        //      outputs via Log::enqueueCleanedGroup().  This single-writer thread
+        //      validates and installs them (renames + trusted open, one group per
+        //      partition per pass) — PartitionReplica::drainCleanerSwapsOnOwner.
         //
-        //      CP-9: Also drain retention deletions (Log::drainRetentionDeletes).
-        //      The cleaner enqueues bases of segments renamed to .deleted via
-        //      Log::enqueueDeletedSegment().  The segments_ erase MUST happen
-        //      here on the append thread (single-writer invariant).
+        //      CP-9: Also drain retention PROPOSALS (Log::enqueueDeletedSegment):
+        //      this thread validates each one (incarnation, not active, ends <=
+        //      HW) and only then renames its files to *.deleted and erases it
+        //      (PartitionReplica::drainRetentionDeletesOnOwner).
         //
         //      E1/E2: when workerPool_ is wired:
         //        - INTERNAL replicas: drained here (control thread owns them).
@@ -618,7 +618,7 @@ private:
                 // Only internal replicas — user replicas are drained by workers.
                 if (replica && replica->topicId() < 0 && replica->isDiskBacked()) {
                     work += replica->drainCleanerSwapsOnOwner();
-                    work += replica->log()->drainRetentionDeletes();
+                    work += replica->drainRetentionDeletesOnOwner();
                     work += replica->log()->drainStagingRenamesDone();
                 }
             }
@@ -629,7 +629,7 @@ private:
                 // disk-Log-only operations; replica->log() asserts isDiskBacked().
                 if (replica && replica->isDiskBacked()) {
                     work += replica->drainCleanerSwapsOnOwner();
-                    work += replica->log()->drainRetentionDeletes();
+                    work += replica->drainRetentionDeletesOnOwner();
                     // Append-p99 fix: apply completed staging→base renames the
                     // background (cleaner) thread performed, so logPath_ tracks the
                     // on-disk name (append-thread-only segments_ access).

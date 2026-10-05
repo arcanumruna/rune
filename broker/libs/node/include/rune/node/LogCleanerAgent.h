@@ -15,9 +15,9 @@
 //      accumulated across segments: if the chosen segment's bytes exceed the
 //      remaining budget, the cycle stops (soft cap; a single oversized segment
 //      is always processed once to avoid starvation, matching Kafka semantics).
-//   5. Enqueue the rewritten segment base via Log::enqueueCleanedSegment().
-//      The actual in-memory reload is deferred to the append thread via
-//      NodeRuntimeAgent::doWork → Log::drainCleanerSwaps().
+//   5. Hand each output to the owner via Log::enqueueCleanedGroup() (fix round
+//      2/3).  The owner validates and installs it (renames + trusted open, one
+//      group per duty pass) in Log::drainCleanerSwaps().
 //
 // Byte dirty ratio (Kafka-exact, §3.2):
 //   cleanBytes     = Σ seg.sizeBytes() for segs with base < firstDirtyOffset
@@ -26,28 +26,29 @@
 //   dirtyRatio     = cleanableBytes / (cleanBytes + cleanableBytes)
 //
 // SINGLE-WRITER INVARIANT — the cleaner thread NEVER touches Log::segments_ (§3.1):
-//   - Cleaner calls LogCleaner::produceCleanedFile() — PURE FILE WORK.  It reads
-//     segment bytes ONLY from the on-disk .log files, using the base offsets
-//     carried in the IMMUTABLE sealed-segment snapshot (atomic shared_ptr
-//     published by the append thread) + the race-free log directory (Log::dir()).
-//     It NEVER calls segmentBaseOffsets(), segmentSize() or reloadSegment().  It
-//     atomically renames <base>.log.new → <base>.log on disk and returns.
-//   - After the rename, the cleaner calls Log::enqueueCleanedSegment(base) — the
-//     SPSC producer half (release-store publishes the base + the file rename).
-//   - NodeRuntimeAgent::doWork drains these enqueues via drainCleanerSwaps()
-//     on the single-writer append thread — the ONLY thread that mutates the
-//     in-memory segments_ map (via reloadSegment()).  The release/acquire pair
-//     on the ring establishes happens-before between the cleaner's file write and
-//     the append thread's map update.  No lock on any path.
-//   - Superseded LogSegment objects are freed on the append thread in
-//     reloadSegment() — no reader can hold a reference after that point
-//     because all reads are also on the append thread (single-writer invariant).
+//   - Cleaner calls LogCleaner::produceCleanedRangeBounded() in deferred-install
+//     mode — PURE FILE WORK.  It reads segment bytes ONLY from the on-disk .log
+//     files, using the base offsets carried in the IMMUTABLE sealed-segment
+//     snapshot + the race-free log directory (Log::dir()).  It NEVER renames,
+//     replaces or deletes a live segment file: each output (log + index,
+//     CRC-verified, fsynced) goes to a unique *.cleaned file (fix round 2/3).
+//   - The cleaner then calls Log::enqueueCleanedGroup() — the SPSC producer half
+//     (one release-store publishes the whole group + the fsynced outputs).
+//   - The owner (NodeRuntimeAgent / Worker duty pass) drains via
+//     PartitionReplica::drainCleanerSwapsOnOwner(): it validates the group
+//     (incarnation, not active, below min(HW, LSO)), commits it with renames
+//     (.cleaned → .swap → .log) and opens the segment trusted — O(1), at most one
+//     group per partition per duty pass.  Rejected outputs are deleted and the
+//     owner publishes a watermark rewind the cleaner folds in.  No lock.
+//   - Superseded LogSegment objects are retired on the owner thread — no reader
+//     can hold a reference after that point (single-writer invariant).
 //   This is the CP-6 data-race fix: the previous design ran reloadSegment() AND
 //     segmentBaseOffsets() on the CLEANER thread (cleanSegment), racing the
 //     append thread's maybeRoll() — a TSan-proven write/write race on segments_.
 //
 // SPSC-overflow safety (§3.1):
-//   enqueueCleanedSegment() returns false when the swap ring is momentarily full.
+//   enqueueCleanedGroup() returns false when the swap ring is momentarily full
+//   (the cleaner then deletes its unenqueued outputs).
 //   On failure the cleaner does NOT advance lastCleanOffset and does NOT charge
 //   the budget — the segment stays dirty and is re-selected + re-produced +
 //   re-enqueued next cycle (idempotent retry).  A dropped swap is never lost.
@@ -56,8 +57,8 @@
 //   The cleaner checks replica->cleanerRole() == Leader BEFORE calling
 //   produceCleanedFile().  If the role changed to Follower BEFORE the check, the
 //   segment is not compacted at all.  If the role changes AFTER the file is
-//   produced (a race window we handle safely), we still enqueue the swap — the
-//   append thread's drainCleanerSwaps → reloadSegment picks up the new file.
+//   produced (a race window we handle safely), we still enqueue the group — the
+//   owner validates it (incarnation / HW / LSO) before installing anything.
 //   This is safe: the compacted data is correct (latest-per-key, below-HW), and
 //   the follower will either truncate above HW (disjoint range) or transition
 //   back to leader and continue.  We do NOT advance lastCleanOffset on a demoted
@@ -277,6 +278,15 @@ public:
             rune::storage::Log* log = replica->log();
             if (!log) continue;
 
+            // Fix round 3: never start a pass while this log's previous outputs
+            // are still queued for the owner (it installs one group per duty
+            // pass) — a second pass over the same snapshot would only produce
+            // duplicates the owner must reject.
+            if (log->cleanerSwapsPending()) continue;
+            // N-MEDIUM-1: fold the owner's published rewind (rejected outputs)
+            // into the cleaner-owned watermark before reading it.
+            replica->applyCleanerRewind();
+
             // Load the immutable snapshot (atomic acquire — no race with append thread).
             auto snap = log->sealedSegmentSnapshot();
             if (!snap || snap->size() < 1) continue;  // need at least one sealed segment
@@ -331,7 +341,9 @@ public:
             // largestTimestamp is within the lag; all segments from that point
             // onward are excluded (firstUncleanable shrinks to that base).
             //
-            // largestTimestamp = 0 means unknown → treat as very old → cleanable.
+            // largestTimestamp <= 0 means unknown → treated as old → cleanable
+            // (compaction never deletes a live key's latest value, so an unknown
+            // age only lets compaction run earlier; time RETENTION keeps it).
             const int64_t minLagMs = replica->minCompactionLagMs();
             if (minLagMs > 0) {
                 for (std::size_t ii = 0; ii < snap->size(); ++ii) {
@@ -474,8 +486,8 @@ public:
         // section, so compaction converges to latest-per-key in the SELECTED pass —
         // even when producers interleave with the cleaner (the drcp1/3/4 fix).  It
         // reads segment bytes only via the immutable snapshot bases (best.snap) +
-        // race-free dir (best.dir); the in-memory reload is deferred to the append
-        // thread via enqueueCleanedSegment() → drainCleanerSwaps() → reloadSegment().
+        // race-free dir (best.dir); the outputs are installed by the owner thread
+        // via enqueueCleanedGroup() → drainCleanerSwaps() (validate + rename).
         //
         // When the bounded map fills before covering the whole dirty range, passEnd
         // < firstUncleanable and the next cycle resumes there (bounded-range-per-
@@ -541,12 +553,8 @@ public:
         //   - a rewritten base → reloadSegment picks up the new .log.
         //   - a merged/emptied base → reloadSegment finds the .log gone, drops it.
         // ---------------------------------------------------------------
-        // Fix round 2: advance the watermark BEFORE handing the outputs over, so
-        // an owner-side rejection's rewind (PartitionReplica::
-        // drainCleanerSwapsOnOwner) is always ordered after this store.
         const bool advance = passEnd > globalDirtyStart &&
                              best.replica->cleanerRole() == rune::replication::Role::Leader;
-        if (advance) best.replica->setLastCleanOffset(passEnd);
         bool allEnqueued = true;
         for (std::size_t gi = 0; gi < passResult.groups.size(); ++gi) {
             const auto& g = passResult.groups[gi];
@@ -561,25 +569,26 @@ public:
                 if (sit != best.snap->end() && sit->baseOffset == gb) lineage = sit->lineage;
                 scratchMembers_[n++] = rune::storage::Log::CleanedMember{gb, lineage};
             }
-            if (!best.log->enqueueCleanedGroup(scratchMembers_.data(), n, g.seq, g.hasOutput)) {
+            if (!best.log->enqueueCleanedGroup(scratchMembers_.data(), n, g.seq, g.hasOutput, g.nextOffset)) {
                 // Ring full: discard this and every later output (the originals are
                 // untouched) — the segments stay dirty and are redone next cycle.
                 for (std::size_t gj = gi; gj < passResult.groups.size(); ++gj) {
                     const auto& d = passResult.groups[gj];
                     std::error_code ec;
-                    if (d.hasOutput)
+                    if (d.hasOutput) {
                         std::filesystem::remove(rune::storage::Log::cleanedLogPath(best.dir, d.bases.front(), d.seq), ec);
+                        std::filesystem::remove(rune::storage::Log::cleanedIndexPath(best.dir, d.bases.front(), d.seq), ec);
+                    }
                 }
                 allEnqueued = false;
                 break;
             }
         }
         if (!allEnqueued) {
-            // Ring full — leave the segment(s) dirty; retry next cycle.  Undo the
-            // advance (a LOWER value is always safe: the owner only ever lowers
-            // it too) — preserves the CP-6 ring-full invariant.
-            if (advance && best.replica->lastCleanOffset() > globalDirtyStart)
-                best.replica->setLastCleanOffset(globalDirtyStart);
+            // Ring full — leave the segment(s) dirty; retry next cycle.  Do not
+            // advance the watermark (preserves the CP-6 ring-full invariant).
+            // Groups already enqueued may still install — harmless (the range
+            // is simply re-cleaned from the unchanged watermark).
             return 0;
         }
 
@@ -590,9 +599,14 @@ public:
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
         if (advance) {
+            // The cleaner is the ONLY writer of the clean watermark (N-MEDIUM-1);
+            // a rewind the owner published meanwhile is folded in right after,
+            // so the checkpoint never persists past a rejected range.
+            best.replica->setLastCleanOffset(passEnd);
+            best.replica->applyCleanerRewind();
             // CP-7: persist the checkpoint (pure file I/O; cleaner-thread-safe).
             if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
-                it->second->store(passEnd);
+                it->second->store(best.replica->lastCleanOffset());
             }
         }
 
@@ -611,33 +625,23 @@ private:
     //   2. Compute the set of deletable segments via three predicates
     //      (time, size, log-start-offset).  Active segment EXCLUDED.
     //      Bounded by high-watermark (only compacted/committed range).
-    //   3. For each deletable segment:
-    //      (a) Rename <base>.log → <base>.log.deleted on disk (pure file work —
-    //          safe on the cleaner thread).
-    //      (b) Enqueue the base via Log::enqueueDeletedSegment() so the
-    //          append thread erases it from segments_ in drainRetentionDeletes().
-    //      (c) Record the .deleted path for deferred physical removal.
-    //   4. Run physicallyRemoveExpiredDeletedFiles(nowMs, fileDeleteDelayMs)
-    //      to physically remove .deleted files whose delay has elapsed.
+    //   3. For each deletable segment: PROPOSE it — enqueue (base, lineage) via
+    //      Log::enqueueDeletedSegment().  The owner (drainRetentionDeletes)
+    //      validates and renames <base>.log/.index → *.deleted, then erases it.
+    //   4. discoverDeletedFiles + physicallyRemoveExpiredDeletedFiles: remove
+    //      the *.deleted files whose file.delete.delay has elapsed.
     //
-    // SINGLE-WRITER INVARIANT:
-    //   - The cleaner thread ONLY renames files and enqueues bases.
-    //   - segments_ mutation happens ONLY on the append thread (step 3b via
-    //     drainRetentionDeletes).
-    //   - No lock on any path.
+    // SINGLE-WRITER INVARIANT (fix round 3):
+    //   - The cleaner thread never renames, replaces or deletes a LIVE segment
+    //     file; it only proposes, and removes files already renamed *.deleted.
+    //   - Every live-file rename and every segments_ mutation happens on the
+    //     owner thread, after validation.  No lock on any path.
     //
-    // compact,delete coordination:
-    //   - For CompactDelete replicas, compaction may have already rewritten a
-    //     segment.  The segment's .log file still exists (compaction renames
-    //     <base>.log.new → <base>.log atomically).  Retention then renames the
-    //     final .log → .deleted.  There is no double-delete because:
-    //     (a) compaction enqueues via the SWAP ring (drainCleanerSwaps →
-    //         reloadSegment, which updates the in-memory segment pointer);
-    //     (b) retention enqueues via the DELETE ring (drainRetentionDeletes →
-    //         segments_.erase).  A segment is never in both rings simultaneously:
-    //         the cleaner selects a segment for EITHER compaction OR deletion in a
-    //         single cycle, never both.  The compaction's log file is the latest
-    //         on disk; retention renames that latest file to .deleted.
+    // compact,delete coordination: compaction outputs (swap ring) and deletions
+    // (delete ring) are both validated against the segment's incarnation
+    // (lineage) on the owner; whichever applies first changes the lineage and
+    // the other is dropped as stale — never a double delete, never a deletion
+    // of a just-merged segment.
     // -----------------------------------------------------------------------
     void runRetention(int64_t nowMs) {
         if (!registry_ && !channel_) return;
@@ -778,52 +782,20 @@ private:
 
                 if (!deletable) continue;
 
-                // -------------------------------------------------------
-                // Async delete: rename .log → .deleted on disk (file work
-                // — safe on the cleaner thread), then enqueue for
-                // segments_ removal on the append thread.
-                // -------------------------------------------------------
-                // Mirror LogSegment::fname: zero-pad base to 20 digits.
-                std::ostringstream pathBuf;
-                pathBuf << log->dir() << "/"
-                        << std::setw(20) << std::setfill('0') << si.baseOffset << ".log";
-                std::string logPath = pathBuf.str();
-                std::string deletedPath = logPath + ".deleted";
-
-                // Only rename if .log still exists (idempotent: a prior cycle
-                // may have already renamed it but the enqueue failed).
-                if (!std::filesystem::exists(logPath)) {
-                    // Already renamed (or never existed); try to enqueue again.
-                    // Record the .deleted path for deferred physical removal if
-                    // not already recorded.
-                    if (std::filesystem::exists(deletedPath)) {
-                        log->recordDeletedFile(deletedPath, nowMs);
-                    }
-                } else {
-                    // Rename .log → .deleted (atomic on most POSIX filesystems).
-                    std::error_code ec;
-                    std::filesystem::rename(logPath, deletedPath, ec);
-                    if (!ec) {
-                        log->recordDeletedFile(deletedPath, nowMs);
-                    }
-                    // Whether rename succeeded or not, we try to enqueue.
-                    // If rename failed, the segment is still intact — no harm.
-                }
-
-                // Enqueue for segments_ removal on the append thread.
-                // enqueueDeletedSegment returns false if the ring is full;
-                // in that case the rename has already happened, so next cycle
-                // we'll retry (find logPath absent → directly record .deleted).
-                // MAJOR-2: carry the lineage acted on — the append thread drops
-                // (and undoes) the delete if the segment was rebuilt meanwhile.
+                // Fix round 3 (N-MEDIUM-2): only PROPOSE the deletion — the
+                // owner thread validates (incarnation, not active, ends <= HW)
+                // and renames the files to *.deleted itself.  Nothing on disk
+                // changes here, so a crash or a stale snapshot loses nothing.
+                // A full ring is retried next cycle.
                 log->enqueueDeletedSegment(si.baseOffset, si.lineage);
                 toDelete.push_back(si.baseOffset);
             }
 
             // ---------------------------------------------------------------
-            // Deferred physical removal: sweep .deleted files whose delay
-            // has elapsed.  Safe to call every retention cycle.
+            // Deferred physical removal: schedule the *.deleted files the owner
+            // produced, then sweep those whose delay has elapsed.
             // ---------------------------------------------------------------
+            log->discoverDeletedFiles(nowMs);
             log->physicallyRemoveExpiredDeletedFiles(nowMs, fileDelayMs);
         }
     }

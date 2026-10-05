@@ -435,6 +435,8 @@ public:
     ///                                [base, end) (committed: recovery completes it).
     static std::string cleanedLogPath(const std::string& dir, int64_t base, uint64_t seq);
     static std::string swapLogPath(const std::string& dir, int64_t base, int64_t end);
+    ///   <base20>.index.<seq>.cleaned — the cleaner-built index of that output.
+    static std::string cleanedIndexPath(const std::string& dir, int64_t base, uint64_t seq);
     /// One member of a deferred compaction group (cleaner thread → owner thread).
     struct CleanedMember { int64_t base = 0; uint64_t lineage = kAnyLineage; };
     /// Fix round 2 (Kafka-style replaceSegments on the owner thread): enqueue a
@@ -446,25 +448,30 @@ public:
     /// originals stay untouched.  false = ring full (the caller deletes its
     /// output and retries next pass).
     bool enqueueCleanedGroup(const CleanedMember* members, std::size_t n, uint64_t seq,
-                             bool hasOutput) noexcept;
+                             bool hasOutput, int64_t nextOffset = 0) noexcept;
+    /// LEGACY / tests only (no production caller since fix round 2): reload
+    /// `base` in place from a file a synchronous caller already replaced —
+    /// reloadSegment + recover() (re-read, CRC, index rebuild, fsync) on the
+    /// owner.  Production compaction uses enqueueCleanedGroup (O(1) install).
     bool enqueueCleanedSegment(int64_t base, uint64_t lineage = kAnyLineage) noexcept;
 
-    /// CP-6: Drain pending cleaner swaps on the single-writer append/duty-cycle
-    /// thread.  Called once per duty cycle from NodeRuntimeAgent::doWork.
-    /// For each pending base calls reloadSegment(base) to atomically update the
-    /// in-memory segment map.  The superseded LogSegment is freed here (the map
-    /// slot is on the append thread; no reader can hold it after this call since
-    /// all reads also happen on the append thread — single-writer invariant).
+    /// CP-6: Drain pending cleaner swaps on the single-writer owner thread (once
+    /// per duty pass).  A deferred group is validated and installed O(1) —
+    /// renames + a trusted open (fix round 3) — and AT MOST ONE group is
+    /// installed per call; the rest stay queued.  Legacy reload entries are
+    /// reloaded (reloadSegment).  The superseded LogSegment is retired here.
     ///
     /// Lock-free SPSC: this is the SINGLE-CONSUMER half.  The acquire-load of
-    /// tail_ pairs with enqueueCleanedSegment's release-store.
-    /// Returns number of swaps processed (>0 = work done).
+    /// tail_ pairs with enqueueSwapSlots_'s release-store.
+    /// Returns number of ring slots consumed (>0 = work done).
     /// `maxBaseBound` (fix round 2): a deferred group is installed only when every
     /// member base is below it — the owner passes min(HW, LSO) (the cleaner
     /// selected members strictly below both).  Legacy reload entries ignore it.
     int drainCleanerSwaps(int64_t maxBaseBound = INT64_MAX);
     /// Deferred groups rejected by validation (their output deleted).  Owner thread.
     [[nodiscard]] uint64_t cleanerGroupsRejected() const noexcept { return cleanerGroupsRejected_; }
+    /// Cleaner thread: outputs it enqueued are not yet consumed by the owner.
+    [[nodiscard]] bool cleanerSwapsPending() const noexcept;
     /// The lowest front base of a deferred group rejected since the last call
     /// (INT64_MAX = none), then reset.  The owner rewinds the replica's clean
     /// watermark to it: the rejected range was NOT compacted although the
@@ -479,16 +486,17 @@ public:
     // CP-9: Retention async-delete API (single-writer invariant preserved).
     //
     // The cleaner agent (off the append thread) selects segments eligible for
-    // deletion, renames them to .deleted on disk (pure file work — OK on the
-    // cleaner thread), and enqueues the base via enqueueDeletedSegment().
+    // deletion and PROPOSES each (base, lineage) via enqueueDeletedSegment() —
+    // it never renames a live file (fix round 3).
     //
-    // The append/duty-cycle thread calls drainRetentionDeletes(), which erases
-    // the segment from segments_ (the ONLY mutation path, preserving the
-    // single-writer invariant).
+    // The owner calls drainRetentionDeletes(hw), which validates each proposal,
+    // renames <base>.log/.index → *.deleted and erases the segment from
+    // segments_ (the ONLY mutation path, preserving the single-writer invariant).
+    // Compaction installs also rename replaced files to *.deleted.
     //
-    // Physical removal of .deleted files is deferred: the cleaner calls
-    // physicallyRemoveExpiredDeletedFiles(nowMs, fileDeleteDelayMs) once per
-    // retention cycle to sweep any .deleted files whose rename time has elapsed.
+    // Physical removal of *.deleted files is deferred: the cleaner calls
+    // discoverDeletedFiles + physicallyRemoveExpiredDeletedFiles(nowMs,
+    // fileDeleteDelayMs) once per retention cycle.
     //
     // Crash-safety: Log construction scans for .deleted files left by a prior
     // crash and records them for immediate physical cleanup (they were already
@@ -496,26 +504,29 @@ public:
     // cannot be re-opened by a restart).
     // -----------------------------------------------------------------------
 
-    /// CP-9 SPSC producer (cleaner thread): enqueue a base for retention deletion.
-    /// The .log file has ALREADY been renamed to .deleted on disk (pure file
-    /// work done by the cleaner before calling this).
+    /// CP-9 SPSC producer (cleaner thread): PROPOSE a segment for retention
+    /// deletion (fix round 3: nothing on disk changes here — the owner validates
+    /// and renames the files in drainRetentionDeletes).
     /// Returns false (drops) if the ring is momentarily full; cleaner retries
     /// next cycle (idempotent — drainRetentionDeletes is a no-op for an unknown
     /// base).
-    /// `lineage`: as enqueueCleanedSegment — a stale delete (active segment or a
-    /// different lineage) is dropped and the cleaner's .log→.deleted rename is
-    /// undone, never erasing live data.
+    /// `lineage`: the incarnation the cleaner saw — a proposal for the active
+    /// segment or a different lineage is dropped, never erasing live data.
     bool enqueueDeletedSegment(int64_t base, uint64_t lineage = kAnyLineage) noexcept;
     /// Cleaner work dropped because it named the active segment or a stale
     /// lineage (MAJOR-2 observability).  Owner thread.
     [[nodiscard]] uint64_t staleCleanerOpsDropped() const noexcept { return staleCleanerOps_; }
 
-    /// CP-9 SPSC consumer (append thread): drain retention-delete enqueues.
-    /// For each pending base, erases the segment from segments_ and updates the
-    /// sealed snapshot.  Called from NodeRuntimeAgent::doWork (same thread as
+    /// CP-9 SPSC consumer (owner thread): validate retention proposals; for each
+    /// valid one rename its files to *.deleted, erase it from segments_ and
+    /// update the sealed snapshot.  Called from NodeRuntimeAgent::doWork (same thread as
     /// all segments_ mutations).
     /// Returns number of segments erased from segments_.
-    int drainRetentionDeletes();
+    /// `maxEndBound` (fix round 3): a segment is deleted only if it ENDS at or
+    /// below it (the owner passes its HW).
+    int drainRetentionDeletes(int64_t maxEndBound = INT64_MAX);
+    /// Cleaner thread: schedule newly renamed *.deleted files for physical removal.
+    void discoverDeletedFiles(int64_t nowMs);
 
     // -----------------------------------------------------------------------
     // Background segment pre-provisioning (append-p99 tail fix).
@@ -772,10 +783,11 @@ private:
     struct SegRef {
         int64_t  base = 0;
         uint64_t lineage = kAnyLineage;
+        int64_t  nextOffset = 0;  ///< group head + hasOutput: the output's nextOffset
         uint32_t seq = 0;         ///< output name (unique among in-flight outputs)
         uint16_t groupSize = 0;   ///< 0 = legacy Reload entry; >0 on a group's first slot
         bool     hasOutput = false;
-    };   // 24 bytes
+    };   // 32 bytes
     uint64_t cleanerGroupsRejected_ = 0;
     int64_t  cleanerRejectLowWater_ = INT64_MAX;   ///< see takeCleanerRejectLowWater()
     /// Validate + install one deferred group (slots [first, first+n)).  Owner thread.
@@ -784,6 +796,8 @@ private:
     void recoverCleanerSwapFiles();
     /// The single SPSC producer path of the swap ring (n slots, one release-store).
     bool enqueueSwapSlots_(const SegRef* refs, std::size_t n) noexcept;
+    /// Consumer body of drainCleanerSwaps over the published slots [head, tail).
+    int drainSwapSlots_(std::size_t head, std::size_t tail, int64_t maxBaseBound);
     std::array<SegRef, kSwapRingCapacity> swapRing_{};
     alignas(64) std::atomic<std::size_t>   swapHead_{0}; // consumer index
     alignas(64) std::atomic<std::size_t>   swapTail_{0}; // producer index

@@ -769,8 +769,38 @@ public:
         rune::storage::Log* l = log();
         const int work = l->drainCleanerSwaps(cleanerSwapBound());
         const int64_t low = l->takeCleanerRejectLowWater();
-        if (low < lastCleanOffset()) setLastCleanOffset(low);
+        if (low != INT64_MAX) requestCleanerRewind(low);
         return work;
+    }
+    /// Fix round 3 (N-MEDIUM-2): retention deletes are only PROPOSED by the
+    /// cleaner; the owner validates (identity, not active, segment end <= HW)
+    /// and only then renames the files away.  Disk-backed only.
+    int drainRetentionDeletesOnOwner() {
+        return log()->drainRetentionDeletes(highWatermark());
+    }
+
+    // ---- Fix round 3 (N-MEDIUM-1): clean-watermark rewind channel ----------
+    // lastCleanOffset_ is written by the cleaner only.  The owner, on rejecting
+    // a compaction output, PUBLISHES a rewind point instead of storing the
+    // watermark itself (a concurrent cleaner pass would overwrite that store).
+    // Owner = single writer of gen/to; cleaner = single writer of ack.  The
+    // owner folds a new rejection into a not-yet-acknowledged one (min), so a
+    // rewind is never lost — at worst over-conservative.
+    void requestCleanerRewind(Offset to) noexcept {
+        const uint64_t gen   = cleanerRewindGen_.load(std::memory_order_relaxed);
+        const uint64_t acked = cleanerRewindAck_.load(std::memory_order_acquire);
+        const Offset   prev  = cleanerRewindTo_.load(std::memory_order_relaxed);
+        cleanerRewindTo_.store(acked == gen ? to : std::min(prev, to), std::memory_order_relaxed);
+        cleanerRewindGen_.store(gen + 1, std::memory_order_release);
+    }
+    /// Cleaner thread: fold any published rewind into the clean watermark.
+    /// Called at pass start and right after the pass stores its passEnd.
+    void applyCleanerRewind() noexcept {
+        const uint64_t gen = cleanerRewindGen_.load(std::memory_order_acquire);
+        if (gen == cleanerRewindAck_.load(std::memory_order_relaxed)) return;
+        const Offset to = cleanerRewindTo_.load(std::memory_order_relaxed);
+        if (to < lastCleanOffset()) setLastCleanOffset(to);
+        cleanerRewindAck_.store(gen, std::memory_order_release);
     }
     // Task #13: gatewayIsrSize() — acquire-load of the published ISR size snapshot.
     // The owning worker publishes (in publishCleanerState()) the current ISR size
@@ -1279,6 +1309,9 @@ private:
     // never re-scanned or re-rewritten on the next duty-cycle call.
     // Atomic: cleaner/duty threads write; test threads may poll it concurrently.
     std::atomic<Offset> lastCleanOffset_{0};
+    std::atomic<uint64_t> cleanerRewindGen_{0};      ///< owner-written (fix round 3)
+    std::atomic<Offset>   cleanerRewindTo_{0};       ///< owner-written
+    std::atomic<uint64_t> cleanerRewindAck_{0};      ///< cleaner-written
 
     // GR-10 push tracking is PER FOLLOWER (F27): FollowerSlot::pushedThrough /
     // pushCursor(); the old shared lastPushedOffset_ advanced even when a push to
