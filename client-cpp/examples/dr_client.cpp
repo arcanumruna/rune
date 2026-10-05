@@ -558,15 +558,19 @@ static int doTxnProduce(Client& c, const TopicHandle& th,
 
     // commit or abort
     const std::string outcome = doCommit ? "committed" : "aborted";
-    try {
-        if (doCommit) {
-            tp.commitTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
-        } else {
-            // Kafka parity: an abort drops records not yet produced — flush first so the aborted records
-            // reach the log (read_uncommitted consumers see them; read_committed must not).
+    if (!doCommit) {
+        // Kafka parity: an abort drops records not yet produced — flush first so the aborted records
+        // reach the log (read_uncommitted consumers see them; read_committed must not).  A failed
+        // flush is logged; the abort still runs (the transaction must never be left open).
+        try {
             tp.flushAndWait(std::chrono::milliseconds(timeoutMs * 2));
-            tp.abortTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
+        } catch (const std::exception& ex) {
+            std::cerr << "CLIENT: TXNFLUSH failed cid=" << cid << ": " << ex.what() << "\n";
         }
+    }
+    try {
+        if (doCommit) tp.commitTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
+        else tp.abortTransactionAndWait(std::chrono::milliseconds(timeoutMs * 2));
     } catch (const std::exception& ex) {
         std::cerr << "CLIENT: FAIL txn " << (doCommit ? "commitTransaction" : "abortTransaction")
                   << ": " << ex.what() << "\n";

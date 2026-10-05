@@ -264,6 +264,7 @@ void TransactionalProducerImpl::applyCommand(const detail::HubCommand& cmd, int6
         op.token      = static_cast<Token>(cmd.a);
         op.deadlineNs = opDeadline_(nowNs);
         op.phase      = UserOp::AwaitData{};
+        op.flushDropEpoch = dropEpoch_;
         ops_.push_back(std::move(op));
         return;
     }
@@ -566,7 +567,12 @@ TxnPartitionState& TransactionalProducerImpl::partition_(int32_t topicId, int32_
 }
 
 void TransactionalProducerImpl::dropWaiting_() noexcept {
-    for (auto& [k, ps] : partitions_) ps.waiting.clear();
+    bool dropped = false;
+    for (auto& [k, ps] : partitions_) {
+        dropped = dropped || !ps.waiting.empty();
+        ps.waiting.clear();
+    }
+    if (dropped) ++dropEpoch_;
 }
 
 void TransactionalProducerImpl::poison_(OpStatus st, uint16_t errorCode, bool bumpEpoch) {
@@ -760,15 +766,19 @@ bool TransactionalProducerImpl::dataSettled_() const noexcept {
 void TransactionalProducerImpl::gateFlushes_() {
     // E3: a flush completes once the data settled (every record produced + acked), or with the
     // transaction's failure once it is poisoned (its records will never all be acked).
+    // B-MEDIUM-1: a flush whose records were dropped unproduced (abort / close) fails.
     const auto* ae = std::get_if<SAbortableError>(&state_);
-    if (ae == nullptr && !dataSettled_()) return;
-    for (;;) {
-        uint64_t id = 0;
-        for (const auto& op : ops_)
-            if (op.kind == OpKind::Flush && std::holds_alternative<UserOp::AwaitData>(op.phase)) { id = op.id; break; }
-        if (id == 0) return;
+    const bool settled = dataSettled_();
+    for (size_t i = 0; i < ops_.size();) {
+        const UserOp& op = ops_[i];
+        if (op.kind != OpKind::Flush || !std::holds_alternative<UserOp::AwaitData>(op.phase)) { ++i; continue; }
+        const uint64_t id = op.id;
         if (ae != nullptr) completeAndErase_(id, ae->status, ae->errorCode, "flush: the transaction failed");
-        else completeAndErase_(id, OpStatus::Ok);
+        else if (op.flushDropEpoch != dropEpoch_)
+            completeAndErase_(id, OpStatus::DeliveryFailed, 0, "flush: records were dropped before they were produced");
+        else if (settled) completeAndErase_(id, OpStatus::Ok);
+        else { ++i; continue; }
+        i = 0;  // completeAndErase_ erased from ops_
     }
 }
 

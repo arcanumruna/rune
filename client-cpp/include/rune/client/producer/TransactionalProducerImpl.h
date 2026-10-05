@@ -306,6 +306,7 @@ private:
         bool              commit = false;        // EndTxn
         TxnOffsetsPayload offsets;               // SendOffsets
         Phase             phase = Init{};
+        uint64_t          flushDropEpoch = 0;    // Flush: dropEpoch_ when issued (B-MEDIUM-1)
         /// m5: abort calls that joined this pending abort (same completion).
         std::vector<std::pair<detail::OpTarget, Token>> joiners;
     };
@@ -421,6 +422,9 @@ private:
     /// started): bump the epoch first when required (abort), else Ready + Ok.
     void endDone_(uint64_t opId, int64_t nowNs);
     void dropWaiting_() noexcept;
+    /// B-MEDIUM-1: bumped whenever dropWaiting_ discards unproduced records; a flush issued
+    /// before a bump lost records and never completes Ok.
+    uint64_t dropEpoch_ = 0;
     void refuse_(const detail::HubCommand& cmd, OpKind kind, OpStatus st, uint16_t code, std::string_view why);
     void publishStatus_();
     TxnPartitionState& partition_(int32_t topicId, int32_t partition);

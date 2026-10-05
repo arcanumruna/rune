@@ -686,6 +686,112 @@ TEST(TransactionalProducerRegression, FlushWithNothingPendingCompletesAtOnce) {
     EXPECT_EQ(flush.status(), OpStatus::Ok);
 }
 
+// Review B-MEDIUM-1: a flush whose records an abort dropped (before they were produced) must not complete Ok.
+TEST(TransactionalProducerRegression, FlushFailsWhenAbortDropsItsRecords) {
+    TxnRig r;
+    r.acquire(42, 0);
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    auto flush = r.flush();
+    auto abort = r.abort();   // same duty pass, before the produce loop: the record is dropped unproduced
+    r.doWork();
+    r.doWork();
+    ASSERT_TRUE(flush.ready());
+    EXPECT_NE(flush.status(), OpStatus::Ok) << "the flushed record was dropped, never produced";
+}
+
+// B-MEDIUM-3: a poisoned transaction (batch timed out) completes the pending flush with the poison status.
+TEST(TransactionalProducerRegression, FlushCompletesWithThePoisonStatus) {
+    ProducerConfig cfg;
+    cfg.produceTimeoutMs = 20;
+    TxnRig r("flush-poison", cfg);
+    r.acquire(42, 0);
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.doWork();
+    ASSERT_EQ(r.sink.count(rpc::TemplateId::Produce), 1);
+    auto flush = r.flush();
+    r.now += 25'000'000;   // the batch (20 ms) expired
+    r.doWork();
+    r.doWork();
+    ASSERT_TRUE(flush.ready());
+    EXPECT_EQ(flush.status(), OpStatus::DeliveryFailed);
+    EXPECT_EQ(r.tp.state(), TxnState::AbortableError);
+}
+
+// B-MEDIUM-3: fencing while a flush is pending completes it Fenced; a flush in FatalError is refused Fenced.
+TEST(TransactionalProducerRegression, FlushFencedWhenTheProducerIsFenced) {
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    auto flush = r.flush();
+    auto commit = r.commit();
+    r.doWork();
+    const auto ids = collectProduceCorrIds(r.sink);
+    ASSERT_EQ(ids.size(), 1u);
+    auto fenced = makeProduceResponse(ids[0], ecOf(rpc::ErrorCode::ProducerFenced), -1);
+    r.impl->onProduceResponse(fenced.data(), fenced.size());
+    r.doWork();
+    ASSERT_TRUE(flush.ready());
+    if (r.tp.state() == TxnState::FatalError) {
+        EXPECT_EQ(flush.status(), OpStatus::Fenced);
+        auto again = r.flush();
+        r.doWork();
+        ASSERT_TRUE(again.ready());
+        EXPECT_EQ(again.status(), OpStatus::Fenced);
+    } else {
+        EXPECT_NE(flush.status(), OpStatus::Ok) << "a fenced produce never counts as flushed";
+    }
+}
+
+// B-MEDIUM-3: close while a flush is pending completes it (never left dangling), not Ok for dropped records.
+TEST(TransactionalProducerRegression, FlushCompletesWhenTheProducerCloses) {
+    TxnRig r;
+    r.acquire(42, 0);
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    auto flush = r.flush();
+    auto close = r.close();
+    for (int i = 0; i < 5; ++i) r.doWork();
+    ASSERT_TRUE(flush.ready());
+    EXPECT_NE(flush.status(), OpStatus::Ok);
+}
+
+// B-MEDIUM-3: the op deadline times the flush out; that never poisons the transaction.
+TEST(TransactionalProducerRegression, FlushTimeoutDoesNotPoison) {
+    ProducerConfig cfg;
+    cfg.transactionOpTimeoutMs = 50;
+    cfg.produceTimeoutMs       = 10'000;
+    TxnRig r("flush-timeout", cfg);
+    r.acquire(42, 0);
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.doWork();                               // produced, ack held
+    auto flush = r.flush();
+    r.now += 60'000'000;                      // past the flush's op deadline, not the batch's
+    r.doWork();
+    ASSERT_TRUE(flush.ready());
+    EXPECT_EQ(flush.status(), OpStatus::Timeout);
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction) << "a flush timeout is not a transaction failure";
+}
+
+// B-MEDIUM-3: a flush issued while committing neither delays nor duplicates the EndTxn.
+TEST(TransactionalProducerRegression, FlushDuringCommitSendsOneEndTxn) {
+    TxnRig r;
+    r.acquire(42, 0);
+    r.startTxn();
+    auto commit = r.commit();
+    auto flush = r.flush();
+    EXPECT_EQ(r.cycles(3, rpc::TemplateId::EndTxn), 1);
+    ASSERT_TRUE(flush.ready());
+    EXPECT_EQ(flush.status(), OpStatus::Ok);
+}
+
 // TX-6b + fix round 1 (C-1): a batch that times out (duty clock — no sleep)
 // poisons the txn: the commit completes DeliveryFailed without an EndTxn and
 // the producer is AbortableError — the broker transaction is still open, so
