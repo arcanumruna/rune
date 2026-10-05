@@ -120,9 +120,27 @@ enum class ErrorCode : uint16_t {
 //   1 — the original client.
 //   2 — D6: understands ErrorCode::UnknownProducerId (28) and
 //       ProduceResponse.logStartOffset.
+//   3 — explicit consumer-group subscriptions: a group member subscribes to
+//       each assigned partition's LEADER itself (after OffsetFetch, from the
+//       committed offset) and demultiplexes Records by (subscriptionId,
+//       correlationId); the coordinator creates no subscription at SyncGroup.
+//       A broker coordinator refuses JoinGroup from a client below 3
+//       (ErrorCode::ProtocolVersion, non-retriable).
 // ---------------------------------------------------------------------------
-inline constexpr int32_t kClientVersionUnknownProducerId = 2;
-inline constexpr int32_t kClientVersion                  = 2;   // what this protocol's client announces
+inline constexpr int32_t kClientVersionUnknownProducerId          = 2;
+inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
+inline constexpr int32_t kClientVersion                           = 3;   // what this protocol's client announces
+
+// ---------------------------------------------------------------------------
+// Broker versions (ConnectResponse.brokerVersion, an additive trailing field;
+// a broker that predates it sends the 38-byte frame = version 0).
+//   3 — explicit consumer-group subscriptions (see client version 3): the
+//       coordinator does not auto-subscribe members, Records carry the
+//       creating Subscribe's correlationId, session / subscription ids are
+//       cluster-unique.  A client runs a GroupConsumer only against >= 3.
+// ---------------------------------------------------------------------------
+inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
+inline constexpr int32_t kBrokerVersion                           = 3;   // what this protocol's broker announces
 
 /// True when a session that connected with `clientVersion` may be answered
 /// UnknownProducerId (else the broker answers OutOfOrderSequence, as before).

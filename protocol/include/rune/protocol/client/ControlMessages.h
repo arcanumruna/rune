@@ -97,8 +97,10 @@ struct ConnectRequest {
 //   [24..25]  code              : int16
 //   [26..29]  leaderMemberId    : int32
 //   [30..37]  assignedSessionId : int64
+//   [38..41]  brokerVersion     : int32  (additive; absent in the 38-byte
+//                                         frame of an older broker = 0)
 //
-// Total = 24 + 14 = 38 bytes (no var fields)
+// Total = 24 + 18 = 42 bytes (no var fields); decode accepts the 38-byte form.
 // ---------------------------------------------------------------------------
 struct ConnectResponse {
     int64_t sessionId         = 0;
@@ -106,13 +108,16 @@ struct ConnectResponse {
     int16_t code              = 0;   // rune::protocol::client::ErrorCode value
     int32_t leaderMemberId    = -1;
     int64_t assignedSessionId = 0;
+    int32_t brokerVersion     = kBrokerVersion;  // capability gate (Protocol.h)
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ConnectResponse); // 2
-    static constexpr uint16_t BODY_FIXED  = 14;
+    static constexpr uint16_t BODY_FIXED  = 18;
+    static constexpr uint16_t BODY_FIXED_V0 = 14;  // an older broker's body (no brokerVersion)
 
-    static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE + BODY_FIXED; // 38
+    static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;     // 42
+    static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0;  // 38
 
-    /// Encode the full frame (38 bytes) into buf.  Returns 38.
+    /// Encode the full frame (42 bytes) into buf.  Returns 42.
     std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr;
         hdr.blockLength   = BODY_FIXED;
@@ -127,6 +132,7 @@ struct ConnectResponse {
         detail::putLE16s(buf, fixedBase + 0, code);
         detail::putLE32 (buf, fixedBase + 2, leaderMemberId);
         detail::putLE64 (buf, fixedBase + 6, assignedSessionId);
+        detail::putLE32 (buf, fixedBase + 14, brokerVersion);
 
         return ENCODED_SIZE;
     }
@@ -134,7 +140,7 @@ struct ConnectResponse {
     /// Decode a full frame from buf[0..avail-1].
     /// Returns nullopt on any truncation or header mismatch.
     static std::optional<ConnectResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
-        if (avail < ENCODED_SIZE) return std::nullopt;
+        if (avail < ENCODED_SIZE_V0) return std::nullopt;
 
         auto hdrOpt = MessageHeader::decode(buf, avail);
         if (!hdrOpt) return std::nullopt;
@@ -150,6 +156,10 @@ struct ConnectResponse {
         msg.code              = detail::getLE16s(buf, fixedBase + 0);
         msg.leaderMemberId    = detail::getLE32 (buf, fixedBase + 2);
         msg.assignedSessionId = detail::getLE64 (buf, fixedBase + 6);
+        // Additive field: present when the sender's body is long enough.
+        msg.brokerVersion = (hdr.blockLength >= BODY_FIXED && avail >= ENCODED_SIZE)
+                                ? static_cast<int32_t>(detail::getLE32(buf, fixedBase + 14))
+                                : 0;
 
         return msg;
     }

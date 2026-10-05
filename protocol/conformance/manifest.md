@@ -77,6 +77,11 @@ Offset  Hex                                        Notes
 
 ## 3. `connect_response.bin` — 38 bytes
 
+> **v0 form.** Since client/broker version 3 a broker sends the 42-byte form:
+> blockLength 18 and a trailing `brokerVersion` int32 at [38..41].  Decoders
+> accept both (the 38-byte form = brokerVersion 0); these golden vectors pin
+> the v0 form every decoder must keep accepting.
+
 **Message:** `ConnectResponse` (templateId = 2)
 
 | Field              | Value (decimal)          | Value (hex)           |

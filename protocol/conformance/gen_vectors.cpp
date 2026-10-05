@@ -83,7 +83,12 @@ int main(int argc, char** argv) {
         msg.code              = static_cast<int16_t>(rpc::ErrorCode::OK);   // 0
         msg.leaderMemberId    = 2;
         msg.assignedSessionId = static_cast<int64_t>(0x00000000DEADBEEFULL);
-        n = msg.encode(buf);
+        // The golden vector is the v0 (pre-brokerVersion, 38-byte) form — every
+        // decoder must keep accepting it; the 42-byte form only appends
+        // brokerVersion (int32 at [38..41]).
+        msg.encode(buf);
+        rune::protocol::client::detail::putLE16(buf, 0, rpc::ConnectResponse::BODY_FIXED_V0);
+        n = rpc::ConnectResponse::ENCODED_SIZE_V0;
         write_vec(dir, "connect_response.bin", buf, n);
     }
 
@@ -97,7 +102,12 @@ int main(int argc, char** argv) {
         msg.code              = static_cast<int16_t>(rpc::ErrorCode::Redirect); // 3
         msg.leaderMemberId    = 1;
         msg.assignedSessionId = 0;
-        n = msg.encode(buf);
+        // The golden vector is the v0 (pre-brokerVersion, 38-byte) form — every
+        // decoder must keep accepting it; the 42-byte form only appends
+        // brokerVersion (int32 at [38..41]).
+        msg.encode(buf);
+        rune::protocol::client::detail::putLE16(buf, 0, rpc::ConnectResponse::BODY_FIXED_V0);
+        n = rpc::ConnectResponse::ENCODED_SIZE_V0;
         write_vec(dir, "connect_response_redirect.bin", buf, n);
     }
 
