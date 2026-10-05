@@ -1839,3 +1839,29 @@ TEST(LogRegression, RestampAppendStampsTheLeaderEpochZeroCopy) {
     }
     std::filesystem::remove_all(dir);
 }
+
+// D11 (2026-10-05): publishSealedSnapshot() reuses each sealed segment's
+// largestTimestamp from the previous snapshot with ONE merge walk (it was a scan
+// of the previous snapshot per segment — O(n^2) on the append path per roll; a
+// 4000-segment test took 70 s).  Every sealed segment must keep its OWN
+// timestamp through every republish.
+TEST(LogRegression, SealedSnapshotKeepsEachSegmentsTimestampAcrossManyRollsRegression) {
+    auto dir = makeTempDir("rune_log_d11");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/64);       // every batch seals a segment
+    constexpr int kBatches = 1500;
+    for (int i = 0; i < kBatches; ++i) {
+        RecordBatchBuilder b(static_cast<int64_t>(i), 100'000 + i);
+        b.append("k", "v", 100'000 + i);
+        log.append(b.build(), static_cast<int64_t>(i));
+    }
+    const auto snap = log.sealedSegmentSnapshot();
+    ASSERT_NE(snap, nullptr);
+    ASSERT_GE(snap->size(), static_cast<std::size_t>(kBatches - 2));
+    for (std::size_t i = 0; i < snap->size(); ++i) {
+        const auto& si = (*snap)[i];
+        EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset) << "segment base " << si.baseOffset;
+        if (i > 0) EXPECT_LT((*snap)[i - 1].baseOffset, si.baseOffset);
+    }
+    std::filesystem::remove_all(dir);
+}
