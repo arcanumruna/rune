@@ -252,6 +252,10 @@ void Log::publishSealedSnapshot() {
     auto snap = std::make_shared<SealedSegmentSnapshot>();
     if (segments_.size() > 1) {
         snap->reserve(segments_.size() - 1);
+        // D11: both segments_ and prevSnap are ascending by baseOffset — one merge
+        // walk (O(n) per roll; was a scan of prevSnap per segment, O(n^2) on the
+        // append path once a partition holds thousands of segments).
+        std::size_t prevIdx = 0;
         auto it  = segments_.begin();
         auto end = std::prev(segments_.end()); // stop before active
         for (; it != end; ++it) {
@@ -265,9 +269,9 @@ void Log::publishSealedSnapshot() {
             // segment (sealed segments are immutable after they are created).
             int64_t largestTs = 0;
             if (prevSnap) {
-                for (const auto& si : *prevSnap) {
-                    if (si.baseOffset == base) { largestTs = si.largestTimestamp; break; }
-                }
+                const SealedSegmentSnapshot& prev = *prevSnap;
+                while (prevIdx < prev.size() && prev[prevIdx].baseOffset < base) ++prevIdx;
+                if (prevIdx < prev.size() && prev[prevIdx].baseOffset == base) largestTs = prev[prevIdx].largestTimestamp;
             }
             // If not found in the previous snapshot, this is either:
             //   (a) A NEWLY SEALED segment from maybeRoll(): use newlySealedMaxTs_
