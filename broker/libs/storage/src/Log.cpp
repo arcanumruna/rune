@@ -112,6 +112,9 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     // recovered from the first batch header and is renamed into place (no data
     // loss); un-adopted / empty staging files are removed.
     recoverStagingFiles();
+    // Fix round 2: settle compaction swaps interrupted by a crash (before the
+    // .log discovery below).
+    recoverCleanerSwapFiles();
     // Discover existing segments; else create the first at offset 0.
     std::vector<int64_t> bases;
     for (auto& e : std::filesystem::directory_iterator(dir_)) {
@@ -1659,7 +1662,134 @@ bool Log::cleanerOpApplies_(SegMap::iterator it, uint64_t lineage) noexcept {
     return true;
 }
 
-bool Log::enqueueCleanedSegment(int64_t base, uint64_t lineage) noexcept {
+bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound) {
+    // Fix round 2 — Kafka replaceSegments, on the OWNER thread.  The cleaner
+    // only wrote an fsynced output (<b1>.log.<seq>.cleaned); nothing on disk or
+    // in segments_ has changed yet.  Validate, then commit with renames:
+    //   1. <b1>.log.<seq>.cleaned -> <b1>.log.<end>.swap   (COMMIT point)
+    //   2. unlink members b2..bk (.log/.index) and b1's stale .index
+    //   3. <b1>.log.<end>.swap   -> <b1>.log               (atomic replace)
+    // A crash before 1 leaves a .cleaned (deleted at construction: originals
+    // intact); after 1 a .swap (construction completes 2-3).  No fsync here:
+    // the output's data was fsynced by the cleaner; the renames are ordered
+    // metadata operations recovery handles in any prefix.
+    const SegRef head = swapRing_[first & kSwapRingMask];
+    const int64_t b1 = head.base;
+    const std::string cleaned = cleanedLogPath(dir_, b1, head.seq);
+    std::error_code ec;
+    auto reject = [&](const char* why) {
+        ++cleanerGroupsRejected_;
+        if (b1 < cleanerRejectLowWater_) cleanerRejectLowWater_ = b1;
+        spdlog::warn("Log {}: rejecting cleaner output for segment {} (+{} member(s)): {} — "
+                     "original segments untouched", dir_, b1, n - 1, why);
+        if (head.hasOutput) std::filesystem::remove(cleaned, ec);
+        return false;
+    };
+    // ---- validate: every member present, contiguous, same incarnation, sealed, below the bound.
+    auto it = segments_.find(b1);
+    if (it == segments_.end()) return reject("front segment gone");
+    auto cur = it;
+    int64_t membersMaxTs = INT64_MIN;
+    for (std::size_t k = 0; k < n; ++k, ++cur) {
+        const SegRef ref = swapRing_[(first + k) & kSwapRingMask];
+        if (cur == segments_.end() || cur->first != ref.base) return reject("members not contiguous / gone");
+        if (std::next(cur) == segments_.end()) return reject("member is the active segment");
+        if (ref.lineage != kAnyLineage && cur->second->tsLineage() != ref.lineage)
+            return reject("member rebuilt since the pass (lineage changed)");
+        if (ref.base >= maxBaseBound) return reject("member at/above the HW/LSO bound");
+        // The cleaner read the CANONICAL <base>.log: a member whose staging→base
+        // rename is still pending was not read (its data is not in the output).
+        if (!std::filesystem::exists(logPathForBase(ref.base), ec)) return reject("member's file is not at its canonical name");
+        membersMaxTs = std::max({membersMaxTs, cur->second->publishedTs(), cur->second->tsFloor()});
+    }
+    const int64_t end = cur->first;   // next segment after the last member (exists: none is active)
+    if (!compactionAllowedThrough(end)) return reject("range ends above the persisted recovery point");
+    if (head.hasOutput && !std::filesystem::exists(cleaned, ec)) return reject("output file missing");
+
+    // ---- commit
+    if (head.hasOutput) {
+        const std::string swap = swapLogPath(dir_, b1, end);
+        std::filesystem::rename(cleaned, swap, ec);
+        if (ec) return reject("rename to .swap failed");
+        try {
+            auto m = std::next(it);
+            for (std::size_t k = 1; k < n; ++k, ++m) {
+                std::filesystem::remove(logPathForBase(m->first));
+                std::filesystem::remove(indexPathForBase(m->first));
+            }
+            std::filesystem::remove(indexPathForBase(b1));
+            std::filesystem::rename(swap, logPathForBase(b1));
+        } catch (const std::exception& ex) {
+            fatalHalt("Log::drainCleanerSwaps: committed swap of segment " + std::to_string(b1) +
+                      " failed mid-way (dir=" + dir_ + "): " + ex.what() +
+                      ".  Halting — construction completes the .swap on restart.");
+        }
+        // In memory: drop the absorbed members, reload the front from the new file.
+        auto m = std::next(it);
+        for (std::size_t k = 1; k < n; ++k) m = erase_(m);
+        reloadSegmentNoPublish_(b1);   // fresh incarnation; floor = the front's own
+        auto f = segments_.find(b1);
+        if (f != segments_.end()) f->second->raiseTsFloor(membersMaxTs);   // CRITICAL-1: newest member
+        return true;
+    }
+    // Every record removed: drop all members (their offsets read as a gap, as
+    // with Kafka compaction).  Their timestamps fold into the predecessor.
+    if (it != segments_.begin()) std::prev(it)->second->raiseTsFloor(membersMaxTs);
+    auto m = it;
+    for (std::size_t k = 0; k < n; ++k) {
+        std::filesystem::remove(logPathForBase(m->first), ec);
+        std::filesystem::remove(indexPathForBase(m->first), ec);
+        m = erase_(m);
+    }
+    return true;
+}
+
+void Log::recoverCleanerSwapFiles() {
+    // Fix round 2 crash recovery (construction, before segment discovery).
+    //   *.cleaned : an UNCOMMITTED cleaner output — delete (originals intact).
+    //   *.swap    : a COMMITTED swap <b1>.log.<end>.swap replacing [b1, end) —
+    //               delete every remaining segment in (b1, end) and b1's index,
+    //               then rename it over <b1>.log (idempotent if re-run).
+    std::vector<std::filesystem::path> cleaned, swaps;
+    for (auto& e : std::filesystem::directory_iterator(dir_)) {
+        const auto ext = e.path().extension();
+        if (ext == ".cleaned") cleaned.push_back(e.path());
+        else if (ext == ".swap") swaps.push_back(e.path());
+    }
+    std::error_code ec;
+    for (const auto& p : cleaned) {
+        spdlog::warn("Log {}: removing uncommitted cleaner output {}", dir_, p.filename().string());
+        std::filesystem::remove(p, ec);
+    }
+    for (const auto& p : swaps) {
+        // <base20>.log.<end>.swap
+        const std::string name = p.filename().string();
+        const auto dot1 = name.find(".log.");
+        const auto dot2 = name.rfind(".swap");
+        if (dot1 == std::string::npos || dot2 == std::string::npos || dot2 <= dot1 + 5) continue;
+        int64_t b1 = 0, end = 0;
+        try {
+            b1  = std::stoll(name.substr(0, dot1));
+            end = std::stoll(name.substr(dot1 + 5, dot2 - dot1 - 5));
+        } catch (...) { continue; }
+        spdlog::warn("Log {}: completing committed compaction swap {} (segments [{}, {}))",
+                     dir_, name, b1, end);
+        for (auto& e : std::filesystem::directory_iterator(dir_)) {
+            if (e.path().extension() != ".log") continue;
+            int64_t b = 0;
+            try { b = std::stoll(e.path().stem().string()); } catch (...) { continue; }
+            if (b > b1 && b < end) {
+                std::filesystem::remove(e.path(), ec);
+                std::filesystem::remove(indexPathForBase(b), ec);
+            }
+        }
+        std::filesystem::remove(indexPathForBase(b1), ec);
+        std::filesystem::rename(p, logPathForBase(b1), ec);
+        if (ec) fatalHalt("Log: cannot complete compaction swap " + p.string() + ": " + ec.message());
+    }
+}
+
+bool Log::enqueueSwapSlots_(const SegRef* refs, std::size_t n) noexcept {
     // LOCK-FREE SPSC producer (single cleaner thread).  No mutex on any path.
     // Uses FREE-RUNNING (unmasked) monotonic counters: head_/tail_ only ever
     // increase; the index into swapRing_ is (counter & kSwapRingMask).  Comparing
@@ -1671,20 +1801,51 @@ bool Log::enqueueCleanedSegment(int64_t base, uint64_t lineage) noexcept {
     // thread's release-store of head_ in drainCleanerSwaps().
     const std::size_t tail = swapTail_.load(std::memory_order_relaxed);
     const std::size_t head = swapHead_.load(std::memory_order_acquire);
-    if (tail - head >= kSwapRingCapacity) {
-        // Ring full — drop (return false).  The cleaner re-enqueues the same base
-        // next cycle; reloadSegment is idempotent so a delayed reload is safe.
+    if (n == 0 || n > kSwapRingCapacity || tail - head > kSwapRingCapacity - n) {
+        // Ring full — drop (return false).  The cleaner retries next cycle.
         return false;
     }
-    swapRing_[tail & kSwapRingMask] = SegRef{base, lineage};
-    // Release-store publishes the slot AND the cleaner's prior on-disk rename to
-    // the consumer's acquire-load of tail_ in drainCleanerSwaps() — the barrier
-    // between the cleaner's file rename and the append thread's reloadSegment().
-    swapTail_.store(tail + 1, std::memory_order_release);
+    for (std::size_t k = 0; k < n; ++k) swapRing_[(tail + k) & kSwapRingMask] = refs[k];
+    // ONE release-store publishes every slot of the group (the consumer sees all
+    // of it or none) AND the cleaner's prior durable output write.
+    swapTail_.store(tail + n, std::memory_order_release);
     return true;
 }
 
-int Log::drainCleanerSwaps() {
+bool Log::enqueueCleanedSegment(int64_t base, uint64_t lineage) noexcept {
+    // Legacy in-place reload (a synchronous / test caller already replaced the file).
+    const SegRef ref{base, lineage, 0, 0, false};
+    return enqueueSwapSlots_(&ref, 1);
+}
+
+bool Log::enqueueCleanedGroup(const CleanedMember* members, std::size_t n, uint64_t seq,
+                              bool hasOutput) noexcept {
+    // Fix round 2: a deferred compaction output.  Bounded by the cleaner
+    // (LogCleaner::kMaxDeferredGroupMembers); the slots live in a fixed scratch
+    // array — no allocation on the cleaner side either.
+    constexpr std::size_t kMax = 256;
+    if (n == 0 || n > kMax) return false;
+    std::array<SegRef, kMax> refs;
+    for (std::size_t k = 0; k < n; ++k)
+        refs[k] = SegRef{members[k].base, members[k].lineage, static_cast<uint32_t>(seq),
+                         static_cast<uint16_t>(k == 0 ? n : 0), hasOutput};
+    // groupSize 0 marks a legacy entry: non-first members are never read alone
+    // (the drain consumes the whole group from its first slot).
+    return enqueueSwapSlots_(refs.data(), n);
+}
+
+std::string Log::cleanedLogPath(const std::string& dir, int64_t base, uint64_t seq) {
+    std::string s = std::to_string(base);
+    if (s.size() < 20) s = std::string(20 - s.size(), '0') + s;
+    return dir + "/" + s + ".log." + std::to_string(static_cast<uint32_t>(seq)) + ".cleaned";
+}
+std::string Log::swapLogPath(const std::string& dir, int64_t base, int64_t end) {
+    std::string s = std::to_string(base);
+    if (s.size() < 20) s = std::string(20 - s.size(), '0') + s;
+    return dir + "/" + s + ".log." + std::to_string(end) + ".swap";
+}
+
+int Log::drainCleanerSwaps(int64_t maxBaseBound) {
     // LOCK-FREE SPSC consumer (single append/duty-cycle thread).  No mutex.
     // head_ is consumer-owned: relaxed load of our own position.
     // tail_ acquire-load pairs with the producer's release-store — the acquire
@@ -1692,8 +1853,16 @@ int Log::drainCleanerSwaps() {
     // reloadSegment() calls below.
     const std::size_t head = swapHead_.load(std::memory_order_relaxed);
     const std::size_t tail = swapTail_.load(std::memory_order_acquire);
-    for (std::size_t i = head; i != tail; ++i) {
+    for (std::size_t i = head; i != tail; ) {
         const SegRef ref = swapRing_[i & kSwapRingMask];
+        if (ref.groupSize > 0) {
+            // Fix round 2: a deferred group — the producer published all of its
+            // slots with one release-store, so [i, i + groupSize) is complete.
+            (void)applyCleanedGroup_(i, ref.groupSize, maxBaseBound);
+            i += ref.groupSize;
+            continue;
+        }
+        ++i;
         auto it = segments_.find(ref.base);
         if (it == segments_.end()) continue;               // already gone: idempotent
         if (!cleanerOpApplies_(it, ref.lineage)) continue;  // MAJOR-2: stale swap

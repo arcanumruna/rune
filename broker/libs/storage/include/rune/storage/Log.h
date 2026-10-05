@@ -428,6 +428,25 @@ public:
     /// is now the ACTIVE segment or carries a different lineage (the cleaner
     /// acted on a stale snapshot: a truncate rebuilt the segment meanwhile).
     static constexpr uint64_t kAnyLineage = 0;
+    /// Fix round 2 file naming (shared with LogCleaner):
+    ///   <base20>.log.<seq>.cleaned — a cleaner output awaiting owner validation
+    ///                                (uncommitted: recovery deletes it);
+    ///   <base20>.log.<end>.swap    — a validated swap replacing every segment in
+    ///                                [base, end) (committed: recovery completes it).
+    static std::string cleanedLogPath(const std::string& dir, int64_t base, uint64_t seq);
+    static std::string swapLogPath(const std::string& dir, int64_t base, int64_t end);
+    /// One member of a deferred compaction group (cleaner thread → owner thread).
+    struct CleanedMember { int64_t base = 0; uint64_t lineage = kAnyLineage; };
+    /// Fix round 2 (Kafka-style replaceSegments on the owner thread): enqueue a
+    /// cleaner output for validation + install.  ALL members are claimed in the
+    /// ring at once (one release-store) so the owner sees the whole group or
+    /// nothing.  The owner installs it only if every member still exists with
+    /// the same lineage, none is the active segment, they are contiguous and
+    /// below the drain bound; otherwise it deletes the cleaned file and the
+    /// originals stay untouched.  false = ring full (the caller deletes its
+    /// output and retries next pass).
+    bool enqueueCleanedGroup(const CleanedMember* members, std::size_t n, uint64_t seq,
+                             bool hasOutput) noexcept;
     bool enqueueCleanedSegment(int64_t base, uint64_t lineage = kAnyLineage) noexcept;
 
     /// CP-6: Drain pending cleaner swaps on the single-writer append/duty-cycle
@@ -440,7 +459,21 @@ public:
     /// Lock-free SPSC: this is the SINGLE-CONSUMER half.  The acquire-load of
     /// tail_ pairs with enqueueCleanedSegment's release-store.
     /// Returns number of swaps processed (>0 = work done).
-    int drainCleanerSwaps();
+    /// `maxBaseBound` (fix round 2): a deferred group is installed only when every
+    /// member base is below it — the owner passes min(HW, LSO) (the cleaner
+    /// selected members strictly below both).  Legacy reload entries ignore it.
+    int drainCleanerSwaps(int64_t maxBaseBound = INT64_MAX);
+    /// Deferred groups rejected by validation (their output deleted).  Owner thread.
+    [[nodiscard]] uint64_t cleanerGroupsRejected() const noexcept { return cleanerGroupsRejected_; }
+    /// The lowest front base of a deferred group rejected since the last call
+    /// (INT64_MAX = none), then reset.  The owner rewinds the replica's clean
+    /// watermark to it: the rejected range was NOT compacted although the
+    /// cleaner already advanced past it.  Owner thread.
+    [[nodiscard]] int64_t takeCleanerRejectLowWater() noexcept {
+        const int64_t v = cleanerRejectLowWater_;
+        cleanerRejectLowWater_ = INT64_MAX;
+        return v;
+    }
 
     // -----------------------------------------------------------------------
     // CP-9: Retention async-delete API (single-writer invariant preserved).
@@ -733,7 +766,24 @@ private:
     // Capacity is a power of two so index masking is a bitwise AND.
     static constexpr std::size_t kSwapRingCapacity = 1024; // power of two
     static constexpr std::size_t kSwapRingMask     = kSwapRingCapacity - 1;
-    struct SegRef { int64_t base = 0; uint64_t lineage = kAnyLineage; };
+    /// A swap-ring slot.  kind Reload = legacy in-place reload of `base` (file
+    /// already replaced by a synchronous / test caller).  kind Group = member of
+    /// a deferred group; the FIRST member carries groupSize, seq, hasOutput.
+    struct SegRef {
+        int64_t  base = 0;
+        uint64_t lineage = kAnyLineage;
+        uint32_t seq = 0;         ///< output name (unique among in-flight outputs)
+        uint16_t groupSize = 0;   ///< 0 = legacy Reload entry; >0 on a group's first slot
+        bool     hasOutput = false;
+    };   // 24 bytes
+    uint64_t cleanerGroupsRejected_ = 0;
+    int64_t  cleanerRejectLowWater_ = INT64_MAX;   ///< see takeCleanerRejectLowWater()
+    /// Validate + install one deferred group (slots [first, first+n)).  Owner thread.
+    bool applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound);
+    /// Construction: delete uncommitted .cleaned outputs, complete committed .swap files.
+    void recoverCleanerSwapFiles();
+    /// The single SPSC producer path of the swap ring (n slots, one release-store).
+    bool enqueueSwapSlots_(const SegRef* refs, std::size_t n) noexcept;
     std::array<SegRef, kSwapRingCapacity> swapRing_{};
     alignas(64) std::atomic<std::size_t>   swapHead_{0}; // consumer index
     alignas(64) std::atomic<std::size_t>   swapTail_{0}; // producer index

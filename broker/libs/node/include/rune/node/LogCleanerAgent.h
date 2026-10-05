@@ -88,6 +88,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <array>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -512,6 +513,10 @@ public:
         // D3b fix round 1: a txn marker is removed only below the minimum fetch
         // position of EVERY assigned replica (a lagging replica must still get it).
         cleaner.setMarkerRemovalBound(best.replica->cleanerMarkerRemovalBound());
+        // Fix round 2 (Kafka-style): the cleaner NEVER replaces / deletes a
+        // segment file — outputs go to unique .cleaned files the owner thread
+        // validates and installs (Log::drainCleanerSwaps).
+        cleaner.setDeferredInstall(&cleanedSeq_);
         rune::storage::RangeCleanResult passResult = cleaner.produceCleanedRangeBounded(
             best.dir,
             sealedBases,
@@ -536,19 +541,45 @@ public:
         //   - a rewritten base → reloadSegment picks up the new .log.
         //   - a merged/emptied base → reloadSegment finds the .log gone, drops it.
         // ---------------------------------------------------------------
+        // Fix round 2: advance the watermark BEFORE handing the outputs over, so
+        // an owner-side rejection's rewind (PartitionReplica::
+        // drainCleanerSwapsOnOwner) is always ordered after this store.
+        const bool advance = passEnd > globalDirtyStart &&
+                             best.replica->cleanerRole() == rune::replication::Role::Leader;
+        if (advance) best.replica->setLastCleanOffset(passEnd);
         bool allEnqueued = true;
-        for (int64_t gb : passResult.rewrittenBases) {
-            // MAJOR-2: the lineage of the incarnation the pass read (best.snap,
-            // ascending by base) — a swap for a since-rebuilt segment is dropped.
-            uint64_t lineage = rune::storage::Log::kAnyLineage;
-            const auto sit = std::lower_bound(best.snap->begin(), best.snap->end(), gb,
-                [](const rune::storage::SegInfo& si, int64_t b) { return si.baseOffset < b; });
-            if (sit != best.snap->end() && sit->baseOffset == gb) lineage = sit->lineage;
-            if (!best.log->enqueueCleanedSegment(gb, lineage)) { allEnqueued = false; break; }
+        for (std::size_t gi = 0; gi < passResult.groups.size(); ++gi) {
+            const auto& g = passResult.groups[gi];
+            // MAJOR-2: the lineage of each member incarnation the pass read
+            // (best.snap, ascending by base) — the owner rejects the group if any
+            // member was rebuilt since.
+            std::size_t n = 0;
+            for (int64_t gb : g.bases) {
+                uint64_t lineage = rune::storage::Log::kAnyLineage;
+                const auto sit = std::lower_bound(best.snap->begin(), best.snap->end(), gb,
+                    [](const rune::storage::SegInfo& si, int64_t b) { return si.baseOffset < b; });
+                if (sit != best.snap->end() && sit->baseOffset == gb) lineage = sit->lineage;
+                scratchMembers_[n++] = rune::storage::Log::CleanedMember{gb, lineage};
+            }
+            if (!best.log->enqueueCleanedGroup(scratchMembers_.data(), n, g.seq, g.hasOutput)) {
+                // Ring full: discard this and every later output (the originals are
+                // untouched) — the segments stay dirty and are redone next cycle.
+                for (std::size_t gj = gi; gj < passResult.groups.size(); ++gj) {
+                    const auto& d = passResult.groups[gj];
+                    std::error_code ec;
+                    if (d.hasOutput)
+                        std::filesystem::remove(rune::storage::Log::cleanedLogPath(best.dir, d.bases.front(), d.seq), ec);
+                }
+                allEnqueued = false;
+                break;
+            }
         }
         if (!allEnqueued) {
-            // Ring full — leave the segment(s) dirty; retry next cycle.  Do not
-            // advance the watermark (preserves the CP-6 ring-full invariant).
+            // Ring full — leave the segment(s) dirty; retry next cycle.  Undo the
+            // advance (a LOWER value is always safe: the owner only ever lowers
+            // it too) — preserves the CP-6 ring-full invariant.
+            if (advance && best.replica->lastCleanOffset() > globalDirtyStart)
+                best.replica->setLastCleanOffset(globalDirtyStart);
             return 0;
         }
 
@@ -558,9 +589,7 @@ public:
         // Advance lastCleanOffset to passEnd (MONOTONIC: forward-only, leader-only).
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
-        if (passEnd > globalDirtyStart &&
-            best.replica->cleanerRole() == rune::replication::Role::Leader) {
-            best.replica->setLastCleanOffset(passEnd);
+        if (advance) {
             // CP-7: persist the checkpoint (pure file I/O; cleaner-thread-safe).
             if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
                 it->second->store(passEnd);
@@ -885,6 +914,8 @@ private:
     // steady-state cleaner cycle performs near-zero heap allocation.
     rune::storage::SkimpyOffsetMap dedupeMap_;
     std::vector<int64_t> scratchBases_;
+    uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)
+    std::array<rune::storage::Log::CleanedMember, rune::storage::LogCleaner::kMaxDeferredGroupMembers> scratchMembers_{};
     std::vector<int64_t> scratchSizes_;
 
     // CP-7: per-log cleaner-offset-checkpoint (lazy init on first compaction).

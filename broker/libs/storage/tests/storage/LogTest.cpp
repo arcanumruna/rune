@@ -2295,3 +2295,123 @@ TEST(LogRegression, DeleteOldSegmentsRespectsHighWatermarkRegression) {
     expectSnapshotMatchesSegments(log);
     std::filesystem::remove_all(dir);
 }
+
+// ===========================================================================
+// Fix round 2: compaction outputs are installed by the OWNER thread
+// (Kafka replaceSegments): .cleaned (uncommitted) -> .swap (committed) -> .log.
+// ===========================================================================
+namespace {
+void writeBytes(const std::string& p, const std::vector<uint8_t>& b) {
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+std::vector<uint8_t> concatSegs(const std::filesystem::path& dir, std::initializer_list<int64_t> bases) {
+    std::vector<uint8_t> out;
+    for (int64_t b : bases) { auto v = readAll(segFile(dir, b, ".log")); out.insert(out.end(), v.begin(), v.end()); }
+    return out;
+}
+int64_t firstOffsetAt(Log& log, int64_t off) {
+    const auto bytes = log.read(off, 1 << 20);
+    if (bytes.empty()) return -1;
+    return RecordBatchReader(bytes.data(), bytes.size()).baseOffset();
+}
+} // namespace
+
+// A valid deferred group is installed on the owner thread: the front holds the
+// merged output, the members are gone (map + disk), no temp file remains, and
+// the merged segment carries the newest member timestamp (CRITICAL-1).
+TEST(LogRegression, DeferredCleanedGroupIsInstalledByOwnerRegression) {
+    auto dir = makeTempDir("rune_log_deferred_ok");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    appendTs(log, 0, 1000); appendTs(log, 1, 1001);
+    appendTs(log, 2, 9'000'002); appendTs(log, 3, 9'000'003);
+    appendTs(log, 4, 9'000'004);
+    const auto snap = log.sealedSegmentSnapshot();
+    writeBytes(Log::cleanedLogPath(dir.string(), 0, 7), concatSegs(dir, {0, 2}));
+    // Nothing on disk changed yet: the originals are intact.
+    ASSERT_TRUE(std::filesystem::exists(segFile(dir, 2, ".log")));
+    const Log::CleanedMember members[] = {{0, (*snap)[0].lineage}, {2, (*snap)[1].lineage}};
+    ASSERT_TRUE(log.enqueueCleanedGroup(members, 2, 7, /*hasOutput=*/true));
+    log.drainCleanerSwaps();
+    EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 4}));
+    EXPECT_FALSE(std::filesystem::exists(segFile(dir, 2, ".log")));
+    EXPECT_FALSE(std::filesystem::exists(Log::cleanedLogPath(dir.string(), 0, 7)));
+    EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
+    for (int64_t o = 0; o < 4; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
+    const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), 0);
+    ASSERT_NE(si, nullptr);
+    EXPECT_EQ(si->endOffset, 4);
+    EXPECT_GE(si->largestTimestamp, 9'000'003);
+    std::filesystem::remove_all(dir);
+}
+
+// A rejected group (stale lineage / active member / above the bound) deletes
+// ONLY the cleaned output — every original segment file and record survives.
+TEST(LogRegression, RejectedCleanedGroupLeavesOriginalsUntouchedRegression) {
+    auto dir = makeTempDir("rune_log_deferred_reject");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    const auto snap = log.sealedSegmentSnapshot();
+    const auto before0 = readAll(segFile(dir, 0, ".log"));
+    const auto before2 = readAll(segFile(dir, 2, ".log"));
+    // (a) above the drain bound (HW/LSO).
+    writeBytes(Log::cleanedLogPath(dir.string(), 0, 1), {1, 2, 3});
+    const Log::CleanedMember m02[] = {{0, (*snap)[0].lineage}, {2, (*snap)[1].lineage}};
+    ASSERT_TRUE(log.enqueueCleanedGroup(m02, 2, 1, true));
+    log.drainCleanerSwaps(/*maxBaseBound=*/2);
+    // (b) stale lineage.
+    writeBytes(Log::cleanedLogPath(dir.string(), 0, 2), {1, 2, 3});
+    const Log::CleanedMember stale[] = {{0, (*snap)[0].lineage + 1000}};
+    ASSERT_TRUE(log.enqueueCleanedGroup(stale, 1, 2, true));
+    log.drainCleanerSwaps();
+    // (c) the active segment.
+    writeBytes(Log::cleanedLogPath(dir.string(), 6, 3), {1, 2, 3});
+    const Log::CleanedMember act[] = {{6, Log::kAnyLineage}};
+    ASSERT_TRUE(log.enqueueCleanedGroup(act, 1, 3, true));
+    log.drainCleanerSwaps();
+    EXPECT_EQ(log.cleanerGroupsRejected(), 3u);
+    EXPECT_EQ(log.takeCleanerRejectLowWater(), 0);
+    EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 4, 6}));
+    EXPECT_EQ(readAll(segFile(dir, 0, ".log")), before0);
+    EXPECT_EQ(readAll(segFile(dir, 2, ".log")), before2);
+    for (uint64_t seq : {1u, 2u}) EXPECT_FALSE(std::filesystem::exists(Log::cleanedLogPath(dir.string(), 0, seq)));
+    EXPECT_FALSE(std::filesystem::exists(Log::cleanedLogPath(dir.string(), 6, 3)));
+    for (int64_t o = 0; o < 7; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
+    std::filesystem::remove_all(dir);
+}
+
+// Crash safety: an uncommitted .cleaned output is deleted at construction and
+// the originals are used; a committed .swap is completed (members in its range
+// deleted, the front replaced).
+TEST(LogRegression, CrashRecoveryDeletesCleanedAndCompletesSwapRegression) {
+    auto dir = makeTempDir("rune_log_swap_recover");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        for (int64_t i = 0; i < 9; ++i) appendTs(log, i, 1000 + i);   // segments 0,2,4,6 + active 8
+    }
+    const auto orig0 = readAll(segFile(dir, 0, ".log"));
+    // Crash 1: an uncommitted output for segment 0 (garbage — must never be used).
+    writeBytes(Log::cleanedLogPath(dir.string(), 0, 42), {9, 9, 9});
+    // Crash 2: a committed swap of [4, 8) = segments 4 and 6 merged; the crash
+    // hit after member 6 was already unlinked (any prefix must complete).
+    writeBytes(Log::swapLogPath(dir.string(), 4, 8), concatSegs(dir, {4, 6}));
+    std::filesystem::remove(segFile(dir, 6, ".log"));
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 4, 8}));
+        EXPECT_EQ(readAll(segFile(dir, 0, ".log")), orig0) << "uncommitted output must not replace the original";
+        for (int64_t o = 0; o < 9; ++o) EXPECT_EQ(firstOffsetAt(log, o), o) << "offset " << o;
+        EXPECT_EQ(log.logEndOffset(), 9);
+    }
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        EXPECT_EQ(name.find(".cleaned"), std::string::npos) << name;
+        EXPECT_EQ(name.find(".swap"), std::string::npos) << name;
+    }
+    std::filesystem::remove_all(dir);
+}

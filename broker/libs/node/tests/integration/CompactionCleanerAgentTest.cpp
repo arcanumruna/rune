@@ -3094,3 +3094,80 @@ TEST(CompactionCleanerAgentRegression, NeverCompactsAboveRecoveryPoint) {
         << "positive control: the segment below R compacts";
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// 2026-10-05 log-truncate review, fix round 2: the cleaner thread replaced the
+// segment files ITSELF before the owner thread validated the swap.  An
+// (unclean-election) truncate below the HW between the cleaner pass and the
+// drain then rebuilt the segment FROM THE COMPACTED FILE: a record whose only
+// superseding copy was truncated away (A=v1 superseded by A=v2@4, truncated) was
+// gone — data loss, also across restart.  Now the cleaner only writes a
+// .cleaned output; the owner validates (lineage / not active / below HW) and
+// installs it or deletes it — the original segment is never touched.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, StaleSwapAfterTruncateBelowHwLeavesOriginalDataReadableRegression) {
+    auto dir = cp6TempDir("fr2_stale_swap");
+    auto firstRecord = [](Log& l, int64_t off, std::string& key, std::string& val) {
+        const auto bytes = l.read(off, 1 << 20);
+        if (bytes.empty()) return int64_t{-1};
+        RecordBatchReader r(bytes.data(), bytes.size());
+        int64_t got = -1;
+        r.forEach([&](std::string_view k, std::string_view v, int64_t o, int64_t) {
+            if (got < 0) { got = o; key = std::string(k); val = std::string(v); }
+        });
+        return got;
+    };
+    {
+        Log log(dir.string(), /*rollBytes=*/100);   // two one-record batches per segment
+        log.append(cp6Batch(0, "A", "v1"), 0);
+        log.append(cp6Batch(1, "B", "b"), 1);
+        log.append(cp6Batch(2, "C", "c"), 2);
+        log.append(cp6Batch(3, "D", "d"), 3);
+        log.append(cp6Batch(4, "A", "v2"), 4);    // supersedes A=v1
+        log.append(cp6Batch(5, "E", "e"), 5);
+        log.append(cp6Batch(6, "F", "f"), 6);     // active segment 6
+        ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 4, 6}));
+        Cp6NullTransport transport;
+        auto owned = std::make_unique<PartitionReplica>(
+            makeCompactConfig(780), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1},
+            &log, &transport);
+        owned->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+        owned->becomeLeader(1, {1});
+        owned->onLeaderLogAppended();
+        PartitionReplica* replica = owned.get();
+        rune::node::ReplicaRegistry registry;
+        registry.add(780, 0, std::move(owned));
+        Cp6MinimalConsensusAgent dummy;
+        rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+        rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0);
+        duty.doWork(1'000'000);                      // publish the cleaner-visible HW
+        ASSERT_GE(replica->cleanerHighWatermark(), 6);
+        ASSERT_GT(cleaner.doWork(2'000'000), 0) << "precondition: the pass compacted (A=v1 superseded)";
+
+        // Unclean election: the log is truncated BELOW the old HW before the
+        // owner drains the swap — segment 0 is rebuilt as the active segment.
+        log.truncateTo(2);
+        log.drainCleanerSwaps();
+
+        std::string k, v;
+        ASSERT_EQ(firstRecord(log, 0, k, v), 0) << "offset 0 lost";
+        EXPECT_EQ(k, "A");
+        EXPECT_EQ(v, "v1");
+        EXPECT_EQ(log.logEndOffset(), 2);
+    }
+    for (auto& e : fs::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        EXPECT_EQ(name.find(".cleaned"), std::string::npos) << "stray cleaner output " << name;
+        EXPECT_EQ(name.find(".swap"), std::string::npos) << "stray swap file " << name;
+    }
+    {   // ...and across restart.
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        std::string k, v;
+        ASSERT_EQ(firstRecord(log, 0, k, v), 0) << "offset 0 lost after restart";
+        EXPECT_EQ(k, "A");
+        EXPECT_EQ(v, "v1");
+        EXPECT_EQ(log.logEndOffset(), 2);
+    }
+    fs::remove_all(dir);
+}

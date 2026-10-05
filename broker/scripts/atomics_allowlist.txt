@@ -80,7 +80,7 @@ libs/storage/src/Log.cpp | auto prevSnap = std::atomic_load(&sealedSnapshot_); |
 libs/storage/src/Log.cpp | std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(std::move(snap))); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/src/Log.cpp | const std::size_t tail = swapTail_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/src/Log.cpp | const std::size_t head = swapHead_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
-libs/storage/src/Log.cpp | swapTail_.store(tail + 1, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/src/Log.cpp | swapTail_.store(tail + n, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/src/Log.cpp | const std::size_t head = swapHead_.load(std::memory_order_relaxed); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/src/Log.cpp | const std::size_t tail = swapTail_.load(std::memory_order_acquire); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/src/Log.cpp | swapHead_.store(tail, std::memory_order_release); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)

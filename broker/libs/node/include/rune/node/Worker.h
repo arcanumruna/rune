@@ -1437,7 +1437,7 @@ public:
         // Step 6.5: drain cleaner/retention/staging queues (disk-backed only).
         for (auto* replica : owned_) {
             if (replica && replica->isDiskBacked()) {
-                if (!cleanerSwapsDeferred_(replica)) work += replica->log()->drainCleanerSwaps();   // D3b
+                if (!cleanerSwapsDeferred_(replica)) work += replica->drainCleanerSwapsOnOwner();   // D3b
                 work += replica->log()->drainRetentionDeletes();
                 work += replica->log()->drainStagingRenamesDone();
                 // fsyncgate: any inline sync failure on this log → fail-stop.
@@ -1509,7 +1509,7 @@ private:
         // Cold tail: consumer egress push, cleaner drains, time-gated log sync.
         work += pushOwnedSubscriptions_(nowNs);
         for (auto& slot : slots_) {
-            if (!cleanerSwapsDeferred_(slot.replica)) work += slot.log->drainCleanerSwaps();   // D3b
+            if (!cleanerSwapsDeferred_(slot.replica)) work += slot.replica->drainCleanerSwapsOnOwner();   // D3b
             work += slot.log->drainRetentionDeletes();
             work += slot.log->drainStagingRenamesDone();
             checkStorageFailure_(slot.log);

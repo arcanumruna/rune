@@ -617,7 +617,7 @@ private:
             for (auto* replica : registry_->allReplicas()) {
                 // Only internal replicas — user replicas are drained by workers.
                 if (replica && replica->topicId() < 0 && replica->isDiskBacked()) {
-                    work += replica->log()->drainCleanerSwaps();
+                    work += replica->drainCleanerSwapsOnOwner();
                     work += replica->log()->drainRetentionDeletes();
                     work += replica->log()->drainStagingRenamesDone();
                 }
@@ -628,7 +628,7 @@ private:
                 // drainCleanerSwaps/drainRetentionDeletes/drainStagingRenamesDone are
                 // disk-Log-only operations; replica->log() asserts isDiskBacked().
                 if (replica && replica->isDiskBacked()) {
-                    work += replica->log()->drainCleanerSwaps();
+                    work += replica->drainCleanerSwapsOnOwner();
                     work += replica->log()->drainRetentionDeletes();
                     // Append-p99 fix: apply completed staging→base renames the
                     // background (cleaner) thread performed, so logPath_ tracks the

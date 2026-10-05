@@ -31,10 +31,25 @@ struct CleanPassResult {
 /// lists ONLY the segments whose on-disk .log actually changed this pass (dropped
 /// records or deleted) — the caller enqueues a swap for exactly these; unchanged
 /// prefix segments are left untouched and are NOT enqueued.
+/// Fix round 2 (deferred install): one compaction output the OWNER thread must
+/// validate and install.  `bases` = the replaced segments (ascending; a merged
+/// group or a single rewrite).  hasOutput: the fsynced output is at
+/// Log::cleanedLogPath(dir, bases.front(), seq); false = every record was
+/// removed (the members are simply dropped).  The originals are untouched.
+struct CleanedGroup {
+    std::vector<int64_t> bases;
+    uint64_t             seq       = 0;
+    bool                 hasOutput = false;
+};
+
 struct RangeCleanResult {
     bool                 compacted = false;
     Offset               passEnd   = -1;
     std::vector<int64_t> rewrittenBases;
+    /// Deferred-install mode only (setDeferredInstall): the outputs to hand to
+    /// the owner thread (Log::enqueueCleanedGroup).  rewrittenBases still lists
+    /// every member base.
+    std::vector<CleanedGroup> groups;
 };
 
 /// Kafka-style log compaction for a single Log.
@@ -323,6 +338,17 @@ public:
                                                Throttler* throttler = nullptr,
                                                int64_t nowMs = -1);
 
+    /// Fix round 2 (Kafka-style swap on the owner thread): in deferred mode
+    /// produceCleanedRangeBounded NEVER renames, replaces or deletes a segment
+    /// file — each output is written (fsynced) to a unique
+    /// Log::cleanedLogPath(dir, base, seq) and reported in
+    /// RangeCleanResult::groups; the owner thread validates and installs it
+    /// (Log::drainCleanerSwaps).  `nextSeq` is the caller's cleaner-owned
+    /// monotonic counter (unique output names across passes).
+    void setDeferredInstall(uint64_t* nextSeq) noexcept { deferredSeq_ = nextSeq; }
+    /// Max members per deferred group (bounds the owner's ring claim).
+    static constexpr std::size_t kMaxDeferredGroupMembers = 256;
+
 private:
     /// Is a record a tombstone?
     /// Treats empty value (vlen == 0) as a delete marker, matching Kafka behaviour.
@@ -387,6 +413,12 @@ private:
     int64_t prefixBytesRead_        = 0;
     Offset  markerRemovalBound_     = 0;
     int64_t rewriteSegmentsRead_    = 0;
+    uint64_t* deferredSeq_          = nullptr;   ///< non-null = deferred-install mode
+    std::vector<CleanedGroup>* deferredOut_ = nullptr;   ///< set for one pass
+    /// Deferred mode: write `out` durably to a fresh cleaned path for `bases`
+    /// (or record an all-removed group) — never touches the originals.
+    void deferInstall_(const std::string& dir, const std::vector<int64_t>& bases,
+                       const std::vector<uint8_t>& out);
 };
 
 } // namespace rune::storage

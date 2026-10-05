@@ -51,6 +51,7 @@
 #include <string>
 
 #include <rune/replication/Types.h>
+#include <algorithm>
 #include <rune/replication/FollowerSlots.h>
 #include <rune/replication/FollowerSync.h>
 #include <rune/replication/HighWatermark.h>
@@ -752,6 +753,24 @@ public:
     }
     [[nodiscard]] Offset cleanerLastStableOffset() const noexcept {
         return publishedLsoForCleaner_.load(std::memory_order_acquire);
+    }
+    /// Fix round 2: the owner thread installs a deferred compaction output only
+    /// when every member base is below min(HW, LSO) — the cleaner selected them
+    /// strictly below both.  Owner thread (reads the live HW).
+    [[nodiscard]] Offset cleanerSwapBound() const noexcept {
+        return std::min<Offset>(highWatermark(), cleanerLastStableOffset());
+    }
+    /// Fix round 2: drain the cleaner's swap ring on the OWNER thread (validate +
+    /// install deferred compaction outputs), then rewind the clean watermark to
+    /// the lowest rejected range — the cleaner advanced it BEFORE enqueueing
+    /// (so this owner store is always later in lastCleanOffset_'s modification
+    /// order), and a rejected range must be recompacted.  Disk-backed only.
+    int drainCleanerSwapsOnOwner() {
+        rune::storage::Log* l = log();
+        const int work = l->drainCleanerSwaps(cleanerSwapBound());
+        const int64_t low = l->takeCleanerRejectLowWater();
+        if (low < lastCleanOffset()) setLastCleanOffset(low);
+        return work;
     }
     // Task #13: gatewayIsrSize() — acquire-load of the published ISR size snapshot.
     // The owning worker publishes (in publishCleanerState()) the current ISR size

@@ -731,10 +731,14 @@ bool LogCleaner::rewriteSegmentImpl(
     // rewritten) only discovers segments with on-disk .log files, so a deleted
     // segment is simply absent — Log remains consistent and LEO is unaffected.
     if (outBuf.empty()) {
+        if (changed) *changed = true; // segment removed — content changed
+        if (deferredOut_ != nullptr) {   // fix round 2: the owner thread drops it
+            deferInstall_(dir, {segBase}, outBuf);
+            return true;
+        }
         std::filesystem::remove(logPath);
         std::filesystem::remove(idxPath);
         fsyncDir(dir);
-        if (changed) *changed = true; // segment removed — content changed
         return true;
     }
 
@@ -748,6 +752,12 @@ bool LogCleaner::rewriteSegmentImpl(
         return true; // file present + valid, unchanged
     }
     if (changed) *changed = true;
+    if (deferredOut_ != nullptr) {
+        // Fix round 2: never replace the original here — the owner thread
+        // validates and installs the output (Log::drainCleanerSwaps).
+        deferInstall_(dir, {segBase}, outBuf);
+        return true;
+    }
 
     // Durable atomic swap: write → fsync file → rename → fsync dir.
     //
@@ -1056,6 +1066,12 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     RangeCleanResult result;
     rewriteSegmentsRead_ = 0;
     result.passEnd = activeBase;   // default: nothing dirty → advance to activeBase
+    // Fix round 2: deferred-install mode collects outputs into result.groups.
+    struct DeferredScope {
+        std::vector<CleanedGroup>*& slot;
+        ~DeferredScope() { slot = nullptr; }
+    } deferredScope{deferredOut_};
+    deferredOut_ = deferredSeq_ != nullptr ? &result.groups : nullptr;
 
     if (sealedBases.empty()) return result;
     if (globalDirtyStart < 0) globalDirtyStart = 0;
@@ -1120,6 +1136,20 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
         const int64_t roll = (groupRollBytes > 0) ? groupRollBytes
                                                    : (64LL * 1024 * 1024);
         auto groups = groupSegmentsBySize(inPassBases, inPassSizes, roll);
+        if (deferredOut_ != nullptr) {
+            // Bound each group so the owner's ring claim always fits.
+            std::vector<SegmentGroup> split;
+            for (auto& g : groups) {
+                for (std::size_t i = 0; i < g.bases.size(); i += kMaxDeferredGroupMembers) {
+                    SegmentGroup part;
+                    const std::size_t e = std::min(g.bases.size(), i + kMaxDeferredGroupMembers);
+                    part.bases.assign(g.bases.begin() + static_cast<std::ptrdiff_t>(i),
+                                      g.bases.begin() + static_cast<std::ptrdiff_t>(e));
+                    split.push_back(std::move(part));
+                }
+            }
+            groups.swap(split);
+        }
         for (const auto& g : groups) {
             if (g.bases.empty()) continue;
             bool changed = false;
@@ -1150,7 +1180,9 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
         // disk and NOT enqueued — no churn (one exists() stat covers both branches).
         std::error_code ec;
         const bool present = std::filesystem::exists(segmentLogPath(dir, b), ec);
-        if (changed || !present) {
+        // Deferred mode never removes a file here, so an absent .log is the
+        // owner's own (already applied) work — only real changes are reported.
+        if (changed || (!present && deferredOut_ == nullptr)) {
             result.rewrittenBases.push_back(b);
             result.compacted = true;
         }
@@ -1165,6 +1197,20 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     }
 
     return result;
+}
+
+// Fix round 2: deferred-install output (cleaner thread).  Writes `out` durably
+// (fsynced data, never renamed over anything) to a unique cleaned path; the
+// owner thread validates + installs it or deletes it.  An empty `out` = every
+// member's records were removed: no file, the owner drops the members.
+void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t>& bases,
+                               const std::vector<uint8_t>& out) {
+    CleanedGroup g;
+    g.bases = bases;
+    g.seq = static_cast<uint32_t>(++*deferredSeq_);
+    g.hasOutput = !out.empty();
+    if (g.hasOutput) writeFileDurable(Log::cleanedLogPath(dir, bases.front(), g.seq), out);
+    deferredOut_->push_back(std::move(g));
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,6 +1479,13 @@ void LogCleaner::mergeGroupWithMap(
     // (re-framing alone is not a logical change) — no rewrite, no enqueue.
     if (!modified) return;
     if (changed) *changed = true;
+    if (deferredOut_ != nullptr) {
+        // Fix round 2: hand the merged output (or the all-removed group) to the
+        // owner thread; the member files stay untouched until it validates.
+        deferInstall_(dir, groupInPass, outBuf);
+        if (throttler && !outBuf.empty()) throttler->maybeThrottle(static_cast<int64_t>(outBuf.size()));
+        return;
+    }
 
     if (outBuf.empty()) {
         // All records removed — delete every member segment.
