@@ -839,12 +839,13 @@ void BrokerNode::buildReplication() {
                     auto t = std::make_unique<WorkerReplicationTransport>(
                         aeron_, w, inboundChannel, streamId, replPeers, streamId);
                     if (!t->resolved()) {
-                        // Hard-refuse: partial plane = silent message loss for the
-                        // partitions assigned to worker w.
+                        // Hard-refuse a LOCAL failure only (inbound bind / peer
+                        // config).  DR-15: unresolved PEER pubs stay Resolving and
+                        // are re-added on the worker's passes (never fatal).
                         throw std::runtime_error(
                             "BrokerNode[" + std::to_string(config_.nodeId) +
                             "]: per-worker replication transport for worker " +
-                            std::to_string(w) + " did not resolve (Aeron registration error or driver timeout) "
+                            std::to_string(w) + " inbound did not resolve (local registration error or driver timeout) "
                             "(stream=" + std::to_string(streamId) + ") — "
                             "refusing to start with a half-wired plane");
                     }
@@ -3328,9 +3329,20 @@ void BrokerNode::attachShardRuntimes_() {
                 peerIds.push_back(static_cast<rune::replication::NodeId>(peer.id));
             }
             auto& plane = *perWorkerReplTransports_[idx];
+            // DR-15 (2026-10-05): only a LOCAL failure (own inbound bind, bad peer
+            // config) refuses to start.  A peer whose publication does not
+            // resolve (its hostname is unresolvable while it restarts — k8s pod,
+            // DNS lag) stays Resolving and the worker re-adds it on its duty
+            // passes until it resolves; it then joins like a late peer.
             if (!plane.attach(shardClients_[idx], peersW, config_.replBaseStreamId + w, pump))
                 throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
-                                         std::to_string(w) + " replication plane did not resolve — refusing to start");
+                                         std::to_string(w) + " replication plane inbound " +
+                                         config_.shardReplBindChannel(w) +
+                                         " did not resolve (local bind / peer config) — refusing to start");
+            if (!plane.allPeersResolved())
+                spdlog::warn("BrokerNode[{}]: shard {} replication plane: {} peer publication(s) unresolved at "
+                             "startup — serving without them; re-added until they resolve",
+                             config_.nodeId, w, plane.resolvingPeerCount());
             // Runtime worker-count symmetry (Task 6 ruling I2): peers' RUNE_WORKERS
             // are unknown at parse time, so each plane verifies them in-band.
             // F3 round 6, item 6: the max-batch constraint is cluster-wide —

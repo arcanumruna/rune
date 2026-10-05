@@ -94,7 +94,10 @@ public:
         // fix: a temporarily-unresolvable peer must not abort node startup.
         // Default pump: 1 ms sleep between probes (legacy); invoker pump: drive
         // this shard's own driver + conductor between probes (spec §3.6).
-        (void)pump.resolve([&] { return resolvePending() == 0; }, std::chrono::seconds{5});
+        // 2026-10-05 (DR-15 audit): stop as soon as Aeron has ANSWERED every
+        // registration (resolved or errored) — an unresolvable peer no longer
+        // holds node startup for the whole 5 s budget.
+        (void)pump.resolve([&] { (void)resolvePending(); return inFlight_() == 0; }, std::chrono::seconds{5});
         // Partial (or zero) resolution is OK — resolvePending() runs on every
         // send() until the remaining peers come up.
     }
@@ -155,6 +158,8 @@ private:
         int32_t     streamId       = 0;
         int64_t     registrationId = -1;
         bool        registered     = false;    // addExclusivePublication issued
+        uint32_t    attempts       = 0;        // errored registrations so far
+        uint64_t    retryPass      = 0;        // re-add due at this resolvePending pass
         std::shared_ptr<aeron::ExclusivePublication> pub; // null until resolved
     };
 
@@ -168,6 +173,9 @@ private:
             // bad host, but guard anyway so construction can never abort.  The
             // slot stays unregistered and is retried by resolvePending().
             slot.registered = false;
+            ++slot.attempts;
+            const uint32_t shift = slot.attempts < 10 ? slot.attempts : 10;
+            slot.retryPass = pass_ + (uint64_t{1} << shift);
         }
     }
 
@@ -177,15 +185,19 @@ private:
     // a later probe — this is what allows a peer that comes up later to reconnect.
     // NEVER throws.  Returns the number of peers still unresolved.
     int resolvePending() noexcept {
+        if (unresolved_ == 0) [[likely]] return 0;
+        ++pass_;
         int unresolved = 0;
         for (auto& [nodeId, slot] : peers_) {
             if (slot.pub) continue;            // already resolved
             ++unresolved;
 
             if (!slot.registered) {
-                // Registration previously failed/errored — try to re-register so
-                // a peer that has since come up can be resolved.
-                registerPeer(slot);
+                // Registration previously failed/errored — re-register once its
+                // pass-count backoff has come (2, 4, ... 1024 passes; DR-15
+                // audit: each re-add is a DNS lookup on the driver conductor, so
+                // an unresolvable peer must not be re-added on every send).
+                if (pass_ >= slot.retryPass) registerPeer(slot);
                 continue;                      // give the driver a tick to work
             }
 
@@ -204,11 +216,24 @@ private:
                 slot.pub.reset();
                 slot.registered     = false;
                 slot.registrationId = -1;
-                registerPeer(slot);
+                ++slot.attempts;
+                const uint32_t shift = slot.attempts < 10 ? slot.attempts : 10;
+                slot.retryPass = pass_ + (uint64_t{1} << shift);
             }
         }
+        unresolved_ = unresolved;
         return unresolved;
     }
+
+    /// Peers with a registration in flight (not yet answered by Aeron).
+    [[nodiscard]] int inFlight_() const noexcept {
+        int n = 0;
+        for (const auto& [nodeId, slot] : peers_) n += (!slot.pub && slot.registered) ? 1 : 0;
+        return n;
+    }
+
+    uint64_t pass_       = 0;
+    int      unresolved_ = 1;   // > 0 until a resolvePending pass finds every peer resolved
 
     std::shared_ptr<aeron::Aeron> aeron_;
     std::unordered_map<rune::consensus::NodeId, PeerSlot> peers_;

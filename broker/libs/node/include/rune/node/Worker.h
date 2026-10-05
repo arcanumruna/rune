@@ -3344,7 +3344,11 @@ private:
         // Shard plane handshake (spec §3.3): one predicted branch unless a peer
         // is unverified / refused (then a hello on the retry cadence).
         const int hs = t.driveHandshake(nowNs);
-        return hs + t.poll(kReplFetchLimit,
+        // DR-15 (2026-10-05): a peer whose publication did not resolve at
+        // startup (hostname unresolvable while it restarts) is re-added here on
+        // a pass-count backoff — one predicted branch once every peer resolved.
+        const int rs = t.drivePeerResolve();
+        return hs + rs + t.poll(kReplFetchLimit,
                            [this, nowNs](int32_t topicId, int32_t partition, uint16_t templateId,
                                          const uint8_t* frame, std::size_t len) {
                                pollReplTransportDispatch_(topicId, partition, templateId, frame, len, nowNs);

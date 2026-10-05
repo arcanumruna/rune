@@ -808,7 +808,8 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_embedded_driver_tests
                 PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
-            add_executable(rune_aeron_pump_tests tests/node/AeronPumpInvokerTest.cpp)
+            add_executable(rune_aeron_pump_tests tests/node/AeronPumpInvokerTest.cpp
+                tests/node/UnresolvedPeerRegressionTest.cpp)
             target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 

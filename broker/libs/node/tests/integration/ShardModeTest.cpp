@@ -1868,3 +1868,56 @@ TEST(ShardModeRegression, BrokerSurvivesAProcessFreezePastAeronLivenessDefault) 
     if (alive) { ::kill(child, SIGKILL); ::waitpid(child, &status, 0); }
     ::close(beat[0]);
 }
+
+// ===========================================================================
+// DR-15 (2026-10-05): two brokers restarted at once both EXITED — each node's
+// shard replication plane registers a publication to every peer at startup; the
+// co-restarting peer had no DNS record yet ("Unresolved - endpoint=rune-2:41256"),
+// the plane attach failed and BrokerNode threw "shard 0 replication plane did not
+// resolve — refusing to start".  A node MUST start and serve with any peer
+// unresolvable (RFC 6761 ".invalid" never resolves).  RED on bc153c3: start() threw.
+// ===========================================================================
+TEST(UnresolvedPeerStartupRegression, NodesStartAndServeWhileAPeerHostnameIsUnresolvableRegression) {
+    TmpDir d0{"unres0"}, d1{"unres1"}, cdir{"unresc"};
+    const auto ports = ShardPorts::discover(3, 1);
+    auto cfgFor = [&](int32_t id, const fs::path& dir) {
+        auto c = asymConfig(id, dir, ports, 3, /*workers=*/1);
+        c.replicaLagMaxMs = 500;                              // the absent peer leaves the ISR fast
+        for (auto& p : c.peers)
+            if (p.id == 2) p.host = "rune-unresolvable.invalid";   // node 2's pod is restarting: no DNS yet
+        return c;
+    };
+    BrokerNode n0{cfgFor(0, d0.path)}, n1{cfgFor(1, d1.path)};
+    ASSERT_NO_THROW(n0.start()) << "a node must start while a peer hostname is unresolvable";
+    ASSERT_NO_THROW(n1.start()) << "a node must start while a peer hostname is unresolvable";
+    ASSERT_TRUE(n0.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms)) << "no consensus with the resolvable peer";
+    // The shard planes of the two live nodes verify each other; node 2 stays
+    // unverified (its publication is still Resolving, re-added on each node's passes).
+    ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 1) == PS::Verified; }));
+    ASSERT_TRUE(eventually([&] { return peerState(n1, 0, 0) == PS::Verified; }));
+    EXPECT_EQ(peerState(n0, 0, 2), PS::Unverified);
+    EXPECT_FALSE(onPlane(n0, 0, [](WorkerReplicationTransport& t) { return t.allPeersResolved(); }));
+    // ... and the cluster serves: an acks=all produce commits on the two live nodes.
+    int32_t part = -1;
+    for (int32_t p = 0; p < kAsymPartitions && part < 0; ++p)
+        if (staticLeader(p, 3) != 2) part = p;
+    ASSERT_GE(part, 0);
+    {
+        ShardTestClient c(cdir.path);
+        const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid0, 0);
+        int32_t leader = -1;
+        ASSERT_TRUE(eventually([&] {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                if (pi.topicId == 0 && pi.partition == part && (pi.leaderId == 0 || pi.leaderId == 1))
+                    leader = pi.leaderId;
+            return leader >= 0;
+        }, 400)) << "no live partition leader advertised";
+        const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+        ASSERT_GT(sid, 0);
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, part,
+                                    /*acks=all*/1, makeBatch(4), /*maxAttempts=*/2000);
+        ASSERT_TRUE(ack.has_value()) << "acks=all never committed with an unresolvable third peer";
+    }
+    n1.stop(); n0.stop();
+}

@@ -77,15 +77,10 @@ void AeronPartitionTransport::addPeer(NodeId             peerId,
     }
 
     PeerPub p;
-    p.peerId = peerId;
-    try {
-        p.registrationId = aeron_->addExclusivePublication(egressChannel, egressStreamId);
-        p.registered     = true;
-    } catch (const std::exception& ex) {
-        spdlog::warn("AeronPartitionTransport: addExclusivePublication failed for "
-                     "peerId={}: {}", peerId, ex.what());
-        // Leave registered=false; peer will be silently dropped on send.
-    }
+    p.peerId   = peerId;
+    p.channel  = egressChannel;
+    p.streamId = egressStreamId;
+    registerPub_(p);   // an error schedules a backed-off re-add (DR-15), never a permanent drop
     peers_.emplace(peerId, std::move(p));
     // F27 F1: the peer's held FIFO, sized to one full outbound ring (>= 8 max-size
     // frames), allocated once here (cold) and never reallocated.
@@ -1124,24 +1119,65 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
 // ---------------------------------------------------------------------------
 // resolvePendingPubs — non-blocking: one findExclusivePublication per unresolved peer.
 // ---------------------------------------------------------------------------
+void AeronPartitionTransport::schedulePubRetry_(PeerPub& p) noexcept
+{
+    p.registered     = false;   // the client conductor erased the errored registration: re-add, never re-find
+    p.registrationId = -1;
+    ++p.attempts;
+    const uint32_t shift = p.attempts < kMaxPubRetryBackoffShift ? p.attempts : kMaxPubRetryBackoffShift;
+    p.retryPass = resolvePass_ + (uint64_t{1} << shift);   // 2, 4, ... 1024 passes (never a timer)
+}
+
+void AeronPartitionTransport::registerPub_(PeerPub& p) noexcept
+{
+    if (p.attempts > 0) ++pubReAdds_;
+    try {
+        p.registrationId = aeron_->addExclusivePublication(p.channel, p.streamId);
+        p.registered     = true;
+    } catch (const std::exception& ex) {
+        if ((pubFailures_++ % 1024) == 0)
+            spdlog::warn("AeronPartitionTransport: addExclusivePublication failed for peerId={} ({}): {} — "
+                         "re-added with backoff", p.peerId, p.channel, ex.what());
+        schedulePubRetry_(p);
+    }
+}
+
+void AeronPartitionTransport::setPeerChannelForTest(NodeId peerId, std::string channel)
+{
+    auto it = peers_.find(peerId);
+    if (it != peers_.end() && !it->second.pub) it->second.channel = std::move(channel);
+}
+
 void AeronPartitionTransport::resolvePendingPubs()
 {
+    ++resolvePass_;
     for (auto& [nodeId, peer] : peers_) {
         if (peer.pub) continue;          // already resolved
-        if (!peer.registered) continue;  // registration failed at addPeer time
+        if (!peer.registered) {
+            // DR-15: errored earlier (peer hostname unresolvable while it
+            // restarts) — re-add once its backoff pass has come.
+            if (resolvePass_ >= peer.retryPass) registerPub_(peer);
+            continue;
+        }
 
         try {
             auto pub = aeron_->findExclusivePublication(peer.registrationId);
             if (pub) {
                 peer.pub = std::move(pub);
-                spdlog::debug("AeronPartitionTransport: pub resolved for peerId={}", peer.peerId);
+                if (peer.attempts > 0)
+                    spdlog::info("AeronPartitionTransport: peerId={} publication {} resolved after {} failed "
+                                 "attempt(s)", peer.peerId, peer.channel, peer.attempts);
+                else
+                    spdlog::debug("AeronPartitionTransport: pub resolved for peerId={}", peer.peerId);
             }
         } catch (const std::exception& ex) {
-            // Conductor signalled an error (bad channel, closed, etc.).
-            // Mark as unregistered so we don't keep probing a dead registration.
-            spdlog::warn("AeronPartitionTransport: findExclusivePublication threw for "
-                         "peerId={}: {}; dropping peer", peer.peerId, ex.what());
-            peer.registered = false;
+            // Conductor signalled an error (typically: the peer's hostname does
+            // not resolve yet).  NOT a permanent drop (DR-15): re-add with backoff.
+            if ((pubFailures_++ % 1024) == 0)
+                spdlog::warn("AeronPartitionTransport: peerId={} publication {} unresolved: {} — re-added "
+                             "with backoff ({} failure(s) so far)", peer.peerId, peer.channel, ex.what(),
+                             pubFailures_);
+            schedulePubRetry_(peer);
         }
     }
 }

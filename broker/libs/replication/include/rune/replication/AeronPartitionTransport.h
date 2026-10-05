@@ -388,6 +388,13 @@ public:
     /// Number of peers whose publication has not yet been resolved.
     [[nodiscard]] int unresolvedPeerCount() const noexcept;
 
+    /// Publication re-adds issued after a registration error (DR-15).
+    [[nodiscard]] uint64_t peerPubReAdds() const noexcept { return pubReAdds_; }
+
+    /// TEST SEAM: the channel an unresolved peer is re-added on from now on
+    /// (models its hostname becoming resolvable).  Control thread only.
+    void setPeerChannelForTest(NodeId peerId, std::string channel);
+
     /// Number of peers registered.
     [[nodiscard]] int peerCount() const noexcept {
         return static_cast<int>(peers_.size());
@@ -402,8 +409,22 @@ private:
         NodeId      peerId         = -1;
         int64_t     registrationId = -1;     ///< from addExclusivePublication
         std::shared_ptr<aeron::ExclusivePublication> pub; ///< null until resolved
-        bool        registered     = false;  ///< addExclusivePublication called
+        bool        registered     = false;  ///< a registration is in flight / live
+        // DR-15 (2026-10-05): an errored registration (peer hostname not
+        // resolvable while it restarts) is RE-ADDED on poll passes with a
+        // pass-count backoff (2, 4, ... 1024 passes) — never dropped for good.
+        std::string channel;                 ///< egress channel (re-add target)
+        int32_t     streamId       = 0;
+        uint32_t    attempts       = 0;      ///< failed registrations so far
+        uint64_t    retryPass      = 0;      ///< re-add due at this poll pass
     };
+    static constexpr uint32_t kMaxPubRetryBackoffShift = 10;
+    uint64_t resolvePass_   = 0;             ///< poll passes (control thread)
+    uint64_t pubFailures_   = 0;             ///< registration failures (rate-limited log)
+    uint64_t pubReAdds_     = 0;
+    /// Issue addExclusivePublication for `p` (errors schedule a backed-off re-add).
+    void registerPub_(PeerPub& p) noexcept;
+    void schedulePubRetry_(PeerPub& p) noexcept;
 
     // -----------------------------------------------------------------------
     // Internal helpers
