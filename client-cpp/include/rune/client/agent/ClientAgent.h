@@ -426,6 +426,16 @@ public:
         return index < sessions_.size() ? sessions_[index]->brokerVersion : 0;
     }
     /// Session `index`'s state (Disconnected when out of range).
+    /// DR-7: connect attempts of session `index` that ended without a session.
+    [[nodiscard]] uint64_t sessionConnectFailuresAt(uint32_t index) const noexcept {
+        return index < sessions_.size() ? sessions_[index]->machine.connectFailures() : 0;
+    }
+    /// DR-7: some partition route sends through session `index` (control path).
+    [[nodiscard]] bool routesUseSession(uint32_t index) const noexcept {
+        for (const PartitionRoute& r : routes_)
+            if (r.sessionIndex == index) return true;
+        return false;
+    }
     [[nodiscard]] session::SessionState sessionStateAt(uint32_t index) const noexcept {
         return index < sessions_.size() ? sessions_[index]->machine.state() : session::SessionState::Disconnected;
     }

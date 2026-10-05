@@ -182,6 +182,9 @@ public:
     [[nodiscard]] bool    everLive()       const noexcept { return everLive_; }
     /// Backoff state: consecutive Backoff entries since the last Live (0 when Live).
     [[nodiscard]] int     backoffAttempt() const noexcept { return backoff_.attempt; }
+    /// DR-7: connect attempts that ended without a session (timed out / refused);
+    /// monotonic — each increment is an event (the owner asks for fresh metadata).
+    [[nodiscard]] uint64_t connectFailures() const noexcept { return connectFailures_; }
     /// Backoff state: injected-clock time of the next attempt.
     [[nodiscard]] int64_t nextAttemptNs()  const noexcept { return backoff_.nextAttemptNs; }
     /// Rejected state: the non-retriable error code (0 otherwise).
@@ -575,6 +578,7 @@ private:
         }
 
         // Connect timed out.
+        ++connectFailures_;  // DR-7: an event the owner reacts to (metadata refresh)
         if (connectRetryCount_ >= cfg_.maxConnectRetries) {
             onRetryBudgetExhausted_(nowNs);
             return;
@@ -626,6 +630,7 @@ private:
     /// OK nor a redirect.
     void onConnectError_(rune::protocol::client::ErrorCode ec, int64_t nowNs) noexcept {
         namespace rpc = rune::protocol::client;
+        ++connectFailures_;
         if (!cfg_.reconnectForeverAfterLive) {
             transitionTo(SessionState::Disconnected);  // today's behaviour, unchanged
             return;
@@ -747,6 +752,7 @@ private:
     int64_t lastTickNs_          = 0;   ///< A10: own-stall detection (gap between ticks)
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
     // DR-BUG-2: fast-retry state for the connect path.
+    uint64_t connectFailures_ = 0;   // DR-7: see connectFailures()
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
     bool    connectSentOk_       = false; // true if the last offer() succeeded
 

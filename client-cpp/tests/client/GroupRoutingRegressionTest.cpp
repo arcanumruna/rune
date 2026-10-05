@@ -1049,3 +1049,46 @@ TEST(GroupRoutingRegression, OldLeaderNodeNeverPollsMetadataAndResumesAfterUpgra
     r.gw.pushRecords(*r.subAt(1, n1), 0, 2);
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 2; }));
 }
+
+// DR-7 (dockerized test_dr7_leader_crash_restart_rejoins_follower[1], 2026-10-05):
+// the client fetched metadata just before the broker failed the partition over, so
+// its route named the KILLED leader.  That node's session never connects — nothing
+// reaches any broker (no NotLeader / Redirect) and nothing asked for metadata again:
+// every batch of the partition failed DeliveryFailed after the delivery timeout
+// while the cluster had long elected a new leader.  A failed connect attempt of a
+// session a partition routes to asks for metadata (Kafka: a failed connection
+// requests a metadata update); the answer re-routes the held batch.
+TEST(GroupRoutingRegression, ProduceRoutedToADeadLeaderFollowsTheFailoverRegression) {
+    RigOptions o;
+    o.connectTimeoutMs = 300;
+    GroupRig r(4141, 4142, o);
+    const auto [n1, p1port] = r.addNode(4141);
+    r.gw.silentEndpoints.insert(n1);                // node 1 was killed: never answers
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 1, 1, 4141, ""}};    // b/0 led by node 1 (about to be stale)
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(2, 0).empty(); }));
+    rc::ProducerConfig pc;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 600'000;                 // the delivery timeout never decides this test
+    auto p = r.client.producer(pc);
+    // The cluster failed b/0 over to node 0 (epoch 2); nobody tells the client.
+    r.gw.partitions = {{2, 0, 0, 2, 4141, ""}};
+    const int md = r.gw.metadataRequests;
+    const std::vector<uint8_t> val{1};
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(p.trySend(r.client.topic("b"), rc::Key(uint64_t{1}), std::span<const uint8_t>(val), r.cq, t),
+              rc::SendResult::Ok);
+    rc::OpStatus st = rc::OpStatus::Closed;
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 4'000'000)) << "the batch stayed held on the dead leader's session (no metadata refresh)";
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_GT(r.gw.metadataRequests, md) << "a failed connect to the partition's leader asked for no metadata";
+    ASSERT_FALSE(r.gw.produced.empty());
+    EXPECT_EQ(r.gw.produced.back().endpoint, 0) << "the batch follows the failover to node 0";
+}

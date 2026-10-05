@@ -1532,6 +1532,8 @@ int Client::dutyCycle(int64_t nowNs) {
             work += watchGroupSessions_(nowNs);
         }
     }
+    // DR-7: a partition route's leader session that fails to connect asks for metadata.
+    work += watchProduceRoutes_();
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
     if (unsentCtl_ != 0) [[unlikely]] work += retryUnsentControl_();
@@ -3295,6 +3297,33 @@ detail::SendResult Client::fetchOfferTrampoline_(void* ctx, uint32_t session, co
     case R::Fatal:    break;
     }
     return detail::SendResult::Fatal;
+}
+
+// DR-7 (dockerized test_dr7_leader_crash_restart_rejoins_follower): metadata read
+// just before a failover routes a partition to the dead ex-leader.  Its session never
+// connects, so no NotLeader / Redirect ever arrives — the only event is the failed
+// connect attempt.  Each one of a session some partition routes to asks for fresh
+// metadata (Kafka: a failed connection requests a metadata update; rate-limited by
+// requestMetadataNow_); the answer re-routes the partition (and its held batches).
+int Client::watchProduceRoutes_() noexcept {
+    const auto n = static_cast<uint32_t>(agent_.sessionCount());
+    if (n > routeConnectFailuresSeen_.size()) [[unlikely]] {
+        try {
+            routeConnectFailuresSeen_.resize(n, 0);
+        } catch (...) {
+            return 0;  // allocation failure on this cold path: the next pass retries
+        }
+    }
+    bool ask = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint64_t f = agent_.sessionConnectFailuresAt(i);
+        if (f == routeConnectFailuresSeen_[i]) [[likely]] continue;
+        routeConnectFailuresSeen_[i] = f;
+        ask = ask || agent_.routesUseSession(i);
+    }
+    if (!ask) return 0;
+    requestMetadataNow_();
+    return 1;
 }
 
 int Client::watchGroupSessions_(int64_t nowNs) {
