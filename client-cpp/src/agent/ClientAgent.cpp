@@ -1115,7 +1115,10 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
             const int64_t sid = leader.machine.sessionId();
             // Leader session still connecting: hold the batch (retried next cycle;
             // produceResendFn_ re-drives it on connect).
-            if (sid == 0 || leader.machine.state() != session::SessionState::Connected) return false;
+            if (sid == 0 || leader.machine.state() != session::SessionState::Connected) {
+                ++heldOffers_;  // DR-7: the owner asks for metadata (the leader may have moved)
+                return false;
+            }
             if (r.streamId != ingressStreamId) {  // once per route / stream change
                 const int32_t stream = ingressStreamId != 0 ? ingressStreamId
                                                             : cfg_.transport.ingressStreamId;

@@ -426,6 +426,10 @@ public:
         return index < sessions_.size() ? sessions_[index]->brokerVersion : 0;
     }
     /// Session `index`'s state (Disconnected when out of range).
+    /// DR-7 (rerun): produce offers held because the partition's leader session is not
+    /// Connected — monotonic; each increment is an event (Kafka: a leader that is not
+    /// ready requests a metadata update, paced by the retry backoff).
+    [[nodiscard]] uint64_t heldOffers() const noexcept { return heldOffers_; }
     /// DR-7: connect attempts of session `index` that ended without a session.
     [[nodiscard]] uint64_t sessionConnectFailuresAt(uint32_t index) const noexcept {
         return index < sessions_.size() ? sessions_[index]->machine.connectFailures() : 0;
@@ -845,6 +849,7 @@ private:
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
     };
     detail::FlatIndexMap        routeIndex_;   // routeKey(t,p) -> routes_ index
+    uint64_t                    heldOffers_ = 0;  // DR-7: see heldOffers()
     std::vector<PartitionRoute> routes_;
     std::vector<uint32_t>       freeRoutes_;
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears

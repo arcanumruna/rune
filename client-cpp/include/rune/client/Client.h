@@ -916,6 +916,7 @@ private:
     int watchProduceRoutes_(int64_t nowNs) noexcept;
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
     std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
+    uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass
     uint64_t groupDiscMask_ = 0;  // ... terminally Disconnected last pass
     static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,

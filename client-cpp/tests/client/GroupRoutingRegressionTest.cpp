@@ -1179,3 +1179,39 @@ TEST(GroupRoutingRegression, BatchSentToALeaderThatDiesFollowsTheFailoverRegress
     EXPECT_GT(r.gw.metadataRequests, md);
     EXPECT_EQ(r.gw.produced.back().endpoint, 0);
 }
+
+// DR-7 (rerun, 2026-10-05): the DR client's connect timeout (40 s) is longer than
+// its delivery timeout (30 s), so a connect FAILURE never comes in time — the batch
+// held on the dead ex-leader's still-connecting session must itself ask for
+// metadata (Kafka: a leader that is not ready requests a metadata update, paced by
+// the retry backoff).  RED (9bcc6e6): no refresh before the delivery timeout.
+TEST(GroupRoutingRegression, BatchHeldOnAConnectingDeadLeaderAsksForMetadataRegression) {
+    RigOptions o;
+    o.connectTimeoutMs = 600'000;                   // no connect failure within this test
+    GroupRig r(4147, 4148, o);
+    const auto [n1, p1port] = r.addNode(4147);
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 1, 1, 4147, ""}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(2, 0).empty(); }));
+    rc::ProducerConfig pc;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 600'000;
+    auto p = r.client.producer(pc);
+    r.gw.partitions = {{2, 0, 0, 2, 4147, ""}};    // already failed over; the client is not told
+    const std::vector<uint8_t> val{1};
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(p.trySend(r.client.topic("b"), rc::Key(uint64_t{1}), std::span<const uint8_t>(val), r.cq, t),
+              rc::SendResult::Ok);
+    rc::OpStatus st = rc::OpStatus::Closed;
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 4'000'000)) << "the held batch never asked for metadata";
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_EQ(r.gw.produced.back().endpoint, 0);
+}

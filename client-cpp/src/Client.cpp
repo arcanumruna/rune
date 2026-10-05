@@ -3311,6 +3311,14 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
     // Review MEDIUM-2: a produce attempt timed out (Kafka: a request timeout
     // requests a metadata update) — the partition may have moved silently.
     bool ask = producerHub_.takeMetadataWanted();
+    // DR-7 (rerun): a batch held on a not-yet-Connected leader session — its connect
+    // timeout may exceed the delivery timeout, so a connect FAILURE can come too late.
+    // The backoff-paced refresh (reset by every answer — Kafka retry.backoff): never
+    // the urgent window a NotLeader / Redirect / failure uses.
+    if (const uint64_t h = agent_.heldOffers(); h != heldOffersSeen_) [[unlikely]] {
+        heldOffersSeen_ = h;
+        scheduleMetadataRefresh();
+    }
     const auto n = static_cast<uint32_t>(agent_.sessionCount());
     if (n > routeConnectFailuresSeen_.size()) [[unlikely]] {
         try {
