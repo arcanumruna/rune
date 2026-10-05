@@ -408,6 +408,7 @@ public:
     uint64_t alterIsrStale() const noexcept { return alterIsrStale_; }
     uint64_t fenceCommitted() const noexcept { return fenceCommitted_; }
     uint64_t alterIsrIneligible() const noexcept { return alterIsrIneligible_; }
+    uint64_t leaderEpochBumps() const noexcept { return leaderEpochBumps_; }
 
 
     // ---------------------------------------------------------------- driving
@@ -750,6 +751,18 @@ private:
             reply(kAlterIsrInvalidUpdateVersion);
             return;
         }
+        // Leader-epoch restart fence (MetadataService::bumpLeaderEpoch_): the
+        // committed leader refused its committed epoch (it led at it in an
+        // earlier incarnation) — the same assignment at a NEW epoch.
+        if (m.isrCount == AlterIsrMsg::kLeaderEpochBump) {
+            ++meta_.epoch;
+            ++meta_.partitionEpoch;
+            ++leaderEpochBumps_;
+            reply(kAlterIsrOk);
+            for (auto& n : nodes_)
+                if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
+            return;
+        }
         // KIP-841 (MEDIUM-2): never ADD a replica the controller considers dead.
         auto liveToController = [&](NodeId id) {
             return node(id).up && cut_.count({id, kControllerAddr}) == 0;
@@ -896,6 +909,7 @@ private:
     uint64_t                alterIsrStale_     = 0;
     uint64_t                fenceCommitted_    = 0;
     uint64_t                alterIsrIneligible_ = 0;
+    uint64_t                leaderEpochBumps_   = 0;
     uint64_t                step_  = 0;
     int64_t                 clock_ = 0;
     uint64_t                nextId_ = 1;

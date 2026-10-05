@@ -404,6 +404,37 @@ public:
     /// sends; set once before the replica is driven (ReplicaRegistry::add).
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
     [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
+
+    // -----------------------------------------------------------------------
+    // Leader-epoch restart fence (Kafka parity; 2026-10-05 epoch-restart fix).
+    //
+    // Every establishment of leadership must use a leader epoch strictly
+    // greater than any epoch already in any replica's log: KIP-101 truncation
+    // cannot tell two histories written under the SAME epoch apart.  After a
+    // restart the committed assignment this node replays can name it leader at
+    // the very epoch its previous incarnation led (and wrote) at — leading at
+    // it again would write a second history under that epoch.
+    //
+    // restartFenceEpoch_ = the highest epoch this replica led at in ANY earlier
+    // incarnation (durable `leader-epoch-fence` file, written tmp+fsync+rename
+    // at every new-epoch becomeLeader, before the first append) or holds in its
+    // log lineage (leader-epoch checkpoint).  When a controller manages this
+    // partition (setIsrChannel != null), becomeLeader(e <= fence) is REFUSED:
+    // the replica stays a follower of no leader (never accepts a produce) and
+    // asks the controller for a new epoch (AlterIsr with
+    // isrCount == AlterIsrMsg::kLeaderEpochBump), re-sent every kAlterIsrResendNs
+    // (loss recovery only) until a newer role arrives.  The controller answers
+    // with the same assignment at leaderEpoch + 1 (MetadataService::onAlterIsr).
+    // Without a controller (single node: no other replica can diverge) the
+    // fence is inert.
+    // -----------------------------------------------------------------------
+    /// Where the fence persists.  Disk-backed replicas default to
+    /// <log dir>/leader-epoch-fence; memory-backed ones are given a path under
+    /// the node's data dir by BrokerNode.  Loads the persisted value.  Cold.
+    void setLeaderEpochFenceFile(std::string path);
+    [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
+    [[nodiscard]] bool  staleLeadershipPendingForTest() const noexcept { return staleLead_.pending; }
+    [[nodiscard]] uint64_t staleLeadershipRefusalsForTest() const noexcept { return staleLeadRefusals_; }
     /// Test view: the committed partitionEpoch this leader derives proposals from.
     [[nodiscard]] int32_t committedPartitionEpochForTest() const noexcept { return committedPartitionEpoch_; }
     /// INTERNAL partitions (MAJOR-2/3): ISR changes commit on a MAJORITY's
@@ -1295,6 +1326,22 @@ private:
     /// this time (a fenced replica is not re-proposed every ISR check).
     int64_t expandBackoffUntilNs_ = 0;
     PartitionTransport* isrChannel_ = nullptr;   ///< AlterIsr sink (null = self-managed ISR)
+    // Leader-epoch restart fence (see setLeaderEpochFenceFile).
+    std::string fenceFile_;                  ///< durable highest-led-epoch file ("" = none)
+    Epoch       restartFenceEpoch_ = -1;     ///< earlier incarnations' highest epoch (constant once driven)
+    Epoch       fencePersisted_    = -1;     ///< highest epoch written to fenceFile_
+    struct StaleLeadership {
+        bool    pending        = false;      ///< a refused leadership awaits a new epoch
+        Epoch   epoch          = -1;         ///< the refused (committed) leader epoch
+        int32_t partitionEpoch = -1;         ///< its committed partitionEpoch
+        int64_t sentNs         = 0;
+        bool    sent           = false;
+    };
+    StaleLeadership staleLead_;
+    uint64_t        staleLeadRefusals_ = 0;
+    void refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch);
+    int  requestLeaderEpochBump_(int64_t nowNs);
+    void persistLedEpoch_(Epoch e);
     static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
     std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload
     uint64_t v2RefusalsLogged_ = 0;                             ///< mixed v2/v3: CRITICAL once

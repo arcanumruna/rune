@@ -1227,6 +1227,13 @@ if(BUILD_TESTING)
         target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Leader-epoch monotonicity across restarts (Kafka parity): full cold
+        # restart, single-node restart, stale same-epoch tail on a follower.
+        add_executable(rune_epoch_restart_tests tests/integration/EpochRestartRegressionTest.cpp)
+        target_include_directories(rune_epoch_restart_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_epoch_restart_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_epoch_restart_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
     endif()
 
     # ---------------------------------------------------------------------------

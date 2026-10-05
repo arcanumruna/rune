@@ -245,7 +245,7 @@ public:
     /// partition with no decision in flight; enqueues the records.  Called from
     /// runDynamicRebalanceOnTick (cold).  Returns the records enqueued.
     std::size_t reconcileCoordinatorPartitions(const std::vector<int32_t>& eligibleNodes) {
-        if (!leaderReady_() || coordinatorKeys_.empty()) return 0;
+        if (!controllerReady_() || coordinatorKeys_.empty()) return 0;
         std::size_t n = 0;
         const int32_t bootstrapEpoch =
             std::max<int32_t>(1, static_cast<int32_t>(replica_->epoch()));   // the consensus term
@@ -318,7 +318,7 @@ public:
         if (!present) { configuredTopics_.push_back(spec); ++routingInputsEpoch_; }
 
         // (2) Emit the initial assignment for this topic (leader only).
-        if (!leaderReady_()) return;
+        if (!controllerReady_()) return;
         if (liveNodes_.empty()) return;
 
         // Per-topic idempotency: skip if the MSM already has every partition
@@ -362,7 +362,7 @@ public:
     /// Public for test-only direct invocation; normally called by doWork().
     /// Single-writer: must be called on the duty-cycle thread.
     void emitStaticAssignmentIfNeeded() {
-        if (!leaderReady_()) return;
+        if (!controllerReady_()) return;
         if (configuredTopics_.empty() || liveNodes_.empty()) return;
 
         // Idempotency guard: if already assigned (flag latched), skip.
@@ -442,10 +442,10 @@ public:
             resp->partitionEpoch = partitionEpoch; resp->errorCode = code;
             if (answer) *answer = true;
         };
-        if (!leaderReady_()) return false;
+        if (!controllerReady_()) return false;
         // Internal topics: only the coordinator partitions on the controller
         // path (MEDIUM-B); __cluster_metadata uses the internal-ISR store.
-        if ((m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) || m.isrCount <= 0) return false;
+        if ((m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) || m.isrCount < 0) return false;
         const rune::metadata::PartitionAssignment* pa = msm_.assignment(m.topicId, m.partition);
         if (pa == nullptr) return false;
         if (pa->leaderNode != m.leaderId || pa->leaderEpoch != static_cast<int32_t>(m.leaderEpoch)) {
@@ -462,6 +462,7 @@ public:
             reply(rr::kAlterIsrInvalidUpdateVersion, pa->partitionEpoch);
             return false;
         }
+        if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump) return bumpLeaderEpoch_(m, *pa, reply);
         std::vector<int32_t> isr;
         isr.reserve(static_cast<std::size_t>(m.isrCount));
         bool hasLeader = false, droppedIneligible = false;
@@ -521,6 +522,42 @@ public:
         drainDynamicQueue();
         return true;
     }
+    /// Leader-epoch restart fence (PartitionReplica::setLeaderEpochFenceFile):
+    /// the committed leader `m.leaderId` refused leadership at the committed
+    /// epoch (it already led at it in an earlier incarnation — leading again
+    /// would write a second history under one epoch).  Kafka parity: every
+    /// establishment of leadership gets a NEW epoch — commit the same
+    /// assignment (leader, ISR, replicas) at leaderEpoch + 1.  The caller
+    /// validated (leader, leaderEpoch, partitionEpoch) against the committed
+    /// assignment, so a duplicate request (re-send) can never bump twice.
+    template <typename Reply>
+    bool bumpLeaderEpoch_(const rune::replication::AlterIsrMsg& m,
+                          const rune::metadata::PartitionAssignment& pa, Reply& reply) {
+        const int64_t key = partitionKey_(m.topicId, m.partition);
+        if (inflight_.count(key) != 0) return false;   // decide on the committed state only
+        for (const auto& q : pendingDynamicRecords_)
+            if (q.rec.topicId == m.topicId && q.rec.partition == m.partition) return false;
+        rune::metadata::BalancerRecord br;
+        br.isr      = pa.isr;
+        br.replicas = pa.replicas;
+        br.rec.topicId        = m.topicId;
+        br.rec.partition      = m.partition;
+        br.rec.leaderNode     = pa.leaderNode;
+        br.rec.leaderEpoch    = pa.leaderEpoch + 1;
+        br.rec.partitionEpoch = pa.partitionEpoch + 1;   // invariant leaderEpoch <= partitionEpoch
+        br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+        br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+        pendingDynamicRecords_.push_back(std::move(br));
+        ++leaderEpochBumps_;
+        reply(rune::replication::kAlterIsrOk, pa.partitionEpoch);
+        drainDynamicQueue();
+        return true;
+    }
+    [[nodiscard]] uint64_t leaderEpochBumpsForTest() const noexcept { return leaderEpochBumps_; }
+    /// The controller decides only once its map reflects its whole log as of
+    /// the claim (see controllerReady_).
+    [[nodiscard]] bool controllerCaughtUpForTest() const noexcept { return controllerCaughtUp_; }
+
     /// AeronPartitionTransport handler: true = send `resp` to the proposer.
     static bool onAlterIsrThunk(void* self, const rune::replication::AlterIsrMsg& m,
                                 rune::replication::AlterIsrResponseMsg& resp) {
@@ -637,7 +674,7 @@ public:
         int maxPreferredElectionsPerCycle = 1000,
         int maxRecordsPerCycle            = 4096)
     {
-        if (!leaderReady_()) return 0;
+        if (!controllerReady_()) return 0;
 
         // MEDIUM-2: the eligible set onAlterIsr filters additions against.
         eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
@@ -790,7 +827,7 @@ public:
         const std::vector<rune::metadata::NodeId>& eligibleNodes,
         int maxPreferredElectionsPerCycle = 1000)
     {
-        if (!leaderReady_()) return 0;
+        if (!controllerReady_()) return 0;
         if (eligibleNodes.empty()) return 0;
         return runDynamicRebalanceOnTick(eligibleNodes, &positions_,
                                          maxPreferredElectionsPerCycle);
@@ -841,11 +878,21 @@ public:
             // the full assignment map before serving requests.
             rebuildFromLog();
             wasLeader_ = true;
-            // MD1 Task 6: on the leader-claim edge, emit static partition
-            // assignment records if not already assigned (idempotent).
-            // This is the only point at which the controller appends assignment
-            // records; followers never emit.
-            emitStaticAssignmentIfNeeded();
+            // Epoch-restart fix (Raft/KRaft: a new leader decides nothing before
+            // its whole log is committed): records past the HW at the claim
+            // (e.g. a predecessor's failover, not yet committed after a cold
+            // restart) are part of the map this controller must decide on — a
+            // decision on the shorter map re-uses their epochs (two leaders /
+            // histories under one epoch) or re-emits the static epoch-0
+            // assignment over them.  Every decision waits until the MSM has
+            // applied the log through the claim-time LEO; event-driven (the HW
+            // reaches it as the followers fetch — no timer).
+            claimLeo_          = replica_->logEndOffset();
+            controllerCaughtUp_ = false;
+            // MD1 Task 6: the static partition assignment is emitted (if not
+            // already assigned — idempotent) once caught up (maybeCatchUp_).
+            // Followers never emit.
+            maybeCatchUp_();
         } else if (!amLeader && wasLeader_) {
             wasLeader_ = false;
             assigned_  = false;  // re-arm emit if we regain leadership later
@@ -865,6 +912,7 @@ public:
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
             msm_.commit(hw - 1);
+            if (amLeader) maybeCatchUp_();
             // Still drain the dynamic queue even if the log is caught up.
             if (amLeader) drainDynamicQueue();
             return 0;
@@ -929,6 +977,7 @@ public:
         // hw is the next-unwritten offset so the last committed is hw-1).
         msm_.commit(hw - 1);
         if (cursor > lastApplied_) lastApplied_ = cursor;
+        if (amLeader) maybeCatchUp_();
 
         // Drain the dynamic assignment queue (bounded per cycle).
         if (amLeader) drainDynamicQueue();
@@ -1125,6 +1174,20 @@ private:
     [[nodiscard]] bool leaderReady_() const noexcept {
         return replica_ != nullptr && replica_->acceptsProduce();
     }
+    /// This replica may DECIDE (emit assignments, answer AlterIsr, rebalance):
+    /// it leads AND its MSM reflects its whole log as of the claim.
+    [[nodiscard]] bool controllerReady_() const noexcept {
+        return leaderReady_() && controllerCaughtUp_;
+    }
+    /// The catch-up edge: the HW (and the MSM apply cursor) reached the
+    /// claim-time LEO — the map is complete; the deferred claim action runs.
+    void maybeCatchUp_() {
+        if (controllerCaughtUp_ || !leaderReady_()) return;
+        const rune::replication::Offset applied = lastApplied_ < 0 ? 0 : lastApplied_;   // -1 = nothing yet
+        if (replica_->highWatermark() < claimLeo_ || applied < claimLeo_) return;
+        controllerCaughtUp_ = true;
+        emitStaticAssignmentIfNeeded();
+    }
 
     void drainDynamicQueue() {
         if (pendingDynamicRecords_.empty()) return;
@@ -1186,6 +1249,12 @@ private:
     std::vector<int32_t>                      coordinatorReplicas_;  ///< MEDIUM-B
     /// replica_->logGeneration() the MSM was built against (see doWork).
     uint64_t lastLogGen_ = 0;
+    /// Epoch-restart fix: the metadata LEO at this controller's claim, and
+    /// whether the MSM has applied the log through it (true before any claim:
+    /// direct-invocation unit rigs decide on what they applied).
+    rune::replication::Offset claimLeo_ = 0;
+    bool     controllerCaughtUp_ = true;
+    uint64_t leaderEpochBumps_   = 0;
 
     // -----------------------------------------------------------------------
     // MD1 Task 6: static assignment emit state.

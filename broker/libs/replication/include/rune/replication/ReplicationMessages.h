@@ -428,6 +428,13 @@ struct ErrorPayloadBuf {
 struct AlterIsrMsg {
     static constexpr uint16_t TEMPLATE_ID = 7;
     static constexpr int kMaxIsr = 16;
+    /// isrCount == kLeaderEpochBump: not an ISR change — "the committed
+    /// (leaderId, leaderEpoch, partitionEpoch) assignment names me leader at an
+    /// epoch I already led at in an earlier incarnation: re-elect me at a NEW
+    /// epoch" (PartitionReplica leader-epoch restart fence).  The controller
+    /// commits the same assignment at leaderEpoch + 1.  An older controller
+    /// ignores it (isrCount <= 0 was always dropped unanswered).
+    static constexpr int32_t kLeaderEpochBump = 0;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

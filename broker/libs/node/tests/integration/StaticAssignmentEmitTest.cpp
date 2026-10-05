@@ -983,3 +983,142 @@ TEST(CoordinatorPartitionRegression, ControllerCommitsCoordinatorIsrAndBridgeFol
     EXPECT_EQ(off->role(), Role::Follower)
         << "the consensus leader led a coordinator partition outside its committed ISR";
 }
+
+// ===========================================================================
+// Epoch-restart fix 2026-10-05 (controller side).
+// ===========================================================================
+
+// A committed leader that refused its committed epoch after a restart (the
+// PartitionReplica restart fence) asks for a new one: AlterIsr with
+// isrCount == AlterIsrMsg::kLeaderEpochBump.  The controller commits the SAME
+// assignment (leader, ISR, replicas) at leaderEpoch + 1 / partitionEpoch + 1 —
+// once: a re-send while in flight, a stale request (old epoch) or one from a
+// non-leader commits nothing.
+TEST(EpochRestartControllerRegression, BumpRequestCommitsSameAssignmentAtNextEpoch) {
+    SaeTempDir dir1("eb1"), dir2("eb2"), dir3("eb3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    const std::vector<NodeId> allNodes = {1, 2, 3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    MetadataService svc1(r1.get(), 1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc1.doWork(clock);
+        }
+    };
+    drive(50);
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    const int32_t leader = pa->leaderNode, le = pa->leaderEpoch, pe = pa->partitionEpoch;
+    const std::vector<int32_t> isr = pa->isr;
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = leader; m.leaderEpoch = le;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = pe;
+    auto notLeader = m; notLeader.leaderId = leader == 3 ? 2 : 3;
+    EXPECT_FALSE(svc1.onAlterIsr(notLeader));
+    auto staleEpoch = m; staleEpoch.leaderEpoch = le - 1;
+    EXPECT_FALSE(svc1.onAlterIsr(staleEpoch));
+    EXPECT_TRUE(svc1.onAlterIsr(m)) << "the controller ignored a leader-epoch bump request";
+    EXPECT_FALSE(svc1.onAlterIsr(m)) << "a re-send while in flight bumped twice";
+    drive(50);
+    pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->leaderNode, leader) << "a bump keeps the leader";
+    EXPECT_EQ(pa->leaderEpoch, le + 1);
+    EXPECT_EQ(pa->partitionEpoch, pe + 1);
+    EXPECT_EQ(pa->isr, isr) << "a bump keeps the ISR";
+    EXPECT_FALSE(svc1.onAlterIsr(m)) << "a late re-send of the old request bumped again";
+}
+
+// A new controller decides nothing before its MSM reflects its WHOLE log as of
+// the claim.  After a cold restart the HW is 0 at the claim, while the log
+// holds the previous incarnation's decisions (here: the static assignment AND a
+// later committed-ISR change).  Deciding on the empty / partial map re-emitted
+// the static epoch-0 assignment after them — the committed map then regressed
+// (ISR, partitionEpoch; with a failover in between, the LEADER EPOCH and the
+// leader) and partitions re-led at epoch 0 (the DR-12 ground truth).
+TEST(EpochRestartControllerRegression, NewControllerNeverReemitsOverItsUncommittedLogRegression) {
+    SaeTempDir dir1("pc1"), dir2("pc2"), dir3("pc3");
+    const std::vector<NodeId> allNodes = {1, 2, 3};
+    int32_t le = -1, pe = -1;
+    std::size_t isrSize = 0;
+    Offset leo = -1;
+    {   // Incarnation 1: static assignment, then an ISR change, all committed.
+        rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+        log1.recover(); log2.recover(); log3.recover();
+        InMemoryTransport transport;
+        auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+        auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+        auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+        transport.setLeader(r1.get());
+        transport.addFollower(2, r2.get());
+        transport.addFollower(3, r3.get());
+        MetadataService svc1(r1.get(), 1);
+        svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+        int64_t clock = 0;
+        auto drive = [&](int n) {
+            for (int i = 0; i < n; ++i) {
+                clock += 1'000'000LL;
+                r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+                transport.pump(clock);
+                (void)svc1.doWork(clock);
+            }
+        };
+        drive(50);
+        const auto* pa = svc1.assignment(0, 0);
+        ASSERT_NE(pa, nullptr);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = pa->leaderNode; m.leaderEpoch = pa->leaderEpoch;
+        m.isrCount = 2; m.isr[0] = pa->leaderNode; m.isr[1] = pa->leaderNode == 1 ? 2 : 1;
+        m.partitionEpoch = pa->partitionEpoch;
+        ASSERT_TRUE(svc1.onAlterIsr(m));
+        drive(50);
+        pa = svc1.assignment(0, 0);
+        ASSERT_NE(pa, nullptr);
+        le = pa->leaderEpoch; pe = pa->partitionEpoch; isrSize = pa->isr.size();
+        ASSERT_EQ(isrSize, 2u);
+        leo = r1->logEndOffset();
+        ASSERT_EQ(r1->highWatermark(), leo);
+    }
+    // Incarnation 2 (cold restart): node 1 is elected again (consensus term 2).
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Follower, 0, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 0, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 0, allNodes, allNodes, &log3, &transport);
+    r1->becomeLeader(2, allNodes);
+    r2->becomeFollower(2, 1);
+    r3->becomeFollower(2, 1);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    ASSERT_LT(r1->highWatermark(), leo) << "precondition: the restarted controller's HW is behind its log";
+    MetadataService svc1(r1.get(), 1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    for (int i = 0; i < 100; ++i) {
+        clock += 1'000'000LL;
+        (void)svc1.doWork(clock);      // the claim edge runs before any fetch
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+    }
+    EXPECT_EQ(r1->logEndOffset(), leo) << "the new controller re-emitted assignments over its uncommitted log";
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->leaderEpoch, le);
+    EXPECT_EQ(pa->partitionEpoch, pe) << "the committed assignment regressed";
+    EXPECT_EQ(pa->isr.size(), isrSize);
+}
