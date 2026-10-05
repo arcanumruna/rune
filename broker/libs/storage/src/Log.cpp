@@ -42,6 +42,40 @@ inline std::string indexPathForLog(const std::string& logPath) {
 // Default index sampling interval — MUST match LogSegment's default
 // indexIntervalBytes so index right-sizing matches the actual sampling rate.
 constexpr int32_t kDefaultIndexIntervalBytes = 4096;
+// Largest epoch-ms batch maxTimestamp over the CRC-valid batch prefix of
+// [data, data+len) — the same running max append() keeps (starts at 0).  Stops
+// at the first torn / corrupt batch.  Cold paths only (recover / truncate /
+// reload), never the append path.
+int64_t maxBatchTimestamp(const uint8_t* data, std::size_t len) {
+    int64_t maxTs = 0;
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= len) {
+        rune::protocol::RecordBatchReader r(data + pos, len - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > len) break;
+        if (!r.ensureValid()) break;
+        const int64_t ts = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
+        if (ts > maxTs) maxTs = ts;
+        pos += static_cast<std::size_t>(total);
+    }
+    return maxTs;
+}
+// maxBatchTimestamp over a segment file; false when it cannot be read.
+bool fileMaxBatchTimestamp(const std::string& path, int64_t& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    f.seekg(0, std::ios::end);
+    const std::streamsize fileSize = f.tellg();
+    if (fileSize < 0) return false;
+    out = 0;
+    if (fileSize == 0) return true;
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buf(static_cast<std::size_t>(fileSize));
+    f.read(reinterpret_cast<char*>(buf.data()), fileSize);
+    if (!f) return false;
+    out = maxBatchTimestamp(buf.data(), buf.size());
+    return true;
+}
 } // anonymous namespace
 
 int32_t Log::indexMaxBytesFor(int64_t rollBytes, int32_t indexIntervalBytes) noexcept {
@@ -188,6 +222,7 @@ void Log::maybeRoll() {
             // Legacy (or > kMaxPendingSeals seals outstanding): inline seal fsync.
             activeSegment().sync();
         }
+        const int64_t sealedBase = activeSegment().baseOffset();
         int64_t base = logEndOffset_;
         // Install the NEXT segment.  Adopts the background-pre-provisioned staging
         // segment (ZERO syscalls: in-memory rebase; the staging→<base> disk rename
@@ -215,6 +250,7 @@ void Log::maybeRoll() {
         // active segment.  publishSealedSnapshot will use this captured value
         // (via newlySealedMaxTs_) instead of re-scanning the file.
         newlySealedMaxTs_ = activeSegmentMaxTs_;
+        newlySealedBase_  = sealedBase;
         activeSegmentMaxTs_ = 0;
         // E1d: an inline seal made the sealed segment durable — R may cross into
         // the new active segment (persisted inline on the legacy path only).
@@ -224,6 +260,7 @@ void Log::maybeRoll() {
         publishSealedSnapshot();
         // Clear the seal-time hint after the snapshot consumed it.
         newlySealedMaxTs_ = 0;
+        newlySealedBase_  = -1;
     }
 }
 
@@ -265,21 +302,31 @@ void Log::publishSealedSnapshot() {
             // last sealed entry).  std::next(it) is always valid here (it != end,
             // and end == the active segment).
             int64_t endOff = std::next(it)->first;
+            const uint64_t lineage = it->second->tsLineage();
             // Try to reuse largestTimestamp from the previous snapshot for this
             // segment (sealed segments are immutable after they are created).
+            // The cache key is (base, lineage): a segment truncateTo() rebuilt
+            // and re-appended is a NEW incarnation at an old base — its stale
+            // pre-truncate timestamp must never be reused (log-snapshot review
+            // MAJOR-1: time retention would delete fresh data early).
             int64_t largestTs = 0;
+            bool    found     = false;   // MEDIUM-2: 0 is a real timestamp, not "not found"
             if (prevSnap) {
                 const SealedSegmentSnapshot& prev = *prevSnap;
                 while (prevIdx < prev.size() && prev[prevIdx].baseOffset < base) ++prevIdx;
-                if (prevIdx < prev.size() && prev[prevIdx].baseOffset == base) largestTs = prev[prevIdx].largestTimestamp;
+                if (prevIdx < prev.size() && prev[prevIdx].baseOffset == base &&
+                    prev[prevIdx].lineage == lineage) {
+                    largestTs = prev[prevIdx].largestTimestamp;
+                    found     = true;
+                }
             }
             // If not found in the previous snapshot, this is either:
-            //   (a) A NEWLY SEALED segment from maybeRoll(): use newlySealedMaxTs_
+            //   (a) The NEWLY SEALED segment from maybeRoll(): use newlySealedMaxTs_
             //       (CP-8 fix — zero append-path I/O at seal time).
             //   (b) A segment recovered from disk by recover(): use recoveryMaxTimestamps_
             //       (CP-5.1 fix — real timestamps to prevent retention-after-restart data loss).
-            if (largestTs == 0) {
-                if (newlySealedMaxTs_ != 0) {
+            if (!found) {
+                if (base == newlySealedBase_) {
                     largestTs = newlySealedMaxTs_;
                 } else {
                     // CP-5.1: check the recovery map (populated by recover() batch scan).
@@ -289,7 +336,7 @@ void Log::publishSealedSnapshot() {
                     }
                 }
             }
-            snap->push_back({base, bytes, largestTs, endOff, compactionAllowedThrough(endOff)});
+            snap->push_back({base, bytes, largestTs, endOff, compactionAllowedThrough(endOff), lineage});
         }
     }
     // CP-5.1: clear the recovery map after first use — it is only needed for the
@@ -704,35 +751,15 @@ int64_t Log::recover() {
     if (segments_.size() > 1) {
         auto sealedEnd = std::prev(segments_.end()); // stop before active
         for (auto it = segments_.begin(); it != sealedEnd; ++it) {
-            int64_t base = it->first;
-            const std::string& logPath = it->second->logPath();
-            // Read the segment file and scan all batches for the max maxTimestamp.
-            std::ifstream f(logPath, std::ios::binary);
-            if (!f.is_open()) continue;
-            f.seekg(0, std::ios::end);
-            std::streamsize fileSize = f.tellg();
-            if (fileSize <= 0) continue;
-            f.seekg(0, std::ios::beg);
-            std::vector<uint8_t> buf(static_cast<std::size_t>(fileSize));
-            f.read(reinterpret_cast<char*>(buf.data()), fileSize);
-            f.close();
-
             int64_t segMaxTs = 0;
-            std::size_t pos = 0;
-            while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
-                rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
-                int32_t total = r.totalLength();
-                if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
-                if (!r.ensureValid()) break;
-                int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
-                if (batchMaxTs > segMaxTs) segMaxTs = batchMaxTs;
-                pos += static_cast<std::size_t>(total);
-            }
-            if (segMaxTs > 0) {
-                recoveryMaxTimestamps_[base] = segMaxTs;
-            }
+            if (fileMaxBatchTimestamp(it->second->logPath(), segMaxTs))
+                recoveryMaxTimestamps_[it->first] = segMaxTs;
         }
     }
+    // Log-snapshot review: seed the ACTIVE segment's running max from its
+    // pre-restart batches — else its seal records only post-restart batches
+    // and a segment holding fresh data reads as old (early time retention).
+    rescanActiveSegmentMaxTs_();
 
     // Publish sealed snapshot so the LogCleanerAgent can see pre-existing
     // sealed segments immediately after recovery (without waiting for the first
@@ -1152,6 +1179,9 @@ void Log::throwIfFailed_() const {
 void Log::install_(int64_t base, std::unique_ptr<LogSegment> seg) {
     seg->setStorageState(&storage_);
     seg->setInstallGen(++segInstallGen_);   // F15 S4 N1: identity, never reused
+    // A fresh content lineage (sealed-snapshot timestamp cache key); a reload of
+    // the same sealed content re-sets the inherited one after install_.
+    seg->setTsLineage(seg->installGen());
     auto it = segments_.find(base);
     if (it != segments_.end()) {
         // MEDIUM-2: a rebuilt / reloaded object over the SAME file name keeps
@@ -1272,8 +1302,12 @@ void Log::truncateTo(int64_t truncateOffset) {
         install_(base, std::move(seg));
         segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);   // MEDIUM-2: deletions + re-create
         logEndOffset_ = base;
+        activeSegmentMaxTs_ = 0;   // the fresh active segment holds nothing yet
         noteTruncatedTo_(logEndOffset_);
         persistAtMost_(logEndOffset_);   // E1d (batch-rounded LEO may be lower)
+        // Log-snapshot review MAJOR-1: segments_ changed (all erased, one
+        // re-created) — the cleaner must never see the erased bases.
+        publishSealedSnapshot();
         return;
     }
 
@@ -1336,6 +1370,9 @@ void Log::truncateTo(int64_t truncateOffset) {
         // All existing batches are fully below the boundary: keep them all.
         cutPos = validEnd;
     }
+    // Log-snapshot review MAJOR-1: the active segment's running max is the
+    // KEPT prefix's — never the erased segments' / dropped batches' maximum.
+    const int64_t keptMaxTs = maxBatchTimestamp(buf.data(), cutPos);
 
     // Truncate the file at cutPos.
     std::filesystem::resize_file(lpath, static_cast<std::uintmax_t>(cutPos));
@@ -1404,8 +1441,14 @@ void Log::truncateTo(int64_t truncateOffset) {
                   ": unknown exception.  The .log file is ALREADY truncated on disk "
                   "(cutPos=" + std::to_string(cutPos) + ").  Halting.");
     }
+    activeSegmentMaxTs_ = keptMaxTs;
     noteTruncatedTo_(logEndOffset_);   // rounded down to the batch boundary
     persistAtMost_(logEndOffset_);   // E1d: a mid-batch cut rounds the LEO below truncateOffset
+    // Log-snapshot review MAJOR-1: segments_ changed (later segments erased, a
+    // formerly sealed segment rebuilt as the ACTIVE one) — republish so the
+    // cleaner's activeBase / sealed set match.  The only earlier publish (inside
+    // the first persistAtMost_) ran BEFORE the erase.
+    publishSealedSnapshot();
 }
 
 void Log::reloadSegments() {
@@ -1439,6 +1482,11 @@ void Log::reloadSegments() {
         // carries a fresh Log-wide generation — install_ is bypassed here, so
         // stamp it now (a later throw only skips numbers; never reused).
         newSegments[b]->setInstallGen(++segInstallGen_);
+        // Same file at the same base = same content lineage (a cleaner rewrite
+        // never raises its max timestamp); a new base gets a fresh one.
+        auto old = segments_.find(b);
+        newSegments[b]->setTsLineage(old != segments_.end() && old->second
+                                         ? old->second->tsLineage() : newSegments[b]->installGen());
     }
     // Recover BEFORE installing — extends the same strong guarantee to the
     // whole reconstruction, not just segment construction: a throwing
@@ -1473,9 +1521,25 @@ void Log::reloadSegments() {
     segments_.swap(newSegments);   // old (now all-null) entries die with newSegments
     logEndOffset_ = next;
     if (recoveryPoint_ > logEndOffset_) recoveryPoint_ = logEndOffset_;   // E1d (never above the LEO)
+    // Log-snapshot review audit: segments_ was rebuilt (a cleaner-emptied
+    // segment may be gone) — re-derive the active max and republish (cold).
+    rescanActiveSegmentMaxTs_();
+    publishSealedSnapshot();
+}
+
+void Log::rescanActiveSegmentMaxTs_() {
+    int64_t ts = 0;
+    activeSegmentMaxTs_ = fileMaxBatchTimestamp(activeSegment().logPath(), ts) ? ts : 0;
 }
 
 void Log::reloadSegment(int64_t baseOffset) {
+    reloadSegmentNoPublish_(baseOffset);
+    // Log-snapshot review audit: a direct (synchronous-cleaner) reload mutates
+    // segments_ too — the cleaner thread must see the new size / removal.
+    publishSealedSnapshot();
+}
+
+void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
     // CP-2: in-place single-segment reload after a cleaner rewrite.
     //
     // The cleaner atomically renamed <base>.log.new -> <base>.log (or, when the
@@ -1507,8 +1571,10 @@ void Log::reloadSegment(int64_t baseOffset) {
     // recover() it so its in-memory index reflects the rewritten bytes.
     const bool    wasDurable = it->second->fullyDurable();
     const int64_t oldDurable = it->second->durableNext();
+    const uint64_t lineage   = it->second->tsLineage();   // same content, compacted
     install_(baseOffset, std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_));
     LogSegment& fresh = *segments_[baseOffset];
+    fresh.setTsLineage(lineage);
     fresh.recover();
     // E1d: the cleaner fsyncs a rewritten segment before its rename.
     fresh.setDurableNext(wasDurable ? fresh.nextOffset() : std::min(oldDurable, fresh.nextOffset()));
@@ -1516,15 +1582,20 @@ void Log::reloadSegment(int64_t baseOffset) {
 
 int Log::deleteOldSegments(int64_t retainBytes) {
     int deleted = 0;
-    while (segments_.size() > 1 && totalBytes() > retainBytes) {
+    int64_t total = totalBytes();   // review LOW-2: one O(n) sum, then a running total
+    while (segments_.size() > 1 && total > retainBytes) {
         auto it = segments_.begin();
         std::string base = it->second->logPath();
         std::string idx = indexPathForLog(base);
+        total -= it->second->sizeBytes();
         erase_(it);
         std::filesystem::remove(base);
         std::filesystem::remove(idx);
         ++deleted;
     }
+    // Log-snapshot review audit: segments_ changed — the cleaner must not keep
+    // seeing (and re-targeting) the deleted bases.
+    if (deleted > 0) publishSealedSnapshot();
     return deleted;
 }
 
@@ -1562,7 +1633,7 @@ int Log::drainCleanerSwaps() {
     const std::size_t head = swapHead_.load(std::memory_order_relaxed);
     const std::size_t tail = swapTail_.load(std::memory_order_acquire);
     for (std::size_t i = head; i != tail; ++i) {
-        reloadSegment(swapRing_[i & kSwapRingMask]);
+        reloadSegmentNoPublish_(swapRing_[i & kSwapRingMask]);
     }
     const int count = static_cast<int>(tail - head);
     if (count > 0) {
@@ -1612,12 +1683,14 @@ int Log::drainRetentionDeletes() {
         }
         // If base is not in segments_ (e.g. idempotent retry), that is fine.
     }
-    if (count > 0) {
-        // Release new head so the cleaner can reuse slots.
+    // Log-snapshot review MEDIUM-1: ALWAYS release the consumed slots (mirror
+    // drainCleanerSwaps) — gating this on count > 0 leaked slots for bases that
+    // were already gone until the ring filled and retention halted forever.
+    if (tail != head) {
         deleteHead_.store(tail, std::memory_order_release);
-        // Refresh the sealed snapshot so the cleaner sees the updated segment list.
-        publishSealedSnapshot();
     }
+    // Refresh the sealed snapshot so the cleaner sees the updated segment list.
+    if (count > 0) publishSealedSnapshot();
     return count;
 }
 
