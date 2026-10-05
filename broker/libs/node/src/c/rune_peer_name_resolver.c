@@ -18,7 +18,6 @@
 #include "aeron_name_resolver.h"
 #include "util/aeron_error.h"
 
-#define RUNE_PEER_RESOLVER_ARGS_PREFIX "rune-peer:"
 
 static int rune_peer_resolve(
     aeron_name_resolver_t *resolver, const char *name, const char *uri_param_name, bool is_re_resolution,
@@ -83,9 +82,9 @@ static int rune_peer_supplier(aeron_name_resolver_t *resolver, const char *args,
 
 int rune_peer_name_resolver_install(aeron_driver_context_t *ctx, rune_peer_name_lookup_t *lookup)
 {
-    char args[64];
-    snprintf(args, sizeof(args), RUNE_PEER_RESOLVER_ARGS_PREFIX "%" PRIxPTR, (uintptr_t)lookup);
-    if (aeron_driver_context_set_name_resolver_init_args(ctx, args) < 0)
+    snprintf(lookup->init_args, sizeof(lookup->init_args), RUNE_PEER_RESOLVER_ARGS_PREFIX "%" PRIxPTR,
+             (uintptr_t)lookup);
+    if (aeron_driver_context_set_name_resolver_init_args(ctx, lookup->init_args) < 0)
     {
         return -1;
     }

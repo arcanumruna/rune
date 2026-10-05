@@ -22,6 +22,7 @@
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/PeerResolverHub.h>
+#include <rune/node/rune_peer_name_resolver.h>
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerReplicationTransport.h>
@@ -33,6 +34,8 @@
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <cinttypes>
+#include <cstdio>
 #include <unistd.h>
 
 #include <atomic>
@@ -497,4 +500,38 @@ TEST(UnresolvedPeerRegression, PeerBindHostNeverDependsOnOwnDnsRecordRegression)
     EXPECT_EQ(c.peerBindHost(), "10.1.2.3") << "a numeric host binds as configured (no lookup)";
     c.peerBindHostOverride = "192.168.0.7";
     EXPECT_EQ(c.peerBindHost(), "192.168.0.7") << "RUNE_PEER_BIND_HOST wins";
+}
+
+// DR-15 Docker (2026-10-05): every broker exited "rune peer resolver: missing init
+// args" (aeron_driver_init EINVAL) — rune_peer_name_resolver_install formatted the
+// init args into a STACK buffer and Aeron keeps the raw pointer
+// (aeron_driver_context_set_name_resolver_init_args stores, never copies): by the
+// time the driver initialises the resolver the frame is gone.  Green on the Mac by
+// luck (the stack survived).  The args must live as long as the lookup.
+namespace {
+[[gnu::noinline]] void installFromAFrameThatDies(aeron_driver_context_t* ctx, rune_peer_name_lookup_t* lk) {
+    ASSERT_EQ(rune_peer_name_resolver_install(ctx, lk), 0);
+}
+[[gnu::noinline]] void clobberTheStack() {
+    volatile char junk[8192];
+    for (std::size_t i = 0; i < sizeof(junk); ++i) junk[i] = 'x';
+}
+int noLookup(void*, const char*, uint32_t*) { return -1; }
+} // namespace
+
+TEST(UnresolvedPeerRegression, ResolverInitArgsOutliveTheInstallCallRegression) {
+    aeron_driver_context_t* ctx = nullptr;
+    ASSERT_EQ(aeron_driver_context_init(&ctx), 0);
+    rune_peer_name_lookup_t lk{};
+    lk.fn    = &noLookup;
+    lk.state = nullptr;
+    installFromAFrameThatDies(ctx, &lk);
+    clobberTheStack();
+    const char* args = aeron_driver_context_get_name_resolver_init_args(ctx);
+    ASSERT_NE(args, nullptr);
+    char expected[64];
+    std::snprintf(expected, sizeof(expected), "%s%" PRIxPTR, RUNE_PEER_RESOLVER_ARGS_PREFIX,
+                  reinterpret_cast<uintptr_t>(&lk));
+    EXPECT_STREQ(args, expected) << "the resolver init args dangle (stack buffer)";
+    aeron_driver_context_close(ctx);
 }

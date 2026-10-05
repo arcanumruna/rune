@@ -14,12 +14,18 @@ extern "C" {
 /* host == NULL: drain only (conductor duty cycle).  Otherwise:
  *   1 = managed + cached (ipv4 set, network order), 0 = managed, not resolved yet,
  *  -1 = not a managed peer host (Aeron's default resolver answers). */
+#define RUNE_PEER_RESOLVER_ARGS_PREFIX "rune-peer:"
+
 typedef int (*rune_peer_name_lookup_fn)(void *state, const char *host, uint32_t *ipv4);
 
 typedef struct rune_peer_name_lookup_stct
 {
     rune_peer_name_lookup_fn fn;
     void *state;
+    /* Aeron keeps the init-args POINTER (aeron_driver_context_set_name_resolver_init_args
+     * never copies): the args live here, as long as the lookup (which must outlive the
+     * driver) — never in a stack buffer of the install call. */
+    char init_args[64];
 }
 rune_peer_name_lookup_t;
 
