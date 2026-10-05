@@ -1199,6 +1199,16 @@ void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
                     thisM->leadershipTermId         = leadershipTermId_;
                     thisM->timeOfLastAppendPositionNs = nowNs;
                 }
+                // LeaderLivenessGraceRegression (DR-10 flap): the node runtime
+                // treats us as leader from HERE (isLocalLeader: Leader* states)
+                // and its partition controller reassigns off eligibleNodeIds()
+                // at once.  Seed every peer's liveness clock now — not only at
+                // electionComplete() — or a just-elected leader sees eligN=1 and
+                // fences every partition (even a live peer's) to itself with
+                // ISR {self}.  Same become-leader grace, same time-independence.
+                for (ClusterMember& m : clusterMembers_) {
+                    if (m.id != thisMemberId_) m.timeOfLastAppendPositionNs = nowNs;
+                }
             }
             break;
         case ElectionState::FollowerLogReplication:

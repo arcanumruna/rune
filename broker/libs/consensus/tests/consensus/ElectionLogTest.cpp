@@ -2101,3 +2101,27 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_StaleCandidateRequestVote_Keeps
     EXPECT_TRUE(e.isClosed());
     EXPECT_EQ(e.leaderMemberId(), 0);
 }
+
+// DR-10 flap (2026-10-05, second layer): the node runtime treats a node as the
+// consensus leader from LEADER_LOG_REPLICATION on (isLocalLeader), and its
+// partition controller reassigns off eligibleNodeIds() right away.  The peer
+// liveness grace was seeded only in electionComplete() (CLOSED), so for the
+// whole LEADER_* window every peer read as dead (eligN=1): the new controller
+// fenced EVERY partition — including those of a live peer — to itself with
+// ISR {self}.  The grace must hold from the moment this node leads.
+TEST(ElectionLog, LeaderLivenessGraceRegression_PeersEligibleFromLeaderLogReplication) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    int64_t nowNs = 1'000'000'000'000LL;   // far past any sentinel window
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+
+    NodeId out[8];
+    const std::size_t n = e.eligibleNodeIds(nowNs, 0, out, 8);
+    std::vector<NodeId> elig(out, out + n);
+    EXPECT_EQ(elig, (std::vector<NodeId>{0, 1, 2}))
+        << "a just-elected leader must not see its live peers as dead before CLOSED";
+}
