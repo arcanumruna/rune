@@ -2671,6 +2671,9 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
         PartitionState& ps = *up;
         ps.inflight.forEachLive([&](InFlightBatch& b) {
             if (nowNs - b.firstSendNs >= deliveryNs) {
+                std::fprintf(stderr, "ProducerImpl: batch corrId=%lld (topic=%d part=%d) failed: no answer within the "
+                             "delivery timeout (%lldms, %d attempts)\n", static_cast<long long>(b.corrId), ps.topicId,
+                             ps.partition, static_cast<long long>(cfg_.deliveryTimeoutMs), b.attempts);
                 failBatch_(ps, b, OpStatus::DeliveryFailed);  // no ProduceResponse in time
             }
         });
@@ -2679,6 +2682,9 @@ void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& no
         // could still be written later.
         if (ps.builder && ps.builder->recordCount() > 0 && ps.batchStartNs != 0 &&
             nowNs - ps.batchStartNs >= deliveryNs) {
+            std::fprintf(stderr, "ProducerImpl: topic=%d part=%d records never sent within the delivery timeout "
+                         "(%lldms; no route / session)\n", ps.topicId, ps.partition,
+                         static_cast<long long>(cfg_.deliveryTimeoutMs));
             failBuilder_(ps, OpStatus::DeliveryFailed);  // never sent
         }
         // Tier-2 batches never sent past the deadline: same rule (FIFO, so the
@@ -2760,6 +2766,8 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
         return true;
     }
     if (b->redirectCount >= kMaxRedirects) {
+        std::fprintf(stderr, "ProducerImpl: batch corrId=%lld (topic=%d part=%d) failed: redirect budget (%d) exhausted\n",
+                     static_cast<long long>(b->corrId), ps.topicId, ps.partition, kMaxRedirects);
         failBatch_(ps, *b, OpStatus::DeliveryFailed);  // redirect budget exhausted
         maybeEndLaneWait_(ps);
         return false;
@@ -2792,6 +2800,9 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
         bool refused = ps.routeResend;  // review MEDIUM-2: behind a queued / refused re-offer, in order
         ps.inflight.forEachLive([&](InFlightBatch& b) {
             if (b.redirectCount >= kMaxRedirects) {
+                std::fprintf(stderr, "ProducerImpl: batch corrId=%lld (topic=%d part=%d) failed: redirect budget (%d) "
+                             "exhausted on resend\n", static_cast<long long>(b.corrId), ps.topicId, ps.partition,
+                             kMaxRedirects);
                 failBatch_(ps, b, OpStatus::DeliveryFailed);  // redirect budget exhausted
                 return;
             }

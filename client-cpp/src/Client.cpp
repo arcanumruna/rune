@@ -2192,6 +2192,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // so the subscribe side and reconnect-pending latch are clean.
                 const std::string retargetReason =
                     "Redirect retarget failed for endpoint: " + newEndpoint;
+                std::fprintf(stderr, "rune-client: produce corr=%lld failed: redirect retarget to %s failed\n",
+                             static_cast<long long>(opt->correlationId), newEndpoint.c_str());
                 producerHub_.failPending(opt->correlationId);  // DeliveryFailed
                 subscriberHub_.failPendingSubscribes("Redirect retarget failed");
                 redirectPending() = false;
