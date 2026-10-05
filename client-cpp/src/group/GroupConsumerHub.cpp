@@ -699,6 +699,14 @@ void GroupConsumerHub::pruneFetch_()
         if (ended(late_[i].session, late_[i].epoch)) { late_[i] = late_.back(); late_.pop_back(); }
         else ++i;
     }
+    for (std::size_t i = 0; i < oldNodeLogged_.size();) {
+        if (ended(oldNodeLogged_[i].session, oldNodeLogged_[i].epoch)) {
+            oldNodeLogged_[i] = oldNodeLogged_.back();
+            oldNodeLogged_.pop_back();
+        } else {
+            ++i;
+        }
+    }
 }
 
 int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
@@ -734,20 +742,30 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
             if (router_.revive != nullptr) router_.revive(router_.ctx, target);
             continue;
         }
-        // A-MEDIUM-3: a node that predates explicit group subscriptions pushes
-        // without the Subscribe's correlationId — every batch would be dropped
-        // (a silent stall).  Park the partition, say why; fresh metadata (e.g.
-        // the upgraded node reconnecting) retries.
+        // A-MEDIUM-3 / R4-MEDIUM-1: a node that predates explicit group
+        // subscriptions pushes without the Subscribe's correlationId — every
+        // batch would be dropped (a silent stall).  The partition is skipped
+        // (not parked, no metadata request: nothing to ask — the node itself
+        // must change) and logged ONCE per that session's connect episode.  It
+        // resumes on the event that exists: the upgraded node's session
+        // reconnects (a new episode advertising >= 3) and its accepted connect
+        // re-drives reconcile.
         if (target != 0 && router_.brokerVersion != nullptr &&
             router_.brokerVersion(router_.ctx, target) <
                 rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions) {
-            std::fprintf(stderr,
-                "rune-client: group '%s' topic %d partition %d: its leader node runs broker version %d "
-                "(< %d, explicit group subscriptions) — partition parked until the node is upgraded\n",
-                impl.groupId.c_str(), tp.topicId, tp.partition, router_.brokerVersion(router_.ctx, target),
-                rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions);
-            fs.parked       = true;
-            metadataWanted_ = true;
+            bool logged = false;
+            for (const OldNodeLog& o : oldNodeLogged_) {
+                if (o.session == target && o.epoch == ep) { logged = true; break; }
+            }
+            if (!logged) {
+                oldNodeLogged_.push_back(OldNodeLog{target, ep});  // cold: once per episode
+                std::fprintf(stderr,
+                    "rune-client: group '%s': a partition leader node (session %u) runs broker version %d "
+                    "(< %d, explicit group subscriptions) — its partitions (first: topic %d partition %d) are "
+                    "not consumed until the node is upgraded and reconnects\n",
+                    impl.groupId.c_str(), target, router_.brokerVersion(router_.ctx, target),
+                    rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions, tp.topicId, tp.partition);
+            }
             continue;
         }
         const int64_t corr = nextFetchCorr_tagged_();

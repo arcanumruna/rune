@@ -1000,3 +1000,52 @@ TEST(GroupRoutingRegression, PartitionLedByAnOldNodeIsParkedNotSilentlyStalledRe
     EXPECT_EQ(r.subAt(1, n1), nullptr) << "subscribed a partition on a node that cannot tag its pushes";
     EXPECT_FALSE(gc.finished()) << "the rest of the assignment keeps running";
 }
+
+// R4-MEDIUM-1: a partition whose leader node is pre-v3 is skipped WITHOUT
+// polling metadata (nothing to ask — the node itself must change) — the
+// metadata request count stays flat while it is assigned — and it is
+// subscribed once that node is upgraded and its session reconnects
+// (advertising v3).  RED (round 4): parking set metadataWanted and every
+// metadata answer unparked it — ~5 requests per second, a log line each.
+TEST(GroupRoutingRegression, OldLeaderNodeNeverPollsMetadataAndResumesAfterUpgradeRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;
+    o.responseTimeoutNs = 400'000'000;
+    GroupRig r(4153, 4154, o);
+    const auto [n1, p1port] = r.addNode(4153);
+    r.gw.advertisedBrokerVersionAt[n1] = -1;  // node 1: pre-v3
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4153, ""}, {1, 1, 1, 1, 4153, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.gw.connectsAt[n1] > 0; }));
+    // Settle (bounded) until the old node's session is connected, then measure.
+    ASSERT_TRUE(r.drive([&] { return r.client.testSessionCount() > 1 &&
+                                     r.client.testSessionStateAt(1) == rc::session::SessionState::Connected; }));
+    const int mdBefore = r.gw.metadataRequests;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);  // a bounded window, not a sleep
+    while (std::chrono::steady_clock::now() < until) {
+        r.client.doWork();
+        r.gw.pump();
+    }
+    EXPECT_EQ(r.gw.metadataRequests, mdBefore) << "a pre-v3 leader made the client poll metadata";
+    EXPECT_EQ(r.subAt(1, n1), nullptr);
+    EXPECT_FALSE(gc.finished());
+
+    // Node 1 is upgraded: it restarts (its session is lost) and comes back v3.
+    r.gw.advertisedBrokerVersionAt[n1] = rune::protocol::client::kBrokerVersion;
+    r.gw.deadEndpoints.insert(n1);
+    ASSERT_TRUE(r.drive([&] { return r.client.testSessionStateAt(1) != rc::session::SessionState::Connected; },
+                        20'000'000));
+    r.gw.deadEndpoints.clear();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 40'000'000))
+        << "the upgraded node's partition was never subscribed";
+    r.gw.pushRecords(*r.subAt(1, n1), 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 2; }));
+}

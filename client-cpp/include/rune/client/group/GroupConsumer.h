@@ -145,13 +145,19 @@ enum class GroupConsumerState : uint8_t {
 /// broker that does not auto-subscribe members and stamps Records with the
 /// creating Subscribe's correlationId.  This client runs a GroupConsumer only
 /// against a seed / coordinator broker advertising ConnectResponse.brokerVersion
-/// >= 3; a partition whose LEADER node is below 3 (a rolling upgrade) is parked
-/// and logged until that node is upgraded; a broker coordinator refuses
+/// >= 3; a partition whose LEADER node is below 3 (a rolling upgrade) is skipped
+/// (logged once per that node's connect episode) until that node is upgraded
+/// and reconnects; a broker coordinator refuses
 /// JoinGroup from a client below 3.  The whole cluster must be >= 3 for every
 /// partition to be consumed.
 enum class GroupFailReason : int32_t {
     None = 0,
     /// The broker does not advertise explicit group subscriptions (brokerVersion < 3).
+    /// Rolling upgrades must upgrade the BOOTSTRAP (seed) nodes the clients
+    /// connect to first (they are the group coordinator's session): a v3 client
+    /// whose seed is still pre-v3 finishes its GroupConsumer with this reason;
+    /// partitions whose leader is a not-yet-upgraded node are only skipped
+    /// (logged once) until that node is upgraded and reconnects.
     BrokerTooOld = 1,
     /// The broker coordinator refused this client's JoinGroup (ProtocolVersion).
     RefusedByBroker = 2,

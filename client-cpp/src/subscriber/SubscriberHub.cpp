@@ -9,6 +9,7 @@
 // StatusRing.  No mutex, no atomics.
 
 #include <rune/client/subscriber/SubscriberHub.h>
+#include <rune/client/group/GroupConsumerHub.h>  // isFetchCorrId (header-only constexpr)
 #include <rune/protocol/RecordBatch.h>
 
 #include <cassert>
@@ -430,7 +431,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         // arrive later, on another publication).  Cold: once per subscription.
         // LOW-1 (round 4): a group fetch push (bit-61 correlationId) is never a
         // plain subscription's — one compare instead of a map lookup per batch.
-        if (rv.correlationId == 0 || (rv.correlationId & (int64_t{1} << 61)) != 0) return;
+        if (rv.correlationId == 0 || group::GroupConsumerHub::isFetchCorrId(rv.correlationId)) return;
         // A-MEDIUM-1 (round 4): no session yet (a fresh connect) = no binding by
         // push: another client's push on a shared publication could carry the
         // same small correlationId.  The SubscribeResponse still binds.

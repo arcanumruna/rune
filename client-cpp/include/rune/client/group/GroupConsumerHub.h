@@ -378,6 +378,8 @@ private:
         int64_t        brokerSid;  // LOW-2 (round 4): a push reveals its id only on that session
     };
     std::vector<LateSub> late_;
+    struct OldNodeLog { uint32_t session; uint64_t epoch; };
+    std::vector<OldNodeLog> oldNodeLogged_;  // R4-MEDIUM-1: one log per pre-v3 node episode
     struct SubRef {   // a subscription instance
         uint32_t       session;
         uint64_t       epoch;
