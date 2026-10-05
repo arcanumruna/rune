@@ -1,4 +1,5 @@
 #include <rune/storage/LogCleaner.h>
+#include <cstring>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/ControlMarkerLayout.h>
 
@@ -213,10 +214,12 @@ int markerControlType(const uint8_t* batch, std::size_t len, const rune::protoco
 // marker was not seen stays unresolved and caps the pass (txn.cleanLimit()).
 // Returns the bytes read (throttled by the caller like the M3 prefix reads).
 int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset toOffset,
-                     Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails) {
+                     Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
+                     const BoundaryHook& hook) {
     int64_t bytes = 0;
     for (int64_t segBase : bases) {
         if (segBase >= toOffset) break;
+        hook();   // fix round 6: segment boundary
         const auto buf = readFile(segmentLogPath(dir, segBase));
         bytes += static_cast<int64_t>(buf.size());
         std::size_t pos = 0;
@@ -320,7 +323,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // D3b: transaction pre-pass (+ producer tails) over the whole log below
     // toOffset; the map never indexes at/after the first unresolved txn (LSO) nor
     // aborted txn data.  M3: these reads are throttled by the caller.
-    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails());
+    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_);
     toOffset = txn.cleanLimit();
 
     for (size_t i = 0; i < bases.size(); ++i) {
@@ -330,6 +333,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (segBase >= toOffset)  break;
         if (segEnd <= fromOffset) continue;   // clean prefix: covered by the pre-pass
 
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
 
@@ -374,7 +378,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     txn.clear();
     if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); return; }
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
-    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails());
+    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_);
     toOffset = txn.cleanLimit();
 
     // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
@@ -398,6 +402,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (segEnd <= fromOffset) continue;   // clean prefix: covered by the pre-pass
 
         // Read segment from disk.
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
 
@@ -445,6 +450,7 @@ bool LogCleaner::rewriteSegmentImpl(
 
     // Read the current segment.
     ++rewriteSegmentsRead_;
+    hook_();   // fix round 6: segment boundary
     auto buf = readFile(logPath);
     if (buf.empty()) return false;
 
@@ -731,10 +737,14 @@ bool LogCleaner::rewriteSegmentImpl(
     // rewritten) only discovers segments with on-disk .log files, so a deleted
     // segment is simply absent — Log remains consistent and LEO is unaffected.
     if (outBuf.empty()) {
+        if (changed) *changed = true; // segment removed — content changed
+        if (deferredOut_ != nullptr) {   // fix round 2: the owner thread drops it
+            deferInstall_(dir, {segBase}, outBuf);
+            return true;
+        }
         std::filesystem::remove(logPath);
         std::filesystem::remove(idxPath);
         fsyncDir(dir);
-        if (changed) *changed = true; // segment removed — content changed
         return true;
     }
 
@@ -748,6 +758,12 @@ bool LogCleaner::rewriteSegmentImpl(
         return true; // file present + valid, unchanged
     }
     if (changed) *changed = true;
+    if (deferredOut_ != nullptr) {
+        // Fix round 2: never replace the original here — the owner thread
+        // validates and installs the output (Log::drainCleanerSwaps).
+        deferInstall_(dir, {segBase}, outBuf);
+        return true;
+    }
 
     // Durable atomic swap: write → fsync file → rename → fsync dir.
     //
@@ -1053,9 +1069,52 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     Throttler* throttler,
     int64_t nowMs)
 {
+    deferredWritten_.clear();
+    if (deferredSeq_ != nullptr) {
+        // Fix round 3: the owner thread installs earlier outputs with renames
+        // only (no fsync on the worker).  Make those directory entries durable
+        // HERE, off the hot path, once per pass.  Not needed for crash safety
+        // (any un-fsynced prefix of the rename protocol recovers via .cleaned /
+        // .swap at construction) — it only bounds how much finished compaction
+        // a power loss can undo.
+        fsyncDir(dir);
+    }
+    try {
+        return produceCleanedRangeBoundedImpl_(dir, sealedBases, sealedSizes, activeBase,
+                                               globalDirtyStart, nowNs, deleteRetentionMs, map,
+                                               useCoalescing, groupRollBytes, throttler, nowMs);
+    } catch (...) {
+        // N-LOW-1: an exception mid-pass loses result.groups — remove this pass's
+        // outputs now (never enqueued; the originals are untouched).
+        std::error_code ec;
+        for (const auto& p : deferredWritten_) std::filesystem::remove(p, ec);
+        deferredWritten_.clear();
+        throw;
+    }
+}
+
+RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
+    const std::string& dir,
+    const std::vector<int64_t>& sealedBases,
+    const std::vector<int64_t>& sealedSizes,
+    Offset activeBase,
+    Offset globalDirtyStart,
+    int64_t nowNs, int64_t deleteRetentionMs,
+    SkimpyOffsetMap& map,
+    bool useCoalescing,
+    int64_t groupRollBytes,
+    Throttler* throttler,
+    int64_t nowMs)
+{
     RangeCleanResult result;
     rewriteSegmentsRead_ = 0;
     result.passEnd = activeBase;   // default: nothing dirty → advance to activeBase
+    // Fix round 2: deferred-install mode collects outputs into result.groups.
+    struct DeferredScope {
+        std::vector<CleanedGroup>*& slot;
+        ~DeferredScope() { slot = nullptr; }
+    } deferredScope{deferredOut_};
+    deferredOut_ = deferredSeq_ != nullptr ? &result.groups : nullptr;
 
     if (sealedBases.empty()) return result;
     if (globalDirtyStart < 0) globalDirtyStart = 0;
@@ -1120,6 +1179,20 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
         const int64_t roll = (groupRollBytes > 0) ? groupRollBytes
                                                    : (64LL * 1024 * 1024);
         auto groups = groupSegmentsBySize(inPassBases, inPassSizes, roll);
+        if (deferredOut_ != nullptr) {
+            // Bound each group so the owner's ring claim always fits.
+            std::vector<SegmentGroup> split;
+            for (auto& g : groups) {
+                for (std::size_t i = 0; i < g.bases.size(); i += kMaxDeferredGroupMembers) {
+                    SegmentGroup part;
+                    const std::size_t e = std::min(g.bases.size(), i + kMaxDeferredGroupMembers);
+                    part.bases.assign(g.bases.begin() + static_cast<std::ptrdiff_t>(i),
+                                      g.bases.begin() + static_cast<std::ptrdiff_t>(e));
+                    split.push_back(std::move(part));
+                }
+            }
+            groups.swap(split);
+        }
         for (const auto& g : groups) {
             if (g.bases.empty()) continue;
             bool changed = false;
@@ -1150,7 +1223,9 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
         // disk and NOT enqueued — no churn (one exists() stat covers both branches).
         std::error_code ec;
         const bool present = std::filesystem::exists(segmentLogPath(dir, b), ec);
-        if (changed || !present) {
+        // Deferred mode never removes a file here, so an absent .log is the
+        // owner's own (already applied) work — only real changes are reported.
+        if (changed || (!present && deferredOut_ == nullptr)) {
             result.rewrittenBases.push_back(b);
             result.compacted = true;
         }
@@ -1165,6 +1240,59 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     }
 
     return result;
+}
+
+// Fix round 2: deferred-install output (cleaner thread).  Writes `out` durably
+// (fsynced data, never renamed over anything) to a unique cleaned path; the
+// owner thread validates + installs it or deletes it.  An empty `out` = every
+// member's records were removed: no file, the owner drops the members.
+void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t>& bases,
+                               const std::vector<uint8_t>& out) {
+    CleanedGroup g;
+    g.bases = bases;
+    g.seq = static_cast<uint32_t>(++*deferredSeq_);
+    g.hasOutput = !out.empty();
+    if (g.hasOutput) {
+        // Fix round 3: the cleaner builds the COMPLETE segment so the owner's
+        // install is O(1) — CRC-verify every output batch, derive nextOffset and
+        // build the sparse index (the same rule as LogSegment::append/recover),
+        // then write both files fsynced.  The owner never re-reads them.
+        const int64_t outBase = bases.front();
+        std::vector<uint8_t> idx;
+        std::size_t pos = 0;
+        int64_t bytesSince = 0;
+        int64_t next = outBase;
+        while (pos < out.size()) {
+            rune::protocol::RecordBatchReader r(out.data() + pos, out.size() - pos);
+            const int32_t total = (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= out.size())
+                                      ? r.totalLength() : 0;
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > out.size() || !r.ensureValid())
+                throw std::runtime_error("LogCleaner: compacted output failed verification (segment " +
+                                         std::to_string(outBase) + ")");
+            if (bytesSince == 0 || bytesSince >= 4096) {
+                if (pos > static_cast<std::size_t>(INT32_MAX))
+                    throw std::runtime_error("LogCleaner: index position exceeds 2GiB limit");
+                const int32_t rel  = static_cast<int32_t>(r.baseOffset() - outBase);
+                const int32_t phys = static_cast<int32_t>(pos);
+                const std::size_t at = idx.size();
+                idx.resize(at + 8);
+                std::memcpy(idx.data() + at, &rel, 4);
+                std::memcpy(idx.data() + at + 4, &phys, 4);
+                bytesSince = 0;
+            }
+            bytesSince += total;
+            next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            pos += static_cast<std::size_t>(total);
+        }
+        g.nextOffset = next;
+        const std::string logOut = Log::cleanedLogPath(dir, outBase, g.seq);
+        const std::string idxOut = Log::cleanedIndexPath(dir, outBase, g.seq);
+        deferredWritten_.push_back(logOut);
+        writeFileDurable(logOut, out);
+        deferredWritten_.push_back(idxOut);
+        writeFileDurable(idxOut, idx);
+    }
+    deferredOut_->push_back(std::move(g));
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1414,7 @@ void LogCleaner::mergeGroupWithMap(
     tmpBatch.reserve(512);
     for (int64_t segBase : groupInPass) {
         ++rewriteSegmentsRead_;
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
         outBuf.reserve(outBuf.size() + buf.size());
@@ -1433,6 +1562,13 @@ void LogCleaner::mergeGroupWithMap(
     // (re-framing alone is not a logical change) — no rewrite, no enqueue.
     if (!modified) return;
     if (changed) *changed = true;
+    if (deferredOut_ != nullptr) {
+        // Fix round 2: hand the merged output (or the all-removed group) to the
+        // owner thread; the member files stay untouched until it validates.
+        deferInstall_(dir, groupInPass, outBuf);
+        if (throttler && !outBuf.empty()) throttler->maybeThrottle(static_cast<int64_t>(outBuf.size()));
+        return;
+    }
 
     if (outBuf.empty()) {
         // All records removed — delete every member segment.

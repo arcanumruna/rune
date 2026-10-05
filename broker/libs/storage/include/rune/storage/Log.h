@@ -348,7 +348,10 @@ public:
     /// The log's logEndOffset is reset to truncateOffset.
     /// Segments entirely beyond truncateOffset are deleted.
     /// The active segment is physically truncated at the correct byte boundary.
-    void truncateTo(int64_t truncateOffset);
+    /// Fix round 5: returns false (nothing done) when the cleaner has not yet
+    /// performed every posted file operation — retry on a later duty pass (the
+    /// replica parks in FollowerSync::TruncatePending; never waits).
+    [[nodiscard]] bool truncateTo(int64_t truncateOffset);
     std::vector<int64_t> segmentBaseOffsets() const;
     /// F15 S4 (I-C): the base offset of the first segment whose base is
     /// strictly above `offset`, or -1 if none.  Non-allocating, O(log segments);
@@ -371,14 +374,17 @@ public:
     };
     [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;
-    int deleteOldSegments(int64_t retainBytes);
+    /// Size retention: delete the oldest sealed segments until the log fits in
+    /// retainBytes — only segments that END at or below `highWatermark` (Kafka:
+    /// HW >= nextSegment.baseOffset), never the active one.
+    int deleteOldSegments(int64_t retainBytes, int64_t highWatermark = INT64_MAX);
     /// Directory that contains this log's segment files.
     const std::string& dir() const noexcept { return dir_; }
     [[nodiscard]] bool isDiskBacked() const noexcept { return true; }
     /// Reload all segments from disk (close + reopen every LogSegment).
     /// Used by LogCleaner after atomically rewriting segment files on disk,
     /// so that in-memory file handles reflect the new file contents.
-    void reloadSegments();
+    bool reloadSegments();   ///< false = deferred (see truncateTo)
     /// CP-2: reload a SINGLE sealed segment in place (close + reopen just that
     /// LogSegment) after its .log file was atomically rewritten by the cleaner.
     /// O(1) in the number of segments — avoids the O(n) full-log reloadSegments()
@@ -420,34 +426,87 @@ public:
     /// and the append thread's reloadSegment().
     /// Returns false (drops) only if the ring is momentarily full; the cleaner
     /// re-enqueues the same base next cycle (idempotent — reloadSegment is too).
-    bool enqueueCleanedSegment(int64_t base) noexcept;
+    /// `lineage` = the SegInfo::lineage the cleaner acted on (kAnyLineage skips
+    /// the check — tests / legacy callers).  The swap is dropped when the base
+    /// is now the ACTIVE segment or carries a different lineage (the cleaner
+    /// acted on a stale snapshot: a truncate rebuilt the segment meanwhile).
+    static constexpr uint64_t kAnyLineage = 0;
+    /// Max members of one deferred compaction group (== LogCleaner::kMaxDeferredGroupMembers).
+    static constexpr std::size_t kMaxGroupMembers = 64;
+    /// Fix round 2 file naming (shared with LogCleaner):
+    ///   <base20>.log.<seq>.cleaned — a cleaner output awaiting owner validation
+    ///                                (uncommitted: recovery deletes it);
+    ///   <base20>.log.<end>.swap    — a validated swap replacing every segment in
+    ///                                [base, end) (committed: recovery completes it).
+    static std::string cleanedLogPath(const std::string& dir, int64_t base, uint64_t seq);
+    static std::string swapLogPath(const std::string& dir, int64_t base, int64_t end);
+    ///   <base20>.index.<seq>.cleaned — the cleaner-built index of that output.
+    static std::string cleanedIndexPath(const std::string& dir, int64_t base, uint64_t seq);
+    /// One member of a deferred compaction group (cleaner thread → owner thread).
+    struct CleanedMember { int64_t base = 0; uint64_t lineage = kAnyLineage; };
+    /// Fix round 2 (Kafka-style replaceSegments on the owner thread): enqueue a
+    /// cleaner output for validation + install.  ALL members are claimed in the
+    /// ring at once (one release-store) so the owner sees the whole group or
+    /// nothing.  The owner installs it only if every member still exists with
+    /// the same lineage, none is the active segment, they are contiguous and
+    /// below the drain bound; otherwise it posts a rejection (the cleaner
+    /// deletes the output) and the originals stay untouched.  false = ring full (the caller deletes its
+    /// output and retries next pass).
+    /// `prebuilt` (fix round 4, ownership transferred on success): the output
+    /// opened by openCleanedOutput — the owner switches to it without any
+    /// filesystem operation.  nullptr with hasOutput = the owner rejects.
+    bool enqueueCleanedGroup(const CleanedMember* members, std::size_t n, uint64_t seq,
+                             bool hasOutput, int64_t nextOffset = 0,
+                             LogSegment* prebuilt = nullptr) noexcept;
+    /// LEGACY / tests only (no production caller since fix round 2): reload
+    /// `base` in place from a file a synchronous caller already replaced —
+    /// reloadSegment + recover() (re-read, CRC, index rebuild, fsync) on the
+    /// owner.  Production compaction uses enqueueCleanedGroup (O(1) install).
+    bool enqueueCleanedSegment(int64_t base, uint64_t lineage = kAnyLineage) noexcept;
 
-    /// CP-6: Drain pending cleaner swaps on the single-writer append/duty-cycle
-    /// thread.  Called once per duty cycle from NodeRuntimeAgent::doWork.
-    /// For each pending base calls reloadSegment(base) to atomically update the
-    /// in-memory segment map.  The superseded LogSegment is freed here (the map
-    /// slot is on the append thread; no reader can hold it after this call since
-    /// all reads also happen on the append thread — single-writer invariant).
+    /// CP-6: Drain pending cleaner swaps on the single-writer owner thread (once
+    /// per duty pass).  A deferred group is validated (metadata) and installed
+    /// with NO filesystem operation (fix round 4): the in-memory map switches to
+    /// the cleaner-opened handle and the renames / object destruction are posted
+    /// to the cleaner (runCleanerFileOps).  AT MOST ONE group per call; the rest
+    /// stay queued.  Legacy reload entries are reloaded (reloadSegment).
     ///
     /// Lock-free SPSC: this is the SINGLE-CONSUMER half.  The acquire-load of
-    /// tail_ pairs with enqueueCleanedSegment's release-store.
-    /// Returns number of swaps processed (>0 = work done).
-    int drainCleanerSwaps();
+    /// tail_ pairs with enqueueSwapSlots_'s release-store.
+    /// Returns number of ring slots consumed (>0 = work done).
+    /// `maxBaseBound` (fix round 2): a deferred group is installed only when every
+    /// member base is below it — the owner passes min(HW, LSO) (the cleaner
+    /// selected members strictly below both).  Legacy reload entries ignore it.
+    int drainCleanerSwaps(int64_t maxBaseBound = INT64_MAX);
+    /// Deferred groups rejected by validation (their output deleted).  Owner thread.
+    [[nodiscard]] uint64_t cleanerGroupsRejected() const noexcept { return cleanerGroupsRejected_; }
+    /// Cleaner thread: outputs it enqueued are not yet consumed by the owner.
+    [[nodiscard]] bool cleanerSwapsPending() const noexcept;
+    /// The lowest front base of a deferred group rejected since the last call
+    /// (INT64_MAX = none), then reset.  The owner rewinds the replica's clean
+    /// watermark to it: the rejected range was NOT compacted although the
+    /// cleaner already advanced past it.  Owner thread.
+    [[nodiscard]] int64_t takeCleanerRejectLowWater() noexcept {
+        const int64_t v = cleanerRejectLowWater_;
+        cleanerRejectLowWater_ = INT64_MAX;
+        return v;
+    }
 
     // -----------------------------------------------------------------------
     // CP-9: Retention async-delete API (single-writer invariant preserved).
     //
     // The cleaner agent (off the append thread) selects segments eligible for
-    // deletion, renames them to .deleted on disk (pure file work — OK on the
-    // cleaner thread), and enqueues the base via enqueueDeletedSegment().
+    // deletion and PROPOSES each (base, lineage) via enqueueDeletedSegment() —
+    // it never renames a live file (fix round 3).
     //
-    // The append/duty-cycle thread calls drainRetentionDeletes(), which erases
-    // the segment from segments_ (the ONLY mutation path, preserving the
-    // single-writer invariant).
+    // The owner calls drainRetentionDeletes(hw), which validates each proposal,
+    // renames <base>.log/.index → *.deleted and erases the segment from
+    // segments_ (the ONLY mutation path, preserving the single-writer invariant).
+    // Compaction installs also rename replaced files to *.deleted.
     //
-    // Physical removal of .deleted files is deferred: the cleaner calls
-    // physicallyRemoveExpiredDeletedFiles(nowMs, fileDeleteDelayMs) once per
-    // retention cycle to sweep any .deleted files whose rename time has elapsed.
+    // Physical removal of *.deleted files is deferred: the cleaner calls
+    // discoverDeletedFiles + physicallyRemoveExpiredDeletedFiles(nowMs,
+    // fileDeleteDelayMs) once per retention cycle.
     //
     // Crash-safety: Log construction scans for .deleted files left by a prior
     // crash and records them for immediate physical cleanup (they were already
@@ -455,20 +514,53 @@ public:
     // cannot be re-opened by a restart).
     // -----------------------------------------------------------------------
 
-    /// CP-9 SPSC producer (cleaner thread): enqueue a base for retention deletion.
-    /// The .log file has ALREADY been renamed to .deleted on disk (pure file
-    /// work done by the cleaner before calling this).
+    /// CP-9 SPSC producer (cleaner thread): PROPOSE a segment for retention
+    /// deletion (fix round 3: nothing on disk changes here — the owner validates
+    /// and renames the files in drainRetentionDeletes).
     /// Returns false (drops) if the ring is momentarily full; cleaner retries
     /// next cycle (idempotent — drainRetentionDeletes is a no-op for an unknown
     /// base).
-    bool enqueueDeletedSegment(int64_t base) noexcept;
+    /// `lineage`: the incarnation the cleaner saw — a proposal for the active
+    /// segment or a different lineage is dropped, never erasing live data.
+    bool enqueueDeletedSegment(int64_t base, uint64_t lineage = kAnyLineage) noexcept;
+    /// Cleaner work dropped because it named the active segment or a stale
+    /// lineage (MAJOR-2 observability).  Owner thread.
+    [[nodiscard]] uint64_t staleCleanerOpsDropped() const noexcept { return staleCleanerOps_; }
 
-    /// CP-9 SPSC consumer (append thread): drain retention-delete enqueues.
-    /// For each pending base, erases the segment from segments_ and updates the
-    /// sealed snapshot.  Called from NodeRuntimeAgent::doWork (same thread as
+    /// CP-9 SPSC consumer (owner thread): validate retention proposals; for each
+    /// valid one rename its files to *.deleted, erase it from segments_ and
+    /// update the sealed snapshot.  Called from NodeRuntimeAgent::doWork (same thread as
     /// all segments_ mutations).
     /// Returns number of segments erased from segments_.
-    int drainRetentionDeletes();
+    /// `maxEndBound` (fix round 3): a segment is deleted only if it ENDS at or
+    /// below it (the owner passes its HW).
+    int drainRetentionDeletes(int64_t maxEndBound = INT64_MAX);
+    /// Cleaner thread: schedule newly renamed *.deleted files for physical removal.
+    void discoverDeletedFiles(int64_t nowMs);
+    /// Fix round 4 (cleaner thread, once per cycle per log): perform the file
+    /// operations the owner posted (compaction renames, retention renames,
+    /// rejected-output deletion), destroy the segment objects it retired, fsync
+    /// the directory, and sweep expired *.deleted files.  Never waits: skips
+    /// the cycle if the owner holds the file-op token.  Returns operations done.
+    int runCleanerFileOps(int64_t nowMs, int64_t fileDeleteDelayMs = 0);
+    /// Owner: every posted file operation has been performed by the cleaner
+    /// (owner cold paths — truncate / reload / size retention — need it).
+    [[nodiscard]] bool fileOpsQuiescent() const noexcept;
+    /// Owner: try to start a cold path now (true = quiescent; the caller then
+    /// calls truncateTo / reloadSegments).  false = it is deferred and the
+    /// owner's drains post nothing until it runs or is cancelled.
+    [[nodiscard]] bool tryBeginColdPath() noexcept { return beginColdPath_(); }
+    /// Owner: a deferred cold path was abandoned (role change) — resume posting.
+    void cancelColdPathWait() noexcept { pauseSwapPost_ = pauseDropPost_ = false; }
+    /// Cleaner thread: posted operations not yet performed (a compaction pass
+    /// must not start on this log before they are — fix round 5).
+    [[nodiscard]] bool cleanerFileOpsPending() const noexcept;
+    /// Test / observability (cleaner thread).
+    void failNextCleanerApplyForTest() noexcept { failNextCleanerApplyForTest_ = true; }
+    [[nodiscard]] uint64_t checkpointWriteFailuresForTest() const noexcept { return checkpointWriteFailures_; }
+    /// Cleaner thread: open a finished output as a trusted sealed segment
+    /// (handed to the owner with enqueueCleanedGroup).  Throws on failure.
+    std::unique_ptr<LogSegment> openCleanedOutput(int64_t base, uint64_t seq, int64_t nextOffset) const;
 
     // -----------------------------------------------------------------------
     // Background segment pre-provisioning (append-p99 tail fix).
@@ -717,9 +809,31 @@ private:
     // consumer establishes happens-before with the cleaner's file rename.
     // Symmetrically head_ (release on consumer / acquire on producer) frees slots.
     // Capacity is a power of two so index masking is a bitwise AND.
-    static constexpr std::size_t kSwapRingCapacity = 1024; // power of two
+    static constexpr std::size_t kSwapRingCapacity = 256; // power of two (fix round 4: groups <= 64 members)
     static constexpr std::size_t kSwapRingMask     = kSwapRingCapacity - 1;
-    std::array<int64_t, kSwapRingCapacity> swapRing_{};
+    /// A swap-ring slot.  kind Reload = legacy in-place reload of `base` (file
+    /// already replaced by a synchronous / test caller).  kind Group = member of
+    /// a deferred group; the FIRST member carries groupSize, seq, hasOutput.
+    struct SegRef {
+        int64_t  base = 0;
+        uint64_t lineage = kAnyLineage;
+        int64_t  nextOffset = 0;  ///< group head + hasOutput: the output's nextOffset
+        uint32_t seq = 0;         ///< output name (unique among in-flight outputs)
+        uint16_t groupSize = 0;   ///< 0 = legacy Reload entry; >0 on a group's first slot
+        bool     hasOutput = false;
+        LogSegment* prebuilt = nullptr;   ///< group head + hasOutput: the cleaner-opened output (fix round 4)
+    };   // 40 bytes
+    uint64_t cleanerGroupsRejected_ = 0;
+    int64_t  cleanerRejectLowWater_ = INT64_MAX;   ///< see takeCleanerRejectLowWater()
+    /// Validate + install one deferred group (slots [first, first+n)).  Owner thread.
+    bool applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound);
+    /// Construction: delete uncommitted .cleaned outputs, complete committed .swap files.
+    void recoverCleanerSwapFiles();
+    /// The single SPSC producer path of the swap ring (n slots, one release-store).
+    bool enqueueSwapSlots_(const SegRef* refs, std::size_t n) noexcept;
+    /// Consumer body of drainCleanerSwaps over the published slots [head, tail).
+    int drainSwapSlots_(std::size_t head, std::size_t tail, int64_t maxBaseBound);
+    std::array<SegRef, kSwapRingCapacity> swapRing_{};
     alignas(64) std::atomic<std::size_t>   swapHead_{0}; // consumer index
     alignas(64) std::atomic<std::size_t>   swapTail_{0}; // producer index
 
@@ -727,11 +841,91 @@ private:
     // compaction swaps with retention deletes; they have different semantics).
     // Producer = cleaner thread (enqueueDeletedSegment, after .log→.deleted rename).
     // Consumer = append/duty-cycle thread (drainRetentionDeletes → segments_.erase).
-    static constexpr std::size_t kDeleteRingCapacity = 1024;
+    static constexpr std::size_t kDeleteRingCapacity = 256;
     static constexpr std::size_t kDeleteRingMask     = kDeleteRingCapacity - 1;
-    std::array<int64_t, kDeleteRingCapacity> deleteRing_{};
+    std::array<SegRef, kDeleteRingCapacity> deleteRing_{};
+    uint64_t staleCleanerOps_ = 0;   ///< see staleCleanerOpsDropped() (owner thread)
+    /// MAJOR-2: true when queued cleaner work for `base`/`lineage` may act — the
+    /// segment exists, is NOT the active one, and (unless kAnyLineage) is the
+    /// same incarnation the cleaner saw.  Owner thread.
+    bool cleanerOpApplies_(SegMap::iterator it, uint64_t lineage) noexcept;
     alignas(64) std::atomic<std::size_t>    deleteHead_{0}; // consumer index
     alignas(64) std::atomic<std::size_t>    deleteTail_{0}; // producer index
+
+    // ---- Fix round 4: owner → cleaner file-operation channel ----------------
+    // The OWNER never touches the filesystem in a duty pass: it switches its
+    // in-memory segments and posts what the files must become; the cleaner
+    // performs the renames (+ directory fsync) and destroys the retired segment
+    // objects (close / munmap — size-dependent costs) off the hot path.
+    enum class MsgKind : uint8_t { SwapAccepted = 1, SwapRejected = 2, RetentionDrop = 3, Dispose = 4 };
+    struct CleanerMsg {
+        int64_t     base = 0;
+        int64_t     end = 0;             ///< SwapAccepted: the group's exclusive end
+        int64_t     logStartAfter = -1;  ///< RetentionDrop: the log start once applied
+        LogSegment* obj = nullptr;       ///< object handed over (destroyed by the consumer)
+        uint32_t    seq = 0;
+        uint16_t    n = 0;               ///< SwapAccepted: number of Dispose slots that follow
+        MsgKind     kind = MsgKind::Dispose;
+        bool        hasOutput = false;
+        uint8_t     reason = 0;          ///< SwapRejected: RejectReason (logged by the cleaner)
+    };   // 40 bytes
+    static constexpr std::size_t kMsgRingCapacity = 512;   // >= kSwapRingCapacity + 1
+    static int64_t readLogStartCheckpoint(const std::string& dir);
+    static constexpr std::size_t kMsgRingMask     = kMsgRingCapacity - 1;
+    std::array<CleanerMsg, kMsgRingCapacity> msgRing_{};
+    alignas(64) std::atomic<std::size_t> msgHead_{0};   // consumer index (cleaner; ~Log once it stopped)
+    alignas(64) std::atomic<std::size_t> msgTail_{0};   // producer index (owner)
+    /// Fix round 5 (no lock, no wait): the ONLY renames / unlinks of live
+    /// segment names are the posted operations, performed by the cleaner.  An
+    /// owner COLD path (truncate / reload / size retention) runs only when every
+    /// posted operation has been performed (fileOpsQuiescent: head == tail,
+    /// acquire) — the owner posts nothing while it waits (coldPathWanted_), so
+    /// the cold path then owns every name.  Otherwise it is deferred to a later
+    /// duty pass (PartitionReplica: FollowerSync TruncatePending).
+    /// A deferred cold path pauses the NEXT swap drain and the NEXT retention
+    /// drain (one each, then cleared): a waiter that retries every pass
+    /// (FollowerSync::TruncatePending) re-arms it each pass; a one-shot caller
+    /// never stalls posting for longer than one pass.
+    bool pauseSwapPost_ = false;
+    bool pauseDropPost_ = false;
+    /// Persisted log start (log-start-offset-checkpoint).  Written by the cleaner
+    /// while applying posted drops, or by the owner's quiescent cold path; the
+    /// msg ring's release/acquire orders the two.
+    int64_t persistedLogStart_ = 0;
+    /// Cleaner → owner: errno of a failed log-start checkpoint write (0 = none).
+    /// The owner fails the log (markStorageFailed) on its next drain.
+    alignas(64) std::atomic<int> cleanerFailedErrno_{0};
+    bool failNextCleanerApplyForTest_ = false;   ///< test seam (cleaner thread)
+    uint64_t checkpointWriteFailures_ = 0;       ///< cleaner thread
+    /// Owner: room for `n` messages?  (single producer; head acquire)
+    bool msgRoom_(std::size_t n) const noexcept;
+    /// Owner: publish `n` messages with ONE release-store (room checked first).
+    void postMsgs_(const CleanerMsg* m, std::size_t n) noexcept;
+    /// msgRing_ consumer (cleaner; or ~Log after the cleaner stopped): perform
+    /// the posted operations in order.  `durable` = the renames happen (false
+    /// only for a simulated crash: objects freed, disk untouched).  Stops — and
+    /// retries next cycle — before a retention drop whose log-start checkpoint
+    /// could not be written, or at an exception (head = the first unfinished
+    /// message).  Returns whether any directory entry changed.
+    bool applyCleanerMsgs_(int64_t nowMs, bool durable);
+    /// Body of applyCleanerMsgs_: performs [i, tail), advancing i past each
+    /// finished message (left at the first unfinished one on a stop / throw).
+    bool applyCleanerMsgRange_(std::size_t& i, std::size_t tail, int64_t nowMs, bool durable);
+    int rejectLogBudget_ = 64;   ///< cleaner thread: rejection log lines per Log (rate limit)
+    /// Why the owner rejected a cleaner output (logged by the cleaner).
+    enum class RejectReason : uint8_t { FrontGone = 1, NotContiguous, Active, Lineage, AboveBound,
+                                        RenamePending, FlushInFlight, RecoveryPoint, BadOutput };
+    /// Owner: may a cold path run now?  true = every posted operation is done
+    /// (and coldPathWanted_ is cleared); false = deferred (posting paused).
+    bool beginColdPath_() noexcept;
+    /// Owner drains (swap / retention): false while a cold path waits for the
+    /// cleaner to drain the msg ring (posting would starve it).  Also surfaces a
+    /// cleaner checkpoint failure as a storage failure.
+    bool ownerDrainAllowed_(bool& pause) noexcept;
+    /// Cleaner (or owner cold path when quiescent): write log-start-offset-checkpoint (tmp + fsync + rename + dir fsync).
+    bool writeLogStartCheckpoint_(int64_t v);
+    static constexpr const char* kLogStartFile    = "log-start-offset-checkpoint";
+    static constexpr const char* kLogStartTmpFile = "log-start-offset-checkpoint.tmp";
 
     // CP-9: deferred physical-removal list — pairs of (deletedFilePath, renamedAtMs).
     // Written by the cleaner (recordDeletedFile) and read/cleared by

@@ -803,14 +803,20 @@ TEST(CompactionRetentionSmoke, CompactDelete_BothRun_NoDoubleDelete) {
 
     rune::node::BrokerNode node{cfg};
     node.start();
-    ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke4: must self-elect";
-    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
-        << "Smoke4: replication bridge must propagate within 2 s";
+    // Fix round 6 (N5-LOW-4): condition-driven — generous deadlines, no fixed sleep.
+    ASSERT_TRUE(node.awaitLeader(30s)) << "Smoke4: must self-elect";
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 30s))
+        << "Smoke4: replication bridge must propagate";
 
-    // HW advanced by becomeLeader() on duty-cycle thread.
-    // No test-thread replica calls (duty-thread-only invariant).
-
-    std::this_thread::sleep_for(2500ms);
+    // HW advanced by becomeLeader() on duty-cycle thread.  The live-record count
+    // is read on the replica's OWNING thread (duty-thread-only invariant).
+    auto liveNow = [&node] {
+        return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) {
+            return countLiveRecords(*r.log());
+        });
+    };
+    EXPECT_TRUE(waitFor([&] { return liveNow() <= 5 * 3; }, 60s))
+        << "Smoke4: compaction + retention never brought the log down to the recent records";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();
@@ -1533,24 +1539,11 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
     {
         Log rawLog(logDir, kRoll);
 
-        // Write enough RECENT records to fill >= 2 sealed segments.
-        // Each batch is ~80 bytes with kRoll=128 → ~1-2 batches seal a segment.
-        // Write 20 records to guarantee >= 2 sealed segments with recent timestamps.
-        for (int i = 0; i < 20; ++i) {
-            auto b = makeSmokeKey(totalOffset,
-                                  "rk" + std::to_string(i),
-                                  "rv" + std::to_string(i),
-                                  nowMs);
-            rawLog.append(b, totalOffset);
-            ++totalOffset;
-        }
-        // Capture sealed-segment count after RECENT writes (exclude active).
-        // segmentBaseOffsets() includes ALL segments; active is the last one.
-        // recentSealedCount = size - 1 (active is always included in size).
-        recentSealedCount = static_cast<int>(rawLog.segmentBaseOffsets().size()) - 1;
-
-        // Write OLD records to fill >= 1 sealed segment with ancient timestamps.
-        // ts=1ms = 1970-01-01 00:00:00.001 UTC — guaranteed ancient.
+        // Fix round 5 (N4-LOW-2, Kafka): time retention deletes only a PREFIX of
+        // the log — the OLD segments must come first (a recent segment in front
+        // of them keeps them, exactly as Kafka's deletableSegments stops at the
+        // first non-expired segment).
+        // OLD records first: ts=1ms = 1970-01-01 00:00:00.001 UTC — ancient.
         for (int i = 0; i < 10; ++i) {
             auto b = makeSmokeKey(totalOffset,
                                   "ok" + std::to_string(i),
@@ -1559,28 +1552,25 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
             rawLog.append(b, totalOffset);
             ++totalOffset;
         }
-        // Capture how many ADDITIONAL sealed segments were created during OLD writes.
-        const int afterOldTotal = static_cast<int>(rawLog.segmentBaseOffsets().size());
-        // These additional seals are old-data segments:
-        oldSealedCount = (afterOldTotal - 1) - recentSealedCount;
-        // (afterOldTotal - 1 = total sealed count; subtract recentSealedCount)
+        const int64_t firstRecent = totalOffset;
 
-        // Write one more RECENT record into the active segment.  This seals the
-        // last OLD-timestamp segment and keeps the active segment with recent data.
-        // The active segment is NEVER deleted by retention.
-        {
-            auto b = makeSmokeKey(totalOffset, "anchor", "active", nowMs);
+        // Then RECENT records (ts = nowMs): >= 2 sealed segments + the active one.
+        for (int i = 0; i < 20; ++i) {
+            auto b = makeSmokeKey(totalOffset,
+                                  "rk" + std::to_string(i),
+                                  "rv" + std::to_string(i),
+                                  nowMs);
             rawLog.append(b, totalOffset);
             ++totalOffset;
         }
-
-        // After the anchor, any OLD-data active-at-that-moment gets sealed.
-        // Recompute oldSealedCount to include any seals triggered by the anchor.
-        const int finalTotal = static_cast<int>(rawLog.segmentBaseOffsets().size());
+        const auto bases = rawLog.segmentBaseOffsets();
+        const int finalTotal = static_cast<int>(bases.size());
         totalSegs = finalTotal;
-        // All sealed = finalTotal - 1; recent sealed = recentSealedCount;
-        // old sealed = finalTotal - 1 - recentSealedCount.
-        oldSealedCount = (finalTotal - 1) - recentSealedCount;
+        // Purely-old sealed segments: those ending at or below the first recent offset.
+        oldSealedCount = 0;
+        for (std::size_t i = 0; i + 1 < bases.size(); ++i)
+            if (bases[i + 1] <= firstRecent) ++oldSealedCount;
+        recentSealedCount = (finalTotal - 1) - oldSealedCount;
 
         ASSERT_GE(totalSegs, 3)
             << "Smoke11: need >= 3 total segments "
@@ -1607,14 +1597,21 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 
     rune::node::BrokerNode node{cfg};
     node.start();
-    ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke11: must self-elect";
-    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
-        << "Smoke11: replication bridge must propagate within 2 s";
+    // Condition-driven waits only (fix round 1 LOW-4: the fixed 2 s sleep and the
+    // 3 s leader bound flaked under parallel ctest load).  The bounds are
+    // generous deadlines, not expected durations.
+    ASSERT_TRUE(node.awaitLeader(30s)) << "Smoke11: must self-elect";
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 30s))
+        << "Smoke11: replication bridge must propagate";
     // HW advanced by becomeLeader() on duty-cycle thread (no test-thread replica
     // calls — duty-thread-only invariant; single-node HW == LEO after becomeLeader).
 
-    // Wait for retention to run (retentionCheckMs=1 → fires on first doWork()).
-    std::this_thread::sleep_for(2000ms);
+    // Wait until retention ran (retentionCheckMs=1 → fires on the first cycles):
+    // an old segment's .log is renamed away.  Arm B below re-checks the count
+    // after stop(); Arm A proves the recent segments survived.
+    // (Deadline well inside the 60 s retention window of the RECENT segments.)
+    EXPECT_TRUE(waitFor([&] { return countLogFiles(logDir) < totalSegs; }, 30s))
+        << "Smoke11: time retention never deleted an old segment";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();

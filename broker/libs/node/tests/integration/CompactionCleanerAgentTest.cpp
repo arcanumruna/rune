@@ -908,7 +908,7 @@ TEST(CompactionCleanerAgent, SwapSafeUnderRoleChangeAndTruncation) {
     if (leoNow > hw) {
         // Truncate the uncommitted tail — this is above HW (disjoint from
         // the compacted sealed segments which are all below HW).
-        log.truncateTo(hw);
+        EXPECT_TRUE(log.truncateTo(hw));
 
         // After truncation, the sealed segments must all still have base < hw.
         auto basesAfterTrunc = log.segmentBaseOffsets();
@@ -2681,7 +2681,10 @@ TEST(LogCleanerAgentLsoRegression, CleanableRangeCappedAtPublishedLso) {
 
     // The transaction resolves: the LSO lifts → the cleaner converges past it.
     replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
-    for (int i = 0; i < kCycles; ++i) {
+    // Fix round 3: the owner installs ONE compaction output per duty pass (O(1)
+    // each), so a pass with many single-segment outputs takes many duty passes
+    // — drive until the range above the LSO is cleaned (bounded, no sleeps).
+    for (int i = 0; i < 4000 && (i % 16 != 0 || liveAtOrAbove(kLso) == kRecords - kLso); ++i) {
         cleaner.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
         duty.doWork(static_cast<int64_t>(kCycles + i) * 1'000'000LL);
     }
@@ -3093,4 +3096,319 @@ TEST(CompactionCleanerAgentRegression, NeverCompactsAboveRecoveryPoint) {
     EXPECT_TRUE(!fs::exists(segFile(bases[0])) || fs::file_size(segFile(bases[0])) < size0)
         << "positive control: the segment below R compacts";
     fs::remove_all(dir);
+}
+
+// ===========================================================================
+// 2026-10-05 log-truncate review, fix round 2: the cleaner thread replaced the
+// segment files ITSELF before the owner thread validated the swap.  An
+// (unclean-election) truncate below the HW between the cleaner pass and the
+// drain then rebuilt the segment FROM THE COMPACTED FILE: a record whose only
+// superseding copy was truncated away (A=v1 superseded by A=v2@4, truncated) was
+// gone — data loss, also across restart.  Now the cleaner only writes a
+// .cleaned output; the owner validates (lineage / not active / below HW) and
+// installs it or deletes it — the original segment is never touched.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, StaleSwapAfterTruncateBelowHwLeavesOriginalDataReadableRegression) {
+    auto dir = cp6TempDir("fr2_stale_swap");
+    auto firstRecord = [](Log& l, int64_t off, std::string& key, std::string& val) {
+        const auto bytes = l.read(off, 1 << 20);
+        if (bytes.empty()) return int64_t{-1};
+        RecordBatchReader r(bytes.data(), bytes.size());
+        int64_t got = -1;
+        r.forEach([&](std::string_view k, std::string_view v, int64_t o, int64_t) {
+            if (got < 0) { got = o; key = std::string(k); val = std::string(v); }
+        });
+        return got;
+    };
+    {
+        Log log(dir.string(), /*rollBytes=*/100);   // two one-record batches per segment
+        log.append(cp6Batch(0, "A", "v1"), 0);
+        log.append(cp6Batch(1, "B", "b"), 1);
+        log.append(cp6Batch(2, "C", "c"), 2);
+        log.append(cp6Batch(3, "D", "d"), 3);
+        log.append(cp6Batch(4, "A", "v2"), 4);    // supersedes A=v1
+        log.append(cp6Batch(5, "E", "e"), 5);
+        log.append(cp6Batch(6, "F", "f"), 6);     // active segment 6
+        ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 4, 6}));
+        Cp6NullTransport transport;
+        auto owned = std::make_unique<PartitionReplica>(
+            makeCompactConfig(780), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1},
+            &log, &transport);
+        owned->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+        owned->becomeLeader(1, {1});
+        owned->onLeaderLogAppended();
+        PartitionReplica* replica = owned.get();
+        rune::node::ReplicaRegistry registry;
+        registry.add(780, 0, std::move(owned));
+        Cp6MinimalConsensusAgent dummy;
+        rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+        rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0);
+        duty.doWork(1'000'000);                      // publish the cleaner-visible HW
+        ASSERT_GE(replica->cleanerHighWatermark(), 6);
+        ASSERT_GT(cleaner.doWork(2'000'000), 0) << "precondition: the pass compacted (A=v1 superseded)";
+
+        // Unclean election: the log is truncated BELOW the old HW before the
+        // owner drains the swap — segment 0 is rebuilt as the active segment.
+        EXPECT_TRUE(log.truncateTo(2));
+        log.drainCleanerSwaps();
+
+        std::string k, v;
+        ASSERT_EQ(firstRecord(log, 0, k, v), 0) << "offset 0 lost";
+        EXPECT_EQ(k, "A");
+        EXPECT_EQ(v, "v1");
+        EXPECT_EQ(log.logEndOffset(), 2);
+    }
+    for (auto& e : fs::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        EXPECT_EQ(name.find(".cleaned"), std::string::npos) << "stray cleaner output " << name;
+        EXPECT_EQ(name.find(".swap"), std::string::npos) << "stray swap file " << name;
+    }
+    {   // ...and across restart.
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        std::string k, v;
+        ASSERT_EQ(firstRecord(log, 0, k, v), 0) << "offset 0 lost after restart";
+        EXPECT_EQ(k, "A");
+        EXPECT_EQ(v, "v1");
+        EXPECT_EQ(log.logEndOffset(), 2);
+    }
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 3 (N-MEDIUM-1): the owner's watermark rewind (rejected outputs) was
+// a plain store into lastCleanOffset_, overwritten by a concurrent cleaner
+// pass's passEnd store.  Now the cleaner stays the single writer; the owner
+// publishes a rewind the cleaner folds in after its own store.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, OwnerRewindSurvivesConcurrentCleanerPassRegression) {
+    auto dir = cp6TempDir("fr3_rewind");
+    Log log(dir.string(), 1 << 20);
+    Cp6NullTransport transport;
+    PartitionReplica r(makeCompactConfig(781), Role::Leader, 1, {1}, {1}, &log, &transport);
+    r.setLastCleanOffset(10);          // pass N stored passEnd_N
+    r.requestCleanerRewind(4);         // owner rejects pass N's group at base 4
+    r.setLastCleanOffset(20);          // pass N+1 (read 10 before the rewind) stores passEnd_{N+1}
+    r.applyCleanerRewind();            // ...and folds the published rewind in
+    EXPECT_EQ(r.lastCleanOffset(), 4) << "the rewind was overwritten";
+    // Two rejections before the cleaner looks: the lower one wins.
+    r.setLastCleanOffset(30);
+    r.requestCleanerRewind(12);
+    r.requestCleanerRewind(7);
+    r.applyCleanerRewind();
+    EXPECT_EQ(r.lastCleanOffset(), 7);
+    // Acknowledged: a later pass is not rewound again.
+    r.setLastCleanOffset(40);
+    r.applyCleanerRewind();
+    EXPECT_EQ(r.lastCleanOffset(), 40);
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 5 (N4-CRITICAL-1, the reviewer's probe): the owner accepted a
+// merged group (in memory) but the cleaner had not yet run its renames when the
+// next compaction pass started — the pass read the OLD <b1>.log by path while
+// the snapshot said b1 spans the merged range, and the install dropped every
+// record of the merged members (3/19 keys survived).
+// ===========================================================================
+// N5-LOW-3: the injected-failure variant — the gate's own file-ops run THROWS,
+// so only the cleanerFileOpsPending() check keeps the pass off the stale file.
+static void passAfterOwnerAcceptBeforeRenames(bool injectFailure);
+TEST(CompactionCleanerAgentRegression, PassAfterOwnerAcceptBeforeRenamesLosesNoKeyRegression) {
+    passAfterOwnerAcceptBeforeRenames(/*injectFailure=*/false);
+}
+TEST(CompactionCleanerAgentRegression, PassAfterOwnerAcceptWithFailingFileOpsLosesNoKeyRegression) {
+    passAfterOwnerAcceptBeforeRenames(/*injectFailure=*/true);
+}
+static void passAfterOwnerAcceptBeforeRenames(bool injectFailure) {
+    auto dir = cp6TempDir("fr5_accept_then_pass");
+    Log log(dir.string(), /*rollBytes=*/128);
+    std::map<std::string, std::string> latest;
+    int64_t next = 0;
+    auto put = [&](const std::string& k, const std::string& v) {
+        log.append(cp6Batch(next, k, v), next);
+        latest[k] = v;
+        ++next;
+    };
+    for (int o = 0; o < 40; ++o) put(o % 2 == 0 ? "dup" : "u" + std::to_string(o), "v" + std::to_string(o));
+    Cp6NullTransport transport;
+    auto owned = std::make_unique<PartitionReplica>(
+        makeCompactConfig(782), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    owned->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    owned->becomeLeader(1, {1});
+    owned->onLeaderLogAppended();
+    PartitionReplica* replica = owned.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(782, 0, std::move(owned));
+    Cp6MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0, -1, -1, /*useCoalescing=*/true, 1 << 20);
+    cleaner.setSkipCycleFileOpsForTest(true);   // the owner's accept lands right before the next pass
+    int64_t t = 1'000'000;
+    duty.doWork(t);
+    ASSERT_GT(cleaner.doWork(t), 0) << "precondition: pass 1 merged the sealed prefix";
+    duty.doWork(t);                               // the owner accepts the group (renames still posted)
+    ASSERT_TRUE(log.cleanerFileOpsPending()) << "precondition: accepted, not yet renamed";
+    for (int o = 0; o < 10; ++o) put("u1", "w" + std::to_string(o));
+    replica->onLeaderLogAppended();
+    duty.doWork(t += 1'000'000);
+    if (injectFailure) log.failNextCleanerApplyForTest();   // the gate's drain throws
+    (void)cleaner.doWork(t);                      // pass 2 — must never read the stale <b1>.log
+    cleaner.setSkipCycleFileOpsForTest(false);
+    for (int i = 0; i < 400; ++i) {
+        t += 1'000'000;
+        duty.doWork(t);
+        (void)cleaner.doWork(t);
+    }
+    duty.doWork(t + 1);
+    (void)cleaner.doWork(t + 1);
+    ASSERT_TRUE(log.fileOpsQuiescent());
+    ASSERT_TRUE(log.reloadSegments());
+    std::map<std::string, std::string> found;
+    for (int64_t o = 0; o < next; ++o) {
+        const auto bytes = log.read(o, 1 << 20);
+        if (bytes.empty()) continue;
+        RecordBatchReader r(bytes.data(), bytes.size());
+        if (r.baseOffset() != o || !r.ensureValid()) continue;
+        r.forEach([&](std::string_view k, std::string_view v, int64_t, int64_t) { found[std::string(k)] = std::string(v); });
+    }
+    for (const auto& [k, v] : latest) EXPECT_EQ(found[k], v) << "key " << k << " lost its latest value";
+    EXPECT_EQ(found.size(), latest.size());
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 5 (N4-MEDIUM-1): a KIP-279 divergence truncation that lands while
+// the log cleaner still has posted renames pending parks the follower in
+// FollowerSync::TruncatePending (no wait, no fetch, no apply) and completes on
+// a later duty pass once the cleaner caught up — also after a cleaner throw.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, DivergenceTruncationDefersToTruncatePendingRegression) {
+    auto dir = cp6TempDir("fr5_truncate_pending");
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t o = 0; o < 9; ++o) log.append(cp6Batch(o, "k" + std::to_string(o), "v"), o);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(783);
+    PartitionReplica follower(cfg, Role::Follower, 1, {1, 2}, {1, 2}, &log, &transport);
+    follower.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    // An accepted compaction output whose renames are still posted.
+    {
+        const auto snap = log.sealedSegmentSnapshot();
+        const int64_t b = (*snap)[1].baseOffset;   // segment 2 = [2,4)
+        std::filesystem::copy_file(log.segmentForTest(b)->logPath(), Log::cleanedLogPath(log.dir(), b, 51));
+        std::string idx = log.segmentForTest(b)->logPath();
+        idx = idx.substr(0, idx.size() - 4) + ".index";
+        std::filesystem::copy_file(idx, Log::cleanedIndexPath(log.dir(), b, 51));
+        const Log::CleanedMember m[] = {{b, (*snap)[1].lineage}};
+        ASSERT_TRUE(log.enqueueCleanedGroup(m, 1, 51, true, b + 2, log.openCleanedOutput(b, 51, b + 2).release()));
+        ASSERT_EQ(log.drainCleanerSwaps(), 1);
+        ASSERT_TRUE(log.cleanerFileOpsPending());
+    }
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 2;
+    resp.partition   = 0;
+    resp.topicId     = 783;
+    resp.errorCode   = rune::replication::kErrDivergingEpoch;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records     = epb.set(/*epoch=*/1, /*endOffset=*/5);
+    follower.applyReplicated(resp);
+    EXPECT_TRUE(follower.truncatePendingForTest());
+    EXPECT_EQ(follower.truncatesDeferred(), 1u);
+    EXPECT_EQ(log.logEndOffset(), 9) << "nothing truncated yet";
+    // Data arriving meanwhile is dropped (it would extend the diverged tail).
+    const auto data = cp6Batch(9, "late", "x");
+    FetchResponseMsg dataResp{};
+    dataResp.leaderEpoch = 2; dataResp.partition = 0; dataResp.topicId = 783;
+    dataResp.records = std::span<const uint8_t>(data.data(), data.size());
+    follower.applyReplicated(dataResp);
+    EXPECT_EQ(follower.appliesDroppedTruncatePending(), 1u);
+    EXPECT_EQ(log.logEndOffset(), 9);
+    // Duty passes while the cleaner has not run (or throws): still pending, no wait.
+    (void)follower.doWork(10'000'000);
+    EXPECT_TRUE(follower.truncatePendingForTest());
+    log.failNextCleanerApplyForTest();
+    (void)log.runCleanerFileOps(0);
+    (void)follower.doWork(20'000'000);
+    EXPECT_TRUE(follower.truncatePendingForTest());
+    (void)log.runCleanerFileOps(0);           // the cleaner catches up
+    (void)follower.doWork(30'000'000);        // the owner completes it
+    EXPECT_FALSE(follower.truncatePendingForTest());
+    EXPECT_EQ(log.logEndOffset(), 5);
+    fs::remove_all(dir);
+}
+
+
+// ===========================================================================
+// Fix round 6 (N5-MEDIUM-1): a TruncatePending follower on log B must not wait
+// for a whole (throttled) compaction pass of an unrelated log A — the cleaner
+// performs B's posted file ops at A's pass segment / throttle-slice boundaries.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, TruncateOfOtherLogCompletesDuringThrottledPassRegression) {
+    // Log A: a compact-topic leader with plenty of dirty data, cleaned at a
+    // throttled rate so its pass lasts seconds.
+    auto dirA = cp6TempDir("fr6_throttled_a");
+    Log logA(dirA.string(), /*rollBytes=*/4096);
+    const std::string big(400, 'x');
+    for (int64_t o = 0; o < 200; ++o) logA.append(cp6Batch(o, "k" + std::to_string(o % 8), big), o);
+    Cp6NullTransport transport;
+    auto ownedA = std::make_unique<PartitionReplica>(
+        makeCompactConfig(784), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logA, &transport);
+    ownedA->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    ownedA->becomeLeader(1, {1});
+    ownedA->onLeaderLogAppended();
+    // Log B: a follower whose divergence truncation is pending on posted renames.
+    auto dirB = cp6TempDir("fr6_pending_b");
+    Log logB(dirB.string(), /*rollBytes=*/100);
+    for (int64_t o = 0; o < 9; ++o) logB.append(cp6Batch(o, "b" + std::to_string(o), "v"), o);
+    auto ownedB = std::make_unique<PartitionReplica>(
+        makeCompactConfig(785), Role::Follower, 1, std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &logB, &transport);
+    PartitionReplica* B = ownedB.get();
+    B->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    {
+        const auto snap = logB.sealedSegmentSnapshot();
+        const int64_t b = (*snap)[1].baseOffset;
+        std::filesystem::copy_file(logB.segmentForTest(b)->logPath(), Log::cleanedLogPath(logB.dir(), b, 61));
+        std::string idx = logB.segmentForTest(b)->logPath();
+        idx = idx.substr(0, idx.size() - 4) + ".index";
+        std::filesystem::copy_file(idx, Log::cleanedIndexPath(logB.dir(), b, 61));
+        const Log::CleanedMember m[] = {{b, (*snap)[1].lineage}};
+        ASSERT_TRUE(logB.enqueueCleanedGroup(m, 1, 61, true, b + 2, logB.openCleanedOutput(b, 61, b + 2).release()));
+        ASSERT_EQ(logB.drainCleanerSwaps(), 1);
+    }
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 2; resp.partition = 0; resp.topicId = 785;
+    resp.errorCode = rune::replication::kErrDivergingEpoch;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records = epb.set(1, 5);
+    B->applyReplicated(resp);
+    ASSERT_TRUE(B->truncatePendingForTest());
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(784, 0, std::move(ownedA));
+    registry.add(785, 0, std::move(ownedB));
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0, -1,
+                                        /*ioMaxBytesPerSec=*/64 * 1024);
+    // Only A's pass boundaries may drain B (not the top-of-cycle file ops).
+    cleaner.setSkipCycleFileOpsForTest(true);
+    Cp6MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    duty.doWork(1'000'000);   // publish A's cleaner-visible HW (B: pending, no fetch)
+
+    std::atomic<bool> passDone{false};
+    std::atomic<int>  passWork{0};
+    std::thread cleanerThread([&] { passWork = cleaner.doWork(2'000'000); passDone = true; });
+    bool completedDuringPass = false;
+    int64_t t = 3'000'000;
+    // B's owner loop (this thread): no sleep, just duty passes until it completes.
+    while (!passDone.load()) {
+        (void)B->doWork(t += 1'000);
+        if (!B->truncatePendingForTest()) { completedDuringPass = !passDone.load(); break; }
+        std::this_thread::yield();
+    }
+    cleanerThread.join();
+    EXPECT_GT(passWork.load(), 0) << "precondition: A's throttled pass ran";
+    EXPECT_TRUE(completedDuringPass) << "B's truncation waited for A's whole throttled pass";
+    EXPECT_EQ(logB.logEndOffset(), 5);
+    fs::remove_all(dirA);
+    fs::remove_all(dirB);
 }

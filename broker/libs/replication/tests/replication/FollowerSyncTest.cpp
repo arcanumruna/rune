@@ -410,3 +410,24 @@ TEST(FollowerSyncRegression, ForceBehindFromBehindClearsOutstandingFetch) {
     EXPECT_TRUE(retry.emit);
     EXPECT_TRUE(retry.wantData);
 }
+
+// Fix round 5/6: TruncatePending holds the target, emits nothing, ignores
+// responses, and (N5-LOW-1) drops an owed fast-ack — the diverged LEO is never
+// reported; reset() (role change / completion) leaves it.
+TEST(FollowerSyncRegression, TruncatePendingEmitsNothingAndDropsOwedAckRegression) {
+    FollowerSync fs;
+    fs.onAckRefused();
+    ASSERT_TRUE(fs.ackOwed());
+    fs.enterTruncatePending(42);
+    EXPECT_TRUE(fs.truncatePending());
+    EXPECT_EQ(fs.truncateTarget(), 42);
+    EXPECT_FALSE(fs.ackOwed()) << "an owed fast-ack would report the diverged LEO";
+    const Action a = fs.decide(1'000'000'000, 1, 1, 1);
+    EXPECT_FALSE(a.emit);
+    fs.onResponse(/*hadRecords=*/true, 7);
+    fs.forceBehind();
+    EXPECT_TRUE(fs.truncatePending());
+    fs.reset();
+    EXPECT_FALSE(fs.truncatePending());
+    EXPECT_EQ(fs.state(), State::Behind);
+}

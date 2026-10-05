@@ -2,6 +2,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <algorithm>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <cstdint>
@@ -35,6 +36,28 @@ std::string LogSegment::fname(std::string dir, int64_t base, const char* ext) {
 // ---------------------------------------------------------------------------
 // Background pre-provisioning (append-p99 fix).
 // ---------------------------------------------------------------------------
+std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
+    const std::string& dir, int64_t base, const std::string& logFile, const std::string& indexFile,
+    int64_t nextOffset, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
+    auto seg = std::unique_ptr<LogSegment>(new LogSegment());
+    seg->baseOffset_         = base;
+    seg->indexIntervalBytes_ = indexIntervalBytes;
+    seg->indexMaxBytes_      = indexMaxBytes;
+    seg->nextOffset_         = base;
+    seg->durableNext_        = base;
+    seg->log_.open(logFile, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+    if (!seg->log_.is_open())
+        throw std::runtime_error("LogSegment::openPrebuilt: cannot open " + logFile);
+    seg->fd_ = ::open(logFile.c_str(), O_RDWR | O_APPEND);
+    if (seg->fd_ < 0)
+        throw std::system_error(errno, std::system_category(), "LogSegment::openPrebuilt: open " + logFile);
+    seg->index_ = std::make_unique<OffsetIndex>(indexFile, base, indexMaxBytes);
+    if (const int e = seg->openTrusted(nextOffset); e != 0)
+        throw std::system_error(e, std::system_category(), "LogSegment::openPrebuilt: fstat " + logFile);
+    seg->logPath_ = fname(dir, base, ".log");   // the name it will have once installed
+    return seg;
+}
+
 std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     const std::string& stagingLogPath, const std::string& stagingIndexPath,
     int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
@@ -91,9 +114,10 @@ void LogSegment::adoptAsActive(int64_t base) {
     durableNext_ = base;
     if (index_) index_->setBaseOffset(base);
     staging_ = false;
+    pathPending_ = true;   // on-disk name is still the staging one until setLogPath
 }
 
-void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; }
+void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; pathPending_ = false; }
 
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
                        int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap)
@@ -139,9 +163,9 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
 
 // D3b fix round 2: the read mapping is ALWAYS made through this segment's own
 // open fd_ (its inode, held for the segment's lifetime anyway) — never by
-// re-opening logPath_.  The log cleaner renames a rewritten file over the path
-// and only then enqueues the swap; until the owner applies it (deferred while a
-// read_committed rebuild scans), this segment must keep reading ITS bytes: a
+// re-opening logPath_.  A compaction install renames a rewritten file over the
+// path (owner thread, fix round 2/3) and the legacy synchronous path replaces it
+// before the reload; until the reload, this segment must keep reading ITS bytes: a
 // by-path (re)map would expose the rewritten file (a marker skipped → a txn left
 // open) or SIGBUS past its shorter EOF.  No extra fd (F3 unchanged).
 std::unique_ptr<MappedFile> LogSegment::makeReadMap_(std::size_t bytes) {
@@ -571,6 +595,17 @@ LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) noexcept
     v.baseOffset = firstBase;
     v.nextOffset = nextOff;
     return v;
+}
+
+int LogSegment::openTrusted(int64_t nextOffset) noexcept {
+    struct stat st{};
+    if (::fstat(fd_, &st) != 0) return errno != 0 ? errno : EIO;
+    logSize_     = static_cast<int64_t>(st.st_size);
+    nextOffset_  = nextOffset;
+    durableNext_ = nextOffset;
+    syncedBytes_ = logSize_;
+    index_->rebuildEntries();   // counts the cleaner-built entries (O(index entries), no I/O)
+    return 0;
 }
 
 int64_t LogSegment::recover() {

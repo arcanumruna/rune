@@ -2269,3 +2269,100 @@ TEST(LogCleanerRegression, CompactionPreservesPartitionLeaderEpoch) {
     EXPECT_EQ(seen, 2);
     std::filesystem::remove_all(dir);
 }
+
+// ===========================================================================
+// Fix round 3: deferred-install outputs (cleaner side).
+// ===========================================================================
+namespace {
+// A log whose sealed segments hold superseded copies of k0..k3.
+void writeDirtyLog(Log& log, int n) {
+    for (int64_t o = 0; o < n; ++o)
+        log.append(makeBatch(o, "k" + std::to_string(o % 4), "v" + std::to_string(o), 1000 + o), o);
+}
+} // namespace
+
+// The cleaner builds the COMPLETE segment: a CRC-valid log output + its index +
+// nextOffset, never touching the originals; the owner installs it O(1).
+TEST(LogCleanerRegression, DeferredOutputCarriesIndexAndNextOffsetAndInstallsRegression) {
+    auto dir = makeTempDir("fr3_deferred_out");
+    std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/256);
+    writeDirtyLog(log, 40);
+    auto bases = log.segmentBaseOffsets();
+    const int64_t active = bases.back();
+    bases.pop_back();
+    std::map<int64_t, std::vector<uint8_t>> before;
+    for (int64_t b : bases) {
+        std::ifstream f(log.segmentForTest(b)->logPath(), std::ios::binary);
+        before[b] = std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+    uint64_t seq = 0;
+    LogCleaner cleaner;
+    cleaner.setDeferredInstall(&seq);
+    SkimpyOffsetMap map(1024);
+    std::vector<int64_t> sizes(bases.size(), 1);
+    const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1'000'000,
+                                                        map, /*coalesce=*/true, 1 << 20, nullptr, -1);
+    ASSERT_FALSE(res.groups.empty());
+    for (int64_t b : bases) {   // originals untouched
+        std::ifstream f(log.segmentForTest(b)->logPath(), std::ios::binary);
+        EXPECT_EQ(std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()), before[b]);
+    }
+    const auto snap = log.sealedSegmentSnapshot();
+    for (const auto& g : res.groups) {
+        ASSERT_TRUE(g.hasOutput);
+        EXPECT_TRUE(std::filesystem::exists(Log::cleanedLogPath(log.dir(), g.bases.front(), g.seq)));
+        EXPECT_TRUE(std::filesystem::exists(Log::cleanedIndexPath(log.dir(), g.bases.front(), g.seq)));
+        EXPECT_GT(g.nextOffset, g.bases.front());
+        std::vector<Log::CleanedMember> members;
+        for (int64_t b : g.bases)
+            for (const auto& si : *snap) if (si.baseOffset == b) members.push_back({b, si.lineage});
+        ASSERT_TRUE(log.enqueueCleanedGroup(members.data(), members.size(), g.seq, true, g.nextOffset,
+                                            log.openCleanedOutput(g.bases.front(), g.seq, g.nextOffset).release()));
+    }
+    for (std::size_t i = 0; i < res.groups.size() + 1; ++i) {   // one group per drain
+        log.drainCleanerSwaps();
+        log.runCleanerFileOps(0);
+    }
+    EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
+    // Latest value per key is still readable; superseded copies are gone.
+    std::map<std::string, std::string> latest;
+    int live = 0;
+    for (int64_t o = 0; o < 40; ++o) {
+        const auto bytes = log.read(o, 1 << 20);
+        if (bytes.empty()) continue;
+        RecordBatchReader r(bytes.data(), bytes.size());
+        if (r.baseOffset() != o) continue;
+        r.forEach([&](std::string_view k, std::string_view v, int64_t, int64_t) { latest[std::string(k)] = std::string(v); ++live; });
+    }
+    for (int k = 0; k < 4; ++k) EXPECT_EQ(latest["k" + std::to_string(k)], "v" + std::to_string(36 + k));
+    EXPECT_LT(live, 40);
+    std::filesystem::remove_all(dir);
+}
+
+// N-LOW-1: an exception mid-pass removes the pass's already-written outputs at
+// once (they were never enqueued; result.groups is lost with the exception).
+TEST(LogCleanerRegression, ExceptionMidPassRemovesItsCleanedOutputsRegression) {
+    auto dir = makeTempDir("fr3_deferred_throw");
+    std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/256);
+    writeDirtyLog(log, 40);
+    auto bases = log.segmentBaseOffsets();
+    const int64_t active = bases.back();
+    bases.pop_back();
+    uint64_t seq = 99;   // the first output is seq 100
+    // Make the FIRST output's index write fail (a directory squats its name).
+    std::filesystem::create_directories(Log::cleanedIndexPath(log.dir(), bases.front(), 100));
+    LogCleaner cleaner;
+    cleaner.setDeferredInstall(&seq);
+    SkimpyOffsetMap map(1024);
+    std::vector<int64_t> sizes(bases.size(), 1);
+    EXPECT_ANY_THROW((void)cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1'000'000,
+                                                              map, /*coalesce=*/true, 1 << 20, nullptr, -1));
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.is_directory()) continue;
+        EXPECT_EQ(e.path().extension(), e.path().extension() == ".cleaned" ? ".none" : e.path().extension())
+            << "orphaned output " << e.path().filename();
+    }
+    std::filesystem::remove_all(dir);
+}

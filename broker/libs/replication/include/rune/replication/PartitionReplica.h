@@ -51,6 +51,7 @@
 #include <string>
 
 #include <rune/replication/Types.h>
+#include <algorithm>
 #include <rune/replication/FollowerSlots.h>
 #include <rune/replication/FollowerSync.h>
 #include <rune/replication/HighWatermark.h>
@@ -753,6 +754,58 @@ public:
     [[nodiscard]] Offset cleanerLastStableOffset() const noexcept {
         return publishedLsoForCleaner_.load(std::memory_order_acquire);
     }
+    /// Fix round 2: the owner thread installs a deferred compaction output only
+    /// when every member base is below min(HW, LSO) — the cleaner selected them
+    /// strictly below both.  Owner thread (reads the live HW).
+    [[nodiscard]] Offset cleanerSwapBound() const noexcept {
+        // Compaction is leader-only: an output the cleaner produced before a
+        // demotion is rejected (bound below every base), never installed on a
+        // follower.
+        if (role_ != Role::Leader) return std::numeric_limits<Offset>::min();
+        return std::min<Offset>(highWatermark(), cleanerLastStableOffset());
+    }
+    /// Fix round 2: drain the cleaner's swap ring on the OWNER thread (validate +
+    /// install deferred compaction outputs), then rewind the clean watermark to
+    /// the lowest rejected range — the cleaner advanced it BEFORE enqueueing
+    /// (so this owner store is always later in lastCleanOffset_'s modification
+    /// order), and a rejected range must be recompacted.  Disk-backed only.
+    int drainCleanerSwapsOnOwner() {
+        rune::storage::Log* l = log();
+        const int work = l->drainCleanerSwaps(cleanerSwapBound());
+        const int64_t low = l->takeCleanerRejectLowWater();
+        if (low != INT64_MAX) requestCleanerRewind(low);
+        return work;
+    }
+    /// Fix round 3 (N-MEDIUM-2): retention deletes are only PROPOSED by the
+    /// cleaner; the owner validates (identity, not active, segment end <= HW)
+    /// and only then renames the files away.  Disk-backed only.
+    int drainRetentionDeletesOnOwner() {
+        return log()->drainRetentionDeletes(highWatermark());
+    }
+
+    // ---- Fix round 3 (N-MEDIUM-1): clean-watermark rewind channel ----------
+    // lastCleanOffset_ is written by the cleaner only.  The owner, on rejecting
+    // a compaction output, PUBLISHES a rewind point instead of storing the
+    // watermark itself (a concurrent cleaner pass would overwrite that store).
+    // Owner = single writer of gen/to; cleaner = single writer of ack.  The
+    // owner folds a new rejection into a not-yet-acknowledged one (min), so a
+    // rewind is never lost — at worst over-conservative.
+    void requestCleanerRewind(Offset to) noexcept {
+        const uint64_t gen   = cleanerRewindGen_.load(std::memory_order_relaxed);
+        const uint64_t acked = cleanerRewindAck_.load(std::memory_order_acquire);
+        const Offset   prev  = cleanerRewindTo_.load(std::memory_order_relaxed);
+        cleanerRewindTo_.store(acked == gen ? to : std::min(prev, to), std::memory_order_relaxed);
+        cleanerRewindGen_.store(gen + 1, std::memory_order_release);
+    }
+    /// Cleaner thread: fold any published rewind into the clean watermark.
+    /// Called at pass start and right after the pass stores its passEnd.
+    void applyCleanerRewind() noexcept {
+        const uint64_t gen = cleanerRewindGen_.load(std::memory_order_acquire);
+        if (gen == cleanerRewindAck_.load(std::memory_order_relaxed)) return;
+        const Offset to = cleanerRewindTo_.load(std::memory_order_relaxed);
+        if (to < lastCleanOffset()) setLastCleanOffset(to);
+        cleanerRewindAck_.store(gen, std::memory_order_release);
+    }
     // Task #13: gatewayIsrSize() — acquire-load of the published ISR size snapshot.
     // The owning worker publishes (in publishCleanerState()) the current ISR size
     // whenever the HW/ISR state is updated.  The gateway reads it in
@@ -1003,6 +1056,18 @@ private:
     /// (Follower) Truncate the log to `truncateOffset` (inclusive last valid
     /// offset = truncateOffset - 1).  Updates local LEO.
     void truncateLog(Offset truncateOffset);
+    /// Fix round 5: the tail of a KIP-279 divergence truncation (truncate, reset
+    /// the fetch state, re-fetch) — run at once or from TruncatePending.
+    void completeDivergenceTruncation_(Offset truncTo);
+public:
+    /// Fix round 5 observability: divergence truncations deferred because the
+    /// log cleaner had posted renames pending; applies dropped meanwhile.
+    [[nodiscard]] uint64_t truncatesDeferred() const noexcept { return truncatesDeferred_; }
+    [[nodiscard]] uint64_t appliesDroppedTruncatePending() const noexcept { return appliesDroppedTruncatePending_; }
+    [[nodiscard]] bool     truncatePendingForTest() const noexcept { return followerSync_.truncatePending(); }
+private:
+    uint64_t truncatesDeferred_ = 0;
+    uint64_t appliesDroppedTruncatePending_ = 0;
 
     /// (Leader) GR-10: push records to all ISR followers via unsolicited
     /// FetchResponse.  Non-blocking (tryClaim/offer).  F27: each follower is
@@ -1260,6 +1325,9 @@ private:
     // never re-scanned or re-rewritten on the next duty-cycle call.
     // Atomic: cleaner/duty threads write; test threads may poll it concurrently.
     std::atomic<Offset> lastCleanOffset_{0};
+    std::atomic<uint64_t> cleanerRewindGen_{0};      ///< owner-written (fix round 3)
+    std::atomic<Offset>   cleanerRewindTo_{0};       ///< owner-written
+    std::atomic<uint64_t> cleanerRewindAck_{0};      ///< cleaner-written
 
     // GR-10 push tracking is PER FOLLOWER (F27): FollowerSlot::pushedThrough /
     // pushCursor(); the old shared lastPushedOffset_ advanced even when a push to

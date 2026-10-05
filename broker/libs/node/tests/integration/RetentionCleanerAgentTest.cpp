@@ -1083,3 +1083,85 @@ TEST(RetentionCleanerAgent, CompactDeleteBothRunNoDoubleDelete) {
 
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// 2026-10-05 log-truncate review MAJOR-3: retention gated only on the segment's
+// BASE (< HW), so a sealed segment straddling the HW (base < HW < end) was
+// deleted with its un-replicated records (Kafka: HW >= nextSegment.base).
+// No sleeps: deletion = the .log renamed to .deleted by the cycle itself.
+// ===========================================================================
+TEST(RetentionCleanerAgent, TimeRetentionNeverDeletesSegmentStraddlingHwRegression) {
+    auto dir = cp9TempDir("cp9_hw_straddle");
+    Log log(dir.string(), /*rollBytes=*/100);   // two one-record batches per segment
+    for (int64_t o = 0; o < 10; ++o) log.append(cp9Batch(o, "k", "v", /*ts=*/1000), o);
+    ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 4, 6, 8}));
+    Cp9NullTransport transport;
+    auto cfg = makeDeleteConfig(911, /*retentionMs=*/1, /*retentionBytes=*/-1);
+    auto owned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1, 2}, std::vector<NodeId>{1, 2}, &log, &transport);
+    owned->becomeLeader(1, {1, 2});
+    PartitionReplica* replica = owned.get();
+    replica->onLeaderLogAppended();
+    // The ISR follower has fetched up to 5: HW = 5, inside segment [4, 6).
+    (void)replica->onFetchRequest(FetchRequestMsg{1, 0, 2, 5, 1 << 20, 911}, 1'000'000);
+    rune::node::ReplicaRegistry reg;
+    reg.add(911, 0, std::move(owned));
+    rune::node::LogCleanerAgent cleaner(&reg);
+    Cp9MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &reg, nullptr);
+    for (int i = 0; i < 10; ++i) {
+        duty.doWork(2'000'000LL + i * 1'000'000LL);
+        cleaner.doWork(2'000'000LL + i * 1'000'000LL);
+        duty.doWork(2'000'000LL + i * 1'000'000LL);
+    }
+    ASSERT_EQ(replica->cleanerHighWatermark(), 5) << "precondition: HW inside segment 4";
+    auto exists = [&](int64_t b) {
+        std::string s = std::to_string(b); s = std::string(20 - s.size(), '0') + s;
+        return fs::exists(dir / (s + ".log"));
+    };
+    EXPECT_FALSE(exists(0)) << "segment [0,2) is fully below HW: deletable";
+    EXPECT_FALSE(exists(2)) << "segment [2,4) is fully below HW: deletable";
+    EXPECT_TRUE(exists(4)) << "segment [4,6) holds offset 5 (above HW): must survive";
+    EXPECT_TRUE(exists(6));
+    EXPECT_TRUE(exists(8));
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 3 (N-MEDIUM-2): the cleaner thread renamed retention victims to
+// .deleted ITSELF, before the owner validated them — a crash before the owner's
+// drain lost the segment (construction removes every *.deleted file), even if
+// it had just been merged with in-window records.  Now the cleaner only
+// proposes; nothing on disk changes until the owner validates.
+// ===========================================================================
+TEST(RetentionCleanerAgent, UndrainedRetentionProposalLosesNothingAcrossCrashRegression) {
+    auto dir = cp9TempDir("cp9_ret_crash");
+    std::vector<int64_t> basesBefore;
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        for (int64_t o = 0; o < 10; ++o) log.append(cp9Batch(o, "k", "v", /*ts=*/1000), o);
+        basesBefore = log.segmentBaseOffsets();
+        Cp9NullTransport transport;
+        auto owned = std::make_unique<PartitionReplica>(
+            makeDeleteConfig(912, /*retentionMs=*/1, /*retentionBytes=*/-1), Role::Leader, 1,
+            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+        owned->becomeLeader(1, {1});
+        owned->onLeaderLogAppended();
+        rune::node::ReplicaRegistry reg;
+        reg.add(912, 0, std::move(owned));
+        rune::node::LogCleanerAgent cleaner(&reg);
+        Cp9MinimalConsensusAgent dummy;
+        rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &reg, nullptr);
+        duty.doWork(1'000'000);                 // publish the cleaner-visible HW
+        for (int i = 0; i < 5; ++i) cleaner.doWork(2'000'000LL + i);   // retention runs; NO owner drain
+        // "crash" here: the owner never validated / applied the proposals.
+    }
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        EXPECT_EQ(log.segmentBaseOffsets(), basesBefore) << "an unvalidated proposal must not delete anything";
+        EXPECT_EQ(log.logStartOffset(), 0);
+    }
+    fs::remove_all(dir);
+}

@@ -5178,7 +5178,7 @@ TEST(PsmLogConsistencyRegression, InlinePassthroughTruncationRebuildsTheProducer
     // partition identity + the log's content generation.
     InlineRig R(Role::Leader, {1}, /*withReplica=*/false);
     for (int32_t s = 0; s <= 2; ++s) ASSERT_EQ(R.produce(7, 0, s).base, s);
-    R.log().truncateTo(1);
+    EXPECT_TRUE(R.log().truncateTo(1));
     const Answer a = R.produce(7, 0, 1);
     EXPECT_EQ(a.err, 0);
     EXPECT_EQ(a.base, 1);

@@ -188,6 +188,12 @@ public:
     LogReadView mappedBytes() noexcept;
 
     int64_t recover();
+    /// Fix round 3 (O(1) owner-thread install): adopt a SEALED segment whose
+    /// .log and .index were built, CRC-verified and fsynced by the cleaner
+    /// thread — no re-read, no CRC, no index rebuild, no fsync.  `nextOffset`
+    /// comes from the cleaner; the size is one fstat.  The segment is fully
+    /// durable (the cleaner fsynced it).  Returns 0 or the errno of the fstat.
+    int openTrusted(int64_t nextOffset) noexcept;
 
     int64_t baseOffset() const noexcept { return baseOffset_; }
     int64_t sizeBytes() const noexcept { return logSize_; }
@@ -203,12 +209,24 @@ public:
     uint64_t installGen() const noexcept { return installGen_; }
     void setInstallGen(uint64_t g) noexcept { installGen_ = g; }
     /// Content lineage for the sealed-snapshot timestamp cache (Log::
-    /// publishSealedSnapshot): a cached largestTimestamp is reused only for the
-    /// SAME lineage at the same base.  A fresh install (roll, truncate rebuild,
-    /// re-create) gets a new lineage; a cleaner rewrite / reload of the same
-    /// sealed segment inherits it (compaction never raises the max timestamp).
+    /// publishSealedSnapshot) and the cleaner's stale-work check: a cached
+    /// largestTimestamp is reused, and a queued cleaner swap / retention delete
+    /// is applied, only for the SAME lineage at the same base.  Every install
+    /// (roll, truncate rebuild, re-create, compaction rewrite) gets a fresh
+    /// lineage; only a full reloadSegments() of an unchanged file inherits it.
+    /// A compaction rewrite is NOT "the same content": a coalesced merge holds
+    /// the later members' (newer) records — its timestamp comes from tsFloor().
     uint64_t tsLineage() const noexcept { return tsLineage_; }
     void setTsLineage(uint64_t l) noexcept { tsLineage_ = l; }
+    /// Lower bound for this segment's published largestTimestamp: the max of
+    /// what the segment(s) it replaced / absorbed published (a compaction
+    /// rewrite inherits its predecessor's; a merge member dropped from the map
+    /// folds its own into the segment that now holds its records).
+    int64_t tsFloor() const noexcept { return tsFloor_; }
+    void raiseTsFloor(int64_t ts) noexcept { if (ts > tsFloor_) tsFloor_ = ts; }
+    /// The largestTimestamp the last sealed-snapshot publish gave this segment.
+    int64_t publishedTs() const noexcept { return publishedTs_; }
+    void setPublishedTs(int64_t ts) noexcept { publishedTs_ = ts; }
     /// E1d MEDIUM-2: the owning Log's directory-mutation generation at which
     /// this segment's directory entry was last created / renamed (0 = present
     /// at open: made durable by recovery's directory fsync).  The entry is
@@ -251,6 +269,17 @@ public:
     /// <dir>/<stagingName>.log and <dir>/<stagingName>.index, opens the fds and
     /// mmaps + prefaults the (right-sized) index.  baseOffset is provisional (0);
     /// call adoptAsActive(base) on the append thread to rebase + rename at roll.
+    /// Fix round 4: open a finished, cleaner-built SEALED segment from its
+    /// temporary files (cleaner thread) — fds + index mmap + entry count + size,
+    /// adopted TRUSTED (fully durable: the cleaner fsynced it).  logPath() is
+    /// the CANONICAL <base>.log the cleaner renames the files to after the owner
+    /// accepts; until then everything goes through the open fd / mmap (a rename
+    /// never affects an open inode).  Throws on any open / map failure.
+    static std::unique_ptr<LogSegment> openPrebuilt(const std::string& dir, int64_t base,
+                                                    const std::string& logFile,
+                                                    const std::string& indexFile,
+                                                    int64_t nextOffset, int32_t indexIntervalBytes,
+                                                    int32_t indexMaxBytes);
     static std::unique_ptr<LogSegment> prepareStaging(
         const std::string& stagingLogPath, const std::string& stagingIndexPath,
         int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes);
@@ -270,6 +299,9 @@ public:
 
     /// True if this segment is still in the staging (un-adopted) state.
     bool isStaging() const noexcept { return staging_; }
+    /// Adopted from staging and the staging→<base> rename not yet confirmed
+    /// (Log::drainStagingRenamesDone → setLogPath).  In-memory, no syscall.
+    bool pathPending() const noexcept { return pathPending_; }
 
     /// TEST-ONLY: whether the read-only .log mapping currently exists.  A
     /// sealed segment recovered from disk starts false (F3: lazy mapping) and
@@ -323,11 +355,14 @@ private:
     std::unique_ptr<OffsetIndex> index_;
     uint64_t installGen_ = 0;
     uint64_t tsLineage_ = 0;     ///< see tsLineage()
+    int64_t  tsFloor_ = INT64_MIN;     ///< see tsFloor()
+    int64_t  publishedTs_ = INT64_MIN; ///< see publishedTs()
     uint64_t dirEntryGen_ = 0;   ///< E1d MEDIUM-2: see dirEntryGen()
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
     int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()
     int64_t durableNext_ = 0;    ///< E1d: see durableNext() (== baseOffset_ when none)
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
+    bool pathPending_ = false;   // see pathPending()
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
 
     // Read-only mmap of the .log for zero-copy readView().  Created WITH the

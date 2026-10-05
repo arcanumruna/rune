@@ -10,6 +10,7 @@
 // the existing segment scanner.
 // ---------------------------------------------------------------------------
 
+#include <type_traits>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/BatchPrefix.h>
 #include <rune/replication/InternalIsrKnowledge.h>
@@ -263,6 +264,11 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
 
 void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch)
 {
+    // Fix round 5: a role change abandons a deferred divergence truncation
+    // (reset below / leadership) — let the log post cleaner work again.
+    if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr) diskLog_->cancelColdPathWait();
+    // Fix round 6 (N5-LOW-2): a leader has no pending divergence truncation.
+    if (followerSync_.truncatePending()) followerSync_.reset();
     // Same-epoch re-assert (a partitionEpoch-only ISR change re-applies the
     // assignment with the SAME leaderEpoch): the controller COMMITTED a new ISR
     // (our AlterIsr proposal, or its own change).  Only the ISR changes; nothing
@@ -409,6 +415,9 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 {
+    // Fix round 5: a role change abandons a deferred divergence truncation
+    // (reset below / leadership) — let the log post cleaner work again.
+    if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr) diskLog_->cancelColdPathWait();
     staleLead_.pending = false;   // a newer committed role supersedes a refused leadership
     // N1/N2: a replica of a LEADERLESS partition reports itself (LEO,
     // incarnation, log-dir state) to the controller once per leaderless epoch
@@ -1141,6 +1150,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
         // Other errors: ignored (the control plane drives role changes).
         return;
     }
+    // Fix round 5: a decided divergence truncation is pending — appending now
+    // would extend the diverged tail.  Drop; the post-truncation fetch re-pulls.
+    if (followerSync_.truncatePending()) [[unlikely]] { ++appliesDroppedTruncatePending_; return; }
     // fsyncgate fail-stop: a log whose fsync failed accepts no further data
     // (the broker is halting; restart recovery + replication re-heal it).
     if (!memoryBacked_ && diskLog_ != nullptr && diskLog_->storageFailed()) [[unlikely]] return;
@@ -1486,7 +1498,20 @@ void PartitionReplica::onDivergingEpoch_(int32_t divergingEpoch, Offset divergin
                          static_cast<long long>(epoch_), divergingEndOffset,
                          divergingEpoch, followerHw_, leo);
     }
-    if (truncTo < leo) truncateLog(truncTo);   // prunes the epoch cache in step (A10)
+    if (truncTo < leo && !memoryBacked_ && diskLog_ != nullptr && !diskLog_->tryBeginColdPath()) {
+        // Fix round 5: the log cleaner still has posted renames to perform —
+        // never wait on the worker.  Park in TruncatePending (the state holds
+        // the target); no fetch / apply until doWork completes it.
+        followerSync_.enterTruncatePending(truncTo);
+        ++truncatesDeferred_;
+        return;
+    }
+    completeDivergenceTruncation_(truncTo);
+}
+
+void PartitionReplica::completeDivergenceTruncation_(Offset truncTo)
+{
+    if (truncTo < logEndOffset_()) truncateLog(truncTo);   // prunes the epoch cache in step (A10)
     followerSync_.reset();
     lastFetchEmitNs_ = 0;
     if (sendFetchToLeader_(nextFetch())) followerSync_.onFetchSent();
@@ -1738,6 +1763,13 @@ int PartitionReplica::doWork(int64_t nowNs)
         // LEO clears it (time-independent: no timer).  While wedged the follower
         // sends NOTHING (no fetch, no keepalive), so the leader's lag check evicts it.
         if (wedgedAtOffset_ >= 0 && wedgedAtOffset_ != logEndOffset_()) wedgedAtOffset_ = -1;
+        // Fix round 5: a deferred divergence truncation completes as soon as the
+        // log cleaner has performed its posted renames (event-driven, no wait).
+        if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr &&
+            diskLog_->tryBeginColdPath()) {
+            completeDivergenceTruncation_(followerSync_.truncateTarget());
+            ++work;
+        }
         {
             // Follower normal fetch — driven ENTIRELY by the FollowerSync state
             // machine (single source of truth; see FollowerSync in the header).
@@ -2493,7 +2525,22 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
         checkpointEpochs_();
     }
 
-    onLog([&](auto& L){ L.truncateTo(truncateOffset); });
+    onLog([&](auto& L) {
+        if constexpr (std::is_same_v<decltype(L.truncateTo(truncateOffset)), bool>) {
+            // Fix round 6: callers enter only when tryBeginColdPath() just held
+            // (TruncatePending otherwise), so a deferral here would desync the
+            // already-pruned epoch cache from the log — fail-stop, never continue.
+            if (!L.truncateTo(truncateOffset)) [[unlikely]] {
+                spdlog::critical("PartitionReplica[topic={} part={}]: truncateTo({}) deferred inside "
+                                 "truncateLog — epoch cache / log desync; halting",
+                                 cfg_.topicId, cfg_.partitionId, truncateOffset);
+                spdlog::default_logger()->flush();
+                std::abort();
+            }
+        } else {
+            L.truncateTo(truncateOffset);
+        }
+    });
 
     // F15 §2.1 step 3: the log's existing content changed at and above
     // truncateOffset — every parked waiter / RC build re-validates against it.
