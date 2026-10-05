@@ -199,6 +199,12 @@ public:
 
     /// CB-5 B: attempt to resend a redirected Produce identified by correlationId.
     /// Returns true if one producer handled it (resent or failed).
+    /// DR-7 review M2: any producer had an attempt time out since the last call.
+    [[nodiscard]] bool takeMetadataWanted() noexcept {
+        bool w = false;
+        for (ProducerImpl* impl : active_) if (impl != nullptr) w = impl->takeMetadataWanted() || w;
+        return w;
+    }
     bool retryRedirectedProduce(int64_t corrId,
                                 std::function<bool(int32_t, int32_t, int32_t, const uint8_t*, std::size_t)> sendFn);
 

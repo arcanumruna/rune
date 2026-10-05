@@ -1533,7 +1533,7 @@ int Client::dutyCycle(int64_t nowNs) {
         }
     }
     // DR-7: a partition route's leader session that fails to connect asks for metadata.
-    work += watchProduceRoutes_();
+    work += watchProduceRoutes_(nowNs);
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
     if (unsentCtl_ != 0) [[unlikely]] work += retryUnsentControl_();
@@ -3305,21 +3305,36 @@ detail::SendResult Client::fetchOfferTrampoline_(void* ctx, uint32_t session, co
 // connect attempt.  Each one of a session some partition routes to asks for fresh
 // metadata (Kafka: a failed connection requests a metadata update; rate-limited by
 // requestMetadataNow_); the answer re-routes the partition (and its held batches).
-int Client::watchProduceRoutes_() noexcept {
+int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
+    // Review MEDIUM-2: a produce attempt timed out (Kafka: a request timeout
+    // requests a metadata update) — the partition may have moved silently.
+    bool ask = producerHub_.takeMetadataWanted();
     const auto n = static_cast<uint32_t>(agent_.sessionCount());
     if (n > routeConnectFailuresSeen_.size()) [[unlikely]] {
         try {
             routeConnectFailuresSeen_.resize(n, 0);
+            routeSessionUp_.resize(n, 0);
         } catch (...) {
             return 0;  // allocation failure on this cold path: the next pass retries
         }
     }
-    bool ask = false;
     for (uint32_t i = 0; i < n; ++i) {
-        const uint64_t f = agent_.sessionConnectFailuresAt(i);
-        if (f == routeConnectFailuresSeen_[i]) [[likely]] continue;
+        const uint64_t f  = agent_.sessionConnectFailuresAt(i);
+        const auto     st = agent_.sessionStateAt(i);
+        const uint8_t  up = st == session::SessionState::Connected ? 1 : 0;
+        const bool failed = f != routeConnectFailuresSeen_[i];
+        const bool lost   = routeSessionUp_[i] != 0 && up == 0;  // review MEDIUM-1: a Connected leader dropped
         routeConnectFailuresSeen_[i] = f;
-        ask = ask || agent_.routesUseSession(i);
+        routeSessionUp_[i]           = up;
+        if (i == 0) continue;                                    // the seed has its own reconnect path
+        if (!failed && !lost && st != session::SessionState::Disconnected) [[likely]] continue;
+        if (!agent_.routesUseSession(i)) continue;
+        ask = ask || failed || lost;
+        // Review MAJOR-1: a routed leader session that gave up (first-connect budget
+        // spent before the cluster elected a new leader) is re-driven; its own connect
+        // budget paces the attempts and each failure is the next refresh event — the
+        // route converges whenever the failover completes, however long it takes.
+        if (st == session::SessionState::Disconnected) (void)agent_.reviveSession(i, nowNs);
     }
     if (!ask) return 0;
     requestMetadataNow_();
@@ -3757,7 +3772,10 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         // NEW-4(b): any route change is a new lane for the partition's later
         // offers (even when nothing is re-offered now — a first worker install).
         if (changed) producerHub_.noteRouteChanged(p.topicId, p.partition);
-        if (changed && hadWorker && !agent::ClientAgent::sameEndpoint(prevData, data)) {
+        // Review MEDIUM-2: any data-channel move (worker OR node route — a failover)
+        // re-offers the stored batches on the new route now (same identity; the
+        // new leader dedups), never waiting for the attempt timer.
+        if (changed && !prevData.empty() && !agent::ClientAgent::sameEndpoint(prevData, data)) {
             moved.emplace_back(p.topicId, p.partition);
         }
         ++mnRoutes;

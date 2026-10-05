@@ -856,6 +856,14 @@ public:
     /// CB-5 B: attempt to resend the wire frame for a redirected Produce.
     /// Returns true if resent, false if corrId unknown / max redirects exceeded.
     /// On failure the pending ack is failed immediately.
+    /// DR-7 review M2: an attempt timed out since the last call (Kafka: a request
+    /// timeout requests a metadata update).  Duty thread; clears the flag.
+    [[nodiscard]] bool takeMetadataWanted() noexcept {
+        const bool w = metadataWanted_;
+        metadataWanted_ = false;
+        return w;
+    }
+    bool metadataWanted_ = false;  // see takeMetadataWanted()
     static constexpr int kMaxRedirects = 3;
     /// N-e: the backoff before a retriable error (MinIsrViolation) is re-sent
     /// (Kafka retry.backoff.ms default), capped by produceTimeoutMs.

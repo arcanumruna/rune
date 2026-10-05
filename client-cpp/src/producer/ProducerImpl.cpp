@@ -2716,6 +2716,7 @@ int ProducerImpl::retransmitStalled(int64_t nowNs, const Sink& sink)
                 failBatch_(ps, b, OpStatus::DeliveryFailed);  // no ProduceResponse in time
                 return;
             }
+            if (nowNs >= b.attemptDeadlineNs && !b.routeResendPending) metadataWanted_ = true;  // review M2
             if (nowNs >= b.attemptDeadlineNs && !b.routeResendPending &&
                 offerAttempt_(ps, b, nowNs, sink, 1)) {
                 b.attemptDeadlineNs = nowNs + attemptNs;  // same frame, a new attempt: broker dedups

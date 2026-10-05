@@ -409,6 +409,7 @@ public:
     [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
+    [[nodiscard]] uint64_t testSessionConnectFailuresAt(uint32_t i) const noexcept { return agent_.sessionConnectFailuresAt(i); }
     /// Test hook (duty-cycle thread only): the cached advertised ingress stream (0 = none).
     [[nodiscard]] int32_t testIngressStreamIdFor(int32_t topicId, int32_t partition) const {
         return metadataCache_.ingressStreamIdFor(topicId, partition);
@@ -912,8 +913,9 @@ private:
     /// re-drive a Disconnected one's connect, re-route.  Event-driven: state
     /// transitions of the agent's sessions, no clock.
     int watchGroupSessions_(int64_t nowNs);
-    int watchProduceRoutes_() noexcept;
+    int watchProduceRoutes_(int64_t nowNs) noexcept;
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
+    std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass
     uint64_t groupDiscMask_ = 0;  // ... terminally Disconnected last pass
     static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,

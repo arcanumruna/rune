@@ -832,10 +832,12 @@ TEST(GroupRoutingRegression, AlreadyDisconnectedLeaderSessionIsRevivedRegression
     const std::vector<uint8_t> val{1};
     ASSERT_EQ(p.trySendTo(r.client.topic("t"), 1, rc::Key(uint64_t{1}), std::span<const uint8_t>(val)),
               rc::SendResult::Ok);
+    // DR-7 review M1: a routed session that spends its first-connect budget is
+    // re-driven at once (never left terminally Disconnected) — the precondition is
+    // that node 1's session went through that give-up (first attempt + 3 retries).
     ASSERT_TRUE(r.drive([&] {
-        return r.client.testSessionCount() > 1 &&
-               r.client.testSessionStateAt(1) == rc::session::SessionState::Disconnected;
-    }, 40'000'000)) << "precondition: node 1's session terminally Disconnected";
+        return r.client.testSessionCount() > 1 && r.client.testSessionConnectFailuresAt(1) >= 4;
+    }, 40'000'000)) << "precondition: node 1's session spent its first-connect budget";
     // Node 1 is reachable again; the group now assigns p1 there.
     r.gw.silentEndpoints.clear();
     r.gw.releaseJoins();
@@ -1091,4 +1093,89 @@ TEST(GroupRoutingRegression, ProduceRoutedToADeadLeaderFollowsTheFailoverRegress
     EXPECT_GT(r.gw.metadataRequests, md) << "a failed connect to the partition's leader asked for no metadata";
     ASSERT_FALSE(r.gw.produced.empty());
     EXPECT_EQ(r.gw.produced.back().endpoint, 0) << "the batch follows the failover to node 0";
+}
+
+// Review MAJOR-1: the election outlasts the dead ex-leader session's first-connect
+// budget (it gives up after its retries).  The client must keep asking — the route
+// converges whenever the failover completes.  RED (9eccba0): the given-up session
+// raised no more events, the stale route stuck, every batch hit the delivery timeout.
+TEST(GroupRoutingRegression, ProduceFollowsAFailoverThatOutlastsTheConnectBudgetRegression) {
+    RigOptions o;
+    o.connectTimeoutMs = 300;
+    GroupRig r(4143, 4144, o);
+    const auto [n1, p1port] = r.addNode(4143);
+    r.gw.deadEndpoints.insert(n1);                  // node 1 was killed
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 1, 1, 4143, ""}};    // b/0 still advertised on node 1 (election pending)
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(2, 0).empty(); }));
+    rc::ProducerConfig pc;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 600'000;
+    auto p = r.client.producer(pc);
+    const std::vector<uint8_t> val{1};
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(p.trySend(r.client.topic("b"), rc::Key(uint64_t{1}), std::span<const uint8_t>(val), r.cq, t),
+              rc::SendResult::Ok);
+    // Many failed attempts later (well past the first-connect budget) the client
+    // is still asking — only then does the cluster finish the failover.
+    const int md0 = r.gw.metadataRequests;
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= md0 + 8; }, 40'000'000))
+        << "the client stopped asking once node 1's session gave up";
+    r.gw.partitions = {{2, 0, 0, 2, 4143, ""}};
+    rc::OpStatus st = rc::OpStatus::Closed;
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 8'000'000));
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    ASSERT_FALSE(r.gw.produced.empty());
+    EXPECT_EQ(r.gw.produced.back().endpoint, 0);
+}
+
+// Review MEDIUM-1/2: the leader was Connected and took the batch, then died
+// silently (no answer, no NotLeader).  The attempt timeout / the lost session asks
+// for metadata and the stored batch is re-offered on the new leader at once (same
+// identity).  RED (9eccba0): no refresh and a node-route move re-offered nothing.
+TEST(GroupRoutingRegression, BatchSentToALeaderThatDiesFollowsTheFailoverRegression) {
+    RigOptions o;
+    o.connectTimeoutMs  = 300;
+    o.keepaliveNs       = 600'000'000'000;   // the session never notices the death by itself:
+    o.responseTimeoutNs = 600'000'000'000;   // only the attempt timeout can trigger the refresh
+    GroupRig r(4145, 4146, o);
+    const auto [n1, p1port] = r.addNode(4145);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions  = {{2, 0, 1, 1, 4145, ""}};
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(2, 0).empty(); }));
+    rc::ProducerConfig pc;
+    pc.lingerUs          = 0;
+    pc.deliveryTimeoutMs = 600'000;
+    pc.produceTimeoutMs  = 500;
+    auto p = r.client.producer(pc);
+    r.gw.holdPartitions = {0};                      // node 1 takes the batch, never acks
+    const std::vector<uint8_t> val{1};
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(p.trySend(r.client.topic("b"), rc::Key(uint64_t{1}), std::span<const uint8_t>(val), r.cq, t),
+              rc::SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty() && r.gw.held.back().endpoint == n1; }, 8'000'000));
+    // Node 1 dies; the cluster fails b/0 over to node 0.
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.holdPartitions.clear();
+    r.gw.partitions = {{2, 0, 0, 2, 4145, ""}};
+    const int md = r.gw.metadataRequests;
+    rc::OpStatus st = rc::OpStatus::Closed;
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 8'000'000)) << "the batch stayed on the dead leader";
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_GT(r.gw.metadataRequests, md);
+    EXPECT_EQ(r.gw.produced.back().endpoint, 0);
 }
