@@ -3203,3 +3203,126 @@ TEST(CompactionCleanerAgentRegression, OwnerRewindSurvivesConcurrentCleanerPassR
     EXPECT_EQ(r.lastCleanOffset(), 40);
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// Fix round 5 (N4-CRITICAL-1, the reviewer's probe): the owner accepted a
+// merged group (in memory) but the cleaner had not yet run its renames when the
+// next compaction pass started — the pass read the OLD <b1>.log by path while
+// the snapshot said b1 spans the merged range, and the install dropped every
+// record of the merged members (3/19 keys survived).
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, PassAfterOwnerAcceptBeforeRenamesLosesNoKeyRegression) {
+    auto dir = cp6TempDir("fr5_accept_then_pass");
+    Log log(dir.string(), /*rollBytes=*/128);
+    std::map<std::string, std::string> latest;
+    int64_t next = 0;
+    auto put = [&](const std::string& k, const std::string& v) {
+        log.append(cp6Batch(next, k, v), next);
+        latest[k] = v;
+        ++next;
+    };
+    for (int o = 0; o < 40; ++o) put(o % 2 == 0 ? "dup" : "u" + std::to_string(o), "v" + std::to_string(o));
+    Cp6NullTransport transport;
+    auto owned = std::make_unique<PartitionReplica>(
+        makeCompactConfig(782), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    owned->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    owned->becomeLeader(1, {1});
+    owned->onLeaderLogAppended();
+    PartitionReplica* replica = owned.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(782, 0, std::move(owned));
+    Cp6MinimalConsensusAgent dummy;
+    rune::node::NodeRuntimeAgent duty(dummy, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0, -1, -1, /*useCoalescing=*/true, 1 << 20);
+    cleaner.setSkipCycleFileOpsForTest(true);   // the owner's accept lands right before the next pass
+    int64_t t = 1'000'000;
+    duty.doWork(t);
+    ASSERT_GT(cleaner.doWork(t), 0) << "precondition: pass 1 merged the sealed prefix";
+    duty.doWork(t);                               // the owner accepts the group (renames still posted)
+    ASSERT_TRUE(log.cleanerFileOpsPending()) << "precondition: accepted, not yet renamed";
+    for (int o = 0; o < 10; ++o) put("u1", "w" + std::to_string(o));
+    replica->onLeaderLogAppended();
+    duty.doWork(t += 1'000'000);
+    (void)cleaner.doWork(t);                      // pass 2 — must never read the stale <b1>.log
+    cleaner.setSkipCycleFileOpsForTest(false);
+    for (int i = 0; i < 400; ++i) {
+        t += 1'000'000;
+        duty.doWork(t);
+        (void)cleaner.doWork(t);
+    }
+    duty.doWork(t + 1);
+    (void)cleaner.doWork(t + 1);
+    ASSERT_TRUE(log.fileOpsQuiescent());
+    ASSERT_TRUE(log.reloadSegments());
+    std::map<std::string, std::string> found;
+    for (int64_t o = 0; o < next; ++o) {
+        const auto bytes = log.read(o, 1 << 20);
+        if (bytes.empty()) continue;
+        RecordBatchReader r(bytes.data(), bytes.size());
+        if (r.baseOffset() != o || !r.ensureValid()) continue;
+        r.forEach([&](std::string_view k, std::string_view v, int64_t, int64_t) { found[std::string(k)] = std::string(v); });
+    }
+    for (const auto& [k, v] : latest) EXPECT_EQ(found[k], v) << "key " << k << " lost its latest value";
+    EXPECT_EQ(found.size(), latest.size());
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 5 (N4-MEDIUM-1): a KIP-279 divergence truncation that lands while
+// the log cleaner still has posted renames pending parks the follower in
+// FollowerSync::TruncatePending (no wait, no fetch, no apply) and completes on
+// a later duty pass once the cleaner caught up — also after a cleaner throw.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, DivergenceTruncationDefersToTruncatePendingRegression) {
+    auto dir = cp6TempDir("fr5_truncate_pending");
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t o = 0; o < 9; ++o) log.append(cp6Batch(o, "k" + std::to_string(o), "v"), o);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(783);
+    PartitionReplica follower(cfg, Role::Follower, 1, {1, 2}, {1, 2}, &log, &transport);
+    follower.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    // An accepted compaction output whose renames are still posted.
+    {
+        const auto snap = log.sealedSegmentSnapshot();
+        const int64_t b = (*snap)[1].baseOffset;   // segment 2 = [2,4)
+        std::filesystem::copy_file(log.segmentForTest(b)->logPath(), Log::cleanedLogPath(log.dir(), b, 51));
+        std::string idx = log.segmentForTest(b)->logPath();
+        idx = idx.substr(0, idx.size() - 4) + ".index";
+        std::filesystem::copy_file(idx, Log::cleanedIndexPath(log.dir(), b, 51));
+        const Log::CleanedMember m[] = {{b, (*snap)[1].lineage}};
+        ASSERT_TRUE(log.enqueueCleanedGroup(m, 1, 51, true, b + 2, log.openCleanedOutput(b, 51, b + 2).release()));
+        ASSERT_EQ(log.drainCleanerSwaps(), 1);
+        ASSERT_TRUE(log.cleanerFileOpsPending());
+    }
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 2;
+    resp.partition   = 0;
+    resp.topicId     = 783;
+    resp.errorCode   = rune::replication::kErrDivergingEpoch;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records     = epb.set(/*epoch=*/1, /*endOffset=*/5);
+    follower.applyReplicated(resp);
+    EXPECT_TRUE(follower.truncatePendingForTest());
+    EXPECT_EQ(follower.truncatesDeferred(), 1u);
+    EXPECT_EQ(log.logEndOffset(), 9) << "nothing truncated yet";
+    // Data arriving meanwhile is dropped (it would extend the diverged tail).
+    const auto data = cp6Batch(9, "late", "x");
+    FetchResponseMsg dataResp{};
+    dataResp.leaderEpoch = 2; dataResp.partition = 0; dataResp.topicId = 783;
+    dataResp.records = std::span<const uint8_t>(data.data(), data.size());
+    follower.applyReplicated(dataResp);
+    EXPECT_EQ(follower.appliesDroppedTruncatePending(), 1u);
+    EXPECT_EQ(log.logEndOffset(), 9);
+    // Duty passes while the cleaner has not run (or throws): still pending, no wait.
+    (void)follower.doWork(10'000'000);
+    EXPECT_TRUE(follower.truncatePendingForTest());
+    log.failNextCleanerApplyForTest();
+    (void)log.runCleanerFileOps(0);
+    (void)follower.doWork(20'000'000);
+    EXPECT_TRUE(follower.truncatePendingForTest());
+    (void)log.runCleanerFileOps(0);           // the cleaner catches up
+    (void)follower.doWork(30'000'000);        // the owner completes it
+    EXPECT_FALSE(follower.truncatePendingForTest());
+    EXPECT_EQ(log.logEndOffset(), 5);
+    fs::remove_all(dir);
+}

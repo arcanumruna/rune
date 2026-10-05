@@ -191,6 +191,10 @@ public:
     // -----------------------------------------------------------------------
     const char* name() const noexcept override { return "rune-cleaner"; }
 
+    /// Test seam (N4-CRITICAL-1 repro): skip the per-cycle file ops at the top
+    /// of doWork, so an owner accept can land right before a compaction pass.
+    void setSkipCycleFileOpsForTest(bool v) noexcept { skipCycleFileOpsForTest_ = v; }
+
     int doWork(int64_t nowNs) override {
         if (channel_) applyViewUpdates_();
         if (!registry_ && !channel_) return 0;
@@ -228,8 +232,10 @@ public:
         // objects, directory fsync, expired *.deleted sweep.  Every replica (any
         // role): the owner posts regardless of role.  Housekeeping like the
         // pre-provisioning above: not folded into the return value.
-        for (auto* r : replicas_()) {
-            if (r && r->isDiskBacked()) (void)r->log()->runCleanerFileOps(nowMs, r->fileDeleteDelayMs());
+        if (!skipCycleFileOpsForTest_) {
+            for (auto* r : replicas_()) {
+                if (r && r->isDiskBacked()) (void)r->log()->runCleanerFileOps(nowMs, r->fileDeleteDelayMs());
+            }
         }
 
         // ---------------------------------------------------------------
@@ -297,6 +303,15 @@ public:
             // pass) — a second pass over the same snapshot would only produce
             // duplicates the owner must reject.
             if (log->cleanerSwapsPending()) continue;
+            // N4-CRITICAL-1: the owner may have accepted a group (swap ring now
+            // empty) whose renames are still posted — a pass would read the OLD
+            // <b1>.log by path while the snapshot says b1 spans the merged range,
+            // and drop the merged members' records.  Perform the posted file ops
+            // NOW and start a pass only if none remain (the owner posts its msgs
+            // before its swapHead_ release, so empty swap ring + empty msg ring ⇒
+            // every name is canonical).
+            (void)log->runCleanerFileOps(nowMs, replica->fileDeleteDelayMs());
+            if (log->cleanerFileOpsPending()) continue;
             // N-MEDIUM-1: fold the owner's published rewind (rejected outputs)
             // into the cleaner-owned watermark before reading it.
             replica->applyCleanerRewind();
@@ -911,6 +926,7 @@ private:
     // steady-state cleaner cycle performs near-zero heap allocation.
     rune::storage::SkimpyOffsetMap dedupeMap_;
     std::vector<int64_t> scratchBases_;
+    bool skipCycleFileOpsForTest_ = false;   ///< test seam: skip the top-of-cycle file ops
     uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)
     std::array<rune::storage::Log::CleanedMember, rune::storage::LogCleaner::kMaxDeferredGroupMembers> scratchMembers_{};
     std::vector<int64_t> scratchSizes_;

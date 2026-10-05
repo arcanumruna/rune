@@ -758,6 +758,10 @@ public:
     /// when every member base is below min(HW, LSO) — the cleaner selected them
     /// strictly below both.  Owner thread (reads the live HW).
     [[nodiscard]] Offset cleanerSwapBound() const noexcept {
+        // Compaction is leader-only: an output the cleaner produced before a
+        // demotion is rejected (bound below every base), never installed on a
+        // follower.
+        if (role_ != Role::Leader) return std::numeric_limits<Offset>::min();
         return std::min<Offset>(highWatermark(), cleanerLastStableOffset());
     }
     /// Fix round 2: drain the cleaner's swap ring on the OWNER thread (validate +
@@ -1052,6 +1056,18 @@ private:
     /// (Follower) Truncate the log to `truncateOffset` (inclusive last valid
     /// offset = truncateOffset - 1).  Updates local LEO.
     void truncateLog(Offset truncateOffset);
+    /// Fix round 5: the tail of a KIP-279 divergence truncation (truncate, reset
+    /// the fetch state, re-fetch) — run at once or from TruncatePending.
+    void completeDivergenceTruncation_(Offset truncTo);
+public:
+    /// Fix round 5 observability: divergence truncations deferred because the
+    /// log cleaner had posted renames pending; applies dropped meanwhile.
+    [[nodiscard]] uint64_t truncatesDeferred() const noexcept { return truncatesDeferred_; }
+    [[nodiscard]] uint64_t appliesDroppedTruncatePending() const noexcept { return appliesDroppedTruncatePending_; }
+    [[nodiscard]] bool     truncatePendingForTest() const noexcept { return followerSync_.truncatePending(); }
+private:
+    uint64_t truncatesDeferred_ = 0;
+    uint64_t appliesDroppedTruncatePending_ = 0;
 
     /// (Leader) GR-10: push records to all ISR followers via unsolicited
     /// FetchResponse.  Non-blocking (tryClaim/offer).  F27: each follower is

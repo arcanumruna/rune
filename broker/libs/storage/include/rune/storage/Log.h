@@ -348,7 +348,10 @@ public:
     /// The log's logEndOffset is reset to truncateOffset.
     /// Segments entirely beyond truncateOffset are deleted.
     /// The active segment is physically truncated at the correct byte boundary.
-    void truncateTo(int64_t truncateOffset);
+    /// Fix round 5: returns false (nothing done) when the cleaner has not yet
+    /// performed every posted file operation — retry on a later duty pass (the
+    /// replica parks in FollowerSync::TruncatePending; never waits).
+    bool truncateTo(int64_t truncateOffset);
     std::vector<int64_t> segmentBaseOffsets() const;
     /// F15 S4 (I-C): the base offset of the first segment whose base is
     /// strictly above `offset`, or -1 if none.  Non-allocating, O(log segments);
@@ -381,7 +384,7 @@ public:
     /// Reload all segments from disk (close + reopen every LogSegment).
     /// Used by LogCleaner after atomically rewriting segment files on disk,
     /// so that in-memory file handles reflect the new file contents.
-    void reloadSegments();
+    bool reloadSegments();   ///< false = deferred (see truncateTo)
     /// CP-2: reload a SINGLE sealed segment in place (close + reopen just that
     /// LogSegment) after its .log file was atomically rewritten by the cleaner.
     /// O(1) in the number of segments — avoids the O(n) full-log reloadSegments()
@@ -540,6 +543,21 @@ public:
     /// the directory, and sweep expired *.deleted files.  Never waits: skips
     /// the cycle if the owner holds the file-op token.  Returns operations done.
     int runCleanerFileOps(int64_t nowMs, int64_t fileDeleteDelayMs = 0);
+    /// Owner: every posted file operation has been performed by the cleaner
+    /// (owner cold paths — truncate / reload / size retention — need it).
+    [[nodiscard]] bool fileOpsQuiescent() const noexcept;
+    /// Owner: try to start a cold path now (true = quiescent; the caller then
+    /// calls truncateTo / reloadSegments).  false = it is deferred and the
+    /// owner's drains post nothing until it runs or is cancelled.
+    [[nodiscard]] bool tryBeginColdPath() noexcept { return beginColdPath_(); }
+    /// Owner: a deferred cold path was abandoned (role change) — resume posting.
+    void cancelColdPathWait() noexcept { pauseSwapPost_ = pauseDropPost_ = false; }
+    /// Cleaner thread: posted operations not yet performed (a compaction pass
+    /// must not start on this log before they are — fix round 5).
+    [[nodiscard]] bool cleanerFileOpsPending() const noexcept;
+    /// Test / observability (cleaner thread).
+    void failNextCleanerApplyForTest() noexcept { failNextCleanerApplyForTest_ = true; }
+    [[nodiscard]] uint64_t checkpointWriteFailuresForTest() const noexcept { return checkpointWriteFailures_; }
     /// Cleaner thread: open a finished output as a trusted sealed segment
     /// (handed to the owner with enqueueCleanedGroup).  Throws on failure.
     std::unique_ptr<LogSegment> openCleanedOutput(int64_t base, uint64_t seq, int64_t nextOffset) const;
@@ -849,41 +867,62 @@ private:
         uint16_t    n = 0;               ///< SwapAccepted: number of Dispose slots that follow
         MsgKind     kind = MsgKind::Dispose;
         bool        hasOutput = false;
+        uint8_t     reason = 0;          ///< SwapRejected: RejectReason (logged by the cleaner)
     };   // 40 bytes
     static constexpr std::size_t kMsgRingCapacity = 512;   // >= kSwapRingCapacity + 1
-    int ownerFsDepth_ = 0;   ///< owner-thread re-entrancy of OwnerFsGuard
     static int64_t readLogStartCheckpoint(const std::string& dir);
     static constexpr std::size_t kMsgRingMask     = kMsgRingCapacity - 1;
     std::array<CleanerMsg, kMsgRingCapacity> msgRing_{};
-    alignas(64) std::atomic<std::size_t> msgHead_{0};   // consumer index (token holder)
+    alignas(64) std::atomic<std::size_t> msgHead_{0};   // consumer index (cleaner; ~Log once it stopped)
     alignas(64) std::atomic<std::size_t> msgTail_{0};   // producer index (owner)
-    /// Directory file-op token: 0 free, 1 cleaner, 2 owner.  Whoever holds it is
-    /// the ONLY thread renaming / unlinking segment files of this log and the
-    /// msgRing_ consumer.  The cleaner takes it per cycle (try, never waits); the
-    /// owner takes it only on COLD paths (truncate / reload / recover / shutdown)
-    /// and then completes every posted operation itself first, so those paths
-    /// always see canonical on-disk names.
-    alignas(64) std::atomic<int> fsToken_{0};
-    /// Persisted log start (log-start-offset-checkpoint); guarded by fsToken_.
+    /// Fix round 5 (no lock, no wait): the ONLY renames / unlinks of live
+    /// segment names are the posted operations, performed by the cleaner.  An
+    /// owner COLD path (truncate / reload / size retention) runs only when every
+    /// posted operation has been performed (fileOpsQuiescent: head == tail,
+    /// acquire) — the owner posts nothing while it waits (coldPathWanted_), so
+    /// the cold path then owns every name.  Otherwise it is deferred to a later
+    /// duty pass (PartitionReplica: FollowerSync TruncatePending).
+    /// A deferred cold path pauses the NEXT swap drain and the NEXT retention
+    /// drain (one each, then cleared): a waiter that retries every pass
+    /// (FollowerSync::TruncatePending) re-arms it each pass; a one-shot caller
+    /// never stalls posting for longer than one pass.
+    bool pauseSwapPost_ = false;
+    bool pauseDropPost_ = false;
+    /// Persisted log start (log-start-offset-checkpoint).  Written by the cleaner
+    /// while applying posted drops, or by the owner's quiescent cold path; the
+    /// msg ring's release/acquire orders the two.
     int64_t persistedLogStart_ = 0;
+    /// Cleaner → owner: errno of a failed log-start checkpoint write (0 = none).
+    /// The owner fails the log (markStorageFailed) on its next drain.
+    alignas(64) std::atomic<int> cleanerFailedErrno_{0};
+    bool failNextCleanerApplyForTest_ = false;   ///< test seam (cleaner thread)
+    uint64_t checkpointWriteFailures_ = 0;       ///< cleaner thread
     /// Owner: room for `n` messages?  (single producer; head acquire)
     bool msgRoom_(std::size_t n) const noexcept;
     /// Owner: publish `n` messages with ONE release-store (room checked first).
     void postMsgs_(const CleanerMsg* m, std::size_t n) noexcept;
-    /// Token holder: perform every posted operation.  `durable` = the renames
-    /// happen (false only for a simulated crash: objects freed, disk untouched).
-    /// Returns whether any directory entry changed.
+    /// msgRing_ consumer (cleaner; or ~Log after the cleaner stopped): perform
+    /// the posted operations in order.  `durable` = the renames happen (false
+    /// only for a simulated crash: objects freed, disk untouched).  Stops — and
+    /// retries next cycle — before a retention drop whose log-start checkpoint
+    /// could not be written, or at an exception (head = the first unfinished
+    /// message).  Returns whether any directory entry changed.
     bool applyCleanerMsgs_(int64_t nowMs, bool durable);
-    /// Owner cold paths: take the token (waiting out a cleaner cycle in
-    /// progress — bounded, a few renames), complete all posted operations.
-    void ownerTakeFsToken_();
-    void ownerReleaseFsToken_() noexcept;
-    struct OwnerFsGuard {
-        Log& l;
-        explicit OwnerFsGuard(Log& log) : l(log) { l.ownerTakeFsToken_(); }
-        ~OwnerFsGuard() { l.ownerReleaseFsToken_(); }
-    };
-    /// Token holder: write log-start-offset-checkpoint (tmp + fsync + rename + dir fsync).
+    /// Body of applyCleanerMsgs_: performs [i, tail), advancing i past each
+    /// finished message (left at the first unfinished one on a stop / throw).
+    bool applyCleanerMsgRange_(std::size_t& i, std::size_t tail, int64_t nowMs, bool durable);
+    int rejectLogBudget_ = 64;   ///< cleaner thread: rejection log lines per Log (rate limit)
+    /// Why the owner rejected a cleaner output (logged by the cleaner).
+    enum class RejectReason : uint8_t { FrontGone = 1, NotContiguous, Active, Lineage, AboveBound,
+                                        RenamePending, FlushInFlight, RecoveryPoint, BadOutput };
+    /// Owner: may a cold path run now?  true = every posted operation is done
+    /// (and coldPathWanted_ is cleared); false = deferred (posting paused).
+    bool beginColdPath_() noexcept;
+    /// Owner drains (swap / retention): false while a cold path waits for the
+    /// cleaner to drain the msg ring (posting would starve it).  Also surfaces a
+    /// cleaner checkpoint failure as a storage failure.
+    bool ownerDrainAllowed_(bool& pause) noexcept;
+    /// Cleaner (or owner cold path when quiescent): write log-start-offset-checkpoint (tmp + fsync + rename + dir fsync).
     bool writeLogStartCheckpoint_(int64_t v);
     static constexpr const char* kLogStartFile    = "log-start-offset-checkpoint";
     static constexpr const char* kLogStartTmpFile = "log-start-offset-checkpoint.tmp";

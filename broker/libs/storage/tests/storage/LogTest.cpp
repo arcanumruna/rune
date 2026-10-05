@@ -2023,14 +2023,26 @@ TEST(LogRegression, SnapshotTimestampsSurviveRetentionDeletesThenRollsRegression
     const auto bases = log.segmentBaseOffsets();
     ASSERT_GE(bases.size(), 20u);
     for (int k = 0; k < 5; ++k) ASSERT_TRUE(log.enqueueDeletedSegment(bases[k]));
+    // Fix round 5 (N4-LOW-2, Kafka): retention deletes only a prefix — a middle
+    // proposal is refused; the middle segment leaves via a compaction drop.
     ASSERT_TRUE(log.enqueueDeletedSegment(bases[10]));
-    EXPECT_EQ(log.drainRetentionDeletes(), 6);
+    EXPECT_EQ(log.drainRetentionDeletes(), 5);
+    EXPECT_NE(findSeg(*log.sealedSegmentSnapshot(), bases[10]), nullptr) << "no hole below HW";
+    {
+        std::string b10 = std::to_string(bases[10]);
+        b10 = std::string(20 - b10.size(), '0') + b10;
+        std::filesystem::remove(dir / (b10 + ".log"));
+        std::filesystem::remove(dir / (b10 + ".index"));
+    }
+    log.reloadSegment(bases[10]);   // the cleaner emptied it (legacy reload drops it)
     expectSnapshotMatchesSegments(log);
     for (int64_t i = 22; i < 24; ++i) appendTs(log, i, 100'000 + i);   // two more rolls
     expectSnapshotMatchesSegments(log);
     const auto snap = log.sealedSegmentSnapshot();
     for (const auto& si : *snap) {
-        EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset) << "segment base " << si.baseOffset;
+        // bases[9] took bases[10]'s offsets (and conservatively its timestamp).
+        const int64_t expected = si.baseOffset == bases[9] ? 100'000 + bases[10] : 100'000 + si.baseOffset;
+        EXPECT_EQ(si.largestTimestamp, expected) << "segment base " << si.baseOffset;
         EXPECT_NE(si.baseOffset, bases[10]);
         EXPECT_GE(si.baseOffset, bases[5]);
     }
@@ -2275,10 +2287,11 @@ TEST(LogRegression, StaleLineageCleanerWorkIsDroppedRegression) {
         ASSERT_FALSE(bytes.empty());
         EXPECT_EQ(RecordBatchReader(bytes.data(), bytes.size()).baseOffset(), 3);
     }
-    // The CURRENT lineage still applies.
+    // The CURRENT lineage still applies (retention deletes a prefix: 0 first).
     const uint64_t cur = findSeg(*log.sealedSegmentSnapshot(), 2)->lineage;
+    ASSERT_TRUE(log.enqueueDeletedSegment(0, findSeg(*log.sealedSegmentSnapshot(), 0)->lineage));
     ASSERT_TRUE(log.enqueueDeletedSegment(2, cur));
-    EXPECT_EQ(log.drainRetentionDeletes(), 1);
+    EXPECT_EQ(log.drainRetentionDeletes(), 2);
     EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), 2), nullptr);
     // Fix round 4: the owner touched no file; the cleaner renames both away.
     EXPECT_TRUE(std::filesystem::exists(segFile(dir, 2, ".log")));
@@ -2626,12 +2639,19 @@ TEST(LogRegression, TruncateAndReloadCompleteAcceptedSwapFirstRegression) {
         for (int64_t i = 0; i < 9; ++i) appendTs(log, i, 1000 + i);
         acceptOutputWithoutFileOps(log, dir, {2, 4}, 32);   // in memory: segment 2 covers [2,6)
         EXPECT_FALSE(std::filesystem::exists(segFile(dir, 2, ".log.32.deleted"))) << "no rename yet";
+        // Fix round 5: the owner never renames / waits — a cold path is DEFERRED
+        // while the cleaner has posted renames pending, and nothing changes.
+        if (viaReload) EXPECT_FALSE(log.reloadSegments());
+        else           EXPECT_FALSE(log.truncateTo(5));
+        EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 6, 8}));
+        EXPECT_EQ(log.logEndOffset(), 9);
+        log.runCleanerFileOps(0);   // the cleaner's next cycle performs them
         if (viaReload) {
-            log.reloadSegments();   // must see the merged file at its canonical name
+            EXPECT_TRUE(log.reloadSegments());   // sees the merged file at its canonical name
             EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 6, 8}));
             for (int64_t o = 0; o < 9; ++o) EXPECT_EQ(firstOffsetAt(log, o), o) << "reload offset " << o;
         } else {
-            log.truncateTo(5);      // into the accepted (not yet renamed) segment
+            EXPECT_TRUE(log.truncateTo(5));      // into the accepted (now renamed) segment
             EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2}));
             EXPECT_EQ(log.logEndOffset(), 5);
             for (int64_t o = 0; o < 5; ++o) EXPECT_EQ(firstOffsetAt(log, o), o) << "truncate offset " << o;
@@ -2692,5 +2712,57 @@ TEST(LogRegression, RetentionCrashWindowsRecoverRegression) {
         EXPECT_EQ(log.logStartOffset(), 1);
         for (int64_t o = 1; o < 8; ++o) EXPECT_EQ(firstOffsetAt(log, o), o) << "offset " << o;
     }
+    std::filesystem::remove_all(dir);
+}
+
+// ===========================================================================
+// Fix round 5: no wait on the owner — cold paths defer until the cleaner has
+// performed its posted operations; failures never block the owner forever.
+// ===========================================================================
+TEST(LogRegression, ColdPathDefersWithoutWaitingAndSurvivesCleanerExceptionRegression) {
+    auto dir = makeTempDir("rune_log_r5_defer");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 9; ++i) appendTs(log, i, 1000 + i);
+    acceptOutputWithoutFileOps(log, dir, {2, 4}, 41);
+    EXPECT_FALSE(log.fileOpsQuiescent());
+    EXPECT_FALSE(log.truncateTo(5)) << "deferred, never waited";
+    // While the cold path waits, the owner posts nothing new (no starvation).
+    const auto snap = log.sealedSegmentSnapshot();
+    ASSERT_TRUE(log.enqueueDeletedSegment(0, findSeg(*snap, 0)->lineage));
+    EXPECT_EQ(log.drainRetentionDeletes(), 0);
+    // The cleaner throws mid-cycle: nothing is held; the work is retried.
+    log.failNextCleanerApplyForTest();
+    (void)log.runCleanerFileOps(0);
+    EXPECT_FALSE(log.fileOpsQuiescent());
+    EXPECT_FALSE(log.truncateTo(5));
+    (void)log.runCleanerFileOps(0);   // next cycle completes
+    EXPECT_TRUE(log.fileOpsQuiescent());
+    EXPECT_TRUE(log.truncateTo(5));
+    EXPECT_EQ(log.logEndOffset(), 5);
+    for (int64_t o = 0; o < 5; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
+    EXPECT_EQ(log.drainRetentionDeletes(), 1) << "posting resumed after the cold path ran";
+    std::filesystem::remove_all(dir);
+}
+
+TEST(LogRegression, FailedLogStartCheckpointNeverRenamesAndFailsTheLogRegression) {
+    auto dir = makeTempDir("rune_log_r5_ckpt_fail");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    log.recover();
+    for (int64_t i = 0; i < 9; ++i) appendTs(log, i, 1000 + i);
+    ASSERT_TRUE(log.enqueueDeletedSegment(0, (*log.sealedSegmentSnapshot())[0].lineage));
+    ASSERT_EQ(log.drainRetentionDeletes(), 1);
+    std::filesystem::create_directories(dir / "log-start-offset-checkpoint.tmp");   // the write fails
+    (void)log.runCleanerFileOps(0, 1'000'000);
+    EXPECT_EQ(log.checkpointWriteFailuresForTest(), 1u);
+    EXPECT_TRUE(std::filesystem::exists(segFile(dir, 0, ".log"))) << "no rename without a durable log start";
+    EXPECT_FALSE(log.fileOpsQuiescent()) << "the drop stays posted (retried)";
+    EXPECT_EQ(log.drainRetentionDeletes(), 0);
+    EXPECT_TRUE(log.storageFailed()) << "the owner fails the log (Kafka: checkpoint IOException)";
+    std::filesystem::remove_all(dir / "log-start-offset-checkpoint.tmp");
+    (void)log.runCleanerFileOps(0, 1'000'000);
+    EXPECT_FALSE(std::filesystem::exists(segFile(dir, 0, ".log")));
+    EXPECT_TRUE(log.fileOpsQuiescent());
     std::filesystem::remove_all(dir);
 }
