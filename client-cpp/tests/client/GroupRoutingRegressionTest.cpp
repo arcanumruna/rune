@@ -964,3 +964,39 @@ TEST(GroupRoutingRegression, JoinGroupRefusedForVersionFinishesTheConsumerRegres
     EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
     EXPECT_EQ(r.gw.joinGroups, 1);
 }
+
+
+// CG round 4 (A-MEDIUM-3): a rolling upgrade — the seed / coordinator runs v3
+// but p1's leader node still runs an older broker (its pushes would carry no
+// Subscribe correlationId: every batch dropped, a silent stall).  The member
+// never subscribes p1 there (parked, logged) and keeps consuming p0.  RED
+// (round 3): it subscribed p1 on the old node.
+TEST(GroupRoutingRegression, PartitionLedByAnOldNodeIsParkedNotSilentlyStalledRegression) {
+    GroupRig r(4151, 4152);
+    const auto [n1, p1port] = r.addNode(4151);
+    r.gw.advertisedBrokerVersionAt[n1] = -1;  // node 1: an older broker's ConnectResponse
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4151, ""}, {1, 1, 1, 1, 4151, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.gw.connectsAt[n1] > 0; }));
+    r.gw.pushRecords(*r.subAt(0, 0), 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.records[0] == 2; }));
+    // Marker: a Ping answered after every frame sent before it reached the gateway.
+    const uint8_t echo[1] = {1};
+    const rc::Token pt = r.nextToken++;
+    ASSERT_EQ(r.client.ping(std::span<const uint8_t>(echo), r.cq, pt), rc::OpResult::Accepted);
+    bool pong = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) { if (cc.token == pt) pong = true; });
+        return pong;
+    }));
+    EXPECT_EQ(r.subAt(1, n1), nullptr) << "subscribed a partition on a node that cannot tag its pushes";
+    EXPECT_FALSE(gc.finished()) << "the rest of the assignment keeps running";
+}

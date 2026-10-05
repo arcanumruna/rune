@@ -229,6 +229,7 @@ Client::Client(ClientConfig cfg)
         fr.sessionId     = &Client::fetchSessionIdTrampoline_;
         fr.epoch         = &Client::fetchEpochTrampoline_;
         fr.revive        = &Client::fetchReviveTrampoline_;
+        fr.brokerVersion = &Client::fetchBrokerVersionTrampoline_;
         fr.offer         = &Client::fetchOfferTrampoline_;
         groupConsumerHub_.setFetchRouter(fr);
     }
@@ -1861,7 +1862,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // JoinGroup, onConnected) concerns it.
         if (agent_.lastConnectSession() != 0) {
             if (ec == rpc::ErrorCode::OK && agent_.lastConnectAccepted() && !groupConsumerHub_.empty()) {
-                (void)groupConsumerHub_.resendUnanswered();  // a session event: unanswered Subscribes re-sent
+                // That session's event: its unanswered Subscribes are re-sent.
+                (void)groupConsumerHub_.resendUnanswered(agent_.lastConnectSession());
             }
             break;
         }
@@ -3275,6 +3277,10 @@ uint64_t Client::fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept {
     return static_cast<Client*>(ctx)->agent_.connectedEpoch(session);
 }
 
+int32_t Client::fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {
+    return static_cast<Client*>(ctx)->agent_.sessionBrokerVersion(session);
+}
+
 void Client::fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept {
     auto* self = static_cast<Client*>(ctx);
     (void)self->agent_.reviveSession(session, self->now());
@@ -3311,6 +3317,7 @@ int Client::watchGroupSessions_(int64_t nowNs) {
         const uint64_t bit = uint64_t{1} << (i - 1);
         if ((events & bit) == 0 || !groupConsumerHub_.fetchUses(i)) continue;
         affected = true;
+        (void)groupConsumerHub_.resendUnanswered(i);  // that session's unanswered Subscribes
         // A terminally Disconnected node session the group depends on never
         // stays so: a fresh connect (its own connect budget paces the retries —
         // each failure is the next event).
@@ -3320,7 +3327,7 @@ int Client::watchGroupSessions_(int64_t nowNs) {
     // The leader may have moved: ask now (rate-limited, falls back to the
     // backoff refresh); the answer re-routes (onMetadataResponse -> reconcile).
     requestMetadataNow_();
-    (void)groupConsumerHub_.resendUnanswered();  // a session event: unanswered Subscribes re-sent
+    (void)groupConsumerHub_.reconcileFetch();
     return 1;
 }
 

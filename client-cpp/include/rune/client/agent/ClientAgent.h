@@ -155,6 +155,9 @@ struct Session {
     /// session Connected (a resume, a reconnect, a node restart that re-used the
     /// broker session id — MEDIUM-1: the broker id alone cannot tell them apart).
     uint64_t    connectEpoch         = 0;
+    /// The node's ConnectResponse.brokerVersion of the latest accepted connect
+    /// (A-MEDIUM-3: every node a group partition is read from must be >= 3).
+    int32_t     brokerVersion        = 0;
 
     Session(ClientAgent* agent, session::SessionConfig cfg,
             std::string sessionEndpoint)
@@ -417,6 +420,10 @@ public:
         if (index >= sessions_.size()) return 0;
         const Session& s = *sessions_[index];
         return s.machine.state() == session::SessionState::Connected ? s.connectEpoch : 0;
+    }
+    /// Session `index`'s node broker version (latest accepted connect; 0 = unknown).
+    [[nodiscard]] int32_t sessionBrokerVersion(uint32_t index) const noexcept {
+        return index < sessions_.size() ? sessions_[index]->brokerVersion : 0;
     }
     /// Session `index`'s state (Disconnected when out of range).
     [[nodiscard]] session::SessionState sessionStateAt(uint32_t index) const noexcept {

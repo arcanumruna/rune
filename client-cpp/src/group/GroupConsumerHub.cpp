@@ -616,7 +616,7 @@ void GroupConsumerHub::learnLateFromRecords_(const codec::RecordsView& rv)
 {
     for (std::size_t i = 0; i < late_.size(); ++i) {
         const LateSub l = late_[i];
-        if (l.corrId != rv.correlationId) continue;
+        if (l.corrId != rv.correlationId || l.brokerSid != rv.sessionId) continue;  // another client's push
         late_[i] = late_.back();
         late_.pop_back();
         unsubscribe_(l.session, l.epoch, rv.subscriptionId, l.tp);
@@ -673,7 +673,7 @@ void GroupConsumerHub::dropFetch_(const TopicPartition& tp, GroupConsumerImpl::F
         if (fs.subscriptionId != 0) {
             unsubscribe_(fs.session, fs.epoch, fs.subscriptionId, tp);
         } else if (fs.corrId != 0) {
-            late_.push_back(LateSub{fs.corrId, fs.session, fs.epoch, tp});
+            late_.push_back(LateSub{fs.corrId, fs.session, fs.epoch, tp, fs.brokerSid});
         }
     }
     fs.epoch          = 0;
@@ -734,6 +734,22 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
             if (router_.revive != nullptr) router_.revive(router_.ctx, target);
             continue;
         }
+        // A-MEDIUM-3: a node that predates explicit group subscriptions pushes
+        // without the Subscribe's correlationId — every batch would be dropped
+        // (a silent stall).  Park the partition, say why; fresh metadata (e.g.
+        // the upgraded node reconnecting) retries.
+        if (target != 0 && router_.brokerVersion != nullptr &&
+            router_.brokerVersion(router_.ctx, target) <
+                rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions) {
+            std::fprintf(stderr,
+                "rune-client: group '%s' topic %d partition %d: its leader node runs broker version %d "
+                "(< %d, explicit group subscriptions) — partition parked until the node is upgraded\n",
+                impl.groupId.c_str(), tp.topicId, tp.partition, router_.brokerVersion(router_.ctx, target),
+                rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions);
+            fs.parked       = true;
+            metadataWanted_ = true;
+            continue;
+        }
         const int64_t corr = nextFetchCorr_tagged_();
         constexpr std::size_t kSubscribeFrameSize = 44u;
         ensureBuf(impl, kSubscribeFrameSize);
@@ -762,18 +778,21 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
     return sent;
 }
 
-int GroupConsumerHub::resendUnanswered()
+int GroupConsumerHub::resendUnanswered(uint32_t session)
 {
     if (!routed_()) return 0;
-    // MEDIUM-2 (round 3): a Subscribe that got neither its answer nor a push is
-    // re-sent on routing / session events and each new generation (never on a
-    // clock): the old instance is abandoned (late_: unsubscribed if its id ever
-    // shows up — its pushes carry its own correlationId, never the new one's).
+    // MEDIUM-2 (round 3/4): a Subscribe that got neither its answer nor a push
+    // is re-sent on THAT session's events (it (re)connected, was lost, ...) and
+    // each new generation (never on a clock): the old instance is abandoned
+    // (late_: unsubscribed if its id ever shows up — its pushes carry its own
+    // correlationId, never the new one's).  Other sessions' in-flight
+    // Subscribes are left alone (A-MEDIUM-2: their answers are queued by the
+    // broker, never lost on a live session).
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active || impl->state != GroupConsumerState::Stable) continue;
         for (auto& [tp, fs] : impl->fetch) {
-            if (fs.epoch != 0 && fs.corrId != 0) dropFetch_(tp, fs);
+            if (fs.epoch != 0 && fs.corrId != 0 && fs.session == session) dropFetch_(tp, fs);
         }
     }
     return reconcileFetch();

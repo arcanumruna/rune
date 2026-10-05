@@ -725,3 +725,30 @@ TEST(SubscriberHubCommand, FatalUnsubscribeFinishesLocallyRegression) {
     EXPECT_EQ(tx.fatals, 2);
     EXPECT_EQ(tx.unsubscribesFor(65) + tx.unsubscribesFor(66), 0);
 }
+
+// CG round 4 (A-MEDIUM-1): a pending plain subscription is bound by a push
+// only when the client HAS a session and the push is that session's.  During
+// a fresh connect (session id 0) another client's push on a shared publication
+// carrying the same small correlationId must not bind it.  RED (round 3): 0
+// meant "unchecked" — it bound the foreign subscription.
+TEST(SubscriberHubCommand, PushNeverBindsAPendingSubscriptionWithoutASessionRegression) {
+    SubscriberHub hub;
+    CaptureSend   send;
+    int delivered = 0;
+    auto impl = makeImpl(7, &delivered);
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    std::vector<uint8_t> st;
+    auto foreign = records(st, /*subId=*/9001, 0, 2);
+    foreign.correlationId = 7;           // another client's Subscribe, same small id
+    foreign.sessionId     = 555;         // ... on its own session
+    hub.onRecords(foreign, /*currentSessionId=*/0);  // this client is mid-connect
+    EXPECT_EQ(delivered, 0);
+    EXPECT_EQ(impl->subscriptionId, 0) << "a foreign push bound the pending subscription";
+    // Its own push, once the session exists, binds it.
+    auto own = records(st, /*subId=*/77, 0, 2);
+    own.correlationId = 7;
+    own.sessionId     = kSession;
+    hub.onRecords(own, kSession);
+    EXPECT_EQ(impl->subscriptionId, 77);
+    EXPECT_EQ(delivered, 2);
+}

@@ -428,12 +428,17 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         // correlationId of the Subscribe that created it — the first Records
         // frame binds a still-pending subscription (its SubscribeResponse may
         // arrive later, on another publication).  Cold: once per subscription.
-        if (rv.correlationId == 0) return;  // unknown / already-removed subscription
+        // LOW-1 (round 4): a group fetch push (bit-61 correlationId) is never a
+        // plain subscription's — one compare instead of a map lookup per batch.
+        if (rv.correlationId == 0 || (rv.correlationId & (int64_t{1} << 61)) != 0) return;
+        // A-MEDIUM-1 (round 4): no session yet (a fresh connect) = no binding by
+        // push: another client's push on a shared publication could carry the
+        // same small correlationId.  The SubscribeResponse still binds.
+        if (currentSessionId == 0 || rv.sessionId != currentSessionId) return;
         const auto p = pendingByCorrelation_.find(rv.correlationId);
         if (p == pendingByCorrelation_.end() || p->second->impl == nullptr) return;
         SubscriptionImpl* pi = p->second->impl;
         if (!pi->active || rv.topicId != pi->topicId) return;
-        if (currentSessionId != 0 && rv.sessionId != currentSessionId) return;  // another session's push
         clearUnsent_(*p->second);
         pendingByCorrelation_.erase(p);
         pi->subscriptionId = rv.subscriptionId;

@@ -148,7 +148,9 @@ public:
     /// the high bits), the creating Subscribe's correlationId (stamped on every
     /// push; a pending subscription is bound by its first Records frame), and
     /// the subscription's own topic / resolved partition.  `currentSessionId`:
-    /// the seed session's broker id (0 = unchecked).
+    /// the seed session's broker id — a pending subscription is bound by a push
+    /// only when it is non-zero and equals the push's session (0 = no session:
+    /// only the SubscribeResponse binds).
     void onRecords(const codec::RecordsView& rv, int64_t currentSessionId = 0);
 
     /// Fail / deactivate all subscriptions (called on close, after the duty

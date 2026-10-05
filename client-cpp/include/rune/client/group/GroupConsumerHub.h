@@ -246,6 +246,10 @@ public:
         /// MEDIUM-1: re-drive the connect of a node session that is terminally
         /// Disconnected (optional; no-op otherwise).
         void (*revive)(void* ctx, uint32_t session) = nullptr;
+        /// A-MEDIUM-3: that session's node broker version (optional; nullptr =
+        /// current).  A partition led by a node below
+        /// kBrokerVersionExplicitGroupSubscriptions is parked, logged.
+        int32_t (*brokerVersion)(void* ctx, uint32_t session) = nullptr;
     };
     void setFetchRouter(const FetchRouter& r) noexcept { router_ = r; }
 
@@ -265,10 +269,10 @@ public:
     /// leaders and sessions (cold: group / routing events).  Also re-offers
     /// refused Unsubscribes.  Returns the Subscribe frames sent.
     int reconcileFetch();
-    /// MEDIUM-2 (round 3): re-send every still-unanswered fetch Subscribe (no
-    /// SubscribeResponse, no push yet) — called on routing / session events,
-    /// never on a timer.  Returns the Subscribe frames sent.
-    int resendUnanswered();
+    /// MEDIUM-2 (round 3/4): re-send the still-unanswered fetch Subscribes (no
+    /// SubscribeResponse, no push yet) sent on `session` — called on that
+    /// session's events, never on a timer.  Returns the Subscribe frames sent.
+    int resendUnanswered(uint32_t session);
     /// Fresh metadata: refused / parked partitions may retry.
     void unparkFetch() noexcept;
     /// A partition was parked (refused, gap loop): fresh metadata is wanted.
@@ -371,6 +375,7 @@ private:
         uint32_t       session;
         uint64_t       epoch;
         TopicPartition tp;
+        int64_t        brokerSid;  // LOW-2 (round 4): a push reveals its id only on that session
     };
     std::vector<LateSub> late_;
     struct SubRef {   // a subscription instance

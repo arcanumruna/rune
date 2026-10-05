@@ -181,6 +181,24 @@ TEST(ClientCodecConformance, ConnectResponse) {
     EXPECT_EQ(view->brokerVersion, 0) << "the v0 frame advertises no capability";
 }
 
+// CG round 4 (A-MAJOR-2): the 42-byte golden every broker >= 3 sends.
+TEST(ClientCodecConformance, ConnectResponseV3Regression) {
+    const auto golden = readVector("connect_response_v3.bin");
+    ASSERT_EQ(golden.size(), 42u);
+    const auto view = cc::decodeConnectResponse(golden.data(), golden.size());
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->brokerVersion, 3);
+    EXPECT_EQ(view->leaderMemberId, 2);
+    EXPECT_EQ(view->assignedSessionId, static_cast<int64_t>(0x00000000DEADBEEFULL));
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = cc::encodeConnectResponse(enc.data(), enc.size(),
+                                                    static_cast<int16_t>(cc::ErrorCode::OK), 2,
+                                                    static_cast<int64_t>(0x00000000DEADBEEFULL),
+                                                    kSessionId, kCorrelationId, /*brokerVersion=*/3);
+    ASSERT_EQ(n, 42u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0) << "differs from golden connect_response_v3.bin";
+}
+
 // MAJOR-2 (CG round 3): the current form appends brokerVersion; the first 38
 // bytes (bar blockLength) are the v0 form, and it decodes to version 3.
 TEST(ClientCodecConformance, ConnectResponseCarriesTheBrokerVersionRegression) {

@@ -2482,3 +2482,26 @@ TEST(GroupFetchCorrIdRegression, NegativeIdsAreNeverFetchIdsRegression) {
     EXPECT_FALSE(GroupConsumerHub::isFetchCorrId(-1));
     EXPECT_FALSE(GroupConsumerHub::isFetchCorrId(42));
 }
+
+
+// CG round 4 (A-MEDIUM-2): an event on one session re-sends only THAT
+// session's unanswered Subscribes — another session's in-flight Subscribe
+// (its answer queued by the broker) is left alone.  RED (round 3): every
+// unanswered Subscribe on every session was abandoned and re-sent.
+TEST_F(GroupConsumerHubTest, SessionEventResendsOnlyThatSessionsUnansweredRegression) {
+    FakeFetchRouter fr;
+    fr.leader  = {{0, 1u}, {1, 2u}};
+    fr.sids[1] = 501;
+    fr.sids[2] = 502;
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto o0 = makeOffsetFetchResponse(kTopicId, 0, 0);
+    hub_->onOffsetFetchResponse(o0.data(), o0.size());
+    auto o1 = makeOffsetFetchResponse(kTopicId, 1, 0);
+    hub_->onOffsetFetchResponse(o1.data(), o1.size());
+    ASSERT_EQ(fr.subscribes(1).size(), 1u);
+    ASSERT_EQ(fr.subscribes(2).size(), 1u);
+    (void)hub_->resendUnanswered(2);  // session 2 (re)connected
+    EXPECT_EQ(fr.subscribes(1).size(), 1u) << "session 1's in-flight Subscribe was abandoned";
+    EXPECT_EQ(fr.subscribes(2).size(), 2u) << "session 2's unanswered Subscribe is re-sent";
+}

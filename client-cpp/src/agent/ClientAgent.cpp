@@ -736,7 +736,10 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             if (sessions_[i].get() == &s) { lastConnectSession_ = i; break; }
         }
         lastConnectAwaited_ = awaited;
-        if (lastConnectAccepted_) ++s.connectEpoch;  // MEDIUM-1: a new connect episode
+        if (lastConnectAccepted_) {
+            ++s.connectEpoch;                  // MEDIUM-1: a new connect episode
+            s.brokerVersion = opt->brokerVersion;
+        }
         // (F8c C3: the observer — Client::onEgressFrame — publishes the new
         // state to app threads (Client::state()) BEFORE it completes the
         // connect, so a thread woken by that completion reads Connected.)

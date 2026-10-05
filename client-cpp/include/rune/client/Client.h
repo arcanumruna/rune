@@ -905,6 +905,7 @@ private:
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
+    static int32_t fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;
     /// M1 (duty thread, while a group consumer exists): a leader-node session a
     /// group partition subscribes through was lost (left Connected) or became
     /// terminally Disconnected — ask for metadata (the leader may have moved),

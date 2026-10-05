@@ -149,6 +149,7 @@ struct InvokerGateway {
     int16_t joinErrorCode = 0;
     // ConnectResponse.brokerVersion advertised (-1 = an older broker's 38-byte frame).
     int32_t advertisedBrokerVersion = rune::protocol::client::kBrokerVersion;
+    std::map<int, int32_t> advertisedBrokerVersionAt;  // per endpoint (a rolling upgrade)
     // OffsetFetch answers are held until releaseOffsetFetches().
     bool holdOffsetFetch = false;
     std::vector<std::vector<uint8_t>> heldOffsetFetches;
@@ -897,7 +898,9 @@ private:
             uint8_t out[64];
             const std::size_t n = rcc::encodeConnectResponse(
                 out, sizeof out, connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK),
-                0, sid, c->sessionId, c->correlationId, advertisedBrokerVersion);
+                0, sid, c->sessionId, c->correlationId,
+                advertisedBrokerVersionAt.count(endpoint) != 0 ? advertisedBrokerVersionAt[endpoint]
+                                                               : advertisedBrokerVersion);
             if (replyFromArrival && !replyOnAnnouncedEgress) {
                 send(endpoint, out, n);
             } else {
