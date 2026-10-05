@@ -19,6 +19,7 @@
 #include <rune/consensus/Types.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -1946,4 +1947,127 @@ TEST(ElectionLogRegression, BecomeLeaderGrantsLivenessGraceToSilentPeer) {
     EXPECT_EQ(std::find(elig2.begin(), elig2.end(), 1), elig2.end())
         << "after the grace window with no heartbeat, a genuinely silent peer "
            "MUST expire so real failover still fires";
+}
+
+// ===========================================================================
+// Controlled shutdown (2026-10-05): a resigning leader hands the consensus
+// off before it exits — it tells every follower to start an election NOW
+// (StandDown, template 59) instead of letting them wait out the leader
+// heartbeat timeout, and it never stands for election again in this process.
+// ===========================================================================
+namespace {
+// Own publisher (NOT derived from FakeConsensusPublisher: several test TUs
+// define different global classes of that name — deriving from it here would
+// pick up another TU's inline members).
+struct StandDownRecorder final : ConsensusPublisher {
+    struct Call { NodeId to; Term term; NodeId leader; };
+    std::vector<Call> standDowns;
+    int requestVotes = 0, nlts = 0;
+    void standDown(NodeId to, Term term, NodeId leader) override { standDowns.push_back({to, term, leader}); }
+    void canvassPosition(NodeId, Term, int64_t, Term, NodeId) override {}
+    void requestVote(NodeId, Term, int64_t, Term, NodeId) override { ++requestVotes; }
+    void placeVote(NodeId, Term, Term, int64_t, NodeId, NodeId, bool) override {}
+    void newLeadershipTerm(NodeId, Term, Term, int64_t, int64_t, Term, int64_t, int64_t, int64_t,
+                           int64_t, NodeId, int32_t, bool, int64_t) override { ++nlts; }
+    void appendPosition(NodeId, Term, int64_t, NodeId, uint8_t) override {}
+    void commitPosition(NodeId, Term, int64_t, NodeId) override {}
+    void clear() { standDowns.clear(); requestVotes = 0; nlts = 0; }
+};
+Election makeSdElection(NodeId self, StandDownRecorder& pub, NodeStateFile& nsf, TermLog& tl, uint64_t seed) {
+    return Election(true, -1, 0, 0, 0, 0, makeMembers3(self), self, pub, nsf, tl,
+                    kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, seed);
+}
+bool driveSdLeaderToClosed(Election& leader, int64_t& nowNs) {
+    for (int i = 0; i < 100 && !leader.isClosed(); ++i) {
+        const int64_t deadline = leader.nextDeadlineNs();
+        nowNs = deadline > nowNs ? deadline : nowNs + 1;
+        leader.doWork(nowNs);
+        if (leader.state() == ElectionState::LeaderLogReplication || leader.state() == ElectionState::LeaderReady)
+            for (NodeId fid : {1, 2}) leader.onAppendPosition(nowNs, leader.leadershipTermId(), leader.appendPosition(), fid, 0);
+    }
+    return leader.isClosed();
+}
+} // namespace
+
+TEST(ElectionStandDownRegression, ResigningLeaderTellsFollowersAndNeverStandsAgainRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_TRUE(driveSdLeaderToClosed(e, nowNs));
+    ASSERT_EQ(e.leaderMemberId(), 0);
+    const Term term = e.leadershipTermId();
+
+    ASSERT_TRUE(e.resign(nowNs)) << "a CLOSED leader must be able to resign";
+    EXPECT_TRUE(e.resigned());
+    ASSERT_EQ(pub.standDowns.size(), 2u) << "every follower must be told to elect now";
+    for (const auto& c : pub.standDowns) { EXPECT_EQ(c.term, term); EXPECT_EQ(c.leader, 0); }
+    EXPECT_NE(e.leaderMemberId(), 0) << "the resigned node still reports itself leader";
+    // It never nominates itself again, however long it canvasses.
+    pub.clear();
+    for (int i = 0; i < 50; ++i) {
+        e.onCanvassPosition(0, 0, term, 1);
+        e.onCanvassPosition(0, 0, term, 2);
+        nowNs += kElectionTimeoutNs;
+        e.doWork(nowNs);
+        EXPECT_TRUE(e.state() == ElectionState::Canvass) << "the resigned node stood for election";
+    }
+    EXPECT_EQ(pub.requestVotes, 0);
+    EXPECT_EQ(pub.nlts, 0) << "the resigned node kept heartbeating as leader";
+    // It follows the successor.
+    e.onNewLeadershipTerm(nowNs, term, term + 1, 0, 0, term + 1, 0, 0, 0, 0, /*leader=*/1, 0, false, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    EXPECT_EQ(e.leaderMemberId(), 1);
+    EXPECT_FALSE(e.resign(nowNs)) << "only the leader can resign";
+}
+
+TEST(ElectionStandDownRegression, FollowerElectsAtOnceSkippingTheResignedLeaderRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, 42);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, 1, 0, 0, 0, 0, /*leader=*/1, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.leaderMemberId(), 1);
+
+    e.onStandDown(nowNs, /*term=*/0, /*leader=*/1);   // stale term
+    e.onStandDown(nowNs, /*term=*/1, /*leader=*/2);   // not our leader
+    EXPECT_EQ(e.state(), ElectionState::Closed) << "a stale / foreign StandDown re-opened the election";
+    EXPECT_EQ(e.leaderMemberId(), 1);
+
+    e.onStandDown(nowNs + 1, /*term=*/1, /*leader=*/1);   // well before any heartbeat timeout
+    EXPECT_EQ(e.state(), ElectionState::Canvass) << "the follower waited for the heartbeat timeout";
+    EXPECT_EQ(e.leaderMemberId(), -1);
+    // Unanimous WITHOUT the resigned leader's canvass: only node 2 reports.
+    e.onCanvassPosition(0, 0, 1, 2);
+    e.doWork(nowNs + 2);
+    EXPECT_EQ(e.state(), ElectionState::Nominate) << "the election waited for the resigned leader";
+}
+
+// Controlled shutdown found it (2026-10-05): the node reports itself leader
+// (NodeConsensusAgent: every Leader* state) from LEADER_LOG_REPLICATION on, so
+// its controller duties (partition failover over eligibleNodeIds()) start
+// THEN — before electionComplete.  The become-leader liveness grace must
+// already hold there: a freshly elected leader sees every peer live for one
+// window, never "only me" (which failed every partition over to itself with
+// ISR={self} right after a hand-off).
+TEST(ElectionStandDownRegression, NewLeaderSeesPeersLiveFromLeaderLogReplicationRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+    std::array<NodeId, 8> buf{};
+    const std::size_t n = e.eligibleNodeIds(nowNs, kElectionTimeoutNs, buf.data(), buf.size());
+    EXPECT_EQ(n, 3u) << "a new leader judged its live peers dead before its first AppendPosition";
 }

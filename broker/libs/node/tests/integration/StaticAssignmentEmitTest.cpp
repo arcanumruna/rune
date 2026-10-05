@@ -46,6 +46,7 @@
 
 #include <gtest/gtest.h>
 
+#include <rune/node/ControlledShutdown.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -1413,4 +1414,164 @@ TEST(EpochRestartControllerRegression, RuntimeTopicDuringCatchUpNeverReassignsEx
     EXPECT_EQ(pa->partitionEpoch, pe) << "an existing partition was re-assigned by the static path";
     EXPECT_EQ(pa->isr.size(), isrSize);
     EXPECT_NE(svc1.assignment(1, 0), nullptr) << "the runtime topic was never assigned";
+}
+
+// ===========================================================================
+// Controlled shutdown (Kafka parity) — controller side.  A node stopping
+// gracefully sends a NODE-level request (AlterIsr channel, topicId =
+// kNodeControlTopicId, kNodeShutdown); the controller then never elects it,
+// moves every partition it leads to another live in-sync replica (new epoch,
+// the stopping node leaves the ISR), drops it from the ISRs it follows in, and
+// refuses to re-admit it — until a NEW incarnation registers (kNodeRegister).
+// A partition whose only in-sync replica is the stopping leader stays (no
+// clean alternative; never an unclean election, no record churn).
+// ===========================================================================
+namespace {
+rune::replication::AlterIsrMsg nodeControl(int32_t node, int64_t inc, bool shutdown) {
+    using rune::replication::AlterIsrMsg;
+    AlterIsrMsg m{};
+    m.topicId = AlterIsrMsg::kNodeControlTopicId; m.partition = 0;
+    m.leaderId = node; m.leaderEpoch = 0; m.partitionEpoch = 0;
+    m.isrCount = AlterIsrMsg::kLeaderEpochBump;
+    m.isr[1] = shutdown ? AlterIsrMsg::kNodeShutdown : AlterIsrMsg::kNodeRegister;
+    m.isr[3] = static_cast<int32_t>(static_cast<uint32_t>(inc));
+    m.isr[4] = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(inc) >> 32));
+    return m;
+}
+/// The leader proposes `isr` (an AlterIsr on the committed state); true = enqueued.
+bool proposeIsr(CtlRig& c, std::vector<int32_t> isr) {
+    const auto& a = c.pa();
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = static_cast<int32_t>(isr.size());
+    for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+    m.partitionEpoch = a.partitionEpoch;
+    const bool ok = c.svc->onAlterIsr(m);
+    c.drive(50);
+    return ok;
+}
+} // namespace
+
+TEST(ControlledShutdownControllerRegression, StoppingLeaderHandsOffToAnIsrMemberAtANewEpochRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, /*shutdown=*/true), &resp, &answer);
+    EXPECT_TRUE(answer) << "the controller never acked the shutdown request";
+    EXPECT_EQ(resp.topicId, rune::replication::AlterIsrMsg::kNodeControlTopicId);
+    EXPECT_EQ(resp.leaderId, L);
+    EXPECT_EQ(resp.leaderEpoch, 7) << "the ack must carry the requester's incarnation";
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE while the stopping node still leads";
+    c.tick();
+    // Moved in the controller's map, but not COMPLETE until every other live
+    // member confirmed its own map routes around the stopping node.
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE before the other members confirmed";
+    EXPECT_EQ(resp.partition, 1) << "the answer names the responding controller";
+    for (int32_t member : {1, 2, 3}) {
+        if (member == L) continue;
+        auto conf = nodeControl(L, 7, false);
+        conf.isr[1] = rune::replication::AlterIsrMsg::kNodeShutdownConfirm;
+        conf.isr[2] = member;
+        conf.isr[5] = rune::replication::AlterIsrMsg::kConfirmUserClear | rune::replication::AlterIsrMsg::kConfirmAllClear;
+        bool a = false;
+        (void)c.svc->onAlterIsr(conf, &resp, &a);
+        EXPECT_FALSE(a) << "a confirmation is never answered";
+    }
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, true), &resp, &answer);
+    EXPECT_TRUE(answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk) << "the hand-off was never confirmed COMPLETE";
+    const auto& pa = c.pa();
+    EXPECT_NE(pa.leaderNode, L) << "the stopping node still leads";
+    EXPECT_EQ(pa.leaderEpoch, le + 1) << "the hand-off is a new leader epoch";
+    EXPECT_EQ(std::count(pa.isr.begin(), pa.isr.end(), L), 0) << "the stopping node stayed in the ISR";
+    EXPECT_EQ(pa.isr.size(), 2u);
+    // Preferred-leader passes never move it back while it is stopping.
+    for (int i = 0; i < 5; ++i) {
+        (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);
+        c.drive(20);
+    }
+    EXPECT_NE(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1);
+}
+
+TEST(ControlledShutdownControllerRegression, SoleIsrPartitionStaysWithTheStoppingLeaderRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch, pe = c.pa().partitionEpoch;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, true));
+    const auto leo = c.r1->logEndOffset();
+    for (int i = 0; i < 5; ++i) c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L) << "a sole-ISR partition was moved (unclean) or taken offline";
+    EXPECT_EQ(c.pa().leaderEpoch, le);
+    EXPECT_EQ(c.pa().partitionEpoch, pe);
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{L});
+    EXPECT_EQ(c.r1->logEndOffset(), leo) << "record churn for a partition that cannot move";
+    // A follower that catches up (the leader re-admits it) makes it movable.
+    const int32_t F = L == 1 ? 2 : 1;
+    ASSERT_TRUE(proposeIsr(c, {L, F}));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, F) << "the partition became movable but stayed with the stopping node";
+}
+
+TEST(ControlledShutdownControllerRegression, StoppingFollowerLeavesTheIsrAndIsNotReadmittedRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    const int32_t F = L == 1 ? 2 : 1;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L) << "a stopping FOLLOWER moved the leadership";
+    EXPECT_EQ(c.pa().leaderEpoch, le);
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0) << "the stopping follower stayed in the ISR";
+    std::vector<int32_t> isr = c.pa().isr;
+    isr.push_back(F);
+    EXPECT_FALSE(proposeIsr(c, isr)) << "the stopping follower was re-admitted";
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0);
+}
+
+TEST(ControlledShutdownControllerRegression, NewIncarnationRegisterClearsTheShutdownMarkRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t F = L == 1 ? 2 : 1;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    ASSERT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0);
+    // A stale register of the stopping incarnation clears nothing.
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, false));
+    std::vector<int32_t> isr = c.pa().isr;
+    isr.push_back(F);
+    EXPECT_FALSE(proposeIsr(c, isr)) << "the stopping incarnation's own register cleared its mark";
+    // The restarted node (incarnation 8) registers: it is a normal member again.
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 8, false), &resp, &answer);
+    EXPECT_TRUE(answer);
+    EXPECT_EQ(resp.leaderEpoch, 8);
+    EXPECT_TRUE(proposeIsr(c, isr)) << "the restarted node was never re-admitted";
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 1);
+    // An older incarnation's late shutdown request is ignored.
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 1) << "a dead incarnation's request applied";
+}
+
+// Node side: what keeps a stopping node from exiting — every ISR it is in,
+// EXCEPT a partition it leads as the SOLE in-sync replica (cannot move without
+// an unclean election: it stays and goes offline with the node, no data loss).
+// The controller's own pre-resign view counts user partitions only.
+TEST(ControlledShutdownControllerRegression, NodeSideDoneConditionLetsSoleIsrPartitionsStayRegression) {
+    rune::metadata::AssignmentMap m;
+    m.put(0, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 3, 5});        // sole ISR: stays
+    m.put(0, 1, PartitionAssignment{1, {1, 2}, {1, 2, 3}, 3, 5});     // movable: blocks
+    m.put(0, 2, PartitionAssignment{2, {2, 1}, {1, 2, 3}, 3, 5});     // follower in ISR: blocks
+    m.put(0, 3, PartitionAssignment{2, {2, 3}, {1, 2, 3}, 3, 5});     // not in ISR: free
+    m.put(-1, 0, PartitionAssignment{1, {1, 2}, {1, 2, 3}, 3, 5});    // coordinator
+    EXPECT_EQ(rune::node::ControlledShutdown::blocking(m, 1, /*userOnly=*/false), 3);
+    EXPECT_EQ(rune::node::ControlledShutdown::blocking(m, 1, /*userOnly=*/true), 2);
+    EXPECT_EQ(rune::node::ControlledShutdown::blocking(m, 3, /*userOnly=*/false), 1);
 }

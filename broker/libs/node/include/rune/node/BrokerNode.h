@@ -397,6 +397,20 @@ public:
     /// and embedded media driver.  Idempotent.
     void stop();
 
+    /// The configured controlled-shutdown budget (RUNE_CONTROLLED_SHUTDOWN_MS; 0 = off).
+    [[nodiscard]] std::chrono::milliseconds controlledShutdownBudget() const noexcept {
+        return std::chrono::milliseconds{config_.controlledShutdownMs};
+    }
+
+    /// Controlled shutdown (Kafka parity) — call BEFORE stop() on a graceful
+    /// stop signal (SIGTERM/SIGINT; never on a fail-stop halt).  Observer
+    /// thread only (the thread that called start()).  See ControlledShutdown.h.
+    /// Returns true when every movable partition this node led is committed
+    /// as led elsewhere (and, on the controller, consensus leadership moved);
+    /// false when `budget` ran out first (logged — the caller then stops as
+    /// before: the remaining partitions fail over the old way).
+    bool controlledShutdown(std::chrono::milliseconds budget);
+
     // -----------------------------------------------------------------------
     // fsyncgate fail-stop (Task 10 fix 1; Kafka LogDirFailure / PostgreSQL
     // data_sync_retry=off).  When any log's fsync fails, the runtime logs

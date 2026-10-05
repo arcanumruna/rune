@@ -167,6 +167,12 @@ public:
         return std::nullopt;
     }
 
+    /// The ack already received for `corr` (no polling; nullopt = none yet).
+    std::optional<pc::ProduceResponse> ackFor(int64_t corr) const {
+        if (auto it = acks_.find(corr); it != acks_.end()) return it->second;
+        return std::nullopt;
+    }
+
     /// Produce until an OK ack (retries NotLeader while leadership settles).  Returns the ack.
     std::optional<pc::ProduceResponse> produceUntilOk(const std::string& channel, int32_t stream,
                                                       int64_t sessionId, int32_t topicId,

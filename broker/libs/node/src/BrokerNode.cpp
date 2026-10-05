@@ -2378,6 +2378,21 @@ void BrokerNode::buildGateway() {
     // before the control thread starts (ordered by its start).
     leaderObserver_.bind(election_.get(), nodeAgent_.get());
     runtimeAgent_->setLeaderObserver(&leaderObserver_);
+    // Controlled shutdown (Kafka parity): multi-node only — a single node has
+    // nobody to hand off to (begin completes at once).  The controller's
+    // acks of this node's NODE-level requests arrive on the legacy transport
+    // (control thread).
+    if (!config_.isSingleNode() && replTransport_ && metadataService_ && election_) {
+        runtimeAgent_->controlledShutdown().bind(
+            config_.nodeId, replicaRegistry_ ? replicaRegistry_->processIncarnation() : 0,
+            replTransport_.get(), metadataService_.get(), election_.get(), [this] {
+                std::vector<int32_t> ids;
+                for (const auto& pc : config_.peers) ids.push_back(pc.id);
+                return ids;
+            }());
+        replTransport_->setNodeControlResponseHandler(&ControlledShutdown::onResponseThunk,
+                                                      &runtimeAgent_->controlledShutdown());
+    }
     // fsyncgate (Task 10 fix 2 / I-1): control-thread-driven replicas (internal
     // partitions) whose fsync failed → halt.
     runtimeAgent_->setStorageFailureHook([this](const std::string& dir, int err) {
@@ -2510,6 +2525,45 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     return hasLeader(); // one final check at deadline
+}
+
+// ---------------------------------------------------------------------------
+// Controlled shutdown (Kafka parity) — see ControlledShutdown.h.  Observer
+// thread.  The hand-off itself is event-driven on the control thread; this
+// only waits for its ring-published status, bounded by `budget` — a
+// last-resort cap after which the caller stops as before (logged).
+// ---------------------------------------------------------------------------
+bool BrokerNode::controlledShutdown(std::chrono::milliseconds budget) {
+    if (!started_ || stopped_ || !runtimeAgent_) return false;
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const auto deadline = t0 + budget;
+    auto& cs = runtimeAgent_->controlledShutdown();
+    if (!cs.active()) return true;   // a single node: nobody to hand anything to
+    if (!cs.begin()) {
+        spdlog::warn("BrokerNode[{}]: controlled shutdown: command ring full — stopping without "
+                     "a hand-off", config_.nodeId);
+        return false;
+    }
+    spdlog::info("BrokerNode[{}]: controlled shutdown — handing partition leadership off "
+                 "(budget {} ms)", config_.nodeId, budget.count());
+    ControlledShutdown::Status st = cs.observe();
+    while (clock::now() < deadline) {
+        st = cs.observe();
+        if (st.phase == ControlledShutdown::Phase::Done) {
+            spdlog::info("BrokerNode[{}]: controlled shutdown complete in {} ms", config_.nodeId,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+    }
+    st = cs.observe();
+    if (st.phase == ControlledShutdown::Phase::Done) return true;
+    spdlog::warn("BrokerNode[{}]: controlled shutdown budget ({} ms) exhausted in phase {} with {} "
+                 "partition(s) still led / ISR(s) still joined here — stopping anyway (they fail "
+                 "over as on an unclean stop)", config_.nodeId, budget.count(),
+                 static_cast<int>(st.phase), st.remaining);
+    return false;
 }
 
 LeaderSnapshot BrokerNode::leaderSnapshot() const noexcept {

@@ -108,3 +108,22 @@ TEST(ControlledShutdown, BeginControlledShutdownUnknownNodeIsNoOp) {
     // Membership table must remain empty.
     EXPECT_EQ(mem.size(), 0u);
 }
+
+// Controlled shutdown (2026-10-05): a node excluded as a leader (a stopping
+// node) is never the target of a PREFERRED-leader election, even when it is
+// replicas[0], live and in the ISR.
+TEST(ControlledShutdownRegression, PreferredLeaderNeverMovesToAnExcludedNodeRegression) {
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{2, {2, 1, 3}, {1, 2, 3}, 4, 9});   // leader 2, preferred 1
+    m.put(7, 1, PartitionAssignment{2, {2, 1, 3}, {2, 1, 3}, 4, 9});
+    DynamicBalancer bal; DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {1, 2, 3};
+    in.topics = { TopicSpec{7, 2, 3, "", ""} };
+    in.excludedLeaders = {{7, 0, 1}, {7, 1, 1}};
+    for (const auto& r : bal.rebalance(in))
+        EXPECT_NE(r.rec.leaderNode, 1) << "partition " << r.rec.partition << " moved to the excluded node";
+    in.excludedLeaders.clear();
+    bool moved = false;
+    for (const auto& r : bal.rebalance(in)) moved = moved || r.rec.leaderNode == 1;
+    EXPECT_TRUE(moved) << "control: without the exclusion the preferred election fires";
+}

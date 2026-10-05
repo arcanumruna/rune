@@ -160,4 +160,9 @@ void ConsensusAgent::onCommitPosition(
     election_.onCommitPosition(nowNs, leadershipTermId, logPosition, leaderMemberId);
 }
 
+void ConsensusAgent::onStandDown(int64_t nowNs, Term leadershipTermId, NodeId leaderMemberId)
+{
+    election_.onStandDown(nowNs, leadershipTermId, leaderMemberId);
+}
+
 } // namespace rune::consensus

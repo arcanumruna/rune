@@ -449,6 +449,40 @@ struct AlterIsrMsg {
     /// answered): isr[2] = its LEO, isr[3]/isr[4] = its process incarnation
     /// (low/high 32 bits).  `leaderId` is the reporting replica.
     static constexpr int32_t kBumpFollowerReport = 8;
+    /// Controlled shutdown (Kafka parity) — NODE-level requests on the same
+    /// channel: topicId == kNodeControlTopicId (no partition), leaderId = the
+    /// requesting node, isrCount == kLeaderEpochBump, isr[1] = flags,
+    /// isr[3]/isr[4] = its process incarnation (low/high 32 bits).
+    ///   kNodeShutdown: "I am stopping gracefully — move every partition I
+    ///     lead to another in-sync replica, never elect me, drop me from the
+    ///     ISRs" (re-sent until this controller acked it).
+    ///   kNodeRegister: "I am incarnation X and NOT stopping" (sent once per
+    ///     start until acked) — clears a mark left by an earlier incarnation.
+    /// The controller answers with an AlterIsrResponse carrying the same
+    /// topicId, leaderId = the requester and the incarnation in
+    /// (leaderEpoch = low 32 bits, partitionEpoch = high 32 bits).  An older
+    /// controller drops it unanswered (topicId < 0, not a coordinator key).
+    static constexpr int32_t kNodeControlTopicId = -100;
+    static constexpr int32_t kNodeShutdown       = 16;
+    static constexpr int32_t kNodeRegister       = 32;
+    /// kNodeShutdown is sent to EVERY member (each records the mark — a
+    /// successor controller already knows it).  kNodeShutdownUserOnly: the
+    /// requester is the controller — completion counts user partitions only
+    /// (its coordinator partitions move after it resigned).
+    static constexpr int32_t kNodeShutdownUserOnly = 64;
+    /// A member's CONFIRMATION to the controller (sent when its committed map
+    /// changes, and on every request it receives): leaderId = the stopping
+    /// node, isr[2] = the confirming member, isr[3]/isr[4] = the stopping
+    /// node's incarnation, isr[5] = kConfirmUserClear | kConfirmAllClear —
+    /// in ITS committed map the stopping node leads / is in-sync for nothing
+    /// movable (so its routing no longer names it).
+    static constexpr int32_t kNodeShutdownConfirm = 128;
+    static constexpr int32_t kConfirmUserClear = 1;
+    static constexpr int32_t kConfirmAllClear  = 2;
+    /// The controller's answer (responder id in `partition`): kAlterIsrOk =
+    /// COMPLETE — clear in its own map AND confirmed clear by every other live
+    /// member; kNodeShutdownPending = marked, not complete yet.
+    static constexpr int16_t kNodeShutdownPending = 6;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

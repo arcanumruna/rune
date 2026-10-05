@@ -287,6 +287,10 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
 
                     const bool prefIsLive = isIn(preferred, in.liveNodes);
                     if (!prefIsLive) continue;
+                    // An excluded node (a restarted ex-leader that asked for a
+                    // new epoch, or a node in controlled shutdown) is never a
+                    // leadership target — not even the preferred one.
+                    if (isExcludedLeader(ts->topicId, preferred)) continue;
                     if (!imbalanced(preferred)) continue;   // N3: below the ratio
                     // Kafka: a preferred election only targets a member of the
                     // committed ISR (the leader's AlterIsr re-admits it first).

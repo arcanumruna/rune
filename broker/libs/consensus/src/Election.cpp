@@ -334,6 +334,18 @@ int Election::canvass(int64_t nowNs)
     // committed ISR is denied by the voters (any grant majority intersects the
     // commit majority).  A self-gate turned stale self-knowledge into a
     // permanently headless consensus.
+    // Controlled shutdown: a resigned leader (or a node that withdrew its
+    // candidacy) never stands again — it still canvasses and votes, so the
+    // others can elect without it.  A resigned leader re-sends its StandDown
+    // on the status interval (a lost one would leave a follower waiting for
+    // the heartbeat timeout) and waits to follow the successor.
+    if (resigned_) {
+        if (workCount > 0 && resignedTermId_ >= 0)
+            for (const ClusterMember& m : clusterMembers_)
+                if (m.id != thisMemberId_) publisher_.standDown(m.id, resignedTermId_, thisMemberId_);
+        return workCount;
+    }
+
     ClusterMember* thisM = memberById(thisMemberId_);
     if (thisM != nullptr) {
         // Election.java:720: isUnanimousCandidate
@@ -1005,6 +1017,38 @@ void Election::onCommitPosition(int64_t nowNs,
 }
 
 // ---------------------------------------------------------------------------
+// Controlled shutdown — leadership hand-off (Raft leadership transfer; Aeron's
+// graceful leader close: followers elect at once, skipping the closed leader).
+// ---------------------------------------------------------------------------
+bool Election::resign(int64_t nowNs)
+{
+    if (state_ != ElectionState::Closed || leaderMember_ == nullptr ||
+        leaderMember_->id != thisMemberId_ || clusterMembers_.size() <= 1)
+        return false;
+    resigned_       = true;
+    resignedTermId_ = leadershipTermId_;
+    for (const ClusterMember& m : clusterMembers_)
+        if (m.id != thisMemberId_) publisher_.standDown(m.id, resignedTermId_, thisMemberId_);
+    followerLiveness_.reset();
+    // Canvass entry resets the members and drops leaderMember_ (no heartbeat,
+    // no leader reported) — the node now only votes and follows.
+    state(ElectionState::Canvass, nowNs, "controlled shutdown: leader resigned");
+    timeOfLastUpdateNs_ = nowNs;   // StandDown just went out: re-send on the interval
+    return true;
+}
+
+void Election::onStandDown(int64_t nowNs, Term leadershipTermIdArg, NodeId leaderMemberIdArg)
+{
+    if (state_ != ElectionState::Closed) return;
+    if (leaderMember_ == nullptr || leaderMember_->id != leaderMemberIdArg ||
+        leaderMemberIdArg == thisMemberId_ || leadershipTermIdArg != leadershipTermId_)
+        return;   // not from the leader we follow, for our term: stale / foreign
+    gracefulClosedLeaderId_ = leaderMemberIdArg;   // canvass completes without it
+    followerLiveness_.reset();
+    state(ElectionState::Canvass, nowNs, "leader stood down (controlled shutdown) → election now");
+}
+
+// ---------------------------------------------------------------------------
 // CLOSED leader heartbeat — post-election NLT broadcast.
 //
 // After the election reaches CLOSED, the leader continues broadcasting
@@ -1120,6 +1164,15 @@ void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
                     thisM->timeOfLastAppendPositionNs = nowNs;
                 }
             }
+            // BECOME-LEADER liveness grace, from the FIRST leader state: this
+            // node reports itself leader (and its controller duties — failover
+            // over eligibleNodeIds() — start) here, not at electionComplete.
+            // Without the seed every peer's clock is the reset sentinel → a
+            // fresh leader sees only itself live and fails every partition over
+            // to itself (seen right after a controlled-shutdown hand-off).
+            // electionComplete seeds again (unchanged).
+            for (ClusterMember& m : clusterMembers_)
+                if (m.id != thisMemberId_) m.timeOfLastAppendPositionNs = nowNs;
             break;
         case ElectionState::FollowerLogReplication:
         case ElectionState::FollowerReplay:

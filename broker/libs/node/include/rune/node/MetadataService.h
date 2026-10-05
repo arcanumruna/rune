@@ -71,6 +71,8 @@
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader
 #include <rune/protocol/MetadataRecords.h>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <deque>
@@ -189,7 +191,8 @@ public:
         const std::vector<int32_t>& eligible,
         rune::metadata::ReplicaPositionTable* positions,
         int32_t bootstrapEpoch,
-        const std::vector<int32_t>& replicas)
+        const std::vector<int32_t>& replicas,
+        bool selfShutting = false)
     {
         namespace rm = rune::metadata;
         auto in = [](int32_t n, const std::vector<int32_t>& v) {
@@ -210,7 +213,7 @@ public:
         std::vector<int32_t> live = eligible;
         if (!in(selfId, live)) live.push_back(selfId);   // the controller is live
         rm::AssignmentChange chg;
-        if (in(selfId, cur->isr)) {
+        if (in(selfId, cur->isr) && !selfShutting) {   // a stopping controller never takes one
             chg.newLeader = selfId;
             chg.newIsr.push_back(selfId);
             for (int32_t n : cur->isr) if (n != selfId) chg.newIsr.push_back(n);
@@ -258,7 +261,7 @@ public:
             if (queued) continue;
             const auto next = decideCoordinatorPartition(
                 k.topicId, k.partition, selfId_, msm_.assignment(k.topicId, k.partition),
-                eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_);
+                eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_, isShutting_(selfId_));
             if (!next) continue;
             rune::metadata::BalancerRecord br;
             br.isr      = next->isr;
@@ -449,6 +452,10 @@ public:
             resp->partitionEpoch = partitionEpoch; resp->errorCode = code;
             if (answer) *answer = true;
         };
+        // Controlled shutdown: a NODE-level request (no partition) — recorded
+        // by EVERY member (a successor controller already knows the marks);
+        // only a ready controller decides / answers.
+        if (m.topicId == rr::AlterIsrMsg::kNodeControlTopicId) return onNodeControl_(m, resp, answer);
         if (!controllerReady_()) return false;
         // Internal topics: only the coordinator partitions on the controller
         // path (MEDIUM-B); __cluster_metadata uses the internal-ISR store.
@@ -489,8 +496,9 @@ public:
             // (flapping).  Members already committed are kept (a shrink of them
             // is the leader's call).
             const bool added = std::find(pa->isr.begin(), pa->isr.end(), n) == pa->isr.end();
-            if (added && n != m.leaderId && eligibleKnown_ &&
-                std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) {
+            if (added && n != m.leaderId &&
+                ((eligibleKnown_ && std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) ||
+                 isShutting_(n))) {   // controlled shutdown: never re-admitted
                 droppedIneligible = true;
                 continue;
             }
@@ -567,6 +575,151 @@ public:
         return false;   // decided (and enqueued) by the next rebalance tick
     }
 
+    /// Controlled shutdown (Kafka parity; KRaft BrokerHeartbeat
+    /// wantShutDown).  The stopping node sends kNodeShutdown to EVERY member;
+    /// each records the mark of that INCARNATION (soft state — a successor
+    /// controller already holds it).  The controller acts on it: from the next
+    /// rebalance pass the node is never elected (failover nor preferred),
+    /// every partition it leads moves to another live in-sync replica at a new
+    /// epoch (co-partition units together; a partition it is the SOLE in-sync
+    /// replica of stays — no unclean election), it leaves the ISR of every
+    /// partition it follows and is never re-admitted.  Every OTHER member
+    /// confirms to the controller (kNodeShutdownConfirm) once its own
+    /// committed map routes around the node; the controller answers the node
+    /// COMPLETE when its own map is clear AND every live member confirmed.
+    /// kNodeRegister from a NEWER incarnation (a restart) clears the mark; a
+    /// request from an OLDER incarnation (a dead process) is ignored.
+    struct NodeLifecycle {
+        int64_t incarnation = 0;
+        bool    shutting    = false;
+        int32_t pushedBits  = -1;                         ///< member side: last confirmation sent
+        std::unordered_map<int32_t, int32_t> confirmed;   ///< controller side: member → clear bits
+    };
+    bool onNodeControl_(const rune::replication::AlterIsrMsg& m,
+                        rune::replication::AlterIsrResponseMsg* resp, bool* answer) {
+        namespace rr = rune::replication;
+        if (m.isrCount != rr::AlterIsrMsg::kLeaderEpochBump || m.leaderId < 0) return false;
+        const int64_t inc   = incarnationOf_(m);
+        const int32_t flags = m.isr[1];
+        auto it = nodeLifecycle_.find(m.leaderId);
+        if (it != nodeLifecycle_.end() && inc < it->second.incarnation) return false;   // a dead process
+        if ((flags & rr::AlterIsrMsg::kNodeShutdownConfirm) != 0) {
+            // A member's confirmation (controller side; recorded for the
+            // stopping incarnation only).
+            if (it != nodeLifecycle_.end() && it->second.shutting && it->second.incarnation == inc)
+                it->second.confirmed[m.isr[2]] = m.isr[5];
+            return false;
+        }
+        noteIncarnation_(m.leaderId, inc, /*logDirFailed=*/false);
+        NodeLifecycle& st = nodeLifecycle_[m.leaderId];
+        if (inc > st.incarnation) st = NodeLifecycle{inc};
+        const bool shutdown = (flags & rr::AlterIsrMsg::kNodeShutdown) != 0;
+        if (shutdown && !st.shutting) {
+            st.shutting = true;
+            ++controlledShutdownRequests_;
+            spdlog::info("MetadataService[{}]: node {} (incarnation {}) is shutting down{}", selfId_,
+                         m.leaderId, inc, controllerReady_() ? " — moving its partition leadership to "
+                                                               "in-sync replicas" : "");
+        }
+        if (!controllerReady_()) {
+            // A member: (re-)confirm its view to the controller (loss recovery).
+            if (st.shutting && m.leaderId != selfId_) { st.pushedBits = -1; queueConfirmation_(m.leaderId, st); }
+            return false;
+        }
+        const bool userOnly = (flags & rr::AlterIsrMsg::kNodeShutdownUserOnly) != 0;
+        const bool complete = !st.shutting || shutdownComplete_(m.leaderId, st, userOnly);
+        if (resp != nullptr) {
+            resp->topicId        = rr::AlterIsrMsg::kNodeControlTopicId;
+            resp->partition      = selfId_;   // the responder
+            resp->leaderId       = m.leaderId;
+            resp->leaderEpoch    = static_cast<rr::Epoch>(static_cast<int32_t>(static_cast<uint32_t>(inc)));
+            resp->partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(inc) >> 32));
+            resp->errorCode      = complete ? rr::kAlterIsrOk : rr::AlterIsrMsg::kNodeShutdownPending;
+            if (answer) *answer = true;
+        }
+        return false;
+    }
+    /// Member side: the clear bits of `node` in this member's committed map.
+    [[nodiscard]] int32_t clearBits_(int32_t node) const noexcept {
+        namespace rr = rune::replication;
+        const auto& map = msm_.committedMap();
+        return (controlledShutdownBlocking(map, node, true) == 0 ? rr::AlterIsrMsg::kConfirmUserClear : 0) |
+               (controlledShutdownBlocking(map, node, false) == 0 ? rr::AlterIsrMsg::kConfirmAllClear : 0);
+    }
+    void queueConfirmation_(int32_t node, NodeLifecycle& st) {
+        namespace rr = rune::replication;
+        const int32_t bits = clearBits_(node);
+        if (bits == st.pushedBits) return;
+        st.pushedBits = bits;
+        rr::AlterIsrMsg c{};
+        c.topicId  = rr::AlterIsrMsg::kNodeControlTopicId;
+        c.leaderId = node;
+        c.leaderEpoch = 0; c.partitionEpoch = 0;
+        c.isrCount = rr::AlterIsrMsg::kLeaderEpochBump;
+        c.isr[1] = rr::AlterIsrMsg::kNodeShutdownConfirm;
+        c.isr[2] = selfId_;
+        c.isr[3] = static_cast<int32_t>(static_cast<uint32_t>(st.incarnation));
+        c.isr[4] = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(st.incarnation) >> 32));
+        c.isr[5] = bits;
+        nodeControlOut_.push_back(c);
+    }
+    /// Member side, on a committed-map change: confirm every stopping node
+    /// whose clear bits changed.  Cold (only while a node is stopping).
+    void confirmShuttingOnMapChange_() {
+        if (nodeLifecycle_.empty() || controllerReady_()) return;
+        const uint64_t v = msm_.committedVersion();
+        if (v == confirmCheckedVersion_) return;
+        confirmCheckedVersion_ = v;
+        for (auto& [n, st] : nodeLifecycle_)
+            if (st.shutting && n != selfId_) queueConfirmation_(n, st);
+    }
+public:
+    /// The control thread sends these (to the current controller) — member
+    /// confirmations of stopping nodes.  Drained by NodeRuntimeAgent.
+    std::vector<rune::replication::AlterIsrMsg>& nodeControlOutbox() noexcept { return nodeControlOut_; }
+    /// Pure: what keeps `node` from stopping in `map` — partitions in whose
+    /// ISR it is (or which it leads), EXCEPT one it leads as the SOLE in-sync
+    /// replica (cannot move without an unclean election: it stays, and goes
+    /// offline with the node — no data loss).  `userOnly`: user topics only
+    /// (a stopping CONTROLLER's coordinator partitions move after it resigned).
+    [[nodiscard]] static int32_t controlledShutdownBlocking(const rune::metadata::AssignmentMap& map,
+                                                            int32_t node, bool userOnly) noexcept {
+        int32_t n = 0;
+        map.forEach([&](int32_t topicId, int32_t, const rune::metadata::PartitionAssignment& pa) {
+            if (userOnly && topicId < 0) return;
+            const bool inIsr = std::find(pa.isr.begin(), pa.isr.end(), node) != pa.isr.end();
+            const bool soleLeader = pa.leaderNode == node && pa.isr.size() <= 1;
+            if ((inIsr || pa.leaderNode == node) && !soleLeader) ++n;
+        });
+        return n;
+    }
+    /// The hand-off of `node` is complete for clients: nothing movable is left
+    /// on it in THIS controller's committed map, and every other live member
+    /// confirmed the same of ITS committed map (its routing no longer names
+    /// `node`).  `userOnly`: a stopping controller, before it resigns.
+    bool shutdownComplete_(int32_t node, NodeLifecycle& st, bool userOnly) {
+        namespace rr = rune::replication;
+        if (controlledShutdownBlocking(msm_.committedMap(), node, userOnly) != 0) return false;
+        const int32_t need = userOnly ? rr::AlterIsrMsg::kConfirmUserClear : rr::AlterIsrMsg::kConfirmAllClear;
+        for (int32_t n : eligible_) {
+            if (n == selfId_ || n == node || isShutting_(n)) continue;
+            const auto c = st.confirmed.find(n);
+            if (c == st.confirmed.end() || (c->second & need) == 0) return false;
+        }
+        return true;
+    }
+    [[nodiscard]] bool isShutting_(int32_t node) const noexcept {
+        const auto it = nodeLifecycle_.find(node);
+        return it != nodeLifecycle_.end() && it->second.shutting;
+    }
+    /// The nodes in controlled shutdown (reused scratch; control plane).
+    const std::vector<int32_t>& shuttingNodes_() {
+        shuttingScratch_.clear();
+        for (const auto& [n, st] : nodeLifecycle_) if (st.shutting) shuttingScratch_.push_back(n);
+        return shuttingScratch_;
+    }
+    [[nodiscard]] uint64_t controlledShutdownRequestsForTest() const noexcept { return controlledShutdownRequests_; }
+
     static int64_t incarnationOf_(const rune::replication::AlterIsrMsg& m) noexcept {
         return static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
                                     static_cast<uint32_t>(m.isr[3]));
@@ -580,6 +733,9 @@ public:
         if (it != nodeIncarnation_.end() && it->second == inc) return;
         nodeIncarnation_[node] = inc;
         positions_.dropNode(node);
+        // Controlled shutdown: a NEWER incarnation is not the stopping process.
+        if (auto ls = nodeLifecycle_.find(node); ls != nodeLifecycle_.end() && inc > ls->second.incarnation)
+            ls->second = NodeLifecycle{inc};
         if (!logDirFailed)
             std::erase_if(offlineReplicas_, [&](const OfflineReplica& o) {
                 return o.node == node && o.incarnation != inc;
@@ -649,7 +805,7 @@ public:
                 if (std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) continue;
                 const auto r = reps.find(n);
                 if (r == reps.end()) { complete = false; break; }   // wait for its report
-                if (r->second.logDirFailed || isOffline_(topicId, partition, n)) continue;
+                if (r->second.logDirFailed || isOffline_(topicId, partition, n) || isShutting_(n)) continue;
                 if (r->second.leo > bestLeo) { best = n; bestLeo = r->second.leo; }
                 if (inIsr(n) && r->second.leo > bestIsrLeo) { bestIsr = n; bestIsrLeo = r->second.leo; }
             }
@@ -716,7 +872,7 @@ public:
             // leaves the ISR (re-admitted by the new leader's AlterIsr).
             if (topicId < 0) {
                 for (int32_t n : pa->isr) {
-                    if (n == q.requester) continue;
+                    if (n == q.requester || isShutting_(n)) continue;
                     if (std::find(eligible_.begin(), eligible_.end(), n) == eligible_.end()) continue;
                     br.rec.leaderNode  = n;
                     br.rec.leaderEpoch = pa->leaderEpoch + 1;
@@ -927,7 +1083,12 @@ public:
     {
         if (!controllerReady_()) return 0;
 
-        // MEDIUM-2: the eligible set onAlterIsr filters additions against.
+        // MEDIUM-2: the eligible set onAlterIsr filters additions against
+        // (a stopping node is never admitted either — checked live there).
+        const std::vector<int32_t>& shutting = shuttingNodes_();
+        auto stopping = [&shutting](int32_t n) {
+            return std::find(shutting.begin(), shutting.end(), n) != shutting.end();
+        };
         eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
         eligibleKnown_ = true;
 
@@ -989,6 +1150,26 @@ public:
         }
         in.dataPlaneAliveLeaders = dataPlaneAliveScratch_;
         validBumpExclusions_(in.excludedLeaders);   // MAJOR-1
+        // Controlled shutdown: a stopping node is excluded as a leader of every
+        // partition it replicates — the balancer moves the ones it leads to a
+        // live in-sync replica (it leaves their ISR), never elects it (failover
+        // nor preferred), and leaves a partition it is the SOLE in-sync replica
+        // of with it.  Not for a partition whose leader is DEAD: there the
+        // stopping node may still be the only live in-sync survivor — electing
+        // it serves the partition until it stops (then it is offline as today).
+        if (!shutting.empty()) {
+            in.cur->forEach([&](int32_t topicId, int32_t partition,
+                                const rune::metadata::PartitionAssignment& pa) {
+                if (topicId < 0) return;   // coordinator partitions: reconcileCoordinatorPartitions
+                const bool leaderLive =
+                    pa.leaderNode != rune::metadata::NO_LEADER &&
+                    (stopping(pa.leaderNode) ||
+                     std::find(eligibleNodes.begin(), eligibleNodes.end(), pa.leaderNode) != eligibleNodes.end());
+                if (!leaderLive) return;
+                for (int32_t n : pa.replicas)
+                    if (stopping(n)) in.excludedLeaders.push_back({topicId, partition, n});
+            });
+        }
 
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
@@ -1018,9 +1199,13 @@ public:
             for (const auto& r : recs) if (r.rec.topicId == topicId && r.rec.partition == partition) return;
             for (const auto& q : pendingDynamicRecords_)
                 if (q.rec.topicId == topicId && q.rec.partition == partition) return;
+            // Controlled shutdown: a stopping FOLLOWER leaves the ISR now (Kafka
+            // removes a shutting-down broker from every ISR) — its HW / acks=all
+            // contribution ends with the process.
             auto alive = [&](int32_t n) {
                 return n == pa.leaderNode ||
-                       std::find(eligibleNodes.begin(), eligibleNodes.end(), n) != eligibleNodes.end();
+                       (std::find(eligibleNodes.begin(), eligibleNodes.end(), n) != eligibleNodes.end() &&
+                        !stopping(n));
             };
             bool anyDead = false;   // steady state: no allocation
             for (int32_t n : pa.isr) anyDead = anyDead || !alive(n);
@@ -1167,6 +1352,9 @@ public:
             // leader re-decides from the committed map.
             pendingDynamicRecords_.clear();
             inflight_.clear();
+            // Controlled-shutdown marks are kept (soft, every member holds
+            // them); confirmations were the old controller's — re-collected.
+            for (auto& [n, st] : nodeLifecycle_) { st.confirmed.clear(); st.pushedBits = -1; }
             // Follower: reset lastApplied_ so we re-apply from scratch if we
             // become leader again later.
             lastApplied_ = -1;
@@ -1182,6 +1370,7 @@ public:
             if (amLeader) maybeCatchUp_();
             // Still drain the dynamic queue even if the log is caught up.
             if (amLeader) drainDynamicQueue();
+            confirmShuttingOnMapChange_();
             return 0;
         }
 
@@ -1248,6 +1437,7 @@ public:
 
         // Drain the dynamic assignment queue (bounded per cycle).
         if (amLeader) drainDynamicQueue();
+        confirmShuttingOnMapChange_();
 
         return applied;
     }
@@ -1547,6 +1737,12 @@ private:
         int64_t incarnation    = 0;
     };
     std::unordered_map<int64_t, BumpRequest> bumpRequests_;
+    /// Controlled shutdown: node → {its newest incarnation seen, stopping?}.
+    std::unordered_map<int32_t, NodeLifecycle> nodeLifecycle_;
+    std::vector<int32_t> shuttingScratch_;
+    std::vector<rune::replication::AlterIsrMsg> nodeControlOut_;   ///< member confirmations to send
+    uint64_t confirmCheckedVersion_ = 0;
+    uint64_t controlledShutdownRequests_ = 0;
     /// Fix round 2 N1 (KIP-112): replicas whose log dir went offline — never
     /// (re-)elected for that partition until a report from a NEW incarnation.
     struct OfflineReplica { int32_t topicId; int32_t partition; int32_t node; int64_t incarnation; };

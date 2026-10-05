@@ -39,6 +39,7 @@
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/LeaderObserver.h>
+#include <rune/node/ControlledShutdown.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
@@ -173,6 +174,11 @@ public:
 
     /// F9a: the control-thread → observer leadership ring.  Set before start.
     void setLeaderObserver(LeaderObserver* o) noexcept { leaderObserver_ = o; }
+
+    /// Controlled shutdown state machine (driven on this agent's slow tick).
+    /// BrokerNode binds it before the control thread starts; begin()/observe()
+    /// are its cross-thread ring endpoints.
+    ControlledShutdown& controlledShutdown() noexcept { return controlledShutdown_; }
 
     // fsyncgate fail-stop (Task 10 fix 2 / I-1): replicas this control thread
     // drives (internal partitions; all partitions without a WorkerPool) whose
@@ -448,6 +454,16 @@ private:
                         prevEligLen_  = n;
                         prevEligInit_ = true;
                     }
+                }
+                // Controlled shutdown (cold): register / hand-off steps, on
+                // the same slow tick as the rebalance it depends on.
+                slowWork += controlledShutdown_.doWork(nowNs);
+                // Member confirmations of stopping nodes → the controller.
+                if (auto& out = metadataService_->nodeControlOutbox(); !out.empty() && transport_) [[unlikely]] {
+                    std::size_t sent = 0;
+                    while (sent < out.size() && transport_->sendAlterIsr(out[sent])) ++sent;
+                    out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(sent));
+                    slowWork += static_cast<int>(sent);
                 }
                 failoverTick_.done(nowNs, slowWork);
             }
@@ -956,6 +972,7 @@ private:
     // RUNE_CTRL_LOG temp diagnostic — read once at construction (not per scan).
     const bool                                         ctrlLog_ = ::getenv("RUNE_CTRL_LOG") != nullptr;
     LeaderObserver*                                    leaderObserver_ = nullptr;  // F9a, non-owning
+    ControlledShutdown                                 controlledShutdown_;        // control thread (+ rings)
     StorageFailureHook                                 storageFailureHook_;
     std::function<void(const std::string&)>            fatalHook_;
 

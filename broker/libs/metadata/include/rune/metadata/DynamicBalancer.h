@@ -122,6 +122,10 @@ struct DynamicBalancerInputs {
     /// the new leader's AlterIsr once caught up).  A group whose ISR has no
     /// other live member is left untouched here (the caller re-elects the
     /// requester at a new epoch: it is the sole in-sync replica).
+    /// Controlled shutdown (2026-10-05) uses the same input for a node that
+    /// is stopping gracefully (one entry per partition it replicates): it is
+    /// never elected (failover nor PREFERRED), leaves the ISR of a partition
+    /// it led, and a partition it is the sole in-sync replica of stays with it.
     struct LeaderExclusion { int32_t topicId; int32_t partition; int32_t node; };
     std::vector<LeaderExclusion> excludedLeaders;
     /// Fix round 2 N3 (Kafka leader.imbalance.per.broker.percentage): a
