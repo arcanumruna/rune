@@ -269,6 +269,17 @@ public:
     /// <dir>/<stagingName>.log and <dir>/<stagingName>.index, opens the fds and
     /// mmaps + prefaults the (right-sized) index.  baseOffset is provisional (0);
     /// call adoptAsActive(base) on the append thread to rebase + rename at roll.
+    /// Fix round 4: open a finished, cleaner-built SEALED segment from its
+    /// temporary files (cleaner thread) — fds + index mmap + entry count + size,
+    /// adopted TRUSTED (fully durable: the cleaner fsynced it).  logPath() is
+    /// the CANONICAL <base>.log the cleaner renames the files to after the owner
+    /// accepts; until then everything goes through the open fd / mmap (a rename
+    /// never affects an open inode).  Throws on any open / map failure.
+    static std::unique_ptr<LogSegment> openPrebuilt(const std::string& dir, int64_t base,
+                                                    const std::string& logFile,
+                                                    const std::string& indexFile,
+                                                    int64_t nextOffset, int32_t indexIntervalBytes,
+                                                    int32_t indexMaxBytes);
     static std::unique_ptr<LogSegment> prepareStaging(
         const std::string& stagingLogPath, const std::string& stagingIndexPath,
         int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes);
@@ -288,6 +299,9 @@ public:
 
     /// True if this segment is still in the staging (un-adopted) state.
     bool isStaging() const noexcept { return staging_; }
+    /// Adopted from staging and the staging→<base> rename not yet confirmed
+    /// (Log::drainStagingRenamesDone → setLogPath).  In-memory, no syscall.
+    bool pathPending() const noexcept { return pathPending_; }
 
     /// TEST-ONLY: whether the read-only .log mapping currently exists.  A
     /// sealed segment recovered from disk starts false (F3: lazy mapping) and
@@ -348,6 +362,7 @@ private:
     int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()
     int64_t durableNext_ = 0;    ///< E1d: see durableNext() (== baseOffset_ when none)
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
+    bool pathPending_ = false;   // see pathPending()
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
 
     // Read-only mmap of the .log for zero-copy readView().  Created WITH the

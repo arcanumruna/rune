@@ -350,7 +350,7 @@ public:
     /// monotonic counter (unique output names across passes).
     void setDeferredInstall(uint64_t* nextSeq) noexcept { deferredSeq_ = nextSeq; }
     /// Max members per deferred group (bounds the owner's ring claim).
-    static constexpr std::size_t kMaxDeferredGroupMembers = 256;
+    static constexpr std::size_t kMaxDeferredGroupMembers = 64;
 
 private:
     /// Is a record a tombstone?

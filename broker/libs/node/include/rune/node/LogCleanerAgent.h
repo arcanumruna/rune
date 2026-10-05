@@ -15,9 +15,10 @@
 //      accumulated across segments: if the chosen segment's bytes exceed the
 //      remaining budget, the cycle stops (soft cap; a single oversized segment
 //      is always processed once to avoid starvation, matching Kafka semantics).
-//   5. Hand each output to the owner via Log::enqueueCleanedGroup() (fix round
-//      2/3).  The owner validates and installs it (renames + trusted open, one
-//      group per duty pass) in Log::drainCleanerSwaps().
+//   5. Open each output and hand it to the owner via Log::enqueueCleanedGroup()
+//      (fix rounds 2-4).  The owner validates and switches to it in memory (no
+//      filesystem op, one group per duty pass); this thread then performs the
+//      renames posted back to it (Log::runCleanerFileOps).
 //
 // Byte dirty ratio (Kafka-exact, §3.2):
 //   cleanBytes     = Σ seg.sizeBytes() for segs with base < firstDirtyOffset
@@ -36,12 +37,14 @@
 //     (one release-store publishes the whole group + the fsynced outputs).
 //   - The owner (NodeRuntimeAgent / Worker duty pass) drains via
 //     PartitionReplica::drainCleanerSwapsOnOwner(): it validates the group
-//     (incarnation, not active, below min(HW, LSO)), commits it with renames
-//     (.cleaned → .swap → .log) and opens the segment trusted — O(1), at most one
-//     group per partition per duty pass.  Rejected outputs are deleted and the
-//     owner publishes a watermark rewind the cleaner folds in.  No lock.
-//   - Superseded LogSegment objects are retired on the owner thread — no reader
-//     can hold a reference after that point (single-writer invariant).
+//     (incarnation, not active, below min(HW, LSO)) and switches its map to the
+//     already-open output — NO filesystem op, at most one group per partition
+//     per duty pass — then posts the file work back (msg ring).  This thread
+//     (runCleanerFileOps, every cycle) performs .cleaned → .swap → .log, the
+//     directory fsync, deletes rejected outputs, and destroys the retired
+//     LogSegment objects (close / munmap).  The owner publishes a watermark
+//     rewind for rejected outputs; the cleaner folds it in.  No lock: a per-log
+//     file-op token (cleaner per cycle, owner only on cold paths) orders them.
 //   This is the CP-6 data-race fix: the previous design ran reloadSegment() AND
 //     segmentBaseOffsets() on the CLEANER thread (cleanSegment), racing the
 //     append thread's maybeRoll() — a TSan-proven write/write race on segments_.
@@ -91,6 +94,7 @@
 #include <cstring>
 #include <array>
 #include <filesystem>
+#include <spdlog/spdlog.h>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -217,6 +221,16 @@ public:
         // CP-8: sample wall-clock epoch-ms ONCE per cycle (deterministic horizon).
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+
+        // Fix round 4: perform the file operations the OWNER posted (it never
+        // touches the filesystem in a duty pass) — compaction renames, retention
+        // renames, rejected-output deletion, destruction of retired segment
+        // objects, directory fsync, expired *.deleted sweep.  Every replica (any
+        // role): the owner posts regardless of role.  Housekeeping like the
+        // pre-provisioning above: not folded into the return value.
+        for (auto* r : replicas_()) {
+            if (r && r->isDiskBacked()) (void)r->log()->runCleanerFileOps(nowMs, r->fileDeleteDelayMs());
+        }
 
         // ---------------------------------------------------------------
         // CP-9: Retention cadence — run retention if retentionCheckMs has
@@ -569,7 +583,20 @@ public:
                 if (sit != best.snap->end() && sit->baseOffset == gb) lineage = sit->lineage;
                 scratchMembers_[n++] = rune::storage::Log::CleanedMember{gb, lineage};
             }
-            if (!best.log->enqueueCleanedGroup(scratchMembers_.data(), n, g.seq, g.hasOutput, g.nextOffset)) {
+            // Fix round 4: open the finished output HERE (cleaner thread) so the
+            // owner installs it without any filesystem operation.
+            std::unique_ptr<rune::storage::LogSegment> prebuilt;
+            if (g.hasOutput) {
+                try {
+                    prebuilt = best.log->openCleanedOutput(g.bases.front(), g.seq, g.nextOffset);
+                } catch (const std::exception& ex) {
+                    spdlog::warn("LogCleanerAgent: cannot open cleaned output for segment {}: {}",
+                                 g.bases.front(), ex.what());
+                }
+            }
+            const bool opened = !g.hasOutput || prebuilt != nullptr;
+            if (!opened || !best.log->enqueueCleanedGroup(scratchMembers_.data(), n, g.seq, g.hasOutput,
+                                                          g.nextOffset, prebuilt.get())) {
                 // Ring full: discard this and every later output (the originals are
                 // untouched) — the segments stay dirty and are redone next cycle.
                 for (std::size_t gj = gi; gj < passResult.groups.size(); ++gj) {
@@ -583,6 +610,7 @@ public:
                 allEnqueued = false;
                 break;
             }
+            (void)prebuilt.release();   // ownership passed to the owner thread with the group
         }
         if (!allEnqueued) {
             // Ring full — leave the segment(s) dirty; retry next cycle.  Do not
@@ -791,12 +819,9 @@ private:
                 toDelete.push_back(si.baseOffset);
             }
 
-            // ---------------------------------------------------------------
-            // Deferred physical removal: schedule the *.deleted files the owner
-            // produced, then sweep those whose delay has elapsed.
-            // ---------------------------------------------------------------
-            log->discoverDeletedFiles(nowMs);
-            log->physicallyRemoveExpiredDeletedFiles(nowMs, fileDelayMs);
+            // Physical removal of *.deleted files: runCleanerFileOps (every cycle,
+            // under the log's file-op token).
+            (void)fileDelayMs;
         }
     }
 

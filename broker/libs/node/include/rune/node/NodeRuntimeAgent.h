@@ -601,8 +601,8 @@ private:
         // 6.5. CP-6: Drain pending cleaner swaps from LogCleanerAgent.
         //      LogCleanerAgent runs on its own thread and enqueues compaction
         //      outputs via Log::enqueueCleanedGroup().  This single-writer thread
-        //      validates and installs them (renames + trusted open, one group per
-        //      partition per pass) — PartitionReplica::drainCleanerSwapsOnOwner.
+        //      validates and installs them in memory (no filesystem op, one group
+        //      per partition per pass) — PartitionReplica::drainCleanerSwapsOnOwner.
         //
         //      CP-9: Also drain retention PROPOSALS (Log::enqueueDeletedSegment):
         //      this thread validates each one (incarnation, not active, ends <=

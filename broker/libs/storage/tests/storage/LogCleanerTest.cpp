@@ -2317,9 +2317,13 @@ TEST(LogCleanerRegression, DeferredOutputCarriesIndexAndNextOffsetAndInstallsReg
         std::vector<Log::CleanedMember> members;
         for (int64_t b : g.bases)
             for (const auto& si : *snap) if (si.baseOffset == b) members.push_back({b, si.lineage});
-        ASSERT_TRUE(log.enqueueCleanedGroup(members.data(), members.size(), g.seq, true, g.nextOffset));
+        ASSERT_TRUE(log.enqueueCleanedGroup(members.data(), members.size(), g.seq, true, g.nextOffset,
+                                            log.openCleanedOutput(g.bases.front(), g.seq, g.nextOffset).release()));
     }
-    for (std::size_t i = 0; i < res.groups.size() + 1; ++i) log.drainCleanerSwaps();   // one group per drain
+    for (std::size_t i = 0; i < res.groups.size() + 1; ++i) {   // one group per drain
+        log.drainCleanerSwaps();
+        log.runCleanerFileOps(0);
+    }
     EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
     // Latest value per key is still readable; superseded copies are gone.
     std::map<std::string, std::string> latest;

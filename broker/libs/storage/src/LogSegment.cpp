@@ -36,6 +36,28 @@ std::string LogSegment::fname(std::string dir, int64_t base, const char* ext) {
 // ---------------------------------------------------------------------------
 // Background pre-provisioning (append-p99 fix).
 // ---------------------------------------------------------------------------
+std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
+    const std::string& dir, int64_t base, const std::string& logFile, const std::string& indexFile,
+    int64_t nextOffset, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
+    auto seg = std::unique_ptr<LogSegment>(new LogSegment());
+    seg->baseOffset_         = base;
+    seg->indexIntervalBytes_ = indexIntervalBytes;
+    seg->indexMaxBytes_      = indexMaxBytes;
+    seg->nextOffset_         = base;
+    seg->durableNext_        = base;
+    seg->log_.open(logFile, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+    if (!seg->log_.is_open())
+        throw std::runtime_error("LogSegment::openPrebuilt: cannot open " + logFile);
+    seg->fd_ = ::open(logFile.c_str(), O_RDWR | O_APPEND);
+    if (seg->fd_ < 0)
+        throw std::system_error(errno, std::system_category(), "LogSegment::openPrebuilt: open " + logFile);
+    seg->index_ = std::make_unique<OffsetIndex>(indexFile, base, indexMaxBytes);
+    if (const int e = seg->openTrusted(nextOffset); e != 0)
+        throw std::system_error(e, std::system_category(), "LogSegment::openPrebuilt: fstat " + logFile);
+    seg->logPath_ = fname(dir, base, ".log");   // the name it will have once installed
+    return seg;
+}
+
 std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     const std::string& stagingLogPath, const std::string& stagingIndexPath,
     int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
@@ -92,9 +114,10 @@ void LogSegment::adoptAsActive(int64_t base) {
     durableNext_ = base;
     if (index_) index_->setBaseOffset(base);
     staging_ = false;
+    pathPending_ = true;   // on-disk name is still the staging one until setLogPath
 }
 
-void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; }
+void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; pathPending_ = false; }
 
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
                        int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap)
