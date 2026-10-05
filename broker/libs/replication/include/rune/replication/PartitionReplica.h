@@ -1341,7 +1341,9 @@ private:
     uint64_t        staleLeadRefusals_ = 0;
     void refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch);
     int  requestLeaderEpochBump_(int64_t nowNs);
-    void persistLedEpoch_(Epoch e);
+    bool persistLedEpoch_(Epoch e);
+    bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
+    bool fenceErrorLogged_ = false;
     static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
     std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload
     uint64_t v2RefusalsLogged_ = 0;                             ///< mixed v2/v3: CRITICAL once

@@ -422,7 +422,15 @@ private:
                     //     every cycle) keeps it from oscillating against a heartbeat-
                     //     flapping node while still re-spreading load when the set is
                     //     stable.  restorable()/position-gating keeps every move safe.
-                    const int maxPref = changed ? 1024 : 0;
+                    //   • Epoch-restart fix round 1 (M2): also when the controller
+                    //     just caught up after its claim, or the committed map changed
+                    //     since the last pass (a returned replica re-entered an ISR —
+                    //     it becomes a preferred candidate only THEN, after the
+                    //     eligible-set edge passed).  An edge seen while the
+                    //     controller cannot decide is NOT consumed (below).
+                    const bool ctlReady = metadataService_->controllerReady();
+                    const bool recheck  = metadataService_->takePreferredRecheck();
+                    const int maxPref = (changed || recheck) ? 1024 : 0;
                     const std::size_t emitted =
                         metadataService_->reassignDeadPartitionLeaders(
                             eligibleScratch_, maxPref);
@@ -434,10 +442,12 @@ private:
                             (long long)(nowNs / 1'000'000), emitted, maxPref, n);
                     work += static_cast<int>(emitted);
                     slowWork += static_cast<int>(emitted);
-                    std::copy(eligBuf_.begin(), eligBuf_.begin() + n,
-                              prevEligBuf_.begin());
-                    prevEligLen_  = n;
-                    prevEligInit_ = true;
+                    if (ctlReady) {   // M2: never consume the edge undecided
+                        std::copy(eligBuf_.begin(), eligBuf_.begin() + n,
+                                  prevEligBuf_.begin());
+                        prevEligLen_  = n;
+                        prevEligInit_ = true;
+                    }
                 }
                 failoverTick_.done(nowNs, slowWork);
             }

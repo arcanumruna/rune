@@ -1765,9 +1765,10 @@ void appendStaleTail(DrCluster& c, NodeId id, int32_t epoch, std::initializer_li
 
 // A fast leader restart (the controller never failed it over): the replayed
 // assignment names it leader at its OLD epoch.  It must not lead (or take a
-// produce) under that epoch; it is re-elected at a new one and its new batches
-// carry it.
-TEST(DrIntegrationRegression, LeaderFastRestart_RefusesItsOldEpoch_ReelectedAtANewEpoch) {
+// produce) under that epoch; it asks for a new one and — another ISR member
+// being live — leadership FAILS OVER (fix round 1 MAJOR-1: a restarted
+// ex-leader may have lost acked records); it rejoins as a follower.
+TEST(DrIntegrationRegression, LeaderFastRestart_RefusesItsOldEpoch_FailsOverToAnIsrMember) {
     DrCluster c(3);
     c.start();                                   // leader 1 @ epoch 1
     ASSERT_EQ(c.produceAcked(10), 10);
@@ -1777,13 +1778,56 @@ TEST(DrIntegrationRegression, LeaderFastRestart_RefusesItsOldEpoch_ReelectedAtAN
     EXPECT_FALSE(c.rep(1).acceptsProduce())
         << "the restarted node leads again at the epoch its previous incarnation led at";
     ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
-    EXPECT_EQ(c.leader(), 1);
-    EXPECT_GT(c.rep(1).epoch(), 1) << "re-established leadership kept the old epoch";
+    EXPECT_NE(c.leader(), 1) << "the restarted ex-leader was re-elected over a live ISR member";
+    EXPECT_GT(c.epoch(), 1);
     ASSERT_EQ(c.produceAcked(5), 5);
     expectAllConvergedAndAcked(c, "fast leader restart");
     const auto eps = c.batchEpochs(1);
     ASSERT_FALSE(eps.empty());
     EXPECT_GT(eps.back().second, 1) << "a post-restart batch was stamped with the pre-restart epoch";
+}
+
+// MAJOR-1: the leader loses its unflushed tail (power loss, periodic fsync
+// off) and restarts before any failover.  Re-electing it would make the ISR
+// followers truncate ACKED records to its short log; the follower in the ISR
+// leads instead and every acked record survives.
+TEST(DrIntegrationRegression, LeaderPowerLossFastRestart_IsrFollowerLeads_NoAckedLoss) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(40), 40);
+    c.crash(1, CrashKind::PowerLoss);            // its unsynced tail is gone
+    c.restart(1);
+    ASSERT_LT(c.rep(1).logEndOffset(), 40) << "precondition: the leader lost acked records";
+    c.applyMetadata(1);                          // no failover: still 1 @ epoch 1
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    EXPECT_NE(c.leader(), 1);
+    ASSERT_EQ(c.produceAcked(5), 5);
+    expectAllConvergedAndAcked(c, "leader power loss + fast restart");
+}
+
+// MAJOR-1: the restarted leader is the SOLE in-sync replica — no clean
+// alternative: it is re-elected, at a NEW epoch.
+TEST(DrIntegrationRegression, SoleIsrLeaderRestart_SameLeaderAtANewEpoch) {
+    DrCluster c(3);
+    c.start();
+    ASSERT_EQ(c.produceAcked(10), 10);
+    c.isolate(2);
+    c.isolate(3);
+    ASSERT_TRUE(c.driveUntil([&] { return c.controllerIsr() == std::vector<NodeId>{1}; }, kCap))
+        << c.dump();
+    const Epoch before = c.epoch();
+    c.crash(1, CrashKind::ProcessKill);
+    c.restart(1);
+    c.applyMetadata(1);
+    ASSERT_TRUE(c.driveUntil([&] { return c.rep(1).acceptsProduce(); }, kCap)) << c.dump();
+    EXPECT_EQ(c.leader(), 1);
+    EXPECT_GT(c.rep(1).epoch(), before) << "the sole ISR leader re-led its old epoch";
+    c.healAll();
+    c.applyMetadata(2);                          // the isolated nodes learn the new epoch
+    c.applyMetadata(3);
+    ASSERT_TRUE(c.waitWritable(kCap)) << c.dump();
+    ASSERT_EQ(c.produceAcked(3), 3);
+    expectAllConvergedAndAcked(c, "sole-ISR restart");
 }
 
 // Cold restart with a follower holding an unreplicated tail written under the

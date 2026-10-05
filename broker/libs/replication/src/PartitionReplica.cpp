@@ -286,6 +286,21 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         refuseStaleLeadership_(newEpoch, partitionEpoch);
         return;
     }
+    if (isrChannel_ != nullptr) {
+        // Fix round 1 M3: never lead without a DURABLE fence.  No fence file
+        // (memory log without a data dir): the epochs led by an earlier
+        // incarnation are unknown — the first leadership of this incarnation
+        // is refused and every epoch the controller grants after it is new
+        // (it commits leader epochs monotonically).  A failed fence write:
+        // refused too (fail closed) — the bump fails over or re-grants.
+        const bool noFence = fenceFile_.empty() && !fenceEstablished_;
+        if (noFence || (!fenceFile_.empty() && !persistLedEpoch_(newEpoch))) {
+            if (newEpoch > restartFenceEpoch_) restartFenceEpoch_ = newEpoch;
+            fenceEstablished_ = true;
+            refuseStaleLeadership_(newEpoch, partitionEpoch);
+            return;
+        }
+    }
     staleLead_.pending = false;
 
     // NB1 fix: capture committed offset BEFORE flipping role or mutating state.
@@ -370,8 +385,6 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         diskLog_->setLeaderEpochStamp(static_cast<int32_t>(epoch_));
         checkpointEpochs_();
     }
-    // Durable BEFORE the first append under this epoch (the restart fence).
-    persistLedEpoch_(epoch_);
 
     lastIsrCheckNs_ = 0;
 
@@ -2284,9 +2297,13 @@ void PartitionReplica::setLeaderEpochFenceFile(std::string path)
     if (v > restartFenceEpoch_) restartFenceEpoch_ = static_cast<Epoch>(v);
 }
 
-void PartitionReplica::persistLedEpoch_(Epoch e)
+bool PartitionReplica::persistLedEpoch_(Epoch e)
 {
-    if (fenceFile_.empty() || e <= fencePersisted_) return;
+    // Durable BEFORE the first append under this epoch.  Only where the fence
+    // is enforced (controller-managed: isrChannel_); internal consensus-led
+    // partitions skip the fsyncs (L3).
+    if (fenceFile_.empty()) return false;
+    if (e <= fencePersisted_) return true;
     const std::string tmp = fenceFile_ + ".tmp";
     const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     bool ok = fd >= 0;
@@ -2303,21 +2320,27 @@ void PartitionReplica::persistLedEpoch_(Epoch e)
         const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
         fencePersisted_ = e;
-    } else {
-        ::unlink(tmp.c_str());
-        // Not fatal for THIS incarnation (it may lead at e); a restart then
-        // falls back to the checkpointed lineage for the fence.
-        spdlog::error("PartitionReplica[node={}] topic={} part={}: leader-epoch fence {} not persisted to {}",
+        fenceErrorLogged_ = false;
+        return true;
+    }
+    ::unlink(tmp.c_str());
+    // Fail closed (M3): the caller refuses the leadership.
+    if (!fenceErrorLogged_) {
+        fenceErrorLogged_ = true;
+        spdlog::error("PartitionReplica[node={}] topic={} part={}: leader-epoch fence {} not persisted to {} "
+                      "— leadership refused until it can be",
                       cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
                       static_cast<long long>(e), fenceFile_);
     }
+    return false;
 }
 
 void PartitionReplica::refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch)
 {
     ++staleLeadRefusals_;
     spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — "
-                 "an earlier incarnation already led at epoch {}; asking the controller for a new epoch",
+                 "restart fence {} (led by an earlier incarnation, or no durable fence); "
+                 "asking the controller for a new epoch",
                  cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
                  static_cast<long long>(newEpoch), static_cast<long long>(restartFenceEpoch_));
     // Never lead (and never accept a produce) under it: a follower of no leader.
@@ -2346,6 +2369,10 @@ int PartitionReplica::requestLeaderEpochBump_(int64_t nowNs)
     m.leaderEpoch    = staleLead_.epoch;
     m.isrCount       = AlterIsrMsg::kLeaderEpochBump;
     m.partitionEpoch = staleLead_.partitionEpoch;
+    m.isr[0] = static_cast<int32_t>(restartFenceEpoch_);   // L2: the controller jumps past it
+    m.isr[1] = AlterIsrMsg::kBumpFenceValid | (memoryBacked_ ? AlterIsrMsg::kBumpMemoryBacked : 0);
+    const Offset leo = logEndOffset_();
+    m.isr[2] = static_cast<int32_t>(std::min<Offset>(leo, std::numeric_limits<int32_t>::max()));
     if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;
     return 1;
 }

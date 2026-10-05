@@ -338,13 +338,26 @@ TEST(EpochRestartRegression, FullClusterColdRestartBumpsEveryUserPartitionEpochR
         EXPECT_TRUE(bumped) << "partition " << p << " never led at an epoch > " << oldEpoch[p];
     }
     EXPECT_FALSE(staleLead) << "a replica led at a pre-restart epoch: " << staleWhat;
-    // The bumped leaders are writable and the history survived.
+    // Fix round 1 (M2 / MAJOR-1): restarted ex-leaders hand leadership to an
+    // in-sync peer; once they are back in the ISR leadership RE-SPREADS (each
+    // node leads one partition again) — never stays collapsed.
+    EXPECT_TRUE(eventually([&] {
+        std::array<int, 3> led{};
+        for (int32_t p = 0; p < kParts; ++p) {
+            const int l = settled(raw(ns), p);
+            if (l < 0) return false;
+            ++led[static_cast<std::size_t>(l)];
+        }
+        return led[0] == 1 && led[1] == 1 && led[2] == 1;
+    }, 60'000ms)) << "leadership never re-spread after the cold restart";
+    // The leaders are writable and the history survived.
     for (int32_t p = 0; p < kParts; ++p) {
-        const auto l = leaderOf(raw(ns), p);
-        ASSERT_GE(l.first, 0);
-        ASSERT_TRUE(produce(*ns[l.first], p, 0xB0, 1));
-        EXPECT_TRUE(eventually([&] { return hwOnOwner(*ns[l.first], 0, p) >= 4; }))
+        ASSERT_TRUE(produceAny(raw(ns), p, 0xB0, 1));
+        int lead = -1;
+        EXPECT_TRUE(eventually([&] { lead = settledWith(raw(ns), p, 4); return lead >= 0; }))
             << "partition " << p << ": post-restart record never committed";
+        ASSERT_GE(lead, 0);
+        const auto l = std::pair<int, Epoch>{lead, 0};
         const auto v = valueBytes(*ns[l.first], p, 0, 4);
         ASSERT_EQ(v.size(), 4u);
         for (int i = 0; i < 3; ++i) EXPECT_EQ(v[static_cast<std::size_t>(i)], 0xA0 + p);
@@ -483,9 +496,12 @@ TEST(EpochRestartRegression, SingleNodeRestartBumpsLeaderEpochRegression) {
     EXPECT_TRUE(bumped) << "partition " << part << " leadership never moved past epoch " << oldEpoch;
     EXPECT_FALSE(staleLead) << "the restarted node led partition " << part << " at pre-restart epoch "
                             << staleEpoch << " (<= " << oldEpoch << ")";
-    const auto l = leaderOf(raw(ns), part);
-    ASSERT_GE(l.first, 0);
-    ASSERT_TRUE(produce(*ns[l.first], part, 0xE1, 1));
-    EXPECT_TRUE(eventually([&] { return hwOnOwner(*ns[l.first], 0, part) >= 4; }));
+    // Fix round 1 (M2 / MAJOR-1): the restarted ex-leader handed leadership to
+    // an in-sync peer; once it is back in the ISR it leads its (preferred)
+    // partition again — leadership re-spreads, never stays collapsed.
+    EXPECT_TRUE(eventually([&] { return settledWith(raw(ns), part, 3) == victim; }, 60'000ms))
+        << "leadership of partition " << part << " never returned to node " << victim;
+    ASSERT_TRUE(produceAny(raw(ns), part, 0xE1, 1));
+    EXPECT_TRUE(eventually([&] { return settledWith(raw(ns), part, 4) >= 0; }));
     for (auto& n : ns) n->stop();
 }

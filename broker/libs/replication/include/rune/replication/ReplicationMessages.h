@@ -435,6 +435,12 @@ struct AlterIsrMsg {
     /// commits the same assignment at leaderEpoch + 1.  An older controller
     /// ignores it (isrCount <= 0 was always dropped unanswered).
     static constexpr int32_t kLeaderEpochBump = 0;
+    /// Bump request payload (isrCount == kLeaderEpochBump): isr[0] = the
+    /// requester's fence epoch, isr[1] = flags, isr[2] = its log end offset
+    /// (clamped to int32).  kBumpFenceValid: isr[0] is meaningful.
+    /// kBumpMemoryBacked: a memory log (empty after a restart).
+    static constexpr int32_t kBumpFenceValid   = 1;
+    static constexpr int32_t kBumpMemoryBacked = 2;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

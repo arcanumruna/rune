@@ -409,6 +409,7 @@ public:
     uint64_t fenceCommitted() const noexcept { return fenceCommitted_; }
     uint64_t alterIsrIneligible() const noexcept { return alterIsrIneligible_; }
     uint64_t leaderEpochBumps() const noexcept { return leaderEpochBumps_; }
+    uint64_t bumpFailovers() const noexcept { return bumpFailovers_; }
 
 
     // ---------------------------------------------------------------- driving
@@ -733,6 +734,9 @@ private:
     /// proposal from the current leader at the current epoch, commit the new
     /// ISR (partitionEpoch + 1) and push the assignment to every node it can
     /// reach (the leader sees a same-epoch becomeLeader).
+    bool liveToController_(NodeId id) {
+        return node(id).up && cut_.count({id, kControllerAddr}) == 0;
+    }
     void controllerAlterIsr_(const AlterIsrMsg& m) {
         auto reply = [&](int16_t code) {
             Frame f; f.kind = Kind::AlterIsrResp; f.from = kControllerAddr; f.to = m.leaderId;
@@ -755,9 +759,25 @@ private:
         // committed leader refused its committed epoch (it led at it in an
         // earlier incarnation) — the same assignment at a NEW epoch.
         if (m.isrCount == AlterIsrMsg::kLeaderEpochBump) {
-            ++meta_.epoch;
-            ++meta_.partitionEpoch;
-            ++leaderEpochBumps_;
+            // Fix round 1 MAJOR-1 (MetadataService::decideBumps_): another
+            // live ISR member leads and the requester leaves the ISR; only a
+            // sole in-sync requester is re-elected, past its fence.
+            NodeId other = -1;
+            for (NodeId n : meta_.isr)
+                if (n != m.leaderId && liveToController_(n)) { other = n; break; }
+            if (other >= 0) {
+                std::vector<NodeId> isr{other};
+                for (NodeId n : meta_.isr) if (n != other && n != m.leaderId) isr.push_back(n);
+                meta_.leader = other;
+                meta_.isr    = std::move(isr);
+                ++meta_.epoch;
+                ++bumpFailovers_;
+            } else {
+                const Epoch fence = (m.isr[1] & AlterIsrMsg::kBumpFenceValid) ? m.isr[0] : -1;
+                meta_.epoch = std::max<Epoch>(meta_.epoch, fence) + 1;
+                ++leaderEpochBumps_;
+            }
+            meta_.partitionEpoch = std::max<int32_t>(meta_.partitionEpoch + 1, static_cast<int32_t>(meta_.epoch));
             reply(kAlterIsrOk);
             for (auto& n : nodes_)
                 if (cut_.count({kControllerAddr, n.id}) == 0) applyMetadata(n.id);
@@ -910,6 +930,7 @@ private:
     uint64_t                fenceCommitted_    = 0;
     uint64_t                alterIsrIneligible_ = 0;
     uint64_t                leaderEpochBumps_   = 0;
+    uint64_t                bumpFailovers_      = 0;
     uint64_t                step_  = 0;
     int64_t                 clock_ = 0;
     uint64_t                nextId_ = 1;
