@@ -199,6 +199,10 @@ public:
 
     /// CB-5 B: attempt to resend a redirected Produce identified by correlationId.
     /// Returns true if one producer handled it (resent or failed).
+    /// DR-15 review M1: see ProducerImpl::noteRedirectAnswer.
+    void noteRedirectAnswer(int64_t corrId) noexcept {
+        for (ProducerImpl* impl : active_) if (impl != nullptr) impl->noteRedirectAnswer(corrId);
+    }
     /// DR-7 review M2: any producer had an attempt time out since the last call.
     [[nodiscard]] bool takeMetadataWanted() noexcept {
         bool w = false;

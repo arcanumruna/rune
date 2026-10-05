@@ -261,6 +261,13 @@ public:
 
     /// CB-5 B: true if there is at least one pending (unbound) subscription.
     [[nodiscard]] bool hasPending() const;
+    /// DR-15: the Subscribe `correlationId` is still pending (no answer bound it).
+    [[nodiscard]] bool isPending(int64_t correlationId) const;
+    /// DR-15: re-send ONLY that pending Subscribe, re-stamped with `sessionId`, and
+    /// restart its deadline (a re-routed request is progressing, not silent).
+    /// False when it is no longer pending.
+    bool resendOne(int64_t correlationId, int64_t sessionId, const SendFn& submitFn,
+                   std::chrono::steady_clock::time_point newDeadline);
 
     // -------------------------------------------------------------------------
     // Helpers (accessible so SubscriberHub is testable standalone)

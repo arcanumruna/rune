@@ -1534,6 +1534,8 @@ int Client::dutyCycle(int64_t nowNs) {
     }
     // DR-7: a partition route's leader session that fails to connect asks for metadata.
     work += watchProduceRoutes_(nowNs);
+    // DR-15: Subscribes redirected to an unreachable node, after fresh metadata.
+    if (!redirectedSubscribes_.empty()) [[unlikely]] work += retryRedirectedSubscribes_(nowNs);
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
     if (unsentCtl_ != 0) [[unlikely]] work += retryUnsentControl_();
@@ -2180,6 +2182,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     redirectPending() = true;
                     agent_.submitReconnect();
                 }
+                redirectedResendBackoffNs_ = kRedirectedResendInitNs;  // DR-15: a reachable target
             } else {
                 // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
                 // that is unreachable right now (it just stopped — its host is gone).
@@ -2188,10 +2191,27 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // the next answer redirects to the live leader or serves it).  The
                 // redirected Produce stays in flight — its attempt timer re-offers it
                 // (no redirect budget spent: nothing was re-sent).
-                std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata\n",
-                             newEndpoint.c_str());
-                redirectPending() = false;
-                if (subscriberHub_.hasPending()) resubscribeOnMetadata_ = true;
+                if ((unreachableRedirects_++ & 1023u) == 0)
+                    std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata "
+                                 "(%llu so far)\n", newEndpoint.c_str(),
+                                 static_cast<unsigned long long>(unreachableRedirects_));
+                // Review M1: still an answer for the produce's in-flight accounting.
+                producerHub_.noteRedirectAnswer(opt->correlationId);
+                // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
+                // which still await their own answer — a duplicate would register a
+                // second subscription broker-side).
+                if (subscriberHub_.isPending(opt->correlationId)) {
+                    try {
+                        redirectedSubscribes_.push_back(opt->correlationId);
+                    } catch (...) {
+                        // allocation failure (cold path): it times out as before
+                    }
+                }
+                // Review M3: paced — the re-send waits for a fresh metadata answer
+                // AND a doubling backoff (100 ms .. 2 s); never a tight redirect loop.
+                redirectMetaSeen_       = metadataResponses_;
+                nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
+                redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
                 requestMetadataNow_();
             }
             break; // Redirect is handled; don't fall through to the error path.
@@ -3344,6 +3364,29 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
     return 1;
 }
 
+int Client::retryRedirectedSubscribes_(int64_t nowNs) {
+    if (metadataResponses_ == redirectMetaSeen_ || nowNs < nextRedirectedResendNs_) return 0;  // no new answer yet
+    const auto snap = agent_.stateAndSessionId();
+    if (snap.state != session::SessionState::Connected || snap.sessionId == 0) {
+        // Review MAJOR-2: the reconnect's resendPending re-sends every pending
+        // Subscribe on the new session — never a second copy from here.
+        redirectedSubscribes_.clear();
+        return 0;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs);
+    int sent = 0;
+    for (const int64_t corr : redirectedSubscribes_) {
+        sent += subscriberHub_.resendOne(
+                    corr, snap.sessionId,
+                    [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
+                        return agent_.submitSend(fb, fl);
+                    },
+                    deadline) ? 1 : 0;
+    }
+    redirectedSubscribes_.clear();
+    return sent;
+}
+
 int Client::watchGroupSessions_(int64_t nowNs) {
     const uint32_t leaders = agent_.leaderSessionCount();
     if (leaders == 0) return 0;
@@ -3792,20 +3835,7 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     for (const auto& [t, pp] : moved) producerHub_.resendPartitionViaRoute(t, pp);
     producerHub_.resendRouteParked();  // (b): fresh metadata after a NotLeader
     ++metadataResponses_;
-    // DR-15: Subscribes redirected to an unreachable node go out again now.
-    if (resubscribeOnMetadata_) [[unlikely]] {
-        resubscribeOnMetadata_ = false;
-        const auto snap = agent_.stateAndSessionId();
-        if (snap.state == session::SessionState::Connected && snap.sessionId != 0) {
-            subscriberHub_.resendPending(
-                snap.sessionId,
-                [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-                    return agent_.submitSend(fb, fl);
-                });
-        } else {
-            resubscribeOnMetadata_ = true;  // the reconnect's resendPending covers it too
-        }
-    }
+
 
     // read-rework I4: open a per-worker dynamic-MDC egress subscription for each
     // partition whose owner advertises one (per-worker egress active on the broker).

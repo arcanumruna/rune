@@ -2751,6 +2751,19 @@ inline void restampSessionId(std::vector<uint8_t>& frame, int64_t sessionId) noe
 }
 } // anonymous namespace
 
+void ProducerImpl::noteRedirectAnswer(int64_t corrId) noexcept
+{
+    const DutyScope duty(*this);
+    if (!batchcorr::isBatch(corrId) || batchcorr::ordinal(corrId) != ordinal_) return;
+    const uint32_t s = batchcorr::slot(corrId);
+    if (s >= partitions_.size()) return;
+    PartitionState& ps = *partitions_[s];
+    if (InFlightBatch* b = ps.inflight.find(corrId)) {
+        noteAnswer_(*b, batchcorr::attempt(corrId));
+        maybeEndLaneWait_(ps);
+    }
+}
+
 bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
 {
     const DutyScope duty(*this);  // fix1 C1

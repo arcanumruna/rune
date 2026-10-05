@@ -917,7 +917,16 @@ private:
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
     std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
     uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
-    bool                  resubscribeOnMetadata_ = false;  // DR-15: re-send pending Subscribes on the next metadata answer
+    // DR-15: Subscribes whose Redirect named an unreachable node — re-sent (only
+    // they) after a fresh metadata answer and a doubling backoff.
+    int retryRedirectedSubscribes_(int64_t nowNs);
+    std::vector<int64_t>  redirectedSubscribes_;
+    int                   redirectMetaSeen_ = 0;
+    int64_t               nextRedirectedResendNs_ = 0;
+    static constexpr int64_t kRedirectedResendInitNs = 100'000'000LL;     // 100 ms
+    static constexpr int64_t kRedirectedResendMaxNs  = 2'000'000'000LL;   // 2 s
+    int64_t               redirectedResendBackoffNs_ = kRedirectedResendInitNs;
+    uint64_t              unreachableRedirects_ = 0;
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass
     uint64_t groupDiscMask_ = 0;  // ... terminally Disconnected last pass
     static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,

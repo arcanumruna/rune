@@ -868,6 +868,9 @@ public:
     /// N-e: the backoff before a retriable error (MinIsrViolation) is re-sent
     /// (Kafka retry.backoff.ms default), capped by produceTimeoutMs.
     static constexpr int64_t kRetriableBackoffNs = 100'000'000LL;
+    /// DR-15 review M1: a Redirect for `corrId` that is not followed (target
+    /// unreachable) is still an answer for the in-flight accounting (NEW-4(b)).
+    void noteRedirectAnswer(int64_t corrId) noexcept;
     bool retryRedirectedProduce(int64_t corrId,
                                 SendFn& sendFn);
 

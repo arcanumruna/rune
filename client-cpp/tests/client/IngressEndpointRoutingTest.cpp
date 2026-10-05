@@ -711,3 +711,28 @@ TEST(IngressEndpointRouting, SubscribeRedirectedToAnUnreachableNodeIsRetriedRegr
     EXPECT_NE(r.gw.latestSubscription(1, 0), nullptr);
     EXPECT_GT(r.gw.metadataRequests, md) << "no metadata asked after the failed retarget";
 }
+
+// DR-15 review MAJOR-1: only the redirected Subscribe is re-sent.  Another
+// Subscribe still awaiting its own answer is never sent twice (a duplicate would
+// register a second, leaked subscription broker-side).
+TEST(IngressEndpointRouting, UnreachableRedirectResendsOnlyThatSubscribeRegression) {
+    Rig r(3932, 3933, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    r.connect();
+    r.gw.dropSubscribeResponsesNext = 1;   // A stays pending (registered, never answered)
+    auto a = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeCorrIds.size() == 1; }));
+    const int64_t corrA = r.gw.subscribeCorrIds[0];
+    r.gw.subscribeRedirectNext = 1;
+    r.gw.subscribeRedirectTo   = "rune-unresolvable.invalid:40200";
+    auto b = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeCorrIds.size() >= 3; })) << "B was never re-sent";
+    // Let any further (wrong) resends surface.
+    const int md = r.gw.metadataRequests;
+    (void)r.drive([&] { return r.gw.metadataRequests >= md + 2; }, 50'000);
+    int copiesOfA = 0;
+    for (const int64_t c : r.gw.subscribeCorrIds) copiesOfA += c == corrA;
+    EXPECT_EQ(copiesOfA, 1) << "the still-pending Subscribe A was re-sent with B";
+    EXPECT_FALSE(b.finished());
+}

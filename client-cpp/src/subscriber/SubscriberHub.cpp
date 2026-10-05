@@ -583,6 +583,34 @@ bool SubscriberHub::hasPending() const
     return !pendingByCorrelation_.empty();
 }
 
+bool SubscriberHub::isPending(int64_t correlationId) const
+{
+    return pendingByCorrelation_.find(correlationId) != pendingByCorrelation_.end();
+}
+
+bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const SendFn& submitFn,
+                              std::chrono::steady_clock::time_point newDeadline)
+{
+    constexpr std::size_t kHeaderSessionIdOff = 8;
+    auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end()) return false;
+    auto& req = it->second;
+    if (!req || !req->impl || !req->impl->active) return false;
+    auto& frame = req->subscribeFrame;
+    if (frame.size() < kHeaderSessionIdOff + 8) return false;
+    const uint64_t u = static_cast<uint64_t>(sessionId);
+    for (int i = 0; i < 8; ++i) frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
+    req->deadline = newDeadline;
+    if (directSend_ != nullptr) {
+        switch (sendSubscribeFrame_(*req)) {
+        case detail::SendResult::Accepted: clearUnsent_(*req); return true;
+        case detail::SendResult::Retry:    markUnsent_(*req); return true;
+        case detail::SendResult::Fatal:    (void)failRequest_(it); return false;
+        }
+    }
+    return submitFn && submitFn(0, frame.data(), frame.size());
+}
+
 // ---------------------------------------------------------------------------
 // M2 FIX: failPendingSubscribes — fail all unbound pending subscribes
 // ---------------------------------------------------------------------------
