@@ -1213,6 +1213,7 @@ private:
 
     // Build + route a Subscribe WorkerOp with the resolved egress pub (may be null
     // → MDC fallback).
+    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub) const;
     void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub);
     // Resolve in-flight record-egress pubs (non-blocking) + drain buffered
     // subscribes.  Called from doWork().
@@ -1806,8 +1807,10 @@ public:
     void setNowForTest(int64_t nowNs) noexcept { nowNs_ = nowNs; }
     /// Test-only: the subscription lifecycle forwarding (worker routing).
     void forwardSubscribeForTest(int64_t subId, int64_t sessionId, int32_t topicId, int32_t partition,
-                                 int64_t nextOffset, uint8_t isolation, bool isGroup, bool carrier) {
-        forwardSubscribeToWorker_(subId, sessionId, topicId, partition, nextOffset, isolation, isGroup, carrier);
+                                 int64_t nextOffset, uint8_t isolation, bool isGroup, bool carrier,
+                                 int64_t subscribeCorrId = 0) {
+        forwardSubscribeToWorker_(subId, sessionId, topicId, partition, nextOffset, isolation, isGroup, carrier,
+                                  subscribeCorrId);
     }
     void forwardUnsubscribeForTest(int64_t subId, int32_t topicId, int32_t partition) {
         forwardUnsubscribeToWorker_(subId, topicId, partition);

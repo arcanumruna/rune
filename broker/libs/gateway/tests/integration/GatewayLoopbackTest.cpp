@@ -352,6 +352,10 @@ TEST_F(GatewayLoopbackFixture, Connect_RoundTrip) {
     EXPECT_GE(resp.assignedSessionId, 1);
     EXPECT_EQ(resp.leaderMemberId, kThisNodeId);
     EXPECT_EQ(gw_->sessionCount(), 1u);
+    // CG round 3/4: the broker advertises its version (the 42-byte form,
+    // golden connect_response_v3.bin) and its session ids carry its node id.
+    EXPECT_EQ(resp.brokerVersion, pc::kBrokerVersion);
+    EXPECT_EQ(resp.assignedSessionId >> 40, static_cast<int64_t>(kThisNodeId) + 1);
 }
 
 // ===========================================================================

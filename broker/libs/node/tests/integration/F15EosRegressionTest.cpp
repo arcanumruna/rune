@@ -3355,6 +3355,26 @@ TEST(TxnRcRegression, GatewayPushFiltersAbortedBatchAndAdvances) {
     }
 }
 
+// CG round 4 (LOW-5): the gateway's PushRead push path stamps every Records
+// frame with the correlationId of the client Subscribe that created the
+// subscription (a group member binds pushes by it).
+TEST(CgPushReadStampRegression, PushReadRecordsCarryTheSubscribeCorrelationIdRegression) {
+    EosRig R;
+    std::vector<int64_t> corrs;
+    R.gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) {
+        if (auto rec = pc::Records::decode(b, n)) corrs.push_back(rec->correlationId);
+        else if (auto sr = pc::SubscribeResponse::decode(b, n)) R.lastSubId = sr->subscriptionId;
+    });
+    const int64_t sid = R.gw.injectTestSession();
+    const int64_t sub = R.subscribe(sid, /*read_uncommitted*/0);  // correlationId 9000
+    ASSERT_GT(sub, 0);
+    ASSERT_EQ(ingressData(R, sid, 2, 20), 1);
+    R.runWorker(21);
+    R.push(16, 100);
+    ASSERT_FALSE(corrs.empty()) << "precondition: the PushRead path delivered";
+    for (const int64_t c : corrs) EXPECT_EQ(c, 9000);
+}
+
 TEST(TxnRcRegression, GatewayPushReadCommittedEmptyWhileBuilding) {
     // §2.3: while RC is not Ready, a read_committed PushRead returns an empty
     // chunk (cursor unchanged, notReady echoed); read_uncommitted is unaffected.

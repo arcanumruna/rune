@@ -2409,6 +2409,29 @@ TEST(ReplicaLifetimeRegression, BackPressuredSubscriptionLifecycleOpsAreQueuedIn
     EXPECT_EQ(m.gw.pendingSubOpsForTest(), 0u);
 }
 
+// CG round 4 (A-MAJOR-1): a Subscribe the worker ring refused goes through the
+// gateway's queued retry (trySubOp_) — the subscription it registers must
+// carry the client Subscribe's correlationId (stamped on every Records push)
+// and its replica, exactly like the direct path.  RED: the retry rebuilt the
+// op without them — every push carried correlationId 0 and a group member
+// dropped them all (silent stall under load).
+TEST(ReplicaLifetimeRegression, QueuedSubscribeKeepsItsCorrelationIdAndReplicaRegression) {
+    MarkerRig m;
+    WorkerOp filler; filler.type = WorkerOp::Type::Unsubscribe;
+    while (m.pool.worker(0).tryEnqueueOp(filler)) {}
+    constexpr int64_t kCorr = 0x2000000000000042LL;  // a client's group fetch Subscribe id
+    m.gw.forwardSubscribeForTest(77, /*session*/0, 0, 0, 0, 0, false, false, kCorr);
+    ASSERT_EQ(m.gw.pendingSubOpsForTest(), 1u) << "precondition: the Subscribe was queued (full ring)";
+    drainIdle(m.pool.worker(0));
+    EXPECT_EQ(m.gw.pumpRetryQueuesForTest(), 1);
+    drainIdle(m.pool.worker(0));
+    const auto& subs = m.pool.worker(0).subscriptionsForTest();
+    ASSERT_EQ(subs.size(), 1u);
+    EXPECT_EQ(subs[0].subscriptionId, 77);
+    EXPECT_EQ(subs[0].subscribeCorrId, kCorr) << "the queued retry dropped the Subscribe's correlationId";
+    EXPECT_EQ(subs[0].replica, m.r) << "the queued retry dropped the replica (LOW-4)";
+}
+
 TEST(ReplicaLifetimeRegression, CleanerUsesItsOwnRingViewAndGatesTheFree) {
     // Found on sight: the LogCleanerAgent thread iterated the registry vector the
     // control thread mutates, and could hold a replica collectRetired then freed.

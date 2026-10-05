@@ -226,6 +226,8 @@ private:
     /// std::map with std::less<> (transparent comparator) so hot-path find()
     /// can be called with std::string_view without constructing a std::string.
     std::map<GroupId, rune::coordination::GroupCoordinator, std::less<>> coordinators_;
+    /// LOW-3 (CG round 4): JoinGroup refusals per old-client session (log rate-limit; cold).
+    std::map<int64_t, uint64_t> oldClientRefusals_;
 
     // CG-4: member → sessionId tracking.
     // Keyed by (groupId + ":" + memberId) for global uniqueness.

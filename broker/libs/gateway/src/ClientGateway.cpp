@@ -2577,7 +2577,11 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 // enqueueSubscribeOp_ — build a Subscribe WorkerOp with the resolved per-consumer
 // egress pub pointer and route it to the owning worker.  egressPub may be null
 // (no session / test fixture / resolve timeout) → the worker falls back to MDC.
-void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub)
+// CG round 4 (A-MAJOR-1): the ONE builder of a worker Subscribe op — the
+// direct path (enqueueSubscribeOp_) and the queued retry (trySubOp_) both use
+// it, so neither can drop a field (the retry used to omit the Subscribe's
+// correlationId — every push then carried 0 — and the replica).
+rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub) const
 {
     rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(s.topicId, s.partition) : nullptr;
     const rune::replication::PartitionReplica* rep =
@@ -2597,6 +2601,12 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
+    return op;
+}
+
+void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub)
+{
+    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
     // op for the same worker) is queued and retried every doWork, in order.
@@ -2641,17 +2651,7 @@ bool ClientGateway::trySubOp_(const PendingSubOp& p)
         egressPub = it->second.get();
     }
     const auto& s = p.sub;
-    op.type                 = rune::node::WorkerOp::Type::Subscribe;
-    op.subscriptionId       = s.subId;
-    op.sessionId            = s.sessionId;
-    op.topicId              = s.topicId;
-    op.partition            = s.partition;
-    op.nextOffset           = s.nextOffset;
-    op.isolation            = s.isolation;
-    op.isGroup              = s.isGroup;
-    op.groupCarrierReceived = s.groupCarrierReceived;
-    op.logPtr               = topicRegistry_ ? topicRegistry_->log(s.topicId, s.partition) : nullptr;
-    op.egressPub            = egressPub;
+    op = buildSubscribeOp_(s, egressPub);  // A-MAJOR-1: correlationId + replica included
     return workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
 }
 

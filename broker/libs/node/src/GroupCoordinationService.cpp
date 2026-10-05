@@ -299,7 +299,11 @@ size_t GroupCoordinationService::handleJoinGroup(
     if (gateway_) {
         const int32_t v = gateway_->sessionClientVersion(msg.sessionId);
         if (v >= 0 && v < pc::kClientVersionExplicitGroupSubscriptions) {
-            spdlog::warn("GroupCoordinationService: JoinGroup from session {} refused — client version {} < {} "
+            // LOW-3: an old client re-joins forever — log the first refusal of a
+            // session and then every power of two (bounded log volume).
+            if (oldClientRefusals_.size() >= 4096) oldClientRefusals_.clear();  // bounded (log only)
+            const uint64_t n = ++oldClientRefusals_[msg.sessionId];
+            if ((n & (n - 1)) == 0) spdlog::warn("GroupCoordinationService: JoinGroup from session {} refused — client version {} < {} "
                          "(explicit group subscriptions required); upgrade the client",
                          msg.sessionId, v, pc::kClientVersionExplicitGroupSubscriptions);
             pc::JoinGroupResponse resp;
