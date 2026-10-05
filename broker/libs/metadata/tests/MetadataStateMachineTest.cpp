@@ -982,3 +982,47 @@ TEST(MetadataStateMachineRegression, CommittedVersionMovesOnlyOnCommittedMapChan
     msm.restore(r);
     EXPECT_GT(msm.committedVersion(), v2) << "restore replaces the committed map";
 }
+
+// Epoch-restart fix round 2 (N4): the MSM never installs an assignment record
+// that moves a partition BACK — a lower leaderEpoch, the same leaderEpoch with
+// a different leader, or a lower partitionEpoch — whether it arrives committed
+// at once, through the pending queue, or in a replay of the log.
+TEST(MetadataStateMachineRegression, EpochRegressionRecordsIgnoredInApplyAndReplayRegression)
+{
+    const std::vector<UpdateArgs> log = {
+        {1, 0, 5, {5, 6}, {5, 6}, 3, 4},   // installed
+        {1, 0, 6, {6, 5}, {5, 6}, 2, 9},   // lower leaderEpoch            → ignored
+        {1, 0, 6, {6},    {5, 6}, 3, 9},   // same epoch, other leader     → ignored
+        {1, 0, 5, {5},    {5, 6}, 3, 3},   // lower partitionEpoch         → ignored
+        {1, 0, 5, {5},    {5, 6}, 3, 5},   // ISR change (pe + 1)          → installed
+        {1, 0, 6, {6, 5}, {5, 6}, 4, 6},   // new election (le + 1)        → installed
+        {1, 0, 5, {5, 6}, {5, 6}, 0, 0},   // a static epoch-0 re-emit      → ignored
+    };
+    auto check = [](const MetadataStateMachine& msm, const char* how) {
+        const auto* a = msm.assignment(1, 0);
+        ASSERT_NE(a, nullptr) << how;
+        EXPECT_EQ(a->leaderNode, 6) << how;
+        EXPECT_EQ(a->leaderEpoch, 4) << how;
+        EXPECT_EQ(a->partitionEpoch, 6) << how;
+        EXPECT_EQ(a->isr, (std::vector<int32_t>{6, 5})) << how;
+        EXPECT_EQ(msm.regressionsRejected(), 4u) << how;
+    };
+    {   // committed one by one
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+            msm.commit(static_cast<int64_t>(i));
+        }
+        check(msm, "applied + committed one by one");
+    }
+    {   // replay: everything pending, committed in one step
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+        }
+        msm.commit(static_cast<int64_t>(log.size()));
+        check(msm, "replayed (pending, one commit)");
+    }
+}

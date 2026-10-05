@@ -1086,19 +1086,133 @@ TEST(EpochRestartControllerRegression, SoleIsrBumpReelectsSameLeaderPastFenceReg
     EXPECT_EQ(c.pa().isr.size(), 1u);
 }
 
-// MAJOR-1 (memory-backed): a sole-ISR MEMORY leader restarts empty — it is
-// never re-elected over a live replica that holds more (it would wipe it).
-TEST(EpochRestartControllerRegression, MemoryBackedSoleIsrNeverWipesAFollowerThatHoldsMoreRegression) {
+namespace {
+rune::replication::AlterIsrMsg leaderlessReport(int32_t node, int32_t epoch, int32_t leo, int64_t inc,
+                                                bool logDirFailed = false) {
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = node; m.leaderEpoch = epoch;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = -1;
+    m.isr[1] = rune::replication::AlterIsrMsg::kBumpFollowerReport |
+               (logDirFailed ? rune::replication::AlterIsrMsg::kBumpLogDirFailed : 0);
+    m.isr[2] = leo;
+    m.isr[3] = static_cast<int32_t>(inc);
+    return m;
+}
+} // namespace
+
+// MAJOR-1 + fix round 2 N2: a sole-ISR MEMORY leader restarts EMPTY.  It is
+// not re-elected blind (it would wipe followers that hold records): the
+// partition goes leaderless and the next leader is decided on FRESH reports of
+// every live replica.  A restarted (empty) replica with a STALE high position
+// report is never chosen over one that holds data; electing a non-ISR replica
+// is an unclean election — only with survivor election allowed, else the
+// partition is held leaderless with no record churn.
+TEST(EpochRestartControllerRegression, MemoryEmptyLeaderNeverElectsAStaleReportOverRealDataRegression) {
+    for (const bool survivor : {false, true}) {
+        SCOPED_TRACE(survivor ? "survivor election ON" : "survivor election OFF");
+        CtlRig c;
+        c.svc->setAllowSurvivorElection(survivor);
+        c.soleIsr();
+        const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+        const int32_t F = L == 1 ? 2 : 1;            // restarts empty, stale HIGH report
+        const int32_t G = 6 - L - F;                 // holds data, lower stale report
+        c.svc->reportReplicaPosition(0, 0, F, le, 100);
+        c.svc->reportReplicaPosition(0, 0, G, le, 10);
+        auto bump = c.bump(le, /*memory=*/true);
+        bump.isr[3] = 2;                             // L's new incarnation
+        (void)c.svc->onAlterIsr(bump);
+        c.tick();
+        ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "the empty memory leader was re-elected blind";
+        const int32_t lle = c.pa().leaderEpoch;
+        (void)c.svc->onAlterIsr(leaderlessReport(L, lle, 0, 2));
+        (void)c.svc->onAlterIsr(leaderlessReport(F, lle, 0, 7));    // restarted: empty
+        c.tick();
+        EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "decided before every live replica reported";
+        (void)c.svc->onAlterIsr(leaderlessReport(G, lle, 10, 1));
+        c.tick();
+        EXPECT_NE(c.pa().leaderNode, F) << "the empty replica with the stale high report was elected";
+        if (survivor) {
+            EXPECT_EQ(c.pa().leaderNode, G);
+            EXPECT_EQ(c.pa().isr, std::vector<int32_t>{G});
+        } else {
+            EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+            const auto leo = c.r1->logEndOffset();
+            for (int i = 0; i < 5; ++i) c.tick();
+            EXPECT_EQ(c.r1->logEndOffset(), leo) << "a held leaderless partition churned metadata records";
+            EXPECT_EQ(c.svc->leaderlessHeldForTest(), 2u);
+        }
+    }
+}
+
+// Fix round 2 N1 (KIP-112): the sole-ISR leader's log dir went offline (its
+// fence cannot be written).  The controller never re-grants it: one record
+// makes the partition leaderless (ISR kept), and the replica's re-sent bumps
+// and reports append NOTHING more (no livelock, no epoch inflation).  A report
+// from a NEW incarnation with a healthy dir re-registers it and it is elected.
+TEST(EpochRestartControllerRegression, LogDirOfflineSoleIsrHeldLeaderlessNoChurnRegression) {
     CtlRig c;
     c.soleIsr();
-    const int32_t requester = c.pa().leaderNode, le = c.pa().leaderEpoch;
-    const int32_t other = requester == 1 ? 2 : 1;
-    c.svc->reportReplicaPosition(0, 0, other, le, 10);
-    (void)c.svc->onAlterIsr(c.bump(le, /*memory=*/true));
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    auto bump = c.bump();
+    bump.isr[1] |= rune::replication::AlterIsrMsg::kBumpLogDirFailed;
+    bump.isr[3] = 5;
+    (void)c.svc->onAlterIsr(bump);
     c.tick();
-    EXPECT_EQ(c.pa().leaderNode, other) << "an empty memory leader was re-elected over a replica holding records";
-    EXPECT_GT(c.pa().leaderEpoch, le);
-    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{other});
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "a replica with an offline log dir was re-granted";
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1);
+    const auto leo = c.r1->logEndOffset();
+    for (int i = 0; i < 10; ++i) {
+        (void)c.svc->onAlterIsr(bump);                                          // stale re-send
+        (void)c.svc->onAlterIsr(leaderlessReport(L, le + 1, 3, 5, /*failed=*/true));
+        c.tick();
+    }
+    EXPECT_EQ(c.r1->logEndOffset(), leo) << "metadata records churned for an offline replica";
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    (void)c.svc->onAlterIsr(leaderlessReport(L, le + 1, 3, 6));               // restarted, healthy
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L) << "the re-registered replica was never elected";
+    EXPECT_EQ(c.pa().leaderEpoch, le + 2);
+}
+
+// Fix round 2 N3: after a restart failover, the returned preferred replica
+// gets its leadership back exactly ONCE when it re-enters the ISR (caught up:
+// the leader's AlterIsr admits it at >= HW); further committed changes and
+// passes never move it again (no ping-pong).
+TEST(EpochRestartControllerRegression, PreferredMoveBackOnceNoPingPongRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(c.bump());
+    c.tick();
+    ASSERT_NE(c.pa().leaderNode, L);
+    ASSERT_EQ(c.pa().leaderEpoch, le + 1);
+    auto alter = [&](std::vector<int32_t> isr) {
+        const auto& a = c.pa();
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = static_cast<int32_t>(isr.size());
+        for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+        m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    };
+    std::vector<int32_t> isr = c.pa().isr;
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);   // L not in the ISR yet: no move
+    c.drive(50);
+    EXPECT_NE(c.pa().leaderNode, L) << "moved back before L re-entered the ISR";
+    isr.push_back(L);
+    alter(isr);                                                    // L caught up: re-admitted
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);
+    c.drive(50);
+    EXPECT_EQ(c.pa().leaderNode, L) << "leadership never returned to the caught-up preferred replica";
+    const int32_t settledEpoch = c.pa().leaderEpoch;
+    EXPECT_EQ(settledEpoch, le + 2);
+    for (int i = 0; i < 5; ++i) {
+        (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);
+        c.drive(20);
+    }
+    EXPECT_EQ(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, settledEpoch) << "leadership ping-ponged";
 }
 
 // M4.1: the controller fails over between the bump decision and its commit —

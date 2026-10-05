@@ -107,6 +107,10 @@ void MetadataStateMachine::commit(int64_t committedPos)
     flushPending(committedPos);
 }
 
+// N4 (fix round 2) — LATENT HAZARD: the MSM has no topic-delete path; if one
+// lands with topic-id REUSE, the delete must erase committed_ for the old
+// topic's partitions, or this guard silently rejects the recreated topic's
+// epoch-0 records (leaderless forever).  Topic ids are never reused today.
 void MetadataStateMachine::install_(int32_t topicId, int32_t partition,
                                     const PartitionAssignment& pa)
 {

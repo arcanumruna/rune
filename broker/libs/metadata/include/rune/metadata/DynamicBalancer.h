@@ -124,6 +124,12 @@ struct DynamicBalancerInputs {
     /// requester at a new epoch: it is the sole in-sync replica).
     struct LeaderExclusion { int32_t topicId; int32_t partition; int32_t node; };
     std::vector<LeaderExclusion> excludedLeaders;
+    /// Fix round 2 N3 (Kafka leader.imbalance.per.broker.percentage): a
+    /// preferred-leader election to node N fires only when MORE than this
+    /// percentage of the partitions N is preferred for are led elsewhere
+    /// (count-based, event-driven — evaluated on each pass).  0 = any
+    /// imbalance (legacy behaviour).
+    int                     imbalancePct = 0;
     int                     maxPreferredElectionsPerCycle = 1000; ///< Budget cap.
     /// Maximum BalancerRecords returned per rebalance() call.  Excess changes are
     /// deferred to the next cycle so one mass failover cannot stall the metadata log.

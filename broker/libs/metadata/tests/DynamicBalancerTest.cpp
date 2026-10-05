@@ -713,3 +713,66 @@ TEST(DynamicBalancerRegression, NoLeaderRetainsIsrAndRecoversOnRejoin) {
     EXPECT_EQ(recovered->rec.leaderNode, 3)
         << "clean election: the retained-ISR replica (node 3) is re-elected leader";
 }
+
+// Epoch-restart fix round 2 (N3, Kafka leader.imbalance.per.broker.percentage):
+// a preferred-leader move back to a node fires only when MORE than
+// imbalancePct of the partitions it is preferred for are led elsewhere — a
+// count threshold, never a timer.  1 of 20 displaced (5%) stays; 3 of 20
+// (15%) move back.
+TEST(DynamicBalancerRegression, PreferredMoveBackGatedByImbalanceRatioRegression) {
+    // 40 partitions: node 1 preferred for 0..19, node 2 for 20..39; the first
+    // `displaced` of node 1's are led by node 2 (node 2 leads more: a move
+    // back improves balance).
+    auto build = [](AssignmentMap& m, int displaced) {
+        for (int p = 0; p < 40; ++p) {
+            const bool mine = p < 20;
+            const int32_t leader = mine ? (p < displaced ? 2 : 1) : 2;
+            m.put(10, p, PartitionAssignment{leader, {1, 2},
+                                             mine ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{2, 1}, 1, 1});
+        }
+    };
+    ReplicaPositionTable pos;
+    for (const int displaced : {1, 3}) {
+        AssignmentMap m;
+        build(m, displaced);
+        DynamicBalancer bal; DynamicBalancerInputs in;
+        in.cur = &m; in.liveNodes = {1, 2}; in.positions = &pos;
+        in.topics = { TopicSpec{10, 40, 2, "", ""} };
+        in.imbalancePct = 10;
+        const auto recs = bal.rebalance(in);
+        if (displaced == 1) EXPECT_TRUE(recs.empty()) << "moved back below the imbalance ratio";
+        else                EXPECT_EQ(recs.size(), 3u) << "no move back above the imbalance ratio";
+        in.imbalancePct = 0;   // legacy: any imbalance
+        EXPECT_EQ(bal.rebalance(in).size(), static_cast<std::size_t>(displaced));
+    }
+}
+
+// Epoch-restart fix round 1/2 (MAJOR-1): an excluded leader (a restarted
+// ex-leader that asked for a new epoch) fails over to another live ISR member
+// and leaves the ISR; when it is the sole live in-sync member the group is
+// left untouched (the controller re-elects it at a new epoch).
+TEST(DynamicBalancerRegression, ExcludedLeaderFailsOverOrIsLeftForTheCallerRegression) {
+    ReplicaPositionTable pos;
+    {
+        AssignmentMap m;
+        m.put(10, 0, PartitionAssignment{1, {1, 2, 3}, {1, 2, 3}, 4, 4});
+        DynamicBalancer bal; DynamicBalancerInputs in;
+        in.cur = &m; in.liveNodes = {1, 2, 3}; in.positions = &pos;
+        in.topics = { TopicSpec{10, 1, 3, "", ""} };
+        in.excludedLeaders = {{10, 0, 1}};
+        const auto recs = bal.rebalance(in);
+        ASSERT_EQ(recs.size(), 1u);
+        EXPECT_NE(recs[0].rec.leaderNode, 1);
+        EXPECT_EQ(recs[0].rec.leaderEpoch, 5);
+        EXPECT_FALSE(isIn_pub(1, recs[0].isr)) << "the excluded ex-leader stayed in the ISR";
+    }
+    {
+        AssignmentMap m;
+        m.put(10, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 4, 4});
+        DynamicBalancer bal; DynamicBalancerInputs in;
+        in.cur = &m; in.liveNodes = {1, 2, 3}; in.positions = &pos;
+        in.topics = { TopicSpec{10, 1, 3, "", ""} };
+        in.excludedLeaders = {{10, 0, 1}};
+        EXPECT_TRUE(bal.rebalance(in).empty()) << "a sole-ISR group must be left to the caller";
+    }
+}

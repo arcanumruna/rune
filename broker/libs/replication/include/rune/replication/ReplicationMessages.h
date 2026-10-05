@@ -441,6 +441,14 @@ struct AlterIsrMsg {
     /// kBumpMemoryBacked: a memory log (empty after a restart).
     static constexpr int32_t kBumpFenceValid   = 1;
     static constexpr int32_t kBumpMemoryBacked = 2;
+    /// Fix round 2 N1 (KIP-112): the requester's log dir is OFFLINE (a fence
+    /// write failed) — never (re-)elect it until a new process incarnation.
+    static constexpr int32_t kBumpLogDirFailed = 4;
+    /// Fix round 2 N1/N2: not a bump — a FOLLOWER REPORT of a replica of a
+    /// LEADERLESS partition (sent once per leaderless epoch, re-sent until
+    /// answered): isr[2] = its LEO, isr[3]/isr[4] = its process incarnation
+    /// (low/high 32 bits).  `leaderId` is the reporting replica.
+    static constexpr int32_t kBumpFollowerReport = 8;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

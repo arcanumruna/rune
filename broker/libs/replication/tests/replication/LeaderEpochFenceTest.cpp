@@ -103,23 +103,47 @@ TEST(LeaderEpochFenceRegression, NoFenceFileRefusesFirstLeadershipRegression) {
     EXPECT_EQ(r->epoch(), 9);
 }
 
-// M3: the fence cannot be written (its directory is gone): fail closed — the
-// leadership is refused and a new epoch requested; never lead without it.
-TEST(LeaderEpochFenceRegression, FenceWriteFailureRefusesLeadershipRegression) {
+// M3 + fix round 2 N1 (KIP-112): the fence cannot be written — the log dir
+// goes OFFLINE for the rest of the incarnation (sticky): the leadership is
+// refused, the bump request says so (kBumpLogDirFailed), later grants are
+// refused WITHOUT retrying the disk, and as a follower of the leaderless
+// partition it reports itself once.  A new incarnation with a healthy dir leads.
+TEST(LeaderEpochFenceRegression, FenceWriteFailureTakesLogDirOfflineStickyRegression) {
     Dir d;
     const fs::path logDir = d.path / "log";
     fs::create_directories(logDir);
-    rune::storage::Log log(logDir.string());
+    {
+        rune::storage::Log log(logDir.string());
+        log.recover();
+        CapturingTransport t;
+        auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+        r->setIsrChannel(&t);
+        r->setLeaderEpochFenceFile((d.path / "missing-dir" / "fence").string());
+        r->becomeLeader(2, kAll);
+        EXPECT_NE(r->role(), Role::Leader) << "led although the fence could not be persisted";
+        EXPECT_TRUE(r->logDirOfflineForTest());
+        r->doWork(1'000'000'000);
+        ASSERT_EQ(t.sent.size(), 1u) << "no new epoch requested after the refusal";
+        EXPECT_NE(t.sent[0].isr[1] & AlterIsrMsg::kBumpLogDirFailed, 0) << "log-dir failure not reported";
+        r->setLeaderEpochFenceFile((logDir / "leader-epoch-fence").string());   // the disk "heals"
+        r->becomeLeader(3, kAll);
+        EXPECT_NE(r->role(), Role::Leader) << "an offline log dir was re-tried within the incarnation";
+        r->becomeFollower(4, NodeId{-1});   // the controller made it leaderless
+        EXPECT_TRUE(r->leaderlessReportPendingForTest());
+        r->doWork(2'000'000'000);
+        ASSERT_EQ(t.sent.size(), 2u);
+        EXPECT_NE(t.sent[1].isr[1] & AlterIsrMsg::kBumpFollowerReport, 0);
+        EXPECT_NE(t.sent[1].isr[1] & AlterIsrMsg::kBumpLogDirFailed, 0);
+        AlterIsrResponseMsg ack{};
+        ack.topicId = 0; ack.partition = 0; ack.leaderId = 1; ack.leaderEpoch = 4;
+        r->onAlterIsrResponse(ack);
+        EXPECT_FALSE(r->leaderlessReportPendingForTest()) << "the answered report keeps being re-sent";
+    }
+    rune::storage::Log log(logDir.string());   // new incarnation, healthy dir
     log.recover();
     CapturingTransport t;
     auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
     r->setIsrChannel(&t);
-    r->setLeaderEpochFenceFile((d.path / "missing-dir" / "fence").string());
-    r->becomeLeader(2, kAll);
-    EXPECT_NE(r->role(), Role::Leader) << "led although the fence could not be persisted";
-    r->doWork(1'000'000'000);
-    EXPECT_EQ(t.sent.size(), 1u) << "no new epoch requested after the refusal";
-    r->setLeaderEpochFenceFile((logDir / "leader-epoch-fence").string());
-    r->becomeLeader(3, kAll);
-    EXPECT_EQ(r->role(), Role::Leader) << "a persistable fence must allow the next epoch";
+    r->becomeLeader(5, kAll);
+    EXPECT_EQ(r->role(), Role::Leader);
 }

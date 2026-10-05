@@ -435,6 +435,8 @@ public:
     [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
     [[nodiscard]] bool  staleLeadershipPendingForTest() const noexcept { return staleLead_.pending; }
     [[nodiscard]] uint64_t staleLeadershipRefusalsForTest() const noexcept { return staleLeadRefusals_; }
+    [[nodiscard]] bool logDirOfflineForTest() const noexcept { return logDirOffline_; }
+    [[nodiscard]] bool leaderlessReportPendingForTest() const noexcept { return report_.pending; }
     /// Test view: the committed partitionEpoch this leader derives proposals from.
     [[nodiscard]] int32_t committedPartitionEpochForTest() const noexcept { return committedPartitionEpoch_; }
     /// INTERNAL partitions (MAJOR-2/3): ISR changes commit on a MAJORITY's
@@ -1342,6 +1344,20 @@ private:
     void refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch);
     int  requestLeaderEpochBump_(int64_t nowNs);
     bool persistLedEpoch_(Epoch e);
+    /// Fix round 2 N1 (KIP-112): a fence write failed — this replica's log dir
+    /// is offline for the rest of this incarnation (sticky): every leadership
+    /// is refused and the controller is told (kBumpLogDirFailed).
+    bool logDirOffline_ = false;
+    /// Fix round 2 N1/N2: the follower report of a leaderless partition.
+    struct LeaderlessReport {
+        bool    pending = false;
+        Epoch   epoch   = -1;
+        bool    sent    = false;
+        int64_t sentNs  = 0;
+    };
+    LeaderlessReport report_;
+    int  sendLeaderlessReport_(int64_t nowNs);
+    [[nodiscard]] int32_t bumpFlags_() const noexcept;
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
     bool fenceErrorLogged_ = false;
     static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms

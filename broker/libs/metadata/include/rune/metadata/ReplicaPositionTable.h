@@ -18,6 +18,7 @@
 // ---------------------------------------------------------------------------
 #include <rune/replication/PartitionReplica.h> // ReplicaPositionReport
 #include <rune/metadata/Gpid.h>
+#include <algorithm>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -39,6 +40,13 @@ public:
         auto it = table_.find(key(topicId, partition, nodeId));
         if (it == table_.end()) return std::nullopt;
         return it->second;
+    }
+
+    /// Fix round 2 N2: forget every report of `nodeId` (a new process
+    /// incarnation: its log may be gone).  Cold.
+    void dropNode(int32_t nodeId) {
+        const auto low = static_cast<uint64_t>(static_cast<uint16_t>(nodeId));
+        std::erase_if(table_, [low](const auto& kv) { return (kv.first & 0xffffu) == low; });
     }
 
     /// Return all known replica positions for a given (topicId, partition).

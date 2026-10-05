@@ -186,6 +186,26 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
             singletons.push_back(&ts);
     }
 
+    // ── 3b. Per-node preferred-leader imbalance (N3, Kafka ratio) ──────────
+    std::unordered_map<int32_t, int32_t> preferredFor, displacedFrom;
+    if (in.imbalancePct > 0) {
+        for (const auto& ts : in.topics) {
+            for (int32_t p = 0; p < ts.partitionCount; ++p) {
+                const PartitionAssignment* cur = in.cur->get(ts.topicId, p);
+                if (!cur || cur->replicas.empty()) continue;
+                const int32_t pref = cur->replicas[0];
+                ++preferredFor[pref];
+                if (cur->leaderNode != pref) ++displacedFrom[pref];
+            }
+        }
+    }
+    auto imbalanced = [&](int32_t node) {
+        if (in.imbalancePct <= 0) return true;
+        const int32_t total = preferredFor.count(node) ? preferredFor.at(node) : 0;
+        const int32_t off   = displacedFrom.count(node) ? displacedFrom.at(node) : 0;
+        return total > 0 && off * 100 > in.imbalancePct * total;
+    };
+
     // ── 4. Result accumulator ───────────────────────────────────────────────
     std::vector<BalancerRecord> result;
     int preferredElectionsUsed = 0;
@@ -267,6 +287,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
 
                     const bool prefIsLive = isIn(preferred, in.liveNodes);
                     if (!prefIsLive) continue;
+                    if (!imbalanced(preferred)) continue;   // N3: below the ratio
                     // Kafka: a preferred election only targets a member of the
                     // committed ISR (the leader's AlterIsr re-admits it first).
                     if (!isIn(preferred, cur->isr)) continue;
