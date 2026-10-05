@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,29 @@ struct Session {
     int32_t                                        egressStreamId = 0;
     std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>>
                                                    recordEgressByWorker;
+    // Subscribe dedupe (2026-10-05): a Subscribe is identified by (session,
+    // correlationId, topicId, resolved partition) — the client binds exactly one
+    // instance per correlationId, so a re-sent Subscribe (redirect / reconnect
+    // retry paths) re-answers this subscriptionId instead of registering a
+    // second, leaked stream.  The (topic, partition) part keeps clients that do
+    // not tag per-partition Subscribes (group isolation carriers: correlationId
+    // 0 for every assigned partition) one subscription per partition.  Cold
+    // (control path: Subscribe / Unsubscribe only).  Dropped with the session,
+    // so the same correlationId on a NEW session is a new subscription.
+    struct SubKey {
+        int64_t correlationId = 0;
+        int32_t topicId       = 0;
+        int32_t partition     = 0;
+        bool operator==(const SubKey&) const = default;
+    };
+    struct SubKeyHash {
+        std::size_t operator()(const SubKey& k) const noexcept {
+            const uint64_t tp = (static_cast<uint64_t>(static_cast<uint32_t>(k.topicId)) << 32) |
+                                static_cast<uint32_t>(k.partition);
+            return std::hash<uint64_t>{}(static_cast<uint64_t>(k.correlationId) ^ (tp * 0x9E3779B97F4A7C15ULL));
+        }
+    };
+    std::unordered_map<SubKey, int64_t, SubKeyHash> subIdByKey;
     // Task 13 fix round 2 (shard mode, G-A6 on the gateway-routed path): bit w
     // set = worker w holds acks for this session (SessionSignal Held/Released).
     // Non-zero → the gateway ABORTs this session's Produce frames.

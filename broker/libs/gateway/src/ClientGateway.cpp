@@ -3162,6 +3162,33 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         nextOffset = msg.fromOffset;
     }
 
+    // 5a. Subscribe dedupe (2026-10-05): (session, correlationId[, topic, partition]) is ONE
+    //     subscription.  A re-sent Subscribe (the client resends after redirect /
+    //     reconnect paths; it binds only one instance per correlationId) used to
+    //     register a SECOND subscription — a leaked duplicate stream for the whole
+    //     session (an Earliest subscription replayed the log twice).  Re-answer the
+    //     existing subscription and create nothing: this one registration point
+    //     feeds every push path (gateway inline, the owning worker's Subscribe op,
+    //     its queued pendingSubOps_ retry and deferred record-egress waiters), so
+    //     none of them can see a duplicate.  Placed after the leadership +
+    //     validation checks so a duplicate that now belongs elsewhere is still
+    //     redirected.
+    //     Keyed (correlationId, topicId, partition): clients that send untagged
+    //     Subscribes (group carriers: correlationId 0 per partition) keep one
+    //     subscription per partition.
+    const Session::SubKey subKey{msg.correlationId, msg.topicId, partition};
+    if (const auto dup = session->subIdByKey.find(subKey); dup != session->subIdByKey.end()) {
+        const auto existing = subscriptions_.find(dup->second);
+        if (existing != subscriptions_.end() && existing->second.sessionId == msg.sessionId) {
+            spdlog::debug("ClientGateway: duplicate Subscribe sessionId={} corrId={} topic={} partition={} "
+                          "→ existing subId={} (no second subscription)",
+                          msg.sessionId, msg.correlationId, msg.topicId, partition, dup->second);
+            sendResp(pc::ErrorCode::OK, partition, dup->second);
+            return;
+        }
+        session->subIdByKey.erase(dup);   // stale index entry (sub already gone)
+    }
+
     // 5b. Group-consumer isolation carrier (TX-5/TX-6):
     //     A group member conveys its isolation level via a Subscribe frame AFTER
     //     the SyncGroup assignment has already created the internal group
@@ -3223,6 +3250,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.subscribeCorrId = msg.correlationId;
 
     subscriptions_.emplace(subId, std::move(sub));
+    session->subIdByKey[subKey] = subId;   // 5a: the dedupe index
 
     // read-rework T3/T4 (I3b): when per-worker egress is active, route the push to
     // the OWNING worker — it owns the cursor and pushes on its own dynamic-MDC
@@ -3275,6 +3303,15 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
         }
     }
 
+    // 5a dedupe index: a later Subscribe with the same correlationId is a NEW
+    // subscription once this one is gone.
+    if (const auto own = subscriptions_.find(msgOpt->subscriptionId); own != subscriptions_.end()) {
+        if (Session* s = sessions_.find(own->second.sessionId)) {
+            const auto ix = s->subIdByKey.find(Session::SubKey{own->second.subscribeCorrId, own->second.topicId,
+                                                               own->second.partition});
+            if (ix != s->subIdByKey.end() && ix->second == msgOpt->subscriptionId) s->subIdByKey.erase(ix);
+        }
+    }
     const std::size_t removed = subscriptions_.erase(msgOpt->subscriptionId);
     spdlog::debug("ClientGateway: Unsubscribe subId={} removed={}",
                   msgOpt->subscriptionId, removed);

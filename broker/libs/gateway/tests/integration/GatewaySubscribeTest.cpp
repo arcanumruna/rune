@@ -1211,6 +1211,61 @@ TEST_F(GatewaySubscribeFixture, ReSubscribe_FromTrackedOffset_Resumes)
 }
 
 // ===========================================================================
+// Subscribe dedupe (2026-10-05, RED on 382c65d): the client re-sends a
+// Subscribe with the SAME correlationId (redirect / reconnect retry paths) and
+// binds only one instance per correlationId.  Over a real client<->gateway
+// Aeron loopback: both answers carry the same subscriptionId, the gateway holds
+// ONE subscription, and an Earliest subscription pushes the log ONCE (it used
+// to be replayed a second time on a leaked duplicate stream).
+// ===========================================================================
+TEST_F(GatewaySubscribeFixture, DuplicateSubscribe_SameCorrId_OneStream_Regression)
+{
+    auto client = makeClient(kEgressBase + 21);
+    auto connResp = doConnect(*client.ingressPub, *client.egressSub,
+                              client.egressStreamId, client.egressChannel,
+                              /*correlationId=*/21, scratch_);
+    const int64_t sid = connResp.assignedSessionId;
+
+    constexpr int kBatches = 3;
+    for (int i = 0; i < kBatches; ++i) directAppend(kTopicIdA, kPartitionA1, 2);   // offsets 0..5
+
+    std::vector<pc::SubscribeResponse> resps;
+    std::vector<pc::Records>           recs;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf,
+                                      aeron::util::index_t offset,
+                                      aeron::util::index_t len,
+                                      aeron::Header&) {
+        const auto* p = reinterpret_cast<const uint8_t*>(buf.buffer() + offset);
+        const auto  n = static_cast<std::size_t>(len);
+        if (auto r = pc::SubscribeResponse::decode(p, n)) resps.push_back(*r);
+        else if (auto rec = pc::Records::decode(p, n)) recs.push_back(*rec);
+    });
+
+    // Earliest (-2), sent, then re-sent with the same correlationId.
+    sendSubscribe(*client.ingressPub, sid, /*corrId=*/2100, kTopicIdA, kPartitionA1, 1, -2, 0, "Sub");
+    pump([&]() { return resps.size() >= 1; }, &*client.egressSub, &asm_, kPumpIter, "SubResp1");
+    sendSubscribe(*client.ingressPub, sid, /*corrId=*/2100, kTopicIdA, kPartitionA1, 1, -2, 0, "SubResend");
+    pump([&]() { return resps.size() >= 2 && static_cast<int>(recs.size()) >= kBatches; },
+         &*client.egressSub, &asm_, kPumpIter, "SubResp2+Records");
+    // Keep pumping: a leaked duplicate stream would replay the log again here.
+    {
+        int idle = 0;
+        pump([&]() { return ++idle >= 400; }, &*client.egressSub, &asm_, 800, "drain");
+    }
+
+    ASSERT_EQ(resps.size(), 2u);
+    EXPECT_EQ(resps[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(resps[1].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(resps[1].subscriptionId, resps[0].subscriptionId) << "the resend re-answers the same subscription";
+    EXPECT_EQ(gw_->subscriptionCount(), 1u) << "no second subscription registered";
+    ASSERT_EQ(static_cast<int>(recs.size()), kBatches) << "exactly one stream of records";
+    for (int i = 0; i < kBatches; ++i) {
+        EXPECT_EQ(recs[i].baseOffset, static_cast<int64_t>(2 * i));
+        EXPECT_EQ(recs[i].subscriptionId, resps[0].subscriptionId);
+    }
+}
+
+// ===========================================================================
 // TEST 8: read_committed == read_uncommitted for M-B.
 //
 // Both isolation modes (0 and 1) deliver up to LEO; assert they produce the
