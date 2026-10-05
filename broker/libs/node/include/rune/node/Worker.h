@@ -1572,7 +1572,7 @@ private:
     // or a full FIFO (beyond its static bound) is an invariant-violation halt
     // (exit 70) — never a drop, never a retry loop.
     //
-    // Bypass (L2): enqueueSignal_ for StorageFailure / OwnershipAck only.
+    // Bypass (L2): enqueueSignal_ for StorageFailure / OwnershipAck / EgressReleased only.
     // Worker-thread only (the producer side of ret_).
     // -----------------------------------------------------------------------
     void enqueueReturn_(const WorkerReturn& ret) {
@@ -4914,7 +4914,7 @@ private:
     }
 
     // ---- fsyncgate fail-stop -------------------------------------------------
-    // L2 bypass (StorageFailure / OwnershipAck): straight to ret_, else to
+    // L2 bypass (StorageFailure / OwnershipAck / EgressReleased): straight to ret_, else to
     // pendingSignals_ (retried at the end of the pass) — never dropped; a claim
     // or encode exception halts like every other return (F15 §6).
     void enqueueSignal_(const WorkerReturn& r) {

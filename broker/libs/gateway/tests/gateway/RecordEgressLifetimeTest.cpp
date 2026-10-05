@@ -330,3 +330,32 @@ TEST(RecordEgressLifetimeRegression, AnUnknownAcknowledgementFreesNothing) {
     r.gw.drainWorkerReturnsForTest(1);
     EXPECT_EQ(pub.destroyed, 1);
 }
+
+// Review MEDIUM-2: the closing session's OWN Subscribe is waiting in
+// pendingSubOps_ (ring full) when the session closes.  The queued entry must
+// never carry the pointer (it re-resolves at send time → the session is gone →
+// moot), so the worker never references the pub and it is freed exactly once.
+// A future change that stores the pointer in the queue turns this RED.
+TEST(RecordEgressLifetimeRegression, AQueuedSubscribeOfTheClosedSessionNeverCarriesItsPub) {
+    Rig r(1, 1, /*ringBytes=*/1 << 12);
+    FakePub pub;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.gw.injectRecordEgressForTest(sid, r.owner(0), pub.make());
+    for (int64_t i = 1000; i < 1200 && r.gw.pendingSubOpsForTest() == 0; ++i)
+        r.gw.forwardSubscribeForTest(i, /*sessionId=*/0, 0, 0, 0, 0, false, false);
+    ASSERT_GT(r.gw.pendingSubOpsForTest(), 0u) << "the ring is full";
+    const std::size_t before = r.gw.pendingSubOpsForTest();
+    r.subscribe(sid, 0);
+    ASSERT_GT(r.gw.pendingSubOpsForTest(), before) << "the session's Subscribe is queued, not on the ring";
+    r.gw.closeSessionForTest(sid);
+    auto& w = r.pool.worker(r.owner(0));
+    for (int i = 0; i < 128 && (r.gw.retiringRecordEgressCountForTest() != 0 || r.gw.pendingSubOpsForTest() != 0); ++i) {
+        w.doWork(10 + i);
+        EXPECT_FALSE(workerReferences(w, pub.ptr())) << "a queued Subscribe handed the closed session's pub out (pass " << i << ")";
+        r.gw.drainWorkerReturnsForTest(10 + i);
+        (void)r.gw.pumpRetryQueuesForTest();
+    }
+    EXPECT_EQ(r.gw.pendingSubOpsForTest(), 0u);
+    EXPECT_EQ(r.gw.retiringRecordEgressCountForTest(), 0u);
+    EXPECT_EQ(pub.destroyed, 1);
+}

@@ -2856,8 +2856,16 @@ int ClientGateway::pumpEgressReleases_()
 {
     if (retiringUnsent_ == 0) [[likely]] return 0;
     int sent = 0;
+    uint64_t refused = 0;   // review MEDIUM-1: a worker whose ring refused is not retried this pass
+    static_assert(Session::kMaxWorkers <= 64, "refused-worker mask is 64 bits");
     for (auto& r : retiringEgress_) {
-        if (r.enqueued || !tryEnqueueEgressRelease_(r)) continue;
+        if (r.enqueued) continue;
+        const uint64_t bit = uint64_t{1} << static_cast<unsigned>(r.worker);
+        if ((refused & bit) != 0) continue;
+        if (!tryEnqueueEgressRelease_(r)) {
+            refused |= bit;
+            continue;
+        }
         r.enqueued = true;
         --retiringUnsent_;
         ++sent;
@@ -2870,7 +2878,11 @@ void ClientGateway::onEgressReleased_(int32_t worker, uint64_t token)
     for (std::size_t i = 0; i < retiringEgress_.size(); ++i) {
         RetiringEgress& r = retiringEgress_[i];
         if (r.token != token || r.worker != worker) continue;
-        if (!r.enqueued) [[unlikely]] break;   // unreachable: an ack precedes its op
+        if (!r.enqueued) [[unlikely]] {         // unreachable: an ack can never precede its op
+            spdlog::error("ClientGateway: EgressReleased from worker {} for retire token {} before its release "
+                          "op was sent — ignored", worker, token);
+            return;
+        }
         if (i + 1 != retiringEgress_.size()) std::swap(retiringEgress_[i], retiringEgress_.back());
         retiringEgress_.pop_back();            // the worker let go — the pub is destroyed now
         return;

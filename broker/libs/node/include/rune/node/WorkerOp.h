@@ -169,6 +169,10 @@ struct WorkerOp {
     // egress ExclusivePublication created + lifetime-owned by the gateway, written
     // only by the owning worker.  Passed through the ring as a uint64 (like
     // replica/logPtr).  nullptr → worker uses the shared MDC pub (broadcast).
+    // Egress RELEASE op (retire-on-ack): an Unsubscribe with subscriptionId 0 and
+    // egressPub != nullptr — the worker drops every subscription on that pub and
+    // returns EgressReleased (token = correlationId); only then does the gateway
+    // destroy the pub.
     void* egressPub = nullptr;
 
     // SessionAnnounce (Task 13): the client session's egress stream + channel.
