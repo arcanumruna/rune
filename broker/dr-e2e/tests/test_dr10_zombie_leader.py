@@ -53,6 +53,8 @@ CID window: 800_000+ (disjoint from DR-1/2/3/4/5/6/7).
 
 from __future__ import annotations
 
+import sys
+
 import re
 import threading
 import time
@@ -693,6 +695,7 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
 @pytest.mark.fault
 @pytest.mark.timeout(1200)
 @pytest.mark.xfail(
+    sys.platform == "darwin",   # Docker Desktop only — strict, real test on Linux (the box)
     reason="HARNESS-DETERMINISM, not a broker bug: under sub-second repeated "
     "pause/unpause of the leader, Docker Desktop's embedded DNS transiently drops "
     "container names and a just-paused ex-leader remains the highest-term log "
