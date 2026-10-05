@@ -140,6 +140,15 @@ struct InvokerGateway {
     std::set<int> deadEndpoints;
     // The next N OffsetFetch answers carry an error code on every entry.
     int offsetFetchErrorsNext = 0;
+    // Records pushes carry the creating Subscribe's correlationId (the broker
+    // since client/broker version 3); false = an older broker (0).
+    bool stampSubscribeCorr = true;
+    // The next N SubscribeResponses are lost (the subscription IS registered).
+    int dropSubscribeResponsesNext = 0;
+    // JoinGroup answers carry this error code (0 = the normal answer).
+    int16_t joinErrorCode = 0;
+    // ConnectResponse.brokerVersion advertised (-1 = an older broker's 38-byte frame).
+    int32_t advertisedBrokerVersion = rune::protocol::client::kBrokerVersion;
     // OffsetFetch answers are held until releaseOffsetFetches().
     bool holdOffsetFetch = false;
     std::vector<std::vector<uint8_t>> heldOffsetFetches;
@@ -494,6 +503,25 @@ struct InvokerGateway {
         if (!offerNow(endpoint, frame)) outbox.emplace_back(endpoint, std::move(frame));
     }
 
+    /// An Assign{gen, parts} frame (the coordinator's assignment change) to a session.
+    void sendAssign(int64_t sessionId, int32_t gen, const std::vector<std::pair<int32_t, int32_t>>& parts) {
+        namespace rp = rune::protocol::client;
+        std::vector<rp::TopicPartition32> tps;
+        for (const auto& [t, p] : parts) {
+            rp::TopicPartition32 tp;
+            tp.topicId   = t;
+            tp.partition = p;
+            tps.push_back(tp);
+        }
+        rp::Assign a;
+        a.sessionId     = sessionId;
+        a.correlationId = 0;
+        a.generationId  = gen;
+        std::vector<uint8_t> out(rp::Assign::encodedSizeFor(tps.size()));
+        const std::size_t n = a.encode(out.data(), tps);
+        send(0, out.data(), n);
+    }
+
     /// Unsolicited or solicited MetadataResponse from the node endpoint.
     void sendMetadata(int64_t sessionId, int64_t correlationId) {
         namespace rp = rune::protocol::client;
@@ -588,7 +616,8 @@ struct InvokerGateway {
         std::vector<uint8_t> out(batch.size() + 256);
         const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId,
                                                  sub.topicId, sub.partition, baseOffset,
-                                                 std::span<const uint8_t>(batch), sub.sessionId, 0);
+                                                 std::span<const uint8_t>(batch), sub.sessionId,
+                                                 stampSubscribeCorr ? sub.corrId : 0);
         send(from, out.data(), n);
     }
 
@@ -626,8 +655,10 @@ private:
         r.correlationId = 0;
         r.generationId  = groupGeneration;
         r.isLeader      = 0;
-        r.errorCode     = 0;
-        r.memberId      = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kMember.data()), kMember.size());
+        r.errorCode     = joinErrorCode;
+        r.memberId      = joinErrorCode != 0 ? std::span<const uint8_t>()
+                                             : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kMember.data()),
+                                                                        kMember.size());
         std::vector<uint8_t> out(r.encodedSize());
         const std::size_t n = r.encode(out.data());
         send(0, out.data(), n);
@@ -866,7 +897,7 @@ private:
             uint8_t out[64];
             const std::size_t n = rcc::encodeConnectResponse(
                 out, sizeof out, connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK),
-                0, sid, c->sessionId, c->correlationId);
+                0, sid, c->sessionId, c->correlationId, advertisedBrokerVersion);
             if (replyFromArrival && !replyOnAnnouncedEgress) {
                 send(endpoint, out, n);
             } else {
@@ -961,6 +992,10 @@ private:
             const std::size_t n = rcc::encodeSubscribeResponse(
                 out, sizeof out, 0, sv->partition, sub.subscriptionId, sv->sessionId,
                 sv->correlationId);
+            if (dropSubscribeResponsesNext > 0) {
+                --dropSubscribeResponsesNext;
+                return;
+            }
             send(replyFromArrival ? endpoint : 0, out, n);
             return;
         }

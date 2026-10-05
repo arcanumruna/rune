@@ -238,6 +238,13 @@ bool GroupConsumer::finished() const noexcept {
     return !impl_ || impl_->status.closed();
 }
 
+GroupFailReason GroupConsumer::failReason() const noexcept {
+    if (impl_ == nullptr) return GroupFailReason::None;
+    if (onDutyThread_()) return impl_->failReason;
+    (void)impl_->status.drainLatest(cache_);
+    return static_cast<GroupFailReason>(cache_.reserved);
+}
+
 int32_t GroupConsumer::generation() const noexcept {
     if (!impl_) return 0;
     if (onDutyThread_()) return impl_->generationId;

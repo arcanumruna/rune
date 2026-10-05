@@ -137,9 +137,26 @@ enum class GroupConsumerState : uint8_t {
 // GroupConsumerStatus — duty thread -> app handle snapshot (fix1 I2: the
 // assignment generation reaches app threads only through the status ring).
 // ---------------------------------------------------------------------------
+/// Why the duty side finished a GroupConsumer on its own (GroupConsumer::failReason()).
+///
+/// Compatibility rule (client / broker version 3, see rune-protocol
+/// Protocol.h kClientVersionExplicitGroupSubscriptions / kBrokerVersion...):
+/// a group member subscribes to its partitions' leaders itself and needs a
+/// broker that does not auto-subscribe members and stamps Records with the
+/// creating Subscribe's correlationId.  This client runs a GroupConsumer only
+/// against a broker advertising ConnectResponse.brokerVersion >= 3; a broker
+/// coordinator refuses JoinGroup from a client below 3.
+enum class GroupFailReason : int32_t {
+    None = 0,
+    /// The broker does not advertise explicit group subscriptions (brokerVersion < 3).
+    BrokerTooOld = 1,
+    /// The broker coordinator refused this client's JoinGroup (ProtocolVersion).
+    RefusedByBroker = 2,
+};
+
 struct GroupConsumerStatus {
     int32_t generationId = 0;
-    int32_t reserved     = 0;
+    int32_t reserved     = 0;  // final snapshot: a GroupFailReason
 };
 
 // ---------------------------------------------------------------------------
@@ -188,7 +205,9 @@ struct GroupConsumerImpl {
         uint32_t session        = 0;      // agent session index it was sent on (0 = the seed)
         uint64_t epoch          = 0;      // that session's connect epoch when sent; 0 = no subscription
         int64_t  brokerSid      = 0;      // that session's broker id when sent (Records' sessionId)
-        int64_t  corrId         = 0;      // its Subscribe correlationId while unanswered
+        int64_t  instanceCorr   = 0;      // its Subscribe correlationId — the instance identity the
+                                          // broker stamps on every push (kept while it lives)
+        int64_t  corrId         = 0;      // == instanceCorr while unanswered (no SubscribeResponse / Records yet)
         int64_t  subscriptionId = 0;      // bound by the SubscribeResponse (0 = unanswered)
         bool     offsetKnown    = false;  // OffsetFetch answered (OK) for it this generation
         bool     parked         = false;  // refused: retried on fresh metadata
@@ -232,6 +251,7 @@ struct GroupConsumerImpl {
 
     // ---- Liveness (duty thread) -----------------------------------------------
     bool active {true};
+    GroupFailReason failReason {GroupFailReason::None};  // set before a failing finish
 
     // ---- F8c C7 fix round 2 (F1): orphaned release -------------------------------
     int64_t orphanFence  = 0;      // written by the handle BEFORE its orphan RMW (published by it)
@@ -381,6 +401,10 @@ public:
     /// callback: the duty thread's live value.  On the owning app thread: the
     /// latest generation the duty thread published (eventually consistent).
     [[nodiscard]] int32_t generation() const noexcept;
+
+    /// Why the duty side finished this consumer on its own (None otherwise) —
+    /// see GroupFailReason for the client / broker compatibility rule.
+    [[nodiscard]] GroupFailReason failReason() const noexcept;
 
 private:
     [[nodiscard]] bool onDutyThread_() const noexcept {

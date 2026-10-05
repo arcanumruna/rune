@@ -133,13 +133,16 @@ public:
     /// current assignment, deliver to that consumer and advance its position.
     /// Also tries the existing subscriberHub path first (via the caller).
     /// C1: a routed partition accepts a batch only from its CURRENT
-    /// subscription instance of the current generation — by subscriptionId
-    /// (cluster-unique) once bound; before the SubscribeResponse binds it, from
-    /// the session it was sent on (the Records' broker sessionId) with an id
-    /// not retired.  Positions are seeded only by OffsetFetch / the reset
+    /// subscription instance of the current generation: the broker stamps every
+    /// push with the correlationId of the Subscribe that created it, so the
+    /// batch must carry this instance's correlationId and broker session id
+    /// (its first batch binds the subscriptionId if the SubscribeResponse has
+    /// not arrived; from then on the id must match too).  No other local
+    /// subscription — another consumer's, a plain one, a retired one — can
+    /// ever match.  Positions are seeded only by OffsetFetch / the reset
     /// policy.  A batch entirely below the position is a duplicate (skipped);
-    /// otherwise the position advances to the batch's end — gaps are legitimate
-    /// (transaction markers, aborted batches, compaction holes).
+    /// otherwise the position advances to the batch's last offset + 1 — gaps
+    /// are legitimate (transaction markers, aborted batches, compaction holes).
     void onRecords(const codec::RecordsView& rv);
 
     /// Called when JoinGroupResponse (tid 33) arrives.
@@ -262,6 +265,10 @@ public:
     /// leaders and sessions (cold: group / routing events).  Also re-offers
     /// refused Unsubscribes.  Returns the Subscribe frames sent.
     int reconcileFetch();
+    /// MEDIUM-2 (round 3): re-send every still-unanswered fetch Subscribe (no
+    /// SubscribeResponse, no push yet) — called on routing / session events,
+    /// never on a timer.  Returns the Subscribe frames sent.
+    int resendUnanswered();
     /// Fresh metadata: refused / parked partitions may retry.
     void unparkFetch() noexcept;
     /// A partition was parked (refused, gap loop): fresh metadata is wanted.
@@ -287,6 +294,12 @@ public:
     /// partition whose start offset is still unknown (refused send, errored
     /// entry, capped answer).  Paced by a doubling backoff on the duty clock.
     int retryOffsetFetch(int64_t nowNs, int64_t sessionId, const SendFn& sendFn);
+    /// MAJOR-2 (round 3): the seed broker's ConnectResponse.brokerVersion.  A
+    /// GroupConsumer runs only against >= kBrokerVersionExplicitGroupSubscriptions;
+    /// otherwise onConnected / joinIfConnected finish it (GroupFailReason::
+    /// BrokerTooOld).  Hub-level tests (no broker) keep the default (current).
+    void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+
     /// MEDIUM-7: a consumer adopted while the session is already Connected joins
     /// now (onConnected already ran).  No-op otherwise.
     void joinIfConnected(int64_t sessionId, const SendFn& sendFn);
@@ -295,8 +308,7 @@ public:
     /// MEDIUM-1 (re-review): an assigned partition waits for a leader session
     /// that is not Connected (the caller keeps a metadata refresh armed).
     [[nodiscard]] bool fetchWaitsForSession() const noexcept;
-    /// Test/observer: retired subscription instances still remembered.
-    [[nodiscard]] std::size_t retiredCount() const noexcept { return retired_.size(); }
+
     /// Test/observer: Subscribes abandoned before their answer, awaiting it.
     [[nodiscard]] std::size_t lateFetchUnsubscribes() const noexcept { return late_.size(); }
     /// Test/observer: batches dropped by the identity / contiguity rules (C1).
@@ -346,6 +358,9 @@ private:
     DirectSendFn directSend_    = nullptr;
     void*        directSendCtx_ = nullptr;
 
+    int32_t brokerVersion_ = rune::protocol::client::kBrokerVersion;
+    void refuse_(GroupConsumerImpl& impl, GroupFailReason why);
+
     // Fetch routing (see FetchRouter).
     FetchRouter router_{};
     int64_t     nextFetchCorr_ = 1;
@@ -364,19 +379,15 @@ private:
         int64_t        subscriptionId;
         TopicPartition tp;
     };
-    // C1: instances whose in-flight records must be dropped before the
-    // partition's current instance is bound (pre-bind acceptance).  Bounded
-    // (MEDIUM-5): an entry is forgotten once its partition's current instance
-    // binds (exact id match from then on) or its session episode ends.
-    std::vector<SubRef> retired_;
     std::vector<SubRef> pendingUnsubs_;  // M2: refused Unsubscribes
     std::vector<SubRef> unsubScratch_;   // LOW-2: double buffer (no per-pass allocation)
     [[nodiscard]] bool routed_() const noexcept { return router_.offer != nullptr; }
     [[nodiscard]] int64_t nextFetchCorr_tagged_() noexcept {
         return kFetchCorrTag | (nextFetchCorr_++ & (kFetchCorrTag - 1));
     }
-    [[nodiscard]] bool isRetired_(const TopicPartition& tp, int64_t subscriptionId) const noexcept;
-    void forgetRetired_(const TopicPartition& tp) noexcept;
+    /// An abandoned (unanswered) instance revealed its id by a Records frame:
+    /// unsubscribe it.  Cold (only for batches no consumer accepts).
+    void learnLateFromRecords_(const codec::RecordsView& rv);
     void pruneFetch_();
     int  reconcileImpl_(GroupConsumerImpl& impl);
     /// Forget fs's subscription: its instance is retired (its records dropped)

@@ -1861,7 +1861,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // JoinGroup, onConnected) concerns it.
         if (agent_.lastConnectSession() != 0) {
             if (ec == rpc::ErrorCode::OK && agent_.lastConnectAccepted() && !groupConsumerHub_.empty()) {
-                (void)groupConsumerHub_.reconcileFetch();
+                (void)groupConsumerHub_.resendUnanswered();  // a session event: unanswered Subscribes re-sent
             }
             break;
         }
@@ -1911,6 +1911,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         return agent_.submitSend(fb, fl);
                     });
             }
+
+            // MAJOR-2 (round 3): the broker's capability, for every group
+            // consumer — present or created later (joinIfConnected).
+            groupConsumerHub_.setBrokerVersion(opt->brokerVersion);
 
             // CG-5: Trigger group consumers to send JoinGroup on connect — only
             // when the SEED (the coordinator's session) connected: a leader
@@ -2339,7 +2343,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // Demultiplexed by subscriptionId — cluster-unique (the broker puts
         // the node id in its high bits), whichever node / publication pushed it.
         // Route to the subscriber hub first (direct subscriptions).
-        subscriberHub_.onRecords(*opt);
+        subscriberHub_.onRecords(*opt, agent_.seedSession().machine.sessionId());
         // Also route to group consumer hub (assigned partitions).
         groupConsumerHub_.onRecords(*opt);
         break;
@@ -3316,7 +3320,7 @@ int Client::watchGroupSessions_(int64_t nowNs) {
     // The leader may have moved: ask now (rate-limited, falls back to the
     // backoff refresh); the answer re-routes (onMetadataResponse -> reconcile).
     requestMetadataNow_();
-    (void)groupConsumerHub_.reconcileFetch();
+    (void)groupConsumerHub_.resendUnanswered();  // a session event: unanswered Subscribes re-sent
     return 1;
 }
 

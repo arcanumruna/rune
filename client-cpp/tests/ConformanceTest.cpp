@@ -174,10 +174,28 @@ TEST(ClientCodecConformance, ConnectResponse) {
         static_cast<int16_t>(cc::ErrorCode::OK),
         2,
         static_cast<int64_t>(0x00000000DEADBEEFULL),
-        kSessionId, kCorrelationId);
+        kSessionId, kCorrelationId, /*brokerVersion=*/-1);  // the golden v0 (38-byte) form
     ASSERT_EQ(n, 38u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden connect_response.bin";
+    EXPECT_EQ(view->brokerVersion, 0) << "the v0 frame advertises no capability";
+}
+
+// MAJOR-2 (CG round 3): the current form appends brokerVersion; the first 38
+// bytes (bar blockLength) are the v0 form, and it decodes to version 3.
+TEST(ClientCodecConformance, ConnectResponseCarriesTheBrokerVersionRegression) {
+    const auto golden = readVector("connect_response.bin");
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = cc::encodeConnectResponse(enc.data(), enc.size(),
+                                                    static_cast<int16_t>(cc::ErrorCode::OK), 2,
+                                                    static_cast<int64_t>(0x00000000DEADBEEFULL),
+                                                    kSessionId, kCorrelationId);
+    ASSERT_EQ(n, 42u);
+    EXPECT_EQ(std::memcmp(enc.data() + 2, golden.data() + 2, 36), 0);
+    const auto view = cc::decodeConnectResponse(enc.data(), n);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->brokerVersion, rune::protocol::client::kBrokerVersion);
+    EXPECT_EQ(view->assignedSessionId, static_cast<int64_t>(0x00000000DEADBEEFULL));
 }
 
 // ===========================================================================
@@ -206,7 +224,7 @@ TEST(ClientCodecConformance, ConnectResponseRedirect) {
         static_cast<int16_t>(cc::ErrorCode::Redirect),
         1,
         0LL,
-        kSessionId, kCorrelationId);
+        kSessionId, kCorrelationId, /*brokerVersion=*/-1);
     ASSERT_EQ(n, 38u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden connect_response_redirect.bin";

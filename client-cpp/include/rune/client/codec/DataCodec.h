@@ -268,6 +268,14 @@ struct RecordsView {
     // RecordBatchReader.  Correct advance = baseOffset + recordCount.
     // Defaults to 1 for backward compatibility when recordBatch is empty/missing.
     int32_t                  recordCount    = 1;
+    // The batch's lastOffsetDelta (header): its last offset is baseOffset +
+    // lastOffsetDelta — compaction can leave holes INSIDE a batch, so the next
+    // offset is baseOffset + lastOffsetDelta + 1, not baseOffset + recordCount.
+    // Defaults to recordCount - 1 (no batch header).
+    int32_t                  lastOffsetDelta = 0;
+    [[nodiscard]] int64_t nextOffset() const noexcept {
+        return baseOffset + static_cast<int64_t>(lastOffsetDelta) + 1;
+    }
 };
 
 /// Encode a Records frame into buf[0..cap-1].
@@ -320,6 +328,8 @@ inline std::optional<RecordsView> decodeRecords(const uint8_t* buf,
                                                   v.recordBatch.size());
         const int32_t cnt = reader.recordCount();
         v.recordCount = (cnt > 0) ? cnt : 1;
+        const int32_t lod = reader.lastOffsetDelta();
+        v.lastOffsetDelta = lod >= v.recordCount - 1 ? lod : v.recordCount - 1;
     }
     // else: recordCount stays 1 (default — empty/stub batch in tests)
     return v;

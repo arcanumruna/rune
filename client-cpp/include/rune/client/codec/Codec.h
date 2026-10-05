@@ -137,17 +137,20 @@ struct ConnectResponseView {
     int16_t code              = 0;   // ErrorCode value
     int32_t leaderMemberId    = -1;
     int64_t assignedSessionId = 0;
+    int32_t brokerVersion     = 0;   // capability gate (0 = a broker that predates the field)
 };
 
 /// Encode a ConnectResponse frame into buf[0..cap-1].
-/// Returns bytes written (always 38 on success), or 0 if cap < 38.
+/// Returns bytes written (42 on success; 38 when brokerVersion < 0 encodes
+/// an older broker's frame, for tests), or 0 if cap is too small.
 inline std::size_t encodeConnectResponse(uint8_t* buf,
                                           std::size_t cap,
                                           int16_t     code,
                                           int32_t     leaderMemberId,
                                           int64_t     assignedSessionId,
                                           int64_t     sessionId,
-                                          int64_t     correlationId) noexcept {
+                                          int64_t     correlationId,
+                                          int32_t     brokerVersion = rpc::kBrokerVersion) noexcept {
     if (cap < rpc::ConnectResponse::ENCODED_SIZE) return 0u;
     rpc::ConnectResponse msg;
     msg.sessionId         = sessionId;
@@ -155,7 +158,12 @@ inline std::size_t encodeConnectResponse(uint8_t* buf,
     msg.code              = code;
     msg.leaderMemberId    = leaderMemberId;
     msg.assignedSessionId = assignedSessionId;
-    return msg.encode(buf);
+    msg.brokerVersion     = brokerVersion < 0 ? 0 : brokerVersion;
+    const std::size_t n = msg.encode(buf);
+    if (brokerVersion >= 0) return n;
+    // An older broker's 38-byte frame (no brokerVersion field).
+    rune::protocol::client::detail::putLE16(buf, 0, rpc::ConnectResponse::BODY_FIXED_V0);
+    return rpc::ConnectResponse::ENCODED_SIZE_V0;
 }
 
 /// Decode a ConnectResponse frame.
@@ -169,6 +177,7 @@ inline std::optional<ConnectResponseView> decodeConnectResponse(const uint8_t* b
     v.code              = opt->code;
     v.leaderMemberId    = opt->leaderMemberId;
     v.assignedSessionId = opt->assignedSessionId;
+    v.brokerVersion     = opt->brokerVersion;
     return v;
 }
 

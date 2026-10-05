@@ -420,14 +420,31 @@ void SubscriberHub::onSubscribeResponse(
 // onRecords — duty thread (hot path: map lookup + handler; one publish/frame)
 // ---------------------------------------------------------------------------
 
-void SubscriberHub::onRecords(const codec::RecordsView& rv)
+void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessionId)
 {
     auto it = activeById_.find(rv.subscriptionId);
     if (it == activeById_.end()) {
-        return; // unknown / already-removed subscription
+        // CG round 3 (MAJOR-1): a broker stamps every push with the
+        // correlationId of the Subscribe that created it — the first Records
+        // frame binds a still-pending subscription (its SubscribeResponse may
+        // arrive later, on another publication).  Cold: once per subscription.
+        if (rv.correlationId == 0) return;  // unknown / already-removed subscription
+        const auto p = pendingByCorrelation_.find(rv.correlationId);
+        if (p == pendingByCorrelation_.end() || p->second->impl == nullptr) return;
+        SubscriptionImpl* pi = p->second->impl;
+        if (!pi->active || rv.topicId != pi->topicId) return;
+        if (currentSessionId != 0 && rv.sessionId != currentSessionId) return;  // another session's push
+        clearUnsent_(*p->second);
+        pendingByCorrelation_.erase(p);
+        pi->subscriptionId = rv.subscriptionId;
+        pi->boundPartition = rv.partition;
+        (void)pi->status.publishFinal(SubscriptionStatus{pi->subscriptionId, pi->nextOffset, pi->failReason});
+        it = activeById_.emplace(rv.subscriptionId, pi).first;
     }
     SubscriptionImpl& impl = *it->second;
     if (!impl.active) return;
+    // Exact instance: the push names the Subscribe that created it.
+    if (rv.correlationId != 0 && rv.correlationId != impl.correlationId) return;
     // Only its own topic / partition (a belt-and-braces compare on a branch
     // already taken: subscription ids are cluster-unique).
     if (rv.topicId != impl.topicId || (impl.boundPartition >= 0 && rv.partition != impl.boundPartition)) return;

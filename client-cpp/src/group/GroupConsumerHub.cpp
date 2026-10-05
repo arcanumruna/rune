@@ -165,7 +165,7 @@ void GroupConsumerHub::setSessionConnected(bool connected, int64_t sessionId, in
 void GroupConsumerHub::closeStatus_(GroupConsumerImpl& impl) {
     if (impl.status.producerClosed()) return;
     // Final snapshot (the reserve guarantees it fits), THEN close.
-    (void)impl.status.publishFinal(GroupConsumerStatus{impl.generationId, 0});
+    (void)impl.status.publishFinal(GroupConsumerStatus{impl.generationId, static_cast<int32_t>(impl.failReason)});
     impl.status.close();
 }
 
@@ -612,20 +612,15 @@ void GroupConsumerHub::sendSubscribeForPartitions(GroupConsumerImpl& impl,
 // Fetch routing — duty thread, cold path (group / routing events)
 // ---------------------------------------------------------------------------
 
-bool GroupConsumerHub::isRetired_(const TopicPartition& tp, int64_t subscriptionId) const noexcept
+void GroupConsumerHub::learnLateFromRecords_(const codec::RecordsView& rv)
 {
-    // Subscription ids are cluster-unique: the id alone names the instance.
-    for (const SubRef& r : retired_) {
-        if (r.subscriptionId == subscriptionId && r.tp == tp) return true;
-    }
-    return false;
-}
-
-void GroupConsumerHub::forgetRetired_(const TopicPartition& tp) noexcept
-{
-    for (std::size_t i = 0; i < retired_.size();) {
-        if (retired_[i].tp == tp) { retired_[i] = retired_.back(); retired_.pop_back(); }
-        else ++i;
+    for (std::size_t i = 0; i < late_.size(); ++i) {
+        const LateSub l = late_[i];
+        if (l.corrId != rv.correlationId) continue;
+        late_[i] = late_.back();
+        late_.pop_back();
+        unsubscribe_(l.session, l.epoch, rv.subscriptionId, l.tp);
+        return;
     }
 }
 
@@ -646,8 +641,9 @@ void GroupConsumerHub::unsubscribe_(uint32_t session, uint64_t epoch, int64_t su
         pendingUnsubs_.push_back(SubRef{session, epoch, subscriptionId, tp});  // M2: re-offered per pass
         break;
     case detail::SendResult::Fatal:
-        // LOW-3: never deliverable; the instance stays retired (its records are
-        // dropped) until its session episode ends.
+        // LOW-3: never deliverable; its records are dropped anyway (they carry
+        // its own correlationId, never the current instance's) until its
+        // session episode ends.
         std::fprintf(stderr,
             "rune-client: group fetch Unsubscribe (subscription %lld, topic %d partition %d) can never be "
             "sent — dropped; the subscription ends with its session\n",
@@ -675,7 +671,6 @@ void GroupConsumerHub::dropFetch_(const TopicPartition& tp, GroupConsumerImpl::F
 {
     if (fs.epoch != 0) {
         if (fs.subscriptionId != 0) {
-            retired_.push_back(SubRef{fs.session, fs.epoch, fs.subscriptionId, tp});
             unsubscribe_(fs.session, fs.epoch, fs.subscriptionId, tp);
         } else if (fs.corrId != 0) {
             late_.push_back(LateSub{fs.corrId, fs.session, fs.epoch, tp});
@@ -683,6 +678,7 @@ void GroupConsumerHub::dropFetch_(const TopicPartition& tp, GroupConsumerImpl::F
     }
     fs.epoch          = 0;
     fs.brokerSid      = 0;
+    fs.instanceCorr   = 0;
     fs.corrId         = 0;
     fs.subscriptionId = 0;
 }
@@ -701,10 +697,6 @@ void GroupConsumerHub::pruneFetch_()
     };
     for (std::size_t i = 0; i < late_.size();) {
         if (ended(late_[i].session, late_[i].epoch)) { late_[i] = late_.back(); late_.pop_back(); }
-        else ++i;
-    }
-    for (std::size_t i = 0; i < retired_.size();) {
-        if (ended(retired_[i].session, retired_[i].epoch)) { retired_[i] = retired_.back(); retired_.pop_back(); }
         else ++i;
     }
 }
@@ -742,15 +734,6 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
             if (router_.revive != nullptr) router_.revive(router_.ctx, target);
             continue;
         }
-        // C1: never two unanswered instances of one partition on one session
-        // episode — pre-bind records are attributed by session, so the old
-        // unanswered one must be answered (retired, unsubscribed) first; its
-        // answer re-drives this reconcile.
-        bool olderUnanswered = false;
-        for (const LateSub& l : late_) {
-            if (l.tp == tp && l.session == target && l.epoch == ep) { olderUnanswered = true; break; }
-        }
-        if (olderUnanswered) continue;
         const int64_t corr = nextFetchCorr_tagged_();
         constexpr std::size_t kSubscribeFrameSize = 44u;
         ensureBuf(impl, kSubscribeFrameSize);
@@ -763,6 +746,7 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
             fs.session        = target;
             fs.epoch          = ep;
             fs.brokerSid      = sid;
+            fs.instanceCorr   = corr;
             fs.corrId         = corr;
             fs.subscriptionId = 0;
             ++sent;
@@ -776,6 +760,23 @@ int GroupConsumerHub::reconcileImpl_(GroupConsumerImpl& impl)
         }
     }
     return sent;
+}
+
+int GroupConsumerHub::resendUnanswered()
+{
+    if (!routed_()) return 0;
+    // MEDIUM-2 (round 3): a Subscribe that got neither its answer nor a push is
+    // re-sent on routing / session events and each new generation (never on a
+    // clock): the old instance is abandoned (late_: unsubscribed if its id ever
+    // shows up — its pushes carry its own correlationId, never the new one's).
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (!impl->active || impl->state != GroupConsumerState::Stable) continue;
+        for (auto& [tp, fs] : impl->fetch) {
+            if (fs.epoch != 0 && fs.corrId != 0) dropFetch_(tp, fs);
+        }
+    }
+    return reconcileFetch();
 }
 
 int GroupConsumerHub::reconcileFetch()
@@ -840,10 +841,10 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
             if (errorCode == 0) {
                 fs.subscriptionId = subscriptionId;
                 fs.redirects      = 0;
-                forgetRetired_(tp);  // MEDIUM-5: exact id match from now on
             } else {
                 fs.epoch        = 0;     // nothing registered (UnknownTopic / UnknownPartition / ...)
                 fs.brokerSid    = 0;
+                fs.instanceCorr = 0;
                 fs.parked       = true;  // retried after fresh metadata
                 metadataWanted_ = true;
             }
@@ -855,11 +856,7 @@ bool GroupConsumerHub::onFetchSubscribeResponse(int64_t corrId, int16_t errorCod
         const LateSub l = late_[i];
         late_[i] = late_.back();
         late_.pop_back();
-        if (errorCode == 0) {
-            retired_.push_back(SubRef{l.session, l.epoch, subscriptionId, l.tp});  // its records: dropped
-            unsubscribe_(l.session, l.epoch, subscriptionId, l.tp);
-        }
-        (void)reconcileFetch();  // a Subscribe that waited for this answer may go now
+        if (errorCode == 0) unsubscribe_(l.session, l.epoch, subscriptionId, l.tp);  // its records never matched
         break;
     }
     return true;  // a group fetch answer (maybe stale): never the SubscriberHub's
@@ -874,6 +871,7 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
             fs.corrId         = 0;
             fs.epoch          = 0;  // registered nothing
             fs.brokerSid      = 0;
+            fs.instanceCorr   = 0;
             fs.subscriptionId = 0;
             if (park || ++fs.redirects > kMaxFetchRedirects) {
                 fs.parked       = true;
@@ -926,7 +924,12 @@ void GroupConsumerHub::joinIfConnected(int64_t sessionId, const SendFn& sendFn)
     if (!sessionConnected_ || sessionId == 0) return;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
-        if (impl->active && impl->state == GroupConsumerState::Unjoined) sendJoinGroup(*impl, sessionId, sendFn);
+        if (!impl->active || impl->state != GroupConsumerState::Unjoined) continue;
+        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions) {
+            refuse_(*impl, GroupFailReason::BrokerTooOld);
+            continue;
+        }
+        sendJoinGroup(*impl, sessionId, sendFn);
     }
 }
 
@@ -1153,17 +1156,20 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         if (it == impl->assignment.end()) continue;
 
         if (routed_()) {
-            // C1: only this consumer's CURRENT subscription instance: its bound
-            // id (cluster-unique), or — before the SubscribeResponse binds it —
-            // a non-retired id pushed for the session it was sent on.  Another
+            // C1: only this consumer's CURRENT subscription instance — the push
+            // names the Subscribe that created it (correlationId) and its
+            // session; once bound, its (cluster-unique) id as well.  Another
             // consumer (another group) may own the batch: keep looking (LOW-5).
             const auto f = impl->fetch.find(key);
             if (f == impl->fetch.end()) continue;
-            const GroupConsumerImpl::FetchSub& fs = f->second;
-            if (fs.epoch == 0 || router_.epoch(router_.ctx, fs.session) != fs.epoch) continue;
-            if (fs.subscriptionId != 0 ? rv.subscriptionId != fs.subscriptionId
-                                       : (rv.sessionId != fs.brokerSid ||
-                                          isRetired_(key, rv.subscriptionId))) {
+            GroupConsumerImpl::FetchSub& fs = f->second;
+            if (fs.epoch == 0 || rv.correlationId != fs.instanceCorr || rv.sessionId != fs.brokerSid) continue;
+            if (router_.epoch(router_.ctx, fs.session) != fs.epoch) continue;
+            if (fs.subscriptionId == 0) {
+                fs.subscriptionId = rv.subscriptionId;  // bound by its first push
+                fs.corrId         = 0;
+                fs.redirects      = 0;
+            } else if (rv.subscriptionId != fs.subscriptionId) {
                 continue;
             }
         }
@@ -1171,7 +1177,10 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         // The position is seeded only by OffsetFetch / the reset policy (C1).
         const int64_t pos = it->second;
         if (pos == GroupConsumerImpl::kUnseededSentinel) { ++droppedBatches_; return; }
-        const int64_t end = rv.baseOffset + static_cast<int64_t>(rv.recordCount);
+        // LOW-1: last offset + 1 (compaction holes inside a batch), never less
+        // than the record count (hand-built views without a batch header).
+        const int64_t span = std::max<int64_t>(static_cast<int64_t>(rv.lastOffsetDelta) + 1, rv.recordCount);
+        const int64_t end  = rv.baseOffset + span;
         if (end <= pos) { ++droppedBatches_; return; }  // entirely below: a duplicate (MEDIUM-3)
         // Otherwise delivered and the position moves to the batch's end — a
         // batch above the position is legitimate (transaction markers, aborted
@@ -1204,6 +1213,8 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         return;
     }
     ++droppedBatches_;
+    // An abandoned, never-answered instance just revealed its id: clean it up.
+    if (routed_() && !late_.empty() && rv.correlationId != 0) learnLateFromRecords_(rv);
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,6 +1247,9 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
             publishGeneration_(*impl);
 
             sendSyncGroup(*impl, sessionId, sendFn);
+        } else if (ec == rpc::ErrorCode::ProtocolVersion) {
+            // MAJOR-2 (round 3): non-retriable — this client is too old for the broker.
+            refuse_(*impl, GroupFailReason::RefusedByBroker);
         } else if (ec == rpc::ErrorCode::NotCoordinator ||
                    ec == rpc::ErrorCode::RebalanceInProgress) {
             toRejoining_(*impl);
@@ -1477,11 +1491,31 @@ void GroupConsumerHub::onAssign(const uint8_t* buf, std::size_t len,
 // onConnected — called when ConnectResponse{OK} arrives
 // ---------------------------------------------------------------------------
 
+void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
+{
+    if (!impl.active) return;
+    std::fprintf(stderr,
+        "rune-client: group '%s' cannot run: %s — the consumer is finished "
+        "(client and broker must both be version >= 3: explicit group subscriptions)\n",
+        impl.groupId.c_str(),
+        why == GroupFailReason::BrokerTooOld ? "the broker does not advertise explicit group subscriptions"
+                                             : "the broker coordinator refused this client's JoinGroup");
+    if (routed_()) dropAllFetch_(impl);
+    impl.failReason = why;
+    finish_(impl);
+}
+
 void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
 {
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
+        // MAJOR-2 (round 3): never against a broker that predates explicit
+        // group subscriptions (it would auto-subscribe and lose records).
+        if (brokerVersion_ < rune::protocol::client::kBrokerVersionExplicitGroupSubscriptions) {
+            refuse_(*impl, GroupFailReason::BrokerTooOld);
+            continue;
+        }
 
         // fix1 I6: a NEW session (reconnect) means the old one was lost — a
         // commitSync whose OffsetCommit went out on it can never be answered.

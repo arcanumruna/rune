@@ -2267,79 +2267,163 @@ void boundOnNodeOne(GroupConsumerHub& hub, CaptureSink& sink, FakeFetchRouter& f
     hub.onOffsetFetchResponse(o1.data(), o1.size());
     ASSERT_TRUE(hub.onFetchSubscribeResponse(fr.subscribes(1).at(0).correlationId, 0, 900));
 }
-codec::RecordsView batch(int32_t partition, int64_t base, int64_t subId, int32_t count = 1, int64_t sid = 501) {
+codec::RecordsView batch(int32_t partition, int64_t base, int64_t subId, int64_t corr, int32_t count = 1,
+                         int64_t sid = 501) {
     codec::RecordsView rv;
     rv.topicId        = kTopicId;
     rv.partition      = partition;
     rv.baseOffset     = base;
     rv.subscriptionId = subId;
+    rv.correlationId  = corr;
     rv.recordCount    = count;
+    rv.lastOffsetDelta = count - 1;
     rv.sessionId      = sid;
     return rv;
 }
 } // namespace
 
-// C1: once bound, only the current instance's (cluster-unique) id is accepted;
-// a retired instance's in-flight batches are dropped.
+// C1: only the current instance — the push names the Subscribe that created
+// it (correlationId) and its session; once bound, its id must match too.  A
+// retired instance's in-flight batches are dropped.
 TEST_F(GroupConsumerHubTest, OnlyTheCurrentSubscriptionInstanceIsAcceptedRegression) {
     FakeFetchRouter fr;
     int delivered = 0;
     impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
     boundOnNodeOne(*hub_, sink_, fr);
     const TopicPartition tp{kTopicId, 1};
-    hub_->onRecords(batch(1, 7, 901));  // another id
+    const int64_t c1 = fr.subscribes(1).at(0).correlationId;
+    hub_->onRecords(batch(1, 7, 901, c1));  // another id under its correlationId
+    hub_->onRecords(batch(1, 7, 900, c1 + 1));  // its id, another request
     EXPECT_EQ(delivered, 0);
     EXPECT_EQ(impl_->assignment.at(tp), 7);
-    hub_->onRecords(batch(1, 7, 900));
+    hub_->onRecords(batch(1, 7, 900, c1));
     EXPECT_EQ(delivered, 1);
     EXPECT_EQ(impl_->assignment.at(tp), 8);
-    // The leader moves to node 2: 900 is retired — its in-flight batches drop.
+    // The leader moves to node 2: instance 900 is abandoned — its in-flight batches drop.
     fr.leader[1] = 2u;
     fr.sids[2]   = 777;
     hub_->reconcileFetch();
-    hub_->onRecords(batch(1, 8, 900));
+    const int64_t c2 = fr.subscribes(2).at(0).correlationId;
+    hub_->onRecords(batch(1, 8, 900, c1));
     EXPECT_EQ(delivered, 1) << "a retired instance's batch was delivered";
-    EXPECT_EQ(impl_->assignment.at(tp), 8);
-    // Before node 2's answer binds the new instance: its session's batches with
-    // a non-retired id are accepted; node 1's session's / the retired id are not.
-    hub_->onRecords(batch(1, 8, 950, 1, /*sid=*/501));
-    hub_->onRecords(batch(1, 8, 900, 1, /*sid=*/777));
+    // Before node 2's answer: only ITS request's pushes (they bind it).
+    hub_->onRecords(batch(1, 8, 950, c2, 1, /*sid=*/501));  // right request, wrong session
     EXPECT_EQ(delivered, 1);
-    hub_->onRecords(batch(1, 8, 951, 2, /*sid=*/777));
+    hub_->onRecords(batch(1, 8, 951, c2, 2, /*sid=*/777));
     EXPECT_EQ(delivered, 2);
     EXPECT_EQ(impl_->assignment.at(tp), 10);
+    hub_->onRecords(batch(1, 10, 952, c2, 1, 777));  // bound to 951 now: another id never
+    EXPECT_EQ(delivered, 2);
 }
 
 // CRITICAL-1 (re-review): a batch above the position is legitimate — a
 // transaction marker, an aborted batch or a compaction hole is never pushed —
-// and the position advances to its end.  RED (fix round 1): the partition was
-// re-subscribed, then parked, and never advanced.
+// and the position advances to its last offset + 1 (LOW-1: holes INSIDE a
+// batch too).  RED (fix round 1): re-subscribed, then parked.
 TEST_F(GroupConsumerHubTest, GapAdvancesThePositionRegression) {
     FakeFetchRouter fr;
     int delivered = 0;
     impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
     boundOnNodeOne(*hub_, sink_, fr);
+    const int64_t c1 = fr.subscribes(1).at(0).correlationId;
     const TopicPartition tp{kTopicId, 1};
-    hub_->onRecords(batch(1, 7, 900, 3));   // 7..9
-    hub_->onRecords(batch(1, 11, 900, 2));  // 10 was a marker: 11..12
+    hub_->onRecords(batch(1, 7, 900, c1, 3));   // 7..9
+    hub_->onRecords(batch(1, 11, 900, c1, 2));  // 10 was a marker: 11..12
     EXPECT_EQ(delivered, 2);
     EXPECT_EQ(impl_->assignment.at(tp), 13);
+    auto compacted = batch(1, 13, 900, c1, 2);  // 2 records, offsets 13 and 16 (holes inside)
+    compacted.lastOffsetDelta = 3;
+    hub_->onRecords(compacted);
+    EXPECT_EQ(impl_->assignment.at(tp), 17) << "LOW-1: last offset + 1, not base + recordCount";
     EXPECT_TRUE(fr.unsubscribes(1).empty()) << "no re-subscribe on a legitimate gap";
     EXPECT_EQ(fr.subscribes(1).size(), 1u);
 }
 
-// MEDIUM-5 (re-review): retired instances are forgotten once the partition's
-// current instance binds — the list stays bounded however often it moves.
-TEST_F(GroupConsumerHubTest, RetiredInstancesAreBoundedRegression) {
+// MEDIUM-1 (round 3): an instance retired long ago (its Unsubscribe never
+// went out: Fatal) never feeds the partition again, however many later
+// instances bind in between.  RED (round 2): binding forgot it, and a later
+// pre-bind window accepted its pushes.
+TEST_F(GroupConsumerHubTest, OldInstanceNeverFeedsAfterLaterBindsRegression) {
     FakeFetchRouter fr;
+    int delivered = 0;
+    impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
     boundOnNodeOne(*hub_, sink_, fr);
-    for (int i = 0; i < 50; ++i) {
-        fr.epochs[1] = static_cast<uint64_t>(2 + i);  // a new episode every round: re-subscribe
+    const int64_t c1 = fr.subscribes(1).at(0).correlationId;
+    for (int i = 0; i < 3; ++i) {  // three later instances, each bound
+        fr.epochs[1] = static_cast<uint64_t>(2 + i);
         hub_->reconcileFetch();
-        const auto subs = fr.subscribes(1);
-        ASSERT_TRUE(hub_->onFetchSubscribeResponse(subs.back().correlationId, 0, 1000 + i));
+        ASSERT_TRUE(hub_->onFetchSubscribeResponse(fr.subscribes(1).back().correlationId, 0, 1000 + i));
     }
-    EXPECT_LE(hub_->retiredCount(), 1u);
+    fr.epochs[1] = 9;  // and one more, still pending (pre-bind)
+    hub_->reconcileFetch();
+    hub_->onRecords(batch(1, 50, 900, c1));  // the orphan from generation 1 pushes far ahead
+    EXPECT_EQ(delivered, 0);
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, 1}), 7);
+}
+
+// MAJOR-1 (round 3): two group consumers of one Client (two groups) on the
+// same partition and node session: B's live, bound subscription never feeds A
+// while A's own Subscribe is unanswered.  RED (round 2): A took B's batch (any
+// unretired id of the session) and jumped past its own records.
+TEST(GroupFetchIdentityRegression, AnotherConsumersSubscriptionNeverFeedsThisMemberRegression) {
+    GroupConsumerHub hub;
+    FakeFetchRouter fr;
+    fr.leader  = {{0, 1u}, {1, 1u}};
+    fr.sids[1] = 501;
+    hub.setFetchRouter(fr.router());
+    CaptureSink sink;
+    GroupConsumerImpl a, b;
+    for (GroupConsumerImpl* g : {&a, &b}) {
+        g->groupId  = g == &a ? "gA" : "gB";
+        g->topicIds = {kTopicId};
+        g->active   = true;
+    }
+    int gotA = 0, gotB = 0;
+    a.cbRecords = [&](const RecordSet&) { ++gotA; };
+    b.cbRecords = [&](const RecordSet&) { ++gotB; };
+    hub.add(&a);
+    hub.add(&b);
+    // Both Stable on p1 (node 1): B first, bound, at 10000; A at 2000, unanswered.
+    for (GroupConsumerImpl* g : {&b, &a}) {
+        g->state = GroupConsumerState::Syncing;
+        auto sgr = makeSyncGroupResponseOK({{kTopicId, 1}});
+        hub.onSyncGroupResponse(sgr.data(), sgr.size(), kSessionId, sink.fn());
+        auto ofr = makeOffsetFetchResponse(kTopicId, 1, g == &b ? 10000 : 2000);
+        hub.onOffsetFetchResponse(ofr.data(), ofr.size());
+    }
+    const auto subs = fr.subscribes(1);
+    ASSERT_EQ(subs.size(), 2u);
+    const int64_t cB = subs[0].fromOffset == 10000 ? subs[0].correlationId : subs[1].correlationId;
+    const int64_t cA = subs[0].fromOffset == 2000 ? subs[0].correlationId : subs[1].correlationId;
+    ASSERT_TRUE(hub.onFetchSubscribeResponse(cB, 0, 700));
+    hub.onRecords(batch(1, 10000, 700, cB, 5));  // B's push
+    EXPECT_EQ(gotA, 0) << "A consumed B's batch";
+    EXPECT_EQ(gotB, 1);
+    EXPECT_EQ(a.assignment.at(TopicPartition{kTopicId, 1}), 2000) << "A's position jumped";
+    EXPECT_EQ(b.assignment.at(TopicPartition{kTopicId, 1}), 10005);
+    hub.onRecords(batch(1, 2000, 701, cA, 3));  // A's own push binds it
+    EXPECT_EQ(gotA, 1);
+    EXPECT_EQ(a.assignment.at(TopicPartition{kTopicId, 1}), 2003);
+}
+
+// MAJOR-1 (round 3): a bound PLAIN subscription on the seed (same partition,
+// same session) never feeds a pending group subscription.  RED (round 2): the
+// group accepted it pre-bind and jumped to the log end.
+TEST_F(GroupConsumerHubTest, PlainSubscriptionNeverFeedsAPendingGroupSubscriptionRegression) {
+    FakeFetchRouter fr;
+    int delivered = 0;
+    impl_->cbRecords = [&](const RecordSet&) { ++delivered; };
+    fr.leader = {{0, 0u}, {1, 0u}};  // both partitions led by the seed
+    hub_->setFetchRouter(fr.router());
+    stableWithTwoPartitions(*hub_, sink_);
+    auto o0 = makeOffsetFetchResponse(kTopicId, 0, 4);
+    hub_->onOffsetFetchResponse(o0.data(), o0.size());
+    ASSERT_FALSE(fr.subscribes(0).empty());
+    // A plain subscription of this Client (id 555, its own request 42) tails p0
+    // from the log end on the seed session.
+    hub_->onRecords(batch(0, 900, 555, /*corr=*/42, 3, /*sid=*/kSessionId));
+    EXPECT_EQ(delivered, 0) << "the group took a plain subscription's batch";
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, 0}), 4);
 }
 
 // M2: an Unsubscribe the transport refused is re-offered on a later pass; one

@@ -757,7 +757,16 @@ TEST(GroupRoutingRegression, StaleConnectResponseChangesNothingRegression) {
     t.r.gw.pushRecords(s0, 0, 3);  // after the stale frame, on the same publication
     ASSERT_TRUE(t.r.drive([&] { return t.led.records[0] == 3; }))
         << "the live seed subscription stopped delivering after a stale ConnectResponse";
-    (void)t.r.drive([] { return false; }, 20'000);  // bounded settle: any re-subscribe reaches the gateway
+    // A positive marker (LOW-8): a Ping sent now is answered only after every
+    // frame the client sent before it on the seed reached the gateway.
+    const uint8_t echo[1] = {7};
+    const rc::Token pt = t.r.nextToken++;
+    ASSERT_EQ(t.r.client.ping(std::span<const uint8_t>(echo), t.r.cq, pt), rc::OpResult::Accepted);
+    bool pong = false;
+    ASSERT_TRUE(t.r.drive([&] {
+        t.r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) { if (cc.token == pt) pong = true; });
+        return pong;
+    }));
     EXPECT_EQ(t.r.gw.subscribed.size(), subsBefore) << "a stale ConnectResponse re-made subscriptions";
 }
 
@@ -854,4 +863,104 @@ TEST(GroupRoutingRegression, PlainSubscribeRedirectedWhileGroupActiveReportsWhyR
     ASSERT_TRUE(r.drive([&] { return sub.finished(); }));
     EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::LeaderElsewhereWhileGroupActive);
     EXPECT_EQ(r.client.testTransport().ingressChannel(), r.c.gatewayChannel) << "the seed moved";
+}
+
+
+// ===========================================================================
+// Fix round 3 (exact instance identity by correlationId, version gate,
+// unanswered Subscribes re-sent on events)
+// ===========================================================================
+
+// MAJOR-1 (round 3): a bound PLAIN subscription of this Client tails p0 on the
+// seed from far ahead while the group member's own p0 Subscribe is still
+// unanswered: the plain subscription's pushes never feed the member.  RED
+// (round 2): the member accepted them pre-bind (same session, unretired id),
+// jumped to the log end and skipped its own records.
+TEST(GroupRoutingRegression, PlainSubscriptionNeverFeedsAPendingGroupSubscriptionRegression) {
+    GroupRig r(4143, 4144);
+    r.gw.partitions      = {{1, 0, 0, 1, 4143, ""}};
+    r.gw.groupAssignment = {{1, 0}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    int plain = 0;
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::latest()},
+                                  [&](const rc::Record&) { ++plain; });
+    ASSERT_TRUE(r.drive([&] { return sub.subscriptionId() > 0 && !r.gw.pendingJoins.empty(); }));
+    const auto plainSub = *r.gw.latestSubscription(1, 0);
+    r.gw.dropSubscribeResponsesNext = 1;  // the member's Subscribe stays unanswered
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] {
+        const auto* s = r.gw.latestSubscription(1, 0);
+        return s != nullptr && s->corrId != plainSub.corrId;
+    }));
+    const auto groupSub = *r.gw.latestSubscription(1, 0);
+    ASSERT_EQ(groupSub.fromOffset, 0);
+    r.gw.pushRecords(plainSub, 900, 3);  // the plain subscription, far ahead
+    ASSERT_TRUE(r.drive([&] { return plain == 3; }));
+    r.gw.pushRecords(groupSub, 0, 2);     // the member's own records
+    ASSERT_TRUE(r.drive([&] { return led.records[0] >= 2; }));
+    EXPECT_EQ(led.records[0], 2) << "the member consumed the plain subscription's batch";
+    EXPECT_EQ(led.next[0], 2);
+}
+
+// MEDIUM-2 (round 3): the SubscribeResponse for p1 (node 1) is lost and p1 is
+// quiet; the coordinator then revokes and re-assigns p1.  The member must
+// subscribe p1 again (on the next routing event) and consume.  RED (round 2):
+// the abandoned unanswered instance blocked every later Subscribe on that
+// session — p1 stalled forever.
+TEST(GroupRoutingRegression, LostSubscribeResponseNeverBlocksAReassignRegression) {
+    GroupRig r(4145, 4146);
+    const auto [n1, p1port] = r.addNode(4145);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4145, ""}, {1, 1, 1, 1, 4145, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.dropSubscribeResponsesNext = 2;  // both answers lost (the subscriptions exist)
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.subAt(1, n1) != nullptr; }));
+    const auto first = *r.subAt(1, n1);
+    const int64_t sid = r.gw.groupSessionIds.front();
+    r.gw.sendAssign(sid, 2, {{1, 0}});          // p1 revoked
+    r.gw.sendAssign(sid, 3, {{1, 0}, {1, 1}});  // and assigned back
+    ASSERT_TRUE(r.drive([&] { return newSubAt(r.gw, 1, n1, first.corrId) != nullptr; }, 2'000'000))
+        << "p1 was never subscribed again after a lost SubscribeResponse";
+    r.gw.pushRecords(*newSubAt(r.gw, 1, n1, first.corrId), 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 2; }));
+}
+
+// MAJOR-2 (round 3): against a broker that predates explicit group
+// subscriptions (no ConnectResponse.brokerVersion) a GroupConsumer never
+// joins: it finishes with GroupFailReason::BrokerTooOld.  RED (round 2): it
+// joined (and would lose records on the old broker's auto-subscriptions).
+TEST(GroupRoutingRegression, GroupConsumerRefusesABrokerTooOldRegression) {
+    GroupRig r(4147, 4148);
+    r.gw.advertisedBrokerVersion = -1;  // an older broker's 38-byte ConnectResponse
+    r.gw.groupAssignment         = {{1, 0}};
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 400'000)) << "the consumer ran against an old broker";
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::BrokerTooOld);
+    EXPECT_EQ(r.gw.joinGroups, 0);
+}
+
+// MAJOR-2 (round 3): a broker coordinator refuses this client's JoinGroup
+// (ProtocolVersion): non-retriable — the consumer finishes with
+// GroupFailReason::RefusedByBroker, no JoinGroup storm.  RED (round 2): it
+// re-joined forever.
+TEST(GroupRoutingRegression, JoinGroupRefusedForVersionFinishesTheConsumerRegression) {
+    GroupRig r(4149, 4150);
+    r.gw.holdJoins     = false;
+    r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::ProtocolVersion);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 400'000)) << "joins: " << r.gw.joinGroups;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(r.gw.joinGroups, 1);
 }

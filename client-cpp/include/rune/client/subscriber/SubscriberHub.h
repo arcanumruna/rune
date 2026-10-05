@@ -145,8 +145,11 @@ public:
     /// The recordBatch span MUST be valid for the duration of this call
     /// (Aeron guarantees the fragment buffer is live for the callback duration).
     /// Matched by subscriptionId (cluster-unique: the broker puts its node id in
-    /// the high bits) and the subscription's own topic / resolved partition.
-    void onRecords(const codec::RecordsView& rv);
+    /// the high bits), the creating Subscribe's correlationId (stamped on every
+    /// push; a pending subscription is bound by its first Records frame), and
+    /// the subscription's own topic / resolved partition.  `currentSessionId`:
+    /// the seed session's broker id (0 = unchecked).
+    void onRecords(const codec::RecordsView& rv, int64_t currentSessionId = 0);
 
     /// Fail / deactivate all subscriptions (called on close, after the duty
     /// thread is gone).  Publishes each final snapshot and closes each status
