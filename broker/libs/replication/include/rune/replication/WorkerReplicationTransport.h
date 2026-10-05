@@ -432,6 +432,10 @@ private:
         bool                                         blocked = false;   // shard plane refusal
     };
     static constexpr std::size_t kMaxPeers = FollowerSlots::kMaxReplicas;
+    // LOW-7: one outstanding broker request per peer always fits the request
+    // ring (ControlRing<1024>: 1024 / 24-byte records = 42), so requestAdd never
+    // fails for capacity.
+    static_assert(kMaxPeers <= 1024 / 24, "PubAddBroker request ring must hold one request per peer");
 
     [[nodiscard]] aeron::ExclusivePublication* findPub_(rune::replication::NodeId id) const noexcept
     {

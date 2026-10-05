@@ -58,8 +58,12 @@ public:
     /// Controller, before start(): a consumer ring, prefilled with every known address.
     [[nodiscard]] rune::consensus::PeerResolutionSource subscribeDriver() { return subscribe_(true); }
     [[nodiscard]] rune::consensus::PeerResolutionSource subscribeOwner() { return subscribe_(false); }
+    /// Controller, before start(): an ad-hoc host-resolution port (the client
+    /// gateway's reply-channel hostnames — fix round 2, LOW-4).
+    [[nodiscard]] rune::consensus::HostResolvePort subscribeHostResolver();
 
-    /// Start / stop (join) the hub thread.  Idempotent.
+    /// Start / stop (join) the hub thread (only when there is something to
+    /// resolve: a managed host or a host-resolution port).  Idempotent.
     void start();
     void stop() noexcept;
 
@@ -97,7 +101,9 @@ private:
 
     rune::consensus::PeerResolutionSource subscribe_(bool driver);
     int  doWork_(int64_t nowNs);
-    bool probe_(std::size_t i, int64_t nowNs);   // true = address first known / changed
+    /// 0 = unresolved, 1 = same address confirmed, 2 = first known / changed.
+    int  probe_(std::size_t i, int64_t nowNs);
+    int  serveHostRequests_();
     void publish_(std::size_t i);
     bool post_(Sub& s, std::size_t i) noexcept;
     void resync_(Sub& s) noexcept;
@@ -106,6 +112,11 @@ private:
     ResolveFn                      fn_;
     std::vector<HostState>         hosts_;   // hub-thread-owned once started
     std::vector<Sub>               subs_;    // fixed before start()
+    struct Port {
+        std::unique_ptr<rune::consensus::HostResolveRing> req, resp;
+        std::vector<std::pair<std::int64_t, std::int64_t>> outbox;   // {reqId, ipv4 | -1} not yet posted
+    };
+    std::vector<Port>              ports_;   // fixed before start()
     Agent                          agent_{*this};
     rune::consensus::MonotonicNanoClock clock_;
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> idle_;

@@ -360,9 +360,10 @@ TEST(UnresolvedPeerRegression, ConsensusSinkStartupEndsWhenAeronAnswersRegressio
 }
 
 // ---------------------------------------------------------------------------
-// The hub: an IP change of an already-resolved peer reaches every consumer.
+// The hub: first resolution, every later confirmation (fix round 2, MEDIUM-A)
+// and an IP change reach every consumer.
 // ---------------------------------------------------------------------------
-TEST(UnresolvedPeerRegression, HubPostsFirstResolutionAndIpChangesOnlyRegression) {
+TEST(UnresolvedPeerRegression, HubPostsResolutionsConfirmationsAndIpChangesRegression) {
     TestDns dns;
     dns.set(kLateHost, "10.0.0.1");
     PeerResolverHub hub({kLateHost, "127.0.0.1", kLateHost}, dns.fn());
@@ -374,7 +375,7 @@ TEST(UnresolvedPeerRegression, HubPostsFirstResolutionAndIpChangesOnlyRegression
     ASSERT_TRUE(inbox.addressOf(0, ip));
     hub.makeAllDueForTest();
     (void)hub.runOnceForTest(1);
-    EXPECT_EQ(inbox.poll(), 0) << "same address: no event";
+    EXPECT_EQ(inbox.poll(), 1) << "a re-check confirming the same address is an event too";
     dns.set(kLateHost, "10.0.0.2");                         // the pod restarted on a new IP
     hub.makeAllDueForTest();
     (void)hub.runOnceForTest(2);
@@ -383,7 +384,101 @@ TEST(UnresolvedPeerRegression, HubPostsFirstResolutionAndIpChangesOnlyRegression
     in_addr want{};
     ::inet_pton(AF_INET, "10.0.0.2", &want);
     EXPECT_EQ(ip, want.s_addr);
-    EXPECT_EQ(inbox.generation(0), 2u);
+    EXPECT_EQ(inbox.generation(0), 3u);
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 2 (MEDIUM-A): an add that fails for a NON-DNS reason while the
+// owner already has the host cached (here: the driver cannot create the
+// endpoint yet — modelled by a driver cache that lags the owner's) is re-added
+// on the next resolver confirmation; without it the peer stays cut for good.
+// ---------------------------------------------------------------------------
+namespace {
+struct LaggingDriverCache {
+    TestDns driverDns, ownerDns;
+    PeerResolverHub driverHub{{kLateHost}, driverDns.fn()};   // feeds the driver: fails the first add
+    PeerResolverHub ownerHub{{kLateHost}, ownerDns.fn()};     // feeds the owner: host already cached
+    LaggingDriverCache() {
+        ownerDns.set(kLateHost, "127.0.0.1");
+        driverHub.resolveAllNow();
+        ownerHub.resolveAllNow();
+    }
+    void driverCanAddNow() {
+        driverDns.set(kLateHost, "127.0.0.1");
+        driverHub.makeAllDueForTest();
+        (void)driverHub.runOnceForTest(1);
+    }
+    void ownerConfirmation() {
+        ownerHub.makeAllDueForTest();
+        (void)ownerHub.runOnceForTest(2);
+    }
+};
+}
+
+TEST(UnresolvedPeerRegression, ConsensusSinkReAddsAfterANonDnsAddFailureRegression) {
+    LaggingDriverCache env;
+    InvokerShard s(env.driverHub.subscribeDriver());
+    auto pump = s.pump();
+    const uint16_t port = rune::aeronutil::testing::allocFreeUdpPort();
+    constexpr int32_t kStream = 7511;
+    const int64_t subReg = s.client->addSubscription(udp("127.0.0.1", port), kStream);
+    std::shared_ptr<aeron::Subscription> sub;
+    ASSERT_TRUE(driveUntil([&] { (void)pump.pump(); }, [&] { return (sub = s.client->findSubscription(subReg)) != nullptr; }));
+    std::unordered_map<rune::consensus::NodeId, UdpMessageSink::PeerEndpoint> peers{{1, {udp(kLateHost, port), kStream}}};
+    UdpMessageSink sink(s.client, peers, pump, env.ownerHub.subscribeOwner());
+    int received = 0;
+    const uint8_t msg[16] = {9};
+    auto pass = [&] {
+        sink.send(1, msg, sizeof msg);
+        (void)pump.pump();
+        (void)sub->poll([&](aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t,
+                            aeron::Header&) { ++received; }, 16);
+    };
+    for (int i = 0; i < 2000; ++i) pass();
+    ASSERT_EQ(received, 0) << "the add must have failed";
+    env.driverCanAddNow();                                   // the cause is gone — no owner event yet
+    for (int i = 0; i < 2000; ++i) pass();
+    EXPECT_EQ(received, 0);
+    env.ownerConfirmation();                                 // the resolver's next re-check
+    ASSERT_TRUE(driveUntil(pass, [&] { return received > 0; }))
+        << "consensus stayed cut after a non-DNS add failure on a cached host";
+}
+
+TEST(UnresolvedPeerRegression, PlaneReAddsAfterANonDnsAddFailureRegression) {
+    LaggingDriverCache env;
+    InvokerShard s(env.driverHub.subscribeDriver());
+    auto pump = s.pump();
+    WorkerReplicationTransport t(0, "aeron:ipc", 7512, WorkerReplicationTransport::DeferredAttach{});
+    t.attachResolution(env.ownerHub.subscribeOwner());
+    ASSERT_TRUE(t.attach(s.client, {{1, udp(kLateHost, rune::aeronutil::testing::allocFreeUdpPort())}}, 7512, pump));
+    auto pass = [&] { (void)pump.pump(); (void)t.drivePeerResolve(); };
+    for (int i = 0; i < 2000; ++i) pass();
+    ASSERT_FALSE(t.allPeersResolved());
+    env.driverCanAddNow();
+    for (int i = 0; i < 2000; ++i) pass();
+    EXPECT_FALSE(t.allPeersResolved());
+    env.ownerConfirmation();
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.allPeersResolved(); }))
+        << "the plane stayed cut after a non-DNS add failure on a cached host";
+}
+
+TEST(UnresolvedPeerRegression, PartitionTransportReAddsAfterANonDnsAddFailureRegression) {
+    LaggingDriverCache env;
+    InvokerShard s(env.driverHub.subscribeDriver());
+    auto pump = s.pump();
+    rune::replication::AeronPartitionTransport t(s.client, "aeron:ipc", 7513, /*selfId=*/0, 64 * 1024, pump);
+    t.attachResolution(env.ownerHub.subscribeOwner());
+    t.addPeer(1, udp(kLateHost, rune::aeronutil::testing::allocFreeUdpPort()), 7514);
+    int64_t nowNs = 0;
+    auto pass = [&] { (void)pump.pump(); (void)t.poll(++nowNs); };
+    for (int i = 0; i < 2000; ++i) pass();
+    ASSERT_EQ(t.unresolvedPeerCount(), 1);
+    env.driverCanAddNow();
+    for (int i = 0; i < 2000; ++i) pass();
+    EXPECT_EQ(t.unresolvedPeerCount(), 1);
+    env.ownerConfirmation();
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.unresolvedPeerCount() == 0; }))
+        << "the internal plane stayed cut after a non-DNS add failure on a cached host";
 }
 
 // ---------------------------------------------------------------------------

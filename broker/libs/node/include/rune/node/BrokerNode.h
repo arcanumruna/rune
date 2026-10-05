@@ -691,6 +691,8 @@ public:
     /// node's cold resolver thread (default getaddrinfo).  Set before start();
     /// called on the resolver thread (and the start thread).
     void setPeerResolveFnForTest(PeerResolverHub::ResolveFn fn) { resolveFnForTest_ = std::move(fn); }
+    /// Test-only: legacy-plane add brokers still alive (0 after stop()).
+    [[nodiscard]] std::size_t legacyPlaneBrokerCountForTest() const noexcept { return legacyPlaneBrokers_.size(); }
 
     /// Test-only: is worker w's shard Aeron client closed?  Call ONLY inside
     /// onOwnerThreadForTest on worker w (the client is worker-owned).

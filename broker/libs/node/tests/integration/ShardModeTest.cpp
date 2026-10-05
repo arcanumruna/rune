@@ -1995,3 +1995,66 @@ TEST(UnresolvedPeerStartupRegression, LatePeerJoinsAfterItsHostnameResolvesRegre
         << "node 2 does not receive new records (not back in the replication set)";
     n2.stop(); n1.stop(); n0.stop();
 }
+
+// ===========================================================================
+// DR-15 fix round 2 (LOW-4): a client's reply-channel HOSTNAME (dr-e2e clients
+// send `endpoint=<container>:<port>`) is resolved by the cold resolver thread
+// and the egress publication is added on the numeric endpoint — never resolved
+// by a driver conductor (worker 0's thread under fused placement).  The name
+// below exists only in the node's resolver (Aeron's own getaddrinfo cannot
+// resolve it): RED before — the Connect never completed.
+// ===========================================================================
+TEST(UnresolvedPeerStartupRegression, ClientReplyHostnameResolvesOffThreadRegression) {
+    TmpDir dir{"crh"}, cdir{"crhc"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/true)};
+    node.setPeerResolveFnForTest([](const std::string& host, std::uint32_t& ip) {
+        if (host != "rune-client.test") return false;
+        ip = htonl(INADDR_LOOPBACK);
+        return true;
+    });
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    {
+        ShardTestClient c(cdir.path);
+        c.advertiseEgressHost("rune-client.test");
+        const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid, 0) << "a Connect with a reply HOSTNAME never completed";
+        auto ack = c.produceUntilOk(workerIngressChannel(ports, 0, 0), kClientStream, sid, 0, 0,
+                                    /*acks=*/1, makeBatch(3));
+        ASSERT_TRUE(ack.has_value()) << "no worker ack on the resolved reply channel";
+    }
+    {
+        ShardTestClient bad(cdir.path);
+        bad.advertiseEgressHost("rune-client-unknown.invalid");
+        EXPECT_LT(bad.connect(gatewayChannel(ports, 0), kClientStream), 0)
+            << "an unresolvable reply host must be dropped (the client retries)";
+    }
+    node.stop();
+}
+
+// DR-15 fix round 2 (MEDIUM-B): a LEGACY node's control-thread add brokers (one
+// may hold an undelivered publication — a peer resolved during shutdown) are
+// released in stop(), while the node client is still alive.
+TEST(UnresolvedPeerStartupRegression, LegacyAddBrokersAreReleasedInStopRegression) {
+    TmpDir d0{"lgb0"};
+    const auto ports = ShardPorts::discover(2, 1);
+    auto cfg = makeShardConfig(0, d0.path, ports, 2, 1, /*fused=*/false);
+    cfg.workerMode       = NodeConfig::WorkerMode::Legacy;
+    cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+    for (auto& p : cfg.peers)
+        if (p.id == 1) p.host = "rune-late.test";
+    std::atomic<bool> resolvable{false};
+    BrokerNode n0{cfg};
+    n0.setPeerResolveFnForTest([&](const std::string& host, std::uint32_t& ip) {
+        if (host != "rune-late.test" || !resolvable.load()) return false;
+        ip = htonl(INADDR_LOOPBACK);
+        return true;
+    });
+    ASSERT_NO_THROW(n0.start());
+    ASSERT_GE(n0.legacyPlaneBrokerCountForTest(), 1u) << "legacy planes must re-add through the control thread";
+    resolvable = true;   // the peer resolves while the node shuts down: a re-add may be in flight
+    n0.stop();
+    EXPECT_EQ(n0.legacyPlaneBrokerCountForTest(), 0u)
+        << "add brokers (and any undelivered publication) must be released before the client closes";
+}

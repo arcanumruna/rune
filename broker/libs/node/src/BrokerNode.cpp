@@ -349,9 +349,11 @@ void BrokerNode::start() {
     //     publication re-adds an unresolved peer on its host's resolution
     //     event.  One blocking pass here (startup thread, before any driver),
     //     the hub thread starts at the end of start().
-    if (!config_.isSingleNode()) {
+    //     Single-node too (fix round 2): clients' reply hostnames resolve here.
+    {
         std::vector<std::string> hosts;
-        for (const auto& peer : config_.peers) hosts.push_back(peer.host);
+        if (!config_.isSingleNode())
+            for (const auto& peer : config_.peers) hosts.push_back(peer.host);
         resolverHub_ = std::make_unique<PeerResolverHub>(hosts, resolveFnForTest_);
         resolverHub_->resolveAllNow();
     }
@@ -1754,6 +1756,8 @@ void BrokerNode::buildGateway() {
         // Wire in the TopicRegistry (GB-1). Non-owning pointer; registry outlives
         // the gateway (both destroyed in stop() with registry after gateway).
         gateway_->setTopicRegistry(topicRegistry_.get());
+        // DR-15 fix round 2 (LOW-4): clients' reply hostnames resolve off-thread.
+        if (resolverHub_) gateway_->setHostResolver(resolverHub_->subscribeHostResolver());
         // fsyncgate fail-stop: worker StorageFailure signals (and the gateway's
         // own flushDirtyLogs) land here on the runtime thread → halt.
         gateway_->setStorageFailureHandler([this](const std::string& dir, int err) {
@@ -3000,6 +3004,10 @@ void BrokerNode::stop() {
     // still alive.  Without this clear(), those dtors run in ~BrokerNode which fires
     // after stop() has already torn down the Aeron client → use-after-close on restart.
     perWorkerReplTransports_.clear(); // WorkerReplicationTransports: deregisters per-worker Subscription + ExclusivePubs
+    // DR-15 fix round 2 (MEDIUM-B): a legacy plane's add broker may still hold an
+    // undelivered publication (resolved by the control thread after the worker
+    // stopped) — release it while the node client is alive (before aeron_.reset()).
+    legacyPlaneBrokers_.clear();
     // Per-worker ingress/egress deregister from their client while it is alive
     // (legacy: the node client; shard: the worker's own client).
     workerIngresses_.clear();

@@ -43,7 +43,45 @@ PeerResolverHub::PeerResolverHub(const std::vector<std::string>& hosts, ResolveF
     : table_(managedHosts(hosts)), fn_(fn ? std::move(fn) : ResolveFn(&resolveWithGetaddrinfo)),
       hosts_(table_.size()) {}
 
-PeerResolverHub::~PeerResolverHub() { stop(); }
+PeerResolverHub::~PeerResolverHub() {
+    stop();
+    // Undelivered requests own their host strings.
+    for (auto& p : ports_)
+        (void)p.req->poll([](std::int32_t type, std::int64_t, std::int64_t b) {
+            if (type == rune::consensus::kHostResolveRequest)
+                delete reinterpret_cast<std::string*>(static_cast<std::intptr_t>(b));
+        });
+}
+
+rune::consensus::HostResolvePort PeerResolverHub::subscribeHostResolver() {
+    Port p;
+    p.req  = std::make_unique<rune::consensus::HostResolveRing>();
+    p.resp = std::make_unique<rune::consensus::HostResolveRing>();
+    ports_.push_back(std::move(p));
+    return {ports_.back().req.get(), ports_.back().resp.get()};
+}
+
+int PeerResolverHub::serveHostRequests_() {
+    int work = 0;
+    for (auto& p : ports_) {
+        work += p.req->poll([&](std::int32_t type, std::int64_t a, std::int64_t b) {
+            if (type != rune::consensus::kHostResolveRequest) return;
+            std::unique_ptr<std::string> host(reinterpret_cast<std::string*>(static_cast<std::intptr_t>(b)));
+            std::uint32_t ip = 0;
+            const bool ok = host && fn_(*host, ip);
+            p.outbox.emplace_back(a, ok ? static_cast<std::int64_t>(ip) : -1);
+        }, 16);
+        std::size_t sent = 0;
+        for (; sent < p.outbox.size(); ++sent) {
+            const auto [id, v] = p.outbox[sent];
+            if (!p.resp->offer(v < 0 ? rune::consensus::kHostUnresolved : rune::consensus::kHostResolved, id,
+                               v < 0 ? 0 : v))
+                break;   // full: the rest next pass (order kept)
+        }
+        if (sent > 0) p.outbox.erase(p.outbox.begin(), p.outbox.begin() + static_cast<std::ptrdiff_t>(sent));
+    }
+    return work;
+}
 
 void PeerResolverHub::resolveAllNow() {
     for (std::size_t i = 0; i < hosts_.size(); ++i) (void)probe_(i, 0);
@@ -59,7 +97,7 @@ rune::consensus::PeerResolutionSource PeerResolverHub::subscribe_(bool driver) {
 }
 
 void PeerResolverHub::start() {
-    if (runner_ || table_.size() == 0) return;   // nothing to resolve: no thread
+    if (runner_ || (table_.size() == 0 && ports_.empty())) return;   // nothing to resolve: no thread
     // A cold thread: it parks between probes (never spins a core).
     idle_   = std::make_unique<rune::consensus::BackoffIdleStrategy>(
         1, 1, std::chrono::milliseconds{1}, std::chrono::milliseconds{10});
@@ -86,26 +124,29 @@ int PeerResolverHub::doWork_(int64_t nowNs) {
         if (driverDirty) { s.dirty = true; continue; }   // never ahead of a driver cache
         if (s.dirty || driverResynced) resync_(s);
     }
+    work += serveHostRequests_();
     for (std::size_t i = 0; i < hosts_.size(); ++i) {
         if (nowNs < hosts_[i].nextProbeNs) continue;
         ++work;
-        if (probe_(i, nowNs)) publish_(i);
+        // Fix round 2 (MEDIUM-A): a CONFIRMATION of the same address is posted
+        // too — owners re-add a peer whose add failed for a non-DNS reason.
+        if (probe_(i, nowNs) > 0) publish_(i);
     }
     return work;
 }
 
-bool PeerResolverHub::probe_(std::size_t i, int64_t nowNs) {
+int PeerResolverHub::probe_(std::size_t i, int64_t nowNs) {
     HostState& h = hosts_[i];
     std::uint32_t ip = 0;
     const bool ok = fn_(table_.host(i), ip);
     if (!ok) {
         h.nextProbeNs = nowNs + h.backoffNs;
         h.backoffNs   = std::min(h.backoffNs * 2, kPendingMaxNs);
-        return false;   // keep the last known address (Aeron keeps its destination)
+        return 0;   // keep the last known address (Aeron keeps its destination)
     }
     h.nextProbeNs = nowNs + kRecheckNs;
     h.backoffNs   = kPendingMinNs;
-    if (h.has && h.ipv4 == ip) return false;
+    if (h.has && h.ipv4 == ip) return 1;
     char buf[INET_ADDRSTRLEN] = {};
     in_addr a{};
     a.s_addr = ip;
@@ -113,7 +154,7 @@ bool PeerResolverHub::probe_(std::size_t i, int64_t nowNs) {
     spdlog::info("PeerResolverHub: peer host {} {} {}", table_.host(i), h.has ? "now at" : "resolved to", buf);
     h.has  = true;
     h.ipv4 = ip;
-    return true;
+    return 2;
 }
 
 void PeerResolverHub::publish_(std::size_t i) {

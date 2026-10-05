@@ -66,13 +66,56 @@ public:
         return ::inet_pton(AF_INET, h.c_str(), &a4) == 1 || ::inet_pton(AF_INET6, h.c_str(), &a6) == 1;
     }
 
+    /// `channel` with its `endpoint=` host replaced by `host` (unchanged when it
+    /// has no endpoint).  Cold (allocates).
+    [[nodiscard]] static std::string withEndpointHost(std::string_view channel, std::string_view host) {
+        auto e = channel.find("?endpoint=");
+        if (e == std::string_view::npos) e = channel.find("|endpoint=");
+        if (e == std::string_view::npos) return std::string(channel);
+        const std::size_t hs = e + 10;
+        std::size_t end = channel.find('|', hs);
+        if (end == std::string_view::npos) end = channel.size();
+        const std::string_view hp = channel.substr(hs, end - hs);
+        const auto colon = hp.rfind(':');
+        const std::size_t he = colon == std::string_view::npos ? end : hs + colon;
+        std::string out(channel.substr(0, hs));
+        out += host;
+        out += channel.substr(he);
+        return out;
+    }
+
 private:
     std::vector<std::string> hosts_;
 };
 
 /// One consumer's ring (single consumer thread, the hub thread produces).
 using PeerResolutionRing = ControlRing<4096>;
-inline constexpr std::int32_t kPeerResolvedV4 = 1;   // {a = host index, b = IPv4, network order}
+/// {a = host index, b = IPv4, network order}: a first resolution, an address
+/// change, AND every later confirmation of the same address (each hub re-check,
+/// ~1 s) — so an owner whose add failed for a NON-DNS reason while the host was
+/// already cached (fd exhaustion, a transient driver error) is re-added on the
+/// next confirmation (fix round 2, MEDIUM-A).
+inline constexpr std::int32_t kPeerResolvedV4 = 1;
+
+// ---------------------------------------------------------------------------
+// Ad-hoc host resolution (fix round 2, LOW-4): CLIENT-supplied reply-channel
+// hostnames are not in the peer table; the gateway asks the hub to resolve
+// them off-thread and adds the client's egress publication on the NUMERIC
+// endpoint — no driver conductor ever resolves a client name.
+//   request  {a = request id, b = (intptr) new std::string(host)} — ownership
+//            of the string moves to the hub (it deletes it, also undelivered
+//            ones at its destruction);
+//   response {a = request id, b = IPv4 (network order)} or kHostUnresolved.
+// ---------------------------------------------------------------------------
+using HostResolveRing = ControlRing<4096>;
+inline constexpr std::int32_t kHostResolveRequest = 1;
+inline constexpr std::int32_t kHostResolved       = 2;
+inline constexpr std::int32_t kHostUnresolved     = 3;
+struct HostResolvePort {
+    HostResolveRing* req  = nullptr;   // requester → hub
+    HostResolveRing* resp = nullptr;   // hub → requester
+    [[nodiscard]] bool valid() const noexcept { return req != nullptr && resp != nullptr; }
+};
 
 /// What a consumer is handed by the hub: the shared table + its OWN ring.
 struct PeerResolutionSource {
