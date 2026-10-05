@@ -2069,7 +2069,229 @@ TEST(LogRegression, ReloadSegmentsRepublishesSealedSnapshotRegression) {
     expectSnapshotMatchesSegments(log);
     EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), bases[1]), nullptr);
     for (int64_t i = 8; i < 10; ++i) appendTs(log, i, 100'000 + i);
+    // The vanished segment's offsets are now covered by its predecessor, which
+    // (conservatively — it may be a coalesced merge) takes its timestamp too
+    // (fix round 1 CRITICAL-1); every other survivor keeps its own.
+    for (const auto& si : *log.sealedSegmentSnapshot()) {
+        const int64_t expected = si.baseOffset == bases[0] ? 100'000 + bases[1] : 100'000 + si.baseOffset;
+        EXPECT_EQ(si.largestTimestamp, expected) << "segment base " << si.baseOffset;
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// ===========================================================================
+// 2026-10-05 log-truncate review, fix round 1: retention data-loss paths.
+// ===========================================================================
+namespace {
+std::string segFile(const std::filesystem::path& dir, int64_t base, const char* ext) {
+    std::string s = std::to_string(base);
+    s = std::string(20 - s.size(), '0') + s;
+    return (dir / (s + ext)).string();
+}
+std::vector<uint8_t> readAll(const std::string& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+// What the cleaner does for a coalesced group: ONE rewritten file at the first
+// base holding every member's records; the other members' files removed.
+void mergeSegmentsOnDisk(const std::filesystem::path& dir, const std::vector<int64_t>& group) {
+    std::vector<uint8_t> merged;
+    for (int64_t b : group) {
+        const auto bytes = readAll(segFile(dir, b, ".log"));
+        merged.insert(merged.end(), bytes.begin(), bytes.end());
+    }
+    const std::string out = segFile(dir, group.front(), ".log");
+    {
+        std::ofstream f(out + ".new", std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(merged.data()), static_cast<std::streamsize>(merged.size()));
+    }
+    std::filesystem::rename(out + ".new", out);
+    std::filesystem::remove(segFile(dir, group.front(), ".index"));
+    for (std::size_t i = 1; i < group.size(); ++i) {
+        std::filesystem::remove(segFile(dir, group[i], ".log"));
+        std::filesystem::remove(segFile(dir, group[i], ".index"));
+    }
+}
+} // namespace
+
+// CRITICAL-1: a coalesced compaction merge kept the FRONT segment's stale
+// largestTimestamp (1001) although the merged file holds the later members'
+// records (9000003) — time retention deleted in-window data.
+TEST(LogRegression, MergedGroupTakesMaxTimestampOfMembersRegression) {
+    for (const bool splitAcrossDrains : {false, true}) {
+        auto dir = makeTempDir("rune_log_merge_ts");
+        std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+        Log log(dir.string(), /*rollBytes=*/100);
+        appendTs(log, 0, 1000); appendTs(log, 1, 1001);
+        appendTs(log, 2, 9'000'002); appendTs(log, 3, 9'000'003);
+        appendTs(log, 4, 9'000'004);
+        ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 4}));
+        mergeSegmentsOnDisk(dir, {0, 2});
+        ASSERT_TRUE(log.enqueueCleanedSegment(0));
+        if (splitAcrossDrains) EXPECT_EQ(log.drainCleanerSwaps(), 1);
+        ASSERT_TRUE(log.enqueueCleanedSegment(2));
+        log.drainCleanerSwaps();
+        ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 4}));
+        const auto snap = log.sealedSegmentSnapshot();
+        ASSERT_EQ(snap->size(), 1u);
+        EXPECT_EQ((*snap)[0].endOffset, 4);
+        EXPECT_GE((*snap)[0].largestTimestamp, 9'000'003) << "split=" << splitAcrossDrains;
+        // ...and it stays after later rolls (the cache must keep the merged max).
+        for (int64_t i = 5; i < 9; ++i) appendTs(log, i, 9'000'000 + i);
+        const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), 0);
+        ASSERT_NE(si, nullptr);
+        EXPECT_GE(si->largestTimestamp, 9'000'003) << "split=" << splitAcrossDrains;
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// A plain (non-merge) compaction rewrite keeps the segment's own timestamp.
+TEST(LogRegression, CompactionRewriteKeepsSegmentTimestampRegression) {
+    auto dir = makeTempDir("rune_log_rewrite_ts");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 100'000 + i);
+    mergeSegmentsOnDisk(dir, {2});   // rewrite segment 2 in place
+    ASSERT_TRUE(log.enqueueCleanedSegment(2));
+    EXPECT_EQ(log.drainCleanerSwaps(), 1);
+    for (int64_t i = 7; i < 10; ++i) appendTs(log, i, 100'000 + i);
     for (const auto& si : *log.sealedSegmentSnapshot())
-        EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset) << "segment base " << si.baseOffset;
+        EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset + 1) << "segment base " << si.baseOffset;
+    std::filesystem::remove_all(dir);
+}
+
+// MAJOR-1: a multi-batch append (the follower apply path appends a whole fetch
+// chunk at once) recorded only the FIRST batch's maxTimestamp.
+TEST(LogRegression, MultiBatchAppendTracksMaxOfAllBatchesRegression) {
+    for (int variant = 0; variant < 2; ++variant) {
+        auto dir = makeTempDir("rune_log_multibatch");
+        std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+        Log log(dir.string(), /*rollBytes=*/100);
+        RecordBatchBuilder b0(0, 1000);       b0.append("k", "v", 1000);
+        RecordBatchBuilder b1(1, 9'000'000);  b1.append("k", "v", 9'000'000);
+        std::vector<uint8_t> chunk = b0.build();
+        const auto second = b1.build();
+        chunk.insert(chunk.end(), second.begin(), second.end());
+        if (variant == 0) log.appendNoSync(chunk.data(), chunk.size(), 1);
+        else              log.append(chunk.data(), chunk.size(), 1);
+        appendTs(log, 2, 1002);   // rolls: segment 0 seals
+        const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), 0);
+        ASSERT_NE(si, nullptr);
+        EXPECT_EQ(si->largestTimestamp, 9'000'000) << "variant " << variant;
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// MAJOR-2: a stale retention enqueue naming the (now) ACTIVE segment — e.g.
+// the cleaner acted on a snapshot from before a truncate rebuilt it as active —
+// erased the active segment.
+TEST(LogRegression, RetentionDeleteNeverErasesActiveSegmentRegression) {
+    auto dir = makeTempDir("rune_log_del_active");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    log.truncateTo(3);                                  // segment 2 is active again
+    const int64_t activeBase = log.segmentBaseOffsets().back();
+    ASSERT_EQ(activeBase, 2);
+    // The cleaner renamed the (formerly sealed) file away and enqueued it.
+    std::filesystem::rename(segFile(dir, activeBase, ".log"), segFile(dir, activeBase, ".log.deleted"));
+    ASSERT_TRUE(log.enqueueDeletedSegment(activeBase));
+    EXPECT_EQ(log.drainRetentionDeletes(), 0);
+    EXPECT_EQ(log.segmentBaseOffsets().back(), activeBase);
+    EXPECT_TRUE(std::filesystem::exists(segFile(dir, activeBase, ".log"))) << "the active file must be restored";
+    appendTs(log, 3, 5003);
+    EXPECT_EQ(log.logEndOffset(), 4);
+    EXPECT_FALSE(log.read(3, 1 << 20).empty());
+    std::filesystem::remove_all(dir);
+}
+
+// MAJOR-2: same for the compaction-swap drain — a stale swap for the active
+// segment (file replaced / gone) must never reload or drop it.
+TEST(LogRegression, CleanerSwapNeverTouchesActiveSegmentRegression) {
+    auto dir = makeTempDir("rune_log_swap_active");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    log.truncateTo(3);
+    const int64_t activeBase = log.segmentBaseOffsets().back();
+    std::filesystem::rename(segFile(dir, activeBase, ".log"), segFile(dir, activeBase, ".log.tmpaside"));
+    ASSERT_TRUE(log.enqueueCleanedSegment(activeBase));
+    log.drainCleanerSwaps();
+    std::filesystem::rename(segFile(dir, activeBase, ".log.tmpaside"), segFile(dir, activeBase, ".log"));
+    EXPECT_EQ(log.segmentBaseOffsets().back(), activeBase);
+    appendTs(log, 3, 5003);
+    EXPECT_EQ(log.logEndOffset(), 4);
+    std::filesystem::remove_all(dir);
+}
+
+// LOW-3: the public synchronous reloadSegment (LogCleaner::cleanSegment path)
+// republishes — a segment the cleaner emptied leaves the snapshot.
+TEST(LogRegression, SyncReloadSegmentRepublishesSealedSnapshotRegression) {
+    auto dir = makeTempDir("rune_log_sync_reload");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    std::filesystem::remove(segFile(dir, 2, ".log"));
+    std::filesystem::remove(segFile(dir, 2, ".index"));
+    log.reloadSegment(2);
+    expectSnapshotMatchesSegments(log);
+    EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), 2), nullptr);
+    std::filesystem::remove_all(dir);
+}
+
+// MAJOR-2: queued cleaner work carries the lineage the cleaner saw; a segment
+// rebuilt since (truncate + re-append + re-seal: SEALED again, same base) is a
+// different incarnation — the stale delete / swap is dropped, the delete's
+// rename undone, and nothing live is erased.
+TEST(LogRegression, StaleLineageCleanerWorkIsDroppedRegression) {
+    auto dir = makeTempDir("rune_log_stale_lineage");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    const SegInfo* before = findSeg(*log.sealedSegmentSnapshot(), 2);
+    ASSERT_NE(before, nullptr);
+    const uint64_t staleLineage = before->lineage;
+    ASSERT_NE(staleLineage, Log::kAnyLineage);
+    log.truncateTo(3);
+    for (int64_t i = 3; i < 7; ++i) appendTs(log, i, 9'000'000 + i);   // segment 2 sealed again
+    const SegInfo* now = findSeg(*log.sealedSegmentSnapshot(), 2);
+    ASSERT_NE(now, nullptr);
+    ASSERT_NE(now->lineage, staleLineage);
+    // Stale retention delete: renamed by the cleaner, then dropped + undone.
+    std::filesystem::rename(segFile(dir, 2, ".log"), segFile(dir, 2, ".log.deleted"));
+    ASSERT_TRUE(log.enqueueDeletedSegment(2, staleLineage));
+    EXPECT_EQ(log.drainRetentionDeletes(), 0);
+    EXPECT_TRUE(std::filesystem::exists(segFile(dir, 2, ".log")));
+    EXPECT_FALSE(std::filesystem::exists(segFile(dir, 2, ".log.deleted")));
+    // Stale compaction swap: dropped (the segment object is untouched).
+    LogSegment* seg2 = log.segmentForTest(2);
+    ASSERT_TRUE(log.enqueueCleanedSegment(2, staleLineage));
+    log.drainCleanerSwaps();
+    EXPECT_EQ(log.segmentForTest(2), seg2);
+    EXPECT_EQ(log.staleCleanerOpsDropped(), 2u);
+    {
+        const auto bytes = log.read(3, 1 << 20);
+        ASSERT_FALSE(bytes.empty());
+        EXPECT_EQ(RecordBatchReader(bytes.data(), bytes.size()).baseOffset(), 3);
+    }
+    // The CURRENT lineage still applies.
+    const uint64_t cur = findSeg(*log.sealedSegmentSnapshot(), 2)->lineage;
+    ASSERT_TRUE(log.enqueueDeletedSegment(2, cur));
+    EXPECT_EQ(log.drainRetentionDeletes(), 1);
+    EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), 2), nullptr);
+    std::filesystem::remove_all(dir);
+}
+
+// MAJOR-3: size retention (deleteOldSegments) only deletes segments ENDING at
+// or below the HW — never one holding un-replicated records.
+TEST(LogRegression, DeleteOldSegmentsRespectsHighWatermarkRegression) {
+    auto dir = makeTempDir("rune_log_delold_hw");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 10; ++i) appendTs(log, i, 1000 + i);
+    ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 2, 4, 6, 8}));
+    EXPECT_EQ(log.deleteOldSegments(/*retainBytes=*/0, /*highWatermark=*/5), 2);
+    EXPECT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{4, 6, 8})) << "[4,6) straddles HW 5";
+    expectSnapshotMatchesSegments(log);
     std::filesystem::remove_all(dir);
 }

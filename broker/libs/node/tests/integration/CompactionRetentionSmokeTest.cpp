@@ -1607,14 +1607,20 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 
     rune::node::BrokerNode node{cfg};
     node.start();
-    ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke11: must self-elect";
-    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
-        << "Smoke11: replication bridge must propagate within 2 s";
+    // Condition-driven waits only (fix round 1 LOW-4: the fixed 2 s sleep and the
+    // 3 s leader bound flaked under parallel ctest load).  The bounds are
+    // generous deadlines, not expected durations.
+    ASSERT_TRUE(node.awaitLeader(30s)) << "Smoke11: must self-elect";
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 30s))
+        << "Smoke11: replication bridge must propagate";
     // HW advanced by becomeLeader() on duty-cycle thread (no test-thread replica
     // calls — duty-thread-only invariant; single-node HW == LEO after becomeLeader).
 
-    // Wait for retention to run (retentionCheckMs=1 → fires on first doWork()).
-    std::this_thread::sleep_for(2000ms);
+    // Wait until retention ran (retentionCheckMs=1 → fires on the first cycles):
+    // an old segment's .log is renamed away.  Arm B below re-checks the count
+    // after stop(); Arm A proves the recent segments survived.
+    EXPECT_TRUE(waitFor([&] { return countLogFiles(logDir) < totalSegs; }, 60s))
+        << "Smoke11: time retention never deleted an old segment";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();

@@ -732,7 +732,7 @@ public:
                 // Run size retention when retentionBytes is set (>= 0).
                 const int64_t retBytes = replica->retentionBytes();
                 if (retBytes >= 0) {
-                    const int deleted = log->deleteOldSegments(retBytes);
+                    const int deleted = log->deleteOldSegments(retBytes, replica->highWatermark());
                     work += deleted;
                 }
                 continue; // done for this replica — never compact Delete topics
@@ -750,7 +750,7 @@ public:
                 if (policy == rune::replication::CleanupPolicy::CompactDelete) {
                     const int64_t retBytes = replica->retentionBytes();
                     if (retBytes >= 0) {
-                        work += log->deleteOldSegments(retBytes);
+                        work += log->deleteOldSegments(retBytes, replica->highWatermark());
                     }
                 }
                 continue;
@@ -818,7 +818,7 @@ public:
             if (policy == rune::replication::CleanupPolicy::CompactDelete) {
                 const int64_t retBytes = replica->retentionBytes();
                 if (retBytes >= 0) {
-                    const int deleted = log->deleteOldSegments(retBytes);
+                    const int deleted = log->deleteOldSegments(retBytes, replica->highWatermark());
                     work += deleted;
                 }
             }

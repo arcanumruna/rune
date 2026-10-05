@@ -203,12 +203,24 @@ public:
     uint64_t installGen() const noexcept { return installGen_; }
     void setInstallGen(uint64_t g) noexcept { installGen_ = g; }
     /// Content lineage for the sealed-snapshot timestamp cache (Log::
-    /// publishSealedSnapshot): a cached largestTimestamp is reused only for the
-    /// SAME lineage at the same base.  A fresh install (roll, truncate rebuild,
-    /// re-create) gets a new lineage; a cleaner rewrite / reload of the same
-    /// sealed segment inherits it (compaction never raises the max timestamp).
+    /// publishSealedSnapshot) and the cleaner's stale-work check: a cached
+    /// largestTimestamp is reused, and a queued cleaner swap / retention delete
+    /// is applied, only for the SAME lineage at the same base.  Every install
+    /// (roll, truncate rebuild, re-create, compaction rewrite) gets a fresh
+    /// lineage; only a full reloadSegments() of an unchanged file inherits it.
+    /// A compaction rewrite is NOT "the same content": a coalesced merge holds
+    /// the later members' (newer) records — its timestamp comes from tsFloor().
     uint64_t tsLineage() const noexcept { return tsLineage_; }
     void setTsLineage(uint64_t l) noexcept { tsLineage_ = l; }
+    /// Lower bound for this segment's published largestTimestamp: the max of
+    /// what the segment(s) it replaced / absorbed published (a compaction
+    /// rewrite inherits its predecessor's; a merge member dropped from the map
+    /// folds its own into the segment that now holds its records).
+    int64_t tsFloor() const noexcept { return tsFloor_; }
+    void raiseTsFloor(int64_t ts) noexcept { if (ts > tsFloor_) tsFloor_ = ts; }
+    /// The largestTimestamp the last sealed-snapshot publish gave this segment.
+    int64_t publishedTs() const noexcept { return publishedTs_; }
+    void setPublishedTs(int64_t ts) noexcept { publishedTs_ = ts; }
     /// E1d MEDIUM-2: the owning Log's directory-mutation generation at which
     /// this segment's directory entry was last created / renamed (0 = present
     /// at open: made durable by recovery's directory fsync).  The entry is
@@ -323,6 +335,8 @@ private:
     std::unique_ptr<OffsetIndex> index_;
     uint64_t installGen_ = 0;
     uint64_t tsLineage_ = 0;     ///< see tsLineage()
+    int64_t  tsFloor_ = INT64_MIN;     ///< see tsFloor()
+    int64_t  publishedTs_ = INT64_MIN; ///< see publishedTs()
     uint64_t dirEntryGen_ = 0;   ///< E1d MEDIUM-2: see dirEntryGen()
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
     int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()

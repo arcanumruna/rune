@@ -538,7 +538,13 @@ public:
         // ---------------------------------------------------------------
         bool allEnqueued = true;
         for (int64_t gb : passResult.rewrittenBases) {
-            if (!best.log->enqueueCleanedSegment(gb)) { allEnqueued = false; break; }
+            // MAJOR-2: the lineage of the incarnation the pass read (best.snap,
+            // ascending by base) — a swap for a since-rebuilt segment is dropped.
+            uint64_t lineage = rune::storage::Log::kAnyLineage;
+            const auto sit = std::lower_bound(best.snap->begin(), best.snap->end(), gb,
+                [](const rune::storage::SegInfo& si, int64_t b) { return si.baseOffset < b; });
+            if (sit != best.snap->end() && sit->baseOffset == gb) lineage = sit->lineage;
+            if (!best.log->enqueueCleanedSegment(gb, lineage)) { allEnqueued = false; break; }
         }
         if (!allEnqueued) {
             // Ring full — leave the segment(s) dirty; retry next cycle.  Do not
@@ -650,7 +656,7 @@ private:
             // A segment is deletable if ANY predicate fires for it.
             //
             // Predicate 1 — Time: now - seg.largestTimestamp > retentionMs
-            //   largestTimestamp = 0 → unknown → treat as ancient (deletable).
+            //   largestTimestamp <= 0 → unknown → KEPT (never deleted by time).
             //   Only fires when retentionMs >= 0.
             //
             // Predicate 2 — Size (oldest-first): running total of sealed-segment
@@ -667,7 +673,7 @@ private:
             // For size predicate: compute total sealed bytes first.
             int64_t totalSealedBytes = 0;
             for (const auto& si : *snap) {
-                if (si.baseOffset >= hw) break; // stop at hw boundary
+                if (si.endOffset > hw) break; // MAJOR-3: only segments wholly at/below HW
                 totalSealedBytes += si.sizeBytes;
             }
 
@@ -681,7 +687,10 @@ private:
 
             for (std::size_t i = 0; i < snap->size(); ++i) {
                 const auto& si = (*snap)[i];
-                if (si.baseOffset >= hw) break; // never touch at/above HW
+                // MAJOR-3 (Kafka: HW >= nextSegment.baseOffset): a segment is
+                // deletable only when it ENDS at or below the HW — one straddling
+                // it holds un-replicated / uncommitted records.
+                if (si.endOffset > hw) break;
 
                 // Compute this segment's logical end (next segment's base or hw).
                 const int64_t segEnd = (i + 1 < snap->size())
@@ -776,7 +785,9 @@ private:
                 // enqueueDeletedSegment returns false if the ring is full;
                 // in that case the rename has already happened, so next cycle
                 // we'll retry (find logPath absent → directly record .deleted).
-                log->enqueueDeletedSegment(si.baseOffset);
+                // MAJOR-2: carry the lineage acted on — the append thread drops
+                // (and undoes) the delete if the segment was rebuilt meanwhile.
+                log->enqueueDeletedSegment(si.baseOffset, si.lineage);
                 toDelete.push_back(si.baseOffset);
             }
 

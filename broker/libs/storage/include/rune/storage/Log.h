@@ -371,7 +371,10 @@ public:
     };
     [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;
-    int deleteOldSegments(int64_t retainBytes);
+    /// Size retention: delete the oldest sealed segments until the log fits in
+    /// retainBytes — only segments that END at or below `highWatermark` (Kafka:
+    /// HW >= nextSegment.baseOffset), never the active one.
+    int deleteOldSegments(int64_t retainBytes, int64_t highWatermark = INT64_MAX);
     /// Directory that contains this log's segment files.
     const std::string& dir() const noexcept { return dir_; }
     [[nodiscard]] bool isDiskBacked() const noexcept { return true; }
@@ -420,7 +423,12 @@ public:
     /// and the append thread's reloadSegment().
     /// Returns false (drops) only if the ring is momentarily full; the cleaner
     /// re-enqueues the same base next cycle (idempotent — reloadSegment is too).
-    bool enqueueCleanedSegment(int64_t base) noexcept;
+    /// `lineage` = the SegInfo::lineage the cleaner acted on (kAnyLineage skips
+    /// the check — tests / legacy callers).  The swap is dropped when the base
+    /// is now the ACTIVE segment or carries a different lineage (the cleaner
+    /// acted on a stale snapshot: a truncate rebuilt the segment meanwhile).
+    static constexpr uint64_t kAnyLineage = 0;
+    bool enqueueCleanedSegment(int64_t base, uint64_t lineage = kAnyLineage) noexcept;
 
     /// CP-6: Drain pending cleaner swaps on the single-writer append/duty-cycle
     /// thread.  Called once per duty cycle from NodeRuntimeAgent::doWork.
@@ -461,7 +469,13 @@ public:
     /// Returns false (drops) if the ring is momentarily full; cleaner retries
     /// next cycle (idempotent — drainRetentionDeletes is a no-op for an unknown
     /// base).
-    bool enqueueDeletedSegment(int64_t base) noexcept;
+    /// `lineage`: as enqueueCleanedSegment — a stale delete (active segment or a
+    /// different lineage) is dropped and the cleaner's .log→.deleted rename is
+    /// undone, never erasing live data.
+    bool enqueueDeletedSegment(int64_t base, uint64_t lineage = kAnyLineage) noexcept;
+    /// Cleaner work dropped because it named the active segment or a stale
+    /// lineage (MAJOR-2 observability).  Owner thread.
+    [[nodiscard]] uint64_t staleCleanerOpsDropped() const noexcept { return staleCleanerOps_; }
 
     /// CP-9 SPSC consumer (append thread): drain retention-delete enqueues.
     /// For each pending base, erases the segment from segments_ and updates the
@@ -719,7 +733,8 @@ private:
     // Capacity is a power of two so index masking is a bitwise AND.
     static constexpr std::size_t kSwapRingCapacity = 1024; // power of two
     static constexpr std::size_t kSwapRingMask     = kSwapRingCapacity - 1;
-    std::array<int64_t, kSwapRingCapacity> swapRing_{};
+    struct SegRef { int64_t base = 0; uint64_t lineage = kAnyLineage; };
+    std::array<SegRef, kSwapRingCapacity> swapRing_{};
     alignas(64) std::atomic<std::size_t>   swapHead_{0}; // consumer index
     alignas(64) std::atomic<std::size_t>   swapTail_{0}; // producer index
 
@@ -729,7 +744,12 @@ private:
     // Consumer = append/duty-cycle thread (drainRetentionDeletes → segments_.erase).
     static constexpr std::size_t kDeleteRingCapacity = 1024;
     static constexpr std::size_t kDeleteRingMask     = kDeleteRingCapacity - 1;
-    std::array<int64_t, kDeleteRingCapacity> deleteRing_{};
+    std::array<SegRef, kDeleteRingCapacity> deleteRing_{};
+    uint64_t staleCleanerOps_ = 0;   ///< see staleCleanerOpsDropped() (owner thread)
+    /// MAJOR-2: true when queued cleaner work for `base`/`lineage` may act — the
+    /// segment exists, is NOT the active one, and (unless kAnyLineage) is the
+    /// same incarnation the cleaner saw.  Owner thread.
+    bool cleanerOpApplies_(SegMap::iterator it, uint64_t lineage) noexcept;
     alignas(64) std::atomic<std::size_t>    deleteHead_{0}; // consumer index
     alignas(64) std::atomic<std::size_t>    deleteTail_{0}; // producer index
 

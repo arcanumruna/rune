@@ -42,38 +42,50 @@ inline std::string indexPathForLog(const std::string& logPath) {
 // Default index sampling interval — MUST match LogSegment's default
 // indexIntervalBytes so index right-sizing matches the actual sampling rate.
 constexpr int32_t kDefaultIndexIntervalBytes = 4096;
-// Largest epoch-ms batch maxTimestamp over the CRC-valid batch prefix of
-// [data, data+len) — the same running max append() keeps (starts at 0).  Stops
-// at the first torn / corrupt batch.  Cold paths only (recover / truncate /
-// reload), never the append path.
-int64_t maxBatchTimestamp(const uint8_t* data, std::size_t len) {
+// Largest epoch-ms batch maxTimestamp across EVERY batch header in
+// [data, data+len) — an append buffer may hold many batches (the follower
+// apply path appends a whole fetch chunk at once).  Header-only walk: no
+// allocation, no CRC (the caller already validated / is writing the bytes);
+// a single-batch append is exactly one iteration.  Starts at 0 like the
+// running max it feeds.
+inline int64_t maxTimestampOfBatches(const uint8_t* data, std::size_t len) noexcept {
     int64_t maxTs = 0;
     std::size_t pos = 0;
     while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= len) {
         rune::protocol::RecordBatchReader r(data + pos, len - pos);
-        const int32_t total = r.totalLength();
-        if (total <= 0 || pos + static_cast<std::size_t>(total) > len) break;
-        if (!r.ensureValid()) break;
         const int64_t ts = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
         if (ts > maxTs) maxTs = ts;
+        const int32_t total = r.totalLength();
+        if (total < rune::protocol::batch::kRecordBatchOverhead) break;
         pos += static_cast<std::size_t>(total);
     }
     return maxTs;
 }
-// maxBatchTimestamp over a segment file; false when it cannot be read.
+// Largest epoch-ms batch maxTimestamp of a segment file: a streaming walk over
+// the batch HEADERS only (seek past each payload) — O(1) memory, no whole-file
+// buffer.  Cold paths only (recover / reloadSegments), after recovery already
+// CRC-validated and cut each segment's torn tail.  false = unreadable.
 bool fileMaxBatchTimestamp(const std::string& path, int64_t& out) {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
     f.seekg(0, std::ios::end);
-    const std::streamsize fileSize = f.tellg();
+    const std::streamoff fileSize = f.tellg();
     if (fileSize < 0) return false;
-    out = 0;
-    if (fileSize == 0) return true;
-    f.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buf(static_cast<std::size_t>(fileSize));
-    f.read(reinterpret_cast<char*>(buf.data()), fileSize);
-    if (!f) return false;
-    out = maxBatchTimestamp(buf.data(), buf.size());
+    constexpr std::size_t kHdr = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+    uint8_t hdr[kHdr];
+    int64_t maxTs = 0;
+    std::streamoff pos = 0;
+    while (pos + static_cast<std::streamoff>(kHdr) <= fileSize) {
+        f.seekg(pos, std::ios::beg);
+        if (!f.read(reinterpret_cast<char*>(hdr), static_cast<std::streamsize>(kHdr))) break;
+        rune::protocol::RecordBatchReader r(hdr, kHdr);
+        const int32_t total = r.totalLength();
+        if (total < static_cast<int32_t>(kHdr) || pos + total > fileSize) break;
+        const int64_t ts = toEpochMs(r.maxTimestamp());
+        if (ts > maxTs) maxTs = ts;
+        pos += total;
+    }
+    out = maxTs;
     return true;
 }
 } // anonymous namespace
@@ -336,6 +348,10 @@ void Log::publishSealedSnapshot() {
                     }
                 }
             }
+            // CRITICAL-1: never below what the segment(s) this one replaced or
+            // absorbed published (a compaction rewrite / coalesced merge).
+            if (it->second->tsFloor() > largestTs) largestTs = it->second->tsFloor();
+            it->second->setPublishedTs(largestTs);
             snap->push_back({base, bytes, largestTs, endOff, compactionAllowedThrough(endOff), lineage});
         }
     }
@@ -593,8 +609,8 @@ int64_t Log::append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // Update incremental largestTimestamp AFTER the write (and after any roll)
     // so this batch's maxTimestamp is attributed to the segment it was written to.
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-        rune::protocol::RecordBatchReader r(data, len);
-        int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
+        // MAJOR-1 (review fix round 1): EVERY batch of a multi-batch append.
+        const int64_t batchMaxTs = maxTimestampOfBatches(data, len);
         if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
     }
     return logEndOffset_;
@@ -613,8 +629,8 @@ int64_t Log::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffs
     maybeRoll();
     logEndOffset_ = activeSegment().appendNoSync(data, len, lastOffset);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-        rune::protocol::RecordBatchReader r(data, len);
-        int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
+        // MAJOR-1 (review fix round 1): EVERY batch of a multi-batch append.
+        const int64_t batchMaxTs = maxTimestampOfBatches(data, len);
         if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
     }
     return logEndOffset_;
@@ -635,8 +651,8 @@ int64_t Log::appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
     logEndOffset_ = activeSegment().appendNoSyncRestamp(batch, len, base, lastOffset,
                                                           leaderEpochStamp_);
     if (len >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-        rune::protocol::RecordBatchReader r(batch, len);
-        int64_t batchMaxTs = toEpochMs(r.maxTimestamp());   // ns- or ms-stamped -> epoch ms
+        // MAJOR-1 (review fix round 1): EVERY batch of a multi-batch append.
+        const int64_t batchMaxTs = maxTimestampOfBatches(batch, len);
         if (batchMaxTs > activeSegmentMaxTs_) activeSegmentMaxTs_ = batchMaxTs;
     }
     return logEndOffset_;
@@ -1339,6 +1355,9 @@ void Log::truncateTo(int64_t truncateOffset) {
     // that lands inside a multi-record batch drops that entire batch (same as Kafka).
     std::size_t cutPos  = 0;
     std::size_t validEnd = 0;
+    // Log-snapshot review MAJOR-1: the active segment's running max is the
+    // KEPT prefix's — never the erased segments' / dropped batches' maximum.
+    int64_t keptMaxTs = 0;
     bool found = false;
     std::size_t pos = 0;
     while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
@@ -1362,6 +1381,7 @@ void Log::truncateTo(int64_t truncateOffset) {
             break;
         }
         // This batch is fully before the truncation boundary.
+        if (const int64_t ts = toEpochMs(r.maxTimestamp()); ts > keptMaxTs) keptMaxTs = ts;
         validEnd = pos + static_cast<std::size_t>(total);
         pos = validEnd;
     }
@@ -1370,9 +1390,6 @@ void Log::truncateTo(int64_t truncateOffset) {
         // All existing batches are fully below the boundary: keep them all.
         cutPos = validEnd;
     }
-    // Log-snapshot review MAJOR-1: the active segment's running max is the
-    // KEPT prefix's — never the erased segments' / dropped batches' maximum.
-    const int64_t keptMaxTs = maxBatchTimestamp(buf.data(), cutPos);
 
     // Truncate the file at cutPos.
     std::filesystem::resize_file(lpath, static_cast<std::uintmax_t>(cutPos));
@@ -1482,11 +1499,25 @@ void Log::reloadSegments() {
         // carries a fresh Log-wide generation — install_ is bypassed here, so
         // stamp it now (a later throw only skips numbers; never reused).
         newSegments[b]->setInstallGen(++segInstallGen_);
-        // Same file at the same base = same content lineage (a cleaner rewrite
-        // never raises its max timestamp); a new base gets a fresh one.
+        // CRITICAL-1: every reloaded object is a NEW incarnation (the file may
+        // be a compaction rewrite / coalesced merge) — fresh lineage; its
+        // timestamp starts from what the object it replaces published.
+        newSegments[b]->setTsLineage(newSegments[b]->installGen());
         auto old = segments_.find(b);
-        newSegments[b]->setTsLineage(old != segments_.end() && old->second
-                                         ? old->second->tsLineage() : newSegments[b]->installGen());
+        if (old != segments_.end() && old->second) {
+            newSegments[b]->raiseTsFloor(old->second->publishedTs());
+            newSegments[b]->raiseTsFloor(old->second->tsFloor());
+        }
+    }
+    // A base whose file vanished (merged into / emptied by the cleaner) folds
+    // its timestamp into the segment that now covers its offsets.
+    for (auto& [b, seg] : segments_) {
+        if (!seg || newSegments.count(b) != 0) continue;
+        auto covering = newSegments.upper_bound(b);
+        if (covering == newSegments.begin()) continue;
+        --covering;
+        covering->second->raiseTsFloor(seg->publishedTs());
+        covering->second->raiseTsFloor(seg->tsFloor());
     }
     // Recover BEFORE installing — extends the same strong guarantee to the
     // whole reconstruction, not just segment construction: a throwing
@@ -1552,6 +1583,9 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
     // LEO (the active segment, which owns the LEO, is never compacted).
     auto it = segments_.find(baseOffset);
     if (it == segments_.end()) return; // unknown segment — nothing to do
+    // MAJOR-2: the ACTIVE segment is never reloaded or dropped (it owns the LEO;
+    // a request naming it is stale — the cleaner acted on an old snapshot).
+    if (std::next(it) == segments_.end()) { ++staleCleanerOps_; return; }
 
     // Check the CANONICAL <base>.log path, NOT it->second->logPath().  The cleaner
     // thread always reads/writes/deletes the canonical <base>.log; a segment that
@@ -1562,7 +1596,15 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
     // (present under <base>.log) and resurfaces on the next full reloadSegments().
     const std::string logPath = logPathForBase(baseOffset);
     if (!std::filesystem::exists(logPath)) {
-        // Cleaner emptied + deleted this segment; drop it from the map.
+        // Cleaner emptied + deleted this segment (or merged it into its
+        // predecessor); drop it from the map.  CRITICAL-1: its records may now
+        // live in the predecessor (a coalesced merge) — fold its timestamp in
+        // there so the merged segment never reads older than its newest member.
+        if (it != segments_.begin()) {
+            LogSegment& pred = *std::prev(it)->second;
+            pred.raiseTsFloor(it->second->publishedTs());
+            pred.raiseTsFloor(it->second->tsFloor());
+        }
         erase_(it);
         return;
     }
@@ -1571,20 +1613,26 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
     // recover() it so its in-memory index reflects the rewritten bytes.
     const bool    wasDurable = it->second->fullyDurable();
     const int64_t oldDurable = it->second->durableNext();
-    const uint64_t lineage   = it->second->tsLineage();   // same content, compacted
+    // CRITICAL-1: a rewrite is a NEW incarnation (fresh lineage from install_);
+    // it starts from what the replaced object published (compaction never
+    // makes a segment newer; a merge adds its members via raiseTsFloor).
+    const int64_t floorTs = std::max(it->second->publishedTs(), it->second->tsFloor());
     install_(baseOffset, std::make_unique<LogSegment>(dir_, baseOffset, kDefaultIndexIntervalBytes, indexMaxBytes_));
     LogSegment& fresh = *segments_[baseOffset];
-    fresh.setTsLineage(lineage);
+    fresh.raiseTsFloor(floorTs);
     fresh.recover();
     // E1d: the cleaner fsyncs a rewritten segment before its rename.
     fresh.setDurableNext(wasDurable ? fresh.nextOffset() : std::min(oldDurable, fresh.nextOffset()));
 }
 
-int Log::deleteOldSegments(int64_t retainBytes) {
+int Log::deleteOldSegments(int64_t retainBytes, int64_t highWatermark) {
     int deleted = 0;
     int64_t total = totalBytes();   // review LOW-2: one O(n) sum, then a running total
     while (segments_.size() > 1 && total > retainBytes) {
         auto it = segments_.begin();
+        // MAJOR-3 (Kafka: HW >= nextSegment.baseOffset): never delete a segment
+        // holding records above the HW (not yet replicated / committed).
+        if (std::next(it)->first > highWatermark) break;
         std::string base = it->second->logPath();
         std::string idx = indexPathForLog(base);
         total -= it->second->sizeBytes();
@@ -1599,7 +1647,19 @@ int Log::deleteOldSegments(int64_t retainBytes) {
     return deleted;
 }
 
-bool Log::enqueueCleanedSegment(int64_t base) noexcept {
+bool Log::cleanerOpApplies_(SegMap::iterator it, uint64_t lineage) noexcept {
+    const bool active = std::next(it) == segments_.end();
+    if (active || (lineage != kAnyLineage && it->second->tsLineage() != lineage)) {
+        ++staleCleanerOps_;
+        spdlog::warn("Log {}: dropping stale cleaner work for segment {} ({}) — the cleaner acted "
+                     "on an outdated snapshot", dir_, it->first, active ? "now the active segment"
+                                                                         : "rebuilt since (lineage changed)");
+        return false;
+    }
+    return true;
+}
+
+bool Log::enqueueCleanedSegment(int64_t base, uint64_t lineage) noexcept {
     // LOCK-FREE SPSC producer (single cleaner thread).  No mutex on any path.
     // Uses FREE-RUNNING (unmasked) monotonic counters: head_/tail_ only ever
     // increase; the index into swapRing_ is (counter & kSwapRingMask).  Comparing
@@ -1616,7 +1676,7 @@ bool Log::enqueueCleanedSegment(int64_t base) noexcept {
         // next cycle; reloadSegment is idempotent so a delayed reload is safe.
         return false;
     }
-    swapRing_[tail & kSwapRingMask] = base;
+    swapRing_[tail & kSwapRingMask] = SegRef{base, lineage};
     // Release-store publishes the slot AND the cleaner's prior on-disk rename to
     // the consumer's acquire-load of tail_ in drainCleanerSwaps() — the barrier
     // between the cleaner's file rename and the append thread's reloadSegment().
@@ -1633,7 +1693,11 @@ int Log::drainCleanerSwaps() {
     const std::size_t head = swapHead_.load(std::memory_order_relaxed);
     const std::size_t tail = swapTail_.load(std::memory_order_acquire);
     for (std::size_t i = head; i != tail; ++i) {
-        reloadSegmentNoPublish_(swapRing_[i & kSwapRingMask]);
+        const SegRef ref = swapRing_[i & kSwapRingMask];
+        auto it = segments_.find(ref.base);
+        if (it == segments_.end()) continue;               // already gone: idempotent
+        if (!cleanerOpApplies_(it, ref.lineage)) continue;  // MAJOR-2: stale swap
+        reloadSegmentNoPublish_(ref.base);
     }
     const int count = static_cast<int>(tail - head);
     if (count > 0) {
@@ -1649,7 +1713,7 @@ int Log::drainCleanerSwaps() {
 // ---------------------------------------------------------------------------
 // CP-9: Retention async-delete — SPSC ring for deletion enqueues.
 // ---------------------------------------------------------------------------
-bool Log::enqueueDeletedSegment(int64_t base) noexcept {
+bool Log::enqueueDeletedSegment(int64_t base, uint64_t lineage) noexcept {
     // LOCK-FREE SPSC producer (cleaner thread only).
     // Mirror of enqueueCleanedSegment but for the delete ring.
     const std::size_t tail = deleteTail_.load(std::memory_order_relaxed);
@@ -1658,7 +1722,7 @@ bool Log::enqueueDeletedSegment(int64_t base) noexcept {
         // Ring full — caller retries next cycle.
         return false;
     }
-    deleteRing_[tail & kDeleteRingMask] = base;
+    deleteRing_[tail & kDeleteRingMask] = SegRef{base, lineage};
     // Release-store: publishes the base AND the prior .log→.deleted file rename
     // to the consumer's acquire-load in drainRetentionDeletes.
     deleteTail_.store(tail + 1, std::memory_order_release);
@@ -1673,8 +1737,21 @@ int Log::drainRetentionDeletes() {
     const std::size_t tail = deleteTail_.load(std::memory_order_acquire);
     int count = 0;
     for (std::size_t i = head; i != tail; ++i) {
-        const int64_t base = deleteRing_[i & kDeleteRingMask];
+        const SegRef ref = deleteRing_[i & kDeleteRingMask];
+        const int64_t base = ref.base;
         auto it = segments_.find(base);
+        if (it != segments_.end() && !cleanerOpApplies_(it, ref.lineage)) {
+            // MAJOR-2: a stale delete (the cleaner acted on a snapshot from
+            // before a truncate rebuilt this segment / made it active).  Undo
+            // the cleaner's .log→.deleted rename so the live segment keeps its
+            // file (the deferred physical removal then finds no .deleted file
+            // and leaves the index alone).
+            const std::string logPath = logPathForBase(base);
+            std::error_code ec;
+            if (!std::filesystem::exists(logPath, ec) && std::filesystem::exists(logPath + ".deleted", ec))
+                std::filesystem::rename(logPath + ".deleted", logPath, ec);
+            continue;
+        }
         if (it != segments_.end()) {
             // Erase the in-memory segment (closes the file descriptor).
             // The .log file is already renamed to .deleted on disk; no file I/O here.
@@ -1709,8 +1786,14 @@ void Log::physicallyRemoveExpiredDeletedFiles(int64_t nowMs, int64_t fileDeleteD
     while (it != pendingPhysicalDeletes_.end()) {
         const int64_t age = nowMs - it->second;
         if (age >= fileDeleteDelayMs) {
-            // Delay elapsed: physically remove the .deleted file.
-            std::filesystem::remove(it->first);
+            // Delay elapsed: physically remove the .deleted file.  MAJOR-2: the
+            // index goes only with it — a stale delete the append thread undid
+            // (renamed back to .log) has no .deleted file and keeps its index.
+            std::error_code rmEc;
+            if (!std::filesystem::remove(it->first, rmEc)) {
+                it = pendingPhysicalDeletes_.erase(it);
+                continue;
+            }
             // Also remove the .index companion.
             // Path: <stem>.log.deleted → strip ".deleted" → <stem>.log → strip ".log" → <stem>.index
             const std::string& deletedPath = it->first;
