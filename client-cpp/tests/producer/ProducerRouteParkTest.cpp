@@ -431,3 +431,61 @@ TEST(ProducerRoutePark, RefusedRedirectReofferGoesOutOnALaterPassRegression) {
     impl.onProduceResponse(w.frames[1].corrId, 100, 0);
     EXPECT_FALSE(impl.hasInFlight());
 }
+
+// Review MEDIUM-1: while a refused redirect re-offer is queued, a YOUNGER
+// batch's Redirect must not overtake it — it joins the per-pass re-offer, which
+// sends oldest first.
+TEST(ProducerRoutePark, YoungerRedirectNeverOvertakesAQueuedRefusedOneRegression) {
+    ProducerConfig cfg = ackedCfg();
+    cfg.produceTimeoutMs  = 30'000;
+    cfg.deliveryTimeoutMs = 30'000;
+    ProducerImpl impl(cfg);
+    Wire w;
+    const auto sink = w.fn();
+    const std::vector<uint8_t> v(8, 1);
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+        pump(impl, sink);
+    }
+    ASSERT_EQ(w.frames.size(), 2u);
+    const Frame a = w.frames[0], b = w.frames[1];
+
+    Wire refusing;
+    refusing.refuse = {0};
+    auto refuseFn = refusing.fn();
+    (void)impl.retryRedirectedProduce(a.corrId, refuseFn);   // A refused: queued
+    Wire direct;
+    auto directFn = direct.fn();
+    (void)impl.retryRedirectedProduce(b.corrId, directFn);   // B: must NOT go out ahead of A
+    EXPECT_TRUE(direct.frames.empty()) << "a younger redirected batch overtook the queued older one";
+
+    pump(impl, sink);
+    ASSERT_GE(w.frames.size(), 4u);
+    EXPECT_EQ(batchcorr::base(w.frames[2].corrId), batchcorr::base(a.corrId));
+    EXPECT_EQ(batchcorr::base(w.frames[3].corrId), batchcorr::base(b.corrId));
+    EXPECT_NE(batchcorr::attempt(w.frames[2].corrId), batchcorr::attempt(a.corrId)) << "a new attempt";
+}
+
+// Review MEDIUM-2 / LOW-3: the single-node resend-after-reconnect stops at the
+// first refused frame; the rest follow it in order on a later pass.
+TEST(ProducerRoutePark, ResendAllRedirectedStopsAtTheFirstRefusalRegression) {
+    ProducerConfig cfg = ackedCfg();
+    cfg.produceTimeoutMs  = 30'000;
+    cfg.deliveryTimeoutMs = 30'000;
+    ProducerImpl impl(cfg);
+    Wire w;
+    const auto sink = w.fn();
+    sendThree(impl, w, sink);
+    const std::vector<Frame> first = w.frames;
+
+    Wire refusing;
+    refusing.refuse = {0};   // the oldest is refused, the younger would be accepted
+    auto refuseFn = refusing.fn();
+    EXPECT_EQ(impl.resendAllRedirected(/*newSessionId=*/77, refuseFn), 0);
+    EXPECT_TRUE(refusing.frames.empty()) << "a younger frame went out ahead of the refused oldest";
+
+    pump(impl, sink);
+    ASSERT_GE(w.frames.size(), 6u);
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(batchcorr::base(w.frames[3 + i].corrId), batchcorr::base(first[i].corrId));
+}

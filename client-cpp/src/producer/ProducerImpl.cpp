@@ -2765,6 +2765,14 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
     }
     ++b->redirectCount;
     ++ps.laneGen;  // NEW-4(b): the redirect target is another lane
+    if (ps.routeResend) {
+        // Review MEDIUM-1: an older batch's re-offer is queued — join it (the
+        // per-pass re-offer sends oldest first); never overtake it.
+        if (ps.ingressStreamId != 0) b->ingressStreamId = ps.ingressStreamId;
+        b->routeResendPending = true;
+        markDirty_(ps);
+        return false;
+    }
     if (offerAttempt_(ps, *b, lastNowNs_, sendFn, 4)) return true;
     // DR-2 (2026-10-05): refused (the leader's publication is still connecting —
     // its session may already be Connected, so no connect event follows): the
@@ -2780,6 +2788,7 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
     for (auto& up : partitions_) {
         PartitionState& ps = *up;
         ++ps.laneGen;  // NEW-4(b): the retargeted transport is another lane
+        bool refused = ps.routeResend;  // review MEDIUM-2: behind a queued / refused re-offer, in order
         ps.inflight.forEachLive([&](InFlightBatch& b) {
             if (b.redirectCount >= kMaxRedirects) {
                 failBatch_(ps, b, OpStatus::DeliveryFailed);  // redirect budget exhausted
@@ -2787,13 +2796,17 @@ int ProducerImpl::resendAllRedirected(int64_t newSessionId, SendFn& sendFn)
             }
             restampSessionId(b.wireFrame, newSessionId);
             ++b.redirectCount;
-            if (offerAttempt_(ps, b, lastNowNs_, sendFn, 4)) {
+            if (!refused && offerAttempt_(ps, b, lastNowNs_, sendFn, 4)) {
                 ++resent;
-            } else {  // DR-2: refused — the per-pass route re-offer drives it (order kept)
-                b.routeResendPending = true;
-                ps.routeResend = true;
-                markDirty_(ps);
+                return;
             }
+            // DR-2: refused (or behind a refused one) — the per-pass route re-offer
+            // drives it, oldest first (review LOW-1: on the partition's current stream).
+            refused = true;
+            if (ps.ingressStreamId != 0) b.ingressStreamId = ps.ingressStreamId;
+            b.routeResendPending = true;
+            ps.routeResend = true;
+            markDirty_(ps);
         });
     }
     return resent;
