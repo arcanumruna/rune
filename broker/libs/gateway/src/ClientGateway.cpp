@@ -4207,7 +4207,10 @@ void ClientGateway::drainWorkerReturns_()
 {
     using namespace rune::protocol::batch;
 
-    workerPool_->drainAllReturns([this](rune::node::WorkerReturn ret) {
+    // F5: zero-copy — a PushReadResult chunk is a view of the worker's return
+    // ring slot (valid inside this callback; handleWorkerReturn_ finishes with
+    // it before returning — never stored).
+    workerPool_->drainAllReturnsView([this](rune::node::WorkerReturn ret) {
         handleWorkerReturn_(std::move(ret));
     });
 }
@@ -4225,7 +4228,8 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         // StorageFailure (fsyncgate fail-stop) — halt the broker.
         // ===================================================================
         if (ret.type == rune::node::WorkerReturn::Type::StorageFailure) [[unlikely]] {
-            raiseStorageFailure_(std::string(ret.chunk.begin(), ret.chunk.end()), ret.errorCode);
+            raiseStorageFailure_(std::string(reinterpret_cast<const char*>(ret.chunkBytes().data()), ret.chunkBytes().size()),
+                                ret.errorCode);
             return;
         }
 
@@ -4377,7 +4381,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // re-seeded meanwhile) carries nothing to adopt.
             const bool current = sub.nextOffset == sub.issuedNextOffset;
 
-            if (ret.chunk.empty()) {
+            if (ret.chunkBytes().empty()) {
                 // F15 addendum R-1: the worker may have consumed batches without
                 // returning any (a trailing marker, an aborted tail stripped on
                 // the worker) — adopt its cursor, else the partition is re-read
@@ -4397,7 +4401,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
 
             // Iterate whole record batches in the chunk — mirrors the inline
             // pushSubscriptions() loop exactly.
-            const std::vector<uint8_t>& chunk = ret.chunk;
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
             std::size_t chunkPos  = 0;
             const std::size_t chunkSize = chunk.size();
             int batchesPushed = 0;

@@ -1083,6 +1083,23 @@ public:
 
     template <typename Fn, typename TxnFn>
     std::size_t drainReturn(Fn&& fn, TxnFn&& txnFn) {
+        return drainReturnImpl_<false>(std::forward<Fn>(fn), std::forward<TxnFn>(txnFn));
+    }
+    /// F5: the zero-copy drain — a PushReadResult's chunk is handed to `fn` as
+    /// WorkerReturn::chunkView (a view of the ring slot, valid ONLY inside the
+    /// callback; `chunk` stays empty).  For consumers that finish with the
+    /// bytes before returning (the gateway encodes Records from them) — no
+    /// per-return heap allocation, no copy.
+    template <typename Fn>
+    std::size_t drainReturnView(Fn&& fn) {
+        return drainReturnImpl_<true>(std::forward<Fn>(fn), [](const TxnReturn&) {
+            throw std::logic_error("Worker::drainReturn: a TxnReturn reached a consumer without a TxnReturn handler");
+        });
+    }
+
+private:
+    template <bool kView, typename Fn, typename TxnFn>
+    std::size_t drainReturnImpl_(Fn&& fn, TxnFn&& txnFn) {
         int drained = ret_.drain(
             [&fn, &txnFn](int32_t /*typeId*/,
                           aeron::concurrent::AtomicBuffer& buf,
@@ -1141,12 +1158,14 @@ public:
                 ret.targetReplicaId      = dec.targetReplicaId();
                 ret.incarnation          = dec.incarnation();
 
-                // Tail: PushReadResult chunk — copy from the ring view (1 copy) so
-                // fn can access it safely after the callback returns.
+                // Tail: the chunk.  Copy mode: copied from the ring view (1 copy)
+                // so fn can keep it after the callback returns.  View mode (F5):
+                // handed over as a view of the slot (valid inside fn only).
                 const std::uint32_t chunkLen = dec.chunkLength();
                 if (chunkLen > 0) {
                     const uint8_t* c = reinterpret_cast<const uint8_t*>(dec.chunk());
-                    ret.chunk.assign(c, c + chunkLen);
+                    if constexpr (kView) ret.chunkView = std::span<const uint8_t>(c, chunkLen);
+                    else                 ret.chunk.assign(c, c + chunkLen);
                 }
 
                 fn(std::move(ret));
@@ -1154,6 +1173,8 @@ public:
             returnDrainLimit_);   // configurable (RUNE_WORKER_RETURN_DRAIN_LIMIT); was 16
         return static_cast<std::size_t>(drained < 0 ? 0 : drained);
     }
+
+public:
 
 
     // -----------------------------------------------------------------------
@@ -1335,6 +1356,7 @@ public:
         // Task 13 fix round 1 (C1a): session lifecycle first, in full, every
         // pass and every mode — never behind data ops or any backlog.
         work += drainSessionOps_();
+        work += beginPushPass_();   // F5: push budget + last pass's deferred reads first
         if (shardMode_) return work + doWorkShard_(nowNs);
 
         // Step E3: reap async-durability completions from the IoBackend FIRST so
@@ -2428,7 +2450,15 @@ private:
         if (subs_.empty()) return 0;
 
         int work = 0;
-        for (auto& s : subs_) {
+        // F5: bounded per pass (kPushPassBudgetBytes, shared with PushRead
+        // answers) and fair — the walk starts at the subscription the budget
+        // ran out on last pass.
+        const std::size_t nSubs = subs_.size();
+        if (pushRotor_ >= nSubs) pushRotor_ = 0;
+        for (std::size_t k = 0; k < nSubs; ++k) {
+            const std::size_t si = (pushRotor_ + k) % nSubs;
+            auto& s = subs_[si];
+            if (pushBudgetLeft_ == 0) { pushRotor_ = si; break; }
             if (!s.logPtr || !s.active) continue;   // parked: partition moved away
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
@@ -2460,12 +2490,10 @@ private:
             }
             if (s.nextOffset >= bound) continue;
 
-            rune::storage::LogReadView view;
-            try {
-                view = s.logPtr->readView(s.nextOffset, kPushMaxChunkBytes);
-            } catch (...) {
-                continue;  // transient read error; retry next cycle
-            }
+            const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
+            // noexcept (F3): a failed lazy map is an empty view (retry next pass).
+            const rune::storage::LogReadView view = s.logPtr->readView(
+                s.nextOffset, static_cast<int32_t>(std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_)));
             if (view.empty()) continue;
 
             std::size_t pos = 0;
@@ -2490,6 +2518,13 @@ private:
                     lengthField |= (static_cast<uint32_t>(bp[kLengthOffset + i]) << (i * 8));
                 const std::size_t batchSize = 12u + static_cast<std::size_t>(lengthField);
                 if (pos + batchSize > view.len) break;  // incomplete batch at end
+                // F5: never past this pass's budget, except the one batch a pass
+                // that pushed nothing yet must take (progress).
+                if (batchSize > pushBudgetLeft_ && !(freshPass && pushed == 0)) {
+                    pushRotor_ = si;
+                    pushBudgetLeft_ = 0;
+                    break;
+                }
 
                 int32_t recordCount = 0;
                 for (int i = 0; i < 4; ++i)
@@ -2558,6 +2593,7 @@ private:
                     pos += batchSize;
                     ++pushed;
                     ++work;
+                    pushBudgetLeft_ -= std::min(batchSize, pushBudgetLeft_);
                 } else {
                     backPressured = true;  // retry from same cursor next cycle
                 }
@@ -2757,90 +2793,173 @@ private:
         ret.setPushEffectiveBound(bound);
 
         // Only read if there are records available (within the bound).
+        // F5 (hot-path B): zero allocation, one copy — the chunk is gathered
+        // from the segment's read mmap (Log::readView) straight into the
+        // claimed return-ring slot, clamped on the fly (bound, markers,
+        // aborted batches), within this pass's push byte budget.
         if (nextOffset < bound) {
-            try {
-                // kMaxPushReadChunkBytes is mirrored by ClientGateway.  Gateway
-                // sets hwBound before enqueuing.
-                ret.chunk = log->read(nextOffset, kMaxPushReadChunkBytes);
-                // F15 S3: Log::read can return MORE than the budget (its window
-                // grows to reach a batch larger than it).  A return the ring can
-                // never hold would halt (§6) — cut the chunk at whole batches so
-                // it fits; only a single batch larger than the ring's max message
-                // is left to the claim's invariant halt.
-                if (ret.chunk.size() > pushReadChunkFit_()) [[unlikely]] {
-                    trimToWholeBatches_(ret.chunk, pushReadChunkFit_());
-                    // Re-review 1 I-4: a SINGLE stored batch larger than the
-                    // ring's max message (stored under an earlier, bigger
-                    // config, or received from a peer and then led) cannot be
-                    // returned.  Answer this read non-retriably — never the
-                    // claim halt, which would crash-loop on every restart.
-                    if (ret.chunk.size() > pushReadChunkFit_()) {
-                        std::vector<uint8_t>().swap(ret.chunk);
-                        ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::MessageTooLarge);
-                        notePushReadOversize_(topicId, partition, nextOffset);
-                    }
-                }
-            } catch (const std::exception& ex) {
-                spdlog::warn("Worker {}: log->read threw for topicId={} partition={}: {}",
-                             workerId_, topicId, partition, ex.what());
-                // Return empty chunk — gateway will skip + retry next cycle.
-            } catch (...) {
-                spdlog::warn("Worker {}: log->read threw unknown exception", workerId_);
+            switch (readPushChunk_(a, ret, log, bound, rc)) {
+            case PushChunk::Written:
+                return;                         // answered in place (ret_ slot)
+            case PushChunk::Deferred:
+                if (deferPushRead_(a)) return;  // re-served next pass (owes one return)
+                // No deferral room: UNANSWERED (review I-1) — the gateway re-issues
+                // on its next push cycle; nothing parks.
+                ret.newNextOffset = nextOffset;
+                ret.setPushEffectiveBound(-1);
+                break;
+            case PushChunk::TooLarge:
+                // Re-review 1 I-4: a SINGLE stored batch larger than the ring's
+                // max message (stored under an earlier, bigger config, or
+                // received from a peer and then led) cannot be returned.
+                // Answered non-retriably — never the claim halt.
+                ret.newNextOffset = nextOffset;
+                ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::MessageTooLarge);
+                notePushReadOversize_(topicId, partition, nextOffset);
+                break;
+            case PushChunk::Empty:
+                break;                          // nothing deliverable (cursor may have advanced)
             }
-            if (ret.errorCode == 0 && !ret.chunk.empty())
-                clampPushChunk_(ret, bound, rc, a.isGroup && !a.carrier);
         }
 
-        enqueueReturn_(std::move(ret));   // chunk moved (never copied) into the FIFO if queued
+        enqueueReturn_(std::move(ret));   // no chunk: a fixed-size answer
     }
 
-    // F15 §2.4 (I-B) + addendum R-2: clamp a PushRead chunk to `bound` (batches
-    // with lastOffset < bound only), strip control batches and — read_committed
-    // (rc != null) — aborted transactional batches, compacting in place (no
-    // allocation; one attribute check per batch in the walk the read needs
-    // anyway).  newNextOffset = past the last batch EXAMINED (copied or
-    // stripped), so the gateway never re-reads a stripped batch (R-1).
-    // preCarrier (TX-6b, R-2): a group sub whose isolation carrier has not
-    // arrived is CUT at its first aborted batch instead — the batch stays
-    // ahead of the cursor until the true isolation is known — and the cut is
-    // echoed as the effective bound (the gateway parks there until the carrier).
-    static void clampPushChunk_(WorkerReturn& ret, int64_t bound, const RcState* rc, bool preCarrier) {
+    // F5: one PushRead's chunk.  Walks the whole batches of a zero-copy
+    // readView once, applying the F15 §2.4 / R-2 clamp (bound, control markers
+    // never delivered, read_committed aborted batches stripped / cut pre-carrier)
+    // and collects the kept bytes as runs; then claims ONE ret_ slot and gathers
+    // the runs into it.  No allocation, no syscall (the read map exists), one copy.
+    //   Written  — answered in ret_ (budget charged);
+    //   Empty    — no deliverable batch; ret.newNextOffset is past what was
+    //              examined (answer it — R-1);
+    //   Deferred — over this pass's push budget, or ret_ cannot take it in
+    //              order now (FIFO non-empty / ring full): serve it next pass
+    //              (the read is idempotent — nothing consumed);
+    //   TooLarge — the first deliverable batch alone exceeds the ring's max message.
+    enum class PushChunk : uint8_t { Written, Empty, Deferred, TooLarge };
+    PushChunk readPushChunk_(const PushReadArgs& a, WorkerReturn& ret, rune::storage::Log* log, int64_t bound,
+                             const RcState* rc) {
         using rune::protocol::RecordBatchReader;
         namespace b = rune::protocol::batch;
-        std::vector<uint8_t>& c = ret.chunk;
-        const std::size_t n = c.size();
-        std::size_t rd = 0, wr = 0;
+        if (pushBudgetLeft_ == 0) return PushChunk::Deferred;
+        const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
+        const std::size_t fit = pushReadChunkFit_();
+        const std::size_t cap = std::min({static_cast<std::size_t>(kMaxPushReadChunkBytes), fit, pushBudgetLeft_});
+        // noexcept (F3): a failed lazy map is an empty view — answered empty, the
+        // gateway retries next cycle (as a throwing Log::read was before).
+        const rune::storage::LogReadView v = log->readView(a.nextOffset, static_cast<int32_t>(cap));
+        if (v.empty()) return PushChunk::Empty;
+        const bool preCarrier = a.isGroup && !a.carrier;
+        std::size_t rd = 0, nRuns = 0, total = 0;
         int64_t next = ret.newNextOffset;
-        while (rd + static_cast<std::size_t>(b::kRecordBatchOverhead) <= n) {
-            RecordBatchReader r(c.data() + rd, n - rd);
-            const int32_t total = r.totalLength();
-            if (total <= 0 || rd + static_cast<std::size_t>(total) > n) break;
+        int64_t cutBound = -1;
+        while (rd + static_cast<std::size_t>(b::kRecordBatchOverhead) <= v.len) {
+            RecordBatchReader r(v.data + rd, v.len - rd);
+            const int32_t t = r.totalLength();
+            if (t <= 0 || rd + static_cast<std::size_t>(t) > v.len) break;
+            const auto sz = static_cast<std::size_t>(t);
             const int64_t base = r.baseOffset();
             const int64_t last = base + r.lastOffsetDelta();
-            if (last >= bound) break;                                  // the HW / LSO bound
+            if (last >= bound) break;                                      // the HW / LSO bound
             const auto attrs = static_cast<uint16_t>(r.attributes());
             if ((attrs & static_cast<uint16_t>(b::kAttrControl)) != 0) {   // markers: never delivered
-                rd += static_cast<std::size_t>(total);
+                rd += sz;
                 next = last + 1;
                 continue;
             }
             if (rc != nullptr && (attrs & kTxnAttrBit) != 0 && rc->isAborted(r.producerId(), base)) [[unlikely]] {
-                if (preCarrier) {                                      // R-2: cut, never strip
-                    ret.setPushEffectiveBound(base);
-                    break;
-                }
-                rd += static_cast<std::size_t>(total);
+                if (preCarrier) { cutBound = base; break; }                // R-2: cut, never strip
+                rd += sz;
                 next = last + 1;
                 continue;
             }
-            if (wr != rd) std::memmove(c.data() + wr, c.data() + rd, static_cast<std::size_t>(total));
-            wr += static_cast<std::size_t>(total);
-            rd += static_cast<std::size_t>(total);
+            if (sz > fit) [[unlikely]] {
+                if (total == 0) return PushChunk::TooLarge;                // only ever the view's first batch
+                break;
+            }
+            if (nRuns != 0 && pushRuns_[nRuns - 1].data + pushRuns_[nRuns - 1].len == v.data + rd) {
+                pushRuns_[nRuns - 1].len += static_cast<uint32_t>(sz);    // contiguous: extend the run
+            } else {
+                if (nRuns == kMaxPushRuns) break;                          // cut here (the rest next read)
+                pushRuns_[nRuns++] = ChunkRun{v.data + rd, static_cast<uint32_t>(sz)};
+            }
+            total += sz;
+            rd += sz;
             next = last + 1;
         }
-        if (wr == 0) std::vector<uint8_t>().swap(c);   // empty: release the read buffer
-        else         c.resize(wr);                       // shrink only: no reallocation
+        // A pass that already pushed never takes a batch past its budget (the
+        // view's first batch is always included — readView's progress rule).
+        if (total > pushBudgetLeft_ && !freshPass) return PushChunk::Deferred;
+        if (total == 0) {
+            if (cutBound >= 0) ret.setPushEffectiveBound(cutBound);
+            ret.newNextOffset = next;
+            return PushChunk::Empty;
+        }
+        if (!retFifo_.empty()) return PushChunk::Deferred;                 // never overtake a queued return
+        const std::size_t n = workerReturnEncodedLength(total);
+        aeron::util::index_t idx = -1;
+        try {
+            idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
+        } catch (const std::exception& ex) {
+            haltInvariant_("return-ring tryClaim threw", ex.what(), total);
+        } catch (...) {
+            haltInvariant_("return-ring tryClaim threw", "non-std exception", total);
+        }
+        if (idx < 0) return PushChunk::Deferred;                           // ring full: next pass
+        if (cutBound >= 0) ret.setPushEffectiveBound(cutBound);
         ret.newNextOffset = next;
+        encodeWorkerReturnGather(reinterpret_cast<char*>(ret_.base() + idx), n, ret, pushRuns_.data(), nRuns,
+                                 static_cast<uint32_t>(total));
+        ret_.commit(idx);
+        pushBudgetLeft_ -= std::min(total, pushBudgetLeft_);
+        ++pushReadChunks_;
+        pushReadBytes_ += total;
+        return PushChunk::Written;
+    }
+
+    // F5: park a PushRead over this pass's budget (or behind a full ring) for
+    // the next pass — FIFO (fair: deferred reads are served first next pass).
+    // Shares kMaxHeldPushReads with the RC holds (each owes one return:
+    // reservedAckSlots_).  False = no room (the caller answers unanswered).
+    // Only replica-backed reads defer (ownership is re-validated on serve).
+    bool deferPushRead_(const PushReadArgs& a) noexcept {
+        if (a.replica == nullptr || heldPushReads_.size() + deferredPushCount_ >= kMaxHeldPushReads ||
+            !owedCapAllows_())
+            return false;
+        deferredPushReads_[(deferredPushHead_ + deferredPushCount_) % kMaxHeldPushReads] = a;
+        ++deferredPushCount_;
+        ++pushReadsDeferred_;
+        return true;
+    }
+
+    // F5: start of every pass — refill the push byte budget, then serve the
+    // reads deferred by earlier passes (oldest first) before any new op.
+    int beginPushPass_() {
+        pushBudgetLeft_ = kPushPassBudgetBytes;
+        if (deferredPushCount_ == 0 || !retFifo_.empty()) [[likely]] return 0;
+        int n = 0;
+        for (std::size_t k = deferredPushCount_; k > 0 && pushBudgetLeft_ > 0 && retFifo_.empty(); --k) {
+            PushReadArgs a = deferredPushReads_[deferredPushHead_];
+            deferredPushHead_ = (deferredPushHead_ + 1) % kMaxHeldPushReads;
+            --deferredPushCount_;
+            // Re-validate ownership (a SetOwnership / role op may have run since).
+            rune::replication::PartitionReplica* r = nullptr;
+            if (a.incarnation != 0) {
+                if (ownsIncarnation_(a.targetReplicaId, a.incarnation)) r = ownedPtr_[a.targetReplicaId];
+            } else {
+                for (auto* o : owned_) if (o == a.replica) { r = o; break; }
+            }
+            if (r != nullptr) {
+                a.replica = r;
+                a.logPtr  = r->isDiskBacked() ? r->log() : nullptr;
+            } else {
+                a.logPtr = nullptr;   // never read a log this worker no longer owns → unanswered
+            }
+            servePushRead_(a, /*mayHold=*/true);
+            ++n;
+        }
+        return n;
     }
 
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
@@ -2859,19 +2978,6 @@ private:
                                    static_cast<std::size_t>(sbe::WorkerReturn::chunkHeaderLength());
         return maxMsg > fixed ? maxMsg - fixed : 0;
     }
-    // Cut `chunk` to its longest prefix of whole record batches within `fit`
-    // bytes (cold).  A first batch alone larger than `fit` is left untouched.
-    [[gnu::cold]] static void trimToWholeBatches_(std::vector<uint8_t>& chunk, std::size_t fit) {
-        std::size_t pos = 0;
-        while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= chunk.size()) {
-            rune::protocol::RecordBatchReader r(chunk.data() + pos, chunk.size() - pos);
-            const int32_t total = r.totalLength();
-            if (total <= 0 || pos + static_cast<std::size_t>(total) > fit) break;
-            pos += static_cast<std::size_t>(total);
-        }
-        if (pos != 0) chunk.resize(pos);
-    }
-
     // -------------------------------------------------------------------
     // executeApplyReplicatedWire_ — apply a replicated FetchResponse to the
     // owning follower replica.  Fire-and-forget (no WorkerReturn needed).
@@ -3875,6 +3981,26 @@ private:
     // Max bytes fetched per subscription per cycle via readView (matches gateway).
     static constexpr int32_t     kPushMaxChunkBytes = static_cast<int32_t>(512 * 1024);
     std::vector<uint8_t> egressScratch_;
+public:
+    /// F5 (hot-path B): the consumer-push byte budget of ONE worker pass, shared
+    /// by gateway PushRead answers and in-worker egress pushes: every pushed
+    /// byte is one copy (mmap → return ring / Aeron term), so a pass copies at
+    /// most this much (plus, in a pass that pushed nothing yet, the one batch
+    /// larger than it).  ~10 µs of memcpy at page-cache bandwidth; the rest
+    /// waits for the next pass (served first — fair).
+    static constexpr std::size_t kPushPassBudgetBytes = 128 * 1024;
+    /// Most contiguous runs one gathered PushRead chunk holds (a run ends at a
+    /// stripped marker / aborted batch); the read is cut there beyond it.
+    static constexpr std::size_t kMaxPushRuns = 64;
+    [[nodiscard]] uint64_t pushReadChunksForTest() const noexcept { return pushReadChunks_; }
+    [[nodiscard]] uint64_t pushReadBytesForTest() const noexcept { return pushReadBytes_; }
+    [[nodiscard]] uint64_t pushReadsDeferredForTest() const noexcept { return pushReadsDeferred_; }
+    [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
+private:
+    std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
+    std::array<ChunkRun, kMaxPushRuns>    pushRuns_{};
+    std::size_t                           pushRotor_ = 0;   ///< in-worker push: first sub served next pass
+    uint64_t                              pushReadChunks_ = 0, pushReadBytes_ = 0, pushReadsDeferred_ = 0;
 
     // E5.1.2d: acks=all commit-wait pending list.
     //
@@ -4222,6 +4348,10 @@ private:
     // state builds — answered on Ready (or unanswered on ownership loss).
     // Each owes one return: counted in reservedAckSlots_(), capped, reserved.
     std::vector<PushReadArgs> heldPushReads_ = [] { std::vector<PushReadArgs> v; v.reserve(kMaxHeldPushReads); return v; }();
+    // F5: PushReads deferred to the next pass (budget / ring) — a fixed FIFO.
+    std::unique_ptr<PushReadArgs[]> deferredPushReads_ = std::make_unique<PushReadArgs[]>(kMaxHeldPushReads);
+    std::size_t                     deferredPushHead_  = 0;
+    std::size_t                     deferredPushCount_ = 0;
     // Per pass, after the RC driver: answer the held reads whose partition is
     // Ready; unanswered (re-issue) when this worker no longer owns it.
     int serveHeldPushReads_() {
@@ -5239,7 +5369,8 @@ private:
     [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
         return static_cast<int64_t>(pendingAcksAll_.size()) +
                static_cast<int64_t>(durablePending_.size()) +
-               static_cast<int64_t>(heldPushReads_.size());    // F15 S4 I-2: held PushReads owe a return
+               static_cast<int64_t>(heldPushReads_.size()) +   // F15 S4 I-2: held PushReads owe a return
+               static_cast<int64_t>(deferredPushCount_);        // F5: so do budget-deferred ones
     }
 
     // Reservation-before-poll (E5.1.3 deliverable b), G-A6: never poll more

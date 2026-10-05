@@ -502,6 +502,14 @@ public:
         }
         return total;
     }
+    /// F5: zero-copy variant — chunks arrive as WorkerReturn::chunkView, valid
+    /// only inside `fn` (Worker::drainReturnView).
+    template <typename Fn>
+    std::size_t drainAllReturnsView(Fn&& fn) {
+        std::size_t total = 0;
+        for (auto& w : workers_) total += w->drainReturnView(fn);
+        return total;
+    }
 
     // Re-derive shard→worker ownership when the registry's replica set changes.
     // Cheap: compares ReplicaRegistry::generation() (O(1); correct under runtime
