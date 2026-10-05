@@ -954,6 +954,54 @@ TEST_F(CG4DeliveryFixture, UnsubscribeFromAnotherSessionIsIgnoredRegression) {
     EXPECT_EQ(gw_->subscriptionCount(), 0u);
 }
 
+// CG routing round 3 (MAJOR-1): the gateway's Records pushes carry the
+// creating Subscribe's correlationId.  RED: 0.
+TEST_F(CG4DeliveryFixture, GatewayRecordsCarryTheSubscribeCorrelationIdRegression) {
+    const int64_t sess = injectSession();
+    pc::Subscribe msg;
+    msg.sessionId      = sess;
+    msg.correlationId  = 0x2000000000000777LL;
+    msg.topicId        = kTopicId;
+    msg.partition      = 0;
+    msg.partitionKnown = 1;
+    msg.fromOffset     = 0;
+    uint8_t buf[kBufSz]{};
+    gw_->applySubscribeForTest(buf, msg.encode(buf));
+    pumpPush(30);
+    int records = 0;
+    for (const auto& f : capturedFrames(sess)) {
+        const auto r = pc::Records::decode(f.bytes.data(), f.bytes.size());
+        if (!r) continue;
+        ++records;
+        EXPECT_EQ(r->correlationId, 0x2000000000000777LL);
+    }
+    EXPECT_GT(records, 0) << "precondition: the partition has records";
+}
+
+// CG routing round 3 (MAJOR-2): a JoinGroup from a client below version 3 is
+// refused (ErrorCode::ProtocolVersion, non-retriable) — that client relies on
+// coordinator-created subscriptions this broker no longer makes.  RED: joined.
+TEST_F(CG4DeliveryFixture, JoinGroupFromAnOldClientIsRefusedRegression) {
+    const int64_t sess = gw_->injectTestSession(clock_, /*clientVersion=*/2);
+    pc::JoinGroup msg;
+    msg.sessionId        = sess;
+    msg.correlationId    = 1;
+    msg.sessionTimeoutMs = 5000;
+    const std::string group = "g-old-client";
+    msg.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    std::array<int32_t, 1> topics{kTopicId};
+    uint8_t req[kBufSz]{}, out[kBufSz]{};
+    const auto reqLen = msg.encode(req, std::span<const int32_t>(topics));
+    const auto outLen = service_->handleJoinGroup(req, reqLen, clock_, out, kBufSz);
+    const auto resp = pc::JoinGroupResponse::decode(out, outLen);
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+    EXPECT_TRUE(resp->memberId.empty());
+    // A current client joins.
+    const int64_t cur = injectSession();
+    EXPECT_FALSE(doJoin(cur, 2, group).empty());
+}
+
 TEST(CG4_AssignFrameEncodeDecode, FullAssign) {
     static constexpr std::size_t kBufSz2 = 512;
     uint8_t buf[kBufSz2]{};

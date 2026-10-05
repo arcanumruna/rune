@@ -1,4 +1,7 @@
 #pragma once
+
+#include <cstdio>
+#include <cstdlib>
 // SessionTable.h — Per-session egress tracking for the ClientGateway (BR-4).
 //
 // Design:
@@ -86,7 +89,12 @@ public:
     // per node and demultiplexes by id).  Always positive.
     // -----------------------------------------------------------------------
     [[nodiscard]] int64_t nextSessionId() noexcept {
-        return idPrefix_ | ++nextId_;
+        // LOW-2: the counter must never carry into the node prefix.
+        if (++nextId_ >= (int64_t{1} << 40)) [[unlikely]] {
+            std::fprintf(stderr, "SessionTable: session id space exhausted (2^40) — aborting\n");
+            std::abort();
+        }
+        return idPrefix_ | nextId_;
     }
     /// Cluster-unique ids: the prefix OR-ed into every id (0 = none, tests).
     void setIdPrefix(int64_t prefix) noexcept { idPrefix_ = prefix; }

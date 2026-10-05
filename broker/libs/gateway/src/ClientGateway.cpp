@@ -200,6 +200,23 @@ int64_t ClientGateway::offerBytes_(Session* session,
 }
 
 // ---------------------------------------------------------------------------
+// CG round 3 (MEDIUM-2): a Subscribe's answer (SubscribeResponse / its
+// Redirect / NotLeader) is queued and retried under back-pressure like the
+// produce answers (enqueueOrBestEffort_) — never a best-effort drop of the
+// answer that binds the client's subscription.  Sessions without a real egress
+// publication (test fixtures: injectTestSession / the null-egress capture
+// hook) keep the direct sendTo path they are observed through.
+// ---------------------------------------------------------------------------
+void ClientGateway::sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len)
+{
+    if (!session.egress) {
+        (void)sendTo(session, buf, len);
+        return;
+    }
+    enqueueOrBestEffort_(session, buf, len);
+}
+
+// ---------------------------------------------------------------------------
 // G0.1: enqueueOrBestEffort_ — THE single reliable-egress primitive.
 //
 // EVERY produce-path ack / redirect / error response routes through this
@@ -2570,6 +2587,7 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
     op.type                 = rune::node::WorkerOp::Type::Subscribe;
     op.subscriptionId       = s.subId;
     op.sessionId            = s.sessionId;
+    op.correlationId        = s.subscribeCorrId;  // stamped on the worker's Records pushes
     op.topicId              = s.topicId;
     op.partition            = s.partition;
     op.nextOffset           = s.nextOffset;
@@ -2653,10 +2671,11 @@ int ClientGateway::pumpSubOps_()
 void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
                                               int32_t topicId, int32_t partition,
                                               int64_t nextOffset, uint8_t isolation,
-                                              bool isGroup, bool groupCarrierReceived)
+                                              bool isGroup, bool groupCarrierReceived,
+                                              int64_t subscribeCorrId)
 {
-    const BufferedSubscribe s{subId, sessionId, topicId, partition,
-                              nextOffset, isolation, isGroup, groupCarrierReceived};
+    BufferedSubscribe s{subId, subscribeCorrId, sessionId, topicId, partition,
+                        nextOffset, isolation, isGroup, groupCarrierReceived};
 
     rune::gateway::Session* sess = sessions_.find(sessionId);
 
@@ -2803,7 +2822,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
                                    errResp.message.size();
         if (needed <= scratch_.size()) {
             const std::size_t encoded = errResp.encode(scratch_.data());
-            sendTo(*session, scratch_.data(), encoded);
+            sendSubscribeAnswer_(*session, scratch_.data(), encoded);  // CG round 3: queued, not best-effort
         }
     };
 
@@ -2827,7 +2846,9 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         static_assert(pc::SubscribeResponse::ENCODED_SIZE <= kScratchSize,
                       "scratch too small for SubscribeResponse");
         const std::size_t encoded = resp.encode(scratch_.data());
-        sendTo(*session, scratch_.data(), encoded);
+        // CG round 3 (MEDIUM-2): queued + retried under back-pressure like the
+        // produce answers — never a best-effort drop of the binding answer.
+        sendSubscribeAnswer_(*session, scratch_.data(), encoded);
     };
 
     // 3. Resolve partition.
@@ -3032,6 +3053,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.partition      = partition;
     sub.nextOffset     = nextOffset;
     sub.isolation      = msg.isolation;
+    sub.subscribeCorrId = msg.correlationId;
 
     subscriptions_.emplace(subId, std::move(sub));
 
@@ -3043,7 +3065,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     if (perWorkerEgressActive_ && workerPool_ && msg.topicId >= 0) {
         forwardSubscribeToWorker_(subId, msg.sessionId, msg.topicId, partition,
                                   nextOffset, msg.isolation,
-                                  /*isGroup=*/false, /*groupCarrierReceived=*/false);
+                                  /*isGroup=*/false, /*groupCarrierReceived=*/false,
+                                  /*subscribeCorrId=*/msg.correlationId);
     }
 
     // Reply SubscribeResponse{OK, partition, subscriptionId}.
@@ -3492,7 +3515,7 @@ void ClientGateway::pushSubscriptions()
             // never skipped silently.
             pc::Records rec;
             rec.sessionId      = sub.sessionId;
-            rec.correlationId  = 0;  // push; no correlation
+            rec.correlationId  = sub.subscribeCorrId;  // the client's Subscribe: exact instance identity
             rec.subscriptionId = sub.subscriptionId;
             rec.topicId        = sub.topicId;
             rec.partition      = sub.partition;
@@ -4304,7 +4327,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 // is failed explicitly and parked AT the batch (no silent skip).
                 pc::Records rec;
                 rec.sessionId      = ret.sessionId;
-                rec.correlationId  = 0;
+                rec.correlationId  = sub.subscribeCorrId;  // the client's Subscribe: exact instance identity
                 rec.subscriptionId = ret.subscriptionId;
                 rec.topicId        = ret.readTopicId;
                 rec.partition      = ret.readPartition;

@@ -1,4 +1,7 @@
 #pragma once
+
+#include <cstdio>
+#include <cstdlib>
 // ClientGateway.h — Client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 //
 // Design:
@@ -427,6 +430,12 @@ public:
     static constexpr int kClusterIdShift = 40;
     [[nodiscard]] static constexpr int64_t clusterIdPrefix(int32_t nodeId) noexcept {
         return static_cast<int64_t>(nodeId + 1) << kClusterIdShift;
+    }
+/// MAJOR-2 (CG routing): the ConnectRequest.clientVersion of a live session,
+    /// -1 when the session is unknown.
+    [[nodiscard]] int32_t sessionClientVersion(int64_t sessionId) {
+        Session* s = sessions_.find(sessionId);
+        return s != nullptr ? s->clientVersion : -1;
     }
     void setClusterIdNode(int32_t nodeId) noexcept {
         idPrefix_ = nodeId >= 0 ? clusterIdPrefix(nodeId) : 0;
@@ -1064,6 +1073,10 @@ private:
     struct Subscription {
         int64_t subscriptionId = 0;
         int64_t sessionId      = 0;
+        // The correlationId of the client's Subscribe that created it: stamped
+        // on every Records push so the client binds the push to ITS request
+        // (exact instance identity, before and after the SubscribeResponse).
+        int64_t subscribeCorrId = 0;
         int32_t topicId        = 0;
         int32_t partition      = 0;
         int64_t nextOffset     = 0;
@@ -1170,7 +1183,8 @@ private:
     // enqueue a Subscribe/Unsubscribe WorkerOp via workerPool_->tryEnqueueOp.
     void forwardSubscribeToWorker_(int64_t subId, int64_t sessionId, int32_t topicId,
                                    int32_t partition, int64_t nextOffset, uint8_t isolation,
-                                   bool isGroup, bool groupCarrierReceived);
+                                   bool isGroup, bool groupCarrierReceived,
+                                   int64_t subscribeCorrId = 0);
     void forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition);
 
     // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
@@ -1179,6 +1193,7 @@ private:
     // pollPendingRecordEgress_ once the pub is ready.
     struct BufferedSubscribe {
         int64_t subId              = 0;
+        int64_t subscribeCorrId    = 0;  // stamped on the worker's Records pushes
         int64_t sessionId          = 0;
         int32_t topicId            = 0;
         int32_t partition          = 0;
@@ -1251,6 +1266,7 @@ private:
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
+    void sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len);
     // Task 13 fix round 1: shard-mode session lifecycle helpers.
     /// Worker ack-table slots in use or about to be (I2): accepted sessions +
     /// closes not yet queued on every worker + pending connects whose
@@ -1595,7 +1611,16 @@ private:
     // GB-3: Monotonic subscription ID generator (starts at 1).
     int64_t nextSubscriptionId_ = 0;
     int64_t idPrefix_           = 0;  // cluster-unique id prefix (setClusterIdNode)
-    [[nodiscard]] int64_t allocSubscriptionId_() noexcept { return idPrefix_ | ++nextSubscriptionId_; }
+    [[nodiscard]] int64_t allocSubscriptionId_() noexcept {
+        // LOW-2: the counter must never carry into the node prefix (another
+        // node's ids) — 2^40 subscriptions per process lifetime.
+        if (++nextSubscriptionId_ >= (int64_t{1} << kClusterIdShift)) [[unlikely]] {
+            std::fprintf(stderr, "ClientGateway: subscription id space exhausted (2^40) — aborting\n");
+            std::abort();
+        }
+        return idPrefix_ | nextSubscriptionId_;
+    }
+
 
     // CG-4: Group-member push subscription tracking.
     // Maps memberSessionId → set of subscriptionIds that were created via

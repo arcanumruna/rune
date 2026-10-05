@@ -292,6 +292,27 @@ size_t GroupCoordinationService::handleJoinGroup(
         return resp.encode(out);
     }
 
+    // CG routing round 3 (MAJOR-2): a member below client version 3 relies on
+    // the coordinator-created subscriptions this broker no longer makes (and
+    // demultiplexes Records without the creating Subscribe's correlationId) —
+    // refuse it, non-retriably, instead of serving it duplicates / losses.
+    if (gateway_) {
+        const int32_t v = gateway_->sessionClientVersion(msg.sessionId);
+        if (v >= 0 && v < pc::kClientVersionExplicitGroupSubscriptions) {
+            spdlog::warn("GroupCoordinationService: JoinGroup from session {} refused — client version {} < {} "
+                         "(explicit group subscriptions required); upgrade the client",
+                         msg.sessionId, v, pc::kClientVersionExplicitGroupSubscriptions);
+            pc::JoinGroupResponse resp;
+            resp.sessionId     = msg.sessionId;
+            resp.correlationId = msg.correlationId;
+            resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::ProtocolVersion);
+            resp.generationId  = 0;
+            resp.isLeader      = 0;
+            resp.memberId      = std::span<const uint8_t>();
+            return resp.encode(out);
+        }
+    }
+
     // Collect subscribedTopicIds → topic names.
     // joinTopicsScratch_ is a reused member; clear + refill to avoid per-call
     // vector allocation.  Short topic names benefit from SSO; the vector itself

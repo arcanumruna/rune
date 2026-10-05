@@ -756,6 +756,7 @@ public:
     struct WorkerSubscription {
         int64_t subscriptionId       = 0;
         int64_t sessionId            = 0;
+        int64_t subscribeCorrId      = 0;   ///< the client's Subscribe correlationId (stamped on Records)
         int32_t topicId              = 0;
         int32_t partition            = 0;
         int64_t nextOffset           = 0;   ///< push cursor (advanced by the worker)
@@ -2232,6 +2233,7 @@ private:
         for (auto& s : subs_) {
             if (s.subscriptionId == subId) {
                 s.sessionId            = op.sessionId();
+                s.subscribeCorrId      = op.correlationId();
                 s.topicId              = op.topicId();
                 s.partition            = op.partition();
                 s.nextOffset           = op.nextOffset();
@@ -2251,6 +2253,7 @@ private:
         WorkerSubscription s;
         s.subscriptionId       = subId;
         s.sessionId            = op.sessionId();
+        s.subscribeCorrId      = op.correlationId();
         s.topicId              = op.topicId();
         s.partition            = op.partition();
         s.nextOffset           = op.nextOffset();
@@ -2491,7 +2494,7 @@ private:
 
                 pc::Records rec;
                 rec.sessionId      = s.sessionId;
-                rec.correlationId  = 0;
+                rec.correlationId  = s.subscribeCorrId;  // the client's Subscribe: exact instance identity
                 rec.subscriptionId = s.subscriptionId;
                 rec.topicId        = s.topicId;
                 rec.partition      = s.partition;

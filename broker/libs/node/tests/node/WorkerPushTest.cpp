@@ -25,6 +25,9 @@
 #include <FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <gtest/gtest.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <aeronmd/aeronmd.h>
 
 #include <atomic>
@@ -176,6 +179,53 @@ TEST_F(WorkerPushFixture, DeliversAllBatchesInOrderExactlyOnce) {
     ASSERT_EQ(static_cast<int>(c.baseOffsets.size()), kN);
     for (int i = 0; i < kN; ++i)
         EXPECT_EQ(c.baseOffsets[i], i) << "out-of-order or gap at index " << i;
+    std::filesystem::remove_all(dir);
+}
+
+// CG routing round 3 (MAJOR-1): every Records push carries the correlationId
+// of the client Subscribe that created the subscription, so the client binds
+// the push to ITS request (exact instance identity).  RED: 0.
+TEST_F(WorkerPushFixture, RecordsCarryTheSubscribeCorrelationIdRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 3; ++i) appendBatch(log, i, 1);
+    auto freePort = [] {
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
+        (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
+        socklen_t len = sizeof a;
+        (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+        ::close(fd);
+        return std::to_string(ntohs(a.sin_port));
+    };
+    const std::string control = "127.0.0.1:" + freePort();
+    const std::string local   = "127.0.0.1:" + freePort();
+    WorkerEgress eg(aeron_, control.c_str(), 3011);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control.c_str(), local.c_str(), 3011);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    WorkerOp op = subscribeOp(1, 10, 0, 0, &log);
+    op.correlationId = 0x2000000000000123LL;  // a client's group fetch Subscribe id
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(op)));
+
+    std::vector<int64_t> corrs;
+    aeron::FragmentAssembler fa([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                                    aeron::util::index_t len, aeron::Header&) {
+        auto dec = pc::Records::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                                       static_cast<std::size_t>(len));
+        if (dec) corrs.push_back(dec->correlationId);
+    });
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(fa.handler(), 64);
+        return corrs.size() >= 3;
+    }, 10s));
+    for (const int64_t c : corrs) EXPECT_EQ(c, 0x2000000000000123LL);
     std::filesystem::remove_all(dir);
 }
 
