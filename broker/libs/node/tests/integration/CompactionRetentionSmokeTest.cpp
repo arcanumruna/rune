@@ -803,14 +803,20 @@ TEST(CompactionRetentionSmoke, CompactDelete_BothRun_NoDoubleDelete) {
 
     rune::node::BrokerNode node{cfg};
     node.start();
-    ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke4: must self-elect";
-    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
-        << "Smoke4: replication bridge must propagate within 2 s";
+    // Fix round 6 (N5-LOW-4): condition-driven — generous deadlines, no fixed sleep.
+    ASSERT_TRUE(node.awaitLeader(30s)) << "Smoke4: must self-elect";
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 30s))
+        << "Smoke4: replication bridge must propagate";
 
-    // HW advanced by becomeLeader() on duty-cycle thread.
-    // No test-thread replica calls (duty-thread-only invariant).
-
-    std::this_thread::sleep_for(2500ms);
+    // HW advanced by becomeLeader() on duty-cycle thread.  The live-record count
+    // is read on the replica's OWNING thread (duty-thread-only invariant).
+    auto liveNow = [&node] {
+        return node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica& r) {
+            return countLiveRecords(*r.log());
+        });
+    };
+    EXPECT_TRUE(waitFor([&] { return liveNow() <= 5 * 3; }, 60s))
+        << "Smoke4: compaction + retention never brought the log down to the recent records";
 
     using sclock = std::chrono::steady_clock;
     const auto t0 = sclock::now();

@@ -400,7 +400,7 @@ void followerTruncationThenReappendIsReflushed(bool shard) {
     int64_t now = 25 * kMs;
     for (int i = 0; i < kCap && w.bgFlushInFlightForTest() > 0; ++i) { w.doWork(now += 1000); std::this_thread::yield(); }
     ASSERT_EQ(w.lastSyncedLeoForTest(&log), 2);
-    log.truncateTo(0);                                     // follower truncation (divergence / role change)
+    EXPECT_TRUE(log.truncateTo(0));                                     // follower truncation (divergence / role change)
     const auto b = batchAt(0);
     log.appendNoSync(b.data(), b.size(), 0);               // re-append below the stale mark (LEO 1),
                                                            // BEFORE the worker's next pass sees the cut
@@ -820,7 +820,7 @@ TEST(ShardNonBlockingRegression, SegmentWithInFlightFlushDefersItsClose) {
     s.w.doWork(1);
     const auto tok = s.w.durablePendingTokenForTest(0);
     const int fd = s.log->activeSegmentFd();
-    s.log->truncateTo(0);                                   // removes the active segment object
+    EXPECT_TRUE(s.log->truncateTo(0));                                   // removes the active segment object
     EXPECT_EQ(s.log->retiredSegmentsForTest(), 1u) << "the pinned segment is retired, not destroyed";
     EXPECT_NE(::fcntl(fd, F_GETFD), -1) << "its fd stays open while the flush is in flight";
     s.w.deliverCompletionForTest(FlushCompletion{tok, 0, 0});
@@ -1156,7 +1156,7 @@ TEST(ShardNonBlockingRegression, TruncateDroppingPendingSealFailsGatedEntriesRet
     ASSERT_EQ(s.produce(2, batchAt(0, 1, 16), 0, 2), 1);    // rolls: A pending seal (unsubmitted)
     ASSERT_EQ(s.log->pendingSealCount(), 1u);
     s.w.deliverCompletionForTest(FlushCompletion{t1, 0, 0}); // P1 now gated on A's seal
-    s.log->truncateTo(0);                                     // role change drops the pending seal
+    EXPECT_TRUE(s.log->truncateTo(0));                                     // role change drops the pending seal
     s.w.doWork(3);
     Acks a;
     a.drain(s.w);
@@ -1175,7 +1175,7 @@ TEST(ShardNonBlockingRegression, TruncateClampsSyncedLeo) {
     for (int i = 0; i < kCap && s.w.bgFlushInFlightForTest() > 0; ++i) { s.w.doWork(2); std::this_thread::yield(); }
     ASSERT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), 2);
     const uint64_t roleSyncsBefore = s.log->roleChangeSyncCallsForTest();
-    s.log->truncateTo(1);
+    EXPECT_TRUE(s.log->truncateTo(1));
     EXPECT_GT(s.log->roleChangeSyncCallsForTest(), roleSyncsBefore)
         << "truncate's index msync + dir fsync are counted as accepted role-change sync work";
     EXPECT_EQ(s.log->syncCallsForTest(), 0u);

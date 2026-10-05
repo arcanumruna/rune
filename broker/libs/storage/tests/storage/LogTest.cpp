@@ -303,7 +303,7 @@ TEST(Log, TruncateSingleSegmentMidLog) {
     ASSERT_EQ(log.segmentBaseOffsets().size(), 1u);
 
     // Truncate to offset 5: keep batches 0-4, drop 5-9.
-    log.truncateTo(5);
+    EXPECT_TRUE(log.truncateTo(5));
     EXPECT_EQ(log.logEndOffset(), 5) << "LEO must equal truncation boundary";
 
     // Records below boundary must be readable.
@@ -364,7 +364,7 @@ TEST(Log, TruncateMultiSegmentIntoEarlierSegment) {
     // Truncate into the second segment: pick a base offset inside segment[1].
     // segment[1] base is basesBefore[1]; truncate to basesBefore[1] + 1.
     int64_t truncOff = basesBefore[1] + 1;
-    log.truncateTo(truncOff);
+    EXPECT_TRUE(log.truncateTo(truncOff));
 
     EXPECT_EQ(log.logEndOffset(), truncOff) << "LEO must equal truncation boundary";
 
@@ -422,7 +422,7 @@ TEST(Log, TruncateAtSegmentBaseOffsetBoundary) {
     int64_t lastBase = bases.back();
     ASSERT_GT(lastBase, 0) << "Last segment must not start at 0 for this test";
 
-    log.truncateTo(lastBase);
+    EXPECT_TRUE(log.truncateTo(lastBase));
     EXPECT_EQ(log.logEndOffset(), lastBase) << "LEO must equal the segment base boundary";
 
     // Records strictly before lastBase must be readable.
@@ -468,7 +468,7 @@ TEST(Log, CrashRecoveryAfterTruncate) {
         ASSERT_EQ(log.logEndOffset(), 30);
         // Truncate mid-log.
         truncBoundary = 15;
-        log.truncateTo(truncBoundary);
+        EXPECT_TRUE(log.truncateTo(truncBoundary));
         ASSERT_EQ(log.logEndOffset(), truncBoundary);
         // Log goes out of scope here (files flushed).
     }
@@ -532,7 +532,7 @@ TEST(Log, TruncateInsideLastBatch) {
     // Truncate at offset 2 — offset 2 is INSIDE batch1 (base=1, last=2).
     // Documented semantics: truncation rounds down to batch boundary.
     // After truncation LEO must be <= 2 (batch1 dropped entirely).
-    log.truncateTo(2);
+    EXPECT_TRUE(log.truncateTo(2));
 
     EXPECT_LE(log.logEndOffset(), 2)
         << "truncateTo(2) must drop the batch that spans [1,2]; LEO must be <= 2";
@@ -557,7 +557,7 @@ TEST(Log, TruncateAtLEOIsNoop) {
     RecordBatchBuilder b(0, 200); b.append("k", "v", 200);
     int64_t leo = log.append(b.build(), 0);
 
-    log.truncateTo(leo); // no-op
+    EXPECT_TRUE(log.truncateTo(leo)); // no-op
     EXPECT_EQ(log.logEndOffset(), leo);
 
     std::filesystem::remove_all(dir);
@@ -575,7 +575,7 @@ TEST(Log, TruncateToZeroRemovesAll) {
     }
     ASSERT_EQ(log.logEndOffset(), 5);
 
-    log.truncateTo(0);
+    EXPECT_TRUE(log.truncateTo(0));
     EXPECT_EQ(log.logEndOffset(), 0);
     auto buf = log.read(0, 1 << 20);
     EXPECT_TRUE(buf.empty()) << "after truncateTo(0) no data must remain";
@@ -607,7 +607,7 @@ TEST(Log, TruncateInsideMultiRecordBatchRoundsDown) {
     EXPECT_EQ(log.logEndOffset(), 3);
 
     // truncateTo(1): offset 1 is inside the [0..2] batch → whole batch dropped.
-    log.truncateTo(1);
+    EXPECT_TRUE(log.truncateTo(1));
     EXPECT_EQ(log.logEndOffset(), 0)
         << "truncateTo inside multi-record batch must drop entire batch";
     auto bytes = log.read(0, 1 << 20);
@@ -639,7 +639,7 @@ TEST(Log, TruncateAtSegmentBaseDeletesSegment) {
     int64_t leoBeforeTrunc = log.logEndOffset();
 
     // Truncate exactly at the second segment's base.
-    log.truncateTo(secondBase);
+    EXPECT_TRUE(log.truncateTo(secondBase));
 
     // LEO must equal secondBase (all records from secondBase onward are gone).
     EXPECT_EQ(log.logEndOffset(), secondBase)
@@ -672,7 +672,7 @@ TEST(Log, TruncateToZeroThenAppendIsContiguous) {
     }
     EXPECT_EQ(log.logEndOffset(), 5);
 
-    log.truncateTo(0);
+    EXPECT_TRUE(log.truncateTo(0));
     EXPECT_EQ(log.logEndOffset(), 0);
 
     // Append new records starting from 0.
@@ -1720,7 +1720,7 @@ TEST(LogRegression, TruncateRebuildFailureFailsStopRegression) {
     std::filesystem::create_directory(indexPath);
     { std::ofstream dummy(indexPath + std::string("/dummy.txt")); dummy << "x"; }
 
-    EXPECT_DEATH(log.truncateTo(2), "FATAL");   // mid-batch -> straddle rebuild -> FATAL abort
+    EXPECT_DEATH((void)log.truncateTo(2), "FATAL");   // mid-batch -> straddle rebuild -> FATAL abort
 
     std::filesystem::remove_all(dir);
 }
@@ -1756,7 +1756,7 @@ TEST(LogRegression, TruncateRecoverFailureFailsStopRegression) {
     std::filesystem::create_directory(tmpPath);
     { std::ofstream dummy(tmpPath + std::string("/dummy.txt")); dummy << "x"; }
 
-    EXPECT_DEATH(log.truncateTo(2), "FATAL");   // recover() throws past the point of no return
+    EXPECT_DEATH((void)log.truncateTo(2), "FATAL");   // recover() throws past the point of no return
 
     std::filesystem::remove_all(dir);
 }
@@ -1903,16 +1903,16 @@ TEST(LogRegression, TruncateToRepublishesSealedSnapshotRegression) {
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
     ASSERT_GE(log.sealedSegmentSnapshot()->size(), 3u);
-    log.truncateTo(3);
+    EXPECT_TRUE(log.truncateTo(3));
     EXPECT_EQ(log.logEndOffset(), 3);
     expectSnapshotMatchesSegments(log);
     // Truncate to an exact segment boundary too (the previous sealed segment becomes active).
     const auto bases = log.segmentBaseOffsets();
     ASSERT_GE(bases.size(), 2u);
-    log.truncateTo(bases.back());
+    EXPECT_TRUE(log.truncateTo(bases.back()));
     expectSnapshotMatchesSegments(log);
     // Truncate everything (fresh segment branch).
-    log.truncateTo(0);
+    EXPECT_TRUE(log.truncateTo(0));
     expectSnapshotMatchesSegments(log);
     std::filesystem::remove_all(dir);
 }
@@ -1925,7 +1925,7 @@ TEST(LogRegression, TruncatedSegmentResealGetsItsOwnTimestampRegression) {
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
-    log.truncateTo(3);
+    EXPECT_TRUE(log.truncateTo(3));
     const int64_t activeBase = log.segmentBaseOffsets().back();
     ASSERT_LT(activeBase, 3);
     for (int64_t i = 3; i < 12; ++i) appendTs(log, i, 9'000'000 + i);
@@ -1945,7 +1945,7 @@ TEST(LogRegression, TruncateRecomputesActiveSegmentMaxTimestampRegression) {
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 4; ++i) appendTs(log, i, 1000 + i);
     for (int64_t i = 4; i < 7; ++i) appendTs(log, i, 8'000'000 + i);
-    log.truncateTo(3);
+    EXPECT_TRUE(log.truncateTo(3));
     const int64_t activeBase = log.segmentBaseOffsets().back();
     for (int64_t i = 3; i < 12; ++i) appendTs(log, i, 2000 + i);
     const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), activeBase);
@@ -2203,7 +2203,7 @@ TEST(LogRegression, RetentionDeleteNeverErasesActiveSegmentRegression) {
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
-    log.truncateTo(3);                                  // segment 2 is active again
+    EXPECT_TRUE(log.truncateTo(3));                                  // segment 2 is active again
     const int64_t activeBase = log.segmentBaseOffsets().back();
     ASSERT_EQ(activeBase, 2);
     // The cleaner proposed the (formerly sealed) segment from a stale snapshot
@@ -2226,7 +2226,7 @@ TEST(LogRegression, CleanerSwapNeverTouchesActiveSegmentRegression) {
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
-    log.truncateTo(3);
+    EXPECT_TRUE(log.truncateTo(3));
     const int64_t activeBase = log.segmentBaseOffsets().back();
     std::filesystem::rename(segFile(dir, activeBase, ".log"), segFile(dir, activeBase, ".log.tmpaside"));
     ASSERT_TRUE(log.enqueueCleanedSegment(activeBase));
@@ -2266,7 +2266,7 @@ TEST(LogRegression, StaleLineageCleanerWorkIsDroppedRegression) {
     ASSERT_NE(before, nullptr);
     const uint64_t staleLineage = before->lineage;
     ASSERT_NE(staleLineage, Log::kAnyLineage);
-    log.truncateTo(3);
+    EXPECT_TRUE(log.truncateTo(3));
     for (int64_t i = 3; i < 7; ++i) appendTs(log, i, 9'000'000 + i);   // segment 2 sealed again
     const SegInfo* now = findSeg(*log.sealedSegmentSnapshot(), 2);
     ASSERT_NE(now, nullptr);
@@ -2703,7 +2703,7 @@ TEST(LogRegression, RetentionCrashWindowsRecoverRegression) {
         for (int64_t o = 4; o < 9; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
         // A full truncation below the persisted start lowers it first: new data
         // written from there survives a restart.
-        log.truncateTo(1);
+        EXPECT_TRUE(log.truncateTo(1));
         for (int64_t i = 1; i < 8; ++i) appendTs(log, i, 9000 + i);
     }
     {

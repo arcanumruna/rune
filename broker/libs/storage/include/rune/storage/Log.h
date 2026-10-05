@@ -351,7 +351,7 @@ public:
     /// Fix round 5: returns false (nothing done) when the cleaner has not yet
     /// performed every posted file operation — retry on a later duty pass (the
     /// replica parks in FollowerSync::TruncatePending; never waits).
-    bool truncateTo(int64_t truncateOffset);
+    [[nodiscard]] bool truncateTo(int64_t truncateOffset);
     std::vector<int64_t> segmentBaseOffsets() const;
     /// F15 S4 (I-C): the base offset of the first segment whose base is
     /// strictly above `offset`, or -1 if none.  Non-allocating, O(log segments);

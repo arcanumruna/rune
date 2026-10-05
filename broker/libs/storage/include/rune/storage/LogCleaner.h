@@ -349,6 +349,9 @@ public:
     /// (Log::drainCleanerSwaps).  `nextSeq` is the caller's cleaner-owned
     /// monotonic counter (unique output names across passes).
     void setDeferredInstall(uint64_t* nextSeq) noexcept { deferredSeq_ = nextSeq; }
+    /// Fix round 6: run `hook` at every segment boundary of a pass (and the
+    /// throttler's sleep slices, if the caller wires it there too).
+    void setBoundaryHook(BoundaryHook hook) noexcept { hook_ = hook; }
     /// Max members per deferred group (bounds the owner's ring claim).
     static constexpr std::size_t kMaxDeferredGroupMembers = 64;
 
@@ -417,6 +420,7 @@ private:
     Offset  markerRemovalBound_     = 0;
     int64_t rewriteSegmentsRead_    = 0;
     uint64_t* deferredSeq_          = nullptr;   ///< non-null = deferred-install mode
+    BoundaryHook hook_{};
     std::vector<CleanedGroup>* deferredOut_ = nullptr;   ///< set for one pass
     std::vector<std::string>   deferredWritten_;         ///< this pass's output files (exception cleanup)
     /// Deferred mode: write `out` durably to a fresh cleaned path for `bases`

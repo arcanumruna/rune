@@ -10,6 +10,7 @@
 // the existing segment scanner.
 // ---------------------------------------------------------------------------
 
+#include <type_traits>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/BatchPrefix.h>
 #include <rune/replication/InternalIsrKnowledge.h>
@@ -266,6 +267,8 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     // Fix round 5: a role change abandons a deferred divergence truncation
     // (reset below / leadership) — let the log post cleaner work again.
     if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr) diskLog_->cancelColdPathWait();
+    // Fix round 6 (N5-LOW-2): a leader has no pending divergence truncation.
+    if (followerSync_.truncatePending()) followerSync_.reset();
     // Same-epoch re-assert (a partitionEpoch-only ISR change re-applies the
     // assignment with the SAME leaderEpoch): the controller COMMITTED a new ISR
     // (our AlterIsr proposal, or its own change).  Only the ISR changes; nothing
@@ -2522,7 +2525,22 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
         checkpointEpochs_();
     }
 
-    onLog([&](auto& L){ L.truncateTo(truncateOffset); });
+    onLog([&](auto& L) {
+        if constexpr (std::is_same_v<decltype(L.truncateTo(truncateOffset)), bool>) {
+            // Fix round 6: callers enter only when tryBeginColdPath() just held
+            // (TruncatePending otherwise), so a deferral here would desync the
+            // already-pruned epoch cache from the log — fail-stop, never continue.
+            if (!L.truncateTo(truncateOffset)) [[unlikely]] {
+                spdlog::critical("PartitionReplica[topic={} part={}]: truncateTo({}) deferred inside "
+                                 "truncateLog — epoch cache / log desync; halting",
+                                 cfg_.topicId, cfg_.partitionId, truncateOffset);
+                spdlog::default_logger()->flush();
+                std::abort();
+            }
+        } else {
+            L.truncateTo(truncateOffset);
+        }
+    });
 
     // F15 §2.1 step 3: the log's existing content changed at and above
     // truncateOffset — every parked waiter / RC build re-validates against it.

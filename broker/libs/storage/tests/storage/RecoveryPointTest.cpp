@@ -421,7 +421,7 @@ TEST(RecoveryPointRegression, TruncateWhileCheckpointInFlight_StaleWriteNeverWin
     Log::RpWrite w;
     ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
     log->recoveryCheckpointSubmitted();                   // in flight (not yet executed)
-    log->truncateTo(bases[1] + 1);
+    EXPECT_TRUE(log->truncateTo(bases[1] + 1));
     const int64_t leo = log->logEndOffset();
     EXPECT_EQ(log->recoveryPoint(), leo);
     EXPECT_EQ(readPersistedR(dir), leo) << "truncation below R must persist the lower R first";
@@ -445,7 +445,7 @@ TEST(RecoveryPointRegression, TruncateWhileCheckpointPrepared_IsDropped) {
     completeFrontSeal(*log);
     Log::RpWrite w;
     ASSERT_TRUE(log->prepareRecoveryCheckpoint(w));
-    log->truncateTo(bases[1] + 1);
+    EXPECT_TRUE(log->truncateTo(bases[1] + 1));
     EXPECT_EQ(log->recoveryCheckpointStage(), Log::RpStage::Idle);
     log->recoveryCheckpointSubmitted();                   // a late submit of the dropped one: no-op
     EXPECT_EQ(log->recoveryCheckpointStage(), Log::RpStage::Idle);
@@ -466,7 +466,7 @@ TEST(RecoveryPointRegression, TruncatePersistsLowerRBeforeTouchingFiles) {
     ASSERT_GT(readPersistedR(dir), bases[1]);
     const auto sizeBefore = fs::file_size(segPath(dir, bases[1]));
     log->setSyncFaultForTest(EIO);                        // the R persist fails
-    log->truncateTo(bases[1] + 1);
+    EXPECT_TRUE(log->truncateTo(bases[1] + 1));
     log->setSyncFaultForTest(0);
     EXPECT_TRUE(log->storageFailed());
     EXPECT_TRUE(fs::exists(segPath(dir, bases[2]))) << "a file was deleted before the lower R was durable";
@@ -657,7 +657,7 @@ TEST(RecoveryPointRegression, ResetForNewOwnerThenTruncate_DiskRNeverAboveLeo) {
     ASSERT_EQ(performWrite(w), 0);                        // landed; completion unobserved
     log->resetRecoveryCheckpointForNewOwner();            // fresh owner: outcome unknown
     ASSERT_LE(P, bases[1] + 1);
-    log->truncateTo(bases[1] + 1);
+    EXPECT_TRUE(log->truncateTo(bases[1] + 1));
     const int64_t leo = log->logEndOffset();
     crashKeepPageCache(log);
     EXPECT_LE(readPersistedR(dir), leo) << "on-disk R " << readPersistedR(dir)
@@ -678,7 +678,7 @@ TEST(RecoveryPointRegression, ResetForNewOwnerThenTruncate_PowerLoss_NoOffsetGap
     log->recoveryCheckpointSubmitted();
     ASSERT_EQ(performWrite(w), 0);
     log->resetRecoveryCheckpointForNewOwner();
-    log->truncateTo(bases[0] + 1);
+    EXPECT_TRUE(log->truncateTo(bases[0] + 1));
     flushActive(*log);
     while (log->logEndOffset() < bases[3] + 2) appendOne(*log, "x");
     crashWithPowerLoss(log);
@@ -700,7 +700,7 @@ TEST(RecoveryPointRegression, CompletionObservedThenTruncate_PowerLoss_NoOffsetG
     log->recoveryCheckpointSubmitted();
     ASSERT_EQ(performWrite(w), 0);
     log->recoveryCheckpointCompleted(w.seq, 0);
-    log->truncateTo(bases[0] + 1);
+    EXPECT_TRUE(log->truncateTo(bases[0] + 1));
     flushActive(*log);
     while (log->logEndOffset() < bases[3] + 2) appendOne(*log, "x");
     crashWithPowerLoss(log);
@@ -767,7 +767,7 @@ TEST(RecoveryPointRegression, TruncationDeletionsGateRUntilDirectorySync) {
     const auto bases = log->segmentBaseOffsets();
     completeFrontSeal(*log);
     completeFrontSeal(*log);
-    log->truncateTo(bases[1] + 1);                        // deletes C
+    EXPECT_TRUE(log->truncateTo(bases[1] + 1));                        // deletes C
     const int64_t r0 = log->recoveryPoint();
     appendOne(*log, "x"); appendOne(*log, "x");
     LogSegment* seg = log->activeSegmentForFlush();

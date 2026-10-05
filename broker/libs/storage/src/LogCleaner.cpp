@@ -214,10 +214,12 @@ int markerControlType(const uint8_t* batch, std::size_t len, const rune::protoco
 // marker was not seen stays unresolved and caps the pass (txn.cleanLimit()).
 // Returns the bytes read (throttled by the caller like the M3 prefix reads).
 int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset toOffset,
-                     Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails) {
+                     Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
+                     const BoundaryHook& hook) {
     int64_t bytes = 0;
     for (int64_t segBase : bases) {
         if (segBase >= toOffset) break;
+        hook();   // fix round 6: segment boundary
         const auto buf = readFile(segmentLogPath(dir, segBase));
         bytes += static_cast<int64_t>(buf.size());
         std::size_t pos = 0;
@@ -321,7 +323,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // D3b: transaction pre-pass (+ producer tails) over the whole log below
     // toOffset; the map never indexes at/after the first unresolved txn (LSO) nor
     // aborted txn data.  M3: these reads are throttled by the caller.
-    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails());
+    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_);
     toOffset = txn.cleanLimit();
 
     for (size_t i = 0; i < bases.size(); ++i) {
@@ -331,6 +333,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (segBase >= toOffset)  break;
         if (segEnd <= fromOffset) continue;   // clean prefix: covered by the pre-pass
 
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
 
@@ -375,7 +378,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     txn.clear();
     if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); return; }
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
-    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails());
+    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_);
     toOffset = txn.cleanLimit();
 
     // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
@@ -399,6 +402,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (segEnd <= fromOffset) continue;   // clean prefix: covered by the pre-pass
 
         // Read segment from disk.
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
 
@@ -446,6 +450,7 @@ bool LogCleaner::rewriteSegmentImpl(
 
     // Read the current segment.
     ++rewriteSegmentsRead_;
+    hook_();   // fix round 6: segment boundary
     auto buf = readFile(logPath);
     if (buf.empty()) return false;
 
@@ -1409,6 +1414,7 @@ void LogCleaner::mergeGroupWithMap(
     tmpBatch.reserve(512);
     for (int64_t segBase : groupInPass) {
         ++rewriteSegmentsRead_;
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
         outBuf.reserve(outBuf.size() + buf.size());

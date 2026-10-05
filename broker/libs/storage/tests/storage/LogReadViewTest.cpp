@@ -313,7 +313,7 @@ TEST(LogReadView, TruncateThenReadIsSafeAndCorrect) {
     }
     // Prime the read mmap at the full size, then truncate to shrink the file.
     ASSERT_FALSE(log.readView(0, 1 << 20).empty());
-    log.truncateTo(5);
+    EXPECT_TRUE(log.truncateTo(5));
     EXPECT_EQ(log.logEndOffset(), 5);
 
     auto below = log.readView(0, 1 << 20);

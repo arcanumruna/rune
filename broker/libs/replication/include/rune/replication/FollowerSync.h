@@ -96,6 +96,7 @@ public:
         state_           = State::TruncatePending;
         truncateTarget_  = target;
         fetchDeadlineNs_ = 0;
+        ackOwed_         = false;   // fix round 6: never report the diverged LEO (the post-truncation fetch carries the LEO)
     }
     [[nodiscard]] bool   truncatePending() const noexcept { return state_ == State::TruncatePending; }
     [[nodiscard]] Offset truncateTarget()  const noexcept { return truncateTarget_; }

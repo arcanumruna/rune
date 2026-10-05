@@ -558,6 +558,19 @@ public:
         // segment file — outputs go to unique .cleaned files the owner thread
         // validates and installs (Log::drainCleanerSwaps).
         cleaner.setDeferredInstall(&cleanedSeq_);
+        // Fix round 6 (N5-MEDIUM-1): at every segment / throttle-slice boundary
+        // of this pass, perform the OTHER logs' posted file ops — an owner
+        // waiting on them (TruncatePending) waits one segment step, never this
+        // (possibly throttled) pass.  Only this log's names matter to the pass.
+        boundaryExclude_ = best.log;
+        boundaryNowMs_   = nowMs;
+        const rune::storage::BoundaryHook hook{&LogCleanerAgent::drainOtherLogsHook_, this};
+        cleaner.setBoundaryHook(hook);
+        throttler_.setBoundaryHook(hook);
+        struct HookReset {
+            LogCleanerAgent& a;
+            ~HookReset() { a.throttler_.setBoundaryHook({}); a.boundaryExclude_ = nullptr; }
+        } hookReset{*this};
         rune::storage::RangeCleanResult passResult = cleaner.produceCleanedRangeBounded(
             best.dir,
             sealedBases,
@@ -927,6 +940,17 @@ private:
     rune::storage::SkimpyOffsetMap dedupeMap_;
     std::vector<int64_t> scratchBases_;
     bool skipCycleFileOpsForTest_ = false;   ///< test seam: skip the top-of-cycle file ops
+    rune::storage::Log* boundaryExclude_ = nullptr;   ///< the log a pass is compacting (fix round 6)
+    int64_t boundaryNowMs_ = 0;
+    static void drainOtherLogsHook_(void* self) { static_cast<LogCleanerAgent*>(self)->drainOtherLogs_(); }
+    void drainOtherLogs_() {
+        for (auto* r : replicas_()) {
+            if (r == nullptr || !r->isDiskBacked()) continue;
+            rune::storage::Log* l = r->log();
+            if (l == boundaryExclude_ || !l->cleanerFileOpsPending()) continue;
+            (void)l->runCleanerFileOps(boundaryNowMs_, r->fileDeleteDelayMs());
+        }
+    }
     uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)
     std::array<rune::storage::Log::CleanedMember, rune::storage::LogCleaner::kMaxDeferredGroupMembers> scratchMembers_{};
     std::vector<int64_t> scratchSizes_;

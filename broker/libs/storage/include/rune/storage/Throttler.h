@@ -23,6 +23,16 @@
 
 namespace rune::storage {
 
+/// Fix round 6: a cleaner-thread callback run at every pass segment / throttle
+/// boundary — the agent drains OTHER logs' posted file operations there, so an
+/// owner waiting on them (FollowerSync::TruncatePending) never waits a whole
+/// (possibly throttled) compaction pass of an unrelated log.  No allocation.
+struct BoundaryHook {
+    void (*fn)(void*) = nullptr;
+    void* ctx = nullptr;
+    void operator()() const { if (fn != nullptr) fn(ctx); }
+};
+
 class Throttler {
 public:
     /// Construct a throttler.
@@ -56,9 +66,11 @@ public:
             const double sleepSec = targetSec - elapsed;
             if (sleepSec > 0.0) {
                 const int64_t sleepMs = static_cast<int64_t>(sleepSec * 1000.0);
-                if (sleepMs > 0) {
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(sleepMs));
+                // Fix round 6: sleep in slices, running the boundary hook before
+                // each, so a long throttle sleep never delays other logs' file ops.
+                for (int64_t left = sleepMs; left > 0; left -= kSliceMs) {
+                    hook_();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(left < kSliceMs ? left : kSliceMs));
                 }
             }
             // Reset the window after sleeping.
@@ -74,11 +86,15 @@ public:
     }
 
     int64_t maxBytesPerSec() const noexcept { return maxBytesPerSec_; }
+    /// Fix round 6: run `hook` before every throttle sleep slice (<= kSliceMs).
+    void setBoundaryHook(BoundaryHook hook) noexcept { hook_ = hook; }
+    static constexpr int64_t kSliceMs = 10;
 
 private:
     int64_t maxBytesPerSec_;
     int64_t bytesInWindow_ = 0;
     std::chrono::steady_clock::time_point windowStart_;
+    BoundaryHook hook_{};
 };
 
 } // namespace rune::storage
