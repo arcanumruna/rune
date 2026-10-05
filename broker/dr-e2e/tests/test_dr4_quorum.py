@@ -125,22 +125,33 @@ def assert_no_serving_leader_in_minority(cluster, running_services: list[str]) -
     """
     # --- produce safety: every write attempt must fail ---
     for svc in running_services:
-        probe = run_clients(
-            1,
-            network=cluster.compose.network_name(),
-            target_service=svc,
-            cid_base=_next_cid_base(),
-            timeout_s=45,
-            mode="produce",
-            topics="multi:1:3",
-            records=5,
-            keys=18,
-            acks="all",            # acks=All; must be refused if ISR < minIsr(2)
-            expect_own=True,
-            timeout_ms=15000,      # short timeout — we WANT this to fail fast
-            connect_retries=0,
-            start_stagger_ms=0,
-        )
+        try:
+            probe = run_clients(
+                1,
+                network=cluster.compose.network_name(),
+                target_service=svc,
+                cid_base=_next_cid_base(),
+                # E3 report 2026-10-04: the client fails the write itself after its
+                # delivery timeout (30 s) + connect — 45 s cut it off mid-failure.
+                timeout_s=90,
+                mode="produce",
+                topics="multi:1:3",
+                records=5,
+                keys=18,
+                acks="all",            # acks=All; must be refused if ISR < minIsr(2)
+                expect_own=True,
+                timeout_ms=15000,      # short timeout — we WANT this to fail fast
+                connect_retries=0,
+                start_stagger_ms=0,
+            )
+        except TimeoutError as exc:
+            # The probe never finished: the write was not acknowledged — unless
+            # an ack (PRODUCED line) is already in its partial output.
+            assert "PRODUCED cid=" not in str(exc), (
+                f"SPLIT-BRAIN / MIN-ISR VIOLATION [BLOCKER]: minority survivor {svc!r} "
+                f"acknowledged an acks=All produce before the probe timed out"
+            )
+            continue
         serving = probe.ok and len(probe.all_produced) > 0
         assert not serving, (
             f"SPLIT-BRAIN / MIN-ISR VIOLATION [BLOCKER]: minority survivor {svc!r} "

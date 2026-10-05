@@ -468,14 +468,15 @@ def test_md1_smoke_distributed_leadership(md1_cluster: Cluster) -> None:
 @pytest.mark.milestone_d_p1
 @pytest.mark.fault
 @pytest.mark.timeout(600)
-def test_md1_availability_phase1_boundary(md1_cluster: Cluster) -> None:
-    """Availability: kill a partition leader → Phase-1 boundary asserted.
+def test_md1_availability_partition_failover(md1_cluster: Cluster) -> None:
+    """Availability: kill a partition leader → failover asserted.
 
-    Phase-1 contract:
+    Contract (Milestone D, distributed partition leadership — was the Phase-1
+    "dead partition stays unavailable" boundary before failover existed):
       - Partitions led by SURVIVING nodes keep producing + consuming without
         interruption after a node kill.
-      - The partition whose OWN leader was killed is UNAVAILABLE (no dynamic
-        failover in Phase-1 — that is Phase-2).
+      - The partition whose OWN leader was killed is re-elected on a survivor and
+        serves produce again (step 6).
 
     Steps:
       1. Pre-kill produce: 30 records across all 3 partitions (acks=all).
@@ -639,19 +640,19 @@ def test_md1_availability_phase1_boundary(md1_cluster: Cluster) -> None:
         m.partition for m in post_alive_res.all_produced
         if m.partition == dead_partition
     }
-    # Phase-1 contract: dead partition must NOT appear in post-kill produced records.
-    # If it does appear, that would mean failover happened (Phase-2 behaviour).
-    assert dead_partition not in dead_parts_in_post, (
-        f"Phase-1 boundary violated: partition {dead_partition} (led by killed "
-        f"node {killed_node_id}) produced records after kill — unexpected "
-        f"failover would indicate Phase-2 behaviour is present; verify that the "
-        f"implementation is Phase-1 only."
+    # Milestone D (distributed partition leadership, failover): the partition
+    # whose leader was killed is re-elected on a survivor and serves again.
+    assert dead_partition in dead_parts_in_post, (
+        f"Partition failover missing: partition {dead_partition} (led by killed "
+        f"node {killed_node_id}) produced no records after the kill — its leadership "
+        f"was not re-elected on a surviving node."
+        + (f"\nClient stderr tail:\n{post_alive_res.clients[0].raw[-1000:]}"
+           if post_alive_res.clients else "")
     )
 
     print(
-        f"[MD1-avail] Phase-1 boundary confirmed: "
-        f"partition {dead_partition} (dead leader) = 0 records after kill. "
-        f"Alive partitions {alive_partitions} keep serving: "
+        f"[MD1-avail] failover confirmed: partition {dead_partition} (killed leader) "
+        f"serves again; alive partitions {alive_partitions} kept serving: "
         f"{sorted(alive_parts_in_post)} ✓"
     )
 
