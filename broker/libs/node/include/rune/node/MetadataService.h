@@ -640,7 +640,19 @@ public:
         }
         NodeLifecycle& st = nodeLifecycle_[m.leaderId];
         const bool wasShutting = st.shutting;
-        if (!st.adopt(nonce)) return false;   // a dead process's late request
+        if (!st.adopt(nonce)) {
+            // A superseded identity.  Normally a dead process's late frame
+            // (nobody acts on the answer); but if a late frame of an UNSEEN
+            // older process superseded the LIVE one (fix round 2, N1), the
+            // live process gets this answer and rotates to a fresh identity —
+            // event-driven recovery, never a silent drop.
+            if (resp != nullptr) {
+                fillNodeControlResponse_(*resp, m.leaderId, nonce, false);
+                resp->errorCode = rr::AlterIsrMsg::kNodeSuperseded;
+                if (answer) *answer = true;
+            }
+            return false;
+        }
         st.capable = true;
         if (wasShutting && !st.shutting)
             spdlog::info("MetadataService[{}]: node {} restarted (new process) — its shutdown mark is "
@@ -662,7 +674,7 @@ public:
             return false;
         }
         const bool complete = !st.shutting || shutdownComplete_(m.leaderId, st, st.userOnly);
-        if (st.shutting && complete) st.completePushed = true;
+        if (st.shutting) st.completePushed = complete;   // N5: re-armed when it turns false
         if (resp != nullptr) {
             fillNodeControlResponse_(*resp, m.leaderId, nonce, complete);
             if (answer) *answer = true;
@@ -681,7 +693,9 @@ public:
     }
     /// Controller: push COMPLETE to stopping `node` the first time it holds.
     void maybePushComplete_(int32_t node, NodeLifecycle& st) {
-        if (!st.shutting || st.completePushed || !shutdownComplete_(node, st, st.userOnly)) return;
+        if (!st.shutting) return;
+        if (!shutdownComplete_(node, st, st.userOnly)) { st.completePushed = false; return; }   // N5
+        if (st.completePushed) return;
         st.completePushed = true;
         rune::replication::AlterIsrResponseMsg r{};
         fillNodeControlResponse_(r, node, st.nonce, true);
@@ -1055,6 +1069,15 @@ public:
     /// reflects its whole log as of the claim).  NodeRuntimeAgent consumes an
     /// eligible-set change only when a decision could be taken (M2).
     [[nodiscard]] bool controllerReady() const noexcept { return controllerReady_(); }
+    /// Fix round 2 (N2): this node is stopping (plain stop()) — it decides
+    /// nothing any more (no rebalance, no AlterIsr answers, no emit).
+    void halt() noexcept {
+        if (halted_) return;
+        halted_ = true;
+        pendingDynamicRecords_.clear();   // undecided under this leadership: the next controller re-decides
+        spdlog::info("MetadataService[{}]: halted (node stopping) — no further controller decisions", selfId_);
+    }
+    [[nodiscard]] bool haltedForTest() const noexcept { return halted_; }
     /// M2: a preferred-leader (re-spread) pass is due — the controller just
     /// caught up, or the committed map changed since the last pass (a returned
     /// replica re-entered an ISR: it becomes a preferred-leader candidate only
@@ -1700,7 +1723,7 @@ private:
     /// This replica may DECIDE (emit assignments, answer AlterIsr, rebalance):
     /// it leads AND its MSM reflects its whole log as of the claim.
     [[nodiscard]] bool controllerReady_() const noexcept {
-        return leaderReady_() && controllerCaughtUp_;
+        return leaderReady_() && controllerCaughtUp_ && !halted_;
     }
     /// The catch-up edge: the HW (and the MSM apply cursor) reached the
     /// claim-time LEO — the map is complete; the deferred claim action runs.
@@ -1778,6 +1801,7 @@ private:
     /// direct-invocation unit rigs decide on what they applied).
     rune::replication::Offset claimLeo_ = 0;
     bool     controllerCaughtUp_ = true;
+    bool     halted_             = false;   ///< fix round 2 N2: stopping — decides nothing
     bool     recheckOnCatchUp_   = false;
     uint64_t preferredCheckedVersion_ = 0;
     uint64_t leaderEpochBumps_   = 0;

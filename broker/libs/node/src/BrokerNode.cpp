@@ -97,12 +97,7 @@ int64_t bumpProcessIncarnation(const std::string& dataDir) {
 // Controlled shutdown (review M1): a random, non-zero 64-bit identity of THIS
 // process — compared by identity, so a restart with a wiped data dir (whose
 // incarnation counter restarts low) is still a new process.  Cold (once).
-int64_t processNonce() {
-    std::random_device rd;
-    uint64_t v = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
-    v ^= static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) * 0x9E3779B97F4A7C15ull;
-    return v == 0 ? 1 : static_cast<int64_t>(v);
-}
+int64_t processNonce() { return ControlledShutdown::freshNonce(); }
 // Leader-epoch restart fence for a MEMORY-backed replica (disk-backed ones keep
 // it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.
 // The records do not survive a restart, but the epochs this node led at must
@@ -2978,6 +2973,26 @@ void BrokerNode::buildAdminWorker() {
 void BrokerNode::stop() {
     if (stopped_) return; // idempotent (controller-owned flag, F9a)
     stopped_ = true;
+
+    // Controlled shutdown fix round 2 (N2): before ANY thread is joined, halt
+    // the controller role — this node decides nothing more while its data
+    // plane goes down (workers are joined first, the runtime last), hands the
+    // consensus off at once if it leads, and tells the members it is going.
+    // Event: wait for the runtime's ring-published Halted ack (bounded — a
+    // runtime that is not running never acks).
+    if (runtimeAgent_ && runtimeAgent_->controlledShutdown().active()) {
+        auto& cs = runtimeAgent_->controlledShutdown();
+        if (cs.halt()) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+            bool acked = false;
+            while (!(acked = cs.observe().phase == ControlledShutdown::Phase::Halted) &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+            if (!acked)
+                spdlog::warn("BrokerNode[{}]: stop: the runtime never acked the halt (not running?) — "
+                             "stopping anyway", config_.nodeId);
+        }
+    }
 
     // 0. DR-15 fix round 1: the cold resolver thread only posts into rings it
     //    owns — stop it first (nothing below consumes it any more).

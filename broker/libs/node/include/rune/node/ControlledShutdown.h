@@ -54,6 +54,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
+#include <random>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -61,7 +64,7 @@ namespace rune::node {
 
 class ControlledShutdown {
 public:
-    enum class Phase : int32_t { Registering = 1, Running = 2, Draining = 3, Resigning = 4, Done = 5 };
+    enum class Phase : int32_t { Registering = 1, Running = 2, Draining = 3, Resigning = 4, Done = 5, Halted = 6 };
 
     /// Observer view: the last published phase + what still blocks it.
     struct Status {
@@ -104,6 +107,10 @@ public:
     // ------------------------------------------------------------- any thread
     /// Ask the control thread to start the hand-off.  false = ring full.
     [[nodiscard]] bool begin() noexcept { return cmd_.offer(kBeginMsg); }
+    /// Fix round 2 (N2): a plain stop() is starting — stop deciding now.
+    [[nodiscard]] bool halt() noexcept { return cmd_.offer(kHaltMsg); }
+    /// Control thread / tests: this process's current identity (nonce).
+    [[nodiscard]] int64_t nonceOnControl() const noexcept { return incarnation_; }
 
     // --------------------------------------------------------- observer thread
     Status observe() noexcept {
@@ -119,10 +126,21 @@ public:
     /// One step (the runtime's slow tick).  Returns work done.
     int doWork(int64_t nowNs) {
         int work = 0;
-        bool beginNow = false;
-        work += cmd_.poll([&beginNow](std::int32_t type, std::int64_t, std::int64_t) noexcept {
+        bool beginNow = false, haltNow = false;
+        work += cmd_.poll([&beginNow, &haltNow](std::int32_t type, std::int64_t, std::int64_t) noexcept {
             if (type == kBeginMsg) beginNow = true;
+            if (type == kHaltMsg) haltNow = true;
         });
+        if (haltNow && !std::holds_alternative<Halted>(state_)) {
+            work += halt_(nowNs);
+            publishStatus_();
+            return work;
+        }
+        if (std::holds_alternative<Halted>(state_)) { publishStatus_(); return work; }
+        if (rotateNow_) {   // N1: a member answered kNodeSuperseded — a fresh identity, re-sent at once
+            rotateNow_ = false;
+            work += rotate_(nowNs);
+        }
         if (beginNow && !std::holds_alternative<Draining>(state_) &&
             !std::holds_alternative<Resigning>(state_) && !std::holds_alternative<Done>(state_)) {
             if (!active_()) {
@@ -144,6 +162,7 @@ public:
     /// CONTROL thread: the controller's ack of a NODE-level request.
     void onResponse(const rune::replication::AlterIsrResponseMsg& r) noexcept {
         if (r.leaderId != self_ || incarnationOf_(r) != incarnation_) return;   // not ours / stale
+        if (r.errorCode == rune::replication::AlterIsrMsg::kNodeSuperseded) { rotateNow_ = true; return; }
         const bool    complete  = r.errorCode == rune::replication::kAlterIsrOk;
         const int32_t responder = r.partition;   // the answering controller
         std::visit([complete, responder](auto& st) {
@@ -196,6 +215,7 @@ private:
         int32_t  registeredWith = -1;
         int32_t  remaining      = -1;   ///< readiness gate: partitions not in sync here (outOfSync)
         uint64_t mapVersion     = ~0ull;
+        int32_t  gateCtl        = -2;   ///< controller the gate was computed under
     };
     struct Draining {
         static constexpr Phase kPhase = Phase::Draining;
@@ -211,9 +231,11 @@ private:
         int32_t remaining = -1;
     };
     struct Done { static constexpr Phase kPhase = Phase::Done; };
-    using State = std::variant<Running, Registering, Draining, Resigning, Done>;
+    struct Halted { static constexpr Phase kPhase = Phase::Halted; };
+    using State = std::variant<Running, Registering, Draining, Resigning, Done, Halted>;
 
     static constexpr std::int32_t kBeginMsg  = 1;
+    static constexpr std::int32_t kHaltMsg   = 2;
     static constexpr std::int32_t kStatusMsg = 1;
 
     [[nodiscard]] bool active_() const noexcept {
@@ -249,6 +271,12 @@ private:
             spdlog::warn("ControlledShutdown[{}]: controller {} does not answer node-control requests (an "
                          "older version?) — backing off", self_, ctl);
         }
+        q.sentTo = ctl;
+        ++q.unanswered;
+        return sendTo_(q, flags, nowNs);
+    }
+    /// Broadcast one NODE-level request to every member (incl. self).
+    int sendTo_(Request& q, int32_t flags, int64_t nowNs) {
         rune::replication::AlterIsrMsg m{};
         m.topicId   = rune::replication::AlterIsrMsg::kNodeControlTopicId;
         m.partition = 0;
@@ -260,8 +288,6 @@ private:
         m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(incarnation_));
         m.isr[4]    = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(incarnation_) >> 32));
         q.lastSendNs = nowNs;   // before the sends: a local answer arrives synchronously
-        q.sentTo     = ctl;
-        ++q.unanswered;
         for (int32_t n : members_) (void)send_fn_(sendCtx_, n, m);   // ring full: re-sent later
         return 1;
     }
@@ -285,13 +311,63 @@ private:
         if (ctl >= 0 && ctl != st.registeredWith) { state_ = Registering{}; return 1; }
         // Readiness gate (review L5): recomputed only on a committed-map change.
         const uint64_t v = metadata_->routingVersion();
-        if (v != st.mapVersion) {
+        if (v != st.mapVersion || ctl != st.gateCtl) {   // N4: a lost controller → unknown
             st.mapVersion = v;
+            st.gateCtl    = ctl;
             st.remaining  = ctl >= 0 ? outOfSync(metadata_->committedMap(), self_) : -1;
         }
         return 0;
     }
     int step_(Done&, int64_t) { return 0; }
+    int step_(Halted&, int64_t) { return 0; }
+
+    /// Fix round 2 (N2): a plain stop() is starting.  Decide nothing more
+    /// (the data plane is about to go), never stand again, hand the consensus
+    /// off at once if leading (StandDown), and tell every member this node is
+    /// going (best effort, once — they avoid it as a leader right away).
+    int halt_(int64_t nowNs) {
+        if (metadata_) metadata_->halt();
+        if (election_) {
+            election_->withdrawCandidacy();
+            (void)election_->resign(nowNs);
+        }
+        if (active_()) {
+            Request q;
+            (void)sendTo_(q, rune::replication::AlterIsrMsg::kNodeShutdown, nowNs);
+        }
+        state_ = Halted{};
+        spdlog::info("ControlledShutdown[{}]: halted for stop — no further decisions, consensus handed off", self_);
+        return 1;
+    }
+    /// N1: a fresh process identity; the current request is re-sent at once.
+    int rotate_(int64_t nowNs) {
+        const int64_t old = incarnation_;
+        incarnation_ = freshNonce();
+        spdlog::warn("ControlledShutdown[{}]: identity {} was superseded by a stale frame — re-registering as {}",
+                     self_, old, incarnation_);
+        return std::visit([&](auto& st) -> int {
+            if constexpr (requires { st.req; }) {
+                st.req = Request{};   // immediate re-send with the new identity
+                return std::visit([&](auto& s2) { return step_(s2, nowNs); }, state_);
+            } else if constexpr (std::is_same_v<std::decay_t<decltype(st)>, Running>) {
+                state_ = Registering{};   // re-register under the new identity
+                return 1;
+            } else {
+                return 0;
+            }
+        }, state_);
+    }
+
+public:
+    /// A random non-zero 64-bit process identity (cold).
+    static int64_t freshNonce() {
+        std::random_device rd;
+        uint64_t v = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        v ^= static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) *
+             0x9E3779B97F4A7C15ull;
+        return v == 0 ? 1 : static_cast<int64_t>(v);
+    }
+private:
     int step_(Registering& st, int64_t nowNs) {
         if (st.req.ackedBy >= 0 && st.req.ackedBy == controller_()) {
             Running r;
@@ -377,6 +453,7 @@ private:
     void*                                       sendCtx_     = nullptr;
     MetadataService*                            metadata_    = nullptr;
     rune::consensus::Election*                  election_    = nullptr;
+    bool                                        rotateNow_   = false;   ///< N1 (control thread)
     std::vector<int32_t>                        members_;               ///< every cluster member (incl. self)
 
     State  state_{Running{}};                       // control thread

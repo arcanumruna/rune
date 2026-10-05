@@ -483,6 +483,10 @@ struct AlterIsrMsg {
     /// COMPLETE — clear in its own map AND confirmed clear by every other live
     /// member; kNodeShutdownPending = marked, not complete yet.
     static constexpr int16_t kNodeShutdownPending = 6;
+    /// Any member's answer to a request from a SUPERSEDED process identity
+    /// (fix round 2, N1): the receiving process is alive by definition — it
+    /// rotates to a fresh identity and re-sends at once.
+    static constexpr int16_t kNodeSuperseded = 7;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

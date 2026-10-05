@@ -1808,3 +1808,144 @@ TEST(ControlledShutdownNodeRegression, ReportsOutOfSyncPartitionsForTheReadiness
     EXPECT_EQ(rune::node::ControlledShutdown::outOfSync(m, 0), 1);
     EXPECT_EQ(rune::node::ControlledShutdown::outOfSync(m, 1), 0);
 }
+
+// ===========================================================================
+// Controlled shutdown — fix round 2 (re-review 2026-10-05).
+// ===========================================================================
+
+// N1: a late request from a process this member never recorded (P1) must not
+// fence the LIVE process (P2) forever: P2's next request is answered
+// kNodeSuperseded (an event), P2 rotates to a fresh identity (P3) and P3 is
+// adopted — the stale mark is cleared, with no controller change.
+TEST(ControlledShutdownControllerRegression, LateUnseenOldProcessNeverFencesTheLiveOneRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t F = L == 1 ? 2 : 1;
+    (void)c.svc->onAlterIsr(nodeControl(F, /*P2*/ 22, false));
+    (void)c.svc->onAlterIsr(nodeControl(F, /*P1*/ 11, true));    // late frame of the dead process
+    c.tick();
+    ASSERT_FALSE(isrHas(c.pa(), F));
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 22, false), &resp, &answer);   // the live process
+    ASSERT_TRUE(answer) << "the live process's request was dropped silently (fenced until restart)";
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeSuperseded);
+    EXPECT_EQ(resp.leaderEpoch, 22) << "the answer must echo the superseded identity";
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, /*P3*/ 33, false), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk);
+    std::vector<int32_t> isr = c.pa().isr;
+    isr.push_back(F);
+    EXPECT_TRUE(proposeIsr(c, isr)) << "the live node stayed fenced";
+}
+
+// N5: COMPLETE is pushed again when completion goes true → false → true.
+TEST(ControlledShutdownControllerRegression, CompleteIsPushedAgainAfterItFlippedRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    for (int32_t n : {1, 2, 3}) (void)c.svc->onAlterIsr(nodeControl(n, 10 + n, false));
+    (void)c.svc->onAlterIsr(nodeControl(L, 10 + L, true));
+    c.tick();
+    auto& out = c.svc->nodeControlResponseOutbox();
+    auto confirmAll = [&](bool clear) {
+        for (int32_t m : {2, 3}) if (m != L) (void)c.svc->onAlterIsr(confirmation(L, 10 + L, m, clear));
+    };
+    auto pushes = [&] {
+        int n = 0;
+        for (const auto& [to, r] : out) n += (to == L && r.errorCode == rune::replication::kAlterIsrOk) ? 1 : 0;
+        return n;
+    };
+    confirmAll(true);
+    ASSERT_EQ(pushes(), 1);
+    confirmAll(false);   // a member's map no longer clear
+    (void)c.svc->onAlterIsr(nodeControl(L, 10 + L, true));
+    confirmAll(true);
+    EXPECT_EQ(pushes(), 2) << "COMPLETE was not re-pushed after completion flipped back";
+}
+
+// N2 (controller side): a halted controller decides nothing — no move to
+// itself while its data plane is going down.
+TEST(ControlledShutdownControllerRegression, HaltedControllerDecidesNothingRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    c.svc->halt();
+    (void)c.svc->onAlterIsr(nodeControl(L, 5, true));
+    c.tick({1, 2, 3});
+    c.tick({1});   // the others look dead: a live controller would fail over to itself
+    EXPECT_EQ(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, le) << "a halted controller still decided";
+}
+
+namespace {
+struct RecordingRig : NodeSideRig {
+    std::vector<rune::replication::AlterIsrMsg> sent;
+    static bool rec(void* self, int32_t, const rune::replication::AlterIsrMsg& m) noexcept {
+        static_cast<RecordingRig*>(self)->sent.push_back(m);
+        return true;
+    }
+    RecordingRig() { cs.bind(0, 0x1234, &RecordingRig::rec, this, &md, &e, {0, 1, 2}); }
+    static int64_t nonceOf(const rune::replication::AlterIsrMsg& m) {
+        return static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
+                                    static_cast<uint32_t>(m.isr[3]));
+    }
+    void answer(int16_t code) {
+        rune::replication::AlterIsrResponseMsg r{};
+        r.topicId = rune::replication::AlterIsrMsg::kNodeControlTopicId;
+        r.partition = 1; r.leaderId = 0;
+        const int64_t n = cs.nonceOnControl();
+        r.leaderEpoch = static_cast<int32_t>(static_cast<uint32_t>(n));
+        r.partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(n) >> 32));
+        r.errorCode = code;
+        cs.onResponse(r);
+    }
+};
+} // namespace
+
+// N1 (node side): kNodeSuperseded → a fresh identity, re-sent at once.
+TEST(ControlledShutdownNodeRegression, SupersededAnswerRotatesTheIdentityAndResendsRegression) {
+    RecordingRig r;
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    (void)r.cs.doWork(now);
+    ASSERT_FALSE(r.sent.empty());
+    const int64_t before = r.cs.nonceOnControl();
+    r.answer(rune::replication::AlterIsrMsg::kNodeSuperseded);
+    r.sent.clear();
+    (void)r.cs.doWork(now + 1);   // well inside the 50 ms re-send window
+    ASSERT_FALSE(r.sent.empty()) << "no immediate re-send after kNodeSuperseded";
+    EXPECT_NE(RecordingRig::nonceOf(r.sent.back()), before) << "the identity was not rotated";
+    EXPECT_EQ(RecordingRig::nonceOf(r.sent.back()), r.cs.nonceOnControl());
+}
+
+// N4: the readiness gate turns unknown (-1) when the controller is lost.
+TEST(ControlledShutdownNodeRegression, ReadinessGateUnknownWithoutAControllerRegression) {
+    RecordingRig r;
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    (void)r.cs.doWork(now);
+    r.answer(rune::replication::kAlterIsrOk);   // registered with controller 1
+    (void)r.cs.doWork(++now);
+    (void)r.cs.doWork(++now);
+    ASSERT_EQ(r.cs.observe().phase, rune::node::ControlledShutdown::Phase::Running);
+    ASSERT_EQ(r.cs.observe().remaining, 0);
+    r.e.onStandDown(++now, r.e.leadershipTermId(), 1);   // controller gone (election)
+    ASSERT_EQ(r.e.leaderMemberId(), -1);
+    (void)r.cs.doWork(++now);
+    EXPECT_EQ(r.cs.observe().remaining, -1) << "the readiness gate kept a stale value without a controller";
+}
+
+// N2 (node side): halt — never stands again, resigns if it leads, tells the
+// members it is going (they avoid it at once), acks Halted.
+TEST(ControlledShutdownNodeRegression, HaltStopsDecidingAndAcksRegression) {
+    RecordingRig r;
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    ASSERT_TRUE(r.cs.halt());
+    r.sent.clear();
+    (void)r.cs.doWork(++now);
+    EXPECT_EQ(r.cs.observe().phase, rune::node::ControlledShutdown::Phase::Halted);
+    EXPECT_TRUE(r.e.resigned()) << "the halted node may still stand for election";
+    bool told = false;
+    for (const auto& m : r.sent) told = told || (m.isr[1] & rune::replication::AlterIsrMsg::kNodeShutdown) != 0;
+    EXPECT_TRUE(told) << "the members were not told the node is going";
+}

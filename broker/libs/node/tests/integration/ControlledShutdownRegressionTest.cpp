@@ -582,3 +582,47 @@ TEST(ControlledShutdownRegression, TwoNodesStoppingAtOnceRegression) {
     ns[static_cast<std::size_t>(b)]->stop();
     ns[static_cast<std::size_t>(controller)]->stop();
 }
+
+// ===========================================================================
+// Fix round 2 (N2): a PLAIN stop() of the controller (no controlled shutdown)
+// halts its controller role before any thread is joined: it never moves a
+// partition to itself while its data plane goes down, and it hands the
+// consensus off at once (StandDown) — the survivors lead everything.
+// ===========================================================================
+TEST(ControlledShutdownRegression, ControllerPlainStopHaltsDecisionsAndHandsOffRegression) {
+    TmpDir d0{"p0"}, d1{"p1"}, d2{"p2"};
+    const auto ports = Ports::discover(3);
+    std::array<std::unique_ptr<BrokerNode>, 3> ns;
+    for (int i = 0; i < 3; ++i) {
+        const fs::path& d = i == 0 ? d0.path : i == 1 ? d1.path : d2.path;
+        ns[static_cast<std::size_t>(i)] = std::make_unique<BrokerNode>(makeConfig(i, d, ports));
+        ns[static_cast<std::size_t>(i)]->start();
+    }
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
+    const int c = consensusLeaderOnControl(*ns[0]);
+    const int s1 = (c + 1) % 3, s2 = (c + 2) % 3;
+    std::array<int32_t, kParts> before{};
+    for (int32_t p = 0; p < kParts; ++p) before[static_cast<std::size_t>(p)] = committedLeader(*ns[static_cast<std::size_t>(s1)], 0, p).second;
+    ns[static_cast<std::size_t>(c)]->stop();
+    // No decision of the stopping controller named itself a NEW leader.
+    for (int32_t p = 0; p < kParts; ++p) {
+        const auto cl = committedLeader(*ns[static_cast<std::size_t>(s1)], 0, p);
+        if (cl.first == c)
+            EXPECT_LE(cl.second, before[static_cast<std::size_t>(p)])
+                << "partition " << p << " was moved TO the stopping controller";
+    }
+    EXPECT_TRUE(eventually([&] {
+        const int l = consensusLeaderOnControl(*ns[static_cast<std::size_t>(s1)]);
+        return (l == s1 || l == s2) && consensusLeaderOnControl(*ns[static_cast<std::size_t>(s2)]) == l;
+    }, 10'000ms)) << "the survivors never agreed on a new controller";
+    EXPECT_TRUE(eventually([&] {
+        for (int32_t p = 0; p < kParts; ++p) {
+            const auto cl = committedLeader(*ns[static_cast<std::size_t>(s1)], 0, p);
+            if (cl.first != s1 && cl.first != s2) return false;
+        }
+        return true;
+    }, 20'000ms)) << "the stopped controller's partitions never moved to the survivors";
+    ns[static_cast<std::size_t>(s1)]->stop();
+    ns[static_cast<std::size_t>(s2)]->stop();
+}

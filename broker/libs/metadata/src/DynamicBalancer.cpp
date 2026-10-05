@@ -348,6 +348,14 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     // epoch (never NO_LEADER / a survivor election from here).
                     if (groupIsr.empty() && hadExcluded) continue;
                 }
+                // Fix round 2 (N3): a stopping leader still SERVING — heartbeat-
+                // live or data-plane alive (its frontier advances) — keeps a
+                // partition no non-stopping in-sync replica can take.
+                const PartitionAssignment* drv = in.cur->get(driver->topicId, p);
+                const bool leaderServingAndStopping =
+                    drv && isIn(drv->leaderNode, in.avoidLeaders) &&
+                    (isIn(drv->leaderNode, in.liveNodes) || isIn(drv->leaderNode, in.dataPlaneAliveLeaders));
+                if (groupIsr.empty() && leaderServingAndStopping) continue;
                 if (!in.avoidLeaders.empty() && !groupIsr.empty()) {
                     // Controlled shutdown: prefer a live NON-stopping in-sync
                     // replica.  With none left: a stopping LEADER keeps the
@@ -356,14 +364,8 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     // (better than offline).
                     std::vector<int32_t> keep;
                     for (int32_t n : groupIsr) if (!isIn(n, in.avoidLeaders)) keep.push_back(n);
-                    if (!keep.empty()) {
-                        groupIsr.swap(keep);
-                    } else {
-                        const PartitionAssignment* dc = in.cur->get(driver->topicId, p);
-                        const bool leaderAliveAndStopping =
-                            dc && isIn(dc->leaderNode, in.avoidLeaders) && isIn(dc->leaderNode, in.liveNodes);
-                        if (leaderAliveAndStopping) continue;
-                    }
+                    if (!keep.empty()) groupIsr.swap(keep);
+                    else if (leaderServingAndStopping) continue;
                 }
 
                 // NB: NO minIsr floor here.  A single surviving in-ISR replica

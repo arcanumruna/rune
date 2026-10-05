@@ -167,3 +167,15 @@ TEST(ControlledShutdownRegression, AvoidedNodeHandsOffOrStaysOrSurvivesRegressio
         EXPECT_EQ(r[0].rec.leaderNode, 2);
     }
 }
+
+// Fix round 2 (N3): a stopping SOLE-ISR leader that is heartbeat-starved out of
+// liveNodes but still serving (data-plane alive) keeps its partition — never
+// failed over to NO_LEADER while it serves.
+TEST(ControlledShutdownRegression, DataPlaneAliveStoppingSoleLeaderKeepsItsPartitionRegression) {
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 4, 9});
+    DynamicBalancer bal; DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {2, 3}; in.dataPlaneAliveLeaders = {1};
+    in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {1};
+    EXPECT_TRUE(bal.rebalance(in).empty()) << "a serving sole-ISR stopping leader was taken offline";
+}
