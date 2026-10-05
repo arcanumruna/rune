@@ -111,6 +111,14 @@ public:
     // The record is NOT applied and does NOT crash apply().
     [[nodiscard]] uint64_t lossCount() const noexcept { return lossCount_; }
 
+    // ── Epoch-regression guard (KRaft invariant; epoch-restart fix round 1):
+    //    an assignment record never moves a partition BACK — it is ignored
+    //    (counted here) when its leaderEpoch is lower than the installed one,
+    //    equal with a different leader (one epoch, one leader), or its
+    //    partitionEpoch is lower.  Every controller decision bumps; only a
+    //    re-emitted stale decision (e.g. a static epoch-0 assignment) regresses.
+    [[nodiscard]] uint64_t regressionsRejected() const noexcept { return regressionsRejected_; }
+
 private:
     // Committed assignments (pos <= committedPos)
     AssignmentMap committed_;
@@ -133,8 +141,10 @@ private:
 
     // Count of records skipped due to unknown recordVersion (handleLoss).
     uint64_t lossCount_ = 0;
+    uint64_t regressionsRejected_ = 0;
 
     void flushPending(int64_t upToPos);
+    void install_(int32_t topicId, int32_t partition, const PartitionAssignment& pa);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

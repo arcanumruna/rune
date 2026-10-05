@@ -186,6 +186,26 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
             singletons.push_back(&ts);
     }
 
+    // ── 3b. Per-node preferred-leader imbalance (N3, Kafka ratio) ──────────
+    std::unordered_map<int32_t, int32_t> preferredFor, displacedFrom;
+    if (in.imbalancePct > 0) {
+        for (const auto& ts : in.topics) {
+            for (int32_t p = 0; p < ts.partitionCount; ++p) {
+                const PartitionAssignment* cur = in.cur->get(ts.topicId, p);
+                if (!cur || cur->replicas.empty()) continue;
+                const int32_t pref = cur->replicas[0];
+                ++preferredFor[pref];
+                if (cur->leaderNode != pref) ++displacedFrom[pref];
+            }
+        }
+    }
+    auto imbalanced = [&](int32_t node) {
+        if (in.imbalancePct <= 0) return true;
+        const int32_t total = preferredFor.count(node) ? preferredFor.at(node) : 0;
+        const int32_t off   = displacedFrom.count(node) ? displacedFrom.at(node) : 0;
+        return total > 0 && off * 100 > in.imbalancePct * total;
+    };
+
     // ── 4. Result accumulator ───────────────────────────────────────────────
     std::vector<BalancerRecord> result;
     int preferredElectionsUsed = 0;
@@ -219,6 +239,20 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
 
             const TopicSpec* driver = nullptr;
 
+            // MAJOR-1: leaders excluded at this partition index (a restarted
+            // ex-leader that asked for a new epoch) — never re-elected here,
+            // never kept in the new ISR.
+            std::vector<int32_t> excluded;
+            for (const auto& ex : in.excludedLeaders)
+                for (const TopicSpec* ts : members)
+                    if (ex.topicId == ts->topicId && ex.partition == p && !isIn(ex.node, excluded))
+                        excluded.push_back(ex.node);
+            auto isExcludedLeader = [&](int32_t topicId, int32_t node) {
+                for (const auto& ex : in.excludedLeaders)
+                    if (ex.topicId == topicId && ex.partition == p && ex.node == node) return true;
+                return false;
+            };
+
             for (const TopicSpec* ts : members) {
                 const PartitionAssignment* cur = in.cur->get(ts->topicId, p);
                 if (!cur) continue;
@@ -232,6 +266,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 // over.  Time-independent: converges off data-plane progress.
                 const bool leaderDead =
                     (cur->leaderNode == NO_LEADER)
+                    || isExcludedLeader(ts->topicId, cur->leaderNode)
                     || (!isIn(cur->leaderNode, in.liveNodes)
                         && !isIn(cur->leaderNode, in.dataPlaneAliveLeaders));
 
@@ -252,6 +287,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
 
                     const bool prefIsLive = isIn(preferred, in.liveNodes);
                     if (!prefIsLive) continue;
+                    if (!imbalanced(preferred)) continue;   // N3: below the ratio
                     // Kafka: a preferred election only targets a member of the
                     // committed ISR (the leader's AlterIsr re-admits it first).
                     if (!isIn(preferred, cur->isr)) continue;
@@ -296,6 +332,15 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                         groupIsr.end());
 
                     if (groupIsr.empty()) break;
+                }
+                if (!excluded.empty()) {
+                    const bool hadExcluded = std::any_of(groupIsr.begin(), groupIsr.end(),
+                        [&](int32_t n) { return isIn(n, excluded); });
+                    std::erase_if(groupIsr, [&](int32_t n) { return isIn(n, excluded); });
+                    // The excluded requester is the only live in-sync member:
+                    // no clean alternative — the caller re-elects it at a new
+                    // epoch (never NO_LEADER / a survivor election from here).
+                    if (groupIsr.empty() && hadExcluded) continue;
                 }
 
                 // NB: NO minIsr floor here.  A single surviving in-ISR replica
@@ -476,7 +521,8 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                         newIsr.reserve(cur->isr.size());
                         newIsr.push_back(computedLeader);
                         for (int32_t node : cur->isr) {
-                            if (node != computedLeader && isIn(node, in.liveNodes))
+                            if (node != computedLeader && isIn(node, in.liveNodes) &&
+                                !isIn(node, excluded))
                                 newIsr.push_back(node);
                         }
                         chg.newIsr = std::move(newIsr);

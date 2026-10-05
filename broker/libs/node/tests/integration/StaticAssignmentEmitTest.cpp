@@ -54,6 +54,7 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/MetadataRecords.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -982,4 +983,434 @@ TEST(CoordinatorPartitionRegression, ControllerCommitsCoordinatorIsrAndBridgeFol
     (void)bridge.doWork(/*consensusLeader=*/kNode2, /*term=*/8);
     EXPECT_EQ(off->role(), Role::Follower)
         << "the consensus leader led a coordinator partition outside its committed ISR";
+}
+
+// ===========================================================================
+// Epoch-restart fix 2026-10-05 (controller side).
+// ===========================================================================
+
+namespace {
+/// A 3-node metadata rig (InMemoryTransport) with svc on node 1, one topic
+/// t(0) x1 partition RF 3, driven until the static assignment committed.
+struct CtlRig {
+    SaeTempDir d1{"cr1"}, d2{"cr2"}, d3{"cr3"};
+    rune::storage::Log log1{d1.path}, log2{d2.path}, log3{d3.path};
+    std::vector<NodeId> all{1, 2, 3};
+    InMemoryTransport transport;
+    std::unique_ptr<PartitionReplica> r1, r2, r3;
+    std::unique_ptr<MetadataService> svc;
+    int64_t clock = 0;
+    CtlRig() {
+        log1.recover(); log2.recover(); log3.recover();
+        r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
+        r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, all, all, &log2, &transport);
+        r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, all, all, &log3, &transport);
+        transport.setLeader(r1.get());
+        transport.addFollower(2, r2.get());
+        transport.addFollower(3, r3.get());
+        svc = std::make_unique<MetadataService>(r1.get(), 1);
+        svc->configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+        drive(50);
+    }
+    void drive(int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+            (void)svc->doWork(clock);
+        }
+    }
+    /// One controller tick over `eligible` + drive until committed.
+    void tick(std::vector<NodeId> eligible = {1, 2, 3}) {
+        (void)svc->reassignDeadPartitionLeaders(eligible, 0);
+        drive(50);
+    }
+    const PartitionAssignment& pa() { return *svc->assignment(0, 0); }
+    /// Shrink the committed ISR to {leader}.
+    void soleIsr() {
+        const auto& a = pa();
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 1; m.isr[0] = a.leaderNode; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(svc->onAlterIsr(m));
+        drive(50);
+        ASSERT_EQ(pa().isr.size(), 1u);
+    }
+    rune::replication::AlterIsrMsg bump(int32_t fence = -1, bool memory = false) {
+        const auto& a = pa();
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+        m.partitionEpoch = a.partitionEpoch;
+        m.isr[0] = fence;
+        m.isr[1] = (fence >= 0 ? rune::replication::AlterIsrMsg::kBumpFenceValid : 0) |
+                   (memory ? rune::replication::AlterIsrMsg::kBumpMemoryBacked : 0);
+        return m;
+    }
+};
+} // namespace
+
+// MAJOR-1: a restarted ex-leader asking for a new epoch may have lost acked
+// records (power loss / memory log): another live ISR member leads (epoch + 1)
+// and the requester leaves the ISR — it rejoins as a follower and truncates to
+// the new leader.  A re-send / stale request decides nothing twice.
+TEST(EpochRestartControllerRegression, BumpFailsOverToAnotherLiveIsrMemberRegression) {
+    CtlRig c;
+    const int32_t requester = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    const auto m = c.bump();
+    auto notLeader = m; notLeader.leaderId = requester == 3 ? 2 : 3;
+    EXPECT_FALSE(c.svc->onAlterIsr(notLeader));
+    (void)c.svc->onAlterIsr(m);
+    (void)c.svc->onAlterIsr(m);   // re-send
+    c.tick();
+    const auto& pa = c.pa();
+    EXPECT_NE(pa.leaderNode, requester) << "the restarted ex-leader was re-elected over a live ISR member";
+    EXPECT_EQ(pa.leaderEpoch, le + 1);
+    EXPECT_EQ(std::count(pa.isr.begin(), pa.isr.end(), requester), 0) << "the requester stayed in the ISR";
+    EXPECT_EQ(pa.isr.size(), 2u);
+    (void)c.svc->onAlterIsr(m);   // late re-send of the old request
+    c.tick();
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1) << "a stale bump request decided again";
+}
+
+// MAJOR-1: the requester is the SOLE in-sync replica: no clean alternative —
+// it is re-elected, at an epoch past its fence (L2: one round trip).
+TEST(EpochRestartControllerRegression, SoleIsrBumpReelectsSameLeaderPastFenceRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t requester = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(c.bump(le + 5));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, requester);
+    EXPECT_EQ(c.pa().leaderEpoch, le + 6) << "the bump did not jump past the requester's fence";
+    EXPECT_EQ(c.pa().isr.size(), 1u);
+}
+
+namespace {
+rune::replication::AlterIsrMsg leaderlessReport(int32_t node, int32_t epoch, int32_t leo, int64_t inc,
+                                                bool logDirFailed = false) {
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = node; m.leaderEpoch = epoch;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = -1;
+    m.isr[1] = rune::replication::AlterIsrMsg::kBumpFollowerReport |
+               (logDirFailed ? rune::replication::AlterIsrMsg::kBumpLogDirFailed : 0);
+    m.isr[2] = leo;
+    m.isr[3] = static_cast<int32_t>(inc);
+    return m;
+}
+} // namespace
+
+// MAJOR-1 + fix round 2 N2: a sole-ISR MEMORY leader restarts EMPTY.  It is
+// not re-elected blind (it would wipe followers that hold records): the
+// partition goes leaderless and the next leader is decided on FRESH reports of
+// every live replica.  A restarted (empty) replica with a STALE high position
+// report is never chosen over one that holds data; electing a non-ISR replica
+// is an unclean election — only with survivor election allowed, else the
+// partition is held leaderless with no record churn.
+TEST(EpochRestartControllerRegression, MemoryEmptyLeaderNeverElectsAStaleReportOverRealDataRegression) {
+    for (const bool survivor : {false, true}) {
+        SCOPED_TRACE(survivor ? "survivor election ON" : "survivor election OFF");
+        CtlRig c;
+        c.svc->setAllowSurvivorElection(survivor);
+        c.soleIsr();
+        const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+        const int32_t F = L == 1 ? 2 : 1;            // restarts empty, stale HIGH report
+        const int32_t G = 6 - L - F;                 // holds data, lower stale report
+        c.svc->reportReplicaPosition(0, 0, F, le, 100);
+        c.svc->reportReplicaPosition(0, 0, G, le, 10);
+        auto bump = c.bump(le, /*memory=*/true);
+        bump.isr[3] = 2;                             // L's new incarnation
+        (void)c.svc->onAlterIsr(bump);
+        c.tick();
+        ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "the empty memory leader was re-elected blind";
+        const int32_t lle = c.pa().leaderEpoch;
+        (void)c.svc->onAlterIsr(leaderlessReport(L, lle, 0, 2));
+        (void)c.svc->onAlterIsr(leaderlessReport(F, lle, 0, 7));    // restarted: empty
+        c.tick();
+        EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "decided before every live replica reported";
+        (void)c.svc->onAlterIsr(leaderlessReport(G, lle, 10, 1));
+        c.tick();
+        EXPECT_NE(c.pa().leaderNode, F) << "the empty replica with the stale high report was elected";
+        if (survivor) {
+            EXPECT_EQ(c.pa().leaderNode, G);
+            EXPECT_EQ(c.pa().isr, std::vector<int32_t>{G});
+        } else {
+            EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+            const auto leo = c.r1->logEndOffset();
+            for (int i = 0; i < 5; ++i) c.tick();
+            EXPECT_EQ(c.r1->logEndOffset(), leo) << "a held leaderless partition churned metadata records";
+            EXPECT_EQ(c.svc->leaderlessHeldForTest(), 2u);
+        }
+    }
+}
+
+// Fix round 2 N1 (KIP-112): the sole-ISR leader's log dir went offline (its
+// fence cannot be written).  The controller never re-grants it: one record
+// makes the partition leaderless (ISR kept), and the replica's re-sent bumps
+// and reports append NOTHING more (no livelock, no epoch inflation).  A report
+// from a NEW incarnation with a healthy dir re-registers it and it is elected.
+TEST(EpochRestartControllerRegression, LogDirOfflineSoleIsrHeldLeaderlessNoChurnRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    auto bump = c.bump();
+    bump.isr[1] |= rune::replication::AlterIsrMsg::kBumpLogDirFailed;
+    bump.isr[3] = 5;
+    (void)c.svc->onAlterIsr(bump);
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "a replica with an offline log dir was re-granted";
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1);
+    const auto leo = c.r1->logEndOffset();
+    for (int i = 0; i < 10; ++i) {
+        (void)c.svc->onAlterIsr(bump);                                          // stale re-send
+        (void)c.svc->onAlterIsr(leaderlessReport(L, le + 1, 3, 5, /*failed=*/true));
+        c.tick();
+    }
+    EXPECT_EQ(c.r1->logEndOffset(), leo) << "metadata records churned for an offline replica";
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    (void)c.svc->onAlterIsr(leaderlessReport(L, le + 1, 3, 6));               // restarted, healthy
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L) << "the re-registered replica was never elected";
+    EXPECT_EQ(c.pa().leaderEpoch, le + 2);
+}
+
+// Fix round 2 N3: after a restart failover, the returned preferred replica
+// gets its leadership back exactly ONCE when it re-enters the ISR (caught up:
+// the leader's AlterIsr admits it at >= HW); further committed changes and
+// passes never move it again (no ping-pong).
+TEST(EpochRestartControllerRegression, PreferredMoveBackOnceNoPingPongRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(c.bump());
+    c.tick();
+    ASSERT_NE(c.pa().leaderNode, L);
+    ASSERT_EQ(c.pa().leaderEpoch, le + 1);
+    auto alter = [&](std::vector<int32_t> isr) {
+        const auto& a = c.pa();
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = static_cast<int32_t>(isr.size());
+        for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+        m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    };
+    std::vector<int32_t> isr = c.pa().isr;
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);   // L not in the ISR yet: no move
+    c.drive(50);
+    EXPECT_NE(c.pa().leaderNode, L) << "moved back before L re-entered the ISR";
+    isr.push_back(L);
+    alter(isr);                                                    // L caught up: re-admitted
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);
+    c.drive(50);
+    EXPECT_EQ(c.pa().leaderNode, L) << "leadership never returned to the caught-up preferred replica";
+    const int32_t settledEpoch = c.pa().leaderEpoch;
+    EXPECT_EQ(settledEpoch, le + 2);
+    for (int i = 0; i < 5; ++i) {
+        (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);
+        c.drive(20);
+    }
+    EXPECT_EQ(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, settledEpoch) << "leadership ping-ponged";
+}
+
+// M4.1: the controller fails over between the bump decision and its commit —
+// the record is (a) lost with the old controller's uncommitted tail or (b) on
+// the new controller's uncommitted tail.  Either way the partition ends at
+// exactly ONE new epoch (the requester re-sends; the CAS on the committed
+// (leaderEpoch, partitionEpoch) never lets it apply twice).
+TEST(EpochRestartControllerRegression, ControllerFailoverMidBumpBumpsExactlyOnceRegression) {
+    for (const bool replicated : {false, true}) {
+        SCOPED_TRACE(replicated ? "bump record on the new controller's tail" : "bump record lost");
+        CtlRig c;
+        c.soleIsr();
+        const int32_t le = c.pa().leaderEpoch;
+        const auto m = c.bump();
+        (void)c.svc->onAlterIsr(m);
+        (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 0);   // decided + appended on node 1
+        if (replicated) c.transport.pump(c.clock);                 // reaches the followers only
+        // Controller moves to node 2 (consensus term 2).
+        c.r1->becomeFollower(2, 2);
+        c.r3->becomeFollower(2, 2);
+        c.r2->becomeLeader(2, c.all);
+        auto& t2 = c.transport;
+        t2.removeFollower(2);
+        t2.setLeader(c.r2.get());
+        t2.addFollower(1, c.r1.get());
+        MetadataService svc2(c.r2.get(), 2);
+        svc2.configure({TopicSpec{0, 1, 3, "", "t"}}, c.all);
+        auto drive2 = [&](int n) {
+            for (int i = 0; i < n; ++i) {
+                c.clock += 1'000'000LL;
+                (void)svc2.doWork(c.clock);
+                c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+                t2.pump(c.clock);
+            }
+        };
+        drive2(100);
+        ASSERT_TRUE(svc2.controllerCaughtUpForTest());
+        (void)svc2.onAlterIsr(m);   // the requester re-sends its (now maybe stale) request
+        (void)svc2.reassignDeadPartitionLeaders({1, 2, 3}, 0);
+        drive2(100);
+        const auto* pa = svc2.assignment(0, 0);
+        ASSERT_NE(pa, nullptr);
+        EXPECT_EQ(pa->leaderEpoch, le + 1) << "bumped " << (pa->leaderEpoch - le) << " times";
+    }
+}
+
+// A new controller decides nothing before its MSM reflects its WHOLE log as of
+// the claim.  After a cold restart the HW is 0 at the claim, while the log
+// holds the previous incarnation's decisions (here: the static assignment AND a
+// later committed-ISR change).  Deciding on the empty / partial map re-emitted
+// the static epoch-0 assignment after them — the committed map then regressed
+// (ISR, partitionEpoch; with a failover in between, the LEADER EPOCH and the
+// leader) and partitions re-led at epoch 0 (the DR-12 ground truth).
+TEST(EpochRestartControllerRegression, NewControllerNeverReemitsOverItsUncommittedLogRegression) {
+    SaeTempDir dir1("pc1"), dir2("pc2"), dir3("pc3");
+    const std::vector<NodeId> allNodes = {1, 2, 3};
+    int32_t le = -1, pe = -1;
+    std::size_t isrSize = 0;
+    Offset leo = -1;
+    {   // Incarnation 1: static assignment, then an ISR change, all committed.
+        rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+        log1.recover(); log2.recover(); log3.recover();
+        InMemoryTransport transport;
+        auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+        auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+        auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+        transport.setLeader(r1.get());
+        transport.addFollower(2, r2.get());
+        transport.addFollower(3, r3.get());
+        MetadataService svc1(r1.get(), 1);
+        svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+        int64_t clock = 0;
+        auto drive = [&](int n) {
+            for (int i = 0; i < n; ++i) {
+                clock += 1'000'000LL;
+                r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+                transport.pump(clock);
+                (void)svc1.doWork(clock);
+            }
+        };
+        drive(50);
+        const auto* pa = svc1.assignment(0, 0);
+        ASSERT_NE(pa, nullptr);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = pa->leaderNode; m.leaderEpoch = pa->leaderEpoch;
+        m.isrCount = 2; m.isr[0] = pa->leaderNode; m.isr[1] = pa->leaderNode == 1 ? 2 : 1;
+        m.partitionEpoch = pa->partitionEpoch;
+        ASSERT_TRUE(svc1.onAlterIsr(m));
+        drive(50);
+        pa = svc1.assignment(0, 0);
+        ASSERT_NE(pa, nullptr);
+        le = pa->leaderEpoch; pe = pa->partitionEpoch; isrSize = pa->isr.size();
+        ASSERT_EQ(isrSize, 2u);
+        leo = r1->logEndOffset();
+        ASSERT_EQ(r1->highWatermark(), leo);
+    }
+    // Incarnation 2 (cold restart): node 1 is elected again (consensus term 2).
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Follower, 0, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 0, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 0, allNodes, allNodes, &log3, &transport);
+    r1->becomeLeader(2, allNodes);
+    r2->becomeFollower(2, 1);
+    r3->becomeFollower(2, 1);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    ASSERT_LT(r1->highWatermark(), leo) << "precondition: the restarted controller's HW is behind its log";
+    MetadataService svc1(r1.get(), 1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    for (int i = 0; i < 100; ++i) {
+        clock += 1'000'000LL;
+        (void)svc1.doWork(clock);      // the claim edge runs before any fetch
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+    }
+    EXPECT_EQ(r1->logEndOffset(), leo) << "the new controller re-emitted assignments over its uncommitted log";
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->leaderEpoch, le);
+    EXPECT_EQ(pa->partitionEpoch, pe) << "the committed assignment regressed";
+    EXPECT_EQ(pa->isr.size(), isrSize);
+}
+
+// M1: a runtime topic created while a new controller is still catching up on
+// its log must not make the catch-up static emit re-assign the EXISTING
+// partitions at epoch 0 — only the new topic's partitions get a static record
+// (and the MSM never installs an assignment that moves a partition back).
+TEST(EpochRestartControllerRegression, RuntimeTopicDuringCatchUpNeverReassignsExistingRegression) {
+    SaeTempDir dir1("rt1"), dir2("rt2"), dir3("rt3");
+    const std::vector<NodeId> allNodes = {1, 2, 3};
+    int32_t le = -1, pe = -1;
+    std::size_t isrSize = 0;
+    {
+        rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+        log1.recover(); log2.recover(); log3.recover();
+        InMemoryTransport transport;
+        auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+        auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+        auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+        transport.setLeader(r1.get());
+        transport.addFollower(2, r2.get());
+        transport.addFollower(3, r3.get());
+        MetadataService svc1(r1.get(), 1);
+        svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+        int64_t clock = 0;
+        auto drive = [&](int n) {
+            for (int i = 0; i < n; ++i) {
+                clock += 1'000'000LL;
+                r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+                transport.pump(clock);
+                (void)svc1.doWork(clock);
+            }
+        };
+        drive(50);
+        const auto* pa = svc1.assignment(0, 0);
+        ASSERT_NE(pa, nullptr);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = pa->leaderNode; m.leaderEpoch = pa->leaderEpoch;
+        m.isrCount = 2; m.isr[0] = pa->leaderNode; m.isr[1] = pa->leaderNode == 1 ? 2 : 1;
+        m.partitionEpoch = pa->partitionEpoch;
+        ASSERT_TRUE(svc1.onAlterIsr(m));
+        drive(50);
+        pa = svc1.assignment(0, 0);
+        le = pa->leaderEpoch; pe = pa->partitionEpoch; isrSize = pa->isr.size();
+    }
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Follower, 0, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 0, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 0, allNodes, allNodes, &log3, &transport);
+    r1->becomeLeader(2, allNodes);
+    r2->becomeFollower(2, 1);
+    r3->becomeFollower(2, 1);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    MetadataService svc1(r1.get(), 1);
+    svc1.configure({TopicSpec{0, 1, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    clock += 1'000'000LL;
+    (void)svc1.doWork(clock);   // the claim: HW behind the log
+    ASSERT_FALSE(svc1.controllerCaughtUpForTest()) << "precondition: claimed before catching up";
+    svc1.addRuntimeTopic(TopicSpec{1, 1, 3, "", "t2"});   // during the catch-up window
+    for (int i = 0; i < 100; ++i) {
+        clock += 1'000'000LL;
+        (void)svc1.doWork(clock);
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+    }
+    const auto* pa = svc1.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->leaderEpoch, le);
+    EXPECT_EQ(pa->partitionEpoch, pe) << "an existing partition was re-assigned by the static path";
+    EXPECT_EQ(pa->isr.size(), isrSize);
+    EXPECT_NE(svc1.assignment(1, 0), nullptr) << "the runtime topic was never assigned";
 }

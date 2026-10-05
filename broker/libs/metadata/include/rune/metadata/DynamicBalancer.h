@@ -114,6 +114,22 @@ struct DynamicBalancerInputs {
     /// kept) until an ISR member returns.  Opt in per cluster
     /// (NodeConfig::survivorLeaderElection / RUNE_SURVIVOR_LEADER_ELECTION).
     bool                    allowSurvivorElection = false;
+    /// Epoch-restart fix round 1 (MAJOR-1): (topicId, partition, node) — the
+    /// committed leader `node` of that partition restarted and asked for a new
+    /// leader epoch; it may have lost acked records (power loss, memory log).
+    /// Kafka (a re-registered broker is fenced): the partition FAILS OVER to
+    /// another live ISR member and `node` leaves the ISR (it re-enters through
+    /// the new leader's AlterIsr once caught up).  A group whose ISR has no
+    /// other live member is left untouched here (the caller re-elects the
+    /// requester at a new epoch: it is the sole in-sync replica).
+    struct LeaderExclusion { int32_t topicId; int32_t partition; int32_t node; };
+    std::vector<LeaderExclusion> excludedLeaders;
+    /// Fix round 2 N3 (Kafka leader.imbalance.per.broker.percentage): a
+    /// preferred-leader election to node N fires only when MORE than this
+    /// percentage of the partitions N is preferred for are led elsewhere
+    /// (count-based, event-driven — evaluated on each pass).  0 = any
+    /// imbalance (legacy behaviour).
+    int                     imbalancePct = 0;
     int                     maxPreferredElectionsPerCycle = 1000; ///< Budget cap.
     /// Maximum BalancerRecords returned per rebalance() call.  Excess changes are
     /// deferred to the next cycle so one mass failover cannot stall the metadata log.

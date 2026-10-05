@@ -60,8 +60,7 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
 
         // If pos is already committed, install directly.
         if (recordPos <= committedPos_) {
-            committed_.put(rec->topicId, rec->partition, pa);
-            ++committedVersion_;
+            install_(rec->topicId, rec->partition, pa);
         } else {
             // Queue as pending
             pending_.push_back(PendingEntry{
@@ -108,6 +107,24 @@ void MetadataStateMachine::commit(int64_t committedPos)
     flushPending(committedPos);
 }
 
+// N4 (fix round 2) — LATENT HAZARD: the MSM has no topic-delete path; if one
+// lands with topic-id REUSE, the delete must erase committed_ for the old
+// topic's partitions, or this guard silently rejects the recreated topic's
+// epoch-0 records (leaderless forever).  Topic ids are never reused today.
+void MetadataStateMachine::install_(int32_t topicId, int32_t partition,
+                                    const PartitionAssignment& pa)
+{
+    if (const PartitionAssignment* cur = committed_.get(topicId, partition)) {
+        const bool regress =
+            pa.leaderEpoch < cur->leaderEpoch ||
+            (pa.leaderEpoch == cur->leaderEpoch && pa.leaderNode != cur->leaderNode) ||
+            pa.partitionEpoch < cur->partitionEpoch;
+        if (regress) { ++regressionsRejected_; return; }
+    }
+    committed_.put(topicId, partition, pa);
+    ++committedVersion_;
+}
+
 void MetadataStateMachine::flushPending(int64_t upToPos)
 {
     if (pending_.empty()) return;
@@ -121,8 +138,7 @@ void MetadataStateMachine::flushPending(int64_t upToPos)
     std::size_t kept = 0;
     for (auto& e : pending_) {
         if (e.pos <= upToPos) {
-            committed_.put(e.topicId, e.partition, e.assignment);
-            ++committedVersion_;
+            install_(e.topicId, e.partition, e.assignment);
         } else {
             // Move back to the kept region
             pending_[kept++] = std::move(e);

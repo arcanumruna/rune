@@ -428,6 +428,27 @@ struct ErrorPayloadBuf {
 struct AlterIsrMsg {
     static constexpr uint16_t TEMPLATE_ID = 7;
     static constexpr int kMaxIsr = 16;
+    /// isrCount == kLeaderEpochBump: not an ISR change — "the committed
+    /// (leaderId, leaderEpoch, partitionEpoch) assignment names me leader at an
+    /// epoch I already led at in an earlier incarnation: re-elect me at a NEW
+    /// epoch" (PartitionReplica leader-epoch restart fence).  The controller
+    /// commits the same assignment at leaderEpoch + 1.  An older controller
+    /// ignores it (isrCount <= 0 was always dropped unanswered).
+    static constexpr int32_t kLeaderEpochBump = 0;
+    /// Bump request payload (isrCount == kLeaderEpochBump): isr[0] = the
+    /// requester's fence epoch, isr[1] = flags, isr[2] = its log end offset
+    /// (clamped to int32).  kBumpFenceValid: isr[0] is meaningful.
+    /// kBumpMemoryBacked: a memory log (empty after a restart).
+    static constexpr int32_t kBumpFenceValid   = 1;
+    static constexpr int32_t kBumpMemoryBacked = 2;
+    /// Fix round 2 N1 (KIP-112): the requester's log dir is OFFLINE (a fence
+    /// write failed) — never (re-)elect it until a new process incarnation.
+    static constexpr int32_t kBumpLogDirFailed = 4;
+    /// Fix round 2 N1/N2: not a bump — a FOLLOWER REPORT of a replica of a
+    /// LEADERLESS partition (sent once per leaderless epoch, re-sent until
+    /// answered): isr[2] = its LEO, isr[3]/isr[4] = its process incarnation
+    /// (low/high 32 bits).  `leaderId` is the reporting replica.
+    static constexpr int32_t kBumpFollowerReport = 8;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

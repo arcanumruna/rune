@@ -28,8 +28,11 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -189,6 +192,12 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
             rebuildEpochCacheFromLog_();
             if (epochCache_.latestEpoch() >= 0) checkpointEpochs_();
         }
+        // Leader-epoch restart fence: the durable highest-led epoch AND the
+        // lineage's latest epoch as checkpointed — read BEFORE the DUR-1 cut
+        // below, which drops an entry whose records did not survive (exactly
+        // the epoch a previous incarnation led at and then lost its tail of).
+        setLeaderEpochFenceFile(diskLog_->dir() + "/leader-epoch-fence");
+        if (epochCache_.latestEpoch() > restartFenceEpoch_) restartFenceEpoch_ = epochCache_.latestEpoch();
         // DUR-1: the checkpoint is fsynced (tmp+fsync+rename) but, with periodic
         // fsync off, the log tail it describes may not have survived an unclean
         // shutdown (power loss) — recovery cut the log back.  An entry starting
@@ -211,6 +220,8 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
 
     if (memoryBacked_ && epochCache_.latestEpoch() < 0 && logEndOffset_() > 0)
         rebuildEpochCacheFromLog_();   // a pre-populated in-memory log (no checkpoint)
+    if (memoryBacked_ && epochCache_.latestEpoch() > restartFenceEpoch_)
+        restartFenceEpoch_ = epochCache_.latestEpoch();
 
     if (role_ == Role::Leader) {
         isrManagerOwned_ = std::make_unique<IsrManager>(replicas, cfg_.selfId, cfg_.replicaLagMaxMs);
@@ -265,6 +276,35 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         publishCleanerState();
         return;
     }
+
+    // Leader-epoch restart fence (see setLeaderEpochFenceFile): an epoch this
+    // replica already led at (or holds records of) in an earlier incarnation is
+    // never led again — a second history under it would be invisible to
+    // KIP-101 truncation.  Controller-managed only: it re-elects us at a new
+    // epoch on request.
+    if (isrChannel_ != nullptr && newEpoch <= restartFenceEpoch_) [[unlikely]] {
+        refuseStaleLeadership_(newEpoch, partitionEpoch);
+        return;
+    }
+    if (isrChannel_ != nullptr) {
+        // Fix round 1 M3: never lead without a DURABLE fence.  No fence file
+        // (memory log without a data dir): the epochs led by an earlier
+        // incarnation are unknown — the first leadership of this incarnation
+        // is refused and every epoch the controller grants after it is new
+        // (it commits leader epochs monotonically).  A failed fence write:
+        // refused too (fail closed) — the bump fails over or re-grants.
+        const bool noFence = fenceFile_.empty() && !fenceEstablished_;
+        if (logDirOffline_ || noFence || (!fenceFile_.empty() && !persistLedEpoch_(newEpoch))) {
+            // A failed fence write takes the log dir offline (sticky, N1).
+            if (!noFence && !fenceFile_.empty()) logDirOffline_ = true;
+            if (newEpoch > restartFenceEpoch_) restartFenceEpoch_ = newEpoch;
+            fenceEstablished_ = true;
+            refuseStaleLeadership_(newEpoch, partitionEpoch);
+            return;
+        }
+    }
+    staleLead_.pending = false;
+    report_.pending    = false;
 
     // NB1 fix: capture committed offset BEFORE flipping role or mutating state.
     // highWatermark() still returns the OLD role's view here:
@@ -369,6 +409,17 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
 
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 {
+    staleLead_.pending = false;   // a newer committed role supersedes a refused leadership
+    // N1/N2: a replica of a LEADERLESS partition reports itself (LEO,
+    // incarnation, log-dir state) to the controller once per leaderless epoch
+    // — the event the controller decides the partition's next leader on.
+    if (isrChannel_ != nullptr && leaderId < 0 && (!report_.pending || report_.epoch != leaderEpoch)) {
+        report_.pending = true;
+        report_.epoch   = leaderEpoch;
+        report_.sent    = false;
+    } else if (leaderId >= 0) {
+        report_.pending = false;
+    }
     // Same-epoch re-assert of the same leader: nothing changes.
     if (role_ == Role::Follower && leaderEpoch == epoch_ && leaderId == leaderId_) {
         publishCleanerState();
@@ -1594,6 +1645,10 @@ int PartitionReplica::doWork(int64_t nowNs)
     // F27 F3: owed DR frames (epoch answers, reconcile pull / answer) — any role.
     work += retryOwedDrSends_();
 
+    // Leader-epoch restart fence: a refused leadership asks for a new epoch.
+    if (staleLead_.pending) [[unlikely]] work += requestLeaderEpochBump_(nowNs);
+    if (report_.pending) [[unlikely]] work += sendLeaderlessReport_(nowNs);
+
     if (role_ == Role::Leader) {
         // DR-BUG-6: reset the follower-lag TIME clock on the first tick after
         // becoming leader (becomeLeader has no clock).  This MUST happen before
@@ -1947,6 +2002,12 @@ void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr, int32_t parti
 
 void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
 {
+    // N1/N2: the controller recorded our leaderless-partition report.
+    if (report_.pending && role_ == Role::Follower && r.leaderId == cfg_.selfId &&
+        r.leaderEpoch == report_.epoch) {
+        report_.pending = false;
+        return;
+    }
     if (role_ != Role::Leader || isrManager_ == nullptr || !isrProposal_.pending) return;
     if (r.leaderEpoch != epoch_) return;                         // an answer for another leadership
     bool clear = false;
@@ -2238,6 +2299,135 @@ void PartitionReplica::onInternalIsr(const InternalIsrMsg& m)
     a.topicId = m.topicId; a.partition = m.partition; a.followerId = cfg_.selfId;
     a.leaderEpoch = m.leaderEpoch; a.version = m.version;
     if (!onTransport([&](auto& t) { return t.sendInternalIsrAck(m.leaderId, a); })) ++sendRefusals_;
+}
+
+// ---------------------------------------------------------------------------
+// Leader-epoch restart fence (cold paths — see the header).
+// ---------------------------------------------------------------------------
+void PartitionReplica::setLeaderEpochFenceFile(std::string path)
+{
+    fenceFile_ = std::move(path);
+    if (fenceFile_.empty()) return;
+    long long v = -1;
+    if (FILE* f = std::fopen(fenceFile_.c_str(), "r")) {
+        if (std::fscanf(f, "%lld", &v) != 1) v = -1;
+        std::fclose(f);
+    }
+    if (v > fencePersisted_)    fencePersisted_    = static_cast<Epoch>(v);
+    if (v > restartFenceEpoch_) restartFenceEpoch_ = static_cast<Epoch>(v);
+}
+
+bool PartitionReplica::persistLedEpoch_(Epoch e)
+{
+    // Durable BEFORE the first append under this epoch.  Only where the fence
+    // is enforced (controller-managed: isrChannel_); internal consensus-led
+    // partitions skip the fsyncs (L3).
+    if (fenceFile_.empty()) return false;
+    if (e <= fencePersisted_) return true;
+    const std::string tmp = fenceFile_ + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    bool ok = fd >= 0;
+    if (ok) {
+        char buf[32];
+        const int n = std::snprintf(buf, sizeof buf, "%lld\n", static_cast<long long>(e));
+        ok = n > 0 && ::write(fd, buf, static_cast<std::size_t>(n)) == n && ::fsync(fd) == 0;
+        ::close(fd);
+    }
+    ok = ok && std::rename(tmp.c_str(), fenceFile_.c_str()) == 0;
+    if (ok) {
+        const auto slash = fenceFile_.find_last_of('/');
+        const std::string dir = slash == std::string::npos ? std::string(".") : fenceFile_.substr(0, slash);
+        const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
+        fencePersisted_ = e;
+        fenceErrorLogged_ = false;
+        return true;
+    }
+    ::unlink(tmp.c_str());
+    // Fail closed (M3): the caller refuses the leadership.
+    if (!fenceErrorLogged_) {
+        fenceErrorLogged_ = true;
+        spdlog::error("PartitionReplica[node={}] topic={} part={}: leader-epoch fence {} not persisted to {} "
+                      "— leadership refused until it can be",
+                      cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
+                      static_cast<long long>(e), fenceFile_);
+    }
+    return false;
+}
+
+void PartitionReplica::refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch)
+{
+    ++staleLeadRefusals_;
+    spdlog::warn("PartitionReplica[node={}] topic={} part={}: leadership at epoch {} REFUSED — "
+                 "restart fence {} (led by an earlier incarnation, or no durable fence); "
+                 "asking the controller for a new epoch",
+                 cfg_.selfId, cfg_.topicId, static_cast<int>(cfg_.partitionId),
+                 static_cast<long long>(newEpoch), static_cast<long long>(restartFenceEpoch_));
+    // Never lead (and never accept a produce) under it: a follower of no leader.
+    if (role_ == Role::Leader)
+        becomeFollower(epoch_ > newEpoch ? epoch_ : newEpoch, NodeId{-1});
+    report_.pending = false;   // the partition HAS a committed leader (us): a bump, not a report
+    staleLead_.pending        = true;
+    staleLead_.epoch          = newEpoch;
+    staleLead_.partitionEpoch = partitionEpoch;
+    staleLead_.sent           = false;
+    publishCleanerState();
+}
+
+int PartitionReplica::requestLeaderEpochBump_(int64_t nowNs)
+{
+    if (isrChannel_ == nullptr) return 0;
+    // Re-sent on the AlterIsr cadence: loss recovery only (the request, the
+    // answer or the record may be lost) — convergence is decided by the
+    // controller's committed assignment, never by this interval.
+    if (staleLead_.sent && nowNs - staleLead_.sentNs < kAlterIsrResendNs) return 0;
+    staleLead_.sent   = true;
+    staleLead_.sentNs = nowNs;
+    AlterIsrMsg m{};
+    m.topicId        = cfg_.topicId;
+    m.partition      = cfg_.partitionId;
+    m.leaderId       = cfg_.selfId;
+    m.leaderEpoch    = staleLead_.epoch;
+    m.isrCount       = AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = staleLead_.partitionEpoch;
+    m.isr[0] = static_cast<int32_t>(restartFenceEpoch_);   // L2: the controller jumps past it
+    m.isr[1] = AlterIsrMsg::kBumpFenceValid | bumpFlags_();
+    const Offset leo = logEndOffset_();
+    m.isr[2] = static_cast<int32_t>(std::min<Offset>(leo, std::numeric_limits<int32_t>::max()));
+    m.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) & 0xffffffffu);
+    m.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) >> 32);
+    if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;
+    return 1;
+}
+
+int32_t PartitionReplica::bumpFlags_() const noexcept
+{
+    return (memoryBacked_ ? AlterIsrMsg::kBumpMemoryBacked : 0) |
+           (logDirOffline_ ? AlterIsrMsg::kBumpLogDirFailed : 0);
+}
+
+int PartitionReplica::sendLeaderlessReport_(int64_t nowNs)
+{
+    if (isrChannel_ == nullptr || role_ != Role::Follower) { report_.pending = false; return 0; }
+    // Re-sent on the AlterIsr cadence until answered (loss recovery only).
+    if (report_.sent && nowNs - report_.sentNs < kAlterIsrResendNs) return 0;
+    report_.sent   = true;
+    report_.sentNs = nowNs;
+    AlterIsrMsg m{};
+    m.topicId        = cfg_.topicId;
+    m.partition      = cfg_.partitionId;
+    m.leaderId       = cfg_.selfId;
+    m.leaderEpoch    = report_.epoch;
+    m.isrCount       = AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = -1;
+    m.isr[0] = static_cast<int32_t>(restartFenceEpoch_);
+    m.isr[1] = AlterIsrMsg::kBumpFollowerReport | AlterIsrMsg::kBumpFenceValid | bumpFlags_();
+    const Offset leo = logEndOffset_();
+    m.isr[2] = static_cast<int32_t>(std::min<Offset>(leo, std::numeric_limits<int32_t>::max()));
+    m.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) & 0xffffffffu);
+    m.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(processIncarnation_) >> 32);
+    if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;
+    return 1;
 }
 
 void PartitionReplica::sendIsrProposal_(int64_t nowNs)

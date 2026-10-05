@@ -93,6 +93,19 @@ int64_t bumpProcessIncarnation(const std::string& dataDir) {
     if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
     return next;
 }
+// Leader-epoch restart fence for a MEMORY-backed replica (disk-backed ones keep
+// it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.
+// The records do not survive a restart, but the epochs this node led at must
+// (a restarted leader must never lead again at one of them).  Cold.
+void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::string& dataDir,
+                         int32_t topicId, int32_t partition) {
+    if (dataDir.empty()) return;
+    const std::string dir = dataDir + "/memory-epoch-fence";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) return;
+    r.setLeaderEpochFenceFile(dir + "/" + std::to_string(topicId) + "-" + std::to_string(partition));
+}
 // Task 10 (spec §3.1) + F30: the ONE place a newly built replica's disk
 // durability policy is set — boot (buildReplication) and runtime-created
 // topics (createRuntimeUserReplicas) alike, in shard AND thread placement.
@@ -1098,6 +1111,7 @@ void BrokerNode::buildReplication() {
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
             applyWorkerDrivenDurability(*replica, topicId);   // Task 10 + F30
+            if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
             // Kafka AlterPartition: user-partition ISR changes go through the
             // controller (multi-node); internal partitions keep a leader-local ISR.
             if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
@@ -1273,6 +1287,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
         applyWorkerDrivenDurability(*replica, topicId);   // same policy as boot (F30 fix round 1, F3)
+        if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
         if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
             replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
 
