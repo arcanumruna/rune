@@ -144,6 +144,14 @@ Offset  Hex                                        Notes
 
 ---
 
+
+## 4b. `connect_response_v3.bin` — 42 bytes
+
+**Message:** `ConnectResponse` (templateId = 2), the form every broker >= version 3
+sends: blockLength 18; the fields of §3 (code 0, leaderMemberId 2,
+assignedSessionId 0xDEADBEEF) followed by `brokerVersion` = 3 (int32 LE at
+[38..41]).  §3 / §4 remain the v0 (38-byte) decode-compatibility vectors.
+
 ## 5. `keepalive.bin` — 24 bytes
 
 **Message:** `Keepalive` (templateId = 3, BODY_FIXED = 0 — header only)

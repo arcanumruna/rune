@@ -112,6 +112,22 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
+    // 4b. connect_response_v3.bin — the 42-byte form (brokerVersion = 3) every
+    //     broker >= version 3 sends.
+    // -----------------------------------------------------------------------
+    {
+        rpc::ConnectResponse msg;
+        msg.sessionId         = kSessionId;
+        msg.correlationId     = kCorrelationId;
+        msg.code              = static_cast<int16_t>(rpc::ErrorCode::OK);
+        msg.leaderMemberId    = 2;
+        msg.assignedSessionId = static_cast<int64_t>(0x00000000DEADBEEFULL);
+        msg.brokerVersion     = 3;
+        n = msg.encode(buf);
+        write_vec(dir, "connect_response_v3.bin", buf, n);
+    }
+
+    // -----------------------------------------------------------------------
     // 5. keepalive.bin
     // -----------------------------------------------------------------------
     {
@@ -364,6 +380,6 @@ int main(int argc, char** argv) {
         write_vec(dir, "unsubscribe.bin", buf, n);
     }
 
-    std::printf("Done. 17 vectors written to %s/\n", dir);
+    std::printf("Done. 18 vectors written to %s/\n", dir);
     return 0;
 }

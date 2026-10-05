@@ -136,11 +136,13 @@ TEST(ConnectResponseCodec, RoundTrip) {
     resp.leaderMemberId    = -3;
     resp.assignedSessionId = 0x7FFFFFFFFFFFFFFFLL;
 
-    EXPECT_EQ(rpc::ConnectResponse::ENCODED_SIZE, 38u);
+    EXPECT_EQ(rpc::ConnectResponse::ENCODED_SIZE, 42u);     // since broker version 3
+    EXPECT_EQ(rpc::ConnectResponse::ENCODED_SIZE_V0, 38u);  // an older broker's frame
 
     std::array<uint8_t, 64> buf{};
     const std::size_t written = resp.encode(buf.data());
-    EXPECT_EQ(written, 38u);
+    EXPECT_EQ(written, 42u);
+    EXPECT_EQ(leS32(buf.data(), 38), rpc::kBrokerVersion);  // brokerVersion @ 38
 
     // Header
     EXPECT_EQ(leU16(buf.data(), 0), rpc::ConnectResponse::BODY_FIXED);   // blockLength
@@ -159,6 +161,26 @@ TEST(ConnectResponseCodec, RoundTrip) {
     EXPECT_EQ(decoded->code,               resp.code);
     EXPECT_EQ(decoded->leaderMemberId,     resp.leaderMemberId);
     EXPECT_EQ(decoded->assignedSessionId,  resp.assignedSessionId);
+    EXPECT_EQ(decoded->brokerVersion,      rpc::kBrokerVersion);
+}
+
+// ---------------------------------------------------------------------------
+// ConnectResponse — the 38-byte frame of a broker that predates brokerVersion
+// (blockLength 14) still decodes, as broker version 0.
+// ---------------------------------------------------------------------------
+TEST(ConnectResponseCodec, OlderBrokerFrameDecodesAsVersionZeroRegression) {
+    rpc::ConnectResponse resp;
+    resp.code              = static_cast<int16_t>(rpc::ErrorCode::OK);
+    resp.leaderMemberId    = 4;
+    resp.assignedSessionId = 77;
+    std::array<uint8_t, 64> buf{};
+    (void)resp.encode(buf.data());
+    rpc::detail::putLE16(buf.data(), 0, rpc::ConnectResponse::BODY_FIXED_V0);  // the v0 frame
+    auto decoded = rpc::ConnectResponse::decode(buf.data(), rpc::ConnectResponse::ENCODED_SIZE_V0);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->brokerVersion, 0);
+    EXPECT_EQ(decoded->leaderMemberId, 4);
+    EXPECT_EQ(decoded->assignedSessionId, 77);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +194,7 @@ TEST(ConnectResponseCodec, LargeAndNegativeValues) {
 
     std::array<uint8_t, 64> buf{};
     const std::size_t written = resp.encode(buf.data());
-    ASSERT_EQ(written, 38u);
+    ASSERT_EQ(written, 42u);
 
     auto decoded = rpc::ConnectResponse::decode(buf.data(), written);
     ASSERT_TRUE(decoded.has_value());
@@ -434,7 +456,7 @@ TEST(ConnectResponseCodec, IntBoundaryValuesAllExtrema) {
 
         std::array<uint8_t, 64> buf{};
         const std::size_t written = resp.encode(buf.data());
-        ASSERT_EQ(written, 38u) << "code=" << tc.code;
+        ASSERT_EQ(written, 42u) << "code=" << tc.code;
 
         // Byte-level verification of field positions.
         EXPECT_EQ(leS16(buf.data(), 24), tc.code)              << "code byte check";

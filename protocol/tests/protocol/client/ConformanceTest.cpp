@@ -174,7 +174,8 @@ TEST(ConformanceGolden, ConnectResponse) {
     const auto golden = readVector("connect_response.bin");
     ASSERT_EQ(golden.size(), 38u);
 
-    assertHeader(golden, rpc::ConnectResponse::TEMPLATE_ID, rpc::ConnectResponse::BODY_FIXED);
+    // The v0 (pre-brokerVersion, 38-byte) form: a decode-compatibility vector.
+    assertHeader(golden, rpc::ConnectResponse::TEMPLATE_ID, rpc::ConnectResponse::BODY_FIXED_V0);
 
     auto msgOpt = rpc::ConnectResponse::decode(golden.data(), golden.size());
     ASSERT_TRUE(msgOpt.has_value());
@@ -191,8 +192,11 @@ TEST(ConformanceGolden, ConnectResponse) {
     msg.leaderMemberId    = 2;
     msg.assignedSessionId = static_cast<int64_t>(0x00000000DEADBEEFULL);
 
+    EXPECT_EQ(msgOpt->brokerVersion, 0) << "a v0 frame advertises no broker version";
     std::array<uint8_t, 64> enc{};
-    const std::size_t n = msg.encode(enc.data());
+    (void)msg.encode(enc.data());
+    rpc::detail::putLE16(enc.data(), 0, rpc::ConnectResponse::BODY_FIXED_V0);  // re-encode the v0 form
+    const std::size_t n = rpc::ConnectResponse::ENCODED_SIZE_V0;
     ASSERT_EQ(n, 38u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden connect_response.bin";
@@ -207,7 +211,8 @@ TEST(ConformanceGolden, ConnectResponseRedirect) {
     const auto golden = readVector("connect_response_redirect.bin");
     ASSERT_EQ(golden.size(), 38u);
 
-    assertHeader(golden, rpc::ConnectResponse::TEMPLATE_ID, rpc::ConnectResponse::BODY_FIXED);
+    // The v0 (pre-brokerVersion, 38-byte) form: a decode-compatibility vector.
+    assertHeader(golden, rpc::ConnectResponse::TEMPLATE_ID, rpc::ConnectResponse::BODY_FIXED_V0);
 
     auto msgOpt = rpc::ConnectResponse::decode(golden.data(), golden.size());
     ASSERT_TRUE(msgOpt.has_value());
@@ -224,11 +229,50 @@ TEST(ConformanceGolden, ConnectResponseRedirect) {
     msg.leaderMemberId    = 1;
     msg.assignedSessionId = 0;
 
+    EXPECT_EQ(msgOpt->brokerVersion, 0) << "a v0 frame advertises no broker version";
     std::array<uint8_t, 64> enc{};
-    const std::size_t n = msg.encode(enc.data());
+    (void)msg.encode(enc.data());
+    rpc::detail::putLE16(enc.data(), 0, rpc::ConnectResponse::BODY_FIXED_V0);  // re-encode the v0 form
+    const std::size_t n = rpc::ConnectResponse::ENCODED_SIZE_V0;
     ASSERT_EQ(n, 38u);
     EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
         << "Encoded bytes differ from golden connect_response_redirect.bin";
+}
+
+// ===========================================================================
+// 4b. connect_response_v3.bin — the form every broker >= version 3 sends:
+//    ConnectResponse{ code=0(OK), leaderMemberId=2,
+//                    assignedSessionId=0x00000000DEADBEEF, brokerVersion=3 }
+//    Expected byte length: 24 + 18 = 42
+// ===========================================================================
+TEST(ConformanceGolden, ConnectResponseV3) {
+    const auto golden = readVector("connect_response_v3.bin");
+    ASSERT_EQ(golden.size(), 42u);
+
+    assertHeader(golden, rpc::ConnectResponse::TEMPLATE_ID, rpc::ConnectResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::ConnectResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,         kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,     kCorrelationId);
+    EXPECT_EQ(msgOpt->code,              static_cast<int16_t>(rpc::ErrorCode::OK));
+    EXPECT_EQ(msgOpt->leaderMemberId,    2);
+    EXPECT_EQ(msgOpt->assignedSessionId, static_cast<int64_t>(0x00000000DEADBEEFULL));
+    EXPECT_EQ(msgOpt->brokerVersion,     3);
+
+    rpc::ConnectResponse msg;
+    msg.sessionId         = kSessionId;
+    msg.correlationId     = kCorrelationId;
+    msg.code              = static_cast<int16_t>(rpc::ErrorCode::OK);
+    msg.leaderMemberId    = 2;
+    msg.assignedSessionId = static_cast<int64_t>(0x00000000DEADBEEFULL);
+    msg.brokerVersion     = 3;
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, 42u);
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0)
+        << "Encoded bytes differ from golden connect_response_v3.bin";
 }
 
 // ===========================================================================

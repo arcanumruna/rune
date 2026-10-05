@@ -11,6 +11,7 @@ conformance/
     connect_request_empty_channel.bin    (34 bytes)
     connect_response.bin                 (38 bytes)
     connect_response_redirect.bin        (38 bytes)
+    connect_response_v3.bin              (42 bytes, brokerVersion 3; the two above are the v0 form)
     keepalive.bin                        (24 bytes)
     disconnect.bin                       (26 bytes)
     error_response.bin                   (53 bytes)
