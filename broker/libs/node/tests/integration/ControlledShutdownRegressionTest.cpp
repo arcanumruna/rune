@@ -466,5 +466,119 @@ TEST(ControlledShutdownRegression, GracefullyStoppedNodeRestartsAndLeadsAgainReg
     ns[static_cast<std::size_t>(victim)]->start();
     EXPECT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms))
         << "the restarted node never re-entered the ISRs / regained its preferred leadership";
+    // The rolling-restart readiness gate: every node reports itself in sync.
+    for (auto& n : ns)
+        EXPECT_TRUE(eventually([&] { return n->outOfSyncPartitions() == 0; }, 10'000ms))
+            << "a node never reported itself in sync (readiness gate)";
     for (auto& n : ns) n->stop();
+}
+
+// ===========================================================================
+// Fix round 1 (review 2026-10-05)
+// ===========================================================================
+
+// M1 (MAJOR): a gracefully stopped node whose data dir is WIPED restarts with
+// a process identity that is not larger than the stopped one's (the counter
+// restarts) — it must still rejoin the ISRs and lead again, never stay fenced.
+TEST(ControlledShutdownRegression, WipedDataDirRestartRejoinsRegression) {
+    TmpDir d0{"w0"}, d1{"w1"}, d2{"w2"};
+    const auto ports = Ports::discover(3);
+    std::array<fs::path, 3> dirs{d0.path, d1.path, d2.path};
+    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports), makeConfig(1, d1.path, ports),
+                                  makeConfig(2, d2.path, ports)};
+    std::array<std::unique_ptr<BrokerNode>, 3> ns;
+    for (int i = 0; i < 3; ++i) {
+        ns[static_cast<std::size_t>(i)] = std::make_unique<BrokerNode>(cfg[static_cast<std::size_t>(i)]);
+        ns[static_cast<std::size_t>(i)]->start();
+    }
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
+    const int controller = consensusLeaderOnControl(*ns[0]);
+    const int victim = (controller + 1) % 3;
+    ASSERT_TRUE(ns[static_cast<std::size_t>(victim)]->controlledShutdown(20'000ms));
+    ns[static_cast<std::size_t>(victim)]->stop();
+    ns[static_cast<std::size_t>(victim)].reset();
+    std::error_code ec;
+    fs::remove_all(dirs[static_cast<std::size_t>(victim)], ec);
+    fs::create_directories(dirs[static_cast<std::size_t>(victim)]);
+    ns[static_cast<std::size_t>(victim)] = std::make_unique<BrokerNode>(cfg[static_cast<std::size_t>(victim)]);
+    ns[static_cast<std::size_t>(victim)]->start();
+    EXPECT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms))
+        << "the wiped-and-restarted node stayed fenced (never re-entered the ISRs)";
+    for (auto& n : ns) n->stop();
+}
+
+// The controller crashes while a node's hand-off is in flight: the request is
+// re-sent to the successor (it already holds the mark) and the hand-off
+// completes there.
+TEST(ControlledShutdownRegression, ControllerCrashMidHandOffRegression) {
+    TmpDir d0{"x0"}, d1{"x1"}, d2{"x2"};
+    const auto ports = Ports::discover(3);
+    std::array<std::unique_ptr<BrokerNode>, 3> ns;
+    for (int i = 0; i < 3; ++i) {
+        const fs::path& d = i == 0 ? d0.path : i == 1 ? d1.path : d2.path;
+        ns[static_cast<std::size_t>(i)] = std::make_unique<BrokerNode>(makeConfig(i, d, ports));
+        ns[static_cast<std::size_t>(i)]->start();
+    }
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
+    const int controller = consensusLeaderOnControl(*ns[0]);
+    const int victim = (controller + 1) % 3;
+    const int third = (controller + 2) % 3;
+    std::map<int32_t, int32_t> oldEpoch;
+    for (int32_t p = 0; p < kParts; ++p) {
+        const auto re = roleEpoch(*ns[static_cast<std::size_t>(victim)], 0, p);
+        if (re.role == Role::Leader) oldEpoch[p] = re.epoch;
+    }
+    // The controller dies (an unclean stop from the cluster's view) right
+    // before the stop signal: the victim still believes it is the controller,
+    // so its first request goes to a dead node; the victim and the third node
+    // then elect the third (the victim withdrew its candidacy), and the
+    // request is re-sent to it on that controller change.
+    ns[static_cast<std::size_t>(controller)]->stop();
+    const bool done = ns[static_cast<std::size_t>(victim)]->controlledShutdown(30'000ms);
+    EXPECT_TRUE(done) << "the hand-off never completed with the successor controller";
+    EXPECT_EQ(consensusLeaderOnControl(*ns[static_cast<std::size_t>(third)]), third);
+    for (const auto& [p, e] : oldEpoch) {
+        const auto cl = committedLeader(*ns[static_cast<std::size_t>(third)], 0, p);
+        EXPECT_EQ(cl.first, third) << "partition " << p << " not handed to the surviving node";
+        EXPECT_GT(cl.second, e);
+    }
+    ns[static_cast<std::size_t>(victim)]->stop();
+    ns[static_cast<std::size_t>(third)]->stop();
+}
+
+// Two nodes stop gracefully at the same time: every partition ends with the
+// remaining node, at a higher epoch, before either exits.
+TEST(ControlledShutdownRegression, TwoNodesStoppingAtOnceRegression) {
+    TmpDir d0{"t0"}, d1{"t1"}, d2{"t2"};
+    const auto ports = Ports::discover(3);
+    std::array<std::unique_ptr<BrokerNode>, 3> ns;
+    for (int i = 0; i < 3; ++i) {
+        const fs::path& d = i == 0 ? d0.path : i == 1 ? d1.path : d2.path;
+        ns[static_cast<std::size_t>(i)] = std::make_unique<BrokerNode>(makeConfig(i, d, ports));
+        ns[static_cast<std::size_t>(i)]->start();
+    }
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    ASSERT_TRUE(eventually([&] { return spreadAndSettled(ns); }, 60'000ms)) << "leadership never spread";
+    const int controller = consensusLeaderOnControl(*ns[0]);
+    const int a = (controller + 1) % 3, b = (controller + 2) % 3;
+    std::array<int32_t, kParts> before{};
+    for (int32_t p = 0; p < kParts; ++p) before[static_cast<std::size_t>(p)] = committedLeader(*ns[static_cast<std::size_t>(controller)], 0, p).second;
+    bool okA = false, okB = false;
+    std::thread ta([&] { okA = ns[static_cast<std::size_t>(a)]->controlledShutdown(20'000ms); });
+    std::thread tb([&] { okB = ns[static_cast<std::size_t>(b)]->controlledShutdown(20'000ms); });
+    ta.join(); tb.join();
+    EXPECT_TRUE(okA);
+    EXPECT_TRUE(okB);
+    for (int32_t p = 0; p < kParts; ++p) {
+        const auto cl = committedLeader(*ns[static_cast<std::size_t>(controller)], 0, p);
+        EXPECT_EQ(cl.first, controller) << "partition " << p << " not with the remaining node";
+        if (cl.first != controller) continue;
+        if (before[static_cast<std::size_t>(p)] >= 0 && roleEpoch(*ns[static_cast<std::size_t>(controller)], 0, p).role != Role::Leader)
+            ADD_FAILURE() << "the remaining node's replica does not lead partition " << p;
+    }
+    ns[static_cast<std::size_t>(a)]->stop();
+    ns[static_cast<std::size_t>(b)]->stop();
+    ns[static_cast<std::size_t>(controller)]->stop();
 }

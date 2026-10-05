@@ -175,6 +175,23 @@ public:
     /// F9a: the control-thread → observer leadership ring.  Set before start.
     void setLeaderObserver(LeaderObserver* o) noexcept { leaderObserver_ = o; }
 
+    int drainNodeControl_() {
+        int sent = 0;
+        if (auto& out = metadataService_->nodeControlOutbox(); !out.empty()) [[unlikely]] {
+            std::size_t n = 0;
+            while (n < out.size() && transport_->sendAlterIsr(out[n])) ++n;
+            out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n));
+            sent += static_cast<int>(n);
+        }
+        if (auto& out = metadataService_->nodeControlResponseOutbox(); !out.empty()) [[unlikely]] {
+            std::size_t n = 0;
+            while (n < out.size() && transport_->sendAlterIsrResponse(out[n].first, out[n].second)) ++n;
+            out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n));
+            sent += static_cast<int>(n);
+        }
+        return sent;
+    }
+
     /// Controlled shutdown state machine (driven on this agent's slow tick).
     /// BrokerNode binds it before the control thread starts; begin()/observe()
     /// are its cross-thread ring endpoints.
@@ -295,6 +312,11 @@ private:
         if (metadataService_) {
             const int metaWork = metadataService_->doWork(nowNs);
             work += metaWork;
+            // Controlled shutdown (cold; two empty() checks when idle): member
+            // confirmations → the controller, the controller's pushed COMPLETE
+            // → the stopping node.  Every cycle (events, not the slow tick).
+            if (election_) metadataService_->noteController(static_cast<int32_t>(election_->leaderMemberId()));
+            if (transport_) [[likely]] work += drainNodeControl_();
 
             // GR-7 / Task-14: FAILOVER reassignment of partition leadership.
             //
@@ -458,13 +480,6 @@ private:
                 // Controlled shutdown (cold): register / hand-off steps, on
                 // the same slow tick as the rebalance it depends on.
                 slowWork += controlledShutdown_.doWork(nowNs);
-                // Member confirmations of stopping nodes → the controller.
-                if (auto& out = metadataService_->nodeControlOutbox(); !out.empty() && transport_) [[unlikely]] {
-                    std::size_t sent = 0;
-                    while (sent < out.size() && transport_->sendAlterIsr(out[sent])) ++sent;
-                    out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(sent));
-                    slowWork += static_cast<int>(sent);
-                }
                 failoverTick_.done(nowNs, slowWork);
             }
 

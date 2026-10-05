@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -92,6 +93,15 @@ int64_t bumpProcessIncarnation(const std::string& dataDir) {
     ::close(fd);
     if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
     return next;
+}
+// Controlled shutdown (review M1): a random, non-zero 64-bit identity of THIS
+// process — compared by identity, so a restart with a wiped data dir (whose
+// incarnation counter restarts low) is still a new process.  Cold (once).
+int64_t processNonce() {
+    std::random_device rd;
+    uint64_t v = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    v ^= static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) * 0x9E3779B97F4A7C15ull;
+    return v == 0 ? 1 : static_cast<int64_t>(v);
 }
 // Leader-epoch restart fence for a MEMORY-backed replica (disk-backed ones keep
 // it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.
@@ -421,6 +431,8 @@ void BrokerNode::start() {
         stuckMarkersCounterRegId_ = aeron_->addCounter(
             kStuckMarkersCounterTypeId, roleKey, kRoleKeyLength,
             stuckMarkersLabel(config_.nodeId));
+        outOfSyncCounterRegId_ = aeron_->addCounter(
+            kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -2383,9 +2395,14 @@ void BrokerNode::buildGateway() {
     // acks of this node's NODE-level requests arrive on the legacy transport
     // (control thread).
     if (!config_.isSingleNode() && replTransport_ && metadataService_ && election_) {
+        // Review M1: the node-control protocol identifies this PROCESS by a
+        // random nonce (compared by identity) — never by the data-dir counter,
+        // which restarts low after a wiped dir.
         runtimeAgent_->controlledShutdown().bind(
-            config_.nodeId, replicaRegistry_ ? replicaRegistry_->processIncarnation() : 0,
-            replTransport_.get(), metadataService_.get(), election_.get(), [this] {
+            config_.nodeId, processNonce(),
+            [](void* t, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept {
+                return static_cast<rune::replication::AeronPartitionTransport*>(t)->sendNodeControl(to, m);
+            }, replTransport_.get(), metadataService_.get(), election_.get(), [this] {
                 std::vector<int32_t> ids;
                 for (const auto& pc : config_.peers) ids.push_back(pc.id);
                 return ids;
@@ -2533,6 +2550,12 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
 // only waits for its ring-published status, bounded by `budget` — a
 // last-resort cap after which the caller stops as before (logged).
 // ---------------------------------------------------------------------------
+int32_t BrokerNode::outOfSyncPartitions() noexcept {
+    if (!runtimeAgent_) return -1;
+    const auto st = runtimeAgent_->controlledShutdown().observe();
+    return st.phase == ControlledShutdown::Phase::Running ? st.remaining : -1;
+}
+
 bool BrokerNode::controlledShutdown(std::chrono::milliseconds budget) {
     if (!started_ || stopped_ || !runtimeAgent_) return false;
     using clock = std::chrono::steady_clock;
@@ -2648,6 +2671,12 @@ void BrokerNode::publishRole() noexcept {
         // Publish the term this node observes (its own leadership term id).
         termCounter_->set(static_cast<std::int64_t>(v.term));
     }
+    // Rolling-restart readiness gate (controlled shutdown review L5).
+    if (!outOfSyncCounter_ && outOfSyncCounterRegId_ >= 0) {
+        try { outOfSyncCounter_ = aeron_->findCounter(outOfSyncCounterRegId_); }
+        catch (...) { outOfSyncCounter_.reset(); }
+    }
+    if (outOfSyncCounter_) outOfSyncCounter_->set(static_cast<std::int64_t>(outOfSyncPartitions()));
 }
 
 // ---------------------------------------------------------------------------
@@ -3110,6 +3139,7 @@ void BrokerNode::stop() {
     roleCounter_.reset();
     termCounter_.reset();
     stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
+    outOfSyncCounter_.reset();      // readiness gate (L5): same rule
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"

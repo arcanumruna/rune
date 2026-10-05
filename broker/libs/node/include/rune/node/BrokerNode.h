@@ -411,6 +411,15 @@ public:
     /// before: the remaining partitions fail over the old way).
     bool controlledShutdown(std::chrono::milliseconds budget);
 
+    /// Rolling-restart readiness gate (observer thread): how many partitions
+    /// this node replicates but is NOT in the committed ISR of; -1 = unknown
+    /// (no controller known yet, or the node is stopping).  0 = this node is
+    /// fully back in sync — safe to restart the next node.  Also published as
+    /// the Aeron counter kOutOfSyncCounterTypeId by publishRole() (read it
+    /// out-of-band from cnc.dat, like the role counter).  Observer thread
+    /// (the same single consumer as controlledShutdown()).
+    int32_t outOfSyncPartitions() noexcept;
+
     // -----------------------------------------------------------------------
     // fsyncgate fail-stop (Task 10 fix 1; Kafka LogDirFailure / PostgreSQL
     // data_sync_retry=off).  When any log's fsync fails, the runtime logs
@@ -1054,6 +1063,8 @@ private:
     std::int64_t                     termCounterRegId_ = -1;
     std::shared_ptr<aeron::Counter>  roleCounter_;
     std::shared_ptr<aeron::Counter>  termCounter_;
+    std::int64_t                     outOfSyncCounterRegId_ = -1;   ///< readiness gate (L5)
+    std::shared_ptr<aeron::Counter>  outOfSyncCounter_;
     // D9 review MEDIUM-3: the TCS stuck-markers gauge counter.  Resolved and
     // set on the CONTROL (runtime) thread only, from the TCS sink below.
     std::int64_t                     stuckMarkersCounterRegId_ = -1;

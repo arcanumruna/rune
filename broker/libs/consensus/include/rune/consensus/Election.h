@@ -465,6 +465,12 @@ private:
     /// for the term it resigned (loss recovery on the status interval).
     bool resigned_       = false;
     Term resignedTermId_ = -1;
+    /// Entry time of this node's current leadership (LeaderLogReplication);
+    /// INT64_MIN = never led.  The failover-liveness grace (eligibleNodeIds).
+    int64_t leaderSinceNs_ = INT64_MIN;
+    /// gracefulClosedLeaderId_ was set by a StandDown: the resigned leader's
+    /// own canvass does not clear it until this election completes.
+    bool skipFromStandDown_ = false;
 
     // Election.java:104  private ClusterMember leaderMember = null;
     ClusterMember* leaderMember_ = nullptr;

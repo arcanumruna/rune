@@ -1964,14 +1964,15 @@ struct StandDownRecorder final : ConsensusPublisher {
     std::vector<Call> standDowns;
     int requestVotes = 0, nlts = 0;
     void standDown(NodeId to, Term term, NodeId leader) override { standDowns.push_back({to, term, leader}); }
-    void canvassPosition(NodeId, Term, int64_t, Term, NodeId) override {}
+    int canvasses = 0;
+    void canvassPosition(NodeId, Term, int64_t, Term, NodeId) override { ++canvasses; }
     void requestVote(NodeId, Term, int64_t, Term, NodeId) override { ++requestVotes; }
     void placeVote(NodeId, Term, Term, int64_t, NodeId, NodeId, bool) override {}
     void newLeadershipTerm(NodeId, Term, Term, int64_t, int64_t, Term, int64_t, int64_t, int64_t,
                            int64_t, NodeId, int32_t, bool, int64_t) override { ++nlts; }
     void appendPosition(NodeId, Term, int64_t, NodeId, uint8_t) override {}
     void commitPosition(NodeId, Term, int64_t, NodeId) override {}
-    void clear() { standDowns.clear(); requestVotes = 0; nlts = 0; }
+    void clear() { standDowns.clear(); requestVotes = 0; nlts = 0; canvasses = 0; }
 };
 Election makeSdElection(NodeId self, StandDownRecorder& pub, NodeStateFile& nsf, TermLog& tl, uint64_t seed) {
     return Election(true, -1, 0, 0, 0, 0, makeMembers3(self), self, pub, nsf, tl,
@@ -2070,4 +2071,81 @@ TEST(ElectionStandDownRegression, NewLeaderSeesPeersLiveFromLeaderLogReplication
     std::array<NodeId, 8> buf{};
     const std::size_t n = e.eligibleNodeIds(nowNs, kElectionTimeoutNs, buf.data(), buf.size());
     EXPECT_EQ(n, 3u) << "a new leader judged its live peers dead before its first AppendPosition";
+}
+
+// Review 2026-10-05 D2 (Aeron fidelity): LEADER_LOG_REPLICATION waits for a
+// quorum of NEW-TERM AppendPositions — the peers' old-term canvass / vote
+// positions never count (Election.java:820), even though the new leader's
+// failover liveness view (eligibleNodeIds) already sees its peers live.
+TEST(ElectionStandDownRegression, LeaderLogReplicationIgnoresOldTermCanvassPositionsRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    Election e(true, -1, 0, 0, /*logPosition=*/1000, /*appendPosition=*/1000, makeMembers3(0), 0, pub, nsf, tl,
+               kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs, 0);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onCanvassPosition(0, 1000, 0, 1);
+    e.onCanvassPosition(0, 1000, 0, 2);
+    nowNs += kStartupCanvassTimeoutNs + 1;
+    e.doWork(nowNs);
+    nowNs += kElectionTimeoutNs * 10;
+    e.doWork(nowNs);
+    nowNs += 1;
+    e.doWork(nowNs);
+    const Term cTerm = e.candidateTermId();
+    e.onVote(0, 1000, cTerm, 0, 1, true);
+    e.onVote(0, 1000, cTerm, 0, 2, true);
+    nowNs += 1;
+    e.doWork(nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+    for (int i = 0; i < 3; ++i) e.doWork(++nowNs);
+    EXPECT_EQ(e.state(), ElectionState::LeaderLogReplication)
+        << "old-term canvass/vote positions counted toward the replication quorum";
+    std::array<NodeId, 8> buf{};
+    EXPECT_EQ(e.eligibleNodeIds(nowNs, kElectionTimeoutNs, buf.data(), buf.size()), 3u)
+        << "the new leader's failover view must still see its peers live";
+    e.onAppendPosition(nowNs, e.leadershipTermId(), 1000, 1, 0);
+    e.doWork(++nowNs);
+    EXPECT_NE(e.state(), ElectionState::LeaderLogReplication) << "a new-term AppendPosition quorum did not advance";
+}
+
+// Review LOW-1: a follower told by StandDown to elect now keeps skipping the
+// resigned leader even when that leader canvasses with a NEWER log (an
+// unreplicated tail appended in its resign tick) — the hand-off election stays
+// unanimous without it instead of falling back to the election timeout.  The
+// resigned leader still canvasses (its position lets others count its vote).
+TEST(ElectionStandDownRegression, ResignedLeaderCanvassKeepsTheFollowersSkipRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, 42);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, 1, 0, 0, 0, 0, /*leader=*/1, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    e.onStandDown(nowNs + 1, 1, 1);
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+    e.onCanvassPosition(1, /*logPosition=*/500, 1, /*from=*/1);   // the resigned leader, newer log
+    e.onCanvassPosition(0, 0, 1, 2);
+    e.doWork(nowNs + 2);
+    EXPECT_EQ(e.state(), ElectionState::Nominate)
+        << "the resigned leader's canvass cleared the skip — the hand-off fell back to the timeout";
+
+    // ... and the resigned leader DOES canvass.
+    TempFile nsf2(".nsf"), tl2(".tl");
+    NodeStateFile n2(nsf2.str());
+    TermLog       t2(tl2.str());
+    StandDownRecorder pub2;
+    auto l = makeSdElection(0, pub2, n2, t2, 0);
+    int64_t now2 = 1'000'000LL;
+    bringToLeaderLogReplication(l, now2);
+    ASSERT_TRUE(driveSdLeaderToClosed(l, now2));
+    ASSERT_TRUE(l.resign(now2));
+    pub2.clear();
+    for (int i = 0; i < 5; ++i) { now2 += kStatusIntervalNs; l.doWork(now2); }
+    EXPECT_GT(pub2.canvasses, 0) << "a resigned leader that never canvasses can block a quorum";
 }

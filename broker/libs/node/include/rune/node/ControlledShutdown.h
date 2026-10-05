@@ -79,11 +79,22 @@ public:
     /// Startup thread, before the control thread runs.  `transport` null (a
     /// single node / no replication transport) = nothing to hand off: a begin
     /// completes at once.
-    void bind(int32_t self, int64_t incarnation, rune::replication::AeronPartitionTransport* transport,
+    using SendFn = bool (*)(void* ctx, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept;
+    void bind(int32_t self, int64_t incarnation, SendFn send, void* sendCtx,
               MetadataService* metadata, rune::consensus::Election* election, std::vector<int32_t> members) {
-        self_ = self; incarnation_ = incarnation; transport_ = transport;
+        self_ = self; incarnation_ = incarnation; send_fn_ = send; sendCtx_ = sendCtx;
         metadata_ = metadata; election_ = election; members_ = std::move(members);
         if (active_()) state_ = Registering{};
+    }
+    /// Pure — the rolling-restart readiness gate: partitions `self`
+    /// replicates but is NOT in the committed ISR of (0 = fully in sync).
+    [[nodiscard]] static int32_t outOfSync(const rune::metadata::AssignmentMap& map, int32_t self) noexcept {
+        int32_t n = 0;
+        map.forEach([&](int32_t, int32_t, const rune::metadata::PartitionAssignment& pa) {
+            if (std::find(pa.replicas.begin(), pa.replicas.end(), self) == pa.replicas.end()) return;
+            if (std::find(pa.isr.begin(), pa.isr.end(), self) == pa.isr.end()) ++n;
+        });
+        return n;
     }
 
     /// Startup-immutable after bind(): false = a single node / no replication
@@ -138,7 +149,9 @@ public:
         std::visit([complete, responder](auto& st) {
             if constexpr (requires { st.req; }) {
                 st.req.ackedBy    = responder;
-                st.req.completeBy = complete ? responder : -2;
+                st.req.unanswered = 0;
+                if (complete) st.req.completeBy = responder;   // a pushed COMPLETE is final for it
+                else if (st.req.completeBy == responder) st.req.completeBy = -2;
             }
         }, state_);
     }
@@ -170,9 +183,20 @@ private:
         int32_t ackedBy    = -2;   ///< controller that acked it (-2 = none)
         int32_t completeBy = -2;   ///< controller that answered COMPLETE (shutdown; -2 = none)
         bool    clearSent  = false;   ///< re-asked at once when this node's own map cleared
+        int32_t unanswered = 0;       ///< sends to `sentTo` with no answer (backoff, review L2)
+        bool    silentLogged = false;
     };
-    struct Registering { static constexpr Phase kPhase = Phase::Registering; Request req; };
-    struct Running     { static constexpr Phase kPhase = Phase::Running; int32_t registeredWith = -1; };
+    /// Review L2: after this many unanswered sends to one controller (an older
+    /// binary never answers) the re-send interval doubles, up to kMaxBackoffShift.
+    static constexpr int32_t kFastSends       = 20;
+    static constexpr int32_t kMaxBackoffShift = 7;   // 50 ms << 7 = 6.4 s
+    struct Registering { static constexpr Phase kPhase = Phase::Registering; Request req; };   // readiness: -1
+    struct Running {
+        static constexpr Phase kPhase = Phase::Running;
+        int32_t  registeredWith = -1;
+        int32_t  remaining      = -1;   ///< readiness gate: partitions not in sync here (outOfSync)
+        uint64_t mapVersion     = ~0ull;
+    };
     struct Draining {
         static constexpr Phase kPhase = Phase::Draining;
         explicit Draining(int64_t now = 0) noexcept : startedNs(now) {}
@@ -193,7 +217,7 @@ private:
     static constexpr std::int32_t kStatusMsg = 1;
 
     [[nodiscard]] bool active_() const noexcept {
-        return transport_ != nullptr && metadata_ != nullptr && election_ != nullptr && self_ >= 0;
+        return send_fn_ != nullptr && metadata_ != nullptr && election_ != nullptr && self_ >= 0;
     }
     [[nodiscard]] int32_t controller_() const noexcept {
         return election_ ? static_cast<int32_t>(election_->leaderMemberId()) : -1;
@@ -216,7 +240,15 @@ private:
         if (ctl < 0) return 0;
         const bool shutdown = (flags & rune::replication::AlterIsrMsg::kNodeShutdown) != 0;
         if (shutdown ? q.completeBy == ctl : q.ackedBy == ctl) return 0;
-        if (!force && q.sentTo == ctl && nowNs - q.lastSendNs < kResendNs) return 0;
+        if (q.sentTo != ctl) q.unanswered = 0;                  // a new controller: fast again
+        else if (q.ackedBy == ctl) q.unanswered = 0;            // it answers (PENDING)
+        const int32_t shift = std::clamp(q.unanswered - kFastSends, 0, kMaxBackoffShift);
+        if (!force && q.sentTo == ctl && nowNs - q.lastSendNs < (kResendNs << shift)) return 0;
+        if (q.unanswered == kFastSends && !q.silentLogged) {
+            q.silentLogged = true;
+            spdlog::warn("ControlledShutdown[{}]: controller {} does not answer node-control requests (an "
+                         "older version?) — backing off", self_, ctl);
+        }
         rune::replication::AlterIsrMsg m{};
         m.topicId   = rune::replication::AlterIsrMsg::kNodeControlTopicId;
         m.partition = 0;
@@ -229,7 +261,8 @@ private:
         m.isr[4]    = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(incarnation_) >> 32));
         q.lastSendNs = nowNs;   // before the sends: a local answer arrives synchronously
         q.sentTo     = ctl;
-        for (int32_t n : members_) (void)transport_->sendNodeControl(n, m);   // ring full: re-sent later
+        ++q.unanswered;
+        for (int32_t n : members_) (void)send_fn_(sendCtx_, n, m);   // ring full: re-sent later
         return 1;
     }
     /// The shutdown request again, at once, the first time this node's own
@@ -245,11 +278,17 @@ private:
     }
 
     int step_(Running& st, int64_t) {
-        // A new controller may hold a mark an earlier incarnation of this node
+        // A new controller may hold a mark an earlier process of this node
         // left (it was a member then): register again on every controller change.
         if (!active_()) return 0;
         const int32_t ctl = controller_();
         if (ctl >= 0 && ctl != st.registeredWith) { state_ = Registering{}; return 1; }
+        // Readiness gate (review L5): recomputed only on a committed-map change.
+        const uint64_t v = metadata_->routingVersion();
+        if (v != st.mapVersion) {
+            st.mapVersion = v;
+            st.remaining  = ctl >= 0 ? outOfSync(metadata_->committedMap(), self_) : -1;
+        }
         return 0;
     }
     int step_(Done&, int64_t) { return 0; }
@@ -265,6 +304,14 @@ private:
     int step_(Draining& st, int64_t nowNs) {
         const auto& map = metadata_->committedMap();
         const int32_t ctl = controller_();
+        if (ctl < 0 && !leadsMovable_(map)) {
+            // Review L3: no controller known and nothing this node leads could
+            // move — nobody to hand anything to; stop now.
+            spdlog::info("ControlledShutdown[{}]: no controller known and no movable partition led here — "
+                         "ready to stop", self_);
+            state_ = Done{};
+            return 1;
+        }
         if (leadsConsensus_()) {
             // The controller: its user partitions first, then the consensus.
             st.remaining = blocking(map, self_, /*userOnly=*/true);
@@ -305,6 +352,14 @@ private:
         return work;
     }
 
+    [[nodiscard]] bool leadsMovable_(const rune::metadata::AssignmentMap& map) const noexcept {
+        bool any = false;
+        map.forEach([&](int32_t, int32_t, const rune::metadata::PartitionAssignment& pa) {
+            any = any || (pa.leaderNode == self_ && pa.isr.size() > 1);
+        });
+        return any;
+    }
+
     void publishStatus_() noexcept {
         Status now;
         now.phase = phaseOnControl();
@@ -318,7 +373,8 @@ private:
 
     int32_t                                     self_        = -1;
     int64_t                                     incarnation_ = 0;
-    rune::replication::AeronPartitionTransport* transport_   = nullptr;
+    SendFn                                      send_fn_     = nullptr;
+    void*                                       sendCtx_     = nullptr;
     MetadataService*                            metadata_    = nullptr;
     rune::consensus::Election*                  election_    = nullptr;
     std::vector<int32_t>                        members_;               ///< every cluster member (incl. self)

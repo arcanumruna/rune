@@ -127,10 +127,16 @@ std::size_t Election::eligibleNodeIds(int64_t nowNs, int64_t timeoutNs,
     const bool   selfLeads =
         (leaderMember_ != nullptr) && (leaderMember_->id == selfId);
 
+    // Become-leader grace (controlled-shutdown review D2): a freshly elected
+    // leader has no AppendPosition from its peers in the new term yet (their
+    // clocks were reset at canvass) — for one window from its first leader
+    // state every peer counts as live, so it never fails partitions over to
+    // itself with ISR={self}.  A dead peer is dropped after the window.
+    const bool leaderGrace = selfLeads && leaderSinceNs_ != INT64_MIN && nowNs - leaderSinceNs_ < timeoutNs;
     std::size_t n = 0;
     for (const ClusterMember& m : clusterMembers_) {
         const bool isSelfLeaderEntry = selfLeads && (m.id == selfId);
-        if (isSelfLeaderEntry || m.isActive(nowNs, timeoutNs)) {
+        if (isSelfLeaderEntry || leaderGrace || m.isActive(nowNs, timeoutNs)) {
             if (n < cap) out[n++] = m.id;
         }
     }
@@ -323,7 +329,8 @@ int Election::canvass(int64_t nowNs)
     // Election.java:707-712: publish CanvassPosition on interval
     if (hasUpdateIntervalExpired(nowNs, electionStatusIntervalNs_)) {
         timeOfLastUpdateNs_ = nowNs;
-        publishCanvassPosition();
+        publishCanvassPosition();   // a resigned leader too: its position is what lets
+                                    // the others count its vote (a quorum without it may not exist)
         workCount++;
     }
 
@@ -698,7 +705,10 @@ void Election::onCanvassPosition(Term    logLeadershipTermId,
     if (followerMemberId == thisMemberId_) return;
 
     // Election.java:296-299: clear gracefulClosedLeaderId if it was this member
-    if (followerMemberId == gracefulClosedLeaderId_) {
+    // — except a leader that RESIGNED to us (StandDown, controlled shutdown):
+    // it keeps canvassing (its vote may be needed for a quorum), and the skip
+    // must hold for this election (review LOW-1).
+    if (followerMemberId == gracefulClosedLeaderId_ && !skipFromStandDown_) {
         gracefulClosedLeaderId_ = -1; // NULL_VALUE
     }
 
@@ -1044,6 +1054,7 @@ void Election::onStandDown(int64_t nowNs, Term leadershipTermIdArg, NodeId leade
         leaderMemberIdArg == thisMemberId_ || leadershipTermIdArg != leadershipTermId_)
         return;   // not from the leader we follow, for our term: stale / foreign
     gracefulClosedLeaderId_ = leaderMemberIdArg;   // canvass completes without it
+    skipFromStandDown_      = true;
     followerLiveness_.reset();
     state(ElectionState::Canvass, nowNs, "leader stood down (controlled shutdown) → election now");
 }
@@ -1164,15 +1175,12 @@ void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
                     thisM->timeOfLastAppendPositionNs = nowNs;
                 }
             }
-            // BECOME-LEADER liveness grace, from the FIRST leader state: this
-            // node reports itself leader (and its controller duties — failover
-            // over eligibleNodeIds() — start) here, not at electionComplete.
-            // Without the seed every peer's clock is the reset sentinel → a
-            // fresh leader sees only itself live and fails every partition over
-            // to itself (seen right after a controlled-shutdown hand-off).
-            // electionComplete seeds again (unchanged).
-            for (ClusterMember& m : clusterMembers_)
-                if (m.id != thisMemberId_) m.timeOfLastAppendPositionNs = nowNs;
+            // Failover-liveness grace from the FIRST leader state (see
+            // eligibleNodeIds): this node reports itself leader — and its
+            // controller duties start — here, not at electionComplete.  A
+            // separate clock: the members' append-position clocks (the
+            // replication quorum, Election.java:820) stay exactly Aeron's.
+            leaderSinceNs_ = nowNs;
             break;
         case ElectionState::FollowerLogReplication:
         case ElectionState::FollowerReplay:
@@ -1241,6 +1249,7 @@ void Election::electionComplete(int64_t nowNs)
         }
     }
 
+    skipFromStandDown_ = false;   // the hand-off election is over
     state(ElectionState::Closed, nowNs, "electionComplete");
 }
 

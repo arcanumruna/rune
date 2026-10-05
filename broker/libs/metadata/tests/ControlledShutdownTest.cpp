@@ -127,3 +127,43 @@ TEST(ControlledShutdownRegression, PreferredLeaderNeverMovesToAnExcludedNodeRegr
     for (const auto& r : bal.rebalance(in)) moved = moved || r.rec.leaderNode == 1;
     EXPECT_TRUE(moved) << "control: without the exclusion the preferred election fires";
 }
+
+// Fix round 1 (D5): the SOFT avoid rule for stopping nodes.
+TEST(ControlledShutdownRegression, AvoidedNodeHandsOffOrStaysOrSurvivesRegression) {
+    DynamicBalancer bal;
+    {   // a stopping leader hands off to a live in-sync replica, and leaves the ISR
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1, 2, 3}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {1, 2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {1};
+        auto r = bal.rebalance(in);
+        ASSERT_EQ(r.size(), 1u);
+        EXPECT_NE(r[0].rec.leaderNode, 1);
+        EXPECT_EQ(std::count(r[0].isr.begin(), r[0].isr.end(), 1), 0);
+    }
+    {   // sole in-sync replica: stays
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {1, 2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {1};
+        EXPECT_TRUE(bal.rebalance(in).empty());
+    }
+    {   // dead leader: a non-stopping survivor first (never the extra hop)
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1, 2, 3}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {2};
+        auto r = bal.rebalance(in);
+        ASSERT_EQ(r.size(), 1u);
+        EXPECT_EQ(r[0].rec.leaderNode, 3);
+    }
+    {   // dead leader, only the stopping survivor in sync: elected (not offline)
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1, 2}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {2};
+        auto r = bal.rebalance(in);
+        ASSERT_EQ(r.size(), 1u);
+        EXPECT_EQ(r[0].rec.leaderNode, 2);
+    }
+}

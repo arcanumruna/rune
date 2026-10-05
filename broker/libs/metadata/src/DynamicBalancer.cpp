@@ -267,6 +267,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 const bool leaderDead =
                     (cur->leaderNode == NO_LEADER)
                     || isExcludedLeader(ts->topicId, cur->leaderNode)
+                    || isIn(cur->leaderNode, in.avoidLeaders)   // a stopping leader hands off
                     || (!isIn(cur->leaderNode, in.liveNodes)
                         && !isIn(cur->leaderNode, in.dataPlaneAliveLeaders));
 
@@ -291,6 +292,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     // new epoch, or a node in controlled shutdown) is never a
                     // leadership target — not even the preferred one.
                     if (isExcludedLeader(ts->topicId, preferred)) continue;
+                    if (isIn(preferred, in.avoidLeaders)) continue;
                     if (!imbalanced(preferred)) continue;   // N3: below the ratio
                     // Kafka: a preferred election only targets a member of the
                     // committed ISR (the leader's AlterIsr re-admits it first).
@@ -345,6 +347,23 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     // no clean alternative — the caller re-elects it at a new
                     // epoch (never NO_LEADER / a survivor election from here).
                     if (groupIsr.empty() && hadExcluded) continue;
+                }
+                if (!in.avoidLeaders.empty() && !groupIsr.empty()) {
+                    // Controlled shutdown: prefer a live NON-stopping in-sync
+                    // replica.  With none left: a stopping LEADER keeps the
+                    // partition (sole in-sync replica — no unclean election);
+                    // a DEAD leader's partition goes to the stopping survivor
+                    // (better than offline).
+                    std::vector<int32_t> keep;
+                    for (int32_t n : groupIsr) if (!isIn(n, in.avoidLeaders)) keep.push_back(n);
+                    if (!keep.empty()) {
+                        groupIsr.swap(keep);
+                    } else {
+                        const PartitionAssignment* dc = in.cur->get(driver->topicId, p);
+                        const bool leaderAliveAndStopping =
+                            dc && isIn(dc->leaderNode, in.avoidLeaders) && isIn(dc->leaderNode, in.liveNodes);
+                        if (leaderAliveAndStopping) continue;
+                    }
                 }
 
                 // NB: NO minIsr floor here.  A single surviving in-ISR replica
@@ -526,7 +545,7 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                         newIsr.push_back(computedLeader);
                         for (int32_t node : cur->isr) {
                             if (node != computedLeader && isIn(node, in.liveNodes) &&
-                                !isIn(node, excluded))
+                                !isIn(node, excluded) && !isIn(node, in.avoidLeaders))
                                 newIsr.push_back(node);
                         }
                         chg.newIsr = std::move(newIsr);
