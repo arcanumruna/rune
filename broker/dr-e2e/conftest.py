@@ -45,12 +45,19 @@ def cluster():
 def fresh_cluster():
     c = Cluster(project="rune-dr-fault")
     try:
-        c.up(build=_build_flag(), leader_timeout=120)
+        # DR_STALE_DATA: start on the previous test's logs (never wiped) — the broker
+        # must be correct WITH stale/divergent data on disk (production never gets a
+        # clean slate).  DR_KEEP_CLUSTER: leave a failed run's cluster up to inspect.
+        stale = bool(os.environ.get("DR_STALE_DATA"))
+        c.up(build=_build_flag(), leader_timeout=120, clean=not stale)
         c.wait_data_plane_ready(max_attempts=5, timeout_s=60)
         yield c
     finally:
         faults.heal_all(c)
-        c.down()
+        if os.environ.get("DR_STALE_DATA"):
+            c.compose.down(keep_volumes=True)
+        elif not os.environ.get("DR_KEEP_CLUSTER"):
+            c.down()
 
 
 @pytest.fixture(scope="session")

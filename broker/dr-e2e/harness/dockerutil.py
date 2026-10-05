@@ -93,6 +93,13 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
         # Killing the `docker run` CLI does not stop its container: remove a
         # named one so it cannot keep producing into the next test (DR-15 phantoms).
         name = _run_container_name(args)
+        log_dir = os.environ.get("DR_CLIENT_LOG_DIR")
+        if name and log_dir:  # keep the full partial output (the exception text gets truncated)
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, f"TIMEOUT-{name}.log"), "w") as fh:
+                for part in (exc.stdout, exc.stderr):
+                    if part:
+                        fh.write(part.decode(errors="replace") if isinstance(part, bytes) else part)
         if name:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=60)
         raise TimeoutError(
@@ -157,9 +164,11 @@ class Compose:
         return run(self._base() + ["build", *services],
                    timeout=timeout, check=True, env=self._env())
 
-    def down(self, timeout: int = 120) -> CmdResult:
+    def down(self, timeout: int = 120, keep_volumes: bool = False) -> CmdResult:
         # -v removes named volumes (fresh state), --remove-orphans cleans stragglers.
-        return run(self._base() + ["down", "-v", "--remove-orphans"], timeout=timeout)
+        # keep_volumes: the containers go, the logs stay (DR_STALE_DATA restarts on them).
+        args = ["down", "--remove-orphans"] if keep_volumes else ["down", "-v", "--remove-orphans"]
+        return run(self._base() + args, timeout=timeout)
 
     def stop(self, service: str, timeout: int = 60) -> CmdResult:
         return run(self._base() + ["stop", service], timeout=timeout)

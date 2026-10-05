@@ -553,6 +553,12 @@ def run_group(
 
 
 def _parse_client_output(cid: int, exit_code: int, out: str) -> ClientResult:
+    # DR_CLIENT_LOG_DIR: keep every client's full output (assertions show only a tail).
+    log_dir = os.environ.get("DR_CLIENT_LOG_DIR")
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, f"{cid}.log"), "w") as fh:
+            fh.write(out)
     res = ClientResult(cid=cid, rc=1, exit_code=exit_code, raw=out)
     for m in _PRODUCED_RE.finditer(out):
         res.produced.append(Msg(int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5])))
