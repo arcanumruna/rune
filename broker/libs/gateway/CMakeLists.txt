@@ -112,6 +112,11 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_shard_notify_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_shard_notify_tests)
 
+    # 2026-10-05: record-egress publication lifetime (retire-on-ack) — no Aeron.
+    add_executable(rune_gateway_record_egress_lifetime_tests tests/gateway/RecordEgressLifetimeTest.cpp)
+    target_link_libraries(rune_gateway_record_egress_lifetime_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_record_egress_lifetime_tests)
+
     # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.
     # Gated behind BUILD_GATEWAY_TESTS (default ON when BUILD_TESTING=ON).

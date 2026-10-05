@@ -1218,6 +1218,40 @@ private:
     // Resolve in-flight record-egress pubs (non-blocking) + drain buffered
     // subscribes.  Called from doWork().
     void pollPendingRecordEgress_(int64_t nowNs);
+    // A resolved record-egress pub: cache it on its Session (never replacing a
+    // cached one) and forward the buffered subscribes with the CACHED pointer.
+    void onRecordEgressResolved_(int64_t sessionId, int32_t workerId, PendingRecordEgress& pend,
+                                 std::shared_ptr<aeron::ExclusivePublication> pub);
+
+    // -----------------------------------------------------------------------
+    // Record-egress publication lifetime — RETIRE-ON-ACK (2026-10-05 fix).
+    //
+    // A per-(session, worker) record-egress pub is handed to worker w as a RAW
+    // pointer (WorkerOp::egressPub); the worker stores it in its subscription
+    // table and writes through it on every push pass.  The gateway must
+    // therefore never destroy it while w may still hold it.  When the session
+    // closes, each of its pubs moves here (still owned — the shared_ptr never
+    // crosses threads) and w is sent a release op on its op ring — the SAME
+    // FIFO ring as every Subscribe op that carried the pointer, so it executes
+    // after them: the worker drops every subscription referencing the pointer
+    // and answers SessionSignal::EgressReleased(token) on its return ring.
+    // Only that acknowledgement destroys the pub (onEgressReleased_).  A
+    // release op a full ring refuses is retried every doWork (never dropped).
+    // Event-driven: no timer decides when a pub is freed.  Cold (close rate).
+    // States per entry: Unsent (enqueued=false) → AwaitingAck (enqueued=true)
+    // → destroyed on the ack.
+    // -----------------------------------------------------------------------
+    struct RetiringEgress {
+        uint64_t                                      token     = 0;
+        int64_t                                       sessionId = 0;
+        int32_t                                       worker    = 0;
+        std::shared_ptr<aeron::ExclusivePublication>  pub;
+        bool                                          enqueued  = false;
+    };
+    void retireRecordEgress_(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub);
+    bool tryEnqueueEgressRelease_(const RetiringEgress& r);
+    int  pumpEgressReleases_();
+    void onEgressReleased_(int32_t worker, uint64_t token);
     // GB-3: Subscribe/Unsubscribe handlers.
     void handleSubscribe    (const uint8_t* buf, std::size_t len);
     void handleUnsubscribe  (const uint8_t* buf, std::size_t len);
@@ -1453,6 +1487,11 @@ private:
     static constexpr uint32_t kCapEvictAfterDeferredPolls = 64;
 
     SessionTable                         sessions_;
+    // Retire-on-ack record-egress pubs (see RetiringEgress).  Declared after
+    // sessions_ / aeron_ so it is destroyed before them (pubs before client).
+    std::vector<RetiringEgress>          retiringEgress_;
+    uint64_t                             nextRetireToken_  = 0;
+    std::size_t                          retiringUnsent_   = 0;
 
     // Async pending-connect table (BR-7a).
     // Bounded to kMaxPendingConnects; all touched only in doWork (single-writer).
@@ -1816,7 +1855,24 @@ public:
         forwardUnsubscribeToWorker_(subId, topicId, partition);
     }
     /// Test-only: run the retry pumps (markers + subscription ops) once.
-    int pumpRetryQueuesForTest() { return pumpMarkerQueue_() + pumpSubOps_(); }
+    int pumpRetryQueuesForTest() { return pumpMarkerQueue_() + pumpSubOps_() + pumpEgressReleases_(); }
+    // Record-egress lifetime (retire-on-ack) test hooks.
+    void injectRecordEgressForTest(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub) {
+        if (Session* s = sessions_.find(sid)) s->recordEgressByWorker[worker] = std::move(pub);
+    }
+    void closeSessionForTest(int64_t sid) { (void)closeSession_(sid); }
+    /// Drive the resolve-completion path for (sid, worker) with `pub` and one
+    /// buffered subscribe `subId` on (topicId, partition).
+    void resolveRecordEgressForTest(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub,
+                                    int64_t subId, int32_t topicId, int32_t partition) {
+        PendingRecordEgress pend;
+        BufferedSubscribe b;
+        b.subId = subId; b.sessionId = sid; b.topicId = topicId; b.partition = partition;
+        pend.waiters.push_back(b);
+        onRecordEgressResolved_(sid, worker, pend, std::move(pub));
+    }
+    [[nodiscard]] std::size_t retiringRecordEgressCountForTest() const noexcept { return retiringEgress_.size(); }
+    [[nodiscard]] std::size_t retiringRecordEgressUnsentForTest() const noexcept { return retiringUnsent_; }
     /// Test-only: feed a worker return through the real drain handler.
     void handleWorkerReturnForTest(const rune::node::WorkerReturn& ret);
     // Task 13 (spec §3.4): shard mode — announce-before-accept (every worker

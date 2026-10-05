@@ -25,6 +25,12 @@ enum class SessionSignalKind : int64_t {
     /// reconnects and resends; idempotent producers dedupe).  WorkerReturn::
     /// baseOffset = its direct share (diagnostic).
     Expire   = 7,
+    /// 2026-10-05 (record-egress lifetime): the worker executed the release op
+    /// (an Unsubscribe carrying egressPub != 0) — it dropped every subscription
+    /// writing through that record-egress publication and will never touch it
+    /// again.  WorkerReturn::baseOffset = the runtime's retire token; the
+    /// runtime destroys the publication on this acknowledgement (retire-on-ack).
+    EgressReleased = 8,
 };
 
 } // namespace rune::node

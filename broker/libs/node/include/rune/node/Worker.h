@@ -795,6 +795,8 @@ public:
     [[nodiscard]] const std::vector<WorkerSubscription>& subscriptionsForTest() const noexcept {
         return subs_;
     }
+    /// Test-only: release ops (record-egress retire-on-ack) executed.
+    [[nodiscard]] uint64_t egressReleasesForTest() const noexcept { return egressReleases_; }
 
     // Set acks=all commit-wait timeout.  Default kDefaultAckTimeoutNs (30 s).
     void setAckTimeoutNs(int64_t timeoutNs) noexcept { ackTimeoutNs_ = timeoutNs; }
@@ -2274,6 +2276,7 @@ private:
     // (swap-and-pop; order does not matter).  No-op if unknown.  Worker-thread-only.
     // -------------------------------------------------------------------
     void executeUnsubscribeWire_(sbe::WorkerOp& op) {
+        if (op.egressPub() != 0) [[unlikely]] { executeEgressReleaseWire_(op); return; }
         const int64_t subId = op.subscriptionId();
         for (std::size_t i = 0; i < subs_.size(); ++i) {
             if (subs_[i].subscriptionId == subId) {
@@ -2282,6 +2285,36 @@ private:
                 return;
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // 2026-10-05 record-egress lifetime (retire-on-ack): an Unsubscribe op
+    // carrying egressPub != 0 is the runtime's RELEASE of that record-egress
+    // publication (correlationId = its retire token).  It rides the same FIFO
+    // op ring as every Subscribe that handed the pointer, so it runs after
+    // them: drop every subscription writing through it (the pointer is only
+    // compared, never dereferenced), then acknowledge with SessionSignal
+    // EgressReleased (never dropped: enqueueSignal_) — only then does the
+    // runtime destroy the publication.  Cold (session-close rate).
+    // -------------------------------------------------------------------
+    [[gnu::cold]] [[gnu::noinline]] void executeEgressReleaseWire_(sbe::WorkerOp& op) {
+        const auto pub = static_cast<std::uintptr_t>(op.egressPub());
+        for (std::size_t i = 0; i < subs_.size(); ) {
+            if (reinterpret_cast<std::uintptr_t>(subs_[i].egressPub) == pub) {
+                subs_[i] = subs_.back();
+                subs_.pop_back();
+            } else {
+                ++i;
+            }
+        }
+        WorkerReturn ack;
+        ack.type       = WorkerReturn::Type::SessionSignal;
+        ack.sessionId  = op.sessionId();
+        ack.partition  = workerId_;
+        ack.lastOffset = static_cast<int64_t>(SessionSignalKind::EgressReleased);
+        ack.baseOffset = op.correlationId();   // the retire token
+        enqueueSignal_(ack);
+        ++egressReleases_;
     }
 
     // -------------------------------------------------------------------
@@ -3824,6 +3857,7 @@ private:
     // control-plane) Subscribe path.
     static constexpr std::size_t kSubsReserve = 4096;
     std::vector<WorkerSubscription> subs_;
+    uint64_t egressReleases_ = 0;   ///< release ops executed (record-egress retire-on-ack)
 
     // read-rework T3/T4 (I3): per-worker encode scratch for the in-worker push
     // loop.  Holds one encoded single-fragment Records frame (tryClaim fast

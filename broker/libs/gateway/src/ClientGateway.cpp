@@ -488,6 +488,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     // (control markers, subscription lifecycle) BEFORE new ingress, in order.
     int work = 0;
     if (workerPool_) work += pumpSubOps_();
+    work += pumpEgressReleases_();   // retire-on-ack release ops a full ring refused (never dropped)
     work += pumpTxnMarkers_();
     if (shardMode_) {
         // D8c: ... or a Produce frame of a session with no produce credit left
@@ -1022,7 +1023,14 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
         routedInFlight_[static_cast<std::size_t>(w)] -= s->produceInFlightOn[static_cast<std::size_t>(w)];
         noteWorkerShareFreed_(w);
     }
-    sessions_.remove(sid);                    // releases its egress publication
+    // Record-egress lifetime (retire-on-ack, 2026-10-05): a worker may still
+    // hold (and push through) the raw pointer of each per-worker record-egress
+    // pub — destroying it with the session was a cross-thread use-after-free
+    // (garbage maxMessageLength 0 → OutOfBounds / SIGSEGV in the push loop).
+    // Each pub is retired: kept alive until its worker acknowledges the release.
+    for (auto& [w, pub] : s->recordEgressByWorker)
+        if (pub) retireRecordEgress_(sid, w, std::move(pub));
+    sessions_.remove(sid);                    // releases its (gateway-written) egress publication
     // Task 13: the workers forget it too (its queued acks drop, its
     // publications are released) — retried until every worker has it.
     if (shardMode_ && workerPool_) sessionAnnouncer_.close(*workerPool_, sid);
@@ -1032,10 +1040,15 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
         pit = (pit->first.first == sid) ? pendingRecordEgress_.erase(pit) : std::next(pit);
     }
 
-    // GB-3: drop all subscriptions belonging to this session.
+    // GB-3: drop all subscriptions belonging to this session — and the owning
+    // workers' cursors too (2026-10-05: they used to outlive the session and
+    // push forever; queued, never dropped, ordered behind queued Subscribes).
+    const bool workerSubs = perWorkerEgressActive_ && workerPool_;
     auto it = subscriptions_.begin();
     while (it != subscriptions_.end()) {
         if (it->second.sessionId == sid) {
+            if (workerSubs && it->second.topicId >= 0)
+                forwardUnsubscribeToWorker_(it->first, it->second.topicId, it->second.partition);
             it = subscriptions_.erase(it);
         } else {
             ++it;
@@ -1201,6 +1214,10 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
 {
     using K = rune::node::SessionSignalKind;
     const auto kind = static_cast<K>(ret.lastOffset);
+    if (kind == K::EgressReleased) {                                  // retire-on-ack: the worker let go
+        onEgressReleased_(ret.partition, static_cast<uint64_t>(ret.baseOffset));
+        return;
+    }
     if (kind != K::Failed && kind != K::Expire) {
         Session* s = sessions_.find(ret.sessionId);
         if (!s) return;                                               // closed meanwhile
@@ -2688,7 +2705,7 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     //   - Otherwise → kick off a NON-BLOCKING resolve and DEFER the Subscribe until
     //     the pub is ready (drained by pollPendingRecordEgress_).  Never blocks the
     //     control thread.
-    if (!sess || sess->egressChannel.empty() || !aeron_ || !workerPool_) {
+    if (!sess || !workerPool_) {
         enqueueSubscribeOp_(s, nullptr);
         return;
     }
@@ -2696,6 +2713,10 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     if (auto it = sess->recordEgressByWorker.find(wid);
         it != sess->recordEgressByWorker.end() && it->second) {
         enqueueSubscribeOp_(s, it->second.get());
+        return;
+    }
+    if (sess->egressChannel.empty() || !aeron_) {
+        enqueueSubscribeOp_(s, nullptr);
         return;
     }
 
@@ -2748,12 +2769,12 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
 
         if (pub) {
             // Resolved: cache on the Session under its worker id and drain waiters.
-            void* raw = pub.get();
-            if (rune::gateway::Session* sess = sessions_.find(sessionId)) {
-                sess->recordEgressByWorker[workerId] = std::move(pub);
-                raw = sess->recordEgressByWorker[workerId].get();
-            }
-            for (const auto& w : pend.waiters) enqueueSubscribeOp_(w, raw);
+            // Record-egress lifetime (2026-10-05): a worker gets ONLY the pointer
+            // of the pub the Session owns — never one this scope destroys (the
+            // old session-gone branch handed the local pub's raw pointer out and
+            // then freed it), and a cached pub is never REPLACED (a worker may
+            // hold it; it lives until its retire-on-ack release at close).
+            onRecordEgressResolved_(sessionId, workerId, pend, std::move(pub));
             it = pendingRecordEgress_.erase(it);
             continue;
         }
@@ -2769,6 +2790,18 @@ void ClientGateway::pollPendingRecordEgress_(int64_t nowNs)
     }
 }
 
+void ClientGateway::onRecordEgressResolved_(int64_t sessionId, int32_t workerId, PendingRecordEgress& pend,
+                                            std::shared_ptr<aeron::ExclusivePublication> pub)
+{
+    if (rune::gateway::Session* sess = sessions_.find(sessionId)) {
+        auto& slot = sess->recordEgressByWorker[workerId];
+        if (!slot) slot = std::move(pub);   // else: the extra resolve dies here, never handed out
+        for (const auto& w : pend.waiters) enqueueSubscribeOp_(w, slot.get());
+    }
+    // else: the session closed meanwhile — its buffered subscribes are moot and
+    // the pub (never handed to a worker) is released with `pub`.
+}
+
 void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition)
 {
     // M5: never dropped on a full ring — queued (behind any queued Subscribe of
@@ -2781,6 +2814,69 @@ void ClientGateway::forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, 
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(topicId, partition));
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !trySubOp_(p)) queueSubOp_(std::move(p));
+}
+
+// ---------------------------------------------------------------------------
+// Record-egress lifetime — retire-on-ack (see ClientGateway.h RetiringEgress).
+// ---------------------------------------------------------------------------
+void ClientGateway::retireRecordEgress_(int64_t sid, int32_t worker,
+                                        std::shared_ptr<aeron::ExclusivePublication> pub)
+{
+    // Pubs are only ever handed to a worker of the pool (forwardSubscribeToWorker_
+    // requires it, and the router is fixed for the pool's lifetime); without
+    // one, no worker can hold it — it is released here.
+    if (!workerPool_ || worker < 0 || worker >= workerPool_->workerCount()) return;
+    RetiringEgress r;
+    r.token     = ++nextRetireToken_;
+    r.sessionId = sid;
+    r.worker    = worker;
+    r.pub       = std::move(pub);
+    r.enqueued  = tryEnqueueEgressRelease_(r);
+    if (!r.enqueued) ++retiringUnsent_;
+    retiringEgress_.push_back(std::move(r));
+}
+
+bool ClientGateway::tryEnqueueEgressRelease_(const RetiringEgress& r)
+{
+    // The release op: an Unsubscribe carrying the pointer (egressPub != 0 is the
+    // release form; subscriptionId 0 names no subscription).  Sent to the worker
+    // the pointer was handed to, on its op ring — FIFO behind every Subscribe op
+    // that carried it.  (Subscribes still queued in pendingSubOps_ re-resolve
+    // the pub from the Session at send time, so none can carry it after this.)
+    rune::node::WorkerOp op;
+    op.type           = rune::node::WorkerOp::Type::Unsubscribe;
+    op.subscriptionId = 0;
+    op.sessionId      = r.sessionId;
+    op.correlationId  = static_cast<int64_t>(r.token);
+    op.egressPub      = r.pub.get();
+    return workerPool_->worker(r.worker).tryEnqueueOp(std::move(op));
+}
+
+int ClientGateway::pumpEgressReleases_()
+{
+    if (retiringUnsent_ == 0) [[likely]] return 0;
+    int sent = 0;
+    for (auto& r : retiringEgress_) {
+        if (r.enqueued || !tryEnqueueEgressRelease_(r)) continue;
+        r.enqueued = true;
+        --retiringUnsent_;
+        ++sent;
+    }
+    return sent;
+}
+
+void ClientGateway::onEgressReleased_(int32_t worker, uint64_t token)
+{
+    for (std::size_t i = 0; i < retiringEgress_.size(); ++i) {
+        RetiringEgress& r = retiringEgress_[i];
+        if (r.token != token || r.worker != worker) continue;
+        if (!r.enqueued) [[unlikely]] break;   // unreachable: an ack precedes its op
+        if (i + 1 != retiringEgress_.size()) std::swap(retiringEgress_[i], retiringEgress_.back());
+        retiringEgress_.pop_back();            // the worker let go — the pub is destroyed now
+        return;
+    }
+    spdlog::error("ClientGateway: EgressReleased from worker {} for unknown retire token {} — ignored",
+                  worker, token);
 }
 
 void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
