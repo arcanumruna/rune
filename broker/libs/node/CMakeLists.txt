@@ -771,6 +771,27 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
     # ---------------------------------------------------------------------------
+    # Duty-pass latency gate (*LatencyGate* + *Regression*): drives the REAL
+    # production worker duty pass (shard-mode Worker + fused NodeRuntimeAgent)
+    # while the real off-thread LogCleanerAgent rolls / retains / compacts /
+    # truncates, and fails when the pass MAX or p99.9 exceeds the per-build-type
+    # budget (Release vs Debug constants in the test).  RUN_SERIAL: a latency
+    # measurement must not share the host with other test processes.
+    # Benchmark mode: RUNE_LATENCY_GATE_BENCH=1 (prints, never fails).
+    # No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_duty_pass_latency_gate_tests
+        tests/integration/DutyPassLatencyGateTest.cpp)
+    target_link_libraries(rune_duty_pass_latency_gate_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_duty_pass_latency_gate_tests
+        PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE)
+
+    # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
     #   retention: time (largestTimestamp), size, log-start-offset; async delete
     #   (.deleted rename + delayed physical remove); retention off append thread;
