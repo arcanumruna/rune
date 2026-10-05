@@ -35,6 +35,10 @@ struct SegInfo {
     /// ONLY such segments: compaction never creates an offset gap in the region
     /// recovery validates with its segment-chain check.
     bool    belowRecoveryPoint = true;
+    /// The segment's content lineage (LogSegment::tsLineage) when this entry
+    /// was published: largestTimestamp is reused by the next publish only when
+    /// base AND lineage match — never across a truncate that rebuilt the segment.
+    uint64_t lineage = 0;
 };
 using SealedSegmentSnapshot = std::vector<SegInfo>;
 
@@ -566,10 +570,18 @@ private:
     /// Rebuild and atomically publish a new sealed-segment snapshot.
     /// MUST be called on the single-writer append thread whenever segments_ changes:
     ///   - after maybeRoll() (when a segment seals)
-    ///   - after drainCleanerSwaps() (after a segment swap)
+    ///   - after drainCleanerSwaps() / reloadSegment() (after a segment swap)
+    ///   - after drainRetentionDeletes() / deleteOldSegments() (segments erased)
+    ///   - at the END of truncateTo() / reloadSegments() / recover()
     /// Only sealed segments (all except the last/active) are included; the active
     /// segment's size is mutable so it is excluded.
     void publishSealedSnapshot();
+    /// reloadSegment() without the snapshot publish (drainCleanerSwaps batches
+    /// several reloads under ONE publish).
+    void reloadSegmentNoPublish_(int64_t baseOffset);
+    /// Re-derive activeSegmentMaxTs_ from the active segment's on-disk batches
+    /// (cold: recover / reloadSegments).
+    void rescanActiveSegmentMaxTs_();
 
     std::string dir_; int64_t rollBytes_; int64_t logEndOffset_ = 0;
     uint64_t readViewCalls_ = 0;   // F18 B-2 (single-owner thread)
@@ -665,6 +677,10 @@ private:
     /// any file I/O.  Only meaningful on the append thread (where maybeRoll and
     /// publishSealedSnapshot are always called in sequence).
     int64_t newlySealedMaxTs_ = 0;
+    /// Base of the segment maybeRoll() just sealed (-1 = no seal in progress):
+    /// identifies the newly-sealed entry explicitly (MEDIUM-2: a 0 timestamp is
+    /// a real value, never a "not found" sentinel).
+    int64_t newlySealedBase_ = -1;
     /// CP-5.1 (retention-after-restart fix): populated by recover() via a one-time
     /// per-segment batch scan.  Maps baseOffset → real largestTimestamp for every
     /// sealed segment found on disk at recovery time.  publishSealedSnapshot() uses

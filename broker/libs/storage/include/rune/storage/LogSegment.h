@@ -202,6 +202,13 @@ public:
     /// Log::install_) — the segment's identity, never reused (no pointer ABA).
     uint64_t installGen() const noexcept { return installGen_; }
     void setInstallGen(uint64_t g) noexcept { installGen_ = g; }
+    /// Content lineage for the sealed-snapshot timestamp cache (Log::
+    /// publishSealedSnapshot): a cached largestTimestamp is reused only for the
+    /// SAME lineage at the same base.  A fresh install (roll, truncate rebuild,
+    /// re-create) gets a new lineage; a cleaner rewrite / reload of the same
+    /// sealed segment inherits it (compaction never raises the max timestamp).
+    uint64_t tsLineage() const noexcept { return tsLineage_; }
+    void setTsLineage(uint64_t l) noexcept { tsLineage_ = l; }
     /// E1d MEDIUM-2: the owning Log's directory-mutation generation at which
     /// this segment's directory entry was last created / renamed (0 = present
     /// at open: made durable by recovery's directory fsync).  The entry is
@@ -315,6 +322,7 @@ private:
     int fd_ = -1;   // POSIX fd for fdatasync — mirrors log_ (write path uses fstream)
     std::unique_ptr<OffsetIndex> index_;
     uint64_t installGen_ = 0;
+    uint64_t tsLineage_ = 0;     ///< see tsLineage()
     uint64_t dirEntryGen_ = 0;   ///< E1d MEDIUM-2: see dirEntryGen()
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
     int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()

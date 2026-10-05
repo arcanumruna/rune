@@ -1865,3 +1865,211 @@ TEST(LogRegression, SealedSnapshotKeepsEachSegmentsTimestampAcrossManyRollsRegre
     }
     std::filesystem::remove_all(dir);
 }
+
+// ===========================================================================
+// 2026-10-05 log-snapshot review: every segments_ mutation republishes the
+// sealed snapshot, and a reused largestTimestamp belongs to the SAME segment
+// incarnation (never base-offset equality across a truncate).
+// ===========================================================================
+namespace {
+void appendTs(Log& log, int64_t off, int64_t ts) {
+    RecordBatchBuilder b(off, ts);
+    b.append("k", "v", ts);
+    log.append(b.build(), off);
+}
+// The published snapshot must describe exactly segments_ minus the active one.
+void expectSnapshotMatchesSegments(Log& log) {
+    const auto bases = log.segmentBaseOffsets();
+    const auto snap  = log.sealedSegmentSnapshot();
+    ASSERT_NE(snap, nullptr);
+    ASSERT_EQ(snap->size(), bases.size() - 1);
+    for (std::size_t i = 0; i < snap->size(); ++i) {
+        EXPECT_EQ((*snap)[i].baseOffset, bases[i]);
+        EXPECT_EQ((*snap)[i].endOffset, bases[i + 1]);
+    }
+}
+const SegInfo* findSeg(const SealedSegmentSnapshot& s, int64_t base) {
+    for (const auto& si : s) if (si.baseOffset == base) return &si;
+    return nullptr;
+}
+} // namespace
+
+// MAJOR-1 (a): truncateTo erased segments and turned a sealed one active, but
+// the snapshot still listed them (the cleaner's activeBase was too high).
+TEST(LogRegression, TruncateToRepublishesSealedSnapshotRegression) {
+    auto dir = makeTempDir("rune_log_trsnap");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    ASSERT_GE(log.sealedSegmentSnapshot()->size(), 3u);
+    log.truncateTo(3);
+    EXPECT_EQ(log.logEndOffset(), 3);
+    expectSnapshotMatchesSegments(log);
+    // Truncate to an exact segment boundary too (the previous sealed segment becomes active).
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u);
+    log.truncateTo(bases.back());
+    expectSnapshotMatchesSegments(log);
+    // Truncate everything (fresh segment branch).
+    log.truncateTo(0);
+    expectSnapshotMatchesSegments(log);
+    std::filesystem::remove_all(dir);
+}
+
+// MAJOR-1 (b): a truncated-then-re-appended segment that rolls reused the
+// stale pre-truncate largestTimestamp (base=2 ts=1003 vs real 9000003) —
+// time retention would delete freshly written data early.
+TEST(LogRegression, TruncatedSegmentResealGetsItsOwnTimestampRegression) {
+    auto dir = makeTempDir("rune_log_trts");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    log.truncateTo(3);
+    const int64_t activeBase = log.segmentBaseOffsets().back();
+    ASSERT_LT(activeBase, 3);
+    for (int64_t i = 3; i < 12; ++i) appendTs(log, i, 9'000'000 + i);
+    const auto snap = log.sealedSegmentSnapshot();
+    const SegInfo* si = findSeg(*snap, activeBase);
+    ASSERT_NE(si, nullptr);
+    EXPECT_EQ(si->largestTimestamp, 9'000'003) << "base " << activeBase;
+    expectSnapshotMatchesSegments(log);
+    std::filesystem::remove_all(dir);
+}
+
+// MAJOR-1 related: activeSegmentMaxTs_ carried the ERASED segment's max after
+// a truncate (overstated: an old segment looks new, retention keeps it).
+TEST(LogRegression, TruncateRecomputesActiveSegmentMaxTimestampRegression) {
+    auto dir = makeTempDir("rune_log_trmax");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 4; ++i) appendTs(log, i, 1000 + i);
+    for (int64_t i = 4; i < 7; ++i) appendTs(log, i, 8'000'000 + i);
+    log.truncateTo(3);
+    const int64_t activeBase = log.segmentBaseOffsets().back();
+    for (int64_t i = 3; i < 12; ++i) appendTs(log, i, 2000 + i);
+    const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), activeBase);
+    ASSERT_NE(si, nullptr);
+    EXPECT_EQ(si->largestTimestamp, 2003) << "base " << activeBase;
+    std::filesystem::remove_all(dir);
+}
+
+// MAJOR-1 related: recover() never seeded activeSegmentMaxTs_, so pre-restart
+// batches in the active segment were forgotten at its seal (understated: a
+// fresh segment looks ancient — retention deletes it early).
+TEST(LogRegression, RecoverSeedsActiveSegmentMaxTimestampRegression) {
+    auto dir = makeTempDir("rune_log_recmax");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    int64_t activeBase = -1;
+    {
+        Log log(dir.string(), /*rollBytes=*/100);
+        log.recover();
+        for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 9'000'000 + i);
+        activeBase = log.segmentBaseOffsets().back();
+    }
+    Log log(dir.string(), /*rollBytes=*/100);
+    log.recover();
+    ASSERT_EQ(log.segmentBaseOffsets().back(), activeBase);
+    for (int64_t i = 7; i < 14; ++i) appendTs(log, i, 1000 + i);
+    const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), activeBase);
+    ASSERT_NE(si, nullptr);
+    EXPECT_EQ(si->largestTimestamp, 9'000'006) << "base " << activeBase;
+    std::filesystem::remove_all(dir);
+}
+
+// MEDIUM-1: drainRetentionDeletes released ring slots only when it erased
+// something — idempotent retries of already-gone bases filled the ring and
+// retention halted forever.
+TEST(LogRegression, RetentionDeleteRingDrainsAlreadyRemovedBasesRegression) {
+    auto dir = makeTempDir("rune_log_delring");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
+    for (int i = 0; i < 3000; ++i) {
+        ASSERT_TRUE(log.enqueueDeletedSegment(987'654'321)) << "ring stuck after " << i;
+        EXPECT_EQ(log.drainRetentionDeletes(), 0);
+    }
+    // A real delete still works after all the no-op retries.
+    const int64_t first = log.segmentBaseOffsets().front();
+    ASSERT_TRUE(log.enqueueDeletedSegment(first));
+    EXPECT_EQ(log.drainRetentionDeletes(), 1);
+    expectSnapshotMatchesSegments(log);
+    std::filesystem::remove_all(dir);
+}
+
+// MEDIUM-2: largestTimestamp == 0 doubled as "not found", so a segment whose
+// real max timestamp is 0 inherited the newest timestamp at the next roll.
+TEST(LogRegression, ZeroTimestampSegmentKeepsZeroAcrossRollsRegression) {
+    auto dir = makeTempDir("rune_log_zerots");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t i = 0; i < 3; ++i) appendTs(log, i, 0);          // seals segment 0 with max ts 0
+    for (int64_t i = 3; i < 9; ++i) appendTs(log, i, 5'000'000 + i);
+    const auto snap = log.sealedSegmentSnapshot();
+    ASSERT_GE(snap->size(), 2u);
+    EXPECT_EQ((*snap)[0].baseOffset, 0);
+    EXPECT_EQ((*snap)[0].largestTimestamp, 0);
+    std::filesystem::remove_all(dir);
+}
+
+// LOW (review LOW-3): prev-snapshot entries removed from segments_ (front
+// retention + a middle segment) followed by rolls — every survivor keeps its
+// OWN timestamp (the merge walk's skip branches).
+TEST(LogRegression, SnapshotTimestampsSurviveRetentionDeletesThenRollsRegression) {
+    auto dir = makeTempDir("rune_log_retroll");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/64);   // every batch seals a segment
+    for (int64_t i = 0; i < 22; ++i) appendTs(log, i, 100'000 + i);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 20u);
+    for (int k = 0; k < 5; ++k) ASSERT_TRUE(log.enqueueDeletedSegment(bases[k]));
+    ASSERT_TRUE(log.enqueueDeletedSegment(bases[10]));
+    EXPECT_EQ(log.drainRetentionDeletes(), 6);
+    expectSnapshotMatchesSegments(log);
+    for (int64_t i = 22; i < 24; ++i) appendTs(log, i, 100'000 + i);   // two more rolls
+    expectSnapshotMatchesSegments(log);
+    const auto snap = log.sealedSegmentSnapshot();
+    for (const auto& si : *snap) {
+        EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset) << "segment base " << si.baseOffset;
+        EXPECT_NE(si.baseOffset, bases[10]);
+        EXPECT_GE(si.baseOffset, bases[5]);
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// Audit: deleteOldSegments (size retention, NodeRuntimeAgent) erased segments
+// without republishing — the cleaner kept seeing the deleted bases.
+TEST(LogRegression, DeleteOldSegmentsRepublishesSealedSnapshotRegression) {
+    auto dir = makeTempDir("rune_log_delold");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/64);
+    for (int64_t i = 0; i < 12; ++i) appendTs(log, i, 100'000 + i);
+    ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/200), 0);
+    expectSnapshotMatchesSegments(log);
+    for (const auto& si : *log.sealedSegmentSnapshot())
+        EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset);
+    std::filesystem::remove_all(dir);
+}
+
+// Audit: reloadSegments (LogCleaner::compact) rebuilt segments_ without
+// republishing; a sealed segment the cleaner removed stayed in the snapshot.
+// Surviving sealed segments keep their timestamps across the reload.
+TEST(LogRegression, ReloadSegmentsRepublishesSealedSnapshotRegression) {
+    auto dir = makeTempDir("rune_log_reload");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/64);
+    for (int64_t i = 0; i < 8; ++i) appendTs(log, i, 100'000 + i);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 4u);
+    // The cleaner emptied and removed the second segment.
+    std::string s = std::to_string(bases[1]);
+    s = std::string(20 - s.size(), '0') + s;
+    std::filesystem::remove(dir / (s + ".log"));
+    std::filesystem::remove(dir / (s + ".index"));
+    log.reloadSegments();
+    expectSnapshotMatchesSegments(log);
+    EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), bases[1]), nullptr);
+    for (int64_t i = 8; i < 10; ++i) appendTs(log, i, 100'000 + i);
+    for (const auto& si : *log.sealedSegmentSnapshot())
+        EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset) << "segment base " << si.baseOffset;
+    std::filesystem::remove_all(dir);
+}
