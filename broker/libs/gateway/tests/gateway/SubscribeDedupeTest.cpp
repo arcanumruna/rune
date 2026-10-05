@@ -279,3 +279,23 @@ TEST(SubscribeDedupeRegression, DuplicateGroupCarrierSubscribeKeepsOneGroupSubsc
     EXPECT_EQ(r.gw.subscriptionCount(), 1u);
     EXPECT_EQ(r.workerSubsOf(sid), 1u);
 }
+
+// Review M-1: a carrier (correlationId 0) that arrived BEFORE the group
+// subscription existed registered a plain subscription under (0, t, p).  When
+// the next generation's group subscription is created (pendingCarrier) and the
+// carrier arrives again, it must reach the GROUP subscription — never be
+// swallowed as a duplicate of the stale plain one (RED: answered with the plain
+// subId; the group sub never got its carrier and stalled at the first aborted txn).
+TEST(SubscribeDedupeRegression, CarrierAfterAStalePlainEntryReachesTheGroupSubscriptionRegression) {
+    Rig r(/*workers=*/false);
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, /*corr=*/0);                                  // early carrier → plain sub
+    ASSERT_EQ(r.responses.size(), 1u);
+    const int64_t plain = r.responses[0].subscriptionId;
+    const int64_t gsub  = r.gw.addGroupSubscription(sid, 0, 0, 0, /*isolation=*/1, /*pendingCarrier=*/true);
+    ASSERT_GT(gsub, 0);
+    ASSERT_NE(gsub, plain);
+    r.subscribe(sid, /*corr=*/0);                                  // the generation's carrier
+    ASSERT_EQ(r.responses.size(), 2u);
+    EXPECT_EQ(r.responses[1].subscriptionId, gsub) << "the carrier was swallowed by the stale plain entry";
+}

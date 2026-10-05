@@ -203,7 +203,8 @@ struct EosRig {
     int64_t nextSubCorr_ = 0;
     int64_t subscribe(int64_t sid, uint8_t isolation, int64_t from = 0) {
         pc::Subscribe sub;
-        sub.sessionId = sid; sub.correlationId = 9000 + nextSubCorr_++;   // one correlationId per instance (dedupe contract) sub.topicId = 0;
+        sub.sessionId = sid; sub.correlationId = 9000 + nextSubCorr_++;   // one correlationId per instance (dedupe contract)
+        sub.topicId = 0;
         sub.partition = 0; sub.partitionKnown = 1; sub.fromOffset = from; sub.isolation = isolation;
         std::vector<uint8_t> frame(sub.encodedSize());
         sub.encode(frame.data());
