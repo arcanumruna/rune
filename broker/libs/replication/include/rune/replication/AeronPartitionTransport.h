@@ -64,6 +64,8 @@ namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 #include <rune_protocol_internal_sbe/OutboundFrame.h>
 #include <concurrent/logbuffer/FrameDescriptor.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/replication/PubAddBroker.h>
+#include <rune/consensus/PeerResolution.h>
 
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/consensus/IngressRing.h>  // agrona ManyToOne ring (outbound marshalling)
@@ -391,9 +393,14 @@ public:
     /// Publication re-adds issued after a registration error (DR-15).
     [[nodiscard]] uint64_t peerPubReAdds() const noexcept { return pubReAdds_; }
 
-    /// TEST SEAM: the channel an unresolved peer is re-added on from now on
-    /// (models its hostname becoming resolvable).  Control thread only.
-    void setPeerChannelForTest(NodeId peerId, std::string channel);
+    /// DR-15 fix round 1: this transport's resolution events (the off-thread
+    /// PeerResolverHub).  Cold; before addPeer().  Control thread consumes.
+    void attachResolution(rune::consensus::PeerResolutionSource src) { inbox_.attach(src); }
+
+    /// Legacy per-worker planes' re-adds, made on THIS (control) thread — the
+    /// node client's admin owner (review MEDIUM-2).  Before the control thread
+    /// runs; brokers must outlive this transport's last poll().
+    void addPubAddBroker(PubAddBroker* broker) { brokers_.push_back(broker); }
 
     /// Number of peers registered.
     [[nodiscard]] int peerCount() const noexcept {
@@ -410,21 +417,25 @@ private:
         int64_t     registrationId = -1;     ///< from addExclusivePublication
         std::shared_ptr<aeron::ExclusivePublication> pub; ///< null until resolved
         bool        registered     = false;  ///< a registration is in flight / live
-        // DR-15 (2026-10-05): an errored registration (peer hostname not
-        // resolvable while it restarts) is RE-ADDED on poll passes with a
-        // pass-count backoff (2, 4, ... 1024 passes) — never dropped for good.
+        // DR-15: an errored registration (peer hostname not resolvable while it
+        // restarts) is RE-ADDED on its host's resolution event (fix round 1:
+        // event-driven, never a pass count) — never dropped for good.
         std::string channel;                 ///< egress channel (re-add target)
         int32_t     streamId       = 0;
+        int         hostIdx        = -1;     ///< managed peer host (-1: unmanaged)
+        uint32_t    addGen         = 0;      ///< host resolution generation at the last add
         uint32_t    attempts       = 0;      ///< failed registrations so far
-        uint64_t    retryPass      = 0;      ///< re-add due at this poll pass
     };
-    static constexpr uint32_t kMaxPubRetryBackoffShift = 10;
-    uint64_t resolvePass_   = 0;             ///< poll passes (control thread)
+    rune::consensus::PeerResolutionInbox inbox_;   ///< control thread: resolution events
+    std::vector<PubAddBroker*>           brokers_; ///< legacy planes' control-thread re-adds
     uint64_t pubFailures_   = 0;             ///< registration failures (rate-limited log)
     uint64_t pubReAdds_     = 0;
-    /// Issue addExclusivePublication for `p` (errors schedule a backed-off re-add).
+    /// The resolution event of host `idx`: re-add every peer waiting on it.
+    void onHostResolved_(int idx) noexcept;
+    /// Issue addExclusivePublication for `p` (an error → onPubFailed_).
     void registerPub_(PeerPub& p) noexcept;
-    void schedulePubRetry_(PeerPub& p) noexcept;
+    /// Re-add now if the host resolved since that add, else wait for its event.
+    void onPubFailed_(PeerPub& p, const char* why) noexcept;
 
     // -----------------------------------------------------------------------
     // Internal helpers

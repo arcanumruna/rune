@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/consensus/PeerResolution.h>
 #include <rune/node/Worker.h>                         // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <stdexcept>
@@ -304,7 +305,19 @@ std::string NodeConfig::shardReplBindChannel(int32_t w) const {
         throw std::logic_error("shardReplBindChannel: RUNE_WORKER_REPL_BASE_PORT unset "
                                "(only valid after validateShardConfig)");
     requireShardWorker(w, workerCount, "shardReplBindChannel");
-    return "aeron:udp?endpoint=" + self().host + ":" + std::to_string(*workerReplBasePort + w);
+    return "aeron:udp?endpoint=" + peerBindHost() + ":" + std::to_string(*workerReplBasePort + w);
+}
+std::string NodeConfig::peerBindHost() const {
+    if (!peerBindHostOverride.empty()) return peerBindHostOverride;
+    const std::string& h = self().host;
+    return rune::consensus::PeerHostTable::isNumericHost(h) ? h : std::string("0.0.0.0");
+}
+std::string NodeConfig::selfConsensusBindChannel() const {
+    return "aeron:udp?endpoint=" + peerBindHost() + ":" + std::to_string(self().consensusPort);
+}
+std::string NodeConfig::selfReplicationBindChannel() const {
+    if (self().replicationPort == 0) return {};
+    return "aeron:udp?endpoint=" + peerBindHost() + ":" + std::to_string(self().replicationPort);
 }
 std::string NodeConfig::shardPeerReplChannel(const PeerConfig& p, int32_t w) {
     if (p.replBasePort == 0 || w < 0)
@@ -619,6 +632,8 @@ ConfigResult parseNodeConfig(
 
     // read-rework T3/T4: per-worker dynamic-MDC egress config (optional overrides;
     // buildWorkerPool resolves workerEgressBaseStreamId=0 → ingressBase+workerCount).
+    // DR-15 fix round 1 (MEDIUM-1): peer-facing bind host (default: derived — see peerBindHost()).
+    if (const char* bh = getenv_fn("RUNE_PEER_BIND_HOST"); bh && *bh) cfg.peerBindHostOverride = bh;
     {
         const char* rawEgHost = getenv_fn("RUNE_WORKER_EGRESS_CONTROL_HOST");
         if (rawEgHost && !std::string_view(rawEgHost).empty())

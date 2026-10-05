@@ -31,6 +31,8 @@ extern "C" {
 #include <rune/node/NodeConfig.h>
 
 #include <rune/consensus/ControlRing.h>
+#include <rune/consensus/PeerResolution.h>
+#include <rune/node/rune_peer_name_resolver.h>
 
 #include <optional>
 #include <string>
@@ -70,6 +72,10 @@ struct EmbeddedDriverConfig {
     /// (read from CnC).  Must exceed the driver timer interval (1 s).  Test-only
     /// override (shard startup-gap regression); never set in production.
     int64_t     clientLivenessTimeoutNs = 0;
+    /// DR-15 fix round 1: when valid, this driver's Aeron name resolver answers
+    /// the managed peer hostnames from this (off-thread fed) cache ONLY — its
+    /// conductor never calls getaddrinfo for a peer.  Invalid = Aeron default.
+    rune::consensus::PeerResolutionSource peerResolution{};
 
     static EmbeddedDriverConfig fromNode(const NodeConfig& c, std::string dir);
 };
@@ -156,8 +162,15 @@ private:
     /// After aeron_driver_context_close: capture the GSO totals and free the bindings.
     void releaseGso_() noexcept;
 
+    /// Conductor-thread lookup for the peer name resolver (cfg_.peerResolution).
+    static int peerLookup_(void* state, const char* host, uint32_t* ipv4) noexcept;
+
     EmbeddedDriverConfig    cfg_;
     DriverMode              mode_;
+    // DR-15 fix round 1: consumed on the CONDUCTOR thread only (resolve / do_work);
+    // must outlive the driver (members are destroyed after close()).
+    rune::consensus::PeerResolutionInbox nameInbox_;
+    rune_peer_name_lookup_t              nameLookup_{};
     aeron_driver_context_t* ctx_    = nullptr;
     aeron_driver_t*         driver_ = nullptr;
     rune_gso_bindings_t*    gso_    = nullptr;   // owned; outlives ctx_ (Aeron points at it)

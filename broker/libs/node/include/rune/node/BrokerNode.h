@@ -22,6 +22,7 @@
 
 #include <rune/node/NodeConfig.h>
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/PeerResolverHub.h>
 #include <rune/node/DriverPumpAgent.h>
 #include <rune/node/UdpMessageSink.h>
 #include <rune/node/NodeConsensusAgent.h>
@@ -49,6 +50,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
+#include <rune/replication/PubAddBroker.h>
 #include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
@@ -685,6 +687,11 @@ public:
         shardResolveStallForTest_       = stall;
     }
 
+    /// Test-only (DR-15 fix round 1): the peer-hostname resolve function of this
+    /// node's cold resolver thread (default getaddrinfo).  Set before start();
+    /// called on the resolver thread (and the start thread).
+    void setPeerResolveFnForTest(PeerResolverHub::ResolveFn fn) { resolveFnForTest_ = std::move(fn); }
+
     /// Test-only: is worker w's shard Aeron client closed?  Call ONLY inside
     /// onOwnerThreadForTest on worker w (the client is worker-owned).
     [[nodiscard]] bool shardClientClosedForTest(int32_t w) const {
@@ -760,6 +767,14 @@ private:
     // Configuration (immutable after construction)
     // -----------------------------------------------------------------------
     NodeConfig config_;
+    // DR-15 fix round 1: the cold peer-hostname resolver thread + the rings it
+    // feeds (driver name caches, peer-publication owners).  Declared FIRST so
+    // it is destroyed LAST — after every consumer of its rings.
+    std::unique_ptr<PeerResolverHub>   resolverHub_;
+    PeerResolverHub::ResolveFn         resolveFnForTest_;
+    // Legacy per-worker planes' control-thread re-add brokers (outlive both
+    // the planes and replTransport_, which polls them).
+    std::vector<std::unique_ptr<rune::replication::PubAddBroker>> legacyPlaneBrokers_;
 
     // -----------------------------------------------------------------------
     // Consensus objects (constructed in start())

@@ -1921,3 +1921,77 @@ TEST(UnresolvedPeerStartupRegression, NodesStartAndServeWhileAPeerHostnameIsUnre
     }
     n1.stop(); n0.stop();
 }
+
+// ===========================================================================
+// DR-15 fix round 1 (MEDIUM-3): node 2 starts LATE and its hostname only
+// becomes resolvable then (the SAME name — no channel swap): nodes 0 and 1
+// learn it from their cold resolver thread, re-add every peer publication to
+// it (consensus sink, internal plane, shard plane) on that event, and node 2
+// catches up and rejoins the ISR.  Node 2's OWN name never resolves for itself
+// (k8s headless record before Ready — MEDIUM-1): it binds its peer-facing
+// inbound on the wildcard and still starts.
+// ===========================================================================
+TEST(UnresolvedPeerStartupRegression, LatePeerJoinsAfterItsHostnameResolvesRegression) {
+    TmpDir d0{"late0"}, d1{"late1"}, d2{"late2"}, cdir{"latec"};
+    const auto ports = ShardPorts::discover(3, 1);
+    const std::string kLate = "rune-late.test";
+    std::atomic<bool> lateResolvable{false};
+    auto cfgFor = [&](int32_t id, const fs::path& dir) {
+        auto c = asymConfig(id, dir, ports, 3, /*workers=*/1);
+        c.replicaLagMaxMs = 500;                              // the absent peer leaves the ISR fast
+        for (auto& p : c.peers)
+            if (p.id == 2) p.host = kLate;
+        return c;
+    };
+    auto peerView = [&](const std::string& host, std::uint32_t& ip) {
+        if (host != kLate || !lateResolvable.load()) return false;
+        ip = htonl(INADDR_LOOPBACK);
+        return true;
+    };
+    BrokerNode n0{cfgFor(0, d0.path)}, n1{cfgFor(1, d1.path)};
+    n0.setPeerResolveFnForTest(peerView);
+    n1.setPeerResolveFnForTest(peerView);
+    ASSERT_NO_THROW(n0.start());
+    ASSERT_NO_THROW(n1.start());
+    ASSERT_TRUE(n0.awaitLeader(15'000ms) || n1.awaitLeader(15'000ms));
+
+    int32_t part = -1;
+    for (int32_t p = 0; p < kAsymPartitions && part < 0; ++p)
+        if (staticLeader(p, 3) == 0) part = p;
+    ASSERT_GE(part, 0);
+    ShardTestClient c(cdir.path);
+    const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid0, 0);
+    auto produceAll = [&](int records) {
+        int32_t leader = -1;
+        if (!eventually([&] {
+                for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                    if (pi.topicId == 0 && pi.partition == part && (pi.leaderId == 0 || pi.leaderId == 1))
+                        leader = pi.leaderId;
+                return leader >= 0;
+            }, 400))
+            return false;
+        const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+        if (sid <= 0) return false;
+        return c.produceUntilOk(workerIngressChannel(ports, leader, 0), kClientStream, sid, 0, part,
+                                /*acks=all*/1, makeBatch(records), /*maxAttempts=*/2000)
+            .has_value();
+    };
+    ASSERT_TRUE(produceAll(4)) << "acks=all never committed on the two live nodes";
+
+    // Node 2's pod is up now: its name resolves for the others; it never resolves for itself.
+    lateResolvable = true;
+    BrokerNode n2{cfgFor(2, d2.path)};
+    n2.setPeerResolveFnForTest([](const std::string&, std::uint32_t&) { return false; });
+    ASSERT_NO_THROW(n2.start()) << "a node must start while its OWN hostname does not resolve";
+
+    ASSERT_TRUE(eventually([&] { return peerState(n0, 0, 2) == PS::Verified; }, 4000))
+        << "node 0's shard plane never attached the late-resolving node 2";
+    ASSERT_TRUE(eventually([&] { return peerState(n2, 0, 0) == PS::Verified; }, 4000));
+    ASSERT_TRUE(eventually([&] { return rune::node::test::leoOrMinusOne(n2, 0, part) >= 4; }, 4000))
+        << "node 2 never caught up after joining late";
+    ASSERT_TRUE(produceAll(4));
+    ASSERT_TRUE(eventually([&] { return rune::node::test::leoOrMinusOne(n2, 0, part) >= 8; }, 4000))
+        << "node 2 does not receive new records (not back in the replication set)";
+    n2.stop(); n1.stop(); n0.stop();
+}
