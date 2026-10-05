@@ -736,3 +736,32 @@ TEST(IngressEndpointRouting, UnreachableRedirectResendsOnlyThatSubscribeRegressi
     EXPECT_EQ(copiesOfA, 1) << "the still-pending Subscribe A was re-sent with B";
     EXPECT_FALSE(b.finished());
 }
+
+// DR-15 re-review NEW-MAJOR-1: a reconnect re-sends every pending Subscribe
+// (resendPending) — the redirected one must not ALSO go out again on the next
+// metadata answer (a duplicate leaks a second broker-side subscription).
+TEST(IngressEndpointRouting, UnreachableRedirectNotResentAgainAfterAReconnectRegression) {
+    Rig r(3934, 3935, "aeron:ipc", "aeron:ipc", /*realClock=*/true);
+    r.connect();
+    r.gw.holdMetadata          = true;    // no answer drains the redirected list before the reconnect
+    r.gw.subscribeRedirectNext = 1;
+    r.gw.subscribeRedirectTo   = "rune-unresolvable.invalid:40200";
+    auto b = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                [](const rc::Record&) {});
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeRefusals == 1; }));
+    const int64_t corrB = r.gw.subscribeCorrIds.back();
+    r.gw.dropSubscribeResponsesNext = 1;                  // B stays pending after the reconnect's resend
+    r.gw.expireSession(r.gw.assignedSessionId);           // the client reconnects → resendPending
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeCorrIds.size() >= 2; })) << "no resend after the reconnect";
+    r.gw.holdMetadata = false;
+    for (const int64_t c : r.gw.metadataCorrIds) r.gw.sendMetadata(r.gw.assignedSessionId, c);
+    const int seen = r.client.testMetadataResponses();
+    (void)r.drive([&] { return r.client.testMetadataResponses() > seen + 1; }, 200'000);
+    // Drive past the redirected-resend backoff (100 ms) so a wrong resend surfaces.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    (void)r.drive([&] { return std::chrono::steady_clock::now() >= until; }, 4'000'000);
+    int copiesOfB = 0;
+    for (const int64_t c : r.gw.subscribeCorrIds) copiesOfB += c == corrB;
+    EXPECT_EQ(copiesOfB, 2) << "the redirected Subscribe went out again after the reconnect's resend";
+    EXPECT_FALSE(b.finished());
+}

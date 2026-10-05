@@ -1907,6 +1907,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         return agent_.submitSend(fb, fl);
                     };
                 subscriberHub_.resendPending(newSessionId, subSendFn);
+                redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
             } else if (subscriberHub_.hasPending()) {
                 // F8a fix2: a pending Subscribe sent before this session existed
                 // was dropped by the ring drain (stale session) — re-issue every
@@ -1916,6 +1917,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
                         return agent_.submitSend(fb, fl);
                     });
+                redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
             }
 
             // MAJOR-2 (round 3): the broker's capability, for every group
@@ -2200,7 +2202,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
                 // which still await their own answer — a duplicate would register a
                 // second subscription broker-side).
-                if (subscriberHub_.isPending(opt->correlationId)) {
+                if (subscriberHub_.isPending(opt->correlationId) &&
+                    std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), opt->correlationId) ==
+                        redirectedSubscribes_.end()) {  // re-review NEW-M1: once per pending resend
                     try {
                         redirectedSubscribes_.push_back(opt->correlationId);
                     } catch (...) {
