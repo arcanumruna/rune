@@ -45,7 +45,7 @@ struct LeaderEpochState {
     static constexpr std::size_t   kHeaderBytes = 32;
     static constexpr std::size_t   kEntryBytes  = 12;
     static constexpr std::size_t   kCrcOffset   = 28;
-    static constexpr std::size_t   kMinEntries  = 1024;          ///< per slot (stride 16 KiB)
+    static constexpr std::size_t   kMinEntries  = 64;            ///< per slot (stride 4 KiB; review Md4: 8 KiB file per partition)
 
     using Entries = std::vector<std::pair<int32_t, int64_t>>;
 
@@ -77,13 +77,22 @@ struct LeaderEpochState {
     /// Encode a slot into `out` (at least imageBytes(n) bytes).  No allocation.
     template <class It>
     static std::size_t encode(uint8_t* out, uint64_t seq, int64_t fence, It first, It last) noexcept {
+        return encodeWith(out, seq, fence, [&](auto&& emit) {
+            for (It it = first; it != last; ++it) emit(it->first, it->second);
+        });
+    }
+    /// Encode a slot whose entries `forEach(emit)` produces (emit(epoch, start)
+    /// in ascending order).  No allocation.
+    template <class F>
+    static std::size_t encodeWith(uint8_t* out, uint64_t seq, int64_t fence, F&& forEach) noexcept {
         std::size_t n = 0;
         uint8_t* e = out + kHeaderBytes;
-        for (It it = first; it != last; ++it, ++n) {
-            putLe32_(e, static_cast<uint32_t>(it->first));
-            putLe64_(e + 4, static_cast<uint64_t>(it->second));
+        forEach([&](int32_t ep, int64_t off) {
+            putLe32_(e, static_cast<uint32_t>(ep));
+            putLe64_(e + 4, static_cast<uint64_t>(off));
             e += kEntryBytes;
-        }
+            ++n;
+        });
         std::memset(out, 0, kHeaderBytes);
         putLe32_(out + 0, kMagic);
         out[4] = static_cast<uint8_t>(kVersion);
@@ -176,6 +185,25 @@ struct LeaderEpochState {
             return -err;
         }
         return fd;
+    }
+
+    /// Review M1 ruling (no downgrade support): once leader-epoch-state holds a
+    /// DURABLE image, the legacy `leader-epoch-checkpoint` / `leader-epoch-fence`
+    /// (and their .tmp) are removed — unlink + one FULL directory fsync — so no
+    /// binary can ever trust stale legacy data.  Returns the number removed, or
+    /// -errno when the directory fsync failed.  Cold (never on a worker).
+    static int removeLegacy(const std::string& dir) {
+        static constexpr const char* kNames[] = {"leader-epoch-checkpoint", "leader-epoch-checkpoint.tmp",
+                                                 "leader-epoch-fence", "leader-epoch-fence.tmp"};
+        int removed = 0;
+        for (const char* n : kNames)
+            if (::unlink((dir + "/" + n).c_str()) == 0) ++removed;
+        if (removed == 0) return 0;
+        const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+        int err = 0;
+        if (dfd < 0 || ::fsync(dfd) != 0) err = errno != 0 ? errno : EIO;
+        if (dfd >= 0) ::close(dfd);
+        return err != 0 ? -err : removed;
     }
 
     /// Open the existing file for slot writes.  -errno on failure.  Cold.

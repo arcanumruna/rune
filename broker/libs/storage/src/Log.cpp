@@ -967,6 +967,7 @@ int64_t Log::recover() {
         dirFd_ = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
         if (dirFd_ < 0 && storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
     }
+    startupRp_ = corrupt ? logStartOffset() : rp;
     validateFromRecoveryPoint_(corrupt ? INT64_MAX : rp, /*deleteOnGap=*/!corrupt);
     const int64_t next = activeSegment().nextOffset();
     logEndOffset_ = next;
@@ -980,6 +981,21 @@ int64_t Log::recover() {
     // known (CP-5.1: a 0 timestamp reads "ancient").
     recoveryPoint_ = next;
     rpDue_ = false;
+    // A directory holding a replica's epoch history guards itself (a passthrough
+    // log never has one, so nothing would ever lift the guard there).
+    if (!epochGuard_) {
+        std::error_code e1, e2;
+        epochGuard_ = std::filesystem::exists(dir_ + "/leader-epoch-state", e1) ||
+                      std::filesystem::exists(dir_ + "/leader-epoch-checkpoint", e2);
+    }
+    if (epochGuard_ && !corrupt) {
+        // Review C1: hold R at the startup value until the epoch history the
+        // owner re-derives from it is durable (setEpochHistoryCap lifts it).
+        const int64_t hold = std::max<int64_t>(logStartOffset(), std::min<int64_t>(startupRp_, next));
+        rpGuardTarget_ = next;
+        rpEpochCap_ = hold;
+        recoveryPoint_ = hold;
+    }
     // MEDIUM-2: every entry present now (recoverStagingFiles' renames, segment
     // files of earlier incarnations) becomes durable before R = LEO trusts it:
     // the directory fd is opened ONCE (kept for the io backend's batched
@@ -1267,6 +1283,7 @@ void Log::advanceRecoveryPoint_() noexcept {
     }
     rpDirBlocked_ = dirBlocked;
     if (r > rpTruncCap_) r = rpTruncCap_;   // hot-path B F7: never above an armed truncation's cut
+    if (r > rpEpochCap_) r = rpEpochCap_;   // review C1: never past epoch history not yet durable
     if (r <= recoveryPoint_) return;
     recoveryPoint_ = r;
     if (!rpDue_) refreshRpDue_();
@@ -1289,6 +1306,24 @@ bool Log::noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept {
     seg->markDurableThrough(upTo);
     advanceRecoveryPoint_();
     return recoveryCheckpointDue() || directorySyncDue();
+}
+
+void Log::setEpochHistoryCap(int64_t c) noexcept {
+    const bool raised = c > rpEpochCap_;
+    rpEpochCap_ = c;
+    if (recoveryPoint_ > c) [[unlikely]] recoveryPoint_ = c;   // in memory only (callers never cap below R)
+    if (raised && rpGuardTarget_ >= 0) {
+        // The recovery-time R the guard held back (everything recovered is durable).
+        const int64_t t = std::min(rpGuardTarget_, c);
+        if (t > recoveryPoint_) recoveryPoint_ = t;
+        if (c >= rpGuardTarget_) rpGuardTarget_ = -1;
+        refreshRpDue_();
+        if (recoveryPoint_ > persistedRp_) rpDue_ = true;
+    }
+    if (raised) {
+        advanceRecoveryPoint_();
+        if (recoveryCheckpointDue() || directorySyncDue()) rpKick_ = true;
+    }
 }
 
 bool Log::prepareTruncationTo(int64_t x) noexcept {

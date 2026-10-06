@@ -425,6 +425,23 @@ public:
     bool prepareTruncationTo(int64_t x) noexcept;
     /// Owner: a lowering checkpoint became due outside a completion (once).
     [[nodiscard]] bool takeCheckpointKick() noexcept { const bool k = rpKick_; rpKick_ = false; return k; }
+    /// Review C1 (Kafka: the leader-epoch checkpoint is flushed before the
+    /// recovery point advances): the owner's replica caps R at the lowest
+    /// offset whose epoch history is not yet durable (INT64_MAX = none).
+    /// Raising it may let R advance (a checkpoint kick follows).  Owner thread.
+    void setEpochHistoryCap(int64_t c) noexcept;
+    /// Review C1: before recover() — recovery keeps the persisted recovery
+    /// point at the startup value (never raises it to the recovered LEO) until
+    /// the epoch-history owner lifts the cap (setEpochHistoryCap).  Automatic
+    /// for a directory that holds a replica's epoch history
+    /// (leader-epoch-state / leader-epoch-checkpoint): its PartitionReplica
+    /// lifts it once the reconciled history is durable.
+    void setEpochHistoryGuard(bool on) noexcept { epochGuard_ = on; }
+    /// The recovery point recovery started from (persisted value, or the
+    /// upgrade default) — the replica re-derives epoch history from here.
+    /// kRecoveryPointUnknown before recover().
+    [[nodiscard]] int64_t startupRecoveryPoint() const noexcept { return startupRp_; }
+    [[nodiscard]] int64_t epochHistoryCapForTest() const noexcept { return rpEpochCap_; }
     [[nodiscard]] uint64_t asyncTruncationLoweringsForTest() const noexcept { return rpLowerings_; }
 
     // Async checkpoint (owning worker, through its io backend):
@@ -958,6 +975,10 @@ private:
     /// Hot-path B F7: a truncation to rpTruncCap_ waits for the on-disk R to be
     /// lowered to it (async, the owner's io backend).  INT64_MAX = none.
     int64_t rpTruncCap_    = INT64_MAX;
+    int64_t rpEpochCap_    = INT64_MAX;   ///< review C1: see setEpochHistoryCap
+    bool    epochGuard_    = false;       ///< review C1: see setEpochHistoryGuard
+    int64_t startupRp_     = -1;          ///< see startupRecoveryPoint
+    int64_t rpGuardTarget_ = -1;          ///< the recovered R held back by the guard
     bool    rpLowerDue_    = false;   ///< the on-disk R (upper bound) exceeds the truncation cap
     bool    rpKick_        = false;   ///< see takeCheckpointKick
     uint64_t rpLowerings_  = 0;

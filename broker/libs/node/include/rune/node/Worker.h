@@ -1227,6 +1227,11 @@ public:
     /// E1d: recovery-point checkpoint fdatasyncs (tmp file + directory) submitted to the io backend.
     [[nodiscard]] uint64_t    recoveryPointSubmitsForTest() const noexcept { return rpSubmits_; }
     [[nodiscard]] uint64_t    dirSyncSubmitsForTest() const noexcept { return dirSyncSubmits_; }
+    [[nodiscard]] uint64_t    epochStateSubmitsForTest() const noexcept { return epochStateSubmits_; }
+    [[nodiscard]] uint64_t    epochStateNotRoutedForTest() const noexcept { return epochStateNotRouted_; }
+    [[nodiscard]] uint64_t    bgFlushSubmitsCountForTest() const noexcept { return bgFlushSubmits_; }
+    /// Review Md3 seam: the next `n` epoch-state route inserts fail.
+    void forceRouteFailForTest(int n) noexcept { forceRouteFailForTest_ = n; }
     /// The Strict-ack seal gate for `log` (true = an older seal is still in
     /// flight or pending: no Strict ack may fire).  Test-only.
     [[nodiscard]] bool sealsOutstandingForTest(rune::storage::Log* log) noexcept { return sealsOutstanding_(log); }
@@ -4216,6 +4221,9 @@ private:
     uint64_t    dirSyncSubmits_ = 0;   ///< E1d MEDIUM-2: batched directory fsyncs submitted
     uint64_t    rpSubmits_      = 0;   ///< E1d recovery-point checkpoint write+fdatasyncs submitted
     uint64_t    epochStateSubmits_ = 0;   ///< hot-path B F7: leader-epoch-state syncs submitted
+    uint64_t    epochStateNotRouted_ = 0; ///< review Md3
+    int         forceRouteFailForTest_ = 0;
+    std::vector<uint8_t> esScratch_ = std::vector<uint8_t>(4096);   ///< review Md4: one image buffer per worker
     std::vector<rune::storage::Log*> rpQueue_;   ///< E1d F8: logs whose checkpoint is due
     uint64_t    ioCompletionsReaped_ = 0;
     uint64_t    storageFailureSignals_ = 0;
@@ -4878,11 +4886,18 @@ private:
         LogFlushSlot* slot = slotOf_(r.log());
         if (slot == nullptr) return 0;                     // not (yet) owned here: next pass
         rune::replication::PartitionReplica::EpochStateWrite w;
-        if (!r.prepareEpochStateWrite(w)) return 0;
+        std::size_t need = 0;
+        if (!r.prepareEpochStateWrite(esScratch_.data(), esScratch_.size(), w, need)) {
+            if (need <= esScratch_.size()) return 0;
+            esScratch_.resize(need);                       // cold: the history outgrew the scratch
+            if (!r.prepareEpochStateWrite(esScratch_.data(), esScratch_.size(), w, need)) return 0;
+        }
+        // The image is copied into the page cache here: the worker's scratch is
+        // free again when pwrite returns (review Md4: no per-replica image).
         if (::pwrite(w.fd, w.data, w.len, static_cast<off_t>(w.offset)) != static_cast<ssize_t>(w.len)) {
             const int err = errno != 0 ? errno : ENOSPC;
             r.epochStateWriteSubmitted();
-            (void)r.epochStateWriteCompleted(w.seq, err);   // fail closed (as a failed fsync)
+            (void)r.epochStateWriteCompleted(w.seq, err);   // the failure path (retry / fail-stop)
             ++epochStateSubmits_;
             return 1;
         }
@@ -4892,9 +4907,18 @@ private:
             return 0;
         }
         r.epochStateWriteSubmitted();
-        if (!routeInsert_(TokenRoute{t, r.log(), nullptr, slot->epoch, RouteKind::EpochState,
-                                     static_cast<int64_t>(w.seq)})) {
-            spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
+        const bool routed = forceRouteFailForTest_ == 0 &&
+                            routeInsert_(TokenRoute{t, r.log(), nullptr, slot->epoch, RouteKind::EpochState,
+                                                    static_cast<int64_t>(w.seq)});
+        if (!routed) [[unlikely]] {
+            if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
+            // Review Md3: an unroutable completion is never observed — the write
+            // is treated as not done and rewritten next pass (never wedged).
+            spdlog::critical("Worker {}: io token route table full (token={}) — epoch-state write re-queued",
+                             workerId_, t);
+            r.epochStateWriteNotRouted();
+            ++epochStateNotRouted_;
+            return 1;
         }
         ++epochStateSubmits_;
         return 1;
