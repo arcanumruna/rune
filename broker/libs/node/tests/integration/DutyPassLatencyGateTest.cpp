@@ -918,14 +918,14 @@ std::string counters(GateRig& rig) {
                   " reads=%" PRIu64 " readMiB=%.1f markers=%" PRIu64 "/%" PRIu64 "err rolls=%" PRIu64
                   " syncCreates=%" PRIu64 " inlineFsyncs=%" PRIu64 " holds=%" PRIu64 " deferrals=%" PRIu64
                   " failureInlineRolls=%" PRIu64
-                  " | FSYNC io: total=%" PRIu64 " seal=%" PRIu64 " bg=%" PRIu64 " rp=%" PRIu64 " dir=%" PRIu64
+                  " | FSYNC io: seal=%" PRIu64 " bg=%" PRIu64 " rp=%" PRIu64 " dir=%" PRIu64
                   " epoch=%" PRIu64 " | worker-inline: sync=%" PRIu64 " role=%" PRIu64
                   " | cleaner: fsync=%" PRIu64 " dir=%" PRIu64 " | provisioned=%" PRIu64
                   " | dirMutations=%" PRIu64 " inPlaceTrunc=%" PRIu64,
                   rig.produceAnswers, rig.produceErrors, static_cast<int>(rig.lastProduceError), rig.installs, rig.retentionDrops, rig.readAnswers,
                   static_cast<double>(rig.readBytes) / kMiB, rig.markersAppended, rig.markerErrors, rig.rolls,
                   rig.syncCreates, rig.inlineFsyncs, rig.holds, rig.rollDeferrals(), rig.failureInlineRolls(),
-                  w.ioSubmitCountForTest(), w.sealSubmitsForTest(), w.bgFlushSubmitsCountForTest(),
+                  w.sealSubmitsForTest(), w.bgFlushSubmitsCountForTest(),
                   w.recoveryPointSubmitsForTest(), w.dirSyncSubmitsForTest(), w.epochStateSubmitsForTest(),
                   inlineSyncs, roleSyncs, cleanerFsyncs, cleanerDirFsyncs, rig.provisionedForTest(), dirMut, inPlace);
     return buf;
