@@ -29,6 +29,7 @@
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/LogCleanerAgent.h>
 #include <rune/node/SegmentProvisionerAgent.h>
+#include <rune/node/ParkUntilWorkIdle.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/GroupCoordinationService.h>
@@ -1036,7 +1037,7 @@ private:
     // Destroyed after the replica registry (declared before it is NOT required:
     // the logs never call into it after the workers stopped).
     std::unique_ptr<SegmentProvisionerAgent>              provisionerAgent_;
-    std::unique_ptr<rune::consensus::BackoffIdleStrategy> provisionerIdleStrategy_;
+    std::unique_ptr<ParkUntilWorkIdle>                    provisionerIdleStrategy_;
     rune::consensus::MonotonicNanoClock                   provisionerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         provisionerRunner_;
     [[nodiscard]] rune::storage::Log::ProvisionHook provisionHook_() noexcept {

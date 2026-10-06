@@ -1007,7 +1007,17 @@ ConfigResult parseNodeConfig(
     if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISION_DEPTH"); raw && *raw) {
         char* end = nullptr;
         const long v = std::strtol(raw, &end, 10);
-        if (end != raw) cfg.segmentProvisionDepth = static_cast<int32_t>(std::clamp<long>(v, 2, 8));
+        if (end != raw) cfg.segmentProvisionDepth = static_cast<int32_t>(std::clamp<long>(v, 1, 8));
+    }
+    if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISION_THRESHOLD_PCT"); raw && *raw) {
+        char* end = nullptr;
+        const long v = std::strtol(raw, &end, 10);
+        if (end != raw) cfg.segmentProvisionThresholdPct = static_cast<int32_t>(std::clamp<long>(v, 1, 100));
+    }
+    if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISION_CAP_BYTES"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end != raw && v >= 0) cfg.segmentProvisionCapBytes = static_cast<int64_t>(v);
     }
     if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISIONER_MAX_PARK_US"); raw && *raw) {
         char* end = nullptr;

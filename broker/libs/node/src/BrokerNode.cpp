@@ -124,11 +124,11 @@ void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::stri
 // SegmentProvisionerAgent keeps its ready segments; a roll never creates one
 // on the worker (it is deferred and the intake back-pressures instead).
 void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId,
-                                 rune::storage::Log::ProvisionHook provision) noexcept {
+                                 rune::storage::Log::ProvisionHook provision, int thresholdPct) noexcept {
     if (topicId < 0) return;
     replica.setExternalFollowerFlush(true);
     if (provision.fn != nullptr && replica.isDiskBacked() && replica.log() != nullptr)
-        replica.log()->setProvisioning(provision);
+        replica.log()->setProvisioning(provision, thresholdPct);
 }
 
 int32_t clampI32(int64_t v) noexcept {
@@ -445,7 +445,7 @@ void BrokerNode::start() {
     // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
     //     built — every worker-driven disk log is wired to its demand hook.
     provisionerAgent_ = std::make_unique<SegmentProvisionerAgent>(
-        static_cast<std::size_t>(config_.segmentProvisionDepth));
+        static_cast<std::size_t>(config_.segmentProvisionDepth), config_.segmentProvisionCapBytes);
 
     // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
     //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
@@ -456,8 +456,7 @@ void BrokerNode::start() {
     // hotpath-A F2: every worker-driven disk log was wired to the provisioner's
     // demand hook (its rolls defer while no ready segment exists) — a missing
     // provisioner thread would wedge every roll.  Never start like that.
-    if (provisionerAgent_ && !provisionerRunner_)
-        throw std::logic_error("BrokerNode: SegmentProvisionerAgent built but not wired to a runner");
+    requireProvisionerRunner(provisionerAgent_ != nullptr, provisionerRunner_ != nullptr);
 
     // 7.0 fsyncgate: a log whose recovery failed (index msync / dir fsync — the
     //     log is marked storage-failed) must never serve.  Refuse to start —
@@ -1181,7 +1180,7 @@ void BrokerNode::buildReplication() {
                 : std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
-            applyWorkerDrivenDurability(*replica, topicId, provisionHook_());   // Task 10 + F30 + hotpath-A
+            applyWorkerDrivenDurability(*replica, topicId, provisionHook_(), config_.segmentProvisionThresholdPct);   // Task 10 + F30 + hotpath-A
             if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
             // Kafka AlterPartition: user-partition ISR changes go through the
             // controller (multi-node); internal partitions keep a leader-local ISR.
@@ -1357,7 +1356,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
             : std::make_unique<PartitionReplica>(
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
-        applyWorkerDrivenDurability(*replica, topicId, provisionHook_());   // same policy as boot (F30 fix round 1, F3)
+        applyWorkerDrivenDurability(*replica, topicId, provisionHook_(), config_.segmentProvisionThresholdPct);   // same policy as boot (F30 fix round 1, F3)
         if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
         if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
             replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
@@ -2535,8 +2534,11 @@ void BrokerNode::buildGateway() {
         if (provisionerAgent_ && runtimeAgent_) {
             cleanerAgent_->setExternalProvisioner(true);
             provisionerAgent_->attachViewChannel(runtimeAgent_->enableProvisionerView());
-            provisionerIdleStrategy_ = std::make_unique<rune::consensus::BackoffIdleStrategy>(
-                10, 20, std::chrono::microseconds{1}, std::chrono::microseconds{config_.segmentProvisionerMaxParkUs});
+            // Review m5: park on the demand ring's doorbell (woken by a demand),
+            // so an idle provisioner costs ~1/maxPark wakeups, not 10k/s.
+            provisionerIdleStrategy_ = std::make_unique<ParkUntilWorkIdle>(
+                IdleShape{10, 20, 1'000, std::max<int64_t>(config_.segmentProvisionerMaxParkUs, 1) * 1'000},
+                nullptr, 0, provisionerAgent_->doorbell());
             provisionerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
                 *provisionerAgent_, *provisionerIdleStrategy_, provisionerClock_);
             spdlog::info("BrokerNode[{}]: SegmentProvisionerAgent wired (depth={}, maxPark={}us)", nodeId,

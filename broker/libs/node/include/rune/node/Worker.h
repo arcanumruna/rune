@@ -5389,7 +5389,13 @@ private:
         // inline create; seal queue full: never an inline fsync).  Hold the
         // frame (the caller ABORTs the controlled poll); its admission unit is
         // given back.  O(1): one size compare (+ one acquire load when full).
-        if (log != nullptr && log->rollDeferred()) [[unlikely]] {
+        // Review m1: the hold is image-wide (a controlled-poll ABORT stops every
+        // later frame of the same publisher on this worker until the roll can
+        // happen — bounded by the provisioner's refill / a reported failure /
+        // the seal-queue drain).  Frames that would be REFUSED anyway (not the
+        // leader, oversize) are never held: they are answered at once.
+        if (log != nullptr && log->rollDeferred() && produceRoleGatePasses_(replica) &&
+            msg.recordBatch.size() <= maxIntakeBatchBytes()) [[unlikely]] {
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
             ++intakeRollHolds_;
             return kIngressHeld;

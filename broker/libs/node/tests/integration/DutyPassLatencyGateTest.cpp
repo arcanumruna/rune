@@ -72,6 +72,7 @@
 #include <rune/node/LogCleanerAgent.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/NodeRuntimeAgent.h>
+#include <rune/node/ParkUntilWorkIdle.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/SegmentProvisionerAgent.h>
 #include <rune/node/Worker.h>
@@ -453,9 +454,11 @@ public:
           // budget, coalescing on (NodeConfig default), 64 MiB fallback roll).
           cleaner_(&reg_, 128 * kMiB, -1, cleanerThrottleBytesPerSec, /*useCoalescing=*/true, 64 * kMiB),
           // hotpath-A F2: BrokerNode's segment provisioner (NodeConfig defaults).
-          provisioner_(static_cast<std::size_t>(rune::node::NodeConfig{}.segmentProvisionDepth)),
-          provisionerIdle_(10, 20, std::chrono::microseconds{1},
-                           std::chrono::microseconds{rune::node::NodeConfig{}.segmentProvisionerMaxParkUs}) {
+          provisioner_(static_cast<std::size_t>(rune::node::NodeConfig{}.segmentProvisionDepth),
+                       rune::node::NodeConfig{}.segmentProvisionCapBytes),
+          provisionerIdle_(rune::node::IdleShape{10, 20, 1'000,
+                                                 rune::node::NodeConfig{}.segmentProvisionerMaxParkUs * 1'000},
+                           nullptr, 0, provisioner_.doorbell()) {
         static int seq = 0;
         dir_ = fs::temp_directory_path() /
                ("rune_latgate_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
@@ -496,7 +499,8 @@ public:
         auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
                                                     std::vector<int32_t>{1}, p->log.get(), &transport_);
         r->setExternalFollowerFlush(true);          // BrokerNode::applyWorkerDrivenDurability
-        p->log->setProvisioning(provisioner_.hook());   // ... + hotpath-A F2
+        p->log->setProvisioning(provisioner_.hook(),
+                                rune::node::NodeConfig{}.segmentProvisionThresholdPct);   // ... + hotpath-A F2 / M3
         if (s.controllerManaged) {
             r->setLeaderEpochFenceFile((d / "leader-epoch-fence").string());
             r->setIsrChannel(&transport_);
@@ -519,22 +523,12 @@ public:
         runner_->start();
         provRunner_ = std::make_unique<rune::consensus::AgentRunner>(provisioner_, provisionerIdle_, provClock_);
         provRunner_->start();
-        // Startup: let the provisioner fill every log's pool (BrokerNode starts it
-        // before any client can connect) — bounded passes, no sleep.
-        for (int i = 0; i < 2'000'000 && !poolsFull(); ++i) {
-            (void)pool_.worker(0).doWork(clock_.nowNs());
-            (void)rt_.doWork(clock_.nowNs());
-            std::this_thread::yield();
-        }
+        // Review M3: provisioning is demand-driven — nothing is pre-built at
+        // startup (an idle partition reserves nothing).
     }
     void stop() {
         if (provRunner_) { provRunner_->stopAndJoin(); provRunner_.reset(); }
         if (runner_) { runner_->stopAndJoin(); runner_.reset(); }
-    }
-    bool poolsFull() const {
-        for (const auto& p : parts_)
-            if (p->log->readyCountForTest() < provisioner_.depth()) return false;
-        return true;
     }
 
     /// ONE measured duty pass.  `frames` are fed through the worker's ingress
@@ -579,6 +573,18 @@ public:
     }
     Split lastSplit{};
     uint64_t holds = 0;   ///< frames held (re-delivered later) — back-pressure, not loss
+    /// Review M3: rolls deferred (a roll arrived before its ready segment) and
+    /// rolls made inline after a provisioning failure / the cap, summed.
+    uint64_t rollDeferrals() const {
+        uint64_t n = 0;
+        for (const auto& p : parts_) n += p->log->rollDeferralsForTest();
+        return n;
+    }
+    uint64_t failureInlineRolls() const {
+        uint64_t n = 0;
+        for (const auto& p : parts_) n += p->log->failureInlineRollsForTest();
+        return n;
+    }
     std::size_t heldFrames() const noexcept { return carried_.size(); }
 
     /// Flags describing what the last pass did (compared with the previous one).
@@ -693,7 +699,7 @@ private:
     rune::consensus::MonotonicNanoClock    clock_;
     std::unique_ptr<rune::consensus::AgentRunner> runner_;
     rune::node::SegmentProvisionerAgent    provisioner_;
-    rune::consensus::BackoffIdleStrategy   provisionerIdle_;
+    rune::node::ParkUntilWorkIdle          provisionerIdle_;   // BrokerNode: doorbell park (review m5)
     rune::consensus::MonotonicNanoClock    provClock_;
     std::unique_ptr<rune::consensus::AgentRunner> provRunner_;
     std::vector<std::unique_ptr<Part>>     parts_;
@@ -890,14 +896,15 @@ void produceLoop(GateRig& rig, Stats& st, const FrameSet& fset, const LoopCfg& l
 uint64_t passes(uint64_t n) { return n * static_cast<uint64_t>(scale()); }
 
 std::string counters(const GateRig& rig) {
-    char buf[384];
+    char buf[512];
     std::snprintf(buf, sizeof buf,
                   "acks=%" PRIu64 " errs=%" PRIu64 "(last %d) installs=%" PRIu64 " retentionDrops=%" PRIu64
                   " reads=%" PRIu64 " readMiB=%.1f markers=%" PRIu64 "/%" PRIu64 "err rolls=%" PRIu64
-                  " syncCreates=%" PRIu64 " inlineFsyncs=%" PRIu64,
+                  " syncCreates=%" PRIu64 " inlineFsyncs=%" PRIu64 " holds=%" PRIu64 " deferrals=%" PRIu64
+                  " failureInlineRolls=%" PRIu64,
                   rig.produceAnswers, rig.produceErrors, static_cast<int>(rig.lastProduceError), rig.installs, rig.retentionDrops, rig.readAnswers,
                   static_cast<double>(rig.readBytes) / kMiB, rig.markersAppended, rig.markerErrors, rig.rolls,
-                  rig.syncCreates, rig.inlineFsyncs);
+                  rig.syncCreates, rig.inlineFsyncs, rig.holds, rig.rollDeferrals(), rig.failureInlineRolls());
     return buf;
 }
 

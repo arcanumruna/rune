@@ -816,16 +816,28 @@ struct NodeConfig {
     // Default 7 days.  Overridable via RUNE_PRODUCER_ID_EXPIRATION_MS (>= 0).
     int64_t producerIdExpirationMs = 7LL * 24 * 3600 * 1000;
 
-    // hotpath-A F2: READY (pre-provisioned, fallocated) segments the
-    // SegmentProvisionerAgent keeps per disk-backed log, refilled event-driven
-    // as rolls consume them.  A roll with none ready is DEFERRED (the intake
-    // back-pressures) — never an inline create on a worker.  Disk reservation:
-    // (depth + 1) x segmentRollBytes per partition (fallocate KEEP_SIZE).
-    // Clamped to [2, Log::kMaxProvisionDepth].  RUNE_SEGMENT_PROVISION_DEPTH.
-    int32_t segmentProvisionDepth = 2;
-    // The provisioner thread's backoff park cap (µs) — its refill latency when
-    // idle.  RUNE_SEGMENT_PROVISIONER_MAX_PARK_US (>= 1).
-    int64_t segmentProvisionerMaxParkUs = 100;
+    // hotpath-A F2 + review M3: READY (pre-provisioned, fallocated) segments
+    // the SegmentProvisionerAgent builds for a disk-backed user log — DEMAND-
+    // DRIVEN: nothing is reserved until the log's active segment is
+    // segmentProvisionThresholdPct full; then up to `depth` ready segments are
+    // built (the next roll adopts one with zero syscalls).  Idle partitions
+    // reserve 0 extra blocks / fds / mmaps.  Worst-case disk reservation per
+    // busy partition: depth x segmentRollBytes (fallocate KEEP_SIZE), bounded
+    // node-wide by segmentProvisionCapBytes.  A roll that arrives before its
+    // ready segment is deferred (the intake holds, bounded); a build failure or
+    // the cap makes that roll inline (blocking, correct, counted).
+    // depth: clamped to [1, Log::kMaxProvisionDepth].  RUNE_SEGMENT_PROVISION_DEPTH.
+    int32_t segmentProvisionDepth = 1;
+    // Fill level (% of segmentRollBytes, 1..100) at which a log demands its
+    // next segment.  RUNE_SEGMENT_PROVISION_THRESHOLD_PCT.
+    int32_t segmentProvisionThresholdPct = 50;
+    // Node-wide cap on bytes reserved by ready segments (0 = no cap).
+    // RUNE_SEGMENT_PROVISION_CAP_BYTES.
+    int64_t segmentProvisionCapBytes = 16LL * 1024 * 1024 * 1024;
+    // The provisioner thread's park cap (µs) when idle.  Demands ring its
+    // doorbell (review m5), so this bounds only fd-less work (replica-view
+    // updates).  RUNE_SEGMENT_PROVISIONER_MAX_PARK_US (>= 1).
+    int64_t segmentProvisionerMaxParkUs = 10'000;
 
     // Segment roll size (bytes) for the internal __consumer_offsets log.
     // Default 64 MiB matches TopicSpec::segmentRollBytes.
