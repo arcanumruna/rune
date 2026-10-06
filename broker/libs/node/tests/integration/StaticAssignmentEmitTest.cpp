@@ -1949,3 +1949,46 @@ TEST(ControlledShutdownNodeRegression, HaltStopsDecidingAndAcksRegression) {
     for (const auto& m : r.sent) told = told || (m.isr[1] & rune::replication::AlterIsrMsg::kNodeShutdown) != 0;
     EXPECT_TRUE(told) << "the members were not told the node is going";
 }
+
+// D17 / DR-10 review MAJOR-1: a consensus leader that stepped down (quorum loss,
+// higher-term NLT, granted RequestVote — or a resumed zombie before it does) keeps
+// its __cluster_metadata replica's Leader role until the bridge learns a NEW
+// leader.  Its controller must stop deciding the moment consensus leadership is
+// gone: otherwise it reassigns every partition it leads over an eligible set
+// that no longer contains itself, and those records COMMIT while the followers
+// still fetch from it.
+TEST(ControllerConsensusGateRegression, SteppedDownConsensusLeaderEmitsNoReassignmentRegression) {
+    SaeTempDir dir1("cg1"), dir2("cg2"), dir3("cg3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 3, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    for (int i = 0; i < 50; ++i) {
+        clock += 1'000'000LL;
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+        (void)svc1.doWork(clock);
+    }
+    ASSERT_TRUE(svc1.controllerReady());
+    const Offset leoBefore = r1->logEndOffset();
+
+    // Consensus leadership is gone; the metadata replica still reads Leader.
+    svc1.setConsensusLeads(false);
+    EXPECT_FALSE(svc1.controllerReady()) << "a non-consensus-leader must not decide";
+    EXPECT_EQ(svc1.runDynamicRebalanceOnTick({kNode2, kNode3}, nullptr), 0u)
+        << "a stepped-down controller reassigned partitions over an eligible set without itself";
+    EXPECT_EQ(r1->logEndOffset(), leoBefore) << "a stepped-down controller appended to the metadata log";
+
+    svc1.setConsensusLeads(true);
+    EXPECT_TRUE(svc1.controllerReady()) << "regaining consensus leadership restores deciding";
+}

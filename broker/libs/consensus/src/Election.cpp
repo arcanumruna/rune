@@ -754,6 +754,22 @@ void Election::onRequestVote(Term    logLeadershipTermId,
         ClusterMember::compareLog(logLeadershipTermId_, appendPosition_,
                                   logLeadershipTermId, logPosition) <= 0 &&
         mayVoteFor(candidateId)) {
+        // DR-10 review MEDIUM-1 — leader stickiness (Raft §9.6 / etcd CheckQuorum):
+        // while this CLOSED node still has a working leadership (as leader: an
+        // active follower quorum; as follower: a leader heard within the
+        // heartbeat timeout) a higher-term candidate is answered with a DENY and
+        // never pulls it out — else a partial partition ping-pongs leadership
+        // (the cut-off node campaigns, the bridge node grants, repeat).  A dead /
+        // paused leader (DR-10) has neither, so the zombie path is unchanged.
+        const bool selfLeads = leaderMember_ != nullptr && leaderMember_->id == thisMemberId_;
+        const bool sticky = selfLeads
+            ? hasActiveFollowerQuorum_(nowNs)
+            : (followerLiveness_.armed() &&
+               nowNs - followerLiveness_.lastLeaderUpdateNs() < leaderHeartbeatTimeoutNs_);
+        if (sticky) {
+            placeVote(candidateTermId, candidateId, false);
+            return;
+        }
         leaveClosedForElection_(leadershipTermId_, nowNs,
                                 "higher-term RequestVote in CLOSED → re-election");
     }

@@ -310,6 +310,11 @@ private:
         //     and the gateway uses it for ALL per-produce/subscribe lookups within
         //     that cycle.  Zero atomic_load per produce on the hot path.
         if (metadataService_) {
+            // D17 / DR-10 review MAJOR-1: only the CONSENSUS leader decides.  The
+            // metadata replica keeps its Leader role after a consensus step-down
+            // until the bridge learns the new leader; deciding on that role let a
+            // stepped-down (or resumed-zombie) controller reassign partitions.
+            metadataService_->setConsensusLeads(isLocalLeader_());
             const int metaWork = metadataService_->doWork(nowNs);
             work += metaWork;
             // Controlled shutdown (cold; two empty() checks when idle): member
