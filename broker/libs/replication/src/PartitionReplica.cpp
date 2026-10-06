@@ -1798,6 +1798,12 @@ int PartitionReplica::doWork(int64_t nowNs)
             if (act.emit) {
                 FetchRequestMsg req = nextFetch();
                 if (!act.wantData) req.maxBytes = 0;   // pure-ack keepalive
+                // hotpath-A review m2: the log cannot roll right now (no ready
+                // segment / seal queue full) — ask for no data (keepalive only:
+                // ISR liveness kept) instead of applying past rollBytes until the
+                // forced-roll cap creates a segment inline on the worker.
+                else if (!memoryBacked_ && diskLog_ != nullptr && diskLog_->rollDeferred()) [[unlikely]]
+                    req.maxBytes = 0;
                 // F27: a refused fetch never left — undo the emit so the NEXT pass
                 // re-sends it (no resend-timer wait for our own refusal).
                 const bool sent = sendFetchToLeader_(req);

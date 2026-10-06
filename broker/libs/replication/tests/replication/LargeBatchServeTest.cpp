@@ -82,8 +82,10 @@ public:
     }
 
     [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override { return frameCap; }
+    std::vector<int32_t> fetchMaxBytes;                // maxBytes of every follower FetchRequest
     bool sendFetchRequest(const FetchRequestMsg& req) override {
         ++fetchRequests;
+        fetchMaxBytes.push_back(req.maxBytes);
         InMemoryTransport::sendFetchRequest(req);
         return true;
     }
@@ -463,4 +465,61 @@ TEST_F(LargeBatchReplicationRegression, UnapplicableBatchNotAtLeoDoesNotWedge) {
     EXPECT_EQ(follower->wedgedAtOffset(), -1);
     follower->onUnapplicableBatch(/*batchBase=*/0, /*leaderEpoch=*/1);    // at LEO, current epoch
     EXPECT_EQ(follower->wedgedAtOffset(), 0);
+}
+
+
+// hotpath-A review m2: a follower whose (provisioned) log cannot roll right now
+// — no ready segment yet — stops asking for DATA (pure-ack keepalives only, so
+// it stays in the ISR) instead of applying until the forced-roll cap makes the
+// worker create a segment inline.  It resumes once a ready segment exists.
+TEST(FollowerRollBackPressureRegression, FollowerStopsFetchingDataWhileRollDeferredRegression) {
+    TempDir leaderDir{"bp_leader"}, followerDir{"bp_follower"};
+    rune::storage::Log leaderLog{leaderDir.path};
+    rune::storage::Log followerLog{followerDir.path, /*rollBytes=*/512};
+    followerLog.recover();
+    struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
+    followerLog.setProvisioning({&Hook::fn, nullptr});
+    CapturingTransport transport;
+    const std::vector<NodeId> replicas{kLeaderId, kFollowerId};
+    auto leader = std::make_unique<PartitionReplica>(makeCfg(kLeaderId, false), Role::Leader, 1, replicas, replicas,
+                                                     &leaderLog, &transport);
+    transport.setLeader(leader.get());
+    auto follower = std::make_unique<PartitionReplica>(makeCfg(kFollowerId, false), Role::Follower, 1, replicas,
+                                                       replicas, &followerLog, &transport);
+    transport.addFollower(kFollowerId, follower.get());
+    const std::vector<uint8_t> small(kSmallValue, 0x5A);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            leader->doWork(clock);
+            follower->doWork(clock);
+            transport.pump(clock);
+        }
+    };
+    // Replicate record by record until the follower's segment is full.
+    for (int i = 0; i < 400 && !followerLog.rollDeferred(); ++i) {
+        ASSERT_GE(leader->append(small), 0);
+        drive(5);
+    }
+    ASSERT_TRUE(followerLog.rollDeferred()) << "the follower's active segment filled with no ready segment";
+    // The leader keeps producing.
+    for (int i = 0; i < 32; ++i) ASSERT_GE(leader->append(small), 0);
+    drive(5);   // a fetch already in flight may still land
+    const Offset stuckLeo = follower->logEndOffset();
+    ASSERT_LT(stuckLeo, leader->logEndOffset());
+    transport.fetchMaxBytes.clear();
+    drive(50);
+    ASSERT_FALSE(transport.fetchMaxBytes.empty()) << "keepalives keep flowing (ISR liveness)";
+    for (int32_t mb : transport.fetchMaxBytes) EXPECT_EQ(mb, 0) << "a data fetch while the roll is deferred";
+    EXPECT_EQ(follower->logEndOffset(), stuckLeo);
+    EXPECT_EQ(followerLog.forcedRollsForTest(), 0u);
+    // A ready segment arrives: the follower catches up.
+    for (int i = 0; i < 40 && follower->logEndOffset() < leader->logEndOffset(); ++i) {
+        (void)followerLog.provisionReady(1);
+        (void)followerLog.finalizeStagingRenames();
+        (void)followerLog.drainStagingRenamesDone();
+        drive(10);
+    }
+    EXPECT_EQ(follower->logEndOffset(), leader->logEndOffset());
 }
