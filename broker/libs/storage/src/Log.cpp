@@ -1236,6 +1236,8 @@ int Log::checkpointRecoveryPoint_(bool publish) noexcept {
 }
 
 void Log::refreshRpDue_() noexcept {
+    // Hot-path B F7: an armed truncation needs the on-disk value lowered.
+    rpLowerDue_ = rpTruncCap_ != INT64_MAX && onDiskRecoveryPointUpperBound() > rpTruncCap_;
     if (recoveryPoint_ <= persistedRp_) { rpDue_ = false; return; }
     const int64_t b = nextSegmentBaseAfter(persistedRp_);
     rpDue_ = b != -1 && b <= recoveryPoint_;
@@ -1263,6 +1265,7 @@ void Log::advanceRecoveryPoint_() noexcept {
         it = nx;
     }
     rpDirBlocked_ = dirBlocked;
+    if (r > rpTruncCap_) r = rpTruncCap_;   // hot-path B F7: never above an armed truncation's cut
     if (r <= recoveryPoint_) return;
     recoveryPoint_ = r;
     if (!rpDue_) refreshRpDue_();
@@ -1287,6 +1290,24 @@ bool Log::noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept {
     return recoveryCheckpointDue() || directorySyncDue();
 }
 
+bool Log::prepareTruncationTo(int64_t x) noexcept {
+    if (!recovered_ || !deferSealSync_ || rpFd_ < 0 || storage_.failedErrno != 0) return true;   // inline path
+    if (x >= logEndOffset_) return true;                          // nothing to truncate
+    // The resulting LEO: truncation rounds down to the start of the batch
+    // holding x (truncateTo's own rule) — lower R exactly there, so truncateTo's
+    // trailing persistAtMost_(LEO) writes nothing either.
+    int64_t cut = std::max<int64_t>(0, x);
+    const LogReadView v = readView(cut, 0);
+    if (!v.empty() && v.baseOffset < cut) cut = v.baseOffset;
+    if (cut < rpTruncCap_) rpTruncCap_ = cut;
+    if (recoveryPoint_ > rpTruncCap_) recoveryPoint_ = rpTruncCap_;
+    const bool staleInProgress = rp_.stage != RpStage::Idle && !rp_.abandoned && rp_.value > rpTruncCap_;
+    refreshRpDue_();
+    if (!staleInProgress && onDiskRecoveryPointUpperBound() <= rpTruncCap_) return true;
+    if (recoveryCheckpointDue()) { rpKick_ = true; ++rpLowerings_; }
+    return false;
+}
+
 bool Log::prepareRecoveryCheckpoint(RpWrite& out) noexcept {
     if (!recoveryCheckpointDue()) return false;
     const int slot = rpActiveSlot_ < 0 ? 0 : 1 - rpActiveSlot_;
@@ -1294,6 +1315,7 @@ bool Log::prepareRecoveryCheckpoint(RpWrite& out) noexcept {
     encodeRpSlot(rpImage_, seq, recoveryPoint_);
     rp_ = RpCheckpoint{RpStage::Prepared, false, slot, seq, recoveryPoint_};
     rpDue_ = false;
+    rpLowerDue_ = false;
     out.fd = rpFd_; out.data = rpImage_; out.len = static_cast<uint32_t>(kRpSlotBytes);
     out.offset = static_cast<int64_t>(slot * kRpSlotStride); out.seq = seq;
     return true;
@@ -1544,6 +1566,12 @@ int64_t Log::totalBytes() const {
     int64_t t = 0; for (auto& [b, seg] : segments_) t += seg->sizeBytes(); return t;
 }
 bool Log::truncateTo(int64_t truncateOffset) {
+    const bool done = truncateTo_(truncateOffset);
+    if (done) clearTruncationCap_();   // hot-path B F7: R may advance again
+    return done;
+}
+
+bool Log::truncateTo_(int64_t truncateOffset) {
     if (truncateOffset >= logEndOffset_) return true; // nothing to do
     // Fix round 5: never touch a file by path while the cleaner still has
     // posted renames to perform — deferred, no wait (the caller retries).
@@ -1718,11 +1746,16 @@ bool Log::truncateTo(int64_t truncateOffset) {
         // Use the segment's actual nextOffset_ (derived from the physically
         // truncated file) rather than hard-coding truncateOffset, so that LEO
         // and the segment's nextOffset_ can never diverge.
-        activeSegment().recover();
+        // Hot-path B F7: a worker-driven log never msyncs / directory-fsyncs
+        // on its owner here — the rebuilt index is then as durable as a
+        // deferred seal leaves it (page cache), and its rename is a directory
+        // mutation R may not pass until the owner's batched async directory
+        // fsync covered it (MEDIUM-2, below).
+        activeSegment().recover(/*syncIndex=*/!deferSealSync_);
         activeSegment().setDurableNext(std::min(oldDurable, activeSegment().nextOffset()));
         // MEDIUM-2: R stays below the deleted files' range until a directory
         // fsync covered the deletions (else they could reappear trusted).
-        if (deletesFiles) activeSegment().setDirEntryGen(++dirMutGen_);
+        if (deletesFiles || deferSealSync_) activeSegment().setDirEntryGen(++dirMutGen_);
         logEndOffset_ = activeSegment().nextOffset();
     } catch (const std::exception& ex) {
         fatalHalt("Log::truncateTo: post-truncate storage failure rebuilding segment "

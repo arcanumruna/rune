@@ -409,6 +409,19 @@ public:
     bool noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept;
     /// Persist R now, inline (cold paths).  0 or the errno (fail-stop).
     int checkpointRecoveryPoint() noexcept;
+    /// Hot-path B F7 (worker-driven logs, deferSealSync): E1d F6 requires the
+    /// on-disk recovery point <= the truncation's resulting LEO before
+    /// truncateTo touches any file.  Instead of truncateTo's inline write +
+    /// fdatasync on the worker, the owner's io backend writes the lowered value
+    /// first: true = already durable (truncateTo writes nothing inline); false
+    /// = a lowering checkpoint is due / in flight (takeCheckpointKick() queues
+    /// it on the owner) — retry next pass (FollowerSync TruncatePending).  Once
+    /// armed, R never advances above the cut until the truncation ran or was
+    /// abandoned (cancelColdPathWait).  Inline-sync logs: always true.
+    bool prepareTruncationTo(int64_t x) noexcept;
+    /// Owner: a lowering checkpoint became due outside a completion (once).
+    [[nodiscard]] bool takeCheckpointKick() noexcept { const bool k = rpKick_; rpKick_ = false; return k; }
+    [[nodiscard]] uint64_t asyncTruncationLoweringsForTest() const noexcept { return rpLowerings_; }
 
     // Async checkpoint (owning worker, through its io backend):
     //   Idle --prepare--> Prepared --submitted--> InFlight --completed--> Idle
@@ -418,7 +431,7 @@ public:
     /// R crossed a segment boundary since the last persist and no checkpoint is
     /// in progress (O(1)).
     [[nodiscard]] bool recoveryCheckpointDue() const noexcept {
-        return rpDue_ && rp_.stage == RpStage::Idle && recovered_ && rpFd_ >= 0 &&
+        return (rpDue_ || rpLowerDue_) && rp_.stage == RpStage::Idle && recovered_ && rpFd_ >= 0 &&
                storage_.failedErrno == 0;
     }
     /// The write the owner submits: `len` bytes of `data` at `offset` of `fd`,
@@ -492,6 +505,9 @@ public:
     /// performed every posted file operation — retry on a later duty pass (the
     /// replica parks in FollowerSync::TruncatePending; never waits).
     [[nodiscard]] bool truncateTo(int64_t truncateOffset);
+private:
+    bool truncateTo_(int64_t truncateOffset);
+public:
     std::vector<int64_t> segmentBaseOffsets() const;
     /// F15 S4 (I-C): the base offset of the first segment whose base is
     /// strictly above `offset`, or -1 if none.  Non-allocating, O(log segments);
@@ -691,7 +707,10 @@ public:
     /// owner's drains post nothing until it runs or is cancelled.
     [[nodiscard]] bool tryBeginColdPath() noexcept { return beginColdPath_(INT64_MIN); }
     /// Owner: a deferred cold path was abandoned (role change) — resume posting.
-    void cancelColdPathWait() noexcept { pauseSwapPost_ = pauseDropPost_ = false; }
+    void cancelColdPathWait() noexcept {
+        pauseSwapPost_ = pauseDropPost_ = false;
+        clearTruncationCap_();   // hot-path B F7: an abandoned truncation releases R
+    }
     /// Cleaner thread: posted operations not yet performed (a compaction pass
     /// must not start on this log before they are — fix round 5).
     [[nodiscard]] bool cleanerFileOpsPending() const noexcept;
@@ -932,6 +951,13 @@ private:
     /// by a confirmed durable write with a higher seq.
     int64_t rpUnconfirmedMax_ = kRecoveryPointUnknown;
     bool    rpDue_         = false;   ///< R crossed a segment boundary since the last persist
+    /// Hot-path B F7: a truncation to rpTruncCap_ waits for the on-disk R to be
+    /// lowered to it (async, the owner's io backend).  INT64_MAX = none.
+    int64_t rpTruncCap_    = INT64_MAX;
+    bool    rpLowerDue_    = false;   ///< the on-disk R (upper bound) exceeds the truncation cap
+    bool    rpKick_        = false;   ///< see takeCheckpointKick
+    uint64_t rpLowerings_  = 0;
+    void clearTruncationCap_() noexcept { rpTruncCap_ = INT64_MAX; rpLowerDue_ = false; }
     uint64_t rpPersists_   = 0;
     uint64_t rpSeq_        = 0;       ///< highest slot seq ever written (or read)
     int      rpActiveSlot_ = -1;      ///< the slot holding persistedRp_ (-1 = none)

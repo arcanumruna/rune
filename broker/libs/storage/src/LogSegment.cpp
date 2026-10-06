@@ -622,7 +622,7 @@ int LogSegment::openTrusted(int64_t nextOffset) noexcept {
     return 0;
 }
 
-int64_t LogSegment::recover() {
+int64_t LogSegment::recover(bool syncIndex) {
     log_.seekg(0, std::ios::end);
     int64_t fileSize = log_.tellg();
     std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
@@ -673,9 +673,11 @@ int64_t LogSegment::recover() {
     // Accepted role-change sync work (truncateTo on a role / epoch change, and
     // startup recovery) — counted, and an error is fail-stop (sticky per log)
     // rather than an exception escaping a worker loop.
-    if (storage_) ++storage_->roleChangeSyncs;
-    if (const int e = (storage_ && storage_->faultForTest) ? storage_->faultForTest : index_->sync(); e != 0) {
-        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
+    if (syncIndex) {
+        if (storage_) ++storage_->roleChangeSyncs;
+        if (const int e = (storage_ && storage_->faultForTest) ? storage_->faultForTest : index_->sync(); e != 0) {
+            if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
+        }
     }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
         const int e = errno;
@@ -691,7 +693,7 @@ int64_t LogSegment::recover() {
                                 "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
     }
     // fsync the directory for durability of the rename
-    {
+    if (syncIndex) {
         std::string dir = logPath_.substr(0, logPath_.rfind('/'));
         int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) {

@@ -187,7 +187,10 @@ public:
     /// readView (F3): a failed lazy map returns an empty view.
     LogReadView mappedBytes() noexcept;
 
-    int64_t recover();
+    /// `syncIndex` = false (hot-path B F7, a worker-driven log's truncation):
+    /// the rebuilt index is renamed into place without msync / directory fsync
+    /// (the owner gates R on an async directory fsync instead).
+    int64_t recover(bool syncIndex = true);
     /// Fix round 3 (O(1) owner-thread install): adopt a SEALED segment whose
     /// .log and .index were built, CRC-verified and fsynced by the cleaner
     /// thread — no re-read, no CRC, no index rebuild, no fsync.  `nextOffset`

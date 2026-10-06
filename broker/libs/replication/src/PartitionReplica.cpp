@@ -1539,7 +1539,11 @@ void PartitionReplica::onDivergingEpoch_(int32_t divergingEpoch, Offset divergin
                          static_cast<long long>(epoch_), divergingEndOffset,
                          divergingEpoch, followerHw_, leo);
     }
-    if (truncTo < leo && !memoryBacked_ && diskLog_ != nullptr && !diskLog_->tryBeginColdPath()) {
+    // Hot-path B F7: the lowered recovery point is made durable by the owning
+    // worker's io backend first (never an inline fdatasync here) — deferred
+    // exactly like a cleaner-busy cold path.
+    if (truncTo < leo && !memoryBacked_ && diskLog_ != nullptr &&
+        (!diskLog_->prepareTruncationTo(truncTo) || !diskLog_->tryBeginColdPath())) {
         // Fix round 5: the log cleaner still has posted renames to perform —
         // never wait on the worker.  Park in TruncatePending (the state holds
         // the target); no fetch / apply until doWork completes it.
@@ -2086,7 +2090,7 @@ int PartitionReplica::doWork(int64_t nowNs)
         // Fix round 5: a deferred divergence truncation completes as soon as the
         // log cleaner has performed its posted renames (event-driven, no wait).
         if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr &&
-            diskLog_->tryBeginColdPath()) {
+            diskLog_->prepareTruncationTo(followerSync_.truncateTarget()) && diskLog_->tryBeginColdPath()) {
             completeDivergenceTruncation_(followerSync_.truncateTarget());
             ++work;
         }

@@ -1178,8 +1178,11 @@ TEST(ShardNonBlockingRegression, TruncateClampsSyncedLeo) {
     ASSERT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), 2);
     const uint64_t roleSyncsBefore = s.log->roleChangeSyncCallsForTest();
     EXPECT_TRUE(s.log->truncateTo(1));
-    EXPECT_GT(s.log->roleChangeSyncCallsForTest(), roleSyncsBefore)
-        << "truncate's index msync + dir fsync are counted as accepted role-change sync work";
+    // Hot-path B F7: a worker-driven log's truncation rebuilds the index with
+    // NO msync / directory fsync on the owner (R is gated on the owner's async
+    // directory fsync instead — MEDIUM-2).
+    EXPECT_EQ(s.log->roleChangeSyncCallsForTest(), roleSyncsBefore)
+        << "truncate synced the rebuilt index / directory on the worker";
     EXPECT_EQ(s.log->syncCallsForTest(), 0u);
     s.w.doWork(3);
     EXPECT_EQ(s.w.lastSyncedLeoForTest(s.log.get()), 1) << "clamped to the new LEO";

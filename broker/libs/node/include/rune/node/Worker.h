@@ -4852,6 +4852,8 @@ private:
         int work = 0;
         for (auto& slot : slots_) {
             reconcileTruncation_(slot);
+            // Hot-path B F7: a truncation armed an async recovery-point lowering.
+            if (slot.log->takeCheckpointKick()) [[unlikely]] queueRecoveryCheckpoint_(slot);
             if (slot.log->pendingSealCount() > 0) work += submitPendingSeals_(slot);
         }
         work += submitRecoveryCheckpoints_();

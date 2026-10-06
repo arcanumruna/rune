@@ -80,8 +80,8 @@ struct Rig {
     PartitionReplica*                         rep = nullptr;
     int64_t                                   now = 1'000'000'000;
 
-    explicit Rig(bool controllerManaged = false) {
-        log = std::make_unique<rune::storage::Log>(dir.p.string(), 64 * 1024 * 1024);
+    explicit Rig(bool controllerManaged = false, int64_t rollBytes = 64 * 1024 * 1024) {
+        log = std::make_unique<rune::storage::Log>(dir.p.string(), rollBytes);
         log->recover();
         PartitionConfig c;
         c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
@@ -357,4 +357,83 @@ TEST(HotPathBRegression, EpochStateRestoreAndCorruptionRegression) {
         EXPECT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 1) << "trusted the stale legacy checkpoint";
         EXPECT_EQ(r.leaderEpochCacheForTest().startOffsetFor(1), 0);
     }
+}
+
+// F7 (truncation completion): a worker-driven follower's divergence truncation
+// below its durable recovery point must not fsync on the worker (old: an inline
+// recovery-point write + fdatasync, then the rebuilt index's msync + directory
+// fsync — 3-5 ms in the truncating pass).  The lowered recovery point is made
+// durable through the io backend FIRST (the truncation waits in
+// TruncatePending, event-driven), so no file is touched before it (E1d F6).
+TEST(HotPathBRegression, FollowerTruncationNeverSyncsOnTheWorkerRegression) {
+    Rig rig(/*controllerManaged=*/false, /*rollBytes=*/4096);
+    rig.roleOp(true, 2);
+    rig.pass();
+    ASSERT_EQ(rig.rep->role(), Role::Leader);
+    const auto frame = produceFrame(1, 1, 0, 200, 4);
+    for (int i = 0; i < 64; ++i) rig.pass(&frame);
+    rig.pool.drainAllReturns([](WorkerReturn) {});
+    ASSERT_TRUE(rig.passUntil([&] { return rig.log->persistedRecoveryPoint() > 40; }))
+        << "precondition: a durable recovery point above the cut (R=" << rig.log->persistedRecoveryPoint() << ")";
+
+    rig.roleOp(false, 3, 2);
+    rig.pass();
+    ASSERT_EQ(rig.rep->role(), Role::Follower);
+    const uint64_t syncsBefore = rig.log->roleChangeSyncCallsForTest();
+    const uint64_t inlineBefore = rig.log->syncCallsForTest();
+
+    rune::replication::ErrorPayloadBuf epb;
+    WorkerOp op;
+    op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 1; op.partition = 0;
+    op.replicatedPayload.leaderEpoch = 3;
+    op.replicatedPayload.partition = 0;
+    op.replicatedPayload.topicId = 1;
+    op.replicatedPayload.errorCode = rune::replication::kErrDivergingEpoch;
+    const auto pl = epb.set(2, 10);
+    op.replicatedPayload.records.assign(pl.begin(), pl.end());
+    ASSERT_TRUE(rig.pool.tryEnqueueOp(1, 0, std::move(op)));
+
+    ASSERT_TRUE(rig.passUntil([&] { return rig.log->logEndOffset() <= 10; })) << "truncation never completed";
+    EXPECT_EQ(rig.log->roleChangeSyncCallsForTest(), syncsBefore)
+        << "the truncation wrote the recovery point / index / directory synchronously on the worker";
+    EXPECT_EQ(rig.log->syncCallsForTest(), inlineBefore) << "an inline fsync on the worker";
+    EXPECT_GE(rig.log->asyncTruncationLoweringsForTest(), 1u);
+    EXPECT_LE(rig.log->persistedRecoveryPoint(), rig.log->logEndOffset())
+        << "a durable recovery point above the truncated log end";
+    EXPECT_FALSE(rig.log->storageFailed());
+    // The follower carries on (the log stays usable; R advances again once the
+    // async directory fsync covered the rebuilt index).
+    for (int i = 0; i < 8; ++i) rig.pass();
+    EXPECT_FALSE(rig.rep->truncatePendingForTest());
+}
+
+// F7 guard: a worker-driven log truncated mid-segment (index rebuilt without
+// msync / directory fsync) and then CRASHED before any async durability ran
+// recovers to exactly the truncated content, with R never above it.
+TEST(HotPathBRegression, UnsyncedTruncationRebuildRecoversAfterCrashRegression) {
+    TmpDir d;
+    int64_t cut = 0;
+    {
+        rune::storage::Log log(d.p.string(), 1 << 20);
+        log.recover();
+        log.setDeferSealSync(true);
+        for (int i = 0; i < 40; ++i) { const auto b = stampedBatch(i * 2, 2, 1); log.append(b, i * 2 + 1); }
+        ASSERT_EQ(log.logEndOffset(), 80);
+        ASSERT_EQ(log.checkpointRecoveryPoint(), 0);
+        cut = 31;   // inside batch [30, 31] → the log ends at 30
+        ASSERT_TRUE(log.truncateTo(cut));
+        ASSERT_EQ(log.logEndOffset(), 30);
+        EXPECT_LE(log.persistedRecoveryPoint(), 30);
+        log.crashForTest();
+    }
+    rune::storage::Log log(d.p.string(), 1 << 20);
+    log.recover();
+    EXPECT_EQ(log.logEndOffset(), 30);
+    EXPECT_LE(log.persistedRecoveryPoint(), 30);
+    const auto v = log.readView(0, 1 << 20);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.nextOffset, 30);
+    const auto b = stampedBatch(30, 2, 2);
+    log.append(b, 31);
+    EXPECT_EQ(log.logEndOffset(), 32);
 }
