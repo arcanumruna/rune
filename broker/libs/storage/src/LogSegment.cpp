@@ -61,7 +61,7 @@ std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
 
 std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     const std::string& stagingLogPath, const std::string& stagingIndexPath,
-    int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
+    int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes, std::size_t readMapBytes) {
     // Construct at provisional base 0.  All the expensive syscalls (2 open()s for
     // the .log fstream+fd, 1 open() + ftruncate + mmap + prefault for the .index)
     // happen HERE, on the background thread.  The staging files use non-.log/.index
@@ -97,7 +97,7 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     // Right-sized index, PREFAULTED so the append/roll hot path never faults it.
     seg->index_ = std::make_unique<OffsetIndex>(idxPath, /*base*/0, indexMaxBytes,
                                                 /*prefault*/true);
-    seg->openReadMap();   // background thread: the read mapping is ready at adopt
+    seg->openReadMap(readMapBytes);   // background thread: the read mapping is ready at adopt — whole-segment sized (F5)
     return seg;
 }
 
@@ -134,7 +134,8 @@ void LogSegment::setCanonicalLogPath(const std::string& dir, int64_t base) noexc
 }
 
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
-                       int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap)
+                       int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap,
+                       std::size_t readMapBytes)
     : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
       indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset), durableNext_(baseOffset) {
     logPath_ = fname(dir, baseOffset, ".log");
@@ -172,7 +173,7 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // see MappedFile).  A sealed segment recovered from disk (eagerReadMap ==
     // false, the default) maps lazily on its first readView(): N retained
     // segments no longer means N eager read mmaps kept forever.
-    if (eagerReadMap) openReadMap();
+    if (eagerReadMap) openReadMap(readMapBytes);
 }
 
 // D3b fix round 2: the read mapping is ALWAYS made through this segment's own
@@ -188,14 +189,23 @@ std::unique_ptr<MappedFile> LogSegment::makeReadMap_(std::size_t bytes) {
     return std::make_unique<MappedFile>(logPath_, bytes, /*writable*/false);   // unreachable: ctor throws on fd_ < 0
 }
 
-void LogSegment::openReadMap() noexcept {
+std::size_t LogSegment::readMapBytesFor(int64_t rollBytes) noexcept {
+    // The roll threshold plus one large batch of overshoot, rounded up to a
+    // power of two (ensureReadMap's geometric growth then never triggers).
+    std::size_t want = rollBytes > 0 ? static_cast<std::size_t>(rollBytes) + (1u << 20) : kReadMapMinBytes;
+    std::size_t cap = kReadMapMinBytes;
+    while (cap < want && cap < (std::size_t{1} << 40)) cap *= 2;
+    return cap;
+}
+
+void LogSegment::openReadMap(std::size_t bytes) noexcept {
     // Create the read-only .log mapping WITH the segment (spec §1a.5): the first
     // readView() after a roll must not allocate a MappedFile + mmap on the
     // push/fetch hot path.  kReadMapMinBytes of headroom past EOF (never touched:
     // readView reads only [0, logSize_)).  Failure is non-fatal — ensureReadMap()
     // falls back to creating it lazily.
     try {
-        readMap_     = makeReadMap_(kReadMapMinBytes);
+        readMap_     = makeReadMap_(std::max(bytes, kReadMapMinBytes));
         readMapSize_ = readMap_->size();
     } catch (...) {
         readMap_.reset();
@@ -510,6 +520,7 @@ bool LogSegment::ensureReadMap() noexcept {
     // costs no syscalls.  A remap happens only O(log(segment/kMin)) times.
     std::size_t cap = readMapSize_ > 0 ? readMapSize_ : kReadMapMinBytes;
     while (cap < want) cap *= 2;
+    ++readMapRemaps_;
     try {
         if (!readMap_) {
             // Read-only mapping (writable=false → no ftruncate; never mutates .log).

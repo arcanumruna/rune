@@ -240,6 +240,10 @@ public:
     /// readView() calls on this log (single-owner counter; F18 B-2 proves a
     /// fetch costs exactly one lookup and a conflated duplicate none).
     [[nodiscard]] uint64_t readViewCallsForTest() const noexcept { return readViewCalls_; }
+    /// Hot-path B F5: on-demand read-map creations / remaps of the ACTIVE segment.
+    [[nodiscard]] uint64_t activeReadMapRemapsForTest() const noexcept {
+        return segments_.empty() ? 0 : segments_.rbegin()->second->readMapRemaps();
+    }
     /// E2 crash-simulation seam: {segment .log path, bytes made durable by the
     /// last inline sync in this incarnation (-1 = none)} for every installed
     /// segment.  A DR harness truncates each file to its durable extent to

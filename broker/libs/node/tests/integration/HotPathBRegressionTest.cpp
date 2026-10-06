@@ -470,3 +470,28 @@ TEST(HotPathBRegression, EpochBumpOfSittingLeaderRefusesProduceUntilDurableRegre
     EXPECT_EQ(c.latestEpoch(), 2);
     EXPECT_EQ(c.startOffsetFor(2), leo);
 }
+
+// F5: consumer reads of the growing ACTIVE segment never create / remap its
+// read mapping on the worker (old: a 1 MiB first map grown geometrically —
+// munmap + mmap of up to 32 MiB inside the read pass, 100-260 us measured
+// under the cleaner's / provisioner's concurrent mmap traffic).
+TEST(HotPathBRegression, ActiveSegmentReadsNeverRemapOnTheWorkerRegression) {
+    Rig rig(/*controllerManaged=*/false, /*rollBytes=*/16 * 1024 * 1024);
+    const auto frame = produceFrame(1, 1, 0, 4000, 8);   // ~32 KiB batches
+    int64_t next = 0;
+    for (int i = 0; i < 300; ++i) {                     // ~9.6 MiB into one segment
+        rig.pass(&frame);
+        if (i % 4 == 3) {
+            rig.pushRead(500 + i, next);
+            rig.pass();
+            rig.pool.drainAllReturns([&](WorkerReturn r) {
+                if (r.type == WorkerReturn::Type::PushReadResult && r.errorCode == 0 && r.newNextOffset > next)
+                    next = r.newNextOffset;
+            });
+        }
+    }
+    ASSERT_GT(rig.log->logEndOffset(), 2000);
+    ASSERT_GT(next, 1000) << "precondition: the reads consumed the segment as it grew";
+    EXPECT_EQ(rig.log->segmentBaseOffsets().size(), 1u) << "precondition: one (active) segment";
+    EXPECT_EQ(rig.log->activeReadMapRemapsForTest(), 0u) << "the read map was created / grown on the worker";
+}
