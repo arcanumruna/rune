@@ -1236,7 +1236,9 @@ Outcome leadershipChange(int nParts) {
     enum class Ph { Leading, Demoted, Promoting } ph = Ph::Leading;
     std::size_t victim = 0;
     uint64_t t = 0;
-    for (uint64_t i = 0; i < n; ++i) {
+    // At least n passes AND 24 flips (a promotion waits for an fdatasync:
+    // milliseconds of idle passes), bounded.
+    for (uint64_t i = 0; (i < n || flips < 24) && i < 200 * n; ++i) {
         uint32_t extra = kProduce;
         ++t;
         Part& vp = *rig.parts()[victim];
