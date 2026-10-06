@@ -1258,6 +1258,10 @@ Outcome leadershipChange(int nParts) {
         const int64_t ns = rig.pass(ptrs.data(), static_cast<int>(ptrs.size()));
         o.stats.add(ns, rig.observe(extra), rig.lastSplit);
     }
+    if (ph == Ph::Demoted) {   // end in leadership: promote the demoted victim
+        rig.becomeLeader(*rig.parts()[victim]);
+        leading[victim] = true;
+    }
     {
         const std::vector<uint8_t>* none[] = {nullptr};
         for (int k = 0; k < 2'000'000 && !allLead(); ++k) step(rig, o.stats, none, 0, 0);
