@@ -974,6 +974,7 @@ public:
     }
     [[nodiscard]] bool leadershipPendingForTest() const noexcept { return pendingLead_.active; }
     [[nodiscard]] uint64_t leadershipsDeferredForTest() const noexcept { return leadershipsDeferred_; }
+    [[nodiscard]] uint64_t leadershipsResumedForTest() const noexcept { return leadershipsResumed_; }
     [[nodiscard]] uint64_t epochStateWritesForTest() const noexcept { return es_.writes; }
     [[nodiscard]] uint64_t epochStateInlineWritesForTest() const noexcept { return es_.inlineWrites; }
     [[nodiscard]] bool epochStateEnabledForTest() const noexcept { return es_.fd >= 0; }

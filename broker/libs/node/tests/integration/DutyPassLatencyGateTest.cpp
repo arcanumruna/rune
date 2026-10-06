@@ -1183,10 +1183,20 @@ Outcome leadershipChange(int nParts) {
         rig.add(PartSpec{.topicId = 1, .part = i, .rollBytes = 1 * kMiB, .controllerManaged = true});
     rig.start();
     // Controller-managed partitions start at a NEW epoch (fence persisted).
+    // Hot-path B F7: the fence is written through the worker's io backend and
+    // the leadership acts once it completed — drive passes until it did
+    // (bounded; the completion pass is measured as a HOT pass).
     for (auto& p : rig.parts()) rig.becomeLeader(*p);
+    auto allLead = [&] {
+        for (auto& p : rig.parts()) if (!p->rep->acceptsProduce()) return false;
+        return true;
+    };
     {
         const std::vector<uint8_t>* none[] = {nullptr};
         step(rig, o.stats, none, 0, kRoleOp);
+        for (int k = 0; k < 2'000'000 && !allLead(); ++k) step(rig, o.stats, none, 0, 0);
+        EXPECT_TRUE(allLead()) << "precondition: every partition leads";
+        if (!allLead()) return o;
     }
     const FrameSet fset = framesFor(rig, BatchShape{});
     std::vector<const std::vector<uint8_t>*> ptrs;
@@ -1201,10 +1211,17 @@ Outcome leadershipChange(int nParts) {
         if (i % 250 == 0) { rig.becomeFollower(*rig.parts()[victim]); leading[victim] = false; extra |= kRoleOp; ++flips; }
         if (i % 250 == 50) { rig.becomeLeader(*rig.parts()[victim]); leading[victim] = true; extra |= kRoleOp; }
         ptrs.clear();
+        // Produce only where the partition accepts it (a promotion leads once
+        // its durable fence completed — F7): never a refused produce.
         for (std::size_t k = 0; k < rig.parts().size(); ++k)
-            if (leading[k] && !((extra & kRoleOp) != 0 && k == victim)) ptrs.push_back(&fset.frames[k]);
+            if (leading[k] && rig.parts()[k]->rep->acceptsProduce() && !((extra & kRoleOp) != 0 && k == victim))
+                ptrs.push_back(&fset.frames[k]);
         const int64_t ns = rig.pass(ptrs.data(), static_cast<int>(ptrs.size()));
         o.stats.add(ns, rig.observe(extra), rig.lastSplit);
+    }
+    {
+        const std::vector<uint8_t>* none[] = {nullptr};
+        for (int k = 0; k < 2'000'000 && !allLead(); ++k) step(rig, o.stats, none, 0, 0);
     }
     EXPECT_GT(flips, 10u);
     for (auto& p : rig.parts()) EXPECT_EQ(p->rep->role(), Role::Leader);
